@@ -5,6 +5,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
 
@@ -156,6 +157,10 @@ function makeConnection(): { info: ConnectionInfo; path: string; tempDir: string
 
 const liveKernels = new Set<KernelManager>();
 let signalHandlersInstalled = false;
+
+registerSessionResourceCleanup(() => {
+	for (const k of liveKernels) k.dispose();
+});
 
 function installSignalHandlersOnce(): void {
 	if (signalHandlersInstalled) return;
@@ -470,7 +475,11 @@ export class KernelManager {
 
 	/** Synchronous best-effort cleanup. Safe to call from `process.on('exit')`. */
 	dispose(): void {
+		this.state = "shutdown";
 		liveKernels.delete(this);
+		this.shell?.close();
+		this.iopub?.close();
+		this.control?.close();
 		try {
 			this.kernel?.kill("SIGTERM");
 		} catch {}

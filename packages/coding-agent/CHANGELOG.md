@@ -5,6 +5,7 @@
 ### Changed
 
 - Changed the default active built-in tool set to `ipython`.
+- Replaced the default system prompt with the model-agnostic RLM harness prompt.
 
 ### Removed
 

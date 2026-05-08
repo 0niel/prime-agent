@@ -944,6 +944,7 @@ export class AgentSession {
 			contextFiles: loadedContextFiles,
 			customPrompt: loaderSystemPrompt,
 			appendSystemPrompt,
+			messagesPath: this.sessionManager.getSessionFile(),
 			selectedTools: validToolNames,
 			toolSnippets,
 			promptGuidelines,
