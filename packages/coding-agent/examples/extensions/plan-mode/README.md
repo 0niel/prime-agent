@@ -4,7 +4,7 @@ Read-only exploration mode for safe code analysis.
 
 ## Features
 
-- **Read-only tools**: Restricts available tools to read, bash, grep, find, ls, question
+- **Read-only tools**: Restricts available tools to bash and questionnaire
 - **Bash allowlist**: Only read-only bash commands are allowed
 - **Plan extraction**: Extracts numbered steps from `Plan:` sections
 - **Progress tracking**: Widget shows completion status during execution
@@ -37,7 +37,7 @@ Plan:
 ## How It Works
 
 ### Plan Mode (Read-Only)
-- Only read-only tools available
+- Only bash and questionnaire are available
 - Bash commands filtered through allowlist
 - Agent creates a plan without making changes
 

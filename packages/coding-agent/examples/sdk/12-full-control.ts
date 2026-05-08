@@ -44,7 +44,7 @@ const resourceLoader: ResourceLoader = {
 	getThemes: () => ({ themes: [], diagnostics: [] }),
 	getAgentsFiles: () => ({ agentsFiles: [] }),
 	getSystemPrompt: () => `You are a minimal assistant.
-Available: read, bash. Be concise.`,
+Available: ipython, bash. Be concise.`,
 	getAppendSystemPrompt: () => [],
 	extendResources: () => {},
 	reload: async () => {},
@@ -58,7 +58,7 @@ const { session } = await createAgentSession({
 	authStorage,
 	modelRegistry,
 	resourceLoader,
-	tools: ["read", "bash"],
+	tools: ["ipython", "bash"],
 	sessionManager: SessionManager.inMemory(cwd),
 	settingsManager,
 });

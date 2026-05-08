@@ -75,6 +75,7 @@ describe("createAgentSession session manager defaults", () => {
 			agentDir,
 			model: model!,
 			sessionManager,
+			tools: ["bash"],
 		});
 
 		expect(session.sessionManager).toBe(sessionManager);

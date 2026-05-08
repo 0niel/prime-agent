@@ -71,7 +71,7 @@ describe.skipIf(!API_KEY)("AgentSession forking", () => {
 					sessionManager,
 					sessionStartEvent,
 					model,
-					tools: ["read", "bash", "edit", "write"],
+					tools: ["ipython", "bash", "edit"],
 				})),
 				services,
 				diagnostics: services.diagnostics,

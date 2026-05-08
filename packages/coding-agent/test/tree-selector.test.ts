@@ -66,7 +66,9 @@ function toolCallOnlyAssistant(id: string, parentId: string | null): SessionMess
 		timestamp: new Date().toISOString(),
 		message: {
 			role: "assistant",
-			content: [{ type: "toolCall", id: `tc-${id}`, name: "read", arguments: { path: "test.ts" } }],
+			content: [
+				{ type: "toolCall", id: `tc-${id}`, name: "ipython", arguments: { code: "open('test.ts').read()" } },
+			],
 			api: "anthropic-messages",
 			provider: "anthropic",
 			model: "claude-sonnet-4",

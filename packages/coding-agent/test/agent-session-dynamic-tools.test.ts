@@ -69,7 +69,7 @@ describe("AgentSession dynamic tool registration", () => {
 
 		const allTools = session.getAllTools();
 		const dynamicTool = allTools.find((tool) => tool.name === "dynamic_tool");
-		const readTool = allTools.find((tool) => tool.name === "read");
+		const ipythonTool = allTools.find((tool) => tool.name === "ipython");
 
 		expect(allTools.map((tool) => tool.name)).toContain("dynamic_tool");
 		expect(dynamicTool?.sourceInfo).toMatchObject({
@@ -78,8 +78,8 @@ describe("AgentSession dynamic tool registration", () => {
 			scope: "temporary",
 			origin: "top-level",
 		});
-		expect(readTool?.sourceInfo).toMatchObject({
-			path: "<builtin:read>",
+		expect(ipythonTool?.sourceInfo).toMatchObject({
+			path: "<builtin:ipython>",
 			source: "builtin",
 			scope: "temporary",
 			origin: "top-level",

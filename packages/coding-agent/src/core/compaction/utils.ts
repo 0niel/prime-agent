@@ -42,12 +42,6 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 		if (!path) continue;
 
 		switch (block.name) {
-			case "read":
-				fileOps.read.add(path);
-				break;
-			case "write":
-				fileOps.written.add(path);
-				break;
 			case "edit":
 				fileOps.edited.add(path);
 				break;

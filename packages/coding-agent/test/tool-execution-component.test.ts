@@ -1,13 +1,10 @@
-import { join, resolve } from "node:path";
 import { Text, type TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { Type } from "typebox";
 import { beforeAll, describe, expect, test } from "vitest";
-import { getReadmePath } from "../src/config.js";
 import type { ToolDefinition } from "../src/core/extensions/types.js";
-import { type BashOperations, createBashToolDefinition } from "../src/core/tools/bash.js";
-import { createReadTool, createReadToolDefinition } from "../src/core/tools/read.js";
-import { createWriteToolDefinition } from "../src/core/tools/write.js";
+import { type BashOperations, createBashTool, createBashToolDefinition } from "../src/core/tools/bash.js";
+import { createEditToolDefinition } from "../src/core/tools/edit.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -90,16 +87,16 @@ describe("ToolExecutionComponent parity", () => {
 
 	test("preserves legacy file_path rendering compatibility for built-in tools", () => {
 		const component = new ToolExecutionComponent(
-			"read",
+			"edit",
 			"tool-3",
-			{ file_path: "README.md" },
+			{ file_path: "README.md", oldText: "before", newText: "after" },
 			{},
 			undefined,
 			createFakeTui(),
 			process.cwd(),
 		);
 		const rendered = stripAnsi(component.render(120).join("\n"));
-		expect(rendered).toContain("read");
+		expect(rendered).toContain("edit");
 		expect(rendered).toContain("README.md");
 	});
 
@@ -125,29 +122,32 @@ describe("ToolExecutionComponent parity", () => {
 
 	test("does not duplicate built-in headers when passed the active built-in definition", () => {
 		const component = new ToolExecutionComponent(
-			"read",
+			"edit",
 			"tool-4",
-			{ path: "README.md" },
+			{ path: "README.md", oldText: "before", newText: "after" },
 			{},
-			createReadToolDefinition(process.cwd()),
+			createEditToolDefinition(process.cwd()),
 			createFakeTui(),
 			process.cwd(),
 		);
-		component.updateResult({ content: [{ type: "text", text: "hello" }], details: undefined, isError: false }, false);
+		component.updateResult(
+			{ content: [], details: { diff: "+1 after", firstChangedLine: 1 }, isError: false },
+			false,
+		);
 		const rendered = stripAnsi(component.render(120).join("\n"));
-		expect(rendered.match(/\bread\b/g)?.length ?? 0).toBe(1);
+		expect(rendered.match(/\bedit\b/g)?.length ?? 0).toBe(1);
 	});
 
 	test("inherits missing built-in result renderer slot from the built-in tool", () => {
 		const overrideDefinition: ToolDefinition = {
-			...createBaseToolDefinition("read"),
+			...createBaseToolDefinition("bash"),
 			renderCall: () => new Text("override call", 0, 0),
 		};
 
 		const component = new ToolExecutionComponent(
-			"read",
+			"bash",
 			"tool-4b",
-			{ path: "notes.txt" },
+			{ command: "echo hello" },
 			{},
 			overrideDefinition,
 			createFakeTui(),
@@ -161,14 +161,14 @@ describe("ToolExecutionComponent parity", () => {
 
 	test("inherits missing built-in call renderer slot from the built-in tool", () => {
 		const overrideDefinition: ToolDefinition = {
-			...createBaseToolDefinition("read"),
+			...createBaseToolDefinition("bash"),
 			renderResult: () => new Text("override result", 0, 0),
 		};
 
 		const component = new ToolExecutionComponent(
-			"read",
+			"bash",
 			"tool-4c",
-			{ path: "README.md" },
+			{ command: "echo hello" },
 			{},
 			overrideDefinition,
 			createFakeTui(),
@@ -176,17 +176,16 @@ describe("ToolExecutionComponent parity", () => {
 		);
 		component.updateResult({ content: [{ type: "text", text: "hello" }], details: undefined, isError: false }, false);
 		const rendered = stripAnsi(component.render(120).join("\n"));
-		expect(rendered).toContain("read");
-		expect(rendered).toContain("README.md");
+		expect(rendered).toContain("echo hello");
 		expect(rendered).toContain("override result");
 	});
 
 	test("uses custom renderers for built-in overrides that reuse built-in definition parameters", () => {
-		const builtInDefinition = createReadToolDefinition(process.cwd());
+		const builtInDefinition = createBashToolDefinition(process.cwd());
 		const component = new ToolExecutionComponent(
-			"read",
+			"bash",
 			"tool-4d",
-			{ path: "README.md" },
+			{ command: "echo hello" },
 			{},
 			{
 				...builtInDefinition,
@@ -200,18 +199,18 @@ describe("ToolExecutionComponent parity", () => {
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered).toContain("override call");
 		expect(rendered).toContain("override result");
-		expect(rendered).not.toContain("read README.md");
+		expect(rendered).not.toContain("bash echo hello");
 	});
 
 	test("uses custom renderers for built-in overrides that reuse wrapped built-in tool parameters", () => {
-		const builtInTool = createReadTool(process.cwd());
+		const builtInTool = createBashTool(process.cwd());
 		const component = new ToolExecutionComponent(
-			"read",
+			"bash",
 			"tool-4e",
-			{ path: "README.md" },
+			{ command: "echo hello" },
 			{},
 			{
-				...createBaseToolDefinition("read"),
+				...createBaseToolDefinition("bash"),
 				parameters: builtInTool.parameters,
 				renderCall: () => new Text("wrapped override call", 0, 0),
 				renderResult: () => new Text("wrapped override result", 0, 0),
@@ -294,123 +293,4 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).toContain("custom_tool");
 		expect(rendered).toContain("done");
 	});
-
-	test("trims trailing blank display lines from write previews", () => {
-		const component = new ToolExecutionComponent(
-			"write",
-			"tool-7",
-			{ path: "README.md", content: "one\ntwo\n" },
-			{},
-			createWriteToolDefinition(process.cwd()),
-			createFakeTui(),
-			process.cwd(),
-		);
-		const rendered = stripAnsi(component.render(120).join("\n"));
-		expect(rendered).toContain("one");
-		expect(rendered).toContain("two");
-		expect(rendered).not.toContain("two\n\n");
-	});
-
-	test("trims trailing blank display lines from read results", () => {
-		const component = new ToolExecutionComponent(
-			"read",
-			"tool-8",
-			{ path: "notes.txt" },
-			{},
-			createReadToolDefinition(process.cwd()),
-			createFakeTui(),
-			process.cwd(),
-		);
-		component.updateResult(
-			{ content: [{ type: "text", text: "one\ntwo\n" }], details: undefined, isError: false },
-			false,
-		);
-		const rendered = stripAnsi(component.render(120).join("\n"));
-		expect(rendered).toContain("one");
-		expect(rendered).toContain("two");
-		expect(rendered).not.toContain("two\n\n");
-	});
-
-	for (const scenario of [
-		{
-			title: "SKILL.md",
-			path: join(process.cwd(), "attio", "SKILL.md"),
-			content: "---\nname: attio\ndescription: CRM helper\n---\n\n# Hidden skill instructions",
-			compact: "[skill] attio",
-			hidden: "Hidden skill instructions",
-			absent: "read skill attio",
-		},
-		{
-			title: "AGENTS.md",
-			path: join(process.cwd(), ".pi", "AGENTS.md"),
-			content: "Hidden resource instructions",
-			compact: "read resource .pi/AGENTS.md",
-			hidden: "Hidden resource instructions",
-			absent: undefined,
-		},
-		{
-			title: "outside AGENTS.md",
-			path: resolve(process.cwd(), "..", "AGENTS.md"),
-			content: "Hidden outside resource instructions",
-			compact: `read resource ${resolve(process.cwd(), "..", "AGENTS.md").replace(/\\/g, "/")}`,
-			hidden: "Hidden outside resource instructions",
-			absent: undefined,
-		},
-		{
-			title: "Pi documentation",
-			path: getReadmePath(),
-			content: "Hidden docs content",
-			compact: "read docs README.md",
-			hidden: "Hidden docs content",
-			absent: undefined,
-		},
-	] as const) {
-		test(`renders ${scenario.title} read results compactly until expanded`, () => {
-			const component = new ToolExecutionComponent(
-				"read",
-				`tool-compact-${scenario.title}`,
-				{ path: scenario.path },
-				{},
-				createReadToolDefinition(process.cwd()),
-				createFakeTui(),
-				process.cwd(),
-			);
-			component.updateResult(
-				{ content: [{ type: "text", text: scenario.content }], details: undefined, isError: false },
-				false,
-			);
-
-			const collapsed = stripAnsi(component.render(120).join("\n"));
-			expect(collapsed).toContain(scenario.compact);
-			expect(collapsed).not.toContain(scenario.hidden);
-			if (scenario.absent) {
-				expect(collapsed).not.toContain(scenario.absent);
-			}
-
-			component.setExpanded(true);
-			const expanded = stripAnsi(component.render(120).join("\n"));
-			expect(expanded).toContain(scenario.hidden);
-		});
-	}
-
-	for (const scenario of [
-		{ title: "SKILL.md", path: join(process.cwd(), "attio", "SKILL.md"), compact: "[skill] attio:120-329" },
-		{ title: "Pi documentation", path: getReadmePath(), compact: "read docs README.md:120-329" },
-	] as const) {
-		test(`shows the read line range in compact ${scenario.title} reads before the expand hint`, () => {
-			const component = new ToolExecutionComponent(
-				"read",
-				`tool-compact-range-${scenario.title}`,
-				{ path: scenario.path, offset: 120, limit: 210 },
-				{},
-				createReadToolDefinition(process.cwd()),
-				createFakeTui(),
-				process.cwd(),
-			);
-
-			const collapsed = stripAnsi(component.render(120).join("\n"));
-			expect(collapsed).toContain(scenario.compact);
-			expect(collapsed.indexOf(":120-329")).toBeLessThan(collapsed.indexOf("to expand"));
-		});
-	}
 });

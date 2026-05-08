@@ -691,7 +691,7 @@ Behavior guarantees:
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 
 pi.on("tool_call", async (event, ctx) => {
-  // event.toolName - "bash", "read", "write", "edit", etc.
+  // event.toolName - "ipython", "bash", "edit", etc.
   // event.toolCallId
   // event.input - tool parameters (mutable)
 
@@ -705,9 +705,9 @@ pi.on("tool_call", async (event, ctx) => {
     }
   }
 
-  if (isToolCallEventType("read", event)) {
-    // event.input is { path: string; offset?: number; limit?: number }
-    console.log(`Reading: ${event.input.path}`);
+  if (isToolCallEventType("ipython", event)) {
+    // event.input is { code: string }
+    console.log(`Python code: ${event.input.code}`);
   }
 });
 ```
@@ -1488,15 +1488,15 @@ Manage active tools. This works for both built-in tools and dynamically register
 const active = pi.getActiveTools();
 const all = pi.getAllTools();
 // [{
-//   name: "read",
-//   description: "Read file contents...",
+//   name: "ipython",
+//   description: "Execute Python code in a persistent IPython kernel...",
 //   parameters: ..., 
-//   sourceInfo: { path: "<builtin:read>", source: "builtin", scope: "temporary", origin: "top-level" }
+//   sourceInfo: { path: "<builtin:ipython>", source: "builtin", scope: "temporary", origin: "top-level" }
 // }, ...]
 const names = all.map(t => t.name);
 const builtinTools = all.filter((t) => t.sourceInfo.source === "builtin");
 const extensionTools = all.filter((t) => t.sourceInfo.source !== "builtin" && t.sourceInfo.source !== "sdk");
-pi.setActiveTools(["read", "bash"]); // Switch to read-only
+pi.setActiveTools(["bash", "edit"]); // Switch to optional shell/edit tools
 ```
 
 `pi.getAllTools()` returns `name`, `description`, `parameters`, and `sourceInfo`.
@@ -1669,7 +1669,7 @@ Use `promptGuidelines` to add tool-specific bullets to the default system prompt
 
 Note: Some models are idiots and include the @ prefix in tool path arguments. Built-in tools strip a leading @ before resolving paths. If your custom tool accepts a path, normalize a leading @ as well.
 
-If your custom tool mutates files, use `withFileMutationQueue()` so it participates in the same per-file queue as built-in `edit` and `write`. This matters because tool calls run in parallel by default. Without the queue, two tools can read the same old file contents, compute different updates, and then whichever write lands last overwrites the other.
+If your custom tool mutates files, use `withFileMutationQueue()` so it participates in the same per-file queue as built-in `edit`. This matters because tool calls run in parallel by default. Without the queue, two tools can read the same old file contents, compute different updates, and then whichever write lands last overwrites the other.
 
 Example failure case: your custom tool edits `foo.ts` while built-in `edit` also changes `foo.ts` in the same assistant turn. If your tool does not participate in the queue, both can read the original `foo.ts`, apply separate changes, and one of those changes is lost.
 
@@ -1823,10 +1823,10 @@ pi.registerTool({
 
 ### Overriding Built-in Tools
 
-Extensions can override built-in tools (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`) by registering a tool with the same name. Interactive mode displays a warning when this happens.
+Extensions can override built-in tools (`ipython`, `bash`, `edit`) by registering a tool with the same name. Interactive mode displays a warning when this happens.
 
 ```bash
-# Extension's read tool replaces built-in read
+# Extension's ipython tool replaces built-in ipython
 pi -e ./tool-override.ts
 ```
 
@@ -1836,7 +1836,7 @@ Alternatively, use `--no-builtin-tools` to start without any built-in tools whil
 pi --no-builtin-tools -e ./my-extension.ts
 ```
 
-See [examples/extensions/tool-override.ts](../examples/extensions/tool-override.ts) for a complete example that overrides `read` with logging and access control.
+See [examples/extensions/tool-override.ts](../examples/extensions/tool-override.ts) for a complete override example.
 
 **Rendering:** Built-in renderer inheritance is resolved per slot. Execution override and rendering override are independent. If your override omits `renderCall`, the built-in `renderCall` is used. If your override omits `renderResult`, the built-in `renderResult` is used. If your override omits both, the built-in renderer is used automatically (syntax highlighting, diffs, etc.). This lets you wrap built-in tools for logging or access control without reimplementing the UI.
 
@@ -1845,44 +1845,37 @@ See [examples/extensions/tool-override.ts](../examples/extensions/tool-override.
 **Your implementation must match the exact result shape**, including the `details` type. The UI and session logic depend on these shapes for rendering and state tracking.
 
 Built-in tool implementations:
-- [read.ts](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/tools/read.ts) - `ReadToolDetails`
+- [ipython.ts](https://github.com/PrimeIntellect-ai/prime-agent/blob/main/packages/coding-agent/src/core/tools/ipython.ts) - `IpythonToolDetails`
 - [bash.ts](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/tools/bash.ts) - `BashToolDetails`
 - [edit.ts](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/tools/edit.ts)
-- [write.ts](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/tools/write.ts)
-- [grep.ts](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/tools/grep.ts) - `GrepToolDetails`
-- [find.ts](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/tools/find.ts) - `FindToolDetails`
-- [ls.ts](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/tools/ls.ts) - `LsToolDetails`
 
 ### Remote Execution
 
-Built-in tools support pluggable operations for delegating to remote systems (SSH, containers, etc.):
+The `bash` and `edit` tools support pluggable operations for delegating to remote systems (SSH, containers, etc.):
 
 ```typescript
-import { createReadTool, createBashTool, type ReadOperations } from "@earendil-works/pi-coding-agent";
+import { createBashTool, type BashOperations } from "@earendil-works/pi-coding-agent";
 
 // Create tool with custom operations
-const remoteRead = createReadTool(cwd, {
-  operations: {
-    readFile: (path) => sshExec(remote, `cat ${path}`),
-    access: (path) => sshExec(remote, `test -r ${path}`).then(() => {}),
-  }
+const remoteBash = createBashTool(cwd, {
+  operations: createRemoteBashOps(ssh),
 });
 
 // Register, checking flag at execution time
 pi.registerTool({
-  ...remoteRead,
+  ...remoteBash,
   async execute(id, params, signal, onUpdate, _ctx) {
     const ssh = getSshConfig();
     if (ssh) {
-      const tool = createReadTool(cwd, { operations: createRemoteOps(ssh) });
+      const tool = createBashTool(cwd, { operations: createRemoteBashOps(ssh) });
       return tool.execute(id, params, signal, onUpdate);
     }
-    return localRead.execute(id, params, signal, onUpdate);
+    return localBash.execute(id, params, signal, onUpdate);
   },
 });
 ```
 
-**Operations interfaces:** `ReadOperations`, `WriteOperations`, `EditOperations`, `BashOperations`, `LsOperations`, `GrepOperations`, `FindOperations`
+**Operations interfaces:** `EditOperations`, `BashOperations`
 
 For `user_bash`, extensions can reuse pi's local shell backend via `createLocalBashOperations()` instead of reimplementing local process spawning, shell resolution, and process-tree termination.
 
@@ -2528,7 +2521,7 @@ All examples in [examples/extensions/](../examples/extensions/).
 | `dynamic-tools.ts` | Register tools after startup and during commands | `registerTool`, `session_start`, `registerCommand` |
 | `structured-output.ts` | Final structured-output tool with `terminate: true` | `registerTool`, terminating tool results |
 | `truncated-tool.ts` | Output truncation example | `registerTool`, `truncateHead` |
-| `tool-override.ts` | Override built-in read tool | `registerTool` (same name as built-in) |
+| `tool-override.ts` | Override a built-in tool | `registerTool` (same name as built-in) |
 | **Commands** |||
 | `pirate.ts` | Modify system prompt per-turn | `registerCommand`, `before_agent_start` |
 | `summarize.ts` | Conversation summary command | `registerCommand`, `ui.custom` |

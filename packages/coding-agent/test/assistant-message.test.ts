@@ -45,7 +45,7 @@ describe("AssistantMessageComponent", () => {
 		const component = new AssistantMessageComponent(
 			createAssistantMessage([
 				{ type: "text", text: "calling tool" },
-				{ type: "toolCall", id: "tool-1", name: "read", arguments: { path: "file.txt" } },
+				{ type: "toolCall", id: "tool-1", name: "ipython", arguments: { code: "open('file.txt').read()" } },
 			]),
 		);
 		const rendered = component.render(60).join("\n");

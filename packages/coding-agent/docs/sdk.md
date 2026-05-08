@@ -62,7 +62,7 @@ const { session } = await createAgentSession();
 // Custom: override specific options
 const { session } = await createAgentSession({
   model: myModel,
-  tools: [readTool, bashTool],
+  tools: ["ipython", "bash"],
   sessionManager: SessionManager.inMemory(),
 });
 ```
@@ -467,53 +467,37 @@ const { session } = await createAgentSession({ resourceLoader: loader });
 ### Tools
 
 ```typescript
-import {
-  codingTools,   // read, bash, edit, write (default)
-  readOnlyTools, // read, grep, find, ls
-  readTool, bashTool, editTool, writeTool,
-  grepTool, findTool, lsTool,
-} from "@earendil-works/pi-coding-agent";
-
-// Use built-in tool set
+// Use the default built-in tool set: ipython
 const { session } = await createAgentSession({
-  tools: readOnlyTools,
+  tools: ["ipython"],
 });
 
 // Pick specific tools
 const { session } = await createAgentSession({
-  tools: [readTool, bashTool, grepTool],
+  tools: ["bash", "edit"],
 });
 ```
 
 #### Tools with Custom cwd
 
-**Important:** The pre-built tool instances (`readTool`, `bashTool`, etc.) use `process.cwd()` for path resolution. When you specify a custom `cwd` AND provide explicit `tools`, you must use the tool factory functions to ensure paths resolve correctly:
+**Important:** Use tool factory functions only when registering custom tool definitions yourself. Built-in tool names passed through `tools` resolve against the session `cwd`.
 
 ```typescript
 import {
-  createCodingTools,    // Creates [read, bash, edit, write] for specific cwd
-  createReadOnlyTools,  // Creates [read, grep, find, ls] for specific cwd
-  createReadTool,
-  createBashTool,
-  createEditTool,
-  createWriteTool,
-  createGrepTool,
-  createFindTool,
-  createLsTool,
+  createIpythonToolDefinition,
+  createBashToolDefinition,
+  createEditToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 
 const cwd = "/path/to/project";
 
-// Use factory for tool sets
 const { session } = await createAgentSession({
   cwd,
-  tools: createCodingTools(cwd),  // Tools resolve paths relative to cwd
-});
-
-// Or pick specific tools
-const { session } = await createAgentSession({
-  cwd,
-  tools: [createReadTool(cwd), createBashTool(cwd), createGrepTool(cwd)],
+  customTools: [
+    createIpythonToolDefinition(cwd),
+    createBashToolDefinition(cwd),
+    createEditToolDefinition(cwd),
+  ],
 });
 ```
 
@@ -884,13 +868,11 @@ interface LoadExtensionsResult {
 import { getModel } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import {
-  AuthStorage,
-  bashTool,
+ AuthStorage,
   createAgentSession,
   DefaultResourceLoader,
   defineTool,
   ModelRegistry,
-  readTool,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
@@ -944,7 +926,7 @@ const { session } = await createAgentSession({
   authStorage,
   modelRegistry,
 
-  tools: [readTool, bashTool],
+  tools: ["ipython", "bash"],
   customTools: [statusTool],
   resourceLoader: loader,
 
@@ -1123,17 +1105,9 @@ defineTool
 SessionManager
 SettingsManager
 
-// Built-in tools (use process.cwd())
-codingTools
-readOnlyTools
-readTool, bashTool, editTool, writeTool
-grepTool, findTool, lsTool
-
 // Tool factories (for custom cwd)
-createCodingTools
-createReadOnlyTools
-createReadTool, createBashTool, createEditTool, createWriteTool
-createGrepTool, createFindTool, createLsTool
+createIpythonTool, createBashTool, createEditTool
+createIpythonToolDefinition, createBashToolDefinition, createEditToolDefinition
 
 // Types
 type CreateAgentSessionOptions

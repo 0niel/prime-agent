@@ -1,20 +1,16 @@
 /**
- * Tool Override Example - Demonstrates overriding built-in tools
+ * Tool Registration Example - Demonstrates an audited file reader
  *
- * Extensions can register tools with the same name as built-in tools to replace them.
- * This is useful for:
+ * Extensions can register custom tools for workflows such as:
  * - Adding logging or auditing to tool calls
  * - Implementing access control or sandboxing
  * - Routing tool calls to remote systems (e.g., pi-ssh-remote)
  * - Modifying tool behavior for specific workflows
  *
- * This example overrides the `read` tool to:
+ * This example registers a `file_reader` tool to:
  * 1. Log all file access to a log file
  * 2. Block access to sensitive paths (e.g., .env files)
- * 3. Delegate to the original read implementation for allowed files
- *
- * Since no custom renderCall/renderResult are provided, the built-in renderer
- * is used automatically (syntax highlighting, line numbers, truncation warnings).
+ * 3. Read allowed files with basic truncation
  *
  * Usage:
  *   pi -e ./tool-override.ts
@@ -27,7 +23,7 @@ import { access, appendFile, readFile } from "fs/promises";
 import { join, resolve } from "path";
 import { Type } from "typebox";
 
-const LOG_FILE = join(getAgentDir(), "read-access.log");
+const LOG_FILE = join(getAgentDir(), "file-reader-access.log");
 
 // Paths that are blocked from reading
 const BLOCKED_PATTERNS = [
@@ -67,8 +63,8 @@ const readSchema = Type.Object({
 
 export default function (pi: ExtensionAPI) {
 	pi.registerTool({
-		name: "read", // Same name as built-in - this will override it
-		label: "read (audited)",
+		name: "file_reader",
+		label: "file reader (audited)",
 		description:
 			"Read the contents of a file with access logging. Some sensitive paths (.env, secrets, credentials) are blocked.",
 		parameters: readSchema,
@@ -124,12 +120,11 @@ export default function (pi: ExtensionAPI) {
 			}
 		},
 
-		// No renderCall/renderResult - uses built-in renderer automatically
-		// (syntax highlighting, line numbers, truncation warnings, etc.)
+		// No renderCall/renderResult - uses the generic tool renderer.
 	});
 
 	// Also register a command to view the access log
-	pi.registerCommand("read-log", {
+	pi.registerCommand("file-reader-log", {
 		description: "View the file access log",
 		handler: async (_args, ctx) => {
 			try {

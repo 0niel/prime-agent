@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Changed the default active built-in tool set to `ipython`.
+
+### Removed
+
+- Removed the legacy `read`, `write`, `grep`, `find`, and `ls` built-in tools.
+
 ## [0.74.0] - 2026-05-07
 
 ### Changed

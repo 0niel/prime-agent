@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createEditTool } from "../src/core/tools/edit.js";
 import { withFileMutationQueue } from "../src/core/tools/file-mutation-queue.js";
-import { createWriteTool } from "../src/core/tools/write.js";
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -86,7 +85,7 @@ describe("withFileMutationQueue", () => {
 	});
 });
 
-describe("built-in edit and write tools", () => {
+describe("built-in edit tool", () => {
 	it("preserves both parallel edits on the same file", async () => {
 		const dir = await createTempDir();
 		const filePath = join(dir, "parallel-edit.txt");
@@ -114,50 +113,5 @@ describe("built-in edit and write tools", () => {
 
 		const content = await readFile(filePath, "utf8");
 		expect(content).toBe("ALPHA\nBETA\ngamma\n");
-	});
-
-	it("shares the queue between edit and write", async () => {
-		const dir = await createTempDir();
-		const filePath = join(dir, "mixed.txt");
-		await writeFile(filePath, "original\n", "utf8");
-
-		const editTool = createEditTool(dir, {
-			operations: {
-				access,
-				readFile: async (path) => {
-					const buffer = await readFile(path);
-					await delay(30);
-					return buffer;
-				},
-				writeFile: async (path, content) => {
-					await delay(30);
-					await writeFile(path, content, "utf8");
-				},
-			},
-		});
-		const writeTool = createWriteTool(dir, {
-			operations: {
-				mkdir: async () => {},
-				writeFile: async (path, content) => {
-					await delay(10);
-					await writeFile(path, content, "utf8");
-				},
-			},
-		});
-
-		const editPromise = editTool.execute("call-1", {
-			path: filePath,
-			edits: [{ oldText: "original", newText: "edited" }],
-		});
-		await delay(5);
-		const writePromise = writeTool.execute("call-2", {
-			path: filePath,
-			content: "replacement\n",
-		});
-
-		await Promise.all([editPromise, writePromise]);
-
-		const content = await readFile(filePath, "utf8");
-		expect(content).toBe("replacement\n");
 	});
 });

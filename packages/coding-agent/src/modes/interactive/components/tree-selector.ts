@@ -846,22 +846,6 @@ class TreeList implements Component {
 		};
 
 		switch (name) {
-			case "read": {
-				const path = shortenPath(String(args.path || args.file_path || ""));
-				const offset = args.offset as number | undefined;
-				const limit = args.limit as number | undefined;
-				let display = path;
-				if (offset !== undefined || limit !== undefined) {
-					const start = offset ?? 1;
-					const end = limit !== undefined ? start + limit - 1 : "";
-					display += `:${start}${end ? `-${end}` : ""}`;
-				}
-				return `[read: ${display}]`;
-			}
-			case "write": {
-				const path = shortenPath(String(args.path || args.file_path || ""));
-				return `[write: ${path}]`;
-			}
 			case "edit": {
 				const path = shortenPath(String(args.path || args.file_path || ""));
 				return `[edit: ${path}]`;
@@ -874,19 +858,13 @@ class TreeList implements Component {
 					.slice(0, 50);
 				return `[bash: ${cmd}${rawCmd.length > 50 ? "..." : ""}]`;
 			}
-			case "grep": {
-				const pattern = String(args.pattern || "");
-				const path = shortenPath(String(args.path || "."));
-				return `[grep: /${pattern}/ in ${path}]`;
-			}
-			case "find": {
-				const pattern = String(args.pattern || "");
-				const path = shortenPath(String(args.path || "."));
-				return `[find: ${pattern} in ${path}]`;
-			}
-			case "ls": {
-				const path = shortenPath(String(args.path || "."));
-				return `[ls: ${path}]`;
+			case "ipython": {
+				const rawCode = String(args.code || "");
+				const code = rawCode
+					.replace(/[\n\t]/g, " ")
+					.trim()
+					.slice(0, 50);
+				return `[ipython: ${code}${rawCode.length > 50 ? "..." : ""}]`;
 			}
 			default: {
 				// Custom tool - show name and truncated JSON args

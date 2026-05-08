@@ -40,9 +40,6 @@ import {
   ModelRegistry,
   SessionManager,
   SettingsManager,
-  codingTools,
-  readOnlyTools,
-  readTool, bashTool, editTool, writeTool,
 } from "@earendil-works/pi-coding-agent";
 
 // Auth and models setup
@@ -63,8 +60,8 @@ const loader = new DefaultResourceLoader({
 await loader.reload();
 const { session } = await createAgentSession({ resourceLoader: loader, authStorage, modelRegistry });
 
-// Read-only
-const { session } = await createAgentSession({ tools: readOnlyTools, authStorage, modelRegistry });
+// Tool selection
+const { session } = await createAgentSession({ tools: ["ipython", "bash"], authStorage, modelRegistry });
 
 // In-memory
 const { session } = await createAgentSession({
@@ -92,7 +89,7 @@ const { session } = await createAgentSession({
   authStorage: customAuth,
   modelRegistry: customRegistry,
   resourceLoader,
-  tools: [readTool, bashTool],
+  tools: ["ipython", "bash"],
   customTools: [{ tool: myTool }],
   sessionManager: SessionManager.inMemory(),
   settingsManager: SettingsManager.inMemory(),
@@ -117,7 +114,7 @@ await session.prompt("Hello");
 | `agentDir` | `~/.pi/agent` | Config directory |
 | `model` | From settings/first available | Model to use |
 | `thinkingLevel` | From settings/"off" | off, low, medium, high |
-| `tools` | `codingTools` | Built-in tools |
+| `tools` | `["ipython"]` | Built-in tools |
 | `customTools` | `[]` | Additional tool definitions |
 | `resourceLoader` | DefaultResourceLoader | Resource loader for extensions, skills, prompts, themes |
 | `sessionManager` | `SessionManager.create(cwd)` | Persistence |

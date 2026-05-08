@@ -258,13 +258,13 @@ Before summarization, messages are serialized to text via [`serializeConversatio
 [User]: What they said
 [Assistant thinking]: Internal reasoning
 [Assistant]: Response text
-[Assistant tool calls]: read(path="foo.ts"); edit(path="bar.ts", ...)
+[Assistant tool calls]: ipython(code="open('foo.ts').read()"); edit(path="bar.ts", ...)
 [Tool result]: Output from tool
 ```
 
 This prevents the model from treating it as a conversation to continue.
 
-Tool results are truncated to 2000 characters during serialization. Content beyond that limit is replaced with a marker indicating how many characters were truncated. This keeps summarization requests within reasonable token budgets, since tool results (especially from `read` and `bash`) are typically the largest contributors to context size.
+Tool results are truncated to 2000 characters during serialization. Content beyond that limit is replaced with a marker indicating how many characters were truncated. This keeps summarization requests within reasonable token budgets, since tool results, especially from `ipython` and optional `bash`, are typically the largest contributors to context size.
 
 ## Custom Summarization via Extensions
 
@@ -322,7 +322,7 @@ pi.on("session_before_compact", async (event, ctx) => {
   // [User]: message text
   // [Assistant thinking]: thinking content
   // [Assistant]: response text
-  // [Assistant tool calls]: read(path="..."); bash(command="...")
+  // [Assistant tool calls]: ipython(code="open('...').read()"); bash(command="...")
   // [Tool result]: output text
 
   // Now send to your model for summarization

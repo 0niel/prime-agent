@@ -65,15 +65,8 @@ import type {
 	BashToolDetails,
 	BashToolInput,
 	EditToolInput,
-	FindToolDetails,
-	FindToolInput,
-	GrepToolDetails,
-	GrepToolInput,
-	LsToolDetails,
-	LsToolInput,
-	ReadToolDetails,
-	ReadToolInput,
-	WriteToolInput,
+	IpythonToolDetails,
+	IpythonToolInput,
 } from "../tools/index.js";
 
 export type { ExecOptions, ExecResult } from "../exec.js";
@@ -778,34 +771,14 @@ export interface BashToolCallEvent extends ToolCallEventBase {
 	input: BashToolInput;
 }
 
-export interface ReadToolCallEvent extends ToolCallEventBase {
-	toolName: "read";
-	input: ReadToolInput;
-}
-
 export interface EditToolCallEvent extends ToolCallEventBase {
 	toolName: "edit";
 	input: EditToolInput;
 }
 
-export interface WriteToolCallEvent extends ToolCallEventBase {
-	toolName: "write";
-	input: WriteToolInput;
-}
-
-export interface GrepToolCallEvent extends ToolCallEventBase {
-	toolName: "grep";
-	input: GrepToolInput;
-}
-
-export interface FindToolCallEvent extends ToolCallEventBase {
-	toolName: "find";
-	input: FindToolInput;
-}
-
-export interface LsToolCallEvent extends ToolCallEventBase {
-	toolName: "ls";
-	input: LsToolInput;
+export interface IpythonToolCallEvent extends ToolCallEventBase {
+	toolName: "ipython";
+	input: IpythonToolInput;
 }
 
 export interface CustomToolCallEvent extends ToolCallEventBase {
@@ -819,15 +792,7 @@ export interface CustomToolCallEvent extends ToolCallEventBase {
  * `event.input` is mutable. Mutate it in place to patch tool arguments before execution.
  * Later `tool_call` handlers see earlier mutations. No re-validation is performed after mutation.
  */
-export type ToolCallEvent =
-	| BashToolCallEvent
-	| ReadToolCallEvent
-	| EditToolCallEvent
-	| WriteToolCallEvent
-	| GrepToolCallEvent
-	| FindToolCallEvent
-	| LsToolCallEvent
-	| CustomToolCallEvent;
+export type ToolCallEvent = BashToolCallEvent | EditToolCallEvent | IpythonToolCallEvent | CustomToolCallEvent;
 
 interface ToolResultEventBase {
 	type: "tool_result";
@@ -842,34 +807,14 @@ export interface BashToolResultEvent extends ToolResultEventBase {
 	details: BashToolDetails | undefined;
 }
 
-export interface ReadToolResultEvent extends ToolResultEventBase {
-	toolName: "read";
-	details: ReadToolDetails | undefined;
-}
-
 export interface EditToolResultEvent extends ToolResultEventBase {
 	toolName: "edit";
 	details: EditToolDetails | undefined;
 }
 
-export interface WriteToolResultEvent extends ToolResultEventBase {
-	toolName: "write";
-	details: undefined;
-}
-
-export interface GrepToolResultEvent extends ToolResultEventBase {
-	toolName: "grep";
-	details: GrepToolDetails | undefined;
-}
-
-export interface FindToolResultEvent extends ToolResultEventBase {
-	toolName: "find";
-	details: FindToolDetails | undefined;
-}
-
-export interface LsToolResultEvent extends ToolResultEventBase {
-	toolName: "ls";
-	details: LsToolDetails | undefined;
+export interface IpythonToolResultEvent extends ToolResultEventBase {
+	toolName: "ipython";
+	details: IpythonToolDetails | undefined;
 }
 
 export interface CustomToolResultEvent extends ToolResultEventBase {
@@ -880,35 +825,19 @@ export interface CustomToolResultEvent extends ToolResultEventBase {
 /** Fired after a tool executes. Can modify result. */
 export type ToolResultEvent =
 	| BashToolResultEvent
-	| ReadToolResultEvent
 	| EditToolResultEvent
-	| WriteToolResultEvent
-	| GrepToolResultEvent
-	| FindToolResultEvent
-	| LsToolResultEvent
+	| IpythonToolResultEvent
 	| CustomToolResultEvent;
 
 // Type guards for ToolResultEvent
 export function isBashToolResult(e: ToolResultEvent): e is BashToolResultEvent {
 	return e.toolName === "bash";
 }
-export function isReadToolResult(e: ToolResultEvent): e is ReadToolResultEvent {
-	return e.toolName === "read";
-}
 export function isEditToolResult(e: ToolResultEvent): e is EditToolResultEvent {
 	return e.toolName === "edit";
 }
-export function isWriteToolResult(e: ToolResultEvent): e is WriteToolResultEvent {
-	return e.toolName === "write";
-}
-export function isGrepToolResult(e: ToolResultEvent): e is GrepToolResultEvent {
-	return e.toolName === "grep";
-}
-export function isFindToolResult(e: ToolResultEvent): e is FindToolResultEvent {
-	return e.toolName === "find";
-}
-export function isLsToolResult(e: ToolResultEvent): e is LsToolResultEvent {
-	return e.toolName === "ls";
+export function isIpythonToolResult(e: ToolResultEvent): e is IpythonToolResultEvent {
+	return e.toolName === "ipython";
 }
 
 /**
@@ -932,12 +861,8 @@ export function isLsToolResult(e: ToolResultEvent): e is LsToolResultEvent {
  * CustomToolCallEvent.toolName is `string` which overlaps with all literals.
  */
 export function isToolCallEventType(toolName: "bash", event: ToolCallEvent): event is BashToolCallEvent;
-export function isToolCallEventType(toolName: "read", event: ToolCallEvent): event is ReadToolCallEvent;
 export function isToolCallEventType(toolName: "edit", event: ToolCallEvent): event is EditToolCallEvent;
-export function isToolCallEventType(toolName: "write", event: ToolCallEvent): event is WriteToolCallEvent;
-export function isToolCallEventType(toolName: "grep", event: ToolCallEvent): event is GrepToolCallEvent;
-export function isToolCallEventType(toolName: "find", event: ToolCallEvent): event is FindToolCallEvent;
-export function isToolCallEventType(toolName: "ls", event: ToolCallEvent): event is LsToolCallEvent;
+export function isToolCallEventType(toolName: "ipython", event: ToolCallEvent): event is IpythonToolCallEvent;
 export function isToolCallEventType<TName extends string, TInput extends Record<string, unknown>>(
 	toolName: TName,
 	event: ToolCallEvent,

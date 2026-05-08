@@ -27,30 +27,26 @@ describe("buildSystemPrompt", () => {
 	});
 
 	describe("default tools", () => {
-		test("includes all default tools when snippets are provided", () => {
+		test("includes the default ipython tool when snippets are provided", () => {
 			const prompt = buildSystemPrompt({
 				toolSnippets: {
-					read: "Read file contents",
-					bash: "Execute bash commands",
-					edit: "Make surgical edits",
-					write: "Create or overwrite files",
+					ipython: "Execute Python in a persistent kernel",
 				},
 				contextFiles: [],
 				skills: [],
 				cwd: process.cwd(),
 			});
 
-			expect(prompt).toContain("- read:");
-			expect(prompt).toContain("- bash:");
-			expect(prompt).toContain("- edit:");
-			expect(prompt).toContain("- write:");
+			expect(prompt).toContain("- ipython:");
+			expect(prompt).not.toContain("- bash:");
+			expect(prompt).not.toContain("- edit:");
 		});
 	});
 
 	describe("custom tool snippets", () => {
 		test("includes custom tools in available tools section when promptSnippet is provided", () => {
 			const prompt = buildSystemPrompt({
-				selectedTools: ["read", "dynamic_tool"],
+				selectedTools: ["ipython", "dynamic_tool"],
 				toolSnippets: {
 					dynamic_tool: "Run dynamic test behavior",
 				},
@@ -64,7 +60,7 @@ describe("buildSystemPrompt", () => {
 
 		test("omits custom tools from available tools section when promptSnippet is not provided", () => {
 			const prompt = buildSystemPrompt({
-				selectedTools: ["read", "dynamic_tool"],
+				selectedTools: ["ipython", "dynamic_tool"],
 				contextFiles: [],
 				skills: [],
 				cwd: process.cwd(),
@@ -77,7 +73,7 @@ describe("buildSystemPrompt", () => {
 	describe("prompt guidelines", () => {
 		test("appends promptGuidelines to default guidelines", () => {
 			const prompt = buildSystemPrompt({
-				selectedTools: ["read", "dynamic_tool"],
+				selectedTools: ["ipython", "dynamic_tool"],
 				promptGuidelines: ["Use dynamic_tool for project summaries."],
 				contextFiles: [],
 				skills: [],
@@ -89,7 +85,7 @@ describe("buildSystemPrompt", () => {
 
 		test("deduplicates and trims promptGuidelines", () => {
 			const prompt = buildSystemPrompt({
-				selectedTools: ["read", "dynamic_tool"],
+				selectedTools: ["ipython", "dynamic_tool"],
 				promptGuidelines: ["Use dynamic_tool for summaries.", "  Use dynamic_tool for summaries.  ", "   "],
 				contextFiles: [],
 				skills: [],

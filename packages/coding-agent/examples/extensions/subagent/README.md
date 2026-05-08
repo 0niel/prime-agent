@@ -56,7 +56,7 @@ done
 
 This tool executes a separate `pi` subprocess with a delegated system prompt and tool/model configuration.
 
-**Project-local agents** (`.pi/agents/*.md`) are repo-controlled prompts that can instruct the model to read files, run bash commands, etc.
+**Project-local agents** (`.pi/agents/*.md`) are repo-controlled prompts that can instruct the model to run ipython, bash commands, etc.
 
 **Default behavior:** Only loads **user-level agents** from `~/.pi/agent/agents`.
 
@@ -78,7 +78,7 @@ Run 2 scouts in parallel: one to find models, one to find providers
 
 ### Chained workflow
 ```
-Use a chain: first have scout find the read tool, then have planner suggest improvements
+Use a chain: first have scout find the ipython tool, then have planner suggest improvements
 ```
 
 ### Workflow prompts
@@ -114,11 +114,10 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 - Updates as each task makes progress
 - Shows "2/3 done, 1 running" status
 
-**Tool call formatting** (mimics built-in tools):
+**Tool call formatting**:
 - `$ command` for bash
-- `read ~/path:1-10` for read
-- `grep /pattern/ in ~/path` for grep
-- etc.
+- `ipython code` for ipython
+- `edit ~/path` for edit
 
 ## Agent Definitions
 
@@ -128,7 +127,7 @@ Agents are markdown files with YAML frontmatter:
 ---
 name: my-agent
 description: What this agent does
-tools: read, grep, find, ls
+tools: bash
 model: claude-haiku-4-5
 ---
 
@@ -145,9 +144,9 @@ Project agents override user agents with the same name when `agentScope: "both"`
 
 | Agent | Purpose | Model | Tools |
 |-------|---------|-------|-------|
-| `scout` | Fast codebase recon | Haiku | read, grep, find, ls, bash |
-| `planner` | Implementation plans | Sonnet | read, grep, find, ls |
-| `reviewer` | Code review | Sonnet | read, grep, find, ls, bash |
+| `scout` | Fast codebase recon | Haiku | bash |
+| `planner` | Implementation plans | Sonnet | bash |
+| `reviewer` | Code review | Sonnet | bash |
 | `worker` | General-purpose | Sonnet | (all default) |
 
 ## Workflow Prompts

@@ -12,16 +12,16 @@
 
 import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 
-// Read-only mode (no edit/write)
+// Default tool surface
 await createAgentSession({
-	tools: ["read", "grep", "find", "ls"],
+	tools: ["ipython"],
 	sessionManager: SessionManager.inMemory(),
 });
-console.log("Read-only session created");
+console.log("IPython session created");
 
 // Custom tool selection
 await createAgentSession({
-	tools: ["read", "bash", "grep"],
+	tools: ["ipython", "bash"],
 	sessionManager: SessionManager.inMemory(),
 });
 console.log("Custom tools session created");
@@ -30,7 +30,7 @@ console.log("Custom tools session created");
 const customCwd = "/path/to/project";
 await createAgentSession({
 	cwd: customCwd,
-	tools: ["read", "bash", "edit", "write"],
+	tools: ["ipython", "bash", "edit"],
 	sessionManager: SessionManager.inMemory(customCwd),
 });
 console.log("Custom cwd session created");
@@ -38,7 +38,7 @@ console.log("Custom cwd session created");
 // Or pick specific tools for custom cwd
 await createAgentSession({
 	cwd: customCwd,
-	tools: ["read", "bash", "grep"],
+	tools: ["bash", "edit"],
 	sessionManager: SessionManager.inMemory(customCwd),
 });
 console.log("Specific tools with custom cwd session created");

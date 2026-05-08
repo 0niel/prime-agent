@@ -72,22 +72,18 @@ export type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
-	FindToolCallEvent,
-	FindToolResultEvent,
 	GetActiveToolsHandler,
 	GetAllToolsHandler,
 	GetCommandsHandler,
 	GetThinkingLevelHandler,
-	GrepToolCallEvent,
-	GrepToolResultEvent,
 	// Events - Input
 	InputEvent,
 	InputEventResult,
 	InputSource,
+	IpythonToolCallEvent,
+	IpythonToolResultEvent,
 	KeybindingsManager,
 	LoadExtensionsResult,
-	LsToolCallEvent,
-	LsToolResultEvent,
 	// Events - Message
 	MessageEndEvent,
 	// Message Rendering
@@ -100,8 +96,6 @@ export type {
 	// Provider Registration
 	ProviderConfig,
 	ProviderModelConfig,
-	ReadToolCallEvent,
-	ReadToolResultEvent,
 	// Commands
 	RegisteredCommand,
 	RegisteredTool,
@@ -154,19 +148,13 @@ export type {
 	UserBashEventResult,
 	WidgetPlacement,
 	WorkingIndicatorOptions,
-	WriteToolCallEvent,
-	WriteToolResultEvent,
 } from "./types.js";
 // Type guards
 export {
 	defineTool,
 	isBashToolResult,
 	isEditToolResult,
-	isFindToolResult,
-	isGrepToolResult,
-	isLsToolResult,
-	isReadToolResult,
+	isIpythonToolResult,
 	isToolCallEventType,
-	isWriteToolResult,
 } from "./types.js";
 export { wrapRegisteredTool, wrapRegisteredTools } from "./wrapper.js";
