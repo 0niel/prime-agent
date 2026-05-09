@@ -232,24 +232,27 @@ export class KernelManager {
 		this.connection = info;
 		this.tempDir = tempDir;
 
-		this.kernel = spawn(this.options.python, ["-m", "ipykernel_launcher", "-f", connectionPath], {
+		const kernel = spawn(this.options.python, ["-m", "ipykernel_launcher", "-f", connectionPath], {
 			cwd: this.options.cwd,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
+		this.kernel = kernel;
 
-		this.kernel.stderr?.on("data", (buf: Buffer) => {
+		kernel.stderr?.on("data", (buf: Buffer) => {
 			const s = buf.toString();
 			this.kernelStderr += s;
 			process.stderr.write(`[kernel] ${s}`);
 		});
 
-		this.kernel.on("error", (err) => {
+		kernel.on("error", (err) => {
+			if (this.kernel !== kernel) return;
 			console.error(`[kernel] spawn error: ${err.message}`);
 			this.state = "shutdown";
 			liveKernels.delete(this);
 		});
 
-		this.kernel.on("exit", (code, signal) => {
+		kernel.on("exit", (code, signal) => {
+			if (this.kernel !== kernel) return;
 			if (this.state !== "shutdown") {
 				console.error(`[kernel] unexpected exit code=${code} signal=${signal}`);
 			}
@@ -272,6 +275,7 @@ export class KernelManager {
 			await this.probeReady();
 		} catch (e) {
 			await this.shutdown();
+			this.state = "idle";
 			throw e;
 		}
 
@@ -444,9 +448,31 @@ export class KernelManager {
 		await this.control.send(encode(msg, this.connection.key));
 	}
 
+	private cleanupResources(): void {
+		this.shell?.close();
+		this.iopub?.close();
+		this.control?.close();
+		this.shell = undefined;
+		this.iopub = undefined;
+		this.control = undefined;
+		try {
+			this.kernel?.kill("SIGTERM");
+		} catch {}
+		this.kernel = undefined;
+		this.connection = undefined;
+		if (this.tempDir) {
+			try {
+				rmSync(this.tempDir, { recursive: true, force: true });
+			} catch {}
+		}
+		this.tempDir = undefined;
+		this.startPromise = undefined;
+	}
+
 	async shutdown(): Promise<void> {
 		if (this.state === "shutdown") {
 			liveKernels.delete(this);
+			this.cleanupResources();
 			return;
 		}
 		this.state = "shutdown";
@@ -460,16 +486,24 @@ export class KernelManager {
 			}
 		} catch {}
 
-		this.shell?.close();
-		this.iopub?.close();
-		this.control?.close();
+		this.cleanupResources();
+	}
+
+	async restart(): Promise<void> {
+		const prev = this.executionQueue;
+		let resolveNext: () => void = () => {};
+		this.executionQueue = new Promise<void>((r) => {
+			resolveNext = r;
+		});
+		await prev;
+
 		try {
-			this.kernel?.kill("SIGTERM");
-		} catch {}
-		if (this.tempDir) {
-			try {
-				rmSync(this.tempDir, { recursive: true, force: true });
-			} catch {}
+			await this.shutdown();
+			this.state = "idle";
+			this.kernelStderr = "";
+			await this.start();
+		} finally {
+			resolveNext();
 		}
 	}
 
@@ -477,17 +511,7 @@ export class KernelManager {
 	dispose(): void {
 		this.state = "shutdown";
 		liveKernels.delete(this);
-		this.shell?.close();
-		this.iopub?.close();
-		this.control?.close();
-		try {
-			this.kernel?.kill("SIGTERM");
-		} catch {}
-		if (this.tempDir) {
-			try {
-				rmSync(this.tempDir, { recursive: true, force: true });
-			} catch {}
-		}
+		this.cleanupResources();
 	}
 
 	get isRunning(): boolean {

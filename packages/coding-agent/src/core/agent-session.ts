@@ -76,6 +76,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
+import type { KernelManager } from "./kernel/index.js";
 import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
@@ -296,6 +297,7 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
+	private _ipythonKernelManagerRef: { current?: KernelManager } = {};
 
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
@@ -1577,6 +1579,10 @@ export class AgentSession {
 		return this.model ? (clampThinkingLevel(this.model, level) as ThinkingLevel) : "off";
 	}
 
+	private async _restartIpythonKernelAfterCompaction(): Promise<void> {
+		await this._ipythonKernelManagerRef.current?.restart();
+	}
+
 	// =========================================================================
 	// Queue Mode Management
 	// =========================================================================
@@ -1705,6 +1711,7 @@ export class AgentSession {
 					fromExtension,
 				});
 			}
+			await this._restartIpythonKernelAfterCompaction();
 
 			const compactionResult = {
 				summary,
@@ -1977,6 +1984,7 @@ export class AgentSession {
 					fromExtension,
 				});
 			}
+			await this._restartIpythonKernelAfterCompaction();
 
 			const result: CompactionResult = {
 				summary,
@@ -2342,6 +2350,7 @@ export class AgentSession {
 					]),
 				)
 			: createAllToolDefinitions(this._cwd, {
+					ipython: { kernelManagerRef: this._ipythonKernelManagerRef },
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 				});
 

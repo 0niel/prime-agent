@@ -24,6 +24,8 @@ export interface IpythonToolDetails {
 export interface IpythonToolOptions {
 	/** Defaults to {@link resolveKernelPython}. Must have `ipykernel` installed. */
 	python?: string;
+	/** Filled after the first kernel start so the owning session can restart it after compaction. */
+	kernelManagerRef?: { current?: KernelManager };
 }
 
 export function createIpythonToolDefinition(
@@ -34,6 +36,9 @@ export function createIpythonToolDefinition(
 	// same in-flight startup instead of creating two managers or skipping the
 	// not-yet-finished start().
 	let managerPromise: Promise<KernelManager> | undefined;
+	if (options?.kernelManagerRef) {
+		options.kernelManagerRef.current = undefined;
+	}
 
 	function getManager(): Promise<KernelManager> {
 		if (!managerPromise) {
@@ -46,6 +51,9 @@ export function createIpythonToolDefinition(
 				}
 				const m = new KernelManager({ python, cwd });
 				await m.start();
+				if (options?.kernelManagerRef) {
+					options.kernelManagerRef.current = m;
+				}
 				return m;
 			})();
 		}

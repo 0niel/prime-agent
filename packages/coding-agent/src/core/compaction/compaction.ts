@@ -484,6 +484,9 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
+const KERNEL_RESTART_SUMMARY_WARNING =
+	"Note: the IPython kernel will be restarted after this summary. Python variables, imports, and in-memory state will be wiped. Files on disk are preserved — capture file paths and what they contain so the next agent can resume without redoing work.";
+
 const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
 
 Update the existing structured summary with new information. RULES:
@@ -545,6 +548,7 @@ export async function generateSummary(
 	if (customInstructions) {
 		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
 	}
+	basePrompt = `${basePrompt}\n\n${KERNEL_RESTART_SUMMARY_WARNING}`;
 
 	// Serialize conversation to text so model doesn't try to continue it
 	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
