@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added automatic IPython kernel runtime bootstrap with uv-managed Python, `ipykernel`, and `prime-agent-runtime`.
+
 ### Changed
 
 - Changed the default active built-in tool set to `ipython`.

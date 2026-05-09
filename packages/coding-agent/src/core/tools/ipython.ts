@@ -2,7 +2,7 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
 import type { ToolDefinition } from "../extensions/types.js";
-import { KernelManager, resolveKernelPython } from "../kernel/index.js";
+import { KernelManager } from "../kernel/index.js";
 import type { RlmRunHandler } from "../rlm-runtime.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
@@ -17,7 +17,7 @@ except Exception as _prime_agent_rlm_error:
         async def run(self, prompt, **kwargs):
             raise RuntimeError(
                 "prime-agent-runtime is not installed in this IPython kernel. "
-                "Run ./scripts/setup-kernel-venv.sh from the repo root, or set "
+                "Remove ~/.prime/agent/kernel-venv so prime-agent can rebuild it, or set "
                 "PRIME_AGENT_KERNEL_PYTHON to a kernel environment with prime-agent-runtime installed. "
                 f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
             )
@@ -45,7 +45,7 @@ export interface IpythonToolDetails {
 }
 
 export interface IpythonToolOptions {
-	/** Defaults to {@link resolveKernelPython}. Must have `ipykernel` installed. */
+	/** Python override. Must have `ipykernel` installed. */
 	python?: string;
 	env?: Record<string, string>;
 	sessionId?: string;
@@ -69,14 +69,8 @@ export function createIpythonToolDefinition(
 	function getManager(): Promise<KernelManager> {
 		if (!managerPromise) {
 			managerPromise = (async () => {
-				const python = options?.python ?? resolveKernelPython();
-				if (!python) {
-					throw new Error(
-						"No Python interpreter with `ipykernel` was found. Run `./scripts/setup-kernel-venv.sh` from the repo root, or set PRIME_AGENT_KERNEL_PYTHON to point at a python that has ipykernel installed.",
-					);
-				}
 				const m = new KernelManager({
-					python,
+					python: options?.python,
 					cwd,
 					env: options?.env,
 					sessionId: options?.sessionId,

@@ -69,11 +69,11 @@ packages/coding-agent/src/core/rlm-runtime.ts
   TypeScript request/result types for the rlm.run bridge.
 
 prime-agent-runtime/src/rlm/__init__.py
-  Python shim installed into .kernel-venv. Exposes rlm, rlm.run(),
+  Python shim installed into ~/.prime/agent/kernel-venv. Exposes rlm, rlm.run(),
   RLMResult, and TokenUsage.
 
 scripts/setup-kernel-venv.sh
-  Creates .kernel-venv and installs ipykernel plus prime-agent-runtime.
+  Thin wrapper around the automatic kernel bootstrap.
 ```
 
 ## ZeroMQ Jupyter Kernel Setup
@@ -174,6 +174,11 @@ Startup sequence:
 ```text
 KernelManager.start()
   |
+  | ensureKernelPython()
+  |   bootstraps ~/.prime/agent/kernel-venv with uv if needed
+  v
+resolved python with ipykernel and prime-agent-runtime
+  |
   v
 makeConnection()
   |
@@ -255,13 +260,15 @@ Process-wide cleanup is registered through `registerSessionResourceCleanup()`. K
 
 ## IPython Tool Bootstrapping
 
-The ipython tool constructs a `KernelManager` lazily on first use. It resolves Python in this order:
+The ipython tool constructs a `KernelManager` lazily on first use. `KernelManager.start()` resolves Python in this order:
 
 ```text
-PRIME_AGENT_KERNEL_PYTHON
-~/.prime-agent/kernel-venv/bin/python
-<repo>/.kernel-venv/bin/python
+PRIME_AGENT_KERNEL_PYTHON, if set and able to import ipykernel
+~/.prime/agent/kernel-venv/bin/python, bootstrapped by uv if needed
+$XDG_DATA_HOME/prime/agent/kernel-venv/bin/python, only if ~/.prime is not writable
 ```
+
+The automatic bootstrap installs Python 3.11, `ipykernel`, and `prime-agent-runtime`, then writes `.bootstrap-version` in the venv. Missing or stale markers cause a rebuild.
 
 After the kernel starts, the tool bootstraps `rlm` into the user namespace:
 
@@ -595,9 +602,9 @@ Those stay in TypeScript so children share the parent harness implementation:
 Common failures and where they surface:
 
 ```text
-prime-agent-runtime missing from .kernel-venv
+prime-agent-runtime missing from the kernel environment
   -> kernel startup succeeds
-  -> rlm.run raises RuntimeError with setup instructions when called
+  -> rlm.run raises RuntimeError with rebuild or PRIME_AGENT_KERNEL_PYTHON instructions when called
 
 RLM_DEPTH >= RLM_MAX_DEPTH
   -> Python RuntimeError before comm_open

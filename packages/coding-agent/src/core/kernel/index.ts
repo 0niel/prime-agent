@@ -1,7 +1,7 @@
 // TODO: reconsider persistent kernel vs stateless `python -c` once RLM-1 weights land.
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -9,6 +9,7 @@ import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
 import type { RlmRunHandler, RlmRunResult } from "../rlm-runtime.js";
+import { ensureKernelPython } from "./bootstrap.js";
 
 const DELIM = Buffer.from("<IDS|MSG>");
 const PROTOCOL_VERSION = "5.3";
@@ -18,8 +19,8 @@ const DEFAULT_MAX_OUTPUT_CHARS = 65536;
 const RLM_DISPOSE_TIMEOUT_MS = 5000;
 
 export interface KernelManagerOptions {
-	/** Python interpreter that has `ipykernel` available. */
-	python: string;
+	/** Python interpreter that has `ipykernel` available. Defaults to the auto-bootstrapped kernel. */
+	python?: string;
 	cwd?: string;
 	env?: Record<string, string>;
 	sessionId?: string;
@@ -207,8 +208,8 @@ function installSignalHandlersOnce(): void {
 // ---- kernel manager ------------------------------------------------------
 
 export class KernelManager {
-	private readonly options: Required<Pick<KernelManagerOptions, "python" | "username">> &
-		Pick<KernelManagerOptions, "cwd" | "env" | "sessionId" | "rlmRunHandler">;
+	private readonly options: Pick<KernelManagerOptions, "python" | "cwd" | "env" | "sessionId" | "rlmRunHandler"> &
+		Required<Pick<KernelManagerOptions, "username">>;
 	private readonly session = uuid();
 	private readonly commTargets = new Map<string, string>();
 	private readonly handledRlmCommIds = new Set<string>();
@@ -227,9 +228,6 @@ export class KernelManager {
 	private startPromise?: Promise<void>;
 
 	constructor(options: KernelManagerOptions) {
-		if (!existsSync(options.python)) {
-			throw new Error(`Python interpreter not found: ${options.python}`);
-		}
 		this.options = {
 			python: options.python,
 			cwd: options.cwd,
@@ -256,11 +254,20 @@ export class KernelManager {
 		this.state = "starting";
 		installSignalHandlersOnce();
 
+		let python: string;
+		try {
+			python = this.options.python ?? (await ensureKernelPython());
+			this.options.python = python;
+		} catch (error) {
+			this.state = "idle";
+			throw error;
+		}
+
 		const { info, path: connectionPath, tempDir } = makeConnection();
 		this.connection = info;
 		this.tempDir = tempDir;
 
-		const kernel = spawn(this.options.python, ["-m", "ipykernel_launcher", "-f", connectionPath], {
+		const kernel = spawn(python, ["-m", "ipykernel_launcher", "-f", connectionPath], {
 			cwd: this.options.cwd,
 			env: this.options.env ? { ...process.env, ...this.options.env } : process.env,
 			stdio: ["ignore", "pipe", "pipe"],
@@ -681,30 +688,4 @@ export class KernelManager {
 	get isRunning(): boolean {
 		return this.state === "running";
 	}
-}
-
-// ---- Python interpreter resolution ---------------------------------------
-
-/**
- * Resolve the Python interpreter to use for the kernel. Searched in order:
- *   1. PRIME_AGENT_KERNEL_PYTHON env var
- *   2. ~/.prime-agent/kernel-venv/bin/python (canonical user-install location)
- *   3. <repo>/.kernel-venv/bin/python (development; created by scripts/setup-kernel-venv.sh)
- */
-export function resolveKernelPython(): string | null {
-	const envOverride = process.env.PRIME_AGENT_KERNEL_PYTHON;
-	if (envOverride && existsSync(envOverride)) return envOverride;
-
-	const home = process.env.HOME;
-	if (home) {
-		const canonical = join(home, ".prime-agent", "kernel-venv", "bin", "python");
-		if (existsSync(canonical)) return canonical;
-	}
-
-	for (let dir = process.cwd(); dir !== "/"; dir = join(dir, "..")) {
-		const candidate = join(dir, ".kernel-venv", "bin", "python");
-		if (existsSync(candidate)) return candidate;
-	}
-
-	return null;
 }
