@@ -14,6 +14,12 @@ export { ExtensionEditorComponent } from "./extension-editor.js";
 export { ExtensionInputComponent } from "./extension-input.js";
 export { ExtensionSelectorComponent } from "./extension-selector.js";
 export { FooterComponent } from "./footer.js";
+export {
+	getIpythonCodeFromArgs,
+	IPythonCellComponent,
+	type IPythonCellContentBlock,
+	type IPythonCellState,
+} from "./ipython-cell.js";
 export { keyHint, keyText, rawKeyHint } from "./keybinding-hints.js";
 export { LoginDialogComponent } from "./login-dialog.js";
 export { ModelSelectorComponent } from "./model-selector.js";
@@ -23,6 +29,13 @@ export { SessionSelectorComponent } from "./session-selector.js";
 export { type SettingsCallbacks, type SettingsConfig, SettingsSelectorComponent } from "./settings-selector.js";
 export { ShowImagesSelectorComponent } from "./show-images-selector.js";
 export { SkillInvocationMessageComponent } from "./skill-invocation-message.js";
+export {
+	type SubAgentStatus,
+	type SubAgentTranscriptLine,
+	SubAgentTreeComponent,
+	type SubAgentTreeNode,
+	type SubAgentTreeOptions,
+} from "./sub-agent-tree.js";
 export { ThemeSelectorComponent } from "./theme-selector.js";
 export { ThinkingSelectorComponent } from "./thinking-selector.js";
 export { ToolExecutionComponent, type ToolExecutionOptions } from "./tool-execution.js";

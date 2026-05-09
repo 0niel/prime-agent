@@ -4,6 +4,7 @@ import { createAllToolDefinitions, type ToolName } from "../../../core/tools/ind
 import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.js";
 import { convertToPng } from "../../../utils/image-convert.js";
 import { theme } from "../theme/theme.js";
+import { getIpythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.js";
 
 export interface ToolExecutionOptions {
 	showImages?: boolean;
@@ -16,6 +17,7 @@ export class ToolExecutionComponent extends Container {
 	private selfRenderContainer: Container;
 	private callRendererComponent?: Component;
 	private resultRendererComponent?: Component;
+	private ipythonCellComponent?: IPythonCellComponent;
 	private rendererState: any = {};
 	private imageComponents: Image[] = [];
 	private imageSpacers: Spacer[] = [];
@@ -103,6 +105,9 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private getRenderShell(): "default" | "self" {
+		if (this.shouldUseIpythonRenderer()) {
+			return "self";
+		}
 		if (!this.builtInToolDefinition) {
 			return this.toolDefinition?.renderShell ?? "default";
 		}
@@ -110,6 +115,10 @@ export class ToolExecutionComponent extends Container {
 			return this.builtInToolDefinition.renderShell ?? "default";
 		}
 		return this.toolDefinition.renderShell ?? this.builtInToolDefinition.renderShell ?? "default";
+	}
+
+	private shouldUseIpythonRenderer(): boolean {
+		return this.toolName === "ipython" && !this.toolDefinition?.renderCall && !this.toolDefinition?.renderResult;
 	}
 
 	private getRenderContext(lastComponent: Component | undefined): ToolRenderContext {
@@ -241,48 +250,69 @@ export class ToolExecutionComponent extends Container {
 			}
 			renderContainer.clear();
 
-			const callRenderer = this.getCallRenderer();
-			if (!callRenderer) {
-				renderContainer.addChild(this.createCallFallback());
+			if (this.shouldUseIpythonRenderer()) {
+				const state = {
+					code: getIpythonCodeFromArgs(this.args),
+					content: this.result?.content,
+					details: this.result?.details,
+					isPartial: this.isPartial,
+					isError: this.result?.isError ?? false,
+					expanded: this.expanded,
+					executionStarted: this.executionStarted,
+					argsComplete: this.argsComplete,
+					showImages: this.showImages,
+				};
+				if (!this.ipythonCellComponent) {
+					this.ipythonCellComponent = new IPythonCellComponent(state);
+				} else {
+					this.ipythonCellComponent.update(state);
+				}
+				renderContainer.addChild(this.ipythonCellComponent);
 				hasContent = true;
 			} else {
-				try {
-					const component = callRenderer(this.args, theme, this.getRenderContext(this.callRendererComponent));
-					this.callRendererComponent = component;
-					renderContainer.addChild(component);
-					hasContent = true;
-				} catch {
-					this.callRendererComponent = undefined;
+				const callRenderer = this.getCallRenderer();
+				if (!callRenderer) {
 					renderContainer.addChild(this.createCallFallback());
 					hasContent = true;
-				}
-			}
-
-			if (this.result) {
-				const resultRenderer = this.getResultRenderer();
-				if (!resultRenderer) {
-					const component = this.createResultFallback();
-					if (component) {
-						renderContainer.addChild(component);
-						hasContent = true;
-					}
 				} else {
 					try {
-						const component = resultRenderer(
-							{ content: this.result.content as any, details: this.result.details },
-							{ expanded: this.expanded, isPartial: this.isPartial },
-							theme,
-							this.getRenderContext(this.resultRendererComponent),
-						);
-						this.resultRendererComponent = component;
+						const component = callRenderer(this.args, theme, this.getRenderContext(this.callRendererComponent));
+						this.callRendererComponent = component;
 						renderContainer.addChild(component);
 						hasContent = true;
 					} catch {
-						this.resultRendererComponent = undefined;
+						this.callRendererComponent = undefined;
+						renderContainer.addChild(this.createCallFallback());
+						hasContent = true;
+					}
+				}
+
+				if (this.result) {
+					const resultRenderer = this.getResultRenderer();
+					if (!resultRenderer) {
 						const component = this.createResultFallback();
 						if (component) {
 							renderContainer.addChild(component);
 							hasContent = true;
+						}
+					} else {
+						try {
+							const component = resultRenderer(
+								{ content: this.result.content as any, details: this.result.details },
+								{ expanded: this.expanded, isPartial: this.isPartial },
+								theme,
+								this.getRenderContext(this.resultRendererComponent),
+							);
+							this.resultRendererComponent = component;
+							renderContainer.addChild(component);
+							hasContent = true;
+						} catch {
+							this.resultRendererComponent = undefined;
+							const component = this.createResultFallback();
+							if (component) {
+								renderContainer.addChild(component);
+								hasContent = true;
+							}
 						}
 					}
 				}
