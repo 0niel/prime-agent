@@ -20,6 +20,9 @@ uv venv --python 3.12 .kernel-venv
 echo ">>> installing ipykernel"
 uv pip install --python .kernel-venv/bin/python ipykernel
 
+echo ">>> installing prime-agent-runtime"
+uv pip install --python .kernel-venv/bin/python -e ./prime-agent-runtime
+
 echo
 echo "Done. The ipython tool will use this venv automatically."
 echo "Override with PRIME_AGENT_KERNEL_PYTHON=/path/to/python."

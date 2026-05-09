@@ -68,3 +68,4 @@ For the full first-run flow, see [Quickstart](quickstart.md).
 ## Development
 
 - [Development](development.md) - local setup, project structure, and debugging.
+- [Kernel and RLM Recursion](kernel-and-rlm-recursion.md) - ZeroMQ kernel transport and recursive sub-agent execution.

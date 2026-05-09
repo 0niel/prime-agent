@@ -26,6 +26,7 @@ describe("buildRlmPrompt", () => {
 			messagesPath: "/repo/.pi/sessions/session.jsonl",
 			installedSkills: ["websearch"],
 			activeTools: ["ipython"],
+			allowRecursion: false,
 		});
 
 		expect(prompt).toBe(
@@ -60,6 +61,8 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("You are a coding agent.");
 		expect(prompt).toContain("Working directory: /repo");
 		expect(prompt).toContain("Conversation log: /repo/.pi/sessions/session.jsonl");
+		expect(prompt).toContain("await rlm('sub-task')");
+		expect(prompt).toContain("asyncio.gather");
 		expect(prompt).toContain("Call at most one built-in tool per turn.");
 		expect(prompt).not.toContain("# IPython Kernel Guidance");
 		expect(prompt).not.toContain("Available tools:");

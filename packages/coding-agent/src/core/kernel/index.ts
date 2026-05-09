@@ -8,6 +8,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
+import type { RlmRunHandler, RlmRunResult } from "../rlm-runtime.js";
 
 const DELIM = Buffer.from("<IDS|MSG>");
 const PROTOCOL_VERSION = "5.3";
@@ -19,6 +20,9 @@ export interface KernelManagerOptions {
 	/** Python interpreter that has `ipykernel` available. */
 	python: string;
 	cwd?: string;
+	env?: Record<string, string>;
+	sessionId?: string;
+	rlmRunHandler?: RlmRunHandler;
 	/** Default: "prime-agent". */
 	username?: string;
 }
@@ -66,6 +70,14 @@ interface JupyterMessage {
 	parent_header: Record<string, unknown>;
 	metadata: Record<string, unknown>;
 	content: Record<string, unknown>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 // ---- wire format ---------------------------------------------------------
@@ -158,8 +170,12 @@ function makeConnection(): { info: ConnectionInfo; path: string; tempDir: string
 const liveKernels = new Set<KernelManager>();
 let signalHandlersInstalled = false;
 
-registerSessionResourceCleanup(() => {
-	for (const k of liveKernels) k.dispose();
+registerSessionResourceCleanup((sessionId) => {
+	for (const k of liveKernels) {
+		if (!sessionId || k.ownerSessionId === sessionId) {
+			k.dispose();
+		}
+	}
 });
 
 function installSignalHandlersOnce(): void {
@@ -190,8 +206,11 @@ function installSignalHandlersOnce(): void {
 // ---- kernel manager ------------------------------------------------------
 
 export class KernelManager {
-	private readonly options: Required<Omit<KernelManagerOptions, "cwd">> & { cwd?: string };
+	private readonly options: Required<Pick<KernelManagerOptions, "python" | "username">> &
+		Pick<KernelManagerOptions, "cwd" | "env" | "sessionId" | "rlmRunHandler">;
 	private readonly session = uuid();
+	private readonly commTargets = new Map<string, string>();
+	private readonly handledRlmCommIds = new Set<string>();
 	private kernel?: ChildProcess;
 	private shell?: Dealer;
 	private iopub?: Subscriber;
@@ -212,8 +231,15 @@ export class KernelManager {
 		this.options = {
 			python: options.python,
 			cwd: options.cwd,
+			env: options.env,
+			sessionId: options.sessionId,
+			rlmRunHandler: options.rlmRunHandler,
 			username: options.username ?? "prime-agent",
 		};
+	}
+
+	get ownerSessionId(): string | undefined {
+		return this.options.sessionId;
 	}
 
 	async start(): Promise<void> {
@@ -234,6 +260,7 @@ export class KernelManager {
 
 		const kernel = spawn(this.options.python, ["-m", "ipykernel_launcher", "-f", connectionPath], {
 			cwd: this.options.cwd,
+			env: this.options.env ? { ...process.env, ...this.options.env } : process.env,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		this.kernel = kernel;
@@ -392,9 +419,13 @@ export class KernelManager {
 			for await (const frames of iopub) {
 				const incoming = decode(frames);
 				if (!incoming) continue;
+				const t = incoming.header.msg_type;
+				if (t === "comm_open" || t === "comm_msg" || t === "comm_close") {
+					this.handleCommMessage(incoming);
+					continue;
+				}
 				if ((incoming.parent_header as { msg_id?: string }).msg_id !== requestMsgId) continue;
 
-				const t = incoming.header.msg_type;
 				if (t === "stream") {
 					const c = incoming.content as { name: "stdout" | "stderr"; text: string };
 					if (c.name === "stdout") {
@@ -440,6 +471,81 @@ export class KernelManager {
 		if (opts.signal?.aborted) status = "aborted";
 
 		return { stdout, stderr, result, error, status, durationMs: Date.now() - started };
+	}
+
+	private handleCommMessage(incoming: JupyterMessage): void {
+		const msgType = incoming.header.msg_type;
+		const content = incoming.content;
+		const commId = content.comm_id;
+		if (typeof commId !== "string") {
+			return;
+		}
+
+		if (msgType === "comm_close") {
+			this.commTargets.delete(commId);
+			this.handledRlmCommIds.delete(commId);
+			return;
+		}
+
+		if (msgType === "comm_open") {
+			const targetName = content.target_name;
+			if (typeof targetName !== "string") {
+				return;
+			}
+			this.commTargets.set(commId, targetName);
+			if (targetName === "rlm.run") {
+				this.startRlmRunFromComm(commId, content.data);
+			}
+			return;
+		}
+
+		const targetName = this.commTargets.get(commId);
+		if (msgType === "comm_msg" && targetName === "rlm.run") {
+			this.startRlmRunFromComm(commId, content.data);
+		}
+	}
+
+	private startRlmRunFromComm(commId: string, data: unknown): void {
+		if (this.handledRlmCommIds.has(commId)) {
+			return;
+		}
+		this.handledRlmCommIds.add(commId);
+
+		void (async () => {
+			try {
+				const result = await this.handleRlmRunRequest(data);
+				await this.sendCommMessage(commId, { status: "ok", ...result });
+			} catch (error) {
+				await this.sendCommMessage(commId, { status: "error", error: errorMessage(error) }).catch(() => {});
+			}
+		})();
+	}
+
+	private async handleRlmRunRequest(data: unknown): Promise<RlmRunResult> {
+		const handler = this.options.rlmRunHandler;
+		if (!handler) {
+			throw new Error("rlm.run is not available in this session");
+		}
+		if (!isRecord(data)) {
+			throw new Error("rlm.run comm payload must be an object");
+		}
+		if (data.type !== "run") {
+			throw new Error("rlm.run comm payload must have type 'run'");
+		}
+		if (typeof data.prompt !== "string") {
+			throw new Error("rlm.run prompt must be a string");
+		}
+		const kwargs = isRecord(data.kwargs) ? data.kwargs : {};
+		return handler({ prompt: data.prompt, kwargs });
+	}
+
+	private async sendCommMessage(commId: string, data: Record<string, unknown>): Promise<void> {
+		const channel = this.control ?? this.shell;
+		if (!channel || !this.connection) {
+			throw new Error("Kernel channel is not connected");
+		}
+		const msg = buildMessage("comm_msg", { comm_id: commId, data }, this.session, this.options.username);
+		await channel.send(encode(msg, this.connection.key));
 	}
 
 	private async interrupt(): Promise<void> {

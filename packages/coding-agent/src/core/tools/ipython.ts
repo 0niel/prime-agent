@@ -3,7 +3,30 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
 import type { ToolDefinition } from "../extensions/types.js";
 import { KernelManager, resolveKernelPython } from "../kernel/index.js";
+import type { RlmRunHandler } from "../rlm-runtime.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
+
+const RLM_BOOTSTRAP_CODE = `
+try:
+    import rlm as _prime_agent_rlm_module
+    rlm = _prime_agent_rlm_module.rlm
+except Exception as _prime_agent_rlm_error:
+    _PRIME_AGENT_RLM_IMPORT_ERROR = str(_prime_agent_rlm_error)
+
+    class _PrimeAgentMissingRlm:
+        async def run(self, prompt, **kwargs):
+            raise RuntimeError(
+                "prime-agent-runtime is not installed in this IPython kernel. "
+                "Run ./scripts/setup-kernel-venv.sh from the repo root, or set "
+                "PRIME_AGENT_KERNEL_PYTHON to a kernel environment with prime-agent-runtime installed. "
+                f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
+            )
+
+        async def __call__(self, prompt, **kwargs):
+            return await self.run(prompt, **kwargs)
+
+    rlm = _PrimeAgentMissingRlm()
+`.trim();
 
 const ipythonSchema = Type.Object({
 	code: Type.String({
@@ -24,6 +47,9 @@ export interface IpythonToolDetails {
 export interface IpythonToolOptions {
 	/** Defaults to {@link resolveKernelPython}. Must have `ipykernel` installed. */
 	python?: string;
+	env?: Record<string, string>;
+	sessionId?: string;
+	rlmRunHandler?: RlmRunHandler;
 	/** Filled after the first kernel start so the owning session can restart it after compaction. */
 	kernelManagerRef?: { current?: KernelManager };
 }
@@ -49,8 +75,19 @@ export function createIpythonToolDefinition(
 						"No Python interpreter with `ipykernel` was found. Run `./scripts/setup-kernel-venv.sh` from the repo root, or set PRIME_AGENT_KERNEL_PYTHON to point at a python that has ipykernel installed.",
 					);
 				}
-				const m = new KernelManager({ python, cwd });
+				const m = new KernelManager({
+					python,
+					cwd,
+					env: options?.env,
+					sessionId: options?.sessionId,
+					rlmRunHandler: options?.rlmRunHandler,
+				});
 				await m.start();
+				const bootstrap = await m.execute(RLM_BOOTSTRAP_CODE);
+				if (bootstrap.status !== "ok") {
+					const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
+					throw new Error(`Failed to initialize rlm runtime in the IPython kernel:\n${details}`);
+				}
 				if (options?.kernelManagerRef) {
 					options.kernelManagerRef.current = m;
 				}

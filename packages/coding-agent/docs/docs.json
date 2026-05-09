@@ -131,6 +131,10 @@
         {
           "title": "Development",
           "path": "development.md"
+        },
+        {
+          "title": "Kernel and RLM Recursion",
+          "path": "kernel-and-rlm-recursion.md"
         }
       ]
     }

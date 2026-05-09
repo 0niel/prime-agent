@@ -10,7 +10,7 @@ export interface RlmPromptOptions {
 export function buildRlmPrompt(options: RlmPromptOptions): string {
 	const { cwd, skillsDir, messagesPath } = options;
 	const installedSkills = options.installedSkills ?? [];
-	const allowRecursion = options.allowRecursion ?? false;
+	const allowRecursion = options.allowRecursion ?? true;
 	const activeTools = options.activeTools ?? [];
 	const parts = [
 		"You are a coding agent. You solve tasks by writing and executing code, observing results, and iterating one step at a time.",

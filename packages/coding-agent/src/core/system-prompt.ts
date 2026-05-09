@@ -24,6 +24,8 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string }>;
 	/** Pre-loaded skills. */
 	skills?: Skill[];
+	/** Whether to include the model-facing rlm recursion guidance. */
+	allowRecursion?: boolean;
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -37,6 +39,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		messagesPath,
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
+		allowRecursion,
 	} = options;
 	const promptCwd = cwd.replace(/\\/g, "/");
 	const promptMessagesPath = (messagesPath ?? "not persisted").replace(/\\/g, "/");
@@ -88,7 +91,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		messagesPath: promptMessagesPath,
 		installedSkills: skills.filter((skill) => !skill.disableModelInvocation).map((skill) => skill.name),
 		activeTools: tools.filter((name) => name === "ipython" || name === "bash" || name === "edit"),
-		allowRecursion: false,
+		allowRecursion,
 	});
 
 	const guidelines = formatPromptGuidelines(promptGuidelines);
