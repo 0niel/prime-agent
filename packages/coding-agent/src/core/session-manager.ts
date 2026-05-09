@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ImageContent, Message, TextContent, Usage } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
@@ -53,6 +53,8 @@ export interface SessionMessageEntry extends SessionEntryBase {
 	message: AgentMessage;
 }
 
+type AssistantSessionMessageEntry = SessionMessageEntry & { message: AssistantMessage };
+
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
 	type: "thinking_level_change";
 	thinkingLevel: string;
@@ -101,6 +103,18 @@ export interface CustomEntry<T = unknown> extends SessionEntryBase {
 	data?: T;
 }
 
+/**
+ * Records usage folded into a parent assistant message after an RLM child run.
+ * The child usage is kept separately so audit/UI code can explain why the
+ * parent turn's aggregate usage exceeds the parent model response itself.
+ */
+export interface ChildUsageAttributionEntry extends SessionEntryBase {
+	type: "child_usage_attributed";
+	targetId: string;
+	childUsage: Usage;
+	aggregateUsage: Usage;
+}
+
 /** Label entry for user-defined bookmarks/markers on entries. */
 export interface LabelEntry extends SessionEntryBase {
 	type: "label";
@@ -142,6 +156,7 @@ export type SessionEntry =
 	| CompactionEntry
 	| BranchSummaryEntry
 	| CustomEntry
+	| ChildUsageAttributionEntry
 	| CustomMessageEntry
 	| LabelEntry
 	| SessionInfoEntry;
@@ -295,7 +310,41 @@ export function parseSessionEntries(content: string): FileEntry[] {
 		}
 	}
 
+	applyChildUsageAttributions(entries);
 	return entries;
+}
+
+function cloneUsage(usage: Usage): Usage {
+	return {
+		input: usage.input,
+		output: usage.output,
+		cacheRead: usage.cacheRead,
+		cacheWrite: usage.cacheWrite,
+		totalTokens: usage.totalTokens,
+		cost: {
+			input: usage.cost.input,
+			output: usage.cost.output,
+			cacheRead: usage.cost.cacheRead,
+			cacheWrite: usage.cost.cacheWrite,
+			total: usage.cost.total,
+		},
+	};
+}
+
+function applyChildUsageAttributions(entries: FileEntry[]): void {
+	const assistantEntriesById = new Map<string, AssistantSessionMessageEntry>();
+	for (const entry of entries) {
+		if (entry.type === "message" && entry.message.role === "assistant") {
+			assistantEntriesById.set(entry.id, entry as AssistantSessionMessageEntry);
+		}
+	}
+
+	for (const entry of entries) {
+		if (entry.type !== "child_usage_attributed") continue;
+		const target = assistantEntriesById.get(entry.targetId);
+		if (!target) continue;
+		target.message.usage = cloneUsage(entry.aggregateUsage);
+	}
 }
 
 export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEntry | null {
@@ -459,6 +508,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		return [];
 	}
 
+	applyChildUsageAttributions(entries);
 	return entries;
 }
 
@@ -902,6 +952,27 @@ export class SessionManager {
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append an RLM child usage attribution and update the parent assistant aggregate in memory. */
+	appendChildUsageAttribution(targetId: string, childUsage: Usage, aggregateUsage: Usage): string {
+		const target = this.byId.get(targetId);
+		if (target?.type !== "message" || target.message.role !== "assistant") {
+			throw new Error(`Assistant message entry ${targetId} not found`);
+		}
+
+		target.message.usage = cloneUsage(aggregateUsage);
+		const entry: ChildUsageAttributionEntry = {
+			type: "child_usage_attributed",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			targetId,
+			childUsage: cloneUsage(childUsage),
+			aggregateUsage: cloneUsage(aggregateUsage),
 		};
 		this._appendEntry(entry);
 		return entry.id;

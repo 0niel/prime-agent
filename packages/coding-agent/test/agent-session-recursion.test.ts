@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -9,6 +9,7 @@ import {
 	createAssistantMessageEventStream,
 	getModel,
 	type TextContent,
+	type Usage,
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
@@ -35,21 +36,25 @@ function userText(context: Context): string {
 		.join("\n");
 }
 
-function assistantMessage(text: string): AssistantMessage {
+function usage(input = 7, output = 3): Usage {
+	return {
+		input,
+		output,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: input + output,
+		cost: { input, output, cacheRead: 0, cacheWrite: 0, total: input + output },
+	};
+}
+
+function assistantMessage(text: string, messageUsage = usage()): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [{ type: "text", text }],
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
-		usage: {
-			input: 7,
-			output: 3,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 10,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
+		usage: messageUsage,
 		stopReason: "stop",
 		timestamp: Date.now(),
 	};
@@ -169,6 +174,65 @@ describe("AgentSession rlm recursion", () => {
 		expect(basename(result.session_dir!)).toMatch(/^sub-/);
 		expect(existsSync(result.session_dir!)).toBe(true);
 		expect(readdirSync(result.session_dir!).some((name) => name.endsWith(".jsonl"))).toBe(true);
+	});
+
+	it("adds child usage to the parent session aggregate", async () => {
+		const root = createSession();
+		const parentAssistant = assistantMessage("running ipython", usage(0, 0));
+		root.agent.state.messages.push(parentAssistant);
+		root.sessionManager.appendMessage(parentAssistant);
+
+		const before = root.getSessionStats();
+		const result = await root.runRlmChild("summarize shard 2");
+		const after = root.getSessionStats();
+
+		expect(result.usage).toEqual({ prompt_tokens: 7, completion_tokens: 3 });
+		expect(after.tokens.input).toBe(before.tokens.input + result.usage.prompt_tokens);
+		expect(after.tokens.output).toBe(before.tokens.output + result.usage.completion_tokens);
+		expect(after.tokens.total).toBe(
+			before.tokens.total + result.usage.prompt_tokens + result.usage.completion_tokens,
+		);
+		expect(after.cost).toBe(before.cost + 10);
+		expect(parentAssistant.usage.totalTokens).toBe(0);
+
+		const parentEntry = root.sessionManager
+			.getEntries()
+			.find((entry) => entry.type === "message" && entry.message === parentAssistant);
+		if (!parentEntry || parentEntry.type !== "message" || parentEntry.message.role !== "assistant") {
+			throw new Error("parent assistant entry was not recorded");
+		}
+		expect(parentEntry.message.usage.input).toBe(result.usage.prompt_tokens);
+		expect(parentEntry.message.usage.output).toBe(result.usage.completion_tokens);
+		expect(parentEntry.message.usage.cost.total).toBe(10);
+
+		const sessionFile = root.sessionManager.getSessionFile();
+		if (!sessionFile) {
+			throw new Error("parent session file was not created");
+		}
+		expect(readFileSync(sessionFile, "utf-8")).toContain('"type":"child_usage_attributed"');
+
+		const reloaded = SessionManager.open(sessionFile, join(tempDir, "sessions"));
+		const reloadedAttribution = reloaded.getEntries().find((entry) => entry.type === "child_usage_attributed");
+		if (!reloadedAttribution || reloadedAttribution.type !== "child_usage_attributed") {
+			throw new Error("child usage attribution entry was not persisted");
+		}
+		expect(reloadedAttribution.childUsage.input).toBe(result.usage.prompt_tokens);
+		expect(reloadedAttribution.childUsage.output).toBe(result.usage.completion_tokens);
+		expect(reloadedAttribution.aggregateUsage.input).toBe(result.usage.prompt_tokens);
+		expect(reloadedAttribution.aggregateUsage.output).toBe(result.usage.completion_tokens);
+		expect(reloadedAttribution.aggregateUsage.cost.total).toBe(10);
+
+		const reloadedParentEntry = reloaded.getEntries().find((entry) => entry.type === "message");
+		if (
+			!reloadedParentEntry ||
+			reloadedParentEntry.type !== "message" ||
+			reloadedParentEntry.message.role !== "assistant"
+		) {
+			throw new Error("reloaded parent assistant entry was not recorded");
+		}
+		expect(reloadedParentEntry.message.usage.input).toBe(result.usage.prompt_tokens);
+		expect(reloadedParentEntry.message.usage.output).toBe(result.usage.completion_tokens);
+		expect(reloadedParentEntry.message.usage.cost.total).toBe(10);
 	});
 
 	it("rejects child creation at the configured recursion depth cap", async () => {

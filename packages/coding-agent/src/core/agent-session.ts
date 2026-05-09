@@ -84,7 +84,7 @@ import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import type { RlmRunResult, RlmUsage } from "./rlm-runtime.js";
-import type { BranchSummaryEntry, CompactionEntry } from "./session-manager.js";
+import type { BranchSummaryEntry, CompactionEntry, SessionMessageEntry } from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionEntry,
@@ -270,6 +270,41 @@ function emptyRlmUsage(): RlmUsage {
 function addUsage(total: RlmUsage, usage: Usage): void {
 	total.prompt_tokens += usage.input + usage.cacheRead + usage.cacheWrite;
 	total.completion_tokens += usage.output;
+}
+
+function emptyUsage(): Usage {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function addAssistantUsage(total: Usage, usage: Usage): void {
+	total.input += usage.input;
+	total.output += usage.output;
+	total.cacheRead += usage.cacheRead;
+	total.cacheWrite += usage.cacheWrite;
+	total.totalTokens += usage.totalTokens;
+	total.cost.input += usage.cost.input;
+	total.cost.output += usage.cost.output;
+	total.cost.cacheRead += usage.cost.cacheRead;
+	total.cost.cacheWrite += usage.cost.cacheWrite;
+	total.cost.total += usage.cost.total;
+}
+
+function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
+	const parentContextTokens =
+		parentUsage.totalTokens ||
+		parentUsage.input + parentUsage.output + parentUsage.cacheRead + parentUsage.cacheWrite;
+	// Recursive children are launched from an assistant tool call, so the parent assistant
+	// message carries their billable usage for session-level cost totals.
+	addAssistantUsage(parentUsage, childUsage);
+	// Child work affects session-level billable totals, not the parent's model-facing context size.
+	parentUsage.totalTokens = parentContextTokens;
 }
 
 // ============================================================================
@@ -2508,6 +2543,34 @@ export class AgentSession {
 		return usage;
 	}
 
+	private _assistantUsageForCurrentMessages(): Usage {
+		const usage = emptyUsage();
+		for (const message of this.agent.state.messages) {
+			if (message.role === "assistant") {
+				addAssistantUsage(usage, (message as AssistantMessage).usage);
+			}
+		}
+		return usage;
+	}
+
+	private _findAssistantEntryForMessage(message: AssistantMessage): SessionMessageEntry | undefined {
+		return this.sessionManager
+			.getEntries()
+			.find((entry): entry is SessionMessageEntry => entry.type === "message" && entry.message === message);
+	}
+
+	private _attributeRlmChildUsageToParent(childUsage: Usage): void {
+		const parentAssistant = this._findLastAssistantMessage();
+		if (!parentAssistant) {
+			return;
+		}
+		const parentEntry = this._findAssistantEntryForMessage(parentAssistant);
+		attributeChildUsage(parentAssistant.usage, childUsage);
+		if (parentEntry) {
+			this.sessionManager.appendChildUsageAttribution(parentEntry.id, childUsage, parentAssistant.usage);
+		}
+	}
+
 	private _assistantTurnCount(): number {
 		return this.agent.state.messages.filter((message) => message.role === "assistant").length;
 	}
@@ -2575,9 +2638,11 @@ export class AgentSession {
 			await child.prompt(prompt, { expandPromptTemplates: false, source: "extension" });
 			await child.agent.waitForIdle();
 			const answer = child.getLastAssistantText() ?? "";
+			const usage = child._usageForCurrentMessages();
+			this._attributeRlmChildUsageToParent(child._assistantUsageForCurrentMessages());
 			return {
 				answer,
-				usage: child._usageForCurrentMessages(),
+				usage,
 				turns: child._assistantTurnCount(),
 				session_dir: childSessionDir,
 			};

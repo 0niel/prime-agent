@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- Fixed RLM child usage aggregation so parent session totals include recursive child runs after session reloads.
 - Fixed `rlm.run` comm handlers to log failures and drain in-flight child runs during kernel disposal.
 
 ### Removed
