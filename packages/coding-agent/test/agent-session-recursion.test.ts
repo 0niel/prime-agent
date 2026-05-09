@@ -10,7 +10,7 @@ import {
 	getModel,
 	type TextContent,
 } from "@earendil-works/pi-ai";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { KernelManager } from "../src/core/kernel/index.js";
@@ -102,6 +102,14 @@ async function waitFor(condition: () => boolean): Promise<void> {
 		}
 		await sleep(10);
 	}
+}
+
+async function expectSettlesWithin(promise: Promise<void>, timeoutMs: number): Promise<void> {
+	const result = await Promise.race([
+		promise.then(() => "settled" as const),
+		sleep(timeoutMs).then(() => "timeout" as const),
+	]);
+	expect(result).toBe("settled");
 }
 
 describe("AgentSession rlm recursion", () => {
@@ -234,7 +242,64 @@ describe("AgentSession rlm recursion", () => {
 				session_dir: null,
 			});
 		} finally {
-			manager.dispose();
+			await manager.dispose();
+		}
+	});
+
+	it("waits for in-flight rlm comm work during dispose and logs failures", async () => {
+		let started = false;
+		let handlerSettled = false;
+		let released = false;
+		let releaseChild: () => void = () => {};
+		const release = new Promise<void>((resolve) => {
+			releaseChild = () => {
+				if (released) return;
+				released = true;
+				resolve();
+			};
+		});
+		const manager = new KernelManager({
+			python: process.execPath,
+			rlmRunHandler: async () => {
+				started = true;
+				try {
+					await release;
+					throw new Error("child failed after dispose");
+				} finally {
+					handlerSettled = true;
+				}
+			},
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		try {
+			const kernel = manager as unknown as KernelCommTestApi;
+
+			kernel.handleCommMessage(rlmCommOpen("comm-dispose", "slow child"));
+
+			await waitFor(() => started);
+			const disposePromise = manager.dispose();
+			let disposeSettled = false;
+			const trackedDispose = disposePromise.then(() => {
+				disposeSettled = true;
+			});
+
+			await sleep(25);
+			expect(disposeSettled).toBe(false);
+
+			releaseChild();
+			await expectSettlesWithin(trackedDispose, 1000);
+			expect(handlerSettled).toBe(true);
+
+			const logLines = errorSpy.mock.calls.map((call) => call.map(String).join(" "));
+			expect(logLines.some((line) => line.includes("[kernel] rlm.run failed for comm comm-dispose"))).toBe(true);
+			expect(
+				logLines.some((line) => line.includes("[kernel] failed to send rlm.run error reply for comm comm-dispose")),
+			).toBe(true);
+		} finally {
+			releaseChild();
+			await manager.dispose();
+			errorSpy.mockRestore();
 		}
 	});
 });

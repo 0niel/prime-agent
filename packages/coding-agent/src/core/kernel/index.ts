@@ -15,6 +15,7 @@ const PROTOCOL_VERSION = "5.3";
 const STARTUP_DELAY_MS = 500;
 const READY_TIMEOUT_MS = 5000;
 const DEFAULT_MAX_OUTPUT_CHARS = 65536;
+const RLM_DISPOSE_TIMEOUT_MS = 5000;
 
 export interface KernelManagerOptions {
 	/** Python interpreter that has `ipykernel` available. */
@@ -173,7 +174,7 @@ let signalHandlersInstalled = false;
 registerSessionResourceCleanup((sessionId) => {
 	for (const k of liveKernels) {
 		if (!sessionId || k.ownerSessionId === sessionId) {
-			k.dispose();
+			void k.dispose();
 		}
 	}
 });
@@ -188,7 +189,7 @@ function installSignalHandlersOnce(): void {
 
 	// `beforeExit` and signal handlers can await async cleanup. `exit`
 	// can only do sync work (Node won't run pending microtasks past it),
-	// so it falls back to `dispose()` which kills the child synchronously.
+	// so it falls back to `disposeSync()` which kills the child synchronously.
 	process.on("beforeExit", () => {
 		void asyncShutdown();
 	});
@@ -199,7 +200,7 @@ function installSignalHandlersOnce(): void {
 		void asyncShutdown().finally(() => process.exit(143));
 	});
 	process.on("exit", () => {
-		for (const k of liveKernels) k.dispose();
+		for (const k of liveKernels) k.disposeSync();
 	});
 }
 
@@ -220,6 +221,7 @@ export class KernelManager {
 	private kernelStderr = "";
 	/** Serializes execute() calls — Jupyter shell channel is request/reply. */
 	private executionQueue: Promise<unknown> = Promise.resolve();
+	private readonly inFlightRlmRuns = new Set<Promise<void>>();
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
 	/** Memoized so concurrent callers all await the same in-flight startup. */
 	private startPromise?: Promise<void>;
@@ -511,14 +513,31 @@ export class KernelManager {
 		}
 		this.handledRlmCommIds.add(commId);
 
-		void (async () => {
+		const task = (async () => {
 			try {
 				const result = await this.handleRlmRunRequest(data);
-				await this.sendCommMessage(commId, { status: "ok", ...result });
+				try {
+					await this.sendCommMessage(commId, { status: "ok", ...result });
+				} catch (replyError) {
+					console.error(
+						`[kernel] failed to send rlm.run ok reply for comm ${commId}: ${errorMessage(replyError)}`,
+					);
+				}
 			} catch (error) {
-				await this.sendCommMessage(commId, { status: "error", error: errorMessage(error) }).catch(() => {});
+				console.error(`[kernel] rlm.run failed for comm ${commId}: ${errorMessage(error)}`);
+				try {
+					await this.sendCommMessage(commId, { status: "error", error: errorMessage(error) });
+				} catch (replyError) {
+					console.error(
+						`[kernel] failed to send rlm.run error reply for comm ${commId}: ${errorMessage(replyError)}`,
+					);
+				}
 			}
 		})();
+		this.inFlightRlmRuns.add(task);
+		void task.finally(() => {
+			this.inFlightRlmRuns.delete(task);
+		});
 	}
 
 	private async handleRlmRunRequest(data: unknown): Promise<RlmRunResult> {
@@ -575,6 +594,24 @@ export class KernelManager {
 		this.startPromise = undefined;
 	}
 
+	private async waitForRlmRunsToSettle(tasks: Promise<void>[], timeoutMs: number): Promise<void> {
+		let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
+		const timeoutPromise = new Promise<"timeout">((resolve) => {
+			timeout = globalThis.setTimeout(() => resolve("timeout"), timeoutMs);
+			if (timeout && typeof timeout === "object" && "unref" in timeout) {
+				timeout.unref();
+			}
+		});
+
+		const result = await Promise.race([Promise.allSettled(tasks).then(() => "settled" as const), timeoutPromise]);
+		if (timeout) {
+			globalThis.clearTimeout(timeout);
+		}
+		if (result === "timeout") {
+			console.error(`[kernel] timed out waiting ${timeoutMs}ms for ${tasks.length} rlm.run task(s) during dispose`);
+		}
+	}
+
 	async shutdown(): Promise<void> {
 		if (this.state === "shutdown") {
 			liveKernels.delete(this);
@@ -613,10 +650,31 @@ export class KernelManager {
 		}
 	}
 
-	/** Synchronous best-effort cleanup. Safe to call from `process.on('exit')`. */
-	dispose(): void {
+	/** Graceful cleanup. Waits briefly for in-flight rlm.run handlers before closing sockets. */
+	dispose(): Promise<void> {
 		this.state = "shutdown";
 		liveKernels.delete(this);
+		const inFlightRlmRuns = [...this.inFlightRlmRuns];
+		if (inFlightRlmRuns.length === 0) {
+			this.cleanupResources();
+			return Promise.resolve();
+		}
+
+		return (async () => {
+			// TODO: plumb AbortSignal through AgentSession.prompt so disposal can cancel long-running child loops.
+			try {
+				await this.waitForRlmRunsToSettle(inFlightRlmRuns, RLM_DISPOSE_TIMEOUT_MS);
+			} finally {
+				this.cleanupResources();
+			}
+		})();
+	}
+
+	/** Synchronous best-effort cleanup. Safe to call from `process.on('exit')`. */
+	disposeSync(): void {
+		this.state = "shutdown";
+		liveKernels.delete(this);
+		// TODO: replace this best-effort hard-exit path if Node exposes an awaitable process-exit cleanup hook.
 		this.cleanupResources();
 	}
 

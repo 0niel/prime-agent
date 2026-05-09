@@ -7,6 +7,10 @@
 - Changed the default active built-in tool set to `ipython`.
 - Replaced the default system prompt with the model-agnostic RLM harness prompt.
 
+### Fixed
+
+- Fixed `rlm.run` comm handlers to log failures and drain in-flight child runs during kernel disposal.
+
 ### Removed
 
 - Removed the legacy `read`, `write`, `grep`, `find`, and `ls` built-in tools.
