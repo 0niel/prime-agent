@@ -755,7 +755,7 @@ export class SettingsManager {
 	}
 
 	getQuietStartup(): boolean {
-		return this.settings.quietStartup ?? true;
+		return this.settings.quietStartup ?? false;
 	}
 
 	setQuietStartup(quiet: boolean): void {

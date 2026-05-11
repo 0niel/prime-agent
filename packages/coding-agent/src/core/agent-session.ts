@@ -2678,7 +2678,10 @@ export class AgentSession {
 		let status: RlmChildAgentStatus = "running";
 		let answerPreview: string | undefined;
 		let durationMs: number | undefined;
-		let assistantTranscriptIndex: number | undefined;
+		// Index of the assistant entry currently being streamed. Cleared whenever the
+		// conversation moves on (new assistant message, tool call) so subsequent assistant
+		// text appends a fresh entry in chronological order instead of overwriting in place.
+		let currentAssistantIndex: number | undefined;
 		let lastToolTranscriptIndex: number | undefined;
 		const emitChildUpdate = () => {
 			this._emit({
@@ -2695,17 +2698,17 @@ export class AgentSession {
 				},
 			});
 		};
-		const setAssistantTranscript = (text: string) => {
+		const recordAssistantText = (text: string) => {
 			const compact = compactRlmText(text);
 			if (!compact) {
 				return;
 			}
 			answerPreview = compact;
-			if (assistantTranscriptIndex === undefined) {
-				assistantTranscriptIndex = transcript.length;
+			if (currentAssistantIndex === undefined) {
+				currentAssistantIndex = transcript.length;
 				transcript.push({ role: "assistant", text: compact });
 			} else {
-				transcript[assistantTranscriptIndex] = { role: "assistant", text: compact };
+				transcript[currentAssistantIndex] = { role: "assistant", text: compact };
 			}
 		};
 		emitChildUpdate();
@@ -2765,8 +2768,11 @@ export class AgentSession {
 						if (text) {
 							transcript.push({ role: "user", text });
 						}
+						currentAssistantIndex = undefined;
 					} else if (event.message.role === "assistant") {
-						setAssistantTranscript(readAssistantText(event.message as AssistantMessage));
+						// New assistant turn: append a fresh entry so prior text isn't overwritten.
+						currentAssistantIndex = undefined;
+						recordAssistantText(readAssistantText(event.message as AssistantMessage));
 					}
 					emitChildUpdate();
 					break;
@@ -2774,13 +2780,15 @@ export class AgentSession {
 				case "message_update":
 				case "message_end": {
 					if (event.message.role === "assistant") {
-						setAssistantTranscript(readAssistantText(event.message as AssistantMessage));
+						recordAssistantText(readAssistantText(event.message as AssistantMessage));
 						emitChildUpdate();
 					}
 					break;
 				}
 				case "tool_execution_start": {
 					const args = formatRlmToolArgs(event.args);
+					// Tool break: next assistant text starts a new entry after this tool row.
+					currentAssistantIndex = undefined;
 					lastToolTranscriptIndex = transcript.length;
 					transcript.push({
 						role: "tool",
@@ -2823,7 +2831,17 @@ export class AgentSession {
 			this._attributeRlmChildUsageToParent(child._assistantUsageForCurrentMessages());
 			status = "done";
 			durationMs = Date.now() - startedAt;
-			setAssistantTranscript(answer);
+			// Streaming events usually capture the final assistant text already. Only
+			// record again when it's missing — otherwise a child whose last streamed
+			// event was tool_execution_start would have currentAssistantIndex cleared,
+			// causing the final answer to be appended as a duplicate row.
+			const compactAnswer = compactRlmText(answer);
+			const lastAssistantText = [...transcript].reverse().find((line) => line.role === "assistant")?.text;
+			if (compactAnswer && compactAnswer !== lastAssistantText) {
+				recordAssistantText(answer);
+			} else if (compactAnswer) {
+				answerPreview = compactAnswer;
+			}
 			emitChildUpdate();
 			return {
 				answer,

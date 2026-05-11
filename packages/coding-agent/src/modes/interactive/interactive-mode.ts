@@ -675,70 +675,78 @@ export class InteractiveMode {
 
 		// Brand splash: side-panel layout — white butterfly on the left, structured runtime
 		// metadata on the right. The mark carries the brand; no wordmark, no slogan.
-		// Cheatsheet behind --verbose.
-		const logoRaw = PRIME_LOGO_SMALL.split("\n");
-		const logoCanvasWidth = logoRaw.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
-		const gutter = 4;
-		const cwdLabel = (() => {
-			let p = this.sessionManager.getCwd();
-			const home = process.env.HOME || process.env.USERPROFILE;
-			if (home && p.startsWith(home)) p = `~${p.slice(home.length)}`;
-			return p;
-		})();
-		const modelId = this.session.state.model?.id;
-		const labelWidth = 9;
-		const labelled = (label: string, value: string) =>
-			theme.fg("dim", label.padEnd(labelWidth)) + theme.fg("muted", value);
-		const metaLines = [
-			labelled("version", `v${this.version}`),
-			labelled("model", modelId ?? "—"),
-			labelled("cwd", cwdLabel),
-			"",
-			theme.fg("dim", "type to start"),
-		];
-		const metaStart = Math.max(0, Math.floor((logoRaw.length - metaLines.length) / 2));
-		const composed = logoRaw.map((line, i) => {
-			const colored = theme.fg("text", line);
-			const padding = " ".repeat(Math.max(0, logoCanvasWidth - visibleWidth(line) + gutter));
-			const meta = i >= metaStart && i < metaStart + metaLines.length ? metaLines[i - metaStart] : "";
-			return colored + padding + meta;
-		});
-		const brandBlock = composed.join("\n");
+		// Cheatsheet behind --verbose. `quietStartup` suppresses the splash entirely
+		// (matches pi-mono's old behaviour for users who want a bare prompt).
+		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
+			const logoRaw = PRIME_LOGO_SMALL.split("\n");
+			const logoCanvasWidth = logoRaw.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
+			const gutter = 4;
+			const cwdLabel = (() => {
+				let p = this.sessionManager.getCwd();
+				const home = process.env.HOME || process.env.USERPROFILE;
+				if (home && p.startsWith(home)) p = `~${p.slice(home.length)}`;
+				return p;
+			})();
+			const modelId = this.session.state.model?.id;
+			const labelWidth = 9;
+			const labelled = (label: string, value: string) =>
+				theme.fg("dim", label.padEnd(labelWidth)) + theme.fg("muted", value);
+			const metaLines = [
+				labelled("version", `v${this.version}`),
+				labelled("model", modelId ?? "—"),
+				labelled("cwd", cwdLabel),
+				"",
+				theme.fg("dim", "type to start"),
+			];
+			const metaStart = Math.max(0, Math.floor((logoRaw.length - metaLines.length) / 2));
+			const composed = logoRaw.map((line, i) => {
+				const colored = theme.fg("text", line);
+				const padding = " ".repeat(Math.max(0, logoCanvasWidth - visibleWidth(line) + gutter));
+				const meta = i >= metaStart && i < metaStart + metaLines.length ? metaLines[i - metaStart] : "";
+				return colored + padding + meta;
+			});
+			const brandBlock = composed.join("\n");
 
-		if (this.options.verbose) {
-			// Verbose: include the full keybinding cheatsheet under the brand mark.
-			const hint = (keybinding: AppKeybinding, description: string) => keyHint(keybinding, description);
-			const expandedInstructions = [
-				hint("app.interrupt", "to interrupt"),
-				hint("app.clear", "to clear"),
-				rawKeyHint(`${keyText("app.clear")} twice`, "to exit"),
-				hint("app.exit", "to exit (empty)"),
-				hint("app.suspend", "to suspend"),
-				keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
-				hint("app.thinking.cycle", "to cycle thinking level"),
-				rawKeyHint(`${keyText("app.model.cycleForward")}/${keyText("app.model.cycleBackward")}`, "to cycle models"),
-				hint("app.model.select", "to select model"),
-				hint("app.tools.expand", "to expand tools"),
-				hint("app.thinking.toggle", "to expand thinking"),
-				hint("app.editor.external", "for external editor"),
-				rawKeyHint("/", "for commands"),
-				rawKeyHint("!", "to run bash"),
-				rawKeyHint("!!", "to run bash (no context)"),
-				hint("app.message.followUp", "to queue follow-up"),
-				hint("app.message.dequeue", "to edit all queued messages"),
-				hint("app.clipboard.pasteImage", "to paste image"),
-				rawKeyHint("drop files", "to attach"),
-			].join("\n");
-			const verboseBlock = `${brandBlock}\n\n${expandedInstructions}`;
-			this.builtInHeader = new Text(verboseBlock, 1, 0);
+			if (this.options.verbose) {
+				// Verbose: include the full keybinding cheatsheet under the brand mark.
+				const hint = (keybinding: AppKeybinding, description: string) => keyHint(keybinding, description);
+				const expandedInstructions = [
+					hint("app.interrupt", "to interrupt"),
+					hint("app.clear", "to clear"),
+					rawKeyHint(`${keyText("app.clear")} twice`, "to exit"),
+					hint("app.exit", "to exit (empty)"),
+					hint("app.suspend", "to suspend"),
+					keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
+					hint("app.thinking.cycle", "to cycle thinking level"),
+					rawKeyHint(
+						`${keyText("app.model.cycleForward")}/${keyText("app.model.cycleBackward")}`,
+						"to cycle models",
+					),
+					hint("app.model.select", "to select model"),
+					hint("app.tools.expand", "to expand tools"),
+					hint("app.thinking.toggle", "to expand thinking"),
+					hint("app.editor.external", "for external editor"),
+					rawKeyHint("/", "for commands"),
+					rawKeyHint("!", "to run bash"),
+					rawKeyHint("!!", "to run bash (no context)"),
+					hint("app.message.followUp", "to queue follow-up"),
+					hint("app.message.dequeue", "to edit all queued messages"),
+					hint("app.clipboard.pasteImage", "to paste image"),
+					rawKeyHint("drop files", "to attach"),
+				].join("\n");
+				const verboseBlock = `${brandBlock}\n\n${expandedInstructions}`;
+				this.builtInHeader = new Text(verboseBlock, 1, 0);
+			} else {
+				this.builtInHeader = new Text(brandBlock, 1, 0);
+			}
+			this.headerContainer.addChild(new Spacer(1));
+			this.headerContainer.addChild(this.builtInHeader);
+			this.headerContainer.addChild(new Spacer(1));
 		} else {
-			this.builtInHeader = new Text(brandBlock, 1, 0);
+			// Quiet startup: skip the splash and surrounding padding entirely.
+			this.builtInHeader = new Text("", 0, 0);
+			this.headerContainer.addChild(this.builtInHeader);
 		}
-
-		// Setup UI layout
-		this.headerContainer.addChild(new Spacer(1));
-		this.headerContainer.addChild(this.builtInHeader);
-		this.headerContainer.addChild(new Spacer(1));
 
 		this.mainContainer.addChild(this.chatContainer);
 		this.mainContainer.addChild(this.pendingMessagesContainer);
