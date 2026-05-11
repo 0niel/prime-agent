@@ -47,6 +47,13 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		);
 	}
 
+	if (activeTools.includes("ipython")) {
+		parts.push(
+			"",
+			"Inside `ipython`, prefix single-line shell commands with `!` (for example `!ls -la`) and use `%%bash` for multi-line shell scripts.",
+		);
+	}
+
 	if (activeTools.length > 0) {
 		parts.push("", "Call at most one built-in tool per turn.");
 	}

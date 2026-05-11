@@ -24,6 +24,11 @@ describe("edit tool prepareArguments", () => {
 		expect(definition.parameters.properties).not.toHaveProperty("newText");
 	});
 
+	it("does not add built-in edit guidance to the system prompt", () => {
+		const definition = createEditToolDefinition(process.cwd());
+		expect(definition.promptGuidelines).toBeUndefined();
+	});
+
 	it("folds top-level oldText/newText into edits", () => {
 		const definition = createEditToolDefinition(process.cwd());
 		const prepared = definition.prepareArguments!({
