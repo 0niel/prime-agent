@@ -34,8 +34,14 @@ interface TracebackParts {
 	preview: string;
 }
 
+type CellBackground = "customMessageBg" | "toolPendingBg" | "toolErrorBg";
+
 const MAGIC_LINE_PATTERN = /^\s*!/;
 const CELL_MAGIC_PATTERN = /^\s*%%bash\b/;
+
+// Collapse long kernel output to the last N lines with a "M earlier lines hidden" marker.
+// Mirrors the bash-execution preview cap so a long-running task doesn't flood the chat.
+const OUTPUT_PREVIEW_LINES = 20;
 
 export function getIpythonCodeFromArgs(args: unknown): string {
 	if (!args || typeof args !== "object" || !("code" in args)) {
@@ -118,6 +124,7 @@ function splitTraceback(text: string, errorName: string | undefined): TracebackP
 }
 
 export class IPythonCellComponent implements Component {
+	private readonly paddingX = 2;
 	private state: IPythonCellState;
 
 	constructor(state: IPythonCellState) {
@@ -137,21 +144,20 @@ export class IPythonCellComponent implements Component {
 		const details = readDetails(this.state.details);
 		const lines: string[] = [];
 
-		lines.push(this.rule(safeWidth, this.header(details)));
-		this.renderCode(lines, safeWidth);
-		this.renderOutput(lines, safeWidth, details);
-		lines.push(theme.fg(this.state.isError ? "error" : "borderMuted", "─".repeat(safeWidth)));
+		lines.push(this.panelLine(this.header(details), safeWidth));
+		const hasCode = this.renderCode(lines, safeWidth);
+		this.renderOutput(lines, safeWidth, details, hasCode);
 		return lines;
 	}
 
 	private header(details: IpythonDetails): string {
 		const status = this.status(details);
 		const duration = formatDuration(details.durationMs);
-		const parts = [theme.bold("ipython"), status.label];
+		const parts = [status.label];
 		if (duration) {
 			parts.push(theme.fg("muted", duration));
 		}
-		return parts.join(" ");
+		return parts.join(theme.fg("dim", " · "));
 	}
 
 	private status(details: IpythonDetails): { label: string } {
@@ -171,34 +177,23 @@ export class IPythonCellComponent implements Component {
 		return { label: theme.fg("success", "done") };
 	}
 
-	private rule(width: number, title: string): string {
-		if (width <= 1) {
-			return theme.fg(this.state.isError ? "error" : "borderAccent", "─");
-		}
-		const color = this.state.isError ? "error" : "borderAccent";
-		const label = ` ${title} `;
-		const plainLabel = ` ${stripAnsi(title)} `;
-		if (visibleWidth(plainLabel) + 1 >= width) {
-			return theme.fg(color, truncateToWidth(plainLabel, width, ""));
-		}
-		const right = "─".repeat(Math.max(0, width - visibleWidth(label) - 1));
-		return theme.fg(color, "─") + label + theme.fg(color, right);
-	}
-
-	private renderCode(lines: string[], width: number): void {
+	private renderCode(lines: string[], width: number): boolean {
 		const code = this.state.code.trimEnd();
 		if (!code) {
-			this.addWrapped(lines, theme.fg("dim", "  in  "), theme.fg("muted", "(waiting for code)"), width);
-			return;
+			this.addBlank(lines, width);
+			this.addWrapped(lines, "", theme.fg("muted", "waiting for code"), width);
+			return false;
 		}
 
+		this.addBlank(lines, width);
 		const isBashCell = CELL_MAGIC_PATTERN.test(code.split("\n")[0] ?? "");
 		const rawLines = code.split("\n");
 		for (const [index, rawLine] of rawLines.entries()) {
-			const prefix = index === 0 ? theme.fg("dim", "  in  ") : theme.fg("dim", "      ");
+			const prefix = index === 0 ? theme.fg("dim", "› ") : theme.fg("dim", "  ");
 			const highlighted = this.highlightInputLine(rawLine, isBashCell);
 			this.addWrapped(lines, prefix, highlighted || " ", width);
 		}
+		return true;
 	}
 
 	private highlightInputLine(line: string, isBashCell: boolean): string {
@@ -209,65 +204,115 @@ export class IPythonCellComponent implements Component {
 		return highlighted[0] ?? theme.fg("mdCodeBlock", line);
 	}
 
-	private renderOutput(lines: string[], width: number, details: IpythonDetails): void {
+	private renderOutput(lines: string[], width: number, details: IpythonDetails, hasCode: boolean): void {
 		const blocks = this.state.content ?? [];
 		const text = textFromBlocks(blocks);
 		const imageCount = blocks.filter(isImageBlock).length;
 		const traceback =
 			this.state.isError || details.status === "error" ? splitTraceback(text, details.errorEname) : undefined;
+		let outputStarted = false;
+
+		const startOutput = (): void => {
+			if (outputStarted) {
+				return;
+			}
+			outputStarted = true;
+			if (hasCode) {
+				this.addBlank(lines, width);
+			}
+		};
 
 		if (traceback?.output) {
+			startOutput();
 			this.renderOutputText(lines, width, traceback.output, "out");
 		} else if (text.trim()) {
+			startOutput();
 			this.renderOutputText(lines, width, normalizeText(text), this.state.isError ? "err" : "out");
 		} else if (this.state.isPartial || (this.state.executionStarted && !this.state.argsComplete)) {
-			this.addWrapped(lines, theme.fg("dim", "  out "), theme.fg("muted", "waiting for kernel output..."), width);
-		} else if (this.state.executionStarted) {
-			this.addWrapped(lines, theme.fg("dim", "  out "), theme.fg("muted", "(no output)"), width);
+			startOutput();
+			this.addWrapped(lines, "", theme.fg("muted", "waiting for output..."), width);
+		} else if (this.state.executionStarted && imageCount === 0) {
+			startOutput();
+			this.addWrapped(lines, "", theme.fg("muted", "no output"), width);
 		}
 
 		if (traceback) {
+			startOutput();
 			if (this.state.expanded) {
 				this.renderTraceback(lines, width, traceback.traceback);
 			} else {
-				this.addWrapped(lines, theme.fg("dim", "  err "), theme.fg("error", traceback.preview), width);
+				this.addWrapped(lines, "", theme.fg("error", traceback.preview), width);
 				this.addWrapped(
 					lines,
-					theme.fg("dim", "      "),
-					`${theme.fg("muted", "traceback collapsed")} (${keyHint("app.tools.expand", "to expand")})`,
+					"",
+					`${theme.fg("muted", "traceback collapsed")} ${theme.fg("dim", "·")} ${keyHint("app.tools.expand", "to expand")}`,
 					width,
 				);
 			}
 		}
 
 		if (imageCount > 0) {
+			startOutput();
 			const text = this.state.showImages
 				? `${imageCount} image${imageCount === 1 ? "" : "s"} rendered below`
 				: `${imageCount} image${imageCount === 1 ? "" : "s"} hidden`;
-			this.addWrapped(lines, theme.fg("dim", "  img "), theme.fg("muted", text), width);
+			this.addWrapped(lines, "", theme.fg("muted", text), width);
 		}
 	}
 
 	private renderOutputText(lines: string[], width: number, text: string, label: "out" | "err"): void {
 		const color = label === "err" ? "error" : "toolOutput";
-		const prefix = label === "err" ? theme.fg("dim", "  err ") : theme.fg("dim", "  out ");
-		for (const [index, line] of text.split("\n").entries()) {
-			this.addWrapped(lines, index === 0 ? prefix : theme.fg("dim", "      "), theme.fg(color, line || " "), width);
+		const allLines = text.split("\n");
+		const expanded = this.state.expanded ?? false;
+		const showCollapsed = !expanded && allLines.length > OUTPUT_PREVIEW_LINES;
+		const visibleLines = showCollapsed ? allLines.slice(-OUTPUT_PREVIEW_LINES) : allLines;
+
+		if (showCollapsed) {
+			const hidden = allLines.length - OUTPUT_PREVIEW_LINES;
+			const headerHint = `${theme.fg("muted", `${hidden} earlier line${hidden === 1 ? "" : "s"} hidden`)} ${theme.fg("dim", "·")} ${keyHint("app.tools.expand", "to expand")}`;
+			this.addWrapped(lines, "", headerHint, width);
+		}
+
+		for (const line of visibleLines) {
+			this.addWrapped(lines, "", theme.fg(color, line || " "), width);
 		}
 	}
 
 	private renderTraceback(lines: string[], width: number, traceback: string): void {
-		for (const [index, line] of traceback.split("\n").entries()) {
-			const prefix = index === 0 ? theme.fg("dim", "  err ") : theme.fg("dim", "      ");
-			this.addWrapped(lines, prefix, theme.fg("error", line || " "), width);
+		for (const line of traceback.split("\n")) {
+			this.addWrapped(lines, "", theme.fg("error", line || " "), width);
 		}
 	}
 
 	private addWrapped(lines: string[], prefix: string, text: string, width: number): void {
-		const available = Math.max(1, width - visibleWidth(prefix));
+		const contentWidth = Math.max(1, width - this.paddingX * 2);
+		const available = Math.max(1, contentWidth - visibleWidth(prefix));
 		const wrapped = wrapTextWithAnsi(text, available);
-		for (const line of wrapped.length > 0 ? wrapped : [""]) {
-			lines.push(truncateToWidth(prefix + line, width));
+		for (const [index, line] of (wrapped.length > 0 ? wrapped : [""]).entries()) {
+			const linePrefix = index === 0 ? prefix : " ".repeat(visibleWidth(prefix));
+			lines.push(this.panelLine(linePrefix + line, width));
 		}
+	}
+
+	private addBlank(lines: string[], width: number): void {
+		lines.push(this.panelLine("", width));
+	}
+
+	private panelLine(line: string, width: number): string {
+		const contentWidth = Math.max(1, width - this.paddingX * 2);
+		const truncated = truncateToWidth(line, contentWidth, "");
+		const paddedContent = truncated + " ".repeat(Math.max(0, contentWidth - visibleWidth(truncated)));
+		const padded = `${" ".repeat(this.paddingX)}${paddedContent}${" ".repeat(this.paddingX)}`;
+		return theme.bg(this.background(), padded);
+	}
+
+	private background(): CellBackground {
+		if (this.state.isError || readDetails(this.state.details).status === "error") {
+			return "toolErrorBg";
+		}
+		if (this.state.isPartial || !this.state.executionStarted) {
+			return "toolPendingBg";
+		}
+		return "customMessageBg";
 	}
 }

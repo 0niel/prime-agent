@@ -77,17 +77,9 @@ export class SubAgentTreeComponent implements Component {
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
 		const lines: string[] = [];
-		lines.push(theme.fg("borderAccent", "─".repeat(safeWidth)));
+		lines.push(theme.fg("borderMuted", "─".repeat(safeWidth)));
 
-		const totalTokens = this.nodes.reduce((total, node) => total + this.tokenRollup(node), 0);
-		const totalCost = this.nodes.reduce((total, node) => total + this.costRollup(node), 0);
 		const headerParts = [theme.bold(this.rootLabel)];
-		if (totalTokens > 0) {
-			headerParts.push(theme.fg("muted", this.formatTokens(totalTokens)));
-		}
-		if (totalCost > 0) {
-			headerParts.push(theme.fg("muted", `$${totalCost.toFixed(4)}`));
-		}
 		lines.push(truncateToWidth(headerParts.join(" "), safeWidth));
 
 		if (this.nodes.length === 0) {
@@ -116,11 +108,11 @@ export class SubAgentTreeComponent implements Component {
 	}
 
 	private renderNode(lines: string[], node: SubAgentTreeNode, prefix: string, isLast: boolean, width: number): void {
-		const connector = `${prefix}${isLast ? "└─ " : "├─ "}`;
-		const line = connector + this.nodeSummary(node);
+		const connector = `${prefix}${isLast ? " └─ " : " ├─ "}`;
+		const line = this.treeEdge(connector) + this.nodeSummary(node);
 		lines.push(truncateToWidth(line, width));
 
-		const childPrefix = `${prefix}${isLast ? "   " : "│  "}`;
+		const childPrefix = `${prefix}${isLast ? "    " : " │  "}`;
 		if (this.expandAll || node.expanded || this.expandedIds.has(node.id)) {
 			this.renderTranscript(lines, node, childPrefix, width);
 		}
@@ -133,8 +125,9 @@ export class SubAgentTreeComponent implements Component {
 
 	private renderTranscript(lines: string[], node: SubAgentTreeNode, prefix: string, width: number): void {
 		const transcript = node.transcript ?? [];
+		const renderedPrefix = this.treeEdge(prefix);
 		if (transcript.length === 0) {
-			lines.push(truncateToWidth(`${prefix}   ${theme.fg("muted", "(transcript unavailable)")}`, width));
+			lines.push(truncateToWidth(`${renderedPrefix}   ${theme.fg("muted", "(transcript unavailable)")}`, width));
 			return;
 		}
 
@@ -145,34 +138,25 @@ export class SubAgentTreeComponent implements Component {
 				Math.max(1, width - visibleWidth(prefix) - 3 - visibleWidth(label)),
 			);
 			for (const [index, line] of wrapped.entries()) {
-				const entryPrefix = index === 0 ? `${prefix}   ${label}` : `${prefix}   ${" ".repeat(visibleWidth(label))}`;
+				const entryPrefix =
+					index === 0 ? `${renderedPrefix}   ${label}` : `${renderedPrefix}   ${" ".repeat(visibleWidth(label))}`;
 				lines.push(truncateToWidth(entryPrefix + line, width));
 			}
 		}
 	}
 
 	private nodeSummary(node: SubAgentTreeNode): string {
-		const parts = [this.statusLabel(node.status), theme.bold(node.label)];
+		const parts = [this.statusLabel(node.status), theme.fg("dim", node.label)];
 		const meta: string[] = [];
 		const duration = this.formatDuration(node.durationMs);
 		if (duration) {
 			meta.push(duration);
 		}
-		const tokenCount = this.tokenRollup(node);
-		if (tokenCount > 0) {
-			meta.push(this.formatTokens(tokenCount));
-		} else if (node.status === "running") {
-			meta.push("... tok");
-		}
-		const cost = this.costRollup(node);
-		if (cost > 0) {
-			meta.push(`$${cost.toFixed(4)}`);
-		}
 		if (meta.length > 0) {
-			parts.push(theme.fg("muted", `(${meta.join(", ")})`));
+			parts.push(theme.fg("muted", `· ${meta.join(" · ")}`));
 		}
 		if (node.answerPreview) {
-			parts.push(theme.fg("toolOutput", `-> "${node.answerPreview}"`));
+			parts.push(theme.fg("toolOutput", `· "${node.answerPreview}"`));
 		}
 		return parts.join(" ");
 	}
@@ -180,15 +164,15 @@ export class SubAgentTreeComponent implements Component {
 	private statusLabel(status: SubAgentStatus): string {
 		switch (status) {
 			case "queued":
-				return theme.fg("muted", "[queued]");
+				return theme.fg("muted", "queued");
 			case "running":
-				return theme.fg("bashMode", "[running]");
+				return theme.fg("accent", "running");
 			case "done":
-				return theme.fg("success", "[done]");
+				return theme.fg("success", "done");
 			case "error":
-				return theme.fg("error", "[error]");
+				return theme.fg("error", "error");
 			case "cancelled":
-				return theme.fg("warning", "[cancelled]");
+				return theme.fg("warning", "cancelled");
 		}
 	}
 
@@ -202,22 +186,7 @@ export class SubAgentTreeComponent implements Component {
 		return `${(durationMs / 1000).toFixed(1)}s`;
 	}
 
-	private formatTokens(tokens: number): string {
-		if (tokens >= 1000) {
-			return `${(tokens / 1000).toFixed(1)}k tok`;
-		}
-		return `${tokens} tok`;
-	}
-
-	private tokenRollup(node: SubAgentTreeNode): number {
-		const own = node.tokenCount ?? 0;
-		const children = node.children?.reduce((total, child) => total + this.tokenRollup(child), 0) ?? 0;
-		return own + children;
-	}
-
-	private costRollup(node: SubAgentTreeNode): number {
-		const own = node.costUsd ?? 0;
-		const children = node.children?.reduce((total, child) => total + this.costRollup(child), 0) ?? 0;
-		return own + children;
+	private treeEdge(text: string): string {
+		return theme.fg("accent", text);
 	}
 }

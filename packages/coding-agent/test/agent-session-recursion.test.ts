@@ -164,6 +164,17 @@ describe("AgentSession rlm recursion", () => {
 
 	it("runs a child session under a sub directory and returns an RLM-shaped result", async () => {
 		const root = createSession();
+		const childUpdates: Array<{
+			status: string;
+			label: string;
+			answerPreview?: string;
+			transcript: readonly { role: string; text: string }[];
+		}> = [];
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update") {
+				childUpdates.push(event.child);
+			}
+		});
 
 		const result = await root.runRlmChild("summarize shard 1");
 
@@ -174,6 +185,12 @@ describe("AgentSession rlm recursion", () => {
 		expect(basename(result.session_dir!)).toMatch(/^sub-/);
 		expect(existsSync(result.session_dir!)).toBe(true);
 		expect(readdirSync(result.session_dir!).some((name) => name.endsWith(".jsonl"))).toBe(true);
+		expect(childUpdates[0]?.status).toBe("running");
+		expect(childUpdates[0]?.label).toBe("summarize shard 1");
+		const doneUpdate = [...childUpdates].reverse().find((update) => update.status === "done");
+		expect(doneUpdate?.answerPreview).toBe("child answer: summarize shard 1");
+		expect(doneUpdate?.transcript).toContainEqual({ role: "user", text: "summarize shard 1" });
+		expect(doneUpdate?.transcript).toContainEqual({ role: "assistant", text: "child answer: summarize shard 1" });
 	});
 
 	it("adds child usage to the parent session aggregate", async () => {

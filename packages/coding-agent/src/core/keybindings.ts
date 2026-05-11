@@ -21,6 +21,7 @@ export interface AppKeybindings {
 	"app.model.select": true;
 	"app.tools.expand": true;
 	"app.thinking.toggle": true;
+	"app.subagents.focus": true;
 	"app.session.toggleNamedFilter": true;
 	"app.editor.external": true;
 	"app.message.followUp": true;
@@ -86,6 +87,10 @@ export const KEYBINDINGS = {
 	"app.thinking.toggle": {
 		defaultKeys: "ctrl+t",
 		description: "Toggle thinking blocks",
+	},
+	"app.subagents.focus": {
+		defaultKeys: "alt+a",
+		description: "Focus child agents",
 	},
 	"app.session.toggleNamedFilter": {
 		defaultKeys: "ctrl+n",
@@ -243,6 +248,7 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	selectModel: "app.model.select",
 	expandTools: "app.tools.expand",
 	toggleThinking: "app.thinking.toggle",
+	focusSubagents: "app.subagents.focus",
 	toggleSessionNamedFilter: "app.session.toggleNamedFilter",
 	externalEditor: "app.editor.external",
 	followUp: "app.message.followUp",

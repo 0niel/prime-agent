@@ -623,17 +623,25 @@ again, hello world`,
 			const lines = markdown.render(80);
 			const plainLines = lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
 
-			const closingBackticksIndex = plainLines.indexOf("```");
-			assert.ok(closingBackticksIndex !== -1, "Should have closing backticks");
+			const codeBlockIndex = plainLines.indexOf('  const hello = "world";');
+			assert.ok(codeBlockIndex !== -1, "Should have code block content");
 
-			const afterBackticks = plainLines.slice(closingBackticksIndex + 1);
-			const emptyLineCount = afterBackticks.findIndex((line) => line !== "");
+			const afterCodeBlock = plainLines.slice(codeBlockIndex + 1);
+			const emptyLineCount = afterCodeBlock.findIndex((line) => line !== "");
 
 			assert.strictEqual(
 				emptyLineCount,
 				1,
-				`Expected 1 empty line after code block, but found ${emptyLineCount}. Lines after backticks: ${JSON.stringify(afterBackticks.slice(0, 5))}`,
+				`Expected 1 empty line after code block, but found ${emptyLineCount}. Lines after code block: ${JSON.stringify(afterCodeBlock.slice(0, 5))}`,
 			);
+		});
+
+		it("should not render code fence markers or language labels", () => {
+			const markdown = new Markdown("```python\nprint('hello')\n```", 0, 0, defaultMarkdownTheme);
+			const lines = markdown.render(80);
+			const plainLines = lines.map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+
+			assert.deepStrictEqual(plainLines, ["  print('hello')"]);
 		});
 
 		it("should normalize paragraph and code block spacing to one blank line", () => {
@@ -651,7 +659,7 @@ code block
 
 more text`,
 			];
-			const expectedLines = ["hello this is text", "", "```", "  code block", "```", "", "more text"];
+			const expectedLines = ["hello this is text", "", "  code block", "", "more text"];
 
 			for (const text of cases) {
 				const markdown = new Markdown(text, 0, 0, defaultMarkdownTheme);

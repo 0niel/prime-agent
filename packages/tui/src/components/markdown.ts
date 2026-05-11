@@ -332,21 +332,7 @@ export class Markdown implements Component {
 			}
 
 			case "code": {
-				const indent = this.theme.codeBlockIndent ?? "  ";
-				lines.push(this.theme.codeBlockBorder(`\`\`\`${token.lang || ""}`));
-				if (this.theme.highlightCode) {
-					const highlightedLines = this.theme.highlightCode(token.text, token.lang);
-					for (const hlLine of highlightedLines) {
-						lines.push(`${indent}${hlLine}`);
-					}
-				} else {
-					// Split code by newlines and style each line
-					const codeLines = token.text.split("\n");
-					for (const codeLine of codeLines) {
-						lines.push(`${indent}${this.theme.codeBlock(codeLine)}`);
-					}
-				}
-				lines.push(this.theme.codeBlockBorder("```"));
+				lines.push(...this.renderCodeBlock(token));
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after code blocks (unless space token follows)
 				}
@@ -621,20 +607,7 @@ export class Markdown implements Component {
 				lines.push(text);
 			} else if (token.type === "code") {
 				// Code block in list item
-				const indent = this.theme.codeBlockIndent ?? "  ";
-				lines.push(this.theme.codeBlockBorder(`\`\`\`${token.lang || ""}`));
-				if (this.theme.highlightCode) {
-					const highlightedLines = this.theme.highlightCode(token.text, token.lang);
-					for (const hlLine of highlightedLines) {
-						lines.push(`${indent}${hlLine}`);
-					}
-				} else {
-					const codeLines = token.text.split("\n");
-					for (const codeLine of codeLines) {
-						lines.push(`${indent}${this.theme.codeBlock(codeLine)}`);
-					}
-				}
-				lines.push(this.theme.codeBlockBorder("```"));
+				lines.push(...this.renderCodeBlock(token));
 			} else {
 				// Other token types - try to render as inline
 				const text = this.renderInlineTokens([token], styleContext);
@@ -645,6 +618,21 @@ export class Markdown implements Component {
 		}
 
 		return lines;
+	}
+
+	private renderCodeBlock(token: Token): string[] {
+		if (!("text" in token) || typeof token.text !== "string") {
+			return [];
+		}
+
+		const indent = this.theme.codeBlockIndent ?? "  ";
+		const lang = "lang" in token && typeof token.lang === "string" ? token.lang : undefined;
+		const renderedCodeLines = this.theme.highlightCode
+			? this.theme.highlightCode(token.text, lang)
+			: token.text.split("\n").map((codeLine) => this.theme.codeBlock(codeLine));
+		const codeLines = renderedCodeLines.length > 0 ? renderedCodeLines : [this.theme.codeBlock("")];
+
+		return codeLines.map((codeLine) => `${indent}${codeLine}`);
 	}
 
 	/**

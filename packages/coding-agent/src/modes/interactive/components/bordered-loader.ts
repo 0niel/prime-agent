@@ -17,7 +17,7 @@ export class BorderedLoader extends Container {
 		if (this.cancellable) {
 			this.loader = new CancellableLoader(
 				tui,
-				(s) => theme.fg("accent", s),
+				(s) => theme.fg("muted", s),
 				(s) => theme.fg("muted", s),
 				message,
 			);
@@ -25,7 +25,7 @@ export class BorderedLoader extends Container {
 			this.signalController = new AbortController();
 			this.loader = new Loader(
 				tui,
-				(s) => theme.fg("accent", s),
+				(s) => theme.fg("muted", s),
 				(s) => theme.fg("muted", s),
 				message,
 			);

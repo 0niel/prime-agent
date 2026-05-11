@@ -126,6 +126,24 @@ export function parseSkillBlock(text: string): ParsedSkillBlock | null {
 	};
 }
 
+export type RlmChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
+
+export interface RlmChildAgentTranscriptLine {
+	role: "user" | "assistant" | "tool" | "system";
+	text: string;
+}
+
+export interface RlmChildAgentSnapshot {
+	id: string;
+	parentId?: string;
+	label: string;
+	status: RlmChildAgentStatus;
+	durationMs?: number;
+	answerPreview?: string;
+	sessionDir: string;
+	transcript: readonly RlmChildAgentTranscriptLine[];
+}
+
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
 	| AgentEvent
@@ -146,7 +164,8 @@ export type AgentSessionEvent =
 			errorMessage?: string;
 	  }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
-	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
+	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| { type: "rlm_child_update"; child: RlmChildAgentSnapshot };
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -189,6 +208,8 @@ export interface AgentSessionConfig {
 	rlmMaxDepth?: number;
 	/** Directory exposed to the kernel as RLM_SESSION_DIR. */
 	rlmSessionDir?: string;
+	/** Node id for this session when it is itself an RLM child. */
+	rlmParentNodeId?: string;
 }
 
 export interface ExtensionBindings {
@@ -296,6 +317,63 @@ function addAssistantUsage(total: Usage, usage: Usage): void {
 	total.cost.total += usage.cost.total;
 }
 
+function compactRlmText(text: string, maxLength = 160): string {
+	const compact = text.replace(/\s+/g, " ").trim();
+	if (compact.length <= maxLength) {
+		return compact;
+	}
+	return `${compact.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+function readTextBlocks(content: string | Array<{ type: string; text?: string }>): string {
+	if (typeof content === "string") {
+		return content;
+	}
+	return content
+		.filter((block) => block.type === "text" && typeof block.text === "string")
+		.map((block) => block.text ?? "")
+		.join("\n");
+}
+
+function readAssistantText(message: AssistantMessage): string {
+	return message.content
+		.filter((block) => block.type === "text")
+		.map((block) => block.text)
+		.join("");
+}
+
+function readToolResultText(result: unknown): string | undefined {
+	if (!result || typeof result !== "object" || !("content" in result)) {
+		return undefined;
+	}
+	const content = (result as { content?: unknown }).content;
+	if (!Array.isArray(content)) {
+		return undefined;
+	}
+	const text = content
+		.filter(
+			(block): block is { type: string; text: string } =>
+				!!block &&
+				typeof block === "object" &&
+				"type" in block &&
+				"text" in block &&
+				block.type === "text" &&
+				typeof block.text === "string",
+		)
+		.map((block) => block.text)
+		.join("\n");
+	return text.trim() ? text : undefined;
+}
+
+function formatRlmToolArgs(args: unknown): string | undefined {
+	try {
+		const text = JSON.stringify(args);
+		return text && text !== "{}" ? compactRlmText(text, 96) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 	const parentContextTokens =
 		parentUsage.totalTokens ||
@@ -370,6 +448,7 @@ export class AgentSession {
 	private _rlmDepth: number;
 	private _rlmMaxDepth: number;
 	private _rlmSessionDir?: string;
+	private _rlmParentNodeId?: string;
 
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
@@ -401,6 +480,7 @@ export class AgentSession {
 		this._rlmDepth = config.rlmDepth ?? parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH");
 		this._rlmMaxDepth = config.rlmMaxDepth ?? parseDepth(process.env.RLM_MAX_DEPTH, 1, "RLM_MAX_DEPTH");
 		this._rlmSessionDir = config.rlmSessionDir;
+		this._rlmParentNodeId = config.rlmParentNodeId;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -2591,6 +2671,45 @@ export class AgentSession {
 		}
 
 		const childSessionDir = this._createChildRlmSessionDir();
+		const childNodeId = basename(childSessionDir);
+		const startedAt = Date.now();
+		const transcript: RlmChildAgentTranscriptLine[] = [];
+		const label = compactRlmText(prompt, 80) || "child agent";
+		let status: RlmChildAgentStatus = "running";
+		let answerPreview: string | undefined;
+		let durationMs: number | undefined;
+		let assistantTranscriptIndex: number | undefined;
+		let lastToolTranscriptIndex: number | undefined;
+		const emitChildUpdate = () => {
+			this._emit({
+				type: "rlm_child_update",
+				child: {
+					id: childNodeId,
+					parentId: this._rlmParentNodeId,
+					label,
+					status,
+					durationMs,
+					answerPreview,
+					sessionDir: childSessionDir,
+					transcript: [...transcript],
+				},
+			});
+		};
+		const setAssistantTranscript = (text: string) => {
+			const compact = compactRlmText(text);
+			if (!compact) {
+				return;
+			}
+			answerPreview = compact;
+			if (assistantTranscriptIndex === undefined) {
+				assistantTranscriptIndex = transcript.length;
+				transcript.push({ role: "assistant", text: compact });
+			} else {
+				transcript[assistantTranscriptIndex] = { role: "assistant", text: compact };
+			}
+		};
+		emitChildUpdate();
+
 		const childSessionManager = SessionManager.create(this._cwd, childSessionDir);
 		childSessionManager.appendModelChange(model.provider, model.id);
 		childSessionManager.appendThinkingLevelChange(this.thinkingLevel);
@@ -2631,7 +2750,69 @@ export class AgentSession {
 			rlmDepth: this._rlmDepth + 1,
 			rlmMaxDepth: this._rlmMaxDepth,
 			rlmSessionDir: childSessionDir,
+			rlmParentNodeId: childNodeId,
 			sessionStartEvent: { type: "session_start", reason: "startup" },
+		});
+		const unsubscribeChild = child.subscribe((event) => {
+			if (event.type === "rlm_child_update") {
+				this._emit(event);
+				return;
+			}
+			switch (event.type) {
+				case "message_start": {
+					if (event.message.role === "user") {
+						const text = compactRlmText(readTextBlocks(event.message.content));
+						if (text) {
+							transcript.push({ role: "user", text });
+						}
+					} else if (event.message.role === "assistant") {
+						setAssistantTranscript(readAssistantText(event.message as AssistantMessage));
+					}
+					emitChildUpdate();
+					break;
+				}
+				case "message_update":
+				case "message_end": {
+					if (event.message.role === "assistant") {
+						setAssistantTranscript(readAssistantText(event.message as AssistantMessage));
+						emitChildUpdate();
+					}
+					break;
+				}
+				case "tool_execution_start": {
+					const args = formatRlmToolArgs(event.args);
+					lastToolTranscriptIndex = transcript.length;
+					transcript.push({
+						role: "tool",
+						text: args ? `${event.toolName} running ${args}` : `${event.toolName} running`,
+					});
+					emitChildUpdate();
+					break;
+				}
+				case "tool_execution_update": {
+					const text = readToolResultText(event.partialResult);
+					if (text && lastToolTranscriptIndex !== undefined) {
+						transcript[lastToolTranscriptIndex] = {
+							role: "tool",
+							text: `${event.toolName} running: ${compactRlmText(text)}`,
+						};
+						emitChildUpdate();
+					}
+					break;
+				}
+				case "tool_execution_end": {
+					const text = readToolResultText(event.result);
+					const summary = text ? `${event.toolName}: ${compactRlmText(text)}` : `${event.toolName} done`;
+					if (lastToolTranscriptIndex === undefined) {
+						lastToolTranscriptIndex = transcript.length;
+						transcript.push({ role: "tool", text: summary });
+					} else {
+						transcript[lastToolTranscriptIndex] = { role: "tool", text: summary };
+					}
+					emitChildUpdate();
+					break;
+				}
+			}
 		});
 
 		try {
@@ -2640,13 +2821,24 @@ export class AgentSession {
 			const answer = child.getLastAssistantText() ?? "";
 			const usage = child._usageForCurrentMessages();
 			this._attributeRlmChildUsageToParent(child._assistantUsageForCurrentMessages());
+			status = "done";
+			durationMs = Date.now() - startedAt;
+			setAssistantTranscript(answer);
+			emitChildUpdate();
 			return {
 				answer,
 				usage,
 				turns: child._assistantTurnCount(),
 				session_dir: childSessionDir,
 			};
+		} catch (error) {
+			status = "error";
+			durationMs = Date.now() - startedAt;
+			transcript.push({ role: "system", text: error instanceof Error ? error.message : String(error) });
+			emitChildUpdate();
+			throw error;
 		} finally {
+			unsubscribeChild();
 			child.dispose();
 		}
 	}

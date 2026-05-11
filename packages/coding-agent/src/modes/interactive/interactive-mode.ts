@@ -43,6 +43,7 @@ import {
 	Text,
 	TruncatedText,
 	TUI,
+	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "child_process";
@@ -56,7 +57,12 @@ import {
 	getShareViewerUrl,
 	VERSION,
 } from "../../config.js";
-import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.js";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	parseSkillBlock,
+	type RlmChildAgentSnapshot,
+} from "../../core/agent-session.js";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.js";
 import type {
 	AutocompleteProviderFactory,
@@ -81,6 +87,7 @@ import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.js";
 import type { SourceInfo } from "../../core/source-info.js";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.js";
 import type { TruncationResult } from "../../core/tools/truncate.js";
+import { PRIME_LOGO_SMALL } from "../../themes/prime-logo.js";
 import { getChangelogPath, getNewEntries, parseChangelog } from "../../utils/changelog.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.js";
@@ -95,6 +102,12 @@ import { AssistantMessageComponent } from "./components/assistant-message.js";
 import { BashExecutionComponent } from "./components/bash-execution.js";
 import { BorderedLoader } from "./components/bordered-loader.js";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.js";
+import {
+	ChildAgentDetailComponent,
+	ChildAgentInspectorComponent,
+	type ChildAgentInspectorNode,
+	type ChildAgentTranscriptLine,
+} from "./components/child-agent-inspector.js";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
@@ -157,6 +170,72 @@ class ExpandableText extends Text implements Expandable {
 
 	setExpanded(expanded: boolean): void {
 		this.setText(expanded ? this.getExpandedText() : this.getCollapsedText());
+	}
+}
+
+function isTerminalImageLine(line: string): boolean {
+	return line.includes("\x1b_G") || line.includes("\x1b]1337;File=");
+}
+
+class RightSidebarLayoutComponent implements Component {
+	private readonly preferredSidebarWidth = 34;
+	private readonly minSidebarWidth = 28;
+	private readonly minSideBySideWidth = 88;
+	private readonly gapWidth = 1;
+
+	constructor(
+		private readonly main: Component,
+		private readonly sidebar: Component,
+		private readonly getViewportHeight: () => number,
+	) {}
+
+	invalidate(): void {
+		this.main.invalidate?.();
+		this.sidebar.invalidate?.();
+	}
+
+	render(width: number): string[] {
+		const safeWidth = Math.max(1, width);
+		const probeSidebarLines = this.sidebar.render(1);
+		if (probeSidebarLines.length === 0) {
+			return this.main.render(safeWidth);
+		}
+
+		if (safeWidth < this.minSideBySideWidth) {
+			const sidebarHeight = Math.min(8, Math.max(1, this.getViewportHeight()));
+			const sidebarLines = this.sidebar.render(safeWidth).slice(0, sidebarHeight);
+			return [...sidebarLines, ...this.main.render(safeWidth)];
+		}
+
+		const sidebarWidth = Math.min(
+			this.preferredSidebarWidth,
+			Math.max(this.minSidebarWidth, Math.floor(safeWidth * 0.28)),
+		);
+		const mainWidth = Math.max(1, safeWidth - sidebarWidth - this.gapWidth);
+		const mainLines = this.main.render(mainWidth);
+		const viewportHeight = Math.max(1, this.getViewportHeight());
+		const sidebarLines = this.sidebar.render(sidebarWidth).slice(0, viewportHeight);
+		const height = Math.max(mainLines.length, viewportHeight);
+		const sidebarStart = Math.max(0, height - viewportHeight);
+		const blankSidebarLine = theme.bg("customMessageBg", " ".repeat(sidebarWidth));
+		const lines: string[] = [];
+
+		for (let index = 0; index < height; index++) {
+			const rawMainLine = mainLines[index] ?? "";
+			if (isTerminalImageLine(rawMainLine)) {
+				lines.push(rawMainLine);
+				continue;
+			}
+			const mainLine = truncateToWidth(rawMainLine, mainWidth, "");
+			const paddedMainLine = mainLine + " ".repeat(Math.max(0, mainWidth - visibleWidth(mainLine)));
+			const sidebarLine =
+				index >= sidebarStart
+					? truncateToWidth(sidebarLines[index - sidebarStart] ?? blankSidebarLine, sidebarWidth, "")
+					: blankSidebarLine;
+			lines.push(`${paddedMainLine}${" ".repeat(this.gapWidth)}${sidebarLine}`);
+		}
+
+		return lines;
 	}
 }
 
@@ -238,7 +317,9 @@ export class InteractiveMode {
 	private autocompleteProvider: AutocompleteProvider | undefined;
 	private autocompleteProviderWrappers: AutocompleteProviderFactory[] = [];
 	private fdPath: string | undefined;
+	private mainContainer: Container;
 	private editorContainer: Container;
+	private shellLayout: RightSidebarLayoutComponent;
 	private footer: FooterComponent;
 	private footerDataProvider: FooterDataProvider;
 	// Stored so the same manager can be injected into custom editors, selectors, and extension UI.
@@ -270,6 +351,14 @@ export class InteractiveMode {
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
+
+	// RLM child-agent inspector, kept as a right sidebar instead of chat-flow content.
+	private childAgentInspector: ChildAgentInspectorComponent;
+	private childAgentDetail: ChildAgentDetailComponent;
+	private childAgentDetailOverlayHandle: OverlayHandle | undefined;
+	private childAgentSnapshots = new Map<string, RlmChildAgentSnapshot>();
+	private childAgentNodes: ChildAgentInspectorNode[] = [];
+	private childAgentDetailNodeId: string | undefined;
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -364,6 +453,11 @@ export class InteractiveMode {
 		this.chatContainer = new Container();
 		this.pendingMessagesContainer = new Container();
 		this.statusContainer = new Container();
+		this.childAgentInspector = new ChildAgentInspectorComponent(() => this.ui.terminal.rows);
+		this.childAgentInspector.onCancel = () => this.unfocusChildAgentInspector();
+		this.childAgentInspector.onOpenDetail = (nodeId) => this.openChildAgentDetail(nodeId);
+		this.childAgentDetail = new ChildAgentDetailComponent(() => this.ui.terminal.rows);
+		this.childAgentDetail.onCancel = () => this.closeChildAgentDetail();
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
 		this.keybindings = KeybindingsManager.create();
@@ -375,8 +469,14 @@ export class InteractiveMode {
 			autocompleteMaxVisible,
 		});
 		this.editor = this.defaultEditor;
+		this.mainContainer = new Container();
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
+		this.shellLayout = new RightSidebarLayoutComponent(
+			this.mainContainer,
+			this.childAgentInspector,
+			() => this.ui.terminal.rows,
+		);
 		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
 		this.footer = new FooterComponent(this.session, this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
@@ -573,13 +673,41 @@ export class InteractiveMode {
 		// Add header container as first child
 		this.ui.addChild(this.headerContainer);
 
-		// Add header with keybindings from config (unless silenced)
-		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
-			const logo = theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", ` v${this.version}`);
+		// Brand splash: side-panel layout — white butterfly on the left, structured runtime
+		// metadata on the right. The mark carries the brand; no wordmark, no slogan.
+		// Cheatsheet behind --verbose.
+		const logoRaw = PRIME_LOGO_SMALL.split("\n");
+		const logoCanvasWidth = logoRaw.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
+		const gutter = 4;
+		const cwdLabel = (() => {
+			let p = this.sessionManager.getCwd();
+			const home = process.env.HOME || process.env.USERPROFILE;
+			if (home && p.startsWith(home)) p = `~${p.slice(home.length)}`;
+			return p;
+		})();
+		const modelId = this.session.state.model?.id;
+		const labelWidth = 9;
+		const labelled = (label: string, value: string) =>
+			theme.fg("dim", label.padEnd(labelWidth)) + theme.fg("muted", value);
+		const metaLines = [
+			labelled("version", `v${this.version}`),
+			labelled("model", modelId ?? "—"),
+			labelled("cwd", cwdLabel),
+			"",
+			theme.fg("dim", "type to start"),
+		];
+		const metaStart = Math.max(0, Math.floor((logoRaw.length - metaLines.length) / 2));
+		const composed = logoRaw.map((line, i) => {
+			const colored = theme.fg("text", line);
+			const padding = " ".repeat(Math.max(0, logoCanvasWidth - visibleWidth(line) + gutter));
+			const meta = i >= metaStart && i < metaStart + metaLines.length ? metaLines[i - metaStart] : "";
+			return colored + padding + meta;
+		});
+		const brandBlock = composed.join("\n");
 
-			// Build startup instructions using keybinding hint helpers
+		if (this.options.verbose) {
+			// Verbose: include the full keybinding cheatsheet under the brand mark.
 			const hint = (keybinding: AppKeybinding, description: string) => keyHint(keybinding, description);
-
 			const expandedInstructions = [
 				hint("app.interrupt", "to interrupt"),
 				hint("app.clear", "to clear"),
@@ -601,47 +729,26 @@ export class InteractiveMode {
 				hint("app.clipboard.pasteImage", "to paste image"),
 				rawKeyHint("drop files", "to attach"),
 			].join("\n");
-			const compactInstructions = [
-				hint("app.interrupt", "interrupt"),
-				rawKeyHint(`${keyText("app.clear")}/${keyText("app.exit")}`, "clear/exit"),
-				rawKeyHint("/", "commands"),
-				rawKeyHint("!", "bash"),
-				hint("app.tools.expand", "more"),
-			].join(theme.fg("muted", " · "));
-			const compactOnboarding = theme.fg(
-				"dim",
-				`Press ${keyText("app.tools.expand")} to show full startup help and loaded resources.`,
-			);
-			const onboarding = theme.fg(
-				"dim",
-				`Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.`,
-			);
-			this.builtInHeader = new ExpandableText(
-				() => `${logo}\n${compactInstructions}\n${compactOnboarding}\n\n${onboarding}`,
-				() => `${logo}\n${expandedInstructions}\n\n${onboarding}`,
-				this.getStartupExpansionState(),
-				1,
-				0,
-			);
-
-			// Setup UI layout
-			this.headerContainer.addChild(new Spacer(1));
-			this.headerContainer.addChild(this.builtInHeader);
-			this.headerContainer.addChild(new Spacer(1));
+			const verboseBlock = `${brandBlock}\n\n${expandedInstructions}`;
+			this.builtInHeader = new Text(verboseBlock, 1, 0);
 		} else {
-			// Minimal header when silenced
-			this.builtInHeader = new Text("", 0, 0);
-			this.headerContainer.addChild(this.builtInHeader);
+			this.builtInHeader = new Text(brandBlock, 1, 0);
 		}
 
-		this.ui.addChild(this.chatContainer);
-		this.ui.addChild(this.pendingMessagesContainer);
-		this.ui.addChild(this.statusContainer);
+		// Setup UI layout
+		this.headerContainer.addChild(new Spacer(1));
+		this.headerContainer.addChild(this.builtInHeader);
+		this.headerContainer.addChild(new Spacer(1));
+
+		this.mainContainer.addChild(this.chatContainer);
+		this.mainContainer.addChild(this.pendingMessagesContainer);
+		this.mainContainer.addChild(this.statusContainer);
 		this.renderWidgets(); // Initialize with default spacer
-		this.ui.addChild(this.widgetContainerAbove);
-		this.ui.addChild(this.editorContainer);
-		this.ui.addChild(this.widgetContainerBelow);
-		this.ui.addChild(this.footer);
+		this.mainContainer.addChild(this.widgetContainerAbove);
+		this.mainContainer.addChild(this.editorContainer);
+		this.mainContainer.addChild(this.widgetContainerBelow);
+		this.mainContainer.addChild(this.footer);
+		this.ui.addChild(this.shellLayout);
 		this.ui.setFocus(this.editor);
 
 		this.setupKeyHandlers();
@@ -1583,6 +1690,7 @@ export class InteractiveMode {
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
 		this.pendingTools.clear();
+		this.resetChildAgentInspector();
 		this.renderInitialMessages();
 	}
 
@@ -2388,6 +2496,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
+		this.defaultEditor.onAction("app.subagents.focus", () => this.focusChildAgentInspector());
 		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
 		this.defaultEditor.onAction("app.message.dequeue", () => this.handleDequeue());
@@ -2847,7 +2956,7 @@ export class InteractiveMode {
 						: `${event.reason === "overflow" ? "Context overflow detected, " : ""}Auto-compacting... ${cancelHint}`;
 				this.autoCompactionLoader = new Loader(
 					this.ui,
-					(spinner) => theme.fg("accent", spinner),
+					(spinner) => theme.fg("muted", spinner),
 					(text) => theme.fg("muted", text),
 					label,
 				);
@@ -2912,7 +3021,7 @@ export class InteractiveMode {
 					`Retrying (${event.attempt}/${event.maxAttempts}) in ${seconds}s... (${keyText("app.interrupt")} to cancel)`;
 				this.retryLoader = new Loader(
 					this.ui,
-					(spinner) => theme.fg("warning", spinner),
+					(spinner) => theme.fg("muted", spinner),
 					(text) => theme.fg("muted", text),
 					retryMessage(Math.ceil(event.delayMs / 1000)),
 				);
@@ -2954,7 +3063,118 @@ export class InteractiveMode {
 				this.ui.requestRender();
 				break;
 			}
+
+			case "rlm_child_update":
+				this.updateChildAgentInspector(event.child);
+				break;
 		}
+	}
+
+	private updateChildAgentInspector(child: RlmChildAgentSnapshot): void {
+		this.childAgentSnapshots.set(child.id, child);
+		this.childAgentNodes = this.buildChildAgentInspectorNodes();
+		this.childAgentInspector.setNodes(this.childAgentNodes);
+		if (this.childAgentDetailNodeId) {
+			this.childAgentDetail.setNode(this.findChildAgentInspectorNode(this.childAgentDetailNodeId));
+		}
+		this.ui.requestRender();
+	}
+
+	private resetChildAgentInspector(): void {
+		this.childAgentSnapshots.clear();
+		this.childAgentNodes = [];
+		this.childAgentInspector.setNodes([]);
+		this.childAgentDetail.setNode(undefined);
+		this.childAgentDetailNodeId = undefined;
+		this.childAgentDetailOverlayHandle?.hide();
+		this.childAgentDetailOverlayHandle = undefined;
+	}
+
+	private openChildAgentDetail(nodeId: string): void {
+		const node = this.findChildAgentInspectorNode(nodeId);
+		if (!node) {
+			return;
+		}
+		this.childAgentDetailNodeId = nodeId;
+		this.childAgentDetail.setNode(node);
+		this.childAgentDetailOverlayHandle?.hide();
+		this.childAgentDetailOverlayHandle = this.ui.showOverlay(this.childAgentDetail, {
+			width: "100%",
+			maxHeight: "100%",
+			anchor: "top-left",
+			margin: 0,
+		});
+		this.ui.requestRender();
+	}
+
+	private focusChildAgentInspector(): void {
+		if (this.childAgentSnapshots.size === 0) {
+			return;
+		}
+		this.ui.setFocus(this.childAgentInspector);
+		this.ui.requestRender();
+	}
+
+	private unfocusChildAgentInspector(): void {
+		this.closeChildAgentDetail(false);
+		this.ui.setFocus(this.editor);
+		this.ui.requestRender();
+	}
+
+	private closeChildAgentDetail(focusInspector = true): void {
+		this.childAgentDetailOverlayHandle?.hide();
+		this.childAgentDetailOverlayHandle = undefined;
+		this.childAgentDetailNodeId = undefined;
+		this.childAgentDetail.setNode(undefined);
+		if (focusInspector && this.childAgentSnapshots.size > 0) {
+			this.ui.setFocus(this.childAgentInspector);
+		} else {
+			this.ui.setFocus(this.editor);
+		}
+		this.ui.requestRender();
+	}
+
+	private buildChildAgentInspectorNodes(): ChildAgentInspectorNode[] {
+		const childrenByParent = new Map<string | undefined, RlmChildAgentSnapshot[]>();
+		for (const child of this.childAgentSnapshots.values()) {
+			const siblings = childrenByParent.get(child.parentId) ?? [];
+			siblings.push(child);
+			childrenByParent.set(child.parentId, siblings);
+		}
+
+		const build = (child: RlmChildAgentSnapshot): ChildAgentInspectorNode => ({
+			id: child.id,
+			label: child.label,
+			status: child.status,
+			durationMs: child.durationMs,
+			answerPreview: child.answerPreview,
+			sessionDir: child.sessionDir,
+			transcript: child.transcript.map(
+				(line): ChildAgentTranscriptLine => ({
+					role: line.role,
+					text: line.text,
+				}),
+			),
+			children: childrenByParent.get(child.id)?.map(build),
+		});
+
+		return (childrenByParent.get(undefined) ?? []).map(build);
+	}
+
+	private findChildAgentInspectorNode(nodeId: string): ChildAgentInspectorNode | undefined {
+		const visit = (nodes: readonly ChildAgentInspectorNode[]): ChildAgentInspectorNode | undefined => {
+			for (const node of nodes) {
+				if (node.id === nodeId) {
+					return node;
+				}
+				const child = visit(node.children ?? []);
+				if (child) {
+					return child;
+				}
+			}
+			return undefined;
+		};
+		return visit(this.childAgentNodes);
 	}
 
 	/** Extract text content from a user message */
@@ -3368,11 +3588,13 @@ export class InteractiveMode {
 	}
 
 	private updateEditorBorderColor(): void {
+		// Bash mode: green border. Otherwise: always white. The thinking-level color ramp lived
+		// here in pi-mono, but the prime brand reserves indigo for accent moments — the input
+		// frame stays neutral so the focus indicator doesn't fight the splash.
 		if (this.isBashMode) {
 			this.editor.borderColor = theme.getBashModeBorderColor();
 		} else {
-			const level = this.session.thinkingLevel || "off";
-			this.editor.borderColor = theme.getThinkingBorderColor(level);
+			this.editor.borderColor = (str: string) => theme.fg("text", str);
 		}
 		this.ui.requestRender();
 	}
@@ -3768,7 +3990,7 @@ export class InteractiveMode {
 					transport: this.settingsManager.getTransport(),
 					thinkingLevel: this.session.thinkingLevel,
 					availableThinkingLevels: this.session.getAvailableThinkingLevels(),
-					currentTheme: this.settingsManager.getTheme() || "dark",
+					currentTheme: this.settingsManager.getTheme() || "prime",
 					availableThemes: getAvailableThemes(),
 					hideThinkingBlock: this.hideThinkingBlock,
 					collapseChangelog: this.settingsManager.getCollapseChangelog(),
@@ -4232,7 +4454,7 @@ export class InteractiveMode {
 						this.chatContainer.addChild(new Spacer(1));
 						summaryLoader = new Loader(
 							this.ui,
-							(spinner) => theme.fg("accent", spinner),
+							(spinner) => theme.fg("muted", spinner),
 							(text) => theme.fg("muted", text),
 							`Summarizing branch... (${keyText("app.interrupt")} to cancel)`,
 						);
