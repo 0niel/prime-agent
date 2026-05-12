@@ -8,7 +8,14 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
-import type { RlmRunHandler, RlmRunResult } from "../rlm-runtime.js";
+import type {
+	RlmBackgroundRunHandler,
+	RlmBackgroundRunStatusHandler,
+	RlmBackgroundRunStatusResult,
+	RlmBackgroundRunWaitHandler,
+	RlmRunHandler,
+	RlmRunResult,
+} from "../rlm-runtime.js";
 import { ensureKernelPython } from "./bootstrap.js";
 
 const DELIM = Buffer.from("<IDS|MSG>");
@@ -27,6 +34,9 @@ export interface KernelManagerOptions {
 	env?: Record<string, string>;
 	sessionId?: string;
 	rlmRunHandler?: RlmRunHandler;
+	rlmBackgroundRunHandler?: RlmBackgroundRunHandler;
+	rlmBackgroundStatusHandler?: RlmBackgroundRunStatusHandler;
+	rlmBackgroundWaitHandler?: RlmBackgroundRunWaitHandler;
 	/** Default: "prime-agent". */
 	username?: string;
 }
@@ -48,6 +58,8 @@ export interface ExecuteResult {
 	error?: { ename: string; evalue: string; traceback: string[] };
 	durationMs: number;
 }
+
+type RlmCommResult = RlmRunResult | RlmBackgroundRunStatusResult;
 
 interface ConnectionInfo {
 	ip: string;
@@ -82,6 +94,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function parseOptionalTimeoutMs(value: unknown): number | undefined {
+	if (value === undefined || value === null) {
+		return undefined;
+	}
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+		throw new Error("rlm.run background wait timeout_ms must be a non-negative number");
+	}
+	return value;
 }
 
 // ---- wire format ---------------------------------------------------------
@@ -246,7 +268,17 @@ function installSignalHandlersOnce(): void {
 // ---- kernel manager ------------------------------------------------------
 
 export class KernelManager {
-	private readonly options: Pick<KernelManagerOptions, "python" | "cwd" | "env" | "sessionId" | "rlmRunHandler"> &
+	private readonly options: Pick<
+		KernelManagerOptions,
+		| "python"
+		| "cwd"
+		| "env"
+		| "sessionId"
+		| "rlmRunHandler"
+		| "rlmBackgroundRunHandler"
+		| "rlmBackgroundStatusHandler"
+		| "rlmBackgroundWaitHandler"
+	> &
 		Required<Pick<KernelManagerOptions, "username">>;
 	private readonly session = uuid();
 	private readonly commTargets = new Map<string, string>();
@@ -272,6 +304,9 @@ export class KernelManager {
 			env: options.env,
 			sessionId: options.sessionId,
 			rlmRunHandler: options.rlmRunHandler,
+			rlmBackgroundRunHandler: options.rlmBackgroundRunHandler,
+			rlmBackgroundStatusHandler: options.rlmBackgroundStatusHandler,
+			rlmBackgroundWaitHandler: options.rlmBackgroundWaitHandler,
 			username: options.username ?? "prime-agent",
 		};
 	}
@@ -593,7 +628,7 @@ export class KernelManager {
 
 		const task = (async () => {
 			try {
-				const result = await this.handleRlmRunRequest(data);
+				const result = await this.handleRlmCommRequest(data);
 				try {
 					await this.sendCommMessage(commId, { status: "ok", ...result });
 				} catch (replyError) {
@@ -618,22 +653,58 @@ export class KernelManager {
 		});
 	}
 
-	private async handleRlmRunRequest(data: unknown): Promise<RlmRunResult> {
-		const handler = this.options.rlmRunHandler;
-		if (!handler) {
-			throw new Error("rlm.run is not available in this session");
-		}
+	private async handleRlmCommRequest(data: unknown): Promise<RlmCommResult> {
 		if (!isRecord(data)) {
 			throw new Error("rlm.run comm payload must be an object");
 		}
-		if (data.type !== "run") {
-			throw new Error("rlm.run comm payload must have type 'run'");
+
+		if (data.type === "run") {
+			const handler = this.options.rlmRunHandler;
+			if (!handler) {
+				throw new Error("rlm.run is not available in this session");
+			}
+			if (typeof data.prompt !== "string") {
+				throw new Error("rlm.run prompt must be a string");
+			}
+			const kwargs = isRecord(data.kwargs) ? data.kwargs : {};
+			return handler({ prompt: data.prompt, kwargs });
 		}
-		if (typeof data.prompt !== "string") {
-			throw new Error("rlm.run prompt must be a string");
+
+		if (data.type === "background") {
+			const handler = this.options.rlmBackgroundRunHandler;
+			if (!handler) {
+				throw new Error("rlm.background is not available in this session");
+			}
+			if (typeof data.prompt !== "string") {
+				throw new Error("rlm.background prompt must be a string");
+			}
+			const kwargs = isRecord(data.kwargs) ? data.kwargs : {};
+			return handler({ prompt: data.prompt, kwargs });
 		}
-		const kwargs = isRecord(data.kwargs) ? data.kwargs : {};
-		return handler({ prompt: data.prompt, kwargs });
+
+		if (data.type === "background_status") {
+			const handler = this.options.rlmBackgroundStatusHandler;
+			if (!handler) {
+				throw new Error("rlm.background status is not available in this session");
+			}
+			if (typeof data.id !== "string") {
+				throw new Error("rlm.background status id must be a string");
+			}
+			return handler({ id: data.id });
+		}
+
+		if (data.type === "background_wait") {
+			const handler = this.options.rlmBackgroundWaitHandler;
+			if (!handler) {
+				throw new Error("rlm.background wait is not available in this session");
+			}
+			if (typeof data.id !== "string") {
+				throw new Error("rlm.background wait id must be a string");
+			}
+			return handler({ id: data.id, timeoutMs: parseOptionalTimeoutMs(data.timeout_ms) });
+		}
+
+		throw new Error("rlm.run comm payload must have a supported type");
 	}
 
 	private async sendCommMessage(commId: string, data: Record<string, unknown>): Promise<void> {

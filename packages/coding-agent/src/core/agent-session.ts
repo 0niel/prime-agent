@@ -102,7 +102,12 @@ import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
-import type { RlmRunResult, RlmUsage } from "./rlm-runtime.js";
+import type {
+	RlmBackgroundRunStartResult,
+	RlmBackgroundRunStatusResult,
+	RlmRunResult,
+	RlmUsage,
+} from "./rlm-runtime.js";
 import type { BranchSummaryEntry, CompactionEntry, SessionMessageEntry } from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
@@ -299,12 +304,57 @@ type GoalSlashCommand =
 	| { kind: "resume" }
 	| { kind: "start"; objective: string; tokenBudget?: number };
 
+interface RlmChildRun {
+	id: string;
+	prompt: string;
+	sessionDir: string;
+	status: RlmChildAgentStatus;
+	completionPolicy: BackgroundRlmCompletionPolicy;
+	result?: RlmRunResult;
+	error?: string;
+	task?: Promise<RlmRunResult>;
+	waiters: Set<() => void>;
+	abort: () => void;
+}
+
+type BackgroundRlmCompletionPolicy = "passive" | "wake" | "silent";
+
 // ============================================================================
 // Constants
 // ============================================================================
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
+const BACKGROUND_RLM_COMPLETION_DEBOUNCE_MS = 250;
+
+function noopRlmChildAbort(): void {}
+
+function parseBackgroundRlmCompletionPolicy(value: unknown): BackgroundRlmCompletionPolicy {
+	if (value === undefined) {
+		return "passive";
+	}
+	if (value === true) {
+		return "wake";
+	}
+	if (value === false || value === null) {
+		return "silent";
+	}
+	if (value === "passive" || value === "wake" || value === "silent") {
+		return value;
+	}
+	throw new Error("rlm.background notify must be 'passive', 'wake', 'silent', true, or false");
+}
+
+function extractBackgroundRlmOptions(kwargs: Record<string, unknown>): {
+	childKwargs: Record<string, unknown>;
+	completionPolicy: BackgroundRlmCompletionPolicy;
+} {
+	const { notify, ...childKwargs } = kwargs;
+	return {
+		childKwargs,
+		completionPolicy: parseBackgroundRlmCompletionPolicy(notify),
+	};
+}
 
 function parseDepth(value: string | undefined, fallback: number, name: string): number {
 	if (value === undefined || value === "") {
@@ -495,11 +545,16 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
+	private _disposed = false;
 	private _ipythonKernelManagerRef: { current?: KernelManager } = {};
 	private _rlmDepth: number;
 	private _rlmMaxDepth: number;
 	private _rlmSessionDir?: string;
 	private _rlmParentNodeId?: string;
+	private _backgroundRlmRuns = new Map<string, RlmChildRun>();
+	private _pendingBackgroundRlmCompletions: RlmChildRun[] = [];
+	private _backgroundRlmCompletionTimer?: ReturnType<typeof globalThis.setTimeout>;
+	private _backgroundRlmQueueDrainPromise?: Promise<void>;
 
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
@@ -1433,6 +1488,27 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		if (this._disposed) {
+			return;
+		}
+		this._disposed = true;
+		for (const run of this._backgroundRlmRuns.values()) {
+			if (run.status === "running" || run.status === "queued") {
+				run.status = "cancelled";
+				run.error = "Parent session disposed";
+				run.abort();
+				this._resolveRlmChildRunWaiters(run);
+			}
+		}
+		if (this._backgroundRlmCompletionTimer) {
+			globalThis.clearTimeout(this._backgroundRlmCompletionTimer);
+			this._backgroundRlmCompletionTimer = undefined;
+		}
+		this._pendingBackgroundRlmCompletions = [];
+		this._pendingNextTurnMessages = [];
+		this._steeringMessages = [];
+		this._followUpMessages = [];
+		this.agent.clearAllQueues();
 		this._extensionRunner.invalidate(
 			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 		);
@@ -1752,6 +1828,12 @@ export class AgentSession {
 			// Build messages array (custom message if any, then user message)
 			messages = [];
 
+			// Inject any pending "nextTurn" messages as context before the user message.
+			for (const msg of this._pendingNextTurnMessages) {
+				messages.push(msg);
+			}
+			this._pendingNextTurnMessages = [];
+
 			// Add user message
 			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
 			if (currentImages) {
@@ -1762,12 +1844,6 @@ export class AgentSession {
 				content: userContent,
 				timestamp: Date.now(),
 			});
-
-			// Inject any pending "nextTurn" messages as context alongside the user message
-			for (const msg of this._pendingNextTurnMessages) {
-				messages.push(msg);
-			}
-			this._pendingNextTurnMessages = [];
 
 			// Emit before_agent_start extension event
 			const result = await this._extensionRunner.emitBeforeAgentStart(
@@ -3061,6 +3137,10 @@ export class AgentSession {
 						env: this._rlmKernelEnv(),
 						sessionId: this.sessionId,
 						rlmRunHandler: ({ prompt, kwargs }) => this.runRlmChild(prompt, kwargs),
+						rlmBackgroundRunHandler: ({ prompt, kwargs }) =>
+							Promise.resolve(this.startBackgroundRlmChild(prompt, kwargs)),
+						rlmBackgroundStatusHandler: ({ id }) => Promise.resolve(this.getBackgroundRlmChildStatus(id)),
+						rlmBackgroundWaitHandler: ({ id, timeoutMs }) => this.waitForBackgroundRlmChild(id, timeoutMs),
 					},
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 				});
@@ -3206,8 +3286,10 @@ export class AgentSession {
 			.find((entry): entry is SessionMessageEntry => entry.type === "message" && entry.message === message);
 	}
 
-	private _attributeRlmChildUsageToParent(childUsage: Usage): void {
-		const parentAssistant = this._findLastAssistantMessage();
+	private _attributeRlmChildUsageToParent(
+		childUsage: Usage,
+		parentAssistant = this._findLastAssistantMessage(),
+	): void {
 		if (!parentAssistant) {
 			return;
 		}
@@ -3222,7 +3304,14 @@ export class AgentSession {
 		return this.agent.state.messages.filter((message) => message.role === "assistant").length;
 	}
 
-	async runRlmChild(prompt: string, kwargs: Record<string, unknown> = {}): Promise<RlmRunResult> {
+	private _startRlmChildRun(
+		prompt: string,
+		kwargs: Record<string, unknown> = {},
+		options: {
+			notifyParentOnCompletion?: boolean;
+			completionPolicy?: BackgroundRlmCompletionPolicy;
+		} = {},
+	): RlmChildRun {
 		const unsupportedKwargs = Object.keys(kwargs);
 		if (unsupportedKwargs.length > 0) {
 			throw new Error(`Unsupported rlm.run kwargs: ${unsupportedKwargs.sort().join(", ")}`);
@@ -3240,11 +3329,20 @@ export class AgentSession {
 		const childSessionDir = this._createChildRlmSessionDir();
 		const childNodeId = basename(childSessionDir);
 		const startedAt = Date.now();
+		const parentAssistantForUsage = this._findLastAssistantMessage();
 		const transcript: RlmChildAgentTranscriptLine[] = [];
 		const label = compactRlmText(prompt, 80) || "child agent";
-		let status: RlmChildAgentStatus = "running";
 		let answerPreview: string | undefined;
 		let durationMs: number | undefined;
+		const run: RlmChildRun = {
+			id: childNodeId,
+			prompt,
+			sessionDir: childSessionDir,
+			status: "running",
+			completionPolicy: options.completionPolicy ?? "passive",
+			waiters: new Set(),
+			abort: noopRlmChildAbort,
+		};
 		// Index of the assistant entry currently being streamed. Cleared whenever the
 		// conversation moves on (new assistant message, tool call) so subsequent assistant
 		// text appends a fresh entry in chronological order instead of overwriting in place.
@@ -3257,7 +3355,7 @@ export class AgentSession {
 					id: childNodeId,
 					parentId: this._rlmParentNodeId,
 					label,
-					status,
+					status: run.status,
 					durationMs,
 					answerPreview,
 					sessionDir: childSessionDir,
@@ -3325,6 +3423,9 @@ export class AgentSession {
 			rlmParentNodeId: childNodeId,
 			sessionStartEvent: { type: "session_start", reason: "startup" },
 		});
+		run.abort = () => {
+			void child.abort();
+		};
 		const unsubscribeChild = child.subscribe((event) => {
 			if (event.type === "rlm_child_update") {
 				this._emit(event);
@@ -3392,41 +3493,285 @@ export class AgentSession {
 			}
 		});
 
-		try {
-			await child.prompt(prompt, { expandPromptTemplates: false, source: "extension" });
-			await child.agent.waitForIdle();
-			const answer = child.getLastAssistantText() ?? "";
-			const usage = child._usageForCurrentMessages();
-			this._attributeRlmChildUsageToParent(child._assistantUsageForCurrentMessages());
-			status = "done";
-			durationMs = Date.now() - startedAt;
-			// Streaming events usually capture the final assistant text already. Only
-			// record again when it's missing — otherwise a child whose last streamed
-			// event was tool_execution_start would have currentAssistantIndex cleared,
-			// causing the final answer to be appended as a duplicate row.
-			const compactAnswer = compactRlmText(answer);
-			const lastAssistantText = [...transcript].reverse().find((line) => line.role === "assistant")?.text;
-			if (compactAnswer && compactAnswer !== lastAssistantText) {
-				recordAssistantText(answer);
-			} else if (compactAnswer) {
-				answerPreview = compactAnswer;
+		const task = (async (): Promise<RlmRunResult> => {
+			try {
+				await child.prompt(prompt, { expandPromptTemplates: false, source: "extension" });
+				await child.agent.waitForIdle();
+				if (run.status === "cancelled") {
+					throw new Error(run.error ?? "RLM child cancelled");
+				}
+				const answer = child.getLastAssistantText() ?? "";
+				const usage = child._usageForCurrentMessages();
+				this._attributeRlmChildUsageToParent(child._assistantUsageForCurrentMessages(), parentAssistantForUsage);
+				run.status = "done";
+				durationMs = Date.now() - startedAt;
+				// Streaming events usually capture the final assistant text already. Only
+				// record again when it's missing — otherwise a child whose last streamed
+				// event was tool_execution_start would have currentAssistantIndex cleared,
+				// causing the final answer to be appended as a duplicate row.
+				const compactAnswer = compactRlmText(answer);
+				const lastAssistantText = [...transcript].reverse().find((line) => line.role === "assistant")?.text;
+				if (compactAnswer && compactAnswer !== lastAssistantText) {
+					recordAssistantText(answer);
+				} else if (compactAnswer) {
+					answerPreview = compactAnswer;
+				}
+				emitChildUpdate();
+				const result = {
+					answer,
+					usage,
+					turns: child._assistantTurnCount(),
+					session_dir: childSessionDir,
+				};
+				run.result = result;
+				return result;
+			} catch (error) {
+				if (run.status !== "cancelled") {
+					run.status = "error";
+				}
+				durationMs = Date.now() - startedAt;
+				run.error = error instanceof Error ? error.message : String(error);
+				transcript.push({ role: "system", text: run.error });
+				emitChildUpdate();
+				throw error;
+			} finally {
+				unsubscribeChild();
+				child.dispose();
+				run.abort = noopRlmChildAbort;
 			}
-			emitChildUpdate();
-			return {
-				answer,
-				usage,
-				turns: child._assistantTurnCount(),
-				session_dir: childSessionDir,
+		})();
+		run.task = task;
+		void task.then(
+			() => this._resolveRlmChildRunWaiters(run),
+			() => this._resolveRlmChildRunWaiters(run),
+		);
+		if (options.notifyParentOnCompletion) {
+			void task.then(
+				() => this._queueBackgroundRlmChildCompletion(run),
+				() => this._queueBackgroundRlmChildCompletion(run),
+			);
+		}
+		return run;
+	}
+
+	async runRlmChild(prompt: string, kwargs: Record<string, unknown> = {}): Promise<RlmRunResult> {
+		const run = this._startRlmChildRun(prompt, kwargs);
+		if (!run.task) {
+			throw new Error("RLM child failed to start");
+		}
+		return await run.task;
+	}
+
+	startBackgroundRlmChild(prompt: string, kwargs: Record<string, unknown> = {}): RlmBackgroundRunStartResult {
+		const { childKwargs, completionPolicy } = extractBackgroundRlmOptions(kwargs);
+		const run = this._startRlmChildRun(prompt, childKwargs, {
+			notifyParentOnCompletion: completionPolicy !== "silent",
+			completionPolicy,
+		});
+		this._backgroundRlmRuns.set(run.id, run);
+		return {
+			id: run.id,
+			state: run.status,
+			session_dir: run.sessionDir,
+		};
+	}
+
+	getBackgroundRlmChildStatus(id: string): RlmBackgroundRunStatusResult {
+		return this._backgroundRlmChildSnapshot(this._getBackgroundRlmChildRun(id));
+	}
+
+	async waitForBackgroundRlmChild(id: string, timeoutMs?: number): Promise<RlmBackgroundRunStatusResult> {
+		const run = this._getBackgroundRlmChildRun(id);
+		if (run.status !== "running" && run.status !== "queued") {
+			return this._backgroundRlmChildSnapshot(run);
+		}
+
+		let timedOut = false;
+		await new Promise<void>((resolve) => {
+			let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
+			const done = () => {
+				run.waiters.delete(done);
+				if (timeout) {
+					globalThis.clearTimeout(timeout);
+				}
+				resolve();
 			};
+			run.waiters.add(done);
+			if (run.status !== "running" && run.status !== "queued") {
+				done();
+				return;
+			}
+			if (timeoutMs !== undefined) {
+				timeout = globalThis.setTimeout(() => {
+					timedOut = true;
+					done();
+				}, timeoutMs);
+				if (timeout && typeof timeout === "object" && "unref" in timeout) {
+					timeout.unref();
+				}
+			}
+		});
+
+		return {
+			...this._backgroundRlmChildSnapshot(run),
+			timed_out: timedOut && (run.status === "running" || run.status === "queued"),
+		};
+	}
+
+	private _getBackgroundRlmChildRun(id: string): RlmChildRun {
+		const run = this._backgroundRlmRuns.get(id);
+		if (!run) {
+			throw new Error(`Unknown background rlm child: ${id}`);
+		}
+		return run;
+	}
+
+	private _backgroundRlmChildSnapshot(run: RlmChildRun): RlmBackgroundRunStatusResult {
+		return {
+			id: run.id,
+			state: run.status,
+			session_dir: run.sessionDir,
+			result: run.result,
+			error: run.error,
+		};
+	}
+
+	private _resolveRlmChildRunWaiters(run: RlmChildRun): void {
+		for (const waiter of run.waiters) {
+			waiter();
+		}
+		run.waiters.clear();
+	}
+
+	private _queueBackgroundRlmChildCompletion(run: RlmChildRun): void {
+		if (this._disposed || run.status === "cancelled") {
+			return;
+		}
+		this._pendingBackgroundRlmCompletions.push(run);
+		if (this._backgroundRlmCompletionTimer) {
+			return;
+		}
+		this._backgroundRlmCompletionTimer = globalThis.setTimeout(() => {
+			this._backgroundRlmCompletionTimer = undefined;
+			if (this._disposed) {
+				this._pendingBackgroundRlmCompletions = [];
+				return;
+			}
+			void this._flushBackgroundRlmChildCompletions();
+		}, BACKGROUND_RLM_COMPLETION_DEBOUNCE_MS);
+		if (
+			this._backgroundRlmCompletionTimer &&
+			typeof this._backgroundRlmCompletionTimer === "object" &&
+			"unref" in this._backgroundRlmCompletionTimer
+		) {
+			this._backgroundRlmCompletionTimer.unref();
+		}
+	}
+
+	private _formatBackgroundRlmCompletionNotice(runs: readonly RlmChildRun[]): string {
+		const plural = runs.length === 1 ? "child has" : "children have";
+		const lines = [
+			"Background RLM completion notice. This message is hidden from the user.",
+			"",
+			`${runs.length} background RLM ${plural} finished.`,
+			"",
+		];
+		for (const run of runs) {
+			const prompt = compactRlmText(run.prompt, 80);
+			if (run.result) {
+				const answer = compactRlmText(run.result.answer || "(empty)", 240);
+				lines.push(`- ${run.id} done: ${prompt}`);
+				lines.push(`  Answer preview: ${answer}`);
+			} else {
+				lines.push(`- ${run.id} failed: ${prompt}`);
+				lines.push(`  Error: ${compactRlmText(run.error ?? "unknown error", 240)}`);
+			}
+		}
+		lines.push(
+			"",
+			"If you told the user you would report background completions, send a concise update now. Otherwise keep this result in mind and avoid an unsolicited status reply.",
+			"Use the saved handle's status(), wait(), or result() methods when you need full details.",
+		);
+		return lines.join("\n");
+	}
+
+	private _ensureBackgroundRlmQueueDrain(): void {
+		if (this._disposed) {
+			return;
+		}
+		if (this._backgroundRlmQueueDrainPromise) {
+			return;
+		}
+		this._backgroundRlmQueueDrainPromise = (async () => {
+			try {
+				while (true) {
+					await this.agent.waitForIdle();
+					if (this._disposed) {
+						return;
+					}
+					if (!this.agent.hasQueuedMessages()) {
+						return;
+					}
+					try {
+						await this.agent.continue();
+						await this.waitForRetry();
+					} catch (error) {
+						if (this._disposed) {
+							return;
+						}
+						if (this.isStreaming) {
+							continue;
+						}
+						throw error;
+					}
+				}
+			} catch (error) {
+				console.error(`[rlm] failed to wake parent agent for background child completion: ${String(error)}`);
+			} finally {
+				this._backgroundRlmQueueDrainPromise = undefined;
+			}
+		})();
+	}
+
+	private async _flushBackgroundRlmChildCompletions(): Promise<void> {
+		if (this._disposed) {
+			this._pendingBackgroundRlmCompletions = [];
+			return;
+		}
+		const runs = this._pendingBackgroundRlmCompletions.splice(0);
+		if (runs.length === 0 || this._disposed) {
+			return;
+		}
+		const content = this._formatBackgroundRlmCompletionNotice(runs);
+		const shouldWakeParent = runs.some((run) => run.completionPolicy === "wake");
+		try {
+			await this.sendCustomMessage(
+				{
+					customType: "rlm_background_result",
+					content,
+					display: false,
+					details: {
+						runs: runs.map((run) => ({
+							id: run.id,
+							prompt: run.prompt,
+							status: run.status,
+							sessionDir: run.sessionDir,
+							result: run.result,
+							error: run.error,
+						})),
+					},
+				},
+				this.isStreaming
+					? { deliverAs: shouldWakeParent ? "followUp" : "nextTurn" }
+					: shouldWakeParent
+						? { triggerTurn: true }
+						: undefined,
+			);
+			if (this.isStreaming && shouldWakeParent) {
+				this._ensureBackgroundRlmQueueDrain();
+			}
 		} catch (error) {
-			status = "error";
-			durationMs = Date.now() - startedAt;
-			transcript.push({ role: "system", text: error instanceof Error ? error.message : String(error) });
-			emitChildUpdate();
-			throw error;
-		} finally {
-			unsubscribeChild();
-			child.dispose();
+			console.error(`[rlm] failed to deliver background child completion notice: ${String(error)}`);
 		}
 	}
 

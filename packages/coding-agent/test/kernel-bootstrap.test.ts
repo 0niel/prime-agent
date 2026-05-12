@@ -20,7 +20,9 @@ function writeBootstrapVersion(venv: string): void {
 }
 
 function writeFakePython(filePath: string, importableModules: readonly string[]): void {
+	const rlmRuntimeCheck = "import rlm; assert hasattr(rlm, 'background'); assert hasattr(rlm.rlm, 'background')";
 	const cases = importableModules.map((moduleName) => `    "import ${moduleName}") exit 0 ;;`).join("\n");
+	const runtimeCase = importableModules.includes("rlm") ? `    "${rlmRuntimeCheck}") exit 0 ;;` : "";
 	writeExecutable(
 		filePath,
 		[
@@ -28,6 +30,7 @@ function writeFakePython(filePath: string, importableModules: readonly string[])
 			'if [ "$1" = "-c" ]; then',
 			'  case "$2" in',
 			cases,
+			runtimeCase,
 			"    *) exit 1 ;;",
 			"  esac",
 			"fi",
@@ -43,6 +46,7 @@ function installFakeUv(): string {
 	const logPath = join(tempDir, "uv.log");
 	process.env.UV_LOG = logPath;
 	process.env.PATH = `${binDir}${process.env.PATH ? `:${process.env.PATH}` : ""}`;
+	const rlmRuntimeCheck = "import rlm; assert hasattr(rlm, 'background'); assert hasattr(rlm.rlm, 'background')";
 	writeExecutable(
 		join(binDir, "uv"),
 		[
@@ -60,6 +64,7 @@ function installFakeUv(): string {
 			'if [ "$1" = "-c" ]; then',
 			'  case "$2" in',
 			'    "import ipykernel"|"import rlm") exit 0 ;;',
+			`    "${rlmRuntimeCheck}") exit 0 ;;`,
 			"    *) exit 1 ;;",
 			"  esac",
 			"fi",
@@ -143,6 +148,33 @@ describe("kernel bootstrap", () => {
 		await expect(ensureKernelPython()).resolves.toBe(python);
 	});
 
+	it("rebuilds a warm venv with a stale rlm runtime", async () => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const python = join(venv, "bin", "python");
+		mkdirSync(join(venv, "bin"), { recursive: true });
+		writeExecutable(
+			python,
+			[
+				"#!/bin/sh",
+				'if [ "$1" = "-c" ]; then',
+				'  case "$2" in',
+				'    "import ipykernel"|"import rlm") exit 0 ;;',
+				"    *) exit 1 ;;",
+				"  esac",
+				"fi",
+				"exit 0",
+				"",
+			].join("\n"),
+		);
+		writeBootstrapVersion(venv);
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+
+		await expect(ensureKernelPython()).resolves.toBe(python);
+
+		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
+	});
+
 	it("rebuilds a broken venv", async () => {
 		const logPath = installFakeUv();
 		const venv = join(tempDir, "kernel-venv");
@@ -157,10 +189,18 @@ describe("kernel bootstrap", () => {
 
 	it("uses PRIME_AGENT_KERNEL_PYTHON as an override contract", async () => {
 		const overridePython = join(tempDir, "override-python");
-		writeFakePython(overridePython, ["ipykernel"]);
+		writeFakePython(overridePython, ["ipykernel", "rlm"]);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
 		await expect(ensureKernelPython()).resolves.toBe(overridePython);
+	});
+
+	it("rejects PRIME_AGENT_KERNEL_PYTHON with a stale rlm runtime", async () => {
+		const overridePython = join(tempDir, "override-python");
+		writeFakePython(overridePython, ["ipykernel"]);
+		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
+
+		await expect(ensureKernelPython()).rejects.toThrow(/current prime-agent-runtime with rlm\.background/);
 	});
 
 	it("fails an invalid PRIME_AGENT_KERNEL_PYTHON without bootstrapping", async () => {
@@ -168,6 +208,6 @@ describe("kernel bootstrap", () => {
 		writeFakePython(overridePython, []);
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
-		await expect(ensureKernelPython()).rejects.toThrow(/cannot import ipykernel/);
+		await expect(ensureKernelPython()).rejects.toThrow(/missing ipykernel/);
 	});
 });

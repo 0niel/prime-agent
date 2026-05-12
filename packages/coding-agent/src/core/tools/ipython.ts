@@ -3,7 +3,12 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
 import type { ToolDefinition } from "../extensions/types.js";
 import { KernelManager } from "../kernel/index.js";
-import type { RlmRunHandler } from "../rlm-runtime.js";
+import type {
+	RlmBackgroundRunHandler,
+	RlmBackgroundRunStatusHandler,
+	RlmBackgroundRunWaitHandler,
+	RlmRunHandler,
+} from "../rlm-runtime.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
 const RLM_BOOTSTRAP_CODE = `
@@ -15,6 +20,14 @@ except Exception as _prime_agent_rlm_error:
 
     class _PrimeAgentMissingRlm:
         async def run(self, prompt, **kwargs):
+            raise RuntimeError(
+                "prime-agent-runtime is not installed in this IPython kernel. "
+                "Remove ~/.prime/agent/kernel-venv so prime-agent can rebuild it, or set "
+                "PRIME_AGENT_KERNEL_PYTHON to a kernel environment with prime-agent-runtime installed. "
+                f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
+            )
+
+        async def background(self, prompt, **kwargs):
             raise RuntimeError(
                 "prime-agent-runtime is not installed in this IPython kernel. "
                 "Remove ~/.prime/agent/kernel-venv so prime-agent can rebuild it, or set "
@@ -50,6 +63,9 @@ export interface IpythonToolOptions {
 	env?: Record<string, string>;
 	sessionId?: string;
 	rlmRunHandler?: RlmRunHandler;
+	rlmBackgroundRunHandler?: RlmBackgroundRunHandler;
+	rlmBackgroundStatusHandler?: RlmBackgroundRunStatusHandler;
+	rlmBackgroundWaitHandler?: RlmBackgroundRunWaitHandler;
 	/** Filled after the first kernel start so the owning session can restart it after compaction. */
 	kernelManagerRef?: { current?: KernelManager };
 }
@@ -75,6 +91,9 @@ export function createIpythonToolDefinition(
 					env: options?.env,
 					sessionId: options?.sessionId,
 					rlmRunHandler: options?.rlmRunHandler,
+					rlmBackgroundRunHandler: options?.rlmBackgroundRunHandler,
+					rlmBackgroundStatusHandler: options?.rlmBackgroundStatusHandler,
+					rlmBackgroundWaitHandler: options?.rlmBackgroundWaitHandler,
 				});
 				await m.start();
 				const bootstrap = await m.execute(RLM_BOOTSTRAP_CODE);

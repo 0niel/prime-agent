@@ -10,6 +10,7 @@ const BOOTSTRAP_SCHEMA = 1;
 const PYTHON_VERSION = "3.11";
 const IPYKERNEL_REQUIREMENT = "ipykernel";
 const RUNTIME_REQUIREMENT = "prime-agent-runtime";
+const RUNTIME_READY_CHECK = "import rlm; assert hasattr(rlm, 'background'); assert hasattr(rlm.rlm, 'background')";
 const BOOTSTRAP_VERSION_FILE = ".bootstrap-version";
 const BOOTSTRAP_LOCK_NAME = ".bootstrap.lock";
 const BOOTSTRAP_LOCK_RETRY_MS = 100;
@@ -135,7 +136,12 @@ async function hasIpykernel(python: string): Promise<boolean> {
 }
 
 async function hasPrimeAgentRuntime(python: string): Promise<boolean> {
-	return pythonImports(python, "rlm");
+	try {
+		await run(python, ["-c", RUNTIME_READY_CHECK], { stdio: "ignore" });
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 function bootstrapLockDir(venv: string): string {
@@ -302,7 +308,7 @@ function formatBootstrapFailure(error: unknown): Error {
 	return new Error(
 		`Failed to set up the Python kernel runtime. ${errorMessage(error)}\n` +
 			"First-time setup needs internet to install uv, Python, ipykernel, and prime-agent-runtime; once set up, prime-agent runs offline. " +
-			"Set PRIME_AGENT_KERNEL_PYTHON to a Python with ipykernel installed to skip auto-bootstrap.",
+			"Set PRIME_AGENT_KERNEL_PYTHON to a Python with ipykernel and a current prime-agent-runtime installed to skip auto-bootstrap.",
 	);
 }
 
@@ -310,8 +316,11 @@ async function ensureKernelPythonUncached(): Promise<string> {
 	const override = process.env.PRIME_AGENT_KERNEL_PYTHON;
 	if (override) {
 		const python = path.resolve(expandHome(override));
-		if (await hasIpykernel(python)) return python;
-		throw new Error(`PRIME_AGENT_KERNEL_PYTHON points to a Python that cannot import ipykernel: ${python}`);
+		const missing: string[] = [];
+		if (!(await hasIpykernel(python))) missing.push("ipykernel");
+		if (!(await hasPrimeAgentRuntime(python))) missing.push("a current prime-agent-runtime with rlm.background");
+		if (missing.length === 0) return python;
+		throw new Error(`PRIME_AGENT_KERNEL_PYTHON points to a Python missing ${missing.join(" and ")}: ${python}`);
 	}
 
 	const venv = await resolveWritableKernelVenvDir();

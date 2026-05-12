@@ -76,6 +76,9 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("Conversation log: /repo/.pi/sessions/session.jsonl");
 		expect(prompt).toContain("await rlm('sub-task')");
 		expect(prompt).toContain("asyncio.gather");
+		expect(prompt).toContain("await rlm.background('sub-task')");
+		expect(prompt).toContain("notify='wake'");
+		expect(prompt).toContain("notify='silent'");
 		expect(prompt).toContain("Inside `ipython`, prefix single-line shell commands with `!`");
 		expect(prompt).toContain("Call at most one built-in tool per turn.");
 		expect(prompt).not.toContain("# IPython Kernel Guidance");
