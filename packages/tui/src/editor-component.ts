@@ -66,6 +66,9 @@ export interface EditorComponent extends Component {
 	/** Border color function */
 	borderColor?: (str: string) => string;
 
+	/** Background color function */
+	backgroundColor?: (str: string) => string;
+
 	/** Set horizontal padding */
 	setPaddingX?(padding: number): void;
 

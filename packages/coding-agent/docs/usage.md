@@ -8,10 +8,10 @@ This page collects day-to-day usage details that do not fit on the quickstart pa
 
 The interface has four main areas:
 
-- **Startup header** - shortcuts, loaded context files, prompt templates, skills, and extensions
+- **Startup header** - compact brand and runtime summary; `--verbose` also lists loaded context files, prompt templates, skills, and extensions
 - **Messages** - user messages, assistant responses, tool calls, tool results, notifications, errors, and extension UI
-- **Editor** - where you type; border color indicates the current thinking level
-- **Footer** - working directory, session name, token/cache usage, cost, context usage, and current model
+- **Editor** - where you type
+- **Footer** - empty by default; use `/usage` for token, cost, and context details
 
 The editor can be replaced temporarily by built-in UI such as `/settings` or by custom extension UI.
 
@@ -42,7 +42,8 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/resume` | Pick from previous sessions |
 | `/new` | Start a new session |
 | `/name <name>` | Set session display name |
-| `/session` | Show session file, ID, messages, tokens, and cost |
+| `/session` | Show session file, ID, and message counts |
+| `/usage` | Show token, cost, and context usage |
 | `/tree` | Jump to any point in the session and continue from there |
 | `/fork` | Create a new session from a previous user message |
 | `/clone` | Duplicate the current active branch into a new session |
@@ -83,6 +84,7 @@ pi --fork <path|id>    # Fork a session into a new session file
 Useful session commands:
 
 - `/session` shows the current session file and ID.
+- `/usage` shows token, cost, and context usage.
 - `/tree` navigates the in-file session tree and can summarize abandoned branches.
 - `/fork` creates a new session from an earlier user message.
 - `/clone` duplicates the current active branch into a new session file.

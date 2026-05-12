@@ -1134,6 +1134,7 @@ export function getSelectListTheme(): SelectListTheme {
 export function getEditorTheme(): EditorTheme {
 	return {
 		borderColor: (text: string) => theme.fg("borderMuted", text),
+		backgroundColor: (text: string) => theme.bg("userMessageBg", text),
 		selectList: getSelectListTheme(),
 	};
 }

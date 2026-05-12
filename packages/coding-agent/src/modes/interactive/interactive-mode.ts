@@ -173,6 +173,115 @@ class ExpandableText extends Text implements Expandable {
 	}
 }
 
+function formatSplashCwd(cwd: string): string {
+	const normalized = cwd.replace(/\\/g, "/");
+	const worktreeMarker = "/.worktrees/";
+	const worktreeIndex = normalized.indexOf(worktreeMarker);
+	if (worktreeIndex >= 0) {
+		const repoRoot = normalized.slice(0, worktreeIndex);
+		const rest = normalized.slice(worktreeIndex + worktreeMarker.length);
+		const repoName = path.basename(repoRoot);
+		return `${repoName}/${rest}`;
+	}
+
+	const home = os.homedir().replace(/\\/g, "/");
+	if (home && normalized === home) {
+		return "~";
+	}
+	if (home && normalized.startsWith(`${home}/`)) {
+		return `~${normalized.slice(home.length)}`;
+	}
+
+	return normalized;
+}
+
+export function truncatePathMiddle(value: string, width: number): string {
+	if (visibleWidth(value) <= width) {
+		return value;
+	}
+	if (width <= 1) {
+		return truncateToWidth(value, width, "");
+	}
+
+	const ellipsis = "…";
+	const normalized = value.replace(/\\/g, "/");
+	const prefix = normalized.startsWith("~/") ? "~/" : normalized.startsWith("/") ? "/" : "";
+	const body = prefix ? normalized.slice(prefix.length) : normalized;
+	const parts = body.split("/").filter((part) => part.length > 0);
+	const last = parts.pop() ?? "";
+	const previous = parts.pop();
+	const suffix = previous ? `${previous}/${last}` : last;
+	const candidate = `${prefix}${ellipsis}/${suffix}`;
+	if (visibleWidth(candidate) <= width) {
+		return candidate;
+	}
+
+	return truncateToWidth(candidate, width);
+}
+
+class BrandSplashHeader implements Component {
+	private readonly logoRaw = PRIME_LOGO_SMALL.split("\n");
+	private readonly logoCanvasWidth = this.logoRaw.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
+	private readonly gutter = 4;
+	private readonly labelWidth = 9;
+
+	constructor(
+		private readonly version: string,
+		private readonly getModelId: () => string | undefined,
+		private readonly getCwd: () => string,
+		private readonly verboseInstructions?: string,
+	) {}
+
+	invalidate(): void {
+		// Render output is derived from current theme/session state.
+	}
+
+	render(width: number): string[] {
+		const safeWidth = Math.max(1, width);
+		const paddingX = safeWidth > 1 ? 1 : 0;
+		const contentWidth = Math.max(1, safeWidth - paddingX * 2);
+		const metaWidth = contentWidth - this.logoCanvasWidth - this.gutter;
+		const showMeta = metaWidth >= this.labelWidth + 8;
+		const valueWidth = Math.max(1, metaWidth - this.labelWidth);
+		const labelled = (label: string, value: string) => {
+			const displayValue =
+				label === "cwd" ? truncatePathMiddle(value, valueWidth) : truncateToWidth(value, valueWidth);
+			return theme.fg("dim", label.padEnd(this.labelWidth)) + theme.fg("muted", displayValue);
+		};
+		const metaLines = showMeta
+			? [
+					labelled("version", `v${this.version}`),
+					labelled("model", this.getModelId() ?? "—"),
+					labelled("cwd", formatSplashCwd(this.getCwd())),
+					"",
+					theme.fg("dim", "type to start"),
+				]
+			: [];
+		const metaStart = Math.max(0, Math.floor((this.logoRaw.length - metaLines.length) / 2));
+		const lines = this.logoRaw.map((line, index) => {
+			const colored = theme.fg("text", line);
+			const meta = index >= metaStart && index < metaStart + metaLines.length ? metaLines[index - metaStart] : "";
+			const padding = showMeta
+				? " ".repeat(Math.max(0, this.logoCanvasWidth - visibleWidth(line) + this.gutter))
+				: "";
+			const content = truncateToWidth(colored + padding + meta, contentWidth, "");
+			return " ".repeat(paddingX) + content + " ".repeat(Math.max(0, safeWidth - paddingX - visibleWidth(content)));
+		});
+
+		if (this.verboseInstructions) {
+			lines.push(" ".repeat(safeWidth));
+			for (const instruction of this.verboseInstructions.split("\n")) {
+				const content = truncateToWidth(instruction, contentWidth);
+				lines.push(
+					" ".repeat(paddingX) + content + " ".repeat(Math.max(0, safeWidth - paddingX - visibleWidth(content))),
+				);
+			}
+		}
+
+		return lines;
+	}
+}
+
 function isTerminalImageLine(line: string): boolean {
 	return line.includes("\x1b_G") || line.includes("\x1b]1337;File=");
 }
@@ -331,6 +440,8 @@ export class InteractiveMode {
 	private workingMessage: string | undefined = undefined;
 	private workingVisible = true;
 	private workingIndicatorOptions: LoaderIndicatorOptions | undefined = undefined;
+	private workingStartedAt: number | undefined = undefined;
+	private workingTimer: NodeJS.Timeout | undefined = undefined;
 	private readonly defaultWorkingMessage = "Working...";
 	private readonly defaultHiddenThinkingLabel = "Thinking...";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
@@ -678,67 +789,40 @@ export class InteractiveMode {
 		// Cheatsheet behind --verbose. `quietStartup` suppresses the splash entirely
 		// (matches pi-mono's old behaviour for users who want a bare prompt).
 		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
-			const logoRaw = PRIME_LOGO_SMALL.split("\n");
-			const logoCanvasWidth = logoRaw.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
-			const gutter = 4;
-			const cwdLabel = (() => {
-				let p = this.sessionManager.getCwd();
-				const home = process.env.HOME || process.env.USERPROFILE;
-				if (home && p.startsWith(home)) p = `~${p.slice(home.length)}`;
-				return p;
-			})();
-			const modelId = this.session.state.model?.id;
-			const labelWidth = 9;
-			const labelled = (label: string, value: string) =>
-				theme.fg("dim", label.padEnd(labelWidth)) + theme.fg("muted", value);
-			const metaLines = [
-				labelled("version", `v${this.version}`),
-				labelled("model", modelId ?? "—"),
-				labelled("cwd", cwdLabel),
-				"",
-				theme.fg("dim", "type to start"),
-			];
-			const metaStart = Math.max(0, Math.floor((logoRaw.length - metaLines.length) / 2));
-			const composed = logoRaw.map((line, i) => {
-				const colored = theme.fg("text", line);
-				const padding = " ".repeat(Math.max(0, logoCanvasWidth - visibleWidth(line) + gutter));
-				const meta = i >= metaStart && i < metaStart + metaLines.length ? metaLines[i - metaStart] : "";
-				return colored + padding + meta;
-			});
-			const brandBlock = composed.join("\n");
-
-			if (this.options.verbose) {
-				// Verbose: include the full keybinding cheatsheet under the brand mark.
-				const hint = (keybinding: AppKeybinding, description: string) => keyHint(keybinding, description);
-				const expandedInstructions = [
-					hint("app.interrupt", "to interrupt"),
-					hint("app.clear", "to clear"),
-					rawKeyHint(`${keyText("app.clear")} twice`, "to exit"),
-					hint("app.exit", "to exit (empty)"),
-					hint("app.suspend", "to suspend"),
-					keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
-					hint("app.thinking.cycle", "to cycle thinking level"),
-					rawKeyHint(
-						`${keyText("app.model.cycleForward")}/${keyText("app.model.cycleBackward")}`,
-						"to cycle models",
-					),
-					hint("app.model.select", "to select model"),
-					hint("app.tools.expand", "to expand tools"),
-					hint("app.thinking.toggle", "to expand thinking"),
-					hint("app.editor.external", "for external editor"),
-					rawKeyHint("/", "for commands"),
-					rawKeyHint("!", "to run bash"),
-					rawKeyHint("!!", "to run bash (no context)"),
-					hint("app.message.followUp", "to queue follow-up"),
-					hint("app.message.dequeue", "to edit all queued messages"),
-					hint("app.clipboard.pasteImage", "to paste image"),
-					rawKeyHint("drop files", "to attach"),
-				].join("\n");
-				const verboseBlock = `${brandBlock}\n\n${expandedInstructions}`;
-				this.builtInHeader = new Text(verboseBlock, 1, 0);
-			} else {
-				this.builtInHeader = new Text(brandBlock, 1, 0);
-			}
+			// Verbose: include the full keybinding cheatsheet under the brand mark.
+			const hint = (keybinding: AppKeybinding, description: string) => keyHint(keybinding, description);
+			const verboseInstructions = this.options.verbose
+				? [
+						hint("app.interrupt", "to interrupt"),
+						hint("app.clear", "to clear"),
+						rawKeyHint(`${keyText("app.clear")} twice`, "to exit"),
+						hint("app.exit", "to exit (empty)"),
+						hint("app.suspend", "to suspend"),
+						keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
+						hint("app.thinking.cycle", "to cycle thinking level"),
+						rawKeyHint(
+							`${keyText("app.model.cycleForward")}/${keyText("app.model.cycleBackward")}`,
+							"to cycle models",
+						),
+						hint("app.model.select", "to select model"),
+						hint("app.tools.expand", "to expand tools"),
+						hint("app.thinking.toggle", "to expand thinking"),
+						hint("app.editor.external", "for external editor"),
+						rawKeyHint("/", "for commands"),
+						rawKeyHint("!", "to run bash"),
+						rawKeyHint("!!", "to run bash (no context)"),
+						hint("app.message.followUp", "to queue follow-up"),
+						hint("app.message.dequeue", "to edit all queued messages"),
+						hint("app.clipboard.pasteImage", "to paste image"),
+						rawKeyHint("drop files", "to attach"),
+					].join("\n")
+				: undefined;
+			this.builtInHeader = new BrandSplashHeader(
+				this.version,
+				() => this.session.state.model?.id,
+				() => this.sessionManager.getCwd(),
+				verboseInstructions,
+			);
 			this.headerContainer.addChild(new Spacer(1));
 			this.headerContainer.addChild(this.builtInHeader);
 			this.headerContainer.addChild(new Spacer(1));
@@ -1376,7 +1460,7 @@ export class InteractiveMode {
 		force?: boolean;
 		showDiagnosticsWhenQuiet?: boolean;
 	}): void {
-		const showListing = options?.force || this.options.verbose || !this.settingsManager.getQuietStartup();
+		const showListing = options?.force === true || this.options.verbose === true;
 		const showDiagnostics = showListing || options?.showDiagnosticsWhenQuiet === true;
 		if (!showListing && !showDiagnostics) {
 			return;
@@ -1579,11 +1663,7 @@ export class InteractiveMode {
 			commandContextActions: {
 				waitForIdle: () => this.session.agent.waitForIdle(),
 				newSession: async (options) => {
-					if (this.loadingAnimation) {
-						this.loadingAnimation.stop();
-						this.loadingAnimation = undefined;
-					}
-					this.statusContainer.clear();
+					this.stopWorkingLoader();
 					try {
 						const result = await this.runtimeHost.newSession(options);
 						if (!result.cancelled) {
@@ -1771,7 +1851,11 @@ export class InteractiveMode {
 	}
 
 	private getWorkingLoaderMessage(): string {
-		return this.workingMessage ?? this.defaultWorkingMessage;
+		const message = this.workingMessage ?? this.defaultWorkingMessage;
+		if (this.workingStartedAt === undefined) {
+			return message;
+		}
+		return `${message} ${this.formatWorkingElapsed(Date.now() - this.workingStartedAt)}`;
 	}
 
 	private createWorkingLoader(): Loader {
@@ -1784,7 +1868,42 @@ export class InteractiveMode {
 		);
 	}
 
+	private formatWorkingElapsed(elapsedMs: number): string {
+		const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
+		if (totalSeconds < 60) {
+			return `${totalSeconds}s`;
+		}
+		const minutes = Math.floor(totalSeconds / 60);
+		const seconds = totalSeconds % 60;
+		return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
+	}
+
+	private updateWorkingLoaderMessage(): void {
+		this.loadingAnimation?.setMessage(this.getWorkingLoaderMessage());
+	}
+
+	private startWorkingTimer(): void {
+		if (this.workingTimer) {
+			clearInterval(this.workingTimer);
+		}
+		this.workingTimer = setInterval(() => this.updateWorkingLoaderMessage(), 1000);
+		this.workingTimer.unref?.();
+	}
+
+	private startWorkingLoader(): void {
+		this.stopWorkingLoader();
+		this.workingStartedAt = Date.now();
+		this.loadingAnimation = this.createWorkingLoader();
+		this.statusContainer.addChild(this.loadingAnimation);
+		this.startWorkingTimer();
+	}
+
 	private stopWorkingLoader(): void {
+		if (this.workingTimer) {
+			clearInterval(this.workingTimer);
+			this.workingTimer = undefined;
+		}
+		this.workingStartedAt = undefined;
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
 			this.loadingAnimation = undefined;
@@ -1801,8 +1920,7 @@ export class InteractiveMode {
 		}
 		if (this.session.isStreaming && !this.loadingAnimation) {
 			this.statusContainer.clear();
-			this.loadingAnimation = this.createWorkingLoader();
-			this.statusContainer.addChild(this.loadingAnimation);
+			this.startWorkingLoader();
 		}
 		this.ui.requestRender();
 	}
@@ -1909,7 +2027,7 @@ export class InteractiveMode {
 		this.workingVisible = true;
 		this.setWorkingIndicator();
 		if (this.loadingAnimation) {
-			this.loadingAnimation.setMessage(`${this.defaultWorkingMessage} (${keyText("app.interrupt")} to interrupt)`);
+			this.updateWorkingLoaderMessage();
 		}
 		this.setHiddenThinkingLabel();
 	}
@@ -2059,7 +2177,7 @@ export class InteractiveMode {
 			setWorkingMessage: (message) => {
 				this.workingMessage = message;
 				if (this.loadingAnimation) {
-					this.loadingAnimation.setMessage(message ?? this.defaultWorkingMessage);
+					this.updateWorkingLoaderMessage();
 				}
 			},
 			setWorkingVisible: (visible) => this.setWorkingVisible(visible),
@@ -2601,6 +2719,11 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
+			if (text === "/usage") {
+				this.handleUsageCommand();
+				this.editor.setText("");
+				return;
+			}
 			if (text === "/changelog") {
 				this.handleChangelogCommand();
 				this.editor.setText("");
@@ -2765,8 +2888,7 @@ export class InteractiveMode {
 				}
 				this.stopWorkingLoader();
 				if (this.workingVisible) {
-					this.loadingAnimation = this.createWorkingLoader();
-					this.statusContainer.addChild(this.loadingAnimation);
+					this.startWorkingLoader();
 				}
 				this.ui.requestRender();
 				break;
@@ -2930,11 +3052,7 @@ export class InteractiveMode {
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
-				if (this.loadingAnimation) {
-					this.loadingAnimation.stop();
-					this.loadingAnimation = undefined;
-					this.statusContainer.clear();
-				}
+				this.stopWorkingLoader();
 				if (this.streamingComponent) {
 					this.chatContainer.removeChild(this.streamingComponent);
 					this.streamingComponent = undefined;
@@ -3596,13 +3714,14 @@ export class InteractiveMode {
 	}
 
 	private updateEditorBorderColor(): void {
-		// Bash mode: green border. Otherwise: always white. The thinking-level color ramp lived
-		// here in pi-mono, but the prime brand reserves indigo for accent moments — the input
-		// frame stays neutral so the focus indicator doesn't fight the splash.
+		// Bash mode keeps a green accent. Otherwise the input surface stays neutral so the
+		// focus indicator doesn't fight the splash.
 		if (this.isBashMode) {
 			this.editor.borderColor = theme.getBashModeBorderColor();
+			this.editor.backgroundColor = (str: string) => theme.bg("toolSuccessBg", str);
 		} else {
 			this.editor.borderColor = (str: string) => theme.fg("text", str);
+			this.editor.backgroundColor = (str: string) => theme.bg("userMessageBg", str);
 		}
 		this.ui.requestRender();
 	}
@@ -4559,11 +4678,7 @@ export class InteractiveMode {
 		sessionPath: string,
 		options?: Parameters<ExtensionCommandContext["switchSession"]>[1],
 	): Promise<{ cancelled: boolean }> {
-		if (this.loadingAnimation) {
-			this.loadingAnimation.stop();
-			this.loadingAnimation = undefined;
-		}
-		this.statusContainer.clear();
+		this.stopWorkingLoader();
 		try {
 			const result = await this.runtimeHost.switchSession(sessionPath, {
 				withSession: options?.withSession,
@@ -5142,11 +5257,7 @@ export class InteractiveMode {
 		}
 
 		try {
-			if (this.loadingAnimation) {
-				this.loadingAnimation.stop();
-				this.loadingAnimation = undefined;
-			}
-			this.statusContainer.clear();
+			this.stopWorkingLoader();
 			const result = await this.runtimeHost.importFromJsonl(inputPath);
 			if (result.cancelled) {
 				this.showStatus("Import cancelled");
@@ -5323,6 +5434,21 @@ export class InteractiveMode {
 		info += `${theme.fg("dim", "Tool Calls:")} ${stats.toolCalls}\n`;
 		info += `${theme.fg("dim", "Tool Results:")} ${stats.toolResults}\n`;
 		info += `${theme.fg("dim", "Total:")} ${stats.totalMessages}\n\n`;
+		info += theme.fg("dim", "Use /usage for token, cost, and context usage.");
+
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(info, 1, 0));
+		this.ui.requestRender();
+	}
+
+	private handleUsageCommand(): void {
+		const stats = this.session.getSessionStats();
+		const model = this.session.model;
+
+		let info = `${theme.bold("Usage")}\n\n`;
+		if (model) {
+			info += `${theme.fg("dim", "Model:")} ${model.provider}/${model.id}\n\n`;
+		}
 		info += `${theme.bold("Tokens")}\n`;
 		info += `${theme.fg("dim", "Input:")} ${stats.tokens.input.toLocaleString()}\n`;
 		info += `${theme.fg("dim", "Output:")} ${stats.tokens.output.toLocaleString()}\n`;
@@ -5336,11 +5462,22 @@ export class InteractiveMode {
 
 		if (stats.cost > 0) {
 			info += `\n${theme.bold("Cost")}\n`;
-			info += `${theme.fg("dim", "Total:")} ${stats.cost.toFixed(4)}`;
+			info += `${theme.fg("dim", "Total:")} $${stats.cost.toFixed(4)}\n`;
+		}
+
+		const contextUsage = stats.contextUsage;
+		if (contextUsage) {
+			info += `\n${theme.bold("Context")}\n`;
+			if (contextUsage.tokens === null || contextUsage.percent === null) {
+				info += `${theme.fg("dim", "Current:")} unknown after compaction\n`;
+			} else {
+				const percent = `${Math.round(contextUsage.percent * 10) / 10}%`;
+				info += `${theme.fg("dim", "Current:")} ${contextUsage.tokens.toLocaleString()} / ${contextUsage.contextWindow.toLocaleString()} (${percent})\n`;
+			}
 		}
 
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(info, 1, 0));
+		this.chatContainer.addChild(new Text(info.trimEnd(), 1, 0));
 		this.ui.requestRender();
 	}
 
@@ -5510,11 +5647,7 @@ export class InteractiveMode {
 	}
 
 	private async handleClearCommand(): Promise<void> {
-		if (this.loadingAnimation) {
-			this.loadingAnimation.stop();
-			this.loadingAnimation = undefined;
-		}
-		this.statusContainer.clear();
+		this.stopWorkingLoader();
 		try {
 			const result = await this.runtimeHost.newSession();
 			if (result.cancelled) {
@@ -5682,11 +5815,7 @@ export class InteractiveMode {
 			return;
 		}
 
-		if (this.loadingAnimation) {
-			this.loadingAnimation.stop();
-			this.loadingAnimation = undefined;
-		}
-		this.statusContainer.clear();
+		this.stopWorkingLoader();
 
 		try {
 			await this.session.compact(customInstructions);
@@ -5700,10 +5829,7 @@ export class InteractiveMode {
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
 		}
-		if (this.loadingAnimation) {
-			this.loadingAnimation.stop();
-			this.loadingAnimation = undefined;
-		}
+		this.stopWorkingLoader();
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();
 		this.footerDataProvider.dispose();

@@ -199,6 +199,7 @@ interface LayoutLine {
 
 export interface EditorTheme {
 	borderColor: (str: string) => string;
+	backgroundColor?: (str: string) => string;
 	selectList: SelectListTheme;
 }
 
@@ -236,6 +237,7 @@ export class Editor implements Component, Focusable {
 
 	// Border color (can be changed dynamically)
 	public borderColor: (str: string) => string;
+	public backgroundColor: ((str: string) => string) | undefined;
 
 	// Autocomplete support
 	private autocompleteProvider?: AutocompleteProvider;
@@ -289,6 +291,7 @@ export class Editor implements Component, Focusable {
 		this.tui = tui;
 		this.theme = theme;
 		this.borderColor = theme.borderColor;
+		this.backgroundColor = theme.backgroundColor;
 		const paddingX = options.paddingX ?? 0;
 		this.paddingX = Number.isFinite(paddingX) ? Math.max(0, Math.floor(paddingX)) : 0;
 		const maxVisible = options.autocompleteMaxVisible ?? 5;
@@ -408,7 +411,11 @@ export class Editor implements Component, Focusable {
 
 	render(width: number): string[] {
 		const maxPadding = Math.max(0, Math.floor((width - 1) / 2));
-		const paddingX = Math.min(this.paddingX, maxPadding);
+		const useBackgroundSurface = this.backgroundColor !== undefined;
+		const configuredPaddingX = Math.min(this.paddingX, maxPadding);
+		const paddingX = useBackgroundSurface
+			? Math.min(Math.max(configuredPaddingX, 2), maxPadding)
+			: configuredPaddingX;
 		const contentWidth = Math.max(1, width - paddingX * 2);
 
 		// Layout width: with padding the cursor can overflow into it,
@@ -448,18 +455,28 @@ export class Editor implements Component, Focusable {
 		const result: string[] = [];
 		const leftPadding = " ".repeat(paddingX);
 		const rightPadding = leftPadding;
+		const cursorReset = useBackgroundSurface ? "\x1b[27m" : "\x1b[0m";
+		const renderSurfaceLine = (line: string): string => {
+			const padded = line + " ".repeat(Math.max(0, width - visibleWidth(line)));
+			return this.backgroundColor ? this.backgroundColor(padded) : padded;
+		};
 
-		// Render top border (with scroll indicator if scrolled down)
-		if (this.scrollOffset > 0) {
-			const indicator = `─── ↑ ${this.scrollOffset} more `;
-			const remaining = width - visibleWidth(indicator);
-			if (remaining >= 0) {
-				result.push(this.borderColor(indicator + "─".repeat(remaining)));
+		if (!useBackgroundSurface) {
+			// Render top border (with scroll indicator if scrolled down)
+			if (this.scrollOffset > 0) {
+				const indicator = `─── ↑ ${this.scrollOffset} more `;
+				const remaining = width - visibleWidth(indicator);
+				if (remaining >= 0) {
+					result.push(this.borderColor(indicator + "─".repeat(remaining)));
+				} else {
+					result.push(this.borderColor(truncateToWidth(indicator, width)));
+				}
 			} else {
-				result.push(this.borderColor(truncateToWidth(indicator, width)));
+				result.push(horizontal.repeat(width));
 			}
 		} else {
-			result.push(horizontal.repeat(width));
+			const line = this.scrollOffset > 0 ? this.borderColor(` ↑ ${this.scrollOffset} more`) : "";
+			result.push(renderSurfaceLine(truncateToWidth(line, width)));
 		}
 
 		// Render each visible layout line
@@ -485,12 +502,12 @@ export class Editor implements Component, Focusable {
 					const afterGraphemes = [...this.segment(after)];
 					const firstGrapheme = afterGraphemes[0]?.segment || "";
 					const restAfter = after.slice(firstGrapheme.length);
-					const cursor = `\x1b[7m${firstGrapheme}\x1b[0m`;
+					const cursor = `\x1b[7m${firstGrapheme}${cursorReset}`;
 					displayText = before + marker + cursor + restAfter;
 					// lineVisibleWidth stays the same - we're replacing, not adding
 				} else {
 					// Cursor is at the end - add highlighted space
-					const cursor = "\x1b[7m \x1b[0m";
+					const cursor = `\x1b[7m ${cursorReset}`;
 					displayText = before + marker + cursor;
 					lineVisibleWidth = lineVisibleWidth + 1;
 					// If cursor overflows content width into the padding, flag it
@@ -505,17 +522,23 @@ export class Editor implements Component, Focusable {
 			const lineRightPadding = cursorInPadding ? rightPadding.slice(1) : rightPadding;
 
 			// Render the line (no side borders, just horizontal lines above and below)
-			result.push(`${leftPadding}${displayText}${padding}${lineRightPadding}`);
+			const contentLine = `${leftPadding}${displayText}${padding}${lineRightPadding}`;
+			result.push(useBackgroundSurface ? renderSurfaceLine(contentLine) : contentLine);
 		}
 
 		// Render bottom border (with scroll indicator if more content below)
 		const linesBelow = layoutLines.length - (this.scrollOffset + visibleLines.length);
-		if (linesBelow > 0) {
-			const indicator = `─── ↓ ${linesBelow} more `;
-			const remaining = width - visibleWidth(indicator);
-			result.push(this.borderColor(indicator + "─".repeat(Math.max(0, remaining))));
+		if (!useBackgroundSurface) {
+			if (linesBelow > 0) {
+				const indicator = `─── ↓ ${linesBelow} more `;
+				const remaining = width - visibleWidth(indicator);
+				result.push(this.borderColor(indicator + "─".repeat(Math.max(0, remaining))));
+			} else {
+				result.push(horizontal.repeat(width));
+			}
 		} else {
-			result.push(horizontal.repeat(width));
+			const line = linesBelow > 0 ? this.borderColor(` ↓ ${linesBelow} more`) : "";
+			result.push(renderSurfaceLine(truncateToWidth(line, width)));
 		}
 
 		// Add autocomplete list if active
@@ -524,7 +547,8 @@ export class Editor implements Component, Focusable {
 			for (const line of autocompleteResult) {
 				const lineWidth = visibleWidth(line);
 				const linePadding = " ".repeat(Math.max(0, contentWidth - lineWidth));
-				result.push(`${leftPadding}${line}${linePadding}${rightPadding}`);
+				const contentLine = `${leftPadding}${line}${linePadding}${rightPadding}`;
+				result.push(useBackgroundSurface ? renderSurfaceLine(contentLine) : contentLine);
 			}
 		}
 

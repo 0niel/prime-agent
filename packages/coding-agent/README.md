@@ -148,10 +148,10 @@ See [docs/providers.md](docs/providers.md) for detailed setup instructions.
 
 The interface from top to bottom:
 
-- **Startup header** - Shows shortcuts (`/hotkeys` for all), loaded AGENTS.md files, prompt templates, skills, and extensions
+- **Startup header** - Shows a compact brand and runtime summary; use `--verbose` to list loaded AGENTS.md files, prompt templates, skills, and extensions
 - **Messages** - Your messages, assistant responses, tool calls and results, notifications, errors, and extension UI
-- **Editor** - Where you type; border color indicates thinking level
-- **Footer** - Working directory, session name, total token/cache usage, cost, context usage, current model
+- **Editor** - Where you type
+- **Footer** - Empty by default; use `/usage` for token, cost, and context details
 
 The editor can be temporarily replaced by other UI, like built-in `/settings` or custom UI from extensions (e.g., a Q&A tool that lets the user answer model questions in a structured format). [Extensions](#extensions) can also replace the editor, add widgets above/below it, a status line, custom footer, or overlays.
 
@@ -180,7 +180,8 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/resume` | Pick from previous sessions |
 | `/new` | Start a new session |
 | `/name <name>` | Set session display name |
-| `/session` | Show session info (file, ID, messages, tokens, cost) |
+| `/session` | Show session info (file, ID, messages) |
+| `/usage` | Show token, cost, and context usage |
 | `/tree` | Jump to any point in the session and continue from there |
 | `/fork` | Create a new session from a previous user message |
 | `/clone` | Duplicate the current active branch into a new session |
