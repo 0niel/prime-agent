@@ -7,6 +7,7 @@ import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
 import { AuthStorage } from "./auth-storage.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
+import { GOAL_TOOL_NAMES } from "./goals.js";
 import { convertToLlm } from "./messages.js";
 import { ModelRegistry } from "./model-registry.js";
 import { findInitialModel } from "./model-resolver.js";
@@ -16,13 +17,7 @@ import { getDefaultSessionDir, SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 import { isInstallTelemetryEnabled } from "./telemetry.js";
 import { time } from "./timings.js";
-import {
-	createBashTool,
-	createEditTool,
-	createIpythonTool,
-	type ToolName,
-	withFileMutationQueue,
-} from "./tools/index.js";
+import { createBashTool, createEditTool, createIpythonTool, withFileMutationQueue } from "./tools/index.js";
 
 export interface CreateAgentSessionOptions {
 	/** Working directory for project-local discovery. Default: process.cwd() */
@@ -256,8 +251,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
 	}
 
-	const defaultActiveToolNames: ToolName[] = ["ipython"];
 	const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
+	const includeGoalTools = options.tools !== undefined || options.noTools !== "all";
+	const autoActivateGoalTools = options.tools === undefined && !options.noTools;
+	const defaultActiveToolNames: string[] =
+		includeGoalTools && autoActivateGoalTools ? ["ipython", ...GOAL_TOOL_NAMES] : ["ipython"];
 	const initialActiveToolNames: string[] = options.tools
 		? [...options.tools]
 		: options.noTools
@@ -388,6 +386,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		modelRegistry,
 		initialActiveToolNames,
 		allowedToolNames,
+		includeGoalTools,
+		autoActivateGoalTools,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
 	});

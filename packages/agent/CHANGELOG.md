@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a continuation-message hook for host-owned policies that should keep the agent loop running after explicit follow-ups are drained.
+
 ## [0.74.0] - 2026-05-07
 
 ## [0.73.1] - 2026-05-07

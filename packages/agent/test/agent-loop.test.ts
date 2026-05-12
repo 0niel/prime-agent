@@ -650,6 +650,106 @@ describe("agentLoop with AgentMessage", () => {
 		expect(sawInterruptInContext).toBe(true);
 	});
 
+	it("should inject continuation messages when the agent would otherwise stop", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		let continuationPolls = 0;
+		let sawContinuationInContext = false;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			getContinuationMessages: async ({ message }) => {
+				continuationPolls++;
+				expect(message.role).toBe("assistant");
+				if (continuationPolls === 1) {
+					return [createUserMessage("continue")];
+				}
+				return [];
+			},
+		};
+
+		let callIndex = 0;
+		const stream = agentLoop([createUserMessage("start")], context, config, undefined, (_model, ctx) => {
+			if (callIndex === 1) {
+				sawContinuationInContext = ctx.messages.some(
+					(message) => message.role === "user" && message.content === "continue",
+				);
+			}
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([{ type: "text", text: callIndex === 0 ? "paused" : "done" }]);
+				mockStream.push({ type: "done", reason: "stop", message });
+				callIndex++;
+			});
+			return mockStream;
+		});
+
+		for await (const _event of stream) {
+			// consume
+		}
+
+		const messages = await stream.result();
+		expect(callIndex).toBe(2);
+		expect(continuationPolls).toBe(2);
+		expect(sawContinuationInContext).toBe(true);
+		expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "user", "assistant"]);
+	});
+
+	it("should prefer explicit follow-up messages before continuation messages", async () => {
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [],
+		};
+
+		let followUpDelivered = false;
+		let continuationPolls = 0;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			getFollowUpMessages: async () => {
+				if (followUpDelivered) {
+					return [];
+				}
+				followUpDelivered = true;
+				return [createUserMessage("follow up")];
+			},
+			getContinuationMessages: async () => {
+				continuationPolls++;
+				return [];
+			},
+		};
+
+		let callIndex = 0;
+		let sawFollowUpInContext = false;
+		const stream = agentLoop([createUserMessage("start")], context, config, undefined, (_model, ctx) => {
+			if (callIndex === 1) {
+				sawFollowUpInContext = ctx.messages.some(
+					(message) => message.role === "user" && message.content === "follow up",
+				);
+			}
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message = createAssistantMessage([{ type: "text", text: callIndex === 0 ? "paused" : "done" }]);
+				mockStream.push({ type: "done", reason: "stop", message });
+				callIndex++;
+			});
+			return mockStream;
+		});
+
+		for await (const _event of stream) {
+			// consume
+		}
+
+		expect(callIndex).toBe(2);
+		expect(continuationPolls).toBe(1);
+		expect(sawFollowUpInContext).toBe(true);
+	});
+
 	it("should force sequential execution when a tool has executionMode=sequential even with default parallel config", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		let firstResolved = false;

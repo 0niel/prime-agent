@@ -20,6 +20,8 @@ import type {
 	AgentTool,
 	BeforeToolCallContext,
 	BeforeToolCallResult,
+	GetContinuationMessagesContext,
+	ShouldStopAfterTurnContext,
 	StreamFn,
 	ToolExecutionMode,
 } from "./types.js";
@@ -101,6 +103,8 @@ export interface AgentOptions {
 	onResponse?: SimpleStreamOptions["onResponse"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
+	getContinuationMessages?: (context: GetContinuationMessagesContext, signal?: AbortSignal) => Promise<AgentMessage[]>;
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
 	sessionId?: string;
@@ -141,6 +145,20 @@ class PendingMessageQueue {
 	clear(): void {
 		this.messages = [];
 	}
+
+	removeWhere(predicate: (message: AgentMessage) => boolean): AgentMessage[] {
+		const removed: AgentMessage[] = [];
+		const retained: AgentMessage[] = [];
+		for (const message of this.messages) {
+			if (predicate(message)) {
+				removed.push(message);
+			} else {
+				retained.push(message);
+			}
+		}
+		this.messages = retained;
+		return removed;
+	}
 }
 
 type ActiveRun = {
@@ -175,6 +193,11 @@ export class Agent {
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined>;
+	public shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
+	public getContinuationMessages?: (
+		context: GetContinuationMessagesContext,
+		signal?: AbortSignal,
+	) => Promise<AgentMessage[]>;
 	private activeRun?: ActiveRun;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
@@ -197,6 +220,8 @@ export class Agent {
 		this.onResponse = options.onResponse;
 		this.beforeToolCall = options.beforeToolCall;
 		this.afterToolCall = options.afterToolCall;
+		this.shouldStopAfterTurn = options.shouldStopAfterTurn;
+		this.getContinuationMessages = options.getContinuationMessages;
 		this.steeringQueue = new PendingMessageQueue(options.steeringMode ?? "one-at-a-time");
 		this.followUpQueue = new PendingMessageQueue(options.followUpMode ?? "one-at-a-time");
 		this.sessionId = options.sessionId;
@@ -272,6 +297,11 @@ export class Agent {
 	clearAllQueues(): void {
 		this.clearSteeringQueue();
 		this.clearFollowUpQueue();
+	}
+
+	/** Remove queued messages matching the predicate from both queues. */
+	removeQueuedMessages(predicate: (message: AgentMessage) => boolean): AgentMessage[] {
+		return [...this.steeringQueue.removeWhere(predicate), ...this.followUpQueue.removeWhere(predicate)];
 	}
 
 	/** Returns true when either queue still contains pending messages. */
@@ -421,6 +451,7 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
+			shouldStopAfterTurn: async (context) => this.shouldStopAfterTurn?.(context) ?? false,
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
 			getApiKey: this.getApiKey,
@@ -432,6 +463,7 @@ export class Agent {
 				return this.steeringQueue.drain();
 			},
 			getFollowUpMessages: async () => this.followUpQueue.drain(),
+			getContinuationMessages: async (context, signal) => this.getContinuationMessages?.(context, signal) ?? [],
 		};
 	}
 

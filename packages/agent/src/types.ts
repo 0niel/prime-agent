@@ -112,6 +112,9 @@ export interface ShouldStopAfterTurnContext {
 	newMessages: AgentMessage[];
 }
 
+/** Context passed to `getContinuationMessages`. */
+export type GetContinuationMessagesContext = ShouldStopAfterTurnContext;
+
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
 
@@ -212,6 +215,20 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Contract: must not throw or reject. Return [] when no follow-up messages are available.
 	 */
 	getFollowUpMessages?: () => Promise<AgentMessage[]>;
+
+	/**
+	 * Returns continuation messages when the agent would otherwise stop.
+	 *
+	 * Called after follow-up messages have been polled and none are available.
+	 * If messages are returned, they're added to the context and the agent
+	 * continues with another turn.
+	 *
+	 * Use this for host-owned continuation policies such as long-running goals.
+	 * Explicit follow-up messages always take precedence over continuation messages.
+	 *
+	 * Contract: must not throw or reject. Return [] when no continuation should run.
+	 */
+	getContinuationMessages?: (context: GetContinuationMessagesContext, signal?: AbortSignal) => Promise<AgentMessage[]>;
 
 	/**
 	 * Tool execution mode.

@@ -161,6 +161,7 @@ async function runLoop(
 	streamFn?: StreamFn,
 ): Promise<void> {
 	let firstTurn = true;
+	let lastTurn: Parameters<NonNullable<AgentLoopConfig["getContinuationMessages"]>>[0] | undefined;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
@@ -214,6 +215,12 @@ async function runLoop(
 			}
 
 			await emit({ type: "turn_end", message, toolResults });
+			lastTurn = {
+				message,
+				toolResults,
+				context: currentContext,
+				newMessages,
+			};
 
 			if (
 				await config.shouldStopAfterTurn?.({
@@ -235,6 +242,12 @@ async function runLoop(
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them
 			pendingMessages = followUpMessages;
+			continue;
+		}
+
+		const continuationMessages = lastTurn ? (await config.getContinuationMessages?.(lastTurn, signal)) || [] : [];
+		if (continuationMessages.length > 0) {
+			pendingMessages = continuationMessages;
 			continue;
 		}
 

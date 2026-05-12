@@ -60,6 +60,7 @@ import {
 import {
 	type AgentSession,
 	type AgentSessionEvent,
+	type GoalState,
 	parseSkillBlock,
 	type RlmChildAgentSnapshot,
 } from "../../core/agent-session.js";
@@ -75,6 +76,7 @@ import type {
 	ExtensionWidgetOptions,
 } from "../../core/extensions/index.js";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.js";
+import { formatGoalUsage } from "../../core/goals.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import { createCompactionSummaryMessage } from "../../core/messages.js";
 import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.js";
@@ -3193,6 +3195,36 @@ export class InteractiveMode {
 			case "rlm_child_update":
 				this.updateChildAgentInspector(event.child);
 				break;
+
+			case "goal_update":
+				this.showStatus(this.formatGoalStatus(event.goal));
+				break;
+		}
+	}
+
+	private formatGoalStatus(goal: GoalState): string {
+		const objective = goal.objective ? `: ${goal.objective}` : "";
+		const usage = formatGoalUsage(goal);
+		const usageText = usage ? ` (${usage})` : "";
+		switch (goal.status) {
+			case "idle":
+				return "No active goal";
+			case "active":
+				return `Pursuing goal${usageText}${objective}`;
+			case "paused":
+				return goal.lastReason ? `Goal paused: ${goal.lastReason}` : "Goal paused (/goal resume)";
+			case "budget_limited":
+				return goal.lastReason
+					? `Goal budget limited${usageText}: ${goal.lastReason}`
+					: `Goal budget limited${usageText}`;
+			case "complete":
+				return goal.lastReason ? `Goal complete: ${goal.lastReason}` : "Goal complete";
+			case "error":
+				return goal.lastError ? `Goal error: ${goal.lastError}` : "Goal error";
+			default: {
+				const _exhaustive: never = goal.status;
+				return _exhaustive;
+			}
 		}
 	}
 
