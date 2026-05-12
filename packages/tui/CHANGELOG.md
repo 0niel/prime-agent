@@ -5,6 +5,7 @@
 ### Added
 
 - Added optional background surface rendering for editor components.
+- Added scrollback overlay rendering for full-screen overlays that should preserve native terminal scrollback.
 
 ## [0.74.0] - 2026-05-07
 

@@ -1,12 +1,20 @@
+import type { AssistantMessage, ImageContent, TextContent, UserMessage } from "@earendil-works/pi-ai";
 import {
 	type Component,
 	type Focusable,
 	getKeybindings,
+	type MarkdownTheme,
+	Text,
+	type TUI,
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import type { ToolDefinition } from "../../../core/extensions/types.js";
 import { theme } from "../theme/theme.js";
+import { AssistantMessageComponent } from "./assistant-message.js";
+import { ToolExecutionComponent, type ToolExecutionOptions } from "./tool-execution.js";
+import { UserMessageComponent } from "./user-message.js";
 
 export type ChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
 
@@ -14,6 +22,43 @@ export interface ChildAgentTranscriptLine {
 	role: "user" | "assistant" | "tool" | "system";
 	text: string;
 }
+
+export interface ChildAgentToolResult {
+	content: (TextContent | ImageContent)[];
+	details?: unknown;
+	isError: boolean;
+}
+
+export interface ChildAgentMessageTranscriptEntry {
+	type: "message";
+	role: "user" | "assistant";
+	text: string;
+	message: UserMessage | AssistantMessage;
+}
+
+export interface ChildAgentToolTranscriptEntry {
+	type: "tool";
+	role: "tool";
+	text: string;
+	toolCallId: string;
+	toolName: string;
+	args: unknown;
+	result?: ChildAgentToolResult;
+	isPartial: boolean;
+	executionStarted: boolean;
+	argsComplete: boolean;
+}
+
+export interface ChildAgentSystemTranscriptEntry {
+	type: "system";
+	role: "system";
+	text: string;
+}
+
+export type ChildAgentStructuredTranscriptEntry =
+	| ChildAgentMessageTranscriptEntry
+	| ChildAgentToolTranscriptEntry
+	| ChildAgentSystemTranscriptEntry;
 
 export interface ChildAgentInspectorNode {
 	id: string;
@@ -23,7 +68,19 @@ export interface ChildAgentInspectorNode {
 	answerPreview?: string;
 	sessionDir: string;
 	transcript: readonly ChildAgentTranscriptLine[];
+	structuredTranscript?: readonly ChildAgentStructuredTranscriptEntry[];
 	children?: readonly ChildAgentInspectorNode[];
+}
+
+export interface ChildAgentDetailOptions {
+	ui?: TUI;
+	getCwd?: () => string;
+	getToolDefinition?: (toolName: string) => ToolDefinition | undefined;
+	getToolOptions?: () => ToolExecutionOptions;
+	getMarkdownTheme?: () => MarkdownTheme;
+	getToolsExpanded?: () => boolean;
+	getHideThinkingBlock?: () => boolean;
+	getHiddenThinkingLabel?: () => string;
 }
 
 interface FlatChildAgentNode {
@@ -34,6 +91,11 @@ interface FlatChildAgentNode {
 interface SidebarLine {
 	text: string;
 	selected: boolean;
+}
+
+interface DetailSections {
+	headerLines: string[];
+	bodyLines: string[];
 }
 
 export class ChildAgentInspectorComponent implements Component, Focusable {
@@ -202,27 +264,37 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 export class ChildAgentDetailComponent implements Component, Focusable {
 	focused = false;
 	private node: ChildAgentInspectorNode | undefined;
+	private transcriptComponents: Component[] = [];
+	private readonly fallbackTui = { requestRender: () => {} } as TUI;
 
 	onCancel?: () => void;
 
-	constructor(private readonly getViewportHeight: () => number = () => 0) {}
+	constructor(
+		private readonly getViewportHeight: () => number = () => 0,
+		private readonly options: ChildAgentDetailOptions = {},
+	) {}
 
 	setNode(node: ChildAgentInspectorNode | undefined): void {
 		this.node = node;
+		this.rebuildTranscriptComponents();
 	}
 
 	invalidate(): void {
-		// Render output is derived from node state.
+		this.rebuildTranscriptComponents();
+		for (const component of this.transcriptComponents) {
+			component.invalidate?.();
+		}
 	}
 
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
-		const lines = this.renderDetail(safeWidth);
 		const targetHeight = Math.max(0, this.getViewportHeight());
+		const sections = this.renderDetail(safeWidth);
+		const lines = [...sections.headerLines, ...sections.bodyLines];
 		while (lines.length < targetHeight) {
-			lines.push("");
+			lines.push(this.panelLine("", safeWidth));
 		}
-		return lines.map((line) => this.panelLine(line, safeWidth));
+		return lines;
 	}
 
 	handleInput(data: string): void {
@@ -232,28 +304,116 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 		}
 	}
 
-	private renderDetail(width: number): string[] {
+	private renderDetail(width: number): DetailSections {
 		const selected = this.node;
 		if (!selected) {
-			return [this.headerLine(theme.fg("muted", "agent unavailable"), width)];
+			return {
+				headerLines: [this.panelLine(this.headerLine(theme.fg("muted", "agent unavailable"), width), width)],
+				bodyLines: [],
+			};
 		}
 
-		const lines = [this.headerLine(`${this.statusLabel(selected.status)} ${theme.fg("dim", selected.label)}`, width)];
+		const headerLines = [
+			this.panelLine(
+				this.headerLine(`${this.statusLabel(selected.status)} ${theme.fg("dim", selected.label)}`, width),
+				width,
+			),
+		];
 		const sessionDirParts = selected.sessionDir.split("/");
 		const leaf = sessionDirParts[sessionDirParts.length - 1];
 		if (leaf) {
-			lines.push(this.truncate(theme.fg("dim", leaf), width));
+			headerLines.push(this.panelLine(this.truncate(theme.fg("dim", leaf), width), width));
 		}
-		lines.push(theme.fg("borderMuted", "─".repeat(width)));
+		headerLines.push(this.panelLine(theme.fg("borderMuted", "─".repeat(width)), width));
+
+		const bodyLines: string[] = [];
+		if (selected.structuredTranscript && selected.structuredTranscript.length > 0) {
+			for (const component of this.transcriptComponents) {
+				bodyLines.push(...component.render(width));
+			}
+			return { headerLines, bodyLines };
+		}
 		for (const line of selected.transcript) {
 			const label = theme.fg("dim", `${line.role}: `);
 			const wrapped = wrapTextWithAnsi(line.text, Math.max(1, width - visibleWidth(label)));
 			for (const [index, wrappedLine] of wrapped.entries()) {
 				const prefix = index === 0 ? label : " ".repeat(visibleWidth(label));
-				lines.push(this.truncate(prefix + wrappedLine, width));
+				bodyLines.push(this.panelLine(this.truncate(prefix + wrappedLine, width), width));
 			}
 		}
-		return lines;
+		return { headerLines, bodyLines };
+	}
+
+	private rebuildTranscriptComponents(): void {
+		const transcript = this.node?.structuredTranscript;
+		if (!transcript || transcript.length === 0) {
+			this.transcriptComponents = [];
+			return;
+		}
+
+		const components: Component[] = [];
+		for (const entry of transcript) {
+			switch (entry.type) {
+				case "message":
+					components.push(this.createMessageComponent(entry));
+					break;
+				case "tool":
+					components.push(this.createToolComponent(entry));
+					break;
+				case "system":
+					components.push(new Text(theme.fg("error", entry.text), 1, 0));
+					break;
+			}
+		}
+		this.transcriptComponents = components;
+	}
+
+	private createMessageComponent(entry: ChildAgentMessageTranscriptEntry): Component {
+		if (entry.message.role === "user") {
+			const text = this.readUserMessageText(entry.message);
+			return text
+				? new UserMessageComponent(text, this.options.getMarkdownTheme?.())
+				: new Text(theme.fg("userMessageText", entry.text), 1, 0);
+		}
+		return new AssistantMessageComponent(
+			entry.message,
+			this.options.getHideThinkingBlock?.() ?? false,
+			this.options.getMarkdownTheme?.(),
+			this.options.getHiddenThinkingLabel?.() ?? "Thinking...",
+		);
+	}
+
+	private createToolComponent(entry: ChildAgentToolTranscriptEntry): Component {
+		const component = new ToolExecutionComponent(
+			entry.toolName,
+			entry.toolCallId,
+			entry.args,
+			this.options.getToolOptions?.() ?? {},
+			this.options.getToolDefinition?.(entry.toolName),
+			this.options.ui ?? this.fallbackTui,
+			this.options.getCwd?.() ?? process.cwd(),
+		);
+		component.setExpanded(this.options.getToolsExpanded?.() ?? false);
+		if (entry.executionStarted) {
+			component.markExecutionStarted();
+		}
+		if (entry.argsComplete) {
+			component.setArgsComplete();
+		}
+		if (entry.result) {
+			component.updateResult(entry.result, entry.isPartial);
+		}
+		return component;
+	}
+
+	private readUserMessageText(message: UserMessage): string {
+		if (typeof message.content === "string") {
+			return message.content;
+		}
+		return message.content
+			.filter((block) => block.type === "text")
+			.map((block) => block.text)
+			.join("");
 	}
 
 	private headerLine(text: string, width: number): string {

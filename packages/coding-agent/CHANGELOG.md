@@ -23,6 +23,7 @@
 - Fixed long cwd values in the startup splash from wrapping through the brand mark.
 - Fixed IPython kernel startup to let `ipykernel` bind OS-assigned ports instead of randomly selecting fixed ports.
 - Fixed RLM child usage aggregation so parent session totals include recursive child runs after session reloads.
+- Fixed the RLM child-agent detail viewer to render messages, thinking, and tool output with the main chat presentation, open at the latest transcript output, and use terminal scrollback for native scrolling.
 - Fixed `rlm.run` comm handlers to log failures and drain in-flight child runs during kernel disposal.
 
 ### Removed

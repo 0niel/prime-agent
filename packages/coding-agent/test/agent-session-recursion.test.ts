@@ -204,6 +204,7 @@ describe("AgentSession rlm recursion", () => {
 			label: string;
 			answerPreview?: string;
 			transcript: readonly { role: string; text: string }[];
+			structuredTranscript?: readonly { type: string; role: string; text: string }[];
 		}> = [];
 		root.subscribe((event) => {
 			if (event.type === "rlm_child_update") {
@@ -226,6 +227,12 @@ describe("AgentSession rlm recursion", () => {
 		expect(doneUpdate?.answerPreview).toBe("child answer: summarize shard 1");
 		expect(doneUpdate?.transcript).toContainEqual({ role: "user", text: "summarize shard 1" });
 		expect(doneUpdate?.transcript).toContainEqual({ role: "assistant", text: "child answer: summarize shard 1" });
+		expect(doneUpdate?.structuredTranscript).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ type: "message", role: "user", text: "summarize shard 1" }),
+				expect.objectContaining({ type: "message", role: "assistant", text: "child answer: summarize shard 1" }),
+			]),
+		);
 	});
 
 	it("adds child usage to the parent session aggregate", async () => {

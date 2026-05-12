@@ -24,6 +24,7 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.js";
+import { cloneUsage } from "./usage.js";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -312,23 +313,6 @@ export function parseSessionEntries(content: string): FileEntry[] {
 
 	applyChildUsageAttributions(entries);
 	return entries;
-}
-
-function cloneUsage(usage: Usage): Usage {
-	return {
-		input: usage.input,
-		output: usage.output,
-		cacheRead: usage.cacheRead,
-		cacheWrite: usage.cacheWrite,
-		totalTokens: usage.totalTokens,
-		cost: {
-			input: usage.cost.input,
-			output: usage.cost.output,
-			cacheRead: usage.cost.cacheRead,
-			cacheWrite: usage.cost.cacheWrite,
-			total: usage.cost.total,
-		},
-	};
 }
 
 function applyChildUsageAttributions(entries: FileEntry[]): void {
