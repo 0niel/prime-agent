@@ -52,7 +52,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	if (activeTools.includes("ipython")) {
 		parts.push(
 			"",
-			"Inside `ipython`, prefix single-line shell commands with `!` (for example `!ls -la`) and use `%%bash` for multi-line shell scripts.",
+			"Use `ipython` for both Python and shell work. For repository shell commands, prefer IPython shell syntax: `!rg ...`, `!npm run check`, or `%%bash` for multi-line scripts. Do not wrap ordinary shell commands in Python subprocesses unless you need Python-level processing.",
 		);
 	}
 

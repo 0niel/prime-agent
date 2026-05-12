@@ -44,8 +44,8 @@ except Exception as _prime_agent_rlm_error:
 const ipythonSchema = Type.Object({
 	code: Type.String({
 		description:
-			"Python code to execute. State (variables, imports, loaded data) persists across calls. " +
-			"Shell commands available via `!cmd` (single-line) or `%%bash` (multi-line cell).",
+			"Python or IPython shell code to execute. State (variables, imports, loaded data) persists across calls. " +
+			"Prefer `!cmd` for ordinary single-line shell commands and `%%bash` for multi-line shell scripts.",
 	}),
 });
 
@@ -114,10 +114,11 @@ export function createIpythonToolDefinition(
 		name: "ipython",
 		label: "ipython",
 		description:
-			"Execute Python code in a persistent IPython kernel. Variables, imports, and loaded data " +
-			"persist across calls. Shell commands available inside Python via `!cmd` (single-line) " +
-			"or `%%bash` (multi-line cells).",
-		promptSnippet: "ipython - execute Python in a persistent kernel; state survives across calls",
+			"Execute Python and shell commands in a persistent IPython kernel. Variables, imports, and loaded data " +
+			"persist across calls. Prefer `!cmd` for ordinary single-line shell commands and `%%bash` " +
+			"for multi-line shell scripts.",
+		promptSnippet:
+			"ipython - execute Python and shell commands in a persistent kernel; prefer `!cmd` and `%%bash` for shell work",
 		// The kernel is single-threaded — pi must not run two ipython calls in parallel within a batch.
 		executionMode: "sequential",
 		parameters: ipythonSchema,

@@ -16,6 +16,7 @@
 - Changed user messages to use the same filled treatment as the prompt input.
 - Changed the interactive working indicator to show elapsed time while the agent is running.
 - Replaced the default system prompt with the model-agnostic RLM harness prompt.
+- Changed IPython prompt guidance to prefer `!cmd` and `%%bash` for shell commands.
 
 ### Fixed
 

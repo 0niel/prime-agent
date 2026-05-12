@@ -42,7 +42,7 @@ describe("buildRlmPrompt", () => {
 				"Each skill is an async function by the same name. Inspect with `help(<skill>)` or `inspect.signature(<skill>.run)`.",
 				"Each skill is also available as a shell command by the same name: `<skill> ...`. Discover its CLI usage with `<skill> --help`.",
 				"",
-				"Inside `ipython`, prefix single-line shell commands with `!` (for example `!ls -la`) and use `%%bash` for multi-line shell scripts.",
+				"Use `ipython` for both Python and shell work. For repository shell commands, prefer IPython shell syntax: `!rg ...`, `!npm run check`, or `%%bash` for multi-line scripts. Do not wrap ordinary shell commands in Python subprocesses unless you need Python-level processing.",
 				"",
 				"Call at most one built-in tool per turn.",
 			].join("\n"),
@@ -57,7 +57,7 @@ describe("buildRlmPrompt", () => {
 			allowRecursion: false,
 		});
 
-		expect(prompt).not.toContain("Inside `ipython`, prefix single-line shell commands");
+		expect(prompt).not.toContain("Use `ipython` for both Python and shell work");
 	});
 });
 
@@ -79,7 +79,9 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("await rlm.background('sub-task')");
 		expect(prompt).toContain("notify='wake'");
 		expect(prompt).toContain("notify='silent'");
-		expect(prompt).toContain("Inside `ipython`, prefix single-line shell commands with `!`");
+		expect(prompt).toContain("Use `ipython` for both Python and shell work");
+		expect(prompt).toContain("prefer IPython shell syntax");
+		expect(prompt).toContain("Do not wrap ordinary shell commands in Python subprocesses");
 		expect(prompt).toContain("Call at most one built-in tool per turn.");
 		expect(prompt).not.toContain("# IPython Kernel Guidance");
 		expect(prompt).not.toContain("Available tools:");
