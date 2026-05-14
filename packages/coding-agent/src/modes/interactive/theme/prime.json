@@ -50,7 +50,7 @@
 		"toolTitle": "",
 		"toolOutput": "muted",
 
-		"mdHeading": "warning",
+		"mdHeading": "primarySoft",
 		"mdLink": "info",
 		"mdLinkUrl": "dim",
 		"mdCode": "neutral",

@@ -9,6 +9,7 @@ export {
 	ChildAgentInspectorComponent,
 	type ChildAgentInspectorNode,
 	type ChildAgentStatus,
+	ChildAgentSummaryComponent,
 	type ChildAgentTranscriptLine,
 } from "./child-agent-inspector.js";
 export { CompactionSummaryMessageComponent } from "./compaction-summary-message.js";

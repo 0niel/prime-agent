@@ -109,6 +109,7 @@ import {
 	ChildAgentInspectorComponent,
 	type ChildAgentInspectorNode,
 	type ChildAgentStructuredTranscriptEntry,
+	ChildAgentSummaryComponent,
 	type ChildAgentTranscriptLine,
 } from "./components/child-agent-inspector.js";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
@@ -285,72 +286,6 @@ class BrandSplashHeader implements Component {
 	}
 }
 
-function isTerminalImageLine(line: string): boolean {
-	return line.includes("\x1b_G") || line.includes("\x1b]1337;File=");
-}
-
-class RightSidebarLayoutComponent implements Component {
-	private readonly preferredSidebarWidth = 34;
-	private readonly minSidebarWidth = 28;
-	private readonly minSideBySideWidth = 88;
-	private readonly gapWidth = 1;
-
-	constructor(
-		private readonly main: Component,
-		private readonly sidebar: Component,
-		private readonly getViewportHeight: () => number,
-	) {}
-
-	invalidate(): void {
-		this.main.invalidate?.();
-		this.sidebar.invalidate?.();
-	}
-
-	render(width: number): string[] {
-		const safeWidth = Math.max(1, width);
-		const probeSidebarLines = this.sidebar.render(1);
-		if (probeSidebarLines.length === 0) {
-			return this.main.render(safeWidth);
-		}
-
-		if (safeWidth < this.minSideBySideWidth) {
-			const sidebarHeight = Math.min(8, Math.max(1, this.getViewportHeight()));
-			const sidebarLines = this.sidebar.render(safeWidth).slice(0, sidebarHeight);
-			return [...sidebarLines, ...this.main.render(safeWidth)];
-		}
-
-		const sidebarWidth = Math.min(
-			this.preferredSidebarWidth,
-			Math.max(this.minSidebarWidth, Math.floor(safeWidth * 0.28)),
-		);
-		const mainWidth = Math.max(1, safeWidth - sidebarWidth - this.gapWidth);
-		const mainLines = this.main.render(mainWidth);
-		const viewportHeight = Math.max(1, this.getViewportHeight());
-		const sidebarLines = this.sidebar.render(sidebarWidth).slice(0, viewportHeight);
-		const height = Math.max(mainLines.length, viewportHeight);
-		const sidebarStart = Math.max(0, height - viewportHeight);
-		const blankSidebarLine = theme.bg("customMessageBg", " ".repeat(sidebarWidth));
-		const lines: string[] = [];
-
-		for (let index = 0; index < height; index++) {
-			const rawMainLine = mainLines[index] ?? "";
-			if (isTerminalImageLine(rawMainLine)) {
-				lines.push(rawMainLine);
-				continue;
-			}
-			const mainLine = truncateToWidth(rawMainLine, mainWidth, "");
-			const paddedMainLine = mainLine + " ".repeat(Math.max(0, mainWidth - visibleWidth(mainLine)));
-			const sidebarLine =
-				index >= sidebarStart
-					? truncateToWidth(sidebarLines[index - sidebarStart] ?? blankSidebarLine, sidebarWidth, "")
-					: blankSidebarLine;
-			lines.push(`${paddedMainLine}${" ".repeat(this.gapWidth)}${sidebarLine}`);
-		}
-
-		return lines;
-	}
-}
-
 type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
@@ -430,8 +365,8 @@ export class InteractiveMode {
 	private autocompleteProviderWrappers: AutocompleteProviderFactory[] = [];
 	private fdPath: string | undefined;
 	private mainContainer: Container;
+	private mainViewContainer: Container;
 	private editorContainer: Container;
-	private shellLayout: RightSidebarLayoutComponent;
 	private footer: FooterComponent;
 	private footerDataProvider: FooterDataProvider;
 	// Stored so the same manager can be injected into custom editors, selectors, and extension UI.
@@ -466,13 +401,14 @@ export class InteractiveMode {
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
 
-	// RLM child-agent inspector, kept as a right sidebar instead of chat-flow content.
+	// RLM child-agent tray: compact entry below the editor, bounded list/detail in the main view.
+	private childAgentSummary: ChildAgentSummaryComponent;
 	private childAgentInspector: ChildAgentInspectorComponent;
 	private childAgentDetail: ChildAgentDetailComponent;
-	private childAgentDetailOverlayHandle: OverlayHandle | undefined;
 	private childAgentSnapshots = new Map<string, RlmChildAgentSnapshot>();
 	private childAgentNodes: ChildAgentInspectorNode[] = [];
 	private childAgentDetailNodeId: string | undefined;
+	private childAgentPanelMode: "list" | "detail" | undefined;
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -567,10 +503,10 @@ export class InteractiveMode {
 		this.chatContainer = new Container();
 		this.pendingMessagesContainer = new Container();
 		this.statusContainer = new Container();
-		this.childAgentInspector = new ChildAgentInspectorComponent(() => this.ui.terminal.rows);
-		this.childAgentInspector.onCancel = () => this.unfocusChildAgentInspector();
+		this.childAgentInspector = new ChildAgentInspectorComponent(() => this.getChildAgentPanelRows());
+		this.childAgentInspector.onCancel = () => this.closeChildAgentPanel();
 		this.childAgentInspector.onOpenDetail = (nodeId) => this.openChildAgentDetail(nodeId);
-		this.childAgentDetail = new ChildAgentDetailComponent(() => this.ui.terminal.rows, {
+		this.childAgentDetail = new ChildAgentDetailComponent(() => this.getChildAgentPanelRows(), {
 			ui: this.ui,
 			getCwd: () => this.sessionManager.getCwd(),
 			getToolDefinition: (toolName) => this.getRegisteredToolDefinition(toolName),
@@ -583,7 +519,7 @@ export class InteractiveMode {
 			getHideThinkingBlock: () => this.hideThinkingBlock,
 			getHiddenThinkingLabel: () => this.hiddenThinkingLabel,
 		});
-		this.childAgentDetail.onCancel = () => this.closeChildAgentDetail();
+		this.childAgentDetail.onCancel = () => this.showChildAgentList();
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
 		this.keybindings = KeybindingsManager.create();
@@ -596,13 +532,17 @@ export class InteractiveMode {
 		});
 		this.editor = this.defaultEditor;
 		this.mainContainer = new Container();
+		this.mainViewContainer = new Container();
+		this.restoreMainAgentView();
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
-		this.shellLayout = new RightSidebarLayoutComponent(
-			this.mainContainer,
-			this.childAgentInspector,
-			() => this.ui.terminal.rows,
+		this.childAgentSummary = new ChildAgentSummaryComponent(
+			() => this.getTrayLocationLabel(),
+			() => this.getTrayContextLabel(),
+			() => this.getTrayOverrideLabel(),
 		);
+		this.childAgentSummary.onOpen = () => this.openChildAgentList();
+		this.childAgentSummary.onCancel = () => this.focusEditor();
 		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
 		this.footer = new FooterComponent(this.session, this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
@@ -847,15 +787,14 @@ export class InteractiveMode {
 			this.headerContainer.addChild(this.builtInHeader);
 		}
 
-		this.mainContainer.addChild(this.chatContainer);
-		this.mainContainer.addChild(this.pendingMessagesContainer);
-		this.mainContainer.addChild(this.statusContainer);
+		this.mainContainer.addChild(this.mainViewContainer);
 		this.renderWidgets(); // Initialize with default spacer
 		this.mainContainer.addChild(this.widgetContainerAbove);
 		this.mainContainer.addChild(this.editorContainer);
+		this.mainContainer.addChild(this.childAgentSummary);
 		this.mainContainer.addChild(this.widgetContainerBelow);
 		this.mainContainer.addChild(this.footer);
-		this.ui.addChild(this.shellLayout);
+		this.ui.addChild(this.mainContainer);
 		this.ui.setFocus(this.editor);
 
 		this.setupKeyHandlers();
@@ -2412,6 +2351,13 @@ export class InteractiveMode {
 	 */
 	private setCustomEditorComponent(factory: EditorFactory | undefined): void {
 		this.editorComponentFactory = factory;
+		if (this.childAgentPanelMode) {
+			this.restoreMainAgentView();
+			this.childAgentDetailNodeId = undefined;
+			this.childAgentDetail.setNode(undefined);
+		}
+		this.childAgentPanelMode = undefined;
+		this.childAgentSummary.setHidden(false);
 
 		// Save text from current editor before switching
 		const currentText = this.editor.getText();
@@ -2454,6 +2400,9 @@ export class InteractiveMode {
 				}
 				if (!customEditor.onPasteImage) {
 					customEditor.onPasteImage = () => this.defaultEditor.onPasteImage?.();
+				}
+				if (!customEditor.onMoveBelowPrompt) {
+					customEditor.onMoveBelowPrompt = () => this.defaultEditor.onMoveBelowPrompt?.();
 				}
 				if (!customEditor.onExtensionShortcut) {
 					customEditor.onExtensionShortcut = (data: string) => this.defaultEditor.onExtensionShortcut?.(data);
@@ -2645,6 +2594,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.session.tree", () => this.showTreeSelector());
 		this.defaultEditor.onAction("app.session.fork", () => this.showUserMessageSelector());
 		this.defaultEditor.onAction("app.session.resume", () => this.showSessionSelector());
+		this.defaultEditor.onMoveBelowPrompt = () => this.focusChildAgentSummary();
 
 		this.defaultEditor.onChange = (text: string) => {
 			const wasBashMode = this.isBashMode;
@@ -3244,6 +3194,7 @@ export class InteractiveMode {
 	private updateChildAgentInspector(child: RlmChildAgentSnapshot): void {
 		this.childAgentSnapshots.set(child.id, child);
 		this.childAgentNodes = this.buildChildAgentInspectorNodes();
+		this.childAgentSummary.setNodes(this.childAgentNodes);
 		this.childAgentInspector.setNodes(this.childAgentNodes);
 		if (this.childAgentDetailNodeId) {
 			this.childAgentDetail.setNode(this.findChildAgentInspectorNode(this.childAgentDetailNodeId));
@@ -3251,14 +3202,94 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private restoreMainAgentView(): void {
+		this.mainViewContainer.clear();
+		this.mainViewContainer.addChild(this.chatContainer);
+		this.mainViewContainer.addChild(this.pendingMessagesContainer);
+		this.mainViewContainer.addChild(this.statusContainer);
+	}
+
 	private resetChildAgentInspector(): void {
 		this.childAgentSnapshots.clear();
 		this.childAgentNodes = [];
+		this.childAgentSummary.setNodes([]);
+		this.childAgentSummary.setHidden(false);
 		this.childAgentInspector.setNodes([]);
 		this.childAgentDetail.setNode(undefined);
 		this.childAgentDetailNodeId = undefined;
-		this.childAgentDetailOverlayHandle?.hide();
-		this.childAgentDetailOverlayHandle = undefined;
+		if (this.childAgentPanelMode) {
+			this.closeChildAgentPanel();
+		}
+	}
+
+	private getChildAgentPanelRows(): number {
+		const rows = this.ui.terminal.rows;
+		return Math.max(4, Math.min(12, Math.floor(rows * 0.4)));
+	}
+
+	private focusEditor(): void {
+		this.ui.setFocus(this.editor);
+		this.ui.requestRender();
+	}
+
+	private focusChildAgentSummary(): boolean {
+		if (!this.childAgentSummary.hasNodes() || this.childAgentPanelMode || this.getTrayOverrideLabel()) {
+			return false;
+		}
+		this.ui.setFocus(this.childAgentSummary);
+		this.ui.requestRender();
+		return true;
+	}
+
+	private getTrayOverrideLabel(): string | undefined {
+		const text = this.editor.getExpandedText?.() ?? this.editor.getText();
+		if (!this.session.isStreaming || !text.trim()) {
+			return undefined;
+		}
+		return `${keyText("app.message.followUp")} to queue message`;
+	}
+
+	private getTrayLocationLabel(): string | undefined {
+		return this.footerDataProvider.getGitBranch() ?? formatSplashCwd(this.sessionManager.getCwd());
+	}
+
+	private getTrayContextLabel(): string | undefined {
+		const usage = this.session.getContextUsage();
+		if (!usage) {
+			return undefined;
+		}
+		if (usage.percent === null) {
+			return undefined;
+		}
+		const remainingPercent = Math.max(0, Math.min(100, 100 - usage.percent));
+		if (remainingPercent > 50) {
+			return undefined;
+		}
+		return `${Math.round(remainingPercent)}% context left`;
+	}
+
+	private openChildAgentList(): void {
+		if (this.childAgentNodes.length === 0) {
+			return;
+		}
+		this.showChildAgentList();
+	}
+
+	private showChildAgentList(): void {
+		if (this.childAgentNodes.length === 0) {
+			this.closeChildAgentPanel();
+			return;
+		}
+		this.childAgentPanelMode = "list";
+		this.childAgentDetailNodeId = undefined;
+		this.childAgentDetail.setNode(undefined);
+		this.childAgentSummary.setHidden(true);
+		this.childAgentInspector.setNodes(this.childAgentNodes);
+		this.editorContainer.clear();
+		this.mainViewContainer.clear();
+		this.mainViewContainer.addChild(this.childAgentInspector);
+		this.ui.setFocus(this.childAgentInspector);
+		this.ui.requestRender();
 	}
 
 	private openChildAgentDetail(nodeId: string): void {
@@ -3266,42 +3297,33 @@ export class InteractiveMode {
 		if (!node) {
 			return;
 		}
+		this.childAgentPanelMode = "detail";
 		this.childAgentDetailNodeId = nodeId;
 		this.childAgentDetail.setNode(node);
-		this.childAgentDetailOverlayHandle?.hide();
-		this.childAgentDetailOverlayHandle = this.ui.showOverlay(this.childAgentDetail, {
-			width: "100%",
-			anchor: "top-left",
-			margin: 0,
-			scrollback: true,
-		});
+		this.childAgentSummary.setHidden(true);
+		this.editorContainer.clear();
+		this.mainViewContainer.clear();
+		this.mainViewContainer.addChild(this.childAgentDetail);
+		this.ui.setFocus(this.childAgentDetail);
 		this.ui.requestRender();
 	}
 
 	private focusChildAgentInspector(): void {
-		if (this.childAgentSnapshots.size === 0) {
+		if (this.childAgentNodes.length === 0) {
 			return;
 		}
-		this.ui.setFocus(this.childAgentInspector);
-		this.ui.requestRender();
+		this.showChildAgentList();
 	}
 
-	private unfocusChildAgentInspector(): void {
-		this.closeChildAgentDetail(false);
-		this.ui.setFocus(this.editor);
-		this.ui.requestRender();
-	}
-
-	private closeChildAgentDetail(focusInspector = true): void {
-		this.childAgentDetailOverlayHandle?.hide();
-		this.childAgentDetailOverlayHandle = undefined;
+	private closeChildAgentPanel(): void {
+		this.childAgentPanelMode = undefined;
 		this.childAgentDetailNodeId = undefined;
 		this.childAgentDetail.setNode(undefined);
-		if (focusInspector && this.childAgentSnapshots.size > 0) {
-			this.ui.setFocus(this.childAgentInspector);
-		} else {
-			this.ui.setFocus(this.editor);
-		}
+		this.childAgentSummary.setHidden(false);
+		this.restoreMainAgentView();
+		this.editorContainer.clear();
+		this.editorContainer.addChild(this.editor);
+		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
 	}
 

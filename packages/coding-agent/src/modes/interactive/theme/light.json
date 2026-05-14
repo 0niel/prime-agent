@@ -42,7 +42,7 @@
 		"toolTitle": "",
 		"toolOutput": "mediumGray",
 
-		"mdHeading": "yellow",
+		"mdHeading": "#7e57c2",
 		"mdLink": "blue",
 		"mdLinkUrl": "dimGray",
 		"mdCode": "teal",

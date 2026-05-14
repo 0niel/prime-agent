@@ -88,7 +88,7 @@ interface FlatChildAgentNode {
 	depth: number;
 }
 
-interface SidebarLine {
+interface InspectorLine {
 	text: string;
 	selected: boolean;
 }
@@ -98,9 +98,129 @@ interface DetailSections {
 	bodyLines: string[];
 }
 
+function flattenChildAgentNodes(nodes: readonly ChildAgentInspectorNode[]): FlatChildAgentNode[] {
+	const result: FlatChildAgentNode[] = [];
+	const walk = (items: readonly ChildAgentInspectorNode[], depth: number): void => {
+		for (const node of items) {
+			result.push({ node, depth });
+			walk(node.children ?? [], depth + 1);
+		}
+	};
+	walk(nodes, 0);
+	return result;
+}
+
+function countRunning(nodes: readonly FlatChildAgentNode[]): number {
+	return nodes.filter((entry) => entry.node.status === "running").length;
+}
+
+function pluralize(count: number, singular: string, plural = `${singular}s`): string {
+	return count === 1 ? singular : plural;
+}
+
+export class ChildAgentSummaryComponent implements Component, Focusable {
+	focused = false;
+	private readonly paddingX = 1;
+	private nodes: readonly ChildAgentInspectorNode[] = [];
+	private hidden = false;
+
+	onOpen?: () => void;
+	onCancel?: () => void;
+
+	constructor(
+		private readonly getLocationLabel: () => string | undefined = () => undefined,
+		private readonly getContextLabel: () => string | undefined = () => undefined,
+		private readonly getOverrideLabel: () => string | undefined = () => undefined,
+	) {}
+
+	setNodes(nodes: readonly ChildAgentInspectorNode[]): void {
+		this.nodes = nodes;
+	}
+
+	setHidden(hidden: boolean): void {
+		this.hidden = hidden;
+	}
+
+	hasNodes(): boolean {
+		return flattenChildAgentNodes(this.nodes).length > 0;
+	}
+
+	invalidate(): void {
+		// Render output is derived from node state.
+	}
+
+	render(width: number): string[] {
+		if (this.hidden) {
+			return [];
+		}
+
+		const safeWidth = Math.max(1, width);
+		const flat = flattenChildAgentNodes(this.nodes);
+		const overrideLabel = this.getOverrideLabel()?.trim();
+		const locationLabel = this.getLocationLabel()?.trim();
+		const contextLabel = this.getContextLabel()?.trim();
+		const override = overrideLabel ? theme.fg("muted", overrideLabel) : "";
+		const location = !override && locationLabel ? theme.fg("muted", locationLabel) : "";
+		const context = contextLabel ? theme.fg("muted", contextLabel) : "";
+		const subagents = !override && flat.length > 0 ? this.subagentSummary(flat, this.focused) : "";
+		const leftSegments = [override, location, subagents].filter((segment) => segment.length > 0);
+		if (leftSegments.length === 0 && !context) {
+			return [];
+		}
+
+		const rawLeft = leftSegments.join(theme.fg("dim", "  "));
+		const paddedLine = context
+			? this.renderSplitLine(rawLeft, context, safeWidth)
+			: this.renderCompactLine(rawLeft, safeWidth);
+		return [paddedLine];
+	}
+
+	handleInput(data: string): void {
+		const kb = getKeybindings();
+		if (kb.matches(data, "tui.select.confirm")) {
+			this.onOpen?.();
+			return;
+		}
+		if (kb.matches(data, "tui.select.cancel") || kb.matches(data, "tui.select.up")) {
+			this.onCancel?.();
+		}
+	}
+
+	private truncate(line: string, width: number): string {
+		return truncateToWidth(line, width, "");
+	}
+
+	private renderCompactLine(line: string, width: number): string {
+		const panelWidth = Math.min(width, visibleWidth(line) + this.paddingX * 2);
+		const contentWidth = Math.max(1, panelWidth - this.paddingX * 2);
+		const truncated = this.truncate(line, contentWidth);
+		return `${" ".repeat(this.paddingX)}${truncated}${" ".repeat(Math.max(0, panelWidth - this.paddingX - visibleWidth(truncated)))}`;
+	}
+
+	private renderSplitLine(left: string, right: string, width: number): string {
+		const contentWidth = Math.max(1, width - this.paddingX);
+		const rightWidth = visibleWidth(right);
+		const gapWidth = left ? 2 : 0;
+		const leftWidth = Math.max(0, contentWidth - rightWidth - gapWidth);
+		const renderedLeft = leftWidth > 0 ? this.truncate(left, leftWidth) : "";
+		const gap = Math.max(0, contentWidth - visibleWidth(renderedLeft) - rightWidth);
+		return `${" ".repeat(this.paddingX)}${renderedLeft}${" ".repeat(gap)}${right}`;
+	}
+
+	private subagentSummary(flat: readonly FlatChildAgentNode[], selected: boolean): string {
+		const running = countRunning(flat);
+		const summary =
+			running > 0
+				? `${running} ${pluralize(running, "subagent")} running`
+				: `${flat.length} ${pluralize(flat.length, "subagent")}`;
+		const rendered = theme.bold(summary);
+		return selected ? theme.bg("selectedBg", rendered) : rendered;
+	}
+}
+
 export class ChildAgentInspectorComponent implements Component, Focusable {
 	focused = false;
-	private readonly paddingX = 2;
+	private readonly paddingX = 1;
 	private nodes: readonly ChildAgentInspectorNode[] = [];
 	private selectedId: string | undefined;
 
@@ -131,7 +251,11 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 		}
 
 		const safeWidth = Math.max(1, width);
-		return this.renderSidebar(safeWidth).map((line) => this.panelLine(line.text, safeWidth, line.selected));
+		const lines = [theme.fg("borderMuted", "─".repeat(safeWidth))];
+		for (const line of this.renderList(safeWidth)) {
+			lines.push(this.panelLine(line.text, safeWidth, line.selected));
+		}
+		return lines;
 	}
 
 	handleInput(data: string): void {
@@ -168,17 +292,16 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 		}
 	}
 
-	private renderSidebar(width: number): SidebarLine[] {
+	private renderList(width: number): InspectorLine[] {
 		const contentWidth = Math.max(1, width - this.paddingX * 2);
 		const flat = this.flatten();
-		const running = flat.filter((entry) => entry.node.status === "running").length;
+		const running = countRunning(flat);
 		const targetHeight = Math.max(0, this.getViewportHeight());
-		const lines: SidebarLine[] = [{ text: this.headerLine(running, flat.length, contentWidth), selected: false }];
+		const lines: InspectorLine[] = [{ text: this.headerLine(running, flat.length, contentWidth), selected: false }];
 		const availableRows = targetHeight > 0 ? Math.max(0, targetHeight - 2) : flat.length;
 		if (availableRows === 0) {
 			return lines;
 		}
-		lines.push({ text: "", selected: false });
 
 		const selectedIndex = Math.max(
 			0,
@@ -189,7 +312,7 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 			const selected = this.focused && entry.node.id === this.selectedId;
 			lines.push({ text: this.renderListEntry(entry, contentWidth, selected), selected });
 		}
-		while (targetHeight > 0 && lines.length < targetHeight) {
+		while (targetHeight > 0 && lines.length < targetHeight - 1) {
 			lines.push({ text: "", selected: false });
 		}
 		return lines;
@@ -202,15 +325,7 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 		return this.truncate(line, width, "…");
 	}
 	private flatten(): FlatChildAgentNode[] {
-		const result: FlatChildAgentNode[] = [];
-		const walk = (nodes: readonly ChildAgentInspectorNode[], depth: number): void => {
-			for (const node of nodes) {
-				result.push({ node, depth });
-				walk(node.children ?? [], depth + 1);
-			}
-		};
-		walk(this.nodes, 0);
-		return result;
+		return flattenChildAgentNodes(this.nodes);
 	}
 
 	private moveSelection(delta: number): void {
@@ -227,8 +342,9 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 	}
 
 	private headerLine(running: number, total: number, width: number): string {
-		const left = theme.bold("agents");
-		const right = theme.fg("muted", `${running}/${total} running`);
+		const left = theme.bold("subagents");
+		const right =
+			running > 0 ? theme.fg("muted", `${running} running · ${total} total`) : theme.fg("muted", `${total} total`);
 		const gap = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
 		return this.truncate(`${left}${gap}${right}`, width);
 	}
@@ -253,7 +369,7 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 		const truncated = this.truncate(line, contentWidth);
 		const paddedContent = truncated + " ".repeat(Math.max(0, contentWidth - visibleWidth(truncated)));
 		const padded = `${" ".repeat(this.paddingX)}${paddedContent}${" ".repeat(this.paddingX)}`;
-		return selected ? theme.bg("selectedBg", padded) : theme.bg("customMessageBg", padded);
+		return selected ? theme.bg("selectedBg", padded) : padded;
 	}
 
 	private truncate(line: string, width: number, ellipsis = ""): string {
@@ -270,7 +386,7 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 	onCancel?: () => void;
 
 	constructor(
-		private readonly getViewportHeight: () => number = () => 0,
+		_getViewportHeight: () => number = () => 0,
 		private readonly options: ChildAgentDetailOptions = {},
 	) {}
 
@@ -288,13 +404,8 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
-		const targetHeight = Math.max(0, this.getViewportHeight());
 		const sections = this.renderDetail(safeWidth);
-		const lines = [...sections.headerLines, ...sections.bodyLines];
-		while (lines.length < targetHeight) {
-			lines.push(this.panelLine("", safeWidth));
-		}
-		return lines;
+		return [...sections.headerLines, ...sections.bodyLines];
 	}
 
 	handleInput(data: string): void {
@@ -438,9 +549,7 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 	}
 
 	private panelLine(line: string, width: number): string {
-		const truncated = this.truncate(line, width);
-		const padded = truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
-		return theme.bg("customMessageBg", padded);
+		return this.truncate(line, width);
 	}
 
 	private truncate(line: string, width: number): string {

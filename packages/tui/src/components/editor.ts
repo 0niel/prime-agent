@@ -369,6 +369,14 @@ export class Editor implements Component, Focusable {
 		return currentVisualLine === visualLines.length - 1;
 	}
 
+	protected isHistoryNavigationActive(): boolean {
+		return this.historyIndex > -1;
+	}
+
+	protected isCursorOnLastVisualLine(): boolean {
+		return this.isOnLastVisualLine();
+	}
+
 	private navigateHistory(direction: 1 | -1): void {
 		this.lastAction = null;
 		if (this.history.length === 0) return;

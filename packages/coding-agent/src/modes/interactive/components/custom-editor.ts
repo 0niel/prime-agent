@@ -12,6 +12,7 @@ export class CustomEditor extends Editor {
 	public onEscape?: () => void;
 	public onCtrlD?: () => void;
 	public onPasteImage?: () => void;
+	public onMoveBelowPrompt?: () => boolean;
 	/** Handler for extension-registered shortcuts. Returns true if handled. */
 	public onExtensionShortcut?: (data: string) => boolean;
 
@@ -72,6 +73,16 @@ export class CustomEditor extends Editor {
 				handler();
 				return;
 			}
+		}
+
+		if (
+			this.keybindings.matches(data, "tui.editor.cursorDown") &&
+			!this.isShowingAutocomplete() &&
+			!this.isHistoryNavigationActive() &&
+			this.isCursorOnLastVisualLine() &&
+			this.onMoveBelowPrompt?.()
+		) {
+			return;
 		}
 
 		// Pass to parent for editor handling

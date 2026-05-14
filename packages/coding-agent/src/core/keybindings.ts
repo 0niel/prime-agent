@@ -90,7 +90,7 @@ export const KEYBINDINGS = {
 	},
 	"app.subagents.focus": {
 		defaultKeys: "alt+a",
-		description: "Focus child agents",
+		description: "Open child agents",
 	},
 	"app.session.toggleNamedFilter": {
 		defaultKeys: "ctrl+n",

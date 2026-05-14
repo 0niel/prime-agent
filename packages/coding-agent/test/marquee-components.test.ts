@@ -7,6 +7,7 @@ import {
 	ChildAgentDetailComponent,
 	ChildAgentInspectorComponent,
 	type ChildAgentInspectorNode,
+	ChildAgentSummaryComponent,
 } from "../src/modes/interactive/components/child-agent-inspector.js";
 import { IPythonCellComponent, type IPythonCellState } from "../src/modes/interactive/components/ipython-cell.js";
 import { SubAgentTreeComponent } from "../src/modes/interactive/components/sub-agent-tree.js";
@@ -23,14 +24,6 @@ class HostComponent implements Component {
 	invalidate(): void {
 		this.child.invalidate();
 	}
-}
-
-class EmptyComponent implements Component {
-	render(): string[] {
-		return [];
-	}
-
-	invalidate(): void {}
 }
 
 function createFakeTui(): TUI {
@@ -173,7 +166,11 @@ describe("marquee TUI components", () => {
 		expect(expanded).toContain("assistant: no anomaly found in this shard");
 	});
 
-	test("renders child agent inspector as a sidebar with full-screen detail handoff", () => {
+	test("renders child agent summary and bounded inspector list", () => {
+		const summary = new ChildAgentSummaryComponent(
+			() => "agents-sidebar",
+			() => "37% context left",
+		);
 		const component = new ChildAgentInspectorComponent();
 		const node: ChildAgentInspectorNode = {
 			id: "sub-a",
@@ -224,16 +221,51 @@ describe("marquee TUI components", () => {
 				},
 			],
 		};
+		summary.setNodes([node]);
 		component.setNodes([node]);
 
+		const summaryText = stripAnsi(summary.render(60).join("\n"));
+		expect(summaryText).toContain("agents-sidebar");
+		expect(summaryText).toContain("37% context left");
+		expect(summaryText).toContain("1 subagent running");
+		expect(summaryText).not.toContain("2 total");
+		expect(summary.render(60)).toHaveLength(1);
+
+		summary.focused = true;
+		const focusedSummary = stripAnsi(summary.render(60).join("\n"));
+		expect(focusedSummary).toContain("agents-sidebar");
+		expect(focusedSummary).toContain("37% context left");
+		expect(focusedSummary).toContain("1 subagent running");
+		expect(focusedSummary).not.toContain("▌");
+		const summaryRow = summary.render(60).at(-1) ?? "";
+		expect(visibleWidth(summaryRow)).toBe(60);
+		expect(stripAnsi(summaryRow).endsWith("37% context left")).toBe(true);
+
+		const queueSummary = new ChildAgentSummaryComponent(
+			() => "agents-sidebar",
+			() => "37% context left",
+			() => "alt+enter to queue message",
+		);
+		queueSummary.setNodes([node]);
+		const queueText = stripAnsi(queueSummary.render(60).join("\n"));
+		expect(queueText).toContain("alt+enter to queue message");
+		expect(queueText).toContain("37% context left");
+		expect(queueText).not.toContain("1 subagent running");
+		expect(queueSummary.render(60)).toHaveLength(1);
+
 		const compact = stripAnsi(component.render(42).join("\n"));
-		expect(compact).toContain("  agents");
-		expect(compact).toContain("1/2 running");
+		expect(compact).toContain("subagents");
+		expect(compact).toContain("─");
+		expect(visibleWidth(component.render(42)[0] ?? "")).toBe(42);
+		expect(compact).toContain("1 running · 2 total");
 		expect(compact).toContain("running · inspect training logs");
 		expect(compact).toContain("done · check shard 2");
 		expect(compact).not.toContain("└─");
 		expect(compact).not.toContain("├─");
 		expect(compact).not.toContain("assistant: reading shard metrics");
+		for (const line of component.render(96)) {
+			expect(visibleWidth(line)).toBe(96);
+		}
 
 		component.focused = true;
 		const focused = stripAnsi(component.render(42).join("\n"));
@@ -262,7 +294,6 @@ describe("marquee TUI components", () => {
 		expect(detail).not.toContain("user: inspect training logs");
 		expect(detail).not.toContain("assistant: reading shard metrics");
 		expect(detail).not.toContain("tool: bash");
-		expect(detailLines).toHaveLength(20);
 
 		component.handleInput("\x1b");
 		const returned = stripAnsi(component.render(42).join("\n"));
@@ -274,13 +305,11 @@ describe("marquee TUI components", () => {
 		}
 
 		const narrow = stripAnsi(component.render(24).join("\n"));
-		expect(narrow).toContain("inspect…");
+		expect(narrow).toContain("inspect t…");
 	});
 
-	test("opens child agent detail in terminal scrollback at the bottom", async () => {
-		const terminal = new VirtualTerminal(48, 8);
-		const tui = new TUI(terminal);
-		const detailComponent = new ChildAgentDetailComponent(() => terminal.rows, { ui: tui });
+	test("renders full child agent detail without internal scroll controls", () => {
+		const detailComponent = new ChildAgentDetailComponent(() => 6);
 		detailComponent.setNode({
 			id: "sub-scroll",
 			label: "inspect long output",
@@ -292,25 +321,13 @@ describe("marquee TUI components", () => {
 			})),
 		});
 
-		tui.addChild(new EmptyComponent());
-		tui.showOverlay(detailComponent, {
-			width: "100%",
-			anchor: "top-left",
-			margin: 0,
-			scrollback: true,
-		});
-		tui.start();
-		await terminal.waitForRender();
-
-		const viewport = stripAnsi(terminal.getViewport().join("\n"));
-		expect(viewport).toContain("fallback transcript row 12");
-		expect(viewport).toContain("fallback transcript row 08");
-		expect(viewport).not.toContain("fallback transcript row 01");
-
-		const scrollBuffer = stripAnsi(terminal.getScrollBuffer().join("\n"));
-		expect(scrollBuffer).toContain("fallback transcript row 01");
-		expect(scrollBuffer).toContain("fallback transcript row 12");
-		tui.stop();
+		const firstLines = detailComponent.render(48);
+		const first = stripAnsi(firstLines.join("\n"));
+		expect(first).toContain("fallback transcript row 01");
+		expect(first).toContain("fallback transcript row 12");
+		expect(first).not.toContain("↑");
+		expect(first).not.toContain("↓");
+		expect(firstLines.length).toBeGreaterThan(6);
 	});
 
 	test("routes built-in ipython tool rows through the cell renderer", () => {
