@@ -4,7 +4,7 @@
 	"description": "Coding agent CLI with ipython, bash, edit tools and session management",
 	"type": "module",
 	"piConfig": {
-		"configDir": ".pi"
+		"configDir": ".prime/agent"
 	},
 	"bin": {
 		"pi": "dist/cli.js"
