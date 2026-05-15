@@ -4,12 +4,15 @@
 
 ### Added
 
+- Added a GitHub Releases installer script for the `prime-agent` standalone binary.
 - Added automatic IPython kernel runtime bootstrap with uv-managed Python, `ipykernel`, and `prime-agent-runtime`.
 - Added `/goal` for long-running objectives that continue after early no-tool stops until the model marks the goal complete.
 - Added `/usage` to show token, cost, and context usage on demand.
 
 ### Changed
 
+- Changed the published CLI command and standalone release archives from `pi` to `prime-agent`.
+- Changed the config directory environment variables and subprocess marker to use the `PRIME_AGENT` prefix.
 - Changed the default active built-in tool set to `ipython`.
 - Changed the interactive startup screen to hide loaded resources by default unless verbose startup is enabled.
 - Changed the interactive prompt input to render as a larger filled surface instead of a bordered frame.

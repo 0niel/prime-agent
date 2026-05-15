@@ -269,7 +269,7 @@ export function getSelfUpdateUnavailableInstruction(
 ): string {
 	const method = detectInstallMethod();
 	if (method === "bun-binary") {
-		return `Download from: https://github.com/earendil-works/pi-mono/releases/latest`;
+		return `Download from: https://github.com/PrimeIntellect-ai/prime-agent/releases/latest`;
 	}
 	const command = getSelfUpdateCommandForMethod(method, packageName, updatePackageName, npmCommand);
 	if (command) {
@@ -423,9 +423,13 @@ export const APP_TITLE: string = piConfigName ? APP_NAME : "π";
 export const CONFIG_DIR_NAME: string = pkg.piConfig?.configDir || ".prime/agent";
 export const VERSION: string = pkg.version || "0.0.0";
 
-// e.g., PI_CODING_AGENT_DIR or TAU_CODING_AGENT_DIR
-export const ENV_AGENT_DIR = `${APP_NAME.toUpperCase()}_CODING_AGENT_DIR`;
-export const ENV_SESSION_DIR = `${APP_NAME.toUpperCase()}_CODING_AGENT_SESSION_DIR`;
+const ENV_PREFIX = APP_NAME.replaceAll(/[^a-zA-Z0-9]+/g, "_")
+	.replaceAll(/^_+|_+$/g, "")
+	.toUpperCase();
+
+// e.g., PI_CODING_AGENT_DIR or PRIME_AGENT_CODING_AGENT_DIR
+export const ENV_AGENT_DIR = `${ENV_PREFIX || "PI"}_CODING_AGENT_DIR`;
+export const ENV_SESSION_DIR = `${ENV_PREFIX || "PI"}_CODING_AGENT_SESSION_DIR`;
 
 export function expandTildePath(path: string): string {
 	if (path === "~") return homedir();

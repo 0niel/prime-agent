@@ -6,9 +6,13 @@ on:
       - 'v*'
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Tag to build (e.g., v0.12.0)'
+      release_tag:
+        description: 'Release tag to create or update (e.g., v0.12.0)'
         required: true
+        type: string
+      ref:
+        description: 'Branch, tag, or SHA to build. Defaults to release_tag.'
+        required: false
         type: string
 
 permissions:
@@ -18,12 +22,13 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+      BUILD_REF: ${{ github.event.inputs.ref || github.event.inputs.release_tag || github.ref_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ env.BUILD_REF }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2.0.1
@@ -63,17 +68,18 @@ jobs:
           # Create release with changelog notes (or update if exists)
           gh release create "${RELEASE_TAG}" \
             --title "${RELEASE_TAG}" \
+            --target "${BUILD_REF}" \
             --notes-file /tmp/release-notes.md \
-            pi-darwin-arm64.tar.gz \
-            pi-darwin-x64.tar.gz \
-            pi-linux-x64.tar.gz \
-            pi-linux-arm64.tar.gz \
-            pi-windows-x64.zip \
+            prime-agent-darwin-arm64.tar.gz \
+            prime-agent-darwin-x64.tar.gz \
+            prime-agent-linux-x64.tar.gz \
+            prime-agent-linux-arm64.tar.gz \
+            prime-agent-windows-x64.zip \
             2>/dev/null || \
           gh release upload "${RELEASE_TAG}" \
-            pi-darwin-arm64.tar.gz \
-            pi-darwin-x64.tar.gz \
-            pi-linux-x64.tar.gz \
-            pi-linux-arm64.tar.gz \
-            pi-windows-x64.zip \
+            prime-agent-darwin-arm64.tar.gz \
+            prime-agent-darwin-x64.tar.gz \
+            prime-agent-linux-x64.tar.gz \
+            prime-agent-linux-arm64.tar.gz \
+            prime-agent-windows-x64.zip \
             --clobber

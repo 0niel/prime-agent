@@ -1,4 +1,4 @@
-# Using Pi
+# Using Prime Agent
 
 This page collects day-to-day usage details that do not fit on the quickstart page.
 
@@ -54,7 +54,7 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/reload` | Reload keybindings, extensions, skills, prompts, and context files |
 | `/hotkeys` | Show all keyboard shortcuts |
 | `/changelog` | Display version history |
-| `/quit` | Quit pi |
+| `/quit` | Quit Prime Agent |
 
 ## Message Queue
 
@@ -65,20 +65,20 @@ You can submit messages while the agent is still working:
 - **Escape** aborts and restores queued messages to the editor.
 - **Alt+Up** retrieves queued messages back to the editor.
 
-On Windows Terminal, Alt+Enter is fullscreen by default. Remap it as described in [Terminal setup](terminal-setup.md) if you want pi to receive the shortcut.
+On Windows Terminal, Alt+Enter is fullscreen by default. Remap it as described in [Terminal setup](terminal-setup.md) if you want Prime Agent to receive the shortcut.
 
 Configure delivery in [Settings](settings.md) with `steeringMode` and `followUpMode`.
 
 ## Sessions
 
-Sessions are saved automatically to `~/.pi/agent/sessions/`, organized by working directory.
+Sessions are saved automatically to `~/.prime/agent/sessions/`, organized by working directory.
 
 ```bash
-pi -c                  # Continue most recent session
-pi -r                  # Browse and select a session
-pi --no-session        # Ephemeral mode; do not save
-pi --session <path|id> # Use a specific session file or session ID
-pi --fork <path|id>    # Fork a session into a new session file
+prime-agent -c                  # Continue most recent session
+prime-agent -r                  # Browse and select a session
+prime-agent --no-session        # Ephemeral mode; do not save
+prime-agent --session <path|id> # Use a specific session file or session ID
+prime-agent --fork <path|id>    # Fork a session into a new session file
 ```
 
 Useful session commands:
@@ -94,9 +94,9 @@ See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 
 ## Context Files
 
-Pi loads `AGENTS.md` or `CLAUDE.md` at startup from:
+Prime Agent loads `AGENTS.md` or `CLAUDE.md` at startup from:
 
-- `~/.pi/agent/AGENTS.md` for global instructions
+- `~/.prime/agent/AGENTS.md` for global instructions
 - parent directories, walking up from the current working directory
 - the current directory
 
@@ -107,7 +107,7 @@ Use context files for project conventions, commands, safety rules, and preferenc
 Replace the default system prompt with:
 
 - `.pi/SYSTEM.md` for a project
-- `~/.pi/agent/SYSTEM.md` globally
+- `~/.prime/agent/SYSTEM.md` globally
 
 Append to the default prompt without replacing it with `APPEND_SYSTEM.md` in either location.
 
@@ -122,21 +122,21 @@ If you use pi for open source work and want to publish sessions for model, promp
 ## CLI Reference
 
 ```bash
-pi [options] [@files...] [messages...]
+prime-agent [options] [@files...] [messages...]
 ```
 
 ### Package Commands
 
 ```bash
-pi install <source> [-l]     # Install package, -l for project-local
-pi remove <source> [-l]      # Remove package
-pi uninstall <source> [-l]   # Alias for remove
-pi update [source|self|pi]   # Update pi and packages; skips pinned packages
-pi update --extensions       # Update packages only
-pi update --self             # Update pi only
-pi update --extension <src>  # Update one package
-pi list                      # List installed packages
-pi config                    # Enable/disable package resources
+prime-agent install <source> [-l]     # Install package, -l for project-local
+prime-agent remove <source> [-l]      # Remove package
+prime-agent uninstall <source> [-l]   # Alias for remove
+prime-agent update [source|self|prime-agent]   # Update Prime Agent and packages; skips pinned packages
+prime-agent update --extensions       # Update packages only
+prime-agent update --self             # Update Prime Agent only
+prime-agent update --extension <src>  # Update one package
+prime-agent list                      # List installed packages
+prime-agent config                    # Enable/disable package resources
 ```
 
 See [Pi Packages](packages.md) for package sources and security notes.
@@ -151,10 +151,10 @@ See [Pi Packages](packages.md) for package sources and security notes.
 | `--mode rpc` | RPC mode over stdin/stdout; see [RPC mode](rpc.md) |
 | `--export <in> [out]` | Export a session to HTML |
 
-In print mode, pi also reads piped stdin and merges it into the initial prompt:
+In print mode, Prime Agent also reads piped stdin and merges it into the initial prompt:
 
 ```bash
-cat README.md | pi -p "Summarize this text"
+cat README.md | prime-agent -p "Summarize this text"
 ```
 
 ### Model Options
@@ -206,7 +206,7 @@ Built-in tools: `ipython`, `bash`, `edit`.
 Combine `--no-*` with explicit flags to load exactly what you need, ignoring settings. Example:
 
 ```bash
-pi --no-extensions -e ./my-extension.ts
+prime-agent --no-extensions -e ./my-extension.ts
 ```
 
 ### Other Options
@@ -224,45 +224,45 @@ pi --no-extensions -e ./my-extension.ts
 Prefix files with `@` to include them in the message:
 
 ```bash
-pi @prompt.md "Answer this"
-pi -p @screenshot.png "What's in this image?"
-pi @code.ts @test.ts "Review these files"
+prime-agent @prompt.md "Answer this"
+prime-agent -p @screenshot.png "What's in this image?"
+prime-agent @code.ts @test.ts "Review these files"
 ```
 
 ### Examples
 
 ```bash
 # Interactive with initial prompt
-pi "List all .ts files in src/"
+prime-agent "List all .ts files in src/"
 
 # Non-interactive
-pi -p "Summarize this codebase"
+prime-agent -p "Summarize this codebase"
 
 # Non-interactive with piped stdin
-cat README.md | pi -p "Summarize this text"
+cat README.md | prime-agent -p "Summarize this text"
 
 # Different model
-pi --provider openai --model gpt-4o "Help me refactor"
+prime-agent --provider openai --model gpt-4o "Help me refactor"
 
 # Model with provider prefix
-pi --model openai/gpt-4o "Help me refactor"
+prime-agent --model openai/gpt-4o "Help me refactor"
 
 # Model with thinking level shorthand
-pi --model sonnet:high "Solve this complex problem"
+prime-agent --model sonnet:high "Solve this complex problem"
 
 # Limit model cycling
-pi --models "claude-*,gpt-4o"
+prime-agent --models "claude-*,gpt-4o"
 
 # Enable optional shell/edit tools
-pi --tools bash,edit -p "Review the code"
+prime-agent --tools bash,edit -p "Review the code"
 ```
 
 ### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `PI_CODING_AGENT_DIR` | Override config directory; default is `~/.pi/agent` |
-| `PI_CODING_AGENT_SESSION_DIR` | Override session storage directory; overridden by `--session-dir` |
+| `PRIME_AGENT_CODING_AGENT_DIR` | Override config directory; default is `~/.prime/agent` |
+| `PRIME_AGENT_CODING_AGENT_SESSION_DIR` | Override session storage directory; overridden by `--session-dir` |
 | `PI_PACKAGE_DIR` | Override package directory, useful for Nix/Guix store paths |
 | `PI_OFFLINE` | Disable startup network operations, including update checks, package update checks, and install/update telemetry |
 | `PI_SKIP_VERSION_CHECK` | Skip the Pi version update check at startup. This prevents the `pi.dev` latest-version request |

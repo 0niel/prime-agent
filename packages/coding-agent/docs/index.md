@@ -1,13 +1,13 @@
-# Pi Documentation
+# Prime Agent Documentation
 
-Pi is a minimal terminal coding harness. It is designed to stay small at the core while being extended through TypeScript extensions, skills, prompt templates, themes, and pi packages.
+Prime Agent is a minimal terminal coding harness. It is designed to stay small at the core while being extended through TypeScript extensions, skills, prompt templates, themes, and pi packages.
 
 ## Quick start
 
-On linux or mac you can install Pi with curl:
+On linux or mac you can install Prime Agent with curl:
 
 ```bash
-curl -fsSL https://pi.dev/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/PrimeIntellect-ai/prime-agent/main/install.sh | sh
 ```
 
 Or alternatively with npm:
@@ -19,10 +19,10 @@ npm install -g @earendil-works/pi-coding-agent
 Then run it in a project directory:
 
 ```bash
-pi
+prime-agent
 ```
 
-Authenticate with `/login` for subscription providers, or set an API key such as `ANTHROPIC_API_KEY` before starting pi.
+Authenticate with `/login` for subscription providers, or set an API key such as `ANTHROPIC_API_KEY` before starting Prime Agent.
 
 For the full first-run flow, see [Quickstart](quickstart.md).
 
@@ -48,7 +48,7 @@ For the full first-run flow, see [Quickstart](quickstart.md).
 
 ## Programmatic usage
 
-- [SDK](sdk.md) - embed pi in Node.js applications.
+- [SDK](sdk.md) - embed Prime Agent in Node.js applications.
 - [RPC mode](rpc.md) - integrate over stdin/stdout JSONL.
 - [JSON event stream mode](json.md) - print mode with structured events.
 - [TUI components](tui.md) - build custom terminal UI for extensions.
