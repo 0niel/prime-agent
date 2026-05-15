@@ -2,12 +2,13 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
-import { Dealer, Subscriber } from "zeromq";
+import type { Dealer, Subscriber } from "zeromq";
 import type {
 	RlmBackgroundRunHandler,
 	RlmBackgroundRunStatusHandler,
@@ -26,6 +27,32 @@ const READY_TIMEOUT_MS = 5000;
 const IOPUB_SUBSCRIBE_DELAY_MS = 50;
 const DEFAULT_MAX_OUTPUT_CHARS = 65536;
 const RLM_DISPOSE_TIMEOUT_MS = 5000;
+const require = createRequire(import.meta.url);
+
+interface ZmqRuntime {
+	Dealer: new () => Dealer;
+	Subscriber: new () => Subscriber;
+}
+
+let zmqRuntime: ZmqRuntime | undefined;
+
+function isBunRuntime(): boolean {
+	const versions = process.versions as NodeJS.ProcessVersions & { bun?: string };
+	return typeof versions.bun === "string";
+}
+
+function getZmqRuntime(): ZmqRuntime {
+	if (isBunRuntime()) {
+		throw new Error(
+			"The IPython tool is not available in the standalone Bun binary because zeromq uses libuv APIs that Bun does not support yet. Use the npm install, or run the standalone binary with --tools bash,edit.",
+		);
+	}
+
+	if (!zmqRuntime) {
+		zmqRuntime = require("zeromq") as ZmqRuntime;
+	}
+	return zmqRuntime;
+}
 
 export interface KernelManagerOptions {
 	/** Python interpreter that has `ipykernel` available. Defaults to the auto-bootstrapped kernel. */
@@ -379,9 +406,10 @@ export class KernelManager {
 			throw e;
 		}
 
-		this.shell = new Dealer();
-		this.iopub = new Subscriber();
-		this.control = new Dealer();
+		const { Dealer: DealerSocket, Subscriber: SubscriberSocket } = getZmqRuntime();
+		this.shell = new DealerSocket();
+		this.iopub = new SubscriberSocket();
+		this.control = new DealerSocket();
 		this.shell.connect(`${conn.transport}://${conn.ip}:${conn.shell_port}`);
 		this.iopub.connect(`${conn.transport}://${conn.ip}:${conn.iopub_port}`);
 		this.control.connect(`${conn.transport}://${conn.ip}:${conn.control_port}`);
