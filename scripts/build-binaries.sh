@@ -102,18 +102,57 @@ fi
 
 for platform in "${PLATFORMS[@]}"; do
     echo "Building for $platform..."
-    # Externalize koffi to avoid embedding all 18 platform .node files (~74MB)
-    # into every binary. Koffi is only used on Windows for VT input and the
-    # call site has a try/catch fallback. For Windows builds, we copy the
-    # appropriate .node file alongside the binary below.
+    # Externalize native modules so their .node files are loaded from the
+    # release directory instead of embedding build-machine paths into the
+    # compiled Bun executable.
     if [[ "$platform" == "windows-x64" ]]; then
-        bun build --compile --external koffi --target=bun-$platform ./dist/bun/cli.js --outfile binaries/$platform/prime-agent.exe
+        bun build --compile --external koffi --external zeromq --target=bun-$platform ./dist/bun/cli.js --outfile binaries/$platform/prime-agent.exe
     else
-        bun build --compile --external koffi --target=bun-$platform ./dist/bun/cli.js --outfile binaries/$platform/prime-agent
+        bun build --compile --external koffi --external zeromq --target=bun-$platform ./dist/bun/cli.js --outfile binaries/$platform/prime-agent
     fi
 done
 
 echo "==> Creating release archives..."
+
+copy_zeromq_runtime() {
+    local platform="$1"
+    local target_dir="$2"
+    local modules_dir="$target_dir/node_modules"
+
+    mkdir -p "$modules_dir/zeromq/lib"
+    mkdir -p "$modules_dir/zeromq/build"
+    mkdir -p "$modules_dir/cmake-ts/build"
+
+    cp ../../node_modules/zeromq/package.json "$modules_dir/zeromq/"
+    cp -R ../../node_modules/zeromq/lib/. "$modules_dir/zeromq/lib/"
+    cp ../../node_modules/zeromq/build/manifest.json "$modules_dir/zeromq/build/"
+
+    case "$platform" in
+        darwin-arm64)
+            mkdir -p "$modules_dir/zeromq/build/darwin"
+            cp -R ../../node_modules/zeromq/build/darwin/arm64 "$modules_dir/zeromq/build/darwin/"
+            ;;
+        darwin-x64)
+            mkdir -p "$modules_dir/zeromq/build/darwin"
+            cp -R ../../node_modules/zeromq/build/darwin/x64 "$modules_dir/zeromq/build/darwin/"
+            ;;
+        linux-arm64)
+            mkdir -p "$modules_dir/zeromq/build/linux"
+            cp -R ../../node_modules/zeromq/build/linux/arm64 "$modules_dir/zeromq/build/linux/"
+            ;;
+        linux-x64)
+            mkdir -p "$modules_dir/zeromq/build/linux"
+            cp -R ../../node_modules/zeromq/build/linux/x64 "$modules_dir/zeromq/build/linux/"
+            ;;
+        windows-x64)
+            mkdir -p "$modules_dir/zeromq/build/win32"
+            cp -R ../../node_modules/zeromq/build/win32/x64 "$modules_dir/zeromq/build/win32/"
+            ;;
+    esac
+
+    cp ../../node_modules/cmake-ts/package.json "$modules_dir/cmake-ts/"
+    cp ../../node_modules/cmake-ts/build/loader.js "$modules_dir/cmake-ts/build/"
+}
 
 # Copy shared files to each platform directory
 for platform in "${PLATFORMS[@]}"; do
@@ -128,6 +167,7 @@ for platform in "${PLATFORMS[@]}"; do
     cp -r dist/core/export-html binaries/$platform/
     cp -r docs binaries/$platform/
     cp -r examples binaries/$platform/
+    copy_zeromq_runtime "$platform" "binaries/$platform"
 
     # Copy koffi native module for Windows (needed for VT input support)
     if [[ "$platform" == "windows-x64" ]]; then

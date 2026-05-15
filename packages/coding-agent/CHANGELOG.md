@@ -23,6 +23,7 @@
 
 ### Fixed
 
+- Fixed standalone release archives to include the `zeromq` native runtime needed by the compiled `prime-agent` binary.
 - Fixed long cwd values in the startup splash from wrapping through the brand mark.
 - Fixed IPython kernel startup to let `ipykernel` bind OS-assigned ports instead of randomly selecting fixed ports.
 - Fixed RLM child usage aggregation so parent session totals include recursive child runs after session reloads.
