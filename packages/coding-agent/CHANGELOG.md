@@ -23,6 +23,7 @@
 
 ### Fixed
 
+- Fixed standalone release archives to include the local Python runtime package used by the IPython bootstrap.
 - Fixed standalone CLI startup to avoid loading the unsupported IPython `zeromq` runtime before the IPython tool is used.
 - Fixed standalone release archives to include the `zeromq` native runtime needed by the compiled `prime-agent` binary.
 - Fixed long cwd values in the startup splash from wrapping through the brand mark.

@@ -203,6 +203,7 @@ for platform in "${PLATFORMS[@]}"; do
     cp -r dist/core/export-html binaries/$platform/
     cp -r docs binaries/$platform/
     cp -r examples binaries/$platform/
+    cp -r dist/prime-agent-runtime binaries/$platform/
     create_launcher "$platform" "binaries/$platform"
     copy_zeromq_runtime "$platform" "binaries/$platform"
 

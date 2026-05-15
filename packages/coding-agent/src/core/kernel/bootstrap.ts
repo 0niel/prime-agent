@@ -269,7 +269,10 @@ async function writeBootstrapVersion(venv: string): Promise<void> {
 
 function runtimeCandidateDirs(): string[] {
 	const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+	const executableDir = path.dirname(process.execPath);
 	return [
+		path.resolve(process.cwd(), "prime-agent-runtime"),
+		path.resolve(executableDir, "prime-agent-runtime"),
 		path.resolve(moduleDir, "..", "..", "prime-agent-runtime"),
 		path.resolve(moduleDir, "..", "..", "..", "..", "..", "prime-agent-runtime"),
 	];
