@@ -64,6 +64,16 @@ function getCellItalic(terminal: VirtualTerminal, row: number, col: number): num
 	return cell.isItalic();
 }
 
+function getCellBg(terminal: VirtualTerminal, row: number, col: number): { mode: number; color: number } {
+	const xterm = (terminal as unknown as { xterm: XtermTerminalType }).xterm;
+	const buffer = xterm.buffer.active;
+	const line = buffer.getLine(buffer.viewportY + row);
+	assert.ok(line, `Missing buffer line at row ${row}`);
+	const cell = line.getCell(col);
+	assert.ok(cell, `Missing cell at row ${row} col ${col}`);
+	return { mode: cell.getBgColorMode(), color: cell.getBgColor() };
+}
+
 describe("TUI Kitty image cleanup", () => {
 	it("deletes changed image ids before drawing moved placements", async () => {
 		const terminal = new LoggingVirtualTerminal(40, 10);
@@ -374,6 +384,25 @@ describe("TUI differential rendering", () => {
 		await terminal.waitForRender();
 
 		assert.strictEqual(getCellItalic(terminal, 1, 0), 0);
+		tui.stop();
+	});
+
+	it("expands tabs before writing rendered lines to the terminal", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 6);
+		const tui = new TUI(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = ["\x1b[48;5;236m512:\t\tcode\x1b[49m"];
+		tui.start();
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		assert.ok(!writes.includes("\t"), "rendered terminal output should not contain raw tabs");
+		assert.ok(writes.includes("512:      code"), "tabs should expand to the measured three-column width");
+		assert.deepStrictEqual(getCellBg(terminal, 0, 4), getCellBg(terminal, 0, 0));
+		assert.deepStrictEqual(getCellBg(terminal, 0, 9), getCellBg(terminal, 0, 0));
+
 		tui.stop();
 	});
 

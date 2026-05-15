@@ -263,10 +263,24 @@ export function visibleWidth(str: string): number {
  */
 const THAI_LAO_AM_REGEX = /[\u0e33\u0eb3]/;
 const THAI_LAO_AM_GLOBAL_REGEX = /[\u0e33\u0eb3]/g;
+const TAB_REGEX = /\t/;
+const TAB_GLOBAL_REGEX = /\t/g;
 
 export function normalizeTerminalOutput(str: string): string {
-	if (!THAI_LAO_AM_REGEX.test(str)) return str;
-	return str.replace(THAI_LAO_AM_GLOBAL_REGEX, (char) => (char === "\u0e33" ? "\u0e4d\u0e32" : "\u0ecd\u0eb2"));
+	const hasThaiLaoAm = THAI_LAO_AM_REGEX.test(str);
+	const hasTab = TAB_REGEX.test(str);
+	if (!hasThaiLaoAm && !hasTab) return str;
+
+	let normalized = str;
+	if (hasThaiLaoAm) {
+		normalized = normalized.replace(THAI_LAO_AM_GLOBAL_REGEX, (char) =>
+			char === "\u0e33" ? "\u0e4d\u0e32" : "\u0ecd\u0eb2",
+		);
+	}
+	if (hasTab) {
+		normalized = normalized.replace(TAB_GLOBAL_REGEX, "   ");
+	}
+	return normalized;
 }
 
 /**
