@@ -196,6 +196,9 @@ subscribe to iopub
 sleep briefly for ZeroMQ slow-joiner behavior
   |
   v
+start persistent iopub pump
+  |
+  v
 probeReady()
   |
   | sends kernel_info_request on shell
@@ -225,7 +228,7 @@ execute(code)
 send execute_request on shell
   |
   v
-read iopub messages
+wait for persistent iopub pump to finish active execution
   |
   | stream        -> stdout / stderr
   | execute_result -> final expression repr
@@ -381,7 +384,7 @@ loop.call_soon_threadsafe(...)
 
 ## TypeScript Comm Handling
 
-`KernelManager.executeInner()` watches IOPub messages. Comm messages are handled before the normal parent `msg_id` filter:
+`KernelManager` starts a persistent IOPub pump when the kernel starts. Comm messages are handled before the active execution `msg_id` filter:
 
 ```text
 for each iopub message:
@@ -389,13 +392,16 @@ for each iopub message:
     handleCommMessage(incoming)
     continue
 
+  if no active execution:
+    ignore
+
   if parent_header.msg_id != active execute_request:
     ignore
 
   handle stdout / stderr / result / error / idle
 ```
 
-This matters because `comm_open` messages may not use the active execute request as their parent.
+This matters because `comm_open` messages may not use the active execute request as their parent, and Python `asyncio` tasks can open RLM comms after the scheduling cell has already returned to idle.
 
 The comm handler tracks:
 

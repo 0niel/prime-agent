@@ -6,11 +6,12 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
-const BOOTSTRAP_SCHEMA = 1;
+const BOOTSTRAP_SCHEMA = 2;
 const PYTHON_VERSION = "3.11";
 const IPYKERNEL_REQUIREMENT = "ipykernel";
 const RUNTIME_REQUIREMENT = "prime-agent-runtime";
-const RUNTIME_READY_CHECK = "import rlm; assert hasattr(rlm, 'background'); assert hasattr(rlm.rlm, 'background')";
+const RUNTIME_READY_CHECK =
+	"import rlm; assert hasattr(rlm, 'run'); assert callable(rlm); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm); assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background')";
 const BOOTSTRAP_VERSION_FILE = ".bootstrap-version";
 const BOOTSTRAP_LOCK_NAME = ".bootstrap.lock";
 const BOOTSTRAP_LOCK_RETRY_MS = 100;
@@ -318,7 +319,7 @@ async function ensureKernelPythonUncached(): Promise<string> {
 		const python = path.resolve(expandHome(override));
 		const missing: string[] = [];
 		if (!(await hasIpykernel(python))) missing.push("ipykernel");
-		if (!(await hasPrimeAgentRuntime(python))) missing.push("a current prime-agent-runtime with rlm.background");
+		if (!(await hasPrimeAgentRuntime(python))) missing.push("a current prime-agent-runtime with callable rlm.run");
 		if (missing.length === 0) return python;
 		throw new Error(`PRIME_AGENT_KERNEL_PYTHON points to a Python missing ${missing.join(" and ")}: ${python}`);
 	}

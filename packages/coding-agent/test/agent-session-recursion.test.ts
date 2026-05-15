@@ -87,33 +87,41 @@ interface CapturedCommReply {
 	data: Record<string, unknown>;
 }
 
-interface InspectableBackgroundRun {
+interface InspectableRlmRun {
 	abort: () => void;
-}
-
-interface InspectableBackgroundSession {
-	_backgroundRlmRuns: Map<string, InspectableBackgroundRun>;
-}
-
-interface InspectableBackgroundCompletionRun {
-	id: string;
-	prompt: string;
-	status: "done";
-	sessionDir: string | null;
-	result: {
-		answer: string;
-		usage: { prompt_tokens: number; completion_tokens: number };
-		turns: number;
-		session_dir: string | null;
-	};
-	completionPolicy: "passive" | "wake" | "silent";
+	status: string;
 	error?: string;
 }
 
-interface InspectableBackgroundCompletionSession {
-	_queueBackgroundRlmChildCompletion(run: InspectableBackgroundCompletionRun): void;
-	_pendingBackgroundRlmCompletions: InspectableBackgroundCompletionRun[];
-	_backgroundRlmCompletionTimer?: ReturnType<typeof globalThis.setTimeout>;
+interface InspectableRlmSession {
+	_activeRlmChildRuns: Map<string, InspectableRlmRun>;
+}
+
+interface KernelPumpTestApi {
+	iopub: AsyncIterable<Buffer[]> & { close(): void };
+	startIopubPump(): void;
+}
+
+interface KernelExecuteTestApi {
+	start: () => Promise<void>;
+	state: "idle" | "starting" | "running" | "shutdown";
+	activeExecution?: unknown;
+	shell?: {
+		send(frames: Buffer[]): Promise<void>;
+		close(): void;
+	};
+	connection?: {
+		ip: string;
+		transport: "tcp";
+		shell_port: number;
+		iopub_port: number;
+		stdin_port: number;
+		control_port: number;
+		hb_port: number;
+		signature_scheme: "hmac-sha256";
+		key: string;
+		kernel_name: string;
+	};
 }
 
 function rlmCommOpenData(commId: string, data: Record<string, unknown>): TestCommMessage {
@@ -131,6 +139,29 @@ function rlmCommOpenData(commId: string, data: Record<string, unknown>): TestCom
 
 function rlmCommOpen(commId: string, prompt: string, kwargs: Record<string, unknown> = {}): TestCommMessage {
 	return rlmCommOpenData(commId, { type: "run", prompt, kwargs });
+}
+
+function encodeTestMessage(message: TestCommMessage): Buffer[] {
+	return [
+		Buffer.from("<IDS|MSG>"),
+		Buffer.from(""),
+		Buffer.from(JSON.stringify(message.header)),
+		Buffer.from(JSON.stringify(message.parent_header)),
+		Buffer.from(JSON.stringify(message.metadata)),
+		Buffer.from(JSON.stringify(message.content)),
+	];
+}
+
+function asyncFrames(frames: Buffer[][]): AsyncIterable<Buffer[]> & { close(): void } {
+	return {
+		close: () => {},
+		async *[Symbol.asyncIterator]() {
+			for (const frame of frames) {
+				await sleep(0);
+				yield frame;
+			}
+		},
+	};
 }
 
 async function waitFor(condition: () => boolean): Promise<void> {
@@ -308,13 +339,12 @@ describe("AgentSession rlm recursion", () => {
 		);
 	});
 
-	it("starts a background child without blocking and records a passive hidden completion notice", async () => {
+	it("cancels active rlm children when the parent session is disposed", async () => {
 		let releaseChild: () => void = () => {};
 		const release = new Promise<void>((resolve) => {
 			releaseChild = resolve;
 		});
 		let childStarted = false;
-		const parentInputs: string[] = [];
 		const root = createSession({
 			streamFn: (_model, context) => {
 				const text = userText(context);
@@ -324,214 +354,23 @@ describe("AgentSession rlm recursion", () => {
 					void release.then(() => {
 						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
 					});
-				} else {
-					parentInputs.push(text);
-					queueMicrotask(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage(`parent saw: ${text}`) });
-					});
 				}
 				return stream;
 			},
 		});
 
-		const start = root.startBackgroundRlmChild("slow shard");
-		const run = (root as unknown as InspectableBackgroundSession)._backgroundRlmRuns.get(start.id);
-		const activeAbort = run?.abort;
-
-		expect(start.state).toBe("running");
-		expect(start.id).toMatch(/^sub-/);
+		const runPromise = root.runRlmChild("slow shard");
 		await waitFor(() => childStarted);
-		expect(root.getBackgroundRlmChildStatus(start.id)).toMatchObject({
-			id: start.id,
-			state: "running",
-			session_dir: start.session_dir,
-		});
-
-		releaseChild();
-		const finished = await root.waitForBackgroundRlmChild(start.id, 1000);
-
-		expect(finished.state).toBe("done");
-		expect(finished.result?.answer).toBe("child answer: slow shard");
-		await waitFor(() => {
-			const notice = root.messages.find(
-				(message) => message.role === "custom" && message.customType === "rlm_background_result",
-			);
-			return notice?.role === "custom" && notice.display === false;
-		});
-		const notice = root.messages.find(
-			(message) => message.role === "custom" && message.customType === "rlm_background_result",
-		);
-		expect(notice?.role).toBe("custom");
-		if (notice?.role !== "custom") {
-			throw new Error("background completion notice was not recorded");
-		}
-		expect(notice.display).toBe(false);
-		expect(notice.content).toContain("1 background RLM child has finished.");
-		expect(notice.content).toContain("Answer preview: child answer: slow shard");
-		expect(run?.abort).not.toBe(activeAbort);
-		await sleep(350);
-		expect(parentInputs).toEqual([]);
-	});
-
-	it("wakes the parent when a background child is started with notify wake", async () => {
-		let releaseChild: () => void = () => {};
-		const release = new Promise<void>((resolve) => {
-			releaseChild = resolve;
-		});
-		let childStarted = false;
-		const parentInputs: string[] = [];
-		const root = createSession({
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				const stream = createAssistantMessageEventStream();
-				if (text === "slow shard") {
-					childStarted = true;
-					void release.then(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-					});
-				} else {
-					parentInputs.push(text);
-					queueMicrotask(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage(`parent saw: ${text}`) });
-					});
-				}
-				return stream;
-			},
-		});
-
-		const start = root.startBackgroundRlmChild("slow shard", { notify: "wake" });
-
-		await waitFor(() => childStarted);
-		releaseChild();
-		const finished = await root.waitForBackgroundRlmChild(start.id, 1000);
-
-		expect(finished.state).toBe("done");
-		await waitFor(() => parentInputs.length === 1);
-		expect(parentInputs[0]).toContain("Background RLM completion notice");
-		expect(parentInputs[0]).toContain("1 background RLM child has finished.");
-		expect(parentInputs[0]).toContain("Answer preview: child answer: slow shard");
-		expect(root.getLastAssistantText()).toContain("parent saw: Background RLM completion notice");
-	});
-
-	it("delivers background completion follow-ups while the parent is still running", async () => {
-		let releaseParent: () => void = () => {};
-		const parentRelease = new Promise<void>((resolve) => {
-			releaseParent = resolve;
-		});
-		let parentStarted = false;
-		const parentInputs: string[] = [];
-		const root = createSession({
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				const stream = createAssistantMessageEventStream();
-				if (text === "parent turn") {
-					parentStarted = true;
-					void parentRelease.then(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage("parent done") });
-					});
-				} else if (text === "slow shard") {
-					queueMicrotask(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-					});
-				} else {
-					parentInputs.push(text);
-					queueMicrotask(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage(`parent saw: ${text}`) });
-					});
-				}
-				return stream;
-			},
-		});
-
-		const parentRun = root.prompt("parent turn");
-		await waitFor(() => parentStarted && root.isStreaming);
-		const start = root.startBackgroundRlmChild("slow shard", { notify: "wake" });
-		const finished = await root.waitForBackgroundRlmChild(start.id, 1000);
-
-		expect(finished.state).toBe("done");
-		await sleep(350);
-		expect(parentInputs).toEqual([]);
-
-		releaseParent();
-		await parentRun;
-
-		expect(parentInputs).toHaveLength(1);
-		expect(parentInputs[0]).toContain("Background RLM completion notice");
-		expect(parentInputs[0]).toContain("Answer preview: child answer: slow shard");
-	});
-
-	it("does not drain queued background completion follow-ups after dispose", async () => {
-		let releaseParent: () => void = () => {};
-		const parentRelease = new Promise<void>((resolve) => {
-			releaseParent = resolve;
-		});
-		let parentStarted = false;
-		const parentInputs: string[] = [];
-		const root = createSession({
-			streamFn: (_model, context) => {
-				const text = userText(context);
-				const stream = createAssistantMessageEventStream();
-				if (text === "parent turn") {
-					parentStarted = true;
-					void parentRelease.then(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage("parent done") });
-					});
-				} else if (text === "slow shard") {
-					queueMicrotask(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
-					});
-				} else {
-					parentInputs.push(text);
-					queueMicrotask(() => {
-						stream.push({ type: "done", reason: "stop", message: assistantMessage(`parent saw: ${text}`) });
-					});
-				}
-				return stream;
-			},
-		});
-
-		const parentRun = root.prompt("parent turn");
-		await waitFor(() => parentStarted && root.isStreaming);
-		const start = root.startBackgroundRlmChild("slow shard", { notify: "wake" });
-		await expect(root.waitForBackgroundRlmChild(start.id, 1000)).resolves.toMatchObject({ state: "done" });
-		await sleep(350);
+		const runs = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
+		expect(runs.size).toBe(1);
+		const run = [...runs.values()][0];
 
 		root.dispose();
-		releaseParent();
-		await parentRun;
-		await sleep(50);
 
-		expect(parentInputs).toEqual([]);
-	});
-
-	it("ignores background completion callbacks that arrive after dispose", async () => {
-		const root = createSession();
-		root.dispose();
-
-		const inspectable = root as unknown as InspectableBackgroundCompletionSession;
-		const entriesBefore = root.sessionManager.getEntries().length;
-		inspectable._queueBackgroundRlmChildCompletion({
-			id: "sub-after-dispose",
-			prompt: "finished shard",
-			status: "done",
-			sessionDir: null,
-			result: {
-				answer: "finished answer",
-				usage: { prompt_tokens: 1, completion_tokens: 1 },
-				turns: 1,
-				session_dir: null,
-			},
-			completionPolicy: "passive",
-		});
-
-		await sleep(350);
-
-		expect(inspectable._pendingBackgroundRlmCompletions).toEqual([]);
-		expect(inspectable._backgroundRlmCompletionTimer).toBeUndefined();
-		expect(root.sessionManager.getEntries()).toHaveLength(entriesBefore);
-		expect(
-			root.messages.some((message) => message.role === "custom" && message.customType === "rlm_background_result"),
-		).toBe(false);
+		expect(run.status).toBe("cancelled");
+		expect(run.error).toBe("Parent session disposed");
+		releaseChild();
+		await expect(runPromise).rejects.toThrow();
 	});
 
 	it("runs parallel rlm comm requests independently", async () => {
@@ -595,25 +434,135 @@ describe("AgentSession rlm recursion", () => {
 		}
 	});
 
-	it("handles background rlm comm requests", async () => {
+	it("handles rlm comm requests from the iopub pump outside active execution", async () => {
+		const replies: CapturedCommReply[] = [];
+		let promptSeen = "";
+		const manager = new KernelManager({
+			python: process.execPath,
+			rlmRunHandler: async ({ prompt }) => {
+				promptSeen = prompt;
+				return {
+					answer: `answer:${prompt}`,
+					usage: { prompt_tokens: 1, completion_tokens: 1 },
+					turns: 1,
+					session_dir: null,
+				};
+			},
+		});
+
+		try {
+			const kernel = manager as unknown as KernelCommTestApi & KernelPumpTestApi;
+			kernel.sendCommMessage = async (commId, data) => {
+				replies.push({ commId, data });
+			};
+			kernel.iopub = asyncFrames([encodeTestMessage(rlmCommOpen("comm-detached", "detached child"))]);
+
+			kernel.startIopubPump();
+
+			await waitFor(() => replies.length === 1);
+
+			expect(promptSeen).toBe("detached child");
+			expect(replies[0]).toEqual({
+				commId: "comm-detached",
+				data: {
+					status: "ok",
+					answer: "answer:detached child",
+					usage: { prompt_tokens: 1, completion_tokens: 1 },
+					turns: 1,
+					session_dir: null,
+				},
+			});
+		} finally {
+			await manager.dispose();
+		}
+	});
+
+	it("handles rlm calls from asyncio tasks after the scheduling cell is idle", async () => {
+		const prompts: string[] = [];
+		const manager = new KernelManager({
+			cwd: tempDir,
+			rlmRunHandler: async ({ prompt }) => {
+				prompts.push(prompt);
+				return {
+					answer: `answer:${prompt}`,
+					usage: { prompt_tokens: 1, completion_tokens: 1 },
+					turns: 1,
+					session_dir: null,
+				};
+			},
+		});
+
+		try {
+			const scheduled = await manager.execute(`
+import asyncio
+import rlm
+
+async def _delayed_rlm():
+    await asyncio.sleep(0.05)
+    return await rlm.run("detached child after idle")
+
+_task = asyncio.create_task(_delayed_rlm())
+print("scheduled")
+`);
+
+			expect(scheduled.status).toBe("ok");
+			expect(scheduled.stdout.trim()).toBe("scheduled");
+			await waitFor(() => prompts.includes("detached child after idle"));
+
+			const finished = await manager.execute(`
+_result = await _task
+print(_result.answer)
+`);
+
+			expect(finished.status).toBe("ok");
+			expect(finished.stdout.trim()).toBe("answer:detached child after idle");
+		} finally {
+			await manager.dispose();
+		}
+	});
+
+	it("clears active execution when execute_request send fails", async () => {
+		const manager = new KernelManager({ python: process.execPath });
+		const kernel = manager as unknown as KernelExecuteTestApi;
+		const sendError = new Error("send failed");
+		kernel.start = async () => {};
+		kernel.state = "running";
+		kernel.shell = {
+			send: async (_frames: Buffer[]) => {
+				throw sendError;
+			},
+			close: () => {},
+		};
+		kernel.connection = {
+			ip: "127.0.0.1",
+			transport: "tcp",
+			shell_port: 1,
+			iopub_port: 2,
+			stdin_port: 3,
+			control_port: 4,
+			hb_port: 5,
+			signature_scheme: "hmac-sha256",
+			key: "",
+			kernel_name: "python3",
+		};
+
+		try {
+			await expect(manager.execute("print('hello')")).rejects.toThrow("send failed");
+			expect(kernel.activeExecution).toBeUndefined();
+		} finally {
+			await manager.dispose();
+		}
+	});
+
+	it("rejects removed background rlm comm request types", async () => {
 		const replies: CapturedCommReply[] = [];
 		const manager = new KernelManager({
 			python: process.execPath,
-			rlmBackgroundRunHandler: async ({ prompt }) => ({
-				id: "bg-1",
-				state: "running",
-				session_dir: `/tmp/${prompt}`,
-			}),
-			rlmBackgroundStatusHandler: async ({ id }) => ({
-				id,
-				state: "running",
-				session_dir: "/tmp/slow",
-			}),
-			rlmBackgroundWaitHandler: async ({ id, timeoutMs }) => ({
-				id,
-				state: "running",
-				session_dir: "/tmp/slow",
-				timed_out: timeoutMs === 25,
+			rlmRunHandler: async () => ({
+				answer: "unused",
+				usage: { prompt_tokens: 1, completion_tokens: 1 },
+				turns: 1,
+				session_dir: null,
 			}),
 		});
 
@@ -624,32 +573,15 @@ describe("AgentSession rlm recursion", () => {
 			};
 
 			kernel.handleCommMessage(rlmCommOpenData("comm-bg", { type: "background", prompt: "slow", kwargs: {} }));
-			kernel.handleCommMessage(rlmCommOpenData("comm-status", { type: "background_status", id: "bg-1" }));
-			kernel.handleCommMessage(
-				rlmCommOpenData("comm-wait", { type: "background_wait", id: "bg-1", timeout_ms: 25 }),
-			);
 
-			await waitFor(() => replies.length === 3);
+			await waitFor(() => replies.length === 1);
 
-			const byCommId = new Map(replies.map((reply) => [reply.commId, reply.data]));
-			expect(byCommId.get("comm-bg")).toEqual({
-				status: "ok",
-				id: "bg-1",
-				state: "running",
-				session_dir: "/tmp/slow",
-			});
-			expect(byCommId.get("comm-status")).toEqual({
-				status: "ok",
-				id: "bg-1",
-				state: "running",
-				session_dir: "/tmp/slow",
-			});
-			expect(byCommId.get("comm-wait")).toEqual({
-				status: "ok",
-				id: "bg-1",
-				state: "running",
-				session_dir: "/tmp/slow",
-				timed_out: true,
+			expect(replies[0]).toEqual({
+				commId: "comm-bg",
+				data: {
+					status: "error",
+					error: "rlm.run comm payload must have a supported type",
+				},
 			});
 		} finally {
 			await manager.dispose();

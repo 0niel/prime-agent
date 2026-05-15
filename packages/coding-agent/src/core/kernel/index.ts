@@ -8,14 +8,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
-import type {
-	RlmBackgroundRunHandler,
-	RlmBackgroundRunStatusHandler,
-	RlmBackgroundRunStatusResult,
-	RlmBackgroundRunWaitHandler,
-	RlmRunHandler,
-	RlmRunResult,
-} from "../rlm-runtime.js";
+import type { RlmRunHandler, RlmRunResult } from "../rlm-runtime.js";
 import { ensureKernelPython } from "./bootstrap.js";
 
 const DELIM = Buffer.from("<IDS|MSG>");
@@ -34,9 +27,6 @@ export interface KernelManagerOptions {
 	env?: Record<string, string>;
 	sessionId?: string;
 	rlmRunHandler?: RlmRunHandler;
-	rlmBackgroundRunHandler?: RlmBackgroundRunHandler;
-	rlmBackgroundStatusHandler?: RlmBackgroundRunStatusHandler;
-	rlmBackgroundWaitHandler?: RlmBackgroundRunWaitHandler;
 	/** Default: "prime-agent". */
 	username?: string;
 }
@@ -59,7 +49,7 @@ export interface ExecuteResult {
 	durationMs: number;
 }
 
-type RlmCommResult = RlmRunResult | RlmBackgroundRunStatusResult;
+type RlmCommResult = RlmRunResult;
 
 interface ConnectionInfo {
 	ip: string;
@@ -88,6 +78,28 @@ interface JupyterMessage {
 	content: Record<string, unknown>;
 }
 
+interface ActiveExecution {
+	requestMsgId: string;
+	started: number;
+	maxChars: number;
+	opts: ExecuteOptions;
+	stdout: string;
+	stderr: string;
+	stdoutTruncated: boolean;
+	stderrTruncated: boolean;
+	result?: string;
+	error?: ExecuteResult["error"];
+	status: ExecuteResult["status"];
+	resolve: (result: ExecuteResult) => void;
+	reject: (error: Error) => void;
+}
+
+interface Deferred<T> {
+	promise: Promise<T>;
+	resolve: (value: T) => void;
+	reject: (error: Error) => void;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -96,14 +108,14 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
-function parseOptionalTimeoutMs(value: unknown): number | undefined {
-	if (value === undefined || value === null) {
-		return undefined;
-	}
-	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-		throw new Error("rlm.run background wait timeout_ms must be a non-negative number");
-	}
-	return value;
+function createDeferred<T>(): Deferred<T> {
+	let resolve!: (value: T) => void;
+	let reject!: (error: Error) => void;
+	const promise = new Promise<T>((promiseResolve, promiseReject) => {
+		resolve = promiseResolve;
+		reject = promiseReject;
+	});
+	return { promise, resolve, reject };
 }
 
 // ---- wire format ---------------------------------------------------------
@@ -268,17 +280,7 @@ function installSignalHandlersOnce(): void {
 // ---- kernel manager ------------------------------------------------------
 
 export class KernelManager {
-	private readonly options: Pick<
-		KernelManagerOptions,
-		| "python"
-		| "cwd"
-		| "env"
-		| "sessionId"
-		| "rlmRunHandler"
-		| "rlmBackgroundRunHandler"
-		| "rlmBackgroundStatusHandler"
-		| "rlmBackgroundWaitHandler"
-	> &
+	private readonly options: Pick<KernelManagerOptions, "python" | "cwd" | "env" | "sessionId" | "rlmRunHandler"> &
 		Required<Pick<KernelManagerOptions, "username">>;
 	private readonly session = uuid();
 	private readonly commTargets = new Map<string, string>();
@@ -287,11 +289,13 @@ export class KernelManager {
 	private shell?: Dealer;
 	private iopub?: Subscriber;
 	private control?: Dealer;
+	private iopubPumpPromise?: Promise<void>;
 	private connection?: ConnectionInfo;
 	private tempDir?: string;
 	private kernelStderr = "";
 	/** Serializes execute() calls — Jupyter shell channel is request/reply. */
 	private executionQueue: Promise<unknown> = Promise.resolve();
+	private activeExecution?: ActiveExecution;
 	private readonly inFlightRlmRuns = new Set<Promise<void>>();
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
 	/** Memoized so concurrent callers all await the same in-flight startup. */
@@ -304,9 +308,6 @@ export class KernelManager {
 			env: options.env,
 			sessionId: options.sessionId,
 			rlmRunHandler: options.rlmRunHandler,
-			rlmBackgroundRunHandler: options.rlmBackgroundRunHandler,
-			rlmBackgroundStatusHandler: options.rlmBackgroundStatusHandler,
-			rlmBackgroundWaitHandler: options.rlmBackgroundWaitHandler,
 			username: options.username ?? "prime-agent",
 		};
 	}
@@ -389,6 +390,7 @@ export class KernelManager {
 
 		// ZMQ PUB/SUB slow-joiner: give the subscription a brief chance to reach the kernel before first execute.
 		await sleep(IOPUB_SUBSCRIBE_DELAY_MS);
+		this.startIopubPump();
 
 		try {
 			await this.probeReady();
@@ -494,7 +496,6 @@ export class KernelManager {
 	private async executeInner(code: string, opts: ExecuteOptions, started: number): Promise<ExecuteResult> {
 		const conn = this.connection!;
 		const shell = this.shell!;
-		const iopub = this.iopub!;
 		const maxChars = opts.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
 
 		const msg = buildMessage(
@@ -515,20 +516,57 @@ export class KernelManager {
 		if (opts.signal?.aborted) {
 			return { stdout: "", stderr: "", status: "aborted", durationMs: Date.now() - started };
 		}
-		await shell.send(encode(msg, conn.key));
-
-		let stdout = "";
-		let stderr = "";
-		let stdoutTruncated = false;
-		let stderrTruncated = false;
-		let result: string | undefined;
-		let error: ExecuteResult["error"];
-		let status: ExecuteResult["status"] = "ok";
+		if (this.activeExecution) {
+			throw new Error("Kernel already has an active execution");
+		}
 
 		const onAbort = () => {
 			this.interrupt().catch(() => {});
 		};
 		opts.signal?.addEventListener("abort", onAbort);
+
+		try {
+			const result = createDeferred<ExecuteResult>();
+			const execution: ActiveExecution = {
+				requestMsgId,
+				started,
+				maxChars,
+				opts,
+				stdout: "",
+				stderr: "",
+				stdoutTruncated: false,
+				stderrTruncated: false,
+				status: "ok",
+				resolve: result.resolve,
+				reject: result.reject,
+			};
+			this.activeExecution = execution;
+			try {
+				await shell.send(encode(msg, conn.key));
+			} catch (error) {
+				if (this.activeExecution === execution) {
+					this.activeExecution = undefined;
+				}
+				throw error instanceof Error ? error : new Error(String(error));
+			}
+			return await result.promise;
+		} finally {
+			opts.signal?.removeEventListener("abort", onAbort);
+		}
+	}
+
+	private startIopubPump(): void {
+		if (this.iopubPumpPromise) {
+			return;
+		}
+		this.iopubPumpPromise = this.runIopubPump();
+	}
+
+	private async runIopubPump(): Promise<void> {
+		const iopub = this.iopub;
+		if (!iopub) {
+			return;
+		}
 
 		try {
 			for await (const frames of iopub) {
@@ -539,53 +577,100 @@ export class KernelManager {
 					this.handleCommMessage(incoming);
 					continue;
 				}
-				if ((incoming.parent_header as { msg_id?: string }).msg_id !== requestMsgId) continue;
-
-				if (t === "stream") {
-					const c = incoming.content as { name: "stdout" | "stderr"; text: string };
-					if (c.name === "stdout") {
-						if (stdout.length < maxChars) {
-							stdout += c.text;
-							if (stdout.length > maxChars) {
-								stdout = stdout.slice(0, maxChars);
-								stdoutTruncated = true;
-							}
-						}
-					} else {
-						if (stderr.length < maxChars) {
-							stderr += c.text;
-							if (stderr.length > maxChars) {
-								stderr = stderr.slice(0, maxChars);
-								stderrTruncated = true;
-							}
-						}
-					}
-					opts.onStream?.(c.text, c.name);
-				} else if (t === "execute_result") {
-					const c = incoming.content as { data: Record<string, string> };
-					if (c.data["text/plain"]) result = c.data["text/plain"];
-				} else if (t === "error") {
-					const c = incoming.content as { ename: string; evalue: string; traceback: string[] };
-					error = c;
-					status = "error";
-				} else if (t === "status") {
-					const c = incoming.content as { execution_state: string };
-					if (c.execution_state === "idle") break;
-				}
+				this.handleExecutionMessage(incoming);
+			}
+		} catch (error) {
+			if ((this.state as string) !== "shutdown") {
+				console.error(`[kernel] iopub pump failed: ${errorMessage(error)}`);
+				this.rejectActiveExecution(new Error(`Kernel IOPub channel failed: ${errorMessage(error)}`));
 			}
 		} finally {
-			opts.signal?.removeEventListener("abort", onAbort);
+			if (this.iopub === iopub) {
+				this.iopubPumpPromise = undefined;
+			}
+		}
+	}
+
+	private handleExecutionMessage(incoming: JupyterMessage): void {
+		const execution = this.activeExecution;
+		if (!execution) {
+			return;
+		}
+		if ((incoming.parent_header as { msg_id?: string }).msg_id !== execution.requestMsgId) {
+			return;
 		}
 
-		if (stdoutTruncated) stdout += `\n[... output truncated at ${maxChars} chars ...]`;
-		if (stderrTruncated) stderr += `\n[... output truncated at ${maxChars} chars ...]`;
-		if (result !== undefined && result.length > maxChars) {
-			result = `${result.slice(0, maxChars)}\n[... output truncated at ${maxChars} chars ...]`;
+		const t = incoming.header.msg_type;
+		if (t === "stream") {
+			const c = incoming.content as { name: "stdout" | "stderr"; text: string };
+			if (c.name === "stdout") {
+				if (execution.stdout.length < execution.maxChars) {
+					execution.stdout += c.text;
+					if (execution.stdout.length > execution.maxChars) {
+						execution.stdout = execution.stdout.slice(0, execution.maxChars);
+						execution.stdoutTruncated = true;
+					}
+				}
+			} else if (c.name === "stderr") {
+				if (execution.stderr.length < execution.maxChars) {
+					execution.stderr += c.text;
+					if (execution.stderr.length > execution.maxChars) {
+						execution.stderr = execution.stderr.slice(0, execution.maxChars);
+						execution.stderrTruncated = true;
+					}
+				}
+			}
+			execution.opts.onStream?.(c.text, c.name);
+		} else if (t === "execute_result") {
+			const c = incoming.content as { data: Record<string, string> };
+			if (c.data["text/plain"]) execution.result = c.data["text/plain"];
+		} else if (t === "error") {
+			const c = incoming.content as { ename: string; evalue: string; traceback: string[] };
+			execution.error = c;
+			execution.status = "error";
+		} else if (t === "status") {
+			const c = incoming.content as { execution_state: string };
+			if (c.execution_state === "idle") {
+				this.finishActiveExecution(execution);
+			}
+		}
+	}
+
+	private finishActiveExecution(execution: ActiveExecution): void {
+		if (this.activeExecution !== execution) {
+			return;
+		}
+		this.activeExecution = undefined;
+
+		let stdout = execution.stdout;
+		let stderr = execution.stderr;
+		let result = execution.result;
+		let status = execution.status;
+		if (execution.stdoutTruncated) stdout += `\n[... output truncated at ${execution.maxChars} chars ...]`;
+		if (execution.stderrTruncated) stderr += `\n[... output truncated at ${execution.maxChars} chars ...]`;
+		if (result !== undefined && result.length > execution.maxChars) {
+			result = `${result.slice(0, execution.maxChars)}\n[... output truncated at ${execution.maxChars} chars ...]`;
 		}
 
-		if (opts.signal?.aborted) status = "aborted";
+		if (execution.opts.signal?.aborted) status = "aborted";
 
-		return { stdout, stderr, result, error, status, durationMs: Date.now() - started };
+		execution.resolve({
+			stdout,
+			stderr,
+			result,
+			error: execution.error,
+			status,
+			durationMs: Date.now() - execution.started,
+		});
+	}
+
+	private rejectActiveExecution(error: Error): void {
+		const execution = this.activeExecution;
+		if (!execution) {
+			return;
+		}
+		this.activeExecution = undefined;
+		execution.reject(error);
 	}
 
 	private handleCommMessage(incoming: JupyterMessage): void {
@@ -670,40 +755,6 @@ export class KernelManager {
 			return handler({ prompt: data.prompt, kwargs });
 		}
 
-		if (data.type === "background") {
-			const handler = this.options.rlmBackgroundRunHandler;
-			if (!handler) {
-				throw new Error("rlm.background is not available in this session");
-			}
-			if (typeof data.prompt !== "string") {
-				throw new Error("rlm.background prompt must be a string");
-			}
-			const kwargs = isRecord(data.kwargs) ? data.kwargs : {};
-			return handler({ prompt: data.prompt, kwargs });
-		}
-
-		if (data.type === "background_status") {
-			const handler = this.options.rlmBackgroundStatusHandler;
-			if (!handler) {
-				throw new Error("rlm.background status is not available in this session");
-			}
-			if (typeof data.id !== "string") {
-				throw new Error("rlm.background status id must be a string");
-			}
-			return handler({ id: data.id });
-		}
-
-		if (data.type === "background_wait") {
-			const handler = this.options.rlmBackgroundWaitHandler;
-			if (!handler) {
-				throw new Error("rlm.background wait is not available in this session");
-			}
-			if (typeof data.id !== "string") {
-				throw new Error("rlm.background wait id must be a string");
-			}
-			return handler({ id: data.id, timeoutMs: parseOptionalTimeoutMs(data.timeout_ms) });
-		}
-
 		throw new Error("rlm.run comm payload must have a supported type");
 	}
 
@@ -723,12 +774,14 @@ export class KernelManager {
 	}
 
 	private cleanupResources(): void {
+		this.rejectActiveExecution(new Error("Kernel has been shut down"));
 		this.shell?.close();
 		this.iopub?.close();
 		this.control?.close();
 		this.shell = undefined;
 		this.iopub = undefined;
 		this.control = undefined;
+		this.iopubPumpPromise = undefined;
 		try {
 			this.kernel?.kill("SIGTERM");
 		} catch {}

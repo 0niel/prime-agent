@@ -28,6 +28,7 @@
 
 ### Removed
 
+- Removed the RLM background API; recursive agents now use `rlm()`/`rlm.run()` with normal Python async tasks for background work.
 - Removed the legacy `read`, `write`, `grep`, `find`, and `ls` built-in tools.
 - Removed the local TPS extension that posted token/cache stats after each agent response.
 
