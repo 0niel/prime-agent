@@ -86,7 +86,7 @@ fi
 echo "==> Building all packages..."
 npm run build
 
-echo "==> Building binaries..."
+echo "==> Building standalone Node distributions..."
 cd packages/coding-agent
 
 # Clean previous builds
@@ -100,17 +100,123 @@ else
     PLATFORMS=(darwin-arm64 darwin-x64 linux-x64 linux-arm64 windows-x64)
 fi
 
-for platform in "${PLATFORMS[@]}"; do
-    echo "Building for $platform..."
-    # Externalize native modules so their .node files are loaded from the
-    # release directory instead of embedding build-machine paths into the
-    # compiled Bun executable.
-    if [[ "$platform" == "windows-x64" ]]; then
-        bun build --compile --external koffi --external zeromq --target=bun-$platform ./dist/bun/cli.js --outfile binaries/$platform/prime-agent-bin.exe
-    else
-        bun build --compile --external koffi --external zeromq --target=bun-$platform ./dist/bun/cli.js --outfile binaries/$platform/prime-agent-bin
+NODE_STANDALONE_VERSION="${NODE_STANDALONE_VERSION:-22.14.0}"
+NODE_RUNTIME_MODULES="binaries/node-runtime"
+
+copy_workspace_package() {
+    local source_dir="$1"
+    local target_dir="$2"
+
+    mkdir -p "$target_dir"
+    cp "$source_dir/package.json" "$target_dir/"
+    if [[ -f "$source_dir/README.md" ]]; then
+        cp "$source_dir/README.md" "$target_dir/"
     fi
-done
+    if [[ -f "$source_dir/CHANGELOG.md" ]]; then
+        cp "$source_dir/CHANGELOG.md" "$target_dir/"
+    fi
+    cp -R "$source_dir/dist" "$target_dir/"
+}
+
+prepare_node_runtime_modules() {
+    echo "==> Installing standalone runtime node_modules..."
+    rm -rf "$NODE_RUNTIME_MODULES"
+    mkdir -p "$NODE_RUNTIME_MODULES"
+
+    STAGING_PACKAGE_JSON="$NODE_RUNTIME_MODULES/package.json" node <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+
+const out = process.env.STAGING_PACKAGE_JSON;
+const packagePaths = [
+	"../agent/package.json",
+	"../ai/package.json",
+	"../tui/package.json",
+	"package.json",
+];
+
+const dependencies = {};
+const optionalDependencies = {};
+
+function merge(target, values) {
+	for (const [name, version] of Object.entries(values ?? {})) {
+		if (name.startsWith("@earendil-works/pi-")) continue;
+		target[name] = version;
+	}
+}
+
+for (const packagePath of packagePaths) {
+	const pkg = JSON.parse(fs.readFileSync(packagePath, "utf8"));
+	merge(dependencies, pkg.dependencies);
+	merge(optionalDependencies, pkg.optionalDependencies);
+}
+
+fs.writeFileSync(
+	out,
+	`${JSON.stringify(
+		{
+			private: true,
+			type: "module",
+			dependencies,
+			optionalDependencies,
+		},
+		null,
+		2,
+	)}\n`,
+);
+NODE
+
+    npm install --prefix "$NODE_RUNTIME_MODULES" --omit=dev --no-audit --no-fund
+
+    mkdir -p "$NODE_RUNTIME_MODULES/node_modules/@earendil-works"
+    copy_workspace_package "../agent" "$NODE_RUNTIME_MODULES/node_modules/@earendil-works/pi-agent-core"
+    copy_workspace_package "../ai" "$NODE_RUNTIME_MODULES/node_modules/@earendil-works/pi-ai"
+    copy_workspace_package "../tui" "$NODE_RUNTIME_MODULES/node_modules/@earendil-works/pi-tui"
+    copy_workspace_package "." "$NODE_RUNTIME_MODULES/node_modules/@earendil-works/pi-coding-agent"
+}
+
+download_node_runtime() {
+    local platform="$1"
+    local target_dir="$2"
+    local version="v$NODE_STANDALONE_VERSION"
+    local base_url="https://nodejs.org/dist/$version"
+    local tmp_dir="binaries/node-download-$platform"
+    local archive=""
+    local extracted=""
+
+    rm -rf "$tmp_dir"
+    mkdir -p "$tmp_dir"
+
+    case "$platform" in
+        darwin-arm64|darwin-x64|linux-x64|linux-arm64)
+            archive="node-$version-$platform"
+            if [[ "$platform" == linux-* ]]; then
+                archive="$archive.tar.xz"
+                curl -fsSL "$base_url/$archive" -o "$tmp_dir/$archive"
+                tar -xJf "$tmp_dir/$archive" -C "$tmp_dir"
+            else
+                archive="$archive.tar.gz"
+                curl -fsSL "$base_url/$archive" -o "$tmp_dir/$archive"
+                tar -xzf "$tmp_dir/$archive" -C "$tmp_dir"
+            fi
+            extracted="${archive%.tar.gz}"
+            extracted="${extracted%.tar.xz}"
+            mkdir -p "$target_dir/node/bin"
+            cp "$tmp_dir/$extracted/bin/node" "$target_dir/node/bin/node"
+            chmod +x "$target_dir/node/bin/node"
+            ;;
+        windows-x64)
+            archive="node-$version-win-x64.zip"
+            curl -fsSL "$base_url/$archive" -o "$tmp_dir/$archive"
+            unzip -q "$tmp_dir/$archive" -d "$tmp_dir"
+            extracted="${archive%.zip}"
+            mkdir -p "$target_dir/node"
+            cp "$tmp_dir/$extracted/node.exe" "$target_dir/node/node.exe"
+            ;;
+    esac
+
+    rm -rf "$tmp_dir"
+}
 
 echo "==> Creating release archives..."
 
@@ -124,7 +230,8 @@ create_launcher() {
 setlocal
 cd /d "%~dp0"
 set "NODE_PATH=%~dp0node_modules;%NODE_PATH%"
-"%~dp0prime-agent-bin.exe" %*
+set "PI_PACKAGE_DIR=%~dp0"
+"%~dp0node\node.exe" "%~dp0dist\cli.js" %*
 EOF
     else
         cat > "$target_dir/prime-agent" <<'EOF'
@@ -144,58 +251,23 @@ done
 dir="$(CDPATH= cd "$(dirname "$script")" && pwd)"
 cd "$dir"
 export NODE_PATH="$dir/node_modules${NODE_PATH:+:$NODE_PATH}"
-exec "$dir/prime-agent-bin" "$@"
+export PI_PACKAGE_DIR="$dir"
+exec "$dir/node/bin/node" "$dir/dist/cli.js" "$@"
 EOF
         chmod +x "$target_dir/prime-agent"
     fi
 }
 
-copy_zeromq_runtime() {
-    local platform="$1"
-    local target_dir="$2"
-    local modules_dir="$target_dir/node_modules"
-
-    mkdir -p "$modules_dir/zeromq/lib"
-    mkdir -p "$modules_dir/zeromq/build"
-    mkdir -p "$modules_dir/cmake-ts/build"
-
-    cp ../../node_modules/zeromq/package.json "$modules_dir/zeromq/"
-    cp -R ../../node_modules/zeromq/lib/. "$modules_dir/zeromq/lib/"
-    cp ../../node_modules/zeromq/build/manifest.json "$modules_dir/zeromq/build/"
-
-    case "$platform" in
-        darwin-arm64)
-            mkdir -p "$modules_dir/zeromq/build/darwin"
-            cp -R ../../node_modules/zeromq/build/darwin/arm64 "$modules_dir/zeromq/build/darwin/"
-            ;;
-        darwin-x64)
-            mkdir -p "$modules_dir/zeromq/build/darwin"
-            cp -R ../../node_modules/zeromq/build/darwin/x64 "$modules_dir/zeromq/build/darwin/"
-            ;;
-        linux-arm64)
-            mkdir -p "$modules_dir/zeromq/build/linux"
-            cp -R ../../node_modules/zeromq/build/linux/arm64 "$modules_dir/zeromq/build/linux/"
-            ;;
-        linux-x64)
-            mkdir -p "$modules_dir/zeromq/build/linux"
-            cp -R ../../node_modules/zeromq/build/linux/x64 "$modules_dir/zeromq/build/linux/"
-            ;;
-        windows-x64)
-            mkdir -p "$modules_dir/zeromq/build/win32"
-            cp -R ../../node_modules/zeromq/build/win32/x64 "$modules_dir/zeromq/build/win32/"
-            ;;
-    esac
-
-    cp ../../node_modules/cmake-ts/package.json "$modules_dir/cmake-ts/"
-    cp ../../node_modules/cmake-ts/build/loader.js "$modules_dir/cmake-ts/build/"
-}
+prepare_node_runtime_modules
 
 # Copy shared files to each platform directory
 for platform in "${PLATFORMS[@]}"; do
     cp package.json binaries/$platform/
     cp README.md binaries/$platform/
     cp CHANGELOG.md binaries/$platform/
-    cp ../../node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm binaries/$platform/
+    cp -R dist binaries/$platform/
+    cp -R "$NODE_RUNTIME_MODULES/node_modules" binaries/$platform/
+    download_node_runtime "$platform" "binaries/$platform"
     mkdir -p binaries/$platform/theme
     cp dist/modes/interactive/theme/*.json binaries/$platform/theme/
     mkdir -p binaries/$platform/assets
@@ -205,15 +277,6 @@ for platform in "${PLATFORMS[@]}"; do
     cp -r examples binaries/$platform/
     cp -r dist/prime-agent-runtime binaries/$platform/
     create_launcher "$platform" "binaries/$platform"
-    copy_zeromq_runtime "$platform" "binaries/$platform"
-
-    # Copy koffi native module for Windows (needed for VT input support)
-    if [[ "$platform" == "windows-x64" ]]; then
-        mkdir -p binaries/$platform/node_modules/koffi/build/koffi/win32_x64
-        cp ../../node_modules/koffi/index.js binaries/$platform/node_modules/koffi/
-        cp ../../node_modules/koffi/package.json binaries/$platform/node_modules/koffi/
-        cp ../../node_modules/koffi/build/koffi/win32_x64/koffi.node binaries/$platform/node_modules/koffi/build/koffi/win32_x64/
-    fi
 done
 
 # Create archives

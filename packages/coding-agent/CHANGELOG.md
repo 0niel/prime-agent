@@ -11,6 +11,7 @@
 
 ### Changed
 
+- Changed standalone release archives to run on a bundled Node.js runtime instead of Bun so native Node addons such as `zeromq` work correctly.
 - Changed the published CLI command and standalone release archives from `pi` to `prime-agent`.
 - Changed the config directory environment variables and subprocess marker to use the `PRIME_AGENT` prefix.
 - Changed the default active built-in tool set to `ipython`.
