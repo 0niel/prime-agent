@@ -37,6 +37,31 @@ download_file() {
 	fi
 }
 
+find_asset_api_url() {
+	printf '%s\n' "$1" | awk -v asset_name="\"name\": \"$2\"" '
+		/"url": "https:\/\/api.github.com\/repos\/.*\/releases\/assets\// { url = $0 }
+		index($0, asset_name) { print url; exit }
+	' | sed -n 's/.*"url":[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+download_release_asset() {
+	if [ -n "$github_token" ]; then
+		release_json="$(github_api "https://api.github.com/repos/$repo/releases/tags/$tag")"
+		asset_api_url="$(find_asset_api_url "$release_json" "$asset")"
+		if [ -z "$asset_api_url" ]; then
+			echo "prime-agent installer: release $tag does not include $asset" >&2
+			exit 1
+		fi
+		curl -fL --progress-bar \
+			-H "Authorization: Bearer $github_token" \
+			-H "Accept: application/octet-stream" \
+			-o "$archive" \
+			"$asset_api_url"
+	else
+		download_file "$url" "$archive"
+	fi
+}
+
 detect_platform() {
 	os="$(uname -s)"
 	arch="$(uname -m)"
@@ -91,6 +116,7 @@ fetch_latest_tag() {
 }
 
 need_cmd curl
+need_cmd awk
 need_cmd head
 need_cmd ln
 need_cmd mktemp
@@ -116,7 +142,7 @@ trap cleanup EXIT INT TERM
 archive="$tmp_dir/$asset"
 
 echo "Downloading prime-agent $tag for $platform..."
-download_file "$url" "$archive"
+download_release_asset
 
 tar -xzf "$archive" -C "$tmp_dir"
 

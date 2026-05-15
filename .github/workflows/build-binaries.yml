@@ -64,22 +64,24 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd packages/coding-agent/binaries
+          assets=(
+            prime-agent-darwin-arm64.tar.gz
+            prime-agent-darwin-x64.tar.gz
+            prime-agent-linux-x64.tar.gz
+            prime-agent-linux-arm64.tar.gz
+            prime-agent-windows-x64.zip
+          )
+          target_args=()
+          if [ "${BUILD_REF}" != "${RELEASE_TAG}" ]; then
+            target_args=(--target "${BUILD_REF}")
+          fi
           
-          # Create release with changelog notes (or update if exists)
-          gh release create "${RELEASE_TAG}" \
-            --title "${RELEASE_TAG}" \
-            --target "${BUILD_REF}" \
-            --notes-file /tmp/release-notes.md \
-            prime-agent-darwin-arm64.tar.gz \
-            prime-agent-darwin-x64.tar.gz \
-            prime-agent-linux-x64.tar.gz \
-            prime-agent-linux-arm64.tar.gz \
-            prime-agent-windows-x64.zip \
-            2>/dev/null || \
-          gh release upload "${RELEASE_TAG}" \
-            prime-agent-darwin-arm64.tar.gz \
-            prime-agent-darwin-x64.tar.gz \
-            prime-agent-linux-x64.tar.gz \
-            prime-agent-linux-arm64.tar.gz \
-            prime-agent-windows-x64.zip \
-            --clobber
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" "${assets[@]}" --clobber
+          else
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              "${target_args[@]}" \
+              --notes-file /tmp/release-notes.md \
+              "${assets[@]}"
+          fi
