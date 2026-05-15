@@ -106,13 +106,49 @@ for platform in "${PLATFORMS[@]}"; do
     # release directory instead of embedding build-machine paths into the
     # compiled Bun executable.
     if [[ "$platform" == "windows-x64" ]]; then
-        bun build --compile --external koffi --external zeromq --target=bun-$platform ./dist/bun/cli.js --outfile binaries/$platform/prime-agent.exe
+        bun build --compile --external koffi --external zeromq --target=bun-$platform ./dist/bun/cli.js --outfile binaries/$platform/prime-agent-bin.exe
     else
-        bun build --compile --external koffi --external zeromq --target=bun-$platform ./dist/bun/cli.js --outfile binaries/$platform/prime-agent
+        bun build --compile --external koffi --external zeromq --target=bun-$platform ./dist/bun/cli.js --outfile binaries/$platform/prime-agent-bin
     fi
 done
 
 echo "==> Creating release archives..."
+
+create_launcher() {
+    local platform="$1"
+    local target_dir="$2"
+
+    if [[ "$platform" == "windows-x64" ]]; then
+        cat > "$target_dir/prime-agent.cmd" <<'EOF'
+@echo off
+setlocal
+cd /d "%~dp0"
+set "NODE_PATH=%~dp0node_modules;%NODE_PATH%"
+"%~dp0prime-agent-bin.exe" %*
+EOF
+    else
+        cat > "$target_dir/prime-agent" <<'EOF'
+#!/bin/sh
+set -eu
+
+script="$0"
+while [ -L "$script" ]; do
+    dir="$(CDPATH= cd "$(dirname "$script")" && pwd)"
+    target="$(readlink "$script")"
+    case "$target" in
+        /*) script="$target" ;;
+        *) script="$dir/$target" ;;
+    esac
+done
+
+dir="$(CDPATH= cd "$(dirname "$script")" && pwd)"
+cd "$dir"
+export NODE_PATH="$dir/node_modules${NODE_PATH:+:$NODE_PATH}"
+exec "$dir/prime-agent-bin" "$@"
+EOF
+        chmod +x "$target_dir/prime-agent"
+    fi
+}
 
 copy_zeromq_runtime() {
     local platform="$1"
@@ -167,6 +203,7 @@ for platform in "${PLATFORMS[@]}"; do
     cp -r dist/core/export-html binaries/$platform/
     cp -r docs binaries/$platform/
     cp -r examples binaries/$platform/
+    create_launcher "$platform" "binaries/$platform"
     copy_zeromq_runtime "$platform" "binaries/$platform"
 
     # Copy koffi native module for Windows (needed for VT input support)
