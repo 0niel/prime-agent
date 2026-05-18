@@ -637,6 +637,7 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	private _continueAfterThresholdCompaction = false;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -826,7 +827,7 @@ export class AgentSession {
 	}
 
 	private _installAgentTurnHook(): void {
-		this.agent.shouldStopAfterTurn = (context) => this._shouldStopAfterGoalTurn(context);
+		this.agent.shouldStopAfterTurn = (context) => this._shouldStopAfterTurn(context);
 	}
 
 	// =========================================================================
@@ -1234,7 +1235,7 @@ export class AgentSession {
 		return true;
 	}
 
-	private _shouldStopAfterGoalTurn(context: ShouldStopAfterTurnContext): boolean {
+	private _shouldStopAfterTurn(context: ShouldStopAfterTurnContext): boolean {
 		if (this._stopGoalContinuationForTerminalMessage(context.message)) {
 			return true;
 		}
@@ -1245,7 +1246,32 @@ export class AgentSession {
 		} catch {
 			// Goal accounting must not interrupt the core agent loop.
 		}
+		if (this._shouldStopForThresholdCompaction(context)) {
+			return true;
+		}
 		return false;
+	}
+
+	private _shouldStopForThresholdCompaction(context: ShouldStopAfterTurnContext): boolean {
+		this._continueAfterThresholdCompaction = false;
+		const settings = this.settingsManager.getCompactionSettings();
+		if (!settings.enabled) return false;
+
+		const contextWindow = this.model?.contextWindow ?? 0;
+		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const compactionTimestamp = compactionEntry ? new Date(compactionEntry.timestamp).getTime() : undefined;
+		if (compactionTimestamp !== undefined && context.message.timestamp <= compactionTimestamp) {
+			return false;
+		}
+
+		const contextTokens = this._getThresholdContextTokens(context.message, compactionTimestamp);
+		if (contextTokens === undefined || !shouldCompact(contextTokens, contextWindow, settings)) {
+			return false;
+		}
+
+		const lastMessage = this.agent.state.messages[this.agent.state.messages.length - 1];
+		this._continueAfterThresholdCompaction = lastMessage !== undefined && lastMessage.role !== "assistant";
+		return true;
 	}
 
 	private createGoalFromTool(objective: string, tokenBudget: number | undefined): GoalState {
@@ -2662,11 +2688,35 @@ export class AgentSession {
 	 *
 	 * Two cases:
 	 * 1. Overflow: LLM returned context overflow error, remove error message from agent state, compact, auto-retry
-	 * 2. Threshold: Context over threshold, compact, NO auto-retry (user continues manually)
+	 * 2. Threshold: Context over threshold, compact, and continue only for stopped in-progress loops or queued messages
 	 *
 	 * @param assistantMessage The assistant message to check
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 */
+	private _getThresholdContextTokens(
+		assistantMessage: AssistantMessage,
+		compactionTimestamp: number | undefined,
+	): number | undefined {
+		const messages = this.agent.state.messages;
+		const estimate = estimateContextTokens(messages);
+		if (estimate.lastUsageIndex !== null) {
+			// Verify the usage source is post-compaction. Kept pre-compaction messages
+			// have stale usage reflecting the old (larger) context and would falsely
+			// trigger compaction right after one just finished.
+			const usageMsg = messages[estimate.lastUsageIndex];
+			if (
+				compactionTimestamp !== undefined &&
+				usageMsg.role === "assistant" &&
+				(usageMsg as AssistantMessage).timestamp <= compactionTimestamp
+			) {
+				return undefined;
+			}
+			return estimate.tokens;
+		}
+		if (assistantMessage.stopReason === "error") return undefined;
+		return calculateContextTokens(assistantMessage.usage);
+	}
+
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
@@ -2687,8 +2737,9 @@ export class AgentSession {
 		// compaction boundary. This prevents a stale pre-compaction usage/error
 		// from retriggering compaction on the first prompt after compaction.
 		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const compactionTimestamp = compactionEntry ? new Date(compactionEntry.timestamp).getTime() : undefined;
 		const assistantIsFromBeforeCompaction =
-			compactionEntry !== null && assistantMessage.timestamp <= new Date(compactionEntry.timestamp).getTime();
+			compactionTimestamp !== undefined && assistantMessage.timestamp <= compactionTimestamp;
 		if (assistantIsFromBeforeCompaction) {
 			return false;
 		}
@@ -2718,29 +2769,11 @@ export class AgentSession {
 			return await this._runAutoCompaction("overflow", true);
 		}
 
-		// Case 2: Threshold - context is getting large
-		// For error messages (no usage data), estimate from last successful response.
-		// This ensures sessions that hit persistent API errors (e.g. 529) can still compact.
-		let contextTokens: number;
-		if (assistantMessage.stopReason === "error") {
-			const messages = this.agent.state.messages;
-			const estimate = estimateContextTokens(messages);
-			if (estimate.lastUsageIndex === null) return false; // No usage data at all
-			// Verify the usage source is post-compaction. Kept pre-compaction messages
-			// have stale usage reflecting the old (larger) context and would falsely
-			// trigger compaction right after one just finished.
-			const usageMsg = messages[estimate.lastUsageIndex];
-			if (
-				compactionEntry &&
-				usageMsg.role === "assistant" &&
-				(usageMsg as AssistantMessage).timestamp <= new Date(compactionEntry.timestamp).getTime()
-			) {
-				return false;
-			}
-			contextTokens = estimate.tokens;
-		} else {
-			contextTokens = calculateContextTokens(assistantMessage.usage);
-		}
+		// Case 2: Threshold - context is getting large.
+		// Use the full-session estimate so messages appended after the last successful
+		// assistant usage are included, matching the /usage context display.
+		const contextTokens = this._getThresholdContextTokens(assistantMessage, compactionTimestamp);
+		if (contextTokens === undefined) return false;
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
 			return await this._runAutoCompaction("threshold", false);
 		}
@@ -2752,6 +2785,8 @@ export class AgentSession {
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
+		const shouldContinueAfterThreshold = reason === "threshold" && this._continueAfterThresholdCompaction;
+		this._continueAfterThresholdCompaction = false;
 
 		this._emit({ type: "compaction_start", reason });
 		this._autoCompactionAbortController = new AbortController();
@@ -2901,9 +2936,9 @@ export class AgentSession {
 					this.agent.continue().catch(() => {});
 				}, 100);
 				return true;
-			} else if (this.agent.hasQueuedMessages()) {
-				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
-				// Kick the loop so queued messages are actually delivered.
+			} else if (shouldContinueAfterThreshold || this.agent.hasQueuedMessages()) {
+				// Threshold compaction can intentionally stop a tool loop between turns.
+				// Queued follow-up/steering/custom messages can also be waiting.
 				setTimeout(() => {
 					this.agent.continue().catch(() => {});
 				}, 100);

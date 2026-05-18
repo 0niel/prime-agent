@@ -1,10 +1,12 @@
-import { type AssistantMessage, fauxAssistantMessage, type Model } from "@earendil-works/pi-ai";
+import type { AgentMessage, ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
+import { type AssistantMessage, fauxAssistantMessage, type Model, type ToolResultMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHarness, type Harness } from "./harness.js";
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<void>;
 	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
+	_shouldStopAfterTurn: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
 };
 
 function createUsage(totalTokens: number) {
@@ -248,6 +250,74 @@ describe("AgentSession compaction characterization", () => {
 		await sessionInternals._checkCompaction(errorAssistant);
 
 		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false);
+	});
+
+	it("triggers threshold compaction when trailing context exceeds the model window", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { enabled: true, reserveTokens: 1000 } },
+			models: [{ id: "faux-1", contextWindow: 200_000 }],
+		});
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const successfulAssistant = createAssistant(harness, {
+			stopReason: "stop",
+			totalTokens: 10_000,
+			timestamp: Date.now(),
+		});
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
+			successfulAssistant,
+			{
+				role: "custom",
+				customType: "large-context",
+				content: [{ type: "text", text: "x".repeat(800_000) }],
+				display: false,
+				timestamp: Date.now() + 500,
+			},
+		];
+
+		const runAutoCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue();
+
+		await sessionInternals._checkCompaction(successfulAssistant, false);
+
+		expect(runAutoCompactionSpy).toHaveBeenCalledWith("threshold", false);
+	});
+
+	it("stops a tool loop for threshold compaction before the next model call", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { enabled: true, reserveTokens: 1000 } },
+			models: [{ id: "faux-1", contextWindow: 200_000 }],
+		});
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const successfulAssistant = createAssistant(harness, {
+			stopReason: "toolUse",
+			totalTokens: 10_000,
+			timestamp: Date.now(),
+		});
+		const toolResult: ToolResultMessage<unknown> = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "large-context",
+			content: [{ type: "text", text: "x".repeat(800_000) }],
+			isError: false,
+			timestamp: Date.now() + 500,
+		};
+		const messages: AgentMessage[] = [
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
+			successfulAssistant,
+			toolResult,
+		];
+		harness.session.agent.state.messages = messages;
+
+		const shouldStop = await sessionInternals._shouldStopAfterTurn({
+			message: successfulAssistant,
+			toolResults: [toolResult],
+			context: { systemPrompt: harness.session.systemPrompt, messages, tools: [] },
+			newMessages: [successfulAssistant, toolResult],
+		});
+
+		expect(shouldStop).toBe(true);
 	});
 
 	it("does not trigger threshold compaction for error messages when no prior usage exists", async () => {
