@@ -1,4 +1,10 @@
-import { type Component, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import {
+	type Component,
+	truncateToWidth,
+	VersionedRenderCache,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { highlightCode, theme } from "../theme/theme.js";
 import { keyHint } from "./keybinding-hints.js";
@@ -125,7 +131,9 @@ function splitTraceback(text: string, errorName: string | undefined): TracebackP
 
 export class IPythonCellComponent implements Component {
 	private readonly paddingX = 2;
+	private readonly renderCache = new VersionedRenderCache();
 	private state: IPythonCellState;
+	private stateVersion = 0;
 
 	constructor(state: IPythonCellState) {
 		this.state = state;
@@ -133,21 +141,27 @@ export class IPythonCellComponent implements Component {
 
 	update(state: IPythonCellState): void {
 		this.state = state;
+		this.stateVersion += 1;
 	}
 
 	invalidate(): void {
-		// Render output depends only on current state and width.
+		this.renderCache.invalidate();
 	}
 
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
+		const cached = this.renderCache.get(safeWidth, this.stateVersion);
+		if (cached) {
+			return cached;
+		}
+
 		const details = readDetails(this.state.details);
 		const lines: string[] = [];
 
 		lines.push(this.panelLine(this.header(details), safeWidth));
 		const hasCode = this.renderCode(lines, safeWidth);
 		this.renderOutput(lines, safeWidth, details, hasCode);
-		return lines;
+		return this.renderCache.set(safeWidth, this.stateVersion, lines);
 	}
 
 	private header(details: IpythonDetails): string {

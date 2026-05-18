@@ -121,6 +121,93 @@ describe("marquee TUI components", () => {
 		}
 	});
 
+	test("caches ipython cell renders until state, width, or invalidation changes", () => {
+		const state: IPythonCellState = {
+			code: "value = 1\nprint(value)",
+			content: [{ type: "text", text: "1" }],
+			details: { status: "ok", durationMs: 15 },
+			executionStarted: true,
+			argsComplete: true,
+		};
+		const component = new IPythonCellComponent(state);
+
+		const first = component.render(80);
+		expect(component.render(80)).toBe(first);
+
+		component.update(state);
+		const afterSameStateUpdate = component.render(80);
+		expect(afterSameStateUpdate).not.toBe(first);
+		expect(afterSameStateUpdate).toEqual(first);
+		expect(component.render(80)).toBe(afterSameStateUpdate);
+
+		component.invalidate();
+		const afterInvalidate = component.render(80);
+		expect(afterInvalidate).not.toBe(afterSameStateUpdate);
+		expect(afterInvalidate).toEqual(afterSameStateUpdate);
+		expect(component.render(80)).toBe(afterInvalidate);
+	});
+
+	test("reflows cached ipython cells when terminal width changes", () => {
+		const state: IPythonCellState = {
+			code: "result = 'this is a deliberately long line that should wrap differently by terminal width'",
+			content: [
+				{
+					type: "text",
+					text: "this output line is also deliberately long so the rendered panel must reflow on resize",
+				},
+			],
+			details: { status: "ok", durationMs: 15 },
+			executionStarted: true,
+			argsComplete: true,
+		};
+		const component = new IPythonCellComponent(state);
+
+		const narrow = component.render(36);
+		expect(component.render(36)).toBe(narrow);
+		for (const line of narrow) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(36);
+		}
+
+		const wide = component.render(80);
+		expect(wide).not.toBe(narrow);
+		expect(wide.length).toBeLessThan(narrow.length);
+		for (const line of wide) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(80);
+		}
+		expect(component.render(80)).toBe(wide);
+	});
+
+	test("invalidates ipython cell cache when expanded state changes", () => {
+		const state: IPythonCellState = {
+			code: "raise ValueError('bad')",
+			content: [
+				{
+					type: "text",
+					text: 'before\nTraceback (most recent call last):\n  File "<stdin>", line 1\nValueError: bad',
+				},
+			],
+			details: { status: "error", errorEname: "ValueError" },
+			isError: true,
+			expanded: false,
+			executionStarted: true,
+			argsComplete: true,
+		};
+		const component = new IPythonCellComponent(state);
+
+		const collapsed = component.render(80);
+		const collapsedText = stripAnsi(collapsed.join("\n"));
+		expect(collapsedText).toContain("traceback collapsed");
+		expect(collapsedText).not.toContain('File "<stdin>"');
+
+		component.update({ ...state, expanded: true });
+		const expanded = component.render(80);
+		expect(expanded).not.toBe(collapsed);
+		const expandedText = stripAnsi(expanded.join("\n"));
+		expect(expandedText).toContain("Traceback (most recent call last):");
+		expect(expandedText).toContain('File "<stdin>"');
+		expect(component.render(80)).toBe(expanded);
+	});
+
 	test("renders sub-agent tree nodes with status, previews, and transcript expansion", async () => {
 		const component = new SubAgentTreeComponent({
 			rootLabel: "root: triage logs",

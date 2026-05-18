@@ -57,6 +57,8 @@ export {
 	parseKey,
 	setKittyProtocolActive,
 } from "./keys.js";
+// Render caching
+export { VersionedRenderCache } from "./render-cache.js";
 // Input buffering for batch splitting
 export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.js";
 // Terminal interface and implementations
