@@ -38,5 +38,10 @@ jobs:
       - name: Check
         run: npm run check
 
+      - name: Install uv
+        run: |
+          python3 -m pip install --user uv
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
       - name: Test
         run: npm test

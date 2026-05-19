@@ -1,34 +1,104 @@
-name: Build Binaries
+name: Release Prime Agent
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Tag to build (e.g., v0.12.0)'
+      release_tag:
+        description: 'Release tag to create or update (e.g., v0.0.1)'
         required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
+  release-context:
     runs-on: ubuntu-latest
-    env:
-      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    permissions:
+      contents: read
+    outputs:
+      build_ref: ${{ steps.context.outputs.build_ref }}
+      release_tag: ${{ steps.context.outputs.release_tag }}
+      should_release: ${{ steps.context.outputs.should_release }}
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@4bc047ad259df6fc24a6c9b0f9a0cb08cf17fbe5 # v2.0.1
+      - name: Resolve release context
+        id: context
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag || '' }}
+        run: |
+          should_release=true
+
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            if [ "$REF_NAME" != "$DEFAULT_BRANCH" ]; then
+              echo "Manual releases must run from the default branch (${DEFAULT_BRANCH}), not ${REF_NAME}." >&2
+              exit 1
+            fi
+            release_tag="$INPUT_RELEASE_TAG"
+            build_ref="$GITHUB_SHA_VALUE"
+          elif [ "$REF_TYPE" = tag ]; then
+            release_tag="$REF_NAME"
+            build_ref="$REF_NAME"
+          else
+            version=$(node -p "require('./package.json').version")
+            release_tag="v${version}"
+            build_ref="$GITHUB_SHA_VALUE"
+            if git ls-remote --exit-code --tags origin "refs/tags/${release_tag}" >/dev/null 2>&1; then
+              echo "Tag ${release_tag} already exists; skipping release."
+              should_release=false
+            fi
+          fi
+
+          case "$release_tag" in
+            v*) ;;
+            *) release_tag="v${release_tag}" ;;
+          esac
+          if ! printf '%s\n' "$release_tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Release tag must be a plain semver tag like v0.0.1: ${release_tag}" >&2
+            exit 1
+          fi
+
+          if [ -z "$build_ref" ]; then
+            build_ref="$release_tag"
+          fi
+
+          echo "build_ref=$build_ref" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $release_tag"
+          echo "Build ref: $build_ref"
+          echo "Should release: $should_release"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: release-context
+    if: needs.release-context.outputs.should_release == 'true'
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ needs.release-context.outputs.release_tag }}
+      BUILD_REF: ${{ needs.release-context.outputs.build_ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          bun-version: 1.2.20
+          ref: ${{ env.BUILD_REF }}
+          persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
@@ -36,44 +106,136 @@ jobs:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
-      - name: Build binaries
-        run: ./scripts/build-binaries.sh
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Check
+        run: npm run check
+
+      - name: Pack private npm tarball
+        env:
+          PRIME_AGENT_DOWNLOAD_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          test -n "${PRIME_AGENT_DOWNLOAD_BASE_URL}"
+          npm run release:pack -- --version "${VERSION}" --base-url "${PRIME_AGENT_DOWNLOAD_BASE_URL}"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: prime-agent-release
+          path: packages/coding-agent/release/artifacts/*
+          if-no-files-found: error
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [release-context, build]
+    if: needs.release-context.outputs.should_release == 'true'
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.release-context.outputs.release_tag }}
+      BUILD_REF: ${{ needs.release-context.outputs.build_ref }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+      R2_PUBLIC_BASE_URL: ${{ vars.R2_PUBLIC_BASE_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.BUILD_REF }}
+          persist-credentials: false
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: prime-agent-release
+          path: release-artifacts
 
       - name: Extract changelog for this version
-        id: changelog
         run: |
-          VERSION="${RELEASE_TAG}"
-          VERSION="${VERSION#v}"  # Remove 'v' prefix
-          
-          # Extract changelog section for this version
-          cd packages/coding-agent
-          awk "/^## \[${VERSION}\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md > /tmp/release-notes.md
-          
-          # If empty, use a default message
+          VERSION="${RELEASE_TAG#v}"
+          awk "/^## \[${VERSION}\]/{flag=1; next} /^## \[/{flag=0} flag" packages/coding-agent/CHANGELOG.md > /tmp/release-notes.md
           if [ ! -s /tmp/release-notes.md ]; then
-            echo "Release ${VERSION}" > /tmp/release-notes.md
+            echo "Release ${RELEASE_TAG}" > /tmp/release-notes.md
           fi
 
-      - name: Create GitHub Release and upload binaries
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cd packages/coding-agent/binaries
-          
-          # Create release with changelog notes (or update if exists)
-          gh release create "${RELEASE_TAG}" \
-            --title "${RELEASE_TAG}" \
-            --notes-file /tmp/release-notes.md \
-            pi-darwin-arm64.tar.gz \
-            pi-darwin-x64.tar.gz \
-            pi-linux-x64.tar.gz \
-            pi-linux-arm64.tar.gz \
-            pi-windows-x64.zip \
-            2>/dev/null || \
-          gh release upload "${RELEASE_TAG}" \
-            pi-darwin-arm64.tar.gz \
-            pi-darwin-x64.tar.gz \
-            pi-linux-x64.tar.gz \
-            pi-linux-arm64.tar.gz \
-            pi-windows-x64.zip \
-            --clobber
+          target_args=()
+          if [ "${BUILD_REF}" != "${RELEASE_TAG}" ]; then
+            target_args=(--target "${BUILD_REF}")
+          fi
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" release-artifacts/* --clobber
+          else
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              "${target_args[@]}" \
+              --notes-file /tmp/release-notes.md \
+              release-artifacts/*
+          fi
+
+      - name: Publish to R2
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          RELEASE_PREFIX="releases/v${VERSION}"
+          TARBALL="release-artifacts/prime-agent-${VERSION}.tgz"
+          INSTALL_BASE_URL="${R2_PUBLIC_BASE_URL}"
+          INSTALL_BASE_URL="${INSTALL_BASE_URL%/}"
+          export INSTALL_BASE_URL
+
+          test -f "${TARBALL}"
+          test -f release-artifacts/SHA256SUMS
+          test -f release-artifacts/stable
+          test -f release-artifacts/latest.json
+          test -n "${INSTALL_BASE_URL}"
+          test -n "${R2_BUCKET}"
+          test -n "${R2_ENDPOINT_URL}"
+
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const baseUrl = process.env.INSTALL_BASE_URL;
+          if (!baseUrl) throw new Error("INSTALL_BASE_URL is required");
+          const installer = fs.readFileSync("install.sh", "utf8")
+            .replaceAll("__PRIME_AGENT_DOWNLOAD_BASE_URL__", baseUrl);
+          fs.writeFileSync("/tmp/prime-agent-install.sh", installer);
+          NODE
+
+          for artifact in release-artifacts/*.tgz; do
+            aws s3 cp "${artifact}" "s3://${R2_BUCKET}/${RELEASE_PREFIX}/$(basename "${artifact}")" \
+              --endpoint-url "${R2_ENDPOINT_URL}" \
+              --content-type "application/gzip" \
+              --cache-control "public, max-age=31536000, immutable"
+          done
+
+          aws s3 cp release-artifacts/SHA256SUMS "s3://${R2_BUCKET}/${RELEASE_PREFIX}/SHA256SUMS" \
+            --endpoint-url "${R2_ENDPOINT_URL}" \
+            --content-type "text/plain" \
+            --cache-control "public, max-age=31536000, immutable"
+
+          aws s3 cp release-artifacts/latest.json "s3://${R2_BUCKET}/latest.json" \
+            --endpoint-url "${R2_ENDPOINT_URL}" \
+            --content-type "application/json" \
+            --cache-control "no-cache"
+
+          aws s3 cp release-artifacts/stable "s3://${R2_BUCKET}/stable" \
+            --endpoint-url "${R2_ENDPOINT_URL}" \
+            --content-type "text/plain" \
+            --cache-control "no-cache"
+
+          aws s3 cp /tmp/prime-agent-install.sh "s3://${R2_BUCKET}/install.sh" \
+            --endpoint-url "${R2_ENDPOINT_URL}" \
+            --content-type "text/x-shellscript" \
+            --cache-control "no-cache"
+
+          echo "Installer: ${INSTALL_BASE_URL}/install.sh"

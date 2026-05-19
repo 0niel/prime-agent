@@ -3,6 +3,8 @@ import { constants, existsSync } from "node:fs";
 import { access, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { stderr, stdin } from "node:process";
+import { createInterface } from "node:readline/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
@@ -10,6 +12,7 @@ const BOOTSTRAP_SCHEMA = 2;
 const PYTHON_VERSION = "3.11";
 const IPYKERNEL_REQUIREMENT = "ipykernel";
 const RUNTIME_REQUIREMENT = "prime-agent-runtime";
+const UV_INSTALL_COMMAND = "curl -LsSf https://astral.sh/uv/install.sh | sh";
 const RUNTIME_READY_CHECK =
 	"import rlm; assert hasattr(rlm, 'run'); assert callable(rlm); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm); assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background')";
 const BOOTSTRAP_VERSION_FILE = ".bootstrap-version";
@@ -221,12 +224,19 @@ async function ensureUv(): Promise<string> {
 	const localUv = path.join(os.homedir(), ".local", "bin", process.platform === "win32" ? "uv.exe" : "uv");
 	if (await isExecutable(localUv)) return localUv;
 
+	if (process.env.PRIME_AGENT_INSTALL_UV !== "1" && !(await confirmUvInstall())) {
+		throw new Error(
+			`uv is required to set up the Python kernel. Install uv yourself: ${UV_INSTALL_COMMAND}, ` +
+				"or set PRIME_AGENT_INSTALL_UV=1 to let prime-agent run that installer.",
+		);
+	}
+
 	process.stderr.write("› installing uv (one-time)…\n");
 	try {
-		await run("sh", ["-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"], { stdio: "inherit" });
+		await run("sh", ["-c", UV_INSTALL_COMMAND], { stdio: "inherit" });
 	} catch (error) {
 		throw new Error(
-			`couldn't install uv from astral.sh; install it yourself: curl -LsSf https://astral.sh/uv/install.sh | sh, then re-run prime-agent. ${errorMessage(error)}`,
+			`couldn't install uv from astral.sh; install it yourself: ${UV_INSTALL_COMMAND}, then re-run prime-agent. ${errorMessage(error)}`,
 		);
 	}
 
@@ -234,6 +244,21 @@ async function ensureUv(): Promise<string> {
 	const installedFromPath = await findExecutable("uv");
 	if (installedFromPath) return installedFromPath;
 	throw new Error("uv install completed but binary not found at ~/.local/bin/uv");
+}
+
+async function confirmUvInstall(): Promise<boolean> {
+	if (process.env.PRIME_AGENT_INSTALL_UV === "0") return false;
+	if (!stdin.isTTY || !stderr.isTTY) return false;
+
+	const rl = createInterface({ input: stdin, output: stderr });
+	try {
+		const answer = (await rl.question("Prime Agent needs uv to set up Python. Install uv from astral.sh now? [Y/n] "))
+			.trim()
+			.toLowerCase();
+		return answer !== "n" && answer !== "no";
+	} finally {
+		rl.close();
+	}
 }
 
 async function readBootstrapVersion(venv: string): Promise<BootstrapVersion | null> {

@@ -47,7 +47,19 @@ What sets it apart:
 
 ## Getting Started
 
-Prime Agent runs as the `pi` CLI in installed builds. From this repository, use the source runner:
+Install the latest stable release:
+
+```bash
+curl -fsSL https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/install.sh | sh
+```
+
+Then start Prime Agent:
+
+```bash
+prime-agent
+```
+
+Alternatively, to test local changes, clone this repository and use the source runner:
 
 ```bash
 npm ci
