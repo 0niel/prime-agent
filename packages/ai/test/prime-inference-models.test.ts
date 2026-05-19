@@ -16,7 +16,7 @@ describe("Prime Inference models", () => {
 	it("registers the Prime Inference catalog", () => {
 		const modelIds = getModels("prime-inference").map((model) => model.id);
 
-		expect(modelIds.length).toBe(23);
+		expect(modelIds.length).toBe(25);
 		expect(modelIds).toEqual(
 			expect.arrayContaining([
 				"anthropic/claude-opus-4.7",
@@ -28,10 +28,11 @@ describe("Prime Inference models", () => {
 				"qwen/qwen3-coder-next",
 				"qwen/qwen3-vl-235b-a22b-thinking",
 				"x-ai/grok-4.20",
+				"z-ai/glm-5",
+				"z-ai/glm-5.1",
 			]),
 		);
 		expect(modelIds).not.toContain("google/gemini-2.5-pro");
-		expect(modelIds).not.toContain("z-ai/glm-5.1");
 	});
 
 	it("registers the default OpenAI-compatible model", () => {
@@ -69,6 +70,12 @@ describe("Prime Inference models", () => {
 		expect(deepseekV4Flash.compat).toMatchObject({
 			requiresReasoningContentOnAssistantMessages: true,
 			thinkingFormat: "deepseek",
+		});
+		const glm51 = getModel("prime-inference", "z-ai/glm-5.1");
+		expect(glm51.reasoning).toBe(true);
+		expect(glm51.compat).toMatchObject({
+			supportsReasoningEffort: false,
+			thinkingFormat: "zai",
 		});
 		expect(getModel("prime-inference", "qwen/qwen3-coder-next").reasoning).toBe(false);
 		expect(getModel("prime-inference", "x-ai/grok-4.20").reasoning).toBe(true);

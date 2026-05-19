@@ -91,6 +91,11 @@ const DEEPSEEK_V4_COMPAT: OpenAICompletionsCompat = {
 	thinkingFormat: "deepseek",
 };
 
+const ZAI_THINKING_COMPAT: OpenAICompletionsCompat = {
+	supportsReasoningEffort: false,
+	thinkingFormat: "zai",
+};
+
 const PRIME_INFERENCE_BASE_URL = "https://api.pinference.ai/api/v1";
 const PRIME_INFERENCE_COMPAT: OpenAICompletionsCompat = {
 	supportsStore: false,
@@ -141,6 +146,8 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	"x-ai/grok-4.20": { contextWindow: 2000000, maxTokens: 30000 },
 	"x-ai/grok-4.20-multi-agent": { contextWindow: 2000000, maxTokens: 30000 },
 	"x-ai/grok-code-fast-1": { contextWindow: 32768, maxTokens: 8192 },
+	"z-ai/glm-5": { contextWindow: 202752, maxTokens: 131072 },
+	"z-ai/glm-5.1": { contextWindow: 202800, maxTokens: 131072 },
 };
 
 const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
@@ -312,16 +319,24 @@ function isPrimeInferenceReasoningModel(modelId: string, catalogReasoning?: bool
 		id.includes("thinking") ||
 		id.includes("deepseek-v4") ||
 		id.startsWith("x-ai/grok-4") ||
+		id.startsWith("z-ai/glm-") ||
 		(id.startsWith("openai/gpt-5") && !id.includes("-chat")) ||
 		/^anthropic\/claude-(?:opus-4|sonnet-4)/.test(id)
 	);
 }
 
 function getPrimeInferenceCompat(modelId: string): OpenAICompletionsCompat {
-	if (modelId.toLowerCase().includes("deepseek-v4")) {
+	const id = modelId.toLowerCase();
+	if (id.includes("deepseek-v4")) {
 		return {
 			...PRIME_INFERENCE_COMPAT,
 			...DEEPSEEK_V4_COMPAT,
+		};
+	}
+	if (id.startsWith("z-ai/glm-")) {
+		return {
+			...PRIME_INFERENCE_COMPAT,
+			...ZAI_THINKING_COMPAT,
 		};
 	}
 
@@ -831,7 +846,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					},
 					compat: {
 						supportsDeveloperRole: false,
-						thinkingFormat: "zai",
+						thinkingFormat: ZAI_THINKING_COMPAT.thinkingFormat,
 						...(!ZAI_TOOL_STREAM_UNSUPPORTED_MODELS.has(modelId) ? { zaiToolStream: true } : {}),
 					},
 					contextWindow: m.limit?.context || 4096,
