@@ -1,7 +1,12 @@
-// NEVER convert to top-level imports - breaks browser/Vite builds (web-ui)
-let _existsSync: typeof import("node:fs").existsSync | null = null;
-let _homedir: typeof import("node:os").homedir | null = null;
-let _join: typeof import("node:path").join | null = null;
+import type { existsSync, readFileSync } from "node:fs";
+import type { homedir } from "node:os";
+import type { join } from "node:path";
+import type { KnownProvider } from "./types.js";
+
+// NEVER convert to top-level runtime imports - breaks browser/Vite builds (web-ui)
+let _existsSync: typeof existsSync | null = null;
+let _homedir: typeof homedir | null = null;
+let _join: typeof join | null = null;
 
 type DynamicImport = (specifier: string) => Promise<unknown>;
 
@@ -13,17 +18,15 @@ const NODE_PATH_SPECIFIER = "node:" + "path";
 // Eagerly load in Node.js/Bun environment only
 if (typeof process !== "undefined" && (process.versions?.node || process.versions?.bun)) {
 	dynamicImport(NODE_FS_SPECIFIER).then((m) => {
-		_existsSync = (m as typeof import("node:fs")).existsSync;
+		_existsSync = (m as { existsSync: typeof existsSync }).existsSync;
 	});
 	dynamicImport(NODE_OS_SPECIFIER).then((m) => {
-		_homedir = (m as typeof import("node:os")).homedir;
+		_homedir = (m as { homedir: typeof homedir }).homedir;
 	});
 	dynamicImport(NODE_PATH_SPECIFIER).then((m) => {
-		_join = (m as typeof import("node:path")).join;
+		_join = (m as { join: typeof join }).join;
 	});
 }
-
-import type { KnownProvider } from "./types.js";
 
 let _procEnvCache: Map<string, string> | null = null;
 
@@ -33,8 +36,7 @@ let _procEnvCache: Map<string, string> | null = null;
  * environments on Linux. We can recover the env from `/proc/self/environ`.
  */
 function getProcEnv(key: string): string | undefined {
-	if (!process.versions?.bun) return undefined;
-	if (typeof process === "undefined") return undefined;
+	if (typeof process === "undefined" || !process.versions?.bun) return undefined;
 
 	// If process.env already has entries, the bug is not triggered.
 	if (Object.keys(process.env).length > 0) return undefined;
@@ -42,8 +44,8 @@ function getProcEnv(key: string): string | undefined {
 	if (_procEnvCache === null) {
 		_procEnvCache = new Map();
 		try {
-			const { readFileSync } = require("node:fs") as typeof import("node:fs");
-			const data = readFileSync("/proc/self/environ", "utf-8");
+			const { readFileSync: readProcEnvFile } = require("node:fs") as { readFileSync: typeof readFileSync };
+			const data = readProcEnvFile("/proc/self/environ", "utf-8");
 			for (const entry of data.split("\0")) {
 				const idx = entry.indexOf("=");
 				if (idx > 0) {
@@ -101,6 +103,7 @@ function getApiKeyEnvVars(provider: string): readonly string[] | undefined {
 	const envMap: Record<string, string> = {
 		openai: "OPENAI_API_KEY",
 		"azure-openai-responses": "AZURE_OPENAI_API_KEY",
+		"prime-inference": "PRIME_API_KEY",
 		deepseek: "DEEPSEEK_API_KEY",
 		google: "GEMINI_API_KEY",
 		"google-vertex": "GOOGLE_CLOUD_API_KEY",

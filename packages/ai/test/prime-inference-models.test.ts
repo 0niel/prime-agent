@@ -1,0 +1,91 @@
+import { afterEach, describe, expect, it } from "vitest";
+import { findEnvKeys, getEnvApiKey } from "../src/env-api-keys.js";
+import { getModel, getModels, getSupportedThinkingLevels } from "../src/models.js";
+
+const originalPrimeApiKey = process.env.PRIME_API_KEY;
+
+afterEach(() => {
+	if (originalPrimeApiKey === undefined) {
+		delete process.env.PRIME_API_KEY;
+	} else {
+		process.env.PRIME_API_KEY = originalPrimeApiKey;
+	}
+});
+
+describe("Prime Inference models", () => {
+	it("registers the Prime Inference catalog", () => {
+		const modelIds = getModels("prime-inference").map((model) => model.id);
+
+		expect(modelIds.length).toBe(23);
+		expect(modelIds).toEqual(
+			expect.arrayContaining([
+				"anthropic/claude-opus-4.7",
+				"deepseek/deepseek-v4-pro",
+				"nvidia/nemotron-3-super-120b-a12b",
+				"openai/gpt-5.4",
+				"openai/gpt-5.5",
+				"prime-intellect/intellect-3",
+				"qwen/qwen3-coder-next",
+				"qwen/qwen3-vl-235b-a22b-thinking",
+				"x-ai/grok-4.20",
+			]),
+		);
+		expect(modelIds).not.toContain("google/gemini-2.5-pro");
+		expect(modelIds).not.toContain("z-ai/glm-5.1");
+	});
+
+	it("registers the default OpenAI-compatible model", () => {
+		const model = getModel("prime-inference", "openai/gpt-5.5");
+
+		expect(model).toBeDefined();
+		expect(model.api).toBe("openai-completions");
+		expect(model.provider).toBe("prime-inference");
+		expect(model.baseUrl).toBe("https://api.pinference.ai/api/v1");
+		expect(model.reasoning).toBe(true);
+		expect(model.thinkingLevelMap).toEqual({ xhigh: "xhigh" });
+		expect(getSupportedThinkingLevels(model)).toContain("xhigh");
+		expect(model.input).toEqual(["text"]);
+		expect(model.contextWindow).toBe(1050000);
+		expect(model.maxTokens).toBe(128000);
+		expect(model.cost).toEqual({
+			input: 5,
+			output: 30,
+			cacheRead: 0,
+			cacheWrite: 0,
+		});
+		expect(model.compat).toEqual({
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			maxTokensField: "max_tokens",
+			supportsStrictMode: false,
+		});
+	});
+
+	it("marks known reasoning-capable Prime Inference model families", () => {
+		expect(getModel("prime-inference", "anthropic/claude-opus-4.7").reasoning).toBe(true);
+		const deepseekV4Flash = getModel("prime-inference", "deepseek/deepseek-v4-flash");
+		expect(deepseekV4Flash.reasoning).toBe(true);
+		expect(deepseekV4Flash.compat).toMatchObject({
+			requiresReasoningContentOnAssistantMessages: true,
+			thinkingFormat: "deepseek",
+		});
+		expect(getModel("prime-inference", "qwen/qwen3-coder-next").reasoning).toBe(false);
+		expect(getModel("prime-inference", "x-ai/grok-4.20").reasoning).toBe(true);
+		expect(getModel("prime-inference", "x-ai/grok-code-fast-1").reasoning).toBe(false);
+	});
+
+	it("resolves PRIME_API_KEY from the environment", () => {
+		process.env.PRIME_API_KEY = "test-prime-key";
+
+		expect(findEnvKeys("prime-inference")).toEqual(["PRIME_API_KEY"]);
+		expect(getEnvApiKey("prime-inference")).toBe("test-prime-key");
+	});
+
+	it("requires an explicit Prime Inference API key", () => {
+		delete process.env.PRIME_API_KEY;
+
+		expect(findEnvKeys("prime-inference")).toBeUndefined();
+		expect(getEnvApiKey("prime-inference")).toBeUndefined();
+	});
+});

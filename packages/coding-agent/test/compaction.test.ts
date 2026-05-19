@@ -245,6 +245,16 @@ describe("shouldCompact", () => {
 
 		expect(shouldCompact(95000, 100000, settings)).toBe(false);
 	});
+
+	it("should return false when context window is unknown", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 10000,
+			keepRecentTokens: 20000,
+		};
+
+		expect(shouldCompact(95000, 0, settings)).toBe(false);
+	});
 });
 
 describe("findCutPoint", () => {

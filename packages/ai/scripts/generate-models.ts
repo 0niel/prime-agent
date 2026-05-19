@@ -86,6 +86,63 @@ const DEEPSEEK_V4_THINKING_LEVEL_MAP = {
 	xhigh: "max",
 } as const;
 
+const DEEPSEEK_V4_COMPAT: OpenAICompletionsCompat = {
+	requiresReasoningContentOnAssistantMessages: true,
+	thinkingFormat: "deepseek",
+};
+
+const PRIME_INFERENCE_BASE_URL = "https://api.pinference.ai/api/v1";
+const PRIME_INFERENCE_COMPAT: OpenAICompletionsCompat = {
+	supportsStore: false,
+	supportsDeveloperRole: false,
+	supportsReasoningEffort: true,
+	maxTokensField: "max_tokens",
+	supportsStrictMode: false,
+};
+
+interface PrimeInferenceCatalogEntry {
+	id: string;
+	input: number;
+	output: number;
+	contextWindow?: number;
+	maxTokens?: number;
+	reasoning?: boolean;
+}
+
+interface PrimeInferenceModelMetadata {
+	contextWindow: number;
+	maxTokens: number;
+}
+
+// Prime Inference intentionally exposes a curated subset of the catalog in the
+// model picker. Add new model IDs here, then rerun this script to refresh
+// src/models.generated.ts.
+const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata> = {
+	"anthropic/claude-haiku-4.5": { contextWindow: 200000, maxTokens: 64000 },
+	"anthropic/claude-opus-4.6": { contextWindow: 1000000, maxTokens: 128000 },
+	"anthropic/claude-opus-4.7": { contextWindow: 1000000, maxTokens: 128000 },
+	"anthropic/claude-sonnet-4.5": { contextWindow: 200000, maxTokens: 64000 },
+	"anthropic/claude-sonnet-4.6": { contextWindow: 1000000, maxTokens: 128000 },
+	"deepseek/deepseek-v3.2": { contextWindow: 128000, maxTokens: 8000 },
+	"deepseek/deepseek-v4-flash": { contextWindow: 1000000, maxTokens: 384000 },
+	"deepseek/deepseek-v4-pro": { contextWindow: 1000000, maxTokens: 384000 },
+	"nvidia/nemotron-3-nano-30b-a3b": { contextWindow: 1000000, maxTokens: 228000 },
+	"nvidia/nemotron-3-super-120b-a12b": { contextWindow: 1000000, maxTokens: 4096 },
+	"openai/gpt-5.3-codex": { contextWindow: 400000, maxTokens: 128000 },
+	"openai/gpt-5.4": { contextWindow: 1050000, maxTokens: 128000 },
+	"openai/gpt-5.4-mini": { contextWindow: 400000, maxTokens: 128000 },
+	"openai/gpt-5.4-pro": { contextWindow: 1050000, maxTokens: 128000 },
+	"openai/gpt-5.5": { contextWindow: 1050000, maxTokens: 128000 },
+	"prime-intellect/intellect-3": { contextWindow: 131072, maxTokens: 131072 },
+	"qwen/qwen3-235b-a22b-thinking-2507": { contextWindow: 262144, maxTokens: 4096 },
+	"qwen/qwen3-coder-next": { contextWindow: 262144, maxTokens: 65536 },
+	"qwen/qwen3-max": { contextWindow: 262144, maxTokens: 65536 },
+	"qwen/qwen3-vl-235b-a22b-thinking": { contextWindow: 262144, maxTokens: 32768 },
+	"x-ai/grok-4.20": { contextWindow: 2000000, maxTokens: 30000 },
+	"x-ai/grok-4.20-multi-agent": { contextWindow: 2000000, maxTokens: 30000 },
+	"x-ai/grok-code-fast-1": { contextWindow: 32768, maxTokens: 8192 },
+};
+
 const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
 	"gpt-5.1",
 	"gpt-5.2",
@@ -181,6 +238,174 @@ function getBedrockBaseUrl(modelId: string): string {
 	return modelId.startsWith("eu.")
 		? "https://bedrock-runtime.eu-central-1.amazonaws.com"
 		: "https://bedrock-runtime.us-east-1.amazonaws.com";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function getOptionalNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function getOptionalBoolean(value: unknown): boolean | undefined {
+	return typeof value === "boolean" ? value : undefined;
+}
+
+function includesCatalogCapability(value: unknown, capabilities: readonly string[]): boolean {
+	if (!Array.isArray(value)) {
+		return false;
+	}
+
+	return value.some((item) => {
+		if (typeof item !== "string") {
+			return false;
+		}
+		const normalized = item.toLowerCase();
+		return capabilities.some((capability) => normalized.includes(capability));
+	});
+}
+
+function getPrimeInferenceDisplayName(modelId: string): string {
+	const rawName = modelId.split("/").at(-1) ?? modelId;
+	return rawName
+		.split(/[-_]+/)
+		.filter((part) => part.length > 0)
+		.map((part) => {
+			if (part === part.toUpperCase() || /\d/.test(part)) return part.toUpperCase();
+			if (part.length <= 3) return part.toUpperCase();
+			return part.charAt(0).toUpperCase() + part.slice(1);
+		})
+		.join(" ");
+}
+
+function getPrimeInferenceCatalogReasoning(item: Record<string, unknown>): boolean | undefined {
+	const metadata = isRecord(item.metadata) ? item.metadata : {};
+	const direct =
+		getOptionalBoolean(item.reasoning) ??
+		getOptionalBoolean(item.supports_reasoning) ??
+		getOptionalBoolean(item.supportsReasoning) ??
+		getOptionalBoolean(metadata.reasoning) ??
+		getOptionalBoolean(metadata.supports_reasoning) ??
+		getOptionalBoolean(metadata.supportsReasoning);
+	if (direct !== undefined) {
+		return direct;
+	}
+
+	return includesCatalogCapability(item.supported_parameters, ["reasoning", "thinking"]) ||
+		includesCatalogCapability(item.capabilities, ["reasoning", "thinking"]) ||
+		includesCatalogCapability(item.tags, ["reasoning", "thinking"]) ||
+		includesCatalogCapability(metadata.supported_parameters, ["reasoning", "thinking"]) ||
+		includesCatalogCapability(metadata.capabilities, ["reasoning", "thinking"]) ||
+		includesCatalogCapability(metadata.tags, ["reasoning", "thinking"])
+		? true
+		: undefined;
+}
+
+function isPrimeInferenceReasoningModel(modelId: string, catalogReasoning?: boolean): boolean {
+	if (catalogReasoning !== undefined) {
+		return catalogReasoning;
+	}
+
+	const id = modelId.toLowerCase();
+	return (
+		id.includes("thinking") ||
+		id.includes("deepseek-v4") ||
+		id.startsWith("x-ai/grok-4") ||
+		(id.startsWith("openai/gpt-5") && !id.includes("-chat")) ||
+		/^anthropic\/claude-(?:opus-4|sonnet-4)/.test(id)
+	);
+}
+
+function getPrimeInferenceCompat(modelId: string): OpenAICompletionsCompat {
+	if (modelId.toLowerCase().includes("deepseek-v4")) {
+		return {
+			...PRIME_INFERENCE_COMPAT,
+			...DEEPSEEK_V4_COMPAT,
+		};
+	}
+
+	return PRIME_INFERENCE_COMPAT;
+}
+
+function parsePrimeInferenceCatalog(data: unknown): PrimeInferenceCatalogEntry[] {
+	if (!isRecord(data) || !Array.isArray(data.data)) {
+		return [];
+	}
+
+	return data.data.flatMap((item): PrimeInferenceCatalogEntry[] => {
+		if (!isRecord(item) || typeof item.id !== "string") {
+			return [];
+		}
+
+		const pricing = isRecord(item.pricing) ? item.pricing : {};
+		const input = getOptionalNumber(pricing.input_usd_per_mtok);
+		const output = getOptionalNumber(pricing.output_usd_per_mtok);
+		if (input === undefined || output === undefined) {
+			return [];
+		}
+
+		const limit = isRecord(item.limit) ? item.limit : {};
+		return [
+			{
+				id: item.id,
+				input,
+				output,
+				contextWindow: getOptionalNumber(item.context_window ?? item.contextWindow ?? limit.context),
+				maxTokens: getOptionalNumber(item.max_tokens ?? item.maxTokens ?? limit.output),
+				reasoning: getPrimeInferenceCatalogReasoning(item),
+			},
+		];
+	});
+}
+
+async function fetchPrimeInferenceModels(): Promise<Model<"openai-completions">[]> {
+	const apiKey = process.env.PRIME_API_KEY;
+
+	try {
+		console.log("Fetching models from Prime Inference API...");
+		const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined;
+		const response = await fetch(`${PRIME_INFERENCE_BASE_URL}/models`, {
+			headers,
+		});
+		const catalog = parsePrimeInferenceCatalog(await response.json());
+		if (catalog.length > 0) {
+			const models = catalog.flatMap((entry): Model<"openai-completions">[] => {
+				const metadata = PRIME_INFERENCE_MODEL_METADATA[entry.id.toLowerCase()];
+				return metadata === undefined ? [] : [createPrimeInferenceModel(entry, metadata)];
+			});
+			console.log(`Fetched ${models.length} curated models from Prime Inference`);
+			return models;
+		}
+	} catch (error) {
+		console.error("Failed to fetch Prime Inference models:", error);
+	}
+
+	return [];
+}
+
+function createPrimeInferenceModel(
+	entry: PrimeInferenceCatalogEntry,
+	metadata: PrimeInferenceModelMetadata,
+): Model<"openai-completions"> {
+	return {
+		id: entry.id,
+		name: `${getPrimeInferenceDisplayName(entry.id)} (Prime Inference)`,
+		api: "openai-completions",
+		provider: "prime-inference",
+		baseUrl: PRIME_INFERENCE_BASE_URL,
+		reasoning: isPrimeInferenceReasoningModel(entry.id, entry.reasoning),
+		input: ["text"],
+		cost: {
+			input: entry.input,
+			output: entry.output,
+			cacheRead: 0,
+			cacheWrite: 0,
+		},
+		contextWindow: entry.contextWindow ?? metadata.contextWindow,
+		maxTokens: entry.maxTokens ?? metadata.maxTokens,
+		compat: getPrimeInferenceCompat(entry.id),
+	};
 }
 
 async function fetchOpenRouterModels(): Promise<Model<any>[]> {
@@ -1288,10 +1513,6 @@ async function generateModels() {
 		});
 	}
 
-	const deepseekCompat: OpenAICompletionsCompat = {
-		requiresReasoningContentOnAssistantMessages: true,
-		thinkingFormat: "deepseek",
-	};
 	const deepseekV4Models: Model<"openai-completions">[] = [
 		{
 			id: "deepseek-v4-flash",
@@ -1309,7 +1530,7 @@ async function generateModels() {
 			},
 			contextWindow: 1000000,
 			maxTokens: 384000,
-			compat: deepseekCompat,
+			compat: DEEPSEEK_V4_COMPAT,
 		},
 		{
 			id: "deepseek-v4-pro",
@@ -1327,7 +1548,7 @@ async function generateModels() {
 			},
 			contextWindow: 1000000,
 			maxTokens: 384000,
-			compat: deepseekCompat,
+			compat: DEEPSEEK_V4_COMPAT,
 		},
 	];
 	allModels.push(...deepseekV4Models);
@@ -1339,10 +1560,10 @@ async function generateModels() {
 				...(candidate.provider === "openrouter"
 					? {
 							requiresReasoningContentOnAssistantMessages:
-								deepseekCompat.requiresReasoningContentOnAssistantMessages,
-							thinkingFormat: deepseekCompat.thinkingFormat,
+								DEEPSEEK_V4_COMPAT.requiresReasoningContentOnAssistantMessages,
+							thinkingFormat: DEEPSEEK_V4_COMPAT.thinkingFormat,
 						}
-					: deepseekCompat),
+					: DEEPSEEK_V4_COMPAT),
 			};
 			mergeThinkingLevelMap(candidate, DEEPSEEK_V4_THINKING_LEVEL_MAP);
 		}
@@ -1725,6 +1946,9 @@ async function generateModels() {
 		},
 	];
 	allModels.push(...vertexModels);
+
+	const primeInferenceModels = await fetchPrimeInferenceModels();
+	allModels.push(...primeInferenceModels);
 
 	const azureOpenAiModels: Model<Api>[] = allModels
 		.filter((model) => model.provider === "openai" && model.api === "openai-responses")
