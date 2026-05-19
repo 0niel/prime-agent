@@ -41,13 +41,13 @@ interface TracebackParts {
 }
 
 type CellBackground = "customMessageBg" | "toolPendingBg" | "toolErrorBg";
+type ExpandHintFormatter = (label: string) => string;
 
 const MAGIC_LINE_PATTERN = /^\s*!/;
 const CELL_MAGIC_PATTERN = /^\s*%%bash\b/;
 
-// Collapse long kernel output to the last N lines with a "M earlier lines hidden" marker.
-// Mirrors the bash-execution preview cap so a long-running task doesn't flood the chat.
-const OUTPUT_PREVIEW_LINES = 20;
+const OUTPUT_PREVIEW_LINES = 5;
+const INPUT_PREVIEW_LINES = 3;
 
 export function getIpythonCodeFromArgs(args: unknown): string {
 	if (!args || typeof args !== "object" || !("code" in args)) {
@@ -81,6 +81,10 @@ function formatDuration(durationMs: number | undefined): string | undefined {
 		return `${Math.round(durationMs)}ms`;
 	}
 	return `${(durationMs / 1000).toFixed(1)}s`;
+}
+
+function hiddenLinesLabel(hidden: number): string {
+	return `… +${hidden} line${hidden === 1 ? "" : "s"}`;
 }
 
 function isImageBlock(block: IPythonCellContentBlock): boolean {
@@ -157,10 +161,18 @@ export class IPythonCellComponent implements Component {
 
 		const details = readDetails(this.state.details);
 		const lines: string[] = [];
+		let expandHintShown = false;
+		const withExpandHint: ExpandHintFormatter = (label) => {
+			if (expandHintShown) {
+				return theme.fg("muted", label);
+			}
+			expandHintShown = true;
+			return `${theme.fg("muted", label)} ${theme.fg("dim", "·")} ${keyHint("app.tools.expand", "to expand")}`;
+		};
 
 		lines.push(this.panelLine(this.header(details), safeWidth));
-		const hasCode = this.renderCode(lines, safeWidth);
-		this.renderOutput(lines, safeWidth, details, hasCode);
+		const hasCode = this.renderCode(lines, safeWidth, withExpandHint);
+		this.renderOutput(lines, safeWidth, details, hasCode, withExpandHint);
 		return this.renderCache.set(safeWidth, this.stateVersion, lines);
 	}
 
@@ -191,7 +203,7 @@ export class IPythonCellComponent implements Component {
 		return { label: theme.fg("success", "done") };
 	}
 
-	private renderCode(lines: string[], width: number): boolean {
+	private renderCode(lines: string[], width: number, withExpandHint: ExpandHintFormatter): boolean {
 		const code = this.state.code.trimEnd();
 		if (!code) {
 			this.addBlank(lines, width);
@@ -202,11 +214,21 @@ export class IPythonCellComponent implements Component {
 		this.addBlank(lines, width);
 		const isBashCell = CELL_MAGIC_PATTERN.test(code.split("\n")[0] ?? "");
 		const rawLines = code.split("\n");
-		for (const [index, rawLine] of rawLines.entries()) {
+		const expanded = this.state.expanded ?? false;
+		const showCollapsed = !expanded && rawLines.length > INPUT_PREVIEW_LINES;
+		const visibleRawLines = showCollapsed ? rawLines.slice(0, INPUT_PREVIEW_LINES) : rawLines;
+		for (const [index, rawLine] of visibleRawLines.entries()) {
 			const prefix = index === 0 ? theme.fg("dim", "› ") : theme.fg("dim", "  ");
 			const highlighted = this.highlightInputLine(rawLine, isBashCell);
 			this.addWrapped(lines, prefix, highlighted || " ", width);
 		}
+
+		if (showCollapsed) {
+			const hidden = rawLines.length - INPUT_PREVIEW_LINES;
+			this.addWrapped(lines, "", withExpandHint(hiddenLinesLabel(hidden)), width);
+			return true;
+		}
+
 		return true;
 	}
 
@@ -218,7 +240,13 @@ export class IPythonCellComponent implements Component {
 		return highlighted[0] ?? theme.fg("mdCodeBlock", line);
 	}
 
-	private renderOutput(lines: string[], width: number, details: IpythonDetails, hasCode: boolean): void {
+	private renderOutput(
+		lines: string[],
+		width: number,
+		details: IpythonDetails,
+		hasCode: boolean,
+		withExpandHint: ExpandHintFormatter,
+	): void {
 		const blocks = this.state.content ?? [];
 		const text = textFromBlocks(blocks);
 		const imageCount = blocks.filter(isImageBlock).length;
@@ -238,10 +266,10 @@ export class IPythonCellComponent implements Component {
 
 		if (traceback?.output) {
 			startOutput();
-			this.renderOutputText(lines, width, traceback.output, "out");
+			this.renderOutputText(lines, width, traceback.output, "out", withExpandHint);
 		} else if (text.trim()) {
 			startOutput();
-			this.renderOutputText(lines, width, normalizeText(text), this.state.isError ? "err" : "out");
+			this.renderOutputText(lines, width, normalizeText(text), this.state.isError ? "err" : "out", withExpandHint);
 		} else if (this.state.isPartial || (this.state.executionStarted && !this.state.argsComplete)) {
 			startOutput();
 			this.addWrapped(lines, "", theme.fg("muted", "waiting for output..."), width);
@@ -256,12 +284,7 @@ export class IPythonCellComponent implements Component {
 				this.renderTraceback(lines, width, traceback.traceback);
 			} else {
 				this.addWrapped(lines, "", theme.fg("error", traceback.preview), width);
-				this.addWrapped(
-					lines,
-					"",
-					`${theme.fg("muted", "traceback collapsed")} ${theme.fg("dim", "·")} ${keyHint("app.tools.expand", "to expand")}`,
-					width,
-				);
+				this.addWrapped(lines, "", withExpandHint("traceback collapsed"), width);
 			}
 		}
 
@@ -274,7 +297,13 @@ export class IPythonCellComponent implements Component {
 		}
 	}
 
-	private renderOutputText(lines: string[], width: number, text: string, label: "out" | "err"): void {
+	private renderOutputText(
+		lines: string[],
+		width: number,
+		text: string,
+		label: "out" | "err",
+		withExpandHint: ExpandHintFormatter,
+	): void {
 		const color = label === "err" ? "error" : "toolOutput";
 		const allLines = text.split("\n");
 		const expanded = this.state.expanded ?? false;
@@ -283,8 +312,7 @@ export class IPythonCellComponent implements Component {
 
 		if (showCollapsed) {
 			const hidden = allLines.length - OUTPUT_PREVIEW_LINES;
-			const headerHint = `${theme.fg("muted", `${hidden} earlier line${hidden === 1 ? "" : "s"} hidden`)} ${theme.fg("dim", "·")} ${keyHint("app.tools.expand", "to expand")}`;
-			this.addWrapped(lines, "", headerHint, width);
+			this.addWrapped(lines, "", withExpandHint(hiddenLinesLabel(hidden)), width);
 		}
 
 		for (const line of visibleLines) {

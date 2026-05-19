@@ -147,6 +147,66 @@ describe("marquee TUI components", () => {
 		expect(component.render(80)).toBe(afterInvalidate);
 	});
 
+	test("collapses long ipython input until tool expansion is enabled", () => {
+		const code = Array.from({ length: 8 }, (_, index) => `line_${index} = ${index}`).join("\n");
+		const state: IPythonCellState = {
+			code,
+			content: [{ type: "text", text: "done" }],
+			details: { status: "ok", durationMs: 15 },
+			executionStarted: true,
+			argsComplete: true,
+			expanded: false,
+		};
+		const component = new IPythonCellComponent(state);
+
+		const collapsed = stripAnsi(component.render(100).join("\n"));
+		expect(collapsed).toContain("line_0 = 0");
+		expect(collapsed).toContain("line_2 = 2");
+		expect(collapsed).not.toContain("line_3 = 3");
+		expect(collapsed).not.toContain("line_4 = 4");
+		expect(collapsed).not.toContain("line_7 = 7");
+		expect(collapsed).toContain("… +5 lines");
+		expect(collapsed.match(/to expand/g)?.length).toBe(1);
+
+		component.update({ ...state, expanded: true });
+		const expanded = stripAnsi(component.render(100).join("\n"));
+		expect(expanded).toContain("line_7 = 7");
+		expect(expanded).not.toContain("… +5 lines");
+	});
+
+	test("shows one expand hint when ipython input and output are both collapsed", () => {
+		const code = Array.from({ length: 8 }, (_, index) => `line_${index} = ${index}`).join("\n");
+		const output = Array.from({ length: 8 }, (_, index) => `out_${index}`).join("\n");
+		const component = new IPythonCellComponent({
+			code,
+			content: [{ type: "text", text: output }],
+			details: { status: "ok", durationMs: 15 },
+			executionStarted: true,
+			argsComplete: true,
+			expanded: false,
+		});
+
+		const collapsed = stripAnsi(component.render(100).join("\n"));
+		expect(collapsed).toContain("… +5 lines");
+		expect(collapsed).toContain("… +3 lines");
+		expect(collapsed.match(/to expand/g)?.length).toBe(1);
+	});
+
+	test("pluralizes singular collapsed ipython line markers", () => {
+		const component = new IPythonCellComponent({
+			code: Array.from({ length: 4 }, (_, index) => `line_${index} = ${index}`).join("\n"),
+			content: [{ type: "text", text: Array.from({ length: 6 }, (_, index) => `out_${index}`).join("\n") }],
+			details: { status: "ok", durationMs: 15 },
+			executionStarted: true,
+			argsComplete: true,
+			expanded: false,
+		});
+
+		const collapsed = stripAnsi(component.render(100).join("\n"));
+		expect(collapsed.match(/… \+1 line\b/g)?.length).toBe(2);
+		expect(collapsed).not.toContain("… +1 lines");
+	});
+
 	test("reflows cached ipython cells when terminal width changes", () => {
 		const state: IPythonCellState = {
 			code: "result = 'this is a deliberately long line that should wrap differently by terminal width'",
