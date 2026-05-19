@@ -22,6 +22,7 @@
 
 ### Fixed
 
+- Fixed `/goal` updates in interactive mode to use a compact persistent lower-tray indicator instead of repeating the full goal in chat on every agent turn.
 - Fixed long cwd values in the startup splash from wrapping through the brand mark.
 - Fixed IPython kernel startup to let `ipykernel` bind OS-assigned ports instead of randomly selecting fixed ports.
 - Fixed RLM child usage aggregation so parent session totals include recursive child runs after session reloads.

@@ -291,6 +291,14 @@ type CompactionQueuedMessage = {
 	mode: "steer" | "followUp";
 };
 
+type GoalAnnouncementSnapshot = {
+	goalId?: string;
+	status: GoalState["status"];
+	objective?: string;
+	lastReason?: string;
+	lastError?: string;
+};
+
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 
 function isDeadTerminalError(error: unknown): boolean {
@@ -393,6 +401,8 @@ export class InteractiveMode {
 	// Status line tracking (for mutating immediately-sequential status updates)
 	private lastStatusSpacer: Spacer | undefined = undefined;
 	private lastStatusText: Text | undefined = undefined;
+	private lastGoalAnnouncement: GoalAnnouncementSnapshot | undefined = undefined;
+	private goalTrayTimer: NodeJS.Timeout | undefined = undefined;
 
 	// Streaming message tracking
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
@@ -546,6 +556,7 @@ export class InteractiveMode {
 		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
 		this.footer = new FooterComponent(this.session, this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
+		this.setGoalAnnouncementBaseline(this.session.goalState);
 
 		// Load hide thinking block setting
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -1715,6 +1726,8 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
+		this.setGoalAnnouncementBaseline(this.session.goalState);
+		this.syncGoalTray(this.session.goalState);
 	}
 
 	private async handleFatalRuntimeError(prefix: string, error: unknown): Promise<never> {
@@ -1733,6 +1746,8 @@ export class InteractiveMode {
 		this.streamingMessage = undefined;
 		this.pendingTools.clear();
 		this.resetChildAgentInspector();
+		this.setGoalAnnouncementBaseline(this.session.goalState);
+		this.syncGoalTray(this.session.goalState);
 		this.renderInitialMessages();
 	}
 
@@ -2689,6 +2704,11 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
+			if (text === "/goal" || text === "/goal status") {
+				this.handleGoalStatusCommand();
+				this.editor.setText("");
+				return;
+			}
 			if (text === "/changelog") {
 				this.handleChangelogCommand();
 				this.editor.setText("");
@@ -3160,35 +3180,137 @@ export class InteractiveMode {
 				break;
 
 			case "goal_update":
-				this.showStatus(this.formatGoalStatus(event.goal));
+				this.handleGoalUpdate(event.goal);
 				break;
 		}
 	}
 
+	private handleGoalUpdate(goal: GoalState): void {
+		this.syncGoalTray(goal);
+		if (this.shouldAnnounceGoalUpdate(goal)) {
+			this.showStatus(this.formatGoalStatus(goal));
+		} else {
+			this.ui.requestRender();
+		}
+	}
+
+	private syncGoalTray(goal: GoalState): void {
+		this.childAgentSummary.invalidate();
+		this.updateGoalTrayTimer(goal);
+	}
+
+	private updateGoalTrayTimer(goal: GoalState): void {
+		if (goal.status === "active") {
+			if (!this.goalTrayTimer) {
+				this.goalTrayTimer = setInterval(() => {
+					this.childAgentSummary.invalidate();
+					this.ui.requestRender();
+				}, 1000);
+				this.goalTrayTimer.unref?.();
+			}
+			return;
+		}
+		this.stopGoalTrayTimer();
+	}
+
+	private stopGoalTrayTimer(): void {
+		if (!this.goalTrayTimer) {
+			return;
+		}
+		clearInterval(this.goalTrayTimer);
+		this.goalTrayTimer = undefined;
+	}
+
+	private setGoalAnnouncementBaseline(goal: GoalState): void {
+		this.lastGoalAnnouncement = this.goalAnnouncementSnapshot(goal);
+	}
+
+	private goalAnnouncementSnapshot(goal: GoalState): GoalAnnouncementSnapshot {
+		return {
+			goalId: goal.goalId,
+			status: goal.status,
+			objective: goal.objective,
+			lastReason: goal.lastReason,
+			lastError: goal.lastError,
+		};
+	}
+
+	private shouldAnnounceGoalUpdate(goal: GoalState): boolean {
+		const previous = this.lastGoalAnnouncement;
+		const next = this.goalAnnouncementSnapshot(goal);
+		this.lastGoalAnnouncement = next;
+		if (!previous) {
+			return goal.status !== "idle";
+		}
+		if (previous.status !== next.status) {
+			return true;
+		}
+		if (previous.goalId !== next.goalId) {
+			return goal.status !== "idle";
+		}
+		switch (goal.status) {
+			case "active":
+				return false;
+			case "paused":
+			case "budget_limited":
+			case "complete":
+				return previous.lastReason !== next.lastReason;
+			case "error":
+				return previous.lastError !== next.lastError;
+			case "idle":
+				return false;
+			default: {
+				const _exhaustive: never = goal.status;
+				return _exhaustive;
+			}
+		}
+	}
+
 	private formatGoalStatus(goal: GoalState): string {
-		const objective = goal.objective ? `: ${goal.objective}` : "";
 		const usage = formatGoalUsage(goal);
 		const usageText = usage ? ` (${usage})` : "";
 		switch (goal.status) {
 			case "idle":
 				return "No active goal";
 			case "active":
-				return `Pursuing goal${usageText}${objective}`;
+				return goal.objective
+					? `Goal${this.formatGoalDetailSuffix(goal.objective, visibleWidth("Goal"))}`
+					: "Pursuing goal";
 			case "paused":
-				return goal.lastReason ? `Goal paused: ${goal.lastReason}` : "Goal paused (/goal resume)";
-			case "budget_limited":
 				return goal.lastReason
-					? `Goal budget limited${usageText}: ${goal.lastReason}`
-					: `Goal budget limited${usageText}`;
+					? `Goal paused${this.formatGoalDetailSuffix(goal.lastReason, visibleWidth("Goal paused"))}`
+					: "Goal paused (/goal resume)";
+			case "budget_limited":
+				if (goal.lastReason) {
+					const prefix = `Goal budget limited${usageText}`;
+					return prefix + this.formatGoalDetailSuffix(goal.lastReason, visibleWidth(prefix));
+				}
+				return `Goal budget limited${usageText}`;
 			case "complete":
-				return goal.lastReason ? `Goal complete: ${goal.lastReason}` : "Goal complete";
+				return goal.lastReason
+					? `Goal complete${this.formatGoalDetailSuffix(goal.lastReason, visibleWidth("Goal complete"))}`
+					: "Goal complete";
 			case "error":
-				return goal.lastError ? `Goal error: ${goal.lastError}` : "Goal error";
+				return goal.lastError
+					? `Goal error${this.formatGoalDetailSuffix(goal.lastError, visibleWidth("Goal error"))}`
+					: "Goal error";
 			default: {
 				const _exhaustive: never = goal.status;
 				return _exhaustive;
 			}
 		}
+	}
+
+	private formatGoalDetailSuffix(value: string | undefined, prefixWidth: number): string {
+		const detail = value?.replace(/\s+/g, " ").trim();
+		if (!detail) {
+			return "";
+		}
+		const availableWidth = Math.min(120, Math.max(1, this.ui.terminal.columns - prefixWidth - 2));
+		if (availableWidth < 8) {
+			return "";
+		}
+		return `: ${truncateToWidth(detail, availableWidth)}`;
 	}
 
 	private updateChildAgentInspector(child: RlmChildAgentSnapshot): void {
@@ -3254,18 +3376,52 @@ export class InteractiveMode {
 	}
 
 	private getTrayContextLabel(): string | undefined {
+		const goalLabel = this.getTrayGoalLabel();
 		const usage = this.session.getContextUsage();
 		if (!usage) {
-			return undefined;
+			return goalLabel;
 		}
 		if (usage.percent === null) {
-			return undefined;
+			return goalLabel;
 		}
 		const remainingPercent = Math.max(0, Math.min(100, 100 - usage.percent));
-		if (remainingPercent > 50) {
-			return undefined;
+		const contextLabel = remainingPercent <= 50 ? `${Math.round(remainingPercent)}% context left` : undefined;
+		return [goalLabel, contextLabel].filter((label) => label !== undefined).join(" · ") || undefined;
+	}
+
+	private getTrayGoalLabel(): string | undefined {
+		const goal = this.session.goalState;
+		switch (goal.status) {
+			case "active":
+				return `Pursuing goal (${this.formatGoalElapsed(goal.timeUsedSeconds)})`;
+			case "paused":
+				return `Goal paused (${this.formatGoalElapsed(goal.timeUsedSeconds)})`;
+			case "budget_limited":
+				return `Goal budget limited (${this.formatGoalElapsed(goal.timeUsedSeconds)})`;
+			case "idle":
+			case "complete":
+			case "error":
+				return undefined;
+			default: {
+				const _exhaustive: never = goal.status;
+				return _exhaustive;
+			}
 		}
-		return `${Math.round(remainingPercent)}% context left`;
+	}
+
+	private formatGoalElapsed(seconds: number): string {
+		const totalSeconds = Math.max(0, Math.trunc(seconds));
+		if (totalSeconds < 60) {
+			return `${totalSeconds}s`;
+		}
+		const minutes = Math.floor(totalSeconds / 60);
+		const remainingSeconds = totalSeconds % 60;
+		if (minutes < 60) {
+			return `${minutes}m ${remainingSeconds.toString().padStart(2, "0")}s`;
+		}
+		const hours = Math.floor(minutes / 60);
+		const remainingMinutes = minutes % 60;
+		return `${hours}h ${remainingMinutes.toString().padStart(2, "0")}m`;
 	}
 
 	private openChildAgentList(): void {
@@ -5551,6 +5707,41 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private handleGoalStatusCommand(): void {
+		const goal = this.session.goalState;
+		if (goal.status === "idle" || !goal.objective) {
+			this.showStatus("No active goal");
+			return;
+		}
+
+		const lines = [
+			theme.bold("Goal"),
+			"",
+			`${theme.fg("dim", "Status:")} ${goal.status}`,
+			`${theme.fg("dim", "Objective:")} ${goal.objective}`,
+			`${theme.fg("dim", "Time:")} ${this.formatGoalElapsed(goal.timeUsedSeconds)}`,
+			`${theme.fg("dim", "Continuations:")} ${goal.continuationsUsed}`,
+			`${theme.fg("dim", "Tokens:")} ${goal.tokensUsed.toLocaleString()}${
+				goal.tokenBudget === undefined ? "" : ` / ${goal.tokenBudget.toLocaleString()}`
+			}`,
+		];
+		if (goal.tokenBudget !== undefined) {
+			lines.push(
+				`${theme.fg("dim", "Remaining:")} ${Math.max(0, goal.tokenBudget - goal.tokensUsed).toLocaleString()}`,
+			);
+		}
+		if (goal.lastReason) {
+			lines.push(`${theme.fg("dim", "Reason:")} ${goal.lastReason}`);
+		}
+		if (goal.lastError) {
+			lines.push(`${theme.fg("dim", "Error:")} ${goal.lastError}`);
+		}
+
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(lines.join("\n"), 1, 0));
+		this.ui.requestRender();
+	}
+
 	private handleChangelogCommand(): void {
 		const changelogPath = getChangelogPath();
 		const allEntries = parseChangelog(changelogPath);
@@ -5900,6 +6091,7 @@ export class InteractiveMode {
 			this.ui.terminal.setProgress(false);
 		}
 		this.stopWorkingLoader();
+		this.stopGoalTrayTimer();
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();
 		this.footerDataProvider.dispose();

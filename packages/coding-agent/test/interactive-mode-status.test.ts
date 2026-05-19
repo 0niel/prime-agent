@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.js";
+import { emptyGoalState, type GoalState } from "../src/core/goals.js";
 import type { SourceInfo } from "../src/core/source-info.js";
 import { InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -81,6 +82,156 @@ describe("InteractiveMode.showStatus", () => {
 		// adds spacer + text
 		expect(fakeThis.chatContainer.children).toHaveLength(5);
 		expect(renderLastLine(fakeThis.chatContainer)).toContain("STATUS_TWO");
+	});
+});
+
+describe("InteractiveMode goal status announcements", () => {
+	test("does not announce active goal usage-only updates", () => {
+		type GoalAnnouncementHarness = {
+			lastGoalAnnouncement?: unknown;
+			setGoalAnnouncementBaseline(goal: GoalState): void;
+			shouldAnnounceGoalUpdate(goal: GoalState): boolean;
+		};
+		const fakeThis = Object.create(InteractiveMode.prototype) as GoalAnnouncementHarness;
+		const activeGoal: GoalState = {
+			active: true,
+			status: "active",
+			goalId: "goal-1",
+			objective: "ship the feature",
+			tokensUsed: 10,
+			timeUsedSeconds: 5,
+			continuationsUsed: 1,
+		};
+
+		fakeThis.setGoalAnnouncementBaseline(emptyGoalState());
+		expect(fakeThis.shouldAnnounceGoalUpdate(activeGoal)).toBe(true);
+		expect(
+			fakeThis.shouldAnnounceGoalUpdate({
+				...activeGoal,
+				tokensUsed: 20,
+				timeUsedSeconds: 15,
+				continuationsUsed: 2,
+			}),
+		).toBe(false);
+		expect(
+			fakeThis.shouldAnnounceGoalUpdate({
+				...activeGoal,
+				objective: "ship the feature and update docs",
+			}),
+		).toBe(false);
+	});
+
+	test("announces a transition back to idle when a goal is cleared", () => {
+		type GoalAnnouncementHarness = {
+			setGoalAnnouncementBaseline(goal: GoalState): void;
+			shouldAnnounceGoalUpdate(goal: GoalState): boolean;
+		};
+		const fakeThis = Object.create(InteractiveMode.prototype) as GoalAnnouncementHarness;
+		fakeThis.setGoalAnnouncementBaseline({
+			active: true,
+			status: "active",
+			goalId: "goal-1",
+			objective: "ship the feature",
+			tokensUsed: 10,
+			timeUsedSeconds: 5,
+			continuationsUsed: 1,
+		});
+
+		expect(fakeThis.shouldAnnounceGoalUpdate(emptyGoalState())).toBe(true);
+		expect(fakeThis.shouldAnnounceGoalUpdate(emptyGoalState())).toBe(false);
+	});
+});
+
+describe("InteractiveMode tray goal label", () => {
+	type TrayLabelHarness = {
+		runtimeHost: {
+			session: {
+				goalState: GoalState;
+				getContextUsage(): { contextWindow: number; percent: number | null } | undefined;
+			};
+		};
+		getTrayContextLabel(): string | undefined;
+	};
+	const getTrayContextLabel = (InteractiveMode.prototype as unknown as TrayLabelHarness).getTrayContextLabel;
+
+	test("shows active goals in the lower tray without an objective", () => {
+		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
+		fakeThis.runtimeHost = {
+			session: {
+				goalState: {
+					active: true,
+					status: "active",
+					objective: "a long objective that should not render in the tray",
+					tokensUsed: 0,
+					timeUsedSeconds: 65,
+					continuationsUsed: 1,
+				} satisfies GoalState,
+				getContextUsage: () => undefined,
+			},
+		};
+
+		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
+	});
+
+	test("combines active goals with low-context signal in one lower-tray label", () => {
+		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
+		fakeThis.runtimeHost = {
+			session: {
+				goalState: {
+					active: true,
+					status: "active",
+					objective: "finish the task",
+					tokensUsed: 0,
+					timeUsedSeconds: 65,
+					continuationsUsed: 1,
+				} satisfies GoalState,
+				getContextUsage: () => ({ contextWindow: 100_000, percent: 75 }),
+			},
+		};
+
+		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 25% context left");
+	});
+});
+
+describe("InteractiveMode.handleGoalStatusCommand", () => {
+	test("prints current goal details without queuing through the agent", () => {
+		type GoalStatusCommandHarness = {
+			runtimeHost: {
+				session: {
+					goalState: GoalState;
+				};
+			};
+			chatContainer: Container;
+			ui: { requestRender(): void };
+			handleGoalStatusCommand(): void;
+			formatGoalElapsed(seconds: number): string;
+		};
+		const fakeThis = Object.create(InteractiveMode.prototype) as GoalStatusCommandHarness;
+		fakeThis.runtimeHost = {
+			session: {
+				goalState: {
+					active: true,
+					status: "active",
+					objective: "ship the feature",
+					tokenBudget: 1000,
+					tokensUsed: 125,
+					timeUsedSeconds: 65,
+					continuationsUsed: 2,
+				},
+			},
+		};
+		fakeThis.chatContainer = new Container();
+		fakeThis.ui = { requestRender: vi.fn() };
+
+		fakeThis.handleGoalStatusCommand();
+
+		const rendered = normalizeRenderedOutput(fakeThis.chatContainer);
+		expect(rendered).toContain("Goal");
+		expect(rendered).toContain("Status: active");
+		expect(rendered).toContain("Objective: ship the feature");
+		expect(rendered).toContain("Time: 1m 05s");
+		expect(rendered).toContain("Tokens: 125 / 1,000");
+		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(1);
 	});
 });
 

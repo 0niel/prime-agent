@@ -455,6 +455,29 @@ describe("marquee TUI components", () => {
 		expect(narrow).toContain("inspect t…");
 	});
 
+	test("keeps child agent summary visible when the right tray label is long", () => {
+		const summary = new ChildAgentSummaryComponent(
+			() => undefined,
+			() => "Pursuing goal (1m 05s) · 25% context left",
+		);
+		summary.setNodes([
+			{
+				id: "sub-a",
+				label: "inspect training logs",
+				status: "running",
+				sessionDir: "/tmp/session/sub-a",
+				transcript: [],
+			},
+		]);
+
+		const row = summary.render(32)[0] ?? "";
+		const text = stripAnsi(row);
+
+		expect(visibleWidth(row)).toBe(32);
+		expect(text).toContain("1 sub");
+		expect(text).toContain("Pursuing goal");
+	});
+
 	test("renders full child agent detail without internal scroll controls", () => {
 		const detailComponent = new ChildAgentDetailComponent(() => 6);
 		detailComponent.setNode({

@@ -199,12 +199,18 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 
 	private renderSplitLine(left: string, right: string, width: number): string {
 		const contentWidth = Math.max(1, width - this.paddingX);
-		const rightWidth = visibleWidth(right);
 		const gapWidth = left ? 2 : 0;
-		const leftWidth = Math.max(0, contentWidth - rightWidth - gapWidth);
-		const renderedLeft = leftWidth > 0 ? this.truncate(left, leftWidth) : "";
+		const leftWidth = visibleWidth(left);
+		const rightWidthLimit =
+			left && contentWidth > gapWidth && leftWidth + gapWidth + visibleWidth(right) > contentWidth
+				? contentWidth - gapWidth - Math.min(leftWidth, Math.max(1, Math.floor((contentWidth - gapWidth) / 3)))
+				: contentWidth;
+		const renderedRight = this.truncate(right, Math.max(0, rightWidthLimit));
+		const rightWidth = visibleWidth(renderedRight);
+		const renderedLeftWidth = Math.max(0, contentWidth - rightWidth - gapWidth);
+		const renderedLeft = renderedLeftWidth > 0 ? this.truncate(left, renderedLeftWidth) : "";
 		const gap = Math.max(0, contentWidth - visibleWidth(renderedLeft) - rightWidth);
-		return `${" ".repeat(this.paddingX)}${renderedLeft}${" ".repeat(gap)}${right}`;
+		return `${" ".repeat(this.paddingX)}${renderedLeft}${" ".repeat(gap)}${renderedRight}`;
 	}
 
 	private subagentSummary(flat: readonly FlatChildAgentNode[], selected: boolean): string {
