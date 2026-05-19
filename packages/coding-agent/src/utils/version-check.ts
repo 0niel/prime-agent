@@ -1,11 +1,13 @@
 import { getPiUserAgent } from "./pi-user-agent.js";
 
-const LATEST_VERSION_URL = "https://pi.dev/api/latest-version";
+const DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL = "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev";
+const LATEST_VERSION_MANIFEST_PATH = "latest.json";
 const DEFAULT_VERSION_CHECK_TIMEOUT_MS = 10000;
 
 export interface LatestPiRelease {
 	version: string;
 	packageName?: string;
+	installSpec?: string;
 }
 
 interface ParsedVersion {
@@ -52,13 +54,35 @@ export function isNewerPackageVersion(candidateVersion: string, currentVersion: 
 	return candidateVersion.trim() !== currentVersion.trim();
 }
 
+function getPrimeAgentDownloadBaseUrl(): string {
+	return (process.env.PRIME_AGENT_DOWNLOAD_BASE_URL?.trim() || DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL).replace(
+		/\/+$/,
+		"",
+	);
+}
+
+function normalizeReleaseVersion(version: string): string {
+	return version.trim().replace(/^v/, "");
+}
+
+function resolveReleaseUrl(baseUrl: string, pathOrUrl: string): string | undefined {
+	const trimmed = pathOrUrl.trim();
+	if (!trimmed) return undefined;
+	try {
+		return new URL(trimmed).toString();
+	} catch {
+		return `${baseUrl}/${trimmed.replace(/^\/+/, "")}`;
+	}
+}
+
 export async function getLatestPiRelease(
 	currentVersion: string,
 	options: { timeoutMs?: number } = {},
 ): Promise<LatestPiRelease | undefined> {
 	if (process.env.PI_SKIP_VERSION_CHECK || process.env.PI_OFFLINE) return undefined;
 
-	const response = await fetch(LATEST_VERSION_URL, {
+	const baseUrl = getPrimeAgentDownloadBaseUrl();
+	const response = await fetch(`${baseUrl}/${LATEST_VERSION_MANIFEST_PATH}`, {
 		headers: {
 			"User-Agent": getPiUserAgent(currentVersion),
 			accept: "application/json",
@@ -67,13 +91,30 @@ export async function getLatestPiRelease(
 	});
 	if (!response.ok) return undefined;
 
-	const data = (await response.json()) as { packageName?: unknown; version?: unknown };
+	const data = (await response.json()) as {
+		package?: unknown;
+		packageName?: unknown;
+		tarball?: unknown;
+		version?: unknown;
+	};
 	if (typeof data.version !== "string" || !data.version.trim()) {
 		return undefined;
 	}
 	const packageName =
-		typeof data.packageName === "string" && data.packageName.trim() ? data.packageName.trim() : undefined;
-	return { version: data.version.trim(), packageName };
+		typeof data.package === "string" && data.package.trim()
+			? data.package.trim()
+			: typeof data.packageName === "string" && data.packageName.trim()
+				? data.packageName.trim()
+				: undefined;
+	const installSpec = typeof data.tarball === "string" ? resolveReleaseUrl(baseUrl, data.tarball) : undefined;
+	const release: LatestPiRelease = { version: normalizeReleaseVersion(data.version) };
+	if (packageName) {
+		release.packageName = packageName;
+	}
+	if (installSpec) {
+		release.installSpec = installSpec;
+	}
+	return release;
 }
 
 export async function getLatestPiVersion(

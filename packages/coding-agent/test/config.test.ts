@@ -198,6 +198,44 @@ describe("detectInstallMethod", () => {
 		});
 	});
 
+	test("self-updates tarball specs without uninstalling the same logical package first", () => {
+		const { prefix } = createNpmPrefixInstall();
+		const tarballUrl = "https://downloads.example.test/prime-agent/prime-agent-0.73.0.tgz";
+
+		const command = getSelfUpdateCommand("@earendil-works/pi-coding-agent", undefined, tarballUrl);
+
+		expect(command).toEqual({
+			command: "npm",
+			args: ["--prefix", prefix, "install", "-g", tarballUrl],
+			display: `npm --prefix ${prefix} install -g ${tarballUrl}`,
+		});
+	});
+
+	test("self-updates renamed tarball packages by uninstalling the old package after install", () => {
+		const { prefix } = createNpmPrefixInstall();
+		const tarballUrl = "https://downloads.example.test/prime-agent/prime-agent-0.73.0.tgz";
+
+		const command = getSelfUpdateCommand("@earendil-works/pi-coding-agent", undefined, tarballUrl, "prime-agent");
+
+		expect(command).toEqual({
+			command: "npm",
+			args: ["--prefix", prefix, "install", "-g", tarballUrl],
+			display: `npm --prefix ${prefix} install -g ${tarballUrl} && npm --prefix ${prefix} uninstall -g @earendil-works/pi-coding-agent`,
+			steps: [
+				{
+					command: "npm",
+					args: ["--prefix", prefix, "install", "-g", tarballUrl],
+					display: `npm --prefix ${prefix} install -g ${tarballUrl}`,
+				},
+				{
+					command: "npm",
+					args: ["--prefix", prefix, "uninstall", "-g", "@earendil-works/pi-coding-agent"],
+					display: `npm --prefix ${prefix} uninstall -g @earendil-works/pi-coding-agent`,
+				},
+			],
+		});
+	});
+
 	test("self-update respects configured npmCommand", () => {
 		const { prefix } = createNpmPrefixInstall();
 
