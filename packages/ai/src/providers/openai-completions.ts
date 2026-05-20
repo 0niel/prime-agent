@@ -10,7 +10,7 @@ import type {
 	ChatCompletionSystemMessageParam,
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions.js";
-import { getEnvApiKey } from "../env-api-keys.js";
+import { getEnvApiKey, getPrimeTeamId } from "../env-api-keys.js";
 import { calculateCost, clampThinkingLevel } from "../models.js";
 import type {
 	AssistantMessage,
@@ -460,6 +460,11 @@ function createClient(
 			hasImages,
 		});
 		Object.assign(headers, copilotHeaders);
+	}
+
+	if (model.provider === "prime-inference") {
+		const teamId = getPrimeTeamId();
+		if (teamId) headers["X-Prime-Team-ID"] = teamId;
 	}
 
 	if (sessionId && compat.sendSessionAffinityHeaders) {
