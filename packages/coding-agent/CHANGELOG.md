@@ -2,36 +2,42 @@
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-05-20
+
 ### Added
 
-- Added a pi-style installer script and R2-backed private npm tarball release pipeline for `prime-agent`.
-- Added automatic IPython kernel runtime bootstrap with uv-managed Python, `ipykernel`, and `prime-agent-runtime`.
-- Added `/goal` for long-running objectives that continue after early no-tool stops until the model marks the goal complete.
-- Added Prime Inference as a selectable built-in provider with `PRIME_API_KEY` and `/login` API-key authentication.
-- Added a first-class `/login` Prime Inference browser auth flow that can import existing Prime CLI credentials.
+- Added a persistent `ipython` tool backed by a Jupyter kernel so Python variables and imports survive across tool calls.
+- Added the RLM harness system prompt and `prime-agent-runtime` bridge so IPython code can call `rlm.run` to spawn recursive child agent sessions.
+- Added automatic IPython runtime bootstrap with uv-managed Python, `ipykernel`, and `prime-agent-runtime`.
+- Added subagent UI surfaces for recursive runs, including compact tray status, full-width detail views, and structured child transcripts rendered like the main chat.
+- Added `/goal` for long-running objectives that continue after normal follow-ups drain until the model marks the goal complete.
+- Added a pi-style installer script and R2-backed private npm tarball release pipeline for Prime Agent.
+- Added Prime Inference as a selectable built-in OpenAI-compatible provider with `PRIME_API_KEY` authentication and `openai/gpt-5.5` as the default model.
+- Added a first-class `/login` Prime Inference browser auth flow that imports usable Prime CLI credentials or obtains a new key through the Prime challenge flow.
 - Added `/usage` to show token, cost, and context usage on demand.
 
 ### Changed
 
 - Changed the default active built-in tool set to `ipython`.
-- Changed the interactive startup screen to hide loaded resources by default unless verbose startup is enabled.
-- Changed the interactive prompt input to render as a larger filled surface instead of a bordered frame.
-- Changed user messages to use the same filled treatment as the prompt input.
-- Changed the interactive working indicator to show elapsed time while the agent is running.
-- Replaced the default system prompt with the model-agnostic RLM harness prompt.
+- Changed compaction to restart the active IPython kernel so summarized sessions release in-memory Python state.
+- Changed recursive background work to use normal Python async tasks with `rlm.run` instead of a separate RLM background API.
+- Changed completed IPython cell rendering to use width/version-aware caching, reducing TUI redraw lag in long sessions.
+- Changed collapsed IPython cells to show compact input and output previews with a single expansion hint.
+- Changed auto-compaction checks to use the current context estimate and stop between long tool-loop turns before resuming after compaction.
+- Changed the goal status UI to use a compact lower-tray indicator instead of repeating the full objective in chat.
 - Changed IPython prompt guidance to prefer `!cmd` and `%%bash` for shell commands.
-- Changed the app update check to read the Prime Agent release manifest instead of the Pi version endpoint.
-- Changed the app update notification to use the Prime accent color instead of the warning color.
+- Changed kernel bootstrap to prompt before installing `uv` and skip postinstall bootstrap unless explicitly enabled.
+- Changed the app update check and self-update flow to read the Prime Agent release manifest and install manifest tarballs directly.
 
 ### Fixed
 
 - Fixed tarball self-updates to install the tarball without first uninstalling the same logical package.
-- Fixed `/goal` updates in interactive mode to use a compact persistent lower-tray indicator instead of repeating the full goal in chat on every agent turn.
-- Fixed long cwd values in the startup splash from wrapping through the brand mark.
 - Fixed IPython kernel startup to let `ipykernel` bind OS-assigned ports instead of randomly selecting fixed ports.
 - Fixed RLM child usage aggregation so parent session totals include recursive child runs after session reloads.
 - Fixed the RLM child-agent detail viewer to render messages, thinking, and tool output with the main chat presentation, open at the latest transcript output, and use terminal scrollback for native scrolling.
 - Fixed `rlm.run` comm handlers to log failures and drain in-flight child runs during kernel disposal.
+- Fixed raw tab rendering in TUI-backed transcript views so painted backgrounds survive indentation.
+- Fixed auto-compaction threshold checks during trailing context and tool-result growth.
 
 ### Removed
 

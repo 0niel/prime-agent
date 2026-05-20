@@ -2,8 +2,11 @@
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-05-20
+
 ### Added
 
+- Added `VersionedRenderCache` for width/version-keyed render caching of expensive TUI components.
 - Added optional background surface rendering for editor components.
 - Added scrollback overlay rendering for full-screen overlays that should preserve native terminal scrollback.
 

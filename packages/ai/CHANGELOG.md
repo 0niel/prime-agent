@@ -2,10 +2,12 @@
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-05-20
+
 ### Added
 
-- Added Prime Inference as an OpenAI-compatible built-in provider using `PRIME_API_KEY` authentication.
-- Added GLM 5 and GLM 5.1 to the Prime Inference model catalog.
+- Added Prime Inference as an OpenAI-compatible built-in provider using `PRIME_API_KEY` authentication, curated model generation, and Prime-specific request compatibility.
+- Added GLM 5 and GLM 5.1 to the Prime Inference model catalog with Z.ai-style thinking compatibility.
 
 ### Fixed
 
