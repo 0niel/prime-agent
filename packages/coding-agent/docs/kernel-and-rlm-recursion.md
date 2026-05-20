@@ -523,7 +523,7 @@ The answer is the child's final assistant text. This matches the RLM-1 training 
 For a persisted root session:
 
 ```text
-~/.pi/agent/sessions/<project>/
+~/.prime/agent/sessions/<project>/
   2026-..._<root-session-id>.jsonl
   2026-..._<root-session-id>/
     sub-dccb69c8/
@@ -634,17 +634,17 @@ kernel comm reply sent on shell channel
 Single child:
 
 ```bash
-./pi-test.sh -p 'use the ipython tool to run `print((await rlm.run('"'"'What is the capital of Japan?'"'"')).answer)`'
+./prime-agent.sh -p 'use the ipython tool to run `print((await rlm.run('"'"'What is the capital of Japan?'"'"')).answer)`'
 ```
 
 Parallel children:
 
 ```bash
-./pi-test.sh -p 'use the ipython tool with asyncio.gather to call rlm.run() three times in parallel for: capital of Japan, capital of Brazil, capital of Egypt. Print only the three answers as a Python list.'
+./prime-agent.sh -p 'use the ipython tool with asyncio.gather to call rlm.run() three times in parallel for: capital of Japan, capital of Brazil, capital of Egypt. Print only the three answers as a Python list.'
 ```
 
 Depth cap:
 
 ```bash
-./pi-test.sh -p 'use the ipython tool to run `result = await rlm.run("use the ipython tool to execute this exact Python code and print the exception message: try:\n    await rlm.run('\''nested'\'')\nexcept Exception as e:\n    print(type(e).__name__, str(e))")\nprint(result.answer)`'
+./prime-agent.sh -p 'use the ipython tool to run `result = await rlm.run("use the ipython tool to execute this exact Python code and print the exception message: try:\n    await rlm.run('\''nested'\'')\nexcept Exception as e:\n    print(type(e).__name__, str(e))")\nprint(result.answer)`'
 ```

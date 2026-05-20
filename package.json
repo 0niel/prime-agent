@@ -1,5 +1,5 @@
 {
-	"name": "pi-monorepo",
+	"name": "prime-agent",
 	"private": true,
 	"type": "module",
 	"workspaces": [

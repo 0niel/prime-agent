@@ -36,8 +36,7 @@ out.html
 packages/coding-agent/binaries/
 todo.md
 plans/
-.pi/hf-sessions/
-.pi/hf-sessions-backup/
+.prime/agent/
 collect.sh
 .kernel-venv/
 .worktrees/

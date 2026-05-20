@@ -52,7 +52,7 @@ if [[ "$NO_ENV" == "true" ]]; then
   unset AZURE_OPENAI_API_KEY
   unset AZURE_OPENAI_BASE_URL
   unset AZURE_OPENAI_RESOURCE_NAME
-  echo "Running without API keys..."
+  echo "Running Prime Agent without API keys..."
 fi
 
 TSX_BIN="$SCRIPT_DIR/node_modules/.bin/tsx"
