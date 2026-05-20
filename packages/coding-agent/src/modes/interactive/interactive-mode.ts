@@ -81,6 +81,11 @@ import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.j
 import { createCompactionSummaryMessage } from "../../core/messages.js";
 import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.js";
 import { DefaultPackageManager } from "../../core/package-manager.js";
+import {
+	loginPrimeInference,
+	PRIME_INFERENCE_PROVIDER_ID,
+	PRIME_INFERENCE_PROVIDER_NAME,
+} from "../../core/prime-inference-auth.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-names.js";
 import type { ResourceDiagnostic } from "../../core/resource-loader.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
@@ -4956,14 +4961,20 @@ export class InteractiveMode {
 	}
 
 	private showLoginAuthTypeSelector(): void {
+		const primeInferenceLabel = "Use Prime Inference";
 		const subscriptionLabel = "Use a subscription";
 		const apiKeyLabel = "Use an API key";
+
 		this.showSelector((done) => {
 			const selector = new ExtensionSelectorComponent(
 				"Select authentication method:",
-				[subscriptionLabel, apiKeyLabel],
+				[primeInferenceLabel, subscriptionLabel, apiKeyLabel],
 				(option) => {
 					done();
+					if (option === primeInferenceLabel) {
+						void this.showPrimeInferenceLoginDialog();
+						return;
+					}
 					const authType = option === subscriptionLabel ? "oauth" : "api_key";
 					this.showLoginProviderSelector(authType);
 				},
@@ -5144,6 +5155,67 @@ export class InteractiveMode {
 		this.editorContainer.addChild(dialog);
 		this.ui.setFocus(dialog);
 		this.ui.requestRender();
+	}
+
+	private async showPrimeInferenceLoginDialog(): Promise<void> {
+		const previousModel = this.session.model;
+		const dialog = new LoginDialogComponent(
+			this.ui,
+			PRIME_INFERENCE_PROVIDER_ID,
+			(_success, _message) => {
+				// Completion handled below.
+			},
+			PRIME_INFERENCE_PROVIDER_NAME,
+		);
+
+		this.editorContainer.clear();
+		this.editorContainer.addChild(dialog);
+		this.ui.setFocus(dialog);
+		this.ui.requestRender();
+
+		const restoreEditor = () => {
+			this.editorContainer.clear();
+			this.editorContainer.addChild(this.editor);
+			this.ui.setFocus(this.editor);
+			this.ui.requestRender();
+		};
+
+		try {
+			const result = await loginPrimeInference({
+				onAuth: (info) => {
+					dialog.showAuth(info.url, info.instructions);
+					dialog.showWaiting("Waiting for browser authentication...");
+				},
+				onProgress: (message) => {
+					dialog.showProgress(message);
+				},
+				signal: dialog.signal,
+			});
+
+			if (dialog.signal.aborted) {
+				restoreEditor();
+				return;
+			}
+
+			this.session.modelRegistry.authStorage.set(PRIME_INFERENCE_PROVIDER_ID, {
+				type: "api_key",
+				key: result.apiKey,
+			});
+
+			restoreEditor();
+			await this.completeProviderAuthentication(
+				PRIME_INFERENCE_PROVIDER_ID,
+				PRIME_INFERENCE_PROVIDER_NAME,
+				"api_key",
+				previousModel,
+			);
+		} catch (error: unknown) {
+			restoreEditor();
+			const errorMsg = error instanceof Error ? error.message : String(error);
+			if (errorMsg !== "Login cancelled") {
+				this.showError(`Failed to login to ${PRIME_INFERENCE_PROVIDER_NAME}: ${errorMsg}`);
+			}
+		}
 	}
 
 	private async showApiKeyLoginDialog(providerId: string, providerName: string): Promise<void> {
