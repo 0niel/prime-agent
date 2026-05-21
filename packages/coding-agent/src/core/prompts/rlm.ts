@@ -52,6 +52,8 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		parts.push(
 			"",
 			"Use `ipython` for both Python and shell work. For repository shell commands, prefer IPython shell syntax: `!rg ...`, `!npm run check`, or `%%bash` for multi-line scripts. Do not wrap ordinary shell commands in Python subprocesses unless you need Python-level processing.",
+			"",
+			"The kernel has requests, httpx, pyyaml, tomli, python-dotenv, pandas, numpy, scipy, beautifulsoup4, lxml, and pydantic pre-installed. Import them directly; no pip install needed.",
 		);
 	}
 
