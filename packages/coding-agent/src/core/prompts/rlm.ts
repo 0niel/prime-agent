@@ -1,4 +1,4 @@
-import { DEFAULT_RLM_EXTRA_UV_ARGS } from "../kernel/bootstrap.js";
+import { DEFAULT_RLM_EXTRA_IMPORT_LABELS } from "../kernel/bootstrap.js";
 
 export interface RlmPromptOptions {
 	cwd: string;
@@ -55,7 +55,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 			"",
 			"Use `ipython` for both Python and shell work. For repository shell commands, prefer IPython shell syntax: `!rg ...`, `!npm run check`, or `%%bash` for multi-line scripts. Do not wrap ordinary shell commands in Python subprocesses unless you need Python-level processing.",
 			"",
-			`The kernel has these packages pre-installed: ${DEFAULT_RLM_EXTRA_UV_ARGS.join(", ")}. Import them directly; no pip install needed.`,
+			`The kernel has these Python imports available: ${DEFAULT_RLM_EXTRA_IMPORT_LABELS.join(", ")}. Import them directly; no pip install needed.`,
 		);
 	}
 

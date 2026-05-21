@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { DEFAULT_RLM_EXTRA_IMPORT_LABELS } from "../src/core/kernel/bootstrap.js";
 import { buildRlmPrompt } from "../src/core/prompts/index.js";
 import type { Skill } from "../src/core/skills.js";
 import { buildSystemPrompt } from "../src/core/system-prompt.js";
@@ -43,6 +44,8 @@ describe("buildRlmPrompt", () => {
 				"Each skill is also available as a shell command by the same name: `<skill> ...`. Discover its CLI usage with `<skill> --help`.",
 				"",
 				"Use `ipython` for both Python and shell work. For repository shell commands, prefer IPython shell syntax: `!rg ...`, `!npm run check`, or `%%bash` for multi-line scripts. Do not wrap ordinary shell commands in Python subprocesses unless you need Python-level processing.",
+				"",
+				`The kernel has these Python imports available: ${DEFAULT_RLM_EXTRA_IMPORT_LABELS.join(", ")}. Import them directly; no pip install needed.`,
 				"",
 				"Call at most one built-in tool per turn.",
 			].join("\n"),
@@ -91,6 +94,9 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).not.toContain("notify='wake'");
 		expect(prompt).not.toContain("notify='silent'");
 		expect(prompt).toContain("Use `ipython` for both Python and shell work");
+		expect(prompt).toContain("yaml (PyYAML)");
+		expect(prompt).toContain("dotenv (python-dotenv)");
+		expect(prompt).toContain("bs4 (Beautiful Soup)");
 		expect(prompt).toContain("prefer IPython shell syntax");
 		expect(prompt).toContain("Do not wrap ordinary shell commands in Python subprocesses");
 		expect(prompt).toContain("Call at most one built-in tool per turn.");
