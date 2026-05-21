@@ -8,23 +8,10 @@ import { createInterface } from "node:readline/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
-const BOOTSTRAP_SCHEMA = 3;
+const BOOTSTRAP_SCHEMA = 2;
 const PYTHON_VERSION = "3.11";
 const IPYKERNEL_REQUIREMENT = "ipykernel";
 const RUNTIME_REQUIREMENT = "prime-agent-runtime";
-export const DEFAULT_RLM_EXTRA_UV_ARGS = [
-	"requests",
-	"httpx",
-	"pyyaml",
-	"tomli",
-	"python-dotenv",
-	"pandas",
-	"numpy",
-	"scipy",
-	"beautifulsoup4",
-	"lxml",
-	"pydantic",
-];
 const UV_INSTALL_COMMAND = "curl -LsSf https://astral.sh/uv/install.sh | sh";
 const RUNTIME_READY_CHECK =
 	"import rlm; assert hasattr(rlm, 'run'); assert callable(rlm); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm); assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background')";
@@ -39,7 +26,6 @@ interface BootstrapVersion {
 	schema: number;
 	ipykernel?: string;
 	runtime?: string;
-	extraUvArgs?: string[];
 }
 
 function errorMessage(error: unknown): string {
@@ -280,35 +266,21 @@ async function readBootstrapVersion(venv: string): Promise<BootstrapVersion | nu
 		const raw = await readFile(path.join(venv, BOOTSTRAP_VERSION_FILE), "utf8");
 		const parsed: unknown = JSON.parse(raw);
 		if (!isRecord(parsed) || typeof parsed.schema !== "number") return null;
-		const extraUvArgs =
-			Array.isArray(parsed.extraUvArgs) &&
-			parsed.extraUvArgs.every((v: unknown): v is string => typeof v === "string")
-				? (parsed.extraUvArgs as string[])
-				: undefined;
 		return {
 			schema: parsed.schema,
 			ipykernel: typeof parsed.ipykernel === "string" ? parsed.ipykernel : undefined,
 			runtime: typeof parsed.runtime === "string" ? parsed.runtime : undefined,
-			extraUvArgs,
 		};
 	} catch {
 		return null;
 	}
 }
 
-function extraUvArgsMatch(a: string[] | undefined, b: string[] | undefined): boolean {
-	if (a === b) return true;
-	if (!a || !b) return false;
-	if (a.length !== b.length) return false;
-	return a.every((v, i) => v === b[i]);
-}
-
 function bootstrapVersionCurrent(version: BootstrapVersion | null): boolean {
 	return (
 		version?.schema === BOOTSTRAP_SCHEMA &&
 		version.ipykernel === IPYKERNEL_REQUIREMENT &&
-		version.runtime === RUNTIME_REQUIREMENT &&
-		extraUvArgsMatch(version.extraUvArgs, DEFAULT_RLM_EXTRA_UV_ARGS)
+		version.runtime === RUNTIME_REQUIREMENT
 	);
 }
 
@@ -317,7 +289,6 @@ async function writeBootstrapVersion(venv: string): Promise<void> {
 		schema: BOOTSTRAP_SCHEMA,
 		ipykernel: IPYKERNEL_REQUIREMENT,
 		runtime: RUNTIME_REQUIREMENT,
-		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
 	};
 	await writeFile(path.join(venv, BOOTSTRAP_VERSION_FILE), `${JSON.stringify(version)}\n`, "utf8");
 }
@@ -347,15 +318,7 @@ async function bootstrapVenv(venv: string): Promise<void> {
 
 	await run(uv, ["python", "install", PYTHON_VERSION]);
 	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"]);
-	await run(uv, [
-		"pip",
-		"install",
-		"--python",
-		python,
-		IPYKERNEL_REQUIREMENT,
-		runtimeRequirement,
-		...DEFAULT_RLM_EXTRA_UV_ARGS,
-	]);
+	await run(uv, ["pip", "install", "--python", python, IPYKERNEL_REQUIREMENT, runtimeRequirement]);
 	await writeBootstrapVersion(venv);
 }
 
