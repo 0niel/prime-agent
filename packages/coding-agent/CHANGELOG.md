@@ -2,11 +2,6 @@
 
 ## [Unreleased]
 
-### Added
-
-- Added default extra Python packages (requests, httpx, pyyaml, tomli, python-dotenv, pandas, numpy, scipy, beautifulsoup4, lxml, pydantic) to the kernel venv bootstrap and system prompt.
-
-
 ## [0.0.2] - 2026-05-20
 
 ### Added
