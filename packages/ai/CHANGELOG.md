@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed OAuth callback pages to use Prime butterfly branding on a black background.
+
 ## [0.0.4] - 2026-05-21
 
 ## [0.0.2] - 2026-05-20
