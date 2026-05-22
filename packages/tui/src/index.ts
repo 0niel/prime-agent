@@ -63,6 +63,28 @@ export { VersionedRenderCache } from "./render-cache.js";
 export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.js";
 // Terminal interface and implementations
 export { ProcessTerminal, type Terminal } from "./terminal.js";
+export {
+	bestAnsiColor,
+	blendColor,
+	clearDefaultTerminalColors,
+	type DefaultTerminalColors,
+	detectBackgroundFromColorFgBg,
+	getDefaultTerminalColors,
+	getTerminalBackgroundKind,
+	isLightColor,
+	type OscColorKind,
+	type OscColorResponse,
+	onDefaultTerminalColorsChange,
+	parseOscColorResponse,
+	QUERY_DEFAULT_BACKGROUND,
+	QUERY_DEFAULT_FOREGROUND,
+	type Rgb,
+	rgbTo256,
+	rgbToHex,
+	setDefaultTerminalColors,
+	type TerminalBackgroundKind,
+	type TerminalColorMode,
+} from "./terminal-colors.js";
 // Terminal image support
 export {
 	allocateImageId,

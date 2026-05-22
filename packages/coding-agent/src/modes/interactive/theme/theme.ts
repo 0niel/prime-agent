@@ -1,6 +1,18 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { EditorTheme, MarkdownTheme, SelectListTheme } from "@earendil-works/pi-tui";
+import {
+	bestAnsiColor,
+	blendColor,
+	type EditorTheme,
+	getDefaultTerminalColors,
+	getTerminalBackgroundKind,
+	isLightColor,
+	type MarkdownTheme,
+	onDefaultTerminalColorsChange,
+	type Rgb,
+	rgbTo256,
+	type SelectListTheme,
+} from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { highlight, supportsLanguage } from "cli-highlight";
 import { type Static, Type } from "typebox";
@@ -154,6 +166,12 @@ export type ThemeBg =
 
 type ColorMode = "truecolor" | "256color";
 
+const ADAPTIVE_LIGHT_BG_ACCENT: Rgb = { r: 0, g: 95, b: 135 };
+const DARK_EDITOR_SURFACE_ALPHA = 0.06;
+const LIGHT_EDITOR_SURFACE_ALPHA = 0.04;
+const BLACK: Rgb = { r: 0, g: 0, b: 0 };
+const WHITE: Rgb = { r: 255, g: 255, b: 255 };
+
 // ============================================================================
 // Color Utilities
 // ============================================================================
@@ -199,82 +217,8 @@ function hexToRgb(hex: string): { r: number; g: number; b: number } {
 	return { r, g, b };
 }
 
-// The 6x6x6 color cube channel values (indices 0-5)
-const CUBE_VALUES = [0, 95, 135, 175, 215, 255];
-
-// Grayscale ramp values (indices 232-255, 24 grays from 8 to 238)
-const GRAY_VALUES = Array.from({ length: 24 }, (_, i) => 8 + i * 10);
-
-function findClosestCubeIndex(value: number): number {
-	let minDist = Infinity;
-	let minIdx = 0;
-	for (let i = 0; i < CUBE_VALUES.length; i++) {
-		const dist = Math.abs(value - CUBE_VALUES[i]);
-		if (dist < minDist) {
-			minDist = dist;
-			minIdx = i;
-		}
-	}
-	return minIdx;
-}
-
-function findClosestGrayIndex(gray: number): number {
-	let minDist = Infinity;
-	let minIdx = 0;
-	for (let i = 0; i < GRAY_VALUES.length; i++) {
-		const dist = Math.abs(gray - GRAY_VALUES[i]);
-		if (dist < minDist) {
-			minDist = dist;
-			minIdx = i;
-		}
-	}
-	return minIdx;
-}
-
-function colorDistance(r1: number, g1: number, b1: number, r2: number, g2: number, b2: number): number {
-	// Weighted Euclidean distance (human eye is more sensitive to green)
-	const dr = r1 - r2;
-	const dg = g1 - g2;
-	const db = b1 - b2;
-	return dr * dr * 0.299 + dg * dg * 0.587 + db * db * 0.114;
-}
-
-function rgbTo256(r: number, g: number, b: number): number {
-	// Find closest color in the 6x6x6 cube
-	const rIdx = findClosestCubeIndex(r);
-	const gIdx = findClosestCubeIndex(g);
-	const bIdx = findClosestCubeIndex(b);
-	const cubeR = CUBE_VALUES[rIdx];
-	const cubeG = CUBE_VALUES[gIdx];
-	const cubeB = CUBE_VALUES[bIdx];
-	const cubeIndex = 16 + 36 * rIdx + 6 * gIdx + bIdx;
-	const cubeDist = colorDistance(r, g, b, cubeR, cubeG, cubeB);
-
-	// Find closest grayscale
-	const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
-	const grayIdx = findClosestGrayIndex(gray);
-	const grayValue = GRAY_VALUES[grayIdx];
-	const grayIndex = 232 + grayIdx;
-	const grayDist = colorDistance(r, g, b, grayValue, grayValue, grayValue);
-
-	// Check if color has noticeable saturation (hue matters)
-	// If max-min spread is significant, prefer cube to preserve tint
-	const maxC = Math.max(r, g, b);
-	const minC = Math.min(r, g, b);
-	const spread = maxC - minC;
-
-	// Only consider grayscale if color is nearly neutral (spread < 10)
-	// AND grayscale is actually closer
-	if (spread < 10 && grayDist < cubeDist) {
-		return grayIndex;
-	}
-
-	return cubeIndex;
-}
-
 function hexTo256(hex: string): number {
-	const { r, g, b } = hexToRgb(hex);
-	return rgbTo256(r, g, b);
+	return rgbTo256(hexToRgb(hex));
 }
 
 function fgAnsi(color: string | number, mode: ColorMode): string {
@@ -378,6 +322,34 @@ export class Theme {
 		const ansi = this.bgColors.get(color);
 		if (!ansi) throw new Error(`Unknown theme background color: ${color}`);
 		return `${ansi}${text}\x1b[49m`; // Reset only background color
+	}
+
+	getEditorBackgroundColor(): ((str: string) => string) | undefined {
+		const terminalBg = getDefaultTerminalColors()?.background;
+		if (!terminalBg) {
+			return undefined;
+		}
+
+		const top = isLightColor(terminalBg) ? BLACK : WHITE;
+		const alpha = isLightColor(terminalBg) ? LIGHT_EDITOR_SURFACE_ALPHA : DARK_EDITOR_SURFACE_ALPHA;
+		const color = bestAnsiColor(blendColor(top, terminalBg, alpha), this.mode);
+		if (color === "") {
+			return undefined;
+		}
+		const ansi = bgAnsi(color, this.mode);
+		return (str: string) => `${ansi}${str}\x1b[49m`;
+	}
+
+	getUserMessageBackgroundColor(): (str: string) => string {
+		return (str: string) => this.getEditorBackgroundColor()?.(str) ?? str;
+	}
+
+	getAdaptiveAccentColor(): (str: string) => string {
+		const ansi =
+			getTerminalBackgroundKind() === "light"
+				? fgAnsi(bestAnsiColor(ADAPTIVE_LIGHT_BG_ACCENT, this.mode), this.mode)
+				: "\x1b[36m";
+		return (str: string) => `${ansi}\x1b[1m${str}\x1b[22m\x1b[39m`;
 	}
 
 	bold(text: string): string {
@@ -636,18 +608,7 @@ export function getThemeByName(name: string): Theme | undefined {
 }
 
 function detectTerminalBackground(): "dark" | "light" {
-	const colorfgbg = process.env.COLORFGBG || "";
-	if (colorfgbg) {
-		const parts = colorfgbg.split(";");
-		if (parts.length >= 2) {
-			const bg = parseInt(parts[1], 10);
-			if (!Number.isNaN(bg)) {
-				const result = bg < 8 ? "dark" : "light";
-				return result;
-			}
-		}
-	}
-	return "dark";
+	return getTerminalBackgroundKind() ?? "dark";
 }
 
 function getDefaultTheme(): string {
@@ -677,10 +638,29 @@ function setGlobalTheme(t: Theme): void {
 }
 
 let currentThemeName: string | undefined;
+let currentThemeIsAutomatic = false;
 let themeWatcher: fs.FSWatcher | undefined;
 let themeReloadTimer: NodeJS.Timeout | undefined;
 let onThemeChangeCallback: (() => void) | undefined;
 const registeredThemes = new Map<string, Theme>();
+
+onDefaultTerminalColorsChange(() => {
+	if (currentThemeIsAutomatic) {
+		const name = getDefaultTheme();
+		if (name !== currentThemeName) {
+			currentThemeName = name;
+			try {
+				setGlobalTheme(loadTheme(name));
+			} catch {
+				currentThemeName = "dark";
+				setGlobalTheme(loadTheme("dark"));
+			}
+		}
+	}
+	if (onThemeChangeCallback) {
+		onThemeChangeCallback();
+	}
+});
 
 export function setRegisteredThemes(themes: Theme[]): void {
 	registeredThemes.clear();
@@ -694,6 +674,7 @@ export function setRegisteredThemes(themes: Theme[]): void {
 export function initTheme(themeName?: string, enableWatcher: boolean = false): void {
 	const name = themeName ?? getDefaultTheme();
 	currentThemeName = name;
+	currentThemeIsAutomatic = themeName === undefined;
 	try {
 		setGlobalTheme(loadTheme(name));
 		if (enableWatcher) {
@@ -709,6 +690,7 @@ export function initTheme(themeName?: string, enableWatcher: boolean = false): v
 
 export function setTheme(name: string, enableWatcher: boolean = false): { success: boolean; error?: string } {
 	currentThemeName = name;
+	currentThemeIsAutomatic = false;
 	try {
 		setGlobalTheme(loadTheme(name));
 		if (enableWatcher) {
@@ -733,6 +715,7 @@ export function setTheme(name: string, enableWatcher: boolean = false): { succes
 export function setThemeInstance(themeInstance: Theme): void {
 	setGlobalTheme(themeInstance);
 	currentThemeName = "<in-memory>";
+	currentThemeIsAutomatic = false;
 	stopThemeWatcher(); // Can't watch a direct instance
 	if (onThemeChangeCallback) {
 		onThemeChangeCallback();
@@ -741,6 +724,9 @@ export function setThemeInstance(themeInstance: Theme): void {
 
 export function onThemeChange(callback: () => void): void {
 	onThemeChangeCallback = callback;
+	if (getDefaultTerminalColors()) {
+		callback();
+	}
 }
 
 function startThemeWatcher(): void {
@@ -1133,8 +1119,8 @@ export function getSelectListTheme(): SelectListTheme {
 
 export function getEditorTheme(): EditorTheme {
 	return {
-		borderColor: (text: string) => theme.fg("borderMuted", text),
-		backgroundColor: (text: string) => theme.bg("userMessageBg", text),
+		borderColor: theme.getAdaptiveAccentColor(),
+		backgroundColor: theme.getEditorBackgroundColor(),
 		selectList: getSelectListTheme(),
 	};
 }

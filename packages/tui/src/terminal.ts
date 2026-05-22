@@ -3,6 +3,13 @@ import { createRequire } from "node:module";
 import * as path from "node:path";
 import { setKittyProtocolActive } from "./keys.js";
 import { StdinBuffer } from "./stdin-buffer.js";
+import {
+	parseOscColorResponse,
+	QUERY_DEFAULT_BACKGROUND,
+	QUERY_DEFAULT_FOREGROUND,
+	type Rgb,
+	setDefaultTerminalColors,
+} from "./terminal-colors.js";
 
 const cjsRequire = createRequire(import.meta.url);
 
@@ -69,6 +76,11 @@ export class ProcessTerminal implements Terminal {
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
 	private progressInterval?: ReturnType<typeof setInterval>;
+	private defaultColorProbe?: {
+		foreground?: Rgb;
+		background?: Rgb;
+		timeout: ReturnType<typeof setTimeout>;
+	};
 	private writeLogPath = (() => {
 		const env = process.env.PI_TUI_WRITE_LOG || "";
 		if (!env) return "";
@@ -140,6 +152,10 @@ export class ProcessTerminal implements Terminal {
 
 		// Forward individual sequences to the input handler
 		this.stdinBuffer.on("data", (sequence) => {
+			if (this.handleDefaultColorProbeResponse(sequence)) {
+				return;
+			}
+
 			// Check for Kitty protocol response (only if not already enabled)
 			if (!this._kittyProtocolActive) {
 				const match = sequence.match(kittyResponsePattern);
@@ -192,6 +208,7 @@ export class ProcessTerminal implements Terminal {
 	private queryAndEnableKittyProtocol(): void {
 		this.setupStdinBuffer();
 		process.stdin.on("data", this.stdinDataHandler!);
+		this.queryDefaultTerminalColors();
 		process.stdout.write("\x1b[?u");
 		setTimeout(() => {
 			if (!this._kittyProtocolActive && !this._modifyOtherKeysActive) {
@@ -199,6 +216,48 @@ export class ProcessTerminal implements Terminal {
 				this._modifyOtherKeysActive = true;
 			}
 		}, 150);
+	}
+
+	private queryDefaultTerminalColors(): void {
+		if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
+			return;
+		}
+		this.finishDefaultColorProbe();
+		this.defaultColorProbe = {
+			timeout: setTimeout(() => this.finishDefaultColorProbe(), 100),
+		};
+		process.stdout.write(QUERY_DEFAULT_FOREGROUND);
+		process.stdout.write(QUERY_DEFAULT_BACKGROUND);
+	}
+
+	private handleDefaultColorProbeResponse(sequence: string): boolean {
+		const response = parseOscColorResponse(sequence);
+		if (!response) {
+			return false;
+		}
+		if (!this.defaultColorProbe) {
+			return true;
+		}
+
+		this.defaultColorProbe[response.kind] = response.rgb;
+		if (this.defaultColorProbe.foreground && this.defaultColorProbe.background) {
+			this.finishDefaultColorProbe();
+		}
+		return true;
+	}
+
+	private finishDefaultColorProbe(): void {
+		if (!this.defaultColorProbe) {
+			return;
+		}
+
+		const { foreground, background, timeout } = this.defaultColorProbe;
+		clearTimeout(timeout);
+		this.defaultColorProbe = undefined;
+		if (foreground && background) {
+			setDefaultTerminalColors({ foreground, background });
+			this.resizeHandler?.();
+		}
 	}
 
 	/**
@@ -269,6 +328,8 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	stop(): void {
+		this.finishDefaultColorProbe();
+
 		if (this.clearProgressInterval()) {
 			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}

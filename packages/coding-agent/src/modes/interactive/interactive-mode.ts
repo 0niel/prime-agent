@@ -3927,8 +3927,9 @@ export class InteractiveMode {
 			this.editor.borderColor = theme.getBashModeBorderColor();
 			this.editor.backgroundColor = (str: string) => theme.bg("toolSuccessBg", str);
 		} else {
-			this.editor.borderColor = (str: string) => theme.fg("text", str);
-			this.editor.backgroundColor = (str: string) => theme.bg("userMessageBg", str);
+			const editorTheme = getEditorTheme();
+			this.editor.borderColor = editorTheme.borderColor;
+			this.editor.backgroundColor = editorTheme.backgroundColor;
 		}
 		this.ui.requestRender();
 	}
