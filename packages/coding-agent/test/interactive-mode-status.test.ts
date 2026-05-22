@@ -33,6 +33,49 @@ function normalizeRenderedOutput(container: Container, width = 220): string {
 		.trim();
 }
 
+describe("InteractiveMode update notifications", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	test("shows the Prime Agent update command in one compact line", () => {
+		const chatContainer = new Container();
+		const fakeThis = {
+			chatContainer,
+			ui: { requestRender: vi.fn() },
+		} as unknown as InteractiveMode;
+
+		InteractiveMode.prototype.showNewVersionNotification.call(fakeThis, "1.2.3");
+
+		const output = normalizeRenderedOutput(chatContainer);
+		expect(chatContainer.children).toHaveLength(1);
+		expect(output.split("\n")).toHaveLength(1);
+		expect(output).toContain("Update available:");
+		expect(output).toContain("v1.2.3");
+		expect(output).toContain("prime-agent update");
+		expect(output).not.toContain("pi update");
+		expect(output).not.toContain("Changelog:");
+	});
+
+	test("shows package updates in one compact line", () => {
+		const chatContainer = new Container();
+		const fakeThis = {
+			chatContainer,
+			ui: { requestRender: vi.fn() },
+		} as unknown as InteractiveMode;
+
+		InteractiveMode.prototype.showPackageUpdateNotification.call(fakeThis, ["npm:@foo/bar"]);
+
+		const output = normalizeRenderedOutput(chatContainer);
+		expect(chatContainer.children).toHaveLength(1);
+		expect(output.split("\n")).toHaveLength(1);
+		expect(output).toContain("Package updates available:");
+		expect(output).toContain("npm:@foo/bar");
+		expect(output).toContain("prime-agent update --extensions");
+		expect(output).not.toContain("pi update");
+	});
+});
+
 type ExtensionFixture = {
 	path: string;
 	sourceInfo?: SourceInfo;

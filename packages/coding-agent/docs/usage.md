@@ -131,10 +131,10 @@ pi [options] [@files...] [messages...]
 pi install <source> [-l]     # Install package, -l for project-local
 pi remove <source> [-l]      # Remove package
 pi uninstall <source> [-l]   # Alias for remove
-pi update [source|self|pi]   # Update Prime Agent and packages; skips pinned packages
-pi update --extensions       # Update packages only
-pi update --self             # Update Prime Agent only
-pi update --extension <src>  # Update one package
+prime-agent update [source|self|prime-agent]   # Update Prime Agent and packages; skips pinned packages
+prime-agent update --extensions                # Update packages only
+prime-agent update --self                      # Update Prime Agent only
+prime-agent update --extension <src>           # Update one package
 pi list                      # List installed packages
 pi config                    # Enable/disable package resources
 ```

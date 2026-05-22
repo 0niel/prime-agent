@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed update notifications and package docs to point at `prime-agent update` and use compact one-line alerts.
+
 ## [0.0.4] - 2026-05-21
 
 ### Added
@@ -56,4 +60,3 @@
 - Removed the RLM background API; recursive agents now use `rlm()`/`rlm.run()` with normal Python async tasks for background work.
 - Removed the legacy `read`, `write`, `grep`, `find`, and `ls` built-in tools.
 - Removed the local TPS extension that posted token/cache stats after each agent response.
-

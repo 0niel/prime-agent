@@ -394,11 +394,11 @@ pi install ssh://git@github.com/user/repo@v1    # tag or commit
 pi remove npm:@foo/pi-tools
 pi uninstall npm:@foo/pi-tools          # alias for remove
 pi list
-pi update                               # update Prime Agent and packages (skips pinned packages)
-pi update --extensions                  # update packages only
-pi update --self                        # update Prime Agent only
-pi update --self --force                # reinstall Prime Agent even if current
-pi update npm:@foo/pi-tools             # update one package
+prime-agent update                      # update Prime Agent and packages (skips pinned packages)
+prime-agent update --extensions         # update packages only
+prime-agent update --self               # update Prime Agent only
+prime-agent update --self --force       # reinstall Prime Agent even if current
+prime-agent update npm:@foo/pi-tools    # update one package
 pi config                               # enable/disable extensions, skills, prompts, themes
 ```
 
@@ -493,11 +493,11 @@ pi [options] [@files...] [messages...]
 pi install <source> [-l]     # Install package, -l for project-local
 pi remove <source> [-l]      # Remove package
 pi uninstall <source> [-l]   # Alias for remove
-pi update [source|self|pi]   # Update Prime Agent and packages (skips pinned packages)
-pi update --extensions       # Update packages only
-pi update --self             # Update Prime Agent only
-pi update --self --force     # Reinstall Prime Agent even if current
-pi update --extension <src>  # Update one package
+prime-agent update [source|self|prime-agent]   # Update Prime Agent and packages (skips pinned packages)
+prime-agent update --extensions                # Update packages only
+prime-agent update --self                      # Update Prime Agent only
+prime-agent update --self --force              # Reinstall Prime Agent even if current
+prime-agent update --extension <src>           # Update one package
 pi list                      # List installed packages
 pi config                    # Enable/disable package resources
 ```
