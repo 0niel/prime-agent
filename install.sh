@@ -11,7 +11,37 @@ prime_agent_package="${PRIME_AGENT_PACKAGE:-prime-agent}"
 prime_agent_cmd="${PRIME_AGENT_CMD:-prime-agent}"
 prime_agent_esc=$(printf '\033')
 prime_agent_original_path="${PATH:-}"
+prime_agent_reset="${prime_agent_esc}[0m"
+prime_agent_bold="${prime_agent_esc}[1m"
+prime_agent_hide_cursor="${prime_agent_esc}[?25l"
+prime_agent_show_cursor="${prime_agent_esc}[?25h"
+prime_agent_home_cursor="${prime_agent_esc}[H"
+prime_agent_clear_screen="${prime_agent_esc}[2J${prime_agent_esc}[H"
+prime_agent_sync_start="${prime_agent_esc}[?2026h"
+prime_agent_sync_end="${prime_agent_esc}[?2026l"
+prime_agent_color_text="${prime_agent_esc}[38;2;244;244;245m"
+prime_agent_color_muted="${prime_agent_esc}[38;2;161;161;170m"
+prime_agent_color_dim="${prime_agent_esc}[38;2;113;113;122m"
+prime_agent_color_primary="${prime_agent_esc}[38;2;127;91;213m"
+prime_agent_color_scan="${prime_agent_esc}[38;2;14;165;233m"
+prime_agent_color_warning="${prime_agent_esc}[38;2;245;158;11m"
 readonly prime_agent_unconfigured_base_url prime_agent_base_url prime_agent_package prime_agent_cmd prime_agent_esc prime_agent_original_path
+readonly prime_agent_reset prime_agent_bold prime_agent_hide_cursor prime_agent_show_cursor prime_agent_home_cursor prime_agent_clear_screen
+readonly prime_agent_sync_start prime_agent_sync_end
+readonly prime_agent_color_text prime_agent_color_muted prime_agent_color_dim prime_agent_color_primary prime_agent_color_scan prime_agent_color_warning
+
+prime_agent_screen_enabled=0
+prime_agent_screen_frame=0
+prime_agent_screen_cols=80
+prime_agent_screen_rows=24
+prime_agent_screen_drawn=0
+prime_agent_screen_last_cols=0
+prime_agent_screen_last_rows=0
+prime_agent_download_dir=
+prime_agent_screen_title=
+prime_agent_screen_status=
+prime_agent_screen_detail=
+prime_agent_screen_question=
 
 main() {
 	if [ "$prime_agent_base_url" = "$prime_agent_unconfigured_base_url" ]; then
@@ -20,9 +50,15 @@ main() {
 		exit 1
 	fi
 
-	start_preflight_checks
+	prime_agent_install_traps
+	prime_agent_init_screen
+	if [ "$prime_agent_screen_enabled" = 1 ]; then
+		prime_agent_screen "Installing Prime Agent" "" "" ""
+	else
+		printf '\n\033[1m  Installing Prime Agent\033[0m\n\033[2m  npm global install\033[0m\n\n'
+	fi
 
-	printf '\n\033[1m  Prime Agent Installer\033[0m\n\033[2m  Installing Prime Agent with npm.\033[0m\n\n'
+	start_preflight_checks
 
 	if finish_preflight_checks; then
 		check_status=0
@@ -51,26 +87,36 @@ main() {
 	tarball_name="$prime_agent_package-$version.tgz"
 	tarball_url="$prime_agent_base_url/releases/v$version/$tarball_name"
 
-	printf 'This will download, verify, and install:\n\n  %s\n\n' "$tarball_url"
-	confirm_install
+	confirm_install "$version" "$tarball_url"
 
 	download_dir=$(create_temp_dir)
-	trap 'rm -rf "$download_dir"' EXIT
+	prime_agent_download_dir="$download_dir"
 	tarball_path="$download_dir/$tarball_name"
 
-	printf '\n'
 	download_prime_agent_package "$version" "$tarball_url" "$tarball_path"
-	printf '\n'
 	install_prime_agent_package "$tarball_path"
 	rm -rf "$download_dir"
-	trap - EXIT
-	printf '\nPrime Agent was installed successfully.\n'
+	prime_agent_download_dir=
 
 	if [ "${PRIME_AGENT_NODE_INSTALLED_STANDALONE:-0}" = 1 ]; then
+		prime_agent_screen "Prime Agent installed" "" "Checking your shell PATH." ""
+		prime_agent_restore_terminal
+		printf '\n'
 		configure_standalone_node_path
 	elif command -v "$prime_agent_cmd" >/dev/null 2>&1; then
-		printf '\nRun it with: %s\n' "$prime_agent_cmd"
+		if [ "$prime_agent_screen_enabled" = 1 ]; then
+			prime_agent_screen "Prime Agent installed" "" "Run it with: $prime_agent_cmd" ""
+		else
+			printf '\nPrime Agent was installed successfully.\n'
+			printf '\nRun it with: %s\n' "$prime_agent_cmd"
+		fi
 	else
+		if [ "$prime_agent_screen_enabled" = 1 ]; then
+			prime_agent_screen "Prime Agent installed" "" "PATH update needed for $prime_agent_cmd." ""
+			prime_agent_restore_terminal
+		else
+			printf '\nPrime Agent was installed successfully.\n'
+		fi
 		cat <<EOF
 The $prime_agent_cmd command was installed, but it is not on your PATH yet.
 Check npm's global bin directory with:
@@ -94,6 +140,524 @@ create_temp_dir() {
 	exit 1
 }
 
+prime_agent_install_traps() {
+	trap 'prime_agent_cleanup' EXIT
+	trap 'prime_agent_signal_cleanup 130' INT
+	trap 'prime_agent_signal_cleanup 143' TERM
+}
+
+prime_agent_cleanup() {
+	status=$?
+	if [ -n "${prime_agent_download_dir:-}" ] && [ -d "$prime_agent_download_dir" ]; then
+		rm -rf "$prime_agent_download_dir"
+	fi
+	prime_agent_restore_terminal
+	return "$status"
+}
+
+prime_agent_signal_cleanup() {
+	prime_agent_restore_terminal
+	exit "$1"
+}
+
+prime_agent_restore_terminal() {
+	if [ "${prime_agent_screen_enabled:-0}" = 1 ]; then
+		if ( : <>/dev/tty ) 2>/dev/null; then
+			printf '%s%s' "$prime_agent_reset" "$prime_agent_show_cursor" >/dev/tty
+		else
+			printf '%s%s' "$prime_agent_reset" "$prime_agent_show_cursor" >&2
+		fi
+	fi
+}
+
+prime_agent_init_screen() {
+	if [ "${PRIME_AGENT_INSTALLER_PLAIN:-0}" = 1 ]; then
+		return
+	fi
+	if [ ! -t 1 ]; then
+		return
+	fi
+	if [ "${TERM:-}" = dumb ]; then
+		return
+	fi
+	prime_agent_screen_enabled=1
+}
+
+prime_agent_read_terminal_size() {
+	prime_agent_screen_cols=80
+	prime_agent_screen_rows=24
+
+	if size=$(stty size 2>/dev/null </dev/tty); then
+		set -- $size
+		if [ "${1:-}" ] && [ "${2:-}" ]; then
+			case "$1" in *[!0-9]*|"") ;; *) prime_agent_screen_rows="$1" ;; esac
+			case "$2" in *[!0-9]*|"") ;; *) prime_agent_screen_cols="$2" ;; esac
+		fi
+	fi
+
+	if [ "$prime_agent_screen_cols" -lt 1 ]; then
+		prime_agent_screen_cols=80
+	fi
+	if [ "$prime_agent_screen_rows" -lt 1 ]; then
+		prime_agent_screen_rows=24
+	fi
+}
+
+prime_agent_screen() {
+	if [ "$prime_agent_screen_enabled" != 1 ]; then
+		return
+	fi
+
+	prime_agent_screen_title="${2:-$1}"
+	if [ -z "$prime_agent_screen_title" ]; then
+		prime_agent_screen_title="$1"
+	fi
+	prime_agent_screen_status=
+	prime_agent_screen_detail="${3:-}"
+	prime_agent_screen_question="${4:-}"
+	prime_agent_screen_frame=$((prime_agent_screen_frame + 1))
+	prime_agent_read_terminal_size
+
+	if [ "$prime_agent_screen_drawn" = 0 ] ||
+		[ "$prime_agent_screen_cols" -ne "$prime_agent_screen_last_cols" ] ||
+		[ "$prime_agent_screen_rows" -ne "$prime_agent_screen_last_rows" ]; then
+		prime_agent_screen_prefix="${prime_agent_reset}${prime_agent_clear_screen}${prime_agent_hide_cursor}"
+		prime_agent_screen_drawn=1
+		prime_agent_screen_last_cols="$prime_agent_screen_cols"
+		prime_agent_screen_last_rows="$prime_agent_screen_rows"
+	else
+		prime_agent_screen_prefix="${prime_agent_reset}${prime_agent_home_cursor}${prime_agent_hide_cursor}"
+	fi
+	prime_agent_screen_frame_text=$(prime_agent_render_screen)
+
+	if ( : <>/dev/tty ) 2>/dev/null; then
+		printf '%s%s%s\n%s' "$prime_agent_sync_start" "$prime_agent_screen_prefix" "$prime_agent_screen_frame_text" "$prime_agent_sync_end" >/dev/tty
+	else
+		printf '%s%s%s\n%s' "$prime_agent_sync_start" "$prime_agent_screen_prefix" "$prime_agent_screen_frame_text" "$prime_agent_sync_end" >&2
+	fi
+}
+
+prime_agent_render_screen() {
+	content_height=$(prime_agent_content_height)
+	top=$(((prime_agent_screen_rows - content_height) / 2))
+	if [ "$top" -lt 0 ]; then
+		top=0
+	fi
+
+	y=0
+	while [ "$y" -lt "$prime_agent_screen_rows" ]; do
+		content_index=$((y - top))
+		prime_agent_content_line "$content_index"
+		if [ "${prime_agent_content_is_set:-0}" = 1 ]; then
+			prime_agent_print_centered_line "$prime_agent_content_text" "$prime_agent_content_width" "$prime_agent_content_style"
+		else
+			prime_agent_print_centered_line "" 0 ""
+		fi
+		y=$((y + 1))
+	done
+}
+
+prime_agent_content_height() {
+	height=2
+	if prime_agent_show_logo; then
+		height=$((height + 15))
+	fi
+	printf '%s' "$height"
+}
+
+prime_agent_show_logo() {
+	[ "$prime_agent_screen_rows" -ge 22 ] && [ "$prime_agent_screen_cols" -ge 42 ]
+}
+
+prime_agent_content_line() {
+	index="$1"
+	prime_agent_content_is_set=0
+	prime_agent_content_text=
+	prime_agent_content_width=0
+	prime_agent_content_style=
+
+	if prime_agent_show_logo; then
+		case "$index" in
+			0|1|2|3|4|5|6|7|8|9|10|11|12|13) prime_agent_set_lab_line "$index" ;;
+			14) prime_agent_set_blank_line ;;
+		esac
+		if [ "$prime_agent_content_is_set" = 1 ]; then
+			return
+		fi
+		index=$((index - 15))
+	fi
+
+	if [ "$index" -lt 0 ]; then
+		return
+	fi
+
+	if [ "$index" -eq 0 ]; then
+		if [ -n "$prime_agent_screen_question" ]; then
+			prime_agent_set_text_line "$(prime_agent_screen_primary_text)" "$prime_agent_bold$prime_agent_color_text"
+		else
+			prime_agent_set_text_line "$prime_agent_screen_title" "$prime_agent_bold$prime_agent_color_primary"
+		fi
+		return
+	fi
+
+	if [ "$index" -eq 1 ]; then
+		if [ -n "$prime_agent_screen_question" ]; then
+			prime_agent_set_text_line "Press Enter to continue; type n to cancel." "$prime_agent_color_muted"
+		elif [ -n "$prime_agent_screen_detail" ]; then
+			prime_agent_set_text_line "$prime_agent_screen_detail" "$prime_agent_color_muted"
+		else
+			prime_agent_set_blank_line
+		fi
+		return
+	fi
+}
+
+prime_agent_screen_primary_text() {
+	if [ -z "$prime_agent_screen_question" ]; then
+		printf '%s' "$prime_agent_screen_title"
+		return
+	fi
+
+	case "$prime_agent_screen_question" in
+		*'[Y/n]'*) printf '%s [Y/n] >' "$prime_agent_screen_title" ;;
+		*) printf '%s %s' "$prime_agent_screen_title" "$prime_agent_screen_question" ;;
+	esac
+}
+
+prime_agent_set_lab_line() {
+	lab_row="$1"
+	prime_agent_lab_width=$((prime_agent_screen_cols - 6))
+	if [ "$prime_agent_lab_width" -gt 78 ]; then
+		prime_agent_lab_width=78
+	fi
+	if [ "$prime_agent_lab_width" -lt 42 ]; then
+		prime_agent_lab_width=42
+	fi
+
+	logo_line=$(prime_agent_logo_line "$lab_row")
+	if [ -n "$logo_line" ]; then
+		logo_start=$(((prime_agent_lab_width - 32) / 2))
+		logo_end=$((logo_start + 32))
+		left=$(prime_agent_lab_background_range "$lab_row" 0 "$logo_start")
+		right=$(prime_agent_lab_background_range "$lab_row" "$logo_end" "$prime_agent_lab_width")
+		trace="${left}${prime_agent_color_text}${logo_line}${prime_agent_reset}${right}"
+	else
+		trace=$(prime_agent_lab_background_range "$lab_row" 0 "$prime_agent_lab_width")
+	fi
+
+	prime_agent_content_is_set=1
+	prime_agent_content_text="$trace"
+	prime_agent_content_width="$prime_agent_lab_width"
+	prime_agent_content_style=
+}
+
+prime_agent_logo_line() {
+	case "$1" in
+		2) printf '                          ▄▄███▀' ;;
+		3) printf '    ▄▄▄▄▄              ▄█████▀' ;;
+		4) printf '    ██████▄         ▄██████▀' ;;
+		5) printf '   ▄███▀███▄     ▄███▀▄██▀' ;;
+		6) printf '   ███ ▄████▄▄▄████▀▄▄██' ;;
+		7) printf '  ▀██  ▀█████████▀▀▀▀▀▀' ;;
+		8) printf '  ▄██   ██████▀▀ ▄███' ;;
+		9) printf ' █████    ▀█▄▄▄█████▀' ;;
+		10) printf '███████▄  ████████▀' ;;
+		11) printf '▀███▀▀    █████▀' ;;
+	esac
+}
+
+prime_agent_lab_background_range() {
+	lab_row="$1"
+	range_start="$2"
+	range_end="$3"
+	active_style=
+	line=
+	x="$range_start"
+	while [ "$x" -lt "$range_end" ]; do
+		prime_agent_lab_cell "$x" "$lab_row"
+		if [ "$prime_agent_lab_cell_style" != "$active_style" ]; then
+			if [ -n "$active_style" ]; then
+				line="${line}${prime_agent_reset}"
+			fi
+			if [ -n "$prime_agent_lab_cell_style" ]; then
+				line="${line}${prime_agent_lab_cell_style}"
+			fi
+			active_style="$prime_agent_lab_cell_style"
+		fi
+		line="${line}${prime_agent_lab_cell_char}"
+		x=$((x + 1))
+	done
+	if [ -n "$active_style" ]; then
+		line="${line}${prime_agent_reset}"
+	fi
+	printf '%s' "$line"
+}
+
+prime_agent_lab_cell() {
+	x="$1"
+	y="$2"
+	width="$prime_agent_lab_width"
+	height=14
+	frame="$prime_agent_screen_frame"
+	prime_agent_lab_cell_char=" "
+	prime_agent_lab_cell_style=
+
+	hash=$(((x * 37 + y * 53 + frame * 11 + x * y * 3) % 101))
+	if [ "$hash" -lt 3 ]; then
+		prime_agent_lab_cell_char="·"
+		prime_agent_lab_cell_style="$prime_agent_color_dim"
+	fi
+
+	center_x=$((width * 36 / 100))
+	center_y=$((height * 54 / 100))
+	dx=$((x - center_x))
+	dy=$((y - center_y))
+	if [ "$dx" -lt 0 ]; then
+		dx=$((-dx))
+	fi
+	if [ "$dy" -lt 0 ]; then
+		dy=$((-dy))
+	fi
+	contour=$((dx + dy * 4 + x / 6 - frame))
+	if [ "$x" -lt $((width * 82 / 100)) ] && [ $(((contour % 24 + 24) % 24)) -eq 12 ]; then
+		if [ $(((x + y) % 5)) -eq 0 ]; then
+			prime_agent_lab_cell_char="╌"
+		else
+			prime_agent_lab_cell_char="·"
+		fi
+		prime_agent_lab_cell_style="$prime_agent_color_dim"
+	fi
+
+	horizon_y=$((height * 58 / 100))
+	if [ "$y" -eq "$horizon_y" ] && [ $((x % 2)) -eq 0 ] && [ $(((x + frame) % 13)) -lt 2 ]; then
+		prime_agent_lab_cell_char="─"
+		if [ "$x" -gt $((width * 60 / 100)) ]; then
+			prime_agent_lab_cell_style="$prime_agent_color_primary"
+		else
+			prime_agent_lab_cell_style="$prime_agent_color_dim"
+		fi
+	fi
+
+	scan_start=$((width / 2))
+	if [ "$x" -ge "$scan_start" ]; then
+		scan_offset=$((x - scan_start))
+		if [ $((scan_offset % 5)) -eq 0 ]; then
+			scan_index=$((scan_offset / 5))
+			scan_top=$((1 + (scan_index + frame / 3) % 3))
+			scan_bottom=$((height - 2 - (scan_index * 2 + frame / 4) % 3))
+			if [ "$y" -ge "$scan_top" ] && [ "$y" -le "$scan_bottom" ] && [ $(((y + scan_index + frame) % 6)) -ne 0 ]; then
+				if [ $(((scan_index + y) % 4)) -eq 0 ]; then
+					prime_agent_lab_cell_char="┃"
+				else
+					prime_agent_lab_cell_char="╎"
+				fi
+				prime_agent_lab_cell_style="$prime_agent_color_scan"
+			fi
+		fi
+	fi
+
+	trace_index=0
+	while [ "$trace_index" -lt 3 ]; do
+		case "$trace_index" in
+			0) base=$((height * 30 / 100)) ;;
+			1) base=$((height * 49 / 100)) ;;
+			*) base=$((height * 72 / 100)) ;;
+		esac
+		wave=$(((x * 2 + frame + trace_index * 7) % 16))
+		if [ "$wave" -gt 7 ]; then
+			wave=$((15 - wave))
+		fi
+		trace_y=$((base + (wave - 3) / 2))
+		if [ "$y" -eq "$trace_y" ]; then
+			if [ $(((x + frame + trace_index * 13) % 41)) -eq 0 ]; then
+				prime_agent_lab_cell_char="◆"
+				prime_agent_lab_cell_style="$prime_agent_color_warning"
+			elif [ $(((x + frame) % 12)) -eq 0 ]; then
+				prime_agent_lab_cell_char="•"
+				prime_agent_lab_cell_style="$prime_agent_color_primary"
+			else
+				prime_agent_lab_cell_char="·"
+				prime_agent_lab_cell_style="$prime_agent_color_primary"
+			fi
+		fi
+		trace_index=$((trace_index + 1))
+	done
+}
+
+prime_agent_set_blank_line() {
+	prime_agent_content_is_set=1
+	prime_agent_content_text=
+	prime_agent_content_width=0
+	prime_agent_content_style=
+}
+
+prime_agent_set_text_line() {
+	max_width=$((prime_agent_screen_cols - 4))
+	if [ "$max_width" -lt 1 ]; then
+		max_width=1
+	fi
+	prime_agent_content_text=$(prime_agent_fit_ascii "$1" "$max_width")
+	prime_agent_content_width=${#prime_agent_content_text}
+	prime_agent_content_style="$2"
+	prime_agent_content_is_set=1
+}
+
+prime_agent_fit_ascii() {
+	text="$1"
+	max_width="$2"
+	if [ "${#text}" -le "$max_width" ]; then
+		printf '%s' "$text"
+		return
+	fi
+	if [ "$max_width" -le 3 ]; then
+		printf '%s' "$text" | cut -c 1-"$max_width"
+		return
+	fi
+	cut_width=$((max_width - 3))
+	printf '%s...' "$(printf '%s' "$text" | cut -c 1-"$cut_width")"
+}
+
+prime_agent_print_centered_line() {
+	text="$1"
+	width="$2"
+	style="$3"
+	left=$(((prime_agent_screen_cols - width) / 2))
+	if [ "$left" -lt 0 ]; then
+		left=0
+	fi
+	right=$((prime_agent_screen_cols - left - width))
+	if [ "$right" -lt 0 ]; then
+		right=0
+	fi
+	if [ -n "$style" ]; then
+		printf '%*s%s%s%s%*s\n' "$left" "" "$style" "$text" "$prime_agent_reset" "$right" ""
+	else
+		printf '%*s%s%*s\n' "$left" "" "$text" "$right" ""
+	fi
+}
+
+prime_agent_place_prompt_cursor() {
+	max_width=$((prime_agent_screen_cols - 4))
+	if [ "$max_width" -lt 1 ]; then
+		max_width=1
+	fi
+	prompt_text=$(prime_agent_fit_ascii "$(prime_agent_screen_primary_text)" "$max_width")
+	prompt_width=${#prompt_text}
+	content_height=$(prime_agent_content_height)
+	top=$(((prime_agent_screen_rows - content_height) / 2))
+	if [ "$top" -lt 0 ]; then
+		top=0
+	fi
+	prompt_index=0
+	if prime_agent_show_logo; then
+		prompt_index=$((prompt_index + 15))
+	fi
+	row=$((top + prompt_index + 1))
+	col=$(((prime_agent_screen_cols - prompt_width) / 2 + prompt_width + 2))
+	if [ "$col" -lt 1 ]; then
+		col=1
+	fi
+	if [ "$col" -gt "$prime_agent_screen_cols" ]; then
+		col="$prime_agent_screen_cols"
+	fi
+	if ( : <>/dev/tty ) 2>/dev/null; then
+		printf '%s%s%s[%s;%sH' "$prime_agent_reset" "$prime_agent_show_cursor" "$prime_agent_esc" "$row" "$col" >/dev/tty
+	else
+		printf '%s%s%s[%s;%sH' "$prime_agent_reset" "$prime_agent_show_cursor" "$prime_agent_esc" "$row" "$col" >&2
+	fi
+}
+
+prime_agent_pulse() {
+	case $((prime_agent_screen_frame % 4)) in
+		0) printf '.' ;;
+		1) printf '..' ;;
+		2) printf '...' ;;
+		*) printf '' ;;
+	esac
+}
+
+prime_agent_run_quiet_with_animation() {
+	title="$1"
+	status="$2"
+	detail="$3"
+	shift 3
+
+	if [ "$prime_agent_screen_enabled" != 1 ]; then
+		printf '%s\n' "$status" >&2
+		"$@"
+		return
+	fi
+
+	output_dir=$(create_temp_dir)
+	output_file="$output_dir/output"
+	"$@" >"$output_file" 2>&1 &
+	command_pid=$!
+
+	while kill -0 "$command_pid" 2>/dev/null; do
+		prime_agent_screen "$title" "$status$(prime_agent_pulse)" "$detail" ""
+		sleep 0.18
+	done
+
+	if wait "$command_pid"; then
+		command_status=0
+	else
+		command_status=$?
+	fi
+
+	if [ "$command_status" -ne 0 ] && [ -s "$output_file" ]; then
+		prime_agent_restore_terminal
+		printf '\n' >&2
+		cat "$output_file" >&2
+	fi
+	rm -rf "$output_dir"
+	return "$command_status"
+}
+
+prime_agent_prompt_yes_no() {
+	question="$1"
+	detail="$2"
+	input_prompt="$3"
+
+	if ( : <>/dev/tty ) 2>/dev/null; then
+		prompt_input=tty
+		exec 3<>/dev/tty
+	elif [ -t 0 ]; then
+		prompt_input=stdin
+	else
+		return 2
+	fi
+
+	if [ "$prime_agent_screen_enabled" = 1 ]; then
+		prime_agent_screen "$question" "" "$detail" "$input_prompt"
+		prime_agent_place_prompt_cursor "$input_prompt"
+	else
+		printf '%s\n' "$detail"
+		if [ "$prompt_input" = tty ]; then
+			printf '%s ' "$input_prompt" >&3
+		else
+			printf '%s ' "$input_prompt" >&2
+		fi
+	fi
+
+	if [ "$prompt_input" = tty ]; then
+		if ! IFS= read -r answer <&3; then
+			answer=
+		fi
+		exec 3>&-
+	else
+		if ! IFS= read -r answer; then
+			answer=
+		fi
+	fi
+
+	case "$answer" in
+		n|N|no|NO)
+			return 1
+			;;
+	esac
+	return 0
+}
+
 start_preflight_checks() {
 	preflight_dir=$(create_temp_dir)
 	preflight_file="$preflight_dir/preflight"
@@ -102,13 +666,32 @@ start_preflight_checks() {
 }
 
 finish_preflight_checks() {
+	if [ "$prime_agent_screen_enabled" = 1 ]; then
+		while kill -0 "$preflight_pid" 2>/dev/null; do
+			prime_agent_screen "Checking Node.js and npm$(prime_agent_pulse)" "" "" ""
+			sleep 0.18
+		done
+	fi
+
 	if wait "$preflight_pid"; then
 		preflight_status=0
 	else
 		preflight_status=$?
 	fi
 
-	cat "$preflight_file"
+	if [ "$prime_agent_screen_enabled" = 1 ]; then
+		if [ "$preflight_status" -ne 0 ]; then
+			preflight_summary=$(sed -n '1p' "$preflight_file")
+			prime_agent_screen "Node.js 20.6.0 or newer is required" "" "$preflight_summary" ""
+			sleep 0.4
+		elif [ -s "$preflight_file" ]; then
+			preflight_summary="Existing $prime_agent_cmd command found on PATH."
+			prime_agent_screen "Environment ready" "" "$preflight_summary" ""
+			sleep 0.4
+		fi
+	else
+		cat "$preflight_file"
+	fi
 	rm -rf "$preflight_dir"
 	return "$preflight_status"
 }
@@ -162,7 +745,19 @@ resolve_prime_agent_version() {
 		exit 1
 	fi
 
-	stable_version="$(curl -fsSL "$prime_agent_base_url/stable" | tr -d '[:space:]')"
+	stable_dir=$(create_temp_dir)
+	stable_path="$stable_dir/stable"
+	if ! prime_agent_run_quiet_with_animation \
+		"Resolving latest release" \
+		"Resolving latest release" \
+		"Checking the stable release channel." \
+		curl -fsSL "$prime_agent_base_url/stable" -o "$stable_path"; then
+		rm -rf "$stable_dir"
+		printf 'error: could not resolve latest Prime Agent version from %s/stable\n' "$prime_agent_base_url" >&2
+		exit 1
+	fi
+	stable_version="$(tr -d '[:space:]' <"$stable_path")"
+	rm -rf "$stable_dir"
 	if [ -z "$stable_version" ]; then
 		printf 'error: could not resolve latest Prime Agent version from %s/stable\n' "$prime_agent_base_url" >&2
 		exit 1
@@ -198,25 +793,21 @@ install_node_npm_interactive() {
 			;;
 	esac
 
-	if ! ( : <>/dev/tty ) 2>/dev/null; then
+	if prime_agent_prompt_yes_no \
+		"Install Node.js and npm with $label?" \
+		"Required before Prime Agent can be installed." \
+		"Install? [Y/n]"; then
+		install_node_npm "$method" "$label"
+		return
+	else
+		prompt_status=$?
+	fi
+	if [ "$prompt_status" -eq 2 ]; then
 		printf 'No terminal detected; install Node.js 20.6.0 or newer and npm, then run this installer again.\n'
-		return 1
+	else
+		printf '\nInstall Node.js 20.6.0 or newer and npm, then run this installer again.\n'
 	fi
-	exec 3<>/dev/tty
-
-	printf 'Prime Agent needs Node.js 20.6.0 or newer and npm. Install them now with %s? [Y/n] ' "$label" >&3
-	if ! IFS= read -r answer <&3; then
-		answer=
-	fi
-	exec 3>&-
-	case "$answer" in
-		n|N|no|NO)
-			printf '\nInstall Node.js 20.6.0 or newer and npm, then run this installer again.\n'
-			return 1
-			;;
-	esac
-
-	install_node_npm "$method" "$label"
+	return 1
 }
 
 detect_node_install_method() {
@@ -281,7 +872,13 @@ install_node_npm() {
 	method="$1"
 	label="$2"
 
-	printf '\nInstalling Node.js and npm with %s...\n\n' "$label"
+	if [ "$prime_agent_screen_enabled" = 1 ]; then
+		prime_agent_screen "Installing Node.js and npm" "" "Using $label." ""
+		prime_agent_restore_terminal
+		printf '\n'
+	else
+		printf '\nInstalling Node.js and npm with %s...\n\n' "$label"
+	fi
 	run_node_install_method "$method"
 
 	if [ "$method" = standalone ]; then
@@ -289,7 +886,11 @@ install_node_npm() {
 		PRIME_AGENT_NODE_INSTALLED_STANDALONE=1
 	fi
 	hash -r
-	printf '\nNode.js and npm are installed.\n\n'
+	if [ "$prime_agent_screen_enabled" = 1 ]; then
+		prime_agent_screen "Node.js and npm installed" "" "Continuing Prime Agent setup." ""
+	else
+		printf '\nNode.js and npm are installed.\n\n'
+	fi
 }
 
 run_node_install_method() {
@@ -539,24 +1140,18 @@ prompt_add_standalone_node_path() {
 	profile="$1"
 	path_line=$(standalone_node_path_line)
 
-	if ! ( : <>/dev/tty ) 2>/dev/null; then
+	if ! prime_agent_prompt_yes_no \
+		"Add standalone Node.js to your PATH?" \
+		"Updates $profile so future shells can run $prime_agent_cmd." \
+		"Update PATH? [Y/n]"; then
+		prime_agent_restore_terminal
+		printf '\n'
 		print_standalone_path_manual_instructions
 		return 0
 	fi
-	exec 3<>/dev/tty
 
-	printf 'Add %s to your PATH in %s now? [Y/n] ' "$PRIME_AGENT_STANDALONE_NODE_BIN" "$profile" >&3
-	if ! IFS= read -r answer <&3; then
-		answer=
-	fi
-	exec 3>&-
-	case "$answer" in
-		n|N|no|NO)
-			print_standalone_path_manual_instructions
-			return 0
-			;;
-	esac
-
+	prime_agent_restore_terminal
+	printf '\n'
 	mkdir -p "$(dirname "$profile")"
 	{
 		printf '\n# Prime Agent standalone Node.js\n'
@@ -580,6 +1175,7 @@ download_prime_agent_package() {
 	tarball_url="$2"
 	tarball_path="$3"
 	download_dir=$(dirname "$tarball_path")
+	tarball_name=$(basename "$tarball_path")
 	checksums_url="$prime_agent_base_url/releases/v$version/SHA256SUMS"
 	checksums_path="$download_dir/SHA256SUMS"
 
@@ -588,11 +1184,17 @@ download_prime_agent_package() {
 		exit 1
 	fi
 
-	printf 'Downloading checksums...\n'
-	curl -fsSL "$checksums_url" -o "$checksums_path"
+	prime_agent_run_quiet_with_animation \
+		"Downloading checksums" \
+		"Downloading release checksums" \
+		"Prime Agent v$version" \
+		curl -fsSL "$checksums_url" -o "$checksums_path"
 
-	printf 'Downloading Prime Agent...\n'
-	curl -fL "$tarball_url" -o "$tarball_path"
+	prime_agent_run_quiet_with_animation \
+		"Downloading Prime Agent" \
+		"Downloading Prime Agent v$version" \
+		"Fetching the verified package." \
+		curl -fsSL "$tarball_url" -o "$tarball_path"
 
 	verify_prime_agent_package_checksum "$checksums_path" "$tarball_path"
 }
@@ -611,41 +1213,71 @@ verify_prime_agent_package_checksum() {
 	fi
 
 	if command -v sha256sum >/dev/null 2>&1; then
-		printf 'Verifying Prime Agent download\n'
-		(cd "$checksum_dir" && sha256sum -c "$(basename "$selected_checksums_path")")
+		prime_agent_run_quiet_with_animation \
+			"Verifying download" \
+			"Verifying Prime Agent download" \
+			"Checking SHA-256." \
+			prime_agent_run_checksum_check "$checksum_dir" "$(basename "$selected_checksums_path")" sha256sum
 	elif command -v shasum >/dev/null 2>&1; then
-		printf 'Verifying Prime Agent download\n'
-		(cd "$checksum_dir" && shasum -a 256 -c "$(basename "$selected_checksums_path")")
+		prime_agent_run_quiet_with_animation \
+			"Verifying download" \
+			"Verifying Prime Agent download" \
+			"Checking SHA-256." \
+			prime_agent_run_checksum_check "$checksum_dir" "$(basename "$selected_checksums_path")" shasum
 	else
 		printf 'error: sha256sum or shasum is required to verify the Prime Agent download.\n' >&2
 		exit 1
 	fi
 }
 
-confirm_install() {
-	if ! ( : <>/dev/tty ) 2>/dev/null; then
-		printf 'No terminal detected; continuing without confirmation.\n'
-		return 0
-	fi
-	exec 3<>/dev/tty
-
-	printf 'Continue? [Y/n] ' >&3
-	if ! IFS= read -r answer <&3; then
-		answer=
-	fi
-	exec 3>&-
-	case "$answer" in
-		n|N|no|NO)
-			printf '\nInstallation cancelled.\n'
-			exit 0
+prime_agent_run_checksum_check() {
+	checksum_dir="$1"
+	selected_checksums_name="$2"
+	checker="$3"
+	case "$checker" in
+		sha256sum)
+			(cd "$checksum_dir" && sha256sum -c "$selected_checksums_name")
+			;;
+		shasum)
+			(cd "$checksum_dir" && shasum -a 256 -c "$selected_checksums_name")
 			;;
 	esac
 }
 
+confirm_install() {
+	version="$1"
+	tarball_url="$2"
+
+	if prime_agent_prompt_yes_no \
+		"Install Prime Agent v$version globally with npm?" \
+		"Downloads the verified release and runs npm install -g." \
+		"Install? [Y/n]"; then
+		return 0
+	else
+		prompt_status=$?
+	fi
+
+	if [ "$prompt_status" -eq 2 ]; then
+		printf 'This will download, verify, and install:\n\n  %s\n\n' "$tarball_url"
+		printf 'No terminal detected; continuing without confirmation.\n'
+		return 0
+	fi
+
+	if [ "$prime_agent_screen_enabled" = 1 ]; then
+		prime_agent_screen "Installation cancelled" "" "No changes were made." ""
+		prime_agent_restore_terminal
+	fi
+	printf '\nInstallation cancelled.\n'
+	exit 0
+}
+
 install_prime_agent_package() {
 	tarball_path="$1"
-	printf 'Installing Prime Agent...\n\n'
-	npm install -g --no-fund --no-audit --loglevel=error --progress=false "$tarball_path"
+	prime_agent_run_quiet_with_animation \
+		"Installing Prime Agent" \
+		"Installing Prime Agent" \
+		"Running npm install -g." \
+		npm install -g --no-fund --no-audit --loglevel=error --progress=false "$tarball_path"
 }
 
 main "$@"
