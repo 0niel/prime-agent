@@ -6,10 +6,13 @@
 
 - Changed the Prime Agent install script to use a bounded animated Prime Lab splash with centered progress and confirmation prompts.
 - Changed startup onboarding to guide unauthenticated users through login and model selection before the first agent turn.
+- Changed installer npm and Node.js setup progress to keep command output hidden behind the splash and rotate detail text.
 
 ### Fixed
 
 - Fixed update notifications and package docs to point at `prime-agent update` and use compact one-line alerts.
+- Fixed Prime CLI credentials from `prime login` to make Prime Inference models available on startup.
+- Fixed first-run search helper downloads to run quietly instead of printing over onboarding.
 
 ### Removed
 

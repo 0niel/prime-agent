@@ -148,6 +148,43 @@ describe("AuthStorage", () => {
 			expect(apiKey).toBe("literal_api_key_value");
 		});
 
+		test("prime inference falls back to Prime CLI config when enabled", async () => {
+			const primeConfigPath = join(tempDir, "prime-config.json");
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
+			writeAuthJson({});
+
+			authStorage = AuthStorage.create(authJsonPath, {
+				primeCliConfigPath: primeConfigPath,
+				usePrimeCliConfig: true,
+			});
+
+			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("prime-cli-key");
+			expect(authStorage.hasAuth("prime-inference")).toBe(true);
+			expect(authStorage.getAuthStatus("prime-inference")).toEqual({
+				configured: false,
+				source: "prime_cli",
+				label: "Prime CLI",
+			});
+		});
+
+		test("prime cli config fallback is cached until reload", async () => {
+			const primeConfigPath = join(tempDir, "prime-config.json");
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
+			writeAuthJson({});
+
+			authStorage = AuthStorage.create(authJsonPath, {
+				primeCliConfigPath: primeConfigPath,
+				usePrimeCliConfig: true,
+			});
+
+			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("prime-cli-key");
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "changed-prime-key" }));
+			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("prime-cli-key");
+
+			authStorage.reload();
+			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("changed-prime-key");
+		});
+
 		test("apiKey command can use shell features like pipes", async () => {
 			writeAuthJson({
 				anthropic: { type: "api_key", key: "!echo 'hello world' | tr ' ' '-'" },

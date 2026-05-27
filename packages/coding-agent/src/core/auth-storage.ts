@@ -18,6 +18,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "f
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
+import { loadPrimeCliConfig, PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
 
 export type ApiKeyCredential = {
@@ -35,8 +36,13 @@ export type AuthStorageData = Record<string, AuthCredential>;
 
 export type AuthStatus = {
 	configured: boolean;
-	source?: "stored" | "runtime" | "environment" | "fallback" | "models_json_key" | "models_json_command";
+	source?: "stored" | "runtime" | "environment" | "prime_cli" | "fallback" | "models_json_key" | "models_json_command";
 	label?: string;
+};
+
+export type AuthStorageOptions = {
+	primeCliConfigPath?: string;
+	usePrimeCliConfig?: boolean;
 };
 
 type LockResult<T> = {
@@ -194,23 +200,29 @@ export class AuthStorage {
 	private fallbackResolver?: (provider: string) => string | undefined;
 	private loadError: Error | null = null;
 	private errors: Error[] = [];
+	private primeCliApiKeyCache: string | undefined;
+	private primeCliApiKeyCacheLoaded = false;
 
-	private constructor(private storage: AuthStorageBackend) {
+	private constructor(
+		private storage: AuthStorageBackend,
+		private options: AuthStorageOptions = {},
+	) {
 		this.reload();
 	}
 
-	static create(authPath?: string): AuthStorage {
-		return new AuthStorage(new FileAuthStorageBackend(authPath ?? join(getAgentDir(), "auth.json")));
+	static create(authPath?: string, options?: AuthStorageOptions): AuthStorage {
+		const authOptions = options ?? { usePrimeCliConfig: authPath === undefined };
+		return new AuthStorage(new FileAuthStorageBackend(authPath ?? join(getAgentDir(), "auth.json")), authOptions);
 	}
 
-	static fromStorage(storage: AuthStorageBackend): AuthStorage {
-		return new AuthStorage(storage);
+	static fromStorage(storage: AuthStorageBackend, options?: AuthStorageOptions): AuthStorage {
+		return new AuthStorage(storage, options);
 	}
 
-	static inMemory(data: AuthStorageData = {}): AuthStorage {
+	static inMemory(data: AuthStorageData = {}, options?: AuthStorageOptions): AuthStorage {
 		const storage = new InMemoryAuthStorageBackend();
 		storage.withLock(() => ({ result: undefined, next: JSON.stringify(data, null, 2) }));
-		return AuthStorage.fromStorage(storage);
+		return AuthStorage.fromStorage(storage, options);
 	}
 
 	/**
@@ -252,6 +264,8 @@ export class AuthStorage {
 	 * Reload credentials from storage.
 	 */
 	reload(): void {
+		this.primeCliApiKeyCache = undefined;
+		this.primeCliApiKeyCacheLoaded = false;
 		let content: string | undefined;
 		try {
 			this.storage.withLock((current) => {
@@ -332,6 +346,7 @@ export class AuthStorage {
 		if (this.runtimeOverrides.has(provider)) return true;
 		if (this.data[provider]) return true;
 		if (getEnvApiKey(provider)) return true;
+		if (this.getPrimeCliApiKey(provider)) return true;
 		if (this.fallbackResolver?.(provider)) return true;
 		return false;
 	}
@@ -351,6 +366,10 @@ export class AuthStorage {
 		const envKeys = findEnvKeys(provider);
 		if (envKeys?.[0]) {
 			return { configured: false, source: "environment", label: envKeys[0] };
+		}
+
+		if (this.getPrimeCliApiKey(provider)) {
+			return { configured: false, source: "prime_cli", label: "Prime CLI" };
 		}
 
 		if (this.fallbackResolver?.(provider)) {
@@ -507,6 +526,9 @@ export class AuthStorage {
 		const envKey = getEnvApiKey(providerId);
 		if (envKey) return envKey;
 
+		const primeCliKey = this.getPrimeCliApiKey(providerId);
+		if (primeCliKey) return primeCliKey;
+
 		// Fall back to custom resolver (e.g., models.json custom providers)
 		if (options?.includeFallback !== false) {
 			return this.fallbackResolver?.(providerId) ?? undefined;
@@ -520,5 +542,19 @@ export class AuthStorage {
 	 */
 	getOAuthProviders() {
 		return getOAuthProviders();
+	}
+
+	private getPrimeCliApiKey(providerId: string): string | undefined {
+		if (providerId !== PRIME_INFERENCE_PROVIDER_ID) {
+			return undefined;
+		}
+		if (!this.options.usePrimeCliConfig && !this.options.primeCliConfigPath) {
+			return undefined;
+		}
+		if (!this.primeCliApiKeyCacheLoaded) {
+			this.primeCliApiKeyCache = loadPrimeCliConfig(this.options.primeCliConfigPath).apiKey;
+			this.primeCliApiKeyCacheLoaded = true;
+		}
+		return this.primeCliApiKeyCache;
 	}
 }

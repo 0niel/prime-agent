@@ -434,4 +434,37 @@ describe("default model selection", () => {
 		expect(result.model?.provider).toBe("vercel-ai-gateway");
 		expect(result.model?.id).toBe("anthropic/claude-opus-4-6");
 	});
+
+	test("findInitialModel skips saved defaults without configured auth", async () => {
+		const savedDefault = mockModels[0];
+		const primeModel: Model<"anthropic-messages"> = {
+			id: "openai/gpt-5.5",
+			name: "GPT 5.5 (Prime Inference)",
+			api: "anthropic-messages",
+			provider: "prime-inference",
+			baseUrl: "https://api.pinference.ai/api/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1 },
+			contextWindow: 128000,
+			maxTokens: 8192,
+		};
+		const registry = {
+			find: (provider: string, modelId: string) =>
+				[savedDefault, primeModel].find((model) => model.provider === provider && model.id === modelId),
+			hasConfiguredAuth: (model: Model<"anthropic-messages">) => model.provider === "prime-inference",
+			getAvailable: async () => [primeModel],
+		} as unknown as Parameters<typeof findInitialModel>[0]["modelRegistry"];
+
+		const result = await findInitialModel({
+			scopedModels: [],
+			isContinuing: false,
+			defaultProvider: savedDefault.provider,
+			defaultModelId: savedDefault.id,
+			modelRegistry: registry,
+		});
+
+		expect(result.model?.provider).toBe("prime-inference");
+		expect(result.model?.id).toBe("openai/gpt-5.5");
+	});
 });

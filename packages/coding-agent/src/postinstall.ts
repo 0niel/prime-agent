@@ -1,6 +1,10 @@
 import { ensureKernelPython } from "./core/kernel/bootstrap.js";
+import { ensureTool } from "./utils/tools-manager.js";
 
-if (process.env.PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL !== "1") {
+const bootstrapKernel = process.env.PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL === "1";
+const bootstrapTools = process.env.PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL === "1";
+
+if (!bootstrapKernel && !bootstrapTools) {
 	process.exit(0);
 }
 
@@ -13,7 +17,12 @@ function oneLine(message: string): string {
 }
 
 try {
-	await ensureKernelPython();
+	if (bootstrapTools) {
+		await Promise.all([ensureTool("fd", true), ensureTool("rg", true)]);
+	}
+	if (bootstrapKernel) {
+		await ensureKernelPython();
+	}
 } catch (error) {
-	console.error(`prime-agent: python kernel setup skipped: ${oneLine(errorMessage(error))}`);
+	console.error(`prime-agent: postinstall setup skipped: ${oneLine(errorMessage(error))}`);
 }
