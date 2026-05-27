@@ -1,15 +1,7 @@
-import {
-	Container,
-	type Focusable,
-	fuzzyFilter,
-	getKeybindings,
-	Input,
-	Spacer,
-	TruncatedText,
-} from "@earendil-works/pi-tui";
+import { Container, type Focusable, fuzzyFilter, getKeybindings, Spacer, TruncatedText } from "@earendil-works/pi-tui";
 import type { AuthStatus, AuthStorage } from "../../../core/auth-storage.js";
 import { theme } from "../theme/theme.js";
-import { DynamicBorder } from "./dynamic-border.js";
+import { MenuList, MenuPanel, MenuRow, MenuSearchInput } from "./menu-panel.js";
 
 export type AuthSelectorProvider = {
 	id: string;
@@ -17,11 +9,18 @@ export type AuthSelectorProvider = {
 	authType: "oauth" | "api_key";
 };
 
+export function compareAuthSelectorProviders(a: AuthSelectorProvider, b: AuthSelectorProvider): number {
+	if (a.authType !== b.authType) {
+		return a.authType === "oauth" ? -1 : 1;
+	}
+	return a.name.localeCompare(b.name);
+}
+
 /**
  * Component that renders an auth provider selector
  */
 export class OAuthSelectorComponent extends Container implements Focusable {
-	private searchInput: Input;
+	private searchInput: MenuSearchInput;
 
 	// Focusable implementation - propagate to search input for IME cursor positioning
 	private _focused = false;
@@ -56,38 +55,30 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		this.mode = mode;
 		this.authStorage = authStorage;
 		this.getAuthStatus = getAuthStatus ?? ((providerId) => this.authStorage.getAuthStatus(providerId));
-		this.allProviders = providers;
-		this.filteredProviders = providers;
+		this.allProviders = this.sortProviders(providers);
+		this.filteredProviders = this.allProviders;
 		this.onSelectCallback = onSelect;
 		this.onCancelCallback = onCancel;
 
-		// Add top border
-		this.addChild(new DynamicBorder());
-		this.addChild(new Spacer(1));
+		const panel = new MenuPanel({
+			title: mode === "login" ? "Providers" : "Saved Credentials",
+			subtitle: mode === "login" ? "Connect with a subscription or API key." : "Choose a credential to remove.",
+		});
+		this.addChild(panel);
 
-		// Add title
-		const title = mode === "login" ? "Select provider to configure:" : "Select provider to logout:";
-		this.addChild(new TruncatedText(theme.fg("accent", theme.bold(title)), 1, 0));
-		this.addChild(new Spacer(1));
-
-		this.searchInput = new Input();
+		this.searchInput = new MenuSearchInput("Search providers");
 		this.searchInput.onSubmit = () => {
 			const selectedProvider = this.filteredProviders[this.selectedIndex];
 			if (selectedProvider) {
 				this.onSelectCallback(selectedProvider.id);
 			}
 		};
-		this.addChild(this.searchInput);
-		this.addChild(new Spacer(1));
+		panel.addChild(this.searchInput);
+		panel.addChild(new Spacer(1));
 
 		// Create list container
-		this.listContainer = new Container();
-		this.addChild(this.listContainer);
-
-		this.addChild(new Spacer(1));
-
-		// Add bottom border
-		this.addChild(new DynamicBorder());
+		this.listContainer = new MenuList();
+		panel.addChild(this.listContainer);
 
 		// Initial render
 		this.filterProviders("");
@@ -99,6 +90,27 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			: this.allProviders;
 		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, Math.max(0, this.filteredProviders.length - 1)));
 		this.updateList();
+	}
+
+	private sortProviders(providers: AuthSelectorProvider[]): AuthSelectorProvider[] {
+		return [...providers].sort((a, b) => {
+			const configuredDelta = Number(this.isProviderConfigured(b)) - Number(this.isProviderConfigured(a));
+			if (configuredDelta !== 0) {
+				return configuredDelta;
+			}
+			return compareAuthSelectorProviders(a, b);
+		});
+	}
+
+	private isProviderConfigured(provider: AuthSelectorProvider): boolean {
+		const credential = this.authStorage.get(provider.id);
+		if (credential) {
+			return true;
+		}
+		if (provider.authType !== "api_key") {
+			return false;
+		}
+		return this.getAuthStatus(provider.id).source !== undefined;
 	}
 
 	private updateList(): void {
@@ -117,18 +129,14 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 
 			const isSelected = i === this.selectedIndex;
 
-			const statusIndicator = this.formatStatusIndicator(provider);
-			let line = "";
-			if (isSelected) {
-				const prefix = theme.fg("accent", "→ ");
-				const text = theme.fg("accent", provider.name);
-				line = prefix + text + statusIndicator;
-			} else {
-				const text = `  ${theme.fg("text", provider.name)}`;
-				line = text + statusIndicator;
-			}
-
-			this.listContainer.addChild(new TruncatedText(line, 1, 0));
+			this.listContainer.addChild(
+				new MenuRow({
+					primary: provider.name,
+					secondary: provider.authType === "oauth" ? "subscription" : "api key",
+					meta: this.formatStatusIndicator(provider),
+					selected: isSelected,
+				}),
+			);
 		}
 
 		if (startIndex > 0 || endIndex < this.filteredProviders.length) {
@@ -144,33 +152,33 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 						? "No providers available"
 						: "No providers logged in. Use /login first."
 					: "No matching providers";
-			this.listContainer.addChild(new TruncatedText(theme.fg("muted", `  ${message}`), 1, 0));
+			this.listContainer.addChild(new TruncatedText(theme.fg("muted", message), 1, 0));
 		}
 	}
 
 	private formatStatusIndicator(provider: AuthSelectorProvider): string {
 		const credential = this.authStorage.get(provider.id);
-		if (credential?.type === provider.authType) return theme.fg("success", " ✓ configured");
+		if (credential?.type === provider.authType) return theme.fg("success", "configured");
 		if (credential) {
 			const label = credential.type === "oauth" ? "subscription configured" : "API key configured";
-			return theme.fg("muted", " • ") + theme.fg("warning", label);
+			return theme.fg("warning", label);
 		}
-		if (provider.authType !== "api_key") return theme.fg("muted", " • unconfigured");
+		if (provider.authType !== "api_key") return theme.fg("muted", "unconfigured");
 
 		const status = this.getAuthStatus(provider.id);
 		switch (status.source) {
 			case "environment":
-				return theme.fg("success", ` ✓ env: ${status.label ?? "API key"}`);
+				return theme.fg("success", `env: ${status.label ?? "API key"}`);
 			case "runtime":
-				return theme.fg("success", " ✓ runtime API key");
+				return theme.fg("success", "runtime API key");
 			case "fallback":
-				return theme.fg("success", " ✓ custom API key");
+				return theme.fg("success", "custom API key");
 			case "models_json_key":
-				return theme.fg("success", " ✓ key in models.json");
+				return theme.fg("success", "key in models.json");
 			case "models_json_command":
-				return theme.fg("success", " ✓ command in models.json");
+				return theme.fg("success", "command in models.json");
 			default:
-				return theme.fg("muted", " • unconfigured");
+				return theme.fg("muted", "unconfigured");
 		}
 	}
 

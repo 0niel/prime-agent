@@ -1,0 +1,103 @@
+import { type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import stripAnsi from "strip-ansi";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { LoginDialogComponent } from "../src/modes/interactive/components/login-dialog.js";
+import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { PRIME_BUTTERFLY_LOGO } from "../src/themes/prime-logo.js";
+
+const mocks = vi.hoisted(() => ({
+	exec: vi.fn(),
+}));
+
+vi.mock("child_process", () => ({
+	exec: mocks.exec,
+}));
+
+function createFakeTui(): TUI {
+	return {
+		requestRender: vi.fn(),
+	} as unknown as TUI;
+}
+
+describe("LoginDialogComponent", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	beforeEach(() => {
+		mocks.exec.mockClear();
+	});
+
+	it("renders browser login without legacy border chrome", () => {
+		const dialog = new LoginDialogComponent(createFakeTui(), "anthropic", () => {}, "Anthropic");
+
+		dialog.showAuth("https://example.com/oauth?client_id=test", "Complete login in your browser.");
+		const output = stripAnsi(dialog.render(88).join("\n"));
+
+		expect(output).toContain("Login to Anthropic");
+		expect(output).toContain("Browser sign-in");
+		expect(output).toContain("Sign-in link");
+		expect(output).toContain("https://example.com/oauth?client_id=test");
+		expect(output).toContain("Next step");
+		expect(output).toContain("Complete login in your browser.");
+		expect(output).not.toContain("click to open");
+		expect(output).not.toContain("─");
+		expect(output).not.toContain("> ");
+		expect(mocks.exec).toHaveBeenCalledOnce();
+	});
+
+	it("renders verification codes as a distinct field", () => {
+		const dialog = new LoginDialogComponent(createFakeTui(), "prime-inference", () => {}, "Prime Inference");
+
+		dialog.showAuth("https://example.com/challenge", "Code: abc-123");
+		const output = stripAnsi(dialog.render(88).join("\n"));
+		const firstLogoLine = PRIME_BUTTERFLY_LOGO.split("\n")[0]?.trim() ?? "";
+
+		expect(output).toContain("Login to Prime Inference");
+		expect(output).toContain(firstLogoLine);
+		expect(output).toContain("Verification code");
+		expect(output).toContain("abc-123");
+		expect(output).not.toContain("click to open");
+		expect(output).not.toContain("Code: abc-123");
+	});
+
+	it("renders Prime Inference waiting status without an extra label", () => {
+		const dialog = new LoginDialogComponent(createFakeTui(), "prime-inference", () => {}, "Prime Inference");
+
+		dialog.showAuth("https://example.com/challenge", "Code: abc-123");
+		dialog.showWaiting("Waiting for browser authentication...");
+		const output = stripAnsi(dialog.render(88).join("\n"));
+
+		expect(output).toContain("Waiting for browser authentication...");
+		expect(output).not.toContain("Status");
+	});
+
+	it("keeps the Prime Inference brand header centered and within the panel", () => {
+		const dialog = new LoginDialogComponent(createFakeTui(), "prime-inference", () => {}, "Prime Inference");
+
+		dialog.showProgress("Checking existing Prime CLI credentials...");
+		const lines = dialog.render(88);
+		const output = stripAnsi(lines.join("\n"));
+		const titleLine = output.split("\n").find((line) => line.includes("Login to Prime Inference"));
+		const titleOffset = titleLine?.indexOf("Login to Prime Inference") ?? -1;
+
+		expect(titleOffset).toBeGreaterThan(20);
+		expect(output).toContain("Connect your Prime Intellect account to enable Prime Inference models.");
+		expect(output).toContain("Preparing authentication");
+		for (const line of lines) {
+			expect(visibleWidth(line)).toBe(88);
+		}
+	});
+
+	it("renders API key prompts without shell input markers", () => {
+		const dialog = new LoginDialogComponent(createFakeTui(), "openai", () => {}, "OpenAI");
+
+		void dialog.showPrompt("Enter API key:");
+		const output = stripAnsi(dialog.render(88).join("\n"));
+
+		expect(output).toContain("Login to OpenAI");
+		expect(output).toContain("Enter API key:");
+		expect(output).not.toContain("─");
+		expect(output).not.toContain("> ");
+	});
+});

@@ -91,13 +91,16 @@ describe("issue #3217 scoped model ordering", () => {
 
 		await waitForAsyncRender();
 
-		const renderedLines = stripAnsi(selector.render(120).join("\n"))
-			.split("\n")
-			.filter((line) => line.includes(`[${modelOne.provider}]`));
-		const orderedIds = renderedLines.slice(0, 3).map((line) => {
-			const [modelId] = line.trim().replace(/^→\s*/, "").split(" [");
-			return modelId?.trim() ?? "";
-		});
+		const renderedLines = stripAnsi(selector.render(120).join("\n")).split("\n");
+		const orderedIds = renderedLines
+			.flatMap((line, index) => {
+				if (line.trim() !== modelOne.provider) {
+					return [];
+				}
+				const [modelId] = renderedLines[index - 1]?.trim().split(/\s{2,}/) ?? [];
+				return modelId ? [modelId.trim()] : [];
+			})
+			.slice(0, 3);
 
 		expect(orderedIds).toEqual([modelTwo.id, modelOne.id, modelThree.id]);
 	});

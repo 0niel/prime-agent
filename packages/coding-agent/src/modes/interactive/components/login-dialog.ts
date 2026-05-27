@@ -1,20 +1,70 @@
 import { getOAuthProviders } from "@earendil-works/pi-ai/oauth";
-import { Container, type Focusable, getKeybindings, Input, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
+import {
+	type Component,
+	Container,
+	type Focusable,
+	getKeybindings,
+	Spacer,
+	Text,
+	type TUI,
+	truncateToWidth,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 import { exec } from "child_process";
+import { PRIME_BUTTERFLY_LOGO } from "../../../themes/prime-logo.js";
 import { theme } from "../theme/theme.js";
-import { DynamicBorder } from "./dynamic-border.js";
 import { keyHint } from "./keybinding-hints.js";
+import { MenuPanel, MenuSearchInput } from "./menu-panel.js";
+
+const PRIME_INFERENCE_PROVIDER_ID = "prime-inference";
+const PRIME_LOGO_LINES = PRIME_BUTTERFLY_LOGO.split("\n");
+const PRIME_LOGO_WIDTH = PRIME_LOGO_LINES.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
+
+function centeredLine(text: string, width: number): string {
+	const safeWidth = Math.max(1, width);
+	const content = truncateToWidth(text, safeWidth, "");
+	const padding = Math.max(0, safeWidth - visibleWidth(content));
+	const left = Math.floor(padding / 2);
+	return " ".repeat(left) + content + " ".repeat(padding - left);
+}
+
+class PrimeLoginHeader implements Component {
+	invalidate(): void {
+		// Header render is derived from the current theme.
+	}
+
+	render(width: number): string[] {
+		const safeWidth = Math.max(1, width);
+		const logoWidth = Math.min(PRIME_LOGO_WIDTH, safeWidth);
+		const logoLines = PRIME_LOGO_LINES.map((line) => {
+			const paddedLogoLine = line + " ".repeat(Math.max(0, PRIME_LOGO_WIDTH - visibleWidth(line)));
+			return centeredLine(theme.fg("text", truncateToWidth(paddedLogoLine, logoWidth, "")), safeWidth);
+		});
+		return [
+			...logoLines,
+			centeredLine("", safeWidth),
+			centeredLine(theme.bold(theme.fg("text", "Login to Prime Inference")), safeWidth),
+			centeredLine(
+				theme.fg("muted", "Connect your Prime Intellect account to enable Prime Inference models."),
+				safeWidth,
+			),
+		];
+	}
+}
 
 /**
  * Login dialog component - replaces editor during OAuth login flow
  */
 export class LoginDialogComponent extends Container implements Focusable {
 	private contentContainer: Container;
-	private input: Input;
+	private input: MenuSearchInput;
 	private tui: TUI;
+	private readonly isPrimeInference: boolean;
 	private abortController = new AbortController();
 	private inputResolver?: (value: string) => void;
 	private inputRejecter?: (error: Error) => void;
+	private continueResolver?: () => void;
+	private continueRejecter?: (error: Error) => void;
 
 	// Focusable implementation - propagate to input for IME cursor positioning
 	private _focused = false;
@@ -38,20 +88,21 @@ export class LoginDialogComponent extends Container implements Focusable {
 
 		const providerInfo = getOAuthProviders().find((p) => p.id === providerId);
 		const providerName = providerNameOverride || providerInfo?.name || providerId;
+		this.isPrimeInference = providerId === PRIME_INFERENCE_PROVIDER_ID;
 		const title = titleOverride ?? `Login to ${providerName}`;
 
-		// Top border
-		this.addChild(new DynamicBorder());
-
-		// Title
-		this.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+		const panel = new MenuPanel({
+			title: this.isPrimeInference ? "" : title,
+			subtitle: this.isPrimeInference ? undefined : "Complete this step to continue setup.",
+		});
+		this.addChild(panel);
 
 		// Dynamic content area
 		this.contentContainer = new Container();
-		this.addChild(this.contentContainer);
+		panel.addChild(this.contentContainer);
 
 		// Input (always present, used when needed)
-		this.input = new Input();
+		this.input = new MenuSearchInput("Paste value");
 		this.input.onSubmit = () => {
 			if (this.inputResolver) {
 				this.inputResolver(this.input.getValue());
@@ -59,12 +110,6 @@ export class LoginDialogComponent extends Container implements Focusable {
 				this.inputRejecter = undefined;
 			}
 		};
-		this.input.onEscape = () => {
-			this.cancel();
-		};
-
-		// Bottom border
-		this.addChild(new DynamicBorder());
 	}
 
 	get signal(): AbortSignal {
@@ -78,6 +123,11 @@ export class LoginDialogComponent extends Container implements Focusable {
 			this.inputResolver = undefined;
 			this.inputRejecter = undefined;
 		}
+		if (this.continueRejecter) {
+			this.continueRejecter(new Error("Login cancelled"));
+			this.continueResolver = undefined;
+			this.continueRejecter = undefined;
+		}
 		this.onComplete(false, "Login cancelled");
 	}
 
@@ -85,18 +135,17 @@ export class LoginDialogComponent extends Container implements Focusable {
 	 * Called by onAuth callback - show URL and optional instructions
 	 */
 	showAuth(url: string, instructions?: string): void {
-		this.contentContainer.clear();
+		this.startContent();
+		this.addSectionTitle("Browser sign-in");
+		this.addMutedText("The sign-in page should already be opening. If it did not open, use the link below.");
 		this.contentContainer.addChild(new Spacer(1));
+		this.addLabel("Sign-in link");
 		const linkedUrl = `\x1b]8;;${url}\x07${url}\x1b]8;;\x07`;
-		this.contentContainer.addChild(new Text(theme.fg("accent", linkedUrl), 1, 0));
-
-		const clickHint = process.platform === "darwin" ? "Cmd+click to open" : "Ctrl+click to open";
-		const hyperlink = `\x1b]8;;${url}\x07${clickHint}\x1b]8;;\x07`;
-		this.contentContainer.addChild(new Text(theme.fg("dim", hyperlink), 1, 0));
+		this.contentContainer.addChild(new Text(theme.fg("text", linkedUrl), 0, 0));
 
 		if (instructions) {
 			this.contentContainer.addChild(new Spacer(1));
-			this.contentContainer.addChild(new Text(theme.fg("warning", instructions), 1, 0));
+			this.addInstructions(instructions);
 		}
 
 		// Try to open browser
@@ -110,10 +159,11 @@ export class LoginDialogComponent extends Container implements Focusable {
 	 * Show input for manual code/URL entry (for callback server providers)
 	 */
 	showManualInput(prompt: string): Promise<string> {
-		this.contentContainer.addChild(new Spacer(1));
-		this.contentContainer.addChild(new Text(theme.fg("dim", prompt), 1, 0));
+		this.addSectionSpacer();
+		this.addSectionTitle("Manual fallback");
+		this.addMutedText(prompt);
 		this.contentContainer.addChild(this.input);
-		this.contentContainer.addChild(new Text(`(${keyHint("tui.select.cancel", "to cancel")})`, 1, 0));
+		this.contentContainer.addChild(new Text(theme.fg("muted", keyHint("tui.select.cancel", "cancel")), 0, 0));
 		this.tui.requestRender();
 
 		return new Promise((resolve, reject) => {
@@ -127,16 +177,15 @@ export class LoginDialogComponent extends Container implements Focusable {
 	 * Note: Does NOT clear content, appends to existing (preserves URL from showAuth)
 	 */
 	showPrompt(message: string, placeholder?: string): Promise<string> {
-		this.contentContainer.addChild(new Spacer(1));
-		this.contentContainer.addChild(new Text(theme.fg("text", message), 1, 0));
+		this.addSectionSpacer();
+		this.addSectionTitle(message);
 		if (placeholder) {
-			this.contentContainer.addChild(new Text(theme.fg("dim", `e.g., ${placeholder}`), 1, 0));
+			this.contentContainer.addChild(new Text(theme.fg("muted", `e.g., ${placeholder}`), 0, 0));
 		}
 		this.contentContainer.addChild(this.input);
 		this.contentContainer.addChild(
 			new Text(
-				`(${keyHint("tui.select.cancel", "to cancel,")} ${keyHint("tui.select.confirm", "to submit")})`,
-				1,
+				theme.fg("muted", `${keyHint("tui.select.confirm", "submit")}  ${keyHint("tui.select.cancel", "cancel")}`),
 				0,
 			),
 		);
@@ -154,23 +203,46 @@ export class LoginDialogComponent extends Container implements Focusable {
 	 * Show informational text without prompting for input.
 	 */
 	showInfo(lines: string[]): void {
-		this.contentContainer.clear();
-		this.contentContainer.addChild(new Spacer(1));
+		this.startContent();
 		for (const line of lines) {
-			this.contentContainer.addChild(new Text(line, 1, 0));
+			this.contentContainer.addChild(new Text(line, 0, 0));
 		}
 		this.contentContainer.addChild(new Spacer(1));
-		this.contentContainer.addChild(new Text(`(${keyHint("tui.select.cancel", "to close")})`, 1, 0));
+		this.contentContainer.addChild(new Text(theme.fg("muted", keyHint("tui.select.cancel", "close")), 0, 0));
 		this.tui.requestRender();
+	}
+
+	showContinueInfo(lines: string[]): Promise<void> {
+		this.startContent();
+		for (const line of lines) {
+			this.contentContainer.addChild(new Text(line, 0, 0));
+		}
+		this.contentContainer.addChild(new Spacer(1));
+		this.contentContainer.addChild(
+			new Text(
+				theme.fg(
+					"muted",
+					`${keyHint("tui.select.confirm", "continue")}  ${keyHint("tui.select.cancel", "cancel")}`,
+				),
+				0,
+				0,
+			),
+		);
+		this.tui.requestRender();
+
+		return new Promise((resolve, reject) => {
+			this.continueResolver = resolve;
+			this.continueRejecter = reject;
+		});
 	}
 
 	/**
 	 * Show waiting message (for polling flows like GitHub Copilot)
 	 */
 	showWaiting(message: string): void {
-		this.contentContainer.addChild(new Spacer(1));
-		this.contentContainer.addChild(new Text(theme.fg("dim", message), 1, 0));
-		this.contentContainer.addChild(new Text(`(${keyHint("tui.select.cancel", "to cancel")})`, 1, 0));
+		this.addSectionSpacer();
+		this.contentContainer.addChild(new Text(theme.fg("accent", message), 0, 0));
+		this.contentContainer.addChild(new Text(theme.fg("muted", keyHint("tui.select.cancel", "cancel")), 0, 0));
 		this.tui.requestRender();
 	}
 
@@ -178,8 +250,53 @@ export class LoginDialogComponent extends Container implements Focusable {
 	 * Called by onProgress callback
 	 */
 	showProgress(message: string): void {
-		this.contentContainer.addChild(new Text(theme.fg("dim", message), 1, 0));
+		if (this.contentContainer.children.length === 0) {
+			this.startContent();
+			this.addSectionTitle("Preparing authentication");
+		}
+		this.contentContainer.addChild(new Text(theme.fg("muted", message), 0, 0));
 		this.tui.requestRender();
+	}
+
+	private startContent(): void {
+		this.contentContainer.clear();
+		if (this.isPrimeInference) {
+			this.contentContainer.addChild(new PrimeLoginHeader());
+			this.contentContainer.addChild(new Spacer(1));
+			return;
+		}
+		this.contentContainer.addChild(new Spacer(1));
+	}
+
+	private addSectionSpacer(): void {
+		if (this.contentContainer.children.length === 0) {
+			this.startContent();
+			return;
+		}
+		this.contentContainer.addChild(new Spacer(1));
+	}
+
+	private addInstructions(instructions: string): void {
+		const codeMatch = /^(?:Code|Enter code):\s*(.+)$/i.exec(instructions.trim());
+		if (codeMatch?.[1]) {
+			this.addLabel("Verification code");
+			this.contentContainer.addChild(new Text(theme.bold(theme.fg("text", codeMatch[1])), 0, 0));
+			return;
+		}
+		this.addLabel("Next step");
+		this.contentContainer.addChild(new Text(theme.fg("text", instructions), 0, 0));
+	}
+
+	private addSectionTitle(text: string): void {
+		this.contentContainer.addChild(new Text(theme.bold(theme.fg("text", text)), 0, 0));
+	}
+
+	private addLabel(text: string): void {
+		this.contentContainer.addChild(new Text(theme.fg("muted", text), 0, 0));
+	}
+
+	private addMutedText(text: string): void {
+		this.contentContainer.addChild(new Text(theme.fg("muted", text), 0, 0));
 	}
 
 	handleInput(data: string): void {
@@ -187,6 +304,14 @@ export class LoginDialogComponent extends Container implements Focusable {
 
 		if (kb.matches(data, "tui.select.cancel")) {
 			this.cancel();
+			return;
+		}
+
+		if (this.continueResolver && kb.matches(data, "tui.select.confirm")) {
+			const resolve = this.continueResolver;
+			this.continueResolver = undefined;
+			this.continueRejecter = undefined;
+			resolve();
 			return;
 		}
 

@@ -78,7 +78,7 @@ import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/
 import { formatGoalUsage } from "../../core/goals.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import { createCompactionSummaryMessage } from "../../core/messages.js";
-import { defaultModelPerProvider, findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.js";
+import { findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.js";
 import { DefaultPackageManager } from "../../core/package-manager.js";
 import {
 	loginPrimeInference,
@@ -92,7 +92,7 @@ import { type SessionContext, SessionManager } from "../../core/session-manager.
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.js";
 import type { SourceInfo } from "../../core/source-info.js";
 import type { TruncationResult } from "../../core/tools/truncate.js";
-import { PRIME_LOGO_SMALL } from "../../themes/prime-logo.js";
+import { PRIME_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, getNewEntries, parseChangelog } from "../../utils/changelog.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.js";
@@ -106,6 +106,7 @@ import { AssistantMessageComponent } from "./components/assistant-message.js";
 import { BashExecutionComponent } from "./components/bash-execution.js";
 import { BorderedLoader } from "./components/bordered-loader.js";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.js";
+import { CenteredOverlayComponent } from "./components/centered-overlay.js";
 import {
 	ChildAgentDetailComponent,
 	ChildAgentInspectorComponent,
@@ -127,8 +128,13 @@ import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FooterComponent } from "./components/footer.js";
 import { keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
 import { LoginDialogComponent } from "./components/login-dialog.js";
-import { ModelSelectorComponent } from "./components/model-selector.js";
-import { type AuthSelectorProvider, OAuthSelectorComponent } from "./components/oauth-selector.js";
+import { type ModelSelectorAction, ModelSelectorComponent } from "./components/model-selector.js";
+import {
+	type AuthSelectorProvider,
+	compareAuthSelectorProviders,
+	OAuthSelectorComponent,
+} from "./components/oauth-selector.js";
+import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
 import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
@@ -226,7 +232,7 @@ export function truncatePathMiddle(value: string, width: number): string {
 }
 
 class BrandSplashHeader implements Component {
-	private readonly logoRaw = PRIME_LOGO_SMALL.split("\n");
+	private readonly logoRaw = PRIME_BUTTERFLY_LOGO.split("\n");
 	private readonly logoCanvasWidth = this.logoRaw.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
 	private readonly gutter = 4;
 	private readonly labelWidth = 9;
@@ -301,6 +307,22 @@ type GoalAnnouncementSnapshot = {
 	lastError?: string;
 };
 
+type AuthenticationResult =
+	| {
+			status: "success";
+			providerId: string;
+			providerName: string;
+			authType: "oauth" | "api_key";
+	  }
+	| { status: "cancelled" }
+	| { status: "failed" };
+
+type ModelSelectionResult = { status: "selected" } | { status: "cancelled" } | { status: "action"; actionId: string };
+
+const MODEL_SELECTOR_ACTIONS: readonly ModelSelectorAction[] = [
+	{ id: "add_provider", label: "Add provider...", description: "subscription or API key" },
+];
+
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 
 function isDeadTerminalError(error: unknown): boolean {
@@ -316,14 +338,6 @@ const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING =
 
 function isAnthropicSubscriptionAuthKey(apiKey: string | undefined): boolean {
 	return typeof apiKey === "string" && apiKey.startsWith("sk-ant-oat");
-}
-
-function isUnknownModel(model: Model<any> | undefined): boolean {
-	return !!model && model.provider === "unknown" && model.id === "unknown" && model.api === "unknown";
-}
-
-function hasDefaultModelProvider(providerId: string): providerId is keyof typeof defaultModelPerProvider {
-	return providerId in defaultModelPerProvider;
 }
 
 const BEDROCK_PROVIDER_ID = "amazon-bedrock";
@@ -752,11 +766,9 @@ export class InteractiveMode {
 		// Add header container as first child
 		this.ui.addChild(this.headerContainer);
 
-		// Brand splash: side-panel layout — white butterfly on the left, structured runtime
-		// metadata on the right. The mark carries the brand; no wordmark, no slogan.
-		// Cheatsheet behind --verbose. `quietStartup` suppresses the splash entirely
-		// (matches pi-mono's old behaviour for users who want a bare prompt).
-		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
+		// Brand splash: side-panel layout with structured runtime metadata on the right.
+		// When onboarding is required, the guided onboarding splash owns the first screen.
+		if (!this.shouldRunOnboarding() && (this.options.verbose || !this.settingsManager.getQuietStartup())) {
 			// Verbose: include the full keybinding cheatsheet under the brand mark.
 			const hint = (keybinding: AppKeybinding, description: string) => keyHint(keybinding, description);
 			const verboseInstructions = this.options.verbose
@@ -892,36 +904,69 @@ export class InteractiveMode {
 			this.showError(`models.json error: ${modelsJsonError}`);
 		}
 
-		if (modelFallbackMessage) {
-			this.showWarning(modelFallbackMessage);
-		}
-
-		void this.maybeWarnAboutAnthropicSubscriptionAuth();
-
-		// Process initial messages
-		if (initialMessage) {
-			try {
-				await this.session.prompt(initialMessage, { images: initialImages });
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				this.showError(errorMessage);
+		let initialPromptsSent = false;
+		const sendInitialPrompts = async () => {
+			if (initialPromptsSent) {
+				return;
 			}
-		}
+			initialPromptsSent = true;
 
-		if (initialMessages) {
-			for (const message of initialMessages) {
+			if (initialMessage) {
 				try {
-					await this.session.prompt(message);
+					await this.session.prompt(initialMessage, { images: initialImages });
 				} catch (error: unknown) {
 					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 					this.showError(errorMessage);
 				}
 			}
+
+			if (initialMessages) {
+				for (const message of initialMessages) {
+					try {
+						await this.session.prompt(message);
+					} catch (error: unknown) {
+						const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+						this.showError(errorMessage);
+					}
+				}
+			}
+		};
+
+		const needsOnboarding = this.shouldRunOnboarding();
+		let modelFallbackWarningShown = false;
+		const showModelFallbackWarning = () => {
+			if (!modelFallbackMessage || modelFallbackWarningShown) {
+				return;
+			}
+			modelFallbackWarningShown = true;
+			this.showWarning(modelFallbackMessage);
+		};
+
+		if (!needsOnboarding) {
+			showModelFallbackWarning();
+		}
+
+		let promptReady = !needsOnboarding;
+		if (needsOnboarding) {
+			promptReady = await this.runOnboardingFlow();
+		}
+
+		if (promptReady) {
+			showModelFallbackWarning();
+			void this.maybeWarnAboutAnthropicSubscriptionAuth();
+			await sendInitialPrompts();
 		}
 
 		// Main interactive loop
 		while (true) {
 			const userInput = await this.getUserInput();
+			if (!(await this.ensurePromptReady())) {
+				this.editor.setText(userInput);
+				this.showStatus("Complete onboarding to send the restored prompt.");
+				continue;
+			}
+			showModelFallbackWarning();
+			await sendInitialPrompts();
 			try {
 				await this.session.prompt(userInput);
 			} catch (error: unknown) {
@@ -929,6 +974,48 @@ export class InteractiveMode {
 				this.showError(errorMessage);
 			}
 		}
+	}
+
+	private shouldRunOnboarding(): boolean {
+		this.session.modelRegistry.refresh();
+		const model = this.session.model;
+		return !model || !this.session.modelRegistry.hasConfiguredAuth(model);
+	}
+
+	private async ensurePromptReady(): Promise<boolean> {
+		if (!this.shouldRunOnboarding()) {
+			return true;
+		}
+		return this.runOnboardingFlow();
+	}
+
+	private async runOnboardingFlow(): Promise<boolean> {
+		this.session.modelRegistry.refresh();
+		if (this.session.modelRegistry.getAvailable().length > 0) {
+			const selectedModel = await this.promptForModelSelection({ allowProviderSetup: true });
+			if (selectedModel || !this.shouldRunOnboarding()) {
+				return true;
+			}
+
+			this.showStatus("Model selection required. Use /model to continue.");
+			return false;
+		}
+
+		const authResult = await this.showOnboardingPrimeLogin();
+		if (authResult.status !== "success") {
+			this.showStatus(
+				"Prime Intellect login required for onboarding. Use /login to configure other providers later.",
+			);
+			return false;
+		}
+
+		const selectedModel = await this.promptForModelSelection({ allowProviderSetup: true });
+		if (selectedModel || !this.shouldRunOnboarding()) {
+			return true;
+		}
+
+		this.showStatus("Model selection required. Use /model to continue.");
+		return false;
 	}
 
 	private async checkForPackageUpdates(): Promise<string[]> {
@@ -2716,13 +2803,13 @@ export class InteractiveMode {
 				return;
 			}
 			if (text === "/login") {
-				this.showOAuthSelector("login");
 				this.editor.setText("");
+				await this.showOAuthSelector("login");
 				return;
 			}
 			if (text === "/logout") {
-				this.showOAuthSelector("logout");
 				this.editor.setText("");
+				await this.showOAuthSelector("logout");
 				return;
 			}
 			if (text === "/new") {
@@ -4296,6 +4383,21 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private showFullPaneOverlay(component: Component, maxContentWidth = 80): OverlayHandle {
+		return this.ui.showOverlay(
+			new CenteredOverlayComponent(component, {
+				getRows: () => this.ui.terminal.rows,
+				maxContentWidth,
+			}),
+			{
+				width: "100%",
+				maxHeight: "100%",
+				row: 0,
+				col: 0,
+			},
+		);
+	}
+
 	private showSettingsSelector(): void {
 		this.showSelector((done) => {
 			const selector = new SettingsSelectorComponent(
@@ -4529,7 +4631,74 @@ export class InteractiveMode {
 	}
 
 	private showModelSelector(initialSearchInput?: string): void {
-		this.showSelector((done) => {
+		void this.showModelSelectorWithProviderSetup(initialSearchInput);
+	}
+
+	private async showModelSelectorWithProviderSetup(initialSearchInput?: string): Promise<void> {
+		let nextSearchInput = initialSearchInput;
+		while (true) {
+			const result = await this.showModelSelectorAsync(nextSearchInput, {
+				actions: MODEL_SELECTOR_ACTIONS,
+			});
+			if (result.status !== "action") {
+				return;
+			}
+			await this.showLoginProviderSelector();
+			nextSearchInput = undefined;
+		}
+	}
+
+	private async promptForModelSelection(options: { allowProviderSetup?: boolean } = {}): Promise<boolean> {
+		this.session.modelRegistry.refresh();
+		const availableModels = this.session.modelRegistry.getAvailable();
+		if (availableModels.length === 0 && !options.allowProviderSetup) {
+			this.showStatus("No models available. Add credentials with /login.");
+			return false;
+		}
+
+		while (true) {
+			this.session.modelRegistry.refresh();
+
+			this.showStatus("Select a model to continue.");
+			const result = await this.showModelSelectorAsync(
+				undefined,
+				options.allowProviderSetup
+					? {
+							actions: MODEL_SELECTOR_ACTIONS,
+							subtitle: "Choose a Prime model, or add another provider.",
+						}
+					: undefined,
+			);
+			if (result.status === "selected") {
+				return true;
+			}
+			if (result.status !== "action") {
+				return false;
+			}
+
+			await this.showLoginProviderSelector();
+		}
+	}
+
+	private showModelSelectorAsync(
+		initialSearchInput?: string,
+		options?: { actions?: ReadonlyArray<ModelSelectorAction>; subtitle?: string },
+	): Promise<ModelSelectionResult> {
+		return new Promise((resolve) => {
+			let handle: OverlayHandle | undefined;
+			let settled = false;
+			const settle = (result: ModelSelectionResult) => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				resolve(result);
+			};
+			const close = () => {
+				handle?.hide();
+				this.ui.requestRender();
+			};
+
 			const selector = new ModelSelectorComponent(
 				this.ui,
 				this.session.model,
@@ -4541,22 +4710,32 @@ export class InteractiveMode {
 						await this.session.setModel(model);
 						this.footer.invalidate();
 						this.updateEditorBorderColor();
-						done();
+						close();
 						this.showStatus(`Model: ${model.id}`);
 						void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 						this.checkDaxnutsEasterEgg(model);
+						settle({ status: "selected" });
 					} catch (error) {
-						done();
+						close();
 						this.showError(error instanceof Error ? error.message : String(error));
+						settle({ status: "cancelled" });
 					}
 				},
 				() => {
-					done();
-					this.ui.requestRender();
+					close();
+					settle({ status: "cancelled" });
 				},
 				initialSearchInput,
+				{
+					actions: options?.actions,
+					onAction: (actionId) => {
+						close();
+						settle({ status: "action", actionId });
+					},
+					subtitle: options?.subtitle,
+				},
 			);
-			return { component: selector, focus: selector };
+			handle = this.showFullPaneOverlay(selector, 96);
 		});
 	}
 
@@ -4924,7 +5103,7 @@ export class InteractiveMode {
 		}
 
 		const filteredOptions = authType ? options.filter((option) => option.authType === authType) : options;
-		return filteredOptions.sort((a, b) => a.name.localeCompare(b.name));
+		return filteredOptions.sort(compareAuthSelectorProviders);
 	}
 
 	private getLogoutProviderOptions(): AuthSelectorProvider[] {
@@ -4946,76 +5125,104 @@ export class InteractiveMode {
 		return options.sort((a, b) => a.name.localeCompare(b.name));
 	}
 
-	private showLoginAuthTypeSelector(): void {
-		const primeInferenceLabel = "Use Prime Inference";
-		const subscriptionLabel = "Use a subscription";
-		const apiKeyLabel = "Use an API key";
-
-		this.showSelector((done) => {
-			const selector = new ExtensionSelectorComponent(
-				"Select authentication method:",
-				[primeInferenceLabel, subscriptionLabel, apiKeyLabel],
-				(option) => {
-					done();
-					if (option === primeInferenceLabel) {
-						void this.showPrimeInferenceLoginDialog();
-						return;
-					}
-					const authType = option === subscriptionLabel ? "oauth" : "api_key";
-					this.showLoginProviderSelector(authType);
+	private showOnboardingPrimeLogin(): Promise<AuthenticationResult> {
+		return new Promise((resolve) => {
+			let settled = false;
+			let handle: OverlayHandle | undefined;
+			let selector: PrimeOnboardingSplashComponent | undefined;
+			const settle = (result: AuthenticationResult) => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				resolve(result);
+			};
+			const close = () => {
+				selector?.dispose();
+				handle?.hide();
+				this.ui.requestRender();
+			};
+			selector = new PrimeOnboardingSplashComponent(
+				() => {
+					close();
+					void this.showPrimeInferenceLoginDialog().then(settle);
 				},
 				() => {
-					done();
-					this.ui.requestRender();
+					close();
+					settle({ status: "cancelled" });
+				},
+				{
+					getRows: () => this.ui.terminal.rows,
+					requestRender: () => this.ui.requestRender(),
 				},
 			);
-			return { component: selector, focus: selector };
+			handle = this.ui.showOverlay(selector, {
+				width: "100%",
+				maxHeight: "100%",
+				row: 0,
+				col: 0,
+			});
 		});
 	}
 
-	private showLoginProviderSelector(authType: "oauth" | "api_key"): void {
+	private showLoginProviderSelector(authType?: "oauth" | "api_key"): Promise<AuthenticationResult> {
 		const providerOptions = this.getLoginProviderOptions(authType);
 		if (providerOptions.length === 0) {
 			this.showStatus(
-				authType === "oauth" ? "No subscription providers available." : "No API key providers available.",
+				authType === "oauth"
+					? "No subscription providers available."
+					: authType === "api_key"
+						? "No API key providers available."
+						: "No providers available.",
 			);
-			return;
+			return Promise.resolve({ status: "failed" });
 		}
 
-		this.showSelector((done) => {
+		return new Promise((resolve) => {
+			let handle: OverlayHandle | undefined;
+			const close = () => {
+				handle?.hide();
+				this.ui.requestRender();
+			};
 			const selector = new OAuthSelectorComponent(
 				"login",
 				this.session.modelRegistry.authStorage,
 				providerOptions,
 				async (providerId: string) => {
-					done();
+					close();
 
 					const providerOption = providerOptions.find((provider) => provider.id === providerId);
 					if (!providerOption) {
+						resolve({ status: "failed" });
 						return;
 					}
 
 					if (providerOption.authType === "oauth") {
-						await this.showLoginDialog(providerOption.id, providerOption.name);
+						resolve(await this.showLoginDialog(providerOption.id, providerOption.name));
+					} else if (providerOption.id === PRIME_INFERENCE_PROVIDER_ID) {
+						resolve(await this.showPrimeInferenceLoginDialog());
 					} else if (providerOption.id === BEDROCK_PROVIDER_ID) {
-						this.showBedrockSetupDialog(providerOption.id, providerOption.name);
+						resolve(await this.showBedrockSetupDialog(providerOption.id, providerOption.name));
 					} else {
-						await this.showApiKeyLoginDialog(providerOption.id, providerOption.name);
+						resolve(await this.showApiKeyLoginDialog(providerOption.id, providerOption.name));
 					}
 				},
 				() => {
-					done();
-					this.showLoginAuthTypeSelector();
+					close();
+					resolve({ status: "cancelled" });
 				},
 				(providerId) => this.session.modelRegistry.getProviderAuthStatus(providerId),
 			);
-			return { component: selector, focus: selector };
+			handle = this.showFullPaneOverlay(selector, 78);
 		});
 	}
 
 	private async showOAuthSelector(mode: "login" | "logout"): Promise<void> {
 		if (mode === "login") {
-			this.showLoginAuthTypeSelector();
+			const authResult = await this.showLoginProviderSelector();
+			if (authResult.status === "success") {
+				await this.promptForModelSelection();
+			}
 			return;
 		}
 
@@ -5066,85 +5273,86 @@ export class InteractiveMode {
 		providerId: string,
 		providerName: string,
 		authType: "oauth" | "api_key",
-		previousModel: Model<any> | undefined,
-	): Promise<void> {
+	): Promise<AuthenticationResult> {
 		this.session.modelRegistry.refresh();
 
 		const actionLabel = authType === "oauth" ? `Logged in to ${providerName}` : `Saved API key for ${providerName}`;
-
-		let selectedModel: Model<any> | undefined;
-		let selectionError: string | undefined;
-		if (isUnknownModel(previousModel)) {
-			const availableModels = this.session.modelRegistry.getAvailable();
-			const providerModels = availableModels.filter((model) => model.provider === providerId);
-			if (!hasDefaultModelProvider(providerId)) {
-				selectionError = `${actionLabel}, but no default model is configured for provider "${providerId}". Use /model to select a model.`;
-			} else if (providerModels.length === 0) {
-				selectionError = `${actionLabel}, but no models are available for that provider. Use /model to select a model.`;
-			} else {
-				const defaultModelId = defaultModelPerProvider[providerId];
-				selectedModel = providerModels.find((model) => model.id === defaultModelId);
-				if (!selectedModel) {
-					selectionError = `${actionLabel}, but its default model "${defaultModelId}" is not available. Use /model to select a model.`;
-				} else {
-					try {
-						await this.session.setModel(selectedModel);
-					} catch (error: unknown) {
-						selectedModel = undefined;
-						const errorMessage = error instanceof Error ? error.message : String(error);
-						selectionError = `${actionLabel}, but selecting its default model failed: ${errorMessage}. Use /model to select a model.`;
-					}
-				}
-			}
-		}
-
 		await this.updateAvailableProviderCount();
 		this.footer.invalidate();
 		this.updateEditorBorderColor();
-		if (selectedModel) {
-			this.showStatus(`${actionLabel}. Selected ${selectedModel.id}. Credentials saved to ${getAuthPath()}`);
-			void this.maybeWarnAboutAnthropicSubscriptionAuth(selectedModel);
-			this.checkDaxnutsEasterEgg(selectedModel);
-		} else {
-			this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}`);
-			if (selectionError) {
-				this.showError(selectionError);
-			} else {
-				void this.maybeWarnAboutAnthropicSubscriptionAuth();
-			}
-		}
+		this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}`);
+		void this.maybeWarnAboutAnthropicSubscriptionAuth();
+		return {
+			status: "success",
+			providerId,
+			providerName,
+			authType,
+		};
 	}
 
-	private showBedrockSetupDialog(providerId: string, providerName: string): void {
-		const restoreEditor = () => {
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.ui.setFocus(this.editor);
-			this.ui.requestRender();
+	private async completeExternalProviderSetup(
+		providerId: string,
+		providerName: string,
+	): Promise<AuthenticationResult> {
+		this.session.modelRegistry.refresh();
+		await this.updateAvailableProviderCount();
+		this.footer.invalidate();
+		this.updateEditorBorderColor();
+		this.showStatus(`${providerName} uses external credentials. Select a model after configuring them.`);
+		return {
+			status: "success",
+			providerId,
+			providerName,
+			authType: "api_key",
 		};
+	}
 
+	private hasAvailableProviderModels(providerId: string): boolean {
+		this.session.modelRegistry.refresh();
+		return this.session.modelRegistry.getAvailable().some((model) => model.provider === providerId);
+	}
+
+	private async showBedrockSetupDialog(providerId: string, providerName: string): Promise<AuthenticationResult> {
 		const dialog = new LoginDialogComponent(
 			this.ui,
 			providerId,
-			() => restoreEditor(),
+			() => {
+				// Completion handled below.
+			},
 			providerName,
 			"Amazon Bedrock setup",
 		);
-		dialog.showInfo([
-			theme.fg("text", "Amazon Bedrock uses AWS credentials instead of a single API key."),
-			theme.fg("text", "Configure an AWS profile, IAM keys, bearer token, or role-based credentials."),
-			theme.fg("muted", "See:"),
-			theme.fg("accent", `  ${path.join(getDocsPath(), "providers.md")}`),
-		]);
+		const handle = this.showFullPaneOverlay(dialog, 88);
+		const closeDialog = () => {
+			handle.hide();
+			this.ui.requestRender();
+		};
 
-		this.editorContainer.clear();
-		this.editorContainer.addChild(dialog);
-		this.ui.setFocus(dialog);
-		this.ui.requestRender();
+		try {
+			await dialog.showContinueInfo([
+				theme.fg("text", "Amazon Bedrock uses AWS credentials instead of a single API key."),
+				theme.fg("text", "Configure an AWS profile, IAM keys, bearer token, or role-based credentials."),
+				theme.fg("muted", "See:"),
+				theme.fg("accent", `  ${path.join(getDocsPath(), "providers.md")}`),
+			]);
+			closeDialog();
+			if (!this.hasAvailableProviderModels(providerId)) {
+				this.showStatus(`${providerName} credentials were not detected. Configure them, then reopen /model.`);
+				return { status: "cancelled" };
+			}
+			return await this.completeExternalProviderSetup(providerId, providerName);
+		} catch (error: unknown) {
+			closeDialog();
+			const errorMsg = error instanceof Error ? error.message : String(error);
+			if (errorMsg !== "Login cancelled") {
+				this.showError(`Failed to set up ${providerName}: ${errorMsg}`);
+				return { status: "failed" };
+			}
+			return { status: "cancelled" };
+		}
 	}
 
-	private async showPrimeInferenceLoginDialog(): Promise<void> {
-		const previousModel = this.session.model;
+	private async showPrimeInferenceLoginDialog(): Promise<AuthenticationResult> {
 		const dialog = new LoginDialogComponent(
 			this.ui,
 			PRIME_INFERENCE_PROVIDER_ID,
@@ -5154,15 +5362,10 @@ export class InteractiveMode {
 			PRIME_INFERENCE_PROVIDER_NAME,
 		);
 
-		this.editorContainer.clear();
-		this.editorContainer.addChild(dialog);
-		this.ui.setFocus(dialog);
-		this.ui.requestRender();
+		const handle = this.showFullPaneOverlay(dialog, 88);
 
-		const restoreEditor = () => {
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.ui.setFocus(this.editor);
+		const closeDialog = () => {
+			handle.hide();
 			this.ui.requestRender();
 		};
 
@@ -5179,8 +5382,8 @@ export class InteractiveMode {
 			});
 
 			if (dialog.signal.aborted) {
-				restoreEditor();
-				return;
+				closeDialog();
+				return { status: "cancelled" };
 			}
 
 			this.session.modelRegistry.authStorage.set(PRIME_INFERENCE_PROVIDER_ID, {
@@ -5188,25 +5391,24 @@ export class InteractiveMode {
 				key: result.apiKey,
 			});
 
-			restoreEditor();
-			await this.completeProviderAuthentication(
+			closeDialog();
+			return await this.completeProviderAuthentication(
 				PRIME_INFERENCE_PROVIDER_ID,
 				PRIME_INFERENCE_PROVIDER_NAME,
 				"api_key",
-				previousModel,
 			);
 		} catch (error: unknown) {
-			restoreEditor();
+			closeDialog();
 			const errorMsg = error instanceof Error ? error.message : String(error);
 			if (errorMsg !== "Login cancelled") {
 				this.showError(`Failed to login to ${PRIME_INFERENCE_PROVIDER_NAME}: ${errorMsg}`);
+				return { status: "failed" };
 			}
+			return { status: "cancelled" };
 		}
 	}
 
-	private async showApiKeyLoginDialog(providerId: string, providerName: string): Promise<void> {
-		const previousModel = this.session.model;
-
+	private async showApiKeyLoginDialog(providerId: string, providerName: string): Promise<AuthenticationResult> {
 		const dialog = new LoginDialogComponent(
 			this.ui,
 			providerId,
@@ -5216,15 +5418,10 @@ export class InteractiveMode {
 			providerName,
 		);
 
-		this.editorContainer.clear();
-		this.editorContainer.addChild(dialog);
-		this.ui.setFocus(dialog);
-		this.ui.requestRender();
+		const handle = this.showFullPaneOverlay(dialog, 88);
 
-		const restoreEditor = () => {
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.ui.setFocus(this.editor);
+		const closeDialog = () => {
+			handle.hide();
 			this.ui.requestRender();
 		};
 
@@ -5236,23 +5433,27 @@ export class InteractiveMode {
 
 			this.session.modelRegistry.authStorage.set(providerId, { type: "api_key", key: apiKey });
 
-			restoreEditor();
-			await this.completeProviderAuthentication(providerId, providerName, "api_key", previousModel);
+			closeDialog();
+			return await this.completeProviderAuthentication(providerId, providerName, "api_key");
 		} catch (error: unknown) {
-			restoreEditor();
+			closeDialog();
 			const errorMsg = error instanceof Error ? error.message : String(error);
 			if (errorMsg !== "Login cancelled") {
 				this.showError(`Failed to save API key for ${providerName}: ${errorMsg}`);
+				return { status: "failed" };
 			}
+			return { status: "cancelled" };
 		}
 	}
 
-	private showOAuthLoginSelect(dialog: LoginDialogComponent, prompt: OAuthSelectPrompt): Promise<string | undefined> {
+	private showOAuthLoginSelect(dialogHandle: OverlayHandle, prompt: OAuthSelectPrompt): Promise<string | undefined> {
 		return new Promise((resolve) => {
+			dialogHandle.setHidden(true);
+			let selectorHandle: OverlayHandle | undefined;
 			const restoreDialog = () => {
-				this.editorContainer.clear();
-				this.editorContainer.addChild(dialog);
-				this.ui.setFocus(dialog);
+				selectorHandle?.hide();
+				dialogHandle.setHidden(false);
+				dialogHandle.focus();
 				this.ui.requestRender();
 			};
 			const labels = prompt.options.map((option) => option.label);
@@ -5268,18 +5469,14 @@ export class InteractiveMode {
 					resolve(undefined);
 				},
 			);
-			this.editorContainer.clear();
-			this.editorContainer.addChild(selector);
-			this.ui.setFocus(selector);
-			this.ui.requestRender();
+			selectorHandle = this.showFullPaneOverlay(selector, 76);
 		});
 	}
 
-	private async showLoginDialog(providerId: string, providerName: string): Promise<void> {
+	private async showLoginDialog(providerId: string, providerName: string): Promise<AuthenticationResult> {
 		const providerInfo = this.session.modelRegistry.authStorage
 			.getOAuthProviders()
 			.find((provider) => provider.id === providerId);
-		const previousModel = this.session.model;
 
 		// Providers that use callback servers (can paste redirect URL)
 		const usesCallbackServer = providerInfo?.usesCallbackServer ?? false;
@@ -5294,11 +5491,7 @@ export class InteractiveMode {
 			providerName,
 		);
 
-		// Show dialog in editor container
-		this.editorContainer.clear();
-		this.editorContainer.addChild(dialog);
-		this.ui.setFocus(dialog);
-		this.ui.requestRender();
+		const dialogHandle = this.showFullPaneOverlay(dialog, 88);
 
 		// Promise for manual code input (racing with callback server)
 		let manualCodeResolve: ((code: string) => void) | undefined;
@@ -5308,11 +5501,9 @@ export class InteractiveMode {
 			manualCodeReject = reject;
 		});
 
-		// Restore editor helper
-		const restoreEditor = () => {
-			this.editorContainer.clear();
-			this.editorContainer.addChild(this.editor);
-			this.ui.setFocus(this.editor);
+		// Close dialog overlay helper.
+		const closeDialog = () => {
+			dialogHandle.hide();
 			this.ui.requestRender();
 		};
 
@@ -5352,7 +5543,7 @@ export class InteractiveMode {
 					dialog.showProgress(message);
 				},
 
-				onSelect: (prompt: OAuthSelectPrompt) => this.showOAuthLoginSelect(dialog, prompt),
+				onSelect: (prompt: OAuthSelectPrompt) => this.showOAuthLoginSelect(dialogHandle, prompt),
 
 				onManualCodeInput: () => manualCodePromise,
 
@@ -5360,14 +5551,16 @@ export class InteractiveMode {
 			});
 
 			// Success
-			restoreEditor();
-			await this.completeProviderAuthentication(providerId, providerName, "oauth", previousModel);
+			closeDialog();
+			return await this.completeProviderAuthentication(providerId, providerName, "oauth");
 		} catch (error: unknown) {
-			restoreEditor();
+			closeDialog();
 			const errorMsg = error instanceof Error ? error.message : String(error);
 			if (errorMsg !== "Login cancelled") {
 				this.showError(`Failed to login to ${providerName}: ${errorMsg}`);
+				return { status: "failed" };
 			}
+			return { status: "cancelled" };
 		}
 	}
 

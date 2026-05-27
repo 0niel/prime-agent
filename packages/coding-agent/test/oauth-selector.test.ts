@@ -4,7 +4,10 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../src/core/provider-display-names.js";
-import { OAuthSelectorComponent } from "../src/modes/interactive/components/oauth-selector.js";
+import {
+	compareAuthSelectorProviders,
+	OAuthSelectorComponent,
+} from "../src/modes/interactive/components/oauth-selector.js";
 import { isApiKeyLoginProvider } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -38,6 +41,43 @@ describe("OAuthSelectorComponent", () => {
 		expect(isApiKeyLoginProvider("amazon-bedrock", oauthProviderIds, builtInProviderIds)).toBe(true);
 		expect(isApiKeyLoginProvider("custom-oauth", oauthProviderIds, builtInProviderIds)).toBe(false);
 		expect(isApiKeyLoginProvider("custom-api", oauthProviderIds, builtInProviderIds)).toBe(true);
+	});
+
+	it("sorts subscription providers before API key providers", () => {
+		const providers = [
+			{ id: "openai", name: "OpenAI", authType: "api_key" as const },
+			{ id: "anthropic", name: "Anthropic", authType: "api_key" as const },
+			{ id: "github-copilot", name: "GitHub Copilot", authType: "oauth" as const },
+			{ id: "anthropic", name: "Anthropic", authType: "oauth" as const },
+		].sort(compareAuthSelectorProviders);
+
+		expect(providers.map((provider) => `${provider.authType}:${provider.name}`)).toEqual([
+			"oauth:Anthropic",
+			"oauth:GitHub Copilot",
+			"api_key:Anthropic",
+			"api_key:OpenAI",
+		]);
+	});
+
+	it("shows configured providers before unconfigured providers", () => {
+		process.env.OPENAI_API_KEY = "test-openai-key";
+		const authStorage = AuthStorage.inMemory();
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			[
+				{ id: "anthropic", name: "Anthropic", authType: "oauth" },
+				{ id: "github-copilot", name: "GitHub Copilot", authType: "oauth" },
+				{ id: "openai", name: "OpenAI", authType: "api_key" },
+			],
+			() => {},
+			() => {},
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+
+		expect(output.indexOf("OpenAI")).toBeLessThan(output.indexOf("Anthropic"));
+		expect(output.indexOf("OpenAI")).toBeLessThan(output.indexOf("GitHub Copilot"));
 	});
 
 	it("shows stored OAuth auth distinctly in the API key selector", () => {
@@ -77,7 +117,7 @@ describe("OAuthSelectorComponent", () => {
 		const output = stripAnsi(selector.render(120).join("\n"));
 
 		expect(output).toContain("OpenAI");
-		expect(output).toContain("✓ env: OPENAI_API_KEY");
+		expect(output).toContain("env: OPENAI_API_KEY");
 		expect(output).not.toContain("unconfigured");
 	});
 
@@ -95,7 +135,7 @@ describe("OAuthSelectorComponent", () => {
 		const output = stripAnsi(selector.render(120).join("\n"));
 
 		expect(output).toContain("ollama");
-		expect(output).toContain("✓ env: OLLAMA_API_KEY");
+		expect(output).toContain("env: OLLAMA_API_KEY");
 		expect(output).not.toContain("unconfigured");
 	});
 
@@ -113,7 +153,7 @@ describe("OAuthSelectorComponent", () => {
 		const output = stripAnsi(selector.render(120).join("\n"));
 
 		expect(output).toContain("local-proxy");
-		expect(output).toContain("✓ key in models.json");
+		expect(output).toContain("key in models.json");
 		expect(output).not.toContain("unconfigured");
 	});
 
@@ -131,7 +171,7 @@ describe("OAuthSelectorComponent", () => {
 		const output = stripAnsi(selector.render(120).join("\n"));
 
 		expect(output).toContain("op-proxy");
-		expect(output).toContain("✓ command in models.json");
+		expect(output).toContain("command in models.json");
 		expect(output).not.toContain("unconfigured");
 	});
 });
