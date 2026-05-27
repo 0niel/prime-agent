@@ -13,6 +13,7 @@ prime_agent_esc=$(printf '\033')
 prime_agent_original_path="${PATH:-}"
 prime_agent_reset="${prime_agent_esc}[0m"
 prime_agent_bold="${prime_agent_esc}[1m"
+prime_agent_italic="${prime_agent_esc}[3m"
 prime_agent_hide_cursor="${prime_agent_esc}[?25l"
 prime_agent_show_cursor="${prime_agent_esc}[?25h"
 prime_agent_home_cursor="${prime_agent_esc}[H"
@@ -26,7 +27,7 @@ prime_agent_color_primary="${prime_agent_esc}[38;2;127;91;213m"
 prime_agent_color_scan="${prime_agent_esc}[38;2;14;165;233m"
 prime_agent_color_warning="${prime_agent_esc}[38;2;245;158;11m"
 readonly prime_agent_unconfigured_base_url prime_agent_base_url prime_agent_package prime_agent_cmd prime_agent_esc prime_agent_original_path
-readonly prime_agent_reset prime_agent_bold prime_agent_hide_cursor prime_agent_show_cursor prime_agent_home_cursor prime_agent_clear_screen
+readonly prime_agent_reset prime_agent_bold prime_agent_italic prime_agent_hide_cursor prime_agent_show_cursor prime_agent_home_cursor prime_agent_clear_screen
 readonly prime_agent_sync_start prime_agent_sync_end
 readonly prime_agent_color_text prime_agent_color_muted prime_agent_color_dim prime_agent_color_primary prime_agent_color_scan prime_agent_color_warning
 
@@ -295,7 +296,7 @@ prime_agent_content_line() {
 		if [ -n "$prime_agent_screen_question" ]; then
 			prime_agent_set_text_line "$(prime_agent_screen_primary_text)" "$prime_agent_bold$prime_agent_color_text"
 		else
-			prime_agent_set_text_line "$prime_agent_screen_title" "$prime_agent_bold$prime_agent_color_primary"
+			prime_agent_set_title_line "$prime_agent_screen_title"
 		fi
 		return
 	fi
@@ -500,6 +501,47 @@ prime_agent_set_text_line() {
 	prime_agent_content_width=${#prime_agent_content_text}
 	prime_agent_content_style="$2"
 	prime_agent_content_is_set=1
+}
+
+prime_agent_set_title_line() {
+	max_width=$((prime_agent_screen_cols - 4))
+	if [ "$max_width" -lt 1 ]; then
+		max_width=1
+	fi
+	prime_agent_content_text=$(prime_agent_fit_ascii "$1" "$max_width")
+	prime_agent_content_width=${#prime_agent_content_text}
+	case "$prime_agent_content_text" in
+		*"Prime Agent"*)
+			prime_agent_content_text=$(prime_agent_style_prime_agent_title "$prime_agent_content_text")
+			prime_agent_content_style=
+			;;
+		*)
+			prime_agent_content_style="$prime_agent_bold$prime_agent_color_primary"
+			;;
+	esac
+	prime_agent_content_is_set=1
+}
+
+prime_agent_style_prime_agent_title() {
+	text="$1"
+	styled=
+	while :; do
+		case "$text" in
+			*"Prime Agent"*)
+				before=${text%%Prime Agent*}
+				rest=${text#*Prime Agent}
+				styled="${styled}${prime_agent_bold}${prime_agent_color_primary}${before}"
+				styled="${styled}${prime_agent_bold}${prime_agent_color_primary}PRIME"
+				styled="${styled}${prime_agent_reset}${prime_agent_italic}${prime_agent_color_primary} Agent${prime_agent_reset}"
+				text="$rest"
+				;;
+			*)
+				styled="${styled}${prime_agent_bold}${prime_agent_color_primary}${text}${prime_agent_reset}"
+				printf '%s' "$styled"
+				return
+				;;
+		esac
+	done
 }
 
 prime_agent_fit_ascii() {
@@ -1265,7 +1307,7 @@ confirm_install() {
 
 	if [ "$prime_agent_screen_enabled" = 1 ]; then
 		prime_agent_screen "Installation cancelled" "" "No changes were made." ""
-		prime_agent_restore_terminal
+		exit 0
 	fi
 	printf '\nInstallation cancelled.\n'
 	exit 0

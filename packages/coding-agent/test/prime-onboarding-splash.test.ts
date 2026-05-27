@@ -1,6 +1,6 @@
 import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { PrimeOnboardingSplashComponent } from "../src/modes/interactive/components/prime-onboarding-splash.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -15,7 +15,11 @@ describe("PrimeOnboardingSplashComponent", () => {
 		setKeybindings(new KeybindingsManager());
 	});
 
-	it("renders a left-aligned first-run onboarding action", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it("renders a minimal first-run login action", () => {
 		const component = new PrimeOnboardingSplashComponent(
 			() => {},
 			() => {},
@@ -25,13 +29,14 @@ describe("PrimeOnboardingSplashComponent", () => {
 		const output = stripAnsi(lines.join("\n"));
 
 		expect(lines).toHaveLength(36);
-		expect(output).toContain("prime agent");
+		expect(output).toContain("Welcome to PRIME Agent");
 		expect(output).toContain("Press Enter to login with Prime Intellect");
-		expect(output).toContain("Research and infrastructure assistant for high-context work.");
-		expect(output).toContain("• Inspect logs, evals, training runs, and environments.");
-		expect(output).toContain("• Keep context alive in Python state and artifacts.");
-		expect(output).toContain("• Delegate focused work through recursive RLM calls.");
 		expect(output).toContain("·");
+		expect(output).not.toContain("prime agent");
+		expect(output).not.toContain("Research and infrastructure assistant for high-context work.");
+		expect(output).not.toContain("• Inspect logs, evals, training runs, and environments.");
+		expect(output).not.toContain("• Keep context alive in Python state and artifacts.");
+		expect(output).not.toContain("• Delegate focused work through recursive RLM calls.");
 		expect(output).not.toContain("long-context coding tasks");
 		expect(output).not.toContain("Login with Prime Intellect");
 		expect(output).not.toContain("████▀▀▀██▄");
@@ -74,18 +79,29 @@ describe("PrimeOnboardingSplashComponent", () => {
 		expect(selected).toBe(true);
 	});
 
-	it("renders a stable starfield", () => {
+	it("animates the splash at an interactive cadence", () => {
+		vi.useFakeTimers();
+		let renderRequests = 0;
 		const component = new PrimeOnboardingSplashComponent(
 			() => {},
 			() => {},
-			{ getRows: () => 36 },
+			{
+				getRows: () => 36,
+				requestRender: () => {
+					renderRequests++;
+				},
+				animationIntervalMs: 20,
+			},
 		);
 
 		const firstRender = stripAnsi(component.render(100).join("\n"));
+		vi.advanceTimersByTime(60);
 		const secondRender = stripAnsi(component.render(100).join("\n"));
+		component.dispose();
 
-		expect(secondRender).toBe(firstRender);
-		expect(secondRender).toContain("prime agent");
+		expect(renderRequests).toBe(3);
+		expect(secondRender).not.toBe(firstRender);
+		expect(secondRender).toContain("Welcome to PRIME Agent");
 		expect(secondRender).toContain("Press Enter to login with Prime Intellect");
 	});
 
@@ -96,10 +112,12 @@ describe("PrimeOnboardingSplashComponent", () => {
 			{ getRows: () => 40 },
 		);
 		const rendered = component.render(60).map((line) => stripAnsi(line));
-		const titleLine = rendered.find((line) => line.includes("prime agent"));
+		const logoLine = rendered.find((line) => line.includes(PRIME_BUTTERFLY_LOGO.split("\n")[0].trim()));
+		const brandLine = rendered.find((line) => line.includes("Welcome to PRIME Agent"));
 		const hintLine = rendered.find((line) => line.includes("Press Enter to login with Prime Intellect"));
 
-		expect(titleLine?.search(/\S/)).toBeGreaterThan(0);
+		expect(logoLine?.search(/\S/)).toBeGreaterThan(0);
+		expect(brandLine?.search(/\S/)).toBeGreaterThan(0);
 		expect(hintLine?.search(/\S/)).toBeGreaterThan(0);
 	});
 });

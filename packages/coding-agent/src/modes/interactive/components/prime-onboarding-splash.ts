@@ -10,11 +10,10 @@ interface PrimeOnboardingSplashOptions {
 
 const LOGO_LINES = PRIME_BUTTERFLY_LOGO.split("\n");
 const LOGO_WIDTH = LOGO_LINES.reduce((max, line) => Math.max(max, visibleWidth(line)), 0);
-const TITLE = "prime agent";
-const SUBTITLE = "Research and infrastructure assistant for high-context work.";
-const PANEL_GAP = 6;
-const ANIMATION_INTERVAL_MS = 900;
-const STAR_DENSITY = 91;
+const ANIMATION_INTERVAL_MS = 120;
+const LAB_FIELD_HEIGHT = 14;
+const LAB_FIELD_MIN_WIDTH = 42;
+const LAB_FIELD_MAX_WIDTH = 78;
 
 type SplashTone = Extract<ThemeColor, "accent" | "borderMuted" | "dim" | "mdLink" | "muted" | "text" | "warning">;
 
@@ -23,18 +22,14 @@ interface SplashCell {
 	tone: SplashTone;
 	priority: number;
 	bold?: boolean;
-}
-
-interface TracePoint {
-	x: number;
-	y: number;
-	tone: SplashTone;
+	italic?: boolean;
 }
 
 interface StyledText {
 	text: string;
 	tone: SplashTone;
 	bold?: boolean;
+	italic?: boolean;
 	transparentSpaces?: boolean;
 }
 
@@ -86,8 +81,8 @@ export class PrimeOnboardingSplashComponent implements Component {
 		const panelLines = this.renderPanel(safeWidth);
 		const targetRows = this.getTargetRows(panelLines.length);
 		const topPadding = Math.max(0, Math.floor((targetRows - panelLines.length) / 2));
-		const quietZone = this.panelQuietZone(panelLines, topPadding, safeWidth, targetRows);
-		const canvas = this.renderBackdrop(safeWidth, targetRows, quietZone);
+		const logoZone = this.logoQuietZone(safeWidth, topPadding, targetRows);
+		const canvas = this.renderBackdrop(safeWidth, targetRows, logoZone);
 		panelLines.forEach((line, index) => {
 			this.drawStyledText(canvas, line.left, topPadding + index, line.parts, 8);
 		});
@@ -113,62 +108,27 @@ export class PrimeOnboardingSplashComponent implements Component {
 		];
 	}
 
+	private formatBrandLine(): PanelTextLine {
+		return [
+			{ text: "Welcome to ", tone: "text" },
+			{ text: "PRIME", tone: "text", bold: true },
+			{ text: " Agent", tone: "text", italic: true },
+		];
+	}
+
 	private renderPanel(width: number): PanelLine[] {
-		const textLines = this.renderTextLines();
-		const textWidth = textLines.reduce((max, line) => Math.max(max, this.visiblePartsWidth(line)), 0);
-		const horizontalWidth = LOGO_WIDTH + PANEL_GAP + textWidth;
-		const left = Math.max(0, Math.floor((width - Math.min(width, horizontalWidth)) / 2));
 		const lines: PanelLine[] = [];
 
-		if (horizontalWidth <= width) {
-			const lockupHeight = Math.max(LOGO_LINES.length, textLines.length);
-			const logoTopPadding = Math.max(0, Math.floor((lockupHeight - LOGO_LINES.length) / 2));
-			const textTopPadding = Math.max(0, Math.floor((lockupHeight - textLines.length) / 2));
-			for (let index = 0; index < lockupHeight; index++) {
-				const logoLine = LOGO_LINES[index - logoTopPadding] ?? "";
-				const textLine = textLines[index - textTopPadding] ?? [];
-				lines.push({ left, parts: this.renderLockupLine(logoLine, textLine) });
-			}
-		} else {
-			for (const line of this.renderLogoBlock(width)) {
-				lines.push(this.centerParts(line, width));
-			}
-			lines.push({ left: 0, parts: [] });
-			for (const line of textLines) {
-				lines.push(this.centerParts(line, width));
-			}
+		for (const line of this.renderLogoBlock(width)) {
+			lines.push(this.centerParts(line, width));
 		}
+		lines.push({ left: 0, parts: [] });
+		lines.push({ left: 0, parts: [] });
+		lines.push({ left: 0, parts: [] });
+		lines.push(this.centerParts(this.formatBrandLine(), width));
+		lines.push(this.centerParts(this.formatContinueHint(), width));
 
 		return lines;
-	}
-
-	private renderTextLines(): PanelTextLine[] {
-		return [
-			[{ text: TITLE, tone: "text", bold: true }],
-			[{ text: SUBTITLE, tone: "muted" }],
-			[],
-			this.formatBullet("Inspect logs, evals, training runs, and environments."),
-			this.formatBullet("Keep context alive in Python state and artifacts."),
-			this.formatBullet("Delegate focused work through recursive RLM calls."),
-			[],
-			this.formatContinueHint(),
-		];
-	}
-
-	private formatBullet(text: string): PanelTextLine {
-		return [
-			{ text: "• ", tone: "muted" },
-			{ text, tone: "muted" },
-		];
-	}
-
-	private renderLockupLine(logoLine: string, textLine: PanelTextLine): PanelTextLine {
-		const paddedLogo = logoLine + " ".repeat(Math.max(0, LOGO_WIDTH - visibleWidth(logoLine)));
-		return [
-			{ text: paddedLogo, tone: "text", transparentSpaces: true },
-			{ text: " ".repeat(PANEL_GAP), tone: "dim", transparentSpaces: true },
-			...textLine,
-		];
 	}
 
 	private renderLogoBlock(width: number): PanelTextLine[] {
@@ -184,177 +144,102 @@ export class PrimeOnboardingSplashComponent implements Component {
 			Array.from({ length: width }, (): SplashCell => ({ char: " ", tone: "dim", priority: 0 })),
 		);
 
-		this.drawStarfield(canvas, width, rows);
-		this.drawContourField(canvas, width, rows, quietZone);
-		this.drawMetricTraces(canvas, width, rows, quietZone);
-		this.drawPulseMarkers(canvas, width, rows, quietZone);
+		this.drawLabField(canvas, width, rows, quietZone);
 
 		return canvas;
 	}
 
-	private drawStarfield(canvas: SplashCell[][], width: number, rows: number): void {
-		for (let y = 0; y < rows; y++) {
-			for (let x = 0; x < width; x++) {
-				const value = this.hash(x, y);
-				if (value % STAR_DENSITY !== 0) {
-					continue;
-				}
-				const tone = value % 7 === 0 ? "muted" : "dim";
-				this.put(canvas, x, y, "·", tone, 1);
-			}
-		}
-	}
-
-	private drawContourField(
-		canvas: SplashCell[][],
-		width: number,
-		rows: number,
-		quietZone: QuietZone | undefined,
-	): void {
-		if (width < 72 || rows < 18) {
+	private drawLabField(canvas: SplashCell[][], width: number, rows: number, quietZone: QuietZone | undefined): void {
+		if (width < LAB_FIELD_MIN_WIDTH || rows < LAB_FIELD_HEIGHT + 2) {
 			return;
 		}
-		const centerX = width * 0.35;
-		const centerY = rows * 0.55;
-		const maxX = Math.floor(width * 0.82);
-		for (let y = 1; y < rows - 1; y++) {
-			for (let x = 2; x < maxX; x++) {
-				const radius = Math.hypot((x - centerX) / 13, (y - centerY) / 3.5);
-				const wave = radius * 2.65 + Math.sin(x * 0.075) * 0.32;
-				if (Math.abs((wave % 1) - 0.5) > 0.016) {
+
+		const labWidth = Math.max(LAB_FIELD_MIN_WIDTH, Math.min(LAB_FIELD_MAX_WIDTH, width - 6));
+		const left = Math.max(0, Math.floor((width - labWidth) / 2));
+		const fieldTop = quietZone ? quietZone.top - 2 : Math.floor((rows - LAB_FIELD_HEIGHT) / 2);
+		const top = Math.max(0, Math.min(rows - LAB_FIELD_HEIGHT, fieldTop));
+
+		for (let labY = 0; labY < LAB_FIELD_HEIGHT; labY++) {
+			for (let labX = 0; labX < labWidth; labX++) {
+				const x = left + labX;
+				const y = top + labY;
+				const cell = this.labCell(labX, labY, labWidth);
+				if (!cell) {
 					continue;
 				}
-				if (this.isInsideQuietZone(x, y, quietZone)) {
+				if (cell.tone === "mdLink" && this.isInsideQuietZone(x, y, quietZone)) {
 					continue;
 				}
-				const char = (x + y) % 6 === 0 ? "╌" : "·";
-				this.put(canvas, x, y, char, "borderMuted", 2);
+				this.put(canvas, x, y, cell.char, cell.tone, cell.priority);
 			}
 		}
 	}
 
-	private drawMetricTraces(
-		canvas: SplashCell[][],
-		width: number,
-		rows: number,
-		quietZone: QuietZone | undefined,
-	): void {
-		if (width < 48 || rows < 12) {
-			return;
+	private labCell(x: number, y: number, width: number): SplashCell | undefined {
+		const height = LAB_FIELD_HEIGHT;
+		const frame = this.frame;
+		let cell: SplashCell | undefined;
+		const setCell = (char: string, tone: SplashTone, priority: number) => {
+			if (!cell || priority >= cell.priority) {
+				cell = { char, tone, priority };
+			}
+		};
+
+		const hash = this.mod(x * 37 + y * 53 + frame * 11 + x * y * 3, 101);
+		if (hash < 3) {
+			setCell("·", "dim", 1);
 		}
-		for (const trace of this.metricTraces(width, rows, quietZone)) {
-			for (let index = 0; index < trace.length; index++) {
-				const point = trace[index];
-				if (!point || point.x % 2 !== 0) {
-					continue;
+
+		const centerX = Math.floor((width * 36) / 100);
+		const centerY = Math.floor((height * 54) / 100);
+		const contour = Math.abs(x - centerX) + Math.abs(y - centerY) * 4 + Math.floor(x / 6) - frame;
+		if (x < Math.floor((width * 82) / 100) && this.mod(contour, 24) === 12) {
+			setCell((x + y) % 5 === 0 ? "╌" : "·", "borderMuted", 2);
+		}
+
+		const horizonY = Math.floor((height * 58) / 100);
+		if (y === horizonY && x % 2 === 0 && this.mod(x + frame, 13) < 2) {
+			setCell("─", x > Math.floor((width * 60) / 100) ? "accent" : "dim", 3);
+		}
+
+		const scanStart = Math.max(0, Math.floor(width / 2) - 5);
+		if (x >= scanStart) {
+			const scanOffset = x - scanStart;
+			if (scanOffset % 4 === 0) {
+				const scanIndex = Math.floor(scanOffset / 4);
+				const segment = this.mod(y + scanIndex * 2 + Math.floor(frame / 2), 6);
+				if (y > 0 && y < height - 1 && segment < 2) {
+					setCell((scanIndex + y) % 4 === 0 ? "┃" : "╎", "mdLink", 4);
 				}
-				if (this.isInsideQuietZone(point.x, point.y, quietZone)) {
-					continue;
-				}
-				const char = index % 19 === 0 ? "•" : "·";
-				this.put(canvas, point.x, point.y, char, point.tone, 3);
 			}
 		}
-	}
 
-	private drawPulseMarkers(
-		canvas: SplashCell[][],
-		width: number,
-		rows: number,
-		quietZone: QuietZone | undefined,
-	): void {
-		const traces = this.metricTraces(width, rows, quietZone);
-		for (let traceIndex = 0; traceIndex < traces.length; traceIndex++) {
-			const trace = traces[traceIndex];
-			if (!trace || trace.length === 0) {
+		for (let traceIndex = 0; traceIndex < 3; traceIndex++) {
+			const base =
+				traceIndex === 0
+					? Math.floor((height * 30) / 100)
+					: traceIndex === 1
+						? Math.floor((height * 49) / 100)
+						: Math.floor((height * 72) / 100);
+			let wave = this.mod(x * 2 + frame + traceIndex * 7, 16);
+			if (wave > 7) {
+				wave = 15 - wave;
+			}
+			const traceY = base + Math.trunc((wave - 3) / 2);
+			if (y !== traceY) {
 				continue;
 			}
-			const offset = traceIndex * Math.floor(trace.length / 3);
-			const point = trace[(this.frame + offset) % trace.length];
-			if (!point) {
-				continue;
+
+			if (this.mod(x + frame + traceIndex * 13, 41) === 0) {
+				setCell("◆", "warning", 5);
+			} else if (this.mod(x + frame, 12) === 0) {
+				setCell("•", "accent", 5);
+			} else {
+				setCell("·", "accent", 3);
 			}
-			if (this.isInsideQuietZone(point.x, point.y, quietZone)) {
-				continue;
-			}
-			const tone: SplashTone = traceIndex === 1 ? "warning" : "accent";
-			this.put(canvas, point.x, point.y, "•", tone, 5);
-		}
-	}
-
-	private metricTraces(width: number, rows: number, quietZone: QuietZone | undefined): TracePoint[][] {
-		if (width < 48 || rows < 12) {
-			return [];
-		}
-		const left = Math.max(3, Math.floor(width * 0.04));
-		const right = Math.max(left + 1, width - Math.max(4, Math.floor(width * 0.04)));
-		const span = Math.max(1, right - left);
-		const traces: TracePoint[][] = [[], [], []];
-
-		for (let x = left; x < right; x++) {
-			const t = (x - left) / span;
-			const loss = 0.18 + 0.34 * (1 - Math.exp(-t * 3.1)) + Math.sin(t * Math.PI * 7) * 0.018;
-			const reward = 0.72 - 0.3 * (1 - Math.exp(-t * 2.4)) + Math.cos(t * Math.PI * 5) * 0.016;
-			const horizon = 0.58 + Math.sin(t * Math.PI * 3.2) * 0.035 + Math.sin(t * Math.PI * 13) * 0.01;
-			traces[0]?.push({ x, y: this.routedTraceY(this.traceY(loss, rows), x, 0, rows, quietZone), tone: "mdLink" });
-			traces[1]?.push({
-				x,
-				y: this.routedTraceY(this.traceY(reward, rows), x, 1, rows, quietZone),
-				tone: "accent",
-			});
-			traces[2]?.push({
-				x,
-				y: this.routedTraceY(this.traceY(horizon, rows), x, 2, rows, quietZone),
-				tone: "borderMuted",
-			});
 		}
 
-		return traces;
-	}
-
-	private routedTraceY(
-		baseY: number,
-		x: number,
-		traceIndex: number,
-		rows: number,
-		quietZone: QuietZone | undefined,
-	): number {
-		if (!quietZone) {
-			return baseY;
-		}
-		const horizontalFade = 18;
-		const start = quietZone.left - horizontalFade;
-		const end = quietZone.right + horizontalFade;
-		if (x < start || x > end) {
-			return baseY;
-		}
-		const blend =
-			x < quietZone.left
-				? this.smoothStep((x - start) / horizontalFade)
-				: x > quietZone.right
-					? this.smoothStep((end - x) / horizontalFade)
-					: 1;
-		const routeProgress = (x - start) / Math.max(1, end - start);
-		const baseAmplitude = Math.max(2, Math.min(5, rows * 0.075));
-		const arch = Math.sin(routeProgress * Math.PI);
-		const ripple =
-			Math.sin(routeProgress * Math.PI * 2.4 + traceIndex * 1.1) * Math.max(1, Math.min(2, rows * 0.022));
-		const clearance = traceIndex === 2 ? 1 : 2;
-		const targetY =
-			traceIndex === 1
-				? Math.min(rows - 1, quietZone.bottom + clearance + arch * baseAmplitude * 1.25 + ripple)
-				: Math.max(0, quietZone.top - clearance - arch * baseAmplitude * (traceIndex === 2 ? 0.45 : 0.7) + ripple);
-		return Math.round(baseY * (1 - blend) + targetY * blend);
-	}
-
-	private traceY(normalized: number, rows: number): number {
-		const y = Math.round(normalized * Math.max(1, rows - 1));
-		return Math.max(0, Math.min(rows - 1, y));
-	}
-
-	private smoothStep(value: number): number {
-		const clamped = Math.max(0, Math.min(1, value));
-		return clamped * clamped * (3 - 2 * clamped);
+		return cell;
 	}
 
 	private isInsideQuietZone(x: number, y: number, quietZone: QuietZone | undefined): boolean {
@@ -379,7 +264,7 @@ export class PrimeOnboardingSplashComponent implements Component {
 			for (const char of part.text) {
 				const width = Math.max(0, visibleWidth(char));
 				if (char !== " " || !part.transparentSpaces) {
-					this.put(canvas, x, y, char, part.tone, priority, part.bold);
+					this.put(canvas, x, y, char, part.tone, priority, part.bold, part.italic);
 				}
 				x += Math.max(1, width);
 			}
@@ -394,33 +279,43 @@ export class PrimeOnboardingSplashComponent implements Component {
 		tone: SplashTone,
 		priority: number,
 		bold = false,
+		italic = false,
 	): void {
 		if (y < 0 || y >= canvas.length) return;
 		const row = canvas[y];
 		if (!row || x < 0 || x >= row.length) return;
 		if (row[x] && row[x].priority > priority) return;
-		row[x] = { char, tone, priority, bold };
+		row[x] = { char, tone, priority, bold, italic };
 	}
 
 	private renderCells(cells: SplashCell[]): string {
 		let rendered = "";
 		let currentTone: SplashTone | undefined;
 		let currentBold = false;
+		let currentItalic = false;
 		let segment = "";
 
 		const flush = () => {
 			if (!segment || !currentTone) return;
-			const colored = theme.fg(currentTone, segment);
-			rendered += currentBold ? theme.bold(colored) : colored;
+			let styled = theme.fg(currentTone, segment);
+			if (currentItalic) {
+				styled = theme.italic(styled);
+			}
+			if (currentBold) {
+				styled = theme.bold(styled);
+			}
+			rendered += styled;
 			segment = "";
 		};
 
 		for (const cell of cells) {
 			const bold = cell.bold === true;
-			if (cell.tone !== currentTone || bold !== currentBold) {
+			const italic = cell.italic === true;
+			if (cell.tone !== currentTone || bold !== currentBold || italic !== currentItalic) {
 				flush();
 				currentTone = cell.tone;
 				currentBold = bold;
+				currentItalic = italic;
 			}
 			segment += cell.char;
 		}
@@ -428,56 +323,25 @@ export class PrimeOnboardingSplashComponent implements Component {
 		return rendered;
 	}
 
-	private hash(x: number, y: number): number {
-		let value = x * 374761393 + y * 668265263;
-		value = (value ^ (value >> 13)) * 1274126177;
-		return Math.abs(value ^ (value >> 16));
+	private mod(value: number, divisor: number): number {
+		return ((value % divisor) + divisor) % divisor;
 	}
 
 	private visiblePartsWidth(parts: PanelTextLine): number {
 		return parts.reduce((sum, part) => sum + visibleWidth(part.text), 0);
 	}
 
-	private panelQuietZone(
-		panelLines: PanelLine[],
-		topPadding: number,
-		width: number,
-		rows: number,
-	): QuietZone | undefined {
-		let left = Number.POSITIVE_INFINITY;
-		let right = Number.NEGATIVE_INFINITY;
-		let top = Number.POSITIVE_INFINITY;
-		let bottom = Number.NEGATIVE_INFINITY;
-
-		for (let rowIndex = 0; rowIndex < panelLines.length; rowIndex++) {
-			const line = panelLines[rowIndex];
-			if (!line) {
-				continue;
-			}
-			let x = line.left;
-			for (const part of line.parts) {
-				for (const char of part.text) {
-					const charWidth = Math.max(1, visibleWidth(char));
-					if (char !== " " || !part.transparentSpaces) {
-						left = Math.min(left, x);
-						right = Math.max(right, x + charWidth - 1);
-						top = Math.min(top, topPadding + rowIndex);
-						bottom = Math.max(bottom, topPadding + rowIndex);
-					}
-					x += charWidth;
-				}
-			}
-		}
-
-		if (!Number.isFinite(left) || !Number.isFinite(right) || !Number.isFinite(top) || !Number.isFinite(bottom)) {
+	private logoQuietZone(width: number, topPadding: number, rows: number): QuietZone | undefined {
+		const logoWidth = Math.min(LOGO_WIDTH, width);
+		if (logoWidth < 1 || rows < 1) {
 			return undefined;
 		}
-
+		const left = Math.max(0, Math.floor((width - logoWidth) / 2));
 		return {
-			left: Math.max(0, Math.floor(left) - 4),
-			right: Math.min(width - 1, Math.ceil(right) + 4),
-			top: Math.max(0, Math.floor(top) - 2),
-			bottom: Math.min(rows - 1, Math.ceil(bottom) + 2),
+			left,
+			right: Math.min(width - 1, left + logoWidth - 1),
+			top: Math.max(0, topPadding),
+			bottom: Math.min(rows - 1, topPadding + LOGO_LINES.length - 1),
 		};
 	}
 
