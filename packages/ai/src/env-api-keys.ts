@@ -3,7 +3,7 @@ import type { homedir } from "node:os";
 import type { join } from "node:path";
 import type { KnownProvider } from "./types.js";
 
-// NEVER convert to top-level runtime imports - breaks browser/Vite builds (web-ui)
+// NEVER convert to top-level runtime imports - breaks browser/Vite builds
 let _existsSync: typeof existsSync | null = null;
 let _readFileSync: typeof readFileSync | null = null;
 let _homedir: typeof homedir | null = null;

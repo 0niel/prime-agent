@@ -9,6 +9,7 @@ import {
 	cpSync,
 	existsSync,
 	mkdirSync,
+	renameSync,
 	readFileSync,
 	rmSync,
 	statSync,
@@ -24,10 +25,10 @@ const publicPackageName = process.env.PRIME_AGENT_PACKAGE_NAME || "prime-agent";
 const publicCommandName = process.env.PRIME_AGENT_CMD || "prime-agent";
 
 const releasePackages = [
-	{ packageDir: "ai", publicName: undefined },
-	{ packageDir: "tui", publicName: undefined },
-	{ packageDir: "agent", publicName: undefined },
-	{ packageDir: "coding-agent", publicName: publicPackageName },
+	{ packageDir: "ai", publicName: undefined, artifactName: "prime-agent-ai" },
+	{ packageDir: "tui", publicName: undefined, artifactName: "prime-agent-tui" },
+	{ packageDir: "agent", publicName: undefined, artifactName: "prime-agent-core" },
+	{ packageDir: "coding-agent", publicName: publicPackageName, artifactName: publicPackageName },
 ];
 
 function parseArgs(args) {
@@ -85,9 +86,9 @@ function printHelp() {
 Creates private npm tarballs for R2 distribution:
 
   <out-dir>/artifacts/prime-agent-<version>.tgz
-  <out-dir>/artifacts/earendil-works-pi-ai-<version>.tgz
-  <out-dir>/artifacts/earendil-works-pi-agent-core-<version>.tgz
-  <out-dir>/artifacts/earendil-works-pi-tui-<version>.tgz
+  <out-dir>/artifacts/prime-agent-ai-<version>.tgz
+  <out-dir>/artifacts/prime-agent-core-<version>.tgz
+  <out-dir>/artifacts/prime-agent-tui-<version>.tgz
   <out-dir>/artifacts/SHA256SUMS
   <out-dir>/artifacts/stable
   <out-dir>/artifacts/latest.json
@@ -143,8 +144,8 @@ function npmTarballName(packageName, version) {
 	return `${packageName.replace(/^@/, "").replace("/", "-")}-${version}.tgz`;
 }
 
-function releaseTarballUrl(baseUrl, version, packageName) {
-	return `${baseUrl}/releases/v${version}/${npmTarballName(packageName, version)}`;
+function releaseTarballUrl(baseUrl, version, tarballFile) {
+	return `${baseUrl}/releases/v${version}/${tarballFile}`;
 }
 
 function rewriteInternalDependencies(dependencies, internalPackageUrls) {
@@ -238,17 +239,28 @@ function main() {
 		requireBuiltPackage(releasePackage.packageDir);
 	}
 
+	// Dependency keys stay on the source package names so existing compiled imports
+	// keep resolving, while release package names and artifact filenames are branded.
+	const sourcePackageNames = new Map();
 	const packageNames = new Map();
+	const artifactFiles = new Map();
 	for (const releasePackage of releasePackages) {
 		const sourcePackage = sourcePackages.get(releasePackage.packageDir);
-		packageNames.set(releasePackage.packageDir, releasePackage.publicName || sourcePackage.name);
+		const packageName = releasePackage.publicName || releasePackage.artifactName || sourcePackage.name;
+		sourcePackageNames.set(releasePackage.packageDir, sourcePackage.name);
+		packageNames.set(releasePackage.packageDir, packageName);
+		artifactFiles.set(
+			releasePackage.packageDir,
+			npmTarballName(releasePackage.artifactName || packageName, releaseVersion),
+		);
 	}
 
 	const internalPackageUrls = new Map();
 	for (const releasePackage of releasePackages) {
 		if (releasePackage.packageDir === "coding-agent") continue;
-		const packageName = packageNames.get(releasePackage.packageDir);
-		internalPackageUrls.set(packageName, releaseTarballUrl(args.baseUrl, releaseVersion, packageName));
+		const sourcePackageName = sourcePackageNames.get(releasePackage.packageDir);
+		const artifactFile = artifactFiles.get(releasePackage.packageDir);
+		internalPackageUrls.set(sourcePackageName, releaseTarballUrl(args.baseUrl, releaseVersion, artifactFile));
 	}
 
 	const stagingRoot = join(args.outDir, "packages");
@@ -284,10 +296,17 @@ function main() {
 			throw new Error(`npm pack did not create ${tarballPath}`);
 		}
 
+		const artifactFile = artifactFiles.get(releasePackage.packageDir);
+		const artifactPath = join(artifactsDir, artifactFile);
+		if (tarballPath !== artifactPath) {
+			rmSync(artifactPath, { force: true });
+			renameSync(tarballPath, artifactPath);
+		}
+
 		tarballs.push({
 			name: packageName,
-			file: basename(tarballPath),
-			sha256: sha256File(tarballPath),
+			file: artifactFile,
+			sha256: sha256File(artifactPath),
 		});
 	}
 
@@ -300,7 +319,7 @@ function main() {
 	writeJson(join(artifactsDir, "latest.json"), {
 		version: `v${releaseVersion}`,
 		package: publicPackageName,
-		tarball: `releases/v${releaseVersion}/${npmTarballName(publicPackageName, releaseVersion)}`,
+		tarball: `releases/v${releaseVersion}/${artifactFiles.get("coding-agent")}`,
 		tarballs: tarballs.map((tarball) => ({
 			package: tarball.name,
 			file: tarball.file,
