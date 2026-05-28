@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	checkPrimeInferenceAccess,
+	fetchPrimeTeams,
 	loadPrimeCliConfig,
 	loginPrimeInference,
 } from "../src/core/prime-inference-auth.js";
@@ -92,7 +93,84 @@ describe("Prime Inference auth", () => {
 			frontendUrl: "https://prime-app.example",
 			inferenceUrl: "https://api.pinference.ai/api/v1",
 			path: configPath,
+			teamIdFromEnv: false,
 		});
+	});
+
+	it("loads Prime CLI team selection", () => {
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				api_key: "prime-key",
+				team_id: "team-1",
+				team_name: "Research",
+				team_role: "admin",
+			}),
+		);
+
+		expect(loadPrimeCliConfig(configPath)).toMatchObject({
+			apiKey: "prime-key",
+			teamId: "team-1",
+			teamName: "Research",
+			teamRole: "admin",
+			teamIdFromEnv: false,
+		});
+	});
+
+	it("lets PRIME_TEAM_ID override Prime CLI team selection", () => {
+		const originalTeamId = process.env.PRIME_TEAM_ID;
+		process.env.PRIME_TEAM_ID = "env-team";
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				team_id: "file-team",
+				team_name: "Research",
+				team_role: "admin",
+			}),
+		);
+
+		try {
+			expect(loadPrimeCliConfig(configPath)).toMatchObject({
+				teamId: "env-team",
+				teamIdFromEnv: true,
+			});
+			expect(loadPrimeCliConfig(configPath).teamName).toBeUndefined();
+		} finally {
+			if (originalTeamId === undefined) {
+				delete process.env.PRIME_TEAM_ID;
+			} else {
+				process.env.PRIME_TEAM_ID = originalTeamId;
+			}
+		}
+	});
+
+	it("fetches Prime teams across paginated responses", async () => {
+		const requestedUrls: string[] = [];
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			requestedUrls.push(getUrl(input));
+			expect(getAuthorization(init)).toBe("Bearer prime-key");
+			if (requestedUrls.length === 1) {
+				return jsonResponse({
+					data: [{ teamId: "team-1", name: "Research", slug: "research", role: "admin" }],
+					total_count: 2,
+				});
+			}
+			return jsonResponse({
+				data: [{ teamId: "team-2", name: "Infra", slug: "infra", role: "member" }],
+				total_count: 2,
+			});
+		});
+
+		await expect(
+			fetchPrimeTeams("prime-key", "https://prime-api.example/api/v1", { fetchFn: fetchMock }),
+		).resolves.toEqual([
+			{ teamId: "team-1", name: "Research", slug: "research", role: "admin" },
+			{ teamId: "team-2", name: "Infra", slug: "infra", role: "member" },
+		]);
+		expect(requestedUrls).toEqual([
+			"https://prime-api.example/api/v1/user/teams?offset=0&limit=100",
+			"https://prime-api.example/api/v1/user/teams?offset=100&limit=100",
+		]);
 	});
 
 	it("checks Prime Inference access with Prime whoami permissions", async () => {

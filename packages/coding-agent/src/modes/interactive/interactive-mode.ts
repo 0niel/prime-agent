@@ -64,6 +64,7 @@ import {
 	type RlmChildAgentSnapshot,
 } from "../../core/agent-session.js";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.js";
+import { formatNoModelsAvailableMessage } from "../../core/auth-guidance.js";
 import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
@@ -81,9 +82,12 @@ import { createCompactionSummaryMessage } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.js";
 import { DefaultPackageManager } from "../../core/package-manager.js";
 import {
+	fetchPrimeTeams,
+	loadPrimeCliConfig,
 	loginPrimeInference,
 	PRIME_INFERENCE_PROVIDER_ID,
 	PRIME_INFERENCE_PROVIDER_NAME,
+	type PrimeTeam,
 } from "../../core/prime-inference-auth.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../../core/provider-display-names.js";
 import type { ResourceDiagnostic } from "../../core/resource-loader.js";
@@ -135,6 +139,7 @@ import {
 	OAuthSelectorComponent,
 } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
+import { PrimeTeamSelectorComponent } from "./components/prime-team-selector.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
 import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
@@ -185,17 +190,8 @@ class ExpandableText extends Text implements Expandable {
 	}
 }
 
-function formatSplashCwd(cwd: string): string {
+export function formatSplashCwd(cwd: string): string {
 	const normalized = cwd.replace(/\\/g, "/");
-	const worktreeMarker = "/.worktrees/";
-	const worktreeIndex = normalized.indexOf(worktreeMarker);
-	if (worktreeIndex >= 0) {
-		const repoRoot = normalized.slice(0, worktreeIndex);
-		const rest = normalized.slice(worktreeIndex + worktreeMarker.length);
-		const repoName = path.basename(repoRoot);
-		return `${repoName}/${rest}`;
-	}
-
 	const home = os.homedir().replace(/\\/g, "/");
 	if (home && normalized === home) {
 		return "~";
@@ -318,6 +314,8 @@ type AuthenticationResult =
 	| { status: "failed" };
 
 type ModelSelectionResult = { status: "selected" } | { status: "cancelled" } | { status: "action"; actionId: string };
+
+type ModelFallbackWarningAction = "show" | "suppress" | "wait";
 
 const MODEL_SELECTOR_ACTIONS: readonly ModelSelectorAction[] = [
 	{ id: "add_provider", label: "Add provider...", description: "subscription or API key" },
@@ -871,26 +869,9 @@ export class InteractiveMode {
 	async run(): Promise<void> {
 		await this.init();
 
-		// Start version check asynchronously
-		checkForNewPiVersion(this.version).then((newVersion) => {
-			if (newVersion) {
-				this.showNewVersionNotification(newVersion);
-			}
-		});
-
-		// Start package update check asynchronously
-		this.checkForPackageUpdates().then((updates) => {
-			if (updates.length > 0) {
-				this.showPackageUpdateNotification(updates);
-			}
-		});
-
-		// Check tmux keyboard setup asynchronously
-		this.checkTmuxKeyboardSetup().then((warning) => {
-			if (warning) {
-				this.showWarning(warning);
-			}
-		});
+		const newVersionPromise = checkForNewPiVersion(this.version);
+		const packageUpdatesPromise = this.checkForPackageUpdates();
+		const tmuxKeyboardWarningPromise = this.checkTmuxKeyboardSetup();
 
 		// Show startup warnings
 		const { migratedProviders, modelFallbackMessage, initialMessage, initialImages, initialMessages } = this.options;
@@ -933,13 +914,51 @@ export class InteractiveMode {
 		};
 
 		const needsOnboarding = this.shouldRunOnboarding();
+		let deferredStartupNotificationsShown = false;
+		const showDeferredStartupNotifications = () => {
+			if (deferredStartupNotificationsShown || this.shouldRunOnboarding()) {
+				return;
+			}
+			deferredStartupNotificationsShown = true;
+
+			void newVersionPromise
+				.then((newVersion) => {
+					if (newVersion) {
+						this.showNewVersionNotification(newVersion);
+					}
+				})
+				.catch(() => {});
+
+			void packageUpdatesPromise
+				.then((updates) => {
+					if (updates.length > 0) {
+						this.showPackageUpdateNotification(updates);
+					}
+				})
+				.catch(() => {});
+
+			void tmuxKeyboardWarningPromise
+				.then((warning) => {
+					if (warning) {
+						this.showWarning(warning);
+					}
+				})
+				.catch(() => {});
+		};
+
 		let modelFallbackWarningShown = false;
 		const showModelFallbackWarning = () => {
-			if (!modelFallbackMessage || modelFallbackWarningShown) {
+			if (modelFallbackWarningShown) {
+				return;
+			}
+			const action = this.getModelFallbackWarningAction(modelFallbackMessage, needsOnboarding);
+			if (action === "wait") {
 				return;
 			}
 			modelFallbackWarningShown = true;
-			this.showWarning(modelFallbackMessage);
+			if (action === "show" && modelFallbackMessage) {
+				this.showWarning(modelFallbackMessage);
+			}
 		};
 
 		if (!needsOnboarding) {
@@ -952,6 +971,7 @@ export class InteractiveMode {
 		}
 
 		if (promptReady) {
+			showDeferredStartupNotifications();
 			showModelFallbackWarning();
 			void this.maybeWarnAboutAnthropicSubscriptionAuth();
 			await sendInitialPrompts();
@@ -965,6 +985,7 @@ export class InteractiveMode {
 				this.showStatus("Complete onboarding to send the restored prompt.");
 				continue;
 			}
+			showDeferredStartupNotifications();
 			showModelFallbackWarning();
 			await sendInitialPrompts();
 			try {
@@ -974,6 +995,26 @@ export class InteractiveMode {
 				this.showError(errorMessage);
 			}
 		}
+	}
+
+	private getModelFallbackWarningAction(
+		modelFallbackMessage: string | undefined,
+		startupNeededOnboarding: boolean,
+	): ModelFallbackWarningAction {
+		if (!modelFallbackMessage) {
+			return "suppress";
+		}
+		if (
+			startupNeededOnboarding &&
+			modelFallbackMessage === formatNoModelsAvailableMessage() &&
+			!this.shouldRunOnboarding()
+		) {
+			return "suppress";
+		}
+		if (startupNeededOnboarding && modelFallbackMessage === formatNoModelsAvailableMessage()) {
+			return "wait";
+		}
+		return "show";
 	}
 
 	private shouldRunOnboarding(): boolean {
@@ -5273,6 +5314,7 @@ export class InteractiveMode {
 		providerId: string,
 		providerName: string,
 		authType: "oauth" | "api_key",
+		statusSuffix?: string,
 	): Promise<AuthenticationResult> {
 		this.session.modelRegistry.refresh();
 
@@ -5280,7 +5322,9 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 		this.footer.invalidate();
 		this.updateEditorBorderColor();
-		this.showStatus(`${actionLabel}. Credentials saved to ${getAuthPath()}`);
+		this.showStatus(
+			`${actionLabel}. Credentials saved to ${getAuthPath()}${statusSuffix ? `. ${statusSuffix}` : ""}`,
+		);
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 		return {
 			status: "success",
@@ -5352,6 +5396,93 @@ export class InteractiveMode {
 		}
 	}
 
+	private showPrimeTeamSelector(
+		teams: PrimeTeam[],
+		currentTeamId: string | undefined,
+	): Promise<PrimeTeam | null | undefined> {
+		return new Promise((resolve) => {
+			let handle: OverlayHandle | undefined;
+			const close = () => {
+				handle?.hide();
+				this.ui.requestRender();
+			};
+			const selector = new PrimeTeamSelectorComponent(
+				teams,
+				currentTeamId,
+				(team) => {
+					close();
+					resolve(team);
+				},
+				() => {
+					close();
+					resolve(undefined);
+				},
+			);
+			handle = this.showFullPaneOverlay(selector, 78);
+		});
+	}
+
+	private getPrimeInferenceDefaultTeamStatus(): string {
+		const storedTeam = this.session.modelRegistry.authStorage.getPrimeInferenceTeamSelection();
+		if (storedTeam) {
+			return `Using team "${storedTeam.name}".`;
+		}
+		if (storedTeam === null) {
+			return "Using personal account.";
+		}
+		let config: ReturnType<typeof loadPrimeCliConfig>;
+		try {
+			config = loadPrimeCliConfig();
+		} catch {
+			return "Using personal account.";
+		}
+		if (config.teamIdFromEnv) {
+			return "Using team from PRIME_TEAM_ID.";
+		}
+		if (config.teamName) {
+			return `Using team "${config.teamName}".`;
+		}
+		if (config.teamId) {
+			return "Using Prime CLI team.";
+		}
+		return "Using personal account.";
+	}
+
+	private async selectPrimeInferenceTeam(apiKey: string, dialog: LoginDialogComponent): Promise<string | undefined> {
+		try {
+			const config = loadPrimeCliConfig();
+			if (config.teamIdFromEnv) {
+				this.session.modelRegistry.authStorage.reload();
+				return "Using team from PRIME_TEAM_ID.";
+			}
+
+			dialog.showProgress("Loading Prime teams...");
+			const teams = await fetchPrimeTeams(apiKey, config.baseUrl, { signal: dialog.signal });
+			if (dialog.signal.aborted) {
+				return this.getPrimeInferenceDefaultTeamStatus();
+			}
+			if (teams.length === 0) {
+				this.session.modelRegistry.authStorage.setPrimeInferenceTeamSelection(null);
+				return "Using personal account.";
+			}
+
+			const storedTeam = this.session.modelRegistry.authStorage.getPrimeInferenceTeamSelection();
+			const currentTeamId = storedTeam === null ? undefined : (storedTeam?.teamId ?? config.teamId);
+			const selectedTeam = await this.showPrimeTeamSelector(teams, currentTeamId);
+			if (selectedTeam !== undefined) {
+				this.session.modelRegistry.authStorage.setPrimeInferenceTeamSelection(selectedTeam);
+			}
+			return selectedTeam
+				? `Using team "${selectedTeam.name}".`
+				: selectedTeam === null
+					? "Using personal account."
+					: this.getPrimeInferenceDefaultTeamStatus();
+		} catch {
+			this.session.modelRegistry.authStorage.reload();
+			return this.getPrimeInferenceDefaultTeamStatus();
+		}
+	}
+
 	private async showPrimeInferenceLoginDialog(): Promise<AuthenticationResult> {
 		const dialog = new LoginDialogComponent(
 			this.ui,
@@ -5386,16 +5517,22 @@ export class InteractiveMode {
 				return { status: "cancelled" };
 			}
 
+			const previousPrimeCredential = this.session.modelRegistry.authStorage.get(PRIME_INFERENCE_PROVIDER_ID);
+			const previousPrimeTeam =
+				previousPrimeCredential?.type === "api_key" ? previousPrimeCredential.primeTeam : undefined;
 			this.session.modelRegistry.authStorage.set(PRIME_INFERENCE_PROVIDER_ID, {
 				type: "api_key",
 				key: result.apiKey,
+				...(previousPrimeTeam !== undefined ? { primeTeam: previousPrimeTeam } : {}),
 			});
+			const teamStatus = await this.selectPrimeInferenceTeam(result.apiKey, dialog);
 
 			closeDialog();
 			return await this.completeProviderAuthentication(
 				PRIME_INFERENCE_PROVIDER_ID,
 				PRIME_INFERENCE_PROVIDER_NAME,
 				"api_key",
+				teamStatus,
 			);
 		} catch (error: unknown) {
 			closeDialog();

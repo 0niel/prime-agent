@@ -27,6 +27,10 @@ export type PrimeCliConfig = {
 	frontendUrl: string;
 	inferenceUrl: string;
 	path: string;
+	teamId?: string;
+	teamName?: string;
+	teamRole?: string;
+	teamIdFromEnv: boolean;
 };
 
 export type PrimeInferenceLoginCallbacks = {
@@ -60,6 +64,14 @@ export type PrimeInferenceAccessResult =
 			message: string;
 	  };
 
+export type PrimeTeam = {
+	teamId: string;
+	name: string;
+	slug?: string;
+	role?: string;
+	createdAt?: string;
+};
+
 function defaultPrimeCliConfigPath(): string {
 	return join(homedir(), ".prime", "config.json");
 }
@@ -80,11 +92,21 @@ function stringField(data: Record<string, unknown>, key: string): string | undef
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
+function stringEnv(name: string): string | undefined {
+	const value = process.env[name];
+	return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function numberField(data: Record<string, unknown>, key: string): number | undefined {
+	const value = data[key];
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function loadPrimeCliConfig(configPath: string = defaultPrimeCliConfigPath()): PrimeCliConfig {
+function readPrimeCliConfigData(configPath: string): Record<string, unknown> {
 	let data: Record<string, unknown> = {};
 	if (existsSync(configPath)) {
 		try {
@@ -96,14 +118,39 @@ export function loadPrimeCliConfig(configPath: string = defaultPrimeCliConfigPat
 			data = {};
 		}
 	}
+	return data;
+}
 
-	return {
-		apiKey: stringField(data, "api_key"),
+export function loadPrimeCliConfig(configPath: string = defaultPrimeCliConfigPath()): PrimeCliConfig {
+	const data = readPrimeCliConfigData(configPath);
+	const teamIdFromEnv = stringEnv("PRIME_TEAM_ID");
+	const teamId = teamIdFromEnv ?? stringField(data, "team_id");
+
+	const config: PrimeCliConfig = {
 		baseUrl: normalizeBaseUrl(stringField(data, "base_url")),
 		frontendUrl: normalizeUrl(stringField(data, "frontend_url"), DEFAULT_PRIME_FRONTEND_URL),
 		inferenceUrl: normalizeUrl(stringField(data, "inference_url"), DEFAULT_PRIME_INFERENCE_URL),
 		path: configPath,
+		teamIdFromEnv: teamIdFromEnv !== undefined,
 	};
+	const apiKey = stringField(data, "api_key");
+	if (apiKey) {
+		config.apiKey = apiKey;
+	}
+	if (teamId) {
+		config.teamId = teamId;
+	}
+	if (!teamIdFromEnv) {
+		const teamName = stringField(data, "team_name");
+		const teamRole = stringField(data, "team_role");
+		if (teamName) {
+			config.teamName = teamName;
+		}
+		if (teamRole) {
+			config.teamRole = teamRole;
+		}
+	}
+	return config;
 }
 
 function throwIfCancelled(signal?: AbortSignal): void {
@@ -199,6 +246,94 @@ async function readJsonObject(response: Response, context: string): Promise<Reco
 		throw new Error(`${context} returned an invalid response`);
 	}
 	return parsed;
+}
+
+function parsePrimeTeam(value: unknown): PrimeTeam | undefined {
+	if (!isRecord(value)) {
+		return undefined;
+	}
+	const teamId = stringField(value, "teamId");
+	if (!teamId) {
+		return undefined;
+	}
+
+	const team: PrimeTeam = {
+		teamId,
+		name: stringField(value, "name") ?? "Unknown",
+	};
+	const slug = stringField(value, "slug");
+	const role = stringField(value, "role");
+	const createdAt = stringField(value, "createdAt");
+	if (slug) {
+		team.slug = slug;
+	}
+	if (role) {
+		team.role = role;
+	}
+	if (createdAt) {
+		team.createdAt = createdAt;
+	}
+	return team;
+}
+
+export async function fetchPrimeTeams(
+	apiKey: string,
+	baseUrl: string,
+	options: {
+		fetchFn?: typeof fetch;
+		requestTimeoutMs?: number;
+		signal?: AbortSignal;
+	} = {},
+): Promise<PrimeTeam[]> {
+	const fetchFn = options.fetchFn ?? fetch;
+	const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+	const teams: PrimeTeam[] = [];
+	let offset = 0;
+	const limit = 100;
+
+	while (true) {
+		const url = new URL(`${normalizeBaseUrl(baseUrl)}/api/v1/user/teams`);
+		url.searchParams.set("offset", String(offset));
+		url.searchParams.set("limit", String(limit));
+		const response = await fetchWithTimeout(
+			fetchFn,
+			url,
+			{
+				method: "GET",
+				headers: {
+					Authorization: `Bearer ${apiKey}`,
+					Accept: "application/json",
+				},
+			},
+			requestTimeoutMs,
+			options.signal,
+		);
+
+		if (!response.ok) {
+			throw new Error(`Failed to fetch Prime teams: ${await readResponseMessage(response)}`);
+		}
+
+		const data = await readJsonObject(response, "Prime teams");
+		const batch = data.data;
+		if (!Array.isArray(batch)) {
+			throw new Error("Prime teams response missing team data");
+		}
+
+		for (const item of batch) {
+			const team = parsePrimeTeam(item);
+			if (team) {
+				teams.push(team);
+			}
+		}
+
+		const totalCount = numberField(data, "total_count") ?? teams.length;
+		if (batch.length === 0 || teams.length >= totalCount) {
+			break;
+		}
+		offset += limit;
+	}
+
+	return teams;
 }
 
 function createPrimeChallengeKeypair(): { privateKey: string; publicKey: string } {

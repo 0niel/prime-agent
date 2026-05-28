@@ -687,14 +687,15 @@ export class ModelRegistry {
 					: undefined);
 
 			const providerHeaders = resolveHeadersOrThrow(providerConfig?.headers, `provider "${model.provider}"`);
+			const authStorageHeaders = this.authStorage.getProviderHeaders(model.provider);
 			const modelHeaders = resolveHeadersOrThrow(
 				this.modelRequestHeaders.get(this.getModelRequestKey(model.provider, model.id)),
 				`model "${model.provider}/${model.id}"`,
 			);
 
 			let headers =
-				model.headers || providerHeaders || modelHeaders
-					? { ...model.headers, ...providerHeaders, ...modelHeaders }
+				model.headers || authStorageHeaders || providerHeaders || modelHeaders
+					? { ...model.headers, ...authStorageHeaders, ...providerHeaders, ...modelHeaders }
 					: undefined;
 
 			if (providerConfig?.authHeader) {

@@ -18,12 +18,26 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "f
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
-import { loadPrimeCliConfig, PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
+import {
+	loadPrimeCliConfig,
+	PRIME_INFERENCE_PROVIDER_ID,
+	type PrimeCliConfig,
+	type PrimeTeam,
+} from "./prime-inference-auth.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
+
+export type PrimeTeamCredential = {
+	teamId: string;
+	name: string;
+	slug?: string;
+	role?: string;
+	createdAt?: string;
+};
 
 export type ApiKeyCredential = {
 	type: "api_key";
 	key: string;
+	primeTeam?: PrimeTeamCredential | null;
 };
 
 export type OAuthCredential = {
@@ -200,8 +214,8 @@ export class AuthStorage {
 	private fallbackResolver?: (provider: string) => string | undefined;
 	private loadError: Error | null = null;
 	private errors: Error[] = [];
-	private primeCliApiKeyCache: string | undefined;
-	private primeCliApiKeyCacheLoaded = false;
+	private primeCliConfigCache: PrimeCliConfig | undefined;
+	private primeCliConfigCacheLoaded = false;
 
 	private constructor(
 		private storage: AuthStorageBackend,
@@ -264,8 +278,8 @@ export class AuthStorage {
 	 * Reload credentials from storage.
 	 */
 	reload(): void {
-		this.primeCliApiKeyCache = undefined;
-		this.primeCliApiKeyCacheLoaded = false;
+		this.primeCliConfigCache = undefined;
+		this.primeCliConfigCacheLoaded = false;
 		let content: string | undefined;
 		try {
 			this.storage.withLock((current) => {
@@ -544,17 +558,79 @@ export class AuthStorage {
 		return getOAuthProviders();
 	}
 
-	private getPrimeCliApiKey(providerId: string): string | undefined {
+	setPrimeInferenceTeamSelection(team: PrimeTeam | null): void {
+		const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
+		if (credential?.type !== "api_key") {
+			return;
+		}
+		this.set(PRIME_INFERENCE_PROVIDER_ID, {
+			...credential,
+			primeTeam: team ? this.toPrimeTeamCredential(team) : null,
+		});
+	}
+
+	getPrimeInferenceTeamSelection(): PrimeTeamCredential | null | undefined {
+		const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
+		return credential?.type === "api_key" ? credential.primeTeam : undefined;
+	}
+
+	getProviderHeaders(providerId: string): Record<string, string> | undefined {
+		if (providerId !== PRIME_INFERENCE_PROVIDER_ID) {
+			return undefined;
+		}
+
+		const primeCliConfig = this.getPrimeCliConfig(providerId);
+		if (primeCliConfig?.teamIdFromEnv) {
+			return primeCliConfig.teamId ? { "X-Prime-Team-ID": primeCliConfig.teamId } : undefined;
+		}
+
+		const credential = this.data[providerId];
+		if (credential?.type === "api_key") {
+			if (credential.primeTeam === null) {
+				return undefined;
+			}
+			const selectedTeamId = credential.primeTeam?.teamId;
+			if (selectedTeamId) {
+				return { "X-Prime-Team-ID": selectedTeamId };
+			}
+		}
+
+		const teamId = primeCliConfig?.teamId;
+		return teamId ? { "X-Prime-Team-ID": teamId } : undefined;
+	}
+
+	private toPrimeTeamCredential(team: PrimeTeam): PrimeTeamCredential {
+		const credential: PrimeTeamCredential = {
+			teamId: team.teamId,
+			name: team.name,
+		};
+		if (team.slug) {
+			credential.slug = team.slug;
+		}
+		if (team.role) {
+			credential.role = team.role;
+		}
+		if (team.createdAt) {
+			credential.createdAt = team.createdAt;
+		}
+		return credential;
+	}
+
+	private getPrimeCliConfig(providerId: string): PrimeCliConfig | undefined {
 		if (providerId !== PRIME_INFERENCE_PROVIDER_ID) {
 			return undefined;
 		}
 		if (!this.options.usePrimeCliConfig && !this.options.primeCliConfigPath) {
 			return undefined;
 		}
-		if (!this.primeCliApiKeyCacheLoaded) {
-			this.primeCliApiKeyCache = loadPrimeCliConfig(this.options.primeCliConfigPath).apiKey;
-			this.primeCliApiKeyCacheLoaded = true;
+		if (!this.primeCliConfigCacheLoaded) {
+			this.primeCliConfigCache = loadPrimeCliConfig(this.options.primeCliConfigPath);
+			this.primeCliConfigCacheLoaded = true;
 		}
-		return this.primeCliApiKeyCache;
+		return this.primeCliConfigCache;
+	}
+
+	private getPrimeCliApiKey(providerId: string): string | undefined {
+		return this.getPrimeCliConfig(providerId)?.apiKey;
 	}
 }

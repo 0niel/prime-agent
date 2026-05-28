@@ -7,10 +7,11 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
+import { formatNoModelsAvailableMessage } from "../src/core/auth-guidance.js";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.js";
 import { emptyGoalState, type GoalState } from "../src/core/goals.js";
 import type { SourceInfo } from "../src/core/source-info.js";
-import { InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
+import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 function renderLastLine(container: Container, width = 120): string {
@@ -125,6 +126,68 @@ describe("InteractiveMode.showStatus", () => {
 		// adds spacer + text
 		expect(fakeThis.chatContainer.children).toHaveLength(5);
 		expect(renderLastLine(fakeThis.chatContainer)).toContain("STATUS_TWO");
+	});
+});
+
+describe("InteractiveMode startup onboarding warnings", () => {
+	type StartupWarningHarness = {
+		shouldRunOnboarding(): boolean;
+		getModelFallbackWarningAction(
+			modelFallbackMessage: string | undefined,
+			startupNeededOnboarding: boolean,
+		): "show" | "suppress" | "wait";
+	};
+
+	const getModelFallbackWarningAction = (InteractiveMode.prototype as unknown as StartupWarningHarness)
+		.getModelFallbackWarningAction;
+
+	test("suppresses the stale no-model warning after onboarding selects a model", () => {
+		const fakeThis: StartupWarningHarness = {
+			shouldRunOnboarding: vi.fn(() => false),
+			getModelFallbackWarningAction,
+		};
+
+		expect(getModelFallbackWarningAction.call(fakeThis, formatNoModelsAvailableMessage(), true)).toBe("suppress");
+		expect(fakeThis.shouldRunOnboarding).toHaveBeenCalledTimes(1);
+	});
+
+	test("waits to suppress the stale no-model warning while onboarding is still needed", () => {
+		const fakeThis: StartupWarningHarness = {
+			shouldRunOnboarding: vi.fn(() => true),
+			getModelFallbackWarningAction,
+		};
+
+		expect(getModelFallbackWarningAction.call(fakeThis, formatNoModelsAvailableMessage(), true)).toBe("wait");
+		expect(fakeThis.shouldRunOnboarding).toHaveBeenCalledTimes(1);
+	});
+
+	test("keeps real model restore fallback warnings after onboarding", () => {
+		const fakeThis: StartupWarningHarness = {
+			shouldRunOnboarding: vi.fn(() => false),
+			getModelFallbackWarningAction,
+		};
+
+		expect(
+			getModelFallbackWarningAction.call(
+				fakeThis,
+				"Could not restore model anthropic/claude-old. Using prime-inference/openai/gpt-5.5.",
+				true,
+			),
+		).toBe("show");
+		expect(fakeThis.shouldRunOnboarding).not.toHaveBeenCalled();
+	});
+});
+
+describe("InteractiveMode splash cwd display", () => {
+	test("formats home-relative cwd paths", () => {
+		expect(formatSplashCwd(homedir())).toBe("~");
+		expect(formatSplashCwd(path.join(homedir(), "pi", "prime-agent"))).toBe("~/pi/prime-agent");
+	});
+
+	test("keeps worktree paths as cwd paths instead of repo branch labels", () => {
+		expect(formatSplashCwd(path.join(homedir(), "pi", "prime-agent", ".worktrees", "improve-onboarding"))).toBe(
+			"~/pi/prime-agent/.worktrees/improve-onboarding",
+		);
 	});
 });
 

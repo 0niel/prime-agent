@@ -185,6 +185,86 @@ describe("AuthStorage", () => {
 			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("changed-prime-key");
 		});
 
+		test("prime inference provider headers include selected Prime Agent team", () => {
+			const primeConfigPath = join(tempDir, "prime-config.json");
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key", team_id: "cli-team" }));
+			writeAuthJson({
+				"prime-inference": {
+					type: "api_key",
+					key: "agent-key",
+					primeTeam: { teamId: "team-1", name: "Research", slug: "research", role: "admin" },
+				},
+			});
+
+			authStorage = AuthStorage.create(authJsonPath, {
+				primeCliConfigPath: primeConfigPath,
+				usePrimeCliConfig: true,
+			});
+
+			expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "team-1" });
+			expect(authStorage.getPrimeInferenceTeamSelection()).toEqual({
+				teamId: "team-1",
+				name: "Research",
+				slug: "research",
+				role: "admin",
+			});
+		});
+
+		test("prime inference personal selection suppresses Prime CLI team fallback for stored Agent key", () => {
+			const primeConfigPath = join(tempDir, "prime-config.json");
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key", team_id: "cli-team" }));
+			writeAuthJson({
+				"prime-inference": {
+					type: "api_key",
+					key: "agent-key",
+					primeTeam: null,
+				},
+			});
+
+			authStorage = AuthStorage.create(authJsonPath, {
+				primeCliConfigPath: primeConfigPath,
+				usePrimeCliConfig: true,
+			});
+
+			expect(authStorage.getProviderHeaders("prime-inference")).toBeUndefined();
+		});
+
+		test("prime inference missing Agent team selection falls back to Prime CLI team", () => {
+			const primeConfigPath = join(tempDir, "prime-config.json");
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key", team_id: "cli-team" }));
+			writeAuthJson({
+				"prime-inference": {
+					type: "api_key",
+					key: "agent-key",
+				},
+			});
+
+			authStorage = AuthStorage.create(authJsonPath, {
+				primeCliConfigPath: primeConfigPath,
+				usePrimeCliConfig: true,
+			});
+
+			expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "cli-team" });
+		});
+
+		test("prime inference provider headers fall back to Prime CLI team until reload", () => {
+			const primeConfigPath = join(tempDir, "prime-config.json");
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key", team_id: "team-1" }));
+			writeAuthJson({});
+
+			authStorage = AuthStorage.create(authJsonPath, {
+				primeCliConfigPath: primeConfigPath,
+				usePrimeCliConfig: true,
+			});
+
+			expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "team-1" });
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key", team_id: "team-2" }));
+			expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "team-1" });
+
+			authStorage.reload();
+			expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "team-2" });
+		});
+
 		test("apiKey command can use shell features like pipes", async () => {
 			writeAuthJson({
 				anthropic: { type: "api_key", key: "!echo 'hello world' | tr ' ' '-'" },
