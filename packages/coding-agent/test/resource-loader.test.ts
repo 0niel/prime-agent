@@ -461,6 +461,7 @@ Content`,
 				baseDir: "/fake",
 				sourceInfo: createSyntheticSourceInfo("/fake/path", { source: "custom" }),
 				disableModelInvocation: false,
+				kind: "markdown",
 			};
 			const loader = new DefaultResourceLoader({
 				cwd,

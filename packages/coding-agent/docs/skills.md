@@ -1,15 +1,16 @@
-> pi can create skills. Ask it to build one for your use case.
+> Prime Agent can create skills. Ask it to build one for your use case.
 
 # Skills
 
-Skills are self-contained capability packages that the agent loads on-demand. A skill provides specialized workflows, setup instructions, helper scripts, and reference documentation for specific tasks.
+Skills are self-contained capability packages that Prime Agent loads on demand. A skill provides specialized workflows, setup instructions, helper scripts, and reference documentation for specific tasks.
 
-Pi implements the [Agent Skills standard](https://agentskills.io/specification), warning about violations but remaining lenient.
+Prime Agent implements the [Agent Skills standard](https://agentskills.io/specification), warning about violations but remaining lenient. It also supports Python-backed skills: a superset of markdown skills that install Python packages into the persistent IPython kernel.
 
 ## Table of Contents
 
 - [Locations](#locations)
 - [How Skills Work](#how-skills-work)
+- [Python-Backed Skills](#python-backed-skills)
 - [Skill Commands](#skill-commands)
 - [Skill Structure](#skill-structure)
 - [Frontmatter](#frontmatter)
@@ -21,20 +22,20 @@ Pi implements the [Agent Skills standard](https://agentskills.io/specification),
 
 > **Security:** Skills can instruct the model to perform any action and may include executable code the model invokes. Review skill content before use.
 
-Pi loads skills from:
+Prime Agent loads skills from:
 
 - Global:
-  - `~/.pi/agent/skills/`
+  - `~/.prime/agent/skills/`
   - `~/.agents/skills/`
 - Project:
-  - `.pi/skills/`
+  - `.prime/agent/skills/`
   - `.agents/skills/` in `cwd` and ancestor directories (up to git repo root, or filesystem root when not in a repo)
 - Packages: `skills/` directories or `pi.skills` entries in `package.json`
 - Settings: `skills` array with files or directories
 - CLI: `--skill <path>` (repeatable, additive even with `--no-skills`)
 
 Discovery rules:
-- In `~/.pi/agent/skills/` and `.pi/skills/`, direct root `.md` files are discovered as individual skills
+- In `~/.prime/agent/skills/` and `.prime/agent/skills/`, direct root `.md` files are discovered as individual skills
 - In all skill locations, directories containing `SKILL.md` are discovered recursively
 - In `~/.agents/skills/` and project `.agents/skills/`, root `.md` files are ignored
 
@@ -53,7 +54,7 @@ To use skills from Claude Code or OpenAI Codex, add their directories to setting
 }
 ```
 
-For project-level Claude Code skills, add to `.pi/settings.json`:
+For project-level Claude Code skills, add to `.prime/agent/settings.json`:
 
 ```json
 {
@@ -63,12 +64,74 @@ For project-level Claude Code skills, add to `.pi/settings.json`:
 
 ## How Skills Work
 
-1. At startup, pi scans skill locations and extracts names and descriptions
-2. The system prompt includes available skills in XML format per the [specification](https://agentskills.io/integrate-skills)
-3. When a task matches, the agent uses `ipython` to load the full SKILL.md (models don't always do this; use prompting or `/skill:name` to force it)
+1. At startup, Prime Agent scans skill locations and extracts names, descriptions, type, and file locations
+2. The system prompt includes visible skills in XML format per the [specification](https://agentskills.io/integrate-skills)
+3. When a task matches, the agent uses `ipython` to load the full `SKILL.md` (models don't always do this; use prompting or `/skill:name` to force it)
 4. The agent follows the instructions, using relative paths to reference scripts and assets
 
 This is progressive disclosure: only descriptions are always in context, full instructions load on-demand.
+
+Skills with `disable-model-invocation: true` are hidden from the startup skill list. They can still be invoked explicitly with `/skill:name`.
+
+## Python-Backed Skills
+
+A Python-backed skill uses the same `SKILL.md` metadata and invocation behavior as a markdown skill, but also provides a Python package for the IPython kernel.
+
+```
+web-search/
+├── SKILL.md
+├── pyproject.toml
+└── src/
+    └── web_search/
+        └── __init__.py
+```
+
+Detection rules:
+- `SKILL.md` is still required
+- `pyproject.toml` marks the skill as Python-backed
+- the import name is the skill name with hyphens converted to underscores
+- `src/<import_name>/__init__.py` must exist
+
+For `web-search`, Prime Agent exposes `web_search` in IPython. If the module defines `run()`, the module is wrapped as an async callable:
+
+```python
+await web_search("prime agent skills")
+await web_search.run("prime agent skills")
+help(web_search)
+```
+
+Python skills are installed editable into the kernel venv during kernel setup. By default this is `~/.prime/agent/kernel-venv`; set `PRIME_AGENT_KERNEL_VENV` to override it. If `pyproject.toml` changes, Prime Agent rebuilds the kernel venv so dependency changes are picked up.
+
+If you set `PRIME_AGENT_KERNEL_PYTHON`, Prime Agent does not install packages into that environment. The Python must already have `ipykernel`, `prime-agent-runtime`, and the default runtime packages installed. Missing Python skill imports are disabled with a warning and calling the skill raises a `RuntimeError`.
+
+### Optional CLI Command
+
+A Python skill can expose a shell command by declaring a console script in `pyproject.toml`. The script name must exactly match the Python import name, including underscores:
+
+```toml
+[project]
+name = "web-search"
+version = "0.1.0"
+dependencies = ["requests"]
+
+[project.scripts]
+web_search = "rlm.skill:cli"
+```
+
+The `rlm.skill:cli` helper imports `web_search.run`, parses CLI arguments with `tyro`, awaits async results, and prints non-`None` return values.
+
+```python
+async def run(query: str, limit: int = 5) -> str:
+    """Search the web and return a concise summary."""
+    ...
+```
+
+The model can then call the skill from normal Python or from shell mode:
+
+```python
+await web_search("prime agent")
+!web_search "prime agent" --limit 3
+```
 
 ## Skill Commands
 
@@ -175,7 +238,7 @@ description: Helps with PDFs.
 
 ## Validation
 
-Pi validates skills against the Agent Skills standard. Most issues produce warnings but still load the skill:
+Prime Agent validates skills against the Agent Skills standard. Most issues produce warnings but still load the skill:
 
 - Name doesn't match parent directory
 - Name exceeds 64 characters or contains invalid characters

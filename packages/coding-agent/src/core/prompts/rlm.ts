@@ -29,12 +29,13 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	}
 	if (installedSkills.length > 0) {
 		const installed = installedSkills.map((skill) => `\`${skill}\``).join(", ");
-		skillLines.push(`Installed skills (pre-imported): ${installed}.`);
+		skillLines.push(`Configured Python skills for IPython: ${installed}.`);
 		skillLines.push(
-			"Each skill is an async function by the same name. Inspect with `help(<skill>)` or `inspect.signature(<skill>.run)`.",
+			"When available, each Python skill is an async callable by the same import name. Inspect with `help(<skill>)` or `inspect.signature(<skill>.run)`.",
 		);
+		skillLines.push("If a Python skill is unavailable, calling it raises a RuntimeError with the import error.");
 		skillLines.push(
-			"Each skill is also available as a shell command by the same name: `<skill> ...`. Discover its CLI usage with `<skill> --help`.",
+			"Each Python skill may also be available as a shell command by the same name: `<skill> ...`. Discover its CLI usage with `<skill> --help`.",
 		);
 	}
 	if (skillLines.length > 0) {

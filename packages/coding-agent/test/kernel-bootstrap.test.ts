@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import {
 	DEFAULT_RLM_EXTRA_UV_ARGS,
 	ensureKernelPython,
 	getKernelVenvDir,
+	type KernelPythonSkill,
 } from "../src/core/kernel/bootstrap.js";
 
 let tempDir = "";
@@ -14,21 +16,52 @@ let originalEnv: NodeJS.ProcessEnv;
 const RLM_RUNTIME_CHECK =
 	"import rlm; assert hasattr(rlm, 'run'); assert callable(rlm); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm); assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background')";
 
+function pyprojectHash(pyprojectPath: string): string {
+	return `sha256:${createHash("sha256").update(readFileSync(pyprojectPath)).digest("hex")}`;
+}
+
 function writeExecutable(filePath: string, content: string): void {
 	writeFileSync(filePath, content);
 	chmodSync(filePath, 0o755);
 }
 
-function writeBootstrapVersion(venv: string): void {
+function writeBootstrapVersion(venv: string, pythonSkills: readonly KernelPythonSkill[] = []): void {
 	writeFileSync(
 		join(venv, ".bootstrap-version"),
 		`${JSON.stringify({
-			schema: 3,
+			schema: 4,
 			ipykernel: "ipykernel",
 			runtime: "prime-agent-runtime",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+			pythonSkills: pythonSkills.map((skill) => ({
+				importName: skill.importName,
+				packagePath: skill.packagePath,
+				pyprojectPath: skill.pyprojectPath,
+				pyprojectHash: pyprojectHash(skill.pyprojectPath),
+			})),
 		})}\n`,
 	);
+}
+
+function createPythonSkill(name = "web-search"): KernelPythonSkill {
+	const packagePath = join(tempDir, "skills", name);
+	const importName = name.replaceAll("-", "_");
+	const pyprojectPath = join(packagePath, "pyproject.toml");
+	mkdirSync(join(packagePath, "src", importName), { recursive: true });
+	writeFileSync(
+		pyprojectPath,
+		`[project]
+name = "${name}"
+version = "0.1.0"
+`,
+	);
+	writeFileSync(join(packagePath, "src", importName, "__init__.py"), "async def run():\n    return 'ok'\n");
+	return {
+		name,
+		importName,
+		packagePath,
+		pyprojectPath,
+	};
 }
 
 function writeFakePython(filePath: string, importableModules: readonly string[]): void {
@@ -62,7 +95,7 @@ function installFakeUv(): string {
 		join(binDir, "uv"),
 		[
 			"#!/bin/sh",
-			"set -eu",
+			"set -e",
 			'printf "%s\\n" "$*" >> "$UV_LOG"',
 			'if [ "$1" = "python" ]; then',
 			"  exit 0",
@@ -86,6 +119,11 @@ function installFakeUv(): string {
 			"  exit 0",
 			"fi",
 			'if [ "$1" = "pip" ]; then',
+			'  for arg in "$@"; do',
+			'    if [ "$UV_FAIL_ARG" != "" ] && [ "$arg" = "$UV_FAIL_ARG" ]; then',
+			"      exit 1",
+			"    fi",
+			"  done",
 			"  exit 0",
 			"fi",
 			"exit 2",
@@ -139,11 +177,126 @@ describe("kernel bootstrap", () => {
 		}
 		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
 		expect(version).toEqual({
-			schema: 3,
+			schema: 4,
 			ipykernel: "ipykernel",
 			runtime: "prime-agent-runtime",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+			pythonSkills: [],
 		});
+	});
+
+	it("installs Python skills into the bootstrapped venv", async () => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const pythonSkill = createPythonSkill();
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+
+		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(join(venv, "bin", "python"));
+
+		const log = readFileSync(logPath, "utf8");
+		expect(log).toContain(`--editable ${pythonSkill.packagePath}`);
+		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
+		expect(version.pythonSkills).toEqual([
+			{
+				importName: pythonSkill.importName,
+				packagePath: pythonSkill.packagePath,
+				pyprojectPath: pythonSkill.pyprojectPath,
+				pyprojectHash: pyprojectHash(pythonSkill.pyprojectPath),
+			},
+		]);
+	});
+
+	it("syncs a warm venv when a Python skill pyproject changes", async () => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const python = join(venv, "bin", "python");
+		const pythonSkill = createPythonSkill();
+		mkdirSync(join(venv, "bin"), { recursive: true });
+		writeFakePython(python, ["ipykernel", "rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeBootstrapVersion(venv, [pythonSkill]);
+		writeFileSync(
+			pythonSkill.pyprojectPath,
+			`[project]
+name = "${pythonSkill.name}"
+version = "0.1.0"
+dependencies = ["httpx"]
+`,
+		);
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+
+		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(python);
+
+		const log = readFileSync(logPath, "utf8");
+		expect(log).not.toContain(`venv ${venv} --python 3.11 --seed`);
+		expect(log).toContain(`--editable ${pythonSkill.packagePath}`);
+		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
+		expect(version.pythonSkills[0].pyprojectHash).toBe(pyprojectHash(pythonSkill.pyprojectPath));
+	});
+
+	it("continues when a Python skill editable install fails and retries it next startup", async () => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const goodSkill = createPythonSkill("good-skill");
+		const brokenSkill = createPythonSkill("broken-skill");
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		process.env.UV_FAIL_ARG = brokenSkill.packagePath;
+
+		await expect(ensureKernelPython({ pythonSkills: [goodSkill, brokenSkill] })).resolves.toBe(
+			join(venv, "bin", "python"),
+		);
+
+		const log = readFileSync(logPath, "utf8");
+		expect(log).toContain(`--editable ${goodSkill.packagePath}`);
+		expect(log).toContain(`--editable ${brokenSkill.packagePath}`);
+		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
+		expect(version.pythonSkills).toEqual([
+			{
+				importName: goodSkill.importName,
+				packagePath: goodSkill.packagePath,
+				pyprojectPath: goodSkill.pyprojectPath,
+				pyprojectHash: pyprojectHash(goodSkill.pyprojectPath),
+			},
+		]);
+
+		await expect(ensureKernelPython({ pythonSkills: [goodSkill, brokenSkill] })).resolves.toBe(
+			join(venv, "bin", "python"),
+		);
+
+		const retryLog = readFileSync(logPath, "utf8");
+		expect(retryLog.split("\n").filter((line) => line.startsWith(`venv ${venv} `))).toHaveLength(1);
+		expect(
+			retryLog.split("\n").filter((line) => line.includes(`--editable ${brokenSkill.packagePath}`)),
+		).toHaveLength(2);
+	});
+
+	it("rebuilds a warm venv with legacy unhashed Python skill manifest entries", async () => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const python = join(venv, "bin", "python");
+		const pythonSkill = createPythonSkill();
+		mkdirSync(join(venv, "bin"), { recursive: true });
+		writeFakePython(python, ["ipykernel", "rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFileSync(
+			join(venv, ".bootstrap-version"),
+			`${JSON.stringify({
+				schema: 4,
+				ipykernel: "ipykernel",
+				runtime: "prime-agent-runtime",
+				extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+				pythonSkills: [
+					{
+						importName: pythonSkill.importName,
+						packagePath: pythonSkill.packagePath,
+						pyprojectPath: pythonSkill.pyprojectPath,
+					},
+				],
+			})}\n`,
+		);
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+
+		await expect(ensureKernelPython()).resolves.toBe(python);
+
+		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
 	});
 
 	it("shares concurrent bootstrap work in one process", async () => {
@@ -214,6 +367,15 @@ describe("kernel bootstrap", () => {
 		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
 
 		await expect(ensureKernelPython()).resolves.toBe(overridePython);
+	});
+
+	it("allows PRIME_AGENT_KERNEL_PYTHON missing Python skill imports", async () => {
+		const overridePython = join(tempDir, "override-python");
+		const pythonSkill = createPythonSkill();
+		writeFakePython(overridePython, ["ipykernel", "rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		process.env.PRIME_AGENT_KERNEL_PYTHON = overridePython;
+
+		await expect(ensureKernelPython({ pythonSkills: [pythonSkill] })).resolves.toBe(overridePython);
 	});
 
 	it("rejects PRIME_AGENT_KERNEL_PYTHON missing default extra packages", async () => {

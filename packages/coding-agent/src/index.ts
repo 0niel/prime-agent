@@ -207,12 +207,18 @@ export {
 // Skills
 export {
 	formatSkillsForPrompt,
+	getPythonSkillRuntimeInfo,
 	type LoadSkillsFromDirOptions,
 	type LoadSkillsResult,
 	loadSkills,
 	loadSkillsFromDir,
+	type MarkdownSkill,
+	type PythonSkill,
+	type PythonSkillRuntimeInfo,
 	type Skill,
 	type SkillFrontmatter,
+	type SkillKind,
+	type SkillPythonMetadata,
 } from "./core/skills.js";
 export { createSyntheticSourceInfo } from "./core/source-info.js";
 // Tools

@@ -17,6 +17,20 @@ function skill(name: string): Skill {
 			origin: "top-level",
 		},
 		disableModelInvocation: false,
+		kind: "markdown",
+	};
+}
+
+function pythonSkill(name: string, importName = name.replaceAll("-", "_")): Skill {
+	const base = skill(name);
+	return {
+		...base,
+		kind: "python",
+		python: {
+			importName,
+			packagePath: `/skills/${name}`,
+			pyprojectPath: `/skills/${name}/pyproject.toml`,
+		},
 	};
 }
 
@@ -39,9 +53,10 @@ describe("buildRlmPrompt", () => {
 				"Working directory: /repo",
 				"Conversation log: /repo/.pi/sessions/session.jsonl",
 				"",
-				"Installed skills (pre-imported): `websearch`.",
-				"Each skill is an async function by the same name. Inspect with `help(<skill>)` or `inspect.signature(<skill>.run)`.",
-				"Each skill is also available as a shell command by the same name: `<skill> ...`. Discover its CLI usage with `<skill> --help`.",
+				"Configured Python skills for IPython: `websearch`.",
+				"When available, each Python skill is an async callable by the same import name. Inspect with `help(<skill>)` or `inspect.signature(<skill>.run)`.",
+				"If a Python skill is unavailable, calling it raises a RuntimeError with the import error.",
+				"Each Python skill may also be available as a shell command by the same name: `<skill> ...`. Discover its CLI usage with `<skill> --help`.",
 				"",
 				"Use `ipython` for both Python and shell work. For repository shell commands, prefer IPython shell syntax: `!rg ...`, `!npm run check`, or `%%bash` for multi-line scripts. Do not wrap ordinary shell commands in Python subprocesses unless you need Python-level processing.",
 				"",
@@ -148,7 +163,7 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("## AGENTS.md\n\nproject rules");
 	});
 
-	test("skills are included in rlm harness prompts", () => {
+	test("markdown skills are included in rlm harness prompts without Python pre-imports", () => {
 		const prompt = buildSystemPrompt({
 			selectedTools: ["ipython"],
 			contextFiles: [],
@@ -156,10 +171,25 @@ describe("buildSystemPrompt", () => {
 			cwd: "/repo",
 		});
 
-		expect(prompt).toContain("Installed skills (pre-imported): `websearch`.");
+		expect(prompt).not.toContain("Configured Python skills for IPython");
 		expect(prompt).toContain("<available_skills>");
 		expect(prompt).toContain("<name>websearch</name>");
+		expect(prompt).toContain("<type>markdown</type>");
 		expect(prompt).toContain("<location>/skills/websearch/SKILL.md</location>");
+	});
+
+	test("Python skills are configured for IPython and included in skill metadata", () => {
+		const prompt = buildSystemPrompt({
+			selectedTools: ["ipython"],
+			contextFiles: [],
+			skills: [pythonSkill("web-search")],
+			cwd: "/repo",
+		});
+
+		expect(prompt).toContain("Configured Python skills for IPython: `web_search`.");
+		expect(prompt).toContain("<name>web-search</name>");
+		expect(prompt).toContain("<type>python</type>");
+		expect(prompt).toContain("<python_import>web_search</python_import>");
 	});
 
 	test("prompt guidelines are appended and deduplicated", () => {

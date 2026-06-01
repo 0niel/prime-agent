@@ -3,7 +3,7 @@
  */
 
 import { buildRlmPrompt } from "./prompts/index.js";
-import { formatSkillsForPrompt, type Skill } from "./skills.js";
+import { formatSkillsForPrompt, getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 
 export interface BuildSystemPromptOptions {
 	/** Custom system prompt (replaces default). */
@@ -55,6 +55,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const contextFiles = providedContextFiles ?? [];
 	const skills = providedSkills ?? [];
 	const tools = selectedTools ?? ["ipython"];
+	const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
 
 	if (customPrompt) {
 		let prompt = customPrompt;
@@ -89,7 +90,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	let prompt = buildRlmPrompt({
 		cwd: promptCwd,
 		messagesPath: promptMessagesPath,
-		installedSkills: skills.filter((skill) => !skill.disableModelInvocation).map((skill) => skill.name),
+		installedSkills: getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName),
 		activeTools: tools.filter((name) => name === "ipython" || name === "bash" || name === "edit"),
 		allowRecursion,
 	});

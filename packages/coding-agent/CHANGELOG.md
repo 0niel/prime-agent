@@ -5,6 +5,7 @@
 ### Added
 
 - Added Prime team selection during Prime Inference login so team inference costs use the selected Prime CLI context.
+- Added Python-backed skills that install into the persistent IPython kernel and are exposed alongside markdown skills.
 
 ### Changed
 

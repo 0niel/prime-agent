@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { constants, existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { constants, existsSync, readFileSync } from "node:fs";
 import { access, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -7,8 +8,9 @@ import { stderr, stdin } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import type { PythonSkillRuntimeInfo } from "../skills.js";
 
-const BOOTSTRAP_SCHEMA = 3;
+const BOOTSTRAP_SCHEMA = 4;
 const PYTHON_VERSION = "3.11";
 const IPYKERNEL_REQUIREMENT = "ipykernel";
 const RUNTIME_REQUIREMENT = "prime-agent-runtime";
@@ -24,6 +26,7 @@ const DEFAULT_RLM_EXTRA_PACKAGES = [
 	{ uvArg: "beautifulsoup4", importName: "bs4", promptLabel: "bs4 (Beautiful Soup)" },
 	{ uvArg: "lxml", importName: "lxml", promptLabel: "lxml" },
 	{ uvArg: "pydantic", importName: "pydantic", promptLabel: "pydantic" },
+	{ uvArg: "tyro", importName: "tyro", promptLabel: "tyro" },
 ];
 export const DEFAULT_RLM_EXTRA_UV_ARGS = DEFAULT_RLM_EXTRA_PACKAGES.map((pkg) => pkg.uvArg);
 export const DEFAULT_RLM_EXTRA_IMPORT_NAMES = DEFAULT_RLM_EXTRA_PACKAGES.map((pkg) => pkg.importName);
@@ -38,11 +41,25 @@ const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS = 30_000;
 
 let inFlightEnsureKernelPython: { key: string; promise: Promise<string> } | null = null;
 
+export type KernelPythonSkill = PythonSkillRuntimeInfo;
+
+export interface EnsureKernelPythonOptions {
+	pythonSkills?: readonly KernelPythonSkill[];
+}
+
+interface BootstrapPythonSkill {
+	importName: string;
+	packagePath: string;
+	pyprojectPath: string;
+	pyprojectHash: string;
+}
+
 interface BootstrapVersion {
 	schema: number;
 	ipykernel?: string;
 	runtime?: string;
 	extraUvArgs?: string[];
+	pythonSkills?: BootstrapPythonSkill[];
 }
 
 function errorMessage(error: unknown): string {
@@ -81,12 +98,41 @@ function expandHome(filePath: string): string {
 	return filePath;
 }
 
-function ensureKernelPythonKey(): string {
+function fileContentHash(filePath: string): string {
+	try {
+		return `sha256:${createHash("sha256").update(readFileSync(filePath)).digest("hex")}`;
+	} catch {
+		return "unreadable";
+	}
+}
+
+function normalizePythonSkills(pythonSkills: readonly KernelPythonSkill[] | undefined): BootstrapPythonSkill[] {
+	const byKey = new Map<string, BootstrapPythonSkill>();
+	for (const skill of pythonSkills ?? []) {
+		const packagePath = path.resolve(skill.packagePath);
+		const pyprojectPath = path.resolve(skill.pyprojectPath);
+		const key = `${skill.importName}\0${packagePath}`;
+		byKey.set(key, {
+			importName: skill.importName,
+			packagePath,
+			pyprojectPath,
+			pyprojectHash: fileContentHash(pyprojectPath),
+		});
+	}
+	return [...byKey.values()].sort((a, b) => {
+		const packageCompare = a.packagePath.localeCompare(b.packagePath);
+		if (packageCompare !== 0) return packageCompare;
+		return a.importName.localeCompare(b.importName);
+	});
+}
+
+function ensureKernelPythonKey(pythonSkills: readonly BootstrapPythonSkill[]): string {
 	return [
 		process.env.PRIME_AGENT_KERNEL_PYTHON ?? "",
 		process.env.PRIME_AGENT_KERNEL_VENV ?? "",
 		process.env.HOME ?? "",
 		process.env.XDG_DATA_HOME ?? "",
+		JSON.stringify(pythonSkills),
 	].join("\0");
 }
 
@@ -170,6 +216,19 @@ async function missingRlmExtraImportLabels(python: string): Promise<string[]> {
 	for (const pkg of DEFAULT_RLM_EXTRA_PACKAGES) {
 		if (!(await pythonImports(python, pkg.importName))) {
 			missing.push(pkg.promptLabel);
+		}
+	}
+	return missing;
+}
+
+async function missingPythonSkillImportLabels(
+	python: string,
+	pythonSkills: readonly KernelPythonSkill[],
+): Promise<string[]> {
+	const missing: string[] = [];
+	for (const skill of pythonSkills) {
+		if (!(await pythonImports(python, skill.importName))) {
+			missing.push(`${skill.name} (${skill.importName})`);
 		}
 	}
 	return missing;
@@ -298,11 +357,29 @@ async function readBootstrapVersion(venv: string): Promise<BootstrapVersion | nu
 			parsed.extraUvArgs.every((v: unknown): v is string => typeof v === "string")
 				? (parsed.extraUvArgs as string[])
 				: undefined;
+		let pythonSkills: BootstrapPythonSkill[] | undefined;
+		if (Array.isArray(parsed.pythonSkills)) {
+			if (
+				!parsed.pythonSkills.every((v: unknown): v is BootstrapPythonSkill => {
+					if (!isRecord(v)) return false;
+					return (
+						typeof v.importName === "string" &&
+						typeof v.packagePath === "string" &&
+						typeof v.pyprojectPath === "string" &&
+						typeof v.pyprojectHash === "string"
+					);
+				})
+			) {
+				return null;
+			}
+			pythonSkills = parsed.pythonSkills as BootstrapPythonSkill[];
+		}
 		return {
 			schema: parsed.schema,
 			ipykernel: typeof parsed.ipykernel === "string" ? parsed.ipykernel : undefined,
 			runtime: typeof parsed.runtime === "string" ? parsed.runtime : undefined,
 			extraUvArgs,
+			pythonSkills,
 		};
 	} catch {
 		return null;
@@ -316,7 +393,30 @@ function extraUvArgsMatch(a: string[] | undefined, b: string[] | undefined): boo
 	return a.every((v, i) => v === b[i]);
 }
 
-function bootstrapVersionCurrent(version: BootstrapVersion | null): boolean {
+function pythonSkillsMatch(a: BootstrapPythonSkill[] | undefined, b: readonly BootstrapPythonSkill[]): boolean {
+	const left = a ?? [];
+	if (left.length !== b.length) return false;
+	return left.every((skill, index) => {
+		const expected = b[index];
+		return (
+			skill.importName === expected.importName &&
+			skill.packagePath === expected.packagePath &&
+			skill.pyprojectPath === expected.pyprojectPath &&
+			skill.pyprojectHash === expected.pyprojectHash
+		);
+	});
+}
+
+function bootstrapVersionCurrent(
+	version: BootstrapVersion | null,
+	pythonSkills: readonly BootstrapPythonSkill[],
+): boolean {
+	return (
+		version !== null && bootstrapBaseVersionCurrent(version) && pythonSkillsMatch(version.pythonSkills, pythonSkills)
+	);
+}
+
+function bootstrapBaseVersionCurrent(version: BootstrapVersion | null): boolean {
 	return (
 		version?.schema === BOOTSTRAP_SCHEMA &&
 		version.ipykernel === IPYKERNEL_REQUIREMENT &&
@@ -325,12 +425,13 @@ function bootstrapVersionCurrent(version: BootstrapVersion | null): boolean {
 	);
 }
 
-async function writeBootstrapVersion(venv: string): Promise<void> {
+async function writeBootstrapVersion(venv: string, pythonSkills: readonly BootstrapPythonSkill[]): Promise<void> {
 	const version: BootstrapVersion = {
 		schema: BOOTSTRAP_SCHEMA,
 		ipykernel: IPYKERNEL_REQUIREMENT,
 		runtime: RUNTIME_REQUIREMENT,
 		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+		pythonSkills: [...pythonSkills],
 	};
 	await writeFile(path.join(venv, BOOTSTRAP_VERSION_FILE), `${JSON.stringify(version)}\n`, "utf8");
 }
@@ -352,7 +453,7 @@ async function resolveRuntimeRequirement(): Promise<string> {
 	return RUNTIME_REQUIREMENT;
 }
 
-async function bootstrapVenv(venv: string): Promise<void> {
+async function bootstrapVenv(venv: string, pythonSkills: readonly BootstrapPythonSkill[]): Promise<void> {
 	await mkdir(path.dirname(venv), { recursive: true });
 	const uv = await ensureUv();
 	const python = path.join(venv, "bin", "python");
@@ -369,14 +470,57 @@ async function bootstrapVenv(venv: string): Promise<void> {
 		runtimeRequirement,
 		...DEFAULT_RLM_EXTRA_UV_ARGS,
 	]);
-	await writeBootstrapVersion(venv);
+	await syncPythonSkills(uv, venv, python, pythonSkills);
 }
 
-async function kernelReady(python: string, venv: string): Promise<boolean> {
+async function syncPythonSkills(
+	uv: string,
+	venv: string,
+	python: string,
+	pythonSkills: readonly BootstrapPythonSkill[],
+): Promise<void> {
+	const version = await readBootstrapVersion(venv);
+	const installedPythonSkills: BootstrapPythonSkill[] = [];
+	const currentPythonSkills = new Map(
+		(version?.pythonSkills ?? []).map((skill) => [`${skill.importName}\0${skill.packagePath}`, skill]),
+	);
+
+	for (const skill of pythonSkills) {
+		const existingSkill = currentPythonSkills.get(`${skill.importName}\0${skill.packagePath}`);
+		if (existingSkill?.pyprojectPath === skill.pyprojectPath && existingSkill.pyprojectHash === skill.pyprojectHash) {
+			installedPythonSkills.push(skill);
+			continue;
+		}
+
+		try {
+			await run(uv, ["pip", "install", "--python", python, "--editable", skill.packagePath]);
+			installedPythonSkills.push(skill);
+		} catch (error) {
+			process.stderr.write(
+				`Warning: Python skill ${skill.importName} failed to install and will be unavailable: ${errorMessage(error)}\n`,
+			);
+		}
+	}
+	await writeBootstrapVersion(venv, installedPythonSkills);
+}
+
+async function kernelBaseReady(python: string, venv: string): Promise<boolean> {
 	return (
 		(await hasIpykernel(python)) &&
 		(await hasPrimeAgentRuntime(python)) &&
-		bootstrapVersionCurrent(await readBootstrapVersion(venv))
+		bootstrapBaseVersionCurrent(await readBootstrapVersion(venv))
+	);
+}
+
+async function kernelReady(
+	python: string,
+	venv: string,
+	pythonSkills: readonly BootstrapPythonSkill[],
+): Promise<boolean> {
+	return (
+		(await hasIpykernel(python)) &&
+		(await hasPrimeAgentRuntime(python)) &&
+		bootstrapVersionCurrent(await readBootstrapVersion(venv), pythonSkills)
 	);
 }
 
@@ -388,7 +532,10 @@ function formatBootstrapFailure(error: unknown): Error {
 	);
 }
 
-async function ensureKernelPythonUncached(): Promise<string> {
+async function ensureKernelPythonUncached(
+	options: EnsureKernelPythonOptions,
+	pythonSkills: readonly BootstrapPythonSkill[],
+): Promise<string> {
 	const override = process.env.PRIME_AGENT_KERNEL_PYTHON;
 	if (override) {
 		const python = path.resolve(expandHome(override));
@@ -401,17 +548,29 @@ async function ensureKernelPythonUncached(): Promise<string> {
 				missing.push(`default Python packages (${missingExtraImports.join(", ")})`);
 			}
 		}
+		if (missing.length === 0 && pythonSkills.length > 0) {
+			const missingPythonSkills = await missingPythonSkillImportLabels(python, options.pythonSkills ?? []);
+			if (missingPythonSkills.length > 0) {
+				process.stderr.write(
+					`Warning: Python skills unavailable in PRIME_AGENT_KERNEL_PYTHON and will be disabled: ${missingPythonSkills.join(", ")}\n`,
+				);
+			}
+		}
 		if (missing.length === 0) return python;
 		throw new Error(`PRIME_AGENT_KERNEL_PYTHON points to a Python missing ${missing.join(" and ")}: ${python}`);
 	}
 
 	const venv = await resolveWritableKernelVenvDir();
 	const python = path.join(venv, "bin", "python");
-	if (await kernelReady(python, venv)) return python;
+	if (await kernelReady(python, venv, pythonSkills)) return python;
 
 	const releaseLock = await acquireBootstrapLock(venv);
 	try {
-		if (await kernelReady(python, venv)) return python;
+		if (await kernelReady(python, venv, pythonSkills)) return python;
+		if (await kernelBaseReady(python, venv)) {
+			await syncPythonSkills(await ensureUv(), venv, python, pythonSkills);
+			return python;
+		}
 
 		const hadVenv = existsSync(venv);
 		process.stderr.write("› setting up python kernel (one-time, ~30s)…\n");
@@ -420,7 +579,7 @@ async function ensureKernelPythonUncached(): Promise<string> {
 			await rm(venv, { recursive: true, force: true });
 		}
 
-		await bootstrapVenv(venv);
+		await bootstrapVenv(venv, pythonSkills);
 	} catch (error) {
 		throw formatBootstrapFailure(error);
 	} finally {
@@ -431,11 +590,12 @@ async function ensureKernelPythonUncached(): Promise<string> {
 	return python;
 }
 
-export function ensureKernelPython(): Promise<string> {
-	const key = ensureKernelPythonKey();
+export function ensureKernelPython(options: EnsureKernelPythonOptions = {}): Promise<string> {
+	const pythonSkills = normalizePythonSkills(options.pythonSkills);
+	const key = ensureKernelPythonKey(pythonSkills);
 	if (inFlightEnsureKernelPython?.key === key) return inFlightEnsureKernelPython.promise;
 
-	const promise = ensureKernelPythonUncached().finally(() => {
+	const promise = ensureKernelPythonUncached(options, pythonSkills).finally(() => {
 		if (inFlightEnsureKernelPython?.promise === promise) inFlightEnsureKernelPython = null;
 	});
 	inFlightEnsureKernelPython = { key, promise };

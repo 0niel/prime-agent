@@ -159,6 +159,7 @@ describe("AgentSession prompt characterization", () => {
 						description: "Test skill",
 						filePath: skillPath,
 						disableModelInvocation: false,
+						kind: "markdown" as const,
 						baseDir: tempDir,
 						sourceInfo: createSyntheticSourceInfo(skillPath, {
 							source: "local",

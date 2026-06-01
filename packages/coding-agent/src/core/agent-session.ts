@@ -119,6 +119,7 @@ import {
 	SessionManager,
 } from "./session-manager.js";
 import type { SettingsManager } from "./settings-manager.js";
+import { getPythonSkillRuntimeInfo } from "./skills.js";
 import type { SlashCommandInfo } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
@@ -3276,6 +3277,7 @@ export class AgentSession {
 	}): void {
 		const shellCommandPrefix = this.settingsManager.getShellCommandPrefix();
 		const shellPath = this.settingsManager.getShellPath();
+		const pythonSkills = getPythonSkillRuntimeInfo(this._resourceLoader.getSkills().skills);
 		const configuredBaseToolDefinitions = this._baseToolsOverride
 			? Object.fromEntries(
 					Object.entries(this._baseToolsOverride).map(([name, tool]) => [
@@ -3289,6 +3291,7 @@ export class AgentSession {
 						env: this._rlmKernelEnv(),
 						sessionId: this.sessionId,
 						rlmRunHandler: ({ prompt, kwargs }) => this.runRlmChild(prompt, kwargs),
+						pythonSkills,
 					},
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 				});

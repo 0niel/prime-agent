@@ -4,9 +4,10 @@ import { type Static, Type } from "typebox";
 import type { ToolDefinition } from "../extensions/types.js";
 import { KernelManager } from "../kernel/index.js";
 import type { RlmRunHandler } from "../rlm-runtime.js";
+import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
-const RLM_BOOTSTRAP_CODE = `
+const RLM_BOOTSTRAP_BASE_CODE = `
 try:
     import nest_asyncio as _prime_agent_nest_asyncio
     _prime_agent_nest_asyncio.apply()
@@ -34,6 +35,79 @@ except Exception as _prime_agent_rlm_error:
     rlm = _PrimeAgentMissingRlm()
 `.trim();
 
+export function buildRlmBootstrapCode(pythonSkills: readonly PythonSkillRuntimeInfo[] = []): string {
+	const importNames = [...new Set(pythonSkills.map((skill) => skill.importName))];
+	if (importNames.length === 0) {
+		return RLM_BOOTSTRAP_BASE_CODE;
+	}
+
+	return `
+${RLM_BOOTSTRAP_BASE_CODE}
+
+import importlib as _prime_agent_importlib
+import inspect as _prime_agent_inspect
+import sys as _prime_agent_sys
+import types as _prime_agent_types
+
+class _PrimeAgentCallableSkillModule(_prime_agent_types.ModuleType):
+    async def __call__(self, *args, **kwargs):
+        result = self.run(*args, **kwargs)
+        if _prime_agent_inspect.isawaitable(result):
+            return await result
+        return result
+
+class _PrimeAgentUnavailableSkill:
+    def __init__(self, name, error):
+        self.__name__ = name
+        self._prime_agent_import_error = error
+        self.__doc__ = f"Python skill {name} is unavailable: {error}"
+
+    async def run(self, *args, **kwargs):
+        raise RuntimeError(
+            f"Python skill {self.__name__} is unavailable in this IPython kernel. "
+            f"Import error: {self._prime_agent_import_error}"
+        )
+
+    async def __call__(self, *args, **kwargs):
+        return await self.run(*args, **kwargs)
+
+    def __repr__(self):
+        return f"<unavailable Python skill {self.__name__!r}: {self._prime_agent_import_error}>"
+
+def _prime_agent_wrap_skill_module(module):
+    run = getattr(module, "run", None)
+    if not callable(run):
+        return module
+    if isinstance(module, _PrimeAgentCallableSkillModule):
+        return module
+    wrapped = _PrimeAgentCallableSkillModule(module.__name__)
+    wrapped.__dict__.update(module.__dict__)
+    try:
+        wrapped.__signature__ = _prime_agent_inspect.signature(run)
+    except Exception:
+        pass
+    doc = getattr(run, "__doc__", None)
+    if doc:
+        wrapped.__doc__ = doc
+    _prime_agent_sys.modules[module.__name__] = wrapped
+    return wrapped
+
+_PRIME_AGENT_SKILL_IMPORT_ERRORS = {}
+
+for _prime_agent_skill_name in ${JSON.stringify(importNames)}:
+    try:
+        globals()[_prime_agent_skill_name] = _prime_agent_wrap_skill_module(
+            _prime_agent_importlib.import_module(_prime_agent_skill_name)
+        )
+    except Exception as _prime_agent_skill_error:
+        _PRIME_AGENT_SKILL_IMPORT_ERRORS[_prime_agent_skill_name] = str(_prime_agent_skill_error)
+        globals()[_prime_agent_skill_name] = _PrimeAgentUnavailableSkill(
+            _prime_agent_skill_name,
+            str(_prime_agent_skill_error),
+        )
+`.trim();
+}
+
 const ipythonSchema = Type.Object({
 	code: Type.String({
 		description:
@@ -56,6 +130,7 @@ export interface IpythonToolOptions {
 	env?: Record<string, string>;
 	sessionId?: string;
 	rlmRunHandler?: RlmRunHandler;
+	pythonSkills?: readonly PythonSkillRuntimeInfo[];
 	/** Filled after the first kernel start so the owning session can restart it after compaction. */
 	kernelManagerRef?: { current?: KernelManager };
 }
@@ -81,9 +156,10 @@ export function createIpythonToolDefinition(
 					env: options?.env,
 					sessionId: options?.sessionId,
 					rlmRunHandler: options?.rlmRunHandler,
+					pythonSkills: options?.pythonSkills,
 				});
 				await m.start();
-				const bootstrap = await m.execute(RLM_BOOTSTRAP_CODE);
+				const bootstrap = await m.execute(buildRlmBootstrapCode(options?.pythonSkills));
 				if (bootstrap.status !== "ok") {
 					const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
 					throw new Error(`Failed to initialize rlm runtime in the IPython kernel:\n${details}`);

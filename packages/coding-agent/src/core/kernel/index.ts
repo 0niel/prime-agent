@@ -9,7 +9,7 @@ import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
 import type { RlmRunHandler, RlmRunResult } from "../rlm-runtime.js";
-import { ensureKernelPython } from "./bootstrap.js";
+import { ensureKernelPython, type KernelPythonSkill } from "./bootstrap.js";
 
 const DELIM = Buffer.from("<IDS|MSG>");
 const PROTOCOL_VERSION = "5.3";
@@ -27,6 +27,7 @@ export interface KernelManagerOptions {
 	env?: Record<string, string>;
 	sessionId?: string;
 	rlmRunHandler?: RlmRunHandler;
+	pythonSkills?: readonly KernelPythonSkill[];
 	/** Default: "prime-agent". */
 	username?: string;
 }
@@ -280,7 +281,10 @@ function installSignalHandlersOnce(): void {
 // ---- kernel manager ------------------------------------------------------
 
 export class KernelManager {
-	private readonly options: Pick<KernelManagerOptions, "python" | "cwd" | "env" | "sessionId" | "rlmRunHandler"> &
+	private readonly options: Pick<
+		KernelManagerOptions,
+		"python" | "cwd" | "env" | "sessionId" | "rlmRunHandler" | "pythonSkills"
+	> &
 		Required<Pick<KernelManagerOptions, "username">>;
 	private readonly session = uuid();
 	private readonly commTargets = new Map<string, string>();
@@ -308,6 +312,7 @@ export class KernelManager {
 			env: options.env,
 			sessionId: options.sessionId,
 			rlmRunHandler: options.rlmRunHandler,
+			pythonSkills: options.pythonSkills,
 			username: options.username ?? "prime-agent",
 		};
 	}
@@ -330,7 +335,7 @@ export class KernelManager {
 
 		let python: string;
 		try {
-			python = this.options.python ?? (await ensureKernelPython());
+			python = this.options.python ?? (await ensureKernelPython({ pythonSkills: this.options.pythonSkills }));
 			this.options.python = python;
 		} catch (error) {
 			this.state = "idle";
