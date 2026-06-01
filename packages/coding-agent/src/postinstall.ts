@@ -8,6 +8,10 @@ if (!bootstrapKernel && !bootstrapTools) {
 	process.exit(0);
 }
 
+if (bootstrapKernel && process.env.PRIME_AGENT_INSTALL_UV === undefined) {
+	process.env.PRIME_AGENT_INSTALL_UV = "1";
+}
+
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }

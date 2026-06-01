@@ -39,6 +39,7 @@ prime_agent_screen_drawn=0
 prime_agent_screen_last_cols=0
 prime_agent_screen_last_rows=0
 prime_agent_download_dir=
+prime_agent_bootstrap_kernel_on_install=0
 prime_agent_screen_title=
 prime_agent_screen_status=
 prime_agent_screen_detail=
@@ -89,6 +90,7 @@ main() {
 	tarball_url="$prime_agent_base_url/releases/v$version/$tarball_name"
 
 	confirm_install "$version" "$tarball_url"
+	confirm_kernel_runtime_setup
 
 	download_dir=$(create_temp_dir)
 	prime_agent_download_dir="$download_dir"
@@ -1418,18 +1420,69 @@ confirm_install() {
 	exit 0
 }
 
+confirm_kernel_runtime_setup() {
+	case "${PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL:-}" in
+		1)
+			prime_agent_bootstrap_kernel_on_install=1
+			return
+			;;
+		0)
+			prime_agent_bootstrap_kernel_on_install=0
+			return
+			;;
+	esac
+
+	if prime_agent_prompt_yes_no \
+		"Prepare IPython runtime now?" \
+		"Installs uv, Python 3.11, ipykernel, and Prime Agent runtime." \
+		"Prepare? [Y/n]"; then
+		prime_agent_bootstrap_kernel_on_install=1
+		return
+	else
+		prompt_status=$?
+	fi
+
+	if [ "$prompt_status" -eq 2 ]; then
+		printf 'No terminal detected; preparing the IPython runtime during install.\n'
+		prime_agent_bootstrap_kernel_on_install=1
+		return
+	fi
+
+	prime_agent_bootstrap_kernel_on_install=0
+	if [ "$prime_agent_screen_enabled" = 1 ]; then
+		prime_agent_screen "IPython setup skipped" "" "The runtime can be prepared on first ipython use." ""
+		sleep 0.4
+	else
+		printf '\nSkipping IPython runtime setup.\n'
+	fi
+}
+
 install_prime_agent_package() {
 	tarball_path="$1"
-	npm_install_details="Preparing global install.
+	if [ "$prime_agent_bootstrap_kernel_on_install" = 1 ]; then
+		npm_install_details="Preparing global install.
+Linking command binaries.
+Installing runtime packages.
+Preloading search tools.
+Preparing IPython kernel.
+Finalizing npm install."
+		prime_agent_run_quiet_with_animation_steps \
+			"Installing Prime Agent" \
+			"Installing Prime Agent" \
+			"$npm_install_details" \
+			env PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL=1 PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=1 PRIME_AGENT_INSTALL_UV=1 npm install -g --no-fund --no-audit --loglevel=error --progress=false "$tarball_path"
+	else
+		npm_install_details="Preparing global install.
 Linking command binaries.
 Installing runtime packages.
 Preloading search tools.
 Finalizing npm install."
-	prime_agent_run_quiet_with_animation_steps \
-		"Installing Prime Agent" \
-		"Installing Prime Agent" \
-		"$npm_install_details" \
-		env PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL=1 npm install -g --no-fund --no-audit --loglevel=error --progress=false "$tarball_path"
+		prime_agent_run_quiet_with_animation_steps \
+			"Installing Prime Agent" \
+			"Installing Prime Agent" \
+			"$npm_install_details" \
+			env PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL=1 npm install -g --no-fund --no-audit --loglevel=error --progress=false "$tarball_path"
+	fi
 }
 
 main "$@"
