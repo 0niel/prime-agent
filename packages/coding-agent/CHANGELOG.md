@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.0.7] - 2026-06-01
+
 ### Added
 
 - Added Prime team selection during Prime Inference login so team inference costs use the selected Prime CLI context.
