@@ -2,9 +2,14 @@ import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type { AgentSession } from "./agent-session.js";
 import type { AgentSessionRuntimeConfig } from "./agent-session-config.js";
-import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.js";
+import type {
+	AgentSessionCreationOptions,
+	AgentSessionRuntimeDiagnostic,
+	AgentSessionServices,
+} from "./agent-session-services.js";
 import type { ReplacedSessionContext, SessionShutdownEvent, SessionStartEvent } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
+import type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
 import type { CreateAgentSessionResult } from "./sdk.js";
 import { assertSessionCwdExists } from "./session-cwd.js";
 import { SessionManager } from "./session-manager.js";
@@ -33,7 +38,22 @@ export type CreateAgentSessionRuntimeFactory = (options: {
 	sessionManager: SessionManager;
 	sessionStartEvent?: SessionStartEvent;
 	sessionConfig?: AgentSessionRuntimeConfig;
+	sessionOptions?: AgentSessionCreationOptions;
 }) => Promise<CreateAgentSessionRuntimeResult>;
+
+export type AgentSessionRuntimeKind = "top-level" | "subagent";
+
+export interface AgentSessionRuntimeMetadata {
+	kind: AgentSessionRuntimeKind;
+	createdAt: number;
+	parentActiveSessionId?: string;
+	parentSessionId?: string;
+	parentSessionFile?: string;
+	rlmChildId?: string;
+	rlmParentNodeId?: string;
+	prompt?: string;
+	sessionDir?: string;
+}
 
 /**
  * Thrown when /import references a JSONL file path that does not exist.
@@ -66,9 +86,12 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
  * and apply the next runtime. If creation fails, the error is propagated to the
  * caller. The caller is responsible for user-facing error handling.
  */
-export class AgentSessionRuntime {
+export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private rebindSession?: (session: AgentSession) => Promise<void>;
 	private beforeSessionInvalidate?: () => void;
+	private subagentRuntimeHost?: SubagentRuntimeHost;
+	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
+	private disposePromise?: Promise<void>;
 
 	constructor(
 		private _session: AgentSession,
@@ -77,7 +100,10 @@ export class AgentSessionRuntime {
 		private _diagnostics: AgentSessionRuntimeDiagnostic[] = [],
 		private _modelFallbackMessage?: string,
 		private readonly sessionConfig?: AgentSessionRuntimeConfig,
-	) {}
+		private readonly _metadata: AgentSessionRuntimeMetadata = { kind: "top-level", createdAt: Date.now() },
+	) {
+		this.bindRuntimeHost();
+	}
 
 	get services(): AgentSessionServices {
 		return this._services;
@@ -99,8 +125,21 @@ export class AgentSessionRuntime {
 		return this._modelFallbackMessage;
 	}
 
+	get metadata(): AgentSessionRuntimeMetadata {
+		return { ...this._metadata };
+	}
+
+	get runtimeConfig(): AgentSessionRuntimeConfig | undefined {
+		return this.sessionConfig ? { ...this.sessionConfig } : undefined;
+	}
+
 	setRebindSession(rebindSession?: (session: AgentSession) => Promise<void>): void {
 		this.rebindSession = rebindSession;
+	}
+
+	setSubagentRuntimeHost(host?: SubagentRuntimeHost): void {
+		this.subagentRuntimeHost = host;
+		this.bindRuntimeHost();
 	}
 
 	/**
@@ -157,6 +196,11 @@ export class AgentSessionRuntime {
 		});
 		this.beforeSessionInvalidate?.();
 		this.session.dispose();
+		await this.disposeHostedSubagentRuntimes();
+	}
+
+	private bindRuntimeHost(): void {
+		this._session.setSubagentRuntimeHost(this.subagentRuntimeHost ?? this);
 	}
 
 	private apply(result: CreateAgentSessionRuntimeResult): void {
@@ -164,6 +208,106 @@ export class AgentSessionRuntime {
 		this._services = result.services;
 		this._diagnostics = result.diagnostics;
 		this._modelFallbackMessage = result.modelFallbackMessage;
+		this.bindRuntimeHost();
+	}
+
+	private async disposeSubagentRuntimes(): Promise<void> {
+		const runtimes = [...this.subagentRuntimes.values()];
+		this.subagentRuntimes.clear();
+		let disposeError: unknown;
+		for (const runtime of runtimes) {
+			try {
+				await runtime.dispose();
+			} catch (error) {
+				disposeError ??= error;
+			}
+		}
+		if (disposeError) {
+			throw disposeError;
+		}
+	}
+
+	private async disposeHostedSubagentRuntimes(): Promise<void> {
+		let disposeError: unknown;
+		try {
+			await this.subagentRuntimeHost?.disposeRlmSubagentRuntimes?.();
+		} catch (error) {
+			disposeError ??= error;
+		}
+		try {
+			await this.disposeSubagentRuntimes();
+		} catch (error) {
+			disposeError ??= error;
+		}
+		if (disposeError) {
+			throw disposeError;
+		}
+	}
+
+	listSubagentRuntimes(): readonly AgentSessionRuntime[] {
+		return [...this.subagentRuntimes.values()];
+	}
+
+	async createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
+		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
+		if (options.parentSession.sessionFile) {
+			sessionManager.newSession({ parentSession: options.parentSession.sessionFile });
+		}
+		const runtime = await createAgentSessionRuntime(this.createRuntime, {
+			cwd: sessionManager.getCwd(),
+			agentDir: this.services.agentDir,
+			sessionManager,
+			sessionStartEvent: { type: "session_start", reason: "startup" },
+			sessionConfig: this.sessionConfig,
+			sessionOptions: {
+				model: options.model,
+				thinkingLevel: options.thinkingLevel,
+				scopedModels: options.scopedModels,
+				initialActiveToolNames: options.activeToolNames,
+				allowedToolNames: options.allowedToolNames,
+				customTools: options.customTools,
+				includeGoalTools: options.includeGoalTools,
+				autoActivateGoalTools: options.autoActivateGoalTools,
+				rlmDepth: options.rlmDepth,
+				rlmMaxDepth: options.rlmMaxDepth,
+				rlmSessionDir: options.sessionDir,
+				rlmParentNodeId: options.rlmParentNodeId,
+			},
+			runtimeMetadata: {
+				kind: "subagent",
+				createdAt: Date.now(),
+				parentSessionId: options.parentSession.sessionId,
+				parentSessionFile: options.parentSession.sessionFile,
+				rlmChildId: options.id,
+				rlmParentNodeId: options.rlmParentNodeId,
+				prompt: options.prompt,
+				sessionDir: options.sessionDir,
+			},
+		});
+		this.subagentRuntimes.set(options.id, runtime);
+		try {
+			await runtime.session.bindExtensions({});
+		} catch (error) {
+			this.subagentRuntimes.delete(options.id);
+			await runtime.dispose();
+			throw error;
+		}
+		return runtime;
+	}
+
+	async releaseRlmSubagentRuntime(
+		runtime: RlmSubagentRuntime,
+		options: CreateRlmSubagentRuntimeOptions,
+	): Promise<void> {
+		const tracked = this.subagentRuntimes.get(options.id);
+		if (tracked === runtime) {
+			this.subagentRuntimes.delete(options.id);
+		}
+		if (runtime instanceof AgentSessionRuntime) {
+			await runtime.dispose();
+		} else {
+			runtime.session.dispose();
+		}
 	}
 
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
@@ -372,13 +516,41 @@ export class AgentSessionRuntime {
 		return { cancelled: false };
 	}
 
+	private async disposeOnce(): Promise<void> {
+		let disposeError: unknown;
+		try {
+			await emitSessionShutdownEvent(this.session.extensionRunner, {
+				type: "session_shutdown",
+				reason: "quit",
+			});
+		} catch (error) {
+			disposeError ??= error;
+		}
+		try {
+			this.beforeSessionInvalidate?.();
+		} catch (error) {
+			disposeError ??= error;
+		}
+		try {
+			this.session.dispose();
+		} catch (error) {
+			disposeError ??= error;
+		}
+		try {
+			await this.disposeHostedSubagentRuntimes();
+		} catch (error) {
+			disposeError ??= error;
+		}
+		if (disposeError) {
+			throw disposeError;
+		}
+	}
+
 	async dispose(): Promise<void> {
-		await emitSessionShutdownEvent(this.session.extensionRunner, {
-			type: "session_shutdown",
-			reason: "quit",
-		});
-		this.beforeSessionInvalidate?.();
-		this.session.dispose();
+		if (!this.disposePromise) {
+			this.disposePromise = this.disposeOnce();
+		}
+		await this.disposePromise;
 	}
 }
 
@@ -396,6 +568,8 @@ export async function createAgentSessionRuntime(
 		sessionManager: SessionManager;
 		sessionStartEvent?: SessionStartEvent;
 		sessionConfig?: AgentSessionRuntimeConfig;
+		sessionOptions?: AgentSessionCreationOptions;
+		runtimeMetadata?: AgentSessionRuntimeMetadata;
 	},
 ): Promise<AgentSessionRuntime> {
 	assertSessionCwdExists(options.sessionManager, options.cwd);
@@ -407,6 +581,7 @@ export async function createAgentSessionRuntime(
 		result.diagnostics,
 		result.modelFallbackMessage,
 		options.sessionConfig,
+		options.runtimeMetadata,
 	);
 }
 

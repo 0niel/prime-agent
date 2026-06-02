@@ -48,13 +48,15 @@ export type DaemonResponse =
 	| { id?: string; type: "response"; command: string; success: true; data?: unknown }
 	| { id?: string; type: "response"; command: string; success: false; error: string };
 
+export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced";
+
 export type DaemonOutbound =
 	| DaemonResponse
 	| { type: "daemon_hello"; socketPath: string }
 	| { type: "session_event"; activeSessionId: string; event: AgentSessionEvent }
 	| { type: "session_attached"; activeSessionId: string; state: SessionSummary; messages: AgentMessage[] }
 	| { type: "session_detached"; activeSessionId: string }
-	| { type: "session_closed"; activeSessionId: string; reason: "killed" | "shutdown" }
+	| { type: "session_closed"; activeSessionId: string; reason: DaemonSessionClosedReason }
 	| {
 			type: "extension_ui_request";
 			activeSessionId: string;

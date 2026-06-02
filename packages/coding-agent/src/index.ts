@@ -154,9 +154,12 @@ export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./co
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.js";
 // SDK for programmatic usage
 export {
+	type AgentSessionCreationOptions,
 	AgentSessionRuntime,
 	type AgentSessionRuntimeConfig,
 	type AgentSessionRuntimeDiagnostic,
+	type AgentSessionRuntimeKind,
+	type AgentSessionRuntimeMetadata,
 	type AgentSessionServices,
 	type CreateAgentSessionFromServicesOptions,
 	type CreateAgentSessionOptions,
@@ -164,6 +167,7 @@ export {
 	type CreateAgentSessionRuntimeFactory,
 	type CreateAgentSessionRuntimeResult,
 	type CreateAgentSessionServicesOptions,
+	type CreateRlmSubagentRuntimeOptions,
 	// Factory
 	createAgentSession,
 	createAgentSessionFromServices,
@@ -174,6 +178,8 @@ export {
 	createEditTool,
 	createIpythonTool,
 	type PromptTemplate,
+	type RlmSubagentRuntime,
+	type SubagentRuntimeHost,
 } from "./core/sdk.js";
 export {
 	type BranchSummaryEntry,

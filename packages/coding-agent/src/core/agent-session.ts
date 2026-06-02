@@ -111,7 +111,14 @@ import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
-import type { RlmRunResult, RlmUsage } from "./rlm-runtime.js";
+import type {
+	CreateRlmSubagentRuntimeOptions,
+	RlmInternalRunResult,
+	RlmRunResult,
+	RlmSubagentRuntime,
+	RlmUsage,
+	SubagentRuntimeHost,
+} from "./rlm-runtime.js";
 import type { BranchSummaryEntry, CompactionEntry, SessionMessageEntry } from "./session-manager.js";
 import {
 	CURRENT_SESSION_VERSION,
@@ -285,6 +292,8 @@ export interface AgentSessionConfig {
 	rlmSessionDir?: string;
 	/** Node id for this session when it is itself an RLM child. */
 	rlmParentNodeId?: string;
+	/** Host responsible for creating RLM subagent runtimes. */
+	subagentRuntimeHost?: SubagentRuntimeHost;
 }
 
 export interface ExtensionBindings {
@@ -355,7 +364,7 @@ interface RlmChildRun {
 	status: RlmChildAgentStatus;
 	result?: RlmRunResult;
 	error?: string;
-	task?: Promise<RlmRunResult>;
+	task?: Promise<RlmInternalRunResult>;
 	abort: () => void;
 }
 
@@ -367,6 +376,10 @@ interface RlmChildRun {
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
 
 function noopRlmChildAbort(): void {}
+
+function isRlmChildRunCancelled(run: RlmChildRun): boolean {
+	return run.status === "cancelled";
+}
 
 function parseDepth(value: string | undefined, fallback: number, name: string): number {
 	if (value === undefined || value === "") {
@@ -680,6 +693,7 @@ export class AgentSession {
 	private _rlmMaxDepth: number;
 	private _rlmSessionDir?: string;
 	private _rlmParentNodeId?: string;
+	private _subagentRuntimeHost?: SubagentRuntimeHost;
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
 
 	// Model registry for API key resolution
@@ -715,6 +729,7 @@ export class AgentSession {
 		this._rlmMaxDepth = config.rlmMaxDepth ?? parseDepth(process.env.RLM_MAX_DEPTH, 1, "RLM_MAX_DEPTH");
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
+		this._subagentRuntimeHost = config.subagentRuntimeHost;
 		this._goalState = this._loadPersistedGoalState();
 		if (this._goalState.status === "active") {
 			this._goalAccountingStartedAt = Date.now();
@@ -736,6 +751,10 @@ export class AgentSession {
 	/** Model registry for API key resolution and model discovery */
 	get modelRegistry(): ModelRegistry {
 		return this._modelRegistry;
+	}
+
+	setSubagentRuntimeHost(host?: SubagentRuntimeHost): void {
+		this._subagentRuntimeHost = host;
 	}
 
 	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
@@ -3450,6 +3469,104 @@ export class AgentSession {
 		return this.agent.state.messages.filter((message) => message.role === "assistant").length;
 	}
 
+	private _createRlmSubagentRuntimeOptions(options: {
+		id: string;
+		prompt: string;
+		sessionDir: string;
+		model: Model<any>;
+	}): CreateRlmSubagentRuntimeOptions {
+		return {
+			parentSession: this,
+			id: options.id,
+			prompt: options.prompt,
+			sessionDir: options.sessionDir,
+			model: options.model,
+			thinkingLevel: this.thinkingLevel,
+			scopedModels: [...this._scopedModels],
+			activeToolNames: this.getActiveToolNames(),
+			allowedToolNames: this._allowedToolNames ? [...this._allowedToolNames] : undefined,
+			customTools: [...this._customTools],
+			includeGoalTools: this._includeGoalTools,
+			autoActivateGoalTools: this._autoActivateGoalTools,
+			rlmDepth: this._rlmDepth + 1,
+			rlmMaxDepth: this._rlmMaxDepth,
+			rlmParentNodeId: options.id,
+		};
+	}
+
+	private async _createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
+		if (this._subagentRuntimeHost) {
+			return await this._subagentRuntimeHost.createRlmSubagentRuntime(options);
+		}
+
+		return this._createInlineRlmSubagentRuntime(options);
+	}
+
+	private async _releaseRlmSubagentRuntime(
+		runtime: RlmSubagentRuntime,
+		options: CreateRlmSubagentRuntimeOptions,
+	): Promise<void> {
+		if (this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
+			await this._subagentRuntimeHost.releaseRlmSubagentRuntime(runtime, options);
+			return;
+		}
+
+		runtime.session.dispose();
+	}
+
+	private _createInlineRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): RlmSubagentRuntime {
+		const childSessionManager = SessionManager.create(this._cwd, options.sessionDir);
+		if (options.parentSession.sessionFile) {
+			childSessionManager.newSession({ parentSession: options.parentSession.sessionFile });
+		}
+		childSessionManager.appendModelChange(options.model.provider, options.model.id);
+		childSessionManager.appendThinkingLevelChange(options.thinkingLevel);
+
+		const childAgent = new Agent({
+			initialState: {
+				systemPrompt: "",
+				model: options.model,
+				thinkingLevel: options.thinkingLevel,
+				tools: [],
+			},
+			convertToLlm: this.agent.convertToLlm,
+			transformContext: this.agent.transformContext,
+			streamFn: this.agent.streamFn,
+			getApiKey: this.agent.getApiKey,
+			onPayload: this.agent.onPayload,
+			onResponse: this.agent.onResponse,
+			steeringMode: this.settingsManager.getSteeringMode(),
+			followUpMode: this.settingsManager.getFollowUpMode(),
+			sessionId: childSessionManager.getSessionId(),
+			thinkingBudgets: this.settingsManager.getThinkingBudgets(),
+			transport: this.settingsManager.getTransport(),
+			maxRetryDelayMs: this.settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+			toolExecution: this.agent.toolExecution,
+		});
+
+		const child = new AgentSession({
+			agent: childAgent,
+			sessionManager: childSessionManager,
+			settingsManager: this.settingsManager,
+			cwd: this._cwd,
+			scopedModels: options.scopedModels,
+			resourceLoader: this._resourceLoader,
+			customTools: options.customTools,
+			modelRegistry: this._modelRegistry,
+			initialActiveToolNames: options.activeToolNames,
+			allowedToolNames: options.allowedToolNames,
+			includeGoalTools: options.includeGoalTools,
+			autoActivateGoalTools: options.autoActivateGoalTools,
+			rlmDepth: options.rlmDepth,
+			rlmMaxDepth: options.rlmMaxDepth,
+			rlmSessionDir: options.sessionDir,
+			rlmParentNodeId: options.rlmParentNodeId,
+			sessionStartEvent: { type: "session_start", reason: "startup" },
+		});
+
+		return { session: child };
+	}
+
 	private _cancelActiveRlmChildRuns(reason: string): void {
 		for (const run of this._activeRlmChildRuns.values()) {
 			if (run.status === "running" || run.status === "queued") {
@@ -3589,155 +3706,127 @@ export class AgentSession {
 		};
 		emitChildUpdate();
 
-		const childSessionManager = SessionManager.create(this._cwd, childSessionDir);
-		childSessionManager.appendModelChange(model.provider, model.id);
-		childSessionManager.appendThinkingLevelChange(this.thinkingLevel);
-
-		const childAgent = new Agent({
-			initialState: {
-				systemPrompt: "",
-				model,
-				thinkingLevel: this.thinkingLevel,
-				tools: [],
-			},
-			convertToLlm: this.agent.convertToLlm,
-			transformContext: this.agent.transformContext,
-			streamFn: this.agent.streamFn,
-			getApiKey: this.agent.getApiKey,
-			onPayload: this.agent.onPayload,
-			onResponse: this.agent.onResponse,
-			steeringMode: this.settingsManager.getSteeringMode(),
-			followUpMode: this.settingsManager.getFollowUpMode(),
-			sessionId: childSessionManager.getSessionId(),
-			thinkingBudgets: this.settingsManager.getThinkingBudgets(),
-			transport: this.settingsManager.getTransport(),
-			maxRetryDelayMs: this.settingsManager.getProviderRetrySettings().maxRetryDelayMs,
-			toolExecution: this.agent.toolExecution,
+		const subagentOptions = this._createRlmSubagentRuntimeOptions({
+			id: childNodeId,
+			prompt,
+			sessionDir: childSessionDir,
+			model,
 		});
+		let childRuntime: RlmSubagentRuntime | undefined;
+		let unsubscribeChild: (() => void) | undefined;
 
-		const child = new AgentSession({
-			agent: childAgent,
-			sessionManager: childSessionManager,
-			settingsManager: this.settingsManager,
-			cwd: this._cwd,
-			scopedModels: this._scopedModels,
-			resourceLoader: this._resourceLoader,
-			customTools: this._customTools,
-			modelRegistry: this._modelRegistry,
-			initialActiveToolNames: this.getActiveToolNames(),
-			allowedToolNames: this._allowedToolNames ? [...this._allowedToolNames] : undefined,
-			includeGoalTools: this._includeGoalTools,
-			autoActivateGoalTools: this._autoActivateGoalTools,
-			rlmDepth: this._rlmDepth + 1,
-			rlmMaxDepth: this._rlmMaxDepth,
-			rlmSessionDir: childSessionDir,
-			rlmParentNodeId: childNodeId,
-			sessionStartEvent: { type: "session_start", reason: "startup" },
-		});
-		run.abort = () => {
-			void child.abort();
-		};
-		const unsubscribeChild = child.subscribe((event) => {
-			if (event.type === "rlm_child_update") {
-				this._emit(event);
-				return;
-			}
-			switch (event.type) {
-				case "message_start": {
-					if (event.message.role === "user") {
-						recordUserMessage(event.message);
-						currentAssistantIndex = undefined;
-					} else if (event.message.role === "assistant") {
-						// New assistant turn: append a fresh entry so prior text isn't overwritten.
-						currentAssistantIndex = undefined;
-						recordAssistantMessage(event.message as AssistantMessage);
-					}
-					emitChildUpdate();
-					break;
-				}
-				case "message_update":
-				case "message_end": {
-					if (event.message.role === "assistant") {
-						recordAssistantMessage(event.message as AssistantMessage);
-						emitChildUpdate();
-					}
-					break;
-				}
-				case "tool_execution_start": {
-					const args = formatRlmToolArgs(event.args);
-					const text = args ? `${event.toolName} running ${args}` : `${event.toolName} running`;
-					// Tool break: next assistant text starts a new entry after this tool row.
-					currentAssistantIndex = undefined;
-					lastToolTranscriptIndex = transcript.length;
-					transcript.push({ role: "tool", text });
-					structuredTranscript.push(createToolTranscriptEntry(event, text, undefined, true));
-					emitChildUpdate();
-					break;
-				}
-				case "tool_execution_update": {
-					const text = readToolResultText(event.partialResult);
-					if (lastToolTranscriptIndex !== undefined) {
-						const previous = structuredTranscript[lastToolTranscriptIndex];
-						const summary = text
-							? `${event.toolName} running: ${compactRlmText(text)}`
-							: transcript[lastToolTranscriptIndex]?.text || `${event.toolName} running`;
-						transcript[lastToolTranscriptIndex] = { role: "tool", text: summary };
-						structuredTranscript[lastToolTranscriptIndex] = createToolTranscriptEntry(
-							{
-								toolCallId: event.toolCallId,
-								toolName: event.toolName,
-								args: previous?.type === "tool" ? previous.args : event.args,
-							},
-							summary,
-							cloneRlmToolResult(event.partialResult, false),
-							true,
-						);
-						emitChildUpdate();
-					}
-					break;
-				}
-				case "tool_execution_end": {
-					const text = readToolResultText(event.result);
-					const summary = text ? `${event.toolName}: ${compactRlmText(text)}` : `${event.toolName} done`;
-					const previous =
-						lastToolTranscriptIndex === undefined ? undefined : structuredTranscript[lastToolTranscriptIndex];
-					const entry = createToolTranscriptEntry(
-						{
-							toolCallId: event.toolCallId,
-							toolName: event.toolName,
-							args: previous?.type === "tool" ? previous.args : undefined,
-						},
-						summary,
-						cloneRlmToolResult(event.result, event.isError),
-						false,
-					);
-					if (lastToolTranscriptIndex === undefined) {
-						lastToolTranscriptIndex = transcript.length;
-						transcript.push({ role: "tool", text: summary });
-						structuredTranscript.push(entry);
-					} else {
-						transcript[lastToolTranscriptIndex] = { role: "tool", text: summary };
-						structuredTranscript[lastToolTranscriptIndex] = entry;
-					}
-					emitChildUpdate();
-					break;
-				}
-			}
-		});
-
-		const task = (async (): Promise<RlmRunResult> => {
+		const task = (async (): Promise<RlmInternalRunResult> => {
 			try {
 				if (!(await ensureTool("rg", true))) {
 					throw new Error(MISSING_RIPGREP_MESSAGE);
 				}
+				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
+				const child = childRuntime.session;
+				run.abort = () => {
+					void child.abort();
+				};
+				unsubscribeChild = child.subscribe((event) => {
+					if (event.type === "rlm_child_update") {
+						this._emit(event);
+						return;
+					}
+					switch (event.type) {
+						case "message_start": {
+							if (event.message.role === "user") {
+								recordUserMessage(event.message);
+								currentAssistantIndex = undefined;
+							} else if (event.message.role === "assistant") {
+								// New assistant turn: append a fresh entry so prior text isn't overwritten.
+								currentAssistantIndex = undefined;
+								recordAssistantMessage(event.message as AssistantMessage);
+							}
+							emitChildUpdate();
+							break;
+						}
+						case "message_update":
+						case "message_end": {
+							if (event.message.role === "assistant") {
+								recordAssistantMessage(event.message as AssistantMessage);
+								emitChildUpdate();
+							}
+							break;
+						}
+						case "tool_execution_start": {
+							const args = formatRlmToolArgs(event.args);
+							const text = args ? `${event.toolName} running ${args}` : `${event.toolName} running`;
+							// Tool break: next assistant text starts a new entry after this tool row.
+							currentAssistantIndex = undefined;
+							lastToolTranscriptIndex = transcript.length;
+							transcript.push({ role: "tool", text });
+							structuredTranscript.push(createToolTranscriptEntry(event, text, undefined, true));
+							emitChildUpdate();
+							break;
+						}
+						case "tool_execution_update": {
+							const text = readToolResultText(event.partialResult);
+							if (lastToolTranscriptIndex !== undefined) {
+								const previous = structuredTranscript[lastToolTranscriptIndex];
+								const summary = text
+									? `${event.toolName} running: ${compactRlmText(text)}`
+									: transcript[lastToolTranscriptIndex]?.text || `${event.toolName} running`;
+								transcript[lastToolTranscriptIndex] = { role: "tool", text: summary };
+								structuredTranscript[lastToolTranscriptIndex] = createToolTranscriptEntry(
+									{
+										toolCallId: event.toolCallId,
+										toolName: event.toolName,
+										args: previous?.type === "tool" ? previous.args : event.args,
+									},
+									summary,
+									cloneRlmToolResult(event.partialResult, false),
+									true,
+								);
+								emitChildUpdate();
+							}
+							break;
+						}
+						case "tool_execution_end": {
+							const text = readToolResultText(event.result);
+							const summary = text ? `${event.toolName}: ${compactRlmText(text)}` : `${event.toolName} done`;
+							const previous =
+								lastToolTranscriptIndex === undefined
+									? undefined
+									: structuredTranscript[lastToolTranscriptIndex];
+							const entry = createToolTranscriptEntry(
+								{
+									toolCallId: event.toolCallId,
+									toolName: event.toolName,
+									args: previous?.type === "tool" ? previous.args : undefined,
+								},
+								summary,
+								cloneRlmToolResult(event.result, event.isError),
+								false,
+							);
+							if (lastToolTranscriptIndex === undefined) {
+								lastToolTranscriptIndex = transcript.length;
+								transcript.push({ role: "tool", text: summary });
+								structuredTranscript.push(entry);
+							} else {
+								transcript[lastToolTranscriptIndex] = { role: "tool", text: summary };
+								structuredTranscript[lastToolTranscriptIndex] = entry;
+							}
+							emitChildUpdate();
+							break;
+						}
+					}
+				});
+				if (isRlmChildRunCancelled(run)) {
+					await child.abort();
+					throw new Error(run.error ?? "RLM child cancelled");
+				}
 				await child.prompt(prompt, { expandPromptTemplates: false, source: "extension" });
 				await child.agent.waitForIdle();
-				if (run.status === "cancelled") {
+				if (isRlmChildRunCancelled(run)) {
 					throw new Error(run.error ?? "RLM child cancelled");
 				}
 				const answer = child.getLastAssistantText() ?? "";
 				const usage = child._usageForCurrentMessages();
-				this._attributeRlmChildUsageToParent(child._assistantUsageForCurrentMessages(), parentAssistantForUsage);
+				const assistantUsage = child._assistantUsageForCurrentMessages();
+				this._attributeRlmChildUsageToParent(assistantUsage, parentAssistantForUsage);
 				run.status = "done";
 				durationMs = Date.now() - startedAt;
 				// Streaming events usually capture the final assistant text already. Only
@@ -3753,14 +3842,14 @@ export class AgentSession {
 					answerPreview = compactAnswer;
 				}
 				emitChildUpdate();
-				const result = {
+				const result: RlmRunResult = {
 					answer,
 					usage,
 					turns: child._assistantTurnCount(),
 					session_dir: childSessionDir,
 				};
 				run.result = result;
-				return result;
+				return { ...result, assistantUsage };
 			} catch (error) {
 				if (run.status !== "cancelled") {
 					run.status = "error";
@@ -3772,8 +3861,10 @@ export class AgentSession {
 				emitChildUpdate();
 				throw error;
 			} finally {
-				unsubscribeChild();
-				child.dispose();
+				unsubscribeChild?.();
+				if (childRuntime) {
+					await this._releaseRlmSubagentRuntime(childRuntime, subagentOptions);
+				}
 				run.abort = noopRlmChildAbort;
 				this._activeRlmChildRuns.delete(run.id);
 			}
@@ -3787,7 +3878,13 @@ export class AgentSession {
 		if (!run.task) {
 			throw new Error("RLM child failed to start");
 		}
-		return await run.task;
+		const result = await run.task;
+		return {
+			answer: result.answer,
+			usage: result.usage,
+			turns: result.turns,
+			session_dir: result.session_dir,
+		};
 	}
 
 	// =========================================================================

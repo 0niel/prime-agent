@@ -5,6 +5,7 @@ import type {
 	ExtensionWidgetOptions,
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.js";
+import type { SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import { type Theme, theme } from "../interactive/theme/theme.js";
 import type { ActiveSessionState } from "./active-session-state.js";
 import type { DaemonOutbound } from "./daemon-protocol.js";
@@ -12,6 +13,7 @@ import type { DaemonOutbound } from "./daemon-protocol.js";
 export interface ActiveSessionBindingCallbacks {
 	broadcast: (state: ActiveSessionState, message: DaemonOutbound) => void;
 	shutdown: () => void;
+	subagentRuntimeHost?: SubagentRuntimeHost;
 }
 
 export async function bindActiveSessionState(
@@ -21,6 +23,7 @@ export async function bindActiveSessionState(
 	const session = state.runtime.session;
 
 	state.unsubscribe?.();
+	state.runtime.setSubagentRuntimeHost(callbacks.subagentRuntimeHost);
 	state.unsubscribe = session.subscribe((event) => {
 		callbacks.broadcast(state, {
 			type: "session_event",

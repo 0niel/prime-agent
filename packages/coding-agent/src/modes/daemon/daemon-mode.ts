@@ -10,7 +10,12 @@ import { createServer, type Server, type Socket } from "node:net";
 import { resolve } from "node:path";
 import type { SessionStats } from "../../core/agent-session.js";
 import { mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
-import { type AgentSessionRuntime, createAgentSessionRuntime } from "../../core/agent-session-runtime.js";
+import { AgentSessionRuntime, createAgentSessionRuntime } from "../../core/agent-session-runtime.js";
+import type {
+	CreateRlmSubagentRuntimeOptions,
+	RlmSubagentRuntime,
+	SubagentRuntimeHost,
+} from "../../core/rlm-runtime.js";
 import { type SessionInfo, SessionManager } from "../../core/session-manager.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
@@ -27,6 +32,7 @@ import {
 	type DaemonModeOptions,
 	type DaemonOutbound,
 	type DaemonResponse,
+	type DaemonSessionClosedReason,
 	failure,
 	success,
 } from "./daemon-protocol.js";
@@ -77,6 +83,7 @@ class AgentDaemon {
 	private ownsSocketPath = false;
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly sessions = new Map<string, ActiveSessionState>();
+	private readonly closingSessions = new Map<string, Promise<void>>();
 	private readonly signalCleanupHandlers: Array<() => void> = [];
 
 	constructor(
@@ -142,6 +149,7 @@ class AgentDaemon {
 				shutdown: () => {
 					void this.shutdown(0);
 				},
+				subagentRuntimeHost: this.createSubagentRuntimeHost(state),
 			});
 		} catch (error) {
 			state.unsubscribe?.();
@@ -185,6 +193,86 @@ class AgentDaemon {
 
 	private getSessionState(id: string): ActiveSessionState {
 		return resolveActiveSessionState(this.sessions, id);
+	}
+
+	private findRuntimeState(runtime: RlmSubagentRuntime): ActiveSessionState | undefined {
+		if (!(runtime instanceof AgentSessionRuntime)) {
+			return undefined;
+		}
+		for (const state of this.sessions.values()) {
+			if (state.runtime === runtime) {
+				return state;
+			}
+		}
+		return undefined;
+	}
+
+	private createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost {
+		return {
+			createRlmSubagentRuntime: async (options) => this.createRlmSubagentRuntime(parentState, options),
+			disposeRlmSubagentRuntimes: async () => {
+				const cascadeError = await this.closeChildSessions(parentState, "replaced");
+				if (cascadeError) {
+					throw cascadeError;
+				}
+			},
+			releaseRlmSubagentRuntime: async (runtime) => {
+				const state = this.findRuntimeState(runtime);
+				if (state) {
+					await this.closeSession(state, "completed");
+					return;
+				}
+				if (runtime instanceof AgentSessionRuntime) {
+					await runtime.dispose();
+					return;
+				}
+				runtime.session.dispose();
+			},
+		};
+	}
+
+	private async createRlmSubagentRuntime(
+		parentState: ActiveSessionState,
+		options: CreateRlmSubagentRuntimeOptions,
+	): Promise<AgentSessionRuntime> {
+		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
+		if (options.parentSession.sessionFile) {
+			sessionManager.newSession({ parentSession: options.parentSession.sessionFile });
+		}
+		const runtime = await createAgentSessionRuntime(this.options.createRuntime, {
+			cwd: sessionManager.getCwd(),
+			agentDir: parentState.runtime.services.agentDir,
+			sessionManager,
+			sessionStartEvent: { type: "session_start", reason: "startup" },
+			sessionConfig: parentState.runtime.runtimeConfig,
+			sessionOptions: {
+				model: options.model,
+				thinkingLevel: options.thinkingLevel,
+				scopedModels: options.scopedModels,
+				initialActiveToolNames: options.activeToolNames,
+				allowedToolNames: options.allowedToolNames,
+				customTools: options.customTools,
+				includeGoalTools: options.includeGoalTools,
+				autoActivateGoalTools: options.autoActivateGoalTools,
+				rlmDepth: options.rlmDepth,
+				rlmMaxDepth: options.rlmMaxDepth,
+				rlmSessionDir: options.sessionDir,
+				rlmParentNodeId: options.rlmParentNodeId,
+			},
+			runtimeMetadata: {
+				kind: "subagent",
+				createdAt: Date.now(),
+				parentActiveSessionId: parentState.activeSessionId,
+				parentSessionId: options.parentSession.sessionId,
+				parentSessionFile: options.parentSession.sessionFile,
+				rlmChildId: options.id,
+				rlmParentNodeId: options.rlmParentNodeId,
+				prompt: options.prompt,
+				sessionDir: options.sessionDir,
+			},
+		});
+		await this.addRuntime(runtime);
+		return runtime;
 	}
 
 	private handleConnection(socket: Socket): void {
@@ -302,7 +390,7 @@ class AgentDaemon {
 
 			case "kill": {
 				const state = this.getSessionState(command.activeSessionId);
-				await this.killSession(state, "killed");
+				await this.closeSession(state, "killed");
 				return success(command.id, "kill");
 			}
 
@@ -433,12 +521,34 @@ class AgentDaemon {
 		}
 	}
 
-	private async killSession(state: ActiveSessionState, reason: "killed" | "shutdown"): Promise<void> {
+	private async closeSession(state: ActiveSessionState, reason: DaemonSessionClosedReason): Promise<void> {
+		const existingClose = this.closingSessions.get(state.activeSessionId);
+		if (existingClose) {
+			await existingClose;
+			return;
+		}
+		const closePromise = Promise.resolve().then(() => this.closeSessionOnce(state, reason));
+		this.closingSessions.set(state.activeSessionId, closePromise);
+		try {
+			await closePromise;
+		} finally {
+			this.closingSessions.delete(state.activeSessionId);
+		}
+	}
+
+	private async closeSessionOnce(state: ActiveSessionState, reason: DaemonSessionClosedReason): Promise<void> {
+		if (!this.sessions.has(state.activeSessionId)) {
+			return;
+		}
+		const cascadeError = await this.closeChildSessions(state, reason);
 		let persistError: unknown;
 		try {
 			state.runtime.session.sessionManager.appendSessionState({ status: "sleep" });
 		} catch (error) {
 			persistError = error;
+		}
+		if (reason === "killed" || reason === "shutdown" || reason === "replaced") {
+			await state.runtime.session.abort().catch(() => undefined);
 		}
 		state.unsubscribe?.();
 		await state.runtime.dispose();
@@ -448,9 +558,27 @@ class AgentDaemon {
 		}
 		state.clients.clear();
 		this.sessions.delete(state.activeSessionId);
-		if (persistError && reason !== "shutdown") {
+		if (persistError && reason !== "shutdown" && reason !== "completed") {
 			throw persistError;
 		}
+		if (cascadeError && reason !== "shutdown" && reason !== "completed") {
+			throw cascadeError;
+		}
+	}
+
+	private async closeChildSessions(
+		parentState: ActiveSessionState,
+		reason: DaemonSessionClosedReason,
+	): Promise<unknown> {
+		let cascadeError: unknown;
+		for (const childState of getChildActiveSessionStates(this.sessions, parentState)) {
+			try {
+				await this.closeSession(childState, reason);
+			} catch (error) {
+				cascadeError ??= error;
+			}
+		}
+		return cascadeError;
 	}
 
 	private broadcastToSession(state: ActiveSessionState, message: DaemonOutbound): void {
@@ -494,7 +622,7 @@ class AgentDaemon {
 			cleanup();
 		}
 		for (const state of [...this.sessions.values()]) {
-			await this.killSession(state, "shutdown");
+			await this.closeSession(state, "shutdown");
 		}
 		for (const client of this.clients) {
 			client.detachInput();
@@ -510,6 +638,17 @@ class AgentDaemon {
 		this.cleanupSocketPath();
 		process.exit(exitCode);
 	}
+}
+
+export function getChildActiveSessionStates(
+	sessions: ReadonlyMap<string, ActiveSessionState>,
+	parentState: ActiveSessionState,
+): ActiveSessionState[] {
+	return [...sessions.values()].filter(
+		(state) =>
+			state.activeSessionId !== parentState.activeSessionId &&
+			state.runtime.metadata.parentActiveSessionId === parentState.activeSessionId,
+	);
 }
 
 export async function resolveDaemonSessionPath(selector: string, cwd: string, sessionDir?: string): Promise<string> {

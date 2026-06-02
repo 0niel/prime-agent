@@ -2,15 +2,19 @@ import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentSession } from "../../src/core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../../src/core/agent-session-config.js";
 import {
+	AgentSessionRuntime,
+	type AgentSessionServices,
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
+import type { SubagentRuntimeHost } from "../../src/core/rlm-runtime.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import type {
 	ExtensionAPI,
@@ -26,6 +30,10 @@ type RecordedSessionEvent =
 	| SessionBeforeForkEvent
 	| SessionShutdownEvent
 	| SessionStartEvent;
+
+type RuntimeSubagentMapAccess = {
+	subagentRuntimes: Map<string, AgentSessionRuntime>;
+};
 
 describe("AgentSessionRuntime characterization", () => {
 	const cleanups: Array<() => Promise<void> | void> = [];
@@ -130,6 +138,26 @@ describe("AgentSessionRuntime characterization", () => {
 		return { runtime, faux, tempDir };
 	}
 
+	function createRuntimeWithFakeSession(options?: { onShutdown?: () => void }) {
+		const disposeSession = vi.fn();
+		const session = {
+			extensionRunner: {
+				hasHandlers: (event: string) => event === "session_shutdown" && options?.onShutdown !== undefined,
+				emit: async () => {
+					options?.onShutdown?.();
+				},
+			},
+			setSubagentRuntimeHost: vi.fn(),
+			dispose: disposeSession,
+		} as unknown as AgentSession;
+		const services = { cwd: "/tmp", agentDir: "/tmp" } as unknown as AgentSessionServices;
+		const createRuntime: CreateAgentSessionRuntimeFactory = async () => {
+			throw new Error("unexpected runtime creation");
+		};
+		const runtime = new AgentSessionRuntime(session, services, createRuntime);
+		return { runtime, disposeSession };
+	}
+
 	it("passes session config to replacement runtimes", async () => {
 		const calls: Array<Parameters<CreateAgentSessionRuntimeFactory>[0]> = [];
 		const sessionConfig: AgentSessionRuntimeConfig = {
@@ -149,6 +177,75 @@ describe("AgentSessionRuntime characterization", () => {
 
 		expect(calls).toHaveLength(2);
 		expect(calls[1]?.sessionConfig).toBe(sessionConfig);
+	});
+
+	it("disposes a runtime only once across repeated teardown calls", async () => {
+		const shutdownEvents: SessionShutdownEvent[] = [];
+		const beforeInvalidate = vi.fn();
+		const { runtime } = await createRuntimeForTest((pi: ExtensionAPI) => {
+			pi.on("session_shutdown", (event) => {
+				shutdownEvents.push(event);
+			});
+		});
+		runtime.setBeforeSessionInvalidate(beforeInvalidate);
+
+		await Promise.all([runtime.dispose(), runtime.dispose()]);
+		await runtime.dispose();
+
+		expect(shutdownEvents).toEqual([{ type: "session_shutdown", reason: "quit" }]);
+		expect(beforeInvalidate).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not replay shutdown events when runtime disposal throws", async () => {
+		let shutdownCount = 0;
+		const { runtime, disposeSession } = createRuntimeWithFakeSession({
+			onShutdown: () => {
+				shutdownCount += 1;
+			},
+		});
+		runtime.setBeforeSessionInvalidate(() => {
+			throw new Error("invalidate failed");
+		});
+
+		await expect(runtime.dispose()).rejects.toThrow("invalidate failed");
+		await expect(runtime.dispose()).rejects.toThrow("invalidate failed");
+
+		expect(shutdownCount).toBe(1);
+		expect(disposeSession).toHaveBeenCalledTimes(1);
+	});
+
+	it("continues disposing tracked subagents after one child dispose fails", async () => {
+		const { runtime } = createRuntimeWithFakeSession();
+		const firstDispose = vi.fn(async () => {
+			throw new Error("first child failed");
+		});
+		const secondDispose = vi.fn(async () => {});
+		const firstChild = { dispose: firstDispose } as unknown as AgentSessionRuntime;
+		const secondChild = { dispose: secondDispose } as unknown as AgentSessionRuntime;
+		const runtimeWithSubagents = runtime as unknown as RuntimeSubagentMapAccess;
+		runtimeWithSubagents.subagentRuntimes.set("first", firstChild);
+		runtimeWithSubagents.subagentRuntimes.set("second", secondChild);
+
+		await expect(runtime.dispose()).rejects.toThrow("first child failed");
+
+		expect(firstDispose).toHaveBeenCalledTimes(1);
+		expect(secondDispose).toHaveBeenCalledTimes(1);
+	});
+
+	it("disposes hosted RLM children during session replacement", async () => {
+		const disposeRlmSubagentRuntimes = vi.fn(async () => {});
+		const host: SubagentRuntimeHost = {
+			createRlmSubagentRuntime: async () => {
+				throw new Error("unexpected child creation");
+			},
+			disposeRlmSubagentRuntimes,
+		};
+		const { runtime } = await createRuntimeForTest(() => {});
+		runtime.setSubagentRuntimeHost(host);
+
+		await runtime.newSession();
+
+		expect(disposeRlmSubagentRuntimes).toHaveBeenCalledTimes(1);
 	});
 
 	it("persists message_end assistant replacements to the session manager", async () => {

@@ -11,6 +11,7 @@ export type SessionStatus = "user" | "idle" | "tool" | "model" | SessionStateSta
 export interface SessionSummary {
 	id: string;
 	status: SessionStatus;
+	runtimeKind?: "top-level" | "subagent";
 	activeSessionId?: string;
 	sessionId: string;
 	sessionFile?: string;
@@ -27,7 +28,11 @@ export interface SessionSummary {
 	created?: string;
 	modified?: string;
 	firstMessage?: string;
+	parentActiveSessionId?: string;
+	parentSessionId?: string;
 	parentSessionPath?: string;
+	rlmChildId?: string;
+	rlmParentNodeId?: string;
 }
 
 export function buildSessionList(
@@ -66,6 +71,7 @@ export function buildSessionList(
 
 export function summaryForActiveSession(activeSession: ActiveSessionState, savedSession?: SessionInfo): SessionSummary {
 	const session = activeSession.runtime.session;
+	const metadata = activeSession.runtime.metadata ?? { kind: "top-level" as const };
 	let modified = savedSession?.modified.toISOString();
 	if (!modified && session.sessionFile) {
 		try {
@@ -78,6 +84,7 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 	return {
 		id: activeSession.activeSessionId,
 		status: activeStatusForSession(activeSession),
+		runtimeKind: metadata.kind,
 		activeSessionId: activeSession.activeSessionId,
 		sessionId: session.sessionId,
 		sessionFile: session.sessionFile,
@@ -94,7 +101,11 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		created: savedSession?.created.toISOString(),
 		modified,
 		firstMessage: savedSession?.firstMessage,
-		parentSessionPath: savedSession?.parentSessionPath,
+		parentActiveSessionId: metadata.parentActiveSessionId,
+		parentSessionId: metadata.parentSessionId,
+		parentSessionPath: savedSession?.parentSessionPath ?? metadata.parentSessionFile,
+		rlmChildId: metadata.rlmChildId,
+		rlmParentNodeId: metadata.rlmParentNodeId,
 	};
 }
 

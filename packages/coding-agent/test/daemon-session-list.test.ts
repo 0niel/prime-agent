@@ -53,6 +53,38 @@ describe("buildSessionList", () => {
 		]);
 		expect(entries[0]!.sessionName).toBe("session active-1");
 	});
+
+	it("includes active subagent parent metadata", () => {
+		const entries = buildSessionList(
+			[
+				makeState({ activeSessionId: "parent", sessionFile: "/tmp/parent.jsonl", sessionId: "parent-session" }),
+				makeState({
+					activeSessionId: "child",
+					sessionFile: "/tmp/child.jsonl",
+					sessionId: "child-session",
+					metadata: {
+						kind: "subagent",
+						createdAt: 1,
+						parentActiveSessionId: "parent",
+						parentSessionId: "parent-session",
+						parentSessionFile: "/tmp/parent.jsonl",
+						rlmChildId: "rlm-child",
+						rlmParentNodeId: "rlm-child",
+					},
+				}),
+			],
+			[],
+		);
+
+		expect(entries.find((entry) => entry.id === "child")).toMatchObject({
+			runtimeKind: "subagent",
+			parentActiveSessionId: "parent",
+			parentSessionId: "parent-session",
+			parentSessionPath: "/tmp/parent.jsonl",
+			rlmChildId: "rlm-child",
+			rlmParentNodeId: "rlm-child",
+		});
+	});
 });
 
 interface StateOptions {
@@ -62,6 +94,15 @@ interface StateOptions {
 	isStreaming?: boolean;
 	pendingToolCalls?: string[];
 	clients?: number;
+	metadata?: {
+		kind: "top-level" | "subagent";
+		createdAt: number;
+		parentActiveSessionId?: string;
+		parentSessionId?: string;
+		parentSessionFile?: string;
+		rlmChildId?: string;
+		rlmParentNodeId?: string;
+	};
 }
 
 function makeState(options: StateOptions): ActiveSessionState {
@@ -74,6 +115,7 @@ function makeState(options: StateOptions): ActiveSessionState {
 		activeSessionId: options.activeSessionId,
 		clients,
 		runtime: {
+			metadata: options.metadata ?? { kind: "top-level", createdAt: 1 },
 			session: {
 				model: undefined,
 				thinkingLevel: "off",

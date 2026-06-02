@@ -575,6 +575,7 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionManager,
 		sessionStartEvent,
 		sessionConfig,
+		sessionOptions: runtimeSessionOptions,
 	}) => {
 		const config = mergeAgentSessionRuntimeConfig(defaultSessionConfig, sessionConfig);
 		const effectiveAgentDir = config.agentDir ?? agentDir;
@@ -627,14 +628,15 @@ export async function main(args: string[], options?: MainOptions) {
 		);
 		diagnostics.push(...sessionOptionDiagnostics);
 
+		const effectiveSessionModel = runtimeSessionOptions?.model ?? sessionOptions.model;
 		if (config.apiKey) {
-			if (!sessionOptions.model) {
+			if (!effectiveSessionModel) {
 				diagnostics.push({
 					type: "error",
 					message: "--api-key requires a model to be specified via --model, --provider/--model, or --models",
 				});
 			} else {
-				authStorage.setRuntimeApiKey(sessionOptions.model.provider, config.apiKey);
+				authStorage.setRuntimeApiKey(effectiveSessionModel.provider, config.apiKey);
 			}
 		}
 
@@ -642,12 +644,21 @@ export async function main(args: string[], options?: MainOptions) {
 			services,
 			sessionManager,
 			sessionStartEvent,
-			model: sessionOptions.model,
-			thinkingLevel: sessionOptions.thinkingLevel,
-			scopedModels: sessionOptions.scopedModels,
-			tools: sessionOptions.tools,
-			noTools: sessionOptions.noTools,
-			customTools: sessionOptions.customTools,
+			model: effectiveSessionModel,
+			thinkingLevel: runtimeSessionOptions?.thinkingLevel ?? sessionOptions.thinkingLevel,
+			scopedModels: runtimeSessionOptions?.scopedModels ?? sessionOptions.scopedModels,
+			tools: runtimeSessionOptions?.tools ?? sessionOptions.tools,
+			noTools: runtimeSessionOptions?.noTools ?? sessionOptions.noTools,
+			customTools: runtimeSessionOptions?.customTools ?? sessionOptions.customTools,
+			initialActiveToolNames: runtimeSessionOptions?.initialActiveToolNames,
+			allowedToolNames: runtimeSessionOptions?.allowedToolNames,
+			includeGoalTools: runtimeSessionOptions?.includeGoalTools,
+			autoActivateGoalTools: runtimeSessionOptions?.autoActivateGoalTools,
+			rlmDepth: runtimeSessionOptions?.rlmDepth,
+			rlmMaxDepth: runtimeSessionOptions?.rlmMaxDepth,
+			rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,
+			rlmParentNodeId: runtimeSessionOptions?.rlmParentNodeId,
+			subagentRuntimeHost: runtimeSessionOptions?.subagentRuntimeHost,
 		});
 		const cliThinkingOverride = config.thinking !== undefined || cliThinkingFromModel;
 		if (created.session.model && cliThinkingOverride) {
