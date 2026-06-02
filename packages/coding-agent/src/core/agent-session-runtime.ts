@@ -1,6 +1,7 @@
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import type { AgentSession } from "./agent-session.js";
+import type { AgentSessionRuntimeConfig } from "./agent-session-config.js";
 import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.js";
 import type { ReplacedSessionContext, SessionShutdownEvent, SessionStartEvent } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
@@ -31,6 +32,7 @@ export type CreateAgentSessionRuntimeFactory = (options: {
 	agentDir: string;
 	sessionManager: SessionManager;
 	sessionStartEvent?: SessionStartEvent;
+	sessionConfig?: AgentSessionRuntimeConfig;
 }) => Promise<CreateAgentSessionRuntimeResult>;
 
 /**
@@ -74,6 +76,7 @@ export class AgentSessionRuntime {
 		private readonly createRuntime: CreateAgentSessionRuntimeFactory,
 		private _diagnostics: AgentSessionRuntimeDiagnostic[] = [],
 		private _modelFallbackMessage?: string,
+		private readonly sessionConfig?: AgentSessionRuntimeConfig,
 	) {}
 
 	get services(): AgentSessionServices {
@@ -191,6 +194,7 @@ export class AgentSessionRuntime {
 				agentDir: this.services.agentDir,
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+				sessionConfig: this.sessionConfig,
 			}),
 		);
 		await this.finishSessionReplacement(options?.withSession);
@@ -221,6 +225,7 @@ export class AgentSessionRuntime {
 				agentDir: this.services.agentDir,
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
+				sessionConfig: this.sessionConfig,
 			}),
 		);
 		if (options?.setup) {
@@ -275,6 +280,7 @@ export class AgentSessionRuntime {
 						agentDir: this.services.agentDir,
 						sessionManager,
 						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+						sessionConfig: this.sessionConfig,
 					}),
 				);
 				await this.finishSessionReplacement(options?.withSession);
@@ -294,6 +300,7 @@ export class AgentSessionRuntime {
 					agentDir: this.services.agentDir,
 					sessionManager,
 					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+					sessionConfig: this.sessionConfig,
 				}),
 			);
 			await this.finishSessionReplacement(options?.withSession);
@@ -313,6 +320,7 @@ export class AgentSessionRuntime {
 				agentDir: this.services.agentDir,
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+				sessionConfig: this.sessionConfig,
 			}),
 		);
 		await this.finishSessionReplacement(options?.withSession);
@@ -357,6 +365,7 @@ export class AgentSessionRuntime {
 				agentDir: this.services.agentDir,
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+				sessionConfig: this.sessionConfig,
 			}),
 		);
 		await this.finishSessionReplacement();
@@ -386,6 +395,7 @@ export async function createAgentSessionRuntime(
 		agentDir: string;
 		sessionManager: SessionManager;
 		sessionStartEvent?: SessionStartEvent;
+		sessionConfig?: AgentSessionRuntimeConfig;
 	},
 ): Promise<AgentSessionRuntime> {
 	assertSessionCwdExists(options.sessionManager, options.cwd);
@@ -396,6 +406,7 @@ export async function createAgentSessionRuntime(
 		createRuntime,
 		result.diagnostics,
 		result.modelFallbackMessage,
+		options.sessionConfig,
 	);
 }
 

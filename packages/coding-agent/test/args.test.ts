@@ -84,6 +84,13 @@ describe("parseArgs", () => {
 		});
 	});
 
+	describe("--cwd flag", () => {
+		test("parses --cwd flag", () => {
+			const result = parseArgs(["--cwd", "/tmp/project"]);
+			expect(result.cwd).toBe("/tmp/project");
+		});
+	});
+
 	describe("flags with values", () => {
 		test("parses --provider", () => {
 			const result = parseArgs(["--provider", "openai"]);

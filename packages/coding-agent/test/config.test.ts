@@ -1,17 +1,23 @@
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
-import { tmpdir } from "os";
+import { homedir, tmpdir } from "os";
 import { delimiter, join } from "path";
 import { afterEach, describe, expect, test } from "vitest";
 import {
 	detectInstallMethod,
+	ENV_LEGACY_SESSION_DIR,
+	ENV_SESSION_DIR,
 	getSelfUpdateCommand,
 	getSelfUpdateUnavailableInstruction,
+	getSessionsDir,
 	getUpdateInstruction,
 } from "../src/config.js";
+import { getDefaultSessionDir } from "../src/core/session-manager.js";
 
 const execPathDescriptor = Object.getOwnPropertyDescriptor(process, "execPath");
 const originalPath = process.env.PATH;
 const originalPiPackageDir = process.env.PI_PACKAGE_DIR;
+const originalSessionDir = process.env[ENV_SESSION_DIR];
+const originalLegacySessionDir = process.env[ENV_LEGACY_SESSION_DIR];
 let tempDir: string | undefined;
 
 function setExecPath(value: string): void {
@@ -34,6 +40,16 @@ afterEach(() => {
 		delete process.env.PI_PACKAGE_DIR;
 	} else {
 		process.env.PI_PACKAGE_DIR = originalPiPackageDir;
+	}
+	if (originalSessionDir === undefined) {
+		delete process.env[ENV_SESSION_DIR];
+	} else {
+		process.env[ENV_SESSION_DIR] = originalSessionDir;
+	}
+	if (originalLegacySessionDir === undefined) {
+		delete process.env[ENV_LEGACY_SESSION_DIR];
+	} else {
+		process.env[ENV_LEGACY_SESSION_DIR] = originalLegacySessionDir;
 	}
 	if (tempDir) {
 		chmodSync(tempDir, 0o700);
@@ -371,5 +387,43 @@ describe("detectInstallMethod", () => {
 		expect(getSelfUpdateUnavailableInstruction("@earendil-works/pi-coding-agent")).toContain(
 			"the install path is not writable",
 		);
+	});
+});
+
+describe("session paths", () => {
+	test("uses the short app-prefixed session dir env var", () => {
+		expect(ENV_SESSION_DIR).toBe("PRIME_AGENT_SESSION_DIR");
+	});
+
+	test("uses the session root env var when computing sessions dir", () => {
+		const sessionRoot = join(tmpdir(), `pi-session-root-${Date.now()}`);
+		process.env[ENV_SESSION_DIR] = sessionRoot;
+
+		expect(getSessionsDir("/agent")).toBe(sessionRoot);
+	});
+
+	test("uses the legacy coding agent session root env var when the new env var is unset", () => {
+		const sessionRoot = join(tmpdir(), `pi-legacy-session-root-${Date.now()}`);
+		delete process.env[ENV_SESSION_DIR];
+		process.env[ENV_LEGACY_SESSION_DIR] = sessionRoot;
+
+		expect(getSessionsDir("/agent")).toBe(sessionRoot);
+	});
+
+	test("expands tilde in the session root env var", () => {
+		process.env[ENV_SESSION_DIR] = "~/prime-agent-sessions";
+
+		expect(getSessionsDir("/agent")).toBe(join(homedir(), "prime-agent-sessions"));
+	});
+
+	test("uses the env session root as the default session dir", () => {
+		tempDir = mkdtempSync(join(tmpdir(), "pi-session-root-"));
+		const cwd = join(tempDir, "project");
+		const sessionRoot = join(tempDir, "sessions-root");
+		process.env[ENV_SESSION_DIR] = sessionRoot;
+
+		const sessionDir = getDefaultSessionDir(cwd, join(tempDir, "agent"));
+
+		expect(sessionDir).toBe(sessionRoot);
 	});
 });

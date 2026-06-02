@@ -3,10 +3,21 @@
  */
 
 import chalk from "chalk";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
-import { dirname, join } from "path";
-import { CONFIG_DIR_NAME, getAgentDir, getBinDir } from "./config.js";
+import {
+	type Dirent,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmdirSync,
+	rmSync,
+	writeFileSync,
+} from "fs";
+import { basename, dirname, join } from "path";
+import { CONFIG_DIR_NAME, getAgentDir, getBinDir, getSessionsDir } from "./config.js";
 import { migrateKeybindingsConfig } from "./core/keybindings.js";
+import { readFirstLineSync } from "./utils/file-lines.js";
 
 const MIGRATION_GUIDE_URL =
 	"https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration";
@@ -73,11 +84,11 @@ export function migrateAuthToAuthJson(): string[] {
 }
 
 /**
- * Migrate sessions from ~/.pi/agent/*.jsonl to proper session directories.
+ * Migrate sessions from ~/.pi/agent/*.jsonl to the session root.
  *
  * Bug in v0.30.0: Sessions were saved to ~/.pi/agent/ instead of
- * ~/.pi/agent/sessions/<encoded-cwd>/. This migration moves them
- * to the correct location based on the cwd in their session header.
+ * ~/.pi/agent/sessions/. This migration moves them to the configured
+ * session root.
  *
  * See: https://github.com/earendil-works/pi-mono/issues/320
  */
@@ -99,18 +110,13 @@ export function migrateSessionsFromAgentRoot(): void {
 	for (const file of files) {
 		try {
 			// Read first line to get session header
-			const content = readFileSync(file, "utf8");
-			const firstLine = content.split("\n")[0];
+			const firstLine = readFirstLineSync(file);
 			if (!firstLine?.trim()) continue;
 
 			const header = JSON.parse(firstLine);
-			if (header.type !== "session" || !header.cwd) continue;
+			if (header.type !== "session") continue;
 
-			const cwd: string = header.cwd;
-
-			// Compute the correct session directory (same encoding as session-manager.ts)
-			const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-			const correctDir = join(agentDir, "sessions", safePath);
+			const correctDir = getSessionsDir(agentDir);
 
 			// Create directory if needed
 			if (!existsSync(correctDir)) {
@@ -118,14 +124,84 @@ export function migrateSessionsFromAgentRoot(): void {
 			}
 
 			// Move the file
-			const fileName = file.split("/").pop() || file.split("\\").pop();
-			const newPath = join(correctDir, fileName!);
+			const newPath = join(correctDir, basename(file));
 
 			if (existsSync(newPath)) continue; // Skip if target exists
 
 			renameSync(file, newPath);
 		} catch {
 			// Skip files that can't be migrated
+		}
+	}
+}
+
+function isSessionJsonlFile(filePath: string): boolean {
+	try {
+		const firstLine = readFirstLineSync(filePath);
+		if (!firstLine?.trim()) {
+			return false;
+		}
+		const header = JSON.parse(firstLine) as { type?: unknown; id?: unknown };
+		return header.type === "session" && typeof header.id === "string";
+	} catch {
+		return false;
+	}
+}
+
+function isLegacySessionDirName(name: string): boolean {
+	return /^--.+--$/.test(name);
+}
+
+/**
+ * Migrate legacy per-cwd session directories into the flat session root.
+ *
+ * Older versions stored sessions under ~/.prime/agent/sessions/--cwd--/*.jsonl.
+ * The daemon list/continue paths now scan the flat session root, so move any
+ * existing nested JSONL session files up one level.
+ */
+export function migrateLegacySessionDirsToSessionRoot(): void {
+	const agentDir = getAgentDir();
+	const sessionsDir = getSessionsDir(agentDir);
+
+	let entries: Dirent[];
+	try {
+		entries = readdirSync(sessionsDir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+
+	for (const entry of entries) {
+		if (!entry.isDirectory() || !isLegacySessionDirName(entry.name)) {
+			continue;
+		}
+
+		const legacyDir = join(sessionsDir, entry.name);
+		let files: string[];
+		try {
+			files = readdirSync(legacyDir).filter((file) => file.endsWith(".jsonl"));
+		} catch {
+			continue;
+		}
+
+		for (const file of files) {
+			const oldPath = join(legacyDir, file);
+			const newPath = join(sessionsDir, file);
+			if (existsSync(newPath) || !isSessionJsonlFile(oldPath)) {
+				continue;
+			}
+			try {
+				renameSync(oldPath, newPath);
+			} catch {
+				// Leave the legacy file in place if it cannot be moved.
+			}
+		}
+
+		try {
+			if (readdirSync(legacyDir).length === 0) {
+				rmdirSync(legacyDir);
+			}
+		} catch {
+			// Ignore cleanup errors; migrated files are already in the flat root.
 		}
 	}
 }
@@ -308,6 +384,7 @@ export function runMigrations(cwd: string): {
 } {
 	const migratedAuthProviders = migrateAuthToAuthJson();
 	migrateSessionsFromAgentRoot();
+	migrateLegacySessionDirsToSessionRoot();
 	migrateToolsToBin();
 	migrateKeybindingsConfigFile();
 	const deprecationWarnings = migrateExtensionSystem(cwd);

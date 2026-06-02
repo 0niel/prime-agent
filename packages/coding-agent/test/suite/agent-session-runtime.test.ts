@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import type { AgentSessionRuntimeConfig } from "../../src/core/agent-session-config.js";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -37,7 +38,13 @@ describe("AgentSessionRuntime characterization", () => {
 
 	async function createRuntimeForTest(
 		extensionFactory: ExtensionFactory,
-		options?: { cwd?: string; bootstrapModel?: boolean; bootstrapThinkingLevel?: boolean },
+		options?: {
+			cwd?: string;
+			bootstrapModel?: boolean;
+			bootstrapThinkingLevel?: boolean;
+			sessionConfig?: AgentSessionRuntimeConfig;
+			onCreateRuntime?: (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => void;
+		},
 	) {
 		const tempDir =
 			options?.cwd ?? join(tmpdir(), `pi-runtime-suite-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -54,7 +61,7 @@ describe("AgentSessionRuntime characterization", () => {
 		const authStorage = AuthStorage.inMemory();
 		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
 
-		const runtimeOptions = {
+		const serviceOptions = {
 			agentDir: tempDir,
 			authStorage,
 			model: options?.bootstrapModel === false ? undefined : faux.getModel(),
@@ -85,9 +92,11 @@ describe("AgentSessionRuntime characterization", () => {
 				noThemes: true,
 			},
 		};
-		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
+		const createRuntime: CreateAgentSessionRuntimeFactory = async (runtimeOptions) => {
+			options?.onCreateRuntime?.(runtimeOptions);
+			const { cwd, sessionManager, sessionStartEvent } = runtimeOptions;
 			const services = await createAgentSessionServices({
-				...runtimeOptions,
+				...serviceOptions,
 				cwd,
 			});
 			return {
@@ -95,8 +104,8 @@ describe("AgentSessionRuntime characterization", () => {
 					services,
 					sessionManager,
 					sessionStartEvent,
-					model: runtimeOptions.model,
-					thinkingLevel: runtimeOptions.thinkingLevel,
+					model: serviceOptions.model,
+					thinkingLevel: serviceOptions.thinkingLevel,
 				})),
 				services,
 				diagnostics: services.diagnostics,
@@ -106,6 +115,7 @@ describe("AgentSessionRuntime characterization", () => {
 			cwd: tempDir,
 			agentDir: tempDir,
 			sessionManager: SessionManager.create(tempDir),
+			sessionConfig: options?.sessionConfig,
 		});
 		await runtime.session.bindExtensions({});
 
@@ -119,6 +129,27 @@ describe("AgentSessionRuntime characterization", () => {
 
 		return { runtime, faux, tempDir };
 	}
+
+	it("passes session config to replacement runtimes", async () => {
+		const calls: Array<Parameters<CreateAgentSessionRuntimeFactory>[0]> = [];
+		const sessionConfig: AgentSessionRuntimeConfig = {
+			cwd: "/tmp/session-config-cwd",
+			model: "faux-2",
+			tools: ["bash"],
+		};
+		const { runtime } = await createRuntimeForTest(() => {}, {
+			sessionConfig,
+			onCreateRuntime: (call) => calls.push(call),
+		});
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.sessionConfig).toBe(sessionConfig);
+
+		await runtime.newSession();
+
+		expect(calls).toHaveLength(2);
+		expect(calls[1]?.sessionConfig).toBe(sessionConfig);
+	});
 
 	it("persists message_end assistant replacements to the session manager", async () => {
 		const { runtime } = await createRuntimeForTest((pi: ExtensionAPI) => {

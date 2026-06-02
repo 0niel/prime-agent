@@ -2,9 +2,12 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { parseArgs } from "../src/cli/args.js";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { getMissingSessionCwdIssue, MissingSessionCwdError } from "../src/core/session-cwd.js";
 import { SessionManager } from "../src/core/session-manager.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
+import { createSessionManager } from "../src/main.js";
 
 function createTempDir(name: string): string {
 	const dir = join(tmpdir(), `${name}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -62,6 +65,26 @@ describe("session cwd handling", () => {
 		const sessionManager = SessionManager.open(sessionFile, undefined, fallbackCwd);
 		expect(sessionManager.getCwd()).toBe(fallbackCwd);
 		expect(getMissingSessionCwdIssue(sessionManager, fallbackCwd)).toBeUndefined();
+	});
+
+	it("uses explicit --cwd as the cwd override when opening --session", async () => {
+		const storedCwd = createTempDir("pi-session-cwd-stored");
+		const explicitCwd = createTempDir("pi-session-cwd-explicit");
+		const agentDir = createTempDir("pi-session-cwd-agent-dir");
+		const sessionDir = createTempDir("pi-session-cwd-session-dir");
+		const sessionFile = join(sessionDir, "session.jsonl");
+		cleanupPaths.push(storedCwd, explicitCwd, agentDir, sessionDir);
+		writeSessionFile(sessionFile, storedCwd);
+
+		const parsed = parseArgs(["--cwd", explicitCwd, "--session", sessionFile]);
+		const sessionManager = await createSessionManager(
+			parsed,
+			explicitCwd,
+			sessionDir,
+			SettingsManager.create(explicitCwd, agentDir),
+		);
+
+		expect(sessionManager.getCwd()).toBe(explicitCwd);
 	});
 
 	it("throws a controlled error before runtime creation when the stored cwd is missing", async () => {

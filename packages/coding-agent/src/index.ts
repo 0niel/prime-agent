@@ -155,6 +155,7 @@ export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-
 // SDK for programmatic usage
 export {
 	AgentSessionRuntime,
+	type AgentSessionRuntimeConfig,
 	type AgentSessionRuntimeDiagnostic,
 	type AgentSessionServices,
 	type CreateAgentSessionFromServicesOptions,
@@ -195,6 +196,9 @@ export {
 	type SessionInfoEntry,
 	SessionManager,
 	type SessionMessageEntry,
+	type SessionState,
+	type SessionStateEntry,
+	type SessionStateStatus,
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.js";
 export {
@@ -255,6 +259,13 @@ export {
 export { type MainOptions, main } from "./main.js";
 // Run modes for programmatic SDK usage
 export {
+	DaemonClient,
+	type DaemonClientMessageListener,
+	type DaemonCommand,
+	type DaemonModeOptions,
+	type DaemonOutbound,
+	type DaemonResponse,
+	defaultDaemonSocketPath,
 	InteractiveMode,
 	type InteractiveModeOptions,
 	type ModelInfo,
@@ -267,6 +278,8 @@ export {
 	type RpcSessionState,
 	runPrintMode,
 	runRpcMode,
+	type SessionStatus,
+	type SessionSummary,
 } from "./modes/index.js";
 // UI components for extensions
 export {

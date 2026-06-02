@@ -5,17 +5,19 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import { ProcessTerminal, setKeybindings, TUI } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.js";
+import { handleDaemonCommand, normalizeDaemonStartArgs } from "./cli/daemon-command.js";
 import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
 import { selectSession } from "./cli/session-picker.js";
-import { ENV_SESSION_DIR, expandTildePath, getAgentDir, VERSION } from "./config.js";
+import { expandTildePath, getAgentDir, getSessionDirEnvOverride, VERSION } from "./config.js";
+import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "./core/agent-session-config.js";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.js";
 import {
 	type AgentSessionRuntimeDiagnostic,
@@ -41,7 +43,7 @@ import { SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
-import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.js";
+import { InteractiveMode, runDaemonMode, runPrintMode, runRpcMode } from "./modes/index.js";
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.js";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.js";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.js";
@@ -93,9 +95,12 @@ function isTruthyEnvFlag(value: string | undefined): boolean {
 	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
 }
 
-type AppMode = "interactive" | "print" | "json" | "rpc";
+type AppMode = "interactive" | "print" | "json" | "rpc" | "daemon";
 
 function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
+	if (parsed.mode === "daemon") {
+		return "daemon";
+	}
 	if (parsed.mode === "rpc") {
 		return "rpc";
 	}
@@ -108,7 +113,7 @@ function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
 	return "interactive";
 }
 
-function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc"> {
+function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc" | "daemon"> {
 	return appMode === "json" ? "json" : "text";
 }
 
@@ -211,12 +216,14 @@ function forkSessionOrExit(sourcePath: string, cwd: string, sessionDir?: string)
 	}
 }
 
-async function createSessionManager(
+export async function createSessionManager(
 	parsed: Args,
 	cwd: string,
 	sessionDir: string | undefined,
 	settingsManager: SettingsManager,
 ): Promise<SessionManager> {
+	const explicitCwdOverride = parsed.cwd ? cwd : undefined;
+
 	if (parsed.noSession) {
 		return SessionManager.inMemory();
 	}
@@ -242,7 +249,7 @@ async function createSessionManager(
 		switch (resolved.type) {
 			case "path":
 			case "local":
-				return SessionManager.open(resolved.path, sessionDir);
+				return SessionManager.open(resolved.path, sessionDir, explicitCwdOverride);
 
 			case "global": {
 				console.log(chalk.yellow(`Session found in different project: ${resolved.cwd}`));
@@ -271,7 +278,7 @@ async function createSessionManager(
 				console.log(chalk.dim("No session selected"));
 				process.exit(0);
 			}
-			return SessionManager.open(selectedPath, sessionDir);
+			return SessionManager.open(selectedPath, sessionDir, explicitCwdOverride);
 		} finally {
 			stopThemeWatcher();
 		}
@@ -285,7 +292,7 @@ async function createSessionManager(
 }
 
 function buildSessionOptions(
-	parsed: Args,
+	config: AgentSessionRuntimeConfig,
 	scopedModels: ScopedModel[],
 	hasExistingSession: boolean,
 	modelRegistry: ModelRegistry,
@@ -302,10 +309,10 @@ function buildSessionOptions(
 	// Model from CLI
 	// - supports --provider <name> --model <pattern>
 	// - supports --model <provider>/<pattern>
-	if (parsed.model) {
+	if (config.model) {
 		const resolved = resolveCliModel({
-			cliProvider: parsed.provider,
-			cliModel: parsed.model,
+			cliProvider: config.provider,
+			cliModel: config.model,
 			modelRegistry,
 		});
 		if (resolved.warning) {
@@ -318,7 +325,7 @@ function buildSessionOptions(
 			options.model = resolved.model;
 			// Allow "--model <pattern>:<thinking>" as a shorthand.
 			// Explicit --thinking still takes precedence (applied later).
-			if (!parsed.thinking && resolved.thinkingLevel) {
+			if (!config.thinking && resolved.thinkingLevel) {
 				options.thinkingLevel = resolved.thinkingLevel;
 				cliThinkingFromModel = true;
 			}
@@ -335,21 +342,21 @@ function buildSessionOptions(
 		if (savedInScope) {
 			options.model = savedInScope.model;
 			// Use thinking level from scoped model config if explicitly set
-			if (!parsed.thinking && savedInScope.thinkingLevel) {
+			if (!config.thinking && savedInScope.thinkingLevel) {
 				options.thinkingLevel = savedInScope.thinkingLevel;
 			}
 		} else {
 			options.model = scopedModels[0].model;
 			// Use thinking level from first scoped model if explicitly set
-			if (!parsed.thinking && scopedModels[0].thinkingLevel) {
+			if (!config.thinking && scopedModels[0].thinkingLevel) {
 				options.thinkingLevel = scopedModels[0].thinkingLevel;
 			}
 		}
 	}
 
 	// Thinking level from CLI (takes precedence over scoped model thinking levels set above)
-	if (parsed.thinking) {
-		options.thinkingLevel = parsed.thinking;
+	if (config.thinking) {
+		options.thinkingLevel = config.thinking;
 	}
 
 	// Scoped models for Ctrl+P cycling
@@ -366,13 +373,13 @@ function buildSessionOptions(
 	// (handled by caller before createAgentSession)
 
 	// Tools
-	if (parsed.noTools) {
+	if (config.noTools) {
 		options.noTools = "all";
-	} else if (parsed.noBuiltinTools) {
+	} else if (config.noBuiltinTools) {
 		options.noTools = "builtin";
 	}
-	if (parsed.tools) {
-		options.tools = [...parsed.tools];
+	if (config.tools) {
+		options.tools = [...config.tools];
 	}
 
 	return { options, cliThinkingFromModel, diagnostics };
@@ -380,6 +387,39 @@ function buildSessionOptions(
 
 function resolveCliPaths(cwd: string, paths: string[] | undefined): string[] | undefined {
 	return paths?.map((value) => (isLocalPath(value) ? resolve(cwd, value) : value));
+}
+
+function runtimeConfigFromArgs(
+	parsed: Args,
+	cwd: string,
+	agentDir: string,
+	sessionDir: string | undefined,
+): AgentSessionRuntimeConfig {
+	return {
+		cwd,
+		agentDir,
+		sessionDir,
+		provider: parsed.provider,
+		model: parsed.model,
+		apiKey: parsed.apiKey,
+		systemPrompt: parsed.systemPrompt,
+		appendSystemPrompt: parsed.appendSystemPrompt,
+		thinking: parsed.thinking,
+		models: parsed.models,
+		tools: parsed.tools,
+		noTools: parsed.noTools,
+		noBuiltinTools: parsed.noBuiltinTools,
+		extensions: resolveCliPaths(cwd, parsed.extensions),
+		noExtensions: parsed.noExtensions,
+		skills: resolveCliPaths(cwd, parsed.skills),
+		noSkills: parsed.noSkills,
+		promptTemplates: resolveCliPaths(cwd, parsed.promptTemplates),
+		noPromptTemplates: parsed.noPromptTemplates,
+		themes: resolveCliPaths(cwd, parsed.themes),
+		noThemes: parsed.noThemes,
+		noContextFiles: parsed.noContextFiles,
+		extensionFlagValues: parsed.unknownFlags.size > 0 ? Object.fromEntries(parsed.unknownFlags.entries()) : undefined,
+	};
 }
 
 async function promptForMissingSessionCwd(
@@ -422,6 +462,7 @@ export interface MainOptions {
 
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
+	args = normalizeDaemonStartArgs(args) ?? args;
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
 		process.env.PI_OFFLINE = "1";
@@ -433,6 +474,10 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	if (await handleConfigCommand(args)) {
+		return;
+	}
+
+	if (await handleDaemonCommand(args)) {
 		return;
 	}
 
@@ -472,18 +517,28 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(0);
 	}
 
-	if (parsed.mode === "rpc" && parsed.fileArgs.length > 0) {
-		console.error(chalk.red("Error: @file arguments are not supported in RPC mode"));
+	if ((parsed.mode === "rpc" || parsed.mode === "daemon") && parsed.fileArgs.length > 0) {
+		console.error(chalk.red("Error: @file arguments are not supported in RPC or daemon mode"));
 		process.exit(1);
 	}
 
 	validateForkFlags(parsed);
 
+	const cwd = parsed.cwd ? resolve(expandTildePath(parsed.cwd)) : process.cwd();
+	if (parsed.cwd) {
+		try {
+			process.chdir(cwd);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error(chalk.red(`Error: Cannot use cwd ${cwd}: ${message}`));
+			process.exit(1);
+		}
+	}
+
 	// Run migrations (pass cwd for project-local migrations)
-	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(process.cwd());
+	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
 	time("runMigrations");
 
-	const cwd = process.cwd();
 	const agentDir = getAgentDir();
 	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
 	reportDiagnostics(collectSettingsDiagnostics(startupSettingsManager, "startup session lookup"));
@@ -493,10 +548,9 @@ export async function main(args: string[], options?: MainOptions) {
 	// settings, resources, provider registrations, and models must be resolved only after
 	// the target session cwd is known. The startup-cwd settings manager is used only for
 	// sessionDir lookup during session selection.
-	const envSessionDir = process.env[ENV_SESSION_DIR];
 	const sessionDir =
-		parsed.sessionDir ??
-		(envSessionDir ? expandTildePath(envSessionDir) : undefined) ??
+		(parsed.sessionDir ? expandTildePath(parsed.sessionDir) : undefined) ??
+		getSessionDirEnvOverride() ??
 		startupSettingsManager.getSessionDir();
 	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
@@ -514,34 +568,36 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createSessionManager");
 
-	const resolvedExtensionPaths = resolveCliPaths(cwd, parsed.extensions);
-	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
-	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
-	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
-	const authStorage = AuthStorage.create();
+	const defaultSessionConfig = runtimeConfigFromArgs(parsed, sessionManager.getCwd(), agentDir, sessionDir);
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
 		sessionManager,
 		sessionStartEvent,
+		sessionConfig,
 	}) => {
+		const config = mergeAgentSessionRuntimeConfig(defaultSessionConfig, sessionConfig);
+		const effectiveAgentDir = config.agentDir ?? agentDir;
+		const authStorage = AuthStorage.create(join(effectiveAgentDir, "auth.json"), {
+			usePrimeCliConfig: effectiveAgentDir === agentDir,
+		});
 		const services = await createAgentSessionServices({
 			cwd,
-			agentDir,
+			agentDir: effectiveAgentDir,
 			authStorage,
-			extensionFlagValues: parsed.unknownFlags,
+			extensionFlagValues: new Map(Object.entries(config.extensionFlagValues ?? {})),
 			resourceLoaderOptions: {
-				additionalExtensionPaths: resolvedExtensionPaths,
-				additionalSkillPaths: resolvedSkillPaths,
-				additionalPromptTemplatePaths: resolvedPromptTemplatePaths,
-				additionalThemePaths: resolvedThemePaths,
-				noExtensions: parsed.noExtensions,
-				noSkills: parsed.noSkills,
-				noPromptTemplates: parsed.noPromptTemplates,
-				noThemes: parsed.noThemes,
-				noContextFiles: parsed.noContextFiles,
-				systemPrompt: parsed.systemPrompt,
-				appendSystemPrompt: parsed.appendSystemPrompt,
+				additionalExtensionPaths: config.extensions,
+				additionalSkillPaths: config.skills,
+				additionalPromptTemplatePaths: config.promptTemplates,
+				additionalThemePaths: config.themes,
+				noExtensions: config.noExtensions,
+				noSkills: config.noSkills,
+				noPromptTemplates: config.noPromptTemplates,
+				noThemes: config.noThemes,
+				noContextFiles: config.noContextFiles,
+				systemPrompt: config.systemPrompt,
+				appendSystemPrompt: config.appendSystemPrompt,
 				extensionFactories: options?.extensionFactories,
 			},
 		});
@@ -555,7 +611,7 @@ export async function main(args: string[], options?: MainOptions) {
 			})),
 		];
 
-		const modelPatterns = parsed.models ?? settingsManager.getEnabledModels();
+		const modelPatterns = config.models ?? settingsManager.getEnabledModels();
 		const scopedModels =
 			modelPatterns && modelPatterns.length > 0 ? await resolveModelScope(modelPatterns, modelRegistry) : [];
 		const {
@@ -563,7 +619,7 @@ export async function main(args: string[], options?: MainOptions) {
 			cliThinkingFromModel,
 			diagnostics: sessionOptionDiagnostics,
 		} = buildSessionOptions(
-			parsed,
+			config,
 			scopedModels,
 			sessionManager.buildSessionContext().messages.length > 0,
 			modelRegistry,
@@ -571,14 +627,14 @@ export async function main(args: string[], options?: MainOptions) {
 		);
 		diagnostics.push(...sessionOptionDiagnostics);
 
-		if (parsed.apiKey) {
+		if (config.apiKey) {
 			if (!sessionOptions.model) {
 				diagnostics.push({
 					type: "error",
 					message: "--api-key requires a model to be specified via --model, --provider/--model, or --models",
 				});
 			} else {
-				authStorage.setRuntimeApiKey(sessionOptions.model.provider, parsed.apiKey);
+				authStorage.setRuntimeApiKey(sessionOptions.model.provider, config.apiKey);
 			}
 		}
 
@@ -593,7 +649,7 @@ export async function main(args: string[], options?: MainOptions) {
 			noTools: sessionOptions.noTools,
 			customTools: sessionOptions.customTools,
 		});
-		const cliThinkingOverride = parsed.thinking !== undefined || cliThinkingFromModel;
+		const cliThinkingOverride = config.thinking !== undefined || cliThinkingFromModel;
 		if (created.session.model && cliThinkingOverride) {
 			created.session.setThinkingLevel(created.session.thinkingLevel);
 		}
@@ -609,6 +665,7 @@ export async function main(args: string[], options?: MainOptions) {
 		cwd: sessionManager.getCwd(),
 		agentDir,
 		sessionManager,
+		sessionConfig: defaultSessionConfig,
 	});
 	const { services, session, modelFallbackMessage } = runtime;
 	const { settingsManager, modelRegistry, resourceLoader } = services;
@@ -627,9 +684,9 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(0);
 	}
 
-	// Read piped stdin content (if any) - skip for RPC mode which uses stdin for JSON-RPC
+	// Read piped stdin content (if any) - skip for RPC/daemon modes which use other transports
 	let stdinContent: string | undefined;
-	if (appMode !== "rpc") {
+	if (appMode !== "rpc" && appMode !== "daemon") {
 		stdinContent = await readPipedStdin();
 		if (stdinContent !== undefined && appMode === "interactive") {
 			appMode = "print";
@@ -659,7 +716,7 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createAgentSession");
 
-	if (appMode !== "interactive" && !session.model) {
+	if (appMode !== "interactive" && appMode !== "daemon" && !session.model) {
 		console.error(chalk.red(formatNoModelsAvailableMessage()));
 		process.exit(1);
 	}
@@ -673,6 +730,13 @@ export async function main(args: string[], options?: MainOptions) {
 	if (appMode === "rpc") {
 		printTimings();
 		await runRpcMode(runtime);
+	} else if (appMode === "daemon") {
+		printTimings();
+		await runDaemonMode(runtime, {
+			socketPath: parsed.daemonSocket,
+			defaultSessionConfig,
+			createRuntime,
+		});
 	} else if (appMode === "interactive") {
 		if (scopedModels.length > 0 && (parsed.verbose || !settingsManager.getQuietStartup())) {
 			const modelList = scopedModels

@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { SessionManager } from "../../src/core/session-manager.js";
+import { loadEntriesFromFile, SessionManager } from "../../src/core/session-manager.js";
 
 const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -105,5 +105,42 @@ describe("SessionManager.newSession with custom id", () => {
 		expect(header).not.toBeNull();
 		expect(header!.id).toMatch(UUID_V7_RE);
 		expect(header!.parentSession).toBe(sourcePath);
+	});
+
+	it("migrates legacy source entries before writing a forked session", () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pi-session-manager-legacy-fork-"));
+		const sourcePath = join(tempDir, "source.jsonl");
+		writeFileSync(
+			sourcePath,
+			`${[
+				JSON.stringify({
+					type: "session",
+					id: "legacy-session-id",
+					timestamp: new Date().toISOString(),
+					cwd: tempDir,
+				}),
+				JSON.stringify({
+					type: "message",
+					timestamp: new Date().toISOString(),
+					message: {
+						role: "user",
+						content: "hello",
+						timestamp: Date.now(),
+					},
+				}),
+			].join("\n")}\n`,
+		);
+
+		const forked = SessionManager.forkFrom(sourcePath, tempDir, tempDir);
+		const entries = loadEntriesFromFile(forked.getSessionFile()!);
+		const messageEntries = entries.filter((entry) => entry.type === "message");
+
+		expect(messageEntries).toHaveLength(1);
+		expect(messageEntries[0]).toMatchObject({
+			type: "message",
+			parentId: null,
+		});
+		expect(messageEntries[0]!.id).toEqual(expect.any(String));
+		expect(forked.buildSessionContext().messages).toHaveLength(1);
 	});
 });

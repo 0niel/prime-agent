@@ -1,0 +1,90 @@
+import { randomUUID } from "node:crypto";
+import type { Socket } from "node:net";
+import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
+import { formatSessionDisplayId, matchesSessionIdSuffix } from "./daemon-session-id.js";
+
+export interface DaemonSocketClient {
+	id: string;
+	socket: Socket;
+	attachedActiveSessionIds: Set<string>;
+	detachInput: () => void;
+}
+
+export interface ActiveSessionState {
+	activeSessionId: string;
+	runtime: AgentSessionRuntime;
+	clients: Set<DaemonSocketClient>;
+	unsubscribe?: () => void;
+}
+
+interface ActiveSessionIdIndex {
+	has(activeSessionId: string): boolean;
+}
+
+export function createActiveSessionId(existingIds?: ActiveSessionIdIndex): string {
+	while (true) {
+		const activeSessionId = formatSessionDisplayId(randomUUID());
+		if (!existingIds?.has(activeSessionId)) {
+			return activeSessionId;
+		}
+	}
+}
+
+export function resolveActiveSessionState(
+	sessions: ReadonlyMap<string, ActiveSessionState>,
+	selector: string,
+): ActiveSessionState {
+	const direct = sessions.get(selector);
+	if (direct) {
+		return direct;
+	}
+
+	const exactMatches = uniqueStates(
+		[...sessions.values()].filter((state) => {
+			const session = state.runtime.session;
+			return session.sessionId === selector || session.sessionName === selector;
+		}),
+	);
+	if (exactMatches.length === 1) {
+		return exactMatches[0]!;
+	}
+	if (exactMatches.length > 1) {
+		throw new Error(formatAmbiguousSessionError(selector, exactMatches));
+	}
+
+	const suffixMatches = uniqueStates(
+		[...sessions.values()].filter((state) => {
+			const session = state.runtime.session;
+			return (
+				matchesSessionIdSuffix(state.activeSessionId, selector) ||
+				matchesSessionIdSuffix(session.sessionId, selector)
+			);
+		}),
+	);
+	if (suffixMatches.length === 1) {
+		return suffixMatches[0]!;
+	}
+	if (suffixMatches.length > 1) {
+		throw new Error(formatAmbiguousSessionError(selector, suffixMatches));
+	}
+
+	throw new Error(`Unknown active session: ${selector}`);
+}
+
+function uniqueStates(states: ActiveSessionState[]): ActiveSessionState[] {
+	const unique = new Map<string, ActiveSessionState>();
+	for (const state of states) {
+		unique.set(state.activeSessionId, state);
+	}
+	return [...unique.values()];
+}
+
+function formatAmbiguousSessionError(selector: string, states: readonly ActiveSessionState[]): string {
+	return `Ambiguous active session "${selector}": matches ${states.map(formatSessionMatch).join(", ")}`;
+}
+
+function formatSessionMatch(state: ActiveSessionState): string {
+	const session = state.runtime.session;
+	const name = session.sessionName ? ` (${session.sessionName})` : "";
+	return `${state.activeSessionId}/${session.sessionId}${name}`;
+}

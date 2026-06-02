@@ -79,6 +79,7 @@ export interface CreateAgentSessionResult {
 
 // Re-exports
 
+export type { AgentSessionRuntimeConfig } from "./agent-session-config.js";
 export * from "./agent-session-runtime.js";
 export type {
 	ExtensionAPI,

@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Agent, type StreamFn } from "@earendil-works/pi-agent-core";
 import {
@@ -265,6 +265,7 @@ describe("AgentSession rlm recursion", () => {
 		expect(result.turns).toBe(1);
 		expect(result.session_dir).not.toBeNull();
 		expect(basename(result.session_dir!)).toMatch(/^sub-/);
+		expect(dirname(result.session_dir!)).toBe(root.sessionManager.getSessionArtifactDir());
 		expect(existsSync(result.session_dir!)).toBe(true);
 		expect(readdirSync(result.session_dir!).some((name) => name.endsWith(".jsonl"))).toBe(true);
 		expect(childUpdates[0]?.status).toBe("running");
