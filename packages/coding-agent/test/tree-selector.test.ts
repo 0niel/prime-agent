@@ -2,11 +2,11 @@ import { setKeybindings } from "@earendil-works/pi-tui";
 import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import type {
-	ModelChangeEntry,
-	SessionEntry,
-	SessionMessageEntry,
-	SessionTreeNode,
-} from "../src/core/session-manager.js";
+	AgentConnectionModelChangeEntry,
+	AgentConnectionSessionEntry,
+	AgentConnectionSessionMessageEntry,
+	AgentConnectionSessionTreeNode,
+} from "../src/modes/agent-connection/index.js";
 import { TreeSelectorComponent } from "../src/modes/interactive/components/tree-selector.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -20,7 +20,7 @@ beforeEach(() => {
 });
 
 // Helper to create a user message entry
-function userMessage(id: string, parentId: string | null, content: string): SessionMessageEntry {
+function userMessage(id: string, parentId: string | null, content: string): AgentConnectionSessionMessageEntry {
 	return {
 		type: "message",
 		id,
@@ -31,7 +31,7 @@ function userMessage(id: string, parentId: string | null, content: string): Sess
 }
 
 // Helper to create an assistant message entry
-function assistantMessage(id: string, parentId: string | null, text: string): SessionMessageEntry {
+function assistantMessage(id: string, parentId: string | null, text: string): AgentConnectionSessionMessageEntry {
 	return {
 		type: "message",
 		id,
@@ -58,7 +58,7 @@ function assistantMessage(id: string, parentId: string | null, text: string): Se
 }
 
 // Helper to create a tool-call-only assistant message (filtered out in default mode)
-function toolCallOnlyAssistant(id: string, parentId: string | null): SessionMessageEntry {
+function toolCallOnlyAssistant(id: string, parentId: string | null): AgentConnectionSessionMessageEntry {
 	return {
 		type: "message",
 		id,
@@ -87,7 +87,7 @@ function toolCallOnlyAssistant(id: string, parentId: string | null): SessionMess
 }
 
 // Helper to create a model_change entry
-function modelChange(id: string, parentId: string | null): ModelChangeEntry {
+function modelChange(id: string, parentId: string | null): AgentConnectionModelChangeEntry {
 	return {
 		type: "model_change",
 		id,
@@ -99,20 +99,20 @@ function modelChange(id: string, parentId: string | null): ModelChangeEntry {
 }
 
 // Helper to build a tree from entries using parentId relationships
-function buildTree(entries: Array<SessionEntry>): SessionTreeNode[] {
+function buildTree(entries: Array<AgentConnectionSessionEntry>): AgentConnectionSessionTreeNode[] {
 	if (entries.length === 0) return [];
 
-	const nodes: SessionTreeNode[] = entries.map((entry) => ({
+	const nodes: AgentConnectionSessionTreeNode[] = entries.map((entry) => ({
 		entry,
 		children: [],
 	}));
 
-	const byId = new Map<string, SessionTreeNode>();
+	const byId = new Map<string, AgentConnectionSessionTreeNode>();
 	for (const node of nodes) {
 		byId.set(node.entry.id, node);
 	}
 
-	const roots: SessionTreeNode[] = [];
+	const roots: AgentConnectionSessionTreeNode[] = [];
 	for (const node of nodes) {
 		if (node.entry.parentId === null) {
 			roots.push(node);
@@ -373,7 +373,7 @@ describe("TreeSelectorComponent", () => {
 		// Foldable nodes: user-1 (root), user-3a (segment start), user-3b (segment start)
 
 		function buildBranchingTree() {
-			const entries: SessionEntry[] = [
+			const entries: AgentConnectionSessionEntry[] = [
 				userMessage("user-1", null, "first message"),
 				assistantMessage("asst-1", "user-1", "response 1"),
 				userMessage("user-2", "asst-1", "second message"),
@@ -523,7 +523,7 @@ describe("TreeSelectorComponent", () => {
 		});
 
 		test("fold and navigate with multiple roots", () => {
-			const entries: SessionEntry[] = [
+			const entries: AgentConnectionSessionEntry[] = [
 				userMessage("user-1", null, "first root"),
 				assistantMessage("asst-1", "user-1", "response 1"),
 				userMessage("user-2", null, "second root"),
@@ -565,7 +565,7 @@ describe("TreeSelectorComponent", () => {
 
 		test("folding root hides descendants even when intermediate nodes are filtered out", () => {
 			// user-1 → toolCallOnly-1 (filtered out) → user-2 → asst-2
-			const entries: SessionEntry[] = [
+			const entries: AgentConnectionSessionEntry[] = [
 				userMessage("user-1", null, "hello"),
 				toolCallOnlyAssistant("tool-asst-1", "user-1"),
 				userMessage("user-2", "tool-asst-1", "follow up"),

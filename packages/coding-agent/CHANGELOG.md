@@ -2,9 +2,15 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Changed `InteractiveMode` construction to require an `AgentConnection` and explicit UI services or local session host.
+
 ### Added
 
+- Added an `AgentConnection` client boundary with in-process and daemon adapters for interactive-mode decoupling.
 - Added daemon mode and CLI controls for starting on demand, creating, listing, attaching, detaching, killing, renaming, and prompting live sessions.
+- Added rich TUI attach for already-active daemon sessions via `--session <selector>` and live `daemon <selector>` shorthand.
 - Added built-in skills shipped with prime-agent, starting with `prime-intellect`: ecosystem knowledge and prime CLI workflows for verifiers environments, evaluations, Hosted Training, sandboxes, inference, and compute. Built-in skills have the lowest precedence (user, project, and package skills with the same name win) and can be disabled with the `enableBuiltinSkills` setting or `--no-skills`.
 
 ### Changed
@@ -22,6 +28,10 @@
 - Fixed the release installer to ask before bootstrapping the IPython kernel runtime during install, avoiding default first-run `uv` prompts inside the TUI.
 - Fixed browser sign-in links to show plain URLs when terminal hyperlinks are unsupported.
 - Fixed the release installer splash to keep its logo geometry stable across terminal resizes.
+
+### Removed
+
+- Removed the interactive `!` / `!!` bash shortcuts; use IPython for shell commands.
 
 ## [0.0.7] - 2026-06-01
 

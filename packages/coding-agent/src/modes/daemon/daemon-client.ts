@@ -1,12 +1,17 @@
 import { createConnection, type Socket } from "node:net";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
-import type { DaemonCommand, DaemonOutbound, DaemonResponse } from "./daemon-protocol.js";
+import type { DaemonCommand, DaemonOutbound, DaemonRequestProgress, DaemonResponse } from "./daemon-protocol.js";
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 
 export type DaemonClientMessageListener = (message: DaemonOutbound) => void;
 export type DaemonClientCloseListener = (error: Error) => void;
+export type DaemonClientProgressListener = (message: DaemonRequestProgress) => void;
+
+export interface DaemonClientRequestOptions {
+	onProgress?: DaemonClientProgressListener;
+}
 
 export class DaemonClient {
 	private socket?: Socket;
@@ -19,6 +24,7 @@ export class DaemonClient {
 			resolve: (response: DaemonResponse) => void;
 			reject: (error: Error) => void;
 			timeout: ReturnType<typeof setTimeout>;
+			onProgress?: DaemonClientProgressListener;
 		}
 	>();
 	private requestId = 0;
@@ -77,7 +83,11 @@ export class DaemonClient {
 		};
 	}
 
-	async request(command: DaemonCommandBody, timeoutMs = 30000): Promise<DaemonResponse> {
+	async request(
+		command: DaemonCommandBody,
+		timeoutMs = 30000,
+		options: DaemonClientRequestOptions = {},
+	): Promise<DaemonResponse> {
 		if (!this.socket || this.socket.destroyed) {
 			throw new Error("Daemon client is not connected");
 		}
@@ -91,7 +101,7 @@ export class DaemonClient {
 				reject(new Error(`Timed out waiting for daemon response to ${command.type}`));
 			}, timeoutMs);
 
-			this.pendingRequests.set(id, { resolve, reject, timeout });
+			this.pendingRequests.set(id, { resolve, reject, timeout, onProgress: options.onProgress });
 			this.socket!.write(serializeJsonLine(fullCommand));
 		});
 	}
@@ -131,6 +141,13 @@ export class DaemonClient {
 				return;
 			}
 		}
+		if (isDaemonRequestProgress(message) && message.id) {
+			const pending = this.pendingRequests.get(message.id);
+			if (pending) {
+				pending.onProgress?.(message);
+				return;
+			}
+		}
 
 		for (const listener of this.listeners) {
 			listener(message as DaemonOutbound);
@@ -164,5 +181,27 @@ function isDaemonResponse(value: unknown): value is DaemonResponse {
 	const candidate = value as { type?: unknown; success?: unknown; command?: unknown };
 	return (
 		candidate.type === "response" && typeof candidate.success === "boolean" && typeof candidate.command === "string"
+	);
+}
+
+function isDaemonRequestProgress(value: unknown): value is DaemonRequestProgress {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as {
+		type?: unknown;
+		command?: unknown;
+		id?: unknown;
+		activeSessionId?: unknown;
+		loaded?: unknown;
+		total?: unknown;
+	};
+	return (
+		candidate.type === "session_list_progress" &&
+		candidate.command === "list_saved_sessions" &&
+		typeof candidate.id === "string" &&
+		typeof candidate.activeSessionId === "string" &&
+		typeof candidate.loaded === "number" &&
+		typeof candidate.total === "number"
 	);
 }

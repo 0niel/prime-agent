@@ -1,5 +1,4 @@
 import type { Component } from "@earendil-works/pi-tui";
-import type { AgentSession } from "../../../core/agent-session.js";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.js";
 
 /**
@@ -11,16 +10,8 @@ import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provi
  * `/usage` can expose telemetry without re-plumbing.
  */
 export class FooterComponent implements Component {
-	constructor(
-		private session: AgentSession,
-		private footerData: ReadonlyFooterDataProvider,
-	) {
-		void this.session;
+	constructor(private footerData: ReadonlyFooterDataProvider) {
 		void this.footerData;
-	}
-
-	setSession(session: AgentSession): void {
-		this.session = session;
 	}
 
 	setAutoCompactEnabled(_enabled: boolean): void {

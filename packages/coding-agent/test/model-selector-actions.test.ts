@@ -45,7 +45,6 @@ describe("ModelSelectorComponent provider actions", () => {
 		const selector = new ModelSelectorComponent(
 			createFakeTui(),
 			harness.getModel("faux-1"),
-			harness.settingsManager,
 			harness.session.modelRegistry,
 			[],
 			(model) => {
@@ -78,6 +77,34 @@ describe("ModelSelectorComponent provider actions", () => {
 		expect(selectedAction).toBe("add_provider");
 	});
 
+	it("uses injected available models when refreshing scoped models", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1", name: "Local One", reasoning: true }],
+		});
+		harnesses.push(harness);
+
+		const localModel = harness.getModel("faux-1")!;
+		const connectionModel = { ...localModel, name: "Connection One" };
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			localModel,
+			harness.session.modelRegistry,
+			[{ model: localModel }],
+			() => {},
+			() => {},
+			undefined,
+			{
+				availableModels: [connectionModel],
+			},
+		);
+
+		await waitForAsyncRender();
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(output).toContain("Connection One");
+		expect(output).not.toContain("Local One");
+	});
+
 	it("keeps the model menu within a short terminal viewport", async () => {
 		const harness = await createHarness({
 			models: Array.from({ length: 12 }, (_, index) => ({
@@ -91,7 +118,6 @@ describe("ModelSelectorComponent provider actions", () => {
 		const selector = new ModelSelectorComponent(
 			createFakeTui(),
 			harness.getModel("faux-1"),
-			harness.settingsManager,
 			harness.session.modelRegistry,
 			[],
 			() => {},
@@ -132,7 +158,6 @@ describe("ModelSelectorComponent provider actions", () => {
 		const selector = new ModelSelectorComponent(
 			createFakeTui(),
 			harness.getModel("faux-1"),
-			harness.settingsManager,
 			harness.session.modelRegistry,
 			scopedModels,
 			() => {},

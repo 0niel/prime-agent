@@ -8,10 +8,7 @@ export {
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
 	type ModelCycleResult,
-	type ParsedSkillBlock,
 	type PromptOptions,
-	parseSkillBlock,
-	type SessionStats,
 } from "./core/agent-session.js";
 // Auth and model registry
 export {
@@ -181,6 +178,7 @@ export {
 	type RlmSubagentRuntime,
 	type SubagentRuntimeHost,
 } from "./core/sdk.js";
+export { SessionImportFileNotFoundError } from "./core/session-import-errors.js";
 export {
 	type BranchSummaryEntry,
 	buildSessionContext,
@@ -207,6 +205,7 @@ export {
 	type SessionStateStatus,
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.js";
+export type { SessionStats } from "./core/session-stats.js";
 export {
 	type CompactionSettings,
 	type ImageSettings,
@@ -214,6 +213,7 @@ export {
 	type RetrySettings,
 	SettingsManager,
 } from "./core/settings-manager.js";
+export { type ParsedSkillBlock, parseSkillBlock } from "./core/skill-blocks.js";
 // Skills
 export {
 	formatSkillsForPrompt,
@@ -263,8 +263,27 @@ export {
 } from "./core/tools/index.js";
 // Main entry point
 export { type MainOptions, main } from "./main.js";
+export {
+	type AgentConnection,
+	type AgentConnectionEvent,
+	type AgentConnectionExtensionUiRequest,
+	type AgentConnectionExtensionUiResponse,
+	type AgentConnectionModel,
+	type AgentConnectionModelCycleResult,
+	type AgentConnectionQueueState,
+	type AgentConnectionResourceSnapshot,
+	type AgentConnectionRlmChildAgentSnapshot,
+	type AgentConnectionSessionEvent,
+	type AgentConnectionSlashCommand,
+	type AgentConnectionState,
+	DaemonAgentConnection,
+	InProcessAgentConnection,
+} from "./modes/agent-connection/index.js";
 // Run modes for programmatic SDK usage
 export {
+	createInteractiveModeLocalSessionHost,
+	createInteractiveModeUiServices,
+	createInteractiveModeUiServicesFromServices,
 	DaemonClient,
 	type DaemonClientMessageListener,
 	type DaemonCommand,
@@ -273,7 +292,9 @@ export {
 	type DaemonResponse,
 	defaultDaemonSocketPath,
 	InteractiveMode,
+	type InteractiveModeLocalSessionHost,
 	type InteractiveModeOptions,
+	type InteractiveModeUiServices,
 	type ModelInfo,
 	type PrintModeOptions,
 	RpcClient,

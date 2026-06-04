@@ -12,7 +12,10 @@ import { emitSessionShutdownEvent } from "./extensions/runner.js";
 import type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
 import type { CreateAgentSessionResult } from "./sdk.js";
 import { assertSessionCwdExists } from "./session-cwd.js";
+import { SessionImportFileNotFoundError } from "./session-import-errors.js";
 import { SessionManager } from "./session-manager.js";
+
+export { SessionImportFileNotFoundError } from "./session-import-errors.js";
 
 /**
  * Result returned by runtime creation.
@@ -53,19 +56,6 @@ export interface AgentSessionRuntimeMetadata {
 	rlmParentNodeId?: string;
 	prompt?: string;
 	sessionDir?: string;
-}
-
-/**
- * Thrown when /import references a JSONL file path that does not exist.
- */
-export class SessionImportFileNotFoundError extends Error {
-	readonly filePath: string;
-
-	constructor(filePath: string) {
-		super(`File not found: ${filePath}`);
-		this.name = "SessionImportFileNotFoundError";
-		this.filePath = filePath;
-	}
 }
 
 function extractUserMessageText(content: string | Array<{ type: string; text?: string }>): string {

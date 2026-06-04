@@ -252,8 +252,7 @@ export function parseModelPattern(
  * The algorithm tries to match the full pattern first, then progressively
  * strips colon-suffixes to find a match.
  */
-export async function resolveModelScope(patterns: string[], modelRegistry: ModelRegistry): Promise<ScopedModel[]> {
-	const availableModels = await modelRegistry.getAvailable();
+export function resolveModelScopeFromModels(patterns: string[], availableModels: Model<Api>[]): ScopedModel[] {
 	const scopedModels: ScopedModel[] = [];
 
 	for (const pattern of patterns) {
@@ -310,6 +309,11 @@ export async function resolveModelScope(patterns: string[], modelRegistry: Model
 	}
 
 	return scopedModels;
+}
+
+export async function resolveModelScope(patterns: string[], modelRegistry: ModelRegistry): Promise<ScopedModel[]> {
+	const availableModels = await modelRegistry.getAvailable();
+	return resolveModelScopeFromModels(patterns, availableModels);
 }
 
 export interface ResolveCliModelResult {

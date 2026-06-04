@@ -1,0 +1,652 @@
+import { getModel } from "@earendil-works/pi-ai";
+import { describe, expect, it } from "vitest";
+import { MissingSessionCwdError } from "../src/core/session-cwd.js";
+import { SessionImportFileNotFoundError } from "../src/core/session-import-errors.js";
+import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
+import type { AgentConnectionEvent, AgentConnectionState } from "../src/modes/agent-connection/types.js";
+import type {
+	DaemonClient,
+	DaemonClientCloseListener,
+	DaemonClientMessageListener,
+	DaemonClientRequestOptions,
+} from "../src/modes/daemon/daemon-client.js";
+import type { DaemonCommand, DaemonOutbound, DaemonResponse } from "../src/modes/daemon/daemon-protocol.js";
+
+class FakeDaemonClient {
+	readonly requests: DaemonCommand[] = [];
+	closeCount = 0;
+	private readonly messageListeners = new Set<DaemonClientMessageListener>();
+	private readonly closeListeners = new Set<DaemonClientCloseListener>();
+
+	async request(
+		command: DaemonCommand,
+		_timeoutMs = 30000,
+		options: DaemonClientRequestOptions = {},
+	): Promise<DaemonResponse> {
+		this.requests.push(command);
+		switch (command.type) {
+			case "attach":
+				if (command.activeSessionId === "missing") {
+					return {
+						type: "response",
+						command: command.type,
+						success: false,
+						error: "Unknown active session: missing",
+					};
+				}
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: {
+						id: "active-1",
+						activeSessionId: "active-1",
+						status: "idle",
+						isStreaming: false,
+					},
+				};
+			case "get_queue":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: { steering: ["steer"], followUp: ["follow"] },
+				};
+			case "get_connection_state":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: createConnectionState(command.activeSessionId, "session-current"),
+				};
+			case "get_resource_snapshot":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: {
+						contextFiles: [{ path: "/tmp/AGENTS.md" }],
+						skills: [
+							{
+								name: "demo-skill",
+								description: "Demo skill",
+								filePath: "/tmp/skills/demo-skill/SKILL.md",
+								sourceInfo: {
+									path: "/tmp/skills/demo-skill/SKILL.md",
+									source: "local",
+									scope: "project",
+									origin: "top-level",
+									baseDir: "/tmp/skills",
+								},
+							},
+						],
+						prompts: [],
+						extensions: [],
+						themes: [],
+						diagnostics: {
+							skills: [],
+							prompts: [],
+							extensions: [],
+							themes: [],
+						},
+					},
+				};
+			case "get_session_context":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: {
+						context: {
+							messages: [{ role: "user", content: "context prompt", timestamp: 3 }],
+							thinkingLevel: "medium",
+							model: { provider: "anthropic", modelId: "claude-sonnet-4-5" },
+						},
+					},
+				};
+			case "get_session_tree":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: {
+						tree: [
+							{
+								entry: {
+									type: "message",
+									id: "user-1",
+									parentId: null,
+									timestamp: "2026-01-01T00:00:00.000Z",
+									message: { role: "user", content: "hello", timestamp: 1 },
+								},
+								children: [],
+							},
+						],
+						leafId: "user-1",
+					},
+				};
+			case "get_tool_definition":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: {
+						toolDefinition: {
+							name: command.name,
+							label: command.name,
+							description: `${command.name} description`,
+							promptSnippet: `${command.name} prompt`,
+							promptGuidelines: [`Use ${command.name}`],
+							parameters: { type: "object" },
+							renderShell: "self",
+						},
+					},
+				};
+			case "clear_queue":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: { steering: ["cleared"], followUp: [] },
+				};
+			case "list_saved_sessions":
+				options.onProgress?.({
+					id: "daemon_test",
+					type: "session_list_progress",
+					command: "list_saved_sessions",
+					activeSessionId: command.activeSessionId,
+					loaded: 1,
+					total: 2,
+				});
+				options.onProgress?.({
+					id: "daemon_test",
+					type: "session_list_progress",
+					command: "list_saved_sessions",
+					activeSessionId: command.activeSessionId,
+					loaded: 2,
+					total: 2,
+				});
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: {
+						sessions: [
+							{
+								path: "/tmp/session-a.jsonl",
+								id: "session-a",
+								cwd: "/tmp",
+								name: "Saved session",
+								created: "2026-01-01T00:00:00.000Z",
+								modified: "2026-01-02T00:00:00.000Z",
+								messageCount: 2,
+								firstMessage: "hello",
+								allMessagesText: "hello world",
+							},
+						],
+					},
+				};
+			case "wait_for_idle":
+			case "set_scoped_models":
+			case "rename_saved_session":
+			case "extension_ui_response":
+			case "detach":
+				return { type: "response", command: command.type, success: true };
+			case "delete_saved_session":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: { ok: true, method: "trash" },
+				};
+			case "switch_session":
+				return {
+					type: "response",
+					command: command.type,
+					success: false,
+					error: "Stored session working directory does not exist: /tmp/missing\nSession file: /tmp/session.jsonl\nCurrent working directory: /tmp/current",
+					errorInfo: {
+						code: "missing_session_cwd",
+						issue: {
+							sessionFile: "/tmp/session.jsonl",
+							sessionCwd: "/tmp/missing",
+							fallbackCwd: "/tmp/current",
+						},
+					},
+				};
+			case "import_jsonl":
+				return {
+					type: "response",
+					command: command.type,
+					success: false,
+					error: "File not found: /tmp/not-found.jsonl",
+					errorInfo: {
+						code: "session_import_file_not_found",
+						filePath: "/tmp/not-found.jsonl",
+					},
+				};
+			default:
+				throw new Error(`Unexpected command: ${command.type}`);
+		}
+	}
+
+	onMessage(listener: DaemonClientMessageListener): () => void {
+		this.messageListeners.add(listener);
+		return () => {
+			this.messageListeners.delete(listener);
+		};
+	}
+
+	onClose(listener: DaemonClientCloseListener): () => void {
+		this.closeListeners.add(listener);
+		return () => {
+			this.closeListeners.delete(listener);
+		};
+	}
+
+	emitMessage(message: DaemonOutbound): void {
+		for (const listener of [...this.messageListeners]) {
+			listener(message);
+		}
+	}
+
+	getMessageListenerCount(): number {
+		return this.messageListeners.size;
+	}
+
+	getCloseListenerCount(): number {
+		return this.closeListeners.size;
+	}
+
+	close(): void {
+		this.closeCount++;
+	}
+}
+
+function asDaemonClient(client: FakeDaemonClient): DaemonClient {
+	return client as unknown as DaemonClient;
+}
+
+function createConnectionState(activeSessionId: string, sessionId: string): AgentConnectionState {
+	return {
+		activeSessionId,
+		cwd: "/tmp/project",
+		model: undefined,
+		thinkingLevel: "medium",
+		availableThinkingLevels: ["minimal", "low", "medium", "high", "xhigh"],
+		isStreaming: false,
+		isCompacting: false,
+		retryAttempt: 0,
+		steeringMode: "all",
+		followUpMode: "one-at-a-time",
+		sessionFile: `/tmp/${sessionId}.jsonl`,
+		sessionId,
+		sessionName: `${sessionId} name`,
+		sessionDir: "/tmp/sessions",
+		leafId: `${sessionId}-leaf`,
+		autoCompactionEnabled: true,
+		messageCount: 1,
+		pendingMessageCount: 0,
+		compactionCount: 0,
+		goal: {
+			active: false,
+			status: "idle",
+			tokensUsed: 0,
+			timeUsedSeconds: 0,
+			continuationsUsed: 0,
+		},
+		scopedModels: [],
+		activeToolNames: ["ipython"],
+		contextUsage: undefined,
+	};
+}
+
+describe("DaemonAgentConnection", () => {
+	it("loads connection state and forwards replacement snapshots through the daemon protocol", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+
+		await expect(connection.getState()).resolves.toMatchObject({
+			activeSessionId: "active-1",
+			cwd: "/tmp/project",
+			sessionId: "session-current",
+			sessionName: "session-current name",
+			activeToolNames: ["ipython"],
+		});
+
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "active-1",
+			state: createConnectionState("active-1", "session-next"),
+			messages: [{ role: "user", content: "replacement prompt", timestamp: 1 }],
+		});
+		fakeClient.emitMessage({
+			type: "session_replaced",
+			activeSessionId: "other",
+			state: createConnectionState("other", "ignored"),
+			messages: [{ role: "user", content: "ignored", timestamp: 2 }],
+		});
+
+		expect(fakeClient.requests[1]).toMatchObject({
+			type: "get_connection_state",
+			activeSessionId: "active-1",
+		});
+		expect(events).toEqual([
+			{
+				type: "session_replaced",
+				state: expect.objectContaining({
+					activeSessionId: "active-1",
+					sessionId: "session-next",
+					sessionName: "session-next name",
+					activeToolNames: ["ipython"],
+				}),
+				messages: [{ role: "user", content: "replacement prompt", timestamp: 1 }],
+			},
+		]);
+	});
+
+	it("sends queue commands through the daemon protocol", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.getQueue()).resolves.toEqual({ steering: ["steer"], followUp: ["follow"] });
+		await expect(connection.clearQueue()).resolves.toEqual({ steering: ["cleared"], followUp: [] });
+		await connection.waitForIdle();
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		if (!model) {
+			throw new Error("Test model not found");
+		}
+		await connection.setScopedModels([{ model, thinkingLevel: "high" }]);
+
+		expect(fakeClient.requests.map((request) => request.type)).toEqual([
+			"attach",
+			"get_queue",
+			"clear_queue",
+			"wait_for_idle",
+			"set_scoped_models",
+		]);
+		expect(fakeClient.requests[1]).toMatchObject({ type: "get_queue", activeSessionId: "active-1" });
+		expect(fakeClient.requests[2]).toMatchObject({ type: "clear_queue", activeSessionId: "active-1" });
+		expect(fakeClient.requests[3]).toMatchObject({ type: "wait_for_idle", activeSessionId: "active-1" });
+		expect(fakeClient.requests[4]).toMatchObject({
+			type: "set_scoped_models",
+			activeSessionId: "active-1",
+			scopedModels: [{ model, thinkingLevel: "high" }],
+		});
+	});
+
+	it("loads resource snapshots through the daemon protocol", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.getResourceSnapshot()).resolves.toMatchObject({
+			contextFiles: [{ path: "/tmp/AGENTS.md" }],
+			skills: [{ name: "demo-skill", filePath: "/tmp/skills/demo-skill/SKILL.md" }],
+			diagnostics: { skills: [], prompts: [], extensions: [], themes: [] },
+		});
+
+		expect(fakeClient.requests[1]).toMatchObject({
+			type: "get_resource_snapshot",
+			activeSessionId: "active-1",
+		});
+	});
+
+	it("loads session context through the daemon protocol", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.getSessionContext()).resolves.toEqual({
+			messages: [{ role: "user", content: "context prompt", timestamp: 3 }],
+			thinkingLevel: "medium",
+			model: { provider: "anthropic", modelId: "claude-sonnet-4-5" },
+		});
+
+		expect(fakeClient.requests[1]).toMatchObject({
+			type: "get_session_context",
+			activeSessionId: "active-1",
+		});
+	});
+
+	it("loads session trees through the daemon protocol", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.getSessionTree()).resolves.toEqual({
+			tree: [
+				{
+					entry: {
+						type: "message",
+						id: "user-1",
+						parentId: null,
+						timestamp: "2026-01-01T00:00:00.000Z",
+						message: { role: "user", content: "hello", timestamp: 1 },
+					},
+					children: [],
+				},
+			],
+			leafId: "user-1",
+		});
+
+		expect(fakeClient.requests[1]).toMatchObject({
+			type: "get_session_tree",
+			activeSessionId: "active-1",
+		});
+	});
+
+	it("loads serializable tool metadata through the daemon protocol", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.getToolDefinition("custom_tool")).resolves.toEqual({
+			name: "custom_tool",
+			label: "custom_tool",
+			description: "custom_tool description",
+			promptSnippet: "custom_tool prompt",
+			promptGuidelines: ["Use custom_tool"],
+			parameters: { type: "object" },
+			renderShell: "self",
+		});
+
+		expect(fakeClient.requests[1]).toMatchObject({
+			type: "get_tool_definition",
+			activeSessionId: "active-1",
+			name: "custom_tool",
+		});
+	});
+
+	it("forwards daemon session events through the connection boundary", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+
+		fakeClient.emitMessage({
+			type: "session_event",
+			activeSessionId: "active-1",
+			event: {
+				type: "queue_update",
+				steering: ["interrupt"],
+				followUp: ["later"],
+			},
+		});
+		fakeClient.emitMessage({
+			type: "session_event",
+			activeSessionId: "other",
+			event: {
+				type: "queue_update",
+				steering: ["ignored"],
+				followUp: [],
+			},
+		});
+
+		expect(events).toEqual([
+			{
+				type: "session_event",
+				event: {
+					type: "queue_update",
+					steering: ["interrupt"],
+					followUp: ["later"],
+				},
+			},
+		]);
+	});
+
+	it("forwards extension UI requests and responses", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const events: AgentConnectionEvent[] = [];
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+		await connection.attach();
+		expect(fakeClient.requests[0]).toMatchObject({
+			type: "attach",
+			activeSessionId: "active-1",
+			supportsExtensionUi: true,
+		});
+
+		fakeClient.emitMessage({
+			type: "extension_ui_request",
+			activeSessionId: "active-1",
+			id: "request-1",
+			method: "confirm",
+			payload: { title: "Confirm", message: "Proceed?" },
+		});
+		fakeClient.emitMessage({
+			type: "extension_ui_request",
+			activeSessionId: "other",
+			id: "request-2",
+			method: "confirm",
+			payload: { title: "Ignore", message: "Wrong session" },
+		});
+
+		expect(events).toEqual([
+			{
+				type: "extension_ui_request",
+				request: {
+					id: "request-1",
+					method: "confirm",
+					payload: { title: "Confirm", message: "Proceed?" },
+				},
+			},
+		]);
+
+		await connection.respondToExtensionUiRequest("request-1", { confirmed: true });
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "extension_ui_response",
+			activeSessionId: "active-1",
+			requestId: "request-1",
+			response: { confirmed: true },
+		});
+	});
+
+	it("lists and renames saved sessions through the daemon protocol", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		const progress: Array<[number, number]> = [];
+
+		const sessions = await connection.listSavedSessions("current", (loaded, total) => {
+			progress.push([loaded, total]);
+		});
+		await connection.renameSavedSession("/tmp/session-a.jsonl", "Next name");
+		await expect(connection.deleteSavedSession("/tmp/session-a.jsonl")).resolves.toEqual({
+			ok: true,
+			method: "trash",
+		});
+
+		expect(sessions).toEqual([
+			{
+				path: "/tmp/session-a.jsonl",
+				id: "session-a",
+				cwd: "/tmp",
+				name: "Saved session",
+				created: new Date("2026-01-01T00:00:00.000Z"),
+				modified: new Date("2026-01-02T00:00:00.000Z"),
+				messageCount: 2,
+				firstMessage: "hello",
+				allMessagesText: "hello world",
+			},
+		]);
+		expect(progress).toEqual([
+			[1, 2],
+			[2, 2],
+		]);
+		expect(fakeClient.requests[1]).toMatchObject({
+			type: "list_saved_sessions",
+			activeSessionId: "active-1",
+			scope: "current",
+		});
+		expect(fakeClient.requests[2]).toMatchObject({
+			type: "rename_saved_session",
+			activeSessionId: "active-1",
+			sessionPath: "/tmp/session-a.jsonl",
+			name: "Next name",
+		});
+		expect(fakeClient.requests[3]).toMatchObject({
+			type: "delete_saved_session",
+			activeSessionId: "active-1",
+			sessionPath: "/tmp/session-a.jsonl",
+		});
+	});
+
+	it("rehydrates daemon recoverable errors for interactive recovery flows", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.switchSession("/tmp/session.jsonl")).rejects.toBeInstanceOf(MissingSessionCwdError);
+		await expect(connection.switchSession("/tmp/session.jsonl")).rejects.toMatchObject({
+			issue: {
+				sessionFile: "/tmp/session.jsonl",
+				sessionCwd: "/tmp/missing",
+				fallbackCwd: "/tmp/current",
+			},
+		});
+		await expect(connection.importFromJsonl("/tmp/not-found.jsonl")).rejects.toBeInstanceOf(
+			SessionImportFileNotFoundError,
+		);
+		await expect(connection.importFromJsonl("/tmp/not-found.jsonl")).rejects.toMatchObject({
+			filePath: "/tmp/not-found.jsonl",
+		});
+	});
+
+	it("can close the daemon client when disposed by an owning caller", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			closeClientOnDispose: true,
+		});
+		await connection.attach();
+
+		await connection.dispose();
+
+		expect(fakeClient.requests.at(-1)).toMatchObject({ type: "detach", activeSessionId: "active-1" });
+		expect(fakeClient.closeCount).toBe(1);
+	});
+
+	it("cleans up daemon client subscriptions when static attach fails", async () => {
+		const fakeClient = new FakeDaemonClient();
+
+		await expect(
+			DaemonAgentConnection.attach(asDaemonClient(fakeClient), "missing", { closeClientOnDispose: true }),
+		).rejects.toThrow("Unknown active session: missing");
+
+		expect(fakeClient.getMessageListenerCount()).toBe(0);
+		expect(fakeClient.getCloseListenerCount()).toBe(0);
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["attach", "detach"]);
+		expect(fakeClient.closeCount).toBe(1);
+	});
+});

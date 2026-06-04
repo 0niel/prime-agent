@@ -116,6 +116,7 @@ function makeState(options: StateOptions): ActiveSessionState {
 		clients,
 		runtime: {
 			metadata: options.metadata ?? { kind: "top-level", createdAt: 1 },
+			diagnostics: [],
 			session: {
 				model: undefined,
 				thinkingLevel: "off",

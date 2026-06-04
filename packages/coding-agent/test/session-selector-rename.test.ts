@@ -1,7 +1,7 @@
 import { setKeybindings } from "@earendil-works/pi-tui";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
-import type { SessionInfo } from "../src/core/session-manager.js";
+import type { AgentConnectionSavedSessionInfo } from "../src/modes/agent-connection/index.js";
 import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -11,7 +11,9 @@ async function flushPromises(): Promise<void> {
 	});
 }
 
-function makeSession(overrides: Partial<SessionInfo> & { id: string }): SessionInfo {
+function makeSession(
+	overrides: Partial<AgentConnectionSavedSessionInfo> & { id: string },
+): AgentConnectionSavedSessionInfo {
 	return {
 		path: overrides.path ?? `/tmp/${overrides.id}.jsonl`,
 		id: overrides.id,

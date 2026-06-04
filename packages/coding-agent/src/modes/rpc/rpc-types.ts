@@ -7,10 +7,11 @@
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Model } from "@earendil-works/pi-ai";
-import type { GoalState, SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
-import type { SourceInfo } from "../../core/source-info.js";
+import type { GoalState } from "../../core/goals.js";
+import type { SessionStats } from "../../core/session-stats.js";
+import type { AgentConnectionSourceInfo } from "../agent-connection/types.js";
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -81,7 +82,7 @@ export interface RpcSlashCommand {
 	/** What kind of command this is */
 	source: "extension" | "prompt" | "skill";
 	/** Source metadata for the owning resource */
-	sourceInfo: SourceInfo;
+	sourceInfo: AgentConnectionSourceInfo;
 }
 
 // ============================================================================

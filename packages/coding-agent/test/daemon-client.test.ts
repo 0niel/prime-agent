@@ -197,6 +197,67 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("routes request progress by response id without notifying general listeners", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+
+		const connect = client.connect();
+		expect(netMock.sockets).toHaveLength(1);
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+
+		const progress: Array<[number, number]> = [];
+		const listenerMessages: unknown[] = [];
+		const unsubscribe = client.onMessage((message) => {
+			listenerMessages.push(message);
+		});
+		const response = client.request(
+			{ type: "list_saved_sessions", activeSessionId: "active-1", scope: "current" },
+			30000,
+			{
+				onProgress: (message) => {
+					progress.push([message.loaded, message.total]);
+				},
+			},
+		);
+		expect(socket.writes).toHaveLength(1);
+		const command = JSON.parse(socket.writes[0]!.trim()) as {
+			id?: string;
+			type?: string;
+			activeSessionId?: string;
+			scope?: string;
+		};
+
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: command.id,
+				type: "session_list_progress",
+				command: "list_saved_sessions",
+				activeSessionId: "active-1",
+				loaded: 1,
+				total: 2,
+			})}\n`,
+		);
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: command.id,
+				type: "response",
+				command: "list_saved_sessions",
+				success: true,
+				data: { sessions: [] },
+			})}\n`,
+		);
+
+		await expect(response).resolves.toMatchObject({ id: command.id, success: true });
+		expect(progress).toEqual([[1, 2]]);
+		expect(listenerMessages).toEqual([]);
+
+		unsubscribe();
+		client.close();
+	});
+
 	it("serializes per-session config for create commands", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 

@@ -1,0 +1,226 @@
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { describe, expect, it } from "vitest";
+import type { AgentSessionEvent, AgentSessionEventListener } from "../src/core/agent-session.js";
+import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
+import { emptyGoalState } from "../src/core/goals.js";
+import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
+import type { AgentConnectionEvent, AgentConnectionState } from "../src/modes/agent-connection/types.js";
+
+type RuntimeSession = AgentSessionRuntime["session"];
+type RuntimeRebindCallback = Parameters<AgentSessionRuntime["setRebindSession"]>[0];
+type RuntimeBeforeInvalidateCallback = Parameters<AgentSessionRuntime["setBeforeSessionInvalidate"]>[0];
+
+interface FakeSessionControl {
+	session: RuntimeSession;
+	listenerCount(): number;
+	unsubscribeCount(): number;
+	emit(event: AgentSessionEvent): void;
+}
+
+class FakeRuntime {
+	private _session: RuntimeSession;
+	rebindSession: RuntimeRebindCallback;
+	beforeSessionInvalidate: RuntimeBeforeInvalidateCallback;
+	disposed = false;
+
+	constructor(session: RuntimeSession) {
+		this._session = session;
+	}
+
+	get session(): RuntimeSession {
+		return this._session;
+	}
+
+	setRebindSession(callback?: RuntimeRebindCallback): void {
+		this.rebindSession = callback;
+	}
+
+	setBeforeSessionInvalidate(callback?: RuntimeBeforeInvalidateCallback): void {
+		this.beforeSessionInvalidate = callback;
+	}
+
+	invalidateCurrentSession(): void {
+		this.beforeSessionInvalidate?.();
+	}
+
+	async replaceSession(session: RuntimeSession): Promise<void> {
+		this._session = session;
+		await this.rebindSession?.(session);
+	}
+
+	async dispose(): Promise<void> {
+		this.disposed = true;
+	}
+}
+
+function asRuntime(runtime: FakeRuntime): AgentSessionRuntime {
+	return runtime as unknown as AgentSessionRuntime;
+}
+
+function userMessage(text: string, timestamp: number): AgentMessage {
+	return {
+		role: "user",
+		content: text,
+		timestamp,
+	};
+}
+
+function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionControl {
+	const listeners = new Set<AgentSessionEventListener>();
+	let unsubscriptions = 0;
+	const thinkingLevel: AgentConnectionState["thinkingLevel"] = "medium";
+	const session = {
+		sessionManager: {
+			getCwd: () => `/tmp/${id}`,
+			getSessionDir: () => "/tmp/prime-agent-sessions",
+			getLeafId: () => `${id}-leaf`,
+			getEntries: () => [],
+			buildSessionContext: () => ({
+				messages,
+				thinkingLevel,
+				model: null,
+			}),
+		},
+		model: undefined,
+		thinkingLevel,
+		getAvailableThinkingLevels: () => ["minimal", "low", "medium", "high", "xhigh"],
+		isStreaming: false,
+		isCompacting: false,
+		retryAttempt: 0,
+		steeringMode: "all",
+		followUpMode: "one-at-a-time",
+		sessionFile: `/tmp/${id}.jsonl`,
+		sessionId: id,
+		sessionName: `${id} name`,
+		autoCompactionEnabled: true,
+		messages,
+		pendingMessageCount: 0,
+		goalState: emptyGoalState(),
+		scopedModels: [],
+		getActiveToolNames: () => ["ipython"],
+		getContextUsage: () => undefined,
+		getToolDefinition: (toolName: string) => ({
+			name: toolName,
+			label: toolName,
+			description: `${toolName} description`,
+			promptSnippet: `${toolName} prompt`,
+			promptGuidelines: [`Use ${toolName}`],
+			parameters: { type: "object" },
+			renderShell: "self",
+			execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+			renderCall: () => undefined,
+			renderResult: () => undefined,
+		}),
+		subscribe(listener: AgentSessionEventListener) {
+			listeners.add(listener);
+			return () => {
+				unsubscriptions++;
+				listeners.delete(listener);
+			};
+		},
+	} as unknown as RuntimeSession;
+
+	return {
+		session,
+		listenerCount: () => listeners.size,
+		unsubscribeCount: () => unsubscriptions,
+		emit(event: AgentSessionEvent) {
+			for (const listener of [...listeners]) {
+				listener(event);
+			}
+		},
+	};
+}
+
+describe("InProcessAgentConnection", () => {
+	it("exposes serializable tool metadata without local execution or renderer callbacks", async () => {
+		const session = createFakeSession("tools", []);
+		const runtime = new FakeRuntime(session.session);
+		const connection = new InProcessAgentConnection(asRuntime(runtime));
+
+		const definition = await connection.getToolDefinition("custom_tool");
+
+		expect(definition).toEqual({
+			name: "custom_tool",
+			label: "custom_tool",
+			description: "custom_tool description",
+			promptSnippet: "custom_tool prompt",
+			promptGuidelines: ["Use custom_tool"],
+			parameters: { type: "object" },
+			renderShell: "self",
+		});
+		expect(definition).not.toHaveProperty("execute");
+		expect(definition).not.toHaveProperty("renderCall");
+		expect(definition).not.toHaveProperty("renderResult");
+	});
+
+	it("loads session context through the connection boundary", async () => {
+		const session = createFakeSession("ctx", [userMessage("context", 1)]);
+		const runtime = new FakeRuntime(session.session);
+		const connection = new InProcessAgentConnection(asRuntime(runtime));
+
+		await expect(connection.getSessionContext()).resolves.toEqual({
+			messages: [userMessage("context", 1)],
+			thinkingLevel: "medium",
+			model: null,
+		});
+	});
+
+	it("emits replacement snapshots and rebinds events when the runtime replaces its session", async () => {
+		const oldSession = createFakeSession("old", [userMessage("old", 1)]);
+		const newSession = createFakeSession("new", [userMessage("new", 2)]);
+		const runtime = new FakeRuntime(oldSession.session);
+		const connection = new InProcessAgentConnection(asRuntime(runtime));
+		const invalidations: string[] = [];
+		const events: AgentConnectionEvent[] = [];
+
+		connection.onBeforeSessionInvalidate(() => {
+			invalidations.push("invalidated");
+		});
+		connection.subscribe((event) => {
+			events.push(event);
+		});
+
+		expect(oldSession.listenerCount()).toBe(1);
+		runtime.invalidateCurrentSession();
+
+		await runtime.replaceSession(newSession.session);
+
+		expect(invalidations).toEqual(["invalidated"]);
+		expect(oldSession.listenerCount()).toBe(0);
+		expect(oldSession.unsubscribeCount()).toBe(1);
+		expect(newSession.listenerCount()).toBe(1);
+		expect(events).toEqual([
+			{
+				type: "session_replaced",
+				state: expect.objectContaining({
+					cwd: "/tmp/new",
+					sessionId: "new",
+					sessionName: "new name",
+					messageCount: 1,
+					leafId: "new-leaf",
+					activeToolNames: ["ipython"],
+				}),
+				messages: [userMessage("new", 2)],
+			},
+		]);
+
+		events.length = 0;
+		oldSession.emit({ type: "queue_update", steering: ["old"], followUp: [] });
+		newSession.emit({ type: "queue_update", steering: ["new"], followUp: ["later"] });
+
+		expect(events).toEqual([
+			{
+				type: "session_event",
+				event: { type: "queue_update", steering: ["new"], followUp: ["later"] },
+			},
+		]);
+
+		await connection.dispose();
+
+		expect(newSession.listenerCount()).toBe(0);
+		expect(runtime.rebindSession).toBeUndefined();
+		expect(runtime.beforeSessionInvalidate).toBeUndefined();
+		expect(runtime.disposed).toBe(true);
+	});
+});

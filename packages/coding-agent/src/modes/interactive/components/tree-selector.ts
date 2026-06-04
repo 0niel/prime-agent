@@ -9,7 +9,7 @@ import {
 	TruncatedText,
 	truncateToWidth,
 } from "@earendil-works/pi-tui";
-import type { SessionTreeNode } from "../../../core/session-manager.js";
+import type { AgentConnectionSessionTreeNode } from "../../agent-connection/index.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyHint, keyText } from "./keybinding-hints.js";
@@ -22,7 +22,7 @@ interface GutterInfo {
 
 /** Flattened tree node for navigation */
 interface FlatNode {
-	node: SessionTreeNode;
+	node: AgentConnectionSessionTreeNode;
 	/** Indentation level (each level = 3 chars) */
 	indent: number;
 	/** Whether to show connector (├─ or └─) - true if parent has multiple children */
@@ -69,7 +69,7 @@ class TreeList implements Component {
 	public onLabelEdit?: (entryId: string, currentLabel: string | undefined) => void;
 
 	constructor(
-		tree: SessionTreeNode[],
+		tree: AgentConnectionSessionTreeNode[],
 		currentLeafId: string | null,
 		maxVisibleLines: number,
 		initialSelectedId?: string,
@@ -140,7 +140,7 @@ class TreeList implements Component {
 		}
 	}
 
-	private flattenTree(roots: SessionTreeNode[]): FlatNode[] {
+	private flattenTree(roots: AgentConnectionSessionTreeNode[]): FlatNode[] {
 		const result: FlatNode[] = [];
 		this.toolCallMap.clear();
 
@@ -150,17 +150,17 @@ class TreeList implements Component {
 		// - At indent 2+: stay flat for single-child chains, +1 only if parent branches
 
 		// Stack items: [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild]
-		type StackItem = [SessionTreeNode, number, boolean, boolean, boolean, GutterInfo[], boolean];
+		type StackItem = [AgentConnectionSessionTreeNode, number, boolean, boolean, boolean, GutterInfo[], boolean];
 		const stack: StackItem[] = [];
 
 		// Determine which subtrees contain the active leaf (to sort current branch first)
 		// Use iterative post-order traversal to avoid stack overflow
-		const containsActive = new Map<SessionTreeNode, boolean>();
+		const containsActive = new Map<AgentConnectionSessionTreeNode, boolean>();
 		const leafId = this.currentLeafId;
 		{
 			// Build list in pre-order, then process in reverse for post-order effect
-			const allNodes: SessionTreeNode[] = [];
-			const preOrderStack: SessionTreeNode[] = [...roots];
+			const allNodes: AgentConnectionSessionTreeNode[] = [];
+			const preOrderStack: AgentConnectionSessionTreeNode[] = [...roots];
 			while (preOrderStack.length > 0) {
 				const node = preOrderStack.pop()!;
 				allNodes.push(node);
@@ -215,8 +215,8 @@ class TreeList implements Component {
 
 			// Order children so the branch containing the active leaf comes first
 			const orderedChildren = (() => {
-				const prioritized: SessionTreeNode[] = [];
-				const rest: SessionTreeNode[] = [];
+				const prioritized: AgentConnectionSessionTreeNode[] = [];
+				const rest: AgentConnectionSessionTreeNode[] = [];
 				for (const child of children) {
 					if (containsActive.get(child)) {
 						prioritized.push(child);
@@ -501,7 +501,7 @@ class TreeList implements Component {
 	}
 
 	/** Get searchable text content from a node */
-	private getSearchableText(node: SessionTreeNode): string {
+	private getSearchableText(node: AgentConnectionSessionTreeNode): string {
 		const entry = node.entry;
 		const parts: string[] = [];
 
@@ -567,7 +567,7 @@ class TreeList implements Component {
 		return this.searchQuery;
 	}
 
-	getSelectedNode(): SessionTreeNode | undefined {
+	getSelectedNode(): AgentConnectionSessionTreeNode | undefined {
 		return this.filteredNodes[this.selectedIndex]?.node;
 	}
 
@@ -702,7 +702,7 @@ class TreeList implements Component {
 		return lines;
 	}
 
-	private getEntryDisplayText(node: SessionTreeNode, isSelected: boolean): string {
+	private getEntryDisplayText(node: AgentConnectionSessionTreeNode, isSelected: boolean): string {
 		const entry = node.entry;
 		let result: string;
 
@@ -1138,7 +1138,7 @@ export class TreeSelectorComponent extends Container implements Focusable {
 	}
 
 	constructor(
-		tree: SessionTreeNode[],
+		tree: AgentConnectionSessionTreeNode[],
 		currentLeafId: string | null,
 		terminalHeight: number,
 		onSelect: (entryId: string) => void,

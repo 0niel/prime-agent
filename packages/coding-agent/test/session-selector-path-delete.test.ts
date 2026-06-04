@@ -2,9 +2,9 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setKeybindings } from "@earendil-works/pi-tui";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
-import type { SessionInfo } from "../src/core/session-manager.js";
+import type { AgentConnectionSavedSessionInfo } from "../src/modes/agent-connection/index.js";
 import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -34,7 +34,9 @@ function stripAnsi(text: string): string {
 	return text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
-function makeSession(overrides: Partial<SessionInfo> & { id: string }): SessionInfo {
+function makeSession(
+	overrides: Partial<AgentConnectionSavedSessionInfo> & { id: string },
+): AgentConnectionSavedSessionInfo {
 	return {
 		path: overrides.path ?? `/tmp/${overrides.id}.jsonl`,
 		id: overrides.id,
@@ -184,9 +186,33 @@ describe("session selector path/delete interactions", () => {
 		expect(deletedPath).toBe(sessions[0]!.path);
 	});
 
+	it("delegates confirmed deletion to the injected delete handler", async () => {
+		const sessions = [makeSession({ id: "a" })];
+		const deleteSession = vi.fn(async () => ({ ok: true as const, method: "unlink" as const }));
+
+		const selector = new SessionSelectorComponent(
+			async () => sessions,
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings, deleteSession },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		list.handleInput(CTRL_D);
+		list.handleInput("\r");
+		await flushPromises();
+
+		expect(deleteSession).toHaveBeenCalledTimes(1);
+		expect(deleteSession).toHaveBeenCalledWith(sessions[0]!.path);
+	});
+
 	it("does not switch scope back to All when All load resolves after toggling back to Current", async () => {
 		const currentSessions = [makeSession({ id: "current" })];
-		const allDeferred = createDeferred<SessionInfo[]>();
+		const allDeferred = createDeferred<AgentConnectionSavedSessionInfo[]>();
 		let allLoadCalls = 0;
 
 		const selector = new SessionSelectorComponent(
@@ -218,7 +244,7 @@ describe("session selector path/delete interactions", () => {
 
 	it("does not start redundant All loads when toggling scopes while All is already loading", async () => {
 		const currentSessions = [makeSession({ id: "current" })];
-		const allDeferred = createDeferred<SessionInfo[]>();
+		const allDeferred = createDeferred<AgentConnectionSavedSessionInfo[]>();
 		let allLoadCalls = 0;
 
 		const selector = new SessionSelectorComponent(

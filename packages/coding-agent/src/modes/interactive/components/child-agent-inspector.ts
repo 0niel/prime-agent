@@ -11,12 +11,11 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import type { ToolDefinition } from "../../../core/extensions/types.js";
 import { theme } from "../theme/theme.js";
 import { AssistantMessageComponent } from "./assistant-message.js";
 import { CollapsibleErrorComponent, shouldCollapseErrorDetails } from "./collapsible-error.js";
 import { keyText } from "./keybinding-hints.js";
-import { ToolExecutionComponent, type ToolExecutionOptions } from "./tool-execution.js";
+import { ToolExecutionComponent, type ToolExecutionDefinition, type ToolExecutionOptions } from "./tool-execution.js";
 import { UserMessageComponent } from "./user-message.js";
 
 export type ChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
@@ -78,7 +77,7 @@ export interface ChildAgentInspectorNode {
 export interface ChildAgentDetailOptions {
 	ui?: TUI;
 	getCwd?: () => string;
-	getToolDefinition?: (toolName: string) => ToolDefinition | undefined;
+	getToolDefinition?: (toolName: string) => ToolExecutionDefinition | undefined;
 	getToolOptions?: () => ToolExecutionOptions;
 	getMarkdownTheme?: () => MarkdownTheme;
 	getToolsExpanded?: () => boolean;

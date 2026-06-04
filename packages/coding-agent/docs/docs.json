@@ -133,6 +133,10 @@
           "path": "development.md"
         },
         {
+          "title": "AgentConnection Architecture",
+          "path": "agent-connection-readme.md"
+        },
+        {
           "title": "Kernel and RLM Recursion",
           "path": "kernel-and-rlm-recursion.md"
         }

@@ -1,0 +1,178 @@
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
+import { afterEach, describe, expect, it } from "vitest";
+import type { AgentSession } from "../src/core/agent-session.js";
+import {
+	type CreateAgentSessionRuntimeFactory,
+	createAgentSessionFromServices,
+	createAgentSessionRuntime,
+	createAgentSessionServices,
+} from "../src/core/agent-session-runtime.js";
+import { AuthStorage } from "../src/core/auth-storage.js";
+import { SessionManager } from "../src/core/session-manager.js";
+import type { ExtensionAPI, ExtensionFactory } from "../src/index.js";
+import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
+import { bindActiveSessionState } from "../src/modes/daemon/daemon-extension-binding.js";
+import type { DaemonOutbound } from "../src/modes/daemon/daemon-protocol.js";
+
+function getText(message: AgentSession["messages"][number]): string {
+	if (!("content" in message)) {
+		return "";
+	}
+	return typeof message.content === "string"
+		? message.content
+		: message.content
+				.filter((part): part is { type: "text"; text: string } => part.type === "text")
+				.map((part) => part.text)
+				.join("");
+}
+
+describe("daemon extension binding", () => {
+	const cleanups: Array<() => Promise<void> | void> = [];
+
+	afterEach(async () => {
+		while (cleanups.length > 0) {
+			await cleanups.pop()?.();
+		}
+	});
+
+	async function createRuntimeForTest(extensionFactory: ExtensionFactory, responses: string[]) {
+		const tempDir = join(tmpdir(), `pi-daemon-extension-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+
+		const faux = registerFauxProvider({
+			models: [{ id: "faux-daemon", reasoning: false }],
+		});
+		faux.setResponses(responses.map((response) => fauxAssistantMessage(response)));
+
+		const authStorage = AuthStorage.inMemory();
+		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
+
+		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
+			const services = await createAgentSessionServices({
+				cwd,
+				agentDir: tempDir,
+				authStorage,
+				resourceLoaderOptions: {
+					extensionFactories: [
+						(pi: ExtensionAPI) => {
+							pi.registerProvider(faux.getModel().provider, {
+								baseUrl: faux.getModel().baseUrl,
+								apiKey: "faux-key",
+								api: faux.api,
+								models: faux.models.map((registeredModel) => ({
+									id: registeredModel.id,
+									name: registeredModel.name,
+									api: registeredModel.api,
+									reasoning: registeredModel.reasoning,
+									input: registeredModel.input,
+									cost: registeredModel.cost,
+									contextWindow: registeredModel.contextWindow,
+									maxTokens: registeredModel.maxTokens,
+								})),
+							});
+							extensionFactory(pi);
+						},
+					],
+					noSkills: true,
+					noPromptTemplates: true,
+					noThemes: true,
+				},
+			});
+			return {
+				...(await createAgentSessionFromServices({
+					services,
+					sessionManager,
+					sessionStartEvent,
+					model: faux.getModel(),
+				})),
+				services,
+				diagnostics: services.diagnostics,
+			};
+		};
+
+		const runtime = await createAgentSessionRuntime(createRuntime, {
+			cwd: tempDir,
+			agentDir: tempDir,
+			sessionManager: SessionManager.create(tempDir),
+		});
+
+		cleanups.push(async () => {
+			await runtime.dispose();
+			faux.unregister();
+			if (existsSync(tempDir)) {
+				rmSync(tempDir, { recursive: true, force: true });
+			}
+		});
+
+		return runtime;
+	}
+
+	it("keeps extension replacement callbacks daemon-side and rebinds before withSession", async () => {
+		const phases: string[] = [];
+		let oldSessionFile: string | undefined;
+		let replacementSessionFile: string | undefined;
+
+		const runtime = await createRuntimeForTest(
+			(pi) => {
+				pi.registerCommand("daemon-replace", {
+					description: "daemon replace",
+					handler: async (_args, ctx) => {
+						phases.push("command");
+						oldSessionFile = ctx.sessionManager.getSessionFile();
+						await ctx.newSession({
+							parentSession: oldSessionFile,
+							withSession: async (replacedCtx) => {
+								phases.push("withSession");
+								replacementSessionFile = replacedCtx.sessionManager.getSessionFile();
+								await replacedCtx.sendUserMessage("daemon replacement message");
+							},
+						});
+					},
+				});
+			},
+			["replacement reply"],
+		);
+
+		const outbound: DaemonOutbound[] = [];
+		const state: ActiveSessionState = {
+			activeSessionId: "active-test",
+			runtime,
+			clients: new Set(),
+			extensionUiRequests: new Map(),
+		};
+		await bindActiveSessionState(state, {
+			broadcast: (_state, message) => {
+				outbound.push(message);
+				if (message.type === "session_replaced") {
+					phases.push("broadcast:session_replaced");
+				}
+			},
+			shutdown: () => {
+				phases.push("shutdown");
+			},
+		});
+
+		await runtime.session.prompt("/daemon-replace");
+
+		const replacementIndex = phases.indexOf("broadcast:session_replaced");
+		const withSessionIndex = phases.indexOf("withSession");
+		expect(replacementIndex).toBeGreaterThan(-1);
+		expect(withSessionIndex).toBeGreaterThan(-1);
+		expect(replacementIndex).toBeLessThan(withSessionIndex);
+		expect(replacementSessionFile).toBeDefined();
+		expect(replacementSessionFile).not.toBe(oldSessionFile);
+		expect(outbound).toContainEqual(
+			expect.objectContaining({
+				type: "session_replaced",
+				activeSessionId: "active-test",
+			}),
+		);
+		expect(runtime.session.messages.map((message) => `${message.role}:${getText(message)}`)).toEqual([
+			"user:daemon replacement message",
+			"assistant:replacement reply",
+		]);
+	});
+});

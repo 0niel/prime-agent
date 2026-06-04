@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { SessionInfo } from "../src/core/session-manager.js";
+import type { AgentConnectionSavedSessionInfo } from "../src/modes/agent-connection/index.js";
 import { filterAndSortSessions } from "../src/modes/interactive/components/session-selector-search.js";
 
 function makeSession(
-	overrides: Partial<SessionInfo> & { id: string; modified: Date; allMessagesText: string },
-): SessionInfo {
+	overrides: Partial<AgentConnectionSavedSessionInfo> & { id: string; modified: Date; allMessagesText: string },
+): AgentConnectionSavedSessionInfo {
 	return {
 		path: `/tmp/${overrides.id}.jsonl`,
 		id: overrides.id,
@@ -20,7 +20,7 @@ function makeSession(
 
 describe("session selector search", () => {
 	it("filters by quoted phrase with whitespace normalization", () => {
-		const sessions: SessionInfo[] = [
+		const sessions: AgentConnectionSavedSessionInfo[] = [
 			makeSession({
 				id: "a",
 				modified: new Date("2026-01-01T00:00:00.000Z"),
@@ -38,7 +38,7 @@ describe("session selector search", () => {
 	});
 
 	it("filters by regex (re:) and is case-insensitive", () => {
-		const sessions: SessionInfo[] = [
+		const sessions: AgentConnectionSavedSessionInfo[] = [
 			makeSession({
 				id: "a",
 				modified: new Date("2026-01-02T00:00:00.000Z"),
@@ -56,7 +56,7 @@ describe("session selector search", () => {
 	});
 
 	it("recent sort preserves input order", () => {
-		const sessions: SessionInfo[] = [
+		const sessions: AgentConnectionSavedSessionInfo[] = [
 			makeSession({
 				id: "newer",
 				modified: new Date("2026-01-03T00:00:00.000Z"),
@@ -79,7 +79,7 @@ describe("session selector search", () => {
 	});
 
 	it("relevance sort orders by score and tie-breaks by modified desc", () => {
-		const sessions: SessionInfo[] = [
+		const sessions: AgentConnectionSavedSessionInfo[] = [
 			makeSession({
 				id: "late",
 				modified: new Date("2026-01-03T00:00:00.000Z"),
@@ -95,7 +95,7 @@ describe("session selector search", () => {
 		const result1 = filterAndSortSessions(sessions, '"brave"', "relevance");
 		expect(result1.map((s) => s.id)).toEqual(["early", "late"]);
 
-		const tieSessions: SessionInfo[] = [
+		const tieSessions: AgentConnectionSavedSessionInfo[] = [
 			makeSession({
 				id: "newer",
 				modified: new Date("2026-01-03T00:00:00.000Z"),
@@ -113,7 +113,7 @@ describe("session selector search", () => {
 	});
 
 	it("returns empty list for invalid regex", () => {
-		const sessions: SessionInfo[] = [
+		const sessions: AgentConnectionSavedSessionInfo[] = [
 			makeSession({
 				id: "a",
 				modified: new Date("2026-01-01T00:00:00.000Z"),
@@ -126,7 +126,7 @@ describe("session selector search", () => {
 	});
 
 	describe("name filter", () => {
-		const sessions: SessionInfo[] = [
+		const sessions: AgentConnectionSavedSessionInfo[] = [
 			makeSession({
 				id: "named1",
 				name: "My Project",
@@ -167,7 +167,7 @@ describe("session selector search", () => {
 		});
 
 		it("excludes whitespace-only names from named filter", () => {
-			const sessionsWithWhitespace: SessionInfo[] = [
+			const sessionsWithWhitespace: AgentConnectionSavedSessionInfo[] = [
 				makeSession({
 					id: "whitespace",
 					name: "   ",

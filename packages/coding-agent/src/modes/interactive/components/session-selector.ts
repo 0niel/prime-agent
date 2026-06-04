@@ -1,6 +1,3 @@
-import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { unlink } from "node:fs/promises";
 import * as os from "node:os";
 import {
 	type Component,
@@ -14,8 +11,12 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { KeybindingsManager } from "../../../core/keybindings.js";
-import type { SessionInfo, SessionListProgress } from "../../../core/session-manager.js";
+import { type DeleteSessionFileResult, deleteSessionFile } from "../../../core/session-file-actions.js";
 import { canonicalizePath as _canonicalizePath } from "../../../utils/paths.js";
+import type {
+	AgentConnectionSavedSessionInfo,
+	AgentConnectionSessionListProgress,
+} from "../../agent-connection/index.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
 import { keyHint, keyText } from "./keybinding-hints.js";
@@ -188,13 +189,13 @@ class SessionSelectorHeader implements Component {
 
 /** A session tree node for hierarchical display */
 interface SessionTreeNode {
-	session: SessionInfo;
+	session: AgentConnectionSavedSessionInfo;
 	children: SessionTreeNode[];
 }
 
 /** Flattened node for display with tree structure info */
 interface FlatSessionNode {
-	session: SessionInfo;
+	session: AgentConnectionSavedSessionInfo;
 	depth: number;
 	isLast: boolean;
 	/** For each ancestor level, whether there are more siblings after it */
@@ -205,7 +206,7 @@ interface FlatSessionNode {
  * Build a tree structure from sessions based on parentSessionPath.
  * Returns root nodes sorted by modified date (descending).
  */
-function buildSessionTree(sessions: SessionInfo[]): SessionTreeNode[] {
+function buildSessionTree(sessions: AgentConnectionSavedSessionInfo[]): SessionTreeNode[] {
 	const byPath = new Map<string, SessionTreeNode>();
 
 	for (const session of sessions) {
@@ -271,7 +272,7 @@ class SessionList implements Component, Focusable {
 		const selected = this.filteredSessions[this.selectedIndex];
 		return selected?.session.path;
 	}
-	private allSessions: SessionInfo[] = [];
+	private allSessions: AgentConnectionSavedSessionInfo[] = [];
 	private filteredSessions: FlatSessionNode[] = [];
 	private selectedIndex: number = 0;
 	private searchInput: Input;
@@ -306,7 +307,7 @@ class SessionList implements Component, Focusable {
 	}
 
 	constructor(
-		sessions: SessionInfo[],
+		sessions: AgentConnectionSavedSessionInfo[],
 		showCwd: boolean,
 		sortMode: SortMode,
 		nameFilter: NameFilter,
@@ -344,7 +345,7 @@ class SessionList implements Component, Focusable {
 		this.filterSessions(this.searchInput.getValue());
 	}
 
-	setSessions(sessions: SessionInfo[], showCwd: boolean): void {
+	setSessions(sessions: AgentConnectionSavedSessionInfo[], showCwd: boolean): void {
 		this.allSessions = sessions;
 		this.showCwd = showCwd;
 		this.filterSessions(this.searchInput.getValue());
@@ -623,47 +624,8 @@ class SessionList implements Component, Focusable {
 	}
 }
 
-type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[]>;
-
-/**
- * Delete a session file, trying the `trash` CLI first, then falling back to unlink
- */
-async function deleteSessionFile(
-	sessionPath: string,
-): Promise<{ ok: boolean; method: "trash" | "unlink"; error?: string }> {
-	// Try `trash` first (if installed)
-	const trashArgs = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
-	const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8" });
-
-	const getTrashErrorHint = (): string | null => {
-		const parts: string[] = [];
-		if (trashResult.error) {
-			parts.push(trashResult.error.message);
-		}
-		const stderr = trashResult.stderr?.trim();
-		if (stderr) {
-			parts.push(stderr.split("\n")[0] ?? stderr);
-		}
-		if (parts.length === 0) return null;
-		return `trash: ${parts.join(" · ").slice(0, 200)}`;
-	};
-
-	// If trash reports success, or the file is gone afterwards, treat it as successful
-	if (trashResult.status === 0 || !existsSync(sessionPath)) {
-		return { ok: true, method: "trash" };
-	}
-
-	// Fallback to permanent deletion
-	try {
-		await unlink(sessionPath);
-		return { ok: true, method: "unlink" };
-	} catch (err) {
-		const unlinkError = err instanceof Error ? err.message : String(err);
-		const trashErrorHint = getTrashErrorHint();
-		const error = trashErrorHint ? `${unlinkError} (${trashErrorHint})` : unlinkError;
-		return { ok: false, method: "unlink", error };
-	}
-}
+type SessionsLoader = (onProgress?: AgentConnectionSessionListProgress) => Promise<AgentConnectionSavedSessionInfo[]>;
+type SessionDeleter = (sessionPath: string) => Promise<DeleteSessionFileResult>;
 
 /**
  * Component that renders a session selector
@@ -690,13 +652,14 @@ export class SessionSelectorComponent extends Container implements Focusable {
 	private scope: SessionScope = "current";
 	private sortMode: SortMode = "threaded";
 	private nameFilter: NameFilter = "all";
-	private currentSessions: SessionInfo[] | null = null;
-	private allSessions: SessionInfo[] | null = null;
+	private currentSessions: AgentConnectionSavedSessionInfo[] | null = null;
+	private allSessions: AgentConnectionSavedSessionInfo[] | null = null;
 	private currentSessionsLoader: SessionsLoader;
 	private allSessionsLoader: SessionsLoader;
 	private onCancel: () => void;
 	private requestRender: () => void;
 	private renameSession?: (sessionPath: string, currentName: string | undefined) => Promise<void>;
+	private deleteSession: SessionDeleter;
 	private currentLoading = false;
 	private allLoading = false;
 	private allLoadSeq = 0;
@@ -742,6 +705,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 		requestRender: () => void,
 		options?: {
 			renameSession?: (sessionPath: string, currentName: string | undefined) => Promise<void>;
+			deleteSession?: SessionDeleter;
 			showRenameHint?: boolean;
 			keybindings?: KeybindingsManager;
 		},
@@ -756,6 +720,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 		this.header = new SessionSelectorHeader(this.scope, this.sortMode, this.nameFilter, this.requestRender);
 		const renameSession = options?.renameSession;
 		this.renameSession = renameSession;
+		this.deleteSession = options?.deleteSession ?? deleteSessionFile;
 		this.canRename = !!renameSession;
 		this.header.setShowRenameHint(options?.showRenameHint ?? this.canRename);
 
@@ -818,7 +783,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 		// Handle session deletion
 		this.sessionList.onDeleteSession = async (sessionPath: string) => {
-			const result = await deleteSessionFile(sessionPath);
+			const result = await this.deleteSession(sessionPath);
 
 			if (result.ok) {
 				if (this.currentSessions) {

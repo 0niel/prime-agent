@@ -5,9 +5,10 @@
  * createAgentSession() options. The SDK does the heavy lifting.
  */
 
+import { spawn } from "node:child_process";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
+import { type Api, type ImageContent, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
 import { ProcessTerminal, setKeybindings, TUI } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.js";
@@ -21,6 +22,7 @@ import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.js";
 import {
 	type AgentSessionRuntimeDiagnostic,
+	type AgentSessionServices,
 	createAgentSessionFromServices,
 	createAgentSessionServices,
 } from "./core/agent-session-services.js";
@@ -30,7 +32,7 @@ import { exportFromFile } from "./core/export-html/index.js";
 import type { ExtensionFactory } from "./core/extensions/types.js";
 import { KeybindingsManager } from "./core/keybindings.js";
 import type { ModelRegistry } from "./core/model-registry.js";
-import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.js";
+import { findInitialModel, resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.js";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.js";
 import type { CreateAgentSessionOptions } from "./core/sdk.js";
 import {
@@ -43,7 +45,19 @@ import { SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
-import { InteractiveMode, runDaemonMode, runPrintMode, runRpcMode } from "./modes/index.js";
+import {
+	createInteractiveModeLocalSessionHost,
+	createInteractiveModeUiServicesFromServices,
+	DaemonAgentConnection,
+	DaemonClient,
+	defaultDaemonSocketPath,
+	InProcessAgentConnection,
+	InteractiveMode,
+	runDaemonMode,
+	runPrintMode,
+	runRpcMode,
+	type SessionSummary,
+} from "./modes/index.js";
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.js";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.js";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.js";
@@ -95,7 +109,7 @@ function isTruthyEnvFlag(value: string | undefined): boolean {
 	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
 }
 
-type AppMode = "interactive" | "print" | "json" | "rpc" | "daemon";
+export type AppMode = "interactive" | "print" | "json" | "rpc" | "daemon";
 
 function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
 	if (parsed.mode === "daemon") {
@@ -115,6 +129,119 @@ function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
 
 function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc" | "daemon"> {
 	return appMode === "json" ? "json" : "text";
+}
+
+export interface InteractiveDaemonStartupDecision {
+	appMode: AppMode;
+	startupBenchmark: boolean;
+	noSession?: boolean;
+	help?: boolean;
+	listModels?: string | true;
+}
+
+export function shouldUseDaemonInteractive(options: InteractiveDaemonStartupDecision): boolean {
+	return (
+		options.appMode === "interactive" &&
+		!options.startupBenchmark &&
+		!options.noSession &&
+		!options.help &&
+		options.listModels === undefined
+	);
+}
+
+export interface DaemonInteractiveSessionManagerDecision {
+	session?: string;
+	resume?: boolean;
+	continue?: boolean;
+	fork?: string;
+	hasActiveDaemonSession?: boolean;
+}
+
+export function shouldUseEphemeralSessionManagerForDaemonInteractive(
+	options: DaemonInteractiveSessionManagerDecision,
+): boolean {
+	return !options.hasActiveDaemonSession && !options.session && !options.resume && !options.continue && !options.fork;
+}
+
+export interface DaemonActiveSessionLookupDecision {
+	useDaemonInteractive: boolean;
+	session?: string;
+}
+
+export function shouldEnsureDaemonBeforeActiveSessionLookup(options: DaemonActiveSessionLookupDecision): boolean {
+	return options.useDaemonInteractive && options.session !== undefined && !looksLikeSessionPath(options.session);
+}
+
+type ActiveDaemonSessionSummaryLookup = (socketPath: string, selector: string) => Promise<SessionSummary | undefined>;
+
+export async function findActiveDaemonSessionSummaryForInteractiveStartup(
+	socketPath: string,
+	selector: string,
+	lookup: ActiveDaemonSessionSummaryLookup = findActiveDaemonSessionSummary,
+): Promise<SessionSummary | undefined> {
+	try {
+		return await lookup(socketPath, selector);
+	} catch {
+		return undefined;
+	}
+}
+
+const DAEMON_RICH_TUI_SHORTCUT_COMMANDS = new Set([
+	"help",
+	"start",
+	"list",
+	"create",
+	"attach",
+	"detach",
+	"kill",
+	"rename",
+	"prompt",
+	"steer",
+	"follow-up",
+	"state",
+	"messages",
+	"stats",
+	"commands",
+	"shutdown",
+]);
+
+export interface DaemonRichTuiAttachShortcut {
+	socketPath: string;
+	selector: string;
+}
+
+export function parseDaemonRichTuiAttachShortcut(args: string[]): DaemonRichTuiAttachShortcut | undefined {
+	if (args[0] !== "daemon") {
+		return undefined;
+	}
+
+	let socketPath = defaultDaemonSocketPath();
+	let selector: string | undefined;
+	for (let index = 1; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--socket" || arg === "--daemon-socket") {
+			const value = args[index + 1];
+			if (!value) {
+				return undefined;
+			}
+			socketPath = value;
+			index++;
+			continue;
+		}
+		if (arg === "--json" || arg.startsWith("-") || DAEMON_RICH_TUI_SHORTCUT_COMMANDS.has(arg)) {
+			return undefined;
+		}
+		if (selector) {
+			return undefined;
+		}
+		selector = arg;
+	}
+
+	return selector ? { socketPath, selector } : undefined;
+}
+
+function looksLikeSessionPath(sessionArg: string): boolean {
+	return sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl");
 }
 
 async function prepareInitialMessage(
@@ -151,7 +278,7 @@ type ResolvedSession =
  */
 async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: string): Promise<ResolvedSession> {
 	// If it looks like a file path, use as-is
-	if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
+	if (looksLikeSessionPath(sessionArg)) {
 		return { type: "path", path: sessionArg };
 	}
 
@@ -422,6 +549,136 @@ function runtimeConfigFromArgs(
 	};
 }
 
+interface PreparedRuntimeServices {
+	services: AgentSessionServices;
+	scopedModels: ScopedModel[];
+	sessionOptions: CreateAgentSessionOptions;
+	cliThinkingFromModel: boolean;
+	diagnostics: AgentSessionRuntimeDiagnostic[];
+}
+
+async function prepareRuntimeServices(options: {
+	config: AgentSessionRuntimeConfig;
+	cwd: string;
+	agentDir: string;
+	sessionManager: SessionManager;
+	extensionFactories?: ExtensionFactory[];
+	sessionOptionsOverride?: CreateAgentSessionOptions;
+}): Promise<PreparedRuntimeServices> {
+	const { config, sessionManager } = options;
+	const effectiveAgentDir = config.agentDir ?? options.agentDir;
+	const authStorage = AuthStorage.create(join(effectiveAgentDir, "auth.json"), {
+		usePrimeCliConfig: effectiveAgentDir === options.agentDir,
+	});
+	const services = await createAgentSessionServices({
+		cwd: options.cwd,
+		agentDir: effectiveAgentDir,
+		authStorage,
+		extensionFlagValues: new Map(Object.entries(config.extensionFlagValues ?? {})),
+		resourceLoaderOptions: {
+			additionalExtensionPaths: config.extensions,
+			additionalSkillPaths: config.skills,
+			additionalPromptTemplatePaths: config.promptTemplates,
+			additionalThemePaths: config.themes,
+			noExtensions: config.noExtensions,
+			noSkills: config.noSkills,
+			noPromptTemplates: config.noPromptTemplates,
+			noThemes: config.noThemes,
+			noContextFiles: config.noContextFiles,
+			systemPrompt: config.systemPrompt,
+			appendSystemPrompt: config.appendSystemPrompt,
+			extensionFactories: options.extensionFactories,
+		},
+	});
+	const { settingsManager, modelRegistry, resourceLoader } = services;
+	const diagnostics: AgentSessionRuntimeDiagnostic[] = [
+		...services.diagnostics,
+		...collectSettingsDiagnostics(settingsManager, "runtime creation"),
+		...resourceLoader.getExtensions().errors.map(({ path, error }) => ({
+			type: "error" as const,
+			message: `Failed to load extension "${path}": ${error}`,
+		})),
+	];
+
+	const modelPatterns = config.models ?? settingsManager.getEnabledModels();
+	const scopedModels =
+		modelPatterns && modelPatterns.length > 0 ? await resolveModelScope(modelPatterns, modelRegistry) : [];
+	const {
+		options: sessionOptions,
+		cliThinkingFromModel,
+		diagnostics: sessionOptionDiagnostics,
+	} = buildSessionOptions(
+		config,
+		scopedModels,
+		sessionManager.buildSessionContext().messages.length > 0,
+		modelRegistry,
+		settingsManager,
+	);
+	diagnostics.push(...sessionOptionDiagnostics);
+
+	const effectiveSessionModel = options.sessionOptionsOverride?.model ?? sessionOptions.model;
+	if (config.apiKey) {
+		if (!effectiveSessionModel) {
+			diagnostics.push({
+				type: "error",
+				message: "--api-key requires a model to be specified via --model, --provider/--model, or --models",
+			});
+		} else {
+			authStorage.setRuntimeApiKey(effectiveSessionModel.provider, config.apiKey);
+		}
+	}
+
+	return {
+		services,
+		scopedModels,
+		sessionOptions,
+		cliThinkingFromModel,
+		diagnostics,
+	};
+}
+
+async function resolvePreparedStartupModel(options: {
+	prepared: PreparedRuntimeServices;
+	sessionManager: SessionManager;
+}): Promise<{ model: Model<Api> | undefined; modelFallbackMessage: string | undefined }> {
+	const { prepared, sessionManager } = options;
+	const { modelRegistry, settingsManager } = prepared.services;
+	const existingSession = sessionManager.buildSessionContext();
+	const hasExistingSession = existingSession.messages.length > 0;
+
+	let model = prepared.sessionOptions.model;
+	let modelFallbackMessage: string | undefined;
+
+	if (!model && hasExistingSession && existingSession.model) {
+		const restoredModel = modelRegistry.find(existingSession.model.provider, existingSession.model.modelId);
+		if (restoredModel && modelRegistry.hasConfiguredAuth(restoredModel)) {
+			model = restoredModel;
+		}
+		if (!model) {
+			modelFallbackMessage = `Could not restore model ${existingSession.model.provider}/${existingSession.model.modelId}`;
+		}
+	}
+
+	if (!model) {
+		const result = await findInitialModel({
+			scopedModels: prepared.scopedModels,
+			isContinuing: hasExistingSession,
+			defaultProvider: settingsManager.getDefaultProvider(),
+			defaultModelId: settingsManager.getDefaultModel(),
+			defaultThinkingLevel: settingsManager.getDefaultThinkingLevel(),
+			modelRegistry,
+		});
+		model = result.model;
+		if (!model) {
+			modelFallbackMessage = formatNoModelsAvailableMessage();
+		} else if (modelFallbackMessage) {
+			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
+		}
+	}
+
+	return { model, modelFallbackMessage };
+}
+
 async function promptForMissingSessionCwd(
 	issue: SessionCwdIssue,
 	settingsManager: SettingsManager,
@@ -456,6 +713,232 @@ async function promptForMissingSessionCwd(
 	});
 }
 
+function delay(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isDaemonSessionSummary(value: unknown): value is SessionSummary {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const summary = value as { activeSessionId?: unknown; id?: unknown };
+	return typeof summary.activeSessionId === "string" || typeof summary.id === "string";
+}
+
+function getDaemonSummaryActiveSessionId(summary: SessionSummary): string {
+	return summary.activeSessionId ?? summary.id;
+}
+
+function isUnknownActiveSessionError(message: string): boolean {
+	return message.startsWith("Unknown active session:");
+}
+
+async function findActiveDaemonSessionSummary(
+	socketPath: string,
+	selector: string,
+): Promise<SessionSummary | undefined> {
+	const client = new DaemonClient(socketPath);
+	try {
+		await client.connect(250);
+	} catch {
+		return undefined;
+	}
+
+	try {
+		const response = await client.request({ type: "get_state", activeSessionId: selector }, 3000);
+		if (!response.success) {
+			if (isUnknownActiveSessionError(response.error)) {
+				return undefined;
+			}
+			throw new Error(response.error);
+		}
+		if (!isDaemonSessionSummary(response.data)) {
+			throw new Error("Daemon returned an invalid active session summary");
+		}
+		return response.data;
+	} finally {
+		client.close();
+	}
+}
+
+async function normalizeDaemonRichTuiAttachArgs(args: string[]): Promise<string[] | undefined> {
+	const shortcut = parseDaemonRichTuiAttachShortcut(args);
+	if (!shortcut) {
+		return undefined;
+	}
+
+	const summary = await findActiveDaemonSessionSummary(shortcut.socketPath, shortcut.selector);
+	if (!summary) {
+		return undefined;
+	}
+
+	return ["--daemon-socket", shortcut.socketPath, "--session", getDaemonSummaryActiveSessionId(summary)];
+}
+
+function createSessionManagerForActiveDaemonSummary(summary: SessionSummary, fallbackCwd: string): SessionManager {
+	const cwd = summary.cwd || fallbackCwd;
+	if (summary.sessionFile) {
+		try {
+			return SessionManager.open(summary.sessionFile, undefined, cwd);
+		} catch {
+			return SessionManager.inMemory(cwd);
+		}
+	}
+	return SessionManager.inMemory(cwd);
+}
+
+async function canConnectToDaemon(socketPath: string, timeoutMs: number): Promise<boolean> {
+	const client = new DaemonClient(socketPath);
+	try {
+		await client.connect(timeoutMs);
+		return true;
+	} catch {
+		return false;
+	} finally {
+		client.close();
+	}
+}
+
+async function ensureInteractiveDaemonRunning(socketPath: string): Promise<void> {
+	if (await canConnectToDaemon(socketPath, 250)) {
+		return;
+	}
+
+	const entrypoint = process.argv[1];
+	if (!entrypoint) {
+		throw new Error("Cannot determine current CLI entrypoint for daemon launch");
+	}
+
+	const child = spawn(
+		process.execPath,
+		[...process.execArgv, entrypoint, "--mode", "daemon", "--daemon-socket", socketPath],
+		{
+			cwd: process.cwd(),
+			detached: true,
+			env: process.env,
+			stdio: "ignore",
+		},
+	);
+	child.unref();
+
+	const deadline = Date.now() + 10000;
+	while (Date.now() < deadline) {
+		if (await canConnectToDaemon(socketPath, 250)) {
+			return;
+		}
+		await delay(100);
+	}
+
+	throw new Error(`Timed out waiting for daemon to start on ${socketPath}`);
+}
+
+function getInteractiveDaemonSessionPath(parsed: Args, sessionManager: SessionManager): string | undefined {
+	if (!parsed.session && !parsed.resume && !parsed.continue && !parsed.fork) {
+		return undefined;
+	}
+	return sessionManager.getSessionFile();
+}
+
+export function findActiveDaemonSessionSummaryForSessionFile(
+	summaries: readonly SessionSummary[],
+	sessionPath: string,
+): SessionSummary | undefined {
+	const resolvedSessionPath = resolve(sessionPath);
+	return summaries.find(
+		(summary) =>
+			summary.activeSessionId !== undefined &&
+			summary.sessionFile !== undefined &&
+			resolve(summary.sessionFile) === resolvedSessionPath,
+	);
+}
+
+async function createDaemonInteractiveConnection(options: {
+	socketPath: string;
+	config: AgentSessionRuntimeConfig;
+	sessionPath?: string;
+	continueRecent?: boolean;
+	activeSessionId?: string;
+}): Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }> {
+	await ensureInteractiveDaemonRunning(options.socketPath);
+	const client = new DaemonClient(options.socketPath);
+	await client.connect();
+
+	try {
+		const attach = async (summary: SessionSummary) => {
+			const connection = await DaemonAgentConnection.attach(client, getDaemonSummaryActiveSessionId(summary), {
+				closeClientOnDispose: true,
+			});
+			return { connection, summary };
+		};
+
+		if (options.activeSessionId) {
+			const summary = await findAttachedDaemonSessionSummary(client, options.activeSessionId);
+			return await attach(summary);
+		}
+
+		if (options.sessionPath) {
+			const activeSummary = findActiveDaemonSessionSummaryForSessionFile(
+				await listActiveDaemonSessionSummaries(client),
+				options.sessionPath,
+			);
+			if (activeSummary) {
+				return await attach(activeSummary);
+			}
+		}
+
+		const response = await client.request({
+			type: "create",
+			config: options.config,
+			sessionPath: options.sessionPath,
+			continueRecent: options.continueRecent,
+		});
+		if (!response.success) {
+			throw new Error(response.error);
+		}
+		if (!isDaemonSessionSummary(response.data)) {
+			throw new Error("Daemon returned an invalid create response");
+		}
+		const summary = response.data;
+		return await attach(summary);
+	} catch (error) {
+		client.close();
+		throw error;
+	}
+}
+
+async function listActiveDaemonSessionSummaries(client: DaemonClient): Promise<SessionSummary[]> {
+	const response = await client.request({ type: "list" });
+	if (!response.success) {
+		throw new Error(response.error);
+	}
+	const data = response.data;
+	if (!data || typeof data !== "object" || !("sessions" in data)) {
+		throw new Error("Daemon returned an invalid session list response");
+	}
+	const sessions = (data as { sessions: unknown }).sessions;
+	if (!Array.isArray(sessions)) {
+		throw new Error("Daemon returned an invalid session list response");
+	}
+	if (!sessions.every(isDaemonSessionSummary)) {
+		throw new Error("Daemon returned an invalid session summary");
+	}
+	return sessions;
+}
+
+async function findAttachedDaemonSessionSummary(
+	client: DaemonClient,
+	activeSessionId: string,
+): Promise<SessionSummary> {
+	const response = await client.request({ type: "get_state", activeSessionId });
+	if (!response.success) {
+		throw new Error(response.error);
+	}
+	if (!isDaemonSessionSummary(response.data)) {
+		throw new Error("Daemon returned an invalid active session summary");
+	}
+	return response.data;
+}
+
 export interface MainOptions {
 	extensionFactories?: ExtensionFactory[];
 }
@@ -475,6 +958,14 @@ export async function main(args: string[], options?: MainOptions) {
 
 	if (await handleConfigCommand(args)) {
 		return;
+	}
+
+	try {
+		args = (await normalizeDaemonRichTuiAttachArgs(args)) ?? args;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(chalk.red(`Error: ${message}`));
+		process.exit(1);
 	}
 
 	if (await handleDaemonCommand(args)) {
@@ -542,6 +1033,18 @@ export async function main(args: string[], options?: MainOptions) {
 	const agentDir = getAgentDir();
 	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
 	reportDiagnostics(collectSettingsDiagnostics(startupSettingsManager, "startup session lookup"));
+	const startupBenchmark = isTruthyEnvFlag(process.env.PI_STARTUP_BENCHMARK);
+	if (startupBenchmark && appMode !== "interactive") {
+		console.error(chalk.red("Error: PI_STARTUP_BENCHMARK only supports interactive mode"));
+		process.exit(1);
+	}
+	const useDaemonInteractive = shouldUseDaemonInteractive({
+		appMode,
+		startupBenchmark,
+		noSession: parsed.noSession,
+		help: parsed.help,
+		listModels: parsed.listModels,
+	});
 
 	// Decide the final runtime cwd before creating cwd-bound runtime services.
 	// --session and --resume may select a session from another project, so project-local
@@ -552,7 +1055,34 @@ export async function main(args: string[], options?: MainOptions) {
 		(parsed.sessionDir ? expandTildePath(parsed.sessionDir) : undefined) ??
 		getSessionDirEnvOverride() ??
 		startupSettingsManager.getSessionDir();
-	let sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	const daemonSocketPath = parsed.daemonSocket ?? defaultDaemonSocketPath();
+	const shouldLookupDaemonActiveSession = shouldEnsureDaemonBeforeActiveSessionLookup({
+		useDaemonInteractive,
+		session: parsed.session,
+	});
+	if (shouldLookupDaemonActiveSession) {
+		await ensureInteractiveDaemonRunning(daemonSocketPath);
+	}
+	const activeDaemonSessionSummary =
+		shouldLookupDaemonActiveSession && parsed.session
+			? await findActiveDaemonSessionSummaryForInteractiveStartup(daemonSocketPath, parsed.session)
+			: undefined;
+	let sessionManager: SessionManager;
+	if (activeDaemonSessionSummary) {
+		sessionManager = createSessionManagerForActiveDaemonSummary(activeDaemonSessionSummary, cwd);
+	} else if (
+		useDaemonInteractive &&
+		shouldUseEphemeralSessionManagerForDaemonInteractive({
+			session: parsed.session,
+			resume: parsed.resume,
+			continue: parsed.continue,
+			fork: parsed.fork,
+		})
+	) {
+		sessionManager = SessionManager.inMemory(cwd);
+	} else {
+		sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+	}
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {
 		if (appMode === "interactive") {
@@ -578,73 +1108,21 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionOptions: runtimeSessionOptions,
 	}) => {
 		const config = mergeAgentSessionRuntimeConfig(defaultSessionConfig, sessionConfig);
-		const effectiveAgentDir = config.agentDir ?? agentDir;
-		const authStorage = AuthStorage.create(join(effectiveAgentDir, "auth.json"), {
-			usePrimeCliConfig: effectiveAgentDir === agentDir,
-		});
-		const services = await createAgentSessionServices({
-			cwd,
-			agentDir: effectiveAgentDir,
-			authStorage,
-			extensionFlagValues: new Map(Object.entries(config.extensionFlagValues ?? {})),
-			resourceLoaderOptions: {
-				additionalExtensionPaths: config.extensions,
-				additionalSkillPaths: config.skills,
-				additionalPromptTemplatePaths: config.promptTemplates,
-				additionalThemePaths: config.themes,
-				noExtensions: config.noExtensions,
-				noSkills: config.noSkills,
-				noPromptTemplates: config.noPromptTemplates,
-				noThemes: config.noThemes,
-				noContextFiles: config.noContextFiles,
-				systemPrompt: config.systemPrompt,
-				appendSystemPrompt: config.appendSystemPrompt,
-				extensionFactories: options?.extensionFactories,
-			},
-		});
-		const { settingsManager, modelRegistry, resourceLoader } = services;
-		const diagnostics: AgentSessionRuntimeDiagnostic[] = [
-			...services.diagnostics,
-			...collectSettingsDiagnostics(settingsManager, "runtime creation"),
-			...resourceLoader.getExtensions().errors.map(({ path, error }) => ({
-				type: "error" as const,
-				message: `Failed to load extension "${path}": ${error}`,
-			})),
-		];
-
-		const modelPatterns = config.models ?? settingsManager.getEnabledModels();
-		const scopedModels =
-			modelPatterns && modelPatterns.length > 0 ? await resolveModelScope(modelPatterns, modelRegistry) : [];
-		const {
-			options: sessionOptions,
-			cliThinkingFromModel,
-			diagnostics: sessionOptionDiagnostics,
-		} = buildSessionOptions(
+		const prepared = await prepareRuntimeServices({
 			config,
-			scopedModels,
-			sessionManager.buildSessionContext().messages.length > 0,
-			modelRegistry,
-			settingsManager,
-		);
-		diagnostics.push(...sessionOptionDiagnostics);
-
-		const effectiveSessionModel = runtimeSessionOptions?.model ?? sessionOptions.model;
-		if (config.apiKey) {
-			if (!effectiveSessionModel) {
-				diagnostics.push({
-					type: "error",
-					message: "--api-key requires a model to be specified via --model, --provider/--model, or --models",
-				});
-			} else {
-				authStorage.setRuntimeApiKey(effectiveSessionModel.provider, config.apiKey);
-			}
-		}
+			cwd,
+			agentDir,
+			sessionManager,
+			extensionFactories: options?.extensionFactories,
+			sessionOptionsOverride: runtimeSessionOptions,
+		});
+		const { services, sessionOptions, diagnostics } = prepared;
 
 		const created = await createAgentSessionFromServices({
 			services,
 			sessionManager,
 			sessionStartEvent,
-			model: effectiveSessionModel,
+			model: runtimeSessionOptions?.model ?? sessionOptions.model,
 			thinkingLevel: runtimeSessionOptions?.thinkingLevel ?? sessionOptions.thinkingLevel,
 			scopedModels: runtimeSessionOptions?.scopedModels ?? sessionOptions.scopedModels,
 			tools: runtimeSessionOptions?.tools ?? sessionOptions.tools,
@@ -660,7 +1138,7 @@ export async function main(args: string[], options?: MainOptions) {
 			rlmParentNodeId: runtimeSessionOptions?.rlmParentNodeId,
 			subagentRuntimeHost: runtimeSessionOptions?.subagentRuntimeHost,
 		});
-		const cliThinkingOverride = config.thinking !== undefined || cliThinkingFromModel;
+		const cliThinkingOverride = config.thinking !== undefined || prepared.cliThinkingFromModel;
 		if (created.session.model && cliThinkingOverride) {
 			created.session.setThinkingLevel(created.session.thinkingLevel);
 		}
@@ -672,6 +1150,82 @@ export async function main(args: string[], options?: MainOptions) {
 		};
 	};
 	time("createRuntime");
+	if (useDaemonInteractive) {
+		const prepared = await prepareRuntimeServices({
+			config: defaultSessionConfig,
+			cwd: sessionManager.getCwd(),
+			agentDir,
+			sessionManager,
+			extensionFactories: options?.extensionFactories,
+		});
+		const { services, scopedModels } = prepared;
+		const { settingsManager } = services;
+
+		const startupModel = await resolvePreparedStartupModel({ prepared, sessionManager });
+
+		let stdinContent: string | undefined;
+		stdinContent = await readPipedStdin();
+		time("readPipedStdin");
+
+		const { initialMessage, initialImages } = await prepareInitialMessage(
+			parsed,
+			settingsManager.getImageAutoResize(),
+			stdinContent,
+		);
+		time("prepareInitialMessage");
+		initTheme(settingsManager.getTheme(), true);
+		time("initTheme");
+
+		if (deprecationWarnings.length > 0) {
+			await showDeprecationWarnings(deprecationWarnings);
+		}
+
+		reportDiagnostics(prepared.diagnostics);
+		if (prepared.diagnostics.some((diagnostic) => diagnostic.type === "error")) {
+			process.exit(1);
+		}
+		time("prepareInteractiveServices");
+
+		if (scopedModels.length > 0 && (parsed.verbose || !settingsManager.getQuietStartup())) {
+			const modelList = scopedModels
+				.map((sm) => {
+					const thinkingStr = sm.thinkingLevel ? `:${sm.thinkingLevel}` : "";
+					return `${sm.model.id}${thinkingStr}`;
+				})
+				.join(", ");
+			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Ctrl+P to cycle)")}`));
+		}
+
+		const { connection: agentConnection, summary } = await createDaemonInteractiveConnection({
+			socketPath: daemonSocketPath,
+			config: defaultSessionConfig,
+			activeSessionId: activeDaemonSessionSummary
+				? getDaemonSummaryActiveSessionId(activeDaemonSessionSummary)
+				: undefined,
+			sessionPath: activeDaemonSessionSummary ? undefined : getInteractiveDaemonSessionPath(parsed, sessionManager),
+		});
+
+		const daemonUiServices = createInteractiveModeUiServicesFromServices({
+			services,
+			sessionManager,
+		});
+		const interactiveMode = new InteractiveMode({
+			agentConnection,
+			uiServices: daemonUiServices,
+			bindLocalSessionExtensions: false,
+			migratedProviders,
+			modelFallbackMessage: summary.modelFallbackMessage ?? startupModel.modelFallbackMessage,
+			initialMessage,
+			initialImages,
+			initialMessages: parsed.messages,
+			verbose: parsed.verbose,
+		});
+
+		printTimings();
+		await interactiveMode.run();
+		return;
+	}
+
 	const runtime = await createAgentSessionRuntime(createRuntime, {
 		cwd: sessionManager.getCwd(),
 		agentDir,
@@ -732,12 +1286,6 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(1);
 	}
 
-	const startupBenchmark = isTruthyEnvFlag(process.env.PI_STARTUP_BENCHMARK);
-	if (startupBenchmark && appMode !== "interactive") {
-		console.error(chalk.red("Error: PI_STARTUP_BENCHMARK only supports interactive mode"));
-		process.exit(1);
-	}
-
 	if (appMode === "rpc") {
 		printTimings();
 		await runRpcMode(runtime);
@@ -759,7 +1307,10 @@ export async function main(args: string[], options?: MainOptions) {
 			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Ctrl+P to cycle)")}`));
 		}
 
-		const interactiveMode = new InteractiveMode(runtime, {
+		const interactiveMode = new InteractiveMode({
+			agentConnection: new InProcessAgentConnection(runtime),
+			localSessionHost: createInteractiveModeLocalSessionHost(runtime),
+			bindLocalSessionExtensions: true,
 			migratedProviders,
 			modelFallbackMessage,
 			initialMessage,

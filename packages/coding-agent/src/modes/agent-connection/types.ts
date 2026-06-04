@@ -1,0 +1,501 @@
+import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type {
+	Api,
+	AssistantMessage,
+	ImageContent,
+	Model,
+	TextContent,
+	Transport,
+	Usage,
+	UserMessage,
+} from "@earendil-works/pi-ai";
+import type { CompactionResult } from "../../core/compaction/index.js";
+import type { GoalState } from "../../core/goals.js";
+import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import type { SessionStats } from "../../core/session-stats.js";
+
+/**
+ * Client-side interaction boundary consumed by InteractiveMode.
+ *
+ * This is not the final hosted/gateway wire protocol. Local and future remote
+ * adapters may implement this interface, but network transports should translate
+ * at their edge to versioned DTOs with their own framing, sequencing, replay,
+ * and command lifecycle semantics.
+ *
+ * Keep runtime ownership details out of this contract. InteractiveMode must not
+ * receive AgentSessionRuntime, AgentSession, SessionManager, daemon socket
+ * clients, in-process event emitters, or executable callbacks through
+ * AgentConnection. Local-only compatibility hooks belong in adapter/service
+ * layers such as InteractiveModeLocalSessionHost.
+ *
+ * Transitional note: AgentEvent and AgentMessage are still reused below so this
+ * PR can move the TUI behind a boundary without rewriting the transcript
+ * renderer and stream event model. Replace those aliases with stable
+ * connection-owned/network DTOs before treating this surface as a remote wire
+ * contract.
+ */
+export type AgentConnectionQueueMode = "all" | "one-at-a-time";
+export type AgentConnectionModel = Model<Api>;
+export type AgentConnectionSavedSessionScope = "current" | "all";
+
+export type AgentConnectionSavedSessionStateStatus = "sleep" | "crash";
+
+export type AgentConnectionSourceScope = "user" | "project" | "temporary";
+export type AgentConnectionSourceOrigin = "package" | "top-level";
+
+export interface AgentConnectionSourceInfo {
+	path: string;
+	source: string;
+	scope: AgentConnectionSourceScope;
+	origin: AgentConnectionSourceOrigin;
+	baseDir?: string;
+}
+
+export interface AgentConnectionResourceCollision {
+	resourceType: "extension" | "skill" | "prompt" | "theme";
+	name: string;
+	winnerPath: string;
+	loserPath: string;
+	winnerSource?: string;
+	loserSource?: string;
+}
+
+export interface AgentConnectionResourceDiagnostic {
+	type: "warning" | "error" | "collision";
+	message: string;
+	path?: string;
+	collision?: AgentConnectionResourceCollision;
+}
+
+export interface AgentConnectionSavedSessionState {
+	status: AgentConnectionSavedSessionStateStatus;
+}
+
+/**
+ * Saved-session registry row for the current local TUI migration.
+ *
+ * Existing fields intentionally preserve local behavior, including filesystem
+ * paths and Date objects. Do not add new TUI features that require these local
+ * shapes through AgentConnection. Hosted/gateway work should introduce opaque
+ * session/artifact identifiers and string timestamp DTOs before exposing this
+ * data across a network.
+ */
+export interface AgentConnectionSavedSessionInfo {
+	path: string;
+	id: string;
+	cwd: string;
+	name?: string;
+	state?: AgentConnectionSavedSessionState;
+	parentSessionPath?: string;
+	created: Date;
+	modified: Date;
+	messageCount: number;
+	firstMessage: string;
+	allMessagesText: string;
+}
+
+export type AgentConnectionSessionListProgress = (loaded: number, total: number) => void;
+
+export interface AgentConnectionSessionEntryBase {
+	type: string;
+	id: string;
+	parentId: string | null;
+	timestamp: string;
+}
+
+export interface AgentConnectionSessionMessageEntry extends AgentConnectionSessionEntryBase {
+	type: "message";
+	message: AgentMessage;
+}
+
+export interface AgentConnectionThinkingLevelChangeEntry extends AgentConnectionSessionEntryBase {
+	type: "thinking_level_change";
+	thinkingLevel: string;
+}
+
+export interface AgentConnectionModelChangeEntry extends AgentConnectionSessionEntryBase {
+	type: "model_change";
+	provider: string;
+	modelId: string;
+}
+
+export interface AgentConnectionCompactionEntry extends AgentConnectionSessionEntryBase {
+	type: "compaction";
+	summary: string;
+	firstKeptEntryId: string;
+	tokensBefore: number;
+	details?: unknown;
+	fromHook?: boolean;
+}
+
+export interface AgentConnectionBranchSummaryEntry extends AgentConnectionSessionEntryBase {
+	type: "branch_summary";
+	fromId: string;
+	summary: string;
+	details?: unknown;
+	fromHook?: boolean;
+}
+
+export interface AgentConnectionCustomEntry extends AgentConnectionSessionEntryBase {
+	type: "custom";
+	customType: string;
+	data?: unknown;
+}
+
+export interface AgentConnectionChildUsageAttributionEntry extends AgentConnectionSessionEntryBase {
+	type: "child_usage_attributed";
+	targetId: string;
+	childUsage: Usage;
+	aggregateUsage: Usage;
+}
+
+export interface AgentConnectionCustomMessageEntry extends AgentConnectionSessionEntryBase {
+	type: "custom_message";
+	customType: string;
+	content: string | (TextContent | ImageContent)[];
+	details?: unknown;
+	display: boolean;
+}
+
+export interface AgentConnectionLabelEntry extends AgentConnectionSessionEntryBase {
+	type: "label";
+	targetId: string;
+	label: string | undefined;
+}
+
+export interface AgentConnectionSessionInfoEntry extends AgentConnectionSessionEntryBase {
+	type: "session_info";
+	name?: string;
+}
+
+export interface AgentConnectionSessionStateEntry extends AgentConnectionSessionEntryBase {
+	type: "session_state";
+	state: AgentConnectionSavedSessionState;
+}
+
+export type AgentConnectionSessionEntry =
+	| AgentConnectionSessionMessageEntry
+	| AgentConnectionThinkingLevelChangeEntry
+	| AgentConnectionModelChangeEntry
+	| AgentConnectionCompactionEntry
+	| AgentConnectionBranchSummaryEntry
+	| AgentConnectionCustomEntry
+	| AgentConnectionChildUsageAttributionEntry
+	| AgentConnectionCustomMessageEntry
+	| AgentConnectionLabelEntry
+	| AgentConnectionSessionInfoEntry
+	| AgentConnectionSessionStateEntry;
+
+export interface AgentConnectionSessionTreeNode {
+	entry: AgentConnectionSessionEntry;
+	children: AgentConnectionSessionTreeNode[];
+	label?: string;
+	labelTimestamp?: string;
+}
+
+export interface AgentConnectionSessionContext {
+	messages: AgentMessage[];
+	thinkingLevel: string;
+	model: { provider: string; modelId: string } | null;
+}
+
+export interface AgentConnectionScopedModel {
+	model: AgentConnectionModel;
+	thinkingLevel?: ThinkingLevel;
+}
+
+export interface AgentConnectionModelCycleResult {
+	model: AgentConnectionModel;
+	thinkingLevel: ThinkingLevel;
+	isScoped: boolean;
+}
+
+export interface AgentConnectionState {
+	activeSessionId?: string;
+	cwd: string;
+	model?: AgentConnectionModel;
+	thinkingLevel: ThinkingLevel;
+	availableThinkingLevels: ThinkingLevel[];
+	isStreaming: boolean;
+	isCompacting: boolean;
+	retryAttempt: number;
+	steeringMode: AgentConnectionQueueMode;
+	followUpMode: AgentConnectionQueueMode;
+	sessionFile?: string;
+	sessionId: string;
+	sessionName?: string;
+	sessionDir?: string;
+	leafId: string | null;
+	autoCompactionEnabled: boolean;
+	messageCount: number;
+	pendingMessageCount: number;
+	compactionCount: number;
+	goal: GoalState;
+	scopedModels: AgentConnectionScopedModel[];
+	activeToolNames: string[];
+	contextUsage: SessionStats["contextUsage"];
+}
+
+export interface AgentConnectionSlashCommand {
+	name: string;
+	registeredName?: string;
+	description?: string;
+	argumentHint?: string;
+	source: "extension" | "prompt" | "skill";
+	sourceInfo: AgentConnectionSourceInfo;
+}
+
+export interface AgentConnectionResourceContextFile {
+	path: string;
+}
+
+export interface AgentConnectionResourceSkill {
+	name: string;
+	description?: string;
+	filePath: string;
+	sourceInfo?: AgentConnectionSourceInfo;
+}
+
+export interface AgentConnectionResourcePrompt {
+	name: string;
+	description?: string;
+	argumentHint?: string;
+	filePath: string;
+	sourceInfo?: AgentConnectionSourceInfo;
+}
+
+export interface AgentConnectionResourceExtension {
+	path: string;
+	sourceInfo?: AgentConnectionSourceInfo;
+}
+
+export interface AgentConnectionResourceTheme {
+	name?: string;
+	sourcePath?: string;
+	sourceInfo?: AgentConnectionSourceInfo;
+}
+
+export interface AgentConnectionResourceDiagnostics {
+	skills: AgentConnectionResourceDiagnostic[];
+	prompts: AgentConnectionResourceDiagnostic[];
+	extensions: AgentConnectionResourceDiagnostic[];
+	themes: AgentConnectionResourceDiagnostic[];
+}
+
+export interface AgentConnectionResourceSnapshot {
+	contextFiles: AgentConnectionResourceContextFile[];
+	skills: AgentConnectionResourceSkill[];
+	prompts: AgentConnectionResourcePrompt[];
+	extensions: AgentConnectionResourceExtension[];
+	themes: AgentConnectionResourceTheme[];
+	diagnostics: AgentConnectionResourceDiagnostics;
+}
+
+export interface AgentConnectionToolDefinition {
+	name: string;
+	label: string;
+	description: string;
+	promptSnippet?: string;
+	promptGuidelines?: string[];
+	parameters: unknown;
+	renderShell?: "default" | "self";
+}
+
+export interface AgentConnectionPromptOptions {
+	images?: ImageContent[];
+	streamingBehavior?: "steer" | "followUp";
+}
+
+export interface AgentConnectionNewSessionOptions {
+	parentSession?: string;
+}
+
+export interface AgentConnectionForkOptions {
+	position?: "before" | "at";
+}
+
+export interface AgentConnectionSwitchSessionOptions {
+	cwdOverride?: string;
+}
+
+export interface AgentConnectionNavigateTreeOptions {
+	summarize?: boolean;
+	customInstructions?: string;
+	replaceInstructions?: boolean;
+	label?: string;
+}
+
+export interface AgentConnectionNavigateTreeResult {
+	editorText?: string;
+	cancelled: boolean;
+	aborted?: boolean;
+}
+
+export interface AgentConnectionUserMessage {
+	entryId: string;
+	text: string;
+}
+
+export interface AgentConnectionQueueState {
+	steering: string[];
+	followUp: string[];
+}
+
+export type AgentConnectionExtensionUiResponse = { value: string } | { confirmed: boolean } | { cancelled: true };
+
+export interface AgentConnectionExtensionUiRequest {
+	id: string;
+	method: string;
+	payload: Record<string, unknown>;
+}
+
+export type AgentConnectionRlmChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
+
+export interface AgentConnectionRlmChildAgentTranscriptLine {
+	role: "user" | "assistant" | "tool" | "system";
+	text: string;
+}
+
+export interface AgentConnectionRlmChildAgentToolResult {
+	content: (TextContent | ImageContent)[];
+	details?: unknown;
+	isError: boolean;
+}
+
+export interface AgentConnectionRlmChildAgentMessageTranscriptEntry {
+	type: "message";
+	role: "user" | "assistant";
+	text: string;
+	message: UserMessage | AssistantMessage;
+}
+
+export interface AgentConnectionRlmChildAgentToolTranscriptEntry {
+	type: "tool";
+	role: "tool";
+	text: string;
+	toolCallId: string;
+	toolName: string;
+	args: unknown;
+	result?: AgentConnectionRlmChildAgentToolResult;
+	isPartial: boolean;
+	executionStarted: boolean;
+	argsComplete: boolean;
+}
+
+export interface AgentConnectionRlmChildAgentSystemTranscriptEntry {
+	type: "system";
+	role: "system";
+	text: string;
+}
+
+export type AgentConnectionRlmChildAgentStructuredTranscriptEntry =
+	| AgentConnectionRlmChildAgentMessageTranscriptEntry
+	| AgentConnectionRlmChildAgentToolTranscriptEntry
+	| AgentConnectionRlmChildAgentSystemTranscriptEntry;
+
+export interface AgentConnectionRlmChildAgentSnapshot {
+	id: string;
+	parentId?: string;
+	label: string;
+	status: AgentConnectionRlmChildAgentStatus;
+	durationMs?: number;
+	answerPreview?: string;
+	sessionDir: string;
+	transcript: readonly AgentConnectionRlmChildAgentTranscriptLine[];
+	structuredTranscript?: readonly AgentConnectionRlmChildAgentStructuredTranscriptEntry[];
+}
+
+export type AgentConnectionSessionEvent =
+	| AgentEvent
+	| {
+			type: "queue_update";
+			steering: readonly string[];
+			followUp: readonly string[];
+	  }
+	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| { type: "session_info_changed"; name: string | undefined }
+	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	| {
+			type: "compaction_end";
+			reason: "manual" | "threshold" | "overflow";
+			result: CompactionResult | undefined;
+			aborted: boolean;
+			willRetry: boolean;
+			errorMessage?: string;
+	  }
+	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
+	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| { type: "rlm_child_update"; child: AgentConnectionRlmChildAgentSnapshot }
+	| { type: "goal_update"; goal: GoalState };
+
+export type AgentConnectionEvent =
+	| { type: "session_event"; event: AgentConnectionSessionEvent }
+	| { type: "session_replaced"; state: AgentConnectionState; messages: AgentMessage[] }
+	| { type: "extension_ui_request"; request: AgentConnectionExtensionUiRequest }
+	| { type: "closed"; error?: string };
+
+export type AgentConnectionEventListener = (event: AgentConnectionEvent) => void | Promise<void>;
+export type AgentConnectionBeforeSessionInvalidateListener = () => void;
+
+export interface AgentConnection {
+	subscribe(listener: AgentConnectionEventListener): () => void;
+	onBeforeSessionInvalidate(listener: AgentConnectionBeforeSessionInvalidateListener): () => void;
+
+	getState(): Promise<AgentConnectionState>;
+	getMessages(): Promise<AgentMessage[]>;
+	getCommands(): Promise<AgentConnectionSlashCommand[]>;
+	getResourceSnapshot(): Promise<AgentConnectionResourceSnapshot>;
+	getAvailableModels(): Promise<AgentConnectionModel[]>;
+	getSessionStats(): Promise<SessionStats>;
+	getSessionContext(): Promise<AgentConnectionSessionContext>;
+	getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }>;
+	listSavedSessions(
+		scope: AgentConnectionSavedSessionScope,
+		onProgress?: AgentConnectionSessionListProgress,
+	): Promise<AgentConnectionSavedSessionInfo[]>;
+	getQueue(): Promise<AgentConnectionQueueState>;
+	clearQueue(): Promise<AgentConnectionQueueState>;
+	getUserMessagesForForking(): Promise<AgentConnectionUserMessage[]>;
+	getLastAssistantText(): Promise<string | undefined>;
+	getToolDefinition(name: string): Promise<AgentConnectionToolDefinition | undefined>;
+	setSessionEntryLabel(entryId: string, label: string | undefined): Promise<void>;
+	respondToExtensionUiRequest(requestId: string, response: AgentConnectionExtensionUiResponse): Promise<void>;
+
+	prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void>;
+	steer(message: string, images?: ImageContent[]): Promise<void>;
+	followUp(message: string, images?: ImageContent[]): Promise<void>;
+	abort(): Promise<void>;
+	waitForIdle(): Promise<void>;
+
+	setModel(provider: string, modelId: string): Promise<AgentConnectionModel>;
+	cycleModel(direction?: "forward" | "backward"): Promise<AgentConnectionModelCycleResult | undefined>;
+	setScopedModels(scopedModels: AgentConnectionScopedModel[]): Promise<void>;
+	setThinkingLevel(level: ThinkingLevel): Promise<void>;
+	cycleThinkingLevel(): Promise<ThinkingLevel | undefined>;
+	setTransport(transport: Transport): Promise<void>;
+	setSteeringMode(mode: AgentConnectionQueueMode): Promise<void>;
+	setFollowUpMode(mode: AgentConnectionQueueMode): Promise<void>;
+	setAutoCompactionEnabled(enabled: boolean): Promise<void>;
+
+	compact(customInstructions?: string): Promise<CompactionResult>;
+	abortCompaction(): Promise<void>;
+	abortBranchSummary(): Promise<void>;
+	abortRetry(): Promise<void>;
+
+	reload(): Promise<void>;
+	newSession(options?: AgentConnectionNewSessionOptions): Promise<{ cancelled: boolean }>;
+	switchSession(sessionPath: string, options?: AgentConnectionSwitchSessionOptions): Promise<{ cancelled: boolean }>;
+	fork(entryId: string, options?: AgentConnectionForkOptions): Promise<{ cancelled: boolean; selectedText?: string }>;
+	navigateTree(
+		targetId: string,
+		options?: AgentConnectionNavigateTreeOptions,
+	): Promise<AgentConnectionNavigateTreeResult>;
+	importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }>;
+	exportToHtml(outputPath?: string): Promise<string>;
+	exportToJsonl(outputPath?: string): Promise<string>;
+	setSessionName(name: string): Promise<void>;
+	renameSavedSession(sessionPath: string, name: string): Promise<void>;
+	deleteSavedSession(sessionPath: string): Promise<DeleteSessionFileResult>;
+
+	dispose(): Promise<void>;
+}

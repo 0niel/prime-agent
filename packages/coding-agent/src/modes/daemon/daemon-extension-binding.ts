@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type {
 	ExtensionCommandContextActions,
 	ExtensionUIContext,
@@ -6,9 +7,14 @@ import type {
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.js";
 import type { SubagentRuntimeHost } from "../../core/rlm-runtime.js";
+import { createAgentConnectionState } from "../agent-connection/snapshot.js";
 import { type Theme, theme } from "../interactive/theme/theme.js";
 import type { ActiveSessionState } from "./active-session-state.js";
-import type { DaemonOutbound } from "./daemon-protocol.js";
+import {
+	type DaemonExtensionUIResponse,
+	type DaemonOutbound,
+	isDaemonDialogExtensionUiRequest,
+} from "./daemon-protocol.js";
 
 export interface ActiveSessionBindingCallbacks {
 	broadcast: (state: ActiveSessionState, message: DaemonOutbound) => void;
@@ -34,6 +40,12 @@ export async function bindActiveSessionState(
 
 	state.runtime.setRebindSession(async () => {
 		await bindActiveSessionState(state, callbacks);
+		callbacks.broadcast(state, {
+			type: "session_replaced",
+			activeSessionId: state.activeSessionId,
+			state: createAgentConnectionState(state.runtime, state.activeSessionId),
+			messages: state.runtime.session.messages,
+		});
 	});
 
 	await session.bindExtensions({
@@ -80,19 +92,32 @@ function createExtensionUIContext(
 	state: ActiveSessionState,
 	broadcast: ActiveSessionBindingCallbacks["broadcast"],
 ): ExtensionUIContext {
-	const emitUiRequest = (method: string, payload: Record<string, unknown>): void => {
+	const emitUiRequest = (method: string, payload: Record<string, unknown>): string => {
+		const id = randomUUID();
 		broadcast(state, {
 			type: "extension_ui_request",
 			activeSessionId: state.activeSessionId,
+			id,
 			method,
 			payload,
 		});
+		return id;
 	};
 
-	const dialogDefault = <T>(opts: ExtensionUIDialogOptions | undefined, fallback: T): Promise<T> => {
+	const dialogRequest = <T>(
+		method: string,
+		payload: Record<string, unknown>,
+		opts: ExtensionUIDialogOptions | undefined,
+		fallback: T,
+		resolveResponse: (response: DaemonExtensionUIResponse) => T,
+	): Promise<T> => {
 		if (opts?.signal?.aborted) {
 			return Promise.resolve(fallback);
 		}
+		if (!hasExtensionUiClientForMethod(state, method)) {
+			return Promise.resolve(fallback);
+		}
+		const requestId = emitUiRequest(method, payload);
 		return new Promise((resolveDialog) => {
 			let timeoutId: ReturnType<typeof setTimeout> | undefined;
 			const cleanup = () => {
@@ -100,34 +125,44 @@ function createExtensionUIContext(
 					clearTimeout(timeoutId);
 				}
 				opts?.signal?.removeEventListener("abort", onAbort);
+				state.extensionUiRequests.delete(requestId);
 			};
-			const finish = () => {
+			const finish = (value: T) => {
 				cleanup();
-				resolveDialog(fallback);
+				resolveDialog(value);
 			};
-			const onAbort = () => finish();
+			const onAbort = () => finish(fallback);
+			state.extensionUiRequests.set(requestId, {
+				resolve: (response) => finish(resolveResponse(response)),
+			});
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 			if (opts?.timeout !== undefined) {
-				timeoutId = setTimeout(finish, opts.timeout);
-			} else {
-				timeoutId = setTimeout(finish, 0);
+				timeoutId = setTimeout(() => finish(fallback), opts.timeout);
 			}
 		});
 	};
 
 	return {
-		select: (title, values, opts) => {
-			emitUiRequest("select", { title, options: values, timeout: opts?.timeout });
-			return dialogDefault(opts, undefined);
-		},
-		confirm: (title, message, opts) => {
-			emitUiRequest("confirm", { title, message, timeout: opts?.timeout });
-			return dialogDefault(opts, false);
-		},
-		input: (title, placeholder, opts) => {
-			emitUiRequest("input", { title, placeholder, timeout: opts?.timeout });
-			return dialogDefault(opts, undefined);
-		},
+		select: (title, values, opts) =>
+			dialogRequest("select", { title, options: values, timeout: opts?.timeout }, opts, undefined, (response) =>
+				"cancelled" in response && response.cancelled
+					? undefined
+					: "value" in response
+						? response.value
+						: undefined,
+			),
+		confirm: (title, message, opts) =>
+			dialogRequest("confirm", { title, message, timeout: opts?.timeout }, opts, false, (response) =>
+				"confirmed" in response ? response.confirmed : false,
+			),
+		input: (title, placeholder, opts) =>
+			dialogRequest("input", { title, placeholder, timeout: opts?.timeout }, opts, undefined, (response) =>
+				"cancelled" in response && response.cancelled
+					? undefined
+					: "value" in response
+						? response.value
+						: undefined,
+			),
 		notify: (message, notifyType) => emitUiRequest("notify", { message, notifyType }),
 		onTerminalInput: () => () => {},
 		setStatus: (key, text) => emitUiRequest("setStatus", { statusKey: key, statusText: text }),
@@ -155,8 +190,13 @@ function createExtensionUIContext(
 		setEditorText: (text) => emitUiRequest("setEditorText", { text }),
 		getEditorText: () => "",
 		editor: (title, prefill) => {
-			emitUiRequest("editor", { title, prefill });
-			return Promise.resolve(undefined);
+			return dialogRequest("editor", { title, prefill }, undefined, undefined, (response) =>
+				"cancelled" in response && response.cancelled
+					? undefined
+					: "value" in response
+						? response.value
+						: undefined,
+			);
 		},
 		addAutocompleteProvider: () => {},
 		setEditorComponent: () => {},
@@ -170,4 +210,11 @@ function createExtensionUIContext(
 		getToolsExpanded: () => false,
 		setToolsExpanded: () => {},
 	};
+}
+
+function hasExtensionUiClientForMethod(state: ActiveSessionState, method: string): boolean {
+	if (!isDaemonDialogExtensionUiRequest(method)) {
+		return state.clients.size > 0;
+	}
+	return [...state.clients].some((client) => client.supportsExtensionUi);
 }

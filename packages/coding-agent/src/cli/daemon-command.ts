@@ -1047,6 +1047,15 @@ class DaemonAttachTerminal {
 			case "session_event":
 				this.handleSessionEvent(message.event);
 				return;
+			case "session_replaced":
+				this.isStreaming = message.state.isStreaming;
+				this.writeLine(chalk.dim(`Session replaced: ${message.state.sessionName ?? message.activeSessionId}`));
+				if (message.messages.length > 0) {
+					this.writeLine(chalk.bold("Transcript"));
+					this.printTranscript(message.messages);
+				}
+				this.rl?.prompt();
+				return;
 			case "session_detached":
 				return;
 			case "session_closed":

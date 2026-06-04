@@ -5,6 +5,7 @@ import {
 	findInitialModel,
 	parseModelPattern,
 	resolveCliModel,
+	resolveModelScopeFromModels,
 } from "../src/core/model-resolver.js";
 
 // Mock models for testing
@@ -64,6 +65,34 @@ const mockOpenRouterModels: Model<"anthropic-messages">[] = [
 ];
 
 const allModels = [...mockModels, ...mockOpenRouterModels];
+
+describe("resolveModelScopeFromModels", () => {
+	test("resolves scope patterns against the supplied model list", () => {
+		const daemonModel: Model<"anthropic-messages"> = {
+			id: "daemon-only-model",
+			name: "Daemon Only Model",
+			api: "anthropic-messages",
+			provider: "prime-inference",
+			baseUrl: "https://api.pinference.ai/api/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1 },
+			contextWindow: 128000,
+			maxTokens: 8192,
+		};
+
+		const result = resolveModelScopeFromModels(
+			["prime-inference/daemon-only-model:high", "openai/gpt-4o"],
+			[...allModels, daemonModel],
+		);
+
+		expect(result).toHaveLength(2);
+		expect(result[0]?.model).toBe(daemonModel);
+		expect(result[0]?.thinkingLevel).toBe("high");
+		expect(result[1]?.model.provider).toBe("openai");
+		expect(result[1]?.model.id).toBe("gpt-4o");
+	});
+});
 
 describe("parseModelPattern", () => {
 	describe("simple patterns without colons", () => {

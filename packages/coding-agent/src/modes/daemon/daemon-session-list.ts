@@ -2,10 +2,12 @@ import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import type { SessionInfo, SessionStateStatus } from "../../core/session-manager.js";
+import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.js";
+import type { SessionInfo } from "../../core/session-manager.js";
+import type { AgentConnectionSavedSessionStateStatus } from "../agent-connection/types.js";
 import type { ActiveSessionState } from "./active-session-state.js";
 
-export type SessionStatus = "user" | "idle" | "tool" | "model" | SessionStateStatus;
+export type SessionStatus = "user" | "idle" | "tool" | "model" | AgentConnectionSavedSessionStateStatus;
 
 // Lightweight daemon session shape used by list, create, rename, attach, and state responses.
 export interface SessionSummary {
@@ -33,6 +35,8 @@ export interface SessionSummary {
 	parentSessionPath?: string;
 	rlmChildId?: string;
 	rlmParentNodeId?: string;
+	modelFallbackMessage?: string;
+	diagnostics?: AgentSessionRuntimeDiagnostic[];
 }
 
 export function buildSessionList(
@@ -106,6 +110,8 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		parentSessionPath: savedSession?.parentSessionPath ?? metadata.parentSessionFile,
 		rlmChildId: metadata.rlmChildId,
 		rlmParentNodeId: metadata.rlmParentNodeId,
+		modelFallbackMessage: activeSession.runtime.modelFallbackMessage,
+		diagnostics: [...activeSession.runtime.diagnostics],
 	};
 }
 
