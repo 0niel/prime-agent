@@ -114,6 +114,7 @@ function makeState(options: StateOptions): ActiveSessionState {
 	return {
 		activeSessionId: options.activeSessionId,
 		clients,
+		lastEventSequence: 0,
 		runtime: {
 			metadata: options.metadata ?? { kind: "top-level", createdAt: 1 },
 			diagnostics: [],

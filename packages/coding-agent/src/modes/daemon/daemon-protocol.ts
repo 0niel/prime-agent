@@ -18,10 +18,121 @@ import type { SessionSummary } from "./daemon-session-list.js";
  * Local daemon JSONL protocol.
  *
  * This is the transport used by DaemonAgentConnection today, not the final
- * remote gateway protocol. Gateway work should add its own versioned envelopes,
- * sequencing/replay, command lifecycle, artifact handles, and auth/control-plane
- * concerns without leaking those details back into InteractiveMode.
+ * remote gateway protocol. The protocol primitives below are intentionally
+ * JSON-serializable so a future gateway can wrap or proxy this local transport
+ * without leaking transport details back into InteractiveMode.
  */
+
+export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
+export const DAEMON_PROTOCOL_VERSION = 1;
+
+export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
+export type DaemonProtocolVersion = typeof DAEMON_PROTOCOL_VERSION;
+export type DaemonCommandId = string;
+export type DaemonEventId = string;
+export type DaemonEventSequence = number;
+export type DaemonClientId = string;
+export type DaemonClientCapability = "attach_snapshot" | "event_sequence" | "extension_ui";
+export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
+
+export interface DaemonProtocolInfo {
+	name: DaemonProtocolName;
+	version: DaemonProtocolVersion;
+}
+
+export const DAEMON_PROTOCOL_INFO: DaemonProtocolInfo = {
+	name: DAEMON_PROTOCOL_NAME,
+	version: DAEMON_PROTOCOL_VERSION,
+};
+
+export const DAEMON_DEFAULT_CLIENT_CAPABILITIES: readonly DaemonClientCapability[] = [
+	"attach_snapshot",
+	"event_sequence",
+];
+
+export interface DaemonResumeCursor {
+	activeSessionId?: string;
+	eventSequence: DaemonEventSequence;
+}
+
+export interface DaemonAttachClientMetadata {
+	clientId?: DaemonClientId;
+	capabilities?: readonly DaemonClientCapability[];
+	resumeCursor?: DaemonResumeCursor;
+}
+
+export interface DaemonReplayInfo {
+	status: DaemonReplayStatus;
+	fromSequence?: DaemonEventSequence;
+	toSequence: DaemonEventSequence;
+	reason?: string;
+}
+
+export interface DaemonEventMeta {
+	id: DaemonEventId;
+	protocol: DaemonProtocolInfo;
+	activeSessionId?: string;
+	sequence?: DaemonEventSequence;
+	emittedAt: string;
+	replayed?: boolean;
+}
+
+export interface DaemonCommandEnvelope<TCommand extends DaemonCommand = DaemonCommand> {
+	type: "command";
+	id: DaemonCommandId;
+	protocol: DaemonProtocolInfo;
+	clientId?: DaemonClientId;
+	command: TCommand;
+}
+
+export interface DaemonEventEnvelope<TEvent extends DaemonOutbound = DaemonOutbound> {
+	type: "event";
+	id: DaemonEventId;
+	protocol: DaemonProtocolInfo;
+	activeSessionId?: string;
+	sequence?: DaemonEventSequence;
+	emittedAt: string;
+	event: TEvent;
+}
+
+export interface DaemonArtifactReference {
+	id: string;
+	sessionId: string;
+	type: string;
+	logicalPath: string;
+	relativePath?: string;
+	mimeType?: string;
+	metadata?: Record<string, string | number | boolean | null>;
+}
+
+export interface DaemonSessionSnapshot {
+	activeSessionId: string;
+	summary: SessionSummary;
+	state: AgentConnectionState;
+	messages: AgentMessage[];
+	lastEventSequence: DaemonEventSequence;
+	parent?: {
+		activeSessionId?: string;
+		sessionId?: string;
+		nodeId?: string;
+		childId?: string;
+	};
+}
+
+export interface DaemonAttachResult {
+	protocol: DaemonProtocolInfo;
+	activeSessionId: string;
+	state: SessionSummary;
+	messages: AgentMessage[];
+	snapshot: DaemonSessionSnapshot;
+	replay: DaemonReplayInfo;
+	lastEventSequence: DaemonEventSequence;
+	client: {
+		id: DaemonClientId;
+		capabilities: DaemonClientCapability[];
+	};
+}
+
 export type DaemonCommand =
 	| { id?: string; type: "list"; all?: boolean; cwd?: string; sessionDir?: string }
 	| { id?: string; type: "list_saved_sessions"; activeSessionId: string; scope: AgentConnectionSavedSessionScope }
@@ -33,7 +144,12 @@ export type DaemonCommand =
 			name?: string;
 			config?: AgentSessionRuntimeConfig;
 	  }
-	| { id?: string; type: "attach"; activeSessionId: string; supportsExtensionUi?: boolean }
+	| ({
+			id?: string;
+			type: "attach";
+			activeSessionId: string;
+			supportsExtensionUi?: boolean;
+	  } & DaemonAttachClientMetadata)
 	| { id?: string; type: "detach"; activeSessionId?: string }
 	| { id?: string; type: "kill"; activeSessionId: string }
 	| { id?: string; type: "rename"; activeSessionId: string; name: string }
@@ -161,20 +277,127 @@ export type DaemonResourceSnapshot = AgentConnectionResourceSnapshot;
 export type DaemonOutbound =
 	| DaemonResponse
 	| DaemonRequestProgress
-	| { type: "daemon_hello"; socketPath: string }
-	| { type: "session_event"; activeSessionId: string; event: AgentConnectionSessionEvent }
-	| { type: "session_replaced"; activeSessionId: string; state: AgentConnectionState; messages: AgentMessage[] }
-	| { type: "session_attached"; activeSessionId: string; state: SessionSummary; messages: AgentMessage[] }
+	| {
+			type: "daemon_hello";
+			socketPath: string;
+			protocol: DaemonProtocolInfo;
+			clientId: DaemonClientId;
+			serverCapabilities: readonly DaemonClientCapability[];
+	  }
+	| { type: "session_event"; activeSessionId: string; event: AgentConnectionSessionEvent; meta?: DaemonEventMeta }
+	| {
+			type: "session_replaced";
+			activeSessionId: string;
+			state: AgentConnectionState;
+			messages: AgentMessage[];
+			meta?: DaemonEventMeta;
+	  }
+	| {
+			type: "session_attached";
+			activeSessionId: string;
+			state: SessionSummary;
+			messages: AgentMessage[];
+			snapshot?: DaemonSessionSnapshot;
+			replay?: DaemonReplayInfo;
+			lastEventSequence?: DaemonEventSequence;
+	  }
 	| { type: "session_detached"; activeSessionId: string }
-	| { type: "session_closed"; activeSessionId: string; reason: DaemonSessionClosedReason }
+	| { type: "session_closed"; activeSessionId: string; reason: DaemonSessionClosedReason; meta?: DaemonEventMeta }
 	| {
 			type: "extension_ui_request";
 			activeSessionId: string;
 			id: string;
 			method: string;
 			payload: Record<string, unknown>;
+			meta?: DaemonEventMeta;
 	  }
-	| { type: "extension_error"; activeSessionId: string; extensionPath: string; event: string; error: string };
+	| {
+			type: "extension_error";
+			activeSessionId: string;
+			extensionPath: string;
+			event: string;
+			error: string;
+			meta?: DaemonEventMeta;
+	  };
+
+export function createDaemonCommandEnvelope<TCommand extends DaemonCommand>(
+	command: TCommand,
+	id: DaemonCommandId,
+	clientId?: DaemonClientId,
+): DaemonCommandEnvelope<TCommand> {
+	return {
+		type: "command",
+		id,
+		protocol: DAEMON_PROTOCOL_INFO,
+		...(clientId ? { clientId } : {}),
+		command,
+	};
+}
+
+export function createDaemonEventEnvelope<TEvent extends DaemonOutbound>(
+	event: TEvent,
+	meta: DaemonEventMeta,
+): DaemonEventEnvelope<TEvent> {
+	return {
+		type: "event",
+		id: meta.id,
+		protocol: meta.protocol,
+		...(meta.activeSessionId ? { activeSessionId: meta.activeSessionId } : {}),
+		...(meta.sequence !== undefined ? { sequence: meta.sequence } : {}),
+		emittedAt: meta.emittedAt,
+		event,
+	};
+}
+
+export function createDaemonEventMeta(
+	activeSessionId: string,
+	sequence: DaemonEventSequence,
+	emittedAt = new Date().toISOString(),
+): DaemonEventMeta {
+	return {
+		id: `${activeSessionId}:${sequence}`,
+		protocol: DAEMON_PROTOCOL_INFO,
+		activeSessionId,
+		sequence,
+		emittedAt,
+	};
+}
+
+export function createDaemonReplayInfo(
+	resumeCursor: DaemonResumeCursor | undefined,
+	lastEventSequence: DaemonEventSequence,
+): DaemonReplayInfo {
+	if (!resumeCursor) {
+		return {
+			status: "complete",
+			toSequence: lastEventSequence,
+		};
+	}
+
+	if (resumeCursor.eventSequence > lastEventSequence) {
+		return {
+			status: "unavailable",
+			fromSequence: resumeCursor.eventSequence,
+			toSequence: lastEventSequence,
+			reason: "resume_cursor_ahead_of_session",
+		};
+	}
+
+	if (resumeCursor.eventSequence === lastEventSequence) {
+		return {
+			status: "complete",
+			fromSequence: resumeCursor.eventSequence,
+			toSequence: lastEventSequence,
+		};
+	}
+
+	return {
+		status: "unavailable",
+		fromSequence: resumeCursor.eventSequence,
+		toSequence: lastEventSequence,
+		reason: "event_replay_not_available",
+	};
+}
 
 export function success(id: string | undefined, command: DaemonCommandName, data?: unknown): DaemonResponse {
 	return data === undefined

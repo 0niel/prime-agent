@@ -39,11 +39,18 @@ import {
 import { serializeDaemonError } from "./daemon-errors.js";
 import { bindActiveSessionState } from "./daemon-extension-binding.js";
 import {
+	createDaemonEventMeta,
+	createDaemonReplayInfo,
+	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
+	DAEMON_PROTOCOL_INFO,
+	type DaemonAttachResult,
+	type DaemonClientCapability,
 	type DaemonCommand,
 	type DaemonOutbound,
 	type DaemonResponse,
 	type DaemonSavedSessionInfo,
 	type DaemonSessionClosedReason,
+	type DaemonSessionSnapshot,
 	failure,
 	isDaemonDialogExtensionUiRequest,
 	success,
@@ -122,6 +129,14 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"shutdown",
 ]);
 
+const DAEMON_SERVER_CAPABILITIES: readonly DaemonClientCapability[] = [
+	"attach_snapshot",
+	"event_sequence",
+	"extension_ui",
+];
+
+const DAEMON_CLIENT_CAPABILITY_SET: ReadonlySet<string> = new Set(DAEMON_SERVER_CAPABILITIES);
+
 export async function runDaemonMode(initialRuntime: AgentSessionRuntime, options: DaemonModeOptions): Promise<never> {
 	const socketPath = options.socketPath ?? defaultDaemonSocketPath();
 	// main() creates a runtime before dispatching modes. Daemon mode should not
@@ -199,6 +214,7 @@ class AgentDaemon {
 			runtime,
 			clients: new Set(),
 			extensionUiRequests: new Map(),
+			lastEventSequence: 0,
 		};
 		try {
 			await bindActiveSessionState(state, {
@@ -339,9 +355,16 @@ class AgentDaemon {
 			attachedActiveSessionIds: new Set(),
 			detachInput: () => {},
 			supportsExtensionUi: false,
+			capabilities: new Set(DAEMON_DEFAULT_CLIENT_CAPABILITIES),
 		};
 		this.clients.add(client);
-		this.write(client, { type: "daemon_hello", socketPath: this.socketPath });
+		this.write(client, {
+			type: "daemon_hello",
+			socketPath: this.socketPath,
+			protocol: DAEMON_PROTOCOL_INFO,
+			clientId: client.id,
+			serverCapabilities: DAEMON_SERVER_CAPABILITIES,
+		});
 
 		client.detachInput = attachJsonlLineReader(socket, (line) => {
 			void this.handleLine(client, line);
@@ -449,16 +472,24 @@ class AgentDaemon {
 
 			case "attach": {
 				const state = this.getSessionState(command.activeSessionId);
-				client.supportsExtensionUi = command.supportsExtensionUi === true;
+				if (command.clientId) {
+					client.id = command.clientId;
+				}
+				client.capabilities = normalizeClientCapabilities(command.capabilities, command.supportsExtensionUi);
+				client.supportsExtensionUi = client.capabilities.has("extension_ui");
 				state.clients.add(client);
 				client.attachedActiveSessionIds.add(state.activeSessionId);
+				const result = this.createAttachResult(client, state, command);
 				this.write(client, {
 					type: "session_attached",
 					activeSessionId: state.activeSessionId,
-					state: summaryForActiveSession(state),
-					messages: state.runtime.session.messages,
+					state: result.state,
+					messages: result.messages,
+					snapshot: result.snapshot,
+					replay: result.replay,
+					lastEventSequence: result.lastEventSequence,
 				});
-				return success(command.id, "attach", summaryForActiveSession(state));
+				return success(command.id, "attach", result);
 			}
 
 			case "detach": {
@@ -848,6 +879,57 @@ class AgentDaemon {
 		}
 	}
 
+	private createAttachResult(
+		client: DaemonSocketClient,
+		state: ActiveSessionState,
+		command: Extract<DaemonCommand, { type: "attach" }>,
+	): DaemonAttachResult {
+		const snapshot = this.createSessionSnapshot(state);
+		const replay =
+			command.resumeCursor?.activeSessionId && command.resumeCursor.activeSessionId !== state.activeSessionId
+				? {
+						status: "unavailable" as const,
+						fromSequence: command.resumeCursor.eventSequence,
+						toSequence: state.lastEventSequence,
+						reason: "resume_cursor_session_mismatch",
+					}
+				: createDaemonReplayInfo(command.resumeCursor, state.lastEventSequence);
+		return {
+			protocol: DAEMON_PROTOCOL_INFO,
+			activeSessionId: state.activeSessionId,
+			state: snapshot.summary,
+			messages: snapshot.messages,
+			snapshot,
+			replay,
+			lastEventSequence: state.lastEventSequence,
+			client: {
+				id: client.id,
+				capabilities: [...client.capabilities],
+			},
+		};
+	}
+
+	private createSessionSnapshot(state: ActiveSessionState): DaemonSessionSnapshot {
+		const metadata = state.runtime.metadata;
+		const parent =
+			metadata.parentActiveSessionId || metadata.parentSessionId || metadata.rlmParentNodeId || metadata.rlmChildId
+				? {
+						...(metadata.parentActiveSessionId ? { activeSessionId: metadata.parentActiveSessionId } : {}),
+						...(metadata.parentSessionId ? { sessionId: metadata.parentSessionId } : {}),
+						...(metadata.rlmParentNodeId ? { nodeId: metadata.rlmParentNodeId } : {}),
+						...(metadata.rlmChildId ? { childId: metadata.rlmChildId } : {}),
+					}
+				: undefined;
+		return {
+			activeSessionId: state.activeSessionId,
+			summary: summaryForActiveSession(state),
+			state: createAgentConnectionState(state.runtime, state.activeSessionId),
+			messages: state.runtime.session.messages,
+			lastEventSequence: state.lastEventSequence,
+			...(parent ? { parent } : {}),
+		};
+	}
+
 	private detachClientFromSession(client: DaemonSocketClient, state: ActiveSessionState): void {
 		detachClientFromActiveSession(client, state);
 		this.write(client, { type: "session_detached", activeSessionId: state.activeSessionId });
@@ -935,12 +1017,22 @@ class AgentDaemon {
 	}
 
 	private broadcastToSession(state: ActiveSessionState, message: DaemonOutbound): void {
+		const sequencedMessage = this.addSessionEventMeta(state, message);
 		for (const client of state.clients) {
-			if (!shouldSendDaemonOutboundToClient(client, message)) {
+			if (!shouldSendDaemonOutboundToClient(client, sequencedMessage)) {
 				continue;
 			}
-			this.write(client, message);
+			this.write(client, sequencedMessage);
 		}
+	}
+
+	private addSessionEventMeta(state: ActiveSessionState, message: DaemonOutbound): DaemonOutbound {
+		if (!isSequencedSessionOutbound(message) || message.meta) {
+			return message;
+		}
+		const meta = createDaemonEventMeta(state.activeSessionId, state.lastEventSequence + 1);
+		state.lastEventSequence = meta.sequence ?? state.lastEventSequence;
+		return { ...message, meta };
 	}
 
 	private write(client: DaemonSocketClient, message: DaemonOutbound): void {
@@ -1037,6 +1129,39 @@ export function cancelPendingExtensionUiRequests(state: ActiveSessionState): voi
 	for (const pending of pendingRequests) {
 		pending.resolve({ cancelled: true });
 	}
+}
+
+function normalizeClientCapabilities(
+	capabilities: readonly DaemonClientCapability[] | undefined,
+	supportsExtensionUi: boolean | undefined,
+): Set<DaemonClientCapability> {
+	const normalized = new Set<DaemonClientCapability>();
+	for (const capability of capabilities ?? DAEMON_DEFAULT_CLIENT_CAPABILITIES) {
+		if (DAEMON_CLIENT_CAPABILITY_SET.has(capability)) {
+			normalized.add(capability);
+		}
+	}
+	if (supportsExtensionUi) {
+		normalized.add("extension_ui");
+	}
+	return normalized;
+}
+
+type SequencedDaemonOutbound = Extract<
+	DaemonOutbound,
+	{
+		type: "session_event" | "session_replaced" | "session_closed" | "extension_ui_request" | "extension_error";
+	}
+>;
+
+function isSequencedSessionOutbound(message: DaemonOutbound): message is SequencedDaemonOutbound {
+	return (
+		message.type === "session_event" ||
+		message.type === "session_replaced" ||
+		message.type === "session_closed" ||
+		message.type === "extension_ui_request" ||
+		message.type === "extension_error"
+	);
 }
 
 export function shouldSendDaemonOutboundToClient(client: DaemonSocketClient, message: DaemonOutbound): boolean {

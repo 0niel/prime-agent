@@ -10,7 +10,13 @@ import type {
 	DaemonClientMessageListener,
 	DaemonClientRequestOptions,
 } from "../src/modes/daemon/daemon-client.js";
-import type { DaemonCommand, DaemonOutbound, DaemonResponse } from "../src/modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_PROTOCOL_INFO,
+	type DaemonAttachResult,
+	type DaemonCommand,
+	type DaemonOutbound,
+	type DaemonResponse,
+} from "../src/modes/daemon/daemon-protocol.js";
 
 class FakeDaemonClient {
 	readonly requests: DaemonCommand[] = [];
@@ -38,12 +44,7 @@ class FakeDaemonClient {
 					type: "response",
 					command: command.type,
 					success: true,
-					data: {
-						id: "active-1",
-						activeSessionId: "active-1",
-						status: "idle",
-						isStreaming: false,
-					},
+					data: createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12),
 				};
 			case "get_queue":
 				return {
@@ -301,6 +302,51 @@ function createConnectionState(activeSessionId: string, sessionId: string): Agen
 	};
 }
 
+function createAttachResult(
+	activeSessionId: string,
+	clientId: string | undefined,
+	capabilities: readonly string[] | undefined,
+	lastEventSequence: number,
+): DaemonAttachResult {
+	const summary = {
+		id: activeSessionId,
+		activeSessionId,
+		status: "idle" as const,
+		sessionId: "session-current",
+		cwd: "/tmp/project",
+		isStreaming: false,
+		isCompacting: false,
+		attachedClients: 1,
+		messageCount: 0,
+		pendingMessageCount: 0,
+	};
+	return {
+		protocol: DAEMON_PROTOCOL_INFO,
+		activeSessionId,
+		state: summary,
+		messages: [],
+		snapshot: {
+			activeSessionId,
+			summary,
+			state: createConnectionState(activeSessionId, "session-current"),
+			messages: [],
+			lastEventSequence,
+		},
+		replay: {
+			status: "complete",
+			toSequence: lastEventSequence,
+		},
+		lastEventSequence,
+		client: {
+			id: clientId ?? "client-1",
+			capabilities: (capabilities ?? ["attach_snapshot", "event_sequence"]).filter(
+				(capability): capability is DaemonAttachResult["client"]["capabilities"][number] =>
+					capability === "attach_snapshot" || capability === "event_sequence" || capability === "extension_ui",
+			),
+		},
+	};
+}
+
 describe("DaemonAgentConnection", () => {
 	it("loads connection state and forwards replacement snapshots through the daemon protocol", async () => {
 		const fakeClient = new FakeDaemonClient();
@@ -481,6 +527,13 @@ describe("DaemonAgentConnection", () => {
 				steering: ["interrupt"],
 				followUp: ["later"],
 			},
+			meta: {
+				id: "active-1:14",
+				protocol: DAEMON_PROTOCOL_INFO,
+				activeSessionId: "active-1",
+				sequence: 14,
+				emittedAt: "2026-01-01T00:00:00.000Z",
+			},
 		});
 		fakeClient.emitMessage({
 			type: "session_event",
@@ -502,6 +555,28 @@ describe("DaemonAgentConnection", () => {
 				},
 			},
 		]);
+
+		await connection.attach();
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "attach",
+			activeSessionId: "active-1",
+			clientId: expect.any(String),
+			capabilities: ["attach_snapshot", "event_sequence", "extension_ui"],
+			resumeCursor: {
+				activeSessionId: "active-1",
+				eventSequence: 14,
+			},
+		});
+
+		await connection.attach();
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "attach",
+			activeSessionId: "active-1",
+			resumeCursor: {
+				activeSessionId: "active-1",
+				eventSequence: 14,
+			},
+		});
 	});
 
 	it("forwards extension UI requests and responses", async () => {
@@ -516,6 +591,8 @@ describe("DaemonAgentConnection", () => {
 			type: "attach",
 			activeSessionId: "active-1",
 			supportsExtensionUi: true,
+			clientId: expect.any(String),
+			capabilities: ["attach_snapshot", "event_sequence", "extension_ui"],
 		});
 
 		fakeClient.emitMessage({

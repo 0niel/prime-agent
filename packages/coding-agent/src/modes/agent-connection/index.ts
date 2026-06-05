@@ -3,6 +3,8 @@ export { InProcessAgentConnection } from "./in-process-agent-connection.js";
 export { createAgentConnectionCommands, createAgentConnectionState } from "./snapshot.js";
 export type {
 	AgentConnection,
+	AgentConnectionArtifactReference,
+	AgentConnectionArtifactType,
 	AgentConnectionBeforeSessionInvalidateListener,
 	AgentConnectionBranchSummaryEntry,
 	AgentConnectionChildUsageAttributionEntry,

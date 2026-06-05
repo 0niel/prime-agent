@@ -245,8 +245,20 @@ export interface AgentConnectionSlashCommand {
 	sourceInfo: AgentConnectionSourceInfo;
 }
 
+export type AgentConnectionArtifactType = "context_file" | "extension" | "prompt" | "skill" | "theme";
+
+export interface AgentConnectionArtifactReference {
+	id: string;
+	sessionId: string;
+	type: AgentConnectionArtifactType;
+	logicalPath: string;
+	relativePath?: string;
+	mimeType?: string;
+}
+
 export interface AgentConnectionResourceContextFile {
 	path: string;
+	artifact?: AgentConnectionArtifactReference;
 }
 
 export interface AgentConnectionResourceSkill {
@@ -254,6 +266,7 @@ export interface AgentConnectionResourceSkill {
 	description?: string;
 	filePath: string;
 	sourceInfo?: AgentConnectionSourceInfo;
+	artifact?: AgentConnectionArtifactReference;
 }
 
 export interface AgentConnectionResourcePrompt {
@@ -262,17 +275,20 @@ export interface AgentConnectionResourcePrompt {
 	argumentHint?: string;
 	filePath: string;
 	sourceInfo?: AgentConnectionSourceInfo;
+	artifact?: AgentConnectionArtifactReference;
 }
 
 export interface AgentConnectionResourceExtension {
 	path: string;
 	sourceInfo?: AgentConnectionSourceInfo;
+	artifact?: AgentConnectionArtifactReference;
 }
 
 export interface AgentConnectionResourceTheme {
 	name?: string;
 	sourcePath?: string;
 	sourceInfo?: AgentConnectionSourceInfo;
+	artifact?: AgentConnectionArtifactReference;
 }
 
 export interface AgentConnectionResourceDiagnostics {

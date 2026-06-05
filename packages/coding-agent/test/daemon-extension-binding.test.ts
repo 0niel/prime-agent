@@ -142,6 +142,7 @@ describe("daemon extension binding", () => {
 			runtime,
 			clients: new Set(),
 			extensionUiRequests: new Map(),
+			lastEventSequence: 0,
 		};
 		await bindActiveSessionState(state, {
 			broadcast: (_state, message) => {

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Transport } from "@earendil-works/pi-ai";
 import type { CompactionResult } from "../../core/compaction/index.js";
@@ -6,6 +7,7 @@ import type { SessionStats } from "../../core/session-stats.js";
 import type { DaemonClient } from "../daemon/daemon-client.js";
 import { deserializeDaemonError } from "../daemon/daemon-errors.js";
 import type {
+	DaemonAttachResult,
 	DaemonCommand,
 	DaemonDeleteSavedSessionResult,
 	DaemonOutbound,
@@ -58,6 +60,8 @@ export class DaemonAgentConnection implements AgentConnection {
 	private readonly listeners = new Set<AgentConnectionEventListener>();
 	private readonly unsubscribeDaemonMessages: () => void;
 	private readonly unsubscribeDaemonClose: () => void;
+	private readonly clientId = `daemon-agent-connection:${randomUUID()}`;
+	private lastEventSequence: number | undefined;
 
 	constructor(
 		private readonly client: DaemonClient,
@@ -88,12 +92,22 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async attach(): Promise<void> {
-		const summary = await this.requestData<SessionSummary>({
+		const result = await this.requestData<SessionSummary | DaemonAttachResult>({
 			type: "attach",
 			activeSessionId: this.activeSessionId,
 			supportsExtensionUi: true,
+			clientId: this.clientId,
+			capabilities: ["attach_snapshot", "event_sequence", "extension_ui"],
+			resumeCursor:
+				this.lastEventSequence === undefined
+					? undefined
+					: {
+							activeSessionId: this.activeSessionId,
+							eventSequence: this.lastEventSequence,
+						},
 		});
-		this.activeSessionId = summary.activeSessionId ?? summary.id;
+		this.activeSessionId = getAttachActiveSessionId(result);
+		this.lastEventSequence = maxEventSequence(this.lastEventSequence, getAttachLastEventSequence(result));
 	}
 
 	subscribe(listener: AgentConnectionEventListener): () => void {
@@ -472,6 +486,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (!this.isMessageForActiveSession(message)) {
 			return;
 		}
+		this.observeDaemonEventSequence(message);
 
 		if (message.type === "session_event") {
 			await this.emit({ type: "session_event", event: message.event });
@@ -504,11 +519,45 @@ export class DaemonAgentConnection implements AgentConnection {
 		return message.activeSessionId === this.activeSessionId;
 	}
 
+	private observeDaemonEventSequence(message: DaemonOutbound): void {
+		if (!("meta" in message) || message.meta?.sequence === undefined) {
+			return;
+		}
+		this.lastEventSequence =
+			this.lastEventSequence === undefined
+				? message.meta.sequence
+				: Math.max(this.lastEventSequence, message.meta.sequence);
+	}
+
 	private async emit(event: AgentConnectionEvent): Promise<void> {
 		for (const listener of [...this.listeners]) {
 			await listener(event);
 		}
 	}
+}
+
+function getAttachActiveSessionId(result: SessionSummary | DaemonAttachResult): string {
+	if ("snapshot" in result) {
+		return result.activeSessionId;
+	}
+	return result.activeSessionId ?? result.id;
+}
+
+function getAttachLastEventSequence(result: SessionSummary | DaemonAttachResult): number | undefined {
+	if ("lastEventSequence" in result) {
+		return result.lastEventSequence;
+	}
+	return undefined;
+}
+
+function maxEventSequence(current: number | undefined, observed: number | undefined): number | undefined {
+	if (current === undefined) {
+		return observed;
+	}
+	if (observed === undefined) {
+		return current;
+	}
+	return Math.max(current, observed);
 }
 
 function deserializeSavedSessionInfo(session: DaemonSavedSessionInfo): AgentConnectionSavedSessionInfo {

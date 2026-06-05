@@ -1,7 +1,11 @@
+import { createHash } from "node:crypto";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { AgentSession } from "../../core/agent-session.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type {
+	AgentConnectionArtifactReference,
+	AgentConnectionArtifactType,
 	AgentConnectionModel,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionSlashCommand,
@@ -78,12 +82,14 @@ export function createAgentConnectionResourceSnapshot(session: AgentSession): Ag
 	return {
 		contextFiles: session.resourceLoader.getAgentsFiles().agentsFiles.map((entry) => ({
 			path: entry.path,
+			artifact: createArtifactReference(session, "context_file", entry.path),
 		})),
 		skills: skillsResult.skills.map((skill) => ({
 			name: skill.name,
 			description: skill.description,
 			filePath: skill.filePath,
 			sourceInfo: skill.sourceInfo,
+			artifact: createArtifactReference(session, "skill", skill.filePath),
 		})),
 		prompts: promptsResult.prompts.map((prompt) => ({
 			name: prompt.name,
@@ -91,15 +97,18 @@ export function createAgentConnectionResourceSnapshot(session: AgentSession): Ag
 			argumentHint: prompt.argumentHint,
 			filePath: prompt.filePath,
 			sourceInfo: prompt.sourceInfo,
+			artifact: createArtifactReference(session, "prompt", prompt.filePath),
 		})),
 		extensions: extensionsResult.extensions.map((extension) => ({
 			path: extension.path,
 			sourceInfo: extension.sourceInfo,
+			artifact: createArtifactReference(session, "extension", extension.path),
 		})),
 		themes: themesResult.themes.map((loadedTheme) => ({
 			name: loadedTheme.name,
 			sourcePath: loadedTheme.sourcePath,
 			sourceInfo: loadedTheme.sourceInfo,
+			artifact: createArtifactReference(session, "theme", loadedTheme.sourcePath),
 		})),
 		diagnostics: {
 			skills: skillsResult.diagnostics,
@@ -118,4 +127,42 @@ export function toConnectionModel(model: Model<Api>): AgentConnectionModel;
 export function toConnectionModel(model: Model<Api> | undefined): AgentConnectionModel | undefined;
 export function toConnectionModel(model: Model<Api> | undefined): AgentConnectionModel | undefined {
 	return model;
+}
+
+function createArtifactReference(
+	session: AgentSession,
+	type: AgentConnectionArtifactType,
+	filePath: string | undefined,
+): AgentConnectionArtifactReference | undefined {
+	if (!filePath) {
+		return undefined;
+	}
+	const { logicalPath, relativePath } = createArtifactPathInfo(filePath, session.sessionManager.getCwd());
+	const idHash = createHash("sha256").update(`${session.sessionId}\0${type}\0${filePath}`).digest("hex").slice(0, 16);
+	return {
+		id: `artifact_${idHash}`,
+		sessionId: session.sessionId,
+		type,
+		logicalPath,
+		...(relativePath ? { relativePath } : {}),
+	};
+}
+
+function createArtifactPathInfo(filePath: string, cwd: string): { logicalPath: string; relativePath?: string } {
+	if (filePath.startsWith("<") && filePath.endsWith(">")) {
+		return { logicalPath: filePath };
+	}
+
+	const resolvedCwd = resolve(cwd);
+	const resolvedPath = resolve(filePath);
+	const cwdRelativePath = toPosixPath(relative(resolvedCwd, resolvedPath));
+	if (cwdRelativePath && !cwdRelativePath.startsWith("..") && !isAbsolute(cwdRelativePath)) {
+		return { logicalPath: cwdRelativePath, relativePath: cwdRelativePath };
+	}
+
+	return { logicalPath: basename(filePath) || "artifact" };
+}
+
+function toPosixPath(path: string): string {
+	return sep === "/" ? path : path.split(sep).join("/");
 }

@@ -89,6 +89,7 @@ function makeState(activeSessionId: string, parentActiveSessionId?: string): Act
 	return {
 		activeSessionId,
 		clients: new Set(),
+		lastEventSequence: 0,
 		runtime: {
 			metadata: {
 				kind: "subagent",
@@ -106,5 +107,6 @@ function makeClient(id: string, activeSessionId: string, supportsExtensionUi = f
 		attachedActiveSessionIds: new Set([activeSessionId]),
 		detachInput: vi.fn(),
 		supportsExtensionUi,
+		capabilities: new Set(supportsExtensionUi ? ["extension_ui"] : []),
 	};
 }
