@@ -39,14 +39,14 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 	private mode: "login" | "logout";
 	private authStorage: AuthStorage;
 	private getAuthStatus: (providerId: string) => AuthStatus;
-	private onSelectCallback: (providerId: string) => void;
+	private onSelectCallback: (provider: AuthSelectorProvider) => void;
 	private onCancelCallback: () => void;
 
 	constructor(
 		mode: "login" | "logout",
 		authStorage: AuthStorage,
 		providers: AuthSelectorProvider[],
-		onSelect: (providerId: string) => void,
+		onSelect: (provider: AuthSelectorProvider) => void,
 		onCancel: () => void,
 		getAuthStatus?: (providerId: string) => AuthStatus,
 	) {
@@ -70,7 +70,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		this.searchInput.onSubmit = () => {
 			const selectedProvider = this.filteredProviders[this.selectedIndex];
 			if (selectedProvider) {
-				this.onSelectCallback(selectedProvider.id);
+				this.onSelectCallback(selectedProvider);
 			}
 		};
 		panel.addChild(this.searchInput);
@@ -202,7 +202,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		else if (kb.matches(keyData, "tui.select.confirm")) {
 			const selectedProvider = this.filteredProviders[this.selectedIndex];
 			if (selectedProvider) {
-				this.onSelectCallback(selectedProvider.id);
+				this.onSelectCallback(selectedProvider);
 			}
 		}
 		// Escape or Ctrl+C

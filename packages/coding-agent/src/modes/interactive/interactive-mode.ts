@@ -82,6 +82,7 @@ import { createCompactionSummaryMessage } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScope } from "../../core/model-resolver.js";
 import { DefaultPackageManager } from "../../core/package-manager.js";
 import {
+	checkPrimeInferenceAccess,
 	fetchPrimeTeams,
 	loadPrimeCliConfig,
 	loginPrimeInference,
@@ -5328,19 +5329,13 @@ export class InteractiveMode {
 				"login",
 				this.session.modelRegistry.authStorage,
 				providerOptions,
-				async (providerId: string) => {
+				async (providerOption: AuthSelectorProvider) => {
 					close();
-
-					const providerOption = providerOptions.find((provider) => provider.id === providerId);
-					if (!providerOption) {
-						resolve({ status: "failed" });
-						return;
-					}
 
 					if (providerOption.authType === "oauth") {
 						resolve(await this.showLoginDialog(providerOption.id, providerOption.name));
 					} else if (providerOption.id === PRIME_INFERENCE_PROVIDER_ID) {
-						resolve(await this.showPrimeInferenceLoginDialog());
+						resolve(await this.showPrimeInferenceApiKeyLoginDialog());
 					} else if (providerOption.id === BEDROCK_PROVIDER_ID) {
 						resolve(await this.showBedrockSetupDialog(providerOption.id, providerOption.name));
 					} else {
@@ -5379,13 +5374,8 @@ export class InteractiveMode {
 				mode,
 				this.session.modelRegistry.authStorage,
 				providerOptions,
-				async (providerId: string) => {
+				async (providerOption: AuthSelectorProvider) => {
 					done();
-
-					const providerOption = providerOptions.find((provider) => provider.id === providerId);
-					if (!providerOption) {
-						return;
-					}
 
 					try {
 						this.session.modelRegistry.authStorage.logout(providerOption.id);
@@ -5638,6 +5628,69 @@ export class InteractiveMode {
 			const errorMsg = error instanceof Error ? error.message : String(error);
 			if (errorMsg !== "Login cancelled") {
 				this.showError(`Failed to login to ${PRIME_INFERENCE_PROVIDER_NAME}: ${errorMsg}`);
+				return { status: "failed" };
+			}
+			return { status: "cancelled" };
+		}
+	}
+
+	private async showPrimeInferenceApiKeyLoginDialog(): Promise<AuthenticationResult> {
+		const dialog = new LoginDialogComponent(
+			this.ui,
+			PRIME_INFERENCE_PROVIDER_ID,
+			(_success, _message) => {
+				// Completion handled below
+			},
+			PRIME_INFERENCE_PROVIDER_NAME,
+		);
+
+		const handle = this.showFullPaneOverlay(dialog, 88);
+
+		const closeDialog = () => {
+			handle.hide();
+			this.ui.requestRender();
+		};
+
+		try {
+			const apiKey = (await dialog.showPrompt("Enter API key:")).trim();
+			if (!apiKey) {
+				throw new Error("API key cannot be empty.");
+			}
+
+			dialog.showProgress("Checking Prime Inference access...");
+			const config = loadPrimeCliConfig();
+			const access = await checkPrimeInferenceAccess(apiKey, config.baseUrl, { signal: dialog.signal });
+			if (dialog.signal.aborted) {
+				closeDialog();
+				return { status: "cancelled" };
+			}
+			if (!access.ok) {
+				const status = access.status === undefined ? "" : `HTTP ${access.status}: `;
+				throw new Error(`Prime API key does not have Prime Inference access (${status}${access.message})`);
+			}
+
+			const previousPrimeCredential = this.session.modelRegistry.authStorage.get(PRIME_INFERENCE_PROVIDER_ID);
+			const previousPrimeTeam =
+				previousPrimeCredential?.type === "api_key" ? previousPrimeCredential.primeTeam : undefined;
+			this.session.modelRegistry.authStorage.set(PRIME_INFERENCE_PROVIDER_ID, {
+				type: "api_key",
+				key: apiKey,
+				...(previousPrimeTeam !== undefined ? { primeTeam: previousPrimeTeam } : {}),
+			});
+			const teamStatus = await this.selectPrimeInferenceTeam(apiKey, dialog);
+
+			closeDialog();
+			return await this.completeProviderAuthentication(
+				PRIME_INFERENCE_PROVIDER_ID,
+				PRIME_INFERENCE_PROVIDER_NAME,
+				"api_key",
+				teamStatus,
+			);
+		} catch (error: unknown) {
+			closeDialog();
+			const errorMsg = error instanceof Error ? error.message : String(error);
+			if (errorMsg !== "Login cancelled") {
+				this.showError(`Failed to save API key for ${PRIME_INFERENCE_PROVIDER_NAME}: ${errorMsg}`);
 				return { status: "failed" };
 			}
 			return { status: "cancelled" };

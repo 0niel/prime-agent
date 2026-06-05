@@ -59,6 +59,28 @@ describe("OAuthSelectorComponent", () => {
 		]);
 	});
 
+	it("preserves auth type when selecting duplicate provider ids", () => {
+		const authStorage = AuthStorage.inMemory();
+		const selections: string[] = [];
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			[
+				{ id: "anthropic", name: "Anthropic", authType: "oauth" },
+				{ id: "anthropic", name: "Anthropic", authType: "api_key" },
+			],
+			(provider) => {
+				selections.push(`${provider.id}:${provider.authType}`);
+			},
+			() => {},
+		);
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\r");
+
+		expect(selections).toEqual(["anthropic:api_key"]);
+	});
+
 	it("shows configured providers before unconfigured providers", () => {
 		process.env.OPENAI_API_KEY = "test-openai-key";
 		const authStorage = AuthStorage.inMemory();
