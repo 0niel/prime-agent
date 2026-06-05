@@ -11,7 +11,9 @@ import type {
 	DaemonCommand,
 	DaemonDeleteSavedSessionResult,
 	DaemonOutbound,
+	DaemonReplayInfo,
 	DaemonSavedSessionInfo,
+	DaemonSessionSnapshot,
 } from "../daemon/daemon-protocol.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
 import type {
@@ -37,6 +39,7 @@ import type {
 	AgentConnectionSessionListProgress,
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSlashCommand,
+	AgentConnectionSnapshot,
 	AgentConnectionState,
 	AgentConnectionSwitchSessionOptions,
 	AgentConnectionToolDefinition,
@@ -62,6 +65,8 @@ export class DaemonAgentConnection implements AgentConnection {
 	private readonly unsubscribeDaemonClose: () => void;
 	private readonly clientId = `daemon-agent-connection:${randomUUID()}`;
 	private lastEventSequence: number | undefined;
+	private latestSnapshot: AgentConnectionSnapshot | undefined;
+	private latestSnapshotIsFresh = false;
 
 	constructor(
 		private readonly client: DaemonClient,
@@ -108,6 +113,16 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 		this.activeSessionId = getAttachActiveSessionId(result);
 		this.lastEventSequence = maxEventSequence(this.lastEventSequence, getAttachLastEventSequence(result));
+		if ("snapshot" in result) {
+			this.latestSnapshot = mapDaemonAttachSnapshot(result);
+			if (this.lastEventSequence !== undefined) {
+				this.latestSnapshot.lastEventSequence = this.lastEventSequence;
+			}
+			this.latestSnapshotIsFresh = true;
+		} else {
+			this.latestSnapshot = undefined;
+			this.latestSnapshotIsFresh = false;
+		}
 	}
 
 	subscribe(listener: AgentConnectionEventListener): () => void {
@@ -122,13 +137,54 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getState(): Promise<AgentConnectionState> {
+		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
+			return this.latestSnapshot.state;
+		}
 		return this.requestData<AgentConnectionState>({
 			type: "get_connection_state",
 			activeSessionId: this.activeSessionId,
 		});
 	}
 
+	async getInitialSnapshot(): Promise<AgentConnectionSnapshot> {
+		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
+			return this.latestSnapshot;
+		}
+		const [state, messagesData, sessionContextData, sessionTree] = await Promise.all([
+			this.requestData<AgentConnectionState>({
+				type: "get_connection_state",
+				activeSessionId: this.activeSessionId,
+			}),
+			this.requestData<{ messages: AgentMessage[] }>({
+				type: "get_messages",
+				activeSessionId: this.activeSessionId,
+			}),
+			this.requestData<{ context: AgentConnectionSessionContext }>({
+				type: "get_session_context",
+				activeSessionId: this.activeSessionId,
+			}),
+			this.requestData<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }>({
+				type: "get_session_tree",
+				activeSessionId: this.activeSessionId,
+			}),
+		]);
+		this.latestSnapshot = {
+			state,
+			messages: messagesData.messages,
+			sessionContext: sessionContextData.context,
+			sessionTree,
+		};
+		if (this.lastEventSequence !== undefined) {
+			this.latestSnapshot.lastEventSequence = this.lastEventSequence;
+		}
+		this.latestSnapshotIsFresh = true;
+		return this.latestSnapshot;
+	}
+
 	async getMessages(): Promise<AgentMessage[]> {
+		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
+			return this.latestSnapshot.messages;
+		}
 		const data = await this.requestData<{ messages: AgentMessage[] }>({
 			type: "get_messages",
 			activeSessionId: this.activeSessionId,
@@ -167,6 +223,9 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getSessionContext(): Promise<AgentConnectionSessionContext> {
+		if (this.latestSnapshotIsFresh && this.latestSnapshot?.sessionContext) {
+			return this.latestSnapshot.sessionContext;
+		}
 		const data = await this.requestData<{ context: AgentConnectionSessionContext }>({
 			type: "get_session_context",
 			activeSessionId: this.activeSessionId,
@@ -175,6 +234,9 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }> {
+		if (this.latestSnapshotIsFresh && this.latestSnapshot?.sessionTree) {
+			return this.latestSnapshot.sessionTree;
+		}
 		return this.requestData<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }>({
 			type: "get_session_tree",
 			activeSessionId: this.activeSessionId,
@@ -479,6 +541,9 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (!response.success) {
 			throw deserializeDaemonError(response);
 		}
+		if (invalidatesCachedSnapshot(command.type)) {
+			this.latestSnapshotIsFresh = false;
+		}
 		return response.data as T;
 	}
 
@@ -486,13 +551,26 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (!this.isMessageForActiveSession(message)) {
 			return;
 		}
+		if (this.isStaleSequencedMessage(message)) {
+			return;
+		}
 		this.observeDaemonEventSequence(message);
 
 		if (message.type === "session_event") {
+			this.latestSnapshotIsFresh = false;
 			await this.emit({ type: "session_event", event: message.event });
 			return;
 		}
 		if (message.type === "session_replaced") {
+			const latestSnapshot: AgentConnectionSnapshot = {
+				state: message.state,
+				messages: message.messages,
+			};
+			if (this.lastEventSequence !== undefined) {
+				latestSnapshot.lastEventSequence = this.lastEventSequence;
+			}
+			this.latestSnapshot = latestSnapshot;
+			this.latestSnapshotIsFresh = true;
 			await this.emit({ type: "session_replaced", state: message.state, messages: message.messages });
 			return;
 		}
@@ -519,14 +597,18 @@ export class DaemonAgentConnection implements AgentConnection {
 		return message.activeSessionId === this.activeSessionId;
 	}
 
+	private isStaleSequencedMessage(message: DaemonOutbound): boolean {
+		const sequence = getDaemonMessageSequence(message);
+		return sequence !== undefined && this.lastEventSequence !== undefined && sequence <= this.lastEventSequence;
+	}
+
 	private observeDaemonEventSequence(message: DaemonOutbound): void {
-		if (!("meta" in message) || message.meta?.sequence === undefined) {
+		const sequence = getDaemonMessageSequence(message);
+		if (sequence === undefined) {
 			return;
 		}
 		this.lastEventSequence =
-			this.lastEventSequence === undefined
-				? message.meta.sequence
-				: Math.max(this.lastEventSequence, message.meta.sequence);
+			this.lastEventSequence === undefined ? sequence : Math.max(this.lastEventSequence, sequence);
 	}
 
 	private async emit(event: AgentConnectionEvent): Promise<void> {
@@ -558,6 +640,66 @@ function maxEventSequence(current: number | undefined, observed: number | undefi
 		return current;
 	}
 	return Math.max(current, observed);
+}
+
+function mapDaemonAttachSnapshot(result: DaemonAttachResult): AgentConnectionSnapshot {
+	return mapDaemonSessionSnapshot(result.snapshot, result.replay);
+}
+
+function mapDaemonSessionSnapshot(snapshot: DaemonSessionSnapshot, replay?: DaemonReplayInfo): AgentConnectionSnapshot {
+	const connectionSnapshot: AgentConnectionSnapshot = {
+		state: snapshot.state,
+		messages: snapshot.messages,
+		lastEventSequence: snapshot.lastEventSequence,
+	};
+	if (snapshot.sessionContext) {
+		connectionSnapshot.sessionContext = snapshot.sessionContext;
+	}
+	if (snapshot.sessionTree) {
+		connectionSnapshot.sessionTree = snapshot.sessionTree;
+	}
+	if (snapshot.parent) {
+		connectionSnapshot.parent = snapshot.parent;
+	}
+	if (replay) {
+		connectionSnapshot.replay = replay;
+	}
+	return connectionSnapshot;
+}
+
+function getDaemonMessageSequence(message: DaemonOutbound): number | undefined {
+	if (!("meta" in message)) {
+		return undefined;
+	}
+	return message.meta?.sequence;
+}
+
+function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): boolean {
+	switch (commandType) {
+		case "attach":
+		case "detach":
+		case "list":
+		case "list_saved_sessions":
+		case "wait_for_idle":
+		case "get_state":
+		case "get_connection_state":
+		case "get_messages":
+		case "get_session_stats":
+		case "get_commands":
+		case "get_resource_snapshot":
+		case "get_available_models":
+		case "get_queue":
+		case "get_session_context":
+		case "get_session_tree":
+		case "get_user_messages_for_forking":
+		case "get_last_assistant_text":
+		case "get_tool_definition":
+		case "export_html":
+		case "export_jsonl":
+			return false;
+		default:
+			return true;
+	}
 }
 
 function deserializeSavedSessionInfo(session: DaemonSavedSessionInfo): AgentConnectionSavedSessionInfo {

@@ -199,6 +199,32 @@ export interface AgentConnectionSessionContext {
 	model: { provider: string; modelId: string } | null;
 }
 
+export type AgentConnectionReplayStatus = "complete" | "partial" | "unavailable";
+
+export interface AgentConnectionReplayInfo {
+	status: AgentConnectionReplayStatus;
+	fromSequence?: number;
+	toSequence: number;
+	reason?: string;
+}
+
+export interface AgentConnectionParentMetadata {
+	activeSessionId?: string;
+	sessionId?: string;
+	nodeId?: string;
+	childId?: string;
+}
+
+export interface AgentConnectionSnapshot {
+	state: AgentConnectionState;
+	messages: AgentMessage[];
+	sessionContext?: AgentConnectionSessionContext;
+	sessionTree?: { tree: AgentConnectionSessionTreeNode[]; leafId: string | null };
+	parent?: AgentConnectionParentMetadata;
+	lastEventSequence?: number;
+	replay?: AgentConnectionReplayInfo;
+}
+
 export interface AgentConnectionScopedModel {
 	model: AgentConnectionModel;
 	thinkingLevel?: ThinkingLevel;
@@ -458,6 +484,7 @@ export interface AgentConnection {
 	onBeforeSessionInvalidate(listener: AgentConnectionBeforeSessionInvalidateListener): () => void;
 
 	getState(): Promise<AgentConnectionState>;
+	getInitialSnapshot(): Promise<AgentConnectionSnapshot>;
 	getMessages(): Promise<AgentMessage[]>;
 	getCommands(): Promise<AgentConnectionSlashCommand[]>;
 	getResourceSnapshot(): Promise<AgentConnectionResourceSnapshot>;

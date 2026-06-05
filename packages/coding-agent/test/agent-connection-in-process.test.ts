@@ -75,6 +75,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 			getSessionDir: () => "/tmp/prime-agent-sessions",
 			getLeafId: () => `${id}-leaf`,
 			getEntries: () => [],
+			getTree: () => [],
 			buildSessionContext: () => ({
 				messages,
 				thinkingLevel,
@@ -164,6 +165,36 @@ describe("InProcessAgentConnection", () => {
 			thinkingLevel: "medium",
 			model: null,
 		});
+	});
+
+	it("builds initial snapshots from the current runtime", async () => {
+		const messages = [userMessage("snapshot context", 1)];
+		const session = createFakeSession("snapshot", messages);
+		const runtime = new FakeRuntime(session.session);
+		const connection = new InProcessAgentConnection(asRuntime(runtime));
+
+		const snapshot = await connection.getInitialSnapshot();
+
+		expect(snapshot).toMatchObject({
+			state: {
+				cwd: "/tmp/snapshot",
+				sessionId: "snapshot",
+				messageCount: 1,
+				leafId: "snapshot-leaf",
+			},
+			messages: [userMessage("snapshot context", 1)],
+			sessionContext: {
+				messages: [userMessage("snapshot context", 1)],
+				thinkingLevel: "medium",
+				model: null,
+			},
+			sessionTree: {
+				tree: [],
+				leafId: "snapshot-leaf",
+			},
+		});
+		messages.push(userMessage("later context", 2));
+		expect(snapshot.messages).toEqual([userMessage("snapshot context", 1)]);
 	});
 
 	it("emits replacement snapshots and rebinds events when the runtime replaces its session", async () => {

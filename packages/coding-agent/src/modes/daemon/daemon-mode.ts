@@ -911,6 +911,7 @@ class AgentDaemon {
 
 	private createSessionSnapshot(state: ActiveSessionState): DaemonSessionSnapshot {
 		const metadata = state.runtime.metadata;
+		const sessionManager = state.runtime.session.sessionManager;
 		const parent =
 			metadata.parentActiveSessionId || metadata.parentSessionId || metadata.rlmParentNodeId || metadata.rlmChildId
 				? {
@@ -925,6 +926,11 @@ class AgentDaemon {
 			summary: summaryForActiveSession(state),
 			state: createAgentConnectionState(state.runtime, state.activeSessionId),
 			messages: state.runtime.session.messages,
+			sessionContext: sessionManager.buildSessionContext(),
+			sessionTree: {
+				tree: sessionManager.getTree(),
+				leafId: sessionManager.getLeafId(),
+			},
 			lastEventSequence: state.lastEventSequence,
 			...(parent ? { parent } : {}),
 		};

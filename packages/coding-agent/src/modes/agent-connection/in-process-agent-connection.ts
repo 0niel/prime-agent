@@ -9,6 +9,7 @@ import type { SessionStats } from "../../core/session-stats.js";
 import {
 	createAgentConnectionCommands,
 	createAgentConnectionResourceSnapshot,
+	createAgentConnectionSnapshot,
 	createAgentConnectionState,
 } from "./snapshot.js";
 import { createAgentConnectionToolDefinition } from "./tool-definition.js";
@@ -35,6 +36,7 @@ import type {
 	AgentConnectionSessionListProgress,
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSlashCommand,
+	AgentConnectionSnapshot,
 	AgentConnectionState,
 	AgentConnectionSwitchSessionOptions,
 	AgentConnectionToolDefinition,
@@ -79,6 +81,10 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async getState(): Promise<AgentConnectionState> {
 		return createAgentConnectionState(this.runtimeHost);
+	}
+
+	async getInitialSnapshot(): Promise<AgentConnectionSnapshot> {
+		return createAgentConnectionSnapshot(this.runtimeHost);
 	}
 
 	async getMessages(): Promise<AgentMessage[]> {

@@ -9,6 +9,7 @@ import type {
 	AgentConnectionModel,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionSlashCommand,
+	AgentConnectionSnapshot,
 	AgentConnectionState,
 } from "./types.js";
 
@@ -45,6 +46,23 @@ export function createAgentConnectionState(
 		})),
 		activeToolNames: session.getActiveToolNames(),
 		contextUsage: session.getContextUsage(),
+	};
+}
+
+export function createAgentConnectionSnapshot(
+	runtime: AgentSessionRuntime,
+	activeSessionId?: string,
+): AgentConnectionSnapshot {
+	const session = runtime.session;
+	const sessionManager = session.sessionManager;
+	return {
+		state: createAgentConnectionState(runtime, activeSessionId),
+		messages: [...session.messages],
+		sessionContext: sessionManager.buildSessionContext(),
+		sessionTree: {
+			tree: sessionManager.getTree(),
+			leafId: sessionManager.getLeafId(),
+		},
 	};
 }
 

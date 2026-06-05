@@ -9,7 +9,9 @@ import type {
 	AgentConnectionSavedSessionScope,
 	AgentConnectionSavedSessionState,
 	AgentConnectionScopedModel,
+	AgentConnectionSessionContext,
 	AgentConnectionSessionEvent,
+	AgentConnectionSessionTreeNode,
 	AgentConnectionState,
 } from "../agent-connection/types.js";
 import type { SessionSummary } from "./daemon-session-list.js";
@@ -110,6 +112,8 @@ export interface DaemonSessionSnapshot {
 	summary: SessionSummary;
 	state: AgentConnectionState;
 	messages: AgentMessage[];
+	sessionContext?: AgentConnectionSessionContext;
+	sessionTree?: { tree: AgentConnectionSessionTreeNode[]; leafId: string | null };
 	lastEventSequence: DaemonEventSequence;
 	parent?: {
 		activeSessionId?: string;
