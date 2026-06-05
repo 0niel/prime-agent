@@ -3,6 +3,7 @@ import {
 	type Component,
 	Container,
 	type Focusable,
+	getCapabilities,
 	getKeybindings,
 	Spacer,
 	Text,
@@ -140,7 +141,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 		this.addMutedText("The sign-in page should already be opening. If it did not open, use the link below.");
 		this.contentContainer.addChild(new Spacer(1));
 		this.addLabel("Sign-in link");
-		const linkedUrl = `\x1b]8;;${url}\x07${url}\x1b]8;;\x07`;
+		const linkedUrl = getCapabilities().hyperlinks ? `\x1b]8;;${url}\x07${url}\x1b]8;;\x07` : url;
 		this.contentContainer.addChild(new Text(theme.fg("text", linkedUrl), 0, 0));
 
 		if (instructions) {

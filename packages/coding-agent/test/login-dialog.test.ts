@@ -1,6 +1,6 @@
-import { type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { resetCapabilitiesCache, setCapabilities, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { LoginDialogComponent } from "../src/modes/interactive/components/login-dialog.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 import { PRIME_BUTTERFLY_LOGO } from "../src/themes/prime-logo.js";
@@ -28,6 +28,10 @@ describe("LoginDialogComponent", () => {
 		mocks.exec.mockClear();
 	});
 
+	afterEach(() => {
+		resetCapabilitiesCache();
+	});
+
 	it("renders browser login without legacy border chrome", () => {
 		const dialog = new LoginDialogComponent(createFakeTui(), "anthropic", () => {}, "Anthropic");
 
@@ -44,6 +48,31 @@ describe("LoginDialogComponent", () => {
 		expect(output).not.toContain("─");
 		expect(output).not.toContain("> ");
 		expect(mocks.exec).toHaveBeenCalledOnce();
+	});
+
+	it("renders sign-in URLs as OSC 8 hyperlinks when supported", () => {
+		setCapabilities({ images: null, trueColor: true, hyperlinks: true });
+		const dialog = new LoginDialogComponent(createFakeTui(), "anthropic", () => {}, "Anthropic");
+		const url = "https://example.com/oauth?client_id=test";
+
+		dialog.showAuth(url, "Complete login in your browser.");
+		const rawOutput = dialog.render(88).join("\n");
+
+		expect(rawOutput).toContain(`\x1b]8;;${url}\x07`);
+		expect(rawOutput).toContain("\x1b]8;;\x07");
+		expect(stripAnsi(rawOutput)).toContain(url);
+	});
+
+	it("renders plain sign-in URLs when OSC 8 hyperlinks are unsupported", () => {
+		setCapabilities({ images: null, trueColor: true, hyperlinks: false });
+		const dialog = new LoginDialogComponent(createFakeTui(), "anthropic", () => {}, "Anthropic");
+		const url = "https://example.com/oauth?client_id=test";
+
+		dialog.showAuth(url, "Complete login in your browser.");
+		const rawOutput = dialog.render(88).join("\n");
+
+		expect(rawOutput).not.toContain("\x1b]8;;");
+		expect(stripAnsi(rawOutput)).toContain(url);
 	});
 
 	it("renders verification codes as a distinct field", () => {
