@@ -66,7 +66,7 @@ describe("ModelSelectorComponent provider actions", () => {
 
 		const output = stripAnsi(selector.render(120).join("\n"));
 		expect(output).toContain("Choose a Prime model, or add another provider.");
-		expect(output).toContain("ctrl+x to add providers and access more models.");
+		expect(output).toContain("Ctrl+X to add providers and access more models.");
 		expect(output.indexOf("add provider")).toBeLessThan(output.indexOf("Search models"));
 		expect(output.match(/add provider/g)).toHaveLength(1);
 

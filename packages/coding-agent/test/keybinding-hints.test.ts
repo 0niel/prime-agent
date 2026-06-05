@@ -1,0 +1,22 @@
+import { describe, expect, it } from "vitest";
+import { formatKeyText } from "../src/modes/interactive/components/keybinding-hints.js";
+
+describe("keybinding hint formatting", () => {
+	it("uses macOS modifier names on darwin", () => {
+		expect(formatKeyText("ctrl+p", "darwin")).toBe("Cmd+P");
+		expect(formatKeyText("alt+enter", "darwin")).toBe("Option+Enter");
+		expect(formatKeyText("shift+ctrl+p/alt+up", "darwin")).toBe("Shift+Cmd+P/Option+Up");
+	});
+
+	it("keeps canonical modifier names on linux", () => {
+		expect(formatKeyText("ctrl+p", "linux")).toBe("Ctrl+P");
+		expect(formatKeyText("alt+enter", "linux")).toBe("Alt+Enter");
+		expect(formatKeyText("shift+ctrl+p/alt+up", "linux")).toBe("Shift+Ctrl+P/Alt+Up");
+	});
+
+	it("keeps canonical modifier names on Windows", () => {
+		expect(formatKeyText("ctrl+p", "win32")).toBe("Ctrl+P");
+		expect(formatKeyText("alt+enter", "win32")).toBe("Alt+Enter");
+		expect(formatKeyText("ctrl+backspace/pageUp", "win32")).toBe("Ctrl+Backspace/PageUp");
+	});
+});
