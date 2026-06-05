@@ -19,4 +19,9 @@ describe("keybinding hint formatting", () => {
 		expect(formatKeyText("alt+enter", "win32")).toBe("Alt+Enter");
 		expect(formatKeyText("ctrl+backspace/pageUp", "win32")).toBe("Ctrl+Backspace/PageUp");
 	});
+
+	it("formats escape as esc", () => {
+		expect(formatKeyText("escape", "linux")).toBe("esc");
+		expect(formatKeyText("ctrl+escape", "linux")).toBe("Ctrl+esc");
+	});
 });

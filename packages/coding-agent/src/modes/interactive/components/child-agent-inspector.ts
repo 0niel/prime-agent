@@ -3,6 +3,7 @@ import {
 	type Component,
 	type Focusable,
 	getKeybindings,
+	type Keybinding,
 	type MarkdownTheme,
 	Text,
 	type TUI,
@@ -13,6 +14,7 @@ import {
 import type { ToolDefinition } from "../../../core/extensions/types.js";
 import { theme } from "../theme/theme.js";
 import { AssistantMessageComponent } from "./assistant-message.js";
+import { keyText } from "./keybinding-hints.js";
 import { ToolExecutionComponent, type ToolExecutionOptions } from "./tool-execution.js";
 import { UserMessageComponent } from "./user-message.js";
 
@@ -118,6 +120,31 @@ function pluralize(count: number, singular: string, plural = `${singular}s`): st
 	return count === 1 ? singular : plural;
 }
 
+interface KeyActionOptions {
+	primaryOnly?: boolean;
+}
+
+function keyAction(keybinding: Keybinding, description: string, options: KeyActionOptions = {}): string | undefined {
+	const keys = keyText(keybinding, options).trim();
+	return keys ? `${theme.fg("dim", keys)}${theme.fg("muted", ` ${description}`)}` : undefined;
+}
+
+function combinedKeyAction(keybindings: readonly Keybinding[], description: string): string | undefined {
+	const keys = keybindings
+		.map((keybinding) => keyText(keybinding).trim())
+		.filter((key) => key.length > 0)
+		.join("/");
+	return keys ? `${theme.fg("dim", keys)}${theme.fg("muted", ` ${description}`)}` : undefined;
+}
+
+function joinHints(hints: ReadonlyArray<string | undefined>): string {
+	return hints.filter((hint) => hint !== undefined).join(theme.fg("dim", " · "));
+}
+
+function hintLine(hints: ReadonlyArray<string | undefined>, width: number): string {
+	return truncateToWidth(joinHints(hints), width, "");
+}
+
 export class ChildAgentSummaryComponent implements Component, Focusable {
 	focused = false;
 	private readonly paddingX = 1;
@@ -163,7 +190,8 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 		const location = !override && locationLabel ? theme.fg("muted", locationLabel) : "";
 		const context = contextLabel ? theme.fg("muted", contextLabel) : "";
 		const subagents = !override && flat.length > 0 ? this.subagentSummary(flat, this.focused) : "";
-		const leftSegments = [override, location, subagents].filter((segment) => segment.length > 0);
+		const summaryHint = !override && this.focused && flat.length > 0 ? this.summaryHint() : "";
+		const leftSegments = [override, location, subagents, summaryHint].filter((segment) => segment.length > 0);
 		if (leftSegments.length === 0 && !context) {
 			return [];
 		}
@@ -220,7 +248,14 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 				? `${running} ${pluralize(running, "subagent")} running`
 				: `${flat.length} ${pluralize(flat.length, "subagent")}`;
 		const rendered = theme.bold(summary);
-		return selected ? theme.bg("selectedBg", rendered) : rendered;
+		if (!selected) {
+			return rendered;
+		}
+		return theme.bg("selectedBg", rendered);
+	}
+
+	private summaryHint(): string {
+		return joinHints([keyAction("tui.select.confirm", "open")]);
 	}
 }
 
@@ -304,30 +339,29 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 		const running = countRunning(flat);
 		const targetHeight = Math.max(0, this.getViewportHeight());
 		const lines: InspectorLine[] = [{ text: this.headerLine(running, flat.length, contentWidth), selected: false }];
-		const availableRows = targetHeight > 0 ? Math.max(0, targetHeight - 2) : flat.length;
-		if (availableRows === 0) {
-			return lines;
-		}
+		const availableRows = targetHeight > 0 ? Math.max(0, targetHeight - 3) : flat.length;
 
 		const selectedIndex = Math.max(
 			0,
 			flat.findIndex((entry) => entry.node.id === this.selectedId),
 		);
 		const start = Math.max(0, Math.min(selectedIndex - Math.floor(availableRows / 2), flat.length - availableRows));
-		for (const entry of flat.slice(start, start + availableRows)) {
-			const selected = this.focused && entry.node.id === this.selectedId;
-			lines.push({ text: this.renderListEntry(entry, contentWidth, selected), selected });
+		if (availableRows > 0) {
+			for (const entry of flat.slice(start, start + availableRows)) {
+				const selected = this.focused && entry.node.id === this.selectedId;
+				lines.push({ text: this.renderListEntry(entry, contentWidth), selected });
+			}
 		}
-		while (targetHeight > 0 && lines.length < targetHeight - 1) {
+		while (targetHeight > 0 && lines.length < targetHeight - 2) {
 			lines.push({ text: "", selected: false });
 		}
+		lines.push({ text: this.listHintLine(contentWidth), selected: false });
 		return lines;
 	}
 
-	private renderListEntry(entry: FlatChildAgentNode, width: number, selected: boolean): string {
-		const selector = selected ? theme.fg("accent", "▌") : " ";
+	private renderListEntry(entry: FlatChildAgentNode, width: number): string {
 		const indent = " ".repeat(Math.min(6, entry.depth * 2));
-		const line = `${selector} ${indent}${this.statusLabel(entry.node.status)} ${theme.fg("dim", "·")} ${theme.fg("muted", entry.node.label)}`;
+		const line = `  ${indent}${this.statusLabel(entry.node.status)} ${theme.fg("dim", "·")} ${theme.fg("muted", entry.node.label)}`;
 		return this.truncate(line, width, "…");
 	}
 	private flatten(): FlatChildAgentNode[] {
@@ -353,6 +387,17 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 			running > 0 ? theme.fg("muted", `${running} running · ${total} total`) : theme.fg("muted", `${total} total`);
 		const gap = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
 		return this.truncate(`${left}${gap}${right}`, width);
+	}
+
+	private listHintLine(width: number): string {
+		return hintLine(
+			[
+				combinedKeyAction(["tui.select.up", "tui.select.down"], "move"),
+				keyAction("tui.select.confirm", "open"),
+				keyAction("tui.select.cancel", "close", { primaryOnly: true }),
+			],
+			width,
+		);
 	}
 
 	private statusLabel(status: ChildAgentStatus): string {
@@ -411,7 +456,12 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
 		const sections = this.renderDetail(safeWidth);
-		return [...sections.headerLines, ...sections.bodyLines];
+		return [
+			...sections.headerLines,
+			...sections.bodyLines,
+			this.panelLine(theme.fg("borderMuted", "─".repeat(safeWidth)), safeWidth),
+			this.panelLine(this.detailHintLine(safeWidth), safeWidth),
+		];
 	}
 
 	handleInput(data: string): void {
@@ -537,6 +587,10 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 		const plainWidth = visibleWidth(text);
 		const rule = "─".repeat(Math.max(1, width - plainWidth - 1));
 		return this.truncate(`${text} ${theme.fg("borderMuted", rule)}`, width);
+	}
+
+	private detailHintLine(width: number): string {
+		return hintLine([keyAction("tui.select.cancel", "back to subagents", { primaryOnly: true })], width);
 	}
 
 	private statusLabel(status: ChildAgentStatus): string {

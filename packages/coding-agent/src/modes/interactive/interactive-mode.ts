@@ -786,6 +786,7 @@ export class InteractiveMode {
 						hint("app.model.select", "to select model"),
 						hint("app.tools.expand", "to expand tools"),
 						hint("app.thinking.toggle", "to expand thinking"),
+						hint("app.subagents.focus", "to inspect subagents"),
 						hint("app.editor.external", "for external editor"),
 						rawKeyHint("/", "for commands"),
 						rawKeyHint("!", "to run bash"),
@@ -2957,7 +2958,7 @@ export class InteractiveMode {
 				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
 				if (command) {
 					if (this.session.isBashRunning) {
-						this.showWarning("A bash command is already running. Press Esc to cancel it first.");
+						this.showWarning("A bash command is already running. Press esc to cancel it first.");
 						this.editor.setText(text);
 						return;
 					}
@@ -6285,7 +6286,7 @@ export class InteractiveMode {
 			.map((k) =>
 				k
 					.split("+")
-					.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+					.map((part) => (part === "esc" ? part : part.charAt(0).toUpperCase() + part.slice(1)))
 					.join("+"),
 			)
 			.join("/");
@@ -6342,6 +6343,7 @@ export class InteractiveMode {
 		const selectModel = this.getAppKeyDisplay("app.model.select");
 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
 		const toggleThinking = this.getAppKeyDisplay("app.thinking.toggle");
+		const focusSubagents = this.getAppKeyDisplay("app.subagents.focus");
 		const externalEditor = this.getAppKeyDisplay("app.editor.external");
 		const cycleModelBackward = this.getAppKeyDisplay("app.model.cycleBackward");
 		const followUp = this.getAppKeyDisplay("app.message.followUp");
@@ -6386,6 +6388,7 @@ export class InteractiveMode {
 | \`${selectModel}\` | Open model selector |
 | \`${expandTools}\` | Toggle tool output expansion |
 | \`${toggleThinking}\` | Toggle thinking block visibility |
+| \`${focusSubagents}\` | Open subagent inspector |
 | \`${externalEditor}\` | Edit message in external editor |
 | \`${followUp}\` | Queue follow-up message |
 | \`${dequeue}\` | Restore queued messages |

@@ -32,14 +32,14 @@ describe("UserMessageComponent", () => {
 		expect(lines[2].endsWith(BG_RESET)).toBe(true);
 	});
 
-	test("does not use a hardcoded message background when terminal background is unknown", () => {
+	test("uses the themed message background when terminal background is unknown", () => {
 		clearDefaultTerminalColors();
 		initTheme("dark");
 
 		const component = new UserMessageComponent("hello");
 		const lines = component.render(20);
 
-		expect(lines[0].endsWith(BG_RESET)).toBe(false);
-		expect(lines[2].endsWith(BG_RESET)).toBe(false);
+		expect(lines[0].endsWith(BG_RESET)).toBe(true);
+		expect(lines[2].endsWith(BG_RESET)).toBe(true);
 	});
 });

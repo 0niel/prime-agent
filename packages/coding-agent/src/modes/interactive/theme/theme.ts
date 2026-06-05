@@ -167,10 +167,11 @@ export type ThemeBg =
 type ColorMode = "truecolor" | "256color";
 
 const ADAPTIVE_LIGHT_BG_ACCENT: Rgb = { r: 0, g: 95, b: 135 };
-const DARK_EDITOR_SURFACE_ALPHA = 0.06;
-const LIGHT_EDITOR_SURFACE_ALPHA = 0.04;
+const SURFACE_MIN_LUMINANCE_DELTA = 12;
+const SURFACE_CONTRAST_ALPHA = 0.08;
 const BLACK: Rgb = { r: 0, g: 0, b: 0 };
 const WHITE: Rgb = { r: 255, g: 255, b: 255 };
+const CUBE_VALUES = [0, 95, 135, 175, 215, 255] as const;
 
 // ============================================================================
 // Color Utilities
@@ -215,6 +216,57 @@ function hexToRgb(hex: string): { r: number; g: number; b: number } {
 		throw new Error(`Invalid hex color: ${hex}`);
 	}
 	return { r, g, b };
+}
+
+function ansi256ToRgb(index: number): Rgb | undefined {
+	if (index < 0 || index > 255) {
+		return undefined;
+	}
+	if (index < 16) {
+		const basicColors: Rgb[] = [
+			{ r: 0, g: 0, b: 0 },
+			{ r: 128, g: 0, b: 0 },
+			{ r: 0, g: 128, b: 0 },
+			{ r: 128, g: 128, b: 0 },
+			{ r: 0, g: 0, b: 128 },
+			{ r: 128, g: 0, b: 128 },
+			{ r: 0, g: 128, b: 128 },
+			{ r: 192, g: 192, b: 192 },
+			{ r: 128, g: 128, b: 128 },
+			{ r: 255, g: 0, b: 0 },
+			{ r: 0, g: 255, b: 0 },
+			{ r: 255, g: 255, b: 0 },
+			{ r: 0, g: 0, b: 255 },
+			{ r: 255, g: 0, b: 255 },
+			{ r: 0, g: 255, b: 255 },
+			{ r: 255, g: 255, b: 255 },
+		];
+		return basicColors[index];
+	}
+	if (index >= 232) {
+		const value = 8 + (index - 232) * 10;
+		return { r: value, g: value, b: value };
+	}
+	const cubeIndex = index - 16;
+	return {
+		r: CUBE_VALUES[Math.floor(cubeIndex / 36)]!,
+		g: CUBE_VALUES[Math.floor((cubeIndex % 36) / 6)]!,
+		b: CUBE_VALUES[cubeIndex % 6]!,
+	};
+}
+
+function colorValueToRgb(value: string | number | undefined): Rgb | undefined {
+	if (typeof value === "number") {
+		return ansi256ToRgb(value);
+	}
+	if (!value || !value.startsWith("#")) {
+		return undefined;
+	}
+	return hexToRgb(value);
+}
+
+function luminance(rgb: Rgb): number {
+	return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
 }
 
 function hexTo256(hex: string): number {
@@ -290,6 +342,7 @@ export class Theme {
 	sourceInfo?: SourceInfo;
 	private fgColors: Map<ThemeColor, string>;
 	private bgColors: Map<ThemeBg, string>;
+	private bgColorValues: Map<ThemeBg, string | number>;
 	private mode: ColorMode;
 
 	constructor(
@@ -310,6 +363,7 @@ export class Theme {
 		for (const [key, value] of Object.entries(bgColors) as [ThemeBg, string | number][]) {
 			this.bgColors.set(key, bgAnsi(value, mode));
 		}
+		this.bgColorValues = new Map(Object.entries(bgColors) as [ThemeBg, string | number][]);
 	}
 
 	fg(color: ThemeColor, text: string): string {
@@ -325,23 +379,32 @@ export class Theme {
 	}
 
 	getEditorBackgroundColor(): ((str: string) => string) | undefined {
-		const terminalBg = getDefaultTerminalColors()?.background;
-		if (!terminalBg) {
-			return undefined;
-		}
-
-		const top = isLightColor(terminalBg) ? BLACK : WHITE;
-		const alpha = isLightColor(terminalBg) ? LIGHT_EDITOR_SURFACE_ALPHA : DARK_EDITOR_SURFACE_ALPHA;
-		const color = bestAnsiColor(blendColor(top, terminalBg, alpha), this.mode);
-		if (color === "") {
-			return undefined;
-		}
-		const ansi = bgAnsi(color, this.mode);
-		return (str: string) => `${ansi}${str}\x1b[49m`;
+		return this.surfaceBackgroundColor("userMessageBg");
 	}
 
 	getUserMessageBackgroundColor(): (str: string) => string {
-		return (str: string) => this.getEditorBackgroundColor()?.(str) ?? str;
+		return this.surfaceBackgroundColor("userMessageBg");
+	}
+
+	private surfaceBackgroundColor(color: ThemeBg): (str: string) => string {
+		const terminalBg = getDefaultTerminalColors()?.background;
+		const surfaceRgb = colorValueToRgb(this.bgColorValues.get(color));
+		if (!terminalBg || !surfaceRgb) {
+			return (str: string) => this.bg(color, str);
+		}
+
+		const delta = Math.abs(luminance(surfaceRgb) - luminance(terminalBg));
+		if (delta >= SURFACE_MIN_LUMINANCE_DELTA) {
+			return (str: string) => this.bg(color, str);
+		}
+
+		const top = isLightColor(terminalBg) ? BLACK : WHITE;
+		const adjustedColor = bestAnsiColor(blendColor(top, surfaceRgb, SURFACE_CONTRAST_ALPHA), this.mode);
+		if (adjustedColor === "") {
+			return (str: string) => this.bg(color, str);
+		}
+		const ansi = bgAnsi(adjustedColor, this.mode);
+		return (str: string) => `${ansi}${str}\x1b[49m`;
 	}
 
 	getAdaptiveAccentColor(): (str: string) => string {
@@ -1119,7 +1182,7 @@ export function getSelectListTheme(): SelectListTheme {
 
 export function getEditorTheme(): EditorTheme {
 	return {
-		borderColor: theme.getAdaptiveAccentColor(),
+		borderColor: (text: string) => theme.fg("borderMuted", text),
 		backgroundColor: theme.getEditorBackgroundColor(),
 		selectList: getSelectListTheme(),
 	};

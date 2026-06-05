@@ -5,12 +5,21 @@
 import { getKeybindings, type Keybinding, type KeyId } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
 
+export interface KeyTextOptions {
+	primaryOnly?: boolean;
+}
+
+function normalizeKeyPart(part: string): string {
+	return part === "escape" ? "esc" : part;
+}
+
 function formatKeyPart(part: string, platform: NodeJS.Platform): string {
+	const normalized = normalizeKeyPart(part);
 	if (platform === "darwin") {
-		if (part === "ctrl") return "Cmd";
-		if (part === "alt") return "Option";
+		if (normalized === "ctrl") return "Cmd";
+		if (normalized === "alt") return "Option";
 	}
-	return part.charAt(0).toUpperCase() + part.slice(1);
+	return normalized === "esc" ? normalized : normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }
 
 export function formatKeyText(key: string, platform: NodeJS.Platform = process.platform): string {
@@ -25,20 +34,21 @@ export function formatKeyText(key: string, platform: NodeJS.Platform = process.p
 		.join("/");
 }
 
-function formatKeys(keys: KeyId[]): string {
-	if (keys.length === 0) return "";
-	if (keys.length === 1) return formatKeyText(keys[0]!);
-	return formatKeyText(keys.join("/"));
+function formatKeys(keys: KeyId[], options: KeyTextOptions = {}): string {
+	const displayKeys = options.primaryOnly ? keys.slice(0, 1) : keys;
+	if (displayKeys.length === 0) return "";
+	if (displayKeys.length === 1) return formatKeyText(displayKeys[0]!);
+	return formatKeyText(displayKeys.join("/"));
 }
 
-export function keyText(keybinding: Keybinding): string {
-	return formatKeys(getKeybindings().getKeys(keybinding));
+export function keyText(keybinding: Keybinding, options: KeyTextOptions = {}): string {
+	return formatKeys(getKeybindings().getKeys(keybinding), options);
 }
 
-export function keyHint(keybinding: Keybinding, description: string): string {
-	return theme.fg("dim", keyText(keybinding)) + theme.fg("muted", ` ${description}`);
+export function keyHint(keybinding: Keybinding, description: string, options: KeyTextOptions = {}): string {
+	return theme.fg("dim", keyText(keybinding, options)) + theme.fg("muted", ` ${description}`);
 }
 
 export function rawKeyHint(key: string, description: string): string {
-	return theme.fg("dim", key) + theme.fg("muted", ` ${description}`);
+	return theme.fg("dim", formatKeyText(key)) + theme.fg("muted", ` ${description}`);
 }

@@ -6,6 +6,24 @@ const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
 
+function getThinkingMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
+	const quiet = (text: string) => theme.fg("thinkingText", text);
+	return {
+		...baseTheme,
+		heading: quiet,
+		link: quiet,
+		linkUrl: quiet,
+		code: quiet,
+		codeBlock: quiet,
+		codeBlockBorder: quiet,
+		quote: quiet,
+		quoteBorder: quiet,
+		hr: quiet,
+		listBullet: quiet,
+		highlightCode: (code: string) => code.split("\n").map((line) => quiet(line)),
+	};
+}
+
 /**
  * Component that renders a complete assistant message
  */
@@ -107,11 +125,10 @@ export class AssistantMessageComponent extends Container {
 						this.contentContainer.addChild(new Spacer(1));
 					}
 				} else {
-					// Thinking traces in thinkingText color, italic
+					// Thinking traces keep Markdown structure but stay visually quiet.
 					this.contentContainer.addChild(
-						new Markdown(content.thinking.trim(), 1, 0, this.markdownTheme, {
+						new Markdown(content.thinking.trim(), 1, 0, getThinkingMarkdownTheme(this.markdownTheme), {
 							color: (text: string) => theme.fg("thinkingText", text),
-							italic: true,
 						}),
 					);
 					if (hasVisibleContentAfter) {
