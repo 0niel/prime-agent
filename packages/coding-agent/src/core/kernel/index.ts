@@ -9,7 +9,7 @@ import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
 import type { RlmRunHandler, RlmRunResult } from "../rlm-runtime.js";
-import { ensureKernelPython, type KernelPythonSkill } from "./bootstrap.js";
+import { ensureKernelPython, type KernelBootstrapProgressHandler, type KernelPythonSkill } from "./bootstrap.js";
 
 const DELIM = Buffer.from("<IDS|MSG>");
 const PROTOCOL_VERSION = "5.3";
@@ -30,6 +30,10 @@ export interface KernelManagerOptions {
 	pythonSkills?: readonly KernelPythonSkill[];
 	/** Default: "prime-agent". */
 	username?: string;
+}
+
+export interface KernelStartOptions {
+	onBootstrapProgress?: KernelBootstrapProgressHandler;
 }
 
 export interface ExecuteOptions {
@@ -321,21 +325,26 @@ export class KernelManager {
 		return this.options.sessionId;
 	}
 
-	async start(): Promise<void> {
+	async start(options: KernelStartOptions = {}): Promise<void> {
 		if (!this.startPromise) {
-			this.startPromise = this.doStart();
+			this.startPromise = this.doStart(options);
 		}
 		return this.startPromise;
 	}
 
-	private async doStart(): Promise<void> {
+	private async doStart(startOptions: KernelStartOptions): Promise<void> {
 		if (this.state !== "idle") return;
 		this.state = "starting";
 		installSignalHandlersOnce();
 
 		let python: string;
 		try {
-			python = this.options.python ?? (await ensureKernelPython({ pythonSkills: this.options.pythonSkills }));
+			python =
+				this.options.python ??
+				(await ensureKernelPython({
+					pythonSkills: this.options.pythonSkills,
+					onProgress: startOptions.onBootstrapProgress,
+				}));
 			this.options.python = python;
 		} catch (error) {
 			this.state = "idle";

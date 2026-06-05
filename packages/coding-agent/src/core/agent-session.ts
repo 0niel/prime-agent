@@ -1642,13 +1642,7 @@ export class AgentSession {
 			return;
 		}
 		this._disposed = true;
-		for (const run of this._activeRlmChildRuns.values()) {
-			if (run.status === "running" || run.status === "queued") {
-				run.status = "cancelled";
-				run.error = "Parent session disposed";
-				run.abort();
-			}
-		}
+		this._cancelActiveRlmChildRuns("Parent session disposed");
 		this._pendingNextTurnMessages = [];
 		this._steeringMessages = [];
 		this._followUpMessages = [];
@@ -2306,6 +2300,7 @@ export class AgentSession {
 	 */
 	async abort(): Promise<void> {
 		this.abortRetry();
+		this._cancelActiveRlmChildRuns("Parent session aborted");
 		this._goalAbortInProgress = this._goalState.status === "active";
 		this.agent.abort();
 		try {
@@ -3453,6 +3448,16 @@ export class AgentSession {
 
 	private _assistantTurnCount(): number {
 		return this.agent.state.messages.filter((message) => message.role === "assistant").length;
+	}
+
+	private _cancelActiveRlmChildRuns(reason: string): void {
+		for (const run of this._activeRlmChildRuns.values()) {
+			if (run.status === "running" || run.status === "queued") {
+				run.status = "cancelled";
+				run.error = reason;
+				run.abort();
+			}
+		}
 	}
 
 	private _startRlmChildRun(prompt: string, kwargs: Record<string, unknown> = {}): RlmChildRun {

@@ -42,9 +42,11 @@ const BOOTSTRAP_LOCK_STALE_WITHOUT_PID_MS = 30_000;
 let inFlightEnsureKernelPython: { key: string; promise: Promise<string> } | null = null;
 
 export type KernelPythonSkill = PythonSkillRuntimeInfo;
+export type KernelBootstrapProgressHandler = (message: string) => void;
 
 export interface EnsureKernelPythonOptions {
 	pythonSkills?: readonly KernelPythonSkill[];
+	onProgress?: KernelBootstrapProgressHandler;
 }
 
 interface BootstrapPythonSkill {
@@ -234,6 +236,14 @@ async function missingPythonSkillImportLabels(
 	return missing;
 }
 
+function reportProgress(options: EnsureKernelPythonOptions, message: string): void {
+	if (options.onProgress) {
+		options.onProgress(message);
+		return;
+	}
+	process.stderr.write(`${message}\n`);
+}
+
 function bootstrapLockDir(venv: string): string {
 	return path.join(path.dirname(venv), `${path.basename(venv)}${BOOTSTRAP_LOCK_NAME}`);
 }
@@ -303,23 +313,25 @@ async function findExecutable(name: string): Promise<string | null> {
 	return null;
 }
 
-async function ensureUv(): Promise<string> {
+async function ensureUv(options: EnsureKernelPythonOptions): Promise<string> {
 	const fromPath = await findExecutable("uv");
 	if (fromPath) return fromPath;
 
 	const localUv = path.join(os.homedir(), ".local", "bin", process.platform === "win32" ? "uv.exe" : "uv");
 	if (await isExecutable(localUv)) return localUv;
 
-	if (process.env.PRIME_AGENT_INSTALL_UV !== "1" && !(await confirmUvInstall())) {
+	const shouldInstallUv =
+		process.env.PRIME_AGENT_INSTALL_UV === "1" || (!options.onProgress && (await confirmUvInstall()));
+	if (!shouldInstallUv) {
 		throw new Error(
 			`uv is required to set up the Python kernel. Install uv yourself: ${UV_INSTALL_COMMAND}, ` +
 				"or set PRIME_AGENT_INSTALL_UV=1 to let prime-agent run that installer.",
 		);
 	}
 
-	process.stderr.write("› installing uv (one-time)…\n");
+	reportProgress(options, "› installing uv (one-time)…");
 	try {
-		await run("sh", ["-c", UV_INSTALL_COMMAND], { stdio: "inherit" });
+		await run("sh", ["-c", UV_INSTALL_COMMAND], { stdio: options.onProgress ? "ignore" : "inherit" });
 	} catch (error) {
 		throw new Error(
 			`couldn't install uv from astral.sh; install it yourself: ${UV_INSTALL_COMMAND}, then re-run prime-agent. ${errorMessage(error)}`,
@@ -453,9 +465,13 @@ async function resolveRuntimeRequirement(): Promise<string> {
 	return RUNTIME_REQUIREMENT;
 }
 
-async function bootstrapVenv(venv: string, pythonSkills: readonly BootstrapPythonSkill[]): Promise<void> {
+async function bootstrapVenv(
+	venv: string,
+	pythonSkills: readonly BootstrapPythonSkill[],
+	options: EnsureKernelPythonOptions,
+): Promise<void> {
 	await mkdir(path.dirname(venv), { recursive: true });
-	const uv = await ensureUv();
+	const uv = await ensureUv(options);
 	const python = path.join(venv, "bin", "python");
 	const runtimeRequirement = await resolveRuntimeRequirement();
 
@@ -470,7 +486,7 @@ async function bootstrapVenv(venv: string, pythonSkills: readonly BootstrapPytho
 		runtimeRequirement,
 		...DEFAULT_RLM_EXTRA_UV_ARGS,
 	]);
-	await syncPythonSkills(uv, venv, python, pythonSkills);
+	await syncPythonSkills(uv, venv, python, pythonSkills, options);
 }
 
 async function syncPythonSkills(
@@ -478,6 +494,7 @@ async function syncPythonSkills(
 	venv: string,
 	python: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
+	options: EnsureKernelPythonOptions,
 ): Promise<void> {
 	const version = await readBootstrapVersion(venv);
 	const installedPythonSkills: BootstrapPythonSkill[] = [];
@@ -496,8 +513,9 @@ async function syncPythonSkills(
 			await run(uv, ["pip", "install", "--python", python, "--editable", skill.packagePath]);
 			installedPythonSkills.push(skill);
 		} catch (error) {
-			process.stderr.write(
-				`Warning: Python skill ${skill.importName} failed to install and will be unavailable: ${errorMessage(error)}\n`,
+			reportProgress(
+				options,
+				`Warning: Python skill ${skill.importName} failed to install and will be unavailable: ${errorMessage(error)}`,
 			);
 		}
 	}
@@ -551,8 +569,9 @@ async function ensureKernelPythonUncached(
 		if (missing.length === 0 && pythonSkills.length > 0) {
 			const missingPythonSkills = await missingPythonSkillImportLabels(python, options.pythonSkills ?? []);
 			if (missingPythonSkills.length > 0) {
-				process.stderr.write(
-					`Warning: Python skills unavailable in PRIME_AGENT_KERNEL_PYTHON and will be disabled: ${missingPythonSkills.join(", ")}\n`,
+				reportProgress(
+					options,
+					`Warning: Python skills unavailable in PRIME_AGENT_KERNEL_PYTHON and will be disabled: ${missingPythonSkills.join(", ")}`,
 				);
 			}
 		}
@@ -568,25 +587,25 @@ async function ensureKernelPythonUncached(
 	try {
 		if (await kernelReady(python, venv, pythonSkills)) return python;
 		if (await kernelBaseReady(python, venv)) {
-			await syncPythonSkills(await ensureUv(), venv, python, pythonSkills);
+			await syncPythonSkills(await ensureUv(options), venv, python, pythonSkills, options);
 			return python;
 		}
 
 		const hadVenv = existsSync(venv);
-		process.stderr.write("› setting up python kernel (one-time, ~30s)…\n");
+		reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
 		if (hadVenv) {
-			process.stderr.write("rebuilding kernel venv\n");
+			reportProgress(options, "rebuilding kernel venv");
 			await rm(venv, { recursive: true, force: true });
 		}
 
-		await bootstrapVenv(venv, pythonSkills);
+		await bootstrapVenv(venv, pythonSkills, options);
 	} catch (error) {
 		throw formatBootstrapFailure(error);
 	} finally {
 		await releaseLock().catch(() => undefined);
 	}
 
-	process.stderr.write("✓ ready\n");
+	reportProgress(options, "✓ ready");
 	return python;
 }
 

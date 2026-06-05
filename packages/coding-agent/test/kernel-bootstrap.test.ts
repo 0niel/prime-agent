@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	DEFAULT_RLM_EXTRA_IMPORT_NAMES,
 	DEFAULT_RLM_EXTRA_UV_ARGS,
@@ -183,6 +183,26 @@ describe("kernel bootstrap", () => {
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
 			pythonSkills: [],
 		});
+	});
+
+	it("routes bootstrap progress through the provided callback", async () => {
+		installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const progress: string[] = [];
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+		const stderrWrite = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+		try {
+			await expect(ensureKernelPython({ onProgress: (message) => progress.push(message) })).resolves.toBe(
+				join(venv, "bin", "python"),
+			);
+		} finally {
+			stderrWrite.mockRestore();
+		}
+
+		expect(progress).toEqual(expect.arrayContaining(["› setting up python kernel (one-time, ~30s)…", "✓ ready"]));
+		expect(stderrWrite).not.toHaveBeenCalledWith(expect.stringContaining("setting up python kernel"));
+		expect(stderrWrite).not.toHaveBeenCalledWith(expect.stringContaining("ready"));
 	});
 
 	it("installs Python skills into the bootstrapped venv", async () => {
