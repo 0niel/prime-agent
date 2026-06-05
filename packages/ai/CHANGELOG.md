@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Claude Opus 4.8 to the curated Prime Inference model list.
+
 ## [0.0.7] - 2026-06-01
 
 ### Fixed

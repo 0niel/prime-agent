@@ -126,6 +126,7 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	"anthropic/claude-haiku-4.5": { contextWindow: 200000, maxTokens: 64000 },
 	"anthropic/claude-opus-4.6": { contextWindow: 1000000, maxTokens: 128000 },
 	"anthropic/claude-opus-4.7": { contextWindow: 1000000, maxTokens: 128000 },
+	"anthropic/claude-opus-4.8": { contextWindow: 1000000, maxTokens: 128000 },
 	"anthropic/claude-sonnet-4.5": { contextWindow: 200000, maxTokens: 64000 },
 	"anthropic/claude-sonnet-4.6": { contextWindow: 1000000, maxTokens: 128000 },
 	"deepseek/deepseek-v3.2": { contextWindow: 128000, maxTokens: 8000 },
@@ -208,7 +209,12 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (model.id.includes("opus-4-6") || model.id.includes("opus-4.6")) {
 		mergeThinkingLevelMap(model, { xhigh: "max" });
 	}
-	if (model.id.includes("opus-4-7") || model.id.includes("opus-4.7")) {
+	if (
+		model.id.includes("opus-4-7") ||
+		model.id.includes("opus-4.7") ||
+		model.id.includes("opus-4-8") ||
+		model.id.includes("opus-4.8")
+	) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
 	}
 	if (model.api === "openai-completions" && model.id.includes("deepseek-v4")) {

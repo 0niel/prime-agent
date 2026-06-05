@@ -16,10 +16,11 @@ describe("Prime Inference models", () => {
 	it("registers the Prime Inference catalog", () => {
 		const modelIds = getModels("prime-inference").map((model) => model.id);
 
-		expect(modelIds.length).toBe(24);
+		expect(modelIds.length).toBe(25);
 		expect(modelIds).toEqual(
 			expect.arrayContaining([
 				"anthropic/claude-opus-4.7",
+				"anthropic/claude-opus-4.8",
 				"deepseek/deepseek-v4-pro",
 				"nvidia/nemotron-3-super-120b-a12b",
 				"openai/gpt-5.4",
@@ -64,6 +65,11 @@ describe("Prime Inference models", () => {
 	});
 
 	it("marks known reasoning-capable Prime Inference model families", () => {
+		const opus48 = getModel("prime-inference", "anthropic/claude-opus-4.8");
+		expect(opus48.reasoning).toBe(true);
+		expect(opus48.thinkingLevelMap).toEqual({ xhigh: "xhigh" });
+		expect(getSupportedThinkingLevels(opus48)).toContain("xhigh");
+
 		expect(getModel("prime-inference", "anthropic/claude-opus-4.7").reasoning).toBe(true);
 		const deepseekV4Flash = getModel("prime-inference", "deepseek/deepseek-v4-flash");
 		expect(deepseekV4Flash.reasoning).toBe(true);
