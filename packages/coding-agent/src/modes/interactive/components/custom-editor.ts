@@ -6,6 +6,7 @@ import type { AppKeybinding, KeybindingsManager } from "../../../core/keybinding
  */
 export class CustomEditor extends Editor {
 	private keybindings: KeybindingsManager;
+	private defaultPromptPrefix: string;
 	public actionHandlers: Map<AppKeybinding, () => void> = new Map();
 
 	// Special handlers that can be dynamically replaced
@@ -17,8 +18,43 @@ export class CustomEditor extends Editor {
 	public onExtensionShortcut?: (data: string) => boolean;
 
 	constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager, options?: EditorOptions) {
-		super(tui, theme, options);
+		const promptPrefix = options?.promptPrefix ?? "> ";
+		super(tui, theme, { ...options, promptPrefix });
 		this.keybindings = keybindings;
+		this.defaultPromptPrefix = promptPrefix;
+	}
+
+	protected override getPromptPrefix(): string {
+		return this.getBashPromptInfo(this.getLines()[0] ?? "")?.promptPrefix ?? this.defaultPromptPrefix;
+	}
+
+	protected override formatPromptPrefix(prefix: string): string {
+		return prefix.startsWith("!") ? this.borderColor(prefix) : prefix;
+	}
+
+	protected override getHiddenTextPrefixLength(lineIndex: number, line: string): number {
+		if (lineIndex !== 0) {
+			return 0;
+		}
+		return this.getBashPromptInfo(line)?.hiddenTextPrefixLength ?? 0;
+	}
+
+	private getBashPromptInfo(line: string): { promptPrefix: string; hiddenTextPrefixLength: number } | undefined {
+		const trimmedLine = line.trimStart();
+		const leadingWhitespaceLength = line.length - trimmedLine.length;
+		if (trimmedLine.startsWith("!!")) {
+			return {
+				promptPrefix: "!! ",
+				hiddenTextPrefixLength: leadingWhitespaceLength + (trimmedLine.startsWith("!! ") ? 3 : 2),
+			};
+		}
+		if (trimmedLine.startsWith("!")) {
+			return {
+				promptPrefix: "! ",
+				hiddenTextPrefixLength: leadingWhitespaceLength + (trimmedLine.startsWith("! ") ? 2 : 1),
+			};
+		}
+		return undefined;
 	}
 
 	/**

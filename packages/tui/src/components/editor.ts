@@ -206,6 +206,7 @@ export interface EditorTheme {
 export interface EditorOptions {
 	paddingX?: number;
 	autocompleteMaxVisible?: number;
+	promptPrefix?: string;
 }
 
 const SLASH_COMMAND_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
@@ -228,6 +229,7 @@ export class Editor implements Component, Focusable {
 	protected tui: TUI;
 	private theme: EditorTheme;
 	private paddingX: number = 0;
+	private promptPrefix: string = "";
 
 	// Store last render width for cursor navigation
 	private lastWidth: number = 80;
@@ -294,6 +296,7 @@ export class Editor implements Component, Focusable {
 		this.backgroundColor = theme.backgroundColor;
 		const paddingX = options.paddingX ?? 0;
 		this.paddingX = Number.isFinite(paddingX) ? Math.max(0, Math.floor(paddingX)) : 0;
+		this.promptPrefix = options.promptPrefix ?? "";
 		const maxVisible = options.autocompleteMaxVisible ?? 5;
 		this.autocompleteMaxVisible = Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 5;
 	}
@@ -330,6 +333,26 @@ export class Editor implements Component, Focusable {
 			this.autocompleteMaxVisible = newMaxVisible;
 			this.tui.requestRender();
 		}
+	}
+
+	protected getPromptPrefix(): string {
+		return this.promptPrefix;
+	}
+
+	protected formatPromptPrefix(prefix: string): string {
+		return prefix;
+	}
+
+	protected getHiddenTextPrefixLength(_lineIndex: number, _line: string): number {
+		return 0;
+	}
+
+	private getLineHiddenTextPrefixLength(lineIndex: number, line: string): number {
+		const hiddenLength = this.getHiddenTextPrefixLength(lineIndex, line);
+		if (!Number.isFinite(hiddenLength)) {
+			return 0;
+		}
+		return Math.max(0, Math.min(line.length, Math.floor(hiddenLength)));
 	}
 
 	setAutocompleteProvider(provider: AutocompleteProvider): void {
@@ -425,10 +448,15 @@ export class Editor implements Component, Focusable {
 			? Math.min(Math.max(configuredPaddingX, 2), maxPadding)
 			: configuredPaddingX;
 		const contentWidth = Math.max(1, width - paddingX * 2);
+		const promptPrefixText = this.getPromptPrefix();
+		const promptPrefixWidth = Math.min(visibleWidth(promptPrefixText), Math.max(0, contentWidth - 1));
+		const inputWidth = Math.max(1, contentWidth - promptPrefixWidth);
+		const promptPrefix =
+			promptPrefixWidth > 0 ? this.formatPromptPrefix(truncateToWidth(promptPrefixText, promptPrefixWidth, "")) : "";
 
 		// Layout width: with padding the cursor can overflow into it,
 		// without padding we reserve 1 column for the cursor.
-		const layoutWidth = Math.max(1, contentWidth - (paddingX ? 0 : 1));
+		const layoutWidth = Math.max(1, inputWidth - (paddingX ? 0 : 1));
 
 		// Store for cursor navigation (must match wrapping width)
 		this.lastWidth = layoutWidth;
@@ -463,6 +491,9 @@ export class Editor implements Component, Focusable {
 		const result: string[] = [];
 		const leftPadding = " ".repeat(paddingX);
 		const rightPadding = leftPadding;
+		const promptPrefixInset = promptPrefixWidth > 0 ? Math.min(1, paddingX) : 0;
+		const promptLeadingPadding = " ".repeat(promptPrefixInset);
+		const promptTrailingPadding = " ".repeat(Math.max(0, paddingX - promptPrefixInset));
 		const cursorReset = useBackgroundSurface ? "\x1b[27m" : "\x1b[0m";
 		const renderSurfaceLine = (line: string): string => {
 			const padded = line + " ".repeat(Math.max(0, width - visibleWidth(line)));
@@ -491,7 +522,10 @@ export class Editor implements Component, Focusable {
 		// Emit hardware cursor marker only when focused and not showing autocomplete
 		const emitCursorMarker = this.focused && !this.autocompleteState;
 
-		for (const layoutLine of visibleLines) {
+		for (let visibleLineIndex = 0; visibleLineIndex < visibleLines.length; visibleLineIndex++) {
+			const layoutLine = visibleLines[visibleLineIndex]!;
+			const absoluteLineIndex = this.scrollOffset + visibleLineIndex;
+			const linePromptPrefix = absoluteLineIndex === 0 ? promptPrefix : " ".repeat(promptPrefixWidth);
 			let displayText = layoutLine.text;
 			let lineVisibleWidth = visibleWidth(layoutLine.text);
 			let cursorInPadding = false;
@@ -519,18 +553,18 @@ export class Editor implements Component, Focusable {
 					displayText = before + marker + cursor;
 					lineVisibleWidth = lineVisibleWidth + 1;
 					// If cursor overflows content width into the padding, flag it
-					if (lineVisibleWidth > contentWidth && paddingX > 0) {
+					if (lineVisibleWidth > inputWidth && paddingX > 0) {
 						cursorInPadding = true;
 					}
 				}
 			}
 
 			// Calculate padding based on actual visible width
-			const padding = " ".repeat(Math.max(0, contentWidth - lineVisibleWidth));
+			const padding = " ".repeat(Math.max(0, inputWidth - lineVisibleWidth));
 			const lineRightPadding = cursorInPadding ? rightPadding.slice(1) : rightPadding;
 
 			// Render the line (no side borders, just horizontal lines above and below)
-			const contentLine = `${leftPadding}${displayText}${padding}${lineRightPadding}`;
+			const contentLine = `${promptLeadingPadding}${linePromptPrefix}${promptTrailingPadding}${displayText}${padding}${lineRightPadding}`;
 			result.push(useBackgroundSurface ? renderSurfaceLine(contentLine) : contentLine);
 		}
 
@@ -551,11 +585,12 @@ export class Editor implements Component, Focusable {
 
 		// Add autocomplete list if active
 		if (this.autocompleteState && this.autocompleteList) {
-			const autocompleteResult = this.autocompleteList.render(contentWidth);
+			const autocompleteResult = this.autocompleteList.render(inputWidth);
+			const promptPrefixPadding = " ".repeat(promptPrefixWidth);
 			for (const line of autocompleteResult) {
 				const lineWidth = visibleWidth(line);
-				const linePadding = " ".repeat(Math.max(0, contentWidth - lineWidth));
-				const contentLine = `${leftPadding}${line}${linePadding}${rightPadding}`;
+				const linePadding = " ".repeat(Math.max(0, inputWidth - lineWidth));
+				const contentLine = `${promptLeadingPadding}${promptPrefixPadding}${promptTrailingPadding}${line}${linePadding}${rightPadding}`;
 				result.push(useBackgroundSurface ? renderSurfaceLine(contentLine) : contentLine);
 			}
 		}
@@ -868,32 +903,43 @@ export class Editor implements Component, Focusable {
 		// Process each logical line
 		for (let i = 0; i < this.state.lines.length; i++) {
 			const line = this.state.lines[i] || "";
+			const hiddenPrefixLength = this.getLineHiddenTextPrefixLength(i, line);
+			const displayLine = line.slice(hiddenPrefixLength);
 			const isCurrentLine = i === this.state.cursorLine;
-			const lineVisibleWidth = visibleWidth(line);
+			const lineVisibleWidth = visibleWidth(displayLine);
+
+			if (displayLine.length === 0) {
+				layoutLines.push({
+					text: "",
+					hasCursor: isCurrentLine,
+					cursorPos: isCurrentLine ? 0 : undefined,
+				});
+				continue;
+			}
 
 			if (lineVisibleWidth <= contentWidth) {
 				// Line fits in one layout line
 				if (isCurrentLine) {
 					layoutLines.push({
-						text: line,
+						text: displayLine,
 						hasCursor: true,
-						cursorPos: this.state.cursorCol,
+						cursorPos: Math.max(0, this.state.cursorCol - hiddenPrefixLength),
 					});
 				} else {
 					layoutLines.push({
-						text: line,
+						text: displayLine,
 						hasCursor: false,
 					});
 				}
 			} else {
 				// Line needs wrapping - use word-aware wrapping
-				const chunks = wordWrapLine(line, contentWidth, [...this.segment(line)]);
+				const chunks = wordWrapLine(displayLine, contentWidth, [...this.segment(displayLine)]);
 
 				for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
 					const chunk = chunks[chunkIndex];
 					if (!chunk) continue;
 
-					const cursorPos = this.state.cursorCol;
+					const cursorPos = Math.max(0, this.state.cursorCol - hiddenPrefixLength);
 					const isLastChunk = chunkIndex === chunks.length - 1;
 
 					// Determine if cursor is in this chunk
@@ -1237,12 +1283,14 @@ export class Editor implements Component, Focusable {
 		this.historyIndex = -1; // Exit history browsing mode
 		this.lastAction = null;
 
-		if (this.state.cursorCol > 0) {
+		const line = this.state.lines[this.state.cursorLine] || "";
+		const lineStartCol = this.getLineHiddenTextPrefixLength(this.state.cursorLine, line);
+
+		if (this.state.cursorCol > lineStartCol) {
 			this.pushUndoSnapshot();
 
 			// Delete grapheme before cursor (handles emojis, combining characters, etc.)
-			const line = this.state.lines[this.state.cursorLine] || "";
-			const beforeCursor = line.slice(0, this.state.cursorCol);
+			const beforeCursor = line.slice(lineStartCol, this.state.cursorCol);
 
 			// Find the last grapheme in the text before cursor
 			const graphemes = [...this.segment(beforeCursor)];
@@ -1254,6 +1302,11 @@ export class Editor implements Component, Focusable {
 
 			this.state.lines[this.state.cursorLine] = before + after;
 			this.setCursorCol(this.state.cursorCol - graphemeLength);
+		} else if (lineStartCol > 0 && line.length === lineStartCol) {
+			this.pushUndoSnapshot();
+
+			this.state.lines[this.state.cursorLine] = "";
+			this.setCursorCol(0);
 		} else if (this.state.cursorLine > 0) {
 			this.pushUndoSnapshot();
 
@@ -1441,7 +1494,8 @@ export class Editor implements Component, Focusable {
 
 	private moveToLineStart(): void {
 		this.lastAction = null;
-		this.setCursorCol(0);
+		const currentLine = this.state.lines[this.state.cursorLine] || "";
+		this.setCursorCol(this.getLineHiddenTextPrefixLength(this.state.cursorLine, currentLine));
 	}
 
 	private moveToLineEnd(): void {
@@ -1454,18 +1508,20 @@ export class Editor implements Component, Focusable {
 		this.historyIndex = -1; // Exit history browsing mode
 
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
+		const lineStartCol = this.getLineHiddenTextPrefixLength(this.state.cursorLine, currentLine);
 
-		if (this.state.cursorCol > 0) {
+		if (this.state.cursorCol > lineStartCol) {
 			this.pushUndoSnapshot();
 
 			// Calculate text to be deleted and save to kill ring (backward deletion = prepend)
-			const deletedText = currentLine.slice(0, this.state.cursorCol);
+			const deletedText = currentLine.slice(lineStartCol, this.state.cursorCol);
 			this.killRing.push(deletedText, { prepend: true, accumulate: this.lastAction === "kill" });
 			this.lastAction = "kill";
 
 			// Delete from start of line up to cursor
-			this.state.lines[this.state.cursorLine] = currentLine.slice(this.state.cursorCol);
-			this.setCursorCol(0);
+			this.state.lines[this.state.cursorLine] =
+				currentLine.slice(0, lineStartCol) + currentLine.slice(this.state.cursorCol);
+			this.setCursorCol(lineStartCol);
 		} else if (this.state.cursorLine > 0) {
 			this.pushUndoSnapshot();
 
@@ -1666,19 +1722,21 @@ export class Editor implements Component, Focusable {
 
 		for (let i = 0; i < this.state.lines.length; i++) {
 			const line = this.state.lines[i] || "";
-			const lineVisWidth = visibleWidth(line);
-			if (line.length === 0) {
+			const hiddenPrefixLength = this.getLineHiddenTextPrefixLength(i, line);
+			const displayLine = line.slice(hiddenPrefixLength);
+			const lineVisWidth = visibleWidth(displayLine);
+			if (displayLine.length === 0) {
 				// Empty line still takes one visual line
-				visualLines.push({ logicalLine: i, startCol: 0, length: 0 });
+				visualLines.push({ logicalLine: i, startCol: hiddenPrefixLength, length: 0 });
 			} else if (lineVisWidth <= width) {
-				visualLines.push({ logicalLine: i, startCol: 0, length: line.length });
+				visualLines.push({ logicalLine: i, startCol: hiddenPrefixLength, length: displayLine.length });
 			} else {
 				// Line needs wrapping - use word-aware wrapping
-				const chunks = wordWrapLine(line, width, [...this.segment(line)]);
+				const chunks = wordWrapLine(displayLine, width, [...this.segment(displayLine)]);
 				for (const chunk of chunks) {
 					visualLines.push({
 						logicalLine: i,
-						startCol: chunk.startIndex,
+						startCol: hiddenPrefixLength + chunk.startIndex,
 						length: chunk.endIndex - chunk.startIndex,
 					});
 				}
@@ -1696,9 +1754,13 @@ export class Editor implements Component, Focusable {
 		line: number,
 		col: number,
 	): number {
+		const hiddenPrefixLength = this.getLineHiddenTextPrefixLength(line, this.state.lines[line] || "");
 		for (let i = 0; i < visualLines.length; i++) {
 			const vl = visualLines[i];
 			if (!vl || vl.logicalLine !== line) continue;
+			if (hiddenPrefixLength > 0 && col < hiddenPrefixLength && vl.startCol === hiddenPrefixLength) {
+				return i;
+			}
 			const offset = col - vl.startCol;
 			// Cursor is in this segment if it's within range. For the last
 			// segment of a logical line, cursor can be at length (end position)
@@ -1734,6 +1796,7 @@ export class Editor implements Component, Focusable {
 
 		if (deltaCol !== 0) {
 			const currentLine = this.state.lines[this.state.cursorLine] || "";
+			const lineStartCol = this.getLineHiddenTextPrefixLength(this.state.cursorLine, currentLine);
 
 			if (deltaCol > 0) {
 				// Moving right - move by one grapheme (handles emojis, combining characters, etc.)
@@ -1755,11 +1818,12 @@ export class Editor implements Component, Focusable {
 				}
 			} else {
 				// Moving left - move by one grapheme (handles emojis, combining characters, etc.)
-				if (this.state.cursorCol > 0) {
-					const beforeCursor = currentLine.slice(0, this.state.cursorCol);
+				if (this.state.cursorCol > lineStartCol) {
+					const beforeCursor = currentLine.slice(lineStartCol, this.state.cursorCol);
 					const graphemes = [...this.segment(beforeCursor)];
 					const lastGrapheme = graphemes[graphemes.length - 1];
-					this.setCursorCol(this.state.cursorCol - (lastGrapheme ? lastGrapheme.segment.length : 1));
+					const previousCol = this.state.cursorCol - (lastGrapheme ? lastGrapheme.segment.length : 1);
+					this.setCursorCol(Math.max(lineStartCol, previousCol));
 				} else if (this.state.cursorLine > 0) {
 					// Wrap to end of previous logical line
 					this.state.cursorLine--;
@@ -1789,9 +1853,10 @@ export class Editor implements Component, Focusable {
 	private moveWordBackwards(): void {
 		this.lastAction = null;
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
+		const lineStartCol = this.getLineHiddenTextPrefixLength(this.state.cursorLine, currentLine);
 
 		// If at start of line, move to end of previous line
-		if (this.state.cursorCol === 0) {
+		if (this.state.cursorCol <= lineStartCol) {
 			if (this.state.cursorLine > 0) {
 				this.state.cursorLine--;
 				const prevLine = this.state.lines[this.state.cursorLine] || "";
@@ -1800,7 +1865,7 @@ export class Editor implements Component, Focusable {
 			return;
 		}
 
-		const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
+		const textBeforeCursor = currentLine.slice(lineStartCol, this.state.cursorCol);
 		const graphemes = [...this.segment(textBeforeCursor)];
 		let newCol = this.state.cursorCol;
 
@@ -1840,7 +1905,7 @@ export class Editor implements Component, Focusable {
 			}
 		}
 
-		this.setCursorCol(newCol);
+		this.setCursorCol(Math.max(lineStartCol, newCol));
 	}
 
 	/**

@@ -4108,11 +4108,11 @@ export class InteractiveMode {
 	private updateEditorBorderColor(): void {
 		// Bash mode keeps a green accent. Otherwise the input surface stays neutral so the
 		// focus indicator doesn't fight the splash.
+		const editorTheme = getEditorTheme();
 		if (this.isBashMode) {
 			this.editor.borderColor = theme.getBashModeBorderColor();
-			this.editor.backgroundColor = (str: string) => theme.bg("toolSuccessBg", str);
+			this.editor.backgroundColor = editorTheme.backgroundColor;
 		} else {
-			const editorTheme = getEditorTheme();
 			this.editor.borderColor = editorTheme.borderColor;
 			this.editor.backgroundColor = editorTheme.backgroundColor;
 		}
