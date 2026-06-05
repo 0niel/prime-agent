@@ -197,6 +197,21 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("onboardingCompleted", () => {
+		it("defaults to false and persists globally", async () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getOnboardingCompleted()).toBe(false);
+
+			manager.setOnboardingCompleted(true);
+			await manager.flush();
+
+			const savedSettings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
+			expect(savedSettings.onboardingCompleted).toBe(true);
+			expect(manager.getOnboardingCompleted()).toBe(true);
+		});
+	});
+
 	describe("error tracking", () => {
 		it("should collect and clear load errors via drainErrors", () => {
 			const globalSettingsPath = join(agentDir, "settings.json");

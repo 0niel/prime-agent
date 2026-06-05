@@ -46,7 +46,8 @@ describe("buildRlmPrompt", () => {
 
 		expect(prompt).toBe(
 			[
-				"You are a coding agent. You solve tasks by writing and executing code, observing results, and iterating one step at a time.",
+				"You are a general purpose agent that uses code to solve tasks.",
+				"You solve tasks by breaking down problems into sub-tasks, writing and executing code, observing results, and iterating one step at a time.",
 				"When you are done, stop calling tools and state your final answer.",
 				"A Python project's interpreter can be in `PATH`. If not use the appropriate `.venv`.",
 				"",
@@ -59,6 +60,10 @@ describe("buildRlmPrompt", () => {
 				"Each Python skill may also be available as a shell command by the same name: `<skill> ...`. Discover its CLI usage with `<skill> --help`.",
 				"",
 				"Use `ipython` for both Python and shell work. For repository shell commands, prefer IPython shell syntax: `!rg ...`, `!npm run check`, or `%%bash` for multi-line scripts. Do not wrap ordinary shell commands in Python subprocesses unless you need Python-level processing.",
+				"",
+				"Each `!cmd` and each `%%bash` cell runs in a throw-away subshell, so shell-level state (`cd`, `export`, `source`, shell variables) does NOT carry to later cells. To persist state, either chain dependent steps inside one cell (e.g. `!cd build && make`, or a single `%%bash` block that sources then uses a venv), or use kernel-level equivalents that survive across calls: `%cd <dir>` for the working directory and `os.environ['VAR'] = '...'` (or `%env VAR=...`) for environment variables — these apply to all subsequent `!` and `%%bash` calls.",
+				"",
+				"Python state in the kernel, by contrast, persists across cells: named variables, helper functions, classes, imports, and shell-output captures via `out = !cmd` (a list of lines) all remain available in every later turn. Tool calls are themselves Python `await` expressions, so their return values can be bound to variables and composed into program logic just like any other call.",
 				"",
 				`The kernel has these Python imports available: ${DEFAULT_RLM_EXTRA_IMPORT_LABELS.join(", ")}. Import them directly; no pip install needed.`,
 				"",
@@ -89,7 +94,7 @@ describe("buildSystemPrompt", () => {
 			messagesPath: "/repo/.pi/sessions/session.jsonl",
 		});
 
-		expect(prompt).toContain("You are a coding agent.");
+		expect(prompt).toContain("You are a general purpose agent that uses code to solve tasks.");
 		expect(prompt).toContain("Working directory: /repo");
 		expect(prompt).toContain("Conversation log: /repo/.pi/sessions/session.jsonl");
 		expect(prompt).toContain("await rlm('sub-task')");
@@ -113,6 +118,8 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("dotenv (python-dotenv)");
 		expect(prompt).toContain("bs4 (Beautiful Soup)");
 		expect(prompt).toContain("prefer IPython shell syntax");
+		expect(prompt).toContain("Each `!cmd` and each `%%bash` cell runs in a throw-away subshell");
+		expect(prompt).toContain("Python state in the kernel, by contrast, persists across cells");
 		expect(prompt).toContain("Do not wrap ordinary shell commands in Python subprocesses");
 		expect(prompt).toContain("Call at most one built-in tool per turn.");
 		expect(prompt).not.toContain("# IPython Kernel Guidance");
@@ -133,7 +140,7 @@ describe("buildSystemPrompt", () => {
 
 		expect(prompt).toContain("custom body");
 		expect(prompt).not.toContain("# IPython Kernel Guidance");
-		expect(prompt).not.toContain("You are a coding agent.");
+		expect(prompt).not.toContain("You are a general purpose agent that uses code to solve tasks.");
 		expect(prompt.indexOf("Current working directory: /repo")).toBeLessThan(prompt.indexOf("custom append"));
 	});
 

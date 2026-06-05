@@ -531,8 +531,7 @@ prime_agent_style_prime_agent_title() {
 				before=${text%%Prime Agent*}
 				rest=${text#*Prime Agent}
 				styled="${styled}${prime_agent_bold}${prime_agent_color_primary}${before}"
-				styled="${styled}${prime_agent_bold}${prime_agent_color_primary}PRIME"
-				styled="${styled}${prime_agent_reset}${prime_agent_italic}${prime_agent_color_primary} Agent${prime_agent_reset}"
+				styled="${styled}${prime_agent_bold}${prime_agent_color_primary}PRIME Agent${prime_agent_reset}"
 				text="$rest"
 				;;
 			*)
@@ -1223,10 +1222,10 @@ configure_standalone_node_path() {
 
 	if shell_profile_has_standalone_node_path "$profile"; then
 		if [ "$prime_agent_screen_enabled" = 1 ]; then
-			prime_agent_screen "Prime Agent installed" "" "Restart your shell or run: . $profile" ""
+			prime_agent_screen "Prime Agent installed" "" "Run: $(prime_agent_source_profile_command "$profile")" ""
 		else
 			printf '%s already contains %s.\n' "$profile" "$PRIME_AGENT_STANDALONE_NODE_BIN"
-			printf 'Restart your shell or run: . %s\n' "$profile"
+			printf 'Restart your shell or run: %s\n' "$(prime_agent_source_profile_command "$profile")"
 		fi
 		return 0
 	fi
@@ -1303,20 +1302,30 @@ prompt_add_standalone_node_path() {
 		printf '%s\n' "$path_line"
 	} >>"$profile"
 	if [ "$prime_agent_screen_enabled" = 1 ]; then
-		prime_agent_screen "Prime Agent installed" "" "Restart your shell or run: . $profile" ""
+		prime_agent_screen "Prime Agent installed" "" "Run: $(prime_agent_source_profile_command "$profile")" ""
 	else
 		printf 'Added %s to %s.\n' "$PRIME_AGENT_STANDALONE_NODE_BIN" "$profile"
-		printf 'Restart your shell or run: . %s\n' "$profile"
+		printf 'Restart your shell or run: %s\n' "$(prime_agent_source_profile_command "$profile")"
 	fi
 }
 
 print_standalone_path_manual_instructions() {
 	printf 'Add this to your shell profile to use %s from new shells:\n\n' "$prime_agent_cmd"
 	printf '  %s\n' "$(standalone_node_path_line)"
+	printf '\nThen restart your shell and run: %s\n' "$prime_agent_cmd"
 }
 
 standalone_node_path_line() {
 	printf 'export PATH="%s:$PATH"' "$PRIME_AGENT_STANDALONE_NODE_BIN"
+}
+
+prime_agent_shell_quote() {
+	quoted=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+	printf "'%s'" "$quoted"
+}
+
+prime_agent_source_profile_command() {
+	printf '. %s && %s' "$(prime_agent_shell_quote "$1")" "$prime_agent_cmd"
 }
 
 download_prime_agent_package() {

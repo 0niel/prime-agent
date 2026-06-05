@@ -79,6 +79,18 @@ describe("PrimeOnboardingSplashComponent", () => {
 		expect(selected).toBe(true);
 	});
 
+	it("renders a model selection action when auth is already available", () => {
+		const component = new PrimeOnboardingSplashComponent(
+			() => {},
+			() => {},
+			{ getRows: () => 36, continueActionLabel: "choose a model" },
+		);
+		const output = stripAnsi(component.render(100).join("\n"));
+
+		expect(output).toContain("Press Enter to choose a model");
+		expect(output).not.toContain("Press Enter to login with Prime Intellect");
+	});
+
 	it("animates the splash at an interactive cadence", () => {
 		vi.useFakeTimers();
 		let renderRequests = 0;

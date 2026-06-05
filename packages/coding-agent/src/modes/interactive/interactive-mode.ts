@@ -1019,8 +1019,47 @@ export class InteractiveMode {
 
 	private shouldRunOnboarding(): boolean {
 		this.session.modelRegistry.refresh();
+		if (this.shouldRunPrimeCliOnboardingSplash()) {
+			return true;
+		}
+		return !this.isCurrentModelReady();
+	}
+
+	private shouldRunPrimeCliOnboardingSplash(): boolean {
+		if (this.settingsManager.getOnboardingCompleted()) {
+			return false;
+		}
 		const model = this.session.model;
-		return !model || !this.session.modelRegistry.hasConfiguredAuth(model);
+		if (!model || model.provider !== PRIME_INFERENCE_PROVIDER_ID) {
+			return false;
+		}
+		const authStatus = this.session.modelRegistry.getProviderAuthStatus(PRIME_INFERENCE_PROVIDER_ID);
+		return authStatus.source === "prime_cli";
+	}
+
+	private isCurrentModelReady(): boolean {
+		const model = this.session.model;
+		return model !== undefined && this.session.modelRegistry.hasConfiguredAuth(model);
+	}
+
+	private completeOnboarding(): void {
+		if (!this.settingsManager.getOnboardingCompleted()) {
+			this.settingsManager.setOnboardingCompleted(true);
+		}
+	}
+
+	private completeOnboardingIfCurrentModelReady(): void {
+		if (this.isCurrentModelReady()) {
+			this.completeOnboarding();
+		}
+	}
+
+	private isOnboardingResolvedAfterModelPrompt(selectedModel: boolean): boolean {
+		if (selectedModel) {
+			this.completeOnboarding();
+			return true;
+		}
+		return !this.shouldRunOnboarding();
 	}
 
 	private async ensurePromptReady(): Promise<boolean> {
@@ -1032,9 +1071,25 @@ export class InteractiveMode {
 
 	private async runOnboardingFlow(): Promise<boolean> {
 		this.session.modelRegistry.refresh();
+		if (this.shouldRunPrimeCliOnboardingSplash()) {
+			const shouldContinue = await this.showOnboardingModelSelectionSplash();
+			if (!shouldContinue) {
+				this.showStatus("Model selection required. Use /model to continue.");
+				return false;
+			}
+
+			const selectedModel = await this.promptForModelSelection({ allowProviderSetup: true });
+			if (this.isOnboardingResolvedAfterModelPrompt(selectedModel)) {
+				return true;
+			}
+
+			this.showStatus("Model selection required. Use /model to continue.");
+			return false;
+		}
+
 		if (this.session.modelRegistry.getAvailable().length > 0) {
 			const selectedModel = await this.promptForModelSelection({ allowProviderSetup: true });
-			if (selectedModel || !this.shouldRunOnboarding()) {
+			if (this.isOnboardingResolvedAfterModelPrompt(selectedModel)) {
 				return true;
 			}
 
@@ -1051,7 +1106,7 @@ export class InteractiveMode {
 		}
 
 		const selectedModel = await this.promptForModelSelection({ allowProviderSetup: true });
-		if (selectedModel || !this.shouldRunOnboarding()) {
+		if (this.isOnboardingResolvedAfterModelPrompt(selectedModel)) {
 			return true;
 		}
 
@@ -4082,6 +4137,7 @@ export class InteractiveMode {
 			} else {
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
+				this.completeOnboardingIfCurrentModelReady();
 				const thinkingStr =
 					result.model.reasoning && result.thinkingLevel !== "off" ? ` (thinking: ${result.thinkingLevel})` : "";
 				this.showStatus(`Switched to ${result.model.name || result.model.id}${thinkingStr}`);
@@ -4602,6 +4658,7 @@ export class InteractiveMode {
 				await this.session.setModel(model);
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
+				this.completeOnboardingIfCurrentModelReady();
 				this.showStatus(`Model: ${model.id}`);
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 				this.checkDaxnutsEasterEgg(model);
@@ -4752,6 +4809,7 @@ export class InteractiveMode {
 						this.footer.invalidate();
 						this.updateEditorBorderColor();
 						close();
+						this.completeOnboardingIfCurrentModelReady();
 						this.showStatus(`Model: ${model.id}`);
 						void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
 						this.checkDaxnutsEasterEgg(model);
@@ -5195,6 +5253,47 @@ export class InteractiveMode {
 				{
 					getRows: () => this.ui.terminal.rows,
 					requestRender: () => this.ui.requestRender(),
+				},
+			);
+			handle = this.ui.showOverlay(selector, {
+				width: "100%",
+				maxHeight: "100%",
+				row: 0,
+				col: 0,
+			});
+		});
+	}
+
+	private showOnboardingModelSelectionSplash(): Promise<boolean> {
+		return new Promise((resolve) => {
+			let settled = false;
+			let handle: OverlayHandle | undefined;
+			let selector: PrimeOnboardingSplashComponent | undefined;
+			const settle = (result: boolean) => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				resolve(result);
+			};
+			const close = () => {
+				selector?.dispose();
+				handle?.hide();
+				this.ui.requestRender();
+			};
+			selector = new PrimeOnboardingSplashComponent(
+				() => {
+					close();
+					settle(true);
+				},
+				() => {
+					close();
+					settle(false);
+				},
+				{
+					getRows: () => this.ui.terminal.rows,
+					requestRender: () => this.ui.requestRender(),
+					continueActionLabel: "choose a model",
 				},
 			);
 			handle = this.ui.showOverlay(selector, {

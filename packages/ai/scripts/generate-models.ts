@@ -145,7 +145,6 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	"qwen/qwen3-vl-235b-a22b-thinking": { contextWindow: 262144, maxTokens: 32768 },
 	"x-ai/grok-4.20": { contextWindow: 2000000, maxTokens: 30000 },
 	"x-ai/grok-4.20-multi-agent": { contextWindow: 2000000, maxTokens: 30000 },
-	"x-ai/grok-code-fast-1": { contextWindow: 32768, maxTokens: 8192 },
 	"z-ai/glm-5": { contextWindow: 202752, maxTokens: 131072 },
 	"z-ai/glm-5.1": { contextWindow: 202800, maxTokens: 131072 },
 };

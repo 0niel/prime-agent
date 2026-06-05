@@ -6,6 +6,7 @@ interface PrimeOnboardingSplashOptions {
 	getRows?: () => number;
 	requestRender?: () => void;
 	animationIntervalMs?: number;
+	continueActionLabel?: string;
 }
 
 const LOGO_LINES = PRIME_BUTTERFLY_LOGO.split("\n");
@@ -101,10 +102,11 @@ export class PrimeOnboardingSplashComponent implements Component {
 	}
 
 	private formatContinueHint(): PanelTextLine {
+		const actionLabel = this.options.continueActionLabel ?? "login with Prime Intellect";
 		return [
 			{ text: "Press ", tone: "muted" },
 			{ text: "Enter", tone: "accent", bold: true },
-			{ text: " to login with Prime Intellect", tone: "muted" },
+			{ text: ` to ${actionLabel}`, tone: "muted" },
 		];
 	}
 

@@ -75,6 +75,7 @@ export type PackageSource =
 
 export interface Settings {
 	lastChangelogVersion?: string;
+	onboardingCompleted?: boolean;
 	defaultProvider?: string;
 	defaultModel?: string;
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -569,6 +570,16 @@ export class SettingsManager {
 	setLastChangelogVersion(version: string): void {
 		this.globalSettings.lastChangelogVersion = version;
 		this.markModified("lastChangelogVersion");
+		this.save();
+	}
+
+	getOnboardingCompleted(): boolean {
+		return this.settings.onboardingCompleted ?? false;
+	}
+
+	setOnboardingCompleted(completed: boolean): void {
+		this.globalSettings.onboardingCompleted = completed;
+		this.markModified("onboardingCompleted");
 		this.save();
 	}
 
