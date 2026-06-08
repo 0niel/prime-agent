@@ -100,6 +100,14 @@ interface DetailSections {
 	bodyLines: string[];
 }
 
+interface ExpandableComponent extends Component {
+	setExpanded(expanded: boolean): void;
+}
+
+function isExpandableComponent(component: Component): component is ExpandableComponent {
+	return "setExpanded" in component && typeof (component as { setExpanded?: unknown }).setExpanded === "function";
+}
+
 function flattenChildAgentNodes(nodes: readonly ChildAgentInspectorNode[]): FlatChildAgentNode[] {
 	const result: FlatChildAgentNode[] = [];
 	const walk = (items: readonly ChildAgentInspectorNode[], depth: number): void => {
@@ -433,17 +441,31 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 	private node: ChildAgentInspectorNode | undefined;
 	private transcriptComponents: Component[] = [];
 	private readonly fallbackTui = { requestRender: () => {} } as TUI;
+	private toolsExpanded = false;
 
 	onCancel?: () => void;
+	onToggleToolsExpanded?: () => void;
 
 	constructor(
 		_getViewportHeight: () => number = () => 0,
 		private readonly options: ChildAgentDetailOptions = {},
-	) {}
+	) {
+		this.toolsExpanded = this.options.getToolsExpanded?.() ?? false;
+	}
 
 	setNode(node: ChildAgentInspectorNode | undefined): void {
 		this.node = node;
+		this.toolsExpanded = this.options.getToolsExpanded?.() ?? this.toolsExpanded;
 		this.rebuildTranscriptComponents();
+	}
+
+	setToolsExpanded(expanded: boolean): void {
+		this.toolsExpanded = expanded;
+		for (const component of this.transcriptComponents) {
+			if (isExpandableComponent(component)) {
+				component.setExpanded(expanded);
+			}
+		}
 	}
 
 	invalidate(): void {
@@ -466,6 +488,10 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 
 	handleInput(data: string): void {
 		const kb = getKeybindings();
+		if (kb.matches(data, "app.tools.expand")) {
+			this.onToggleToolsExpanded?.();
+			return;
+		}
 		if (kb.matches(data, "tui.select.cancel")) {
 			this.onCancel?.();
 		}
@@ -560,7 +586,7 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 			this.options.ui ?? this.fallbackTui,
 			this.options.getCwd?.() ?? process.cwd(),
 		);
-		component.setExpanded(this.options.getToolsExpanded?.() ?? false);
+		component.setExpanded(this.toolsExpanded);
 		if (entry.executionStarted) {
 			component.markExecutionStarted();
 		}
@@ -590,7 +616,11 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 	}
 
 	private detailHintLine(width: number): string {
-		return hintLine([keyAction("tui.select.cancel", "back to subagents", { primaryOnly: true })], width);
+		const expandAction = keyAction("app.tools.expand", this.toolsExpanded ? "to collapse" : "to expand");
+		return hintLine(
+			[keyAction("tui.select.cancel", "back to subagents", { primaryOnly: true }), expandAction],
+			width,
+		);
 	}
 
 	private statusLabel(status: ChildAgentStatus): string {

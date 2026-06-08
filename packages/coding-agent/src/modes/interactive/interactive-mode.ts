@@ -545,6 +545,7 @@ export class InteractiveMode {
 			getHiddenThinkingLabel: () => this.hiddenThinkingLabel,
 		});
 		this.childAgentDetail.onCancel = () => this.showChildAgentList();
+		this.childAgentDetail.onToggleToolsExpanded = () => this.toggleToolOutputExpansion();
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
 		this.keybindings = KeybindingsManager.create();
@@ -4165,6 +4166,7 @@ export class InteractiveMode {
 				child.setExpanded(expanded);
 			}
 		}
+		this.childAgentDetail.setToolsExpanded(expanded);
 		this.ui.requestRender();
 	}
 

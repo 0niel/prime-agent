@@ -19,7 +19,7 @@ function formatKeyPart(part: string, platform: NodeJS.Platform): string {
 		if (normalized === "ctrl") return "Cmd";
 		if (normalized === "alt") return "Option";
 	}
-	return normalized === "esc" ? normalized : normalized.charAt(0).toUpperCase() + normalized.slice(1);
+	return normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }
 
 export function formatKeyText(key: string, platform: NodeJS.Platform = process.platform): string {

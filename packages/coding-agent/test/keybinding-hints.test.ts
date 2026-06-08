@@ -20,8 +20,9 @@ describe("keybinding hint formatting", () => {
 		expect(formatKeyText("ctrl+backspace/pageUp", "win32")).toBe("Ctrl+Backspace/PageUp");
 	});
 
-	it("formats escape as esc", () => {
-		expect(formatKeyText("escape", "linux")).toBe("esc");
-		expect(formatKeyText("ctrl+escape", "linux")).toBe("Ctrl+esc");
+	it("formats escape as Esc", () => {
+		expect(formatKeyText("escape", "linux")).toBe("Esc");
+		expect(formatKeyText("esc", "linux")).toBe("Esc");
+		expect(formatKeyText("ctrl+escape", "linux")).toBe("Ctrl+Esc");
 	});
 });

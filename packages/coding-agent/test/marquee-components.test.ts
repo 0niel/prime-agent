@@ -1,8 +1,9 @@
 import type { AssistantMessage, Usage, UserMessage } from "@earendil-works/pi-ai";
-import { type Component, TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, setKeybindings, TUI, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, test } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.js";
+import { KeybindingsManager } from "../src/core/keybindings.js";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import {
 	ChildAgentDetailComponent,
@@ -83,6 +84,7 @@ async function renderInVirtualTerminal(component: Component, width = 100, height
 describe("marquee TUI components", () => {
 	beforeAll(() => {
 		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
 	});
 
 	test("renders ipython cells with shell magic and collapsed traceback", async () => {
@@ -434,7 +436,7 @@ describe("marquee TUI components", () => {
 		const wideList = stripAnsi(component.render(96).join("\n"));
 		expect(wideList).toContain("Up/Down move");
 		expect(wideList).toContain("Enter open");
-		expect(wideList).toContain("esc close");
+		expect(wideList).toContain("Esc close");
 		expect(wideList).not.toContain("ctrl+c close");
 		for (const line of component.render(96)) {
 			expect(visibleWidth(line)).toBe(96);
@@ -465,7 +467,7 @@ describe("marquee TUI components", () => {
 		expect(detail).toContain("reading shard metrics");
 		expect(detail).toContain("$ echo hi");
 		expect(detail).toContain("hi");
-		expect(detail).toContain("esc back to subagents");
+		expect(detail).toContain("Esc back to subagents");
 		expect(detail).not.toContain("user: inspect training logs");
 		expect(detail).not.toContain("assistant: reading shard metrics");
 		expect(detail).not.toContain("tool: bash");
@@ -482,6 +484,52 @@ describe("marquee TUI components", () => {
 
 		const narrow = stripAnsi(component.render(24).join("\n"));
 		expect(narrow).toContain("inspect t…");
+	});
+
+	test("routes child agent detail tool expansion through app keybindings", () => {
+		setKeybindings(new KeybindingsManager({ "app.tools.expand": "ctrl+x" }));
+		try {
+			const detailComponent = new ChildAgentDetailComponent(() => 20);
+			let toggleCount = 0;
+			detailComponent.onToggleToolsExpanded = () => {
+				toggleCount += 1;
+			};
+			detailComponent.setNode({
+				id: "sub-a",
+				label: "inspect training logs",
+				status: "running",
+				sessionDir: "/tmp/session/sub-a",
+				transcript: [],
+				structuredTranscript: [
+					{
+						type: "tool",
+						role: "tool",
+						text: "bash: hi",
+						toolCallId: "tool-sub-a",
+						toolName: "bash",
+						args: { command: "echo hi" },
+						result: {
+							content: [{ type: "text", text: "hi" }],
+							isError: false,
+						},
+						isPartial: false,
+						executionStarted: true,
+						argsComplete: true,
+					},
+				],
+			});
+
+			const before = stripAnsi(detailComponent.render(80).join("\n"));
+			expect(before).toContain("Ctrl+X to expand");
+			detailComponent.handleInput("\x18");
+
+			expect(toggleCount).toBe(1);
+			detailComponent.setToolsExpanded(true);
+			const after = stripAnsi(detailComponent.render(80).join("\n"));
+			expect(after).toContain("Ctrl+X to collapse");
+		} finally {
+			setKeybindings(new KeybindingsManager());
+		}
 	});
 
 	test("keeps child agent summary visible when the right tray label is long", () => {
@@ -524,7 +572,7 @@ describe("marquee TUI components", () => {
 		const first = stripAnsi(firstLines.join("\n"));
 		expect(first).toContain("fallback transcript row 01");
 		expect(first).toContain("fallback transcript row 12");
-		expect(first).toContain("esc back to subagents");
+		expect(first).toContain("Esc back to subagents");
 		expect(first).not.toContain("↑");
 		expect(first).not.toContain("↓");
 		expect(firstLines.length).toBeGreaterThan(6);
