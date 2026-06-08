@@ -78,11 +78,11 @@ export class CustomEditor extends Editor {
 
 		// Check app keybindings first
 
-		// Escape/interrupt - only if autocomplete is NOT active
-		if (this.keybindings.matches(data, "app.interrupt")) {
+		// Clear input - only if autocomplete is NOT active
+		if (this.keybindings.matches(data, "app.input.clear")) {
 			if (!this.isShowingAutocomplete()) {
 				// Use dynamic onEscape if set, otherwise registered handler
-				const handler = this.onEscape ?? this.actionHandlers.get("app.interrupt");
+				const handler = this.onEscape ?? this.actionHandlers.get("app.input.clear");
 				if (handler) {
 					handler();
 					return;
@@ -105,7 +105,10 @@ export class CustomEditor extends Editor {
 
 		// Check all other app actions
 		for (const [action, handler] of this.actionHandlers) {
-			if (action !== "app.interrupt" && action !== "app.exit" && this.keybindings.matches(data, action)) {
+			if (action !== "app.input.clear" && action !== "app.exit" && this.keybindings.matches(data, action)) {
+				if ((action === "app.clear" || action === "app.interrupt") && this.isShowingAutocomplete()) {
+					this.cancelAutocomplete();
+				}
 				handler();
 				return;
 			}

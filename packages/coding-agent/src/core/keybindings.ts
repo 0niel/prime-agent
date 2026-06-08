@@ -13,6 +13,7 @@ import { getAgentDir } from "../config.js";
 export interface AppKeybindings {
 	"app.interrupt": true;
 	"app.clear": true;
+	"app.input.clear": true;
 	"app.exit": true;
 	"app.suspend": true;
 	"app.thinking.cycle": true;
@@ -64,8 +65,9 @@ declare module "@earendil-works/pi-tui" {
 
 export const KEYBINDINGS = {
 	...TUI_KEYBINDINGS,
-	"app.interrupt": { defaultKeys: "escape", description: "Cancel or abort" },
-	"app.clear": { defaultKeys: "ctrl+c", description: "Clear editor" },
+	"app.interrupt": { defaultKeys: [], description: "Interrupt current operation" },
+	"app.clear": { defaultKeys: "ctrl+c", description: "Interrupt current operation, then exit" },
+	"app.input.clear": { defaultKeys: "escape", description: "Clear input" },
 	"app.exit": { defaultKeys: "ctrl+d", description: "Exit when editor is empty" },
 	"app.suspend": {
 		defaultKeys: process.platform === "win32" ? [] : "ctrl+z",
@@ -242,6 +244,7 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	selectCancel: "tui.select.cancel",
 	interrupt: "app.interrupt",
 	clear: "app.clear",
+	clearInput: "app.input.clear",
 	exit: "app.exit",
 	suspend: "app.suspend",
 	cycleThinkingLevel: "app.thinking.cycle",

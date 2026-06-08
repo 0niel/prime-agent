@@ -2373,7 +2373,7 @@ export class Editor implements Component, Focusable {
 		this.autocompletePrefix = "";
 	}
 
-	private cancelAutocomplete(): void {
+	protected cancelAutocomplete(): void {
 		this.cancelAutocompleteRequest();
 		this.clearAutocompleteUi();
 	}
