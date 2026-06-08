@@ -13,6 +13,31 @@ interface MenuPanelOptions {
 	subtitle?: string;
 }
 
+export interface MenuViewportProvider {
+	getRows?: () => number;
+}
+
+interface MenuListOptions {
+	compact?: boolean | (() => boolean);
+}
+
+interface MenuListLayoutOptions extends MenuViewportProvider {
+	preferredVisibleItems: number;
+	minVisibleItems?: number;
+	totalItems?: number;
+	reservedRows: number;
+	comfortableItemRows: number;
+	compactItemRows?: number;
+	scrollIndicatorRows?: number;
+	comfortableListPaddingRows?: number;
+	compactListPaddingRows?: number;
+}
+
+export interface MenuListLayout {
+	compact: boolean;
+	visibleItems: number;
+}
+
 const PANEL_PADDING_X = 2;
 const PANEL_PADDING_Y = 1;
 const FIELD_PADDING_X = 2;
@@ -25,6 +50,136 @@ interface FullWidthMenuComponent {
 
 function fillsMenuPanel(component: Component): component is Component & FullWidthMenuComponent {
 	return (component as { fillsMenuPanel?: unknown }).fillsMenuPanel === true;
+}
+
+function getViewportRows(getRows: (() => number) | undefined): number | undefined {
+	const rows = getRows?.();
+	if (rows === undefined || !Number.isFinite(rows) || rows <= 0) {
+		return undefined;
+	}
+	return Math.floor(rows);
+}
+
+function visibleItemCount(
+	rows: number,
+	options: {
+		preferredVisibleItems: number;
+		minVisibleItems: number;
+		reservedRows: number;
+		itemRows: number;
+		listPaddingRows: number;
+		extraRows: number;
+	},
+): number {
+	const capacityRows = Math.max(0, rows - options.reservedRows - options.listPaddingRows - options.extraRows);
+	const itemCapacity = Math.floor(capacityRows / options.itemRows);
+	return Math.max(options.minVisibleItems, Math.min(options.preferredVisibleItems, itemCapacity));
+}
+
+function listRowsUsed(options: {
+	reservedRows: number;
+	listPaddingRows: number;
+	visibleItems: number;
+	itemRows: number;
+	extraRows: number;
+}): number {
+	return options.reservedRows + options.listPaddingRows + options.extraRows + options.visibleItems * options.itemRows;
+}
+
+function scrollIndicatorRows(options: {
+	totalItems: number | undefined;
+	visibleItems: number;
+	scrollIndicatorRows: number;
+}): number {
+	if (options.totalItems === undefined || options.scrollIndicatorRows <= 0) {
+		return 0;
+	}
+	return options.totalItems > options.visibleItems ? options.scrollIndicatorRows : 0;
+}
+
+function getLayoutCandidate(
+	rows: number,
+	options: MenuListLayoutOptions,
+	itemRows: number,
+	listPaddingRows: number,
+	compact: boolean,
+): MenuListLayout & { rowsUsed: number; fits: boolean } {
+	const minVisibleItems = options.minVisibleItems ?? 1;
+	const preferredVisibleItems = Math.max(minVisibleItems, options.preferredVisibleItems);
+	const visibleItemsWithoutScroll = visibleItemCount(rows, {
+		preferredVisibleItems,
+		minVisibleItems,
+		reservedRows: options.reservedRows,
+		itemRows,
+		listPaddingRows,
+		extraRows: 0,
+	});
+	const extraRows = scrollIndicatorRows({
+		totalItems: options.totalItems,
+		visibleItems: visibleItemsWithoutScroll,
+		scrollIndicatorRows: options.scrollIndicatorRows ?? 0,
+	});
+	const visibleItems =
+		extraRows > 0
+			? visibleItemCount(rows, {
+					preferredVisibleItems,
+					minVisibleItems,
+					reservedRows: options.reservedRows,
+					itemRows,
+					listPaddingRows,
+					extraRows,
+				})
+			: visibleItemsWithoutScroll;
+	const rowsUsed = listRowsUsed({
+		reservedRows: options.reservedRows,
+		listPaddingRows,
+		visibleItems,
+		itemRows,
+		extraRows,
+	});
+	return {
+		compact,
+		visibleItems,
+		rowsUsed,
+		fits: rowsUsed <= rows,
+	};
+}
+
+export function getMenuListLayout(options: MenuListLayoutOptions): MenuListLayout {
+	const minVisibleItems = options.minVisibleItems ?? 1;
+	const preferredVisibleItems = Math.max(minVisibleItems, options.preferredVisibleItems);
+	const rows = getViewportRows(options.getRows);
+	if (rows === undefined) {
+		return { compact: false, visibleItems: preferredVisibleItems };
+	}
+
+	const comfortableLayout = getLayoutCandidate(
+		rows,
+		options,
+		Math.max(1, options.comfortableItemRows),
+		options.comfortableListPaddingRows ?? 1,
+		false,
+	);
+	if (options.compactItemRows === undefined) {
+		return { compact: false, visibleItems: comfortableLayout.visibleItems };
+	}
+
+	const compactLayout = getLayoutCandidate(
+		rows,
+		options,
+		Math.max(1, options.compactItemRows),
+		options.compactListPaddingRows ?? 0,
+		true,
+	);
+	if (compactLayout.fits && (!comfortableLayout.fits || compactLayout.visibleItems > comfortableLayout.visibleItems)) {
+		return { compact: true, visibleItems: compactLayout.visibleItems };
+	}
+	if (comfortableLayout.fits) {
+		return { compact: false, visibleItems: comfortableLayout.visibleItems };
+	}
+	return compactLayout.rowsUsed <= comfortableLayout.rowsUsed
+		? { compact: true, visibleItems: compactLayout.visibleItems }
+		: { compact: false, visibleItems: comfortableLayout.visibleItems };
 }
 
 function surfaceLine(text: string, width: number, paddingX = PANEL_PADDING_X): string {
@@ -209,11 +364,20 @@ export class MenuRow implements Component, FullWidthMenuComponent {
 export class MenuList extends Container implements FullWidthMenuComponent {
 	readonly fillsMenuPanel = true;
 
+	constructor(private readonly options: MenuListOptions = {}) {
+		super();
+	}
+
 	override render(width: number): string[] {
 		const lines: string[] = [];
+		const compact = this.isCompact();
 		for (let index = 0; index < this.children.length; index++) {
 			const child = this.children[index];
 			if (child instanceof MenuRow) {
+				if (compact) {
+					lines.push(...child.renderContent(width));
+					continue;
+				}
 				const previousChild = this.children[index - 1];
 				const nextChild = this.children[index + 1];
 				const previousRow = previousChild instanceof MenuRow ? previousChild : undefined;
@@ -233,5 +397,10 @@ export class MenuList extends Container implements FullWidthMenuComponent {
 			}
 		}
 		return lines;
+	}
+
+	private isCompact(): boolean {
+		const compact = this.options.compact;
+		return typeof compact === "function" ? compact() : compact === true;
 	}
 }

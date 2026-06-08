@@ -4803,6 +4803,7 @@ export class InteractiveMode {
 						settle({ status: "action", actionId });
 					},
 					subtitle: options?.subtitle,
+					getRows: () => this.ui.terminal.rows,
 				},
 			);
 			handle = this.showFullPaneOverlay(selector, 96);
@@ -5311,6 +5312,7 @@ export class InteractiveMode {
 					resolve({ status: "cancelled" });
 				},
 				(providerId) => this.session.modelRegistry.getProviderAuthStatus(providerId),
+				{ getRows: () => this.ui.terminal.rows },
 			);
 			handle = this.showFullPaneOverlay(selector, 78);
 		});
@@ -5358,6 +5360,8 @@ export class InteractiveMode {
 					done();
 					this.ui.requestRender();
 				},
+				undefined,
+				{ getRows: () => this.ui.terminal.rows },
 			);
 			return { component: selector, focus: selector };
 		});
@@ -5470,6 +5474,7 @@ export class InteractiveMode {
 					close();
 					resolve(undefined);
 				},
+				{ getRows: () => this.ui.terminal.rows },
 			);
 			handle = this.showFullPaneOverlay(selector, 78);
 		});
@@ -5721,6 +5726,7 @@ export class InteractiveMode {
 					restoreDialog();
 					resolve(undefined);
 				},
+				{ getRows: () => this.ui.terminal.rows },
 			);
 			selectorHandle = this.showFullPaneOverlay(selector, 76);
 		});

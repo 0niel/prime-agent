@@ -4,7 +4,14 @@ import type { ModelRegistry } from "../../../core/model-registry.js";
 import type { SettingsManager } from "../../../core/settings-manager.js";
 import { theme } from "../theme/theme.js";
 import { keyHint, keyText } from "./keybinding-hints.js";
-import { MenuList, MenuPanel, MenuRow, MenuSearchInput } from "./menu-panel.js";
+import {
+	getMenuListLayout,
+	MenuList,
+	MenuPanel,
+	MenuRow,
+	MenuSearchInput,
+	type MenuViewportProvider,
+} from "./menu-panel.js";
 
 interface ModelItem {
 	provider: string;
@@ -27,9 +34,19 @@ interface ModelSelectorOptions {
 	actions?: ReadonlyArray<ModelSelectorAction>;
 	onAction?: (actionId: string) => void;
 	subtitle?: string;
+	getRows?: () => number;
 }
 
 type ModelScope = "all" | "scoped";
+
+const PREFERRED_VISIBLE_MODELS = 10;
+const MODEL_LIST_RESERVED_ROWS = {
+	base: 7,
+	detail: 2,
+};
+const MODEL_SCROLL_INDICATOR_ROWS = 1;
+const MODEL_HELP_MIN_ROWS = 12;
+const MODEL_DETAIL_MIN_ROWS = 14;
 
 /**
  * Component that renders a model selector with search
@@ -65,6 +82,17 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private scope: ModelScope = "all";
 	private scopeText?: Text;
 	private scopeHintText?: Text;
+	private panel: MenuPanel;
+	private headerHelpContainer: Container;
+	private warningText?: Text;
+	private listLayout = getMenuListLayout({
+		preferredVisibleItems: PREFERRED_VISIBLE_MODELS,
+		reservedRows: MODEL_LIST_RESERVED_ROWS.base,
+		comfortableItemRows: 3,
+		compactItemRows: 2,
+	});
+	private responsiveLayoutKey = "";
+	private readonly viewport: MenuViewportProvider;
 
 	constructor(
 		tui: TUI,
@@ -89,27 +117,27 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.onCancelCallback = onCancel;
 		this.actions = options.actions ?? [];
 		this.onActionCallback = options.onAction;
+		this.viewport = { getRows: options.getRows };
 
-		const panel = new MenuPanel({
+		this.panel = new MenuPanel({
 			title: "Models",
 			subtitle: options.subtitle ?? "Available from configured providers.",
 		});
-		this.addChild(panel);
+		this.addChild(this.panel);
 
 		// Add hint about model filtering
 		if (scopedModels.length > 0) {
 			this.scopeText = new Text(this.getScopeText(), 0, 0);
-			panel.addChild(this.scopeText);
 			this.scopeHintText = new Text(this.getScopeHintText(), 0, 0);
-			panel.addChild(this.scopeHintText);
 		} else {
 			const hintText =
 				this.actions.length > 0
 					? `Only showing models from configured providers. ${keyText("app.provider.add")} to add providers and access more models.`
 					: "Only showing models from configured providers. Use /login to add providers and see more models.";
-			panel.addChild(new Text(theme.fg("warning", hintText), 0, 0));
+			this.warningText = new Text(theme.fg("warning", hintText), 0, 0);
 		}
-		panel.addChild(new Spacer(1));
+		this.headerHelpContainer = new Container();
+		this.panel.addChild(this.headerHelpContainer);
 
 		// Create search input
 		this.searchInput = new MenuSearchInput("Search models");
@@ -119,13 +147,14 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.searchInput.onSubmit = () => {
 			this.handleConfirm();
 		};
-		panel.addChild(this.searchInput);
+		this.panel.addChild(this.searchInput);
 
-		panel.addChild(new Spacer(1));
+		this.panel.addChild(new Spacer(1));
 
 		// Create list container
-		this.listContainer = new MenuList();
-		panel.addChild(this.listContainer);
+		this.listContainer = new MenuList({ compact: () => this.listLayout.compact });
+		this.panel.addChild(this.listContainer);
+		this.updateResponsiveLayout();
 
 		// Load models and do initial render
 		this.loadModels().then(() => {
@@ -232,10 +261,20 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.updateList();
 	}
 
+	override render(width: number): string[] {
+		const previousLayoutKey = this.responsiveLayoutKey;
+		this.updateResponsiveLayout();
+		if (this.responsiveLayoutKey !== previousLayoutKey) {
+			this.updateList();
+		}
+		return super.render(width);
+	}
+
 	private updateList(): void {
+		this.updateResponsiveLayout();
 		this.listContainer.clear();
 
-		const maxVisible = 10;
+		const maxVisible = this.listLayout.visibleItems;
 		const selectedModelIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
 		const startIndex = Math.max(
 			0,
@@ -278,7 +317,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			this.listContainer.addChild(new Text(theme.fg("muted", "No matching models"), 0, 0));
 		} else {
 			const selected = this.filteredModels[this.selectedIndex];
-			if (selected) {
+			if (selected && this.shouldShowSelectedDetails()) {
 				this.listContainer.addChild(new Spacer(1));
 				this.listContainer.addChild(new Text(theme.fg("muted", selected.model.name), 0, 0));
 			}
@@ -351,5 +390,57 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	getSearchInput(): MenuSearchInput {
 		return this.searchInput;
+	}
+
+	private updateResponsiveLayout(): void {
+		const showHeaderHelp = this.shouldShowHeaderHelp();
+		let headerHelpRows = 0;
+		this.headerHelpContainer.clear();
+		if (showHeaderHelp) {
+			if (this.scopeText && this.scopeHintText) {
+				this.headerHelpContainer.addChild(this.scopeText);
+				this.headerHelpContainer.addChild(this.scopeHintText);
+				headerHelpRows += 2;
+			} else if (this.warningText) {
+				this.headerHelpContainer.addChild(this.warningText);
+				headerHelpRows += 1;
+			}
+			this.headerHelpContainer.addChild(new Spacer(1));
+			headerHelpRows += 1;
+		}
+
+		const reservedRows =
+			MODEL_LIST_RESERVED_ROWS.base +
+			headerHelpRows +
+			(this.shouldShowSelectedDetails() ? MODEL_LIST_RESERVED_ROWS.detail : 0);
+		this.listLayout = getMenuListLayout({
+			getRows: this.viewport.getRows,
+			preferredVisibleItems: PREFERRED_VISIBLE_MODELS,
+			totalItems: this.filteredModels.length,
+			reservedRows,
+			comfortableItemRows: 3,
+			compactItemRows: 2,
+			scrollIndicatorRows: MODEL_SCROLL_INDICATOR_ROWS,
+		});
+		this.responsiveLayoutKey = [
+			showHeaderHelp ? "help" : "no-help",
+			headerHelpRows,
+			this.shouldShowSelectedDetails() ? "detail" : "no-detail",
+			this.listLayout.compact ? "compact" : "comfortable",
+			this.listLayout.visibleItems,
+		].join(":");
+	}
+
+	private shouldShowHeaderHelp(): boolean {
+		return this.hasRows(MODEL_HELP_MIN_ROWS);
+	}
+
+	private shouldShowSelectedDetails(): boolean {
+		return this.hasRows(MODEL_DETAIL_MIN_ROWS);
+	}
+
+	private hasRows(minRows: number): boolean {
+		const rows = this.viewport.getRows?.();
+		return rows === undefined || !Number.isFinite(rows) || rows >= minRows;
 	}
 }

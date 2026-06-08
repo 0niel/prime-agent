@@ -1,7 +1,13 @@
 import { type Component, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it } from "vitest";
-import { MenuList, MenuPanel, MenuRow, MenuSearchInput } from "../src/modes/interactive/components/menu-panel.js";
+import {
+	getMenuListLayout,
+	MenuList,
+	MenuPanel,
+	MenuRow,
+	MenuSearchInput,
+} from "../src/modes/interactive/components/menu-panel.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 class StaticComponent implements Component {
@@ -100,6 +106,74 @@ describe("MenuPanel", () => {
 		expect(selectedIndex).toBeGreaterThan(0);
 		expect(output[selectedIndex - 1]?.trim()).toBe("");
 		expect(output[selectedIndex - 2]?.trim()).not.toBe("");
+		for (const line of lines) {
+			expect(visibleWidth(line)).toBe(40);
+		}
+	});
+
+	it("uses compact list layout when the comfortable layout would overflow", () => {
+		const layout = getMenuListLayout({
+			getRows: () => 24,
+			preferredVisibleItems: 8,
+			reservedRows: 8,
+			comfortableItemRows: 3,
+			compactItemRows: 2,
+		});
+
+		expect(layout).toEqual({ compact: true, visibleItems: 8 });
+	});
+
+	it("reserves scroll indicator rows when sizing visible items", () => {
+		const layout = getMenuListLayout({
+			getRows: () => 16,
+			preferredVisibleItems: 10,
+			totalItems: 12,
+			reservedRows: 12,
+			comfortableItemRows: 3,
+			compactItemRows: 2,
+			scrollIndicatorRows: 1,
+		});
+
+		expect(layout).toEqual({ compact: true, visibleItems: 1 });
+	});
+
+	it("uses compact layout when neither layout can fully fit", () => {
+		const layout = getMenuListLayout({
+			getRows: () => 5,
+			preferredVisibleItems: 3,
+			reservedRows: 4,
+			comfortableItemRows: 3,
+			compactItemRows: 2,
+		});
+
+		expect(layout).toEqual({ compact: true, visibleItems: 1 });
+	});
+
+	it("renders compact rows without vertical padding", () => {
+		const list = new MenuList({ compact: true });
+		list.addChild(
+			new MenuRow({
+				primary: "first",
+				secondary: "provider",
+				selected: true,
+			}),
+		);
+		list.addChild(
+			new MenuRow({
+				primary: "second",
+				secondary: "provider",
+				selected: false,
+			}),
+		);
+
+		const lines = list.render(40);
+		const output = lines.map((line) => stripAnsi(line));
+
+		expect(lines).toHaveLength(4);
+		expect(output[0]).toContain("first");
+		expect(output[1]).toContain("provider");
+		expect(output[2]).toContain("second");
+		expect(output[3]).toContain("provider");
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBe(40);
 		}

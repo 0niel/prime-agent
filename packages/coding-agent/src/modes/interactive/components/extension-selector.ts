@@ -4,14 +4,20 @@
  */
 
 import { Container, getKeybindings, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
+import { theme } from "../theme/theme.js";
 import { CountdownTimer } from "./countdown-timer.js";
 import { keyHint, rawKeyHint } from "./keybinding-hints.js";
-import { MenuList, MenuPanel, MenuRow } from "./menu-panel.js";
+import { getMenuListLayout, MenuList, MenuPanel, MenuRow, type MenuViewportProvider } from "./menu-panel.js";
 
 export interface ExtensionSelectorOptions {
 	tui?: TUI;
 	timeout?: number;
+	getRows?: () => number;
 }
+
+const PREFERRED_VISIBLE_OPTIONS = 8;
+const OPTION_LIST_RESERVED_ROWS = 6;
+const OPTION_SCROLL_INDICATOR_ROWS = 1;
 
 export class ExtensionSelectorComponent extends Container {
 	private options: string[];
@@ -22,6 +28,13 @@ export class ExtensionSelectorComponent extends Container {
 	private baseTitle: string;
 	private countdown: CountdownTimer | undefined;
 	private panel: MenuPanel;
+	private listLayout = getMenuListLayout({
+		preferredVisibleItems: PREFERRED_VISIBLE_OPTIONS,
+		reservedRows: OPTION_LIST_RESERVED_ROWS,
+		comfortableItemRows: 2,
+		compactItemRows: 1,
+	});
+	private readonly viewport: MenuViewportProvider;
 
 	constructor(
 		title: string,
@@ -36,6 +49,8 @@ export class ExtensionSelectorComponent extends Container {
 		this.onSelectCallback = onSelect;
 		this.onCancelCallback = onCancel;
 		this.baseTitle = title;
+		const tui = opts?.tui;
+		this.viewport = { getRows: opts?.getRows ?? (tui ? () => tui.terminal.rows : undefined) };
 
 		this.panel = new MenuPanel({
 			title,
@@ -51,7 +66,7 @@ export class ExtensionSelectorComponent extends Container {
 			);
 		}
 
-		this.listContainer = new MenuList();
+		this.listContainer = new MenuList({ compact: () => this.listLayout.compact });
 		this.panel.addChild(this.listContainer);
 		this.panel.addChild(new Spacer(1));
 		this.panel.addChild(
@@ -69,15 +84,39 @@ export class ExtensionSelectorComponent extends Container {
 		this.updateList();
 	}
 
+	override render(width: number): string[] {
+		const previousLayout = this.listLayout;
+		this.updateLayout();
+		if (
+			this.listLayout.compact !== previousLayout.compact ||
+			this.listLayout.visibleItems !== previousLayout.visibleItems
+		) {
+			this.updateList();
+		}
+		return super.render(width);
+	}
+
 	private updateList(): void {
+		this.updateLayout();
 		this.listContainer.clear();
-		for (let i = 0; i < this.options.length; i++) {
+		const maxVisible = this.listLayout.visibleItems;
+		const startIndex = Math.max(
+			0,
+			Math.min(this.selectedIndex - Math.floor(maxVisible / 2), this.options.length - maxVisible),
+		);
+		const endIndex = Math.min(startIndex + maxVisible, this.options.length);
+		for (let i = startIndex; i < endIndex; i++) {
 			const isSelected = i === this.selectedIndex;
 			this.listContainer.addChild(
 				new MenuRow({
 					primary: this.options[i] ?? "",
 					selected: isSelected,
 				}),
+			);
+		}
+		if (startIndex > 0 || endIndex < this.options.length) {
+			this.listContainer.addChild(
+				new Text(theme.fg("muted", `  (${this.selectedIndex + 1}/${this.options.length})`), 0, 0),
 			);
 		}
 	}
@@ -100,5 +139,17 @@ export class ExtensionSelectorComponent extends Container {
 
 	dispose(): void {
 		this.countdown?.dispose();
+	}
+
+	private updateLayout(): void {
+		this.listLayout = getMenuListLayout({
+			getRows: this.viewport.getRows,
+			preferredVisibleItems: PREFERRED_VISIBLE_OPTIONS,
+			totalItems: this.options.length,
+			reservedRows: OPTION_LIST_RESERVED_ROWS,
+			comfortableItemRows: 2,
+			compactItemRows: 1,
+			scrollIndicatorRows: OPTION_SCROLL_INDICATOR_ROWS,
+		});
 	}
 }

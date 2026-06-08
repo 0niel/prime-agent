@@ -1,7 +1,14 @@
 import { Container, type Focusable, fuzzyFilter, getKeybindings, Spacer, TruncatedText } from "@earendil-works/pi-tui";
 import type { AuthStatus, AuthStorage } from "../../../core/auth-storage.js";
 import { theme } from "../theme/theme.js";
-import { MenuList, MenuPanel, MenuRow, MenuSearchInput } from "./menu-panel.js";
+import {
+	getMenuListLayout,
+	MenuList,
+	MenuPanel,
+	MenuRow,
+	MenuSearchInput,
+	type MenuViewportProvider,
+} from "./menu-panel.js";
 
 export type AuthSelectorProvider = {
 	id: string;
@@ -15,6 +22,10 @@ export function compareAuthSelectorProviders(a: AuthSelectorProvider, b: AuthSel
 	}
 	return a.name.localeCompare(b.name);
 }
+
+const PREFERRED_VISIBLE_PROVIDERS = 8;
+const PROVIDER_LIST_RESERVED_ROWS = 7;
+const PROVIDER_SCROLL_INDICATOR_ROWS = 1;
 
 /**
  * Component that renders an auth provider selector
@@ -41,6 +52,13 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 	private getAuthStatus: (providerId: string) => AuthStatus;
 	private onSelectCallback: (provider: AuthSelectorProvider) => void;
 	private onCancelCallback: () => void;
+	private listLayout = getMenuListLayout({
+		preferredVisibleItems: PREFERRED_VISIBLE_PROVIDERS,
+		reservedRows: PROVIDER_LIST_RESERVED_ROWS,
+		comfortableItemRows: 3,
+		compactItemRows: 2,
+	});
+	private readonly viewport: MenuViewportProvider;
 
 	constructor(
 		mode: "login" | "logout",
@@ -49,12 +67,14 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		onSelect: (provider: AuthSelectorProvider) => void,
 		onCancel: () => void,
 		getAuthStatus?: (providerId: string) => AuthStatus,
+		viewport: MenuViewportProvider = {},
 	) {
 		super();
 
 		this.mode = mode;
 		this.authStorage = authStorage;
 		this.getAuthStatus = getAuthStatus ?? ((providerId) => this.authStorage.getAuthStatus(providerId));
+		this.viewport = viewport;
 		this.allProviders = this.sortProviders(providers);
 		this.filteredProviders = this.allProviders;
 		this.onSelectCallback = onSelect;
@@ -77,7 +97,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		panel.addChild(new Spacer(1));
 
 		// Create list container
-		this.listContainer = new MenuList();
+		this.listContainer = new MenuList({ compact: () => this.listLayout.compact });
 		panel.addChild(this.listContainer);
 
 		// Initial render
@@ -113,10 +133,23 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		return this.getAuthStatus(provider.id).source !== undefined;
 	}
 
+	override render(width: number): string[] {
+		const previousLayout = this.listLayout;
+		this.updateLayout();
+		if (
+			this.listLayout.compact !== previousLayout.compact ||
+			this.listLayout.visibleItems !== previousLayout.visibleItems
+		) {
+			this.updateList();
+		}
+		return super.render(width);
+	}
+
 	private updateList(): void {
+		this.updateLayout();
 		this.listContainer.clear();
 
-		const maxVisible = 8;
+		const maxVisible = this.listLayout.visibleItems;
 		const startIndex = Math.max(
 			0,
 			Math.min(this.selectedIndex - Math.floor(maxVisible / 2), this.filteredProviders.length - maxVisible),
@@ -214,5 +247,17 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			this.searchInput.handleInput(keyData);
 			this.filterProviders(this.searchInput.getValue());
 		}
+	}
+
+	private updateLayout(): void {
+		this.listLayout = getMenuListLayout({
+			getRows: this.viewport.getRows,
+			preferredVisibleItems: PREFERRED_VISIBLE_PROVIDERS,
+			totalItems: this.filteredProviders.length,
+			reservedRows: PROVIDER_LIST_RESERVED_ROWS,
+			comfortableItemRows: 3,
+			compactItemRows: 2,
+			scrollIndicatorRows: PROVIDER_SCROLL_INDICATOR_ROWS,
+		});
 	}
 }

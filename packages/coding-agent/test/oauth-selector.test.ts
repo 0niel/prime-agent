@@ -196,4 +196,32 @@ describe("OAuthSelectorComponent", () => {
 		expect(output).toContain("command in models.json");
 		expect(output).not.toContain("unconfigured");
 	});
+
+	it("keeps the provider menu within a short terminal viewport", () => {
+		const authStorage = AuthStorage.inMemory();
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			Array.from({ length: 12 }, (_, index) => ({
+				id: `provider-${index + 1}`,
+				name: `Provider ${index + 1}`,
+				authType: "api_key" as const,
+			})),
+			() => {},
+			() => {},
+			() => ({ configured: false }),
+			{ getRows: () => 12 },
+		);
+
+		expect(selector.render(80)).toHaveLength(12);
+
+		for (let i = 0; i < 5; i++) {
+			selector.handleInput("\x1b[B");
+		}
+		const output = stripAnsi(selector.render(80).join("\n"));
+
+		expect(selector.render(80)).toHaveLength(12);
+		expect(output).toContain("Provider 3");
+		expect(output).toContain("(6/12)");
+	});
 });
