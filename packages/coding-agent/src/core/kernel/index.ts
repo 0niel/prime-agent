@@ -325,6 +325,10 @@ export class KernelManager {
 		return this.options.sessionId;
 	}
 
+	private appendKernelDiagnostic(message: string): void {
+		this.kernelStderr += `[kernel] ${message.endsWith("\n") ? message : `${message}\n`}`;
+	}
+
 	async start(options: KernelStartOptions = {}): Promise<void> {
 		if (!this.startPromise) {
 			this.startPromise = this.doStart(options);
@@ -364,12 +368,11 @@ export class KernelManager {
 		kernel.stderr?.on("data", (buf: Buffer) => {
 			const s = buf.toString();
 			this.kernelStderr += s;
-			process.stderr.write(`[kernel] ${s}`);
 		});
 
 		kernel.on("error", (err) => {
 			if (this.kernel !== kernel) return;
-			console.error(`[kernel] spawn error: ${err.message}`);
+			this.appendKernelDiagnostic(`spawn error: ${err.message}`);
 			this.state = "shutdown";
 			liveKernels.delete(this);
 		});
@@ -377,7 +380,7 @@ export class KernelManager {
 		kernel.on("exit", (code, signal) => {
 			if (this.kernel !== kernel) return;
 			if (this.state !== "shutdown") {
-				console.error(`[kernel] unexpected exit code=${code} signal=${signal}`);
+				this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
 			}
 			this.state = "shutdown";
 			liveKernels.delete(this);
@@ -595,7 +598,7 @@ export class KernelManager {
 			}
 		} catch (error) {
 			if ((this.state as string) !== "shutdown") {
-				console.error(`[kernel] iopub pump failed: ${errorMessage(error)}`);
+				this.appendKernelDiagnostic(`iopub pump failed: ${errorMessage(error)}`);
 				this.rejectActiveExecution(new Error(`Kernel IOPub channel failed: ${errorMessage(error)}`));
 			}
 		} finally {
@@ -731,17 +734,17 @@ export class KernelManager {
 				try {
 					await this.sendCommMessage(commId, { status: "ok", ...result });
 				} catch (replyError) {
-					console.error(
-						`[kernel] failed to send rlm.run ok reply for comm ${commId}: ${errorMessage(replyError)}`,
+					this.appendKernelDiagnostic(
+						`failed to send rlm.run ok reply for comm ${commId}: ${errorMessage(replyError)}`,
 					);
 				}
 			} catch (error) {
-				console.error(`[kernel] rlm.run failed for comm ${commId}: ${errorMessage(error)}`);
+				this.appendKernelDiagnostic(`rlm.run failed for comm ${commId}: ${errorMessage(error)}`);
 				try {
 					await this.sendCommMessage(commId, { status: "error", error: errorMessage(error) });
 				} catch (replyError) {
-					console.error(
-						`[kernel] failed to send rlm.run error reply for comm ${commId}: ${errorMessage(replyError)}`,
+					this.appendKernelDiagnostic(
+						`failed to send rlm.run error reply for comm ${commId}: ${errorMessage(replyError)}`,
 					);
 				}
 			}
@@ -824,7 +827,9 @@ export class KernelManager {
 			globalThis.clearTimeout(timeout);
 		}
 		if (result === "timeout") {
-			console.error(`[kernel] timed out waiting ${timeoutMs}ms for ${tasks.length} rlm.run task(s) during dispose`);
+			this.appendKernelDiagnostic(
+				`timed out waiting ${timeoutMs}ms for ${tasks.length} rlm.run task(s) during dispose`,
+			);
 		}
 	}
 

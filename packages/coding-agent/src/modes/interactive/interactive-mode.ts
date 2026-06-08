@@ -104,7 +104,7 @@ import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipb
 import { parseGitUrl } from "../../utils/git.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
-import { ensureTool } from "../../utils/tools-manager.js";
+import { ensureTool, MISSING_RIPGREP_MESSAGE } from "../../utils/tools-manager.js";
 import { checkForNewPiVersion } from "../../utils/version-check.js";
 import { ArminComponent } from "./components/armin.js";
 import { AssistantMessageComponent } from "./components/assistant-message.js";
@@ -725,8 +725,11 @@ export class InteractiveMode {
 
 		// Ensure fd and rg are available (downloads if missing, adds to PATH via getBinDir)
 		// fd powers autocomplete, and rg is available for shell commands.
-		const [fdPath] = await Promise.all([ensureTool("fd"), ensureTool("rg")]);
+		const [fdPath, rgPath] = await Promise.all([ensureTool("fd"), ensureTool("rg")]);
 		this.fdPath = fdPath;
+		if (!rgPath) {
+			this.showWarning(MISSING_RIPGREP_MESSAGE);
+		}
 
 		// Add header container as first child
 		this.ui.addChild(this.headerContainer);
@@ -4225,7 +4228,7 @@ export class InteractiveMode {
 
 	showWarning(warningMessage: string): void {
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
+		this.chatContainer.addChild(new Text(theme.fg("warning", `⚠ ${warningMessage}`), 1, 0));
 		this.ui.requestRender();
 	}
 
