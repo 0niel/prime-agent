@@ -18,6 +18,7 @@ prime_agent_hide_cursor="${prime_agent_esc}[?25l"
 prime_agent_show_cursor="${prime_agent_esc}[?25h"
 prime_agent_home_cursor="${prime_agent_esc}[H"
 prime_agent_clear_screen="${prime_agent_esc}[2J${prime_agent_esc}[H"
+prime_agent_clear_line="${prime_agent_esc}[K"
 prime_agent_sync_start="${prime_agent_esc}[?2026h"
 prime_agent_sync_end="${prime_agent_esc}[?2026l"
 prime_agent_color_text="${prime_agent_esc}[38;2;244;244;245m"
@@ -27,7 +28,7 @@ prime_agent_color_primary="${prime_agent_esc}[38;2;127;91;213m"
 prime_agent_color_scan="${prime_agent_esc}[38;2;14;165;233m"
 prime_agent_color_warning="${prime_agent_esc}[38;2;245;158;11m"
 readonly prime_agent_unconfigured_base_url prime_agent_base_url prime_agent_package prime_agent_cmd prime_agent_esc prime_agent_original_path
-readonly prime_agent_reset prime_agent_bold prime_agent_italic prime_agent_hide_cursor prime_agent_show_cursor prime_agent_home_cursor prime_agent_clear_screen
+readonly prime_agent_reset prime_agent_bold prime_agent_italic prime_agent_hide_cursor prime_agent_show_cursor prime_agent_home_cursor prime_agent_clear_screen prime_agent_clear_line
 readonly prime_agent_sync_start prime_agent_sync_end
 readonly prime_agent_color_text prime_agent_color_muted prime_agent_color_dim prime_agent_color_primary prime_agent_color_scan prime_agent_color_warning
 
@@ -38,6 +39,11 @@ prime_agent_screen_rows=24
 prime_agent_screen_drawn=0
 prime_agent_screen_last_cols=0
 prime_agent_screen_last_rows=0
+prime_agent_screen_layout_ready=0
+prime_agent_screen_layout_show_logo=0
+prime_agent_screen_layout_lab_width=0
+prime_agent_screen_render_lab_width=0
+prime_agent_screen_compact=0
 prime_agent_download_dir=
 prime_agent_bootstrap_kernel_on_install=0
 prime_agent_screen_title=
@@ -218,6 +224,8 @@ prime_agent_screen() {
 	prime_agent_screen_question="${4:-}"
 	prime_agent_screen_frame=$((prime_agent_screen_frame + 1))
 	prime_agent_read_terminal_size
+	prime_agent_init_screen_layout
+	prime_agent_refresh_screen_layout_mode
 
 	if [ "$prime_agent_screen_drawn" = 0 ] ||
 		[ "$prime_agent_screen_cols" -ne "$prime_agent_screen_last_cols" ] ||
@@ -236,6 +244,70 @@ prime_agent_screen() {
 	else
 		printf '%s%s%s\n%s' "$prime_agent_sync_start" "$prime_agent_screen_prefix" "$prime_agent_screen_frame_text" "$prime_agent_sync_end" >&2
 	fi
+}
+
+prime_agent_init_screen_layout() {
+	if [ "$prime_agent_screen_layout_ready" = 1 ]; then
+		return
+	fi
+
+	prime_agent_screen_layout_ready=1
+	prime_agent_screen_layout_show_logo=0
+	prime_agent_screen_layout_lab_width=0
+	prime_agent_screen_render_lab_width=0
+	if prime_agent_terminal_size_supports_logo; then
+		prime_agent_screen_layout_show_logo=1
+		prime_agent_screen_layout_lab_width=$(prime_agent_lab_width_for_cols "$prime_agent_screen_cols")
+	fi
+}
+
+prime_agent_refresh_screen_layout_mode() {
+	prime_agent_screen_compact=0
+	prime_agent_screen_render_lab_width=0
+	if [ "$prime_agent_screen_layout_show_logo" != 1 ]; then
+		return
+	fi
+	if [ "$prime_agent_screen_rows" -lt 17 ]; then
+		prime_agent_screen_compact=1
+		return
+	fi
+
+	max_safe_width=$((prime_agent_screen_cols - 1))
+	if [ "$max_safe_width" -lt 32 ]; then
+		prime_agent_screen_compact=1
+		return
+	fi
+
+	prime_agent_screen_render_lab_width="$prime_agent_screen_layout_lab_width"
+	if [ "$prime_agent_screen_render_lab_width" -gt "$max_safe_width" ]; then
+		prime_agent_screen_render_lab_width="$max_safe_width"
+	fi
+}
+
+prime_agent_terminal_size_supports_logo() {
+	[ "$prime_agent_screen_rows" -ge 22 ] && [ "$prime_agent_screen_cols" -ge 42 ]
+}
+
+prime_agent_lab_width_for_cols() {
+	cols="$1"
+	width=$((cols - 6))
+	if [ "$width" -gt 78 ]; then
+		width=78
+	fi
+	if [ "$width" -lt 42 ]; then
+		width=42
+	fi
+	max_safe_width=$((cols - 1))
+	if [ "$max_safe_width" -lt 1 ]; then
+		max_safe_width=1
+	fi
+	if [ "$width" -gt "$max_safe_width" ]; then
+		width="$max_safe_width"
+	fi
+	if [ "$width" -lt 32 ]; then
+		width=32
+	fi
+	printf '%s' "$width"
 }
 
 prime_agent_render_screen() {
@@ -267,7 +339,7 @@ prime_agent_content_height() {
 }
 
 prime_agent_show_logo() {
-	[ "$prime_agent_screen_rows" -ge 22 ] && [ "$prime_agent_screen_cols" -ge 42 ]
+	[ "$prime_agent_screen_layout_show_logo" = 1 ] && [ "$prime_agent_screen_compact" != 1 ] && [ "$prime_agent_screen_render_lab_width" -ge 32 ]
 }
 
 prime_agent_content_line() {
@@ -327,13 +399,7 @@ prime_agent_screen_primary_text() {
 
 prime_agent_set_lab_line() {
 	lab_row="$1"
-	prime_agent_lab_width=$((prime_agent_screen_cols - 6))
-	if [ "$prime_agent_lab_width" -gt 78 ]; then
-		prime_agent_lab_width=78
-	fi
-	if [ "$prime_agent_lab_width" -lt 42 ]; then
-		prime_agent_lab_width=42
-	fi
+	prime_agent_lab_width="$prime_agent_screen_render_lab_width"
 
 	logo_line=$(prime_agent_logo_line "$lab_row")
 	if [ -n "$logo_line" ]; then
@@ -566,14 +632,10 @@ prime_agent_print_centered_line() {
 	if [ "$left" -lt 0 ]; then
 		left=0
 	fi
-	right=$((prime_agent_screen_cols - left - width))
-	if [ "$right" -lt 0 ]; then
-		right=0
-	fi
 	if [ -n "$style" ]; then
-		printf '%*s%s%s%s%*s\n' "$left" "" "$style" "$text" "$prime_agent_reset" "$right" ""
+		printf '%*s%s%s%s%s\n' "$left" "" "$style" "$text" "$prime_agent_reset" "$prime_agent_clear_line"
 	else
-		printf '%*s%s%*s\n' "$left" "" "$text" "$right" ""
+		printf '%*s%s%s\n' "$left" "" "$text" "$prime_agent_clear_line"
 	fi
 }
 
