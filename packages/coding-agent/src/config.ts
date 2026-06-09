@@ -434,6 +434,15 @@ export function getBundledInteractiveAssetPath(name: string): string {
 	return join(getInteractiveAssetsDir(), name);
 }
 
+/**
+ * Get the directory containing built-in skills shipped with the package.
+ * - For Bun binary: skills/ next to executable (copied by copy-binary-assets)
+ * - For Node.js (dist/) and tsx (src/): <package root>/skills
+ */
+export function getBundledSkillsDir(): string {
+	return join(getPackageDir(), "skills");
+}
+
 // =============================================================================
 // App Config (from package.json piConfig)
 // =============================================================================

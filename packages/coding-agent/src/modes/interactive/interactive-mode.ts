@@ -588,6 +588,10 @@ export class InteractiveMode {
 		const scopePrefix = sourceInfo.scope === "user" ? "u" : sourceInfo.scope === "project" ? "p" : "t";
 		const source = sourceInfo.source.trim();
 
+		if (source === "builtin") {
+			return "builtin";
+		}
+
 		if (source === "auto" || source === "local" || source === "cli") {
 			return scopePrefix;
 		}
@@ -4486,6 +4490,7 @@ export class InteractiveMode {
 					autoResizeImages: this.settingsManager.getImageAutoResize(),
 					blockImages: this.settingsManager.getBlockImages(),
 					enableSkillCommands: this.settingsManager.getEnableSkillCommands(),
+					enableBuiltinSkills: this.settingsManager.getEnableBuiltinSkills(),
 					steeringMode: this.session.steeringMode,
 					followUpMode: this.session.followUpMode,
 					transport: this.settingsManager.getTransport(),
@@ -4533,6 +4538,10 @@ export class InteractiveMode {
 					onEnableSkillCommandsChange: (enabled) => {
 						this.settingsManager.setEnableSkillCommands(enabled);
 						this.setupAutocompleteProvider();
+					},
+					onEnableBuiltinSkillsChange: (enabled) => {
+						this.settingsManager.setEnableBuiltinSkills(enabled);
+						void this.handleReloadCommand();
 					},
 					onSteeringModeChange: (mode) => {
 						this.session.setSteeringMode(mode);

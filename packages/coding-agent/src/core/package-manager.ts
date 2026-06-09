@@ -27,7 +27,7 @@ import type { Readable } from "node:stream";
 import { globSync } from "glob";
 import ignore from "ignore";
 import { minimatch } from "minimatch";
-import { CONFIG_DIR_NAME } from "../config.js";
+import { CONFIG_DIR_NAME, getBundledSkillsDir } from "../config.js";
 import { shouldUseWindowsShell } from "../utils/child-process.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
@@ -111,6 +111,8 @@ interface PackageManagerOptions {
 	cwd: string;
 	agentDir: string;
 	settingsManager: SettingsManager;
+	/** Directory of built-in skills shipped with the package. Defaults to the bundled skills dir; pass null to disable. */
+	bundledSkillsDir?: string | null;
 }
 
 type SourceScope = "user" | "project" | "temporary";
@@ -169,8 +171,10 @@ interface ResourceAccumulator {
  *   2  user + settings entry (source: "local", scope: "user")
  *   3  user + auto-discovered (source: "auto", scope: "user")
  *   4  package resource (origin: "package")
+ *   5  built-in resource shipped with prime-agent (source: "builtin")
  */
 function resourcePrecedenceRank(m: PathMetadata): number {
+	if (m.source === "builtin") return 5;
 	if (m.origin === "package") return 4;
 	const scopeBase = m.scope === "project" ? 0 : 2;
 	return scopeBase + (m.source === "local" ? 0 : 1);
@@ -758,6 +762,7 @@ export class DefaultPackageManager implements PackageManager {
 	private cwd: string;
 	private agentDir: string;
 	private settingsManager: SettingsManager;
+	private bundledSkillsDir: string | null;
 	private globalNpmRoot: string | undefined;
 	private globalNpmRootCommandKey: string | undefined;
 	private progressCallback: ProgressCallback | undefined;
@@ -766,6 +771,7 @@ export class DefaultPackageManager implements PackageManager {
 		this.cwd = options.cwd;
 		this.agentDir = options.agentDir;
 		this.settingsManager = options.settingsManager;
+		this.bundledSkillsDir = options.bundledSkillsDir === undefined ? getBundledSkillsDir() : options.bundledSkillsDir;
 	}
 
 	setProgressCallback(callback: ProgressCallback | undefined): void {
@@ -2228,6 +2234,22 @@ export class DefaultPackageManager implements PackageManager {
 			userOverrides.skills,
 			globalBaseDir,
 		);
+
+		if (this.bundledSkillsDir && this.settingsManager.getEnableBuiltinSkills()) {
+			const builtinMetadata: PathMetadata = {
+				source: "builtin",
+				scope: "user",
+				origin: "top-level",
+				baseDir: this.bundledSkillsDir,
+			};
+			addResources(
+				"skills",
+				collectAutoSkillEntries(this.bundledSkillsDir, "pi"),
+				builtinMetadata,
+				userOverrides.skills,
+				this.bundledSkillsDir,
+			);
+		}
 		addResources(
 			"prompts",
 			collectAutoPromptEntries(userDirs.prompts),

@@ -9,6 +9,7 @@ Prime Agent implements the [Agent Skills standard](https://agentskills.io/specif
 ## Table of Contents
 
 - [Locations](#locations)
+- [Built-in Skills](#built-in-skills)
 - [How Skills Work](#how-skills-work)
 - [Python-Backed Skills](#python-backed-skills)
 - [Skill Commands](#skill-commands)
@@ -33,6 +34,7 @@ Prime Agent loads skills from:
 - Packages: `skills/` directories or `pi.skills` entries in `package.json`
 - Settings: `skills` array with files or directories
 - CLI: `--skill <path>` (repeatable, additive even with `--no-skills`)
+- Built-in: `skills/` shipped with the prime-agent package (lowest precedence)
 
 Discovery rules:
 - In `~/.prime/agent/skills/` and `.prime/agent/skills/`, direct root `.md` files are discovered as individual skills
@@ -40,6 +42,30 @@ Discovery rules:
 - In `~/.agents/skills/` and project `.agents/skills/`, root `.md` files are ignored
 
 Disable discovery with `--no-skills` (explicit `--skill` paths still load).
+
+## Built-in Skills
+
+Prime Agent ships with built-in skills that teach the agent the Prime Intellect ecosystem:
+
+- `prime-intellect` - Prime Intellect products and workflows via the prime CLI: verifiers environments and the Environments Hub, evaluations (local and hosted), Hosted Training and prime-rl, sandboxes, tunnels, Prime Inference, GPU compute, and storage. Reference docs for each area load on demand from the skill's `references/` directory.
+
+Built-in skills behave like any other skill but have the lowest precedence: a user, project, or package skill with the same name overrides the built-in one.
+
+To disable all built-in skills, set `enableBuiltinSkills` to `false` in `settings.json` (or toggle "Built-in skills" in `/settings`):
+
+```json
+{
+  "enableBuiltinSkills": false
+}
+```
+
+`--no-skills` also excludes them. To disable a single built-in skill, force-exclude it in the global `skills` array (patterns resolve against the built-in skills directory):
+
+```json
+{
+  "skills": ["-prime-intellect/SKILL.md"]
+}
+```
 
 ### Using Skills from Other Harnesses
 

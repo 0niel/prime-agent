@@ -60,6 +60,9 @@ function getGroupLabel(metadata: PathMetadata): string {
 		return `${metadata.source} (${metadata.scope})`;
 	}
 	// Top-level resources
+	if (metadata.source === "builtin") {
+		return "Built-in";
+	}
 	if (metadata.source === "auto") {
 		return metadata.scope === "user" ? `User (~/${CONFIG_DIR_NAME}/)` : `Project (${CONFIG_DIR_NAME}/)`;
 	}
@@ -534,6 +537,11 @@ class ResourceList implements Component, Focusable {
 	}
 
 	private getResourcePattern(item: ResourceItem): string {
+		// Built-in resources live under the package install dir; their override
+		// patterns are matched relative to metadata.baseDir, not the config dir.
+		if (item.metadata.source === "builtin" && item.metadata.baseDir) {
+			return relative(item.metadata.baseDir, item.path);
+		}
 		const scope = item.metadata.scope as "user" | "project";
 		const baseDir = this.getTopLevelBaseDir(scope);
 		return relative(baseDir, item.path);

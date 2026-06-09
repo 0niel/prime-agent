@@ -128,6 +128,8 @@ export interface DefaultResourceLoaderOptions {
 	noPromptTemplates?: boolean;
 	noThemes?: boolean;
 	noContextFiles?: boolean;
+	/** Directory of built-in skills shipped with the package. Defaults to the bundled skills dir; pass null to disable. */
+	bundledSkillsDir?: string | null;
 	systemPrompt?: string;
 	appendSystemPrompt?: string[];
 	extensionsOverride?: (base: LoadExtensionsResult) => LoadExtensionsResult;
@@ -213,6 +215,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			cwd: this.cwd,
 			agentDir: this.agentDir,
 			settingsManager: this.settingsManager,
+			bundledSkillsDir: options.bundledSkillsDir,
 		});
 		this.additionalExtensionPaths = options.additionalExtensionPaths ?? [];
 		this.additionalSkillPaths = options.additionalSkillPaths ?? [];

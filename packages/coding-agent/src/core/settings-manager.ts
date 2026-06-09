@@ -96,6 +96,7 @@ export interface Settings {
 	prompts?: string[]; // Array of local prompt template paths or directories
 	themes?: string[]; // Array of local theme file paths or directories
 	enableSkillCommands?: boolean; // default: true - register skills as /skill:name commands
+	enableBuiltinSkills?: boolean; // default: true - load built-in skills shipped with prime-agent
 	terminal?: TerminalSettings;
 	images?: ImageSettings;
 	enabledModels?: string[]; // Model patterns for cycling (same format as --models CLI flag)
@@ -873,6 +874,16 @@ export class SettingsManager {
 	setEnableSkillCommands(enabled: boolean): void {
 		this.globalSettings.enableSkillCommands = enabled;
 		this.markModified("enableSkillCommands");
+		this.save();
+	}
+
+	getEnableBuiltinSkills(): boolean {
+		return this.settings.enableBuiltinSkills ?? true;
+	}
+
+	setEnableBuiltinSkills(enabled: boolean): void {
+		this.globalSettings.enableBuiltinSkills = enabled;
+		this.markModified("enableBuiltinSkills");
 		this.save();
 	}
 

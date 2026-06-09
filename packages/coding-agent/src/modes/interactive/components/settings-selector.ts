@@ -36,6 +36,7 @@ export interface SettingsConfig {
 	autoResizeImages: boolean;
 	blockImages: boolean;
 	enableSkillCommands: boolean;
+	enableBuiltinSkills: boolean;
 	steeringMode: "all" | "one-at-a-time";
 	followUpMode: "all" | "one-at-a-time";
 	transport: Transport;
@@ -61,6 +62,7 @@ export interface SettingsCallbacks {
 	onAutoResizeImagesChange: (enabled: boolean) => void;
 	onBlockImagesChange: (blocked: boolean) => void;
 	onEnableSkillCommandsChange: (enabled: boolean) => void;
+	onEnableBuiltinSkillsChange: (enabled: boolean) => void;
 	onSteeringModeChange: (mode: "all" | "one-at-a-time") => void;
 	onFollowUpModeChange: (mode: "all" | "one-at-a-time") => void;
 	onTransportChange: (transport: Transport) => void;
@@ -368,8 +370,18 @@ export class SettingsSelectorComponent extends Container {
 			values: ["true", "false"],
 		});
 
-		// Hardware cursor toggle (insert after skill-commands)
-		const skillCommandsIndex = items.findIndex((item) => item.id === "skill-commands");
+		// Built-in skills toggle (insert after skill-commands)
+		const skillCommandsItemIndex = items.findIndex((item) => item.id === "skill-commands");
+		items.splice(skillCommandsItemIndex + 1, 0, {
+			id: "builtin-skills",
+			label: "Built-in skills",
+			description: "Load built-in skills shipped with prime-agent (takes effect after reload)",
+			currentValue: config.enableBuiltinSkills ? "true" : "false",
+			values: ["true", "false"],
+		});
+
+		// Hardware cursor toggle (insert after builtin-skills)
+		const skillCommandsIndex = items.findIndex((item) => item.id === "builtin-skills");
 		items.splice(skillCommandsIndex + 1, 0, {
 			id: "show-hardware-cursor",
 			label: "Show hardware cursor",
@@ -444,6 +456,9 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "skill-commands":
 						callbacks.onEnableSkillCommandsChange(newValue === "true");
+						break;
+					case "builtin-skills":
+						callbacks.onEnableBuiltinSkillsChange(newValue === "true");
 						break;
 					case "steering-mode":
 						callbacks.onSteeringModeChange(newValue as "all" | "one-at-a-time");

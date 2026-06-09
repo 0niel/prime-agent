@@ -63,6 +63,7 @@ describe("DefaultPackageManager", () => {
 			cwd: tempDir,
 			agentDir,
 			settingsManager,
+			bundledSkillsDir: null,
 		});
 	});
 

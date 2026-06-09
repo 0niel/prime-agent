@@ -211,6 +211,7 @@ Paths in `~/.pi/agent/settings.json` resolve relative to `~/.pi/agent`. Paths in
 | `prompts` | string[] | `[]` | Local prompt template paths or directories |
 | `themes` | string[] | `[]` | Local theme file paths or directories |
 | `enableSkillCommands` | boolean | `true` | Register skills as `/skill:name` commands |
+| `enableBuiltinSkills` | boolean | `true` | Load built-in skills shipped with prime-agent |
 
 Arrays support glob patterns and exclusions. Use `!pattern` to exclude. Use `+path` to force-include an exact path and `-path` to force-exclude an exact path.
 
