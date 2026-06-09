@@ -19,6 +19,15 @@ export type {
 	AgentConnectionState,
 } from "./agent-connection/index.js";
 export { DaemonAgentConnection, InProcessAgentConnection } from "./agent-connection/index.js";
+export { type AgentsViewModeOptions, runAgentsViewMode } from "./agents-view/agents-view-mode.js";
+export {
+	type AgentsViewRow,
+	type AgentsViewSection,
+	buildAgentsViewRows,
+	classifyAgentsViewSession,
+	sectionTitle,
+	shouldShowAgentsViewSession,
+} from "./agents-view/agents-view-state.js";
 export { DaemonClient, type DaemonClientMessageListener } from "./daemon/daemon-client.js";
 export { type DaemonModeOptions, runDaemonMode } from "./daemon/daemon-mode.js";
 export type {
@@ -53,6 +62,7 @@ export { defaultDaemonSocketPath } from "./daemon/daemon-socket.js";
 export {
 	InteractiveMode,
 	type InteractiveModeOptions,
+	type InteractiveModeRunResult,
 } from "./interactive/interactive-mode.js";
 export {
 	createInteractiveModeLocalSessionHost,

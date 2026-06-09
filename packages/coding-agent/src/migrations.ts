@@ -12,6 +12,7 @@ import {
 	renameSync,
 	rmdirSync,
 	rmSync,
+	statSync,
 	writeFileSync,
 } from "fs";
 import { basename, dirname, join } from "path";
@@ -185,9 +186,18 @@ export function migrateLegacySessionDirsToSessionRoot(): void {
 
 		for (const file of files) {
 			const oldPath = join(legacyDir, file);
-			const newPath = join(sessionsDir, file);
-			if (existsSync(newPath) || !isSessionJsonlFile(oldPath)) {
+			let newPath = join(sessionsDir, file);
+			if (!isSessionJsonlFile(oldPath)) {
 				continue;
+			}
+			if (existsSync(newPath)) {
+				if (filesHaveSameContent(oldPath, newPath)) {
+					// Already migrated; leave the legacy copy alone.
+					continue;
+				}
+				// A different session shares the basename; move it under a unique name
+				// so it stays discoverable by the flat-root list and continue paths.
+				newPath = uniqueSessionRootPath(sessionsDir, file);
 			}
 			try {
 				renameSync(oldPath, newPath);
@@ -202,6 +212,27 @@ export function migrateLegacySessionDirsToSessionRoot(): void {
 			}
 		} catch {
 			// Ignore cleanup errors; migrated files are already in the flat root.
+		}
+	}
+}
+
+function filesHaveSameContent(a: string, b: string): boolean {
+	try {
+		if (statSync(a).size !== statSync(b).size) {
+			return false;
+		}
+		return readFileSync(a, "utf-8") === readFileSync(b, "utf-8");
+	} catch {
+		return false;
+	}
+}
+
+function uniqueSessionRootPath(sessionsDir: string, file: string): string {
+	const base = file.endsWith(".jsonl") ? file.slice(0, -".jsonl".length) : file;
+	for (let n = 1; ; n++) {
+		const candidate = join(sessionsDir, `${base}-${n}.jsonl`);
+		if (!existsSync(candidate)) {
+			return candidate;
 		}
 	}
 }

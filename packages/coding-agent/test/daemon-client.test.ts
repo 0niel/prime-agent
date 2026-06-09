@@ -142,6 +142,33 @@ describe("DaemonClient", () => {
 		await expect(secondAttempt).resolves.toMatchObject({ message: "retry reached socket" });
 	});
 
+	it("captures the daemon hello greeting for version checks", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+
+		expect(client.hello).toBeUndefined();
+		const waited = client.waitForHello();
+		const hello = {
+			type: "daemon_hello",
+			socketPath: "/tmp/prime-agent.sock",
+			protocol: { name: "prime-agent.daemon", version: 1 },
+			appVersion: "9.9.9",
+			clientId: "client-1",
+			serverCapabilities: [],
+		};
+		socket.emit("data", `${JSON.stringify(hello)}\n`);
+
+		await expect(waited).resolves.toMatchObject({ appVersion: "9.9.9" });
+		expect(client.hello).toMatchObject({ protocol: { version: 1 }, appVersion: "9.9.9" });
+		await expect(client.waitForHello()).resolves.toMatchObject({ appVersion: "9.9.9" });
+
+		client.close();
+	});
+
 	it("serializes activeSessionId for session commands", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 

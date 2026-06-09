@@ -262,7 +262,12 @@ function colorValueToRgb(value: string | number | undefined): Rgb | undefined {
 	if (!value || !value.startsWith("#")) {
 		return undefined;
 	}
-	return hexToRgb(value);
+	try {
+		return hexToRgb(value);
+	} catch {
+		// Malformed theme colors (e.g. 3-character hex shorthand) should not crash rendering.
+		return undefined;
+	}
 }
 
 function luminance(rgb: Rgb): number {

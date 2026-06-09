@@ -6,6 +6,7 @@ describe("InteractiveMode compaction events", () => {
 		const fakeThis = {
 			isInitialized: true,
 			footer: { invalidate: vi.fn() },
+			updateConnectionStateFromEvent: vi.fn(),
 			autoCompactionLoader: undefined,
 			defaultEditor: {},
 			statusContainer: { clear: vi.fn() },

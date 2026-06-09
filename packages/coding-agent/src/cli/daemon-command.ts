@@ -392,7 +392,7 @@ function parseSessionOption(
 			return { consumed: 0, continueRecent: true };
 		case "--resume":
 		case "-r":
-			return { consumed: 0 };
+			throw new Error(`${arg} is not supported for daemon sessions; use --session <selector> or --continue instead`);
 		case "--session": {
 			const value = readValue();
 			return {
@@ -498,7 +498,9 @@ function parseSessionOption(
 		case "--offline":
 			return SESSION_BOOLEAN_FLAGS.has(arg) ? boolean(arg) : undefined;
 		case "--no-session":
-			return { consumed: 0 };
+			throw new Error(
+				"--no-session is not supported for daemon sessions; daemon-owned sessions are always persisted",
+			);
 		default:
 			if (!arg.startsWith("--")) {
 				return undefined;
@@ -746,11 +748,13 @@ async function runPrompt(client: DaemonClient, args: string[]): Promise<void> {
 		throw new Error("Usage: daemon prompt <session> <message>");
 	}
 
-	const finished = waitForSessionEnd(client, activeSessionId);
+	let promptAcknowledged = false;
+	const finished = waitForSessionEnd(client, activeSessionId, () => promptAcknowledged);
 	const unsubscribeOutput = client.onMessage(printJsonLine);
 	try {
 		await requireSuccessAsync(client.request({ type: "attach", activeSessionId }));
 		await requireSuccessAsync(client.request({ type: "prompt", activeSessionId, message }));
+		promptAcknowledged = true;
 		await finished.promise;
 	} finally {
 		unsubscribeOutput();
@@ -860,7 +864,11 @@ function createDaemonMessageWaiter(
 	return { promise, cancel: resolveOnce };
 }
 
-function waitForSessionEnd(client: DaemonClient, activeSessionId: string): SessionEndWaiter {
+function waitForSessionEnd(
+	client: DaemonClient,
+	activeSessionId: string,
+	isPromptAcknowledged?: () => boolean,
+): SessionEndWaiter {
 	let observedAgentStart = false;
 	return createDaemonMessageWaiter(client, (message) => {
 		if (message.type === "session_closed" && message.activeSessionId === activeSessionId) {
@@ -873,7 +881,11 @@ function waitForSessionEnd(client: DaemonClient, activeSessionId: string): Sessi
 			observedAgentStart = true;
 			return false;
 		}
-		return message.event.type === "agent_end" && observedAgentStart;
+		// Requiring agent_start guards against replayed agent_end events from the
+		// attach snapshot, but an agent that was already running when we attached
+		// never emits agent_start to this client. Once our prompt is acknowledged,
+		// any later agent_end is live, so accept it to avoid hanging.
+		return message.event.type === "agent_end" && (observedAgentStart || (isPromptAcknowledged?.() ?? false));
 	});
 }
 

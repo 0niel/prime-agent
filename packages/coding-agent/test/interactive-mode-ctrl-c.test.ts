@@ -13,18 +13,17 @@ type FakeEditor = {
 type FakeInteractiveMode = {
 	ctrlCExitHintExpiresAt: number;
 	ctrlCExitHintTimer: ReturnType<typeof setTimeout> | undefined;
-	isBashMode: boolean;
 	isShuttingDown: boolean;
 	editor: FakeEditor;
-	session: {
+	connectionState: {
 		isStreaming: boolean;
 		isCompacting: boolean;
-		isRetrying: boolean;
-		isBashRunning: boolean;
+		retryAttempt: number;
+	};
+	agentConnection: {
 		abortRetry: Mock;
 		abortCompaction: Mock;
 		abortBranchSummary: Mock;
-		abortBash: Mock;
 	};
 	childAgentSummary: { invalidate: Mock };
 	ui: { requestRender: Mock; onDebug?: () => void };
@@ -63,30 +62,27 @@ function createInteractiveFake(options: {
 	editorText?: string;
 	streaming?: boolean;
 	compacting?: boolean;
-	retrying?: boolean;
-	bashRunning?: boolean;
-	bashMode?: boolean;
+	retryAttempt?: number;
 }): FakeInteractiveMode {
 	const editor = createEditor(options.editorText ?? "");
 	const fake: FakeInteractiveMode = {
 		ctrlCExitHintExpiresAt: 0,
 		ctrlCExitHintTimer: undefined,
-		isBashMode: options.bashMode ?? false,
 		isShuttingDown: false,
 		editor,
-		session: {
+		connectionState: {
 			isStreaming: options.streaming ?? false,
 			isCompacting: options.compacting ?? false,
-			isRetrying: options.retrying ?? false,
-			isBashRunning: options.bashRunning ?? false,
+			retryAttempt: options.retryAttempt ?? 0,
+		},
+		agentConnection: {
 			abortRetry: vi.fn(),
 			abortCompaction: vi.fn(),
 			abortBranchSummary: vi.fn(),
-			abortBash: vi.fn(),
 		},
 		childAgentSummary: { invalidate: vi.fn() },
 		ui: { requestRender: vi.fn() },
-		restoreQueuedMessagesToEditor: vi.fn(),
+		restoreQueuedMessagesToEditor: vi.fn().mockResolvedValue(0),
 		shutdown: vi.fn().mockResolvedValue(undefined),
 		updateEditorBorderColor: vi.fn(),
 	};
@@ -154,17 +150,6 @@ describe("InteractiveMode Ctrl+C flow", () => {
 		expect(mode.shutdown).not.toHaveBeenCalled();
 	});
 
-	it("clears bash-mode input on first Ctrl+C", () => {
-		const mode = createInteractiveFake({ editorText: "!echo hi", bashMode: true });
-
-		Reflect.get(InteractiveMode.prototype, "handleCtrlC").call(mode);
-
-		expect(mode.editor.getText()).toBe("");
-		expect(mode.isBashMode).toBe(false);
-		expect(mode.updateEditorBorderColor).toHaveBeenCalledTimes(1);
-		expect(mode.shutdown).not.toHaveBeenCalled();
-	});
-
 	it("makes Escape clear input without aborting the agent", () => {
 		const actionHandlers = new Map<string, () => void>();
 		const mode = createInteractiveFake({ editorText: "draft", streaming: true });
@@ -184,10 +169,9 @@ describe("InteractiveMode Ctrl+C flow", () => {
 		defaultEditor.onEscape?.();
 
 		expect(mode.editor.getText()).toBe("");
-		expect(mode.session.abortRetry).not.toHaveBeenCalled();
-		expect(mode.session.abortCompaction).not.toHaveBeenCalled();
-		expect(mode.session.abortBranchSummary).not.toHaveBeenCalled();
+		expect(mode.agentConnection.abortRetry).not.toHaveBeenCalled();
+		expect(mode.agentConnection.abortCompaction).not.toHaveBeenCalled();
+		expect(mode.agentConnection.abortBranchSummary).not.toHaveBeenCalled();
 		expect(mode.restoreQueuedMessagesToEditor).not.toHaveBeenCalled();
-		expect(mode.session.abortBash).not.toHaveBeenCalled();
 	});
 });

@@ -7,6 +7,7 @@ import {
 	type InteractiveDaemonStartupDecision,
 	parseDaemonRichTuiAttachShortcut,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
+	shouldOpenAgentsViewForDaemonInteractive,
 	shouldUseDaemonInteractive,
 	shouldUseEphemeralSessionManagerForDaemonInteractive,
 } from "../src/main.js";
@@ -62,6 +63,26 @@ describe("interactive startup routing", () => {
 });
 
 describe("daemon-backed interactive session manager routing", () => {
+	test("opens agents view for default daemon-backed interactive startup", () => {
+		expect(
+			shouldOpenAgentsViewForDaemonInteractive({
+				useDaemonInteractive: true,
+			}),
+		).toBe(true);
+	});
+
+	const directAttachCases: Array<[string, Parameters<typeof shouldOpenAgentsViewForDaemonInteractive>[0]]> = [
+		["non-daemon interactive path", { useDaemonInteractive: false }],
+		["explicit session", { useDaemonInteractive: true, session: "active-1" }],
+		["resume picker", { useDaemonInteractive: true, resume: true }],
+		["continue recent", { useDaemonInteractive: true, continue: true }],
+		["fork", { useDaemonInteractive: true, fork: "source-session-id" }],
+	];
+
+	test.each(directAttachCases)("does not open agents view for %s", (_label, decision) => {
+		expect(shouldOpenAgentsViewForDaemonInteractive(decision)).toBe(false);
+	});
+
 	test("ensures daemon is available before probing non-path session selectors", () => {
 		expect(
 			shouldEnsureDaemonBeforeActiveSessionLookup({

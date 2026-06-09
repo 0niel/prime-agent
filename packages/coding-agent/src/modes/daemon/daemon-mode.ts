@@ -8,6 +8,7 @@
 
 import { createServer, type Server, type Socket } from "node:net";
 import { resolve } from "node:path";
+import { VERSION } from "../../config.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
 	AgentSessionRuntime,
@@ -255,6 +256,20 @@ class AgentDaemon {
 			: command.continueRecent
 				? SessionManager.continueRecent(cwd, config.sessionDir)
 				: SessionManager.create(cwd, config.sessionDir);
+		const existing = this.findSessionBySessionFile(sessionManager.getSessionFile());
+		if (existing) {
+			// A live runtime already owns this session file; reuse it instead of
+			// starting a second runtime that would interleave writes to one file.
+			if (command.name) {
+				existing.runtime.session.setSessionName(command.name);
+			}
+			return existing;
+		}
+		if ((sessionPath || command.continueRecent) && sessionManager.getSessionState()?.status === "hidden") {
+			// Resuming a hidden session is the intentional opt-in that makes it
+			// visible in session lists again.
+			sessionManager.appendSessionState({ status: "sleep" });
+		}
 		const runtime = await createAgentSessionRuntime(this.options.createRuntime, {
 			cwd: sessionManager.getCwd(),
 			agentDir: config.agentDir,
@@ -262,6 +277,20 @@ class AgentDaemon {
 			sessionConfig: config,
 		});
 		return this.addRuntime(runtime, command.name);
+	}
+
+	private findSessionBySessionFile(sessionFile: string | undefined): ActiveSessionState | undefined {
+		if (!sessionFile) {
+			return undefined;
+		}
+		const target = resolve(sessionFile);
+		for (const state of this.sessions.values()) {
+			const file = state.runtime.session.sessionFile;
+			if (file && resolve(file) === target) {
+				return state;
+			}
+		}
+		return undefined;
 	}
 
 	private getSessionState(id: string): ActiveSessionState {
@@ -362,6 +391,7 @@ class AgentDaemon {
 			type: "daemon_hello",
 			socketPath: this.socketPath,
 			protocol: DAEMON_PROTOCOL_INFO,
+			appVersion: VERSION,
 			clientId: client.id,
 			serverCapabilities: DAEMON_SERVER_CAPABILITIES,
 		});
@@ -534,7 +564,9 @@ class AgentDaemon {
 			}
 
 			case "delete_saved_session": {
-				this.getSessionState(command.activeSessionId);
+				if (command.activeSessionId) {
+					this.getSessionState(command.activeSessionId);
+				}
 				if (this.findActiveSessionByFile(command.sessionPath)) {
 					throw new Error("Cannot delete the currently active session");
 				}

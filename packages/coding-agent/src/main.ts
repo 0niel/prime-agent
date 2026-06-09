@@ -48,11 +48,13 @@ import { runMigrations, showDeprecationWarnings } from "./migrations.js";
 import {
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServicesFromServices,
+	DAEMON_PROTOCOL_VERSION,
 	DaemonAgentConnection,
 	DaemonClient,
 	defaultDaemonSocketPath,
 	InProcessAgentConnection,
 	InteractiveMode,
+	runAgentsViewMode,
 	runDaemonMode,
 	runPrintMode,
 	runRpcMode,
@@ -147,6 +149,18 @@ export function shouldUseDaemonInteractive(options: InteractiveDaemonStartupDeci
 		!options.help &&
 		options.listModels === undefined
 	);
+}
+
+export interface AgentsViewStartupDecision {
+	useDaemonInteractive: boolean;
+	session?: string;
+	resume?: boolean;
+	continue?: boolean;
+	fork?: string;
+}
+
+export function shouldOpenAgentsViewForDaemonInteractive(options: AgentsViewStartupDecision): boolean {
+	return options.useDaemonInteractive && !options.session && !options.resume && !options.continue && !options.fork;
 }
 
 export interface DaemonInteractiveSessionManagerDecision {
@@ -799,9 +813,79 @@ async function canConnectToDaemon(socketPath: string, timeoutMs: number): Promis
 	}
 }
 
+type DaemonVersionProbe = "absent" | "current" | "stale";
+
+/** Connect to a running daemon and check whether it matches this client's protocol and app version. */
+async function probeDaemonVersion(socketPath: string): Promise<DaemonVersionProbe> {
+	const client = new DaemonClient(socketPath);
+	try {
+		await client.connect(250);
+	} catch {
+		client.close();
+		return "absent";
+	}
+	try {
+		const hello = await client.waitForHello(2000);
+		const current = hello.protocol.version === DAEMON_PROTOCOL_VERSION && hello.appVersion === VERSION;
+		return current ? "current" : "stale";
+	} catch {
+		// Connected but no recognizable greeting: assume a stale daemon.
+		return "stale";
+	} finally {
+		client.close();
+	}
+}
+
+/**
+ * Stop a stale daemon so a current-version one can replace it, but only when it
+ * has no live sessions. Returns true once the daemon is no longer accepting
+ * connections.
+ */
+async function shutdownStaleDaemonIfIdle(socketPath: string): Promise<boolean> {
+	const client = new DaemonClient(socketPath);
+	try {
+		await client.connect(1000);
+		let hasLiveSessions = true;
+		try {
+			const summaries = await listActiveDaemonSessionSummaries(client);
+			hasLiveSessions = summaries.some((summary) => summary.activeSessionId !== undefined);
+		} catch {
+			// If we cannot confirm the daemon is idle, leave it running rather than
+			// risking a shutdown of live sessions on a transient list failure.
+		}
+		if (hasLiveSessions) {
+			return false;
+		}
+		await client.request({ type: "shutdown" }).catch(() => undefined);
+	} catch {
+		// Connection failures mean the daemon is already gone.
+	} finally {
+		client.close();
+	}
+
+	const deadline = Date.now() + 5000;
+	while (Date.now() < deadline) {
+		if (!(await canConnectToDaemon(socketPath, 250))) {
+			return true;
+		}
+		await delay(100);
+	}
+	return false;
+}
+
 async function ensureInteractiveDaemonRunning(socketPath: string): Promise<void> {
-	if (await canConnectToDaemon(socketPath, 250)) {
+	const probe = await probeDaemonVersion(socketPath);
+	if (probe === "current") {
 		return;
+	}
+	if (probe === "stale") {
+		const stopped = await shutdownStaleDaemonIfIdle(socketPath);
+		if (!stopped) {
+			console.error(
+				`Warning: the daemon on ${socketPath} runs a different prime-agent version but has active sessions, so it was left running. Run "prime-agent daemon shutdown" when its sessions are done to upgrade it.`,
+			);
+			return;
+		}
 	}
 
 	const entrypoint = process.argv[1];
@@ -1196,6 +1280,55 @@ export async function main(args: string[], options?: MainOptions) {
 			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Ctrl+P to cycle)")}`));
 		}
 
+		const daemonUiServices = createInteractiveModeUiServicesFromServices({
+			services,
+			sessionManager,
+		});
+		if (
+			shouldOpenAgentsViewForDaemonInteractive({
+				useDaemonInteractive,
+				session: parsed.session,
+				resume: parsed.resume,
+				continue: parsed.continue,
+				fork: parsed.fork,
+			})
+		) {
+			await ensureInteractiveDaemonRunning(daemonSocketPath);
+			printTimings();
+			await runAgentsViewMode({
+				socketPath: daemonSocketPath,
+				config: defaultSessionConfig,
+				uiServices: daemonUiServices,
+				createUiServicesForSession: async (summary) => {
+					const attachedSessionManager = createSessionManagerForActiveDaemonSummary(
+						summary,
+						sessionManager.getCwd(),
+					);
+					const attachedPrepared = await prepareRuntimeServices({
+						config: mergeAgentSessionRuntimeConfig(defaultSessionConfig, {
+							cwd: attachedSessionManager.getCwd(),
+						}),
+						cwd: attachedSessionManager.getCwd(),
+						agentDir,
+						sessionManager: attachedSessionManager,
+						extensionFactories: options?.extensionFactories,
+					});
+					return createInteractiveModeUiServicesFromServices({
+						services: attachedPrepared.services,
+						sessionManager: attachedSessionManager,
+					});
+				},
+				migratedProviders,
+				modelFallbackMessage: startupModel.modelFallbackMessage,
+				startupModelId: startupModel.model?.id,
+				initialMessage,
+				initialImages,
+				initialMessages: parsed.messages,
+				verbose: parsed.verbose,
+			});
+			return;
+		}
+
 		const { connection: agentConnection, summary } = await createDaemonInteractiveConnection({
 			socketPath: daemonSocketPath,
 			config: defaultSessionConfig,
@@ -1205,10 +1338,6 @@ export async function main(args: string[], options?: MainOptions) {
 			sessionPath: activeDaemonSessionSummary ? undefined : getInteractiveDaemonSessionPath(parsed, sessionManager),
 		});
 
-		const daemonUiServices = createInteractiveModeUiServicesFromServices({
-			services,
-			sessionManager,
-		});
 		const interactiveMode = new InteractiveMode({
 			agentConnection,
 			uiServices: daemonUiServices,

@@ -5,13 +5,13 @@ describe("keybinding hint formatting", () => {
 	it("uses macOS modifier names on darwin", () => {
 		expect(formatKeyText("ctrl+p", "darwin")).toBe("Cmd+P");
 		expect(formatKeyText("alt+enter", "darwin")).toBe("Option+Enter");
-		expect(formatKeyText("shift+ctrl+p/alt+up", "darwin")).toBe("Shift+Cmd+P/Option+Up");
+		expect(formatKeyText("shift+ctrl+p/alt+up", "darwin")).toBe("Shift+Cmd+P/Option+↑");
 	});
 
 	it("keeps canonical modifier names on linux", () => {
 		expect(formatKeyText("ctrl+p", "linux")).toBe("Ctrl+P");
 		expect(formatKeyText("alt+enter", "linux")).toBe("Alt+Enter");
-		expect(formatKeyText("shift+ctrl+p/alt+up", "linux")).toBe("Shift+Ctrl+P/Alt+Up");
+		expect(formatKeyText("shift+ctrl+p/alt+up", "linux")).toBe("Shift+Ctrl+P/Alt+↑");
 	});
 
 	it("keeps canonical modifier names on Windows", () => {
@@ -24,5 +24,9 @@ describe("keybinding hint formatting", () => {
 		expect(formatKeyText("escape", "linux")).toBe("Esc");
 		expect(formatKeyText("esc", "linux")).toBe("Esc");
 		expect(formatKeyText("ctrl+escape", "linux")).toBe("Ctrl+Esc");
+	});
+
+	it("formats arrow keys as symbols", () => {
+		expect(formatKeyText("up/down/left/right", "linux")).toBe("↑/↓/←/→");
 	});
 });

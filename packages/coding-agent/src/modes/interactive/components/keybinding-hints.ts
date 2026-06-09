@@ -13,8 +13,25 @@ function normalizeKeyPart(part: string): string {
 	return part === "escape" ? "esc" : part;
 }
 
+function formatArrowKey(part: string): string | undefined {
+	switch (part) {
+		case "up":
+			return "↑";
+		case "down":
+			return "↓";
+		case "left":
+			return "←";
+		case "right":
+			return "→";
+		default:
+			return undefined;
+	}
+}
+
 function formatKeyPart(part: string, platform: NodeJS.Platform): string {
 	const normalized = normalizeKeyPart(part);
+	const arrow = formatArrowKey(normalized);
+	if (arrow) return arrow;
 	if (platform === "darwin") {
 		if (normalized === "ctrl") return "Cmd";
 		if (normalized === "alt") return "Option";

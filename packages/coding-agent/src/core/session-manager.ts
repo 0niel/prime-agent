@@ -119,7 +119,7 @@ export interface SessionInfoEntry extends SessionEntryBase {
 	name?: string;
 }
 
-export type SessionStateStatus = "sleep" | "crash";
+export type SessionStateStatus = "sleep" | "crash" | "hidden";
 
 export interface SessionState {
 	status: SessionStateStatus;
@@ -648,7 +648,7 @@ function getSessionModifiedDate(entries: FileEntry[], header: SessionHeader, sta
 }
 
 function isSessionStateStatus(value: unknown): value is SessionStateStatus {
-	return value === "sleep" || value === "crash";
+	return value === "sleep" || value === "crash" || value === "hidden";
 }
 
 async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
@@ -846,6 +846,9 @@ export class SessionManager {
 		if (this.persist) {
 			if (options?.id) {
 				sessionFile = getSessionFilePath(this.getSessionDir(), sessionId);
+				if (existsSync(sessionFile)) {
+					throw new Error(`Session file already exists for id "${sessionId}": ${sessionFile}`);
+				}
 			} else {
 				const target = createUniqueSessionFileTarget(this.getSessionDir());
 				sessionId = target.sessionId;

@@ -1,5 +1,17 @@
-import { Editor, type EditorOptions, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
+import {
+	Editor,
+	type EditorOptions,
+	type EditorTheme,
+	type TUI,
+	truncateToWidth,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 import type { AppKeybinding, KeybindingsManager } from "../../../core/keybindings.js";
+
+export interface CustomEditorOptions extends EditorOptions {
+	placeholder?: string;
+	placeholderColor?: (text: string) => string;
+}
 
 /**
  * Custom editor that handles app-level keybindings for coding-agent.
@@ -7,6 +19,9 @@ import type { AppKeybinding, KeybindingsManager } from "../../../core/keybinding
 export class CustomEditor extends Editor {
 	private keybindings: KeybindingsManager;
 	private defaultPromptPrefix: string;
+	private readonly configuredPaddingX: number;
+	private placeholder: string | undefined;
+	private readonly placeholderColor: (text: string) => string;
 	public actionHandlers: Map<AppKeybinding, () => void> = new Map();
 
 	// Special handlers that can be dynamically replaced
@@ -14,14 +29,18 @@ export class CustomEditor extends Editor {
 	public onCtrlD?: () => void;
 	public onPasteImage?: () => void;
 	public onMoveBelowPrompt?: () => boolean;
+	public onAgentsBack?: () => boolean;
 	/** Handler for extension-registered shortcuts. Returns true if handled. */
 	public onExtensionShortcut?: (data: string) => boolean;
 
-	constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager, options?: EditorOptions) {
+	constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager, options?: CustomEditorOptions) {
 		const promptPrefix = options?.promptPrefix ?? "> ";
 		super(tui, theme, { ...options, promptPrefix });
 		this.keybindings = keybindings;
 		this.defaultPromptPrefix = promptPrefix;
+		this.configuredPaddingX = options?.paddingX ?? 0;
+		this.placeholder = options?.placeholder;
+		this.placeholderColor = options?.placeholderColor ?? ((text) => text);
 	}
 
 	protected override getPromptPrefix(): string {
@@ -64,6 +83,19 @@ export class CustomEditor extends Editor {
 		this.actionHandlers.set(action, handler);
 	}
 
+	override render(width: number): string[] {
+		const lines = super.render(width);
+		if (!this.placeholder || this.getText().length > 0 || lines.length < 2) {
+			return lines;
+		}
+		return [lines[0]!, this.renderPlaceholderLine(width), ...lines.slice(2)];
+	}
+
+	setPlaceholder(placeholder: string | undefined): void {
+		this.placeholder = placeholder;
+		this.invalidate();
+	}
+
 	handleInput(data: string): void {
 		// Check extension-registered shortcuts first
 		if (this.onExtensionShortcut?.(data)) {
@@ -77,6 +109,10 @@ export class CustomEditor extends Editor {
 		}
 
 		// Check app keybindings first
+
+		if (this.keybindings.matches(data, "app.agents.back") && this.onAgentsBack?.()) {
+			return;
+		}
 
 		// Clear input - only if autocomplete is NOT active
 		if (this.keybindings.matches(data, "app.input.clear")) {
@@ -126,5 +162,30 @@ export class CustomEditor extends Editor {
 
 		// Pass to parent for editor handling
 		super.handleInput(data);
+	}
+
+	private renderPlaceholderLine(width: number): string {
+		const maxPadding = Math.max(0, Math.floor((width - 1) / 2));
+		const useBackgroundSurface = this.backgroundColor !== undefined;
+		const configuredPaddingX = Math.min(this.configuredPaddingX, maxPadding);
+		const paddingX = useBackgroundSurface
+			? Math.min(Math.max(configuredPaddingX, 2), maxPadding)
+			: configuredPaddingX;
+		const contentWidth = Math.max(1, width - paddingX * 2);
+		const promptPrefixText = this.getPromptPrefix();
+		const promptPrefixWidth = Math.min(visibleWidth(promptPrefixText), Math.max(0, contentWidth - 1));
+		const inputWidth = Math.max(1, contentWidth - promptPrefixWidth);
+		const promptPrefix =
+			promptPrefixWidth > 0 ? this.formatPromptPrefix(truncateToWidth(promptPrefixText, promptPrefixWidth, "")) : "";
+		const promptPrefixInset = promptPrefixWidth > 0 ? Math.min(1, paddingX) : 0;
+		const promptLeadingPadding = " ".repeat(promptPrefixInset);
+		const promptTrailingPadding = " ".repeat(Math.max(0, paddingX - promptPrefixInset));
+		const rightPadding = " ".repeat(paddingX);
+		const placeholderText = truncateToWidth(this.placeholder ?? "", inputWidth, "");
+		const displayText = this.placeholderColor(placeholderText);
+		const padding = " ".repeat(Math.max(0, inputWidth - visibleWidth(placeholderText)));
+		const line = `${promptLeadingPadding}${promptPrefix}${promptTrailingPadding}${displayText}${padding}${rightPadding}`;
+		const padded = line + " ".repeat(Math.max(0, width - visibleWidth(line)));
+		return this.backgroundColor ? this.backgroundColor(padded) : padded;
 	}
 }

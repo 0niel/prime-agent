@@ -577,7 +577,7 @@ describe("marquee TUI components", () => {
 		expect(compact).not.toContain("├─");
 		expect(compact).not.toContain("assistant: reading shard metrics");
 		const wideList = stripAnsi(component.render(96).join("\n"));
-		expect(wideList).toContain("Up/Down move");
+		expect(wideList).toContain("↑/↓ move");
 		expect(wideList).toContain("Enter open");
 		expect(wideList).toContain("Esc close");
 		expect(wideList).not.toContain("ctrl+c close");

@@ -5,6 +5,8 @@ import type { DaemonCommand, DaemonOutbound, DaemonRequestProgress, DaemonRespon
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 
+export type DaemonHello = Extract<DaemonOutbound, { type: "daemon_hello" }>;
+
 export type DaemonClientMessageListener = (message: DaemonOutbound) => void;
 export type DaemonClientCloseListener = (error: Error) => void;
 export type DaemonClientProgressListener = (message: DaemonRequestProgress) => void;
@@ -28,8 +30,39 @@ export class DaemonClient {
 		}
 	>();
 	private requestId = 0;
+	private helloMessage?: DaemonHello;
+	private readonly helloWaiters = new Set<{
+		resolve: (hello: DaemonHello) => void;
+		reject: (error: Error) => void;
+		timeout: ReturnType<typeof setTimeout>;
+	}>();
 
 	constructor(private readonly socketPath: string) {}
+
+	get hello(): DaemonHello | undefined {
+		return this.helloMessage;
+	}
+
+	/** Wait for the daemon_hello greeting sent on connect. */
+	async waitForHello(timeoutMs = 3000): Promise<DaemonHello> {
+		if (this.helloMessage) {
+			return this.helloMessage;
+		}
+		if (!this.socket || this.socket.destroyed) {
+			throw new Error("Daemon client is not connected");
+		}
+		return new Promise<DaemonHello>((resolve, reject) => {
+			const waiter = {
+				resolve,
+				reject,
+				timeout: setTimeout(() => {
+					this.helloWaiters.delete(waiter);
+					reject(new Error("Timed out waiting for daemon hello"));
+				}, timeoutMs),
+			};
+			this.helloWaiters.add(waiter);
+		});
+	}
 
 	async connect(timeoutMs = 3000): Promise<void> {
 		if (this.socket) {
@@ -132,6 +165,15 @@ export class DaemonClient {
 			return;
 		}
 
+		if (isDaemonHello(message)) {
+			this.helloMessage = message;
+			for (const waiter of [...this.helloWaiters]) {
+				clearTimeout(waiter.timeout);
+				this.helloWaiters.delete(waiter);
+				waiter.resolve(message);
+			}
+		}
+
 		if (isDaemonResponse(message) && message.id) {
 			const pending = this.pendingRequests.get(message.id);
 			if (pending) {
@@ -160,6 +202,11 @@ export class DaemonClient {
 			pending.reject(error);
 			this.pendingRequests.delete(id);
 		}
+		for (const waiter of [...this.helloWaiters]) {
+			clearTimeout(waiter.timeout);
+			this.helloWaiters.delete(waiter);
+			waiter.reject(error);
+		}
 	}
 
 	private notifyClosed(socket: Socket, error: Error): void {
@@ -172,6 +219,14 @@ export class DaemonClient {
 			listener(error);
 		}
 	}
+}
+
+function isDaemonHello(value: unknown): value is DaemonHello {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as { type?: unknown; protocol?: unknown };
+	return candidate.type === "daemon_hello" && typeof candidate.protocol === "object" && candidate.protocol !== null;
 }
 
 function isDaemonResponse(value: unknown): value is DaemonResponse {

@@ -31,6 +31,9 @@ const EMPTY_USAGE: Usage = {
 
 type RenderSessionContextThis = {
 	pendingTools: Map<string, ToolExecutionComponent>;
+	pendingToolCreations: Set<string>;
+	startedToolCalls: Set<string>;
+	resetPendingToolState(): void;
 	chatContainer: Container;
 	footer: { invalidate(): void };
 	ui: TUI;
@@ -59,8 +62,18 @@ type HandleEvent = (this: RenderSessionContextThis, event: AgentConnectionSessio
 
 function createFakeInteractiveModeThis(): RenderSessionContextThis {
 	const chatContainer = new Container();
+	const pendingTools = new Map<string, ToolExecutionComponent>();
+	const pendingToolCreations = new Set<string>();
+	const startedToolCalls = new Set<string>();
 	return {
-		pendingTools: new Map<string, ToolExecutionComponent>(),
+		pendingTools,
+		pendingToolCreations,
+		startedToolCalls,
+		resetPendingToolState() {
+			pendingTools.clear();
+			pendingToolCreations.clear();
+			startedToolCalls.clear();
+		},
 		chatContainer,
 		footer: { invalidate: vi.fn() },
 		ui: { requestRender: vi.fn() } as unknown as TUI,

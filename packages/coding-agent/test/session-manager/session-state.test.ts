@@ -66,6 +66,32 @@ describe("SessionManager session state", () => {
 		}
 	});
 
+	it("persists hidden lifecycle state for sessions hidden from agents view", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "session-state-hidden-"));
+		try {
+			const cwd = join(tempDir, "project");
+			const sessionDir = join(tempDir, "sessions");
+			const session = SessionManager.create(cwd, sessionDir);
+
+			session.appendMessage(userMsg("hide me"));
+			session.appendSessionState({ status: "hidden" });
+
+			const sessionFile = session.getSessionFile();
+			expect(sessionFile).toBeDefined();
+			expect(existsSync(sessionFile!)).toBe(true);
+			expect(session.getSessionState()).toEqual({ status: "hidden" });
+
+			const sessions = await SessionManager.list(cwd, sessionDir);
+			expect(sessions).toHaveLength(1);
+			expect(sessions[0]).toMatchObject({
+				id: session.getSessionId(),
+				state: { status: "hidden" },
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("does not duplicate entries when lifecycle state is followed by a normal turn", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "session-state-turn-"));
 		try {
