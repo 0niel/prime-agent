@@ -5,8 +5,8 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import stripAnsi from "strip-ansi";
 import { highlightCode, theme } from "../theme/theme.js";
+import { normalizeErrorDetails, summarizeErrorDetails } from "./collapsible-error.js";
 import { keyHint } from "./keybinding-hints.js";
 
 export interface IPythonCellContentBlock {
@@ -32,6 +32,16 @@ interface IpythonDetails {
 	durationMs?: number;
 	status?: string;
 	errorEname?: string;
+	stdout?: string;
+	stderr?: string;
+	result?: string;
+	error?: IpythonErrorDetails;
+}
+
+interface IpythonErrorDetails {
+	ename: string;
+	evalue: string;
+	traceback: readonly string[];
 }
 
 interface TracebackParts {
@@ -40,7 +50,6 @@ interface TracebackParts {
 	preview: string;
 }
 
-type CellBackground = "customMessageBg" | "toolPendingBg" | "toolErrorBg";
 type ExpandHintFormatter = (label: string) => string;
 
 const MAGIC_LINE_PATTERN = /^\s*!/;
@@ -62,15 +71,33 @@ function readDetails(details: unknown): IpythonDetails {
 		return {};
 	}
 	const record = details as Record<string, unknown>;
+	const error = readErrorDetails(record.error);
 	return {
 		durationMs: typeof record.durationMs === "number" ? record.durationMs : undefined,
 		status: typeof record.status === "string" ? record.status : undefined,
-		errorEname: typeof record.errorEname === "string" ? record.errorEname : undefined,
+		errorEname: error?.ename ?? (typeof record.errorEname === "string" ? record.errorEname : undefined),
+		stdout: typeof record.stdout === "string" ? record.stdout : undefined,
+		stderr: typeof record.stderr === "string" ? record.stderr : undefined,
+		result: typeof record.result === "string" ? record.result : undefined,
+		error,
 	};
 }
 
-function normalizeText(text: string): string {
-	return stripAnsi(text).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+function readErrorDetails(value: unknown): IpythonErrorDetails | undefined {
+	if (!value || typeof value !== "object") {
+		return undefined;
+	}
+	const record = value as Record<string, unknown>;
+	if (typeof record.ename !== "string") {
+		return undefined;
+	}
+	return {
+		ename: record.ename,
+		evalue: typeof record.evalue === "string" ? record.evalue : "",
+		traceback: Array.isArray(record.traceback)
+			? record.traceback.filter((line): line is string => typeof line === "string")
+			: [],
+	};
 }
 
 function formatDuration(durationMs: number | undefined): string | undefined {
@@ -102,7 +129,7 @@ function textFromBlocks(blocks: readonly IPythonCellContentBlock[] | undefined):
 }
 
 function splitTraceback(text: string, errorName: string | undefined): TracebackParts | undefined {
-	const normalized = normalizeText(text);
+	const normalized = normalizeErrorDetails(text);
 	if (!normalized.trim()) {
 		return undefined;
 	}
@@ -113,24 +140,25 @@ function splitTraceback(text: string, errorName: string | undefined): TracebackP
 		tracebackIndex = lines.findIndex((line) => line.trim().startsWith(`${errorName}:`));
 	}
 	if (tracebackIndex < 0) {
-		tracebackIndex = lines.findIndex((line) =>
-			/^[A-Za-z_][\w.]*?(Error|Exception|Interrupt|Exit)\b/.test(line.trim()),
-		);
-	}
-	if (tracebackIndex < 0) {
 		return undefined;
 	}
 
 	const output = lines.slice(0, tracebackIndex).join("\n").trimEnd();
 	const traceback = lines.slice(tracebackIndex).join("\n").trim();
-	const preview =
-		traceback
-			.split("\n")
-			.filter((line) => line.trim().length > 0)
-			.at(-1) ??
-		errorName ??
-		"error";
-	return { output, traceback, preview };
+	const preview = summarizeErrorDetails(traceback);
+	return { output, traceback, preview: preview === "Error" && errorName ? errorName : preview };
+}
+
+function formatIpythonErrorSummary(error: IpythonErrorDetails): string {
+	const normalizedValue = normalizeErrorDetails(error.evalue);
+	if (!normalizedValue.trim()) {
+		return error.ename;
+	}
+	const value = summarizeErrorDetails(normalizedValue);
+	if (value === "Error") {
+		return error.ename;
+	}
+	return visibleWidth(value) <= 48 ? `${error.ename}: ${value}` : error.ename;
 }
 
 export class IPythonCellComponent implements Component {
@@ -250,9 +278,17 @@ export class IPythonCellComponent implements Component {
 		const blocks = this.state.content ?? [];
 		const text = textFromBlocks(blocks);
 		const imageCount = blocks.filter(isImageBlock).length;
+		const hasStructuredOutput =
+			details.stdout !== undefined ||
+			details.stderr !== undefined ||
+			details.result !== undefined ||
+			details.error !== undefined;
 		const traceback =
-			this.state.isError || details.status === "error" ? splitTraceback(text, details.errorEname) : undefined;
+			!hasStructuredOutput && (this.state.isError || details.status === "error")
+				? splitTraceback(text, details.errorEname)
+				: undefined;
 		let outputStarted = false;
+		let renderedTextOutput = false;
 
 		const startOutput = (): void => {
 			if (outputStarted) {
@@ -264,27 +300,74 @@ export class IPythonCellComponent implements Component {
 			}
 		};
 
-		if (traceback?.output) {
-			startOutput();
-			this.renderOutputText(lines, width, traceback.output, "out", withExpandHint);
+		if (hasStructuredOutput) {
+			if (details.stdout?.trim()) {
+				startOutput();
+				renderedTextOutput = true;
+				this.renderOutputText(lines, width, normalizeErrorDetails(details.stdout), "out", withExpandHint);
+			}
+			if (details.stderr?.trim()) {
+				startOutput();
+				renderedTextOutput = true;
+				this.renderOutputText(lines, width, normalizeErrorDetails(details.stderr), "err", withExpandHint);
+			}
+			if (details.result?.trim()) {
+				startOutput();
+				renderedTextOutput = true;
+				this.renderOutputText(lines, width, normalizeErrorDetails(details.result), "out", withExpandHint);
+			}
+		} else if (traceback) {
+			if (traceback.output) {
+				startOutput();
+				renderedTextOutput = true;
+				this.renderOutputText(lines, width, traceback.output, "out", withExpandHint);
+			}
 		} else if (text.trim()) {
 			startOutput();
-			this.renderOutputText(lines, width, normalizeText(text), this.state.isError ? "err" : "out", withExpandHint);
-		} else if (this.state.isPartial || (this.state.executionStarted && !this.state.argsComplete)) {
+			renderedTextOutput = true;
+			this.renderOutputText(
+				lines,
+				width,
+				normalizeErrorDetails(text),
+				this.state.isError ? "err" : "out",
+				withExpandHint,
+			);
+		}
+
+		if (!renderedTextOutput && this.state.isPartial) {
 			startOutput();
 			this.addWrapped(lines, "", theme.fg("muted", "waiting for output..."), width);
-		} else if (this.state.executionStarted && imageCount === 0) {
+		} else if (!renderedTextOutput && this.state.executionStarted && !this.state.argsComplete) {
+			startOutput();
+			this.addWrapped(lines, "", theme.fg("muted", "waiting for output..."), width);
+		} else if (
+			!renderedTextOutput &&
+			!traceback &&
+			!details.error &&
+			this.state.executionStarted &&
+			imageCount === 0
+		) {
 			startOutput();
 			this.addWrapped(lines, "", theme.fg("muted", "no output"), width);
 		}
 
-		if (traceback) {
+		if (details.error) {
+			startOutput();
+			if (this.state.expanded) {
+				this.renderTraceback(
+					lines,
+					width,
+					details.error.traceback.join("\n") || formatIpythonErrorSummary(details.error),
+				);
+			} else {
+				this.addWrapped(lines, "", withExpandHint(formatIpythonErrorSummary(details.error)), width);
+			}
+		} else if (traceback) {
 			startOutput();
 			if (this.state.expanded) {
 				this.renderTraceback(lines, width, traceback.traceback);
 			} else {
-				this.addWrapped(lines, "", theme.fg("error", traceback.preview), width);
-				this.addWrapped(lines, "", withExpandHint("traceback collapsed"), width);
+				this.addWrapped(lines, "", withExpandHint(traceback.preview), width);
 			}
 		}
 
@@ -304,7 +387,7 @@ export class IPythonCellComponent implements Component {
 		label: "out" | "err",
 		withExpandHint: ExpandHintFormatter,
 	): void {
-		const color = label === "err" ? "error" : "toolOutput";
+		const color = label === "err" ? "muted" : "toolOutput";
 		const allLines = text.split("\n");
 		const expanded = this.state.expanded ?? false;
 		const showCollapsed = !expanded && allLines.length > OUTPUT_PREVIEW_LINES;
@@ -322,7 +405,7 @@ export class IPythonCellComponent implements Component {
 
 	private renderTraceback(lines: string[], width: number, traceback: string): void {
 		for (const line of traceback.split("\n")) {
-			this.addWrapped(lines, "", theme.fg("error", line || " "), width);
+			this.addWrapped(lines, "", theme.fg("muted", line || " "), width);
 		}
 	}
 
@@ -344,17 +427,7 @@ export class IPythonCellComponent implements Component {
 		const contentWidth = Math.max(1, width - this.paddingX * 2);
 		const truncated = truncateToWidth(line, contentWidth, "");
 		const paddedContent = truncated + " ".repeat(Math.max(0, contentWidth - visibleWidth(truncated)));
-		const padded = `${" ".repeat(this.paddingX)}${paddedContent}${" ".repeat(this.paddingX)}`;
-		return theme.bg(this.background(), padded);
-	}
-
-	private background(): CellBackground {
-		if (this.state.isError || readDetails(this.state.details).status === "error") {
-			return "toolErrorBg";
-		}
-		if (this.state.isPartial || !this.state.executionStarted) {
-			return "toolPendingBg";
-		}
-		return "customMessageBg";
+		const rail = theme.bg("customMessageBg", " ");
+		return `${rail}${" ".repeat(this.paddingX - 1)}${paddedContent}${" ".repeat(this.paddingX)}`;
 	}
 }

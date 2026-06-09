@@ -1,4 +1,5 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import stripAnsi from "strip-ansi";
 import { describe, expect, test } from "vitest";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -53,5 +54,25 @@ describe("AssistantMessageComponent", () => {
 		expect(rendered.includes(OSC133_ZONE_START)).toBe(false);
 		expect(rendered.includes(OSC133_ZONE_END)).toBe(false);
 		expect(rendered.includes(OSC133_ZONE_FINAL)).toBe(false);
+	});
+
+	test("honors initial expansion for multiline assistant errors", () => {
+		initTheme("dark");
+
+		const message = {
+			...createAssistantMessage([]),
+			stopReason: "error" as const,
+			errorMessage: [
+				"Provider request failed",
+				"Traceback (most recent call last):",
+				'  File "/tmp/internal.py", line 12, in run',
+				"RuntimeError: backend crashed",
+			].join("\n"),
+		};
+		const component = new AssistantMessageComponent(message, false, undefined, "Thinking...", { expanded: true });
+		const rendered = stripAnsi(component.render(100).join("\n"));
+
+		expect(rendered).toContain("/tmp/internal.py");
+		expect(rendered).not.toContain("Ctrl+O to expand");
 	});
 });

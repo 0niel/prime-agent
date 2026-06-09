@@ -122,6 +122,14 @@ export interface IpythonToolDetails {
 	durationMs?: number;
 	status?: "ok" | "error" | "aborted" | "starting";
 	errorEname?: string;
+	stdout?: string;
+	stderr?: string;
+	result?: string;
+	error?: {
+		ename: string;
+		evalue: string;
+		traceback: string[];
+	};
 }
 
 export interface IpythonToolOptions {
@@ -220,6 +228,10 @@ export function createIpythonToolDefinition(
 						durationMs: r.durationMs,
 						status: r.status,
 						errorEname: r.error?.ename,
+						stdout: r.stdout,
+						stderr: r.stderr,
+						result: r.result,
+						error: r.error,
 					},
 					isError: r.status === "error" || r.status === "aborted",
 				};

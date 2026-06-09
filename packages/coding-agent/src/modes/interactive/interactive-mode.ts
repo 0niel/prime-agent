@@ -2989,6 +2989,7 @@ export class InteractiveMode {
 						this.hideThinkingBlock,
 						this.getMarkdownThemeWithSettings(),
 						this.hiddenThinkingLabel,
+						{ expanded: this.toolOutputExpanded },
 					);
 					this.streamingMessage = event.message;
 					this.chatContainer.addChild(this.streamingComponent);
@@ -3710,6 +3711,7 @@ export class InteractiveMode {
 					this.hideThinkingBlock,
 					this.getMarkdownThemeWithSettings(),
 					this.hiddenThinkingLabel,
+					{ expanded: this.toolOutputExpanded },
 				);
 				this.chatContainer.addChild(assistantComponent);
 				break;
