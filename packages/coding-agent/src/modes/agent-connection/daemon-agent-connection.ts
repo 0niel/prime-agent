@@ -102,7 +102,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			activeSessionId: this.activeSessionId,
 			supportsExtensionUi: true,
 			clientId: this.clientId,
-			capabilities: ["attach_snapshot", "event_sequence", "extension_ui"],
+			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach"],
 			resumeCursor:
 				this.lastEventSequence === undefined
 					? undefined

@@ -34,7 +34,7 @@ export type DaemonCommandId = string;
 export type DaemonEventId = string;
 export type DaemonEventSequence = number;
 export type DaemonClientId = string;
-export type DaemonClientCapability = "attach_snapshot" | "event_sequence" | "extension_ui";
+export type DaemonClientCapability = "attach_snapshot" | "event_sequence" | "extension_ui" | "slim_attach";
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
 export interface DaemonProtocolInfo {
@@ -126,8 +126,10 @@ export interface DaemonSessionSnapshot {
 export interface DaemonAttachResult {
 	protocol: DaemonProtocolInfo;
 	activeSessionId: string;
-	state: SessionSummary;
-	messages: AgentMessage[];
+	/** Omitted for clients with the "slim_attach" capability; use snapshot.summary. */
+	state?: SessionSummary;
+	/** Omitted for clients with the "slim_attach" capability; use snapshot.messages. */
+	messages?: AgentMessage[];
 	snapshot: DaemonSessionSnapshot;
 	replay: DaemonReplayInfo;
 	lastEventSequence: DaemonEventSequence;

@@ -627,7 +627,7 @@ async function runStart(parsed: ParsedDaemonClientCommand): Promise<void> {
 			console.log(`Daemon started on ${parsed.socketPath} (pid ${child.pid})`);
 			return;
 		}
-		await delay(100);
+		await delay(25);
 	}
 
 	throw new Error(`Timed out waiting for daemon to start on ${parsed.socketPath}`);

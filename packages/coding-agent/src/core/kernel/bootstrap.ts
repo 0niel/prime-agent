@@ -8,6 +8,7 @@ import { stderr, stdin } from "node:process";
 import { createInterface } from "node:readline/promises";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
+import { getPackageDir } from "../../config.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 
 const BOOTSTRAP_SCHEMA = 4;
@@ -451,6 +452,8 @@ async function writeBootstrapVersion(venv: string, pythonSkills: readonly Bootst
 function runtimeCandidateDirs(): string[] {
 	const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 	return [
+		// Stable across layouts (dist/, dist/bundle/, tsx): <package>/dist/prime-agent-runtime
+		path.join(getPackageDir(), "dist", "prime-agent-runtime"),
 		path.resolve(moduleDir, "..", "..", "prime-agent-runtime"),
 		path.resolve(moduleDir, "..", "..", "..", "..", "..", "prime-agent-runtime"),
 	];

@@ -3,12 +3,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Check for --no-env flag
+# Check for --no-env / --dist flags
 NO_ENV=false
+USE_DIST=false
 ARGS=()
 for arg in "$@"; do
   if [[ "$arg" == "--no-env" ]]; then
     NO_ENV=true
+  elif [[ "$arg" == "--dist" ]]; then
+    USE_DIST=true
   else
     ARGS+=("$arg")
   fi
@@ -53,6 +56,16 @@ if [[ "$NO_ENV" == "true" ]]; then
   unset AZURE_OPENAI_BASE_URL
   unset AZURE_OPENAI_RESOURCE_NAME
   echo "Running Prime Agent without API keys..."
+fi
+
+# --dist runs the bundled build (what users get; ~3x faster startup than tsx).
+if [[ "$USE_DIST" == "true" ]]; then
+  BUNDLE="$SCRIPT_DIR/packages/coding-agent/dist/bundle/cli.js"
+  if [[ ! -f "$BUNDLE" ]]; then
+    echo "Bundle not found at $BUNDLE. Run npm run build first." >&2
+    exit 1
+  fi
+  exec node "$BUNDLE" ${ARGS[@]+"${ARGS[@]}"}
 fi
 
 TSX_BIN="$SCRIPT_DIR/node_modules/.bin/tsx"

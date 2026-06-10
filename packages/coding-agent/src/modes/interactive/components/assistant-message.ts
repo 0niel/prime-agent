@@ -30,7 +30,12 @@ function getThinkingMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
 }
 
 /**
- * Component that renders a complete assistant message
+ * Component that renders a complete assistant message.
+ *
+ * Streaming sends one updateContent() per token, so content updates are
+ * reconciled lazily at render time (at most once per frame): when the block
+ * structure is unchanged, only the text of changed blocks is updated in place,
+ * preserving each Markdown child's render cache instead of rebuilding the tree.
  */
 export class AssistantMessageComponent extends Container {
 	private contentContainer: Container;
@@ -40,6 +45,10 @@ export class AssistantMessageComponent extends Container {
 	private lastMessage?: AssistantMessage;
 	private hasToolCalls = false;
 	private expanded = false;
+	private dirty = false;
+	private lastSignature?: string;
+	private blockMarkdowns = new Map<number, Markdown>();
+	private lastBlockTexts = new Map<number, string>();
 
 	constructor(
 		message?: AssistantMessage,
@@ -66,35 +75,35 @@ export class AssistantMessageComponent extends Container {
 
 	override invalidate(): void {
 		super.invalidate();
-		if (this.lastMessage) {
-			this.updateContent(this.lastMessage);
-		}
+		// Force a full rebuild so theme-dependent children are recreated.
+		this.lastSignature = undefined;
+		this.dirty = true;
 	}
 
 	setHideThinkingBlock(hide: boolean): void {
 		this.hideThinkingBlock = hide;
-		if (this.lastMessage) {
-			this.updateContent(this.lastMessage);
-		}
+		this.dirty = true;
 	}
 
 	setHiddenThinkingLabel(label: string): void {
 		this.hiddenThinkingLabel = label;
-		if (this.lastMessage) {
-			this.updateContent(this.lastMessage);
-		}
+		this.dirty = true;
 	}
 
 	setExpanded(expanded: boolean): void {
 		if (this.expanded !== expanded) {
 			this.expanded = expanded;
-			if (this.lastMessage) {
-				this.updateContent(this.lastMessage);
-			}
+			this.dirty = true;
 		}
 	}
 
 	override render(width: number): string[] {
+		if (this.dirty) {
+			if (this.lastMessage) {
+				this.reconcile(this.lastMessage);
+			}
+			this.dirty = false;
+		}
 		const lines = super.render(width);
 		if (this.hasToolCalls || lines.length === 0) {
 			return lines;
@@ -107,9 +116,66 @@ export class AssistantMessageComponent extends Container {
 
 	updateContent(message: AssistantMessage): void {
 		this.lastMessage = message;
+		this.dirty = true;
+	}
 
+	/**
+	 * Everything that affects child component identity/order, but not the text
+	 * inside a block. While the signature is stable, updates reduce to setText()
+	 * on changed blocks; any structural change triggers a full rebuild.
+	 */
+	private computeSignature(message: AssistantMessage): string {
+		const parts: string[] = [];
+		for (let i = 0; i < message.content.length; i++) {
+			const content = message.content[i];
+			if (content.type === "text") {
+				parts.push(`${i}:text:${content.text.trim() ? 1 : 0}`);
+			} else if (content.type === "thinking") {
+				parts.push(`${i}:thinking:${content.thinking.trim() ? 1 : 0}`);
+			} else {
+				parts.push(`${i}:${content.type}`);
+			}
+		}
+		parts.push(
+			`hide:${this.hideThinkingBlock}`,
+			`label:${this.hiddenThinkingLabel}`,
+			`expanded:${this.expanded}`,
+			`stop:${message.stopReason ?? ""}`,
+			`error:${message.errorMessage ?? ""}`,
+		);
+		return parts.join("|");
+	}
+
+	private reconcile(message: AssistantMessage): void {
+		const signature = this.computeSignature(message);
+		if (signature !== this.lastSignature) {
+			this.lastSignature = signature;
+			this.rebuild(message);
+			return;
+		}
+
+		// Structure unchanged: update only blocks whose text changed (during
+		// streaming that is just the final block).
+		for (let i = 0; i < message.content.length; i++) {
+			const markdown = this.blockMarkdowns.get(i);
+			if (!markdown) {
+				continue;
+			}
+			const content = message.content[i];
+			const text =
+				content.type === "text" ? content.text.trim() : content.type === "thinking" ? content.thinking.trim() : "";
+			if (this.lastBlockTexts.get(i) !== text) {
+				markdown.setText(text);
+				this.lastBlockTexts.set(i, text);
+			}
+		}
+	}
+
+	private rebuild(message: AssistantMessage): void {
 		// Clear content container
 		this.contentContainer.clear();
+		this.blockMarkdowns.clear();
+		this.lastBlockTexts.clear();
 
 		const hasVisibleContent = message.content.some(
 			(c) => (c.type === "text" && c.text.trim()) || (c.type === "thinking" && c.thinking.trim()),
@@ -125,7 +191,10 @@ export class AssistantMessageComponent extends Container {
 			if (content.type === "text" && content.text.trim()) {
 				// Assistant text messages with no background - trim the text
 				// Set paddingY=0 to avoid extra spacing before tool executions
-				this.contentContainer.addChild(new Markdown(content.text.trim(), 1, 0, this.markdownTheme));
+				const markdown = new Markdown(content.text.trim(), 1, 0, this.markdownTheme);
+				this.blockMarkdowns.set(i, markdown);
+				this.lastBlockTexts.set(i, content.text.trim());
+				this.contentContainer.addChild(markdown);
 			} else if (content.type === "thinking" && content.thinking.trim()) {
 				// Add spacing only when another visible assistant content block follows.
 				// This avoids a superfluous blank line before separately-rendered tool execution blocks.
@@ -143,11 +212,18 @@ export class AssistantMessageComponent extends Container {
 					}
 				} else {
 					// Thinking traces keep Markdown structure but stay visually quiet.
-					this.contentContainer.addChild(
-						new Markdown(content.thinking.trim(), 1, 0, getThinkingMarkdownTheme(this.markdownTheme), {
+					const markdown = new Markdown(
+						content.thinking.trim(),
+						1,
+						0,
+						getThinkingMarkdownTheme(this.markdownTheme),
+						{
 							color: (text: string) => theme.fg("thinkingText", text),
-						}),
+						},
 					);
+					this.blockMarkdowns.set(i, markdown);
+					this.lastBlockTexts.set(i, content.thinking.trim());
+					this.contentContainer.addChild(markdown);
 					if (hasVisibleContentAfter) {
 						this.contentContainer.addChild(new Spacer(1));
 					}
@@ -165,11 +241,7 @@ export class AssistantMessageComponent extends Container {
 					message.errorMessage && message.errorMessage !== "Request was aborted"
 						? message.errorMessage
 						: "Operation aborted";
-				if (hasVisibleContent) {
-					this.contentContainer.addChild(new Spacer(1));
-				} else {
-					this.contentContainer.addChild(new Spacer(1));
-				}
+				this.contentContainer.addChild(new Spacer(1));
 				this.contentContainer.addChild(this.createErrorComponent(abortMessage));
 			} else if (message.stopReason === "error") {
 				const errorMsg = message.errorMessage || "Unknown error";

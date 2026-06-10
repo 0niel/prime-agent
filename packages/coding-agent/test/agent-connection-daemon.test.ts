@@ -343,11 +343,11 @@ function createAttachResult(
 		messageCount: messages.length,
 		pendingMessageCount: 0,
 	};
+	// Slim shape: the daemon omits top-level state/messages for clients with the
+	// "slim_attach" capability, which DaemonAgentConnection always advertises.
 	return {
 		protocol: DAEMON_PROTOCOL_INFO,
 		activeSessionId,
-		state: summary,
-		messages,
 		snapshot: {
 			activeSessionId,
 			summary,
@@ -373,7 +373,10 @@ function createAttachResult(
 			id: clientId ?? "client-1",
 			capabilities: (capabilities ?? ["attach_snapshot", "event_sequence"]).filter(
 				(capability): capability is DaemonAttachResult["client"]["capabilities"][number] =>
-					capability === "attach_snapshot" || capability === "event_sequence" || capability === "extension_ui",
+					capability === "attach_snapshot" ||
+					capability === "event_sequence" ||
+					capability === "extension_ui" ||
+					capability === "slim_attach",
 			),
 		},
 	};
@@ -552,6 +555,7 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests.at(-1)).toMatchObject({
 			type: "attach",
 			activeSessionId: "active-1",
+			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach"],
 			resumeCursor: {
 				activeSessionId: "active-1",
 				eventSequence: 14,
@@ -857,7 +861,7 @@ describe("DaemonAgentConnection", () => {
 			type: "attach",
 			activeSessionId: "active-1",
 			clientId: expect.any(String),
-			capabilities: ["attach_snapshot", "event_sequence", "extension_ui"],
+			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach"],
 			resumeCursor: {
 				activeSessionId: "active-1",
 				eventSequence: 14,
@@ -868,6 +872,7 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests.at(-1)).toMatchObject({
 			type: "attach",
 			activeSessionId: "active-1",
+			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach"],
 			resumeCursor: {
 				activeSessionId: "active-1",
 				eventSequence: 14,
@@ -888,7 +893,7 @@ describe("DaemonAgentConnection", () => {
 			activeSessionId: "active-1",
 			supportsExtensionUi: true,
 			clientId: expect.any(String),
-			capabilities: ["attach_snapshot", "event_sequence", "extension_ui"],
+			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach"],
 		});
 
 		fakeClient.emitMessage({

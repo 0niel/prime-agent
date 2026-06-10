@@ -76,3 +76,111 @@ describe("AssistantMessageComponent", () => {
 		expect(rendered).not.toContain("Ctrl+O to expand");
 	});
 });
+
+describe("AssistantMessageComponent streaming identity", () => {
+	// updateContent applied incrementally (as during daemon streaming) must render
+	// byte-identical to a fresh component built from the final message. Guards the
+	// reconcile-instead-of-rebuild optimization.
+	function expectIdentity(component: AssistantMessageComponent, message: AssistantMessage, width = 90) {
+		const incremental = component.render(width);
+		const fresh = new AssistantMessageComponent(message).render(width);
+		expect(incremental).toEqual(fresh);
+	}
+
+	test("growing text block renders identically", () => {
+		initTheme("dark");
+		const corpus =
+			"## Heading\n\nSome paragraph text that wraps.\n\n- one\n- two\n\n```js\nconst a = 1;\n```\n\nEnd.";
+		const component = new AssistantMessageComponent();
+		let text = "";
+		for (let offset = 0; offset < corpus.length; offset += 5) {
+			text += corpus.slice(offset, offset + 5);
+			const message = createAssistantMessage([{ type: "text", text }]);
+			component.updateContent(message);
+			expectIdentity(component, message);
+		}
+	});
+
+	test("thinking then text then tool call renders identically", () => {
+		initTheme("dark");
+		const component = new AssistantMessageComponent();
+		const steps: AssistantMessage["content"][] = [
+			[{ type: "thinking", thinking: "Let me think" }],
+			[{ type: "thinking", thinking: "Let me think about this more carefully." }],
+			[
+				{ type: "thinking", thinking: "Let me think about this more carefully." },
+				{ type: "text", text: "Here is" },
+			],
+			[
+				{ type: "thinking", thinking: "Let me think about this more carefully." },
+				{ type: "text", text: "Here is the answer with **bold** text." },
+			],
+			[
+				{ type: "thinking", thinking: "Let me think about this more carefully." },
+				{ type: "text", text: "Here is the answer with **bold** text." },
+				{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "ls" } },
+			],
+		];
+		for (const content of steps) {
+			const message = createAssistantMessage(content);
+			component.updateContent(message);
+			expectIdentity(component, message);
+		}
+	});
+
+	test("aborted and error stop reasons render identically after streaming", () => {
+		initTheme("dark");
+		for (const final of [
+			{ stopReason: "aborted" as const, errorMessage: undefined },
+			{ stopReason: "error" as const, errorMessage: "Provider exploded" },
+		]) {
+			const component = new AssistantMessageComponent();
+			component.updateContent(createAssistantMessage([{ type: "text", text: "Partial out" }]));
+			component.render(90);
+			const message = {
+				...createAssistantMessage([{ type: "text", text: "Partial output" }]),
+				...final,
+			};
+			component.updateContent(message);
+			const incremental = component.render(90);
+			const fresh = new AssistantMessageComponent(message).render(90);
+			expect(incremental).toEqual(fresh);
+		}
+	});
+
+	test("setHideThinkingBlock and setExpanded mid-stream render identically", () => {
+		initTheme("dark");
+		const component = new AssistantMessageComponent();
+		const content: AssistantMessage["content"] = [
+			{ type: "thinking", thinking: "Deep thoughts here." },
+			{ type: "text", text: "Visible answer." },
+		];
+		const message = createAssistantMessage(content);
+		component.updateContent(message);
+		component.render(90);
+
+		component.setHideThinkingBlock(true);
+		const hidden = component.render(90);
+		const freshHidden = new AssistantMessageComponent(message, true).render(90);
+		expect(hidden).toEqual(freshHidden);
+
+		component.setHideThinkingBlock(false);
+		const shown = component.render(90);
+		const freshShown = new AssistantMessageComponent(message, false).render(90);
+		expect(shown).toEqual(freshShown);
+	});
+
+	test("width change mid-stream renders identically", () => {
+		initTheme("dark");
+		const component = new AssistantMessageComponent();
+		const corpus = "A paragraph long enough to wrap at narrow widths with **style** and `code`.";
+		let text = "";
+		const widths = [40, 90, 60];
+		for (let offset = 0, i = 0; offset < corpus.length; offset += 8, i++) {
+			text += corpus.slice(offset, offset + 8);
+			const message = createAssistantMessage([{ type: "text", text }]);
+			component.updateContent(message);
+			expectIdentity(component, message, widths[i % widths.length]);
+		}
+	});
+});

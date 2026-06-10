@@ -180,7 +180,7 @@ function createReleasePackageJson(sourcePackage, packageName, releaseVersion, in
 
 	if (packageName === publicPackageName) {
 		packageJson.bin = {
-			[publicCommandName]: "dist/cli.js",
+			[publicCommandName]: "dist/bundle/cli.js",
 		};
 		packageJson.piConfig = {
 			...(packageJson.piConfig || {}),

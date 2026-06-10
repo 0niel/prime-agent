@@ -8,22 +8,8 @@ import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import * as _bundledPiAgentCore from "@earendil-works/pi-agent-core";
-import * as _bundledPiAi from "@earendil-works/pi-ai";
-import * as _bundledPiAiOauth from "@earendil-works/pi-ai/oauth";
 import type { KeyId } from "@earendil-works/pi-tui";
-import * as _bundledPiTui from "@earendil-works/pi-tui";
-import { createJiti } from "jiti/static";
-// Static imports of packages that extensions may use.
-// These MUST be static so Bun bundles them into the compiled binary.
-// The virtualModules option then makes them available to extensions.
-import * as _bundledTypebox from "typebox";
-import * as _bundledTypeboxCompile from "typebox/compile";
-import * as _bundledTypeboxValue from "typebox/value";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary } from "../../config.js";
-// NOTE: This import works because loader.ts exports are NOT re-exported from index.ts,
-// avoiding a circular dependency. Extensions can import from @earendil-works/pi-coding-agent.
-import * as _bundledPiCodingAgent from "../../index.js";
 import { createEventBus, type EventBus } from "../event-bus.js";
 import type { ExecOptions } from "../exec.js";
 import { execCommand } from "../exec.js";
@@ -39,26 +25,6 @@ import type {
 	RegisteredCommand,
 	ToolDefinition,
 } from "./types.js";
-
-/** Modules available to extensions via virtualModules (for compiled Bun binary) */
-const VIRTUAL_MODULES: Record<string, unknown> = {
-	typebox: _bundledTypebox,
-	"typebox/compile": _bundledTypeboxCompile,
-	"typebox/value": _bundledTypeboxValue,
-	"@sinclair/typebox": _bundledTypebox,
-	"@sinclair/typebox/compile": _bundledTypeboxCompile,
-	"@sinclair/typebox/value": _bundledTypeboxValue,
-	"@earendil-works/pi-agent-core": _bundledPiAgentCore,
-	"@earendil-works/pi-tui": _bundledPiTui,
-	"@earendil-works/pi-ai": _bundledPiAi,
-	"@earendil-works/pi-ai/oauth": _bundledPiAiOauth,
-	"@earendil-works/pi-coding-agent": _bundledPiCodingAgent,
-	"@mariozechner/pi-agent-core": _bundledPiAgentCore,
-	"@mariozechner/pi-tui": _bundledPiTui,
-	"@mariozechner/pi-ai": _bundledPiAi,
-	"@mariozechner/pi-ai/oauth": _bundledPiAiOauth,
-	"@mariozechner/pi-coding-agent": _bundledPiCodingAgent,
-};
 
 const require = createRequire(import.meta.url);
 
@@ -353,13 +319,27 @@ function createExtensionAPI(
 	return api;
 }
 
+// Replaced with `true` by the esbuild CLI bundle (scripts/bundle.mjs); stays
+// undefined in unbundled dist/ and under tsx.
+declare const __PI_BUNDLED__: boolean | undefined;
+const isBundledCli = typeof __PI_BUNDLED__ !== "undefined" && __PI_BUNDLED__ === true;
+
 async function loadExtensionModule(extensionPath: string) {
+	// jiti and the bundled virtual modules are loaded lazily so that importing
+	// the loader (which nearly every startup path does transitively) doesn't pay
+	// for the full package graph; both specifiers are literals, so Bun still
+	// bundles them into the compiled binary.
+	const { createJiti } = await import("jiti/static");
 	const jiti = createJiti(import.meta.url, {
 		moduleCache: false,
-		// In Bun binary: use virtualModules for bundled packages (no filesystem resolution)
+		// In the Bun binary and the esbuild CLI bundle: serve pi packages from
+		// virtualModules so extensions share the bundle's module instances
+		// (file-path aliases would load a second, divergent copy of each package).
 		// Also disable tryNative so jiti handles ALL imports (not just the entry point)
 		// In Node.js/dev: use aliases to resolve to node_modules paths
-		...(isBunBinary ? { virtualModules: VIRTUAL_MODULES, tryNative: false } : { alias: getAliases() }),
+		...(isBunBinary || isBundledCli
+			? { virtualModules: (await import("./bundled-modules.js")).VIRTUAL_MODULES, tryNative: false }
+			: { alias: getAliases() }),
 	});
 
 	const module = await jiti.import(extensionPath, { default: true });

@@ -14,9 +14,8 @@ import {
 	type SelectListTheme,
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
-import { highlight, supportsLanguage } from "cli-highlight";
-import { type Static, Type } from "typebox";
-import { Compile } from "typebox/compile";
+import { type Static, type TProperties, Type } from "typebox";
+import type { Validator } from "typebox/compile";
 import { getCustomThemesDir, getThemesDir } from "../../../config.js";
 import type { SourceInfo } from "../../../core/source-info.js";
 import { closeWatcher, watchWithErrorHandler } from "../../../utils/fs-watch.js";
@@ -107,7 +106,19 @@ const ThemeJsonSchema = Type.Object({
 
 type ThemeJson = Static<typeof ThemeJsonSchema>;
 
-const validateThemeJson = Compile(ThemeJsonSchema);
+// typebox/compile costs ~300ms to import, so the theme validator loads lazily.
+// Built-in themes never validate; custom themes get a minimal structural check
+// until the validator is ready (preloaded from initTheme), after which full
+// schema validation applies (e.g. on watcher reloads and setTheme).
+let validateThemeJson: Validator<TProperties, typeof ThemeJsonSchema> | undefined;
+let themeValidatorPromise: Promise<void> | undefined;
+
+export function preloadThemeValidator(): Promise<void> {
+	themeValidatorPromise ??= import("typebox/compile").then(({ Compile }) => {
+		validateThemeJson = Compile(ThemeJsonSchema);
+	});
+	return themeValidatorPromise;
+}
 
 export type ThemeColor =
 	| "accent"
@@ -556,6 +567,23 @@ export function getAvailableThemesWithPaths(): ThemeInfo[] {
 }
 
 function parseThemeJson(label: string, json: unknown): ThemeJson {
+	if (!validateThemeJson) {
+		// Validator not loaded yet (first custom-theme parse during startup):
+		// apply a minimal structural check now and report full schema errors
+		// asynchronously once the validator is ready.
+		const colors = (json as Partial<ThemeJson> | null)?.colors;
+		if (!json || typeof json !== "object" || !colors || typeof colors !== "object") {
+			throw new Error(`Invalid theme "${label}": expected a JSON object with a "colors" object`);
+		}
+		void preloadThemeValidator().then(() => {
+			try {
+				parseThemeJson(label, json);
+			} catch (error) {
+				console.error(error instanceof Error ? error.message : String(error));
+			}
+		});
+		return json as ThemeJson;
+	}
 	if (!validateThemeJson.Check(json)) {
 		const errors = Array.from(validateThemeJson.Errors(json));
 		const missingColors = new Set<string>();
@@ -739,7 +767,26 @@ export function setRegisteredThemes(themes: Theme[]): void {
 	}
 }
 
+type CodeHighlighterModule = typeof import("./code-highlighter.js");
+let codeHighlighter: CodeHighlighterModule | undefined;
+let codeHighlighterPromise: Promise<void> | undefined;
+
+/**
+ * Start loading the syntax highlighter (cli-highlight pulls in all of
+ * highlight.js, ~350ms) off the startup-critical import path. highlightCode
+ * falls back to unhighlighted output until the load completes; await this
+ * before the first render to guarantee highlighted code blocks.
+ */
+export function preloadCodeHighlighter(): Promise<void> {
+	codeHighlighterPromise ??= import("./code-highlighter.js").then((module) => {
+		codeHighlighter = module;
+	});
+	return codeHighlighterPromise;
+}
+
 export function initTheme(themeName?: string, enableWatcher: boolean = false): void {
+	void preloadCodeHighlighter();
+	void preloadThemeValidator();
 	const name = themeName ?? getDefaultTheme();
 	currentThemeName = name;
 	currentThemeIsAutomatic = themeName === undefined;
@@ -1045,12 +1092,14 @@ function getCliHighlightTheme(t: Theme): CliHighlightTheme {
  * Returns array of highlighted lines.
  */
 export function highlightCode(code: string, lang?: string): string[] {
+	// The highlighter loads lazily; until then render the block unhighlighted.
+	const highlighter = codeHighlighter;
 	// Validate language before highlighting to avoid stderr spam from cli-highlight
-	const validLang = lang && supportsLanguage(lang) ? lang : undefined;
+	const validLang = lang && highlighter?.supportsLanguage(lang) ? lang : undefined;
 	// Skip highlighting when no valid language is specified. cli-highlight's
 	// auto-detection is unreliable and can misidentify prose as AppleScript,
 	// LiveCodeServer, etc., coloring random English words as keywords.
-	if (!validLang) {
+	if (!highlighter || !validLang) {
 		return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
 	}
 	const opts = {
@@ -1059,7 +1108,7 @@ export function highlightCode(code: string, lang?: string): string[] {
 		theme: getCliHighlightTheme(theme),
 	};
 	try {
-		return highlight(code, opts).split("\n");
+		return highlighter.highlight(code, opts).split("\n");
 	} catch {
 		return code.split("\n");
 	}
@@ -1153,12 +1202,14 @@ export function getMarkdownTheme(): MarkdownTheme {
 		underline: (text: string) => theme.underline(text),
 		strikethrough: (text: string) => chalk.strikethrough(text),
 		highlightCode: (code: string, lang?: string): string[] => {
+			// The highlighter loads lazily; until then render the block unhighlighted.
+			const highlighter = codeHighlighter;
 			// Validate language before highlighting to avoid stderr spam from cli-highlight
-			const validLang = lang && supportsLanguage(lang) ? lang : undefined;
+			const validLang = lang && highlighter?.supportsLanguage(lang) ? lang : undefined;
 			// Skip highlighting when no valid language is specified. cli-highlight's
 			// auto-detection is unreliable and can misidentify prose as AppleScript,
 			// LiveCodeServer, etc., coloring random English words as keywords.
-			if (!validLang) {
+			if (!highlighter || !validLang) {
 				return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
 			}
 			const opts = {
@@ -1167,7 +1218,7 @@ export function getMarkdownTheme(): MarkdownTheme {
 				theme: getCliHighlightTheme(theme),
 			};
 			try {
-				return highlight(code, opts).split("\n");
+				return highlighter.highlight(code, opts).split("\n");
 			} catch {
 				return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
 			}

@@ -22,6 +22,26 @@ export interface ActiveSessionBindingCallbacks {
 	subagentRuntimeHost?: SubagentRuntimeHost;
 }
 
+type BroadcastSessionEvent = Extract<DaemonOutbound, { type: "session_event" }>["event"];
+
+/**
+ * message_update events carry the full partial assistant message twice: once
+ * as event.message and once nested as assistantMessageEvent.partial. Socket
+ * clients read event.message (and assistantMessageEvent.type/toolCall), so the
+ * nested copy is dropped before serialization, halving streaming wire bytes
+ * per token. In-process consumers (extensions) still receive the full event.
+ */
+function slimSessionEventForWire(event: BroadcastSessionEvent): BroadcastSessionEvent {
+	if (event.type !== "message_update") {
+		return event;
+	}
+	const { partial: _partial, ...assistantMessageEvent } = event.assistantMessageEvent as { partial?: unknown };
+	return {
+		...event,
+		assistantMessageEvent: assistantMessageEvent as typeof event.assistantMessageEvent,
+	};
+}
+
 export async function bindActiveSessionState(
 	state: ActiveSessionState,
 	callbacks: ActiveSessionBindingCallbacks,
@@ -34,7 +54,7 @@ export async function bindActiveSessionState(
 		callbacks.broadcast(state, {
 			type: "session_event",
 			activeSessionId: state.activeSessionId,
-			event,
+			event: slimSessionEventForWire(event),
 		});
 	});
 

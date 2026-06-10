@@ -1241,4 +1241,96 @@ bar`,
 			);
 		});
 	});
+
+	describe("Streaming identity", () => {
+		// Incremental setText (as during token streaming) must render byte-identical
+		// to a fresh component constructed with the same final text. Guards the
+		// per-block render cache against stale or mis-keyed entries.
+		const assertStreamingIdentity = (corpus: string, chunkSize: number, width: number) => {
+			const streaming = new Markdown("", 1, 1, defaultMarkdownTheme);
+			let text = "";
+			for (let offset = 0; offset < corpus.length; offset += chunkSize) {
+				text += corpus.slice(offset, offset + chunkSize);
+				streaming.setText(text);
+				const incremental = streaming.render(width);
+				const fresh = new Markdown(text, 1, 1, defaultMarkdownTheme).render(width);
+				assert.deepStrictEqual(
+					incremental,
+					fresh,
+					`Streaming render diverged at ${text.length}/${corpus.length} chars`,
+				);
+			}
+		};
+
+		const corpus = [
+			"# Title",
+			"",
+			"Intro paragraph with **bold**, *italic*, and `code` that wraps at narrow widths.",
+			"",
+			"- item one",
+			"- item two",
+			"  - nested",
+			"- item three",
+			"",
+			"```ts",
+			"function f(x: number) {",
+			"  return x * 2;",
+			"}",
+			"```",
+			"",
+			"| a | b |",
+			"| - | - |",
+			"| 1 | 2 |",
+			"| 3 | 4 |",
+			"",
+			"> quote line that is long enough to wrap when rendered at narrow widths",
+			"",
+			"Closing paragraph.",
+		].join("\n");
+
+		it("renders identically when streamed in 3-char chunks", () => {
+			assertStreamingIdentity(corpus, 3, 60);
+		});
+
+		it("renders identically when streamed in 7-char chunks", () => {
+			assertStreamingIdentity(corpus, 7, 100);
+		});
+
+		it("handles a code fence that stays unterminated then closes", () => {
+			assertStreamingIdentity("Some text\n\n```js\nconst a = 1;\nconst b = 2;\n```\n\nAfter fence.", 4, 80);
+		});
+
+		it("handles a paragraph that becomes a setext heading", () => {
+			assertStreamingIdentity("Heading text\n===\n\nBody paragraph.", 2, 80);
+		});
+
+		it("handles width changes mid-stream", () => {
+			const streaming = new Markdown("", 1, 1, defaultMarkdownTheme);
+			let text = "";
+			const widths = [40, 80, 60, 100];
+			for (let offset = 0, i = 0; offset < corpus.length; offset += 16, i++) {
+				text += corpus.slice(offset, offset + 16);
+				streaming.setText(text);
+				const width = widths[i % widths.length];
+				const incremental = streaming.render(width);
+				const fresh = new Markdown(text, 1, 1, defaultMarkdownTheme).render(width);
+				assert.deepStrictEqual(incremental, fresh, `Diverged at ${text.length} chars, width ${width}`);
+			}
+		});
+
+		it("handles invalidate mid-stream", () => {
+			const streaming = new Markdown("", 1, 1, defaultMarkdownTheme);
+			let text = "";
+			for (let offset = 0, i = 0; offset < corpus.length; offset += 16, i++) {
+				text += corpus.slice(offset, offset + 16);
+				streaming.setText(text);
+				if (i % 5 === 4) {
+					streaming.invalidate();
+				}
+				const incremental = streaming.render(80);
+				const fresh = new Markdown(text, 1, 1, defaultMarkdownTheme).render(80);
+				assert.deepStrictEqual(incremental, fresh, `Diverged at ${text.length} chars`);
+			}
+		});
+	});
 });
