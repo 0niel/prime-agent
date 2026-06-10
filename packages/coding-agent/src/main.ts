@@ -417,6 +417,7 @@ export async function createSessionManager(
 			const selectedPath = await selectSession(
 				(onProgress) => SessionManager.list(cwd, sessionDir, onProgress),
 				SessionManager.listAll,
+				{ cwd },
 			);
 			if (!selectedPath) {
 				console.log(chalk.dim("No session selected"));
@@ -1160,18 +1161,7 @@ export async function main(args: string[], options?: MainOptions) {
 			services,
 			sessionManager,
 		});
-		if (
-			shouldOpenAgentsViewForDaemonInteractive({
-				useDaemonInteractive,
-				session: parsed.session,
-				resume: parsed.resume,
-				continue: parsed.continue,
-				fork: parsed.fork,
-			})
-		) {
-			await daemonReady;
-			await preloadCodeHighlighter();
-			printTimings();
+		const launchAgentsView = async (includeInitialPrompts: boolean) => {
 			await runAgentsViewMode({
 				socketPath: daemonSocketPath,
 				config: defaultSessionConfig,
@@ -1198,11 +1188,23 @@ export async function main(args: string[], options?: MainOptions) {
 				migratedProviders,
 				modelFallbackMessage: startupModel.modelFallbackMessage,
 				startupModelId: startupModel.model?.id,
-				initialMessage,
-				initialImages,
-				initialMessages: parsed.messages,
+				...(includeInitialPrompts ? { initialMessage, initialImages, initialMessages: parsed.messages } : {}),
 				verbose: parsed.verbose,
 			});
+		};
+		if (
+			shouldOpenAgentsViewForDaemonInteractive({
+				useDaemonInteractive,
+				session: parsed.session,
+				resume: parsed.resume,
+				continue: parsed.continue,
+				fork: parsed.fork,
+			})
+		) {
+			await daemonReady;
+			await preloadCodeHighlighter();
+			printTimings();
+			await launchAgentsView(true);
 			return;
 		}
 
@@ -1226,11 +1228,15 @@ export async function main(args: string[], options?: MainOptions) {
 			initialImages,
 			initialMessages: parsed.messages,
 			verbose: parsed.verbose,
+			// Resumed/attached daemon sessions are part of the same fleet; left
+			// arrow takes them to the agents view like any other session.
+			returnToAgentsView: true,
 		});
 
 		await preloadCodeHighlighter();
 		printTimings();
 		await interactiveMode.run();
+		await launchAgentsView(false);
 		return;
 	}
 

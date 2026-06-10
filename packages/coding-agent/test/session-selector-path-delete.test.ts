@@ -85,7 +85,7 @@ function createSymlinkedSessionPaths(): {
 	};
 }
 
-const CTRL_D = "\x04";
+const CTRL_X = "\x18";
 const CTRL_BACKSPACE = "\x1b[127;5u";
 
 describe("session selector path/delete interactions", () => {
@@ -131,7 +131,7 @@ describe("session selector path/delete interactions", () => {
 		expect(confirmationChanges).toEqual([]);
 	});
 
-	it("enters confirmation mode on Ctrl+D even with a non-empty search query", async () => {
+	it("enters confirmation mode on Ctrl+X even with a non-empty search query", async () => {
 		const sessions = [makeSession({ id: "a" }), makeSession({ id: "b" })];
 
 		const selector = new SessionSelectorComponent(
@@ -150,7 +150,7 @@ describe("session selector path/delete interactions", () => {
 		list.onDeleteConfirmationChange = (path) => confirmationChanges.push(path);
 
 		list.handleInput("a");
-		list.handleInput(CTRL_D);
+		list.handleInput(CTRL_X);
 
 		expect(confirmationChanges).toEqual([sessions[0]!.path]);
 	});
@@ -181,7 +181,7 @@ describe("session selector path/delete interactions", () => {
 		list.handleInput(CTRL_BACKSPACE);
 		expect(confirmationChanges).toEqual([sessions[0]!.path]);
 
-		list.handleInput("\r");
+		list.handleInput(CTRL_BACKSPACE);
 		expect(confirmationChanges).toEqual([sessions[0]!.path, null]);
 		expect(deletedPath).toBe(sessions[0]!.path);
 	});
@@ -202,8 +202,8 @@ describe("session selector path/delete interactions", () => {
 		await flushPromises();
 
 		const list = selector.getSessionList();
-		list.handleInput(CTRL_D);
-		list.handleInput("\r");
+		list.handleInput(CTRL_X);
+		list.handleInput(CTRL_X);
 		await flushPromises();
 
 		expect(deleteSession).toHaveBeenCalledTimes(1);
@@ -238,8 +238,8 @@ describe("session selector path/delete interactions", () => {
 
 		expect(allLoadCalls).toBe(1);
 		const output = selector.render(120).join("\n");
-		expect(output).toContain("Resume Session (Current Folder)");
-		expect(output).not.toContain("Resume Session (All)");
+		expect(output).toContain("current folder");
+		expect(output).not.toContain("all projects");
 	});
 
 	it("does not start redundant All loads when toggling scopes while All is already loading", async () => {
@@ -305,7 +305,7 @@ describe("session selector path/delete interactions", () => {
 
 		const output = stripAnsi(selector.render(120).join("\n"));
 		expect(output).toContain("Parent");
-		expect(output).toContain("└─ Child");
+		expect(output).toContain("└─ ✓ Child");
 	});
 
 	it("treats the current session as active across symlink aliases", async () => {
@@ -333,7 +333,7 @@ describe("session selector path/delete interactions", () => {
 			errorMessage = message;
 		};
 
-		list.handleInput(CTRL_D);
+		list.handleInput(CTRL_X);
 
 		expect(confirmationChanges).toEqual([]);
 		expect(errorMessage).toBe("Cannot delete the currently active session");
