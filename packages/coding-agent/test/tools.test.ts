@@ -319,7 +319,10 @@ describe("Coding Agent Tools", () => {
 		});
 
 		it("should pass shellPath through to shell resolution", async () => {
+			// vi.spyOn returns the spy created by the previous test, including its
+			// recorded calls; clear them so the assertions only see this test's calls.
 			const getShellConfigSpy = vi.spyOn(shellModule, "getShellConfig");
+			getShellConfigSpy.mockClear();
 			const bashWithCustomShell = createBashTool(testDir, {
 				shellPath: "/custom/bash",
 				operations: {
