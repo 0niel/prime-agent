@@ -1,6 +1,6 @@
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBundledSkillsDir } from "../src/config.js";
 import { DefaultPackageManager } from "../src/core/package-manager.js";
@@ -160,6 +160,31 @@ describe("builtin skills", () => {
 			expect(diagnostics).toEqual([]);
 			expect(skills.length).toBeGreaterThan(0);
 			expect(skills.map((s) => s.name)).toContain("prime-intellect");
+			expect(skills.map((s) => s.name)).toContain("skill-creator");
+		});
+
+		it("loads the skill-creator python template as a valid python skill", () => {
+			const referencePath = join(getBundledSkillsDir(), "skill-creator", "references", "python-skills.md");
+			const reference = readFileSync(referencePath, "utf-8");
+			const section = reference.match(/## Minimal Template([\s\S]*?)\n## /)?.[1];
+			expect(section).toBeDefined();
+
+			const files = [...(section as string).matchAll(/\*\*`([^`]+)`\*\*\s*\n+```[a-z]*\n([\s\S]*?)\n```/g)];
+			expect(files.map((m) => m[1])).toEqual(["SKILL.md", "pyproject.toml", "src/word_count/__init__.py"]);
+
+			const templateRoot = join(tempDir, "template-skills");
+			for (const [, relPath, content] of files) {
+				const filePath = join(templateRoot, "word-count", relPath);
+				mkdirSync(dirname(filePath), { recursive: true });
+				writeFileSync(filePath, content);
+			}
+
+			const { skills, diagnostics } = loadSkillsFromDir({ dir: templateRoot, source: "test" });
+			expect(diagnostics).toEqual([]);
+			expect(skills).toHaveLength(1);
+			expect(skills[0].name).toBe("word-count");
+			expect(skills[0].kind).toBe("python");
+			expect(skills[0].kind === "python" && skills[0].python.importName).toBe("word_count");
 		});
 	});
 });

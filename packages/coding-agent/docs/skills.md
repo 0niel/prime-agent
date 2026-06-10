@@ -48,6 +48,7 @@ Disable discovery with `--no-skills` (explicit `--skill` paths still load).
 Prime Agent ships with built-in skills that teach the agent the Prime Intellect ecosystem:
 
 - `prime-intellect` - Prime Intellect products and workflows via the prime CLI: verifiers environments and the Environments Hub, evaluations (local and hosted), Hosted Training and prime-rl, sandboxes, tunnels, Prime Inference, GPU compute, and storage. Reference docs for each area load on demand from the skill's `references/` directory.
+- `skill-creator` - teaches the agent to create new skills: markdown skill layout, frontmatter rules, placement and precedence, and the full Python-backed skill contract (package layout, `run()` convention, optional CLI, kernel venv behavior) with a working template in `references/python-skills.md`.
 
 Built-in skills behave like any other skill but have the lowest precedence: a user, project, or package skill with the same name overrides the built-in one.
 
