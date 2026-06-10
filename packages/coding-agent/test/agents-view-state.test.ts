@@ -3,9 +3,10 @@ import type { AgentSessionRuntimeConfig } from "../src/core/agent-session-config
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import type { SettingsManager } from "../src/core/settings-manager.js";
 import {
-	createAgentsViewReplyPlaceholder,
+	createAgentsViewReplyHeadline,
 	createAgentsViewResumeConfig,
 	createAgentsViewSessionName,
+	formatAgentsViewRelativeTime,
 	resolveAgentsViewSessionUiServices,
 } from "../src/modes/agents-view/agents-view-mode.js";
 import {
@@ -186,9 +187,21 @@ describe("agents view state", () => {
 		expect(config.cwd).toBe("/tmp/dashboard");
 	});
 
-	test("uses latest assistant text as reply placeholder", () => {
-		expect(createAgentsViewReplyPlaceholder("  Done.\nNext step?  ")).toBe("Reply to: Done. Next step?");
-		expect(createAgentsViewReplyPlaceholder(undefined)).toBe("Write a reply to this agent");
+	test("derives the reply headline from the first line of the latest assistant text", () => {
+		expect(createAgentsViewReplyHeadline("  Done.\nNext step?  ")).toBe("Done.");
+		expect(createAgentsViewReplyHeadline("\n\n  spread   over \nlines")).toBe("spread over");
+		expect(createAgentsViewReplyHeadline("   \n  ")).toBeUndefined();
+		expect(createAgentsViewReplyHeadline(undefined)).toBeUndefined();
+	});
+
+	test("formats relative timestamps for the reply header", () => {
+		const now = Date.parse("2026-01-02T12:00:00Z");
+		expect(formatAgentsViewRelativeTime("2026-01-02T11:59:30Z", now)).toBe("30s");
+		expect(formatAgentsViewRelativeTime("2026-01-02T11:15:00Z", now)).toBe("45m");
+		expect(formatAgentsViewRelativeTime("2026-01-02T06:00:00Z", now)).toBe("6h");
+		expect(formatAgentsViewRelativeTime("2025-12-30T12:00:00Z", now)).toBe("3d");
+		expect(formatAgentsViewRelativeTime(undefined, now)).toBe("");
+		expect(formatAgentsViewRelativeTime("not a timestamp", now)).toBe("");
 	});
 
 	test("caps generated session names at the configured limit", () => {

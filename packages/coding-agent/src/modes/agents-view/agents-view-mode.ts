@@ -92,9 +92,11 @@ export function createAgentsViewResumeConfig(config: AgentSessionRuntimeConfig):
 	return resumeConfig;
 }
 
-export function createAgentsViewReplyPlaceholder(text: string | undefined): string {
-	const normalized = text?.replace(/\s+/g, " ").trim();
-	return normalized ? `Reply to: ${normalized}` : REPLY_PROMPT_FALLBACK_PLACEHOLDER;
+export function createAgentsViewReplyHeadline(text: string | undefined): string | undefined {
+	return text
+		?.split("\n")
+		.map((line) => line.replace(/\s+/g, " ").trim())
+		.find((line) => line.length > 0);
 }
 
 async function openAgentsViewSession(
@@ -215,6 +217,9 @@ class AgentsViewMode implements Component, Focusable {
 	private selectedRowIdentity: string | undefined;
 	private selectedActiveSessionId: string | undefined;
 	private replyActiveSessionId: string | undefined;
+	private replyLastAssistantText: string | undefined;
+	private replyLastAssistantTextLoading = false;
+	private replyHeaderTime = "";
 	private pendingDeleteAgent: PendingDeleteAgent | undefined;
 	private readonly inactiveAgentIdentities = new Set<string>();
 	private statusMessage: string | undefined;
@@ -241,6 +246,7 @@ class AgentsViewMode implements Component, Focusable {
 			placeholderColor: (text) => theme.fg("dim", text),
 		});
 		this.editor.focused = true;
+		this.editor.getHeaderLine = () => this.renderReplyHeaderLine();
 		this.editor.onSubmit = (value) => {
 			void this.submit(value);
 		};
@@ -539,24 +545,50 @@ class AgentsViewMode implements Component, Focusable {
 			this.setReplyTarget(undefined);
 			return;
 		}
-		this.setReplyTarget(activeSessionId, REPLY_PROMPT_FALLBACK_PLACEHOLDER);
+		this.setReplyTarget(activeSessionId);
+		this.replyLastAssistantTextLoading = true;
 		try {
 			const latestAssistantText = await this.getLastAssistantText(activeSessionId);
 			if (this.replyActiveSessionId === activeSessionId) {
-				this.editor.setPlaceholder(createAgentsViewReplyPlaceholder(latestAssistantText));
+				this.replyLastAssistantText = latestAssistantText;
+				this.replyLastAssistantTextLoading = false;
 				this.ui.requestRender();
 			}
 		} catch (error) {
 			if (this.replyActiveSessionId === activeSessionId) {
+				this.replyLastAssistantTextLoading = false;
 				this.setStatusMessage(formatError("Failed to load latest response", error));
 			}
 		}
 	}
 
-	private setReplyTarget(activeSessionId: string | undefined, placeholder?: string): void {
+	private setReplyTarget(activeSessionId: string | undefined): void {
 		this.replyActiveSessionId = activeSessionId;
-		this.editor.setPlaceholder(activeSessionId ? placeholder : DEFAULT_PROMPT_PLACEHOLDER);
+		this.replyLastAssistantText = undefined;
+		this.replyLastAssistantTextLoading = false;
+		// Captured once on entry so the header does not count up while reply mode stays open.
+		this.replyHeaderTime = activeSessionId ? this.getReplyHeaderTime(activeSessionId) : "";
+		this.editor.setPlaceholder(activeSessionId ? REPLY_PROMPT_FALLBACK_PLACEHOLDER : DEFAULT_PROMPT_PLACEHOLDER);
 		this.ui.requestRender();
+	}
+
+	private getReplyHeaderTime(activeSessionId: string): string {
+		const summary = this.findSummaryByActiveSessionId(activeSessionId);
+		return formatAgentsViewRelativeTime(summary?.modified ?? summary?.created);
+	}
+
+	private findSummaryByActiveSessionId(activeSessionId: string): SessionSummary | undefined {
+		return this.rows.find((row) => (row.summary.activeSessionId ?? row.summary.id) === activeSessionId)?.summary;
+	}
+
+	private renderReplyHeaderLine(): string | undefined {
+		if (!this.replyActiveSessionId) {
+			return undefined;
+		}
+		const headline =
+			createAgentsViewReplyHeadline(this.replyLastAssistantText) ??
+			theme.fg("dim", this.replyLastAssistantTextLoading ? "Loading last response..." : "No response yet");
+		return this.replyHeaderTime ? `${theme.fg("warning", this.replyHeaderTime)} ${headline}` : headline;
 	}
 
 	private async getLastAssistantText(activeSessionId: string): Promise<string | undefined> {
@@ -578,10 +610,7 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	private async sendReply(activeSessionId: string, text: string): Promise<void> {
-		const row = this.rows.find(
-			(candidate) => (candidate.summary.activeSessionId ?? candidate.summary.id) === activeSessionId,
-		);
-		const behavior = row?.summary.isStreaming ? "followUp" : undefined;
+		const behavior = this.findSummaryByActiveSessionId(activeSessionId)?.isStreaming ? "followUp" : undefined;
 		this.setStatusMessage("Sending reply...");
 		try {
 			await this.sendPrompt(activeSessionId, text, undefined, behavior);
@@ -621,7 +650,7 @@ class AgentsViewMode implements Component, Focusable {
 				stopped: false,
 			};
 			this.setStatusMessage(undefined, { render: false });
-			this.replyActiveSessionId = undefined;
+			this.setReplyTarget(undefined);
 			this.showDeleteConfirmation();
 			return;
 		}
@@ -634,7 +663,7 @@ class AgentsViewMode implements Component, Focusable {
 				stopped: false,
 			};
 			this.setStatusMessage(undefined, { render: false });
-			this.replyActiveSessionId = undefined;
+			this.setReplyTarget(undefined);
 			this.showDeleteConfirmation();
 			return;
 		}
@@ -653,7 +682,7 @@ class AgentsViewMode implements Component, Focusable {
 				stopped: true,
 			};
 			this.selectedActiveSessionId = activeSessionId;
-			this.replyActiveSessionId = undefined;
+			this.setReplyTarget(undefined);
 			this.setStatusMessage(undefined, { render: false });
 			this.showDeleteConfirmation();
 			await this.refreshSessions();
@@ -1171,11 +1200,15 @@ function formatRightTableCell(value: string, width: number): string {
 }
 
 function formatSessionDuration(summary: SessionSummary): string {
-	const timestamp = parseSessionTimestamp(summary.created ?? summary.modified);
+	return formatAgentsViewRelativeTime(summary.created ?? summary.modified);
+}
+
+export function formatAgentsViewRelativeTime(value: string | undefined, now: number = Date.now()): string {
+	const timestamp = parseSessionTimestamp(value);
 	if (!timestamp) {
 		return "";
 	}
-	const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+	const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
 	if (seconds < 60) {
 		return `${seconds}s`;
 	}

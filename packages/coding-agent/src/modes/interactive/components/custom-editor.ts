@@ -30,6 +30,8 @@ export class CustomEditor extends Editor {
 	public onPasteImage?: () => void;
 	public onMoveBelowPrompt?: () => boolean;
 	public onAgentsBack?: () => boolean;
+	/** When set, the returned line is rendered inside the top of the editor box. */
+	public getHeaderLine?: () => string | undefined;
 	/** Handler for extension-registered shortcuts. Returns true if handled. */
 	public onExtensionShortcut?: (data: string) => boolean;
 
@@ -84,11 +86,20 @@ export class CustomEditor extends Editor {
 	}
 
 	override render(width: number): string[] {
-		const lines = super.render(width);
-		if (!this.placeholder || this.getText().length > 0 || lines.length < 2) {
-			return lines;
+		let lines = super.render(width);
+		if (this.placeholder && this.getText().length === 0 && lines.length >= 2) {
+			lines = [lines[0]!, this.renderPlaceholderLine(width), ...lines.slice(2)];
 		}
-		return [lines[0]!, this.renderPlaceholderLine(width), ...lines.slice(2)];
+		const headerLine = this.getHeaderLine?.();
+		if (headerLine !== undefined && lines.length >= 2) {
+			lines = [
+				lines[0]!,
+				this.renderHeaderContentLine(headerLine, width),
+				this.renderHeaderContentLine("", width),
+				...lines.slice(1),
+			];
+		}
+		return lines;
 	}
 
 	setPlaceholder(placeholder: string | undefined): void {
@@ -164,13 +175,33 @@ export class CustomEditor extends Editor {
 		super.handleInput(data);
 	}
 
-	private renderPlaceholderLine(width: number): string {
+	private getEffectivePaddingX(width: number): number {
 		const maxPadding = Math.max(0, Math.floor((width - 1) / 2));
-		const useBackgroundSurface = this.backgroundColor !== undefined;
 		const configuredPaddingX = Math.min(this.configuredPaddingX, maxPadding);
-		const paddingX = useBackgroundSurface
+		return this.backgroundColor !== undefined
 			? Math.min(Math.max(configuredPaddingX, 2), maxPadding)
 			: configuredPaddingX;
+	}
+
+	private renderHeaderContentLine(content: string, width: number): string {
+		const paddingX = this.getEffectivePaddingX(width);
+		const contentWidth = Math.max(1, width - paddingX * 2);
+		const line = `${" ".repeat(paddingX)}${truncateToWidth(content, contentWidth)}`;
+		const padded = line + " ".repeat(Math.max(0, width - visibleWidth(line)));
+		const backgroundColor = this.backgroundColor;
+		if (!backgroundColor) {
+			return padded;
+		}
+		// Truncation may inject full ANSI resets; wrap each segment so the
+		// background survives past them instead of falling back to the terminal's.
+		return padded
+			.split("\x1b[0m")
+			.map((segment) => backgroundColor(segment))
+			.join("\x1b[0m");
+	}
+
+	private renderPlaceholderLine(width: number): string {
+		const paddingX = this.getEffectivePaddingX(width);
 		const contentWidth = Math.max(1, width - paddingX * 2);
 		const promptPrefixText = this.getPromptPrefix();
 		const promptPrefixWidth = Math.min(visibleWidth(promptPrefixText), Math.max(0, contentWidth - 1));
