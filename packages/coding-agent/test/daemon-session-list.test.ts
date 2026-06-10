@@ -73,6 +73,7 @@ describe("buildSessionList", () => {
 						parentSessionFile: "/tmp/parent.jsonl",
 						rlmChildId: "rlm-child",
 						rlmParentNodeId: "rlm-child",
+						prompt: "Audit the   retry\nlogic for races",
 					},
 				}),
 			],
@@ -86,6 +87,8 @@ describe("buildSessionList", () => {
 			parentSessionPath: "/tmp/parent.jsonl",
 			rlmChildId: "rlm-child",
 			rlmParentNodeId: "rlm-child",
+			// The spawn prompt doubles as the subagent's display title.
+			firstMessage: "Audit the retry logic for races",
 		});
 	});
 });

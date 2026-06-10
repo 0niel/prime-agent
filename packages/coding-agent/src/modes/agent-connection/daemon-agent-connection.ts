@@ -168,11 +168,17 @@ export class DaemonAgentConnection implements AgentConnection {
 				activeSessionId: this.activeSessionId,
 			}),
 		]);
+		// Children only travel in the attach snapshot; a session event arriving
+		// before the first read marks the cache stale, but the attach-time child
+		// roster is still the best seed available (live rlm_child_update events
+		// overwrite each entry anyway).
+		const children = this.latestSnapshot?.children;
 		this.latestSnapshot = {
 			state,
 			messages: messagesData.messages,
 			sessionContext: sessionContextData.context,
 			sessionTree,
+			...(children ? { children } : {}),
 		};
 		if (this.lastEventSequence !== undefined) {
 			this.latestSnapshot.lastEventSequence = this.lastEventSequence;

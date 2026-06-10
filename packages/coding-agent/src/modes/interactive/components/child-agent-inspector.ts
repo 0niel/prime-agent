@@ -153,6 +153,69 @@ function hintLine(hints: ReadonlyArray<string | undefined>, width: number): stri
 	return truncateToWidth(joinHints(hints), width, "");
 }
 
+// Subagent list entries mirror the agents view row format: icon, title, right-aligned time.
+function childAgentStatusIcon(status: ChildAgentStatus): string {
+	switch (status) {
+		case "queued":
+			return "◇";
+		case "running":
+			return "◆";
+		case "done":
+			return "✓";
+		case "error":
+		case "cancelled":
+			return "✗";
+		default: {
+			const _exhaustive: never = status;
+			return _exhaustive;
+		}
+	}
+}
+
+function formatChildAgentStatusIcon(status: ChildAgentStatus, icon: string): string {
+	switch (status) {
+		case "queued":
+			return theme.fg("dim", icon);
+		case "running":
+			return theme.bold(icon);
+		case "done":
+			return theme.fg("success", icon);
+		case "error":
+			return theme.fg("error", icon);
+		case "cancelled":
+			return theme.fg("warning", icon);
+		default: {
+			const _exhaustive: never = status;
+			return _exhaustive;
+		}
+	}
+}
+
+function formatChildAgentDuration(durationMs: number | undefined): string {
+	if (durationMs === undefined) {
+		return "";
+	}
+	const seconds = Math.max(0, Math.floor(durationMs / 1000));
+	if (seconds < 60) {
+		return `${seconds}s`;
+	}
+	const minutes = Math.floor(seconds / 60);
+	if (minutes < 60) {
+		return `${minutes}m`;
+	}
+	return `${Math.floor(minutes / 60)}h`;
+}
+
+function padTableCell(value: string, width: number): string {
+	const truncated = truncateToWidth(value, width, "");
+	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
+}
+
+function padRightTableCell(value: string, width: number): string {
+	const truncated = truncateToWidth(value, width, "");
+	return " ".repeat(Math.max(0, width - visibleWidth(truncated))) + truncated;
+}
+
 export class ChildAgentSummaryComponent implements Component, Focusable {
 	focused = false;
 	private readonly paddingX = 1;
@@ -314,7 +377,7 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 			return;
 		}
 
-		if (kb.matches(data, "tui.select.cancel")) {
+		if (kb.matches(data, "app.agents.back")) {
 			this.onCancel?.();
 			return;
 		}
@@ -369,8 +432,13 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 
 	private renderListEntry(entry: FlatChildAgentNode, width: number): string {
 		const indent = " ".repeat(Math.min(6, entry.depth * 2));
-		const line = `  ${indent}${this.statusLabel(entry.node.status)} ${theme.fg("dim", "·")} ${theme.fg("muted", entry.node.label)}`;
-		return this.truncate(line, width, "…");
+		const rawIcon = childAgentStatusIcon(entry.node.status);
+		const icon = formatChildAgentStatusIcon(entry.node.status, rawIcon);
+		const timeWidth = 6;
+		const titleWidth = Math.max(0, width - visibleWidth(indent) - visibleWidth(rawIcon) - timeWidth - 2);
+		const titleCell = padTableCell(entry.node.label, titleWidth);
+		const timeCell = padRightTableCell(formatChildAgentDuration(entry.node.durationMs), timeWidth);
+		return this.truncate(`${indent}${icon} ${titleCell} ${timeCell}`, width, "");
 	}
 	private flatten(): FlatChildAgentNode[] {
 		return flattenChildAgentNodes(this.nodes);
@@ -402,25 +470,10 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 			[
 				combinedKeyAction(["tui.select.up", "tui.select.down"], "move"),
 				keyAction("tui.select.confirm", "open"),
-				keyAction("tui.select.cancel", "close", { primaryOnly: true }),
+				keyAction("app.agents.back", "back to chat", { primaryOnly: true }),
 			],
 			width,
 		);
-	}
-
-	private statusLabel(status: ChildAgentStatus): string {
-		switch (status) {
-			case "queued":
-				return theme.fg("muted", "queued");
-			case "running":
-				return theme.fg("accent", "running");
-			case "done":
-				return theme.fg("success", "done");
-			case "error":
-				return theme.fg("error", "error");
-			case "cancelled":
-				return theme.fg("warning", "cancelled");
-		}
 	}
 
 	private panelLine(line: string, width: number, selected: boolean): string {
@@ -492,7 +545,7 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 			this.onToggleToolsExpanded?.();
 			return;
 		}
-		if (kb.matches(data, "tui.select.cancel")) {
+		if (kb.matches(data, "app.agents.back")) {
 			this.onCancel?.();
 		}
 	}
@@ -628,10 +681,7 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 
 	private detailHintLine(width: number): string {
 		const expandAction = keyAction("app.tools.expand", this.toolsExpanded ? "to collapse" : "to expand");
-		return hintLine(
-			[keyAction("tui.select.cancel", "back to subagents", { primaryOnly: true }), expandAction],
-			width,
-		);
+		return hintLine([keyAction("app.agents.back", "back to subagents", { primaryOnly: true }), expandAction], width);
 	}
 
 	private statusLabel(status: ChildAgentStatus): string {

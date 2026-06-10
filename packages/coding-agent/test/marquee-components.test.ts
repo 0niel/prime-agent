@@ -571,15 +571,15 @@ describe("marquee TUI components", () => {
 		expect(compact).toContain("─");
 		expect(visibleWidth(component.render(42)[0] ?? "")).toBe(42);
 		expect(compact).toContain("1 running · 2 total");
-		expect(compact).toContain("running · inspect training logs");
-		expect(compact).toContain("done · check shard 2");
+		expect(compact).toContain("◆ inspect training logs");
+		expect(compact).toContain("✓ check shard 2");
 		expect(compact).not.toContain("└─");
 		expect(compact).not.toContain("├─");
 		expect(compact).not.toContain("assistant: reading shard metrics");
 		const wideList = stripAnsi(component.render(96).join("\n"));
 		expect(wideList).toContain("↑/↓ move");
 		expect(wideList).toContain("Enter open");
-		expect(wideList).toContain("Esc close");
+		expect(wideList).toContain("← back to chat");
 		expect(wideList).not.toContain("ctrl+c close");
 		for (const line of component.render(96)) {
 			expect(visibleWidth(line)).toBe(96);
@@ -588,7 +588,7 @@ describe("marquee TUI components", () => {
 		component.focused = true;
 		const focused = stripAnsi(component.render(42).join("\n"));
 		expect(focused).not.toContain("▌");
-		expect(focused).toContain("running · inspect training logs");
+		expect(focused).toContain("◆ inspect training logs");
 		expect(focused).not.toContain("assistant: reading shard metrics");
 
 		let openedNodeId: string | undefined;
@@ -610,7 +610,7 @@ describe("marquee TUI components", () => {
 		expect(detail).toContain("reading shard metrics");
 		expect(detail).toContain("$ echo hi");
 		expect(detail).toContain("hi");
-		expect(detail).toContain("Esc back to subagents");
+		expect(detail).toContain("← back to subagents");
 		expect(detail).not.toContain("user: inspect training logs");
 		expect(detail).not.toContain("assistant: reading shard metrics");
 		expect(detail).not.toContain("tool: bash");
@@ -618,7 +618,7 @@ describe("marquee TUI components", () => {
 		component.handleInput("\x1b");
 		const returned = stripAnsi(component.render(42).join("\n"));
 		expect(returned).not.toContain("▌");
-		expect(returned).toContain("running · inspect training logs");
+		expect(returned).toContain("◆ inspect training logs");
 		expect(returned).not.toContain("assistant: reading shard metrics");
 
 		for (const line of component.render(42)) {
@@ -626,7 +626,7 @@ describe("marquee TUI components", () => {
 		}
 
 		const narrow = stripAnsi(component.render(24).join("\n"));
-		expect(narrow).toContain("inspect t…");
+		expect(narrow).toContain("◆ inspect train");
 	});
 
 	test("collapses multiline child agent system errors in detail view", () => {
@@ -783,7 +783,7 @@ describe("marquee TUI components", () => {
 		const first = stripAnsi(firstLines.join("\n"));
 		expect(first).toContain("fallback transcript row 01");
 		expect(first).toContain("fallback transcript row 12");
-		expect(first).toContain("Esc back to subagents");
+		expect(first).toContain("← back to subagents");
 		expect(first).not.toContain("↑");
 		expect(first).not.toContain("↓");
 		expect(firstLines.length).toBeGreaterThan(6);

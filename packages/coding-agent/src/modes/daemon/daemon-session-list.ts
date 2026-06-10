@@ -110,7 +110,9 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		streamingMessage: session.state.streamingMessage,
 		created: savedSession?.created.toISOString(),
 		modified,
-		firstMessage: savedSession?.firstMessage,
+		// Subagent sessions live in artifact dirs that the saved-session scan
+		// never sees; their spawn prompt is the most identifying title we have.
+		firstMessage: savedSession?.firstMessage ?? (metadata.prompt ? compactRlmText(metadata.prompt, 120) : undefined),
 		parentActiveSessionId: metadata.parentActiveSessionId,
 		parentSessionId: metadata.parentSessionId,
 		parentSessionPath: savedSession?.parentSessionPath ?? metadata.parentSessionFile,
