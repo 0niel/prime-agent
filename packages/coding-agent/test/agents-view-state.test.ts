@@ -22,21 +22,21 @@ describe("agents view state", () => {
 	test("classifies active daemon sessions into coarse fleet sections", () => {
 		expect(classifyAgentsViewSession(makeSummary({ isStreaming: true, status: "model" }))).toBe("working");
 		expect(classifyAgentsViewSession(makeSummary({ pendingMessageCount: 1 }))).toBe("working");
-		expect(classifyAgentsViewSession(makeSummary({ status: "user", messageCount: 2 }))).toBe("needs_input");
-		expect(classifyAgentsViewSession(makeSummary({ status: "idle", messageCount: 0 }))).toBe("needs_input");
+		expect(classifyAgentsViewSession(makeSummary({ status: "tool" }))).toBe("working");
+		expect(classifyAgentsViewSession(makeSummary({ status: "user", messageCount: 2 }))).toBe("completed");
+		expect(classifyAgentsViewSession(makeSummary({ status: "idle", messageCount: 0 }))).toBe("completed");
 		expect(classifyAgentsViewSession(makeSummary({ status: "idle", messageCount: 4 }))).toBe("completed");
 	});
 
 	test("sorts rows by section and most recent modified time", () => {
 		const rows = buildAgentsViewRows([
 			makeSummary({ sessionName: "completed", status: "idle", messageCount: 2, modified: "2026-01-01T00:00:00Z" }),
-			makeSummary({ sessionName: "working", isStreaming: true, modified: "2026-01-01T00:00:00Z" }),
-			makeSummary({ sessionName: "older input", status: "user", modified: "2026-01-01T00:00:00Z" }),
-			makeSummary({ sessionName: "newer input", status: "user", modified: "2026-01-02T00:00:00Z" }),
+			makeSummary({ sessionName: "older working", isStreaming: true, modified: "2026-01-01T00:00:00Z" }),
+			makeSummary({ sessionName: "newer working", isStreaming: true, modified: "2026-01-02T00:00:00Z" }),
 		]);
 
-		expect(rows.map((row) => row.title)).toEqual(["newer input", "older input", "working", "completed"]);
-		expect(rows.map((row) => row.section)).toEqual(["needs_input", "needs_input", "working", "completed"]);
+		expect(rows.map((row) => row.title)).toEqual(["newer working", "older working", "completed"]);
+		expect(rows.map((row) => row.section)).toEqual(["working", "working", "completed"]);
 	});
 
 	test("summarizes subagents on their parent and omits subagent rows", () => {
@@ -157,17 +157,16 @@ describe("agents view state", () => {
 		expect(rows.map((row) => row.title)).toEqual(["Other"]);
 	});
 
-	test("hides inactive hidden sessions while keeping active sessions visible", () => {
+	test("shows daemon-resident sessions only", () => {
 		const inactiveHidden = makeSummary({ status: "hidden" });
-		const staleDaemonHidden = makeSummary({ status: "sleep" });
+		const inactiveSleep = makeSummary({ status: "sleep" });
 		delete inactiveHidden.activeSessionId;
-		delete staleDaemonHidden.activeSessionId;
+		delete inactiveSleep.activeSessionId;
 
 		expect(shouldShowAgentsViewSession(inactiveHidden)).toBe(false);
-		expect(shouldShowAgentsViewSession(staleDaemonHidden, "hidden")).toBe(false);
-		expect(shouldShowAgentsViewSession(inactiveHidden, undefined)).toBe(false);
-		expect(shouldShowAgentsViewSession(makeSummary({ status: "idle" }), undefined, true)).toBe(false);
-		expect(shouldShowAgentsViewSession(makeSummary({ status: "hidden", activeSessionId: "active-1" }))).toBe(true);
+		expect(shouldShowAgentsViewSession(inactiveSleep)).toBe(false);
+		expect(shouldShowAgentsViewSession(makeSummary({ status: "idle" }))).toBe(true);
+		expect(shouldShowAgentsViewSession(makeSummary({ status: "idle" }), true)).toBe(false);
 	});
 
 	test("does not override saved session cwd when reopening inactive agents", () => {

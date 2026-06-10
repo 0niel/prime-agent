@@ -6,6 +6,7 @@ import type { DeleteSessionFileResult } from "../../core/session-file-actions.js
 import type {
 	AgentConnectionQueueMode,
 	AgentConnectionResourceSnapshot,
+	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionSavedSessionScope,
 	AgentConnectionSavedSessionState,
 	AgentConnectionScopedModel,
@@ -121,6 +122,8 @@ export interface DaemonSessionSnapshot {
 		nodeId?: string;
 		childId?: string;
 	};
+	/** Live RLM child sessions (including grandchildren) hosted by the daemon under this session. */
+	children?: AgentConnectionRlmChildAgentSnapshot[];
 }
 
 export interface DaemonAttachResult {

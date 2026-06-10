@@ -3964,6 +3964,19 @@ export class InteractiveMode {
 		return `: ${truncateToWidth(detail, availableWidth)}`;
 	}
 
+	private seedChildAgentInspector(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {
+		if (!children?.length) {
+			return;
+		}
+		for (const child of children) {
+			// Live rlm_child_update events are richer than the snapshot; never
+			// clobber state that already arrived from the event stream.
+			if (!this.childAgentSnapshots.has(child.id)) {
+				this.updateChildAgentInspector(child);
+			}
+		}
+	}
+
 	private updateChildAgentInspector(child: AgentConnectionRlmChildAgentSnapshot): void {
 		this.childAgentSnapshots.set(child.id, child);
 		this.childAgentNodes = this.buildChildAgentInspectorNodes();
@@ -4433,6 +4446,7 @@ export class InteractiveMode {
 			this.initialConnectionSnapshotConsumed = true;
 			context = this.getSessionContextFromConnectionSnapshot(snapshot);
 			state = snapshot.state;
+			this.seedChildAgentInspector(snapshot.children);
 		}
 		this.applyConnectionStateSnapshot(state);
 		await this.renderSessionContext(context, {

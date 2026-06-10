@@ -661,6 +661,9 @@ function mapDaemonSessionSnapshot(snapshot: DaemonSessionSnapshot, replay?: Daem
 	if (snapshot.parent) {
 		connectionSnapshot.parent = snapshot.parent;
 	}
+	if (snapshot.children) {
+		connectionSnapshot.children = snapshot.children;
+	}
 	if (replay) {
 		connectionSnapshot.replay = replay;
 	}

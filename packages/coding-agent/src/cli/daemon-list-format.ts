@@ -7,9 +7,10 @@ const LIST_STATUS_ORDER: Record<SessionStatus, number> = {
 	idle: 1,
 	tool: 2,
 	model: 3,
-	sleep: 4,
-	crash: 5,
-	hidden: 6,
+	active: 4,
+	sleep: 5,
+	crash: 6,
+	hidden: 7,
 };
 
 type ListRow = {
@@ -57,6 +58,7 @@ function formatListCell(row: ListRow, column: keyof ListRow, value: string): str
 		case "user":
 		case "idle":
 			return chalk.blue(value);
+		case "active":
 		case "sleep":
 		case "crash":
 		case "hidden":

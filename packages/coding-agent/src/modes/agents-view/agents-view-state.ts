@@ -1,7 +1,7 @@
 import { basename } from "node:path";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
 
-export type AgentsViewSection = "needs_input" | "working" | "completed";
+export type AgentsViewSection = "working" | "completed";
 
 export interface AgentsViewRow {
 	section: AgentsViewSection;
@@ -21,27 +21,20 @@ export function classifyAgentsViewSession(summary: SessionSummary): AgentsViewSe
 	if (summary.status === "model" || summary.status === "tool") {
 		return "working";
 	}
-	if (summary.status === "user" || summary.messageCount === 0) {
-		return "needs_input";
-	}
 	return "completed";
 }
 
-export function shouldShowAgentsViewSession(
-	summary: SessionSummary,
-	savedStatus: SessionSummary["status"] | undefined = summary.status,
-	manuallyInactive = false,
-): boolean {
+// The agents view shows daemon-resident sessions only; saved (slept) sessions
+// stay out of the list until they are resumed back into the daemon.
+export function shouldShowAgentsViewSession(summary: SessionSummary, manuallyInactive = false): boolean {
 	if (manuallyInactive) {
 		return false;
 	}
-	return summary.activeSessionId !== undefined || savedStatus !== "hidden";
+	return summary.activeSessionId !== undefined;
 }
 
 export function sectionTitle(section: AgentsViewSection): string {
 	switch (section) {
-		case "needs_input":
-			return "Needs Input";
 		case "working":
 			return "Working";
 		case "completed":
@@ -173,12 +166,10 @@ function isSubagentSummary(summary: SessionSummary): boolean {
 
 function sectionRank(section: AgentsViewSection): number {
 	switch (section) {
-		case "needs_input":
-			return 0;
 		case "working":
-			return 1;
+			return 0;
 		case "completed":
-			return 2;
+			return 1;
 		default: {
 			const _exhaustive: never = section;
 			return _exhaustive;

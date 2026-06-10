@@ -3,7 +3,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, it } from "vitest";
 import type { SessionInfo } from "../src/core/session-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
-import { buildSessionList } from "../src/modes/daemon/daemon-session-list.js";
+import { buildRlmChildSnapshots, buildSessionList } from "../src/modes/daemon/daemon-session-list.js";
 
 describe("buildSessionList", () => {
 	it("derives active session statuses", () => {
@@ -90,6 +90,71 @@ describe("buildSessionList", () => {
 	});
 });
 
+describe("buildRlmChildSnapshots", () => {
+	it("collects children and grandchildren with event-compatible parent ids", () => {
+		const parent = makeState({ activeSessionId: "parent", sessionFile: "/tmp/parent.jsonl" });
+		const child = makeState({
+			activeSessionId: "child",
+			isStreaming: true,
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: "parent",
+				rlmChildId: "sub-aaa",
+				rlmParentNodeId: "sub-aaa",
+				prompt: "Summarize   the repo\nlayout",
+				sessionDir: "/tmp/artifacts/sub-aaa",
+			},
+			messages: [
+				{ role: "user", content: "Summarize the repo layout" },
+				{ role: "assistant", content: [{ type: "text", text: "The repo is an npm workspace." }] },
+			] as AgentMessage[],
+		});
+		const grandchild = makeState({
+			activeSessionId: "grandchild",
+			metadata: {
+				kind: "subagent",
+				createdAt: 2,
+				parentActiveSessionId: "child",
+				rlmChildId: "sub-bbb",
+				rlmParentNodeId: "sub-bbb",
+				prompt: "Read the docs",
+				sessionDir: "/tmp/artifacts/sub-aaa/sub-bbb",
+			},
+		});
+		const unrelated = makeState({
+			activeSessionId: "unrelated-child",
+			metadata: {
+				kind: "subagent",
+				createdAt: 3,
+				parentActiveSessionId: "someone-else",
+				rlmChildId: "sub-ccc",
+			},
+		});
+
+		const snapshots = buildRlmChildSnapshots("parent", [parent, child, grandchild, unrelated]);
+
+		expect(snapshots.map((snapshot) => [snapshot.id, snapshot.parentId, snapshot.status])).toEqual([
+			["sub-aaa", undefined, "running"],
+			["sub-bbb", "sub-aaa", "done"],
+		]);
+		expect(snapshots[0]).toMatchObject({
+			label: "Summarize the repo layout",
+			answerPreview: "The repo is an npm workspace.",
+			sessionDir: "/tmp/artifacts/sub-aaa",
+			transcript: [
+				{ role: "user", text: "Summarize the repo layout" },
+				{ role: "assistant", text: "The repo is an npm workspace." },
+			],
+		});
+	});
+
+	it("returns no snapshots for sessions without children", () => {
+		const solo = makeState({ activeSessionId: "solo" });
+		expect(buildRlmChildSnapshots("solo", [solo])).toEqual([]);
+	});
+});
+
 interface StateOptions {
 	activeSessionId: string;
 	sessionFile?: string;
@@ -97,6 +162,7 @@ interface StateOptions {
 	isStreaming?: boolean;
 	pendingToolCalls?: string[];
 	clients?: number;
+	messages?: AgentMessage[];
 	metadata?: {
 		kind: "top-level" | "subagent";
 		createdAt: number;
@@ -105,6 +171,8 @@ interface StateOptions {
 		parentSessionFile?: string;
 		rlmChildId?: string;
 		rlmParentNodeId?: string;
+		prompt?: string;
+		sessionDir?: string;
 	};
 }
 
@@ -131,8 +199,9 @@ function makeState(options: StateOptions): ActiveSessionState {
 				sessionName: `session ${options.activeSessionId}`,
 				sessionManager: {
 					getCwd: () => "/tmp/project",
+					getSessionDir: () => "/tmp/sessions",
 				},
-				messages: [] as AgentMessage[],
+				messages: options.messages ?? ([] as AgentMessage[]),
 				pendingMessageCount: 0,
 				state: {
 					streamingMessage: undefined,

@@ -381,7 +381,7 @@ function addAssistantUsage(total: Usage, usage: Usage): void {
 	total.cost.total += usage.cost.total;
 }
 
-function compactRlmText(text: string, maxLength = 160): string {
+export function compactRlmText(text: string, maxLength = 160): string {
 	const compact = text.replace(/\s+/g, " ").trim();
 	if (compact.length <= maxLength) {
 		return compact;

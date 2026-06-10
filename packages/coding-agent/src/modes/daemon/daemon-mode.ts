@@ -56,7 +56,7 @@ import {
 	isDaemonDialogExtensionUiRequest,
 	success,
 } from "./daemon-protocol.js";
-import { buildSessionList, summaryForActiveSession } from "./daemon-session-list.js";
+import { buildRlmChildSnapshots, buildSessionList, summaryForActiveSession } from "./daemon-session-list.js";
 import {
 	cleanupDaemonSocketPath,
 	defaultDaemonSocketPath,
@@ -196,6 +196,42 @@ class AgentDaemon {
 
 		this.registerSignalHandlers();
 		console.error(`Prime Agent daemon listening on ${this.socketPath}`);
+		void this.restoreActiveSessions();
+	}
+
+	/**
+	 * Reload sessions that were daemon-resident when the previous daemon
+	 * exited (clean shutdown or crash). Runs in the background after the
+	 * socket starts listening so startup latency is unaffected; clients see
+	 * restored sessions appear in list results as each one loads.
+	 */
+	private async restoreActiveSessions(): Promise<void> {
+		let saved: SessionInfo[];
+		try {
+			saved = await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir);
+		} catch (error) {
+			console.error(
+				`Failed to scan sessions for restore: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return;
+		}
+		for (const info of saved) {
+			// Empty sessions carry no work worth restoring; leaving them out keeps
+			// abandoned create-and-quit sessions from resurrecting on every restart.
+			if (info.state?.status !== "active" || info.messageCount === 0) {
+				continue;
+			}
+			if (this.shuttingDown) {
+				return;
+			}
+			try {
+				await this.createRuntime({ type: "create", sessionPath: info.path });
+			} catch (error) {
+				console.error(
+					`Failed to restore session ${info.path}: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
 	}
 
 	private cleanupSocketPath(): void {
@@ -230,6 +266,16 @@ class AgentDaemon {
 		this.sessions.set(state.activeSessionId, state);
 		if (name) {
 			state.runtime.session.setSessionName(name);
+		}
+		if (runtime.metadata.kind !== "subagent") {
+			// Mark the session as daemon-resident so a restarted daemon can
+			// restore it. Closes for kill/completed/replaced flip this back to
+			// sleep; clean shutdowns leave it in place on purpose.
+			try {
+				runtime.session.sessionManager.appendSessionState({ status: "active" });
+			} catch {
+				// Marking is best-effort; the session still works unrestored.
+			}
 		}
 		return state;
 	}
@@ -957,6 +1003,7 @@ class AgentDaemon {
 						...(metadata.rlmChildId ? { childId: metadata.rlmChildId } : {}),
 					}
 				: undefined;
+		const children = buildRlmChildSnapshots(state.activeSessionId, [...this.sessions.values()]);
 		return {
 			activeSessionId: state.activeSessionId,
 			summary: summaryForActiveSession(state),
@@ -969,6 +1016,7 @@ class AgentDaemon {
 			},
 			lastEventSequence: state.lastEventSequence,
 			...(parent ? { parent } : {}),
+			...(children.length > 0 ? { children } : {}),
 		};
 	}
 
@@ -1018,10 +1066,12 @@ class AgentDaemon {
 		}
 		const cascadeError = await this.closeChildSessions(state, reason);
 		let persistError: unknown;
-		try {
-			state.runtime.session.sessionManager.appendSessionState({ status: "sleep" });
-		} catch (error) {
-			persistError = error;
+		if (reason !== "shutdown") {
+			try {
+				state.runtime.session.sessionManager.appendSessionState({ status: "sleep" });
+			} catch (error) {
+				persistError = error;
+			}
 		}
 		cancelPendingExtensionUiRequests(state);
 		if (reason === "killed" || reason === "shutdown" || reason === "replaced") {

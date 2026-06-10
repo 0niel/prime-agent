@@ -11,7 +11,7 @@ import {
 import { APP_TITLE, VERSION } from "../../config.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
-import { loadEntriesFromFile, SessionManager } from "../../core/session-manager.js";
+import { SessionManager } from "../../core/session-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import { DaemonClient } from "../daemon/daemon-client.js";
 import type { DaemonCommand, DaemonResponse } from "../daemon/daemon-protocol.js";
@@ -44,7 +44,6 @@ const STATUS_MESSAGE_DURATION_MS = 4500;
 const SESSION_NAME_MAX_LENGTH = 80;
 const DEFAULT_PROMPT_PLACEHOLDER = "Describe a task for a new session";
 const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "Write a reply to this agent";
-const NEEDS_INPUT_ROW_ICON = "◆";
 const COMPLETED_ROW_ICON = "✓";
 const WORKING_ICON_FRAMES = ["◇", "◈", "◆", "◈"] as const;
 const SELECTED_ROW_MARKER = "\0agents-view-selected-row\0";
@@ -712,9 +711,14 @@ class AgentsViewMode implements Component, Focusable {
 				}
 			}
 			if (pending.sessionFile) {
-				SessionManager.open(pending.sessionFile, this.options.config.sessionDir).appendSessionState({
-					status: "hidden",
-				});
+				// The kill above normally persists sleep, but it can be skipped or
+				// hit an unknown session (e.g. the daemon died after listing). Make
+				// sure the file is not left marked active, or a restarted daemon
+				// would resurrect a deliberately deactivated agent.
+				const sessionManager = SessionManager.open(pending.sessionFile, this.options.config.sessionDir);
+				if (sessionManager.getSessionState()?.status === "active") {
+					sessionManager.appendSessionState({ status: "sleep" });
+				}
 			}
 			this.inactiveAgentIdentities.add(pending.identity);
 			this.pendingDeleteAgent = undefined;
@@ -810,11 +814,7 @@ class AgentsViewMode implements Component, Focusable {
 			const data = requireDaemonData(response);
 			const sessions = expectSessionList(data);
 			const visibleSessions = sessions.filter((summary) =>
-				shouldShowAgentsViewSession(
-					summary,
-					this.getSavedSessionStatus(summary),
-					this.inactiveAgentIdentities.has(getSummaryIdentity(summary)),
-				),
+				shouldShowAgentsViewSession(summary, this.inactiveAgentIdentities.has(getSummaryIdentity(summary))),
 			);
 			this.rows = buildAgentsViewRows(this.withPendingDeleteSession(visibleSessions));
 			this.restoreSelection();
@@ -841,24 +841,6 @@ class AgentsViewMode implements Component, Focusable {
 			return pending.summary;
 		});
 		return replaced ? merged : [...merged, pending.summary];
-	}
-
-	private getSavedSessionStatus(summary: SessionSummary): SessionSummary["status"] | undefined {
-		if (!summary.sessionFile || summary.activeSessionId) {
-			return undefined;
-		}
-		try {
-			const entries = loadEntriesFromFile(summary.sessionFile);
-			for (let index = entries.length - 1; index >= 0; index--) {
-				const entry = entries[index];
-				if (entry.type === "session_state") {
-					return entry.state.status;
-				}
-			}
-		} catch {
-			return undefined;
-		}
-		return undefined;
 	}
 
 	private restoreSelection(): void {
@@ -943,7 +925,7 @@ class AgentsViewMode implements Component, Focusable {
 
 	private getAgentCountsText(): string {
 		const counts = countRowsBySection(this.rows);
-		return `${counts.needs_input} need input, ${counts.working} working, ${counts.completed} completed`;
+		return `${counts.working} working, ${counts.completed} completed`;
 	}
 
 	private renderSessionRows(width: number, maxRows: number): string[] {
@@ -952,7 +934,7 @@ class AgentsViewMode implements Component, Focusable {
 		}
 		if (this.rows.length === 0) {
 			return [
-				theme.bold(sectionTitle("needs_input")),
+				theme.bold(sectionTitle("working")),
 				theme.fg("dim", "  No agents yet. Describe a task below to start one."),
 			].slice(0, maxRows);
 		}
@@ -1087,10 +1069,8 @@ class AgentsViewMode implements Component, Focusable {
 
 	private getRowIcon(section: AgentsViewSection): string {
 		switch (section) {
-			case "needs_input":
-				return NEEDS_INPUT_ROW_ICON;
 			case "working":
-				return WORKING_ICON_FRAMES[this.workingIconFrame % WORKING_ICON_FRAMES.length] ?? NEEDS_INPUT_ROW_ICON;
+				return WORKING_ICON_FRAMES[this.workingIconFrame % WORKING_ICON_FRAMES.length] ?? WORKING_ICON_FRAMES[0];
 			case "completed":
 				return COMPLETED_ROW_ICON;
 			default: {
@@ -1102,8 +1082,6 @@ class AgentsViewMode implements Component, Focusable {
 
 	private formatRowIcon(section: AgentsViewSection, icon: string): string {
 		switch (section) {
-			case "needs_input":
-				return theme.fg("warning", icon);
 			case "working":
 				return theme.bold(icon);
 			case "completed":
@@ -1125,7 +1103,7 @@ type DisplayItem =
 
 function buildDisplayItems(rows: readonly AgentsViewRow[]): DisplayItem[] {
 	const items: DisplayItem[] = [];
-	const sections: AgentsViewSection[] = ["needs_input", "working", "completed"];
+	const sections: AgentsViewSection[] = ["working", "completed"];
 	for (const [index, section] of sections.entries()) {
 		if (index > 0) {
 			items.push({ type: "spacer" });
@@ -1152,7 +1130,6 @@ function getDisplayRowsForSection(rows: readonly AgentsViewRow[], section: Agent
 
 function countRowsBySection(rows: readonly AgentsViewRow[]): Record<AgentsViewSection, number> {
 	return {
-		needs_input: rows.filter((row) => row.section === "needs_input").length,
 		working: rows.filter((row) => row.section === "working").length,
 		completed: rows.filter((row) => row.section === "completed").length,
 	};

@@ -38,7 +38,7 @@ export type AgentConnectionQueueMode = "all" | "one-at-a-time";
 export type AgentConnectionModel = Model<Api>;
 export type AgentConnectionSavedSessionScope = "current" | "all";
 
-export type AgentConnectionSavedSessionStateStatus = "sleep" | "crash" | "hidden";
+export type AgentConnectionSavedSessionStateStatus = "active" | "sleep" | "crash" | "hidden";
 
 export type AgentConnectionSourceScope = "user" | "project" | "temporary";
 export type AgentConnectionSourceOrigin = "package" | "top-level";
@@ -221,6 +221,8 @@ export interface AgentConnectionSnapshot {
 	sessionContext?: AgentConnectionSessionContext;
 	sessionTree?: { tree: AgentConnectionSessionTreeNode[]; leafId: string | null };
 	parent?: AgentConnectionParentMetadata;
+	/** Live RLM child agents (including grandchildren) known to the host at snapshot time. */
+	children?: AgentConnectionRlmChildAgentSnapshot[];
 	lastEventSequence?: number;
 	replay?: AgentConnectionReplayInfo;
 }

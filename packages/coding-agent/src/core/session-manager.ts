@@ -119,7 +119,7 @@ export interface SessionInfoEntry extends SessionEntryBase {
 	name?: string;
 }
 
-export type SessionStateStatus = "sleep" | "crash" | "hidden";
+export type SessionStateStatus = "active" | "sleep" | "crash" | "hidden";
 
 export interface SessionState {
 	status: SessionStateStatus;
@@ -648,7 +648,7 @@ function getSessionModifiedDate(entries: FileEntry[], header: SessionHeader, sta
 }
 
 function isSessionStateStatus(value: unknown): value is SessionStateStatus {
-	return value === "sleep" || value === "crash" || value === "hidden";
+	return value === "active" || value === "sleep" || value === "crash" || value === "hidden";
 }
 
 async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
