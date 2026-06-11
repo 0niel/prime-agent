@@ -250,6 +250,7 @@ export {
 	type EditToolInput,
 	type EditToolOptions,
 	formatSize,
+	IpythonKernelProvisioner,
 	type IpythonToolDetails,
 	type IpythonToolInput,
 	type IpythonToolOptions,

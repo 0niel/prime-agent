@@ -106,7 +106,6 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
-import type { KernelManager } from "./kernel/index.js";
 import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
@@ -134,6 +133,7 @@ import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
+import { IpythonKernelProvisioner } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
 import { cloneUsage, emptyUsage } from "./usage.js";
 
@@ -276,6 +276,13 @@ export interface AgentSessionConfig {
 	rlmParentNodeId?: string;
 	/** Host responsible for creating RLM subagent runtimes. */
 	subagentRuntimeHost?: SubagentRuntimeHost;
+	/**
+	 * Boot the IPython kernel in the background as soon as the session is created,
+	 * so the first ipython tool call doesn't pay the kernel cold start.
+	 *
+	 * Only applies to main agents (rlmDepth 0); subagent kernels stay lazy. Default: false.
+	 */
+	prewarmIpythonKernel?: boolean;
 }
 
 export interface ExtensionBindings {
@@ -650,7 +657,8 @@ export class AgentSession {
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
 	private _disposed = false;
-	private _ipythonKernelManagerRef: { current?: KernelManager } = {};
+	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
+	private readonly _prewarmIpythonKernel: boolean;
 	private _rlmDepth: number;
 	private _rlmMaxDepth: number;
 	private _rlmSessionDir?: string;
@@ -689,6 +697,7 @@ export class AgentSession {
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._rlmDepth = config.rlmDepth ?? parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH");
 		this._rlmMaxDepth = config.rlmMaxDepth ?? parseDepth(process.env.RLM_MAX_DEPTH, 1, "RLM_MAX_DEPTH");
+		this._prewarmIpythonKernel = (config.prewarmIpythonKernel ?? false) && this._rlmDepth === 0;
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._subagentRuntimeHost = config.subagentRuntimeHost;
@@ -2480,7 +2489,7 @@ export class AgentSession {
 	}
 
 	private async _restartIpythonKernelAfterCompaction(): Promise<void> {
-		await this._ipythonKernelManagerRef.current?.restart();
+		await this._ipythonKernelProvisioner?.restart();
 	}
 
 	// =========================================================================
@@ -3268,23 +3277,29 @@ export class AgentSession {
 		const shellCommandPrefix = this.settingsManager.getShellCommandPrefix();
 		const shellPath = this.settingsManager.getShellPath();
 		const pythonSkills = getPythonSkillRuntimeInfo(this._resourceLoader.getSkills().skills);
-		const configuredBaseToolDefinitions = this._baseToolsOverride
-			? Object.fromEntries(
-					Object.entries(this._baseToolsOverride).map(([name, tool]) => [
-						name,
-						createToolDefinitionFromAgentTool(tool),
-					]),
-				)
-			: createAllToolDefinitions(this._cwd, {
-					ipython: {
-						kernelManagerRef: this._ipythonKernelManagerRef,
-						env: this._rlmKernelEnv(),
-						sessionId: this.sessionId,
-						rlmRunHandler: ({ prompt, kwargs }) => this.runRlmChild(prompt, kwargs),
-						pythonSkills,
-					},
-					bash: { commandPrefix: shellCommandPrefix, shellPath },
-				});
+		let configuredBaseToolDefinitions: Record<string, ToolDefinition>;
+		if (this._baseToolsOverride) {
+			configuredBaseToolDefinitions = Object.fromEntries(
+				Object.entries(this._baseToolsOverride).map(([name, tool]) => [
+					name,
+					createToolDefinitionFromAgentTool(tool),
+				]),
+			);
+		} else {
+			// Rebuilding (e.g. /reload) replaces the provisioner; drop the previous
+			// kernel so the session never holds two live kernels.
+			void this._ipythonKernelProvisioner?.dispose();
+			this._ipythonKernelProvisioner = new IpythonKernelProvisioner(this._cwd, {
+				env: this._rlmKernelEnv(),
+				sessionId: this.sessionId,
+				rlmRunHandler: ({ prompt, kwargs }) => this.runRlmChild(prompt, kwargs),
+				pythonSkills,
+			});
+			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
+				ipython: { provisioner: this._ipythonKernelProvisioner },
+				bash: { commandPrefix: shellCommandPrefix, shellPath },
+			});
+		}
 		const goalToolDefinitions = this._includeGoalTools
 			? createGoalToolDefinitions({
 					getGoalState: () => this.goalState,
@@ -3333,6 +3348,10 @@ export class AgentSession {
 			activeToolNames: [...new Set(baseActiveToolNames)],
 			includeAllExtensionTools: options.includeAllExtensionTools,
 		});
+
+		if (this._prewarmIpythonKernel && this.getActiveToolNames().includes("ipython")) {
+			this._ipythonKernelProvisioner?.prewarm();
+		}
 	}
 
 	async reload(): Promise<void> {

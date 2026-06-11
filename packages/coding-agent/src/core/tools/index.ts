@@ -21,6 +21,7 @@ export { withFileMutationQueue } from "./file-mutation-queue.js";
 export {
 	createIpythonTool,
 	createIpythonToolDefinition,
+	IpythonKernelProvisioner,
 	type IpythonToolDetails,
 	type IpythonToolInput,
 	type IpythonToolOptions,

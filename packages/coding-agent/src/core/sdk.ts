@@ -362,6 +362,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		rlmParentNodeId: options.rlmParentNodeId,
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		sessionStartEvent: options.sessionStartEvent,
+		prewarmIpythonKernel: options.prewarmIpythonKernel,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
 

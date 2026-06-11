@@ -340,6 +340,9 @@ export class KernelManager {
 		if (this.state !== "idle") return;
 		this.state = "starting";
 		installSignalHandlersOnce();
+		// Tracked from the moment startup begins so session cleanup and signal
+		// handlers can dispose a kernel that is still booting.
+		liveKernels.add(this);
 
 		let python: string;
 		try {
@@ -351,8 +354,13 @@ export class KernelManager {
 				}));
 			this.options.python = python;
 		} catch (error) {
-			this.state = "idle";
+			liveKernels.delete(this);
+			if ((this.state as string) !== "shutdown") this.state = "idle";
 			throw error;
+		}
+
+		if ((this.state as string) === "shutdown") {
+			throw new Error("Kernel was disposed during startup");
 		}
 
 		const { path: connectionPath, tempDir } = makeConnection();
@@ -418,7 +426,6 @@ export class KernelManager {
 			throw e;
 		}
 
-		liveKernels.add(this);
 		this.state = "running";
 	}
 

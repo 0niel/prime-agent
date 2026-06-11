@@ -1085,6 +1085,9 @@ export async function main(args: string[], options?: MainOptions) {
 			rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,
 			rlmParentNodeId: runtimeSessionOptions?.rlmParentNodeId,
 			subagentRuntimeHost: runtimeSessionOptions?.subagentRuntimeHost,
+			// Main agents boot their kernel in the background at session creation;
+			// subagent sessions (rlmDepth > 0) keep the lazy first-call start.
+			prewarmIpythonKernel: true,
 		});
 		const cliThinkingOverride = config.thinking !== undefined || prepared.cliThinkingFromModel;
 		if (created.session.model && cliThinkingOverride) {

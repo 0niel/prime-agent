@@ -56,6 +56,7 @@ export interface AgentSessionCreationOptions {
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
 	subagentRuntimeHost?: SubagentRuntimeHost;
+	prewarmIpythonKernel?: boolean;
 }
 
 /**
@@ -216,5 +217,6 @@ export async function createAgentSessionFromServices(
 		rlmParentNodeId: options.rlmParentNodeId,
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		sessionStartEvent: options.sessionStartEvent,
+		prewarmIpythonKernel: options.prewarmIpythonKernel,
 	});
 }

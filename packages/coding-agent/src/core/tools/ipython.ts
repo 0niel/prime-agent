@@ -141,47 +141,134 @@ export interface IpythonToolOptions {
 	pythonSkills?: readonly PythonSkillRuntimeInfo[];
 	/** Filled after the first kernel start so the owning session can restart it after compaction. */
 	kernelManagerRef?: { current?: KernelManager };
+	/** Shared provisioner owning the kernel lifecycle. When provided, the remaining options are ignored. */
+	provisioner?: IpythonKernelProvisioner;
+}
+
+/**
+ * Owns the lazy create+start+runtime-bootstrap of one session's IPython kernel.
+ *
+ * Concurrent ensure() calls await the same in-flight startup, a failed startup
+ * clears the memo so the next call retries fresh, and progress listeners can
+ * attach mid-flight (a tool call racing a background prewarm()).
+ */
+export class IpythonKernelProvisioner {
+	private managerPromise?: Promise<KernelManager>;
+	private startedManager?: KernelManager;
+	private readonly startupListeners = new Set<KernelBootstrapProgressHandler>();
+	private lastStartupMessage?: string;
+
+	constructor(
+		private readonly cwd: string,
+		private readonly options?: Omit<IpythonToolOptions, "provisioner">,
+	) {
+		if (options?.kernelManagerRef) {
+			options.kernelManagerRef.current = undefined;
+		}
+	}
+
+	/** The kernel manager, once a startup has completed successfully. */
+	get manager(): KernelManager | undefined {
+		return this.startedManager;
+	}
+
+	/** Start the kernel in the background. Failures are swallowed here and surface on the next ensure(). */
+	prewarm(): void {
+		void this.ensure().catch(() => {});
+	}
+
+	/** Restart the kernel if one is running (e.g. after compaction). */
+	async restart(): Promise<void> {
+		await this.startedManager?.restart();
+	}
+
+	/** Dispose the kernel owned by this provisioner, including one still starting up. */
+	async dispose(): Promise<void> {
+		const pending = this.managerPromise;
+		this.managerPromise = undefined;
+		this.startedManager = undefined;
+		if (!pending) return;
+		try {
+			const m = await pending;
+			await m.dispose();
+		} catch {
+			// a failed startup already cleaned up after itself
+		}
+	}
+
+	ensure(onProgress?: KernelBootstrapProgressHandler): Promise<KernelManager> {
+		if (onProgress && !this.startedManager) {
+			this.startupListeners.add(onProgress);
+			// Joining an in-flight startup: replay the current stage.
+			if (this.managerPromise && this.lastStartupMessage) {
+				onProgress(this.lastStartupMessage);
+			}
+		}
+		if (!this.managerPromise) {
+			const startup = this.startKernel();
+			this.managerPromise = startup;
+			startup.then(
+				(m) => {
+					if (this.managerPromise === startup) {
+						this.startedManager = m;
+					}
+					this.settleStartup();
+				},
+				() => {
+					// Clear the memo so the next ensure() retries instead of
+					// rethrowing a cached rejection forever.
+					if (this.managerPromise === startup) {
+						this.managerPromise = undefined;
+					}
+					this.settleStartup();
+				},
+			);
+		}
+		return this.managerPromise;
+	}
+
+	private settleStartup(): void {
+		this.startupListeners.clear();
+		this.lastStartupMessage = undefined;
+	}
+
+	private emitStartupProgress(message: string): void {
+		this.lastStartupMessage = message;
+		for (const listener of [...this.startupListeners]) {
+			listener(message);
+		}
+	}
+
+	private async startKernel(): Promise<KernelManager> {
+		const m = new KernelManager({
+			python: this.options?.python,
+			cwd: this.cwd,
+			env: this.options?.env,
+			sessionId: this.options?.sessionId,
+			rlmRunHandler: this.options?.rlmRunHandler,
+			pythonSkills: this.options?.pythonSkills,
+		});
+		this.emitStartupProgress("Starting IPython kernel...");
+		await m.start({ onBootstrapProgress: (message) => this.emitStartupProgress(message) });
+		this.emitStartupProgress("Preparing IPython runtime...");
+		const bootstrap = await m.execute(buildRlmBootstrapCode(this.options?.pythonSkills));
+		if (bootstrap.status !== "ok") {
+			const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
+			void m.dispose();
+			throw new Error(`Failed to initialize rlm runtime in the IPython kernel:\n${details}`);
+		}
+		if (this.options?.kernelManagerRef) {
+			this.options.kernelManagerRef.current = m;
+		}
+		return m;
+	}
 }
 
 export function createIpythonToolDefinition(
 	cwd: string,
 	options?: IpythonToolOptions,
 ): ToolDefinition<typeof ipythonSchema, IpythonToolDetails> {
-	// Memoize the entire create+start so concurrent first calls all await the
-	// same in-flight startup instead of creating two managers or skipping the
-	// not-yet-finished start().
-	let managerPromise: Promise<KernelManager> | undefined;
-	if (options?.kernelManagerRef) {
-		options.kernelManagerRef.current = undefined;
-	}
-
-	function getManager(onBootstrapProgress?: KernelBootstrapProgressHandler): Promise<KernelManager> {
-		if (!managerPromise) {
-			managerPromise = (async () => {
-				const m = new KernelManager({
-					python: options?.python,
-					cwd,
-					env: options?.env,
-					sessionId: options?.sessionId,
-					rlmRunHandler: options?.rlmRunHandler,
-					pythonSkills: options?.pythonSkills,
-				});
-				onBootstrapProgress?.("Starting IPython kernel...");
-				await m.start({ onBootstrapProgress });
-				onBootstrapProgress?.("Preparing IPython runtime...");
-				const bootstrap = await m.execute(buildRlmBootstrapCode(options?.pythonSkills));
-				if (bootstrap.status !== "ok") {
-					const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
-					throw new Error(`Failed to initialize rlm runtime in the IPython kernel:\n${details}`);
-				}
-				if (options?.kernelManagerRef) {
-					options.kernelManagerRef.current = m;
-				}
-				return m;
-			})();
-		}
-		return managerPromise;
-	}
+	const provisioner = options?.provisioner ?? new IpythonKernelProvisioner(cwd, options);
 
 	return {
 		name: "ipython",
@@ -204,7 +291,7 @@ export function createIpythonToolDefinition(
 			};
 
 			try {
-				const m = await getManager(reportStartupProgress);
+				const m = await provisioner.ensure(reportStartupProgress);
 				const r = await m.execute(params.code, {
 					signal,
 					onStream: (chunk) => {
