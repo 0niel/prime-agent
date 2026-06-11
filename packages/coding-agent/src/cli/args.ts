@@ -298,13 +298,13 @@ ${chalk.bold("Examples:")}
   # Use model with thinking level shorthand
   ${APP_NAME} --model sonnet:high "Solve this complex problem"
 
-  # Limit model cycling to specific models
+  # Limit the session to specific models
   ${APP_NAME} --models claude-sonnet,claude-haiku,gpt-4o
 
   # Limit to a specific provider with glob pattern
   ${APP_NAME} --models "github-copilot/*"
 
-  # Cycle models with fixed thinking levels
+  # Scope models with fixed thinking levels
   ${APP_NAME} --models sonnet:high,haiku:low
 
   # Start with a specific thinking level

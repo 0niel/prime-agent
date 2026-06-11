@@ -17,8 +17,6 @@ export interface AppKeybindings {
 	"app.exit": true;
 	"app.suspend": true;
 	"app.thinking.cycle": true;
-	"app.model.cycleForward": true;
-	"app.model.cycleBackward": true;
 	"app.model.select": true;
 	"app.provider.add": true;
 	"app.tools.expand": true;
@@ -80,16 +78,8 @@ export const KEYBINDINGS = {
 		defaultKeys: "shift+tab",
 		description: "Cycle thinking level",
 	},
-	"app.model.cycleForward": {
-		defaultKeys: "ctrl+p",
-		description: "Cycle to next model",
-	},
-	"app.model.cycleBackward": {
-		defaultKeys: "shift+ctrl+p",
-		description: "Cycle to previous model",
-	},
 	"app.model.select": { defaultKeys: "ctrl+l", description: "Open model selector" },
-	"app.provider.add": { defaultKeys: "alt+p", description: "Add provider" },
+	"app.provider.add": { defaultKeys: "ctrl+p", description: "Add provider" },
 	"app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
 	"app.thinking.toggle": {
 		defaultKeys: "ctrl+t",
@@ -254,8 +244,6 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	exit: "app.exit",
 	suspend: "app.suspend",
 	cycleThinkingLevel: "app.thinking.cycle",
-	cycleModelForward: "app.model.cycleForward",
-	cycleModelBackward: "app.model.cycleBackward",
 	selectModel: "app.model.select",
 	expandTools: "app.tools.expand",
 	toggleThinking: "app.thinking.toggle",

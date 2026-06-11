@@ -107,7 +107,7 @@ describe("ExtensionRunner", () => {
 		it("allows a shortcut when the reserved set no longer contains the default key", async () => {
 			const extCode = `
 				export default function(pi) {
-					pi.registerShortcut("ctrl+p", {
+					pi.registerShortcut("ctrl+l", {
 						description: "Uses freed default",
 						handler: async () => {},
 					});
@@ -119,10 +119,10 @@ describe("ExtensionRunner", () => {
 
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
-			const keybindings = { ...defaultKeybindings, "app.model.cycleForward": "ctrl+n" as KeyId };
+			const keybindings = { ...defaultKeybindings, "app.model.select": "ctrl+n" as KeyId };
 			const shortcuts = runner.getShortcuts(keybindings);
 
-			expect(shortcuts.has("ctrl+p")).toBe(true);
+			expect(shortcuts.has("ctrl+l")).toBe(true);
 			expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining("conflicts with built-in"));
 
 			warnSpy.mockRestore();
@@ -183,7 +183,7 @@ describe("ExtensionRunner", () => {
 		it("blocks shortcuts when reserved key is also bound to non-reserved actions", async () => {
 			const extCode = `
 				export default function(pi) {
-					pi.registerShortcut("ctrl+p", {
+					pi.registerShortcut("ctrl+t", {
 						description: "Conflicts with shared reserved default",
 						handler: async () => {},
 					});
@@ -198,7 +198,7 @@ describe("ExtensionRunner", () => {
 			const shortcuts = runner.getShortcuts(defaultKeybindings);
 
 			expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("conflicts with built-in"));
-			expect(shortcuts.has("ctrl+p")).toBe(false);
+			expect(shortcuts.has("ctrl+t")).toBe(false);
 
 			warnSpy.mockRestore();
 		});

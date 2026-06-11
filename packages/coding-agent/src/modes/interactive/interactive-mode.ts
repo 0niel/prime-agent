@@ -878,10 +878,6 @@ export class InteractiveMode {
 						hint("app.suspend", "to suspend"),
 						keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
 						hint("app.thinking.cycle", "to cycle thinking level"),
-						rawKeyHint(
-							`${keyText("app.model.cycleForward")}/${keyText("app.model.cycleBackward")}`,
-							"to cycle models",
-						),
 						hint("app.model.select", "to select model"),
 						hint("app.tools.expand", "to expand tools"),
 						hint("app.thinking.toggle", "to expand thinking"),
@@ -2088,10 +2084,6 @@ export class InteractiveMode {
 		return this.connectionState?.scopedModels ?? [];
 	}
 
-	private hasScopedModelState(): boolean {
-		return this.getScopedModelState().length > 0;
-	}
-
 	private async rebindCurrentSession(): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
@@ -3088,8 +3080,6 @@ export class InteractiveMode {
 		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
 		this.defaultEditor.onAction("app.suspend", () => this.handleCtrlZ());
 		this.defaultEditor.onAction("app.thinking.cycle", () => this.cycleThinkingLevel());
-		this.defaultEditor.onAction("app.model.cycleForward", () => this.cycleModel("forward"));
-		this.defaultEditor.onAction("app.model.cycleBackward", () => this.cycleModel("backward"));
 
 		// Global debug handler on TUI (works regardless of focus)
 		this.ui.onDebug = () => {
@@ -4782,30 +4772,6 @@ export class InteractiveMode {
 			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
 			});
-	}
-
-	private async cycleModel(direction: "forward" | "backward"): Promise<void> {
-		try {
-			const result = await this.agentConnection.cycleModel(direction);
-			if (result === undefined) {
-				const msg = this.hasScopedModelState() ? "Only one model in scope" : "Only one model available";
-				this.showStatus(msg);
-			} else {
-				this.patchConnectionState({
-					model: result.model,
-					thinkingLevel: result.thinkingLevel,
-				});
-				this.footer.invalidate();
-				this.updateEditorBorderColor();
-				this.completeOnboardingIfCurrentModelReady();
-				const thinkingStr =
-					result.model.reasoning && result.thinkingLevel !== "off" ? ` (thinking: ${result.thinkingLevel})` : "";
-				this.showStatus(`Switched to ${result.model.name || result.model.id}${thinkingStr}`);
-				void this.maybeWarnAboutAnthropicSubscriptionAuth(result.model);
-			}
-		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
-		}
 	}
 
 	private toggleToolOutputExpansion(): void {
@@ -7100,13 +7066,11 @@ export class InteractiveMode {
 		const exit = this.getAppKeyDisplay("app.exit");
 		const suspend = this.getAppKeyDisplay("app.suspend");
 		const cycleThinkingLevel = this.getAppKeyDisplay("app.thinking.cycle");
-		const cycleModelForward = this.getAppKeyDisplay("app.model.cycleForward");
 		const selectModel = this.getAppKeyDisplay("app.model.select");
 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
 		const toggleThinking = this.getAppKeyDisplay("app.thinking.toggle");
 		const focusSubagents = this.getAppKeyDisplay("app.subagents.focus");
 		const externalEditor = this.getAppKeyDisplay("app.editor.external");
-		const cycleModelBackward = this.getAppKeyDisplay("app.model.cycleBackward");
 		const followUp = this.getAppKeyDisplay("app.message.followUp");
 		const dequeue = this.getAppKeyDisplay("app.message.dequeue");
 		const pasteImage = this.getAppKeyDisplay("app.clipboard.pasteImage");
@@ -7145,7 +7109,6 @@ export class InteractiveMode {
 ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${exit}\` | Exit (when editor is empty) |
 | \`${suspend}\` | Suspend to background |
 | \`${cycleThinkingLevel}\` | Cycle thinking level |
-| \`${cycleModelForward}\` / \`${cycleModelBackward}\` | Cycle models |
 | \`${selectModel}\` | Open model selector |
 | \`${expandTools}\` | Toggle tool output expansion |
 | \`${toggleThinking}\` | Toggle thinking block visibility |
