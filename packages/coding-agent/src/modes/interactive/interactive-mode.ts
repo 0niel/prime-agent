@@ -165,6 +165,7 @@ import type {
 	InteractiveModeLocalToolRendererDefinition,
 	InteractiveModeUiServices,
 } from "./interactive-mode-services.js";
+import { formatResumeHint } from "./resume-hint.js";
 import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
@@ -4591,6 +4592,9 @@ export class InteractiveMode {
 		this.unregisterSignalHandlers();
 		this.clearCtrlCExitHint({ render: false });
 
+		// Fetch while the connection is still alive; exit must not fail on a stats error.
+		const sessionStats = await this.agentConnection.getSessionStats().catch(() => undefined);
+
 		// Drain any in-flight Kitty key release events before stopping.
 		// This prevents escape sequences from leaking to the parent shell over slow SSH.
 		await this.ui.terminal.drainInput(1000);
@@ -4600,6 +4604,10 @@ export class InteractiveMode {
 			await this.agentConnection.dispose();
 		} finally {
 			await this.options.onShutdown?.();
+		}
+		const resumeHint = formatResumeHint(sessionStats);
+		if (resumeHint) {
+			console.log(resumeHint);
 		}
 		process.exit(0);
 	}
