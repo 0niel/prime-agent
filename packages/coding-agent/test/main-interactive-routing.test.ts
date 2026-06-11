@@ -67,16 +67,18 @@ describe("daemon-backed interactive session manager routing", () => {
 		expect(
 			shouldOpenAgentsViewForDaemonInteractive({
 				useDaemonInteractive: true,
+				needsOnboarding: false,
 			}),
 		).toBe(true);
 	});
 
 	const directAttachCases: Array<[string, Parameters<typeof shouldOpenAgentsViewForDaemonInteractive>[0]]> = [
-		["non-daemon interactive path", { useDaemonInteractive: false }],
-		["explicit session", { useDaemonInteractive: true, session: "active-1" }],
-		["resume picker", { useDaemonInteractive: true, resume: true }],
-		["continue recent", { useDaemonInteractive: true, continue: true }],
-		["fork", { useDaemonInteractive: true, fork: "source-session-id" }],
+		["non-daemon interactive path", { useDaemonInteractive: false, needsOnboarding: false }],
+		["pending onboarding", { useDaemonInteractive: true, needsOnboarding: true }],
+		["explicit session", { useDaemonInteractive: true, needsOnboarding: false, session: "active-1" }],
+		["resume picker", { useDaemonInteractive: true, needsOnboarding: false, resume: true }],
+		["continue recent", { useDaemonInteractive: true, needsOnboarding: false, continue: true }],
+		["fork", { useDaemonInteractive: true, needsOnboarding: false, fork: "source-session-id" }],
 	];
 
 	test.each(directAttachCases)("does not open agents view for %s", (_label, decision) => {

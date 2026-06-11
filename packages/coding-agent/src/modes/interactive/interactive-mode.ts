@@ -166,6 +166,12 @@ import type {
 	InteractiveModeLocalToolRendererDefinition,
 	InteractiveModeUiServices,
 } from "./interactive-mode-services.js";
+import {
+	isOnboardingModelReady,
+	type OnboardingStartupState,
+	shouldRunOnboarding,
+	shouldRunPrimeCliOnboardingSplash,
+} from "./onboarding.js";
 import { formatResumeHint } from "./resume-hint.js";
 import {
 	getAvailableThemes,
@@ -1132,29 +1138,24 @@ export class InteractiveMode {
 		return "show";
 	}
 
+	private getOnboardingState(): OnboardingStartupState {
+		return {
+			settingsManager: this.settingsManager,
+			modelRegistry: this.modelRegistry,
+			model: this.getCurrentModel(),
+		};
+	}
+
 	private shouldRunOnboarding(): boolean {
-		this.modelRegistry.refresh();
-		if (this.shouldRunPrimeCliOnboardingSplash()) {
-			return true;
-		}
-		return !this.isCurrentModelReady();
+		return shouldRunOnboarding(this.getOnboardingState());
 	}
 
 	private shouldRunPrimeCliOnboardingSplash(): boolean {
-		if (this.settingsManager.getOnboardingCompleted()) {
-			return false;
-		}
-		const model = this.getCurrentModel();
-		if (!model || model.provider !== PRIME_INFERENCE_PROVIDER_ID) {
-			return false;
-		}
-		const authStatus = this.modelRegistry.getProviderAuthStatus(PRIME_INFERENCE_PROVIDER_ID);
-		return authStatus.source === "prime_cli";
+		return shouldRunPrimeCliOnboardingSplash(this.getOnboardingState());
 	}
 
 	private isCurrentModelReady(): boolean {
-		const model = this.getCurrentModel();
-		return model !== undefined && this.modelRegistry.hasConfiguredAuth(model);
+		return isOnboardingModelReady(this.getOnboardingState());
 	}
 
 	private completeOnboarding(): void {

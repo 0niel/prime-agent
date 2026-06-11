@@ -64,6 +64,7 @@ import {
 	type SessionSummary,
 } from "./modes/index.js";
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.js";
+import { shouldRunOnboarding } from "./modes/interactive/onboarding.js";
 import { initTheme, preloadCodeHighlighter, stopThemeWatcher } from "./modes/interactive/theme/theme.js";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.js";
 import { isLocalPath } from "./utils/paths.js";
@@ -156,6 +157,7 @@ export function shouldUseDaemonInteractive(options: InteractiveDaemonStartupDeci
 
 export interface AgentsViewStartupDecision {
 	useDaemonInteractive: boolean;
+	needsOnboarding: boolean;
 	session?: string;
 	resume?: boolean;
 	continue?: boolean;
@@ -163,7 +165,17 @@ export interface AgentsViewStartupDecision {
 }
 
 export function shouldOpenAgentsViewForDaemonInteractive(options: AgentsViewStartupDecision): boolean {
-	return options.useDaemonInteractive && !options.session && !options.resume && !options.continue && !options.fork;
+	return (
+		options.useDaemonInteractive &&
+		// Onboarding lives in InteractiveMode, so a first run must take the
+		// direct session path; the agents view would otherwise require creating
+		// an agent before the onboarding splash ever renders.
+		!options.needsOnboarding &&
+		!options.session &&
+		!options.resume &&
+		!options.continue &&
+		!options.fork
+	);
 }
 
 export interface DaemonInteractiveSessionManagerDecision {
@@ -1198,6 +1210,11 @@ export async function main(args: string[], options?: MainOptions) {
 		if (
 			shouldOpenAgentsViewForDaemonInteractive({
 				useDaemonInteractive,
+				needsOnboarding: shouldRunOnboarding({
+					settingsManager,
+					modelRegistry: services.modelRegistry,
+					model: startupModel.model,
+				}),
 				session: parsed.session,
 				resume: parsed.resume,
 				continue: parsed.continue,
