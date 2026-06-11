@@ -7,6 +7,7 @@ import {
 	createAgentsViewResumeConfig,
 	createAgentsViewSessionName,
 	formatAgentsViewRelativeTime,
+	formatAgentsViewStatusLine,
 	resolveAgentsViewSessionUiServices,
 } from "../src/modes/agents-view/agents-view-mode.js";
 import {
@@ -290,6 +291,17 @@ describe("agents view state", () => {
 		expect(formatAgentsViewRelativeTime("2025-12-30T12:00:00Z", now)).toBe("3d");
 		expect(formatAgentsViewRelativeTime(undefined, now)).toBe("");
 		expect(formatAgentsViewRelativeTime("not a timestamp", now)).toBe("");
+	});
+
+	test("flattens multiline status messages so they fit the single-row hint slot", () => {
+		expect(formatAgentsViewStatusLine("Failed to send reply: connection lost\nat Socket.emit\nat process")).toBe(
+			"Failed to send reply: connection lost at Socket.emit at process",
+		);
+		expect(formatAgentsViewStatusLine('Failed:\r\n\t{\r\n\t"error": "boom"\r\n}')).toBe(
+			'Failed: { "error": "boom" }',
+		);
+		expect(formatAgentsViewStatusLine("  already   flat  ")).toBe("already flat");
+		expect(formatAgentsViewStatusLine("\n \r\n ")).toBe("");
 	});
 
 	test("caps generated session names at the configured limit", () => {
