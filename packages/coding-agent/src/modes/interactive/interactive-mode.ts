@@ -761,6 +761,7 @@ export class InteractiveMode {
 		const slashCommands: SlashCommand[] = BUILTIN_SLASH_COMMANDS.map((command) => ({
 			name: command.name,
 			description: command.description,
+			argumentHint: command.argumentHint,
 		}));
 
 		const modelCommand = slashCommands.find((command) => command.name === "model");
@@ -3702,9 +3703,12 @@ export class InteractiveMode {
 				// Keep editor active; submissions are queued during compaction.
 				this.statusContainer.clear();
 				const cancelHint = `(${keyText("app.clear")} to cancel)`;
+				const focus = event.customInstructions
+					? ` (focus: ${truncateToWidth(event.customInstructions, 60, "…")})`
+					: "";
 				const label =
 					event.reason === "manual"
-						? `Compacting context... ${cancelHint}`
+						? `Compacting context${focus}... ${cancelHint}`
 						: `${event.reason === "overflow" ? "Context overflow detected, " : ""}Auto-compacting... ${cancelHint}`;
 				this.autoCompactionLoader = new Loader(
 					this.ui,
@@ -3740,11 +3744,14 @@ export class InteractiveMode {
 							event.result.summary,
 							event.result.tokensBefore,
 							new Date().toISOString(),
+							event.customInstructions,
 						),
 					);
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
-					if (event.reason === "manual") {
+					if (event.errorSeverity === "warning") {
+						this.showWarning(event.errorMessage);
+					} else if (event.reason === "manual") {
 						this.showError(event.errorMessage);
 					} else {
 						this.chatContainer.addChild(new Spacer(1));

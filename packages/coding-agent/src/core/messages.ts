@@ -63,6 +63,8 @@ export interface CompactionSummaryMessage {
 	role: "compactionSummary";
 	summary: string;
 	tokensBefore: number;
+	/** User instructions that guided the summary (from `/compact <instructions>`) */
+	customInstructions?: string;
 	timestamp: number;
 }
 
@@ -110,11 +112,13 @@ export function createCompactionSummaryMessage(
 	summary: string,
 	tokensBefore: number,
 	timestamp: string,
+	customInstructions?: string,
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
 		summary: summary,
 		tokensBefore,
+		customInstructions,
 		timestamp: new Date(timestamp).getTime(),
 	};
 }

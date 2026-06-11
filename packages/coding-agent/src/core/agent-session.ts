@@ -205,7 +205,7 @@ export type AgentSessionEvent =
 			steering: readonly string[];
 			followUp: readonly string[];
 	  }
-	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
+	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow"; customInstructions?: string }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| {
@@ -215,6 +215,9 @@ export type AgentSessionEvent =
 			aborted: boolean;
 			willRetry: boolean;
 			errorMessage?: string;
+			/** "warning" for benign skips (nothing to compact), "error" for real failures */
+			errorSeverity?: "warning" | "error";
+			customInstructions?: string;
 	  }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
@@ -223,6 +226,9 @@ export type AgentSessionEvent =
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
+
+/** Thrown when compaction is skipped for a benign reason (surfaced as a warning, not an error) */
+export class CompactionSkippedError extends Error {}
 
 // ============================================================================
 // Types
@@ -2512,7 +2518,7 @@ export class AgentSession {
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
-		this._emit({ type: "compaction_start", reason: "manual" });
+		this._emit({ type: "compaction_start", reason: "manual", customInstructions });
 
 		try {
 			if (!this.model) {
@@ -2529,9 +2535,9 @@ export class AgentSession {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
 				if (lastEntry?.type === "compaction") {
-					throw new Error("Already compacted");
+					throw new CompactionSkippedError("Already compacted");
 				}
-				throw new Error("Nothing to compact (session too small)");
+				throw new CompactionSkippedError("Session is too short to compact — try again once it grows");
 			}
 
 			let extensionCompaction: CompactionResult | undefined;
@@ -2588,7 +2594,14 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension);
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				customInstructions,
+			);
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
@@ -2619,18 +2632,22 @@ export class AgentSession {
 				result: compactionResult,
 				aborted: false,
 				willRetry: false,
+				customInstructions,
 			});
 			return compactionResult;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			const aborted = message === "Compaction cancelled" || (error instanceof Error && error.name === "AbortError");
+			const skipped = error instanceof CompactionSkippedError;
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
 				result: undefined,
 				aborted,
 				willRetry: false,
-				errorMessage: aborted ? undefined : `Compaction failed: ${message}`,
+				errorMessage: aborted ? undefined : skipped ? message : `Compaction failed: ${message}`,
+				errorSeverity: skipped ? "warning" : "error",
+				customInstructions,
 			});
 			throw error;
 		} finally {
@@ -2798,6 +2815,8 @@ export class AgentSession {
 					result: undefined,
 					aborted: false,
 					willRetry: false,
+					errorMessage: "Auto-compaction skipped: nothing to summarize outside the recent-context window",
+					errorSeverity: "warning",
 				});
 				return false;
 			}

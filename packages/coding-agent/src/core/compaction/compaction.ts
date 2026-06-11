@@ -87,7 +87,12 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 		return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
 	}
 	if (entry.type === "compaction") {
-		return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
+		return createCompactionSummaryMessage(
+			entry.summary,
+			entry.tokensBefore,
+			entry.timestamp,
+			entry.customInstructions,
+		);
 	}
 	return undefined;
 }
@@ -528,6 +533,18 @@ Use this EXACT format:
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
 /**
+ * Build the instruction portion of the summarization prompt: the initial or
+ * update template, optional user instructions, and the kernel restart warning.
+ */
+export function buildSummarizationPrompt(customInstructions?: string, previousSummary?: string): string {
+	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
+	if (customInstructions) {
+		basePrompt += `\n\n<user-instructions>\nThe user provided these instructions for this summary. Follow them with high priority while keeping the section format above: emphasize what they ask to focus on, and preserve verbatim anything they ask to remember.\n${customInstructions}\n</user-instructions>`;
+	}
+	return `${basePrompt}\n\n${KERNEL_RESTART_SUMMARY_WARNING}`;
+}
+
+/**
  * Generate a summary of the conversation using the LLM.
  * If previousSummary is provided, uses the update prompt to merge.
  */
@@ -544,12 +561,7 @@ export async function generateSummary(
 ): Promise<string> {
 	const maxTokens = Math.floor(0.8 * reserveTokens);
 
-	// Use update prompt if we have a previous summary, otherwise initial prompt
-	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
-	if (customInstructions) {
-		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
-	}
-	basePrompt = `${basePrompt}\n\n${KERNEL_RESTART_SUMMARY_WARNING}`;
+	const basePrompt = buildSummarizationPrompt(customInstructions, previousSummary);
 
 	// Serialize conversation to text so model doesn't try to continue it
 	// Convert to LLM messages first (handles custom types like bashExecution, custom, etc.)
@@ -669,6 +681,12 @@ export function prepareCompaction(
 			const msg = getMessageFromEntryForCompaction(pathEntries[i]);
 			if (msg) turnPrefixMessages.push(msg);
 		}
+	}
+
+	// Everything fits in the keep-recent window and there is no previous summary
+	// to carry forward — compacting would summarize an empty conversation.
+	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0 && !previousSummary) {
+		return undefined;
 	}
 
 	// Extract file operations from messages and previous compaction

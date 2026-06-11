@@ -153,6 +153,19 @@ describe("buildSessionContext", () => {
 			expect((ctx.messages[0] as any).summary).toContain("Empty summary");
 		});
 
+		it("carries customInstructions onto the summary message", () => {
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "first"),
+				msg("2", "1", "assistant", "response"),
+				{ ...compaction("3", "2", "Summary", "1"), customInstructions: "focus on the auth refactor" },
+				msg("4", "3", "user", "second"),
+			];
+			const ctx = buildSessionContext(entries);
+
+			expect((ctx.messages[0] as any).summary).toContain("Summary");
+			expect((ctx.messages[0] as any).customInstructions).toBe("focus on the auth refactor");
+		});
+
 		it("multiple compactions uses latest", () => {
 			const entries: SessionEntry[] = [
 				msg("1", null, "user", "a"),

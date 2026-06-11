@@ -88,6 +88,21 @@ describe("SessionManager append and tree traversal", () => {
 			expect(entries[3].parentId).toBe(compactionId);
 		});
 
+		it("appendCompaction persists customInstructions", () => {
+			const session = SessionManager.inMemory();
+
+			const id1 = session.appendMessage(userMsg("1"));
+			session.appendMessage(assistantMsg("2"));
+			session.appendCompaction("summary", id1, 1000, undefined, undefined, "focus on xyz");
+
+			const compactionEntry = session.getEntries().find((e) => e.type === "compaction");
+			if (compactionEntry?.type === "compaction") {
+				expect(compactionEntry.customInstructions).toBe("focus on xyz");
+			} else {
+				expect.fail("compaction entry not found");
+			}
+		});
+
 		it("appendCustomEntry integrates into tree", () => {
 			const session = SessionManager.inMemory();
 

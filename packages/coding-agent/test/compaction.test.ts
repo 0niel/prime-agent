@@ -5,6 +5,7 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+	buildSummarizationPrompt,
 	type CompactionSettings,
 	calculateContextTokens,
 	compact,
@@ -173,6 +174,31 @@ function extractText(messages: AgentMessage[]): string {
 // ============================================================================
 // Unit tests
 // ============================================================================
+
+describe("buildSummarizationPrompt", () => {
+	it("omits user instructions block when no instructions given", () => {
+		const prompt = buildSummarizationPrompt();
+		expect(prompt).not.toContain("<user-instructions>");
+		expect(prompt).toContain("## Goal");
+		expect(prompt).toContain("IPython kernel");
+	});
+
+	it("includes user instructions in a delimited block before the kernel warning", () => {
+		const prompt = buildSummarizationPrompt("focus on the auth refactor, remember the migration command");
+		expect(prompt).toContain("<user-instructions>");
+		expect(prompt).toContain("focus on the auth refactor, remember the migration command");
+		expect(prompt).toContain("</user-instructions>");
+		expect(prompt.indexOf("</user-instructions>")).toBeLessThan(prompt.indexOf("IPython kernel"));
+	});
+
+	it("uses the update template when a previous summary exists", () => {
+		const initial = buildSummarizationPrompt("focus on xyz");
+		const update = buildSummarizationPrompt("focus on xyz", "## Goal\nprevious summary");
+		expect(initial).not.toContain("existing summary provided in <previous-summary> tags");
+		expect(update).toContain("existing summary provided in <previous-summary> tags");
+		expect(update).toContain("<user-instructions>");
+	});
+});
 
 describe("Token calculation", () => {
 	it("should calculate total context tokens from usage", () => {
@@ -402,6 +428,22 @@ describe("buildSessionContext", () => {
 		// model_change is later overwritten by assistant message's model info
 		expect(loaded.model).toEqual({ provider: "anthropic", modelId: "claude-sonnet-4-5" });
 		expect(loaded.thinkingLevel).toBe("high");
+	});
+});
+
+describe("prepareCompaction with small sessions", () => {
+	it("returns undefined when everything fits in the keep-recent window", () => {
+		// Session well under keepRecentTokens (20k default): nothing to summarize,
+		// so compaction should be skipped instead of summarizing an empty conversation
+		const entries: SessionEntry[] = [
+			createMessageEntry(createUserMessage("hello")),
+			createMessageEntry(createAssistantMessage("hi there", createMockUsage(5000, 1000))),
+			createMessageEntry(createUserMessage("how are you")),
+			createMessageEntry(createAssistantMessage("great", createMockUsage(8000, 2000))),
+		];
+
+		const preparation = prepareCompaction(entries, DEFAULT_COMPACTION_SETTINGS);
+		expect(preparation).toBeUndefined();
 	});
 });
 
