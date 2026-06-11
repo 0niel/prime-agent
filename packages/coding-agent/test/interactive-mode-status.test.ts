@@ -21,6 +21,7 @@ import type {
 	AgentConnectionSourceInfo,
 	AgentConnectionState,
 } from "../src/modes/agent-connection/types.js";
+import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -361,6 +362,7 @@ describe("InteractiveMode tool event rendering", () => {
 			init: vi.fn(async () => {}),
 			footer: { invalidate: vi.fn() },
 			updateConnectionStateFromEvent: vi.fn(),
+			activityTracker: new AgentActivityTracker(),
 			streamingComponent: { updateContent: vi.fn() },
 			streamingMessage: undefined,
 			chatContainer: new Container(),
@@ -378,38 +380,40 @@ describe("InteractiveMode tool event rendering", () => {
 			ui: { requestRender: vi.fn() },
 			getCurrentCwd: () => "/tmp/project",
 		});
-		const event = {
-			type: "message_update",
-			message: {
-				role: "assistant",
-				content: [
-					{
-						type: "toolCall",
-						id: "tool-1",
-						name: "ipython",
-						arguments: { code: "print(1)" },
-					},
-				],
-				api: "anthropic-messages",
-				provider: "anthropic",
-				model: "claude-sonnet-4-5",
-				usage: {
+		const message = {
+			role: "assistant",
+			content: [
+				{
+					type: "toolCall",
+					id: "tool-1",
+					name: "ipython",
+					arguments: { code: "print(1)" },
+				},
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: {
 					input: 0,
 					output: 0,
 					cacheRead: 0,
 					cacheWrite: 0,
-					totalTokens: 0,
-					cost: {
-						input: 0,
-						output: 0,
-						cacheRead: 0,
-						cacheWrite: 0,
-						total: 0,
-					},
+					total: 0,
 				},
-				stopReason: "stop",
-				timestamp: 1,
 			},
+			stopReason: "stop",
+			timestamp: 1,
+		};
+		const event = {
+			type: "message_update",
+			message,
+			assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial: message },
 		} as unknown as AgentConnectionSessionEvent;
 		const handleEvent = (
 			InteractiveMode.prototype as unknown as {

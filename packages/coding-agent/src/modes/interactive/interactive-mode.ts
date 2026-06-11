@@ -117,6 +117,7 @@ import type {
 	AgentConnectionState,
 	AgentConnectionToolDefinition,
 } from "../agent-connection/index.js";
+import { AGENT_ACTIVITY_LABELS, AgentActivityTracker, formatTokenCount } from "./agent-activity.js";
 import { ArminComponent } from "./components/armin.js";
 import { AssistantMessageComponent } from "./components/assistant-message.js";
 import { BashExecutionComponent } from "./components/bash-execution.js";
@@ -520,7 +521,7 @@ export class InteractiveMode {
 	private workingIndicatorOptions: LoaderIndicatorOptions | undefined = undefined;
 	private workingStartedAt: number | undefined = undefined;
 	private workingTimer: NodeJS.Timeout | undefined = undefined;
-	private readonly defaultWorkingMessage = "Working...";
+	private readonly activityTracker = new AgentActivityTracker();
 	private readonly defaultHiddenThinkingLabel = "Thinking...";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
 
@@ -2125,6 +2126,7 @@ export class InteractiveMode {
 		this.compactionQueuedMessages = [];
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
+		this.activityTracker.reset();
 		this.resetPendingToolState();
 		this.resetChildAgentInspector();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
@@ -2328,11 +2330,23 @@ export class InteractiveMode {
 	}
 
 	private getWorkingLoaderMessage(): string {
-		const message = this.workingMessage ?? this.defaultWorkingMessage;
-		if (this.workingStartedAt === undefined) {
-			return message;
+		const elapsed =
+			this.workingStartedAt === undefined
+				? undefined
+				: this.formatWorkingElapsed(Date.now() - this.workingStartedAt);
+		if (this.workingMessage !== undefined) {
+			// Extensions and tool bootstrap own the message; keep the plain "<message> <elapsed>" form.
+			return elapsed === undefined ? this.workingMessage : `${this.workingMessage} ${elapsed}`;
 		}
-		return `${message} ${this.formatWorkingElapsed(Date.now() - this.workingStartedAt)}`;
+		const status = this.activityTracker.getStatus();
+		const parts = [AGENT_ACTIVITY_LABELS[status.activity]];
+		if (elapsed !== undefined) {
+			parts.push(elapsed);
+		}
+		if (status.tokens > 0) {
+			parts.push(`${status.direction === "down" ? "↓" : "↑"} ${formatTokenCount(status.tokens)} tokens`);
+		}
+		return parts.join(" · ");
 	}
 
 	private createWorkingLoader(): Loader {
@@ -3530,6 +3544,8 @@ export class InteractiveMode {
 
 		this.footer.invalidate();
 		this.updateConnectionStateFromEvent(event);
+		this.activityTracker.handleEvent(event);
+		this.updateWorkingLoaderMessage();
 
 		switch (event.type) {
 			case "agent_start":
@@ -3607,10 +3623,14 @@ export class InteractiveMode {
 					let errorMessage: string | undefined;
 					if (this.streamingMessage.stopReason === "aborted") {
 						const retryAttempt = this.getRetryAttempt();
+						const elapsedSuffix =
+							this.workingStartedAt === undefined
+								? ""
+								: ` · ${this.formatWorkingElapsed(Date.now() - this.workingStartedAt)}`;
 						errorMessage =
 							retryAttempt > 0
-								? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`
-								: "Operation aborted";
+								? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}${elapsedSuffix}`
+								: `Operation aborted${elapsedSuffix}`;
 						this.streamingMessage.errorMessage = errorMessage;
 					}
 					this.ensureAssistantStreamingComponent(event.message).updateContent(this.streamingMessage);
@@ -4414,7 +4434,9 @@ export class InteractiveMode {
 								errorMessage =
 									retryAttempt > 0
 										? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`
-										: "Operation aborted";
+										: message.errorMessage && message.errorMessage !== "Request was aborted"
+											? message.errorMessage
+											: "Operation aborted";
 							} else {
 								errorMessage = message.errorMessage || "Error";
 							}

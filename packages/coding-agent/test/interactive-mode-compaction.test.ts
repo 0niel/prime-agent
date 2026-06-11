@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
+import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 
 describe("InteractiveMode compaction events", () => {
@@ -7,6 +8,8 @@ describe("InteractiveMode compaction events", () => {
 			isInitialized: true,
 			footer: { invalidate: vi.fn() },
 			updateConnectionStateFromEvent: vi.fn(),
+			activityTracker: new AgentActivityTracker(),
+			updateWorkingLoaderMessage: vi.fn(),
 			autoCompactionLoader: undefined,
 			defaultEditor: {},
 			statusContainer: { clear: vi.fn() },
