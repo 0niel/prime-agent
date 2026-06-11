@@ -104,6 +104,7 @@ interface InspectableRlmRun {
 	abort: () => void;
 	status: string;
 	error?: string;
+	session?: AgentSession;
 }
 
 interface InspectableRlmSession {
@@ -440,6 +441,117 @@ describe("AgentSession rlm recursion", () => {
 		expect(run.error).toBe("Parent session aborted");
 		releaseChild();
 		await expect(runPromise).rejects.toThrow("Parent session aborted");
+	});
+
+	it("cancels a single rlm child run by id and reports unknown ids", async () => {
+		let releaseChild: () => void = () => {};
+		const release = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		let childStarted = false;
+		const root = createSession({
+			streamFn: (_model, context) => {
+				const text = userText(context);
+				const stream = createAssistantMessageEventStream();
+				if (text === "slow shard") {
+					childStarted = true;
+					void release.then(() => {
+						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
+					});
+				}
+				return stream;
+			},
+		});
+		const childStatuses: string[] = [];
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update") {
+				childStatuses.push(event.child.status);
+			}
+		});
+
+		const runPromise = root.runRlmChild("slow shard");
+		await waitFor(() => childStarted);
+		const runs = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
+		expect(runs.size).toBe(1);
+		const childId = [...runs.keys()][0];
+		if (!childId) {
+			throw new Error("Missing child run id");
+		}
+		const run = runs.get(childId);
+
+		expect(root.cancelRlmChildRun("unknown-child")).toBe(false);
+		expect(run?.status).toBe("running");
+
+		expect(root.cancelRlmChildRun(childId)).toBe(true);
+		expect(run?.status).toBe("cancelled");
+		expect(run?.error).toBe("Cancelled by user");
+		// The cancelled update is pushed at cancel time, before the (possibly
+		// stuck) child unwinds; viewers must not keep showing a running child.
+		expect(childStatuses[childStatuses.length - 1]).toBe("cancelled");
+		releaseChild();
+		await expect(runPromise).rejects.toThrow("Cancelled by user");
+		expect(childStatuses[childStatuses.length - 1]).toBe("cancelled");
+
+		// The run has finished; a second cancel finds nothing to stop.
+		expect(root.cancelRlmChildRun(childId)).toBe(false);
+	});
+
+	it("cancels nested rlm child runs through the root session", async () => {
+		let releaseChild: () => void = () => {};
+		const release = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		let releaseNested: () => void = () => {};
+		const nestedRelease = new Promise<void>((resolve) => {
+			releaseNested = resolve;
+		});
+		let childStarted = false;
+		let nestedStarted = false;
+		const root = createSession({
+			maxDepth: 2,
+			streamFn: (_model, context) => {
+				const text = userText(context);
+				const stream = createAssistantMessageEventStream();
+				if (text === "slow shard") {
+					childStarted = true;
+					void release.then(() => {
+						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
+					});
+				} else if (text === "nested shard") {
+					nestedStarted = true;
+					void nestedRelease.then(() => {
+						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
+					});
+				}
+				return stream;
+			},
+		});
+
+		const runPromise = root.runRlmChild("slow shard");
+		await waitFor(() => childStarted);
+		const rootRuns = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
+		const rootRun = [...rootRuns.values()][0];
+		if (!rootRun?.session) {
+			throw new Error("Missing child session on root run");
+		}
+
+		const childSession = rootRun.session;
+		const nestedPromise = childSession.runRlmChild("nested shard");
+		await waitFor(() => nestedStarted);
+		const nestedRuns = (childSession as unknown as InspectableRlmSession)._activeRlmChildRuns;
+		expect(nestedRuns.size).toBe(1);
+		const nestedId = [...nestedRuns.keys()][0];
+		if (!nestedId) {
+			throw new Error("Missing nested run id");
+		}
+
+		expect(root.cancelRlmChildRun(nestedId)).toBe(true);
+		releaseNested();
+		await expect(nestedPromise).rejects.toThrow("Cancelled by user");
+		expect(rootRun.status).toBe("running");
+
+		releaseChild();
+		await expect(runPromise).resolves.toMatchObject({ answer: "child answer: slow shard" });
 	});
 
 	it("runs parallel rlm comm requests independently", async () => {

@@ -335,6 +335,10 @@ interface RlmChildRun {
 	error?: string;
 	task?: Promise<RlmInternalRunResult>;
 	abort: () => void;
+	/** Child session, once its runtime exists. Used to cancel nested child runs. */
+	session?: AgentSession;
+	/** Re-emits the run's rlm_child_update snapshot with its current status. */
+	emitUpdate?: () => void;
 }
 
 // ============================================================================
@@ -3563,12 +3567,46 @@ export class AgentSession {
 
 	private _cancelActiveRlmChildRuns(reason: string): void {
 		for (const run of this._activeRlmChildRuns.values()) {
-			if (run.status === "running" || run.status === "queued") {
-				run.status = "cancelled";
-				run.error = reason;
-				run.abort();
+			this._cancelRlmChildRun(run, reason);
+		}
+	}
+
+	private _cancelRlmChildRun(run: RlmChildRun, reason: string): boolean {
+		if (run.status !== "running" && run.status !== "queued") {
+			return false;
+		}
+		run.status = "cancelled";
+		run.error = reason;
+		run.abort();
+		// Surface the cancellation immediately; the run's own terminal update is
+		// delayed indefinitely when the child is stuck mid-stream, which is
+		// exactly when users reach for the kill.
+		run.emitUpdate?.();
+		return true;
+	}
+
+	/** Status of a direct RLM child run, while the run is still tracked. */
+	getRlmChildRunStatus(childId: string): RlmChildAgentStatus | undefined {
+		return this._activeRlmChildRuns.get(childId)?.status;
+	}
+
+	/**
+	 * Cancel a single RLM child run by id, searching nested child sessions.
+	 *
+	 * @returns true when a running or queued run was cancelled; false when the
+	 * id is unknown or the run already finished.
+	 */
+	cancelRlmChildRun(childId: string, reason = "Cancelled by user"): boolean {
+		const run = this._activeRlmChildRuns.get(childId);
+		if (run) {
+			return this._cancelRlmChildRun(run, reason);
+		}
+		for (const candidate of this._activeRlmChildRuns.values()) {
+			if (candidate.session?.cancelRlmChildRun(childId, reason)) {
+				return true;
 			}
 		}
+		return false;
 	}
 
 	private _startRlmChildRun(prompt: string, kwargs: Record<string, unknown> = {}): RlmChildRun {
@@ -3624,6 +3662,7 @@ export class AgentSession {
 				},
 			});
 		};
+		run.emitUpdate = emitChildUpdate;
 		const recordAssistantMessage = (message: AssistantMessage) => {
 			const text = compactRlmText(readAssistantText(message));
 			const thinking = compactRlmText(readAssistantThinking(message));
@@ -3716,6 +3755,7 @@ export class AgentSession {
 				}
 				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
 				const child = childRuntime.session;
+				run.session = child;
 				run.abort = () => {
 					void child.abort();
 				};
@@ -3860,6 +3900,7 @@ export class AgentSession {
 					await this._releaseRlmSubagentRuntime(childRuntime, subagentOptions);
 				}
 				run.abort = noopRlmChildAbort;
+				run.session = undefined;
 				this._activeRlmChildRuns.delete(run.id);
 			}
 		})();

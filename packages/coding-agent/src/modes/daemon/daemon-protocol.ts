@@ -173,6 +173,7 @@ export type DaemonCommand =
 	| { id?: string; type: "steer"; activeSessionId: string; message: string; images?: ImageContent[] }
 	| { id?: string; type: "follow_up"; activeSessionId: string; message: string; images?: ImageContent[] }
 	| { id?: string; type: "abort"; activeSessionId: string }
+	| { id?: string; type: "cancel_rlm_child"; activeSessionId: string; childId: string }
 	| { id?: string; type: "wait_for_idle"; activeSessionId: string }
 	| { id?: string; type: "get_state"; activeSessionId: string }
 	| { id?: string; type: "get_connection_state"; activeSessionId: string }
@@ -254,6 +255,14 @@ export type DaemonExtensionUIResponse = { value: string } | { confirmed: boolean
 
 export function isDaemonDialogExtensionUiRequest(method: string): boolean {
 	return method === "select" || method === "confirm" || method === "input" || method === "editor";
+}
+
+/**
+ * True when a daemon rejected a command it does not know, i.e. the daemon
+ * process was started from a build that predates the command.
+ */
+export function isUnknownDaemonCommandError(error: unknown, command: DaemonCommand["type"]): boolean {
+	return error instanceof Error && error.message.includes(`Unknown daemon command: ${command}`);
 }
 
 export interface DaemonRequestProgress {

@@ -6,14 +6,15 @@ import type { DeleteSessionFileResult } from "../../core/session-file-actions.js
 import type { SessionStats } from "../../core/session-stats.js";
 import type { DaemonClient } from "../daemon/daemon-client.js";
 import { deserializeDaemonError } from "../daemon/daemon-errors.js";
-import type {
-	DaemonAttachResult,
-	DaemonCommand,
-	DaemonDeleteSavedSessionResult,
-	DaemonOutbound,
-	DaemonReplayInfo,
-	DaemonSavedSessionInfo,
-	DaemonSessionSnapshot,
+import {
+	type DaemonAttachResult,
+	type DaemonCommand,
+	type DaemonDeleteSavedSessionResult,
+	type DaemonOutbound,
+	type DaemonReplayInfo,
+	type DaemonSavedSessionInfo,
+	type DaemonSessionSnapshot,
+	isUnknownDaemonCommandError,
 } from "../daemon/daemon-protocol.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
 import type {
@@ -350,6 +351,22 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	async abort(): Promise<void> {
 		await this.requestOk({ type: "abort", activeSessionId: this.activeSessionId });
+	}
+
+	async cancelRlmChild(childId: string): Promise<boolean> {
+		try {
+			const result = await this.requestData<{ cancelled: boolean }>({
+				type: "cancel_rlm_child",
+				activeSessionId: this.activeSessionId,
+				childId,
+			});
+			return result.cancelled;
+		} catch (error) {
+			if (isUnknownDaemonCommandError(error, "cancel_rlm_child")) {
+				throw new Error("the daemon is running an older build; restart the daemon and try again");
+			}
+			throw error;
+		}
 	}
 
 	async waitForIdle(): Promise<void> {

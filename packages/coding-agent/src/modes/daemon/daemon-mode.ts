@@ -86,6 +86,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"steer",
 	"follow_up",
 	"abort",
+	"cancel_rlm_child",
 	"wait_for_idle",
 	"get_state",
 	"get_connection_state",
@@ -671,6 +672,12 @@ class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				await state.runtime.session.abort();
 				return success(command.id, "abort");
+			}
+
+			case "cancel_rlm_child": {
+				const state = this.getSessionState(command.activeSessionId);
+				const cancelled = state.runtime.session.cancelRlmChildRun(command.childId);
+				return success(command.id, "cancel_rlm_child", { cancelled });
 			}
 
 			case "wait_for_idle": {

@@ -14,7 +14,7 @@ import { KeybindingsManager } from "../../core/keybindings.js";
 import { SessionManager } from "../../core/session-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import { DaemonClient } from "../daemon/daemon-client.js";
-import type { DaemonCommand, DaemonResponse } from "../daemon/daemon-protocol.js";
+import { type DaemonCommand, type DaemonResponse, isUnknownDaemonCommandError } from "../daemon/daemon-protocol.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
 import { CustomEditor } from "../interactive/components/custom-editor.js";
 import { keyText } from "../interactive/components/keybinding-hints.js";
@@ -77,6 +77,11 @@ type PendingDeleteAgent = {
 	sessionFile?: string;
 	summary: SessionSummary;
 	stopped: boolean;
+};
+type PendingKillSubagent = {
+	identity: string;
+	rootActiveSessionId: string;
+	childId: string;
 };
 
 export async function resolveAgentsViewSessionUiServices(
@@ -228,6 +233,7 @@ class AgentsViewMode implements Component, Focusable {
 	private replyLastAssistantTextLoading = false;
 	private replyHeaderTime = "";
 	private pendingDeleteAgent: PendingDeleteAgent | undefined;
+	private pendingKillSubagent: PendingKillSubagent | undefined;
 	private readonly inactiveAgentIdentities = new Set<string>();
 	private statusMessage: string | undefined;
 	private statusMessageTimer: ReturnType<typeof setTimeout> | undefined;
@@ -453,6 +459,7 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	private clearDeleteConfirmation(options: { render?: boolean } = {}): void {
+		this.pendingKillSubagent = undefined;
 		if (!this.deleteConfirmTimer && this.deleteConfirmExpiresAt === 0) {
 			return;
 		}
@@ -611,18 +618,25 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	private openSelectedSubagent(row: AgentsViewRow): void {
-		// The whole subagent tree is inspected from the root agent's chat view,
-		// so nested subagents also resolve to their top-level ancestor.
-		let root = this.rows.find((candidate) => candidate.identity === row.parentIdentity);
-		while (root && root.kind !== "agent") {
-			const parentIdentity = root.parentIdentity;
-			root = this.rows.find((candidate) => candidate.identity === parentIdentity);
-		}
+		const root = this.findSubagentRootRow(row);
 		if (!root || !(root.summary.activeSessionId || root.summary.sessionFile)) {
 			this.setStatusMessage("Cannot open subagent without its parent agent");
 			return;
 		}
 		this.finish({ type: "open", summary: root.summary, subagent: row.summary });
+	}
+
+	/**
+	 * The whole subagent tree belongs to the root agent's session, so nested
+	 * subagents also resolve to their top-level ancestor.
+	 */
+	private findSubagentRootRow(row: AgentsViewRow): AgentsViewRow | undefined {
+		let root = this.rows.find((candidate) => candidate.identity === row.parentIdentity);
+		while (root && root.kind !== "agent") {
+			const parentIdentity = root.parentIdentity;
+			root = this.rows.find((candidate) => candidate.identity === parentIdentity);
+		}
+		return root;
 	}
 
 	private async toggleReplyTarget(): Promise<void> {
@@ -721,9 +735,18 @@ class AgentsViewMode implements Component, Focusable {
 
 	private async handleDeleteSelected(): Promise<void> {
 		const row = this.rows[this.selectedIndex];
-		if (row?.kind !== "agent" || !row.selectable) {
+		if (!row?.selectable) {
 			return;
 		}
+		if (row.kind === "subagent") {
+			this.pendingDeleteAgent = undefined;
+			await this.handleKillSubagentSelected(row);
+			return;
+		}
+		if (row.kind !== "agent") {
+			return;
+		}
+		this.pendingKillSubagent = undefined;
 		const identity = getSummaryIdentity(row.summary);
 		if (this.pendingDeleteAgent?.identity === identity) {
 			if (this.isDeleteConfirmationVisible()) {
@@ -734,6 +757,49 @@ class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		await this.stopAgentForDeletion(row);
+	}
+
+	// Subagent rows only stay visible while the daemon hosts their session, and
+	// the daemon releases a child session as soon as its run settles, so any
+	// visible subagent is part of an active run regardless of its idle/streaming
+	// status. A kill that races completion reports "already finished".
+	private async handleKillSubagentSelected(row: AgentsViewRow): Promise<void> {
+		const identity = getSummaryIdentity(row.summary);
+		if (this.pendingKillSubagent?.identity === identity && this.isDeleteConfirmationVisible()) {
+			const pending = this.pendingKillSubagent;
+			this.clearDeleteConfirmation({ render: false });
+			await this.killSubagent(pending);
+			return;
+		}
+		const childId = row.summary.rlmChildId;
+		const rootActiveSessionId = this.findSubagentRootRow(row)?.summary.activeSessionId;
+		if (!childId || !rootActiveSessionId) {
+			this.setStatusMessage("Cannot stop subagent without its parent agent");
+			return;
+		}
+		this.pendingKillSubagent = { identity, rootActiveSessionId, childId };
+		this.showDeleteConfirmation();
+	}
+
+	private async killSubagent(pending: PendingKillSubagent): Promise<void> {
+		this.setStatusMessage("Stopping subagent...");
+		try {
+			const response = await this.requireClient().request({
+				type: "cancel_rlm_child",
+				activeSessionId: pending.rootActiveSessionId,
+				childId: pending.childId,
+			});
+			const data = requireDaemonData(response);
+			const cancelled = isRecord(data) && data.cancelled === true;
+			this.setStatusMessage(cancelled ? "Subagent stopped" : "Subagent already finished", { render: false });
+			await this.refreshSessions();
+		} catch (error) {
+			this.setStatusMessage(
+				isUnknownDaemonCommandError(error, "cancel_rlm_child")
+					? "Failed to stop subagent: the daemon is running an older build; restart the daemon and try again"
+					: formatError("Failed to stop subagent", error),
+			);
+		}
 	}
 
 	private async stopAgentForDeletion(row: AgentsViewRow): Promise<void> {
@@ -1083,16 +1149,21 @@ class AgentsViewMode implements Component, Focusable {
 			return selected ? `${SELECTED_ROW_MARKER}${line}` : line;
 		}
 		const pendingDelete = row.kind === "agent" && this.isPendingDeleteRow(row);
+		const pendingKill = row.kind === "subagent" && this.isPendingKillSubagentRow(row);
 		const rawIcon = this.getRowIcon(row.section);
 		const icon = this.formatRowIcon(row.section, rawIcon);
 		const indent = "  ".repeat(row.depth);
 		const timeWidth = 10;
 		const titleWidth = Math.max(0, width - visibleWidth(indent) - visibleWidth(rawIcon) - timeWidth - 2);
-		const title = pendingDelete ? this.getPendingDeleteTitle() : row.title;
+		const title = pendingDelete
+			? this.getPendingDeleteTitle()
+			: pendingKill
+				? `${keyText("app.agents.delete")} again to stop`
+				: row.title;
 		const titleCell = formatTableCell(title, titleWidth);
 		const cells = [
 			icon,
-			pendingDelete ? theme.fg("error", titleCell) : titleCell,
+			pendingDelete || pendingKill ? theme.fg("error", titleCell) : titleCell,
 			formatRightTableCell(formatSessionDuration(row.summary), timeWidth),
 		];
 		const base = `${indent}${cells[0]} ${cells[1]} ${cells[2]}`;
@@ -1110,6 +1181,12 @@ class AgentsViewMode implements Component, Focusable {
 	private isPendingDeleteRow(row: AgentsViewRow): boolean {
 		return (
 			getSummaryIdentity(row.summary) === this.pendingDeleteAgent?.identity && this.isDeleteConfirmationVisible()
+		);
+	}
+
+	private isPendingKillSubagentRow(row: AgentsViewRow): boolean {
+		return (
+			getSummaryIdentity(row.summary) === this.pendingKillSubagent?.identity && this.isDeleteConfirmationVisible()
 		);
 	}
 
@@ -1134,13 +1211,16 @@ class AgentsViewMode implements Component, Focusable {
 			const tone = this.statusMessage.startsWith("Failed") ? "error" : "muted";
 			return truncateToWidth(theme.fg(tone, this.statusMessage), width);
 		}
-		// Subagents are read-only: reply and stop/deactivate don't apply to them.
-		const selectedAgent = this.rows[this.selectedIndex]?.kind === "agent";
+		// Replying is reserved for top-level agents; subagents can be stopped.
+		const selectedRow = this.rows[this.selectedIndex];
+		const selectedAgent = selectedRow?.kind === "agent";
+		const selectedSubagent = selectedRow?.kind === "subagent";
 		const hints = [
 			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
 			`${keyText("tui.select.confirm")} open/send`,
 			selectedAgent ? `${keyText("app.agents.reply")} reply` : undefined,
 			selectedAgent ? `${keyText("app.agents.delete")} stop/deactivate` : undefined,
+			selectedSubagent ? `${keyText("app.agents.delete")} stop` : undefined,
 			this.replyActiveSessionId ? `${keyText("app.agents.back")} back` : undefined,
 		]
 			.filter((hint): hint is string => hint !== undefined)

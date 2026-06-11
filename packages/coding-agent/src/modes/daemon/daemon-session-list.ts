@@ -165,16 +165,16 @@ export function buildRlmChildSnapshots(
 	}
 
 	const snapshots: AgentConnectionRlmChildAgentSnapshot[] = [];
-	const visit = (parentActiveSessionId: string, parentNodeId: string | undefined): void => {
+	const visit = (parent: ActiveSessionState | undefined, parentActiveSessionId: string): void => {
+		const parentNodeId = parent?.runtime.metadata.rlmChildId;
 		for (const child of childrenByParent.get(parentActiveSessionId) ?? []) {
-			const metadata = child.runtime.metadata;
-			snapshots.push(rlmChildSnapshotForActiveSession(child, metadata, parentNodeId));
+			snapshots.push(rlmChildSnapshotForActiveSession(child, child.runtime.metadata, parentNodeId, parent));
 			// A child passes its own node id to its children as their parent id.
-			visit(child.activeSessionId, metadata.rlmChildId);
+			visit(child, child.activeSessionId);
 		}
 	};
 	const root = activeSessions.find((candidate) => candidate.activeSessionId === rootActiveSessionId);
-	visit(rootActiveSessionId, root?.runtime.metadata.rlmChildId);
+	visit(root, rootActiveSessionId);
 	return snapshots;
 }
 
@@ -182,6 +182,7 @@ function rlmChildSnapshotForActiveSession(
 	activeSession: ActiveSessionState,
 	metadata: AgentSessionRuntimeMetadata,
 	parentNodeId: string | undefined,
+	parent: ActiveSessionState | undefined,
 ): AgentConnectionRlmChildAgentSnapshot {
 	const session = activeSession.runtime.session;
 	const transcript: AgentConnectionRlmChildAgentTranscriptLine[] = [];
@@ -199,11 +200,18 @@ function rlmChildSnapshotForActiveSession(
 			answerPreview = text;
 		}
 	}
+	// The parent session's run tracker is the source of truth for child status;
+	// a daemon-hosted child whose agent is momentarily idle is still part of an
+	// active run. The streaming heuristic only covers parents the daemon does
+	// not host (e.g. children attributed to a session created by an older build).
+	const runStatus = metadata.rlmChildId
+		? parent?.runtime.session.getRlmChildRunStatus(metadata.rlmChildId)
+		: undefined;
 	return {
 		id: metadata.rlmChildId ?? activeSession.activeSessionId,
 		parentId: parentNodeId,
 		label: compactRlmText(metadata.prompt ?? "", 80) || "child agent",
-		status: session.isStreaming || session.pendingMessageCount > 0 ? "running" : "done",
+		status: runStatus ?? (session.isStreaming || session.pendingMessageCount > 0 ? "running" : "done"),
 		answerPreview,
 		sessionDir: metadata.sessionDir ?? session.sessionManager.getSessionDir(),
 		transcript,

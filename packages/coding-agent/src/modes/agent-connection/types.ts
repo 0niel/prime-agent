@@ -513,6 +513,7 @@ export interface AgentConnection {
 	steer(message: string, images?: ImageContent[]): Promise<void>;
 	followUp(message: string, images?: ImageContent[]): Promise<void>;
 	abort(): Promise<void>;
+	cancelRlmChild(childId: string): Promise<boolean>;
 	waitForIdle(): Promise<void>;
 
 	setModel(provider: string, modelId: string): Promise<AgentConnectionModel>;

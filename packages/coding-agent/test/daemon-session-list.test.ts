@@ -152,6 +152,33 @@ describe("buildRlmChildSnapshots", () => {
 		});
 	});
 
+	it("prefers the parent's run status over the streaming heuristic", () => {
+		// An idle child session is still part of an active run; only the parent's
+		// run tracker knows that.
+		const parent = makeState({
+			activeSessionId: "parent",
+			sessionFile: "/tmp/parent.jsonl",
+			childRunStatuses: { "sub-aaa": "running" },
+		});
+		const idleChild = makeState({
+			activeSessionId: "child",
+			isStreaming: false,
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: "parent",
+				rlmChildId: "sub-aaa",
+				rlmParentNodeId: "sub-aaa",
+				prompt: "Slow task",
+				sessionDir: "/tmp/artifacts/sub-aaa",
+			},
+		});
+
+		const snapshots = buildRlmChildSnapshots("parent", [parent, idleChild]);
+
+		expect(snapshots.map((snapshot) => [snapshot.id, snapshot.status])).toEqual([["sub-aaa", "running"]]);
+	});
+
 	it("returns no snapshots for sessions without children", () => {
 		const solo = makeState({ activeSessionId: "solo" });
 		expect(buildRlmChildSnapshots("solo", [solo])).toEqual([]);
@@ -166,6 +193,7 @@ interface StateOptions {
 	pendingToolCalls?: string[];
 	clients?: number;
 	messages?: AgentMessage[];
+	childRunStatuses?: Record<string, "queued" | "running" | "done" | "error" | "cancelled">;
 	metadata?: {
 		kind: "top-level" | "subagent";
 		createdAt: number;
@@ -205,6 +233,7 @@ function makeState(options: StateOptions): ActiveSessionState {
 					getSessionDir: () => "/tmp/sessions",
 				},
 				messages: options.messages ?? ([] as AgentMessage[]),
+				getRlmChildRunStatus: (childId: string) => options.childRunStatuses?.[childId],
 				pendingMessageCount: 0,
 				state: {
 					streamingMessage: undefined,

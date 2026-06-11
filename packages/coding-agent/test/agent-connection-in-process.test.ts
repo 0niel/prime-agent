@@ -100,6 +100,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 		scopedModels: [],
 		getActiveToolNames: () => ["ipython"],
 		getContextUsage: () => undefined,
+		cancelRlmChildRun: (childId: string) => childId === "child-1",
 		getToolDefinition: (toolName: string) => ({
 			name: toolName,
 			label: toolName,
@@ -153,6 +154,15 @@ describe("InProcessAgentConnection", () => {
 		expect(definition).not.toHaveProperty("execute");
 		expect(definition).not.toHaveProperty("renderCall");
 		expect(definition).not.toHaveProperty("renderResult");
+	});
+
+	it("cancels rlm child runs through the session", async () => {
+		const session = createFakeSession("rlm", []);
+		const runtime = new FakeRuntime(session.session);
+		const connection = new InProcessAgentConnection(asRuntime(runtime));
+
+		await expect(connection.cancelRlmChild("child-1")).resolves.toBe(true);
+		await expect(connection.cancelRlmChild("finished-child")).resolves.toBe(false);
 	});
 
 	it("loads session context through the connection boundary", async () => {

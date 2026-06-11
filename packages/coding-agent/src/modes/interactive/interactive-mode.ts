@@ -647,9 +647,13 @@ export class InteractiveMode {
 		this.chatContainer = new Container();
 		this.pendingMessagesContainer = new Container();
 		this.statusContainer = new Container();
-		this.childAgentInspector = new ChildAgentInspectorComponent(() => this.getChildAgentPanelRows());
+		this.childAgentInspector = new ChildAgentInspectorComponent(
+			() => this.getChildAgentPanelRows(),
+			() => this.ui.requestRender(),
+		);
 		this.childAgentInspector.onCancel = () => this.closeChildAgentPanel();
 		this.childAgentInspector.onOpenDetail = (nodeId) => this.openChildAgentDetail(nodeId);
+		this.childAgentInspector.onKill = (nodeId) => void this.killChildAgent(nodeId);
 		this.childAgentDetail = new ChildAgentDetailComponent(() => this.getChildAgentPanelRows(), {
 			ui: this.ui,
 			getCwd: () => this.getCurrentCwd(),
@@ -665,6 +669,7 @@ export class InteractiveMode {
 		});
 		this.childAgentDetail.onCancel = () => this.showChildAgentList();
 		this.childAgentDetail.onToggleToolsExpanded = () => this.toggleToolOutputExpansion();
+		this.childAgentDetail.onKill = (nodeId) => void this.killChildAgent(nodeId);
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
 		this.keybindings = KeybindingsManager.create();
@@ -4007,14 +4012,38 @@ export class InteractiveMode {
 	}
 
 	private updateChildAgentInspector(child: AgentConnectionRlmChildAgentSnapshot): void {
-		this.childAgentSnapshots.set(child.id, child);
+		// Cancelled subagents were deliberately stopped; drop them from the
+		// viewer instead of keeping a dead row around.
+		if (child.status === "cancelled") {
+			this.removeChildAgentSnapshot(child.id);
+		} else {
+			this.childAgentSnapshots.set(child.id, child);
+		}
 		this.childAgentNodes = this.buildChildAgentInspectorNodes();
 		this.childAgentSummary.setNodes(this.childAgentNodes);
 		this.childAgentInspector.setNodes(this.childAgentNodes);
 		if (this.childAgentDetailNodeId) {
-			this.childAgentDetail.setNode(this.findChildAgentInspectorNode(this.childAgentDetailNodeId));
+			const detailNode = this.findChildAgentInspectorNode(this.childAgentDetailNodeId);
+			if (!detailNode && this.childAgentPanelMode === "detail") {
+				this.showChildAgentList();
+				return;
+			}
+			this.childAgentDetail.setNode(detailNode);
+		}
+		if (this.childAgentPanelMode === "list" && this.childAgentNodes.length === 0) {
+			this.closeChildAgentPanel();
+			return;
 		}
 		this.ui.requestRender();
+	}
+
+	private removeChildAgentSnapshot(id: string): void {
+		this.childAgentSnapshots.delete(id);
+		for (const child of [...this.childAgentSnapshots.values()]) {
+			if (child.parentId === id) {
+				this.removeChildAgentSnapshot(child.id);
+			}
+		}
 	}
 
 	private restoreMainAgentView(): void {
@@ -4138,6 +4167,18 @@ export class InteractiveMode {
 			return;
 		}
 		this.showChildAgentList();
+	}
+
+	private async killChildAgent(nodeId: string): Promise<void> {
+		try {
+			const cancelled = await this.agentConnection.cancelRlmChild(nodeId);
+			if (!cancelled) {
+				this.showError("Subagent already finished");
+			}
+		} catch (error) {
+			this.showError(`Failed to stop subagent: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		this.ui.requestRender();
 	}
 
 	private showChildAgentList(): void {

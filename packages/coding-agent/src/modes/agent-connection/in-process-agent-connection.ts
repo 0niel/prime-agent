@@ -183,6 +183,10 @@ export class InProcessAgentConnection implements AgentConnection {
 		await this.session.abort();
 	}
 
+	async cancelRlmChild(childId: string): Promise<boolean> {
+		return this.session.cancelRlmChildRun(childId);
+	}
+
 	async waitForIdle(): Promise<void> {
 		await this.session.agent.waitForIdle();
 	}

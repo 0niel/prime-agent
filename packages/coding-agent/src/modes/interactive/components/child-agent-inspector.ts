@@ -153,6 +153,13 @@ function hintLine(hints: ReadonlyArray<string | undefined>, width: number): stri
 	return truncateToWidth(joinHints(hints), width, "");
 }
 
+// Matches the agents view delete confirmation window.
+const KILL_CONFIRM_DURATION_MS = 2000;
+
+function isKillableChildAgentStatus(status: ChildAgentStatus): boolean {
+	return status === "running" || status === "queued";
+}
+
 // Subagent list entries mirror the agents view row format: icon, title, right-aligned time.
 function childAgentStatusIcon(status: ChildAgentStatus): string {
 	switch (status) {
@@ -335,17 +342,25 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 	private readonly paddingX = 1;
 	private nodes: readonly ChildAgentInspectorNode[] = [];
 	private selectedId: string | undefined;
+	private pendingKillId: string | undefined;
+	private killConfirmExpiresAt = 0;
+	private killConfirmTimer: ReturnType<typeof setTimeout> | undefined;
 
 	onCancel?: () => void;
 	onOpenDetail?: (nodeId: string) => void;
+	onKill?: (nodeId: string) => void;
 
-	constructor(private readonly getViewportHeight: () => number = () => 0) {}
+	constructor(
+		private readonly getViewportHeight: () => number = () => 0,
+		private readonly requestRender: () => void = () => {},
+	) {}
 
 	setNodes(nodes: readonly ChildAgentInspectorNode[]): void {
 		this.nodes = nodes;
 		const flat = this.flatten();
 		if (flat.length === 0) {
 			this.selectedId = undefined;
+			this.clearKillConfirmation({ render: false });
 			return;
 		}
 		if (!this.selectedId || !flat.some((entry) => entry.node.id === this.selectedId)) {
@@ -377,6 +392,11 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 			return;
 		}
 
+		// Any input other than the kill key disarms the pending confirmation,
+		// matching the agents view delete flow.
+		if (!kb.matches(data, "app.agents.delete")) {
+			this.clearKillConfirmation({ render: false });
+		}
 		if (kb.matches(data, "app.agents.back")) {
 			this.onCancel?.();
 			return;
@@ -385,6 +405,10 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 			if (this.selectedId) {
 				this.onOpenDetail?.(this.selectedId);
 			}
+			return;
+		}
+		if (kb.matches(data, "app.agents.delete")) {
+			this.handleKillKey();
 			return;
 		}
 		if (kb.matches(data, "tui.select.up")) {
@@ -436,9 +460,12 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 		const icon = formatChildAgentStatusIcon(entry.node.status, rawIcon);
 		const timeWidth = 6;
 		const titleWidth = Math.max(0, width - visibleWidth(indent) - visibleWidth(rawIcon) - timeWidth - 2);
-		const titleCell = padTableCell(entry.node.label, titleWidth);
+		const pendingKill = this.isPendingKillNode(entry.node);
+		const title = pendingKill ? `${keyText("app.agents.delete").trim()} again to stop` : entry.node.label;
+		const titleCell = padTableCell(title, titleWidth);
 		const timeCell = padRightTableCell(formatChildAgentDuration(entry.node.durationMs), timeWidth);
-		return this.truncate(`${indent}${icon} ${titleCell} ${timeCell}`, width, "");
+		const renderedTitleCell = pendingKill ? theme.fg("error", titleCell) : titleCell;
+		return this.truncate(`${indent}${icon} ${renderedTitleCell} ${timeCell}`, width, "");
 	}
 	private flatten(): FlatChildAgentNode[] {
 		return flattenChildAgentNodes(this.nodes);
@@ -457,6 +484,61 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 		this.selectedId = flat[next]?.node.id;
 	}
 
+	private handleKillKey(): void {
+		const selected = this.flatten().find((entry) => entry.node.id === this.selectedId)?.node;
+		if (!selected || !isKillableChildAgentStatus(selected.status)) {
+			this.clearKillConfirmation({ render: false });
+			return;
+		}
+		if (this.pendingKillId === selected.id && this.isKillConfirmationVisible()) {
+			this.clearKillConfirmation({ render: false });
+			this.onKill?.(selected.id);
+			return;
+		}
+		this.showKillConfirmation(selected.id);
+	}
+
+	private isPendingKillNode(node: ChildAgentInspectorNode): boolean {
+		return (
+			node.id === this.pendingKillId && isKillableChildAgentStatus(node.status) && this.isKillConfirmationVisible()
+		);
+	}
+
+	private showKillConfirmation(nodeId: string): void {
+		if (this.killConfirmTimer) {
+			clearTimeout(this.killConfirmTimer);
+		}
+		this.pendingKillId = nodeId;
+		this.killConfirmExpiresAt = Date.now() + KILL_CONFIRM_DURATION_MS;
+		this.killConfirmTimer = setTimeout(() => {
+			this.killConfirmTimer = undefined;
+			this.pendingKillId = undefined;
+			this.killConfirmExpiresAt = 0;
+			this.requestRender();
+		}, KILL_CONFIRM_DURATION_MS);
+		this.killConfirmTimer.unref?.();
+		this.requestRender();
+	}
+
+	private clearKillConfirmation(options: { render?: boolean } = {}): void {
+		if (!this.killConfirmTimer && this.killConfirmExpiresAt === 0) {
+			return;
+		}
+		if (this.killConfirmTimer) {
+			clearTimeout(this.killConfirmTimer);
+			this.killConfirmTimer = undefined;
+		}
+		this.pendingKillId = undefined;
+		this.killConfirmExpiresAt = 0;
+		if (options.render !== false) {
+			this.requestRender();
+		}
+	}
+
+	private isKillConfirmationVisible(): boolean {
+		return this.killConfirmExpiresAt > Date.now();
+	}
+
 	private headerLine(running: number, total: number, width: number): string {
 		const left = theme.bold("subagents");
 		const right =
@@ -466,10 +548,13 @@ export class ChildAgentInspectorComponent implements Component, Focusable {
 	}
 
 	private listHintLine(width: number): string {
+		const selected = this.flatten().find((entry) => entry.node.id === this.selectedId)?.node;
+		const killable = selected !== undefined && isKillableChildAgentStatus(selected.status);
 		return hintLine(
 			[
 				combinedKeyAction(["tui.select.up", "tui.select.down"], "move"),
 				keyAction("tui.select.confirm", "open"),
+				killable ? keyAction("app.agents.delete", "stop", { primaryOnly: true }) : undefined,
 				keyAction("app.agents.back", "back to chat", { primaryOnly: true }),
 			],
 			width,
@@ -495,9 +580,12 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 	private transcriptComponents: Component[] = [];
 	private readonly fallbackTui = { requestRender: () => {} } as TUI;
 	private toolsExpanded = false;
+	private killConfirmExpiresAt = 0;
+	private killConfirmTimer: ReturnType<typeof setTimeout> | undefined;
 
 	onCancel?: () => void;
 	onToggleToolsExpanded?: () => void;
+	onKill?: (nodeId: string) => void;
 
 	constructor(
 		_getViewportHeight: () => number = () => 0,
@@ -507,6 +595,9 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 	}
 
 	setNode(node: ChildAgentInspectorNode | undefined): void {
+		if (node?.id !== this.node?.id) {
+			this.clearKillConfirmation({ render: false });
+		}
 		this.node = node;
 		this.toolsExpanded = this.options.getToolsExpanded?.() ?? this.toolsExpanded;
 		this.rebuildTranscriptComponents();
@@ -541,13 +632,72 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 
 	handleInput(data: string): void {
 		const kb = getKeybindings();
+		// Any input other than the kill key disarms the pending confirmation,
+		// matching the agents view delete flow.
+		if (!kb.matches(data, "app.agents.delete")) {
+			this.clearKillConfirmation({ render: false });
+		}
 		if (kb.matches(data, "app.tools.expand")) {
 			this.onToggleToolsExpanded?.();
+			return;
+		}
+		if (kb.matches(data, "app.agents.delete")) {
+			this.handleKillKey();
 			return;
 		}
 		if (kb.matches(data, "app.agents.back")) {
 			this.onCancel?.();
 		}
+	}
+
+	private handleKillKey(): void {
+		const node = this.node;
+		if (!node || !isKillableChildAgentStatus(node.status)) {
+			this.clearKillConfirmation({ render: false });
+			return;
+		}
+		if (this.isKillConfirmationVisible()) {
+			this.clearKillConfirmation({ render: false });
+			this.onKill?.(node.id);
+			return;
+		}
+		this.showKillConfirmation();
+	}
+
+	private showKillConfirmation(): void {
+		if (this.killConfirmTimer) {
+			clearTimeout(this.killConfirmTimer);
+		}
+		this.killConfirmExpiresAt = Date.now() + KILL_CONFIRM_DURATION_MS;
+		this.killConfirmTimer = setTimeout(() => {
+			this.killConfirmTimer = undefined;
+			this.killConfirmExpiresAt = 0;
+			this.requestRender();
+		}, KILL_CONFIRM_DURATION_MS);
+		this.killConfirmTimer.unref?.();
+		this.requestRender();
+	}
+
+	private clearKillConfirmation(options: { render?: boolean } = {}): void {
+		if (!this.killConfirmTimer && this.killConfirmExpiresAt === 0) {
+			return;
+		}
+		if (this.killConfirmTimer) {
+			clearTimeout(this.killConfirmTimer);
+			this.killConfirmTimer = undefined;
+		}
+		this.killConfirmExpiresAt = 0;
+		if (options.render !== false) {
+			this.requestRender();
+		}
+	}
+
+	private isKillConfirmationVisible(): boolean {
+		return this.killConfirmExpiresAt > Date.now();
+	}
+
+	private requestRender(): void {
+		(this.options.ui ?? this.fallbackTui).requestRender();
 	}
 
 	private renderDetail(width: number): DetailSections {
@@ -681,7 +831,16 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 
 	private detailHintLine(width: number): string {
 		const expandAction = keyAction("app.tools.expand", this.toolsExpanded ? "to collapse" : "to expand");
-		return hintLine([keyAction("app.agents.back", "back to subagents", { primaryOnly: true }), expandAction], width);
+		const killable = this.node !== undefined && isKillableChildAgentStatus(this.node.status);
+		const stopAction = !killable
+			? undefined
+			: this.isKillConfirmationVisible()
+				? theme.fg("error", `${keyText("app.agents.delete", { primaryOnly: true }).trim()} again to stop`)
+				: keyAction("app.agents.delete", "stop", { primaryOnly: true });
+		return hintLine(
+			[keyAction("app.agents.back", "back to subagents", { primaryOnly: true }), expandAction, stopAction],
+			width,
+		);
 	}
 
 	private statusLabel(status: ChildAgentStatus): string {
