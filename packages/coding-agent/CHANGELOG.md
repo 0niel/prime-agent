@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-11
+
 ### Breaking Changes
 
 - Changed `InteractiveMode` construction to require an `AgentConnection` and explicit UI services or local session host.
