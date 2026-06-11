@@ -167,6 +167,13 @@ export class LoginDialogComponent extends Container implements Focusable {
 		this.contentContainer.addChild(new Text(theme.fg("muted", keyHint("tui.select.cancel", "cancel")), 0, 0));
 		this.tui.requestRender();
 
+		return this.waitForInput();
+	}
+
+	/**
+	 * Wait for the next submission of the already-visible input.
+	 */
+	waitForInput(): Promise<string> {
 		return new Promise((resolve, reject) => {
 			this.inputResolver = resolve;
 			this.inputRejecter = reject;
@@ -194,10 +201,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 		this.input.setValue("");
 		this.tui.requestRender();
 
-		return new Promise((resolve, reject) => {
-			this.inputResolver = resolve;
-			this.inputRejecter = reject;
-		});
+		return this.waitForInput();
 	}
 
 	/**

@@ -118,6 +118,30 @@ describe("LoginDialogComponent", () => {
 		}
 	});
 
+	it("cancels the prompt with esc and ctrl+c", async () => {
+		for (const key of ["\x1b", "\x03"]) {
+			const dialog = new LoginDialogComponent(createFakeTui(), "prime-inference", () => {}, "Prime Inference");
+			const prompt = dialog.showPrompt("Enter API key:");
+			dialog.handleInput(key);
+			await expect(prompt).rejects.toThrow("Login cancelled");
+		}
+	});
+
+	it("re-arms manual input after an empty submission", async () => {
+		const dialog = new LoginDialogComponent(createFakeTui(), "prime-inference", () => {}, "Prime Inference");
+		dialog.showAuth("https://example.com/challenge", "Code: abc-123");
+
+		const first = dialog.showManualInput("Or paste an API key below:");
+		dialog.handleInput("\r");
+		await expect(first).resolves.toBe("");
+
+		const second = dialog.waitForInput();
+		dialog.handleInput("p");
+		dialog.handleInput("k");
+		dialog.handleInput("\r");
+		await expect(second).resolves.toBe("pk");
+	});
+
 	it("renders API key prompts without shell input markers", () => {
 		const dialog = new LoginDialogComponent(createFakeTui(), "openai", () => {}, "OpenAI");
 

@@ -32,9 +32,9 @@ function formatKeyPart(part: string, platform: NodeJS.Platform): string {
 	const normalized = normalizeKeyPart(part);
 	const arrow = formatArrowKey(normalized);
 	if (arrow) return arrow;
-	if (platform === "darwin") {
-		if (normalized === "ctrl") return "Cmd";
-		if (normalized === "alt") return "Option";
+	// Terminals send the literal Control key on macOS, so never label it Cmd.
+	if (platform === "darwin" && normalized === "alt") {
+		return "Option";
 	}
 	return normalized.charAt(0).toUpperCase() + normalized.slice(1);
 }

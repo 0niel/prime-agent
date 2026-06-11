@@ -2,10 +2,10 @@ import { describe, expect, it } from "vitest";
 import { formatKeyText } from "../src/modes/interactive/components/keybinding-hints.js";
 
 describe("keybinding hint formatting", () => {
-	it("uses macOS modifier names on darwin", () => {
-		expect(formatKeyText("ctrl+p", "darwin")).toBe("Cmd+P");
+	it("uses macOS modifier names on darwin but keeps Ctrl literal", () => {
+		expect(formatKeyText("ctrl+p", "darwin")).toBe("Ctrl+P");
 		expect(formatKeyText("alt+enter", "darwin")).toBe("Option+Enter");
-		expect(formatKeyText("shift+ctrl+p/alt+up", "darwin")).toBe("Shift+Cmd+P/Option+↑");
+		expect(formatKeyText("shift+ctrl+p/alt+up", "darwin")).toBe("Shift+Ctrl+P/Option+↑");
 	});
 
 	it("keeps canonical modifier names on linux", () => {

@@ -6066,7 +6066,7 @@ export class InteractiveMode {
 					if (providerOption.authType === "oauth") {
 						resolve(await this.showLoginDialog(providerOption.id, providerOption.name));
 					} else if (providerOption.id === PRIME_INFERENCE_PROVIDER_ID) {
-						resolve(await this.showPrimeInferenceApiKeyLoginDialog());
+						resolve(await this.showPrimeInferenceLoginDialog());
 					} else if (providerOption.id === BEDROCK_PROVIDER_ID) {
 						resolve(await this.showBedrockSetupDialog(providerOption.id, providerOption.name));
 					} else {
@@ -6307,6 +6307,30 @@ export class InteractiveMode {
 		}
 	}
 
+	private async completePrimeInferenceLogin(
+		apiKey: string,
+		dialog: LoginDialogComponent,
+		closeDialog: () => void,
+	): Promise<AuthenticationResult> {
+		const previousPrimeCredential = this.modelRegistry.authStorage.get(PRIME_INFERENCE_PROVIDER_ID);
+		const previousPrimeTeam =
+			previousPrimeCredential?.type === "api_key" ? previousPrimeCredential.primeTeam : undefined;
+		this.modelRegistry.authStorage.set(PRIME_INFERENCE_PROVIDER_ID, {
+			type: "api_key",
+			key: apiKey,
+			...(previousPrimeTeam !== undefined ? { primeTeam: previousPrimeTeam } : {}),
+		});
+		const teamStatus = await this.selectPrimeInferenceTeam(apiKey, dialog);
+
+		closeDialog();
+		return await this.completeProviderAuthentication(
+			PRIME_INFERENCE_PROVIDER_ID,
+			PRIME_INFERENCE_PROVIDER_NAME,
+			"api_key",
+			teamStatus,
+		);
+	}
+
 	private async showPrimeInferenceLoginDialog(): Promise<AuthenticationResult> {
 		const dialog = new LoginDialogComponent(
 			this.ui,
@@ -6324,40 +6348,64 @@ export class InteractiveMode {
 			this.ui.requestRender();
 		};
 
+		// The browser challenge gets its own controller so a manually pasted key
+		// can stop the polling without tearing down the dialog.
+		const browserAbort = new AbortController();
+		const onDialogAbort = () => browserAbort.abort();
+		dialog.signal.addEventListener("abort", onDialogAbort, { once: true });
+
+		let resolveManualKey: (apiKey: string) => void = () => {};
+		const manualKeyEntry = new Promise<{ apiKey: string; source: "manual" }>((resolve) => {
+			resolveManualKey = (apiKey) => resolve({ apiKey, source: "manual" });
+		});
+
 		try {
-			const result = await loginPrimeInference({
+			const browserLogin = loginPrimeInference({
 				onAuth: (info) => {
 					dialog.showAuth(info.url, info.instructions);
-					dialog.showWaiting("Waiting for browser authentication...");
+					void (async () => {
+						let value = (
+							await dialog.showManualInput("Complete the sign-in in your browser, or paste an API key below:")
+						).trim();
+						while (!value) {
+							value = (await dialog.waitForInput()).trim();
+						}
+						resolveManualKey(value);
+					})().catch(() => {
+						// Cancellation surfaces through the dialog signal.
+					});
 				},
 				onProgress: (message) => {
 					dialog.showProgress(message);
 				},
-				signal: dialog.signal,
+				signal: browserAbort.signal,
 			});
+			// Promise.race observes the rejection below, but keep a dedicated handler
+			// so an aborted browser flow can never surface as an unhandled rejection.
+			browserLogin.catch(() => {});
 
+			const result = await Promise.race([browserLogin, manualKeyEntry]);
 			if (dialog.signal.aborted) {
 				closeDialog();
 				return { status: "cancelled" };
 			}
 
-			const previousPrimeCredential = this.modelRegistry.authStorage.get(PRIME_INFERENCE_PROVIDER_ID);
-			const previousPrimeTeam =
-				previousPrimeCredential?.type === "api_key" ? previousPrimeCredential.primeTeam : undefined;
-			this.modelRegistry.authStorage.set(PRIME_INFERENCE_PROVIDER_ID, {
-				type: "api_key",
-				key: result.apiKey,
-				...(previousPrimeTeam !== undefined ? { primeTeam: previousPrimeTeam } : {}),
-			});
-			const teamStatus = await this.selectPrimeInferenceTeam(result.apiKey, dialog);
+			if (result.source === "manual") {
+				browserAbort.abort();
+				dialog.showProgress("Checking Prime Inference access...");
+				const config = loadPrimeCliConfig();
+				const access = await checkPrimeInferenceAccess(result.apiKey, config.baseUrl, { signal: dialog.signal });
+				if (dialog.signal.aborted) {
+					closeDialog();
+					return { status: "cancelled" };
+				}
+				if (!access.ok) {
+					const status = access.status === undefined ? "" : `HTTP ${access.status}: `;
+					throw new Error(`Prime API key does not have Prime Inference access (${status}${access.message})`);
+				}
+			}
 
-			closeDialog();
-			return await this.completeProviderAuthentication(
-				PRIME_INFERENCE_PROVIDER_ID,
-				PRIME_INFERENCE_PROVIDER_NAME,
-				"api_key",
-				teamStatus,
-			);
+			return await this.completePrimeInferenceLogin(result.apiKey, dialog, closeDialog);
 		} catch (error: unknown) {
 			closeDialog();
 			const errorMsg = error instanceof Error ? error.message : String(error);
@@ -6366,69 +6414,8 @@ export class InteractiveMode {
 				return { status: "failed" };
 			}
 			return { status: "cancelled" };
-		}
-	}
-
-	private async showPrimeInferenceApiKeyLoginDialog(): Promise<AuthenticationResult> {
-		const dialog = new LoginDialogComponent(
-			this.ui,
-			PRIME_INFERENCE_PROVIDER_ID,
-			(_success, _message) => {
-				// Completion handled below
-			},
-			PRIME_INFERENCE_PROVIDER_NAME,
-		);
-
-		const handle = this.showFullPaneOverlay(dialog, 88);
-
-		const closeDialog = () => {
-			handle.hide();
-			this.ui.requestRender();
-		};
-
-		try {
-			const apiKey = (await dialog.showPrompt("Enter API key:")).trim();
-			if (!apiKey) {
-				throw new Error("API key cannot be empty.");
-			}
-
-			dialog.showProgress("Checking Prime Inference access...");
-			const config = loadPrimeCliConfig();
-			const access = await checkPrimeInferenceAccess(apiKey, config.baseUrl, { signal: dialog.signal });
-			if (dialog.signal.aborted) {
-				closeDialog();
-				return { status: "cancelled" };
-			}
-			if (!access.ok) {
-				const status = access.status === undefined ? "" : `HTTP ${access.status}: `;
-				throw new Error(`Prime API key does not have Prime Inference access (${status}${access.message})`);
-			}
-
-			const previousPrimeCredential = this.modelRegistry.authStorage.get(PRIME_INFERENCE_PROVIDER_ID);
-			const previousPrimeTeam =
-				previousPrimeCredential?.type === "api_key" ? previousPrimeCredential.primeTeam : undefined;
-			this.modelRegistry.authStorage.set(PRIME_INFERENCE_PROVIDER_ID, {
-				type: "api_key",
-				key: apiKey,
-				...(previousPrimeTeam !== undefined ? { primeTeam: previousPrimeTeam } : {}),
-			});
-			const teamStatus = await this.selectPrimeInferenceTeam(apiKey, dialog);
-
-			closeDialog();
-			return await this.completeProviderAuthentication(
-				PRIME_INFERENCE_PROVIDER_ID,
-				PRIME_INFERENCE_PROVIDER_NAME,
-				"api_key",
-				teamStatus,
-			);
-		} catch (error: unknown) {
-			closeDialog();
-			const errorMsg = error instanceof Error ? error.message : String(error);
-			if (errorMsg !== "Login cancelled") {
-				this.showError(`Failed to save API key for ${PRIME_INFERENCE_PROVIDER_NAME}: ${errorMsg}`);
-				return { status: "failed" };
-			}
-			return { status: "cancelled" };
+		} finally {
+			dialog.signal.removeEventListener("abort", onDialogAbort);
 		}
 	}
 
