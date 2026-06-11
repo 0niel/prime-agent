@@ -6354,37 +6354,60 @@ export class InteractiveMode {
 		const onDialogAbort = () => browserAbort.abort();
 		dialog.signal.addEventListener("abort", onDialogAbort, { once: true });
 
-		let resolveManualKey: (apiKey: string) => void = () => {};
+		let manualInputArmed = false;
+		let resolveManualKey: (entry: { apiKey: string; source: "manual" }) => void = () => {};
 		const manualKeyEntry = new Promise<{ apiKey: string; source: "manual" }>((resolve) => {
-			resolveManualKey = (apiKey) => resolve({ apiKey, source: "manual" });
+			resolveManualKey = resolve;
 		});
+		const armManualInput = (prompt: string): void => {
+			manualInputArmed = true;
+			void (async () => {
+				let value = (await dialog.showManualInput(prompt)).trim();
+				while (!value) {
+					value = (await dialog.waitForInput()).trim();
+				}
+				resolveManualKey({ apiKey: value, source: "manual" });
+			})().catch(() => {
+				// Cancellation surfaces through the dialog signal.
+			});
+		};
 
 		try {
 			const browserLogin = loginPrimeInference({
 				onAuth: (info) => {
 					dialog.showAuth(info.url, info.instructions);
-					void (async () => {
-						let value = (
-							await dialog.showManualInput("Complete the sign-in in your browser, or paste an API key below:")
-						).trim();
-						while (!value) {
-							value = (await dialog.waitForInput()).trim();
-						}
-						resolveManualKey(value);
-					})().catch(() => {
-						// Cancellation surfaces through the dialog signal.
-					});
+					armManualInput("Complete the sign-in in your browser, or paste an API key below:");
 				},
 				onProgress: (message) => {
 					dialog.showProgress(message);
 				},
 				signal: browserAbort.signal,
 			});
-			// Promise.race observes the rejection below, but keep a dedicated handler
-			// so an aborted browser flow can never surface as an unhandled rejection.
-			browserLogin.catch(() => {});
+			// When the browser challenge cannot start or breaks down, keep the dialog
+			// open and fall back to plain API key entry instead of failing outright.
+			const browserLoginOrFallback = browserLogin.catch((error: unknown) => {
+				if (browserAbort.signal.aborted) {
+					throw error;
+				}
+				const errorMsg = error instanceof Error ? error.message : String(error);
+				dialog.showProgress(`Browser sign-in unavailable (${errorMsg}).`);
+				if (!manualInputArmed) {
+					armManualInput("Paste a Prime API key below:");
+				}
+				return manualKeyEntry;
+			});
+			// Once the browser flow has settled into manual fallback, nothing above
+			// rejects on cancel anymore, so the dialog signal must end the race too.
+			const dialogCancelled = new Promise<never>((_, reject) => {
+				dialog.signal.addEventListener("abort", () => reject(new Error("Login cancelled")), { once: true });
+			});
+			// Promise.race observes the rejections below, but keep dedicated handlers
+			// so neither an aborted browser flow nor a cancelled dialog can surface
+			// as an unhandled rejection.
+			browserLoginOrFallback.catch(() => {});
+			dialogCancelled.catch(() => {});
 
-			const result = await Promise.race([browserLogin, manualKeyEntry]);
+			const result = await Promise.race([browserLoginOrFallback, manualKeyEntry, dialogCancelled]);
 			if (dialog.signal.aborted) {
 				closeDialog();
 				return { status: "cancelled" };
@@ -6409,7 +6432,7 @@ export class InteractiveMode {
 		} catch (error: unknown) {
 			closeDialog();
 			const errorMsg = error instanceof Error ? error.message : String(error);
-			if (errorMsg !== "Login cancelled") {
+			if (!dialog.signal.aborted && errorMsg !== "Login cancelled") {
 				this.showError(`Failed to login to ${PRIME_INFERENCE_PROVIDER_NAME}: ${errorMsg}`);
 				return { status: "failed" };
 			}
