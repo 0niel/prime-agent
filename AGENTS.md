@@ -32,6 +32,12 @@
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` and name them `<issue-number>-<short-slug>.test.ts`.
 - NEVER commit unless user asks
 
+## Dependencies
+
+- A 7-day minimum release age applies to all dependency updates: `.npmrc` sets `min-release-age=7` and `.github/dependabot.yml` uses a matching `cooldown`. Never bypass it for routine updates.
+- Enforcement requires npm >= 11.10; older npm silently ignores the setting, so use a current npm when updating dependencies.
+- For an urgent security patch younger than 7 days, override explicitly: `npm install --min-release-age=0 <pkg>`.
+
 ## GitHub Workflow
 
 When creating issues:
