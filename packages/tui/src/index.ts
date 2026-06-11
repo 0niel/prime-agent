@@ -57,6 +57,8 @@ export {
 	parseKey,
 	setKittyProtocolActive,
 } from "./keys.js";
+// LaTeX math to Unicode conversion
+export { latexToUnicode } from "./latex.js";
 // Render caching
 export { VersionedRenderCache } from "./render-cache.js";
 // Input buffering for batch splitting

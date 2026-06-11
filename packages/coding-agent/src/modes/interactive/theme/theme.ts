@@ -1201,6 +1201,8 @@ export function getMarkdownTheme(): MarkdownTheme {
 		italic: (text: string) => theme.italic(text),
 		underline: (text: string) => theme.underline(text),
 		strikethrough: (text: string) => chalk.strikethrough(text),
+		math: (text: string) => theme.fg("mdCode", text),
+		mathBlock: (text: string) => theme.fg("mdCodeBlock", text),
 		highlightCode: (code: string, lang?: string): string[] => {
 			// The highlighter loads lazily; until then render the block unhighlighted.
 			const highlighter = codeHighlighter;
