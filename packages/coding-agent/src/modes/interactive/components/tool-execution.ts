@@ -1,5 +1,5 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { Box, type Component, Container, getCapabilities, Image, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
+import { type Component, Container, getCapabilities, Image, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
 import type { ToolDefinition, ToolRenderContext, ToolRenderResultOptions } from "../../../core/extensions/types.js";
 import { createAllToolDefinitions, type ToolName } from "../../../core/tools/index.js";
 import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.js";
@@ -7,6 +7,7 @@ import { convertToPng } from "../../../utils/image-convert.js";
 import type { AgentConnectionToolDefinition } from "../../agent-connection/index.js";
 import { type Theme, theme } from "../theme/theme.js";
 import { getIpythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.js";
+import { ToolPanel } from "./tool-panel.js";
 
 export interface ToolExecutionOptions {
 	showImages?: boolean;
@@ -26,8 +27,7 @@ export interface ToolExecutionRendererDefinition {
 export type ToolExecutionDefinition = AgentConnectionToolDefinition & Partial<ToolExecutionRendererDefinition>;
 
 export class ToolExecutionComponent extends Container {
-	private contentBox: Box;
-	private contentText: Text;
+	private contentPanel: ToolPanel;
 	private selfRenderContainer: Container;
 	private callRendererComponent?: Component;
 	private resultRendererComponent?: Component;
@@ -78,17 +78,17 @@ export class ToolExecutionComponent extends Container {
 
 		this.addChild(new Spacer(1));
 
-		// Always create all shell variants. contentBox is used for default renderer-based composition.
-		// selfRenderContainer is used when the tool renders its own framing.
-		// contentText is reserved for generic fallback rendering when no tool definition exists.
-		this.contentBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
-		this.contentText = new Text("", 1, 1, (text: string) => theme.bg("toolPendingBg", text));
+		// Always create both shell variants. contentPanel is the tool panel used
+		// for default renderer-based composition (and the generic fallback when no
+		// tool definition exists). selfRenderContainer is used when the tool
+		// renders its own framing.
+		this.contentPanel = new ToolPanel();
 		this.selfRenderContainer = new Container();
 
-		if (this.hasRendererDefinition()) {
-			this.addChild(this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox);
+		if (this.hasRendererDefinition() && this.getRenderShell() === "self") {
+			this.addChild(this.selfRenderContainer);
 		} else {
-			this.addChild(this.contentText);
+			this.addChild(this.contentPanel);
 		}
 
 		this.updateDisplay();
@@ -249,20 +249,10 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private updateDisplay(): void {
-		const bgFn = this.isPartial
-			? (text: string) => theme.bg("toolPendingBg", text)
-			: this.result?.isError
-				? (text: string) => theme.bg("toolErrorBg", text)
-				: (text: string) => theme.bg("toolSuccessBg", text);
-
 		let hasContent = false;
 		this.hideComponent = false;
-		if (this.hasRendererDefinition()) {
-			const renderContainer = this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox;
-			if (renderContainer instanceof Box) {
-				renderContainer.setBgFn(bgFn);
-			}
-			renderContainer.clear();
+		if (this.hasRendererDefinition() && this.getRenderShell() === "self") {
+			this.selfRenderContainer.clear();
 
 			if (this.shouldUseIpythonRenderer()) {
 				const state = {
@@ -281,59 +271,24 @@ export class ToolExecutionComponent extends Container {
 				} else {
 					this.ipythonCellComponent.update(state);
 				}
-				renderContainer.addChild(this.ipythonCellComponent);
+				this.selfRenderContainer.addChild(this.ipythonCellComponent);
 				hasContent = true;
 			} else {
-				const callRenderer = this.getCallRenderer();
-				if (!callRenderer) {
-					renderContainer.addChild(this.createCallFallback());
-					hasContent = true;
-				} else {
-					try {
-						const component = callRenderer(this.args, theme, this.getRenderContext(this.callRendererComponent));
-						this.callRendererComponent = component;
-						renderContainer.addChild(component);
-						hasContent = true;
-					} catch {
-						this.callRendererComponent = undefined;
-						renderContainer.addChild(this.createCallFallback());
-						hasContent = true;
-					}
-				}
-
-				if (this.result) {
-					const resultRenderer = this.getResultRenderer();
-					if (!resultRenderer) {
-						const component = this.createResultFallback();
-						if (component) {
-							renderContainer.addChild(component);
-							hasContent = true;
-						}
-					} else {
-						try {
-							const component = resultRenderer(
-								{ content: this.result.content as any, details: this.result.details },
-								{ expanded: this.expanded, isPartial: this.isPartial },
-								theme,
-								this.getRenderContext(this.resultRendererComponent),
-							);
-							this.resultRendererComponent = component;
-							renderContainer.addChild(component);
-							hasContent = true;
-						} catch {
-							this.resultRendererComponent = undefined;
-							const component = this.createResultFallback();
-							if (component) {
-								renderContainer.addChild(component);
-								hasContent = true;
-							}
-						}
-					}
-				}
+				hasContent = this.mountRenderers(this.selfRenderContainer, true);
 			}
 		} else {
-			this.contentText.setCustomBgFn(bgFn);
-			this.contentText.setText(this.formatToolExecution());
+			// Default shell: tool panel with a `label · status` header so the block
+			// is self-identifying. The header replaces the bold-tool-name fallback.
+			this.contentPanel.setHeader(this.panelHeader());
+			this.contentPanel.clear();
+			if (this.hasRendererDefinition()) {
+				this.mountRenderers(this.contentPanel, false);
+			} else {
+				const fallbackText = this.formatToolExecution();
+				if (fallbackText) {
+					this.contentPanel.addChild(new Text(fallbackText, 0, 0));
+				}
+			}
 			hasContent = true;
 		}
 
@@ -377,20 +332,100 @@ export class ToolExecutionComponent extends Container {
 		}
 	}
 
+	/**
+	 * Mount the call/result renderer components into the given shell container.
+	 * `useFallbacks` keeps the bold-tool-name call fallback for self-rendering
+	 * tools; the default panel shell already names the tool in its header.
+	 */
+	private mountRenderers(container: Container | ToolPanel, useFallbacks: boolean): boolean {
+		let hasContent = false;
+
+		const callRenderer = this.getCallRenderer();
+		if (!callRenderer) {
+			if (useFallbacks) {
+				container.addChild(this.createCallFallback());
+				hasContent = true;
+			}
+		} else {
+			try {
+				const component = callRenderer(this.args, theme, this.getRenderContext(this.callRendererComponent));
+				this.callRendererComponent = component;
+				container.addChild(component);
+				hasContent = true;
+			} catch {
+				this.callRendererComponent = undefined;
+				if (useFallbacks) {
+					container.addChild(this.createCallFallback());
+					hasContent = true;
+				}
+			}
+		}
+
+		if (this.result) {
+			const resultRenderer = this.getResultRenderer();
+			if (!resultRenderer) {
+				const component = this.createResultFallback();
+				if (component) {
+					container.addChild(component);
+					hasContent = true;
+				}
+			} else {
+				try {
+					const component = resultRenderer(
+						{ content: this.result.content as any, details: this.result.details },
+						{ expanded: this.expanded, isPartial: this.isPartial },
+						theme,
+						this.getRenderContext(this.resultRendererComponent),
+					);
+					this.resultRendererComponent = component;
+					container.addChild(component);
+					hasContent = true;
+				} catch {
+					this.resultRendererComponent = undefined;
+					const component = this.createResultFallback();
+					if (component) {
+						container.addChild(component);
+						hasContent = true;
+					}
+				}
+			}
+		}
+
+		return hasContent;
+	}
+
+	private panelHeader(): string {
+		const label = this.toolDefinition?.label ?? this.builtInToolDefinition?.label ?? this.toolName;
+		return `${theme.fg("muted", label)}${theme.fg("dim", " · ")}${this.panelStatus()}`;
+	}
+
+	private panelStatus(): string {
+		if (this.result && !this.isPartial) {
+			return this.result.isError ? theme.fg("error", "error") : theme.fg("success", "done");
+		}
+		if (this.result?.isError) {
+			return theme.fg("error", "error");
+		}
+		if (this.executionStarted) {
+			return theme.fg("bashMode", "running");
+		}
+		return theme.fg("muted", "queued");
+	}
+
 	private getTextOutput(): string {
 		return getRenderedTextOutput(this.result, this.showImages);
 	}
 
 	private formatToolExecution(): string {
-		let text = theme.fg("toolTitle", theme.bold(this.toolName));
+		const parts: string[] = [];
 		const content = JSON.stringify(this.args, null, 2);
 		if (content) {
-			text += `\n\n${content}`;
+			parts.push(content);
 		}
 		const output = this.getTextOutput();
 		if (output) {
-			text += `\n${output}`;
+			parts.push(output);
 		}
-		return text;
+		return parts.join("\n\n");
 	}
 }

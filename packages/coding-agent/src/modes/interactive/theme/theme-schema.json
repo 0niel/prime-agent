@@ -55,6 +55,7 @@
 				"toolPendingBg",
 				"toolSuccessBg",
 				"toolErrorBg",
+				"toolPanelBg",
 				"toolTitle",
 				"toolOutput",
 				"mdHeading",
@@ -167,6 +168,10 @@
 				"toolErrorBg": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Tool execution box (error state)"
+				},
+				"toolPanelBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Tool panel background (ipython cells and tool executions)"
 				},
 				"toolTitle": {
 					"$ref": "#/$defs/colorValue",

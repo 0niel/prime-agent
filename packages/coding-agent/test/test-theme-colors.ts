@@ -225,6 +225,7 @@ function cmdTheme(themeName: string): void {
 	console.log("toolPendingBg:", theme.bg("toolPendingBg", " Sample "));
 	console.log("toolSuccessBg:", theme.bg("toolSuccessBg", " Sample "));
 	console.log("toolErrorBg:", theme.bg("toolErrorBg", " Sample "));
+	console.log("toolPanelBg:", theme.bg("toolPanelBg", " Sample "));
 	console.log();
 }
 

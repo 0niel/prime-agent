@@ -48,6 +48,7 @@ export {
 export { ThemeSelectorComponent } from "./theme-selector.js";
 export { ThinkingSelectorComponent } from "./thinking-selector.js";
 export { ToolExecutionComponent, type ToolExecutionOptions } from "./tool-execution.js";
+export { TOOL_PANEL_PADDING_X, ToolPanel, toolPanelContentWidth, toolPanelLine } from "./tool-panel.js";
 export { TreeSelectorComponent } from "./tree-selector.js";
 export { UserMessageComponent } from "./user-message.js";
 export { UserMessageSelectorComponent } from "./user-message-selector.js";

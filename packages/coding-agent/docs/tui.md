@@ -420,7 +420,7 @@ renderResult(result, options, theme, context) {
 
 **Background colors** (`theme.bg(color, text)`):
 
-`selectedBg`, `userMessageBg`, `customMessageBg`, `toolPendingBg`, `toolSuccessBg`, `toolErrorBg`
+`selectedBg`, `userMessageBg`, `customMessageBg`, `toolPendingBg`, `toolSuccessBg`, `toolErrorBg`, `toolPanelBg`
 
 **For Markdown**, use `getMarkdownTheme()`:
 

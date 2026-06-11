@@ -274,6 +274,56 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).toContain("arg:bar");
 	});
 
+	test("renders default-shell tools in a rail panel with a labeled status header", () => {
+		const component = new ToolExecutionComponent(
+			"bash",
+			"tool-7",
+			{ command: "echo hello" },
+			{},
+			undefined,
+			createFakeTui(),
+			process.cwd(),
+		);
+		expect(stripAnsi(component.render(100).join("\n"))).toContain("bash · queued");
+
+		component.markExecutionStarted();
+		expect(stripAnsi(component.render(100).join("\n"))).toContain("bash · running");
+
+		component.updateResult({ content: [{ type: "text", text: "hello" }], details: undefined, isError: false }, false);
+		const lines = component.render(100);
+		const rendered = stripAnsi(lines.join("\n"));
+		expect(rendered).toContain("bash · done");
+		expect(rendered).toContain("$ echo hello");
+		expect(rendered).toContain("hello");
+
+		// Panel lines carry the neutral panel background across the full width.
+		const panelLines = lines.filter((line) => line.includes("\x1b[48;"));
+		expect(panelLines.length).toBeGreaterThan(0);
+		for (const line of panelLines) {
+			expect(line.startsWith("\x1b[48;")).toBe(true);
+			expect(line.endsWith("\x1b[49m")).toBe(true);
+		}
+	});
+
+	test("shows the error status in the rail panel header", () => {
+		const component = new ToolExecutionComponent(
+			"bash",
+			"tool-8",
+			{ command: "false" },
+			{},
+			undefined,
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.markExecutionStarted();
+		component.updateResult(
+			{ content: [{ type: "text", text: "Command exited with code 1" }], details: undefined, isError: true },
+			false,
+		);
+		const rendered = stripAnsi(component.render(100).join("\n"));
+		expect(rendered).toContain("bash · error");
+	});
+
 	test("falls back when custom renderers are absent", () => {
 		const toolDefinition: ToolDefinition = {
 			...createBaseToolDefinition(),

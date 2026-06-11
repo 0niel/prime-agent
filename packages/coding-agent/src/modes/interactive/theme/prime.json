@@ -46,6 +46,7 @@
 		"toolPendingBg": "toolPendingBg",
 		"toolSuccessBg": "toolSuccessBg",
 		"toolErrorBg": "toolErrorBg",
+		"toolPanelBg": "surface",
 		"toolTitle": "",
 		"toolOutput": "muted",
 		"mdHeading": "primarySoft",

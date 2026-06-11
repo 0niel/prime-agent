@@ -79,6 +79,7 @@ vim ~/.pi/agent/themes/my-theme.json
     "toolPendingBg": "#1e1e2e",
     "toolSuccessBg": "#1e2e1e",
     "toolErrorBg": "#2e1e1e",
+    "toolPanelBg": "#2d2d38",
     "toolTitle": "primary",
     "toolOutput": "",
     "mdHeading": "#ffaa00",
@@ -163,7 +164,7 @@ Every theme must define all 51 color tokens. There are no optional colors.
 | `text` | Default text (usually `""`) |
 | `thinkingText` | Thinking block text |
 
-### Backgrounds & Content (11 colors)
+### Backgrounds & Content (12 colors)
 
 | Token | Purpose |
 |-------|---------|
@@ -176,6 +177,7 @@ Every theme must define all 51 color tokens. There are no optional colors.
 | `toolPendingBg` | Tool box (pending) |
 | `toolSuccessBg` | Tool box (success) |
 | `toolErrorBg` | Tool box (error) |
+| `toolPanelBg` | Tool panel background |
 | `toolTitle` | Tool title |
 | `toolOutput` | Tool output text |
 

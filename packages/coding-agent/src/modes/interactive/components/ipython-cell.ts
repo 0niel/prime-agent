@@ -1,13 +1,8 @@
-import {
-	type Component,
-	truncateToWidth,
-	VersionedRenderCache,
-	visibleWidth,
-	wrapTextWithAnsi,
-} from "@earendil-works/pi-tui";
+import { type Component, VersionedRenderCache, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { highlightCode, theme } from "../theme/theme.js";
 import { normalizeErrorDetails, summarizeErrorDetails } from "./collapsible-error.js";
 import { keyHint } from "./keybinding-hints.js";
+import { toolPanelContentWidth, toolPanelLine } from "./tool-panel.js";
 
 export interface IPythonCellContentBlock {
 	type: string;
@@ -162,7 +157,6 @@ function formatIpythonErrorSummary(error: IpythonErrorDetails): string {
 }
 
 export class IPythonCellComponent implements Component {
-	private readonly paddingX = 2;
 	private readonly renderCache = new VersionedRenderCache();
 	private state: IPythonCellState;
 	private stateVersion = 0;
@@ -198,16 +192,19 @@ export class IPythonCellComponent implements Component {
 			return `${theme.fg("muted", label)} ${theme.fg("dim", "·")} ${keyHint("app.tools.expand", "to expand")}`;
 		};
 
-		lines.push(this.panelLine(this.header(details), safeWidth));
+		lines.push(toolPanelLine(this.header(details), safeWidth));
 		const hasCode = this.renderCode(lines, safeWidth, withExpandHint);
 		this.renderOutput(lines, safeWidth, details, hasCode, withExpandHint);
 		return this.renderCache.set(safeWidth, this.stateVersion, lines);
 	}
 
 	private header(details: IpythonDetails): string {
+		// Name the cell so the status reads as part of this tool call instead of
+		// a floating label between the surrounding blocks.
+		const isBashCell = CELL_MAGIC_PATTERN.test(this.state.code.split("\n")[0] ?? "");
 		const status = this.status(details);
 		const duration = formatDuration(details.durationMs);
-		const parts = [status.label];
+		const parts = [theme.fg("muted", isBashCell ? "bash" : "python"), status.label];
 		if (duration) {
 			parts.push(theme.fg("muted", duration));
 		}
@@ -410,24 +407,15 @@ export class IPythonCellComponent implements Component {
 	}
 
 	private addWrapped(lines: string[], prefix: string, text: string, width: number): void {
-		const contentWidth = Math.max(1, width - this.paddingX * 2);
-		const available = Math.max(1, contentWidth - visibleWidth(prefix));
+		const available = Math.max(1, toolPanelContentWidth(width) - visibleWidth(prefix));
 		const wrapped = wrapTextWithAnsi(text, available);
 		for (const [index, line] of (wrapped.length > 0 ? wrapped : [""]).entries()) {
 			const linePrefix = index === 0 ? prefix : " ".repeat(visibleWidth(prefix));
-			lines.push(this.panelLine(linePrefix + line, width));
+			lines.push(toolPanelLine(linePrefix + line, width));
 		}
 	}
 
 	private addBlank(lines: string[], width: number): void {
-		lines.push(this.panelLine("", width));
-	}
-
-	private panelLine(line: string, width: number): string {
-		const contentWidth = Math.max(1, width - this.paddingX * 2);
-		const truncated = truncateToWidth(line, contentWidth, "");
-		const paddedContent = truncated + " ".repeat(Math.max(0, contentWidth - visibleWidth(truncated)));
-		const rail = theme.bg("customMessageBg", " ");
-		return `${rail}${" ".repeat(this.paddingX - 1)}${paddedContent}${" ".repeat(this.paddingX)}`;
+		lines.push(toolPanelLine("", width));
 	}
 }

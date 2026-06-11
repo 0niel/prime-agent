@@ -39,6 +39,7 @@
 		"toolPendingBg": "toolPendingBg",
 		"toolSuccessBg": "toolSuccessBg",
 		"toolErrorBg": "toolErrorBg",
+		"toolPanelBg": "#ededf2",
 		"toolTitle": "",
 		"toolOutput": "mediumGray",
 

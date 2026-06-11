@@ -39,6 +39,7 @@
 		"toolPendingBg": "toolPendingBg",
 		"toolSuccessBg": "toolSuccessBg",
 		"toolErrorBg": "toolErrorBg",
+		"toolPanelBg": "#262630",
 		"toolTitle": "",
 		"toolOutput": "gray",
 		"mdHeading": "#f0c674",

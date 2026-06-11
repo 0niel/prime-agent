@@ -106,7 +106,7 @@ describe("marquee TUI components", () => {
 		const component = new IPythonCellComponent(state);
 
 		const collapsed = await renderInVirtualTerminal(component);
-		expect(collapsed).toContain("error · 1.2s");
+		expect(collapsed).toContain("bash · error · 1.2s");
 		expect(collapsed).not.toContain("ipython");
 		expect(collapsed).toContain("%%bash");
 		expect(collapsed).toContain("hi");
@@ -809,12 +809,13 @@ describe("marquee TUI components", () => {
 
 		const rawOutput = component.render(100).join("\n");
 		expect(rawOutput).toMatch(/\x1b\[48;(?:2|5);/);
-		const railLine = component.render(100).find((line) => line.includes("\x1b[48;")) ?? "";
-		const backgroundResetIndex = railLine.indexOf("\x1b[49m");
-		expect(backgroundResetIndex).toBeGreaterThan(0);
-		expect(backgroundResetIndex).toBeLessThan(32);
+		// The panel background spans the full line with the content padded inside.
+		const panelLine = component.render(100).find((line) => line.includes("\x1b[48;")) ?? "";
+		expect(panelLine.startsWith("\x1b[48;")).toBe(true);
+		expect(panelLine.endsWith("\x1b[49m")).toBe(true);
+		expect(visibleWidth(panelLine)).toBe(100);
 		const output = stripAnsi(rawOutput);
-		expect(output).toContain("done · 12ms");
+		expect(output).toContain("python · done · 12ms");
 		expect(output).not.toContain("ipython");
 		expect(output).toContain("print(55)");
 		expect(output).toContain("55");

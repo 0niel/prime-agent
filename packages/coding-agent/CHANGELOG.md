@@ -31,6 +31,7 @@
 
 ### Fixed
 
+- Fixed confusing transcript formatting around thinking blocks and tool calls: ipython cells and default-shell tools (bash and extension tools) now share one panel style with a subtle neutral background instead of a status-colored box or a left rail, and tool status headers name the tool (`python · done · 7ms`, `bash · running`) so they no longer read as floating labels for the preceding thinking block. Themes gain a required `toolPanelBg` color for the panel background.
 - Fixed `prime-agent` to detect a daemon left running by a previous version after self-update: the daemon now reports its app version on connect, and idle stale daemons are restarted automatically (daemons with active sessions are left running with a warning).
 - Fixed Agents View listing daemon-owned subagents as top-level selectable agents instead of nested child rows.
 - Fixed Agents View opening saved or stale sessions by creating a daemon runtime from the saved session file before attaching.
