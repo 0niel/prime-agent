@@ -2,13 +2,21 @@
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-06-12
+
 ### Added
 
 - Added a `/context` command showing a tree overview of the main agent and all sub-agents with per-agent tokens, cost, and context-window usage, plus session totals and a token/cost breakdown.
+- Added `/clear` as an alias for `/new`.
 
 ### Changed
 
 - Changed `/usage` to be an alias for the new `/context` command.
+
+### Fixed
+
+- Fixed the stale "no models available" warning appearing for sessions that already have a working model.
+- Fixed the `!` and `!!` bash shortcuts in interactive mode by running bash through the agent connection, restoring streaming output, history, and Ctrl+C abort for both in-process and daemon-attached clients.
 
 ## [0.1.2] - 2026-06-12
 
