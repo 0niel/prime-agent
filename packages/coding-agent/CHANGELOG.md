@@ -2,12 +2,19 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-06-12
+
+### Fixed
+
+- Fixed the model selector showing no models after logging in with Prime Inference during onboarding by reloading auth storage from disk when the model registry refreshes ([#151](https://github.com/PrimeIntellect-ai/prime-agent/issues/151)).
+
 ## [0.1.1] - 2026-06-11
 
 ### Fixed
 
 - Fixed first launch to run onboarding before opening the Agents View ([#147](https://github.com/PrimeIntellect-ai/prime-agent/issues/147)).
 - Fixed multiline status errors in Agents View to render as a single flattened line so they cannot overlap the input ([#146](https://github.com/PrimeIntellect-ai/prime-agent/issues/146)).
+- Fixed slash commands in the main Agents View ([#149](https://github.com/PrimeIntellect-ai/prime-agent/issues/149)).
 
 ## [0.1.0] - 2026-06-11
 
