@@ -36,6 +36,7 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "login", description: "Configure provider authentication" },
 	{ name: "logout", description: "Remove provider authentication" },
 	{ name: "new", description: "Start a new session" },
+	{ name: "clear", description: "Start a new session (alias for /new)" },
 	{
 		name: "compact",
 		description: "Compact the session context; optional instructions focus the summary",

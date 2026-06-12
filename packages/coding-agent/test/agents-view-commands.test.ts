@@ -38,7 +38,7 @@ describe("classifyAgentsViewCommand", () => {
 	});
 
 	test("other built-ins are session-only", () => {
-		for (const name of ["compact", "fork", "settings", "resume", "new", "export"]) {
+		for (const name of ["compact", "fork", "settings", "resume", "new", "clear", "export"]) {
 			expect(classifyAgentsViewCommand(name)).toBe("session-only");
 		}
 	});
