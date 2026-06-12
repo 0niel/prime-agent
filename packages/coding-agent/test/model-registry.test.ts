@@ -1121,6 +1121,28 @@ describe("ModelRegistry", () => {
 		});
 	});
 
+	describe("auth refresh across processes", () => {
+		test("refresh() picks up credentials written by another process", () => {
+			const savedEnvKey = process.env.PRIME_API_KEY;
+			delete process.env.PRIME_API_KEY;
+			try {
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+				expect(registry.getAvailable().some((m) => m.provider === "prime-inference")).toBe(false);
+
+				// Simulate the UI process saving a login while this registry lives in the daemon.
+				const otherProcessAuth = AuthStorage.create(join(tempDir, "auth.json"));
+				otherProcessAuth.set("prime-inference", { type: "api_key", key: "test-key" });
+
+				registry.refresh();
+				expect(registry.getAvailable().some((m) => m.provider === "prime-inference")).toBe(true);
+			} finally {
+				if (savedEnvKey !== undefined) {
+					process.env.PRIME_API_KEY = savedEnvKey;
+				}
+			}
+		});
+	});
+
 	describe("API key resolution", () => {
 		/** Create provider config with custom apiKey */
 		function providerWithApiKey(apiKey: string) {

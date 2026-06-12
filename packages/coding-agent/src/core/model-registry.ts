@@ -369,6 +369,10 @@ export class ModelRegistry {
 		this.modelRequestHeaders.clear();
 		this.loadError = undefined;
 
+		// Credentials may have been written by another process (e.g. the UI
+		// process saving a login while the session lives in the daemon).
+		this.authStorage.reload();
+
 		// Ensure dynamic API/OAuth registrations are rebuilt from current provider state.
 		resetApiProviders();
 		resetOAuthProviders();
