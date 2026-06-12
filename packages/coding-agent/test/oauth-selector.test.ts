@@ -4,11 +4,11 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../src/core/provider-display-names.js";
+import { isApiKeyLoginProvider } from "../src/modes/interactive/auth-flows.js";
 import {
 	compareAuthSelectorProviders,
 	OAuthSelectorComponent,
 } from "../src/modes/interactive/components/oauth-selector.js";
-import { isApiKeyLoginProvider } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 const originalOpenAiApiKey = process.env.OPENAI_API_KEY;

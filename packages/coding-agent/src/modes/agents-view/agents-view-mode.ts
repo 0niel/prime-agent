@@ -1,7 +1,10 @@
-import type { ImageContent } from "@earendil-works/pi-ai";
+import type { Api, ImageContent, Model } from "@earendil-works/pi-ai";
+import type { AutocompleteItem, OverlayHandle, SlashCommand } from "@earendil-works/pi-tui";
 import {
+	CombinedAutocompleteProvider,
 	type Component,
 	type Focusable,
+	fuzzyFilter,
 	ProcessTerminal,
 	setKeybindings,
 	TUI,
@@ -11,13 +14,17 @@ import {
 import { APP_TITLE, VERSION } from "../../config.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
+import { findExactModelReferenceMatch } from "../../core/model-resolver.js";
 import { SessionManager } from "../../core/session-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import { DaemonClient } from "../daemon/daemon-client.js";
 import { type DaemonCommand, type DaemonResponse, isUnknownDaemonCommandError } from "../daemon/daemon-protocol.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
+import { getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "../interactive/auth-flows.js";
+import { showFullPaneOverlay } from "../interactive/components/centered-overlay.js";
 import { CustomEditor } from "../interactive/components/custom-editor.js";
 import { keyText } from "../interactive/components/keybinding-hints.js";
+import { ModelSelectorComponent } from "../interactive/components/model-selector.js";
 import { BrandSplashHeader, InteractiveMode } from "../interactive/interactive-mode.js";
 import type { InteractiveModeUiServices } from "../interactive/interactive-mode-services.js";
 import {
@@ -28,6 +35,13 @@ import {
 	stopThemeWatcher,
 	theme,
 } from "../interactive/theme/theme.js";
+import {
+	AGENTS_VIEW_SLASH_COMMANDS,
+	type AgentsViewCommandName,
+	classifyAgentsViewCommand,
+	type ParsedSlashCommand,
+	parseSlashCommand,
+} from "./agents-view-commands.js";
 import {
 	type AgentsViewRow,
 	type AgentsViewSection,
@@ -243,8 +257,11 @@ class AgentsViewMode implements Component, Focusable {
 	private pendingKillSubagent: PendingKillSubagent | undefined;
 	private readonly inactiveAgentIdentities = new Set<string>();
 	private statusMessage: string | undefined;
+	private statusMessageTone: "muted" | "error" | "warning" = "muted";
+	private statusMessageSticky = false;
 	private statusMessageTimer: ReturnType<typeof setTimeout> | undefined;
 	private stopped = false;
+	private anthropicSubscriptionWarningShown = false;
 
 	constructor(
 		private readonly options: AgentsViewModeOptions,
@@ -266,6 +283,7 @@ class AgentsViewMode implements Component, Focusable {
 			placeholderColor: (text) => theme.fg("dim", text),
 		});
 		this.editor.focused = true;
+		this.editor.setAutocompleteProvider(this.createAutocompleteProvider());
 		this.editor.getHeaderLine = () => this.renderReplyHeaderLine();
 		this.editor.onSubmit = (value) => {
 			void this.submit(value);
@@ -333,6 +351,7 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	handleInput(data: string): void {
+		this.clearStickyStatusMessage();
 		if (this.keybindings.matches(data, "app.clear")) {
 			this.handleCtrlC();
 			return;
@@ -484,14 +503,21 @@ class AgentsViewMode implements Component, Focusable {
 		return this.deleteConfirmExpiresAt > Date.now();
 	}
 
-	private setStatusMessage(message: string | undefined, options: { render?: boolean } = {}): void {
+	private setStatusMessage(
+		message: string | undefined,
+		options: { render?: boolean; tone?: "muted" | "error" | "warning"; sticky?: boolean } = {},
+	): void {
 		const statusLine = message === undefined ? undefined : formatAgentsViewStatusLine(message);
 		if (this.statusMessageTimer) {
 			clearTimeout(this.statusMessageTimer);
 			this.statusMessageTimer = undefined;
 		}
 		this.statusMessage = statusLine;
-		if (statusLine) {
+		// Errors come both from explicit tones and from formatError-style messages.
+		this.statusMessageTone = options.tone ?? (statusLine?.startsWith("Failed") ? "error" : "muted");
+		// Sticky messages stay up until the next keypress instead of a timer.
+		this.statusMessageSticky = options.sticky === true && statusLine !== undefined;
+		if (statusLine && !this.statusMessageSticky) {
 			this.statusMessageTimer = setTimeout(() => {
 				this.statusMessageTimer = undefined;
 				if (this.statusMessage === statusLine) {
@@ -504,6 +530,16 @@ class AgentsViewMode implements Component, Focusable {
 		if (options.render !== false) {
 			this.ui.requestRender();
 		}
+	}
+
+	/** Sticky messages (e.g. billing warnings) stay until the user acknowledges them with any keypress. */
+	private clearStickyStatusMessage(): void {
+		if (!this.statusMessageSticky) {
+			return;
+		}
+		this.statusMessageSticky = false;
+		this.statusMessage = undefined;
+		this.ui.requestRender();
 	}
 
 	private moveSelection(delta: number): void {
@@ -581,12 +617,176 @@ class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 
+		// Only built-in interactive commands are intercepted here; unknown "/..."
+		// text still reaches the daemon session, which expands prompt templates,
+		// skills, and extension commands.
+		const command = parseSlashCommand(text);
+		if (command) {
+			const kind = classifyAgentsViewCommand(command.name);
+			if (kind === "agents-view") {
+				this.editor.setText("");
+				await this.runSlashCommand(command);
+				return;
+			}
+			if (kind === "session-only") {
+				this.editor.setText("");
+				this.setStatusMessage(
+					`/${command.name} is only available inside an agent session — press ${keyText("tui.select.confirm")} on an agent to open it`,
+				);
+				return;
+			}
+		}
+
 		this.editor.setText("");
 		if (this.replyActiveSessionId) {
 			await this.sendReply(this.replyActiveSessionId, text);
 			return;
 		}
 		await this.createAgentForPrompt(text);
+	}
+
+	private async runSlashCommand(command: ParsedSlashCommand): Promise<void> {
+		switch (command.name as AgentsViewCommandName) {
+			case "login":
+				await this.createAuthFlows().runLogin();
+				return;
+			case "logout":
+				await this.createAuthFlows().runLogout();
+				return;
+			case "model": {
+				const searchTerm = command.args || undefined;
+				if (searchTerm) {
+					// Mirror the in-session /model behavior: an exact provider/id or
+					// unique model id reference applies directly without the picker.
+					const match = findExactModelReferenceMatch(
+						searchTerm,
+						this.options.uiServices.modelRegistry.getAvailable(),
+					);
+					if (match) {
+						this.applyDefaultModel(match);
+						return;
+					}
+				}
+				await this.showModelSelector(searchTerm);
+				return;
+			}
+			case "quit":
+				this.finish({ type: "exit" });
+				return;
+			default: {
+				const _exhaustive: never = command.name as never;
+				return _exhaustive;
+			}
+		}
+	}
+
+	private createAuthFlows(): ProviderAuthFlows {
+		const modelRegistry = this.options.uiServices.modelRegistry;
+		return new ProviderAuthFlows({
+			ui: this.ui,
+			modelRegistry,
+			showStatus: (message) => this.setStatusMessage(message),
+			showError: (message) => this.setStatusMessage(message, { tone: "error" }),
+			getAvailableModels: async () => modelRegistry.getAvailable(),
+			onLoginCompleted: () => {
+				void this.maybeWarnAboutAnthropicSubscriptionAuth(this.getDefaultModelForNewAgents());
+			},
+		});
+	}
+
+	private async maybeWarnAboutAnthropicSubscriptionAuth(model: Model<Api> | undefined): Promise<void> {
+		if (this.options.uiServices.settingsManager.getWarnings().anthropicExtraUsage === false) {
+			return;
+		}
+		if (this.anthropicSubscriptionWarningShown) {
+			return;
+		}
+		const warning = await getAnthropicSubscriptionAuthWarning(this.options.uiServices.modelRegistry, model);
+		if (!warning) {
+			return;
+		}
+		this.anthropicSubscriptionWarningShown = true;
+		this.setStatusMessage(warning, { tone: "warning", sticky: true });
+	}
+
+	private showModelSelector(initialSearchInput?: string): Promise<void> {
+		const modelRegistry = this.options.uiServices.modelRegistry;
+		const availableModels = modelRegistry.getAvailable();
+		if (availableModels.length === 0) {
+			this.setStatusMessage("No models available. Add credentials with /login.");
+			return Promise.resolve();
+		}
+		return new Promise((resolve) => {
+			let handle: OverlayHandle | undefined;
+			const close = () => {
+				handle?.hide();
+				this.ui.requestRender();
+			};
+			const selector = new ModelSelectorComponent(
+				this.ui,
+				this.getDefaultModelForNewAgents(),
+				modelRegistry,
+				[],
+				(model) => {
+					close();
+					this.applyDefaultModel(model);
+					resolve();
+				},
+				() => {
+					close();
+					resolve();
+				},
+				initialSearchInput,
+				{ availableModels, getRows: () => this.ui.terminal.rows },
+			);
+			handle = showFullPaneOverlay(this.ui, selector, 96);
+		});
+	}
+
+	private getDefaultModelForNewAgents(): Model<Api> | undefined {
+		const settings = this.options.uiServices.settingsManager;
+		const provider = settings.getDefaultProvider();
+		const modelId = settings.getDefaultModel();
+		return provider && modelId ? this.options.uiServices.modelRegistry.find(provider, modelId) : undefined;
+	}
+
+	private applyDefaultModel(model: Model<Api>): void {
+		this.options.uiServices.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+		// New agents are created from this shared config; pin the model explicitly
+		// so the daemon does not fall back to its own settings snapshot.
+		this.options.config.provider = model.provider;
+		this.options.config.model = model.id;
+		this.options.startupModelId = model.id;
+		this.setStatusMessage(`Model for new agents: ${model.id}`);
+		void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
+	}
+
+	private createAutocompleteProvider(): CombinedAutocompleteProvider {
+		const commands: SlashCommand[] = AGENTS_VIEW_SLASH_COMMANDS.map((command) => ({
+			name: command.name,
+			description: command.description,
+			...(command.argumentHint ? { argumentHint: command.argumentHint } : {}),
+		}));
+		const modelCommand = commands.find((command) => command.name === "model");
+		if (modelCommand) {
+			modelCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
+				const models = this.options.uiServices.modelRegistry.getAvailable();
+				if (models.length === 0) {
+					return null;
+				}
+				const items = models.map((model) => ({
+					id: model.id,
+					provider: model.provider,
+					label: `${model.provider}/${model.id}`,
+				}));
+				const filtered = fuzzyFilter(items, prefix, (item) => `${item.id} ${item.provider}`);
+				if (filtered.length === 0) {
+					return null;
+				}
+				return filtered.map((item) => ({ value: item.label, label: item.id, description: item.provider }));
+			};
+		}
+		return new CombinedAutocompleteProvider(commands, this.options.uiServices.getInitialCwd(), null);
 	}
 
 	private openSelected(): void {
@@ -1221,8 +1421,7 @@ class AgentsViewMode implements Component, Focusable {
 			return truncateToWidth(theme.fg("muted", hint), width);
 		}
 		if (this.statusMessage) {
-			const tone = this.statusMessage.startsWith("Failed") ? "error" : "muted";
-			return truncateToWidth(theme.fg(tone, this.statusMessage), width);
+			return truncateToWidth(theme.fg(this.statusMessageTone, this.statusMessage), width);
 		}
 		// Replying is reserved for top-level agents; subagents can be stopped.
 		const selectedRow = this.rows[this.selectedIndex];
@@ -1231,6 +1430,7 @@ class AgentsViewMode implements Component, Focusable {
 		const hints = [
 			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
 			`${keyText("tui.select.confirm")} open/send`,
+			"/ commands",
 			selectedAgent ? `${keyText("app.agents.reply")} reply` : undefined,
 			selectedAgent ? `${keyText("app.agents.delete")} stop/deactivate` : undefined,
 			selectedSubagent ? `${keyText("app.agents.delete")} stop` : undefined,

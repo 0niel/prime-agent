@@ -1,4 +1,12 @@
-import { type Component, type Focusable, isFocusable, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	type Component,
+	type Focusable,
+	isFocusable,
+	type OverlayHandle,
+	type TUI,
+	truncateToWidth,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 
 interface CenteredOverlayOptions {
 	getRows: () => number;
@@ -12,6 +20,22 @@ interface InputHandler {
 
 function hasInputHandler(component: Component): component is Component & InputHandler {
 	return typeof (component as { handleInput?: unknown }).handleInput === "function";
+}
+
+/** Shows a component as a full-pane centered overlay on the given TUI. */
+export function showFullPaneOverlay(ui: TUI, component: Component, maxContentWidth = 80): OverlayHandle {
+	return ui.showOverlay(
+		new CenteredOverlayComponent(component, {
+			getRows: () => ui.terminal.rows,
+			maxContentWidth,
+		}),
+		{
+			width: "100%",
+			maxHeight: "100%",
+			row: 0,
+			col: 0,
+		},
+	);
 }
 
 export class CenteredOverlayComponent implements Component, Focusable {
