@@ -187,6 +187,7 @@ export type DaemonCommand =
 	| { id?: string; type: "get_connection_state"; activeSessionId: string }
 	| { id?: string; type: "get_messages"; activeSessionId: string }
 	| { id?: string; type: "get_session_stats"; activeSessionId: string }
+	| { id?: string; type: "get_context_tree"; activeSessionId: string }
 	| { id?: string; type: "get_commands"; activeSessionId: string }
 	| { id?: string; type: "get_resource_snapshot"; activeSessionId: string }
 	| { id?: string; type: "get_available_models"; activeSessionId: string }

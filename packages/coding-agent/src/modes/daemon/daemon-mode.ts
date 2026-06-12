@@ -94,6 +94,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_connection_state",
 	"get_messages",
 	"get_session_stats",
+	"get_context_tree",
 	"get_commands",
 	"get_resource_snapshot",
 	"get_available_models",
@@ -735,6 +736,11 @@ class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				const stats: SessionStats = state.runtime.session.getSessionStats();
 				return success(command.id, "get_session_stats", stats);
+			}
+
+			case "get_context_tree": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "get_context_tree", state.runtime.session.getContextTree());
 			}
 
 			case "get_commands": {

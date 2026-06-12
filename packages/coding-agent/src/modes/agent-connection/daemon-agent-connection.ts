@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Transport } from "@earendil-works/pi-ai";
 import type { CompactionResult } from "../../core/compaction/index.js";
+import type { ContextTreeNode } from "../../core/context-tree.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import type { DaemonClient } from "../daemon/daemon-client.js";
@@ -226,6 +227,13 @@ export class DaemonAgentConnection implements AgentConnection {
 	async getSessionStats(): Promise<SessionStats> {
 		return this.requestData<SessionStats>({
 			type: "get_session_stats",
+			activeSessionId: this.activeSessionId,
+		});
+	}
+
+	async getContextTree(): Promise<ContextTreeNode> {
+		return this.requestData<ContextTreeNode>({
+			type: "get_context_tree",
 			activeSessionId: this.activeSessionId,
 		});
 	}

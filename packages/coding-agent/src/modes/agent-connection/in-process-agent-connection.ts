@@ -3,6 +3,7 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { ImageContent, Transport } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
+import type { ContextTreeNode } from "../../core/context-tree.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
 import { SessionManager } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
@@ -107,6 +108,10 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async getSessionStats(): Promise<SessionStats> {
 		return this.session.getSessionStats();
+	}
+
+	async getContextTree(): Promise<ContextTreeNode> {
+		return this.session.getContextTree();
 	}
 
 	async getSessionContext(): Promise<AgentConnectionSessionContext> {

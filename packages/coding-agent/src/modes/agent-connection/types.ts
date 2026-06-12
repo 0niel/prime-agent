@@ -10,6 +10,7 @@ import type {
 	UserMessage,
 } from "@earendil-works/pi-ai";
 import type { CompactionResult } from "../../core/compaction/index.js";
+import type { ContextTreeNode } from "../../core/context-tree.js";
 import type { GoalState } from "../../core/goals.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type { SessionStats } from "../../core/session-stats.js";
@@ -511,6 +512,7 @@ export interface AgentConnection {
 	getResourceSnapshot(): Promise<AgentConnectionResourceSnapshot>;
 	getAvailableModels(): Promise<AgentConnectionModel[]>;
 	getSessionStats(): Promise<SessionStats>;
+	getContextTree(): Promise<ContextTreeNode>;
 	getSessionContext(): Promise<AgentConnectionSessionContext>;
 	getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }>;
 	listSavedSessions(

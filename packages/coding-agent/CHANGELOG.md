@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `/context` command showing a tree overview of the main agent and all sub-agents with per-agent tokens, cost, and context-window usage, plus session totals and a token/cost breakdown.
+
+### Changed
+
+- Changed `/usage` to be an alias for the new `/context` command.
+
 ## [0.1.2] - 2026-06-12
 
 ### Fixed

@@ -106,6 +106,7 @@ import {
 	type ChildAgentTranscriptLine,
 } from "./components/child-agent-inspector.js";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
+import { formatContextTree } from "./components/context-tree-format.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { CustomMessageComponent } from "./components/custom-message.js";
@@ -3176,8 +3177,8 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
-			if (text === "/usage") {
-				await this.handleUsageCommand();
+			if (text === "/context" || text === "/usage") {
+				await this.handleContextCommand();
 				this.editor.setText("");
 				return;
 			}
@@ -6438,52 +6439,26 @@ export class InteractiveMode {
 		info += `${theme.fg("dim", "Tool Calls:")} ${stats.toolCalls}\n`;
 		info += `${theme.fg("dim", "Tool Results:")} ${stats.toolResults}\n`;
 		info += `${theme.fg("dim", "Total:")} ${stats.totalMessages}\n\n`;
-		info += theme.fg("dim", "Use /usage for token, cost, and context usage.");
+		info += theme.fg("dim", "Use /context for token, cost, and context usage.");
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(info, 1, 0));
 		this.ui.requestRender();
 	}
 
-	private async handleUsageCommand(): Promise<void> {
-		const stats = await this.agentConnection.getSessionStats();
-		const state = await this.agentConnection.getState();
-		this.applyConnectionStateSnapshot(state);
-		const model = state.model;
-
-		let info = `${theme.bold("Usage")}\n\n`;
-		if (model) {
-			info += `${theme.fg("dim", "Model:")} ${model.provider}/${model.id}\n\n`;
-		}
-		info += `${theme.bold("Tokens")}\n`;
-		info += `${theme.fg("dim", "Input:")} ${stats.tokens.input.toLocaleString()}\n`;
-		info += `${theme.fg("dim", "Output:")} ${stats.tokens.output.toLocaleString()}\n`;
-		if (stats.tokens.cacheRead > 0) {
-			info += `${theme.fg("dim", "Cache Read:")} ${stats.tokens.cacheRead.toLocaleString()}\n`;
-		}
-		if (stats.tokens.cacheWrite > 0) {
-			info += `${theme.fg("dim", "Cache Write:")} ${stats.tokens.cacheWrite.toLocaleString()}\n`;
-		}
-		info += `${theme.fg("dim", "Total:")} ${stats.tokens.total.toLocaleString()}\n`;
-
-		if (stats.cost > 0) {
-			info += `\n${theme.bold("Cost")}\n`;
-			info += `${theme.fg("dim", "Total:")} $${stats.cost.toFixed(4)}\n`;
-		}
-
-		const contextUsage = stats.contextUsage;
-		if (contextUsage) {
-			info += `\n${theme.bold("Context")}\n`;
-			if (contextUsage.tokens === null || contextUsage.percent === null) {
-				info += `${theme.fg("dim", "Current:")} unknown after compaction\n`;
-			} else {
-				const percent = `${Math.round(contextUsage.percent * 10) / 10}%`;
-				info += `${theme.fg("dim", "Current:")} ${contextUsage.tokens.toLocaleString()} / ${contextUsage.contextWindow.toLocaleString()} (${percent})\n`;
-			}
+	private async handleContextCommand(): Promise<void> {
+		let info: string;
+		try {
+			const tree = await this.agentConnection.getContextTree();
+			const width = Math.max(60, Math.min(this.ui.terminal.columns - 2, 120));
+			info = formatContextTree(tree, width);
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+			return;
 		}
 
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(info.trimEnd(), 1, 0));
+		this.chatContainer.addChild(new Text(info, 1, 0));
 		this.ui.requestRender();
 	}
 

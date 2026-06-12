@@ -61,6 +61,13 @@ import {
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.js";
+import {
+	type ContextTreeNode,
+	type ContextWindowResolver,
+	computeOwnAndTotalUsage,
+	loadContextTreeChildFromDisk,
+	loadContextTreeChildrenFromDisk,
+} from "./context-tree.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
@@ -135,7 +142,7 @@ import { type BashOperations, createLocalBashOperations } from "./tools/bash.js"
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
-import { cloneUsage, emptyUsage } from "./usage.js";
+import { addAssistantUsage, cloneUsage, emptyUsage } from "./usage.js";
 
 export type { GoalState, GoalStatus } from "./goals.js";
 export type { SessionStats } from "./session-stats.js";
@@ -403,19 +410,6 @@ function emptyRlmUsage(): RlmUsage {
 function addUsage(total: RlmUsage, usage: Usage): void {
 	total.prompt_tokens += usage.input + usage.cacheRead + usage.cacheWrite;
 	total.completion_tokens += usage.output;
-}
-
-function addAssistantUsage(total: Usage, usage: Usage): void {
-	total.input += usage.input;
-	total.output += usage.output;
-	total.cacheRead += usage.cacheRead;
-	total.cacheWrite += usage.cacheWrite;
-	total.totalTokens += usage.totalTokens;
-	total.cost.input += usage.cost.input;
-	total.cost.output += usage.cost.output;
-	total.cost.cacheRead += usage.cost.cacheRead;
-	total.cost.cacheWrite += usage.cost.cacheWrite;
-	total.cost.total += usage.cost.total;
 }
 
 export function compactRlmText(text: string, maxLength = 160): string {
@@ -4626,6 +4620,60 @@ export class AgentSession {
 			tokens: estimate.tokens,
 			contextWindow,
 			percent,
+		};
+	}
+
+	/** RLM session dir holding sub-* child sessions, without creating directories. */
+	private _rlmSessionDirForReading(): string | undefined {
+		return this._rlmSessionDir ?? this.sessionManager.getSessionArtifactDir();
+	}
+
+	private _contextWindowResolver(): ContextWindowResolver {
+		return (provider, modelId) => this._modelRegistry.find(provider, modelId)?.contextWindow;
+	}
+
+	/**
+	 * Build the agent context overview for /context: this session as the root
+	 * plus one node per RLM sub-agent, recursively. Running children are read
+	 * from their live sessions; completed children from their persisted session
+	 * dirs, so the tree survives child disposal and session resume.
+	 */
+	getContextTree(): ContextTreeNode {
+		const resolveContextWindow = this._contextWindowResolver();
+		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(
+			this.sessionManager.getBranch(),
+			this.sessionManager.getEntries(),
+		);
+
+		const children: ContextTreeNode[] = [];
+		const liveIds = new Set<string>();
+		for (const run of this._activeRlmChildRuns.values()) {
+			liveIds.add(run.id);
+			const node =
+				run.session?.getContextTree() ?? loadContextTreeChildFromDisk(run.sessionDir, resolveContextWindow);
+			children.push({
+				...(node ?? {
+					ownUsage: emptyUsage(),
+					totalUsage: emptyUsage(),
+					children: [],
+				}),
+				id: run.id,
+				label: compactRlmText(run.prompt, 80) || "child agent",
+				status: run.status,
+			});
+		}
+		children.push(...loadContextTreeChildrenFromDisk(this._rlmSessionDirForReading(), resolveContextWindow, liveIds));
+
+		const model = this.model;
+		return {
+			id: "root",
+			label: this.sessionName ?? "main agent",
+			status: "active",
+			model: model ? { provider: model.provider, id: model.id } : undefined,
+			ownUsage,
+			totalUsage,
+			contextUsage: this.getContextUsage(),
+			children,
 		};
 	}
 
