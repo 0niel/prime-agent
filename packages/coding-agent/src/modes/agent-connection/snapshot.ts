@@ -27,6 +27,7 @@ export function createAgentConnectionState(
 		availableThinkingLevels: session.getAvailableThinkingLevels(),
 		isStreaming: session.isStreaming,
 		isCompacting: session.isCompacting,
+		isBashRunning: session.isBashRunning,
 		retryAttempt: session.retryAttempt,
 		steeringMode: session.steeringMode,
 		followUpMode: session.followUpMode,

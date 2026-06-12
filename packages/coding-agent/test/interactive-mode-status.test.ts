@@ -22,6 +22,7 @@ import type {
 	AgentConnectionState,
 } from "../src/modes/agent-connection/types.js";
 import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
+import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -54,6 +55,7 @@ function createConnectionState(overrides: Partial<AgentConnectionState> = {}): A
 		availableThinkingLevels: ["minimal", "low", "medium", "high", "xhigh"],
 		isStreaming: false,
 		isCompacting: false,
+		isBashRunning: false,
 		retryAttempt: 0,
 		steeringMode: "all",
 		followUpMode: "all",
@@ -168,33 +170,224 @@ describe("InteractiveMode.showStatus", () => {
 
 type SubmitHandlerHarness = {
 	defaultEditor: { onSubmit?: (text: string) => Promise<void> };
-	editor: { setText: (text: string) => void };
+	editor: { setText: (text: string) => void; addToHistory?: (text: string) => void };
 	showWarning: (message: string) => void;
-	agentConnection: { prompt: (message: string) => Promise<void> };
+	showError: (message: string) => void;
+	isBashRunning: () => boolean;
+	patchConnectionState: (patch: Record<string, unknown>) => void;
+	agentConnection: {
+		prompt: (message: string) => Promise<void>;
+		executeBash: (command: string, options?: { excludeFromContext?: boolean }) => Promise<void>;
+		getState: () => Promise<{ isBashRunning: boolean }>;
+	};
 };
 
-describe("InteractiveMode submit handling", () => {
-	test("rejects legacy bash shortcuts before reaching the agent connection", async () => {
-		const fakeThis: SubmitHandlerHarness = {
-			defaultEditor: {},
-			editor: { setText: vi.fn() },
-			showWarning: vi.fn(),
-			agentConnection: { prompt: vi.fn(async () => {}) },
-		};
+function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {}): SubmitHandlerHarness {
+	const fakeThis: SubmitHandlerHarness = {
+		defaultEditor: {},
+		editor: { setText: vi.fn(), addToHistory: vi.fn() },
+		showWarning: vi.fn(),
+		showError: vi.fn(),
+		isBashRunning: () => false,
+		patchConnectionState: vi.fn(),
+		agentConnection: {
+			prompt: vi.fn(async () => {}),
+			executeBash: vi.fn(async () => {}),
+			getState: vi.fn(async () => ({ isBashRunning: false })),
+		},
+		...overrides,
+	};
+	(
+		InteractiveMode.prototype as unknown as {
+			setupEditorSubmitHandler(this: SubmitHandlerHarness): void;
+		}
+	).setupEditorSubmitHandler.call(fakeThis);
+	return fakeThis;
+}
 
-		(
-			InteractiveMode.prototype as unknown as {
-				setupEditorSubmitHandler(this: SubmitHandlerHarness): void;
-			}
-		).setupEditorSubmitHandler.call(fakeThis);
+describe("InteractiveMode submit handling", () => {
+	test("routes ! shortcuts to executeBash on the agent connection", async () => {
+		const fakeThis = createSubmitHandlerHarness();
 
 		await fakeThis.defaultEditor.onSubmit?.("!pwd");
 
-		expect(fakeThis.showWarning).toHaveBeenCalledWith(
-			"Bash commands are not available in interactive mode. Use IPython for shell commands.",
-		);
+		expect(fakeThis.agentConnection.executeBash).toHaveBeenCalledWith("pwd", { excludeFromContext: false });
+		expect(fakeThis.editor.addToHistory).toHaveBeenCalledWith("!pwd");
 		expect(fakeThis.editor.setText).toHaveBeenCalledWith("");
 		expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
+	});
+
+	test("routes !! shortcuts to executeBash with excludeFromContext", async () => {
+		const fakeThis = createSubmitHandlerHarness();
+
+		await fakeThis.defaultEditor.onSubmit?.("!!git status");
+
+		expect(fakeThis.agentConnection.executeBash).toHaveBeenCalledWith("git status", { excludeFromContext: true });
+		expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
+	});
+
+	test("ignores bare ! and !! input instead of prompting the agent", async () => {
+		const fakeThis = createSubmitHandlerHarness();
+
+		await fakeThis.defaultEditor.onSubmit?.("!");
+		await fakeThis.defaultEditor.onSubmit?.("!!");
+
+		expect(fakeThis.agentConnection.executeBash).not.toHaveBeenCalled();
+		expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
+	});
+
+	test("warns instead of executing when a bash command is already running", async () => {
+		const fakeThis = createSubmitHandlerHarness({ isBashRunning: () => true });
+
+		await fakeThis.defaultEditor.onSubmit?.("!pwd");
+
+		expect(fakeThis.showWarning).toHaveBeenCalledWith(expect.stringContaining("A bash command is already running"));
+		expect(fakeThis.agentConnection.executeBash).not.toHaveBeenCalled();
+		expect(fakeThis.editor.setText).not.toHaveBeenCalled();
+	});
+
+	test("surfaces executeBash transport failures via showError", async () => {
+		const fakeThis = createSubmitHandlerHarness({
+			agentConnection: {
+				prompt: vi.fn(async () => {}),
+				executeBash: vi.fn(async () => {
+					throw new Error("the daemon is running an older build; restart the daemon and try again");
+				}),
+				getState: vi.fn(async () => ({ isBashRunning: false })),
+			},
+		});
+
+		await fakeThis.defaultEditor.onSubmit?.("!pwd");
+
+		expect(fakeThis.showError).toHaveBeenCalledWith(expect.stringContaining("older build"));
+		expect(fakeThis.patchConnectionState).toHaveBeenLastCalledWith({ isBashRunning: false });
+	});
+
+	test("re-syncs the bash flag from connection state when executeBash is rejected", async () => {
+		const fakeThis = createSubmitHandlerHarness({
+			agentConnection: {
+				prompt: vi.fn(async () => {}),
+				executeBash: vi.fn(async () => {
+					throw new Error("A bash command is already running");
+				}),
+				// Another attached client holds the bash slot
+				getState: vi.fn(async () => ({ isBashRunning: true })),
+			},
+		});
+
+		await fakeThis.defaultEditor.onSubmit?.("!pwd");
+
+		expect(fakeThis.patchConnectionState).toHaveBeenLastCalledWith({ isBashRunning: true });
+	});
+});
+
+describe("InteractiveMode pending bash components", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	const bashComponent = () => ({ render: () => [], invalidate: () => {} });
+
+	test("keeps pending bash components visible across queue refreshes", () => {
+		const pendingMessagesContainer = new Container();
+		const component = bashComponent();
+		const fakeThis = {
+			pendingMessagesContainer,
+			pendingBashComponents: [component],
+			getAllQueuedMessages: () => ({ steering: [], followUp: [] }),
+		} as unknown as InteractiveMode;
+
+		(
+			InteractiveMode.prototype as unknown as { updatePendingMessagesDisplay(this: unknown): void }
+		).updatePendingMessagesDisplay.call(fakeThis);
+
+		expect(pendingMessagesContainer.children).toContain(component);
+	});
+
+	test("flushes pending bash components from the pending area to chat", () => {
+		const pendingMessagesContainer = new Container();
+		const chatContainer = new Container();
+		const component = bashComponent();
+		pendingMessagesContainer.addChild(component);
+		const fakeThis = {
+			pendingMessagesContainer,
+			chatContainer,
+			pendingBashComponents: [component],
+		} as unknown as InteractiveMode;
+
+		(
+			InteractiveMode.prototype as unknown as { flushPendingBashComponents(this: unknown): void }
+		).flushPendingBashComponents.call(fakeThis);
+
+		expect(pendingMessagesContainer.children).not.toContain(component);
+		expect(chatContainer.children).toContain(component);
+		expect((fakeThis as unknown as { pendingBashComponents: unknown[] }).pendingBashComponents).toHaveLength(0);
+	});
+
+	test("handles session events in emission order even when a handler suspends", async () => {
+		type ConnectionListener = (event: { type: string; event: { type: string } }) => Promise<void>;
+		let listener: ConnectionListener | undefined;
+		const order: string[] = [];
+		const fakeThis = {
+			agentConnection: {
+				subscribe: (l: ConnectionListener) => {
+					listener = l;
+					return () => {};
+				},
+			},
+			sessionEventQueue: Promise.resolve(),
+			showError: vi.fn(),
+			handleEvent: async (event: { type: string }) => {
+				order.push(`start:${event.type}`);
+				if (event.type === "bash_start") {
+					await new Promise((resolve) => setTimeout(resolve, 10));
+				}
+				order.push(`end:${event.type}`);
+			},
+		} as unknown as InteractiveMode;
+
+		(InteractiveMode.prototype as unknown as { subscribeToAgent(this: unknown): void }).subscribeToAgent.call(
+			fakeThis,
+		);
+
+		const first = listener?.({ type: "session_event", event: { type: "bash_start" } });
+		const second = listener?.({ type: "session_event", event: { type: "bash_end" } });
+		await Promise.all([first, second]);
+
+		expect(order).toEqual(["start:bash_start", "end:bash_start", "start:bash_end", "end:bash_end"]);
+	});
+
+	test("stops an orphaned bash loader when session render state resets", () => {
+		const tuiStub = {
+			terminal: { columns: 120, rows: 24 },
+			requestRender: () => {},
+		} as unknown as ConstructorParameters<typeof BashExecutionComponent>[1];
+		const component = new BashExecutionComponent("sleep 99", tuiStub);
+		const loader = (component as unknown as { loader: { intervalId: unknown } }).loader;
+		expect(loader.intervalId).not.toBeNull();
+
+		const fakeThis = {
+			chatContainer: new Container(),
+			pendingMessagesContainer: new Container(),
+			compactionQueuedMessages: [],
+			streamingComponent: undefined,
+			streamingMessage: undefined,
+			activeBashComponent: component,
+			pendingBashComponents: [component],
+			activityTracker: { reset: vi.fn() },
+			resetPendingToolState: vi.fn(),
+			resetChildAgentInspector: vi.fn(),
+			setGoalAnnouncementBaseline: vi.fn(),
+			syncGoalTray: vi.fn(),
+			getGoalState: () => emptyGoalState(),
+		} as unknown as InteractiveMode;
+
+		(
+			InteractiveMode.prototype as unknown as { resetCurrentSessionRenderState(this: unknown): void }
+		).resetCurrentSessionRenderState.call(fakeThis);
+
+		expect(loader.intervalId).toBeNull();
+		expect((fakeThis as unknown as { activeBashComponent: unknown }).activeBashComponent).toBeUndefined();
 	});
 });
 

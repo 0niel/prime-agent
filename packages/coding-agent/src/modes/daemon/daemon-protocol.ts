@@ -173,6 +173,14 @@ export type DaemonCommand =
 	| { id?: string; type: "steer"; activeSessionId: string; message: string; images?: ImageContent[] }
 	| { id?: string; type: "follow_up"; activeSessionId: string; message: string; images?: ImageContent[] }
 	| { id?: string; type: "abort"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "execute_bash";
+			activeSessionId: string;
+			command: string;
+			excludeFromContext?: boolean;
+	  }
+	| { id?: string; type: "abort_bash"; activeSessionId: string }
 	| { id?: string; type: "cancel_rlm_child"; activeSessionId: string; childId: string }
 	| { id?: string; type: "wait_for_idle"; activeSessionId: string }
 	| { id?: string; type: "get_state"; activeSessionId: string }

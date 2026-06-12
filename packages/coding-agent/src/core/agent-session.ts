@@ -222,10 +222,30 @@ export type AgentSessionEvent =
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| { type: "rlm_child_update"; child: RlmChildAgentSnapshot }
-	| { type: "goal_update"; goal: GoalState };
+	| { type: "goal_update"; goal: GoalState }
+	| { type: "bash_start"; command: string; excludeFromContext: boolean }
+	| { type: "bash_output"; chunk: string }
+	| {
+			type: "bash_end";
+			exitCode: number | undefined;
+			cancelled: boolean;
+			truncated: boolean;
+			fullOutputPath?: string;
+			/** Set when execution failed before producing a result (e.g. spawn failure) */
+			errorMessage?: string;
+	  };
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
+
+/** Payload of the bash_end event for a user-initiated bash command */
+type UserBashEndDetails = {
+	exitCode: number | undefined;
+	cancelled: boolean;
+	truncated: boolean;
+	fullOutputPath?: string;
+	errorMessage?: string;
+};
 
 /** Thrown when compaction is skipped for a benign reason (surfaced as a warning, not an error) */
 export class CompactionSkippedError extends Error {}
@@ -638,6 +658,8 @@ export class AgentSession {
 
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
+	private _userBashRunning = false;
+	private _userBashAbortRequested = false;
 	private _pendingBashMessages: BashExecutionMessage[] = [];
 
 	// Extension system
@@ -4106,6 +4128,99 @@ export class AgentSession {
 	}
 
 	/**
+	 * Run a user-initiated bash command (! / !! prefix), emitting bash_start,
+	 * bash_output, and bash_end session events so any attached client can render
+	 * streaming output. Extensions can intercept execution via the user_bash event.
+	 * Execution failures are reported through bash_end rather than a rejected promise;
+	 * only the already-running guard and extension dispatch errors reject.
+	 * @param command The bash command to execute
+	 * @param options.excludeFromContext If true, command output won't be sent to LLM (!! prefix)
+	 */
+	async runUserBash(command: string, options?: { excludeFromContext?: boolean }): Promise<void> {
+		if (this.isBashRunning) {
+			throw new Error("A bash command is already running");
+		}
+		// Claim the bash slot synchronously: isBashRunning is otherwise false until
+		// executeBash installs its abort controller, which would let a second command
+		// slip through during the user_bash extension dispatch below.
+		this._userBashRunning = true;
+		this._userBashAbortRequested = false;
+		let end: UserBashEndDetails;
+		try {
+			end = await this.runUserBashLocked(command, options?.excludeFromContext ?? false);
+		} finally {
+			this._userBashRunning = false;
+		}
+		// Emitted after the slot is released so clients never observe a bash_end
+		// while the session still rejects new commands as already running.
+		this._emit({ type: "bash_end", ...end });
+	}
+
+	private async runUserBashLocked(command: string, excludeFromContext: boolean): Promise<UserBashEndDetails> {
+		const eventResult = await this._extensionRunner.emitUserBash({
+			type: "user_bash",
+			command,
+			excludeFromContext,
+			cwd: this.sessionManager.getCwd(),
+		});
+
+		this._emit({ type: "bash_start", command, excludeFromContext });
+		try {
+			// If an extension returned a full result, surface it without executing
+			if (eventResult?.result) {
+				const result = eventResult.result;
+				if (result.output) {
+					this._emit({ type: "bash_output", chunk: result.output });
+				}
+				this.recordBashResult(command, result, { excludeFromContext });
+				return {
+					exitCode: result.exitCode,
+					cancelled: result.cancelled,
+					truncated: result.truncated,
+					fullOutputPath: result.fullOutputPath,
+				};
+			}
+
+			// An abort that arrived before the process spawned (during extension
+			// dispatch) has no abort controller to act on; honor it here instead.
+			if (this._userBashAbortRequested) {
+				this.recordBashResult(
+					command,
+					{ output: "", exitCode: undefined, cancelled: true, truncated: false },
+					{ excludeFromContext },
+				);
+				return { exitCode: undefined, cancelled: true, truncated: false };
+			}
+
+			const result = await this.executeBash(command, (chunk) => this._emit({ type: "bash_output", chunk }), {
+				excludeFromContext,
+				operations: eventResult?.operations,
+			});
+			return {
+				exitCode: result.exitCode,
+				cancelled: result.cancelled,
+				truncated: result.truncated,
+				fullOutputPath: result.fullOutputPath,
+			};
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			// Persist the failure like every other outcome so replayed transcripts
+			// and the LLM context reflect that the command did not run.
+			this.recordBashResult(
+				command,
+				{ output: `bash failed: ${errorMessage}`, exitCode: undefined, cancelled: false, truncated: false },
+				{ excludeFromContext },
+			);
+			return {
+				exitCode: undefined,
+				cancelled: false,
+				truncated: false,
+				errorMessage,
+			};
+		}
+	}
+
+	/**
 	 * Record a bash execution result in session history.
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
@@ -4139,12 +4254,17 @@ export class AgentSession {
 	 * Cancel running bash command.
 	 */
 	abortBash(): void {
+		// A user bash command may not have spawned yet (extension dispatch in
+		// progress); flag the request so runUserBash cancels before executing.
+		if (this._userBashRunning && this._bashAbortController === undefined) {
+			this._userBashAbortRequested = true;
+		}
 		this._bashAbortController?.abort();
 	}
 
 	/** Whether a bash command is currently running */
 	get isBashRunning(): boolean {
-		return this._bashAbortController !== undefined;
+		return this._bashAbortController !== undefined || this._userBashRunning;
 	}
 
 	/** Whether there are pending bash messages waiting to be flushed */

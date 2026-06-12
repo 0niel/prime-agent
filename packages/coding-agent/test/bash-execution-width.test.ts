@@ -77,4 +77,18 @@ describe("BashExecutionComponent width handling (#2569)", () => {
 			expect(w, `Line ${i} visibleWidth=${w} > 60`).toBeLessThanOrEqual(60);
 		}
 	});
+
+	it("renders an inline failure state via setFailed", () => {
+		const { stub } = createTuiStub(120);
+		const component = new BashExecutionComponent("boom", stub);
+
+		component.setFailed("spawn failure");
+
+		const rendered = component
+			.render(120)
+			.map((line) => line.replace(/\[[0-9;]*m/g, ""))
+			.join("\n");
+		expect(rendered).toContain("failed: spawn failure");
+		expect(rendered).not.toContain("Running...");
+	});
 });

@@ -246,6 +246,7 @@ export interface AgentConnectionState {
 	availableThinkingLevels: ThinkingLevel[];
 	isStreaming: boolean;
 	isCompacting: boolean;
+	isBashRunning: boolean;
 	retryAttempt: number;
 	steeringMode: AgentConnectionQueueMode;
 	followUpMode: AgentConnectionQueueMode;
@@ -348,6 +349,10 @@ export interface AgentConnectionToolDefinition {
 export interface AgentConnectionPromptOptions {
 	images?: ImageContent[];
 	streamingBehavior?: "steer" | "followUp";
+}
+
+export interface AgentConnectionExecuteBashOptions {
+	excludeFromContext?: boolean;
 }
 
 export interface AgentConnectionNewSessionOptions {
@@ -473,7 +478,18 @@ export type AgentConnectionSessionEvent =
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| { type: "rlm_child_update"; child: AgentConnectionRlmChildAgentSnapshot }
-	| { type: "goal_update"; goal: GoalState };
+	| { type: "goal_update"; goal: GoalState }
+	| { type: "bash_start"; command: string; excludeFromContext: boolean }
+	| { type: "bash_output"; chunk: string }
+	| {
+			type: "bash_end";
+			exitCode: number | undefined;
+			cancelled: boolean;
+			truncated: boolean;
+			fullOutputPath?: string;
+			/** Set when execution failed before producing a result (e.g. spawn failure) */
+			errorMessage?: string;
+	  };
 
 export type AgentConnectionEvent =
 	| { type: "session_event"; event: AgentConnectionSessionEvent }
@@ -515,6 +531,14 @@ export interface AgentConnection {
 	abort(): Promise<void>;
 	cancelRlmChild(childId: string): Promise<boolean>;
 	waitForIdle(): Promise<void>;
+
+	/**
+	 * Run a user-initiated bash command (! / !! prefix). Resolution timing is
+	 * adapter-specific; rendering must be driven by the bash_start/bash_output/
+	 * bash_end session events, which reach every attached client.
+	 */
+	executeBash(command: string, options?: AgentConnectionExecuteBashOptions): Promise<void>;
+	abortBash(): Promise<void>;
 
 	setModel(provider: string, modelId: string): Promise<AgentConnectionModel>;
 	cycleModel(direction?: "forward" | "backward"): Promise<AgentConnectionModelCycleResult | undefined>;

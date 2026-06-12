@@ -18,6 +18,7 @@ import type {
 	AgentConnectionBeforeSessionInvalidateListener,
 	AgentConnectionEvent,
 	AgentConnectionEventListener,
+	AgentConnectionExecuteBashOptions,
 	AgentConnectionExtensionUiResponse,
 	AgentConnectionForkOptions,
 	AgentConnectionModel,
@@ -189,6 +190,14 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async waitForIdle(): Promise<void> {
 		await this.session.agent.waitForIdle();
+	}
+
+	async executeBash(command: string, options?: AgentConnectionExecuteBashOptions): Promise<void> {
+		await this.session.runUserBash(command, options);
+	}
+
+	async abortBash(): Promise<void> {
+		this.session.abortBash();
 	}
 
 	async setModel(provider: string, modelId: string): Promise<AgentConnectionModel> {

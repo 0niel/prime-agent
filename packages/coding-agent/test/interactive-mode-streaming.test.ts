@@ -62,6 +62,8 @@ function createFakeInteractiveModeThis(): HandleEventThis {
 		hiddenThinkingLabel: "Thinking...",
 		streamingComponent: undefined,
 		streamingMessage: undefined,
+		pendingMessagesContainer: new Container(),
+		pendingBashComponents: [],
 		pendingTools: new Map<string, ToolExecutionComponent>(),
 		updateConnectionStateFromEvent: vi.fn(),
 		getMarkdownThemeWithSettings: () => getMarkdownTheme(),

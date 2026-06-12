@@ -476,6 +476,13 @@ export class InteractiveMode {
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
 	private streamingMessage: AssistantMessage | undefined = undefined;
 
+	// User bash execution tracking (! / !! prefix), driven by bash_* session events
+	private activeBashComponent: BashExecutionComponent | undefined = undefined;
+	private pendingBashComponents: BashExecutionComponent[] = [];
+
+	// Serializes session event handling; see subscribeToAgent
+	private sessionEventQueue: Promise<void> = Promise.resolve();
+
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
 	private pendingToolCreations = new Set<string>();
@@ -1979,6 +1986,12 @@ export class InteractiveMode {
 			case "goal_update":
 				this.patchConnectionState({ goal: event.goal });
 				break;
+			case "bash_start":
+				this.patchConnectionState({ isBashRunning: true });
+				break;
+			case "bash_end":
+				this.patchConnectionState({ isBashRunning: false });
+				break;
 		}
 	}
 
@@ -2004,6 +2017,10 @@ export class InteractiveMode {
 
 	private isAgentCompacting(): boolean {
 		return this.connectionState?.isCompacting ?? false;
+	}
+
+	private isBashRunning(): boolean {
+		return this.connectionState?.isBashRunning ?? false;
 	}
 
 	private getRetryAttempt(): number {
@@ -2065,6 +2082,11 @@ export class InteractiveMode {
 		this.compactionQueuedMessages = [];
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
+		// The discarded component's loader interval keeps firing otherwise; no
+		// bash_end will reach it once the reference is dropped.
+		this.activeBashComponent?.setComplete(undefined, true);
+		this.activeBashComponent = undefined;
+		this.pendingBashComponents = [];
 		this.activityTracker.reset();
 		this.resetPendingToolState();
 		this.resetChildAgentInspector();
@@ -3241,10 +3263,36 @@ export class InteractiveMode {
 				return;
 			}
 
-			// Legacy bash shortcuts are intentionally not transported through AgentConnection.
+			// Handle bash command (! for normal, !! for excluded from context)
 			if (text.startsWith("!")) {
-				this.showWarning("Bash commands are not available in interactive mode. Use IPython for shell commands.");
+				const isExcluded = text.startsWith("!!");
+				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
+				if (!command) {
+					// Bare ! / !! is bash mode with nothing to run; don't send it as a prompt
+					return;
+				}
+				if (this.isBashRunning()) {
+					this.showWarning(`A bash command is already running. Press ${keyText("app.clear")} to cancel it first.`);
+					return;
+				}
+				this.editor.addToHistory?.(text);
 				this.editor.setText("");
+				// Optimistic: bash_start only fires after extension dispatch, and the
+				// clear key must already route to abortBash in that window.
+				this.patchConnectionState({ isBashRunning: true });
+				try {
+					await this.agentConnection.executeBash(command, { excludeFromContext: isExcluded });
+				} catch (error) {
+					// Re-sync rather than assume idle: the rejection may mean another
+					// client's bash run already holds the slot.
+					try {
+						const state = await this.agentConnection.getState();
+						this.patchConnectionState({ isBashRunning: state.isBashRunning });
+					} catch {
+						this.patchConnectionState({ isBashRunning: false });
+					}
+					this.showError(error instanceof Error ? error.message : String(error));
+				}
 				return;
 			}
 
@@ -3271,6 +3319,10 @@ export class InteractiveMode {
 				return;
 			}
 
+			// Normal message submission
+			// First, move any pending bash components to chat
+			this.flushPendingBashComponents();
+
 			if (this.onInputCallback) {
 				this.onInputCallback(text);
 			}
@@ -3282,7 +3334,12 @@ export class InteractiveMode {
 		this.unsubscribe = this.agentConnection.subscribe(async (event) => {
 			try {
 				if (event.type === "session_event") {
-					await this.handleEvent(event.event);
+					// Connection adapters dispatch without awaiting, so a handler that
+					// suspends would let later events overtake it; queue session events
+					// to keep paired events like bash_start/bash_end in emission order.
+					const run = this.sessionEventQueue.then(() => this.handleEvent(event.event));
+					this.sessionEventQueue = run.catch(() => {});
+					await run;
 				} else if (event.type === "session_replaced") {
 					this.resetExtensionUI();
 					this.applyConnectionStateSnapshot(event.state);
@@ -3527,6 +3584,45 @@ export class InteractiveMode {
 				this.updateEditorBorderColor();
 				break;
 
+			case "bash_start": {
+				const component = new BashExecutionComponent(event.command, this.ui, event.excludeFromContext);
+				if (this.isAgentStreaming()) {
+					this.pendingMessagesContainer.addChild(component);
+					this.pendingBashComponents.push(component);
+				} else {
+					this.chatContainer.addChild(component);
+				}
+				this.activeBashComponent = component;
+				this.ui.requestRender();
+				break;
+			}
+
+			case "bash_output":
+				if (this.activeBashComponent) {
+					this.activeBashComponent.appendOutput(event.chunk);
+					this.ui.requestRender();
+				}
+				break;
+
+			case "bash_end":
+				if (this.activeBashComponent) {
+					if (event.errorMessage) {
+						this.activeBashComponent.setFailed(event.errorMessage);
+					} else {
+						this.activeBashComponent.setComplete(
+							event.exitCode,
+							event.cancelled,
+							event.truncated ? ({ truncated: true } as TruncationResult) : undefined,
+							event.fullOutputPath,
+						);
+					}
+					this.activeBashComponent = undefined;
+				} else if (event.errorMessage) {
+					this.showError(`Bash command failed: ${event.errorMessage}`);
+				}
+				this.ui.requestRender();
+				break;
+
 			case "message_start":
 				if (event.message.role === "custom") {
 					this.addMessageToChat(event.message);
@@ -3649,6 +3745,7 @@ export class InteractiveMode {
 					this.streamingComponent = undefined;
 					this.streamingMessage = undefined;
 				}
+				this.flushPendingBashComponents();
 				this.resetPendingToolState();
 
 				await this.checkShutdownRequested();
@@ -4526,6 +4623,12 @@ export class InteractiveMode {
 			void this.agentConnection.abortBranchSummary();
 			return;
 		}
+		// Bash outranks the agent stream: the already-running warning tells the user
+		// this key cancels the bash command, and the stream stays one press away.
+		if (this.isBashRunning()) {
+			void this.agentConnection.abortBash();
+			return;
+		}
 		if (this.isAgentStreaming()) {
 			void this.restoreQueuedMessagesToEditor({ abort: true }).catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
@@ -4966,6 +5069,11 @@ export class InteractiveMode {
 
 	private updatePendingMessagesDisplay(): void {
 		this.pendingMessagesContainer.clear();
+		// Keep in-flight bash output visible across queue refreshes; clear() detaches
+		// the components but they stay tracked in pendingBashComponents until flushed.
+		for (const component of this.pendingBashComponents) {
+			this.pendingMessagesContainer.addChild(component);
+		}
 		const { steering: steeringMessages, followUp: followUpMessages } = this.getAllQueuedMessages();
 		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
 			this.pendingMessagesContainer.addChild(new Spacer(1));
@@ -4981,6 +5089,15 @@ export class InteractiveMode {
 			const hintText = theme.fg("dim", `↳ ${dequeueHint} to edit all queued messages`);
 			this.pendingMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
 		}
+	}
+
+	/** Move pending bash components from pending area to chat */
+	private flushPendingBashComponents(): void {
+		for (const component of this.pendingBashComponents) {
+			this.pendingMessagesContainer.removeChild(component);
+			this.chatContainer.addChild(component);
+		}
+		this.pendingBashComponents = [];
 	}
 
 	private async restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): Promise<number> {

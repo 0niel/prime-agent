@@ -86,6 +86,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"steer",
 	"follow_up",
 	"abort",
+	"execute_bash",
+	"abort_bash",
 	"cancel_rlm_child",
 	"wait_for_idle",
 	"get_state",
@@ -672,6 +674,30 @@ class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				await state.runtime.session.abort();
 				return success(command.id, "abort");
+			}
+
+			case "execute_bash": {
+				const state = this.getSessionState(command.activeSessionId);
+				if (state.runtime.session.isBashRunning) {
+					throw new Error("A bash command is already running");
+				}
+				// Respond before completion (bash can outlive the client request
+				// timeout); output and completion stream via bash_* session events.
+				void state.runtime.session
+					.runUserBash(command.command, { excludeFromContext: command.excludeFromContext })
+					.catch((error) => {
+						this.broadcastToSession(
+							state,
+							failure(undefined, "execute_bash", error, serializeDaemonError(error)),
+						);
+					});
+				return success(command.id, "execute_bash");
+			}
+
+			case "abort_bash": {
+				const state = this.getSessionState(command.activeSessionId);
+				state.runtime.session.abortBash();
+				return success(command.id, "abort_bash");
 			}
 
 			case "cancel_rlm_child": {

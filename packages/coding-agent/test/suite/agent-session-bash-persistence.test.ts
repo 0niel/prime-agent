@@ -239,4 +239,132 @@ describe("AgentSession bash and persistence characterization", () => {
 		expect(result.output).toContain("hello from custom ops");
 		expect(harness.session.messages[harness.session.messages.length - 1]?.role).toBe("bashExecution");
 	});
+
+	it("emits bash lifecycle events and records the result for runUserBash", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const events: Array<{ type: string }> = [];
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "bash_start" || event.type === "bash_output" || event.type === "bash_end") {
+				events.push(event);
+			}
+		});
+
+		await harness.session.runUserBash("echo lifecycle", { excludeFromContext: true });
+		unsubscribe();
+
+		expect(events[0]).toMatchObject({ type: "bash_start", command: "echo lifecycle", excludeFromContext: true });
+		expect(events.some((event) => event.type === "bash_output")).toBe(true);
+		expect(events[events.length - 1]).toMatchObject({ type: "bash_end", exitCode: 0, cancelled: false });
+
+		const lastMessage = harness.session.messages[harness.session.messages.length - 1];
+		expect(lastMessage?.role).toBe("bashExecution");
+		if (lastMessage?.role === "bashExecution") {
+			expect(lastMessage.output).toContain("lifecycle");
+			expect(lastMessage.excludeFromContext).toBe(true);
+		}
+	});
+
+	it("reports runUserBash execution failures through bash_end instead of rejecting", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const events: Array<{ type: string; errorMessage?: string }> = [];
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "bash_end") {
+				events.push(event);
+			}
+		});
+
+		const executeBashSpy = harness.session.executeBash.bind(harness.session);
+		harness.session.executeBash = async () => {
+			throw new Error("spawn failure");
+		};
+		await harness.session.runUserBash("echo unreachable");
+		harness.session.executeBash = executeBashSpy;
+		unsubscribe();
+
+		expect(events).toHaveLength(1);
+		expect(events[0]?.errorMessage).toBe("spawn failure");
+
+		// The failure is persisted like every other outcome
+		const lastMessage = harness.session.messages[harness.session.messages.length - 1];
+		expect(lastMessage?.role).toBe("bashExecution");
+		if (lastMessage?.role === "bashExecution") {
+			expect(lastMessage.output).toContain("spawn failure");
+		}
+	});
+
+	it("cancels runUserBash when abortBash arrives before execution starts", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const events: Array<{ type: string; cancelled?: boolean }> = [];
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "bash_output" || event.type === "bash_end") {
+				events.push(event);
+			}
+		});
+
+		// Abort lands during the user_bash extension dispatch, before any process spawns
+		const run = harness.session.runUserBash("echo should-not-run");
+		harness.session.abortBash();
+		await run;
+		unsubscribe();
+
+		expect(events).toEqual([{ type: "bash_end", exitCode: undefined, cancelled: true, truncated: false }]);
+		const lastMessage = harness.session.messages[harness.session.messages.length - 1];
+		expect(lastMessage?.role).toBe("bashExecution");
+		if (lastMessage?.role === "bashExecution") {
+			expect(lastMessage.cancelled).toBe(true);
+			expect(lastMessage.output).toBe("");
+		}
+	});
+
+	it("releases the bash slot before bash_end reaches subscribers", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let runningAtBashEnd: boolean | undefined;
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "bash_end") {
+				runningAtBashEnd = harness.session.isBashRunning;
+			}
+		});
+
+		await harness.session.runUserBash("echo done");
+		unsubscribe();
+
+		expect(runningAtBashEnd).toBe(false);
+	});
+
+	it("rejects a second runUserBash issued before the first starts executing", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+
+		// Same-tick overlap: the guard must trip before the first command reaches
+		// executeBash, i.e. during the async user_bash extension dispatch.
+		const first = harness.session.runUserBash("echo first");
+		await expect(harness.session.runUserBash("echo second")).rejects.toThrow("already running");
+		await first;
+
+		const bashMessages = harness.session.messages.filter((message) => message.role === "bashExecution");
+		expect(bashMessages).toHaveLength(1);
+	});
+
+	it("rejects runUserBash while another bash command is running", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let releaseExec: (() => void) | undefined;
+		const operations: BashOperations = {
+			exec: async () => {
+				await new Promise<void>((resolve) => {
+					releaseExec = resolve;
+				});
+				return { exitCode: 0 };
+			},
+		};
+
+		const first = harness.session.executeBash("blocked", undefined, { operations });
+		await expect(harness.session.runUserBash("echo nope")).rejects.toThrow("already running");
+		releaseExec?.();
+		await first;
+	});
 });

@@ -23,6 +23,7 @@ export class BashExecutionComponent extends Container {
 	private outputLines: string[] = [];
 	private status: "running" | "complete" | "cancelled" | "error" = "running";
 	private exitCode: number | undefined = undefined;
+	private errorMessage: string | undefined = undefined;
 	private loader: Loader;
 	private truncationResult?: TruncationResult;
 	private fullOutputPath?: string;
@@ -116,6 +117,14 @@ export class BashExecutionComponent extends Container {
 		this.updateDisplay();
 	}
 
+	/** Mark the execution as failed before producing a result (e.g. spawn failure). */
+	setFailed(message: string): void {
+		this.errorMessage = message;
+		this.status = "error";
+		this.loader.stop();
+		this.updateDisplay();
+	}
+
 	private updateDisplay(): void {
 		// Apply truncation for LLM context limits (same limits as bash tool)
 		const fullOutput = this.outputLines.join("\n");
@@ -187,7 +196,12 @@ export class BashExecutionComponent extends Container {
 			if (this.status === "cancelled") {
 				statusParts.push(theme.fg("warning", "(cancelled)"));
 			} else if (this.status === "error") {
-				statusParts.push(theme.fg("error", `(exit ${this.exitCode})`));
+				statusParts.push(
+					theme.fg(
+						"error",
+						this.errorMessage !== undefined ? `(failed: ${this.errorMessage})` : `(exit ${this.exitCode})`,
+					),
+				);
 			}
 
 			// Add truncation warning (context truncation, not preview truncation)
