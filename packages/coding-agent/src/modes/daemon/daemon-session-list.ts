@@ -45,6 +45,24 @@ export interface SessionSummary {
 	diagnostics?: AgentSessionRuntimeDiagnostic[];
 }
 
+/**
+ * Pick the model fallback message to show when attaching to a daemon session.
+ *
+ * The daemon's summary is authoritative. The attaching process's own startup
+ * snapshot only applies when the summary reports no model: a UI process may
+ * compute "no models available" merely because it cannot see credentials the
+ * daemon resolves fine (e.g. an env var set only for the daemon).
+ */
+export function resolveAttachModelFallbackMessage(
+	summary: SessionSummary,
+	startupModelFallbackMessage: string | undefined,
+): string | undefined {
+	if (summary.modelFallbackMessage) {
+		return summary.modelFallbackMessage;
+	}
+	return summary.model ? undefined : startupModelFallbackMessage;
+}
+
 export function buildSessionList(
 	activeSessions: readonly ActiveSessionState[],
 	savedSessions: readonly SessionInfo[],

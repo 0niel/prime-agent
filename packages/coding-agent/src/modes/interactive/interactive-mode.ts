@@ -40,7 +40,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "child_process";
 import { APP_TITLE, getAgentDir, getDebugLogPath, getShareViewerUrl, VERSION } from "../../config.js";
-import { formatNoModelsAvailableMessage } from "../../core/auth-guidance.js";
+import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
 import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
@@ -1056,14 +1056,16 @@ export class InteractiveMode {
 		if (!modelFallbackMessage) {
 			return "suppress";
 		}
-		if (
-			startupNeededOnboarding &&
-			modelFallbackMessage === formatNoModelsAvailableMessage() &&
-			!this.shouldRunOnboarding()
-		) {
+		// The no-models warning is a snapshot from whichever process created the
+		// session; trust the live connection over it (e.g. credentials only
+		// visible to the daemon, or added after the snapshot was taken).
+		if (isNoModelsAvailableMessage(modelFallbackMessage) && this.getCurrentModel()) {
 			return "suppress";
 		}
-		if (startupNeededOnboarding && modelFallbackMessage === formatNoModelsAvailableMessage()) {
+		if (startupNeededOnboarding && isNoModelsAvailableMessage(modelFallbackMessage) && !this.shouldRunOnboarding()) {
+			return "suppress";
+		}
+		if (startupNeededOnboarding && isNoModelsAvailableMessage(modelFallbackMessage)) {
 			return "wait";
 		}
 		return "show";

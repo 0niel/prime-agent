@@ -19,7 +19,7 @@ import { SessionManager } from "../../core/session-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import { DaemonClient } from "../daemon/daemon-client.js";
 import { type DaemonCommand, type DaemonResponse, isUnknownDaemonCommandError } from "../daemon/daemon-protocol.js";
-import type { SessionSummary } from "../daemon/daemon-session-list.js";
+import { resolveAttachModelFallbackMessage, type SessionSummary } from "../daemon/daemon-session-list.js";
 import { getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "../interactive/auth-flows.js";
 import { showFullPaneOverlay } from "../interactive/components/centered-overlay.js";
 import { CustomEditor } from "../interactive/components/custom-editor.js";
@@ -210,7 +210,7 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 				uiServices,
 				bindLocalSessionExtensions: false,
 				migratedProviders: options.migratedProviders,
-				modelFallbackMessage: opened.summary.modelFallbackMessage ?? options.modelFallbackMessage,
+				modelFallbackMessage: resolveAttachModelFallbackMessage(opened.summary, options.modelFallbackMessage),
 				verbose: options.verbose,
 				returnToAgentsView: true,
 				// Matches the node id scheme used by snapshot child seeding

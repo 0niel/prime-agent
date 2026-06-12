@@ -462,6 +462,7 @@ describe("InteractiveMode transcript rebuild", () => {
 describe("InteractiveMode startup onboarding warnings", () => {
 	type StartupWarningHarness = {
 		shouldRunOnboarding(): boolean;
+		getCurrentModel(): AgentConnectionModel | undefined;
 		getModelFallbackWarningAction(
 			modelFallbackMessage: string | undefined,
 			startupNeededOnboarding: boolean,
@@ -471,31 +472,45 @@ describe("InteractiveMode startup onboarding warnings", () => {
 	const getModelFallbackWarningAction = (InteractiveMode.prototype as unknown as StartupWarningHarness)
 		.getModelFallbackWarningAction;
 
+	const createHarness = (options: {
+		shouldRunOnboarding?: boolean;
+		currentModel?: AgentConnectionModel;
+	}): StartupWarningHarness => ({
+		shouldRunOnboarding: vi.fn(() => options.shouldRunOnboarding ?? false),
+		getCurrentModel: vi.fn(() => options.currentModel),
+		getModelFallbackWarningAction,
+	});
+
+	const liveModel = { id: "gpt-5.5", provider: "prime-inference" } as AgentConnectionModel;
+
 	test("suppresses the stale no-model warning after onboarding selects a model", () => {
-		const fakeThis: StartupWarningHarness = {
-			shouldRunOnboarding: vi.fn(() => false),
-			getModelFallbackWarningAction,
-		};
+		const fakeThis = createHarness({ shouldRunOnboarding: false });
 
 		expect(getModelFallbackWarningAction.call(fakeThis, formatNoModelsAvailableMessage(), true)).toBe("suppress");
 		expect(fakeThis.shouldRunOnboarding).toHaveBeenCalledTimes(1);
 	});
 
 	test("waits to suppress the stale no-model warning while onboarding is still needed", () => {
-		const fakeThis: StartupWarningHarness = {
-			shouldRunOnboarding: vi.fn(() => true),
-			getModelFallbackWarningAction,
-		};
+		const fakeThis = createHarness({ shouldRunOnboarding: true });
 
 		expect(getModelFallbackWarningAction.call(fakeThis, formatNoModelsAvailableMessage(), true)).toBe("wait");
 		expect(fakeThis.shouldRunOnboarding).toHaveBeenCalledTimes(1);
 	});
 
+	test("suppresses the no-model warning when the live session has a model", () => {
+		const fakeThis = createHarness({ currentModel: liveModel });
+
+		expect(getModelFallbackWarningAction.call(fakeThis, formatNoModelsAvailableMessage(), false)).toBe("suppress");
+	});
+
+	test("shows the no-model warning when the live session has no model", () => {
+		const fakeThis = createHarness({});
+
+		expect(getModelFallbackWarningAction.call(fakeThis, formatNoModelsAvailableMessage(), false)).toBe("show");
+	});
+
 	test("keeps real model restore fallback warnings after onboarding", () => {
-		const fakeThis: StartupWarningHarness = {
-			shouldRunOnboarding: vi.fn(() => false),
-			getModelFallbackWarningAction,
-		};
+		const fakeThis = createHarness({ shouldRunOnboarding: false, currentModel: liveModel });
 
 		expect(
 			getModelFallbackWarningAction.call(

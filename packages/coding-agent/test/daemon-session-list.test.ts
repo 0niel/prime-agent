@@ -3,7 +3,12 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, it } from "vitest";
 import type { SessionInfo } from "../src/core/session-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
-import { buildRlmChildSnapshots, buildSessionList } from "../src/modes/daemon/daemon-session-list.js";
+import {
+	buildRlmChildSnapshots,
+	buildSessionList,
+	resolveAttachModelFallbackMessage,
+	type SessionSummary,
+} from "../src/modes/daemon/daemon-session-list.js";
 
 describe("buildSessionList", () => {
 	it("derives active session statuses", () => {
@@ -182,6 +187,41 @@ describe("buildRlmChildSnapshots", () => {
 	it("returns no snapshots for sessions without children", () => {
 		const solo = makeState({ activeSessionId: "solo" });
 		expect(buildRlmChildSnapshots("solo", [solo])).toEqual([]);
+	});
+});
+
+describe("resolveAttachModelFallbackMessage", () => {
+	const startupMessage = "No models available. Use /login...";
+
+	function makeSummary(overrides: Partial<SessionSummary>): SessionSummary {
+		return {
+			id: "active-1",
+			status: "idle",
+			sessionId: "session-1",
+			cwd: "/tmp/project",
+			isStreaming: false,
+			isCompacting: false,
+			attachedClients: 0,
+			messageCount: 0,
+			pendingMessageCount: 0,
+			...overrides,
+		};
+	}
+
+	it("prefers the daemon's own fallback message", () => {
+		const summary = makeSummary({ modelFallbackMessage: "Could not restore model a/b. Using c/d" });
+
+		expect(resolveAttachModelFallbackMessage(summary, startupMessage)).toBe("Could not restore model a/b. Using c/d");
+	});
+
+	it("ignores the attaching process's snapshot when the session has a model", () => {
+		const summary = makeSummary({ model: { provider: "prime-inference", id: "gpt-5.5" } as SessionSummary["model"] });
+
+		expect(resolveAttachModelFallbackMessage(summary, startupMessage)).toBeUndefined();
+	});
+
+	it("falls back to the attaching process's snapshot when the session has no model", () => {
+		expect(resolveAttachModelFallbackMessage(makeSummary({}), startupMessage)).toBe(startupMessage);
 	});
 });
 

@@ -7,6 +7,7 @@ import type {
 	AgentSessionRuntimeDiagnostic,
 	AgentSessionServices,
 } from "./agent-session-services.js";
+import { isNoModelsAvailableMessage } from "./auth-guidance.js";
 import type { ReplacedSessionContext, SessionShutdownEvent, SessionStartEvent } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
 import type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
@@ -112,6 +113,12 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	}
 
 	get modelFallbackMessage(): string | undefined {
+		// The "no models available" warning describes session state, not a
+		// startup event: once the session gains a model (set_model, /login,
+		// onboarding), the stored snapshot is stale and must not reach clients.
+		if (isNoModelsAvailableMessage(this._modelFallbackMessage) && this._session.model) {
+			return undefined;
+		}
 		return this._modelFallbackMessage;
 	}
 
