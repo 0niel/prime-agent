@@ -1443,7 +1443,7 @@ class AgentsViewMode implements Component, Focusable {
 			this.replyActiveSessionId ? `${keyText("app.agents.back")} back` : undefined,
 		]
 			.filter((hint): hint is string => hint !== undefined)
-			.join("  ");
+			.join("   ");
 		return truncateToWidth(theme.fg("muted", hints), width);
 	}
 
