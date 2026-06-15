@@ -417,6 +417,7 @@ class AgentDaemon {
 				rlmChildId: options.id,
 				rlmParentNodeId: options.rlmParentNodeId,
 				prompt: options.prompt,
+				spawnCode: options.spawnCode,
 				sessionDir: options.sessionDir,
 			},
 		});

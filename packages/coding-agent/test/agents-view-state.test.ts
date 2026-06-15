@@ -221,6 +221,115 @@ describe("agents view state", () => {
 		expect(rows[0]?.runningSubagentCount).toBe(1);
 	});
 
+	test("groups expanded subagents by spawn code and reveals the program", () => {
+		const codeA = "task = sleep(60)\nfor i in range(2):\n    run_subagent(i, task)";
+		const codeB = ["a = 1", "b = 2", "c = 3", "d = 4", "e = 5", "f = 6"].join("\n");
+		const summaries = [
+			makeSummary({
+				id: "a1",
+				activeSessionId: "a1",
+				sessionId: "a1-session",
+				sessionName: "A1",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "parent-active",
+				spawnCode: codeA,
+				modified: "2026-01-01T00:00:04Z",
+			}),
+			makeSummary({
+				id: "a2",
+				activeSessionId: "a2",
+				sessionId: "a2-session",
+				sessionName: "A2",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "parent-active",
+				spawnCode: codeA,
+				modified: "2026-01-01T00:00:03Z",
+			}),
+			makeSummary({
+				id: "b1",
+				activeSessionId: "b1",
+				sessionId: "b1-session",
+				sessionName: "B1",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "parent-active",
+				spawnCode: codeB,
+				modified: "2026-01-01T00:00:02Z",
+			}),
+			makeSummary({
+				id: "parent-active",
+				activeSessionId: "parent-active",
+				sessionId: "parent-session",
+				sessionName: "Parent",
+				isStreaming: true,
+				status: "tool",
+			}),
+		];
+
+		const collapsed = buildAgentsViewRows(summaries);
+		expect(collapsed[1]?.kind).toBe("subagent-summary");
+		expect(collapsed[1]?.hasSpawnCode).toBe(true);
+
+		const parentIdentity = collapsed[0]?.identity ?? "";
+		const expandedNoProgram = buildAgentsViewRows(summaries, new Set([parentIdentity]));
+		// Without the program toggle, only the grouped subagent rows render.
+		expect(expandedNoProgram.map((row) => row.kind)).toEqual(["agent", "subagent", "subagent", "subagent"]);
+
+		const expanded = buildAgentsViewRows(summaries, new Set([parentIdentity]), new Set([parentIdentity]));
+		// Each spawn cell renders in full, once, directly above the subagents it
+		// launched — padded with a blank panel line above and below, no truncation.
+		expect(expanded.map((row) => [row.kind, row.code ?? row.title])).toEqual([
+			["agent", "Parent"],
+			["subagent-code", ""],
+			["subagent-code", "task = sleep(60)"],
+			["subagent-code", "for i in range(2):"],
+			["subagent-code", "    run_subagent(i, task)"],
+			["subagent-code", ""],
+			["subagent", "A1"],
+			["subagent", "A2"],
+			["subagent-code", ""],
+			["subagent-code", "a = 1"],
+			["subagent-code", "b = 2"],
+			["subagent-code", "c = 3"],
+			["subagent-code", "d = 4"],
+			["subagent-code", "e = 5"],
+			["subagent-code", "f = 6"],
+			["subagent-code", ""],
+			["subagent", "B1"],
+		]);
+		expect(expanded.every((row) => row.kind !== "subagent-code" || !row.selectable)).toBe(true);
+	});
+
+	test("caps spawn code at 10 lines with a remainder note", () => {
+		const longCode = Array.from({ length: 25 }, (_, i) => `line_${i}`).join("\n");
+		const summaries = [
+			makeSummary({
+				id: "c1",
+				activeSessionId: "c1",
+				sessionId: "c1-session",
+				sessionName: "C1",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "parent-active",
+				spawnCode: longCode,
+			}),
+			makeSummary({
+				id: "parent-active",
+				activeSessionId: "parent-active",
+				sessionId: "parent-session",
+				sessionName: "Parent",
+				isStreaming: true,
+				status: "tool",
+			}),
+		];
+		const parentIdentity = buildAgentsViewRows(summaries)[0]?.identity ?? "";
+		const rows = buildAgentsViewRows(summaries, new Set([parentIdentity]), new Set([parentIdentity]));
+		const codeLines = rows.filter((row) => row.kind === "subagent-code").map((row) => row.code);
+		// 10 capped body lines + the "more" note + two blank pad lines.
+		const bodyLines = codeLines.filter((line) => line !== "");
+		expect(bodyLines).toHaveLength(11);
+		expect(bodyLines.slice(0, 10)).toEqual(Array.from({ length: 10 }, (_, i) => `line_${i}`));
+		expect(bodyLines[10]).toBe("… +15 more lines");
+	});
+
 	test("omits subagents when their parent is not visible", () => {
 		const rows = buildAgentsViewRows([
 			makeSummary({

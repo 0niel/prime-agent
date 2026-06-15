@@ -63,6 +63,9 @@ const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "Write a reply to this agent";
 const COMPLETED_ROW_ICON = "✓";
 const WORKING_ICON_FRAMES = ["◇", "◈", "◆", "◈"] as const;
 const SELECTED_ROW_MARKER = "\0agents-view-selected-row\0";
+// Tags a spawn-code line so finalize can wrap the whole row in a panel
+// background, visually segmenting the program from the agent rows.
+const CODE_ROW_MARKER = "\0agents-view-code-row\0";
 
 export interface AgentsViewModeOptions {
 	socketPath: string;
@@ -247,6 +250,9 @@ class AgentsViewMode implements Component, Focusable {
 	private rows: AgentsViewRow[] = [];
 	private lastVisibleSummaries: SessionSummary[] = [];
 	private expandedSubagentParents = new Set<string>();
+	// Agent row identities whose full spawn program is currently shown.
+	// The program key toggles each agent shown ↔ hidden.
+	private programShownParents = new Set<string>();
 	private selectedIndex = 0;
 	private selectedRowIdentity: string | undefined;
 	private selectedActiveSessionId: string | undefined;
@@ -366,6 +372,10 @@ class AgentsViewMode implements Component, Focusable {
 		this.clearDeleteConfirmation({ render: false });
 		if (this.keybindings.matches(data, "app.agents.reply") && this.editor.getText().length === 0) {
 			void this.toggleReplyTarget();
+			return;
+		}
+		if (this.keybindings.matches(data, "app.agents.program") && this.editor.getText().length === 0) {
+			this.cycleProgramForSelected();
 			return;
 		}
 		if (this.editor.getText().length === 0 && this.handleListNavigation(data)) {
@@ -592,13 +602,24 @@ class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		this.expandedSubagentParents = next;
+		// A collapsed agent's revealed program collapses with it, so reopening
+		// starts from the hidden state rather than a stale reveal.
+		for (const identity of [...this.programShownParents]) {
+			if (!next.has(identity)) {
+				this.programShownParents.delete(identity);
+			}
+		}
 		this.rebuildRows();
 	}
 
 	/** Rebuild rows from the last fetched summaries, keeping selection on the same row. */
 	private rebuildRows(): void {
 		const selectedIdentity = this.rows[this.selectedIndex]?.identity;
-		this.rows = buildAgentsViewRows(this.lastVisibleSummaries, this.expandedSubagentParents);
+		this.rows = buildAgentsViewRows(
+			this.lastVisibleSummaries,
+			this.expandedSubagentParents,
+			this.programShownParents,
+		);
 		const index =
 			selectedIdentity === undefined ? -1 : this.rows.findIndex((row) => row.identity === selectedIdentity);
 		if (index >= 0) {
@@ -829,6 +850,70 @@ class AgentsViewMode implements Component, Focusable {
 		}
 		this.syncSelectedRowState();
 		this.ui.requestRender();
+	}
+
+	/**
+	 * Toggle the full spawn program for the agent owning the selected row:
+	 * one press shows it, another hides it. The subagent list is expanded as
+	 * needed so the code sits directly above the subagents it launched.
+	 */
+	private cycleProgramForSelected(): void {
+		const row = this.rows[this.selectedIndex];
+		if (!row) {
+			return;
+		}
+		const target = row.kind === "agent" ? row.identity : row.parentIdentity;
+		if (!target) {
+			return;
+		}
+		if (!this.targetHasSpawnCode(target)) {
+			this.setStatusMessage("No program recorded for these subagents");
+			return;
+		}
+		// Code only renders inside an expanded subagent list, so reveal it too.
+		this.expandedSubagentParents.add(target);
+		if (this.programShownParents.has(target)) {
+			this.programShownParents.delete(target);
+		} else {
+			this.programShownParents.add(target);
+		}
+		const prevIdentity = row.identity;
+		this.rebuildRows();
+		// The collapsed summary row vanishes once expanded; keep a sane selection.
+		if (this.rows[this.selectedIndex]?.identity !== prevIdentity) {
+			const agentIndex = this.rows.findIndex((candidate) => candidate.identity === target);
+			if (agentIndex >= 0) {
+				this.selectedIndex = agentIndex;
+			}
+		}
+		this.syncSelectedRowState();
+		this.ui.requestRender();
+	}
+
+	/** Whether any subagent under the given agent identity carries spawn code. */
+	private targetHasSpawnCode(target: string): boolean {
+		for (const row of this.rows) {
+			if (row.parentIdentity !== target) {
+				continue;
+			}
+			if (row.kind === "subagent-summary") {
+				return row.hasSpawnCode === true;
+			}
+			if (row.kind === "subagent" && rowHasSpawnCode(row)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** True when the selected row exposes the "show program" affordance. */
+	private selectedRowCanShowProgram(): boolean {
+		const row = this.rows[this.selectedIndex];
+		if (!row) {
+			return false;
+		}
+		const target = row.kind === "agent" ? row.identity : row.parentIdentity;
+		return target !== undefined && this.targetHasSpawnCode(target);
 	}
 
 	private openSelectedSubagent(row: AgentsViewRow): void {
@@ -1195,7 +1280,11 @@ class AgentsViewMode implements Component, Focusable {
 				shouldShowAgentsViewSession(summary, this.inactiveAgentIdentities.has(getSummaryIdentity(summary))),
 			);
 			this.lastVisibleSummaries = this.withPendingDeleteSession(visibleSessions);
-			this.rows = buildAgentsViewRows(this.lastVisibleSummaries, this.expandedSubagentParents);
+			this.rows = buildAgentsViewRows(
+				this.lastVisibleSummaries,
+				this.expandedSubagentParents,
+				this.programShownParents,
+			);
 			this.restoreSelection();
 			this.ui.requestRender();
 		} catch (error) {
@@ -1356,9 +1445,13 @@ class AgentsViewMode implements Component, Focusable {
 
 	private renderRow(row: AgentsViewRow, width: number): string {
 		const selected = row.selectable && row.identity === this.rows[this.selectedIndex]?.identity;
+		if (row.kind === "subagent-code") {
+			return this.renderCodeRow(row);
+		}
 		if (row.kind === "subagent-summary") {
 			const indent = "  ".repeat(row.depth);
-			const label = theme.fg("dim", `▸ ${row.title}`);
+			const hint = row.hasSpawnCode ? theme.fg("dim", ` · ${keyText("app.agents.program")} show program`) : "";
+			const label = `${theme.fg("dim", `▸ ${row.title}`)}${hint}`;
 			const line = padLine(truncateToWidth(`${indent}${label}`, width, ""), width);
 			return selected ? `${SELECTED_ROW_MARKER}${line}` : line;
 		}
@@ -1385,15 +1478,32 @@ class AgentsViewMode implements Component, Focusable {
 		return selected ? `${SELECTED_ROW_MARKER}${line}` : line;
 	}
 
+	// Spawn-code rows are read-only context. They render deemphasized — muted
+	// text on a panel background (applied in finalizeRenderedLine) so the program
+	// reads as one quiet segmented block rather than competing with agent rows.
+	private renderCodeRow(row: AgentsViewRow): string {
+		const indent = "  ".repeat(row.depth);
+		const body = theme.fg("muted", row.code || " ");
+		return `${CODE_ROW_MARKER}${indent}  ${body}`;
+	}
+
 	private finalizeRenderedLine(line: string, width: number): string {
-		const selected = line.startsWith(SELECTED_ROW_MARKER);
-		let content = selected ? line.slice(SELECTED_ROW_MARKER.length) : line;
+		const code = line.startsWith(CODE_ROW_MARKER);
+		const selected = !code && line.startsWith(SELECTED_ROW_MARKER);
+		let content = code
+			? line.slice(CODE_ROW_MARKER.length)
+			: selected
+				? line.slice(SELECTED_ROW_MARKER.length)
+				: line;
 		// Each rendered line must occupy exactly one terminal row; a stray
 		// newline would shift every line below it and overlap the editor.
 		if (content.includes("\n") || content.includes("\r")) {
 			content = content.replace(/[\r\n]+/g, " ");
 		}
 		const padded = padLine(truncateToWidth(content, width), width);
+		if (code) {
+			return theme.bg("toolPanelBg", padded);
+		}
 		return selected ? theme.bg("selectedBg", padded) : padded;
 	}
 
@@ -1440,6 +1550,7 @@ class AgentsViewMode implements Component, Focusable {
 			selectedAgent ? `${keyText("app.agents.reply")} reply` : undefined,
 			selectedAgent ? `${keyText("app.agents.delete")} stop/deactivate` : undefined,
 			selectedSubagent ? `${keyText("app.agents.delete")} stop` : undefined,
+			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,
 			this.replyActiveSessionId ? `${keyText("app.agents.back")} back` : undefined,
 		]
 			.filter((hint): hint is string => hint !== undefined)
@@ -1538,6 +1649,11 @@ function countRowsBySection(rows: readonly AgentsViewRow[]): Record<AgentsViewSe
 
 function getSelectedRowIdentity(row: AgentsViewRow | undefined): string | undefined {
 	return row?.identity;
+}
+
+function rowHasSpawnCode(row: AgentsViewRow): boolean {
+	const code = row.summary.spawnCode;
+	return typeof code === "string" && code.trim().length > 0;
 }
 
 function isRunningSessionSummary(summary: SessionSummary): boolean {

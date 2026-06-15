@@ -34,6 +34,7 @@ export interface AppKeybindings {
 	"app.agents.back": true;
 	"app.agents.reply": true;
 	"app.agents.delete": true;
+	"app.agents.program": true;
 	"app.tree.foldOrUp": true;
 	"app.tree.unfoldOrDown": true;
 	"app.tree.editLabel": true;
@@ -116,6 +117,7 @@ export const KEYBINDINGS = {
 	"app.agents.back": { defaultKeys: "left", description: "Return to agents view" },
 	"app.agents.reply": { defaultKeys: "space", description: "Reply to selected agent" },
 	"app.agents.delete": { defaultKeys: "ctrl+x", description: "Stop or delete selected agent" },
+	"app.agents.program": { defaultKeys: "ctrl+o", description: "Show the program that spawned subagents" },
 	"app.tree.foldOrUp": {
 		defaultKeys: ["ctrl+left", "alt+left"],
 		description: "Fold tree branch or move up",
@@ -260,6 +262,7 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	agentsBack: "app.agents.back",
 	agentsReply: "app.agents.reply",
 	agentsDelete: "app.agents.delete",
+	agentsProgram: "app.agents.program",
 	treeFoldOrUp: "app.tree.foldOrUp",
 	treeUnfoldOrDown: "app.tree.unfoldOrDown",
 	treeEditLabel: "app.tree.editLabel",

@@ -3,7 +3,10 @@ import type { SessionSummary } from "../daemon/daemon-session-list.js";
 
 export type AgentsViewSection = "working" | "completed";
 
-export type AgentsViewRowKind = "agent" | "subagent-summary" | "subagent";
+export type AgentsViewRowKind = "agent" | "subagent-summary" | "subagent" | "subagent-code";
+
+// Hard cap on spawn-code lines shown so a large program never floods the view.
+const MAX_SPAWN_CODE_LINES = 10;
 
 export interface AgentsViewRow {
 	kind: AgentsViewRowKind;
@@ -19,6 +22,10 @@ export interface AgentsViewRow {
 	identity: string;
 	/** Identity of the agent row this row is nested under. */
 	parentIdentity?: string;
+	/** True when this row's subagents carry spawn code that can be revealed. */
+	hasSpawnCode?: boolean;
+	/** One source line of the spawn cell, for "subagent-code" rows. */
+	code?: string;
 }
 
 export function classifyAgentsViewSession(summary: SessionSummary): AgentsViewSection {
@@ -66,6 +73,7 @@ export function getAgentsViewSummaryIdentity(summary: SessionSummary): string {
 export function buildAgentsViewRows(
 	summaries: readonly SessionSummary[],
 	expandedSubagentParents: ReadonlySet<string> = new Set(),
+	programShownParents: ReadonlySet<string> = new Set(),
 ): AgentsViewRow[] {
 	const baseRows = summaries.map(
 		(summary): MutableAgentsViewRow => ({
@@ -111,13 +119,23 @@ export function buildAgentsViewRows(
 		if (children.length === 0) {
 			return;
 		}
+		const childHasSpawnCode = children.some((child) => hasSpawnCode(child.summary));
 		if (expandedSubagentParents.has(row.identity)) {
-			for (const child of children.sort(compareAgentsViewRows)) {
-				child.parentIdentity = row.identity;
-				emit(child, depth + 1);
+			const showProgram = programShownParents.has(row.identity);
+			const groups = groupChildrenBySpawnCode(children.sort(compareAgentsViewRows));
+			for (const [groupIndex, group] of groups.entries()) {
+				if (showProgram && group.spawnCode) {
+					for (const codeRow of buildSpawnCodeRows(row, group.spawnCode, depth + 1, groupIndex)) {
+						flattened.push(codeRow);
+					}
+				}
+				for (const child of group.children) {
+					child.parentIdentity = row.identity;
+					emit(child, depth + 1);
+				}
 			}
 		} else {
-			flattened.push(createSubagentSummaryRow(row, children.length, depth + 1));
+			flattened.push(createSubagentSummaryRow(row, children.length, depth + 1, childHasSpawnCode));
 		}
 	};
 	for (const root of roots.sort(compareAgentsViewRows)) {
@@ -128,7 +146,12 @@ export function buildAgentsViewRows(
 
 type MutableAgentsViewRow = AgentsViewRow;
 
-function createSubagentSummaryRow(parent: AgentsViewRow, totalCount: number, depth: number): AgentsViewRow {
+function createSubagentSummaryRow(
+	parent: AgentsViewRow,
+	totalCount: number,
+	depth: number,
+	hasSpawnCode: boolean,
+): AgentsViewRow {
 	const running = parent.runningSubagentCount;
 	// Finished subagents stay reachable through the summary row even when
 	// nothing is running anymore.
@@ -148,7 +171,70 @@ function createSubagentSummaryRow(parent: AgentsViewRow, totalCount: number, dep
 		runningSubagentCount: running,
 		identity: `subagents:${parent.identity}`,
 		parentIdentity: parent.identity,
+		hasSpawnCode,
 	};
+}
+
+function hasSpawnCode(summary: SessionSummary): boolean {
+	return typeof summary.spawnCode === "string" && summary.spawnCode.trim().length > 0;
+}
+
+interface SpawnCodeGroup {
+	/** Shared spawn-cell source for this group, or undefined when unavailable. */
+	spawnCode?: string;
+	children: MutableAgentsViewRow[];
+}
+
+// Subagents spawned by the same IPython cell share its source; group them so
+// each spawn cell renders once, above the subagents it launched. Different turns
+// produce different cells and therefore distinct groups. Insertion order follows
+// each cell's first subagent so groups read top-to-bottom in spawn order.
+function groupChildrenBySpawnCode(children: readonly MutableAgentsViewRow[]): SpawnCodeGroup[] {
+	const NO_CODE_KEY = " no-spawn-code";
+	const groups = new Map<string, SpawnCodeGroup>();
+	for (const child of children) {
+		const code = hasSpawnCode(child.summary) ? child.summary.spawnCode : undefined;
+		const key = code ?? NO_CODE_KEY;
+		const group = groups.get(key);
+		if (group) {
+			group.children.push(child);
+		} else {
+			groups.set(key, { spawnCode: code, children: [child] });
+		}
+	}
+	return [...groups.values()];
+}
+
+function buildSpawnCodeRows(
+	parent: AgentsViewRow,
+	spawnCode: string,
+	depth: number,
+	groupIndex: number,
+): AgentsViewRow[] {
+	const makeRow = (code: string, lineIndex: string): AgentsViewRow => ({
+		kind: "subagent-code",
+		section: parent.section,
+		summary: parent.summary,
+		title: "",
+		subtitle: "",
+		statusLabel: "",
+		depth,
+		// Code rows are read-only context; selection skips over them.
+		selectable: false,
+		runningSubagentCount: 0,
+		identity: `code:${parent.identity}:${groupIndex}:${lineIndex}`,
+		parentIdentity: parent.identity,
+		code,
+	});
+	const allLines = spawnCode.replace(/\s+$/, "").split("\n");
+	// Cap the body so a long program can't flood the view; note the remainder.
+	const lines = allLines.slice(0, MAX_SPAWN_CODE_LINES).map((line, i) => makeRow(line, String(i)));
+	const hidden = allLines.length - lines.length;
+	if (hidden > 0) {
+		lines.push(makeRow(`… +${hidden} more ${hidden === 1 ? "line" : "lines"}`, "more"));
+	}
+	// A blank panel line above and below pads the program into a clean block.
+	return [makeRow("", "pad-top"), ...lines, makeRow("", "pad-bottom")];
 }
 
 function compareAgentsViewRows(a: AgentsViewRow, b: AgentsViewRow): number {

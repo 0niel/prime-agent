@@ -94,6 +94,8 @@ interface JupyterMessage {
 
 interface ActiveExecution {
 	requestMsgId: string;
+	/** Source of the cell currently executing; surfaced to rlm.run spawns. */
+	code: string;
 	started: number;
 	maxChars: number;
 	opts: ExecuteOptions;
@@ -313,6 +315,10 @@ export class KernelManager {
 	/** Serializes execute() calls — Jupyter shell channel is request/reply. */
 	private executionQueue: Promise<unknown> = Promise.resolve();
 	private activeExecution?: ActiveExecution;
+	// Source of the most recently started cell, retained after it finishes so
+	// rlm.run spawns from detached asyncio tasks (cell already idle) can still
+	// attribute their spawning program.
+	private lastCellCode?: string;
 	private readonly inFlightHostRequests = new Set<Promise<void>>();
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
 	/** Memoized so concurrent callers all await the same in-flight startup. */
@@ -562,6 +568,7 @@ export class KernelManager {
 			const result = createDeferred<ExecuteResult>();
 			const execution: ActiveExecution = {
 				requestMsgId,
+				code,
 				started,
 				maxChars,
 				opts,
@@ -574,6 +581,7 @@ export class KernelManager {
 				reject: result.reject,
 			};
 			this.activeExecution = execution;
+			this.lastCellCode = code;
 			try {
 				await shell.send(encode(msg, conn.key));
 			} catch (error) {
@@ -783,7 +791,11 @@ export class KernelManager {
 		if (!handler) {
 			throw new Error(`host request type "${data.type}" is not available in this session`);
 		}
-		return handler(data);
+		// Tag the request with the cell that triggered it. A blocking call is still
+		// the in-flight execution; detached spawns (asyncio.create_task) fire after
+		// the scheduling cell goes idle, so fall back to that last cell's source.
+		const cellSourceCode = this.activeExecution?.code ?? this.lastCellCode;
+		return handler({ ...data, cellSourceCode });
 	}
 
 	private async sendCommMessage(commId: string, data: Record<string, unknown>): Promise<void> {

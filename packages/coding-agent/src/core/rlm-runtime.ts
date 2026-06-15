@@ -12,6 +12,8 @@ export interface RlmUsage {
 export interface RlmRunRequest {
 	prompt: string;
 	kwargs: Record<string, unknown>;
+	/** Source of the IPython cell that issued this rlm.run call, when available. */
+	cellSourceCode?: string;
 }
 
 export interface RlmRunResult {
@@ -38,7 +40,8 @@ export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHand
 			throw new Error("rlm.run prompt must be a string");
 		}
 		const kwargs = isRecord(payload.kwargs) ? payload.kwargs : {};
-		const result = await handler({ prompt: payload.prompt, kwargs });
+		const cellSourceCode = typeof payload.cellSourceCode === "string" ? payload.cellSourceCode : undefined;
+		const result = await handler({ prompt: payload.prompt, kwargs, cellSourceCode });
 		return result as unknown as Record<string, unknown>;
 	};
 }
@@ -62,6 +65,8 @@ export interface CreateRlmSubagentRuntimeOptions {
 	rlmDepth: number;
 	rlmMaxDepth: number;
 	rlmParentNodeId: string;
+	/** Source of the IPython cell that spawned this subagent, for display. */
+	spawnCode?: string;
 }
 
 export interface SubagentRuntimeHost {

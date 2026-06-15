@@ -15,6 +15,10 @@ import type { ActiveSessionState } from "./active-session-state.js";
 
 export type SessionStatus = "user" | "idle" | "tool" | "model" | AgentConnectionSavedSessionStateStatus;
 
+// Upper bound on the spawn-code source carried in a session summary. Generous
+// enough for real spawn cells while keeping the daemon wire payload bounded.
+const SPAWN_CODE_MAX_CHARS = 4000;
+
 // Lightweight daemon session shape used by list, create, rename, attach, and state responses.
 export interface SessionSummary {
 	id: string;
@@ -41,6 +45,8 @@ export interface SessionSummary {
 	parentSessionPath?: string;
 	rlmChildId?: string;
 	rlmParentNodeId?: string;
+	/** Source of the IPython cell that spawned this subagent, for display. */
+	spawnCode?: string;
 	modelFallbackMessage?: string;
 	diagnostics?: AgentSessionRuntimeDiagnostic[];
 }
@@ -136,6 +142,9 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		parentSessionPath: savedSession?.parentSessionPath ?? metadata.parentSessionFile,
 		rlmChildId: metadata.rlmChildId,
 		rlmParentNodeId: metadata.rlmParentNodeId,
+		// Cap the cell source so the summary stays small on the daemon wire; the
+		// agents view truncates further for display.
+		spawnCode: metadata.spawnCode ? metadata.spawnCode.slice(0, SPAWN_CODE_MAX_CHARS) : undefined,
 		modelFallbackMessage: activeSession.runtime.modelFallbackMessage,
 		diagnostics: [...activeSession.runtime.diagnostics],
 	};
