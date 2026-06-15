@@ -62,7 +62,7 @@ describe("buildRlmPrompt", () => {
 				"",
 				"Do not assume IPython is the native runtime of the external thing being investigated. A repository, package, service, dataset, paper, website, benchmark, or API may have its own environment and normal interface. Evaluate external systems through their own interface, then use IPython to coordinate the process and analyze what comes back.",
 				"",
-				"When running shell commands from IPython, use `%%bash` cells. Avoid `!cmd` shell escapes for project commands so shell behavior is explicit and multi-line commands share one shell context.",
+				"When running shell commands from IPython, use `%%bash` cells. If you use `%%bash`, it must be the first line of the code cell: no comments, spaces, blank lines, imports, or Python statements before it. Avoid `!cmd` shell escapes for project commands so shell behavior is explicit and multi-line commands share one shell context.",
 				"",
 				'Project import checks are target-environment checks. If the user asks whether the current project, package, or repository imports from Python, do not run `import <project>` directly in IPython. Use a `%%bash` cell with the target environment, such as `uv run python -c "import <package>"`, `.venv/bin/python -c "import <package>"`, or the documented project command.',
 				"",
@@ -88,6 +88,40 @@ describe("buildRlmPrompt", () => {
 		});
 
 		expect(prompt).not.toContain("IPython is the agent's long-lived notebook");
+	});
+
+	test("documents the %%bash first-line rule when ipython is active", () => {
+		const prompt = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/.pi/sessions/session.jsonl",
+			activeTools: ["ipython"],
+			allowRecursion: false,
+		});
+
+		expect(prompt).toContain("it must be the first line of the code cell");
+	});
+
+	test("includes the edit skill guidance only when the edit skill is installed", () => {
+		const withEdit = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/.pi/sessions/session.jsonl",
+			installedSkills: ["edit"],
+			activeTools: ["ipython"],
+			allowRecursion: false,
+		});
+
+		expect(withEdit).toContain('await edit(path="pkg/file.py", old_str=old, new_str=new)');
+		expect(withEdit).toContain("triple double quotes");
+
+		const withoutEdit = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/.pi/sessions/session.jsonl",
+			installedSkills: ["websearch"],
+			activeTools: ["ipython"],
+			allowRecursion: false,
+		});
+
+		expect(withoutEdit).not.toContain("await edit(path=");
 	});
 });
 
