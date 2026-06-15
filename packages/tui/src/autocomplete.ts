@@ -226,6 +226,7 @@ type Awaitable<T> = T | Promise<T>;
 
 export interface SlashCommand {
 	name: string;
+	aliases?: readonly string[];
 	description?: string;
 	argumentHint?: string;
 	// Function to get argument completions for this command
@@ -309,17 +310,19 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				const prefix = textBeforeCursor.slice(1);
 				const commandItems = this.commands.map((cmd) => {
 					const name = "name" in cmd ? cmd.name : cmd.value;
+					const aliases = "aliases" in cmd && cmd.aliases ? cmd.aliases : [];
 					const hint = "argumentHint" in cmd && cmd.argumentHint ? cmd.argumentHint : undefined;
 					const desc = cmd.description ?? "";
 					const fullDesc = hint ? (desc ? `${hint} — ${desc}` : hint) : desc;
 					return {
 						name,
+						searchText: [name, ...aliases].join(" "),
 						label: name,
 						description: fullDesc || undefined,
 					};
 				});
 
-				const filtered = fuzzyFilter(commandItems, prefix, (item) => item.name).map((item) => ({
+				const filtered = fuzzyFilter(commandItems, prefix, (item) => item.searchText).map((item) => ({
 					value: item.name,
 					label: item.label,
 					...(item.description && { description: item.description }),

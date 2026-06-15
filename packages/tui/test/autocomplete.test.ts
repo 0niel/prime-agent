@@ -55,6 +55,27 @@ const getSuggestions = (
 ) => provider.getSuggestions(lines, cursorLine, cursorCol, { signal: new AbortController().signal, force });
 
 describe("CombinedAutocompleteProvider", () => {
+	describe("slash commands", () => {
+		it("matches command aliases while previewing and completing the canonical command", async () => {
+			const provider = new CombinedAutocompleteProvider(
+				[
+					{
+						name: "new",
+						aliases: ["clear"],
+						description: "Start a new session",
+					},
+				],
+				"/tmp",
+			);
+			const result = await getSuggestions(provider, ["/clear"], 0, 6);
+
+			assert.deepStrictEqual(result, {
+				prefix: "/clear",
+				items: [{ value: "new", label: "new", description: "Start a new session" }],
+			});
+		});
+	});
+
 	describe("extractPathPrefix", () => {
 		it("extracts / from 'hey /' when forced", async () => {
 			const provider = new CombinedAutocompleteProvider([], "/tmp");

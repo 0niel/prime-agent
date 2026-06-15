@@ -8,7 +8,13 @@
  * extension commands are expanded by the daemon-side session.
  */
 
-import { BUILTIN_SLASH_COMMANDS, type BuiltinSlashCommand } from "../../core/slash-commands.js";
+import {
+	BUILTIN_SLASH_COMMANDS,
+	type BuiltinSlashCommand,
+	isBuiltinSlashCommandName,
+	type ParsedSlashCommand,
+	resolveBuiltinSlashCommandName,
+} from "../../core/slash-commands.js";
 
 const AGENTS_VIEW_COMMAND_NAMES = ["login", "logout", "model", "quit"] as const;
 
@@ -27,22 +33,7 @@ export const AGENTS_VIEW_SLASH_COMMANDS: readonly BuiltinSlashCommand[] = AGENTS
 	return { ...builtin, description: AGENTS_VIEW_COMMAND_DESCRIPTIONS[name] ?? builtin.description };
 });
 
-export interface ParsedSlashCommand {
-	name: string;
-	args: string;
-}
-
-export function parseSlashCommand(text: string): ParsedSlashCommand | undefined {
-	if (!text.startsWith("/")) {
-		return undefined;
-	}
-	const spaceIndex = text.indexOf(" ");
-	const name = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-	if (!name) {
-		return undefined;
-	}
-	return { name, args: spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim() };
-}
+export { type ParsedSlashCommand, parseSlashCommand } from "../../core/slash-commands.js";
 
 export type AgentsViewCommandKind =
 	/** Whitelisted built-in that runs directly in the agents view. */
@@ -53,11 +44,16 @@ export type AgentsViewCommandKind =
 	| "unknown";
 
 export function classifyAgentsViewCommand(name: string): AgentsViewCommandKind {
-	if ((AGENTS_VIEW_COMMAND_NAMES as readonly string[]).includes(name)) {
+	const canonicalName = resolveBuiltinSlashCommandName(name);
+	if ((AGENTS_VIEW_COMMAND_NAMES as readonly string[]).includes(canonicalName)) {
 		return "agents-view";
 	}
-	if (BUILTIN_SLASH_COMMANDS.some((command) => command.name === name)) {
+	if (isBuiltinSlashCommandName(name)) {
 		return "session-only";
 	}
 	return "unknown";
+}
+
+export function resolveAgentsViewCommand(command: ParsedSlashCommand): ParsedSlashCommand {
+	return { ...command, name: resolveBuiltinSlashCommandName(command.name) };
 }

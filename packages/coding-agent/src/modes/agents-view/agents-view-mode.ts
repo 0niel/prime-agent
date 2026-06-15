@@ -41,6 +41,7 @@ import {
 	classifyAgentsViewCommand,
 	type ParsedSlashCommand,
 	parseSlashCommand,
+	resolveAgentsViewCommand,
 } from "./agents-view-commands.js";
 import {
 	type AgentsViewRow,
@@ -625,13 +626,18 @@ class AgentsViewMode implements Component, Focusable {
 			const kind = classifyAgentsViewCommand(command.name);
 			if (kind === "agents-view") {
 				this.editor.setText("");
-				await this.runSlashCommand(command);
+				await this.runSlashCommand(resolveAgentsViewCommand(command));
 				return;
 			}
 			if (kind === "session-only") {
 				this.editor.setText("");
+				const resolvedCommand = resolveAgentsViewCommand(command);
+				const commandLabel =
+					resolvedCommand.name === command.name
+						? `/${command.name}`
+						: `/${command.name} maps to /${resolvedCommand.name}, which`;
 				this.setStatusMessage(
-					`/${command.name} is only available inside an agent session — press ${keyText("tui.select.confirm")} on an agent to open it`,
+					`${commandLabel} is only available inside an agent session — press ${keyText("tui.select.confirm")} on an agent to open it`,
 				);
 				return;
 			}

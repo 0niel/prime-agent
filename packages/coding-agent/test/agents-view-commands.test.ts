@@ -4,6 +4,7 @@ import {
 	AGENTS_VIEW_SLASH_COMMANDS,
 	classifyAgentsViewCommand,
 	parseSlashCommand,
+	resolveAgentsViewCommand,
 } from "../src/modes/agents-view/agents-view-commands.js";
 
 describe("parseSlashCommand", () => {
@@ -41,6 +42,11 @@ describe("classifyAgentsViewCommand", () => {
 		for (const name of ["compact", "fork", "settings", "resume", "new", "clear", "export"]) {
 			expect(classifyAgentsViewCommand(name)).toBe("session-only");
 		}
+	});
+
+	test("aliases classify by their canonical built-in target", () => {
+		expect(classifyAgentsViewCommand("clear")).toBe("session-only");
+		expect(resolveAgentsViewCommand({ name: "clear", args: "" })).toEqual({ name: "new", args: "" });
 	});
 
 	test("non-built-ins pass through for daemon-side expansion", () => {

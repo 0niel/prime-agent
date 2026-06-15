@@ -15,9 +15,26 @@ export interface BuiltinSlashCommand {
 	description: string;
 	/** Shown in autocomplete before the description, e.g. "[instructions]" */
 	argumentHint?: string;
+	/** Hidden names that resolve to this command without being shown as commands. */
+	aliases?: readonly string[];
 }
 
-export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
+export interface ParsedSlashCommand {
+	name: string;
+	args: string;
+}
+
+export interface ResolvedSlashCommand extends ParsedSlashCommand {
+	originalName: string;
+	isAlias: boolean;
+}
+
+interface BuiltinSlashCommandAlias {
+	name: string;
+	aliasFor: string;
+}
+
+const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "settings", description: "Open settings menu" },
 	{ name: "model", description: "Select model (opens selector UI)" },
 	{ name: "scoped-models", description: "Enable/disable models for Ctrl+P cycling" },
@@ -28,7 +45,6 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "name", description: "Set session display name" },
 	{ name: "session", description: "Show session info" },
 	{ name: "context", description: "Show token, cost, and context usage for agent and sub-agents" },
-	{ name: "usage", description: "Show token, cost, and context usage (alias for /context)" },
 	{ name: "changelog", description: "Show changelog entries" },
 	{ name: "hotkeys", description: "Show all keyboard shortcuts" },
 	{ name: "fork", description: "Create a new fork from a previous user message" },
@@ -37,7 +53,6 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "login", description: "Configure provider authentication" },
 	{ name: "logout", description: "Remove provider authentication" },
 	{ name: "new", description: "Start a new session" },
-	{ name: "clear", description: "Start a new session (alias for /new)" },
 	{
 		name: "compact",
 		description: "Compact the session context; optional instructions focus the summary",
@@ -49,3 +64,66 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "reload", description: "Reload keybindings, extensions, skills, prompts, and themes" },
 	{ name: "quit", description: `Quit ${APP_NAME}` },
 ];
+
+const BUILTIN_SLASH_COMMAND_ALIASES: ReadonlyArray<BuiltinSlashCommandAlias> = [
+	{ name: "clear", aliasFor: "new" },
+	{ name: "usage", aliasFor: "context" },
+];
+
+function buildBuiltinSlashCommands(): ReadonlyArray<BuiltinSlashCommand> {
+	const canonicalByName = new Map(CANONICAL_BUILTIN_SLASH_COMMANDS.map((command) => [command.name, command]));
+	const aliasesByTarget = new Map<string, string[]>();
+	for (const alias of BUILTIN_SLASH_COMMAND_ALIASES) {
+		const target = canonicalByName.get(alias.aliasFor);
+		if (!target) {
+			throw new Error(`Slash command alias '/${alias.name}' targets unknown command '/${alias.aliasFor}'`);
+		}
+		const targetAliases = aliasesByTarget.get(alias.aliasFor);
+		if (targetAliases) {
+			targetAliases.push(alias.name);
+		} else {
+			aliasesByTarget.set(alias.aliasFor, [alias.name]);
+		}
+	}
+	return CANONICAL_BUILTIN_SLASH_COMMANDS.map((command) => ({
+		...command,
+		...(aliasesByTarget.has(command.name) ? { aliases: aliasesByTarget.get(command.name) } : {}),
+	}));
+}
+
+export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = buildBuiltinSlashCommands();
+
+const BUILTIN_SLASH_COMMAND_BY_NAME = new Map(BUILTIN_SLASH_COMMANDS.map((command) => [command.name, command]));
+const BUILTIN_SLASH_COMMAND_ALIAS_TO_NAME = new Map(
+	BUILTIN_SLASH_COMMANDS.flatMap((command) => command.aliases?.map((alias) => [alias, command.name] as const) ?? []),
+);
+
+export function parseSlashCommand(text: string): ParsedSlashCommand | undefined {
+	if (!text.startsWith("/")) {
+		return undefined;
+	}
+	const spaceIndex = text.indexOf(" ");
+	const name = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+	if (!name) {
+		return undefined;
+	}
+	return { name, args: spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim() };
+}
+
+export function resolveBuiltinSlashCommandName(name: string): string {
+	return BUILTIN_SLASH_COMMAND_ALIAS_TO_NAME.get(name) ?? name;
+}
+
+export function isBuiltinSlashCommandName(name: string): boolean {
+	return BUILTIN_SLASH_COMMAND_BY_NAME.has(name) || BUILTIN_SLASH_COMMAND_ALIAS_TO_NAME.has(name);
+}
+
+export function resolveSlashCommand(command: ParsedSlashCommand): ResolvedSlashCommand {
+	const name = resolveBuiltinSlashCommandName(command.name);
+	return {
+		...command,
+		name,
+		originalName: command.name,
+		isAlias: name !== command.name,
+	};
+}
