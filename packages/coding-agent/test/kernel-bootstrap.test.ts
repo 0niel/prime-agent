@@ -13,6 +13,7 @@ import {
 
 let tempDir = "";
 let originalEnv: NodeJS.ProcessEnv;
+
 function pyprojectHash(pyprojectPath: string): string {
 	return `sha256:${createHash("sha256").update(readFileSync(pyprojectPath)).digest("hex")}`;
 }

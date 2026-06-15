@@ -99,20 +99,21 @@ import {
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
 import {
 	createGoalContextMessage,
-	createGoalToolDefinitions,
 	emptyGoalState,
 	GOAL_CONTEXT_CUSTOM_TYPE,
+	GOAL_SKILL_NAME,
 	GOAL_STATE_CUSTOM_TYPE,
-	GOAL_TOOL_NAMES,
+	type GoalHostResponse,
 	type GoalState,
 	type GoalStatus,
+	goalHostResponse,
 	goalTokenDeltaForUsage,
 	isPersistedGoalState,
 	normalizeGoalState,
-	UPDATE_GOAL_TOOL_NAME,
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
+import type { HostRequestHandlers } from "./kernel/index.js";
 import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
@@ -129,13 +130,14 @@ import {
 	saveHarnessState,
 } from "./refinement/index.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
-import type {
-	CreateRlmSubagentRuntimeOptions,
-	RlmInternalRunResult,
-	RlmRunResult,
-	RlmSubagentRuntime,
-	RlmUsage,
-	SubagentRuntimeHost,
+import {
+	type CreateRlmSubagentRuntimeOptions,
+	createRlmRunHostHandler,
+	type RlmInternalRunResult,
+	type RlmRunResult,
+	type RlmSubagentRuntime,
+	type RlmUsage,
+	type SubagentRuntimeHost,
 } from "./rlm-runtime.js";
 import type { BranchSummaryEntry, CompactionEntry, SessionMessageEntry } from "./session-manager.js";
 import {
@@ -146,7 +148,7 @@ import {
 } from "./session-manager.js";
 import type { SessionStats } from "./session-stats.js";
 import type { SettingsManager } from "./settings-manager.js";
-import { getPythonSkillRuntimeInfo } from "./skills.js";
+import { getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 import type { SlashCommandInfo } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
@@ -290,10 +292,12 @@ export interface AgentSessionConfig {
 	initialActiveToolNames?: string[];
 	/** Optional allowlist of tool names. When provided, only these tool names are exposed. */
 	allowedToolNames?: string[];
-	/** Whether the built-in long-running goal tools are exposed. Default: true. */
-	includeGoalTools?: boolean;
-	/** Whether goal tools are automatically active without an explicit goal. Default: true. */
-	autoActivateGoalTools?: boolean;
+	/**
+	 * Whether the built-in long-running goals feature is available: the bundled
+	 * goal skill in the IPython kernel, its goal.* host handlers, and /goal.
+	 * Default: true.
+	 */
+	includeGoals?: boolean;
 	/**
 	 * Override base tools (useful for custom runtimes).
 	 *
@@ -679,8 +683,7 @@ export class AgentSession {
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
-	private _includeGoalTools: boolean;
-	private _autoActivateGoalTools: boolean;
+	private _includeGoals: boolean;
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
@@ -723,8 +726,7 @@ export class AgentSession {
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
-		this._includeGoalTools = config.includeGoalTools ?? true;
-		this._autoActivateGoalTools = config.autoActivateGoalTools ?? true;
+		this._includeGoals = config.includeGoals ?? true;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._rlmDepth = config.rlmDepth ?? parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH");
@@ -1125,38 +1127,30 @@ export class AgentSession {
 		}
 	}
 
-	private _ensureGoalToolsActive(context?: AgentContext): void {
-		const goalTools: AgentTool[] = [];
-		for (const toolName of GOAL_TOOL_NAMES) {
-			const tool = this._toolRegistry.get(toolName);
-			if (!tool) {
-				throw new Error("Goal tools are disabled. Enable goal tools before using /goal.");
-			}
-			goalTools.push(tool);
+	/**
+	 * Goals are pursued through the IPython goal skill, so the only tool the
+	 * model needs is ipython. Force-activate it (including into a live
+	 * continuation context) so the model can always reach `goal.complete()`.
+	 */
+	private _ensureGoalRuntimeActive(context?: AgentContext): void {
+		if (!this._includeGoals) {
+			throw new Error("Goals are disabled. Enable goals before using /goal.");
 		}
-		if (!this._includeGoalTools) {
-			throw new Error("Goal tools are disabled. Enable goal tools before using /goal.");
+		const ipythonTool = this._toolRegistry.get("ipython");
+		if (!ipythonTool) {
+			throw new Error("Goals require the ipython tool, which is not available in this session.");
 		}
 		const activeToolNames = new Set(this.getActiveToolNames());
-		let changed = false;
-		for (const toolName of GOAL_TOOL_NAMES) {
-			if (!activeToolNames.has(toolName)) {
-				activeToolNames.add(toolName);
-				changed = true;
-			}
-		}
-		if (changed) {
+		if (!activeToolNames.has("ipython")) {
+			activeToolNames.add("ipython");
 			this.setActiveToolsByName([...activeToolNames]);
 		}
 		if (context) {
 			const contextTools = [...(context.tools ?? [])];
-			const contextToolNames = new Set(contextTools.map((tool) => tool.name));
-			for (const tool of goalTools) {
-				if (!contextToolNames.has(tool.name)) {
-					contextTools.push(tool);
-				}
+			if (!contextTools.some((tool) => tool.name === "ipython")) {
+				contextTools.push(ipythonTool);
+				context.tools = contextTools;
 			}
-			context.tools = contextTools;
 		}
 	}
 
@@ -1167,7 +1161,7 @@ export class AgentSession {
 		if (!this._goalState.objective) {
 			return;
 		}
-		this._ensureGoalToolsActive();
+		this._ensureGoalRuntimeActive();
 		const message = createGoalContextMessage(this._goalState, kind, images);
 		if (this.isStreaming) {
 			if (kind === "budget_limit") {
@@ -1213,7 +1207,7 @@ export class AgentSession {
 		if (!this.isStreaming) {
 			await this._validateCanStartAgentRun();
 		}
-		this._ensureGoalToolsActive();
+		this._ensureGoalRuntimeActive();
 		this._clearQueuedGoalContexts();
 		this._startGoal(command.objective, command.tokenBudget);
 		await this._runOrQueueGoalContext(previousWasActive ? "objective_updated" : "continuation", images);
@@ -1230,10 +1224,12 @@ export class AgentSession {
 		if (this._goalAccountedAssistantMessages.has(message)) {
 			return false;
 		}
-		const updateGoalRequested = message.content.some(
-			(content) => content.type === "toolCall" && content.name === UPDATE_GOAL_TOOL_NAME,
-		);
-		if (this._goalState.status !== "active" && !(this._goalState.status === "complete" && updateGoalRequested)) {
+		// Usage is attributed at the assistant message's message_end, which fires
+		// before that turn's ipython cell runs. goal.complete() only arrives later
+		// over the kernel host bridge, so the completing turn is always accounted
+		// while the goal is still active. Only count turns spent pursuing the goal;
+		// post-completion turns (e.g. a closing summary) must not be attributed.
+		if (this._goalState.status !== "active") {
 			return false;
 		}
 		this._goalAccountedAssistantMessages.add(message);
@@ -1243,8 +1239,7 @@ export class AgentSession {
 			...goal,
 			tokensUsed: goal.tokensUsed + tokenDelta,
 		};
-		const budgetReached =
-			!updateGoalRequested && nextGoal.tokenBudget !== undefined && nextGoal.tokensUsed >= nextGoal.tokenBudget;
+		const budgetReached = nextGoal.tokenBudget !== undefined && nextGoal.tokensUsed >= nextGoal.tokenBudget;
 		if (!budgetReached) {
 			this._setGoalState(nextGoal);
 			return false;
@@ -1298,20 +1293,63 @@ export class AgentSession {
 		return true;
 	}
 
-	private createGoalFromTool(objective: string, tokenBudget: number | undefined): GoalState {
-		if (this._goalState.status !== "idle") {
-			throw new Error(
-				"cannot create a new goal because this thread already has a goal; use update_goal only when the existing goal is complete",
-			);
+	/**
+	 * Handle a goal.* request from the IPython kernel host bridge (the bundled
+	 * goal skill). All goal state stays host-side; the kernel only sees the
+	 * serialized snake_case response.
+	 */
+	handleGoalHostRequest(type: string, payload: Record<string, unknown> = {}): GoalHostResponse {
+		if (!this._includeGoals) {
+			throw new Error("goals are disabled in this session");
 		}
-		return this._startGoal(objective, tokenBudget);
+		switch (type) {
+			case "goal.get":
+				return goalHostResponse(this.goalState, false);
+			case "goal.create": {
+				if (typeof payload.objective !== "string") {
+					throw new Error("goal.create objective must be a string");
+				}
+				if (payload.token_budget !== undefined && typeof payload.token_budget !== "number") {
+					throw new Error("goal.create token_budget must be an integer when provided");
+				}
+				return goalHostResponse(this._createGoalFromHost(payload.objective, payload.token_budget), false);
+			}
+			case "goal.complete":
+				return goalHostResponse(this._completeGoalFromHost(), true);
+			default:
+				throw new Error(`unknown goal request type "${type}"`);
+		}
 	}
 
-	private completeGoalFromTool(): GoalState {
+	private _createGoalFromHost(objective: string, tokenBudget: number | undefined): GoalState {
+		switch (this._goalState.status) {
+			case "active":
+				throw new Error(
+					"cannot create a new goal because this thread already has an active goal; run `await goal.complete()` when it is achieved, or ask the user to clear it with /goal clear",
+				);
+			case "paused":
+				throw new Error(
+					"cannot create a new goal because a paused goal exists; ask the user to resume it with /goal resume or clear it with /goal clear",
+				);
+			case "budget_limited":
+				throw new Error(
+					"cannot create a new goal because a budget-limited goal exists; ask the user to resume it with /goal resume or clear it with /goal clear",
+				);
+			default:
+				// idle, or a terminal record (complete / error): nothing pending, start fresh.
+				return this._startGoal(objective, tokenBudget);
+		}
+	}
+
+	private _completeGoalFromHost(): GoalState {
 		if (!this._goalState.objective || this._goalState.status === "idle") {
-			throw new Error("cannot update goal because this thread has no goal");
+			throw new Error("cannot complete goal because this thread has no goal");
 		}
 		const goal = this._goalWithAccountedWallClock();
+		// A turn can cross the budget and complete the goal at once: accounting
+		// runs at message_end, before the completing ipython cell executes, so a
+		// budget-limit context may already be steered. It is stale now — drop it.
+		this._clearQueuedGoalContexts();
 		this._setGoalState({
 			...goal,
 			active: false,
@@ -1333,7 +1371,7 @@ export class AgentSession {
 			return [];
 		}
 		try {
-			this._ensureGoalToolsActive(context.context);
+			this._ensureGoalRuntimeActive(context.context);
 			const nextGoal = {
 				...this._goalState,
 				continuationsUsed: this._goalState.continuationsUsed + 1,
@@ -1861,7 +1899,7 @@ export class AgentSession {
 		const loaderAppendSystemPrompt = this._resourceLoader.getAppendSystemPrompt();
 		const appendSystemPrompt =
 			loaderAppendSystemPrompt.length > 0 ? loaderAppendSystemPrompt.join("\n\n") : undefined;
-		const loadedSkills = this._resourceLoader.getSkills().skills;
+		const loadedSkills = this._modelVisibleSkills();
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
 		this._baseSystemPromptOptions = {
@@ -3359,7 +3397,7 @@ export class AgentSession {
 	}): void {
 		const shellCommandPrefix = this.settingsManager.getShellCommandPrefix();
 		const shellPath = this.settingsManager.getShellPath();
-		const pythonSkills = getPythonSkillRuntimeInfo(this._resourceLoader.getSkills().skills);
+		const pythonSkills = getPythonSkillRuntimeInfo(this._modelVisibleSkills());
 		let configuredBaseToolDefinitions: Record<string, ToolDefinition>;
 		if (this._baseToolsOverride) {
 			configuredBaseToolDefinitions = Object.fromEntries(
@@ -3375,7 +3413,7 @@ export class AgentSession {
 			this._ipythonKernelProvisioner = new IpythonKernelProvisioner(this._cwd, {
 				env: this._rlmKernelEnv(),
 				sessionId: this.sessionId,
-				rlmRunHandler: ({ prompt, kwargs }) => this.runRlmChild(prompt, kwargs),
+				hostHandlers: this._createKernelHostHandlers(),
 				pythonSkills,
 			});
 			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
@@ -3383,20 +3421,9 @@ export class AgentSession {
 				bash: { commandPrefix: shellCommandPrefix, shellPath },
 			});
 		}
-		const goalToolDefinitions = this._includeGoalTools
-			? createGoalToolDefinitions({
-					getGoalState: () => this.goalState,
-					createGoalFromTool: (objective, tokenBudget) => this.createGoalFromTool(objective, tokenBudget),
-					completeGoalFromTool: () => this.completeGoalFromTool(),
-				})
-			: [];
-		const baseToolDefinitions = {
-			...configuredBaseToolDefinitions,
-			...Object.fromEntries(goalToolDefinitions.map((definition) => [definition.name, definition])),
-		};
 
 		this._baseToolDefinitions = new Map(
-			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
+			Object.entries(configuredBaseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
 		);
 
 		const extensionsResult = this._resourceLoader.getExtensions();
@@ -3420,12 +3447,10 @@ export class AgentSession {
 		this._applyExtensionBindings(this._extensionRunner);
 
 		const defaultActiveToolNames = this._baseToolsOverride ? Object.keys(this._baseToolsOverride) : ["ipython"];
-		if (this._includeGoalTools && this._autoActivateGoalTools) {
-			defaultActiveToolNames.push(...GOAL_TOOL_NAMES);
-		}
 		const baseActiveToolNames = [...(options.activeToolNames ?? defaultActiveToolNames)];
-		if (this._goalState.status === "active" && this._includeGoalTools) {
-			baseActiveToolNames.push(...GOAL_TOOL_NAMES);
+		if (this._goalState.status === "active" && this._includeGoals) {
+			// An active goal needs ipython so the model can reach the goal skill.
+			baseActiveToolNames.push("ipython");
 		}
 		this._refreshToolRegistry({
 			activeToolNames: [...new Set(baseActiveToolNames)],
@@ -3435,6 +3460,31 @@ export class AgentSession {
 		if (this._prewarmIpythonKernel && this.getActiveToolNames().includes("ipython")) {
 			this._ipythonKernelProvisioner?.prewarm();
 		}
+	}
+
+	/**
+	 * Skills exposed to the model (system prompt + kernel). The bundled goal
+	 * skill is withheld when goals are disabled for this session.
+	 */
+	private _modelVisibleSkills(): Skill[] {
+		const skills = this._resourceLoader.getSkills().skills;
+		if (this._includeGoals) {
+			return skills;
+		}
+		return skills.filter((skill) => skill.name !== GOAL_SKILL_NAME);
+	}
+
+	/** Typed handlers for host requests arriving from the IPython kernel comm bridge. */
+	private _createKernelHostHandlers(): HostRequestHandlers {
+		const handlers: HostRequestHandlers = {
+			"rlm.run": createRlmRunHostHandler(({ prompt, kwargs }) => this.runRlmChild(prompt, kwargs)),
+		};
+		if (this._includeGoals) {
+			for (const type of ["goal.get", "goal.create", "goal.complete"]) {
+				handlers[type] = async (payload) => this.handleGoalHostRequest(type, payload);
+			}
+		}
+		return handlers;
 	}
 
 	async reload(): Promise<void> {
@@ -3564,8 +3614,7 @@ export class AgentSession {
 			activeToolNames: this.getActiveToolNames(),
 			allowedToolNames: this._allowedToolNames ? [...this._allowedToolNames] : undefined,
 			customTools: [...this._customTools],
-			includeGoalTools: this._includeGoalTools,
-			autoActivateGoalTools: this._autoActivateGoalTools,
+			includeGoals: this._includeGoals,
 			rlmDepth: this._rlmDepth + 1,
 			rlmMaxDepth: this._rlmMaxDepth,
 			rlmParentNodeId: options.id,
@@ -3633,8 +3682,7 @@ export class AgentSession {
 			modelRegistry: this._modelRegistry,
 			initialActiveToolNames: options.activeToolNames,
 			allowedToolNames: options.allowedToolNames,
-			includeGoalTools: options.includeGoalTools,
-			autoActivateGoalTools: options.autoActivateGoalTools,
+			includeGoals: options.includeGoals,
 			rlmDepth: options.rlmDepth,
 			rlmMaxDepth: options.rlmMaxDepth,
 			rlmSessionDir: options.sessionDir,

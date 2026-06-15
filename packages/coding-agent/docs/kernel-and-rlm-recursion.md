@@ -4,6 +4,8 @@ This document explains the IPython kernel transport and the recursive `rlm` sub-
 
 The important design constraint is that the Python `rlm` package in the kernel is only a shim. It preserves the model-facing API from `rlm-harness`, but it does not run a child agent loop in Python. Child agents are run by the TypeScript host through the same `AgentSession` machinery as the parent.
 
+The same comm transport doubles as a generic host bridge: kernel-side Python (skills such as the bundled `goal` skill) can call `rlm.host_request("<type>", {...})` and the TypeScript host dispatches the typed request to a registered handler. `rlm.run` is just the first registered request type.
+
 ## High-Level Shape
 
 ```text
@@ -34,7 +36,7 @@ the flow becomes:
 ```text
 Python rlm shim
   |
-  | Jupyter comm target "rlm.run"
+  | Jupyter comm target "host.request", payload type "rlm.run"
   v
 KernelManager comm handler
   |
@@ -56,7 +58,8 @@ Python RLMResult
 ```text
 packages/coding-agent/src/core/kernel/index.ts
   ZeroMQ connection setup, Jupyter wire encoding, execute_request handling,
-  comm_open / comm_msg handling for rlm.run.
+  comm_open / comm_msg handling for the "host.request" bridge, dispatching
+  typed requests (rlm.run, goal.*) to registered host handlers.
 
 packages/coding-agent/src/core/tools/ipython.ts
   Tool wrapper around KernelManager. Starts the kernel and bootstraps the
@@ -66,16 +69,22 @@ packages/coding-agent/src/core/agent-session.ts
   Parent session owns recursion settings and implements runRlmChild().
 
 packages/coding-agent/src/core/rlm-runtime.ts
-  TypeScript request/result types for the rlm.run bridge.
+  TypeScript request/result types for rlm.run and the adapter that registers
+  it as a typed host request handler.
 
 prime-agent-runtime/src/rlm/__init__.py
   Python shim installed into ~/.prime/agent/kernel-venv. Exposes rlm, rlm.run(),
-  RLMResult, TokenUsage, and the session-backed harness state helper.
+  host_request(), RLMResult, TokenUsage, and the session-backed harness state
+  helper.
 
 prime-agent-runtime/src/rlm/harness.py
   Session-backed JSON store for reset-free harness refinement notes: prompt
   notes, memory entries, reusable skill descriptions, subagent specs, and
   refinement events.
+
+packages/coding-agent/skills/goal
+  Bundled Python skill exposing goal.get / goal.create / goal.complete in the
+  kernel. A thin wrapper over host_request; all goal state stays in the host.
 
 scripts/setup-kernel-venv.sh
   Thin wrapper around the automatic kernel bootstrap.
@@ -370,6 +379,7 @@ It exports:
 ```python
 rlm
 run(prompt: str, **kwargs)
+host_request(request_type: str, payload: dict | None = None)
 RLMResult
 TokenUsage
 ```
@@ -414,18 +424,18 @@ the shim:
 
 ```text
 creates asyncio Future
-creates Jupyter Comm target "rlm.run"
+creates Jupyter Comm target "host.request"
 registers on_msg callback
 opens the comm with:
   {
-    "type": "run",
+    "type": "rlm.run",
     "prompt": "subtask",
     "kwargs": {}
   }
 awaits the Future
 ```
 
-The callback converts host payloads into `RLMResult` or raises `RuntimeError`.
+The callback strips the reply's `status` field and converts the payload into `RLMResult`, or raises `RuntimeError` when the host reports an error. The comm-open/await machinery is the public `host_request()`; `run()` is a typed wrapper around it, and other kernel-side skills reuse `host_request()` for their own request types.
 
 The shim accepts `**kwargs` for API compatibility with `rlm-harness` and includes them in the comm payload. V1 does not apply any kwargs on the TypeScript side. Unsupported kwargs are rejected with a clear error instead of being ignored.
 
@@ -474,26 +484,28 @@ The comm handler tracks:
 
 ```text
 commTargets: comm_id -> target_name
-handledRlmCommIds: comm ids already started
+handledHostRequestCommIds: comm ids already started
 ```
 
-For target `rlm.run`, it starts work asynchronously:
+For target `host.request`, it starts work asynchronously and dispatches on the payload `type`:
 
 ```text
-comm_open target "rlm.run"
+comm_open target "host.request"
   |
   v
-startRlmRunFromComm(comm_id, data)
+startHostRequestFromComm(comm_id, data)
   |
   v
-handleRlmRunRequest(data)
+handleHostRequest(data)
   |
   v
-options.rlmRunHandler({ prompt, kwargs })
+options.hostHandlers[data.type](data)
   |
   v
 sendCommMessage(comm_id, { status: "ok", ...result })
 ```
+
+Unknown types fail with `host request type "<type>" is not available in this session`.
 
 Errors are returned as:
 
@@ -508,10 +520,15 @@ The send path uses `control` if available, then falls back to `shell`.
 
 ## Child AgentSession Execution
 
-The root `AgentSession` passes this handler into the root kernel:
+The root `AgentSession` registers typed handlers into the root kernel:
 
 ```typescript
-rlmRunHandler: ({ prompt, kwargs }) => this.runRlmChild(prompt, kwargs)
+hostHandlers: {
+  "rlm.run": createRlmRunHostHandler(({ prompt, kwargs }) => this.runRlmChild(prompt, kwargs)),
+  "goal.get": ...,      // only when goals are enabled
+  "goal.create": ...,
+  "goal.complete": ...,
+}
 ```
 
 `runRlmChild()` is the TypeScript owner of actual recursion.
@@ -584,6 +601,39 @@ The answer is the child's final assistant text. This matches the RLM-1 training 
 ### Cost Accounting
 
 `RLMResult.usage` reports the child session's token usage. The parent session's displayed usage and cost do not currently fold child usage into the parent assistant-message totals. Child cost is independent in v1 and should be read from the child result or child session until parent aggregation is added.
+
+## Goal Skill Over the Host Bridge
+
+Goals are not harness tools. The model's only built-in tool is `ipython`; the goal feature is exposed as the bundled Python skill `goal`, which the kernel bootstrap imports into the user namespace like any other Python skill:
+
+```python
+await goal.get()
+await goal.create("ship the release notes", token_budget=200000)
+await goal.complete()
+```
+
+Each call is a thin wrapper over `rlm.host_request("goal.<op>", {...})`. All goal state — status transitions, token/wall-clock accounting, persistence, continuation re-prompting — lives in the TypeScript `AgentSession`:
+
+```text
+model runs `await goal.complete()` inside an ipython cell
+  |
+  | comm target "host.request", payload { "type": "goal.complete" }
+  v
+KernelManager dispatches to hostHandlers["goal.complete"]
+  |
+  v
+AgentSession.handleGoalHostRequest("goal.complete")
+  |  flips goal state to complete, marks the run for usage accounting,
+  |  emits goal_update to connected clients
+  v
+comm reply { status: "ok", goal: {...}, completion_budget_report: ... }
+```
+
+Replies use snake_case keys (`tokens_used`, `remaining_tokens`, `completion_budget_report`) since they are a Python-facing API.
+
+The re-prompting loop is unchanged and entirely host-side: while a goal is active the session injects `goal_context` continuation messages after each turn, steers a budget-limit context when the token budget is exhausted, and stops continuing once `goal.complete` arrives over the bridge (or the user pauses/clears the goal). Because completion arrives mid-cell rather than as a detectable tool call, the session records that completion was requested during the run so the completing turn's tokens still count toward the goal budget.
+
+When goals are disabled for a session (`includeGoals: false`), the goal skill is filtered out of the kernel and the system prompt, and the `goal.*` handlers are not registered — calls fail with the unknown-type error above.
 
 ## Session Directory Layout
 

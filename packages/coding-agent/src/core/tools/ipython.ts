@@ -3,8 +3,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
 import type { ToolDefinition } from "../extensions/types.js";
 import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
-import { KernelManager } from "../kernel/index.js";
-import type { RlmRunHandler } from "../rlm-runtime.js";
+import { type HostRequestHandlers, KernelManager } from "../kernel/index.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
@@ -137,7 +136,8 @@ export interface IpythonToolOptions {
 	python?: string;
 	env?: Record<string, string>;
 	sessionId?: string;
-	rlmRunHandler?: RlmRunHandler;
+	/** Typed host request handlers for the kernel↔host bridge (rlm.run, goal.*, …). */
+	hostHandlers?: HostRequestHandlers;
 	pythonSkills?: readonly PythonSkillRuntimeInfo[];
 	/** Filled after the first kernel start so the owning session can restart it after compaction. */
 	kernelManagerRef?: { current?: KernelManager };
@@ -245,7 +245,7 @@ export class IpythonKernelProvisioner {
 			cwd: this.cwd,
 			env: this.options?.env,
 			sessionId: this.options?.sessionId,
-			rlmRunHandler: this.options?.rlmRunHandler,
+			hostHandlers: this.options?.hostHandlers,
 			pythonSkills: this.options?.pythonSkills,
 		});
 		this.emitStartupProgress("Starting IPython kernel...");

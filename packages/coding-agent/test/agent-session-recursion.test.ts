@@ -17,6 +17,7 @@ import { AuthStorage } from "../src/core/auth-storage.js";
 import { KernelManager } from "../src/core/kernel/index.js";
 import { convertToLlm } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
+import { createRlmRunHostHandler } from "../src/core/rlm-runtime.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { MISSING_RIPGREP_MESSAGE } from "../src/utils/tools-manager.js";
@@ -145,14 +146,14 @@ function rlmCommOpenData(commId: string, data: Record<string, unknown>): TestCom
 		metadata: {},
 		content: {
 			comm_id: commId,
-			target_name: "rlm.run",
+			target_name: "host.request",
 			data,
 		},
 	};
 }
 
 function rlmCommOpen(commId: string, prompt: string, kwargs: Record<string, unknown> = {}): TestCommMessage {
-	return rlmCommOpenData(commId, { type: "run", prompt, kwargs });
+	return rlmCommOpenData(commId, { type: "rlm.run", prompt, kwargs });
 }
 
 function encodeTestMessage(message: TestCommMessage): Buffer[] {
@@ -565,18 +566,20 @@ describe("AgentSession rlm recursion", () => {
 		const replies: CapturedCommReply[] = [];
 		const manager = new KernelManager({
 			python: process.execPath,
-			rlmRunHandler: async ({ prompt }) => {
-				active++;
-				started++;
-				maxActive = Math.max(maxActive, active);
-				await release;
-				active--;
-				return {
-					answer: `answer:${prompt}`,
-					usage: { prompt_tokens: 1, completion_tokens: 1 },
-					turns: 1,
-					session_dir: null,
-				};
+			hostHandlers: {
+				"rlm.run": createRlmRunHostHandler(async ({ prompt }) => {
+					active++;
+					started++;
+					maxActive = Math.max(maxActive, active);
+					await release;
+					active--;
+					return {
+						answer: `answer:${prompt}`,
+						usage: { prompt_tokens: 1, completion_tokens: 1 },
+						turns: 1,
+						session_dir: null,
+					};
+				}),
 			},
 		});
 
@@ -620,14 +623,16 @@ describe("AgentSession rlm recursion", () => {
 		let promptSeen = "";
 		const manager = new KernelManager({
 			python: process.execPath,
-			rlmRunHandler: async ({ prompt }) => {
-				promptSeen = prompt;
-				return {
-					answer: `answer:${prompt}`,
-					usage: { prompt_tokens: 1, completion_tokens: 1 },
-					turns: 1,
-					session_dir: null,
-				};
+			hostHandlers: {
+				"rlm.run": createRlmRunHostHandler(async ({ prompt }) => {
+					promptSeen = prompt;
+					return {
+						answer: `answer:${prompt}`,
+						usage: { prompt_tokens: 1, completion_tokens: 1 },
+						turns: 1,
+						session_dir: null,
+					};
+				}),
 			},
 		});
 
@@ -662,14 +667,16 @@ describe("AgentSession rlm recursion", () => {
 		const prompts: string[] = [];
 		const manager = new KernelManager({
 			cwd: tempDir,
-			rlmRunHandler: async ({ prompt }) => {
-				prompts.push(prompt);
-				return {
-					answer: `answer:${prompt}`,
-					usage: { prompt_tokens: 1, completion_tokens: 1 },
-					turns: 1,
-					session_dir: null,
-				};
+			hostHandlers: {
+				"rlm.run": createRlmRunHostHandler(async ({ prompt }) => {
+					prompts.push(prompt);
+					return {
+						answer: `answer:${prompt}`,
+						usage: { prompt_tokens: 1, completion_tokens: 1 },
+						turns: 1,
+						session_dir: null,
+					};
+				}),
 			},
 		});
 
@@ -739,12 +746,14 @@ print(_result.answer)
 		const replies: CapturedCommReply[] = [];
 		const manager = new KernelManager({
 			python: process.execPath,
-			rlmRunHandler: async () => ({
-				answer: "unused",
-				usage: { prompt_tokens: 1, completion_tokens: 1 },
-				turns: 1,
-				session_dir: null,
-			}),
+			hostHandlers: {
+				"rlm.run": createRlmRunHostHandler(async () => ({
+					answer: "unused",
+					usage: { prompt_tokens: 1, completion_tokens: 1 },
+					turns: 1,
+					session_dir: null,
+				})),
+			},
 		});
 
 		try {
@@ -761,7 +770,7 @@ print(_result.answer)
 				commId: "comm-bg",
 				data: {
 					status: "error",
-					error: "rlm.run comm payload must have a supported type",
+					error: 'host request type "background" is not available in this session',
 				},
 			});
 		} finally {
@@ -783,14 +792,16 @@ print(_result.answer)
 		});
 		const manager = new KernelManager({
 			python: process.execPath,
-			rlmRunHandler: async () => {
-				started = true;
-				try {
-					await release;
-					throw new Error("child failed after dispose");
-				} finally {
-					handlerSettled = true;
-				}
+			hostHandlers: {
+				"rlm.run": createRlmRunHostHandler(async () => {
+					started = true;
+					try {
+						await release;
+						throw new Error("child failed after dispose");
+					} finally {
+						handlerSettled = true;
+					}
+				}),
 			},
 		});
 		const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
@@ -815,8 +826,8 @@ print(_result.answer)
 			expect(handlerSettled).toBe(true);
 
 			const kernelStderr = (manager as unknown as { kernelStderr: string }).kernelStderr;
-			expect(kernelStderr).toContain("[kernel] rlm.run failed for comm comm-dispose");
-			expect(kernelStderr).toContain("[kernel] failed to send rlm.run error reply for comm comm-dispose");
+			expect(kernelStderr).toContain("[kernel] host request failed for comm comm-dispose");
+			expect(kernelStderr).toContain("[kernel] failed to send host request error reply for comm comm-dispose");
 			expect(stderrSpy).not.toHaveBeenCalled();
 		} finally {
 			releaseChild();

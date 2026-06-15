@@ -8,7 +8,6 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
-import type { RlmRunHandler, RlmRunResult } from "../rlm-runtime.js";
 import { ensureKernelPython, type KernelBootstrapProgressHandler, type KernelPythonSkill } from "./bootstrap.js";
 
 const DELIM = Buffer.from("<IDS|MSG>");
@@ -18,7 +17,19 @@ const READY_TIMEOUT_MS = 5000;
 // Loopback PUB/SUB subscription propagation is usually sub-ms, but keep a small guard before first execute.
 const IOPUB_SUBSCRIBE_DELAY_MS = 50;
 const DEFAULT_MAX_OUTPUT_CHARS = 65536;
-const RLM_DISPOSE_TIMEOUT_MS = 5000;
+const HOST_REQUEST_DISPOSE_TIMEOUT_MS = 5000;
+
+/** Comm target the kernel-side `rlm.host_request` shim opens for typed host requests. */
+export const HOST_COMM_TARGET = "host.request";
+
+/**
+ * Handles one typed request from Python code running in the kernel.
+ * The returned record is sent back verbatim as the comm reply payload.
+ */
+export type HostRequestHandler = (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
+
+/** Host request handlers keyed by request type (e.g. "rlm.run", "goal.complete"). */
+export type HostRequestHandlers = Record<string, HostRequestHandler>;
 
 export interface KernelManagerOptions {
 	/** Python interpreter that has `ipykernel` available. Defaults to the auto-bootstrapped kernel. */
@@ -26,7 +37,7 @@ export interface KernelManagerOptions {
 	cwd?: string;
 	env?: Record<string, string>;
 	sessionId?: string;
-	rlmRunHandler?: RlmRunHandler;
+	hostHandlers?: HostRequestHandlers;
 	pythonSkills?: readonly KernelPythonSkill[];
 	/** Default: "prime-agent". */
 	username?: string;
@@ -53,8 +64,6 @@ export interface ExecuteResult {
 	error?: { ename: string; evalue: string; traceback: string[] };
 	durationMs: number;
 }
-
-type RlmCommResult = RlmRunResult;
 
 interface ConnectionInfo {
 	ip: string;
@@ -287,12 +296,12 @@ function installSignalHandlersOnce(): void {
 export class KernelManager {
 	private readonly options: Pick<
 		KernelManagerOptions,
-		"python" | "cwd" | "env" | "sessionId" | "rlmRunHandler" | "pythonSkills"
+		"python" | "cwd" | "env" | "sessionId" | "hostHandlers" | "pythonSkills"
 	> &
 		Required<Pick<KernelManagerOptions, "username">>;
 	private readonly session = uuid();
 	private readonly commTargets = new Map<string, string>();
-	private readonly handledRlmCommIds = new Set<string>();
+	private readonly handledHostRequestCommIds = new Set<string>();
 	private kernel?: ChildProcess;
 	private shell?: Dealer;
 	private iopub?: Subscriber;
@@ -304,7 +313,7 @@ export class KernelManager {
 	/** Serializes execute() calls — Jupyter shell channel is request/reply. */
 	private executionQueue: Promise<unknown> = Promise.resolve();
 	private activeExecution?: ActiveExecution;
-	private readonly inFlightRlmRuns = new Set<Promise<void>>();
+	private readonly inFlightHostRequests = new Set<Promise<void>>();
 	private state: "idle" | "starting" | "running" | "shutdown" = "idle";
 	/** Memoized so concurrent callers all await the same in-flight startup. */
 	private startPromise?: Promise<void>;
@@ -315,7 +324,7 @@ export class KernelManager {
 			cwd: options.cwd,
 			env: options.env,
 			sessionId: options.sessionId,
-			rlmRunHandler: options.rlmRunHandler,
+			hostHandlers: options.hostHandlers,
 			pythonSkills: options.pythonSkills,
 			username: options.username ?? "prime-agent",
 		};
@@ -707,7 +716,7 @@ export class KernelManager {
 
 		if (msgType === "comm_close") {
 			this.commTargets.delete(commId);
-			this.handledRlmCommIds.delete(commId);
+			this.handledHostRequestCommIds.delete(commId);
 			return;
 		}
 
@@ -717,69 +726,64 @@ export class KernelManager {
 				return;
 			}
 			this.commTargets.set(commId, targetName);
-			if (targetName === "rlm.run") {
-				this.startRlmRunFromComm(commId, content.data);
+			if (targetName === HOST_COMM_TARGET) {
+				this.startHostRequestFromComm(commId, content.data);
 			}
 			return;
 		}
 
 		const targetName = this.commTargets.get(commId);
-		if (msgType === "comm_msg" && targetName === "rlm.run") {
-			this.startRlmRunFromComm(commId, content.data);
+		if (msgType === "comm_msg" && targetName === HOST_COMM_TARGET) {
+			this.startHostRequestFromComm(commId, content.data);
 		}
 	}
 
-	private startRlmRunFromComm(commId: string, data: unknown): void {
-		if (this.handledRlmCommIds.has(commId)) {
+	private startHostRequestFromComm(commId: string, data: unknown): void {
+		if (this.handledHostRequestCommIds.has(commId)) {
 			return;
 		}
-		this.handledRlmCommIds.add(commId);
+		this.handledHostRequestCommIds.add(commId);
 
 		const task = (async () => {
 			try {
-				const result = await this.handleRlmCommRequest(data);
+				const result = await this.handleHostRequest(data);
 				try {
 					await this.sendCommMessage(commId, { status: "ok", ...result });
 				} catch (replyError) {
 					this.appendKernelDiagnostic(
-						`failed to send rlm.run ok reply for comm ${commId}: ${errorMessage(replyError)}`,
+						`failed to send host request ok reply for comm ${commId}: ${errorMessage(replyError)}`,
 					);
 				}
 			} catch (error) {
-				this.appendKernelDiagnostic(`rlm.run failed for comm ${commId}: ${errorMessage(error)}`);
+				this.appendKernelDiagnostic(`host request failed for comm ${commId}: ${errorMessage(error)}`);
 				try {
 					await this.sendCommMessage(commId, { status: "error", error: errorMessage(error) });
 				} catch (replyError) {
 					this.appendKernelDiagnostic(
-						`failed to send rlm.run error reply for comm ${commId}: ${errorMessage(replyError)}`,
+						`failed to send host request error reply for comm ${commId}: ${errorMessage(replyError)}`,
 					);
 				}
 			}
 		})();
-		this.inFlightRlmRuns.add(task);
+		this.inFlightHostRequests.add(task);
 		void task.finally(() => {
-			this.inFlightRlmRuns.delete(task);
+			this.inFlightHostRequests.delete(task);
 		});
 	}
 
-	private async handleRlmCommRequest(data: unknown): Promise<RlmCommResult> {
+	private async handleHostRequest(data: unknown): Promise<Record<string, unknown>> {
 		if (!isRecord(data)) {
-			throw new Error("rlm.run comm payload must be an object");
+			throw new Error("host request payload must be an object");
+		}
+		if (typeof data.type !== "string" || data.type.length === 0) {
+			throw new Error("host request payload must have a string type");
 		}
 
-		if (data.type === "run") {
-			const handler = this.options.rlmRunHandler;
-			if (!handler) {
-				throw new Error("rlm.run is not available in this session");
-			}
-			if (typeof data.prompt !== "string") {
-				throw new Error("rlm.run prompt must be a string");
-			}
-			const kwargs = isRecord(data.kwargs) ? data.kwargs : {};
-			return handler({ prompt: data.prompt, kwargs });
+		const handler = this.options.hostHandlers?.[data.type];
+		if (!handler) {
+			throw new Error(`host request type "${data.type}" is not available in this session`);
 		}
-
-		throw new Error("rlm.run comm payload must have a supported type");
+		return handler(data);
 	}
 
 	private async sendCommMessage(commId: string, data: Record<string, unknown>): Promise<void> {
@@ -820,7 +824,7 @@ export class KernelManager {
 		this.startPromise = undefined;
 	}
 
-	private async waitForRlmRunsToSettle(tasks: Promise<void>[], timeoutMs: number): Promise<void> {
+	private async waitForHostRequestsToSettle(tasks: Promise<void>[], timeoutMs: number): Promise<void> {
 		let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
 		const timeoutPromise = new Promise<"timeout">((resolve) => {
 			timeout = globalThis.setTimeout(() => resolve("timeout"), timeoutMs);
@@ -835,7 +839,7 @@ export class KernelManager {
 		}
 		if (result === "timeout") {
 			this.appendKernelDiagnostic(
-				`timed out waiting ${timeoutMs}ms for ${tasks.length} rlm.run task(s) during dispose`,
+				`timed out waiting ${timeoutMs}ms for ${tasks.length} host request task(s) during dispose`,
 			);
 		}
 	}
@@ -878,12 +882,12 @@ export class KernelManager {
 		}
 	}
 
-	/** Graceful cleanup. Waits briefly for in-flight rlm.run handlers before closing sockets. */
+	/** Graceful cleanup. Waits briefly for in-flight host request handlers before closing sockets. */
 	dispose(): Promise<void> {
 		this.state = "shutdown";
 		liveKernels.delete(this);
-		const inFlightRlmRuns = [...this.inFlightRlmRuns];
-		if (inFlightRlmRuns.length === 0) {
+		const inFlightHostRequests = [...this.inFlightHostRequests];
+		if (inFlightHostRequests.length === 0) {
 			this.cleanupResources();
 			return Promise.resolve();
 		}
@@ -891,7 +895,7 @@ export class KernelManager {
 		return (async () => {
 			// TODO: plumb AbortSignal through AgentSession.prompt so disposal can cancel long-running child loops.
 			try {
-				await this.waitForRlmRunsToSettle(inFlightRlmRuns, RLM_DISPOSE_TIMEOUT_MS);
+				await this.waitForHostRequestsToSettle(inFlightHostRequests, HOST_REQUEST_DISPOSE_TIMEOUT_MS);
 			} finally {
 				this.cleanupResources();
 			}

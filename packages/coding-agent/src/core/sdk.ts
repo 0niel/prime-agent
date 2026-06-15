@@ -8,7 +8,6 @@ import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
 import { AuthStorage } from "./auth-storage.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
-import { GOAL_TOOL_NAMES } from "./goals.js";
 import { convertToLlm } from "./messages.js";
 import { ModelRegistry } from "./model-registry.js";
 import { findInitialModel } from "./model-resolver.js";
@@ -225,13 +224,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	const allowedToolNames = options.allowedToolNames ?? options.tools ?? (options.noTools === "all" ? [] : undefined);
-	const includeGoalTools = options.includeGoalTools ?? (options.tools !== undefined || options.noTools !== "all");
-	const autoActivateGoalTools = options.autoActivateGoalTools ?? (options.tools === undefined && !options.noTools);
-	const defaultActiveToolNames: string[] =
-		includeGoalTools && autoActivateGoalTools ? ["ipython", ...GOAL_TOOL_NAMES] : ["ipython"];
+	const includeGoals = options.includeGoals ?? (options.tools !== undefined || options.noTools !== "all");
 	const initialActiveToolNames: string[] =
-		options.initialActiveToolNames ??
-		(options.tools ? [...options.tools] : options.noTools ? [] : defaultActiveToolNames);
+		options.initialActiveToolNames ?? (options.tools ? [...options.tools] : options.noTools ? [] : ["ipython"]);
 
 	let agent: Agent;
 
@@ -353,8 +348,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		modelRegistry,
 		initialActiveToolNames,
 		allowedToolNames,
-		includeGoalTools,
-		autoActivateGoalTools,
+		includeGoals,
 		extensionRunnerRef,
 		rlmDepth: options.rlmDepth,
 		rlmMaxDepth: options.rlmMaxDepth,

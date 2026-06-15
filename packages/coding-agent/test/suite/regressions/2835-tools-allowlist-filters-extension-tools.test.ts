@@ -91,12 +91,4 @@ describe("regression #2835: tool allowlists filter extension tools", () => {
 		expect(session.systemPrompt).not.toContain("dynamic_tool");
 		session.dispose();
 	});
-
-	it("allows goal tools only when explicitly listed", async () => {
-		const session = await createSession(["get_goal"]);
-
-		expect(session.getAllTools().map((tool) => tool.name)).toEqual(["get_goal"]);
-		expect(session.getActiveToolNames()).toEqual(["get_goal"]);
-		session.dispose();
-	});
 });
