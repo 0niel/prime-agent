@@ -116,6 +116,18 @@ import {
 import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
+import {
+	appendGlobalRefinement,
+	applyRefinementProposal,
+	getGlobalHarnessStateDir,
+	getRefinementHistory,
+	loadGlobalRefinementHistory,
+	loadHarnessState,
+	mergeRefinementHistory,
+	planRefinement,
+	type RefinementResult,
+	saveHarnessState,
+} from "./refinement/index.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import type {
 	CreateRlmSubagentRuntimeOptions,
@@ -1863,6 +1875,7 @@ export class AgentSession {
 			toolSnippets,
 			promptGuidelines,
 			allowRecursion: this._rlmDepth < this._rlmMaxDepth,
+			harnessState: loadHarnessState(getGlobalHarnessStateDir()),
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
@@ -2694,6 +2707,56 @@ export class AgentSession {
 	}
 
 	/**
+	 * Refine editable harness state: prompt notes, memory, skills, and subagent specs.
+	 * The base system prompt is intentionally not editable through this path.
+	 */
+	async refine(options: { instructions?: string; rollbackId?: string } = {}): Promise<RefinementResult> {
+		this._disconnectFromAgent();
+
+		try {
+			await this.abort();
+
+			if (!this.model) {
+				throw new Error(formatNoModelSelectedMessage());
+			}
+
+			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
+			const harnessStateDir = getGlobalHarnessStateDir();
+			const planningState = loadHarnessState(harnessStateDir);
+			// Harness state is global, so rollback history must be too: merge the global
+			// cross-session log with this session's entries so a refinement applied in any
+			// session can be rolled back from here.
+			const history = mergeRefinementHistory(
+				loadGlobalRefinementHistory(harnessStateDir),
+				getRefinementHistory(this.sessionManager.getEntries().filter((entry) => entry.type === "custom")),
+			);
+			const plan = await planRefinement(
+				this.agent.state.messages,
+				planningState,
+				history,
+				this.model,
+				apiKey,
+				options,
+				headers,
+				undefined,
+				this.thinkingLevel,
+			);
+			// Re-read the shared state immediately before applying so concurrent kernel
+			// (`rlm.harness`) or cross-session writes during the LLM pass are not clobbered.
+			const state = loadHarnessState(harnessStateDir);
+			const result = applyRefinementProposal(state, plan.proposal, { id: plan.id, rollbackOf: plan.rollbackOf });
+			result.harnessStatePath = saveHarnessState(harnessStateDir, state);
+			appendGlobalRefinement(harnessStateDir, result);
+			this.sessionManager.appendCustomEntry("prime-agent.refinement", result);
+			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+			this.agent.state.systemPrompt = this._baseSystemPrompt;
+			return result;
+		} finally {
+			this._reconnectToAgent();
+		}
+	}
+
+	/**
 	 * Cancel in-progress branch summarization.
 	 */
 	abortBranchSummary(): void {
@@ -3401,6 +3464,7 @@ export class AgentSession {
 		return {
 			RLM_DEPTH: String(this._rlmDepth),
 			RLM_MAX_DEPTH: String(this._rlmMaxDepth),
+			RLM_HARNESS_STATE_DIR: getGlobalHarnessStateDir(),
 			RLM_SESSION_DIR: this._ensureRlmSessionDir(),
 		};
 	}

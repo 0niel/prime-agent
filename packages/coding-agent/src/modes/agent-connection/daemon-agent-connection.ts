@@ -3,6 +3,7 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { ImageContent, Transport } from "@earendil-works/pi-ai";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
+import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import type { DaemonClient } from "../daemon/daemon-client.js";
@@ -51,6 +52,8 @@ import type {
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
+
+export const DAEMON_REFINE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 
 export interface DaemonAgentConnectionOptions {
 	closeClientOnDispose?: boolean;
@@ -471,6 +474,18 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
+	async refine(options: { instructions?: string; rollbackId?: string } = {}): Promise<RefinementResult> {
+		return this.requestData<RefinementResult>(
+			{
+				type: "refine",
+				activeSessionId: this.activeSessionId,
+				instructions: options.instructions,
+				rollbackId: options.rollbackId,
+			},
+			DAEMON_REFINE_REQUEST_TIMEOUT_MS,
+		);
+	}
+
 	async abortCompaction(): Promise<void> {
 		await this.requestOk({ type: "abort_compaction", activeSessionId: this.activeSessionId });
 	}
@@ -595,8 +610,8 @@ export class DaemonAgentConnection implements AgentConnection {
 		await this.requestData<unknown>(command);
 	}
 
-	private async requestData<T>(command: DaemonCommandBody): Promise<T> {
-		const response = await this.client.request(command);
+	private async requestData<T>(command: DaemonCommandBody, timeoutMs?: number): Promise<T> {
+		const response = await this.client.request(command, timeoutMs);
 		if (!response.success) {
 			throw deserializeDaemonError(response);
 		}

@@ -139,6 +139,10 @@
         {
           "title": "Kernel and RLM Recursion",
           "path": "kernel-and-rlm-recursion.md"
+        },
+        {
+          "title": "/refine Verification Log",
+          "path": "refine-verification-log.md"
         }
       ]
     }

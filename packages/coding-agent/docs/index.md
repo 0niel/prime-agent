@@ -70,3 +70,4 @@ For the full first-run flow, see [Quickstart](quickstart.md).
 - [Development](development.md) - local setup, project structure, and debugging.
 - [AgentConnection Architecture](agent-connection-readme.md) - daemon-first interactive mode, connection boundaries, local-only hooks, and gateway follow-up work.
 - [Kernel and RLM Recursion](kernel-and-rlm-recursion.md) - ZeroMQ kernel transport and recursive sub-agent execution.
+- [/refine verification log](refine-verification-log.md) - manual benchmark checks for continual harness refinement.

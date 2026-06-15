@@ -3,6 +3,7 @@
  */
 
 import { buildRlmPrompt } from "./prompts/index.js";
+import { formatHarnessStateForPrompt, type HarnessState } from "./refinement/index.js";
 import { formatSkillsForPrompt, getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 
 export interface BuildSystemPromptOptions {
@@ -26,6 +27,8 @@ export interface BuildSystemPromptOptions {
 	skills?: Skill[];
 	/** Whether to include the model-facing rlm recursion guidance. */
 	allowRecursion?: boolean;
+	/** Global harness state to inject as compact persistent context. */
+	harnessState?: HarnessState;
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -40,6 +43,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		contextFiles: providedContextFiles,
 		skills: providedSkills,
 		allowRecursion,
+		harnessState,
 	} = options;
 	const promptCwd = cwd.replace(/\\/g, "/");
 	const promptMessagesPath = (messagesPath ?? "not persisted").replace(/\\/g, "/");
@@ -80,6 +84,10 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		prompt += `\nCurrent date: ${date}`;
 		prompt += `\nCurrent working directory: ${promptCwd}`;
 
+		if (harnessState) {
+			prompt += `\n\n${formatHarnessStateForPrompt(harnessState)}`;
+		}
+
 		if (appendSection) {
 			prompt += appendSection;
 		}
@@ -94,6 +102,10 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		activeTools: tools.filter((name) => name === "ipython" || name === "bash" || name === "edit"),
 		allowRecursion,
 	});
+
+	if (harnessState) {
+		prompt += `\n\n${formatHarnessStateForPrompt(harnessState)}`;
+	}
 
 	const guidelines = formatPromptGuidelines(promptGuidelines);
 	if (guidelines) {

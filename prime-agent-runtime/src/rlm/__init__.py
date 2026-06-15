@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .harness import HarnessEntry, HarnessState, RefinementEvent, get_harness_state
+
 try:
     from ipykernel.comm import Comm
 except Exception:  # pragma: no cover - depends on ipykernel version
@@ -139,7 +141,19 @@ async def run(prompt: str, **kwargs: Any) -> RLMResult:
     return _result_from_payload(payload)
 
 
+try:
+    _harness_state = get_harness_state()
+except Exception:  # pragma: no cover - harness state must never break `import rlm`
+    # Importing rlm runs inside the kernel; a failure here would take down the whole
+    # kernel. Fall back to a true in-memory store (no path resolution, no disk) so the
+    # failure cannot recur and refinement is merely degraded, not fatal.
+    _harness_state = HarnessState(in_memory=True)
+
+
 class _RLMCallable:
+    harness = _harness_state
+    get_harness_state = staticmethod(get_harness_state)
+
     async def run(self, prompt: str, **kwargs: Any) -> RLMResult:
         return await run(prompt, **kwargs)
 
@@ -148,6 +162,7 @@ class _RLMCallable:
 
 
 rlm = _RLMCallable()
+harness = _harness_state
 
 
 class _CallableModule(types.ModuleType):
@@ -158,8 +173,13 @@ class _CallableModule(types.ModuleType):
 sys.modules[__name__].__class__ = _CallableModule
 
 __all__ = [
+    "HarnessEntry",
+    "HarnessState",
     "RLMResult",
+    "RefinementEvent",
     "TokenUsage",
+    "get_harness_state",
+    "harness",
     "rlm",
     "run",
 ]

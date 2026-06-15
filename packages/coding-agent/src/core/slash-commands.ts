@@ -43,6 +43,7 @@ export const BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		description: "Compact the session context; optional instructions focus the summary",
 		argumentHint: "[instructions]",
 	},
+	{ name: "refine", description: "Refine editable harness prompt notes, skills, subagents, and memory" },
 	{ name: "goal", description: "Set or view a persistent goal; supports pause, resume, and clear" },
 	{ name: "resume", description: "Resume a different session" },
 	{ name: "reload", description: "Reload keybindings, extensions, skills, prompts, and themes" },

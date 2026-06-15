@@ -70,11 +70,78 @@ packages/coding-agent/src/core/rlm-runtime.ts
 
 prime-agent-runtime/src/rlm/__init__.py
   Python shim installed into ~/.prime/agent/kernel-venv. Exposes rlm, rlm.run(),
-  RLMResult, and TokenUsage.
+  RLMResult, TokenUsage, and the session-backed harness state helper.
+
+prime-agent-runtime/src/rlm/harness.py
+  Session-backed JSON store for reset-free harness refinement notes: prompt
+  notes, memory entries, reusable skill descriptions, subagent specs, and
+  refinement events.
 
 scripts/setup-kernel-venv.sh
   Thin wrapper around the automatic kernel bootstrap.
 ```
+
+## Continual Harness State
+
+Prime Agent exposes a lightweight continual-harness state store in the kernel:
+
+```python
+import rlm
+
+rlm.harness.remember(
+    "Validation failure",
+    "The package import only matters when run through the project environment.",
+    path="repo/testing",
+)
+rlm.harness.upsert_skill(
+    "Run native Python import checks",
+    "Use `uv run python -c ...` or the repo's documented interpreter.",
+)
+rlm.harness.upsert_subagent(
+    "Focused reviewer",
+    "Review the current patch for regressions and missing focused tests.",
+)
+rlm.harness.record_refinement(
+    "Repeated import-check confusion",
+    ["added repo/testing memory", "added native import-check skill"],
+    evidence="two failed checks were run in the IPython kernel instead of the repo env",
+)
+print(rlm.harness.overview())
+```
+
+The store writes `harness_state.json` in the global agent harness directory
+(`RLM_HARNESS_STATE_DIR`, e.g. `~/.prime/agent/harness/`), so learned state is
+shared across sessions. Because the long-lived kernel and the host `/refine`
+command write the same file from separate processes, the kernel-side store
+reloads the file whenever its on-disk mtime changes before reading or mutating,
+so concurrent host edits are merged rather than clobbered. It is intentionally a
+state ledger, not a second execution engine: child-agent execution still uses
+`await rlm(...)`, installed Python skills still use the configured skill surface,
+and file/code edits still go through the normal Prime Agent tools.
+
+This mirrors the useful, domain-independent part of Continual Harness: the agent
+can make small online updates to its prompt notes, memory, skill descriptions,
+and subagent specs after observing trajectory evidence, then record the outcome
+without resetting the run.
+
+The same state can be updated from the TUI or RPC with `/refine`. The command
+runs a dedicated refiner prompt over the current trajectory, existing harness
+state, and prior refinement history, then applies JSON Create/Update/Delete
+edits to the editable components only:
+
+```text
+/refine
+/refine focus on improving validation behavior
+/refine rollback refine_20260608142312
+```
+
+Rollback uses the before/after snapshots stored for each refinement. Because the
+harness state is global, the snapshots are appended to a global
+`refinements.jsonl` log in the harness directory (in addition to a
+`prime-agent.refinement` custom entry in the originating session), so a
+refinement applied in one session can be rolled back from any later session. The
+base system prompt remains immutable; `/refine` can only create or update
+supplemental prompt notes.
 
 ## ZeroMQ Jupyter Kernel Setup
 

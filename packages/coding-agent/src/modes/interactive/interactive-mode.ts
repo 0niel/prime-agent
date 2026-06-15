@@ -3233,6 +3233,12 @@ export class InteractiveMode {
 				await this.handleCompactCommand(customInstructions);
 				return;
 			}
+			if (text === "/refine" || text.startsWith("/refine ")) {
+				const refineArgs = text.startsWith("/refine ") ? text.slice(8).trim() : undefined;
+				this.editor.setText("");
+				await this.handleRefineCommand(refineArgs);
+				return;
+			}
 			if (text === "/reload") {
 				this.editor.setText("");
 				await this.handleReloadCommand();
@@ -6759,6 +6765,54 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 			await this.agentConnection.compact(customInstructions);
 		} catch {
 			// Ignore, will be emitted as an event
+		}
+	}
+
+	private async handleRefineCommand(args?: string): Promise<void> {
+		const trimmedArgs = args?.trim();
+		const rollbackPrefix = "rollback ";
+		let options: { instructions?: string; rollbackId?: string };
+
+		if (trimmedArgs === "rollback") {
+			this.showWarning("Usage: /refine rollback <refinement-id>");
+			return;
+		}
+
+		if (trimmedArgs?.startsWith(rollbackPrefix) && trimmedArgs.slice(rollbackPrefix.length).trim()) {
+			// Rollback uses the global refinement history, not the current trajectory,
+			// so it must work even in a fresh session with no messages yet.
+			options = { rollbackId: trimmedArgs.slice(rollbackPrefix.length).trim() };
+		} else {
+			let messageCount: number;
+			try {
+				const stats = await this.agentConnection.getSessionStats();
+				messageCount = stats.totalMessages;
+			} catch (error) {
+				this.showError(error instanceof Error ? error.message : String(error));
+				return;
+			}
+
+			if (messageCount < 2) {
+				this.showWarning("Nothing to refine (no trajectory yet)");
+				return;
+			}
+			options = { instructions: args };
+		}
+
+		this.stopWorkingLoader();
+		this.showStatus(
+			options.rollbackId ? `Rolling back refinement ${options.rollbackId}...` : "Refining harness state...",
+		);
+
+		try {
+			const result = await this.agentConnection.refine(options);
+			const applied = result.appliedEdits.filter((edit) => edit.applied).length;
+			const failed = result.appliedEdits.length - applied;
+			const failedSuffix = failed > 0 ? `, ${failed} failed` : "";
+			this.showStatus(`Refined harness state: ${applied} edit${applied === 1 ? "" : "s"} applied${failedSuffix}`);
+			this.showStatus(`Harness state: ${result.harnessStatePath}`);
+		} catch (error) {
+			this.showError(`Refinement failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 

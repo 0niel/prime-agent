@@ -514,6 +514,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				return success(id, "compact", result);
 			}
 
+			case "refine": {
+				const result = await session.refine({ instructions: command.instructions, rollbackId: command.rollbackId });
+				return success(id, "refine", result);
+			}
+
 			case "set_auto_compaction": {
 				session.setAutoCompactionEnabled(command.enabled);
 				return success(id, "set_auto_compaction");

@@ -9,6 +9,7 @@ import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi
 import type { ImageContent } from "@earendil-works/pi-ai";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
+import type { RefinementResult } from "../../core/refinement/index.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
 import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.js";
@@ -16,6 +17,9 @@ import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "
 // ============================================================================
 // Types
 // ============================================================================
+
+/** Extended response timeout for refine requests, which run an LLM pass. */
+export const REFINE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Distributive Omit that works with union types */
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
@@ -273,6 +277,16 @@ export class RpcClient {
 	}
 
 	/**
+	 * Refine editable harness state.
+	 */
+	async refine(options: { instructions?: string; rollbackId?: string } = {}): Promise<RefinementResult> {
+		// Refinement runs an LLM pass that routinely exceeds the default 30s response
+		// timeout, so use the same extended window as the daemon refine path.
+		const response = await this.send({ type: "refine", ...options }, REFINE_REQUEST_TIMEOUT_MS);
+		return this.getData(response);
+	}
+
+	/**
 	 * Set auto-compaction enabled/disabled.
 	 */
 	async setAutoCompaction(enabled: boolean): Promise<void> {
@@ -471,7 +485,7 @@ export class RpcClient {
 		}
 	}
 
-	private async send(command: RpcCommandBody): Promise<RpcResponse> {
+	private async send(command: RpcCommandBody, timeoutMs = 30000): Promise<RpcResponse> {
 		if (!this.process?.stdin) {
 			throw new Error("Client not started");
 		}
@@ -485,7 +499,7 @@ export class RpcClient {
 			const timeout = setTimeout(() => {
 				this.pendingRequests.delete(id);
 				reject(new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.stderr}`));
-			}, 30000);
+			}, timeoutMs);
 
 			this.pendingRequests.set(id, {
 				resolve: (response) => {
