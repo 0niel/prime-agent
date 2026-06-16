@@ -54,6 +54,27 @@ describe("session cwd handling", () => {
 		});
 	});
 
+	it("reads the header cwd even when the file starts with a blank line", () => {
+		// open() reads the first physical line for the header, but the full loader
+		// trims and skips leading blank lines. A leading blank line must not make
+		// getCwd() fall back to process.cwd() and disagree with the loaded header.
+		const sessionDir = createTempDir("pi-session-cwd-blank-line");
+		const sessionFile = join(sessionDir, "session.jsonl");
+		cleanupPaths.push(sessionDir);
+		const headerCwd = join(sessionDir, "project");
+		const header = JSON.stringify({
+			type: "session",
+			version: 3,
+			id: "session-id",
+			timestamp: new Date().toISOString(),
+			cwd: headerCwd,
+		});
+		writeFileSync(sessionFile, `\n${header}\n`);
+
+		const sessionManager = SessionManager.open(sessionFile);
+		expect(sessionManager.getCwd()).toBe(headerCwd);
+	});
+
 	it("supports overriding the effective cwd when opening a session", () => {
 		const fallbackCwd = createTempDir("pi-session-cwd-override");
 		const missingCwd = join(fallbackCwd, "does-not-exist");

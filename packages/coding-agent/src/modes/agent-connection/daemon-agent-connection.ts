@@ -156,7 +156,10 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (this.latestSnapshotIsFresh && this.latestSnapshot) {
 			return this.latestSnapshot;
 		}
-		const [state, messagesData, sessionContextData, sessionTree] = await Promise.all([
+		// The session tree is intentionally not fetched here: it is large on long
+		// sessions and only needed when the user opens the tree/branch selector.
+		// getSessionTree() fetches it lazily via get_session_tree on first use.
+		const [state, messagesData, sessionContextData] = await Promise.all([
 			this.requestData<AgentConnectionState>({
 				type: "get_connection_state",
 				activeSessionId: this.activeSessionId,
@@ -169,10 +172,6 @@ export class DaemonAgentConnection implements AgentConnection {
 				type: "get_session_context",
 				activeSessionId: this.activeSessionId,
 			}),
-			this.requestData<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }>({
-				type: "get_session_tree",
-				activeSessionId: this.activeSessionId,
-			}),
 		]);
 		// Children only travel in the attach snapshot; a session event arriving
 		// before the first read marks the cache stale, but the attach-time child
@@ -183,7 +182,6 @@ export class DaemonAgentConnection implements AgentConnection {
 			state,
 			messages: messagesData.messages,
 			sessionContext: sessionContextData.context,
-			sessionTree,
 			...(children ? { children } : {}),
 		};
 		if (this.lastEventSequence !== undefined) {

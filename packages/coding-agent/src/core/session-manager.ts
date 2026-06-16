@@ -1237,7 +1237,12 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionContext(): SessionContext {
-		return buildSessionContext(this.getEntries(), this.leafId, this.byId);
+		// Pass fileEntries directly rather than getEntries(): the resolved context
+		// is computed from the leaf-to-root walk over byId (which already excludes
+		// the header), so the entries argument is only a fallback for an undefined
+		// leaf — never hit here since leafId is always set or null. Avoids an O(n)
+		// array copy on every call (attach, get_session_context, agent init, ...).
+		return buildSessionContext(this.fileEntries as SessionEntry[], this.leafId, this.byId);
 	}
 
 	/**
@@ -1470,13 +1475,31 @@ export class SessionManager {
 	 * @param cwdOverride Optional cwd override instead of the session header cwd.
 	 */
 	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
-		// Extract cwd from session header if possible, otherwise use process.cwd()
-		const entries = loadEntriesFromFile(path);
-		const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
-		const cwd = cwdOverride ?? header?.cwd ?? process.cwd();
+		// Only the header's cwd is needed to construct the manager; the constructor
+		// (setSessionFile) performs the full parse. Read just the first line here
+		// instead of parsing the entire file a second time — that double parse is a
+		// needless O(n) cost on open and is noticeable for long sessions.
+		let cwd = cwdOverride;
+		if (cwd === undefined) {
+			let header: Partial<SessionHeader> | undefined;
+			try {
+				header = readSessionHeader(path);
+			} catch {
+				header = undefined;
+			}
+			// readSessionHeader only inspects the first physical line. If that isn't a
+			// valid session header (e.g. a leading blank/whitespace or malformed line),
+			// fall back to the full loader, which trims and skips such lines exactly
+			// like setSessionFile does — so this.cwd stays consistent with the header
+			// the session is actually loaded with. This slow path is rare.
+			if (header?.type !== "session" || typeof header.id !== "string") {
+				header = loadEntriesFromFile(path).find((e) => e.type === "session") as SessionHeader | undefined;
+			}
+			cwd = header?.cwd;
+		}
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ?? resolve(path, "..");
-		return new SessionManager(cwd, dir, path, true);
+		return new SessionManager(cwd ?? process.cwd(), dir, path, true);
 	}
 
 	/**

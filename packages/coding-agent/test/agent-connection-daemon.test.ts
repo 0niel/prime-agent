@@ -649,7 +649,8 @@ describe("DaemonAgentConnection", () => {
 		await connection.attach();
 		emitSequencedQueueUpdate(fakeClient, "active-1", 13);
 
-		await expect(connection.getInitialSnapshot()).resolves.toMatchObject({
+		const snapshot = await connection.getInitialSnapshot();
+		expect(snapshot).toMatchObject({
 			state: {
 				sessionId: "session-current",
 			},
@@ -657,16 +658,15 @@ describe("DaemonAgentConnection", () => {
 			sessionContext: {
 				messages: [{ role: "user", content: "context prompt", timestamp: 3 }],
 			},
-			sessionTree: {
-				leafId: "user-1",
-			},
 		});
+		// The session tree is fetched lazily (only when the tree/branch selector is
+		// opened), so refreshing the initial snapshot must not request it.
+		expect(snapshot.sessionTree).toBeUndefined();
 		expect(fakeClient.requests.map((request) => request.type)).toEqual([
 			"attach",
 			"get_connection_state",
 			"get_messages",
 			"get_session_context",
-			"get_session_tree",
 		]);
 	});
 

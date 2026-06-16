@@ -1059,10 +1059,11 @@ class AgentDaemon {
 			state: createAgentConnectionState(state.runtime, state.activeSessionId),
 			messages: state.runtime.session.messages,
 			sessionContext: sessionManager.buildSessionContext(),
-			sessionTree: {
-				tree: sessionManager.getTree(),
-				leafId: sessionManager.getLeafId(),
-			},
+			// The session tree is omitted on purpose: it carries every entry's full
+			// body (tens of MB on long sessions) but is only needed when the user
+			// opens the tree/branch selector. Clients fetch it lazily via
+			// get_session_tree (see DaemonAgentConnection.getSessionTree), keeping
+			// attach cheap regardless of transcript length.
 			lastEventSequence: state.lastEventSequence,
 			...(parent ? { parent } : {}),
 			...(children.length > 0 ? { children } : {}),
