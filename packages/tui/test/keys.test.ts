@@ -481,6 +481,9 @@ describe("matchesKey", () => {
 		it("should match alt+arrows", () => {
 			assert.strictEqual(matchesKey("\x1bp", "alt+up"), true);
 			assert.strictEqual(matchesKey("\x1bp", "up"), false);
+			// Standard xterm CSI modified-arrow sequences (terminals without Kitty protocol)
+			assert.strictEqual(matchesKey("\x1b[1;3A", "alt+up"), true);
+			assert.strictEqual(matchesKey("\x1b[1;3B", "alt+down"), true);
 		});
 
 		it("should match rxvt modifier sequences", () => {

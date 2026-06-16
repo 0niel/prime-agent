@@ -1043,7 +1043,11 @@ export function matchesKey(data: string, keyId: KeyId): boolean {
 
 		case "up":
 			if (modifier === MODIFIERS.alt) {
-				return data === "\x1bp" || matchesKittySequence(data, ARROW_CODEPOINTS.up, MODIFIERS.alt);
+				return (
+					data === "\x1b[1;3A" ||
+					data === "\x1bp" ||
+					matchesKittySequence(data, ARROW_CODEPOINTS.up, MODIFIERS.alt)
+				);
 			}
 			if (modifier === 0) {
 				return (
@@ -1058,7 +1062,11 @@ export function matchesKey(data: string, keyId: KeyId): boolean {
 
 		case "down":
 			if (modifier === MODIFIERS.alt) {
-				return data === "\x1bn" || matchesKittySequence(data, ARROW_CODEPOINTS.down, MODIFIERS.alt);
+				return (
+					data === "\x1b[1;3B" ||
+					data === "\x1bn" ||
+					matchesKittySequence(data, ARROW_CODEPOINTS.down, MODIFIERS.alt)
+				);
 			}
 			if (modifier === 0) {
 				return (
