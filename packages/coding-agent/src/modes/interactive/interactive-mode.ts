@@ -39,7 +39,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "child_process";
-import { APP_TITLE, getAgentDir, getDebugLogPath, getShareViewerUrl, VERSION } from "../../config.js";
+import { APP_TITLE, getAgentDir, getDebugLogPath, getLogsDir, getShareViewerUrl, VERSION } from "../../config.js";
 import {
 	type AgentTraceUploadResult,
 	getPrimeAgentTraceCredential,
@@ -3190,6 +3190,11 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
+			if (commandName === "logs" && !commandArgs) {
+				this.handleLogsCommand();
+				this.editor.setText("");
+				return;
+			}
 			if (commandName === "goal" && (!commandArgs || commandArgs === "status")) {
 				this.handleGoalStatusCommand();
 				this.editor.setText("");
@@ -4735,16 +4740,25 @@ export class InteractiveMode {
 		process.exit(0);
 	}
 
+	/**
+	 * Tear down the session's terminal UI before handing the terminal back to the
+	 * agents view. Drains in-flight Kitty/SSH key-release sequences so they don't
+	 * leak into the parent UI, then stops the renderer and theme watcher. Safe to
+	 * call from a crash path too; idempotent via stop().
+	 */
+	async teardownSessionUi(): Promise<void> {
+		await this.ui.terminal.drainInput(1000).catch(() => undefined);
+		this.stop();
+		stopThemeWatcher();
+	}
+
 	private async returnToAgentsView(): Promise<void> {
 		if (this.isShuttingDown || this.returnToAgentsViewRequested) return;
 		this.returnToAgentsViewRequested = true;
 		this.isShuttingDown = true;
 		this.unregisterSignalHandlers();
 
-		await this.ui.terminal.drainInput(1000);
-
-		this.stop();
-		stopThemeWatcher();
+		await this.teardownSessionUi();
 		try {
 			await this.agentConnection.dispose();
 		} finally {
@@ -6449,6 +6463,39 @@ export class InteractiveMode {
 		info += `${theme.fg("dim", "Tool Results:")} ${stats.toolResults}\n`;
 		info += `${theme.fg("dim", "Total:")} ${stats.totalMessages}\n\n`;
 		info += theme.fg("dim", "Use /context for token, cost, and context usage.");
+
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(info, 1, 0));
+		this.ui.requestRender();
+	}
+
+	private handleLogsCommand(): void {
+		const logsDir = getLogsDir();
+		let info = `${theme.bold("Logs")}\n\n`;
+		info += `${theme.fg("dim", "Directory:")} ${logsDir}\n\n`;
+
+		let files: string[] = [];
+		try {
+			if (fs.existsSync(logsDir)) {
+				files = fs.readdirSync(logsDir).filter((name) => !name.startsWith("."));
+			}
+		} catch {
+			// Fall through to the empty-state line below.
+		}
+		if (files.length === 0) {
+			info += `${theme.fg("dim", "No logs written yet.")}\n`;
+		} else {
+			for (const name of files.sort()) {
+				let size = "";
+				try {
+					size = ` ${theme.fg("dim", `(${(fs.statSync(path.join(logsDir, name)).size / 1024).toFixed(1)} KB)`)}`;
+				} catch {
+					// Skip the size if the file vanished between readdir and stat.
+				}
+				info += `${theme.fg("dim", "•")} ${name}${size}\n`;
+			}
+		}
+		info += `\n${theme.fg("dim", "Daemon crashes log to <socket>.log; agent-open failures log to client-errors.log.")}`;
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(info, 1, 0));

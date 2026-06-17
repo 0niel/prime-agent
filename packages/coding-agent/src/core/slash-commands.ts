@@ -44,6 +44,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "copy", description: "Copy last agent message to clipboard" },
 	{ name: "name", description: "Set session display name" },
 	{ name: "session", description: "Show session info" },
+	{ name: "logs", description: "Show where daemon and client logs are saved" },
 	{
 		name: "traces",
 		description: "Opt in or out of Prime Agent trace sharing",

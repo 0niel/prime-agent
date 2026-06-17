@@ -1,5 +1,17 @@
 import { spawnSync } from "child_process";
-import { accessSync, constants, existsSync, readFileSync, realpathSync } from "fs";
+import { createHash } from "crypto";
+import {
+	accessSync,
+	appendFileSync,
+	constants,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
+	statSync,
+} from "fs";
 import { homedir } from "os";
 import { basename, dirname, join, resolve, sep, win32 } from "path";
 import { fileURLToPath } from "url";
@@ -505,6 +517,52 @@ export function getAgentDir(): string {
 /** Get path to user's custom themes directory */
 export function getCustomThemesDir(): string {
 	return join(getAgentDir(), "themes");
+}
+
+/** Directory where daemon and client diagnostic logs are written (e.g. ~/.prime/agent/logs/). */
+export function getLogsDir(): string {
+	return join(getAgentDir(), "logs");
+}
+
+/** Log file capturing client-side agent-open failures. */
+export function getClientErrorLogPath(): string {
+	return join(getLogsDir(), "client-errors.log");
+}
+
+/**
+ * Log file for a daemon. The basename keeps it readable; a hash of the full
+ * socket path makes it unique so two sockets that share a basename (e.g.
+ * daemon.sock in different dirs) don't interleave into one file.
+ */
+export function getDaemonLogPath(socketPath: string): string {
+	const hash = createHash("sha256").update(socketPath).digest("hex").slice(0, 8);
+	return join(getLogsDir(), `${basename(socketPath)}.${hash}.log`);
+}
+
+const MAX_LOG_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Append a line to a log file, keeping its size bounded with a single-generation
+ * rotation. Opens and closes per call (no held fd), so rotation works at runtime
+ * — a long-lived writer rotates on the write that crosses the cap, not only at
+ * startup. Best-effort: diagnostics must never throw into the caller.
+ */
+export function appendRotatingLog(logPath: string, message: string): void {
+	try {
+		mkdirSync(dirname(logPath), { recursive: true });
+		try {
+			if (existsSync(logPath) && statSync(logPath).size > MAX_LOG_BYTES) {
+				// Drop any prior .old first: renameSync fails on Windows if it exists.
+				rmSync(`${logPath}.old`, { force: true });
+				renameSync(logPath, `${logPath}.old`);
+			}
+		} catch {
+			// Keep appending rather than dropping the log on a rotation failure.
+		}
+		appendFileSync(logPath, `${message}\n`);
+	} catch {
+		// A read-only or missing log dir must never break the caller.
+	}
 }
 
 /** Get path to models.json */

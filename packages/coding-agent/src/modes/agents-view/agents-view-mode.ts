@@ -12,7 +12,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { APP_TITLE, getAgentDir, VERSION } from "../../config.js";
+import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSION } from "../../config.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
 import { findExactModelReferenceMatch } from "../../core/model-resolver.js";
@@ -238,9 +238,22 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 					? (result.subagent.rlmChildId ?? result.subagent.activeSessionId)
 					: undefined,
 			});
-			await interactiveMode.run();
+			try {
+				await interactiveMode.run();
+			} catch (error) {
+				// The session opened fine and then threw while running; label it as a
+				// runtime crash so it isn't mixed in with true open failures.
+				logClientError("Agent session crashed", error);
+				persistentState.statusMessage = formatError("Agent session crashed", error);
+				// Tear down the session TUI exactly as a normal back-navigation would
+				// (drain input, stop renderer + theme watcher) so it doesn't fight the
+				// agents-view UI for the terminal, then drop the daemon connection.
+				await interactiveMode.teardownSessionUi();
+				await opened.connection.dispose().catch(() => undefined);
+			}
 		} catch (error) {
 			await opened?.connection.dispose().catch(() => undefined);
+			logClientError("Failed to open agent", error);
 			persistentState.statusMessage = formatError("Failed to open agent", error);
 		}
 	}
@@ -1835,6 +1848,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function formatError(prefix: string, error: unknown): string {
 	const message = error instanceof Error ? error.message : String(error);
 	return formatAgentsViewStatusLine(`${prefix}: ${message}`);
+}
+
+// The agents view shows open failures as a one-line status only, so a client-side
+// crash (e.g. "Maximum call stack size exceeded") leaves no stack to debug from.
+// Persist the full stack to a file — the TUI owns stdout/stderr, so a log file is
+// the only safe sink.
+function logClientError(prefix: string, error: unknown): void {
+	const detail = error instanceof Error ? (error.stack ?? error.message) : String(error);
+	appendRotatingLog(getClientErrorLogPath(), `[${new Date().toISOString()}] ${prefix}: ${detail}`);
 }
 
 function padLine(line: string, width: number): string {

@@ -146,6 +146,8 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 			cwd: spawnCwd ?? process.cwd(),
 			detached: true,
 			env: process.env,
+			// The daemon writes its own rotating log (see daemon-mode); nothing here
+			// needs its stdout/stderr, so leave them detached.
 			stdio: "ignore",
 		},
 	);

@@ -8,7 +8,7 @@
 
 import { createServer, type Server, type Socket } from "node:net";
 import { resolve } from "node:path";
-import { VERSION } from "../../config.js";
+import { appendRotatingLog, getDaemonLogPath, VERSION } from "../../config.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
 	AgentSessionRuntime,
@@ -180,7 +180,30 @@ class AgentDaemon {
 		private readonly options: DaemonModeOptions,
 	) {}
 
+	// The daemon runs detached with no terminal, so route its diagnostics to a
+	// rotating log file (and stderr too, for when it's run in the foreground).
+	private log(message: string): void {
+		console.error(message);
+		appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] ${message}`);
+	}
+
+	// A crash thrown outside a command handler would otherwise vanish with the
+	// detached stdio; capture its stack before the process goes down.
+	private installCrashHandlers(): void {
+		process.on("uncaughtException", (error) => {
+			this.log(`uncaught exception: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+			process.exit(1);
+		});
+		process.on("unhandledRejection", (reason) => {
+			this.log(
+				`unhandled rejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`,
+			);
+			process.exit(1);
+		});
+	}
+
 	async start(): Promise<void> {
+		this.installCrashHandlers();
 		await prepareDaemonSocketPath(this.socketPath);
 
 		this.server = createServer((socket) => this.handleConnection(socket));
@@ -216,7 +239,7 @@ class AgentDaemon {
 
 		this.registerSignalHandlers();
 		this.summarizer.start();
-		console.error(`Prime Agent daemon listening on ${this.socketPath}`);
+		this.log(`Prime Agent daemon listening on ${this.socketPath}`);
 		void this.restoreActiveSessions();
 	}
 
@@ -231,9 +254,7 @@ class AgentDaemon {
 		try {
 			saved = await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir);
 		} catch (error) {
-			console.error(
-				`Failed to scan sessions for restore: ${error instanceof Error ? error.message : String(error)}`,
-			);
+			this.log(`Failed to scan sessions for restore: ${error instanceof Error ? error.message : String(error)}`);
 			return;
 		}
 		for (const info of saved) {
@@ -248,7 +269,7 @@ class AgentDaemon {
 			try {
 				await this.createRuntime({ type: "create", sessionPath: info.path });
 			} catch (error) {
-				console.error(
+				this.log(
 					`Failed to restore session ${info.path}: ${error instanceof Error ? error.message : String(error)}`,
 				);
 			}
@@ -504,6 +525,12 @@ class AgentDaemon {
 				this.write(client, response);
 			}
 		} catch (error) {
+			// Only the error message reaches the client (serializeDaemonError drops
+			// the rest), so log the full stack here — this is the one place a handler
+			// crash like a RangeError from a pathological session is recoverable.
+			this.log(
+				`daemon command "${command.type}" failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+			);
 			this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
 		}
 	}
