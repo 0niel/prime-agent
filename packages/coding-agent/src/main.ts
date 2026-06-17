@@ -1249,7 +1249,9 @@ export async function main(args: string[], options?: MainOptions) {
 			initialMessages: parsed.messages,
 			verbose: parsed.verbose,
 			// Resumed/attached daemon sessions are part of the same fleet; left
-			// arrow takes them to the agents view like any other session.
+			// arrow takes them to the agents view like any other session. The agents
+			// view was not rendered here, so we intentionally leave
+			// agentsViewOwnsStartupNotices unset and let the in-session fallback run.
 			returnToAgentsView: true,
 		});
 

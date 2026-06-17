@@ -10,8 +10,9 @@ import {
 	TUI,
 	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { APP_TITLE, VERSION } from "../../config.js";
+import { APP_TITLE, getAgentDir, VERSION } from "../../config.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
 import { findExactModelReferenceMatch } from "../../core/model-resolver.js";
@@ -35,6 +36,13 @@ import {
 	stopThemeWatcher,
 	theme,
 } from "../interactive/theme/theme.js";
+import {
+	formatPackageUpdateNotice,
+	formatTmuxWarningNotice,
+	formatUpdateAvailableNotice,
+	gatherStartupNotices,
+	type StartupNotices,
+} from "../shared/startup-notices.js";
 import {
 	AGENTS_VIEW_SLASH_COMMANDS,
 	type AgentsViewCommandName,
@@ -86,6 +94,10 @@ type AgentsViewPersistentState = {
 	selectedRowIdentity?: string;
 	statusMessage?: string;
 	initialPromptsSent?: boolean;
+	// Gathered once and reused across agents-view instances so the notices survive
+	// re-entry and render the moment they resolve, even if the first view was left early.
+	startupNotices?: StartupNotices;
+	startupNoticesPromise?: Promise<StartupNotices>;
 };
 
 type PromptCommand = Extract<DaemonCommand, { type: "prompt" }>;
@@ -217,6 +229,8 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 				modelFallbackMessage: resolveAttachModelFallbackMessage(opened.summary, options.modelFallbackMessage),
 				verbose: options.verbose,
 				returnToAgentsView: true,
+				// The agents view renders the global notices itself, so suppress them in-session.
+				agentsViewOwnsStartupNotices: true,
 				// Matches the node id scheme used by snapshot child seeding
 				// (rlmChildId, falling back to the child's active session id).
 				initialSubagentNodeId: result.subagent
@@ -339,6 +353,7 @@ class AgentsViewMode implements Component, Focusable {
 
 		await this.refreshSessions();
 		await this.sendInitialPrompts();
+		this.loadStartupNotices();
 		this.pollTimer = setInterval(() => {
 			void this.refreshSessions();
 		}, POLL_INTERVAL_MS);
@@ -411,10 +426,63 @@ class AgentsViewMode implements Component, Focusable {
 		}
 		const lines: string[] = [];
 		lines.push(...this.splash.render(width));
+		const noticeLines = this.renderStartupNotices(width);
+		if (noticeLines.length > 0) {
+			lines.push("", ...noticeLines);
+		}
 		lines.push("");
 		const listRows = Math.max(0, height - lines.length);
 		lines.push(...this.renderSessionRows(width, listRows));
 		return lines;
+	}
+
+	private loadStartupNotices(): void {
+		// Notices live on persistentState (read directly in renderStartupNotices), so they
+		// survive leaving and re-entering the agents view regardless of which instance's
+		// gather resolved. Already have them? Nothing to do.
+		if (this.persistentState.startupNotices) {
+			return;
+		}
+		// Reuse an in-flight gather from an earlier agents-view instance so re-entry does
+		// not re-run the checks or lose a result that resolved meanwhile.
+		const promise =
+			this.persistentState.startupNoticesPromise ??
+			gatherStartupNotices({
+				version: VERSION,
+				cwd: this.options.uiServices.getInitialCwd(),
+				agentDir: getAgentDir(),
+				settingsManager: this.options.uiServices.settingsManager,
+			});
+		this.persistentState.startupNoticesPromise = promise;
+		void promise
+			.then((notices) => {
+				this.persistentState.startupNotices = notices;
+				// Best-effort immediate paint; a re-entered instance also picks this up on
+				// its next poll tick since render reads persistentState directly.
+				this.ui.requestRender();
+			})
+			.catch(() => {});
+	}
+
+	private renderStartupNotices(width: number): string[] {
+		const notices = this.persistentState.startupNotices;
+		if (!notices) {
+			return [];
+		}
+		const formatted: string[] = [];
+		if (notices.newVersion) {
+			formatted.push(formatUpdateAvailableNotice(notices.newVersion));
+		}
+		if (notices.packageUpdates.length > 0) {
+			formatted.push(formatPackageUpdateNotice(notices.packageUpdates));
+		}
+		if (notices.tmuxWarning) {
+			formatted.push(formatTmuxWarningNotice(notices.tmuxWarning));
+		}
+		// Match the splash header's one-column gutter and wrap so long notices
+		// (e.g. the tmux fix instructions) stay readable instead of truncating.
+		const wrapWidth = Math.max(1, width - 1);
+		return formatted.flatMap((line) => wrapTextWithAnsi(line, wrapWidth).map((wrapped) => ` ${wrapped}`));
 	}
 
 	private handleListNavigation(data: string): boolean {
