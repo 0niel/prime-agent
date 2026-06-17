@@ -175,6 +175,15 @@ export interface AgentConnectionSessionStateEntry extends AgentConnectionSession
 	state: AgentConnectionSavedSessionState;
 }
 
+export interface AgentConnectionAgentStatusEntry extends AgentConnectionSessionEntryBase {
+	type: "agent_status";
+	status: {
+		summary: string;
+		taskState?: "needs_input" | "completed";
+		basedOnMessageCount: number;
+	};
+}
+
 export type AgentConnectionSessionEntry =
 	| AgentConnectionSessionMessageEntry
 	| AgentConnectionThinkingLevelChangeEntry
@@ -186,7 +195,8 @@ export type AgentConnectionSessionEntry =
 	| AgentConnectionCustomMessageEntry
 	| AgentConnectionLabelEntry
 	| AgentConnectionSessionInfoEntry
-	| AgentConnectionSessionStateEntry;
+	| AgentConnectionSessionStateEntry
+	| AgentConnectionAgentStatusEntry;
 
 export interface AgentConnectionSessionTreeNode {
 	entry: AgentConnectionSessionEntry;
@@ -265,6 +275,8 @@ export interface AgentConnectionState {
 	scopedModels: AgentConnectionScopedModel[];
 	activeToolNames: string[];
 	contextUsage: SessionStats["contextUsage"];
+	/** One-line recap of the agent's recent work, shown above the prompt. */
+	recap?: string;
 }
 
 export interface AgentConnectionSlashCommand {
@@ -496,6 +508,7 @@ export type AgentConnectionSessionEvent =
 export type AgentConnectionEvent =
 	| { type: "session_event"; event: AgentConnectionSessionEvent }
 	| { type: "session_replaced"; state: AgentConnectionState; messages: AgentMessage[] }
+	| { type: "session_status"; recap?: string }
 	| { type: "extension_ui_request"; request: AgentConnectionExtensionUiRequest }
 	| { type: "closed"; error?: string };
 

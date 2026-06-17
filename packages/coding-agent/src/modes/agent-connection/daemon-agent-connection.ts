@@ -633,6 +633,17 @@ export class DaemonAgentConnection implements AgentConnection {
 			await this.emit({ type: "session_event", event: message.event });
 			return;
 		}
+		if (message.type === "session_status") {
+			// Keep a cached snapshot's recap current so a later re-attach seeds it.
+			if (this.latestSnapshot) {
+				this.latestSnapshot = {
+					...this.latestSnapshot,
+					state: { ...this.latestSnapshot.state, recap: message.recap },
+				};
+			}
+			await this.emit({ type: "session_status", recap: message.recap });
+			return;
+		}
 		if (message.type === "session_replaced") {
 			const latestSnapshot: AgentConnectionSnapshot = {
 				state: message.state,

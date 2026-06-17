@@ -29,6 +29,21 @@ describe("agents view state", () => {
 		expect(classifyAgentsViewSession(makeSummary({ status: "idle", messageCount: 4 }))).toBe("completed");
 	});
 
+	test("idle sessions split by the summarizer's completion verdict", () => {
+		// Working is heuristic and ignores taskState.
+		expect(classifyAgentsViewSession(makeSummary({ isStreaming: true, taskState: "completed" }))).toBe("working");
+		// Idle sessions follow the verdict; absent one they stay completed.
+		expect(classifyAgentsViewSession(makeSummary({ status: "idle", taskState: "needs_input" }))).toBe("needs-input");
+		expect(classifyAgentsViewSession(makeSummary({ status: "idle", taskState: "completed" }))).toBe("completed");
+		expect(classifyAgentsViewSession(makeSummary({ status: "idle", taskState: undefined }))).toBe("completed");
+	});
+
+	test("defaults an idle session with no verdict to completed", () => {
+		// A slow, failed, or absent classification never lingers in Working; only
+		// an explicit needs_input verdict moves an idle session out of completed.
+		expect(classifyAgentsViewSession(makeSummary({ status: "idle", taskState: undefined }))).toBe("completed");
+	});
+
 	test("sorts rows by section and most recent modified time", () => {
 		const rows = buildAgentsViewRows([
 			makeSummary({ sessionName: "completed", status: "idle", messageCount: 2, modified: "2026-01-01T00:00:00Z" }),

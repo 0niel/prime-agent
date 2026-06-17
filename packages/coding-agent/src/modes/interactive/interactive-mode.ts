@@ -568,6 +568,10 @@ export class InteractiveMode {
 	private widgetContainerAbove!: Container;
 	private widgetContainerBelow!: Container;
 
+	// One-line recap of the agent's recent work, rendered just above the editor.
+	private recapContainer!: Container;
+	private sessionRecap: string | undefined;
+
 	// Custom footer from extension (undefined = use built-in footer)
 	private customFooter: (Component & { dispose?(): void }) | undefined = undefined;
 
@@ -640,6 +644,7 @@ export class InteractiveMode {
 		this.childAgentDetail.onKill = (nodeId) => void this.killChildAgent(nodeId);
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
+		this.recapContainer = new Container();
 		this.keybindings = KeybindingsManager.create();
 		setKeybindings(this.keybindings);
 		const editorPaddingX = this.settingsManager.getEditorPaddingX();
@@ -883,6 +888,8 @@ export class InteractiveMode {
 		this.mainContainer.addChild(this.mainViewContainer);
 		this.renderWidgets(); // Initialize with default spacer
 		this.mainContainer.addChild(this.widgetContainerAbove);
+		this.renderRecap();
+		this.mainContainer.addChild(this.recapContainer);
 		this.mainContainer.addChild(this.editorContainer);
 		this.mainContainer.addChild(this.childAgentSummary);
 		this.mainContainer.addChild(this.widgetContainerBelow);
@@ -1917,6 +1924,8 @@ export class InteractiveMode {
 	private applyConnectionStateSnapshot(state: AgentConnectionState): void {
 		this.connectionState = state;
 		this.footer.setAutoCompactEnabled(state.autoCompactionEnabled);
+		this.sessionRecap = state.recap;
+		this.renderRecap();
 	}
 
 	private patchConnectionState(patch: Partial<AgentConnectionState>): void {
@@ -2472,6 +2481,19 @@ export class InteractiveMode {
 		if (!this.widgetContainerAbove || !this.widgetContainerBelow) return;
 		this.renderWidgetContainer(this.widgetContainerAbove, this.extensionWidgetsAbove, true, true);
 		this.renderWidgetContainer(this.widgetContainerBelow, this.extensionWidgetsBelow, false, false);
+		this.ui.requestRender();
+	}
+
+	/** Render the recap line above the editor, only when one exists. */
+	private renderRecap(): void {
+		if (!this.recapContainer) return;
+		this.recapContainer.clear();
+		const recap = this.sessionRecap?.trim();
+		if (recap) {
+			this.recapContainer.addChild(new Text(theme.fg("dim", `Recap: ${recap}`), 1, 0));
+			// Blank line between the recap and the prompt bar below it.
+			this.recapContainer.addChild(new Spacer(1));
+		}
 		this.ui.requestRender();
 	}
 
@@ -3340,6 +3362,10 @@ export class InteractiveMode {
 					await this.rebindCurrentSession();
 					await this.renderInitialMessages();
 					this.ui.requestRender();
+				} else if (event.type === "session_status") {
+					this.sessionRecap = event.recap;
+					this.patchConnectionState({ recap: event.recap });
+					this.renderRecap();
 				} else if (event.type === "extension_ui_request") {
 					await this.handleConnectionExtensionUiRequest(event.request);
 				} else if (event.type === "closed") {
@@ -3622,6 +3648,9 @@ export class InteractiveMode {
 					this.ui.requestRender();
 				} else if (event.message.role === "user") {
 					this.addMessageToChat(event.message);
+					// A new turn makes the recap stale; clear it until the summarizer pushes a fresh one.
+					this.sessionRecap = undefined;
+					this.renderRecap();
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Socket } from "node:net";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
+import type { AgentStatus } from "../../core/session-manager.js";
 import type { DaemonClientCapability, DaemonEventSequence, DaemonExtensionUIResponse } from "./daemon-protocol.js";
 import { formatSessionDisplayId, matchesSessionIdSuffix } from "./daemon-session-id.js";
 
@@ -20,6 +21,8 @@ export interface ActiveSessionState {
 	extensionUiRequests: Map<string, ActiveSessionExtensionUiRequest>;
 	lastEventSequence: DaemonEventSequence;
 	unsubscribe?: () => void;
+	/** Latest background status summary, surfaced in the agents view. */
+	summaryState?: AgentStatus;
 }
 
 export interface ActiveSessionExtensionUiRequest {

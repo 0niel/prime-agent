@@ -5,7 +5,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { compactRlmText } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.js";
-import type { SessionInfo } from "../../core/session-manager.js";
+import type { AgentTaskState, SessionInfo } from "../../core/session-manager.js";
 import type {
 	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionRlmChildAgentTranscriptLine,
@@ -49,6 +49,10 @@ export interface SessionSummary {
 	spawnCode?: string;
 	modelFallbackMessage?: string;
 	diagnostics?: AgentSessionRuntimeDiagnostic[];
+	/** One-line background summary of what the agent is doing or just did. */
+	summary?: string;
+	/** Completion verdict for an idle session; absent while working or unjudged. */
+	taskState?: AgentTaskState;
 }
 
 /**
@@ -147,7 +151,17 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		spawnCode: metadata.spawnCode ? metadata.spawnCode.slice(0, SPAWN_CODE_MAX_CHARS) : undefined,
 		modelFallbackMessage: activeSession.runtime.modelFallbackMessage,
 		diagnostics: [...activeSession.runtime.diagnostics],
+		// Drop both summary and verdict once new messages arrive; a stale recap
+		// would describe a prior turn. The summarizer refreshes within seconds.
+		...(isSummaryCurrent(activeSession)
+			? { summary: activeSession.summaryState?.summary, taskState: activeSession.summaryState?.taskState }
+			: {}),
 	};
+}
+
+export function isSummaryCurrent(activeSession: ActiveSessionState): boolean {
+	const status = activeSession.summaryState;
+	return status !== undefined && status.basedOnMessageCount === activeSession.runtime.session.messages.length;
 }
 
 export function summaryForInactiveSession(session: SessionInfo): SessionSummary {

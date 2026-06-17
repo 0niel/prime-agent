@@ -315,6 +315,7 @@ export type DaemonOutbound =
 			serverCapabilities: readonly DaemonClientCapability[];
 	  }
 	| { type: "session_event"; activeSessionId: string; event: AgentConnectionSessionEvent; meta?: DaemonEventMeta }
+	| { type: "session_status"; activeSessionId: string; recap?: string; meta?: DaemonEventMeta }
 	| {
 			type: "session_replaced";
 			activeSessionId: string;
