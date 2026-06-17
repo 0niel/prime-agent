@@ -11,10 +11,13 @@ import { fileURLToPath } from "node:url";
 import { getPackageDir } from "../../config.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 
-const BOOTSTRAP_SCHEMA = 6;
+const BOOTSTRAP_SCHEMA = 7;
 const PYTHON_VERSION = "3.11";
 const IPYKERNEL_REQUIREMENT = "ipykernel";
 const RUNTIME_REQUIREMENT = "prime-agent-runtime";
+// Serializes the kernel's user namespace so it can be revived across session
+// resume. Internal-only; intentionally not surfaced to the model as an import.
+const STATE_SNAPSHOT_REQUIREMENT = "dill";
 const DEFAULT_RLM_EXTRA_PACKAGES = [
 	{ uvArg: "requests", importName: "requests", promptLabel: "requests" },
 	{ uvArg: "httpx", importName: "httpx", promptLabel: "httpx" },
@@ -75,6 +78,7 @@ interface BootstrapVersion {
 	schema: number;
 	ipykernel?: string;
 	runtime?: string;
+	snapshot?: string;
 	extraUvArgs?: string[];
 	pythonSkills?: BootstrapPythonSkill[];
 }
@@ -405,6 +409,7 @@ async function readBootstrapVersion(venv: string): Promise<BootstrapVersion | nu
 			schema: parsed.schema,
 			ipykernel: typeof parsed.ipykernel === "string" ? parsed.ipykernel : undefined,
 			runtime: typeof parsed.runtime === "string" ? parsed.runtime : undefined,
+			snapshot: typeof parsed.snapshot === "string" ? parsed.snapshot : undefined,
 			extraUvArgs,
 			pythonSkills,
 		};
@@ -448,6 +453,7 @@ function bootstrapBaseVersionCurrent(version: BootstrapVersion | null): boolean 
 		version?.schema === BOOTSTRAP_SCHEMA &&
 		version.ipykernel === IPYKERNEL_REQUIREMENT &&
 		version.runtime === RUNTIME_REQUIREMENT &&
+		version.snapshot === STATE_SNAPSHOT_REQUIREMENT &&
 		extraUvArgsMatch(version.extraUvArgs, DEFAULT_RLM_EXTRA_UV_ARGS)
 	);
 }
@@ -457,6 +463,7 @@ async function writeBootstrapVersion(venv: string, pythonSkills: readonly Bootst
 		schema: BOOTSTRAP_SCHEMA,
 		ipykernel: IPYKERNEL_REQUIREMENT,
 		runtime: RUNTIME_REQUIREMENT,
+		snapshot: STATE_SNAPSHOT_REQUIREMENT,
 		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
 		pythonSkills: [...pythonSkills],
 	};
@@ -501,6 +508,7 @@ async function bootstrapVenv(
 		python,
 		IPYKERNEL_REQUIREMENT,
 		runtimeRequirement,
+		STATE_SNAPSHOT_REQUIREMENT,
 		...DEFAULT_RLM_EXTRA_UV_ARGS,
 	]);
 	await syncPythonSkills(uv, venv, python, pythonSkills, options);

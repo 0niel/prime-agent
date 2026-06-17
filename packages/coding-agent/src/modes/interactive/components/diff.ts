@@ -224,7 +224,14 @@ export function renderRichDiff(diffText: string, contentWidth: number, options: 
 		const parsed = parseDiffLine(rawLine);
 		if (!parsed) {
 			rows.push(
-				buildRichDiffLine({ bg: "toolPanelBg", gutterFg: "toolDiffContext", gutter: "", content: replaceTabs(rawLine), language, width }),
+				buildRichDiffLine({
+					bg: "toolPanelBg",
+					gutterFg: "toolDiffContext",
+					gutter: "",
+					content: replaceTabs(rawLine),
+					language,
+					width,
+				}),
 			);
 			continue;
 		}
@@ -257,7 +264,14 @@ export function renderRichDiff(diffText: string, contentWidth: number, options: 
 			);
 		} else {
 			rows.push(
-				buildRichDiffLine({ bg: "toolPanelBg", gutterFg: "toolDiffContext", gutter, content: text, language, width }),
+				buildRichDiffLine({
+					bg: "toolPanelBg",
+					gutterFg: "toolDiffContext",
+					gutter,
+					content: text,
+					language,
+					width,
+				}),
 			);
 		}
 	}

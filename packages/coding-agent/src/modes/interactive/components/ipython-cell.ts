@@ -286,12 +286,7 @@ export class IPythonCellComponent implements Component {
 		return { label: theme.fg("success", "done") };
 	}
 
-	private renderCode(
-		lines: string[],
-		width: number,
-		withExpandHint: ExpandHintFormatter,
-		hasDiffs: boolean,
-	): boolean {
+	private renderCode(lines: string[], width: number, withExpandHint: ExpandHintFormatter, hasDiffs: boolean): boolean {
 		const code = this.state.code.trimEnd();
 		if (!code) {
 			this.addBlank(lines, width);

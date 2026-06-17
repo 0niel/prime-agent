@@ -1,9 +1,12 @@
 // TODO: reconsider whether the persistent kernel is needed once RLM-1 weights land.
+import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
 import type { ToolDefinition } from "../extensions/types.js";
 import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
 import { type HostRequestHandlers, type KernelDiffDisplay, KernelManager } from "../kernel/index.js";
+import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
@@ -141,8 +144,18 @@ export interface IpythonToolOptions {
 	/** Typed host request handlers for the kernel↔host bridge (rlm.run, goal.*, …). */
 	hostHandlers?: HostRequestHandlers;
 	pythonSkills?: readonly PythonSkillRuntimeInfo[];
+	/** Per-session artifact dir where the kernel namespace snapshot is stored. Omit to disable snapshots. */
+	snapshotDir?: string;
+	/** Resolves before this kernel starts — e.g. the previous provisioner's dispose, so a
+	 * /reload's old-kernel snapshot flush can't race the new kernel's restore. */
+	readyGate?: Promise<unknown>;
 	/** Filled after the first kernel start so the owning session can restart it after compaction. */
 	kernelManagerRef?: { current?: KernelManager };
+	/**
+	 * Fires once per kernel start when a previous session's namespace was revived
+	 * (some names restored or some failed), so the session can tell the model.
+	 */
+	onRestore?: (result: RestoreResult) => void;
 	/** Shared provisioner owning the kernel lifecycle. When provided, the remaining options are ignored. */
 	provisioner?: IpythonKernelProvisioner;
 }
@@ -159,6 +172,7 @@ export class IpythonKernelProvisioner {
 	private startedManager?: KernelManager;
 	private readonly startupListeners = new Set<KernelBootstrapProgressHandler>();
 	private lastStartupMessage?: string;
+	private _lastRestore?: RestoreResult;
 
 	constructor(
 		private readonly cwd: string,
@@ -174,6 +188,11 @@ export class IpythonKernelProvisioner {
 		return this.startedManager;
 	}
 
+	/** Result of reviving a prior session's namespace on the last kernel start, if any. */
+	get lastRestore(): RestoreResult | undefined {
+		return this._lastRestore;
+	}
+
 	/** Start the kernel in the background. Failures are swallowed here and surface on the next ensure(). */
 	prewarm(): void {
 		void this.ensure().catch(() => {});
@@ -181,7 +200,24 @@ export class IpythonKernelProvisioner {
 
 	/** Restart the kernel if one is running (e.g. after compaction). */
 	async restart(): Promise<void> {
-		await this.startedManager?.restart();
+		try {
+			// Await any in-flight startup first, so we restart a fully-started kernel and
+			// delete the snapshot after (not during) a concurrent restore.
+			const m = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
+			await m?.restart();
+		} finally {
+			// Compaction deliberately wipes the namespace and tells the model so. Drop the
+			// stale on-disk snapshot too — even if the restart threw — so a later resume
+			// doesn't revive state the model was told is gone (a fresh cell re-snapshots).
+			this._lastRestore = undefined;
+			const dir = this.options?.snapshotDir;
+			if (dir) {
+				await Promise.allSettled([
+					rm(snapshotPathIn(dir), { force: true }),
+					rm(manifestPathIn(dir), { force: true }),
+				]);
+			}
+		}
 	}
 
 	/** Dispose the kernel owned by this provisioner, including one still starting up. */
@@ -242,6 +278,14 @@ export class IpythonKernelProvisioner {
 	}
 
 	private async startKernel(): Promise<KernelManager> {
+		// Wait for a previous provisioner (e.g. on /reload) to finish disposing — and
+		// flushing its final snapshot — before we read that snapshot back, so the two
+		// kernels can't race over the same on-disk file. Guarded so the common
+		// no-gate path stays synchronous (callers rely on prompt startup progress).
+		if (this.options?.readyGate) {
+			await this.options.readyGate.catch(() => {});
+		}
+		const snapshotDir = this.options?.snapshotDir;
 		const m = new KernelManager({
 			python: this.options?.python,
 			cwd: this.cwd,
@@ -249,15 +293,42 @@ export class IpythonKernelProvisioner {
 			sessionId: this.options?.sessionId,
 			hostHandlers: this.options?.hostHandlers,
 			pythonSkills: this.options?.pythonSkills,
+			// Only persistent sessions (which have an artifact dir) get a revivable snapshot.
+			snapshot: snapshotDir
+				? { path: snapshotPathIn(snapshotDir), manifestPath: manifestPathIn(snapshotDir) }
+				: undefined,
 		});
 		this.emitStartupProgress("Starting IPython kernel...");
 		await m.start({ onBootstrapProgress: (message) => this.emitStartupProgress(message) });
-		this.emitStartupProgress("Preparing IPython runtime...");
-		const bootstrap = await m.execute(buildRlmBootstrapCode(this.options?.pythonSkills));
-		if (bootstrap.status !== "ok") {
-			const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
+		// Whether a snapshot existed decides if we notify the model on success.
+		let pendingRestore: RestoreResult | undefined;
+		try {
+			// Revive a prior session's namespace before the bootstrap, so the bootstrap
+			// then overwrites live handles (rlm, skills) on top of anything restored.
+			if (snapshotDir) {
+				const snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
+				this.emitStartupProgress("Restoring IPython state...");
+				const restore = await m.restoreState();
+				if (snapshotExisted) {
+					pendingRestore = restore ?? { restored: [], failed: [], path: snapshotPathIn(snapshotDir) };
+				}
+			}
+			this.emitStartupProgress("Preparing IPython runtime...");
+			const bootstrap = await m.execute(buildRlmBootstrapCode(this.options?.pythonSkills));
+			if (bootstrap.status !== "ok") {
+				const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
+				throw new Error(`Failed to initialize rlm runtime in the IPython kernel:\n${details}`);
+			}
+		} catch (error) {
+			// Never leak the kernel's ZMQ sockets / temp dir if startup fails after spawn.
 			void m.dispose();
-			throw new Error(`Failed to initialize rlm runtime in the IPython kernel:\n${details}`);
+			throw error;
+		}
+		// Only tell the model what was revived once the kernel is actually usable —
+		// a notice claiming restored state must never outlive a failed bootstrap.
+		if (pendingRestore) {
+			this._lastRestore = pendingRestore;
+			this.options?.onRestore?.(pendingRestore);
 		}
 		if (this.options?.kernelManagerRef) {
 			this.options.kernelManagerRef.current = m;
@@ -276,7 +347,7 @@ export function createIpythonToolDefinition(
 		name: "ipython",
 		label: "ipython",
 		description:
-			"Execute Python scratchpad code and `%%bash` shell cells in a persistent IPython kernel. Variables, imports, and loaded data persist across calls. Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.",
+			"Execute Python scratchpad code and `%%bash` shell cells in a persistent IPython kernel. Variables, imports, and loaded data persist across calls, and are revived on a best-effort basis when a session is resumed (objects that cannot be serialized are dropped and reported). Project imports, tests, scripts, CLIs, and dependency checks should run through the target project's own environment.",
 		promptSnippet: "ipython - persistent agent notebook for Python scratchpad code and %%bash orchestration",
 		// The kernel is single-threaded — pi must not run two ipython calls in parallel within a batch.
 		executionMode: "sequential",

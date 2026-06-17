@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanupSessionResources } from "@earendil-works/pi-ai";
@@ -95,6 +95,38 @@ describe("IpythonKernelProvisioner", () => {
 		provisioner.prewarm();
 		await provisioner.dispose();
 		expect(provisioner.manager).toBeUndefined();
+	});
+
+	it("waits for readyGate before starting the kernel", async () => {
+		const { python, countRuns } = writeFakePython();
+		let release: () => void = () => {};
+		const gate = new Promise<void>((r) => {
+			release = r;
+		});
+		const provisioner = new IpythonKernelProvisioner(tempDir, { python, readyGate: gate });
+
+		const started = provisioner.ensure().catch(() => {});
+		await new Promise((r) => setTimeout(r, 50));
+		expect(countRuns()).toBe(0); // gated: must not spawn the kernel yet
+
+		release();
+		await started;
+		expect(countRuns()).toBe(1);
+	});
+
+	it("restart() drops the on-disk snapshot so a compaction wipe isn't revived on resume", async () => {
+		const snapshotDir = join(tempDir, "artifacts");
+		const provisioner = new IpythonKernelProvisioner(tempDir, { snapshotDir });
+		const dill = join(snapshotDir, "kernel-state.dill");
+		const manifest = join(snapshotDir, "kernel-state.json");
+		mkdirSync(snapshotDir, { recursive: true });
+		writeFileSync(dill, "payload");
+		writeFileSync(manifest, "{}");
+
+		await provisioner.restart();
+
+		expect(existsSync(dill)).toBe(false);
+		expect(existsSync(manifest)).toBe(false);
 	});
 });
 

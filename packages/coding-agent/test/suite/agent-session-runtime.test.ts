@@ -149,6 +149,7 @@ describe("AgentSessionRuntime characterization", () => {
 			},
 			setSubagentRuntimeHost: vi.fn(),
 			dispose: disposeSession,
+			disposeAsync: disposeSession,
 		} as unknown as AgentSession;
 		const services = { cwd: "/tmp", agentDir: "/tmp" } as unknown as AgentSessionServices;
 		const createRuntime: CreateAgentSessionRuntimeFactory = async () => {

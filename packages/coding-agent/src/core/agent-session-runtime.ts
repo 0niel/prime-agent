@@ -194,7 +194,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			targetSessionFile,
 		});
 		this.beforeSessionInvalidate?.();
-		this.session.dispose();
+		// Await the kernel's final snapshot flush before invalidating the session.
+		await this.session.disposeAsync();
 		await this.disposeHostedSubagentRuntimes();
 	}
 
@@ -531,7 +532,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			disposeError ??= error;
 		}
 		try {
-			this.session.dispose();
+			// Await the kernel's final snapshot flush before tearing the session down.
+			await this.session.disposeAsync();
 		} catch (error) {
 			disposeError ??= error;
 		}

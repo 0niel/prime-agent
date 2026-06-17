@@ -1,13 +1,24 @@
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { unlink } from "node:fs/promises";
+import { rm, unlink } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 
 export type DeleteSessionFileResult = { ok: true; method: "trash" | "unlink" } | { ok: false; error: string };
 
 /**
- * Delete a session file, trying the `trash` CLI first, then falling back to unlink.
+ * Permanently remove a session's artifact directory (kernel state snapshot, rlm
+ * scratch files, …), which lives at `<dirname(sessionDir)>/session-artifacts/<id>`.
+ * Only invoked on delete, never on deactivation.
  */
-export async function deleteSessionFile(sessionPath: string): Promise<DeleteSessionFileResult> {
+async function deleteSessionArtifacts(sessionPath: string): Promise<void> {
+	const sessionId = basename(sessionPath).replace(/\.jsonl$/, "");
+	if (!sessionId) return;
+	const artifactDir = join(dirname(dirname(sessionPath)), "session-artifacts", sessionId);
+	await rm(artifactDir, { recursive: true, force: true });
+}
+
+/** Remove the session `.jsonl`, trying the `trash` CLI first, then falling back to unlink. */
+async function removeSessionFile(sessionPath: string): Promise<DeleteSessionFileResult> {
 	const trashArgs = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
 	const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8" });
 
@@ -37,4 +48,18 @@ export async function deleteSessionFile(sessionPath: string): Promise<DeleteSess
 		const error = trashErrorHint ? `${unlinkError} (${trashErrorHint})` : unlinkError;
 		return { ok: false, error };
 	}
+}
+
+/**
+ * Delete a session file, trying the `trash` CLI first, then falling back to unlink.
+ * Also permanently removes the session's artifact directory (derived data), but only
+ * once the session file itself is gone — otherwise a failed delete would orphan a
+ * session whose kernel snapshot has already been destroyed.
+ */
+export async function deleteSessionFile(sessionPath: string): Promise<DeleteSessionFileResult> {
+	const result = await removeSessionFile(sessionPath);
+	if (result.ok) {
+		await deleteSessionArtifacts(sessionPath);
+	}
+	return result;
 }

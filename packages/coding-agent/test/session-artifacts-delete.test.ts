@@ -1,0 +1,47 @@
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { deleteSessionFile } from "../src/core/session-file-actions.js";
+
+let root = "";
+
+describe("deleteSessionFile removes the session artifact directory", () => {
+	beforeEach(() => {
+		root = mkdtempSync(join(tmpdir(), "prime-agent-session-delete-"));
+	});
+
+	afterEach(() => {
+		if (root) rmSync(root, { recursive: true, force: true });
+		root = "";
+	});
+
+	it("permanently deletes <root>/session-artifacts/<id> alongside the session file", async () => {
+		const sessionId = "session-xyz";
+		const sessionsDir = join(root, "sessions");
+		mkdirSync(sessionsDir, { recursive: true });
+		const sessionPath = join(sessionsDir, `${sessionId}.jsonl`);
+		writeFileSync(sessionPath, '{"type":"session"}\n');
+
+		const artifactDir = join(root, "session-artifacts", sessionId);
+		mkdirSync(artifactDir, { recursive: true });
+		writeFileSync(join(artifactDir, "kernel-state.dill"), "payload");
+		writeFileSync(join(artifactDir, "kernel-state.json"), "{}");
+
+		const result = await deleteSessionFile(sessionPath);
+
+		expect(result.ok).toBe(true);
+		expect(existsSync(artifactDir)).toBe(false);
+		expect(existsSync(sessionPath)).toBe(false);
+	});
+
+	it("succeeds when the session has no artifact directory", async () => {
+		const sessionsDir = join(root, "sessions");
+		mkdirSync(sessionsDir, { recursive: true });
+		const sessionPath = join(sessionsDir, "no-artifacts.jsonl");
+		writeFileSync(sessionPath, "{}\n");
+
+		const result = await deleteSessionFile(sessionPath);
+		expect(result.ok).toBe(true);
+	});
+});
