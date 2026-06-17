@@ -836,3 +836,70 @@ print(_result.answer)
 		}
 	});
 });
+
+interface InspectableRlmDirSession {
+	_ensureRlmSessionDir(): string | undefined;
+	_rlmKernelEnv(): Record<string, string>;
+}
+
+describe("AgentSession RLM session dir", () => {
+	let tempDir: string;
+	let session: AgentSession | undefined;
+
+	beforeEach(() => {
+		tempDir = join(tmpdir(), `pi-rlm-dir-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+	});
+
+	afterEach(() => {
+		session?.dispose();
+		session = undefined;
+		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	function createSession(sessionManager: SessionManager): AgentSession {
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const agent = new Agent({
+			convertToLlm,
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: "", tools: [], thinkingLevel: "off" },
+			streamFn: () => streamAnswer("ignored"),
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager: SettingsManager.create(tempDir, tempDir),
+			cwd: tempDir,
+			modelRegistry: ModelRegistry.create(authStorage, join(tempDir, "models.json")),
+			resourceLoader: createTestResourceLoader(),
+		});
+		return session;
+	}
+
+	it("does not create a /tmp dir or set RLM_SESSION_DIR for a non-persisted session", () => {
+		const root = createSession(SessionManager.inMemory(tempDir));
+		const inspectable = root as unknown as InspectableRlmDirSession;
+
+		const before = readdirSync(tmpdir()).filter((name) => name.startsWith("prime-agent-rlm-"));
+
+		expect(inspectable._ensureRlmSessionDir()).toBeUndefined();
+		const env = inspectable._rlmKernelEnv();
+		expect(env.RLM_SESSION_DIR).toBeUndefined();
+		expect(env).toMatchObject({ RLM_DEPTH: "0" });
+
+		const after = readdirSync(tmpdir()).filter((name) => name.startsWith("prime-agent-rlm-"));
+		expect(after).toEqual(before);
+	});
+
+	it("uses the persistent artifact dir and sets RLM_SESSION_DIR for a persisted session", () => {
+		const sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
+		const root = createSession(sessionManager);
+		const inspectable = root as unknown as InspectableRlmDirSession;
+
+		const artifactDir = sessionManager.getSessionArtifactDir();
+		expect(artifactDir).toBeDefined();
+		expect(inspectable._ensureRlmSessionDir()).toBe(artifactDir);
+		expect(inspectable._rlmKernelEnv().RLM_SESSION_DIR).toBe(artifactDir);
+	});
+});
