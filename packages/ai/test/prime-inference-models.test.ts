@@ -16,12 +16,14 @@ describe("Prime Inference models", () => {
 	it("registers the Prime Inference catalog", () => {
 		const modelIds = getModels("prime-inference").map((model) => model.id);
 
-		expect(modelIds.length).toBe(25);
+		expect(modelIds.length).toBe(27);
 		expect(modelIds).toEqual(
 			expect.arrayContaining([
 				"anthropic/claude-opus-4.7",
 				"anthropic/claude-opus-4.8",
 				"deepseek/deepseek-v4-pro",
+				"minimax/minimax-m3",
+				"moonshotai/kimi-k2.7-code",
 				"nvidia/nemotron-3-super-120b-a12b",
 				"openai/gpt-5.4",
 				"openai/gpt-5.5",
@@ -85,6 +87,8 @@ describe("Prime Inference models", () => {
 		});
 		expect(getModel("prime-inference", "qwen/qwen3-coder-next").reasoning).toBe(false);
 		expect(getModel("prime-inference", "x-ai/grok-4.20").reasoning).toBe(true);
+		expect(getModel("prime-inference", "minimax/minimax-m3").reasoning).toBe(true);
+		expect(getModel("prime-inference", "moonshotai/kimi-k2.7-code").reasoning).toBe(true);
 	});
 
 	it("resolves PRIME_API_KEY from the environment", () => {

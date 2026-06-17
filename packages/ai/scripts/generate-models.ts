@@ -132,6 +132,8 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	"deepseek/deepseek-v3.2": { contextWindow: 128000, maxTokens: 8000 },
 	"deepseek/deepseek-v4-flash": { contextWindow: 1000000, maxTokens: 384000 },
 	"deepseek/deepseek-v4-pro": { contextWindow: 1000000, maxTokens: 384000 },
+	"minimax/minimax-m3": { contextWindow: 204800, maxTokens: 131072 },
+	"moonshotai/kimi-k2.7-code": { contextWindow: 262144, maxTokens: 16000 },
 	"nvidia/nemotron-3-nano-30b-a3b": { contextWindow: 1000000, maxTokens: 228000 },
 	"nvidia/nemotron-3-super-120b-a12b": { contextWindow: 1000000, maxTokens: 4096 },
 	"openai/gpt-5.3-codex": { contextWindow: 400000, maxTokens: 128000 },
@@ -323,6 +325,8 @@ function isPrimeInferenceReasoningModel(modelId: string, catalogReasoning?: bool
 	return (
 		id.includes("thinking") ||
 		id.includes("deepseek-v4") ||
+		id.startsWith("minimax/minimax-m") ||
+		id.startsWith("moonshotai/kimi") ||
 		id.startsWith("x-ai/grok-4") ||
 		id.startsWith("z-ai/glm-") ||
 		(id.startsWith("openai/gpt-5") && !id.includes("-chat")) ||
