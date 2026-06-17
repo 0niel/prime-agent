@@ -52,7 +52,7 @@ export function cleanupDaemonSocketPath(socketPath: string): void {
 	}
 }
 
-function defaultDaemonSocketDir(): string {
+export function defaultDaemonSocketDir(): string {
 	const suffix = typeof process.getuid === "function" ? String(process.getuid()) : "user";
 	return join(tmpdir(), `prime-agent-${suffix}`);
 }

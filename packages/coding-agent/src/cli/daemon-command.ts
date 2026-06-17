@@ -14,6 +14,7 @@ import { defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
 import { isLocalPath } from "../utils/paths.js";
 import { isValidThinkingLevel } from "./args.js";
 import { formatSessionListTable } from "./daemon-list-format.js";
+import { runPs, runReap } from "./daemon-ps.js";
 
 interface ParsedDaemonClientCommand {
 	command: string;
@@ -25,6 +26,7 @@ interface ParsedDaemonClientCommand {
 const DAEMON_CLIENT_COMMANDS = new Set([
 	"help",
 	"start",
+	"ps",
 	"list",
 	"create",
 	"attach",
@@ -145,6 +147,11 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 
 	if (parsed.command === "start") {
 		await runStart(parsed);
+		return;
+	}
+
+	if (parsed.command === "ps") {
+		await runPsCommand(parsed);
 		return;
 	}
 
@@ -631,6 +638,25 @@ async function runStart(parsed: ParsedDaemonClientCommand): Promise<void> {
 	}
 
 	throw new Error(`Timed out waiting for daemon to start on ${parsed.socketPath}`);
+}
+
+async function runPsCommand(parsed: ParsedDaemonClientCommand): Promise<void> {
+	let reap = false;
+	let force = false;
+	for (const arg of parsed.positionals) {
+		if (arg === "--reap" || arg === "reap") {
+			reap = true;
+		} else if (arg === "--force" || arg === "-f") {
+			force = true;
+		} else {
+			throw new Error(`Unknown ps option: ${arg}`);
+		}
+	}
+	if (reap) {
+		await runReap(parsed.json, force);
+		return;
+	}
+	await runPs(parsed.json);
 }
 
 async function canConnectToDaemon(socketPath: string, timeoutMs: number): Promise<boolean> {
@@ -1324,6 +1350,7 @@ function printDaemonHelp(): void {
 ${chalk.bold("Commands:")}
   help                          Show daemon help
   start                         Start the background daemon and return
+  ps [--reap [--force]]         List all daemons on this machine; --reap stops idle/orphaned ones
   list [-a|--all]               List active sessions; include inactive sessions with -a
   create [name]                 Create a new active session
   attach <session>              Attach an interactive terminal to a live session
@@ -1355,6 +1382,8 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock scratch
   ${APP_NAME} daemon start --socket /tmp/prime-agent.sock --model openai/gpt-4o-mini
   ${APP_NAME} daemon start --foreground --socket /tmp/prime-agent.sock --offline
+  ${APP_NAME} daemon ps
+  ${APP_NAME} daemon ps --reap
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock list
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock list -a
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock create scratch
