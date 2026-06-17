@@ -4889,7 +4889,10 @@ export class InteractiveMode {
 			}
 		}
 		this.childAgentDetail.setToolsExpanded(expanded);
-		this.ui.requestRender();
+		// Expanding/collapsing changes blocks above the viewport, which would
+		// otherwise force a full redraw that scrolls to the top and replays the
+		// whole transcript. Keep the user anchored at their current position.
+		this.ui.requestRenderPreservingViewport();
 	}
 
 	private toggleThinkingBlockVisibility(): void {

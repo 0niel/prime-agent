@@ -1248,7 +1248,7 @@ describe("InteractiveMode.setToolsExpanded", () => {
 			builtInHeader: header,
 			chatContainer: { children: [chatChild] },
 			childAgentDetail,
-			ui: { requestRender: vi.fn() },
+			ui: { requestRender: vi.fn(), requestRenderPreservingViewport: vi.fn() },
 		};
 
 		(InteractiveMode as any).prototype.setToolsExpanded.call(fakeThis, true);
@@ -1257,7 +1257,8 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(header.setExpanded).toHaveBeenCalledWith(true);
 		expect(chatChild.setExpanded).toHaveBeenCalledWith(true);
 		expect(childAgentDetail.setToolsExpanded).toHaveBeenCalledWith(true);
-		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(1);
+		// Expansion keeps the user anchored, so it uses the viewport-preserving path.
+		expect(fakeThis.ui.requestRenderPreservingViewport).toHaveBeenCalledTimes(1);
 	});
 });
 
