@@ -32,6 +32,8 @@ export interface NewSessionOptions {
 	parentSession?: string;
 }
 
+export type SessionPersistListener = (sessionFile: string) => void;
+
 export interface SessionEntryBase {
 	type: string;
 	id: string;
@@ -800,6 +802,7 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	private persistListeners = new Set<SessionPersistListener>();
 
 	private constructor(cwd: string, sessionDir: string, sessionFile: string | undefined, persist: boolean) {
 		this.cwd = cwd;
@@ -914,6 +917,27 @@ export class SessionManager {
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
 		mkdirSync(dirname(this.sessionFile), { recursive: true });
 		writeFileSync(this.sessionFile, content);
+		this._notifyPersistListeners();
+	}
+
+	private _notifyPersistListeners(): void {
+		if (!this.sessionFile) {
+			return;
+		}
+		for (const listener of this.persistListeners) {
+			try {
+				listener(this.sessionFile);
+			} catch {
+				// Persistence observers must not break session writes.
+			}
+		}
+	}
+
+	onPersist(listener: SessionPersistListener): () => void {
+		this.persistListeners.add(listener);
+		return () => {
+			this.persistListeners.delete(listener);
+		};
 	}
 
 	isPersisted(): boolean {
@@ -957,6 +981,7 @@ export class SessionManager {
 		} else {
 			mkdirSync(dirname(this.sessionFile), { recursive: true });
 			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			this._notifyPersistListeners();
 		}
 	}
 

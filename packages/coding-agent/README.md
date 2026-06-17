@@ -146,6 +146,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/new`, `/clear` | Start a new session |
 | `/name <name>` | Set session display name |
 | `/session` | Show session info (file, ID, messages) |
+| `/traces [status\|on\|off\|upload\|login]` | Manage opt-in Prime Agent trace sharing |
 | `/usage` | Show token, cost, and context usage |
 | `/tree` | Jump to any point in the session and continue from there |
 | `/fork` | Create a new session from a previous user message |
@@ -576,7 +577,9 @@ prime-agent --thinking high "Solve this complex problem"
 | `PI_SKIP_VERSION_CHECK` | Skip the Prime Agent version update check at startup. This prevents the release manifest request |
 | `PRIME_AGENT_DOWNLOAD_BASE_URL` | Override the Prime Agent release manifest and tarball base URL |
 | `PI_CACHE_RETENTION` | Set to `long` for extended prompt cache (Anthropic: 1h, OpenAI: 24h) |
-| `PRIME_API_KEY` | Prime Inference API key |
+| `PRIME_API_KEY` | Prime Inference API key; also used for trace sharing if it has `agent_traces` scope |
+| `PRIME_AGENT_TRACES_API_KEY` | Prime API key used only for opt-in trace sharing |
+| `PRIME_AGENT_TRACES_BASE_URL` | Override the Prime Agent trace upload API base URL |
 | `PRIME_AGENT_KERNEL_PYTHON` | Use an existing Python environment with `ipykernel` instead of auto-bootstrapping `~/.prime/agent/kernel-venv` |
 | `VISUAL`, `EDITOR` | External editor for Ctrl+G |
 

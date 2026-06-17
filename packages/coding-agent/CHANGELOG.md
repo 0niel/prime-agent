@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in Prime Agent trace sharing with `/traces` and background uploads of persisted session JSONL files.
+
 ## [0.1.3] - 2026-06-12
 
 ### Added

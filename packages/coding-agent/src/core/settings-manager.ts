@@ -83,6 +83,7 @@ export interface Settings {
 	followUpMode?: "all" | "one-at-a-time";
 	theme?: string;
 	compaction?: CompactionSettings;
+	agentTraces?: AgentTracesSettings;
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
@@ -108,6 +109,10 @@ export interface Settings {
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
+}
+
+export interface AgentTracesSettings {
+	enabled?: boolean;
 }
 
 /** Deep merge settings: project/overrides take precedence, nested objects merge recursively */
@@ -673,6 +678,19 @@ export class SettingsManager {
 		}
 		this.globalSettings.compaction.enabled = enabled;
 		this.markModified("compaction", "enabled");
+		this.save();
+	}
+
+	getAgentTracesEnabled(): boolean {
+		return this.settings.agentTraces?.enabled ?? false;
+	}
+
+	setAgentTracesEnabled(enabled: boolean): void {
+		if (!this.globalSettings.agentTraces) {
+			this.globalSettings.agentTraces = {};
+		}
+		this.globalSettings.agentTraces.enabled = enabled;
+		this.markModified("agentTraces", "enabled");
 		this.save();
 	}
 

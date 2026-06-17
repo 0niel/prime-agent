@@ -7,6 +7,8 @@ import type { OAuthAuthInfo } from "@earendil-works/pi-ai";
 
 export const PRIME_INFERENCE_PROVIDER_ID = "prime-inference";
 export const PRIME_INFERENCE_PROVIDER_NAME = "Prime Inference";
+export const PRIME_AGENT_TRACES_PROVIDER_ID = "prime-agent-traces";
+export const PRIME_AGENT_TRACES_PROVIDER_NAME = "Prime Agent Traces";
 
 const DEFAULT_PRIME_API_BASE_URL = "https://api.primeintellect.ai";
 const DEFAULT_PRIME_FRONTEND_URL = "https://app.primeintellect.ai";
@@ -64,6 +66,8 @@ export type PrimeInferenceAccessResult =
 			message: string;
 	  };
 
+type PrimeAccessScope = "inference" | "agent_traces";
+
 export type PrimeTeam = {
 	teamId: string;
 	name: string;
@@ -77,10 +81,7 @@ function defaultPrimeCliConfigPath(): string {
 }
 
 function normalizeBaseUrl(value: string | undefined): string {
-	return (value || DEFAULT_PRIME_API_BASE_URL)
-		.trim()
-		.replace(/\/+$/, "")
-		.replace(/\/api\/v1$/, "");
+	return (value?.trim() || DEFAULT_PRIME_API_BASE_URL).replace(/\/+$/, "").replace(/\/api\/v1$/, "");
 }
 
 function normalizeUrl(value: string | undefined, fallback: string): string {
@@ -151,6 +152,17 @@ export function loadPrimeCliConfig(configPath: string = defaultPrimeCliConfigPat
 		}
 	}
 	return config;
+}
+
+export function resolvePrimeAgentTracesBaseUrl(baseUrl?: string): string {
+	return normalizeBaseUrl(baseUrl ?? stringEnv("PRIME_AGENT_TRACES_BASE_URL"));
+}
+
+function resolvePrimeAgentTracesChallengeConfig(config: PrimeCliConfig): PrimeChallengeConfig {
+	return {
+		baseUrl: resolvePrimeAgentTracesBaseUrl(),
+		frontendUrl: stringEnv("PRIME_AGENT_TRACES_BASE_URL") ? config.frontendUrl : DEFAULT_PRIME_FRONTEND_URL,
+	};
 }
 
 function throwIfCancelled(signal?: AbortSignal): void {
@@ -445,17 +457,24 @@ async function runPrimeBrowserLogin(
 	fetchFn: typeof fetch,
 	timeoutMs: number,
 	pollIntervalMs: number,
+	scope?: PrimeAccessScope,
 ): Promise<string> {
 	const { privateKey, publicKey } = createPrimeChallengeKeypair();
 	const challenge = await generatePrimeChallenge(config, publicKey, fetchFn, timeoutMs, callbacks.signal);
-	const url = `${config.frontendUrl}/dashboard/tokens/challenge?code=${encodeURIComponent(challenge.challenge)}`;
-	callbacks.onAuth({ url, instructions: `Code: ${challenge.challenge}` });
+	const url = new URL(`${config.frontendUrl}/dashboard/tokens/challenge`);
+	url.searchParams.set("code", challenge.challenge);
+	if (scope) {
+		url.searchParams.set("scope", scope);
+	}
+	callbacks.onAuth({ url: url.toString(), instructions: `Code: ${challenge.challenge}` });
 	return pollPrimeChallengeResult(config, challenge, privateKey, fetchFn, timeoutMs, pollIntervalMs, callbacks.signal);
 }
 
-export async function checkPrimeInferenceAccess(
+async function checkPrimeScopeAccess(
 	apiKey: string,
 	baseUrl: string,
+	scopeName: PrimeAccessScope,
+	scopeLabel: string,
 	options: {
 		fetchFn?: typeof fetch;
 		requestTimeoutMs?: number;
@@ -498,16 +517,40 @@ export async function checkPrimeInferenceAccess(
 		return { ok: false, message: "Prime token is missing permission scope data" };
 	}
 
-	const inference = scope.inference;
-	if (!isRecord(inference)) {
-		return { ok: false, message: "Prime token is missing inference permissions" };
+	const scopedPermission = scope[scopeName];
+	if (!isRecord(scopedPermission)) {
+		return { ok: false, message: `Prime token is missing ${scopeLabel} permissions` };
 	}
 
-	if (inference.write === true) {
+	if (scopedPermission.write === true) {
 		return { ok: true };
 	}
 
-	return { ok: false, message: "Prime token does not have inference write permission" };
+	return { ok: false, message: `Prime token does not have ${scopeLabel} write permission` };
+}
+
+export async function checkPrimeInferenceAccess(
+	apiKey: string,
+	baseUrl: string,
+	options: {
+		fetchFn?: typeof fetch;
+		requestTimeoutMs?: number;
+		signal?: AbortSignal;
+	} = {},
+): Promise<PrimeInferenceAccessResult> {
+	return checkPrimeScopeAccess(apiKey, baseUrl, "inference", "inference", options);
+}
+
+export async function checkPrimeAgentTracesAccess(
+	apiKey: string,
+	baseUrl: string,
+	options: {
+		fetchFn?: typeof fetch;
+		requestTimeoutMs?: number;
+		signal?: AbortSignal;
+	} = {},
+): Promise<PrimeInferenceAccessResult> {
+	return checkPrimeScopeAccess(apiKey, baseUrl, "agent_traces", "agent trace", options);
 }
 
 function formatAccessFailure(result: Exclude<PrimeInferenceAccessResult, { ok: true }>): string {
@@ -552,6 +595,57 @@ export async function loginPrimeInference(
 	});
 	if (!access.ok) {
 		throw new Error(`Prime API key does not have Prime Inference access (${formatAccessFailure(access)})`);
+	}
+
+	throwIfCancelled(callbacks.signal);
+	return { apiKey, source: "browser" };
+}
+
+export async function loginPrimeAgentTraces(
+	callbacks: PrimeInferenceLoginCallbacks,
+	options: PrimeInferenceLoginOptions = {},
+): Promise<PrimeInferenceLoginResult> {
+	const config = loadPrimeCliConfig(options.configPath);
+	const traceConfig = resolvePrimeAgentTracesChallengeConfig(config);
+	const fetchFn = options.fetchFn ?? fetch;
+	const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+	const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+
+	if (config.apiKey) {
+		callbacks.onProgress?.("Checking existing Prime CLI credentials...");
+		const access = await checkPrimeAgentTracesAccess(config.apiKey, traceConfig.baseUrl, {
+			fetchFn,
+			requestTimeoutMs,
+			signal: callbacks.signal,
+		});
+		if (access.ok) {
+			throwIfCancelled(callbacks.signal);
+			return { apiKey: config.apiKey, source: "prime-cli" };
+		}
+		callbacks.onProgress?.(
+			`Existing Prime CLI key cannot upload Prime Agent traces (${formatAccessFailure(access)}). Starting browser login...`,
+		);
+	} else {
+		callbacks.onProgress?.("No Prime CLI API key found. Starting browser login...");
+	}
+
+	const apiKey = await runPrimeBrowserLogin(
+		traceConfig,
+		callbacks,
+		fetchFn,
+		requestTimeoutMs,
+		pollIntervalMs,
+		"agent_traces",
+	);
+	throwIfCancelled(callbacks.signal);
+	callbacks.onProgress?.("Checking Prime Agent trace access...");
+	const access = await checkPrimeAgentTracesAccess(apiKey, traceConfig.baseUrl, {
+		fetchFn,
+		requestTimeoutMs,
+		signal: callbacks.signal,
+	});
+	if (!access.ok) {
+		throw new Error(`Prime API key does not have Prime Agent trace access (${formatAccessFailure(access)})`);
 	}
 
 	throwIfCancelled(callbacks.signal);

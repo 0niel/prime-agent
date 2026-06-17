@@ -40,6 +40,11 @@ import {
 } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "child_process";
 import { APP_TITLE, getAgentDir, getDebugLogPath, getShareViewerUrl, VERSION } from "../../config.js";
+import {
+	type AgentTraceUploadResult,
+	getPrimeAgentTraceCredential,
+	uploadAgentTraceFile,
+} from "../../core/agent-traces.js";
 import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
 import type {
 	AutocompleteProviderFactory,
@@ -3150,6 +3155,11 @@ export class InteractiveMode {
 			}
 			if (commandName === "session" && !commandArgs) {
 				await this.handleSessionCommand();
+				this.editor.setText("");
+				return;
+			}
+			if (commandName === "traces") {
+				await this.handleTracesCommand(canonicalCommandText);
 				this.editor.setText("");
 				return;
 			}
@@ -6414,6 +6424,122 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(info, 1, 0));
 		this.ui.requestRender();
+	}
+
+	private formatTraceUploadResult(result: AgentTraceUploadResult): string {
+		switch (result.status) {
+			case "uploaded":
+				return `Trace uploaded (${result.bytesStored.toLocaleString()} bytes).`;
+			case "disabled":
+				return "Trace sharing is disabled.";
+			case "missing_credentials":
+				return "Trace sharing needs a Prime API key. Run /traces login.";
+			case "no_session_file":
+				return "Trace sharing enabled. Current session will upload after the first assistant response.";
+			case "empty_session":
+				return "Trace sharing enabled. Current session is empty.";
+			case "invalid_session":
+				return `Trace upload skipped: ${result.message}.`;
+			case "too_large":
+				return `Trace upload skipped: session file is ${result.size.toLocaleString()} bytes; limit is ${result.maxBytes.toLocaleString()} bytes.`;
+			case "failed":
+				if (result.statusCode === 404) {
+					return "Trace upload endpoint was not found. The platform API may not be deployed yet, or PRIME_AGENT_TRACES_BASE_URL points at the wrong API.";
+				}
+				return `Trace upload failed: ${result.statusCode ? `HTTP ${result.statusCode}: ` : ""}${result.message}`;
+		}
+	}
+
+	private async uploadCurrentTraceOnce(): Promise<AgentTraceUploadResult> {
+		const state = await this.agentConnection.getState();
+		return uploadAgentTraceFile({
+			sessionFile: state.sessionFile,
+			authStorage: this.modelRegistry.authStorage,
+			settingsManager: this.settingsManager,
+			reloadConfig: false,
+		});
+	}
+
+	private async handleTracesCommand(text: string): Promise<void> {
+		const command =
+			text
+				.replace(/^\/traces\b/, "")
+				.trim()
+				.toLowerCase() || "status";
+
+		if (command === "status") {
+			await this.settingsManager.reload().catch(() => undefined);
+			const credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
+			const state = await this.agentConnection.getState();
+			const info = [
+				theme.bold("Trace Sharing"),
+				"",
+				`${theme.fg("dim", "Status:")} ${this.settingsManager.getAgentTracesEnabled() ? "Enabled" : "Disabled"}`,
+				`${theme.fg("dim", "Credential:")} ${credential?.label ?? "Not configured"}`,
+				`${theme.fg("dim", "Session file:")} ${state.sessionFile ?? "In-memory"}`,
+				"",
+				theme.fg("dim", "Commands: /traces on, /traces off, /traces upload, /traces login"),
+			].join("\n");
+			this.chatContainer.addChild(new Spacer(1));
+			this.chatContainer.addChild(new Text(info, 1, 0));
+			this.ui.requestRender();
+			return;
+		}
+
+		if (command === "off" || command === "disable") {
+			this.settingsManager.setAgentTracesEnabled(false);
+			await this.settingsManager.flush();
+			this.showStatus("Trace sharing disabled.");
+			return;
+		}
+
+		if (command === "login") {
+			await this.createAuthFlows().runPrimeAgentTracesLogin();
+			return;
+		}
+
+		if (command === "on" || command === "enable") {
+			let credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
+			if (!credential) {
+				const authResult = await this.createAuthFlows().runPrimeAgentTracesLogin();
+				if (authResult.status !== "success") {
+					return;
+				}
+				credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
+			}
+			if (!credential) {
+				this.showError("Trace sharing needs a Prime API key.");
+				return;
+			}
+
+			this.settingsManager.setAgentTracesEnabled(true);
+			await this.settingsManager.flush();
+			const uploadResult = await this.uploadCurrentTraceOnce();
+			const uploadMessage = this.formatTraceUploadResult(uploadResult);
+			this.showStatus(
+				uploadResult.status === "no_session_file" || uploadResult.status === "empty_session"
+					? uploadMessage
+					: `Trace sharing enabled. ${uploadMessage}`,
+			);
+			return;
+		}
+
+		if (command === "upload") {
+			if (!this.settingsManager.getAgentTracesEnabled()) {
+				this.showStatus("Trace sharing is disabled. Run /traces on first.");
+				return;
+			}
+			const uploadResult = await this.uploadCurrentTraceOnce();
+			const message = this.formatTraceUploadResult(uploadResult);
+			if (uploadResult.status === "failed") {
+				this.showError(message);
+			} else {
+				this.showStatus(message);
+			}
+			return;
+		}
+
+		this.showWarning("Usage: /traces [status|on|off|upload|login]");
 	}
 
 	private async handleContextCommand(): Promise<void> {
