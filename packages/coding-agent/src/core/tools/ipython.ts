@@ -3,7 +3,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
 import type { ToolDefinition } from "../extensions/types.js";
 import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
-import { type HostRequestHandlers, KernelManager } from "../kernel/index.js";
+import { type HostRequestHandlers, type KernelDiffDisplay, KernelManager } from "../kernel/index.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
@@ -124,6 +124,8 @@ export interface IpythonToolDetails {
 	stdout?: string;
 	stderr?: string;
 	result?: string;
+	/** Diffs streamed from file edits, rendered by the IPython cell. */
+	diffs?: KernelDiffDisplay[];
 	error?: {
 		ename: string;
 		evalue: string;
@@ -318,6 +320,7 @@ export function createIpythonToolDefinition(
 						stdout: r.stdout,
 						stderr: r.stderr,
 						result: r.result,
+						diffs: r.diffs,
 						error: r.error,
 					},
 					isError: r.status === "error" || r.status === "aborted",

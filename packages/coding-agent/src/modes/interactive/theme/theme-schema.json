@@ -55,6 +55,8 @@
 				"toolPendingBg",
 				"toolSuccessBg",
 				"toolErrorBg",
+				"toolDiffAddedBg",
+				"toolDiffRemovedBg",
 				"toolPanelBg",
 				"toolTitle",
 				"toolOutput",
@@ -168,6 +170,14 @@
 				"toolErrorBg": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Tool execution box (error state)"
+				},
+				"toolDiffAddedBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Diff added-line background block"
+				},
+				"toolDiffRemovedBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Diff removed-line background block"
 				},
 				"toolPanelBg": {
 					"$ref": "#/$defs/colorValue",

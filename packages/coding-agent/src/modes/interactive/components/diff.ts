@@ -1,5 +1,6 @@
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import * as Diff from "diff";
-import { theme } from "../theme/theme.js";
+import { highlightCode, theme } from "../theme/theme.js";
 
 /**
  * Parse diff line to extract prefix, line number, and content.
@@ -144,4 +145,122 @@ export function renderDiff(diffText: string, _options: RenderDiffOptions = {}): 
 	}
 
 	return result.join("\n");
+}
+
+type ThemeBg = Parameters<typeof theme.bg>[0];
+type ThemeColor = Parameters<typeof theme.fg>[0];
+
+// Rewrite full/background resets to foreground-only so a row's background block
+// survives the syntax-highlighted content.
+const BG_CLEARING_RESET = /\x1b\[(?:0|49)m/g;
+
+function keepBackground(highlighted: string): string {
+	return highlighted.replace(BG_CLEARING_RESET, "\x1b[39m");
+}
+
+function highlightContent(content: string, language: string | undefined): string {
+	if (!content) {
+		return "";
+	}
+	if (language) {
+		return keepBackground(highlightCode(content, language)[0] ?? content);
+	}
+	return theme.fg("mdCodeBlock", content);
+}
+
+interface DiffLineSpec {
+	bg: ThemeBg;
+	gutter: string;
+	gutterFg: ThemeColor;
+	content: string;
+	language: string | undefined;
+	width: number;
+	/** Flat content color instead of syntax highlighting (256-color fallback). */
+	contentFg?: ThemeColor;
+}
+
+/** Build one diff row filling `width` on a single background block. */
+function buildRichDiffLine(spec: DiffLineSpec): string {
+	const styledGutter = theme.fg(spec.gutterFg, spec.gutter);
+	const renderedContent = spec.contentFg
+		? theme.fg(spec.contentFg, spec.content)
+		: highlightContent(spec.content, spec.language);
+	let inner = `${styledGutter}${renderedContent}\x1b[39m`;
+	if (visibleWidth(inner) > spec.width) {
+		inner = truncateToWidth(inner, spec.width, "");
+	}
+	// Pad after truncating too: a 2-cell character straddling the cutoff leaves
+	// the result a cell short.
+	const pad = spec.width - visibleWidth(inner);
+	if (pad > 0) {
+		inner += " ".repeat(pad);
+	}
+	return theme.bg(spec.bg, inner);
+}
+
+export interface RichDiffOptions {
+	/** Language id for syntax highlighting the diff content (e.g. "typescript"). */
+	language?: string;
+}
+
+/** A dim `⋮` row separating non-adjacent hunks of one file's diff. */
+export function renderDiffSeparator(contentWidth: number): string {
+	const width = Math.max(1, contentWidth);
+	const marker = theme.fg("toolDiffContext", " ⋮");
+	const pad = Math.max(0, width - visibleWidth(marker));
+	return theme.bg("toolPanelBg", marker + " ".repeat(pad));
+}
+
+/** Render a unified diff as full-width rows: green/red blocks, syntax-highlighted. */
+export function renderRichDiff(diffText: string, contentWidth: number, options: RichDiffOptions = {}): string[] {
+	const width = Math.max(1, contentWidth);
+	const language = options.language;
+	// 256-color can't render subtle tints (a dark block quantizes to black), so
+	// color the text instead of the background there.
+	const useBlocks = theme.colorMode === "truecolor";
+	const rows: string[] = [];
+
+	for (const rawLine of diffText.split("\n")) {
+		const parsed = parseDiffLine(rawLine);
+		if (!parsed) {
+			rows.push(
+				buildRichDiffLine({ bg: "toolPanelBg", gutterFg: "toolDiffContext", gutter: "", content: replaceTabs(rawLine), language, width }),
+			);
+			continue;
+		}
+		const { prefix, lineNum, content } = parsed;
+		const gutter = `${lineNum} ${prefix === " " ? " " : prefix} `;
+		const text = replaceTabs(content);
+		if (prefix === "+") {
+			rows.push(
+				buildRichDiffLine({
+					bg: useBlocks ? "toolDiffAddedBg" : "toolPanelBg",
+					gutterFg: "toolDiffAdded",
+					gutter,
+					content: text,
+					language,
+					width,
+					contentFg: useBlocks ? undefined : "toolDiffAdded",
+				}),
+			);
+		} else if (prefix === "-") {
+			rows.push(
+				buildRichDiffLine({
+					bg: useBlocks ? "toolDiffRemovedBg" : "toolPanelBg",
+					gutterFg: "toolDiffRemoved",
+					gutter,
+					content: text,
+					language,
+					width,
+					contentFg: useBlocks ? undefined : "toolDiffRemoved",
+				}),
+			);
+		} else {
+			rows.push(
+				buildRichDiffLine({ bg: "toolPanelBg", gutterFg: "toolDiffContext", gutter, content: text, language, width }),
+			);
+		}
+	}
+
+	return rows;
 }

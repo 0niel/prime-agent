@@ -23,7 +23,9 @@
 		"customMsgBg": "#151518",
 		"toolPendingBg": "#101015",
 		"toolSuccessBg": "#0e1510",
-		"toolErrorBg": "#1a0d12"
+		"toolErrorBg": "#1a0d12",
+		"toolDiffAddedBg": "#015f00",
+		"toolDiffRemovedBg": "#5e0000"
 	},
 	"colors": {
 		"accent": "primary",
@@ -46,6 +48,8 @@
 		"toolPendingBg": "toolPendingBg",
 		"toolSuccessBg": "toolSuccessBg",
 		"toolErrorBg": "toolErrorBg",
+		"toolDiffAddedBg": "toolDiffAddedBg",
+		"toolDiffRemovedBg": "toolDiffRemovedBg",
 		"toolPanelBg": "surface",
 		"toolTitle": "",
 		"toolOutput": "muted",
@@ -59,8 +63,8 @@
 		"mdQuoteBorder": "grid",
 		"mdHr": "grid",
 		"mdListBullet": "muted",
-		"toolDiffAdded": "success",
-		"toolDiffRemoved": "error",
+		"toolDiffAdded": "#3fb950",
+		"toolDiffRemoved": "#f85149",
 		"toolDiffContext": "muted",
 		"syntaxComment": "muted",
 		"syntaxKeyword": "info",

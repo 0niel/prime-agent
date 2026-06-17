@@ -58,6 +58,8 @@ const ThemeJsonSchema = Type.Object({
 		toolPendingBg: ColorValueSchema,
 		toolSuccessBg: ColorValueSchema,
 		toolErrorBg: ColorValueSchema,
+		toolDiffAddedBg: ColorValueSchema,
+		toolDiffRemovedBg: ColorValueSchema,
 		toolPanelBg: ColorValueSchema,
 		toolTitle: ColorValueSchema,
 		toolOutput: ColorValueSchema,
@@ -175,6 +177,8 @@ export type ThemeBg =
 	| "toolPendingBg"
 	| "toolSuccessBg"
 	| "toolErrorBg"
+	| "toolDiffAddedBg"
+	| "toolDiffRemovedBg"
 	| "toolPanelBg";
 
 type ColorMode = "truecolor" | "256color";
@@ -208,9 +212,10 @@ function detectColorMode(): ColorMode {
 	if (process.env.TERM_PROGRAM === "Apple_Terminal") {
 		return "256color";
 	}
-	// GNU screen doesn't support truecolor unless explicitly opted in via COLORTERM=truecolor.
-	// TERM under screen is typically "screen", "screen-256color", or "screen.xterm-256color".
-	if (term === "screen" || term.startsWith("screen-") || term.startsWith("screen.")) {
+	// tmux reports TERM=screen* but forwards 24-bit color, so treat it as
+	// truecolor-capable; only genuine GNU screen (no $TMUX) falls back.
+	const inTmux = process.env.TMUX !== undefined || term.startsWith("tmux");
+	if (!inTmux && (term === "screen" || term.startsWith("screen-") || term.startsWith("screen."))) {
 		return "256color";
 	}
 	// Assume truecolor for everything else - virtually all modern terminals support it
@@ -394,6 +399,11 @@ export class Theme {
 		const ansi = this.bgColors.get(color);
 		if (!ansi) throw new Error(`Unknown theme background color: ${color}`);
 		return `${ansi}${text}\x1b[49m`; // Reset only background color
+	}
+
+	/** Active color depth (truecolor vs 256color). */
+	get colorMode(): ColorMode {
+		return this.mode;
 	}
 
 	getEditorBackgroundColor(): ((str: string) => string) | undefined {
@@ -668,6 +678,8 @@ function createTheme(themeJson: ThemeJson, mode?: ColorMode, sourcePath?: string
 		"toolPendingBg",
 		"toolSuccessBg",
 		"toolErrorBg",
+		"toolDiffAddedBg",
+		"toolDiffRemovedBg",
 		"toolPanelBg",
 	]);
 	for (const [key, value] of Object.entries(resolvedColors)) {

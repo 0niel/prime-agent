@@ -37,5 +37,33 @@ async def run(path: str, old_str: str, new_str: str) -> str:
             f"found {count} occurrences in {path}, need exactly 1 — "
             "widen the snippet to make it unique"
         )
+    match_index = content.index(old_str)
+    start_line = content.count("\n", 0, match_index) + 1
     filepath.write_text(content.replace(old_str, new_str, 1), encoding="utf-8")
+    _emit_diff(path, old_str, new_str, start_line)
     return f"Edited {path}"
+
+
+# Keep in sync with DIFF_DISPLAY_MIME in src/core/kernel/index.ts.
+_DIFF_DISPLAY_MIME = "application/vnd.prime-agent.diff+json"
+
+
+def _emit_diff(path: str, old_str: str, new_str: str, start_line: int) -> None:
+    """Stream a diff to the host via display_data; best-effort outside IPython."""
+    try:
+        from IPython.display import display
+
+        display(
+            {
+                _DIFF_DISPLAY_MIME: {
+                    "path": path,
+                    "old_str": old_str,
+                    "new_str": new_str,
+                    "start_line": start_line,
+                },
+                "text/plain": f"Edited {path}",
+            },
+            raw=True,
+        )
+    except Exception:
+        pass

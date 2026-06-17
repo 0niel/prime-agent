@@ -15,6 +15,8 @@
 		"toolPendingBg": "#e8e8f0",
 		"toolSuccessBg": "#e8f0e8",
 		"toolErrorBg": "#f0e8e8",
+		"toolDiffAddedBg": "#dafbe1",
+		"toolDiffRemovedBg": "#ffebe9",
 		"customMsgBg": "#ede7f6"
 	},
 	"colors": {
@@ -39,6 +41,8 @@
 		"toolPendingBg": "toolPendingBg",
 		"toolSuccessBg": "toolSuccessBg",
 		"toolErrorBg": "toolErrorBg",
+		"toolDiffAddedBg": "toolDiffAddedBg",
+		"toolDiffRemovedBg": "toolDiffRemovedBg",
 		"toolPanelBg": "#ededf2",
 		"toolTitle": "",
 		"toolOutput": "mediumGray",

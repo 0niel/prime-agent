@@ -267,17 +267,19 @@ export function generateDiffString(
 	oldContent: string,
 	newContent: string,
 	contextLines = 4,
+	startLine = 1,
 ): { diff: string; firstChangedLine: number | undefined } {
 	const parts = Diff.diffLines(oldContent, newContent);
 	const output: string[] = [];
 
 	const oldLines = oldContent.split("\n");
 	const newLines = newContent.split("\n");
-	const maxLineNum = Math.max(oldLines.length, newLines.length);
+	// Offset by startLine so a snippet shows absolute file line numbers.
+	const maxLineNum = startLine - 1 + Math.max(oldLines.length, newLines.length);
 	const lineNumWidth = String(maxLineNum).length;
 
-	let oldLineNum = 1;
-	let newLineNum = 1;
+	let oldLineNum = startLine;
+	let newLineNum = startLine;
 	let lastWasChange = false;
 	let firstChangedLine: number | undefined;
 

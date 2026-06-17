@@ -55,14 +55,40 @@ export interface ExecuteOptions {
 	maxOutputChars?: number;
 }
 
+/** MIME tag the `edit` skill emits diff payloads under, via `display_data`. */
+export const DIFF_DISPLAY_MIME = "application/vnd.prime-agent.diff+json";
+
+/** One file edit, captured from a {@link DIFF_DISPLAY_MIME} display payload. */
+export interface KernelDiffDisplay {
+	path: string;
+	oldStr: string;
+	newStr: string;
+	/** 1-based line where `oldStr` begins in the file, for absolute line numbers. */
+	startLine?: number;
+}
+
 export interface ExecuteResult {
 	stdout: string;
 	stderr: string;
 	/** Last `execute_result` payload (text/plain), if the cell produced one. */
 	result?: string;
+	/** Diffs emitted via display_data, in order. */
+	diffs?: KernelDiffDisplay[];
 	status: "ok" | "error" | "aborted";
 	error?: { ename: string; evalue: string; traceback: string[] };
 	durationMs: number;
+}
+
+/** Parse a {@link DIFF_DISPLAY_MIME} payload, tolerating malformed input. */
+function parseDiffDisplay(payload: unknown): KernelDiffDisplay | undefined {
+	if (!isRecord(payload)) {
+		return undefined;
+	}
+	const { path, old_str: oldStr, new_str: newStr, start_line: startLine } = payload;
+	if (typeof path !== "string" || typeof oldStr !== "string" || typeof newStr !== "string") {
+		return undefined;
+	}
+	return { path, oldStr, newStr, startLine: typeof startLine === "number" ? startLine : undefined };
 }
 
 interface ConnectionInfo {
@@ -104,6 +130,7 @@ interface ActiveExecution {
 	stdoutTruncated: boolean;
 	stderrTruncated: boolean;
 	result?: string;
+	diffs: KernelDiffDisplay[];
 	error?: ExecuteResult["error"];
 	status: ExecuteResult["status"];
 	resolve: (result: ExecuteResult) => void;
@@ -576,6 +603,7 @@ export class KernelManager {
 				stderr: "",
 				stdoutTruncated: false,
 				stderrTruncated: false,
+				diffs: [],
 				status: "ok",
 				resolve: result.resolve,
 				reject: result.reject,
@@ -665,6 +693,10 @@ export class KernelManager {
 		} else if (t === "execute_result") {
 			const c = incoming.content as { data: Record<string, string> };
 			if (c.data["text/plain"]) execution.result = c.data["text/plain"];
+		} else if (t === "display_data" || t === "update_display_data") {
+			const c = incoming.content as { data?: Record<string, unknown> };
+			const diff = parseDiffDisplay(c.data?.[DIFF_DISPLAY_MIME]);
+			if (diff) execution.diffs.push(diff);
 		} else if (t === "error") {
 			const c = incoming.content as { ename: string; evalue: string; traceback: string[] };
 			execution.error = c;
@@ -699,6 +731,7 @@ export class KernelManager {
 			stdout,
 			stderr,
 			result,
+			diffs: execution.diffs.length > 0 ? execution.diffs : undefined,
 			error: execution.error,
 			status,
 			durationMs: Date.now() - execution.started,

@@ -1,8 +1,10 @@
 import { type Component, VersionedRenderCache, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { highlightCode, theme } from "../theme/theme.js";
+import { generateDiffString } from "../../../core/tools/edit-diff.js";
+import { getLanguageFromPath, highlightCode, theme } from "../theme/theme.js";
 import { normalizeErrorDetails, summarizeErrorDetails } from "./collapsible-error.js";
+import { renderDiffSeparator, renderRichDiff } from "./diff.js";
 import { keyHint } from "./keybinding-hints.js";
-import { toolPanelContentWidth, toolPanelLine } from "./tool-panel.js";
+import { TOOL_PANEL_PADDING_X, toolPanelContentWidth, toolPanelLine } from "./tool-panel.js";
 
 export interface IPythonCellContentBlock {
 	type: string;
@@ -23,6 +25,13 @@ export interface IPythonCellState {
 	showImages?: boolean;
 }
 
+interface DiffDisplay {
+	path: string;
+	oldStr: string;
+	newStr: string;
+	startLine?: number;
+}
+
 interface IpythonDetails {
 	durationMs?: number;
 	status?: string;
@@ -30,6 +39,7 @@ interface IpythonDetails {
 	stdout?: string;
 	stderr?: string;
 	result?: string;
+	diffs?: DiffDisplay[];
 	error?: IpythonErrorDetails;
 }
 
@@ -52,6 +62,7 @@ const CELL_MAGIC_PATTERN = /^\s*%%bash\b/;
 
 const OUTPUT_PREVIEW_LINES = 5;
 const INPUT_PREVIEW_LINES = 3;
+const DIFF_PREVIEW_LINES = 12;
 
 export function getIpythonCodeFromArgs(args: unknown): string {
 	if (!args || typeof args !== "object" || !("code" in args)) {
@@ -74,8 +85,54 @@ function readDetails(details: unknown): IpythonDetails {
 		stdout: typeof record.stdout === "string" ? record.stdout : undefined,
 		stderr: typeof record.stderr === "string" ? record.stderr : undefined,
 		result: typeof record.result === "string" ? record.result : undefined,
+		diffs: readDiffDisplays(record.diffs),
 		error,
 	};
+}
+
+function readDiffDisplays(value: unknown): DiffDisplay[] | undefined {
+	if (!Array.isArray(value)) {
+		return undefined;
+	}
+	const diffs = value.flatMap((entry): DiffDisplay[] => {
+		if (!entry || typeof entry !== "object") {
+			return [];
+		}
+		const record = entry as Record<string, unknown>;
+		if (typeof record.path !== "string" || typeof record.oldStr !== "string" || typeof record.newStr !== "string") {
+			return [];
+		}
+		return [
+			{
+				path: record.path,
+				oldStr: record.oldStr,
+				newStr: record.newStr,
+				startLine: typeof record.startLine === "number" ? record.startLine : undefined,
+			},
+		];
+	});
+	return diffs.length > 0 ? diffs : undefined;
+}
+
+/** Strip one layer of repr quotes so an `execute_result` string compares cleanly. */
+function stripReprQuotes(text: string): string {
+	const trimmed = text.trim();
+	if (
+		trimmed.length >= 2 &&
+		((trimmed.startsWith("'") && trimmed.endsWith("'")) || (trimmed.startsWith('"') && trimmed.endsWith('"')))
+	) {
+		return trimmed.slice(1, -1);
+	}
+	return trimmed;
+}
+
+/** True when `text` is just the edit skill's "Edited <path>" confirmation for one of `diffs`. */
+function isEditConfirmation(text: string | undefined, diffs: readonly DiffDisplay[]): boolean {
+	if (!text) {
+		return false;
+	}
+	const stripped = stripReprQuotes(text);
+	return diffs.some((diff) => stripped === `Edited ${diff.path}`);
 }
 
 function readErrorDetails(value: unknown): IpythonErrorDetails | undefined {
@@ -192,8 +249,9 @@ export class IPythonCellComponent implements Component {
 			return `${theme.fg("muted", label)} ${theme.fg("dim", "·")} ${keyHint("app.tools.expand", "to expand")}`;
 		};
 
+		const hasDiffs = (details.diffs?.length ?? 0) > 0;
 		lines.push(toolPanelLine(this.header(details), safeWidth));
-		const hasCode = this.renderCode(lines, safeWidth, withExpandHint);
+		const hasCode = this.renderCode(lines, safeWidth, withExpandHint, hasDiffs);
 		this.renderOutput(lines, safeWidth, details, hasCode, withExpandHint);
 		return this.renderCache.set(safeWidth, this.stateVersion, lines);
 	}
@@ -228,7 +286,12 @@ export class IPythonCellComponent implements Component {
 		return { label: theme.fg("success", "done") };
 	}
 
-	private renderCode(lines: string[], width: number, withExpandHint: ExpandHintFormatter): boolean {
+	private renderCode(
+		lines: string[],
+		width: number,
+		withExpandHint: ExpandHintFormatter,
+		hasDiffs: boolean,
+	): boolean {
 		const code = this.state.code.trimEnd();
 		if (!code) {
 			this.addBlank(lines, width);
@@ -240,6 +303,14 @@ export class IPythonCellComponent implements Component {
 		const isBashCell = CELL_MAGIC_PATTERN.test(code.split("\n")[0] ?? "");
 		const rawLines = code.split("\n");
 		const expanded = this.state.expanded ?? false;
+
+		// With a diff to show below, collapse the (often large) edit source to one bar.
+		if (hasDiffs && !expanded) {
+			const label = `${rawLines.length} line${rawLines.length === 1 ? "" : "s"} of source`;
+			this.addWrapped(lines, theme.fg("dim", "› "), withExpandHint(label), width);
+			return true;
+		}
+
 		const showCollapsed = !expanded && rawLines.length > INPUT_PREVIEW_LINES;
 		const visibleRawLines = showCollapsed ? rawLines.slice(0, INPUT_PREVIEW_LINES) : rawLines;
 		for (const [index, rawLine] of visibleRawLines.entries()) {
@@ -287,6 +358,8 @@ export class IPythonCellComponent implements Component {
 		let outputStarted = false;
 		let renderedTextOutput = false;
 
+		const diffs = details.diffs ?? [];
+
 		const startOutput = (): void => {
 			if (outputStarted) {
 				return;
@@ -297,8 +370,26 @@ export class IPythonCellComponent implements Component {
 			}
 		};
 
+		// Group edits by file: one block per file, edits shown as `⋮`-separated hunks.
+		const diffsByPath = new Map<string, DiffDisplay[]>();
+		for (const diff of diffs) {
+			const existing = diffsByPath.get(diff.path);
+			if (existing) existing.push(diff);
+			else diffsByPath.set(diff.path, [diff]);
+		}
+		let fileIndex = 0;
+		for (const [path, edits] of diffsByPath) {
+			startOutput();
+			if (fileIndex > 0) {
+				this.addBlank(lines, width);
+			}
+			fileIndex++;
+			this.renderFileDiff(lines, width, path, edits, withExpandHint);
+			renderedTextOutput = true;
+		}
+
 		if (hasStructuredOutput) {
-			if (details.stdout?.trim()) {
+			if (details.stdout?.trim() && !isEditConfirmation(details.stdout, diffs)) {
 				startOutput();
 				renderedTextOutput = true;
 				this.renderOutputText(lines, width, normalizeErrorDetails(details.stdout), "out", withExpandHint);
@@ -308,7 +399,7 @@ export class IPythonCellComponent implements Component {
 				renderedTextOutput = true;
 				this.renderOutputText(lines, width, normalizeErrorDetails(details.stderr), "err", withExpandHint);
 			}
-			if (details.result?.trim()) {
+			if (details.result?.trim() && !isEditConfirmation(details.result, diffs)) {
 				startOutput();
 				renderedTextOutput = true;
 				this.renderOutputText(lines, width, normalizeErrorDetails(details.result), "out", withExpandHint);
@@ -374,6 +465,48 @@ export class IPythonCellComponent implements Component {
 				? `${imageCount} image${imageCount === 1 ? "" : "s"} rendered below`
 				: `${imageCount} image${imageCount === 1 ? "" : "s"} hidden`;
 			this.addWrapped(lines, "", theme.fg("muted", text), width);
+		}
+	}
+
+	private renderFileDiff(
+		lines: string[],
+		width: number,
+		path: string,
+		edits: readonly DiffDisplay[],
+		withExpandHint: ExpandHintFormatter,
+	): void {
+		const contentWidth = toolPanelContentWidth(width);
+		const language = getLanguageFromPath(path);
+
+		const rows: string[] = [];
+		let added = 0;
+		let removed = 0;
+		edits.forEach((edit, index) => {
+			const { diff: diffText } = generateDiffString(edit.oldStr, edit.newStr, 4, edit.startLine ?? 1);
+			for (const row of diffText.split("\n")) {
+				if (row.startsWith("+")) added++;
+				else if (row.startsWith("-")) removed++;
+			}
+			if (index > 0) {
+				rows.push(renderDiffSeparator(contentWidth));
+			}
+			rows.push(...renderRichDiff(diffText, contentWidth, { language }));
+		});
+
+		const counts = `${theme.fg("toolDiffAdded", `+${added}`)} ${theme.fg("toolDiffRemoved", `-${removed}`)}`;
+		this.addWrapped(lines, "", `${theme.fg("muted", "edit")} ${path}  ${counts}`, width);
+
+		const expanded = this.state.expanded ?? false;
+		const showCollapsed = !expanded && rows.length > DIFF_PREVIEW_LINES;
+		const visibleRows = showCollapsed ? rows.slice(0, DIFF_PREVIEW_LINES) : rows;
+		// Rows already fill the content width; just add the panel side padding.
+		const sidePad = theme.bg("toolPanelBg", " ".repeat(TOOL_PANEL_PADDING_X));
+		for (const row of visibleRows) {
+			lines.push(sidePad + row + sidePad);
+		}
+		if (showCollapsed) {
+			const hidden = rows.length - DIFF_PREVIEW_LINES;
+			this.addWrapped(lines, "", withExpandHint(hiddenLinesLabel(hidden)), width);
 		}
 	}
 
