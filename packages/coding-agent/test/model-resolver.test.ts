@@ -405,7 +405,7 @@ describe("default model selection", () => {
 	test("openai defaults track current models", () => {
 		expect(defaultModelPerProvider.openai).toBe("gpt-5.4");
 		expect(defaultModelPerProvider["openai-codex"]).toBe("gpt-5.5");
-		expect(defaultModelPerProvider["prime-inference"]).toBe("openai/gpt-5.5");
+		expect(defaultModelPerProvider["prime-inference"]).toBe("anthropic/claude-opus-4.8");
 	});
 
 	test("zai, minimax, and cerebras defaults track current models", () => {
@@ -490,6 +490,70 @@ describe("default model selection", () => {
 			isContinuing: false,
 			defaultProvider: savedDefault.provider,
 			defaultModelId: savedDefault.id,
+			modelRegistry: registry,
+		});
+
+		expect(result.model?.provider).toBe("prime-inference");
+		expect(result.model?.id).toBe("openai/gpt-5.5");
+	});
+
+	test("findInitialModel rebuilds a saved default missing from the model snapshot when the provider is authed", async () => {
+		const primeSnapshotModel: Model<"anthropic-messages"> = {
+			id: "openai/gpt-5.5",
+			name: "GPT 5.5 (Prime Inference)",
+			api: "anthropic-messages",
+			provider: "prime-inference",
+			baseUrl: "https://api.pinference.ai/api/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1 },
+			contextWindow: 128000,
+			maxTokens: 8192,
+		};
+		const registry = {
+			find: () => undefined,
+			getAll: () => [primeSnapshotModel],
+			hasConfiguredAuth: (model: Model<"anthropic-messages">) => model.provider === "prime-inference",
+			getAvailable: async () => [primeSnapshotModel],
+		} as unknown as Parameters<typeof findInitialModel>[0]["modelRegistry"];
+
+		const result = await findInitialModel({
+			scopedModels: [],
+			isContinuing: false,
+			defaultProvider: "prime-inference",
+			defaultModelId: "anthropic/claude-opus-4.6",
+			modelRegistry: registry,
+		});
+
+		expect(result.model?.provider).toBe("prime-inference");
+		expect(result.model?.id).toBe("anthropic/claude-opus-4.6");
+	});
+
+	test("findInitialModel does not rebuild a saved default for an unauthed provider", async () => {
+		const primeSnapshotModel: Model<"anthropic-messages"> = {
+			id: "openai/gpt-5.5",
+			name: "GPT 5.5 (Prime Inference)",
+			api: "anthropic-messages",
+			provider: "prime-inference",
+			baseUrl: "https://api.pinference.ai/api/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0.1, cacheWrite: 1 },
+			contextWindow: 128000,
+			maxTokens: 8192,
+		};
+		const registry = {
+			find: () => undefined,
+			getAll: () => [...mockModels, primeSnapshotModel],
+			hasConfiguredAuth: (model: Model<"anthropic-messages">) => model.provider === "prime-inference",
+			getAvailable: async () => [primeSnapshotModel],
+		} as unknown as Parameters<typeof findInitialModel>[0]["modelRegistry"];
+
+		const result = await findInitialModel({
+			scopedModels: [],
+			isContinuing: false,
+			defaultProvider: "anthropic",
+			defaultModelId: "claude-ghost-9",
 			modelRegistry: registry,
 		});
 
