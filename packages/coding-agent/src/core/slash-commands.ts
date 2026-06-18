@@ -66,6 +66,11 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	},
 	{ name: "refine", description: "Refine editable harness prompt notes, skills, subagents, and memory" },
 	{ name: "goal", description: "Set or view a persistent goal; supports pause, resume, and clear" },
+	{
+		name: "heartbeat",
+		description: "Set or view a persistent heartbeat; supports pause, resume, and clear",
+		argumentHint: "[--every <interval>] <instruction>",
+	},
 	{ name: "resume", description: "Resume a different session" },
 	{ name: "reload", description: "Reload keybindings, extensions, skills, prompts, and themes" },
 	{ name: "quit", description: `Quit ${APP_NAME}` },

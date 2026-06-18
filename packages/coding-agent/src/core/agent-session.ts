@@ -68,6 +68,7 @@ import {
 	loadContextTreeChildFromDisk,
 	loadContextTreeChildrenFromDisk,
 } from "./context-tree.js";
+import type { AgentCronJob, AgentRlmHeartbeatController, AgentRlmHeartbeatStatusUpdate } from "./cron-jobs.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.js";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.js";
@@ -300,6 +301,11 @@ export interface AgentSessionConfig {
 	 */
 	includeGoals?: boolean;
 	/**
+	 * Optional host-side controller for the bundled rlm-heartbeat Python skill.
+	 * When omitted, rlm_heartbeat.* host requests are unavailable.
+	 */
+	rlmHeartbeatController?: AgentRlmHeartbeatController;
+	/**
 	 * Override base tools (useful for custom runtimes).
 	 *
 	 * These are synthesized into minimal ToolDefinitions internally so AgentSession can keep
@@ -344,10 +350,18 @@ export interface PromptOptions {
 	images?: ImageContent[];
 	/** When streaming, how to queue the message: "steer" (interrupt) or "followUp" (wait). Required if streaming. */
 	streamingBehavior?: "steer" | "followUp";
+	/** Coalesce follow-up queueing so only one pending follow-up exists for this key. */
+	followUpQueueKey?: string;
 	/** Source of input for extension input event handlers. Defaults to "interactive". */
 	source?: InputSource;
 	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
 	preflightResult?: (success: boolean) => void;
+}
+
+interface QueuedFollowUpMessage {
+	text: string;
+	queueKey?: string;
+	message: AgentMessage;
 }
 
 /** Result from cycleModel() */
@@ -643,7 +657,7 @@ export class AgentSession {
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
 	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
-	private _followUpMessages: string[] = [];
+	private _followUpMessages: QueuedFollowUpMessage[] = [];
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
@@ -685,6 +699,7 @@ export class AgentSession {
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
 	private _includeGoals: boolean;
+	private _rlmHeartbeatController?: AgentRlmHeartbeatController;
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
@@ -732,6 +747,7 @@ export class AgentSession {
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
 		this._includeGoals = config.includeGoals ?? true;
+		this._rlmHeartbeatController = config.rlmHeartbeatController;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._rlmDepth = config.rlmDepth ?? parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH");
@@ -876,7 +892,7 @@ export class AgentSession {
 		this._emit({
 			type: "queue_update",
 			steering: [...this._steeringMessages],
-			followUp: [...this._followUpMessages],
+			followUp: this._followUpMessages.map((message) => message.text),
 		});
 	}
 
@@ -1326,6 +1342,90 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Handle an rlm_heartbeat.* request from the bundled rlm-heartbeat skill.
+	 * These heartbeats are internal to this active session and never read or
+	 * mutate the user-level /heartbeat.
+	 */
+	handleRlmHeartbeatHostRequest(type: string, payload: Record<string, unknown> = {}): Record<string, unknown> {
+		const controller = this._rlmHeartbeatController;
+		if (!controller) {
+			throw new Error("RLM heartbeat skill is not available in this session");
+		}
+		switch (type) {
+			case "rlm_heartbeat.list": {
+				const includeInactive = payload.include_inactive === true || payload.includeInactive === true;
+				return {
+					heartbeats: controller
+						.listRlmHeartbeats({ includeInactive })
+						.map((heartbeat) => rlmHeartbeatHostResponse(heartbeat)),
+				};
+			}
+			case "rlm_heartbeat.create": {
+				if (typeof payload.instruction !== "string") {
+					throw new Error("rlm_heartbeat.create instruction must be a string");
+				}
+				if (payload.interval !== undefined && typeof payload.interval !== "string") {
+					throw new Error("rlm_heartbeat.create interval must be a string when provided");
+				}
+				if (payload.label !== undefined && typeof payload.label !== "string") {
+					throw new Error("rlm_heartbeat.create label must be a string when provided");
+				}
+				return {
+					heartbeat: rlmHeartbeatHostResponse(
+						controller.createRlmHeartbeat({
+							instruction: payload.instruction,
+							interval: payload.interval,
+							label: payload.label,
+						}),
+					),
+				};
+			}
+			case "rlm_heartbeat.update": {
+				if (typeof payload.id !== "string") {
+					throw new Error("rlm_heartbeat.update id must be a string");
+				}
+				if (payload.instruction !== undefined && typeof payload.instruction !== "string") {
+					throw new Error("rlm_heartbeat.update instruction must be a string when provided");
+				}
+				if (payload.interval !== undefined && typeof payload.interval !== "string") {
+					throw new Error("rlm_heartbeat.update interval must be a string when provided");
+				}
+				if (payload.label !== undefined && typeof payload.label !== "string") {
+					throw new Error("rlm_heartbeat.update label must be a string when provided");
+				}
+				if (payload.status !== undefined && !isRlmHeartbeatStatusUpdate(payload.status)) {
+					throw new Error('rlm_heartbeat.update status must be "pause" or "resume" when provided');
+				}
+				if (
+					payload.instruction === undefined &&
+					payload.interval === undefined &&
+					payload.label === undefined &&
+					payload.status === undefined
+				) {
+					throw new Error("rlm_heartbeat.update requires at least one field to update");
+				}
+				const heartbeat = controller.updateRlmHeartbeat({
+					id: payload.id,
+					instruction: payload.instruction,
+					interval: payload.interval,
+					label: payload.label,
+					status: payload.status,
+				});
+				return { heartbeat: heartbeat ? rlmHeartbeatHostResponse(heartbeat) : null };
+			}
+			case "rlm_heartbeat.delete": {
+				if (typeof payload.id !== "string") {
+					throw new Error("rlm_heartbeat.delete id must be a string");
+				}
+				const heartbeat = controller.deleteRlmHeartbeat(payload.id);
+				return { heartbeat: heartbeat ? rlmHeartbeatHostResponse(heartbeat) : null };
+			}
+			default:
+				throw new Error(`unknown RLM heartbeat request type "${type}"`);
+		}
+	}
+
 	private _createGoalFromHost(objective: string, tokenBudget: number | undefined): GoalState {
 		switch (this._goalState.status) {
 			case "active":
@@ -1461,7 +1561,7 @@ export class AgentSession {
 					this._emitQueueUpdate();
 				} else {
 					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
+					const followUpIndex = this._followUpMessages.findIndex((message) => message.text === messageText);
 					if (followUpIndex !== -1) {
 						this._followUpMessages.splice(followUpIndex, 1);
 						this._emitQueueUpdate();
@@ -2013,7 +2113,7 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+					await this._queueFollowUp(expandedText, currentImages, { queueKey: options.followUpQueueKey });
 				} else {
 					await this._queueSteer(expandedText, currentImages);
 				}
@@ -2196,7 +2296,7 @@ export class AgentSession {
 	 * @param images Optional image attachments to include with the message
 	 * @throws Error if text is an extension command
 	 */
-	async followUp(text: string, images?: ImageContent[]): Promise<void> {
+	async followUp(text: string, images?: ImageContent[], options: { queueKey?: string } = {}): Promise<boolean> {
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -2206,7 +2306,7 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueFollowUp(expandedText, images);
+		return this._queueFollowUp(expandedText, images, { queueKey: options.queueKey });
 	}
 
 	/**
@@ -2229,18 +2329,27 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
-		this._followUpMessages.push(text);
-		this._emitQueueUpdate();
+	private async _queueFollowUp(
+		text: string,
+		images?: ImageContent[],
+		options: { queueKey?: string } = {},
+	): Promise<boolean> {
+		if (options.queueKey && this._followUpMessages.some((message) => message.queueKey === options.queueKey)) {
+			return false;
+		}
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({
+		const message: AgentMessage = {
 			role: "user",
 			content,
 			timestamp: Date.now(),
-		});
+		};
+		this._followUpMessages.push({ text, queueKey: options.queueKey, message });
+		this._emitQueueUpdate();
+		this.agent.followUp(message);
+		return true;
 	}
 
 	/**
@@ -2352,7 +2461,7 @@ export class AgentSession {
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
 		const steering = [...this._steeringMessages];
-		const followUp = [...this._followUpMessages];
+		const followUp = this._followUpMessages.map((message) => message.text);
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this.agent.clearAllQueues();
@@ -2372,7 +2481,23 @@ export class AgentSession {
 
 	/** Get pending follow-up messages (read-only) */
 	getFollowUpMessages(): readonly string[] {
-		return this._followUpMessages;
+		return this._followUpMessages.map((message) => message.text);
+	}
+
+	hasQueuedFollowUp(queueKey: string): boolean {
+		return this._followUpMessages.some((message) => message.queueKey === queueKey);
+	}
+
+	removeQueuedFollowUp(queueKey: string): boolean {
+		const removed = this._followUpMessages.filter((message) => message.queueKey === queueKey);
+		if (removed.length === 0) {
+			return false;
+		}
+		this._followUpMessages = this._followUpMessages.filter((message) => message.queueKey !== queueKey);
+		const removedMessages = new Set(removed.map((message) => message.message));
+		this.agent.removeQueuedMessages((message) => removedMessages.has(message));
+		this._emitQueueUpdate();
+		return true;
 	}
 
 	get resourceLoader(): ResourceLoader {
@@ -3557,6 +3682,16 @@ export class AgentSession {
 		if (this._includeGoals) {
 			for (const type of ["goal.get", "goal.create", "goal.complete"]) {
 				handlers[type] = async (payload) => this.handleGoalHostRequest(type, payload);
+			}
+		}
+		if (this._rlmHeartbeatController) {
+			for (const type of [
+				"rlm_heartbeat.list",
+				"rlm_heartbeat.create",
+				"rlm_heartbeat.update",
+				"rlm_heartbeat.delete",
+			]) {
+				handlers[type] = async (payload) => this.handleRlmHeartbeatHostRequest(type, payload);
 			}
 		}
 		return handlers;
@@ -4996,4 +5131,24 @@ export class AgentSession {
 	get extensionRunner(): ExtensionRunner {
 		return this._extensionRunner;
 	}
+}
+
+function isRlmHeartbeatStatusUpdate(value: unknown): value is AgentRlmHeartbeatStatusUpdate {
+	return value === "pause" || value === "resume";
+}
+
+function rlmHeartbeatHostResponse(job: AgentCronJob): Record<string, unknown> {
+	return {
+		id: job.id,
+		status: job.status,
+		label: job.label ?? null,
+		instruction: job.prompt,
+		schedule: job.schedule,
+		created_at: job.createdAt,
+		updated_at: job.updatedAt,
+		next_run_at: job.nextRunAt ?? null,
+		last_run_at: job.lastRunAt ?? null,
+		last_error: job.lastError ?? null,
+		run_count: job.runCount,
+	};
 }

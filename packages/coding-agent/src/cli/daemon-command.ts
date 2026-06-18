@@ -7,6 +7,7 @@ import { spawn } from "child_process";
 import { APP_NAME, expandTildePath } from "../config.js";
 import type { AgentSessionEvent } from "../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js";
+import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
 import { DaemonClient, type DaemonClientMessageListener } from "../modes/daemon/daemon-client.js";
 import type { DaemonOutbound, DaemonResponse } from "../modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
@@ -40,6 +41,7 @@ const DAEMON_CLIENT_COMMANDS = new Set([
 	"messages",
 	"stats",
 	"commands",
+	"cron",
 	"shutdown",
 ]);
 
@@ -95,6 +97,12 @@ function parseDaemonClientCommand(args: string[]): ParsedDaemonClientCommand {
 
 		if (passthrough) {
 			positionals.push(arg);
+			continue;
+		}
+
+		if (arg === "--" && command === "cron") {
+			positionals.push(arg);
+			passthrough = true;
 			continue;
 		}
 
@@ -226,6 +234,9 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 					{ type: "get_commands", activeSessionId: requireActiveSessionId(parsed.positionals) },
 					true,
 				);
+				return;
+			case "cron":
+				await runCron(client, parsed.positionals, parsed.json);
 				return;
 			case "shutdown":
 				await printResponseData(client, { type: "shutdown" }, parsed.json);
@@ -803,6 +814,79 @@ async function runMessageCommand(
 	await printResponseData(client, { type, activeSessionId, message }, json);
 }
 
+async function runCron(client: DaemonClient, args: string[], json: boolean): Promise<void> {
+	const subcommand = args[0] ?? "list";
+	if (subcommand === "list") {
+		const includeInactive = args.includes("--all") || args.includes("-a");
+		const activeSessionId = args.find((arg) => !arg.startsWith("-") && arg !== "list");
+		const response = await client.request({ type: "cron_list", activeSessionId, includeInactive });
+		const data = requireSuccess(response);
+		if (json) {
+			printJson(data);
+			return;
+		}
+		const jobs = getCronJobs(data);
+		if (!jobs) {
+			printJson(data);
+			return;
+		}
+		if (jobs.length === 0) {
+			console.log("No cron jobs.");
+			return;
+		}
+		for (const job of jobs) {
+			console.log(formatAgentCronJob(job));
+		}
+		return;
+	}
+
+	if (subcommand === "add" || subcommand === "schedule") {
+		const separator = args.indexOf("--");
+		if (separator < 0) {
+			throw new Error("Usage: daemon cron add <session> <schedule> -- <message>");
+		}
+		const activeSessionId = args[1];
+		if (!activeSessionId) {
+			throw new Error("Usage: daemon cron add <session> <schedule> -- <message>");
+		}
+		const schedule = args.slice(2, separator).join(" ").trim();
+		const message = args
+			.slice(separator + 1)
+			.join(" ")
+			.trim();
+		if (!schedule || !message) {
+			throw new Error("Usage: daemon cron add <session> <schedule> -- <message>");
+		}
+		const response = await client.request({ type: "cron_add", activeSessionId, schedule, prompt: message });
+		const data = requireSuccess(response);
+		if (json) {
+			printJson(data);
+			return;
+		}
+		const job = getCronJob(data);
+		console.log(job ? `Scheduled ${job.id} next=${job.nextRunAt ?? "-"}` : "Scheduled cron job.");
+		return;
+	}
+
+	if (subcommand === "cancel" || subcommand === "delete" || subcommand === "remove") {
+		const jobId = args[1];
+		if (!jobId) {
+			throw new Error("Usage: daemon cron cancel <job-id>");
+		}
+		const response = await client.request({ type: "cron_cancel", jobId });
+		const data = requireSuccess(response);
+		if (json) {
+			printJson(data);
+			return;
+		}
+		const job = getCronJob(data);
+		console.log(job ? `Cancelled ${job.id}` : "Cancelled cron job.");
+		return;
+	}
+
+	throw new Error(`Unknown cron command: ${subcommand}`);
+}
+
 async function printResponseData(
 	client: DaemonClient,
 	command: Parameters<DaemonClient["request"]>[0],
@@ -1340,6 +1424,26 @@ function isLiveSessionSummary(value: unknown): value is SessionSummary & { activ
 	return isSessionSummary(value) && typeof value.activeSessionId === "string";
 }
 
+function getCronJobs(value: unknown): AgentCronJob[] | undefined {
+	if (!value || typeof value !== "object") {
+		return undefined;
+	}
+	const jobs = (value as { jobs?: unknown }).jobs;
+	return Array.isArray(jobs) ? (jobs as AgentCronJob[]) : undefined;
+}
+
+function getCronJob(value: unknown): { id: string; nextRunAt?: string } | undefined {
+	if (!value || typeof value !== "object") {
+		return undefined;
+	}
+	const job = (value as { job?: unknown }).job;
+	if (!job || typeof job !== "object" || typeof (job as { id?: unknown }).id !== "string") {
+		return undefined;
+	}
+	const candidate = job as { id: string; nextRunAt?: unknown };
+	return { id: candidate.id, ...(typeof candidate.nextRunAt === "string" ? { nextRunAt: candidate.nextRunAt } : {}) };
+}
+
 function printDaemonHelp(): void {
 	console.log(`${chalk.bold("Usage:")}
   ${APP_NAME} daemon [options] [session name]
@@ -1364,6 +1468,10 @@ ${chalk.bold("Commands:")}
   messages <session>            Print messages as JSON
   stats <session>               Print session stats as JSON
   commands <session>            Print available commands as JSON
+  cron list [-a|--all] [session] List scheduled cron jobs
+  cron add <session> <schedule> -- <message>
+                                Schedule a prompt for a session
+  cron cancel <job-id>           Cancel a scheduled cron job
   shutdown                      Stop the daemon
 
 ${chalk.bold("Options:")}
@@ -1387,6 +1495,8 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock list
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock list -a
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock create scratch
+  ${APP_NAME} daemon --socket /tmp/prime-agent.sock cron add <session> "*/30 * * * *" -- "Check progress"
+  ${APP_NAME} daemon --socket /tmp/prime-agent.sock cron list
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock prompt <session> "Say hello"
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock attach <session>
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock shutdown

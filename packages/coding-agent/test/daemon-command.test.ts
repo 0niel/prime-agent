@@ -6,6 +6,9 @@ const daemonClientMock = vi.hoisted(() => {
 	type Command = {
 		type: string;
 		name?: string;
+		activeSessionId?: string;
+		schedule?: string;
+		prompt?: string;
 		sessionPath?: string;
 		config?: { extensionFlagValues?: Record<string, boolean | string> };
 	};
@@ -219,6 +222,30 @@ describe("daemon command", () => {
 		expect(client?.requests[0]).toMatchObject({
 			type: "create",
 			sessionPath: "abc123",
+		});
+	});
+
+	it("preserves cron add separator before the scheduled prompt", async () => {
+		await expect(
+			handleDaemonCommand([
+				"daemon",
+				"--socket",
+				"/tmp/prime-agent.sock",
+				"cron",
+				"add",
+				"active-1",
+				"in 5m",
+				"--",
+				"check status",
+			]),
+		).resolves.toBe(true);
+
+		const client = daemonClientMock.instances[0];
+		expect(client?.requests[0]).toEqual({
+			type: "cron_add",
+			activeSessionId: "active-1",
+			schedule: "in 5m",
+			prompt: "check status",
 		});
 	});
 });

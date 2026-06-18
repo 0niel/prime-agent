@@ -580,6 +580,11 @@ export function getSettingsPath(): string {
 	return join(getAgentDir(), "settings.json");
 }
 
+/** Get path to cron jobs store */
+export function getCronJobsPath(agentDir: string = getAgentDir()): string {
+	return join(agentDir, "cron-jobs.json");
+}
+
 /** Get path to tools directory */
 export function getToolsDir(): string {
 	return join(getAgentDir(), "tools");

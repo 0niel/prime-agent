@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import type { CreateAgentSessionOptions } from "../src/core/sdk.js";
 import {
 	type AppMode,
 	type DaemonInteractiveSessionManagerDecision,
@@ -6,6 +7,7 @@ import {
 	findActiveDaemonSessionSummaryForSessionFile,
 	type InteractiveDaemonStartupDecision,
 	parseDaemonRichTuiAttachShortcut,
+	resolveRuntimeSessionOptions,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
 	shouldOpenAgentsViewForDaemonInteractive,
 	shouldUseDaemonInteractive,
@@ -185,6 +187,44 @@ describe("daemon rich TUI attach shortcut parsing", () => {
 		expect(parseDaemonRichTuiAttachShortcut(["daemon", "--socket", "/tmp/prime.sock", "d5c1e83e2182"])).toEqual({
 			socketPath: "/tmp/prime.sock",
 			selector: "d5c1e83e2182",
+		});
+	});
+});
+
+describe("runtime session option resolution", () => {
+	test("preserves daemon-provided RLM heartbeat controller when creating sessions", () => {
+		const preparedModel = { id: "prepared-model" } as unknown as CreateAgentSessionOptions["model"];
+		const runtimeModel = { id: "runtime-model" } as unknown as CreateAgentSessionOptions["model"];
+		const rlmHeartbeatController: NonNullable<CreateAgentSessionOptions["rlmHeartbeatController"]> = {
+			listRlmHeartbeats: () => [],
+			createRlmHeartbeat: () => {
+				throw new Error("not used");
+			},
+			updateRlmHeartbeat: () => undefined,
+			deleteRlmHeartbeat: () => undefined,
+		};
+
+		const resolved = resolveRuntimeSessionOptions(
+			{
+				model: preparedModel,
+				tools: ["ipython"],
+				customTools: [],
+			},
+			{
+				model: runtimeModel,
+				rlmHeartbeatController,
+				rlmDepth: 1,
+				rlmSessionDir: "/tmp/rlm-session",
+			},
+		);
+
+		expect(resolved).toMatchObject({
+			model: runtimeModel,
+			tools: ["ipython"],
+			customTools: [],
+			rlmHeartbeatController,
+			rlmDepth: 1,
+			rlmSessionDir: "/tmp/rlm-session",
 		});
 	});
 });

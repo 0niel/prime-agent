@@ -1,6 +1,7 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Transport } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
+import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type {
@@ -193,6 +194,12 @@ export type DaemonCommand =
 	| { id?: string; type: "get_available_models"; activeSessionId: string }
 	| { id?: string; type: "get_queue"; activeSessionId: string }
 	| { id?: string; type: "clear_queue"; activeSessionId: string }
+	| { id?: string; type: "cron_list"; activeSessionId?: string; includeInactive?: boolean }
+	| { id?: string; type: "cron_add"; activeSessionId: string; schedule: string; prompt: string }
+	| { id?: string; type: "cron_cancel"; jobId: string }
+	| { id?: string; type: "heartbeat_get"; activeSessionId: string }
+	| { id?: string; type: "heartbeat_set"; activeSessionId: string; schedule: string; prompt: string }
+	| { id?: string; type: "heartbeat_update"; activeSessionId: string; action: AgentHeartbeatUpdateAction }
 	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string }
 	| { id?: string; type: "cycle_model"; activeSessionId: string; direction?: "forward" | "backward" }
 	| { id?: string; type: "set_scoped_models"; activeSessionId: string; scopedModels: AgentConnectionScopedModel[] }
@@ -301,6 +308,8 @@ export interface DaemonSavedSessionInfo {
 export type DaemonDeleteSavedSessionResult = DeleteSessionFileResult;
 
 export type DaemonResourceSnapshot = AgentConnectionResourceSnapshot;
+
+export type DaemonCronJob = AgentCronJob;
 
 export type DaemonOutbound =
 	| DaemonResponse

@@ -4,6 +4,7 @@ import type { ImageContent, Transport } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
+import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
 import { SessionManager } from "../../core/session-manager.js";
@@ -149,6 +150,30 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async clearQueue(): Promise<AgentConnectionQueueState> {
 		return this.session.clearQueue();
+	}
+
+	async listCronJobs(_options: { includeInactive?: boolean } = {}): Promise<AgentCronJob[]> {
+		return [];
+	}
+
+	async addCronJob(_schedule: string, _prompt: string): Promise<AgentCronJob> {
+		throw new Error("Cron jobs require daemon mode");
+	}
+
+	async cancelCronJob(_jobId: string): Promise<AgentCronJob> {
+		throw new Error("Cron jobs require daemon mode");
+	}
+
+	async getHeartbeat(): Promise<AgentCronJob | undefined> {
+		return undefined;
+	}
+
+	async setHeartbeat(_schedule: string, _instruction: string): Promise<AgentCronJob> {
+		throw new Error("Heartbeats require daemon mode");
+	}
+
+	async updateHeartbeat(_action: AgentHeartbeatUpdateAction): Promise<AgentCronJob | undefined> {
+		throw new Error("Heartbeats require daemon mode");
 	}
 
 	async getUserMessagesForForking(): Promise<AgentConnectionUserMessage[]> {

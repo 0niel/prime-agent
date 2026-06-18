@@ -11,6 +11,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
+import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
 import type { GoalState } from "../../core/goals.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
@@ -535,6 +536,12 @@ export interface AgentConnection {
 	): Promise<AgentConnectionSavedSessionInfo[]>;
 	getQueue(): Promise<AgentConnectionQueueState>;
 	clearQueue(): Promise<AgentConnectionQueueState>;
+	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;
+	addCronJob(schedule: string, prompt: string): Promise<AgentCronJob>;
+	cancelCronJob(jobId: string): Promise<AgentCronJob>;
+	getHeartbeat(): Promise<AgentCronJob | undefined>;
+	setHeartbeat(schedule: string, instruction: string): Promise<AgentCronJob>;
+	updateHeartbeat(action: AgentHeartbeatUpdateAction): Promise<AgentCronJob | undefined>;
 	getUserMessagesForForking(): Promise<AgentConnectionUserMessage[]>;
 	getLastAssistantText(): Promise<string | undefined>;
 	getToolDefinition(name: string): Promise<AgentConnectionToolDefinition | undefined>;

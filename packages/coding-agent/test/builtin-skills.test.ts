@@ -172,6 +172,15 @@ describe("builtin skills", () => {
 			expect(goal?.kind === "python" && goal.python.importName).toBe("goal");
 		});
 
+		it("loads the bundled RLM heartbeat skill as a python skill", () => {
+			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
+
+			const rlmHeartbeat = skills.find((s) => s.name === "rlm-heartbeat");
+			expect(rlmHeartbeat).toBeDefined();
+			expect(rlmHeartbeat?.kind).toBe("python");
+			expect(rlmHeartbeat?.kind === "python" && rlmHeartbeat.python.importName).toBe("rlm_heartbeat");
+		});
+
 		it("ships the edit skill as a python skill importable as `edit`", () => {
 			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
 

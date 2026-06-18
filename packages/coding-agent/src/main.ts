@@ -588,6 +588,29 @@ interface PreparedRuntimeServices {
 	diagnostics: AgentSessionRuntimeDiagnostic[];
 }
 
+export function resolveRuntimeSessionOptions(
+	sessionOptions: CreateAgentSessionOptions,
+	runtimeSessionOptions?: CreateAgentSessionOptions,
+): CreateAgentSessionOptions {
+	return {
+		model: runtimeSessionOptions?.model ?? sessionOptions.model,
+		thinkingLevel: runtimeSessionOptions?.thinkingLevel ?? sessionOptions.thinkingLevel,
+		scopedModels: runtimeSessionOptions?.scopedModels ?? sessionOptions.scopedModels,
+		tools: runtimeSessionOptions?.tools ?? sessionOptions.tools,
+		noTools: runtimeSessionOptions?.noTools ?? sessionOptions.noTools,
+		customTools: runtimeSessionOptions?.customTools ?? sessionOptions.customTools,
+		initialActiveToolNames: runtimeSessionOptions?.initialActiveToolNames,
+		allowedToolNames: runtimeSessionOptions?.allowedToolNames,
+		includeGoals: runtimeSessionOptions?.includeGoals,
+		rlmHeartbeatController: runtimeSessionOptions?.rlmHeartbeatController,
+		rlmDepth: runtimeSessionOptions?.rlmDepth,
+		rlmMaxDepth: runtimeSessionOptions?.rlmMaxDepth,
+		rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,
+		rlmParentNodeId: runtimeSessionOptions?.rlmParentNodeId,
+		subagentRuntimeHost: runtimeSessionOptions?.subagentRuntimeHost,
+	};
+}
+
 async function prepareRuntimeServices(options: {
 	config: AgentSessionRuntimeConfig;
 	cwd: string;
@@ -1078,25 +1101,13 @@ export async function main(args: string[], options?: MainOptions) {
 			sessionOptionsOverride: runtimeSessionOptions,
 		});
 		const { services, sessionOptions, diagnostics } = prepared;
+		const resolvedSessionOptions = resolveRuntimeSessionOptions(sessionOptions, runtimeSessionOptions);
 
 		const created = await createAgentSessionFromServices({
 			services,
 			sessionManager,
 			sessionStartEvent,
-			model: runtimeSessionOptions?.model ?? sessionOptions.model,
-			thinkingLevel: runtimeSessionOptions?.thinkingLevel ?? sessionOptions.thinkingLevel,
-			scopedModels: runtimeSessionOptions?.scopedModels ?? sessionOptions.scopedModels,
-			tools: runtimeSessionOptions?.tools ?? sessionOptions.tools,
-			noTools: runtimeSessionOptions?.noTools ?? sessionOptions.noTools,
-			customTools: runtimeSessionOptions?.customTools ?? sessionOptions.customTools,
-			initialActiveToolNames: runtimeSessionOptions?.initialActiveToolNames,
-			allowedToolNames: runtimeSessionOptions?.allowedToolNames,
-			includeGoals: runtimeSessionOptions?.includeGoals,
-			rlmDepth: runtimeSessionOptions?.rlmDepth,
-			rlmMaxDepth: runtimeSessionOptions?.rlmMaxDepth,
-			rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,
-			rlmParentNodeId: runtimeSessionOptions?.rlmParentNodeId,
-			subagentRuntimeHost: runtimeSessionOptions?.subagentRuntimeHost,
+			...resolvedSessionOptions,
 			// Main agents boot their kernel in the background at session creation;
 			// subagent sessions (rlmDepth > 0) keep the lazy first-call start.
 			prewarmIpythonKernel: true,

@@ -3,6 +3,7 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { ImageContent, Transport } from "@earendil-works/pi-ai";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
+import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type { SessionStats } from "../../core/session-stats.js";
@@ -296,6 +297,57 @@ export class DaemonAgentConnection implements AgentConnection {
 			type: "clear_queue",
 			activeSessionId: this.activeSessionId,
 		});
+	}
+
+	async listCronJobs(options: { includeInactive?: boolean } = {}): Promise<AgentCronJob[]> {
+		const data = await this.requestData<{ jobs: AgentCronJob[] }>({
+			type: "cron_list",
+			activeSessionId: this.activeSessionId,
+			includeInactive: options.includeInactive,
+		});
+		return data.jobs;
+	}
+
+	async addCronJob(schedule: string, prompt: string): Promise<AgentCronJob> {
+		const data = await this.requestData<{ job: AgentCronJob }>({
+			type: "cron_add",
+			activeSessionId: this.activeSessionId,
+			schedule,
+			prompt,
+		});
+		return data.job;
+	}
+
+	async cancelCronJob(jobId: string): Promise<AgentCronJob> {
+		const data = await this.requestData<{ job: AgentCronJob }>({ type: "cron_cancel", jobId });
+		return data.job;
+	}
+
+	async getHeartbeat(): Promise<AgentCronJob | undefined> {
+		const data = await this.requestData<{ heartbeat?: AgentCronJob | null }>({
+			type: "heartbeat_get",
+			activeSessionId: this.activeSessionId,
+		});
+		return data.heartbeat ?? undefined;
+	}
+
+	async setHeartbeat(schedule: string, instruction: string): Promise<AgentCronJob> {
+		const data = await this.requestData<{ heartbeat: AgentCronJob }>({
+			type: "heartbeat_set",
+			activeSessionId: this.activeSessionId,
+			schedule,
+			prompt: instruction,
+		});
+		return data.heartbeat;
+	}
+
+	async updateHeartbeat(action: AgentHeartbeatUpdateAction): Promise<AgentCronJob | undefined> {
+		const data = await this.requestData<{ heartbeat?: AgentCronJob | null }>({
+			type: "heartbeat_update",
+			activeSessionId: this.activeSessionId,
+			action,
+		});
+		return data.heartbeat ?? undefined;
 	}
 
 	async getUserMessagesForForking(): Promise<AgentConnectionUserMessage[]> {
@@ -775,6 +827,7 @@ function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): bool
 		case "get_resource_snapshot":
 		case "get_available_models":
 		case "get_queue":
+		case "cron_list":
 		case "get_session_context":
 		case "get_session_tree":
 		case "get_user_messages_for_forking":

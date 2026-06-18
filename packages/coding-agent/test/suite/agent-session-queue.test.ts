@@ -122,6 +122,107 @@ describe("AgentSession queue characterization", () => {
 		expect(getAssistantTexts(harness)).toContain("saw steer");
 	});
 
+	it("coalesces follow-up messages with the same queue key", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		await waitForToolStart;
+		await harness.session.prompt("heartbeat", {
+			streamingBehavior: "followUp",
+			followUpQueueKey: "heartbeat:one",
+		});
+		await harness.session.prompt("heartbeat", {
+			streamingBehavior: "followUp",
+			followUpQueueKey: "heartbeat:one",
+		});
+
+		expect(harness.session.getFollowUpMessages()).toEqual(["heartbeat"]);
+
+		releaseToolExecution();
+		await promptPromise;
+	});
+
+	it("keeps separate follow-up messages for different queue keys", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("first done"),
+			fauxAssistantMessage("second done"),
+		]);
+		await waitForToolStart;
+		await harness.session.prompt("heartbeat one", {
+			streamingBehavior: "followUp",
+			followUpQueueKey: "heartbeat:one",
+		});
+		await harness.session.prompt("heartbeat two", {
+			streamingBehavior: "followUp",
+			followUpQueueKey: "heartbeat:two",
+		});
+
+		expect(harness.session.getFollowUpMessages()).toEqual(["heartbeat one", "heartbeat two"]);
+
+		releaseToolExecution();
+		await promptPromise;
+	});
+
+	it("removes only the matching coalesced follow-up when texts match", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		await waitForToolStart;
+		await harness.session.prompt("same heartbeat", {
+			streamingBehavior: "followUp",
+			followUpQueueKey: "heartbeat:one",
+		});
+		await harness.session.prompt("same heartbeat", {
+			streamingBehavior: "followUp",
+			followUpQueueKey: "heartbeat:two",
+		});
+
+		expect(harness.session.removeQueuedFollowUp("heartbeat:one")).toBe(true);
+		expect(harness.session.getFollowUpMessages()).toEqual(["same heartbeat"]);
+
+		releaseToolExecution();
+		await promptPromise;
+		expect(getUserTexts(harness)).toEqual(["start", "same heartbeat"]);
+	});
+
+	it("removes coalesced follow-up messages by queue key", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		await waitForToolStart;
+		await harness.session.prompt("heartbeat", {
+			streamingBehavior: "followUp",
+			followUpQueueKey: "heartbeat:one",
+		});
+
+		expect(harness.session.removeQueuedFollowUp("heartbeat:one")).toBe(true);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+
+		releaseToolExecution();
+		await promptPromise;
+		expect(getUserTexts(harness)).toEqual(["start"]);
+	});
+
 	it("delivers follow-up messages only after the current run finishes", async () => {
 		const waiting = await createWaitingHarness();
 		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
