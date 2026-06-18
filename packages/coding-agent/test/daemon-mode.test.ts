@@ -301,6 +301,7 @@ describe("daemon mode helpers", () => {
 				sessionName: "Target",
 				isStreaming: true,
 				pendingMessageCount: 19,
+				clearQueue: vi.fn(() => ({ cleared: 0 })),
 				prompt: vi.fn(
 					() =>
 						new Promise<void>((_resolve, reject) => {
@@ -311,6 +312,7 @@ describe("daemon mode helpers", () => {
 		} as never;
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
 			sendAgentSessionMessage(options: {
 				targetSelector: string;
 				message: string;
@@ -329,6 +331,11 @@ describe("daemon mode helpers", () => {
 		});
 		await Promise.resolve();
 
+		await internals.handleCommand(makeClient("client-1", targetState.activeSessionId), {
+			id: "command-1",
+			type: "agent_messages_clear",
+			activeSessionId: targetState.activeSessionId,
+		});
 		await expect(
 			internals.sendAgentSessionMessage({
 				targetSelector: targetState.activeSessionId,
