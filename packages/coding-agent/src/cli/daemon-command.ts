@@ -15,7 +15,7 @@ import { defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
 import { isLocalPath } from "../utils/paths.js";
 import { isValidThinkingLevel } from "./args.js";
 import { formatSessionListTable } from "./daemon-list-format.js";
-import { runPs, runReap } from "./daemon-ps.js";
+import { runPs, runReap, runShutdownAll } from "./daemon-ps.js";
 
 interface ParsedDaemonClientCommand {
 	command: string;
@@ -160,6 +160,11 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 
 	if (parsed.command === "ps") {
 		await runPsCommand(parsed);
+		return;
+	}
+
+	if (parsed.command === "shutdown" && parsed.positionals.some((arg) => arg === "--all" || arg === "-a")) {
+		await runShutdownAll(parsed.json);
 		return;
 	}
 
@@ -1472,7 +1477,7 @@ ${chalk.bold("Commands:")}
   cron add <session> <schedule> -- <message>
                                 Schedule a prompt for a session
   cron cancel <job-id>           Cancel a scheduled cron job
-  shutdown                      Stop the daemon
+  shutdown [--all]              Stop the daemon; --all force-stops every daemon on this machine
 
 ${chalk.bold("Options:")}
   --socket <path>               Socket path (default: ${defaultDaemonSocketPath()})
@@ -1500,5 +1505,6 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock prompt <session> "Say hello"
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock attach <session>
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock shutdown
+  ${APP_NAME} daemon shutdown --all
 `);
 }
