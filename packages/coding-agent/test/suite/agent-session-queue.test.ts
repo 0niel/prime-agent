@@ -6,10 +6,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RefinementResult } from "../../src/core/refinement/index.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
 
+type AutoRefineReason = "turn_interval" | "compact";
+
 type AutoRefineInternals = {
-	_maybeAutoRefine(reason: "turn_interval" | "compact"): Promise<void>;
+	_maybeAutoRefine(reason: AutoRefineReason): Promise<void>;
+	_scheduleAutoRefine(reason: AutoRefineReason): void;
+	_scheduleAutoRefineAfterCompaction(willContinueAfterCompaction: boolean): void;
+	_scheduleAutoRefineAfterAgentEnd(): void;
 	_assistantTurnsSinceAutoRefine: number;
 	_lastAutoRefineReviewAt: number;
+	_compactAutoRefinePending: boolean;
 };
 
 function emptyRefinementResult(): RefinementResult {
@@ -123,6 +129,67 @@ describe("AgentSession queue characterization", () => {
 
 		expect(reviewer).toHaveBeenCalledWith({ reason: "compact", turnsSinceLastReview: 0 });
 		expect(refine).not.toHaveBeenCalled();
+	});
+
+	it("auto-refine compact hook waits for planned post-compaction continuation", async () => {
+		const harness = await createHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		const scheduleAutoRefine = vi.spyOn(internals, "_scheduleAutoRefine").mockImplementation(() => {});
+
+		internals._scheduleAutoRefineAfterCompaction(true);
+
+		expect(internals._compactAutoRefinePending).toBe(true);
+		expect(scheduleAutoRefine).not.toHaveBeenCalled();
+
+		internals._scheduleAutoRefineAfterAgentEnd();
+
+		expect(internals._compactAutoRefinePending).toBe(true);
+		expect(scheduleAutoRefine).toHaveBeenCalledWith("compact");
+		expect(scheduleAutoRefine).toHaveBeenCalledTimes(1);
+	});
+
+	it("auto-refine compact hook runs immediately when no post-compaction continuation is planned", async () => {
+		const harness = await createHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		const scheduleAutoRefine = vi.spyOn(internals, "_scheduleAutoRefine").mockImplementation(() => {});
+
+		internals._scheduleAutoRefineAfterCompaction(false);
+
+		expect(internals._compactAutoRefinePending).toBe(false);
+		expect(scheduleAutoRefine).toHaveBeenCalledWith("compact");
+	});
+
+	it("auto-refine compact hook stays pending if the agent becomes active during review", async () => {
+		let finishReview: (() => void) | undefined;
+		const reviewStarted = new Promise<void>((resolve) => {
+			finishReview = resolve;
+		});
+		const reviewer = vi.fn(async () => {
+			await reviewStarted;
+			return { shouldRefine: true, rationale: "durable lesson" };
+		});
+		const harness = await createHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
+		vi.spyOn(harness.session.agent, "hasQueuedMessages").mockReturnValueOnce(false).mockReturnValueOnce(true);
+
+		const autoRefinePromise = internals._maybeAutoRefine("compact");
+		expect(reviewer).toHaveBeenCalledWith({ reason: "compact", turnsSinceLastReview: 0 });
+		finishReview?.();
+		await autoRefinePromise;
+
+		expect(refine).not.toHaveBeenCalled();
+		expect(internals._compactAutoRefinePending).toBe(true);
 	});
 
 	it("auto-refine review obeys the cooldown", async () => {

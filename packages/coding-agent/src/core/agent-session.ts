@@ -756,6 +756,7 @@ export class AgentSession {
 	private _assistantTurnsSinceAutoRefine = 0;
 	private _lastAutoRefineReviewAt = 0;
 	private _autoRefineInProgress = false;
+	private _compactAutoRefinePending = false;
 	private readonly _autoRefineReviewer?: AutoRefineReviewer;
 
 	constructor(config: AgentSessionConfig) {
@@ -1663,7 +1664,7 @@ export class AgentSession {
 			const compactionWillRetry = await this._checkCompaction(msg);
 			if (!compactionWillRetry) {
 				this._finishGoalForTerminalAssistantMessage(msg);
-				this._scheduleAutoRefine("turn_interval");
+				this._scheduleAutoRefineAfterAgentEnd();
 			}
 		}
 	}
@@ -2955,6 +2956,28 @@ export class AgentSession {
 		this._autoCompactionAbortController?.abort();
 	}
 
+	private _scheduleAutoRefineAfterAgentEnd(): void {
+		if (this._compactAutoRefinePending) {
+			this._scheduleAutoRefine("compact");
+			return;
+		}
+
+		this._scheduleAutoRefine("turn_interval");
+	}
+
+	private _scheduleAutoRefineAfterCompaction(willContinueAfterCompaction: boolean): void {
+		if (willContinueAfterCompaction) {
+			this._compactAutoRefinePending = true;
+			return;
+		}
+
+		this._scheduleAutoRefine("compact");
+	}
+
+	private _shouldSkipAutoRefineForActiveAgent(): boolean {
+		return this.isStreaming || this.isCompacting || this.agent.hasQueuedMessages();
+	}
+
 	private _scheduleAutoRefine(reason: AutoRefineReason): void {
 		setTimeout(() => {
 			void this._maybeAutoRefine(reason);
@@ -2963,10 +2986,20 @@ export class AgentSession {
 
 	private async _maybeAutoRefine(reason: AutoRefineReason): Promise<void> {
 		const settings = this.settingsManager.getAutoRefineSettings();
-		if (!settings.enabled || this._autoRefineInProgress || this.isStreaming || this.isCompacting) {
+		if (!settings.enabled) {
+			if (reason === "compact") {
+				this._compactAutoRefinePending = false;
+			}
+			return;
+		}
+		if (this._autoRefineInProgress || this._shouldSkipAutoRefineForActiveAgent()) {
+			if (reason === "compact") {
+				this._compactAutoRefinePending = true;
+			}
 			return;
 		}
 		if (reason === "compact" && !settings.compact) {
+			this._compactAutoRefinePending = false;
 			return;
 		}
 		if (reason === "turn_interval" && this._assistantTurnsSinceAutoRefine < settings.turnInterval) {
@@ -2977,6 +3010,9 @@ export class AgentSession {
 			return;
 		}
 		if (!this.model) {
+			if (reason === "compact") {
+				this._compactAutoRefinePending = false;
+			}
 			return;
 		}
 		this._autoRefineInProgress = true;
@@ -2985,7 +3021,16 @@ export class AgentSession {
 			const review = await this._reviewAutoRefine({ reason, turnsSinceLastReview });
 			this._lastAutoRefineReviewAt = nowMs;
 			this._assistantTurnsSinceAutoRefine = 0;
+			if (reason === "compact") {
+				this._compactAutoRefinePending = false;
+			}
 			if (!review.shouldRefine) {
+				return;
+			}
+			if (this._shouldSkipAutoRefineForActiveAgent()) {
+				if (reason === "compact") {
+					this._compactAutoRefinePending = true;
+				}
 				return;
 			}
 			await this.refine({ instructions: autoRefineInstructions(reason, review) });
@@ -3315,7 +3360,9 @@ export class AgentSession {
 				details,
 			};
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
-			this._scheduleAutoRefine("compact");
+			const hasQueuedMessages = this.agent.hasQueuedMessages();
+			const willContinueAfterCompaction = willRetry || shouldContinueAfterThreshold || hasQueuedMessages;
+			this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
 
 			if (willRetry) {
 				const messages = this.agent.state.messages;
@@ -3328,7 +3375,7 @@ export class AgentSession {
 					this.agent.continue().catch(() => {});
 				}, 100);
 				return true;
-			} else if (shouldContinueAfterThreshold || this.agent.hasQueuedMessages()) {
+			} else if (shouldContinueAfterThreshold || hasQueuedMessages) {
 				// Threshold compaction can intentionally stop a tool loop between turns.
 				// Queued follow-up/steering/custom messages can also be waiting.
 				setTimeout(() => {
