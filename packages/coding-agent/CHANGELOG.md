@@ -5,6 +5,7 @@
 ### Added
 
 - Added a daemon-backed user orchestrator surface with agent-to-agent messaging and read-only observation of active sessions.
+- Added an orchestration heartbeat skill that creates or refreshes an internal RLM heartbeat for compact multi-session progress, blocker, and action summaries.
 - Added opt-in Prime Agent trace sharing with `/traces` and background uploads of persisted session JSONL files.
 - Added a first draft of daemon-backed cron jobs for scheduling prompts against long-running sessions without using `/goal`.
 
