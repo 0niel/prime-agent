@@ -63,6 +63,7 @@ export interface HarnessOptions {
 	resourceLoader?: ResourceLoader;
 	extensionFactories?: Array<ExtensionFactory | CreateTestExtensionsResultInput>;
 	withConfiguredAuth?: boolean;
+	rlmDepth?: number;
 	autoRefineReviewer?: AutoRefineReviewer;
 }
 
@@ -175,6 +176,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		resourceLoader,
 		baseToolsOverride: toolMap,
 		extensionRunnerRef,
+		rlmDepth: options.rlmDepth,
 		autoRefineReviewer: options.autoRefineReviewer,
 	});
 

@@ -757,6 +757,7 @@ export class AgentSession {
 	private _lastAutoRefineReviewAt = 0;
 	private _autoRefineInProgress = false;
 	private _compactAutoRefinePending = false;
+	private _pendingAutoRefineReview: { reason: AutoRefineReason; review: AutoRefineReview } | undefined;
 	private readonly _autoRefineReviewer?: AutoRefineReviewer;
 
 	constructor(config: AgentSessionConfig) {
@@ -2956,7 +2957,18 @@ export class AgentSession {
 		this._autoCompactionAbortController?.abort();
 	}
 
+	private _autoRefineAllowedForSession(): boolean {
+		return this._rlmDepth === 0;
+	}
+
 	private _scheduleAutoRefineAfterAgentEnd(): void {
+		if (!this._autoRefineAllowedForSession()) {
+			return;
+		}
+		if (this._pendingAutoRefineReview) {
+			this._scheduleAutoRefine(this._pendingAutoRefineReview.reason);
+			return;
+		}
 		if (this._compactAutoRefinePending) {
 			this._scheduleAutoRefine("compact");
 			return;
@@ -2966,6 +2978,9 @@ export class AgentSession {
 	}
 
 	private _scheduleAutoRefineAfterCompaction(willContinueAfterCompaction: boolean): void {
+		if (!this._autoRefineAllowedForSession()) {
+			return;
+		}
 		if (willContinueAfterCompaction) {
 			this._compactAutoRefinePending = true;
 			return;
@@ -2985,11 +3000,16 @@ export class AgentSession {
 	}
 
 	private async _maybeAutoRefine(reason: AutoRefineReason): Promise<void> {
+		if (!this._autoRefineAllowedForSession()) {
+			this._compactAutoRefinePending = false;
+			this._pendingAutoRefineReview = undefined;
+			return;
+		}
+
 		const settings = this.settingsManager.getAutoRefineSettings();
 		if (!settings.enabled) {
-			if (reason === "compact") {
-				this._compactAutoRefinePending = false;
-			}
+			this._compactAutoRefinePending = false;
+			this._pendingAutoRefineReview = undefined;
 			return;
 		}
 		if (this._autoRefineInProgress || this._shouldSkipAutoRefineForActiveAgent()) {
@@ -2998,6 +3018,17 @@ export class AgentSession {
 			}
 			return;
 		}
+
+		const pendingReview = this._pendingAutoRefineReview;
+		if (pendingReview) {
+			this._pendingAutoRefineReview = undefined;
+			if (pendingReview.reason === "compact") {
+				this._compactAutoRefinePending = false;
+			}
+			await this.refine({ instructions: autoRefineInstructions(pendingReview.reason, pendingReview.review) });
+			return;
+		}
+
 		if (reason === "compact" && !settings.compact) {
 			this._compactAutoRefinePending = false;
 			return;
@@ -3028,9 +3059,7 @@ export class AgentSession {
 				return;
 			}
 			if (this._shouldSkipAutoRefineForActiveAgent()) {
-				if (reason === "compact") {
-					this._compactAutoRefinePending = true;
-				}
+				this._pendingAutoRefineReview = { reason, review };
 				return;
 			}
 			await this.refine({ instructions: autoRefineInstructions(reason, review) });
