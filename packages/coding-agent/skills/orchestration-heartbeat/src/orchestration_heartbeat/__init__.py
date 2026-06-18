@@ -50,6 +50,21 @@ def _format_sessions(agents: list[dict[str, Any]]) -> str:
     return "\n".join(_session_label(agent) for agent in agents)
 
 
+def _interval_matches_schedule(interval: str, schedule: Any) -> bool:
+    if not isinstance(schedule, dict):
+        return False
+    expression = schedule.get("expression")
+    if not isinstance(expression, str):
+        return False
+    normalized_interval = " ".join(interval.strip().lower().split())
+    normalized_expression = " ".join(expression.strip().lower().split())
+    if normalized_expression == normalized_interval:
+        return True
+    if not normalized_interval.startswith("every "):
+        return normalized_expression == f"every {normalized_interval}"
+    return False
+
+
 def build_instruction(
     sessions: list[dict[str, Any]] | None = None,
     focus: str | None = None,
@@ -116,13 +131,13 @@ async def initialize(
     existing = await rlm_heartbeat.list(include_inactive=False)
     for heartbeat in existing.get("heartbeats", []):
         if heartbeat.get("label") == label:
-            updated = await rlm_heartbeat.update(
-                heartbeat["id"],
-                instruction=instruction,
-                interval=interval,
-                label=label,
-                status="resume",
-            )
+            update_args: dict[str, Any] = {
+                "instruction": instruction,
+                "label": label,
+            }
+            if not _interval_matches_schedule(interval, heartbeat.get("schedule")):
+                update_args["interval"] = interval
+            updated = await rlm_heartbeat.update(heartbeat["id"], **update_args)
             return {
                 "action": "updated",
                 "heartbeat": updated.get("heartbeat"),
