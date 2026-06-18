@@ -849,6 +849,12 @@ describe("harness refinement", () => {
 		);
 
 		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+		expect(completeSimpleMock.mock.calls[0][1]).toMatchObject({
+			systemPrompt: expect.stringContaining("The current editable harness store is global/profile-scoped"),
+		});
+		expect(completeSimpleMock.mock.calls[0][1]).toMatchObject({
+			systemPrompt: expect.stringContaining("Return an empty `edits` array for session-only progress"),
+		});
 		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({
 			maxTokens: 4096,
 			apiKey: "api-key",

@@ -116,6 +116,13 @@ Editable components:
 - skill: installed Python REPL skill. Skill create/update edits MUST include a \`reference\` object with \`{"type":"python"}\`, a Python import, and a callable or call pattern; they also MUST include an \`arguments\` object describing accepted inputs, required fields, defaults, and constraints. Use \`{}\` for \`arguments\` only when the Python callable truly needs no external inputs. Include the RLM-native call form \`await <skill_import>(...)\`.
 - subagent: reusable delegation specs, including purpose, instructions, and when to invoke. Include the RLM-native call form: create a concise task prompt and call \`await rlm("sub-task")\`; for independent parallel subagents use \`await asyncio.gather(rlm("task1"), rlm("task2"))\`. Do not invent wrappers like \`run_subagent(...)\`.
 
+Scope and persistence policy:
+- The current editable harness store is global/profile-scoped. Treat every applied edit as durable context that can affect future sessions.
+- Create or update entries only for lessons that should survive beyond the current conversation. Return an empty \`edits\` array for session-only progress, active task state, temporary blockers, one-off hypotheses, transient tool outputs, or current-run coordination notes.
+- Project/workspace-specific lessons may be persisted only when the title, path, or content explicitly names the project/workspace and the lesson is likely to be reused in future sessions for that project. Prefer no edit when the lesson only belongs in the current conversation.
+- Use memory for declarative facts and preferences, skill for repeatable procedures exposed as Python calls, prompt for narrow behavioral policy addenda, and subagent for reusable delegation roles.
+- When an edit is persisted, include metadata such as \`{"scope":"global"}\` or \`{"scope":"workspace","workspace":"<name-or-path>"}\` when that helps future review understand the intended blast radius.
+
 Use the trajectory, current harness state, and prior refinement history. Prefer
 small evidence-backed edits. If prior refinements caused issues, rollback or
 replace the faulty editable entries. Never edit source files directly. Output
@@ -144,6 +151,7 @@ JSON only with this exact shape:
 const AUTO_REFINE_REVIEW_SYSTEM_PROMPT = `You are Prime Agent's automatic /refine review gate.
 
 Decide whether this checkpoint should run /refine. /refine mutates durable continual harness state, so prefer no unless the trajectory contains clear, reusable evidence.
+Reject session-only progress, active task state, temporary blockers, one-off hypotheses, transient tool outputs, and unqualified project facts. Approve only durable global/profile lessons or explicitly project-qualified lessons likely to be reused in future sessions.
 
 Return JSON only:
 {
@@ -329,6 +337,7 @@ export function formatHarnessStateForPrompt(
 		"# Global Harness State",
 		"",
 		"Persistent harness state is global by default and should influence this session without requiring a tool call.",
+		"Persistence scope: this store is global/profile-scoped today. Treat entries as durable cross-session context; do not use /refine to save current task progress, temporary blockers, or one-off session state. Project-specific entries should name the project or workspace explicitly.",
 		"Use these prompt notes, memories, skills, and subagent specs when they are relevant. The base system prompt is immutable; prompt entries below are supplemental notes only.",
 		"",
 		"When to call `/refine`: after a repeated failure, a reusable tactic emerges, a user corrects behavior that should persist, validation shows a harness entry is wrong, or a skill/subagent/memory/prompt note should be created, updated, deleted, or rolled back. Keep `/refine` edits small and evidence-backed.",
@@ -747,7 +756,7 @@ ${historyForPrompt(history)}
 		`<conversation>
 ${conversationText}
 </conversation>`,
-		"Return shouldRefine=false unless a durable, evidence-backed harness update is likely useful. Prefer no-op for task-local or speculative lessons.",
+		"Return shouldRefine=false unless a durable, evidence-backed harness update is likely useful. Prefer no-op for task-local, session-only, speculative, or unqualified project-specific lessons.",
 	].join("\n\n");
 	const response = await completeSimple(
 		model,

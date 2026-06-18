@@ -114,6 +114,12 @@ describe("AgentSession queue characterization", () => {
 		expect(refine).toHaveBeenCalledWith(
 			expect.objectContaining({ instructions: expect.stringContaining("capture the durable lesson") }),
 		);
+		expect(refine).toHaveBeenCalledWith(
+			expect.objectContaining({ instructions: expect.stringContaining("session-only memories") }),
+		);
+		expect(refine).toHaveBeenCalledWith(
+			expect.objectContaining({ instructions: expect.stringContaining("explicitly project-qualified") }),
+		);
 		expect(internals._assistantTurnsSinceAutoRefine).toBe(0);
 	});
 

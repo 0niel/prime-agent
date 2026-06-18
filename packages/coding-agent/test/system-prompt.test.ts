@@ -246,6 +246,8 @@ describe("buildSystemPrompt", () => {
 
 		expect(prompt).toContain("# Global Harness State");
 		expect(prompt).toContain("Persistent harness state is global by default");
+		expect(prompt).toContain("Persistence scope: this store is global/profile-scoped today");
+		expect(prompt).toContain("Project-specific entries should name the project or workspace explicitly");
 		expect(prompt).toContain("When to call `/refine`");
 		expect(prompt).toContain("Call contract: use installed Python skills as `await <skill_import>(...)`");
 		expect(prompt).toContain("Harness skill entries are Python REPL skills");

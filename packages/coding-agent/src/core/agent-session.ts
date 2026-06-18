@@ -429,7 +429,7 @@ function autoRefineInstructions(reason: AutoRefineReason, review: AutoRefineRevi
 		? `
 Reviewer instructions: ${review.instructions}`
 		: "";
-	return `Automatic refine review triggered by ${reason}. Only create/update/delete harness entries if there is clear durable evidence. Prefer an empty edits array over speculative or task-local memories. Reviewer rationale: ${review.rationale}${detail}`;
+	return `Automatic refine review triggered by ${reason}. Only create/update/delete harness entries if there is clear durable evidence that should persist beyond this conversation. Prefer an empty edits array over speculative, task-local, or session-only memories. Persist project-specific lessons only when they are explicitly project-qualified and reusable in future sessions. Reviewer rationale: ${review.rationale}${detail}`;
 }
 
 function parseDepth(value: string | undefined, fallback: number, name: string): number {
