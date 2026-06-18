@@ -222,6 +222,7 @@ export class AgentDaemon {
 	private readonly cronScheduler: AgentCronScheduler;
 	private readonly agentMessageRateLimiter = new AgentSessionMessageRateLimiter();
 	private readonly agentMessagePendingReservations = new Map<string, number>();
+	private readonly agentMessageTargetLocks = new Map<string, Promise<void>>();
 	private agentMessagesPaused = false;
 	private readonly summarizer = new DaemonSessionSummarizer(
 		() => [...this.sessions.values()].filter((state) => state.runtime.metadata.kind !== "subagent"),
@@ -1758,6 +1759,25 @@ export class AgentDaemon {
 		};
 	}
 
+	private async withAgentMessageTargetLock<T>(activeSessionId: string, run: () => Promise<T>): Promise<T> {
+		const previous = this.agentMessageTargetLocks.get(activeSessionId) ?? Promise.resolve();
+		let releaseCurrent: () => void = () => {};
+		const current = new Promise<void>((resolve) => {
+			releaseCurrent = resolve;
+		});
+		const next = previous.catch(() => undefined).then(() => current);
+		this.agentMessageTargetLocks.set(activeSessionId, next);
+		await previous.catch(() => undefined);
+		try {
+			return await run();
+		} finally {
+			releaseCurrent();
+			if (this.agentMessageTargetLocks.get(activeSessionId) === next) {
+				this.agentMessageTargetLocks.delete(activeSessionId);
+			}
+		}
+	}
+
 	private async sendAgentSessionMessage(options: {
 		targetSelector: string;
 		message: string;
@@ -1794,11 +1814,13 @@ export class AgentDaemon {
 		);
 
 		try {
-			await targetState.runtime.session.prompt(createAgentSessionMessagePrompt(payload), {
-				expandPromptTemplates: false,
-				streamingBehavior,
-				source: "rpc",
-			});
+			await this.withAgentMessageTargetLock(targetState.activeSessionId, () =>
+				targetState.runtime.session.prompt(createAgentSessionMessagePrompt(payload), {
+					expandPromptTemplates: false,
+					streamingBehavior,
+					source: "rpc",
+				}),
+			);
 			return createAgentSessionMessageReceipt(payload);
 		} catch (error) {
 			this.agentMessageRateLimiter.refund(rateLimitKey);

@@ -137,6 +137,7 @@ describe("daemon mode helpers", () => {
 			settled = true;
 		});
 		await Promise.resolve();
+		await Promise.resolve();
 
 		expect(prompt).toHaveBeenCalledOnce();
 		expect(settled).toBe(false);
@@ -347,6 +348,77 @@ describe("daemon mode helpers", () => {
 
 		rejectPrompt(new Error("release reservation"));
 		await expect(first).rejects.toThrow("release reservation");
+	});
+
+	it("serializes concurrent agent messages to an idle target", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const fromState = makeState("source");
+		const targetState = makeState("target");
+		fromState.runtime = {
+			...fromState.runtime,
+			session: { sessionId: "session-source", sessionName: "Source" },
+		} as never;
+		const promptResolves: Array<() => void> = [];
+		const prompt = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					promptResolves.push(resolve);
+				}),
+		);
+		targetState.runtime = {
+			...targetState.runtime,
+			cwd: "/tmp",
+			session: {
+				sessionId: "session-target",
+				sessionName: "Target",
+				isStreaming: false,
+				pendingMessageCount: 0,
+				prompt,
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(fromState.activeSessionId, fromState);
+		internals.sessions.set(targetState.activeSessionId, targetState);
+
+		const first = internals.sendAgentSessionMessage({
+			targetSelector: targetState.activeSessionId,
+			message: "first",
+			fromState,
+			origin: "agent",
+		});
+		const second = internals.sendAgentSessionMessage({
+			targetSelector: targetState.activeSessionId,
+			message: "second",
+			fromState,
+			origin: "agent",
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(prompt).toHaveBeenCalledTimes(1);
+
+		promptResolves[0]?.();
+		await expect(first).resolves.toMatchObject({ message: "first" });
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(prompt).toHaveBeenCalledTimes(2);
+
+		promptResolves[1]?.();
+		await expect(second).resolves.toMatchObject({ message: "second" });
 	});
 
 	it("sends dialog extension UI requests only to UI-capable clients", () => {
