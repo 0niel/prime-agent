@@ -17,7 +17,7 @@ export const defaultModelPerProvider: Record<KnownProvider, string> = {
 	openai: "gpt-5.4",
 	"azure-openai-responses": "gpt-5.4",
 	"openai-codex": "gpt-5.5",
-	"prime-inference": "openai/gpt-5.5",
+	"prime-inference": "anthropic/claude-opus-4.8",
 	deepseek: "deepseek-v4-pro",
 	google: "gemini-3.1-pro-preview",
 	"google-vertex": "gemini-3.1-pro-preview",
@@ -535,7 +535,11 @@ export async function findInitialModel(options: {
 
 	// 3. Try saved default from settings
 	if (defaultProvider && defaultModelId) {
-		const found = modelRegistry.find(defaultProvider, defaultModelId);
+		// Rebuild from the provider template when the saved id is missing from this
+		// build's snapshot (e.g. prime-inference catalog churn), so it survives updates.
+		const found =
+			modelRegistry.find(defaultProvider, defaultModelId) ??
+			buildFallbackModel(defaultProvider, defaultModelId, modelRegistry.getAll());
 		if (found && modelRegistry.hasConfiguredAuth(found)) {
 			model = found;
 			if (defaultThinkingLevel) {
