@@ -3000,17 +3000,18 @@ export class AgentSession {
 		if (this._autoRefineReviewer) {
 			return this._autoRefineReviewer(context);
 		}
-		if (!this.model) {
+		const model = this.model;
+		if (!model) {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
-		const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
+		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
 		const harnessStateDir = getGlobalHarnessStateDir();
 		const state = loadHarnessState(harnessStateDir);
 		const history = mergeRefinementHistory(
 			loadGlobalRefinementHistory(harnessStateDir),
 			getRefinementHistory(this.sessionManager.getEntries().filter((entry) => entry.type === "custom")),
 		);
-		return reviewAutoRefine(this.agent.state.messages, state, history, this.model, apiKey, context, headers);
+		return reviewAutoRefine(this.agent.state.messages, state, history, model, apiKey, context, headers);
 	}
 
 	/**
