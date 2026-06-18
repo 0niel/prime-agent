@@ -221,6 +221,7 @@ export class AgentDaemon {
 	private readonly cronStore: AgentCronJobStore;
 	private readonly cronScheduler: AgentCronScheduler;
 	private readonly agentMessageRateLimiter = new AgentSessionMessageRateLimiter();
+	private readonly agentMessagePendingReservations = new Map<string, number>();
 	private agentMessagesPaused = false;
 	private readonly summarizer = new DaemonSessionSummarizer(
 		() => [...this.sessions.values()].filter((state) => state.runtime.metadata.kind !== "subagent"),
@@ -1221,7 +1222,8 @@ export class AgentDaemon {
 
 			case "agent_messages_clear": {
 				const state = this.getSessionState(command.activeSessionId);
-				this.agentMessageRateLimiter.clear(state.activeSessionId);
+				this.agentMessageRateLimiter.clearMatching((key) => key.endsWith(`->${state.activeSessionId}`));
+				this.agentMessagePendingReservations.delete(state.activeSessionId);
 				return success(command.id, "agent_messages_clear", state.runtime.session.clearQueue());
 			}
 
@@ -1734,6 +1736,29 @@ export class AgentDaemon {
 		};
 	}
 
+	private reserveAgentMessageQueueSlot(targetState: ActiveSessionState): () => void {
+		const activeSessionId = targetState.activeSessionId;
+		const reserved = this.agentMessagePendingReservations.get(activeSessionId) ?? 0;
+		assertAgentMessageQueueCapacity(
+			targetState.runtime.session.pendingMessageCount + reserved,
+			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+		);
+		this.agentMessagePendingReservations.set(activeSessionId, reserved + 1);
+		let released = false;
+		return () => {
+			if (released) {
+				return;
+			}
+			released = true;
+			const next = (this.agentMessagePendingReservations.get(activeSessionId) ?? 1) - 1;
+			if (next <= 0) {
+				this.agentMessagePendingReservations.delete(activeSessionId);
+			} else {
+				this.agentMessagePendingReservations.set(activeSessionId, next);
+			}
+		};
+	}
+
 	private async sendAgentSessionMessage(options: {
 		targetSelector: string;
 		message: string;
@@ -1748,14 +1773,12 @@ export class AgentDaemon {
 		const targetSelector = assertDirectAgentMessageTarget(options.targetSelector);
 		const targetState = this.getSessionState(targetSelector);
 		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
-		assertAgentMessageQueueCapacity(
-			targetState.runtime.session.pendingMessageCount,
-			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
-		);
+		const releaseQueueSlot = this.reserveAgentMessageQueueSlot(targetState);
 		const senderKey = options.fromState?.activeSessionId ?? `client:${options.clientId ?? "unknown"}`;
 		const rateLimitKey = `${senderKey}->${targetState.activeSessionId}`;
 		const rateLimit = this.agentMessageRateLimiter.tryConsume(rateLimitKey);
 		if (!rateLimit.ok) {
+			releaseQueueSlot();
 			throw new Error(`Agent messaging rate limit exceeded; retry after ${rateLimit.retryAfterMs}ms`);
 		}
 		const payload: AgentSessionMessagePayload = {
@@ -1771,21 +1794,19 @@ export class AgentDaemon {
 			payload.deliveryMode,
 		);
 
-		return new Promise<AgentSessionMessageReceipt>((resolveReceipt, rejectReceipt) => {
-			void targetState.runtime.session
-				.prompt(createAgentSessionMessagePrompt(payload), {
-					expandPromptTemplates: false,
-					streamingBehavior,
-					source: "rpc",
-				})
-				.then(() => {
-					resolveReceipt(createAgentSessionMessageReceipt(payload));
-				})
-				.catch((error) => {
-					this.agentMessageRateLimiter.refund(rateLimitKey);
-					rejectReceipt(error);
-				});
-		});
+		try {
+			await targetState.runtime.session.prompt(createAgentSessionMessagePrompt(payload), {
+				expandPromptTemplates: false,
+				streamingBehavior,
+				source: "rpc",
+			});
+			return createAgentSessionMessageReceipt(payload);
+		} catch (error) {
+			this.agentMessageRateLimiter.refund(rateLimitKey);
+			throw error;
+		} finally {
+			releaseQueueSlot();
+		}
 	}
 
 	private detachClientFromSession(client: DaemonSocketClient, state: ActiveSessionState): void {

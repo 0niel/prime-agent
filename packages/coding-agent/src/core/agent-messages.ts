@@ -214,6 +214,14 @@ export class AgentSessionMessageRateLimiter {
 		}
 		this.buckets.clear();
 	}
+
+	clearMatching(predicate: (key: string) => boolean): void {
+		for (const key of this.buckets.keys()) {
+			if (predicate(key)) {
+				this.buckets.delete(key);
+			}
+		}
+	}
 }
 
 export function createAgentMessageHostHandlers(

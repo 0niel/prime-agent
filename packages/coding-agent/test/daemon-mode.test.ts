@@ -170,11 +170,13 @@ describe("daemon mode helpers", () => {
 					isStreaming: false,
 					pendingMessageCount: 0,
 					prompt: vi.fn(async () => {}),
+					clearQueue: vi.fn(() => ({ cleared: 0 })),
 				},
 			} as never;
 		}
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
 			sendAgentSessionMessage(options: {
 				targetSelector: string;
 				message: string;
@@ -204,6 +206,19 @@ describe("daemon mode helpers", () => {
 				origin: "agent",
 			}),
 		).rejects.toThrow("Agent messaging rate limit exceeded");
+		await internals.handleCommand(makeClient("client-1", targetA.activeSessionId), {
+			id: "command-1",
+			type: "agent_messages_clear",
+			activeSessionId: targetA.activeSessionId,
+		});
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: targetA.activeSessionId,
+				message: "after clear",
+				fromState,
+				origin: "agent",
+			}),
+		).resolves.toMatchObject({ target: { activeSessionId: targetA.activeSessionId } });
 		await expect(
 			internals.sendAgentSessionMessage({
 				targetSelector: targetB.activeSessionId,
@@ -262,6 +277,69 @@ describe("daemon mode helpers", () => {
 				}),
 			).rejects.toThrow("missing model");
 		}
+	});
+
+	it("counts concurrent agent message queue reservations against the target queue cap", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const fromState = makeState("source");
+		const targetState = makeState("target");
+		fromState.runtime = {
+			...fromState.runtime,
+			session: { sessionId: "session-source", sessionName: "Source" },
+		} as never;
+		let rejectPrompt: (error: Error) => void = () => {};
+		targetState.runtime = {
+			...targetState.runtime,
+			cwd: "/tmp",
+			session: {
+				sessionId: "session-target",
+				sessionName: "Target",
+				isStreaming: true,
+				pendingMessageCount: 19,
+				prompt: vi.fn(
+					() =>
+						new Promise<void>((_resolve, reject) => {
+							rejectPrompt = reject;
+						}),
+				),
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(fromState.activeSessionId, fromState);
+		internals.sessions.set(targetState.activeSessionId, targetState);
+
+		const first = internals.sendAgentSessionMessage({
+			targetSelector: targetState.activeSessionId,
+			message: "first",
+			fromState,
+			origin: "agent",
+		});
+		await Promise.resolve();
+
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: targetState.activeSessionId,
+				message: "second",
+				fromState,
+				origin: "agent",
+			}),
+		).rejects.toThrow("Target session has too many pending messages");
+
+		rejectPrompt(new Error("release reservation"));
+		await expect(first).rejects.toThrow("release reservation");
 	});
 
 	it("sends dialog extension UI requests only to UI-capable clients", () => {
