@@ -106,11 +106,14 @@ describe("marquee TUI components", () => {
 		const component = new IPythonCellComponent(state);
 
 		const collapsed = await renderInVirtualTerminal(component);
-		expect(collapsed).toContain("bash · error · 1.2s");
+		// Collapsed: marker + the bash command + duration + error name, on one line.
+		expect(collapsed).toContain("bash");
+		expect(collapsed).toContain("echo hi");
+		expect(collapsed).not.toContain("%%bash");
+		expect(collapsed).toContain("1.2s");
+		expect(collapsed).toContain("ValueError");
+		expect(collapsed).not.toContain("ValueError: bad");
 		expect(collapsed).not.toContain("ipython");
-		expect(collapsed).toContain("%%bash");
-		expect(collapsed).toContain("hi");
-		expect(collapsed).toContain("ValueError: bad");
 		expect(collapsed).toContain("Ctrl+O to expand");
 		expect(collapsed).not.toContain("traceback collapsed");
 		expect(collapsed).not.toContain('File "<stdin>"');
@@ -159,8 +162,9 @@ describe("marquee TUI components", () => {
 		const component = new IPythonCellComponent(state);
 
 		const collapsed = stripAnsi(component.render(100).join("\n"));
-		expect(collapsed).toContain("cat: /tmp/missing-file: No such file or directory");
+		expect(collapsed).toContain("cat /tmp/missing-file");
 		expect(collapsed).toContain("CalledProcessError · Ctrl+O to expand");
+		expect(collapsed).not.toContain("No such file or directory");
 		expect(collapsed).not.toContain("returned non-zero exit status 1.");
 		expect(collapsed).not.toContain("traceback collapsed");
 		expect(collapsed).not.toContain("get_ipython().run_cell_magic");
@@ -239,18 +243,16 @@ describe("marquee TUI components", () => {
 		const component = new IPythonCellComponent(state);
 
 		const collapsed = stripAnsi(component.render(100).join("\n"));
-		expect(collapsed).toContain("line_0 = 0");
-		expect(collapsed).toContain("line_2 = 2");
-		expect(collapsed).not.toContain("line_3 = 3");
-		expect(collapsed).not.toContain("line_4 = 4");
+		// Collapsed python shows no code — just the input line count and expand hint.
+		expect(collapsed).not.toContain("line_0 = 0");
 		expect(collapsed).not.toContain("line_7 = 7");
-		expect(collapsed).toContain("… +5 lines");
+		expect(collapsed).toContain("↑ 8");
 		expect(collapsed.match(/to expand/g)?.length).toBe(1);
 
 		component.update({ ...state, expanded: true });
 		const expanded = stripAnsi(component.render(100).join("\n"));
+		expect(expanded).toContain("line_0 = 0");
 		expect(expanded).toContain("line_7 = 7");
-		expect(expanded).not.toContain("… +5 lines");
 	});
 
 	test("shows one expand hint when ipython input and output are both collapsed", () => {
@@ -266,24 +268,9 @@ describe("marquee TUI components", () => {
 		});
 
 		const collapsed = stripAnsi(component.render(100).join("\n"));
-		expect(collapsed).toContain("… +5 lines");
-		expect(collapsed).toContain("… +3 lines");
+		// A single status line carries both counts and exactly one expand hint.
+		expect(collapsed).toContain("↑ 8 ↓ 8 lines");
 		expect(collapsed.match(/to expand/g)?.length).toBe(1);
-	});
-
-	test("pluralizes singular collapsed ipython line markers", () => {
-		const component = new IPythonCellComponent({
-			code: Array.from({ length: 4 }, (_, index) => `line_${index} = ${index}`).join("\n"),
-			content: [{ type: "text", text: Array.from({ length: 6 }, (_, index) => `out_${index}`).join("\n") }],
-			details: { status: "ok", durationMs: 15 },
-			executionStarted: true,
-			argsComplete: true,
-			expanded: false,
-		});
-
-		const collapsed = stripAnsi(component.render(100).join("\n"));
-		expect(collapsed.match(/… \+1 line\b/g)?.length).toBe(2);
-		expect(collapsed).not.toContain("… +1 lines");
 	});
 
 	test("reflows cached ipython cells when terminal width changes", () => {
@@ -298,6 +285,8 @@ describe("marquee TUI components", () => {
 			details: { status: "ok", durationMs: 15 },
 			executionStarted: true,
 			argsComplete: true,
+			// Expanded so the long code/output lines wrap and reflow with width.
+			expanded: true,
 		};
 		const component = new IPythonCellComponent(state);
 
@@ -807,18 +796,25 @@ describe("marquee TUI components", () => {
 			isError: false,
 		});
 
+		// Collapsed: routed through the cell renderer (a status line), not the
+		// generic JSON arg dump.
+		const collapsed = stripAnsi(component.render(100).join("\n"));
+		expect(collapsed).toContain("python");
+		expect(collapsed).toContain("12ms");
+		expect(collapsed).not.toContain("ipython");
+		expect(collapsed).not.toContain('"code"');
+
+		// Expanded: full panel with the code and output on the panel background.
+		component.setExpanded(true);
 		const rawOutput = component.render(100).join("\n");
 		expect(rawOutput).toMatch(/\x1b\[48;(?:2|5);/);
-		// The panel background spans the full line with the content padded inside.
 		const panelLine = component.render(100).find((line) => line.includes("\x1b[48;")) ?? "";
 		expect(panelLine.startsWith("\x1b[48;")).toBe(true);
 		expect(panelLine.endsWith("\x1b[49m")).toBe(true);
 		expect(visibleWidth(panelLine)).toBe(100);
-		const output = stripAnsi(rawOutput);
-		expect(output).toContain("python · done · 12ms");
-		expect(output).not.toContain("ipython");
-		expect(output).toContain("print(55)");
-		expect(output).toContain("55");
-		expect(output).not.toContain('"code"');
+		const expanded = stripAnsi(rawOutput);
+		expect(expanded).toContain("print(55)");
+		expect(expanded).toContain("55");
+		expect(expanded).not.toContain('"code"');
 	});
 });

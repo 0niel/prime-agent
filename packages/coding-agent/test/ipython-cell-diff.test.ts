@@ -28,6 +28,7 @@ describe("IPythonCellComponent diff rendering", () => {
 			},
 			executionStarted: true,
 			argsComplete: true,
+			expanded: true,
 		});
 
 		// Header carries the path and the +/- line counts.
@@ -50,6 +51,7 @@ describe("IPythonCellComponent diff rendering", () => {
 			},
 			executionStarted: true,
 			argsComplete: true,
+			expanded: true,
 		}).render(72);
 		// Every rendered line is exactly the panel width (no ragged backgrounds).
 		expect(out.every((line) => stripAnsi(line).length === 72)).toBe(true);
@@ -86,7 +88,9 @@ describe("IPythonCellComponent diff rendering", () => {
 			argsComplete: true,
 			expanded: false,
 		});
-		expect(collapsed).toMatch(/\+\d+ lines/);
+		// Collapsed is a single line: the diff itself is hidden behind the expand hint.
+		expect(collapsed).toContain("to expand");
+		expect(collapsed).not.toContain("ROW");
 
 		const expanded = renderCell({
 			code: "await edit(...)",
@@ -95,7 +99,7 @@ describe("IPythonCellComponent diff rendering", () => {
 			argsComplete: true,
 			expanded: true,
 		});
-		expect(expanded).not.toMatch(/\+\d+ lines/);
+		expect(expanded).toContain("ROW");
 	});
 
 	it("renders multiple diffs from a single cell", () => {
@@ -111,6 +115,7 @@ describe("IPythonCellComponent diff rendering", () => {
 			},
 			executionStarted: true,
 			argsComplete: true,
+			expanded: true,
 		});
 		expect(out).toContain("edit a.py");
 		expect(out).toContain("edit b.py");
