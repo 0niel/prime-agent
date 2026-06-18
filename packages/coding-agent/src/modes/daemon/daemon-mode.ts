@@ -1791,6 +1791,9 @@ export class AgentDaemon {
 		}
 		const targetSelector = assertDirectAgentMessageTarget(options.targetSelector);
 		const targetState = this.getSessionState(targetSelector);
+		if (options.fromState?.activeSessionId === targetState.activeSessionId) {
+			throw new Error("Agent messaging cannot target the sending session");
+		}
 		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
 		const releaseQueueSlot = this.reserveAgentMessageQueueSlot(targetState);
 		const senderKey = options.fromState?.activeSessionId ?? `client:${options.clientId ?? "unknown"}`;
@@ -1808,19 +1811,18 @@ export class AgentDaemon {
 			target: this.createAgentSessionMessageEndpoint(targetState),
 			deliveryMode: options.deliveryMode ?? "auto",
 		};
-		const streamingBehavior = resolveAgentSessionMessageStreamingBehavior(
-			targetState.runtime.session.isStreaming,
-			payload.deliveryMode,
-		);
-
 		try {
-			await this.withAgentMessageTargetLock(targetState.activeSessionId, () =>
-				targetState.runtime.session.prompt(createAgentSessionMessagePrompt(payload), {
+			await this.withAgentMessageTargetLock(targetState.activeSessionId, () => {
+				const streamingBehavior = resolveAgentSessionMessageStreamingBehavior(
+					targetState.runtime.session.isStreaming,
+					payload.deliveryMode,
+				);
+				return targetState.runtime.session.prompt(createAgentSessionMessagePrompt(payload), {
 					expandPromptTemplates: false,
 					streamingBehavior,
 					source: "rpc",
-				}),
-			);
+				});
+			});
 			return createAgentSessionMessageReceipt(payload);
 		} catch (error) {
 			this.agentMessageRateLimiter.refund(rateLimitKey);

@@ -365,7 +365,7 @@ describe("daemon mode helpers", () => {
 		} as never;
 		const promptResolves: Array<() => void> = [];
 		const prompt = vi.fn(
-			() =>
+			(_message: string, _options?: { streamingBehavior?: "steer" | "followUp" }) =>
 				new Promise<void>((resolve) => {
 					promptResolves.push(resolve);
 				}),
@@ -416,9 +416,123 @@ describe("daemon mode helpers", () => {
 		await Promise.resolve();
 
 		expect(prompt).toHaveBeenCalledTimes(2);
+		expect(prompt.mock.calls[1]?.[1]).toMatchObject({ streamingBehavior: undefined });
 
 		promptResolves[1]?.();
 		await expect(second).resolves.toMatchObject({ message: "second" });
+	});
+
+	it("recomputes agent message streaming behavior after waiting for the target lock", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const fromState = makeState("source");
+		const targetState = makeState("target");
+		fromState.runtime = {
+			...fromState.runtime,
+			session: { sessionId: "session-source", sessionName: "Source" },
+		} as never;
+		const promptResolves: Array<() => void> = [];
+		const prompt = vi.fn(
+			(_message: string, _options?: { streamingBehavior?: "steer" | "followUp" }) =>
+				new Promise<void>((resolve) => {
+					promptResolves.push(resolve);
+				}),
+		);
+		targetState.runtime = {
+			...targetState.runtime,
+			cwd: "/tmp",
+			session: {
+				sessionId: "session-target",
+				sessionName: "Target",
+				isStreaming: false,
+				pendingMessageCount: 0,
+				prompt,
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(fromState.activeSessionId, fromState);
+		internals.sessions.set(targetState.activeSessionId, targetState);
+
+		const first = internals.sendAgentSessionMessage({
+			targetSelector: targetState.activeSessionId,
+			message: "first",
+			fromState,
+			origin: "agent",
+		});
+		const second = internals.sendAgentSessionMessage({
+			targetSelector: targetState.activeSessionId,
+			message: "second",
+			fromState,
+			origin: "agent",
+		});
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(prompt).toHaveBeenCalledTimes(1);
+		(targetState.runtime.session as { isStreaming: boolean }).isStreaming = true;
+		promptResolves[0]?.();
+		await expect(first).resolves.toMatchObject({ message: "first" });
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(prompt).toHaveBeenCalledTimes(2);
+		expect(prompt.mock.calls[1]?.[1]).toMatchObject({ streamingBehavior: "followUp" });
+
+		promptResolves[1]?.();
+		await expect(second).resolves.toMatchObject({ message: "second" });
+	});
+
+	it("rejects agent messages to the sending session", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const state = makeState("self");
+		state.runtime = {
+			...state.runtime,
+			cwd: "/tmp",
+			session: {
+				sessionId: "session-self",
+				sessionName: "Self",
+				isStreaming: false,
+				pendingMessageCount: 0,
+				prompt: vi.fn(async () => {}),
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: state.activeSessionId,
+				message: "self",
+				fromState: state,
+				origin: "agent",
+			}),
+		).rejects.toThrow("Agent messaging cannot target the sending session");
+		expect(state.runtime.session.prompt).not.toHaveBeenCalled();
 	});
 
 	it("sends dialog extension UI requests only to UI-capable clients", () => {
