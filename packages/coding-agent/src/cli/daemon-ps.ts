@@ -137,6 +137,11 @@ function scanListeningDaemons(): DiscoveredDaemonProcess[] {
 	return [];
 }
 
+function isDaemonProcessListening(pid: number, socketPath: string): boolean {
+	const target = normalizeSocketPath(socketPath);
+	return scanListeningDaemons().some((daemon) => daemon.pid === pid && daemon.socketPath === target);
+}
+
 function enrichUptimes(daemons: DiscoveredDaemonProcess[]): DiscoveredDaemonProcess[] {
 	const pids = daemons.map((daemon) => daemon.pid);
 	if (pids.length === 0) {
@@ -191,16 +196,18 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 	try {
 		let version: string | undefined;
 		let protocolVersion: number | undefined;
+		let greeted = false;
 		try {
 			const hello = await client.waitForHello(1500);
 			version = hello.appVersion;
 			protocolVersion = hello.protocol.version;
+			greeted = true;
 		} catch {
 			// Connected but no recognizable greeting: an old/foreign daemon.
 		}
 		let sessionCount: number | undefined;
 		try {
-			const response = await client.request({ type: "list" });
+			const response = await client.request({ type: "list" }, greeted ? 30000 : 1500);
 			if (response.success) {
 				const sessions = (response.data as { sessions?: unknown })?.sessions;
 				if (Array.isArray(sessions)) {
@@ -336,6 +343,115 @@ export function planReap(daemons: readonly DaemonInfo[], force: boolean): ReapAc
 	});
 }
 
+export function planShutdownAll(daemons: readonly DaemonInfo[]): ReapAction[] {
+	return daemons.map((daemon): ReapAction => {
+		if (daemon.status === "orphan-file") {
+			return { kind: "remove-file", daemon };
+		}
+		if (daemon.status === "unreachable") {
+			return daemon.pid === undefined ? { kind: "remove-file", daemon } : { kind: "kill", daemon };
+		}
+		return { kind: "shutdown", daemon };
+	});
+}
+
+const SHUTDOWN_ALL_ACTION_ORDER: Record<ReapAction["kind"], number> = {
+	shutdown: 0,
+	"remove-file": 1,
+	kill: 2,
+	skip: 3,
+};
+
+export async function runShutdownAll(json: boolean): Promise<void> {
+	const daemons = await discoverDaemons();
+	const stopped: Array<{ socketPath: string; action: string }> = [];
+	const failed: Array<{ socketPath: string; reason: string }> = [];
+	const handledPids = new Set<number>();
+
+	const actions = [...planShutdownAll(daemons)].sort(
+		(left, right) => SHUTDOWN_ALL_ACTION_ORDER[left.kind] - SHUTDOWN_ALL_ACTION_ORDER[right.kind],
+	);
+
+	for (const action of actions) {
+		const { socketPath, pid } = action.daemon;
+		if (pid !== undefined && handledPids.has(pid)) {
+			removeSocketFile(socketPath);
+			stopped.push({ socketPath, action: `already stopped (pid ${pid})` });
+			continue;
+		}
+		switch (action.kind) {
+			case "remove-file": {
+				if ((await probeDaemon(socketPath)).reachable) {
+					apply(await stopDaemonForcefully(socketPath, pid, handledPids), socketPath, stopped, failed);
+				} else if (removeSocketFile(socketPath)) {
+					stopped.push({ socketPath, action: "removed stale socket file" });
+				} else {
+					failed.push({ socketPath, reason: "could not remove socket file" });
+				}
+				break;
+			}
+			case "kill": {
+				if ((await probeDaemon(socketPath)).reachable) {
+					apply(await stopDaemonForcefully(socketPath, pid, handledPids), socketPath, stopped, failed);
+				} else if (isDaemonProcessListening(pid!, socketPath)) {
+					await forceKillDaemon(pid!);
+					handledPids.add(pid!);
+					removeSocketFile(socketPath);
+					stopped.push({ socketPath, action: `killed unreachable daemon (pid ${pid})` });
+				} else {
+					removeSocketFile(socketPath);
+					stopped.push({ socketPath, action: "daemon already stopped" });
+				}
+				break;
+			}
+			case "shutdown":
+				apply(await stopDaemonForcefully(socketPath, pid, handledPids), socketPath, stopped, failed);
+				break;
+			case "skip":
+				break;
+		}
+	}
+
+	if (json) {
+		console.log(JSON.stringify({ stopped, failed }, null, 2));
+		return;
+	}
+	if (stopped.length === 0 && failed.length === 0) {
+		console.log("No daemons found.");
+		return;
+	}
+	for (const entry of stopped) {
+		console.log(chalk.green(`stopped ${entry.socketPath}: ${entry.action}`));
+	}
+	for (const entry of failed) {
+		console.log(chalk.red(`failed  ${entry.socketPath}: ${entry.reason}`));
+	}
+}
+
+async function stopDaemonForcefully(
+	socketPath: string,
+	pid: number | undefined,
+	handledPids: Set<number>,
+): Promise<ReapOutcome> {
+	if (await shutdownDaemon(socketPath)) {
+		if (pid !== undefined) {
+			handledPids.add(pid);
+		}
+		return { reaped: `stopped daemon${pid ? ` (pid ${pid})` : ""}` };
+	}
+	if (!(await canConnectToSocket(socketPath, 250))) {
+		removeSocketFile(socketPath);
+		return { reaped: "daemon already stopped" };
+	}
+	if (pid === undefined) {
+		return { skipped: "still listening but no pid to kill" };
+	}
+	await forceKillDaemon(pid);
+	handledPids.add(pid);
+	removeSocketFile(socketPath);
+	return { reaped: `force-killed unresponsive daemon (pid ${pid})` };
+}
+
 export async function runReap(json: boolean, force: boolean): Promise<void> {
 	const daemons = await discoverDaemons();
 	const reaped: Array<{ socketPath: string; action: string }> = [];
@@ -449,6 +565,29 @@ function killDaemon(pid: number): void {
 	}
 }
 
+async function forceKillDaemon(pid: number): Promise<void> {
+	killDaemon(pid);
+	const deadline = Date.now() + 1000;
+	while (Date.now() < deadline) {
+		if (!isProcessAlive(pid)) {
+			return;
+		}
+		await delay(50);
+	}
+	try {
+		process.kill(pid, "SIGKILL");
+	} catch {}
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -479,7 +618,7 @@ async function shutdownDaemon(socketPath: string): Promise<boolean> {
 		return false;
 	}
 	try {
-		await client.request({ type: "shutdown" });
+		await client.request({ type: "shutdown" }, 1500);
 	} catch {
 		// The daemon may still stop; the connectivity check below is the source of truth.
 	} finally {

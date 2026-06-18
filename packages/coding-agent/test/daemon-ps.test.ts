@@ -5,6 +5,7 @@ import {
 	parsePsEtimes,
 	parseSsListeners,
 	planReap,
+	planShutdownAll,
 	sortDaemons,
 } from "../src/cli/daemon-ps.js";
 
@@ -127,6 +128,31 @@ describe("planReap", () => {
 		const phantom = plan.find((action) => action.daemon.socketPath === "/tmp/phantom.sock");
 		expect(phantom?.kind).toBe("skip");
 		expect(phantom && phantom.kind === "skip" ? phantom.reason : "").toContain("also backs another daemon");
+	});
+});
+
+describe("planShutdownAll", () => {
+	it("targets every daemon reap would skip", () => {
+		const plan = planShutdownAll([
+			makeDaemon({ socketPath: "/tmp/default.sock", status: "current", isDefault: true, sessionCount: 0, pid: 1 }),
+			makeDaemon({ socketPath: "/tmp/busy.sock", status: "current", sessionCount: 3, pid: 2 }),
+			makeDaemon({ socketPath: "/tmp/hung.sock", status: "unreachable", pid: 7 }),
+			makeDaemon({ socketPath: "/tmp/orphan.sock", status: "orphan-file" }),
+		]);
+		expect(plan.map((action) => action.kind)).toEqual(["shutdown", "shutdown", "kill", "remove-file"]);
+	});
+
+	it("never skips a daemon", () => {
+		const plan = planShutdownAll([
+			makeDaemon({ socketPath: "/tmp/a.sock", status: "stale", pid: 9 }),
+			makeDaemon({ socketPath: "/tmp/b.sock", status: "unreachable", pid: 10 }),
+		]);
+		expect(plan.some((action) => action.kind === "skip")).toBe(false);
+	});
+
+	it("removes the socket file for an unreachable daemon with no pid", () => {
+		const plan = planShutdownAll([makeDaemon({ socketPath: "/tmp/c.sock", status: "unreachable" })]);
+		expect(plan[0]!.kind).toBe("remove-file");
 	});
 });
 
