@@ -125,9 +125,11 @@ import {
 	appendGlobalRefinement,
 	applyRefinementProposal,
 	getGlobalHarnessStateDir,
+	getLocalHarnessStateDir,
 	getRefinementHistory,
 	loadGlobalRefinementHistory,
 	loadHarnessState,
+	mergeHarnessStates,
 	mergeRefinementHistory,
 	planRefinement,
 	type RefinementResult,
@@ -429,7 +431,7 @@ function autoRefineInstructions(reason: AutoRefineReason, review: AutoRefineRevi
 		? `
 Reviewer instructions: ${review.instructions}`
 		: "";
-	return `Automatic refine review triggered by ${reason}. Only create/update/delete harness entries if there is clear durable evidence that should persist beyond this conversation. Prefer an empty edits array over speculative, task-local, or session-only memories. Persist project-specific lessons only when they are explicitly project-qualified and reusable in future sessions. Reviewer rationale: ${review.rationale}${detail}`;
+	return `Automatic refine review triggered by ${reason}. Only create/update/delete local harness entries if there is clear evidence that should help this session continue. Prefer an empty edits array over speculative or one-off memories. Do not promote anything global unless explicitly requested. Reviewer rationale: ${review.rationale}${detail}`;
 }
 
 function parseDepth(value: string | undefined, fallback: number, name: string): number {
@@ -2067,7 +2069,12 @@ export class AgentSession {
 			toolSnippets,
 			promptGuidelines,
 			allowRecursion: this._rlmDepth < this._rlmMaxDepth,
-			harnessState: loadHarnessState(getGlobalHarnessStateDir()),
+			harnessState: mergeHarnessStates(
+				loadHarnessState(getGlobalHarnessStateDir(), "global"),
+				this.sessionManager.getSessionArtifactDir()
+					? loadHarnessState(getLocalHarnessStateDir(this.sessionManager.getSessionArtifactDir())!, "local")
+					: undefined,
+			),
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
@@ -3107,7 +3114,11 @@ export class AgentSession {
 		}
 		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
 		const harnessStateDir = getGlobalHarnessStateDir();
-		const state = loadHarnessState(harnessStateDir);
+		const localHarnessStateDir = getLocalHarnessStateDir(this.sessionManager.getSessionArtifactDir());
+		const state = mergeHarnessStates(
+			loadHarnessState(harnessStateDir, "global"),
+			localHarnessStateDir ? loadHarnessState(localHarnessStateDir, "local") : undefined,
+		);
 		const history = mergeRefinementHistory(
 			loadGlobalRefinementHistory(harnessStateDir),
 			getRefinementHistory(this.sessionManager.getEntries().filter((entry) => entry.type === "custom")),
@@ -3119,7 +3130,9 @@ export class AgentSession {
 	 * Refine editable harness state: prompt notes, memory, skills, and subagent specs.
 	 * The base system prompt is intentionally not editable through this path.
 	 */
-	async refine(options: { instructions?: string; rollbackId?: string } = {}): Promise<RefinementResult> {
+	async refine(
+		options: { instructions?: string; rollbackId?: string; global?: boolean } = {},
+	): Promise<RefinementResult> {
 		this._disconnectFromAgent();
 
 		try {
@@ -3130,13 +3143,19 @@ export class AgentSession {
 			}
 
 			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
-			const harnessStateDir = getGlobalHarnessStateDir();
-			const planningState = loadHarnessState(harnessStateDir);
-			// Harness state is global, so rollback history must be too: merge the global
-			// cross-session log with this session's entries so a refinement applied in any
-			// session can be rolled back from here.
+			const globalHarnessStateDir = getGlobalHarnessStateDir();
+			const localHarnessStateDir = getLocalHarnessStateDir(this.sessionManager.getSessionArtifactDir());
+			const targetScope = options.global ? "global" : "local";
+			if (!options.global && !localHarnessStateDir) {
+				throw new Error("Local harness refinement requires a persisted session; use global refinement instead.");
+			}
+			const targetHarnessStateDir = options.global ? globalHarnessStateDir : localHarnessStateDir!;
+			const planningState = mergeHarnessStates(
+				loadHarnessState(globalHarnessStateDir, "global"),
+				localHarnessStateDir ? loadHarnessState(localHarnessStateDir, "local") : undefined,
+			);
 			const history = mergeRefinementHistory(
-				loadGlobalRefinementHistory(harnessStateDir),
+				loadGlobalRefinementHistory(globalHarnessStateDir),
 				getRefinementHistory(this.sessionManager.getEntries().filter((entry) => entry.type === "custom")),
 			);
 			const plan = await planRefinement(
@@ -3150,12 +3169,18 @@ export class AgentSession {
 				undefined,
 				this.thinkingLevel,
 			);
-			// Re-read the shared state immediately before applying so concurrent kernel
-			// (`rlm.harness`) or cross-session writes during the LLM pass are not clobbered.
-			const state = loadHarnessState(harnessStateDir);
-			const result = applyRefinementProposal(state, plan.proposal, { id: plan.id, rollbackOf: plan.rollbackOf });
-			result.harnessStatePath = saveHarnessState(harnessStateDir, state);
-			appendGlobalRefinement(harnessStateDir, result);
+			// Re-read the target state immediately before applying so concurrent kernel
+			// (`rlm.harness`) writes during the LLM pass are not clobbered.
+			const state = loadHarnessState(targetHarnessStateDir, targetScope);
+			const result = applyRefinementProposal(state, plan.proposal, {
+				id: plan.id,
+				rollbackOf: plan.rollbackOf,
+				scope: targetScope,
+			});
+			result.harnessStatePath = saveHarnessState(targetHarnessStateDir, state);
+			if (options.global) {
+				appendGlobalRefinement(globalHarnessStateDir, result);
+			}
 			this.sessionManager.appendCustomEntry("prime-agent.refinement", result);
 			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 			this.agent.state.systemPrompt = this._baseSystemPrompt;
@@ -3919,11 +3944,12 @@ export class AgentSession {
 		const env: Record<string, string> = {
 			RLM_DEPTH: String(this._rlmDepth),
 			RLM_MAX_DEPTH: String(this._rlmMaxDepth),
-			RLM_HARNESS_STATE_DIR: getGlobalHarnessStateDir(),
+			RLM_GLOBAL_HARNESS_STATE_DIR: getGlobalHarnessStateDir(),
 		};
 		const rlmSessionDir = this._ensureRlmSessionDir();
 		if (rlmSessionDir) {
 			env.RLM_SESSION_DIR = rlmSessionDir;
+			env.RLM_HARNESS_STATE_DIR = getLocalHarnessStateDir(rlmSessionDir)!;
 		}
 		return env;
 	}

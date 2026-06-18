@@ -282,7 +282,9 @@ export class InProcessAgentConnection implements AgentConnection {
 		return this.session.compact(customInstructions);
 	}
 
-	async refine(options: { instructions?: string; rollbackId?: string } = {}): Promise<RefinementResult> {
+	async refine(
+		options: { instructions?: string; rollbackId?: string; global?: boolean } = {},
+	): Promise<RefinementResult> {
 		return this.session.refine(options);
 	}
 

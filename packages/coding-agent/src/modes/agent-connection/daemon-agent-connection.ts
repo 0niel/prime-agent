@@ -524,13 +524,16 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
-	async refine(options: { instructions?: string; rollbackId?: string } = {}): Promise<RefinementResult> {
+	async refine(
+		options: { instructions?: string; rollbackId?: string; global?: boolean } = {},
+	): Promise<RefinementResult> {
 		return this.requestData<RefinementResult>(
 			{
 				type: "refine",
 				activeSessionId: this.activeSessionId,
 				instructions: options.instructions,
 				rollbackId: options.rollbackId,
+				global: options.global,
 			},
 			DAEMON_REFINE_REQUEST_TIMEOUT_MS,
 		);

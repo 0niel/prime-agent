@@ -10,11 +10,13 @@ import {
 	applyRefinementProposal,
 	getGlobalHarnessStateDir,
 	getHarnessStatePath,
+	getLocalHarnessStateDir,
 	getRefinementHistory,
 	getRefinementHistoryPath,
 	type HarnessState,
 	loadGlobalRefinementHistory,
 	loadHarnessState,
+	mergeHarnessStates,
 	mergeRefinementHistory,
 	planRefinement,
 	type RefinementAction,
@@ -466,9 +468,54 @@ describe("harness refinement", () => {
 		expect(getHarnessStatePath(harnessDir)).toBe(join(agentDir, "harness", "harness_state.json"));
 	});
 
+	it("uses a local harness state directory under the session artifact dir", () => {
+		const artifactDir = makeTempDir();
+
+		expect(getLocalHarnessStateDir(artifactDir)).toBe(join(artifactDir, "harness"));
+		expect(getLocalHarnessStateDir(undefined)).toBeUndefined();
+	});
+
+	it("merges global and local harness state with local entries taking precedence", () => {
+		const root = makeTempDir();
+		const globalState = loadHarnessState(join(root, "global"), "global");
+		const localState = loadHarnessState(join(root, "local"), "local");
+		applyRefinementProposal(
+			globalState,
+			proposal("Global note", [
+				{
+					action: "create",
+					kind: "memory",
+					id: "shared",
+					title: "Shared",
+					content: "Global content.",
+				},
+			]),
+			{ id: "refine_global", scope: "global" },
+		);
+		applyRefinementProposal(
+			localState,
+			proposal("Local note", [
+				{
+					action: "create",
+					kind: "memory",
+					id: "shared",
+					title: "Shared",
+					content: "Local content.",
+				},
+			]),
+			{ id: "refine_local", scope: "local" },
+		);
+
+		const merged = mergeHarnessStates(globalState, localState);
+
+		expect(merged.entries.memory.shared.content).toBe("Local content.");
+		expect(merged.entries.memory.shared.scope).toBe("local");
+		expect(globalState.entries.memory.shared.scope).toBe("global");
+	});
+
 	it("persists harness state in the selected harness directory", () => {
 		const dir = makeTempDir();
-		const state = loadHarnessState(dir);
+		const state = loadHarnessState(dir, "local");
 		applyRefinementProposal(
 			state,
 			{
@@ -489,10 +536,11 @@ describe("harness refinement", () => {
 		);
 
 		const statePath = saveHarnessState(dir, state);
-		const reloaded = loadHarnessState(dir);
+		const reloaded = loadHarnessState(dir, "local");
 
 		expect(statePath.endsWith("harness_state.json")).toBe(true);
 		expect(reloaded.entries.prompt.focused_edits.content).toBe("Prefer small harness edits.");
+		expect(reloaded.entries.prompt.focused_edits.scope).toBe("local");
 		expect(reloaded.refinements[0]).toMatchObject({
 			id: "refine_1",
 			trigger: "Add prompt note",
@@ -850,10 +898,10 @@ describe("harness refinement", () => {
 
 		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
 		expect(completeSimpleMock.mock.calls[0][1]).toMatchObject({
-			systemPrompt: expect.stringContaining("The current editable harness store is global/profile-scoped"),
+			systemPrompt: expect.stringContaining("The default editable harness store is local"),
 		});
 		expect(completeSimpleMock.mock.calls[0][1]).toMatchObject({
-			systemPrompt: expect.stringContaining("Return an empty `edits` array for session-only progress"),
+			systemPrompt: expect.stringContaining("A caller may explicitly request global refinement"),
 		});
 		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({
 			maxTokens: 4096,

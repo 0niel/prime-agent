@@ -7013,9 +7013,15 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 	}
 
 	private async handleRefineCommand(args?: string): Promise<void> {
-		const trimmedArgs = args?.trim();
+		let trimmedArgs = args?.trim() ?? "";
+		const globalPrefix = "--global";
+		const global = trimmedArgs === globalPrefix || trimmedArgs?.startsWith(`${globalPrefix} `) === true;
+		if (global) {
+			trimmedArgs = trimmedArgs === globalPrefix ? "" : trimmedArgs.slice(globalPrefix.length).trim();
+		}
+		const globalOption = global ? { global: true } : {};
 		const rollbackPrefix = "rollback ";
-		let options: { instructions?: string; rollbackId?: string };
+		let options: { instructions?: string; rollbackId?: string; global?: boolean };
 
 		if (trimmedArgs === "rollback") {
 			this.showWarning("Usage: /refine rollback <refinement-id>");
@@ -7025,7 +7031,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 		if (trimmedArgs?.startsWith(rollbackPrefix) && trimmedArgs.slice(rollbackPrefix.length).trim()) {
 			// Rollback uses the global refinement history, not the current trajectory,
 			// so it must work even in a fresh session with no messages yet.
-			options = { rollbackId: trimmedArgs.slice(rollbackPrefix.length).trim() };
+			options = { rollbackId: trimmedArgs.slice(rollbackPrefix.length).trim(), ...globalOption };
 		} else {
 			let messageCount: number;
 			try {
@@ -7040,12 +7046,14 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 				this.showWarning("Nothing to refine (no trajectory yet)");
 				return;
 			}
-			options = { instructions: args };
+			options = { instructions: trimmedArgs || undefined, ...globalOption };
 		}
 
 		this.stopWorkingLoader();
 		this.showStatus(
-			options.rollbackId ? `Rolling back refinement ${options.rollbackId}...` : "Refining harness state...",
+			options.rollbackId
+				? `Rolling back refinement ${options.rollbackId}...`
+				: `Refining ${global ? "global" : "local"} harness state...`,
 		);
 
 		try {

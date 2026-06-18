@@ -115,10 +115,10 @@ describe("AgentSession queue characterization", () => {
 			expect.objectContaining({ instructions: expect.stringContaining("capture the durable lesson") }),
 		);
 		expect(refine).toHaveBeenCalledWith(
-			expect.objectContaining({ instructions: expect.stringContaining("session-only memories") }),
+			expect.objectContaining({ instructions: expect.stringContaining("local harness entries") }),
 		);
 		expect(refine).toHaveBeenCalledWith(
-			expect.objectContaining({ instructions: expect.stringContaining("explicitly project-qualified") }),
+			expect.objectContaining({ instructions: expect.stringContaining("Do not promote anything global") }),
 		);
 		expect(internals._assistantTurnsSinceAutoRefine).toBe(0);
 	});

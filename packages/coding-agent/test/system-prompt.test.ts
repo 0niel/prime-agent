@@ -77,7 +77,7 @@ describe("buildRlmPrompt", () => {
 				"",
 				`The kernel has these Python imports available: ${DEFAULT_RLM_EXTRA_IMPORT_LABELS.join(", ")}. Import them directly; no pip install needed.`,
 				"",
-				"Global continual harness state is available as `rlm.harness` and `rlm.get_harness_state()`. Use it to record reset-free improvements to prompt notes, memory, reusable skills, and subagent specs that should persist across Prime Agent sessions. Use explicit CRUD calls such as `rlm.harness.create_memory(...)`, `rlm.harness.update_memory(...)`, `rlm.harness.delete_memory(...)`, `rlm.harness.create_skill(...)`, `rlm.harness.update_skill(...)`, `rlm.harness.delete_skill(...)`, `rlm.harness.create_subagent(...)`, `rlm.harness.update_subagent(...)`, `rlm.harness.delete_subagent(...)`, `rlm.harness.create_prompt_note(...)`, `rlm.harness.update_prompt_note(...)`, `rlm.harness.delete_prompt_note(...)`, plus `rlm.harness.record_refinement(...)` and `rlm.harness.overview()`.",
+				"Continual harness state is available as `rlm.harness` and `rlm.get_harness_state()`. CRUD calls are local to this Prime Agent session by default: `rlm.harness.create_memory(...)`, `rlm.harness.update_memory(...)`, `rlm.harness.delete_memory(...)`, `rlm.harness.create_skill(...)`, `rlm.harness.update_skill(...)`, `rlm.harness.delete_skill(...)`, `rlm.harness.create_subagent(...)`, `rlm.harness.update_subagent(...)`, `rlm.harness.delete_subagent(...)`, `rlm.harness.create_prompt_note(...)`, `rlm.harness.update_prompt_note(...)`, `rlm.harness.delete_prompt_note(...)`, plus `rlm.harness.record_refinement(...)` and `rlm.harness.overview()`. Use `global_=True` only for stable cross-session lessons; Python reserves `global`, so literal `global=True` is invalid syntax.",
 				"",
 				"RLM-native call contract for refined entries: installed Python skills are called from IPython as `await <skill_import>(...)` with keyword arguments, or as `<skill_import> ...` from shell when a CLI exists. Harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Harness subagent entries are reusable delegation specs; invoke them by turning the spec into a concise task prompt and calling `await rlm('sub-task')`, or `await asyncio.gather(rlm('task1'), rlm('task2'))` for independent parallel subagents. Do not invent non-native wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
 				"",
@@ -244,10 +244,10 @@ describe("buildSystemPrompt", () => {
 			harnessState,
 		});
 
-		expect(prompt).toContain("# Global Harness State");
-		expect(prompt).toContain("Persistent harness state is global by default");
-		expect(prompt).toContain("Persistence scope: this store is global/profile-scoped today");
-		expect(prompt).toContain("Project-specific entries should name the project or workspace explicitly");
+		expect(prompt).toContain("# Continual Harness State");
+		expect(prompt).toContain("Local harness entries belong to this Prime Agent session");
+		expect(prompt).toContain("The entries below are compact summaries, not full descriptions");
+		expect(prompt).toContain("Use global only for stable cross-session lessons");
 		expect(prompt).toContain("When to call `/refine`");
 		expect(prompt).toContain("Call contract: use installed Python skills as `await <skill_import>(...)`");
 		expect(prompt).toContain("Harness skill entries are Python REPL skills");
@@ -256,13 +256,13 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("after a repeated failure");
 		expect(prompt).toContain("a reusable tactic emerges");
 		expect(prompt).toContain("validation shows a harness entry is wrong");
-		expect(prompt).toContain("[focused_edits] Focused edits (policy, v1)");
-		expect(prompt).toContain("[validation] Validation (repo/prime-agent, v2): Run `npm run check`");
-		expect(prompt).toContain("[review_refinement] Review refinement (quality, v1)");
-		expect(prompt).toContain("[refinement_reviewer] Refinement reviewer (review, v1)");
+		expect(prompt).toContain("[global:focused_edits] Focused edits (policy, v1)");
+		expect(prompt).toContain("[global:validation] Validation (repo/prime-agent, v2): Run `npm run check`");
+		expect(prompt).toContain("[global:review_refinement] Review refinement (quality, v1)");
+		expect(prompt).toContain("[global:refinement_reviewer] Refinement reviewer (review, v1)");
 		expect(prompt).toContain("recent refinements: 1");
 		expect(prompt).toContain("[refine_1] Observed validation miss: create memory:validation");
-		expect(prompt.indexOf("# Global Harness State")).toBeGreaterThan(prompt.indexOf("Conversation log:"));
+		expect(prompt.indexOf("# Continual Harness State")).toBeGreaterThan(prompt.indexOf("Conversation log:"));
 	});
 
 	test("keeps injected harness context compact", () => {
@@ -344,10 +344,9 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("Avoid `!cmd` shell escapes for project commands");
 		expect(prompt).toContain("Each `%%bash` cell runs in a throw-away subshell");
 		expect(prompt).toContain("Python state in the kernel, by contrast, persists across cells");
-		expect(prompt).toContain("Global continual harness state is available as `rlm.harness`");
-		expect(prompt).toContain(
-			"record reset-free improvements to prompt notes, memory, reusable skills, and subagent specs",
-		);
+		expect(prompt).toContain("Continual harness state is available as `rlm.harness`");
+		expect(prompt).toContain("CRUD calls are local to this Prime Agent session by default");
+		expect(prompt).toContain("global_=True");
 		expect(prompt).toContain("rlm.harness.create_memory");
 		expect(prompt).toContain("rlm.harness.update_skill");
 		expect(prompt).toContain("rlm.harness.delete_subagent");
@@ -414,13 +413,15 @@ describe("buildSystemPrompt", () => {
 		});
 
 		expect(prompt).toContain("custom body");
-		expect(prompt).toContain("# Global Harness State");
-		expect(prompt).toContain("[custom_memory] Custom memory (custom, v1)");
+		expect(prompt).toContain("# Continual Harness State");
+		expect(prompt).toContain("[global:custom_memory] Custom memory (custom, v1)");
 		expect(prompt).not.toContain("# IPython Kernel Guidance");
 		expect(prompt).not.toContain("You are a general purpose agent that uses code to solve tasks.");
-		expect(prompt.indexOf("Current working directory: /repo")).toBeLessThan(prompt.indexOf("# Global Harness State"));
+		expect(prompt.indexOf("Current working directory: /repo")).toBeLessThan(
+			prompt.indexOf("# Continual Harness State"),
+		);
 		expect(prompt.indexOf("Current working directory: /repo")).toBeLessThan(prompt.indexOf("custom append"));
-		expect(prompt.indexOf("# Global Harness State")).toBeLessThan(prompt.indexOf("custom append"));
+		expect(prompt.indexOf("# Continual Harness State")).toBeLessThan(prompt.indexOf("custom append"));
 	});
 
 	test("append system prompt content is included after the rlm harness prompt", () => {
