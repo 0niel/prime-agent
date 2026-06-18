@@ -146,6 +146,124 @@ describe("daemon mode helpers", () => {
 		await expect(send).rejects.toThrow("target turn failed");
 	});
 
+	it("rate limits agent messages per sender and target pair", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const fromState = makeState("source");
+		const targetA = makeState("target-a");
+		const targetB = makeState("target-b");
+		fromState.runtime = {
+			...fromState.runtime,
+			session: { sessionId: "session-source", sessionName: "Source" },
+		} as never;
+		for (const targetState of [targetA, targetB]) {
+			targetState.runtime = {
+				...targetState.runtime,
+				cwd: "/tmp",
+				session: {
+					sessionId: `session-${targetState.activeSessionId}`,
+					sessionName: targetState.activeSessionId,
+					isStreaming: false,
+					pendingMessageCount: 0,
+					prompt: vi.fn(async () => {}),
+				},
+			} as never;
+		}
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(fromState.activeSessionId, fromState);
+		internals.sessions.set(targetA.activeSessionId, targetA);
+		internals.sessions.set(targetB.activeSessionId, targetB);
+
+		for (let i = 0; i < 3; i++) {
+			await expect(
+				internals.sendAgentSessionMessage({
+					targetSelector: targetA.activeSessionId,
+					message: `message ${i}`,
+					fromState,
+					origin: "agent",
+				}),
+			).resolves.toMatchObject({ target: { activeSessionId: targetA.activeSessionId } });
+		}
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: targetA.activeSessionId,
+				message: "over limit",
+				fromState,
+				origin: "agent",
+			}),
+		).rejects.toThrow("Agent messaging rate limit exceeded");
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: targetB.activeSessionId,
+				message: "different target",
+				fromState,
+				origin: "agent",
+			}),
+		).resolves.toMatchObject({ target: { activeSessionId: targetB.activeSessionId } });
+	});
+
+	it("refunds agent message rate limit tokens when delivery fails", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const fromState = makeState("source");
+		const targetState = makeState("target");
+		fromState.runtime = {
+			...fromState.runtime,
+			session: { sessionId: "session-source", sessionName: "Source" },
+		} as never;
+		targetState.runtime = {
+			...targetState.runtime,
+			cwd: "/tmp",
+			session: {
+				sessionId: "session-target",
+				sessionName: "Target",
+				isStreaming: false,
+				pendingMessageCount: 0,
+				prompt: vi.fn(async () => {
+					throw new Error("missing model");
+				}),
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(fromState.activeSessionId, fromState);
+		internals.sessions.set(targetState.activeSessionId, targetState);
+
+		for (let i = 0; i < 4; i++) {
+			await expect(
+				internals.sendAgentSessionMessage({
+					targetSelector: targetState.activeSessionId,
+					message: `message ${i}`,
+					fromState,
+					origin: "agent",
+				}),
+			).rejects.toThrow("missing model");
+		}
+	});
+
 	it("sends dialog extension UI requests only to UI-capable clients", () => {
 		const lineClient = makeClient("line-client", "active", false);
 		const uiClient = makeClient("ui-client", "active", true);

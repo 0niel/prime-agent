@@ -198,6 +198,15 @@ export class AgentSessionMessageRateLimiter {
 		return { ok: true };
 	}
 
+	refund(key: string): void {
+		const bucket = this.buckets.get(key);
+		if (!bucket) {
+			return;
+		}
+		bucket.tokens = Math.min(this.capacity, bucket.tokens + 1);
+		this.buckets.set(key, bucket);
+	}
+
 	clear(key?: string): void {
 		if (key) {
 			this.buckets.delete(key);

@@ -1753,7 +1753,8 @@ export class AgentDaemon {
 			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 		);
 		const senderKey = options.fromState?.activeSessionId ?? `client:${options.clientId ?? "unknown"}`;
-		const rateLimit = this.agentMessageRateLimiter.tryConsume(senderKey);
+		const rateLimitKey = `${senderKey}->${targetState.activeSessionId}`;
+		const rateLimit = this.agentMessageRateLimiter.tryConsume(rateLimitKey);
 		if (!rateLimit.ok) {
 			throw new Error(`Agent messaging rate limit exceeded; retry after ${rateLimit.retryAfterMs}ms`);
 		}
@@ -1776,16 +1777,12 @@ export class AgentDaemon {
 					expandPromptTemplates: false,
 					streamingBehavior,
 					source: "rpc",
-					preflightResult: (didSucceed) => {
-						if (!didSucceed) {
-							rejectReceipt(new Error("Agent message prompt preflight failed"));
-						}
-					},
 				})
 				.then(() => {
 					resolveReceipt(createAgentSessionMessageReceipt(payload));
 				})
 				.catch((error) => {
+					this.agentMessageRateLimiter.refund(rateLimitKey);
 					rejectReceipt(error);
 				});
 		});

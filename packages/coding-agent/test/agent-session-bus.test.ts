@@ -122,6 +122,9 @@ describe("agent session bus", () => {
 		expect(limiter.tryConsume("sender")).toEqual({ ok: true });
 		expect(limiter.tryConsume("other")).toEqual({ ok: true });
 
+		limiter.refund("sender");
+		expect(limiter.tryConsume("sender")).toEqual({ ok: true });
+
 		limiter.clear("sender");
 		expect(limiter.tryConsume("sender")).toEqual({ ok: true });
 	});
