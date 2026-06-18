@@ -17,6 +17,7 @@ type AutoRefineInternals = {
 	_lastAutoRefineReviewAt: number;
 	_compactAutoRefinePending: boolean;
 	_pendingAutoRefineReview?: unknown;
+	_autoRefineInProgress: boolean;
 };
 
 function emptyRefinementResult(): RefinementResult {
@@ -230,6 +231,32 @@ describe("AgentSession queue characterization", () => {
 		expect(refine).toHaveBeenCalledWith(
 			expect.objectContaining({ instructions: expect.stringContaining("durable lesson") }),
 		);
+		expect(internals._pendingAutoRefineReview).toBeUndefined();
+	});
+
+	it("auto-refine pending review uses the in-progress guard and catches refine failures", async () => {
+		const harness = await createHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 } },
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._pendingAutoRefineReview = {
+			reason: "turn_interval",
+			review: { shouldRefine: true, rationale: "durable lesson" },
+		};
+		let guardWasSetDuringRefine = false;
+		const refine = vi.spyOn(harness.session, "refine").mockImplementation(async () => {
+			guardWasSetDuringRefine = internals._autoRefineInProgress;
+			throw new Error("refine failed");
+		});
+
+		await internals._maybeAutoRefine("turn_interval");
+
+		expect(refine).toHaveBeenCalledWith(
+			expect.objectContaining({ instructions: expect.stringContaining("durable lesson") }),
+		);
+		expect(guardWasSetDuringRefine).toBe(true);
+		expect(internals._autoRefineInProgress).toBe(false);
 		expect(internals._pendingAutoRefineReview).toBeUndefined();
 	});
 

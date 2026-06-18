@@ -3021,11 +3021,18 @@ export class AgentSession {
 
 		const pendingReview = this._pendingAutoRefineReview;
 		if (pendingReview) {
-			this._pendingAutoRefineReview = undefined;
-			if (pendingReview.reason === "compact") {
-				this._compactAutoRefinePending = false;
+			this._autoRefineInProgress = true;
+			try {
+				this._pendingAutoRefineReview = undefined;
+				if (pendingReview.reason === "compact") {
+					this._compactAutoRefinePending = false;
+				}
+				await this.refine({ instructions: autoRefineInstructions(pendingReview.reason, pendingReview.review) });
+			} catch {
+				// Auto-refine is opportunistic; manual /refine remains available.
+			} finally {
+				this._autoRefineInProgress = false;
 			}
-			await this.refine({ instructions: autoRefineInstructions(pendingReview.reason, pendingReview.review) });
 			return;
 		}
 
