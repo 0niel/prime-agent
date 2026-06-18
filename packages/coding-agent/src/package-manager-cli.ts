@@ -1,6 +1,14 @@
+import { createInterface } from "node:readline";
 import chalk from "chalk";
 import { spawn } from "child_process";
 import { selectConfig } from "./cli/config-selector.js";
+import {
+	ensureInteractiveDaemonRunning,
+	isSessionBusy,
+	probeRunningDaemonSessions,
+	type RunningDaemonProbe,
+	shutdownDaemonAndWait,
+} from "./cli/daemon-launch.js";
 import {
 	APP_NAME,
 	CONFIG_DIR_NAME,
@@ -13,6 +21,7 @@ import {
 } from "./config.js";
 import { DefaultPackageManager } from "./core/package-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
+import { defaultDaemonSocketPath } from "./modes/daemon/daemon-socket.js";
 import { shouldUseWindowsShell } from "./utils/child-process.js";
 import { getLatestPiRelease, isNewerPackageVersion } from "./utils/version-check.js";
 
@@ -346,6 +355,69 @@ async function runSelfUpdate(command: SelfUpdateCommand): Promise<void> {
 	}
 }
 
+function promptUpdateConfirm(message: string): Promise<boolean> {
+	return new Promise((resolve) => {
+		const rl = createInterface({ input: process.stdin, output: process.stdout });
+		rl.question(`${message} [y/N] `, (answer) => {
+			rl.close();
+			const normalized = answer.trim().toLowerCase();
+			resolve(normalized === "y" || normalized === "yes");
+		});
+	});
+}
+
+// Returns false when the update should be aborted to avoid terminating live sessions.
+// Only busy sessions (streaming, compacting, or pending messages) would lose work;
+// idle loaded sessions reload from disk on the fresh daemon.
+async function confirmDaemonSessionLossBeforeUpdate(probe: RunningDaemonProbe, force: boolean): Promise<boolean> {
+	if (!probe.reachable || force) {
+		return true;
+	}
+	let detail: string;
+	if (probe.activeSessions === undefined) {
+		// Reachable but couldn't list sessions: assume work may be lost.
+		detail =
+			"A running daemon's sessions could not be listed. Updating will stop the daemon and may terminate active sessions.";
+	} else {
+		const busySessions = probe.activeSessions.filter(isSessionBusy);
+		if (busySessions.length === 0) {
+			return true;
+		}
+		const count = busySessions.length;
+		const noun = count === 1 ? "session" : "sessions";
+		const pronoun = count === 1 ? "it" : "them";
+		detail = `The running daemon has ${count} busy ${noun}. Updating will stop the daemon and terminate ${pronoun}.`;
+	}
+	if (!process.stdin.isTTY) {
+		console.error(chalk.red(`${detail} Re-run with --force to proceed.`));
+		return false;
+	}
+	return promptUpdateConfirm(`${detail} Continue?`);
+}
+
+async function restartDaemonAfterSelfUpdate(socketPath: string, daemonWasRunning: boolean): Promise<void> {
+	if (!daemonWasRunning) {
+		return;
+	}
+	const stopped = await shutdownDaemonAndWait(socketPath);
+	if (!stopped) {
+		console.error(
+			chalk.yellow(`Warning: could not stop the old daemon on ${socketPath}; it will be replaced on next launch.`),
+		);
+		return;
+	}
+	try {
+		await ensureInteractiveDaemonRunning(socketPath);
+	} catch (error: unknown) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(
+			chalk.yellow(
+				`Warning: updated, but could not relaunch the daemon (${message}); it will start on next launch.`,
+			),
+		);
+	}
+}
+
 export async function handleConfigCommand(args: string[]): Promise<boolean> {
 	if (args[0] !== "config") {
 		return false;
@@ -514,6 +586,16 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						process.exitCode = 1;
 						return true;
 					}
+					// Confirm before the install, since upgrading the daemon afterward stops it.
+					const daemonSocketPath = defaultDaemonSocketPath();
+					const daemonProbe = await probeRunningDaemonSessions(daemonSocketPath);
+					if (!(await confirmDaemonSessionLossBeforeUpdate(daemonProbe, options.force))) {
+						if (process.stdin.isTTY) {
+							console.log(chalk.dim("Update cancelled."));
+						}
+						process.exitCode = 1;
+						return true;
+					}
 					try {
 						await runSelfUpdate(selfUpdateCommand);
 					} catch (error: unknown) {
@@ -524,6 +606,7 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						return true;
 					}
 					console.log(chalk.green(`Updated ${APP_NAME}`));
+					await restartDaemonAfterSelfUpdate(daemonSocketPath, daemonProbe.reachable);
 				}
 				return true;
 			}
