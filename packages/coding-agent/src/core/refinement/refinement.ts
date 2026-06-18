@@ -91,6 +91,19 @@ export interface RefineOptions {
 	rollbackId?: string;
 }
 
+export type AutoRefineReason = "turn_interval" | "compact";
+
+export interface AutoRefineReviewContext {
+	reason: AutoRefineReason;
+	turnsSinceLastReview: number;
+}
+
+export interface AutoRefineReview {
+	shouldRefine: boolean;
+	rationale: string;
+	instructions?: string;
+}
+
 const REFINEMENT_SYSTEM_PROMPT = `You are Prime Agent's /refine subsystem.
 
 Your job is to improve the editable harness state from the current trajectory.
@@ -126,6 +139,17 @@ JSON only with this exact shape:
       "reason": "why this edit is useful"
     }
   ]
+}`;
+
+const AUTO_REFINE_REVIEW_SYSTEM_PROMPT = `You are Prime Agent's automatic /refine review gate.
+
+Decide whether this checkpoint should run /refine. /refine mutates durable continual harness state, so prefer no unless the trajectory contains clear, reusable evidence.
+
+Return JSON only:
+{
+  "shouldRefine": true|false,
+  "rationale": "short reason",
+  "instructions": "optional concise instructions for /refine if shouldRefine is true"
 }`;
 
 function now(): string {
@@ -684,6 +708,63 @@ export async function planRefinement(
 		.map((content) => content.text)
 		.join("\n");
 	return { proposal: parseProposal(text), id };
+}
+
+function parseAutoRefineReview(text: string): AutoRefineReview {
+	const value = extractJsonObject(text);
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new Error("Auto-refine review JSON must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	return {
+		shouldRefine: record.shouldRefine === true,
+		rationale: typeof record.rationale === "string" ? record.rationale : "No rationale provided.",
+		instructions: typeof record.instructions === "string" ? record.instructions : undefined,
+	};
+}
+
+export async function reviewAutoRefine(
+	messages: AgentMessage[],
+	state: HarnessState,
+	history: RefinementResult[],
+	model: Model<any>,
+	apiKey: string,
+	context: AutoRefineReviewContext,
+	headers?: Record<string, string>,
+	signal?: AbortSignal,
+): Promise<AutoRefineReview> {
+	const conversationText = serializeConversation(convertToLlm(messages)).slice(-40_000);
+	const userPrompt = [
+		`<trigger>
+${context.reason}; ${context.turnsSinceLastReview} assistant turns since last auto-refine review
+</trigger>`,
+		`<current_harness_state>
+${overviewForPrompt(state)}
+</current_harness_state>`,
+		`<refinement_history>
+${historyForPrompt(history)}
+</refinement_history>`,
+		`<conversation>
+${conversationText}
+</conversation>`,
+		"Return shouldRefine=false unless a durable, evidence-backed harness update is likely useful. Prefer no-op for task-local or speculative lessons.",
+	].join("\n\n");
+	const response = await completeSimple(
+		model,
+		{
+			systemPrompt: AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
+			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
+		},
+		{ maxTokens: 1024, signal, apiKey, headers },
+	);
+	if (response.stopReason === "error") {
+		throw new Error(`Auto-refine review failed: ${response.errorMessage || "Unknown error"}`);
+	}
+	const text = response.content
+		.filter((content): content is { type: "text"; text: string } => content.type === "text")
+		.map((content) => content.text)
+		.join("\n");
+	return parseAutoRefineReview(text);
 }
 
 export async function refineHarness(

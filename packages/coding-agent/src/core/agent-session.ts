@@ -120,6 +120,8 @@ import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import {
+	type AutoRefineReason,
+	type AutoRefineReview,
 	appendGlobalRefinement,
 	applyRefinementProposal,
 	getGlobalHarnessStateDir,
@@ -129,6 +131,7 @@ import {
 	mergeRefinementHistory,
 	planRefinement,
 	type RefinementResult,
+	reviewAutoRefine,
 	saveHarnessState,
 } from "./refinement/index.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
@@ -333,6 +336,8 @@ export interface AgentSessionConfig {
 	 * Only applies to main agents (rlmDepth 0); subagent kernels stay lazy. Default: false.
 	 */
 	prewarmIpythonKernel?: boolean;
+	/** Test/extension hook for automatic refine review decisions. Defaults to the model-backed review gate. */
+	autoRefineReviewer?: AutoRefineReviewer;
 }
 
 export interface ExtensionBindings {
@@ -341,6 +346,13 @@ export interface ExtensionBindings {
 	shutdownHandler?: ShutdownHandler;
 	onError?: ExtensionErrorListener;
 }
+
+export interface AutoRefineReviewRequest {
+	reason: AutoRefineReason;
+	turnsSinceLastReview: number;
+}
+
+export type AutoRefineReviewer = (request: AutoRefineReviewRequest) => Promise<AutoRefineReview>;
 
 /** Options for AgentSession.prompt() */
 export interface PromptOptions {
@@ -410,6 +422,14 @@ function noopRlmChildAbort(): void {}
 
 function isRlmChildRunCancelled(run: RlmChildRun): boolean {
 	return run.status === "cancelled";
+}
+
+function autoRefineInstructions(reason: AutoRefineReason, review: AutoRefineReview): string {
+	const detail = review.instructions
+		? `
+Reviewer instructions: ${review.instructions}`
+		: "";
+	return `Automatic refine review triggered by ${reason}. Only create/update/delete harness entries if there is clear durable evidence. Prefer an empty edits array over speculative or task-local memories. Reviewer rationale: ${review.rationale}${detail}`;
 }
 
 function parseDepth(value: string | undefined, fallback: number, name: string): number {
@@ -733,6 +753,10 @@ export class AgentSession {
 	// Base system prompt (without extension appends) - used to apply fresh appends each turn
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
+	private _assistantTurnsSinceAutoRefine = 0;
+	private _lastAutoRefineReviewAt = 0;
+	private _autoRefineInProgress = false;
+	private readonly _autoRefineReviewer?: AutoRefineReviewer;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -753,6 +777,7 @@ export class AgentSession {
 		this._rlmDepth = config.rlmDepth ?? parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH");
 		this._rlmMaxDepth = config.rlmMaxDepth ?? parseDepth(process.env.RLM_MAX_DEPTH, 1, "RLM_MAX_DEPTH");
 		this._prewarmIpythonKernel = (config.prewarmIpythonKernel ?? false) && this._rlmDepth === 0;
+		this._autoRefineReviewer = config.autoRefineReviewer;
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._subagentRuntimeHost = config.subagentRuntimeHost;
@@ -1600,6 +1625,7 @@ export class AgentSession {
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
 				this._lastAssistantMessage = event.message;
+				this._assistantTurnsSinceAutoRefine++;
 
 				const assistantMsg = event.message as AssistantMessage;
 				if (assistantMsg.stopReason !== "error") {
@@ -1637,6 +1663,7 @@ export class AgentSession {
 			const compactionWillRetry = await this._checkCompaction(msg);
 			if (!compactionWillRetry) {
 				this._finishGoalForTerminalAssistantMessage(msg);
+				this._scheduleAutoRefine("turn_interval");
 			}
 		}
 	}
@@ -2776,6 +2803,7 @@ export class AgentSession {
 	async compact(customInstructions?: string): Promise<CompactionResult> {
 		this._disconnectFromAgent();
 		await this.abort();
+		let didCompact = false;
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual", customInstructions });
 
@@ -2893,6 +2921,7 @@ export class AgentSession {
 				willRetry: false,
 				customInstructions,
 			});
+			didCompact = true;
 			return compactionResult;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -2912,6 +2941,9 @@ export class AgentSession {
 		} finally {
 			this._compactionAbortController = undefined;
 			this._reconnectToAgent();
+			if (didCompact) {
+				this._scheduleAutoRefine("compact");
+			}
 		}
 	}
 
@@ -2921,6 +2953,64 @@ export class AgentSession {
 	abortCompaction(): void {
 		this._compactionAbortController?.abort();
 		this._autoCompactionAbortController?.abort();
+	}
+
+	private _scheduleAutoRefine(reason: AutoRefineReason): void {
+		setTimeout(() => {
+			void this._maybeAutoRefine(reason);
+		}, 0);
+	}
+
+	private async _maybeAutoRefine(reason: AutoRefineReason): Promise<void> {
+		const settings = this.settingsManager.getAutoRefineSettings();
+		if (!settings.enabled || this._autoRefineInProgress || this.isStreaming || this.isCompacting) {
+			return;
+		}
+		if (reason === "compact" && !settings.compact) {
+			return;
+		}
+		if (reason === "turn_interval" && this._assistantTurnsSinceAutoRefine < settings.turnInterval) {
+			return;
+		}
+		const nowMs = Date.now();
+		if (this._lastAutoRefineReviewAt > 0 && nowMs - this._lastAutoRefineReviewAt < settings.cooldownMs) {
+			return;
+		}
+		if (!this.model) {
+			return;
+		}
+		this._autoRefineInProgress = true;
+		const turnsSinceLastReview = this._assistantTurnsSinceAutoRefine;
+		try {
+			const review = await this._reviewAutoRefine({ reason, turnsSinceLastReview });
+			this._lastAutoRefineReviewAt = nowMs;
+			this._assistantTurnsSinceAutoRefine = 0;
+			if (!review.shouldRefine) {
+				return;
+			}
+			await this.refine({ instructions: autoRefineInstructions(reason, review) });
+		} catch {
+			// Auto-refine is opportunistic; manual /refine remains available.
+		} finally {
+			this._autoRefineInProgress = false;
+		}
+	}
+
+	private async _reviewAutoRefine(context: AutoRefineReviewRequest): Promise<AutoRefineReview> {
+		if (this._autoRefineReviewer) {
+			return this._autoRefineReviewer(context);
+		}
+		if (!this.model) {
+			return { shouldRefine: false, rationale: "No model selected." };
+		}
+		const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
+		const harnessStateDir = getGlobalHarnessStateDir();
+		const state = loadHarnessState(harnessStateDir);
+		const history = mergeRefinementHistory(
+			loadGlobalRefinementHistory(harnessStateDir),
+			getRefinementHistory(this.sessionManager.getEntries().filter((entry) => entry.type === "custom")),
+		);
+		return reviewAutoRefine(this.agent.state.messages, state, history, this.model, apiKey, context, headers);
 	}
 
 	/**
@@ -3224,6 +3314,7 @@ export class AgentSession {
 				details,
 			};
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+			this._scheduleAutoRefine("compact");
 
 			if (willRetry) {
 				const messages = this.agent.state.messages;

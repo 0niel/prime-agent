@@ -6,6 +6,7 @@
 
 - Added opt-in Prime Agent trace sharing with `/traces` and background uploads of persisted session JSONL files.
 - Added a first draft of daemon-backed cron jobs for scheduling prompts against long-running sessions without using `/goal`.
+- Added an opt-in auto-refine review hook that can ask whether `/refine` should run after turn intervals or compaction checkpoints.
 
 ## [0.1.3] - 2026-06-12
 

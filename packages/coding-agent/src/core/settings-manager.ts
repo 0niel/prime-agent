@@ -16,6 +16,13 @@ export interface BranchSummarySettings {
 	skipPrompt?: boolean; // default: false - when true, skips "Summarize branch?" prompt and defaults to no summary
 }
 
+export interface AutoRefineSettings {
+	enabled?: boolean; // default: false
+	turnInterval?: number; // default: 25 assistant turns
+	compact?: boolean; // default: true
+	cooldownMs?: number; // default: 20 minutes
+}
+
 export interface ProviderRetrySettings {
 	timeoutMs?: number; // SDK/provider request timeout in milliseconds
 	maxRetries?: number; // SDK/provider retry attempts
@@ -83,6 +90,7 @@ export interface Settings {
 	followUpMode?: "all" | "one-at-a-time";
 	theme?: string;
 	compaction?: CompactionSettings;
+	autoRefine?: AutoRefineSettings;
 	agentTraces?: AgentTracesSettings;
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
@@ -707,6 +715,15 @@ export class SettingsManager {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
+		};
+	}
+
+	getAutoRefineSettings(): { enabled: boolean; turnInterval: number; compact: boolean; cooldownMs: number } {
+		return {
+			enabled: this.settings.autoRefine?.enabled ?? false,
+			turnInterval: Math.max(1, this.settings.autoRefine?.turnInterval ?? 25),
+			compact: this.settings.autoRefine?.compact ?? true,
+			cooldownMs: Math.max(0, this.settings.autoRefine?.cooldownMs ?? 20 * 60_000),
 		};
 	}
 
