@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added a daemon-backed user orchestrator surface with agent-to-agent messaging and read-only observation of active sessions.
 - Added opt-in Prime Agent trace sharing with `/traces` and background uploads of persisted session JSONL files.
 - Added a first draft of daemon-backed cron jobs for scheduling prompts against long-running sessions without using `/goal`.
 
