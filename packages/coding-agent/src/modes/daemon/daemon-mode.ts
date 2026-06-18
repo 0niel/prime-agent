@@ -1771,37 +1771,21 @@ export class AgentDaemon {
 		);
 
 		return new Promise<AgentSessionMessageReceipt>((resolveReceipt, rejectReceipt) => {
-			let settled = false;
-			const settleSuccess = () => {
-				if (settled) {
-					return;
-				}
-				settled = true;
-				resolveReceipt(createAgentSessionMessageReceipt(payload));
-			};
 			void targetState.runtime.session
 				.prompt(createAgentSessionMessagePrompt(payload), {
 					expandPromptTemplates: false,
 					streamingBehavior,
 					source: "rpc",
 					preflightResult: (didSucceed) => {
-						if (didSucceed) {
-							settleSuccess();
+						if (!didSucceed) {
+							rejectReceipt(new Error("Agent message prompt preflight failed"));
 						}
 					},
 				})
 				.then(() => {
-					settleSuccess();
+					resolveReceipt(createAgentSessionMessageReceipt(payload));
 				})
 				.catch((error) => {
-					if (settled) {
-						this.broadcastToSession(
-							targetState,
-							failure(undefined, "send_message", error, serializeDaemonError(error)),
-						);
-						return;
-					}
-					settled = true;
 					rejectReceipt(error);
 				});
 		});

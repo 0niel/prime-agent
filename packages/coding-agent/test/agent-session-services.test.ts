@@ -3,9 +3,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerFauxProvider } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import type { AgentSessionMessageController } from "../src/core/agent-messages.js";
+import { AGENT_MESSAGE_SKILL_NAME, type AgentSessionMessageController } from "../src/core/agent-messages.js";
+import {
+	AGENT_OBSERVE_SKILL_NAME,
+	type AgentObserveController,
+	ORCHESTRATION_HEARTBEAT_SKILL_NAME,
+} from "../src/core/agent-observe.js";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/agent-session-services.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import type { AgentRlmHeartbeatController } from "../src/core/cron-jobs.js";
 import { SessionManager } from "../src/core/session-manager.js";
 
 describe("createAgentSessionFromServices", () => {
@@ -84,6 +90,98 @@ describe("createAgentSessionFromServices", () => {
 			});
 		} finally {
 			session.dispose();
+		}
+	});
+
+	it("hides daemon-backed orchestration skills unless their host bridges are available", async () => {
+		const tempDir = join(tmpdir(), `pi-session-skills-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+		cleanupPaths.push(tempDir);
+
+		const authStorage = AuthStorage.inMemory();
+		const services = await createAgentSessionServices({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			resourceLoaderOptions: {
+				noPromptTemplates: true,
+				noThemes: true,
+			},
+		});
+
+		const createSession = async (options: Parameters<typeof createAgentSessionFromServices>[0]) => {
+			const { session } = await createAgentSessionFromServices(options);
+			return session;
+		};
+		const visibleSkillNames = (session: unknown) =>
+			(
+				session as {
+					_modelVisibleSkills(): Array<{ name: string }>;
+				}
+			)
+				._modelVisibleSkills()
+				.map((skill) => skill.name);
+
+		const withoutControllers = await createSession({
+			services,
+			sessionManager: SessionManager.create(tempDir, join(tempDir, "sessions-without")),
+		});
+		try {
+			expect(visibleSkillNames(withoutControllers)).not.toContain(AGENT_MESSAGE_SKILL_NAME);
+			expect(visibleSkillNames(withoutControllers)).not.toContain(AGENT_OBSERVE_SKILL_NAME);
+			expect(visibleSkillNames(withoutControllers)).not.toContain(ORCHESTRATION_HEARTBEAT_SKILL_NAME);
+		} finally {
+			withoutControllers.dispose();
+		}
+
+		const agentObserveController: AgentObserveController = {
+			listAgents: () => ({
+				current: {
+					activeSessionId: "current",
+					sessionId: "session-current",
+					runtimeKind: "top-level",
+					cwd: tempDir,
+					status: "idle",
+					isCurrent: true,
+					isStreaming: false,
+					isCompacting: false,
+					attachedClients: 1,
+					messageCount: 0,
+					pendingMessageCount: 0,
+				},
+				agents: [],
+			}),
+			getAgent: () => {
+				throw new Error("not used");
+			},
+			recentMessages: () => {
+				throw new Error("not used");
+			},
+		};
+		const rlmHeartbeatController: AgentRlmHeartbeatController = {
+			listRlmHeartbeats: () => [],
+			createRlmHeartbeat: () => {
+				throw new Error("not used");
+			},
+			updateRlmHeartbeat: () => {
+				throw new Error("not used");
+			},
+			deleteRlmHeartbeat: () => {
+				throw new Error("not used");
+			},
+		};
+		const withControllers = await createSession({
+			services,
+			sessionManager: SessionManager.create(tempDir, join(tempDir, "sessions-with")),
+			agentObserveController,
+			rlmHeartbeatController,
+		});
+		try {
+			expect(visibleSkillNames(withControllers)).toContain(AGENT_OBSERVE_SKILL_NAME);
+			expect(visibleSkillNames(withControllers)).toContain(ORCHESTRATION_HEARTBEAT_SKILL_NAME);
+			expect(visibleSkillNames(withControllers)).not.toContain(AGENT_MESSAGE_SKILL_NAME);
+		} finally {
+			withControllers.dispose();
 		}
 	});
 });

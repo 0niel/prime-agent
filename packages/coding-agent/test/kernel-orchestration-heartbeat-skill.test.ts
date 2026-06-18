@@ -45,25 +45,25 @@ describe("orchestration heartbeat skill over bundled host bridges", () => {
 				"agent_observe.list": async (payload) => {
 					requests.push({ type: "agent_observe.list", payload });
 					return {
-						current: { name: "orch" },
+						current: { sessionName: "orch" },
 						agents: [
 							{
-								name: "autoenv",
-								session_id: "sess-autoenv",
-								active_session_id: "active-autoenv",
+								sessionName: "autoenv",
+								sessionId: "sess-autoenv",
+								activeSessionId: "active-autoenv",
 								cwd: "/repo/autoenv",
 								status: "tool",
-								streaming: false,
-								pending_message_count: 1,
+								isStreaming: false,
+								pendingMessageCount: 1,
 							},
 							{
-								name: "emulatorBench",
-								session_id: "sess-emulator",
-								active_session_id: "active-emulator",
+								sessionName: "emulatorBench",
+								sessionId: "sess-emulator",
+								activeSessionId: "active-emulator",
 								cwd: "/repo/emulator",
 								status: "idle",
-								streaming: false,
-								pending_message_count: 0,
+								isStreaming: false,
+								pendingMessageCount: 0,
 							},
 						],
 					};
@@ -121,7 +121,7 @@ print(json.dumps({
     "updated_action": updated["action"],
     "created_label": created["heartbeat"]["label"],
     "updated_label": updated["heartbeat"]["label"],
-    "session_names": [agent.get("name") for agent in updated["sessions"]],
+    "session_names": [agent.get("sessionName") for agent in updated["sessions"]],
     "instruction": updated["instruction"],
 }, sort_keys=True))
 `);
@@ -139,6 +139,10 @@ print(json.dumps({
 		expect(output.instruction).toContain("recommend the exact action and draft the target message");
 		expect(output.instruction).toContain("Do not send cross-session messages until the user approves");
 		expect(output.instruction).toContain("name=autoenv");
+		expect(output.instruction).toContain("session_id=sess-autoenv");
+		expect(output.instruction).toContain("active_session_id=active-autoenv");
+		expect(output.instruction).toContain("streaming=False");
+		expect(output.instruction).toContain("pending_messages=1");
 		expect(requests.map((request) => request.type)).toEqual([
 			"agent_observe.list",
 			"rlm_heartbeat.list",

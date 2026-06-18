@@ -16,14 +16,22 @@ DEFAULT_INTERVAL = "5m"
 DEFAULT_LABEL = "orchestrator"
 
 
+def _first_value(agent: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = agent.get(key)
+        if value is not None:
+            return value
+    return None
+
+
 def _session_label(agent: dict[str, Any]) -> str:
-    name = agent.get("name")
-    session_id = agent.get("session_id")
-    active_session_id = agent.get("active_session_id")
+    name = _first_value(agent, "sessionName", "name")
+    session_id = _first_value(agent, "sessionId", "session_id")
+    active_session_id = _first_value(agent, "activeSessionId", "active_session_id")
     cwd = agent.get("cwd")
     status = agent.get("status")
-    streaming = agent.get("streaming")
-    pending = agent.get("pending_message_count")
+    streaming = _first_value(agent, "isStreaming", "streaming")
+    pending = _first_value(agent, "pendingMessageCount", "pending_message_count")
     parts = [
         f"name={name}" if name else None,
         f"session_id={session_id}" if session_id else None,

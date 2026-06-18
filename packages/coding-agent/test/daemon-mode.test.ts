@@ -70,6 +70,82 @@ describe("daemon mode helpers", () => {
 		expect(resolve).toHaveBeenCalledWith({ cancelled: true });
 	});
 
+	it("does not acknowledge agent messages until the target prompt completes", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const fromState = makeState("source");
+		const targetState = makeState("target") as ActiveSessionState & {
+			runtime: ActiveSessionState["runtime"] & {
+				session: {
+					sessionId: string;
+					sessionName: string;
+					isStreaming: boolean;
+					pendingMessageCount: number;
+					prompt: ReturnType<typeof vi.fn>;
+				};
+			};
+		};
+		let rejectPrompt: (error: Error) => void = () => {};
+		const prompt = vi.fn((_message: string, options?: { preflightResult?: (didSucceed: boolean) => void }) => {
+			options?.preflightResult?.(true);
+			return new Promise<void>((_resolve, reject) => {
+				rejectPrompt = reject;
+			});
+		});
+		targetState.runtime = {
+			...targetState.runtime,
+			cwd: "/tmp",
+			session: {
+				sessionId: "session-target",
+				sessionName: "Target",
+				isStreaming: false,
+				pendingMessageCount: 0,
+				prompt,
+			},
+		} as never;
+		fromState.runtime = {
+			...fromState.runtime,
+			session: {
+				sessionId: "session-source",
+				sessionName: "Source",
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(fromState.activeSessionId, fromState);
+		internals.sessions.set(targetState.activeSessionId, targetState);
+
+		const send = internals.sendAgentSessionMessage({
+			targetSelector: targetState.activeSessionId,
+			message: "please continue",
+			fromState,
+			origin: "agent",
+		});
+		let settled = false;
+		void send.catch(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+
+		expect(prompt).toHaveBeenCalledOnce();
+		expect(settled).toBe(false);
+
+		rejectPrompt(new Error("target turn failed"));
+
+		await expect(send).rejects.toThrow("target turn failed");
+	});
+
 	it("sends dialog extension UI requests only to UI-capable clients", () => {
 		const lineClient = makeClient("line-client", "active", false);
 		const uiClient = makeClient("ui-client", "active", true);

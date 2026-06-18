@@ -68,6 +68,7 @@ import {
 	createAgentObserveHostHandlers,
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
+	ORCHESTRATION_HEARTBEAT_SKILL_NAME,
 } from "./agent-observe.js";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
@@ -3763,6 +3764,9 @@ export class AgentSession {
 		}
 		if (!this._agentObserveController) {
 			skills = skills.filter((skill) => skill.name !== AGENT_OBSERVE_SKILL_NAME);
+		}
+		if (!this._agentObserveController || !this._rlmHeartbeatController) {
+			skills = skills.filter((skill) => skill.name !== ORCHESTRATION_HEARTBEAT_SKILL_NAME);
 		}
 		return skills;
 	}
