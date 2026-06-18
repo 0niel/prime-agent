@@ -150,6 +150,7 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	"x-ai/grok-4.20-multi-agent": { contextWindow: 2000000, maxTokens: 30000 },
 	"z-ai/glm-5": { contextWindow: 202752, maxTokens: 131072 },
 	"z-ai/glm-5.1": { contextWindow: 202800, maxTokens: 131072 },
+	"z-ai/glm-5.2": { contextWindow: 202800, maxTokens: 131072 },
 };
 
 const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([

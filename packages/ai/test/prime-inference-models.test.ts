@@ -16,7 +16,7 @@ describe("Prime Inference models", () => {
 	it("registers the Prime Inference catalog", () => {
 		const modelIds = getModels("prime-inference").map((model) => model.id);
 
-		expect(modelIds.length).toBe(27);
+		expect(modelIds.length).toBe(28);
 		expect(modelIds).toEqual(
 			expect.arrayContaining([
 				"anthropic/claude-opus-4.7",
@@ -33,6 +33,7 @@ describe("Prime Inference models", () => {
 				"x-ai/grok-4.20",
 				"z-ai/glm-5",
 				"z-ai/glm-5.1",
+				"z-ai/glm-5.2",
 			]),
 		);
 		expect(modelIds).not.toContain("google/gemini-2.5-pro");
@@ -82,6 +83,12 @@ describe("Prime Inference models", () => {
 		const glm51 = getModel("prime-inference", "z-ai/glm-5.1");
 		expect(glm51.reasoning).toBe(true);
 		expect(glm51.compat).toMatchObject({
+			supportsReasoningEffort: false,
+			thinkingFormat: "zai",
+		});
+		const glm52 = getModel("prime-inference", "z-ai/glm-5.2");
+		expect(glm52.reasoning).toBe(true);
+		expect(glm52.compat).toMatchObject({
 			supportsReasoningEffort: false,
 			thinkingFormat: "zai",
 		});

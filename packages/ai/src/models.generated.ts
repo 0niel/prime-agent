@@ -13276,6 +13276,24 @@ export const MODELS = {
 			contextWindow: 202800,
 			maxTokens: 131072,
 		} satisfies Model<"openai-completions">,
+		"z-ai/glm-5.2": {
+			id: "z-ai/glm-5.2",
+			name: "GLM 5.2 (Prime Inference)",
+			api: "openai-completions",
+			provider: "prime-inference",
+			baseUrl: "https://api.pinference.ai/api/v1",
+			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","supportsStrictMode":false,"thinkingFormat":"zai"},
+			reasoning: true,
+			input: ["text"],
+			cost: {
+				input: 1.68,
+				output: 5.28,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 202800,
+			maxTokens: 131072,
+		} satisfies Model<"openai-completions">,
 	},
 	"vercel-ai-gateway": {
 		"alibaba/qwen-3-14b": {
