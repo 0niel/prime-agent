@@ -757,7 +757,10 @@ export class AgentSession {
 	private _lastAutoRefineReviewAt = 0;
 	private _autoRefineInProgress = false;
 	private _compactAutoRefinePending = false;
-	private _pendingAutoRefineReview: { reason: AutoRefineReason; review: AutoRefineReview } | undefined;
+	private _pendingAutoRefineReview:
+		| { reason: AutoRefineReason; review: AutoRefineReview; branchVersion: number }
+		| undefined;
+	private _autoRefineBranchVersion = 0;
 	private readonly _autoRefineReviewer?: AutoRefineReviewer;
 
 	constructor(config: AgentSessionConfig) {
@@ -2961,6 +2964,16 @@ export class AgentSession {
 		return this._rlmDepth === 0;
 	}
 
+	private _discardPendingAutoRefine(): void {
+		this._compactAutoRefinePending = false;
+		this._pendingAutoRefineReview = undefined;
+	}
+
+	private _invalidatePendingAutoRefineForBranchChange(): void {
+		this._discardPendingAutoRefine();
+		this._autoRefineBranchVersion++;
+	}
+
 	private _scheduleAutoRefineAfterAgentEnd(): void {
 		if (!this._autoRefineAllowedForSession()) {
 			return;
@@ -3001,15 +3014,13 @@ export class AgentSession {
 
 	private async _maybeAutoRefine(reason: AutoRefineReason): Promise<void> {
 		if (!this._autoRefineAllowedForSession()) {
-			this._compactAutoRefinePending = false;
-			this._pendingAutoRefineReview = undefined;
+			this._discardPendingAutoRefine();
 			return;
 		}
 
 		const settings = this.settingsManager.getAutoRefineSettings();
 		if (!settings.enabled) {
-			this._compactAutoRefinePending = false;
-			this._pendingAutoRefineReview = undefined;
+			this._discardPendingAutoRefine();
 			return;
 		}
 		if (this._autoRefineInProgress || this._shouldSkipAutoRefineForActiveAgent()) {
@@ -3021,6 +3032,11 @@ export class AgentSession {
 
 		const pendingReview = this._pendingAutoRefineReview;
 		if (pendingReview) {
+			if (pendingReview.branchVersion !== this._autoRefineBranchVersion) {
+				this._discardPendingAutoRefine();
+				return;
+			}
+
 			this._autoRefineInProgress = true;
 			try {
 				this._pendingAutoRefineReview = undefined;
@@ -3055,8 +3071,12 @@ export class AgentSession {
 		}
 		this._autoRefineInProgress = true;
 		const turnsSinceLastReview = this._assistantTurnsSinceAutoRefine;
+		const branchVersion = this._autoRefineBranchVersion;
 		try {
 			const review = await this._reviewAutoRefine({ reason, turnsSinceLastReview });
+			if (branchVersion !== this._autoRefineBranchVersion) {
+				return;
+			}
 			this._lastAutoRefineReviewAt = nowMs;
 			this._assistantTurnsSinceAutoRefine = 0;
 			if (reason === "compact") {
@@ -3066,7 +3086,7 @@ export class AgentSession {
 				return;
 			}
 			if (this._shouldSkipAutoRefineForActiveAgent()) {
-				this._pendingAutoRefineReview = { reason, review };
+				this._pendingAutoRefineReview = { reason, review, branchVersion };
 				return;
 			}
 			await this.refine({ instructions: autoRefineInstructions(reason, review) });
@@ -4986,6 +5006,8 @@ export class AgentSession {
 			if (label && !summaryText) {
 				this.sessionManager.appendLabelChange(targetId, label);
 			}
+
+			this._invalidatePendingAutoRefineForBranchChange();
 
 			// Update agent state
 			const sessionContext = this.sessionManager.buildSessionContext();

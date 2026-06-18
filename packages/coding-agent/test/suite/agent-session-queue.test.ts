@@ -18,6 +18,7 @@ type AutoRefineInternals = {
 	_compactAutoRefinePending: boolean;
 	_pendingAutoRefineReview?: unknown;
 	_autoRefineInProgress: boolean;
+	_autoRefineBranchVersion: number;
 };
 
 function emptyRefinementResult(): RefinementResult {
@@ -243,6 +244,7 @@ describe("AgentSession queue characterization", () => {
 		internals._pendingAutoRefineReview = {
 			reason: "turn_interval",
 			review: { shouldRefine: true, rationale: "durable lesson" },
+			branchVersion: internals._autoRefineBranchVersion,
 		};
 		let guardWasSetDuringRefine = false;
 		const refine = vi.spyOn(harness.session, "refine").mockImplementation(async () => {
@@ -257,6 +259,32 @@ describe("AgentSession queue characterization", () => {
 		);
 		expect(guardWasSetDuringRefine).toBe(true);
 		expect(internals._autoRefineInProgress).toBe(false);
+		expect(internals._pendingAutoRefineReview).toBeUndefined();
+	});
+
+	it("clears pending auto-refine state when navigating to another branch", async () => {
+		const harness = await createHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		await harness.session.prompt("first");
+		await harness.session.prompt("second");
+		const targetEntry = harness.sessionManager
+			.getEntries()
+			.find((entry) => entry.type === "message" && entry.message.role === "user");
+		expect(targetEntry).toBeDefined();
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._compactAutoRefinePending = true;
+		internals._pendingAutoRefineReview = {
+			reason: "compact",
+			review: { shouldRefine: true, rationale: "old branch" },
+			branchVersion: internals._autoRefineBranchVersion,
+		};
+
+		await harness.session.navigateTree(targetEntry!.id, { summarize: false });
+
+		expect(internals._compactAutoRefinePending).toBe(false);
 		expect(internals._pendingAutoRefineReview).toBeUndefined();
 	});
 
