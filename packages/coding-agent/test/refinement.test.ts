@@ -962,6 +962,7 @@ describe("harness refinement", () => {
 		});
 
 		expect(rollback.rollbackOf).toBe("refine_target");
+		expect(rollback.scope).toBe("local");
 		expect(rollback.appliedEdits.map((edit) => `${edit.action} ${edit.kind}:${edit.id}`)).toEqual([
 			"create skill:deleted_skill",
 			"update memory:kept_memory",
@@ -1107,6 +1108,7 @@ describe("global refinement history", () => {
 		});
 
 		expect(plan.rollbackOf).toBe("refine_rollback_target");
+		expect(plan.rollbackScope).toBe("local");
 		// The entry still exists until the proposal is applied.
 		expect(state.entries.memory.rollback_me).toBeDefined();
 		applyRefinementProposal(state, plan.proposal, { id: plan.id, rollbackOf: plan.rollbackOf });
@@ -1143,6 +1145,65 @@ describe("global refinement history", () => {
 		});
 
 		expect(rollback.rollbackOf).toBe("refine_session_a");
+		expect(rollback.scope).toBe("local");
 		expect(sessionBState.entries.memory.session_a_memory).toBeUndefined();
+	});
+
+	it("plans rollback against the recorded global scope when --global is omitted", async () => {
+		const dir = makeTempDir();
+		const state = loadHarnessState(dir, "global");
+		const target = applyRefinementProposal(
+			state,
+			proposal("Global refinement", [
+				{
+					action: "create",
+					kind: "memory",
+					id: "global_memory",
+					title: "Global memory",
+					content: "Created globally.",
+				},
+			]),
+			{ id: "refine_global_target", scope: "global" },
+		);
+		expect(target.scope).toBe("global");
+
+		const plan = await planRefinement([], state, [target], {} as never, "api-key", {
+			rollbackId: "refine_global_target",
+		});
+
+		expect(plan.rollbackOf).toBe("refine_global_target");
+		expect(plan.rollbackScope).toBe("global");
+		const rollback = applyRefinementProposal(state, plan.proposal, {
+			id: plan.id,
+			rollbackOf: plan.rollbackOf,
+			scope: plan.rollbackScope,
+		});
+		expect(rollback.scope).toBe("global");
+		expect(state.entries.memory.global_memory).toBeUndefined();
+	});
+
+	it("infers rollback scope from legacy global edits without top-level scope", async () => {
+		const dir = makeTempDir();
+		const state = loadHarnessState(dir, "global");
+		const target = applyRefinementProposal(
+			state,
+			proposal("Legacy global refinement", [
+				{
+					action: "create",
+					kind: "memory",
+					id: "legacy_global_memory",
+					title: "Legacy global memory",
+					content: "Created globally before result.scope existed.",
+				},
+			]),
+			{ id: "refine_legacy_global", scope: "global" },
+		);
+		const legacyTarget = { ...target, scope: undefined };
+
+		const plan = await planRefinement([], state, [legacyTarget], {} as never, "api-key", {
+			rollbackId: "refine_legacy_global",
+		});
+
+		expect(plan.rollbackScope).toBe("global");
 	});
 });

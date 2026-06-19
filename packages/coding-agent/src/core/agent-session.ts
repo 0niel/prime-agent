@@ -3145,11 +3145,10 @@ export class AgentSession {
 			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
 			const globalHarnessStateDir = getGlobalHarnessStateDir();
 			const localHarnessStateDir = getLocalHarnessStateDir(this.sessionManager.getSessionArtifactDir());
-			const targetScope = options.global ? "global" : "local";
-			if (!options.global && !localHarnessStateDir) {
+			const requestedScope = options.global ? "global" : "local";
+			if (!options.rollbackId && requestedScope === "local" && !localHarnessStateDir) {
 				throw new Error("Local harness refinement requires a persisted session; use global refinement instead.");
 			}
-			const targetHarnessStateDir = options.global ? globalHarnessStateDir : localHarnessStateDir!;
 			const planningState = mergeHarnessStates(
 				loadHarnessState(globalHarnessStateDir, "global"),
 				localHarnessStateDir ? loadHarnessState(localHarnessStateDir, "local") : undefined,
@@ -3169,6 +3168,11 @@ export class AgentSession {
 				undefined,
 				this.thinkingLevel,
 			);
+			const targetScope = plan.rollbackScope ?? requestedScope;
+			if (targetScope === "local" && !localHarnessStateDir) {
+				throw new Error("Local harness refinement requires a persisted session; use global refinement instead.");
+			}
+			const targetHarnessStateDir = targetScope === "global" ? globalHarnessStateDir : localHarnessStateDir!;
 			// Re-read the target state immediately before applying so concurrent kernel
 			// (`rlm.harness`) writes during the LLM pass are not clobbered.
 			const state = loadHarnessState(targetHarnessStateDir, targetScope);
@@ -3178,7 +3182,7 @@ export class AgentSession {
 				scope: targetScope,
 			});
 			result.harnessStatePath = saveHarnessState(targetHarnessStateDir, state);
-			if (options.global) {
+			if (targetScope === "global") {
 				appendGlobalRefinement(globalHarnessStateDir, result);
 			}
 			this.sessionManager.appendCustomEntry("prime-agent.refinement", result);

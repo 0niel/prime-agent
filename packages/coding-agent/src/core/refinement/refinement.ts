@@ -86,6 +86,7 @@ export interface RefinementResult {
 	appliedEdits: AppliedRefinementEdit[];
 	harnessStatePath: string;
 	rollbackOf?: string;
+	scope?: HarnessScope;
 }
 
 export interface RefineOptions {
@@ -203,6 +204,21 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 
 function normalizeHarnessScope(value: unknown, fallback: HarnessScope): HarnessScope {
 	return value === "global" || value === "local" ? value : fallback;
+}
+
+function inferRefinementResultScope(result: RefinementResult): HarnessScope | undefined {
+	if (result.scope) {
+		return result.scope;
+	}
+
+	const scopes = new Set<HarnessScope>();
+	for (const edit of result.appliedEdits) {
+		const scope = edit.after?.scope ?? edit.before?.scope;
+		if (scope) {
+			scopes.add(scope);
+		}
+	}
+	return scopes.size === 1 ? [...scopes][0] : undefined;
 }
 
 export function getGlobalHarnessStateDir(agentDir: string = getAgentDir()): string {
@@ -632,6 +648,7 @@ export function applyRefinementProposal(
 		appliedEdits,
 		harnessStatePath: "",
 		rollbackOf: options.rollbackOf,
+		scope: options.scope,
 	};
 }
 
@@ -682,6 +699,7 @@ export interface RefinementPlan {
 	proposal: RefinementProposal;
 	id: string;
 	rollbackOf?: string;
+	rollbackScope?: HarnessScope;
 }
 
 /**
@@ -711,7 +729,13 @@ export async function planRefinement(
 		if (!target) {
 			throw new Error(`Refinement ${options.rollbackId} not found`);
 		}
-		return { proposal: rollbackProposal(target), id, rollbackOf: target.id };
+		const fallbackScope: HarnessScope = options.global ? "global" : "local";
+		return {
+			proposal: rollbackProposal(target),
+			id,
+			rollbackOf: target.id,
+			rollbackScope: inferRefinementResultScope(target) ?? fallbackScope,
+		};
 	}
 
 	const conversationText = serializeConversation(convertToLlm(messages)).slice(-80_000);
@@ -820,5 +844,9 @@ export async function refineHarness(
 	thinkingLevel?: ThinkingLevel,
 ): Promise<RefinementResult> {
 	const plan = await planRefinement(messages, state, history, model, apiKey, options, headers, signal, thinkingLevel);
-	return applyRefinementProposal(state, plan.proposal, { id: plan.id, rollbackOf: plan.rollbackOf });
+	return applyRefinementProposal(state, plan.proposal, {
+		id: plan.id,
+		rollbackOf: plan.rollbackOf,
+		scope: plan.rollbackScope ?? (options.global ? "global" : "local"),
+	});
 }
