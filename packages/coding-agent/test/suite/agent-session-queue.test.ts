@@ -13,6 +13,7 @@ type AutoRefineInternals = {
 	_scheduleAutoRefine(reason: AutoRefineReason): void;
 	_scheduleAutoRefineAfterCompaction(willContinueAfterCompaction: boolean): void;
 	_scheduleAutoRefineAfterAgentEnd(): void;
+	_invalidatePendingAutoRefineForBranchChange(): void;
 	_assistantTurnsSinceAutoRefine: number;
 	_lastAutoRefineReviewAt: number;
 	_compactAutoRefinePending: boolean;
@@ -291,6 +292,37 @@ describe("AgentSession queue characterization", () => {
 		await harness.session.navigateTree(targetEntry!.id, { summarize: false });
 
 		expect(internals._compactAutoRefinePending).toBe(false);
+		expect(internals._pendingAutoRefineReview).toBeUndefined();
+	});
+
+	it("records auto-refine cooldown when a review completes after branch navigation", async () => {
+		let finishReview: (() => void) | undefined;
+		const reviewStarted = new Promise<void>((resolve) => {
+			finishReview = resolve;
+		});
+		const reviewer = vi.fn(async () => {
+			await reviewStarted;
+			return { shouldRefine: true, rationale: "old branch" };
+		});
+		const harness = await createHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 2;
+		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
+		const beforeReviewAt = internals._lastAutoRefineReviewAt;
+
+		const autoRefinePromise = internals._maybeAutoRefine("turn_interval");
+		expect(reviewer).toHaveBeenCalledWith({ reason: "turn_interval", turnsSinceLastReview: 2 });
+		internals._invalidatePendingAutoRefineForBranchChange();
+		finishReview?.();
+		await autoRefinePromise;
+
+		expect(refine).not.toHaveBeenCalled();
+		expect(internals._lastAutoRefineReviewAt).toBeGreaterThanOrEqual(beforeReviewAt);
+		expect(internals._assistantTurnsSinceAutoRefine).toBe(0);
 		expect(internals._pendingAutoRefineReview).toBeUndefined();
 	});
 

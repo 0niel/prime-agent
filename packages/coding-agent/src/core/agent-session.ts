@@ -3081,11 +3081,11 @@ export class AgentSession {
 		const branchVersion = this._autoRefineBranchVersion;
 		try {
 			const review = await this._reviewAutoRefine({ reason, turnsSinceLastReview });
+			this._lastAutoRefineReviewAt = nowMs;
+			this._assistantTurnsSinceAutoRefine = 0;
 			if (branchVersion !== this._autoRefineBranchVersion) {
 				return;
 			}
-			this._lastAutoRefineReviewAt = nowMs;
-			this._assistantTurnsSinceAutoRefine = 0;
 			if (reason === "compact") {
 				this._compactAutoRefinePending = false;
 			}
