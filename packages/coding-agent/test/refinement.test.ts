@@ -1020,7 +1020,33 @@ describe("global refinement history", () => {
 		appendGlobalRefinement(dir, second);
 
 		expect(historyPath).toBe(getRefinementHistoryPath(dir));
-		expect(loadGlobalRefinementHistory(dir)).toEqual([first, second]);
+		expect(loadGlobalRefinementHistory(dir)).toEqual([
+			{ ...first, scope: "global" },
+			{ ...second, scope: "global" },
+		]);
+	});
+
+	it("defaults legacy global history results to global scope", () => {
+		const dir = makeTempDir();
+		const legacy = sampleResult("refine_legacy_global", { scope: undefined });
+		appendFileSync(
+			getRefinementHistoryPath(dir),
+			`${JSON.stringify(legacy)}
+`,
+			"utf8",
+		);
+
+		expect(loadGlobalRefinementHistory(dir)[0]).toMatchObject({ id: "refine_legacy_global", scope: "global" });
+	});
+
+	it("preserves global scope when session history shadows legacy global history", () => {
+		const globalOld = sampleResult("refine_shared", { scope: "global", summary: "global version" });
+		const sessionNew = sampleResult("refine_shared", { scope: undefined, summary: "session version" });
+
+		const merged = mergeRefinementHistory([globalOld], [sessionNew]);
+
+		expect(merged).toHaveLength(1);
+		expect(merged[0]).toMatchObject({ id: "refine_shared", summary: "session version", scope: "global" });
 	});
 
 	it("skips malformed history lines without throwing", () => {
@@ -1031,7 +1057,7 @@ describe("global refinement history", () => {
 		appendFileSync(getRefinementHistoryPath(dir), "not json\n", "utf8");
 		appendFileSync(getRefinementHistoryPath(dir), `${JSON.stringify({ id: "x" })}\n`, "utf8");
 
-		expect(loadGlobalRefinementHistory(dir)).toEqual([valid]);
+		expect(loadGlobalRefinementHistory(dir)).toEqual([{ ...valid, scope: "global" }]);
 	});
 
 	it("merges global and session history, preferring session entries by id", () => {
@@ -1198,9 +1224,18 @@ describe("global refinement history", () => {
 			]),
 			{ id: "refine_legacy_global", scope: "global" },
 		);
-		const legacyTarget = { ...target, scope: undefined };
+		const legacyTarget = {
+			...target,
+			scope: undefined,
+			appliedEdits: target.appliedEdits.map((edit) => ({
+				...edit,
+				before: edit.before ? { ...edit.before, scope: undefined } : undefined,
+				after: edit.after ? { ...edit.after, scope: undefined } : undefined,
+			})),
+		};
+		const legacyHistory = mergeRefinementHistory([{ ...legacyTarget, scope: "global" }], [legacyTarget]);
 
-		const plan = await planRefinement([], state, [legacyTarget], {} as never, "api-key", {
+		const plan = await planRefinement([], state, legacyHistory, {} as never, "api-key", {
 			rollbackId: "refine_legacy_global",
 		});
 

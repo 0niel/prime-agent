@@ -468,6 +468,37 @@ class HarnessStateTest(unittest.TestCase):
                 HarnessState(global_dir / "harness_state.json", scope="global").get("memory", "kwargs_global_note")
             )
 
+    def test_state_cache_keeps_scope_distinct_when_local_and_global_share_a_file(self) -> None:
+        previous_local = os.environ.get("RLM_HARNESS_STATE_DIR")
+        previous_global = os.environ.get("RLM_GLOBAL_HARNESS_STATE_DIR")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            os.environ["RLM_HARNESS_STATE_DIR"] = temp_dir
+            os.environ["RLM_GLOBAL_HARNESS_STATE_DIR"] = temp_dir
+            try:
+                state = get_harness_state()
+                global_state = get_harness_state(global_=True)
+                local_entry = state.create_memory("Local note", "Only this session.", id="local_note")
+                global_entry = state.create_memory("Global note", "All sessions.", id="global_note", global_=True)
+            finally:
+                if previous_local is None:
+                    os.environ.pop("RLM_HARNESS_STATE_DIR", None)
+                else:
+                    os.environ["RLM_HARNESS_STATE_DIR"] = previous_local
+                if previous_global is None:
+                    os.environ.pop("RLM_GLOBAL_HARNESS_STATE_DIR", None)
+                else:
+                    os.environ["RLM_GLOBAL_HARNESS_STATE_DIR"] = previous_global
+
+            self.assertIsNot(state, global_state)
+            self.assertEqual(state.file_path, global_state.file_path)
+            self.assertEqual(state.scope, "local")
+            self.assertEqual(global_state.scope, "global")
+            self.assertEqual(local_entry.scope, "local")
+            self.assertEqual(global_entry.scope, "global")
+            reloaded = HarnessState(Path(temp_dir) / "harness_state.json")
+            self.assertEqual(reloaded.get("memory", "local_note").scope, "local")
+            self.assertEqual(reloaded.get("memory", "global_note").scope, "global")
+
     def test_callable_rlm_exposes_harness_state_helpers(self) -> None:
         self.assertIs(callable_rlm.harness, package_harness)
         self.assertIs(callable_rlm.get_harness_state, get_harness_state)

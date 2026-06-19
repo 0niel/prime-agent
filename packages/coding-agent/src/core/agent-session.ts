@@ -2968,7 +2968,7 @@ export class AgentSession {
 	}
 
 	private _autoRefineAllowedForSession(): boolean {
-		return this._rlmDepth === 0;
+		return this._rlmDepth === 0 && getLocalHarnessStateDir(this.sessionManager.getSessionArtifactDir()) !== undefined;
 	}
 
 	private _discardPendingAutoRefine(): void {

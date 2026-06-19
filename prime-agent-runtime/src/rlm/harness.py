@@ -21,7 +21,7 @@ HarnessScope = Literal["local", "global"]
 _DEFAULT_FILE_NAME = "harness_state.json"
 _DEFAULT_HARNESS_DIR_NAME = "harness"
 _KINDS: tuple[HarnessKind, ...] = ("prompt", "memory", "skill", "subagent")
-_state_cache: dict[Path, "HarnessState"] = {}
+_state_cache: dict[tuple[Path, HarnessScope], "HarnessState"] = {}
 
 
 def _now() -> str:
@@ -232,7 +232,7 @@ class HarnessState:
         if not _resolve_global_flag(global_, extra):
             return None
         target = get_harness_state(global_=True)
-        if self.file_path is not None and target.file_path == self.file_path:
+        if self.file_path is not None and target.file_path == self.file_path and target.scope == self.scope:
             return None
         return target
 
@@ -729,10 +729,12 @@ def get_harness_state(
     """Return the cached local harness state, or global when requested."""
     global_ = _resolve_global_flag(global_, kwargs)
     file_path = _state_file(state_dir, global_=global_)
-    state = _state_cache.get(file_path)
+    scope: HarnessScope = "global" if global_ else "local"
+    cache_key = (file_path, scope)
+    state = _state_cache.get(cache_key)
     if state is None:
-        state = HarnessState(file_path, scope="global" if global_ else "local")
-        _state_cache[file_path] = state
+        state = HarnessState(file_path, scope=scope)
+        _state_cache[cache_key] = state
     return state
 
 

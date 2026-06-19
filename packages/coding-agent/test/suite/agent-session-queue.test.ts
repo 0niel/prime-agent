@@ -33,6 +33,10 @@ function emptyRefinementResult(): RefinementResult {
 	};
 }
 
+function createAutoRefineHarness(options: Parameters<typeof createHarness>[0] = {}): Promise<Harness> {
+	return createHarness({ ...options, persistSession: true });
+}
+
 async function createWaitingHarness(
 	options: {
 		tools?: AgentTool[];
@@ -100,7 +104,7 @@ describe("AgentSession queue characterization", () => {
 			rationale: "durable lesson found",
 			instructions: "capture the durable lesson",
 		}));
-		const harness = await createHarness({
+		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 0 } },
 			autoRefineReviewer: reviewer,
 		});
@@ -126,7 +130,7 @@ describe("AgentSession queue characterization", () => {
 
 	it("auto-refine compact hook does not require the turn interval", async () => {
 		const reviewer = vi.fn(async () => ({ shouldRefine: false, rationale: "nothing durable" }));
-		const harness = await createHarness({
+		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
 			autoRefineReviewer: reviewer,
 		});
@@ -142,7 +146,7 @@ describe("AgentSession queue characterization", () => {
 	});
 
 	it("auto-refine compact hook waits for planned post-compaction continuation", async () => {
-		const harness = await createHarness({
+		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
 		});
 		harnesses.push(harness);
@@ -162,7 +166,7 @@ describe("AgentSession queue characterization", () => {
 	});
 
 	it("auto-refine compact hook runs immediately when no post-compaction continuation is planned", async () => {
-		const harness = await createHarness({
+		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
 		});
 		harnesses.push(harness);
@@ -184,7 +188,7 @@ describe("AgentSession queue characterization", () => {
 			await reviewStarted;
 			return { shouldRefine: true, rationale: "durable lesson" };
 		});
-		const harness = await createHarness({
+		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
 			autoRefineReviewer: reviewer,
 		});
@@ -212,7 +216,7 @@ describe("AgentSession queue characterization", () => {
 			await reviewStarted;
 			return { shouldRefine: true, rationale: "durable lesson" };
 		});
-		const harness = await createHarness({
+		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 } },
 			autoRefineReviewer: reviewer,
 		});
@@ -243,7 +247,7 @@ describe("AgentSession queue characterization", () => {
 	});
 
 	it("auto-refine pending review uses the in-progress guard and catches refine failures", async () => {
-		const harness = await createHarness({
+		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 } },
 		});
 		harnesses.push(harness);
@@ -270,7 +274,7 @@ describe("AgentSession queue characterization", () => {
 	});
 
 	it("clears pending auto-refine state when navigating to another branch", async () => {
-		const harness = await createHarness({
+		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
 		});
 		harnesses.push(harness);
@@ -304,7 +308,7 @@ describe("AgentSession queue characterization", () => {
 			await reviewStarted;
 			return { shouldRefine: true, rationale: "old branch" };
 		});
-		const harness = await createHarness({
+		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 } },
 			autoRefineReviewer: reviewer,
 		});
@@ -326,9 +330,30 @@ describe("AgentSession queue characterization", () => {
 		expect(internals._pendingAutoRefineReview).toBeUndefined();
 	});
 
-	it("auto-refine is skipped for subagent sessions", async () => {
+	it("auto-refine is skipped for sessions without a local harness directory", async () => {
 		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
 		const harness = await createHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 1;
+		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
+		const scheduleAutoRefine = vi.spyOn(internals, "_scheduleAutoRefine").mockImplementation(() => {});
+
+		await internals._maybeAutoRefine("turn_interval");
+		internals._scheduleAutoRefineAfterCompaction(false);
+		internals._scheduleAutoRefineAfterAgentEnd();
+
+		expect(reviewer).not.toHaveBeenCalled();
+		expect(refine).not.toHaveBeenCalled();
+		expect(scheduleAutoRefine).not.toHaveBeenCalled();
+	});
+
+	it("auto-refine is skipped for subagent sessions", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
+		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
 			rlmDepth: 1,
 			autoRefineReviewer: reviewer,
@@ -348,7 +373,7 @@ describe("AgentSession queue characterization", () => {
 
 	it("auto-refine review obeys the cooldown", async () => {
 		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
-		const harness = await createHarness({
+		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 60_000 } },
 			autoRefineReviewer: reviewer,
 		});

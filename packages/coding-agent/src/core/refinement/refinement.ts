@@ -221,6 +221,10 @@ function inferRefinementResultScope(result: RefinementResult): HarnessScope | un
 	return scopes.size === 1 ? [...scopes][0] : undefined;
 }
 
+function withDefaultRefinementScope(result: RefinementResult, scope: HarnessScope): RefinementResult {
+	return inferRefinementResultScope(result) ? result : { ...result, scope };
+}
+
 export function getGlobalHarnessStateDir(agentDir: string = getAgentDir()): string {
 	return join(agentDir, HARNESS_STATE_DIR_NAME);
 }
@@ -333,7 +337,7 @@ export function loadGlobalRefinementHistory(harnessStateDir: string = getGlobalH
 		try {
 			const parsed = JSON.parse(trimmed);
 			if (isRefinementResult(parsed)) {
-				results.push(parsed);
+				results.push(withDefaultRefinementScope(parsed, "global"));
 			}
 		} catch {
 			// Skip malformed lines so a single bad append cannot break rollback.
@@ -355,7 +359,8 @@ export function mergeRefinementHistory(
 		byId.set(result.id, result);
 	}
 	for (const result of session) {
-		byId.set(result.id, result);
+		const existing = byId.get(result.id);
+		byId.set(result.id, result.scope || !existing?.scope ? result : { ...result, scope: existing.scope });
 	}
 	return [...byId.values()];
 }
