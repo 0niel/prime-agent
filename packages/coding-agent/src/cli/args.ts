@@ -217,9 +217,10 @@ export function printHelp(extensionFlags?: ExtensionFlag[]): void {
 	console.log(`${chalk.bold(APP_NAME)} - AI coding assistant with an ipython tool
 
 ${chalk.bold("Usage:")}
-  ${APP_NAME} [options] [@files...] [messages...]
+  ${APP_NAME} [options] [@files...] [messages...]   Open a new chat (press left to reach the agents view)
 
 ${chalk.bold("Commands:")}
+  ${APP_NAME} agents                    Open the agents view (alias: manage)
   ${APP_NAME} install <source> [-l]     Install extension source and add to settings
   ${APP_NAME} remove <source> [-l]      Remove extension source from settings
   ${APP_NAME} uninstall <source> [-l]   Alias for remove

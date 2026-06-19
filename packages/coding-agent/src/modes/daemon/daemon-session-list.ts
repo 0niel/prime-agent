@@ -33,6 +33,7 @@ export interface SessionSummary {
 	thinkingLevel?: ThinkingLevel;
 	isStreaming: boolean;
 	isCompacting: boolean;
+	isBashRunning?: boolean;
 	attachedClients: number;
 	messageCount: number;
 	pendingMessageCount: number;
@@ -132,6 +133,7 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		thinkingLevel: session.thinkingLevel,
 		isStreaming: session.isStreaming,
 		isCompacting: session.isCompacting,
+		isBashRunning: session.isBashRunning,
 		attachedClients: activeSession.clients.size,
 		messageCount: session.messages.length,
 		pendingMessageCount: session.pendingMessageCount,

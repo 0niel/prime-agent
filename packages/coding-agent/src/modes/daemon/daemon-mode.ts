@@ -1535,8 +1535,11 @@ export class AgentDaemon {
 		// agent_status to a session being torn down.
 		this.summarizer.forget(state.activeSessionId);
 		const cascadeError = await this.closeChildSessions(state, reason);
+		// A killed session with no messages (abandoned new-chat) is discarded
+		// outright instead of persisting a sleep state that clutters the list.
+		const isEmptyKilledSession = reason === "killed" && state.runtime.session.messages.length === 0;
 		let persistError: unknown;
-		if (reason !== "shutdown") {
+		if (reason !== "shutdown" && !isEmptyKilledSession) {
 			try {
 				state.runtime.session.sessionManager.appendSessionState({ status: "sleep" });
 			} catch (error) {
@@ -1555,6 +1558,12 @@ export class AgentDaemon {
 		}
 		state.clients.clear();
 		this.sessions.delete(state.activeSessionId);
+		if (isEmptyKilledSession) {
+			const sessionFile = state.runtime.session.sessionFile;
+			if (sessionFile) {
+				await deleteSessionFile(sessionFile).catch(() => undefined);
+			}
+		}
 		if (persistError && reason !== "shutdown" && reason !== "completed") {
 			throw persistError;
 		}
