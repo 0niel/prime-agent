@@ -110,6 +110,41 @@ function readSessionHeader(sessionFile: string): SessionHeader | undefined {
 	}
 }
 
+/** Active-branch git for the indexing headers: walk leaf to root, not the last git_state in
+ * file order (which may belong to a sibling branch). */
+export function activeGitContext(
+	body: string,
+	header: SessionHeader,
+): { repoUrl?: string; commit?: string } | undefined {
+	const byId = new Map<string, { parentId: string | null; type: string; git?: unknown }>();
+	let leafId: string | null = null;
+	for (const line of body.split("\n")) {
+		if (!line.trim()) continue;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		if (!isRecord(parsed) || parsed.type === "session" || typeof parsed.id !== "string") continue;
+		byId.set(parsed.id, {
+			parentId: typeof parsed.parentId === "string" ? parsed.parentId : null,
+			type: typeof parsed.type === "string" ? parsed.type : "",
+			git: parsed.git,
+		});
+		leafId = parsed.id;
+	}
+
+	let current = leafId ? byId.get(leafId) : undefined;
+	for (let depth = 0; current && depth < byId.size + 1; depth += 1) {
+		if (current.type === "git_state" && isRecord(current.git)) {
+			return current.git as { repoUrl?: string; commit?: string };
+		}
+		current = current.parentId ? byId.get(current.parentId) : undefined;
+	}
+	return header.git;
+}
+
 function resolveParentSessionPath(sessionFile: string, parentSession: string): string {
 	return isAbsolute(parentSession) ? parentSession : resolve(dirname(sessionFile), parentSession);
 }
@@ -312,6 +347,13 @@ export async function uploadAgentTraceFile(options: AgentTraceUploadOptions): Pr
 	};
 	if (traceContext.parentSessionId) {
 		headers["X-Parent-Session"] = traceContext.parentSessionId;
+	}
+	const git = activeGitContext(body, header);
+	if (git?.repoUrl) {
+		headers["X-Git-Repo"] = git.repoUrl;
+	}
+	if (git?.commit) {
+		headers["X-Git-Commit"] = git.commit;
 	}
 
 	if (!(await getAgentTracesEnabled(options))) {

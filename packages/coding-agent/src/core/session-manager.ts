@@ -7,6 +7,7 @@ import { dirname, join, resolve } from "path";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import { readFirstLineSync } from "../utils/file-lines.js";
+import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -25,6 +26,7 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	git?: GitContext;
 }
 
 export interface NewSessionOptions {
@@ -152,6 +154,12 @@ export interface AgentStatusEntry extends SessionEntryBase {
 	status: AgentStatus;
 }
 
+/** Append-only repo-state entry; ignored by buildSessionContext and other readers. */
+export interface GitStateEntry extends SessionEntryBase {
+	type: "git_state";
+	git: GitContext;
+}
+
 /**
  * Custom message entry for extensions to inject messages into LLM context.
  * Use customType to identify your extension's entries.
@@ -185,7 +193,8 @@ export type SessionEntry =
 	| LabelEntry
 	| SessionInfoEntry
 	| SessionStateEntry
-	| AgentStatusEntry;
+	| AgentStatusEntry
+	| GitStateEntry;
 
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
@@ -888,6 +897,7 @@ export class SessionManager {
 
 		this.sessionId = sessionId;
 		const timestamp = new Date().toISOString();
+		const git = this.persist ? (captureGitContext(this.cwd) ?? undefined) : undefined;
 		const header: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
@@ -895,6 +905,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.cwd,
 			parentSession: options?.parentSession,
+			git,
 		};
 		this.fileEntries = [header];
 		this.byId.clear();
@@ -1184,6 +1195,39 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Append a git state entry as child of current leaf, then advance leaf. Returns entry id. */
+	appendGitState(git: GitContext): string {
+		const entry: GitStateEntry = {
+			type: "git_state",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			git,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	recordGitStateIfChanged(): string | undefined {
+		if (!this.persist) return undefined;
+		const git = captureGitContext(this.cwd);
+		if (!git) return undefined;
+		const last = this.getActiveGitContext();
+		if (last && gitContextsEqual(last, git)) return undefined;
+		return this.appendGitState(git);
+	}
+
+	/** Active-branch git: nearest git_state from leaf to root, else the header snapshot. */
+	private getActiveGitContext(): GitContext | undefined {
+		let current = this.leafId ? this.byId.get(this.leafId) : undefined;
+		while (current) {
+			if (current.type === "git_state") return current.git;
+			current = current.parentId ? this.byId.get(current.parentId) : undefined;
+		}
+		const header = this.fileEntries[0];
+		return header?.type === "session" ? header.git : undefined;
+	}
+
 	/** Get the latest agent status from the most recent agent_status entry, if any. */
 	getLatestAgentStatus(): AgentStatus | undefined {
 		// Walk the current leaf to root so we only read status on the active branch,
@@ -1460,6 +1504,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.cwd,
 			parentSession: this.persist ? previousSessionFile : undefined,
+			git: this.persist ? (captureGitContext(this.cwd) ?? undefined) : undefined,
 		};
 
 		// Collect labels for entries in the path
@@ -1633,14 +1678,26 @@ export class SessionManager {
 			timestamp,
 			cwd: targetCwd,
 			parentSession: sourcePath,
+			git: captureGitContext(targetCwd) ?? undefined,
 		};
 		appendFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`);
 
-		// Copy all non-header entries from source
+		// Drop the source's git_state entries (re-linking children): they describe the source repo,
+		// so the fork would otherwise report the source's git instead of its own target context.
+		const droppedParent = new Map<string, string | null>();
 		for (const entry of sourceEntries) {
-			if (entry.type !== "session") {
-				appendFileSync(newSessionFile, `${JSON.stringify(entry)}\n`);
-			}
+			if (entry.type === "git_state") droppedParent.set(entry.id, entry.parentId);
+		}
+		const liveParent = (parentId: string | null): string | null => {
+			let pid = parentId;
+			while (pid !== null && droppedParent.has(pid)) pid = droppedParent.get(pid) ?? null;
+			return pid;
+		};
+		for (const entry of sourceEntries) {
+			if (entry.type === "session" || entry.type === "git_state") continue;
+			const parentId = liveParent(entry.parentId);
+			const out = parentId === entry.parentId ? entry : { ...entry, parentId };
+			appendFileSync(newSessionFile, `${JSON.stringify(out)}\n`);
 		}
 
 		return new SessionManager(targetCwd, dir, newSessionFile, true);

@@ -185,6 +185,15 @@ export interface AgentConnectionAgentStatusEntry extends AgentConnectionSessionE
 	};
 }
 
+export interface AgentConnectionGitStateEntry extends AgentConnectionSessionEntryBase {
+	type: "git_state";
+	git: {
+		repoUrl?: string;
+		commit?: string;
+		branch?: string;
+	};
+}
+
 export type AgentConnectionSessionEntry =
 	| AgentConnectionSessionMessageEntry
 	| AgentConnectionThinkingLevelChangeEntry
@@ -197,7 +206,8 @@ export type AgentConnectionSessionEntry =
 	| AgentConnectionLabelEntry
 	| AgentConnectionSessionInfoEntry
 	| AgentConnectionSessionStateEntry
-	| AgentConnectionAgentStatusEntry;
+	| AgentConnectionAgentStatusEntry
+	| AgentConnectionGitStateEntry;
 
 export interface AgentConnectionSessionTreeNode {
 	entry: AgentConnectionSessionEntry;
