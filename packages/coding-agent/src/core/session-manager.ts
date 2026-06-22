@@ -1,9 +1,19 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, TextContent, Usage } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "fs";
-import { readdir, readFile, stat } from "fs/promises";
+import {
+	appendFileSync,
+	createReadStream,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	statSync,
+	writeFileSync,
+} from "fs";
+import { readdir, stat } from "fs/promises";
 import { dirname, join, resolve } from "path";
+import { createInterface } from "readline";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import { readFirstLineSync } from "../utils/file-lines.js";
@@ -18,6 +28,9 @@ import {
 import { cloneUsage } from "./usage.js";
 
 export const CURRENT_SESSION_VERSION = 3;
+const SESSION_LIST_SEARCH_TEXT_MAX_CHARS = 64 * 1024;
+const SESSION_LIST_PARSE_MAX_LINE_CHARS = 1024 * 1024;
+const SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS = 256;
 
 export interface SessionHeader {
 	type: "session";
@@ -647,36 +660,44 @@ function extractTextContent(message: Message): string {
 		.join(" ");
 }
 
-function getLastActivityTime(entries: FileEntry[]): number | undefined {
-	let lastActivityTime: number | undefined;
+function isSessionStateStatus(value: unknown): value is SessionStateStatus {
+	return value === "active" || value === "sleep" || value === "crash" || value === "hidden";
+}
 
-	for (const entry of entries) {
-		if (entry.type !== "message") continue;
+function updateLastActivityTime(lastActivityTime: number | undefined, entry: FileEntry): number | undefined {
+	if (entry.type !== "message") {
+		return lastActivityTime;
+	}
 
-		const message = (entry as SessionMessageEntry).message;
-		if (!isMessageWithContent(message)) continue;
-		if (message.role !== "user" && message.role !== "assistant") continue;
+	const message = (entry as SessionMessageEntry).message;
+	if (!isMessageWithContent(message)) {
+		return lastActivityTime;
+	}
+	if (message.role !== "user" && message.role !== "assistant") {
+		return lastActivityTime;
+	}
 
-		const msgTimestamp = (message as { timestamp?: number }).timestamp;
-		if (typeof msgTimestamp === "number") {
-			lastActivityTime = Math.max(lastActivityTime ?? 0, msgTimestamp);
-			continue;
-		}
+	const msgTimestamp = (message as { timestamp?: number }).timestamp;
+	if (typeof msgTimestamp === "number") {
+		return Math.max(lastActivityTime ?? 0, msgTimestamp);
+	}
 
-		const entryTimestamp = (entry as SessionEntryBase).timestamp;
-		if (typeof entryTimestamp === "string") {
-			const t = new Date(entryTimestamp).getTime();
-			if (!Number.isNaN(t)) {
-				lastActivityTime = Math.max(lastActivityTime ?? 0, t);
-			}
+	const entryTimestamp = (entry as SessionEntryBase).timestamp;
+	if (typeof entryTimestamp === "string") {
+		const t = new Date(entryTimestamp).getTime();
+		if (!Number.isNaN(t)) {
+			return Math.max(lastActivityTime ?? 0, t);
 		}
 	}
 
 	return lastActivityTime;
 }
 
-function getSessionModifiedDate(entries: FileEntry[], header: SessionHeader, statsMtime: Date): Date {
-	const lastActivityTime = getLastActivityTime(entries);
+function getSessionModifiedDateFromLastActivity(
+	lastActivityTime: number | undefined,
+	header: SessionHeader,
+	statsMtime: Date,
+): Date {
 	if (typeof lastActivityTime === "number" && lastActivityTime > 0) {
 		return new Date(lastActivityTime);
 	}
@@ -685,37 +706,128 @@ function getSessionModifiedDate(entries: FileEntry[], header: SessionHeader, sta
 	return !Number.isNaN(headerTime) ? new Date(headerTime) : statsMtime;
 }
 
-function isSessionStateStatus(value: unknown): value is SessionStateStatus {
-	return value === "active" || value === "sleep" || value === "crash" || value === "hidden";
+function appendCappedSearchText(current: string, text: string): string {
+	if (!text || current.length >= SESSION_LIST_SEARCH_TEXT_MAX_CHARS) {
+		return current;
+	}
+	const next = current ? ` ${text}` : text;
+	return current + next.slice(0, SESSION_LIST_SEARCH_TEXT_MAX_CHARS - current.length);
+}
+
+function looksLikeMessageEntry(line: string): boolean {
+	return line.includes('"type":"message"') || line.includes('"type": "message"');
+}
+
+function extractJsonStringPropertyPrefix(
+	text: string,
+	propertyName: string,
+	maxChars: number,
+	startIndex = 0,
+): string | undefined {
+	const propertyIndex = text.indexOf(`"${propertyName}"`, startIndex);
+	if (propertyIndex < 0) {
+		return undefined;
+	}
+	let index = propertyIndex + propertyName.length + 2;
+	while (index < text.length && /\s/.test(text[index] ?? "")) index++;
+	if (text[index] !== ":") {
+		return undefined;
+	}
+	index++;
+	while (index < text.length && /\s/.test(text[index] ?? "")) index++;
+	if (text[index] !== '"') {
+		return undefined;
+	}
+	index++;
+
+	let result = "";
+	let escaped = false;
+	for (; index < text.length && result.length < maxChars; index++) {
+		const char = text[index];
+		if (escaped) {
+			result += char;
+			escaped = false;
+			continue;
+		}
+		if (char === "\\") {
+			escaped = true;
+			continue;
+		}
+		if (char === '"') {
+			break;
+		}
+		result += char;
+	}
+	return result;
+}
+
+function extractOversizedMessageSummary(line: string): {
+	role?: string;
+	timestamp?: number;
+	textPreview?: string;
+} {
+	const timestampText = extractJsonStringPropertyPrefix(line, "timestamp", 64);
+	const timestamp = timestampText ? new Date(timestampText).getTime() : NaN;
+	const messageIndex = line.indexOf('"message"');
+	const role =
+		messageIndex >= 0
+			? extractJsonStringPropertyPrefix(line, "role", 64, messageIndex)
+			: extractJsonStringPropertyPrefix(line, "role", 64);
+	let textPreview: string | undefined;
+	if (messageIndex >= 0) {
+		textPreview =
+			extractJsonStringPropertyPrefix(line, "content", SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS, messageIndex) ??
+			extractJsonStringPropertyPrefix(line, "text", SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS, messageIndex);
+	}
+	return {
+		role,
+		...(Number.isNaN(timestamp) ? {} : { timestamp }),
+		...(textPreview ? { textPreview } : {}),
+	};
 }
 
 async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 	try {
-		const content = await readFile(filePath, "utf8");
-		const entries: FileEntry[] = [];
-		const lines = content.trim().split("\n");
-
-		for (const line of lines) {
-			if (!line.trim()) continue;
-			try {
-				entries.push(JSON.parse(line) as FileEntry);
-			} catch {
-				// Skip malformed lines
-			}
-		}
-
-		if (entries.length === 0) return null;
-		const header = entries[0];
-		if (header.type !== "session") return null;
-
 		const stats = await stat(filePath);
+		const stream = createReadStream(filePath, { encoding: "utf8" });
+		const lines = createInterface({ input: stream, crlfDelay: Infinity });
+		let header: SessionHeader | undefined;
 		let messageCount = 0;
 		let firstMessage = "";
-		const allMessages: string[] = [];
+		let allMessagesText = "";
 		let name: string | undefined;
 		let state: SessionState | undefined;
+		let lastActivityTime: number | undefined;
 
-		for (const entry of entries) {
+		for await (const line of lines) {
+			if (!line.trim()) continue;
+
+			// Large tool-result entries can be many MB. They do not carry the
+			// session-list metadata we need, and parsing them during every refresh
+			// can exhaust the daemon heap.
+			if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
+				if (looksLikeMessageEntry(line)) {
+					messageCount++;
+					const summary = extractOversizedMessageSummary(line);
+					if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
+						lastActivityTime = Math.max(lastActivityTime ?? 0, summary.timestamp);
+					}
+					if (summary.role === "user" && !firstMessage) {
+						firstMessage = summary.textPreview || "(large message)";
+					}
+				}
+				continue;
+			}
+
+			const trimmed = line.trim();
+			let entry: FileEntry;
+			try {
+				entry = JSON.parse(trimmed) as FileEntry;
+			} catch {
+				// Skip malformed lines
+				continue;
+			}
+
 			// Extract session name (use latest, including explicit clears)
 			if (entry.type === "session_info") {
 				const infoEntry = entry as SessionInfoEntry;
@@ -728,6 +840,15 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 				}
 			}
 
+			if (!header) {
+				if (entry.type !== "session") {
+					return null;
+				}
+				header = entry as SessionHeader;
+			}
+
+			lastActivityTime = updateLastActivityTime(lastActivityTime, entry);
+
 			if (entry.type !== "message") continue;
 			messageCount++;
 
@@ -738,29 +859,29 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 			const textContent = extractTextContent(message);
 			if (!textContent) continue;
 
-			allMessages.push(textContent);
+			allMessagesText = appendCappedSearchText(allMessagesText, textContent);
 			if (!firstMessage && message.role === "user") {
 				firstMessage = textContent;
 			}
 		}
 
-		const cwd = typeof (header as SessionHeader).cwd === "string" ? (header as SessionHeader).cwd : "";
-		const parentSessionPath = (header as SessionHeader).parentSession;
-
-		const modified = getSessionModifiedDate(entries, header as SessionHeader, stats.mtime);
+		if (!header) return null;
+		const cwd = typeof header.cwd === "string" ? header.cwd : "";
+		const parentSessionPath = header.parentSession;
+		const modified = getSessionModifiedDateFromLastActivity(lastActivityTime, header, stats.mtime);
 
 		return {
 			path: filePath,
-			id: (header as SessionHeader).id,
+			id: header.id,
 			cwd,
 			name,
 			state,
 			parentSessionPath,
-			created: new Date((header as SessionHeader).timestamp),
+			created: new Date(header.timestamp),
 			modified,
 			messageCount,
 			firstMessage: firstMessage || "(no messages)",
-			allMessagesText: allMessages.join(" "),
+			allMessagesText,
 		};
 	} catch {
 		return null;
@@ -786,15 +907,10 @@ async function listSessionsFromDir(
 		const total = progressTotal ?? files.length;
 
 		let loaded = 0;
-		const results = await Promise.all(
-			files.map(async (file) => {
-				const info = await buildSessionInfo(file);
-				loaded++;
-				onProgress?.(progressOffset + loaded, total);
-				return info;
-			}),
-		);
-		for (const info of results) {
+		for (const file of files) {
+			const info = await buildSessionInfo(file);
+			loaded++;
+			onProgress?.(progressOffset + loaded, total);
 			if (info) {
 				sessions.push(info);
 			}
