@@ -84,10 +84,10 @@ export async function listActiveDaemonSessionSummaries(client: DaemonClient): Pr
 
 /** Thrown when a stale-version daemon can't be replaced. The message is user-facing. */
 export class StaleDaemonError extends Error {
-	constructor(socketPath: string) {
+	constructor(readonly socketPath: string) {
 		super(
-			`A previous prime-agent version's background daemon on ${socketPath} couldn't be replaced — it may be mid-turn ` +
-				`or still shutting down, and this version can't drive it. Wait a moment and retry, or run "prime-agent daemon shutdown" to stop it and upgrade.`,
+			`A background daemon from a different prime-agent version is running on ${socketPath} and can't be driven by ` +
+				`this version. Run "prime-agent daemon shutdown" to stop it, then retry.`,
 		);
 		this.name = "StaleDaemonError";
 	}

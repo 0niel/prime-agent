@@ -16,8 +16,11 @@ import {
 	ensureInteractiveDaemonRunning,
 	isDaemonSessionSummary,
 	listActiveDaemonSessionSummaries,
+	probeRunningDaemonSessions,
 	StaleDaemonError,
+	shutdownDaemonAndWait,
 } from "./cli/daemon-launch.js";
+import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions } from "./cli/daemon-stop-confirm.js";
 import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
@@ -363,16 +366,66 @@ async function promptConfirm(message: string): Promise<boolean> {
 	});
 }
 
-async function awaitDaemonReady(daemonReady: Promise<void> | undefined): Promise<void> {
+// Only busy sessions (streaming, compacting, or pending messages) lose work;
+// idle loaded sessions reload from disk on the fresh daemon.
+const STARTUP_SESSION_LOSS_COPY: DaemonSessionLossCopy = {
+	busyDetail(count) {
+		const { noun, pronoun } = pluralizeSessions(count);
+		return `A background daemon from a different prime-agent version is running with ${count} busy ${noun}. Stopping it will terminate ${pronoun}.`;
+	},
+	unlistableDetail:
+		"A background daemon from a different prime-agent version is running and its sessions could not be listed. Stopping it may terminate active sessions.",
+	question: "Stop it and continue?",
+	nonTtyHint: 'Run "prime-agent daemon shutdown" to stop it, then retry.',
+};
+
+// The promise to keep after awaiting readiness. Wrapped in an object so it
+// survives `await` (which would otherwise flatten a returned Promise to void).
+type DaemonReadyResult = { ready: Promise<void> | undefined };
+
+// A stale-version daemon couldn't be taken over automatically (busy or stuck).
+// Offer to stop it (default No) and start a fresh daemon, or exit. Returns the
+// fresh ready promise so callers stop re-handling the original rejection.
+async function takeOverStaleDaemonOrExit(socketPath: string): Promise<DaemonReadyResult> {
+	const probe = await probeRunningDaemonSessions(socketPath);
+	const confirmed = await confirmDaemonSessionLoss(probe, { force: false, copy: STARTUP_SESSION_LOSS_COPY });
+	if (!confirmed) {
+		// Non-TTY already printed the reason; at a TTY the user declined.
+		if (process.stdin.isTTY) {
+			console.error(chalk.dim("Cancelled."));
+		}
+		process.exit(1);
+	}
+	if (!(await shutdownDaemonAndWait(socketPath))) {
+		console.error(
+			chalk.red(`Could not stop the daemon on ${socketPath}. Run "prime-agent daemon shutdown" and retry.`),
+		);
+		process.exit(1);
+	}
+	const ready = ensureInteractiveDaemonRunning(socketPath);
+	try {
+		await ready;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(chalk.red(`Could not start the daemon: ${message}`));
+		process.exit(1);
+	}
+	return { ready };
+}
+
+// Resolves the daemon-ready promise, returning the promise to keep (the same
+// one on success, or the fresh one from a stale-daemon takeover) so repeat
+// calls don't re-handle the original rejection.
+async function awaitDaemonReady(daemonReady: Promise<void> | undefined): Promise<DaemonReadyResult> {
 	if (!daemonReady) {
-		return;
+		return { ready: daemonReady };
 	}
 	try {
 		await daemonReady;
+		return { ready: daemonReady };
 	} catch (error) {
 		if (error instanceof StaleDaemonError) {
-			console.error(chalk.red(error.message));
-			process.exit(1);
+			return takeOverStaleDaemonOrExit(error.socketPath);
 		}
 		throw error;
 	}
@@ -1106,7 +1159,7 @@ export async function main(args: string[], options?: MainOptions) {
 	const daemonSocketPath = parsed.daemonSocket ?? defaultDaemonSocketPath();
 	// Kick off daemon spawn/readiness immediately so it overlaps session-manager
 	// and runtime-services preparation; awaited wherever the daemon is first used.
-	const daemonReady = useDaemonInteractive ? ensureInteractiveDaemonRunning(daemonSocketPath) : undefined;
+	let daemonReady = useDaemonInteractive ? ensureInteractiveDaemonRunning(daemonSocketPath) : undefined;
 	// Errors are rethrown at the await sites below; this only avoids an unhandled
 	// rejection if startup exits before reaching them.
 	daemonReady?.catch(() => {});
@@ -1115,7 +1168,7 @@ export async function main(args: string[], options?: MainOptions) {
 		session: parsed.session,
 	});
 	if (shouldLookupDaemonActiveSession && daemonReady) {
-		await awaitDaemonReady(daemonReady);
+		daemonReady = (await awaitDaemonReady(daemonReady)).ready;
 	}
 	const activeDaemonSessionSummary =
 		shouldLookupDaemonActiveSession && parsed.session
@@ -1303,14 +1356,14 @@ export async function main(args: string[], options?: MainOptions) {
 				fork: parsed.fork,
 			})
 		) {
-			await awaitDaemonReady(daemonReady);
+			daemonReady = (await awaitDaemonReady(daemonReady)).ready;
 			await preloadCodeHighlighter();
 			printTimings();
 			await launchAgentsView(true);
 			return;
 		}
 
-		await awaitDaemonReady(daemonReady);
+		daemonReady = (await awaitDaemonReady(daemonReady)).ready;
 		// No attach and no session selector means a fresh default chat. Defer the
 		// daemon session until the first action so startup is instant and leaving
 		// straight to the agents view (or quitting) creates nothing to clean up.
