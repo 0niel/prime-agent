@@ -846,8 +846,10 @@ export class InteractiveMode {
 		this.ui.addChild(this.headerContainer);
 
 		// Brand splash: side-panel layout with structured runtime metadata on the right.
-		// When onboarding is required, the guided onboarding splash owns the first screen.
-		if (!this.shouldRunOnboarding() && (this.options.verbose || !this.settingsManager.getQuietStartup())) {
+		// The model/cwd are read through live getters, so they fill in once the
+		// connection state loads (rebindCurrentSession below). Onboarding, when
+		// required, renders as a full-screen overlay on top of this header.
+		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
 			// Verbose: include the full keybinding cheatsheet under the brand mark.
 			const hint = (keybinding: AppKeybinding, description: string) => keyHint(keybinding, description);
 			const verboseInstructions = this.options.verbose
