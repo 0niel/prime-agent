@@ -366,10 +366,14 @@ describe("InteractiveMode pending bash components", () => {
 		const loader = (component as unknown as { loader: { intervalId: unknown } }).loader;
 		expect(loader.intervalId).not.toBeNull();
 
+		const editorStub = { clearHistory: vi.fn(), setText: vi.fn() };
 		const fakeThis = {
 			chatContainer: new Container(),
 			pendingMessagesContainer: new Container(),
 			compactionQueuedMessages: [],
+			pastedImages: new Map(),
+			defaultEditor: editorStub,
+			editor: editorStub,
 			streamingComponent: undefined,
 			streamingMessage: undefined,
 			activeBashComponent: component,

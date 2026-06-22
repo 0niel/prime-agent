@@ -726,6 +726,38 @@ describe("Editor component", () => {
 		});
 	});
 
+	describe("Image marker atomicity", () => {
+		it("deletes a whole [image #N] marker with a single Backspace", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+
+			editor.setText("look [image #1]");
+			editor.handleInput("\x7f"); // Backspace
+
+			assert.strictEqual(editor.getText(), "look ");
+		});
+
+		it("deletes a whole [image #N] marker with a single forward Delete", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+
+			editor.setText("[image #12] tail");
+			editor.handleInput("\x01"); // Ctrl+A (move to start of line)
+			editor.handleInput("\x1b[3~"); // Delete (forward)
+
+			assert.strictEqual(editor.getText(), " tail");
+		});
+
+		it("leaves surrounding text intact when deleting a marker", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+
+			editor.setText("a [image #1] b");
+			editor.handleInput("\x1b[D"); // Left past trailing " b" word
+			editor.handleInput("\x1b[D");
+			editor.handleInput("\x7f"); // Backspace deletes the marker, not a single char
+
+			assert.strictEqual(editor.getText(), "a  b");
+		});
+	});
+
 	describe("Word wrapping", () => {
 		it("wraps at word boundaries instead of mid-word", () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
