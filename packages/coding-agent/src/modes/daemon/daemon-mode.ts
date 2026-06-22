@@ -1452,7 +1452,6 @@ export class AgentDaemon {
 
 	private createSessionSnapshot(state: ActiveSessionState): DaemonSessionSnapshot {
 		const metadata = state.runtime.metadata;
-		const sessionManager = state.runtime.session.sessionManager;
 		const parent =
 			metadata.parentActiveSessionId || metadata.parentSessionId || metadata.rlmParentNodeId || metadata.rlmChildId
 				? {
@@ -1474,12 +1473,9 @@ export class AgentDaemon {
 			summary: summaryForActiveSession(state),
 			state: connectionState,
 			messages: state.runtime.session.messages,
-			sessionContext: sessionManager.buildSessionContext(),
-			// The session tree is omitted on purpose: it carries every entry's full
-			// body (tens of MB on long sessions) but is only needed when the user
-			// opens the tree/branch selector. Clients fetch it lazily via
-			// get_session_tree (see DaemonAgentConnection.getSessionTree), keeping
-			// attach cheap regardless of transcript length.
+			// Omit duplicate heavy payloads from attach. The client can derive render
+			// context from messages + state, and fetch the full session tree lazily
+			// when the tree/branch selector opens.
 			lastEventSequence: state.lastEventSequence,
 			...(parent ? { parent } : {}),
 			...(children.length > 0 ? { children } : {}),

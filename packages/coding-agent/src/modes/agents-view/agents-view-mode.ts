@@ -128,6 +128,16 @@ export function createAgentsViewResumeConfig(config: AgentSessionRuntimeConfig):
 	return resumeConfig;
 }
 
+export function createAgentsViewListCommand(
+	config: AgentSessionRuntimeConfig,
+): Extract<DaemonCommand, { type: "list" }> {
+	const command: Extract<DaemonCommand, { type: "list" }> = { type: "list" };
+	if (config.sessionDir) {
+		command.sessionDir = config.sessionDir;
+	}
+	return command;
+}
+
 // Status messages render in a single-row hint slot below the editor; embedded
 // newlines would make that row taller than the layout accounts for and overlap
 // the input, so flatten all whitespace runs to single spaces.
@@ -1358,11 +1368,7 @@ class AgentsViewMode implements Component, Focusable {
 	private async refreshSessions(): Promise<void> {
 		const client = this.requireClient();
 		try {
-			const command: Extract<DaemonCommand, { type: "list" }> = { type: "list", all: true };
-			if (this.options.config.sessionDir) {
-				command.sessionDir = this.options.config.sessionDir;
-			}
-			const response = await client.request(command);
+			const response = await client.request(createAgentsViewListCommand(this.options.config));
 			const data = requireDaemonData(response);
 			const sessions = expectSessionList(data);
 			const visibleSessions = sessions.filter((summary) =>

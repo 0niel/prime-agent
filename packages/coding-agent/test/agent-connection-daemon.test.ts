@@ -373,6 +373,7 @@ interface CreateAttachResultOptions {
 	state?: AgentConnectionState;
 	messages?: AgentMessage[];
 	sessionContext?: DaemonAttachResult["snapshot"]["sessionContext"];
+	omitSessionContext?: boolean;
 	sessionTree?: DaemonAttachResult["snapshot"]["sessionTree"];
 	parent?: DaemonAttachResult["snapshot"]["parent"];
 	replay?: DaemonAttachResult["replay"];
@@ -409,13 +410,17 @@ function createAttachResult(
 			summary,
 			state,
 			messages,
-			sessionContext:
-				options.sessionContext ??
-				({
-					messages,
-					thinkingLevel: state.thinkingLevel,
-					model: state.model ? { provider: state.model.provider, modelId: state.model.id } : null,
-				} satisfies NonNullable<DaemonAttachResult["snapshot"]["sessionContext"]>),
+			...(options.omitSessionContext
+				? {}
+				: {
+						sessionContext:
+							options.sessionContext ??
+							({
+								messages,
+								thinkingLevel: state.thinkingLevel,
+								model: state.model ? { provider: state.model.provider, modelId: state.model.id } : null,
+							} satisfies NonNullable<DaemonAttachResult["snapshot"]["sessionContext"]>),
+					}),
 			sessionTree: options.sessionTree ?? { tree: [], leafId: state.leafId },
 			lastEventSequence,
 			...(options.parent ? { parent: options.parent } : {}),
@@ -573,6 +578,37 @@ describe("DaemonAgentConnection", () => {
 		});
 		await expect(connection.getMessages()).resolves.toEqual(messages);
 		expect(fakeClient.requests.map((request) => request.type)).toEqual(["attach"]);
+	});
+
+	it("keeps attach snapshots usable when the daemon omits duplicate session context", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const messages: AgentMessage[] = [{ role: "user", content: "snapshot prompt", timestamp: 1 }];
+		fakeClient.attachResultFactory = (command) =>
+			createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 15, {
+				state: createConnectionState(command.activeSessionId, "session-snapshot"),
+				messages,
+				omitSessionContext: true,
+			});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await connection.attach();
+
+		const snapshot = await connection.getInitialSnapshot();
+		expect(snapshot).toMatchObject({
+			state: {
+				activeSessionId: "active-1",
+				sessionId: "session-snapshot",
+			},
+			messages,
+			lastEventSequence: 15,
+		});
+		expect(snapshot.sessionContext).toBeUndefined();
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["attach"]);
+
+		await expect(connection.getSessionContext()).resolves.toMatchObject({
+			messages: [{ role: "user", content: "context prompt", timestamp: 3 }],
+		});
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["attach", "get_session_context"]);
 	});
 
 	it("keeps reconnect usable from attach snapshots when replay is unavailable", async () => {
