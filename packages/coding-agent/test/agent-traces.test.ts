@@ -1,4 +1,3 @@
-import { Buffer } from "node:buffer";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -226,7 +225,7 @@ describe("agent trace upload", () => {
 		expect(headers.get("x-parent-session")).toBe("parent-session");
 		expect(headers.get("x-cwd")).toBe(cwd);
 		expect(headers.get("x-agent-version")).toBeTruthy();
-		expect(headers.get("content-length")).toBe(String(Buffer.byteLength(call.init.body as string, "utf8")));
+		expect(headers.get("content-length")).toBeNull();
 	});
 
 	it("uses the production trace API unless a trace-specific base URL is configured", async () => {

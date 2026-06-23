@@ -446,7 +446,6 @@ async function performAgentTraceUpload(options: AgentTraceUploadOptions): Promis
 		Authorization: `Bearer ${credential.apiKey}`,
 		"Content-Type": "application/x-ndjson",
 		Accept: "application/json",
-		"Content-Length": String(bodyBytes),
 		"X-Trace-Id": traceContext.traceId,
 		"X-Cwd": header.cwd,
 		"X-Agent-Version": VERSION,
