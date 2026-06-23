@@ -623,6 +623,9 @@ function buildSessionOptions(
 	if (config.tools) {
 		options.tools = [...config.tools];
 	}
+	if (config.autonomous) {
+		options.autonomous = { ...config.autonomous };
+	}
 
 	return { options, cliThinkingFromModel, diagnostics };
 }
@@ -660,6 +663,7 @@ function runtimeConfigFromArgs(
 		themes: resolveCliPaths(cwd, parsed.themes),
 		noThemes: parsed.noThemes,
 		noContextFiles: parsed.noContextFiles,
+		autonomous: parsed.autonomous ? { enabled: true } : undefined,
 		extensionFlagValues: parsed.unknownFlags.size > 0 ? Object.fromEntries(parsed.unknownFlags.entries()) : undefined,
 	};
 }
@@ -687,6 +691,7 @@ export function resolveRuntimeSessionOptions(
 		allowedToolNames: runtimeSessionOptions?.allowedToolNames,
 		includeGoals: runtimeSessionOptions?.includeGoals,
 		rlmHeartbeatController: runtimeSessionOptions?.rlmHeartbeatController,
+		autonomous: runtimeSessionOptions?.autonomous ?? sessionOptions.autonomous,
 		rlmDepth: runtimeSessionOptions?.rlmDepth,
 		rlmMaxDepth: runtimeSessionOptions?.rlmMaxDepth,
 		rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,

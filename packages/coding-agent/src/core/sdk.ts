@@ -6,6 +6,7 @@ import { AgentSession } from "./agent-session.js";
 import type { AgentSessionCreationOptions } from "./agent-session-services.js";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
 import { AuthStorage } from "./auth-storage.js";
+import type { AgentAutonomousConfig } from "./autonomous.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { convertToLlm } from "./messages.js";
@@ -65,6 +66,8 @@ export interface CreateAgentSessionOptions extends AgentSessionCreationOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Host-side autonomous continuation policy. */
+	autonomous?: AgentAutonomousConfig;
 }
 
 /** Result from createAgentSession */
@@ -358,6 +361,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		sessionStartEvent: options.sessionStartEvent,
 		prewarmIpythonKernel: options.prewarmIpythonKernel,
+		autonomous: options.autonomous,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
 

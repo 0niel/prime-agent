@@ -50,6 +50,16 @@ import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
 import { ensureTool, MISSING_RIPGREP_MESSAGE } from "../utils/tools-manager.js";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.js";
+import {
+	type AgentAutonomousConfig,
+	type AgentAutonomousStatus,
+	type AutonomousRuntimeState,
+	addAutonomousUsage,
+	autonomousStatus,
+	createAutonomousRuntimeState,
+	nextAutonomousContinuation,
+	setAutonomousEnabled,
+} from "./autonomous.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import {
 	type CompactionResult,
@@ -326,6 +336,8 @@ export interface AgentSessionConfig {
 	rlmParentNodeId?: string;
 	/** Host responsible for creating RLM subagent runtimes. */
 	subagentRuntimeHost?: SubagentRuntimeHost;
+	/** Host-side autonomous continuation policy. */
+	autonomous?: AgentAutonomousConfig;
 	/**
 	 * Boot the IPython kernel in the background as soon as the session is created,
 	 * so the first ipython tool call doesn't pay the kernel cold start.
@@ -383,6 +395,8 @@ type GoalSlashCommand =
 	| { kind: "pause" }
 	| { kind: "resume" }
 	| { kind: "start"; objective: string; tokenBudget?: number };
+
+type AutonomousSlashCommand = { kind: "status" } | { kind: "on" } | { kind: "off" };
 
 interface RlmChildRun {
 	id: string;
@@ -665,6 +679,7 @@ export class AgentSession {
 	private _goalAccountingStartedAt: number | undefined = undefined;
 	private _goalAccountedAssistantMessages = new WeakSet<AssistantMessage>();
 	private _goalAbortInProgress = false;
+	private _autonomousState: AutonomousRuntimeState;
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
@@ -756,6 +771,7 @@ export class AgentSession {
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._subagentRuntimeHost = config.subagentRuntimeHost;
+		this._autonomousState = createAutonomousRuntimeState(config.autonomous);
 		this._goalState = this._loadPersistedGoalState();
 		if (this._goalState.status === "active") {
 			this._goalAccountingStartedAt = Date.now();
@@ -870,7 +886,7 @@ export class AgentSession {
 	}
 
 	private _installAgentContinuationHook(): void {
-		this.agent.getContinuationMessages = (context, signal) => this._getGoalContinuationMessages(context, signal);
+		this.agent.getContinuationMessages = (context, signal) => this._getContinuationMessages(context, signal);
 	}
 
 	private _installAgentTurnHook(): void {
@@ -1129,6 +1145,55 @@ export class AgentSession {
 		}
 
 		return { kind: "start", objective: validateGoalObjective(objective), tokenBudget };
+	}
+
+	private _parseAutonomousSlashCommand(text: string): AutonomousSlashCommand | undefined {
+		if (text !== "/autonomous" && !text.startsWith("/autonomous ")) {
+			return undefined;
+		}
+		const rest = text.slice("/autonomous".length).trim().toLowerCase();
+		if (!rest || rest === "status") {
+			return { kind: "status" };
+		}
+		if (rest === "on" || rest === "enable" || rest === "enabled") {
+			return { kind: "on" };
+		}
+		if (rest === "off" || rest === "disable" || rest === "disabled") {
+			return { kind: "off" };
+		}
+		throw new Error("Usage: /autonomous [on|off|status]");
+	}
+
+	private _formatAutonomousStatus(): string {
+		const status = this.getAutonomousStatus();
+		const state = status.enabled ? "on" : "off";
+		return `Autonomous mode: ${state}. Continuations: ${status.continuationsUsed}/${status.limits.maxContinuations}. Turns: ${status.turnsUsed}/${status.limits.maxTurns}. Tokens: ${status.tokensUsed}/${status.limits.maxTokens}.`;
+	}
+
+	private async _emitAutonomousStatus(): Promise<void> {
+		await this.sendCustomMessage(
+			{
+				customType: "autonomous_status",
+				content: this._formatAutonomousStatus(),
+				display: true,
+				details: this.getAutonomousStatus(),
+			},
+			{ triggerTurn: false },
+		);
+	}
+
+	private async _handleAutonomousSlashCommand(text: string): Promise<boolean> {
+		const command = this._parseAutonomousSlashCommand(text);
+		if (!command) {
+			return false;
+		}
+		if (command.kind === "on") {
+			setAutonomousEnabled(this._autonomousState, true);
+		} else if (command.kind === "off") {
+			setAutonomousEnabled(this._autonomousState, false);
+		}
+		await this._emitAutonomousStatus();
+		return true;
 	}
 
 	private async _validateCanStartAgentRun(): Promise<void> {
@@ -1496,6 +1561,18 @@ export class AgentSession {
 		}
 	}
 
+	private async _getContinuationMessages(
+		context: GetContinuationMessagesContext,
+		signal?: AbortSignal,
+	): Promise<AgentMessage[]> {
+		const goalMessages = await this._getGoalContinuationMessages(context, signal);
+		if (goalMessages.length > 0 || signal?.aborted) {
+			return goalMessages;
+		}
+		const autonomousMessage = nextAutonomousContinuation(this._autonomousState, context.message);
+		return autonomousMessage ? [autonomousMessage] : [];
+	}
+
 	// Track last assistant message for auto-compaction check
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
 
@@ -1619,6 +1696,7 @@ export class AgentSession {
 				if (this._accountGoalUsageForAssistantMessage(assistantMsg)) {
 					this.agent.steer(createGoalContextMessage(this._goalState, "budget_limit"));
 				}
+				addAutonomousUsage(this._autonomousState, assistantMsg.usage);
 			}
 		}
 
@@ -1965,6 +2043,10 @@ export class AgentSession {
 		return { ...this._goalWithCurrentWallClock() };
 	}
 
+	getAutonomousStatus(): AgentAutonomousStatus {
+		return autonomousStatus(this._autonomousState);
+	}
+
 	/** Scoped models for cycling (from --models flag) */
 	get scopedModels(): ReadonlyArray<{ model: Model<any>; thinkingLevel?: ThinkingLevel }> {
 		return this._scopedModels;
@@ -2066,6 +2148,11 @@ export class AgentSession {
 			let currentImages = options?.images;
 
 			if (expandPromptTemplates) {
+				const handledAutonomousCommand = await this._handleAutonomousSlashCommand(currentText);
+				if (handledAutonomousCommand) {
+					preflightResult?.(true);
+					return;
+				}
 				const handledGoalCommand = await this._handleGoalSlashCommand(currentText, currentImages);
 				if (handledGoalCommand) {
 					preflightResult?.(true);
