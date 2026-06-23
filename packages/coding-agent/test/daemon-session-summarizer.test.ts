@@ -18,141 +18,116 @@ function assistantMessage(text: string, tools: string[] = []): AgentMessage {
 
 describe("daemon session summarizer", () => {
 	describe("parseAgentStatusResponse", () => {
-		test("parses summary and completion verdict for an idle session", () => {
-			const result = parseAgentStatusResponse("SUMMARY: Added the API reference page.\nSTATUS: COMPLETED", false);
+		test("parses recap and completion verdict for an idle session", () => {
+			const result = parseAgentStatusResponse(
+				"<recap>Added the API reference page</recap>\n<status>COMPLETED</status>",
+				false,
+			);
 			expect(result).toEqual({ summary: "Added the API reference page", taskState: "completed" });
 		});
 
 		test("maps NEEDS_INPUT for idle sessions", () => {
-			const result = parseAgentStatusResponse("SUMMARY: Asked which database to target\nSTATUS: NEEDS_INPUT", false);
+			const result = parseAgentStatusResponse(
+				"<recap>Asked which database to target</recap>\n<status>NEEDS_INPUT</status>",
+				false,
+			);
 			expect(result?.taskState).toBe("needs_input");
 		});
 
-		test("omits the verdict while working", () => {
-			const result = parseAgentStatusResponse("SUMMARY: Refactoring token validation\nSTATUS: WORKING", true);
+		test("omits the verdict while working and ignores any status tag", () => {
+			const result = parseAgentStatusResponse(
+				"<recap>Refactoring token validation</recap>\n<status>COMPLETED</status>",
+				true,
+			);
 			expect(result).toEqual({ summary: "Refactoring token validation" });
 		});
 
-		test("falls back to needs_input on an unrecognized or hedged idle verdict", () => {
-			expect(parseAgentStatusResponse("SUMMARY: Something\nSTATUS: WORKING", false)?.taskState).toBe("needs_input");
-			expect(parseAgentStatusResponse("SUMMARY: Something\nSTATUS: MAYBE", false)?.taskState).toBe("needs_input");
-			expect(parseAgentStatusResponse("SUMMARY: Something", false)?.taskState).toBe("needs_input");
+		test("falls back to needs_input on a missing or unrecognized idle verdict", () => {
+			expect(
+				parseAgentStatusResponse("<recap>Doing something</recap>\n<status>MAYBE</status>", false)?.taskState,
+			).toBe("needs_input");
+			expect(parseAgentStatusResponse("<recap>Doing something</recap>", false)?.taskState).toBe("needs_input");
 		});
 
-		test("requires the SUMMARY marker and never surfaces free-form text", () => {
-			// A chatty/reasoning model that narrates instead of answering yields no
-			// recap rather than leaking its thinking.
+		test("ignores narration outside the tags and never leaks free-form text", () => {
+			// A chatty/reasoning model that narrates instead of using tags yields no recap.
 			expect(parseAgentStatusResponse("Investigating the failing test.", true)).toBeUndefined();
 			expect(
 				parseAgentStatusResponse(
-					"We need to produce exactly two lines: SUMMARY: <one present-tense clause> and STATUS: with a",
-					false,
+					"Recap: . So: <recap>Curating a niche list of Muon optimizer papers</recap>",
+					true,
 				),
-			).toBeUndefined();
+			).toEqual({ summary: "Curating a niche list of Muon optimizer papers" });
 		});
 
-		test("takes the answer after inline reasoning and strips think tags", () => {
-			const reasoning =
-				"<think>Let me decide. The agent finished editing.</think>\nSUMMARY: Updated the login handler\nSTATUS: COMPLETED";
-			expect(parseAgentStatusResponse(reasoning, false)).toEqual({
+		test("ignores reasoning prose around the tags", () => {
+			const text =
+				"Let me decide. The agent finished editing.\n<recap>Updated the login handler</recap>\n<status>COMPLETED</status>";
+			expect(parseAgentStatusResponse(text, false)).toEqual({
 				summary: "Updated the login handler",
 				taskState: "completed",
 			});
 		});
 
-		test("ignores an echoed prompt template", () => {
-			const echoed = "SUMMARY: <one present-tense clause, at most 12 words, no trailing period>\nSTATUS: WORKING";
+		test("rejects an echoed prompt template", () => {
+			const echoed =
+				"<recap>a present-tense clause, at most 12 words, no trailing period</recap>\n<status>COMPLETED</status>";
 			expect(parseAgentStatusResponse(echoed, true)).toBeUndefined();
 		});
 
-		test("strips reasoning tag variants before parsing", () => {
-			for (const tag of ["think", "thinking", "reasoning", "redacted_thinking"]) {
-				const text = `<${tag}>deliberating about the answer</${tag}>\nSUMMARY: Wired the recap line\nSTATUS: COMPLETED`;
-				expect(parseAgentStatusResponse(text, false)).toEqual({
-					summary: "Wired the recap line",
-					taskState: "completed",
-				});
-			}
-		});
-
-		test("returns undefined when no summary is present", () => {
+		test("returns undefined when no recap tag is present", () => {
 			expect(parseAgentStatusResponse("", false)).toBeUndefined();
-			expect(parseAgentStatusResponse("STATUS: COMPLETED", false)).toBeUndefined();
+			expect(parseAgentStatusResponse("<status>COMPLETED</status>", false)).toBeUndefined();
 		});
 
-		test("extracts the recap from <recap> tags", () => {
-			const text = "SUMMARY: <recap>Sending SSH auth retry to tcg-autoresearch-rl</recap>\nSTATUS: WORKING";
+		test("drops chain-of-thought that falls outside the closing recap tag", () => {
+			const text =
+				"<recap>Sending SSH auth retry to tcg-autoresearch-rl</recap> That's 5 words? Count: Sending(1) SSH(2) = 6 words.\n<status>NEEDS_INPUT</status>";
 			expect(parseAgentStatusResponse(text, true)).toEqual({
 				summary: "Sending SSH auth retry to tcg-autoresearch-rl",
 			});
 		});
 
-		test("drops chain-of-thought after the closing recap tag", () => {
+		test("rejects a recap body that is nothing but counting artifacts", () => {
+			expect(parseAgentStatusResponse("<recap>(1) word(2) count(3) = 3 words</recap>", true)).toBeUndefined();
+		});
+
+		test("rejects a rambling recap that blows past the word ceiling", () => {
 			const text =
-				"SUMMARY: <recap>Sending SSH auth retry to tcg-autoresearch-rl</recap> That's 5 words? Count: Sending(1) SSH(2) auth(3) retry(4) to(5) tcg-autoresearch-rl(6) = 6 words. Under..\nSTATUS: WORKING";
-			expect(parseAgentStatusResponse(text, true)).toEqual({
-				summary: "Sending SSH auth retry to tcg-autoresearch-rl",
-			});
-		});
-
-		test("cuts inline reasoning when the model omits the closing tag", () => {
-			const text =
-				"SUMMARY: Sending SSH auth retry to tcg-autoresearch-rl. That's 5 words? Count: Sending(1) SSH(2) = 6 words. Under\nSTATUS: WORKING";
-			expect(parseAgentStatusResponse(text, true)).toEqual({
-				summary: "Sending SSH auth retry to tcg-autoresearch-rl",
-			});
-		});
-
-		test("salvages the clean prefix before counting artifacts begin", () => {
-			const text = "SUMMARY: Counting words(1) two(2) three(3) = 3 words\nSTATUS: WORKING";
-			expect(parseAgentStatusResponse(text, true)).toEqual({ summary: "Counting words" });
-		});
-
-		test("rejects a candidate whose counting starts at the very first word", () => {
-			// No clean prefix to salvage — the recap is nothing but the artifact.
-			const text = "SUMMARY: (1) word(2) count(3) = 3 words\nSTATUS: WORKING";
-			expect(parseAgentStatusResponse(text, true)).toBeUndefined();
-		});
-
-		test("rejects a rambling candidate that blows past the word ceiling", () => {
-			const text =
-				"SUMMARY: this is a very long rambling sentence that just keeps going and going well past any reasonable recap length\nSTATUS: WORKING";
+				"<recap>this is a very long rambling sentence that just keeps going and going well past any reasonable recap length</recap>";
 			expect(parseAgentStatusResponse(text, true)).toBeUndefined();
 		});
 
 		test("strips wrapping quotes the model adds around the recap", () => {
-			const text = 'SUMMARY: <recap>"Wiring the recap line"</recap>\nSTATUS: COMPLETED';
+			const text = '<recap>"Wiring the recap line"</recap>\n<status>COMPLETED</status>';
 			expect(parseAgentStatusResponse(text, false)).toEqual({
 				summary: "Wiring the recap line",
 				taskState: "completed",
 			});
 		});
 
-		test("accepts RECAP: as a synonym for SUMMARY:", () => {
-			const text = "RECAP: Restarting the daemon\nSTATUS: WORKING";
-			expect(parseAgentStatusResponse(text, true)).toEqual({ summary: "Restarting the daemon" });
-		});
-
 		test("ignores an open recap tag with no close", () => {
-			const text = "SUMMARY: <recap>Editing the parser\nSTATUS: WORKING";
-			expect(parseAgentStatusResponse(text, true)).toEqual({ summary: "Editing the parser" });
+			expect(
+				parseAgentStatusResponse("<recap>Editing the parser\n<status>NEEDS_INPUT</status>", true),
+			).toBeUndefined();
 		});
 
-		test("keeps recaps that start with words also used in reasoning", () => {
-			for (const recap of ["Waiting for CI to finish", "Let me know once tests pass", "Under review by the team"]) {
-				expect(parseAgentStatusResponse(`SUMMARY: ${recap}\nSTATUS: WORKING`, true)).toEqual({ summary: recap });
-			}
-		});
-
-		test("takes the last SUMMARY line when a draft is corrected", () => {
-			const text = "SUMMARY: Draft recap\nSUMMARY: Final corrected recap\nSTATUS: WORKING";
+		test("takes the last recap tag when a draft is corrected", () => {
+			const text = "<recap>Draft recap</recap>\n<recap>Final corrected recap</recap>";
 			expect(parseAgentStatusResponse(text, true)).toEqual({ summary: "Final corrected recap" });
 		});
 
-		test("falls back to a SUMMARY line when the tagged body is rejected", () => {
-			// The tag body is pure counting (rejected); a later valid line must win.
-			const text = "<recap>(1) two(2) = 2 words</recap>\nSUMMARY: Editing the parser\nSTATUS: WORKING";
-			expect(parseAgentStatusResponse(text, true)).toEqual({ summary: "Editing the parser" });
+		test("takes the last status tag when a draft is corrected", () => {
+			const text = "<recap>Editing the parser</recap>\n<status>NEEDS_INPUT</status>\n<status>COMPLETED</status>";
+			expect(parseAgentStatusResponse(text, false)?.taskState).toBe("completed");
+		});
+
+		test("normalizes unicode angle-bracket lookalikes around the tags", () => {
+			// The model sometimes emits › ‹ instead of > < ; normalize so the tag still parses.
+			const text = "‹recap›Curating a niche list of Muon optimizer papers‹/recap›";
+			expect(parseAgentStatusResponse(text, true)).toEqual({
+				summary: "Curating a niche list of Muon optimizer papers",
+			});
 		});
 	});
 
