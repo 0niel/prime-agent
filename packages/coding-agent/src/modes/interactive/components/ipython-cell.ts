@@ -77,6 +77,43 @@ const COMMENT_LINE_PATTERN = /^\s*#/;
 // Strip a leading `cd … &&` to surface the real command.
 const CD_PREFIX_PATTERN = /^\s*cd\s+[^&;|]+(?:&&|;)\s*/;
 
+const SGR_PATTERN = /\x1b\[([0-9;]*)m/g;
+
+/**
+ * Append `ESC[0m` when `line` ends with a foreground or background color still
+ * open, so a span that wrapTextWithAnsi split across lines cannot bleed into the
+ * trailing padding or the next line.
+ */
+function closeOpenSgr(line: string): string {
+	let fgOpen = false;
+	let bgOpen = false;
+	for (const match of line.matchAll(SGR_PATTERN)) {
+		const params = match[1] === "" ? ["0"] : match[1].split(";");
+		for (let i = 0; i < params.length; i++) {
+			const code = Number(params[i]);
+			if (code === 0) {
+				fgOpen = false;
+				bgOpen = false;
+			} else if (code === 38 || code === 48) {
+				// Skip the color data of `38;5;n` / `38;2;r;g;b` so a component (e.g. 38) isn't read as a code.
+				if (code === 38) fgOpen = true;
+				else bgOpen = true;
+				const mode = Number(params[i + 1]);
+				i += mode === 2 ? 4 : mode === 5 ? 2 : 1;
+			} else if (code === 39) {
+				fgOpen = false;
+			} else if (code === 49) {
+				bgOpen = false;
+			} else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) {
+				fgOpen = true;
+			} else if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) {
+				bgOpen = true;
+			}
+		}
+	}
+	return fgOpen || bgOpen ? `${line}\x1b[0m` : line;
+}
+
 function collapseWhitespace(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
@@ -693,7 +730,7 @@ export class IPythonCellComponent implements Component {
 		const wrapped = wrapTextWithAnsi(text, available);
 		for (const [index, line] of (wrapped.length > 0 ? wrapped : [""]).entries()) {
 			const linePrefix = index === 0 ? prefix : " ".repeat(visibleWidth(prefix));
-			lines.push(toolPanelLine(linePrefix + line, width));
+			lines.push(toolPanelLine(linePrefix + closeOpenSgr(line), width));
 		}
 	}
 
