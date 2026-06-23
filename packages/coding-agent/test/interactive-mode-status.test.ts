@@ -293,6 +293,7 @@ describe("InteractiveMode pending bash components", () => {
 		const component = bashComponent();
 		const fakeThis = {
 			pendingMessagesContainer,
+			queuedMessagesContainer: new Container(),
 			pendingBashComponents: [component],
 			getAllQueuedMessages: () => ({ steering: [], followUp: [] }),
 		} as unknown as InteractiveMode;
@@ -370,6 +371,7 @@ describe("InteractiveMode pending bash components", () => {
 		const fakeThis = {
 			chatContainer: new Container(),
 			pendingMessagesContainer: new Container(),
+			queuedMessagesContainer: new Container(),
 			compactionQueuedMessages: [],
 			pastedImages: new Map(),
 			defaultEditor: editorStub,

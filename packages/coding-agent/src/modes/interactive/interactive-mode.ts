@@ -491,6 +491,7 @@ export class InteractiveMode {
 	private chatContainer: Container;
 	private pendingMessagesContainer: Container;
 	private statusContainer: Container;
+	private queuedMessagesContainer: Container;
 	private defaultEditor: CustomEditor;
 	private editor: EditorComponent;
 	private editorComponentFactory: EditorFactory | undefined;
@@ -661,6 +662,7 @@ export class InteractiveMode {
 		this.chatContainer = new Container();
 		this.pendingMessagesContainer = new Container();
 		this.statusContainer = new Container();
+		this.queuedMessagesContainer = new Container();
 		this.childAgentInspector = new ChildAgentInspectorComponent(
 			() => this.getChildAgentPanelRows(),
 			() => this.ui.requestRender(),
@@ -944,6 +946,7 @@ export class InteractiveMode {
 		this.mainContainer.addChild(this.widgetContainerAbove);
 		this.renderRecap();
 		this.mainContainer.addChild(this.recapContainer);
+		this.mainContainer.addChild(this.queuedMessagesContainer);
 		this.mainContainer.addChild(this.editorContainer);
 		this.mainContainer.addChild(this.childAgentSummary);
 		this.mainContainer.addChild(this.widgetContainerBelow);
@@ -2123,6 +2126,7 @@ export class InteractiveMode {
 	private resetCurrentSessionRenderState(): void {
 		this.chatContainer.clear();
 		this.pendingMessagesContainer.clear();
+		this.queuedMessagesContainer.clear();
 		this.compactionQueuedMessages = [];
 		// Pasted images belong to the session being torn down; drop them so markers
 		// in a newly loaded session can't resolve to the previous session's bytes.
@@ -2922,6 +2926,8 @@ export class InteractiveMode {
 		this.editorComponentFactory = factory;
 		if (this.childAgentPanelMode) {
 			this.restoreMainAgentView();
+			// Re-render queued previews cleared on panel entry; the queue may still hold messages.
+			this.updatePendingMessagesDisplay();
 			this.childAgentDetailNodeId = undefined;
 			this.childAgentDetail.setNode(undefined);
 		}
@@ -4404,6 +4410,7 @@ export class InteractiveMode {
 		this.childAgentSummary.setHidden(true);
 		this.childAgentInspector.setNodes(this.childAgentNodes);
 		this.editorContainer.clear();
+		this.queuedMessagesContainer.clear();
 		this.mainViewContainer.clear();
 		this.mainViewContainer.addChild(this.childAgentInspector);
 		this.ui.setFocus(this.childAgentInspector);
@@ -4420,6 +4427,7 @@ export class InteractiveMode {
 		this.childAgentDetail.setNode(node);
 		this.childAgentSummary.setHidden(true);
 		this.editorContainer.clear();
+		this.queuedMessagesContainer.clear();
 		this.mainViewContainer.clear();
 		this.mainViewContainer.addChild(this.childAgentDetail);
 		this.ui.setFocus(this.childAgentDetail);
@@ -4440,6 +4448,8 @@ export class InteractiveMode {
 		this.childAgentDetail.setNode(undefined);
 		this.childAgentSummary.setHidden(false);
 		this.restoreMainAgentView();
+		// Re-render queued previews cleared on panel entry; the queue may still hold messages.
+		this.updatePendingMessagesDisplay();
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
 		this.ui.setFocus(this.editor);
@@ -5229,26 +5239,30 @@ export class InteractiveMode {
 	}
 
 	private updatePendingMessagesDisplay(): void {
+		// pendingMessagesContainer holds only in-flight bash output for the current
+		// turn, so it stays above the execution indicator. clear() detaches the
+		// components but they stay tracked in pendingBashComponents until flushed.
 		this.pendingMessagesContainer.clear();
-		// Keep in-flight bash output visible across queue refreshes; clear() detaches
-		// the components but they stay tracked in pendingBashComponents until flushed.
 		for (const component of this.pendingBashComponents) {
 			this.pendingMessagesContainer.addChild(component);
 		}
+		// Queued steering/follow-up previews are future turns, so they render in
+		// their own container below the execution indicator and recap.
+		this.queuedMessagesContainer.clear();
 		const { steering: steeringMessages, followUp: followUpMessages } = this.getAllQueuedMessages();
 		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
-			this.pendingMessagesContainer.addChild(new Spacer(1));
+			this.queuedMessagesContainer.addChild(new Spacer(1));
 			for (const message of steeringMessages) {
 				const text = theme.fg("dim", `Steering: ${message}`);
-				this.pendingMessagesContainer.addChild(new TruncatedText(text, 1, 0));
+				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			for (const message of followUpMessages) {
 				const text = theme.fg("dim", `Follow-up: ${message}`);
-				this.pendingMessagesContainer.addChild(new TruncatedText(text, 1, 0));
+				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			const dequeueHint = this.getAppKeyDisplay("app.message.dequeue");
 			const hintText = theme.fg("dim", `↳ ${dequeueHint} to edit all queued messages`);
-			this.pendingMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
+			this.queuedMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
 		}
 	}
 
