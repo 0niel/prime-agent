@@ -2,16 +2,42 @@ import { describe, expect, it } from "vitest";
 import { getModel, getSupportedThinkingLevels } from "../src/models.js";
 
 describe("getSupportedThinkingLevels", () => {
-	it("includes xhigh for Anthropic Opus 4.6 on anthropic-messages API", () => {
+	it("includes max but not xhigh for Anthropic Opus 4.6 on anthropic-messages API", () => {
 		const model = getModel("anthropic", "claude-opus-4-6");
 		expect(model).toBeDefined();
-		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
+		const levels = getSupportedThinkingLevels(model!);
+		expect(levels).toContain("max");
+		expect(levels).not.toContain("xhigh");
 	});
 
-	it("includes xhigh for Anthropic Opus 4.7 on anthropic-messages API", () => {
+	it("includes both xhigh and max for Anthropic Opus 4.7 on anthropic-messages API", () => {
 		const model = getModel("anthropic", "claude-opus-4-7");
 		expect(model).toBeDefined();
-		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
+		const levels = getSupportedThinkingLevels(model!);
+		expect(levels).toContain("xhigh");
+		expect(levels).toContain("max");
+	});
+
+	it("includes both xhigh and max for Anthropic Opus 4.8 on anthropic-messages API", () => {
+		const model = getModel("anthropic", "claude-opus-4-8");
+		expect(model).toBeDefined();
+		const levels = getSupportedThinkingLevels(model!);
+		expect(levels).toContain("xhigh");
+		expect(levels).toContain("max");
+	});
+
+	it("includes max but not xhigh for Anthropic Sonnet 4.6 (adaptive thinking)", () => {
+		const model = getModel("anthropic", "claude-sonnet-4-6");
+		expect(model).toBeDefined();
+		const levels = getSupportedThinkingLevels(model!);
+		expect(levels).toContain("max");
+		expect(levels).not.toContain("xhigh");
+	});
+
+	it("does not include max for older budget-based Claude models", () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeDefined();
+		expect(getSupportedThinkingLevels(model!)).not.toContain("max");
 	});
 
 	it("does not include xhigh for non-Opus Anthropic models", () => {
@@ -44,9 +70,11 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "high", "xhigh"]);
 	});
 
-	it("includes xhigh for OpenRouter Opus 4.6 (openai-completions API)", () => {
+	it("includes max but not xhigh for OpenRouter Opus 4.6 (openai-completions API)", () => {
 		const model = getModel("openrouter", "anthropic/claude-opus-4.6");
 		expect(model).toBeDefined();
-		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
+		const levels = getSupportedThinkingLevels(model!);
+		expect(levels).toContain("max");
+		expect(levels).not.toContain("xhigh");
 	});
 });

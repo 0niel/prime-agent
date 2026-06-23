@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `max` thinking level (above `xhigh`) and mapped each adaptive Claude family to the effort levels its API actually supports: Opus 4.6 / Sonnet 4.6 expose `max` (no `xhigh`); Opus 4.7 / Opus 4.8 / Fable 5 / Mythos 5 expose both `xhigh` and `max`; Mythos Preview exposes `max`. Adaptive thinking detection now also covers Opus 4.8 and the Fable/Mythos families on both the Anthropic and Bedrock providers.
+
 ## [0.1.3] - 2026-06-12
 
 ## [0.1.2] - 2026-06-12

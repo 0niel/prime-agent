@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added a `max` thinking level to the thinking selector, `--thinking` flag, and settings, exposing the top reasoning effort on Claude models that support it (e.g. Opus 4.6+/Sonnet 4.6).
 - Added opt-in Prime Agent trace sharing with `/traces` and background uploads of persisted session JSONL files.
 - Added a first draft of daemon-backed cron jobs for scheduling prompts against long-running sessions without using `/goal`.
 

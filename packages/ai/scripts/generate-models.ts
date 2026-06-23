@@ -209,8 +209,15 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (supportsOpenAiXhigh(model.id)) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
 	}
-	if (model.id.includes("opus-4-6") || model.id.includes("opus-4.6")) {
-		mergeThinkingLevelMap(model, { xhigh: "max" });
+	// Per-family effort support per the Anthropic effort docs. Opus 4.6 / Sonnet 4.6
+	// have no xhigh; Fable 5 / Mythos 5 / Mythos Preview think every turn (off: null).
+	if (
+		model.id.includes("opus-4-6") ||
+		model.id.includes("opus-4.6") ||
+		model.id.includes("sonnet-4-6") ||
+		model.id.includes("sonnet-4.6")
+	) {
+		mergeThinkingLevelMap(model, { max: "max" });
 	}
 	if (
 		model.id.includes("opus-4-7") ||
@@ -218,7 +225,13 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 		model.id.includes("opus-4-8") ||
 		model.id.includes("opus-4.8")
 	) {
-		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
+		mergeThinkingLevelMap(model, { xhigh: "xhigh", max: "max" });
+	}
+	if (model.id.includes("fable-5") || model.id.includes("mythos-5")) {
+		mergeThinkingLevelMap(model, { off: null, xhigh: "xhigh", max: "max" });
+	}
+	if (model.id.includes("mythos-preview")) {
+		mergeThinkingLevelMap(model, { off: null, max: "max" });
 	}
 	if (model.api === "openai-completions" && model.id.includes("deepseek-v4")) {
 		mergeThinkingLevelMap(model, DEEPSEEK_V4_THINKING_LEVEL_MAP);

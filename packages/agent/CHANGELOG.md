@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `max` to the `ThinkingLevel` union so callers can request the top adaptive-thinking effort on supported Claude models.
+
 ## [0.1.3] - 2026-06-12
 
 ## [0.1.2] - 2026-06-12
