@@ -374,7 +374,7 @@ export class AgentDaemon {
 			? await resolveDaemonSessionPath(command.sessionPath, cwd, config.sessionDir)
 			: undefined;
 		const sessionManager = sessionPath
-			? SessionManager.open(sessionPath, config.sessionDir, cwdOverride)
+			? await SessionManager.openAsync(sessionPath, config.sessionDir, cwdOverride)
 			: command.continueRecent
 				? SessionManager.continueRecent(cwd, config.sessionDir)
 				: SessionManager.create(cwd, config.sessionDir);

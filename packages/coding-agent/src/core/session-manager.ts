@@ -11,7 +11,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "fs";
-import { readdir, stat } from "fs/promises";
+import { readdir, readFile, stat } from "fs/promises";
 import { dirname, join, resolve } from "path";
 import { createInterface } from "readline";
 import { v7 as uuidv7 } from "uuid";
@@ -542,13 +542,9 @@ export function getDefaultSessionDir(_cwd: string, agentDir: string = getDefault
 	return sessionDir;
 }
 
-/** Exported for testing */
-export function loadEntriesFromFile(filePath: string): FileEntry[] {
-	if (!existsSync(filePath)) return [];
-
-	// Decode per line off a Buffer: readFileSync(path, "utf8") on a large file is far
-	// slower (one giant UTF-16 string). Splitting on 0x0a is UTF-8-safe.
-	const buffer = readFileSync(filePath);
+// Decode per line off a Buffer: toString("utf8") on a whole large file is far slower
+// (one giant UTF-16 string). Splitting on 0x0a is UTF-8-safe.
+function parseEntriesFromBuffer(buffer: Buffer): FileEntry[] {
 	const entries: FileEntry[] = [];
 	const len = buffer.length;
 	let start = 0;
@@ -564,16 +560,53 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		}
 		start = end + 1;
 	}
+	return entries;
+}
 
-	// Validate session header
+function finalizeLoadedEntries(entries: FileEntry[]): FileEntry[] {
 	if (entries.length === 0) return entries;
 	const header = entries[0];
 	if (header.type !== "session" || typeof (header as any).id !== "string") {
 		return [];
 	}
-
 	applyChildUsageAttributions(entries);
 	return entries;
+}
+
+/** Exported for testing */
+export function loadEntriesFromFile(filePath: string): FileEntry[] {
+	if (!existsSync(filePath)) return [];
+	return finalizeLoadedEntries(parseEntriesFromBuffer(readFileSync(filePath)));
+}
+
+// Async loader for the daemon: reads off the event loop and yields while parsing so a
+// large load doesn't freeze other sessions. Identical output to loadEntriesFromFile.
+export async function loadEntriesFromFileAsync(filePath: string): Promise<FileEntry[]> {
+	if (!existsSync(filePath)) return [];
+	const buffer = await readFile(filePath);
+	const entries: FileEntry[] = [];
+	const len = buffer.length;
+	// yield by bytes, not entry count: parse cost scales with bytes (handles a few huge entries too)
+	const YIELD_BYTES = 4 * 1024 * 1024;
+	let start = 0;
+	let lastYield = 0;
+	while (start < len) {
+		let end = buffer.indexOf(0x0a, start);
+		if (end === -1) end = len;
+		if (end > start) {
+			try {
+				entries.push(JSON.parse(buffer.toString("utf8", start, end)) as FileEntry);
+			} catch {
+				// Skip malformed/blank lines (JSON.parse rejects whitespace-only slices)
+			}
+		}
+		start = end + 1;
+		if (start - lastYield >= YIELD_BYTES) {
+			lastYield = start;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+	}
+	return finalizeLoadedEntries(entries);
 }
 
 function readSessionHeader(filePath: string): Partial<SessionHeader> | undefined {
@@ -986,7 +1019,13 @@ export class SessionManager {
 	private leafId: string | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
 
-	private constructor(cwd: string, sessionDir: string, sessionFile: string | undefined, persist: boolean) {
+	private constructor(
+		cwd: string,
+		sessionDir: string,
+		sessionFile: string | undefined,
+		persist: boolean,
+		preloadedEntries?: FileEntry[],
+	) {
 		this.cwd = cwd;
 		this.sessionDir = sessionDir;
 		this.persist = persist;
@@ -995,17 +1034,21 @@ export class SessionManager {
 		}
 
 		if (sessionFile) {
-			this.setSessionFile(sessionFile);
+			this.setSessionFile(sessionFile, preloadedEntries);
 		} else {
 			this.newSession();
 		}
 	}
 
-	/** Switch to a different session file (used for resume and branching) */
-	setSessionFile(sessionFile: string): void {
+	/**
+	 * Switch to a different session file (used for resume and branching).
+	 * preloadedEntries must be loadEntriesFromFile(sessionFile) for the same path; it
+	 * lets the async daemon path skip the synchronous re-read.
+	 */
+	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
 		this.sessionFile = resolve(sessionFile);
 		if (existsSync(this.sessionFile)) {
-			this.fileEntries = loadEntriesFromFile(this.sessionFile);
+			this.fileEntries = preloadedEntries ?? loadEntriesFromFile(this.sessionFile);
 
 			// If file was empty or corrupted (no valid header), truncate and start fresh
 			// to avoid appending messages without a session header (which breaks the session)
@@ -1776,6 +1819,25 @@ export class SessionManager {
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ?? resolve(path, "..");
 		return new SessionManager(cwd ?? process.cwd(), dir, path, true);
+	}
+
+	/**
+	 * Non-blocking open() for the daemon: parses off the event loop so a large load
+	 * doesn't freeze other sessions. Falls back to open() for any non-happy path so
+	 * behavior is identical to it.
+	 */
+	static async openAsync(path: string, sessionDir?: string, cwdOverride?: string): Promise<SessionManager> {
+		if (!existsSync(path)) {
+			return SessionManager.open(path, sessionDir, cwdOverride);
+		}
+		const entries = await loadEntriesFromFileAsync(path);
+		// empty/corrupt: defer to open() (finalizeLoadedEntries guarantees entries[0] is a valid header otherwise)
+		if (entries.length === 0) {
+			return SessionManager.open(path, sessionDir, cwdOverride);
+		}
+		const cwd = cwdOverride ?? (entries[0] as SessionHeader).cwd;
+		const dir = sessionDir ?? resolve(path, "..");
+		return new SessionManager(cwd ?? process.cwd(), dir, path, true, entries);
 	}
 
 	/**
