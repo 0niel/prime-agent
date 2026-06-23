@@ -7,6 +7,11 @@
 - Added a `max` thinking level to the thinking selector, `--thinking` flag, and settings, exposing the top reasoning effort on Claude models that support it (e.g. Opus 4.6+/Sonnet 4.6).
 - Added opt-in Prime Agent trace sharing with `/traces` and background uploads of persisted session JSONL files.
 - Added a first draft of daemon-backed cron jobs for scheduling prompts against long-running sessions without using `/goal`.
+- Added `/effort` (alias `/thinking`) to set the reasoning/thinking level, with argument autocomplete listing the levels the current model supports.
+
+### Changed
+
+- Replaced the `Shift+Tab` thinking-level cycle with the `/effort` command.
 
 ## [0.1.3] - 2026-06-12
 

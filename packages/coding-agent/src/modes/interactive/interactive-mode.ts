@@ -6,8 +6,16 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Api, AssistantMessage, ImageContent, Message, Model, ToolCall } from "@earendil-works/pi-ai";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import {
+	type Api,
+	type AssistantMessage,
+	getSupportedThinkingLevels,
+	type ImageContent,
+	type Message,
+	type Model,
+	type ToolCall,
+} from "@earendil-works/pi-ai";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -341,6 +349,15 @@ type ModelFallbackWarningAction = "show" | "suppress" | "wait";
 const MODEL_SELECTOR_ACTIONS: readonly ModelSelectorAction[] = [
 	{ id: "add_provider", label: "Add provider...", description: "subscription or API key" },
 ];
+
+const THINKING_LEVEL_DESCRIPTIONS: Record<ThinkingLevel, string> = {
+	off: "No reasoning",
+	minimal: "Very brief reasoning",
+	low: "Light reasoning",
+	medium: "Moderate reasoning",
+	high: "Deep reasoning",
+	xhigh: "Maximum reasoning",
+};
 
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 
@@ -789,6 +806,16 @@ export class InteractiveMode {
 			};
 		}
 
+		const effortCommand = slashCommands.find((command) => command.name === "effort");
+		if (effortCommand) {
+			effortCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
+				this.getThinkingLevelCompletions(prefix);
+			const levels = this.getAvailableThinkingLevels();
+			if (levels.length > 0) {
+				effortCommand.argumentHint = `[${levels.join("/")}]`;
+			}
+		}
+
 		const connectionCommands = this.connectionCommands;
 		const templateCommands: SlashCommand[] = connectionCommands
 			.filter((cmd) => cmd.source === "prompt")
@@ -874,7 +901,7 @@ export class InteractiveMode {
 						hint("app.exit", "to exit (empty)"),
 						hint("app.suspend", "to suspend"),
 						keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
-						hint("app.thinking.cycle", "to cycle thinking level"),
+						rawKeyHint("/effort", "to set thinking level"),
 						hint("app.model.select", "to select model"),
 						hint("app.tools.expand", "to expand tools"),
 						hint("app.thinking.toggle", "to expand thinking"),
@@ -3089,7 +3116,6 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.interrupt", () => this.handleInterruptKey());
 		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
 		this.defaultEditor.onAction("app.suspend", () => this.handleCtrlZ());
-		this.defaultEditor.onAction("app.thinking.cycle", () => this.cycleThinkingLevel());
 
 		// Global debug handler on TUI (works regardless of focus)
 		this.ui.onDebug = () => {
@@ -3255,6 +3281,11 @@ export class InteractiveMode {
 				const searchTerm = commandArgs || undefined;
 				this.editor.setText("");
 				await this.handleModelCommand(searchTerm);
+				return;
+			}
+			if (commandName === "effort") {
+				this.editor.setText("");
+				this.handleEffortCommand(commandArgs);
 				return;
 			}
 			if (commandName === "export") {
@@ -5022,24 +5053,6 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private cycleThinkingLevel(): void {
-		void this.agentConnection
-			.cycleThinkingLevel()
-			.then((newLevel) => {
-				if (newLevel === undefined) {
-					this.showStatus("Current model does not support thinking");
-				} else {
-					this.patchConnectionState({ thinkingLevel: newLevel });
-					this.footer.invalidate();
-					this.updateEditorBorderColor();
-					this.showStatus(`Thinking level: ${newLevel}`);
-				}
-			})
-			.catch((error) => {
-				this.showError(error instanceof Error ? error.message : String(error));
-			});
-	}
-
 	private toggleToolOutputExpansion(): void {
 		this.setToolsExpanded(!this.toolOutputExpanded);
 	}
@@ -5587,9 +5600,14 @@ export class InteractiveMode {
 	private async applySelectedModel(model: AgentConnectionModel): Promise<void> {
 		await this.agentConnection.setModel(model.provider, model.id);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
-		this.patchConnectionState({ model });
+		this.patchConnectionState({
+			model,
+			availableThinkingLevels: getSupportedThinkingLevels(model) as ThinkingLevel[],
+		});
 		this.footer.invalidate();
 		this.updateEditorBorderColor();
+		// Rebuild so the /effort argument hint reflects the new model's levels.
+		this.setupAutocompleteProvider();
 	}
 
 	private async getConnectionAvailableModels(): Promise<AgentConnectionModel[]> {
@@ -5658,6 +5676,59 @@ export class InteractiveMode {
 		}
 		this.anthropicSubscriptionWarningShown = true;
 		this.showWarning(warning);
+	}
+
+	private getAvailableThinkingLevels(): ThinkingLevel[] {
+		const levels = this.connectionState?.availableThinkingLevels ?? [];
+		const supportsThinking = levels.length > 0 && !(levels.length === 1 && levels[0] === "off");
+		return supportsThinking ? levels : [];
+	}
+
+	private getThinkingLevelCompletions(prefix: string): AutocompleteItem[] | null {
+		const levels = this.getAvailableThinkingLevels();
+		if (levels.length === 0) return null;
+		const current = this.connectionState?.thinkingLevel;
+		const term = prefix.trim().toLowerCase();
+		const matches = term ? levels.filter((level) => level.startsWith(term)) : levels;
+		if (matches.length === 0) return null;
+		return matches.map((level) => ({
+			value: level,
+			label: level,
+			description:
+				level === current ? `${THINKING_LEVEL_DESCRIPTIONS[level]} (current)` : THINKING_LEVEL_DESCRIPTIONS[level],
+		}));
+	}
+
+	private handleEffortCommand(arg: string): void {
+		const levels = this.getAvailableThinkingLevels();
+		if (levels.length === 0) {
+			this.showStatus("Current model does not support thinking");
+			return;
+		}
+		const requested = arg.trim().toLowerCase();
+		if (!requested) {
+			this.showStatus(`Thinking level: ${this.connectionState?.thinkingLevel} (type a level: ${levels.join(", ")})`);
+			return;
+		}
+		if (!levels.includes(requested as ThinkingLevel)) {
+			this.showError(`Unknown thinking level '${requested}'. Available: ${levels.join(", ")}`);
+			return;
+		}
+		this.applyThinkingLevel(requested as ThinkingLevel);
+	}
+
+	private applyThinkingLevel(level: ThinkingLevel): void {
+		void this.agentConnection
+			.setThinkingLevel(level)
+			.then(() => {
+				this.patchConnectionState({ thinkingLevel: level });
+				this.footer.invalidate();
+				this.updateEditorBorderColor();
+				this.showStatus(`Thinking level: ${level}`);
+			})
+			.catch((error) => {
+				this.showError(error instanceof Error ? error.message : String(error));
+			});
 	}
 
 	private showModelSelector(initialSearchInput?: string): void {
@@ -6942,7 +7013,6 @@ export class InteractiveMode {
 		const interrupt = this.getAppKeyDisplay("app.interrupt");
 		const exit = this.getAppKeyDisplay("app.exit");
 		const suspend = this.getAppKeyDisplay("app.suspend");
-		const cycleThinkingLevel = this.getAppKeyDisplay("app.thinking.cycle");
 		const selectModel = this.getAppKeyDisplay("app.model.select");
 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
 		const toggleThinking = this.getAppKeyDisplay("app.thinking.toggle");
@@ -6985,7 +7055,6 @@ export class InteractiveMode {
 | \`${clear}\` | Interrupt current operation (first) / exit (second) |
 ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${exit}\` | Exit (when editor is empty) |
 | \`${suspend}\` | Suspend to background |
-| \`${cycleThinkingLevel}\` | Cycle thinking level |
 | \`${selectModel}\` | Open model selector |
 | \`${expandTools}\` | Toggle tool output expansion |
 | \`${toggleThinking}\` | Toggle thinking block visibility |

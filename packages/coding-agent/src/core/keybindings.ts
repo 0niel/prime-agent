@@ -16,7 +16,6 @@ export interface AppKeybindings {
 	"app.input.clear": true;
 	"app.exit": true;
 	"app.suspend": true;
-	"app.thinking.cycle": true;
 	"app.model.select": true;
 	"app.provider.add": true;
 	"app.tools.expand": true;
@@ -75,10 +74,6 @@ export const KEYBINDINGS = {
 	"app.suspend": {
 		defaultKeys: process.platform === "win32" ? [] : "ctrl+z",
 		description: "Suspend to background",
-	},
-	"app.thinking.cycle": {
-		defaultKeys: "shift+tab",
-		description: "Cycle thinking level",
 	},
 	"app.model.select": { defaultKeys: "ctrl+l", description: "Open model selector" },
 	"app.provider.add": { defaultKeys: "ctrl+p", description: "Add provider" },
@@ -247,7 +242,6 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	clearInput: "app.input.clear",
 	exit: "app.exit",
 	suspend: "app.suspend",
-	cycleThinkingLevel: "app.thinking.cycle",
 	selectModel: "app.model.select",
 	expandTools: "app.tools.expand",
 	toggleThinking: "app.thinking.toggle",

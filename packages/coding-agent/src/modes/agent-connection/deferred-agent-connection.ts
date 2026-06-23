@@ -1,5 +1,5 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Transport } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type ImageContent, type Transport } from "@earendil-works/pi-ai";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
 import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
@@ -189,7 +189,9 @@ export class DeferredAgentConnection implements AgentConnection {
 			cwd: this.seed.cwd,
 			model: this.seed.model,
 			thinkingLevel: this.seed.thinkingLevel,
-			availableThinkingLevels: [],
+			availableThinkingLevels: this.seed.model
+				? (getSupportedThinkingLevels(this.seed.model) as ThinkingLevel[])
+				: [],
 			isStreaming: false,
 			isCompacting: false,
 			isBashRunning: false,

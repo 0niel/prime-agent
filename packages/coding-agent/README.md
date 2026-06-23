@@ -140,6 +140,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 |---------|-------------|
 | `/login`, `/logout` | OAuth authentication |
 | `/model` | Switch models |
+| `/effort` | Set reasoning/thinking level |
 | `/scoped-models` | Enable/disable models for Ctrl+P cycling |
 | `/settings` | Thinking level, theme, message delivery, transport |
 | `/resume` | Pick from previous sessions |
@@ -174,7 +175,6 @@ See `/hotkeys` for the full list. Customize via `~/.prime/agent/keybindings.json
 | Escape twice | Open `/tree` |
 | Ctrl+L | Open model selector |
 | Ctrl+P / Shift+Ctrl+P | Cycle scoped models forward/backward |
-| Shift+Tab | Cycle thinking level |
 | Ctrl+O | Collapse/expand tool output |
 | Ctrl+T | Collapse/expand thinking blocks |
 

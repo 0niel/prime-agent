@@ -14,6 +14,14 @@ describe("built-in slash commands", () => {
 		expect(commandNames).toContain("heartbeat");
 		expect(commandNames).not.toContain("cron");
 	});
+
+	test("exposes /effort for selecting the thinking level", () => {
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "effort")).toMatchObject({
+			description: "Set reasoning/thinking level",
+			argumentHint: "[level]",
+			aliases: ["thinking"],
+		});
+	});
 });
 
 describe("slash command aliases", () => {
@@ -58,6 +66,19 @@ describe("slash command aliases", () => {
 			name: "new",
 			args: "",
 			originalName: "clear",
+			isAlias: true,
+		});
+	});
+
+	test("resolves /thinking to /effort through the alias path", () => {
+		const parsed = parseSlashCommand("/thinking");
+
+		expect(isBuiltinSlashCommandName("thinking")).toBe(true);
+		expect(resolveBuiltinSlashCommandName("thinking")).toBe("effort");
+		expect(resolveSlashCommand(parsed!)).toEqual({
+			name: "effort",
+			args: "",
+			originalName: "thinking",
 			isAlias: true,
 		});
 	});

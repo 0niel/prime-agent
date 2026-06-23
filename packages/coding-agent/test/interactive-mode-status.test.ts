@@ -808,6 +808,7 @@ describe("InteractiveMode model selection persistence", () => {
 		applySelectedModel(model: AgentConnectionModel): Promise<void>;
 		handleModelCommand(searchTerm?: string): Promise<void>;
 		completeOnboardingIfCurrentModelReady(): void;
+		setupAutocompleteProvider(): void;
 	};
 
 	const createModel = (provider: string, id: string): AgentConnectionModel =>
@@ -836,13 +837,14 @@ describe("InteractiveMode model selection persistence", () => {
 		fakeThis.footer = { invalidate: vi.fn() };
 		fakeThis.patchConnectionState = vi.fn();
 		fakeThis.updateEditorBorderColor = vi.fn();
+		fakeThis.setupAutocompleteProvider = vi.fn();
 
 		await fakeThis.applySelectedModel(model);
 
 		expect(fakeThis.agentConnection.setModel).toHaveBeenCalledWith("openai", "gpt-5.5");
 		expect(fakeThis.uiServices.settingsManager.setDefaultModelAndProvider).toHaveBeenCalledWith("openai", "gpt-5.5");
 		expect(order).toEqual(["connection", "settings"]);
-		expect(fakeThis.patchConnectionState).toHaveBeenCalledWith({ model });
+		expect(fakeThis.patchConnectionState).toHaveBeenCalledWith({ model, availableThinkingLevels: ["off"] });
 		expect(fakeThis.footer.invalidate).toHaveBeenCalledTimes(1);
 		expect(fakeThis.updateEditorBorderColor).toHaveBeenCalledTimes(1);
 	});
@@ -890,12 +892,13 @@ describe("InteractiveMode model selection persistence", () => {
 		fakeThis.maybeWarnAboutAnthropicSubscriptionAuth = vi.fn(async () => {});
 		fakeThis.checkDaxnutsEasterEgg = vi.fn();
 		fakeThis.completeOnboardingIfCurrentModelReady = vi.fn();
+		fakeThis.setupAutocompleteProvider = vi.fn();
 
 		await fakeThis.handleModelCommand("gpt-5.5");
 
 		expect(fakeThis.agentConnection.setModel).toHaveBeenCalledWith("openai", "gpt-5.5");
 		expect(fakeThis.uiServices.settingsManager.setDefaultModelAndProvider).toHaveBeenCalledWith("openai", "gpt-5.5");
-		expect(fakeThis.patchConnectionState).toHaveBeenCalledWith({ model });
+		expect(fakeThis.patchConnectionState).toHaveBeenCalledWith({ model, availableThinkingLevels: ["off"] });
 		expect(fakeThis.showStatus).toHaveBeenCalledWith("Model: gpt-5.5");
 		expect(fakeThis.showError).not.toHaveBeenCalled();
 		expect(fakeThis.completeOnboardingIfCurrentModelReady).toHaveBeenCalledTimes(1);
@@ -909,6 +912,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		handleModelCommand(searchTerm?: string): Promise<void>;
 		runOnboardingFlow(): Promise<boolean>;
 		applySelectedModel(model: AgentConnectionModel): Promise<void>;
+		setupAutocompleteProvider(): void;
 	};
 	type OnboardingFake = OnboardingHarness & {
 		connectionState: AgentConnectionState;
@@ -1037,6 +1041,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		fakeThis.maybeWarnAboutAnthropicSubscriptionAuth = vi.fn();
 		fakeThis.checkDaxnutsEasterEgg = vi.fn();
 		fakeThis.applySelectedModel = applySelectedModel;
+		fakeThis.setupAutocompleteProvider = vi.fn();
 
 		await handleModelCommand.call(fakeThis, "prime-inference/openai/gpt-5.5");
 

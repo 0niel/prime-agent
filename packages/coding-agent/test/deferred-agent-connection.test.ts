@@ -84,6 +84,31 @@ describe("DeferredAgentConnection", () => {
 		expect(conn.created).toBe(false);
 	});
 
+	test("derives available thinking levels from the seed model before a session exists", async () => {
+		const reasoningModel = {
+			provider: "anthropic",
+			id: "claude-opus",
+			reasoning: true,
+		} as unknown as AgentConnectionModel;
+		const { factory } = makeFactory();
+		const conn = new DeferredAgentConnection(factory, { ...SEED, model: reasoningModel });
+
+		const state = await conn.getState();
+
+		expect(state.availableThinkingLevels).toContain("high");
+		expect(state.availableThinkingLevels.length).toBeGreaterThan(1);
+		expect(factory).not.toHaveBeenCalled();
+	});
+
+	test("reports no thinking levels for a non-reasoning seed model", async () => {
+		const { factory } = makeFactory();
+		const conn = new DeferredAgentConnection(factory, SEED);
+
+		const state = await conn.getState();
+
+		expect(state.availableThinkingLevels).toEqual(["off"]);
+	});
+
 	test("re-evaluates availableModels on each read so login during onboarding shows models", async () => {
 		const { factory } = makeFactory();
 		let models: AgentConnectionModel[] = [];

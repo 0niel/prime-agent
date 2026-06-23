@@ -111,7 +111,6 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 |--------|---------|-------------|
 | `app.model.select` | `ctrl+l` | Open model selector |
 | `app.provider.add` | `ctrl+p` | Add provider from the model selector |
-| `app.thinking.cycle` | `shift+tab` | Cycle thinking level |
 | `app.thinking.toggle` | `ctrl+t` | Collapse or expand thinking blocks |
 
 ### Display and Message Queue
