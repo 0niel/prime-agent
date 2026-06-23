@@ -46,7 +46,15 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "child_process";
-import { APP_TITLE, getAgentDir, getDebugLogPath, getLogsDir, getShareViewerUrl, VERSION } from "../../config.js";
+import {
+	APP_TITLE,
+	getAgentDir,
+	getAgentTracesLogPath,
+	getDebugLogPath,
+	getLogsDir,
+	getShareViewerUrl,
+	VERSION,
+} from "../../config.js";
 import {
 	type AgentTraceUploadResult,
 	getPrimeAgentTraceCredential,
@@ -69,6 +77,7 @@ import { emptyGoalState, formatGoalUsage, type GoalState } from "../../core/goal
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import { createCompactionSummaryMessage } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
+import { resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { parseSkillBlock } from "../../core/skill-blocks.js";
@@ -356,7 +365,8 @@ const THINKING_LEVEL_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	low: "Light reasoning",
 	medium: "Moderate reasoning",
 	high: "Deep reasoning",
-	xhigh: "Maximum reasoning",
+	xhigh: "Very deep reasoning",
+	max: "Maximum reasoning",
 };
 
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
@@ -6711,7 +6721,7 @@ export class InteractiveMode {
 				if (result.statusCode === 404) {
 					return "Trace upload endpoint was not found. The platform API may not be deployed yet, or PRIME_AGENT_TRACES_BASE_URL points at the wrong API.";
 				}
-				return `Trace upload failed: ${result.statusCode ? `HTTP ${result.statusCode}: ` : ""}${result.message}`;
+				return `Trace upload failed: ${result.statusCode ? `HTTP ${result.statusCode}: ` : ""}${result.message}. See ${getAgentTracesLogPath()} for details.`;
 		}
 	}
 
@@ -6741,6 +6751,7 @@ export class InteractiveMode {
 				"",
 				`${theme.fg("dim", "Status:")} ${this.settingsManager.getAgentTracesEnabled() ? "Enabled" : "Disabled"}`,
 				`${theme.fg("dim", "Credential:")} ${credential?.label ?? "Not configured"}`,
+				`${theme.fg("dim", "Endpoint:")} ${resolvePrimeAgentTracesBaseUrl()}`,
 				`${theme.fg("dim", "Session file:")} ${state.sessionFile ?? "In-memory"}`,
 				"",
 				theme.fg("dim", "Commands: /traces on, /traces off, /traces upload, /traces login"),
