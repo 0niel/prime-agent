@@ -425,6 +425,8 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 		this.lastSkillPaths = skillPaths;
 		this.updateSkillsFromPaths(skillPaths, metadataByPath);
+		// Surface resolution-time skill warnings (e.g. missing bundled skills dir).
+		this.skillDiagnostics.push(...resolvedPaths.diagnostics);
 		for (const p of this.additionalSkillPaths) {
 			if (isLocalPath(p) && !existsSync(p) && !this.skillDiagnostics.some((d) => d.path === p)) {
 				this.skillDiagnostics.push({ type: "error", message: "Skill path does not exist", path: p });

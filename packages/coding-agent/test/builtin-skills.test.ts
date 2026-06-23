@@ -98,6 +98,61 @@ describe("builtin skills", () => {
 			expect(result.skills.some((r) => r.metadata.source === "builtin")).toBe(false);
 		});
 
+		it("warns when the bundled skills directory is missing (packaging slip)", async () => {
+			const missingDir = join(tempDir, "does-not-exist");
+			const packageManager = new DefaultPackageManager({
+				cwd,
+				agentDir,
+				settingsManager,
+				bundledSkillsDir: missingDir,
+			});
+			const result = await packageManager.resolve();
+
+			const warning = result.diagnostics.find((d) => d.path === missingDir && d.type === "warning");
+			expect(warning).toBeDefined();
+			expect(warning?.message).toContain("built-in skills");
+		});
+
+		it("warns when the bundled skills directory exists but is empty", async () => {
+			const packageManager = new DefaultPackageManager({
+				cwd,
+				agentDir,
+				settingsManager,
+				bundledSkillsDir: bundledDir,
+			});
+			const result = await packageManager.resolve();
+
+			const warning = result.diagnostics.find((d) => d.path === bundledDir && d.type === "warning");
+			expect(warning).toBeDefined();
+		});
+
+		it("does not warn when bundled skills are present", async () => {
+			writeSkill(bundledDir, "builtin-skill");
+			const packageManager = new DefaultPackageManager({
+				cwd,
+				agentDir,
+				settingsManager,
+				bundledSkillsDir: bundledDir,
+			});
+			const result = await packageManager.resolve();
+
+			expect(result.diagnostics.some((d) => d.path === bundledDir)).toBe(false);
+		});
+
+		it("does not warn when built-in skills are disabled", async () => {
+			const missingDir = join(tempDir, "does-not-exist");
+			settingsManager.setEnableBuiltinSkills(false);
+			const packageManager = new DefaultPackageManager({
+				cwd,
+				agentDir,
+				settingsManager,
+				bundledSkillsDir: missingDir,
+			});
+			const result = await packageManager.resolve();
+
+			expect(result.diagnostics.some((d) => d.path === missingDir)).toBe(false);
+		});
+
 		it("disables individual bundled skills via settings override patterns", async () => {
 			writeSkill(bundledDir, "builtin-skill");
 			writeSkill(bundledDir, "other-skill");
@@ -150,6 +205,15 @@ describe("builtin skills", () => {
 			await loader.reload();
 
 			expect(loader.getSkills().skills).toEqual([]);
+		});
+
+		it("surfaces a skill diagnostic when the bundled skills dir is missing", async () => {
+			const missingDir = join(tempDir, "does-not-exist");
+			const loader = new DefaultResourceLoader({ cwd, agentDir, bundledSkillsDir: missingDir });
+			await loader.reload();
+
+			const { diagnostics } = loader.getSkills();
+			expect(diagnostics.some((d) => d.path === missingDir && d.type === "warning")).toBe(true);
 		});
 	});
 
@@ -212,6 +276,35 @@ describe("builtin skills", () => {
 			expect(skills[0].name).toBe("word-count");
 			expect(skills[0].kind).toBe("python");
 			expect(skills[0].kind === "python" && skills[0].python.importName).toBe("word_count");
+		});
+	});
+
+	// The bundled skills only reach a deployed agent if the build/release scripts
+	// copy skills/ into the shipped layout. A regression here resolves zero
+	// built-in skills at runtime even though the source tree looks correct
+	// (ENG-4220), so assert each shipping path still copies skills.
+	describe("packaging ships bundled skills", () => {
+		const packageRoot = join(__dirname, "..");
+		const repoRoot = join(packageRoot, "..", "..");
+
+		it("npm build (copy-assets) copies skills into dist", () => {
+			const pkg = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf-8")) as {
+				files?: string[];
+				scripts?: Record<string, string>;
+			};
+			expect(pkg.scripts?.["copy-assets"]).toContain("skills dist/skills");
+			// npm publish ships the source skills/ dir via the files allowlist too.
+			expect(pkg.files).toContain("skills");
+		});
+
+		it("binary release script copies skills next to the executable", () => {
+			const script = readFileSync(join(repoRoot, "scripts", "build-binaries.sh"), "utf-8");
+			expect(script).toMatch(/cp -r skills binaries\/\$platform\//);
+		});
+
+		it("release packer includes skills in the packed package", () => {
+			const script = readFileSync(join(repoRoot, "scripts", "pack-prime-agent-release.mjs"), "utf-8");
+			expect(script).toContain('"skills"');
 		});
 	});
 });
