@@ -83,6 +83,7 @@ import { SessionImportFileNotFoundError } from "../../core/session-import-errors
 import { parseSkillBlock } from "../../core/skill-blocks.js";
 import {
 	BUILTIN_SLASH_COMMANDS,
+	builtinSlashCommandTakesArgument,
 	isBuiltinSlashCommandName,
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
@@ -696,6 +697,7 @@ export class InteractiveMode {
 		this.defaultEditor = new CustomEditor(this.ui, getEditorTheme(), this.keybindings, {
 			paddingX: editorPaddingX,
 			autocompleteMaxVisible,
+			isArgumentCommand: builtinSlashCommandTakesArgument,
 		});
 		this.editor = this.defaultEditor;
 		this.mainContainer = new Container();
@@ -786,6 +788,7 @@ export class InteractiveMode {
 			aliases: command.aliases,
 			description: command.description,
 			argumentHint: command.argumentHint,
+			takesArgument: command.takesArgument,
 		}));
 
 		const modelCommand = slashCommands.find((command) => command.name === "model");

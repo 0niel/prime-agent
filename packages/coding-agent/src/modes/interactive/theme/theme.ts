@@ -1265,6 +1265,7 @@ export function getEditorTheme(): EditorTheme {
 		borderColor: (text: string) => theme.fg("borderMuted", text),
 		backgroundColor: theme.getEditorBackgroundColor(),
 		selectList: getSelectListTheme(),
+		commandColor: (text: string) => theme.fg("accent", text),
 	};
 }
 

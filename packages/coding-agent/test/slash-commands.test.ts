@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
 	BUILTIN_SLASH_COMMANDS,
+	builtinSlashCommandTakesArgument,
 	isBuiltinSlashCommandName,
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
@@ -21,6 +22,20 @@ describe("built-in slash commands", () => {
 			argumentHint: "[level]",
 			aliases: ["thinking"],
 		});
+	});
+
+	test("marks argument commands as taking a free-form argument", () => {
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "goal")).toMatchObject({
+			takesArgument: true,
+		});
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "effort")).toMatchObject({
+			takesArgument: true,
+		});
+		expect(builtinSlashCommandTakesArgument("goal")).toBe(true);
+		expect(builtinSlashCommandTakesArgument("effort")).toBe(true);
+		expect(builtinSlashCommandTakesArgument("thinking")).toBe(true);
+		expect(builtinSlashCommandTakesArgument("new")).toBe(false);
+		expect(builtinSlashCommandTakesArgument("clear")).toBe(false);
 	});
 });
 

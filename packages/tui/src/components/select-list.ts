@@ -13,6 +13,7 @@ export interface SelectItem {
 	value: string;
 	label: string;
 	description?: string;
+	takesArgument?: boolean;
 }
 
 export interface SelectListTheme {

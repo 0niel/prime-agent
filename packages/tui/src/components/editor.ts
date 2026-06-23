@@ -225,6 +225,7 @@ export interface EditorTheme {
 	borderColor: (str: string) => string;
 	backgroundColor?: (str: string) => string;
 	selectList: SelectListTheme;
+	commandColor?: (str: string) => string;
 }
 
 export interface EditorOptions {
@@ -264,6 +265,7 @@ export class Editor implements Component, Focusable {
 	// Border color (can be changed dynamically)
 	public borderColor: (str: string) => string;
 	public backgroundColor: ((str: string) => string) | undefined;
+	public commandColor: ((str: string) => string) | undefined;
 
 	// Autocomplete support
 	private autocompleteProvider?: AutocompleteProvider;
@@ -318,6 +320,7 @@ export class Editor implements Component, Focusable {
 		this.theme = theme;
 		this.borderColor = theme.borderColor;
 		this.backgroundColor = theme.backgroundColor;
+		this.commandColor = theme.commandColor;
 		const paddingX = options.paddingX ?? 0;
 		this.paddingX = Number.isFinite(paddingX) ? Math.max(0, Math.floor(paddingX)) : 0;
 		this.promptPrefix = options.promptPrefix ?? "";
@@ -369,6 +372,15 @@ export class Editor implements Component, Focusable {
 
 	protected getHiddenTextPrefixLength(_lineIndex: number, _line: string): number {
 		return 0;
+	}
+
+	protected styleDisplayText(
+		displayText: string,
+		_layoutLineIndex: number,
+		_lineText: string,
+		_cursorCol: number | undefined,
+	): string {
+		return displayText;
 	}
 
 	private getLineHiddenTextPrefixLength(lineIndex: number, line: string): number {
@@ -594,6 +606,13 @@ export class Editor implements Component, Focusable {
 				}
 			}
 
+			displayText = this.styleDisplayText(
+				displayText,
+				absoluteLineIndex,
+				layoutLine.text,
+				layoutLine.hasCursor ? layoutLine.cursorPos : undefined,
+			);
+
 			// Calculate padding based on actual visible width
 			const padding = " ".repeat(Math.max(0, inputWidth - lineVisibleWidth));
 			const lineRightPadding = cursorInPadding ? rightPadding.slice(1) : rightPadding;
@@ -745,6 +764,10 @@ export class Editor implements Component, Focusable {
 
 					if (this.autocompletePrefix.startsWith("/")) {
 						this.cancelAutocomplete();
+						if (selected.takesArgument) {
+							if (this.onChange) this.onChange(this.getText());
+							return;
+						}
 						// Fall through to submit
 					} else {
 						this.cancelAutocomplete();

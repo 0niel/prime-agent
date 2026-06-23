@@ -17,6 +17,7 @@ export interface BuiltinSlashCommand {
 	argumentHint?: string;
 	/** Hidden names that resolve to this command without being shown as commands. */
 	aliases?: readonly string[];
+	takesArgument?: boolean;
 }
 
 export interface ParsedSlashCommand {
@@ -37,7 +38,7 @@ interface BuiltinSlashCommandAlias {
 const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "settings", description: "Open settings menu" },
 	{ name: "model", description: "Select model (opens selector UI)" },
-	{ name: "effort", description: "Set reasoning/thinking level", argumentHint: "[level]" },
+	{ name: "effort", description: "Set reasoning/thinking level", argumentHint: "[level]", takesArgument: true },
 	{ name: "scoped-models", description: "Enable/disable models for Ctrl+P cycling" },
 	{ name: "export", description: "Export session (HTML default, or specify path: .html/.jsonl)" },
 	{ name: "import", description: "Import and resume a session from a JSONL file" },
@@ -67,7 +68,12 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		argumentHint: "[instructions]",
 	},
 	{ name: "refine", description: "Refine editable harness prompt notes, skills, subagents, and memory" },
-	{ name: "goal", description: "Set or view a persistent goal; supports pause, resume, and clear" },
+	{
+		name: "goal",
+		description: "Set or view a persistent goal; supports pause, resume, and clear",
+		argumentHint: "[objective]",
+		takesArgument: true,
+	},
 	{
 		name: "heartbeat",
 		description: "Set or view a persistent heartbeat; supports pause, resume, and clear",
@@ -131,6 +137,10 @@ export function resolveBuiltinSlashCommandName(name: string): string {
 
 export function isBuiltinSlashCommandName(name: string): boolean {
 	return BUILTIN_SLASH_COMMAND_BY_NAME.has(name) || BUILTIN_SLASH_COMMAND_ALIAS_TO_NAME.has(name);
+}
+
+export function builtinSlashCommandTakesArgument(name: string): boolean {
+	return BUILTIN_SLASH_COMMAND_BY_NAME.get(resolveBuiltinSlashCommandName(name))?.takesArgument === true;
 }
 
 export function resolveSlashCommand(command: ParsedSlashCommand): ResolvedSlashCommand {
