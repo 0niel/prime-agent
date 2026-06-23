@@ -79,6 +79,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 const BUILTIN_SLASH_COMMAND_ALIASES: ReadonlyArray<BuiltinSlashCommandAlias> = [
 	{ name: "clear", aliasFor: "new" },
 	{ name: "usage", aliasFor: "context" },
+	{ name: "rename", aliasFor: "name" },
 ];
 
 function buildBuiltinSlashCommands(): ReadonlyArray<BuiltinSlashCommand> {

@@ -300,6 +300,7 @@ class AgentsViewMode implements Component, Focusable {
 	private replyHeaderTime = "";
 	private pendingDeleteAgent: PendingDeleteAgent | undefined;
 	private pendingKillSubagent: PendingKillSubagent | undefined;
+	private renameTarget: { activeSessionId: string; identity: string } | undefined;
 	private readonly inactiveAgentIdentities = new Set<string>();
 	private statusMessage: string | undefined;
 	private statusMessageTone: "muted" | "error" | "warning" = "muted";
@@ -398,8 +399,22 @@ class AgentsViewMode implements Component, Focusable {
 
 	handleInput(data: string): void {
 		this.clearStickyStatusMessage();
+		// While renaming, the editor holds the proposed name: Escape cancels, Enter
+		// (via onSubmit) confirms, everything else edits the text.
+		if (this.renameTarget) {
+			if (this.keybindings.matches(data, "tui.select.cancel")) {
+				this.exitRenameMode();
+				return;
+			}
+			this.editor.handleInput(data);
+			return;
+		}
 		if (this.keybindings.matches(data, "app.clear")) {
 			this.handleCtrlC();
+			return;
+		}
+		if (this.keybindings.matches(data, "app.agents.rename") && this.editor.getText().length === 0) {
+			this.enterRenameMode();
 			return;
 		}
 		if (this.keybindings.matches(data, "app.agents.delete") && this.editor.getText().length === 0) {
@@ -722,6 +737,10 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	private async submit(value: string): Promise<void> {
+		if (this.renameTarget) {
+			await this.confirmRename(value);
+			return;
+		}
 		const text = value.trim();
 		if (!text) {
 			if (this.replyActiveSessionId) {
@@ -1077,6 +1096,62 @@ class AgentsViewMode implements Component, Focusable {
 		this.ui.requestRender();
 	}
 
+	private enterRenameMode(): void {
+		const row = this.rows[this.selectedIndex];
+		// Only top-level agents carry a renameable session; subagents do not.
+		if (row?.kind !== "agent" || !row.selectable) {
+			return;
+		}
+		const activeSessionId = row.summary.activeSessionId;
+		if (!activeSessionId) {
+			this.setStatusMessage("This agent has no active session to rename");
+			return;
+		}
+		this.setReplyTarget(undefined);
+		this.pendingDeleteAgent = undefined;
+		this.pendingKillSubagent = undefined;
+		this.renameTarget = { activeSessionId, identity: getSummaryIdentity(row.summary) };
+		this.editor.setPlaceholder("Name this agent session");
+		this.editor.setText(row.summary.sessionName ?? "");
+		this.ui.requestRender();
+	}
+
+	private exitRenameMode(): void {
+		this.renameTarget = undefined;
+		this.editor.setText("");
+		this.editor.setPlaceholder(DEFAULT_PROMPT_PLACEHOLDER);
+		this.ui.requestRender();
+	}
+
+	private async confirmRename(value: string): Promise<void> {
+		const target = this.renameTarget;
+		if (!target) {
+			return;
+		}
+		const name = value.trim();
+		if (!name) {
+			this.exitRenameMode();
+			return;
+		}
+		this.exitRenameMode();
+		this.setStatusMessage("Renaming agent...");
+		try {
+			await this.requireClient().request({
+				type: "rename",
+				activeSessionId: target.activeSessionId,
+				name,
+			});
+			this.setStatusMessage(`Renamed to ${name}`, { render: false });
+			await this.refreshSessions();
+		} catch (error) {
+			this.setStatusMessage(
+				isUnknownDaemonCommandError(error, "rename")
+					? "Failed to rename: the daemon is running an older build; restart the daemon and try again"
+					: formatError("Failed to rename agent", error),
+			);
+		}
+	}
+
 	private getReplyHeaderTime(activeSessionId: string): string {
 		const summary = this.findSummaryByActiveSessionId(activeSessionId);
 		return formatAgentsViewRelativeTime(summary?.modified ?? summary?.created);
@@ -1087,6 +1162,9 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	private renderReplyHeaderLine(): string | undefined {
+		if (this.renameTarget) {
+			return theme.fg("warning", "Rename agent session");
+		}
 		if (!this.replyActiveSessionId) {
 			return undefined;
 		}
@@ -1644,6 +1722,10 @@ class AgentsViewMode implements Component, Focusable {
 		if (this.statusMessage) {
 			return truncateToWidth(theme.fg(this.statusMessageTone, this.statusMessage), width);
 		}
+		if (this.renameTarget) {
+			const hint = `${keyText("tui.select.confirm")} save   ${keyText("tui.select.cancel")} cancel`;
+			return truncateToWidth(theme.fg("muted", hint), width);
+		}
 		// Replying is reserved for top-level agents; subagents can be stopped.
 		const selectedRow = this.rows[this.selectedIndex];
 		const selectedAgent = selectedRow?.kind === "agent";
@@ -1653,6 +1735,7 @@ class AgentsViewMode implements Component, Focusable {
 			`${keyText("tui.select.confirm")} open/send`,
 			"/ commands",
 			selectedAgent ? `${keyText("app.agents.reply")} reply` : undefined,
+			selectedAgent ? `${keyText("app.agents.rename")} rename` : undefined,
 			selectedAgent ? `${keyText("app.agents.delete")} stop/deactivate` : undefined,
 			selectedSubagent ? `${keyText("app.agents.delete")} stop` : undefined,
 			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,

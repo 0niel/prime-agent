@@ -20,6 +20,7 @@ describe("slash command aliases", () => {
 	test("keeps aliases hidden on canonical command entries", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "clear")).toBeUndefined();
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "usage")).toBeUndefined();
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "rename")).toBeUndefined();
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "new")).toMatchObject({
 			description: "Start a new session",
 			aliases: ["clear"],
@@ -27,6 +28,23 @@ describe("slash command aliases", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "context")).toMatchObject({
 			description: "Show token, cost, and context usage for agent and sub-agents",
 			aliases: ["usage"],
+		});
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "name")).toMatchObject({
+			description: "Set session display name",
+			aliases: ["rename"],
+		});
+	});
+
+	test("resolves /rename to /name through the alias path", () => {
+		const parsed = parseSlashCommand("/rename my session");
+
+		expect(isBuiltinSlashCommandName("rename")).toBe(true);
+		expect(resolveBuiltinSlashCommandName("rename")).toBe("name");
+		expect(resolveSlashCommand(parsed!)).toEqual({
+			name: "name",
+			args: "my session",
+			originalName: "rename",
+			isAlias: true,
 		});
 	});
 
