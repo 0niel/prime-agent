@@ -153,11 +153,11 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		spawnCode: metadata.spawnCode ? metadata.spawnCode.slice(0, SPAWN_CODE_MAX_CHARS) : undefined,
 		modelFallbackMessage: activeSession.runtime.modelFallbackMessage,
 		diagnostics: [...activeSession.runtime.diagnostics],
-		// Drop both summary and verdict once new messages arrive; a stale recap
-		// would describe a prior turn. The summarizer refreshes within seconds.
-		...(isSummaryCurrent(activeSession)
-			? { summary: activeSession.summaryState?.summary, taskState: activeSession.summaryState?.taskState }
-			: {}),
+		// Keep the last recap visible across turns so the view never blanks, but
+		// gate the verdict on currency: a stale "completed" must not show on a turn
+		// that is active again.
+		summary: activeSession.summaryState?.summary,
+		...(isSummaryCurrent(activeSession) ? { taskState: activeSession.summaryState?.taskState } : {}),
 	};
 }
 

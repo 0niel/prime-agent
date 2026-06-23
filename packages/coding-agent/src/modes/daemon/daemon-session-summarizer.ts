@@ -20,8 +20,8 @@ const SUMMARY_MAX_TOKENS = 400;
 
 export const AGENT_STATUS_SYSTEM_PROMPT = `You generate a status line for an AI coding agent dashboard. You are given the recent conversation between a user and the agent, plus whether the agent is currently working or idle.
 
-Output ONLY these two lines, nothing before or after. Do not think out loud, explain, or add any other text.
-SUMMARY: a present-tense clause, at most 12 words, saying what the agent is doing or just did, no trailing period
+Output ONLY these two lines, nothing before or after. Do not think out loud, explain, or count words. Put the summary inside <recap></recap> tags and write nothing after the closing tag.
+SUMMARY: <recap>a present-tense clause, at most 12 words, saying what the agent is doing or just did, no trailing period</recap>
 STATUS: one of WORKING, NEEDS_INPUT, COMPLETED
 
 STATUS meaning:
@@ -31,7 +31,7 @@ STATUS meaning:
 When the agent is idle and you are unsure between COMPLETED and NEEDS_INPUT, choose NEEDS_INPUT.
 
 Example:
-SUMMARY: Refactoring the auth middleware and updating its tests
+SUMMARY: <recap>Refactoring the auth middleware and updating its tests</recap>
 STATUS: WORKING`;
 
 export interface AgentStatusResult {
@@ -100,27 +100,57 @@ export function buildStatusContext(messages: readonly AgentMessage[], isWorking:
 	return `<agent-state>${state}</agent-state>\n<conversation>\n${lines.join("\n")}\n</conversation>`;
 }
 
+// Cuts the word-counting chain-of-thought the model appends on the recap line,
+// e.g. `Sending X. That's 5 words? Count: X(1)... = 6 words.`. Restricted to
+// structural counting markers so plain words ("Waiting for CI") survive.
+const REASONING_TRAILER = /\s*(?:["”]\s*)?(?:\bthat['’]?s\s+\d+\s*words?\b|\bcount\s*:|\(\d+\)|=\s*\d+\s*words?\b).*/i;
+const COUNTING_ARTIFACT = /\(\d+\)|=\s*\d+\s*words?\b/i;
+const MAX_RECAP_WORDS = 16;
+
+/** Strip reasoning trailer and quotes, then reject anything still polluted. */
+function cleanRecap(raw: string): string | undefined {
+	const value = raw
+		.trim()
+		.replace(REASONING_TRAILER, "")
+		.replace(/^["“']+|["”']+$/g, "")
+		.replace(/[.\s]+$/, "")
+		.trim();
+	if (!value || value.startsWith("<") || /present-tense|12 words/i.test(value)) {
+		return undefined;
+	}
+	if (COUNTING_ARTIFACT.test(value) || value.split(/\s+/).length > MAX_RECAP_WORDS) {
+		return undefined;
+	}
+	return value;
+}
+
 /**
- * Parse the two-line reply. Requires an explicit `SUMMARY:` line (last one wins,
- * after any reasoning) and never falls back to free text, so a model's
- * chain-of-thought can't leak into the recap. Idle verdicts default to
- * needs_input on anything unrecognized.
+ * Parse the two-line reply. The recap is delimited by `<recap></recap>` so
+ * trailing chain-of-thought falls outside it; without the close tag we fall back
+ * to the `SUMMARY:`/`RECAP:` line and cut inline word-counting. The last clean
+ * recap wins. A still-polluted candidate is rejected; idle verdicts default to
+ * needs_input.
  */
 export function parseAgentStatusResponse(text: string, isWorking: boolean): AgentStatusResult | undefined {
 	const reasoningTag = /<\/?(?:think|thinking|reasoning|redacted_thinking)>/gi;
 	const cleaned = text
 		.replace(/<(think|thinking|reasoning|redacted_thinking)>[\s\S]*?<\/\1>/gi, " ")
 		.replace(reasoningTag, " ");
-	let summary: string | undefined;
+
+	// Prefer the tag (last match wins so a corrected draft resolves). Fall back to
+	// the SUMMARY/RECAP lines only when the tag is missing or its body is rejected;
+	// among lines the last clean one wins.
+	const tagMatch = [...cleaned.matchAll(/<recap>([\s\S]*?)<\/recap>/gi)].at(-1);
+	const tagSummary = tagMatch ? cleanRecap(tagMatch[1]!) : undefined;
+	let summary = tagSummary;
+
 	let status: string | undefined;
 	for (const rawLine of cleaned.split("\n")) {
 		const line = rawLine.trim();
-		const summaryMatch = /^summary\s*:\s*(.+)$/i.exec(line);
+		const summaryMatch = /^(?:summary|recap)\s*:\s*(.+)$/i.exec(line);
 		if (summaryMatch) {
-			const candidate = summaryMatch[1]!.trim().replace(/[.\s]+$/, "");
-			// Skip an echoed prompt template (e.g. "<one present-tense clause…>").
-			if (candidate && !candidate.startsWith("<") && !/present-tense|12 words/i.test(candidate)) {
-				summary = candidate;
+			if (!tagSummary) {
+				summary = cleanRecap(summaryMatch[1]!.replace(/<\/?recap>/gi, "")) ?? summary;
 			}
 			continue;
 		}

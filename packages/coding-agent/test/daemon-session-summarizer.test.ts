@@ -79,6 +79,81 @@ describe("daemon session summarizer", () => {
 			expect(parseAgentStatusResponse("", false)).toBeUndefined();
 			expect(parseAgentStatusResponse("STATUS: COMPLETED", false)).toBeUndefined();
 		});
+
+		test("extracts the recap from <recap> tags", () => {
+			const text = "SUMMARY: <recap>Sending SSH auth retry to tcg-autoresearch-rl</recap>\nSTATUS: WORKING";
+			expect(parseAgentStatusResponse(text, true)).toEqual({
+				summary: "Sending SSH auth retry to tcg-autoresearch-rl",
+			});
+		});
+
+		test("drops chain-of-thought after the closing recap tag", () => {
+			const text =
+				"SUMMARY: <recap>Sending SSH auth retry to tcg-autoresearch-rl</recap> That's 5 words? Count: Sending(1) SSH(2) auth(3) retry(4) to(5) tcg-autoresearch-rl(6) = 6 words. Under..\nSTATUS: WORKING";
+			expect(parseAgentStatusResponse(text, true)).toEqual({
+				summary: "Sending SSH auth retry to tcg-autoresearch-rl",
+			});
+		});
+
+		test("cuts inline reasoning when the model omits the closing tag", () => {
+			const text =
+				"SUMMARY: Sending SSH auth retry to tcg-autoresearch-rl. That's 5 words? Count: Sending(1) SSH(2) = 6 words. Under\nSTATUS: WORKING";
+			expect(parseAgentStatusResponse(text, true)).toEqual({
+				summary: "Sending SSH auth retry to tcg-autoresearch-rl",
+			});
+		});
+
+		test("salvages the clean prefix before counting artifacts begin", () => {
+			const text = "SUMMARY: Counting words(1) two(2) three(3) = 3 words\nSTATUS: WORKING";
+			expect(parseAgentStatusResponse(text, true)).toEqual({ summary: "Counting words" });
+		});
+
+		test("rejects a candidate whose counting starts at the very first word", () => {
+			// No clean prefix to salvage — the recap is nothing but the artifact.
+			const text = "SUMMARY: (1) word(2) count(3) = 3 words\nSTATUS: WORKING";
+			expect(parseAgentStatusResponse(text, true)).toBeUndefined();
+		});
+
+		test("rejects a rambling candidate that blows past the word ceiling", () => {
+			const text =
+				"SUMMARY: this is a very long rambling sentence that just keeps going and going well past any reasonable recap length\nSTATUS: WORKING";
+			expect(parseAgentStatusResponse(text, true)).toBeUndefined();
+		});
+
+		test("strips wrapping quotes the model adds around the recap", () => {
+			const text = 'SUMMARY: <recap>"Wiring the recap line"</recap>\nSTATUS: COMPLETED';
+			expect(parseAgentStatusResponse(text, false)).toEqual({
+				summary: "Wiring the recap line",
+				taskState: "completed",
+			});
+		});
+
+		test("accepts RECAP: as a synonym for SUMMARY:", () => {
+			const text = "RECAP: Restarting the daemon\nSTATUS: WORKING";
+			expect(parseAgentStatusResponse(text, true)).toEqual({ summary: "Restarting the daemon" });
+		});
+
+		test("ignores an open recap tag with no close", () => {
+			const text = "SUMMARY: <recap>Editing the parser\nSTATUS: WORKING";
+			expect(parseAgentStatusResponse(text, true)).toEqual({ summary: "Editing the parser" });
+		});
+
+		test("keeps recaps that start with words also used in reasoning", () => {
+			for (const recap of ["Waiting for CI to finish", "Let me know once tests pass", "Under review by the team"]) {
+				expect(parseAgentStatusResponse(`SUMMARY: ${recap}\nSTATUS: WORKING`, true)).toEqual({ summary: recap });
+			}
+		});
+
+		test("takes the last SUMMARY line when a draft is corrected", () => {
+			const text = "SUMMARY: Draft recap\nSUMMARY: Final corrected recap\nSTATUS: WORKING";
+			expect(parseAgentStatusResponse(text, true)).toEqual({ summary: "Final corrected recap" });
+		});
+
+		test("falls back to a SUMMARY line when the tagged body is rejected", () => {
+			// The tag body is pure counting (rejected); a later valid line must win.
+			const text = "<recap>(1) two(2) = 2 words</recap>\nSUMMARY: Editing the parser\nSTATUS: WORKING";
+			expect(parseAgentStatusResponse(text, true)).toEqual({ summary: "Editing the parser" });
+		});
 	});
 
 	describe("buildStatusContext", () => {
