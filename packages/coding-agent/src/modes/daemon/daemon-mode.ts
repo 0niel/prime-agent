@@ -150,6 +150,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_session_tree",
 	"get_user_messages_for_forking",
 	"get_last_assistant_text",
+	"get_system_prompt",
 	"get_tool_definition",
 	"set_session_entry_label",
 	"extension_ui_response",
@@ -1376,6 +1377,13 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "get_last_assistant_text", {
 					text: state.runtime.session.getLastAssistantText(),
+				});
+			}
+
+			case "get_system_prompt": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "get_system_prompt", {
+					systemPrompt: state.runtime.session.systemPrompt,
 				});
 			}
 

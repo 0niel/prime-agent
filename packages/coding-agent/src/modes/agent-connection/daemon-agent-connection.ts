@@ -366,6 +366,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		return data.text ?? undefined;
 	}
 
+	async getSystemPrompt(): Promise<string> {
+		const data = await this.requestData<{ systemPrompt: string }>({
+			type: "get_system_prompt",
+			activeSessionId: this.activeSessionId,
+		});
+		return data.systemPrompt;
+	}
+
 	async getToolDefinition(name: string): Promise<AgentConnectionToolDefinition | undefined> {
 		const data = await this.requestData<{ toolDefinition?: AgentConnectionToolDefinition }>({
 			type: "get_tool_definition",
@@ -832,6 +840,7 @@ function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): bool
 		case "get_session_tree":
 		case "get_user_messages_for_forking":
 		case "get_last_assistant_text":
+		case "get_system_prompt":
 		case "get_tool_definition":
 		case "export_html":
 		case "export_jsonl":

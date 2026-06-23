@@ -325,6 +325,10 @@ export class DeferredAgentConnection implements AgentConnection {
 		return this.real ? this.real.getLastAssistantText() : undefined;
 	}
 
+	async getSystemPrompt(): Promise<string> {
+		return this.real ? this.real.getSystemPrompt() : "";
+	}
+
 	async getToolDefinition(name: string): Promise<AgentConnectionToolDefinition | undefined> {
 		return this.real ? this.real.getToolDefinition(name) : undefined;
 	}

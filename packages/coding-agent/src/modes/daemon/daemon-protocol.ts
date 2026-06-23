@@ -238,6 +238,7 @@ export type DaemonCommand =
 	| { id?: string; type: "get_session_tree"; activeSessionId: string }
 	| { id?: string; type: "get_user_messages_for_forking"; activeSessionId: string }
 	| { id?: string; type: "get_last_assistant_text"; activeSessionId: string }
+	| { id?: string; type: "get_system_prompt"; activeSessionId: string }
 	| { id?: string; type: "get_tool_definition"; activeSessionId: string; name: string }
 	| { id?: string; type: "set_session_entry_label"; activeSessionId: string; entryId: string; label?: string }
 	| {
