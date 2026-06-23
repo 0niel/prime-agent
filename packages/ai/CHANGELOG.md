@@ -10,6 +10,26 @@
 
 - Added a `max` thinking level (above `xhigh`) and mapped each adaptive Claude family to the effort levels its API actually supports: Opus 4.6 / Sonnet 4.6 expose `max` (no `xhigh`); Opus 4.7 / Opus 4.8 / Fable 5 / Mythos 5 expose both `xhigh` and `max`; Mythos Preview exposes `max`. Adaptive thinking detection now also covers Opus 4.8 and the Fable/Mythos families on both the Anthropic and Bedrock providers.
 
+### Fixed
+
+- Fixed callers passing `reasoning: "xhigh"` directly from sending an effort the model lacks; the thinking level is now clamped to the model's supported levels before mapping to an Anthropic effort.
+
+## [0.1.9] - 2026-06-22
+
+## [0.1.8] - 2026-06-21
+
+## [0.1.7] - 2026-06-18
+
+### Added
+
+- Added the `glm-5.2`, `minimax-m3`, and `kimi-k2.7-code` models from Prime Inference, and marked the MiniMax `minimax-m*` and Moonshot `kimi*` families as reasoning models in the registry generator.
+
+## [0.1.6] - 2026-06-17
+
+## [0.1.5] - 2026-06-16
+
+## [0.1.4] - 2026-06-15
+
 ## [0.1.3] - 2026-06-12
 
 ## [0.1.2] - 2026-06-12
@@ -22,11 +42,29 @@
 
 - Added Claude Opus 4.8 to the curated Prime Inference model list.
 
+## [0.0.10] - 2026-06-08
+
+## [0.0.9] - 2026-06-04
+
+## [0.0.8] - 2026-06-04
+
+### Removed
+
+- Removed the `x-ai/grok-code-fast-1` model from the Prime Inference catalog.
+
 ## [0.0.7] - 2026-06-01
 
 ### Fixed
 
 - Fixed OAuth callback pages to use Prime butterfly branding on a black background.
+
+## [0.0.6] - 2026-05-27
+
+## [0.0.5] - 2026-05-26
+
+### Changed
+
+- Changed the Fireworks model catalog to point the turbo router at `kimi-k2p6-turbo` and refresh the available Fireworks models.
 
 ## [0.0.4] - 2026-05-21
 
@@ -40,6 +78,8 @@
 ### Fixed
 
 - Fixed OpenAI Responses requests for models that support disabling reasoning to send `reasoning.effort: "none"` when thinking is off.
+
+## [0.0.1] - 2026-05-18
 
 ## [0.74.0] - 2026-05-07
 

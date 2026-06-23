@@ -10,6 +10,18 @@
 
 - Added `max` to the `ThinkingLevel` union so callers can request the top adaptive-thinking effort on supported Claude models.
 
+## [0.1.9] - 2026-06-22
+
+## [0.1.8] - 2026-06-21
+
+## [0.1.7] - 2026-06-18
+
+## [0.1.6] - 2026-06-17
+
+## [0.1.5] - 2026-06-16
+
+## [0.1.4] - 2026-06-15
+
 ## [0.1.3] - 2026-06-12
 
 ## [0.1.2] - 2026-06-12
@@ -18,6 +30,18 @@
 
 ## [0.1.0] - 2026-06-11
 
+## [0.0.10] - 2026-06-08
+
+## [0.0.9] - 2026-06-04
+
+## [0.0.8] - 2026-06-04
+
+## [0.0.7] - 2026-06-01
+
+## [0.0.6] - 2026-05-27
+
+## [0.0.5] - 2026-05-26
+
 ## [0.0.4] - 2026-05-21
 
 ## [0.0.2] - 2026-05-20
@@ -25,6 +49,8 @@
 ### Added
 
 - Added a continuation-message hook for host-owned policies that should keep the agent loop running after explicit follow-ups are drained.
+
+## [0.0.1] - 2026-05-18
 
 ## [0.74.0] - 2026-05-07
 

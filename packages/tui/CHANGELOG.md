@@ -6,6 +6,36 @@
 
 ## [0.2.0] - 2026-06-23
 
+### Added
+
+- Added an optional `commandColor` to the editor theme so a leading slash command stays highlighted while its argument is being typed.
+- Added editor support for atomic pasted-image markers, resolving markers by presence so undo and dequeue keep them intact.
+
+## [0.1.9] - 2026-06-22
+
+## [0.1.8] - 2026-06-21
+
+## [0.1.7] - 2026-06-18
+
+### Fixed
+
+- Fixed TUI flicker when attaching to long or streaming sessions by only preserving scrollback when the transcript grows, not when it shrinks.
+
+## [0.1.6] - 2026-06-17
+
+### Fixed
+
+- Fixed the viewport not staying anchored when collapsing or expanding tool output, preserving scrollback images instead of forcing a full redraw.
+
+## [0.1.5] - 2026-06-16
+
+### Fixed
+
+- Fixed `Alt+Up`/`Alt+Down` key matching in non-kitty terminals so the bindings are recognized outside kitty's keyboard protocol.
+- Fixed autocomplete to respect slash-command alias resolution so aliased commands complete to their canonical form.
+
+## [0.1.4] - 2026-06-15
+
 ## [0.1.3] - 2026-06-12
 
 ## [0.1.2] - 2026-06-12
@@ -13,6 +43,30 @@
 ## [0.1.1] - 2026-06-11
 
 ## [0.1.0] - 2026-06-11
+
+## [0.0.10] - 2026-06-08
+
+### Added
+
+- Added an optional `promptPrefix` to the editor that renders a leading prompt indicator with correct wrapping and padding, with overridable hooks for subclasses.
+
+### Changed
+
+- Changed `Editor.cancelAutocomplete` from private to protected so subclasses can cancel autocomplete before handling interrupts.
+
+## [0.0.9] - 2026-06-04
+
+## [0.0.8] - 2026-06-04
+
+## [0.0.7] - 2026-06-01
+
+## [0.0.6] - 2026-05-27
+
+## [0.0.5] - 2026-05-26
+
+### Added
+
+- Added a terminal-colors module that probes the terminal's default foreground/background via OSC queries and exposes helpers to adapt surfaces to dark or light terminals.
 
 ## [0.0.4] - 2026-05-21
 
@@ -27,6 +81,12 @@
 ### Fixed
 
 - Fixed raw tabs in rendered TUI lines to preserve painted backgrounds across indentation.
+
+## [0.0.1] - 2026-05-18
+
+### Added
+
+- Added marquee TUI components and a Prime-branded theme as part of the initial Prime Agent fork from pi-mono.
 
 ## [0.74.0] - 2026-05-07
 
