@@ -444,13 +444,14 @@ export function buildSessionContext(
 		return { messages: [], thinkingLevel: "off", model: null };
 	}
 
-	// Walk from leaf to root, collecting path
+	// push+reverse, not unshift-per-entry: unshift is O(n), making this O(n^2) on long sessions.
 	const path: SessionEntry[] = [];
 	let current: SessionEntry | undefined = leaf;
 	while (current) {
-		path.unshift(current);
+		path.push(current);
 		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
+	path.reverse();
 
 	// Extract settings and find compaction
 	let thinkingLevel = "off";
@@ -545,18 +546,23 @@ export function getDefaultSessionDir(_cwd: string, agentDir: string = getDefault
 export function loadEntriesFromFile(filePath: string): FileEntry[] {
 	if (!existsSync(filePath)) return [];
 
-	const content = readFileSync(filePath, "utf8");
+	// Decode per line off a Buffer: readFileSync(path, "utf8") on a large file is far
+	// slower (one giant UTF-16 string). Splitting on 0x0a is UTF-8-safe.
+	const buffer = readFileSync(filePath);
 	const entries: FileEntry[] = [];
-	const lines = content.trim().split("\n");
-
-	for (const line of lines) {
-		if (!line.trim()) continue;
-		try {
-			const entry = JSON.parse(line) as FileEntry;
-			entries.push(entry);
-		} catch {
-			// Skip malformed lines
+	const len = buffer.length;
+	let start = 0;
+	while (start < len) {
+		let end = buffer.indexOf(0x0a, start);
+		if (end === -1) end = len;
+		if (end > start) {
+			try {
+				entries.push(JSON.parse(buffer.toString("utf8", start, end)) as FileEntry);
+			} catch {
+				// skip malformed/blank lines
+			}
 		}
+		start = end + 1;
 	}
 
 	// Validate session header
@@ -786,9 +792,34 @@ function extractOversizedMessageSummary(line: string): {
 	};
 }
 
+interface SessionInfoCacheEntry {
+	size: number;
+	mtimeMs: number;
+	info: SessionInfo | null;
+}
+
+// Session files are append-only, so an unchanged (size, mtimeMs) means identical
+// content: cache list metadata and rescan only files that changed.
+const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
+
 async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
+	let stats: Awaited<ReturnType<typeof stat>>;
 	try {
-		const stats = await stat(filePath);
+		stats = await stat(filePath);
+	} catch {
+		return null;
+	}
+	const cached = sessionInfoCache.get(filePath);
+	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) {
+		return cached.info;
+	}
+	const info = await scanSessionInfo(filePath, stats);
+	sessionInfoCache.set(filePath, { size: stats.size, mtimeMs: stats.mtimeMs, info });
+	return info;
+}
+
+async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeof stat>>): Promise<SessionInfo | null> {
+	try {
 		const stream = createReadStream(filePath, { encoding: "utf8" });
 		const lines = createInterface({ input: stream, crlfDelay: Infinity });
 		let header: SessionHeader | undefined;
@@ -905,6 +936,14 @@ async function listSessionsFromDir(
 		const dirEntries = await readdir(dir);
 		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
 		const total = progressTotal ?? files.length;
+
+		// drop cache entries for deleted files so it stays bounded
+		const present = new Set(files);
+		for (const key of sessionInfoCache.keys()) {
+			if (dirname(key) === dir && !present.has(key)) {
+				sessionInfoCache.delete(key);
+			}
+		}
 
 		let loaded = 0;
 		for (const file of files) {
@@ -1456,13 +1495,15 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
+		// push+reverse, not unshift-per-entry: unshift is O(n), which makes this O(n^2) on long sessions.
 		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.leafId;
 		let current = startId ? this.byId.get(startId) : undefined;
 		while (current) {
-			path.unshift(current);
+			path.push(current);
 			current = current.parentId ? this.byId.get(current.parentId) : undefined;
 		}
+		path.reverse();
 		return path;
 	}
 
