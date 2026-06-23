@@ -1389,7 +1389,7 @@ export async function main(args: string[], options?: MainOptions) {
 					model: startupModel.model,
 					thinkingLevel: prepared.sessionOptions.thinkingLevel ?? defaultSessionConfig.thinking ?? "off",
 					scopedModels: prepared.sessionOptions.scopedModels ?? [],
-					availableModels: services.modelRegistry.getAvailable(),
+					availableModels: () => services.modelRegistry.getAvailable(),
 					steeringMode: settingsManager.getSteeringMode(),
 					followUpMode: settingsManager.getFollowUpMode(),
 					autoCompactionEnabled: settingsManager.getCompactionEnabled(),

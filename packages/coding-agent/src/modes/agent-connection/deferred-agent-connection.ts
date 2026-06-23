@@ -47,7 +47,7 @@ export interface DeferredAgentConnectionSeed {
 	model?: AgentConnectionModel;
 	thinkingLevel: ThinkingLevel;
 	scopedModels: AgentConnectionScopedModel[];
-	availableModels: AgentConnectionModel[];
+	availableModels: () => AgentConnectionModel[];
 	steeringMode: AgentConnectionQueueMode;
 	followUpMode: AgentConnectionQueueMode;
 	autoCompactionEnabled: boolean;
@@ -237,7 +237,7 @@ export class DeferredAgentConnection implements AgentConnection {
 	}
 
 	async getAvailableModels(): Promise<AgentConnectionModel[]> {
-		return this.real ? this.real.getAvailableModels() : this.seed.availableModels;
+		return this.real ? this.real.getAvailableModels() : this.seed.availableModels();
 	}
 
 	async getSessionStats(): Promise<SessionStats> {
