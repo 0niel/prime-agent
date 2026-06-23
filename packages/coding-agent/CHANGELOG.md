@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-23
+
+### Fixed
+
+- Fixed daemon session recaps disappearing while a new turn regenerated them ([#239](https://github.com/PrimeIntellect-ai/prime-agent/issues/239)).
+- Fixed bundled built-in skills missing from the packaged release layouts ([#240](https://github.com/PrimeIntellect-ai/prime-agent/issues/240)).
+
+## [0.2.0] - 2026-06-23
+
 ### Added
 
 - Added a `max` thinking level to the thinking selector, `--thinking` flag, and settings, exposing the top reasoning effort on Claude models that support it (e.g. Opus 4.6+/Sonnet 4.6).
