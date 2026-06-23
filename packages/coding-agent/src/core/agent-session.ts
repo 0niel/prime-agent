@@ -771,7 +771,7 @@ export class AgentSession {
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._subagentRuntimeHost = config.subagentRuntimeHost;
-		this._autonomousState = createAutonomousRuntimeState(config.autonomous);
+		this._autonomousState = createAutonomousRuntimeState(config.autonomous, { cwd: this._cwd });
 		this._goalState = this._loadPersistedGoalState();
 		if (this._goalState.status === "active") {
 			this._goalAccountingStartedAt = Date.now();
@@ -1188,7 +1188,7 @@ export class AgentSession {
 			return false;
 		}
 		if (command.kind === "on") {
-			setAutonomousEnabled(this._autonomousState, true);
+			setAutonomousEnabled(this._autonomousState, true, { cwd: this._cwd });
 		} else if (command.kind === "off") {
 			setAutonomousEnabled(this._autonomousState, false);
 		}
@@ -1569,7 +1569,7 @@ export class AgentSession {
 		if (goalMessages.length > 0 || signal?.aborted) {
 			return goalMessages;
 		}
-		const autonomousMessage = nextAutonomousContinuation(this._autonomousState, context.message);
+		const autonomousMessage = nextAutonomousContinuation(this._autonomousState, context.message, { cwd: this._cwd });
 		return autonomousMessage ? [autonomousMessage] : [];
 	}
 

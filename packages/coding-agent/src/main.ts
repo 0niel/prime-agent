@@ -663,7 +663,19 @@ function runtimeConfigFromArgs(
 		themes: resolveCliPaths(cwd, parsed.themes),
 		noThemes: parsed.noThemes,
 		noContextFiles: parsed.noContextFiles,
-		autonomous: parsed.autonomous ? { enabled: true } : undefined,
+		autonomous: parsed.autonomous
+			? {
+					enabled: true,
+					gates:
+						parsed.autonomousGates || parsed.autonomousGateRetries || parsed.autonomousGateTimeoutMs
+							? {
+									commands: parsed.autonomousGates,
+									maxRetries: parsed.autonomousGateRetries,
+									timeoutMs: parsed.autonomousGateTimeoutMs,
+								}
+							: undefined,
+				}
+			: undefined,
 		extensionFlagValues: parsed.unknownFlags.size > 0 ? Object.fromEntries(parsed.unknownFlags.entries()) : undefined,
 	};
 }

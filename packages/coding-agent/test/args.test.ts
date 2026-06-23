@@ -284,6 +284,24 @@ describe("parseArgs", () => {
 			const result = parseArgs(["--autonomous"]);
 			expect(result.autonomous).toBe(true);
 		});
+
+		test("parses autonomous gate flags", () => {
+			const result = parseArgs([
+				"--autonomous",
+				"--autonomous-gate",
+				"npm test",
+				"--autonomous-gate",
+				"npm run lint",
+				"--autonomous-gate-retries",
+				"2",
+				"--autonomous-gate-timeout-ms",
+				"1000",
+			]);
+			expect(result.autonomous).toBe(true);
+			expect(result.autonomousGates).toEqual(["npm test", "npm run lint"]);
+			expect(result.autonomousGateRetries).toBe(2);
+			expect(result.autonomousGateTimeoutMs).toBe(1000);
+		});
 	});
 
 	describe("tool flags", () => {

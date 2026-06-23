@@ -43,6 +43,9 @@ export interface Args {
 	noThemes?: boolean;
 	noContextFiles?: boolean;
 	autonomous?: boolean;
+	autonomousGates?: string[];
+	autonomousGateRetries?: number;
+	autonomousGateTimeoutMs?: number;
 	listModels?: string | true;
 	offline?: boolean;
 	verbose?: boolean;
@@ -169,6 +172,13 @@ export function parseArgs(args: string[]): Args {
 			result.noContextFiles = true;
 		} else if (arg === "--autonomous") {
 			result.autonomous = true;
+		} else if (arg === "--autonomous-gate" && i + 1 < args.length) {
+			result.autonomousGates = result.autonomousGates ?? [];
+			result.autonomousGates.push(args[++i]);
+		} else if (arg === "--autonomous-gate-retries" && i + 1 < args.length) {
+			result.autonomousGateRetries = parsePositiveInt(args[++i], "--autonomous-gate-retries", result);
+		} else if (arg === "--autonomous-gate-timeout-ms" && i + 1 < args.length) {
+			result.autonomousGateTimeoutMs = parsePositiveInt(args[++i], "--autonomous-gate-timeout-ms", result);
 		} else if (arg === "--list-models") {
 			// Check if next arg is a search pattern (not a flag or file arg)
 			if (i + 1 < args.length && !args[i + 1].startsWith("-") && !args[i + 1].startsWith("@")) {
@@ -265,7 +275,10 @@ ${chalk.bold("Options:")}
   --theme <path>                 Load a theme file or directory (can be used multiple times)
   --no-themes                    Disable theme discovery and loading
   --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
-  --autonomous                   Continue autonomously on help requests or soft blockers
+  --autonomous                   Continue autonomously until host-observable terminal evidence exists
+  --autonomous-gate <command>    Run a command before autonomous mode may finish (repeatable)
+  --autonomous-gate-retries <n>  Max autonomous retries per failed gate (default: 3)
+  --autonomous-gate-timeout-ms <n> Timeout per autonomous gate command in milliseconds
   --export <file>                Export session file to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
@@ -375,4 +388,13 @@ ${chalk.bold("Built-in Tool Names:")}
   bash    - Execute bash commands (off by default)
   edit    - Edit files with find/replace (off by default)
 `);
+}
+
+function parsePositiveInt(value: string, flag: string, result: Args): number | undefined {
+	const parsed = Number(value);
+	if (!Number.isInteger(parsed) || parsed <= 0) {
+		result.diagnostics.push({ type: "error", message: `${flag} must be a positive integer` });
+		return undefined;
+	}
+	return parsed;
 }

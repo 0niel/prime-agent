@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import type { AssistantMessage, TextContent, Usage, UserMessage } from "@earendil-works/pi-ai";
 
 export interface AgentAutonomousConfig {
@@ -7,6 +8,13 @@ export interface AgentAutonomousConfig {
 	maxTokens?: number;
 	timeoutMs?: number;
 	continuationPrompt?: string;
+	gates?: AgentAutonomousGateConfig;
+}
+
+export interface AgentAutonomousGateConfig {
+	commands?: string[];
+	maxRetries?: number;
+	timeoutMs?: number;
 }
 
 export interface AgentAutonomousStatus {
@@ -15,17 +23,26 @@ export interface AgentAutonomousStatus {
 	turnsUsed: number;
 	tokensUsed: number;
 	startedAt?: number;
-	limits: Required<Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt">>;
+	limits: Required<Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt" | "gates">>;
+	gates: Required<AgentAutonomousGateConfig>;
 }
 
 export const DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT =
-	"Continue autonomously. Make a reasonable assumption, inspect the repo, run tests, and only stop when you have a validated patch or a concrete external blocker. If you are blocked, state the exact blocker and the evidence.";
+	"No human input is available in autonomous mode. Continue working. If you were asking the user a question, make a reasonable assumption and verify it. If you believe you are blocked, prove it with host-observable evidence. If you believe the task is complete, produce completion evidence: passing gates or a patch relative to the autonomous baseline.";
 
-export const DEFAULT_AUTONOMOUS_LIMITS: Required<Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt">> = {
+export const DEFAULT_AUTONOMOUS_LIMITS: Required<
+	Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt" | "gates">
+> = {
 	maxContinuations: 3,
 	maxTurns: 12,
 	maxTokens: 80_000,
 	timeoutMs: 30 * 60 * 1000,
+};
+
+export const DEFAULT_AUTONOMOUS_GATES: Required<AgentAutonomousGateConfig> = {
+	commands: [],
+	maxRetries: 3,
+	timeoutMs: 5 * 60 * 1000,
 };
 
 export interface AutonomousRuntimeState {
@@ -34,16 +51,35 @@ export interface AutonomousRuntimeState {
 	turnsUsed: number;
 	tokensUsed: number;
 	startedAt?: number;
-	limits: Required<Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt">>;
+	limits: Required<Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt" | "gates">>;
 	continuationPrompt: string;
+	gates: Required<AgentAutonomousGateConfig>;
+	gateAttempts: Record<string, number>;
+	lastGateFailure?: GateFailure;
+	gitBaseline?: GitWorktreeSnapshot;
 }
 
 export interface AutonomousDecision {
 	shouldContinue: boolean;
-	reason: "asks_user" | "soft_blocker" | "real_blocker" | "not_needed" | "limit_reached";
+	reason: "missing_terminal_evidence" | "gate_failed" | "not_needed" | "limit_reached";
 }
 
-export function createAutonomousRuntimeState(config?: AgentAutonomousConfig): AutonomousRuntimeState {
+interface GitWorktreeSnapshot {
+	status: string;
+	diff: string;
+}
+
+interface GateFailure {
+	command: string;
+	attempt: number;
+	exitText: string;
+	output: string;
+}
+
+export function createAutonomousRuntimeState(
+	config?: AgentAutonomousConfig,
+	options: { cwd?: string } = {},
+): AutonomousRuntimeState {
 	const enabled = config?.enabled === true;
 	return {
 		enabled,
@@ -58,18 +94,36 @@ export function createAutonomousRuntimeState(config?: AgentAutonomousConfig): Au
 			timeoutMs: normalizeLimit(config?.timeoutMs, DEFAULT_AUTONOMOUS_LIMITS.timeoutMs),
 		},
 		continuationPrompt: config?.continuationPrompt?.trim() || DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT,
+		gates: {
+			commands: [...(config?.gates?.commands ?? DEFAULT_AUTONOMOUS_GATES.commands)],
+			maxRetries: normalizeLimit(config?.gates?.maxRetries, DEFAULT_AUTONOMOUS_GATES.maxRetries),
+			timeoutMs: normalizeLimit(config?.gates?.timeoutMs, DEFAULT_AUTONOMOUS_GATES.timeoutMs),
+		},
+		gateAttempts: {},
+		lastGateFailure: undefined,
+		gitBaseline: enabled ? captureGitWorktreeSnapshot(options.cwd) : undefined,
 	};
 }
 
-export function setAutonomousEnabled(state: AutonomousRuntimeState, enabled: boolean): void {
+export function setAutonomousEnabled(
+	state: AutonomousRuntimeState,
+	enabled: boolean,
+	options: { cwd?: string } = {},
+): void {
 	state.enabled = enabled;
 	if (enabled) {
 		state.continuationsUsed = 0;
 		state.turnsUsed = 0;
 		state.tokensUsed = 0;
 		state.startedAt = Date.now();
+		state.gateAttempts = {};
+		state.lastGateFailure = undefined;
+		state.gitBaseline = captureGitWorktreeSnapshot(options.cwd);
 	} else {
 		state.startedAt = undefined;
+		state.gateAttempts = {};
+		state.lastGateFailure = undefined;
+		state.gitBaseline = undefined;
 	}
 }
 
@@ -81,6 +135,7 @@ export function autonomousStatus(state: AutonomousRuntimeState): AgentAutonomous
 		tokensUsed: state.tokensUsed,
 		startedAt: state.startedAt,
 		limits: { ...state.limits },
+		gates: { ...state.gates, commands: [...state.gates.commands] },
 	};
 }
 
@@ -95,19 +150,28 @@ export function addAutonomousUsage(state: AutonomousRuntimeState, usage: Usage |
 export function nextAutonomousContinuation(
 	state: AutonomousRuntimeState,
 	message: AssistantMessage,
+	options: { cwd?: string } = {},
 	now = Date.now(),
 ): UserMessage | undefined {
 	if (!state.enabled) {
 		return undefined;
 	}
-	const decision = shouldAutonomouslyContinue(state, message, now);
+	const decision = shouldAutonomouslyContinue(state, message, options, now);
 	if (!decision.shouldContinue) {
 		return undefined;
 	}
 	state.continuationsUsed++;
 	return {
 		role: "user",
-		content: [{ type: "text", text: state.continuationPrompt }],
+		content: [
+			{
+				type: "text",
+				text:
+					decision.reason === "gate_failed"
+						? (buildGateFailureContinuation(state, now) ?? state.continuationPrompt)
+						: state.continuationPrompt,
+			},
+		],
 		timestamp: now,
 	};
 }
@@ -115,6 +179,7 @@ export function nextAutonomousContinuation(
 export function shouldAutonomouslyContinue(
 	state: AutonomousRuntimeState,
 	message: AssistantMessage,
+	options: { cwd?: string } = {},
 	now = Date.now(),
 ): AutonomousDecision {
 	if (!state.enabled || message.stopReason === "error" || message.stopReason === "aborted") {
@@ -123,20 +188,17 @@ export function shouldAutonomouslyContinue(
 	if (autonomousLimitReached(state, now)) {
 		return { shouldContinue: false, reason: "limit_reached" };
 	}
-	const text = assistantText(message);
-	if (!text) {
+	if (state.gates.commands.length > 0) {
+		const gateResult = runAutonomousQualityGates(state, options.cwd);
+		if (gateResult === "passed" || gateResult === "retry_exhausted") {
+			return { shouldContinue: false, reason: "not_needed" };
+		}
+		return { shouldContinue: true, reason: "gate_failed" };
+	}
+	if (hasGitWorktreeChangedSinceBaseline(state, options.cwd)) {
 		return { shouldContinue: false, reason: "not_needed" };
 	}
-	if (isRealExternalBlocker(text)) {
-		return { shouldContinue: false, reason: "real_blocker" };
-	}
-	if (asksUserForHelp(text)) {
-		return { shouldContinue: true, reason: "asks_user" };
-	}
-	if (reportsSoftBlocker(text)) {
-		return { shouldContinue: true, reason: "soft_blocker" };
-	}
-	return { shouldContinue: false, reason: "not_needed" };
+	return { shouldContinue: true, reason: "missing_terminal_evidence" };
 }
 
 export function assistantText(message: AssistantMessage): string {
@@ -160,54 +222,92 @@ function autonomousLimitReached(state: AutonomousRuntimeState, now: number): boo
 	return state.startedAt !== undefined && now - state.startedAt >= state.limits.timeoutMs;
 }
 
-function asksUserForHelp(text: string): boolean {
-	const normalized = normalize(text);
-	return [
-		/\bcan you\b/,
-		/\bcould you\b/,
-		/\bdo you want\b/,
-		/\bwhich\b.*\?/,
-		/\bwhat should\b/,
-		/\bplease (provide|confirm|choose|tell|share)\b/,
-		/\blet me know\b/,
-		/\bneed your\b/,
-		/\bwaiting for\b.*\b(user|you|input|confirmation)\b/,
-	].some((pattern) => pattern.test(normalized));
+type GateResult = "passed" | "failed" | "retry_exhausted";
+
+function runAutonomousQualityGates(state: AutonomousRuntimeState, cwd: string | undefined): GateResult {
+	if (!cwd) {
+		return "failed";
+	}
+	for (const command of state.gates.commands) {
+		const result = spawnSync(command, {
+			cwd,
+			encoding: "utf8",
+			shell: true,
+			timeout: state.gates.timeoutMs,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		if (result.status === 0 && !result.error) {
+			state.gateAttempts[command] = 0;
+			if (state.lastGateFailure?.command === command) {
+				state.lastGateFailure = undefined;
+			}
+			continue;
+		}
+		const attempt = (state.gateAttempts[command] ?? 0) + 1;
+		state.gateAttempts[command] = attempt;
+		const exitText =
+			result.error?.message ??
+			(result.signal ? `terminated by ${result.signal}` : `exited ${result.status ?? "unknown"}`);
+		state.lastGateFailure = {
+			command,
+			attempt,
+			exitText,
+			output: truncateGateOutput([result.stdout, result.stderr].filter(Boolean).join("\n").trim()),
+		};
+		return attempt > state.gates.maxRetries ? "retry_exhausted" : "failed";
+	}
+	state.lastGateFailure = undefined;
+	return "passed";
 }
 
-function reportsSoftBlocker(text: string): boolean {
-	const normalized = normalize(text);
-	return [
-		/\bi'?m blocked\b/,
-		/\bi am blocked\b/,
-		/\bi'?m stuck\b/,
-		/\bi am stuck\b/,
-		/\bcannot proceed\b/,
-		/\bcan't proceed\b/,
-		/\bblocked until\b/,
-	].some((pattern) => pattern.test(normalized));
+function buildGateFailureContinuation(state: AutonomousRuntimeState, timestamp: number): string | undefined {
+	const failure = state.lastGateFailure;
+	if (!failure) {
+		return undefined;
+	}
+	return (
+		`Autonomous quality gate failed (attempt ${failure.attempt}/${state.gates.maxRetries}): \`${failure.command}\` ${failure.exitText}.\n` +
+		(failure.output ? `\nOutput:\n${failure.output}\n` : "\n") +
+		`\nContinue working. Fix the failure, then produce terminal evidence. Timestamp: ${new Date(timestamp).toISOString()}.`
+	);
 }
 
-function isRealExternalBlocker(text: string): boolean {
-	const normalized = normalize(text);
-	const blockerLanguage =
-		/\b(blocked|cannot proceed|can't proceed|cannot continue|can't continue|need|requires|required)\b/.test(
-			normalized,
-		);
-	if (!blockerLanguage) {
+function hasGitWorktreeChangedSinceBaseline(state: AutonomousRuntimeState, cwd: string | undefined): boolean {
+	const current = captureGitWorktreeSnapshot(cwd);
+	if (!current || !state.gitBaseline) {
 		return false;
 	}
-	return [
-		/\b(api key|credential|secret|token|oauth|login|sign in|authenticate|authentication)\b/,
-		/\b(permission denied|access denied|403|401|unauthorized|forbidden)\b/,
-		/\b(service outage|network unavailable|rate limit|quota exceeded)\b/,
-		/\bmanual approval\b/,
-		/\bexternal account\b/,
-	].some((pattern) => pattern.test(normalized));
+	return current.status !== state.gitBaseline.status || current.diff !== state.gitBaseline.diff;
 }
 
-function normalize(text: string): string {
-	return text.toLowerCase().replace(/\s+/g, " ").trim();
+function captureGitWorktreeSnapshot(cwd: string | undefined): GitWorktreeSnapshot | undefined {
+	if (!cwd) {
+		return undefined;
+	}
+	const status = spawnSync("git", ["--no-optional-locks", "status", "--porcelain=v1", "-uall"], {
+		cwd,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "ignore"],
+	});
+	if (status.status !== 0 || typeof status.stdout !== "string") {
+		return undefined;
+	}
+	const diff = spawnSync("git", ["--no-optional-locks", "diff", "--no-ext-diff", "--binary", "HEAD", "--"], {
+		cwd,
+		encoding: "utf8",
+		stdio: ["ignore", "pipe", "ignore"],
+	});
+	return {
+		status: status.stdout,
+		diff: diff.status === 0 && typeof diff.stdout === "string" ? diff.stdout : "",
+	};
+}
+
+function truncateGateOutput(output: string, maxChars = 6000): string {
+	if (output.length <= maxChars) {
+		return output;
+	}
+	return `${output.slice(0, maxChars)}\n... [truncated ${output.length - maxChars} chars]`;
 }
 
 function normalizeLimit(value: number | undefined, fallback: number): number {
