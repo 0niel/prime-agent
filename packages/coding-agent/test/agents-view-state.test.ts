@@ -373,12 +373,9 @@ describe("agents view state", () => {
 	});
 
 	test("shows daemon-resident sessions only", () => {
-		const inactiveHidden = makeSummary({ status: "hidden" });
 		const inactiveSleep = makeSummary({ status: "sleep" });
-		delete inactiveHidden.activeSessionId;
 		delete inactiveSleep.activeSessionId;
 
-		expect(shouldShowAgentsViewSession(inactiveHidden)).toBe(false);
 		expect(shouldShowAgentsViewSession(inactiveSleep)).toBe(false);
 		expect(shouldShowAgentsViewSession(makeSummary({ status: "idle" }))).toBe(true);
 		expect(shouldShowAgentsViewSession(makeSummary({ status: "idle" }), true)).toBe(false);

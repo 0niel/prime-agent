@@ -10,7 +10,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { expandTildePath, VERSION } from "../config.js";
+import { appendRotatingLog, expandTildePath, getClientErrorLogPath, VERSION } from "../config.js";
 import { DaemonClient } from "../modes/daemon/daemon-client.js";
 import { DAEMON_PROTOCOL_VERSION } from "../modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
@@ -26,6 +26,13 @@ export function isDaemonSessionSummary(value: unknown): value is SessionSummary 
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Daemon replacement used to be silent (no crash, no log), so a daemon dying
+// out from under another window looked "random". Trace the decisions to the
+// client-errors log so replacements are attributable after the fact.
+function logDaemonLaunch(message: string): void {
+	appendRotatingLog(getClientErrorLogPath(), `[${new Date().toISOString()}] daemon-launch: ${message}`);
 }
 
 async function canConnectToDaemon(socketPath: string, timeoutMs: number): Promise<boolean> {
@@ -54,9 +61,16 @@ async function probeDaemonVersion(socketPath: string): Promise<DaemonVersionProb
 	try {
 		const hello = await client.waitForHello(2000);
 		const current = hello.protocol.version === DAEMON_PROTOCOL_VERSION && hello.appVersion === VERSION;
+		if (!current) {
+			logDaemonLaunch(
+				`running daemon on ${socketPath} is stale: daemon v${hello.appVersion}/proto${hello.protocol.version} ` +
+					`vs client v${VERSION}/proto${DAEMON_PROTOCOL_VERSION}`,
+			);
+		}
 		return current ? "current" : "stale";
 	} catch {
 		// Connected but no recognizable greeting: assume a stale daemon.
+		logDaemonLaunch(`running daemon on ${socketPath} sent no recognizable hello; treating as stale`);
 		return "stale";
 	} finally {
 		client.close();
@@ -151,11 +165,13 @@ async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<boolean
 	const client = new DaemonClient(socketPath);
 	let connected = false;
 	let hasBusySessions = false;
+	let loadedSessionCount = 0;
 	try {
 		await client.connect(1000);
 		connected = true;
 		try {
 			const summaries = await listActiveDaemonSessionSummaries(client);
+			loadedSessionCount = summaries.length;
 			hasBusySessions = summaries.some(isSessionBusy);
 		} catch {
 			// Couldn't confirm idleness: treat as busy rather than risk interrupting work.
@@ -171,8 +187,12 @@ async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<boolean
 		return waitForDaemonGone(socketPath);
 	}
 	if (hasBusySessions) {
+		logDaemonLaunch(`refusing to replace stale daemon on ${socketPath}: busy session(s) present`);
 		return false;
 	}
+	logDaemonLaunch(
+		`replacing stale daemon on ${socketPath} (idle): ${loadedSessionCount} loaded session(s) will reload`,
+	);
 	return shutdownDaemonAndWait(socketPath);
 }
 

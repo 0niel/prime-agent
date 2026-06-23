@@ -39,12 +39,10 @@ describe("buildSessionList", () => {
 		const activePath = resolve("/tmp/project/active.jsonl");
 		const sleepingPath = resolve("/tmp/project/sleeping.jsonl");
 		const crashedPath = resolve("/tmp/project/crashed.jsonl");
-		const hiddenPath = resolve("/tmp/project/hidden.jsonl");
 		const savedSessions = [
 			makeSessionInfo({ path: activePath, id: "saved-active", name: "active saved" }),
 			makeSessionInfo({ path: sleepingPath, id: "saved-sleeping", name: "sleeping saved" }),
 			makeSessionInfo({ path: crashedPath, id: "saved-crashed", state: { status: "crash" } }),
-			makeSessionInfo({ path: hiddenPath, id: "saved-hidden", state: { status: "hidden" } }),
 		];
 
 		const entries = buildSessionList(
@@ -52,12 +50,11 @@ describe("buildSessionList", () => {
 			savedSessions,
 		);
 
-		expect(entries).toHaveLength(4);
+		expect(entries).toHaveLength(3);
 		expect(entries.map((entry) => [entry.id, entry.sessionId, entry.status])).toEqual([
 			["active-1", "saved-active", "idle"],
 			["saved-sleeping", "saved-sleeping", "sleep"],
 			["saved-crashed", "saved-crashed", "crash"],
-			["saved-hidden", "saved-hidden", "hidden"],
 		]);
 		expect(entries[0]!.sessionName).toBe("session active-1");
 	});

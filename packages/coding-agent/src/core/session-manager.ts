@@ -138,7 +138,7 @@ export interface SessionInfoEntry extends SessionEntryBase {
 	name?: string;
 }
 
-export type SessionStateStatus = "active" | "sleep" | "crash" | "hidden";
+export type SessionStateStatus = "active" | "sleep" | "crash";
 
 export interface SessionState {
 	status: SessionStateStatus;
@@ -699,8 +699,15 @@ function extractTextContent(message: Message): string {
 		.join(" ");
 }
 
-function isSessionStateStatus(value: unknown): value is SessionStateStatus {
-	return value === "active" || value === "sleep" || value === "crash" || value === "hidden";
+// Legacy "hidden" status is coerced to "sleep" for sessions written by older versions.
+function normalizeSessionStateStatus(value: unknown): SessionStateStatus | undefined {
+	if (value === "active" || value === "sleep" || value === "crash") {
+		return value;
+	}
+	if (value === "hidden") {
+		return "sleep";
+	}
+	return undefined;
 }
 
 function updateLastActivityTime(lastActivityTime: number | undefined, entry: FileEntry): number | undefined {
@@ -899,8 +906,9 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			}
 			if (entry.type === "session_state") {
 				const stateEntry = entry as SessionStateEntry;
-				if (isSessionStateStatus(stateEntry.state?.status)) {
-					state = { status: stateEntry.state.status };
+				const status = normalizeSessionStateStatus(stateEntry.state?.status);
+				if (status) {
+					state = { status };
 				}
 			}
 
@@ -1370,7 +1378,10 @@ export class SessionManager {
 		for (let i = entries.length - 1; i >= 0; i--) {
 			const entry = entries[i];
 			if (entry.type === "session_state") {
-				return { status: entry.state.status };
+				const status = normalizeSessionStateStatus(entry.state.status);
+				if (status) {
+					return { status };
+				}
 			}
 		}
 		return undefined;

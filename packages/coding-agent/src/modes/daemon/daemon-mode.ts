@@ -389,11 +389,6 @@ export class AgentDaemon {
 				this.rebindCronJobsToState(existing);
 				return existing;
 			}
-			if ((sessionPath || command.continueRecent) && sessionManager.getSessionState()?.status === "hidden") {
-				// Resuming a hidden session is the intentional opt-in that makes it
-				// visible in session lists again.
-				sessionManager.appendSessionState({ status: "sleep" });
-			}
 			let stateRef: ActiveSessionState | undefined;
 			const runtime = await createAgentSessionRuntime(this.options.createRuntime, {
 				cwd: sessionManager.getCwd(),
@@ -1411,6 +1406,7 @@ export class AgentDaemon {
 			}
 
 			case "shutdown":
+				this.log(`shutdown command received over socket; ${this.sessions.size} active session(s) will be closed`);
 				setImmediate(() => {
 					void this.shutdown(0);
 				});
@@ -1623,6 +1619,7 @@ export class AgentDaemon {
 		}
 		for (const signal of signals) {
 			const handler = () => {
+				this.log(`received ${signal}; shutting down`);
 				killTrackedDetachedChildren();
 				void this.shutdown(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143);
 			};
@@ -1639,6 +1636,7 @@ export class AgentDaemon {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
+		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
 
 		this.summarizer.stop();
 		for (const cleanup of this.signalCleanupHandlers) {
