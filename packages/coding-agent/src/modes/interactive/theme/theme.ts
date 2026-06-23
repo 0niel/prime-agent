@@ -77,6 +77,7 @@ const ThemeJsonSchema = Type.Object({
 		// Tool Diffs (3 colors)
 		toolDiffAdded: ColorValueSchema,
 		toolDiffRemoved: ColorValueSchema,
+		toolDiffText: ColorValueSchema,
 		toolDiffContext: ColorValueSchema,
 		// Syntax Highlighting (9 colors)
 		syntaxComment: ColorValueSchema,
@@ -152,6 +153,7 @@ export type ThemeColor =
 	| "mdListBullet"
 	| "toolDiffAdded"
 	| "toolDiffRemoved"
+	| "toolDiffText"
 	| "toolDiffContext"
 	| "syntaxComment"
 	| "syntaxKeyword"

@@ -265,6 +265,7 @@ export class ToolExecutionComponent extends Container {
 					executionStarted: this.executionStarted,
 					argsComplete: this.argsComplete,
 					showImages: this.showImages,
+					cwd: this.cwd,
 				};
 				if (!this.ipythonCellComponent) {
 					this.ipythonCellComponent = new IPythonCellComponent(state);
