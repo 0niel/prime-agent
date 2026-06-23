@@ -265,6 +265,10 @@ export class MenuSearchInput implements Component, Focusable, FullWidthMenuCompo
 		return this.input.getValue();
 	}
 
+	getCursor(): number {
+		return this.input.getCursor();
+	}
+
 	setValue(value: string): void {
 		this.input.setValue(value);
 	}

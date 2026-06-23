@@ -31,6 +31,8 @@ export interface AppKeybindings {
 	"app.session.fork": true;
 	"app.session.resume": true;
 	"app.agents.back": true;
+	"app.agents.open": true;
+	"app.modal.back": true;
 	"app.agents.reply": true;
 	"app.agents.delete": true;
 	"app.agents.program": true;
@@ -111,6 +113,8 @@ export const KEYBINDINGS = {
 	"app.session.fork": { defaultKeys: [], description: "Fork current session" },
 	"app.session.resume": { defaultKeys: [], description: "Resume a session" },
 	"app.agents.back": { defaultKeys: "left", description: "Return to agents view" },
+	"app.agents.open": { defaultKeys: "right", description: "Open chat view for selected agent" },
+	"app.modal.back": { defaultKeys: "left", description: "Go back / close the current dialog" },
 	"app.agents.reply": { defaultKeys: "space", description: "Reply to selected agent" },
 	"app.agents.delete": { defaultKeys: "ctrl+x", description: "Stop or delete selected agent" },
 	"app.agents.program": { defaultKeys: "ctrl+o", description: "Show the program that spawned subagents" },

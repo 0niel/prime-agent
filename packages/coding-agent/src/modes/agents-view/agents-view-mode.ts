@@ -432,6 +432,17 @@ class AgentsViewMode implements Component, Focusable {
 			this.cycleProgramForSelected();
 			return;
 		}
+		// Mirror the confirm shortcut: open the selected agent only when the prompt
+		// is empty and we are not composing a reply (empty confirm is a no-op then).
+		// Match the confirm path's trim() so a whitespace-only prompt still opens.
+		if (
+			this.keybindings.matches(data, "app.agents.open") &&
+			this.editor.getText().trim().length === 0 &&
+			!this.replyActiveSessionId
+		) {
+			this.openSelected();
+			return;
+		}
 		if (this.editor.getText().length === 0 && this.handleListNavigation(data)) {
 			return;
 		}
@@ -1733,6 +1744,7 @@ class AgentsViewMode implements Component, Focusable {
 		const hints = [
 			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
 			`${keyText("tui.select.confirm")} open/send`,
+			`${keyText("app.agents.open")} open`,
 			"/ commands",
 			selectedAgent ? `${keyText("app.agents.reply")} reply` : undefined,
 			selectedAgent ? `${keyText("app.agents.rename")} rename` : undefined,

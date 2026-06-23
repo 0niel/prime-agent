@@ -11,6 +11,7 @@ import {
 	MenuSearchInput,
 	type MenuViewportProvider,
 } from "./menu-panel.js";
+import { shouldTreatAsBack } from "./modal-back.js";
 
 interface ModelItem {
 	provider: string;
@@ -368,8 +369,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		else if (kb.matches(keyData, "tui.select.confirm")) {
 			this.handleConfirm();
 		}
-		// Escape or Ctrl+C
-		else if (kb.matches(keyData, "tui.select.cancel")) {
+		// Escape / Ctrl+C, or left arrow when the search field is at its start
+		else if (kb.matches(keyData, "tui.select.cancel") || shouldTreatAsBack(keyData, this.searchInput)) {
 			this.onCancelCallback();
 		}
 		// Pass everything else to search input
