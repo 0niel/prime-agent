@@ -204,9 +204,10 @@ function isSessionWorking(state: ActiveSessionState): boolean {
 }
 
 /**
- * Background status summarization for daemon-hosted top-level sessions. A
- * periodic sweep refreshes working sessions; debounced turn-end activity drives
- * the idle verdict. Status lives in memory; settled idle verdicts are persisted.
+ * Background status summarization for daemon-hosted sessions, top-level and
+ * subagents alike. A periodic sweep refreshes working sessions; debounced
+ * turn-end activity drives the idle verdict. Status lives in memory; settled
+ * idle verdicts are persisted.
  */
 export class DaemonSessionSummarizer {
 	private interval: ReturnType<typeof setInterval> | undefined;
@@ -217,7 +218,7 @@ export class DaemonSessionSummarizer {
 	private readonly rerunRequested = new Set<string>();
 
 	constructor(
-		private readonly listTopLevelSessions: () => readonly ActiveSessionState[],
+		private readonly listSessions: () => readonly ActiveSessionState[],
 		private readonly onStatusChanged?: (state: ActiveSessionState) => void,
 		// Injectable for tests.
 		private readonly generate: (
@@ -230,7 +231,7 @@ export class DaemonSessionSummarizer {
 			return;
 		}
 		this.interval = setInterval(() => {
-			for (const state of this.listTopLevelSessions()) {
+			for (const state of this.listSessions()) {
 				void this.summarize(state);
 			}
 		}, SWEEP_INTERVAL_MS);
@@ -276,9 +277,6 @@ export class DaemonSessionSummarizer {
 
 	/** Called when a session finishes a turn; debounce until the agent settles. */
 	notifyActivity(state: ActiveSessionState): void {
-		if (state.runtime.metadata.kind === "subagent") {
-			return;
-		}
 		const id = state.activeSessionId;
 		const existing = this.debounceTimers.get(id);
 		if (existing) {
@@ -293,9 +291,6 @@ export class DaemonSessionSummarizer {
 	}
 
 	private async summarize(state: ActiveSessionState): Promise<void> {
-		if (state.runtime.metadata.kind === "subagent") {
-			return;
-		}
 		const id = state.activeSessionId;
 		if (this.inFlight.has(id)) {
 			this.rerunRequested.add(id); // run once more after the current pass

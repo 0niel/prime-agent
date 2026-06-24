@@ -180,7 +180,7 @@ export class AgentDaemon {
 	private readonly cronStore: AgentCronJobStore;
 	private readonly cronScheduler: AgentCronScheduler;
 	private readonly summarizer = new DaemonSessionSummarizer(
-		() => [...this.sessions.values()].filter((state) => state.runtime.metadata.kind !== "subagent"),
+		() => [...this.sessions.values()],
 		(state) =>
 			this.broadcastToSession(state, {
 				type: "session_status",
@@ -348,9 +348,9 @@ export class AgentDaemon {
 			} catch {
 				// Marking is best-effort; the session still works unrestored.
 			}
-			// Restore the last persisted status so it shows before the first sweep.
-			this.summarizer.seed(state);
 		}
+		// Restore the last persisted status so it shows before the first sweep.
+		this.summarizer.seed(state);
 		return state;
 	}
 
