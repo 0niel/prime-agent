@@ -123,12 +123,14 @@ interface PrimeInferenceModelMetadata {
 // model picker. Add new model IDs here, then rerun this script to refresh
 // src/models.generated.ts.
 const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata> = {
+	// prime-inference proxies Anthropic models through OpenRouter without the
+	// context-1m beta header, so the enforced window is the standard 200k, not 1M.
 	"anthropic/claude-haiku-4.5": { contextWindow: 200000, maxTokens: 64000 },
-	"anthropic/claude-opus-4.6": { contextWindow: 1000000, maxTokens: 128000 },
-	"anthropic/claude-opus-4.7": { contextWindow: 1000000, maxTokens: 128000 },
-	"anthropic/claude-opus-4.8": { contextWindow: 1000000, maxTokens: 128000 },
+	"anthropic/claude-opus-4.6": { contextWindow: 200000, maxTokens: 128000 },
+	"anthropic/claude-opus-4.7": { contextWindow: 200000, maxTokens: 128000 },
+	"anthropic/claude-opus-4.8": { contextWindow: 200000, maxTokens: 128000 },
 	"anthropic/claude-sonnet-4.5": { contextWindow: 200000, maxTokens: 64000 },
-	"anthropic/claude-sonnet-4.6": { contextWindow: 1000000, maxTokens: 128000 },
+	"anthropic/claude-sonnet-4.6": { contextWindow: 200000, maxTokens: 128000 },
 	"deepseek/deepseek-v3.2": { contextWindow: 128000, maxTokens: 8000 },
 	"deepseek/deepseek-v4-flash": { contextWindow: 1000000, maxTokens: 384000 },
 	"deepseek/deepseek-v4-pro": { contextWindow: 1000000, maxTokens: 384000 },
