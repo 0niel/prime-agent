@@ -92,25 +92,27 @@ export function fuzzyMatch(query: string, text: string): FuzzyMatch {
 	return { matches: true, score: swappedMatch.score + 5 };
 }
 
-/**
- * Filter and sort items by fuzzy match quality (best matches first).
- * Supports space-separated tokens: all tokens must match.
- */
-export function fuzzyFilter<T>(items: T[], query: string, getText: (item: T) => string): T[] {
-	if (!query.trim()) {
-		return items;
-	}
+export interface ScoredItem<T> {
+	item: T;
+	score: number;
+}
 
+/**
+ * Filter items by fuzzy match quality, returning each match with its score
+ * (lower is better) sorted best-first. Supports space-separated tokens: all
+ * tokens must match.
+ */
+export function fuzzyFilterScored<T>(items: T[], query: string, getText: (item: T) => string): ScoredItem<T>[] {
 	const tokens = query
 		.trim()
 		.split(/\s+/)
 		.filter((t) => t.length > 0);
 
 	if (tokens.length === 0) {
-		return items;
+		return items.map((item) => ({ item, score: 0 }));
 	}
 
-	const results: { item: T; totalScore: number }[] = [];
+	const results: ScoredItem<T>[] = [];
 
 	for (const item of items) {
 		const text = getText(item);
@@ -128,10 +130,21 @@ export function fuzzyFilter<T>(items: T[], query: string, getText: (item: T) => 
 		}
 
 		if (allMatch) {
-			results.push({ item, totalScore });
+			results.push({ item, score: totalScore });
 		}
 	}
 
-	results.sort((a, b) => a.totalScore - b.totalScore);
-	return results.map((r) => r.item);
+	results.sort((a, b) => a.score - b.score);
+	return results;
+}
+
+/**
+ * Filter and sort items by fuzzy match quality (best matches first).
+ * Supports space-separated tokens: all tokens must match.
+ */
+export function fuzzyFilter<T>(items: T[], query: string, getText: (item: T) => string): T[] {
+	if (!query.trim()) {
+		return items;
+	}
+	return fuzzyFilterScored(items, query, getText).map((r) => r.item);
 }

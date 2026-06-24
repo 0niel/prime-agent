@@ -1,5 +1,13 @@
 import { type Model, modelsAreEqual } from "@earendil-works/pi-ai";
-import { Container, type Focusable, fuzzyFilter, getKeybindings, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
+import {
+	Container,
+	type Focusable,
+	fuzzyFilterScored,
+	getKeybindings,
+	Spacer,
+	Text,
+	type TUI,
+} from "@earendil-works/pi-tui";
 import type { ModelRegistry } from "../../../core/model-registry.js";
 import { theme } from "../theme/theme.js";
 import { keyHint, keyText } from "./keybinding-hints.js";
@@ -36,6 +44,7 @@ interface ModelSelectorOptions {
 	onAction?: (actionId: string) => void;
 	subtitle?: string;
 	getRows?: () => number;
+	recentModels?: ReadonlyArray<string>;
 }
 
 type ModelScope = "all" | "scoped";
@@ -77,6 +86,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private actions: ReadonlyArray<ModelSelectorAction>;
 	private availableModels?: ReadonlyArray<Model<any>>;
 	private onActionCallback?: (actionId: string) => void;
+	private recentRank: Map<string, number>;
 	private errorMessage?: string;
 	private tui: TUI;
 	private scopedModels: ReadonlyArray<ScopedModelItem>;
@@ -117,6 +127,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.actions = options.actions ?? [];
 		this.availableModels = options.availableModels;
 		this.onActionCallback = options.onAction;
+		this.recentRank = new Map((options.recentModels ?? []).map((key, i) => [key, i]));
 		this.viewport = { getRows: options.getRows };
 
 		this.panel = new MenuPanel({
@@ -224,14 +235,20 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			currentIndex >= 0 ? currentIndex : Math.min(this.selectedIndex, Math.max(0, this.getSelectableCount() - 1));
 	}
 
+	private recentRankOf(item: ModelItem): number {
+		// Finite sentinel so subtracting two non-recent ranks yields 0, not NaN.
+		return this.recentRank.get(`${item.provider}/${item.id}`) ?? Number.MAX_SAFE_INTEGER;
+	}
+
 	private sortModels(models: ModelItem[]): ModelItem[] {
 		const sorted = [...models];
-		// Sort: current model first, then by provider
+		// Current model first, then most-recently-used, then provider.
 		sorted.sort((a, b) => {
 			const aIsCurrent = modelsAreEqual(this.currentModel, a.model);
 			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
-			if (aIsCurrent && !bIsCurrent) return -1;
-			if (!aIsCurrent && bIsCurrent) return 1;
+			if (aIsCurrent !== bIsCurrent) return aIsCurrent ? -1 : 1;
+			const rankDiff = this.recentRankOf(a) - this.recentRankOf(b);
+			if (rankDiff !== 0) return rankDiff;
 			return a.provider.localeCompare(b.provider);
 		});
 		return sorted;
@@ -260,13 +277,18 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private filterModels(query: string): void {
-		this.filteredModels = query
-			? fuzzyFilter(
-					this.activeModels,
-					query,
-					({ id, provider }) => `${id} ${provider} ${provider}/${id} ${provider} ${id}`,
-				)
-			: this.activeModels;
+		if (query.trim()) {
+			const scored = fuzzyFilterScored(
+				this.activeModels,
+				query,
+				({ id, provider }) => `${id} ${provider} ${provider}/${id} ${provider} ${id}`,
+			);
+			// Among equally-good matches (e.g. glm-5 / glm-5.1 / glm-5.2), prefer the most-recently-used.
+			scored.sort((a, b) => a.score - b.score || this.recentRankOf(a.item) - this.recentRankOf(b.item));
+			this.filteredModels = scored.map((r) => r.item);
+		} else {
+			this.filteredModels = this.activeModels;
+		}
 		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.getSelectableCount() - 1));
 		this.updateList();
 	}

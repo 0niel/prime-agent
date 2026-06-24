@@ -5,6 +5,8 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 
+const RECENT_MODELS_LIMIT = 20;
+
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
@@ -77,6 +79,7 @@ export interface Settings {
 	onboardingCompleted?: boolean;
 	defaultProvider?: string;
 	defaultModel?: string;
+	recentModels?: string[]; // "provider/id" keys, most-recently-used first
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
@@ -615,7 +618,19 @@ export class SettingsManager {
 		this.globalSettings.defaultModel = modelId;
 		this.markModified("defaultProvider");
 		this.markModified("defaultModel");
+		this.recordModelUseInternal(provider, modelId);
+		this.markModified("recentModels");
 		this.save();
+	}
+
+	getRecentModels(): string[] {
+		return this.settings.recentModels ?? [];
+	}
+
+	private recordModelUseInternal(provider: string, modelId: string): void {
+		const key = `${provider}/${modelId}`;
+		const next = [key, ...this.getRecentModels().filter((k) => k !== key)];
+		this.globalSettings.recentModels = next.slice(0, RECENT_MODELS_LIMIT);
 	}
 
 	getSteeringMode(): "all" | "one-at-a-time" {

@@ -888,7 +888,11 @@ class AgentsViewMode implements Component, Focusable {
 					resolve();
 				},
 				initialSearchInput,
-				{ availableModels, getRows: () => this.ui.terminal.rows },
+				{
+					availableModels,
+					getRows: () => this.ui.terminal.rows,
+					recentModels: this.options.uiServices.settingsManager.getRecentModels(),
+				},
 			);
 			handle = showFullPaneOverlay(this.ui, selector, 96);
 		});

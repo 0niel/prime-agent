@@ -30,7 +30,7 @@ export { TruncatedText } from "./components/truncated-text.js";
 // Editor component interface (for custom editors)
 export type { EditorComponent } from "./editor-component.js";
 // Fuzzy matching
-export { type FuzzyMatch, fuzzyFilter, fuzzyMatch } from "./fuzzy.js";
+export { type FuzzyMatch, fuzzyFilter, fuzzyFilterScored, fuzzyMatch, type ScoredItem } from "./fuzzy.js";
 // Keybindings
 export {
 	getKeybindings,

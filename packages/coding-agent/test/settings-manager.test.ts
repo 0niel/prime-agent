@@ -212,6 +212,33 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("recentModels", () => {
+		it("records most-recently-used first, dedupes, and persists", async () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			manager.setDefaultModelAndProvider("prov", "a");
+			manager.setDefaultModelAndProvider("prov", "b");
+			manager.setDefaultModelAndProvider("prov", "a");
+			await manager.flush();
+
+			expect(manager.getRecentModels()).toEqual(["prov/a", "prov/b"]);
+			const saved = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
+			expect(saved.recentModels).toEqual(["prov/a", "prov/b"]);
+		});
+
+		it("caps the list at the limit", async () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+			for (let i = 0; i < 25; i++) {
+				manager.setDefaultModelAndProvider("prov", `m${i}`);
+			}
+			await manager.flush();
+
+			const recent = manager.getRecentModels();
+			expect(recent).toHaveLength(20);
+			expect(recent[0]).toBe("prov/m24");
+		});
+	});
+
 	describe("error tracking", () => {
 		it("should collect and clear load errors via drainErrors", () => {
 			const globalSettingsPath = join(agentDir, "settings.json");
