@@ -12800,7 +12800,7 @@ export const MODELS = {
 	"prime-inference": {
 		"Qwen/Qwen3-235B-A22B-Thinking-2507": {
 			id: "Qwen/Qwen3-235B-A22B-Thinking-2507",
-			name: "QWEN3 235B A22B Thinking 2507 (Prime Inference)",
+			name: "QWEN3 235B A22B Thinking 2507",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -12818,7 +12818,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"anthropic/claude-haiku-4.5": {
 			id: "anthropic/claude-haiku-4.5",
-			name: "Claude Haiku 4.5 (Prime Inference)",
+			name: "Claude Haiku 4.5",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -12836,7 +12836,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"anthropic/claude-opus-4.6": {
 			id: "anthropic/claude-opus-4.6",
-			name: "Claude Opus 4.6 (Prime Inference)",
+			name: "Claude Opus 4.6",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -12855,7 +12855,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"anthropic/claude-opus-4.7": {
 			id: "anthropic/claude-opus-4.7",
-			name: "Claude Opus 4.7 (Prime Inference)",
+			name: "Claude Opus 4.7",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -12874,7 +12874,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"anthropic/claude-opus-4.8": {
 			id: "anthropic/claude-opus-4.8",
-			name: "Claude Opus 4.8 (Prime Inference)",
+			name: "Claude Opus 4.8",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -12893,7 +12893,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"anthropic/claude-sonnet-4.5": {
 			id: "anthropic/claude-sonnet-4.5",
-			name: "Claude Sonnet 4.5 (Prime Inference)",
+			name: "Claude Sonnet 4.5",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -12911,7 +12911,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"anthropic/claude-sonnet-4.6": {
 			id: "anthropic/claude-sonnet-4.6",
-			name: "Claude Sonnet 4.6 (Prime Inference)",
+			name: "Claude Sonnet 4.6",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -12930,7 +12930,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"deepseek/deepseek-v3.2": {
 			id: "deepseek/deepseek-v3.2",
-			name: "Deepseek V3.2 (Prime Inference)",
+			name: "Deepseek V3.2",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -12948,7 +12948,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"deepseek/deepseek-v4-flash": {
 			id: "deepseek/deepseek-v4-flash",
-			name: "Deepseek V4 Flash (Prime Inference)",
+			name: "Deepseek V4 Flash",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -12967,7 +12967,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"deepseek/deepseek-v4-pro": {
 			id: "deepseek/deepseek-v4-pro",
-			name: "Deepseek V4 PRO (Prime Inference)",
+			name: "Deepseek V4 PRO",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -12986,7 +12986,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"minimax/minimax-m3": {
 			id: "minimax/minimax-m3",
-			name: "Minimax M3 (Prime Inference)",
+			name: "Minimax M3",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13004,7 +13004,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"moonshotai/kimi-k2.7-code": {
 			id: "moonshotai/kimi-k2.7-code",
-			name: "Kimi K2.7 Code (Prime Inference)",
+			name: "Kimi K2.7 Code",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13022,7 +13022,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"nvidia/nemotron-3-nano-30b-a3b": {
 			id: "nvidia/nemotron-3-nano-30b-a3b",
-			name: "Nemotron 3 Nano 30B A3B (Prime Inference)",
+			name: "Nemotron 3 Nano 30B A3B",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13040,7 +13040,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"nvidia/nemotron-3-super-120b-a12b": {
 			id: "nvidia/nemotron-3-super-120b-a12b",
-			name: "Nemotron 3 Super 120B A12B (Prime Inference)",
+			name: "Nemotron 3 Super 120B A12B",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13058,7 +13058,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"openai/gpt-5.3-codex": {
 			id: "openai/gpt-5.3-codex",
-			name: "GPT 5.3 Codex (Prime Inference)",
+			name: "GPT 5.3 Codex",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13077,7 +13077,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"openai/gpt-5.4": {
 			id: "openai/gpt-5.4",
-			name: "GPT 5.4 (Prime Inference)",
+			name: "GPT 5.4",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13096,7 +13096,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"openai/gpt-5.4-mini": {
 			id: "openai/gpt-5.4-mini",
-			name: "GPT 5.4 Mini (Prime Inference)",
+			name: "GPT 5.4 Mini",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13115,7 +13115,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"openai/gpt-5.4-pro": {
 			id: "openai/gpt-5.4-pro",
-			name: "GPT 5.4 PRO (Prime Inference)",
+			name: "GPT 5.4 PRO",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13134,7 +13134,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"openai/gpt-5.5": {
 			id: "openai/gpt-5.5",
-			name: "GPT 5.5 (Prime Inference)",
+			name: "GPT 5.5",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13153,7 +13153,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"prime-intellect/intellect-3": {
 			id: "prime-intellect/intellect-3",
-			name: "Intellect 3 (Prime Inference)",
+			name: "Intellect 3",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13171,7 +13171,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"qwen/qwen3-coder-next": {
 			id: "qwen/qwen3-coder-next",
-			name: "QWEN3 Coder Next (Prime Inference)",
+			name: "QWEN3 Coder Next",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13189,7 +13189,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"qwen/qwen3-max": {
 			id: "qwen/qwen3-max",
-			name: "QWEN3 MAX (Prime Inference)",
+			name: "QWEN3 MAX",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13207,7 +13207,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"qwen/qwen3-vl-235b-a22b-thinking": {
 			id: "qwen/qwen3-vl-235b-a22b-thinking",
-			name: "QWEN3 VL 235B A22B Thinking (Prime Inference)",
+			name: "QWEN3 VL 235B A22B Thinking",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13225,7 +13225,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"x-ai/grok-4.20": {
 			id: "x-ai/grok-4.20",
-			name: "Grok 4.20 (Prime Inference)",
+			name: "Grok 4.20",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13243,7 +13243,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"x-ai/grok-4.20-multi-agent": {
 			id: "x-ai/grok-4.20-multi-agent",
-			name: "Grok 4.20 Multi Agent (Prime Inference)",
+			name: "Grok 4.20 Multi Agent",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13261,7 +13261,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"z-ai/glm-5": {
 			id: "z-ai/glm-5",
-			name: "GLM 5 (Prime Inference)",
+			name: "GLM 5",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13279,7 +13279,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"z-ai/glm-5.1": {
 			id: "z-ai/glm-5.1",
-			name: "GLM 5.1 (Prime Inference)",
+			name: "GLM 5.1",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",
@@ -13297,7 +13297,7 @@ export const MODELS = {
 		} satisfies Model<"openai-completions">,
 		"z-ai/glm-5.2": {
 			id: "z-ai/glm-5.2",
-			name: "GLM 5.2 (Prime Inference)",
+			name: "GLM 5.2",
 			api: "openai-completions",
 			provider: "prime-inference",
 			baseUrl: "https://api.pinference.ai/api/v1",

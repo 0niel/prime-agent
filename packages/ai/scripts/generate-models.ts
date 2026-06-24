@@ -430,7 +430,7 @@ function createPrimeInferenceModel(
 ): Model<"openai-completions"> {
 	return {
 		id: entry.id,
-		name: `${getPrimeInferenceDisplayName(entry.id)} (Prime Inference)`,
+		name: getPrimeInferenceDisplayName(entry.id),
 		api: "openai-completions",
 		provider: "prime-inference",
 		baseUrl: PRIME_INFERENCE_BASE_URL,

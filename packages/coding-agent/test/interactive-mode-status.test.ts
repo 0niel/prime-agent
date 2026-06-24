@@ -1155,12 +1155,13 @@ describe("InteractiveMode goal status announcements", () => {
 });
 
 describe("InteractiveMode tray goal label", () => {
+	type TrayUsage = { contextWindow: number; tokens: number | null; percent: number | null };
 	type TrayLabelHarness = {
 		connectionState: {
 			goal: GoalState;
-			contextUsage: { contextWindow: number; percent: number | null } | undefined;
+			contextUsage: TrayUsage | undefined;
 		};
-		uiServices: { getContextUsage(): { contextWindow: number; percent: number | null } | undefined };
+		uiServices: { getContextUsage(): TrayUsage | undefined };
 		getTrayContextLabel(): string | undefined;
 	};
 	const getTrayContextLabel = (InteractiveMode.prototype as unknown as TrayLabelHarness).getTrayContextLabel;
@@ -1183,7 +1184,7 @@ describe("InteractiveMode tray goal label", () => {
 		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});
 
-	test("combines active goals with low-context signal in one lower-tray label", () => {
+	test("combines active goals with token/context usage in one lower-tray label", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
 		fakeThis.connectionState = {
 			goal: {
@@ -1194,11 +1195,29 @@ describe("InteractiveMode tray goal label", () => {
 				timeUsedSeconds: 65,
 				continuationsUsed: 1,
 			} satisfies GoalState,
-			contextUsage: { contextWindow: 100_000, percent: 75 },
+			contextUsage: { contextWindow: 100_000, tokens: 75_000, percent: 75 },
 		};
 		fakeThis.uiServices = { getContextUsage: () => undefined };
 
-		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 25% context left");
+		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 75k (75%)");
+	});
+
+	test("omits the usage segment when token count is unknown", () => {
+		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
+		fakeThis.connectionState = {
+			goal: {
+				active: true,
+				status: "active",
+				objective: "finish the task",
+				tokensUsed: 0,
+				timeUsedSeconds: 65,
+				continuationsUsed: 1,
+			} satisfies GoalState,
+			contextUsage: { contextWindow: 100_000, tokens: null, percent: null },
+		};
+		fakeThis.uiServices = { getContextUsage: () => undefined };
+
+		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});
 });
 
