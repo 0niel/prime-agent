@@ -11,6 +11,8 @@ describe("InteractiveMode compaction events", () => {
 			activityTracker: new AgentActivityTracker(),
 			updateWorkingLoaderMessage: vi.fn(),
 			autoCompactionLoader: undefined,
+			retryLoader: undefined,
+			syncWorkingLoader: vi.fn(),
 			defaultEditor: {},
 			statusContainer: { clear: vi.fn() },
 			chatContainer: { clear: vi.fn() },

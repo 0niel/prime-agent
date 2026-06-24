@@ -6,7 +6,6 @@ export { BorderedLoader } from "./bordered-loader.js";
 export { BranchSummaryMessageComponent } from "./branch-summary-message.js";
 export {
 	ChildAgentDetailComponent,
-	ChildAgentInspectorComponent,
 	type ChildAgentInspectorNode,
 	type ChildAgentStatus,
 	ChildAgentSummaryComponent,

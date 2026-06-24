@@ -7,7 +7,6 @@ import { KeybindingsManager } from "../src/core/keybindings.js";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import {
 	ChildAgentDetailComponent,
-	ChildAgentInspectorComponent,
 	type ChildAgentInspectorNode,
 	ChildAgentSummaryComponent,
 } from "../src/modes/interactive/components/child-agent-inspector.js";
@@ -464,12 +463,11 @@ describe("marquee TUI components", () => {
 		expect(short).not.toContain("Ctrl+O to expand");
 	});
 
-	test("renders child agent summary and bounded inspector list", () => {
+	test("renders child agent summary inline list and detail view", () => {
 		const summary = new ChildAgentSummaryComponent(
 			() => "agents-sidebar",
 			() => "37% context left",
 		);
-		const component = new ChildAgentInspectorComponent();
 		const node: ChildAgentInspectorNode = {
 			id: "sub-a",
 			label: "inspect training logs",
@@ -520,73 +518,27 @@ describe("marquee TUI components", () => {
 			],
 		};
 		summary.setNodes([node]);
-		component.setNodes([node]);
 
-		const summaryText = stripAnsi(summary.render(60).join("\n"));
+		// The info line carries location/context; the list renders the subagents
+		// below a separator, with the time pinned at the right edge.
+		const summaryLines = summary.render(90).map(stripAnsi);
+		const summaryText = summaryLines.join("\n");
 		expect(summaryText).toContain("agents-sidebar");
 		expect(summaryText).toContain("37% context left");
-		expect(summaryText).toContain("1 subagent running");
-		expect(summaryText).not.toContain("2 total");
-		expect(summary.render(60)).toHaveLength(1);
+		expect(summaryText).toContain("Subagent 1");
+		expect(summaryText).toContain("inspect training logs");
+		expect(summaryLines.some((line) => line.includes("─"))).toBe(true);
+		const infoRow = summary.render(90)[0] ?? "";
+		expect(visibleWidth(infoRow)).toBe(90);
 
 		summary.focused = true;
-		const focusedSummary = stripAnsi(summary.render(60).join("\n"));
-		expect(focusedSummary).toContain("agents-sidebar");
-		expect(focusedSummary).toContain("37% context left");
-		expect(focusedSummary).toContain("1 subagent running");
-		expect(focusedSummary).not.toContain("▌");
-		const focusedSummaryWide = stripAnsi(summary.render(96).join("\n"));
-		expect(focusedSummaryWide).toContain("Enter open");
-		expect(focusedSummaryWide).not.toContain("editor");
-		expect(focusedSummaryWide).not.toContain("ctrl+c");
-		const summaryRow = summary.render(60).at(-1) ?? "";
-		expect(visibleWidth(summaryRow)).toBe(60);
-		expect(stripAnsi(summaryRow).endsWith("37% context left")).toBe(true);
-
-		const queueSummary = new ChildAgentSummaryComponent(
-			() => "agents-sidebar",
-			() => "37% context left",
-			() => "alt+enter to queue message",
-		);
-		queueSummary.setNodes([node]);
-		const queueText = stripAnsi(queueSummary.render(60).join("\n"));
-		expect(queueText).toContain("alt+enter to queue message");
-		expect(queueText).toContain("37% context left");
-		expect(queueText).not.toContain("1 subagent running");
-		expect(queueSummary.render(60)).toHaveLength(1);
-
-		const compact = stripAnsi(component.render(42).join("\n"));
-		expect(compact).toContain("subagents");
-		expect(compact).toContain("─");
-		expect(visibleWidth(component.render(42)[0] ?? "")).toBe(42);
-		expect(compact).toContain("1 running · 2 total");
-		expect(compact).toContain("◆ inspect training logs");
-		expect(compact).toContain("✓ check shard 2");
-		expect(compact).not.toContain("└─");
-		expect(compact).not.toContain("├─");
-		expect(compact).not.toContain("assistant: reading shard metrics");
-		const wideList = stripAnsi(component.render(96).join("\n"));
-		expect(wideList).toContain("↑/↓ move");
-		expect(wideList).toContain("Enter open");
-		expect(wideList).toContain("← back to chat");
-		expect(wideList).not.toContain("ctrl+c close");
-		for (const line of component.render(96)) {
-			expect(visibleWidth(line)).toBe(96);
-		}
-
-		component.focused = true;
-		const focused = stripAnsi(component.render(42).join("\n"));
-		expect(focused).not.toContain("▌");
-		expect(focused).toContain("◆ inspect training logs");
-		expect(focused).not.toContain("assistant: reading shard metrics");
-
 		let openedNodeId: string | undefined;
-		component.onOpenDetail = (nodeId) => {
+		summary.onOpenDetail = (nodeId) => {
 			openedNodeId = nodeId;
 		};
-		component.handleInput("\r");
+		// Right opens the selected subagent, like Enter.
+		summary.handleInput("\x1b[C");
 		expect(openedNodeId).toBe("sub-a");
-		expect(stripAnsi(component.render(42).join("\n"))).not.toContain("assistant: reading shard metrics");
 
 		const detailComponent = new ChildAgentDetailComponent(() => 20);
 		detailComponent.setNode(node);
@@ -599,23 +551,10 @@ describe("marquee TUI components", () => {
 		expect(detail).toContain("reading shard metrics");
 		expect(detail).toContain("$ echo hi");
 		expect(detail).toContain("hi");
-		expect(detail).toContain("← back to subagents");
+		expect(detail).toContain("← back to chat");
 		expect(detail).not.toContain("user: inspect training logs");
 		expect(detail).not.toContain("assistant: reading shard metrics");
 		expect(detail).not.toContain("tool: bash");
-
-		component.handleInput("\x1b");
-		const returned = stripAnsi(component.render(42).join("\n"));
-		expect(returned).not.toContain("▌");
-		expect(returned).toContain("◆ inspect training logs");
-		expect(returned).not.toContain("assistant: reading shard metrics");
-
-		for (const line of component.render(42)) {
-			expect(visibleWidth(line)).toBeLessThanOrEqual(42);
-		}
-
-		const narrow = stripAnsi(component.render(24).join("\n"));
-		expect(narrow).toContain("◆ inspect train");
 	});
 
 	test("collapses multiline child agent system errors in detail view", () => {
@@ -747,12 +686,13 @@ describe("marquee TUI components", () => {
 			},
 		]);
 
-		const row = summary.render(32)[0] ?? "";
-		const text = stripAnsi(row);
+		const lines = summary.render(32);
+		const infoRow = lines[0] ?? "";
 
-		expect(visibleWidth(row)).toBe(32);
-		expect(text).toContain("1 sub");
-		expect(text).toContain("Pursuing goal");
+		expect(visibleWidth(infoRow)).toBe(32);
+		expect(stripAnsi(infoRow)).toContain("Pursuing goal");
+		// The subagent itself renders as a list row below the info line.
+		expect(stripAnsi(lines.join("\n"))).toContain("Subagent 1");
 	});
 
 	test("renders full child agent detail without internal scroll controls", () => {
@@ -772,7 +712,7 @@ describe("marquee TUI components", () => {
 		const first = stripAnsi(firstLines.join("\n"));
 		expect(first).toContain("fallback transcript row 01");
 		expect(first).toContain("fallback transcript row 12");
-		expect(first).toContain("← back to subagents");
+		expect(first).toContain("← back to chat");
 		expect(first).not.toContain("↑");
 		expect(first).not.toContain("↓");
 		expect(firstLines.length).toBeGreaterThan(6);

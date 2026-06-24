@@ -6,6 +6,7 @@ import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/rend
 import { convertToPng } from "../../../utils/image-convert.js";
 import type { AgentConnectionToolDefinition } from "../../agent-connection/index.js";
 import { type Theme, theme } from "../theme/theme.js";
+import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
 import { getIpythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.js";
 import { ToolPanel } from "./tool-panel.js";
 
@@ -245,7 +246,27 @@ export class ToolExecutionComponent extends Container {
 		if (this.hideComponent) {
 			return [];
 		}
+		// Refresh the animated glyph without rebuilding the whole panel, for as long
+		// as panelStatus() is still animating (including partial streaming results).
+		if (this.isStatusAnimating() && !this.usesSelfRenderShell()) {
+			this.contentPanel.setHeader(this.panelHeader());
+		}
 		return super.render(width);
+	}
+
+	private isStatusAnimating(): boolean {
+		if (!this.executionStarted) {
+			return false;
+		}
+		// Matches panelStatus(): animating until a non-partial or error result lands.
+		if (this.result && !this.isPartial) {
+			return false;
+		}
+		return !this.result?.isError;
+	}
+
+	private usesSelfRenderShell(): boolean {
+		return this.hasRendererDefinition() && this.getRenderShell() === "self";
 	}
 
 	private updateDisplay(): void {
@@ -408,7 +429,7 @@ export class ToolExecutionComponent extends Container {
 			return theme.fg("error", "error");
 		}
 		if (this.executionStarted) {
-			return theme.fg("bashMode", "running");
+			return theme.fg("bashMode", `${workingIconFrame(getWorkingPulseFrame())} running`);
 		}
 		return theme.fg("muted", "queued");
 	}

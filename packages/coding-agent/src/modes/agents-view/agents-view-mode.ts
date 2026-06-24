@@ -36,6 +36,7 @@ import {
 	stopThemeWatcher,
 	theme,
 } from "../interactive/theme/theme.js";
+import { WORKING_ICON_INTERVAL_MS, workingIconFrame } from "../interactive/theme/working-icon.js";
 import {
 	formatPackageUpdateNotice,
 	formatTmuxWarningNotice,
@@ -61,7 +62,6 @@ import {
 } from "./agents-view-state.js";
 
 const POLL_INTERVAL_MS = 1000;
-const WORKING_ICON_INTERVAL_MS = 250;
 const EXIT_HINT_DURATION_MS = 2000;
 const DELETE_CONFIRM_DURATION_MS = 2000;
 const STATUS_MESSAGE_DURATION_MS = 4500;
@@ -70,7 +70,6 @@ const DEFAULT_PROMPT_PLACEHOLDER = "Describe a task for a new session";
 const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "Write a reply to this agent";
 const COMPLETED_ROW_ICON = "✓";
 const NEEDS_INPUT_ROW_ICON = "●";
-const WORKING_ICON_FRAMES = ["◇", "◈", "◆", "◈"] as const;
 const SELECTED_ROW_MARKER = "\0agents-view-selected-row\0";
 // Tags a spawn-code line so finalize can wrap the whole row in a panel
 // background, visually segmenting the program from the agent rows.
@@ -1773,7 +1772,7 @@ class AgentsViewMode implements Component, Focusable {
 	private getRowIcon(section: AgentsViewSection): string {
 		switch (section) {
 			case "working":
-				return WORKING_ICON_FRAMES[this.workingIconFrame % WORKING_ICON_FRAMES.length] ?? WORKING_ICON_FRAMES[0];
+				return workingIconFrame(this.workingIconFrame);
 			case "needs-input":
 				return NEEDS_INPUT_ROW_ICON;
 			case "completed":

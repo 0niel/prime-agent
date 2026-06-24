@@ -7,6 +7,7 @@ import { type BashOperations, createBashTool, createBashToolDefinition } from ".
 import { createEditToolDefinition } from "../src/core/tools/edit.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { getWorkingPulseFrame, workingIconFrame } from "../src/modes/interactive/theme/working-icon.js";
 
 function createBaseToolDefinition(name = "custom_tool"): ToolDefinition {
 	return {
@@ -287,7 +288,10 @@ describe("ToolExecutionComponent parity", () => {
 		expect(stripAnsi(component.render(100).join("\n"))).toContain("bash · queued");
 
 		component.markExecutionStarted();
-		expect(stripAnsi(component.render(100).join("\n"))).toContain("bash · running");
+		// Running status leads with the animated working glyph for the current frame.
+		expect(stripAnsi(component.render(100).join("\n"))).toContain(
+			`bash · ${workingIconFrame(getWorkingPulseFrame())} running`,
+		);
 
 		component.updateResult({ content: [{ type: "text", text: "hello" }], details: undefined, isError: false }, false);
 		const lines = component.render(100);

@@ -451,6 +451,13 @@ export function compactRlmText(text: string, maxLength = 160): string {
 	return `${compact.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
 }
 
+// Child-agent label: collapse to one line but keep the full prompt — the TUI
+// truncates to the visible width and elides shared prefixes, so capping here
+// would only hide the divergence between near-identical sibling prompts.
+export function rlmChildLabel(prompt: string): string {
+	return prompt.replace(/\s+/g, " ").trim() || "child agent";
+}
+
 function readTextBlocks(content: string | Array<{ type: string; text?: string }>): string {
 	if (typeof content === "string") {
 		return content;
@@ -3984,7 +3991,7 @@ export class AgentSession {
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		const transcript: RlmChildAgentTranscriptLine[] = [];
 		const structuredTranscript: RlmChildAgentStructuredTranscriptEntry[] = [];
-		const label = compactRlmText(prompt, 80) || "child agent";
+		const label = rlmChildLabel(prompt);
 		let answerPreview: string | undefined;
 		let durationMs: number | undefined;
 		const run: RlmChildRun = {
@@ -4997,7 +5004,7 @@ export class AgentSession {
 					children: [],
 				}),
 				id: run.id,
-				label: compactRlmText(run.prompt, 80) || "child agent",
+				label: rlmChildLabel(run.prompt),
 				status: run.status,
 			});
 		}
