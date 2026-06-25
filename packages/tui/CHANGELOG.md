@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-06-25
+
+- Added `fuzzyFilterScored`, returning scored matches so callers can break ties by recency; `fuzzyFilter` delegates to it unchanged ([#251](https://github.com/PrimeIntellect-ai/prime-agent/issues/251)).
+- Changed the editor to expose `rlmChildLabel` (whitespace-normalized full prompt) and centralized the "still working" pulse glyph in `working-icon.ts` for shared use across panels and lists ([#247](https://github.com/PrimeIntellect-ai/prime-agent/issues/247)).
+
 ## [0.2.1] - 2026-06-23
 
 ## [0.2.0] - 2026-06-23

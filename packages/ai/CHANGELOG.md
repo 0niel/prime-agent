@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-06-25
+
+- Added a curated `vision` flag on Prime Inference model metadata so vision-capable models advertise `["text", "image"]` input, since the Prime Inference models API reports no modality data ([#261](https://github.com/PrimeIntellect-ai/prime-agent/issues/261)).
+- Changed Prime Inference model names to drop the redundant ` (Prime Inference)` suffix at the generator source ([#252](https://github.com/PrimeIntellect-ai/prime-agent/issues/252)).
+- Fixed the declared context window for Prime Inference Claude Opus 4.6/4.7/4.8 and Sonnet 4.6 to 200k (the route lacks the long-context beta), and added `calculatePromptTokens` so context budgeting counts prompt tokens only ([#246](https://github.com/PrimeIntellect-ai/prime-agent/issues/246)).
+
 ## [0.2.1] - 2026-06-23
 
 ## [0.2.0] - 2026-06-23
