@@ -579,6 +579,75 @@ describe("AgentSession queue characterization", () => {
 		}
 	});
 
+	it("rolls back copied local refinement history against the original local harness state", async () => {
+		const original = await createAutoRefineHarness();
+		const branched = await createAutoRefineHarness();
+		harnesses.push(original, branched);
+		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		process.env.PRIME_AGENT_CODING_AGENT_DIR = `${original.tempDir}/agent`;
+		try {
+			const originalLocalDir = getLocalHarnessStateDir(original.sessionManager.getSessionArtifactDir())!;
+			const branchedLocalDir = getLocalHarnessStateDir(branched.sessionManager.getSessionArtifactDir())!;
+			const branchedState = loadHarnessState(branchedLocalDir, "local");
+			applyRefinementProposal(
+				branchedState,
+				{
+					summary: "Branch local memory",
+					rationale: "seed",
+					expectedOutcome: "seeded",
+					edits: [
+						{
+							action: "create",
+							kind: "memory",
+							id: "remember_me",
+							title: "Branch memory",
+							content: "Branch content should survive rollback of copied history.",
+						},
+					],
+				},
+				{ id: "seed_branch", scope: "local" },
+			);
+			saveHarnessState(branchedLocalDir, branchedState);
+			original.setResponses([
+				fauxAssistantMessage(
+					JSON.stringify({
+						summary: "Create original local memory",
+						rationale: "seed",
+						expectedOutcome: "Original local entry exists.",
+						edits: [
+							{
+								action: "create",
+								kind: "memory",
+								id: "remember_me",
+								title: "Original memory",
+								content: "Original content should be rolled back.",
+							},
+						],
+					}),
+				),
+			]);
+
+			const originalRefinement = await original.session.refine({ instructions: "remember this locally" });
+			branched.sessionManager.appendCustomEntry("prime-agent.refinement", originalRefinement);
+			expect(loadHarnessState(originalLocalDir, "local").entries.memory.remember_me.content).toBe(
+				"Original content should be rolled back.",
+			);
+
+			await branched.session.refine({ rollbackId: originalRefinement.id });
+
+			expect(loadHarnessState(originalLocalDir, "local").entries.memory.remember_me).toBeUndefined();
+			expect(loadHarnessState(branchedLocalDir, "local").entries.memory.remember_me.content).toBe(
+				"Branch content should survive rollback of copied history.",
+			);
+		} finally {
+			if (previousAgentDir === undefined) {
+				delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+			} else {
+				process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
+			}
+		}
+	});
+
 	it("dispatches extension commands immediately when prompted while idle", async () => {
 		const commandRuns: string[] = [];
 		const harness = await createHarness({

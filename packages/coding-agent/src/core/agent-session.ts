@@ -3201,6 +3201,7 @@ export class AgentSession {
 				loadGlobalRefinementHistory(globalHarnessStateDir),
 				getRefinementHistory(this.sessionManager.getEntries().filter((entry) => entry.type === "custom")),
 			);
+			const rollbackTarget = options.rollbackId ? history.find((item) => item.id === options.rollbackId) : undefined;
 			const plan = await planRefinement(
 				this.agent.state.messages,
 				planningState,
@@ -3216,7 +3217,15 @@ export class AgentSession {
 			if (targetScope === "local" && !localHarnessStateDir) {
 				throw new Error("Local harness refinement requires a persisted session; use global refinement instead.");
 			}
-			const targetHarnessStateDir = targetScope === "global" ? globalHarnessStateDir : localHarnessStateDir!;
+			let targetHarnessStateDir = targetScope === "global" ? globalHarnessStateDir : localHarnessStateDir!;
+			if (targetScope === "local" && rollbackTarget?.harnessStatePath) {
+				if (!existsSync(rollbackTarget.harnessStatePath)) {
+					throw new Error(
+						`Local refinement ${rollbackTarget.id} state file not found: ${rollbackTarget.harnessStatePath}`,
+					);
+				}
+				targetHarnessStateDir = dirname(rollbackTarget.harnessStatePath);
+			}
 			// Re-read the target state immediately before applying so concurrent kernel
 			// (`rlm.harness`) writes during the LLM pass are not clobbered.
 			const state = loadHarnessState(targetHarnessStateDir, targetScope);
