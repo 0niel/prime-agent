@@ -7414,7 +7414,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 		this.showStatus(
 			options.rollbackId
 				? `Rolling back refinement ${options.rollbackId}...`
-				: `Refining ${global ? "global" : "local"} continual harness state...`,
+				: `Refining ${options.global ? "global" : "local"} continual harness state...`,
 		);
 
 		try {
