@@ -116,6 +116,8 @@ conversation you emit precise Create, Update, or Delete edits to reusable state.
 The continual harness is the persistent, editable set of prompt notes, memories,
 skills, and subagent specs that lets Prime Agent improve reusable behavior
 outside the token history.
+Use "continual harness" for that persistent artifact layer; keep "RLM" for the
+runtime, IPython kernel, and native call interface that executes those artifacts.
 
 Continual harness components:
 - prompt: supplemental prompt notes only. The base system prompt is immutable and MUST NOT be rewritten.
