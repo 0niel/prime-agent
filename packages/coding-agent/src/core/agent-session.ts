@@ -131,6 +131,7 @@ import {
 	type RefinementResult,
 	saveHarnessState,
 } from "./refinement/index.js";
+import { resolveConfigValue } from "./resolve-config-value.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
@@ -159,6 +160,7 @@ import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
 import { addAssistantUsage, cloneUsage, emptyUsage } from "./usage.js";
+import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
 
 export type { GoalState, GoalStatus } from "./goals.js";
 export type { SessionStats } from "./session-stats.js";
@@ -282,6 +284,8 @@ export interface AgentSessionConfig {
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
 	cwd: string;
+	/** Config dir backing credentials (auth.json); exported to the kernel for skills. */
+	agentDir?: string;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	/** Resource loader for skills, prompts, themes, context files, system prompt */
@@ -702,6 +706,7 @@ export class AgentSession {
 	private _customTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
 	private _cwd: string;
+	private _agentDir?: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	private _allowedToolNames?: Set<string>;
@@ -749,6 +754,7 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		this._agentDir = config.agentDir;
 		this._modelRegistry = config.modelRegistry;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
@@ -3740,7 +3746,31 @@ export class AgentSession {
 		if (rlmSessionDir) {
 			env.RLM_SESSION_DIR = rlmSessionDir;
 		}
+		this._addWebsearchKeyEnv(env);
 		return env;
+	}
+
+	private _addWebsearchKeyEnv(env: Record<string, string>): void {
+		if (this._agentDir) {
+			env.PRIME_AGENT_CODING_AGENT_DIR = this._agentDir;
+		}
+
+		if (process.env[SERPER_ENV_VAR]?.trim()) {
+			return;
+		}
+		// Inject only when a websearch skill (bundled or custom) is actually loaded,
+		// so the key isn't exposed to kernels that can't use it.
+		if (!this._resourceLoader.getSkills().skills.some((skill) => skill.name === WEBSEARCH_SKILL_NAME)) {
+			return;
+		}
+		const cred = this._modelRegistry.authStorage.get(SERPER_CREDENTIAL_ID);
+		if (cred?.type !== "api_key") {
+			return;
+		}
+		const resolved = resolveConfigValue(cred.key)?.trim();
+		if (resolved) {
+			env[SERPER_ENV_VAR] = resolved;
+		}
 	}
 
 	// Undefined when there's no persistent artifact dir (e.g. the viewer client):
@@ -3909,6 +3939,7 @@ export class AgentSession {
 			sessionManager: childSessionManager,
 			settingsManager: this.settingsManager,
 			cwd: this._cwd,
+			agentDir: this._agentDir,
 			scopedModels: options.scopedModels,
 			resourceLoader: this._resourceLoader,
 			customTools: options.customTools,

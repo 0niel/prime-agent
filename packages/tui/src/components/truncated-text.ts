@@ -15,6 +15,10 @@ export class TruncatedText implements Component {
 		this.paddingY = paddingY;
 	}
 
+	setText(text: string): void {
+		this.text = text;
+	}
+
 	invalidate(): void {
 		// No cached state to invalidate currently
 	}

@@ -224,4 +224,63 @@ describe("OAuthSelectorComponent", () => {
 		expect(output).toContain("Provider 3");
 		expect(output).toContain("(6/12)");
 	});
+
+	it("shows Providers/Services tabs and switches with left/right arrows", () => {
+		const selector = new OAuthSelectorComponent(
+			"login",
+			AuthStorage.inMemory(),
+			[
+				{ id: "anthropic", name: "Anthropic", authType: "oauth", category: "provider" },
+				{ id: "serper", name: "Serper (web search)", authType: "api_key", category: "service" },
+			],
+			() => {},
+			() => {},
+		);
+
+		// Providers tab active first: provider shown, service hidden.
+		let output = stripAnsi(selector.render(120).join("\n"));
+		expect(output).toContain("Providers");
+		expect(output).toContain("Services");
+		expect(output).toContain("Anthropic");
+		expect(output).not.toContain("Serper");
+
+		// Right arrow switches to the Services tab.
+		selector.handleInput("\x1b[C");
+		output = stripAnsi(selector.render(120).join("\n"));
+		expect(output).toContain("Serper (web search)");
+		expect(output).not.toContain("Anthropic");
+	});
+
+	it("selecting on the Services tab returns the service entry", () => {
+		let chosen: string | undefined;
+		const selector = new OAuthSelectorComponent(
+			"login",
+			AuthStorage.inMemory(),
+			[
+				{ id: "anthropic", name: "Anthropic", authType: "oauth", category: "provider" },
+				{ id: "serper", name: "Serper (web search)", authType: "api_key", category: "service" },
+			],
+			(provider) => {
+				chosen = provider.id;
+			},
+			() => {},
+		);
+
+		selector.handleInput("\x1b[C"); // -> Services tab
+		selector.handleInput("\r"); // confirm
+		expect(chosen).toBe("serper");
+	});
+
+	it("shows no tab bar when only one category is present", () => {
+		const selector = new OAuthSelectorComponent(
+			"login",
+			AuthStorage.inMemory(),
+			[{ id: "anthropic", name: "Anthropic", authType: "oauth", category: "provider" }],
+			() => {},
+			() => {},
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(output).not.toContain("←/→ switch");
+	});
 });

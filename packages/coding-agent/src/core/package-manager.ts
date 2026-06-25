@@ -2258,7 +2258,10 @@ export class DefaultPackageManager implements PackageManager {
 					path: this.bundledSkillsDir,
 				});
 			}
-			addResources("skills", builtinEntries, builtinMetadata, userOverrides.skills, this.bundledSkillsDir);
+			const builtinSkillOverrides = this.settingsManager.getBundledWebsearchEnabled()
+				? userOverrides.skills
+				: [...userOverrides.skills, "-websearch/SKILL.md"];
+			addResources("skills", builtinEntries, builtinMetadata, builtinSkillOverrides, this.bundledSkillsDir);
 		}
 		addResources(
 			"prompts",

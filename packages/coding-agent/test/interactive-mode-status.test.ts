@@ -16,6 +16,7 @@ import type {
 	AgentConnectionExtensionUiRequest,
 	AgentConnectionExtensionUiResponse,
 	AgentConnectionModel,
+	AgentConnectionResourceDiagnostic,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionSessionEvent,
 	AgentConnectionSourceInfo,
@@ -1422,8 +1423,9 @@ describe("InteractiveMode.showLoadedResources", () => {
 		contextFiles?: Array<{ path: string; content?: string }>;
 		extensions?: ExtensionFixture[];
 		skills?: Array<{ filePath: string; name: string }>;
-		skillDiagnostics?: AgentConnectionResourceSnapshot["diagnostics"]["skills"];
+		skillDiagnostics?: AgentConnectionResourceDiagnostic[];
 		useRealScopeGroups?: boolean;
+		useRealDiagnostics?: boolean;
 	}) {
 		const connectionResourceSnapshot: AgentConnectionResourceSnapshot = {
 			contextFiles: (options.contextFiles ?? []).map((contextFile) => ({ path: contextFile.path })),
@@ -1484,6 +1486,13 @@ describe("InteractiveMode.showLoadedResources", () => {
 			formatDiagnostics: () => "diagnostics",
 			getBuiltInCommandConflictDiagnostics: () => [],
 		};
+
+		if (options.useRealDiagnostics) {
+			fakeThis.formatDiagnostics = (
+				diagnostics: readonly AgentConnectionResourceDiagnostic[],
+				sourceInfos: Map<string, AgentConnectionSourceInfo>,
+			) => (InteractiveMode as any).prototype.formatDiagnostics.call(fakeThis, diagnostics, sourceInfos);
+		}
 
 		if (options.useRealScopeGroups) {
 			fakeThis.getScopeGroup = (sourceInfo?: AgentConnectionSourceInfo) =>
@@ -2060,7 +2069,35 @@ describe("InteractiveMode.showLoadedResources", () => {
 		});
 
 		const output = renderAll(fakeThis.chatContainer);
-		expect(output).toContain("[Skill conflicts]");
+		expect(output).toContain("[Skill warning]");
 		expect(output).not.toContain("[Skills]");
+	});
+
+	test("formats a multi-line skill warning without path noise", () => {
+		const fakeThis = createShowLoadedResourcesThis({
+			quietStartup: true,
+			skillDiagnostics: [
+				{
+					type: "warning",
+					message: "first line of the warning.\nsecond line with guidance.\n\n  indented detail",
+				},
+			],
+			useRealDiagnostics: true,
+		});
+
+		(InteractiveMode as any).prototype.showLoadedResources.call(fakeThis, {
+			force: false,
+			showDiagnosticsWhenQuiet: true,
+		});
+
+		const output = normalizeRenderedOutput(fakeThis.chatContainer, 100);
+		expect(output).toMatchInlineSnapshot(`
+"[Skill warning]
+  first line of the warning.
+  second line with guidance.
+
+    indented detail"
+`);
+		expect(output).not.toContain("[Skill conflicts]");
 	});
 });

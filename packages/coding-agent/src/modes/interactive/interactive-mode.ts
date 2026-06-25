@@ -1653,13 +1653,19 @@ export class InteractiveMode {
 			}
 		}
 
+		const formatMessageLines = (diagnostic: AgentConnectionResourceDiagnostic, indent: number): string[] => {
+			const color = diagnostic.type === "error" ? "error" : "warning";
+			const prefix = " ".repeat(indent);
+			return diagnostic.message.split("\n").map((line) => theme.fg(color, `${prefix}${line}`));
+		};
+
 		for (const d of otherDiagnostics) {
 			if (d.path) {
 				const formattedPath = this.formatPathWithSource(d.path, this.findSourceInfoForPath(d.path, sourceInfos));
 				lines.push(theme.fg(d.type === "error" ? "error" : "warning", `  ${formattedPath}`));
-				lines.push(theme.fg(d.type === "error" ? "error" : "warning", `    ${d.message}`));
+				lines.push(...formatMessageLines(d, 4));
 			} else {
-				lines.push(theme.fg(d.type === "error" ? "error" : "warning", `  ${d.message}`));
+				lines.push(...formatMessageLines(d, 2));
 			}
 		}
 
@@ -1678,6 +1684,25 @@ export class InteractiveMode {
 		}
 
 		const sectionHeader = (name: string, color: ThemeColor = "mdHeading") => theme.fg(color, `[${name}]`);
+		const diagnosticsHeader = (name: string, diagnostics: readonly AgentConnectionResourceDiagnostic[]): string => {
+			if (diagnostics.some((diagnostic) => diagnostic.type === "collision")) {
+				return `${name} conflicts`;
+			}
+
+			const errorCount = diagnostics.filter((diagnostic) => diagnostic.type === "error").length;
+			const warningCount = diagnostics.filter((diagnostic) => diagnostic.type === "warning").length;
+			if (errorCount > 0 && warningCount > 0) {
+				return `${name} diagnostics`;
+			}
+			if (errorCount > 0) {
+				return `${name} error${errorCount === 1 ? "" : "s"}`;
+			}
+			if (warningCount > 0) {
+				return `${name} warning${warningCount === 1 ? "" : "s"}`;
+			}
+
+			return `${name} diagnostics`;
+		};
 		const formatCompactList = (items: string[], options?: { sort?: boolean }): string => {
 			const labels = items.map((item) => item.trim()).filter((item) => item.length > 0);
 			if (options?.sort !== false) {
@@ -1812,7 +1837,13 @@ export class InteractiveMode {
 			const skillDiagnostics = resourceSnapshot?.diagnostics.skills ?? [];
 			if (skillDiagnostics.length > 0) {
 				const warningLines = this.formatDiagnostics(skillDiagnostics, sourceInfos);
-				this.chatContainer.addChild(new Text(`${theme.fg("warning", "[Skill conflicts]")}\n${warningLines}`, 0, 0));
+				this.chatContainer.addChild(
+					new Text(
+						`${sectionHeader(diagnosticsHeader("Skill", skillDiagnostics), "warning")}\n${warningLines}`,
+						0,
+						0,
+					),
+				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
 
@@ -1820,7 +1851,11 @@ export class InteractiveMode {
 			if (promptDiagnostics.length > 0) {
 				const warningLines = this.formatDiagnostics(promptDiagnostics, sourceInfos);
 				this.chatContainer.addChild(
-					new Text(`${theme.fg("warning", "[Prompt conflicts]")}\n${warningLines}`, 0, 0),
+					new Text(
+						`${sectionHeader(diagnosticsHeader("Prompt", promptDiagnostics), "warning")}\n${warningLines}`,
+						0,
+						0,
+					),
 				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
@@ -1843,7 +1878,11 @@ export class InteractiveMode {
 			if (extensionDiagnostics.length > 0) {
 				const warningLines = this.formatDiagnostics(extensionDiagnostics, sourceInfos);
 				this.chatContainer.addChild(
-					new Text(`${theme.fg("warning", "[Extension issues]")}\n${warningLines}`, 0, 0),
+					new Text(
+						`${sectionHeader(diagnosticsHeader("Extension", extensionDiagnostics), "warning")}\n${warningLines}`,
+						0,
+						0,
+					),
 				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
@@ -1851,7 +1890,13 @@ export class InteractiveMode {
 			const themeDiagnostics = resourceSnapshot?.diagnostics.themes ?? [];
 			if (themeDiagnostics.length > 0) {
 				const warningLines = this.formatDiagnostics(themeDiagnostics, sourceInfos);
-				this.chatContainer.addChild(new Text(`${theme.fg("warning", "[Theme conflicts]")}\n${warningLines}`, 0, 0));
+				this.chatContainer.addChild(
+					new Text(
+						`${sectionHeader(diagnosticsHeader("Theme", themeDiagnostics), "warning")}\n${warningLines}`,
+						0,
+						0,
+					),
+				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
 		}
@@ -6436,7 +6481,8 @@ export class InteractiveMode {
 	private async showOAuthSelector(mode: "login" | "logout"): Promise<void> {
 		if (mode === "login") {
 			const authResult = await this.showLoginProviderSelector();
-			if (authResult.status === "success") {
+			// Service credentials don't change the model, so skip the model picker.
+			if (authResult.status === "success" && authResult.kind !== "service") {
 				await this.promptForModelSelection();
 			}
 			return;

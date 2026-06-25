@@ -365,6 +365,9 @@ ${chalk.bold("Environment Variables:")}
   PI_OFFLINE                       - Disable startup network operations when set to 1/true/yes
   PRIME_AGENT_DOWNLOAD_BASE_URL    - Override the Prime Agent release manifest and tarball base URL
   PI_SHARE_VIEWER_URL              - Base URL for /share command (default: https://pi.dev/session/)
+  SERPER_API_KEY                   - Overrides the stored Serper key for the websearch skill (use /login to store one)
+  PRIME_AGENT_WEBSEARCH_TIMEOUT    - websearch HTTP timeout in seconds (default: 45)
+  PRIME_AGENT_WEBSEARCH_NUM_RESULTS - websearch organic results to return (default: 5)
 
 ${chalk.bold("Built-in Tool Names:")}
   ipython - Execute Python in a persistent IPython kernel

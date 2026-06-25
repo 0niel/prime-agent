@@ -212,8 +212,19 @@ Paths in `~/.pi/agent/settings.json` resolve relative to `~/.pi/agent`. Paths in
 | `themes` | string[] | `[]` | Local theme file paths or directories |
 | `enableSkillCommands` | boolean | `true` | Register skills as `/skill:name` commands |
 | `enableBuiltinSkills` | boolean | `true` | Load built-in skills shipped with prime-agent |
+| `bundledSkills.websearch` | boolean | `true` | Load the built-in `websearch` skill |
 
 Arrays support glob patterns and exclusions. Use `!pattern` to exclude. Use `+path` to force-include an exact path and `-path` to force-exclude an exact path.
+
+Disable the built-in `websearch` skill while keeping normal skill discovery enabled:
+
+```json
+{
+  "bundledSkills": {
+    "websearch": false
+  }
+}
+```
 
 #### packages
 

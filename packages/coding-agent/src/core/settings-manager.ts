@@ -54,6 +54,10 @@ export interface MarkdownSettings {
 	codeBlockIndent?: string; // default: "  "
 }
 
+export interface BundledSkillsSettings {
+	websearch?: boolean; // default: true
+}
+
 export interface WarningSettings {
 	anthropicExtraUsage?: boolean; // default: true
 }
@@ -100,6 +104,7 @@ export interface Settings {
 	prompts?: string[]; // Array of local prompt template paths or directories
 	themes?: string[]; // Array of local theme file paths or directories
 	enableSkillCommands?: boolean; // default: true - register skills as /skill:name commands
+	bundledSkills?: BundledSkillsSettings; // Configure built-in skills shipped with Prime Agent
 	enableBuiltinSkills?: boolean; // default: true - load built-in skills shipped with prime-agent
 	terminal?: TerminalSettings;
 	images?: ImageSettings;
@@ -908,6 +913,16 @@ export class SettingsManager {
 		this.globalSettings.enableSkillCommands = enabled;
 		this.markModified("enableSkillCommands");
 		this.save();
+	}
+
+	getBundledSkills(): { websearch: boolean } {
+		return {
+			websearch: this.settings.bundledSkills?.websearch ?? true,
+		};
+	}
+
+	getBundledWebsearchEnabled(): boolean {
+		return this.getBundledSkills().websearch;
 	}
 
 	getEnableBuiltinSkills(): boolean {
