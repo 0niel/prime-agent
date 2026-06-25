@@ -416,6 +416,27 @@ class HarnessStateTest(unittest.TestCase):
             self.assertIs(state, again)
             self.assertEqual(state.file_path, Path(temp_dir).resolve() / "harness_state.json")
 
+    def test_explicit_state_dir_global_flag_uses_matching_state_file(self) -> None:
+        previous_global = os.environ.get("RLM_GLOBAL_HARNESS_STATE_DIR")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            explicit_dir = Path(temp_dir) / "explicit"
+            env_global_dir = Path(temp_dir) / "env-global"
+            os.environ["RLM_GLOBAL_HARNESS_STATE_DIR"] = str(env_global_dir)
+            try:
+                state = get_harness_state(explicit_dir)
+                global_entry = state.create_memory("Scoped global", "custom dir", id="scoped_global", global_=True)
+            finally:
+                if previous_global is None:
+                    os.environ.pop("RLM_GLOBAL_HARNESS_STATE_DIR", None)
+                else:
+                    os.environ["RLM_GLOBAL_HARNESS_STATE_DIR"] = previous_global
+
+            self.assertEqual(global_entry.scope, "global")
+            self.assertIsNotNone(
+                HarnessState(explicit_dir / "harness_state.json", scope="global").get("memory", "scoped_global")
+            )
+            self.assertFalse((env_global_dir / "harness_state.json").exists())
+
     def test_default_state_uses_global_harness_env_dir(self) -> None:
         previous = os.environ.get("RLM_HARNESS_STATE_DIR")
         with tempfile.TemporaryDirectory() as temp_dir:

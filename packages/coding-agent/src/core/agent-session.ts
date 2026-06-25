@@ -3040,8 +3040,11 @@ export class AgentSession {
 		return this.isStreaming || this.isCompacting;
 	}
 
-	private _scheduleAutoRefine(reason: AutoRefineReason): void {
+	private _scheduleAutoRefine(reason: AutoRefineReason, branchVersion = this._autoRefineBranchVersion): void {
 		setTimeout(() => {
+			if (branchVersion !== this._autoRefineBranchVersion) {
+				return;
+			}
 			void this._maybeAutoRefine(reason);
 		}, 0);
 	}
@@ -3073,11 +3076,13 @@ export class AgentSession {
 
 			this._autoRefineInProgress = true;
 			try {
+				await this.refine({ instructions: autoRefineInstructions(pendingReview.reason, pendingReview.review) });
 				this._pendingAutoRefineReview = undefined;
+				this._lastAutoRefineReviewAt = Date.now();
+				this._assistantTurnsSinceAutoRefine = 0;
 				if (pendingReview.reason === "compact") {
 					this._compactAutoRefinePending = false;
 				}
-				await this.refine({ instructions: autoRefineInstructions(pendingReview.reason, pendingReview.review) });
 			} catch {
 				// Auto-refine is opportunistic; manual /refine remains available.
 			} finally {
@@ -3114,12 +3119,12 @@ export class AgentSession {
 			if (branchVersion !== this._autoRefineBranchVersion) {
 				return;
 			}
-			this._lastAutoRefineReviewAt = nowMs;
-			this._assistantTurnsSinceAutoRefine = 0;
-			if (reason === "compact") {
-				this._compactAutoRefinePending = false;
-			}
 			if (!review.shouldRefine) {
+				this._lastAutoRefineReviewAt = nowMs;
+				this._assistantTurnsSinceAutoRefine = 0;
+				if (reason === "compact") {
+					this._compactAutoRefinePending = false;
+				}
 				return;
 			}
 			if (this._shouldSkipAutoRefineForActiveAgent()) {
@@ -3127,6 +3132,11 @@ export class AgentSession {
 				return;
 			}
 			await this.refine({ instructions: autoRefineInstructions(reason, review) });
+			this._lastAutoRefineReviewAt = nowMs;
+			this._assistantTurnsSinceAutoRefine = 0;
+			if (reason === "compact") {
+				this._compactAutoRefinePending = false;
+			}
 		} catch {
 			// Auto-refine is opportunistic; manual /refine remains available.
 		} finally {

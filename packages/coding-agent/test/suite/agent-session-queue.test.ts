@@ -190,6 +190,25 @@ describe("AgentSession queue characterization", () => {
 		expect(scheduleAutoRefine).toHaveBeenCalledWith("compact");
 	});
 
+	it("does not run scheduled auto-refine after branch navigation", async () => {
+		vi.useFakeTimers();
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		const maybeAutoRefine = vi.spyOn(internals, "_maybeAutoRefine").mockResolvedValue();
+		try {
+			internals._scheduleAutoRefine("compact");
+			internals._invalidatePendingAutoRefineForBranchChange();
+			await vi.runAllTimersAsync();
+
+			expect(maybeAutoRefine).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("auto-refine compact hook defers an approved refine if the agent becomes active during review", async () => {
 		let finishReview: (() => void) | undefined;
 		const reviewStarted = new Promise<void>((resolve) => {
@@ -279,7 +298,31 @@ describe("AgentSession queue characterization", () => {
 		);
 		expect(guardWasSetDuringRefine).toBe(true);
 		expect(internals._autoRefineInProgress).toBe(false);
+		expect(internals._pendingAutoRefineReview).toBeDefined();
+
+		refine.mockResolvedValueOnce(emptyRefinementResult());
+		await internals._maybeAutoRefine("turn_interval");
+
 		expect(internals._pendingAutoRefineReview).toBeUndefined();
+	});
+
+	it("keeps auto-refine counters when an approved immediate refine fails", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 2;
+		const beforeReviewAt = internals._lastAutoRefineReviewAt;
+		vi.spyOn(harness.session, "refine").mockRejectedValueOnce(new Error("refine failed"));
+
+		await internals._maybeAutoRefine("turn_interval");
+
+		expect(reviewer).toHaveBeenCalledWith({ reason: "turn_interval", turnsSinceLastReview: 2 });
+		expect(internals._assistantTurnsSinceAutoRefine).toBe(2);
+		expect(internals._lastAutoRefineReviewAt).toBe(beforeReviewAt);
 	});
 
 	it("clears pending auto-refine state when navigating to another branch", async () => {

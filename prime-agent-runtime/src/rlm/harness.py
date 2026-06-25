@@ -132,6 +132,7 @@ class HarnessState:
         self.scope: HarnessScope = scope
         self.entries: dict[HarnessKind, dict[str, HarnessEntry]] = {kind: {} for kind in _KINDS}
         self.refinements: list[RefinementEvent] = []
+        self._global_target_state_dir: Path | None = None
         # mtime of the file as of the last load/save, used to detect out-of-process
         # writes (e.g. the host `/refine` command) and avoid clobbering them.
         self._loaded_mtime: int | None = None
@@ -240,7 +241,7 @@ class HarnessState:
             return None
         if self.file_path is None:
             return None
-        target = get_harness_state(global_=True)
+        target = get_harness_state(state_dir=self._global_target_state_dir, global_=True)
         if self.file_path is not None and target.file_path == self.file_path and target.scope == self.scope:
             return None
         return target
@@ -743,6 +744,8 @@ def get_harness_state(
     state = _state_cache.get(cache_key)
     if state is None:
         state = HarnessState(file_path, scope=scope)
+        if state_dir is not None:
+            state._global_target_state_dir = Path(state_dir).expanduser().resolve()
         _state_cache[cache_key] = state
     return state
 

@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	appendGlobalRefinement,
 	applyRefinementProposal,
+	formatHarnessStateForPrompt,
 	getGlobalHarnessStateDir,
 	getHarnessStatePath,
 	getLocalHarnessStateDir,
@@ -518,6 +519,9 @@ describe("harness refinement", () => {
 		expect(Object.values(merged.entries.memory).map((entry) => `${entry.scope}:${entry.content}`)).toEqual(
 			expect.arrayContaining(["global:Global content.", "local:Local content."]),
 		);
+		const promptOverview = formatHarnessStateForPrompt(merged);
+		expect(promptOverview).toContain("[global:shared]");
+		expect(promptOverview).toContain("[local:shared]");
 		expect(globalState.entries.memory.shared.scope).toBe("global");
 	});
 
