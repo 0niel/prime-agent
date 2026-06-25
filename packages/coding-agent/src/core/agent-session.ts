@@ -3220,16 +3220,16 @@ export class AgentSession {
 			// Re-read the target state immediately before applying so concurrent kernel
 			// (`rlm.harness`) writes during the LLM pass are not clobbered.
 			const state = loadHarnessState(targetHarnessStateDir, targetScope);
-			const proposal =
-				targetScope === "local"
-					? {
-							...plan.proposal,
-							edits: plan.proposal.edits.map((edit) => ({
-								...edit,
-								id: edit.id?.startsWith("local:") ? edit.id.slice("local:".length) : edit.id,
-							})),
-						}
-					: plan.proposal;
+			const proposal = {
+				...plan.proposal,
+				edits: plan.proposal.edits.map((edit) => {
+					const displayPrefix = `${targetScope}:`;
+					return {
+						...edit,
+						id: edit.id?.startsWith(displayPrefix) ? edit.id.slice(displayPrefix.length) : edit.id,
+					};
+				}),
+			};
 			const result = applyRefinementProposal(state, proposal, {
 				id: plan.id,
 				rollbackOf: plan.rollbackOf,

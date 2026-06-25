@@ -517,6 +517,68 @@ describe("AgentSession queue characterization", () => {
 		}
 	});
 
+	it("strips global display prefixes before applying global refine edits", async () => {
+		const harness = await createAutoRefineHarness();
+		harnesses.push(harness);
+		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		process.env.PRIME_AGENT_CODING_AGENT_DIR = `${harness.tempDir}/agent`;
+		try {
+			const globalDir = getGlobalHarnessStateDir();
+			const globalState = loadHarnessState(globalDir, "global");
+			applyRefinementProposal(
+				globalState,
+				{
+					summary: "Global shared memory",
+					rationale: "seed",
+					expectedOutcome: "seeded",
+					edits: [
+						{
+							action: "create",
+							kind: "memory",
+							id: "shared",
+							title: "Shared",
+							content: "Global content",
+						},
+					],
+				},
+				{ id: "seed_global", scope: "global" },
+			);
+			saveHarnessState(globalDir, globalState);
+			harness.setResponses([
+				fauxAssistantMessage(
+					JSON.stringify({
+						summary: "Update global shared memory",
+						rationale: "The global display id was selected from the overview.",
+						expectedOutcome: "Only the global entry changes.",
+						edits: [
+							{
+								action: "update",
+								kind: "memory",
+								id: "global:shared",
+								title: "Shared",
+								content: "Updated global content",
+							},
+						],
+					}),
+				),
+			]);
+
+			const result = await harness.session.refine({
+				instructions: "update the global shared memory",
+				global: true,
+			});
+
+			expect(result.appliedEdits[0]).toMatchObject({ id: "shared", applied: true });
+			expect(loadHarnessState(globalDir, "global").entries.memory.shared.content).toBe("Updated global content");
+		} finally {
+			if (previousAgentDir === undefined) {
+				delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+			} else {
+				process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
+			}
+		}
+	});
+
 	it("dispatches extension commands immediately when prompted while idle", async () => {
 		const commandRuns: string[] = [];
 		const harness = await createHarness({
