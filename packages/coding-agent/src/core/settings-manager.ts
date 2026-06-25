@@ -5,6 +5,8 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
 
+const RECENT_MODELS_LIMIT = 20;
+
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
@@ -59,6 +61,10 @@ export interface MarkdownSettings {
 	codeBlockIndent?: string; // default: "  "
 }
 
+export interface BundledSkillsSettings {
+	websearch?: boolean; // default: true
+}
+
 export interface WarningSettings {
 	anthropicExtraUsage?: boolean; // default: true
 }
@@ -84,7 +90,8 @@ export interface Settings {
 	onboardingCompleted?: boolean;
 	defaultProvider?: string;
 	defaultModel?: string;
-	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+	recentModels?: string[]; // "provider/id" keys, most-recently-used first
+	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
@@ -105,6 +112,7 @@ export interface Settings {
 	prompts?: string[]; // Array of local prompt template paths or directories
 	themes?: string[]; // Array of local theme file paths or directories
 	enableSkillCommands?: boolean; // default: true - register skills as /skill:name commands
+	bundledSkills?: BundledSkillsSettings; // Configure built-in skills shipped with Prime Agent
 	enableBuiltinSkills?: boolean; // default: true - load built-in skills shipped with prime-agent
 	terminal?: TerminalSettings;
 	images?: ImageSettings;
@@ -623,7 +631,19 @@ export class SettingsManager {
 		this.globalSettings.defaultModel = modelId;
 		this.markModified("defaultProvider");
 		this.markModified("defaultModel");
+		this.recordModelUseInternal(provider, modelId);
+		this.markModified("recentModels");
 		this.save();
+	}
+
+	getRecentModels(): string[] {
+		return this.settings.recentModels ?? [];
+	}
+
+	private recordModelUseInternal(provider: string, modelId: string): void {
+		const key = `${provider}/${modelId}`;
+		const next = [key, ...this.getRecentModels().filter((k) => k !== key)];
+		this.globalSettings.recentModels = next.slice(0, RECENT_MODELS_LIMIT);
 	}
 
 	getSteeringMode(): "all" | "one-at-a-time" {
@@ -656,11 +676,11 @@ export class SettingsManager {
 		this.save();
 	}
 
-	getDefaultThinkingLevel(): "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | undefined {
+	getDefaultThinkingLevel(): "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | undefined {
 		return this.settings.defaultThinkingLevel;
 	}
 
-	setDefaultThinkingLevel(level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh"): void {
+	setDefaultThinkingLevel(level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"): void {
 		this.globalSettings.defaultThinkingLevel = level;
 		this.markModified("defaultThinkingLevel");
 		this.save();
@@ -910,6 +930,16 @@ export class SettingsManager {
 		this.globalSettings.enableSkillCommands = enabled;
 		this.markModified("enableSkillCommands");
 		this.save();
+	}
+
+	getBundledSkills(): { websearch: boolean } {
+		return {
+			websearch: this.settings.bundledSkills?.websearch ?? true,
+		};
+	}
+
+	getBundledWebsearchEnabled(): boolean {
+		return this.getBundledSkills().websearch;
 	}
 
 	getEnableBuiltinSkills(): boolean {

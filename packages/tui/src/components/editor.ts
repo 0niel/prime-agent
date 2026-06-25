@@ -15,34 +15,58 @@ const PASTE_MARKER_REGEX = /\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]/g;
 /** Non-global version for single-segment testing. */
 const PASTE_MARKER_SINGLE = /^\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]$/;
 
-/** Check if a segment is a paste marker (i.e. was merged by segmentWithMarkers). */
-function isPasteMarker(segment: string): boolean {
-	return segment.length >= 10 && PASTE_MARKER_SINGLE.test(segment);
+/**
+ * Regex matching image markers like `[image #1]`. Kept in sync with the marker
+ * format produced by the coding agent's image-markers helper; the tui package
+ * can't depend on the coding agent, so the pattern is duplicated here.
+ */
+const IMAGE_MARKER_REGEX = /\[image #(\d+)\]/g;
+
+/** Non-global version for single-segment testing. */
+const IMAGE_MARKER_SINGLE = /^\[image #(\d+)\]$/;
+
+/** Check if a segment is an atomic marker (paste or image) merged by segmentWithMarkers. */
+function isAtomicMarker(segment: string): boolean {
+	return segment.length >= 10 && (PASTE_MARKER_SINGLE.test(segment) || IMAGE_MARKER_SINGLE.test(segment));
 }
 
 /**
  * A segmenter that wraps Intl.Segmenter and merges graphemes that fall
- * within paste markers into single atomic segments.  This makes cursor
- * movement, deletion, word-wrap, etc. treat paste markers as single units.
+ * within paste or image markers into single atomic segments. This makes cursor
+ * movement, deletion, word-wrap, etc. treat the markers as single units.
  *
- * Only markers whose numeric ID exists in `validIds` are merged.
+ * Paste markers are only merged when their numeric ID exists in `validPasteIds`
+ * (so a stale `[paste #N]` typed by the user isn't treated as atomic). Image
+ * markers are self-contained and always merged.
  */
-function segmentWithMarkers(text: string, validIds: Set<number>): Iterable<Intl.SegmentData> {
-	// Fast path: no paste markers in the text or no valid IDs.
-	if (validIds.size === 0 || !text.includes("[paste #")) {
+function segmentWithMarkers(text: string, validPasteIds: Set<number>): Iterable<Intl.SegmentData> {
+	const hasPaste = validPasteIds.size > 0 && text.includes("[paste #");
+	const hasImage = text.includes("[image #");
+
+	// Fast path: nothing to merge.
+	if (!hasPaste && !hasImage) {
 		return baseSegmenter.segment(text);
 	}
 
-	// Find all marker spans with valid IDs.
+	// Find all marker spans (paste markers gated by valid IDs, image markers always).
 	const markers: Array<{ start: number; end: number }> = [];
-	for (const m of text.matchAll(PASTE_MARKER_REGEX)) {
-		const id = Number.parseInt(m[1]!, 10);
-		if (!validIds.has(id)) continue;
-		markers.push({ start: m.index, end: m.index + m[0].length });
+	if (hasPaste) {
+		for (const m of text.matchAll(PASTE_MARKER_REGEX)) {
+			const id = Number.parseInt(m[1]!, 10);
+			if (!validPasteIds.has(id)) continue;
+			markers.push({ start: m.index, end: m.index + m[0].length });
+		}
+	}
+	if (hasImage) {
+		for (const m of text.matchAll(IMAGE_MARKER_REGEX)) {
+			markers.push({ start: m.index, end: m.index + m[0].length });
+		}
 	}
 	if (markers.length === 0) {
 		return baseSegmenter.segment(text);
 	}
+	// The merge loop below assumes spans are sorted ascending by start.
+	markers.sort((a, b) => a.start - b.start);
 
 	// Build merged segment list.
 	const baseSegments = baseSegmenter.segment(text);
@@ -124,7 +148,7 @@ export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl
 		const grapheme = seg.segment;
 		const gWidth = visibleWidth(grapheme);
 		const charIndex = seg.index;
-		const isWs = !isPasteMarker(grapheme) && isWhitespaceChar(grapheme);
+		const isWs = !isAtomicMarker(grapheme) && isWhitespaceChar(grapheme);
 
 		// Overflow check before advancing.
 		if (currentWidth + gWidth > maxWidth) {
@@ -172,7 +196,7 @@ export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl
 		// Multiple spaces join (no break between them); the break point is
 		// after the last space before the next word.
 		const next = segments[i + 1];
-		if (isWs && next && (isPasteMarker(next.segment) || !isWhitespaceChar(next.segment))) {
+		if (isWs && next && (isAtomicMarker(next.segment) || !isWhitespaceChar(next.segment))) {
 			wrapOppIndex = next.index;
 			wrapOppWidth = currentWidth;
 		}
@@ -201,6 +225,7 @@ export interface EditorTheme {
 	borderColor: (str: string) => string;
 	backgroundColor?: (str: string) => string;
 	selectList: SelectListTheme;
+	commandColor?: (str: string) => string;
 }
 
 export interface EditorOptions {
@@ -240,6 +265,7 @@ export class Editor implements Component, Focusable {
 	// Border color (can be changed dynamically)
 	public borderColor: (str: string) => string;
 	public backgroundColor: ((str: string) => string) | undefined;
+	public commandColor: ((str: string) => string) | undefined;
 
 	// Autocomplete support
 	private autocompleteProvider?: AutocompleteProvider;
@@ -294,6 +320,7 @@ export class Editor implements Component, Focusable {
 		this.theme = theme;
 		this.borderColor = theme.borderColor;
 		this.backgroundColor = theme.backgroundColor;
+		this.commandColor = theme.commandColor;
 		const paddingX = options.paddingX ?? 0;
 		this.paddingX = Number.isFinite(paddingX) ? Math.max(0, Math.floor(paddingX)) : 0;
 		this.promptPrefix = options.promptPrefix ?? "";
@@ -347,6 +374,15 @@ export class Editor implements Component, Focusable {
 		return 0;
 	}
 
+	protected styleDisplayText(
+		displayText: string,
+		_layoutLineIndex: number,
+		_lineText: string,
+		_cursorCol: number | undefined,
+	): string {
+		return displayText;
+	}
+
 	private getLineHiddenTextPrefixLength(lineIndex: number, line: string): number {
 		const hiddenLength = this.getHiddenTextPrefixLength(lineIndex, line);
 		if (!Number.isFinite(hiddenLength)) {
@@ -374,6 +410,17 @@ export class Editor implements Component, Focusable {
 		if (this.history.length > 100) {
 			this.history.pop();
 		}
+	}
+
+	/** Prompt history entries (most recent first). */
+	getHistory(): readonly string[] {
+		return this.history;
+	}
+
+	/** Clear prompt history (e.g. when switching to a different session). */
+	clearHistory(): void {
+		this.history = [];
+		this.historyIndex = -1;
 	}
 
 	private isEditorEmpty(): boolean {
@@ -559,6 +606,13 @@ export class Editor implements Component, Focusable {
 				}
 			}
 
+			displayText = this.styleDisplayText(
+				displayText,
+				absoluteLineIndex,
+				layoutLine.text,
+				layoutLine.hasCursor ? layoutLine.cursorPos : undefined,
+			);
+
 			// Calculate padding based on actual visible width
 			const padding = " ".repeat(Math.max(0, inputWidth - lineVisibleWidth));
 			const lineRightPadding = cursorInPadding ? rightPadding.slice(1) : rightPadding;
@@ -710,6 +764,10 @@ export class Editor implements Component, Focusable {
 
 					if (this.autocompletePrefix.startsWith("/")) {
 						this.cancelAutocomplete();
+						if (selected.takesArgument) {
+							if (this.onChange) this.onChange(this.getText());
+							return;
+						}
 						// Fall through to submit
 					} else {
 						this.cancelAutocomplete();
@@ -1872,7 +1930,7 @@ export class Editor implements Component, Focusable {
 		// Skip trailing whitespace
 		while (
 			graphemes.length > 0 &&
-			!isPasteMarker(graphemes[graphemes.length - 1]?.segment || "") &&
+			!isAtomicMarker(graphemes[graphemes.length - 1]?.segment || "") &&
 			isWhitespaceChar(graphemes[graphemes.length - 1]?.segment || "")
 		) {
 			newCol -= graphemes.pop()?.segment.length || 0;
@@ -1880,7 +1938,7 @@ export class Editor implements Component, Focusable {
 
 		if (graphemes.length > 0) {
 			const lastGrapheme = graphemes[graphemes.length - 1]?.segment || "";
-			if (isPasteMarker(lastGrapheme)) {
+			if (isAtomicMarker(lastGrapheme)) {
 				// Paste marker is a single atomic word
 				newCol -= graphemes.pop()?.segment.length || 0;
 			} else if (isPunctuationChar(lastGrapheme)) {
@@ -1888,7 +1946,7 @@ export class Editor implements Component, Focusable {
 				while (
 					graphemes.length > 0 &&
 					isPunctuationChar(graphemes[graphemes.length - 1]?.segment || "") &&
-					!isPasteMarker(graphemes[graphemes.length - 1]?.segment || "")
+					!isAtomicMarker(graphemes[graphemes.length - 1]?.segment || "")
 				) {
 					newCol -= graphemes.pop()?.segment.length || 0;
 				}
@@ -1898,7 +1956,7 @@ export class Editor implements Component, Focusable {
 					graphemes.length > 0 &&
 					!isWhitespaceChar(graphemes[graphemes.length - 1]?.segment || "") &&
 					!isPunctuationChar(graphemes[graphemes.length - 1]?.segment || "") &&
-					!isPasteMarker(graphemes[graphemes.length - 1]?.segment || "")
+					!isAtomicMarker(graphemes[graphemes.length - 1]?.segment || "")
 				) {
 					newCol -= graphemes.pop()?.segment.length || 0;
 				}
@@ -2099,19 +2157,19 @@ export class Editor implements Component, Focusable {
 		let newCol = this.state.cursorCol;
 
 		// Skip leading whitespace
-		while (!next.done && !isPasteMarker(next.value.segment) && isWhitespaceChar(next.value.segment)) {
+		while (!next.done && !isAtomicMarker(next.value.segment) && isWhitespaceChar(next.value.segment)) {
 			newCol += next.value.segment.length;
 			next = iterator.next();
 		}
 
 		if (!next.done) {
 			const firstGrapheme = next.value.segment;
-			if (isPasteMarker(firstGrapheme)) {
+			if (isAtomicMarker(firstGrapheme)) {
 				// Paste marker is a single atomic word
 				newCol += firstGrapheme.length;
 			} else if (isPunctuationChar(firstGrapheme)) {
 				// Skip punctuation run
-				while (!next.done && isPunctuationChar(next.value.segment) && !isPasteMarker(next.value.segment)) {
+				while (!next.done && isPunctuationChar(next.value.segment) && !isAtomicMarker(next.value.segment)) {
 					newCol += next.value.segment.length;
 					next = iterator.next();
 				}
@@ -2121,7 +2179,7 @@ export class Editor implements Component, Focusable {
 					!next.done &&
 					!isWhitespaceChar(next.value.segment) &&
 					!isPunctuationChar(next.value.segment) &&
-					!isPasteMarker(next.value.segment)
+					!isAtomicMarker(next.value.segment)
 				) {
 					newCol += next.value.segment.length;
 					next = iterator.next();

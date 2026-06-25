@@ -15,6 +15,7 @@ import {
 	untrackDetachedChildPid,
 } from "../../utils/shell.js";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
+import { previewBashCommand } from "./code-preview.js";
 import { OutputAccumulator } from "./output-accumulator.js";
 import { getTextOutput, invalidArgText, str } from "./render-utils.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
@@ -181,7 +182,16 @@ function formatBashCall(args: { command?: string; timeout?: number } | undefined
 	const command = str(args?.command);
 	const timeout = args?.timeout as number | undefined;
 	const timeoutSuffix = timeout ? theme.fg("muted", ` (timeout ${timeout}s)`) : "";
-	const commandDisplay = command === null ? invalidArgText(theme) : command ? command : theme.fg("toolOutput", "...");
+	let commandDisplay: string;
+	if (command === null) {
+		commandDisplay = invalidArgText(theme);
+	} else if (command) {
+		const preview = previewBashCommand(command);
+		const label = preview.language === "bash" ? "" : `${preview.language}: `;
+		commandDisplay = preview.text ? `${label}${preview.text}` : command;
+	} else {
+		commandDisplay = theme.fg("toolOutput", "...");
+	}
 	return theme.fg("toolTitle", theme.bold(`$ ${commandDisplay}`)) + timeoutSuffix;
 }
 

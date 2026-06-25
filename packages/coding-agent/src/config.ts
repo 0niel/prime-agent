@@ -448,11 +448,20 @@ export function getBundledInteractiveAssetPath(name: string): string {
 
 /**
  * Get the directory containing built-in skills shipped with the package.
- * - For Bun binary: skills/ next to executable (copied by copy-binary-assets)
- * - For Node.js (dist/) and tsx (src/): <package root>/skills
+ * - For Bun binary: skills/ next to executable
+ * - For Node.js (dist/): dist/skills/
+ * - For tsx (src/): skills/ at the package root
  */
 export function getBundledSkillsDir(): string {
-	return join(getPackageDir(), "skills");
+	if (isBunBinary) {
+		return join(getPackageDir(), "skills");
+	}
+	const packageDir = getPackageDir();
+	// Source checkouts (tsx) keep built-in skills at the package root; built
+	// packages copy them to dist/skills. Decide by whether src/ is present so a
+	// stale dist/ from a prior build never shadows live source edits.
+	const isSourceCheckout = existsSync(join(packageDir, "src"));
+	return isSourceCheckout ? join(packageDir, "skills") : join(packageDir, "dist", "skills");
 }
 
 // =============================================================================
@@ -527,6 +536,10 @@ export function getLogsDir(): string {
 /** Log file capturing client-side agent-open failures. */
 export function getClientErrorLogPath(): string {
 	return join(getLogsDir(), "client-errors.log");
+}
+
+export function getAgentTracesLogPath(): string {
+	return join(getLogsDir(), "agent-traces.log");
 }
 
 /**

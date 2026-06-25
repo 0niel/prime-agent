@@ -16,6 +16,7 @@ import type {
 	AgentConnectionExtensionUiRequest,
 	AgentConnectionExtensionUiResponse,
 	AgentConnectionModel,
+	AgentConnectionResourceDiagnostic,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionSessionEvent,
 	AgentConnectionSourceInfo,
@@ -293,6 +294,7 @@ describe("InteractiveMode pending bash components", () => {
 		const component = bashComponent();
 		const fakeThis = {
 			pendingMessagesContainer,
+			queuedMessagesContainer: new Container(),
 			pendingBashComponents: [component],
 			getAllQueuedMessages: () => ({ steering: [], followUp: [] }),
 		} as unknown as InteractiveMode;
@@ -366,10 +368,15 @@ describe("InteractiveMode pending bash components", () => {
 		const loader = (component as unknown as { loader: { intervalId: unknown } }).loader;
 		expect(loader.intervalId).not.toBeNull();
 
+		const editorStub = { clearHistory: vi.fn(), setText: vi.fn() };
 		const fakeThis = {
 			chatContainer: new Container(),
 			pendingMessagesContainer: new Container(),
+			queuedMessagesContainer: new Container(),
 			compactionQueuedMessages: [],
+			pastedImages: new Map(),
+			defaultEditor: editorStub,
+			editor: editorStub,
 			streamingComponent: undefined,
 			streamingMessage: undefined,
 			activeBashComponent: component,
@@ -804,6 +811,7 @@ describe("InteractiveMode model selection persistence", () => {
 		applySelectedModel(model: AgentConnectionModel): Promise<void>;
 		handleModelCommand(searchTerm?: string): Promise<void>;
 		completeOnboardingIfCurrentModelReady(): void;
+		setupAutocompleteProvider(): void;
 	};
 
 	const createModel = (provider: string, id: string): AgentConnectionModel =>
@@ -832,13 +840,14 @@ describe("InteractiveMode model selection persistence", () => {
 		fakeThis.footer = { invalidate: vi.fn() };
 		fakeThis.patchConnectionState = vi.fn();
 		fakeThis.updateEditorBorderColor = vi.fn();
+		fakeThis.setupAutocompleteProvider = vi.fn();
 
 		await fakeThis.applySelectedModel(model);
 
 		expect(fakeThis.agentConnection.setModel).toHaveBeenCalledWith("openai", "gpt-5.5");
 		expect(fakeThis.uiServices.settingsManager.setDefaultModelAndProvider).toHaveBeenCalledWith("openai", "gpt-5.5");
 		expect(order).toEqual(["connection", "settings"]);
-		expect(fakeThis.patchConnectionState).toHaveBeenCalledWith({ model });
+		expect(fakeThis.patchConnectionState).toHaveBeenCalledWith({ model, availableThinkingLevels: ["off"] });
 		expect(fakeThis.footer.invalidate).toHaveBeenCalledTimes(1);
 		expect(fakeThis.updateEditorBorderColor).toHaveBeenCalledTimes(1);
 	});
@@ -886,12 +895,13 @@ describe("InteractiveMode model selection persistence", () => {
 		fakeThis.maybeWarnAboutAnthropicSubscriptionAuth = vi.fn(async () => {});
 		fakeThis.checkDaxnutsEasterEgg = vi.fn();
 		fakeThis.completeOnboardingIfCurrentModelReady = vi.fn();
+		fakeThis.setupAutocompleteProvider = vi.fn();
 
 		await fakeThis.handleModelCommand("gpt-5.5");
 
 		expect(fakeThis.agentConnection.setModel).toHaveBeenCalledWith("openai", "gpt-5.5");
 		expect(fakeThis.uiServices.settingsManager.setDefaultModelAndProvider).toHaveBeenCalledWith("openai", "gpt-5.5");
-		expect(fakeThis.patchConnectionState).toHaveBeenCalledWith({ model });
+		expect(fakeThis.patchConnectionState).toHaveBeenCalledWith({ model, availableThinkingLevels: ["off"] });
 		expect(fakeThis.showStatus).toHaveBeenCalledWith("Model: gpt-5.5");
 		expect(fakeThis.showError).not.toHaveBeenCalled();
 		expect(fakeThis.completeOnboardingIfCurrentModelReady).toHaveBeenCalledTimes(1);
@@ -905,6 +915,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		handleModelCommand(searchTerm?: string): Promise<void>;
 		runOnboardingFlow(): Promise<boolean>;
 		applySelectedModel(model: AgentConnectionModel): Promise<void>;
+		setupAutocompleteProvider(): void;
 	};
 	type OnboardingFake = OnboardingHarness & {
 		connectionState: AgentConnectionState;
@@ -1033,6 +1044,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		fakeThis.maybeWarnAboutAnthropicSubscriptionAuth = vi.fn();
 		fakeThis.checkDaxnutsEasterEgg = vi.fn();
 		fakeThis.applySelectedModel = applySelectedModel;
+		fakeThis.setupAutocompleteProvider = vi.fn();
 
 		await handleModelCommand.call(fakeThis, "prime-inference/openai/gpt-5.5");
 
@@ -1144,12 +1156,13 @@ describe("InteractiveMode goal status announcements", () => {
 });
 
 describe("InteractiveMode tray goal label", () => {
+	type TrayUsage = { contextWindow: number; tokens: number | null; percent: number | null };
 	type TrayLabelHarness = {
 		connectionState: {
 			goal: GoalState;
-			contextUsage: { contextWindow: number; percent: number | null } | undefined;
+			contextUsage: TrayUsage | undefined;
 		};
-		uiServices: { getContextUsage(): { contextWindow: number; percent: number | null } | undefined };
+		uiServices: { getContextUsage(): TrayUsage | undefined };
 		getTrayContextLabel(): string | undefined;
 	};
 	const getTrayContextLabel = (InteractiveMode.prototype as unknown as TrayLabelHarness).getTrayContextLabel;
@@ -1172,7 +1185,7 @@ describe("InteractiveMode tray goal label", () => {
 		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});
 
-	test("combines active goals with low-context signal in one lower-tray label", () => {
+	test("combines active goals with token/context usage in one lower-tray label", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
 		fakeThis.connectionState = {
 			goal: {
@@ -1183,11 +1196,29 @@ describe("InteractiveMode tray goal label", () => {
 				timeUsedSeconds: 65,
 				continuationsUsed: 1,
 			} satisfies GoalState,
-			contextUsage: { contextWindow: 100_000, percent: 75 },
+			contextUsage: { contextWindow: 100_000, tokens: 75_000, percent: 75 },
 		};
 		fakeThis.uiServices = { getContextUsage: () => undefined };
 
-		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 25% context left");
+		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 75k (75%)");
+	});
+
+	test("omits the usage segment when token count is unknown", () => {
+		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
+		fakeThis.connectionState = {
+			goal: {
+				active: true,
+				status: "active",
+				objective: "finish the task",
+				tokensUsed: 0,
+				timeUsedSeconds: 65,
+				continuationsUsed: 1,
+			} satisfies GoalState,
+			contextUsage: { contextWindow: 100_000, tokens: null, percent: null },
+		};
+		fakeThis.uiServices = { getContextUsage: () => undefined };
+
+		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s)");
 	});
 });
 
@@ -1392,8 +1423,9 @@ describe("InteractiveMode.showLoadedResources", () => {
 		contextFiles?: Array<{ path: string; content?: string }>;
 		extensions?: ExtensionFixture[];
 		skills?: Array<{ filePath: string; name: string }>;
-		skillDiagnostics?: AgentConnectionResourceSnapshot["diagnostics"]["skills"];
+		skillDiagnostics?: AgentConnectionResourceDiagnostic[];
 		useRealScopeGroups?: boolean;
+		useRealDiagnostics?: boolean;
 	}) {
 		const connectionResourceSnapshot: AgentConnectionResourceSnapshot = {
 			contextFiles: (options.contextFiles ?? []).map((contextFile) => ({ path: contextFile.path })),
@@ -1454,6 +1486,13 @@ describe("InteractiveMode.showLoadedResources", () => {
 			formatDiagnostics: () => "diagnostics",
 			getBuiltInCommandConflictDiagnostics: () => [],
 		};
+
+		if (options.useRealDiagnostics) {
+			fakeThis.formatDiagnostics = (
+				diagnostics: readonly AgentConnectionResourceDiagnostic[],
+				sourceInfos: Map<string, AgentConnectionSourceInfo>,
+			) => (InteractiveMode as any).prototype.formatDiagnostics.call(fakeThis, diagnostics, sourceInfos);
+		}
 
 		if (options.useRealScopeGroups) {
 			fakeThis.getScopeGroup = (sourceInfo?: AgentConnectionSourceInfo) =>
@@ -2030,7 +2069,35 @@ describe("InteractiveMode.showLoadedResources", () => {
 		});
 
 		const output = renderAll(fakeThis.chatContainer);
-		expect(output).toContain("[Skill conflicts]");
+		expect(output).toContain("[Skill warning]");
 		expect(output).not.toContain("[Skills]");
+	});
+
+	test("formats a multi-line skill warning without path noise", () => {
+		const fakeThis = createShowLoadedResourcesThis({
+			quietStartup: true,
+			skillDiagnostics: [
+				{
+					type: "warning",
+					message: "first line of the warning.\nsecond line with guidance.\n\n  indented detail",
+				},
+			],
+			useRealDiagnostics: true,
+		});
+
+		(InteractiveMode as any).prototype.showLoadedResources.call(fakeThis, {
+			force: false,
+			showDiagnosticsWhenQuiet: true,
+		});
+
+		const output = normalizeRenderedOutput(fakeThis.chatContainer, 100);
+		expect(output).toMatchInlineSnapshot(`
+"[Skill warning]
+  first line of the warning.
+  second line with guidance.
+
+    indented detail"
+`);
+		expect(output).not.toContain("[Skill conflicts]");
 	});
 });

@@ -8,6 +8,7 @@ import {
 	buildSessionList,
 	resolveAttachModelFallbackMessage,
 	type SessionSummary,
+	summaryForActiveSession,
 } from "../src/modes/daemon/daemon-session-list.js";
 
 describe("buildSessionList", () => {
@@ -39,12 +40,10 @@ describe("buildSessionList", () => {
 		const activePath = resolve("/tmp/project/active.jsonl");
 		const sleepingPath = resolve("/tmp/project/sleeping.jsonl");
 		const crashedPath = resolve("/tmp/project/crashed.jsonl");
-		const hiddenPath = resolve("/tmp/project/hidden.jsonl");
 		const savedSessions = [
 			makeSessionInfo({ path: activePath, id: "saved-active", name: "active saved" }),
 			makeSessionInfo({ path: sleepingPath, id: "saved-sleeping", name: "sleeping saved" }),
 			makeSessionInfo({ path: crashedPath, id: "saved-crashed", state: { status: "crash" } }),
-			makeSessionInfo({ path: hiddenPath, id: "saved-hidden", state: { status: "hidden" } }),
 		];
 
 		const entries = buildSessionList(
@@ -52,12 +51,11 @@ describe("buildSessionList", () => {
 			savedSessions,
 		);
 
-		expect(entries).toHaveLength(4);
+		expect(entries).toHaveLength(3);
 		expect(entries.map((entry) => [entry.id, entry.sessionId, entry.status])).toEqual([
 			["active-1", "saved-active", "idle"],
 			["saved-sleeping", "saved-sleeping", "sleep"],
 			["saved-crashed", "saved-crashed", "crash"],
-			["saved-hidden", "saved-hidden", "hidden"],
 		]);
 		expect(entries[0]!.sessionName).toBe("session active-1");
 	});
@@ -95,6 +93,46 @@ describe("buildSessionList", () => {
 			// The spawn prompt doubles as the subagent's display title.
 			firstMessage: "Audit the retry logic for races",
 		});
+	});
+});
+
+describe("summaryForActiveSession recap currency", () => {
+	const twoMessages = [
+		{ role: "user", content: "hi" },
+		{ role: "assistant", content: "ok" },
+	] as AgentMessage[];
+
+	it("surfaces both recap and verdict while the summary matches the turn", () => {
+		const summary = summaryForActiveSession(
+			makeState({
+				activeSessionId: "s1",
+				messages: twoMessages,
+				summaryState: { summary: "Editing the router", taskState: "completed", basedOnMessageCount: 2 },
+			}),
+		);
+		expect(summary.summary).toBe("Editing the router");
+		expect(summary.taskState).toBe("completed");
+	});
+
+	it("keeps showing the prior recap once a new turn outpaces the summary", () => {
+		// New messages arrived (count 3) but the summary is still based on 2; the
+		// recap text must survive so the agents view does not flicker to blank.
+		const summary = summaryForActiveSession(
+			makeState({
+				activeSessionId: "s1",
+				messages: [...twoMessages, { role: "user", content: "next" } as AgentMessage],
+				summaryState: { summary: "Editing the router", taskState: "completed", basedOnMessageCount: 2 },
+			}),
+		);
+		expect(summary.summary).toBe("Editing the router");
+		// ...but a stale "completed" verdict must not show on a turn that is active again.
+		expect(summary.taskState).toBeUndefined();
+	});
+
+	it("omits the recap entirely when there is no summary yet", () => {
+		const summary = summaryForActiveSession(makeState({ activeSessionId: "s1", messages: twoMessages }));
+		expect(summary.summary).toBeUndefined();
+		expect(summary.taskState).toBeUndefined();
 	});
 });
 
@@ -233,6 +271,7 @@ interface StateOptions {
 	pendingToolCalls?: string[];
 	clients?: number;
 	messages?: AgentMessage[];
+	summaryState?: ActiveSessionState["summaryState"];
 	childRunStatuses?: Record<string, "queued" | "running" | "done" | "error" | "cancelled">;
 	metadata?: {
 		kind: "top-level" | "subagent";
@@ -257,6 +296,7 @@ function makeState(options: StateOptions): ActiveSessionState {
 		activeSessionId: options.activeSessionId,
 		clients,
 		lastEventSequence: 0,
+		summaryState: options.summaryState,
 		runtime: {
 			metadata: options.metadata ?? { kind: "top-level", createdAt: 1 },
 			diagnostics: [],

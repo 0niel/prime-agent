@@ -17,6 +17,7 @@ import { ModelRegistry } from "../src/core/model-registry.js";
 import type { ResourceLoader } from "../src/core/resource-loader.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import type { Skill } from "../src/core/skills.js";
 import { createIpythonTool } from "../src/index.js";
 
 /**
@@ -205,6 +206,7 @@ export async function createTestExtensionsResult(
 
 export interface CreateTestResourceLoaderOptions {
 	extensionsResult?: LoadExtensionsResult;
+	skills?: Skill[];
 }
 
 export function createTestResourceLoader(options: CreateTestResourceLoaderOptions = {}): ResourceLoader {
@@ -216,7 +218,7 @@ export function createTestResourceLoader(options: CreateTestResourceLoaderOption
 
 	return {
 		getExtensions: () => extensionsResult,
-		getSkills: () => ({ skills: [], diagnostics: [] }),
+		getSkills: () => ({ skills: options.skills ?? [], diagnostics: [] }),
 		getPrompts: () => ({ prompts: [], diagnostics: [] }),
 		getThemes: () => ({ themes: [], diagnostics: [] }),
 		getAgentsFiles: () => ({ agentsFiles: [] }),

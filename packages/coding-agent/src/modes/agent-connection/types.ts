@@ -41,7 +41,7 @@ export type AgentConnectionQueueMode = "all" | "one-at-a-time";
 export type AgentConnectionModel = Model<Api>;
 export type AgentConnectionSavedSessionScope = "current" | "all";
 
-export type AgentConnectionSavedSessionStateStatus = "active" | "sleep" | "crash" | "hidden";
+export type AgentConnectionSavedSessionStateStatus = "active" | "sleep" | "crash";
 
 export type AgentConnectionSourceScope = "user" | "project" | "temporary";
 export type AgentConnectionSourceOrigin = "package" | "top-level";
@@ -185,6 +185,15 @@ export interface AgentConnectionAgentStatusEntry extends AgentConnectionSessionE
 	};
 }
 
+export interface AgentConnectionGitStateEntry extends AgentConnectionSessionEntryBase {
+	type: "git_state";
+	git: {
+		repoUrl?: string;
+		commit?: string;
+		branch?: string;
+	};
+}
+
 export type AgentConnectionSessionEntry =
 	| AgentConnectionSessionMessageEntry
 	| AgentConnectionThinkingLevelChangeEntry
@@ -197,7 +206,8 @@ export type AgentConnectionSessionEntry =
 	| AgentConnectionLabelEntry
 	| AgentConnectionSessionInfoEntry
 	| AgentConnectionSessionStateEntry
-	| AgentConnectionAgentStatusEntry;
+	| AgentConnectionAgentStatusEntry
+	| AgentConnectionGitStateEntry;
 
 export interface AgentConnectionSessionTreeNode {
 	entry: AgentConnectionSessionEntry;
@@ -464,6 +474,12 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 	status: AgentConnectionRlmChildAgentStatus;
 	durationMs?: number;
 	answerPreview?: string;
+	/** Number of tool executions the subagent has started so far. */
+	toolUseCount?: number;
+	/** Context size (tokens) of the subagent's latest turn. */
+	tokenCount?: number;
+	/** Latest recap of what the subagent is doing. */
+	recap?: string;
 	sessionDir: string;
 	transcript: readonly AgentConnectionRlmChildAgentTranscriptLine[];
 	structuredTranscript?: readonly AgentConnectionRlmChildAgentStructuredTranscriptEntry[];
@@ -493,6 +509,7 @@ export type AgentConnectionSessionEvent =
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| { type: "rlm_child_update"; child: AgentConnectionRlmChildAgentSnapshot }
+	| { type: "recap_update"; recap: string | undefined }
 	| { type: "goal_update"; goal: GoalState }
 	| { type: "bash_start"; command: string; excludeFromContext: boolean }
 	| { type: "bash_output"; chunk: string }
@@ -544,6 +561,8 @@ export interface AgentConnection {
 	updateHeartbeat(action: AgentHeartbeatUpdateAction): Promise<AgentCronJob | undefined>;
 	getUserMessagesForForking(): Promise<AgentConnectionUserMessage[]>;
 	getLastAssistantText(): Promise<string | undefined>;
+	/** The system prompt currently in effect for the model (with any per-turn extension changes). */
+	getSystemPrompt(): Promise<string>;
 	getToolDefinition(name: string): Promise<AgentConnectionToolDefinition | undefined>;
 	setSessionEntryLabel(entryId: string, label: string | undefined): Promise<void>;
 	respondToExtensionUiRequest(requestId: string, response: AgentConnectionExtensionUiResponse): Promise<void>;

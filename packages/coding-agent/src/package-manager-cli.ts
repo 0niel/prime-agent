@@ -1,14 +1,13 @@
-import { createInterface } from "node:readline";
 import chalk from "chalk";
 import { spawn } from "child_process";
 import { selectConfig } from "./cli/config-selector.js";
 import {
 	ensureInteractiveDaemonRunning,
-	isSessionBusy,
 	probeRunningDaemonSessions,
 	type RunningDaemonProbe,
 	shutdownDaemonAndWait,
 } from "./cli/daemon-launch.js";
+import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions } from "./cli/daemon-stop-confirm.js";
 import {
 	APP_NAME,
 	CONFIG_DIR_NAME,
@@ -355,44 +354,22 @@ async function runSelfUpdate(command: SelfUpdateCommand): Promise<void> {
 	}
 }
 
-function promptUpdateConfirm(message: string): Promise<boolean> {
-	return new Promise((resolve) => {
-		const rl = createInterface({ input: process.stdin, output: process.stdout });
-		rl.question(`${message} [y/N] `, (answer) => {
-			rl.close();
-			const normalized = answer.trim().toLowerCase();
-			resolve(normalized === "y" || normalized === "yes");
-		});
-	});
-}
-
-// Returns false when the update should be aborted to avoid terminating live sessions.
 // Only busy sessions (streaming, compacting, or pending messages) would lose work;
 // idle loaded sessions reload from disk on the fresh daemon.
-async function confirmDaemonSessionLossBeforeUpdate(probe: RunningDaemonProbe, force: boolean): Promise<boolean> {
-	if (!probe.reachable || force) {
-		return true;
-	}
-	let detail: string;
-	if (probe.activeSessions === undefined) {
-		// Reachable but couldn't list sessions: assume work may be lost.
-		detail =
-			"A running daemon's sessions could not be listed. Updating will stop the daemon and may terminate active sessions.";
-	} else {
-		const busySessions = probe.activeSessions.filter(isSessionBusy);
-		if (busySessions.length === 0) {
-			return true;
-		}
-		const count = busySessions.length;
-		const noun = count === 1 ? "session" : "sessions";
-		const pronoun = count === 1 ? "it" : "them";
-		detail = `The running daemon has ${count} busy ${noun}. Updating will stop the daemon and terminate ${pronoun}.`;
-	}
-	if (!process.stdin.isTTY) {
-		console.error(chalk.red(`${detail} Re-run with --force to proceed.`));
-		return false;
-	}
-	return promptUpdateConfirm(`${detail} Continue?`);
+const UPDATE_SESSION_LOSS_COPY: DaemonSessionLossCopy = {
+	busyDetail(count) {
+		const { noun, pronoun } = pluralizeSessions(count);
+		return `The running daemon has ${count} busy ${noun}. Updating will stop the daemon and terminate ${pronoun}.`;
+	},
+	unlistableDetail:
+		"A running daemon's sessions could not be listed. Updating will stop the daemon and may terminate active sessions.",
+	question: "Continue?",
+	nonTtyHint: "Re-run with --force to proceed.",
+};
+
+// Returns false when the update should be aborted to avoid terminating live sessions.
+function confirmDaemonSessionLossBeforeUpdate(probe: RunningDaemonProbe, force: boolean): Promise<boolean> {
+	return confirmDaemonSessionLoss(probe, { force, copy: UPDATE_SESSION_LOSS_COPY });
 }
 
 async function restartDaemonAfterSelfUpdate(socketPath: string, daemonWasRunning: boolean): Promise<void> {

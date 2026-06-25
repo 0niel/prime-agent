@@ -15,16 +15,24 @@ describe("DefaultResourceLoader", () => {
 	let tempDir: string;
 	let agentDir: string;
 	let cwd: string;
+	let previousSerperApiKey: string | undefined;
 
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `rl-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		agentDir = join(tempDir, "agent");
 		cwd = join(tempDir, "project");
+		previousSerperApiKey = process.env.SERPER_API_KEY;
+		delete process.env.SERPER_API_KEY;
 		mkdirSync(agentDir, { recursive: true });
 		mkdirSync(cwd, { recursive: true });
 	});
 
 	afterEach(() => {
+		if (previousSerperApiKey === undefined) {
+			delete process.env.SERPER_API_KEY;
+		} else {
+			process.env.SERPER_API_KEY = previousSerperApiKey;
+		}
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
@@ -449,6 +457,102 @@ Content`,
 
 			const { skills } = loader.getSkills();
 			expect(skills.some((s) => s.name === "custom")).toBe(true);
+		});
+	});
+
+	describe("bundled skills", () => {
+		it("should load the bundled websearch skill by default", async () => {
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			await loader.reload();
+
+			const { skills } = loader.getSkills();
+			const websearch = skills.find((s) => s.name === "websearch");
+			expect(websearch).toBeDefined();
+			expect(websearch?.kind).toBe("python");
+			if (websearch?.kind === "python") {
+				expect(websearch.python.importName).toBe("websearch");
+				expect(websearch.python.pyprojectPath.endsWith("pyproject.toml")).toBe(true);
+			}
+		});
+
+		it("should not emit a SERPER_API_KEY warning when the key is unset", async () => {
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			await loader.reload();
+
+			const { diagnostics } = loader.getSkills();
+			expect(diagnostics.some((d) => d.type === "warning" && d.message.includes("SERPER_API_KEY"))).toBe(false);
+		});
+
+		it("should not load the bundled websearch skill when disabled in settings", async () => {
+			const settingsManager = SettingsManager.inMemory({ bundledSkills: { websearch: false } });
+			const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+			await loader.reload();
+
+			const { skills, diagnostics } = loader.getSkills();
+			expect(skills.some((s) => s.name === "websearch")).toBe(false);
+			expect(diagnostics.some((d) => d.type === "warning" && d.message.includes("SERPER_API_KEY is not set"))).toBe(
+				false,
+			);
+		});
+
+		it("should not load bundled skills when noSkills is true", async () => {
+			const loader = new DefaultResourceLoader({ cwd, agentDir, noSkills: true });
+			await loader.reload();
+
+			const { skills } = loader.getSkills();
+			expect(skills.some((s) => s.name === "websearch")).toBe(false);
+		});
+
+		it("should let a project skill override the bundled websearch skill", async () => {
+			const projectSkillDir = join(cwd, ".prime", "agent", "skills", "websearch");
+			mkdirSync(projectSkillDir, { recursive: true });
+			writeFileSync(
+				join(projectSkillDir, "SKILL.md"),
+				`---
+name: websearch
+description: Project-specific web search override.
+---
+Project override.`,
+			);
+
+			const loader = new DefaultResourceLoader({ cwd, agentDir });
+			await loader.reload();
+
+			const { skills, diagnostics } = loader.getSkills();
+			const websearch = skills.find((s) => s.name === "websearch");
+			expect(websearch).toBeDefined();
+			expect(websearch?.filePath).toBe(join(projectSkillDir, "SKILL.md"));
+			expect(websearch?.kind).toBe("markdown");
+			expect(diagnostics.some((d) => d.type === "collision" && d.collision?.name === "websearch")).toBe(true);
+			expect(diagnostics.some((d) => d.type === "warning" && d.message.includes("SERPER_API_KEY is not set"))).toBe(
+				false,
+			);
+		});
+
+		it("should let an explicit --skill path override the bundled websearch skill", async () => {
+			const customSkillDir = join(tempDir, "custom-websearch", "websearch");
+			mkdirSync(customSkillDir, { recursive: true });
+			writeFileSync(
+				join(customSkillDir, "SKILL.md"),
+				`---
+name: websearch
+description: Explicit web search override.
+---
+Explicit override.`,
+			);
+
+			const loader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				additionalSkillPaths: [customSkillDir],
+			});
+			await loader.reload();
+
+			const { skills } = loader.getSkills();
+			const websearch = skills.find((s) => s.name === "websearch");
+			expect(websearch).toBeDefined();
+			expect(websearch?.filePath).toBe(join(customSkillDir, "SKILL.md"));
+			expect(websearch?.kind).toBe("markdown");
 		});
 	});
 

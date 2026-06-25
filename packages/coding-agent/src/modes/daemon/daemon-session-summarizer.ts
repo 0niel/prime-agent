@@ -15,24 +15,23 @@ const SUMMARY_MODEL_ID = "nvidia/nemotron-3-nano-30b-a3b";
 
 const SUMMARY_CONTEXT_MESSAGES = 8;
 const SUMMARY_MAX_CHARS_PER_MESSAGE = 600;
-// Generous so a chatty model still reaches the SUMMARY line before truncation.
+// Generous so a chatty model still closes the tags before truncation.
 const SUMMARY_MAX_TOKENS = 400;
 
 export const AGENT_STATUS_SYSTEM_PROMPT = `You generate a status line for an AI coding agent dashboard. You are given the recent conversation between a user and the agent, plus whether the agent is currently working or idle.
 
-Output ONLY these two lines, nothing before or after. Do not think out loud, explain, or add any other text.
-SUMMARY: a present-tense clause, at most 12 words, saying what the agent is doing or just did, no trailing period
-STATUS: one of WORKING, NEEDS_INPUT, COMPLETED
+Output ONLY these two tags, nothing before, between, or after. Do not think out loud, explain, or count words.
+<recap>a present-tense clause, at most 12 words, saying what the agent is doing or just did, no trailing period</recap>
+<status>one of NEEDS_INPUT, COMPLETED</status>
 
 STATUS meaning:
-- WORKING: the agent is mid-task and still acting.
 - COMPLETED: the agent finished its turn AND the user's request is fully done with nothing left.
 - NEEDS_INPUT: the agent finished its turn but the task is not fully done — it asked a question, hit a blocker, or needs more prompting.
-When the agent is idle and you are unsure between COMPLETED and NEEDS_INPUT, choose NEEDS_INPUT.
+When you are unsure between COMPLETED and NEEDS_INPUT, choose NEEDS_INPUT.
 
 Example:
-SUMMARY: Refactoring the auth middleware and updating its tests
-STATUS: WORKING`;
+<recap>Refactoring the auth middleware and updating its tests</recap>
+<status>NEEDS_INPUT</status>`;
 
 export interface AgentStatusResult {
 	summary: string;
@@ -100,41 +99,44 @@ export function buildStatusContext(messages: readonly AgentMessage[], isWorking:
 	return `<agent-state>${state}</agent-state>\n<conversation>\n${lines.join("\n")}\n</conversation>`;
 }
 
-/**
- * Parse the two-line reply. Requires an explicit `SUMMARY:` line (last one wins,
- * after any reasoning) and never falls back to free text, so a model's
- * chain-of-thought can't leak into the recap. Idle verdicts default to
- * needs_input on anything unrecognized.
- */
-export function parseAgentStatusResponse(text: string, isWorking: boolean): AgentStatusResult | undefined {
-	const reasoningTag = /<\/?(?:think|thinking|reasoning|redacted_thinking)>/gi;
-	const cleaned = text
-		.replace(/<(think|thinking|reasoning|redacted_thinking)>[\s\S]*?<\/\1>/gi, " ")
-		.replace(reasoningTag, " ");
-	let summary: string | undefined;
-	let status: string | undefined;
-	for (const rawLine of cleaned.split("\n")) {
-		const line = rawLine.trim();
-		const summaryMatch = /^summary\s*:\s*(.+)$/i.exec(line);
-		if (summaryMatch) {
-			const candidate = summaryMatch[1]!.trim().replace(/[.\s]+$/, "");
-			// Skip an echoed prompt template (e.g. "<one present-tense clause…>").
-			if (candidate && !candidate.startsWith("<") && !/present-tense|12 words/i.test(candidate)) {
-				summary = candidate;
-			}
-			continue;
-		}
-		const statusMatch = /^status\s*:\s*([a-z_]+)/i.exec(line);
-		if (statusMatch) {
-			status = statusMatch[1]!.toUpperCase();
-		}
+// Cuts a word-counting trailer the model sometimes appends, e.g.
+// `Sending X. That's 5 words? Count: X(1)... = 6 words.`. Kept to structural
+// counting markers so plain words ("Waiting for CI") survive.
+const REASONING_TRAILER = /\s*(?:["”]\s*)?(?:\bthat['’]?s\s+\d+\s*words?\b|\bcount\s*:|\(\d+\)|=\s*\d+\s*words?\b).*/i;
+const COUNTING_ARTIFACT = /\(\d+\)|=\s*\d+\s*words?\b/i;
+const MAX_RECAP_WORDS = 16;
+
+function cleanRecap(raw: string): string | undefined {
+	const value = raw
+		.trim()
+		.replace(REASONING_TRAILER, "")
+		.replace(/^["“']+|["”']+$/g, "")
+		.replace(/[.\s]+$/, "")
+		.trim();
+	if (!value || value.startsWith("<") || /present-tense|12 words/i.test(value)) {
+		return undefined;
 	}
+	if (COUNTING_ARTIFACT.test(value) || value.split(/\s+/).length > MAX_RECAP_WORDS) {
+		return undefined;
+	}
+	return value;
+}
+
+/** Take the content of the last `<recap>` and `<status>` tags; idle verdicts default to needs_input. */
+export function parseAgentStatusResponse(text: string, isWorking: boolean): AgentStatusResult | undefined {
+	// Normalize unicode angle-bracket lookalikes (‹ › ＜ ＞) so a tag written with them still parses.
+	const cleaned = text.replace(/[‹＜]/g, "<").replace(/[›＞]/g, ">");
+
+	const recapMatch = [...cleaned.matchAll(/<recap>([\s\S]*?)<\/recap>/gi)].at(-1);
+	const summary = recapMatch ? cleanRecap(recapMatch[1]!) : undefined;
 	if (!summary) {
 		return undefined;
 	}
 	if (isWorking) {
 		return { summary };
 	}
+	const statusMatch = [...cleaned.matchAll(/<status>\s*([a-z_]+)\s*<\/status>/gi)].at(-1);
+	const status = statusMatch ? statusMatch[1]!.toUpperCase() : undefined;
 	const taskState: AgentTaskState = status === "COMPLETED" ? "completed" : "needs_input";
 	return { summary, taskState };
 }
@@ -202,9 +204,10 @@ function isSessionWorking(state: ActiveSessionState): boolean {
 }
 
 /**
- * Background status summarization for daemon-hosted top-level sessions. A
- * periodic sweep refreshes working sessions; debounced turn-end activity drives
- * the idle verdict. Status lives in memory; settled idle verdicts are persisted.
+ * Background status summarization for daemon-hosted sessions, top-level and
+ * subagents alike. A periodic sweep refreshes working sessions; debounced
+ * turn-end activity drives the idle verdict. Status lives in memory; settled
+ * idle verdicts are persisted.
  */
 export class DaemonSessionSummarizer {
 	private interval: ReturnType<typeof setInterval> | undefined;
@@ -215,7 +218,7 @@ export class DaemonSessionSummarizer {
 	private readonly rerunRequested = new Set<string>();
 
 	constructor(
-		private readonly listTopLevelSessions: () => readonly ActiveSessionState[],
+		private readonly listSessions: () => readonly ActiveSessionState[],
 		private readonly onStatusChanged?: (state: ActiveSessionState) => void,
 		// Injectable for tests.
 		private readonly generate: (
@@ -228,7 +231,7 @@ export class DaemonSessionSummarizer {
 			return;
 		}
 		this.interval = setInterval(() => {
-			for (const state of this.listTopLevelSessions()) {
+			for (const state of this.listSessions()) {
 				void this.summarize(state);
 			}
 		}, SWEEP_INTERVAL_MS);
@@ -274,9 +277,6 @@ export class DaemonSessionSummarizer {
 
 	/** Called when a session finishes a turn; debounce until the agent settles. */
 	notifyActivity(state: ActiveSessionState): void {
-		if (state.runtime.metadata.kind === "subagent") {
-			return;
-		}
 		const id = state.activeSessionId;
 		const existing = this.debounceTimers.get(id);
 		if (existing) {
@@ -291,9 +291,6 @@ export class DaemonSessionSummarizer {
 	}
 
 	private async summarize(state: ActiveSessionState): Promise<void> {
-		if (state.runtime.metadata.kind === "subagent") {
-			return;
-		}
 		const id = state.activeSessionId;
 		if (this.inFlight.has(id)) {
 			this.rerunRequested.add(id); // run once more after the current pass

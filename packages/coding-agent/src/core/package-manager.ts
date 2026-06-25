@@ -31,6 +31,7 @@ import { CONFIG_DIR_NAME, getBundledSkillsDir } from "../config.js";
 import { shouldUseWindowsShell } from "../utils/child-process.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { canonicalizePath, isLocalPath } from "../utils/paths.js";
+import type { ResourceDiagnostic } from "./diagnostics.js";
 import { isStdoutTakenOver } from "./output-guard.js";
 import type { PackageSource, SettingsManager } from "./settings-manager.js";
 
@@ -62,6 +63,7 @@ export interface ResolvedPaths {
 	skills: ResolvedResource[];
 	prompts: ResolvedResource[];
 	themes: ResolvedResource[];
+	diagnostics: ResourceDiagnostic[];
 }
 
 export type MissingSourceAction = "install" | "skip" | "error";
@@ -158,6 +160,7 @@ interface ResourceAccumulator {
 	skills: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	prompts: Map<string, { metadata: PathMetadata; enabled: boolean }>;
 	themes: Map<string, { metadata: PathMetadata; enabled: boolean }>;
+	diagnostics: ResourceDiagnostic[];
 }
 
 /**
@@ -2242,13 +2245,23 @@ export class DefaultPackageManager implements PackageManager {
 				origin: "top-level",
 				baseDir: this.bundledSkillsDir,
 			};
-			addResources(
-				"skills",
-				collectAutoSkillEntries(this.bundledSkillsDir, "pi"),
-				builtinMetadata,
-				userOverrides.skills,
-				this.bundledSkillsDir,
-			);
+			const builtinEntries = collectAutoSkillEntries(this.bundledSkillsDir, "pi");
+			// Built-in skills (edit, goal, …) are expected to ship with the package. A
+			// packaging slip that drops the skills/ dir from the build output would
+			// otherwise degrade silently to zero skills (ENG-4220); surface it loudly.
+			if (builtinEntries.length === 0) {
+				accumulator.diagnostics.push({
+					type: "warning",
+					message: existsSync(this.bundledSkillsDir)
+						? "built-in skills directory contains no skills; this build may be packaged incorrectly"
+						: "built-in skills directory not found; this build may be packaged incorrectly",
+					path: this.bundledSkillsDir,
+				});
+			}
+			const builtinSkillOverrides = this.settingsManager.getBundledWebsearchEnabled()
+				? userOverrides.skills
+				: [...userOverrides.skills, "-websearch/SKILL.md"];
+			addResources("skills", builtinEntries, builtinMetadata, builtinSkillOverrides, this.bundledSkillsDir);
 		}
 		addResources(
 			"prompts",
@@ -2321,6 +2334,7 @@ export class DefaultPackageManager implements PackageManager {
 			skills: new Map(),
 			prompts: new Map(),
 			themes: new Map(),
+			diagnostics: [],
 		};
 	}
 
@@ -2349,6 +2363,7 @@ export class DefaultPackageManager implements PackageManager {
 			skills: mapToResolved(accumulator.skills),
 			prompts: mapToResolved(accumulator.prompts),
 			themes: mapToResolved(accumulator.themes),
+			diagnostics: accumulator.diagnostics,
 		};
 	}
 

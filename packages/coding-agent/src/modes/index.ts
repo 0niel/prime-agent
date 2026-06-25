@@ -18,7 +18,12 @@ export type {
 	AgentConnectionSlashCommand,
 	AgentConnectionState,
 } from "./agent-connection/index.js";
-export { DaemonAgentConnection, InProcessAgentConnection } from "./agent-connection/index.js";
+export {
+	DaemonAgentConnection,
+	DeferredAgentConnection,
+	type DeferredAgentConnectionSeed,
+	InProcessAgentConnection,
+} from "./agent-connection/index.js";
 export { type AgentsViewModeOptions, runAgentsViewMode } from "./agents-view/agents-view-mode.js";
 export {
 	type AgentsViewRow,

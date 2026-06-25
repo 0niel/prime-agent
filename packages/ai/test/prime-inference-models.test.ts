@@ -49,7 +49,7 @@ describe("Prime Inference models", () => {
 		expect(model.reasoning).toBe(true);
 		expect(model.thinkingLevelMap).toEqual({ xhigh: "xhigh" });
 		expect(getSupportedThinkingLevels(model)).toContain("xhigh");
-		expect(model.input).toEqual(["text"]);
+		expect(model.input).toEqual(["text", "image"]);
 		expect(model.contextWindow).toBe(1050000);
 		expect(model.maxTokens).toBe(128000);
 		expect(model.cost).toEqual({
@@ -70,8 +70,9 @@ describe("Prime Inference models", () => {
 	it("marks known reasoning-capable Prime Inference model families", () => {
 		const opus48 = getModel("prime-inference", "anthropic/claude-opus-4.8");
 		expect(opus48.reasoning).toBe(true);
-		expect(opus48.thinkingLevelMap).toEqual({ xhigh: "xhigh" });
+		expect(opus48.thinkingLevelMap).toEqual({ xhigh: "xhigh", max: "max" });
 		expect(getSupportedThinkingLevels(opus48)).toContain("xhigh");
+		expect(getSupportedThinkingLevels(opus48)).toContain("max");
 
 		expect(getModel("prime-inference", "anthropic/claude-opus-4.7").reasoning).toBe(true);
 		const deepseekV4Flash = getModel("prime-inference", "deepseek/deepseek-v4-flash");

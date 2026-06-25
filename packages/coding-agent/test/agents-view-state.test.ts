@@ -3,6 +3,7 @@ import type { AgentSessionRuntimeConfig } from "../src/core/agent-session-config
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import type { SettingsManager } from "../src/core/settings-manager.js";
 import {
+	createAgentsViewListCommand,
 	createAgentsViewReplyHeadline,
 	createAgentsViewResumeConfig,
 	createAgentsViewSessionName,
@@ -372,12 +373,9 @@ describe("agents view state", () => {
 	});
 
 	test("shows daemon-resident sessions only", () => {
-		const inactiveHidden = makeSummary({ status: "hidden" });
 		const inactiveSleep = makeSummary({ status: "sleep" });
-		delete inactiveHidden.activeSessionId;
 		delete inactiveSleep.activeSessionId;
 
-		expect(shouldShowAgentsViewSession(inactiveHidden)).toBe(false);
 		expect(shouldShowAgentsViewSession(inactiveSleep)).toBe(false);
 		expect(shouldShowAgentsViewSession(makeSummary({ status: "idle" }))).toBe(true);
 		expect(shouldShowAgentsViewSession(makeSummary({ status: "idle" }), true)).toBe(false);
@@ -398,6 +396,14 @@ describe("agents view state", () => {
 		expect(resumeConfig.sessionDir).toBe("/tmp/sessions");
 		expect(resumeConfig.model).toBe("openai/gpt-5");
 		expect(config.cwd).toBe("/tmp/dashboard");
+	});
+
+	test("requests only daemon-resident sessions for the agents view refresh", () => {
+		expect(createAgentsViewListCommand({ cwd: "/tmp/project" })).toEqual({ type: "list" });
+		expect(createAgentsViewListCommand({ cwd: "/tmp/project", sessionDir: "/tmp/sessions" })).toEqual({
+			type: "list",
+			sessionDir: "/tmp/sessions",
+		});
 	});
 
 	test("derives the reply headline from the first line of the latest assistant text", () => {

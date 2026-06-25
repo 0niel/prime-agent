@@ -1,3 +1,4 @@
+import { isAbsolute, relative } from "node:path";
 import {
 	type Component,
 	truncateToWidth,
@@ -5,12 +6,15 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { previewIpythonCode } from "../../../core/tools/code-preview.js";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
+import { shortenPath } from "../../../core/tools/render-utils.js";
 import { getLanguageFromPath, highlightCode, theme } from "../theme/theme.js";
+import { getWorkingPulseFrame, WORKING_ICON_FRAMES, workingIconFrame } from "../theme/working-icon.js";
 import { normalizeErrorDetails, summarizeErrorDetails } from "./collapsible-error.js";
 import { renderDiffSeparator, renderRichDiff } from "./diff.js";
 import { keyHint } from "./keybinding-hints.js";
-import { TOOL_PANEL_PADDING_X, toolPanelContentWidth, toolPanelLine } from "./tool-panel.js";
+import { toolPanelContentWidth, toolPanelLine } from "./tool-panel.js";
 
 export interface IPythonCellContentBlock {
 	type: string;
@@ -29,6 +33,8 @@ export interface IPythonCellState {
 	executionStarted?: boolean;
 	argsComplete?: boolean;
 	showImages?: boolean;
+	/** Session cwd — edit paths nested under it render relative, else absolute. */
+	cwd?: string;
 }
 
 interface DiffDisplay {
@@ -68,43 +74,42 @@ const CELL_MAGIC_PATTERN = /^\s*%%bash\b/;
 
 const OUTPUT_PREVIEW_LINES = 5;
 const INPUT_PREVIEW_LINES = 3;
-const DIFF_PREVIEW_LINES = 12;
 
-// Cap so the trailing duration/counts stay visible on narrow widths.
-const DESCRIPTOR_MAX_WIDTH = 64;
+const SGR_PATTERN = /\x1b\[([0-9;]*)m/g;
 
-const COMMENT_LINE_PATTERN = /^\s*#/;
-// Strip a leading `cd … &&` to surface the real command.
-const CD_PREFIX_PATTERN = /^\s*cd\s+[^&;|]+(?:&&|;)\s*/;
-
-function collapseWhitespace(text: string): string {
-	return text.replace(/\s+/g, " ").trim();
-}
-
-function truncateDescriptor(text: string): string {
-	if (text.length <= DESCRIPTOR_MAX_WIDTH) {
-		return text;
-	}
-	return `${text.slice(0, DESCRIPTOR_MAX_WIDTH - 1).trimEnd()}…`;
-}
-
-/** Leading meaningful command of a cell; "" while code is still streaming. */
-function summarizeCell(code: string): string {
-	const lines = code.split("\n");
-	const isBashCell = CELL_MAGIC_PATTERN.test(lines[0] ?? "");
-	const body = isBashCell ? lines.slice(1) : lines;
-	for (const rawLine of body) {
-		const trimmed = rawLine.trim();
-		if (!trimmed || COMMENT_LINE_PATTERN.test(trimmed)) {
-			continue;
+/**
+ * Append `ESC[0m` when `line` ends with a foreground or background color still
+ * open, so a span that wrapTextWithAnsi split across lines cannot bleed into the
+ * trailing padding or the next line.
+ */
+function closeOpenSgr(line: string): string {
+	let fgOpen = false;
+	let bgOpen = false;
+	for (const match of line.matchAll(SGR_PATTERN)) {
+		const params = match[1] === "" ? ["0"] : match[1].split(";");
+		for (let i = 0; i < params.length; i++) {
+			const code = Number(params[i]);
+			if (code === 0) {
+				fgOpen = false;
+				bgOpen = false;
+			} else if (code === 38 || code === 48) {
+				// Skip the color data of `38;5;n` / `38;2;r;g;b` so a component (e.g. 38) isn't read as a code.
+				if (code === 38) fgOpen = true;
+				else bgOpen = true;
+				const mode = Number(params[i + 1]);
+				i += mode === 2 ? 4 : mode === 5 ? 2 : 1;
+			} else if (code === 39) {
+				fgOpen = false;
+			} else if (code === 49) {
+				bgOpen = false;
+			} else if ((code >= 30 && code <= 37) || (code >= 90 && code <= 97)) {
+				fgOpen = true;
+			} else if ((code >= 40 && code <= 47) || (code >= 100 && code <= 107)) {
+				bgOpen = true;
+			}
 		}
-		const command = trimmed.replace(MAGIC_LINE_PATTERN, "").trim();
-		if (!command) {
-			continue;
-		}
-		return truncateDescriptor(collapseWhitespace(command.replace(CD_PREFIX_PATTERN, "")));
 	}
-	return "";
+	return fgOpen || bgOpen ? `${line}\x1b[0m` : line;
 }
 
 export function getIpythonCodeFromArgs(args: unknown): string {
@@ -209,6 +214,18 @@ function hiddenLinesLabel(hidden: number): string {
 	return `… +${hidden} line${hidden === 1 ? "" : "s"}`;
 }
 
+// Relative to the session cwd when nested under it, else the absolute path.
+function displayEditPath(path: string, cwd: string | undefined): string {
+	if (cwd && isAbsolute(path)) {
+		const rel = relative(cwd, path);
+		if (rel && !rel.startsWith("..") && !isAbsolute(rel)) {
+			return rel;
+		}
+		return shortenPath(path);
+	}
+	return path;
+}
+
 function isImageBlock(block: IPythonCellContentBlock): boolean {
 	return block.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string";
 }
@@ -276,18 +293,31 @@ export class IPythonCellComponent implements Component {
 
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
-		const cached = this.renderCache.get(safeWidth, this.stateVersion);
+		const details = readDetails(this.state.details);
+		// Fold the animation frame into the cache key while running (offset within
+		// a stateVersion slot so it never collides with another version).
+		const frames = WORKING_ICON_FRAMES.length;
+		const cacheVersion =
+			this.statusKind(details) === "running"
+				? this.stateVersion * frames + (getWorkingPulseFrame() % frames)
+				: this.stateVersion * frames;
+		const cached = this.renderCache.get(safeWidth, cacheVersion);
 		if (cached) {
 			return cached;
 		}
 
-		const details = readDetails(this.state.details);
-
 		// Collapsed default: one line, indented to match message text. Cached by
 		// state version so it never re-renders on unrelated repaints (would flicker).
+		// Edits are the exception: the diff always shows in full under the summary
+		// line so file changes are visible without expanding.
 		if (!this.state.expanded) {
-			const line = truncateToWidth(` ${this.collapsedLine(details)}`, safeWidth, "");
-			return this.renderCache.set(safeWidth, this.stateVersion, [line]);
+			const summary = truncateToWidth(` ${this.collapsedLine(details)}`, safeWidth, "");
+			if ((details.diffs?.length ?? 0) === 0) {
+				return this.renderCache.set(safeWidth, cacheVersion, [summary]);
+			}
+			const lines = [summary];
+			this.renderDiffs(lines, safeWidth, details.diffs ?? [], this.marker(details));
+			return this.renderCache.set(safeWidth, cacheVersion, lines);
 		}
 
 		const lines: string[] = [];
@@ -304,22 +334,20 @@ export class IPythonCellComponent implements Component {
 		lines.push(toolPanelLine(this.header(details), safeWidth));
 		const hasCode = this.renderCode(lines, safeWidth, withExpandHint, hasDiffs);
 		this.renderOutput(lines, safeWidth, details, hasCode, withExpandHint);
-		return this.renderCache.set(safeWidth, this.stateVersion, lines);
+		return this.renderCache.set(safeWidth, cacheVersion, lines);
 	}
 
-	// Command is bash-only: python first-lines are usually imports/setup, not intent.
 	private collapsedLine(details: IpythonDetails): string {
 		const code = this.state.code.trimEnd();
 		const isBashCell = CELL_MAGIC_PATTERN.test(code.split("\n")[0] ?? "");
-		const parts = [`${this.marker(details)} ${theme.fg("muted", isBashCell ? "bash" : "python")}`];
+		const preview = previewIpythonCode(code);
+		const languageLabel = isBashCell && preview.language !== "bash" ? `bash · ${preview.language}` : preview.language;
+		const parts = [`${this.marker(details)} ${theme.fg("muted", languageLabel)}`];
 
-		if (isBashCell) {
-			const command = summarizeCell(code);
-			if (command) {
-				parts.push(this.highlightInputLine(command, true));
-			} else if (!this.state.executionStarted) {
-				parts.push(theme.fg("muted", "waiting for code"));
-			}
+		if (preview.text) {
+			parts.push(this.highlightInputLine(preview.text, preview.language === "bash"));
+		} else if (!this.state.executionStarted) {
+			parts.push(theme.fg("muted", "waiting for code"));
 		}
 
 		const counts = this.lineCounts(details);
@@ -351,7 +379,7 @@ export class IPythonCellComponent implements Component {
 			case "done":
 				return theme.fg("success", "✓");
 			case "running":
-				return theme.fg("bashMode", "▸");
+				return theme.fg("bashMode", workingIconFrame(getWorkingPulseFrame()));
 			default: // queued
 				return theme.fg("muted", "▸");
 		}
@@ -519,21 +547,11 @@ export class IPythonCellComponent implements Component {
 			}
 		};
 
-		// Group edits by file: one block per file, edits shown as `⋮`-separated hunks.
-		const diffsByPath = new Map<string, DiffDisplay[]>();
-		for (const diff of diffs) {
-			const existing = diffsByPath.get(diff.path);
-			if (existing) existing.push(diff);
-			else diffsByPath.set(diff.path, [diff]);
-		}
-		let fileIndex = 0;
-		for (const [path, edits] of diffsByPath) {
-			startOutput();
-			if (fileIndex > 0) {
-				this.addBlank(lines, width);
-			}
-			fileIndex++;
-			this.renderFileDiff(lines, width, path, edits, withExpandHint);
+		if (diffs.length > 0) {
+			// renderDiffs adds its own leading blank, so skip startOutput's to avoid
+			// a double gap; mark output started for the trailing text below.
+			outputStarted = true;
+			this.renderDiffs(lines, width, diffs, this.marker(details));
 			renderedTextOutput = true;
 		}
 
@@ -617,19 +635,31 @@ export class IPythonCellComponent implements Component {
 		}
 	}
 
+	// Edits always render in full, regardless of expand state. Grouped by file.
+	private renderDiffs(lines: string[], width: number, diffs: readonly DiffDisplay[], marker: string): void {
+		const diffsByPath = new Map<string, DiffDisplay[]>();
+		for (const diff of diffs) {
+			const existing = diffsByPath.get(diff.path);
+			if (existing) existing.push(diff);
+			else diffsByPath.set(diff.path, [diff]);
+		}
+		for (const [path, edits] of diffsByPath) {
+			this.addPlain(lines, "");
+			this.renderFileDiff(lines, width, path, edits, marker);
+		}
+	}
+
 	private renderFileDiff(
 		lines: string[],
 		width: number,
 		path: string,
 		edits: readonly DiffDisplay[],
-		withExpandHint: ExpandHintFormatter,
+		marker: string,
 	): void {
-		const contentWidth = toolPanelContentWidth(width);
 		const language = getLanguageFromPath(path);
-
-		const rows: string[] = [];
 		let added = 0;
 		let removed = 0;
+		const rows: string[] = [];
 		edits.forEach((edit, index) => {
 			const { diff: diffText } = generateDiffString(edit.oldStr, edit.newStr, 4, edit.startLine ?? 1);
 			for (const row of diffText.split("\n")) {
@@ -637,25 +667,23 @@ export class IPythonCellComponent implements Component {
 				else if (row.startsWith("-")) removed++;
 			}
 			if (index > 0) {
-				rows.push(renderDiffSeparator(contentWidth));
+				rows.push(renderDiffSeparator(width));
 			}
-			rows.push(...renderRichDiff(diffText, contentWidth, { language }));
+			// Append, not spread: a huge edit's diff can exceed the JS arg-count limit.
+			for (const row of renderRichDiff(diffText, width, { language })) {
+				rows.push(row);
+			}
 		});
 
 		const counts = `${theme.fg("toolDiffAdded", `+${added}`)} ${theme.fg("toolDiffRemoved", `-${removed}`)}`;
-		this.addWrapped(lines, "", `${theme.fg("muted", "edit")} ${path}  ${counts}`, width);
+		const displayPath = displayEditPath(path, this.state.cwd);
+		// Truncate the path (not the counts) so it can't push the header past width.
+		const fixed = visibleWidth(marker) + 1 + 2 + visibleWidth(counts);
+		const shownPath = truncateToWidth(displayPath, Math.max(1, width - 1 - fixed), "…");
+		this.addPlain(lines, `${marker} ${shownPath}  ${counts}`);
 
-		const expanded = this.state.expanded ?? false;
-		const showCollapsed = !expanded && rows.length > DIFF_PREVIEW_LINES;
-		const visibleRows = showCollapsed ? rows.slice(0, DIFF_PREVIEW_LINES) : rows;
-		// Rows already fill the content width; just add the panel side padding.
-		const sidePad = theme.bg("toolPanelBg", " ".repeat(TOOL_PANEL_PADDING_X));
-		for (const row of visibleRows) {
-			lines.push(sidePad + row + sidePad);
-		}
-		if (showCollapsed) {
-			const hidden = rows.length - DIFF_PREVIEW_LINES;
-			this.addWrapped(lines, "", withExpandHint(hiddenLinesLabel(hidden)), width);
+		for (const row of rows) {
+			lines.push(row);
 		}
 	}
 
@@ -693,11 +721,16 @@ export class IPythonCellComponent implements Component {
 		const wrapped = wrapTextWithAnsi(text, available);
 		for (const [index, line] of (wrapped.length > 0 ? wrapped : [""]).entries()) {
 			const linePrefix = index === 0 ? prefix : " ".repeat(visibleWidth(prefix));
-			lines.push(toolPanelLine(linePrefix + line, width));
+			lines.push(toolPanelLine(linePrefix + closeOpenSgr(line), width));
 		}
 	}
 
 	private addBlank(lines: string[], width: number): void {
 		lines.push(toolPanelLine("", width));
+	}
+
+	// No-background line, indented one space to align with the summary line above.
+	private addPlain(lines: string[], text: string): void {
+		lines.push(` ${text}`);
 	}
 }

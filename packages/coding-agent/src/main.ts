@@ -16,8 +16,11 @@ import {
 	ensureInteractiveDaemonRunning,
 	isDaemonSessionSummary,
 	listActiveDaemonSessionSummaries,
+	probeRunningDaemonSessions,
 	StaleDaemonError,
+	shutdownDaemonAndWait,
 } from "./cli/daemon-launch.js";
+import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions } from "./cli/daemon-stop-confirm.js";
 import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
@@ -51,10 +54,12 @@ import { SettingsManager } from "./core/settings-manager.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
 import {
+	type AgentConnection,
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServicesFromServices,
 	DaemonAgentConnection,
 	DaemonClient,
+	DeferredAgentConnection,
 	defaultDaemonSocketPath,
 	InProcessAgentConnection,
 	InteractiveMode,
@@ -139,6 +144,15 @@ function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc" | "daemon"> {
 	return appMode === "json" ? "json" : "text";
 }
 
+// `prime-agent agents` / `prime-agent manage` open the agents view directly; the
+// leading verb is stripped so the remaining args parse as usual.
+export function parseAgentsViewCommand(args: string[]): { explicitAgentsView: boolean; args: string[] } {
+	if (args[0] === "agents" || args[0] === "manage") {
+		return { explicitAgentsView: true, args: args.slice(1) };
+	}
+	return { explicitAgentsView: false, args };
+}
+
 export interface InteractiveDaemonStartupDecision {
 	appMode: AppMode;
 	startupBenchmark: boolean;
@@ -160,6 +174,7 @@ export function shouldUseDaemonInteractive(options: InteractiveDaemonStartupDeci
 export interface AgentsViewStartupDecision {
 	useDaemonInteractive: boolean;
 	needsOnboarding: boolean;
+	explicitAgentsView?: boolean;
 	session?: string;
 	resume?: boolean;
 	continue?: boolean;
@@ -169,6 +184,9 @@ export interface AgentsViewStartupDecision {
 export function shouldOpenAgentsViewForDaemonInteractive(options: AgentsViewStartupDecision): boolean {
 	return (
 		options.useDaemonInteractive &&
+		// `prime-agent` opens a new chat by default; the agents view is reached via
+		// left-arrow from a session or requested explicitly (`agents`/`manage`).
+		!!options.explicitAgentsView &&
 		// Onboarding lives in InteractiveMode, so a first run must take the
 		// direct session path; the agents view would otherwise require creating
 		// an agent before the onboarding splash ever renders.
@@ -348,16 +366,66 @@ async function promptConfirm(message: string): Promise<boolean> {
 	});
 }
 
-async function awaitDaemonReady(daemonReady: Promise<void> | undefined): Promise<void> {
+// Only busy sessions (streaming, compacting, or pending messages) lose work;
+// idle loaded sessions reload from disk on the fresh daemon.
+const STARTUP_SESSION_LOSS_COPY: DaemonSessionLossCopy = {
+	busyDetail(count) {
+		const { noun, pronoun } = pluralizeSessions(count);
+		return `A background daemon from a different prime-agent version is running with ${count} busy ${noun}. Stopping it will terminate ${pronoun}.`;
+	},
+	unlistableDetail:
+		"A background daemon from a different prime-agent version is running and its sessions could not be listed. Stopping it may terminate active sessions.",
+	question: "Stop it and continue?",
+	nonTtyHint: 'Run "prime-agent daemon shutdown" to stop it, then retry.',
+};
+
+// The promise to keep after awaiting readiness. Wrapped in an object so it
+// survives `await` (which would otherwise flatten a returned Promise to void).
+type DaemonReadyResult = { ready: Promise<void> | undefined };
+
+// A stale-version daemon couldn't be taken over automatically (busy or stuck).
+// Offer to stop it (default No) and start a fresh daemon, or exit. Returns the
+// fresh ready promise so callers stop re-handling the original rejection.
+async function takeOverStaleDaemonOrExit(socketPath: string): Promise<DaemonReadyResult> {
+	const probe = await probeRunningDaemonSessions(socketPath);
+	const confirmed = await confirmDaemonSessionLoss(probe, { force: false, copy: STARTUP_SESSION_LOSS_COPY });
+	if (!confirmed) {
+		// Non-TTY already printed the reason; at a TTY the user declined.
+		if (process.stdin.isTTY) {
+			console.error(chalk.dim("Cancelled."));
+		}
+		process.exit(1);
+	}
+	if (!(await shutdownDaemonAndWait(socketPath))) {
+		console.error(
+			chalk.red(`Could not stop the daemon on ${socketPath}. Run "prime-agent daemon shutdown" and retry.`),
+		);
+		process.exit(1);
+	}
+	const ready = ensureInteractiveDaemonRunning(socketPath);
+	try {
+		await ready;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(chalk.red(`Could not start the daemon: ${message}`));
+		process.exit(1);
+	}
+	return { ready };
+}
+
+// Resolves the daemon-ready promise, returning the promise to keep (the same
+// one on success, or the fresh one from a stale-daemon takeover) so repeat
+// calls don't re-handle the original rejection.
+async function awaitDaemonReady(daemonReady: Promise<void> | undefined): Promise<DaemonReadyResult> {
 	if (!daemonReady) {
-		return;
+		return { ready: daemonReady };
 	}
 	try {
 		await daemonReady;
+		return { ready: daemonReady };
 	} catch (error) {
 		if (error instanceof StaleDaemonError) {
-			console.error(chalk.red(error.message));
-			process.exit(1);
+			return takeOverStaleDaemonOrExit(error.socketPath);
 		}
 		throw error;
 	}
@@ -819,6 +887,40 @@ async function findActiveDaemonSessionSummary(
 	}
 }
 
+// Best-effort: kill a promoted session that never received a message so abandoned
+// new-chats don't linger in the agents view. Any failure leaves it in place.
+async function discardEmptyDaemonSession(socketPath: string, activeSessionId: string): Promise<void> {
+	const client = new DaemonClient(socketPath);
+	try {
+		await client.connect(250);
+	} catch {
+		return;
+	}
+	try {
+		const state = await client.request({ type: "get_state", activeSessionId }, 3000);
+		if (!state.success || !isDaemonSessionSummary(state.data)) {
+			return;
+		}
+		const summary = state.data;
+		// Keep the session if it holds any work: messages, a queued/streaming turn,
+		// an in-progress compaction, or a running user bash command.
+		if (
+			summary.messageCount > 0 ||
+			summary.pendingMessageCount > 0 ||
+			summary.isStreaming ||
+			summary.isCompacting ||
+			summary.isBashRunning
+		) {
+			return;
+		}
+		await client.request({ type: "kill", activeSessionId }, 3000);
+	} catch {
+		// Best-effort cleanup; leave the session in place on any error.
+	} finally {
+		client.close();
+	}
+}
+
 async function normalizeDaemonRichTuiAttachArgs(args: string[]): Promise<string[] | undefined> {
 	const shortcut = parseDaemonRichTuiAttachShortcut(args);
 	if (!shortcut) {
@@ -966,6 +1068,11 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 
+	// `prime-agent agents` / `prime-agent manage` open the agents view directly.
+	const agentsViewCommand = parseAgentsViewCommand(args);
+	const explicitAgentsView = agentsViewCommand.explicitAgentsView;
+	args = agentsViewCommand.args;
+
 	const parsed = parseArgs(args);
 	if (parsed.diagnostics.length > 0) {
 		for (const d of parsed.diagnostics) {
@@ -1052,7 +1159,7 @@ export async function main(args: string[], options?: MainOptions) {
 	const daemonSocketPath = parsed.daemonSocket ?? defaultDaemonSocketPath();
 	// Kick off daemon spawn/readiness immediately so it overlaps session-manager
 	// and runtime-services preparation; awaited wherever the daemon is first used.
-	const daemonReady = useDaemonInteractive ? ensureInteractiveDaemonRunning(daemonSocketPath) : undefined;
+	let daemonReady = useDaemonInteractive ? ensureInteractiveDaemonRunning(daemonSocketPath) : undefined;
 	// Errors are rethrown at the await sites below; this only avoids an unhandled
 	// rejection if startup exits before reaching them.
 	daemonReady?.catch(() => {});
@@ -1061,7 +1168,7 @@ export async function main(args: string[], options?: MainOptions) {
 		session: parsed.session,
 	});
 	if (shouldLookupDaemonActiveSession && daemonReady) {
-		await awaitDaemonReady(daemonReady);
+		daemonReady = (await awaitDaemonReady(daemonReady)).ready;
 	}
 	const activeDaemonSessionSummary =
 		shouldLookupDaemonActiveSession && parsed.session
@@ -1237,6 +1344,7 @@ export async function main(args: string[], options?: MainOptions) {
 		if (
 			shouldOpenAgentsViewForDaemonInteractive({
 				useDaemonInteractive,
+				explicitAgentsView,
 				needsOnboarding: shouldRunOnboarding({
 					settingsManager,
 					modelRegistry: services.modelRegistry,
@@ -1248,29 +1356,70 @@ export async function main(args: string[], options?: MainOptions) {
 				fork: parsed.fork,
 			})
 		) {
-			await awaitDaemonReady(daemonReady);
+			daemonReady = (await awaitDaemonReady(daemonReady)).ready;
 			await preloadCodeHighlighter();
 			printTimings();
 			await launchAgentsView(true);
 			return;
 		}
 
-		await awaitDaemonReady(daemonReady);
-		const { connection: agentConnection, summary } = await createDaemonInteractiveConnection({
-			socketPath: daemonSocketPath,
-			config: defaultSessionConfig,
-			activeSessionId: activeDaemonSessionSummary
-				? getDaemonSummaryActiveSessionId(activeDaemonSessionSummary)
-				: undefined,
-			sessionPath: activeDaemonSessionSummary ? undefined : getInteractiveDaemonSessionPath(parsed, sessionManager),
-		});
+		daemonReady = (await awaitDaemonReady(daemonReady)).ready;
+		// No attach and no session selector means a fresh default chat. Defer the
+		// daemon session until the first action so startup is instant and leaving
+		// straight to the agents view (or quitting) creates nothing to clean up.
+		const isFreshDefaultSession =
+			!activeDaemonSessionSummary && !getInteractiveDaemonSessionPath(parsed, sessionManager);
+		let agentConnection: AgentConnection;
+		let attachModelFallbackMessage: string | undefined;
+		if (isFreshDefaultSession) {
+			agentConnection = new DeferredAgentConnection(
+				async () => {
+					const created = await createDaemonInteractiveConnection({
+						socketPath: daemonSocketPath,
+						config: defaultSessionConfig,
+					});
+					return {
+						connection: created.connection,
+						activeSessionId: getDaemonSummaryActiveSessionId(created.summary),
+					};
+				},
+				{
+					cwd: sessionManager.getCwd(),
+					sessionDir,
+					model: startupModel.model,
+					thinkingLevel: prepared.sessionOptions.thinkingLevel ?? defaultSessionConfig.thinking ?? "off",
+					scopedModels: prepared.sessionOptions.scopedModels ?? [],
+					availableModels: () => services.modelRegistry.getAvailable(),
+					steeringMode: settingsManager.getSteeringMode(),
+					followUpMode: settingsManager.getFollowUpMode(),
+					autoCompactionEnabled: settingsManager.getCompactionEnabled(),
+				},
+				(activeSessionId) => discardEmptyDaemonSession(daemonSocketPath, activeSessionId),
+			);
+			// The deferred path only ever fresh-creates with this same config, so the
+			// startup resolution is authoritative — there is no attached session whose
+			// summary could carry a different fallback (resolveAttachModelFallbackMessage
+			// only matters when attaching to an existing session).
+			attachModelFallbackMessage = startupModel.modelFallbackMessage;
+		} else {
+			const { connection, summary } = await createDaemonInteractiveConnection({
+				socketPath: daemonSocketPath,
+				config: defaultSessionConfig,
+				activeSessionId: activeDaemonSessionSummary
+					? getDaemonSummaryActiveSessionId(activeDaemonSessionSummary)
+					: undefined,
+				sessionPath: getInteractiveDaemonSessionPath(parsed, sessionManager),
+			});
+			agentConnection = connection;
+			attachModelFallbackMessage = resolveAttachModelFallbackMessage(summary, startupModel.modelFallbackMessage);
+		}
 
 		const interactiveMode = new InteractiveMode({
 			agentConnection,
 			uiServices: daemonUiServices,
 			bindLocalSessionExtensions: false,
 			migratedProviders,
-			modelFallbackMessage: resolveAttachModelFallbackMessage(summary, startupModel.modelFallbackMessage),
+			modelFallbackMessage: attachModelFallbackMessage,
 			initialMessage,
 			initialImages,
 			initialMessages: parsed.messages,

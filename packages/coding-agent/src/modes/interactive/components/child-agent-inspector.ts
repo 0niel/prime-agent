@@ -12,6 +12,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
+import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
 import { AssistantMessageComponent } from "./assistant-message.js";
 import { CollapsibleErrorComponent, shouldCollapseErrorDetails } from "./collapsible-error.js";
 import { keyText } from "./keybinding-hints.js";
@@ -68,6 +69,9 @@ export interface ChildAgentInspectorNode {
 	status: ChildAgentStatus;
 	durationMs?: number;
 	answerPreview?: string;
+	toolUseCount?: number;
+	tokenCount?: number;
+	recap?: string;
 	sessionDir: string;
 	transcript: readonly ChildAgentTranscriptLine[];
 	structuredTranscript?: readonly ChildAgentStructuredTranscriptEntry[];
@@ -88,11 +92,6 @@ export interface ChildAgentDetailOptions {
 interface FlatChildAgentNode {
 	node: ChildAgentInspectorNode;
 	depth: number;
-}
-
-interface InspectorLine {
-	text: string;
-	selected: boolean;
 }
 
 interface DetailSections {
@@ -118,14 +117,6 @@ function flattenChildAgentNodes(nodes: readonly ChildAgentInspectorNode[]): Flat
 	};
 	walk(nodes, 0);
 	return result;
-}
-
-function countRunning(nodes: readonly FlatChildAgentNode[]): number {
-	return nodes.filter((entry) => entry.node.status === "running").length;
-}
-
-function pluralize(count: number, singular: string, plural = `${singular}s`): string {
-	return count === 1 ? singular : plural;
 }
 
 interface KeyActionOptions {
@@ -218,19 +209,30 @@ function padTableCell(value: string, width: number): string {
 	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
 }
 
-function padRightTableCell(value: string, width: number): string {
-	const truncated = truncateToWidth(value, width, "");
-	return " ".repeat(Math.max(0, width - visibleWidth(truncated))) + truncated;
-}
+// Rows shown at once in the inline list below the prompt; extras scroll.
+const SUMMARY_VISIBLE_ROWS = 5;
+const SUMMARY_LIST_INDENT = 1;
+const SHARED_PREFIX_MIN = 12;
+// Gap between the "Subagent N" column and the prompt.
+const SUMMARY_LABEL_GAP = 4;
+// Opening chars of the prompt kept for context before eliding a shared prefix.
+const PROMPT_LEADING_CONTEXT = 14;
+// Words of context kept on each side of the divergence.
+const PROMPT_DIFF_CONTEXT_WORDS = 2;
 
 export class ChildAgentSummaryComponent implements Component, Focusable {
 	focused = false;
 	private readonly paddingX = 1;
 	private nodes: readonly ChildAgentInspectorNode[] = [];
 	private hidden = false;
+	private selectedId: string | undefined;
 
 	onOpen?: () => void;
 	onCancel?: () => void;
+	onExit?: () => void;
+	onOpenDetail?: (nodeId: string) => void;
+	// Chat actions that should still work while the list holds focus.
+	onChatAction?: (data: string) => void;
 
 	constructor(
 		private readonly getLocationLabel: () => string | undefined = () => undefined,
@@ -240,10 +242,24 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 
 	setNodes(nodes: readonly ChildAgentInspectorNode[]): void {
 		this.nodes = nodes;
+		const flat = flattenChildAgentNodes(this.nodes);
+		if (flat.length === 0) {
+			this.selectedId = undefined;
+			return;
+		}
+		if (!this.selectedId || !flat.some((entry) => entry.node.id === this.selectedId)) {
+			this.selectedId = flat.find((entry) => entry.node.status === "running")?.node.id ?? flat[0]?.node.id;
+		}
 	}
 
 	setHidden(hidden: boolean): void {
 		this.hidden = hidden;
+	}
+
+	selectNode(nodeId: string): void {
+		if (flattenChildAgentNodes(this.nodes).some((entry) => entry.node.id === nodeId)) {
+			this.selectedId = nodeId;
+		}
 	}
 
 	hasNodes(): boolean {
@@ -261,35 +277,283 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 
 		const safeWidth = Math.max(1, width);
 		const flat = flattenChildAgentNodes(this.nodes);
+		const lines = [...this.renderInfoLine(safeWidth)];
+		lines.push(...this.renderSubagentList(flat, safeWidth));
+		return lines;
+	}
+
+	handleInput(data: string): void {
+		const kb = getKeybindings();
+		const flat = flattenChildAgentNodes(this.nodes);
+		const open = () => (this.selectedId ? this.onOpenDetail?.(this.selectedId) : this.onOpen?.());
+		if (kb.matches(data, "tui.select.confirm") || kb.matches(data, "app.agents.open")) {
+			open();
+			return;
+		}
+		if (kb.matches(data, "app.agents.back")) {
+			this.onExit?.();
+			return;
+		}
+		if (kb.matches(data, "tui.select.down")) {
+			this.moveSelection(1, flat);
+			return;
+		}
+		if (kb.matches(data, "tui.select.up")) {
+			if (this.isAtFirstRow(flat)) {
+				this.onCancel?.();
+			} else {
+				this.moveSelection(-1, flat);
+			}
+			return;
+		}
+		if (kb.matches(data, "tui.select.cancel")) {
+			this.onCancel?.();
+			return;
+		}
+		// Keys the list doesn't own fall through to chat actions (expand tools, etc.).
+		this.onChatAction?.(data);
+	}
+
+	private isAtFirstRow(flat: readonly FlatChildAgentNode[]): boolean {
+		return flat.length === 0 || flat[0]?.node.id === this.selectedId;
+	}
+
+	private moveSelection(delta: number, flat: readonly FlatChildAgentNode[]): void {
+		if (flat.length === 0) {
+			return;
+		}
+		const current = Math.max(
+			0,
+			flat.findIndex((entry) => entry.node.id === this.selectedId),
+		);
+		const next = Math.max(0, Math.min(flat.length - 1, current + delta));
+		this.selectedId = flat[next]?.node.id;
+	}
+
+	private renderInfoLine(width: number): string[] {
 		const overrideLabel = this.getOverrideLabel()?.trim();
 		const locationLabel = this.getLocationLabel()?.trim();
 		const contextLabel = this.getContextLabel()?.trim();
 		const override = overrideLabel ? theme.fg("muted", overrideLabel) : "";
 		const location = !override && locationLabel ? theme.fg("muted", locationLabel) : "";
 		const context = contextLabel ? theme.fg("muted", contextLabel) : "";
-		const subagents = !override && flat.length > 0 ? this.subagentSummary(flat, this.focused) : "";
-		const summaryHint = !override && this.focused && flat.length > 0 ? this.summaryHint() : "";
-		const leftSegments = [override, location, subagents, summaryHint].filter((segment) => segment.length > 0);
+		const leftSegments = [override, location].filter((segment) => segment.length > 0);
 		if (leftSegments.length === 0 && !context) {
 			return [];
 		}
 
 		const rawLeft = leftSegments.join(theme.fg("dim", "  "));
 		const paddedLine = context
-			? this.renderSplitLine(rawLeft, context, safeWidth)
-			: this.renderCompactLine(rawLeft, safeWidth);
+			? this.renderSplitLine(rawLeft, context, width)
+			: this.renderCompactLine(rawLeft, width);
 		return [paddedLine];
 	}
 
-	handleInput(data: string): void {
-		const kb = getKeybindings();
-		if (kb.matches(data, "tui.select.confirm")) {
-			this.onOpen?.();
-			return;
+	private renderSubagentList(flat: readonly FlatChildAgentNode[], width: number): string[] {
+		if (flat.length === 0) {
+			return [];
 		}
-		if (kb.matches(data, "tui.select.cancel") || kb.matches(data, "tui.select.up")) {
-			this.onCancel?.();
+		const contentWidth = Math.max(1, width - this.paddingX * 2);
+		const selectedIndex = Math.max(
+			0,
+			flat.findIndex((entry) => entry.node.id === this.selectedId),
+		);
+		const start = Math.max(
+			0,
+			Math.min(selectedIndex - (SUMMARY_VISIBLE_ROWS - 1), flat.length - SUMMARY_VISIBLE_ROWS),
+		);
+		const clampedStart = Math.max(0, start);
+		const window = flat.slice(clampedStart, clampedStart + SUMMARY_VISIBLE_ROWS);
+
+		const labelWidth = `Subagent ${flat.length}`.length;
+		const promptPrefix = this.sharedPromptPrefix(window);
+		const promptSuffix = this.sharedPromptSuffix(window, promptPrefix);
+
+		const lines: string[] = [theme.fg("borderMuted", "─".repeat(width))];
+		for (const entry of window) {
+			const selected = this.focused && entry.node.id === this.selectedId;
+			const number = flat.indexOf(entry) + 1;
+			lines.push(
+				this.panelLine(
+					this.renderListEntry(entry, number, labelWidth, promptPrefix, promptSuffix, contentWidth),
+					width,
+					selected,
+				),
+			);
 		}
+		const scrollHint = this.scrollHint(flat.length, clampedStart, contentWidth);
+		if (scrollHint) {
+			lines.push(this.panelLine(scrollHint, width, false));
+		}
+		return lines;
+	}
+
+	// Only elide when the prefix is long enough and leaves a distinguishing tail.
+	private sharedPromptPrefix(flat: readonly FlatChildAgentNode[]): string {
+		if (flat.length < 2) {
+			return "";
+		}
+		const labels = flat.map((entry) => entry.node.label);
+		let prefix = labels[0] ?? "";
+		for (const label of labels) {
+			let i = 0;
+			while (i < prefix.length && i < label.length && prefix[i] === label[i]) {
+				i++;
+			}
+			prefix = prefix.slice(0, i);
+			if (!prefix) {
+				break;
+			}
+		}
+		const minTail = labels.some((label) => label.length <= prefix.length);
+		return prefix.length >= SHARED_PREFIX_MIN && !minTail ? prefix : "";
+	}
+
+	// Common trailing run after the divergence, so the diff window can also drop a
+	// shared tail. Only used when it leaves room past the prefix for a real diff.
+	private sharedPromptSuffix(flat: readonly FlatChildAgentNode[], prefix: string): string {
+		if (flat.length < 2 || !prefix) {
+			return "";
+		}
+		const labels = flat.map((entry) => entry.node.label);
+		let suffix = labels[0] ?? "";
+		for (const label of labels) {
+			let i = 0;
+			while (
+				i < suffix.length &&
+				i < label.length &&
+				suffix[suffix.length - 1 - i] === label[label.length - 1 - i]
+			) {
+				i++;
+			}
+			suffix = suffix.slice(suffix.length - i);
+		}
+		// Keep the suffix clear of the prefix on every label so the diff survives.
+		const safe = labels.every((label) => prefix.length + suffix.length < label.length);
+		return safe && suffix.length >= SHARED_PREFIX_MIN ? suffix : "";
+	}
+
+	private renderListEntry(
+		entry: FlatChildAgentNode,
+		number: number,
+		labelWidth: number,
+		sharedPrefix: string,
+		sharedSuffix: string,
+		width: number,
+	): string {
+		const indent = " ".repeat(SUMMARY_LIST_INDENT + Math.min(6, entry.depth * 2));
+		// Running rows pulse the shared working glyph; other states stay static.
+		const rawIcon =
+			entry.node.status === "running"
+				? workingIconFrame(getWorkingPulseFrame())
+				: childAgentStatusIcon(entry.node.status);
+		const icon = formatChildAgentStatusIcon(entry.node.status, rawIcon);
+		const numberCell = theme.fg("muted", padTableCell(`Subagent ${number}`, labelWidth));
+		const time = formatChildAgentDuration(entry.node.durationMs);
+		const timeWidth = 6;
+		// Fixed columns consume: icon + space, the label gap, and a space before time.
+		const fixed = visibleWidth(indent) + visibleWidth(rawIcon) + 1 + labelWidth + SUMMARY_LABEL_GAP + 1 + timeWidth;
+		// The prompt may use all remaining space; the elision keeps it short and the
+		// gap fill still right-aligns the time.
+		const promptWidth = Math.max(0, width - fixed);
+		const prompt = this.elidePrompt(entry.node.label, sharedPrefix, sharedSuffix, promptWidth);
+		const promptCell = theme.fg("dim", prompt);
+		const labelGap = " ".repeat(SUMMARY_LABEL_GAP);
+		const fillWidth = Math.max(
+			0,
+			width -
+				visibleWidth(indent) -
+				visibleWidth(rawIcon) -
+				1 -
+				labelWidth -
+				SUMMARY_LABEL_GAP -
+				visibleWidth(prompt) -
+				visibleWidth(time) -
+				1,
+		);
+		const fill = " ".repeat(fillWidth);
+		const timeCell = theme.fg("muted", time);
+		return `${indent}${icon} ${numberCell}${labelGap}${promptCell}${fill} ${timeCell}`;
+	}
+
+	// Coloring is applied by the caller so the trailing ellipsis matches the text.
+	private elidePrompt(label: string, sharedPrefix: string, sharedSuffix: string, width: number): string {
+		const text = this.elideAroundDiff(label, sharedPrefix, sharedSuffix);
+		// Column-aware truncation (handles wide/combining chars), with the ellipsis
+		// reserved inside the budget rather than appended past it.
+		return truncateToWidth(text, Math.max(0, width), "…");
+	}
+
+	// Window the prompt around its divergence: "<leading context>…<~2 words before
+	// the diff><diff><~2 words after the diff>…", dropping the shared head and tail.
+	private elideAroundDiff(label: string, sharedPrefix: string, sharedSuffix: string): string {
+		// Nothing useful to elide if the whole shared run fits in the leading window.
+		if (!sharedPrefix || !label.startsWith(sharedPrefix) || sharedPrefix.length <= PROMPT_LEADING_CONTEXT) {
+			return label;
+		}
+		// Snap the leading window to a word boundary so it doesn't cut mid-word.
+		const leadSpace = label.lastIndexOf(" ", PROMPT_LEADING_CONTEXT);
+		const lead = label.slice(0, leadSpace > 0 ? leadSpace : PROMPT_LEADING_CONTEXT).trimEnd();
+
+		// Back the window start up a couple words before the divergence.
+		let start = sharedPrefix.length;
+		for (let words = 0; words < PROMPT_DIFF_CONTEXT_WORDS && start > 0; words++) {
+			const prevSpace = label.lastIndexOf(" ", start - 2);
+			if (prevSpace <= lead.length) {
+				break;
+			}
+			start = prevSpace + 1;
+		}
+
+		// Advance the window end a couple words past where the labels re-converge.
+		let end = label.length;
+		if (sharedSuffix && label.endsWith(sharedSuffix)) {
+			end = label.length - sharedSuffix.length;
+			for (let words = 0; words < PROMPT_DIFF_CONTEXT_WORDS && end < label.length; words++) {
+				const nextSpace = label.indexOf(" ", end + 1);
+				if (nextSpace < 0) {
+					end = label.length;
+					break;
+				}
+				end = nextSpace;
+			}
+		}
+
+		const middle = label.slice(start, end).trimEnd();
+		const tail = end < label.length ? "…" : "";
+		return `${lead}…${middle}${tail}`;
+	}
+
+	private scrollHint(total: number, start: number, width: number): string | undefined {
+		if (total <= SUMMARY_VISIBLE_ROWS) {
+			return undefined;
+		}
+		const above = start;
+		const below = total - (start + SUMMARY_VISIBLE_ROWS);
+		const segments: string[] = [];
+		if (above > 0) {
+			segments.push(theme.fg("dim", `▴ ${above} above`));
+		}
+		if (below > 0) {
+			segments.push(theme.fg("dim", `▾ ${below} below`));
+		}
+		const hint = this.focused
+			? joinHints([
+					combinedKeyAction(["tui.select.up", "tui.select.down"], "scroll"),
+					keyAction("tui.select.confirm", "open"),
+				])
+			: "";
+		const left = segments.join(theme.fg("dim", " · "));
+		const body = hint ? `${left}${theme.fg("dim", "  ")}${hint}` : left;
+		return this.truncate(`${" ".repeat(SUMMARY_LIST_INDENT)}${body}`, width);
+	}
+
+	private panelLine(line: string, width: number, selected: boolean): string {
+		const contentWidth = Math.max(1, width - this.paddingX * 2);
+		const truncated = this.truncate(line, contentWidth);
+		const paddedContent = truncated + " ".repeat(Math.max(0, contentWidth - visibleWidth(truncated)));
+		const padded = `${" ".repeat(this.paddingX)}${paddedContent}${" ".repeat(this.paddingX)}`;
+		return selected ? theme.bg("selectedBg", padded) : padded;
 	}
 
 	private truncate(line: string, width: number): string {
@@ -317,260 +581,6 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 		const renderedLeft = renderedLeftWidth > 0 ? this.truncate(left, renderedLeftWidth) : "";
 		const gap = Math.max(0, contentWidth - visibleWidth(renderedLeft) - rightWidth);
 		return `${" ".repeat(this.paddingX)}${renderedLeft}${" ".repeat(gap)}${renderedRight}`;
-	}
-
-	private subagentSummary(flat: readonly FlatChildAgentNode[], selected: boolean): string {
-		const running = countRunning(flat);
-		const summary =
-			running > 0
-				? `${running} ${pluralize(running, "subagent")} running`
-				: `${flat.length} ${pluralize(flat.length, "subagent")}`;
-		const rendered = theme.bold(summary);
-		if (!selected) {
-			return rendered;
-		}
-		return theme.bg("selectedBg", rendered);
-	}
-
-	private summaryHint(): string {
-		return joinHints([keyAction("tui.select.confirm", "open")]);
-	}
-}
-
-export class ChildAgentInspectorComponent implements Component, Focusable {
-	focused = false;
-	private readonly paddingX = 1;
-	private nodes: readonly ChildAgentInspectorNode[] = [];
-	private selectedId: string | undefined;
-	private pendingKillId: string | undefined;
-	private killConfirmExpiresAt = 0;
-	private killConfirmTimer: ReturnType<typeof setTimeout> | undefined;
-
-	onCancel?: () => void;
-	onOpenDetail?: (nodeId: string) => void;
-	onKill?: (nodeId: string) => void;
-
-	constructor(
-		private readonly getViewportHeight: () => number = () => 0,
-		private readonly requestRender: () => void = () => {},
-	) {}
-
-	setNodes(nodes: readonly ChildAgentInspectorNode[]): void {
-		this.nodes = nodes;
-		const flat = this.flatten();
-		if (flat.length === 0) {
-			this.selectedId = undefined;
-			this.clearKillConfirmation({ render: false });
-			return;
-		}
-		if (!this.selectedId || !flat.some((entry) => entry.node.id === this.selectedId)) {
-			this.selectedId = flat.find((entry) => entry.node.status === "running")?.node.id ?? flat[0]?.node.id;
-		}
-	}
-
-	invalidate(): void {
-		// Render output is derived from node state.
-	}
-
-	render(width: number): string[] {
-		if (this.nodes.length === 0) {
-			return [];
-		}
-
-		const safeWidth = Math.max(1, width);
-		const lines = [theme.fg("borderMuted", "─".repeat(safeWidth))];
-		for (const line of this.renderList(safeWidth)) {
-			lines.push(this.panelLine(line.text, safeWidth, line.selected));
-		}
-		return lines;
-	}
-
-	handleInput(data: string): void {
-		const kb = getKeybindings();
-		const flat = this.flatten();
-		if (flat.length === 0) {
-			return;
-		}
-
-		// Any input other than the kill key disarms the pending confirmation,
-		// matching the agents view delete flow.
-		if (!kb.matches(data, "app.agents.delete")) {
-			this.clearKillConfirmation({ render: false });
-		}
-		if (kb.matches(data, "app.agents.back")) {
-			this.onCancel?.();
-			return;
-		}
-		if (kb.matches(data, "tui.select.confirm")) {
-			if (this.selectedId) {
-				this.onOpenDetail?.(this.selectedId);
-			}
-			return;
-		}
-		if (kb.matches(data, "app.agents.delete")) {
-			this.handleKillKey();
-			return;
-		}
-		if (kb.matches(data, "tui.select.up")) {
-			this.moveSelection(-1);
-			return;
-		}
-		if (kb.matches(data, "tui.select.down")) {
-			this.moveSelection(1);
-			return;
-		}
-		if (kb.matches(data, "tui.select.pageUp")) {
-			this.moveSelection(-5);
-			return;
-		}
-		if (kb.matches(data, "tui.select.pageDown")) {
-			this.moveSelection(5);
-		}
-	}
-
-	private renderList(width: number): InspectorLine[] {
-		const contentWidth = Math.max(1, width - this.paddingX * 2);
-		const flat = this.flatten();
-		const running = countRunning(flat);
-		const targetHeight = Math.max(0, this.getViewportHeight());
-		const lines: InspectorLine[] = [{ text: this.headerLine(running, flat.length, contentWidth), selected: false }];
-		const availableRows = targetHeight > 0 ? Math.max(0, targetHeight - 3) : flat.length;
-
-		const selectedIndex = Math.max(
-			0,
-			flat.findIndex((entry) => entry.node.id === this.selectedId),
-		);
-		const start = Math.max(0, Math.min(selectedIndex - Math.floor(availableRows / 2), flat.length - availableRows));
-		if (availableRows > 0) {
-			for (const entry of flat.slice(start, start + availableRows)) {
-				const selected = this.focused && entry.node.id === this.selectedId;
-				lines.push({ text: this.renderListEntry(entry, contentWidth), selected });
-			}
-		}
-		while (targetHeight > 0 && lines.length < targetHeight - 2) {
-			lines.push({ text: "", selected: false });
-		}
-		lines.push({ text: this.listHintLine(contentWidth), selected: false });
-		return lines;
-	}
-
-	private renderListEntry(entry: FlatChildAgentNode, width: number): string {
-		const indent = " ".repeat(Math.min(6, entry.depth * 2));
-		const rawIcon = childAgentStatusIcon(entry.node.status);
-		const icon = formatChildAgentStatusIcon(entry.node.status, rawIcon);
-		const timeWidth = 6;
-		const titleWidth = Math.max(0, width - visibleWidth(indent) - visibleWidth(rawIcon) - timeWidth - 2);
-		const pendingKill = this.isPendingKillNode(entry.node);
-		const title = pendingKill ? `${keyText("app.agents.delete").trim()} again to stop` : entry.node.label;
-		const titleCell = padTableCell(title, titleWidth);
-		const timeCell = padRightTableCell(formatChildAgentDuration(entry.node.durationMs), timeWidth);
-		const renderedTitleCell = pendingKill ? theme.fg("error", titleCell) : titleCell;
-		return this.truncate(`${indent}${icon} ${renderedTitleCell} ${timeCell}`, width, "");
-	}
-	private flatten(): FlatChildAgentNode[] {
-		return flattenChildAgentNodes(this.nodes);
-	}
-
-	private moveSelection(delta: number): void {
-		const flat = this.flatten();
-		if (flat.length === 0) {
-			return;
-		}
-		const current = Math.max(
-			0,
-			flat.findIndex((entry) => entry.node.id === this.selectedId),
-		);
-		const next = (current + delta + flat.length) % flat.length;
-		this.selectedId = flat[next]?.node.id;
-	}
-
-	private handleKillKey(): void {
-		const selected = this.flatten().find((entry) => entry.node.id === this.selectedId)?.node;
-		if (!selected || !isKillableChildAgentStatus(selected.status)) {
-			this.clearKillConfirmation({ render: false });
-			return;
-		}
-		if (this.pendingKillId === selected.id && this.isKillConfirmationVisible()) {
-			this.clearKillConfirmation({ render: false });
-			this.onKill?.(selected.id);
-			return;
-		}
-		this.showKillConfirmation(selected.id);
-	}
-
-	private isPendingKillNode(node: ChildAgentInspectorNode): boolean {
-		return (
-			node.id === this.pendingKillId && isKillableChildAgentStatus(node.status) && this.isKillConfirmationVisible()
-		);
-	}
-
-	private showKillConfirmation(nodeId: string): void {
-		if (this.killConfirmTimer) {
-			clearTimeout(this.killConfirmTimer);
-		}
-		this.pendingKillId = nodeId;
-		this.killConfirmExpiresAt = Date.now() + KILL_CONFIRM_DURATION_MS;
-		this.killConfirmTimer = setTimeout(() => {
-			this.killConfirmTimer = undefined;
-			this.pendingKillId = undefined;
-			this.killConfirmExpiresAt = 0;
-			this.requestRender();
-		}, KILL_CONFIRM_DURATION_MS);
-		this.killConfirmTimer.unref?.();
-		this.requestRender();
-	}
-
-	private clearKillConfirmation(options: { render?: boolean } = {}): void {
-		if (!this.killConfirmTimer && this.killConfirmExpiresAt === 0) {
-			return;
-		}
-		if (this.killConfirmTimer) {
-			clearTimeout(this.killConfirmTimer);
-			this.killConfirmTimer = undefined;
-		}
-		this.pendingKillId = undefined;
-		this.killConfirmExpiresAt = 0;
-		if (options.render !== false) {
-			this.requestRender();
-		}
-	}
-
-	private isKillConfirmationVisible(): boolean {
-		return this.killConfirmExpiresAt > Date.now();
-	}
-
-	private headerLine(running: number, total: number, width: number): string {
-		const left = theme.bold("subagents");
-		const right =
-			running > 0 ? theme.fg("muted", `${running} running · ${total} total`) : theme.fg("muted", `${total} total`);
-		const gap = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-		return this.truncate(`${left}${gap}${right}`, width);
-	}
-
-	private listHintLine(width: number): string {
-		const selected = this.flatten().find((entry) => entry.node.id === this.selectedId)?.node;
-		const killable = selected !== undefined && isKillableChildAgentStatus(selected.status);
-		return hintLine(
-			[
-				combinedKeyAction(["tui.select.up", "tui.select.down"], "move"),
-				keyAction("tui.select.confirm", "open"),
-				killable ? keyAction("app.agents.delete", "stop", { primaryOnly: true }) : undefined,
-				keyAction("app.agents.back", "back to chat", { primaryOnly: true }),
-			],
-			width,
-		);
-	}
-
-	private panelLine(line: string, width: number, selected: boolean): string {
-		const contentWidth = Math.max(1, width - this.paddingX * 2);
-		const truncated = this.truncate(line, contentWidth);
-		const paddedContent = truncated + " ".repeat(Math.max(0, contentWidth - visibleWidth(truncated)));
-		const padded = `${" ".repeat(this.paddingX)}${paddedContent}${" ".repeat(this.paddingX)}`;
-		return selected ? theme.bg("selectedBg", padded) : padded;
-	}
-
-	private truncate(line: string, width: number, ellipsis = ""): string {
-		return truncateToWidth(line, width, ellipsis);
 	}
 }
 
@@ -838,7 +848,7 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 				? theme.fg("error", `${keyText("app.agents.delete", { primaryOnly: true }).trim()} again to stop`)
 				: keyAction("app.agents.delete", "stop", { primaryOnly: true });
 		return hintLine(
-			[keyAction("app.agents.back", "back to subagents", { primaryOnly: true }), expandAction, stopAction],
+			[keyAction("app.agents.back", "back to chat", { primaryOnly: true }), expandAction, stopAction],
 			width,
 		);
 	}

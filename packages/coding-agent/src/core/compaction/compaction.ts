@@ -136,6 +136,9 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 /**
  * Calculate total context tokens from usage.
  * Uses the native totalTokens field when available, falls back to computing from components.
+ *
+ * Includes output: the assistant's response becomes part of the prompt on the next
+ * request, so it counts toward the context the next turn will send.
  */
 export function calculateContextTokens(usage: Usage): number {
 	return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;

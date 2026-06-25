@@ -196,7 +196,7 @@ function copyPackageContents(sourceDir, targetDir, packageJson) {
 	mkdirSync(targetDir, { recursive: true });
 	writeJson(join(targetDir, "package.json"), packageJson);
 
-	for (const entry of ["dist", "docs", "examples", "postinstall.cjs", "README.md", "CHANGELOG.md"]) {
+	for (const entry of ["dist", "docs", "examples", "skills", "postinstall.cjs", "README.md", "CHANGELOG.md"]) {
 		copyIfExists(join(sourceDir, entry), join(targetDir, entry));
 	}
 }

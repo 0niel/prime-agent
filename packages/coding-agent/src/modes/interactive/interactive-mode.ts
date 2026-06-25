@@ -3,12 +3,19 @@
  * Handles TUI rendering and user interaction, delegating agent execution to AgentConnection.
  */
 
-import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Api, AssistantMessage, ImageContent, Message, Model, ToolCall } from "@earendil-works/pi-ai";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import {
+	type Api,
+	type AssistantMessage,
+	getSupportedThinkingLevels,
+	type ImageContent,
+	type Message,
+	type Model,
+	type ToolCall,
+} from "@earendil-works/pi-ai";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -39,7 +46,15 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "child_process";
-import { APP_TITLE, getAgentDir, getDebugLogPath, getLogsDir, getShareViewerUrl, VERSION } from "../../config.js";
+import {
+	APP_TITLE,
+	getAgentDir,
+	getAgentTracesLogPath,
+	getDebugLogPath,
+	getLogsDir,
+	getShareViewerUrl,
+	VERSION,
+} from "../../config.js";
 import {
 	type AgentTraceUploadResult,
 	getPrimeAgentTraceCredential,
@@ -62,11 +77,13 @@ import { emptyGoalState, formatGoalUsage, type GoalState } from "../../core/goal
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import { createCompactionSummaryMessage } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
+import { resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { parseSkillBlock } from "../../core/skill-blocks.js";
 import {
 	BUILTIN_SLASH_COMMANDS,
+	builtinSlashCommandTakesArgument,
 	isBuiltinSlashCommandName,
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
@@ -75,8 +92,9 @@ import type { TruncationResult } from "../../core/tools/truncate.js";
 import { PRIME_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
-import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.js";
+import { readClipboardImage } from "../../utils/clipboard-image.js";
 import { parseGitUrl } from "../../utils/git.js";
+import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { ensureTool, MISSING_RIPGREP_MESSAGE } from "../../utils/tools-manager.js";
@@ -115,7 +133,6 @@ import { BranchSummaryMessageComponent } from "./components/branch-summary-messa
 import { showFullPaneOverlay } from "./components/centered-overlay.js";
 import {
 	ChildAgentDetailComponent,
-	ChildAgentInspectorComponent,
 	type ChildAgentInspectorNode,
 	type ChildAgentStructuredTranscriptEntry,
 	ChildAgentSummaryComponent,
@@ -140,10 +157,12 @@ import { ScopedModelsSelectorComponent } from "./components/scoped-models-select
 import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
+import { SubagentTreeView } from "./components/subagent-tree-view.js";
 import { ToolExecutionComponent, type ToolExecutionDefinition } from "./components/tool-execution.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
+import { collectMarkedImages, evictImagesToBudget, formatImageMarker, imageMarkerIds } from "./image-markers.js";
 import type {
 	InteractiveModeLocalSessionHost,
 	InteractiveModeLocalToolRendererDefinition,
@@ -172,6 +191,7 @@ import {
 	type ThemeColor,
 	theme,
 } from "./theme/theme.js";
+import { setWorkingPulseFrame, WORKING_ICON_INTERVAL_MS } from "./theme/working-icon.js";
 
 /** Interface for components that can be expanded/collapsed */
 interface Expandable {
@@ -341,7 +361,22 @@ const MODEL_SELECTOR_ACTIONS: readonly ModelSelectorAction[] = [
 	{ id: "add_provider", label: "Add provider...", description: "subscription or API key" },
 ];
 
+const THINKING_LEVEL_DESCRIPTIONS: Record<ThinkingLevel, string> = {
+	off: "No reasoning",
+	minimal: "Very brief reasoning",
+	low: "Light reasoning",
+	medium: "Moderate reasoning",
+	high: "Deep reasoning",
+	xhigh: "Very deep reasoning",
+	max: "Maximum reasoning",
+};
+
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
+
+// Cap on retained pasted-image bytes (base64). Images are resized below the
+// inline limit before storing, so this holds many recent pastes; the oldest are
+// evicted past the cap to keep a long session bounded.
+const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
 
 function isDeadTerminalError(error: unknown): boolean {
 	if (!error || typeof error !== "object" || !("code" in error)) {
@@ -458,6 +493,7 @@ export class InteractiveMode {
 	private chatContainer: Container;
 	private pendingMessagesContainer: Container;
 	private statusContainer: Container;
+	private queuedMessagesContainer: Container;
 	private defaultEditor: CustomEditor;
 	private editor: EditorComponent;
 	private editorComponentFactory: EditorFactory | undefined;
@@ -481,6 +517,8 @@ export class InteractiveMode {
 	private workingIndicatorOptions: LoaderIndicatorOptions | undefined = undefined;
 	private workingStartedAt: number | undefined = undefined;
 	private workingTimer: NodeJS.Timeout | undefined = undefined;
+	private pulseTimer: NodeJS.Timeout | undefined = undefined;
+	private pulseFrame = 0;
 	private readonly activityTracker = new AgentActivityTracker();
 	private readonly defaultHiddenThinkingLabel = "Thinking...";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
@@ -513,14 +551,16 @@ export class InteractiveMode {
 	private pendingToolGeneration = 0;
 	private toolDefinitionCache = new Map<string, ToolExecutionDefinition | undefined>();
 
-	// RLM child-agent tray: compact entry below the editor, bounded list/detail in the main view.
+	// RLM child-agent tray: inline list below the editor, full-screen detail on open.
 	private childAgentSummary: ChildAgentSummaryComponent;
-	private childAgentInspector: ChildAgentInspectorComponent;
+	// Live tree of the current turn's subagents, drawn above the working loader.
+	// Shown in addition to the inline list below the prompt bar.
+	private subagentTree = new SubagentTreeView();
 	private childAgentDetail: ChildAgentDetailComponent;
 	private childAgentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	private childAgentNodes: ChildAgentInspectorNode[] = [];
 	private childAgentDetailNodeId: string | undefined;
-	private childAgentPanelMode: "list" | "detail" | undefined;
+	private childAgentPanelMode: "detail" | undefined;
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -537,6 +577,14 @@ export class InteractiveMode {
 	private initialConnectionSnapshotConsumed = false;
 	// Whether the session already had messages when first rendered (i.e. a resumed session).
 	private sessionHadInitialMessages = false;
+
+	// Registry of images pasted this session, keyed by the `[image #N]` marker
+	// shown to the user. Insertion-ordered; the bytes persist (bounded by
+	// MAX_PASTED_IMAGE_BYTES) so a marker resolves to its image whenever the text
+	// reappears — on submit, undo, history recall, retry, or dequeue. A submission
+	// attaches only the images whose markers are present in the sent text.
+	private pastedImages = new Map<number, ImageContent>();
+	private nextImageMarkerId = 1;
 
 	// Agent subscription unsubscribe function
 	private unsubscribe?: () => void;
@@ -620,13 +668,7 @@ export class InteractiveMode {
 		this.chatContainer = new Container();
 		this.pendingMessagesContainer = new Container();
 		this.statusContainer = new Container();
-		this.childAgentInspector = new ChildAgentInspectorComponent(
-			() => this.getChildAgentPanelRows(),
-			() => this.ui.requestRender(),
-		);
-		this.childAgentInspector.onCancel = () => this.closeChildAgentPanel();
-		this.childAgentInspector.onOpenDetail = (nodeId) => this.openChildAgentDetail(nodeId);
-		this.childAgentInspector.onKill = (nodeId) => void this.killChildAgent(nodeId);
+		this.queuedMessagesContainer = new Container();
 		this.childAgentDetail = new ChildAgentDetailComponent(() => this.getChildAgentPanelRows(), {
 			ui: this.ui,
 			getCwd: () => this.getCurrentCwd(),
@@ -640,7 +682,7 @@ export class InteractiveMode {
 			getHideThinkingBlock: () => this.hideThinkingBlock,
 			getHiddenThinkingLabel: () => this.hiddenThinkingLabel,
 		});
-		this.childAgentDetail.onCancel = () => this.showChildAgentList();
+		this.childAgentDetail.onCancel = () => this.closeChildAgentPanel({ selectNodeId: this.childAgentDetailNodeId });
 		this.childAgentDetail.onToggleToolsExpanded = () => this.toggleToolOutputExpansion();
 		this.childAgentDetail.onKill = (nodeId) => void this.killChildAgent(nodeId);
 		this.widgetContainerAbove = new Container();
@@ -653,6 +695,7 @@ export class InteractiveMode {
 		this.defaultEditor = new CustomEditor(this.ui, getEditorTheme(), this.keybindings, {
 			paddingX: editorPaddingX,
 			autocompleteMaxVisible,
+			isArgumentCommand: builtinSlashCommandTakesArgument,
 		});
 		this.editor = this.defaultEditor;
 		this.mainContainer = new Container();
@@ -665,8 +708,12 @@ export class InteractiveMode {
 			() => this.getTrayContextLabel(),
 			() => this.getTrayOverrideLabel(),
 		);
-		this.childAgentSummary.onOpen = () => this.openChildAgentList();
+		this.childAgentSummary.onOpenDetail = (nodeId) => this.openChildAgentDetail(nodeId);
+		// Fallback for Enter when the list emptied out while focused (no selection).
+		this.childAgentSummary.onOpen = () => this.focusEditor();
 		this.childAgentSummary.onCancel = () => this.focusEditor();
+		this.childAgentSummary.onExit = () => this.handleSubagentSummaryExit();
+		this.childAgentSummary.onChatAction = (data) => this.handleSubagentSummaryChatAction(data);
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
@@ -743,6 +790,7 @@ export class InteractiveMode {
 			aliases: command.aliases,
 			description: command.description,
 			argumentHint: command.argumentHint,
+			takesArgument: command.takesArgument,
 		}));
 
 		const modelCommand = slashCommands.find((command) => command.name === "model");
@@ -773,6 +821,16 @@ export class InteractiveMode {
 					description: item.provider,
 				}));
 			};
+		}
+
+		const effortCommand = slashCommands.find((command) => command.name === "effort");
+		if (effortCommand) {
+			effortCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
+				this.getThinkingLevelCompletions(prefix);
+			const levels = this.getAvailableThinkingLevels();
+			if (levels.length > 0) {
+				effortCommand.argumentHint = `[${levels.join("/")}]`;
+			}
 		}
 
 		const connectionCommands = this.connectionCommands;
@@ -846,8 +904,10 @@ export class InteractiveMode {
 		this.ui.addChild(this.headerContainer);
 
 		// Brand splash: side-panel layout with structured runtime metadata on the right.
-		// When onboarding is required, the guided onboarding splash owns the first screen.
-		if (!this.shouldRunOnboarding() && (this.options.verbose || !this.settingsManager.getQuietStartup())) {
+		// The model/cwd are read through live getters, so they fill in once the
+		// connection state loads (rebindCurrentSession below). Onboarding, when
+		// required, renders as a full-screen overlay on top of this header.
+		if (this.options.verbose || !this.settingsManager.getQuietStartup()) {
 			// Verbose: include the full keybinding cheatsheet under the brand mark.
 			const hint = (keybinding: AppKeybinding, description: string) => keyHint(keybinding, description);
 			const verboseInstructions = this.options.verbose
@@ -858,7 +918,7 @@ export class InteractiveMode {
 						hint("app.exit", "to exit (empty)"),
 						hint("app.suspend", "to suspend"),
 						keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
-						hint("app.thinking.cycle", "to cycle thinking level"),
+						rawKeyHint("/effort", "to set thinking level"),
 						hint("app.model.select", "to select model"),
 						hint("app.tools.expand", "to expand tools"),
 						hint("app.thinking.toggle", "to expand thinking"),
@@ -891,6 +951,7 @@ export class InteractiveMode {
 		this.mainContainer.addChild(this.widgetContainerAbove);
 		this.renderRecap();
 		this.mainContainer.addChild(this.recapContainer);
+		this.mainContainer.addChild(this.queuedMessagesContainer);
 		this.mainContainer.addChild(this.editorContainer);
 		this.mainContainer.addChild(this.childAgentSummary);
 		this.mainContainer.addChild(this.widgetContainerBelow);
@@ -1097,8 +1158,12 @@ export class InteractiveMode {
 			showDeferredStartupNotifications();
 			showModelFallbackWarning();
 			await sendInitialPrompts();
+			// Collect images from the markers in the submitted text. The registry
+			// still holds them (it is not cleared on submit), so this works even after
+			// the text was restored to the editor by onboarding, history, or a retry.
+			const images = this.collectImagesFor(userInput);
 			try {
-				await this.agentConnection.prompt(userInput);
+				await this.agentConnection.prompt(userInput, { images });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -1592,13 +1657,19 @@ export class InteractiveMode {
 			}
 		}
 
+		const formatMessageLines = (diagnostic: AgentConnectionResourceDiagnostic, indent: number): string[] => {
+			const color = diagnostic.type === "error" ? "error" : "warning";
+			const prefix = " ".repeat(indent);
+			return diagnostic.message.split("\n").map((line) => theme.fg(color, `${prefix}${line}`));
+		};
+
 		for (const d of otherDiagnostics) {
 			if (d.path) {
 				const formattedPath = this.formatPathWithSource(d.path, this.findSourceInfoForPath(d.path, sourceInfos));
 				lines.push(theme.fg(d.type === "error" ? "error" : "warning", `  ${formattedPath}`));
-				lines.push(theme.fg(d.type === "error" ? "error" : "warning", `    ${d.message}`));
+				lines.push(...formatMessageLines(d, 4));
 			} else {
-				lines.push(theme.fg(d.type === "error" ? "error" : "warning", `  ${d.message}`));
+				lines.push(...formatMessageLines(d, 2));
 			}
 		}
 
@@ -1617,6 +1688,25 @@ export class InteractiveMode {
 		}
 
 		const sectionHeader = (name: string, color: ThemeColor = "mdHeading") => theme.fg(color, `[${name}]`);
+		const diagnosticsHeader = (name: string, diagnostics: readonly AgentConnectionResourceDiagnostic[]): string => {
+			if (diagnostics.some((diagnostic) => diagnostic.type === "collision")) {
+				return `${name} conflicts`;
+			}
+
+			const errorCount = diagnostics.filter((diagnostic) => diagnostic.type === "error").length;
+			const warningCount = diagnostics.filter((diagnostic) => diagnostic.type === "warning").length;
+			if (errorCount > 0 && warningCount > 0) {
+				return `${name} diagnostics`;
+			}
+			if (errorCount > 0) {
+				return `${name} error${errorCount === 1 ? "" : "s"}`;
+			}
+			if (warningCount > 0) {
+				return `${name} warning${warningCount === 1 ? "" : "s"}`;
+			}
+
+			return `${name} diagnostics`;
+		};
 		const formatCompactList = (items: string[], options?: { sort?: boolean }): string => {
 			const labels = items.map((item) => item.trim()).filter((item) => item.length > 0);
 			if (options?.sort !== false) {
@@ -1751,7 +1841,13 @@ export class InteractiveMode {
 			const skillDiagnostics = resourceSnapshot?.diagnostics.skills ?? [];
 			if (skillDiagnostics.length > 0) {
 				const warningLines = this.formatDiagnostics(skillDiagnostics, sourceInfos);
-				this.chatContainer.addChild(new Text(`${theme.fg("warning", "[Skill conflicts]")}\n${warningLines}`, 0, 0));
+				this.chatContainer.addChild(
+					new Text(
+						`${sectionHeader(diagnosticsHeader("Skill", skillDiagnostics), "warning")}\n${warningLines}`,
+						0,
+						0,
+					),
+				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
 
@@ -1759,7 +1855,11 @@ export class InteractiveMode {
 			if (promptDiagnostics.length > 0) {
 				const warningLines = this.formatDiagnostics(promptDiagnostics, sourceInfos);
 				this.chatContainer.addChild(
-					new Text(`${theme.fg("warning", "[Prompt conflicts]")}\n${warningLines}`, 0, 0),
+					new Text(
+						`${sectionHeader(diagnosticsHeader("Prompt", promptDiagnostics), "warning")}\n${warningLines}`,
+						0,
+						0,
+					),
 				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
@@ -1782,7 +1882,11 @@ export class InteractiveMode {
 			if (extensionDiagnostics.length > 0) {
 				const warningLines = this.formatDiagnostics(extensionDiagnostics, sourceInfos);
 				this.chatContainer.addChild(
-					new Text(`${theme.fg("warning", "[Extension issues]")}\n${warningLines}`, 0, 0),
+					new Text(
+						`${sectionHeader(diagnosticsHeader("Extension", extensionDiagnostics), "warning")}\n${warningLines}`,
+						0,
+						0,
+					),
 				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
@@ -1790,7 +1894,13 @@ export class InteractiveMode {
 			const themeDiagnostics = resourceSnapshot?.diagnostics.themes ?? [];
 			if (themeDiagnostics.length > 0) {
 				const warningLines = this.formatDiagnostics(themeDiagnostics, sourceInfos);
-				this.chatContainer.addChild(new Text(`${theme.fg("warning", "[Theme conflicts]")}\n${warningLines}`, 0, 0));
+				this.chatContainer.addChild(
+					new Text(
+						`${sectionHeader(diagnosticsHeader("Theme", themeDiagnostics), "warning")}\n${warningLines}`,
+						0,
+						0,
+					),
+				);
 				this.chatContainer.addChild(new Spacer(1));
 			}
 		}
@@ -1927,6 +2037,7 @@ export class InteractiveMode {
 		this.footer.setAutoCompactEnabled(state.autoCompactionEnabled);
 		this.sessionRecap = state.recap;
 		this.renderRecap();
+		this.updateWorkingPulse();
 	}
 
 	private patchConnectionState(patch: Partial<AgentConnectionState>): void {
@@ -1934,6 +2045,7 @@ export class InteractiveMode {
 			return;
 		}
 		this.connectionState = { ...this.connectionState, ...patch };
+		this.updateWorkingPulse();
 	}
 
 	private updateConnectionStateFromEvent(event: AgentConnectionSessionEvent): void {
@@ -2053,6 +2165,7 @@ export class InteractiveMode {
 		this.updateTerminalTitle();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
+		this.syncWorkingLoader();
 	}
 
 	private async handleFatalRuntimeError(prefix: string, error: unknown): Promise<never> {
@@ -2066,7 +2179,21 @@ export class InteractiveMode {
 	private resetCurrentSessionRenderState(): void {
 		this.chatContainer.clear();
 		this.pendingMessagesContainer.clear();
+		this.queuedMessagesContainer.clear();
 		this.compactionQueuedMessages = [];
+		// Pasted images belong to the session being torn down; drop them so markers
+		// in a newly loaded session can't resolve to the previous session's bytes.
+		// Clear every editor's prompt history and draft text alongside them so no
+		// `[image #N]` marker survives without a backing image. nextImageMarkerId
+		// stays monotonic so a new paste never reuses an id that may still appear in
+		// restored text.
+		this.pastedImages.clear();
+		this.defaultEditor.clearHistory?.();
+		this.defaultEditor.setText("");
+		if (this.editor !== this.defaultEditor) {
+			this.editor.clearHistory?.();
+			this.editor.setText("");
+		}
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
 		// The discarded component's loader interval keeps firing otherwise; no
@@ -2091,6 +2218,7 @@ export class InteractiveMode {
 	private async renderCurrentSessionState(): Promise<void> {
 		this.resetCurrentSessionRenderState();
 		await this.renderInitialMessages();
+		this.syncWorkingLoader();
 	}
 
 	private getCachedToolDefinition(toolName: string): ToolExecutionDefinition | undefined {
@@ -2282,12 +2410,17 @@ export class InteractiveMode {
 			this.workingStartedAt === undefined
 				? undefined
 				: this.formatWorkingElapsed(Date.now() - this.workingStartedAt);
+		const status = this.activityTracker.getStatus();
+		// The subagent count/recaps live in the tree above the loader, so the loader
+		// message itself no longer repeats "N subagents running".
+		if (!this.isAgentStreaming()) {
+			return "";
+		}
 		if (this.workingMessage !== undefined) {
 			// Extensions and tool bootstrap own the message; keep the plain "<message> <elapsed>" form.
 			return elapsed === undefined ? this.workingMessage : `${this.workingMessage} ${elapsed}`;
 		}
-		const status = this.activityTracker.getStatus();
-		const parts = [AGENT_ACTIVITY_LABELS[status.activity]];
+		const parts: string[] = [AGENT_ACTIVITY_LABELS[status.activity]];
 		if (elapsed !== undefined) {
 			parts.push(elapsed);
 		}
@@ -2350,6 +2483,65 @@ export class InteractiveMode {
 		this.statusContainer.clear();
 	}
 
+	private updateWorkingPulse(): void {
+		const active = this.isAgentStreaming() || this.countRunningChildAgents() > 0;
+		if (!active) {
+			this.stopWorkingPulse();
+			return;
+		}
+		if (!this.pulseTimer) {
+			this.pulseTimer = setInterval(() => this.tickWorkingPulse(), WORKING_ICON_INTERVAL_MS);
+			this.pulseTimer.unref?.();
+		}
+	}
+
+	private tickWorkingPulse(): void {
+		this.pulseFrame += 1;
+		setWorkingPulseFrame(this.pulseFrame);
+		this.ui.requestRender();
+	}
+
+	private stopWorkingPulse(): void {
+		if (this.pulseTimer) {
+			clearInterval(this.pulseTimer);
+			this.pulseTimer = undefined;
+		}
+	}
+
+	private countRunningChildAgents(): number {
+		let count = 0;
+		for (const child of this.childAgentSnapshots.values()) {
+			if (child.status === "running") {
+				count += 1;
+			}
+		}
+		return count;
+	}
+
+	private shouldShowWorkingLoader(): boolean {
+		return this.workingVisible && (this.isAgentStreaming() || this.countRunningChildAgents() > 0);
+	}
+
+	// Reconcile the loader with current state for transitions that fire no live
+	// agent_start edge (returning from agents view, resuming mid-stream).
+	private syncWorkingLoader(): void {
+		// Compaction/retry own the status container while active; don't fight them.
+		if (this.autoCompactionLoader || this.retryLoader) {
+			return;
+		}
+		if (this.shouldShowWorkingLoader()) {
+			// A bare `loadingAnimation != null` check isn't proof it's on screen:
+			// other paths clear statusContainer without nulling it, orphaning the
+			// loader. Re-attach unless it is actually mounted.
+			if (!this.loadingAnimation || !this.statusContainer.children.includes(this.loadingAnimation)) {
+				this.startWorkingLoader();
+			}
+		} else if (this.loadingAnimation) {
+			this.stopWorkingLoader();
+		}
+		this.ui.requestRender();
+	}
+
 	private setWorkingVisible(visible: boolean): void {
 		this.workingVisible = visible;
 		if (!visible) {
@@ -2357,7 +2549,7 @@ export class InteractiveMode {
 			this.ui.requestRender();
 			return;
 		}
-		if (this.isAgentStreaming() && !this.loadingAnimation) {
+		if (this.shouldShowWorkingLoader() && !this.loadingAnimation) {
 			this.statusContainer.clear();
 			this.startWorkingLoader();
 		}
@@ -2852,6 +3044,8 @@ export class InteractiveMode {
 		this.editorComponentFactory = factory;
 		if (this.childAgentPanelMode) {
 			this.restoreMainAgentView();
+			// Re-render queued previews cleared on panel entry; the queue may still hold messages.
+			this.updatePendingMessagesDisplay();
 			this.childAgentDetailNodeId = undefined;
 			this.childAgentDetail.setNode(undefined);
 		}
@@ -3056,7 +3250,6 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.interrupt", () => this.handleInterruptKey());
 		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
 		this.defaultEditor.onAction("app.suspend", () => this.handleCtrlZ());
-		this.defaultEditor.onAction("app.thinking.cycle", () => this.cycleThinkingLevel());
 
 		// Global debug handler on TUI (works regardless of focus)
 		this.ui.onDebug = () => {
@@ -3065,7 +3258,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
-		this.defaultEditor.onAction("app.subagents.focus", () => this.focusChildAgentInspector());
+		this.defaultEditor.onAction("app.subagents.focus", () => this.focusChildAgentSummary());
 		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
 		this.defaultEditor.onAction("app.message.dequeue", () => {
@@ -3109,19 +3302,92 @@ export class InteractiveMode {
 				return;
 			}
 
-			// Write to temp file
-			const tmpDir = os.tmpdir();
-			const ext = extensionForImageMimeType(image.mimeType) ?? "png";
-			const fileName = `pi-clipboard-${crypto.randomUUID()}.${ext}`;
-			const filePath = path.join(tmpDir, fileName);
-			fs.writeFileSync(filePath, Buffer.from(image.bytes));
+			// Resize down to the inline image size limit, mirroring the CLI @file
+			// path, so large screenshots don't exceed provider limits. Fall back to
+			// the raw bytes if resizing is unavailable.
+			const raw: ImageContent = {
+				type: "image",
+				data: Buffer.from(image.bytes).toString("base64"),
+				mimeType: image.mimeType,
+			};
+			const resized = await resizeImage(raw);
+			const attachment: ImageContent = resized
+				? { type: "image", data: resized.data, mimeType: resized.mimeType }
+				: raw;
 
-			// Insert file path directly
-			this.editor.insertTextAtCursor?.(filePath);
+			// Register the image and insert a visible marker. The image is attached to
+			// the prompt as multimodal content rather than written to disk, so a vision
+			// model receives it directly.
+			const markerId = this.nextImageMarkerId++;
+			this.rememberPastedImage(markerId, attachment);
+			this.editor.insertTextAtCursor?.(formatImageMarker(markerId));
 			this.ui.requestRender();
+
+			const model = this.getCurrentModel();
+			if (model && !model.input.includes("image")) {
+				this.showStatus("Current model does not support images; the attachment will be omitted.");
+			}
 		} catch {
 			// Silently ignore clipboard errors (may not have permission, etc.)
 		}
+	}
+
+	/**
+	 * Record a pasted image, evicting the oldest entries once the retained bytes
+	 * exceed {@link MAX_PASTED_IMAGE_BYTES} so a long session stays bounded. The
+	 * just-added image and any whose marker is still referenced (editor or queues)
+	 * are never evicted, so a live marker never loses its image.
+	 */
+	private rememberPastedImage(id: number, image: ImageContent): void {
+		this.pastedImages.set(id, image);
+		const keep = this.liveImageMarkerIds();
+		keep.add(id);
+		evictImagesToBudget(this.pastedImages, (img) => img.data.length, MAX_PASTED_IMAGE_BYTES, keep);
+	}
+
+	/**
+	 * Marker ids still reachable — current editor text, prompt history (recallable
+	 * with the up arrow), the compaction queue, and the connection queue. These are
+	 * never evicted so a recall or resend never finds a marker with no image.
+	 */
+	private liveImageMarkerIds(): Set<number> {
+		const ids = new Set<number>();
+		const add = (text: string) => {
+			for (const markerId of imageMarkerIds(text)) {
+				ids.add(markerId);
+			}
+		};
+		add(this.editor.getText());
+		for (const entry of this.editor.getHistory?.() ?? []) {
+			add(entry);
+		}
+		for (const msg of this.compactionQueuedMessages) {
+			add(msg.text);
+		}
+		for (const msg of [...this.connectionQueue.steering, ...this.connectionQueue.followUp]) {
+			add(msg);
+		}
+		return ids;
+	}
+
+	/**
+	 * The images whose `[image #N]` markers are present in `text`, or undefined if
+	 * none. Read-only: the registry is never cleared here, so deleting a marker
+	 * simply drops its image while restoring the marker (undo, history, retry,
+	 * dequeue) brings it back. Marker presence in the sent text is the single
+	 * source of truth.
+	 *
+	 * Resolved against the current model: if it has no image input, attachments
+	 * are dropped here (matching the paste-time hint) rather than sent and
+	 * downgraded downstream.
+	 */
+	private collectImagesFor(text: string): ImageContent[] | undefined {
+		const model = this.getCurrentModel();
+		if (model && !model.input.includes("image")) {
+			return undefined;
+		}
+		const images = collectMarkedImages(this.pastedImages, text);
+		return images.length > 0 ? images : undefined;
 	}
 
 	private setupEditorSubmitHandler(): void {
@@ -3151,6 +3417,11 @@ export class InteractiveMode {
 				await this.handleModelCommand(searchTerm);
 				return;
 			}
+			if (commandName === "effort") {
+				this.editor.setText("");
+				this.handleEffortCommand(commandArgs);
+				return;
+			}
 			if (commandName === "export") {
 				await this.handleExportCommand(canonicalCommandText);
 				this.editor.setText("");
@@ -3178,6 +3449,11 @@ export class InteractiveMode {
 			}
 			if (commandName === "session" && !commandArgs) {
 				await this.handleSessionCommand();
+				this.editor.setText("");
+				return;
+			}
+			if (commandName === "system-prompt" && !commandArgs) {
+				await this.handleSystemPromptCommand();
 				this.editor.setText("");
 				return;
 			}
@@ -3327,7 +3603,7 @@ export class InteractiveMode {
 				if (this.isExtensionCommand(text)) {
 					this.editor.addToHistory?.(text);
 					this.editor.setText("");
-					await this.agentConnection.prompt(text);
+					await this.agentConnection.prompt(text, { images: this.collectImagesFor(text) });
 				} else {
 					this.queueCompactionMessage(text, "steer");
 				}
@@ -3337,9 +3613,10 @@ export class InteractiveMode {
 			// If streaming, use prompt() with steer behavior
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
 			if (this.isAgentStreaming()) {
+				const images = this.collectImagesFor(text);
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.agentConnection.prompt(text, { streamingBehavior: "steer" });
+				await this.agentConnection.prompt(text, { streamingBehavior: "steer", images });
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				return;
@@ -3768,7 +4045,8 @@ export class InteractiveMode {
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
-				this.stopWorkingLoader();
+				// Keep the loader up if async subagents outlive the parent turn.
+				this.syncWorkingLoader();
 				if (this.streamingComponent) {
 					if (this.streamingMessage) {
 						this.streamingComponent.updateContent(this.streamingMessage);
@@ -3791,6 +4069,8 @@ export class InteractiveMode {
 					this.ui.terminal.setProgress(true);
 				}
 				// Keep editor active; submissions are queued during compaction.
+				// Fully stop the working loader (not just detach) so it isn't orphaned.
+				this.stopWorkingLoader();
 				this.statusContainer.clear();
 				const cancelHint = `(${keyText("app.clear")} to cancel)`;
 				const focus = event.customInstructions
@@ -3820,6 +4100,8 @@ export class InteractiveMode {
 					this.autoCompactionLoader = undefined;
 					this.statusContainer.clear();
 				}
+				// Restore the working loader if streaming/subagents still warrant it.
+				this.syncWorkingLoader();
 				if (event.aborted) {
 					if (event.reason === "manual") {
 						this.showError("Compaction cancelled");
@@ -3855,6 +4137,7 @@ export class InteractiveMode {
 
 			case "auto_retry_start": {
 				// Show retry indicator
+				this.stopWorkingLoader();
 				this.statusContainer.clear();
 				this.retryCountdown?.dispose();
 				const retryMessage = (seconds: number) =>
@@ -3891,6 +4174,8 @@ export class InteractiveMode {
 					this.retryLoader = undefined;
 					this.statusContainer.clear();
 				}
+				// Restore the working loader if streaming/subagents still warrant it.
+				this.syncWorkingLoader();
 				// Show error only on final failure (success shows normal response)
 				if (!event.success) {
 					this.showError(`Retry failed after ${event.attempt} attempts: ${event.finalError || "Unknown error"}`);
@@ -4085,18 +4370,17 @@ export class InteractiveMode {
 		}
 		this.childAgentNodes = this.buildChildAgentInspectorNodes();
 		this.childAgentSummary.setNodes(this.childAgentNodes);
-		this.childAgentInspector.setNodes(this.childAgentNodes);
+		this.subagentTree.setNodes(this.childAgentNodes);
+		this.updateWorkingPulse();
+		this.syncWorkingLoader();
+		this.updateWorkingLoaderMessage();
 		if (this.childAgentDetailNodeId) {
 			const detailNode = this.findChildAgentInspectorNode(this.childAgentDetailNodeId);
 			if (!detailNode && this.childAgentPanelMode === "detail") {
-				this.showChildAgentList();
+				this.closeChildAgentPanel();
 				return;
 			}
 			this.childAgentDetail.setNode(detailNode);
-		}
-		if (this.childAgentPanelMode === "list" && this.childAgentNodes.length === 0) {
-			this.closeChildAgentPanel();
-			return;
 		}
 		this.ui.requestRender();
 	}
@@ -4114,6 +4398,8 @@ export class InteractiveMode {
 		this.mainViewContainer.clear();
 		this.mainViewContainer.addChild(this.chatContainer);
 		this.mainViewContainer.addChild(this.pendingMessagesContainer);
+		// Subagent tree sits directly above the loader, mirroring Claude's layout.
+		this.mainViewContainer.addChild(this.subagentTree);
 		this.mainViewContainer.addChild(this.statusContainer);
 	}
 
@@ -4121,13 +4407,17 @@ export class InteractiveMode {
 		this.childAgentSnapshots.clear();
 		this.childAgentNodes = [];
 		this.childAgentSummary.setNodes([]);
+		this.subagentTree.setNodes([]);
 		this.childAgentSummary.setHidden(false);
-		this.childAgentInspector.setNodes([]);
 		this.childAgentDetail.setNode(undefined);
 		this.childAgentDetailNodeId = undefined;
 		if (this.childAgentPanelMode) {
 			this.closeChildAgentPanel();
 		}
+		// Clearing snapshots can drop the last running subagent; reconcile the
+		// pulse and loader so neither lingers when nothing is in flight.
+		this.updateWorkingPulse();
+		this.syncWorkingLoader();
 	}
 
 	private getChildAgentPanelRows(): number {
@@ -4149,6 +4439,28 @@ export class InteractiveMode {
 		return true;
 	}
 
+	// Left from the focused subagent list: exit to manage sessions if available,
+	// otherwise just drop focus back to the editor.
+	private handleSubagentSummaryExit(): void {
+		if (this.options.returnToAgentsView && !this.editor.getText().trim()) {
+			void this.returnToAgentsView();
+			return;
+		}
+		this.focusEditor();
+	}
+
+	// Chat actions stay live while the subagent list holds focus; the editor's
+	// own handlers are bypassed because input routes only to the focused list.
+	private handleSubagentSummaryChatAction(data: string): void {
+		if (this.keybindings.matches(data, "app.tools.expand")) {
+			this.toggleToolOutputExpansion();
+			return;
+		}
+		if (this.keybindings.matches(data, "app.thinking.toggle")) {
+			this.toggleThinkingBlockVisibility();
+		}
+	}
+
 	private getTrayOverrideLabel(): string | undefined {
 		if (this.isCtrlCExitHintVisible()) {
 			const clearKey = keyText("app.clear");
@@ -4162,9 +4474,20 @@ export class InteractiveMode {
 	}
 
 	private getTrayLocationLabel(): string | undefined {
-		const location = this.footerDataProvider.getGitBranch() ?? formatSplashCwd(this.getCurrentCwd());
 		const agentsHint = this.getAgentsViewTrayHint();
-		return [agentsHint, location].filter((label): label is string => label !== undefined).join("  ");
+		return [agentsHint, this.getModelTrayLabel()].filter((label): label is string => label !== undefined).join("  ");
+	}
+
+	private getModelTrayLabel(): string {
+		const model = this.getCurrentModel();
+		if (!model) {
+			return "—";
+		}
+		if (!model.reasoning) {
+			return model.name;
+		}
+		const level = this.connectionState?.thinkingLevel ?? "off";
+		return level === "off" ? model.name : `${model.name} • ${level}`;
 	}
 
 	private getAgentsViewTrayHint(): string | undefined {
@@ -4174,20 +4497,16 @@ export class InteractiveMode {
 		if (this.editor.getText().trim()) {
 			return undefined;
 		}
-		return keyHint("app.agents.back", "agents");
+		return keyHint("app.agents.back", "manage sessions");
 	}
 
 	private getTrayContextLabel(): string | undefined {
 		const goalLabel = this.getTrayGoalLabel();
 		const usage = this.getConnectionContextUsage();
-		if (!usage) {
-			return goalLabel;
-		}
-		if (usage.percent === null) {
-			return goalLabel;
-		}
-		const remainingPercent = Math.max(0, Math.min(100, 100 - usage.percent));
-		const contextLabel = remainingPercent <= 50 ? `${Math.round(remainingPercent)}% context left` : undefined;
+		const contextLabel =
+			usage && typeof usage.tokens === "number" && typeof usage.percent === "number"
+				? `${formatTokenCount(usage.tokens)} (${Math.round(usage.percent)}%)`
+				: undefined;
 		return [goalLabel, contextLabel].filter((label) => label !== undefined).join(" · ") || undefined;
 	}
 
@@ -4226,13 +4545,6 @@ export class InteractiveMode {
 		return `${hours}h ${remainingMinutes.toString().padStart(2, "0")}m`;
 	}
 
-	private openChildAgentList(): void {
-		if (this.childAgentNodes.length === 0) {
-			return;
-		}
-		this.showChildAgentList();
-	}
-
 	private async killChildAgent(nodeId: string): Promise<void> {
 		try {
 			const cancelled = await this.agentConnection.cancelRlmChild(nodeId);
@@ -4242,23 +4554,6 @@ export class InteractiveMode {
 		} catch (error) {
 			this.showError(`Failed to stop subagent: ${error instanceof Error ? error.message : String(error)}`);
 		}
-		this.ui.requestRender();
-	}
-
-	private showChildAgentList(): void {
-		if (this.childAgentNodes.length === 0) {
-			this.closeChildAgentPanel();
-			return;
-		}
-		this.childAgentPanelMode = "list";
-		this.childAgentDetailNodeId = undefined;
-		this.childAgentDetail.setNode(undefined);
-		this.childAgentSummary.setHidden(true);
-		this.childAgentInspector.setNodes(this.childAgentNodes);
-		this.editorContainer.clear();
-		this.mainViewContainer.clear();
-		this.mainViewContainer.addChild(this.childAgentInspector);
-		this.ui.setFocus(this.childAgentInspector);
 		this.ui.requestRender();
 	}
 
@@ -4272,6 +4567,7 @@ export class InteractiveMode {
 		this.childAgentDetail.setNode(node);
 		this.childAgentSummary.setHidden(true);
 		this.editorContainer.clear();
+		this.queuedMessagesContainer.clear();
 		this.mainViewContainer.clear();
 		this.mainViewContainer.addChild(this.childAgentDetail);
 		this.ui.setFocus(this.childAgentDetail);
@@ -4279,22 +4575,24 @@ export class InteractiveMode {
 		return true;
 	}
 
-	private focusChildAgentInspector(): void {
-		if (this.childAgentNodes.length === 0) {
-			return;
-		}
-		this.showChildAgentList();
-	}
-
-	private closeChildAgentPanel(): void {
+	private closeChildAgentPanel(options: { selectNodeId?: string } = {}): void {
 		this.childAgentPanelMode = undefined;
 		this.childAgentDetailNodeId = undefined;
 		this.childAgentDetail.setNode(undefined);
 		this.childAgentSummary.setHidden(false);
 		this.restoreMainAgentView();
+		// Re-render queued previews cleared on panel entry; the queue may still hold messages.
+		this.updatePendingMessagesDisplay();
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
-		this.ui.setFocus(this.editor);
+		// Returning from a subagent's detail keeps that subagent selected in the
+		// inline list; other closes drop back to the editor.
+		if (options.selectNodeId && this.childAgentSummary.hasNodes()) {
+			this.childAgentSummary.selectNode(options.selectNodeId);
+			this.ui.setFocus(this.childAgentSummary);
+		} else {
+			this.ui.setFocus(this.editor);
+		}
 		this.ui.requestRender();
 	}
 
@@ -4312,6 +4610,9 @@ export class InteractiveMode {
 			status: child.status,
 			durationMs: child.durationMs,
 			answerPreview: child.answerPreview,
+			toolUseCount: child.toolUseCount,
+			tokenCount: child.tokenCount,
+			recap: child.recap,
 			sessionDir: child.sessionDir,
 			transcript: child.transcript.map(
 				(line): ChildAgentTranscriptLine => ({
@@ -4875,7 +5176,7 @@ export class InteractiveMode {
 			if (this.isExtensionCommand(text)) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.agentConnection.prompt(text);
+				await this.agentConnection.prompt(text, { images: this.collectImagesFor(text) });
 			} else {
 				this.queueCompactionMessage(text, "followUp");
 			}
@@ -4885,9 +5186,10 @@ export class InteractiveMode {
 		// Alt+Enter queues a follow-up message (waits until agent finishes)
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.isAgentStreaming()) {
+			const images = this.collectImagesFor(text);
 			this.editor.addToHistory?.(text);
 			this.editor.setText("");
-			await this.agentConnection.prompt(text, { streamingBehavior: "followUp" });
+			await this.agentConnection.prompt(text, { streamingBehavior: "followUp", images });
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
 		}
@@ -4912,24 +5214,6 @@ export class InteractiveMode {
 		this.editor.borderColor = editorTheme.borderColor;
 		this.editor.backgroundColor = editorTheme.backgroundColor;
 		this.ui.requestRender();
-	}
-
-	private cycleThinkingLevel(): void {
-		void this.agentConnection
-			.cycleThinkingLevel()
-			.then((newLevel) => {
-				if (newLevel === undefined) {
-					this.showStatus("Current model does not support thinking");
-				} else {
-					this.patchConnectionState({ thinkingLevel: newLevel });
-					this.footer.invalidate();
-					this.updateEditorBorderColor();
-					this.showStatus(`Thinking level: ${newLevel}`);
-				}
-			})
-			.catch((error) => {
-				this.showError(error instanceof Error ? error.message : String(error));
-			});
 	}
 
 	private toggleToolOutputExpansion(): void {
@@ -5098,26 +5382,30 @@ export class InteractiveMode {
 	}
 
 	private updatePendingMessagesDisplay(): void {
+		// pendingMessagesContainer holds only in-flight bash output for the current
+		// turn, so it stays above the execution indicator. clear() detaches the
+		// components but they stay tracked in pendingBashComponents until flushed.
 		this.pendingMessagesContainer.clear();
-		// Keep in-flight bash output visible across queue refreshes; clear() detaches
-		// the components but they stay tracked in pendingBashComponents until flushed.
 		for (const component of this.pendingBashComponents) {
 			this.pendingMessagesContainer.addChild(component);
 		}
+		// Queued steering/follow-up previews are future turns, so they render in
+		// their own container below the execution indicator and recap.
+		this.queuedMessagesContainer.clear();
 		const { steering: steeringMessages, followUp: followUpMessages } = this.getAllQueuedMessages();
 		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
-			this.pendingMessagesContainer.addChild(new Spacer(1));
+			this.queuedMessagesContainer.addChild(new Spacer(1));
 			for (const message of steeringMessages) {
 				const text = theme.fg("dim", `Steering: ${message}`);
-				this.pendingMessagesContainer.addChild(new TruncatedText(text, 1, 0));
+				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			for (const message of followUpMessages) {
 				const text = theme.fg("dim", `Follow-up: ${message}`);
-				this.pendingMessagesContainer.addChild(new TruncatedText(text, 1, 0));
+				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			const dequeueHint = this.getAppKeyDisplay("app.message.dequeue");
 			const hintText = theme.fg("dim", `↳ ${dequeueHint} to edit all queued messages`);
-			this.pendingMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
+			this.queuedMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
 		}
 	}
 
@@ -5143,6 +5431,8 @@ export class InteractiveMode {
 		const queuedText = allQueued.join("\n\n");
 		const currentText = options?.currentText ?? this.editor.getText();
 		const combinedText = [queuedText, currentText].filter((t) => t.trim()).join("\n\n");
+		// The image registry persists, so the restored `[image #N]` markers resolve
+		// on resubmit without any re-registration here.
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
 		if (options?.abort) {
@@ -5193,11 +5483,11 @@ export class InteractiveMode {
 				// When retry is pending, queue messages for the retry turn
 				for (const message of queuedMessages) {
 					if (this.isExtensionCommand(message.text)) {
-						await this.agentConnection.prompt(message.text);
+						await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
 					} else if (message.mode === "followUp") {
-						await this.agentConnection.followUp(message.text);
+						await this.agentConnection.followUp(message.text, this.collectImagesFor(message.text));
 					} else {
-						await this.agentConnection.steer(message.text);
+						await this.agentConnection.steer(message.text, this.collectImagesFor(message.text));
 					}
 				}
 				this.updatePendingMessagesDisplay();
@@ -5209,7 +5499,7 @@ export class InteractiveMode {
 			if (firstPromptIndex === -1) {
 				// All extension commands - execute them all
 				for (const message of queuedMessages) {
-					await this.agentConnection.prompt(message.text);
+					await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
 				}
 				return;
 			}
@@ -5220,22 +5510,24 @@ export class InteractiveMode {
 			const rest = queuedMessages.slice(firstPromptIndex + 1);
 
 			for (const message of preCommands) {
-				await this.agentConnection.prompt(message.text);
+				await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
 			}
 
 			// Send first prompt (starts streaming)
-			const promptPromise = this.agentConnection.prompt(firstPrompt.text).catch((error) => {
-				void restoreQueue(error);
-			});
+			const promptPromise = this.agentConnection
+				.prompt(firstPrompt.text, { images: this.collectImagesFor(firstPrompt.text) })
+				.catch((error) => {
+					void restoreQueue(error);
+				});
 
 			// Queue remaining messages
 			for (const message of rest) {
 				if (this.isExtensionCommand(message.text)) {
-					await this.agentConnection.prompt(message.text);
+					await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
 				} else if (message.mode === "followUp") {
-					await this.agentConnection.followUp(message.text);
+					await this.agentConnection.followUp(message.text, this.collectImagesFor(message.text));
 				} else {
-					await this.agentConnection.steer(message.text);
+					await this.agentConnection.steer(message.text, this.collectImagesFor(message.text));
 				}
 			}
 			this.updatePendingMessagesDisplay();
@@ -5475,9 +5767,14 @@ export class InteractiveMode {
 	private async applySelectedModel(model: AgentConnectionModel): Promise<void> {
 		await this.agentConnection.setModel(model.provider, model.id);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
-		this.patchConnectionState({ model });
+		this.patchConnectionState({
+			model,
+			availableThinkingLevels: getSupportedThinkingLevels(model) as ThinkingLevel[],
+		});
 		this.footer.invalidate();
 		this.updateEditorBorderColor();
+		// Rebuild so the /effort argument hint reflects the new model's levels.
+		this.setupAutocompleteProvider();
 	}
 
 	private async getConnectionAvailableModels(): Promise<AgentConnectionModel[]> {
@@ -5546,6 +5843,59 @@ export class InteractiveMode {
 		}
 		this.anthropicSubscriptionWarningShown = true;
 		this.showWarning(warning);
+	}
+
+	private getAvailableThinkingLevels(): ThinkingLevel[] {
+		const levels = this.connectionState?.availableThinkingLevels ?? [];
+		const supportsThinking = levels.length > 0 && !(levels.length === 1 && levels[0] === "off");
+		return supportsThinking ? levels : [];
+	}
+
+	private getThinkingLevelCompletions(prefix: string): AutocompleteItem[] | null {
+		const levels = this.getAvailableThinkingLevels();
+		if (levels.length === 0) return null;
+		const current = this.connectionState?.thinkingLevel;
+		const term = prefix.trim().toLowerCase();
+		const matches = term ? levels.filter((level) => level.startsWith(term)) : levels;
+		if (matches.length === 0) return null;
+		return matches.map((level) => ({
+			value: level,
+			label: level,
+			description:
+				level === current ? `${THINKING_LEVEL_DESCRIPTIONS[level]} (current)` : THINKING_LEVEL_DESCRIPTIONS[level],
+		}));
+	}
+
+	private handleEffortCommand(arg: string): void {
+		const levels = this.getAvailableThinkingLevels();
+		if (levels.length === 0) {
+			this.showStatus("Current model does not support thinking");
+			return;
+		}
+		const requested = arg.trim().toLowerCase();
+		if (!requested) {
+			this.showStatus(`Thinking level: ${this.connectionState?.thinkingLevel} (type a level: ${levels.join(", ")})`);
+			return;
+		}
+		if (!levels.includes(requested as ThinkingLevel)) {
+			this.showError(`Unknown thinking level '${requested}'. Available: ${levels.join(", ")}`);
+			return;
+		}
+		this.applyThinkingLevel(requested as ThinkingLevel);
+	}
+
+	private applyThinkingLevel(level: ThinkingLevel): void {
+		void this.agentConnection
+			.setThinkingLevel(level)
+			.then(() => {
+				this.patchConnectionState({ thinkingLevel: level });
+				this.footer.invalidate();
+				this.updateEditorBorderColor();
+				this.showStatus(`Thinking level: ${level}`);
+			})
+			.catch((error) => {
+				this.showError(error instanceof Error ? error.message : String(error));
+			});
 	}
 
 	private showModelSelector(initialSearchInput?: string): void {
@@ -5656,6 +6006,7 @@ export class InteractiveMode {
 					},
 					subtitle: options?.subtitle,
 					getRows: () => this.ui.terminal.rows,
+					recentModels: this.settingsManager.getRecentModels(),
 				},
 			);
 			handle = this.showFullPaneOverlay(selector, 96);
@@ -6135,7 +6486,8 @@ export class InteractiveMode {
 	private async showOAuthSelector(mode: "login" | "logout"): Promise<void> {
 		if (mode === "login") {
 			const authResult = await this.showLoginProviderSelector();
-			if (authResult.status === "success") {
+			// Service credentials don't change the model, so skip the model picker.
+			if (authResult.status === "success" && authResult.kind !== "service") {
 				await this.promptForModelSelection();
 			}
 			return;
@@ -6508,6 +6860,17 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private async handleSystemPromptCommand(): Promise<void> {
+		const prompt = await this.agentConnection.getSystemPrompt();
+		const header = `${theme.bold("System Prompt")} ${theme.fg("dim", `(${prompt.length} chars)`)}`;
+
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(header, 1, 0));
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(prompt, 1, 0));
+		this.ui.requestRender();
+	}
+
 	private formatTraceUploadResult(result: AgentTraceUploadResult): string {
 		switch (result.status) {
 			case "uploaded":
@@ -6528,7 +6891,7 @@ export class InteractiveMode {
 				if (result.statusCode === 404) {
 					return "Trace upload endpoint was not found. The platform API may not be deployed yet, or PRIME_AGENT_TRACES_BASE_URL points at the wrong API.";
 				}
-				return `Trace upload failed: ${result.statusCode ? `HTTP ${result.statusCode}: ` : ""}${result.message}`;
+				return `Trace upload failed: ${result.statusCode ? `HTTP ${result.statusCode}: ` : ""}${result.message}. See ${getAgentTracesLogPath()} for details.`;
 		}
 	}
 
@@ -6558,6 +6921,7 @@ export class InteractiveMode {
 				"",
 				`${theme.fg("dim", "Status:")} ${this.settingsManager.getAgentTracesEnabled() ? "Enabled" : "Disabled"}`,
 				`${theme.fg("dim", "Credential:")} ${credential?.label ?? "Not configured"}`,
+				`${theme.fg("dim", "Endpoint:")} ${resolvePrimeAgentTracesBaseUrl()}`,
 				`${theme.fg("dim", "Session file:")} ${state.sessionFile ?? "In-memory"}`,
 				"",
 				theme.fg("dim", "Commands: /traces on, /traces off, /traces upload, /traces login"),
@@ -6830,7 +7194,6 @@ export class InteractiveMode {
 		const interrupt = this.getAppKeyDisplay("app.interrupt");
 		const exit = this.getAppKeyDisplay("app.exit");
 		const suspend = this.getAppKeyDisplay("app.suspend");
-		const cycleThinkingLevel = this.getAppKeyDisplay("app.thinking.cycle");
 		const selectModel = this.getAppKeyDisplay("app.model.select");
 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
 		const toggleThinking = this.getAppKeyDisplay("app.thinking.toggle");
@@ -6873,7 +7236,6 @@ export class InteractiveMode {
 | \`${clear}\` | Interrupt current operation (first) / exit (second) |
 ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${exit}\` | Exit (when editor is empty) |
 | \`${suspend}\` | Suspend to background |
-| \`${cycleThinkingLevel}\` | Cycle thinking level |
 | \`${selectModel}\` | Open model selector |
 | \`${expandTools}\` | Toggle tool output expansion |
 | \`${toggleThinking}\` | Toggle thinking block visibility |
@@ -7075,6 +7437,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 			this.ui.terminal.setProgress(false);
 		}
 		this.stopWorkingLoader();
+		this.stopWorkingPulse();
 		this.stopGoalTrayTimer();
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();

@@ -6,6 +6,7 @@ import {
 	findActiveDaemonSessionSummaryForInteractiveStartup,
 	findActiveDaemonSessionSummaryForSessionFile,
 	type InteractiveDaemonStartupDecision,
+	parseAgentsViewCommand,
 	parseDaemonRichTuiAttachShortcut,
 	resolveRuntimeSessionOptions,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
@@ -65,22 +66,44 @@ describe("interactive startup routing", () => {
 });
 
 describe("daemon-backed interactive session manager routing", () => {
-	test("opens agents view for default daemon-backed interactive startup", () => {
+	test("opens a new chat (not the agents view) for default daemon-backed interactive startup", () => {
 		expect(
 			shouldOpenAgentsViewForDaemonInteractive({
 				useDaemonInteractive: true,
 				needsOnboarding: false,
 			}),
+		).toBe(false);
+	});
+
+	test("opens the agents view when explicitly requested via the agents/manage command", () => {
+		expect(
+			shouldOpenAgentsViewForDaemonInteractive({
+				useDaemonInteractive: true,
+				needsOnboarding: false,
+				explicitAgentsView: true,
+			}),
 		).toBe(true);
 	});
 
 	const directAttachCases: Array<[string, Parameters<typeof shouldOpenAgentsViewForDaemonInteractive>[0]]> = [
-		["non-daemon interactive path", { useDaemonInteractive: false, needsOnboarding: false }],
-		["pending onboarding", { useDaemonInteractive: true, needsOnboarding: true }],
-		["explicit session", { useDaemonInteractive: true, needsOnboarding: false, session: "active-1" }],
-		["resume picker", { useDaemonInteractive: true, needsOnboarding: false, resume: true }],
-		["continue recent", { useDaemonInteractive: true, needsOnboarding: false, continue: true }],
-		["fork", { useDaemonInteractive: true, needsOnboarding: false, fork: "source-session-id" }],
+		[
+			"non-daemon interactive path",
+			{ useDaemonInteractive: false, needsOnboarding: false, explicitAgentsView: true },
+		],
+		["pending onboarding", { useDaemonInteractive: true, needsOnboarding: true, explicitAgentsView: true }],
+		[
+			"explicit session",
+			{ useDaemonInteractive: true, needsOnboarding: false, explicitAgentsView: true, session: "active-1" },
+		],
+		["resume picker", { useDaemonInteractive: true, needsOnboarding: false, explicitAgentsView: true, resume: true }],
+		[
+			"continue recent",
+			{ useDaemonInteractive: true, needsOnboarding: false, explicitAgentsView: true, continue: true },
+		],
+		[
+			"fork",
+			{ useDaemonInteractive: true, needsOnboarding: false, explicitAgentsView: true, fork: "source-session-id" },
+		],
 	];
 
 	test.each(directAttachCases)("does not open agents view for %s", (_label, decision) => {
@@ -167,6 +190,33 @@ describe("daemon-backed interactive session manager routing", () => {
 				"/tmp/project/../project/session.jsonl",
 			),
 		).toBe(activeSummary);
+	});
+});
+
+describe("agents view command parsing", () => {
+	test("routes the agents verb to the agents view and strips it", () => {
+		expect(parseAgentsViewCommand(["agents"])).toEqual({ explicitAgentsView: true, args: [] });
+	});
+
+	test("treats manage as an alias for agents", () => {
+		expect(parseAgentsViewCommand(["manage", "--verbose"])).toEqual({
+			explicitAgentsView: true,
+			args: ["--verbose"],
+		});
+	});
+
+	test("leaves a normal message untouched", () => {
+		expect(parseAgentsViewCommand(["fix the agents view"])).toEqual({
+			explicitAgentsView: false,
+			args: ["fix the agents view"],
+		});
+	});
+
+	test("only matches the verb as the first token", () => {
+		expect(parseAgentsViewCommand(["--verbose", "agents"])).toEqual({
+			explicitAgentsView: false,
+			args: ["--verbose", "agents"],
+		});
 	});
 });
 

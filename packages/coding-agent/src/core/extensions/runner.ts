@@ -64,7 +64,6 @@ const RESERVED_KEYBINDINGS_FOR_EXTENSION_CONFLICTS = [
 	"app.clear",
 	"app.exit",
 	"app.suspend",
-	"app.thinking.cycle",
 	"app.model.select",
 	"app.tools.expand",
 	"app.thinking.toggle",

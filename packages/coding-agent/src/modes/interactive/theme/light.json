@@ -60,6 +60,7 @@
 
 		"toolDiffAdded": "green",
 		"toolDiffRemoved": "red",
+		"toolDiffText": "#57606a",
 		"toolDiffContext": "mediumGray",
 
 		"syntaxComment": "#008000",

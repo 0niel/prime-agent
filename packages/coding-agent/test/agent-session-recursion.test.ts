@@ -20,6 +20,8 @@ import { ModelRegistry } from "../src/core/model-registry.js";
 import { createRlmRunHostHandler } from "../src/core/rlm-runtime.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
+import type { Skill } from "../src/core/skills.js";
+import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 import { MISSING_RIPGREP_MESSAGE } from "../src/utils/tools-manager.js";
 import { createTestResourceLoader } from "./utilities.js";
 
@@ -251,6 +253,8 @@ describe("AgentSession rlm recursion", () => {
 			status: string;
 			label: string;
 			answerPreview?: string;
+			tokenCount?: number;
+			toolUseCount?: number;
 			transcript: readonly { role: string; text: string }[];
 			structuredTranscript?: readonly { type: string; role: string; text: string }[];
 		}> = [];
@@ -274,6 +278,9 @@ describe("AgentSession rlm recursion", () => {
 		expect(childUpdates[0]?.label).toBe("summarize shard 1");
 		const doneUpdate = [...childUpdates].reverse().find((update) => update.status === "done");
 		expect(doneUpdate?.answerPreview).toBe("child answer: summarize shard 1");
+		// Context tokens from the child's own assistant usage (input 7 + output 3); no tools ran.
+		expect(doneUpdate?.tokenCount).toBe(10);
+		expect(doneUpdate?.toolUseCount).toBeUndefined();
 		expect(doneUpdate?.transcript).toContainEqual({ role: "user", text: "summarize shard 1" });
 		expect(doneUpdate?.transcript).toContainEqual({ role: "assistant", text: "child answer: summarize shard 1" });
 		expect(doneUpdate?.structuredTranscript).toEqual(
@@ -282,6 +289,47 @@ describe("AgentSession rlm recursion", () => {
 				expect.objectContaining({ type: "message", role: "assistant", text: "child answer: summarize shard 1" }),
 			]),
 		);
+	});
+
+	it("surfaces a child's recap on its snapshot once the summarizer sets it", async () => {
+		let releaseChild: () => void = () => {};
+		const release = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		let childStarted = false;
+		const root = createSession({
+			streamFn: (_model, context) => {
+				const text = userText(context);
+				const stream = createAssistantMessageEventStream();
+				childStarted = true;
+				void release.then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
+				});
+				return stream;
+			},
+		});
+
+		const recaps: Array<string | undefined> = [];
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update") {
+				recaps.push(event.child.recap);
+			}
+		});
+
+		const runPromise = root.runRlmChild("slow shard");
+		await waitFor(() => childStarted);
+		const rootRun = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0];
+		if (!rootRun?.session) {
+			throw new Error("Missing child session on root run");
+		}
+
+		// What the daemon summarizer does for subagents: stash the recap on the session,
+		// which emits recap_update and re-emits the parent's enriched child snapshot.
+		rootRun.session.setCurrentRecap("Summarizing the slow shard");
+		await waitFor(() => recaps.includes("Summarizing the slow shard"));
+
+		releaseChild();
+		await runPromise;
 	});
 
 	it("surfaces missing ripgrep as one child-agent error before model work starts", async () => {
@@ -857,22 +905,44 @@ describe("AgentSession RLM session dir", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
-	function createSession(sessionManager: SessionManager): AgentSession {
+	function createSession(
+		sessionManager: SessionManager,
+		agentDir?: string,
+		serperKey?: string,
+		loadWebsearchSkill = false,
+	): AgentSession {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		if (serperKey !== undefined) {
+			authStorage.set("serper", { type: "api_key", key: serperKey });
+		}
 		const agent = new Agent({
 			convertToLlm,
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: "", tools: [], thinkingLevel: "off" },
 			streamFn: () => streamAnswer("ignored"),
 		});
+		const skills: Skill[] = loadWebsearchSkill
+			? [
+					{
+						kind: "markdown",
+						name: "websearch",
+						description: "",
+						filePath: "/x/websearch/SKILL.md",
+						baseDir: "/x/websearch",
+						sourceInfo: createSyntheticSourceInfo("/x/websearch/SKILL.md", { source: "package" }),
+						disableModelInvocation: false,
+					},
+				]
+			: [];
 		session = new AgentSession({
 			agent,
 			sessionManager,
 			settingsManager: SettingsManager.create(tempDir, tempDir),
 			cwd: tempDir,
+			agentDir,
 			modelRegistry: ModelRegistry.create(authStorage, join(tempDir, "models.json")),
-			resourceLoader: createTestResourceLoader(),
+			resourceLoader: createTestResourceLoader({ skills }),
 		});
 		return session;
 	}
@@ -905,5 +975,71 @@ describe("AgentSession RLM session dir", () => {
 		expect(inspectable._rlmKernelEnv().RLM_SESSION_DIR).toBe(artifactDir);
 		expect(inspectable._rlmKernelEnv().RLM_HARNESS_STATE_DIR).toBe(join(artifactDir!, "harness"));
 		expect(inspectable._rlmKernelEnv().RLM_GLOBAL_HARNESS_STATE_DIR).toBeDefined();
+	});
+
+	it("exports the configured agentDir to the kernel so skills find auth.json", () => {
+		const agentDir = join(tempDir, "custom-agent-dir");
+		const root = createSession(SessionManager.inMemory(tempDir), agentDir);
+		const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
+		expect(env.PRIME_AGENT_CODING_AGENT_DIR).toBe(agentDir);
+	});
+
+	it("omits the agentDir env var when none is configured", () => {
+		const root = createSession(SessionManager.inMemory(tempDir));
+		const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
+		expect(env.PRIME_AGENT_CODING_AGENT_DIR).toBeUndefined();
+	});
+
+	it("exports agentDir but skips key injection when no websearch skill is loaded", () => {
+		const agentDir = join(tempDir, "custom-agent-dir");
+		const root = createSession(SessionManager.inMemory(tempDir), agentDir, "stored-key", false);
+		const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
+		expect(env.PRIME_AGENT_CODING_AGENT_DIR).toBe(agentDir);
+		expect(env.SERPER_API_KEY).toBeUndefined();
+	});
+
+	it("injects the key for a custom websearch skill even when bundled is off", () => {
+		const previous = process.env.SERPER_API_KEY;
+		delete process.env.SERPER_API_KEY;
+		try {
+			// loadWebsearchSkill=true models a --skill/project websearch; the bundled
+			// setting is irrelevant because the gate checks the loaded skill, not settings.
+			const root = createSession(SessionManager.inMemory(tempDir), undefined, "custom-key", true);
+			const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
+			expect(env.SERPER_API_KEY).toBe("custom-key");
+		} finally {
+			if (previous === undefined) delete process.env.SERPER_API_KEY;
+			else process.env.SERPER_API_KEY = previous;
+		}
+	});
+
+	it("injects a literal stored Serper key into the kernel", () => {
+		const previous = process.env.SERPER_API_KEY;
+		delete process.env.SERPER_API_KEY;
+		try {
+			const root = createSession(SessionManager.inMemory(tempDir), undefined, "literal-serper-key", true);
+			const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
+			expect(env.SERPER_API_KEY).toBe("literal-serper-key");
+		} finally {
+			if (previous === undefined) delete process.env.SERPER_API_KEY;
+			else process.env.SERPER_API_KEY = previous;
+		}
+	});
+
+	it("resolves an env-var-reference Serper key before injecting it", () => {
+		const previousKey = process.env.SERPER_API_KEY;
+		const previousRef = process.env.MY_SERPER_REF;
+		delete process.env.SERPER_API_KEY;
+		process.env.MY_SERPER_REF = "resolved-secret";
+		try {
+			const root = createSession(SessionManager.inMemory(tempDir), undefined, "MY_SERPER_REF", true);
+			const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
+			expect(env.SERPER_API_KEY).toBe("resolved-secret");
+		} finally {
+			if (previousKey === undefined) delete process.env.SERPER_API_KEY;
+			else process.env.SERPER_API_KEY = previousKey;
+			if (previousRef === undefined) delete process.env.MY_SERPER_REF;
+			else process.env.MY_SERPER_REF = previousRef;
+		}
 	});
 });

@@ -117,37 +117,40 @@ interface PrimeInferenceCatalogEntry {
 interface PrimeInferenceModelMetadata {
 	contextWindow: number;
 	maxTokens: number;
+	vision?: boolean;
 }
 
 // Prime Inference intentionally exposes a curated subset of the catalog in the
 // model picker. Add new model IDs here, then rerun this script to refresh
 // src/models.generated.ts.
 const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata> = {
-	"anthropic/claude-haiku-4.5": { contextWindow: 200000, maxTokens: 64000 },
-	"anthropic/claude-opus-4.6": { contextWindow: 1000000, maxTokens: 128000 },
-	"anthropic/claude-opus-4.7": { contextWindow: 1000000, maxTokens: 128000 },
-	"anthropic/claude-opus-4.8": { contextWindow: 1000000, maxTokens: 128000 },
-	"anthropic/claude-sonnet-4.5": { contextWindow: 200000, maxTokens: 64000 },
-	"anthropic/claude-sonnet-4.6": { contextWindow: 1000000, maxTokens: 128000 },
+	// prime-inference proxies Anthropic models through OpenRouter without the
+	// context-1m beta header, so the enforced window is the standard 200k, not 1M.
+	"anthropic/claude-haiku-4.5": { contextWindow: 200000, maxTokens: 64000, vision: true },
+	"anthropic/claude-opus-4.6": { contextWindow: 200000, maxTokens: 128000, vision: true },
+	"anthropic/claude-opus-4.7": { contextWindow: 200000, maxTokens: 128000, vision: true },
+	"anthropic/claude-opus-4.8": { contextWindow: 200000, maxTokens: 128000, vision: true },
+	"anthropic/claude-sonnet-4.5": { contextWindow: 200000, maxTokens: 64000, vision: true },
+	"anthropic/claude-sonnet-4.6": { contextWindow: 200000, maxTokens: 128000, vision: true },
 	"deepseek/deepseek-v3.2": { contextWindow: 128000, maxTokens: 8000 },
 	"deepseek/deepseek-v4-flash": { contextWindow: 1000000, maxTokens: 384000 },
 	"deepseek/deepseek-v4-pro": { contextWindow: 1000000, maxTokens: 384000 },
 	"minimax/minimax-m3": { contextWindow: 204800, maxTokens: 131072 },
-	"moonshotai/kimi-k2.7-code": { contextWindow: 262144, maxTokens: 16000 },
+	"moonshotai/kimi-k2.7-code": { contextWindow: 262144, maxTokens: 16000, vision: true },
 	"nvidia/nemotron-3-nano-30b-a3b": { contextWindow: 1000000, maxTokens: 228000 },
 	"nvidia/nemotron-3-super-120b-a12b": { contextWindow: 1000000, maxTokens: 4096 },
-	"openai/gpt-5.3-codex": { contextWindow: 400000, maxTokens: 128000 },
-	"openai/gpt-5.4": { contextWindow: 1050000, maxTokens: 128000 },
-	"openai/gpt-5.4-mini": { contextWindow: 400000, maxTokens: 128000 },
-	"openai/gpt-5.4-pro": { contextWindow: 1050000, maxTokens: 128000 },
-	"openai/gpt-5.5": { contextWindow: 1050000, maxTokens: 128000 },
+	"openai/gpt-5.3-codex": { contextWindow: 400000, maxTokens: 128000, vision: true },
+	"openai/gpt-5.4": { contextWindow: 1050000, maxTokens: 128000, vision: true },
+	"openai/gpt-5.4-mini": { contextWindow: 400000, maxTokens: 128000, vision: true },
+	"openai/gpt-5.4-pro": { contextWindow: 1050000, maxTokens: 128000, vision: true },
+	"openai/gpt-5.5": { contextWindow: 1050000, maxTokens: 128000, vision: true },
 	"prime-intellect/intellect-3": { contextWindow: 131072, maxTokens: 131072 },
 	"qwen/qwen3-235b-a22b-thinking-2507": { contextWindow: 262144, maxTokens: 4096 },
 	"qwen/qwen3-coder-next": { contextWindow: 262144, maxTokens: 65536 },
 	"qwen/qwen3-max": { contextWindow: 262144, maxTokens: 65536 },
-	"qwen/qwen3-vl-235b-a22b-thinking": { contextWindow: 262144, maxTokens: 32768 },
-	"x-ai/grok-4.20": { contextWindow: 2000000, maxTokens: 30000 },
-	"x-ai/grok-4.20-multi-agent": { contextWindow: 2000000, maxTokens: 30000 },
+	"qwen/qwen3-vl-235b-a22b-thinking": { contextWindow: 262144, maxTokens: 32768, vision: true },
+	"x-ai/grok-4.20": { contextWindow: 2000000, maxTokens: 30000, vision: true },
+	"x-ai/grok-4.20-multi-agent": { contextWindow: 2000000, maxTokens: 30000, vision: true },
 	"z-ai/glm-5": { contextWindow: 202752, maxTokens: 131072 },
 	"z-ai/glm-5.1": { contextWindow: 202800, maxTokens: 131072 },
 	"z-ai/glm-5.2": { contextWindow: 202800, maxTokens: 131072 },
@@ -209,8 +212,15 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (supportsOpenAiXhigh(model.id)) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
 	}
-	if (model.id.includes("opus-4-6") || model.id.includes("opus-4.6")) {
-		mergeThinkingLevelMap(model, { xhigh: "max" });
+	// Per-family effort support per the Anthropic effort docs. Opus 4.6 / Sonnet 4.6
+	// have no xhigh; Fable 5 / Mythos 5 / Mythos Preview think every turn (off: null).
+	if (
+		model.id.includes("opus-4-6") ||
+		model.id.includes("opus-4.6") ||
+		model.id.includes("sonnet-4-6") ||
+		model.id.includes("sonnet-4.6")
+	) {
+		mergeThinkingLevelMap(model, { max: "max" });
 	}
 	if (
 		model.id.includes("opus-4-7") ||
@@ -218,7 +228,13 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 		model.id.includes("opus-4-8") ||
 		model.id.includes("opus-4.8")
 	) {
-		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
+		mergeThinkingLevelMap(model, { xhigh: "xhigh", max: "max" });
+	}
+	if (model.id.includes("fable-5") || model.id.includes("mythos-5")) {
+		mergeThinkingLevelMap(model, { off: null, xhigh: "xhigh", max: "max" });
+	}
+	if (model.id.includes("mythos-preview")) {
+		mergeThinkingLevelMap(model, { off: null, max: "max" });
 	}
 	if (model.api === "openai-completions" && model.id.includes("deepseek-v4")) {
 		mergeThinkingLevelMap(model, DEEPSEEK_V4_THINKING_LEVEL_MAP);
@@ -415,12 +431,12 @@ function createPrimeInferenceModel(
 ): Model<"openai-completions"> {
 	return {
 		id: entry.id,
-		name: `${getPrimeInferenceDisplayName(entry.id)} (Prime Inference)`,
+		name: getPrimeInferenceDisplayName(entry.id),
 		api: "openai-completions",
 		provider: "prime-inference",
 		baseUrl: PRIME_INFERENCE_BASE_URL,
 		reasoning: isPrimeInferenceReasoningModel(entry.id, entry.reasoning),
-		input: ["text"],
+		input: metadata.vision ? ["text", "image"] : ["text"],
 		cost: {
 			input: entry.input,
 			output: entry.output,

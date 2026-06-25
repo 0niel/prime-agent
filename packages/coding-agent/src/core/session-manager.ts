@@ -1,12 +1,23 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, TextContent, Usage } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import {
+	appendFileSync,
+	createReadStream,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	statSync,
+	writeFileSync,
+} from "fs";
 import { readdir, readFile, stat } from "fs/promises";
 import { dirname, join, resolve } from "path";
+import { createInterface } from "readline";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import { readFirstLineSync } from "../utils/file-lines.js";
+import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -17,6 +28,9 @@ import {
 import { cloneUsage } from "./usage.js";
 
 export const CURRENT_SESSION_VERSION = 3;
+const SESSION_LIST_SEARCH_TEXT_MAX_CHARS = 64 * 1024;
+const SESSION_LIST_PARSE_MAX_LINE_CHARS = 1024 * 1024;
+const SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS = 256;
 
 export interface SessionHeader {
 	type: "session";
@@ -25,6 +39,7 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	git?: GitContext;
 }
 
 export interface NewSessionOptions {
@@ -123,7 +138,7 @@ export interface SessionInfoEntry extends SessionEntryBase {
 	name?: string;
 }
 
-export type SessionStateStatus = "active" | "sleep" | "crash" | "hidden";
+export type SessionStateStatus = "active" | "sleep" | "crash";
 
 export interface SessionState {
 	status: SessionStateStatus;
@@ -150,6 +165,12 @@ export interface AgentStatus {
 export interface AgentStatusEntry extends SessionEntryBase {
 	type: "agent_status";
 	status: AgentStatus;
+}
+
+/** Append-only repo-state entry; ignored by buildSessionContext and other readers. */
+export interface GitStateEntry extends SessionEntryBase {
+	type: "git_state";
+	git: GitContext;
 }
 
 /**
@@ -185,7 +206,8 @@ export type SessionEntry =
 	| LabelEntry
 	| SessionInfoEntry
 	| SessionStateEntry
-	| AgentStatusEntry;
+	| AgentStatusEntry
+	| GitStateEntry;
 
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
@@ -422,13 +444,14 @@ export function buildSessionContext(
 		return { messages: [], thinkingLevel: "off", model: null };
 	}
 
-	// Walk from leaf to root, collecting path
+	// push+reverse, not unshift-per-entry: unshift is O(n), making this O(n^2) on long sessions.
 	const path: SessionEntry[] = [];
 	let current: SessionEntry | undefined = leaf;
 	while (current) {
-		path.unshift(current);
+		path.push(current);
 		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
+	path.reverse();
 
 	// Extract settings and find compaction
 	let thinkingLevel = "off";
@@ -519,33 +542,71 @@ export function getDefaultSessionDir(_cwd: string, agentDir: string = getDefault
 	return sessionDir;
 }
 
-/** Exported for testing */
-export function loadEntriesFromFile(filePath: string): FileEntry[] {
-	if (!existsSync(filePath)) return [];
-
-	const content = readFileSync(filePath, "utf8");
+// Decode per line off a Buffer: toString("utf8") on a whole large file is far slower
+// (one giant UTF-16 string). Splitting on 0x0a is UTF-8-safe.
+function parseEntriesFromBuffer(buffer: Buffer): FileEntry[] {
 	const entries: FileEntry[] = [];
-	const lines = content.trim().split("\n");
-
-	for (const line of lines) {
-		if (!line.trim()) continue;
-		try {
-			const entry = JSON.parse(line) as FileEntry;
-			entries.push(entry);
-		} catch {
-			// Skip malformed lines
+	const len = buffer.length;
+	let start = 0;
+	while (start < len) {
+		let end = buffer.indexOf(0x0a, start);
+		if (end === -1) end = len;
+		if (end > start) {
+			try {
+				entries.push(JSON.parse(buffer.toString("utf8", start, end)) as FileEntry);
+			} catch {
+				// skip malformed/blank lines
+			}
 		}
+		start = end + 1;
 	}
+	return entries;
+}
 
-	// Validate session header
+function finalizeLoadedEntries(entries: FileEntry[]): FileEntry[] {
 	if (entries.length === 0) return entries;
 	const header = entries[0];
 	if (header.type !== "session" || typeof (header as any).id !== "string") {
 		return [];
 	}
-
 	applyChildUsageAttributions(entries);
 	return entries;
+}
+
+/** Exported for testing */
+export function loadEntriesFromFile(filePath: string): FileEntry[] {
+	if (!existsSync(filePath)) return [];
+	return finalizeLoadedEntries(parseEntriesFromBuffer(readFileSync(filePath)));
+}
+
+// Async loader for the daemon: reads off the event loop and yields while parsing so a
+// large load doesn't freeze other sessions. Identical output to loadEntriesFromFile.
+export async function loadEntriesFromFileAsync(filePath: string): Promise<FileEntry[]> {
+	if (!existsSync(filePath)) return [];
+	const buffer = await readFile(filePath);
+	const entries: FileEntry[] = [];
+	const len = buffer.length;
+	// yield by bytes, not entry count: parse cost scales with bytes (handles a few huge entries too)
+	const YIELD_BYTES = 4 * 1024 * 1024;
+	let start = 0;
+	let lastYield = 0;
+	while (start < len) {
+		let end = buffer.indexOf(0x0a, start);
+		if (end === -1) end = len;
+		if (end > start) {
+			try {
+				entries.push(JSON.parse(buffer.toString("utf8", start, end)) as FileEntry);
+			} catch {
+				// Skip malformed/blank lines (JSON.parse rejects whitespace-only slices)
+			}
+		}
+		start = end + 1;
+		if (start - lastYield >= YIELD_BYTES) {
+			lastYield = start;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+	}
+	return finalizeLoadedEntries(entries);
 }
 
 function readSessionHeader(filePath: string): Partial<SessionHeader> | undefined {
@@ -638,36 +699,51 @@ function extractTextContent(message: Message): string {
 		.join(" ");
 }
 
-function getLastActivityTime(entries: FileEntry[]): number | undefined {
-	let lastActivityTime: number | undefined;
+// Legacy "hidden" status is coerced to "sleep" for sessions written by older versions.
+function normalizeSessionStateStatus(value: unknown): SessionStateStatus | undefined {
+	if (value === "active" || value === "sleep" || value === "crash") {
+		return value;
+	}
+	if (value === "hidden") {
+		return "sleep";
+	}
+	return undefined;
+}
 
-	for (const entry of entries) {
-		if (entry.type !== "message") continue;
+function updateLastActivityTime(lastActivityTime: number | undefined, entry: FileEntry): number | undefined {
+	if (entry.type !== "message") {
+		return lastActivityTime;
+	}
 
-		const message = (entry as SessionMessageEntry).message;
-		if (!isMessageWithContent(message)) continue;
-		if (message.role !== "user" && message.role !== "assistant") continue;
+	const message = (entry as SessionMessageEntry).message;
+	if (!isMessageWithContent(message)) {
+		return lastActivityTime;
+	}
+	if (message.role !== "user" && message.role !== "assistant") {
+		return lastActivityTime;
+	}
 
-		const msgTimestamp = (message as { timestamp?: number }).timestamp;
-		if (typeof msgTimestamp === "number") {
-			lastActivityTime = Math.max(lastActivityTime ?? 0, msgTimestamp);
-			continue;
-		}
+	const msgTimestamp = (message as { timestamp?: number }).timestamp;
+	if (typeof msgTimestamp === "number") {
+		return Math.max(lastActivityTime ?? 0, msgTimestamp);
+	}
 
-		const entryTimestamp = (entry as SessionEntryBase).timestamp;
-		if (typeof entryTimestamp === "string") {
-			const t = new Date(entryTimestamp).getTime();
-			if (!Number.isNaN(t)) {
-				lastActivityTime = Math.max(lastActivityTime ?? 0, t);
-			}
+	const entryTimestamp = (entry as SessionEntryBase).timestamp;
+	if (typeof entryTimestamp === "string") {
+		const t = new Date(entryTimestamp).getTime();
+		if (!Number.isNaN(t)) {
+			return Math.max(lastActivityTime ?? 0, t);
 		}
 	}
 
 	return lastActivityTime;
 }
 
-function getSessionModifiedDate(entries: FileEntry[], header: SessionHeader, statsMtime: Date): Date {
-	const lastActivityTime = getLastActivityTime(entries);
+function getSessionModifiedDateFromLastActivity(
+	lastActivityTime: number | undefined,
+	header: SessionHeader,
+	statsMtime: Date,
+): Date {
 	if (typeof lastActivityTime === "number" && lastActivityTime > 0) {
 		return new Date(lastActivityTime);
 	}
@@ -676,37 +752,153 @@ function getSessionModifiedDate(entries: FileEntry[], header: SessionHeader, sta
 	return !Number.isNaN(headerTime) ? new Date(headerTime) : statsMtime;
 }
 
-function isSessionStateStatus(value: unknown): value is SessionStateStatus {
-	return value === "active" || value === "sleep" || value === "crash" || value === "hidden";
+function appendCappedSearchText(current: string, text: string): string {
+	if (!text || current.length >= SESSION_LIST_SEARCH_TEXT_MAX_CHARS) {
+		return current;
+	}
+	const next = current ? ` ${text}` : text;
+	return current + next.slice(0, SESSION_LIST_SEARCH_TEXT_MAX_CHARS - current.length);
 }
 
-async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
-	try {
-		const content = await readFile(filePath, "utf8");
-		const entries: FileEntry[] = [];
-		const lines = content.trim().split("\n");
+function looksLikeMessageEntry(line: string): boolean {
+	return line.includes('"type":"message"') || line.includes('"type": "message"');
+}
 
-		for (const line of lines) {
-			if (!line.trim()) continue;
-			try {
-				entries.push(JSON.parse(line) as FileEntry);
-			} catch {
-				// Skip malformed lines
-			}
+function extractJsonStringPropertyPrefix(
+	text: string,
+	propertyName: string,
+	maxChars: number,
+	startIndex = 0,
+): string | undefined {
+	const propertyIndex = text.indexOf(`"${propertyName}"`, startIndex);
+	if (propertyIndex < 0) {
+		return undefined;
+	}
+	let index = propertyIndex + propertyName.length + 2;
+	while (index < text.length && /\s/.test(text[index] ?? "")) index++;
+	if (text[index] !== ":") {
+		return undefined;
+	}
+	index++;
+	while (index < text.length && /\s/.test(text[index] ?? "")) index++;
+	if (text[index] !== '"') {
+		return undefined;
+	}
+	index++;
+
+	let result = "";
+	let escaped = false;
+	for (; index < text.length && result.length < maxChars; index++) {
+		const char = text[index];
+		if (escaped) {
+			result += char;
+			escaped = false;
+			continue;
 		}
+		if (char === "\\") {
+			escaped = true;
+			continue;
+		}
+		if (char === '"') {
+			break;
+		}
+		result += char;
+	}
+	return result;
+}
 
-		if (entries.length === 0) return null;
-		const header = entries[0];
-		if (header.type !== "session") return null;
+function extractOversizedMessageSummary(line: string): {
+	role?: string;
+	timestamp?: number;
+	textPreview?: string;
+} {
+	const timestampText = extractJsonStringPropertyPrefix(line, "timestamp", 64);
+	const timestamp = timestampText ? new Date(timestampText).getTime() : NaN;
+	const messageIndex = line.indexOf('"message"');
+	const role =
+		messageIndex >= 0
+			? extractJsonStringPropertyPrefix(line, "role", 64, messageIndex)
+			: extractJsonStringPropertyPrefix(line, "role", 64);
+	let textPreview: string | undefined;
+	if (messageIndex >= 0) {
+		textPreview =
+			extractJsonStringPropertyPrefix(line, "content", SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS, messageIndex) ??
+			extractJsonStringPropertyPrefix(line, "text", SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS, messageIndex);
+	}
+	return {
+		role,
+		...(Number.isNaN(timestamp) ? {} : { timestamp }),
+		...(textPreview ? { textPreview } : {}),
+	};
+}
 
-		const stats = await stat(filePath);
+interface SessionInfoCacheEntry {
+	size: number;
+	mtimeMs: number;
+	info: SessionInfo | null;
+}
+
+// Session files are append-only, so an unchanged (size, mtimeMs) means identical
+// content: cache list metadata and rescan only files that changed.
+const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
+
+async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
+	let stats: Awaited<ReturnType<typeof stat>>;
+	try {
+		stats = await stat(filePath);
+	} catch {
+		return null;
+	}
+	const cached = sessionInfoCache.get(filePath);
+	if (cached && cached.size === stats.size && cached.mtimeMs === stats.mtimeMs) {
+		return cached.info;
+	}
+	const info = await scanSessionInfo(filePath, stats);
+	sessionInfoCache.set(filePath, { size: stats.size, mtimeMs: stats.mtimeMs, info });
+	return info;
+}
+
+async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeof stat>>): Promise<SessionInfo | null> {
+	try {
+		const stream = createReadStream(filePath, { encoding: "utf8" });
+		const lines = createInterface({ input: stream, crlfDelay: Infinity });
+		let header: SessionHeader | undefined;
 		let messageCount = 0;
 		let firstMessage = "";
-		const allMessages: string[] = [];
+		let allMessagesText = "";
 		let name: string | undefined;
 		let state: SessionState | undefined;
+		let lastActivityTime: number | undefined;
 
-		for (const entry of entries) {
+		for await (const line of lines) {
+			if (!line.trim()) continue;
+
+			// Large tool-result entries can be many MB. They do not carry the
+			// session-list metadata we need, and parsing them during every refresh
+			// can exhaust the daemon heap.
+			if (line.length > SESSION_LIST_PARSE_MAX_LINE_CHARS) {
+				if (looksLikeMessageEntry(line)) {
+					messageCount++;
+					const summary = extractOversizedMessageSummary(line);
+					if (typeof summary.timestamp === "number" && (summary.role === "user" || summary.role === "assistant")) {
+						lastActivityTime = Math.max(lastActivityTime ?? 0, summary.timestamp);
+					}
+					if (summary.role === "user" && !firstMessage) {
+						firstMessage = summary.textPreview || "(large message)";
+					}
+				}
+				continue;
+			}
+
+			const trimmed = line.trim();
+			let entry: FileEntry;
+			try {
+				entry = JSON.parse(trimmed) as FileEntry;
+			} catch {
+				// Skip malformed lines
+				continue;
+			}
+
 			// Extract session name (use latest, including explicit clears)
 			if (entry.type === "session_info") {
 				const infoEntry = entry as SessionInfoEntry;
@@ -714,10 +906,20 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 			}
 			if (entry.type === "session_state") {
 				const stateEntry = entry as SessionStateEntry;
-				if (isSessionStateStatus(stateEntry.state?.status)) {
-					state = { status: stateEntry.state.status };
+				const status = normalizeSessionStateStatus(stateEntry.state?.status);
+				if (status) {
+					state = { status };
 				}
 			}
+
+			if (!header) {
+				if (entry.type !== "session") {
+					return null;
+				}
+				header = entry as SessionHeader;
+			}
+
+			lastActivityTime = updateLastActivityTime(lastActivityTime, entry);
 
 			if (entry.type !== "message") continue;
 			messageCount++;
@@ -729,29 +931,29 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 			const textContent = extractTextContent(message);
 			if (!textContent) continue;
 
-			allMessages.push(textContent);
+			allMessagesText = appendCappedSearchText(allMessagesText, textContent);
 			if (!firstMessage && message.role === "user") {
 				firstMessage = textContent;
 			}
 		}
 
-		const cwd = typeof (header as SessionHeader).cwd === "string" ? (header as SessionHeader).cwd : "";
-		const parentSessionPath = (header as SessionHeader).parentSession;
-
-		const modified = getSessionModifiedDate(entries, header as SessionHeader, stats.mtime);
+		if (!header) return null;
+		const cwd = typeof header.cwd === "string" ? header.cwd : "";
+		const parentSessionPath = header.parentSession;
+		const modified = getSessionModifiedDateFromLastActivity(lastActivityTime, header, stats.mtime);
 
 		return {
 			path: filePath,
-			id: (header as SessionHeader).id,
+			id: header.id,
 			cwd,
 			name,
 			state,
 			parentSessionPath,
-			created: new Date((header as SessionHeader).timestamp),
+			created: new Date(header.timestamp),
 			modified,
 			messageCount,
 			firstMessage: firstMessage || "(no messages)",
-			allMessagesText: allMessages.join(" "),
+			allMessagesText,
 		};
 	} catch {
 		return null;
@@ -776,16 +978,19 @@ async function listSessionsFromDir(
 		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
 		const total = progressTotal ?? files.length;
 
+		// drop cache entries for deleted files so it stays bounded
+		const present = new Set(files);
+		for (const key of sessionInfoCache.keys()) {
+			if (dirname(key) === dir && !present.has(key)) {
+				sessionInfoCache.delete(key);
+			}
+		}
+
 		let loaded = 0;
-		const results = await Promise.all(
-			files.map(async (file) => {
-				const info = await buildSessionInfo(file);
-				loaded++;
-				onProgress?.(progressOffset + loaded, total);
-				return info;
-			}),
-		);
-		for (const info of results) {
+		for (const file of files) {
+			const info = await buildSessionInfo(file);
+			loaded++;
+			onProgress?.(progressOffset + loaded, total);
 			if (info) {
 				sessions.push(info);
 			}
@@ -822,7 +1027,13 @@ export class SessionManager {
 	private leafId: string | null = null;
 	private persistListeners = new Set<SessionPersistListener>();
 
-	private constructor(cwd: string, sessionDir: string, sessionFile: string | undefined, persist: boolean) {
+	private constructor(
+		cwd: string,
+		sessionDir: string,
+		sessionFile: string | undefined,
+		persist: boolean,
+		preloadedEntries?: FileEntry[],
+	) {
 		this.cwd = cwd;
 		this.sessionDir = sessionDir;
 		this.persist = persist;
@@ -831,17 +1042,21 @@ export class SessionManager {
 		}
 
 		if (sessionFile) {
-			this.setSessionFile(sessionFile);
+			this.setSessionFile(sessionFile, preloadedEntries);
 		} else {
 			this.newSession();
 		}
 	}
 
-	/** Switch to a different session file (used for resume and branching) */
-	setSessionFile(sessionFile: string): void {
+	/**
+	 * Switch to a different session file (used for resume and branching).
+	 * preloadedEntries must be loadEntriesFromFile(sessionFile) for the same path; it
+	 * lets the async daemon path skip the synchronous re-read.
+	 */
+	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
 		this.sessionFile = resolve(sessionFile);
 		if (existsSync(this.sessionFile)) {
-			this.fileEntries = loadEntriesFromFile(this.sessionFile);
+			this.fileEntries = preloadedEntries ?? loadEntriesFromFile(this.sessionFile);
 
 			// If file was empty or corrupted (no valid header), truncate and start fresh
 			// to avoid appending messages without a session header (which breaks the session)
@@ -888,6 +1103,7 @@ export class SessionManager {
 
 		this.sessionId = sessionId;
 		const timestamp = new Date().toISOString();
+		const git = this.persist ? (captureGitContext(this.cwd) ?? undefined) : undefined;
 		const header: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
@@ -895,6 +1111,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.cwd,
 			parentSession: options?.parentSession,
+			git,
 		};
 		this.fileEntries = [header];
 		this.byId.clear();
@@ -1161,7 +1378,10 @@ export class SessionManager {
 		for (let i = entries.length - 1; i >= 0; i--) {
 			const entry = entries[i];
 			if (entry.type === "session_state") {
-				return { status: entry.state.status };
+				const status = normalizeSessionStateStatus(entry.state.status);
+				if (status) {
+					return { status };
+				}
 			}
 		}
 		return undefined;
@@ -1182,6 +1402,39 @@ export class SessionManager {
 		};
 		this._appendEntry(entry);
 		return entry.id;
+	}
+
+	/** Append a git state entry as child of current leaf, then advance leaf. Returns entry id. */
+	appendGitState(git: GitContext): string {
+		const entry: GitStateEntry = {
+			type: "git_state",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			git,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	recordGitStateIfChanged(): string | undefined {
+		if (!this.persist) return undefined;
+		const git = captureGitContext(this.cwd);
+		if (!git) return undefined;
+		const last = this.getActiveGitContext();
+		if (last && gitContextsEqual(last, git)) return undefined;
+		return this.appendGitState(git);
+	}
+
+	/** Active-branch git: nearest git_state from leaf to root, else the header snapshot. */
+	private getActiveGitContext(): GitContext | undefined {
+		let current = this.leafId ? this.byId.get(this.leafId) : undefined;
+		while (current) {
+			if (current.type === "git_state") return current.git;
+			current = current.parentId ? this.byId.get(current.parentId) : undefined;
+		}
+		const header = this.fileEntries[0];
+		return header?.type === "session" ? header.git : undefined;
 	}
 
 	/** Get the latest agent status from the most recent agent_status entry, if any. */
@@ -1296,13 +1549,15 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
+		// push+reverse, not unshift-per-entry: unshift is O(n), which makes this O(n^2) on long sessions.
 		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.leafId;
 		let current = startId ? this.byId.get(startId) : undefined;
 		while (current) {
-			path.unshift(current);
+			path.push(current);
 			current = current.parentId ? this.byId.get(current.parentId) : undefined;
 		}
+		path.reverse();
 		return path;
 	}
 
@@ -1460,6 +1715,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.cwd,
 			parentSession: this.persist ? previousSessionFile : undefined,
+			git: this.persist ? (captureGitContext(this.cwd) ?? undefined) : undefined,
 		};
 
 		// Collect labels for entries in the path
@@ -1577,6 +1833,25 @@ export class SessionManager {
 	}
 
 	/**
+	 * Non-blocking open() for the daemon: parses off the event loop so a large load
+	 * doesn't freeze other sessions. Falls back to open() for any non-happy path so
+	 * behavior is identical to it.
+	 */
+	static async openAsync(path: string, sessionDir?: string, cwdOverride?: string): Promise<SessionManager> {
+		if (!existsSync(path)) {
+			return SessionManager.open(path, sessionDir, cwdOverride);
+		}
+		const entries = await loadEntriesFromFileAsync(path);
+		// empty/corrupt: defer to open() (finalizeLoadedEntries guarantees entries[0] is a valid header otherwise)
+		if (entries.length === 0) {
+			return SessionManager.open(path, sessionDir, cwdOverride);
+		}
+		const cwd = cwdOverride ?? (entries[0] as SessionHeader).cwd;
+		const dir = sessionDir ?? resolve(path, "..");
+		return new SessionManager(cwd ?? process.cwd(), dir, path, true, entries);
+	}
+
+	/**
 	 * Continue the most recent session, or create new if none.
 	 * @param cwd Working directory
 	 * @param sessionDir Optional session directory. If omitted, uses the configured session root.
@@ -1633,14 +1908,26 @@ export class SessionManager {
 			timestamp,
 			cwd: targetCwd,
 			parentSession: sourcePath,
+			git: captureGitContext(targetCwd) ?? undefined,
 		};
 		appendFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`);
 
-		// Copy all non-header entries from source
+		// Drop the source's git_state entries (re-linking children): they describe the source repo,
+		// so the fork would otherwise report the source's git instead of its own target context.
+		const droppedParent = new Map<string, string | null>();
 		for (const entry of sourceEntries) {
-			if (entry.type !== "session") {
-				appendFileSync(newSessionFile, `${JSON.stringify(entry)}\n`);
-			}
+			if (entry.type === "git_state") droppedParent.set(entry.id, entry.parentId);
+		}
+		const liveParent = (parentId: string | null): string | null => {
+			let pid = parentId;
+			while (pid !== null && droppedParent.has(pid)) pid = droppedParent.get(pid) ?? null;
+			return pid;
+		};
+		for (const entry of sourceEntries) {
+			if (entry.type === "session" || entry.type === "git_state") continue;
+			const parentId = liveParent(entry.parentId);
+			const out = parentId === entry.parentId ? entry : { ...entry, parentId };
+			appendFileSync(newSessionFile, `${JSON.stringify(out)}\n`);
 		}
 
 		return new SessionManager(targetCwd, dir, newSessionFile, true);

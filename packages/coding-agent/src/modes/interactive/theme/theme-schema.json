@@ -72,6 +72,7 @@
 				"mdListBullet",
 				"toolDiffAdded",
 				"toolDiffRemoved",
+				"toolDiffText",
 				"toolDiffContext",
 				"syntaxComment",
 				"syntaxKeyword",
@@ -238,6 +239,10 @@
 				"toolDiffRemoved": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Removed lines in tool diffs"
+				},
+				"toolDiffText": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Diff line content on colored add/remove blocks"
 				},
 				"toolDiffContext": {
 					"$ref": "#/$defs/colorValue",

@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -66,7 +66,7 @@ describe("SessionManager session state", () => {
 		}
 	});
 
-	it("persists hidden lifecycle state for sessions hidden from agents view", async () => {
+	it("coerces legacy hidden lifecycle state to sleep on read", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "session-state-hidden-"));
 		try {
 			const cwd = join(tempDir, "project");
@@ -74,19 +74,41 @@ describe("SessionManager session state", () => {
 			const session = SessionManager.create(cwd, sessionDir);
 
 			session.appendMessage(userMsg("hide me"));
-			session.appendSessionState({ status: "hidden" });
-
+			session.appendSessionState({ status: "sleep" });
 			const sessionFile = session.getSessionFile();
 			expect(sessionFile).toBeDefined();
-			expect(existsSync(sessionFile!)).toBe(true);
-			expect(session.getSessionState()).toEqual({ status: "hidden" });
+			appendFileSync(sessionFile!, `${JSON.stringify({ type: "session_state", state: { status: "hidden" } })}\n`);
+
+			expect(SessionManager.open(sessionFile!, sessionDir).getSessionState()).toEqual({ status: "sleep" });
 
 			const sessions = await SessionManager.list(cwd, sessionDir);
 			expect(sessions).toHaveLength(1);
 			expect(sessions[0]).toMatchObject({
 				id: session.getSessionId(),
-				state: { status: "hidden" },
+				state: { status: "sleep" },
 			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("falls back to the last valid status when the newest entry is unrecognized", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "session-state-bad-"));
+		try {
+			const cwd = join(tempDir, "project");
+			const sessionDir = join(tempDir, "sessions");
+			const session = SessionManager.create(cwd, sessionDir);
+
+			session.appendMessage(userMsg("hi"));
+			session.appendSessionState({ status: "active" });
+			const sessionFile = session.getSessionFile();
+			expect(sessionFile).toBeDefined();
+			appendFileSync(sessionFile!, `${JSON.stringify({ type: "session_state", state: { status: "bogus" } })}\n`);
+
+			expect(SessionManager.open(sessionFile!, sessionDir).getSessionState()).toEqual({ status: "active" });
+
+			const sessions = await SessionManager.list(cwd, sessionDir);
+			expect(sessions[0]).toMatchObject({ id: session.getSessionId(), state: { status: "active" } });
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

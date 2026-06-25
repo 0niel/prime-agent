@@ -77,6 +77,7 @@ const ThemeJsonSchema = Type.Object({
 		// Tool Diffs (3 colors)
 		toolDiffAdded: ColorValueSchema,
 		toolDiffRemoved: ColorValueSchema,
+		toolDiffText: ColorValueSchema,
 		toolDiffContext: ColorValueSchema,
 		// Syntax Highlighting (9 colors)
 		syntaxComment: ColorValueSchema,
@@ -152,6 +153,7 @@ export type ThemeColor =
 	| "mdListBullet"
 	| "toolDiffAdded"
 	| "toolDiffRemoved"
+	| "toolDiffText"
 	| "toolDiffContext"
 	| "syntaxComment"
 	| "syntaxKeyword"
@@ -479,7 +481,9 @@ export class Theme {
 		return this.mode;
 	}
 
-	getThinkingBorderColor(level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh"): (str: string) => string {
+	getThinkingBorderColor(
+		level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max",
+	): (str: string) => string {
 		// Map thinking levels to dedicated theme colors
 		switch (level) {
 			case "off":
@@ -493,6 +497,9 @@ export class Theme {
 			case "high":
 				return (str: string) => this.fg("thinkingHigh", str);
 			case "xhigh":
+				return (str: string) => this.fg("thinkingXhigh", str);
+			case "max":
+				// Reuse the xhigh color: a dedicated max color would touch every theme preset.
 				return (str: string) => this.fg("thinkingXhigh", str);
 			default:
 				return (str: string) => this.fg("thinkingOff", str);
@@ -1258,6 +1265,7 @@ export function getEditorTheme(): EditorTheme {
 		borderColor: (text: string) => theme.fg("borderMuted", text),
 		backgroundColor: theme.getEditorBackgroundColor(),
 		selectList: getSelectListTheme(),
+		commandColor: (text: string) => theme.fg("accent", text),
 	};
 }
 

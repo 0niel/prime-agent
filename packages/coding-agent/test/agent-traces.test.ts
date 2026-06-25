@@ -1,12 +1,12 @@
-import { Buffer } from "node:buffer";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ENV_AGENT_DIR, getAgentTracesLogPath } from "../src/config.js";
 import { flushAgentTraceUpload, installAgentTraceUpload, uploadAgentTraceFile } from "../src/core/agent-traces.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
-import { PRIME_AGENT_TRACES_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
+import { PRIME_AGENT_TRACES_PROVIDER_ID, PRIME_INFERENCE_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 
@@ -72,9 +72,12 @@ describe("agent trace upload", () => {
 	let originalPrimeApiKey: string | undefined;
 	let originalTraceBaseUrl: string | undefined;
 	let originalPrimeBaseUrl: string | undefined;
+	let originalAgentDir: string | undefined;
 
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "agent-traces-test-"));
+		originalAgentDir = process.env[ENV_AGENT_DIR];
+		process.env[ENV_AGENT_DIR] = tempDir;
 		originalTraceApiKey = process.env.PRIME_AGENT_TRACES_API_KEY;
 		originalPrimeApiKey = process.env.PRIME_API_KEY;
 		originalTraceBaseUrl = process.env.PRIME_AGENT_TRACES_BASE_URL;
@@ -87,6 +90,11 @@ describe("agent trace upload", () => {
 
 	afterEach(() => {
 		vi.useRealTimers();
+		if (originalAgentDir === undefined) {
+			delete process.env[ENV_AGENT_DIR];
+		} else {
+			process.env[ENV_AGENT_DIR] = originalAgentDir;
+		}
 		if (originalTraceApiKey === undefined) {
 			delete process.env.PRIME_AGENT_TRACES_API_KEY;
 		} else {
@@ -217,7 +225,7 @@ describe("agent trace upload", () => {
 		expect(headers.get("x-parent-session")).toBe("parent-session");
 		expect(headers.get("x-cwd")).toBe(cwd);
 		expect(headers.get("x-agent-version")).toBeTruthy();
-		expect(headers.get("content-length")).toBe(String(Buffer.byteLength(call.init.body as string, "utf8")));
+		expect(headers.get("content-length")).toBeNull();
 	});
 
 	it("uses the production trace API unless a trace-specific base URL is configured", async () => {
@@ -370,5 +378,179 @@ describe("agent trace upload", () => {
 		setTimeoutSpy.mockClear();
 		sessionManager.appendMessage(createUserMessage("next"));
 		expect(Number(setTimeoutSpy.mock.calls.at(-1)?.[1])).toBe(60_000);
+	});
+
+	it("surfaces the underlying fetch cause and logs the failure", async () => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "failing-session");
+		const sessionFile = session.getSessionFile();
+
+		const failingFetch: typeof fetch = async () => {
+			const error = new TypeError("fetch failed");
+			(error as { cause?: unknown }).cause = { code: "ENOTFOUND", message: "getaddrinfo ENOTFOUND host" };
+			throw error;
+		};
+
+		const result = await uploadAgentTraceFile({
+			sessionFile,
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: failingFetch,
+			reloadConfig: false,
+		});
+
+		expect(result.status).toBe("failed");
+		if (result.status === "failed") {
+			expect(result.message).toBe("fetch failed (ENOTFOUND)");
+		}
+
+		const logContents = readFileSync(getAgentTracesLogPath(), "utf8");
+		expect(logContents).toContain("upload failed");
+		expect(logContents).toContain("fetch failed (ENOTFOUND)");
+		expect(logContents).toContain(sessionFile ?? "");
+	});
+
+	it("retries once on a transient connection failure, then succeeds", async () => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "retry-session");
+		const calls: FetchCall[] = [];
+		let attempts = 0;
+		const flakyFetch: typeof fetch = async (input, init) => {
+			attempts += 1;
+			if (attempts === 1) {
+				const error = new TypeError("fetch failed");
+				(error as { cause?: unknown }).cause = { code: "ECONNRESET" };
+				throw error;
+			}
+			return createFetchRecorder(calls)(input, init);
+		};
+
+		const result = await uploadAgentTraceFile({
+			sessionFile: session.getSessionFile(),
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: flakyFetch,
+			reloadConfig: false,
+		});
+
+		expect(attempts).toBe(2);
+		expect(result.status).toBe("uploaded");
+		expect(calls).toHaveLength(1);
+	});
+
+	it("surfaces the cancellation reason when aborted during the retry backoff", async () => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "aborted-retry-session");
+		const controller = new AbortController();
+		const abortReason = new Error("upload cancelled");
+		let attempts = 0;
+		const flakyFetch: typeof fetch = async () => {
+			attempts += 1;
+			controller.abort(abortReason);
+			const error = new TypeError("fetch failed");
+			(error as { cause?: unknown }).cause = { code: "ECONNRESET" };
+			throw error;
+		};
+
+		const result = await uploadAgentTraceFile({
+			sessionFile: session.getSessionFile(),
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: flakyFetch,
+			signal: controller.signal,
+			reloadConfig: false,
+		});
+
+		expect(attempts).toBe(1);
+		expect(result.status).toBe("failed");
+		if (result.status === "failed") {
+			expect(result.message).toBe("upload cancelled");
+		}
+	});
+
+	it("does not retry a permanent DNS failure", async () => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "dns-failure-session");
+		let attempts = 0;
+		const dnsFailFetch: typeof fetch = async () => {
+			attempts += 1;
+			const error = new TypeError("fetch failed");
+			(error as { cause?: unknown }).cause = { code: "ENOTFOUND", message: "getaddrinfo ENOTFOUND host" };
+			throw error;
+		};
+
+		const result = await uploadAgentTraceFile({
+			sessionFile: session.getSessionFile(),
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: dnsFailFetch,
+			reloadConfig: false,
+		});
+
+		expect(attempts).toBe(1);
+		expect(result.status).toBe("failed");
+		if (result.status === "failed") {
+			expect(result.message).toBe("fetch failed (ENOTFOUND)");
+		}
+	});
+
+	it("does not retry on an HTTP error response", async () => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "http-error-session");
+		let attempts = 0;
+		const erroringFetch: typeof fetch = async () => {
+			attempts += 1;
+			return new Response(JSON.stringify({ detail: "bad request" }), {
+				status: 400,
+				headers: { "content-type": "application/json" },
+			});
+		};
+
+		const result = await uploadAgentTraceFile({
+			sessionFile: session.getSessionFile(),
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			fetchFn: erroringFetch,
+			reloadConfig: false,
+		});
+
+		expect(attempts).toBe(1);
+		expect(result.status).toBe("failed");
+		if (result.status === "failed") {
+			expect(result.statusCode).toBe(400);
+		}
+	});
+
+	it("prefers the prime-inference credential over the prime-cli config key", async () => {
+		const session = writeSession(tempDir, join(tempDir, "sessions"), "credential-order-session");
+		const calls: FetchCall[] = [];
+		const configPath = join(tempDir, "prime-config.json");
+		writeFileSync(configPath, JSON.stringify({ api_key: "cli-fallback-key" }));
+
+		const result = await uploadAgentTraceFile({
+			sessionFile: session.getSessionFile(),
+			authStorage: AuthStorage.inMemory({
+				[PRIME_INFERENCE_PROVIDER_ID]: { type: "api_key", key: "inference-key" },
+			}),
+			settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+			baseUrl: "https://api.example.test",
+			configPath,
+			fetchFn: createFetchRecorder(calls),
+			reloadConfig: false,
+		});
+
+		expect(result.status).toBe("uploaded");
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.init.headers).toMatchObject({ Authorization: "Bearer inference-key" });
 	});
 });

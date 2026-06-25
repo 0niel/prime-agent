@@ -65,12 +65,7 @@ import {
 	isDaemonDialogExtensionUiRequest,
 	success,
 } from "./daemon-protocol.js";
-import {
-	buildRlmChildSnapshots,
-	buildSessionList,
-	isSummaryCurrent,
-	summaryForActiveSession,
-} from "./daemon-session-list.js";
+import { buildRlmChildSnapshots, buildSessionList, summaryForActiveSession } from "./daemon-session-list.js";
 import { DaemonSessionSummarizer } from "./daemon-session-summarizer.js";
 import {
 	cleanupDaemonSocketPath,
@@ -150,6 +145,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_session_tree",
 	"get_user_messages_for_forking",
 	"get_last_assistant_text",
+	"get_system_prompt",
 	"get_tool_definition",
 	"set_session_entry_label",
 	"extension_ui_response",
@@ -184,13 +180,19 @@ export class AgentDaemon {
 	private readonly cronStore: AgentCronJobStore;
 	private readonly cronScheduler: AgentCronScheduler;
 	private readonly summarizer = new DaemonSessionSummarizer(
-		() => [...this.sessions.values()].filter((state) => state.runtime.metadata.kind !== "subagent"),
-		(state) =>
+		() => [...this.sessions.values()],
+		(state) => {
+			// Subagents share their recap with the parent so it shows in the parent's
+			// subagent tree; their own session channel usually has no attached client.
+			if (state.runtime.metadata.kind === "subagent") {
+				state.runtime.session.setCurrentRecap(state.summaryState?.summary);
+			}
 			this.broadcastToSession(state, {
 				type: "session_status",
 				activeSessionId: state.activeSessionId,
 				recap: state.summaryState?.summary,
-			}),
+			});
+		},
 	);
 
 	constructor(
@@ -352,9 +354,9 @@ export class AgentDaemon {
 			} catch {
 				// Marking is best-effort; the session still works unrestored.
 			}
-			// Restore the last persisted status so it shows before the first sweep.
-			this.summarizer.seed(state);
 		}
+		// Restore the last persisted status so it shows before the first sweep.
+		this.summarizer.seed(state);
 		return state;
 	}
 
@@ -374,7 +376,7 @@ export class AgentDaemon {
 			? await resolveDaemonSessionPath(command.sessionPath, cwd, config.sessionDir)
 			: undefined;
 		const sessionManager = sessionPath
-			? SessionManager.open(sessionPath, config.sessionDir, cwdOverride)
+			? await SessionManager.openAsync(sessionPath, config.sessionDir, cwdOverride)
 			: command.continueRecent
 				? SessionManager.continueRecent(cwd, config.sessionDir)
 				: SessionManager.create(cwd, config.sessionDir);
@@ -388,11 +390,6 @@ export class AgentDaemon {
 				}
 				this.rebindCronJobsToState(existing);
 				return existing;
-			}
-			if ((sessionPath || command.continueRecent) && sessionManager.getSessionState()?.status === "hidden") {
-				// Resuming a hidden session is the intentional opt-in that makes it
-				// visible in session lists again.
-				sessionManager.appendSessionState({ status: "sleep" });
 			}
 			let stateRef: ActiveSessionState | undefined;
 			const runtime = await createAgentSessionRuntime(this.options.createRuntime, {
@@ -1385,6 +1382,13 @@ export class AgentDaemon {
 				});
 			}
 
+			case "get_system_prompt": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "get_system_prompt", {
+					systemPrompt: state.runtime.session.systemPrompt,
+				});
+			}
+
 			case "get_tool_definition": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "get_tool_definition", {
@@ -1412,6 +1416,7 @@ export class AgentDaemon {
 			}
 
 			case "shutdown":
+				this.log(`shutdown command received over socket; ${this.sessions.size} active session(s) will be closed`);
 				setImmediate(() => {
 					void this.shutdown(0);
 				});
@@ -1453,7 +1458,6 @@ export class AgentDaemon {
 
 	private createSessionSnapshot(state: ActiveSessionState): DaemonSessionSnapshot {
 		const metadata = state.runtime.metadata;
-		const sessionManager = state.runtime.session.sessionManager;
 		const parent =
 			metadata.parentActiveSessionId || metadata.parentSessionId || metadata.rlmParentNodeId || metadata.rlmChildId
 				? {
@@ -1465,9 +1469,8 @@ export class AgentDaemon {
 				: undefined;
 		const children = buildRlmChildSnapshots(state.activeSessionId, [...this.sessions.values()]);
 		const connectionState = createAgentConnectionState(state.runtime, state.activeSessionId);
-		// Prefer the live in-memory recap over the persisted baseline, but only
-		// while it matches the current turn so we don't seed a stale recap.
-		if (state.summaryState?.summary && isSummaryCurrent(state)) {
+		// Prefer the live in-memory recap over the persisted baseline.
+		if (state.summaryState?.summary) {
 			connectionState.recap = state.summaryState.summary;
 		}
 		return {
@@ -1475,12 +1478,9 @@ export class AgentDaemon {
 			summary: summaryForActiveSession(state),
 			state: connectionState,
 			messages: state.runtime.session.messages,
-			sessionContext: sessionManager.buildSessionContext(),
-			// The session tree is omitted on purpose: it carries every entry's full
-			// body (tens of MB on long sessions) but is only needed when the user
-			// opens the tree/branch selector. Clients fetch it lazily via
-			// get_session_tree (see DaemonAgentConnection.getSessionTree), keeping
-			// attach cheap regardless of transcript length.
+			// Omit duplicate heavy payloads from attach. The client can derive render
+			// context from messages + state, and fetch the full session tree lazily
+			// when the tree/branch selector opens.
 			lastEventSequence: state.lastEventSequence,
 			...(parent ? { parent } : {}),
 			...(children.length > 0 ? { children } : {}),
@@ -1536,8 +1536,11 @@ export class AgentDaemon {
 		// agent_status to a session being torn down.
 		this.summarizer.forget(state.activeSessionId);
 		const cascadeError = await this.closeChildSessions(state, reason);
+		// A killed session with no messages (abandoned new-chat) is discarded
+		// outright instead of persisting a sleep state that clutters the list.
+		const isEmptyKilledSession = reason === "killed" && state.runtime.session.messages.length === 0;
 		let persistError: unknown;
-		if (reason !== "shutdown") {
+		if (reason !== "shutdown" && !isEmptyKilledSession) {
 			try {
 				state.runtime.session.sessionManager.appendSessionState({ status: "sleep" });
 			} catch (error) {
@@ -1556,6 +1559,12 @@ export class AgentDaemon {
 		}
 		state.clients.clear();
 		this.sessions.delete(state.activeSessionId);
+		if (isEmptyKilledSession) {
+			const sessionFile = state.runtime.session.sessionFile;
+			if (sessionFile) {
+				await deleteSessionFile(sessionFile).catch(() => undefined);
+			}
+		}
 		if (persistError && reason !== "shutdown" && reason !== "completed") {
 			throw persistError;
 		}
@@ -1619,6 +1628,7 @@ export class AgentDaemon {
 		}
 		for (const signal of signals) {
 			const handler = () => {
+				this.log(`received ${signal}; shutting down`);
 				killTrackedDetachedChildren();
 				void this.shutdown(signal === "SIGINT" ? 130 : signal === "SIGHUP" ? 129 : 143);
 			};
@@ -1635,6 +1645,7 @@ export class AgentDaemon {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
+		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
 
 		this.summarizer.stop();
 		for (const cleanup of this.signalCleanupHandlers) {

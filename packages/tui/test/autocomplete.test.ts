@@ -74,6 +74,24 @@ describe("CombinedAutocompleteProvider", () => {
 				items: [{ value: "new", label: "new", description: "Start a new session" }],
 			});
 		});
+
+		it("surfaces takesArgument on free-form-argument commands and omits it otherwise", async () => {
+			const provider = new CombinedAutocompleteProvider(
+				[
+					{ name: "goal", description: "Set a goal", takesArgument: true },
+					{ name: "new", description: "Start a new session" },
+				],
+				"/tmp",
+			);
+
+			const goal = await getSuggestions(provider, ["/goal"], 0, 5);
+			assert.deepStrictEqual(goal?.items, [
+				{ value: "goal", label: "goal", description: "Set a goal", takesArgument: true },
+			]);
+
+			const fresh = await getSuggestions(provider, ["/new"], 0, 4);
+			assert.deepStrictEqual(fresh?.items, [{ value: "new", label: "new", description: "Start a new session" }]);
+		});
 	});
 
 	describe("extractPathPrefix", () => {

@@ -36,6 +36,7 @@ import {
 	stopThemeWatcher,
 	theme,
 } from "../interactive/theme/theme.js";
+import { WORKING_ICON_INTERVAL_MS, workingIconFrame } from "../interactive/theme/working-icon.js";
 import {
 	formatPackageUpdateNotice,
 	formatTmuxWarningNotice,
@@ -61,7 +62,6 @@ import {
 } from "./agents-view-state.js";
 
 const POLL_INTERVAL_MS = 1000;
-const WORKING_ICON_INTERVAL_MS = 250;
 const EXIT_HINT_DURATION_MS = 2000;
 const DELETE_CONFIRM_DURATION_MS = 2000;
 const STATUS_MESSAGE_DURATION_MS = 4500;
@@ -70,7 +70,6 @@ const DEFAULT_PROMPT_PLACEHOLDER = "Describe a task for a new session";
 const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "Write a reply to this agent";
 const COMPLETED_ROW_ICON = "✓";
 const NEEDS_INPUT_ROW_ICON = "●";
-const WORKING_ICON_FRAMES = ["◇", "◈", "◆", "◈"] as const;
 const SELECTED_ROW_MARKER = "\0agents-view-selected-row\0";
 // Tags a spawn-code line so finalize can wrap the whole row in a panel
 // background, visually segmenting the program from the agent rows.
@@ -126,6 +125,16 @@ export function createAgentsViewResumeConfig(config: AgentSessionRuntimeConfig):
 	const resumeConfig: AgentSessionRuntimeConfig = { ...config };
 	delete resumeConfig.cwd;
 	return resumeConfig;
+}
+
+export function createAgentsViewListCommand(
+	config: AgentSessionRuntimeConfig,
+): Extract<DaemonCommand, { type: "list" }> {
+	const command: Extract<DaemonCommand, { type: "list" }> = { type: "list" };
+	if (config.sessionDir) {
+		command.sessionDir = config.sessionDir;
+	}
+	return command;
 }
 
 // Status messages render in a single-row hint slot below the editor; embedded
@@ -290,6 +299,7 @@ class AgentsViewMode implements Component, Focusable {
 	private replyHeaderTime = "";
 	private pendingDeleteAgent: PendingDeleteAgent | undefined;
 	private pendingKillSubagent: PendingKillSubagent | undefined;
+	private renameTarget: { activeSessionId: string; identity: string } | undefined;
 	private readonly inactiveAgentIdentities = new Set<string>();
 	private statusMessage: string | undefined;
 	private statusMessageTone: "muted" | "error" | "warning" = "muted";
@@ -388,8 +398,22 @@ class AgentsViewMode implements Component, Focusable {
 
 	handleInput(data: string): void {
 		this.clearStickyStatusMessage();
+		// While renaming, the editor holds the proposed name: Escape cancels, Enter
+		// (via onSubmit) confirms, everything else edits the text.
+		if (this.renameTarget) {
+			if (this.keybindings.matches(data, "tui.select.cancel")) {
+				this.exitRenameMode();
+				return;
+			}
+			this.editor.handleInput(data);
+			return;
+		}
 		if (this.keybindings.matches(data, "app.clear")) {
 			this.handleCtrlC();
+			return;
+		}
+		if (this.keybindings.matches(data, "app.agents.rename") && this.editor.getText().length === 0) {
+			this.enterRenameMode();
 			return;
 		}
 		if (this.keybindings.matches(data, "app.agents.delete") && this.editor.getText().length === 0) {
@@ -405,6 +429,17 @@ class AgentsViewMode implements Component, Focusable {
 		}
 		if (this.keybindings.matches(data, "app.agents.program") && this.editor.getText().length === 0) {
 			this.cycleProgramForSelected();
+			return;
+		}
+		// Mirror the confirm shortcut: open the selected agent only when the prompt
+		// is empty and we are not composing a reply (empty confirm is a no-op then).
+		// Match the confirm path's trim() so a whitespace-only prompt still opens.
+		if (
+			this.keybindings.matches(data, "app.agents.open") &&
+			this.editor.getText().trim().length === 0 &&
+			!this.replyActiveSessionId
+		) {
+			this.openSelected();
 			return;
 		}
 		if (this.editor.getText().length === 0 && this.handleListNavigation(data)) {
@@ -712,6 +747,10 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	private async submit(value: string): Promise<void> {
+		if (this.renameTarget) {
+			await this.confirmRename(value);
+			return;
+		}
 		const text = value.trim();
 		if (!text) {
 			if (this.replyActiveSessionId) {
@@ -849,7 +888,11 @@ class AgentsViewMode implements Component, Focusable {
 					resolve();
 				},
 				initialSearchInput,
-				{ availableModels, getRows: () => this.ui.terminal.rows },
+				{
+					availableModels,
+					getRows: () => this.ui.terminal.rows,
+					recentModels: this.options.uiServices.settingsManager.getRecentModels(),
+				},
 			);
 			handle = showFullPaneOverlay(this.ui, selector, 96);
 		});
@@ -1067,6 +1110,62 @@ class AgentsViewMode implements Component, Focusable {
 		this.ui.requestRender();
 	}
 
+	private enterRenameMode(): void {
+		const row = this.rows[this.selectedIndex];
+		// Only top-level agents carry a renameable session; subagents do not.
+		if (row?.kind !== "agent" || !row.selectable) {
+			return;
+		}
+		const activeSessionId = row.summary.activeSessionId;
+		if (!activeSessionId) {
+			this.setStatusMessage("This agent has no active session to rename");
+			return;
+		}
+		this.setReplyTarget(undefined);
+		this.pendingDeleteAgent = undefined;
+		this.pendingKillSubagent = undefined;
+		this.renameTarget = { activeSessionId, identity: getSummaryIdentity(row.summary) };
+		this.editor.setPlaceholder("Name this agent session");
+		this.editor.setText(row.summary.sessionName ?? "");
+		this.ui.requestRender();
+	}
+
+	private exitRenameMode(): void {
+		this.renameTarget = undefined;
+		this.editor.setText("");
+		this.editor.setPlaceholder(DEFAULT_PROMPT_PLACEHOLDER);
+		this.ui.requestRender();
+	}
+
+	private async confirmRename(value: string): Promise<void> {
+		const target = this.renameTarget;
+		if (!target) {
+			return;
+		}
+		const name = value.trim();
+		if (!name) {
+			this.exitRenameMode();
+			return;
+		}
+		this.exitRenameMode();
+		this.setStatusMessage("Renaming agent...");
+		try {
+			await this.requireClient().request({
+				type: "rename",
+				activeSessionId: target.activeSessionId,
+				name,
+			});
+			this.setStatusMessage(`Renamed to ${name}`, { render: false });
+			await this.refreshSessions();
+		} catch (error) {
+			this.setStatusMessage(
+				isUnknownDaemonCommandError(error, "rename")
+					? "Failed to rename: the daemon is running an older build; restart the daemon and try again"
+					: formatError("Failed to rename agent", error),
+			);
+		}
+	}
+
 	private getReplyHeaderTime(activeSessionId: string): string {
 		const summary = this.findSummaryByActiveSessionId(activeSessionId);
 		return formatAgentsViewRelativeTime(summary?.modified ?? summary?.created);
@@ -1077,6 +1176,9 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	private renderReplyHeaderLine(): string | undefined {
+		if (this.renameTarget) {
+			return theme.fg("warning", "Rename agent session");
+		}
 		if (!this.replyActiveSessionId) {
 			return undefined;
 		}
@@ -1358,11 +1460,7 @@ class AgentsViewMode implements Component, Focusable {
 	private async refreshSessions(): Promise<void> {
 		const client = this.requireClient();
 		try {
-			const command: Extract<DaemonCommand, { type: "list" }> = { type: "list", all: true };
-			if (this.options.config.sessionDir) {
-				command.sessionDir = this.options.config.sessionDir;
-			}
-			const response = await client.request(command);
+			const response = await client.request(createAgentsViewListCommand(this.options.config));
 			const data = requireDaemonData(response);
 			const sessions = expectSessionList(data);
 			const visibleSessions = sessions.filter((summary) =>
@@ -1638,6 +1736,10 @@ class AgentsViewMode implements Component, Focusable {
 		if (this.statusMessage) {
 			return truncateToWidth(theme.fg(this.statusMessageTone, this.statusMessage), width);
 		}
+		if (this.renameTarget) {
+			const hint = `${keyText("tui.select.confirm")} save   ${keyText("tui.select.cancel")} cancel`;
+			return truncateToWidth(theme.fg("muted", hint), width);
+		}
 		// Replying is reserved for top-level agents; subagents can be stopped.
 		const selectedRow = this.rows[this.selectedIndex];
 		const selectedAgent = selectedRow?.kind === "agent";
@@ -1645,8 +1747,10 @@ class AgentsViewMode implements Component, Focusable {
 		const hints = [
 			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
 			`${keyText("tui.select.confirm")} open/send`,
+			`${keyText("app.agents.open")} open`,
 			"/ commands",
 			selectedAgent ? `${keyText("app.agents.reply")} reply` : undefined,
+			selectedAgent ? `${keyText("app.agents.rename")} rename` : undefined,
 			selectedAgent ? `${keyText("app.agents.delete")} stop/deactivate` : undefined,
 			selectedSubagent ? `${keyText("app.agents.delete")} stop` : undefined,
 			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,
@@ -1672,7 +1776,7 @@ class AgentsViewMode implements Component, Focusable {
 	private getRowIcon(section: AgentsViewSection): string {
 		switch (section) {
 			case "working":
-				return WORKING_ICON_FRAMES[this.workingIconFrame % WORKING_ICON_FRAMES.length] ?? WORKING_ICON_FRAMES[0];
+				return workingIconFrame(this.workingIconFrame);
 			case "needs-input":
 				return NEEDS_INPUT_ROW_ICON;
 			case "completed":

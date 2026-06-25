@@ -52,7 +52,7 @@ export interface Args {
 	diagnostics: Array<{ type: "warning" | "error"; message: string }>;
 }
 
-const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const REMOVED_BUILTIN_TOOL_NAMES = new Set(["read", "write", "grep", "find", "ls"]);
 const BUILTIN_TOOL_NAMES = ["ipython", "bash", "edit"];
 
@@ -217,9 +217,10 @@ export function printHelp(extensionFlags?: ExtensionFlag[]): void {
 	console.log(`${chalk.bold(APP_NAME)} - AI coding assistant with an ipython tool
 
 ${chalk.bold("Usage:")}
-  ${APP_NAME} [options] [@files...] [messages...]
+  ${APP_NAME} [options] [@files...] [messages...]   Open a new chat (press left to reach the agents view)
 
 ${chalk.bold("Commands:")}
+  ${APP_NAME} agents                    Open the agents view (alias: manage)
   ${APP_NAME} install <source> [-l]     Install extension source and add to settings
   ${APP_NAME} remove <source> [-l]      Remove extension source from settings
   ${APP_NAME} uninstall <source> [-l]   Alias for remove
@@ -251,7 +252,7 @@ ${chalk.bold("Options:")}
   --no-builtin-tools, -nbt       Disable built-in tools by default but keep extension/custom tools enabled
   --tools, -t <tools>            Comma-separated allowlist of tool names to enable
                                  Applies to built-in, extension, and custom tools
-  --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh
+  --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
   --extension, -e <path>         Load an extension file (can be used multiple times)
   --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
   --skill <path>                 Load a skill file or directory (can be used multiple times)
@@ -364,6 +365,9 @@ ${chalk.bold("Environment Variables:")}
   PI_OFFLINE                       - Disable startup network operations when set to 1/true/yes
   PRIME_AGENT_DOWNLOAD_BASE_URL    - Override the Prime Agent release manifest and tarball base URL
   PI_SHARE_VIEWER_URL              - Base URL for /share command (default: https://pi.dev/session/)
+  SERPER_API_KEY                   - Overrides the stored Serper key for the websearch skill (use /login to store one)
+  PRIME_AGENT_WEBSEARCH_TIMEOUT    - websearch HTTP timeout in seconds (default: 45)
+  PRIME_AGENT_WEBSEARCH_NUM_RESULTS - websearch organic results to return (default: 5)
 
 ${chalk.bold("Built-in Tool Names:")}
   ipython - Execute Python in a persistent IPython kernel

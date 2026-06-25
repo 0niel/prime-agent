@@ -7,7 +7,7 @@ import type {
 	RawMessageStreamEvent,
 } from "@anthropic-ai/sdk/resources/messages.js";
 import { getEnvApiKey } from "../env-api-keys.js";
-import { calculateCost } from "../models.js";
+import { calculateCost, clampThinkingLevel } from "../models.js";
 import type {
 	AnthropicMessagesCompat,
 	Api,
@@ -184,10 +184,10 @@ export interface AnthropicOptions extends StreamOptions {
 	 */
 	thinkingBudgetTokens?: number;
 	/**
-	 * Effort level for adaptive thinking (Opus 4.6+ and Sonnet 4.6).
+	 * Effort level for adaptive thinking (Opus 4.6+, Sonnet 4.6, Fable/Mythos).
 	 * Controls how much thinking Claude allocates:
-	 * - "max": Always thinks with no constraints (Opus 4.6 only)
-	 * - "xhigh": Highest reasoning level (Opus 4.7)
+	 * - "max": Always thinks with no constraints (Opus 4.6+, Sonnet 4.6, Fable/Mythos)
+	 * - "xhigh": Highest reasoning level (Opus 4.7+, Fable 5, Mythos 5)
 	 * - "high": Always thinks, deep reasoning (default)
 	 * - "medium": Moderate thinking, may skip for simple queries
 	 * - "low": Minimal thinking, skips for simple tasks
@@ -679,29 +679,39 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
  * Check if a model supports adaptive thinking (Opus 4.6+, Sonnet 4.6)
  */
 function supportsAdaptiveThinking(modelId: string): boolean {
-	// Adaptive-thinking model IDs (with or without date suffix)
+	// Adaptive-thinking model IDs (with or without date suffix).
 	return (
 		modelId.includes("opus-4-6") ||
 		modelId.includes("opus-4.6") ||
 		modelId.includes("opus-4-7") ||
 		modelId.includes("opus-4.7") ||
+		modelId.includes("opus-4-8") ||
+		modelId.includes("opus-4.8") ||
 		modelId.includes("sonnet-4-6") ||
-		modelId.includes("sonnet-4.6")
+		modelId.includes("sonnet-4.6") ||
+		modelId.includes("fable-5") ||
+		modelId.includes("mythos-5") ||
+		modelId.includes("mythos-preview")
 	);
 }
 
 /**
- * Map ThinkingLevel to Anthropic effort levels for adaptive thinking.
- * Note: effort "max" is only valid on Opus 4.6, while Opus 4.7 supports "xhigh".
+ * Map ThinkingLevel to Anthropic effort levels for adaptive thinking. The effort is
+ * driven by each model's `thinkingLevelMap` (see generate-models.ts); the switch is a
+ * fallback for levels without an explicit mapping.
  */
 function mapThinkingLevelToEffort(
 	model: Model<"anthropic-messages">,
 	level: SimpleStreamOptions["reasoning"],
 ): AnthropicEffort {
-	const mapped = level ? model.thinkingLevelMap?.[level] : undefined;
+	// Clamp to what the model actually supports so callers that bypass
+	// clampThinkingLevel (e.g. passing reasoning: "xhigh" directly) can't send an
+	// effort the model lacks — xhigh on a max-only model resolves to max, not xhigh.
+	const effective = level ? clampThinkingLevel(model, level) : undefined;
+	const mapped = effective ? model.thinkingLevelMap?.[effective] : undefined;
 	if (typeof mapped === "string") return mapped as AnthropicEffort;
 
-	switch (level) {
+	switch (effective) {
 		case "minimal":
 		case "low":
 			return "low";
@@ -709,6 +719,10 @@ function mapThinkingLevelToEffort(
 			return "medium";
 		case "high":
 			return "high";
+		case "xhigh":
+			return "xhigh";
+		case "max":
+			return "max";
 		default:
 			return "high";
 	}
@@ -931,9 +945,9 @@ function buildParams(
 				// Adaptive thinking: Claude decides when and how much to think.
 				params.thinking = { type: "adaptive", display };
 				if (options.effort) {
-					// The Anthropic SDK types can lag newly supported effort values such as "xhigh".
+					// The Anthropic SDK types can lag newly supported effort values such as "xhigh"/"max".
 					params.output_config =
-						options.effort === "xhigh"
+						options.effort === "xhigh" || options.effort === "max"
 							? ({ effort: options.effort } as unknown as NonNullable<
 									MessageCreateParamsStreaming["output_config"]
 								>)

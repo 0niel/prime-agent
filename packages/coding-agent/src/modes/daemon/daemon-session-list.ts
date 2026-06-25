@@ -33,6 +33,7 @@ export interface SessionSummary {
 	thinkingLevel?: ThinkingLevel;
 	isStreaming: boolean;
 	isCompacting: boolean;
+	isBashRunning?: boolean;
 	attachedClients: number;
 	messageCount: number;
 	pendingMessageCount: number;
@@ -132,6 +133,7 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		thinkingLevel: session.thinkingLevel,
 		isStreaming: session.isStreaming,
 		isCompacting: session.isCompacting,
+		isBashRunning: session.isBashRunning,
 		attachedClients: activeSession.clients.size,
 		messageCount: session.messages.length,
 		pendingMessageCount: session.pendingMessageCount,
@@ -151,11 +153,11 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		spawnCode: metadata.spawnCode ? metadata.spawnCode.slice(0, SPAWN_CODE_MAX_CHARS) : undefined,
 		modelFallbackMessage: activeSession.runtime.modelFallbackMessage,
 		diagnostics: [...activeSession.runtime.diagnostics],
-		// Drop both summary and verdict once new messages arrive; a stale recap
-		// would describe a prior turn. The summarizer refreshes within seconds.
-		...(isSummaryCurrent(activeSession)
-			? { summary: activeSession.summaryState?.summary, taskState: activeSession.summaryState?.taskState }
-			: {}),
+		// Keep the last recap visible across turns so the view never blanks, but
+		// gate the verdict on currency: a stale "completed" must not show on a turn
+		// that is active again.
+		summary: activeSession.summaryState?.summary,
+		...(isSummaryCurrent(activeSession) ? { taskState: activeSession.summaryState?.taskState } : {}),
 	};
 }
 

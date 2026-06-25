@@ -220,6 +220,7 @@ export interface AutocompleteItem {
 	value: string;
 	label: string;
 	description?: string;
+	takesArgument?: boolean;
 }
 
 type Awaitable<T> = T | Promise<T>;
@@ -229,6 +230,7 @@ export interface SlashCommand {
 	aliases?: readonly string[];
 	description?: string;
 	argumentHint?: string;
+	takesArgument?: boolean;
 	// Function to get argument completions for this command
 	// Returns null if no argument completion is available
 	getArgumentCompletions?(argumentPrefix: string): Awaitable<AutocompleteItem[] | null>;
@@ -314,11 +316,13 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 					const hint = "argumentHint" in cmd && cmd.argumentHint ? cmd.argumentHint : undefined;
 					const desc = cmd.description ?? "";
 					const fullDesc = hint ? (desc ? `${hint} — ${desc}` : hint) : desc;
+					const takesArgument = "takesArgument" in cmd ? cmd.takesArgument === true : false;
 					return {
 						name,
 						searchText: [name, ...aliases].join(" "),
 						label: name,
 						description: fullDesc || undefined,
+						takesArgument,
 					};
 				});
 
@@ -326,6 +330,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 					value: item.name,
 					label: item.label,
 					...(item.description && { description: item.description }),
+					...(item.takesArgument && { takesArgument: true }),
 				}));
 
 				if (filtered.length === 0) return null;

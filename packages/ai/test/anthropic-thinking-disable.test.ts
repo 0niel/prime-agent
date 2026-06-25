@@ -138,6 +138,33 @@ describe("Anthropic thinking disable payload", () => {
 		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
 		expect(payload.output_config).toEqual({ effort: "xhigh" });
 	});
+
+	it("maps max reasoning to effort=max for Claude Opus 4.7", async () => {
+		const payload = await capturePayload(getModel("anthropic", "claude-opus-4-7"), { reasoning: "max" });
+
+		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.output_config).toEqual({ effort: "max" });
+	});
+
+	it("maps max reasoning to effort=max for Claude Opus 4.6 (no native xhigh)", async () => {
+		const payload = await capturePayload(getModel("anthropic", "claude-opus-4-6"), { reasoning: "max" });
+
+		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.output_config).toEqual({ effort: "max" });
+	});
+
+	it("clamps xhigh reasoning to effort=max for Claude Opus 4.6 (no native xhigh)", async () => {
+		const payload = await capturePayload(getModel("anthropic", "claude-opus-4-6"), { reasoning: "xhigh" });
+
+		expect(payload.output_config).toEqual({ effort: "max" });
+	});
+
+	it("maps max reasoning to effort=max for Claude Sonnet 4.6 (no native xhigh)", async () => {
+		const payload = await capturePayload(getModel("anthropic", "claude-sonnet-4-6"), { reasoning: "max" });
+
+		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.output_config).toEqual({ effort: "max" });
+	});
 });
 
 describe.skipIf(!process.env.ANTHROPIC_API_KEY)("Anthropic thinking disable E2E", () => {

@@ -39,6 +39,10 @@ export class Input implements Component, Focusable {
 		return this.value;
 	}
 
+	getCursor(): number {
+		return this.cursor;
+	}
+
 	setValue(value: string): void {
 		this.value = value;
 		this.cursor = Math.min(this.cursor, value.length);

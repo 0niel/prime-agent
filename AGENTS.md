@@ -2,14 +2,15 @@
 
 ## Conversational Style
 
+- No fluff or cheerful filler text
 - Keep answers short and concise
 - No emojis in commits, issues, PR comments, or code
-- No fluff or cheerful filler text
 - Technical prose only, be kind but direct (e.g., "Thanks @user" not "Thanks so much @user!")
 
 ## Code Quality
 
 - Read files in full before making wide-ranging changes, before editing files you have not already fully inspected, and when the user asks you to investigate or audit something. Do not rely only on search snippets for broad changes.
+- Don't be too verbose with comments in the code. Only write comments when there is serious ambiguity
 - No `any` types unless absolutely necessary
 - Check node_modules for external API type definitions instead of guessing
 - **NEVER use inline imports** - no `await import("./foo.js")`, no `import("pkg").Type` in type positions, no dynamic imports for types. Always use standard top-level imports.
@@ -30,7 +31,6 @@
 - When writing tests, run them, identify issues in either the test or implementation, and iterate until fixed.
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` plus the faux provider. Do not use real provider APIs, real API keys, or paid tokens.
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` and name them `<issue-number>-<short-slug>.test.ts`.
-- NEVER commit unless user asks
 
 ## Dependencies
 
@@ -64,7 +64,7 @@ When closing issues via commit:
 
 - Analyze PRs without pulling locally first
 - If the user approves: create a feature branch, pull PR, rebase on main, apply adjustments, commit, merge into main, push, close PR, and leave a comment in the user's tone
-- You never open PRs yourself. We work in feature branches until everything is according to the user's requirements, then merge into main, and push.
+- We work in feature branches until everything is according to the user's requirements. Never merge PRs by yourself.
 
 ## Testing Prime Agent Interactive Mode with tmux
 
@@ -91,27 +91,32 @@ tmux send-keys -t prime-agent-test C-o  # ctrl+o
 tmux kill-session -t prime-agent-test
 ```
 
+You, yourself, are often running into a tmux session, so be careful when killing tmux sessions. Lots of other processes can be running on different tmux sessions/
+
 ## Changelog
 
 Location: `packages/*/CHANGELOG.md` (each package has its own)
 
 ### Format
 
-Use these sections under `## [Unreleased]`:
+A flat list of plain bullets under `## [Unreleased]`. No `### Added` / `### Changed` / `### Fixed` / `### Removed` subsections — just one bullet per change, written as a short sentence starting with a past-tense verb (Added, Changed, Fixed, Removed). Keep each bullet to one line; describe the user-visible change, not the implementation.
 
-- `### Breaking Changes` - API changes requiring migration
-- `### Added` - New features
-- `### Changed` - Changes to existing functionality
-- `### Fixed` - Bug fixes
-- `### Removed` - Removed features
+Example of a well-formed `[Unreleased]` section:
+
+```markdown
+## [Unreleased]
+
+- Added `/effort` to set the reasoning level, with autocomplete for the levels the current model supports.
+- Changed `prime-agent` to open a new chat by default instead of resuming the previous session.
+- Fixed onboarding showing no models after entering a provider key.
+- Removed the interactive `!` / `!!` bash shortcuts; use IPython instead.
+```
 
 ### Rules
 
-- Before adding entries, read the full `[Unreleased]` section to see which subsections already exist
-- New entries ALWAYS go under `## [Unreleased]` section
-- Append to existing subsections (e.g., `### Fixed`), do not create duplicates
-- NEVER modify already-released version sections (e.g., `## [0.12.2]`)
-- Each version section is immutable once released
+- Read the full `[Unreleased]` section first so you don't duplicate an existing bullet
+- New entries ALWAYS go under `## [Unreleased]`
+- NEVER modify already-released version sections (e.g., `## [0.2.1]`) — each is immutable once released
 
 ### Attribution
 
