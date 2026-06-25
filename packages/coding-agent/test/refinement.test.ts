@@ -475,7 +475,7 @@ describe("harness refinement", () => {
 		expect(getLocalHarnessStateDir(undefined)).toBeUndefined();
 	});
 
-	it("merges global and local harness state with local entries taking precedence", () => {
+	it("merges global and local harness state without hiding colliding entries", () => {
 		const root = makeTempDir();
 		const globalState = loadHarnessState(join(root, "global"), "global");
 		const localState = loadHarnessState(join(root, "local"), "local");
@@ -508,9 +508,39 @@ describe("harness refinement", () => {
 
 		const merged = mergeHarnessStates(globalState, localState);
 
-		expect(merged.entries.memory.shared.content).toBe("Local content.");
-		expect(merged.entries.memory.shared.scope).toBe("local");
+		expect(merged.entries.memory.shared.content).toBe("Global content.");
+		expect(merged.entries.memory.shared.scope).toBe("global");
+		expect(merged.entries.memory["local:shared"]).toMatchObject({
+			id: "shared",
+			content: "Local content.",
+			scope: "local",
+		});
+		expect(Object.values(merged.entries.memory).map((entry) => `${entry.scope}:${entry.content}`)).toEqual(
+			expect.arrayContaining(["global:Global content.", "local:Local content."]),
+		);
 		expect(globalState.entries.memory.shared.scope).toBe("global");
+	});
+
+	it("preserves entry scope stored inside the global harness file", () => {
+		const root = makeTempDir();
+		const globalState = loadHarnessState(join(root, "global"), "global");
+		applyRefinementProposal(
+			globalState,
+			proposal("Session-local note in shared file", [
+				{
+					action: "create",
+					kind: "memory",
+					id: "session_note",
+					title: "Session note",
+					content: "Written by a local RLM harness store in a shared file.",
+				},
+			]),
+			{ id: "refine_local_in_global_file", scope: "local" },
+		);
+
+		const merged = mergeHarnessStates(globalState);
+
+		expect(merged.entries.memory.session_note.scope).toBe("local");
 	});
 
 	it("persists harness state in the selected harness directory", () => {
@@ -1039,6 +1069,44 @@ describe("global refinement history", () => {
 		expect(loadGlobalRefinementHistory(dir)[0]).toMatchObject({ id: "refine_legacy_global", scope: "global" });
 	});
 
+	it("writes inferred legacy history scope back onto loaded results", () => {
+		const dir = makeTempDir();
+		const legacy = sampleResult("refine_legacy_inferred", {
+			scope: undefined,
+			appliedEdits: [
+				{
+					action: "create",
+					kind: "memory",
+					id: "legacy_global_memory",
+					title: "Legacy global memory",
+					content: "created globally",
+					applied: true,
+					after: {
+						id: "legacy_global_memory",
+						kind: "memory",
+						title: "Legacy global memory",
+						content: "created globally",
+						path: "general",
+						scope: "global",
+						reference: {},
+						arguments: {},
+						metadata: {},
+						source: "refine",
+						created_at: "2026-01-01T00:00:00.000Z",
+						updated_at: "2026-01-01T00:00:00.000Z",
+						version: 1,
+					},
+				},
+			],
+		});
+		appendFileSync(getRefinementHistoryPath(dir), `${JSON.stringify(legacy)}\n`, "utf8");
+
+		expect(loadGlobalRefinementHistory(dir)[0]).toMatchObject({
+			id: "refine_legacy_inferred",
+			scope: "global",
+		});
+	});
+
 	it("preserves global scope when session history shadows legacy global history", () => {
 		const globalOld = sampleResult("refine_shared", { scope: "global", summary: "global version" });
 		const sessionNew = sampleResult("refine_shared", { scope: undefined, summary: "session version" });
@@ -1110,12 +1178,41 @@ describe("global refinement history", () => {
 		// so applying must be the only thing that mutates state.
 		expect(plan.proposal.edits).toHaveLength(1);
 		expect(plan.id).toMatch(/^refine_/);
+		const userPrompt = completeSimpleMock.mock.calls[0][1].messages[0].content[0].text;
+		expect(userPrompt).toContain("Requested refinement scope: local");
 		expect(state.entries.memory.planned_memory).toBeUndefined();
 		expect(state.refinements).toHaveLength(0);
 
 		const result = applyRefinementProposal(state, plan.proposal, { id: plan.id });
 		expect(result.appliedEdits[0]).toMatchObject({ id: "planned_memory", applied: true });
 		expect(state.entries.memory.planned_memory).toBeDefined();
+	});
+
+	it("adds global-only scope policy when planning a global refinement", async () => {
+		const state = loadHarnessState(makeTempDir(), "global");
+		completeSimpleMock.mockResolvedValueOnce(
+			assistantText(
+				JSON.stringify({
+					summary: "No global edit",
+					rationale: "No durable cross-session lesson.",
+					expectedOutcome: "No change.",
+					edits: [],
+				}),
+			),
+		);
+
+		await planRefinement(
+			[{ role: "user", content: "remember this only if global", timestamp: Date.now() } satisfies AgentMessage],
+			state,
+			[],
+			createRefineModel(false),
+			"api-key",
+			{ global: true },
+		);
+
+		const userPrompt = completeSimpleMock.mock.calls[0][1].messages[0].content[0].text;
+		expect(userPrompt).toContain("Requested refinement scope: global");
+		expect(userPrompt).toContain("Do not persist session-only progress");
 	});
 
 	it("plans a rollback without mutating harness state", async () => {

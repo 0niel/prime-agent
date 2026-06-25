@@ -1088,6 +1088,7 @@ describe("DaemonAgentConnection", () => {
 			activeSessionId: "active-1",
 			instructions: "remember this",
 			rollbackId: "refine_previous",
+			global: false,
 		});
 		expect(fakeClient.requestTimeouts[0]).toBe(30000);
 		expect(fakeClient.requestTimeouts[1]).toBe(DAEMON_REFINE_REQUEST_TIMEOUT_MS);

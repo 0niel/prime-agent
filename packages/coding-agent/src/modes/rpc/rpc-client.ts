@@ -284,7 +284,10 @@ export class RpcClient {
 	): Promise<RefinementResult> {
 		// Refinement runs an LLM pass that routinely exceeds the default 30s response
 		// timeout, so use the same extended window as the daemon refine path.
-		const response = await this.send({ type: "refine", ...options }, REFINE_REQUEST_TIMEOUT_MS);
+		const response = await this.send(
+			{ type: "refine", ...options, global: options.global ?? false },
+			REFINE_REQUEST_TIMEOUT_MS,
+		);
 		return this.getData(response);
 	}
 

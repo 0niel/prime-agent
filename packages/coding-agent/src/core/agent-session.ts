@@ -2979,6 +2979,7 @@ export class AgentSession {
 			this._compactionAbortController = undefined;
 			this._reconnectToAgent();
 			if (didCompact) {
+				this._discardPendingAutoRefine();
 				this._scheduleAutoRefine("compact");
 			}
 		}
@@ -3003,6 +3004,7 @@ export class AgentSession {
 
 	private _invalidatePendingAutoRefineForBranchChange(): void {
 		this._discardPendingAutoRefine();
+		this._assistantTurnsSinceAutoRefine = 0;
 		this._autoRefineBranchVersion++;
 	}
 
@@ -3035,7 +3037,7 @@ export class AgentSession {
 	}
 
 	private _shouldSkipAutoRefineForActiveAgent(): boolean {
-		return this.isStreaming || this.isCompacting || this.agent.hasQueuedMessages();
+		return this.isStreaming || this.isCompacting;
 	}
 
 	private _scheduleAutoRefine(reason: AutoRefineReason): void {
@@ -3093,6 +3095,9 @@ export class AgentSession {
 		}
 		const nowMs = Date.now();
 		if (this._lastAutoRefineReviewAt > 0 && nowMs - this._lastAutoRefineReviewAt < settings.cooldownMs) {
+			if (reason === "compact") {
+				this._compactAutoRefinePending = true;
+			}
 			return;
 		}
 		if (!this.model) {
@@ -3148,7 +3153,17 @@ export class AgentSession {
 			loadGlobalRefinementHistory(harnessStateDir),
 			getRefinementHistory(this.sessionManager.getEntries().filter((entry) => entry.type === "custom")),
 		);
-		return reviewAutoRefine(this.agent.state.messages, state, history, model, apiKey, context, headers);
+		return reviewAutoRefine(
+			this.agent.state.messages,
+			state,
+			history,
+			model,
+			apiKey,
+			context,
+			headers,
+			undefined,
+			this.thinkingLevel,
+		);
 	}
 
 	/**
@@ -3167,17 +3182,21 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
+			const model = this.model;
+			const { apiKey, headers } = await this._getRequiredRequestAuth(model);
 			const globalHarnessStateDir = getGlobalHarnessStateDir();
 			const localHarnessStateDir = getLocalHarnessStateDir(this.sessionManager.getSessionArtifactDir());
 			const requestedScope = options.global ? "global" : "local";
 			if (!options.rollbackId && requestedScope === "local" && !localHarnessStateDir) {
 				throw new Error("Local harness refinement requires a persisted session; use global refinement instead.");
 			}
-			const planningState = mergeHarnessStates(
-				loadHarnessState(globalHarnessStateDir, "global"),
-				localHarnessStateDir ? loadHarnessState(localHarnessStateDir, "local") : undefined,
-			);
+			const planningState =
+				requestedScope === "global"
+					? loadHarnessState(globalHarnessStateDir, "global")
+					: mergeHarnessStates(
+							loadHarnessState(globalHarnessStateDir, "global"),
+							localHarnessStateDir ? loadHarnessState(localHarnessStateDir, "local") : undefined,
+						);
 			const history = mergeRefinementHistory(
 				loadGlobalRefinementHistory(globalHarnessStateDir),
 				getRefinementHistory(this.sessionManager.getEntries().filter((entry) => entry.type === "custom")),
@@ -3186,7 +3205,7 @@ export class AgentSession {
 				this.agent.state.messages,
 				planningState,
 				history,
-				this.model,
+				model,
 				apiKey,
 				options,
 				headers,

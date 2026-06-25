@@ -44,9 +44,12 @@ def _agent_dir() -> Path:
 
 
 def _resolve_global_flag(global_: bool = False, extra: dict[str, Any] | None = None) -> bool:
-    extra = extra or {}
+    extra = dict(extra or {})
     if "global" in extra:
-        global_ = bool(extra.pop("global"))
+        value = extra.pop("global")
+        if not isinstance(value, bool):
+            raise TypeError(f"global must be a bool, got {type(value).__name__}")
+        global_ = value
     if extra:
         unexpected = next(iter(extra))
         raise TypeError(f"unexpected keyword argument {unexpected!r}")
@@ -121,7 +124,11 @@ class HarnessState:
         if in_memory:
             self.file_path: Path | None = None
         else:
-            self.file_path = Path(file_path).expanduser().resolve() if file_path else _state_file()
+            self.file_path = (
+                Path(file_path).expanduser().resolve()
+                if file_path
+                else _state_file(global_=(scope == "global"))
+            )
         self.scope: HarnessScope = scope
         self.entries: dict[HarnessKind, dict[str, HarnessEntry]] = {kind: {} for kind in _KINDS}
         self.refinements: list[RefinementEvent] = []
@@ -230,6 +237,8 @@ class HarnessState:
 
     def _global_target(self, global_: bool, extra: dict[str, Any] | None = None) -> "HarnessState | None":
         if not _resolve_global_flag(global_, extra):
+            return None
+        if self.file_path is None:
             return None
         target = get_harness_state(global_=True)
         if self.file_path is not None and target.file_path == self.file_path and target.scope == self.scope:

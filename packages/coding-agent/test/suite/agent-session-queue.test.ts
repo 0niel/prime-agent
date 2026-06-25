@@ -37,6 +37,10 @@ function createAutoRefineHarness(options: Parameters<typeof createHarness>[0] = 
 	return createHarness({ ...options, persistSession: true });
 }
 
+function setAgentStreaming(harness: Harness, isStreaming: boolean): void {
+	(harness.session.agent.state as { isStreaming: boolean }).isStreaming = isStreaming;
+}
+
 async function createWaitingHarness(
 	options: {
 		tools?: AgentTool[];
@@ -186,6 +190,7 @@ describe("AgentSession queue characterization", () => {
 		});
 		const reviewer = vi.fn(async () => {
 			await reviewStarted;
+			setAgentStreaming(harness, true);
 			return { shouldRefine: true, rationale: "durable lesson" };
 		});
 		const harness = await createAutoRefineHarness({
@@ -195,7 +200,6 @@ describe("AgentSession queue characterization", () => {
 		harnesses.push(harness);
 		const internals = harness.session as unknown as AutoRefineInternals;
 		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
-		vi.spyOn(harness.session.agent, "hasQueuedMessages").mockReturnValueOnce(false).mockReturnValueOnce(true);
 
 		const autoRefinePromise = internals._maybeAutoRefine("compact");
 		expect(reviewer).toHaveBeenCalledWith({ reason: "compact", turnsSinceLastReview: 0 });
@@ -214,6 +218,7 @@ describe("AgentSession queue characterization", () => {
 		});
 		const reviewer = vi.fn(async () => {
 			await reviewStarted;
+			setAgentStreaming(harness, true);
 			return { shouldRefine: true, rationale: "durable lesson" };
 		});
 		const harness = await createAutoRefineHarness({
@@ -224,10 +229,6 @@ describe("AgentSession queue characterization", () => {
 		const internals = harness.session as unknown as AutoRefineInternals;
 		internals._assistantTurnsSinceAutoRefine = 2;
 		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
-		vi.spyOn(harness.session.agent, "hasQueuedMessages")
-			.mockReturnValueOnce(false)
-			.mockReturnValueOnce(true)
-			.mockReturnValue(false);
 
 		const autoRefinePromise = internals._maybeAutoRefine("turn_interval");
 		expect(reviewer).toHaveBeenCalledWith({ reason: "turn_interval", turnsSinceLastReview: 2 });
@@ -237,6 +238,7 @@ describe("AgentSession queue characterization", () => {
 		expect(refine).not.toHaveBeenCalled();
 		expect(internals._pendingAutoRefineReview).toBeDefined();
 
+		setAgentStreaming(harness, false);
 		await internals._maybeAutoRefine("turn_interval");
 
 		expect(reviewer).toHaveBeenCalledTimes(1);
@@ -286,6 +288,7 @@ describe("AgentSession queue characterization", () => {
 			.find((entry) => entry.type === "message" && entry.message.role === "user");
 		expect(targetEntry).toBeDefined();
 		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 5;
 		internals._compactAutoRefinePending = true;
 		internals._pendingAutoRefineReview = {
 			reason: "compact",
@@ -297,6 +300,7 @@ describe("AgentSession queue characterization", () => {
 
 		expect(internals._compactAutoRefinePending).toBe(false);
 		expect(internals._pendingAutoRefineReview).toBeUndefined();
+		expect(internals._assistantTurnsSinceAutoRefine).toBe(0);
 	});
 
 	it("records auto-refine cooldown when a review completes after branch navigation", async () => {
@@ -385,6 +389,44 @@ describe("AgentSession queue characterization", () => {
 		await internals._maybeAutoRefine("turn_interval");
 
 		expect(reviewer).not.toHaveBeenCalled();
+	});
+
+	it("auto-refine preserves a compact checkpoint when cooldown is active", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 60_000 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._lastAutoRefineReviewAt = Date.now();
+
+		await internals._maybeAutoRefine("compact");
+
+		expect(reviewer).not.toHaveBeenCalled();
+		expect(internals._compactAutoRefinePending).toBe(true);
+	});
+
+	it("queued follow-up messages do not make an idle agent active for auto-refine", async () => {
+		const reviewer = vi.fn(async () => ({
+			shouldRefine: true,
+			rationale: "durable lesson found",
+			instructions: "capture the durable lesson",
+		}));
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 1;
+		vi.spyOn(harness.session.agent, "hasQueuedMessages").mockReturnValue(true);
+		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
+
+		await internals._maybeAutoRefine("turn_interval");
+
+		expect(reviewer).toHaveBeenCalledWith({ reason: "turn_interval", turnsSinceLastReview: 1 });
+		expect(refine).toHaveBeenCalled();
 	});
 
 	it("dispatches extension commands immediately when prompted while idle", async () => {

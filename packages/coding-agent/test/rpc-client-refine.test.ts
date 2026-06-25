@@ -24,7 +24,7 @@ describe("RpcClient refine", () => {
 		const result = await client.refine({ instructions: "tighten validation" });
 
 		expect(send).toHaveBeenCalledWith(
-			{ type: "refine", instructions: "tighten validation" },
+			{ type: "refine", instructions: "tighten validation", global: false },
 			REFINE_REQUEST_TIMEOUT_MS,
 		);
 		expect(REFINE_REQUEST_TIMEOUT_MS).toBeGreaterThan(30000);

@@ -227,7 +227,8 @@ function inferRefinementResultScope(result: RefinementResult): HarnessScope | un
 }
 
 function withDefaultRefinementScope(result: RefinementResult, scope: HarnessScope): RefinementResult {
-	return inferRefinementResultScope(result) ? result : { ...result, scope };
+	const inferred = inferRefinementResultScope(result);
+	return { ...result, scope: inferred ?? scope };
 }
 
 export function getGlobalHarnessStateDir(agentDir: string = getAgentDir()): string {
@@ -292,10 +293,14 @@ export function mergeHarnessStates(globalState: HarnessState, localState?: Harne
 	merged.schema = Math.max(globalState.schema, localState?.schema ?? 1);
 	for (const kind of Object.keys(merged.entries) as RefinementKind[]) {
 		for (const [id, entry] of Object.entries(globalState.entries[kind])) {
-			merged.entries[kind][id] = { ...cloneEntry(entry)!, scope: "global" };
+			const cloned = cloneEntry(entry)!;
+			merged.entries[kind][id] = { ...cloned, scope: normalizeHarnessScope(cloned.scope, "global") };
 		}
 		for (const [id, entry] of Object.entries(localState?.entries[kind] ?? {})) {
-			merged.entries[kind][id] = { ...cloneEntry(entry)!, scope: "local" };
+			const cloned = cloneEntry(entry)!;
+			const scopedEntry = { ...cloned, scope: normalizeHarnessScope(cloned.scope, "local") };
+			const mergedId = merged.entries[kind][id] ? `${scopedEntry.scope}:${id}` : id;
+			merged.entries[kind][mergedId] = scopedEntry;
 		}
 	}
 	merged.refinements = [...globalState.refinements, ...(localState?.refinements ?? [])];
@@ -749,10 +754,14 @@ export async function planRefinement(
 	}
 
 	const conversationText = serializeConversation(convertToLlm(messages)).slice(-80_000);
+	const scopeInstruction = options.global
+		? "Requested refinement scope: global. Only propose stable cross-session continual harness edits, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts that should affect future Prime Agent sessions. Do not persist session-only progress, temporary blockers, or current-run coordination globally."
+		: "Requested refinement scope: local. Prefer local continual harness edits for current task progress, temporary blockers, current-run coordination, and project facts that are not clearly reusable across Prime Agent sessions.";
 	const userPrompt = [
 		`<current_harness_state>\n${overviewForPrompt(state)}\n</current_harness_state>`,
 		`<refinement_history>\n${historyForPrompt(history)}\n</refinement_history>`,
 		`<conversation>\n${conversationText}\n</conversation>`,
+		`<scope_policy>\n${scopeInstruction}\n</scope_policy>`,
 		options.instructions ? `<user_refine_instructions>\n${options.instructions}\n</user_refine_instructions>` : "",
 		"Return only JSON edits. If no useful edit is justified, return an empty edits array with a rationale.",
 	]
@@ -807,6 +816,7 @@ export async function reviewAutoRefine(
 	context: AutoRefineReviewContext,
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
+	thinkingLevel?: ThinkingLevel,
 ): Promise<AutoRefineReview> {
 	const conversationText = serializeConversation(convertToLlm(messages)).slice(-40_000);
 	const userPrompt = [
@@ -824,6 +834,9 @@ ${conversationText}
 </conversation>`,
 		"Return shouldRefine=false unless a durable, evidence-backed harness update is likely useful. Prefer no-op for task-local, session-only, speculative, or unqualified project-specific lessons.",
 	].join("\n\n");
+	// Auto-refine review requires parseable JSON. Keep it non-reasoning so
+	// reasoning-capable models use final text budget for the JSON object.
+	void thinkingLevel;
 	const response = await completeSimple(
 		model,
 		{

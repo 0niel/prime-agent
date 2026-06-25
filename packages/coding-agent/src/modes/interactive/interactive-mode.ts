@@ -7376,12 +7376,11 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 
 	private async handleRefineCommand(args?: string): Promise<void> {
 		let trimmedArgs = args?.trim() ?? "";
-		const globalPrefix = "--global";
-		const global = trimmedArgs === globalPrefix || trimmedArgs?.startsWith(`${globalPrefix} `) === true;
-		if (global) {
-			trimmedArgs = trimmedArgs === globalPrefix ? "" : trimmedArgs.slice(globalPrefix.length).trim();
+		const globalOption: { global?: boolean } = {};
+		if (/(^|\s)--global(?=\s|$)/.test(trimmedArgs)) {
+			globalOption.global = true;
+			trimmedArgs = trimmedArgs.replace(/(^|\s)--global(?=\s|$)/g, " ").trim();
 		}
-		const globalOption = global ? { global: true } : {};
 		const rollbackPrefix = "rollback ";
 		let options: { instructions?: string; rollbackId?: string; global?: boolean };
 

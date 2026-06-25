@@ -345,6 +345,9 @@ class HarnessStateTest(unittest.TestCase):
             self.assertIsNone(state.file_path)
             self.assertEqual(created.content, "in memory only")
             self.assertEqual(state.get("memory", "volatile").content, "in memory only")
+            state.create_memory("Volatile global", "still in memory only", id="volatile_global", global_=True)
+            state.record_refinement("global trigger", ["global change"], global_=True)
+            self.assertEqual(state.get("memory", "volatile_global").content, "still in memory only")
             # No path was resolved, so nothing was persisted anywhere under the dir.
             self.assertEqual(list(Path(temp_dir).iterdir()), [])
 
@@ -427,6 +430,29 @@ class HarnessStateTest(unittest.TestCase):
 
             self.assertEqual(state.file_path, Path(temp_dir).resolve() / "harness_state.json")
 
+    def test_global_scope_default_state_uses_global_harness_env_dir(self) -> None:
+        previous_local = os.environ.get("RLM_HARNESS_STATE_DIR")
+        previous_global = os.environ.get("RLM_GLOBAL_HARNESS_STATE_DIR")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_dir = Path(temp_dir) / "local"
+            global_dir = Path(temp_dir) / "global"
+            os.environ["RLM_HARNESS_STATE_DIR"] = str(local_dir)
+            os.environ["RLM_GLOBAL_HARNESS_STATE_DIR"] = str(global_dir)
+            try:
+                state = HarnessState(scope="global")
+            finally:
+                if previous_local is None:
+                    os.environ.pop("RLM_HARNESS_STATE_DIR", None)
+                else:
+                    os.environ["RLM_HARNESS_STATE_DIR"] = previous_local
+                if previous_global is None:
+                    os.environ.pop("RLM_GLOBAL_HARNESS_STATE_DIR", None)
+                else:
+                    os.environ["RLM_GLOBAL_HARNESS_STATE_DIR"] = previous_global
+
+            self.assertEqual(state.scope, "global")
+            self.assertEqual(state.file_path, global_dir.resolve() / "harness_state.json")
+
     def test_default_state_is_local_and_global_flag_targets_global_store(self) -> None:
         previous_local = os.environ.get("RLM_HARNESS_STATE_DIR")
         previous_global = os.environ.get("RLM_GLOBAL_HARNESS_STATE_DIR")
@@ -467,6 +493,13 @@ class HarnessStateTest(unittest.TestCase):
             self.assertIsNotNone(
                 HarnessState(global_dir / "harness_state.json", scope="global").get("memory", "kwargs_global_note")
             )
+
+    def test_global_kwarg_must_be_boolean(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+
+            with self.assertRaisesRegex(TypeError, "global must be a bool"):
+                state.create_memory("Bad global flag", "bad", id="bad_global", **{"global": "false"})
 
     def test_state_cache_keeps_scope_distinct_when_local_and_global_share_a_file(self) -> None:
         previous_local = os.environ.get("RLM_HARNESS_STATE_DIR")

@@ -541,7 +541,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				activeSessionId: this.activeSessionId,
 				instructions: options.instructions,
 				rollbackId: options.rollbackId,
-				global: options.global,
+				global: options.global ?? false,
 			},
 			DAEMON_REFINE_REQUEST_TIMEOUT_MS,
 		);
