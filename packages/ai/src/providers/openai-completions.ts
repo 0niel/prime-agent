@@ -834,10 +834,23 @@ export function convertMessages(
 						assistantMsg.content = assistantText;
 					}
 
-					// Use the signature from the first thinking block if available (for llama.cpp server + gpt-oss)
-					const signature = nonEmptyThinkingBlocks[0].thinkingSignature;
-					if (signature && signature.length > 0) {
-						(assistantMsg as any)[signature] = nonEmptyThinkingBlocks.map((block) => block.thinking).join("\n");
+					// thinkingSignature holds the field the provider streamed reasoning in
+					// (reasoning_content / reasoning / reasoning_text), not a crypto signature.
+					// Prefer reasoning_content when the provider requires it (otherwise the
+					// reasoning_content="" default below would clobber the trace); else round-trip
+					// into the recorded field; with neither, keep the trace as text rather than
+					// inventing an unsupported field.
+					const reasoningText = nonEmptyThinkingBlocks
+						.map((block) => sanitizeSurrogates(block.thinking))
+						.join("\n");
+					const reasoningField = compat.requiresReasoningContentOnAssistantMessages
+						? "reasoning_content"
+						: nonEmptyThinkingBlocks[0].thinkingSignature || undefined;
+					if (reasoningField) {
+						(assistantMsg as any)[reasoningField] = reasoningText;
+					} else {
+						assistantMsg.content =
+							assistantText.length > 0 ? `${reasoningText}\n\n${assistantText}` : reasoningText;
 					}
 				}
 			} else if (assistantText.length > 0) {

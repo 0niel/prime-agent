@@ -64,6 +64,7 @@ import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
 import { type AgentCronJob, parseHeartbeatCommand } from "../../core/cron-jobs.js";
 import type {
 	AutocompleteProviderFactory,
+	ContextUsage,
 	EditorFactory,
 	ExtensionCommandContext,
 	ExtensionContext,
@@ -520,6 +521,9 @@ export class InteractiveMode {
 	private pulseTimer: NodeJS.Timeout | undefined = undefined;
 	private pulseFrame = 0;
 	private readonly activityTracker = new AgentActivityTracker();
+	// activityTracker token count already folded into the context snapshot; only output beyond
+	// this counts as live in-flight (keeps auto-retries from re-adding a failed attempt).
+	private contextUsageTokenBaseline = 0;
 	private readonly defaultHiddenThinkingLabel = "Thinking...";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
 
@@ -2034,6 +2038,10 @@ export class InteractiveMode {
 
 	private applyConnectionStateSnapshot(state: AgentConnectionState): void {
 		this.connectionState = state;
+		// Don't touch contextUsageTokenBaseline: a mid-stream snapshot reflects only completed
+		// turns (the in-flight message isn't persisted yet), so the in-flight delta must keep
+		// accumulating. The baseline is managed at turn end (refreshConnectionContextUsage) and
+		// reset on a new user message.
 		this.footer.setAutoCompactEnabled(state.autoCompactionEnabled);
 		this.sessionRecap = state.recap;
 		this.renderRecap();
@@ -2046,6 +2054,37 @@ export class InteractiveMode {
 		}
 		this.connectionState = { ...this.connectionState, ...patch };
 		this.updateWorkingPulse();
+	}
+
+	// Bake this attempt's output into the snapshot so the tray doesn't dip in the gap between
+	// isStreaming clearing and the async refresh landing.
+	private applyOptimisticContextUsage(): void {
+		const snapshot = this.connectionState?.contextUsage;
+		if (!snapshot || snapshot.tokens === null || snapshot.contextWindow <= 0) return;
+		const completed = Math.max(0, this.activityTracker.getStatus().tokens - this.contextUsageTokenBaseline);
+		if (completed <= 0) return;
+		const tokens = snapshot.tokens + completed;
+		this.patchConnectionState({
+			contextUsage: {
+				tokens,
+				contextWindow: snapshot.contextWindow,
+				percent: (tokens / snapshot.contextWindow) * 100,
+			},
+		});
+	}
+
+	/** Refresh the tray's context usage from the session after a turn or compaction completes. */
+	private async refreshConnectionContextUsage(): Promise<void> {
+		const connection = this.agentConnection;
+		const sessionId = this.connectionState?.sessionId;
+		const stats = await connection?.getSessionStats?.().catch(() => undefined);
+		if (!stats) return;
+		// Drop the result if the user switched sessions or the connection was rebound while the
+		// async call was in flight — otherwise stale stats would overwrite the new session.
+		if (this.agentConnection !== connection || this.connectionState?.sessionId !== sessionId) return;
+		// Anything counted so far is now reflected in the snapshot; only later output is in-flight.
+		this.contextUsageTokenBaseline = this.activityTracker.getStatus().tokens;
+		this.patchConnectionState({ contextUsage: stats.contextUsage });
 	}
 
 	private updateConnectionStateFromEvent(event: AgentConnectionSessionEvent): void {
@@ -2135,7 +2174,25 @@ export class InteractiveMode {
 	}
 
 	private getConnectionContextUsage(): AgentConnectionState["contextUsage"] {
-		return this.connectionState?.contextUsage;
+		const snapshot = this.connectionState?.contextUsage;
+		if (!snapshot || snapshot.tokens === null || snapshot.contextWindow <= 0) {
+			return snapshot;
+		}
+		// Add only the output produced since the snapshot was last refreshed. The activity
+		// tracker accumulates across auto-retries within a turn, so subtract the baseline
+		// captured at the last refresh to avoid re-adding a failed attempt's tokens.
+		const inFlight = this.isAgentStreaming()
+			? Math.max(0, this.activityTracker.getStatus().tokens - this.contextUsageTokenBaseline)
+			: 0;
+		if (inFlight <= 0) {
+			return snapshot;
+		}
+		const tokens = snapshot.tokens + inFlight;
+		return {
+			tokens,
+			contextWindow: snapshot.contextWindow,
+			percent: (tokens / snapshot.contextWindow) * 100,
+		} satisfies ContextUsage;
 	}
 
 	private getScopedModelState(): AgentConnectionState["scopedModels"] {
@@ -2202,6 +2259,7 @@ export class InteractiveMode {
 		this.activeBashComponent = undefined;
 		this.pendingBashComponents = [];
 		this.activityTracker.reset();
+		this.contextUsageTokenBaseline = 0;
 		this.resetPendingToolState();
 		this.resetChildAgentInspector();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
@@ -3847,6 +3905,11 @@ export class InteractiveMode {
 
 		this.footer.invalidate();
 		this.updateConnectionStateFromEvent(event);
+		// A new user message resets the activity tracker to 0, so the in-flight baseline must
+		// reset with it. (agent_start on auto-retry does not reset the tracker.)
+		if (event.type === "message_start" && event.message.role === "user") {
+			this.contextUsageTokenBaseline = 0;
+		}
 		this.activityTracker.handleEvent(event);
 		this.updateWorkingLoaderMessage();
 
@@ -4059,6 +4122,9 @@ export class InteractiveMode {
 				this.flushPendingBashComponents();
 				this.resetPendingToolState();
 
+				this.applyOptimisticContextUsage();
+				await this.refreshConnectionContextUsage();
+
 				await this.checkShutdownRequested();
 
 				this.ui.requestRender();
@@ -4119,6 +4185,7 @@ export class InteractiveMode {
 							event.customInstructions,
 						),
 					);
+					await this.refreshConnectionContextUsage();
 					this.footer.invalidate();
 				} else if (event.errorMessage) {
 					if (event.errorSeverity === "warning") {

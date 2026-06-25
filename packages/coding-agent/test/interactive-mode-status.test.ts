@@ -1222,6 +1222,107 @@ describe("InteractiveMode tray goal label", () => {
 	});
 });
 
+describe("InteractiveMode live context usage", () => {
+	type LiveContextHarness = {
+		connectionState: Pick<AgentConnectionState, "contextUsage"> | undefined;
+		activityTracker: { getStatus(): { tokens: number } };
+		isAgentStreaming(): boolean;
+		contextUsageTokenBaseline: number;
+		getConnectionContextUsage(): AgentConnectionState["contextUsage"];
+	};
+	const prototype = InteractiveMode.prototype as unknown as LiveContextHarness;
+
+	function createHarness(
+		opts: { streaming?: boolean; inFlight?: number; baseline?: number } = {},
+	): LiveContextHarness {
+		const fakeThis = Object.create(InteractiveMode.prototype) as LiveContextHarness;
+		fakeThis.connectionState = { contextUsage: undefined };
+		fakeThis.activityTracker = { getStatus: () => ({ tokens: opts.inFlight ?? 0 }) };
+		fakeThis.isAgentStreaming = () => opts.streaming ?? false;
+		fakeThis.contextUsageTokenBaseline = opts.baseline ?? 0;
+		return fakeThis;
+	}
+
+	test("returns the snapshot verbatim when idle", () => {
+		const fakeThis = createHarness();
+		fakeThis.connectionState = { contextUsage: { contextWindow: 100_000, tokens: 42_000, percent: 42 } };
+
+		expect(prototype.getConnectionContextUsage.call(fakeThis)).toEqual({
+			contextWindow: 100_000,
+			tokens: 42_000,
+			percent: 42,
+		});
+	});
+
+	test("adds in-flight streaming output to the snapshot baseline while streaming", () => {
+		const fakeThis = createHarness({ streaming: true, inFlight: 3_000 });
+		fakeThis.connectionState = { contextUsage: { contextWindow: 100_000, tokens: 42_000, percent: 42 } };
+
+		// 42k baseline + 3k in-flight = 45k; ticks up live as the model writes.
+		expect(prototype.getConnectionContextUsage.call(fakeThis)).toMatchObject({ tokens: 45_000, percent: 45 });
+	});
+
+	test("only adds output beyond the refresh baseline (auto-retry does not double count)", () => {
+		// Tracker holds 5k from a failed attempt (baseline), now 6k after 1k of the retry.
+		const fakeThis = createHarness({ streaming: true, inFlight: 6_000, baseline: 5_000 });
+		fakeThis.connectionState = { contextUsage: { contextWindow: 100_000, tokens: 42_000, percent: 42 } };
+
+		// Only the 1k generated since the refresh is in-flight, not the failed attempt's 5k.
+		expect(prototype.getConnectionContextUsage.call(fakeThis)).toMatchObject({ tokens: 43_000 });
+	});
+
+	test("does not add in-flight output when not streaming", () => {
+		const fakeThis = createHarness({ streaming: false, inFlight: 3_000 });
+		fakeThis.connectionState = { contextUsage: { contextWindow: 100_000, tokens: 42_000, percent: 42 } };
+
+		expect(prototype.getConnectionContextUsage.call(fakeThis)).toMatchObject({ tokens: 42_000 });
+	});
+
+	test("passes through an unknown (post-compaction) snapshot without inflating it", () => {
+		const fakeThis = createHarness({ streaming: true, inFlight: 3_000 });
+		fakeThis.connectionState = { contextUsage: { contextWindow: 100_000, tokens: null, percent: null } };
+
+		expect(prototype.getConnectionContextUsage.call(fakeThis)).toMatchObject({ tokens: null, percent: null });
+	});
+
+	test("returns undefined when there is no snapshot yet", () => {
+		const fakeThis = createHarness({ streaming: true, inFlight: 3_000 });
+		fakeThis.connectionState = { contextUsage: undefined };
+
+		expect(prototype.getConnectionContextUsage.call(fakeThis)).toBeUndefined();
+	});
+
+	test("refreshConnectionContextUsage drops stale stats after a session switch", async () => {
+		type RefreshHarness = {
+			agentConnection: { getSessionStats(): Promise<{ contextUsage: unknown }> };
+			connectionState: { sessionId?: string; contextUsage?: unknown };
+			activityTracker: { getStatus(): { tokens: number } };
+			contextUsageTokenBaseline: number;
+			patchConnectionState(patch: Record<string, unknown>): void;
+			refreshConnectionContextUsage(): Promise<void>;
+		};
+		const refresh = (InteractiveMode.prototype as unknown as RefreshHarness).refreshConnectionContextUsage;
+		const fakeThis = Object.create(InteractiveMode.prototype) as RefreshHarness;
+		const patched: Record<string, unknown>[] = [];
+		fakeThis.activityTracker = { getStatus: () => ({ tokens: 0 }) };
+		fakeThis.contextUsageTokenBaseline = 0;
+		fakeThis.connectionState = { sessionId: "session-A", contextUsage: undefined };
+		fakeThis.patchConnectionState = (p) => patched.push(p);
+		fakeThis.agentConnection = {
+			getSessionStats: async () => {
+				// User switches sessions while the stats call is in flight.
+				fakeThis.connectionState = { sessionId: "session-B", contextUsage: undefined };
+				return { contextUsage: { contextWindow: 100_000, tokens: 50_000, percent: 50 } };
+			},
+		};
+
+		await refresh.call(fakeThis);
+
+		// Stats belonged to session-A; must not overwrite session-B.
+		expect(patched).toHaveLength(0);
+	});
+});
+
 describe("InteractiveMode.handleGoalStatusCommand", () => {
 	test("prints current goal details without queuing through the agent", () => {
 		type GoalStatusCommandHarness = {

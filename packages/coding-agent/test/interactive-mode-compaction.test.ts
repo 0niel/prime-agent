@@ -18,6 +18,7 @@ describe("InteractiveMode compaction events", () => {
 			chatContainer: { clear: vi.fn() },
 			rebuildChatFromMessages: vi.fn(),
 			addMessageToChat: vi.fn(),
+			refreshConnectionContextUsage: vi.fn().mockResolvedValue(undefined),
 			showError: vi.fn(),
 			showWarning: vi.fn(),
 			showStatus: vi.fn(),
