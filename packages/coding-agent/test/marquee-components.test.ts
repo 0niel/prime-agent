@@ -242,8 +242,8 @@ describe("marquee TUI components", () => {
 		const component = new IPythonCellComponent(state);
 
 		const collapsed = stripAnsi(component.render(100).join("\n"));
-		// Collapsed python shows no code — just the input line count and expand hint.
-		expect(collapsed).not.toContain("line_0 = 0");
+		// Collapsed python shows a one-line preview, the input line count, and the expand hint.
+		expect(collapsed).toContain("line_0 = 0");
 		expect(collapsed).not.toContain("line_7 = 7");
 		expect(collapsed).toContain("↑ 8");
 		expect(collapsed.match(/to expand/g)?.length).toBe(1);
@@ -321,19 +321,19 @@ describe("marquee TUI components", () => {
 		};
 		const component = new IPythonCellComponent(state);
 
-		const collapsed = component.render(80);
+		const collapsed = component.render(100);
 		const collapsedText = stripAnsi(collapsed.join("\n"));
 		expect(collapsedText).toContain("Ctrl+O to expand");
 		expect(collapsedText).not.toContain("traceback collapsed");
 		expect(collapsedText).not.toContain('File "<stdin>"');
 
 		component.update({ ...state, expanded: true });
-		const expanded = component.render(80);
+		const expanded = component.render(100);
 		expect(expanded).not.toBe(collapsed);
 		const expandedText = stripAnsi(expanded.join("\n"));
 		expect(expandedText).toContain("Traceback (most recent call last):");
 		expect(expandedText).toContain('File "<stdin>"');
-		expect(component.render(80)).toBe(expanded);
+		expect(component.render(100)).toBe(expanded);
 	});
 
 	test("renders sub-agent tree nodes with status, previews, and transcript expansion", async () => {

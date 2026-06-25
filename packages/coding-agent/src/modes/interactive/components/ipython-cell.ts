@@ -6,6 +6,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { previewIpythonCode } from "../../../core/tools/code-preview.js";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
 import { shortenPath } from "../../../core/tools/render-utils.js";
 import { getLanguageFromPath, highlightCode, theme } from "../theme/theme.js";
@@ -74,13 +75,6 @@ const CELL_MAGIC_PATTERN = /^\s*%%bash\b/;
 const OUTPUT_PREVIEW_LINES = 5;
 const INPUT_PREVIEW_LINES = 3;
 
-// Cap so the trailing duration/counts stay visible on narrow widths.
-const DESCRIPTOR_MAX_WIDTH = 64;
-
-const COMMENT_LINE_PATTERN = /^\s*#/;
-// Strip a leading `cd … &&` to surface the real command.
-const CD_PREFIX_PATTERN = /^\s*cd\s+[^&;|]+(?:&&|;)\s*/;
-
 const SGR_PATTERN = /\x1b\[([0-9;]*)m/g;
 
 /**
@@ -116,36 +110,6 @@ function closeOpenSgr(line: string): string {
 		}
 	}
 	return fgOpen || bgOpen ? `${line}\x1b[0m` : line;
-}
-
-function collapseWhitespace(text: string): string {
-	return text.replace(/\s+/g, " ").trim();
-}
-
-function truncateDescriptor(text: string): string {
-	if (text.length <= DESCRIPTOR_MAX_WIDTH) {
-		return text;
-	}
-	return `${text.slice(0, DESCRIPTOR_MAX_WIDTH - 1).trimEnd()}…`;
-}
-
-/** Leading meaningful command of a cell; "" while code is still streaming. */
-function summarizeCell(code: string): string {
-	const lines = code.split("\n");
-	const isBashCell = CELL_MAGIC_PATTERN.test(lines[0] ?? "");
-	const body = isBashCell ? lines.slice(1) : lines;
-	for (const rawLine of body) {
-		const trimmed = rawLine.trim();
-		if (!trimmed || COMMENT_LINE_PATTERN.test(trimmed)) {
-			continue;
-		}
-		const command = trimmed.replace(MAGIC_LINE_PATTERN, "").trim();
-		if (!command) {
-			continue;
-		}
-		return truncateDescriptor(collapseWhitespace(command.replace(CD_PREFIX_PATTERN, "")));
-	}
-	return "";
 }
 
 export function getIpythonCodeFromArgs(args: unknown): string {
@@ -373,19 +337,17 @@ export class IPythonCellComponent implements Component {
 		return this.renderCache.set(safeWidth, cacheVersion, lines);
 	}
 
-	// Command is bash-only: python first-lines are usually imports/setup, not intent.
 	private collapsedLine(details: IpythonDetails): string {
 		const code = this.state.code.trimEnd();
 		const isBashCell = CELL_MAGIC_PATTERN.test(code.split("\n")[0] ?? "");
-		const parts = [`${this.marker(details)} ${theme.fg("muted", isBashCell ? "bash" : "python")}`];
+		const preview = previewIpythonCode(code);
+		const languageLabel = isBashCell && preview.language !== "bash" ? `bash · ${preview.language}` : preview.language;
+		const parts = [`${this.marker(details)} ${theme.fg("muted", languageLabel)}`];
 
-		if (isBashCell) {
-			const command = summarizeCell(code);
-			if (command) {
-				parts.push(this.highlightInputLine(command, true));
-			} else if (!this.state.executionStarted) {
-				parts.push(theme.fg("muted", "waiting for code"));
-			}
+		if (preview.text) {
+			parts.push(this.highlightInputLine(preview.text, preview.language === "bash"));
+		} else if (!this.state.executionStarted) {
+			parts.push(theme.fg("muted", "waiting for code"));
 		}
 
 		const counts = this.lineCounts(details);
