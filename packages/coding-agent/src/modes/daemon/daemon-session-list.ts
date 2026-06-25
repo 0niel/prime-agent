@@ -142,7 +142,13 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		modified,
 		// Subagent sessions live in artifact dirs that the saved-session scan
 		// never sees; their spawn prompt is the most identifying title we have.
-		firstMessage: savedSession?.firstMessage ?? (metadata.prompt ? compactRlmText(metadata.prompt, 120) : undefined),
+		// A freshly created top-level session has neither yet — its jsonl is not
+		// scanned until it flushes — so derive from the live first user message to
+		// avoid titling the chat with its session ID until the file lands.
+		firstMessage:
+			savedSession?.firstMessage ??
+			(metadata.prompt ? compactRlmText(metadata.prompt, 120) : undefined) ??
+			firstUserMessageText(session),
 		parentActiveSessionId: metadata.parentActiveSessionId,
 		parentSessionId: metadata.parentSessionId,
 		parentSessionPath: savedSession?.parentSessionPath ?? metadata.parentSessionFile,
@@ -259,6 +265,19 @@ function rlmChildSnapshotForActiveSession(
 		sessionDir: metadata.sessionDir ?? session.sessionManager.getSessionDir(),
 		transcript,
 	};
+}
+
+function firstUserMessageText(session: ActiveSessionState["runtime"]["session"]): string | undefined {
+	for (const message of session.messages) {
+		if (message.role !== "user") {
+			continue;
+		}
+		const text = compactRlmText(readMessageText(message.content), 120).trim();
+		if (text) {
+			return text;
+		}
+	}
+	return undefined;
 }
 
 function readMessageText(content: unknown): string {
