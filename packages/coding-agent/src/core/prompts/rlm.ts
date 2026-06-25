@@ -83,9 +83,5 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		parts.push("", IPYTHON_CONTROL_PROMPT);
 	}
 
-	if (activeTools.length > 0) {
-		parts.push("", "Call at most one built-in tool per turn.");
-	}
-
 	return parts.join("\n");
 }

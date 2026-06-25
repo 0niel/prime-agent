@@ -80,8 +80,6 @@ describe("buildRlmPrompt", () => {
 				"RLM-native call contract for refined entries: installed Python skills are called from IPython as `await <skill_import>(...)` with keyword arguments, or as `<skill_import> ...` from shell when a CLI exists. Harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Harness subagent entries are reusable delegation specs; invoke them by turning the spec into a concise task prompt and calling `await rlm('sub-task')`, or `await asyncio.gather(rlm('task1'), rlm('task2'))` for independent parallel subagents. Do not invent non-native wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
 				"",
 				"Treat harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant harness component, validate on the next action, then record the outcome. Do not rewrite the whole harness when a focused memory, skill, prompt note, or subagent spec is enough.",
-				"",
-				"Call at most one built-in tool per turn.",
 			].join("\n"),
 		);
 	});
@@ -362,7 +360,7 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("run it through that project's own environment");
 		expect(prompt).not.toContain("!cd build && make");
 		expect(prompt).not.toContain("out = !cmd");
-		expect(prompt).toContain("Call at most one built-in tool per turn.");
+		expect(prompt).not.toContain("Call at most one built-in tool per turn.");
 		expect(prompt).not.toContain("# IPython Kernel Guidance");
 		expect(prompt).not.toContain("Available tools:");
 		expect(prompt).not.toContain("## Worked example:");
@@ -425,9 +423,10 @@ describe("buildSystemPrompt", () => {
 			cwd: "/repo",
 		});
 
-		expect(prompt.indexOf("Call at most one built-in tool per turn.")).toBeLessThan(
+		expect(prompt.indexOf("Treat harness refinement as a small, evidence-backed update")).toBeLessThan(
 			prompt.indexOf("extra instruction"),
 		);
+		expect(prompt).not.toContain("Call at most one built-in tool per turn.");
 	});
 
 	test("project context files are appended", () => {
