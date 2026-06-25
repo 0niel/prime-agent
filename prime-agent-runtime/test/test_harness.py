@@ -437,6 +437,40 @@ class HarnessStateTest(unittest.TestCase):
             )
             self.assertFalse((env_global_dir / "harness_state.json").exists())
 
+    def test_cached_state_dir_global_flag_uses_later_explicit_state_file(self) -> None:
+        previous_local = os.environ.get("RLM_HARNESS_STATE_DIR")
+        previous_global = os.environ.get("RLM_GLOBAL_HARNESS_STATE_DIR")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            explicit_dir = Path(temp_dir) / "explicit"
+            env_global_dir = Path(temp_dir) / "env-global"
+            os.environ["RLM_HARNESS_STATE_DIR"] = str(explicit_dir)
+            os.environ["RLM_GLOBAL_HARNESS_STATE_DIR"] = str(env_global_dir)
+            try:
+                cached_from_env = get_harness_state()
+                cached_from_explicit = get_harness_state(explicit_dir)
+                global_entry = cached_from_explicit.create_memory(
+                    "Scoped global",
+                    "custom dir after cache hit",
+                    id="cached_scoped_global",
+                    global_=True,
+                )
+            finally:
+                if previous_local is None:
+                    os.environ.pop("RLM_HARNESS_STATE_DIR", None)
+                else:
+                    os.environ["RLM_HARNESS_STATE_DIR"] = previous_local
+                if previous_global is None:
+                    os.environ.pop("RLM_GLOBAL_HARNESS_STATE_DIR", None)
+                else:
+                    os.environ["RLM_GLOBAL_HARNESS_STATE_DIR"] = previous_global
+
+            self.assertIs(cached_from_env, cached_from_explicit)
+            self.assertEqual(global_entry.scope, "global")
+            self.assertIsNotNone(
+                HarnessState(explicit_dir / "harness_state.json", scope="global").get("memory", "cached_scoped_global")
+            )
+            self.assertFalse((env_global_dir / "harness_state.json").exists())
+
     def test_default_state_uses_global_harness_env_dir(self) -> None:
         previous = os.environ.get("RLM_HARNESS_STATE_DIR")
         with tempfile.TemporaryDirectory() as temp_dir:

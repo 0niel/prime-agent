@@ -744,9 +744,9 @@ def get_harness_state(
     state = _state_cache.get(cache_key)
     if state is None:
         state = HarnessState(file_path, scope=scope)
-        if state_dir is not None:
-            state._global_target_state_dir = Path(state_dir).expanduser().resolve()
         _state_cache[cache_key] = state
+    if state_dir is not None:
+        state._global_target_state_dir = Path(state_dir).expanduser().resolve()
     return state
 
 
