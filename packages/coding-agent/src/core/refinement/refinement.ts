@@ -108,9 +108,9 @@ export interface AutoRefineReview {
 	instructions?: string;
 }
 
-const REFINEMENT_SYSTEM_PROMPT = `You are Prime Agent's /refine subsystem.
+const REFINEMENT_SYSTEM_PROMPT = `You are Prime Agent's /refine continual harness subsystem.
 
-Your job is to improve the editable harness state from the current trajectory.
+Your job is to improve the editable continual harness state from the current trajectory.
 This is similar in spirit to context compaction, but instead of summarizing the
 conversation you emit precise Create, Update, or Delete edits to reusable state.
 
@@ -121,13 +121,13 @@ Editable components:
 - subagent: reusable delegation specs, including purpose, instructions, and when to invoke. Include the RLM-native call form: create a concise task prompt and call \`await rlm("sub-task")\`; for independent parallel subagents use \`await asyncio.gather(rlm("task1"), rlm("task2"))\`. Do not invent wrappers like \`run_subagent(...)\`.
 
 Scope and persistence policy:
-- The default editable harness store is local to the current Prime Agent session. Use it for session-specific progress, active task state, current-run coordination notes, temporary blockers, and project facts that should not affect other sessions.
+- The default editable continual harness store is local to the current Prime Agent session. Use it for session-specific progress, active task state, current-run coordination notes, temporary blockers, and project facts that should not affect other sessions.
 - A caller may explicitly request global refinement. Global edits must be stable cross-session lessons, durable user preferences, reusable skills/subagents, or tool/environment facts that should affect future sessions.
 - Project/workspace-specific lessons may be persisted globally only when the title, path, or content explicitly names the project/workspace and the lesson is likely to be reused in future sessions for that project. Prefer local edits when the lesson only belongs in the current conversation.
 - Use memory for declarative facts and preferences, skill for repeatable procedures exposed as Python calls, prompt for narrow behavioral policy addenda, and subagent for reusable delegation roles.
 - When an edit is persisted, include metadata such as \`{"scope":"local"}\` or \`{"scope":"global"}\` when that helps future review understand the intended blast radius.
 
-Use the trajectory, current harness state, and prior refinement history. Prefer
+Use the trajectory, current continual harness state, and prior refinement history. Prefer
 small evidence-backed edits. If prior refinements caused issues, rollback or
 replace the faulty editable entries. Never edit source files directly. Output
 JSON only with this exact shape:
@@ -392,7 +392,7 @@ export function formatHarnessStateForPrompt(
 		"Default to local refinement for current task progress, temporary blockers, and session coordination. Use global only for stable cross-session lessons, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts.",
 		"Use these prompt notes, memories, skills, and subagent specs when they are relevant. The base system prompt is immutable; prompt entries below are supplemental notes only.",
 		"",
-		"When to call `/refine`: after a repeated failure, a reusable tactic emerges, a user corrects behavior that should persist locally or globally, validation shows a harness entry is wrong, or a skill/subagent/memory/prompt note should be created, updated, deleted, or rolled back. Keep `/refine` edits small and evidence-backed.",
+		"When to call `/refine`: after a repeated failure, a reusable tactic emerges, a user corrects behavior that should persist locally or globally, validation shows a continual harness entry is wrong, or a skill/subagent/memory/prompt note should be created, updated, deleted, or rolled back. Keep `/refine` continual harness edits small and evidence-backed.",
 		"",
 		"Call contract: use installed Python skills as `await <skill_import>(...)` in IPython, or `<skill_import> ...` in shell when a CLI exists. Harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Harness subagent entries are invoked by composing a concise task prompt and calling `await rlm('sub-task')`; use `await asyncio.gather(rlm('task1'), rlm('task2'))` for independent parallel subagents. Do not invent wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
 		"",
@@ -513,7 +513,7 @@ function parseProposal(text: string): RefinementProposal {
 	const record = value as Record<string, unknown>;
 	const edits = Array.isArray(record.edits) ? record.edits : [];
 	return {
-		summary: typeof record.summary === "string" ? record.summary : "Refined harness state",
+		summary: typeof record.summary === "string" ? record.summary : "Refined continual harness state",
 		rationale: typeof record.rationale === "string" ? record.rationale : "",
 		expectedOutcome: typeof record.expectedOutcome === "string" ? record.expectedOutcome : "",
 		edits: edits
@@ -685,7 +685,7 @@ function rollbackProposal(target: RefinementResult): RefinementProposal {
 	}
 	return {
 		summary: `Rollback refinement ${target.id}`,
-		rationale: `Restores harness state snapshots from refinement ${target.id}.`,
+		rationale: `Restores continual harness state snapshots from refinement ${target.id}.`,
 		expectedOutcome: "Faulty refinement edits are reverted.",
 		edits,
 	};

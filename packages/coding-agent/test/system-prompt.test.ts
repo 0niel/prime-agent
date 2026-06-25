@@ -253,7 +253,7 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("await rlm('sub-task')");
 		expect(prompt).toContain("after a repeated failure");
 		expect(prompt).toContain("a reusable tactic emerges");
-		expect(prompt).toContain("validation shows a harness entry is wrong");
+		expect(prompt).toContain("validation shows a continual harness entry is wrong");
 		expect(prompt).toContain("[global:focused_edits] Focused edits (policy, v1)");
 		expect(prompt).toContain("[global:validation] Validation (repo/prime-agent, v2): Run `npm run check`");
 		expect(prompt).toContain("[global:review_refinement] Review refinement (quality, v1)");

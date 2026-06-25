@@ -7415,7 +7415,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 		this.showStatus(
 			options.rollbackId
 				? `Rolling back refinement ${options.rollbackId}...`
-				: `Refining ${global ? "global" : "local"} harness state...`,
+				: `Refining ${global ? "global" : "local"} continual harness state...`,
 		);
 
 		try {
@@ -7423,7 +7423,9 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 			const applied = result.appliedEdits.filter((edit) => edit.applied).length;
 			const failed = result.appliedEdits.length - applied;
 			const failedSuffix = failed > 0 ? `, ${failed} failed` : "";
-			this.showStatus(`Refined harness state: ${applied} edit${applied === 1 ? "" : "s"} applied${failedSuffix}`);
+			this.showStatus(
+				`Refined continual harness state: ${applied} edit${applied === 1 ? "" : "s"} applied${failedSuffix}`,
+			);
 			this.showStatus(`Harness state: ${result.harnessStatePath}`);
 		} catch (error) {
 			this.showError(`Refinement failed: ${error instanceof Error ? error.message : String(error)}`);

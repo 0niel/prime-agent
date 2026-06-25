@@ -247,7 +247,7 @@ describe("harness refinement", () => {
 		expect(state.refinements.at(-1)?.changes).toEqual(kinds.map((kind) => `delete ${kind}:${kind}_entry`));
 	});
 
-	it("applies create, update, and delete edits to editable harness state", () => {
+	it("applies create, update, and delete edits to editable continual harness state", () => {
 		const state = loadHarnessState(makeTempDir());
 		const first = applyRefinementProposal(
 			state,
@@ -898,7 +898,7 @@ describe("harness refinement", () => {
 
 		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
 		expect(completeSimpleMock.mock.calls[0][1]).toMatchObject({
-			systemPrompt: expect.stringContaining("The default editable harness store is local"),
+			systemPrompt: expect.stringContaining("The default editable continual harness store is local"),
 		});
 		expect(completeSimpleMock.mock.calls[0][1]).toMatchObject({
 			systemPrompt: expect.stringContaining("A caller may explicitly request global refinement"),

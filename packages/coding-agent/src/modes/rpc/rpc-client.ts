@@ -277,7 +277,7 @@ export class RpcClient {
 	}
 
 	/**
-	 * Refine editable harness state.
+	 * Refine editable continual harness state.
 	 */
 	async refine(
 		options: { instructions?: string; rollbackId?: string; global?: boolean } = {},

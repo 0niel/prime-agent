@@ -3152,7 +3152,7 @@ export class AgentSession {
 	}
 
 	/**
-	 * Refine editable harness state: prompt notes, memory, skills, and subagent specs.
+	 * Refine editable continual harness state: prompt notes, memory, skills, and subagent specs.
 	 * The base system prompt is intentionally not editable through this path.
 	 */
 	async refine(
