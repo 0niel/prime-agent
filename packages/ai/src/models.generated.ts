@@ -12824,7 +12824,7 @@ export const MODELS = {
 			baseUrl: "https://api.pinference.ai/api/v1",
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: false,
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 1,
 				output: 5,
@@ -12843,7 +12843,7 @@ export const MODELS = {
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
 			thinkingLevelMap: {"max":"max"},
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 5,
 				output: 25,
@@ -12862,7 +12862,7 @@ export const MODELS = {
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
 			thinkingLevelMap: {"xhigh":"xhigh","max":"max"},
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 5,
 				output: 25,
@@ -12881,7 +12881,7 @@ export const MODELS = {
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
 			thinkingLevelMap: {"xhigh":"xhigh","max":"max"},
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 5,
 				output: 25,
@@ -12899,7 +12899,7 @@ export const MODELS = {
 			baseUrl: "https://api.pinference.ai/api/v1",
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 3,
 				output: 15,
@@ -12918,7 +12918,7 @@ export const MODELS = {
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
 			thinkingLevelMap: {"max":"max"},
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 3,
 				output: 15,
@@ -13010,7 +13010,7 @@ export const MODELS = {
 			baseUrl: "https://api.pinference.ai/api/v1",
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 1.0925,
 				output: 4.6,
@@ -13065,7 +13065,7 @@ export const MODELS = {
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
 			thinkingLevelMap: {"xhigh":"xhigh"},
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 1.75,
 				output: 14,
@@ -13084,7 +13084,7 @@ export const MODELS = {
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
 			thinkingLevelMap: {"xhigh":"xhigh"},
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 2.5,
 				output: 15,
@@ -13103,7 +13103,7 @@ export const MODELS = {
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
 			thinkingLevelMap: {"xhigh":"xhigh"},
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 0.75,
 				output: 4.5,
@@ -13122,7 +13122,7 @@ export const MODELS = {
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
 			thinkingLevelMap: {"xhigh":"xhigh"},
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 30,
 				output: 180,
@@ -13141,7 +13141,7 @@ export const MODELS = {
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
 			thinkingLevelMap: {"xhigh":"xhigh"},
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 5,
 				output: 30,
@@ -13213,7 +13213,7 @@ export const MODELS = {
 			baseUrl: "https://api.pinference.ai/api/v1",
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 0.784,
 				output: 3.16,
@@ -13231,7 +13231,7 @@ export const MODELS = {
 			baseUrl: "https://api.pinference.ai/api/v1",
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 2,
 				output: 6,
@@ -13249,7 +13249,7 @@ export const MODELS = {
 			baseUrl: "https://api.pinference.ai/api/v1",
 			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
 			reasoning: true,
-			input: ["text"],
+			input: ["text", "image"],
 			cost: {
 				input: 2,
 				output: 6,
