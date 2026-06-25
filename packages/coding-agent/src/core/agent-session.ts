@@ -3111,11 +3111,11 @@ export class AgentSession {
 		const branchVersion = this._autoRefineBranchVersion;
 		try {
 			const review = await this._reviewAutoRefine({ reason, turnsSinceLastReview });
-			this._lastAutoRefineReviewAt = nowMs;
-			this._assistantTurnsSinceAutoRefine = 0;
 			if (branchVersion !== this._autoRefineBranchVersion) {
 				return;
 			}
+			this._lastAutoRefineReviewAt = nowMs;
+			this._assistantTurnsSinceAutoRefine = 0;
 			if (reason === "compact") {
 				this._compactAutoRefinePending = false;
 			}
@@ -3220,7 +3220,17 @@ export class AgentSession {
 			// Re-read the target state immediately before applying so concurrent kernel
 			// (`rlm.harness`) writes during the LLM pass are not clobbered.
 			const state = loadHarnessState(targetHarnessStateDir, targetScope);
-			const result = applyRefinementProposal(state, plan.proposal, {
+			const proposal =
+				targetScope === "local"
+					? {
+							...plan.proposal,
+							edits: plan.proposal.edits.map((edit) => ({
+								...edit,
+								id: edit.id?.startsWith("local:") ? edit.id.slice("local:".length) : edit.id,
+							})),
+						}
+					: plan.proposal;
+			const result = applyRefinementProposal(state, proposal, {
 				id: plan.id,
 				rollbackOf: plan.rollbackOf,
 				scope: targetScope,

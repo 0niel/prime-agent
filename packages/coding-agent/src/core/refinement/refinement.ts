@@ -832,7 +832,7 @@ ${historyForPrompt(history)}
 		`<conversation>
 ${conversationText}
 </conversation>`,
-		"Return shouldRefine=false unless a durable, evidence-backed harness update is likely useful. Prefer no-op for task-local, session-only, speculative, or unqualified project-specific lessons.",
+		"Return shouldRefine=true when the trajectory contains evidence useful to this session's future turns. Prefer local harness edits for current task progress, temporary blockers, and current-run coordination. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified facts likely to be reused in future sessions.",
 	].join("\n\n");
 	// Auto-refine review requires parseable JSON. Keep it non-reasoning so
 	// reasoning-capable models use final text budget for the JSON object.

@@ -3,7 +3,14 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { RefinementResult } from "../../src/core/refinement/index.js";
+import {
+	applyRefinementProposal,
+	getGlobalHarnessStateDir,
+	getLocalHarnessStateDir,
+	loadHarnessState,
+	type RefinementResult,
+	saveHarnessState,
+} from "../../src/core/refinement/index.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
 
 type AutoRefineReason = "turn_interval" | "compact";
@@ -303,7 +310,7 @@ describe("AgentSession queue characterization", () => {
 		expect(internals._assistantTurnsSinceAutoRefine).toBe(0);
 	});
 
-	it("records auto-refine cooldown when a review completes after branch navigation", async () => {
+	it("does not apply stale auto-refine cooldown when a review completes after branch navigation", async () => {
 		let finishReview: (() => void) | undefined;
 		const reviewStarted = new Promise<void>((resolve) => {
 			finishReview = resolve;
@@ -329,7 +336,7 @@ describe("AgentSession queue characterization", () => {
 		await autoRefinePromise;
 
 		expect(refine).not.toHaveBeenCalled();
-		expect(internals._lastAutoRefineReviewAt).toBeGreaterThanOrEqual(beforeReviewAt);
+		expect(internals._lastAutoRefineReviewAt).toBe(beforeReviewAt);
 		expect(internals._assistantTurnsSinceAutoRefine).toBe(0);
 		expect(internals._pendingAutoRefineReview).toBeUndefined();
 	});
@@ -427,6 +434,87 @@ describe("AgentSession queue characterization", () => {
 
 		expect(reviewer).toHaveBeenCalledWith({ reason: "turn_interval", turnsSinceLastReview: 1 });
 		expect(refine).toHaveBeenCalled();
+	});
+
+	it("strips local display prefixes before applying local refine edits", async () => {
+		const harness = await createAutoRefineHarness();
+		harnesses.push(harness);
+		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		process.env.PRIME_AGENT_CODING_AGENT_DIR = `${harness.tempDir}/agent`;
+		try {
+			const globalDir = getGlobalHarnessStateDir();
+			const localDir = getLocalHarnessStateDir(harness.sessionManager.getSessionArtifactDir())!;
+			const globalState = loadHarnessState(globalDir, "global");
+			const localState = loadHarnessState(localDir, "local");
+			applyRefinementProposal(
+				globalState,
+				{
+					summary: "Global shared memory",
+					rationale: "seed",
+					expectedOutcome: "seeded",
+					edits: [
+						{
+							action: "create",
+							kind: "memory",
+							id: "shared",
+							title: "Shared",
+							content: "Global content",
+						},
+					],
+				},
+				{ id: "seed_global", scope: "global" },
+			);
+			applyRefinementProposal(
+				localState,
+				{
+					summary: "Local shared memory",
+					rationale: "seed",
+					expectedOutcome: "seeded",
+					edits: [
+						{
+							action: "create",
+							kind: "memory",
+							id: "shared",
+							title: "Shared",
+							content: "Local content",
+						},
+					],
+				},
+				{ id: "seed_local", scope: "local" },
+			);
+			saveHarnessState(globalDir, globalState);
+			saveHarnessState(localDir, localState);
+			harness.setResponses([
+				fauxAssistantMessage(
+					JSON.stringify({
+						summary: "Update local shared memory",
+						rationale: "The local display id was selected from merged state.",
+						expectedOutcome: "Only the local entry changes.",
+						edits: [
+							{
+								action: "update",
+								kind: "memory",
+								id: "local:shared",
+								title: "Shared",
+								content: "Updated local content",
+							},
+						],
+					}),
+				),
+			]);
+
+			const result = await harness.session.refine({ instructions: "update the local shared memory" });
+
+			expect(result.appliedEdits[0]).toMatchObject({ id: "shared", applied: true });
+			expect(loadHarnessState(localDir, "local").entries.memory.shared.content).toBe("Updated local content");
+			expect(loadHarnessState(globalDir, "global").entries.memory.shared.content).toBe("Global content");
+		} finally {
+			if (previousAgentDir === undefined) {
+				delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+			} else {
+				process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
+			}
+		}
 	});
 
 	it("dispatches extension commands immediately when prompted while idle", async () => {

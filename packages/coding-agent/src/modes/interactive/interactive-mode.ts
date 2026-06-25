@@ -7377,9 +7377,9 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 	private async handleRefineCommand(args?: string): Promise<void> {
 		let trimmedArgs = args?.trim() ?? "";
 		const globalOption: { global?: boolean } = {};
-		if (/(^|\s)--global(?=\s|$)/.test(trimmedArgs)) {
+		if (/^--global(?=\s|$)/.test(trimmedArgs)) {
 			globalOption.global = true;
-			trimmedArgs = trimmedArgs.replace(/(^|\s)--global(?=\s|$)/g, " ").trim();
+			trimmedArgs = trimmedArgs.replace(/^--global(?=\s|$)/, "").trim();
 		}
 		const rollbackPrefix = "rollback ";
 		let options: { instructions?: string; rollbackId?: string; global?: boolean };
@@ -7392,7 +7392,12 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 		if (trimmedArgs?.startsWith(rollbackPrefix) && trimmedArgs.slice(rollbackPrefix.length).trim()) {
 			// Rollback uses the global refinement history, not the current trajectory,
 			// so it must work even in a fresh session with no messages yet.
-			options = { rollbackId: trimmedArgs.slice(rollbackPrefix.length).trim(), ...globalOption };
+			let rollbackId = trimmedArgs.slice(rollbackPrefix.length).trim();
+			if (/\s--global$/.test(rollbackId)) {
+				globalOption.global = true;
+				rollbackId = rollbackId.replace(/\s--global$/, "").trim();
+			}
+			options = { rollbackId, ...globalOption };
 		} else {
 			let messageCount: number;
 			try {
