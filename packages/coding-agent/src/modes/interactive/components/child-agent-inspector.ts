@@ -69,6 +69,9 @@ export interface ChildAgentInspectorNode {
 	status: ChildAgentStatus;
 	durationMs?: number;
 	answerPreview?: string;
+	toolUseCount?: number;
+	tokenCount?: number;
+	recap?: string;
 	sessionDir: string;
 	transcript: readonly ChildAgentTranscriptLine[];
 	structuredTranscript?: readonly ChildAgentStructuredTranscriptEntry[];

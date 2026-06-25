@@ -181,12 +181,18 @@ export class AgentDaemon {
 	private readonly cronScheduler: AgentCronScheduler;
 	private readonly summarizer = new DaemonSessionSummarizer(
 		() => [...this.sessions.values()],
-		(state) =>
+		(state) => {
+			// Subagents share their recap with the parent so it shows in the parent's
+			// subagent tree; their own session channel usually has no attached client.
+			if (state.runtime.metadata.kind === "subagent") {
+				state.runtime.session.setCurrentRecap(state.summaryState?.summary);
+			}
 			this.broadcastToSession(state, {
 				type: "session_status",
 				activeSessionId: state.activeSessionId,
 				recap: state.summaryState?.summary,
-			}),
+			});
+		},
 	);
 
 	constructor(

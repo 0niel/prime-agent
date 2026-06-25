@@ -474,6 +474,12 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 	status: AgentConnectionRlmChildAgentStatus;
 	durationMs?: number;
 	answerPreview?: string;
+	/** Number of tool executions the subagent has started so far. */
+	toolUseCount?: number;
+	/** Context size (tokens) of the subagent's latest turn. */
+	tokenCount?: number;
+	/** Latest recap of what the subagent is doing. */
+	recap?: string;
 	sessionDir: string;
 	transcript: readonly AgentConnectionRlmChildAgentTranscriptLine[];
 	structuredTranscript?: readonly AgentConnectionRlmChildAgentStructuredTranscriptEntry[];
@@ -503,6 +509,7 @@ export type AgentConnectionSessionEvent =
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| { type: "rlm_child_update"; child: AgentConnectionRlmChildAgentSnapshot }
+	| { type: "recap_update"; recap: string | undefined }
 	| { type: "goal_update"; goal: GoalState }
 	| { type: "bash_start"; command: string; excludeFromContext: boolean }
 	| { type: "bash_output"; chunk: string }

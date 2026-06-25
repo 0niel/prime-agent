@@ -44,6 +44,7 @@ export {
 	type SubAgentTreeNode,
 	type SubAgentTreeOptions,
 } from "./sub-agent-tree.js";
+export { SubagentTreeView } from "./subagent-tree-view.js";
 export { ThemeSelectorComponent } from "./theme-selector.js";
 export { ThinkingSelectorComponent } from "./thinking-selector.js";
 export { ToolExecutionComponent, type ToolExecutionOptions } from "./tool-execution.js";

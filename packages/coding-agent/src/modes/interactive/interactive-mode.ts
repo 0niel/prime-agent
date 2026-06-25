@@ -157,6 +157,7 @@ import { ScopedModelsSelectorComponent } from "./components/scoped-models-select
 import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
+import { SubagentTreeView } from "./components/subagent-tree-view.js";
 import { ToolExecutionComponent, type ToolExecutionDefinition } from "./components/tool-execution.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
@@ -552,6 +553,9 @@ export class InteractiveMode {
 
 	// RLM child-agent tray: inline list below the editor, full-screen detail on open.
 	private childAgentSummary: ChildAgentSummaryComponent;
+	// Live tree of the current turn's subagents, drawn above the working loader.
+	// Shown in addition to the inline list below the prompt bar.
+	private subagentTree = new SubagentTreeView();
 	private childAgentDetail: ChildAgentDetailComponent;
 	private childAgentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	private childAgentNodes: ChildAgentInspectorNode[] = [];
@@ -2407,22 +2411,16 @@ export class InteractiveMode {
 				? undefined
 				: this.formatWorkingElapsed(Date.now() - this.workingStartedAt);
 		const status = this.activityTracker.getStatus();
-		const runningSubagents = this.countRunningChildAgents();
-		// Subagents-only (turn ended, subagents still running): just the count, no
-		// elapsed timer (it resets on view return) and no stale extension message.
+		// The subagent count/recaps live in the tree above the loader, so the loader
+		// message itself no longer repeats "N subagents running".
 		if (!this.isAgentStreaming()) {
-			return runningSubagents > 0
-				? `${runningSubagents} ${runningSubagents === 1 ? "subagent" : "subagents"} running`
-				: "";
+			return "";
 		}
 		if (this.workingMessage !== undefined) {
 			// Extensions and tool bootstrap own the message; keep the plain "<message> <elapsed>" form.
 			return elapsed === undefined ? this.workingMessage : `${this.workingMessage} ${elapsed}`;
 		}
 		const parts: string[] = [AGENT_ACTIVITY_LABELS[status.activity]];
-		if (runningSubagents > 0) {
-			parts.push(`${runningSubagents} ${runningSubagents === 1 ? "subagent" : "subagents"} running`);
-		}
 		if (elapsed !== undefined) {
 			parts.push(elapsed);
 		}
@@ -4372,6 +4370,7 @@ export class InteractiveMode {
 		}
 		this.childAgentNodes = this.buildChildAgentInspectorNodes();
 		this.childAgentSummary.setNodes(this.childAgentNodes);
+		this.subagentTree.setNodes(this.childAgentNodes);
 		this.updateWorkingPulse();
 		this.syncWorkingLoader();
 		this.updateWorkingLoaderMessage();
@@ -4399,6 +4398,8 @@ export class InteractiveMode {
 		this.mainViewContainer.clear();
 		this.mainViewContainer.addChild(this.chatContainer);
 		this.mainViewContainer.addChild(this.pendingMessagesContainer);
+		// Subagent tree sits directly above the loader, mirroring Claude's layout.
+		this.mainViewContainer.addChild(this.subagentTree);
 		this.mainViewContainer.addChild(this.statusContainer);
 	}
 
@@ -4406,6 +4407,7 @@ export class InteractiveMode {
 		this.childAgentSnapshots.clear();
 		this.childAgentNodes = [];
 		this.childAgentSummary.setNodes([]);
+		this.subagentTree.setNodes([]);
 		this.childAgentSummary.setHidden(false);
 		this.childAgentDetail.setNode(undefined);
 		this.childAgentDetailNodeId = undefined;
@@ -4608,6 +4610,9 @@ export class InteractiveMode {
 			status: child.status,
 			durationMs: child.durationMs,
 			answerPreview: child.answerPreview,
+			toolUseCount: child.toolUseCount,
+			tokenCount: child.tokenCount,
+			recap: child.recap,
 			sessionDir: child.sessionDir,
 			transcript: child.transcript.map(
 				(line): ChildAgentTranscriptLine => ({

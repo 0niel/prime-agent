@@ -253,6 +253,8 @@ describe("AgentSession rlm recursion", () => {
 			status: string;
 			label: string;
 			answerPreview?: string;
+			tokenCount?: number;
+			toolUseCount?: number;
 			transcript: readonly { role: string; text: string }[];
 			structuredTranscript?: readonly { type: string; role: string; text: string }[];
 		}> = [];
@@ -276,6 +278,9 @@ describe("AgentSession rlm recursion", () => {
 		expect(childUpdates[0]?.label).toBe("summarize shard 1");
 		const doneUpdate = [...childUpdates].reverse().find((update) => update.status === "done");
 		expect(doneUpdate?.answerPreview).toBe("child answer: summarize shard 1");
+		// Context tokens from the child's own assistant usage (input 7 + output 3); no tools ran.
+		expect(doneUpdate?.tokenCount).toBe(10);
+		expect(doneUpdate?.toolUseCount).toBeUndefined();
 		expect(doneUpdate?.transcript).toContainEqual({ role: "user", text: "summarize shard 1" });
 		expect(doneUpdate?.transcript).toContainEqual({ role: "assistant", text: "child answer: summarize shard 1" });
 		expect(doneUpdate?.structuredTranscript).toEqual(
@@ -284,6 +289,47 @@ describe("AgentSession rlm recursion", () => {
 				expect.objectContaining({ type: "message", role: "assistant", text: "child answer: summarize shard 1" }),
 			]),
 		);
+	});
+
+	it("surfaces a child's recap on its snapshot once the summarizer sets it", async () => {
+		let releaseChild: () => void = () => {};
+		const release = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		let childStarted = false;
+		const root = createSession({
+			streamFn: (_model, context) => {
+				const text = userText(context);
+				const stream = createAssistantMessageEventStream();
+				childStarted = true;
+				void release.then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
+				});
+				return stream;
+			},
+		});
+
+		const recaps: Array<string | undefined> = [];
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update") {
+				recaps.push(event.child.recap);
+			}
+		});
+
+		const runPromise = root.runRlmChild("slow shard");
+		await waitFor(() => childStarted);
+		const rootRun = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0];
+		if (!rootRun?.session) {
+			throw new Error("Missing child session on root run");
+		}
+
+		// What the daemon summarizer does for subagents: stash the recap on the session,
+		// which emits recap_update and re-emits the parent's enriched child snapshot.
+		rootRun.session.setCurrentRecap("Summarizing the slow shard");
+		await waitFor(() => recaps.includes("Summarizing the slow shard"));
+
+		releaseChild();
+		await runPromise;
 	});
 
 	it("surfaces missing ripgrep as one child-agent error before model work starts", async () => {
