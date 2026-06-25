@@ -7376,7 +7376,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 
 	private async handleRefineCommand(args?: string): Promise<void> {
 		let trimmedArgs = args?.trim() ?? "";
-		const globalOption: { global?: boolean } = {};
+		const globalOption: { global: boolean } = { global: false };
 		if (/^--global(?=\s|$)/.test(trimmedArgs)) {
 			globalOption.global = true;
 			trimmedArgs = trimmedArgs.replace(/^--global(?=\s|$)/, "").trim();

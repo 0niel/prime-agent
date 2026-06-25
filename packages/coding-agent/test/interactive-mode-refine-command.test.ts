@@ -52,7 +52,7 @@ describe("InteractiveMode.handleRefineCommand", () => {
 		// Rollback uses global history, so the empty-trajectory guard must not block it.
 		expect(context.agentConnection.getSessionStats).not.toHaveBeenCalled();
 		expect(context.showWarning).not.toHaveBeenCalled();
-		expect(context.agentConnection.refine).toHaveBeenCalledWith({ rollbackId: "refine_123" });
+		expect(context.agentConnection.refine).toHaveBeenCalledWith({ rollbackId: "refine_123", global: false });
 	});
 
 	test("parses --global after rollback id", async () => {
@@ -111,6 +111,7 @@ describe("InteractiveMode.handleRefineCommand", () => {
 		expect(context.showStatus).toHaveBeenCalledWith("Refining local continual harness state...");
 		expect(context.agentConnection.refine).toHaveBeenCalledWith({
 			instructions: "update docs to explain --global",
+			global: false,
 		});
 	});
 
@@ -131,6 +132,7 @@ describe("InteractiveMode.handleRefineCommand", () => {
 		expect(context.showStatus).toHaveBeenCalledWith("Refining local continual harness state...");
 		expect(context.agentConnection.refine).toHaveBeenCalledWith({
 			instructions: "focus on validation",
+			global: false,
 		});
 	});
 
