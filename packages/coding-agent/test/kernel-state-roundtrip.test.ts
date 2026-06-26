@@ -141,6 +141,24 @@ describeIfKernel("kernel state snapshot round-trip (real kernel)", () => {
 		}
 	}, 60_000);
 
+	it("lists live user-defined names, filtering internals and live handles", async () => {
+		const listDir = mkdtempSync(join(tmpdir(), "prime-agent-state-list-"));
+		const manager = new KernelManager({ python: python as string, cwd: listDir });
+		try {
+			// A fresh, unstarted kernel reports no names.
+			expect(await manager.listNamespaceNames()).toBeNull();
+			await manager.execute("alpha = 1\ndef helper(n):\n    return n\n_hidden = 2\nrlm = object()");
+			const names = await manager.listNamespaceNames();
+			expect(names).toEqual(expect.arrayContaining(["alpha", "helper"]));
+			// Underscore-prefixed names and the live rlm handle must be filtered out.
+			expect(names).not.toContain("_hidden");
+			expect(names).not.toContain("rlm");
+		} finally {
+			await manager.dispose();
+			rmSync(listDir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
 	it("auto-snapshots after a successful execution (debounced)", async () => {
 		const autoDir = mkdtempSync(join(tmpdir(), "prime-agent-state-auto-"));
 		const autoPath = join(autoDir, "auto.dill");

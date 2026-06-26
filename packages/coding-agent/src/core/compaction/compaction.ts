@@ -493,8 +493,8 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
-const KERNEL_RESTART_SUMMARY_WARNING =
-	"Note: the IPython kernel will be restarted after this summary. Python variables, imports, and in-memory state will be wiped. Files on disk are preserved — capture file paths and what they contain so the next agent can resume without redoing work.";
+const KERNEL_PERSIST_SUMMARY_NOTE =
+	"Note: the IPython kernel keeps running after this summary — every Python variable, import, and helper you defined stays available. The cells that defined them won't appear above, so record in the summary any names worth remembering so you reuse them instead of redefining them.";
 
 const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
 
@@ -537,14 +537,14 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 
 /**
  * Build the instruction portion of the summarization prompt: the initial or
- * update template, optional user instructions, and the kernel restart warning.
+ * update template, optional user instructions, and the kernel persistence note.
  */
 export function buildSummarizationPrompt(customInstructions?: string, previousSummary?: string): string {
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
 	if (customInstructions) {
 		basePrompt += `\n\n<user-instructions>\nThe user provided these instructions for this summary. Follow them with high priority while keeping the section format above: emphasize what they ask to focus on, and preserve verbatim anything they ask to remember.\n${customInstructions}\n</user-instructions>`;
 	}
-	return `${basePrompt}\n\n${KERNEL_RESTART_SUMMARY_WARNING}`;
+	return `${basePrompt}\n\n${KERNEL_PERSIST_SUMMARY_NOTE}`;
 }
 
 /**

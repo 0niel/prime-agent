@@ -114,7 +114,12 @@ describe("IpythonKernelProvisioner", () => {
 		expect(countRuns()).toBe(1);
 	});
 
-	it("restart() drops the on-disk snapshot so a compaction wipe isn't revived on resume", async () => {
+	it("listNamespaceNames() returns null when no kernel is running", async () => {
+		const provisioner = new IpythonKernelProvisioner(tempDir, {});
+		expect(await provisioner.listNamespaceNames()).toBeNull();
+	});
+
+	it("does not delete the on-disk snapshot (the kernel survives compaction)", async () => {
 		const snapshotDir = join(tempDir, "artifacts");
 		const provisioner = new IpythonKernelProvisioner(tempDir, { snapshotDir });
 		const dill = join(snapshotDir, "kernel-state.dill");
@@ -123,10 +128,11 @@ describe("IpythonKernelProvisioner", () => {
 		writeFileSync(dill, "payload");
 		writeFileSync(manifest, "{}");
 
-		await provisioner.restart();
+		// listing the namespace must never touch the on-disk snapshot
+		await provisioner.listNamespaceNames();
 
-		expect(existsSync(dill)).toBe(false);
-		expect(existsSync(manifest)).toBe(false);
+		expect(existsSync(dill)).toBe(true);
+		expect(existsSync(manifest)).toBe(true);
 	});
 });
 

@@ -193,6 +193,39 @@ finally:
 `.trim();
 }
 
+/** Marker-line list of live user-defined names, filtered like the snapshot. Never raises. */
+export function buildListNamesCode(): string {
+	return `
+def _prime_agent_list_state_names():
+    import builtins as _b, json
+    ip = None
+    try:
+        ip = get_ipython()  # noqa: F821 (injected by IPython)
+    except _b.Exception:
+        ip = None
+    ns = ip.user_ns if ip is not None else _b.globals()
+    hidden = _b.set(_b.getattr(ip, "user_ns_hidden", {}) or {}) if ip is not None else _b.set()
+    always_skip = {"rlm", "In", "Out", "get_ipython", "exit", "quit", "open"}
+    names = []
+    for name in _b.list(ns.keys()):
+        if name.startswith("_") or name in hidden or name in always_skip:
+            continue
+        names.append(name)
+    _b.print(${pyStr(RESULT_MARKER)} + json.dumps({"names": _b.sorted(names)}))
+
+
+try:
+    _prime_agent_list_state_names()
+finally:
+    del _prime_agent_list_state_names
+`.trim();
+}
+
+interface RawListNames {
+	names?: unknown;
+	error?: unknown;
+}
+
 interface RawSnapshot {
 	saved?: unknown;
 	skipped?: unknown;
@@ -254,4 +287,11 @@ export function parseRestoreResult(stdout: string, path: string): RestoreResult 
 		failed: asReasonArray(raw.failed),
 		path,
 	};
+}
+
+/** Sorted list of live user-defined names, or null if the marker was absent/invalid. */
+export function parseListNamesResult(stdout: string): string[] | null {
+	const raw = parseMarkerLine<RawListNames>(stdout);
+	if (!raw || raw.error) return null;
+	return asStringArray(raw.names);
 }

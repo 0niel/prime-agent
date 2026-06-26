@@ -10,9 +10,11 @@ import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
 import { ensureKernelPython, type KernelBootstrapProgressHandler, type KernelPythonSkill } from "./bootstrap.js";
 import {
+	buildListNamesCode,
 	buildRestoreCode,
 	buildSnapshotCode,
 	DEFAULT_SNAPSHOT_MAX_BYTES,
+	parseListNamesResult,
 	parseRestoreResult,
 	parseSnapshotResult,
 	type RestoreResult,
@@ -82,6 +84,8 @@ export interface ExecuteOptions {
 	onStream?: (chunk: string, name: "stdout" | "stderr") => void;
 	/** Cap stdout / stderr / result at this many characters. Default 65536. */
 	maxOutputChars?: number;
+	/** Synthetic host cell (snapshot/restore/list); excluded from lastCellCode attribution. */
+	internal?: boolean;
 }
 
 /** MIME tag the `edit` skill emits diff payloads under, via `display_data`. */
@@ -653,7 +657,9 @@ export class KernelManager {
 				reject: result.reject,
 			};
 			this.activeExecution = execution;
-			this.lastCellCode = code;
+			if (!opts.internal) {
+				this.lastCellCode = code;
+			}
 			try {
 				await shell.send(encode(msg, conn.key));
 			} catch (error) {
@@ -986,7 +992,7 @@ export class KernelManager {
 		if (!cfg || !this.isRunning) return null;
 		const code = buildSnapshotCode(cfg.path, cfg.manifestPath, cfg.maxBytes ?? DEFAULT_SNAPSHOT_MAX_BYTES);
 		try {
-			const r = await this.enqueueExecute(code, { maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS });
+			const r = await this.enqueueExecute(code, { maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS, internal: true });
 			if (r.status !== "ok") {
 				this.appendKernelDiagnostic(`state snapshot failed: ${r.error?.evalue ?? r.stderr}`);
 				return null;
@@ -1008,7 +1014,7 @@ export class KernelManager {
 		if (!cfg) return null;
 		const code = buildRestoreCode(cfg.path);
 		try {
-			const r = await this.enqueueExecute(code, { maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS });
+			const r = await this.enqueueExecute(code, { maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS, internal: true });
 			if (r.status !== "ok") {
 				this.appendKernelDiagnostic(`state restore failed: ${r.error?.evalue ?? r.stderr}`);
 				return null;
@@ -1016,6 +1022,26 @@ export class KernelManager {
 			return parseRestoreResult(r.stdout, cfg.path);
 		} catch (error) {
 			this.appendKernelDiagnostic(`state restore error: ${errorMessage(error)}`);
+			return null;
+		}
+	}
+
+	/** Live user-defined top-level names, or null if the kernel isn't running. Never throws. */
+	async listNamespaceNames(signal?: AbortSignal): Promise<string[] | null> {
+		if (!this.isRunning) return null;
+		try {
+			const r = await this.enqueueExecute(buildListNamesCode(), {
+				maxOutputChars: SNAPSHOT_MAX_OUTPUT_CHARS,
+				internal: true,
+				signal,
+			});
+			if (r.status !== "ok") {
+				this.appendKernelDiagnostic(`namespace listing failed: ${r.error?.evalue ?? r.stderr}`);
+				return null;
+			}
+			return parseListNamesResult(r.stdout);
+		} catch (error) {
+			this.appendKernelDiagnostic(`namespace listing error: ${errorMessage(error)}`);
 			return null;
 		}
 	}

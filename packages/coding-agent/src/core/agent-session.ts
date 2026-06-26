@@ -417,6 +417,9 @@ interface RlmChildRun {
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
 
+/** Cap on the post-compaction kernel namespace probe so a wedged kernel can't stall recovery. */
+const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+
 function noopRlmChildAbort(): void {}
 
 function isRlmChildRunCancelled(run: RlmChildRun): boolean {
@@ -2731,8 +2734,56 @@ export class AgentSession {
 		return this.model ? (clampThinkingLevel(this.model, level) as ThinkingLevel) : "off";
 	}
 
-	private async _restartIpythonKernelAfterCompaction(): Promise<void> {
-		await this._ipythonKernelProvisioner?.restart();
+	// Added to history (not a nextTurn message) so it also reaches the continue()-driven
+	// auto-compaction resume, which never injects nextTurn messages.
+	private async _notifyKernelStateAfterCompaction(): Promise<void> {
+		const provisioner = this._ipythonKernelProvisioner;
+		// No kernel means no state to remind about; only stay silent in that case.
+		if (!provisioner?.hasRunningKernel) return;
+		// Bound the probe so a wedged kernel can't stall recovery, and abort it on timeout so
+		// the kernel's serialized execution queue isn't left occupied by a never-resolving cell.
+		const abort = new AbortController();
+		const timer = setTimeout(() => abort.abort(), KERNEL_STATE_LISTING_TIMEOUT_MS);
+		if (typeof timer === "object" && "unref" in timer) timer.unref();
+		let names: string[] | null;
+		try {
+			names = await provisioner.listNamespaceNames(abort.signal).catch(() => null);
+		} finally {
+			clearTimeout(timer);
+		}
+		// null is a listing failure/timeout; only claim state survived if the kernel is still up
+		// (it may have died in the window since the check above).
+		if (names === null && !provisioner.hasRunningKernel) return;
+		const detail =
+			names === null
+				? ""
+				: names.length > 0
+					? ` These names are still defined: ${names.join(", ")}.`
+					: " You have not defined any names yet.";
+		const content = [
+			"<ipython_state>",
+			`Your IPython kernel persisted through compaction; all variables, imports, and helpers you defined remain available.${detail}`,
+			"</ipython_state>",
+		].join("\n");
+		const message = {
+			role: "custom" as const,
+			customType: "ipython_state",
+			content,
+			display: false,
+			timestamp: Date.now(),
+		} satisfies CustomMessage;
+		// Insert before a trailing assistant error so overflow-retry cleanup can still strip it.
+		const messages = this.agent.state.messages;
+		const last = messages[messages.length - 1];
+		const insertBeforeError = last?.role === "assistant" && (last as AssistantMessage).stopReason === "error";
+		if (insertBeforeError) {
+			messages.splice(messages.length - 1, 0, message);
+		} else {
+			messages.push(message);
+		}
+		this.sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, undefined);
+		this._emit({ type: "message_start", message });
+		this._emit({ type: "message_end", message });
 	}
 
 	/**
@@ -2902,7 +2953,7 @@ export class AgentSession {
 					fromExtension,
 				});
 			}
-			await this._restartIpythonKernelAfterCompaction();
+			await this._notifyKernelStateAfterCompaction();
 
 			const compactionResult = {
 				summary,
@@ -3240,7 +3291,7 @@ export class AgentSession {
 					fromExtension,
 				});
 			}
-			await this._restartIpythonKernelAfterCompaction();
+			await this._notifyKernelStateAfterCompaction();
 
 			const result: CompactionResult = {
 				summary,

@@ -1,6 +1,5 @@
 // TODO: reconsider whether the persistent kernel is needed once RLM-1 weights land.
 import { existsSync } from "node:fs";
-import { rm } from "node:fs/promises";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
 import type { ToolDefinition } from "../extensions/types.js";
@@ -149,7 +148,7 @@ export interface IpythonToolOptions {
 	/** Resolves before this kernel starts — e.g. the previous provisioner's dispose, so a
 	 * /reload's old-kernel snapshot flush can't race the new kernel's restore. */
 	readyGate?: Promise<unknown>;
-	/** Filled after the first kernel start so the owning session can restart it after compaction. */
+	/** Filled with the live KernelManager after the first kernel start; cleared on construction. */
 	kernelManagerRef?: { current?: KernelManager };
 	/**
 	 * Fires once per kernel start when a previous session's namespace was revived
@@ -198,26 +197,15 @@ export class IpythonKernelProvisioner {
 		void this.ensure().catch(() => {});
 	}
 
-	/** Restart the kernel if one is running (e.g. after compaction). */
-	async restart(): Promise<void> {
-		try {
-			// Await any in-flight startup first, so we restart a fully-started kernel and
-			// delete the snapshot after (not during) a concurrent restore.
-			const m = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
-			await m?.restart();
-		} finally {
-			// Compaction deliberately wipes the namespace and tells the model so. Drop the
-			// stale on-disk snapshot too — even if the restart threw — so a later resume
-			// doesn't revive state the model was told is gone (a fresh cell re-snapshots).
-			this._lastRestore = undefined;
-			const dir = this.options?.snapshotDir;
-			if (dir) {
-				await Promise.allSettled([
-					rm(snapshotPathIn(dir), { force: true }),
-					rm(manifestPathIn(dir), { force: true }),
-				]);
-			}
-		}
+	/** Whether a kernel has finished starting and is currently running. */
+	get hasRunningKernel(): boolean {
+		return this.startedManager?.isRunning ?? false;
+	}
+
+	/** Live user-defined names in the kernel namespace, or null if listing failed / no kernel. */
+	async listNamespaceNames(signal?: AbortSignal): Promise<string[] | null> {
+		const m = this.startedManager ?? (await this.managerPromise?.catch(() => undefined));
+		return (await m?.listNamespaceNames(signal)) ?? null;
 	}
 
 	/** Dispose the kernel owned by this provisioner, including one still starting up. */
