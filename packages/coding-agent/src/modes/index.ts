@@ -28,8 +28,11 @@ export { type AgentsViewModeOptions, runAgentsViewMode } from "./agents-view/age
 export {
 	type AgentsViewRow,
 	type AgentsViewSection,
+	type AgentsViewSelectionKey,
 	buildAgentsViewRows,
 	classifyAgentsViewSession,
+	getAgentsViewSelectionKey,
+	resolveAgentsViewSelectionIndex,
 	sectionTitle,
 	shouldShowAgentsViewSession,
 } from "./agents-view/agents-view-state.js";

@@ -76,6 +76,46 @@ export function getAgentsViewSummaryIdentity(summary: SessionSummary): string {
 	return `session:${summary.sessionId}`;
 }
 
+export interface AgentsViewSelectionKey {
+	sessionId: string;
+	activeSessionId?: string;
+}
+
+export function getAgentsViewSelectionKey(summary: SessionSummary): AgentsViewSelectionKey {
+	return { sessionId: summary.sessionId, activeSessionId: summary.activeSessionId };
+}
+
+// Matches by identity, then activeSessionId, then sessionId: a row's identity
+// changes when a session is persisted or re-attached, so the latter two keys
+// re-find the same session across those transitions. Returns -1 when gone.
+export function resolveAgentsViewSelectionIndex(
+	rows: readonly AgentsViewRow[],
+	identity: string | undefined,
+	key: AgentsViewSelectionKey | undefined,
+): number {
+	const findSelectable = (predicate: (row: AgentsViewRow) => boolean): number =>
+		rows.findIndex((row) => row.selectable && predicate(row));
+
+	if (identity !== undefined) {
+		const index = findSelectable((row) => row.identity === identity);
+		if (index >= 0) {
+			return index;
+		}
+	}
+	if (key?.activeSessionId !== undefined) {
+		const activeSessionId = key.activeSessionId;
+		const index = findSelectable((row) => (row.summary.activeSessionId ?? row.summary.id) === activeSessionId);
+		if (index >= 0) {
+			return index;
+		}
+	}
+	if (key?.sessionId !== undefined) {
+		const sessionId = key.sessionId;
+		return findSelectable((row) => row.summary.sessionId === sessionId);
+	}
+	return -1;
+}
+
 export function buildAgentsViewRows(
 	summaries: readonly SessionSummary[],
 	expandedSubagentParents: ReadonlySet<string> = new Set(),

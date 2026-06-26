@@ -14,6 +14,8 @@ import {
 import {
 	buildAgentsViewRows,
 	classifyAgentsViewSession,
+	getAgentsViewSelectionKey,
+	resolveAgentsViewSelectionIndex,
 	type SessionSummary,
 	shouldShowAgentsViewSession,
 } from "../src/modes/index.js";
@@ -455,6 +457,63 @@ describe("agents view state", () => {
 			),
 		).resolves.toBe(sessionServices);
 		expect(createUiServicesForSession).toHaveBeenCalledWith(summary);
+	});
+
+	describe("restores selection to the previously open session", () => {
+		const opened = makeSummary({
+			id: "active-open",
+			activeSessionId: "active-open",
+			sessionId: "session-open",
+			sessionFile: "/tmp/project/open.jsonl",
+			sessionName: "open",
+		});
+		const other = makeSummary({
+			id: "active-other",
+			activeSessionId: "active-other",
+			sessionId: "session-other",
+			sessionFile: "/tmp/project/other.jsonl",
+			sessionName: "other",
+		});
+		const identity = `file:${opened.sessionFile}`;
+		const key = getAgentsViewSelectionKey(opened);
+
+		test("re-finds the session after the list reorders", () => {
+			// Returning bumps the opened session's modified time so it sorts first.
+			const rows = buildAgentsViewRows([
+				{ ...opened, modified: "2026-01-02T00:00:00Z" },
+				{ ...other, modified: "2026-01-01T00:00:00Z" },
+			]);
+			expect(rows[0]?.summary.sessionId).toBe("session-open");
+			expect(resolveAgentsViewSelectionIndex(rows, identity, key)).toBe(0);
+		});
+
+		test("falls back to activeSessionId when the row identity changed", () => {
+			// Selected before the session had a file, so the stored identity is active:...
+			const rows = buildAgentsViewRows([other, opened]);
+			const staleIdentity = "active:active-open";
+			expect(resolveAgentsViewSelectionIndex(rows, staleIdentity, key)).toBe(
+				rows.findIndex((row) => row.summary.sessionId === "session-open"),
+			);
+		});
+
+		test("falls back to sessionId after a daemon re-attach regenerates the active id", () => {
+			// Re-attach gives a fresh activeSessionId, so only the sessionId still matches.
+			const reattached = { ...opened, id: "active-open-2", activeSessionId: "active-open-2" };
+			const rows = buildAgentsViewRows([other, reattached]);
+			expect(resolveAgentsViewSelectionIndex(rows, identity, key)).toBe(
+				rows.findIndex((row) => row.summary.sessionId === "session-open"),
+			);
+		});
+
+		test("returns -1 when the session is gone so callers pick a default", () => {
+			const rows = buildAgentsViewRows([other]);
+			expect(resolveAgentsViewSelectionIndex(rows, identity, key)).toBe(-1);
+		});
+
+		test("returns -1 with no stored selection", () => {
+			const rows = buildAgentsViewRows([opened, other]);
+			expect(resolveAgentsViewSelectionIndex(rows, undefined, undefined)).toBe(-1);
+		});
 	});
 });
 
