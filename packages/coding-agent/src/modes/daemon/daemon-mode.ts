@@ -74,6 +74,29 @@ import {
 	restrictDaemonSocketPath,
 } from "./daemon-socket.js";
 
+/** Env vars from the client that should be exposed to extensions via process.env. */
+const CLIENT_ENV_KEYS = [
+	"HERDR_ENV",
+	"HERDR_PANE_ID",
+	"HERDR_SOCKET_PATH",
+	"HERDR_TAB_ID",
+	"HERDR_WORKSPACE_ID",
+] as const;
+
+/**
+ * Update process.env with the client's environment variables so extensions
+ * running in the daemon process can access them (e.g. herdr pane identity).
+ * Only a curated set of keys is applied to avoid leaking unrelated env vars.
+ */
+function applyClientEnvToProcess(env?: Record<string, string>): void {
+	if (!env) return;
+	for (const key of CLIENT_ENV_KEYS) {
+		if (env[key] !== undefined) {
+			process.env[key] = env[key];
+		}
+	}
+}
+
 export interface DaemonModeOptions {
 	socketPath?: string;
 	defaultSessionConfig: AgentSessionRuntimeConfig;
@@ -898,6 +921,7 @@ export class AgentDaemon {
 			}
 
 			case "create": {
+				applyClientEnvToProcess(command.env);
 				const state = await this.createRuntime(command);
 				return success(command.id, "create", summaryForActiveSession(state));
 			}
@@ -909,6 +933,8 @@ export class AgentDaemon {
 				}
 				client.capabilities = normalizeClientCapabilities(command.capabilities, command.supportsExtensionUi);
 				client.supportsExtensionUi = client.capabilities.has("extension_ui");
+				client.clientEnv = command.env;
+				applyClientEnvToProcess(command.env);
 				state.clients.add(client);
 				client.attachedActiveSessionIds.add(state.activeSessionId);
 				const result = this.createAttachResult(client, state, command);

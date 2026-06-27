@@ -65,6 +65,16 @@ export interface DaemonAttachClientMetadata {
 	resumeCursor?: DaemonResumeCursor;
 }
 
+/**
+ * Environment variables sent from the interactive client to the daemon so
+ * extensions running in the daemon process can access client-side env vars
+ * (e.g. HERDR_PANE_ID, HERDR_SOCKET_PATH set by herdr on each pane).
+ */
+export interface DaemonClientEnv {
+	/** Key-value env vars from the client process that the daemon should expose to extensions. */
+	env?: Record<string, string>;
+}
+
 export interface DaemonReplayInfo {
 	status: DaemonReplayStatus;
 	fromSequence?: DaemonEventSequence;
@@ -146,20 +156,21 @@ export interface DaemonAttachResult {
 export type DaemonCommand =
 	| { id?: string; type: "list"; all?: boolean; cwd?: string; sessionDir?: string }
 	| { id?: string; type: "list_saved_sessions"; activeSessionId: string; scope: AgentConnectionSavedSessionScope }
-	| {
+	| ({
 			id?: string;
 			type: "create";
 			sessionPath?: string;
 			continueRecent?: boolean;
 			name?: string;
 			config?: AgentSessionRuntimeConfig;
-	  }
+	  } & DaemonClientEnv)
 	| ({
 			id?: string;
 			type: "attach";
 			activeSessionId: string;
 			supportsExtensionUi?: boolean;
-	  } & DaemonAttachClientMetadata)
+	  } & DaemonAttachClientMetadata &
+			DaemonClientEnv)
 	| { id?: string; type: "detach"; activeSessionId?: string }
 	| { id?: string; type: "kill"; activeSessionId: string }
 	| { id?: string; type: "rename"; activeSessionId: string; name: string }

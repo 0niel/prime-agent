@@ -12,6 +12,8 @@ export interface DaemonSocketClient {
 	detachInput: () => void;
 	supportsExtensionUi: boolean;
 	capabilities: Set<DaemonClientCapability>;
+	/** Environment variables sent by the client (e.g. herdr pane env vars). */
+	clientEnv?: Record<string, string>;
 }
 
 export interface ActiveSessionState {

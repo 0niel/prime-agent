@@ -99,6 +99,26 @@ async function readPipedStdin(): Promise<string | undefined> {
 	});
 }
 
+/** Env vars the interactive client sends to the daemon so extensions can access them. */
+const CLIENT_ENV_KEYS = [
+	"HERDR_ENV",
+	"HERDR_PANE_ID",
+	"HERDR_SOCKET_PATH",
+	"HERDR_TAB_ID",
+	"HERDR_WORKSPACE_ID",
+] as const;
+
+function collectClientEnv(): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const key of CLIENT_ENV_KEYS) {
+		const value = process.env[key];
+		if (value !== undefined) {
+			env[key] = value;
+		}
+	}
+	return env;
+}
+
 function collectSettingsDiagnostics(
 	settingsManager: SettingsManager,
 	context: string,
@@ -1006,6 +1026,7 @@ async function createDaemonInteractiveConnection(options: {
 			config: options.config,
 			sessionPath: options.sessionPath,
 			continueRecent: options.continueRecent,
+			env: collectClientEnv(),
 		});
 		if (!response.success) {
 			throw new Error(response.error);

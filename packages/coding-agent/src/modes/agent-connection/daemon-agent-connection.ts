@@ -60,6 +60,26 @@ export interface DaemonAgentConnectionOptions {
 	closeClientOnDispose?: boolean;
 }
 
+/** Env vars the interactive client sends to the daemon so extensions can access them. */
+const CLIENT_ENV_KEYS = [
+	"HERDR_ENV",
+	"HERDR_PANE_ID",
+	"HERDR_SOCKET_PATH",
+	"HERDR_TAB_ID",
+	"HERDR_WORKSPACE_ID",
+] as const;
+
+function collectClientEnv(): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const key of CLIENT_ENV_KEYS) {
+		const value = process.env[key];
+		if (value !== undefined) {
+			env[key] = value;
+		}
+	}
+	return env;
+}
+
 /**
  * AgentConnection adapter for the local daemon JSONL socket transport.
  *
@@ -110,6 +130,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			supportsExtensionUi: true,
 			clientId: this.clientId,
 			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach"],
+			env: collectClientEnv(),
 			resumeCursor:
 				this.lastEventSequence === undefined
 					? undefined
