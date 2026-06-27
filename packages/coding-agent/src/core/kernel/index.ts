@@ -91,6 +91,17 @@ export interface ExecuteOptions {
 /** MIME tag the `edit` skill emits diff payloads under, via `display_data`. */
 export const DIFF_DISPLAY_MIME = "application/vnd.prime-agent.diff+json";
 
+/** MIME tag the `attach-image` skill emits media payloads under, via `display_data`. */
+export const ATTACHMENT_DISPLAY_MIME = "application/vnd.prime-agent.attachment+json";
+
+/**
+ * Hard ceiling on a single attachment's base64 payload, a defensive guard
+ * against a runaway direct `display_data` emit. The `attach-image` skill caps
+ * its own images well under this (see `_MAX_IMAGE_BYTES`), so a skill-produced
+ * attachment is never dropped here — only a non-skill emit can hit this.
+ */
+const MAX_ATTACHMENT_DATA_CHARS = 10_000_000;
+
 /** One file edit, captured from a {@link DIFF_DISPLAY_MIME} display payload. */
 export interface KernelDiffDisplay {
 	path: string;
@@ -100,6 +111,15 @@ export interface KernelDiffDisplay {
 	startLine?: number;
 }
 
+/** One media attachment, captured from an {@link ATTACHMENT_DISPLAY_MIME} display payload. */
+export interface KernelAttachment {
+	mimeType: string;
+	/** base64-encoded bytes. */
+	data: string;
+	/** Source path, surfaced to the TUI renderer. */
+	path?: string;
+}
+
 export interface ExecuteResult {
 	stdout: string;
 	stderr: string;
@@ -107,6 +127,8 @@ export interface ExecuteResult {
 	result?: string;
 	/** Diffs emitted via display_data, in order. */
 	diffs?: KernelDiffDisplay[];
+	/** Media attachments emitted via display_data, in order. */
+	attachments?: KernelAttachment[];
 	status: "ok" | "error" | "aborted";
 	error?: { ename: string; evalue: string; traceback: string[] };
 	durationMs: number;
@@ -122,6 +144,26 @@ function parseDiffDisplay(payload: unknown): KernelDiffDisplay | undefined {
 		return undefined;
 	}
 	return { path, oldStr, newStr, startLine: typeof startLine === "number" ? startLine : undefined };
+}
+
+/**
+ * Parse an {@link ATTACHMENT_DISPLAY_MIME} payload. Malformed payloads are
+ * tolerantly ignored (`undefined`); a well-formed payload exceeding
+ * {@link MAX_ATTACHMENT_DATA_CHARS} is reported as `"oversized"` so the caller
+ * can fail the cell loudly rather than silently dropping the image.
+ */
+function parseAttachmentDisplay(payload: unknown): KernelAttachment | "oversized" | undefined {
+	if (!isRecord(payload)) {
+		return undefined;
+	}
+	const { mime_type: mimeType, data, path } = payload;
+	if (typeof mimeType !== "string" || typeof data !== "string") {
+		return undefined;
+	}
+	if (data.length > MAX_ATTACHMENT_DATA_CHARS) {
+		return "oversized";
+	}
+	return { mimeType, data, path: typeof path === "string" ? path : undefined };
 }
 
 interface ConnectionInfo {
@@ -164,6 +206,7 @@ interface ActiveExecution {
 	stderrTruncated: boolean;
 	result?: string;
 	diffs: KernelDiffDisplay[];
+	attachments: KernelAttachment[];
 	error?: ExecuteResult["error"];
 	status: ExecuteResult["status"];
 	resolve: (result: ExecuteResult) => void;
@@ -652,6 +695,7 @@ export class KernelManager {
 				stdoutTruncated: false,
 				stderrTruncated: false,
 				diffs: [],
+				attachments: [],
 				status: "ok",
 				resolve: result.resolve,
 				reject: result.reject,
@@ -747,6 +791,13 @@ export class KernelManager {
 			const c = incoming.content as { data?: Record<string, unknown> };
 			const diff = parseDiffDisplay(c.data?.[DIFF_DISPLAY_MIME]);
 			if (diff) execution.diffs.push(diff);
+			const attachment = parseAttachmentDisplay(c.data?.[ATTACHMENT_DISPLAY_MIME]);
+			if (attachment === "oversized") {
+				execution.stderr += `${execution.stderr ? "\n" : ""}attachment dropped: exceeds ${MAX_ATTACHMENT_DATA_CHARS} base64 chars`;
+				execution.status = "error";
+			} else if (attachment) {
+				execution.attachments.push(attachment);
+			}
 		} else if (t === "error") {
 			const c = incoming.content as { ename: string; evalue: string; traceback: string[] };
 			execution.error = c;
@@ -782,6 +833,7 @@ export class KernelManager {
 			stderr,
 			result,
 			diffs: execution.diffs.length > 0 ? execution.diffs : undefined,
+			attachments: execution.attachments.length > 0 ? execution.attachments : undefined,
 			error: execution.error,
 			status,
 			durationMs: Date.now() - execution.started,

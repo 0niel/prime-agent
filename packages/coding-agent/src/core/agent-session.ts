@@ -3754,6 +3754,11 @@ export class AgentSession {
 			"rlm.run": createRlmRunHostHandler(({ prompt, kwargs, cellSourceCode }) =>
 				this.runRlmChild(prompt, kwargs, cellSourceCode),
 			),
+			"model.info": async () => ({
+				id: this.model?.id ?? null,
+				provider: this.model?.provider ?? null,
+				input: this.model?.input ?? [],
+			}),
 		};
 		if (this._includeGoals) {
 			for (const type of ["goal.get", "goal.create", "goal.complete"]) {

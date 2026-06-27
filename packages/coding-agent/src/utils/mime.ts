@@ -1,7 +1,7 @@
 import { open } from "node:fs/promises";
 import { fileTypeFromBuffer } from "file-type";
 
-const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+export const IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
 
 const FILE_TYPE_SNIFF_BYTES = 4100;
 
