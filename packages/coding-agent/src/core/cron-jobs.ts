@@ -58,6 +58,12 @@ export interface AgentCronSchedulerHooks {
 	onError?: (job: AgentCronJob, error: unknown) => void;
 }
 
+export interface HeartbeatCronSessionActivity {
+	isStreaming: boolean;
+	isBashRunning: boolean;
+	pendingMessageCount: number;
+}
+
 interface CronJobsFile {
 	jobs?: unknown;
 }
@@ -812,6 +818,16 @@ function consumeLeadingEverySchedule(text: string): { interval: string; rest: st
 			.replace(/^--\s*/, "")
 			.trim(),
 	};
+}
+
+export function isHeartbeatCronJob(job: AgentCronJob): boolean {
+	return job.source === "heartbeat" || job.source === "rlm_heartbeat";
+}
+
+export function shouldDeferHeartbeatCronJob(job: AgentCronJob, activity: HeartbeatCronSessionActivity): boolean {
+	return (
+		isHeartbeatCronJob(job) && (activity.isStreaming || activity.isBashRunning || activity.pendingMessageCount > 0)
+	);
 }
 
 function nextCronRunAfter(expression: string, after: Date): Date {
