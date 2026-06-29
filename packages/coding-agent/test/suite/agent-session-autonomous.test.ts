@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+	addAutonomousUsage,
 	createAutonomousRuntimeState,
 	DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT,
 	shouldAutonomouslyContinue,
@@ -173,6 +174,24 @@ describe("AgentSession autonomous mode", () => {
 		expect(users[1]).toContain("Autonomous quality gate failed");
 		expect(users[1]).toContain("gate failed");
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
+	});
+
+	it("does not count cache-read tokens against the autonomous token budget", () => {
+		const state = createAutonomousRuntimeState({ enabled: true, maxTokens: 10 });
+
+		addAutonomousUsage(state, {
+			input: 2,
+			output: 3,
+			cacheRead: 1_000,
+			cacheWrite: 4,
+			totalTokens: 1_009,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+
+		expect(state.tokensUsed).toBe(9);
+		expect(shouldAutonomouslyContinue(state, fauxAssistantMessage("Done."))).toMatchObject({
+			shouldContinue: true,
+		});
 	});
 
 	it("does not use assistant prose as terminal blocker evidence", () => {

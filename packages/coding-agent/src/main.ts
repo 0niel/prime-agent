@@ -666,6 +666,10 @@ function runtimeConfigFromArgs(
 		autonomous: parsed.autonomous
 			? {
 					enabled: true,
+					maxContinuations: parsed.autonomousMaxContinuations,
+					maxTurns: parsed.autonomousMaxTurns,
+					maxTokens: parsed.autonomousMaxTokens,
+					timeoutMs: parsed.autonomousTimeoutMs,
 					gates:
 						parsed.autonomousGates || parsed.autonomousGateRetries || parsed.autonomousGateTimeoutMs
 							? {

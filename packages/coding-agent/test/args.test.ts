@@ -302,6 +302,25 @@ describe("parseArgs", () => {
 			expect(result.autonomousGateRetries).toBe(2);
 			expect(result.autonomousGateTimeoutMs).toBe(1000);
 		});
+
+		test("parses autonomous limit flags", () => {
+			const result = parseArgs([
+				"--autonomous",
+				"--autonomous-max-continuations",
+				"20",
+				"--autonomous-max-turns",
+				"80",
+				"--autonomous-max-tokens",
+				"500000",
+				"--autonomous-timeout-ms",
+				"1800000",
+			]);
+			expect(result.autonomous).toBe(true);
+			expect(result.autonomousMaxContinuations).toBe(20);
+			expect(result.autonomousMaxTurns).toBe(80);
+			expect(result.autonomousMaxTokens).toBe(500000);
+			expect(result.autonomousTimeoutMs).toBe(1800000);
+		});
 	});
 
 	describe("tool flags", () => {

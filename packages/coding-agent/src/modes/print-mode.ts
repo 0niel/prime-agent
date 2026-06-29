@@ -8,6 +8,7 @@
 
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.js";
+import type { AgentAutonomousGateFailure, AgentAutonomousStatus } from "../core/autonomous.js";
 import { flushRawStdout, writeRawStdout } from "../core/output-guard.js";
 import { killTrackedDetachedChildren } from "../utils/shell.js";
 
@@ -23,6 +24,58 @@ export interface PrintModeOptions {
 	initialMessage?: string;
 	/** Images to attach to the initial message */
 	initialImages?: ImageContent[];
+}
+
+function latestGateAttempt(status: AgentAutonomousStatus): number {
+	return Math.max(status.lastGateFailure?.attempt ?? 0, 0, ...Object.values(status.gateAttempts));
+}
+
+function autonomousLimitsReached(status: AgentAutonomousStatus, now = Date.now()): boolean {
+	if (status.continuationsUsed >= status.limits.maxContinuations) return true;
+	if (status.turnsUsed >= status.limits.maxTurns) return true;
+	if (status.tokensUsed >= status.limits.maxTokens) return true;
+	return status.startedAt !== undefined && now - status.startedAt >= status.limits.timeoutMs;
+}
+
+function shouldContinuePrintModeAutonomousGates(status: AgentAutonomousStatus): boolean {
+	if (!status.enabled || status.gates.commands.length === 0 || !status.lastGateFailure) return false;
+	if (autonomousLimitsReached(status)) return false;
+	return latestGateAttempt(status) <= status.gates.maxRetries;
+}
+
+function buildPrintModeGateContinuation(
+	failure: AgentAutonomousGateFailure,
+	attempt: number,
+	maxRetries: number,
+): string {
+	return (
+		`Autonomous quality gate failed (attempt ${attempt}/${maxRetries}): \`${failure.command}\` ${failure.exitText}.\n` +
+		(failure.output ? `\nOutput:\n${failure.output}\n` : "\n") +
+		`\nContinue working. Fix the failure, then produce terminal evidence. Timestamp: ${new Date().toISOString()}.`
+	);
+}
+
+async function waitForPrintModeIdleWithAutonomousGates(
+	getSession: () => AgentSessionRuntime["session"],
+): Promise<void> {
+	let lastPromptedGateAttempt = 0;
+	while (true) {
+		const session = getSession();
+		await session.agent.waitForIdle();
+		const status = session.getAutonomousStatus();
+		const attempt = latestGateAttempt(status);
+		if (
+			!shouldContinuePrintModeAutonomousGates(status) ||
+			!status.lastGateFailure ||
+			attempt <= lastPromptedGateAttempt
+		) {
+			return;
+		}
+		lastPromptedGateAttempt = attempt;
+		await session.prompt(buildPrintModeGateContinuation(status.lastGateFailure, attempt, status.gates.maxRetries), {
+			streamingBehavior: "followUp",
+		});
+	}
 }
 
 /**
@@ -125,6 +178,8 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			await session.prompt(message);
 		}
 
+		await waitForPrintModeIdleWithAutonomousGates(() => session);
+
 		if (mode === "text") {
 			const state = session.state;
 			const lastMessage = state.messages[state.messages.length - 1];
@@ -142,6 +197,14 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 					}
 				}
 			}
+		}
+
+		const autonomousStatus = session.getAutonomousStatus();
+		if (autonomousStatus.enabled && autonomousStatus.gates.commands.length > 0 && autonomousStatus.lastGateFailure) {
+			console.error(
+				`Autonomous quality gate still failing after attempt ${latestGateAttempt(autonomousStatus)}/${autonomousStatus.gates.maxRetries}: ${autonomousStatus.lastGateFailure.exitText}`,
+			);
+			exitCode = 1;
 		}
 
 		return exitCode;

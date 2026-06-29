@@ -17,6 +17,13 @@ export interface AgentAutonomousGateConfig {
 	timeoutMs?: number;
 }
 
+export interface AgentAutonomousGateFailure {
+	command: string;
+	attempt: number;
+	exitText: string;
+	output: string;
+}
+
 export interface AgentAutonomousStatus {
 	enabled: boolean;
 	continuationsUsed: number;
@@ -25,6 +32,8 @@ export interface AgentAutonomousStatus {
 	startedAt?: number;
 	limits: Required<Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt" | "gates">>;
 	gates: Required<AgentAutonomousGateConfig>;
+	gateAttempts: Record<string, number>;
+	lastGateFailure?: AgentAutonomousGateFailure;
 }
 
 export const DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT =
@@ -69,12 +78,7 @@ interface GitWorktreeSnapshot {
 	diff: string;
 }
 
-interface GateFailure {
-	command: string;
-	attempt: number;
-	exitText: string;
-	output: string;
-}
+type GateFailure = AgentAutonomousGateFailure;
 
 export function createAutonomousRuntimeState(
 	config?: AgentAutonomousConfig,
@@ -136,6 +140,8 @@ export function autonomousStatus(state: AutonomousRuntimeState): AgentAutonomous
 		startedAt: state.startedAt,
 		limits: { ...state.limits },
 		gates: { ...state.gates, commands: [...state.gates.commands] },
+		gateAttempts: { ...state.gateAttempts },
+		lastGateFailure: state.lastGateFailure ? { ...state.lastGateFailure } : undefined,
 	};
 }
 
@@ -144,7 +150,17 @@ export function addAutonomousUsage(state: AutonomousRuntimeState, usage: Usage |
 		return;
 	}
 	state.turnsUsed++;
-	state.tokensUsed += usage?.totalTokens ?? 0;
+	state.tokensUsed += autonomousTokenDelta(usage);
+}
+
+function autonomousTokenDelta(usage: Usage | undefined): number {
+	if (!usage) {
+		return 0;
+	}
+	// Cache-read tokens are repeated context served from provider cache. Counting them
+	// cumulatively makes long autonomous verifier loops exhaust their host-side token
+	// budget far before the non-cached work reaches the configured cap.
+	return usage.input + usage.output + usage.cacheWrite;
 }
 
 export function nextAutonomousContinuation(

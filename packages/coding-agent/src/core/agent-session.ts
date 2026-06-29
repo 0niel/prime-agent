@@ -686,6 +686,8 @@ export class AgentSession {
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
 	private _continueAfterThresholdCompaction = false;
+	private _postCompactionContinuePromise: Promise<void> | undefined = undefined;
+	private _postCompactionContinuationMessages: AgentMessage[] = [];
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1374,8 +1376,23 @@ export class AgentSession {
 			return false;
 		}
 
+		if (this._queueAutonomousContinuationForThresholdCompaction(context.message)) {
+			this._continueAfterThresholdCompaction = true;
+			return true;
+		}
+
 		const lastMessage = this.agent.state.messages[this.agent.state.messages.length - 1];
 		this._continueAfterThresholdCompaction = lastMessage !== undefined && lastMessage.role !== "assistant";
+		return true;
+	}
+
+	private _queueAutonomousContinuationForThresholdCompaction(message: AssistantMessage): boolean {
+		const autonomousMessage = nextAutonomousContinuation(this._autonomousState, message, { cwd: this._cwd });
+		if (!autonomousMessage) {
+			return false;
+		}
+		this._postCompactionContinuationMessages.push(autonomousMessage);
+		this.agent.followUp(autonomousMessage);
 		return true;
 	}
 
@@ -2294,8 +2311,13 @@ export class AgentSession {
 		}
 
 		preflightResult?.(true);
+		// `isStreaming` can become false before the lower-level Agent has fully
+		// completed its run lifecycle. Wait for that lifecycle to settle before
+		// starting the next print-mode/autonomous gate prompt.
+		await this.agent.waitForIdle();
 		await this.agent.prompt(messages);
 		await this.waitForRetry();
+		await this._waitForPostCompactionContinuations();
 	}
 
 	/**
@@ -3163,9 +3185,49 @@ export class AgentSession {
 		const contextTokens = this._getThresholdContextTokens(assistantMessage, compactionTimestamp);
 		if (contextTokens === undefined) return false;
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
+			if (this._queueAutonomousContinuationForThresholdCompaction(assistantMessage)) {
+				this._continueAfterThresholdCompaction = true;
+			}
 			return await this._runAutoCompaction("threshold", false);
 		}
 		return false;
+	}
+
+	private _schedulePostCompactionContinue(): void {
+		if (this._postCompactionContinuePromise) {
+			return;
+		}
+		let scheduledPromise: Promise<void>;
+		scheduledPromise = new Promise<void>((resolve) => {
+			setTimeout(() => {
+				this._runPostCompactionContinue()
+					.catch(() => {})
+					.finally(resolve);
+			}, 100);
+		});
+		this._postCompactionContinuePromise = scheduledPromise.finally(() => {
+			if (this._postCompactionContinuePromise === scheduledPromise) {
+				this._postCompactionContinuePromise = undefined;
+			}
+		});
+	}
+
+	private async _runPostCompactionContinue(): Promise<void> {
+		const continuationMessages = this._postCompactionContinuationMessages.splice(0);
+		const lastMessage = this.agent.state.messages[this.agent.state.messages.length - 1];
+		if (continuationMessages.length > 0 && lastMessage?.role !== "assistant") {
+			const continuationMessageSet = new Set(continuationMessages);
+			this.agent.removeQueuedMessages((message) => continuationMessageSet.has(message));
+			await this.agent.prompt(continuationMessages);
+			return;
+		}
+		await this.agent.continue();
+	}
+
+	private async _waitForPostCompactionContinuations(): Promise<void> {
+		while (this._postCompactionContinuePromise) {
+			await this._postCompactionContinuePromise;
+		}
 	}
 
 	/**
@@ -3217,6 +3279,10 @@ export class AgentSession {
 					errorMessage: "Auto-compaction skipped: nothing to summarize outside the recent-context window",
 					errorSeverity: "warning",
 				});
+				if (shouldContinueAfterThreshold || this.agent.hasQueuedMessages()) {
+					this._schedulePostCompactionContinue();
+					return true;
+				}
 				return false;
 			}
 
@@ -3322,16 +3388,13 @@ export class AgentSession {
 					this.agent.state.messages = messages.slice(0, -1);
 				}
 
-				setTimeout(() => {
-					this.agent.continue().catch(() => {});
-				}, 100);
+				this._schedulePostCompactionContinue();
 				return true;
 			} else if (shouldContinueAfterThreshold || this.agent.hasQueuedMessages()) {
 				// Threshold compaction can intentionally stop a tool loop between turns.
 				// Queued follow-up/steering/custom messages can also be waiting.
-				setTimeout(() => {
-					this.agent.continue().catch(() => {});
-				}, 100);
+				this._schedulePostCompactionContinue();
+				return true;
 			}
 			return false;
 		} catch (error) {

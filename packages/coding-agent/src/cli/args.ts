@@ -46,6 +46,10 @@ export interface Args {
 	autonomousGates?: string[];
 	autonomousGateRetries?: number;
 	autonomousGateTimeoutMs?: number;
+	autonomousMaxContinuations?: number;
+	autonomousMaxTurns?: number;
+	autonomousMaxTokens?: number;
+	autonomousTimeoutMs?: number;
 	listModels?: string | true;
 	offline?: boolean;
 	verbose?: boolean;
@@ -179,6 +183,14 @@ export function parseArgs(args: string[]): Args {
 			result.autonomousGateRetries = parsePositiveInt(args[++i], "--autonomous-gate-retries", result);
 		} else if (arg === "--autonomous-gate-timeout-ms" && i + 1 < args.length) {
 			result.autonomousGateTimeoutMs = parsePositiveInt(args[++i], "--autonomous-gate-timeout-ms", result);
+		} else if (arg === "--autonomous-max-continuations" && i + 1 < args.length) {
+			result.autonomousMaxContinuations = parsePositiveInt(args[++i], "--autonomous-max-continuations", result);
+		} else if (arg === "--autonomous-max-turns" && i + 1 < args.length) {
+			result.autonomousMaxTurns = parsePositiveInt(args[++i], "--autonomous-max-turns", result);
+		} else if (arg === "--autonomous-max-tokens" && i + 1 < args.length) {
+			result.autonomousMaxTokens = parsePositiveInt(args[++i], "--autonomous-max-tokens", result);
+		} else if (arg === "--autonomous-timeout-ms" && i + 1 < args.length) {
+			result.autonomousTimeoutMs = parsePositiveInt(args[++i], "--autonomous-timeout-ms", result);
 		} else if (arg === "--list-models") {
 			// Check if next arg is a search pattern (not a flag or file arg)
 			if (i + 1 < args.length && !args[i + 1].startsWith("-") && !args[i + 1].startsWith("@")) {
@@ -279,6 +291,10 @@ ${chalk.bold("Options:")}
   --autonomous-gate <command>    Run a command before autonomous mode may finish (repeatable)
   --autonomous-gate-retries <n>  Max autonomous retries per failed gate (default: 3)
   --autonomous-gate-timeout-ms <n> Timeout per autonomous gate command in milliseconds
+  --autonomous-max-continuations <n> Max autonomous follow-up messages (default: 3)
+  --autonomous-max-turns <n>     Max assistant turns while autonomous mode is active (default: 12)
+  --autonomous-max-tokens <n>    Max tokens while autonomous mode is active (default: 80000)
+  --autonomous-timeout-ms <n>    Max autonomous wall-clock time in milliseconds (default: 1800000)
   --export <file>                Export session file to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
