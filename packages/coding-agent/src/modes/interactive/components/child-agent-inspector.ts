@@ -592,6 +592,7 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 	private toolsExpanded = false;
 	private killConfirmExpiresAt = 0;
 	private killConfirmTimer: ReturnType<typeof setTimeout> | undefined;
+	private backHintLabel = "back to chat";
 
 	onCancel?: () => void;
 	onToggleToolsExpanded?: () => void;
@@ -611,6 +612,10 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 		this.node = node;
 		this.toolsExpanded = this.options.getToolsExpanded?.() ?? this.toolsExpanded;
 		this.rebuildTranscriptComponents();
+	}
+
+	setBackHintLabel(label: string): void {
+		this.backHintLabel = label;
 	}
 
 	setToolsExpanded(expanded: boolean): void {
@@ -848,7 +853,7 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 				? theme.fg("error", `${keyText("app.agents.delete", { primaryOnly: true }).trim()} again to stop`)
 				: keyAction("app.agents.delete", "stop", { primaryOnly: true });
 		return hintLine(
-			[keyAction("app.agents.back", "back to chat", { primaryOnly: true }), expandAction, stopAction],
+			[keyAction("app.agents.back", this.backHintLabel, { primaryOnly: true }), expandAction, stopAction],
 			width,
 		);
 	}

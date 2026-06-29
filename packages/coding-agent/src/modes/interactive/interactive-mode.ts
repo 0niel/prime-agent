@@ -565,6 +565,7 @@ export class InteractiveMode {
 	private childAgentNodes: ChildAgentInspectorNode[] = [];
 	private childAgentDetailNodeId: string | undefined;
 	private childAgentPanelMode: "detail" | undefined;
+	private enteredSessionViaSubagentDetail = false;
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -686,7 +687,13 @@ export class InteractiveMode {
 			getHideThinkingBlock: () => this.hideThinkingBlock,
 			getHiddenThinkingLabel: () => this.hiddenThinkingLabel,
 		});
-		this.childAgentDetail.onCancel = () => this.closeChildAgentPanel({ selectNodeId: this.childAgentDetailNodeId });
+		this.childAgentDetail.onCancel = () => {
+			if (this.options.returnToAgentsView && this.enteredSessionViaSubagentDetail) {
+				void this.returnToAgentsView();
+				return;
+			}
+			this.closeChildAgentPanel({ selectNodeId: this.childAgentDetailNodeId });
+		};
 		this.childAgentDetail.onToggleToolsExpanded = () => this.toggleToolOutputExpansion();
 		this.childAgentDetail.onKill = (nodeId) => void this.killChildAgent(nodeId);
 		this.widgetContainerAbove = new Container();
@@ -978,11 +985,18 @@ export class InteractiveMode {
 
 		// Jump straight into a subagent's read-only detail view when the agents
 		// view opened this session targeting one of its subagents.
-		if (this.options.initialSubagentNodeId && !this.openChildAgentDetail(this.options.initialSubagentNodeId)) {
-			// The subagent can finish and get released between the agents view
-			// listing it and this session attaching; say so instead of silently
-			// landing in the parent chat.
-			this.showStatus("Subagent already finished; showing its parent session");
+		if (this.options.initialSubagentNodeId) {
+			if (this.openChildAgentDetail(this.options.initialSubagentNodeId)) {
+				if (this.options.returnToAgentsView) {
+					this.enteredSessionViaSubagentDetail = true;
+					this.childAgentDetail.setBackHintLabel("back to agents");
+				}
+			} else {
+				// The subagent can finish and get released between the agents view
+				// listing it and this session attaching; say so instead of silently
+				// landing in the parent chat.
+				this.showStatus("Subagent already finished; showing its parent session");
+			}
 		}
 
 		// Set up theme file watcher
@@ -3105,6 +3119,8 @@ export class InteractiveMode {
 			// Re-render queued previews cleared on panel entry; the queue may still hold messages.
 			this.updatePendingMessagesDisplay();
 			this.childAgentDetailNodeId = undefined;
+			this.enteredSessionViaSubagentDetail = false;
+			this.childAgentDetail.setBackHintLabel("back to chat");
 			this.childAgentDetail.setNode(undefined);
 		}
 		this.childAgentPanelMode = undefined;
@@ -4652,6 +4668,8 @@ export class InteractiveMode {
 	private closeChildAgentPanel(options: { selectNodeId?: string } = {}): void {
 		this.childAgentPanelMode = undefined;
 		this.childAgentDetailNodeId = undefined;
+		this.enteredSessionViaSubagentDetail = false;
+		this.childAgentDetail.setBackHintLabel("back to chat");
 		this.childAgentDetail.setNode(undefined);
 		this.childAgentSummary.setHidden(false);
 		this.restoreMainAgentView();

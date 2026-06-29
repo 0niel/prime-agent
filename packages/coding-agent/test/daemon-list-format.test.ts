@@ -10,9 +10,19 @@ describe("formatSessionListTable", () => {
 		const table = stripAnsi(
 			formatSessionListTable(
 				[
-					makeSummary({ name: "sleep", id: "019e71ec-e08a-75a9-b573-fc10e9f8380f", lifecycle: "archived", activity: "idle" }),
+					makeSummary({
+						name: "sleep",
+						id: "019e71ec-e08a-75a9-b573-fc10e9f8380f",
+						lifecycle: "archived",
+						activity: "idle",
+					}),
 					makeSummary({ name: "tool", id: "ccccddddeeee", lifecycle: "live", activity: "working" }),
-					makeSummary({ name: "crash", id: "019e71ec-e08a-75a9-b573-abcdef123456", lifecycle: "archived", activity: "idle" }),
+					makeSummary({
+						name: "crash",
+						id: "019e71ec-e08a-75a9-b573-abcdef123456",
+						lifecycle: "archived",
+						activity: "idle",
+					}),
 					makeSummary({ name: "idle", id: "bbbbccccdddd", lifecycle: "live", activity: "idle" }),
 					makeSummary({ name: "model", id: "ddddeeeeffff", lifecycle: "live", activity: "working" }),
 					makeSummary({
