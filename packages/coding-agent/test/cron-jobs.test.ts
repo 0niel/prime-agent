@@ -9,6 +9,7 @@ import {
 	createAgentHeartbeatToolDefinitions,
 	parseAgentCronSchedule,
 	parseHeartbeatCommand,
+	shouldDeferHeartbeatCronJob,
 } from "../src/core/cron-jobs.js";
 
 const start = new Date("2026-01-01T12:34:00.000Z");
@@ -702,6 +703,7 @@ describe("AgentCronScheduler", () => {
 			id: job.id,
 			status: "active",
 			nextRunAt: "2026-01-01T12:45:00.000Z",
+			lastSkippedAt: "2026-01-01T12:40:00.000Z",
 			runCount: 0,
 		});
 		expect(store.getHeartbeat("active-1")).not.toHaveProperty("lastRunAt");
@@ -749,6 +751,69 @@ describe("AgentCronScheduler", () => {
 				expect.objectContaining({ id: second.id, status: "cancelled", runCount: 0 }),
 			]),
 		);
+	});
+});
+
+describe("shouldDeferHeartbeatCronJob", () => {
+	const baseJob: AgentCronJob = {
+		id: "job-1",
+		status: "active",
+		activeSessionId: "active-1",
+		sessionId: "session-1",
+		sessionFile: "/tmp/session.jsonl",
+		cwd: "/tmp/project",
+		prompt: "check progress",
+		schedule: { kind: "interval", expression: "every 5m", intervalMs: 300_000 },
+		createdAt: "2026-01-01T12:34:00.000Z",
+		updatedAt: "2026-01-01T12:34:00.000Z",
+		nextRunAt: "2026-01-01T12:39:00.000Z",
+		runCount: 0,
+	};
+
+	it("defers user and RLM heartbeats while the target session is working", () => {
+		for (const source of ["heartbeat", "rlm_heartbeat"] as const) {
+			const job = { ...baseJob, source };
+
+			expect(
+				shouldDeferHeartbeatCronJob(job, {
+					isStreaming: true,
+					isBashRunning: false,
+					pendingMessageCount: 0,
+				}),
+			).toBe(true);
+			expect(
+				shouldDeferHeartbeatCronJob(job, {
+					isStreaming: false,
+					isBashRunning: true,
+					pendingMessageCount: 0,
+				}),
+			).toBe(true);
+			expect(
+				shouldDeferHeartbeatCronJob(job, {
+					isStreaming: false,
+					isBashRunning: false,
+					pendingMessageCount: 1,
+				}),
+			).toBe(true);
+		}
+	});
+
+	it("allows heartbeats when the target session is idle", () => {
+		expect(
+			shouldDeferHeartbeatCronJob(
+				{ ...baseJob, source: "heartbeat" },
+				{ isStreaming: false, isBashRunning: false, pendingMessageCount: 0 },
+			),
+		).toBe(false);
+	});
+
+	it("does not defer ordinary cron jobs", () => {
+		expect(
+			shouldDeferHeartbeatCronJob(
+				{ ...baseJob, source: "cron" },
+				{ isStreaming: true, isBashRunning: true, pendingMessageCount: 2 },
+			),
+		).toBe(false);
 	});
 });
 
