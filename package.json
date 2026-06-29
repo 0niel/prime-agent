@@ -51,7 +51,7 @@
 	"version": "0.2.2",
 	"dependencies": {
 		"@earendil-works/pi-coding-agent": "^0.2.2",
-		"get-east-asian-width": "^1.4.0"
+		"get-east-asian-width": "^1.6.0"
 	},
 	"overrides": {
 		"rimraf": "6.1.2",
