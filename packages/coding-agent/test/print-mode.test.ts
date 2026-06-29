@@ -1,5 +1,6 @@
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentAutonomousStatus } from "../src/core/autonomous.js";
 import type { SessionShutdownEvent } from "../src/index.js";
 import { runPrintMode } from "../src/modes/print-mode.js";
 
@@ -12,13 +13,14 @@ type FakeExtensionRunner = {
 
 type FakeSession = {
 	sessionManager: { getHeader: () => object | undefined };
-	agent: { waitForIdle: () => Promise<void> };
+	agent: { waitForIdle: ReturnType<typeof vi.fn<() => Promise<void>>> };
 	state: { messages: AssistantMessage[] };
 	extensionRunner: FakeExtensionRunner;
 	bindExtensions: ReturnType<typeof vi.fn>;
 	subscribe: ReturnType<typeof vi.fn>;
 	prompt: ReturnType<typeof vi.fn>;
 	reload: ReturnType<typeof vi.fn>;
+	getAutonomousStatus: ReturnType<typeof vi.fn>;
 };
 
 type FakeRuntimeHost = {
@@ -55,7 +57,18 @@ function createAssistantMessage(options?: {
 	};
 }
 
-function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost {
+function createRuntimeHost(
+	assistantMessage: AssistantMessage,
+	autonomousStatus: AgentAutonomousStatus = {
+		enabled: false,
+		continuationsUsed: 0,
+		turnsUsed: 0,
+		tokensUsed: 0,
+		limits: { maxContinuations: 3, maxTurns: 12, maxTokens: 80_000, timeoutMs: 1_800_000 },
+		gates: { commands: [], maxRetries: 3, timeoutMs: 300_000 },
+		gateAttempts: {},
+	},
+): FakeRuntimeHost {
 	const extensionRunner: FakeExtensionRunner = {
 		hasHandlers: (eventType: string) => eventType === "session_shutdown",
 		emit: vi.fn(async () => {}),
@@ -65,13 +78,14 @@ function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost 
 
 	const session: FakeSession = {
 		sessionManager: { getHeader: () => undefined },
-		agent: { waitForIdle: async () => {} },
+		agent: { waitForIdle: vi.fn(async () => {}) },
 		state,
 		extensionRunner,
 		bindExtensions: vi.fn(async () => {}),
 		subscribe: vi.fn(() => () => {}),
 		prompt: vi.fn(async () => {}),
 		reload: vi.fn(async () => {}),
+		getAutonomousStatus: vi.fn(() => autonomousStatus),
 	};
 
 	return {
@@ -138,5 +152,144 @@ describe("runPrintMode", () => {
 		expect(errorSpy).toHaveBeenCalledWith("provider failure");
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+	});
+
+	it("returns non-zero when autonomous gates are still failing", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), {
+			enabled: true,
+			continuationsUsed: 34,
+			turnsUsed: 92,
+			tokensUsed: 215_535,
+			limits: { maxContinuations: 999, maxTurns: 1000, maxTokens: 2_000_000, timeoutMs: 1_800_000 },
+			gates: { commands: ["verify-public"], maxRetries: 999, timeoutMs: 3_600_000 },
+			gateAttempts: { "verify-public": 34 },
+			lastGateFailure: {
+				command: "verify-public",
+				attempt: 34,
+				exitText: "exited 1",
+				output: "0/43",
+			},
+		});
+		const { session } = runtimeHost;
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(1);
+		expect(errorSpy).toHaveBeenCalledWith("Autonomous quality gate still failing after attempt 34/999: exited 1");
+		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+	});
+
+	it("keeps prompting while autonomous gates fail below retry limits", async () => {
+		const statuses: AgentAutonomousStatus[] = [
+			{
+				enabled: true,
+				continuationsUsed: 1,
+				turnsUsed: 2,
+				tokensUsed: 100,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 1 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 1,
+					exitText: "exited 1",
+					output: "0/9",
+				},
+			},
+			{
+				enabled: true,
+				continuationsUsed: 2,
+				turnsUsed: 3,
+				tokensUsed: 200,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 2 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 2,
+					exitText: "exited 1",
+					output: "0/9 summary",
+				},
+			},
+			{
+				enabled: true,
+				continuationsUsed: 2,
+				turnsUsed: 4,
+				tokensUsed: 250,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 2 },
+			},
+		];
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still working" }), statuses[0]);
+		const { session } = runtimeHost;
+		let statusIndex = 0;
+		session.getAutonomousStatus.mockImplementation(
+			() => statuses[Math.min(statusIndex++, statuses.length - 1)] as AgentAutonomousStatus,
+		);
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(0);
+		expect(session.agent.waitForIdle).toHaveBeenCalledBefore(session.prompt);
+		expect(session.prompt).toHaveBeenCalledTimes(2);
+		expect(session.prompt.mock.calls[0][0]).toContain("Autonomous quality gate failed (attempt 1/3)");
+		expect(session.prompt.mock.calls[0][0]).toContain("0/9");
+		expect(session.prompt.mock.calls[0][1]).toEqual({ streamingBehavior: "followUp" });
+		expect(session.prompt.mock.calls[1][0]).toContain("Autonomous quality gate failed (attempt 2/3)");
+		expect(session.prompt.mock.calls[1][0]).toContain("0/9 summary");
+		expect(session.prompt.mock.calls[1][1]).toEqual({ streamingBehavior: "followUp" });
+	});
+
+	it("does not synchronously spin when a re-prompt does not advance gate attempts", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), {
+			enabled: true,
+			continuationsUsed: 1,
+			turnsUsed: 2,
+			tokensUsed: 100,
+			startedAt: Date.now(),
+			limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+			gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+			gateAttempts: { "verify-public": 1 },
+			lastGateFailure: {
+				command: "verify-public",
+				attempt: 1,
+				exitText: "exited 1",
+				output: "0/9",
+			},
+		});
+		const { session } = runtimeHost;
+		session.getAutonomousStatus.mockImplementation(() => ({
+			enabled: true,
+			continuationsUsed: 1,
+			turnsUsed: 2,
+			tokensUsed: 100,
+			startedAt: Date.now(),
+			limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+			gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+			gateAttempts: { "verify-public": 1 },
+			lastGateFailure: {
+				command: "verify-public",
+				attempt: 1,
+				exitText: "exited 1",
+				output: "0/9",
+			},
+		}));
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(1);
+		expect(session.agent.waitForIdle).toHaveBeenCalledTimes(2);
+		expect(session.prompt).toHaveBeenCalledTimes(1);
 	});
 });

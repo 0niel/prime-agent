@@ -1,4 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentAutonomousConfig } from "./autonomous.js";
 
 export interface AgentSessionRuntimeConfig {
 	cwd?: string;
@@ -23,6 +24,7 @@ export interface AgentSessionRuntimeConfig {
 	themes?: string[];
 	noThemes?: boolean;
 	noContextFiles?: boolean;
+	autonomous?: AgentAutonomousConfig;
 	extensionFlagValues?: Record<string, boolean | string>;
 }
 
@@ -56,6 +58,7 @@ export function mergeAgentSessionRuntimeConfig(
 		themes: cloneArray(override.themes ?? base.themes),
 		noThemes: override.noThemes ?? base.noThemes,
 		noContextFiles: override.noContextFiles ?? base.noContextFiles,
+		autonomous: mergeAutonomousConfig(base.autonomous, override.autonomous),
 		extensionFlagValues:
 			base.extensionFlagValues || override.extensionFlagValues
 				? { ...(base.extensionFlagValues ?? {}), ...(override.extensionFlagValues ?? {}) }
@@ -73,7 +76,21 @@ function cloneAgentSessionRuntimeConfig(config: AgentSessionRuntimeConfig): Agen
 		skills: cloneArray(config.skills),
 		promptTemplates: cloneArray(config.promptTemplates),
 		themes: cloneArray(config.themes),
+		autonomous: config.autonomous ? { ...config.autonomous } : undefined,
 		extensionFlagValues: config.extensionFlagValues ? { ...config.extensionFlagValues } : undefined,
+	};
+}
+
+function mergeAutonomousConfig(
+	base: AgentAutonomousConfig | undefined,
+	override: AgentAutonomousConfig | undefined,
+): AgentAutonomousConfig | undefined {
+	if (!base && !override) {
+		return undefined;
+	}
+	return {
+		...(base ?? {}),
+		...(override ?? {}),
 	};
 }
 

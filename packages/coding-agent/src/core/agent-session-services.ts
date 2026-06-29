@@ -4,6 +4,7 @@ import type { Model } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.js";
 import { installAgentTraceUpload } from "./agent-traces.js";
 import { AuthStorage } from "./auth-storage.js";
+import type { AgentAutonomousConfig } from "./autonomous.js";
 import type { AgentRlmHeartbeatController } from "./cron-jobs.js";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { ModelRegistry } from "./model-registry.js";
@@ -59,6 +60,7 @@ export interface AgentSessionCreationOptions {
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	rlmHeartbeatController?: AgentRlmHeartbeatController;
 	prewarmIpythonKernel?: boolean;
+	autonomous?: AgentAutonomousConfig;
 }
 
 /**
@@ -224,5 +226,6 @@ export async function createAgentSessionFromServices(
 		rlmHeartbeatController: options.rlmHeartbeatController,
 		sessionStartEvent: options.sessionStartEvent,
 		prewarmIpythonKernel: options.prewarmIpythonKernel,
+		autonomous: options.autonomous,
 	});
 }

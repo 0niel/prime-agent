@@ -1,7 +1,7 @@
 import type { AgentMessage, ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage, type Model, type ToolResultMessage } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { createHarness, type Harness } from "./harness.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createHarness, getMessageText, type Harness } from "./harness.js";
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<void>;
@@ -43,8 +43,16 @@ function createAssistant(
 	};
 }
 
+function failingGateCommand(): string {
+	return `${process.execPath} -e "console.error('gate failed'); process.exit(1)"`;
+}
+
 describe("AgentSession compaction characterization", () => {
 	const harnesses: Harness[] = [];
+
+	beforeEach(() => {
+		vi.useRealTimers();
+	});
 
 	afterEach(() => {
 		vi.useRealTimers();
@@ -340,6 +348,169 @@ describe("AgentSession compaction characterization", () => {
 		});
 
 		expect(shouldStop).toBe(true);
+	});
+
+	it("queues a failing autonomous gate continuation before threshold compaction stops a tool loop", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness({
+			autonomous: {
+				enabled: true,
+				maxContinuations: 2,
+				maxTurns: 100,
+				gates: { commands: [failingGateCommand()], maxRetries: 5 },
+			},
+			settings: { compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1 } },
+			models: [{ id: "faux-1", contextWindow: 200_000 }],
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "auto compacted",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const successfulAssistant = createAssistant(harness, {
+			stopReason: "toolUse",
+			totalTokens: 10_000,
+			timestamp: Date.now(),
+		});
+		const toolResult: ToolResultMessage<unknown> = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "large-context",
+			content: [{ type: "text", text: "x".repeat(800_000) }],
+			isError: false,
+			timestamp: Date.now() + 500,
+		};
+		const currentUser = {
+			role: "user",
+			content: [{ type: "text", text: "hello" }],
+			timestamp: Date.now() - 1000,
+		} satisfies Parameters<typeof harness.sessionManager.appendMessage>[0];
+		const oldUser = {
+			role: "user",
+			content: [{ type: "text", text: "old" }],
+			timestamp: Date.now() - 3000,
+		} satisfies Parameters<typeof harness.sessionManager.appendMessage>[0];
+		const oldAssistant = createAssistant(harness, {
+			stopReason: "stop",
+			totalTokens: 100,
+			timestamp: Date.now() - 2000,
+		});
+		const oldMessages: AgentMessage[] = [oldUser, oldAssistant];
+		const messages: AgentMessage[] = [currentUser, successfulAssistant, toolResult];
+		for (const message of [oldUser, oldAssistant, currentUser, successfulAssistant]) {
+			harness.sessionManager.appendMessage(message);
+		}
+		harness.session.agent.state.messages = [...oldMessages, ...messages];
+
+		const continueSpy = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
+		const followUpSpy = vi.spyOn(harness.session.agent, "followUp");
+
+		const shouldStop = await sessionInternals._shouldStopAfterTurn({
+			message: successfulAssistant,
+			toolResults: [toolResult],
+			context: { systemPrompt: harness.session.systemPrompt, messages, tools: [] },
+			newMessages: [successfulAssistant, toolResult],
+		});
+
+		expect(shouldStop).toBe(true);
+		expect(harness.session.getAutonomousStatus()).toMatchObject({
+			continuationsUsed: 1,
+			gates: expect.objectContaining({ maxRetries: 5 }),
+		});
+		expect(followUpSpy).toHaveBeenCalledTimes(1);
+		const queuedText = getMessageText(followUpSpy.mock.calls[0]?.[0]);
+		expect(queuedText).toContain("Autonomous quality gate failed (attempt 1/5)");
+		expect(queuedText).toContain("gate failed");
+
+		await sessionInternals._runAutoCompaction("threshold", false);
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("queues a failing autonomous gate continuation before post-turn threshold compaction", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness({
+			autonomous: {
+				enabled: true,
+				maxContinuations: 2,
+				maxTurns: 100,
+				gates: { commands: [failingGateCommand()], maxRetries: 5 },
+			},
+			settings: { compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1 } },
+			models: [{ id: "faux-1", contextWindow: 200_000 }],
+		});
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const successfulAssistant = createAssistant(harness, {
+			stopReason: "stop",
+			totalTokens: 10_000,
+			timestamp: Date.now(),
+		});
+		const largeToolResult: ToolResultMessage<unknown> = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "large-context",
+			content: [{ type: "text", text: "x".repeat(800_000) }],
+			isError: false,
+			timestamp: Date.now() + 500,
+		};
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
+			successfulAssistant,
+			largeToolResult,
+		];
+
+		const runCompactionSpy = vi.spyOn(sessionInternals, "_runAutoCompaction").mockResolvedValue();
+		const followUpSpy = vi.spyOn(harness.session.agent, "followUp");
+
+		await sessionInternals._checkCompaction(successfulAssistant, false);
+
+		expect(runCompactionSpy).toHaveBeenCalledWith("threshold", false);
+		expect(followUpSpy).toHaveBeenCalledTimes(1);
+		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
+		const queuedText = getMessageText(followUpSpy.mock.calls[0]?.[0]);
+		expect(queuedText).toContain("Autonomous quality gate failed (attempt 1/5)");
+		expect(queuedText).toContain("gate failed");
+	});
+
+	it("waits for threshold-compaction autonomous continuations before finishing prompt", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness({
+			autonomous: {
+				enabled: true,
+				maxContinuations: 1,
+				maxTurns: 100,
+				gates: { commands: [failingGateCommand()], maxRetries: 5 },
+			},
+			settings: { compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1 } },
+			models: [{ id: "faux-1", contextWindow: 200_000 }],
+		});
+		harnesses.push(harness);
+		const highUsageDone = {
+			...fauxAssistantMessage("done"),
+			usage: createUsage(10_000),
+		};
+		harness.setResponses([highUsageDone, fauxAssistantMessage("retry")]);
+		const promptPromise = harness.session.prompt("make the change");
+
+		await vi.waitFor(() => expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1));
+		await vi.advanceTimersByTimeAsync(100);
+		await promptPromise;
+
+		expect(harness.session.getAutonomousStatus()).toMatchObject({
+			continuationsUsed: 1,
+			turnsUsed: 2,
+		});
 	});
 
 	it("does not trigger threshold compaction for error messages when no prior usage exists", async () => {

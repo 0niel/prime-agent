@@ -25,8 +25,8 @@ export function waitForChildProcess(child: ChildProcess): Promise<number | null>
 		let exited = false;
 		let exitCode: number | null = null;
 		let postExitTimer: NodeJS.Timeout | undefined;
-		let stdoutEnded = child.stdout === null;
-		let stderrEnded = child.stderr === null;
+		let stdoutEnded = child.stdout === null || child.stdout.readableEnded;
+		let stderrEnded = child.stderr === null || child.stderr.readableEnded;
 
 		const cleanup = () => {
 			if (postExitTimer) {
@@ -91,5 +91,9 @@ export function waitForChildProcess(child: ChildProcess): Promise<number | null>
 		child.once("error", onError);
 		child.once("exit", onExit);
 		child.once("close", onClose);
+
+		if (child.exitCode !== null || child.signalCode !== null) {
+			onExit(child.exitCode);
+		}
 	});
 }
