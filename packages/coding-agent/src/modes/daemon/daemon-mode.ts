@@ -9,6 +9,38 @@
 import { createServer, type Server, type Socket } from "node:net";
 import { resolve } from "node:path";
 import { appendRotatingLog, getCronJobsPath, getDaemonLogPath, VERSION } from "../../config.js";
+import {
+	AGENT_MESSAGE_SOURCE,
+	type AgentSessionMessageAgentSummary,
+	type AgentSessionMessageEndpoint,
+	type AgentSessionMessageListResult,
+	type AgentSessionMessagePayload,
+	AgentSessionMessageRateLimiter,
+	type AgentSessionMessageReceipt,
+	type AgentSessionMessageSender,
+	assertAgentMessageQueueCapacity,
+	assertDirectAgentMessageTarget,
+	createAgentSessionMessageId,
+	createAgentSessionMessagePrompt,
+	createAgentSessionMessageReceipt,
+	DEFAULT_AGENT_MESSAGE_MAX_CHARS,
+	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY,
+	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS,
+	normalizeAgentSessionMessage,
+	resolveAgentSessionMessageStreamingBehavior,
+} from "../../core/agent-messages.js";
+import {
+	type AgentObserveAgentSnapshot,
+	type AgentObserveAgentSummary,
+	type AgentObserveController,
+	type AgentObserveListResult,
+	type AgentObserveRecentMessagesInput,
+	type AgentObserveRecentMessagesResult,
+	createAgentObserveMessagePreview,
+	normalizeObserveLimit,
+	normalizeObserveMaxChars,
+} from "../../core/agent-observe.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
 	AgentSessionRuntime,
@@ -95,6 +127,11 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"prompt",
 	"steer",
 	"follow_up",
+	"send_message",
+	"agent_messages_status",
+	"agent_messages_pause",
+	"agent_messages_resume",
+	"agent_messages_clear",
 	"abort",
 	"execute_bash",
 	"abort_bash",
@@ -179,6 +216,10 @@ export class AgentDaemon {
 	private readonly signalCleanupHandlers: Array<() => void> = [];
 	private readonly cronStore: AgentCronJobStore;
 	private readonly cronScheduler: AgentCronScheduler;
+	private readonly agentMessageRateLimiter = new AgentSessionMessageRateLimiter();
+	private readonly agentMessagePendingReservations = new Map<string, number>();
+	private readonly agentMessageTargetLocks = new Map<string, Promise<void>>();
+	private agentMessagesPaused = false;
 	private readonly summarizer = new DaemonSessionSummarizer(
 		() => [...this.sessions.values()],
 		(state) => {
@@ -434,6 +475,27 @@ export class AgentDaemon {
 							return this.deleteRlmHeartbeatForState(stateRef, id);
 						},
 					},
+					agentMessageController: {
+						listAgents: () => {
+							if (!stateRef) {
+								throw new Error("Agent message state is not ready for this session yet");
+							}
+							return this.createAgentMessageListResult(stateRef);
+						},
+						sendAgentMessage: (input) => {
+							if (!stateRef) {
+								throw new Error("Agent message state is not ready for this session yet");
+							}
+							return this.sendAgentSessionMessage({
+								targetSelector: input.target,
+								message: input.message,
+								fromState: stateRef,
+								deliveryMode: input.deliveryMode,
+								origin: "agent",
+							});
+						},
+					},
+					agentObserveController: this.createAgentObserveController(() => stateRef),
 				},
 			});
 			const state = await this.addRuntime(runtime, command.name);
@@ -750,6 +812,27 @@ export class AgentDaemon {
 						return this.deleteRlmHeartbeatForState(stateRef, id);
 					},
 				},
+				agentMessageController: {
+					listAgents: () => {
+						if (!stateRef) {
+							throw new Error("Agent message state is not ready for this session yet");
+						}
+						return this.createAgentMessageListResult(stateRef);
+					},
+					sendAgentMessage: (input) => {
+						if (!stateRef) {
+							throw new Error("Agent message state is not ready for this session yet");
+						}
+						return this.sendAgentSessionMessage({
+							targetSelector: input.target,
+							message: input.message,
+							fromState: stateRef,
+							deliveryMode: input.deliveryMode,
+							origin: "agent",
+						});
+					},
+				},
+				agentObserveController: this.createAgentObserveController(() => stateRef),
 				rlmDepth: options.rlmDepth,
 				rlmMaxDepth: options.rlmMaxDepth,
 				rlmSessionDir: options.sessionDir,
@@ -771,6 +854,86 @@ export class AgentDaemon {
 		const state = await this.addRuntime(runtime);
 		stateRef = state;
 		return runtime;
+	}
+
+	private createAgentObserveController(getCurrentState: () => ActiveSessionState | undefined): AgentObserveController {
+		const requireCurrentState = () => {
+			const current = getCurrentState();
+			if (!current) {
+				throw new Error("Agent observe state is not ready for this session yet");
+			}
+			return current;
+		};
+		return {
+			listAgents: () => this.createAgentObserveListResult(requireCurrentState()),
+			getAgent: (target) => this.createAgentObserveAgentSnapshot(requireCurrentState(), target),
+			recentMessages: (input) => this.createAgentObserveRecentMessages(requireCurrentState(), input),
+		};
+	}
+
+	private createAgentObserveListResult(currentState: ActiveSessionState): AgentObserveListResult {
+		return {
+			current: this.createAgentObserveSummary(currentState, currentState),
+			agents: [...this.sessions.values()].map((state) => this.createAgentObserveSummary(state, currentState)),
+		};
+	}
+
+	private createAgentObserveAgentSnapshot(
+		currentState: ActiveSessionState,
+		target: string,
+	): AgentObserveAgentSnapshot {
+		return {
+			agent: this.createAgentObserveSummary(this.getSessionState(target), currentState),
+		};
+	}
+
+	private createAgentObserveRecentMessages(
+		currentState: ActiveSessionState,
+		input: AgentObserveRecentMessagesInput,
+	): AgentObserveRecentMessagesResult {
+		const targetState = this.getSessionState(input.target);
+		const limit = normalizeObserveLimit(input.limit);
+		const maxChars = normalizeObserveMaxChars(input.maxChars);
+		const messages = targetState.runtime.session.messages;
+		const startIndex = Math.max(0, messages.length - limit);
+		return {
+			agent: this.createAgentObserveSummary(targetState, currentState),
+			messages: messages
+				.slice(startIndex)
+				.map((message, offset) => createAgentObserveMessagePreview(message, startIndex + offset, maxChars)),
+			limit,
+			maxChars,
+			truncated: startIndex > 0,
+		};
+	}
+
+	private createAgentObserveSummary(
+		state: ActiveSessionState,
+		currentState: ActiveSessionState,
+	): AgentObserveAgentSummary {
+		const summary = summaryForActiveSession(state);
+		const messages = state.runtime.session.messages;
+		const latest = messages.at(-1);
+		return {
+			activeSessionId: state.activeSessionId,
+			sessionId: summary.sessionId,
+			...(summary.sessionName ? { sessionName: summary.sessionName } : {}),
+			...(summary.runtimeKind ? { runtimeKind: summary.runtimeKind } : {}),
+			cwd: summary.cwd,
+			status: summary.status,
+			isCurrent: state.activeSessionId === currentState.activeSessionId,
+			isStreaming: summary.isStreaming,
+			isCompacting: summary.isCompacting,
+			attachedClients: summary.attachedClients,
+			messageCount: summary.messageCount,
+			pendingMessageCount: summary.pendingMessageCount,
+			...(summary.parentActiveSessionId ? { parentActiveSessionId: summary.parentActiveSessionId } : {}),
+			...(summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
+			...(summary.rlmChildId ? { rlmChildId: summary.rlmChildId } : {}),
+			...(summary.rlmParentNodeId ? { rlmParentNodeId: summary.rlmParentNodeId } : {}),
+			...(summary.firstMessage ? { firstMessage: summary.firstMessage } : {}),
+			...(latest ? { latestMessage: createAgentObserveMessagePreview(latest, messages.length - 1, 240) } : {}),
+		};
 	}
 
 	private handleConnection(socket: Socket): void {
@@ -1024,6 +1187,41 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				await state.runtime.session.followUp(command.message, command.images);
 				return success(command.id, "follow_up");
+			}
+
+			case "send_message": {
+				const fromState = command.fromActiveSessionId
+					? this.getSessionState(command.fromActiveSessionId)
+					: undefined;
+				const receipt = await this.sendAgentSessionMessage({
+					targetSelector: command.targetActiveSessionId,
+					message: command.message,
+					fromState,
+					clientId: client.id,
+					deliveryMode: command.deliveryMode,
+					origin: "cli",
+				});
+				return success(command.id, "send_message", receipt);
+			}
+
+			case "agent_messages_status": {
+				return success(command.id, "agent_messages_status", this.getAgentMessageSafetyStatus());
+			}
+
+			case "agent_messages_pause": {
+				this.agentMessagesPaused = true;
+				return success(command.id, "agent_messages_pause", this.getAgentMessageSafetyStatus());
+			}
+
+			case "agent_messages_resume": {
+				this.agentMessagesPaused = false;
+				return success(command.id, "agent_messages_resume", this.getAgentMessageSafetyStatus());
+			}
+
+			case "agent_messages_clear": {
+				const state = this.getSessionState(command.activeSessionId);
+				this.agentMessageRateLimiter.clearMatching((key) => key.endsWith(`->${state.activeSessionId}`));
+				return success(command.id, "agent_messages_clear", state.runtime.session.clearQueue());
 			}
 
 			case "abort": {
@@ -1484,6 +1682,154 @@ export class AgentDaemon {
 			...(parent ? { parent } : {}),
 			...(children.length > 0 ? { children } : {}),
 		};
+	}
+
+	private createAgentSessionMessageEndpoint(state: ActiveSessionState): AgentSessionMessageEndpoint {
+		const metadata = state.runtime.metadata;
+		return {
+			activeSessionId: state.activeSessionId,
+			sessionId: state.runtime.session.sessionId,
+			...(state.runtime.session.sessionName ? { sessionName: state.runtime.session.sessionName } : {}),
+			runtimeKind: metadata.kind,
+		};
+	}
+
+	private createAgentSessionMessageSender(
+		state: ActiveSessionState | undefined,
+		clientId: string,
+	): AgentSessionMessageSender {
+		if (!state) {
+			return { clientId };
+		}
+		return {
+			...this.createAgentSessionMessageEndpoint(state),
+			clientId,
+		};
+	}
+
+	private createAgentMessageAgentSummary(state: ActiveSessionState): AgentSessionMessageAgentSummary {
+		const metadata = state.runtime.metadata;
+		return {
+			...this.createAgentSessionMessageEndpoint(state),
+			cwd: state.runtime.cwd,
+			isStreaming: state.runtime.session.isStreaming,
+			pendingMessageCount: state.runtime.session.pendingMessageCount,
+			...(metadata.parentActiveSessionId ? { parentActiveSessionId: metadata.parentActiveSessionId } : {}),
+			...(metadata.rlmChildId ? { rlmChildId: metadata.rlmChildId } : {}),
+		};
+	}
+
+	private createAgentMessageListResult(current: ActiveSessionState): AgentSessionMessageListResult {
+		return {
+			current: this.createAgentSessionMessageEndpoint(current),
+			agents: [...this.sessions.values()].map((state) => this.createAgentMessageAgentSummary(state)),
+		};
+	}
+
+	private getAgentMessageSafetyStatus() {
+		return {
+			paused: this.agentMessagesPaused,
+			maxMessageChars: DEFAULT_AGENT_MESSAGE_MAX_CHARS,
+			maxPendingPerSession: DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+			rateLimitCapacity: DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY,
+			rateLimitRefillMs: DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS,
+		};
+	}
+
+	private reserveAgentMessageQueueSlot(targetState: ActiveSessionState): () => void {
+		const activeSessionId = targetState.activeSessionId;
+		const reserved = this.agentMessagePendingReservations.get(activeSessionId) ?? 0;
+		assertAgentMessageQueueCapacity(
+			targetState.runtime.session.pendingMessageCount + reserved,
+			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+		);
+		this.agentMessagePendingReservations.set(activeSessionId, reserved + 1);
+		let released = false;
+		return () => {
+			if (released) {
+				return;
+			}
+			released = true;
+			const next = (this.agentMessagePendingReservations.get(activeSessionId) ?? 1) - 1;
+			if (next <= 0) {
+				this.agentMessagePendingReservations.delete(activeSessionId);
+			} else {
+				this.agentMessagePendingReservations.set(activeSessionId, next);
+			}
+		};
+	}
+
+	private async withAgentMessageTargetLock<T>(activeSessionId: string, run: () => Promise<T>): Promise<T> {
+		const previous = this.agentMessageTargetLocks.get(activeSessionId) ?? Promise.resolve();
+		let releaseCurrent: () => void = () => {};
+		const current = new Promise<void>((resolve) => {
+			releaseCurrent = resolve;
+		});
+		const next = previous.catch(() => undefined).then(() => current);
+		this.agentMessageTargetLocks.set(activeSessionId, next);
+		await previous.catch(() => undefined);
+		try {
+			return await run();
+		} finally {
+			releaseCurrent();
+			if (this.agentMessageTargetLocks.get(activeSessionId) === next) {
+				this.agentMessageTargetLocks.delete(activeSessionId);
+			}
+		}
+	}
+
+	private async sendAgentSessionMessage(options: {
+		targetSelector: string;
+		message: string;
+		fromState?: ActiveSessionState;
+		clientId?: string;
+		deliveryMode?: AgentSessionMessagePayload["deliveryMode"];
+		origin: "agent" | "cli";
+	}): Promise<AgentSessionMessageReceipt> {
+		if (this.agentMessagesPaused) {
+			throw new Error("Agent messaging is paused");
+		}
+		const targetSelector = assertDirectAgentMessageTarget(options.targetSelector);
+		const targetState = this.getSessionState(targetSelector);
+		if (options.fromState?.activeSessionId === targetState.activeSessionId) {
+			throw new Error("Agent messaging cannot target the sending session");
+		}
+		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
+		const releaseQueueSlot = this.reserveAgentMessageQueueSlot(targetState);
+		const senderKey = options.fromState?.activeSessionId ?? `client:${options.clientId ?? "unknown"}`;
+		const rateLimitKey = `${senderKey}->${targetState.activeSessionId}`;
+		const rateLimit = this.agentMessageRateLimiter.tryConsume(rateLimitKey);
+		if (!rateLimit.ok) {
+			releaseQueueSlot();
+			throw new Error(`Agent messaging rate limit exceeded; retry after ${rateLimit.retryAfterMs}ms`);
+		}
+		const payload: AgentSessionMessagePayload = {
+			id: createAgentSessionMessageId(),
+			source: AGENT_MESSAGE_SOURCE,
+			message,
+			from: this.createAgentSessionMessageSender(options.fromState, options.clientId ?? options.origin),
+			target: this.createAgentSessionMessageEndpoint(targetState),
+			deliveryMode: options.deliveryMode ?? "auto",
+		};
+		try {
+			await this.withAgentMessageTargetLock(targetState.activeSessionId, () => {
+				const streamingBehavior = resolveAgentSessionMessageStreamingBehavior(
+					targetState.runtime.session.isStreaming,
+					payload.deliveryMode,
+				);
+				return targetState.runtime.session.prompt(createAgentSessionMessagePrompt(payload), {
+					expandPromptTemplates: false,
+					streamingBehavior,
+					source: "rpc",
+				});
+			});
+			return createAgentSessionMessageReceipt(payload);
+		} catch (error) {
+			this.agentMessageRateLimiter.refund(rateLimitKey);
+			throw error;
+		} finally {
+			releaseQueueSlot();
+		}
 	}
 
 	private detachClientFromSession(client: DaemonSocketClient, state: ActiveSessionState): void {

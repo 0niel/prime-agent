@@ -49,6 +49,27 @@ import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
 import { ensureTool, MISSING_RIPGREP_MESSAGE } from "../utils/tools-manager.js";
+import {
+	AGENT_MESSAGE_SKILL_NAME,
+	type AgentSessionMessageController,
+	type AgentSessionMessageListResult,
+	type AgentSessionMessageReceipt,
+	assertDirectAgentMessageTarget,
+	createAgentMessageHostHandlers,
+	normalizeAgentSessionMessage,
+	normalizeAgentSessionMessageDeliveryMode,
+} from "./agent-messages.js";
+import {
+	AGENT_OBSERVE_SKILL_NAME,
+	type AgentObserveAgentSnapshot,
+	type AgentObserveController,
+	type AgentObserveListResult,
+	type AgentObserveRecentMessagesResult,
+	createAgentObserveHostHandlers,
+	normalizeObserveLimit,
+	normalizeObserveMaxChars,
+	ORCHESTRATION_HEARTBEAT_SKILL_NAME,
+} from "./agent-observe.js";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.js";
 import {
 	type AgentAutonomousConfig,
@@ -321,6 +342,10 @@ export interface AgentSessionConfig {
 	 * Default: true.
 	 */
 	includeGoals?: boolean;
+	/** Daemon-backed agent-to-agent messaging bridge. Omitted for local-only sessions. */
+	agentMessageController?: AgentSessionMessageController;
+	/** Daemon-backed read-only active-session observation bridge. Omitted for local-only sessions. */
+	agentObserveController?: AgentObserveController;
 	/**
 	 * Optional host-side controller for the bundled rlm-heartbeat Python skill.
 	 * When omitted, rlm_heartbeat.* host requests are unavailable.
@@ -739,6 +764,8 @@ export class AgentSession {
 	private _allowedToolNames?: Set<string>;
 	private _includeGoals: boolean;
 	private _rlmHeartbeatController?: AgentRlmHeartbeatController;
+	private _agentMessageController?: AgentSessionMessageController;
+	private _agentObserveController?: AgentObserveController;
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
@@ -790,6 +817,8 @@ export class AgentSession {
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
 		this._includeGoals = config.includeGoals ?? true;
 		this._rlmHeartbeatController = config.rlmHeartbeatController;
+		this._agentMessageController = config.agentMessageController;
+		this._agentObserveController = config.agentObserveController;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._rlmDepth = config.rlmDepth ?? parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH");
@@ -1530,6 +1559,67 @@ export class AgentSession {
 			}
 			default:
 				throw new Error(`unknown RLM heartbeat request type "${type}"`);
+		}
+	}
+
+	handleAgentMessageHostRequest(
+		type: string,
+		payload: Record<string, unknown> = {},
+	): AgentSessionMessageListResult | Promise<AgentSessionMessageReceipt> {
+		if (!this._agentMessageController) {
+			throw new Error("agent messaging is not available in this session");
+		}
+		switch (type) {
+			case "agent_message.list":
+				return this._agentMessageController.listAgents();
+			case "agent_message.send": {
+				if (typeof payload.target !== "string") {
+					throw new Error("agent_message.send target must be a string");
+				}
+				if (typeof payload.message !== "string") {
+					throw new Error("agent_message.send message must be a string");
+				}
+				const deliveryMode = normalizeAgentSessionMessageDeliveryMode(payload.mode);
+				return this._agentMessageController.sendAgentMessage({
+					target: assertDirectAgentMessageTarget(payload.target),
+					message: normalizeAgentSessionMessage(payload.message),
+					...(deliveryMode ? { deliveryMode } : {}),
+				});
+			}
+			default:
+				throw new Error(`unknown agent message request type "${type}"`);
+		}
+	}
+
+	handleAgentObserveHostRequest(
+		type: string,
+		payload: Record<string, unknown> = {},
+	): AgentObserveListResult | AgentObserveAgentSnapshot | AgentObserveRecentMessagesResult {
+		const controller = this._agentObserveController;
+		if (!controller) {
+			throw new Error("agent observation is not available in this session");
+		}
+		switch (type) {
+			case "agent_observe.list":
+				return controller.listAgents();
+			case "agent_observe.get": {
+				if (typeof payload.target !== "string") {
+					throw new Error("agent_observe.get target must be a string");
+				}
+				return controller.getAgent(payload.target);
+			}
+			case "agent_observe.recent": {
+				if (typeof payload.target !== "string") {
+					throw new Error("agent_observe.recent target must be a string");
+				}
+				return controller.recentMessages({
+					target: payload.target,
+					limit: normalizeObserveLimit(payload.limit as number | undefined),
+					maxChars: normalizeObserveMaxChars((payload.max_chars ?? payload.maxChars) as number | undefined),
+				});
+			}
+			default:
+				throw new Error(`unknown agent observe request type "${type}"`);
 		}
 	}
 
@@ -3891,11 +3981,20 @@ export class AgentSession {
 	 * skill is withheld when goals are disabled for this session.
 	 */
 	private _modelVisibleSkills(): Skill[] {
-		const skills = this._resourceLoader.getSkills().skills;
-		if (this._includeGoals) {
-			return skills;
+		let skills = this._resourceLoader.getSkills().skills;
+		if (!this._includeGoals) {
+			skills = skills.filter((skill) => skill.name !== GOAL_SKILL_NAME);
 		}
-		return skills.filter((skill) => skill.name !== GOAL_SKILL_NAME);
+		if (!this._agentMessageController) {
+			skills = skills.filter((skill) => skill.name !== AGENT_MESSAGE_SKILL_NAME);
+		}
+		if (!this._agentObserveController) {
+			skills = skills.filter((skill) => skill.name !== AGENT_OBSERVE_SKILL_NAME);
+		}
+		if (!this._agentObserveController || !this._rlmHeartbeatController) {
+			skills = skills.filter((skill) => skill.name !== ORCHESTRATION_HEARTBEAT_SKILL_NAME);
+		}
+		return skills;
 	}
 
 	/** Typed handlers for host requests arriving from the IPython kernel comm bridge. */
@@ -3924,6 +4023,37 @@ export class AgentSession {
 			]) {
 				handlers[type] = async (payload) => this.handleRlmHeartbeatHostRequest(type, payload);
 			}
+		}
+		if (this._agentMessageController) {
+			Object.assign(
+				handlers,
+				createAgentMessageHostHandlers({
+					listAgents: () =>
+						this.handleAgentMessageHostRequest("agent_message.list") as AgentSessionMessageListResult,
+					sendAgentMessage: async (input) =>
+						(await this.handleAgentMessageHostRequest("agent_message.send", {
+							target: input.target,
+							message: input.message,
+							mode: input.deliveryMode,
+						})) as AgentSessionMessageReceipt,
+				}),
+			);
+		}
+		if (this._agentObserveController) {
+			Object.assign(
+				handlers,
+				createAgentObserveHostHandlers({
+					listAgents: () => this.handleAgentObserveHostRequest("agent_observe.list") as AgentObserveListResult,
+					getAgent: (target) =>
+						this.handleAgentObserveHostRequest("agent_observe.get", { target }) as AgentObserveAgentSnapshot,
+					recentMessages: (input) =>
+						this.handleAgentObserveHostRequest("agent_observe.recent", {
+							target: input.target,
+							limit: input.limit,
+							max_chars: input.maxChars,
+						}) as AgentObserveRecentMessagesResult,
+				}),
+			);
 		}
 		return handlers;
 	}

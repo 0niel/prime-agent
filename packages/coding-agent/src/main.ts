@@ -708,6 +708,8 @@ export function resolveRuntimeSessionOptions(
 		includeGoals: runtimeSessionOptions?.includeGoals,
 		rlmHeartbeatController: runtimeSessionOptions?.rlmHeartbeatController,
 		autonomous: runtimeSessionOptions?.autonomous ?? sessionOptions.autonomous,
+		agentMessageController: runtimeSessionOptions?.agentMessageController ?? sessionOptions.agentMessageController,
+		agentObserveController: runtimeSessionOptions?.agentObserveController ?? sessionOptions.agentObserveController,
 		rlmDepth: runtimeSessionOptions?.rlmDepth,
 		rlmMaxDepth: runtimeSessionOptions?.rlmMaxDepth,
 		rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,

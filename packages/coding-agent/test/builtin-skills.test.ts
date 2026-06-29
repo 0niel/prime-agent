@@ -245,6 +245,17 @@ describe("builtin skills", () => {
 			expect(rlmHeartbeat?.kind === "python" && rlmHeartbeat.python.importName).toBe("rlm_heartbeat");
 		});
 
+		it("loads the bundled orchestration heartbeat skill as a python skill", () => {
+			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
+
+			const orchestrationHeartbeat = skills.find((s) => s.name === "orchestration-heartbeat");
+			expect(orchestrationHeartbeat).toBeDefined();
+			expect(orchestrationHeartbeat?.kind).toBe("python");
+			expect(orchestrationHeartbeat?.kind === "python" && orchestrationHeartbeat.python.importName).toBe(
+				"orchestration_heartbeat",
+			);
+		});
+
 		it("ships the edit skill as a python skill importable as `edit`", () => {
 			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
 

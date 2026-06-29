@@ -35,6 +35,8 @@ const DAEMON_CLIENT_COMMANDS = new Set([
 	"kill",
 	"rename",
 	"prompt",
+	"send",
+	"agent-messages",
 	"steer",
 	"follow-up",
 	"state",
@@ -205,6 +207,12 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 				return;
 			case "prompt":
 				await runPrompt(client, parsed.positionals);
+				return;
+			case "send":
+				await runSend(client, parsed.positionals, parsed.json);
+				return;
+			case "agent-messages":
+				await runAgentMessages(client, parsed.positionals, parsed.json);
 				return;
 			case "steer":
 				await runMessageCommand(client, "steer", parsed.positionals, parsed.json);
@@ -802,6 +810,104 @@ async function runPrompt(client: DaemonClient, args: string[]): Promise<void> {
 		unsubscribeOutput();
 		finished.cancel();
 	}
+}
+
+async function runAgentMessages(client: DaemonClient, args: string[], json: boolean): Promise<void> {
+	const subcommand = args[0];
+	switch (subcommand) {
+		case "status":
+			await printResponseData(client, { type: "agent_messages_status" }, json);
+			return;
+		case "pause":
+			await printResponseData(client, { type: "agent_messages_pause" }, json);
+			return;
+		case "resume":
+			await printResponseData(client, { type: "agent_messages_resume" }, json);
+			return;
+		case "clear": {
+			const activeSessionId = args[1];
+			if (!activeSessionId) {
+				throw new Error("Usage: daemon agent-messages clear <session>");
+			}
+			await printResponseData(client, { type: "agent_messages_clear", activeSessionId }, json);
+			return;
+		}
+		default:
+			throw new Error("Usage: daemon agent-messages <status|pause|resume|clear>");
+	}
+}
+
+async function runSend(client: DaemonClient, args: string[], json: boolean): Promise<void> {
+	const parsed = parseSendArgs(args);
+	const response = await client.request({
+		type: "send_message",
+		targetActiveSessionId: parsed.targetActiveSessionId,
+		fromActiveSessionId: parsed.fromActiveSessionId,
+		deliveryMode: parsed.deliveryMode,
+		message: parsed.message,
+	});
+	const data = requireSuccess(response);
+	if (json) {
+		printJson(data);
+		return;
+	}
+	if (isAgentMessageReceipt(data)) {
+		const target = data.target.sessionName ?? data.target.activeSessionId;
+		console.log(`Sent to ${target}`);
+		return;
+	}
+	console.log("ok");
+}
+
+interface ParsedSendArgs {
+	targetActiveSessionId: string;
+	fromActiveSessionId?: string;
+	deliveryMode?: "auto" | "steer" | "follow_up";
+	message: string;
+}
+
+function parseSendArgs(args: string[]): ParsedSendArgs {
+	let fromActiveSessionId: string | undefined;
+	let deliveryMode: "auto" | "steer" | "follow_up" | undefined;
+	const positionals: string[] = [];
+
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--from") {
+			const value = args[index + 1];
+			if (!value) {
+				throw new Error("--from requires a session id or name");
+			}
+			fromActiveSessionId = value;
+			index++;
+			continue;
+		}
+		if (arg === "--steer") {
+			deliveryMode = "steer";
+			continue;
+		}
+		if (arg === "--follow-up") {
+			deliveryMode = "follow_up";
+			continue;
+		}
+		if (arg === "--auto") {
+			deliveryMode = "auto";
+			continue;
+		}
+		positionals.push(arg);
+	}
+
+	const targetActiveSessionId = positionals[0];
+	const message = positionals.slice(1).join(" ").trim();
+	if (!targetActiveSessionId || !message) {
+		throw new Error("Usage: daemon send [--from <session>] [--steer|--follow-up] <target-session> <message>");
+	}
+	return {
+		targetActiveSessionId,
+		fromActiveSessionId,
+		deliveryMode,
+		message,
+	};
 }
 
 async function runMessageCommand(
@@ -1449,6 +1555,18 @@ function getCronJob(value: unknown): { id: string; nextRunAt?: string } | undefi
 	return { id: candidate.id, ...(typeof candidate.nextRunAt === "string" ? { nextRunAt: candidate.nextRunAt } : {}) };
 }
 
+function isAgentMessageReceipt(value: unknown): value is { target: { activeSessionId: string; sessionName?: string } } {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const target = (value as { target?: unknown }).target;
+	return (
+		!!target &&
+		typeof target === "object" &&
+		typeof (target as { activeSessionId?: unknown }).activeSessionId === "string"
+	);
+}
+
 function printDaemonHelp(): void {
 	console.log(`${chalk.bold("Usage:")}
   ${APP_NAME} daemon [options] [session name]
@@ -1465,6 +1583,8 @@ ${chalk.bold("Commands:")}
   attach <session>              Attach an interactive terminal to a live session
   detach [session]              Detach this client from one session or all sessions
   prompt <session> <message>    Send a prompt, stream events, and exit when idle
+  send [options] <target> <msg> Send an agent-to-agent message to another live session
+  agent-messages <cmd>          Safety controls: status, pause, resume, clear <session>
   steer <session> <message>     Queue a steering message
   follow-up <session> <message> Queue a follow-up message
   rename <session> <name>       Rename a live session
@@ -1485,6 +1605,8 @@ ${chalk.bold("Options:")}
   --cwd <dir>                   Working directory for the created session
   --foreground, --no-detach     Keep daemon attached to this terminal for debugging
   --json                        Print raw JSON for commands with formatted output; attach streams raw protocol JSON
+  send options: --from <session>, --steer, --follow-up
+  agent-messages clear only clears one explicitly named session
   Agent options such as --model, --provider, --tools, and --thinking apply to created sessions.
 
 ${chalk.bold("Examples:")}
@@ -1503,6 +1625,7 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock cron add <session> "*/30 * * * *" -- "Check progress"
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock cron list
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock prompt <session> "Say hello"
+  ${APP_NAME} daemon --socket /tmp/prime-agent.sock send --from planner worker "Use this context..."
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock attach <session>
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock shutdown
   ${APP_NAME} daemon shutdown --all

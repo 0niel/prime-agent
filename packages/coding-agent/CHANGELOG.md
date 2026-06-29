@@ -24,6 +24,7 @@
 
 ### Added
 
+- Added bundled `agent-observe`, `agent-message`, and `orchestration-heartbeat` skills for daemon-backed session observation, messaging, and orchestrator status reporting.
 - Added `/effort` (alias `/thinking`) to set the reasoning level, with argument autocomplete that lists the levels the current model supports.
 - Added a `/system-prompt` command that shows the exact prompt last sent to the model, labelling it honestly when no turn has run yet.
 - Added a `/rename` alias for `/name` and a `Ctrl+R` shortcut in the Agents View to rename the selected session inline.
