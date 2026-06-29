@@ -115,7 +115,7 @@ describe("AgentSession autonomous mode", () => {
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
 	});
 
-	it("accepts a git worktree change relative to the autonomous baseline as terminal evidence", async () => {
+	it("continues after a git worktree change instead of letting the agent self-terminate", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		execFileSync("git", ["init"], { cwd: harness.tempDir, stdio: "ignore" });
@@ -130,15 +130,16 @@ describe("AgentSession autonomous mode", () => {
 		});
 		await harness.session.prompt("/autonomous on");
 		writeFileSync(path, "after\n");
-		harness.setResponses([fauxAssistantMessage("Done.")]);
+		harness.setResponses([fauxAssistantMessage("Done."), fauxAssistantMessage("Continuing until the evaluator stops me.")]);
 
 		await harness.session.prompt("make the change");
 
-		expect(getUserTexts(harness)).toEqual(["make the change"]);
-		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);
+		expect(getUserTexts(harness)[0]).toBe("make the change");
+		expect(getUserTexts(harness).slice(1)).toContain(DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT);
+		expect(harness.session.getAutonomousStatus().continuationsUsed).toBeGreaterThan(0);
 	});
 
-	it("accepts passing autonomous gates as terminal evidence", async () => {
+	it("continues after passing autonomous gates instead of treating the gate as terminal evidence", async () => {
 		const harness = await createHarness({
 			autonomous: {
 				enabled: true,
@@ -147,12 +148,12 @@ describe("AgentSession autonomous mode", () => {
 			},
 		});
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("Done.")]);
+		harness.setResponses([fauxAssistantMessage("Done."), fauxAssistantMessage("Continuing under verifier control.")]);
 
 		await harness.session.prompt("make the change");
 
-		expect(getUserTexts(harness)).toEqual(["make the change"]);
-		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);
+		expect(getUserTexts(harness)).toEqual(["make the change", DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT]);
+		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
 	});
 
 	it("feeds failing autonomous gate output back into the session", async () => {

@@ -37,7 +37,7 @@ export interface AgentAutonomousStatus {
 }
 
 export const DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT =
-	"No human input is available in autonomous mode. Continue working. If you were asking the user a question, make a reasonable assumption and verify it. If you believe you are blocked, prove it with host-observable evidence. If you believe the task is complete, produce completion evidence: passing gates or a patch relative to the autonomous baseline.";
+	"No human input is available in autonomous mode. Continue working until the host evaluator, verifier, or configured autonomous limits stop the run. If you were asking the user a question, make a reasonable assumption and verify it. If you believe you are blocked, prove it with host-observable evidence, preserve that evidence, and keep looking for safe progress while budget remains. If a quality gate passes, preserve the evidence and continue useful verification, cleanup, or robustness work instead of ending the session yourself.";
 
 export const DEFAULT_AUTONOMOUS_LIMITS: Required<
 	Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt" | "gates">
@@ -210,13 +210,10 @@ export function shouldAutonomouslyContinue(
 	}
 	if (state.gates.commands.length > 0) {
 		const gateResult = runAutonomousQualityGates(state, options.cwd);
-		if (gateResult === "passed" || gateResult === "retry_exhausted") {
-			return { shouldContinue: false, reason: "not_needed" };
-		}
-		return { shouldContinue: true, reason: "gate_failed" };
-	}
-	if (hasGitWorktreeChangedSinceBaseline(state, options.cwd)) {
-		return { shouldContinue: false, reason: "not_needed" };
+		return {
+			shouldContinue: true,
+			reason: gateResult === "passed" ? "missing_terminal_evidence" : "gate_failed",
+		};
 	}
 	return { shouldContinue: true, reason: "missing_terminal_evidence" };
 }
@@ -258,9 +255,8 @@ function runAutonomousQualityGates(state: AutonomousRuntimeState, cwd: string | 
 			state.lastGateFailure = {
 				...state.lastGateFailure,
 				exitText: "not rerun: workspace unchanged since previous failed gate",
-				output: truncateGateOutput(
-					`${state.lastGateFailure.output}\n\nThe autonomous gate was not rerun because the workspace has not changed since this failure. Edit source files, tests, or a blocker artifact before attempting to finish again.`,
-				),
+				output:
+					"The autonomous gate was not rerun because the workspace has not changed since this failure. Edit source files, tests, or a blocker artifact before attempting to finish again.",
 			};
 			return "failed";
 		}
