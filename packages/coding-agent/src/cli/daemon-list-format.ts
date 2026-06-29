@@ -1,21 +1,27 @@
 import chalk from "chalk";
 import { formatSessionDisplayId } from "../modes/daemon/daemon-session-id.js";
-import type { SessionStatus, SessionSummary } from "../modes/daemon/daemon-session-list.js";
+import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 
-const LIST_STATUS_ORDER: Record<SessionStatus, number> = {
-	user: 0,
+// Display status derived from the lifecycle + activity axes.
+type ListStatus = "working" | "idle" | "archived";
+
+const LIST_STATUS_ORDER: Record<ListStatus, number> = {
+	working: 0,
 	idle: 1,
-	tool: 2,
-	model: 3,
-	active: 4,
-	sleep: 5,
-	crash: 6,
+	archived: 2,
 };
+
+function listStatusForSummary(summary: SessionSummary): ListStatus {
+	if (summary.lifecycle === "archived") {
+		return "archived";
+	}
+	return summary.activity === "working" ? "working" : "idle";
+}
 
 type ListRow = {
 	name: string;
 	id: string;
-	status: SessionStatus;
+	status: ListStatus;
 	age: string;
 	model: string;
 	messages: string;
@@ -26,7 +32,7 @@ export function formatSessionListTable(sessions: readonly SessionSummary[], nowM
 	const rows = sortSessionsForList(sessions).map((session) => ({
 		name: session.sessionName ?? "",
 		id: formatSessionDisplayId(session.id),
-		status: session.status,
+		status: listStatusForSummary(session),
 		age: formatSessionAge(session.modified, nowMs),
 		model: formatSessionModel(session.model),
 		messages: String(session.messageCount),
@@ -39,7 +45,9 @@ function sortSessionsForList(sessions: readonly SessionSummary[]): SessionSummar
 	return sessions
 		.map((session, index) => ({ session, index }))
 		.sort((left, right) => {
-			const statusDelta = LIST_STATUS_ORDER[left.session.status] - LIST_STATUS_ORDER[right.session.status];
+			const statusDelta =
+				LIST_STATUS_ORDER[listStatusForSummary(left.session)] -
+				LIST_STATUS_ORDER[listStatusForSummary(right.session)];
 			return statusDelta || left.index - right.index;
 		})
 		.map(({ session }) => session);
@@ -51,15 +59,11 @@ function formatListCell(row: ListRow, column: keyof ListRow, value: string): str
 	}
 
 	switch (row.status) {
-		case "tool":
-		case "model":
+		case "working":
 			return chalk.red(value);
-		case "user":
 		case "idle":
 			return chalk.blue(value);
-		case "active":
-		case "sleep":
-		case "crash":
+		case "archived":
 			return chalk.dim(value);
 	}
 }

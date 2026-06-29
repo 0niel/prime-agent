@@ -328,7 +328,8 @@ export {
 	type RpcSessionState,
 	runPrintMode,
 	runRpcMode,
-	type SessionStatus,
+	type SessionActivity,
+	type SessionLifecycle,
 	type SessionSummary,
 } from "./modes/index.js";
 // UI components for extensions

@@ -29,26 +29,19 @@ export interface AgentsViewRow {
 }
 
 export function classifyAgentsViewSession(summary: SessionSummary): AgentsViewSection {
-	if (summary.isStreaming || summary.isCompacting || summary.pendingMessageCount > 0) {
+	if (summary.activity === "working") {
 		return "working";
 	}
-	if (summary.status === "model" || summary.status === "tool") {
-		return "working";
-	}
-	// Idle defaults to Completed; only an explicit verdict moves it to Needs Input.
-	if (summary.taskState === "needs_input") {
-		return "needs-input";
-	}
-	return "completed";
+	// Idle defaults to Needs Input; only an explicit completed verdict moves it on.
+	return summary.taskState === "completed" ? "completed" : "needs-input";
 }
 
-// The agents view shows daemon-resident sessions only; saved (slept) sessions
-// stay out of the list until they are resumed back into the daemon.
+// Live sessions only; drafts and archived stay out.
 export function shouldShowAgentsViewSession(summary: SessionSummary, manuallyInactive = false): boolean {
 	if (manuallyInactive) {
 		return false;
 	}
-	return summary.activeSessionId !== undefined;
+	return summary.lifecycle === "live";
 }
 
 export function sectionTitle(section: AgentsViewSection): string {
@@ -390,19 +383,16 @@ function getSessionStatusLabel(summary: SessionSummary): string {
 		return "compacting";
 	}
 	if (summary.isStreaming) {
-		return summary.status === "tool" ? "running tools" : "thinking";
+		return summary.isRunningTools ? "running tools" : "thinking";
 	}
 	if (summary.pendingMessageCount > 0) {
 		return `${summary.pendingMessageCount} queued`;
 	}
-	if (summary.status === "crash") {
-		return "crashed";
+	if (summary.lifecycle === "archived") {
+		return "archived";
 	}
-	if (summary.status === "sleep") {
-		return "saved";
+	if (summary.activity === "working") {
+		return "classifying";
 	}
-	if (summary.messageCount === 0) {
-		return "new";
-	}
-	return summary.status;
+	return summary.taskState === "completed" ? "completed" : "needs input";
 }

@@ -100,5 +100,5 @@ function makeState(activeSessionId: string, sessionId: string): ActiveSessionSta
 function createSavedSession(cwd: string, sessionDir: string, sessionId: string): void {
 	const session = SessionManager.create(cwd, sessionDir);
 	session.newSession({ id: sessionId });
-	session.appendSessionState({ status: "sleep" });
+	session.appendSessionState({ status: "archived" });
 }

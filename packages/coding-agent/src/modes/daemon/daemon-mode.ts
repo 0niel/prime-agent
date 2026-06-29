@@ -65,7 +65,12 @@ import {
 	isDaemonDialogExtensionUiRequest,
 	success,
 } from "./daemon-protocol.js";
-import { buildRlmChildSnapshots, buildSessionList, summaryForActiveSession } from "./daemon-session-list.js";
+import {
+	buildRlmChildSnapshots,
+	buildSessionList,
+	isActiveSessionBusy,
+	summaryForActiveSession,
+} from "./daemon-session-list.js";
 import { DaemonSessionSummarizer } from "./daemon-session-summarizer.js";
 import {
 	cleanupDaemonSocketPath,
@@ -81,7 +86,7 @@ export interface DaemonModeOptions {
 }
 
 export type { DaemonCommand, DaemonOutbound, DaemonResponse } from "./daemon-protocol.js";
-export type { SessionStatus, SessionSummary } from "./daemon-session-list.js";
+export type { SessionActivity, SessionLifecycle, SessionSummary } from "./daemon-session-list.js";
 export { defaultDaemonSocketPath } from "./daemon-socket.js";
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
@@ -1489,6 +1494,54 @@ export class AgentDaemon {
 	private detachClientFromSession(client: DaemonSocketClient, state: ActiveSessionState): void {
 		detachClientFromActiveSession(client, state);
 		this.write(client, { type: "session_detached", activeSessionId: state.activeSessionId });
+		// Abandoned new-chat: discard it so it doesn't linger in memory or leave an
+		// empty file. Replaces the old DeferredAgentConnection.
+		if (this.isDiscardableDraft(state)) {
+			// Re-check after yielding: a client may reattach before the async close
+			// runs, in which case the draft is no longer abandoned and must be kept.
+			queueMicrotask(() => {
+				if (this.sessions.has(state.activeSessionId) && this.isDiscardableDraft(state)) {
+					void this.closeSession(state, "killed");
+				}
+			});
+		}
+	}
+
+	private isDiscardableDraft(state: ActiveSessionState): boolean {
+		if (state.clients.size > 0) {
+			return false;
+		}
+		if (state.runtime.metadata.kind === "subagent") {
+			return false;
+		}
+		// A running bash or in-flight turn means there is live work to preserve.
+		if (state.runtime.session.isBashRunning || isActiveSessionBusy(state)) {
+			return false;
+		}
+		return this.isEmptyDraftContent(state);
+	}
+
+	/**
+	 * True when a session holds nothing worth persisting: no messages, no user
+	 * config (model/name/etc.), and no scheduled jobs. Shared by the detach-time
+	 * discard and the close-time file deletion so both agree on what an abandoned
+	 * draft is.
+	 */
+	private isEmptyDraftContent(state: ActiveSessionState): boolean {
+		const session = state.runtime.session;
+		if (session.messages.length > 0 || session.sessionManager.hasUserContent()) {
+			return false;
+		}
+		return !this.hasScheduledJobsForSession(state.activeSessionId);
+	}
+
+	private hasScheduledJobsForSession(activeSessionId: string): boolean {
+		return this.cronStore
+			.list()
+			.some(
+				(job) =>
+					job.activeSessionId === activeSessionId && job.status !== "cancelled" && job.status !== "completed",
+			);
 	}
 
 	private detachClient(client: DaemonSocketClient): void {
@@ -1535,13 +1588,14 @@ export class AgentDaemon {
 		// agent_status to a session being torn down.
 		this.summarizer.forget(state.activeSessionId);
 		const cascadeError = await this.closeChildSessions(state, reason);
-		// A killed session with no messages (abandoned new-chat) is discarded
-		// outright instead of persisting a sleep state that clutters the list.
-		const isEmptyKilledSession = reason === "killed" && state.runtime.session.messages.length === 0;
+		// Empty draft (no messages, config, or jobs): discard rather than persist an
+		// empty session file. Mirrors the detach-time discard so a config-bearing
+		// draft closed via kill/completed is never wiped.
+		const isEmptyDraftSession = reason !== "shutdown" && this.isEmptyDraftContent(state);
 		let persistError: unknown;
-		if (reason !== "shutdown" && !isEmptyKilledSession) {
+		if (reason !== "shutdown" && !isEmptyDraftSession) {
 			try {
-				state.runtime.session.sessionManager.appendSessionState({ status: "sleep" });
+				state.runtime.session.sessionManager.appendSessionState({ status: "archived" });
 			} catch (error) {
 				persistError = error;
 			}
@@ -1558,7 +1612,7 @@ export class AgentDaemon {
 		}
 		state.clients.clear();
 		this.sessions.delete(state.activeSessionId);
-		if (isEmptyKilledSession) {
+		if (isEmptyDraftSession) {
 			const sessionFile = state.runtime.session.sessionFile;
 			if (sessionFile) {
 				await deleteSessionFile(sessionFile).catch(() => undefined);
@@ -1588,12 +1642,21 @@ export class AgentDaemon {
 	}
 
 	private broadcastToSession(state: ActiveSessionState, message: DaemonOutbound): void {
-		// A finished turn/compaction is the cue to refresh status.
-		if (
-			message.type === "session_event" &&
-			(message.event.type === "turn_end" || message.event.type === "compaction_end")
-		) {
-			this.summarizer.notifyActivity(state);
+		if (message.type === "session_event") {
+			const eventType = message.event.type;
+			// A finished turn/compaction is the cue to refresh status.
+			if (eventType === "turn_end" || eventType === "compaction_end") {
+				this.summarizer.notifyActivity(state);
+			}
+			// A draft whose last client detached while it was busy isn't discardable
+			// at detach time; re-check once any work (turn, compaction, or bash)
+			// settles so it doesn't linger in the daemon.
+			if (
+				(eventType === "turn_end" || eventType === "compaction_end" || eventType === "bash_end") &&
+				this.isDiscardableDraft(state)
+			) {
+				void this.closeSession(state, "killed");
+			}
 		}
 		const sequencedMessage = this.addSessionEventMeta(state, message);
 		for (const client of state.clients) {

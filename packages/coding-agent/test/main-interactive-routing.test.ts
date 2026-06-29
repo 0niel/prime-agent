@@ -144,7 +144,8 @@ describe("daemon-backed interactive session manager routing", () => {
 			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", async () => ({
 				id: "active-1",
 				activeSessionId: "active-1",
-				status: "idle",
+				lifecycle: "draft",
+				activity: "idle",
 				sessionId: "session-1",
 				cwd: "/tmp/project",
 				isStreaming: false,
@@ -282,7 +283,8 @@ describe("runtime session option resolution", () => {
 function makeSessionSummary(overrides: Partial<SessionSummary>): SessionSummary {
 	return {
 		id: "session-1",
-		status: "idle",
+		lifecycle: "draft",
+		activity: "idle",
 		sessionId: "session-1",
 		cwd: "/tmp/project",
 		isStreaming: false,

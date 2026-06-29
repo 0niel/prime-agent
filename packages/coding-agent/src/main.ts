@@ -59,7 +59,6 @@ import {
 	createInteractiveModeUiServicesFromServices,
 	DaemonAgentConnection,
 	DaemonClient,
-	DeferredAgentConnection,
 	defaultDaemonSocketPath,
 	InProcessAgentConnection,
 	InteractiveMode,
@@ -887,40 +886,6 @@ async function findActiveDaemonSessionSummary(
 	}
 }
 
-// Best-effort: kill a promoted session that never received a message so abandoned
-// new-chats don't linger in the agents view. Any failure leaves it in place.
-async function discardEmptyDaemonSession(socketPath: string, activeSessionId: string): Promise<void> {
-	const client = new DaemonClient(socketPath);
-	try {
-		await client.connect(250);
-	} catch {
-		return;
-	}
-	try {
-		const state = await client.request({ type: "get_state", activeSessionId }, 3000);
-		if (!state.success || !isDaemonSessionSummary(state.data)) {
-			return;
-		}
-		const summary = state.data;
-		// Keep the session if it holds any work: messages, a queued/streaming turn,
-		// an in-progress compaction, or a running user bash command.
-		if (
-			summary.messageCount > 0 ||
-			summary.pendingMessageCount > 0 ||
-			summary.isStreaming ||
-			summary.isCompacting ||
-			summary.isBashRunning
-		) {
-			return;
-		}
-		await client.request({ type: "kill", activeSessionId }, 3000);
-	} catch {
-		// Best-effort cleanup; leave the session in place on any error.
-	} finally {
-		client.close();
-	}
-}
-
 async function normalizeDaemonRichTuiAttachArgs(args: string[]): Promise<string[] | undefined> {
 	const shortcut = parseDaemonRichTuiAttachShortcut(args);
 	if (!shortcut) {
@@ -1364,55 +1329,23 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 
 		daemonReady = (await awaitDaemonReady(daemonReady)).ready;
-		// No attach and no session selector means a fresh default chat. Defer the
-		// daemon session until the first action so startup is instant and leaving
-		// straight to the agents view (or quitting) creates nothing to clean up.
+		// A fresh default chat opens a real but message-less session; the lifecycle
+		// axis treats it as a draft (hidden, discarded on detach if never used), so
+		// no DeferredAgentConnection is needed to avoid creating it up front.
 		const isFreshDefaultSession =
 			!activeDaemonSessionSummary && !getInteractiveDaemonSessionPath(parsed, sessionManager);
-		let agentConnection: AgentConnection;
-		let attachModelFallbackMessage: string | undefined;
-		if (isFreshDefaultSession) {
-			agentConnection = new DeferredAgentConnection(
-				async () => {
-					const created = await createDaemonInteractiveConnection({
-						socketPath: daemonSocketPath,
-						config: defaultSessionConfig,
-					});
-					return {
-						connection: created.connection,
-						activeSessionId: getDaemonSummaryActiveSessionId(created.summary),
-					};
-				},
-				{
-					cwd: sessionManager.getCwd(),
-					sessionDir,
-					model: startupModel.model,
-					thinkingLevel: prepared.sessionOptions.thinkingLevel ?? defaultSessionConfig.thinking ?? "off",
-					scopedModels: prepared.sessionOptions.scopedModels ?? [],
-					availableModels: () => services.modelRegistry.getAvailable(),
-					steeringMode: settingsManager.getSteeringMode(),
-					followUpMode: settingsManager.getFollowUpMode(),
-					autoCompactionEnabled: settingsManager.getCompactionEnabled(),
-				},
-				(activeSessionId) => discardEmptyDaemonSession(daemonSocketPath, activeSessionId),
-			);
-			// The deferred path only ever fresh-creates with this same config, so the
-			// startup resolution is authoritative — there is no attached session whose
-			// summary could carry a different fallback (resolveAttachModelFallbackMessage
-			// only matters when attaching to an existing session).
-			attachModelFallbackMessage = startupModel.modelFallbackMessage;
-		} else {
-			const { connection, summary } = await createDaemonInteractiveConnection({
-				socketPath: daemonSocketPath,
-				config: defaultSessionConfig,
-				activeSessionId: activeDaemonSessionSummary
-					? getDaemonSummaryActiveSessionId(activeDaemonSessionSummary)
-					: undefined,
-				sessionPath: getInteractiveDaemonSessionPath(parsed, sessionManager),
-			});
-			agentConnection = connection;
-			attachModelFallbackMessage = resolveAttachModelFallbackMessage(summary, startupModel.modelFallbackMessage);
-		}
+		const { connection, summary } = await createDaemonInteractiveConnection({
+			socketPath: daemonSocketPath,
+			config: defaultSessionConfig,
+			activeSessionId: activeDaemonSessionSummary
+				? getDaemonSummaryActiveSessionId(activeDaemonSessionSummary)
+				: undefined,
+			sessionPath: getInteractiveDaemonSessionPath(parsed, sessionManager),
+		});
+		const agentConnection: AgentConnection = connection;
+		const attachModelFallbackMessage = isFreshDefaultSession
+			? startupModel.modelFallbackMessage
+			: resolveAttachModelFallbackMessage(summary, startupModel.modelFallbackMessage);
 
 		const interactiveMode = new InteractiveMode({
 			agentConnection,

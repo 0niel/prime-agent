@@ -41,7 +41,7 @@ export type AgentConnectionQueueMode = "all" | "one-at-a-time";
 export type AgentConnectionModel = Model<Api>;
 export type AgentConnectionSavedSessionScope = "current" | "all";
 
-export type AgentConnectionSavedSessionStateStatus = "active" | "sleep" | "crash";
+export type AgentConnectionSavedSessionStateStatus = "active" | "archived" | "crash";
 
 export type AgentConnectionSourceScope = "user" | "project" | "temporary";
 export type AgentConnectionSourceOrigin = "package" | "top-level";

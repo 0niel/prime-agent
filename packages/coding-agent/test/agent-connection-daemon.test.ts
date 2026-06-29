@@ -391,7 +391,8 @@ function createAttachResult(
 	const summary = {
 		id: activeSessionId,
 		activeSessionId,
-		status: "idle" as const,
+		lifecycle: "live" as const,
+		activity: "idle" as const,
 		sessionId: state.sessionId,
 		cwd: "/tmp/project",
 		isStreaming: false,
