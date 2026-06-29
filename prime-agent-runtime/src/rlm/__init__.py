@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .harness import HarnessEntry, HarnessState, RefinementEvent, get_harness_state
+from .harness import HarnessEntry, HarnessScope, HarnessState, RefinementEvent, get_harness_state
 
 try:
     from ipykernel.comm import Comm
@@ -197,6 +197,7 @@ sys.modules[__name__].__class__ = _CallableModule
 
 __all__ = [
     "HarnessEntry",
+    "HarnessScope",
     "HarnessState",
     "RLMResult",
     "RefinementEvent",

@@ -421,7 +421,7 @@ export class DeferredAgentConnection implements AgentConnection {
 		return (await this.ensure()).compact(customInstructions);
 	}
 
-	async refine(options?: { instructions?: string; rollbackId?: string }): Promise<RefinementResult> {
+	async refine(options?: { instructions?: string; rollbackId?: string; global?: boolean }): Promise<RefinementResult> {
 		return (await this.ensure()).refine(options);
 	}
 

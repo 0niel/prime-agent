@@ -2,8 +2,51 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	applyRefinementProposal,
+	getGlobalHarnessStateDir,
+	getLocalHarnessStateDir,
+	loadHarnessState,
+	type RefinementResult,
+	saveHarnessState,
+} from "../../src/core/refinement/index.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
+
+type AutoRefineReason = "turn_interval" | "compact";
+
+type AutoRefineInternals = {
+	_maybeAutoRefine(reason: AutoRefineReason): Promise<void>;
+	_scheduleAutoRefine(reason: AutoRefineReason): void;
+	_scheduleAutoRefineAfterCompaction(willContinueAfterCompaction: boolean): void;
+	_scheduleAutoRefineAfterAgentEnd(): void;
+	_invalidatePendingAutoRefineForBranchChange(): void;
+	_assistantTurnsSinceAutoRefine: number;
+	_lastAutoRefineReviewAt: number;
+	_compactAutoRefinePending: boolean;
+	_pendingAutoRefineReview?: unknown;
+	_autoRefineInProgress: boolean;
+	_autoRefineBranchVersion: number;
+};
+
+function emptyRefinementResult(): RefinementResult {
+	return {
+		id: "refine_test",
+		summary: "test refinement",
+		rationale: "test rationale",
+		expectedOutcome: "test outcome",
+		appliedEdits: [],
+		harnessStatePath: "/tmp/harness_state.json",
+	};
+}
+
+function createAutoRefineHarness(options: Parameters<typeof createHarness>[0] = {}): Promise<Harness> {
+	return createHarness({ ...options, persistSession: true });
+}
+
+function setAgentStreaming(harness: Harness, isStreaming: boolean): void {
+	(harness.session.agent.state as { isStreaming: boolean }).isStreaming = isStreaming;
+}
 
 async function createWaitingHarness(
 	options: {
@@ -63,6 +106,588 @@ describe("AgentSession queue characterization", () => {
 	afterEach(() => {
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
+		}
+	});
+
+	it("auto-refine review runs after the configured turn interval", async () => {
+		const reviewer = vi.fn(async () => ({
+			shouldRefine: true,
+			rationale: "durable lesson found",
+			instructions: "capture the durable lesson",
+		}));
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 2;
+
+		await internals._maybeAutoRefine("turn_interval");
+
+		expect(reviewer).toHaveBeenCalledWith({ reason: "turn_interval", turnsSinceLastReview: 2 });
+		expect(refine).toHaveBeenCalledWith(
+			expect.objectContaining({ instructions: expect.stringContaining("capture the durable lesson") }),
+		);
+		expect(refine).toHaveBeenCalledWith(
+			expect.objectContaining({ instructions: expect.stringContaining("local harness entries") }),
+		);
+		expect(refine).toHaveBeenCalledWith(
+			expect.objectContaining({ instructions: expect.stringContaining("Do not promote anything global") }),
+		);
+		expect(internals._assistantTurnsSinceAutoRefine).toBe(0);
+	});
+
+	it("auto-refine compact hook does not require the turn interval", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: false, rationale: "nothing durable" }));
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 0;
+
+		await internals._maybeAutoRefine("compact");
+
+		expect(reviewer).toHaveBeenCalledWith({ reason: "compact", turnsSinceLastReview: 0 });
+		expect(refine).not.toHaveBeenCalled();
+	});
+
+	it("auto-refine compact hook waits for planned post-compaction continuation", async () => {
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		const scheduleAutoRefine = vi.spyOn(internals, "_scheduleAutoRefine").mockImplementation(() => {});
+
+		internals._scheduleAutoRefineAfterCompaction(true);
+
+		expect(internals._compactAutoRefinePending).toBe(true);
+		expect(scheduleAutoRefine).not.toHaveBeenCalled();
+
+		internals._scheduleAutoRefineAfterAgentEnd();
+
+		expect(internals._compactAutoRefinePending).toBe(true);
+		expect(scheduleAutoRefine).toHaveBeenCalledWith("compact");
+		expect(scheduleAutoRefine).toHaveBeenCalledTimes(1);
+	});
+
+	it("auto-refine compact hook runs immediately when no post-compaction continuation is planned", async () => {
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		const scheduleAutoRefine = vi.spyOn(internals, "_scheduleAutoRefine").mockImplementation(() => {});
+
+		internals._scheduleAutoRefineAfterCompaction(false);
+
+		expect(internals._compactAutoRefinePending).toBe(false);
+		expect(scheduleAutoRefine).toHaveBeenCalledWith("compact");
+	});
+
+	it("does not run scheduled auto-refine after branch navigation", async () => {
+		vi.useFakeTimers();
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		const maybeAutoRefine = vi.spyOn(internals, "_maybeAutoRefine").mockResolvedValue();
+		try {
+			internals._scheduleAutoRefine("compact");
+			internals._invalidatePendingAutoRefineForBranchChange();
+			await vi.runAllTimersAsync();
+
+			expect(maybeAutoRefine).not.toHaveBeenCalled();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("auto-refine compact hook defers an approved refine if the agent becomes active during review", async () => {
+		let finishReview: (() => void) | undefined;
+		const reviewStarted = new Promise<void>((resolve) => {
+			finishReview = resolve;
+		});
+		const reviewer = vi.fn(async () => {
+			await reviewStarted;
+			setAgentStreaming(harness, true);
+			return { shouldRefine: true, rationale: "durable lesson" };
+		});
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
+
+		const autoRefinePromise = internals._maybeAutoRefine("compact");
+		expect(reviewer).toHaveBeenCalledWith({ reason: "compact", turnsSinceLastReview: 0 });
+		finishReview?.();
+		await autoRefinePromise;
+
+		expect(refine).not.toHaveBeenCalled();
+		expect(internals._pendingAutoRefineReview).toBeDefined();
+		expect(internals._compactAutoRefinePending).toBe(false);
+	});
+
+	it("auto-refine turn interval defers an approved refine if the agent becomes active during review", async () => {
+		let finishReview: (() => void) | undefined;
+		const reviewStarted = new Promise<void>((resolve) => {
+			finishReview = resolve;
+		});
+		const reviewer = vi.fn(async () => {
+			await reviewStarted;
+			setAgentStreaming(harness, true);
+			return { shouldRefine: true, rationale: "durable lesson" };
+		});
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 2;
+		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
+
+		const autoRefinePromise = internals._maybeAutoRefine("turn_interval");
+		expect(reviewer).toHaveBeenCalledWith({ reason: "turn_interval", turnsSinceLastReview: 2 });
+		finishReview?.();
+		await autoRefinePromise;
+
+		expect(refine).not.toHaveBeenCalled();
+		expect(internals._pendingAutoRefineReview).toBeDefined();
+
+		setAgentStreaming(harness, false);
+		await internals._maybeAutoRefine("turn_interval");
+
+		expect(reviewer).toHaveBeenCalledTimes(1);
+		expect(refine).toHaveBeenCalledWith(
+			expect.objectContaining({ instructions: expect.stringContaining("durable lesson") }),
+		);
+		expect(internals._pendingAutoRefineReview).toBeUndefined();
+	});
+
+	it("auto-refine pending review uses the in-progress guard and catches refine failures", async () => {
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 } },
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._pendingAutoRefineReview = {
+			reason: "turn_interval",
+			review: { shouldRefine: true, rationale: "durable lesson" },
+			branchVersion: internals._autoRefineBranchVersion,
+		};
+		let guardWasSetDuringRefine = false;
+		const refine = vi.spyOn(harness.session, "refine").mockImplementation(async () => {
+			guardWasSetDuringRefine = internals._autoRefineInProgress;
+			throw new Error("refine failed");
+		});
+
+		await internals._maybeAutoRefine("turn_interval");
+
+		expect(refine).toHaveBeenCalledWith(
+			expect.objectContaining({ instructions: expect.stringContaining("durable lesson") }),
+		);
+		expect(guardWasSetDuringRefine).toBe(true);
+		expect(internals._autoRefineInProgress).toBe(false);
+		expect(internals._pendingAutoRefineReview).toBeDefined();
+
+		refine.mockResolvedValueOnce(emptyRefinementResult());
+		await internals._maybeAutoRefine("turn_interval");
+
+		expect(internals._pendingAutoRefineReview).toBeUndefined();
+	});
+
+	it("keeps auto-refine counters when an approved immediate refine fails", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 2;
+		const beforeReviewAt = internals._lastAutoRefineReviewAt;
+		vi.spyOn(harness.session, "refine").mockRejectedValueOnce(new Error("refine failed"));
+
+		await internals._maybeAutoRefine("turn_interval");
+
+		expect(reviewer).toHaveBeenCalledWith({ reason: "turn_interval", turnsSinceLastReview: 2 });
+		expect(internals._assistantTurnsSinceAutoRefine).toBe(2);
+		expect(internals._lastAutoRefineReviewAt).toBe(beforeReviewAt);
+	});
+
+	it("clears pending auto-refine state when navigating to another branch", async () => {
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		await harness.session.prompt("first");
+		await harness.session.prompt("second");
+		const targetEntry = harness.sessionManager
+			.getEntries()
+			.find((entry) => entry.type === "message" && entry.message.role === "user");
+		expect(targetEntry).toBeDefined();
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 5;
+		internals._compactAutoRefinePending = true;
+		internals._pendingAutoRefineReview = {
+			reason: "compact",
+			review: { shouldRefine: true, rationale: "old branch" },
+			branchVersion: internals._autoRefineBranchVersion,
+		};
+
+		await harness.session.navigateTree(targetEntry!.id, { summarize: false });
+
+		expect(internals._compactAutoRefinePending).toBe(false);
+		expect(internals._pendingAutoRefineReview).toBeUndefined();
+		expect(internals._assistantTurnsSinceAutoRefine).toBe(0);
+	});
+
+	it("does not apply stale auto-refine cooldown when a review completes after branch navigation", async () => {
+		let finishReview: (() => void) | undefined;
+		const reviewStarted = new Promise<void>((resolve) => {
+			finishReview = resolve;
+		});
+		const reviewer = vi.fn(async () => {
+			await reviewStarted;
+			return { shouldRefine: true, rationale: "old branch" };
+		});
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 2, cooldownMs: 60_000 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 2;
+		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
+		const beforeReviewAt = internals._lastAutoRefineReviewAt;
+
+		const autoRefinePromise = internals._maybeAutoRefine("turn_interval");
+		expect(reviewer).toHaveBeenCalledWith({ reason: "turn_interval", turnsSinceLastReview: 2 });
+		internals._invalidatePendingAutoRefineForBranchChange();
+		finishReview?.();
+		await autoRefinePromise;
+
+		expect(refine).not.toHaveBeenCalled();
+		expect(internals._lastAutoRefineReviewAt).toBe(beforeReviewAt);
+		expect(internals._assistantTurnsSinceAutoRefine).toBe(0);
+		expect(internals._pendingAutoRefineReview).toBeUndefined();
+	});
+
+	it("auto-refine is skipped for sessions without a local harness directory", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
+		const harness = await createHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 1;
+		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
+		const scheduleAutoRefine = vi.spyOn(internals, "_scheduleAutoRefine").mockImplementation(() => {});
+
+		await internals._maybeAutoRefine("turn_interval");
+		internals._scheduleAutoRefineAfterCompaction(false);
+		internals._scheduleAutoRefineAfterAgentEnd();
+
+		expect(reviewer).not.toHaveBeenCalled();
+		expect(refine).not.toHaveBeenCalled();
+		expect(scheduleAutoRefine).not.toHaveBeenCalled();
+	});
+
+	it("auto-refine is skipped for subagent sessions", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
+			rlmDepth: 1,
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 1;
+		const scheduleAutoRefine = vi.spyOn(internals, "_scheduleAutoRefine").mockImplementation(() => {});
+
+		await internals._maybeAutoRefine("turn_interval");
+		internals._scheduleAutoRefineAfterCompaction(false);
+		internals._scheduleAutoRefineAfterAgentEnd();
+
+		expect(reviewer).not.toHaveBeenCalled();
+		expect(scheduleAutoRefine).not.toHaveBeenCalled();
+	});
+
+	it("auto-refine review obeys the cooldown", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 60_000 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 1;
+		internals._lastAutoRefineReviewAt = Date.now();
+
+		await internals._maybeAutoRefine("turn_interval");
+
+		expect(reviewer).not.toHaveBeenCalled();
+	});
+
+	it("auto-refine preserves a compact checkpoint when cooldown is active", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 60_000 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._lastAutoRefineReviewAt = Date.now();
+
+		await internals._maybeAutoRefine("compact");
+
+		expect(reviewer).not.toHaveBeenCalled();
+		expect(internals._compactAutoRefinePending).toBe(true);
+	});
+
+	it("queued follow-up messages do not make an idle agent active for auto-refine", async () => {
+		const reviewer = vi.fn(async () => ({
+			shouldRefine: true,
+			rationale: "durable lesson found",
+			instructions: "capture the durable lesson",
+		}));
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		internals._assistantTurnsSinceAutoRefine = 1;
+		vi.spyOn(harness.session.agent, "hasQueuedMessages").mockReturnValue(true);
+		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
+
+		await internals._maybeAutoRefine("turn_interval");
+
+		expect(reviewer).toHaveBeenCalledWith({ reason: "turn_interval", turnsSinceLastReview: 1 });
+		expect(refine).toHaveBeenCalled();
+	});
+
+	it("strips local display prefixes before applying local refine edits", async () => {
+		const harness = await createAutoRefineHarness();
+		harnesses.push(harness);
+		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		process.env.PRIME_AGENT_CODING_AGENT_DIR = `${harness.tempDir}/agent`;
+		try {
+			const globalDir = getGlobalHarnessStateDir();
+			const localDir = getLocalHarnessStateDir(harness.sessionManager.getSessionArtifactDir())!;
+			const globalState = loadHarnessState(globalDir, "global");
+			const localState = loadHarnessState(localDir, "local");
+			applyRefinementProposal(
+				globalState,
+				{
+					summary: "Global shared memory",
+					rationale: "seed",
+					expectedOutcome: "seeded",
+					edits: [
+						{
+							action: "create",
+							kind: "memory",
+							id: "shared",
+							title: "Shared",
+							content: "Global content",
+						},
+					],
+				},
+				{ id: "seed_global", scope: "global" },
+			);
+			applyRefinementProposal(
+				localState,
+				{
+					summary: "Local shared memory",
+					rationale: "seed",
+					expectedOutcome: "seeded",
+					edits: [
+						{
+							action: "create",
+							kind: "memory",
+							id: "shared",
+							title: "Shared",
+							content: "Local content",
+						},
+					],
+				},
+				{ id: "seed_local", scope: "local" },
+			);
+			saveHarnessState(globalDir, globalState);
+			saveHarnessState(localDir, localState);
+			harness.setResponses([
+				fauxAssistantMessage(
+					JSON.stringify({
+						summary: "Update local shared memory",
+						rationale: "The local display id was selected from merged state.",
+						expectedOutcome: "Only the local entry changes.",
+						edits: [
+							{
+								action: "update",
+								kind: "memory",
+								id: "local:shared",
+								title: "Shared",
+								content: "Updated local content",
+							},
+						],
+					}),
+				),
+			]);
+
+			const result = await harness.session.refine({ instructions: "update the local shared memory" });
+
+			expect(result.appliedEdits[0]).toMatchObject({ id: "shared", applied: true });
+			expect(loadHarnessState(localDir, "local").entries.memory.shared.content).toBe("Updated local content");
+			expect(loadHarnessState(globalDir, "global").entries.memory.shared.content).toBe("Global content");
+		} finally {
+			if (previousAgentDir === undefined) {
+				delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+			} else {
+				process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
+			}
+		}
+	});
+
+	it("strips global display prefixes before applying global refine edits", async () => {
+		const harness = await createAutoRefineHarness();
+		harnesses.push(harness);
+		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		process.env.PRIME_AGENT_CODING_AGENT_DIR = `${harness.tempDir}/agent`;
+		try {
+			const globalDir = getGlobalHarnessStateDir();
+			const globalState = loadHarnessState(globalDir, "global");
+			applyRefinementProposal(
+				globalState,
+				{
+					summary: "Global shared memory",
+					rationale: "seed",
+					expectedOutcome: "seeded",
+					edits: [
+						{
+							action: "create",
+							kind: "memory",
+							id: "shared",
+							title: "Shared",
+							content: "Global content",
+						},
+					],
+				},
+				{ id: "seed_global", scope: "global" },
+			);
+			saveHarnessState(globalDir, globalState);
+			harness.setResponses([
+				fauxAssistantMessage(
+					JSON.stringify({
+						summary: "Update global shared memory",
+						rationale: "The global display id was selected from the overview.",
+						expectedOutcome: "Only the global entry changes.",
+						edits: [
+							{
+								action: "update",
+								kind: "memory",
+								id: "global:shared",
+								title: "Shared",
+								content: "Updated global content",
+							},
+						],
+					}),
+				),
+			]);
+
+			const result = await harness.session.refine({
+				instructions: "update the global shared memory",
+				global: true,
+			});
+
+			expect(result.appliedEdits[0]).toMatchObject({ id: "shared", applied: true });
+			expect(loadHarnessState(globalDir, "global").entries.memory.shared.content).toBe("Updated global content");
+		} finally {
+			if (previousAgentDir === undefined) {
+				delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+			} else {
+				process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
+			}
+		}
+	});
+
+	it("rolls back copied local refinement history against the original local harness state", async () => {
+		const original = await createAutoRefineHarness();
+		const branched = await createAutoRefineHarness();
+		harnesses.push(original, branched);
+		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		process.env.PRIME_AGENT_CODING_AGENT_DIR = `${original.tempDir}/agent`;
+		try {
+			const originalLocalDir = getLocalHarnessStateDir(original.sessionManager.getSessionArtifactDir())!;
+			const branchedLocalDir = getLocalHarnessStateDir(branched.sessionManager.getSessionArtifactDir())!;
+			const branchedState = loadHarnessState(branchedLocalDir, "local");
+			applyRefinementProposal(
+				branchedState,
+				{
+					summary: "Branch local memory",
+					rationale: "seed",
+					expectedOutcome: "seeded",
+					edits: [
+						{
+							action: "create",
+							kind: "memory",
+							id: "remember_me",
+							title: "Branch memory",
+							content: "Branch content should survive rollback of copied history.",
+						},
+					],
+				},
+				{ id: "seed_branch", scope: "local" },
+			);
+			saveHarnessState(branchedLocalDir, branchedState);
+			original.setResponses([
+				fauxAssistantMessage(
+					JSON.stringify({
+						summary: "Create original local memory",
+						rationale: "seed",
+						expectedOutcome: "Original local entry exists.",
+						edits: [
+							{
+								action: "create",
+								kind: "memory",
+								id: "remember_me",
+								title: "Original memory",
+								content: "Original content should be rolled back.",
+							},
+						],
+					}),
+				),
+			]);
+
+			const originalRefinement = await original.session.refine({ instructions: "remember this locally" });
+			branched.sessionManager.appendCustomEntry("prime-agent.refinement", originalRefinement);
+			expect(loadHarnessState(originalLocalDir, "local").entries.memory.remember_me.content).toBe(
+				"Original content should be rolled back.",
+			);
+
+			await branched.session.refine({ rollbackId: originalRefinement.id });
+
+			expect(loadHarnessState(originalLocalDir, "local").entries.memory.remember_me).toBeUndefined();
+			expect(loadHarnessState(branchedLocalDir, "local").entries.memory.remember_me.content).toBe(
+				"Branch content should survive rollback of copied history.",
+			);
+		} finally {
+			if (previousAgentDir === undefined) {
+				delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+			} else {
+				process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
+			}
 		}
 	});
 

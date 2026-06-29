@@ -956,6 +956,8 @@ describe("AgentSession RLM session dir", () => {
 		expect(inspectable._ensureRlmSessionDir()).toBeUndefined();
 		const env = inspectable._rlmKernelEnv();
 		expect(env.RLM_SESSION_DIR).toBeUndefined();
+		expect(env.RLM_HARNESS_STATE_DIR).toBeUndefined();
+		expect(env.RLM_GLOBAL_HARNESS_STATE_DIR).toBeDefined();
 		expect(env).toMatchObject({ RLM_DEPTH: "0" });
 
 		const after = readdirSync(tmpdir()).filter((name) => name.startsWith("prime-agent-rlm-"));
@@ -971,6 +973,8 @@ describe("AgentSession RLM session dir", () => {
 		expect(artifactDir).toBeDefined();
 		expect(inspectable._ensureRlmSessionDir()).toBe(artifactDir);
 		expect(inspectable._rlmKernelEnv().RLM_SESSION_DIR).toBe(artifactDir);
+		expect(inspectable._rlmKernelEnv().RLM_HARNESS_STATE_DIR).toBe(join(artifactDir!, "harness"));
+		expect(inspectable._rlmKernelEnv().RLM_GLOBAL_HARNESS_STATE_DIR).toBeDefined();
 	});
 
 	it("exports the configured agentDir to the kernel so skills find auth.json", () => {

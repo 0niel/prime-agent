@@ -151,15 +151,20 @@ import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import {
+	type AutoRefineReason,
+	type AutoRefineReview,
 	appendGlobalRefinement,
 	applyRefinementProposal,
 	getGlobalHarnessStateDir,
+	getLocalHarnessStateDir,
 	getRefinementHistory,
 	loadGlobalRefinementHistory,
 	loadHarnessState,
+	mergeHarnessStates,
 	mergeRefinementHistory,
 	planRefinement,
 	type RefinementResult,
+	reviewAutoRefine,
 	saveHarnessState,
 } from "./refinement/index.js";
 import { resolveConfigValue } from "./resolve-config-value.js";
@@ -381,6 +386,8 @@ export interface AgentSessionConfig {
 	 * Only applies to main agents (rlmDepth 0); subagent kernels stay lazy. Default: false.
 	 */
 	prewarmIpythonKernel?: boolean;
+	/** Test/extension hook for automatic refine review decisions. Defaults to the model-backed review gate. */
+	autoRefineReviewer?: AutoRefineReviewer;
 }
 
 export interface ExtensionBindings {
@@ -389,6 +396,13 @@ export interface ExtensionBindings {
 	shutdownHandler?: ShutdownHandler;
 	onError?: ExtensionErrorListener;
 }
+
+export interface AutoRefineReviewRequest {
+	reason: AutoRefineReason;
+	turnsSinceLastReview: number;
+}
+
+export type AutoRefineReviewer = (request: AutoRefineReviewRequest) => Promise<AutoRefineReview>;
 
 /** Options for AgentSession.prompt() */
 export interface PromptOptions {
@@ -463,6 +477,14 @@ function noopRlmChildAbort(): void {}
 
 function isRlmChildRunCancelled(run: RlmChildRun): boolean {
 	return run.status === "cancelled";
+}
+
+function autoRefineInstructions(reason: AutoRefineReason, review: AutoRefineReview): string {
+	const detail = review.instructions
+		? `
+Reviewer instructions: ${review.instructions}`
+		: "";
+	return `Automatic refine review triggered by ${reason}. Only create/update/delete local harness entries if there is clear evidence that should help this session continue. Prefer an empty edits array over speculative or one-off memories. Do not promote anything global unless explicitly requested. Reviewer rationale: ${review.rationale}${detail}`;
 }
 
 function parseDepth(value: string | undefined, fallback: number, name: string): number {
@@ -801,6 +823,15 @@ export class AgentSession {
 	// Base system prompt (without extension appends) - used to apply fresh appends each turn
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
+	private _assistantTurnsSinceAutoRefine = 0;
+	private _lastAutoRefineReviewAt = 0;
+	private _autoRefineInProgress = false;
+	private _compactAutoRefinePending = false;
+	private _pendingAutoRefineReview:
+		| { reason: AutoRefineReason; review: AutoRefineReview; branchVersion: number }
+		| undefined;
+	private _autoRefineBranchVersion = 0;
+	private readonly _autoRefineReviewer?: AutoRefineReviewer;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -824,6 +855,7 @@ export class AgentSession {
 		this._rlmDepth = config.rlmDepth ?? parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH");
 		this._rlmMaxDepth = config.rlmMaxDepth ?? parseDepth(process.env.RLM_MAX_DEPTH, 1, "RLM_MAX_DEPTH");
 		this._prewarmIpythonKernel = (config.prewarmIpythonKernel ?? false) && this._rlmDepth === 0;
+		this._autoRefineReviewer = config.autoRefineReviewer;
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._subagentRuntimeHost = config.subagentRuntimeHost;
@@ -1809,6 +1841,7 @@ export class AgentSession {
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
 				this._lastAssistantMessage = event.message;
+				this._assistantTurnsSinceAutoRefine++;
 
 				const assistantMsg = event.message as AssistantMessage;
 				if (assistantMsg.stopReason !== "error") {
@@ -1847,6 +1880,7 @@ export class AgentSession {
 			const compactionWillRetry = await this._checkCompaction(msg);
 			if (!compactionWillRetry) {
 				this._finishGoalForTerminalAssistantMessage(msg);
+				this._scheduleAutoRefineAfterAgentEnd();
 			}
 		}
 	}
@@ -2252,7 +2286,12 @@ export class AgentSession {
 			toolSnippets,
 			promptGuidelines,
 			allowRecursion: this._rlmDepth < this._rlmMaxDepth,
-			harnessState: loadHarnessState(getGlobalHarnessStateDir()),
+			harnessState: mergeHarnessStates(
+				loadHarnessState(getGlobalHarnessStateDir(), "global"),
+				this.sessionManager.getSessionArtifactDir()
+					? loadHarnessState(getLocalHarnessStateDir(this.sessionManager.getSessionArtifactDir())!, "local")
+					: undefined,
+			),
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
 	}
@@ -3051,6 +3090,7 @@ export class AgentSession {
 	async compact(customInstructions?: string): Promise<CompactionResult> {
 		this._disconnectFromAgent();
 		await this.abort();
+		let didCompact = false;
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual", customInstructions });
 
@@ -3168,6 +3208,7 @@ export class AgentSession {
 				willRetry: false,
 				customInstructions,
 			});
+			didCompact = true;
 			return compactionResult;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -3187,6 +3228,10 @@ export class AgentSession {
 		} finally {
 			this._compactionAbortController = undefined;
 			this._reconnectToAgent();
+			if (didCompact) {
+				this._discardPendingAutoRefine();
+				this._scheduleAutoRefine("compact");
+			}
 		}
 	}
 
@@ -3198,11 +3243,196 @@ export class AgentSession {
 		this._autoCompactionAbortController?.abort();
 	}
 
+	private _autoRefineAllowedForSession(): boolean {
+		return this._rlmDepth === 0 && getLocalHarnessStateDir(this.sessionManager.getSessionArtifactDir()) !== undefined;
+	}
+
+	private _discardPendingAutoRefine(): void {
+		this._compactAutoRefinePending = false;
+		this._pendingAutoRefineReview = undefined;
+	}
+
+	private _invalidatePendingAutoRefineForBranchChange(): void {
+		this._discardPendingAutoRefine();
+		this._assistantTurnsSinceAutoRefine = 0;
+		this._autoRefineBranchVersion++;
+	}
+
+	private _scheduleAutoRefineAfterAgentEnd(): void {
+		if (!this._autoRefineAllowedForSession()) {
+			return;
+		}
+		if (this._pendingAutoRefineReview) {
+			this._scheduleAutoRefine(this._pendingAutoRefineReview.reason);
+			return;
+		}
+		if (this._compactAutoRefinePending) {
+			this._scheduleAutoRefine("compact");
+			return;
+		}
+
+		this._scheduleAutoRefine("turn_interval");
+	}
+
+	private _scheduleAutoRefineAfterCompaction(willContinueAfterCompaction: boolean): void {
+		if (!this._autoRefineAllowedForSession()) {
+			return;
+		}
+		if (willContinueAfterCompaction) {
+			this._compactAutoRefinePending = true;
+			return;
+		}
+
+		this._scheduleAutoRefine("compact");
+	}
+
+	private _shouldSkipAutoRefineForActiveAgent(): boolean {
+		return this.isStreaming || this.isCompacting;
+	}
+
+	private _scheduleAutoRefine(reason: AutoRefineReason, branchVersion = this._autoRefineBranchVersion): void {
+		setTimeout(() => {
+			if (branchVersion !== this._autoRefineBranchVersion) {
+				return;
+			}
+			void this._maybeAutoRefine(reason);
+		}, 0);
+	}
+
+	private async _maybeAutoRefine(reason: AutoRefineReason): Promise<void> {
+		if (!this._autoRefineAllowedForSession()) {
+			this._discardPendingAutoRefine();
+			return;
+		}
+
+		const settings = this.settingsManager.getAutoRefineSettings();
+		if (!settings.enabled) {
+			this._discardPendingAutoRefine();
+			return;
+		}
+		if (this._autoRefineInProgress || this._shouldSkipAutoRefineForActiveAgent()) {
+			if (reason === "compact") {
+				this._compactAutoRefinePending = true;
+			}
+			return;
+		}
+
+		const pendingReview = this._pendingAutoRefineReview;
+		if (pendingReview) {
+			if (pendingReview.branchVersion !== this._autoRefineBranchVersion) {
+				this._discardPendingAutoRefine();
+				return;
+			}
+
+			this._autoRefineInProgress = true;
+			try {
+				await this.refine({ instructions: autoRefineInstructions(pendingReview.reason, pendingReview.review) });
+				this._pendingAutoRefineReview = undefined;
+				this._lastAutoRefineReviewAt = Date.now();
+				this._assistantTurnsSinceAutoRefine = 0;
+				if (pendingReview.reason === "compact") {
+					this._compactAutoRefinePending = false;
+				}
+			} catch {
+				// Auto-refine is opportunistic; manual /refine remains available.
+			} finally {
+				this._autoRefineInProgress = false;
+			}
+			return;
+		}
+
+		if (reason === "compact" && !settings.compact) {
+			this._compactAutoRefinePending = false;
+			return;
+		}
+		if (reason === "turn_interval" && this._assistantTurnsSinceAutoRefine < settings.turnInterval) {
+			return;
+		}
+		const nowMs = Date.now();
+		if (this._lastAutoRefineReviewAt > 0 && nowMs - this._lastAutoRefineReviewAt < settings.cooldownMs) {
+			if (reason === "compact") {
+				this._compactAutoRefinePending = true;
+			}
+			return;
+		}
+		if (!this.model) {
+			if (reason === "compact") {
+				this._compactAutoRefinePending = false;
+			}
+			return;
+		}
+		this._autoRefineInProgress = true;
+		const turnsSinceLastReview = this._assistantTurnsSinceAutoRefine;
+		const branchVersion = this._autoRefineBranchVersion;
+		try {
+			const review = await this._reviewAutoRefine({ reason, turnsSinceLastReview });
+			if (branchVersion !== this._autoRefineBranchVersion) {
+				return;
+			}
+			if (!review.shouldRefine) {
+				this._lastAutoRefineReviewAt = nowMs;
+				this._assistantTurnsSinceAutoRefine = 0;
+				if (reason === "compact") {
+					this._compactAutoRefinePending = false;
+				}
+				return;
+			}
+			if (this._shouldSkipAutoRefineForActiveAgent()) {
+				this._pendingAutoRefineReview = { reason, review, branchVersion };
+				return;
+			}
+			await this.refine({ instructions: autoRefineInstructions(reason, review) });
+			this._lastAutoRefineReviewAt = nowMs;
+			this._assistantTurnsSinceAutoRefine = 0;
+			if (reason === "compact") {
+				this._compactAutoRefinePending = false;
+			}
+		} catch {
+			// Auto-refine is opportunistic; manual /refine remains available.
+		} finally {
+			this._autoRefineInProgress = false;
+		}
+	}
+
+	private async _reviewAutoRefine(context: AutoRefineReviewRequest): Promise<AutoRefineReview> {
+		if (this._autoRefineReviewer) {
+			return this._autoRefineReviewer(context);
+		}
+		const model = this.model;
+		if (!model) {
+			return { shouldRefine: false, rationale: "No model selected." };
+		}
+		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		const harnessStateDir = getGlobalHarnessStateDir();
+		const localHarnessStateDir = getLocalHarnessStateDir(this.sessionManager.getSessionArtifactDir());
+		const state = mergeHarnessStates(
+			loadHarnessState(harnessStateDir, "global"),
+			localHarnessStateDir ? loadHarnessState(localHarnessStateDir, "local") : undefined,
+		);
+		const history = mergeRefinementHistory(
+			loadGlobalRefinementHistory(harnessStateDir),
+			getRefinementHistory(this.sessionManager.getEntries().filter((entry) => entry.type === "custom")),
+		);
+		return reviewAutoRefine(
+			this.agent.state.messages,
+			state,
+			history,
+			model,
+			apiKey,
+			context,
+			headers,
+			undefined,
+			this.thinkingLevel,
+		);
+	}
+
 	/**
-	 * Refine editable harness state: prompt notes, memory, skills, and subagent specs.
+	 * Refine editable continual harness state: prompt notes, memory, skills, and subagent specs.
 	 * The base system prompt is intentionally not editable through this path.
 	 */
-	async refine(options: { instructions?: string; rollbackId?: string } = {}): Promise<RefinementResult> {
+	async refine(
+		options: { instructions?: string; rollbackId?: string; global?: boolean } = {},
+	): Promise<RefinementResult> {
 		this._disconnectFromAgent();
 
 		try {
@@ -3212,33 +3442,72 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
-			const harnessStateDir = getGlobalHarnessStateDir();
-			const planningState = loadHarnessState(harnessStateDir);
-			// Harness state is global, so rollback history must be too: merge the global
-			// cross-session log with this session's entries so a refinement applied in any
-			// session can be rolled back from here.
+			const model = this.model;
+			const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+			const globalHarnessStateDir = getGlobalHarnessStateDir();
+			const localHarnessStateDir = getLocalHarnessStateDir(this.sessionManager.getSessionArtifactDir());
+			const requestedScope = options.global ? "global" : "local";
+			if (!options.rollbackId && requestedScope === "local" && !localHarnessStateDir) {
+				throw new Error("Local harness refinement requires a persisted session; use global refinement instead.");
+			}
+			const planningState =
+				requestedScope === "global"
+					? loadHarnessState(globalHarnessStateDir, "global")
+					: mergeHarnessStates(
+							loadHarnessState(globalHarnessStateDir, "global"),
+							localHarnessStateDir ? loadHarnessState(localHarnessStateDir, "local") : undefined,
+						);
 			const history = mergeRefinementHistory(
-				loadGlobalRefinementHistory(harnessStateDir),
+				loadGlobalRefinementHistory(globalHarnessStateDir),
 				getRefinementHistory(this.sessionManager.getEntries().filter((entry) => entry.type === "custom")),
 			);
+			const rollbackTarget = options.rollbackId ? history.find((item) => item.id === options.rollbackId) : undefined;
 			const plan = await planRefinement(
 				this.agent.state.messages,
 				planningState,
 				history,
-				this.model,
+				model,
 				apiKey,
 				options,
 				headers,
 				undefined,
 				this.thinkingLevel,
 			);
-			// Re-read the shared state immediately before applying so concurrent kernel
-			// (`rlm.harness`) or cross-session writes during the LLM pass are not clobbered.
-			const state = loadHarnessState(harnessStateDir);
-			const result = applyRefinementProposal(state, plan.proposal, { id: plan.id, rollbackOf: plan.rollbackOf });
-			result.harnessStatePath = saveHarnessState(harnessStateDir, state);
-			appendGlobalRefinement(harnessStateDir, result);
+			const targetScope = plan.rollbackScope ?? requestedScope;
+			if (targetScope === "local" && !localHarnessStateDir) {
+				throw new Error("Local harness refinement requires a persisted session; use global refinement instead.");
+			}
+			let targetHarnessStateDir = targetScope === "global" ? globalHarnessStateDir : localHarnessStateDir!;
+			if (targetScope === "local" && rollbackTarget?.harnessStatePath) {
+				if (!existsSync(rollbackTarget.harnessStatePath)) {
+					throw new Error(
+						`Local refinement ${rollbackTarget.id} state file not found: ${rollbackTarget.harnessStatePath}`,
+					);
+				}
+				targetHarnessStateDir = dirname(rollbackTarget.harnessStatePath);
+			}
+			// Re-read the target state immediately before applying so concurrent kernel
+			// (`rlm.harness`) writes during the LLM pass are not clobbered.
+			const state = loadHarnessState(targetHarnessStateDir, targetScope);
+			const proposal = {
+				...plan.proposal,
+				edits: plan.proposal.edits.map((edit) => {
+					const displayPrefix = `${targetScope}:`;
+					return {
+						...edit,
+						id: edit.id?.startsWith(displayPrefix) ? edit.id.slice(displayPrefix.length) : edit.id,
+					};
+				}),
+			};
+			const result = applyRefinementProposal(state, proposal, {
+				id: plan.id,
+				rollbackOf: plan.rollbackOf,
+				scope: targetScope,
+			});
+			result.harnessStatePath = saveHarnessState(targetHarnessStateDir, state);
+			if (targetScope === "global") {
+				appendGlobalRefinement(globalHarnessStateDir, result);
+			}
 			this.sessionManager.appendCustomEntry("prime-agent.refinement", result);
 			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 			this.agent.state.systemPrompt = this._baseSystemPrompt;
@@ -3543,6 +3812,9 @@ export class AgentSession {
 				details,
 			};
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+			const hasQueuedMessages = this.agent.hasQueuedMessages();
+			const willContinueAfterCompaction = willRetry || shouldContinueAfterThreshold || hasQueuedMessages;
+			this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
 
 			if (willRetry) {
 				const messages = this.agent.state.messages;
@@ -3553,7 +3825,7 @@ export class AgentSession {
 
 				this._schedulePostCompactionContinue();
 				return true;
-			} else if (shouldContinueAfterThreshold || this.agent.hasQueuedMessages()) {
+			} else if (shouldContinueAfterThreshold || hasQueuedMessages) {
 				// Threshold compaction can intentionally stop a tool loop between turns.
 				// Queued follow-up/steering/custom messages can also be waiting.
 				this._schedulePostCompactionContinue();
@@ -4085,11 +4357,12 @@ export class AgentSession {
 		const env: Record<string, string> = {
 			RLM_DEPTH: String(this._rlmDepth),
 			RLM_MAX_DEPTH: String(this._rlmMaxDepth),
-			RLM_HARNESS_STATE_DIR: getGlobalHarnessStateDir(),
+			RLM_GLOBAL_HARNESS_STATE_DIR: getGlobalHarnessStateDir(),
 		};
 		const rlmSessionDir = this._ensureRlmSessionDir();
 		if (rlmSessionDir) {
 			env.RLM_SESSION_DIR = rlmSessionDir;
+			env.RLM_HARNESS_STATE_DIR = getLocalHarnessStateDir(rlmSessionDir)!;
 		}
 		this._addWebsearchKeyEnv(env);
 		return env;
@@ -5225,6 +5498,8 @@ export class AgentSession {
 			if (label && !summaryText) {
 				this.sessionManager.appendLabelChange(targetId, label);
 			}
+
+			this._invalidatePendingAutoRefineForBranchChange();
 
 			// Update agent state
 			const sessionContext = this.sessionManager.buildSessionContext();

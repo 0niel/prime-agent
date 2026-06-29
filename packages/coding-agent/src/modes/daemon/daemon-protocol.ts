@@ -227,7 +227,14 @@ export type DaemonCommand =
 	| { id?: string; type: "set_follow_up_mode"; activeSessionId: string; mode: AgentConnectionQueueMode }
 	| { id?: string; type: "set_auto_compaction"; activeSessionId: string; enabled: boolean }
 	| { id?: string; type: "compact"; activeSessionId: string; customInstructions?: string }
-	| { id?: string; type: "refine"; activeSessionId: string; instructions?: string; rollbackId?: string }
+	| {
+			id?: string;
+			type: "refine";
+			activeSessionId: string;
+			instructions?: string;
+			rollbackId?: string;
+			global?: boolean;
+	  }
 	| { id?: string; type: "abort_compaction"; activeSessionId: string }
 	| { id?: string; type: "abort_branch_summary"; activeSessionId: string }
 	| { id?: string; type: "abort_retry"; activeSessionId: string }
