@@ -32,6 +32,21 @@ const SESSION_LIST_SEARCH_TEXT_MAX_CHARS = 64 * 1024;
 const SESSION_LIST_PARSE_MAX_LINE_CHARS = 1024 * 1024;
 const SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS = 256;
 
+// Entry types that can represent user intent (vs. daemon bookkeeping like
+// session_state/agent_status/git_state/child_usage_attributed). Used by
+// hasUserContent to decide whether a message-less draft is safe to discard.
+const CONTENT_ENTRY_TYPES = new Set([
+	"message",
+	"custom_message",
+	"custom",
+	"model_change",
+	"thinking_level_change",
+	"session_info",
+	"label",
+	"compaction",
+	"branch_summary",
+]);
+
 export interface SessionHeader {
 	type: "session";
 	version?: number; // v1 sessions don't have this
@@ -138,7 +153,9 @@ export interface SessionInfoEntry extends SessionEntryBase {
 	name?: string;
 }
 
-export type SessionStateStatus = "active" | "sleep" | "crash";
+// On-disk lifecycle. "archived" replaces legacy "sleep" (normalized on read).
+// "crash" is read-only back-compat; no longer written.
+export type SessionStateStatus = "active" | "archived" | "crash";
 
 export interface SessionState {
 	status: SessionStateStatus;
@@ -244,6 +261,8 @@ export interface SessionInfo {
 	messageCount: number;
 	firstMessage: string;
 	allMessagesText: string;
+	/** Latest persisted recap/verdict, so off-daemon sessions keep their status. */
+	agentStatus?: AgentStatus;
 }
 
 export type ReadonlySessionManager = Pick<
@@ -699,13 +718,14 @@ function extractTextContent(message: Message): string {
 		.join(" ");
 }
 
-// Legacy "hidden" status is coerced to "sleep" for sessions written by older versions.
+// Legacy "hidden" and "sleep" statuses (written by older versions) both map to
+// the current "archived".
 function normalizeSessionStateStatus(value: unknown): SessionStateStatus | undefined {
-	if (value === "active" || value === "sleep" || value === "crash") {
+	if (value === "active" || value === "archived" || value === "crash") {
 		return value;
 	}
-	if (value === "hidden") {
-		return "sleep";
+	if (value === "hidden" || value === "sleep") {
+		return "archived";
 	}
 	return undefined;
 }
@@ -868,6 +888,7 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 		let allMessagesText = "";
 		let name: string | undefined;
 		let state: SessionState | undefined;
+		let agentStatus: AgentStatus | undefined;
 		let lastActivityTime: number | undefined;
 
 		for await (const line of lines) {
@@ -910,6 +931,11 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 				if (status) {
 					state = { status };
 				}
+			}
+			// Keep the latest recap/verdict so off-daemon sessions don't all show as
+			// unjudged in the agents view. Append-only, so last seen wins.
+			if (entry.type === "agent_status") {
+				agentStatus = (entry as AgentStatusEntry).status;
 			}
 
 			if (!header) {
@@ -954,6 +980,7 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			messageCount,
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText,
+			agentStatus,
 		};
 	} catch {
 		return null;
@@ -1385,6 +1412,29 @@ export class SessionManager {
 			}
 		}
 		return undefined;
+	}
+
+	/**
+	 * True when the session holds user-meaningful persisted content, as opposed to
+	 * only daemon-written bookkeeping (session_state, agent_status, git_state) or
+	 * the default model/thinking entries every new session is created with. Used by
+	 * the daemon discard guard to decide whether a message-less draft is safe to
+	 * delete (that guard always also requires zero messages).
+	 *
+	 * createAgentSession opens a new session with an optional leading `model_change`
+	 * (only when a model is available) followed by `thinking_level_change`. That
+	 * creation prefix is skipped; anything beyond it is user content.
+	 */
+	hasUserContent(): boolean {
+		const contentEntries = this.getEntries().filter((entry) => CONTENT_ENTRY_TYPES.has(entry.type));
+		let start = 0;
+		if (contentEntries[start]?.type === "model_change") {
+			start++;
+		}
+		if (contentEntries[start]?.type === "thinking_level_change") {
+			start++;
+		}
+		return contentEntries.length > start;
 	}
 
 	/** Append the latest agent status (summary + completion judgment). Returns entry id. */

@@ -33,6 +33,7 @@ export interface AgentCronJob {
 	updatedAt: string;
 	nextRunAt?: string;
 	lastRunAt?: string;
+	lastSkippedAt?: string;
 	lastError?: string;
 	runCount: number;
 }
@@ -489,7 +490,12 @@ export class AgentCronJobStore {
 				return job;
 			}
 			const nextRunAt = nextRunAtForSchedule(job.schedule, now);
-			updated = { ...job, nextRunAt: nextRunAt?.toISOString(), updatedAt: now.toISOString() };
+			updated = {
+				...job,
+				nextRunAt: nextRunAt?.toISOString(),
+				lastSkippedAt: now.toISOString(),
+				updatedAt: now.toISOString(),
+			};
 			return updated;
 		});
 		if (updated) {
@@ -766,7 +772,8 @@ export function formatAgentCronJob(job: AgentCronJob): string {
 	const preview = job.prompt.replace(/\s+/g, " ").slice(0, 80);
 	const error = job.lastError ? ` error=${job.lastError}` : "";
 	const label = job.label ? ` label="${job.label}"` : "";
-	return `${job.id} ${job.status}${label} next=${next} last=${last} runs=${job.runCount} schedule="${job.schedule.expression}" prompt="${preview}"${error}`;
+	const skipped = job.lastSkippedAt ? ` skipped=${new Date(job.lastSkippedAt).toLocaleString()}` : "";
+	return `${job.id} ${job.status}${label} next=${next} last=${last}${skipped} runs=${job.runCount} schedule="${job.schedule.expression}" prompt="${preview}"${error}`;
 }
 
 export function createAgentHeartbeatToolDefinitions(controller: AgentCronToolController): ToolDefinition[] {

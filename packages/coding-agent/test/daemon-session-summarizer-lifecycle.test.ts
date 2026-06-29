@@ -56,7 +56,7 @@ describe("DaemonSessionSummarizer lifecycle", () => {
 		expect(onStatusChanged).toHaveBeenCalled();
 	});
 
-	test("a failing model leaves no verdict — the view then defaults to completed", async () => {
+	test("a failing model on an idle session settles to a needs_input fallback verdict", async () => {
 		vi.useFakeTimers();
 		const generate = vi.fn().mockResolvedValue(undefined); // 404 / 401 / timeout / unparseable
 		const summarizer = new DaemonSessionSummarizer(() => [], undefined, generate);
@@ -65,8 +65,29 @@ describe("DaemonSessionSummarizer lifecycle", () => {
 		summarizer.notifyActivity(state);
 		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
 		expect(generate).toHaveBeenCalledOnce();
-		// No status recorded; taskState stays undefined so classification → completed.
-		expect(state.summaryState).toBeUndefined();
+		// The activity axis holds an unjudged idle session at "working"; the fallback
+		// settles it to needs_input so it doesn't spin forever.
+		expect(state.summaryState).toMatchObject({ taskState: "needs_input", basedOnMessageCount: 2 });
+	});
+
+	test("retries after a needs_input fallback until a real summary lands", async () => {
+		vi.useFakeTimers();
+		const generate = vi
+			.fn()
+			.mockResolvedValueOnce(undefined) // transient failure → blank needs_input fallback
+			.mockResolvedValue({ summary: "Reviewed the diff", taskState: "completed" });
+		const summarizer = new DaemonSessionSummarizer(() => [], undefined, generate);
+		const state = makeState({ working: false });
+
+		summarizer.notifyActivity(state);
+		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
+		expect(state.summaryState).toMatchObject({ summary: "", taskState: "needs_input" });
+
+		// A blank recap still owes a summary, so a later sweep retries and records it.
+		summarizer.notifyActivity(state);
+		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
+		expect(generate).toHaveBeenCalledTimes(2);
+		expect(state.summaryState).toMatchObject({ summary: "Reviewed the diff", taskState: "completed" });
 	});
 
 	test("refreshes a working session even when the message count is unchanged", async () => {

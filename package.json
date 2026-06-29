@@ -34,7 +34,7 @@
 		"prepare": "husky"
 	},
 	"devDependencies": {
-		"@anthropic-ai/sandbox-runtime": "^0.0.53",
+		"@anthropic-ai/sandbox-runtime": "^0.0.55",
 		"@biomejs/biome": "2.3.5",
 		"@types/node": "^22.10.5",
 		"@typescript/native-preview": "7.0.0-dev.20260120.1",
@@ -51,7 +51,7 @@
 	"version": "0.2.2",
 	"dependencies": {
 		"@earendil-works/pi-coding-agent": "^0.2.2",
-		"get-east-asian-width": "^1.4.0"
+		"get-east-asian-width": "^1.6.0"
 	},
 	"overrides": {
 		"rimraf": "6.1.2",

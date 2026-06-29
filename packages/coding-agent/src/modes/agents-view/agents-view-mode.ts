@@ -134,7 +134,10 @@ export function createAgentsViewResumeConfig(config: AgentSessionRuntimeConfig):
 export function createAgentsViewListCommand(
 	config: AgentSessionRuntimeConfig,
 ): Extract<DaemonCommand, { type: "list" }> {
-	const command: Extract<DaemonCommand, { type: "list" }> = { type: "list" };
+	// `all` makes the daemon merge on-disk sessions with in-memory ones; without it
+	// only daemon-resident sessions return and live sessions saved to disk are lost
+	// from the view. No cwd is set so the fleet view spans every directory.
+	const command: Extract<DaemonCommand, { type: "list" }> = { type: "list", all: true };
 	if (config.sessionDir) {
 		command.sessionDir = config.sessionDir;
 	}
@@ -1369,13 +1372,13 @@ class AgentsViewMode implements Component, Focusable {
 				}
 			}
 			if (pending.sessionFile) {
-				// The kill above normally persists sleep, but it can be skipped or
-				// hit an unknown session (e.g. the daemon died after listing). Make
-				// sure the file is not left marked active, or a restarted daemon
-				// would resurrect a deliberately deactivated agent.
+				// The kill above normally persists the archived state, but it can be
+				// skipped or hit an unknown session (e.g. the daemon died after
+				// listing). Make sure the file is not left marked active, or a
+				// restarted daemon would resurrect a deliberately deactivated agent.
 				const sessionManager = SessionManager.open(pending.sessionFile, this.options.config.sessionDir);
 				if (sessionManager.getSessionState()?.status === "active") {
-					sessionManager.appendSessionState({ status: "sleep" });
+					sessionManager.appendSessionState({ status: "archived" });
 				}
 			}
 			this.inactiveAgentIdentities.add(pending.identity);
@@ -1870,13 +1873,7 @@ function rowHasSpawnCode(row: AgentsViewRow): boolean {
 }
 
 function isRunningSessionSummary(summary: SessionSummary): boolean {
-	return (
-		summary.isStreaming ||
-		summary.isCompacting ||
-		summary.pendingMessageCount > 0 ||
-		summary.status === "model" ||
-		summary.status === "tool"
-	);
+	return summary.activity === "working";
 }
 
 export function createAgentsViewSessionName(text: string): string {

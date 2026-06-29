@@ -9,11 +9,17 @@ import type { AgentTaskState, SessionInfo } from "../../core/session-manager.js"
 import type {
 	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionRlmChildAgentTranscriptLine,
-	AgentConnectionSavedSessionStateStatus,
 } from "../agent-connection/types.js";
 import type { ActiveSessionState } from "./active-session-state.js";
 
-export type SessionStatus = "user" | "idle" | "tool" | "model" | AgentConnectionSavedSessionStateStatus;
+// Durable lifecycle; decides agents-view visibility. Only "live" is shown.
+// "draft" = no message sent yet (discarded on close); "archived" = ctrl+x'd,
+// reachable only via /resume.
+export type SessionLifecycle = "draft" | "live" | "archived";
+
+// Heuristic activity of a live session. Classification-in-flight counts as
+// "working" so the view never sees an unlabeled idle session.
+export type SessionActivity = "working" | "idle";
 
 // Upper bound on the spawn-code source carried in a session summary. Generous
 // enough for real spawn cells while keeping the daemon wire payload bounded.
@@ -22,7 +28,8 @@ const SPAWN_CODE_MAX_CHARS = 4000;
 // Lightweight daemon session shape used by list, create, rename, attach, and state responses.
 export interface SessionSummary {
 	id: string;
-	status: SessionStatus;
+	lifecycle: SessionLifecycle;
+	activity: SessionActivity;
 	runtimeKind?: "top-level" | "subagent";
 	activeSessionId?: string;
 	sessionId: string;
@@ -34,6 +41,8 @@ export interface SessionSummary {
 	isStreaming: boolean;
 	isCompacting: boolean;
 	isBashRunning?: boolean;
+	/** True while the agent is streaming with tool calls pending; drives the "running tools" label. */
+	isRunningTools?: boolean;
 	attachedClients: number;
 	messageCount: number;
 	pendingMessageCount: number;
@@ -122,7 +131,8 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 
 	return {
 		id: activeSession.activeSessionId,
-		status: activeStatusForSession(activeSession),
+		lifecycle: activeLifecycleForSession(activeSession),
+		activity: activeActivityForSession(activeSession),
 		runtimeKind: metadata.kind,
 		activeSessionId: activeSession.activeSessionId,
 		sessionId: session.sessionId,
@@ -134,6 +144,7 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		isStreaming: session.isStreaming,
 		isCompacting: session.isCompacting,
 		isBashRunning: session.isBashRunning,
+		isRunningTools: session.isStreaming && session.state.pendingToolCalls.size > 0,
 		attachedClients: activeSession.clients.size,
 		messageCount: session.messages.length,
 		pendingMessageCount: session.pendingMessageCount,
@@ -175,7 +186,8 @@ export function isSummaryCurrent(activeSession: ActiveSessionState): boolean {
 export function summaryForInactiveSession(session: SessionInfo): SessionSummary {
 	return {
 		id: session.id,
-		status: session.state?.status ?? "sleep",
+		lifecycle: inactiveLifecycleForSession(session),
+		activity: "idle",
 		sessionId: session.id,
 		sessionFile: session.path,
 		sessionName: session.name,
@@ -189,6 +201,13 @@ export function summaryForInactiveSession(session: SessionInfo): SessionSummary 
 		modified: session.modified.toISOString(),
 		firstMessage: session.firstMessage,
 		parentSessionPath: session.parentSessionPath,
+		// Carry the persisted recap/verdict so an off-daemon session keeps its
+		// agents-view bucket (e.g. Completed) instead of defaulting to Needs Input.
+		// Gate on message-count currency like isSummaryCurrent does for resident
+		// sessions, so a verdict from before later messages isn't shown stale.
+		...(session.agentStatus?.basedOnMessageCount === session.messageCount
+			? { summary: session.agentStatus.summary, taskState: session.agentStatus.taskState }
+			: {}),
 	};
 }
 
@@ -299,10 +318,44 @@ function readMessageText(content: unknown): string {
 		.join("\n");
 }
 
-function activeStatusForSession(activeSession: ActiveSessionState): SessionStatus {
+// Agent doing work, ignoring the classification verdict.
+export function isActiveSessionBusy(activeSession: ActiveSessionState): boolean {
 	const session = activeSession.runtime.session;
-	if (session.isStreaming) {
-		return session.state.pendingToolCalls.size > 0 ? "tool" : "model";
+	return session.isStreaming || session.isCompacting || session.pendingMessageCount > 0;
+}
+
+export function activeActivityForSession(activeSession: ActiveSessionState): SessionActivity {
+	if (isActiveSessionBusy(activeSession)) {
+		return "working";
 	}
-	return activeSession.clients.size > 0 ? "user" : "idle";
+	// Hold at "working" until the idle verdict is current, so the view never
+	// buckets an unlabeled idle session.
+	return isSummaryCurrent(activeSession) ? "idle" : "working";
+}
+
+/**
+ * Lifecycle for an on-disk session not resident in the daemon. Explicitly
+ * archived/crashed records stay out of the view; everything else is classified
+ * by message count (live once a message exists, draft otherwise). A missing
+ * session_state is treated as not-archived, so older sessions that never wrote a
+ * lifecycle entry still surface. Message-based to match activeLifecycleForSession.
+ */
+export function inactiveLifecycleForSession(session: SessionInfo): SessionLifecycle {
+	const status = session.state?.status;
+	if (status === "archived" || status === "crash") {
+		return "archived";
+	}
+	return session.messageCount > 0 ? "live" : "draft";
+}
+
+export function activeLifecycleForSession(activeSession: ActiveSessionState): SessionLifecycle {
+	// Lifecycle drives agents-view visibility and is message-based: a session
+	// becomes live once a message is sent. A message-less session is a draft (hidden
+	// from the view) even if the user changed its model/name first — that config is
+	// still preserved on disk by the discard guard (see isEmptyDraftContent), it
+	// just doesn't surface a conversation-less row. Keeping this purely message-based
+	// matches inactiveLifecycleForSession, so a session doesn't change lifecycle when
+	// it leaves daemon memory. Stale on-disk archived/crash markers never apply to a
+	// resident session.
+	return activeSession.runtime.session.messages.length === 0 ? "draft" : "live";
 }

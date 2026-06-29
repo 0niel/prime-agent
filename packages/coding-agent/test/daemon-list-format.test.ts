@@ -2,7 +2,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import stripAnsi from "strip-ansi";
 import { describe, expect, it } from "vitest";
 import { formatSessionListTable } from "../src/cli/daemon-list-format.js";
-import type { SessionStatus, SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import type { SessionActivity, SessionLifecycle, SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 
 describe("formatSessionListTable", () => {
 	it("sorts sessions by status and renders compact suffix ids", () => {
@@ -10,15 +10,27 @@ describe("formatSessionListTable", () => {
 		const table = stripAnsi(
 			formatSessionListTable(
 				[
-					makeSummary({ name: "sleep", id: "019e71ec-e08a-75a9-b573-fc10e9f8380f", status: "sleep" }),
-					makeSummary({ name: "tool", id: "ccccddddeeee", status: "tool" }),
-					makeSummary({ name: "crash", id: "019e71ec-e08a-75a9-b573-abcdef123456", status: "crash" }),
-					makeSummary({ name: "idle", id: "bbbbccccdddd", status: "idle" }),
-					makeSummary({ name: "model", id: "ddddeeeeffff", status: "model" }),
+					makeSummary({
+						name: "sleep",
+						id: "019e71ec-e08a-75a9-b573-fc10e9f8380f",
+						lifecycle: "archived",
+						activity: "idle",
+					}),
+					makeSummary({ name: "tool", id: "ccccddddeeee", lifecycle: "live", activity: "working" }),
+					makeSummary({
+						name: "crash",
+						id: "019e71ec-e08a-75a9-b573-abcdef123456",
+						lifecycle: "archived",
+						activity: "idle",
+					}),
+					makeSummary({ name: "idle", id: "bbbbccccdddd", lifecycle: "live", activity: "idle" }),
+					makeSummary({ name: "model", id: "ddddeeeeffff", lifecycle: "live", activity: "working" }),
 					makeSummary({
 						name: "user",
 						id: "aaaabbbbcccc",
-						status: "user",
+						lifecycle: "live",
+						activity: "idle",
+						clients: 1,
 						model: { provider: "openai-codex", id: "gpt-5.5" } as Model<Api>,
 					}),
 				],
@@ -29,12 +41,12 @@ describe("formatSessionListTable", () => {
 		const lines = table.split("\n");
 		expect(lines[0]!.trim().split(/\s+/)).toEqual(["name", "id", "status", "age", "model", "messages", "clients"]);
 		expect(lines.slice(1).map((line) => line.trim().split(/\s+/).slice(0, 3))).toEqual([
-			["user", "aaaabbbbcccc", "user"],
+			["tool", "ccccddddeeee", "working"],
+			["model", "ddddeeeeffff", "working"],
 			["idle", "bbbbccccdddd", "idle"],
-			["tool", "ccccddddeeee", "tool"],
-			["model", "ddddeeeeffff", "model"],
-			["sleep", "fc10e9f8380f", "sleep"],
-			["crash", "abcdef123456", "crash"],
+			["user", "aaaabbbbcccc", "idle"],
+			["sleep", "fc10e9f8380f", "archived"],
+			["crash", "abcdef123456", "archived"],
 		]);
 		expect(table).toContain("openai-codex/gpt-5.5");
 		expect(table).not.toContain("/tmp/project");
@@ -42,17 +54,25 @@ describe("formatSessionListTable", () => {
 	});
 });
 
-function makeSummary(options: { name: string; id: string; status: SessionStatus; model?: Model<Api> }): SessionSummary {
+function makeSummary(options: {
+	name: string;
+	id: string;
+	lifecycle: SessionLifecycle;
+	activity: SessionActivity;
+	clients?: number;
+	model?: Model<Api>;
+}): SessionSummary {
 	return {
 		id: options.id,
-		status: options.status,
+		lifecycle: options.lifecycle,
+		activity: options.activity,
 		sessionId: options.id,
 		sessionName: options.name,
 		cwd: "/tmp/project",
 		model: options.model,
-		isStreaming: options.status === "tool" || options.status === "model",
+		isStreaming: options.lifecycle === "live" && options.activity === "working",
 		isCompacting: false,
-		attachedClients: options.status === "user" ? 1 : 0,
+		attachedClients: options.clients ?? 0,
 		messageCount: 2,
 		pendingMessageCount: 0,
 		modified: "2026-05-29T10:00:00.000Z",

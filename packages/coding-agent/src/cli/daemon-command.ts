@@ -1522,7 +1522,8 @@ function isSessionSummary(value: unknown): value is SessionSummary {
 		typeof candidate.id === "string" &&
 		typeof candidate.sessionId === "string" &&
 		typeof candidate.cwd === "string" &&
-		typeof candidate.status === "string" &&
+		typeof candidate.lifecycle === "string" &&
+		typeof candidate.activity === "string" &&
 		typeof candidate.isStreaming === "boolean" &&
 		typeof candidate.isCompacting === "boolean" &&
 		typeof candidate.attachedClients === "number" &&

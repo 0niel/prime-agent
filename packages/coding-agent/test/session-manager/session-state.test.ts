@@ -47,7 +47,7 @@ describe("SessionManager session state", () => {
 			const session = SessionManager.create(cwd, sessionDir);
 
 			session.appendSessionInfo("empty");
-			session.appendSessionState({ status: "sleep" });
+			session.appendSessionState({ status: "archived" });
 
 			const sessionFile = session.getSessionFile();
 			expect(sessionFile).toBeDefined();
@@ -59,14 +59,14 @@ describe("SessionManager session state", () => {
 				id: session.getSessionId(),
 				name: "empty",
 				messageCount: 0,
-				state: { status: "sleep" },
+				state: { status: "archived" },
 			});
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
 
-	it("coerces legacy hidden lifecycle state to sleep on read", async () => {
+	it("coerces legacy sleep and hidden lifecycle state to archived on read", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "session-state-hidden-"));
 		try {
 			const cwd = join(tempDir, "project");
@@ -74,18 +74,21 @@ describe("SessionManager session state", () => {
 			const session = SessionManager.create(cwd, sessionDir);
 
 			session.appendMessage(userMsg("hide me"));
-			session.appendSessionState({ status: "sleep" });
+			// Flush a header + state entry, then append the legacy raw "sleep"/"hidden"
+			// entries older daemons wrote; both must normalize to "archived" on read.
+			session.appendSessionState({ status: "active" });
 			const sessionFile = session.getSessionFile();
 			expect(sessionFile).toBeDefined();
+			appendFileSync(sessionFile!, `${JSON.stringify({ type: "session_state", state: { status: "sleep" } })}\n`);
 			appendFileSync(sessionFile!, `${JSON.stringify({ type: "session_state", state: { status: "hidden" } })}\n`);
 
-			expect(SessionManager.open(sessionFile!, sessionDir).getSessionState()).toEqual({ status: "sleep" });
+			expect(SessionManager.open(sessionFile!, sessionDir).getSessionState()).toEqual({ status: "archived" });
 
 			const sessions = await SessionManager.list(cwd, sessionDir);
 			expect(sessions).toHaveLength(1);
 			expect(sessions[0]).toMatchObject({
 				id: session.getSessionId(),
-				state: { status: "sleep" },
+				state: { status: "archived" },
 			});
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
@@ -121,7 +124,7 @@ describe("SessionManager session state", () => {
 			const sessionDir = join(tempDir, "sessions");
 			const session = SessionManager.create(cwd, sessionDir);
 
-			session.appendSessionState({ status: "sleep" });
+			session.appendSessionState({ status: "archived" });
 			session.appendMessage(userMsg("hello"));
 			session.appendMessage(assistantMsg("hi"));
 
@@ -146,7 +149,7 @@ describe("SessionManager session state", () => {
 			expect(sessionFile).toBeDefined();
 
 			rmSync(sessionDir, { recursive: true, force: true });
-			session.appendSessionState({ status: "sleep" });
+			session.appendSessionState({ status: "archived" });
 
 			expect(existsSync(sessionFile!)).toBe(true);
 			const entries = loadEntriesFromFile(sessionFile!);
@@ -171,7 +174,7 @@ describe("SessionManager session state", () => {
 			expect(existsSync(sessionFile!)).toBe(true);
 
 			rmSync(sessionFile!, { force: true });
-			session.appendSessionState({ status: "sleep" });
+			session.appendSessionState({ status: "archived" });
 
 			const entries = loadEntriesFromFile(sessionFile!);
 			expect(entries[0]).toMatchObject({ type: "session", id: session.getSessionId() });

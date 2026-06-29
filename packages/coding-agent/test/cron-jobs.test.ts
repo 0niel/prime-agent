@@ -703,6 +703,7 @@ describe("AgentCronScheduler", () => {
 			id: job.id,
 			status: "active",
 			nextRunAt: "2026-01-01T12:45:00.000Z",
+			lastSkippedAt: "2026-01-01T12:40:00.000Z",
 			runCount: 0,
 		});
 		expect(store.getHeartbeat("active-1")).not.toHaveProperty("lastRunAt");
