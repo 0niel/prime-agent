@@ -192,6 +192,7 @@ describe("AgentSession autonomous mode", () => {
 			const state = createAutonomousRuntimeState({ enabled: true, maxContinuations: 3, gates: { commands: [gate], maxRetries: 3 } }, { cwd: tempDir });
 
 			const first = nextAutonomousContinuation(state, fauxAssistantMessage("Done."), { cwd: tempDir });
+			writeFileSync(join(tempDir, "Cargo.lock"), "generated lockfile\n");
 			const second = nextAutonomousContinuation(state, fauxAssistantMessage("Still done."), { cwd: tempDir });
 
 			expect(first).toBeDefined();

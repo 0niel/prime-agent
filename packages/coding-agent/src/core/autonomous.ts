@@ -333,6 +333,7 @@ function captureGitWorktreeSnapshot(cwd: string | undefined): GitWorktreeSnapsho
 		":(exclude)verification",
 		":(exclude)target",
 		":(exclude).vf-prime-agent",
+		":(exclude)Cargo.lock",
 		":(exclude)submission.tar.gz",
 		":(exclude)runner_args.log",
 	];
