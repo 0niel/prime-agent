@@ -4928,6 +4928,8 @@ export class InteractiveMode {
 							{
 								showImages: this.settingsManager.getShowImages(),
 								imageWidthCells: this.settingsManager.getImageWidthCells(),
+								// Do not replay historical inline image payloads on session load/rebuild.
+								allowInlineImages: false,
 							},
 							this.getCachedToolDefinition(content.name),
 							this.ui,
@@ -4969,6 +4971,8 @@ export class InteractiveMode {
 		}
 
 		for (const [toolCallId, component] of renderedPendingTools) {
+			// These tool calls have no historical result yet, so future updates are live output.
+			component.setAllowInlineImages(true);
 			this.pendingTools.set(toolCallId, component);
 		}
 		this.ui.requestRender();

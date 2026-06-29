@@ -203,13 +203,14 @@ function rebuildBashResultRenderComponent(
 	},
 	options: ToolRenderResultOptions,
 	showImages: boolean,
+	includeImageDimensions: boolean,
 	startedAt: number | undefined,
 	endedAt: number | undefined,
 ): void {
 	const state = component.state;
 	component.clear();
 
-	const output = getTextOutput(result as any, showImages).trim();
+	const output = getTextOutput(result as any, showImages, { includeImageDimensions }).trim();
 
 	if (output) {
 		const styledOutput = output
@@ -436,6 +437,7 @@ export function createBashToolDefinition(
 				result as any,
 				options,
 				context.showImages,
+				context.includeImageDimensions,
 				state.startedAt,
 				state.endedAt,
 			);
