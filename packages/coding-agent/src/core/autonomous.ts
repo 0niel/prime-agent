@@ -37,7 +37,7 @@ export interface AgentAutonomousStatus {
 }
 
 export const DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT =
-	"No human input is available in autonomous mode. Continue working until the host evaluator, verifier, or configured autonomous limits stop the run. If you were asking the user a question, make a reasonable assumption and verify it. If you believe you are blocked, prove it with host-observable evidence, preserve that evidence, and keep looking for safe progress while budget remains. If a quality gate passes, preserve the evidence and continue useful verification, cleanup, or robustness work instead of ending the session yourself.";
+	"No human input is available in autonomous mode. Continue working until the host evaluator, verifier, or configured autonomous limits stop the run. If you were asking the user a question, make a reasonable assumption and verify it. If you believe you are blocked, prove it with host-observable evidence, preserve that evidence, and keep looking for safe progress while budget remains. Do not end the session yourself; the verifier/evaluator decides completion when configured gates pass.";
 
 export const DEFAULT_AUTONOMOUS_LIMITS: Required<
 	Omit<AgentAutonomousConfig, "enabled" | "continuationPrompt" | "gates">
@@ -210,10 +210,10 @@ export function shouldAutonomouslyContinue(
 	}
 	if (state.gates.commands.length > 0) {
 		const gateResult = runAutonomousQualityGates(state, options.cwd);
-		return {
-			shouldContinue: true,
-			reason: gateResult === "passed" ? "missing_terminal_evidence" : "gate_failed",
-		};
+		if (gateResult === "passed") {
+			return { shouldContinue: false, reason: "not_needed" };
+		}
+		return { shouldContinue: true, reason: "gate_failed" };
 	}
 	return { shouldContinue: true, reason: "missing_terminal_evidence" };
 }
@@ -305,15 +305,6 @@ function buildGateFailureContinuation(state: AutonomousRuntimeState, timestamp: 
 		`\nContinue working. Fix the failure, then produce terminal evidence. Timestamp: ${new Date(timestamp).toISOString()}.`
 	);
 }
-
-function hasGitWorktreeChangedSinceBaseline(state: AutonomousRuntimeState, cwd: string | undefined): boolean {
-	const current = captureGitWorktreeSnapshot(cwd);
-	if (!current || !state.gitBaseline) {
-		return false;
-	}
-	return current.status !== state.gitBaseline.status || current.diff !== state.gitBaseline.diff;
-}
-
 
 function gitWorktreeSnapshotsEqual(a: GitWorktreeSnapshot | undefined, b: GitWorktreeSnapshot | undefined): boolean {
 	return !!a && !!b && a.status === b.status && a.diff === b.diff;

@@ -130,7 +130,10 @@ describe("AgentSession autonomous mode", () => {
 		});
 		await harness.session.prompt("/autonomous on");
 		writeFileSync(path, "after\n");
-		harness.setResponses([fauxAssistantMessage("Done."), fauxAssistantMessage("Continuing until the evaluator stops me.")]);
+		harness.setResponses([
+			fauxAssistantMessage("Done."),
+			fauxAssistantMessage("Continuing until the evaluator stops me."),
+		]);
 
 		await harness.session.prompt("make the change");
 
@@ -139,7 +142,7 @@ describe("AgentSession autonomous mode", () => {
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBeGreaterThan(0);
 	});
 
-	it("continues after passing autonomous gates instead of treating the gate as terminal evidence", async () => {
+	it("lets passing autonomous gates complete the run under verifier control", async () => {
 		const harness = await createHarness({
 			autonomous: {
 				enabled: true,
@@ -148,12 +151,12 @@ describe("AgentSession autonomous mode", () => {
 			},
 		});
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("Done."), fauxAssistantMessage("Continuing under verifier control.")]);
+		harness.setResponses([fauxAssistantMessage("Done.")]);
 
 		await harness.session.prompt("make the change");
 
-		expect(getUserTexts(harness)).toEqual(["make the change", DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT]);
-		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
+		expect(getUserTexts(harness)).toEqual(["make the change"]);
+		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);
 	});
 
 	it("feeds failing autonomous gate output back into the session", async () => {
@@ -186,11 +189,17 @@ describe("AgentSession autonomous mode", () => {
 		execFileSync("git", ["config", "user.name", "Test User"], { cwd: tempDir });
 		writeFileSync(join(tempDir, "src.rs"), "initial\n");
 		execFileSync("git", ["add", "src.rs"], { cwd: tempDir });
-		execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "--no-gpg-sign", "-m", "initial"], { cwd: tempDir, stdio: "ignore" });
+		execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "--no-gpg-sign", "-m", "initial"], {
+			cwd: tempDir,
+			stdio: "ignore",
+		});
 		try {
 			const counter = join(tempDir, "verification", "public_feedback_scores.jsonl");
 			const gate = `${process.execPath} -e "const fs=require('fs'); const p='${counter}'; const n=fs.existsSync(p)?fs.readFileSync(p,'utf8').trim().split(/\\n/).filter(Boolean).length:0; fs.appendFileSync(p,JSON.stringify({run:n+1,score:0})+'\\n'); process.exit(1);"`;
-			const state = createAutonomousRuntimeState({ enabled: true, maxContinuations: 3, gates: { commands: [gate], maxRetries: 3 } }, { cwd: tempDir });
+			const state = createAutonomousRuntimeState(
+				{ enabled: true, maxContinuations: 3, gates: { commands: [gate], maxRetries: 3 } },
+				{ cwd: tempDir },
+			);
 
 			const first = nextAutonomousContinuation(state, fauxAssistantMessage("Done."), { cwd: tempDir });
 			writeFileSync(join(tempDir, "Cargo.lock"), "generated lockfile\n");
