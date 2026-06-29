@@ -82,8 +82,6 @@ describe("buildRlmPrompt", () => {
 				"RLM-native call contract for refined continual harness entries: installed Python skills are called from IPython as `await <skill_import>(...)` with keyword arguments, or as `<skill_import> ...` from shell when a CLI exists. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are reusable delegation specs; invoke them by turning the spec into a concise task prompt and calling `await rlm('sub-task')`, or `await asyncio.gather(rlm('task1'), rlm('task2'))` for independent parallel subagents. Do not invent non-native wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
 				"",
 				"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
-				"",
-				"Call at most one built-in tool per turn.",
 			].join("\n"),
 		);
 	});
