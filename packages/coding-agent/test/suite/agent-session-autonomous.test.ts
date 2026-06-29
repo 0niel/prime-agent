@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,9 +7,10 @@ import {
 	addAutonomousUsage,
 	createAutonomousRuntimeState,
 	DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT,
+	nextAutonomousContinuation,
 	shouldAutonomouslyContinue,
 } from "../../src/core/autonomous.js";
-import { createHarness, getAssistantTexts, getUserTexts, type Harness } from "./harness.js";
+import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
 
 describe("AgentSession autonomous mode", () => {
 	const harnesses: Harness[] = [];
@@ -174,6 +175,34 @@ describe("AgentSession autonomous mode", () => {
 		expect(users[1]).toContain("Autonomous quality gate failed");
 		expect(users[1]).toContain("gate failed");
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
+	});
+
+	it("does not rerun a failed autonomous gate until the workspace changes", () => {
+		const tempDir = join(process.cwd(), `.tmp-autonomous-gate-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		execFileSync("mkdir", ["-p", join(tempDir, "verification")]);
+		execFileSync("git", ["init"], { cwd: tempDir, stdio: "ignore" });
+		execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: tempDir });
+		execFileSync("git", ["config", "user.name", "Test User"], { cwd: tempDir });
+		writeFileSync(join(tempDir, "src.rs"), "initial\n");
+		execFileSync("git", ["add", "src.rs"], { cwd: tempDir });
+		execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "--no-gpg-sign", "-m", "initial"], { cwd: tempDir, stdio: "ignore" });
+		try {
+			const counter = join(tempDir, "verification", "public_feedback_scores.jsonl");
+			const gate = `${process.execPath} -e "const fs=require('fs'); const p='${counter}'; const n=fs.existsSync(p)?fs.readFileSync(p,'utf8').trim().split(/\\n/).filter(Boolean).length:0; fs.appendFileSync(p,JSON.stringify({run:n+1,score:0})+'\\n'); process.exit(1);"`;
+			const state = createAutonomousRuntimeState({ enabled: true, maxContinuations: 3, gates: { commands: [gate], maxRetries: 3 } }, { cwd: tempDir });
+
+			const first = nextAutonomousContinuation(state, fauxAssistantMessage("Done."), { cwd: tempDir });
+			const second = nextAutonomousContinuation(state, fauxAssistantMessage("Still done."), { cwd: tempDir });
+
+			expect(first).toBeDefined();
+			expect(second).toBeDefined();
+			expect(getMessageText(second)).toContain("workspace has not changed");
+			expect(getMessageText(second)).toContain("Edit source files");
+			expect(readFileSync(counter, "utf8").trim().split(/\n/)).toHaveLength(1);
+			expect(state.gateAttempts[gate]).toBe(1);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("does not count cache-read tokens against the autonomous token budget", () => {

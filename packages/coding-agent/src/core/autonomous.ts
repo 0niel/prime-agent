@@ -65,6 +65,7 @@ export interface AutonomousRuntimeState {
 	gates: Required<AgentAutonomousGateConfig>;
 	gateAttempts: Record<string, number>;
 	lastGateFailure?: GateFailure;
+	lastGateFailureSnapshot?: GitWorktreeSnapshot;
 	gitBaseline?: GitWorktreeSnapshot;
 }
 
@@ -105,6 +106,7 @@ export function createAutonomousRuntimeState(
 		},
 		gateAttempts: {},
 		lastGateFailure: undefined,
+		lastGateFailureSnapshot: undefined,
 		gitBaseline: enabled ? captureGitWorktreeSnapshot(options.cwd) : undefined,
 	};
 }
@@ -122,11 +124,13 @@ export function setAutonomousEnabled(
 		state.startedAt = Date.now();
 		state.gateAttempts = {};
 		state.lastGateFailure = undefined;
+		state.lastGateFailureSnapshot = undefined;
 		state.gitBaseline = captureGitWorktreeSnapshot(options.cwd);
 	} else {
 		state.startedAt = undefined;
 		state.gateAttempts = {};
 		state.lastGateFailure = undefined;
+		state.lastGateFailureSnapshot = undefined;
 		state.gitBaseline = undefined;
 	}
 }
@@ -245,6 +249,21 @@ function runAutonomousQualityGates(state: AutonomousRuntimeState, cwd: string | 
 		return "failed";
 	}
 	for (const command of state.gates.commands) {
+		const currentSnapshot = captureGitWorktreeSnapshot(cwd);
+		if (
+			state.lastGateFailure?.command === command &&
+			state.lastGateFailureSnapshot &&
+			gitWorktreeSnapshotsEqual(currentSnapshot, state.lastGateFailureSnapshot)
+		) {
+			state.lastGateFailure = {
+				...state.lastGateFailure,
+				exitText: "not rerun: workspace unchanged since previous failed gate",
+				output: truncateGateOutput(
+					`${state.lastGateFailure.output}\n\nThe autonomous gate was not rerun because the workspace has not changed since this failure. Edit source files, tests, or a blocker artifact before attempting to finish again.`,
+				),
+			};
+			return "failed";
+		}
 		const result = spawnSync(command, {
 			cwd,
 			encoding: "utf8",
@@ -256,6 +275,7 @@ function runAutonomousQualityGates(state: AutonomousRuntimeState, cwd: string | 
 			state.gateAttempts[command] = 0;
 			if (state.lastGateFailure?.command === command) {
 				state.lastGateFailure = undefined;
+				state.lastGateFailureSnapshot = undefined;
 			}
 			continue;
 		}
@@ -270,9 +290,11 @@ function runAutonomousQualityGates(state: AutonomousRuntimeState, cwd: string | 
 			exitText,
 			output: truncateGateOutput([result.stdout, result.stderr].filter(Boolean).join("\n").trim()),
 		};
+		state.lastGateFailureSnapshot = currentSnapshot;
 		return attempt > state.gates.maxRetries ? "retry_exhausted" : "failed";
 	}
 	state.lastGateFailure = undefined;
+	state.lastGateFailureSnapshot = undefined;
 	return "passed";
 }
 
@@ -296,11 +318,25 @@ function hasGitWorktreeChangedSinceBaseline(state: AutonomousRuntimeState, cwd: 
 	return current.status !== state.gitBaseline.status || current.diff !== state.gitBaseline.diff;
 }
 
+
+function gitWorktreeSnapshotsEqual(a: GitWorktreeSnapshot | undefined, b: GitWorktreeSnapshot | undefined): boolean {
+	return !!a && !!b && a.status === b.status && a.diff === b.diff;
+}
+
 function captureGitWorktreeSnapshot(cwd: string | undefined): GitWorktreeSnapshot | undefined {
 	if (!cwd) {
 		return undefined;
 	}
-	const status = spawnSync("git", ["--no-optional-locks", "status", "--porcelain=v1", "-uall"], {
+	const pathspec = [
+		"--",
+		".",
+		":(exclude)verification",
+		":(exclude)target",
+		":(exclude).vf-prime-agent",
+		":(exclude)submission.tar.gz",
+		":(exclude)runner_args.log",
+	];
+	const status = spawnSync("git", ["--no-optional-locks", "status", "--porcelain=v1", "-uall", ...pathspec], {
 		cwd,
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "ignore"],
@@ -308,7 +344,7 @@ function captureGitWorktreeSnapshot(cwd: string | undefined): GitWorktreeSnapsho
 	if (status.status !== 0 || typeof status.stdout !== "string") {
 		return undefined;
 	}
-	const diff = spawnSync("git", ["--no-optional-locks", "diff", "--no-ext-diff", "--binary", "HEAD", "--"], {
+	const diff = spawnSync("git", ["--no-optional-locks", "diff", "--no-ext-diff", "--binary", "HEAD", ...pathspec], {
 		cwd,
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "ignore"],
