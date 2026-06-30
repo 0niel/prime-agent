@@ -79,8 +79,12 @@ export function buildConversationComponents(
 			pendingTools.delete(message.toolCallId);
 		} else if (message.role === "user") {
 			const text = readUserText(message.content);
-			if (text) {
-				components.push(new UserMessageComponent(text, options.markdownTheme));
+			const hasContent =
+				typeof message.content === "string" ? message.content.length > 0 : message.content.length > 0;
+			// An image-only prompt has no text; show a placeholder rather than dropping it.
+			const display = text || (hasContent ? "[image]" : "");
+			if (display) {
+				components.push(new UserMessageComponent(display, options.markdownTheme));
 			}
 		}
 		// Non-conversational messages (bash/branch-summary/compaction/custom) aren't shown.

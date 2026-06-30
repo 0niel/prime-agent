@@ -4691,9 +4691,11 @@ export class InteractiveMode {
 			return;
 		}
 		if (!watcher) {
-			// A still-running child may not have registered yet; the watched key is kept
-			// so maybeRetryChildAgentWatch retries only once a better key (activeSessionId) arrives.
+			// A still-running child may not have registered yet (in-process snapshots never
+			// carry activeSessionId, so the key won't change). Clear the watched key so the
+			// next rlm_child_update retries the attach until a watcher is obtained.
 			if (node.status === "running" || node.status === "queued") {
+				this.childAgentWatchedKey = undefined;
 				return;
 			}
 			const fallback = node.error?.trim()
@@ -4715,9 +4717,9 @@ export class InteractiveMode {
 		await this.refreshChildAgentWatch(token, watcher);
 	}
 
-	// A queued/just-started subagent's first snapshot may lack activeSessionId; once a
-	// better key arrives, (re)attach. Gating purely on key change avoids re-attaching
-	// (and cancelling the in-flight attach) on every update.
+	// (Re)attach when the key differs from what we last attached with — including the
+	// undefined left by a failed attach on a not-yet-registered child. Once a watcher is
+	// held the key matches, so this won't re-attach (or cancel an in-flight attach) per update.
 	private maybeRetryChildAgentWatch(node: ChildAgentInspectorNode | undefined): void {
 		if (!node || this.childAgentPanelMode !== "detail") {
 			return;

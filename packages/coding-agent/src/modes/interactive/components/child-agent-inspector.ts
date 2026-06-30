@@ -570,6 +570,7 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 	private killConfirmTimer: ReturnType<typeof setTimeout> | undefined;
 	private backHintLabel = "back to chat";
 	private statusLoader: Loader | undefined;
+	private lastStatusMessage: string | undefined;
 
 	onCancel?: () => void;
 	onToggleToolsExpanded?: () => void;
@@ -590,6 +591,7 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 		if (!node || (node.status !== "running" && node.status !== "queued")) {
 			this.statusLoader?.stop();
 			this.statusLoader = undefined;
+			this.lastStatusMessage = undefined;
 		}
 	}
 
@@ -640,7 +642,13 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 			// Reuse the main agent's loader so the spinner and labels are identical.
 			// The loader self-pads one space; add one more to align with the body.
 			const loader = this.ensureStatusLoader();
-			loader.setMessage(this.panelStatusLabel(node));
+			// setMessage triggers a render; only call it when the label actually changes,
+			// or render()->setMessage->requestRender->render becomes a self-sustaining loop.
+			const message = this.panelStatusLabel(node);
+			if (message !== this.lastStatusMessage) {
+				this.lastStatusMessage = message;
+				loader.setMessage(message);
+			}
 			lines.push(...loader.render(width).map((line) => this.indent(line, width, 1)));
 		}
 		const recap = node.recap?.trim();
