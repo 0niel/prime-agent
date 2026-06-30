@@ -15,6 +15,7 @@ import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionRuntime,
 } from "../../core/agent-session-runtime.js";
+import { flushAgentTraceUpload } from "../../core/agent-traces.js";
 import {
 	type AgentCronJob,
 	AgentCronJobStore,
@@ -694,10 +695,22 @@ export class AgentDaemon {
 					throw cascadeError;
 				}
 			},
-			releaseRlmSubagentRuntime: async (runtime) => {
+			releaseRlmSubagentRuntime: async (runtime, options, status) => {
 				const state = this.findRuntimeState(runtime);
+				// A successful subagent stays resident so it's still viewable (torn down with the
+				// parent via closeChildSessions); errored/cancelled would re-seed as "done", so close them.
+				if (state && status === "done") {
+					// Run shutdown side effects without disposing the still-readable session.
+					this.cancelSubagentRlmHeartbeats(state);
+					await flushAgentTraceUpload(state.runtime.session.sessionManager).catch(() => undefined);
+					// Retention can decline if the parent is already tearing down; if so, close
+					// the session here so it doesn't linger in the registry.
+					if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
+						return;
+					}
+				}
 				if (state) {
-					await this.closeSession(state, "completed");
+					await this.closeSession(state, status === "cancelled" ? "killed" : "completed");
 					return;
 				}
 				if (runtime instanceof AgentSessionRuntime) {
@@ -1661,12 +1674,31 @@ export class AgentDaemon {
 				void this.closeSession(state, "killed");
 			}
 		}
+		this.stampRlmChildActiveSessionId(message);
 		const sequencedMessage = this.addSessionEventMeta(state, message);
 		for (const client of state.clients) {
 			if (!shouldSendDaemonOutboundToClient(client, sequencedMessage)) {
 				continue;
 			}
 			this.write(client, sequencedMessage);
+		}
+	}
+
+	// The AgentSession doesn't know its own daemon active-session id, so fill it in here.
+	private stampRlmChildActiveSessionId(message: DaemonOutbound): void {
+		if (
+			message.type !== "session_event" ||
+			message.event.type !== "rlm_child_update" ||
+			message.event.child.activeSessionId
+		) {
+			return;
+		}
+		const childId = message.event.child.id;
+		for (const candidate of this.sessions.values()) {
+			if (candidate.runtime.metadata.rlmChildId === childId) {
+				message.event.child.activeSessionId = candidate.activeSessionId;
+				return;
+			}
 		}
 	}
 

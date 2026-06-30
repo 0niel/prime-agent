@@ -11,7 +11,12 @@ import { flushAgentTraceUpload } from "./agent-traces.js";
 import { isNoModelsAvailableMessage } from "./auth-guidance.js";
 import type { ReplacedSessionContext, SessionShutdownEvent, SessionStartEvent } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
-import type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
+import type {
+	CreateRlmSubagentRuntimeOptions,
+	RlmSubagentReleaseStatus,
+	RlmSubagentRuntime,
+	SubagentRuntimeHost,
+} from "./rlm-runtime.js";
 import type { CreateAgentSessionResult } from "./sdk.js";
 import { assertSessionCwdExists } from "./session-cwd.js";
 import { SessionImportFileNotFoundError } from "./session-import-errors.js";
@@ -300,10 +305,22 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	async releaseRlmSubagentRuntime(
 		runtime: RlmSubagentRuntime,
 		options: CreateRlmSubagentRuntimeOptions,
+		status: RlmSubagentReleaseStatus,
 	): Promise<void> {
 		const tracked = this.subagentRuntimes.get(options.id);
 		if (tracked === runtime) {
 			this.subagentRuntimes.delete(options.id);
+		}
+		// Keep a successful run's session readable via the parent's inspector (disposed
+		// with the parent); errored/cancelled runs have nothing to show, so dispose now.
+		if (status === "done") {
+			// Flush traces now since the runtime's own shutdown path is skipped while retained.
+			await flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
+			// Retention can decline if the parent is already tearing down; if so, fall
+			// through and dispose the runtime instead of leaving it dangling.
+			if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
+				return;
+			}
 		}
 		if (runtime instanceof AgentSessionRuntime) {
 			await runtime.dispose();

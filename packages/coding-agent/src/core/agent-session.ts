@@ -28,15 +28,7 @@ import {
 	type ShouldStopAfterTurnContext,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type {
-	AssistantMessage,
-	ImageContent,
-	Message,
-	Model,
-	TextContent,
-	Usage,
-	UserMessage,
-} from "@earendil-works/pi-ai";
+import type { AssistantMessage, ImageContent, Message, Model, TextContent, Usage } from "@earendil-works/pi-ai";
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
@@ -49,6 +41,7 @@ import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
 import { ensureTool, MISSING_RIPGREP_MESSAGE } from "../utils/tools-manager.js";
+import { flushAgentTraceUpload } from "./agent-traces.js";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import {
@@ -139,6 +132,7 @@ import {
 	createRlmRunHostHandler,
 	type RlmInternalRunResult,
 	type RlmRunResult,
+	type RlmSubagentReleaseStatus,
 	type RlmSubagentRuntime,
 	type RlmUsage,
 	type SubagentRuntimeHost,
@@ -160,7 +154,7 @@ import { type BashOperations, createLocalBashOperations } from "./tools/bash.js"
 import { createAllToolDefinitions } from "./tools/index.js";
 import { IpythonKernelProvisioner } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
-import { addAssistantUsage, cloneUsage, emptyUsage } from "./usage.js";
+import { addAssistantUsage, emptyUsage } from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
 
 export type { GoalState, GoalStatus } from "./goals.js";
@@ -169,51 +163,15 @@ export { type ParsedSkillBlock, parseSkillBlock } from "./skill-blocks.js";
 
 export type RlmChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
 
-export interface RlmChildAgentTranscriptLine {
-	role: "user" | "assistant" | "tool" | "system";
-	text: string;
+export interface RlmChildAgentActivity {
+	kind: "waiting" | "writing" | "executing";
+	toolName?: string;
 }
-
-export interface RlmChildAgentToolResult {
-	content: (TextContent | ImageContent)[];
-	details?: unknown;
-	isError: boolean;
-}
-
-export interface RlmChildAgentMessageTranscriptEntry {
-	type: "message";
-	role: "user" | "assistant";
-	text: string;
-	message: UserMessage | AssistantMessage;
-}
-
-export interface RlmChildAgentToolTranscriptEntry {
-	type: "tool";
-	role: "tool";
-	text: string;
-	toolCallId: string;
-	toolName: string;
-	args: unknown;
-	result?: RlmChildAgentToolResult;
-	isPartial: boolean;
-	executionStarted: boolean;
-	argsComplete: boolean;
-}
-
-export interface RlmChildAgentSystemTranscriptEntry {
-	type: "system";
-	role: "system";
-	text: string;
-}
-
-export type RlmChildAgentStructuredTranscriptEntry =
-	| RlmChildAgentMessageTranscriptEntry
-	| RlmChildAgentToolTranscriptEntry
-	| RlmChildAgentSystemTranscriptEntry;
 
 export interface RlmChildAgentSnapshot {
 	id: string;
 	parentId?: string;
+	activeSessionId?: string;
 	label: string;
 	status: RlmChildAgentStatus;
 	durationMs?: number;
@@ -225,8 +183,9 @@ export interface RlmChildAgentSnapshot {
 	/** Latest recap of what the subagent is doing, from the summarizer. */
 	recap?: string;
 	sessionDir: string;
-	transcript: readonly RlmChildAgentTranscriptLine[];
-	structuredTranscript?: readonly RlmChildAgentStructuredTranscriptEntry[];
+	activity?: RlmChildAgentActivity;
+	/** Failure reason when status is "error". */
+	error?: string;
 }
 
 /** Session-specific events that extend the core AgentEvent */
@@ -478,180 +437,11 @@ export function rlmChildLabel(prompt: string): string {
 	return prompt.replace(/\s+/g, " ").trim() || "child agent";
 }
 
-function readTextBlocks(content: string | Array<{ type: string; text?: string }>): string {
-	if (typeof content === "string") {
-		return content;
-	}
-	return content
-		.filter((block) => block.type === "text" && typeof block.text === "string")
-		.map((block) => block.text ?? "")
-		.join("\n");
-}
-
 function readAssistantText(message: AssistantMessage): string {
 	return message.content
 		.filter((block) => block.type === "text")
 		.map((block) => block.text)
 		.join("");
-}
-
-function readAssistantThinking(message: AssistantMessage): string {
-	return message.content
-		.filter((block) => block.type === "thinking")
-		.map((block) => block.thinking)
-		.join("");
-}
-
-function cloneTextImageContentBlock(block: TextContent | ImageContent): TextContent | ImageContent {
-	if (block.type === "text") {
-		return {
-			type: "text",
-			text: block.text,
-			...(block.textSignature !== undefined ? { textSignature: block.textSignature } : {}),
-		};
-	}
-	return {
-		type: "image",
-		data: block.data,
-		mimeType: block.mimeType,
-	};
-}
-
-function cloneUserMessage(message: UserMessage): UserMessage {
-	return {
-		role: "user",
-		content:
-			typeof message.content === "string"
-				? message.content
-				: message.content.map((block) => cloneTextImageContentBlock(block)),
-		timestamp: message.timestamp,
-	};
-}
-
-function cloneAssistantContentBlock(block: AssistantMessage["content"][number]): AssistantMessage["content"][number] {
-	switch (block.type) {
-		case "text":
-			return {
-				type: "text",
-				text: block.text,
-				...(block.textSignature !== undefined ? { textSignature: block.textSignature } : {}),
-			};
-		case "thinking":
-			return {
-				type: "thinking",
-				thinking: block.thinking,
-				...(block.thinkingSignature !== undefined ? { thinkingSignature: block.thinkingSignature } : {}),
-				...(block.redacted !== undefined ? { redacted: block.redacted } : {}),
-			};
-		case "toolCall":
-			return {
-				type: "toolCall",
-				id: block.id,
-				name: block.name,
-				arguments: { ...block.arguments },
-				...(block.thoughtSignature !== undefined ? { thoughtSignature: block.thoughtSignature } : {}),
-			};
-	}
-}
-
-function cloneAssistantMessage(message: AssistantMessage): AssistantMessage {
-	return {
-		role: "assistant",
-		content: message.content.map((block) => cloneAssistantContentBlock(block)),
-		api: message.api,
-		provider: message.provider,
-		model: message.model,
-		...(message.responseModel !== undefined ? { responseModel: message.responseModel } : {}),
-		...(message.responseId !== undefined ? { responseId: message.responseId } : {}),
-		...(message.diagnostics !== undefined
-			? { diagnostics: message.diagnostics.map((diagnostic) => ({ ...diagnostic })) }
-			: {}),
-		usage: cloneUsage(message.usage),
-		stopReason: message.stopReason,
-		...(message.errorMessage !== undefined ? { errorMessage: message.errorMessage } : {}),
-		timestamp: message.timestamp,
-	};
-}
-
-function createAssistantTextMessage(text: string, model: Model<any>, timestamp = Date.now()): AssistantMessage {
-	return {
-		role: "assistant",
-		content: [{ type: "text", text }],
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
-		usage: emptyUsage(),
-		stopReason: "stop",
-		timestamp,
-	};
-}
-
-function cloneUnknownTextImageContentBlock(block: unknown): TextContent | ImageContent | undefined {
-	if (!block || typeof block !== "object" || !("type" in block)) {
-		return undefined;
-	}
-	const typedBlock = block as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
-	if (typedBlock.type === "text" && typeof typedBlock.text === "string") {
-		return { type: "text", text: typedBlock.text };
-	}
-	if (typedBlock.type === "image" && typeof typedBlock.data === "string" && typeof typedBlock.mimeType === "string") {
-		return { type: "image", data: typedBlock.data, mimeType: typedBlock.mimeType };
-	}
-	return undefined;
-}
-
-function cloneRlmToolResult(result: unknown, isError: boolean): RlmChildAgentToolResult | undefined {
-	if (!result || typeof result !== "object" || !("content" in result)) {
-		return undefined;
-	}
-	const resultRecord = result as { content?: unknown; details?: unknown };
-	if (!Array.isArray(resultRecord.content)) {
-		return undefined;
-	}
-	const content: (TextContent | ImageContent)[] = [];
-	for (const block of resultRecord.content) {
-		const cloned = cloneUnknownTextImageContentBlock(block);
-		if (cloned) {
-			content.push(cloned);
-		}
-	}
-	return {
-		content,
-		...(resultRecord.details !== undefined ? { details: resultRecord.details } : {}),
-		isError,
-	};
-}
-
-function readToolResultText(result: unknown): string | undefined {
-	if (!result || typeof result !== "object" || !("content" in result)) {
-		return undefined;
-	}
-	const content = (result as { content?: unknown }).content;
-	if (!Array.isArray(content)) {
-		return undefined;
-	}
-	const text = content
-		.filter(
-			(block): block is { type: string; text: string } =>
-				!!block &&
-				typeof block === "object" &&
-				"type" in block &&
-				"text" in block &&
-				block.type === "text" &&
-				typeof block.text === "string",
-		)
-		.map((block) => block.text)
-		.join("\n");
-	return text.trim() ? text : undefined;
-}
-
-function formatRlmToolArgs(args: unknown): string | undefined {
-	try {
-		const text = JSON.stringify(args);
-		return text && text !== "{}" ? compactRlmText(text, 96) : undefined;
-	} catch {
-		return undefined;
-	}
 }
 
 function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
@@ -737,6 +527,10 @@ export class AgentSession {
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
 	private _disposed = false;
+	// Set at the start of async teardown so a child finishing mid-disposeAsync doesn't
+	// re-populate the retained map after it's been cleared.
+	private _disposing = false;
+	private _disposeAsyncPromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
 	private _ipythonKernelSnapshotDir?: string;
@@ -749,6 +543,12 @@ export class AgentSession {
 	private _rlmParentNodeId?: string;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
+	// Inline mode keeps finished child sessions so the inspector can still read them;
+	// the daemon does the same by leaving the child session resident in its registry.
+	private _retainedRlmChildSessions = new Map<string, AgentSession>();
+	// Kept alive for retained children so nested updates (e.g. a grandchild cancel)
+	// still forward to root; torn down when the retained child is disposed.
+	private _retainedRlmChildUnsubscribes = new Map<string, () => void>();
 	/** Latest recap for this session, written by the daemon summarizer; read by a parent to label its child snapshots. */
 	private _currentRecap?: string;
 
@@ -1848,6 +1648,32 @@ export class AgentSession {
 		if (this._disposed) {
 			return;
 		}
+		// Concurrent callers await the same in-flight teardown so none resolves before
+		// the kernel snapshot flush finishes.
+		if (this._disposeAsyncPromise) {
+			return this._disposeAsyncPromise;
+		}
+		this._disposing = true;
+		this._disposeAsyncPromise = this._disposeAsyncOnce();
+		return this._disposeAsyncPromise;
+	}
+
+	private async _disposeAsyncOnce(): Promise<void> {
+		// Flush kernels/traces for both still-running and retained children; the sync
+		// dispose() below only tears them down synchronously.
+		for (const run of this._activeRlmChildRuns.values()) {
+			if (run.session) {
+				await run.session.disposeAsync().catch(() => undefined);
+			}
+		}
+		for (const unsubscribe of this._retainedRlmChildUnsubscribes.values()) {
+			unsubscribe();
+		}
+		this._retainedRlmChildUnsubscribes.clear();
+		for (const session of this._retainedRlmChildSessions.values()) {
+			await session.disposeAsync().catch(() => undefined);
+		}
+		this._retainedRlmChildSessions.clear();
 		try {
 			await this._ipythonKernelProvisioner?.dispose();
 		} catch {
@@ -1862,6 +1688,14 @@ export class AgentSession {
 		}
 		this._disposed = true;
 		this._cancelActiveRlmChildRuns("Parent session disposed");
+		for (const unsubscribe of this._retainedRlmChildUnsubscribes.values()) {
+			unsubscribe();
+		}
+		this._retainedRlmChildUnsubscribes.clear();
+		for (const session of this._retainedRlmChildSessions.values()) {
+			session.dispose();
+		}
+		this._retainedRlmChildSessions.clear();
 		this._pendingNextTurnMessages = [];
 		this._steeringMessages = [];
 		this._followUpMessages = [];
@@ -3994,13 +3828,24 @@ export class AgentSession {
 	private async _releaseRlmSubagentRuntime(
 		runtime: RlmSubagentRuntime,
 		options: CreateRlmSubagentRuntimeOptions,
+		status: RlmSubagentReleaseStatus,
 	): Promise<void> {
 		if (this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
-			await this._subagentRuntimeHost.releaseRlmSubagentRuntime(runtime, options);
+			await this._subagentRuntimeHost.releaseRlmSubagentRuntime(runtime, options, status);
 			return;
 		}
 
-		runtime.session.dispose();
+		// Inline: keep a successful run readable (disposed with the parent); errored or
+		// cancelled runs have nothing useful to show, so dispose them now. retainFinished…
+		// disposes the child itself when it declines, so only dispose here otherwise.
+		if (status === "done") {
+			await flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
+			if (!options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
+				runtime.session.dispose();
+			}
+		} else {
+			runtime.session.dispose();
+		}
 	}
 
 	private _createInlineRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): RlmSubagentRuntime {
@@ -4082,6 +3927,62 @@ export class AgentSession {
 	}
 
 	/**
+	 * Retain a finished child session so the inspector can still read it; disposed with
+	 * the parent. Returns false (and disposes the child) when the parent is already
+	 * tearing down, so the caller can drop the matching event forwarder too.
+	 */
+	retainFinishedRlmChildSession(childId: string, session: AgentSession): boolean {
+		// A child can finish concurrently while the parent is (or has) torn down; don't
+		// resurrect the map (it would never be disposed), just drop the child now.
+		if (this._disposed || this._disposing) {
+			void session.disposeAsync().catch(() => undefined);
+			return false;
+		}
+		this._retainedRlmChildSessions.set(childId, session);
+		return true;
+	}
+
+	/** True when any direct or nested subagent is still running or queued. */
+	hasRunningRlmChildren(): boolean {
+		for (const run of this._activeRlmChildRuns.values()) {
+			if (run.status === "running" || run.status === "queued") {
+				return true;
+			}
+			if (run.session?.hasRunningRlmChildren()) {
+				return true;
+			}
+		}
+		// A finished direct child can still have a running nested subagent.
+		for (const session of this._retainedRlmChildSessions.values()) {
+			if (session.hasRunningRlmChildren()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Inline (non-daemon) mode only; daemon clients attach to the child session directly.
+	getRlmChildSession(childId: string): AgentSession | undefined {
+		const direct = this._activeRlmChildRuns.get(childId)?.session ?? this._retainedRlmChildSessions.get(childId);
+		if (direct) {
+			return direct;
+		}
+		for (const candidate of this._activeRlmChildRuns.values()) {
+			const nested = candidate.session?.getRlmChildSession(childId);
+			if (nested) {
+				return nested;
+			}
+		}
+		for (const retained of this._retainedRlmChildSessions.values()) {
+			const nested = retained.getRlmChildSession(childId);
+			if (nested) {
+				return nested;
+			}
+		}
+		return undefined;
+	}
+
+	/**
 	 * Cancel a single RLM child run by id, searching nested child sessions.
 	 *
 	 * @returns true when a running or queued run was cancelled; false when the
@@ -4094,6 +3995,12 @@ export class AgentSession {
 		}
 		for (const candidate of this._activeRlmChildRuns.values()) {
 			if (candidate.session?.cancelRlmChildRun(childId, reason)) {
+				return true;
+			}
+		}
+		// A finished, retained child can still have a running nested subagent.
+		for (const retained of this._retainedRlmChildSessions.values()) {
+			if (retained.cancelRlmChildRun(childId, reason)) {
 				return true;
 			}
 		}
@@ -4119,12 +4026,15 @@ export class AgentSession {
 		const childNodeId = basename(childSessionDir);
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
-		const transcript: RlmChildAgentTranscriptLine[] = [];
-		const structuredTranscript: RlmChildAgentStructuredTranscriptEntry[] = [];
 		const label = rlmChildLabel(prompt);
 		let answerPreview: string | undefined;
 		let durationMs: number | undefined;
 		let toolUseCount = 0;
+		let runningToolCount = 0;
+		let activity: RlmChildAgentActivity | undefined;
+		// Held for emitChildUpdate so post-run events (a retained child's forwarder still
+		// fires) keep reading recap/tokens after run.session is cleared in the finally.
+		let childSession: AgentSession | undefined;
 		const run: RlmChildRun = {
 			id: childNodeId,
 			prompt,
@@ -4133,11 +4043,7 @@ export class AgentSession {
 			abort: noopRlmChildAbort,
 		};
 		this._activeRlmChildRuns.set(run.id, run);
-		// Index of the assistant entry currently being streamed. Cleared whenever the
-		// conversation moves on (new assistant message, tool call) so subsequent assistant
-		// text appends a fresh entry in chronological order instead of overwriting in place.
-		let currentAssistantIndex: number | undefined;
-		let lastToolTranscriptIndex: number | undefined;
+		// Status-only relay; the conversation is read from the child's own session.
 		const emitChildUpdate = () => {
 			this._emit({
 				type: "rlm_child_update",
@@ -4149,89 +4055,15 @@ export class AgentSession {
 					durationMs,
 					answerPreview,
 					toolUseCount: toolUseCount > 0 ? toolUseCount : undefined,
-					tokenCount: run.session?._contextTokensForCurrentMessages(),
-					recap: run.session?.getCurrentRecap(),
+					tokenCount: childSession?._contextTokensForCurrentMessages(),
+					recap: childSession?.getCurrentRecap(),
 					sessionDir: childSessionDir,
-					transcript: [...transcript],
-					structuredTranscript: [...structuredTranscript],
+					activity,
+					error: run.error,
 				},
 			});
 		};
 		run.emitUpdate = emitChildUpdate;
-		const recordAssistantMessage = (message: AssistantMessage) => {
-			const text = compactRlmText(readAssistantText(message));
-			const thinking = compactRlmText(readAssistantThinking(message));
-			const compact = text || thinking;
-			if (!compact) {
-				return;
-			}
-			if (text) {
-				answerPreview = text;
-			}
-			const entry: RlmChildAgentMessageTranscriptEntry = {
-				type: "message",
-				role: "assistant",
-				text: compact,
-				message: cloneAssistantMessage(message),
-			};
-			if (currentAssistantIndex === undefined) {
-				currentAssistantIndex = transcript.length;
-				transcript.push({ role: "assistant", text: compact });
-				structuredTranscript.push(entry);
-			} else {
-				transcript[currentAssistantIndex] = { role: "assistant", text: compact };
-				structuredTranscript[currentAssistantIndex] = entry;
-			}
-		};
-		const recordAssistantText = (text: string, sourceMessage?: AssistantMessage) => {
-			const compact = compactRlmText(text);
-			if (!compact) {
-				return;
-			}
-			const sourceCompact = sourceMessage
-				? compactRlmText(readAssistantText(sourceMessage)) || compactRlmText(readAssistantThinking(sourceMessage))
-				: undefined;
-			const message =
-				sourceMessage && sourceCompact === compact
-					? sourceMessage
-					: createAssistantTextMessage(text, model, sourceMessage?.timestamp);
-			recordAssistantMessage(message);
-		};
-		const recordUserMessage = (message: UserMessage) => {
-			const text = compactRlmText(readTextBlocks(message.content));
-			if (!text) {
-				return;
-			}
-			transcript.push({ role: "user", text });
-			structuredTranscript.push({
-				type: "message",
-				role: "user",
-				text,
-				message: cloneUserMessage(message),
-			});
-		};
-		const createToolTranscriptEntry = (
-			event: { toolCallId: string; toolName: string; args?: unknown },
-			text: string,
-			result: RlmChildAgentToolResult | undefined,
-			isPartial: boolean,
-		): RlmChildAgentToolTranscriptEntry => {
-			const entry: RlmChildAgentToolTranscriptEntry = {
-				type: "tool",
-				role: "tool",
-				text,
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				args: event.args,
-				isPartial,
-				executionStarted: true,
-				argsComplete: true,
-			};
-			if (result) {
-				entry.result = result;
-			}
-			return entry;
-		};
 		emitChildUpdate();
 
 		const subagentOptions = this._createRlmSubagentRuntimeOptions({
@@ -4251,6 +4083,7 @@ export class AgentSession {
 				}
 				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
 				const child = childRuntime.session;
+				childSession = child;
 				run.session = child;
 				run.abort = () => {
 					void child.abort();
@@ -4260,92 +4093,37 @@ export class AgentSession {
 						this._emit(event);
 						return;
 					}
-					if (event.type === "recap_update") {
-						// The summarizer set the child's recap; refresh its snapshot so the parent UI shows it.
-						emitChildUpdate();
-						return;
-					}
 					switch (event.type) {
-						case "message_start": {
-							if (event.message.role === "user") {
-								recordUserMessage(event.message);
-								currentAssistantIndex = undefined;
-							} else if (event.message.role === "assistant") {
-								// New assistant turn: append a fresh entry so prior text isn't overwritten.
-								currentAssistantIndex = undefined;
-								recordAssistantMessage(event.message as AssistantMessage);
-							}
+						case "recap_update":
 							emitChildUpdate();
 							break;
-						}
+						case "message_start":
 						case "message_update":
 						case "message_end": {
 							if (event.message.role === "assistant") {
-								recordAssistantMessage(event.message as AssistantMessage);
+								const text = compactRlmText(readAssistantText(event.message as AssistantMessage));
+								if (text) {
+									answerPreview = text;
+								}
+								activity = { kind: "writing" };
 								emitChildUpdate();
 							}
 							break;
 						}
 						case "tool_execution_start": {
-							const args = formatRlmToolArgs(event.args);
-							const text = args ? `${event.toolName} running ${args}` : `${event.toolName} running`;
 							toolUseCount += 1;
-							// Tool break: next assistant text starts a new entry after this tool row.
-							currentAssistantIndex = undefined;
-							lastToolTranscriptIndex = transcript.length;
-							transcript.push({ role: "tool", text });
-							structuredTranscript.push(createToolTranscriptEntry(event, text, undefined, true));
+							runningToolCount += 1;
+							activity = { kind: "executing", toolName: event.toolName };
 							emitChildUpdate();
-							break;
-						}
-						case "tool_execution_update": {
-							const text = readToolResultText(event.partialResult);
-							if (lastToolTranscriptIndex !== undefined) {
-								const previous = structuredTranscript[lastToolTranscriptIndex];
-								const summary = text
-									? `${event.toolName} running: ${compactRlmText(text)}`
-									: transcript[lastToolTranscriptIndex]?.text || `${event.toolName} running`;
-								transcript[lastToolTranscriptIndex] = { role: "tool", text: summary };
-								structuredTranscript[lastToolTranscriptIndex] = createToolTranscriptEntry(
-									{
-										toolCallId: event.toolCallId,
-										toolName: event.toolName,
-										args: previous?.type === "tool" ? previous.args : event.args,
-									},
-									summary,
-									cloneRlmToolResult(event.partialResult, false),
-									true,
-								);
-								emitChildUpdate();
-							}
 							break;
 						}
 						case "tool_execution_end": {
-							const text = readToolResultText(event.result);
-							const summary = text ? `${event.toolName}: ${compactRlmText(text)}` : `${event.toolName} done`;
-							const previous =
-								lastToolTranscriptIndex === undefined
-									? undefined
-									: structuredTranscript[lastToolTranscriptIndex];
-							const entry = createToolTranscriptEntry(
-								{
-									toolCallId: event.toolCallId,
-									toolName: event.toolName,
-									args: previous?.type === "tool" ? previous.args : undefined,
-								},
-								summary,
-								cloneRlmToolResult(event.result, event.isError),
-								false,
-							);
-							if (lastToolTranscriptIndex === undefined) {
-								lastToolTranscriptIndex = transcript.length;
-								transcript.push({ role: "tool", text: summary });
-								structuredTranscript.push(entry);
-							} else {
-								transcript[lastToolTranscriptIndex] = { role: "tool", text: summary };
-								structuredTranscript[lastToolTranscriptIndex] = entry;
+							runningToolCount = Math.max(0, runningToolCount - 1);
+							// Stay "executing" while sibling tools from the same turn run.
+							if (runningToolCount === 0) {
+								activity = { kind: "waiting" };
+								emitChildUpdate();
 							}
-							emitChildUpdate();
 							break;
 						}
 					}
@@ -4365,16 +4143,9 @@ export class AgentSession {
 				this._attributeRlmChildUsageToParent(assistantUsage, parentAssistantForUsage);
 				run.status = "done";
 				durationMs = Date.now() - startedAt;
-				// Streaming events usually capture the final assistant text already. Only
-				// record again when it's missing — otherwise a child whose last streamed
-				// event was tool_execution_start would have currentAssistantIndex cleared,
-				// causing the final answer to be appended as a duplicate row.
+				activity = undefined;
 				const compactAnswer = compactRlmText(answer);
-				const lastAssistantText = [...transcript].reverse().find((line) => line.role === "assistant")?.text;
-				if (compactAnswer && compactAnswer !== lastAssistantText) {
-					const lastAssistant = child._findLastAssistantMessage();
-					recordAssistantText(answer, lastAssistant);
-				} else if (compactAnswer) {
+				if (compactAnswer) {
 					answerPreview = compactAnswer;
 				}
 				emitChildUpdate();
@@ -4392,14 +4163,23 @@ export class AgentSession {
 				}
 				durationMs = Date.now() - startedAt;
 				run.error = error instanceof Error ? error.message : String(error);
-				transcript.push({ role: "system", text: run.error });
-				structuredTranscript.push({ type: "system", role: "system", text: run.error });
+				activity = undefined;
 				emitChildUpdate();
 				throw error;
 			} finally {
-				unsubscribeChild?.();
+				const releaseStatus: RlmSubagentReleaseStatus =
+					run.status === "cancelled" || run.status === "error" ? run.status : "done";
 				if (childRuntime) {
-					await this._releaseRlmSubagentRuntime(childRuntime, subagentOptions);
+					await this._releaseRlmSubagentRuntime(childRuntime, subagentOptions, releaseStatus);
+				}
+				// Keep the forwarder only if the child was actually retained (retention can
+				// decline when the parent is disposing); otherwise drop it.
+				if (unsubscribeChild) {
+					if (this._retainedRlmChildSessions.has(run.id)) {
+						this._retainedRlmChildUnsubscribes.set(run.id, unsubscribeChild);
+					} else {
+						unsubscribeChild();
+					}
 				}
 				run.abort = noopRlmChildAbort;
 				run.session = undefined;

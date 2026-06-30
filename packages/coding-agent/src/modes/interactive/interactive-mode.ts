@@ -113,6 +113,7 @@ import type {
 	AgentConnectionSessionContext,
 	AgentConnectionSessionEvent,
 	AgentConnectionSessionTreeNode,
+	AgentConnectionSessionWatcher,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
 	AgentConnectionSourceInfo,
@@ -136,12 +137,11 @@ import { showFullPaneOverlay } from "./components/centered-overlay.js";
 import {
 	ChildAgentDetailComponent,
 	type ChildAgentInspectorNode,
-	type ChildAgentStructuredTranscriptEntry,
 	ChildAgentSummaryComponent,
-	type ChildAgentTranscriptLine,
 } from "./components/child-agent-inspector.js";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
 import { formatContextTree } from "./components/context-tree-format.js";
+import { buildConversationComponents } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { CustomMessageComponent } from "./components/custom-message.js";
@@ -271,6 +271,7 @@ export interface BrandSplashMetadataLine {
 export interface BrandSplashHeaderOptions {
 	logo?: string;
 	getExtraMetadata?: () => readonly BrandSplashMetadataLine[];
+	getHideStartHint?: () => boolean;
 }
 
 export class BrandSplashHeader implements Component {
@@ -307,14 +308,14 @@ export class BrandSplashHeader implements Component {
 			return theme.fg("dim", label.padEnd(this.labelWidth)) + theme.fg("muted", displayValue);
 		};
 		const extraMetadata = this.options.getExtraMetadata?.() ?? [];
+		const hideStartHint = this.options.getHideStartHint?.() ?? false;
 		const metaLines = showMeta
 			? [
 					labelled("version", `v${this.version}`),
 					labelled("model", this.getModelId() ?? "—"),
 					labelled("cwd", formatSplashCwd(this.getCwd())),
 					...extraMetadata.map((line) => labelled(line.label, line.value)),
-					"",
-					theme.fg("dim", "type to start"),
+					...(hideStartHint ? [] : ["", theme.fg("dim", "type to start")]),
 				]
 			: [];
 		const metaStart = Math.max(0, Math.floor((this.logoRaw.length - metaLines.length) / 2));
@@ -567,6 +568,14 @@ export class InteractiveMode {
 	private childAgentDetailNodeId: string | undefined;
 	private childAgentPanelMode: "detail" | undefined;
 	private enteredSessionViaSubagentDetail = false;
+	private childAgentWatcher: AgentConnectionSessionWatcher | undefined;
+	private childAgentWatcherToken = 0;
+	private childAgentWatcherMessages: AgentMessage[] = [];
+	// Monotonic per-watch counter so a late-resolving getMessages can't clobber a newer one.
+	private childAgentRefreshSeq = 0;
+	// The session key the current watcher attached with, so a later snapshot that
+	// gains the real activeSessionId can retry the attach.
+	private childAgentWatchedKey: string | undefined;
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -677,16 +686,6 @@ export class InteractiveMode {
 		this.queuedMessagesContainer = new Container();
 		this.childAgentDetail = new ChildAgentDetailComponent(() => this.getChildAgentPanelRows(), {
 			ui: this.ui,
-			getCwd: () => this.getCurrentCwd(),
-			getToolDefinition: (toolName) => this.getCachedToolDefinition(toolName),
-			getToolOptions: () => ({
-				showImages: this.settingsManager.getShowImages(),
-				imageWidthCells: this.settingsManager.getImageWidthCells(),
-			}),
-			getMarkdownTheme: () => this.getMarkdownThemeWithSettings(),
-			getToolsExpanded: () => this.toolOutputExpanded,
-			getHideThinkingBlock: () => this.hideThinkingBlock,
-			getHiddenThinkingLabel: () => this.hiddenThinkingLabel,
 		});
 		this.childAgentDetail.onCancel = () => {
 			if (this.options.returnToAgentsView && this.enteredSessionViaSubagentDetail) {
@@ -948,6 +947,7 @@ export class InteractiveMode {
 				() => this.getCurrentModelId(),
 				() => this.getCurrentCwd(),
 				verboseInstructions,
+				{ getHideStartHint: () => this.childAgentPanelMode !== undefined },
 			);
 			this.headerContainer.addChild(new Spacer(1));
 			this.headerContainer.addChild(this.builtInHeader);
@@ -2592,7 +2592,10 @@ export class InteractiveMode {
 	}
 
 	private shouldShowWorkingLoader(): boolean {
-		return this.workingVisible && (this.isAgentStreaming() || this.countRunningChildAgents() > 0);
+		// Background subagents (agent turn done, asyncio tasks still running) would
+		// otherwise show a textless spinner; the subagent tree above the loader carries
+		// that state, so the loader only shows while the main agent is itself streaming.
+		return this.workingVisible && this.isAgentStreaming();
 	}
 
 	// Reconcile the loader with current state for transitions that fire no live
@@ -2754,7 +2757,8 @@ export class InteractiveMode {
 	private renderRecap(): void {
 		if (!this.recapContainer) return;
 		this.recapContainer.clear();
-		const recap = this.sessionRecap?.trim();
+		// The subagent panel shows its own recap; suppress the parent's while it's open.
+		const recap = this.childAgentPanelMode ? undefined : this.sessionRecap?.trim();
 		if (recap) {
 			this.recapContainer.addChild(new Text(theme.fg("dim", `Recap: ${recap}`), 1, 0));
 			// Blank line between the recap and the prompt bar below it.
@@ -4137,7 +4141,7 @@ export class InteractiveMode {
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
-				// Keep the loader up if async subagents outlive the parent turn.
+				// Drops the loader; background subagents are shown by the tree, not the loader.
 				this.syncWorkingLoader();
 				if (this.streamingComponent) {
 					if (this.streamingMessage) {
@@ -4477,6 +4481,7 @@ export class InteractiveMode {
 				return;
 			}
 			this.childAgentDetail.setNode(detailNode);
+			this.maybeRetryChildAgentWatch(detailNode);
 		}
 		this.ui.requestRender();
 	}
@@ -4661,6 +4666,8 @@ export class InteractiveMode {
 		this.childAgentPanelMode = "detail";
 		this.childAgentDetailNodeId = nodeId;
 		this.childAgentDetail.setNode(node);
+		this.childAgentDetail.setBodyComponents([]);
+		this.renderRecap();
 		this.childAgentSummary.setHidden(true);
 		this.editorContainer.clear();
 		this.queuedMessagesContainer.clear();
@@ -4668,17 +4675,136 @@ export class InteractiveMode {
 		this.mainViewContainer.addChild(this.childAgentDetail);
 		this.ui.setFocus(this.childAgentDetail);
 		this.ui.requestRender();
+		void this.startChildAgentWatch(node);
 		return true;
 	}
 
+	private async startChildAgentWatch(node: ChildAgentInspectorNode): Promise<void> {
+		this.stopChildAgentWatch();
+		const key = node.activeSessionId ?? node.id;
+		const token = ++this.childAgentWatcherToken;
+		this.childAgentWatchedKey = key;
+		const watcher = await this.agentConnection.watchSession(key).catch(() => undefined);
+		// The panel may have closed (or another node opened) while attaching.
+		if (token !== this.childAgentWatcherToken) {
+			await watcher?.close().catch(() => undefined);
+			return;
+		}
+		if (!watcher) {
+			// A still-running child may not have registered yet (in-process snapshots never
+			// carry activeSessionId, so the key won't change). Clear the watched key so the
+			// next rlm_child_update retries the attach until a watcher is obtained.
+			if (node.status === "running" || node.status === "queued") {
+				this.childAgentWatchedKey = undefined;
+				return;
+			}
+			const fallback = node.error?.trim()
+				? theme.fg("error", `  ${node.error.trim()}`)
+				: theme.fg("muted", "  conversation unavailable");
+			this.childAgentDetail.setBodyComponents([new Text(fallback, 1, 0)]);
+			return;
+		}
+		this.childAgentWatcher = watcher;
+		watcher.subscribe((event) => {
+			if (token !== this.childAgentWatcherToken) {
+				return;
+			}
+			// session_replaced carries a fresh messages array; both need a rebuild.
+			if (event.type === "session_event" || event.type === "session_replaced") {
+				void this.refreshChildAgentWatch(token, watcher);
+			}
+		});
+		await this.refreshChildAgentWatch(token, watcher);
+	}
+
+	// (Re)attach when the key differs from what we last attached with — including the
+	// undefined left by a failed attach on a not-yet-registered child. Once a watcher is
+	// held the key matches, so this won't re-attach (or cancel an in-flight attach) per update.
+	private maybeRetryChildAgentWatch(node: ChildAgentInspectorNode | undefined): void {
+		if (!node || this.childAgentPanelMode !== "detail") {
+			return;
+		}
+		const key = node.activeSessionId ?? node.id;
+		if (key !== this.childAgentWatchedKey) {
+			void this.startChildAgentWatch(node);
+		}
+	}
+
+	private async refreshChildAgentWatch(token: number, watcher: AgentConnectionSessionWatcher): Promise<void> {
+		const seq = ++this.childAgentRefreshSeq;
+		const messages = await watcher.getMessages().catch(() => undefined);
+		// Drop a fetch that a newer refresh (or a different watch) has already superseded.
+		if (!messages || token !== this.childAgentWatcherToken || seq !== this.childAgentRefreshSeq) {
+			return;
+		}
+		this.childAgentWatcherMessages = messages;
+		await this.rebuildChildAgentBody(token);
+	}
+
+	private async rebuildChildAgentBody(token: number): Promise<void> {
+		const watcher = this.childAgentWatcher;
+		if (!watcher || token !== this.childAgentWatcherToken) {
+			return;
+		}
+		const messages = this.childAgentWatcherMessages;
+		const toolNames = new Set<string>();
+		for (const message of messages) {
+			if (message.role === "assistant") {
+				for (const content of message.content) {
+					if (content.type === "toolCall") {
+						toolNames.add(content.name);
+					}
+				}
+			}
+		}
+		const definitions = new Map<string, ToolExecutionDefinition | undefined>();
+		await Promise.all(
+			[...toolNames].map(async (name) => {
+				definitions.set(name, (await watcher.getToolDefinition(name).catch(() => undefined)) ?? undefined);
+			}),
+		);
+		// A newer refresh (or a close) may have superseded this build while awaiting defs.
+		if (token !== this.childAgentWatcherToken) {
+			return;
+		}
+		this.childAgentDetail.setBodyComponents(
+			buildConversationComponents(messages, {
+				ui: this.ui,
+				cwd: this.getCurrentCwd(),
+				toolOptions: {
+					showImages: this.settingsManager.getShowImages(),
+					imageWidthCells: this.settingsManager.getImageWidthCells(),
+				},
+				getToolDefinition: (name) => definitions.get(name),
+				markdownTheme: this.getMarkdownThemeWithSettings(),
+				hideThinkingBlock: this.hideThinkingBlock,
+				hiddenThinkingLabel: this.hiddenThinkingLabel,
+				toolsExpanded: this.toolOutputExpanded,
+			}),
+		);
+	}
+
+	private stopChildAgentWatch(): void {
+		this.childAgentWatcherToken++;
+		this.childAgentWatcherMessages = [];
+		this.childAgentWatchedKey = undefined;
+		const watcher = this.childAgentWatcher;
+		this.childAgentWatcher = undefined;
+		void watcher?.close().catch(() => undefined);
+	}
+
 	private closeChildAgentPanel(options: { selectNodeId?: string } = {}): void {
+		this.stopChildAgentWatch();
 		this.childAgentPanelMode = undefined;
 		this.childAgentDetailNodeId = undefined;
 		this.enteredSessionViaSubagentDetail = false;
 		this.childAgentDetail.setBackHintLabel("back to chat");
 		this.childAgentDetail.setNode(undefined);
+		this.childAgentDetail.setBodyComponents([]);
 		this.childAgentSummary.setHidden(false);
 		this.restoreMainAgentView();
+		// Restore the parent recap that was suppressed while the panel was open.
+		this.renderRecap();
 		// Re-render queued previews cleared on panel entry; the queue may still hold messages.
 		this.updatePendingMessagesDisplay();
 		this.editorContainer.clear();
@@ -4704,6 +4830,7 @@ export class InteractiveMode {
 
 		const build = (child: AgentConnectionRlmChildAgentSnapshot): ChildAgentInspectorNode => ({
 			id: child.id,
+			activeSessionId: child.activeSessionId,
 			label: child.label,
 			status: child.status,
 			durationMs: child.durationMs,
@@ -4712,15 +4839,8 @@ export class InteractiveMode {
 			tokenCount: child.tokenCount,
 			recap: child.recap,
 			sessionDir: child.sessionDir,
-			transcript: child.transcript.map(
-				(line): ChildAgentTranscriptLine => ({
-					role: line.role,
-					text: line.text,
-				}),
-			),
-			structuredTranscript: child.structuredTranscript?.map(
-				(entry): ChildAgentStructuredTranscriptEntry => ({ ...entry }),
-			),
+			activity: child.activity,
+			error: child.error,
 			children: childrenByParent.get(child.id)?.map(build),
 		});
 
@@ -5365,6 +5485,11 @@ export class InteractiveMode {
 				this.streamingComponent.setHideThinkingBlock(this.hideThinkingBlock);
 				this.streamingComponent.updateContent(this.streamingMessage);
 				this.chatContainer.addChild(this.streamingComponent);
+			}
+
+			// The open subagent body bakes in thinking visibility at build time.
+			if (this.childAgentWatcher) {
+				await this.rebuildChildAgentBody(this.childAgentWatcherToken);
 			}
 
 			this.showStatus(`Thinking blocks: ${this.hideThinkingBlock ? "hidden" : "visible"}`);

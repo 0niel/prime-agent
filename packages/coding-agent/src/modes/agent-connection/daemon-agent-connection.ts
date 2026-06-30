@@ -43,6 +43,7 @@ import type {
 	AgentConnectionSessionContext,
 	AgentConnectionSessionListProgress,
 	AgentConnectionSessionTreeNode,
+	AgentConnectionSessionWatcher,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
 	AgentConnectionState,
@@ -653,6 +654,23 @@ export class DaemonAgentConnection implements AgentConnection {
 			activeSessionId: this.activeSessionId,
 			sessionPath,
 		});
+	}
+
+	async watchSession(activeSessionId: string): Promise<AgentConnectionSessionWatcher | undefined> {
+		// A second connection on the shared client; each one filters to its own session id.
+		// attach() rejects for an unknown/exited session — treat that as unreachable.
+		let connection: DaemonAgentConnection;
+		try {
+			connection = await DaemonAgentConnection.attach(this.client, activeSessionId, { closeClientOnDispose: false });
+		} catch {
+			return undefined;
+		}
+		return {
+			getMessages: () => connection.getMessages(),
+			subscribe: (listener) => connection.subscribe(listener),
+			getToolDefinition: (name) => connection.getToolDefinition(name),
+			close: () => connection.dispose(),
+		};
 	}
 
 	async dispose(): Promise<void> {

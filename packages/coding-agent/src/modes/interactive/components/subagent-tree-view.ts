@@ -2,7 +2,7 @@ import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/p
 import { formatTokenCount } from "../agent-activity.js";
 import { theme } from "../theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
-import type { ChildAgentInspectorNode, ChildAgentStructuredTranscriptEntry } from "./child-agent-inspector.js";
+import { type ChildAgentInspectorNode, nodeActivityLabel } from "./child-agent-inspector.js";
 
 /** Left padding so the tree aligns with the loader message / tool-call text. */
 const PAD = " ";
@@ -110,43 +110,6 @@ export class SubagentTreeView implements Component {
 		}
 		return parts.join(" ");
 	}
-}
-
-/**
- * A main-agent-style activity label ("Waiting" / "Writing" / "Executing") derived from
- * the subagent's latest transcript entry, shown until its recap lands.
- */
-function nodeActivityLabel(node: ChildAgentInspectorNode): string {
-	if (node.status === "queued") {
-		return "Waiting";
-	}
-	const last = lastMeaningfulEntry(node.structuredTranscript);
-	if (!last) {
-		return "Waiting";
-	}
-	if (last.type === "tool") {
-		// Still running its tool vs. finished and about to think again.
-		return last.isPartial ? `Executing ${last.toolName}` : "Waiting";
-	}
-	if (last.type === "message" && last.role === "assistant") {
-		return "Writing";
-	}
-	return "Waiting";
-}
-
-function lastMeaningfulEntry(
-	transcript: readonly ChildAgentStructuredTranscriptEntry[] | undefined,
-): ChildAgentStructuredTranscriptEntry | undefined {
-	if (!transcript) {
-		return undefined;
-	}
-	for (let i = transcript.length - 1; i >= 0; i--) {
-		const entry = transcript[i];
-		if (entry && entry.type !== "system") {
-			return entry;
-		}
-	}
-	return undefined;
 }
 
 /** First few words of the prompt, clipped to a sensible width with an ellipsis. */
