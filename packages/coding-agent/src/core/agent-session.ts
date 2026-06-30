@@ -131,6 +131,7 @@ import {
 	createRlmRunHostHandler,
 	type RlmInternalRunResult,
 	type RlmRunResult,
+	type RlmSubagentReleaseStatus,
 	type RlmSubagentRuntime,
 	type RlmUsage,
 	type SubagentRuntimeHost,
@@ -3787,14 +3788,20 @@ export class AgentSession {
 	private async _releaseRlmSubagentRuntime(
 		runtime: RlmSubagentRuntime,
 		options: CreateRlmSubagentRuntimeOptions,
+		status: RlmSubagentReleaseStatus,
 	): Promise<void> {
 		if (this._subagentRuntimeHost?.releaseRlmSubagentRuntime) {
-			await this._subagentRuntimeHost.releaseRlmSubagentRuntime(runtime, options);
+			await this._subagentRuntimeHost.releaseRlmSubagentRuntime(runtime, options, status);
 			return;
 		}
 
-		// Inline: keep the finished session readable; disposed with the parent.
-		this._retainedRlmChildSessions.set(options.id, runtime.session);
+		// Inline: keep a successful run readable (disposed with the parent); errored or
+		// cancelled runs have nothing useful to show, so dispose them now.
+		if (status === "done") {
+			this._retainedRlmChildSessions.set(options.id, runtime.session);
+		} else {
+			runtime.session.dispose();
+		}
 	}
 
 	private _createInlineRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): RlmSubagentRuntime {
@@ -3873,6 +3880,11 @@ export class AgentSession {
 	/** Status of a direct RLM child run, while the run is still tracked. */
 	getRlmChildRunStatus(childId: string): RlmChildAgentStatus | undefined {
 		return this._activeRlmChildRuns.get(childId)?.status;
+	}
+
+	/** Retain a finished inline child session so the inspector can still read it; disposed with the parent. */
+	retainFinishedRlmChildSession(childId: string, session: AgentSession): void {
+		this._retainedRlmChildSessions.set(childId, session);
 	}
 
 	/** True when any direct or nested subagent is still running or queued. */
@@ -4085,7 +4097,9 @@ export class AgentSession {
 			} finally {
 				unsubscribeChild?.();
 				if (childRuntime) {
-					await this._releaseRlmSubagentRuntime(childRuntime, subagentOptions);
+					const releaseStatus: RlmSubagentReleaseStatus =
+						run.status === "cancelled" || run.status === "error" ? run.status : "done";
+					await this._releaseRlmSubagentRuntime(childRuntime, subagentOptions, releaseStatus);
 				}
 				run.abort = noopRlmChildAbort;
 				run.session = undefined;

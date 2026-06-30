@@ -572,6 +572,8 @@ export class InteractiveMode {
 	private childAgentWatcher: AgentConnectionSessionWatcher | undefined;
 	private childAgentWatcherToken = 0;
 	private childAgentWatcherMessages: AgentMessage[] = [];
+	// Monotonic per-watch counter so a late-resolving getMessages can't clobber a newer one.
+	private childAgentRefreshSeq = 0;
 	// The session key the current watcher attached with, so a later snapshot that
 	// gains the real activeSessionId can retry the attach.
 	private childAgentWatchedKey: string | undefined;
@@ -4727,8 +4729,10 @@ export class InteractiveMode {
 	}
 
 	private async refreshChildAgentWatch(token: number, watcher: AgentConnectionSessionWatcher): Promise<void> {
+		const seq = ++this.childAgentRefreshSeq;
 		const messages = await watcher.getMessages().catch(() => undefined);
-		if (!messages || token !== this.childAgentWatcherToken) {
+		// Drop a fetch that a newer refresh (or a different watch) has already superseded.
+		if (!messages || token !== this.childAgentWatcherToken || seq !== this.childAgentRefreshSeq) {
 			return;
 		}
 		this.childAgentWatcherMessages = messages;

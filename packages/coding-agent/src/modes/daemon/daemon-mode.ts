@@ -694,10 +694,16 @@ export class AgentDaemon {
 					throw cascadeError;
 				}
 			},
-			releaseRlmSubagentRuntime: async (runtime) => {
-				// Keep a finished subagent resident so it stays viewable; it's torn down
-				// with the parent via the closeChildSessions cascade.
-				if (this.findRuntimeState(runtime)) {
+			releaseRlmSubagentRuntime: async (runtime, _options, status) => {
+				const state = this.findRuntimeState(runtime);
+				// Keep a successful subagent resident so it stays viewable (torn down with
+				// the parent via the closeChildSessions cascade). Errored/cancelled runs have
+				// nothing useful to show and would otherwise re-seed as "done", so close them.
+				if (state && status === "done") {
+					return;
+				}
+				if (state) {
+					await this.closeSession(state, status === "cancelled" ? "killed" : "completed");
 					return;
 				}
 				if (runtime instanceof AgentSessionRuntime) {
