@@ -41,6 +41,7 @@ import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
 import { ensureTool, MISSING_RIPGREP_MESSAGE } from "../utils/tools-manager.js";
+import { flushAgentTraceUpload } from "./agent-traces.js";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import {
@@ -3816,7 +3817,8 @@ export class AgentSession {
 		// Inline: keep a successful run readable (disposed with the parent); errored or
 		// cancelled runs have nothing useful to show, so dispose them now.
 		if (status === "done") {
-			this._retainedRlmChildSessions.set(options.id, runtime.session);
+			await flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
+			options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session);
 		} else {
 			runtime.session.dispose();
 		}
