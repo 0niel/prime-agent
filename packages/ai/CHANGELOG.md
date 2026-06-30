@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-06-30
+
+- Added a `./mcp` entry point with a built-in MCP server catalog (Linear, Notion) and generic OAuth 2.1 (PKCE + dynamic client registration) providers stored as `mcp:<server>` in `auth.json`; the local OAuth callback server tries a range of ports so a stale or concurrent login can't block sign-in ([#280](https://github.com/PrimeIntellect-ai/prime-agent/issues/280)).
+- Added the `qwen/qwen3-30b-a3b-instruct-2507` model to the Prime Inference catalog ([#284](https://github.com/PrimeIntellect-ai/prime-agent/issues/284)).
+
 ## [0.2.2] - 2026-06-25
 
 - Added a curated `vision` flag on Prime Inference model metadata so vision-capable models advertise `["text", "image"]` input, since the Prime Inference models API reports no modality data ([#261](https://github.com/PrimeIntellect-ai/prime-agent/issues/261)).
