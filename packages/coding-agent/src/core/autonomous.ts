@@ -252,13 +252,16 @@ function runAutonomousQualityGates(state: AutonomousRuntimeState, cwd: string | 
 			state.lastGateFailureSnapshot &&
 			gitWorktreeSnapshotsEqual(currentSnapshot, state.lastGateFailureSnapshot)
 		) {
+			const attempt = (state.gateAttempts[command] ?? state.lastGateFailure.attempt) + 1;
+			state.gateAttempts[command] = attempt;
 			state.lastGateFailure = {
 				...state.lastGateFailure,
+				attempt,
 				exitText: "not rerun: workspace unchanged since previous failed gate",
 				output:
 					"The autonomous gate was not rerun because the workspace has not changed since this failure. Edit source files, tests, or a blocker artifact before attempting to finish again.",
 			};
-			return "failed";
+			return attempt > state.gates.maxRetries ? "retry_exhausted" : "failed";
 		}
 		const result = spawnSync(command, {
 			cwd,

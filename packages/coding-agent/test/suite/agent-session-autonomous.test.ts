@@ -181,7 +181,7 @@ describe("AgentSession autonomous mode", () => {
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
 	});
 
-	it("does not rerun a failed autonomous gate until the workspace changes", () => {
+	it("advances retry budget without rerunning a failed autonomous gate until the workspace changes", () => {
 		const tempDir = join(process.cwd(), `.tmp-autonomous-gate-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		execFileSync("mkdir", ["-p", join(tempDir, "verification")]);
 		execFileSync("git", ["init"], { cwd: tempDir, stdio: "ignore" });
@@ -210,7 +210,7 @@ describe("AgentSession autonomous mode", () => {
 			expect(getMessageText(second)).toContain("workspace has not changed");
 			expect(getMessageText(second)).toContain("Edit source files");
 			expect(readFileSync(counter, "utf8").trim().split(/\n/)).toHaveLength(1);
-			expect(state.gateAttempts[gate]).toBe(1);
+			expect(state.gateAttempts[gate]).toBe(2);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
