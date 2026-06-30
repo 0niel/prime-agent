@@ -4032,6 +4032,9 @@ export class AgentSession {
 		let toolUseCount = 0;
 		let runningToolCount = 0;
 		let activity: RlmChildAgentActivity | undefined;
+		// Held for emitChildUpdate so post-run events (a retained child's forwarder still
+		// fires) keep reading recap/tokens after run.session is cleared in the finally.
+		let childSession: AgentSession | undefined;
 		const run: RlmChildRun = {
 			id: childNodeId,
 			prompt,
@@ -4052,8 +4055,8 @@ export class AgentSession {
 					durationMs,
 					answerPreview,
 					toolUseCount: toolUseCount > 0 ? toolUseCount : undefined,
-					tokenCount: run.session?._contextTokensForCurrentMessages(),
-					recap: run.session?.getCurrentRecap(),
+					tokenCount: childSession?._contextTokensForCurrentMessages(),
+					recap: childSession?.getCurrentRecap(),
 					sessionDir: childSessionDir,
 					activity,
 					error: run.error,
@@ -4080,6 +4083,7 @@ export class AgentSession {
 				}
 				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
 				const child = childRuntime.session;
+				childSession = child;
 				run.session = child;
 				run.abort = () => {
 					void child.abort();
