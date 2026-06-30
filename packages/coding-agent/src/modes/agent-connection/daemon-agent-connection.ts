@@ -657,9 +657,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async watchSession(activeSessionId: string): Promise<AgentConnectionSessionWatcher | undefined> {
-		// A second connection on the shared client: the daemon routes each session's
-		// events only to clients attached to it, and each connection ignores events
-		// for other sessions, so root and child streams stay cleanly separated.
+		// A second connection on the shared client; each one filters to its own session id.
 		const connection = await DaemonAgentConnection.attach(this.client, activeSessionId, {
 			closeClientOnDispose: false,
 		});

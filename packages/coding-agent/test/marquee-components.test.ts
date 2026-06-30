@@ -471,8 +471,6 @@ describe("marquee TUI components", () => {
 
 		const detailComponent = new ChildAgentDetailComponent(() => 20);
 		detailComponent.setNode(node);
-		// The detail view renders the child's own conversation, built by the shared
-		// helper (the same one interactive mode feeds from the watched child session).
 		detailComponent.setBodyComponents(
 			buildConversationComponents(
 				[
@@ -484,8 +482,7 @@ describe("marquee TUI components", () => {
 		);
 		const detailLines = detailComponent.render(42);
 		const detail = stripAnsi(detailLines.join("\n"));
-		expect(detail).toContain("running inspect training logs");
-		expect(detail).toContain("sub-a");
+		expect(detail).toContain("inspect training logs");
 		expect(detail).toContain("reading shard metrics");
 		expect(detail).toContain("← back to chat");
 		expect(detail).not.toContain("user: inspect training logs");

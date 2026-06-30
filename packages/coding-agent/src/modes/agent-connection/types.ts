@@ -424,7 +424,7 @@ export interface AgentConnectionRlmChildAgentActivity {
 export interface AgentConnectionRlmChildAgentSnapshot {
 	id: string;
 	parentId?: string;
-	/** The child's own daemon active-session id, so a client can attach to it directly. */
+	/** The child's own daemon active-session id, for attaching to it directly. */
 	activeSessionId?: string;
 	label: string;
 	status: AgentConnectionRlmChildAgentStatus;
@@ -568,17 +568,12 @@ export interface AgentConnection {
 	renameSavedSession(sessionPath: string, name: string): Promise<void>;
 	deleteSavedSession(sessionPath: string): Promise<DeleteSessionFileResult>;
 
-	/**
-	 * Open a read-only watcher on another live session (a subagent) so a viewer can
-	 * render it from its own messages + event stream rather than a parent projection.
-	 * Returns undefined when the transport can't reach the session independently.
-	 */
+	/** Read-only watcher on another live session (a subagent); undefined if the transport can't reach it. */
 	watchSession(activeSessionId: string): Promise<AgentConnectionSessionWatcher | undefined>;
 
 	dispose(): Promise<void>;
 }
 
-/** Read-only live view of another session: its messages plus a subscription to its events. */
 export interface AgentConnectionSessionWatcher {
 	getMessages(): Promise<AgentMessage[]>;
 	subscribe(listener: AgentConnectionEventListener): () => void;

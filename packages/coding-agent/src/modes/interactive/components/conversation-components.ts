@@ -27,12 +27,7 @@ function readUserText(content: string | Array<{ type: string; text?: string }>):
 		.join("");
 }
 
-/**
- * Build renderable components from a message list using the same component classes
- * the main conversation uses, so a subagent renders identically to a root session.
- * Tool calls become ToolExecutionComponents whose results are matched from the
- * following toolResult message; a still-running tool call stays result-less.
- */
+/** Build conversation components from a message list, matching tool results to their calls. */
 export function buildConversationComponents(
 	messages: readonly AgentMessage[],
 	options: ConversationComponentsOptions,

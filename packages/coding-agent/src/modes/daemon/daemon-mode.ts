@@ -695,10 +695,8 @@ export class AgentDaemon {
 				}
 			},
 			releaseRlmSubagentRuntime: async (runtime) => {
-				// A finished subagent stays resident (idle) so its conversation can still
-				// be opened from the parent's inspector. The parent's run tracker holds
-				// its terminal status; the session is torn down with the parent via the
-				// closeChildSessions cascade. Only dispose an off-registry runtime.
+				// Keep a finished subagent resident so it stays viewable; it's torn down
+				// with the parent via the closeChildSessions cascade.
 				if (this.findRuntimeState(runtime)) {
 					return;
 				}
@@ -1673,11 +1671,7 @@ export class AgentDaemon {
 		}
 	}
 
-	/**
-	 * The parent emits rlm_child_update with the child's node id but not its daemon
-	 * active-session id (the AgentSession doesn't know it). Fill it in here so a client
-	 * can attach to the child session directly.
-	 */
+	// The AgentSession doesn't know its own daemon active-session id, so fill it in here.
 	private stampRlmChildActiveSessionId(message: DaemonOutbound): void {
 		if (
 			message.type !== "session_event" ||

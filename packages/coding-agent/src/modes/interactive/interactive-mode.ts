@@ -568,8 +568,7 @@ export class InteractiveMode {
 	private childAgentDetailNodeId: string | undefined;
 	private childAgentPanelMode: "detail" | undefined;
 	private enteredSessionViaSubagentDetail = false;
-	// Live watcher on the open subagent's own session; the detail view renders from
-	// the child's real messages + event stream rather than a parent projection.
+	// Read-only watcher on the open subagent's own session.
 	private childAgentWatcher: AgentConnectionSessionWatcher | undefined;
 	private childAgentWatcherToken = 0;
 	private childAgentWatcherMessages: AgentMessage[] = [];
@@ -2589,7 +2588,10 @@ export class InteractiveMode {
 	}
 
 	private shouldShowWorkingLoader(): boolean {
-		return this.workingVisible && (this.isAgentStreaming() || this.countRunningChildAgents() > 0);
+		// Background subagents (agent turn done, asyncio tasks still running) would
+		// otherwise show a textless spinner; the subagent tree above the loader carries
+		// that state, so the loader only shows while the main agent is itself streaming.
+		return this.workingVisible && this.isAgentStreaming();
 	}
 
 	// Reconcile the loader with current state for transitions that fire no live
@@ -2751,8 +2753,7 @@ export class InteractiveMode {
 	private renderRecap(): void {
 		if (!this.recapContainer) return;
 		this.recapContainer.clear();
-		// The subagent detail panel shows the subagent's own recap; don't also show
-		// the parent's recap underneath it.
+		// The subagent panel shows its own recap; suppress the parent's while it's open.
 		const recap = this.childAgentPanelMode ? undefined : this.sessionRecap?.trim();
 		if (recap) {
 			this.recapContainer.addChild(new Text(theme.fg("dim", `Recap: ${recap}`), 1, 0));
@@ -4136,7 +4137,7 @@ export class InteractiveMode {
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
-				// Keep the loader up if async subagents outlive the parent turn.
+				// Drops the loader; background subagents are shown by the tree, not the loader.
 				this.syncWorkingLoader();
 				if (this.streamingComponent) {
 					if (this.streamingMessage) {

@@ -161,12 +161,6 @@ export { type ParsedSkillBlock, parseSkillBlock } from "./skill-blocks.js";
 
 export type RlmChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
 
-/**
- * Coarse, always-on activity descriptor for the subagent tree. Derived from the
- * child's own events so the tree can show "Writing" / "Executing rg" without the
- * parent mirroring the whole conversation — the inspector attaches to the child's
- * own session for the full stream.
- */
 export interface RlmChildAgentActivity {
 	kind: "waiting" | "writing" | "executing";
 	toolName?: string;
@@ -175,7 +169,6 @@ export interface RlmChildAgentActivity {
 export interface RlmChildAgentSnapshot {
 	id: string;
 	parentId?: string;
-	/** The child's own daemon active-session id, so a client can attach to it directly. */
 	activeSessionId?: string;
 	label: string;
 	status: RlmChildAgentStatus;
@@ -3874,7 +3867,7 @@ export class AgentSession {
 		return this._activeRlmChildRuns.get(childId)?.status;
 	}
 
-	/** Live session of an RLM child run, searching nested children (inline mode only). */
+	// Inline (non-daemon) mode only; daemon clients attach to the child session directly.
 	getRlmChildSession(childId: string): AgentSession | undefined {
 		const direct = this._activeRlmChildRuns.get(childId)?.session;
 		if (direct) {
@@ -3940,9 +3933,7 @@ export class AgentSession {
 			abort: noopRlmChildAbort,
 		};
 		this._activeRlmChildRuns.set(run.id, run);
-		// The parent relays only what it owns: status, run metadata, and a coarse
-		// activity descriptor for the always-on tree. The full conversation is read
-		// from the child's own session by whoever opens the inspector.
+		// Status-only relay; the conversation is read from the child's own session.
 		const emitChildUpdate = () => {
 			this._emit({
 				type: "rlm_child_update",
@@ -3992,7 +3983,6 @@ export class AgentSession {
 					}
 					switch (event.type) {
 						case "recap_update":
-							// The summarizer set the child's recap; refresh so the tree shows it.
 							emitChildUpdate();
 							break;
 						case "message_start":

@@ -3,10 +3,12 @@ import {
 	type Focusable,
 	getKeybindings,
 	type Keybinding,
+	Loader,
 	type TUI,
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
+import { AGENT_ACTIVITY_LABELS } from "../agent-activity.js";
 import { theme } from "../theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
 import { keyText } from "./keybinding-hints.js";
@@ -56,8 +58,7 @@ function isExpandableComponent(component: Component): component is ExpandableCom
 	return "setExpanded" in component && typeof (component as { setExpanded?: unknown }).setExpanded === "function";
 }
 
-// Active subagents (running/queued) sort above finished ones; order is otherwise
-// preserved, so completed agents settle to the bottom of each sibling group.
+// Active before finished, so completed agents settle to the bottom.
 function childAgentSortRank(status: ChildAgentStatus): number {
 	return status === "running" || status === "queued" ? 0 : 1;
 }
@@ -102,6 +103,9 @@ function hintLine(hints: ReadonlyArray<string | undefined>, width: number): stri
 
 // Matches the agents view delete confirmation window.
 const KILL_CONFIRM_DURATION_MS = 2000;
+
+// Left indent for the detail panel's own lines, aligned with the conversation body.
+const CONTENT_INDENT = 2;
 
 function isKillableChildAgentStatus(status: ChildAgentStatus): boolean {
 	return status === "running" || status === "queued";
@@ -558,14 +562,14 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 export class ChildAgentDetailComponent implements Component, Focusable {
 	focused = false;
 	private node: ChildAgentInspectorNode | undefined;
-	// Body is the watched child session's conversation, built and refreshed by the
-	// owner (interactive mode) from the child's own messages — not a parent projection.
+	// The child's conversation, built and set by the owner from the child's own messages.
 	private bodyComponents: Component[] = [];
 	private toolsExpanded = false;
 	private readonly fallbackTui = { requestRender: () => {} } as TUI;
 	private killConfirmExpiresAt = 0;
 	private killConfirmTimer: ReturnType<typeof setTimeout> | undefined;
 	private backHintLabel = "back to chat";
+	private statusLoader: Loader | undefined;
 
 	onCancel?: () => void;
 	onToggleToolsExpanded?: () => void;
@@ -581,6 +585,10 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 			this.clearKillConfirmation({ render: false });
 		}
 		this.node = node;
+		if (!node) {
+			this.statusLoader?.stop();
+			this.statusLoader = undefined;
+		}
 	}
 
 	setBodyComponents(components: Component[]): void {
@@ -625,19 +633,54 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 		if (!node) {
 			return [];
 		}
-		const lines: string[] = [""];
+		const lines: string[] = [];
 		if (node.status === "running" || node.status === "queued") {
-			const icon = workingIconFrame(getWorkingPulseFrame());
-			lines.push(
-				this.panelLine(`${theme.fg("accent", icon)} ${theme.fg("muted", `${nodeActivityLabel(node)}…`)}`, width),
-			);
+			// Reuse the main agent's loader so the spinner and labels are identical.
+			// The loader self-pads one space; add one more to align with the body.
+			const loader = this.ensureStatusLoader();
+			loader.setMessage(this.panelStatusLabel(node));
+			lines.push(...loader.render(width).map((line) => this.indent(line, width, 1)));
 		}
 		const recap = node.recap?.trim();
 		if (recap) {
-			lines.push(this.panelLine(this.truncate(theme.fg("dim", `Recap: ${recap}`), width), width));
+			lines.push("");
+			lines.push(this.indent(this.truncate(theme.fg("dim", `Recap: ${recap}`), width - CONTENT_INDENT), width));
 		}
 		lines.push("");
 		return lines;
+	}
+
+	private ensureStatusLoader(): Loader {
+		if (!this.statusLoader) {
+			this.statusLoader = new Loader(
+				this.options.ui ?? this.fallbackTui,
+				(spinner) => theme.fg("accent", spinner),
+				(text) => theme.fg("muted", text),
+				"",
+			);
+		}
+		return this.statusLoader;
+	}
+
+	private panelStatusLabel(node: ChildAgentInspectorNode): string {
+		if (node.status === "queued") {
+			return AGENT_ACTIVITY_LABELS.waiting;
+		}
+		switch (node.activity?.kind) {
+			case "executing":
+				return AGENT_ACTIVITY_LABELS.executing;
+			case "writing":
+				return AGENT_ACTIVITY_LABELS.writing;
+			default:
+				return AGENT_ACTIVITY_LABELS.waiting;
+		}
+	}
+
+	private indent(line: string, width: number, spaces = CONTENT_INDENT): string {
+		if (line === "") {
+			return line;
+		}
+		return this.truncate(`${" ".repeat(spaces)}${line}`, width);
 	}
 
 	handleInput(data: string): void {
@@ -719,17 +762,7 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 			};
 		}
 
-		const headerLines = [
-			this.panelLine(
-				this.headerLine(`${this.statusLabel(selected.status)} ${theme.fg("dim", selected.label)}`, width),
-				width,
-			),
-		];
-		const sessionDirParts = selected.sessionDir.split("/");
-		const leaf = sessionDirParts[sessionDirParts.length - 1];
-		if (leaf) {
-			headerLines.push(this.panelLine(this.truncate(theme.fg("dim", leaf), width), width));
-		}
+		const headerLines = [this.indent(this.truncate(theme.fg("text", selected.label), width - CONTENT_INDENT), width)];
 		headerLines.push(this.panelLine(theme.fg("borderMuted", "─".repeat(width)), width));
 
 		const bodyLines: string[] = [];
@@ -757,21 +790,6 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 			[keyAction("app.agents.back", this.backHintLabel, { primaryOnly: true }), expandAction, stopAction],
 			width,
 		);
-	}
-
-	private statusLabel(status: ChildAgentStatus): string {
-		switch (status) {
-			case "queued":
-				return theme.fg("muted", "queued");
-			case "running":
-				return theme.fg("accent", "running");
-			case "done":
-				return theme.fg("success", "done");
-			case "error":
-				return theme.fg("error", "error");
-			case "cancelled":
-				return theme.fg("warning", "cancelled");
-		}
 	}
 
 	private panelLine(line: string, width: number): string {
