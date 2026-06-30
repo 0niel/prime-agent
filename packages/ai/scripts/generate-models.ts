@@ -146,6 +146,7 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	"openai/gpt-5.5": { contextWindow: 1050000, maxTokens: 128000, vision: true },
 	"prime-intellect/intellect-3": { contextWindow: 131072, maxTokens: 131072 },
 	"qwen/qwen3-235b-a22b-thinking-2507": { contextWindow: 262144, maxTokens: 4096 },
+	"qwen/qwen3-30b-a3b-instruct-2507": { contextWindow: 262144, maxTokens: 65536 },
 	"qwen/qwen3-coder-next": { contextWindow: 262144, maxTokens: 65536 },
 	"qwen/qwen3-max": { contextWindow: 262144, maxTokens: 65536 },
 	"qwen/qwen3-vl-235b-a22b-thinking": { contextWindow: 262144, maxTokens: 32768, vision: true },
