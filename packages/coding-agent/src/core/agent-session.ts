@@ -3889,8 +3889,14 @@ export class AgentSession {
 		return this._activeRlmChildRuns.get(childId)?.status;
 	}
 
-	/** Retain a finished inline child session so the inspector can still read it; disposed with the parent. */
+	/** Retain a finished child session so the inspector can still read it; disposed with the parent. */
 	retainFinishedRlmChildSession(childId: string, session: AgentSession): void {
+		// A child can finish concurrently after the parent was torn down; don't resurrect
+		// the map (it would never be disposed), just dispose the child now.
+		if (this._disposed) {
+			void session.disposeAsync().catch(() => undefined);
+			return;
+		}
 		this._retainedRlmChildSessions.set(childId, session);
 	}
 

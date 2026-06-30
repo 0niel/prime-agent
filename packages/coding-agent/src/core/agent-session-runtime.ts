@@ -314,6 +314,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		// Keep a successful run's session readable via the parent's inspector (disposed
 		// with the parent); errored/cancelled runs have nothing to show, so dispose now.
 		if (status === "done") {
+			// Flush traces now since the runtime's own shutdown path is skipped while retained.
+			await flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
 			options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session);
 			return;
 		}

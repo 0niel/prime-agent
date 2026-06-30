@@ -15,6 +15,7 @@ import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionRuntime,
 } from "../../core/agent-session-runtime.js";
+import { flushAgentTraceUpload } from "../../core/agent-traces.js";
 import {
 	type AgentCronJob,
 	AgentCronJobStore,
@@ -700,8 +701,12 @@ export class AgentDaemon {
 				// the parent via the closeChildSessions cascade). Errored/cancelled runs have
 				// nothing useful to show and would otherwise re-seed as "done", so close them.
 				if (state && status === "done") {
-					// Also retain on the parent so hasRunningRlmChildren can see nested work
-					// under this finished child (dispose() is idempotent on the shared session).
+					// Run the finished child's shutdown side effects (heartbeats off, traces
+					// flushed) but keep the session resident and readable; it's fully torn
+					// down with the parent via the closeChildSessions cascade. Also retain on
+					// the parent so hasRunningRlmChildren can see nested work under it.
+					this.cancelSubagentRlmHeartbeats(state);
+					await flushAgentTraceUpload(state.runtime.session.sessionManager).catch(() => undefined);
 					options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session);
 					return;
 				}
