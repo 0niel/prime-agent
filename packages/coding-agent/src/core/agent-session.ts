@@ -527,6 +527,9 @@ export class AgentSession {
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
 	private _disposed = false;
+	// Set at the start of async teardown so a child finishing mid-disposeAsync doesn't
+	// re-populate the retained map after it's been cleared.
+	private _disposing = false;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
 	private _ipythonKernelSnapshotDir?: string;
@@ -1641,9 +1644,10 @@ export class AgentSession {
 	 * the latest state reaches disk instead of racing process exit.
 	 */
 	async disposeAsync(): Promise<void> {
-		if (this._disposed) {
+		if (this._disposed || this._disposing) {
 			return;
 		}
+		this._disposing = true;
 		// Flush retained children's kernels too; dispose() below only tears down sync.
 		for (const unsubscribe of this._retainedRlmChildUnsubscribes.values()) {
 			unsubscribe();
@@ -3904,9 +3908,9 @@ export class AgentSession {
 
 	/** Retain a finished child session so the inspector can still read it; disposed with the parent. */
 	retainFinishedRlmChildSession(childId: string, session: AgentSession): void {
-		// A child can finish concurrently after the parent was torn down; don't resurrect
-		// the map (it would never be disposed), just dispose the child now.
-		if (this._disposed) {
+		// A child can finish concurrently while the parent is (or has) torn down; don't
+		// resurrect the map (it would never be disposed), just dispose the child now.
+		if (this._disposed || this._disposing) {
 			void session.disposeAsync().catch(() => undefined);
 			return;
 		}
