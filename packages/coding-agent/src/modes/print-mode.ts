@@ -69,6 +69,7 @@ async function waitForPrintModeIdleWithAutonomousGates(
 	getSession: () => AgentSessionRuntime["session"],
 ): Promise<void> {
 	let lastPromptedProgressKey: string | undefined;
+	let repeatedProgressPrompts = 0;
 	while (true) {
 		const session = getSession();
 		await session.agent.waitForIdle();
@@ -78,9 +79,20 @@ async function waitForPrintModeIdleWithAutonomousGates(
 		}
 		const progressKey = printModeAutonomousProgressKey(status);
 		if (progressKey === lastPromptedProgressKey) {
-			return;
+			repeatedProgressPrompts++;
+		} else {
+			repeatedProgressPrompts = 0;
+			lastPromptedProgressKey = progressKey;
 		}
-		lastPromptedProgressKey = progressKey;
+		// Print mode is the host loop for autonomous verifier runs. A still-failing
+		// gate is not terminal while the configured autonomous budgets remain. Keep
+		// feeding the failure back even if the observable status key repeats; the
+		// normal autonomous limits above bound retries, turns, tokens, and wall time.
+		// The small yield prevents a tight loop if a test double or broken session
+		// returns immediately without advancing state.
+		if (repeatedProgressPrompts > 0) {
+			await new Promise((resolve) => setTimeout(resolve, Math.min(1000, repeatedProgressPrompts * 50)));
+		}
 		await session.prompt(
 			buildPrintModeGateContinuation(status.lastGateFailure, latestGateAttempt(status), status.gates.maxRetries),
 			{

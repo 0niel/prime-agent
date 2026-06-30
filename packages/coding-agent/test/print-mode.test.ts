@@ -157,7 +157,7 @@ describe("runPrintMode", () => {
 	it("returns non-zero when autonomous gates are still failing", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), {
 			enabled: true,
-			continuationsUsed: 34,
+			continuationsUsed: 999,
 			turnsUsed: 92,
 			tokensUsed: 215_535,
 			limits: { maxContinuations: 999, maxTurns: 1000, maxTokens: 2_000_000, timeoutMs: 1_800_000 },
@@ -297,8 +297,24 @@ describe("runPrintMode", () => {
 			},
 			{
 				enabled: true,
-				continuationsUsed: 2,
-				turnsUsed: 3,
+				continuationsUsed: 3,
+				turnsUsed: 4,
+				tokensUsed: 150,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 1 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 1,
+					exitText: "not rerun: workspace unchanged since previous failed gate",
+					output: "edit source files before attempting to finish again",
+				},
+			},
+			{
+				enabled: true,
+				continuationsUsed: 10,
+				turnsUsed: 5,
 				tokensUsed: 150,
 				startedAt: Date.now(),
 				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
@@ -322,8 +338,94 @@ describe("runPrintMode", () => {
 		});
 
 		expect(exitCode).toBe(1);
-		expect(session.agent.waitForIdle).toHaveBeenCalledTimes(3);
-		expect(session.prompt).toHaveBeenCalledTimes(2);
+		expect(session.agent.waitForIdle).toHaveBeenCalledTimes(4);
+		expect(session.prompt).toHaveBeenCalledTimes(3);
 		expect(session.prompt.mock.calls[1][0]).toContain("workspace unchanged");
+		expect(session.prompt.mock.calls[2][0]).toContain("workspace unchanged");
+	});
+
+	it("keeps prompting on repeated gate progress until autonomous limits stop the run", async () => {
+		const startedAt = Date.now();
+		const statuses: AgentAutonomousStatus[] = [
+			{
+				enabled: true,
+				continuationsUsed: 7,
+				turnsUsed: 8,
+				tokensUsed: 100,
+				startedAt,
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 20, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 7 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 7,
+					exitText: "not rerun: workspace unchanged since previous failed gate",
+					output: "edit source files before attempting to finish again",
+				},
+			},
+			{
+				enabled: true,
+				continuationsUsed: 8,
+				turnsUsed: 9,
+				tokensUsed: 100,
+				startedAt,
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 20, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 7 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 7,
+					exitText: "not rerun: workspace unchanged since previous failed gate",
+					output: "edit source files before attempting to finish again",
+				},
+			},
+			{
+				enabled: true,
+				continuationsUsed: 9,
+				turnsUsed: 10,
+				tokensUsed: 100,
+				startedAt,
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 20, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 7 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 7,
+					exitText: "not rerun: workspace unchanged since previous failed gate",
+					output: "edit source files before attempting to finish again",
+				},
+			},
+			{
+				enabled: true,
+				continuationsUsed: 10,
+				turnsUsed: 11,
+				tokensUsed: 100,
+				startedAt,
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 20, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 7 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 7,
+					exitText: "not rerun: workspace unchanged since previous failed gate",
+					output: "edit source files before attempting to finish again",
+				},
+			},
+		];
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), statuses[0]);
+		const { session } = runtimeHost;
+		let statusIndex = 0;
+		session.getAutonomousStatus.mockImplementation(
+			() => statuses[Math.min(statusIndex++, statuses.length - 1)] as AgentAutonomousStatus,
+		);
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(1);
+		expect(session.prompt).toHaveBeenCalledTimes(3);
+		expect(session.prompt.mock.calls[0][0]).toContain("workspace unchanged");
+		expect(session.prompt.mock.calls[2][0]).toContain("workspace unchanged");
 	});
 });
