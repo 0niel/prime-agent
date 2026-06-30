@@ -113,6 +113,7 @@ import type {
 	AgentConnectionSessionContext,
 	AgentConnectionSessionEvent,
 	AgentConnectionSessionTreeNode,
+	AgentConnectionSessionWatcher,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
 	AgentConnectionSourceInfo,
@@ -136,12 +137,11 @@ import { showFullPaneOverlay } from "./components/centered-overlay.js";
 import {
 	ChildAgentDetailComponent,
 	type ChildAgentInspectorNode,
-	type ChildAgentStructuredTranscriptEntry,
 	ChildAgentSummaryComponent,
-	type ChildAgentTranscriptLine,
 } from "./components/child-agent-inspector.js";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
 import { formatContextTree } from "./components/context-tree-format.js";
+import { buildConversationComponents } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { CustomMessageComponent } from "./components/custom-message.js";
@@ -271,6 +271,7 @@ export interface BrandSplashMetadataLine {
 export interface BrandSplashHeaderOptions {
 	logo?: string;
 	getExtraMetadata?: () => readonly BrandSplashMetadataLine[];
+	getHideStartHint?: () => boolean;
 }
 
 export class BrandSplashHeader implements Component {
@@ -307,14 +308,14 @@ export class BrandSplashHeader implements Component {
 			return theme.fg("dim", label.padEnd(this.labelWidth)) + theme.fg("muted", displayValue);
 		};
 		const extraMetadata = this.options.getExtraMetadata?.() ?? [];
+		const hideStartHint = this.options.getHideStartHint?.() ?? false;
 		const metaLines = showMeta
 			? [
 					labelled("version", `v${this.version}`),
 					labelled("model", this.getModelId() ?? "—"),
 					labelled("cwd", formatSplashCwd(this.getCwd())),
 					...extraMetadata.map((line) => labelled(line.label, line.value)),
-					"",
-					theme.fg("dim", "type to start"),
+					...(hideStartHint ? [] : ["", theme.fg("dim", "type to start")]),
 				]
 			: [];
 		const metaStart = Math.max(0, Math.floor((this.logoRaw.length - metaLines.length) / 2));
@@ -567,6 +568,11 @@ export class InteractiveMode {
 	private childAgentDetailNodeId: string | undefined;
 	private childAgentPanelMode: "detail" | undefined;
 	private enteredSessionViaSubagentDetail = false;
+	// Live watcher on the open subagent's own session; the detail view renders from
+	// the child's real messages + event stream rather than a parent projection.
+	private childAgentWatcher: AgentConnectionSessionWatcher | undefined;
+	private childAgentWatcherToken = 0;
+	private childAgentWatcherMessages: AgentMessage[] = [];
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -677,16 +683,6 @@ export class InteractiveMode {
 		this.queuedMessagesContainer = new Container();
 		this.childAgentDetail = new ChildAgentDetailComponent(() => this.getChildAgentPanelRows(), {
 			ui: this.ui,
-			getCwd: () => this.getCurrentCwd(),
-			getToolDefinition: (toolName) => this.getCachedToolDefinition(toolName),
-			getToolOptions: () => ({
-				showImages: this.settingsManager.getShowImages(),
-				imageWidthCells: this.settingsManager.getImageWidthCells(),
-			}),
-			getMarkdownTheme: () => this.getMarkdownThemeWithSettings(),
-			getToolsExpanded: () => this.toolOutputExpanded,
-			getHideThinkingBlock: () => this.hideThinkingBlock,
-			getHiddenThinkingLabel: () => this.hiddenThinkingLabel,
 		});
 		this.childAgentDetail.onCancel = () => {
 			if (this.options.returnToAgentsView && this.enteredSessionViaSubagentDetail) {
@@ -948,6 +944,7 @@ export class InteractiveMode {
 				() => this.getCurrentModelId(),
 				() => this.getCurrentCwd(),
 				verboseInstructions,
+				{ getHideStartHint: () => this.childAgentPanelMode !== undefined },
 			);
 			this.headerContainer.addChild(new Spacer(1));
 			this.headerContainer.addChild(this.builtInHeader);
@@ -2754,7 +2751,9 @@ export class InteractiveMode {
 	private renderRecap(): void {
 		if (!this.recapContainer) return;
 		this.recapContainer.clear();
-		const recap = this.sessionRecap?.trim();
+		// The subagent detail panel shows the subagent's own recap; don't also show
+		// the parent's recap underneath it.
+		const recap = this.childAgentPanelMode ? undefined : this.sessionRecap?.trim();
 		if (recap) {
 			this.recapContainer.addChild(new Text(theme.fg("dim", `Recap: ${recap}`), 1, 0));
 			// Blank line between the recap and the prompt bar below it.
@@ -4661,6 +4660,8 @@ export class InteractiveMode {
 		this.childAgentPanelMode = "detail";
 		this.childAgentDetailNodeId = nodeId;
 		this.childAgentDetail.setNode(node);
+		this.childAgentDetail.setBodyComponents([]);
+		this.renderRecap();
 		this.childAgentSummary.setHidden(true);
 		this.editorContainer.clear();
 		this.queuedMessagesContainer.clear();
@@ -4668,17 +4669,98 @@ export class InteractiveMode {
 		this.mainViewContainer.addChild(this.childAgentDetail);
 		this.ui.setFocus(this.childAgentDetail);
 		this.ui.requestRender();
+		void this.startChildAgentWatch(node);
 		return true;
 	}
 
+	private async startChildAgentWatch(node: ChildAgentInspectorNode): Promise<void> {
+		this.stopChildAgentWatch();
+		const token = ++this.childAgentWatcherToken;
+		const watcher = await this.agentConnection.watchSession(node.activeSessionId ?? node.id).catch(() => undefined);
+		// The panel may have closed (or another node opened) while attaching.
+		if (!watcher || token !== this.childAgentWatcherToken) {
+			await watcher?.close().catch(() => undefined);
+			return;
+		}
+		this.childAgentWatcher = watcher;
+		watcher.subscribe((event) => {
+			if (token !== this.childAgentWatcherToken) {
+				return;
+			}
+			if (event.type === "session_event") {
+				void this.refreshChildAgentWatch(token, watcher);
+			}
+		});
+		await this.refreshChildAgentWatch(token, watcher);
+	}
+
+	private async refreshChildAgentWatch(token: number, watcher: AgentConnectionSessionWatcher): Promise<void> {
+		const messages = await watcher.getMessages().catch(() => undefined);
+		if (!messages || token !== this.childAgentWatcherToken) {
+			return;
+		}
+		this.childAgentWatcherMessages = messages;
+		await this.rebuildChildAgentBody();
+	}
+
+	private async rebuildChildAgentBody(): Promise<void> {
+		const watcher = this.childAgentWatcher;
+		if (!watcher) {
+			return;
+		}
+		const toolNames = new Set<string>();
+		for (const message of this.childAgentWatcherMessages) {
+			if (message.role === "assistant") {
+				for (const content of message.content) {
+					if (content.type === "toolCall") {
+						toolNames.add(content.name);
+					}
+				}
+			}
+		}
+		const definitions = new Map<string, ToolExecutionDefinition | undefined>();
+		await Promise.all(
+			[...toolNames].map(async (name) => {
+				definitions.set(name, (await watcher.getToolDefinition(name).catch(() => undefined)) ?? undefined);
+			}),
+		);
+		this.childAgentDetail.setBodyComponents(
+			buildConversationComponents(this.childAgentWatcherMessages, {
+				ui: this.ui,
+				cwd: this.getCurrentCwd(),
+				toolOptions: {
+					showImages: this.settingsManager.getShowImages(),
+					imageWidthCells: this.settingsManager.getImageWidthCells(),
+				},
+				getToolDefinition: (name) => definitions.get(name),
+				markdownTheme: this.getMarkdownThemeWithSettings(),
+				hideThinkingBlock: this.hideThinkingBlock,
+				hiddenThinkingLabel: this.hiddenThinkingLabel,
+				toolsExpanded: this.toolOutputExpanded,
+			}),
+		);
+	}
+
+	private stopChildAgentWatch(): void {
+		this.childAgentWatcherToken++;
+		this.childAgentWatcherMessages = [];
+		const watcher = this.childAgentWatcher;
+		this.childAgentWatcher = undefined;
+		void watcher?.close().catch(() => undefined);
+	}
+
 	private closeChildAgentPanel(options: { selectNodeId?: string } = {}): void {
+		this.stopChildAgentWatch();
 		this.childAgentPanelMode = undefined;
 		this.childAgentDetailNodeId = undefined;
 		this.enteredSessionViaSubagentDetail = false;
 		this.childAgentDetail.setBackHintLabel("back to chat");
 		this.childAgentDetail.setNode(undefined);
+		this.childAgentDetail.setBodyComponents([]);
 		this.childAgentSummary.setHidden(false);
 		this.restoreMainAgentView();
+		// Restore the parent recap that was suppressed while the panel was open.
+		this.renderRecap();
 		// Re-render queued previews cleared on panel entry; the queue may still hold messages.
 		this.updatePendingMessagesDisplay();
 		this.editorContainer.clear();
@@ -4704,6 +4786,7 @@ export class InteractiveMode {
 
 		const build = (child: AgentConnectionRlmChildAgentSnapshot): ChildAgentInspectorNode => ({
 			id: child.id,
+			activeSessionId: child.activeSessionId,
 			label: child.label,
 			status: child.status,
 			durationMs: child.durationMs,
@@ -4712,15 +4795,7 @@ export class InteractiveMode {
 			tokenCount: child.tokenCount,
 			recap: child.recap,
 			sessionDir: child.sessionDir,
-			transcript: child.transcript.map(
-				(line): ChildAgentTranscriptLine => ({
-					role: line.role,
-					text: line.text,
-				}),
-			),
-			structuredTranscript: child.structuredTranscript?.map(
-				(entry): ChildAgentStructuredTranscriptEntry => ({ ...entry }),
-			),
+			activity: child.activity,
 			children: childrenByParent.get(child.id)?.map(build),
 		});
 

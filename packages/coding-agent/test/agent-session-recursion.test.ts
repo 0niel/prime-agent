@@ -255,8 +255,6 @@ describe("AgentSession rlm recursion", () => {
 			answerPreview?: string;
 			tokenCount?: number;
 			toolUseCount?: number;
-			transcript: readonly { role: string; text: string }[];
-			structuredTranscript?: readonly { type: string; role: string; text: string }[];
 		}> = [];
 		root.subscribe((event) => {
 			if (event.type === "rlm_child_update") {
@@ -281,14 +279,6 @@ describe("AgentSession rlm recursion", () => {
 		// Context tokens from the child's own assistant usage (input 7 + output 3); no tools ran.
 		expect(doneUpdate?.tokenCount).toBe(10);
 		expect(doneUpdate?.toolUseCount).toBeUndefined();
-		expect(doneUpdate?.transcript).toContainEqual({ role: "user", text: "summarize shard 1" });
-		expect(doneUpdate?.transcript).toContainEqual({ role: "assistant", text: "child answer: summarize shard 1" });
-		expect(doneUpdate?.structuredTranscript).toEqual(
-			expect.arrayContaining([
-				expect.objectContaining({ type: "message", role: "user", text: "summarize shard 1" }),
-				expect.objectContaining({ type: "message", role: "assistant", text: "child answer: summarize shard 1" }),
-			]),
-		);
 	});
 
 	it("surfaces a child's recap on its snapshot once the summarizer sets it", async () => {
@@ -336,7 +326,7 @@ describe("AgentSession rlm recursion", () => {
 		toolsManagerMock.ensureTool.mockResolvedValueOnce(undefined);
 		const streamFn = vi.fn((_model, context: Context) => streamAnswer(`child answer: ${userText(context)}`));
 		const root = createSession({ streamFn });
-		const childUpdates: Array<{ status: string; transcript: readonly { role: string; text: string }[] }> = [];
+		const childUpdates: Array<{ status: string }> = [];
 		root.subscribe((event) => {
 			if (event.type === "rlm_child_update") {
 				childUpdates.push(event.child);
@@ -348,7 +338,7 @@ describe("AgentSession rlm recursion", () => {
 		expect(toolsManagerMock.ensureTool).toHaveBeenCalledWith("rg", true);
 		expect(streamFn).not.toHaveBeenCalled();
 		const errorUpdate = [...childUpdates].reverse().find((update) => update.status === "error");
-		expect(errorUpdate?.transcript).toContainEqual({ role: "system", text: MISSING_RIPGREP_MESSAGE });
+		expect(errorUpdate).toBeDefined();
 	});
 
 	it("adds child usage to the parent session aggregate", async () => {

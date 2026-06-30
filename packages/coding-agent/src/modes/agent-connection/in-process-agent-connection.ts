@@ -39,6 +39,7 @@ import type {
 	AgentConnectionSessionContext,
 	AgentConnectionSessionListProgress,
 	AgentConnectionSessionTreeNode,
+	AgentConnectionSessionWatcher,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
 	AgentConnectionState,
@@ -366,6 +367,19 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async deleteSavedSession(sessionPath: string): Promise<DeleteSessionFileResult> {
 		return deleteSessionFile(sessionPath);
+	}
+
+	async watchSession(childId: string): Promise<AgentConnectionSessionWatcher | undefined> {
+		const child = this.session.getRlmChildSession(childId);
+		if (!child) {
+			return undefined;
+		}
+		return {
+			getMessages: async () => child.messages,
+			subscribe: (listener) => child.subscribe((event) => void listener({ type: "session_event", event })),
+			getToolDefinition: async (name) => createAgentConnectionToolDefinition(child.getToolDefinition(name)),
+			close: async () => {},
+		};
 	}
 
 	async dispose(): Promise<void> {

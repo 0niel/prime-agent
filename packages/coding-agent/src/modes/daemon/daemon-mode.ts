@@ -695,9 +695,11 @@ export class AgentDaemon {
 				}
 			},
 			releaseRlmSubagentRuntime: async (runtime) => {
-				const state = this.findRuntimeState(runtime);
-				if (state) {
-					await this.closeSession(state, "completed");
+				// A finished subagent stays resident (idle) so its conversation can still
+				// be opened from the parent's inspector. The parent's run tracker holds
+				// its terminal status; the session is torn down with the parent via the
+				// closeChildSessions cascade. Only dispose an off-registry runtime.
+				if (this.findRuntimeState(runtime)) {
 					return;
 				}
 				if (runtime instanceof AgentSessionRuntime) {
@@ -1661,12 +1663,35 @@ export class AgentDaemon {
 				void this.closeSession(state, "killed");
 			}
 		}
+		this.stampRlmChildActiveSessionId(message);
 		const sequencedMessage = this.addSessionEventMeta(state, message);
 		for (const client of state.clients) {
 			if (!shouldSendDaemonOutboundToClient(client, sequencedMessage)) {
 				continue;
 			}
 			this.write(client, sequencedMessage);
+		}
+	}
+
+	/**
+	 * The parent emits rlm_child_update with the child's node id but not its daemon
+	 * active-session id (the AgentSession doesn't know it). Fill it in here so a client
+	 * can attach to the child session directly.
+	 */
+	private stampRlmChildActiveSessionId(message: DaemonOutbound): void {
+		if (
+			message.type !== "session_event" ||
+			message.event.type !== "rlm_child_update" ||
+			message.event.child.activeSessionId
+		) {
+			return;
+		}
+		const childId = message.event.child.id;
+		for (const candidate of this.sessions.values()) {
+			if (candidate.runtime.metadata.rlmChildId === childId) {
+				message.event.child.activeSessionId = candidate.activeSessionId;
+				return;
+			}
 		}
 	}
 

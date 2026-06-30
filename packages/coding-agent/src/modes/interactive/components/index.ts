@@ -9,7 +9,6 @@ export {
 	type ChildAgentInspectorNode,
 	type ChildAgentStatus,
 	ChildAgentSummaryComponent,
-	type ChildAgentTranscriptLine,
 } from "./child-agent-inspector.js";
 export { CompactionSummaryMessageComponent } from "./compaction-summary-message.js";
 export { CustomEditor } from "./custom-editor.js";
@@ -37,13 +36,6 @@ export { SessionSelectorComponent } from "./session-selector.js";
 export { type SettingsCallbacks, type SettingsConfig, SettingsSelectorComponent } from "./settings-selector.js";
 export { ShowImagesSelectorComponent } from "./show-images-selector.js";
 export { SkillInvocationMessageComponent } from "./skill-invocation-message.js";
-export {
-	type SubAgentStatus,
-	type SubAgentTranscriptLine,
-	SubAgentTreeComponent,
-	type SubAgentTreeNode,
-	type SubAgentTreeOptions,
-} from "./sub-agent-tree.js";
 export { SubagentTreeView } from "./subagent-tree-view.js";
 export { ThemeSelectorComponent } from "./theme-selector.js";
 export { ThinkingSelectorComponent } from "./thinking-selector.js";

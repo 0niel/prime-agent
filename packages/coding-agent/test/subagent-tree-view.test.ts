@@ -11,7 +11,6 @@ function node(overrides: Partial<ChildAgentInspectorNode> & { id: string }): Chi
 		label: overrides.id,
 		status: "running",
 		sessionDir: `/tmp/${overrides.id}`,
-		transcript: [],
 		...overrides,
 	};
 }
@@ -125,48 +124,24 @@ describe("SubagentTreeView", () => {
 
 	test("falls back to a live activity label until the recap lands", () => {
 		const view = new SubagentTreeView();
-		// No transcript yet -> Waiting.
+		// No activity yet -> Waiting.
 		view.setNodes([node({ id: "x", label: "scout" })]);
 		// header + blank + 2 node lines = 4
 		expect(view.render(100)).toHaveLength(4);
 		expect(renderText(view)).toContain("Waiting");
 
 		// A tool still running -> Executing <tool>.
-		view.setNodes([
-			node({
-				id: "x",
-				label: "scout",
-				structuredTranscript: [
-					{
-						type: "tool",
-						role: "tool",
-						text: "",
-						toolCallId: "1",
-						toolName: "Bash",
-						args: {},
-						isPartial: true,
-						executionStarted: true,
-						argsComplete: true,
-					},
-				],
-			}),
-		]);
+		view.setNodes([node({ id: "x", label: "scout", activity: { kind: "executing", toolName: "Bash" } })]);
 		expect(renderText(view)).toContain("Executing Bash");
 
 		// Assistant text streaming -> Writing.
-		view.setNodes([
-			node({
-				id: "x",
-				label: "scout",
-				structuredTranscript: [
-					{ type: "message", role: "assistant", text: "thinking out loud", message: {} as never },
-				],
-			}),
-		]);
+		view.setNodes([node({ id: "x", label: "scout", activity: { kind: "writing" } })]);
 		expect(renderText(view)).toContain("Writing");
 
-		// Queued -> Waiting regardless of transcript.
-		view.setNodes([node({ id: "x", label: "scout", status: "queued" })]);
+		// Queued -> Waiting regardless of activity.
+		view.setNodes([
+			node({ id: "x", label: "scout", status: "queued", activity: { kind: "executing", toolName: "Bash" } }),
+		]);
 		expect(renderText(view)).toContain("Waiting");
 	});
 
@@ -177,19 +152,7 @@ describe("SubagentTreeView", () => {
 				id: "x",
 				label: "scout",
 				recap: "Searching for 6 patterns",
-				structuredTranscript: [
-					{
-						type: "tool",
-						role: "tool",
-						text: "",
-						toolCallId: "1",
-						toolName: "Bash",
-						args: {},
-						isPartial: true,
-						executionStarted: true,
-						argsComplete: true,
-					},
-				],
+				activity: { kind: "executing", toolName: "Bash" },
 			}),
 		]);
 		const text = renderText(view);
@@ -204,12 +167,6 @@ describe("SubagentTreeView", () => {
 		// summary line carries one of the working icon glyphs.
 		const summaryLine = stripAnsi(view.render(100)[2] ?? "");
 		expect(summaryLine).toMatch(/[◇◈◆]/);
-	});
-
-	test("never leaks the transcript onto the recap line", () => {
-		const view = new SubagentTreeView();
-		view.setNodes([node({ id: "x", label: "scout", transcript: [{ role: "tool", text: "Bash: rm -rf secret" }] })]);
-		expect(renderText(view)).not.toContain("Bash: rm -rf secret");
 	});
 
 	test("caps the label to a few words", () => {
