@@ -16,7 +16,10 @@ describe("Prime Inference models", () => {
 	it("registers the Prime Inference catalog", () => {
 		const modelIds = getModels("prime-inference").map((model) => model.id);
 
-		expect(modelIds.length).toBe(28);
+		// Lower bound, not an exact count — the catalog grows with each release and an
+		// exact number breaks on every routine addition. The membership checks below
+		// are the meaningful assertions.
+		expect(modelIds.length).toBeGreaterThanOrEqual(28);
 		expect(modelIds).toEqual(
 			expect.arrayContaining([
 				"anthropic/claude-opus-4.7",
