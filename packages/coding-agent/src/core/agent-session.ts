@@ -3508,6 +3508,11 @@ export class AgentSession {
 			// kernel so the session never holds two live kernels. Gate the new kernel's
 			// startup on the old one's dispose (which flushes a final snapshot), so a
 			// reload can't restore from a snapshot the old kernel is still writing.
+			// Child runs bound to the old kernel can never complete once it's gone, so
+			// cancel them first — otherwise they hang as "running" forever.
+			if (this._ipythonKernelProvisioner) {
+				this._cancelActiveRlmChildRuns("Parent kernel was reloaded");
+			}
 			const previousDispose = this._ipythonKernelProvisioner?.dispose();
 			this._ipythonKernelSnapshotDir = this.sessionManager.getSessionArtifactDir();
 			// Only surface the "revived from your previous session" notice on the first
