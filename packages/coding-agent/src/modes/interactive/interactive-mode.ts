@@ -4692,16 +4692,16 @@ export class InteractiveMode {
 			return;
 		}
 		if (!watcher) {
-			// Couldn't reach the session. A still-running child may just not have
-			// registered yet — keep the key so maybeRetryChildAgentWatch retries when
-			// activeSessionId arrives. A finished child won't register, so its
-			// conversation is genuinely gone; say so instead of leaving a blank pane.
-			const stillRunning = node.status === "running" || node.status === "queued";
-			if (stillRunning) {
+			// A still-running child may not have registered yet; keep the key so
+			// maybeRetryChildAgentWatch retries once activeSessionId arrives.
+			if (node.status === "running" || node.status === "queued") {
 				this.childAgentWatchedKey = undefined;
-			} else {
-				this.childAgentDetail.setBodyComponents([new Text(theme.fg("muted", "  conversation unavailable"), 1, 0)]);
+				return;
 			}
+			const fallback = node.error?.trim()
+				? theme.fg("error", `  ${node.error.trim()}`)
+				: theme.fg("muted", "  conversation unavailable");
+			this.childAgentDetail.setBodyComponents([new Text(fallback, 1, 0)]);
 			return;
 		}
 		this.childAgentWatcher = watcher;
@@ -4838,6 +4838,7 @@ export class InteractiveMode {
 			recap: child.recap,
 			sessionDir: child.sessionDir,
 			activity: child.activity,
+			error: child.error,
 			children: childrenByParent.get(child.id)?.map(build),
 		});
 

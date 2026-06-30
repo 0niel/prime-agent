@@ -183,6 +183,8 @@ export interface RlmChildAgentSnapshot {
 	recap?: string;
 	sessionDir: string;
 	activity?: RlmChildAgentActivity;
+	/** Failure reason when status is "error". */
+	error?: string;
 }
 
 /** Session-specific events that extend the core AgentEvent */
@@ -1638,6 +1640,11 @@ export class AgentSession {
 		if (this._disposed) {
 			return;
 		}
+		// Flush retained children's kernels too; dispose() below only tears down sync.
+		for (const session of this._retainedRlmChildSessions.values()) {
+			await session.disposeAsync().catch(() => undefined);
+		}
+		this._retainedRlmChildSessions.clear();
 		try {
 			await this._ipythonKernelProvisioner?.dispose();
 		} catch {
@@ -3897,6 +3904,12 @@ export class AgentSession {
 				return true;
 			}
 		}
+		// A finished direct child can still have a running nested subagent.
+		for (const session of this._retainedRlmChildSessions.values()) {
+			if (session.hasRunningRlmChildren()) {
+				return true;
+			}
+		}
 		return false;
 	}
 
@@ -3989,6 +4002,7 @@ export class AgentSession {
 					recap: run.session?.getCurrentRecap(),
 					sessionDir: childSessionDir,
 					activity,
+					error: run.error,
 				},
 			});
 		};

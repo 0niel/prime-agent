@@ -33,6 +33,7 @@ export interface ChildAgentInspectorNode {
 	recap?: string;
 	sessionDir: string;
 	activity?: ChildAgentActivity;
+	error?: string;
 	children?: readonly ChildAgentInspectorNode[];
 }
 

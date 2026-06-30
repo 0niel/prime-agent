@@ -438,6 +438,8 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 	recap?: string;
 	sessionDir: string;
 	activity?: AgentConnectionRlmChildAgentActivity;
+	/** Failure reason when status is "error". */
+	error?: string;
 }
 
 export type AgentConnectionSessionEvent =
