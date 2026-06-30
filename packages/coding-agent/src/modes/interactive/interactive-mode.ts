@@ -4692,10 +4692,9 @@ export class InteractiveMode {
 			return;
 		}
 		if (!watcher) {
-			// A still-running child may not have registered yet; keep the key so
-			// maybeRetryChildAgentWatch retries once activeSessionId arrives.
+			// A still-running child may not have registered yet; the watched key is kept
+			// so maybeRetryChildAgentWatch retries only once a better key (activeSessionId) arrives.
 			if (node.status === "running" || node.status === "queued") {
-				this.childAgentWatchedKey = undefined;
 				return;
 			}
 			const fallback = node.error?.trim()
@@ -4716,14 +4715,15 @@ export class InteractiveMode {
 		await this.refreshChildAgentWatch(token, watcher);
 	}
 
-	// A queued/just-started subagent's first snapshot may lack activeSessionId; once it
-	// arrives (or changes), (re)attach so the body isn't stuck empty for the run.
+	// A queued/just-started subagent's first snapshot may lack activeSessionId; once a
+	// better key arrives, (re)attach. Gating purely on key change avoids re-attaching
+	// (and cancelling the in-flight attach) on every update.
 	private maybeRetryChildAgentWatch(node: ChildAgentInspectorNode | undefined): void {
 		if (!node || this.childAgentPanelMode !== "detail") {
 			return;
 		}
 		const key = node.activeSessionId ?? node.id;
-		if (key !== this.childAgentWatchedKey || (!this.childAgentWatcher && node.activeSessionId)) {
+		if (key !== this.childAgentWatchedKey) {
 			void this.startChildAgentWatch(node);
 		}
 	}
@@ -5483,6 +5483,11 @@ export class InteractiveMode {
 				this.streamingComponent.setHideThinkingBlock(this.hideThinkingBlock);
 				this.streamingComponent.updateContent(this.streamingMessage);
 				this.chatContainer.addChild(this.streamingComponent);
+			}
+
+			// The open subagent body bakes in thinking visibility at build time.
+			if (this.childAgentWatcher) {
+				await this.rebuildChildAgentBody(this.childAgentWatcherToken);
 			}
 
 			this.showStatus(`Thinking blocks: ${this.hideThinkingBlock ? "hidden" : "visible"}`);
