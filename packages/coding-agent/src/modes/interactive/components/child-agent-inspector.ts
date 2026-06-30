@@ -585,7 +585,9 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 			this.clearKillConfirmation({ render: false });
 		}
 		this.node = node;
-		if (!node) {
+		// Stop the spinner's interval once the subagent is no longer running, not just
+		// when the panel closes, so it doesn't keep requesting redraws after completion.
+		if (!node || (node.status !== "running" && node.status !== "queued")) {
 			this.statusLoader?.stop();
 			this.statusLoader = undefined;
 		}
