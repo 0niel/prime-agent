@@ -1659,7 +1659,13 @@ export class AgentSession {
 	}
 
 	private async _disposeAsyncOnce(): Promise<void> {
-		// Flush retained children's kernels too; dispose() below only tears down sync.
+		// Flush kernels/traces for both still-running and retained children; the sync
+		// dispose() below only tears them down synchronously.
+		for (const run of this._activeRlmChildRuns.values()) {
+			if (run.session) {
+				await run.session.disposeAsync().catch(() => undefined);
+			}
+		}
 		for (const unsubscribe of this._retainedRlmChildUnsubscribes.values()) {
 			unsubscribe();
 		}
