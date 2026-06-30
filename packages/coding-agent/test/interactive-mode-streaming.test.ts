@@ -166,4 +166,28 @@ describe("InteractiveMode streaming events", () => {
 
 		await expect(getUserInput.call({ returnToAgentsViewRequested: true })).resolves.toBeUndefined();
 	});
+
+	test("sweeps a stuck running subagent to done on turn end", () => {
+		const reconcile = (InteractiveMode.prototype as unknown as { reconcileChildAgentsOnTurnEnd(): void })
+			.reconcileChildAgentsOnTurnEnd;
+		const snapshots = new Map<string, { id: string; status: string; sessionDir: string; label: string }>([
+			["a", { id: "a", status: "running", sessionDir: "/tmp/a", label: "a" }],
+			["b", { id: "b", status: "done", sessionDir: "/tmp/b", label: "b" }],
+		]);
+		const fakeThis = {
+			childAgentSnapshots: snapshots,
+			childAgentDetailNodeId: undefined,
+			childAgentNodes: [],
+			buildChildAgentInspectorNodes: () => [],
+			childAgentSummary: { setNodes: vi.fn() },
+			subagentTree: { setNodes: vi.fn() },
+			updateWorkingPulse: vi.fn(),
+			syncWorkingLoader: vi.fn(),
+			ui: { requestRender: vi.fn() },
+		};
+		reconcile.call(fakeThis as never);
+
+		expect(snapshots.get("a")?.status).toBe("done");
+		expect(snapshots.get("b")?.status).toBe("done");
+	});
 });

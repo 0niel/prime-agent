@@ -4141,6 +4141,8 @@ export class InteractiveMode {
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
 				}
+				// Turn-scoped children are all done by now; clear any stuck "running".
+				this.reconcileChildAgentsOnTurnEnd();
 				// Drops the loader; background subagents are shown by the tree, not the loader.
 				this.syncWorkingLoader();
 				if (this.streamingComponent) {
@@ -4493,6 +4495,35 @@ export class InteractiveMode {
 				this.removeChildAgentSnapshot(child.id);
 			}
 		}
+	}
+
+	// RLM children are awaited within the parent's turn, so by agent_end none can still
+	// be running. Sweep any left at running/queued to done — guards against a terminal
+	// rlm_child_update being dropped/raced (more likely with many concurrent children),
+	// which would otherwise leave a subagent stuck "running" forever.
+	private reconcileChildAgentsOnTurnEnd(): void {
+		if (!this.childAgentSnapshots?.size) {
+			return;
+		}
+		let changed = false;
+		for (const [id, child] of this.childAgentSnapshots) {
+			if (child.status === "running" || child.status === "queued") {
+				this.childAgentSnapshots.set(id, { ...child, status: "done", activity: undefined });
+				changed = true;
+			}
+		}
+		if (!changed) {
+			return;
+		}
+		this.childAgentNodes = this.buildChildAgentInspectorNodes();
+		this.childAgentSummary.setNodes(this.childAgentNodes);
+		this.subagentTree.setNodes(this.childAgentNodes);
+		this.updateWorkingPulse();
+		this.syncWorkingLoader();
+		if (this.childAgentDetailNodeId) {
+			this.childAgentDetail.setNode(this.findChildAgentInspectorNode(this.childAgentDetailNodeId));
+		}
+		this.ui.requestRender();
 	}
 
 	private restoreMainAgentView(): void {
