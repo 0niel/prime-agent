@@ -563,7 +563,6 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 export class ChildAgentDetailComponent implements Component, Focusable {
 	focused = false;
 	private node: ChildAgentInspectorNode | undefined;
-	// The child's conversation, built and set by the owner from the child's own messages.
 	private bodyComponents: Component[] = [];
 	private toolsExpanded = false;
 	private readonly fallbackTui = { requestRender: () => {} } as TUI;

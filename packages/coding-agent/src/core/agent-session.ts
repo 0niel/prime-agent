@@ -3836,10 +3836,13 @@ export class AgentSession {
 		}
 
 		// Inline: keep a successful run readable (disposed with the parent); errored or
-		// cancelled runs have nothing useful to show, so dispose them now.
+		// cancelled runs have nothing useful to show, so dispose them now. retainFinished…
+		// disposes the child itself when it declines, so only dispose here otherwise.
 		if (status === "done") {
 			await flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
-			options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session);
+			if (!options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
+				runtime.session.dispose();
+			}
 		} else {
 			runtime.session.dispose();
 		}
@@ -4165,9 +4168,8 @@ export class AgentSession {
 				if (childRuntime) {
 					await this._releaseRlmSubagentRuntime(childRuntime, subagentOptions, releaseStatus);
 				}
-				// Keep the forwarder only if the child was actually retained (so nested
-				// updates reach root); otherwise drop it. retainFinishedRlmChildSession owns
-				// the retained map and may decline (parent disposing), so check the outcome.
+				// Keep the forwarder only if the child was actually retained (retention can
+				// decline when the parent is disposing); otherwise drop it.
 				if (unsubscribeChild) {
 					if (this._retainedRlmChildSessions.has(run.id)) {
 						this._retainedRlmChildUnsubscribes.set(run.id, unsubscribeChild);

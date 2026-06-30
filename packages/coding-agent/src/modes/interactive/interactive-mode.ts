@@ -568,7 +568,6 @@ export class InteractiveMode {
 	private childAgentDetailNodeId: string | undefined;
 	private childAgentPanelMode: "detail" | undefined;
 	private enteredSessionViaSubagentDetail = false;
-	// Read-only watcher on the open subagent's own session.
 	private childAgentWatcher: AgentConnectionSessionWatcher | undefined;
 	private childAgentWatcherToken = 0;
 	private childAgentWatcherMessages: AgentMessage[] = [];

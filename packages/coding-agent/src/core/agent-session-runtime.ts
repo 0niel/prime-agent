@@ -316,8 +316,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		if (status === "done") {
 			// Flush traces now since the runtime's own shutdown path is skipped while retained.
 			await flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
-			options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session);
-			return;
+			// Retention can decline if the parent is already tearing down; if so, fall
+			// through and dispose the runtime instead of leaving it dangling.
+			if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
+				return;
+			}
 		}
 		if (runtime instanceof AgentSessionRuntime) {
 			await runtime.dispose();
