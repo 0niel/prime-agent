@@ -14,7 +14,6 @@ import { getWorkingPulseFrame, WORKING_ICON_FRAMES, workingIconFrame } from "../
 import { normalizeErrorDetails, summarizeErrorDetails } from "./collapsible-error.js";
 import { renderDiffSeparator, renderRichDiff } from "./diff.js";
 import { keyHint } from "./keybinding-hints.js";
-import { toolPanelContentWidth, toolPanelLine } from "./tool-panel.js";
 
 export interface IPythonCellContentBlock {
 	type: string;
@@ -67,13 +66,11 @@ interface TracebackParts {
 	preview: string;
 }
 
-type ExpandHintFormatter = (label: string) => string;
-
 const MAGIC_LINE_PATTERN = /^\s*!/;
 const CELL_MAGIC_PATTERN = /^\s*%%bash\b/;
 
-const OUTPUT_PREVIEW_LINES = 5;
-const INPUT_PREVIEW_LINES = 3;
+// Two columns, matching the code body's "› "/"  " gutter so output aligns under it.
+const OUTPUT_INDENT = "  ";
 
 const SGR_PATTERN = /\x1b\[([0-9;]*)m/g;
 
@@ -210,10 +207,6 @@ function formatDuration(durationMs: number | undefined): string | undefined {
 	return `${(durationMs / 1000).toFixed(1)}s`;
 }
 
-function hiddenLinesLabel(hidden: number): string {
-	return `… +${hidden} line${hidden === 1 ? "" : "s"}`;
-}
-
 // Relative to the session cwd when nested under it, else the absolute path.
 function displayEditPath(path: string, cwd: string | undefined): string {
 	if (cwd && isAbsolute(path)) {
@@ -306,34 +299,24 @@ export class IPythonCellComponent implements Component {
 			return cached;
 		}
 
-		// Collapsed default: one line, indented to match message text. Cached by
-		// state version so it never re-renders on unrelated repaints (would flicker).
-		// Edits are the exception: the diff always shows in full under the summary
-		// line so file changes are visible without expanding.
-		if (!this.state.expanded) {
-			const summary = truncateToWidth(` ${this.collapsedLine(details)}`, safeWidth, "");
-			if ((details.diffs?.length ?? 0) === 0) {
-				return this.renderCache.set(safeWidth, cacheVersion, [summary]);
-			}
-			const lines = [summary];
+		// The top line is identical whether collapsed or expanded — same marker,
+		// counts, duration, and expand hint — so toggling never shifts the layout
+		// or indentation; expanding only attaches code and output below it.
+		// Cached by state version so unrelated repaints don't re-render (flicker).
+		const lines = [truncateToWidth(` ${this.collapsedLine(details)}`, safeWidth, "")];
+
+		const hasDiffs = (details.diffs?.length ?? 0) > 0;
+		// Edits always show their diff under the top line, regardless of expand state.
+		if (hasDiffs) {
 			this.renderDiffs(lines, safeWidth, details.diffs ?? [], this.marker(details));
+		}
+
+		if (!this.state.expanded) {
 			return this.renderCache.set(safeWidth, cacheVersion, lines);
 		}
 
-		const lines: string[] = [];
-		let expandHintShown = false;
-		const withExpandHint: ExpandHintFormatter = (label) => {
-			if (expandHintShown) {
-				return theme.fg("muted", label);
-			}
-			expandHintShown = true;
-			return `${theme.fg("muted", label)} ${theme.fg("dim", "·")} ${keyHint("app.tools.expand", "to expand")}`;
-		};
-
-		const hasDiffs = (details.diffs?.length ?? 0) > 0;
-		lines.push(toolPanelLine(this.header(details), safeWidth));
-		const hasCode = this.renderCode(lines, safeWidth, withExpandHint, hasDiffs);
-		this.renderOutput(lines, safeWidth, details, hasCode, withExpandHint);
+		const hasCode = this.renderCode(lines, safeWidth, hasDiffs);
+		this.renderOutput(lines, safeWidth, details, hasCode);
 		return this.renderCache.set(safeWidth, cacheVersion, lines);
 	}
 
@@ -365,7 +348,7 @@ export class IPythonCellComponent implements Component {
 			parts.push(theme.fg("error", errorName));
 		}
 
-		parts.push(keyHint("app.tools.expand", "to expand"));
+		parts.push(keyHint("app.tools.expand", this.state.expanded ? "to collapse" : "to expand"));
 		return parts.join(theme.fg("dim", " · "));
 	}
 
@@ -410,19 +393,6 @@ export class IPythonCellComponent implements Component {
 		return segments.length > 0 ? `${segments.join(" ")} lines` : undefined;
 	}
 
-	private header(details: IpythonDetails): string {
-		// Name the cell so the status reads as part of this tool call instead of
-		// a floating label between the surrounding blocks.
-		const isBashCell = CELL_MAGIC_PATTERN.test(this.state.code.split("\n")[0] ?? "");
-		const status = this.status(details);
-		const duration = formatDuration(details.durationMs);
-		const parts = [theme.fg("muted", isBashCell ? "bash" : "python"), status.label];
-		if (duration) {
-			parts.push(theme.fg("muted", duration));
-		}
-		return parts.join(theme.fg("dim", " · "));
-	}
-
 	private statusKind(details: IpythonDetails): "error" | "aborted" | "running" | "queued" | "done" {
 		const status = details.status;
 		if (this.state.isError || status === "error") {
@@ -453,53 +423,26 @@ export class IPythonCellComponent implements Component {
 		);
 	}
 
-	private status(details: IpythonDetails): { label: string } {
-		switch (this.statusKind(details)) {
-			case "error":
-				return { label: theme.fg("error", "error") };
-			case "aborted":
-				return { label: theme.fg("warning", "aborted") };
-			case "running":
-				return { label: theme.fg("bashMode", "running") };
-			case "queued":
-				return { label: theme.fg("muted", "queued") };
-			default:
-				return { label: theme.fg("success", "done") };
+	// Only runs when expanded — shows the full source below the fixed top line.
+	// Edits skip the source: their diff already renders above and conveys the change.
+	private renderCode(lines: string[], width: number, hasDiffs: boolean): boolean {
+		if (hasDiffs) {
+			return false;
 		}
-	}
-
-	private renderCode(lines: string[], width: number, withExpandHint: ExpandHintFormatter, hasDiffs: boolean): boolean {
 		const code = this.state.code.trimEnd();
 		if (!code) {
 			this.addBlank(lines, width);
-			this.addWrapped(lines, "", theme.fg("muted", "waiting for code"), width);
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "waiting for code"), width);
 			return false;
 		}
 
 		this.addBlank(lines, width);
 		const isBashCell = CELL_MAGIC_PATTERN.test(code.split("\n")[0] ?? "");
 		const rawLines = code.split("\n");
-		const expanded = this.state.expanded ?? false;
-
-		// With a diff to show below, collapse the (often large) edit source to one bar.
-		if (hasDiffs && !expanded) {
-			const label = `${rawLines.length} line${rawLines.length === 1 ? "" : "s"} of source`;
-			this.addWrapped(lines, theme.fg("dim", "› "), withExpandHint(label), width);
-			return true;
-		}
-
-		const showCollapsed = !expanded && rawLines.length > INPUT_PREVIEW_LINES;
-		const visibleRawLines = showCollapsed ? rawLines.slice(0, INPUT_PREVIEW_LINES) : rawLines;
-		for (const [index, rawLine] of visibleRawLines.entries()) {
+		for (const [index, rawLine] of rawLines.entries()) {
 			const prefix = index === 0 ? theme.fg("dim", "› ") : theme.fg("dim", "  ");
 			const highlighted = this.highlightInputLine(rawLine, isBashCell);
 			this.addWrapped(lines, prefix, highlighted || " ", width);
-		}
-
-		if (showCollapsed) {
-			const hidden = rawLines.length - INPUT_PREVIEW_LINES;
-			this.addWrapped(lines, "", withExpandHint(hiddenLinesLabel(hidden)), width);
-			return true;
 		}
 
 		return true;
@@ -513,13 +456,8 @@ export class IPythonCellComponent implements Component {
 		return highlighted[0] ?? theme.fg("mdCodeBlock", line);
 	}
 
-	private renderOutput(
-		lines: string[],
-		width: number,
-		details: IpythonDetails,
-		hasCode: boolean,
-		withExpandHint: ExpandHintFormatter,
-	): void {
+	// Only runs when expanded — shows full output below the code, no previews.
+	private renderOutput(lines: string[], width: number, details: IpythonDetails, hasCode: boolean): void {
 		const blocks = this.state.content ?? [];
 		const text = textFromBlocks(blocks);
 		const imageCount = blocks.filter(isImageBlock).length;
@@ -547,83 +485,62 @@ export class IPythonCellComponent implements Component {
 			}
 		};
 
-		if (diffs.length > 0) {
-			// renderDiffs adds its own leading blank, so skip startOutput's to avoid
-			// a double gap; mark output started for the trailing text below.
-			outputStarted = true;
-			this.renderDiffs(lines, width, diffs, this.marker(details));
-			renderedTextOutput = true;
-		}
-
 		if (hasStructuredOutput) {
 			if (details.stdout?.trim() && !isEditConfirmation(details.stdout, diffs)) {
 				startOutput();
 				renderedTextOutput = true;
-				this.renderOutputText(lines, width, normalizeErrorDetails(details.stdout), "out", withExpandHint);
+				this.renderOutputText(lines, width, normalizeErrorDetails(details.stdout), "out");
 			}
 			if (details.stderr?.trim()) {
 				startOutput();
 				renderedTextOutput = true;
-				this.renderOutputText(lines, width, normalizeErrorDetails(details.stderr), "err", withExpandHint);
+				this.renderOutputText(lines, width, normalizeErrorDetails(details.stderr), "err");
 			}
 			if (details.result?.trim() && !isEditConfirmation(details.result, diffs)) {
 				startOutput();
 				renderedTextOutput = true;
-				this.renderOutputText(lines, width, normalizeErrorDetails(details.result), "out", withExpandHint);
+				this.renderOutputText(lines, width, normalizeErrorDetails(details.result), "out");
 			}
 		} else if (traceback) {
 			if (traceback.output) {
 				startOutput();
 				renderedTextOutput = true;
-				this.renderOutputText(lines, width, traceback.output, "out", withExpandHint);
+				this.renderOutputText(lines, width, traceback.output, "out");
 			}
 		} else if (text.trim()) {
 			startOutput();
 			renderedTextOutput = true;
-			this.renderOutputText(
-				lines,
-				width,
-				normalizeErrorDetails(text),
-				this.state.isError ? "err" : "out",
-				withExpandHint,
-			);
+			this.renderOutputText(lines, width, normalizeErrorDetails(text), this.state.isError ? "err" : "out");
 		}
 
 		if (!renderedTextOutput && this.state.isPartial) {
 			startOutput();
-			this.addWrapped(lines, "", theme.fg("muted", "waiting for output..."), width);
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "waiting for output..."), width);
 		} else if (!renderedTextOutput && this.state.executionStarted && !this.state.argsComplete) {
 			startOutput();
-			this.addWrapped(lines, "", theme.fg("muted", "waiting for output..."), width);
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "waiting for output..."), width);
 		} else if (
 			!renderedTextOutput &&
 			!traceback &&
 			!details.error &&
+			diffs.length === 0 &&
 			this.state.executionStarted &&
 			imageCount === 0
 		) {
 			startOutput();
-			this.addWrapped(lines, "", theme.fg("muted", "no output"), width);
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", "no output"), width);
 		}
 
 		if (details.error) {
 			startOutput();
-			if (this.state.expanded) {
-				this.renderTraceback(
-					lines,
-					width,
-					details.error.traceback.join("\n") || formatIpythonErrorSummary(details.error),
-				);
-			} else {
-				this.addWrapped(lines, "", withExpandHint(formatIpythonErrorSummary(details.error)), width);
-			}
+			this.renderTraceback(
+				lines,
+				width,
+				details.error.traceback.join("\n") || formatIpythonErrorSummary(details.error),
+			);
 		} else if (traceback) {
 			startOutput();
-			if (this.state.expanded) {
-				this.renderTraceback(lines, width, traceback.traceback);
-			} else {
-				this.addWrapped(lines, "", withExpandHint(traceback.preview), width);
-			}
+			this.renderTraceback(lines, width, traceback.traceback);
 		}
 
 		if (imageCount > 0) {
@@ -631,7 +548,7 @@ export class IPythonCellComponent implements Component {
 			const text = this.state.showImages
 				? `${imageCount} image${imageCount === 1 ? "" : "s"} rendered below`
 				: `${imageCount} image${imageCount === 1 ? "" : "s"} hidden`;
-			this.addWrapped(lines, "", theme.fg("muted", text), width);
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", text), width);
 		}
 	}
 
@@ -687,46 +604,32 @@ export class IPythonCellComponent implements Component {
 		}
 	}
 
-	private renderOutputText(
-		lines: string[],
-		width: number,
-		text: string,
-		label: "out" | "err",
-		withExpandHint: ExpandHintFormatter,
-	): void {
+	private renderOutputText(lines: string[], width: number, text: string, label: "out" | "err"): void {
 		const color = label === "err" ? "muted" : "toolOutput";
-		const allLines = text.split("\n");
-		const expanded = this.state.expanded ?? false;
-		const showCollapsed = !expanded && allLines.length > OUTPUT_PREVIEW_LINES;
-		const visibleLines = showCollapsed ? allLines.slice(-OUTPUT_PREVIEW_LINES) : allLines;
-
-		if (showCollapsed) {
-			const hidden = allLines.length - OUTPUT_PREVIEW_LINES;
-			this.addWrapped(lines, "", withExpandHint(hiddenLinesLabel(hidden)), width);
-		}
-
-		for (const line of visibleLines) {
-			this.addWrapped(lines, "", theme.fg(color, line || " "), width);
+		for (const line of text.split("\n")) {
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg(color, line || " "), width);
 		}
 	}
 
 	private renderTraceback(lines: string[], width: number, traceback: string): void {
 		for (const line of traceback.split("\n")) {
-			this.addWrapped(lines, "", theme.fg("muted", line || " "), width);
+			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", line || " "), width);
 		}
 	}
 
+	// Backgroundless line, indented one space to align under the fixed top line.
 	private addWrapped(lines: string[], prefix: string, text: string, width: number): void {
-		const available = Math.max(1, toolPanelContentWidth(width) - visibleWidth(prefix));
+		const available = Math.max(1, width - 1 - visibleWidth(prefix));
 		const wrapped = wrapTextWithAnsi(text, available);
 		for (const [index, line] of (wrapped.length > 0 ? wrapped : [""]).entries()) {
 			const linePrefix = index === 0 ? prefix : " ".repeat(visibleWidth(prefix));
-			lines.push(toolPanelLine(linePrefix + closeOpenSgr(line), width));
+			// Truncate the composed line so a narrow pane can't exceed width (fatal in the renderer).
+			lines.push(truncateToWidth(` ${linePrefix}${closeOpenSgr(line)}`, width, ""));
 		}
 	}
 
-	private addBlank(lines: string[], width: number): void {
-		lines.push(toolPanelLine("", width));
+	private addBlank(lines: string[], _width: number): void {
+		lines.push("");
 	}
 
 	// No-background line, indented one space to align with the summary line above.

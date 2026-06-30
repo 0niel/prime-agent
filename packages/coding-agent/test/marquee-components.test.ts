@@ -613,23 +613,22 @@ describe("marquee TUI components", () => {
 
 		// Collapsed: routed through the cell renderer (a status line), not the
 		// generic JSON arg dump.
-		const collapsed = stripAnsi(component.render(100).join("\n"));
+		const collapsedLines = component.render(100);
+		const collapsed = stripAnsi(collapsedLines.join("\n"));
 		expect(collapsed).toContain("python");
 		expect(collapsed).toContain("12ms");
 		expect(collapsed).not.toContain("ipython");
 		expect(collapsed).not.toContain('"code"');
 
-		// Expanded: full panel with the code and output on the panel background.
+		// Expanded keeps the identical top line — no restructuring — and just
+		// attaches the code and output below it, backgroundless like the top line.
 		component.setExpanded(true);
-		const rawOutput = component.render(100).join("\n");
-		expect(rawOutput).toMatch(/\x1b\[48;(?:2|5);/);
-		const panelLine = component.render(100).find((line) => line.includes("\x1b[48;")) ?? "";
-		expect(panelLine.startsWith("\x1b[48;")).toBe(true);
-		expect(panelLine.endsWith("\x1b[49m")).toBe(true);
-		expect(visibleWidth(panelLine)).toBe(100);
-		const expanded = stripAnsi(rawOutput);
+		const expandedLines = component.render(100);
+		expect(stripAnsi(expandedLines[0])).toBe(stripAnsi(collapsedLines[0]));
+		const expanded = stripAnsi(expandedLines.join("\n"));
 		expect(expanded).toContain("print(55)");
 		expect(expanded).toContain("55");
 		expect(expanded).not.toContain('"code"');
+		expect(expandedLines.some((line) => /\x1b\[48;/.test(line))).toBe(false);
 	});
 });
