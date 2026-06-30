@@ -658,9 +658,13 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	async watchSession(activeSessionId: string): Promise<AgentConnectionSessionWatcher | undefined> {
 		// A second connection on the shared client; each one filters to its own session id.
-		const connection = await DaemonAgentConnection.attach(this.client, activeSessionId, {
-			closeClientOnDispose: false,
-		});
+		// attach() rejects for an unknown/exited session — treat that as unreachable.
+		let connection: DaemonAgentConnection;
+		try {
+			connection = await DaemonAgentConnection.attach(this.client, activeSessionId, { closeClientOnDispose: false });
+		} catch {
+			return undefined;
+		}
 		return {
 			getMessages: () => connection.getMessages(),
 			subscribe: (listener) => connection.subscribe(listener),

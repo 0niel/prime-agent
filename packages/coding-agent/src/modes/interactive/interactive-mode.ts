@@ -572,6 +572,9 @@ export class InteractiveMode {
 	private childAgentWatcher: AgentConnectionSessionWatcher | undefined;
 	private childAgentWatcherToken = 0;
 	private childAgentWatcherMessages: AgentMessage[] = [];
+	// The session key the current watcher attached with, so a later snapshot that
+	// gains the real activeSessionId can retry the attach.
+	private childAgentWatchedKey: string | undefined;
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -4477,6 +4480,7 @@ export class InteractiveMode {
 				return;
 			}
 			this.childAgentDetail.setNode(detailNode);
+			this.maybeRetryChildAgentWatch(detailNode);
 		}
 		this.ui.requestRender();
 	}
@@ -4676,11 +4680,26 @@ export class InteractiveMode {
 
 	private async startChildAgentWatch(node: ChildAgentInspectorNode): Promise<void> {
 		this.stopChildAgentWatch();
+		const key = node.activeSessionId ?? node.id;
 		const token = ++this.childAgentWatcherToken;
-		const watcher = await this.agentConnection.watchSession(node.activeSessionId ?? node.id).catch(() => undefined);
+		this.childAgentWatchedKey = key;
+		const watcher = await this.agentConnection.watchSession(key).catch(() => undefined);
 		// The panel may have closed (or another node opened) while attaching.
-		if (!watcher || token !== this.childAgentWatcherToken) {
+		if (token !== this.childAgentWatcherToken) {
 			await watcher?.close().catch(() => undefined);
+			return;
+		}
+		if (!watcher) {
+			// Couldn't reach the session. A still-running child may just not have
+			// registered yet — keep the key so maybeRetryChildAgentWatch retries when
+			// activeSessionId arrives. A finished child won't register, so its
+			// conversation is genuinely gone; say so instead of leaving a blank pane.
+			const stillRunning = node.status === "running" || node.status === "queued";
+			if (stillRunning) {
+				this.childAgentWatchedKey = undefined;
+			} else {
+				this.childAgentDetail.setBodyComponents([new Text(theme.fg("muted", "  conversation unavailable"), 1, 0)]);
+			}
 			return;
 		}
 		this.childAgentWatcher = watcher;
@@ -4695,22 +4714,35 @@ export class InteractiveMode {
 		await this.refreshChildAgentWatch(token, watcher);
 	}
 
+	// A queued/just-started subagent's first snapshot may lack activeSessionId; once it
+	// arrives (or changes), (re)attach so the body isn't stuck empty for the run.
+	private maybeRetryChildAgentWatch(node: ChildAgentInspectorNode | undefined): void {
+		if (!node || this.childAgentPanelMode !== "detail") {
+			return;
+		}
+		const key = node.activeSessionId ?? node.id;
+		if (key !== this.childAgentWatchedKey || (!this.childAgentWatcher && node.activeSessionId)) {
+			void this.startChildAgentWatch(node);
+		}
+	}
+
 	private async refreshChildAgentWatch(token: number, watcher: AgentConnectionSessionWatcher): Promise<void> {
 		const messages = await watcher.getMessages().catch(() => undefined);
 		if (!messages || token !== this.childAgentWatcherToken) {
 			return;
 		}
 		this.childAgentWatcherMessages = messages;
-		await this.rebuildChildAgentBody();
+		await this.rebuildChildAgentBody(token);
 	}
 
-	private async rebuildChildAgentBody(): Promise<void> {
+	private async rebuildChildAgentBody(token: number): Promise<void> {
 		const watcher = this.childAgentWatcher;
-		if (!watcher) {
+		if (!watcher || token !== this.childAgentWatcherToken) {
 			return;
 		}
+		const messages = this.childAgentWatcherMessages;
 		const toolNames = new Set<string>();
-		for (const message of this.childAgentWatcherMessages) {
+		for (const message of messages) {
 			if (message.role === "assistant") {
 				for (const content of message.content) {
 					if (content.type === "toolCall") {
@@ -4725,8 +4757,12 @@ export class InteractiveMode {
 				definitions.set(name, (await watcher.getToolDefinition(name).catch(() => undefined)) ?? undefined);
 			}),
 		);
+		// A newer refresh (or a close) may have superseded this build while awaiting defs.
+		if (token !== this.childAgentWatcherToken) {
+			return;
+		}
 		this.childAgentDetail.setBodyComponents(
-			buildConversationComponents(this.childAgentWatcherMessages, {
+			buildConversationComponents(messages, {
 				ui: this.ui,
 				cwd: this.getCurrentCwd(),
 				toolOptions: {
@@ -4745,6 +4781,7 @@ export class InteractiveMode {
 	private stopChildAgentWatch(): void {
 		this.childAgentWatcherToken++;
 		this.childAgentWatcherMessages = [];
+		this.childAgentWatchedKey = undefined;
 		const watcher = this.childAgentWatcher;
 		this.childAgentWatcher = undefined;
 		void watcher?.close().catch(() => undefined);
