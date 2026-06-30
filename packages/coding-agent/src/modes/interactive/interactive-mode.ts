@@ -4708,7 +4708,8 @@ export class InteractiveMode {
 			if (token !== this.childAgentWatcherToken) {
 				return;
 			}
-			if (event.type === "session_event") {
+			// session_replaced carries a fresh messages array; both need a rebuild.
+			if (event.type === "session_event" || event.type === "session_replaced") {
 				void this.refreshChildAgentWatch(token, watcher);
 			}
 		});
