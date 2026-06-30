@@ -32,6 +32,7 @@ This workspace still keeps an inherited source package name internally. The dist
 - [Customization](#customization)
   - [Prompt Templates](#prompt-templates)
   - [Skills](#skills)
+  - [MCP Integrations](#mcp-integrations)
   - [Extensions](#extensions)
   - [Themes](#themes)
   - [Prime Agent Packages](#prime-agent-packages)
@@ -304,6 +305,53 @@ Skills can also be Python-backed. A Python skill is a normal skill directory wit
 Place in `~/.prime/agent/skills/`, `~/.agents/skills/`, `.prime/agent/skills/`, or `.agents/skills/` (from `cwd` up through parent directories) or a [Prime Agent package](#prime-agent-packages) to share with others. See [docs/skills.md](docs/skills.md).
 
 Prime Agent ships with a built-in `websearch` skill (Google search via the [Serper](https://serper.dev) API). It loads by default; run `/login` and choose "Serper (web search)" to add your key, disable it with `bundledSkills.websearch: false`, or override it with your own `websearch` skill in any location above. See [docs/skills.md#built-in-skills](docs/skills.md#built-in-skills).
+
+### MCP Integrations
+
+Connect external services (Linear, Notion, …) over the [Model Context Protocol](https://modelcontextprotocol.io). Consistent with the single-tool design, MCP is **not** exposed as new agent tools — each integration is a Python skill package the model imports and calls from the kernel:
+
+```python
+import linear
+issues = await linear.list_issues(team="Engineering")   # tools auto-discovered from the server
+help(linear.list_issues)                                 # description + argument schema
+```
+
+Built-in integrations for Linear and Notion ship disabled. **Logging in enables them**: open `/login`, switch to the **Services** tab, pick the integration, and complete OAuth in the browser. The integration's skill then becomes visible and is auto-imported into the kernel. `/mcp` offers the same from the command line:
+
+```
+/mcp                 list integrations and connection status
+/mcp login <name>    connect via OAuth (browser)
+/mcp logout <name>   disconnect
+```
+
+Credentials are stored once in `~/.prime/agent/auth.json` (under `mcp:<name>`); the kernel reads them directly and the host refreshes expired tokens. Enablement is derived from whether valid credentials exist, so there is no separate on/off switch.
+
+**Add your own server.** Declare it under `mcpServers` in settings, then ship a tiny Python skill package that subclasses `McpIntegration`:
+
+```jsonc
+// ~/.prime/settings.json
+{
+  "mcpServers": {
+    "acme": { "type": "http", "url": "https://mcp.acme.com/mcp", "oauth": true }
+  }
+}
+```
+
+```python
+# ~/.prime/agent/skills/acme/src/acme/__init__.py
+from rlm import McpIntegration
+
+class Acme(McpIntegration):
+    server = "acme"
+    url = "https://mcp.acme.com/mcp"
+
+acme = Acme()
+
+def __getattr__(name):     # so `import acme; await acme.<tool>(...)` works
+    return getattr(acme, name)
+```
+
+The base class connects with the official `mcp` SDK, injects the bearer token from `auth.json`, and binds the server's tools as async methods. Use `await acme.call_tool("name", {...})` for tools whose names aren't valid Python identifiers, or a static `bearerTokenEnvVar` instead of OAuth.
 
 ### Extensions
 

@@ -198,6 +198,9 @@ sys.modules[__name__].__class__ = _CallableModule
 __all__ = [
     "HarnessEntry",
     "HarnessState",
+    "McpIntegration",
+    "McpToolError",
+    "NotEnabled",
     "RLMResult",
     "RefinementEvent",
     "TokenUsage",
@@ -207,3 +210,15 @@ __all__ = [
     "rlm",
     "run",
 ]
+
+# Lazily re-export the MCP base class. Kept lazy so `import rlm` never requires
+# the optional `mcp` SDK — only integration packages that subclass it do.
+_LAZY_MCP = {"McpIntegration", "McpToolError", "NotEnabled"}
+
+
+def __getattr__(name: str) -> Any:  # noqa: D401 - module-level lazy attr hook
+    if name in _LAZY_MCP:
+        from . import mcp_base
+
+        return getattr(mcp_base, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

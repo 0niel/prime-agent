@@ -16,6 +16,7 @@ import {
 	type Model,
 	type ToolCall,
 } from "@earendil-works/pi-ai";
+import { BUILTIN_MCP_CATALOG } from "@earendil-works/pi-ai/mcp";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -3598,6 +3599,11 @@ export class InteractiveMode {
 				await this.showOAuthSelector("logout");
 				return;
 			}
+			if (commandName === "mcp") {
+				this.editor.setText("");
+				await this.handleMcpCommand(commandArgs);
+				return;
+			}
 			if (commandName === "new" && !commandArgs) {
 				this.editor.setText("");
 				await this.handleClearCommand();
@@ -6590,6 +6596,65 @@ export class InteractiveMode {
 		return this.createAuthFlows().runLogin(authType);
 	}
 
+	private async handleMcpCommand(args: string | undefined): Promise<void> {
+		const [sub, server] = (args ?? "").trim().split(/\s+/);
+		const authStorage = this.modelRegistry.authStorage;
+		const isAuthed = (name: string) => authStorage.get(`mcp:${name}`) !== undefined;
+
+		if (!sub || sub === "list") {
+			const labels = new Map(BUILTIN_MCP_CATALOG.map((e) => [e.server, e.label]));
+			const names = new Set([...labels.keys(), ...Object.keys(this.settingsManager.getMcpServers() ?? {})]);
+			const lines = [...names].map((name) => {
+				const status = isAuthed(name) ? "connected" : "not connected";
+				return `  ${labels.get(name) ?? name} (${name}) — ${status}`;
+			});
+			this.showStatus(
+				`MCP integrations:\n${lines.join("\n")}\n\nUse /mcp login <name> to connect, /mcp logout <name> to disconnect.`,
+			);
+			return;
+		}
+
+		if (sub === "login") {
+			if (!server) {
+				this.showError("Usage: /mcp login <name> (e.g. /mcp login linear)");
+				return;
+			}
+			const result = await this.createAuthFlows().runMcpLogin(server);
+			if (result.status === "success") {
+				// Enabling the skill needs a reload, which is refused mid-turn; tell the
+				// user to /reload rather than silently leaving creds saved but inactive.
+				if (this.isAgentStreaming() || this.isAgentCompacting()) {
+					this.showStatus(`Connected ${server}. Run /reload (after the current turn) to activate it.`);
+				} else {
+					this.showStatus(`Connected ${server}. Reloading so the integration becomes available…`);
+					await this.handleReloadCommand();
+				}
+			}
+			return;
+		}
+
+		if (sub === "logout") {
+			if (!server) {
+				this.showError("Usage: /mcp logout <name>");
+				return;
+			}
+			if (!isAuthed(server)) {
+				this.showStatus(`${server} is not connected.`);
+				return;
+			}
+			authStorage.logout(`mcp:${server}`);
+			if (this.isAgentStreaming() || this.isAgentCompacting()) {
+				this.showStatus(`Disconnected ${server}. Run /reload (after the current turn) to fully unload it.`);
+			} else {
+				this.showStatus(`Disconnected ${server}. Reloading…`);
+				await this.handleReloadCommand();
+			}
+			return;
+		}
+
+		this.showError(`Unknown /mcp subcommand: ${sub}. Use list, login, or logout.`);
+	}
+
 	private async showOAuthSelector(mode: "login" | "logout"): Promise<void> {
 		if (mode === "login") {
 			const authResult = await this.showLoginProviderSelector();
@@ -6597,10 +6662,24 @@ export class InteractiveMode {
 			if (authResult.status === "success" && authResult.kind !== "service") {
 				await this.promptForModelSelection();
 			}
+			// An MCP integration login enables its skill, so reload resources — but a
+			// reload is refused mid-turn, so tell the user to /reload (matching /mcp login).
+			if (authResult.status === "success" && authResult.providerId.startsWith("mcp:")) {
+				if (this.isAgentStreaming() || this.isAgentCompacting()) {
+					this.showStatus("Connected. Run /reload (after the current turn) to activate the integration.");
+				} else {
+					await this.handleReloadCommand();
+				}
+			}
 			return;
 		}
 
-		await this.createAuthFlows().runLogout();
+		// Only reload when an MCP integration was actually removed (its skill must
+		// be disabled); a cancelled or non-MCP logout needs no reload.
+		const loggedOut = await this.createAuthFlows().runLogout();
+		if (loggedOut?.startsWith("mcp:")) {
+			await this.handleReloadCommand();
+		}
 	}
 
 	// =========================================================================

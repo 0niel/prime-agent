@@ -116,6 +116,7 @@ import {
 } from "./goals.js";
 import type { HostRequestHandlers } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
+import type { McpManager } from "./mcp/mcp-manager.js";
 import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
@@ -316,6 +317,11 @@ export interface AgentSessionConfig {
 	 * When omitted, rlm_heartbeat.* host requests are unavailable.
 	 */
 	rlmHeartbeatController?: AgentRlmHeartbeatController;
+	/**
+	 * Optional MCP integration manager. When present, its mcp.* host requests
+	 * (refresh, begin_login) are exposed to the kernel.
+	 */
+	mcpManager?: McpManager;
 	/**
 	 * Override base tools (useful for custom runtimes).
 	 *
@@ -722,6 +728,7 @@ export class AgentSession {
 	private _allowedToolNames?: Set<string>;
 	private _includeGoals: boolean;
 	private _rlmHeartbeatController?: AgentRlmHeartbeatController;
+	private _mcpManager?: McpManager;
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
@@ -773,6 +780,7 @@ export class AgentSession {
 		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
 		this._includeGoals = config.includeGoals ?? true;
 		this._rlmHeartbeatController = config.rlmHeartbeatController;
+		this._mcpManager = config.mcpManager;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._rlmDepth = config.rlmDepth ?? parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH");
@@ -3775,6 +3783,9 @@ export class AgentSession {
 				handlers[type] = async (payload) => this.handleRlmHeartbeatHostRequest(type, payload);
 			}
 		}
+		if (this._mcpManager) {
+			Object.assign(handlers, this._mcpManager.hostHandlers());
+		}
 		return handlers;
 	}
 
@@ -3782,7 +3793,12 @@ export class AgentSession {
 		const previousFlagValues = this._extensionRunner.getFlagValues();
 		await emitSessionShutdownEvent(this._extensionRunner, { type: "session_shutdown", reason: "reload" });
 		await this.settingsManager.reload();
+		// Re-read auth.json: a login saved by the client process (daemon mode) must be
+		// visible here so MCP skill gating sees the new credentials.
+		this._modelRegistry.authStorage.reload();
 		resetApiProviders();
+		// Re-read mcpServers and re-register user MCP providers from the reloaded settings.
+		this._mcpManager?.refresh();
 		await this._resourceLoader.reload();
 		this._buildRuntime({
 			activeToolNames: this.getActiveToolNames(),

@@ -46,6 +46,10 @@
 			"types": "./dist/oauth.d.ts",
 			"import": "./dist/oauth.js"
 		},
+		"./mcp": {
+			"types": "./dist/mcp.d.ts",
+			"import": "./dist/mcp.js"
+		},
 		"./bedrock-provider": {
 			"types": "./dist/bedrock-provider.d.ts",
 			"import": "./dist/bedrock-provider.js"

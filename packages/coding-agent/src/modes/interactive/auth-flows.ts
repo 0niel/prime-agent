@@ -118,6 +118,23 @@ export class ProviderAuthFlows {
 	constructor(private readonly host: ProviderAuthFlowsHost) {}
 
 	/** Runs the provider selector followed by the matching login dialog. */
+	/**
+	 * Run the OAuth login flow for an MCP integration server.
+	 *
+	 * The provider must already be registered (the McpManager does this as
+	 * `mcp:<server>`). On success the credentials land in auth.json and the
+	 * caller should reload resources so the integration's skill enables.
+	 */
+	runMcpLogin(server: string, label?: string): Promise<AuthenticationResult> {
+		const providerId = `mcp:${server}`;
+		const provider = this.host.modelRegistry.authStorage.getOAuthProviders().find((p) => p.id === providerId);
+		if (!provider) {
+			this.host.showError(`Unknown MCP integration: ${server}`);
+			return Promise.resolve({ status: "failed" });
+		}
+		return this.showLoginDialog(providerId, label ?? provider.name, "service");
+	}
+
 	runLogin(authType?: "oauth" | "api_key"): Promise<AuthenticationResult> {
 		const providerOptions = this.getLoginProviderOptions(authType);
 		if (providerOptions.length === 0) {
@@ -145,7 +162,7 @@ export class ProviderAuthFlows {
 					close();
 
 					if (providerOption.authType === "oauth") {
-						resolve(await this.showLoginDialog(providerOption.id, providerOption.name));
+						resolve(await this.showLoginDialog(providerOption.id, providerOption.name, providerOption.category));
 					} else if (providerOption.id === PRIME_INFERENCE_PROVIDER_ID) {
 						resolve(await this.runPrimeInferenceLogin());
 					} else if (providerOption.id === BEDROCK_PROVIDER_ID) {
@@ -167,13 +184,14 @@ export class ProviderAuthFlows {
 	}
 
 	/** Shows the stored-credential selector and removes the chosen credential. */
-	runLogout(): Promise<void> {
+	/** Returns the provider id that was logged out, or null if nothing changed (cancelled / none). */
+	runLogout(): Promise<string | null> {
 		const providerOptions = this.getLogoutProviderOptions();
 		if (providerOptions.length === 0) {
 			this.host.showStatus(
 				"No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.",
 			);
-			return Promise.resolve();
+			return Promise.resolve(null);
 		}
 
 		return new Promise((resolve) => {
@@ -198,14 +216,15 @@ export class ProviderAuthFlows {
 								? `Logged out of ${providerOption.name}`
 								: `Removed stored API key for ${providerOption.name}. Environment variables and models.json config are unchanged.`;
 						this.host.showStatus(message);
+						resolve(providerOption.id);
 					} catch (error: unknown) {
 						this.host.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
+						resolve(null);
 					}
-					resolve();
 				},
 				() => {
 					close();
-					resolve();
+					resolve(null);
 				},
 				undefined,
 				{ getRows: () => this.host.ui.terminal.rows },
@@ -222,6 +241,8 @@ export class ProviderAuthFlows {
 			id: provider.id,
 			name: provider.name,
 			authType: "oauth",
+			// MCP integrations (mcp:<server>) are services, not model providers.
+			...(provider.id.startsWith("mcp:") ? { category: "service" as const } : {}),
 		}));
 
 		const modelProviders = new Set(this.host.modelRegistry.getAll().map((model) => model.provider));
@@ -252,17 +273,24 @@ export class ProviderAuthFlows {
 		const authStorage = this.host.modelRegistry.authStorage;
 		const options: AuthSelectorProvider[] = [];
 
+		const oauthProvidersById = new Map(authStorage.getOAuthProviders().map((p) => [p.id, p]));
 		for (const providerId of authStorage.list()) {
 			const credential = authStorage.get(providerId);
 			if (!credential) {
 				continue;
 			}
 			const isSerper = providerId === SERPER_CREDENTIAL_ID;
+			const isMcp = providerId.startsWith("mcp:");
+			const name = isSerper
+				? SERPER_CREDENTIAL_NAME
+				: isMcp
+					? (oauthProvidersById.get(providerId)?.name ?? providerId.slice("mcp:".length))
+					: this.host.modelRegistry.getProviderDisplayName(providerId);
 			options.push({
 				id: providerId,
-				name: isSerper ? SERPER_CREDENTIAL_NAME : this.host.modelRegistry.getProviderDisplayName(providerId),
+				name,
 				authType: credential.type,
-				category: isSerper ? "service" : "provider",
+				category: isSerper || isMcp ? "service" : "provider",
 			});
 		}
 
@@ -763,7 +791,11 @@ export class ProviderAuthFlows {
 		});
 	}
 
-	private async showLoginDialog(providerId: string, providerName: string): Promise<AuthenticationResult> {
+	private async showLoginDialog(
+		providerId: string,
+		providerName: string,
+		kind: "provider" | "service" = "provider",
+	): Promise<AuthenticationResult> {
 		const providerInfo = this.host.modelRegistry.authStorage
 			.getOAuthProviders()
 			.find((provider) => provider.id === providerId);
@@ -842,7 +874,7 @@ export class ProviderAuthFlows {
 
 			// Success
 			closeDialog();
-			return await this.completeProviderAuthentication(providerId, providerName, "oauth");
+			return await this.completeProviderAuthentication(providerId, providerName, "oauth", undefined, kind);
 		} catch (error: unknown) {
 			closeDialog();
 			const errorMsg = error instanceof Error ? error.message : String(error);

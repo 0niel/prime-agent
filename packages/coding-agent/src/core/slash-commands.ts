@@ -61,6 +61,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "tree", description: "Navigate session tree (switch branches)" },
 	{ name: "login", description: "Configure provider authentication" },
 	{ name: "logout", description: "Remove provider authentication" },
+	{ name: "mcp", description: "Manage MCP integrations (list, login <name>, logout <name>)" },
 	{ name: "new", description: "Start a new session" },
 	{
 		name: "compact",

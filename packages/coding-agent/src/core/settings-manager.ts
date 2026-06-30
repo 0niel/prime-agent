@@ -79,6 +79,36 @@ export type PackageSource =
 			themes?: string[];
 	  };
 
+/**
+ * Remote/local MCP server an integration connects to. Built-in integrations
+ * (Linear/Notion) are defined in the ai/mcp catalog; this is for user-declared
+ * servers. The kernel-side integration package reads creds from auth.json
+ * (`mcp:<name>`); login/refresh run host-side.
+ */
+export type McpServerConfig =
+	| {
+			type: "http";
+			url: string;
+			headers?: Record<string, string>;
+			/** Env var holding a static bearer token (skips OAuth). */
+			bearerTokenEnvVar?: string;
+			/** Use the generic OAuth login flow for this server. */
+			oauth?: boolean;
+			/** Force-disable even when credentials exist. */
+			enabled?: boolean;
+			enabledTools?: string[];
+			disabledTools?: string[];
+	  }
+	| {
+			type: "stdio";
+			command: string;
+			args?: string[];
+			env?: Record<string, string>;
+			enabled?: boolean;
+			enabledTools?: string[];
+			disabledTools?: string[];
+	  };
+
 export interface Settings {
 	onboardingCompleted?: boolean;
 	defaultProvider?: string;
@@ -98,6 +128,7 @@ export interface Settings {
 	quietStartup?: boolean;
 	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
 	npmCommand?: string[]; // Command used for npm package lookup/install operations, argv-style (e.g., ["mise", "exec", "node@20", "--", "npm"])
+	mcpServers?: Record<string, McpServerConfig>; // User-declared MCP servers (name → config); built-ins are in the ai/mcp catalog
 	packages?: PackageSource[]; // Array of npm/git package sources (string or object with filtering)
 	extensions?: string[]; // Array of local extension file paths or directories
 	skills?: string[]; // Array of local skill file paths or directories
@@ -1027,6 +1058,10 @@ export class SettingsManager {
 
 	getEnabledModels(): string[] | undefined {
 		return this.settings.enabledModels;
+	}
+
+	getMcpServers(): Record<string, McpServerConfig> | undefined {
+		return this.settings.mcpServers;
 	}
 
 	setEnabledModels(patterns: string[] | undefined): void {

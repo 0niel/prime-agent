@@ -18,6 +18,7 @@ import {
 	resetApiProviders,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
 import { registerOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
@@ -347,11 +348,18 @@ export class ModelRegistry {
 	private registeredProviders: Map<string, ProviderConfigInput> = new Map();
 	private loadError: string | undefined = undefined;
 
+	/** Re-register dynamic OAuth providers (e.g. user MCP servers) after refresh() resets the registry. */
+	private onOAuthProvidersReset?: () => void;
+
 	private constructor(
 		readonly authStorage: AuthStorage,
 		private modelsJsonPath: string | undefined,
 	) {
 		this.loadModels();
+	}
+
+	setOnOAuthProvidersReset(hook: () => void): void {
+		this.onOAuthProvidersReset = hook;
 	}
 
 	static create(authStorage: AuthStorage, modelsJsonPath: string = join(getAgentDir(), "models.json")): ModelRegistry {
@@ -377,6 +385,15 @@ export class ModelRegistry {
 		// Ensure dynamic API/OAuth registrations are rebuilt from current provider state.
 		resetApiProviders();
 		resetOAuthProviders();
+		// reset drops everything but model-provider built-ins; re-add MCP integrations
+		// (built-in catalog + this session's user-declared servers via the hook).
+		// NOTE: the OAuth registry is process-global. Built-in MCP providers are
+		// identical across sessions so they always survive; a user-declared server
+		// unique to another daemon session is dropped here and re-registered on that
+		// session's next refresh. Fully isolating it would require a session-scoped
+		// registry in pi-ai (out of scope here).
+		registerBuiltinMcpOAuthProviders();
+		this.onOAuthProvidersReset?.();
 
 		this.loadModels();
 
