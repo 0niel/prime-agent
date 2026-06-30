@@ -694,12 +694,15 @@ export class AgentDaemon {
 					throw cascadeError;
 				}
 			},
-			releaseRlmSubagentRuntime: async (runtime, _options, status) => {
+			releaseRlmSubagentRuntime: async (runtime, options, status) => {
 				const state = this.findRuntimeState(runtime);
 				// Keep a successful subagent resident so it stays viewable (torn down with
 				// the parent via the closeChildSessions cascade). Errored/cancelled runs have
 				// nothing useful to show and would otherwise re-seed as "done", so close them.
 				if (state && status === "done") {
+					// Also retain on the parent so hasRunningRlmChildren can see nested work
+					// under this finished child (dispose() is idempotent on the shared session).
+					options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session);
 					return;
 				}
 				if (state) {
