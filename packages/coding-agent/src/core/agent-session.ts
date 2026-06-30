@@ -541,6 +541,9 @@ export class AgentSession {
 	// Inline mode keeps finished child sessions so the inspector can still read them;
 	// the daemon does the same by leaving the child session resident in its registry.
 	private _retainedRlmChildSessions = new Map<string, AgentSession>();
+	// Kept alive for retained children so nested updates (e.g. a grandchild cancel)
+	// still forward to root; torn down when the retained child is disposed.
+	private _retainedRlmChildUnsubscribes = new Map<string, () => void>();
 	/** Latest recap for this session, written by the daemon summarizer; read by a parent to label its child snapshots. */
 	private _currentRecap?: string;
 
@@ -1641,6 +1644,10 @@ export class AgentSession {
 			return;
 		}
 		// Flush retained children's kernels too; dispose() below only tears down sync.
+		for (const unsubscribe of this._retainedRlmChildUnsubscribes.values()) {
+			unsubscribe();
+		}
+		this._retainedRlmChildUnsubscribes.clear();
 		for (const session of this._retainedRlmChildSessions.values()) {
 			await session.disposeAsync().catch(() => undefined);
 		}
@@ -1659,6 +1666,10 @@ export class AgentSession {
 		}
 		this._disposed = true;
 		this._cancelActiveRlmChildRuns("Parent session disposed");
+		for (const unsubscribe of this._retainedRlmChildUnsubscribes.values()) {
+			unsubscribe();
+		}
+		this._retainedRlmChildUnsubscribes.clear();
 		for (const session of this._retainedRlmChildSessions.values()) {
 			session.dispose();
 		}
@@ -4121,10 +4132,16 @@ export class AgentSession {
 				emitChildUpdate();
 				throw error;
 			} finally {
-				unsubscribeChild?.();
+				const releaseStatus: RlmSubagentReleaseStatus =
+					run.status === "cancelled" || run.status === "error" ? run.status : "done";
+				// Keep forwarding events for a retained (done) child so nested updates reach
+				// root; non-retained children's subscription is dropped now.
+				if (releaseStatus === "done" && unsubscribeChild) {
+					this._retainedRlmChildUnsubscribes.set(run.id, unsubscribeChild);
+				} else {
+					unsubscribeChild?.();
+				}
 				if (childRuntime) {
-					const releaseStatus: RlmSubagentReleaseStatus =
-						run.status === "cancelled" || run.status === "error" ? run.status : "done";
 					await this._releaseRlmSubagentRuntime(childRuntime, subagentOptions, releaseStatus);
 				}
 				run.abort = noopRlmChildAbort;
