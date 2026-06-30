@@ -530,6 +530,7 @@ export class AgentSession {
 	// Set at the start of async teardown so a child finishing mid-disposeAsync doesn't
 	// re-populate the retained map after it's been cleared.
 	private _disposing = false;
+	private _disposeAsyncPromise?: Promise<void>;
 	private _ipythonKernelProvisioner?: IpythonKernelProvisioner;
 	/** Artifact dir backing the current provisioner's kernel snapshot, if any. */
 	private _ipythonKernelSnapshotDir?: string;
@@ -1644,10 +1645,20 @@ export class AgentSession {
 	 * the latest state reaches disk instead of racing process exit.
 	 */
 	async disposeAsync(): Promise<void> {
-		if (this._disposed || this._disposing) {
+		if (this._disposed) {
 			return;
 		}
+		// Concurrent callers await the same in-flight teardown so none resolves before
+		// the kernel snapshot flush finishes.
+		if (this._disposeAsyncPromise) {
+			return this._disposeAsyncPromise;
+		}
 		this._disposing = true;
+		this._disposeAsyncPromise = this._disposeAsyncOnce();
+		return this._disposeAsyncPromise;
+	}
+
+	private async _disposeAsyncOnce(): Promise<void> {
 		// Flush retained children's kernels too; dispose() below only tears down sync.
 		for (const unsubscribe of this._retainedRlmChildUnsubscribes.values()) {
 			unsubscribe();
