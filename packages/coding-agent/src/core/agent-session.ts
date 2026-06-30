@@ -3917,15 +3917,20 @@ export class AgentSession {
 		return this._activeRlmChildRuns.get(childId)?.status;
 	}
 
-	/** Retain a finished child session so the inspector can still read it; disposed with the parent. */
-	retainFinishedRlmChildSession(childId: string, session: AgentSession): void {
+	/**
+	 * Retain a finished child session so the inspector can still read it; disposed with
+	 * the parent. Returns false (and disposes the child) when the parent is already
+	 * tearing down, so the caller can drop the matching event forwarder too.
+	 */
+	retainFinishedRlmChildSession(childId: string, session: AgentSession): boolean {
 		// A child can finish concurrently while the parent is (or has) torn down; don't
-		// resurrect the map (it would never be disposed), just dispose the child now.
+		// resurrect the map (it would never be disposed), just drop the child now.
 		if (this._disposed || this._disposing) {
 			void session.disposeAsync().catch(() => undefined);
-			return;
+			return false;
 		}
 		this._retainedRlmChildSessions.set(childId, session);
+		return true;
 	}
 
 	/** True when any direct or nested subagent is still running or queued. */
@@ -4151,15 +4156,18 @@ export class AgentSession {
 			} finally {
 				const releaseStatus: RlmSubagentReleaseStatus =
 					run.status === "cancelled" || run.status === "error" ? run.status : "done";
-				// Keep forwarding events for a retained (done) child so nested updates reach
-				// root; non-retained children's subscription is dropped now.
-				if (releaseStatus === "done" && unsubscribeChild) {
-					this._retainedRlmChildUnsubscribes.set(run.id, unsubscribeChild);
-				} else {
-					unsubscribeChild?.();
-				}
 				if (childRuntime) {
 					await this._releaseRlmSubagentRuntime(childRuntime, subagentOptions, releaseStatus);
+				}
+				// Keep the forwarder only if the child was actually retained (so nested
+				// updates reach root); otherwise drop it. retainFinishedRlmChildSession owns
+				// the retained map and may decline (parent disposing), so check the outcome.
+				if (unsubscribeChild) {
+					if (this._retainedRlmChildSessions.has(run.id)) {
+						this._retainedRlmChildUnsubscribes.set(run.id, unsubscribeChild);
+					} else {
+						unsubscribeChild();
+					}
 				}
 				run.abort = noopRlmChildAbort;
 				run.session = undefined;
