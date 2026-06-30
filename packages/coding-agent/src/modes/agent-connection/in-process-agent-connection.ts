@@ -374,11 +374,24 @@ export class InProcessAgentConnection implements AgentConnection {
 		if (!child) {
 			return undefined;
 		}
+		const unsubscribes = new Set<() => void>();
 		return {
 			getMessages: async () => child.messages,
-			subscribe: (listener) => child.subscribe((event) => void listener({ type: "session_event", event })),
+			subscribe: (listener) => {
+				const unsubscribe = child.subscribe((event) => void listener({ type: "session_event", event }));
+				unsubscribes.add(unsubscribe);
+				return () => {
+					unsubscribes.delete(unsubscribe);
+					unsubscribe();
+				};
+			},
 			getToolDefinition: async (name) => createAgentConnectionToolDefinition(child.getToolDefinition(name)),
-			close: async () => {},
+			close: async () => {
+				for (const unsubscribe of unsubscribes) {
+					unsubscribe();
+				}
+				unsubscribes.clear();
+			},
 		};
 	}
 

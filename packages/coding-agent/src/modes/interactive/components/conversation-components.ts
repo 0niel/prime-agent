@@ -55,7 +55,8 @@ export function buildConversationComponents(
 					content.name,
 					content.id,
 					content.arguments,
-					options.toolOptions,
+					// Replayed history rebuilds on every event; don't re-emit inline images.
+					{ ...options.toolOptions, allowInlineImages: false },
 					options.getToolDefinition(content.name),
 					options.ui,
 					options.cwd,

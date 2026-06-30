@@ -535,6 +535,9 @@ export class AgentSession {
 	private _rlmParentNodeId?: string;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
+	// Inline mode keeps finished child sessions so the inspector can still read them;
+	// the daemon does the same by leaving the child session resident in its registry.
+	private _retainedRlmChildSessions = new Map<string, AgentSession>();
 	/** Latest recap for this session, written by the daemon summarizer; read by a parent to label its child snapshots. */
 	private _currentRecap?: string;
 
@@ -1648,6 +1651,10 @@ export class AgentSession {
 		}
 		this._disposed = true;
 		this._cancelActiveRlmChildRuns("Parent session disposed");
+		for (const session of this._retainedRlmChildSessions.values()) {
+			session.dispose();
+		}
+		this._retainedRlmChildSessions.clear();
 		this._pendingNextTurnMessages = [];
 		this._steeringMessages = [];
 		this._followUpMessages = [];
@@ -3786,7 +3793,8 @@ export class AgentSession {
 			return;
 		}
 
-		runtime.session.dispose();
+		// Inline: keep the finished session readable; disposed with the parent.
+		this._retainedRlmChildSessions.set(options.id, runtime.session);
 	}
 
 	private _createInlineRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): RlmSubagentRuntime {
@@ -3867,14 +3875,33 @@ export class AgentSession {
 		return this._activeRlmChildRuns.get(childId)?.status;
 	}
 
+	/** True when any direct or nested subagent is still running or queued. */
+	hasRunningRlmChildren(): boolean {
+		for (const run of this._activeRlmChildRuns.values()) {
+			if (run.status === "running" || run.status === "queued") {
+				return true;
+			}
+			if (run.session?.hasRunningRlmChildren()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	// Inline (non-daemon) mode only; daemon clients attach to the child session directly.
 	getRlmChildSession(childId: string): AgentSession | undefined {
-		const direct = this._activeRlmChildRuns.get(childId)?.session;
+		const direct = this._activeRlmChildRuns.get(childId)?.session ?? this._retainedRlmChildSessions.get(childId);
 		if (direct) {
 			return direct;
 		}
 		for (const candidate of this._activeRlmChildRuns.values()) {
 			const nested = candidate.session?.getRlmChildSession(childId);
+			if (nested) {
+				return nested;
+			}
+		}
+		for (const retained of this._retainedRlmChildSessions.values()) {
+			const nested = retained.getRlmChildSession(childId);
 			if (nested) {
 				return nested;
 			}
@@ -3924,6 +3951,7 @@ export class AgentSession {
 		let answerPreview: string | undefined;
 		let durationMs: number | undefined;
 		let toolUseCount = 0;
+		let runningToolCount = 0;
 		let activity: RlmChildAgentActivity | undefined;
 		const run: RlmChildRun = {
 			id: childNodeId,
@@ -4000,13 +4028,18 @@ export class AgentSession {
 						}
 						case "tool_execution_start": {
 							toolUseCount += 1;
+							runningToolCount += 1;
 							activity = { kind: "executing", toolName: event.toolName };
 							emitChildUpdate();
 							break;
 						}
 						case "tool_execution_end": {
-							activity = { kind: "waiting" };
-							emitChildUpdate();
+							runningToolCount = Math.max(0, runningToolCount - 1);
+							// Stay "executing" while sibling tools from the same turn run.
+							if (runningToolCount === 0) {
+								activity = { kind: "waiting" };
+								emitChildUpdate();
+							}
 							break;
 						}
 					}

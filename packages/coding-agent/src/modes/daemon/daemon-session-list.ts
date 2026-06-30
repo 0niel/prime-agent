@@ -314,7 +314,10 @@ function readMessageText(content: unknown): string {
 // Agent doing work, ignoring the classification verdict.
 export function isActiveSessionBusy(activeSession: ActiveSessionState): boolean {
 	const session = activeSession.runtime.session;
-	return session.isStreaming || session.isCompacting || session.pendingMessageCount > 0;
+	// Background subagents keep the parent "working" even after its own turn ends.
+	return (
+		session.isStreaming || session.isCompacting || session.pendingMessageCount > 0 || session.hasRunningRlmChildren()
+	);
 }
 
 export function activeActivityForSession(activeSession: ActiveSessionState): SessionActivity {
