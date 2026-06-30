@@ -449,6 +449,7 @@ function makeState(options: StateOptions): ActiveSessionState {
 				messages: options.messages ?? ([] as AgentMessage[]),
 				getRlmChildRunStatus: (childId: string) => options.childRunStatuses?.[childId],
 				hasRunningRlmChildren: () => options.hasRunningRlmChildren ?? false,
+				getCurrentRecap: () => undefined,
 				pendingMessageCount: 0,
 				state: {
 					streamingMessage: undefined,

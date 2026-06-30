@@ -274,6 +274,7 @@ function rlmChildSnapshotForActiveSession(
 		label: compactRlmText(metadata.prompt ?? "", 80) || "child agent",
 		status,
 		answerPreview,
+		recap: session.getCurrentRecap(),
 		sessionDir: metadata.sessionDir ?? session.sessionManager.getSessionDir(),
 		activity: status === "running" ? { kind: session.isStreaming ? "writing" : "waiting" } : undefined,
 	};

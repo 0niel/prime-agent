@@ -3956,6 +3956,12 @@ export class AgentSession {
 				return true;
 			}
 		}
+		// A finished, retained child can still have a running nested subagent.
+		for (const retained of this._retainedRlmChildSessions.values()) {
+			if (retained.cancelRlmChildRun(childId, reason)) {
+				return true;
+			}
+		}
 		return false;
 	}
 
