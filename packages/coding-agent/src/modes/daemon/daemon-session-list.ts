@@ -325,6 +325,11 @@ export function activeActivityForSession(activeSession: ActiveSessionState): Ses
 	if (isActiveSessionBusy(activeSession)) {
 		return "working";
 	}
+	// A finished subagent is resident but never gets a summarizer verdict, so don't hold
+	// it at "working" waiting for one — a not-busy subagent is simply idle/done.
+	if (activeSession.runtime.metadata?.kind === "subagent") {
+		return "idle";
+	}
 	// Hold at "working" until the idle verdict is current, so the view never
 	// buckets an unlabeled idle session.
 	return isSummaryCurrent(activeSession) ? "idle" : "working";

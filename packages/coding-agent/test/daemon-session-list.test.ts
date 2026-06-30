@@ -73,6 +73,25 @@ describe("buildSessionList", () => {
 		expect(entries[0]?.activity).toBe("working");
 	});
 
+	it("marks a finished subagent idle instead of holding it at working", () => {
+		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
+		const entries = buildSessionList(
+			[
+				makeState({
+					activeSessionId: "child",
+					sessionFile: "/tmp/child.jsonl",
+					isStreaming: false,
+					hasRunningRlmChildren: false,
+					messages: oneMessage,
+					// No current summary verdict — a resident finished subagent never gets one.
+					metadata: { kind: "subagent", createdAt: 1, parentActiveSessionId: "parent", rlmChildId: "c1" },
+				}),
+			],
+			[],
+		);
+		expect(entries[0]?.activity).toBe("idle");
+	});
+
 	it("merges active records with saved sessions and marks inactive sessions", () => {
 		const activePath = resolve("/tmp/project/active.jsonl");
 		const sleepingPath = resolve("/tmp/project/sleeping.jsonl");
