@@ -55,26 +55,38 @@ function buildPrintModeGateContinuation(
 	);
 }
 
+function printModeAutonomousProgressKey(status: AgentAutonomousStatus): string {
+	return [
+		latestGateAttempt(status),
+		status.continuationsUsed,
+		status.turnsUsed,
+		status.tokensUsed,
+		status.lastGateFailure?.exitText ?? "",
+	].join(":");
+}
+
 async function waitForPrintModeIdleWithAutonomousGates(
 	getSession: () => AgentSessionRuntime["session"],
 ): Promise<void> {
-	let lastPromptedGateAttempt = 0;
+	let lastPromptedProgressKey: string | undefined;
 	while (true) {
 		const session = getSession();
 		await session.agent.waitForIdle();
 		const status = session.getAutonomousStatus();
-		const attempt = latestGateAttempt(status);
-		if (
-			!shouldContinuePrintModeAutonomousGates(status) ||
-			!status.lastGateFailure ||
-			attempt <= lastPromptedGateAttempt
-		) {
+		if (!shouldContinuePrintModeAutonomousGates(status) || !status.lastGateFailure) {
 			return;
 		}
-		lastPromptedGateAttempt = attempt;
-		await session.prompt(buildPrintModeGateContinuation(status.lastGateFailure, attempt, status.gates.maxRetries), {
-			streamingBehavior: "followUp",
-		});
+		const progressKey = printModeAutonomousProgressKey(status);
+		if (progressKey === lastPromptedProgressKey) {
+			return;
+		}
+		lastPromptedProgressKey = progressKey;
+		await session.prompt(
+			buildPrintModeGateContinuation(status.lastGateFailure, latestGateAttempt(status), status.gates.maxRetries),
+			{
+				streamingBehavior: "followUp",
+			},
+		);
 	}
 }
 

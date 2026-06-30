@@ -249,7 +249,7 @@ describe("runPrintMode", () => {
 		expect(session.prompt.mock.calls[1][1]).toEqual({ streamingBehavior: "followUp" });
 	});
 
-	it("does not synchronously spin when a re-prompt does not advance gate attempts", async () => {
+	it("continues prompting when gate attempts do not advance but autonomous usage does", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), {
 			enabled: true,
 			continuationsUsed: 1,
@@ -267,29 +267,63 @@ describe("runPrintMode", () => {
 			},
 		});
 		const { session } = runtimeHost;
-		session.getAutonomousStatus.mockImplementation(() => ({
-			enabled: true,
-			continuationsUsed: 1,
-			turnsUsed: 2,
-			tokensUsed: 100,
-			startedAt: Date.now(),
-			limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
-			gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
-			gateAttempts: { "verify-public": 1 },
-			lastGateFailure: {
-				command: "verify-public",
-				attempt: 1,
-				exitText: "exited 1",
-				output: "0/9",
+		const statuses: AgentAutonomousStatus[] = [
+			{
+				enabled: true,
+				continuationsUsed: 1,
+				turnsUsed: 2,
+				tokensUsed: 100,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 1 },
+				lastGateFailure: { command: "verify-public", attempt: 1, exitText: "exited 1", output: "0/9" },
 			},
-		}));
+			{
+				enabled: true,
+				continuationsUsed: 2,
+				turnsUsed: 3,
+				tokensUsed: 150,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 1 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 1,
+					exitText: "not rerun: workspace unchanged since previous failed gate",
+					output: "edit source files before attempting to finish again",
+				},
+			},
+			{
+				enabled: true,
+				continuationsUsed: 2,
+				turnsUsed: 3,
+				tokensUsed: 150,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 1 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 1,
+					exitText: "not rerun: workspace unchanged since previous failed gate",
+					output: "edit source files before attempting to finish again",
+				},
+			},
+		];
+		let statusIndex = 0;
+		session.getAutonomousStatus.mockImplementation(
+			() => statuses[Math.min(statusIndex++, statuses.length - 1)] as AgentAutonomousStatus,
+		);
 
 		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
 			mode: "text",
 		});
 
 		expect(exitCode).toBe(1);
-		expect(session.agent.waitForIdle).toHaveBeenCalledTimes(2);
-		expect(session.prompt).toHaveBeenCalledTimes(1);
+		expect(session.agent.waitForIdle).toHaveBeenCalledTimes(3);
+		expect(session.prompt).toHaveBeenCalledTimes(2);
+		expect(session.prompt.mock.calls[1][0]).toContain("workspace unchanged");
 	});
 });
