@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants, existsSync, readFileSync } from "node:fs";
-import { access, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { stderr, stdin } from "node:process";
@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { getPackageDir } from "../../config.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
 
-const BOOTSTRAP_SCHEMA = 7;
+const BOOTSTRAP_SCHEMA = 8;
 const PYTHON_VERSION = "3.11";
 const IPYKERNEL_REQUIREMENT = "ipykernel";
 const RUNTIME_REQUIREMENT = "prime-agent-runtime";
@@ -51,7 +51,7 @@ const REQUIRED_HARNESS_METHODS = [
 	"delete_prompt_note",
 	"record_refinement",
 ];
-const RUNTIME_READY_CHECK = `import inspect; import rlm; from rlm.harness import HarnessEntry; _harness_methods = ${JSON.stringify(REQUIRED_HARNESS_METHODS)}; assert hasattr(rlm, 'run'); assert callable(rlm); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm); assert callable(rlm.host_request); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background')`;
+const RUNTIME_READY_CHECK = `import inspect; import rlm; from rlm import McpIntegration; from rlm.harness import HarnessEntry; _harness_methods = ${JSON.stringify(REQUIRED_HARNESS_METHODS)}; assert hasattr(rlm, 'run'); assert callable(rlm); assert hasattr(rlm, 'rlm'); assert callable(rlm.rlm); assert callable(rlm.host_request); assert hasattr(rlm, 'harness'); assert hasattr(rlm, 'get_harness_state'); assert hasattr(rlm.rlm, 'harness'); assert hasattr(rlm.rlm, 'get_harness_state'); assert all(callable(getattr(_harness, _method, None)) for _harness in (rlm.harness, rlm.rlm.harness) for _method in _harness_methods); assert 'reference' in HarnessEntry.__dataclass_fields__; assert 'reference' in inspect.signature(rlm.harness.create_skill).parameters; assert 'reference' in inspect.signature(rlm.harness.update_skill).parameters; assert not hasattr(rlm, 'background'); assert not hasattr(rlm.rlm, 'background')`;
 const BOOTSTRAP_VERSION_FILE = ".bootstrap-version";
 const BOOTSTRAP_LOCK_NAME = ".bootstrap.lock";
 const BOOTSTRAP_LOCK_RETRY_MS = 100;
@@ -491,28 +491,35 @@ function pythonSkillsMatch(a: BootstrapPythonSkill[] | undefined, b: readonly Bo
 
 function bootstrapVersionCurrent(
 	version: BootstrapVersion | null,
+	runtimeIdentity: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
 ): boolean {
 	return (
-		version !== null && bootstrapBaseVersionCurrent(version) && pythonSkillsMatch(version.pythonSkills, pythonSkills)
+		version !== null &&
+		bootstrapBaseVersionCurrent(version, runtimeIdentity) &&
+		pythonSkillsMatch(version.pythonSkills, pythonSkills)
 	);
 }
 
-function bootstrapBaseVersionCurrent(version: BootstrapVersion | null): boolean {
+function bootstrapBaseVersionCurrent(version: BootstrapVersion | null, runtimeIdentity: string): boolean {
 	return (
 		version?.schema === BOOTSTRAP_SCHEMA &&
 		version.ipykernel === IPYKERNEL_REQUIREMENT &&
-		version.runtime === RUNTIME_REQUIREMENT &&
+		version.runtime === runtimeIdentity &&
 		version.snapshot === STATE_SNAPSHOT_REQUIREMENT &&
 		extraUvArgsMatch(version.extraUvArgs, DEFAULT_RLM_EXTRA_UV_ARGS)
 	);
 }
 
-async function writeBootstrapVersion(venv: string, pythonSkills: readonly BootstrapPythonSkill[]): Promise<void> {
+async function writeBootstrapVersion(
+	venv: string,
+	runtimeIdentity: string,
+	pythonSkills: readonly BootstrapPythonSkill[],
+): Promise<void> {
 	const version: BootstrapVersion = {
 		schema: BOOTSTRAP_SCHEMA,
 		ipykernel: IPYKERNEL_REQUIREMENT,
-		runtime: RUNTIME_REQUIREMENT,
+		runtime: runtimeIdentity,
 		snapshot: STATE_SNAPSHOT_REQUIREMENT,
 		extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
 		pythonSkills: [...pythonSkills],
@@ -522,21 +529,64 @@ async function writeBootstrapVersion(venv: string, pythonSkills: readonly Bootst
 
 function runtimeCandidateDirs(): string[] {
 	const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+	// dist/prime-agent-runtime is listed first deliberately: it is the only path stable
+	// across every shipped layout (dist/, dist/bundle/, bun), where import.meta.url-relative
+	// resolution breaks. `npm run build` rebuilds it from live source (copy-assets does
+	// rm -rf + cp), so the staleness hash still refreshes on every build. The relative
+	// paths below cover running from source (tsx) where dist/ hasn't been built.
 	return [
-		// Stable across layouts (dist/, dist/bundle/, tsx): <package>/dist/prime-agent-runtime
 		path.join(getPackageDir(), "dist", "prime-agent-runtime"),
 		path.resolve(moduleDir, "..", "..", "prime-agent-runtime"),
 		path.resolve(moduleDir, "..", "..", "..", "..", "..", "prime-agent-runtime"),
 	];
 }
 
-async function resolveRuntimeRequirement(): Promise<string> {
+async function resolveRuntimeSourceDir(): Promise<string | null> {
 	for (const candidate of runtimeCandidateDirs()) {
 		if (await exists(path.join(candidate, "pyproject.toml"))) {
 			return candidate;
 		}
 	}
-	return RUNTIME_REQUIREMENT;
+	return null;
+}
+
+// Identity of the runtime to be installed. For a local source checkout this is a
+// content hash of every rlm/*.py file plus pyproject.toml, so any runtime code or
+// dependency change invalidates an existing venv automatically. Falls back to the
+// bare package name when the runtime resolves to a registry install (no local source).
+export async function resolveRuntimeIdentity(): Promise<string> {
+	const sourceDir = await resolveRuntimeSourceDir();
+	if (!sourceDir) return RUNTIME_REQUIREMENT;
+	return hashRuntimeSource(sourceDir);
+}
+
+// Throws if the local source can't be read. A failure here must surface rather than
+// fall back to RUNTIME_REQUIREMENT: that constant is the registry-install identity, and
+// recording it for a local checkout would permanently mask later source changes.
+async function hashRuntimeSource(sourceDir: string): Promise<string> {
+	const rlmDir = path.join(sourceDir, "src", "rlm");
+	const files: string[] = [path.join(sourceDir, "pyproject.toml")];
+	async function collect(dir: string): Promise<void> {
+		const entries = await readdir(dir, { withFileTypes: true });
+		for (const entry of entries) {
+			const full = path.join(dir, entry.name);
+			if (entry.isDirectory()) {
+				await collect(full);
+			} else if (entry.isFile() && entry.name.endsWith(".py")) {
+				files.push(full);
+			}
+		}
+	}
+	await collect(rlmDir);
+	files.sort();
+	const hash = createHash("sha256");
+	for (const file of files) {
+		hash.update(path.relative(sourceDir, file));
+		hash.update("\0");
+		hash.update(await readFile(file));
+		hash.update("\0");
+	}
+	return `sha256:${hash.digest("hex")}`;
 }
 
 async function bootstrapVenv(
@@ -546,7 +596,9 @@ async function bootstrapVenv(
 ): Promise<void> {
 	await mkdir(path.dirname(venv), { recursive: true });
 	const python = path.join(venv, "bin", "python");
-	const runtimeRequirement = await resolveRuntimeRequirement();
+	const sourceDir = await resolveRuntimeSourceDir();
+	const runtimeRequirement = sourceDir ?? RUNTIME_REQUIREMENT;
+	const runtimeIdentity = await resolveRuntimeIdentity();
 
 	// Build the step list before running so the percentage denominator only
 	// counts work that will actually happen on this machine.
@@ -579,17 +631,17 @@ async function bootstrapVenv(
 		STATE_SNAPSHOT_REQUIREMENT,
 		...DEFAULT_RLM_EXTRA_UV_ARGS,
 	]);
-
 	if (pythonSkills.length > 0) {
 		progress.begin(BOOTSTRAP_STEP.skills);
 	}
-	await syncPythonSkills(uv, venv, python, pythonSkills, options);
+	await syncPythonSkills(uv, venv, python, runtimeIdentity, pythonSkills, options);
 }
 
 async function syncPythonSkills(
 	uv: string,
 	venv: string,
 	python: string,
+	runtimeIdentity: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
 	options: EnsureKernelPythonOptions,
 ): Promise<void> {
@@ -616,26 +668,27 @@ async function syncPythonSkills(
 			);
 		}
 	}
-	await writeBootstrapVersion(venv, installedPythonSkills);
+	await writeBootstrapVersion(venv, runtimeIdentity, installedPythonSkills);
 }
 
-async function kernelBaseReady(python: string, venv: string): Promise<boolean> {
+async function kernelBaseReady(python: string, venv: string, runtimeIdentity: string): Promise<boolean> {
 	return (
 		(await hasIpykernel(python)) &&
 		(await hasPrimeAgentRuntime(python)) &&
-		bootstrapBaseVersionCurrent(await readBootstrapVersion(venv))
+		bootstrapBaseVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity)
 	);
 }
 
 async function kernelReady(
 	python: string,
 	venv: string,
+	runtimeIdentity: string,
 	pythonSkills: readonly BootstrapPythonSkill[],
 ): Promise<boolean> {
 	return (
 		(await hasIpykernel(python)) &&
 		(await hasPrimeAgentRuntime(python)) &&
-		bootstrapVersionCurrent(await readBootstrapVersion(venv), pythonSkills)
+		bootstrapVersionCurrent(await readBootstrapVersion(venv), runtimeIdentity, pythonSkills)
 	);
 }
 
@@ -682,13 +735,14 @@ async function ensureKernelPythonUncached(
 
 	const venv = await resolveWritableKernelVenvDir();
 	const python = path.join(venv, "bin", "python");
-	if (await kernelReady(python, venv, pythonSkills)) return python;
+	const runtimeIdentity = await resolveRuntimeIdentity();
+	if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
 
 	const releaseLock = await acquireBootstrapLock(venv);
 	try {
-		if (await kernelReady(python, venv, pythonSkills)) return python;
-		if (await kernelBaseReady(python, venv)) {
-			await syncPythonSkills(await ensureUv(options), venv, python, pythonSkills, options);
+		if (await kernelReady(python, venv, runtimeIdentity, pythonSkills)) return python;
+		if (await kernelBaseReady(python, venv, runtimeIdentity)) {
+			await syncPythonSkills(await ensureUv(options), venv, python, runtimeIdentity, pythonSkills, options);
 			return python;
 		}
 
