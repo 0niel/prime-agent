@@ -62,6 +62,7 @@ function createConnectionState(overrides: Partial<AgentConnectionState> = {}): A
 		retryAttempt: 0,
 		steeringMode: "all",
 		followUpMode: "all",
+		planMode: false,
 		sessionId: "session-1",
 		leafId: null,
 		autoCompactionEnabled: true,

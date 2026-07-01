@@ -129,6 +129,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"set_scoped_models",
 	"set_thinking_level",
 	"cycle_thinking_level",
+	"set_plan_mode",
 	"set_transport",
 	"set_steering_mode",
 	"set_follow_up_mode",
@@ -1198,6 +1199,12 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				const level = state.runtime.session.cycleThinkingLevel();
 				return success(command.id, "cycle_thinking_level", level ? { level } : null);
+			}
+
+			case "set_plan_mode": {
+				const state = this.getSessionState(command.activeSessionId);
+				await state.runtime.session.setPlanMode(command.enabled);
+				return success(command.id, "set_plan_mode");
 			}
 
 			case "set_transport": {

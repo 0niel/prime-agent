@@ -145,6 +145,11 @@ export interface IpythonToolDetails {
 	};
 }
 
+/** Mutable plan-mode flag shared between the session and the kernel lifecycle. */
+export interface PlanModeController {
+	enabled: boolean;
+}
+
 export interface IpythonToolOptions {
 	/** Python override. Must have `ipykernel` installed. */
 	python?: string;
@@ -165,6 +170,8 @@ export interface IpythonToolOptions {
 	 * (some names restored or some failed), so the session can tell the model.
 	 */
 	onRestore?: (result: RestoreResult) => void;
+	/** Plan-mode (no-edit) state, read at kernel start and on toggle. */
+	planMode?: PlanModeController;
 	/** Shared provisioner owning the kernel lifecycle. When provided, the remaining options are ignored. */
 	provisioner?: IpythonKernelProvisioner;
 }
@@ -211,6 +218,19 @@ export class IpythonKernelProvisioner {
 	/** Whether a kernel has finished starting and is currently running. */
 	get hasRunningKernel(): boolean {
 		return this.startedManager?.isRunning ?? false;
+	}
+
+	/**
+	 * Apply a plan-mode toggle to the live kernel (waiting out an in-flight
+	 * startup). A kernel that hasn't started picks the state up from
+	 * `options.planMode` during its bootstrap instead.
+	 */
+	async setPlanMode(enabled: boolean): Promise<void> {
+		if (!this.managerPromise) return;
+		const m = await this.managerPromise.catch(() => undefined);
+		if (m?.isRunning) {
+			await m.setPlanMode(enabled);
+		}
 	}
 
 	/** Live user-defined names in the kernel namespace, or null if listing failed / no kernel. */
@@ -332,6 +352,14 @@ export class IpythonKernelProvisioner {
 			if (bootstrap.status !== "ok") {
 				const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
 				throw new Error(`Failed to initialize rlm runtime in the IPython kernel:\n${details}`);
+			}
+			// Bind the plan-guard token before any model code can run. An outdated
+			// kernel runtime without the guard only fails startup when plan mode is
+			// actually on; otherwise the kernel stays usable.
+			try {
+				await m.setPlanMode(this.options?.planMode?.enabled ?? false);
+			} catch (error) {
+				if (this.options?.planMode?.enabled) throw error;
 			}
 		} catch (error) {
 			// Never leak the kernel's ZMQ sockets / temp dir if startup fails after spawn.

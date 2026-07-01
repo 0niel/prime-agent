@@ -509,6 +509,10 @@ export class DaemonAgentConnection implements AgentConnection {
 		return result?.level;
 	}
 
+	async setPlanMode(enabled: boolean): Promise<void> {
+		await this.requestOk({ type: "set_plan_mode", activeSessionId: this.activeSessionId, enabled });
+	}
+
 	async setTransport(transport: Transport): Promise<void> {
 		await this.requestOk({ type: "set_transport", activeSessionId: this.activeSessionId, transport });
 	}

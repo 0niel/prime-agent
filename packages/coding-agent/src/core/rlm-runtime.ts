@@ -57,6 +57,7 @@ export interface CreateRlmSubagentRuntimeOptions {
 	sessionDir: string;
 	model: Model<any>;
 	thinkingLevel: ThinkingLevel;
+	planMode?: boolean;
 	scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	activeToolNames: string[];
 	allowedToolNames?: string[];

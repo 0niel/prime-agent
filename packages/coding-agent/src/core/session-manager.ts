@@ -41,6 +41,7 @@ const CONTENT_ENTRY_TYPES = new Set([
 	"custom",
 	"model_change",
 	"thinking_level_change",
+	"plan_mode_change",
 	"session_info",
 	"label",
 	"compaction",
@@ -87,6 +88,11 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
 	provider: string;
 	modelId: string;
+}
+
+export interface PlanModeChangeEntry extends SessionEntryBase {
+	type: "plan_mode_change";
+	enabled: boolean;
 }
 
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
@@ -214,6 +220,7 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 export type SessionEntry =
 	| SessionMessageEntry
 	| ThinkingLevelChangeEntry
+	| PlanModeChangeEntry
 	| ModelChangeEntry
 	| CompactionEntry
 	| BranchSummaryEntry
@@ -242,6 +249,7 @@ export interface SessionTreeNode {
 export interface SessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
+	planMode: boolean;
 	model: { provider: string; modelId: string } | null;
 }
 
@@ -449,7 +457,7 @@ export function buildSessionContext(
 	let leaf: SessionEntry | undefined;
 	if (leafId === null) {
 		// Explicitly null - return no messages (navigated to before first entry)
-		return { messages: [], thinkingLevel: "off", model: null };
+		return { messages: [], thinkingLevel: "off", planMode: false, model: null };
 	}
 	if (leafId) {
 		leaf = byId.get(leafId);
@@ -460,7 +468,7 @@ export function buildSessionContext(
 	}
 
 	if (!leaf) {
-		return { messages: [], thinkingLevel: "off", model: null };
+		return { messages: [], thinkingLevel: "off", planMode: false, model: null };
 	}
 
 	// push+reverse, not unshift-per-entry: unshift is O(n), making this O(n^2) on long sessions.
@@ -474,12 +482,15 @@ export function buildSessionContext(
 
 	// Extract settings and find compaction
 	let thinkingLevel = "off";
+	let planMode = false;
 	let model: { provider: string; modelId: string } | null = null;
 	let compaction: CompactionEntry | null = null;
 
 	for (const entry of path) {
 		if (entry.type === "thinking_level_change") {
 			thinkingLevel = entry.thinkingLevel;
+		} else if (entry.type === "plan_mode_change") {
+			planMode = entry.enabled;
 		} else if (entry.type === "model_change") {
 			model = { provider: entry.provider, modelId: entry.modelId };
 		} else if (entry.type === "message" && entry.message.role === "assistant") {
@@ -546,7 +557,7 @@ export function buildSessionContext(
 		}
 	}
 
-	return { messages, thinkingLevel, model };
+	return { messages, thinkingLevel, planMode, model };
 }
 
 /**
@@ -1280,6 +1291,19 @@ export class SessionManager {
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			thinkingLevel,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append a plan mode change as child of current leaf, then advance leaf. Returns entry id. */
+	appendPlanModeChange(enabled: boolean): string {
+		const entry: PlanModeChangeEntry = {
+			type: "plan_mode_change",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			enabled,
 		};
 		this._appendEntry(entry);
 		return entry.id;

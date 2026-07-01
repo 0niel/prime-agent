@@ -205,6 +205,7 @@ export type DaemonCommand =
 	| { id?: string; type: "set_scoped_models"; activeSessionId: string; scopedModels: AgentConnectionScopedModel[] }
 	| { id?: string; type: "set_thinking_level"; activeSessionId: string; level: ThinkingLevel }
 	| { id?: string; type: "cycle_thinking_level"; activeSessionId: string }
+	| { id?: string; type: "set_plan_mode"; activeSessionId: string; enabled: boolean }
 	| { id?: string; type: "set_transport"; activeSessionId: string; transport: Transport }
 	| { id?: string; type: "set_steering_mode"; activeSessionId: string; mode: AgentConnectionQueueMode }
 	| { id?: string; type: "set_follow_up_mode"; activeSessionId: string; mode: AgentConnectionQueueMode }

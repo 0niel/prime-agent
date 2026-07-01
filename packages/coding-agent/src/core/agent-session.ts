@@ -113,6 +113,7 @@ import type { McpManager } from "./mcp/mcp-manager.js";
 import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
+import { PLAN_MODE_BLOCKED_TOOLS, PLAN_MODE_PROMPT } from "./prompts/plan-mode.js";
 import {
 	appendGlobalRefinement,
 	applyRefinementProposal,
@@ -152,7 +153,7 @@ import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
-import { IpythonKernelProvisioner } from "./tools/ipython.js";
+import { IpythonKernelProvisioner, type PlanModeController } from "./tools/ipython.js";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.js";
 import { addAssistantUsage, emptyUsage } from "./usage.js";
 import { SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME } from "./websearch-credential.js";
@@ -199,6 +200,7 @@ export type AgentSessionEvent =
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow"; customInstructions?: string }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	| { type: "plan_mode_changed"; enabled: boolean }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
@@ -265,6 +267,8 @@ export interface AgentSessionConfig {
 	initialActiveToolNames?: string[];
 	/** Optional allowlist of tool names. When provided, only these tool names are exposed. */
 	allowedToolNames?: string[];
+	/** Start with plan mode (no-edit) active. Default: false. */
+	planMode?: boolean;
 	/**
 	 * Whether the built-in long-running goals feature is available: the bundled
 	 * goal skill in the IPython kernel, its goal.* host handlers, and /goal.
@@ -565,6 +569,9 @@ export class AgentSession {
 	private _baseSystemPrompt = "";
 	private _baseSystemPromptOptions!: BuildSystemPromptOptions;
 
+	/** Shared with the kernel provisioner so a kernel started later picks up the current state. */
+	private readonly _planModeController: PlanModeController = { enabled: false };
+
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
@@ -589,6 +596,7 @@ export class AgentSession {
 		this._rlmSessionDir = config.rlmSessionDir;
 		this._rlmParentNodeId = config.rlmParentNodeId;
 		this._subagentRuntimeHost = config.subagentRuntimeHost;
+		this._planModeController.enabled = config.planMode ?? false;
 		this._goalState = this._loadPersistedGoalState();
 		if (this._goalState.status === "active") {
 			this._goalAccountingStartedAt = Date.now();
@@ -652,6 +660,15 @@ export class AgentSession {
 	 */
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
+			// The ipython tool is enforced inside the kernel; mutating side tools
+			// (non-default configs) are blocked here.
+			if (this._planModeController.enabled && PLAN_MODE_BLOCKED_TOOLS.has(toolCall.name)) {
+				return {
+					block: true,
+					reason: `Plan mode is active: the ${toolCall.name} tool is disabled. Present your plan or answer, and ask the user to exit plan mode if changes are needed.`,
+				};
+			}
+
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_call")) {
 				return undefined;
@@ -2057,13 +2074,12 @@ export class AgentSession {
 					});
 				}
 			}
-			// Apply extension-modified system prompt, or reset to base
-			if (result?.systemPrompt) {
-				this.agent.state.systemPrompt = result.systemPrompt;
-			} else {
-				// Ensure we're using the base prompt (in case previous turn had modifications)
-				this.agent.state.systemPrompt = this._baseSystemPrompt;
-			}
+			// Apply extension-modified system prompt, or reset to base; plan mode
+			// appends per-turn so a toggle takes effect on the next turn.
+			const turnSystemPrompt = result?.systemPrompt || this._baseSystemPrompt;
+			this.agent.state.systemPrompt = this._planModeController.enabled
+				? `${turnSystemPrompt}\n\n${PLAN_MODE_PROMPT}`
+				: turnSystemPrompt;
 		} catch (error) {
 			preflightResult?.(false);
 			throw error;
@@ -2495,6 +2511,34 @@ export class AgentSession {
 		await this._emitModelSelect(nextModel, currentModel, "cycle");
 
 		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
+	}
+
+	// =========================================================================
+	// Plan Mode (no-edit) Management
+	// =========================================================================
+
+	get planMode(): boolean {
+		return this._planModeController.enabled;
+	}
+
+	/**
+	 * Toggle plan mode. Enabling arms the kernel-side write guard (edits raise
+	 * PlanModeError); a kernel that isn't running yet picks the state up at
+	 * bootstrap. Throws — without changing state — when the live kernel cannot
+	 * enforce the guard, so the UI never claims a protection that isn't active.
+	 */
+	async setPlanMode(enabled: boolean): Promise<void> {
+		if (this._planModeController.enabled === enabled) return;
+		const previous = this._planModeController.enabled;
+		this._planModeController.enabled = enabled;
+		try {
+			await this._ipythonKernelProvisioner?.setPlanMode(enabled);
+		} catch (error) {
+			this._planModeController.enabled = previous;
+			throw error;
+		}
+		this.sessionManager.appendPlanModeChange(enabled);
+		this._emit({ type: "plan_mode_changed", enabled });
 	}
 
 	// =========================================================================
@@ -3524,6 +3568,7 @@ export class AgentSession {
 				snapshotDir: this._ipythonKernelSnapshotDir,
 				readyGate: previousDispose,
 				onRestore: notifyRestore ? (result) => this._onIpythonStateRestored(result) : undefined,
+				planMode: this._planModeController,
 			});
 			configuredBaseToolDefinitions = createAllToolDefinitions(this._cwd, {
 				ipython: { provisioner: this._ipythonKernelProvisioner },
@@ -3808,6 +3853,7 @@ export class AgentSession {
 			sessionDir: options.sessionDir,
 			model: options.model,
 			thinkingLevel: this.thinkingLevel,
+			planMode: this._planModeController.enabled,
 			scopedModels: [...this._scopedModels],
 			activeToolNames: this.getActiveToolNames(),
 			allowedToolNames: this._allowedToolNames ? [...this._allowedToolNames] : undefined,
@@ -3898,6 +3944,8 @@ export class AgentSession {
 			rlmSessionDir: options.sessionDir,
 			rlmParentNodeId: options.rlmParentNodeId,
 			sessionStartEvent: { type: "session_start", reason: "startup" },
+			// A child spawned during plan mode must not be an edit escape hatch.
+			planMode: this._planModeController.enabled,
 		});
 
 		return { session: child };

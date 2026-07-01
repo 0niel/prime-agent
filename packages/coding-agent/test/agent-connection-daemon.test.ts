@@ -347,6 +347,7 @@ function createConnectionState(activeSessionId: string, sessionId: string): Agen
 		retryAttempt: 0,
 		steeringMode: "all",
 		followUpMode: "one-at-a-time",
+		planMode: false,
 		sessionFile: `/tmp/${sessionId}.jsonl`,
 		sessionId,
 		sessionName: `${sessionId} name`,

@@ -2059,6 +2059,7 @@ export class InteractiveMode {
 
 	private applyConnectionStateSnapshot(state: AgentConnectionState): void {
 		this.connectionState = state;
+		this.updatePlanModeIndicator(state.planMode);
 		// Don't touch contextUsageTokenBaseline: a mid-stream snapshot reflects only completed
 		// turns (the in-flight message isn't persisted yet), so the in-flight delta must keep
 		// accumulating. The baseline is managed at turn end (refreshConnectionContextUsage) and
@@ -2135,6 +2136,9 @@ export class InteractiveMode {
 				break;
 			case "thinking_level_changed":
 				this.patchConnectionState({ thinkingLevel: event.level });
+				break;
+			case "plan_mode_changed":
+				this.patchConnectionState({ planMode: event.enabled });
 				break;
 			case "auto_retry_start":
 				this.patchConnectionState({ retryAttempt: event.attempt });
@@ -3343,6 +3347,9 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
+		this.defaultEditor.onAction("app.plan.toggle", () => {
+			void this.togglePlanMode();
+		});
 		this.defaultEditor.onAction("app.subagents.focus", () => this.focusChildAgentSummary());
 		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
@@ -3505,6 +3512,11 @@ export class InteractiveMode {
 			if (commandName === "effort") {
 				this.editor.setText("");
 				this.handleEffortCommand(commandArgs);
+				return;
+			}
+			if (commandName === "plan") {
+				this.editor.setText("");
+				this.handlePlanCommand(commandArgs);
 				return;
 			}
 			if (commandName === "export") {
@@ -3991,6 +4003,10 @@ export class InteractiveMode {
 			case "thinking_level_changed":
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
+				break;
+
+			case "plan_mode_changed":
+				this.updatePlanModeIndicator(event.enabled);
 				break;
 
 			case "bash_start": {
@@ -6140,6 +6156,37 @@ export class InteractiveMode {
 			.catch((error) => {
 				this.showError(error instanceof Error ? error.message : String(error));
 			});
+	}
+
+	private async togglePlanMode(): Promise<void> {
+		await this.applyPlanMode(!(this.connectionState?.planMode ?? false));
+	}
+
+	private async applyPlanMode(enabled: boolean): Promise<void> {
+		try {
+			await this.agentConnection.setPlanMode(enabled);
+			this.patchConnectionState({ planMode: enabled });
+			this.updatePlanModeIndicator(enabled);
+			this.showStatus(enabled ? "Plan mode on: file edits are blocked" : "Plan mode off: file edits allowed");
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private updatePlanModeIndicator(enabled: boolean): void {
+		this.setExtensionStatus("plan-mode", enabled ? "⏸ plan" : undefined);
+		this.footer.invalidate();
+		this.ui.requestRender();
+	}
+
+	private handlePlanCommand(arg: string): void {
+		const requested = arg.trim().toLowerCase();
+		if (requested && requested !== "on" && requested !== "off") {
+			this.showError(`Usage: /plan [on|off]`);
+			return;
+		}
+		const enabled = requested ? requested === "on" : !(this.connectionState?.planMode ?? false);
+		void this.applyPlanMode(enabled);
 	}
 
 	private showModelSelector(initialSearchInput?: string): void {

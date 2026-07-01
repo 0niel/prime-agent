@@ -20,6 +20,7 @@ export interface AppKeybindings {
 	"app.provider.add": true;
 	"app.tools.expand": true;
 	"app.thinking.toggle": true;
+	"app.plan.toggle": true;
 	"app.subagents.focus": true;
 	"app.session.toggleNamedFilter": true;
 	"app.editor.external": true;
@@ -83,6 +84,10 @@ export const KEYBINDINGS = {
 	"app.thinking.toggle": {
 		defaultKeys: "ctrl+t",
 		description: "Toggle thinking blocks",
+	},
+	"app.plan.toggle": {
+		defaultKeys: "shift+tab",
+		description: "Toggle plan mode (no edits)",
 	},
 	"app.subagents.focus": {
 		defaultKeys: "alt+a",

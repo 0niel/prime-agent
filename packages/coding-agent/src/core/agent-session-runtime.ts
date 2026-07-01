@@ -269,6 +269,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			sessionOptions: {
 				model: options.model,
 				thinkingLevel: options.thinkingLevel,
+				planMode: options.planMode,
 				scopedModels: options.scopedModels,
 				initialActiveToolNames: options.activeToolNames,
 				allowedToolNames: options.allowedToolNames,

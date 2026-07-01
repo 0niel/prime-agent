@@ -37,6 +37,7 @@ export function createAgentConnectionState(
 		retryAttempt: session.retryAttempt,
 		steeringMode: session.steeringMode,
 		followUpMode: session.followUpMode,
+		planMode: session.planMode,
 		sessionFile: session.sessionFile,
 		sessionId: session.sessionId,
 		sessionName: session.sessionName,

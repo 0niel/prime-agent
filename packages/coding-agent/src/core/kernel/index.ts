@@ -3,7 +3,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
@@ -89,6 +89,8 @@ export interface ExecuteOptions {
 	maxOutputChars?: number;
 	/** Synthetic host cell (snapshot/restore/list); excluded from lastCellCode attribution. */
 	internal?: boolean;
+	/** Execute without recording the cell in IPython history (In[]/%history). */
+	silent?: boolean;
 }
 
 /** MIME tag the `edit` skill emits diff payloads under, via `display_data`. */
@@ -437,6 +439,8 @@ export class KernelManager {
 	private startPromise?: Promise<void>;
 	/** Pending debounced auto-snapshot, if one has been scheduled. */
 	private snapshotTimer?: ReturnType<typeof globalThis.setTimeout>;
+	/** Authenticates plan-guard toggles; held host-side only. */
+	private readonly planGuardToken = randomBytes(32).toString("hex");
 
 	constructor(options: KernelManagerOptions) {
 		this.options = {
@@ -732,8 +736,8 @@ export class KernelManager {
 			"execute_request",
 			{
 				code,
-				silent: false,
-				store_history: true,
+				silent: opts.silent ?? false,
+				store_history: !opts.silent,
 				user_expressions: {},
 				allow_stdin: false,
 				stop_on_error: true,
@@ -1159,6 +1163,35 @@ export class KernelManager {
 		} catch (error) {
 			this.appendKernelDiagnostic(`state restore error: ${errorMessage(error)}`);
 			return null;
+		}
+	}
+
+	/**
+	 * Toggle the kernel-side plan-mode write guard (rlm.plan_guard). Runs as a
+	 * silent cell so the host-held token never lands in IPython history. Throws
+	 * when the kernel runtime cannot enforce the guard.
+	 */
+	async setPlanMode(enabled: boolean, extraWritableRoots: readonly string[] = []): Promise<void> {
+		const roots = new Set(extraWritableRoots);
+		// The guard must not break the host's own machinery: snapshots and the
+		// connection temp dir stay writable.
+		if (this.options.snapshot) {
+			roots.add(dirname(this.options.snapshot.path));
+			roots.add(dirname(this.options.snapshot.manifestPath));
+		}
+		if (this.tempDir) roots.add(this.tempDir);
+		const token = JSON.stringify(this.planGuardToken);
+		const code = [
+			"from rlm import plan_guard as _prime_agent_plan_guard",
+			`_prime_agent_plan_guard.install(${token})`,
+			`_prime_agent_plan_guard.set_enabled(${token}, ${enabled ? "True" : "False"}, ${JSON.stringify([...roots])})`,
+		].join("\n");
+		const r = await this.enqueueExecute(code, { internal: true, silent: true });
+		if (r.status !== "ok") {
+			const details = [r.error?.evalue, r.stderr].filter(Boolean).join("\n");
+			throw new Error(
+				`Failed to ${enabled ? "enable" : "disable"} the plan-mode guard in the IPython kernel: ${details}`,
+			);
 		}
 	}
 

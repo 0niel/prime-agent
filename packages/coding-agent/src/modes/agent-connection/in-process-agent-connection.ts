@@ -266,6 +266,10 @@ export class InProcessAgentConnection implements AgentConnection {
 		return this.session.cycleThinkingLevel();
 	}
 
+	async setPlanMode(enabled: boolean): Promise<void> {
+		await this.session.setPlanMode(enabled);
+	}
+
 	async setTransport(transport: Transport): Promise<void> {
 		this.session.settingsManager.setTransport(transport);
 		this.session.agent.transport = transport;
