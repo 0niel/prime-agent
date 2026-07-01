@@ -399,9 +399,7 @@ describe("parseArgs", () => {
 		test("a dash-leading prompt without -- still errors", () => {
 			const result = parseArgs(["- do the thing"]);
 			expect(result.messages).toEqual([]);
-			expect(result.diagnostics).toEqual([
-				{ type: "error", message: "Unknown option: - do the thing" },
-			]);
+			expect(result.diagnostics).toEqual([{ type: "error", message: "Unknown option: - do the thing" }]);
 		});
 
 		test("does not parse flags after -- as options", () => {

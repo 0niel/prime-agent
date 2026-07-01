@@ -39,9 +39,11 @@ export class ForkServerUnavailable extends Error {
 	}
 }
 
-/** Fork is a Linux-only, in-process fan-out optimization. */
+// On by default on Linux (fork-without-exec is unsafe on macOS);
+// PRIME_AGENT_KERNEL_FORKSERVER=0 opts out.
 export function isForkServerEnabled(): boolean {
-	return process.platform === "linux" && process.env.PRIME_AGENT_KERNEL_FORKSERVER === "1";
+	if (process.platform !== "linux") return false;
+	return process.env.PRIME_AGENT_KERNEL_FORKSERVER !== "0";
 }
 
 // A forkserver template is defined solely by the interpreter — the imported

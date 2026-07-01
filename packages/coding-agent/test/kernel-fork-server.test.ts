@@ -8,15 +8,17 @@ describe("fork-server gating", () => {
 		delete process.env[FORK_ENV];
 	});
 
-	it("is disabled unless the flag is set on linux", () => {
+	it("is on by default on linux, opt-out via the flag", () => {
 		delete process.env[FORK_ENV];
+		expect(isForkServerEnabled()).toBe(process.platform === "linux");
+		process.env[FORK_ENV] = "0";
 		expect(isForkServerEnabled()).toBe(false);
 		process.env[FORK_ENV] = "1";
 		expect(isForkServerEnabled()).toBe(process.platform === "linux");
 	});
 
-	it("rejects with ForkServerUnavailable when disabled so callers fall back", async () => {
-		delete process.env[FORK_ENV];
+	it("rejects with ForkServerUnavailable when opted out so callers fall back", async () => {
+		process.env[FORK_ENV] = "0";
 		await expect(forkKernel("python3", { connectionPath: "/tmp/nope/connection.json" })).rejects.toBeInstanceOf(
 			ForkServerUnavailable,
 		);
@@ -24,7 +26,6 @@ describe("fork-server gating", () => {
 
 	it("degrades to ForkServerUnavailable when the interpreter can't start", async () => {
 		if (process.platform !== "linux") return;
-		process.env[FORK_ENV] = "1";
 		// The spawn errors immediately (ENOENT), so markDead fails the ready promise
 		// fast rather than waiting out the ready timeout.
 		await expect(
@@ -34,7 +35,6 @@ describe("fork-server gating", () => {
 
 	it("falls back to direct spawn for any PYTHON* startup-env override", async () => {
 		if (process.platform !== "linux") return;
-		process.env[FORK_ENV] = "1";
 		// The guard treats the whole PYTHON* family as startup-affecting, so even a var
 		// not explicitly enumerated diverts to direct spawn (no var can be "missed").
 		for (const key of ["PYTHONPATH", "PYTHONUSERBASE", "PYTHONDONTWRITEBYTECODE"]) {

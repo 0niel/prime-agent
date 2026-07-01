@@ -32,7 +32,8 @@ function arg(name, def) {
 const mode = arg("mode", "gated");
 const n = Number(arg("n", 50)) || 50;
 
-if (mode === "forkserver") process.env.PRIME_AGENT_KERNEL_FORKSERVER = "1";
+// Pin per-mode so the default-on forkserver doesn't leak into the direct-spawn modes.
+process.env.PRIME_AGENT_KERNEL_FORKSERVER = mode === "forkserver" ? "1" : "0";
 
 const { KernelManager } = await import(kernelMod);
 const { ensureKernelPython } = await import(bootstrapMod);
