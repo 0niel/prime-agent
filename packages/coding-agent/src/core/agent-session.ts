@@ -4081,6 +4081,9 @@ export class AgentSession {
 				if (!(await ensureTool("rg", true))) {
 					throw new Error(MISSING_RIPGREP_MESSAGE);
 				}
+				if (isRlmChildRunCancelled(run)) {
+					throw new Error(run.error ?? "RLM child cancelled");
+				}
 				childRuntime = await this._createRlmSubagentRuntime(subagentOptions);
 				const child = childRuntime.session;
 				childSession = child;
