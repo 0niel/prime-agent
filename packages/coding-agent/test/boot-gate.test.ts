@@ -2,10 +2,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import { resolveKernelBootConcurrency } from "../src/core/kernel/boot-gate.js";
 
 const ENV = "PRIME_AGENT_MAX_CONCURRENT_KERNEL_BOOTS";
+const FORK_ENV = "PRIME_AGENT_KERNEL_FORKSERVER";
 
 describe("resolveKernelBootConcurrency", () => {
 	afterEach(() => {
 		delete process.env[ENV];
+		delete process.env[FORK_ENV];
 	});
 
 	it("never returns a value below 1 (so the semaphore can't throw at load)", () => {
@@ -15,10 +17,22 @@ describe("resolveKernelBootConcurrency", () => {
 		}
 	});
 
-	it("honors a clean positive integer, clamped to the max", () => {
+	it("honors a clean positive integer, clamped to the direct-spawn max", () => {
 		process.env[ENV] = "8";
 		expect(resolveKernelBootConcurrency()).toBe(8);
 		process.env[ENV] = "999999";
 		expect(resolveKernelBootConcurrency()).toBe(64);
+	});
+
+	it("raises the ceiling when the forkserver is enabled (linux only)", () => {
+		if (process.platform !== "linux") return;
+		process.env[FORK_ENV] = "1";
+		// Auto default is well above the direct-spawn default but still bounded.
+		const auto = resolveKernelBootConcurrency();
+		expect(auto).toBeGreaterThanOrEqual(32);
+		expect(auto).toBeLessThanOrEqual(128);
+		// A huge override is clamped to the fork backstop, not the direct-spawn cap.
+		process.env[ENV] = "999999";
+		expect(resolveKernelBootConcurrency()).toBe(128);
 	});
 });
