@@ -13,6 +13,12 @@ import { ToolPanel } from "./tool-panel.js";
 export interface ToolExecutionOptions {
 	showImages?: boolean;
 	imageWidthCells?: number;
+	/**
+	 * Whether this component may emit inline terminal image escape sequences.
+	 * Historical session replay disables this so loading image-heavy sessions does
+	 * not re-send every image in the scrollback.
+	 */
+	allowInlineImages?: boolean;
 }
 
 export interface ToolExecutionRendererDefinition {
@@ -41,6 +47,7 @@ export class ToolExecutionComponent extends Container {
 	private args: any;
 	private expanded = false;
 	private showImages: boolean;
+	private allowInlineImages: boolean;
 	private imageWidthCells: number;
 	private isPartial = true;
 	private toolDefinition?: ToolExecutionDefinition;
@@ -73,6 +80,7 @@ export class ToolExecutionComponent extends Container {
 		this.toolDefinition = toolDefinition;
 		this.builtInToolDefinition = createAllToolDefinitions(cwd)[toolName as ToolName];
 		this.showImages = options.showImages ?? true;
+		this.allowInlineImages = options.allowInlineImages ?? true;
 		this.imageWidthCells = options.imageWidthCells ?? 60;
 		this.ui = ui;
 		this.cwd = cwd;
@@ -136,7 +144,12 @@ export class ToolExecutionComponent extends Container {
 		return this.toolName === "ipython" && !this.toolDefinition?.renderCall && !this.toolDefinition?.renderResult;
 	}
 
+	private shouldRenderInlineImages(): boolean {
+		return this.showImages && this.allowInlineImages;
+	}
+
 	private getRenderContext(lastComponent: Component | undefined): ToolRenderContext {
+		const renderInlineImages = this.shouldRenderInlineImages();
 		return {
 			args: this.args,
 			toolCallId: this.toolCallId,
@@ -151,7 +164,8 @@ export class ToolExecutionComponent extends Container {
 			argsComplete: this.argsComplete,
 			isPartial: this.isPartial,
 			expanded: this.expanded,
-			showImages: this.showImages,
+			showImages: renderInlineImages,
+			includeImageDimensions: this.allowInlineImages,
 			isError: this.result?.isError ?? false,
 		};
 	}
@@ -200,6 +214,7 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private maybeConvertImagesForKitty(): void {
+		if (!this.allowInlineImages) return;
 		const caps = getCapabilities();
 		if (caps.images !== "kitty") return;
 		if (!this.result) return;
@@ -229,6 +244,17 @@ export class ToolExecutionComponent extends Container {
 
 	setShowImages(show: boolean): void {
 		this.showImages = show;
+		if (show) {
+			this.maybeConvertImagesForKitty();
+		}
+		this.updateDisplay();
+	}
+
+	setAllowInlineImages(allow: boolean): void {
+		this.allowInlineImages = allow;
+		if (allow) {
+			this.maybeConvertImagesForKitty();
+		}
 		this.updateDisplay();
 	}
 
@@ -270,6 +296,7 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private updateDisplay(): void {
+		const renderInlineImages = this.shouldRenderInlineImages();
 		let hasContent = false;
 		this.hideComponent = false;
 		if (this.hasRendererDefinition() && this.getRenderShell() === "self") {
@@ -285,7 +312,7 @@ export class ToolExecutionComponent extends Container {
 					expanded: this.expanded,
 					executionStarted: this.executionStarted,
 					argsComplete: this.argsComplete,
-					showImages: this.showImages,
+					showImages: renderInlineImages,
 					cwd: this.cwd,
 				};
 				if (!this.ipythonCellComponent) {
@@ -328,7 +355,7 @@ export class ToolExecutionComponent extends Container {
 			const caps = getCapabilities();
 			for (let i = 0; i < imageBlocks.length; i++) {
 				const img = imageBlocks[i];
-				if (caps.images && this.showImages && img.data && img.mimeType) {
+				if (caps.images && renderInlineImages && img.data && img.mimeType) {
 					const converted = this.convertedImages.get(i);
 					const imageData = converted?.data ?? img.data;
 					const imageMimeType = converted?.mimeType ?? img.mimeType;
@@ -435,7 +462,9 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private getTextOutput(): string {
-		return getRenderedTextOutput(this.result, this.showImages);
+		return getRenderedTextOutput(this.result, this.shouldRenderInlineImages(), {
+			includeImageDimensions: this.allowInlineImages,
+		});
 	}
 
 	private formatToolExecution(): string {

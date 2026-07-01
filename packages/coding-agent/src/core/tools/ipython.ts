@@ -5,6 +5,7 @@ import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import { IMAGE_MIME_TYPES } from "../../utils/mime.js";
 import type { ToolDefinition } from "../extensions/types.js";
+import { withKernelBootPermit } from "../kernel/boot-gate.js";
 import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
 import {
 	type HostRequestHandlers,
@@ -181,6 +182,7 @@ export class IpythonKernelProvisioner {
 	private readonly startupListeners = new Set<KernelBootstrapProgressHandler>();
 	private lastStartupMessage?: string;
 	private _lastRestore?: RestoreResult;
+	private readonly disposeController = new AbortController();
 
 	constructor(
 		private readonly cwd: string,
@@ -219,6 +221,10 @@ export class IpythonKernelProvisioner {
 
 	/** Dispose the kernel owned by this provisioner, including one still starting up. */
 	async dispose(): Promise<void> {
+		// Drops a still-queued boot out of the semaphore and short-circuits an
+		// in-flight startKernel before it spawns, so a disposed session's boot
+		// doesn't waste a slot during a fan-out.
+		this.disposeController.abort();
 		const pending = this.managerPromise;
 		this.managerPromise = undefined;
 		this.startedManager = undefined;
@@ -295,9 +301,20 @@ export class IpythonKernelProvisioner {
 				? { path: snapshotPathIn(snapshotDir), manifestPath: manifestPathIn(snapshotDir) }
 				: undefined,
 		});
+		// Emitted synchronously (before the permit await) so a listener attaching
+		// mid-flight can replay the current stage.
 		this.emitStartupProgress("Starting IPython kernel...");
-		await m.start({ onBootstrapProgress: (message) => this.emitStartupProgress(message) });
-		// Whether a snapshot existed decides if we notify the model on success.
+		// Only the process spawn + port resolve contends for OS resources under a
+		// fan-out, and it is bounded by start()'s own timeouts — so the permit
+		// covers only start(). Restore/bootstrap run per-kernel afterwards and are
+		// unbounded execute()s; holding the global permit across them could pin it
+		// forever on a wedged bootstrap and starve every other session's boot.
+		const signal = this.disposeController.signal;
+		await withKernelBootPermit(() => {
+			// Disposed while queued for the permit — don't spawn a kernel nobody wants.
+			if (signal.aborted) throw new Error("Kernel provisioner disposed before start");
+			return m.start({ onBootstrapProgress: (message) => this.emitStartupProgress(message) });
+		}, signal);
 		let pendingRestore: RestoreResult | undefined;
 		try {
 			// Revive a prior session's namespace before the bootstrap, so the bootstrap
@@ -358,10 +375,16 @@ export function createIpythonToolDefinition(
 		executionMode: "sequential",
 		parameters: ipythonSchema,
 		execute: async (_toolCallId, params, signal, onUpdate, ctx) => {
+			// Cosmetic; ctx.ui can throw on a stale ctx, but must never fail the cell.
+			const setWorkingMessage = (message?: string) => {
+				try {
+					ctx?.ui.setWorkingMessage(message);
+				} catch {}
+			};
 			let reportedStartupProgress = false;
 			const reportStartupProgress: KernelBootstrapProgressHandler = (message) => {
 				reportedStartupProgress = true;
-				ctx?.ui.setWorkingMessage(message);
+				setWorkingMessage(message);
 				onUpdate?.({
 					content: [{ type: "text", text: message }],
 					details: { status: "starting" },
@@ -407,7 +430,7 @@ export function createIpythonToolDefinition(
 				};
 			} finally {
 				if (reportedStartupProgress) {
-					ctx?.ui.setWorkingMessage();
+					setWorkingMessage();
 				}
 			}
 		},

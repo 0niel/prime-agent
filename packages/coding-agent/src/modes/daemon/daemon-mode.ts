@@ -47,6 +47,7 @@ import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionRuntime,
 } from "../../core/agent-session-runtime.js";
+import { flushAgentTraceUpload } from "../../core/agent-traces.js";
 import {
 	type AgentCronJob,
 	AgentCronJobStore,
@@ -319,43 +320,9 @@ export class AgentDaemon {
 		this.registerSignalHandlers();
 		this.summarizer.start();
 		this.log(`Prime Agent daemon listening on ${this.socketPath}`);
-		void this.restoreActiveSessions().finally(() => {
-			if (!this.shuttingDown) {
-				this.cronScheduler.start();
-			}
-		});
-	}
-
-	/**
-	 * Reload sessions that were daemon-resident when the previous daemon
-	 * exited (clean shutdown or crash). Runs in the background after the
-	 * socket starts listening so startup latency is unaffected; clients see
-	 * restored sessions appear in list results as each one loads.
-	 */
-	private async restoreActiveSessions(): Promise<void> {
-		let saved: SessionInfo[];
-		try {
-			saved = await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir);
-		} catch (error) {
-			this.log(`Failed to scan sessions for restore: ${error instanceof Error ? error.message : String(error)}`);
-			return;
-		}
-		for (const info of saved) {
-			// Empty sessions carry no work worth restoring; leaving them out keeps
-			// abandoned create-and-quit sessions from resurrecting on every restart.
-			if (info.state?.status !== "active" || info.messageCount === 0) {
-				continue;
-			}
-			if (this.shuttingDown) {
-				return;
-			}
-			try {
-				await this.createRuntime({ type: "create", sessionPath: info.path });
-			} catch (error) {
-				this.log(
-					`Failed to restore session ${info.path}: ${error instanceof Error ? error.message : String(error)}`,
-				);
-			}
+		// No startup restore: on-disk sessions return only via /resume or --resume.
+		if (!this.shuttingDown) {
+			this.cronScheduler.start();
 		}
 	}
 
@@ -392,16 +359,6 @@ export class AgentDaemon {
 		this.rebindCronJobsToState(state);
 		if (name) {
 			state.runtime.session.setSessionName(name);
-		}
-		if (runtime.metadata.kind !== "subagent") {
-			// Mark the session as daemon-resident so a restarted daemon can
-			// restore it. Closes for kill/completed/replaced flip this back to
-			// sleep; clean shutdowns leave it in place on purpose.
-			try {
-				runtime.session.sessionManager.appendSessionState({ status: "active" });
-			} catch {
-				// Marking is best-effort; the session still works unrestored.
-			}
 		}
 		// Restore the last persisted status so it shows before the first sweep.
 		this.summarizer.seed(state);
@@ -756,10 +713,22 @@ export class AgentDaemon {
 					throw cascadeError;
 				}
 			},
-			releaseRlmSubagentRuntime: async (runtime) => {
+			releaseRlmSubagentRuntime: async (runtime, options, status) => {
 				const state = this.findRuntimeState(runtime);
+				// A successful subagent stays resident so it's still viewable (torn down with the
+				// parent via closeChildSessions); errored/cancelled would re-seed as "done", so close them.
+				if (state && status === "done") {
+					// Run shutdown side effects without disposing the still-readable session.
+					this.cancelSubagentRlmHeartbeats(state);
+					await flushAgentTraceUpload(state.runtime.session.sessionManager).catch(() => undefined);
+					// Retention can decline if the parent is already tearing down; if so, close
+					// the session here so it doesn't linger in the registry.
+					if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
+						return;
+					}
+				}
 				if (state) {
-					await this.closeSession(state, "completed");
+					await this.closeSession(state, status === "cancelled" ? "killed" : "completed");
 					return;
 				}
 				if (runtime instanceof AgentSessionRuntime) {
@@ -1943,6 +1912,7 @@ export class AgentDaemon {
 		// draft closed via kill/completed is never wiped.
 		const isEmptyDraftSession = reason !== "shutdown" && this.isEmptyDraftContent(state);
 		let persistError: unknown;
+		// Clean shutdown leaves the session un-archived so it stays in the resume list.
 		if (reason !== "shutdown" && !isEmptyDraftSession) {
 			try {
 				state.runtime.session.sessionManager.appendSessionState({ status: "archived" });
@@ -2008,12 +1978,31 @@ export class AgentDaemon {
 				void this.closeSession(state, "killed");
 			}
 		}
+		this.stampRlmChildActiveSessionId(message);
 		const sequencedMessage = this.addSessionEventMeta(state, message);
 		for (const client of state.clients) {
 			if (!shouldSendDaemonOutboundToClient(client, sequencedMessage)) {
 				continue;
 			}
 			this.write(client, sequencedMessage);
+		}
+	}
+
+	// The AgentSession doesn't know its own daemon active-session id, so fill it in here.
+	private stampRlmChildActiveSessionId(message: DaemonOutbound): void {
+		if (
+			message.type !== "session_event" ||
+			message.event.type !== "rlm_child_update" ||
+			message.event.child.activeSessionId
+		) {
+			return;
+		}
+		const childId = message.event.child.id;
+		for (const candidate of this.sessions.values()) {
+			if (candidate.runtime.metadata.rlmChildId === childId) {
+				message.event.child.activeSessionId = candidate.activeSessionId;
+				return;
+			}
 		}
 	}
 

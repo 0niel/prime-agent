@@ -9,10 +9,12 @@ import {
 	ensureKernelPython,
 	getKernelVenvDir,
 	type KernelPythonSkill,
+	resolveRuntimeIdentity,
 } from "../src/core/kernel/bootstrap.js";
 
 let tempDir = "";
 let originalEnv: NodeJS.ProcessEnv;
+let runtimeIdentity = "";
 
 function pyprojectHash(pyprojectPath: string): string {
 	return `sha256:${createHash("sha256").update(readFileSync(pyprojectPath)).digest("hex")}`;
@@ -27,9 +29,9 @@ function writeBootstrapVersion(venv: string, pythonSkills: readonly KernelPython
 	writeFileSync(
 		join(venv, ".bootstrap-version"),
 		`${JSON.stringify({
-			schema: 7,
+			schema: 8,
 			ipykernel: "ipykernel",
-			runtime: "prime-agent-runtime",
+			runtime: runtimeIdentity,
 			snapshot: "dill",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
 			pythonSkills: pythonSkills.map((skill) => ({
@@ -133,7 +135,8 @@ function installFakeUv(): string {
 }
 
 describe("kernel bootstrap", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
+		runtimeIdentity = await resolveRuntimeIdentity();
 		originalEnv = { ...process.env };
 		tempDir = mkdtempSync(join(tmpdir(), "prime-agent-kernel-bootstrap-"));
 		process.env.HOME = tempDir;
@@ -177,13 +180,14 @@ describe("kernel bootstrap", () => {
 		}
 		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
 		expect(version).toEqual({
-			schema: 7,
+			schema: 8,
 			ipykernel: "ipykernel",
-			runtime: "prime-agent-runtime",
+			runtime: runtimeIdentity,
 			snapshot: "dill",
 			extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
 			pythonSkills: [],
 		});
+		expect(version.runtime).toMatch(/^sha256:/);
 	});
 
 	it("routes bootstrap progress through the provided callback", async () => {
@@ -201,9 +205,33 @@ describe("kernel bootstrap", () => {
 			stderrWrite.mockRestore();
 		}
 
-		expect(progress).toEqual(expect.arrayContaining(["› setting up python kernel (one-time, ~30s)…", "✓ ready"]));
-		expect(stderrWrite).not.toHaveBeenCalledWith(expect.stringContaining("setting up python kernel"));
+		// Fake uv is on PATH, so the uv-install step is skipped; the rest describe real steps.
+		expect(progress).toEqual([
+			"installing Python 3.11 · 0%",
+			expect.stringMatching(/^creating virtual environment · \d+%$/),
+			expect.stringMatching(/^installing packages \(.+\) · \d+%$/),
+			"✓ ready · 100%",
+		]);
+
+		const percents = progress.map((line) => Number(line.match(/(\d+)%$/)?.[1] ?? "0"));
+		expect(percents).toEqual([...percents].sort((a, b) => a - b));
+		expect(percents.at(-1)).toBe(100);
 		expect(stderrWrite).not.toHaveBeenCalledWith(expect.stringContaining("ready"));
+	});
+
+	it("does not show an installing-uv step when uv install is refused", async () => {
+		// uv absent from PATH and from the temp HOME, and install not permitted.
+		const emptyBin = join(tempDir, "empty-bin");
+		mkdirSync(emptyBin, { recursive: true });
+		process.env.PATH = emptyBin;
+		delete process.env.PRIME_AGENT_INSTALL_UV;
+		const venv = join(tempDir, "kernel-venv");
+		const progress: string[] = [];
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+
+		await expect(ensureKernelPython({ onProgress: (message) => progress.push(message) })).rejects.toThrow(/uv/);
+		expect(progress).not.toContain(expect.stringContaining("installing uv"));
+		expect(progress.some((line) => line.startsWith("installing uv"))).toBe(false);
 	});
 
 	it("installs Python skills into the bootstrapped venv", async () => {
@@ -341,6 +369,32 @@ dependencies = ["httpx"]
 		process.env.PRIME_AGENT_KERNEL_VENV = venv;
 
 		await expect(ensureKernelPython()).resolves.toBe(python);
+	});
+
+	it("rebuilds a warm venv whose recorded runtime hash no longer matches local source", async () => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const python = join(venv, "bin", "python");
+		mkdirSync(join(venv, "bin"), { recursive: true });
+		writeFakePython(python, ["ipykernel", "rlm", ...DEFAULT_RLM_EXTRA_IMPORT_NAMES]);
+		writeFileSync(
+			join(venv, ".bootstrap-version"),
+			`${JSON.stringify({
+				schema: 8,
+				ipykernel: "ipykernel",
+				runtime: "sha256:stale",
+				snapshot: "dill",
+				extraUvArgs: DEFAULT_RLM_EXTRA_UV_ARGS,
+				pythonSkills: [],
+			})}\n`,
+		);
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+
+		await expect(ensureKernelPython()).resolves.toBe(python);
+
+		expect(readFileSync(logPath, "utf8")).toContain(`venv ${venv} --python 3.11 --seed`);
+		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
+		expect(version.runtime).toBe(runtimeIdentity);
 	});
 
 	it("rebuilds a warm venv with a stale rlm runtime", async () => {

@@ -129,6 +129,53 @@ describe("AgentSession retry", () => {
 		return { session, getCallCount: () => callCount };
 	}
 
+	// Build a session whose stream fails `failCount` times with `errorMessage`, then succeeds.
+	function createSessionWithError(errorMessage: string, options?: { failCount?: number; maxRetries?: number }) {
+		const failCount = options?.failCount ?? 1;
+		const maxRetries = options?.maxRetries ?? 3;
+		let callCount = 0;
+
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: "Test", tools: [] },
+			streamFn: () => {
+				callCount++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					if (callCount <= failCount) {
+						const msg = createAssistantMessage("", { stopReason: "error", errorMessage });
+						stream.push({ type: "start", partial: msg });
+						stream.push({ type: "error", reason: "error", error: msg });
+					} else {
+						const msg = createAssistantMessage("Recovered after retry");
+						stream.push({ type: "start", partial: msg });
+						stream.push({ type: "done", reason: "stop", message: msg });
+					}
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = ModelRegistry.create(authStorage, tempDir);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries, baseDelayMs: 1 } });
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRegistry,
+			resourceLoader: createTestResourceLoader(),
+		});
+
+		return { session, getCallCount: () => callCount };
+	}
+
 	it("retries after a transient error and succeeds", async () => {
 		const created = createSession({ failCount: 1 });
 		const events: string[] = [];
@@ -314,5 +361,50 @@ describe("AgentSession retry", () => {
 		// A follow-up prompt must work (no "Agent is already processing" error)
 		await session.prompt("Follow-up");
 		expect(callCount).toBe(4);
+	});
+
+	// Transient provider stream artifacts the classifier previously missed (ENG-4390).
+	const transientProviderErrors: Array<[string, string]> = [
+		["content_filter finish_reason", "Provider finish_reason: content_filter"],
+		["cybersecurity policy flag", "Your request was flagged for cybersecurity risk and cannot be processed."],
+		["usage policy flag", "flagged as potentially violating our usage policy"],
+		["prose-form transient 5xx", "An error occurred while processing your request. You can retry your request."],
+	];
+
+	for (const [name, errorMessage] of transientProviderErrors) {
+		it(`retries transient provider error: ${name}`, async () => {
+			const created = createSessionWithError(errorMessage, { failCount: 1 });
+			const events: string[] = [];
+			created.session.subscribe((event) => {
+				if (event.type === "auto_retry_start") events.push(`start:${event.attempt}`);
+				if (event.type === "auto_retry_end") events.push(`end:success=${event.success}`);
+			});
+
+			await created.session.prompt("Test");
+
+			expect(created.getCallCount()).toBe(2);
+			expect(events).toEqual(["start:1", "end:success=true"]);
+			expect(created.session.isRetrying).toBe(false);
+		});
+	}
+
+	it("bounds retries on a persistent content_filter block", async () => {
+		const created = createSessionWithError("Provider finish_reason: content_filter", {
+			failCount: 99,
+			maxRetries: 2,
+		});
+		const events: string[] = [];
+		created.session.subscribe((event) => {
+			if (event.type === "auto_retry_start") events.push(`start:${event.attempt}`);
+			if (event.type === "auto_retry_end") events.push(`end:success=${event.success}`);
+		});
+
+		await created.session.prompt("Test");
+
+		expect(created.getCallCount()).toBe(3);
+		expect(events).toContain("start:1");
+		expect(events).toContain("start:2");
+		expect(events).toContain("end:success=false");
+		expect(created.session.isRetrying).toBe(false);
 	});
 });

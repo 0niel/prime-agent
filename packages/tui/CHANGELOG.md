@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-06-30
+
 ## [0.2.2] - 2026-06-25
 
 - Added `fuzzyFilterScored`, returning scored matches so callers can break ties by recency; `fuzzyFilter` delegates to it unchanged ([#251](https://github.com/PrimeIntellect-ai/prime-agent/issues/251)).

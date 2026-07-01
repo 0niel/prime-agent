@@ -99,4 +99,43 @@ describe("openai-completions convertMessages", () => {
 		);
 		expect(imageParts.length).toBe(2);
 	});
+
+	it("does not emit the image placeholder for empty-text tool results with no image", () => {
+		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini");
+		const model: Model<"openai-completions"> = {
+			...baseModel,
+			api: "openai-completions",
+			input: ["text", "image"],
+		};
+
+		const now = Date.now();
+		const assistantMessage: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "tool-1", name: "bash", arguments: { cmd: "true" } }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: emptyUsage,
+			stopReason: "toolUse",
+			timestamp: now,
+		};
+
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "tool-1",
+			toolName: "bash",
+			content: [{ type: "text", text: "" }],
+			isError: false,
+			timestamp: now + 1,
+		};
+
+		const context: Context = {
+			messages: [{ role: "user", content: "Run it", timestamp: now - 2 }, assistantMessage, toolResult],
+		};
+
+		const messages = convertMessages(model, context, compat);
+		const toolMessage = messages.find((message) => message.role === "tool");
+		expect(toolMessage?.content).toBe("");
+		expect(toolMessage?.content).not.toBe("(see attached image)");
+	});
 });

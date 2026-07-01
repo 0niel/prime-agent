@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntimeConfig } from "../src/core/agent-session-config.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
@@ -9,6 +12,7 @@ import {
 	createAgentsViewSessionName,
 	formatAgentsViewRelativeTime,
 	formatAgentsViewStatusLine,
+	resolveAgentsViewOpenCwd,
 	resolveAgentsViewSessionUiServices,
 } from "../src/modes/agents-view/agents-view-mode.js";
 import {
@@ -191,6 +195,58 @@ describe("agents view state", () => {
 			["Completed child", "subagent", 1],
 		]);
 		expect(expanded.slice(1).every((row) => row.selectable && row.parentIdentity === parentIdentity)).toBe(true);
+	});
+
+	test("reveals a nested subagent only after its parent is also expanded", () => {
+		const summaries = [
+			makeSummary({
+				id: "grandchild-active",
+				activeSessionId: "grandchild-active",
+				sessionId: "grandchild-session",
+				sessionName: "Grandchild",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "child-active",
+				parentSessionId: "child-session",
+				isStreaming: true,
+				activity: "working",
+			}),
+			makeSummary({
+				id: "child-active",
+				activeSessionId: "child-active",
+				sessionId: "child-session",
+				sessionName: "Child",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "root-active",
+				parentSessionId: "root-session",
+				isStreaming: true,
+				activity: "working",
+			}),
+			makeSummary({
+				id: "root-active",
+				activeSessionId: "root-active",
+				sessionId: "root-session",
+				sessionName: "Root",
+				isStreaming: true,
+				activity: "working",
+			}),
+		];
+
+		const rootIdentity = buildAgentsViewRows(summaries)[0]?.identity ?? "";
+		// Expanding only the root reveals the child but not the grandchild.
+		const oneLevel = buildAgentsViewRows(summaries, new Set([rootIdentity]));
+		expect(oneLevel.map((row) => [row.title, row.kind])).toEqual([
+			["Root", "agent"],
+			["Child", "subagent"],
+			["1 subagent running", "subagent-summary"],
+		]);
+
+		const childIdentity = oneLevel.find((row) => row.title === "Child")?.identity ?? "";
+		const twoLevel = buildAgentsViewRows(summaries, new Set([rootIdentity, childIdentity]));
+		expect(twoLevel.map((row) => [row.title, row.kind, row.depth])).toEqual([
+			["Root", "agent", 0],
+			["Child", "subagent", 1],
+			["Grandchild", "subagent", 2],
+		]);
 	});
 
 	test("keeps finished subagents reachable via the summary row", () => {
@@ -422,13 +478,36 @@ describe("agents view state", () => {
 		expect(config.cwd).toBe("/tmp/dashboard");
 	});
 
-	test("requests all sessions (in-memory + on-disk) for the agents view refresh", () => {
-		expect(createAgentsViewListCommand({ cwd: "/tmp/project" })).toEqual({ type: "list", all: true });
-		expect(createAgentsViewListCommand({ cwd: "/tmp/project", sessionDir: "/tmp/sessions" })).toEqual({
-			type: "list",
-			all: true,
-			sessionDir: "/tmp/sessions",
-		});
+	test("opens an existing-cwd session in its own directory with no override or notice", () => {
+		const dir = mkdtempSync(join(tmpdir(), "agents-view-cwd-"));
+		try {
+			expect(resolveAgentsViewOpenCwd(makeSummary({ cwd: dir }), "/tmp/launch")).toEqual({});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("falls back to the launch cwd and explains it when the stored cwd is gone", () => {
+		const missing = join(tmpdir(), "agents-view-missing-worktree-does-not-exist");
+		const { overrideCwd, notice } = resolveAgentsViewOpenCwd(makeSummary({ cwd: missing }), "/tmp/launch");
+		expect(overrideCwd).toBe("/tmp/launch");
+		expect(notice).toContain(missing);
+		expect(notice).toContain("/tmp/launch");
+	});
+
+	test("does not override when there is no fallback cwd to use", () => {
+		const missing = join(tmpdir(), "agents-view-missing-worktree-does-not-exist");
+		expect(resolveAgentsViewOpenCwd(makeSummary({ cwd: missing }), undefined)).toEqual({});
+	});
+
+	test("passes the override cwd through the resume config when the stored cwd is missing", () => {
+		const config: AgentSessionRuntimeConfig = { cwd: "/tmp/launch", agentDir: "/tmp/agents" };
+		const resumeConfig = createAgentsViewResumeConfig(config, "/tmp/launch");
+		expect(resumeConfig.cwd).toBe("/tmp/launch");
+	});
+
+	test("requests only daemon-resident sessions for the agents view refresh", () => {
+		expect(createAgentsViewListCommand()).toEqual({ type: "list" });
 	});
 
 	test("derives the reply headline from the first line of the latest assistant text", () => {

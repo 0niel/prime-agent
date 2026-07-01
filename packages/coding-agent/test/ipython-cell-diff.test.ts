@@ -270,4 +270,61 @@ describe("IPythonCellComponent diff rendering", () => {
 		// Hunks are separated by the vertical-ellipsis marker.
 		expect((out.match(/⋮/g) ?? []).length).toBe(2);
 	});
+
+	it("keeps the top line stable when expanded — only the hint flips, no header line, no layout shift", () => {
+		const state = {
+			code: "print(55)",
+			content: [{ type: "text", text: "55" }],
+			details: { status: "ok", durationMs: 780_000 },
+			executionStarted: true,
+			argsComplete: true,
+		};
+		const collapsed = new IPythonCellComponent({ ...state, expanded: false }).render(80);
+		const expanded = new IPythonCellComponent({ ...state, expanded: true }).render(80);
+
+		// Top line is unchanged through the duration; only the trailing hint flips
+		// "to expand" → "to collapse", so nothing before it can shift.
+		expect(stripAnsi(collapsed[0])).toMatch(/^ ✓ python · .* · ↑ 1 ↓ 1 lines · 780\.0s · .*to expand$/);
+		expect(stripAnsi(expanded[0])).toMatch(/^ ✓ python · .* · ↑ 1 ↓ 1 lines · 780\.0s · .*to collapse$/);
+		const upToHint = (line: string) => stripAnsi(line).replace(/· [^·]*to (expand|collapse)$/, "");
+		expect(upToHint(expanded[0])).toBe(upToHint(collapsed[0]));
+
+		// No separate "python · done · 780.0s" header line below the top line.
+		const stripped = expanded.map(stripAnsi);
+		expect(stripped.filter((l) => /python · done/.test(l)).length).toBe(0);
+
+		// Expanding only attaches code + output below, backgroundless like the top.
+		expect(stripped.join("\n")).toContain("print(55)");
+		expect(stripped.join("\n")).toContain("55");
+		expect(expanded.some(hasBackground)).toBe(false);
+	});
+
+	it("does not show a 'no output' line under an edit-only diff", () => {
+		const out = renderCell({
+			code: 'await edit(path="a.ts", old_str="x", new_str="X")',
+			details: { status: "ok", diffs: [{ path: "a.ts", oldStr: "x", newStr: "X", startLine: 1 }] },
+			executionStarted: true,
+			argsComplete: true,
+			expanded: true,
+		});
+		expect(out).toContain("a.ts");
+		expect(out).not.toContain("no output");
+	});
+
+	it("never emits a line wider than the viewport, even in a very narrow pane", () => {
+		for (const width of [1, 2, 3, 5, 8]) {
+			const lines = new IPythonCellComponent({
+				code: "import numpy as np\nresult = np.linspace(0, 100, 50)",
+				content: [{ type: "text", text: "a fairly long line of output that must wrap" }],
+				details: { status: "ok", durationMs: 12, stdout: "a fairly long line of output that must wrap" },
+				executionStarted: true,
+				argsComplete: true,
+				expanded: true,
+			}).render(width);
+			expect(
+				lines.every((line) => visibleWidth(line) <= width),
+				`width=${width}`,
+			).toBe(true);
+		}
+	});
 });

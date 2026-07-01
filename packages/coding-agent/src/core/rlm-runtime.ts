@@ -69,8 +69,15 @@ export interface CreateRlmSubagentRuntimeOptions {
 	spawnCode?: string;
 }
 
+/** Terminal status of an RLM child run, passed to the host when releasing its runtime. */
+export type RlmSubagentReleaseStatus = "done" | "error" | "cancelled";
+
 export interface SubagentRuntimeHost {
 	createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime>;
-	releaseRlmSubagentRuntime?(runtime: RlmSubagentRuntime, options: CreateRlmSubagentRuntimeOptions): Promise<void>;
+	releaseRlmSubagentRuntime?(
+		runtime: RlmSubagentRuntime,
+		options: CreateRlmSubagentRuntimeOptions,
+		status: RlmSubagentReleaseStatus,
+	): Promise<void>;
 	disposeRlmSubagentRuntimes?(): Promise<void>;
 }

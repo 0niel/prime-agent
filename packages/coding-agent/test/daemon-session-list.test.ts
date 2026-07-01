@@ -55,6 +55,43 @@ describe("buildSessionList", () => {
 		]);
 	});
 
+	it("keeps a session working while background subagents run", () => {
+		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
+		const entries = buildSessionList(
+			[
+				makeState({
+					activeSessionId: "parent",
+					sessionFile: "/tmp/parent.jsonl",
+					isStreaming: false,
+					hasRunningRlmChildren: true,
+					messages: oneMessage,
+					summaryState: { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"],
+				}),
+			],
+			[],
+		);
+		expect(entries[0]?.activity).toBe("working");
+	});
+
+	it("marks a finished subagent idle instead of holding it at working", () => {
+		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
+		const entries = buildSessionList(
+			[
+				makeState({
+					activeSessionId: "child",
+					sessionFile: "/tmp/child.jsonl",
+					isStreaming: false,
+					hasRunningRlmChildren: false,
+					messages: oneMessage,
+					// No current summary verdict — a resident finished subagent never gets one.
+					metadata: { kind: "subagent", createdAt: 1, parentActiveSessionId: "parent", rlmChildId: "c1" },
+				}),
+			],
+			[],
+		);
+		expect(entries[0]?.activity).toBe("idle");
+	});
+
 	it("merges active records with saved sessions and marks inactive sessions", () => {
 		const activePath = resolve("/tmp/project/active.jsonl");
 		const sleepingPath = resolve("/tmp/project/sleeping.jsonl");
@@ -303,10 +340,7 @@ describe("buildRlmChildSnapshots", () => {
 			label: "Summarize the repo layout",
 			answerPreview: "The repo is an npm workspace.",
 			sessionDir: "/tmp/artifacts/sub-aaa",
-			transcript: [
-				{ role: "user", text: "Summarize the repo layout" },
-				{ role: "assistant", text: "The repo is an npm workspace." },
-			],
+			activeSessionId: "child",
 		});
 	});
 
@@ -390,6 +424,7 @@ interface StateOptions {
 	hasUserContent?: boolean;
 	summaryState?: ActiveSessionState["summaryState"];
 	childRunStatuses?: Record<string, "queued" | "running" | "done" | "error" | "cancelled">;
+	hasRunningRlmChildren?: boolean;
 	metadata?: {
 		kind: "top-level" | "subagent";
 		createdAt: number;
@@ -432,6 +467,8 @@ function makeState(options: StateOptions): ActiveSessionState {
 				},
 				messages: options.messages ?? ([] as AgentMessage[]),
 				getRlmChildRunStatus: (childId: string) => options.childRunStatuses?.[childId],
+				hasRunningRlmChildren: () => options.hasRunningRlmChildren ?? false,
+				getCurrentRecap: () => undefined,
 				pendingMessageCount: 0,
 				state: {
 					streamingMessage: undefined,

@@ -4,6 +4,8 @@ import {
 	type AutocompleteProvider,
 	CombinedAutocompleteProvider,
 	Container,
+	resetCapabilitiesCache,
+	setCapabilities,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
@@ -166,6 +168,109 @@ describe("InteractiveMode.showStatus", () => {
 		// adds spacer + text
 		expect(fakeThis.chatContainer.children).toHaveLength(5);
 		expect(renderLastLine(fakeThis.chatContainer)).toContain("STATUS_TWO");
+	});
+});
+
+describe("InteractiveMode.renderSessionContext", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	test("renders historical tool result images as fallbacks instead of replaying inline payloads", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		try {
+			const chatContainer = new Container();
+			const fakeThis: any = {
+				pendingTools: new Map(),
+				toolOutputExpanded: false,
+				chatContainer,
+				footer: { invalidate: vi.fn() },
+				updateEditorBorderColor: vi.fn(),
+				resetPendingToolState: vi.fn(),
+				preloadToolDefinitions: vi.fn(async () => {}),
+				settingsManager: {
+					getShowImages: () => true,
+					getImageWidthCells: () => 60,
+				},
+				getCachedToolDefinition: () => undefined,
+				getCurrentCwd: () => process.cwd(),
+				getRetryAttempt: () => 0,
+				ui: { requestRender: vi.fn() },
+				addMessageToChat: vi.fn(() => {
+					chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
+				}),
+			};
+
+			await (InteractiveMode as any).prototype.renderSessionContext.call(fakeThis, {
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", name: "custom_tool", id: "tool-1", arguments: {} }],
+					},
+					{
+						role: "toolResult",
+						toolCallId: "tool-1",
+						content: [{ type: "image", data: "AAAA", mimeType: "image/png" }],
+						isError: false,
+					},
+				],
+				thinkingLevel: "medium",
+				model: null,
+			});
+
+			const rendered = renderAll(chatContainer);
+			expect(rendered).not.toContain("\x1b_G");
+			expect(normalizeRenderedOutput(chatContainer)).toContain("[Image: [image/png]]");
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
+	test("keeps pending history tool calls eligible for live inline image updates", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		try {
+			const chatContainer = new Container();
+			const pendingTools = new Map<string, ToolExecutionComponent>();
+			const fakeThis: any = {
+				pendingTools,
+				toolOutputExpanded: false,
+				chatContainer,
+				footer: { invalidate: vi.fn() },
+				updateEditorBorderColor: vi.fn(),
+				resetPendingToolState: vi.fn(),
+				preloadToolDefinitions: vi.fn(async () => {}),
+				settingsManager: {
+					getShowImages: () => true,
+					getImageWidthCells: () => 60,
+				},
+				getCachedToolDefinition: () => undefined,
+				getCurrentCwd: () => process.cwd(),
+				getRetryAttempt: () => 0,
+				ui: { requestRender: vi.fn() },
+				addMessageToChat: vi.fn(() => {
+					chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
+				}),
+			};
+
+			await (InteractiveMode as any).prototype.renderSessionContext.call(fakeThis, {
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", name: "custom_tool", id: "tool-1", arguments: {} }],
+					},
+				],
+				thinkingLevel: "medium",
+				model: null,
+			});
+
+			const component = pendingTools.get("tool-1");
+			expect(component).toBeDefined();
+			component!.updateResult({ content: [{ type: "image", data: "AAAA", mimeType: "image/png" }], isError: false });
+
+			expect(component!.render(120).join("\n")).toContain("\x1b_G");
+		} finally {
+			resetCapabilitiesCache();
+		}
 	});
 });
 

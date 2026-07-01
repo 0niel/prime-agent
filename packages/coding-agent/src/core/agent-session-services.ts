@@ -9,6 +9,7 @@ import { AuthStorage } from "./auth-storage.js";
 import type { AgentAutonomousConfig } from "./autonomous.js";
 import type { AgentRlmHeartbeatController } from "./cron-jobs.js";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
+import { McpManager } from "./mcp/mcp-manager.js";
 import { ModelRegistry } from "./model-registry.js";
 import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.js";
 import type { SubagentRuntimeHost } from "./rlm-runtime.js";
@@ -92,6 +93,7 @@ export interface AgentSessionServices {
 	settingsManager: SettingsManager;
 	modelRegistry: ModelRegistry;
 	resourceLoader: ResourceLoader;
+	mcpManager: McpManager;
 	diagnostics: AgentSessionRuntimeDiagnostic[];
 }
 
@@ -156,11 +158,22 @@ export async function createAgentSessionServices(
 	const authStorage = options.authStorage ?? AuthStorage.create(join(agentDir, "auth.json"));
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const modelRegistry = options.modelRegistry ?? ModelRegistry.create(authStorage, join(agentDir, "models.json"));
+
+	// MCP integrations: registers OAuth providers and gates the built-in
+	// integration skills by whether the user is logged in (enable-by-login).
+	const mcpManager = new McpManager({
+		authStorage,
+		getUserServers: () => settingsManager.getMcpServers(),
+	});
+	// refresh() resets the OAuth registry to built-ins; re-add user MCP providers too.
+	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerUserProviders());
+
 	const resourceLoader = new DefaultResourceLoader({
 		...(options.resourceLoaderOptions ?? {}),
 		cwd,
 		agentDir,
 		settingsManager,
+		extraBuiltinSkillOverrides: () => mcpManager.getDisabledBuiltinSkillOverrides(),
 	});
 	await resourceLoader.reload();
 
@@ -187,6 +200,7 @@ export async function createAgentSessionServices(
 		settingsManager,
 		modelRegistry,
 		resourceLoader,
+		mcpManager,
 		diagnostics,
 	};
 }
@@ -212,6 +226,7 @@ export async function createAgentSessionFromServices(
 		settingsManager: options.services.settingsManager,
 		modelRegistry: options.services.modelRegistry,
 		resourceLoader: options.services.resourceLoader,
+		mcpManager: options.services.mcpManager,
 		sessionManager: options.sessionManager,
 		model: options.model,
 		thinkingLevel: options.thinkingLevel,

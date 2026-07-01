@@ -49,6 +49,10 @@
           "path": "skills.md"
         },
         {
+          "title": "MCP Integrations",
+          "path": "mcp-integrations.md"
+        },
+        {
           "title": "Prompt Templates",
           "path": "prompt-templates.md"
         },

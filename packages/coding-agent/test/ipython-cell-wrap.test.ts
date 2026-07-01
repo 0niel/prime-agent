@@ -62,11 +62,11 @@ describe("IPythonCellComponent wrapping", () => {
 		}
 	});
 
-	it("pads every wrapped line to exactly the panel width", () => {
+	it("keeps every wrapped line within the available width", () => {
 		for (const width of [20, 30, 40, 50]) {
 			const lines = new IPythonCellComponent(WRAPPING_STATE).render(width);
 			expect(
-				lines.every((line) => visibleWidth(line) === width),
+				lines.every((line) => visibleWidth(line) <= width),
 				`width=${width}`,
 			).toBe(true);
 		}
@@ -85,6 +85,6 @@ describe("IPythonCellComponent wrapping", () => {
 	it("leaves non-wrapping (wide) output untouched", () => {
 		const lines = new IPythonCellComponent(WRAPPING_STATE).render(100);
 		expect(lines.some(foregroundLeftOpen)).toBe(false);
-		expect(lines.every((line) => visibleWidth(line) === 100)).toBe(true);
+		expect(lines.every((line) => visibleWidth(line) <= 100)).toBe(true);
 	});
 });

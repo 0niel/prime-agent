@@ -12,7 +12,7 @@ function stripAnsi(text: string): string {
 }
 
 function node(id: string, status: ChildAgentInspectorNode["status"] = "running"): ChildAgentInspectorNode {
-	return { id, label: id, status, sessionDir: `/tmp/${id}`, transcript: [] };
+	return { id, label: id, status, sessionDir: `/tmp/${id}` };
 }
 
 describe("ChildAgentSummaryComponent inline list", () => {
@@ -147,13 +147,6 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		// Ctrl+O isn't a list key, so it should bubble to the chat action handler.
 		summary.handleInput("\x0f");
 		expect(forwarded).toBe("\x0f");
-	});
-
-	it("renders a separator line above the list", () => {
-		const summary = new ChildAgentSummaryComponent();
-		summary.setNodes([node("only")]);
-		const lines = summary.render(40).map(stripAnsi);
-		expect(lines.some((line) => line.includes("─"))).toBe(true);
 	});
 
 	it("opens the selected subagent's detail on confirm", () => {

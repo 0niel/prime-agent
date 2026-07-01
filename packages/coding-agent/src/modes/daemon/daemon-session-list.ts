@@ -6,10 +6,7 @@ import { compactRlmText } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.js";
 import type { AgentTaskState, SessionInfo } from "../../core/session-manager.js";
-import type {
-	AgentConnectionRlmChildAgentSnapshot,
-	AgentConnectionRlmChildAgentTranscriptLine,
-} from "../agent-connection/types.js";
+import type { AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
 import type { ActiveSessionState } from "./active-session-state.js";
 
 // Durable lifecycle; decides agents-view visibility. Only "live" is shown.
@@ -253,19 +250,13 @@ function rlmChildSnapshotForActiveSession(
 	parent: ActiveSessionState | undefined,
 ): AgentConnectionRlmChildAgentSnapshot {
 	const session = activeSession.runtime.session;
-	const transcript: AgentConnectionRlmChildAgentTranscriptLine[] = [];
 	let answerPreview: string | undefined;
 	for (const message of session.messages) {
-		if (message.role !== "user" && message.role !== "assistant") {
-			continue;
-		}
-		const text = compactRlmText(readMessageText(message.content));
-		if (!text) {
-			continue;
-		}
-		transcript.push({ role: message.role, text });
 		if (message.role === "assistant") {
-			answerPreview = text;
+			const text = compactRlmText(readMessageText(message.content));
+			if (text) {
+				answerPreview = text;
+			}
 		}
 	}
 	// The parent session's run tracker is the source of truth for child status;
@@ -275,14 +266,17 @@ function rlmChildSnapshotForActiveSession(
 	const runStatus = metadata.rlmChildId
 		? parent?.runtime.session.getRlmChildRunStatus(metadata.rlmChildId)
 		: undefined;
+	const status = runStatus ?? (session.isStreaming || session.pendingMessageCount > 0 ? "running" : "done");
 	return {
 		id: metadata.rlmChildId ?? activeSession.activeSessionId,
 		parentId: parentNodeId,
+		activeSessionId: activeSession.activeSessionId,
 		label: compactRlmText(metadata.prompt ?? "", 80) || "child agent",
-		status: runStatus ?? (session.isStreaming || session.pendingMessageCount > 0 ? "running" : "done"),
+		status,
 		answerPreview,
+		recap: session.getCurrentRecap(),
 		sessionDir: metadata.sessionDir ?? session.sessionManager.getSessionDir(),
-		transcript,
+		activity: status === "running" ? { kind: session.isStreaming ? "writing" : "waiting" } : undefined,
 	};
 }
 
@@ -321,12 +315,20 @@ function readMessageText(content: unknown): string {
 // Agent doing work, ignoring the classification verdict.
 export function isActiveSessionBusy(activeSession: ActiveSessionState): boolean {
 	const session = activeSession.runtime.session;
-	return session.isStreaming || session.isCompacting || session.pendingMessageCount > 0;
+	// Background subagents keep the parent "working" even after its own turn ends.
+	return (
+		session.isStreaming || session.isCompacting || session.pendingMessageCount > 0 || session.hasRunningRlmChildren()
+	);
 }
 
 export function activeActivityForSession(activeSession: ActiveSessionState): SessionActivity {
 	if (isActiveSessionBusy(activeSession)) {
 		return "working";
+	}
+	// A finished subagent is resident but never gets a summarizer verdict, so don't hold
+	// it at "working" waiting for one — a not-busy subagent is simply idle/done.
+	if (activeSession.runtime.metadata?.kind === "subagent") {
+		return "idle";
 	}
 	// Hold at "working" until the idle verdict is current, so the view never
 	// buckets an unlabeled idle session.

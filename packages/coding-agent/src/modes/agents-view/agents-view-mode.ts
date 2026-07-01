@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import type { Api, ImageContent, Model } from "@earendil-works/pi-ai";
 import type { AutocompleteItem, OverlayHandle, SlashCommand } from "@earendil-works/pi-tui";
 import {
@@ -92,10 +93,22 @@ export interface AgentsViewModeOptions {
 	verbose?: boolean;
 }
 
-type AgentsViewRunResult = { type: "exit" } | { type: "open"; summary: SessionSummary; subagent?: SessionSummary };
+type AgentsViewRunResult =
+	| { type: "exit" }
+	| {
+			type: "open";
+			summary: SessionSummary;
+			subagent?: SessionSummary;
+			// Session ids of every ancestor that must be expanded to reveal the
+			// opened subagent, from the root agent down to its immediate parent.
+			subagentAncestorSessionIds?: string[];
+	  };
 type AgentsViewPersistentState = {
 	selectedRowIdentity?: string;
 	selectedSessionKey?: AgentsViewSelectionKey;
+	// Ancestor chain to re-expand on return to a subagent. Kept by sessionId, not
+	// row identity, so it survives a parent's active→persisted identity flip.
+	pendingExpandedAncestorSessionIds?: string[];
 	statusMessage?: string;
 	initialPromptsSent?: boolean;
 	// Gathered once and reused across agents-view instances so the notices survive
@@ -125,23 +138,25 @@ export async function resolveAgentsViewSessionUiServices(
 	return options.createUiServicesForSession ? await options.createUiServicesForSession(summary) : options.uiServices;
 }
 
-export function createAgentsViewResumeConfig(config: AgentSessionRuntimeConfig): AgentSessionRuntimeConfig {
+// Stripping cwd opens the session in its own stored directory; overrideCwd is
+// sent when that directory no longer exists so the daemon doesn't reject it.
+export function createAgentsViewResumeConfig(
+	config: AgentSessionRuntimeConfig,
+	overrideCwd?: string,
+): AgentSessionRuntimeConfig {
 	const resumeConfig: AgentSessionRuntimeConfig = { ...config };
-	delete resumeConfig.cwd;
+	if (overrideCwd) {
+		resumeConfig.cwd = overrideCwd;
+	} else {
+		delete resumeConfig.cwd;
+	}
 	return resumeConfig;
 }
 
-export function createAgentsViewListCommand(
-	config: AgentSessionRuntimeConfig,
-): Extract<DaemonCommand, { type: "list" }> {
-	// `all` makes the daemon merge on-disk sessions with in-memory ones; without it
-	// only daemon-resident sessions return and live sessions saved to disk are lost
-	// from the view. No cwd is set so the fleet view spans every directory.
-	const command: Extract<DaemonCommand, { type: "list" }> = { type: "list", all: true };
-	if (config.sessionDir) {
-		command.sessionDir = config.sessionDir;
-	}
-	return command;
+export function createAgentsViewListCommand(): Extract<DaemonCommand, { type: "list" }> {
+	// Omitting `all` returns daemon-resident sessions only; on-disk ones come back
+	// via /resume.
+	return { type: "list" };
 }
 
 // Status messages render in a single-row hint slot below the editor; embedded
@@ -158,10 +173,29 @@ export function createAgentsViewReplyHeadline(text: string | undefined): string 
 		.find((line) => line.length > 0);
 }
 
+interface OpenedAgentsViewSession {
+	connection: DaemonAgentConnection;
+	summary: SessionSummary;
+	cwdFallbackNotice?: string;
+}
+
+export function resolveAgentsViewOpenCwd(
+	summary: SessionSummary,
+	fallbackCwd: string | undefined,
+): { overrideCwd?: string; notice?: string } {
+	if (!summary.cwd || existsSync(summary.cwd) || !fallbackCwd) {
+		return {};
+	}
+	return {
+		overrideCwd: fallbackCwd,
+		notice: `Original directory is missing (${summary.cwd}); opened in ${fallbackCwd} instead.`,
+	};
+}
+
 async function openAgentsViewSession(
 	options: AgentsViewModeOptions,
 	summary: SessionSummary,
-): Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }> {
+): Promise<OpenedAgentsViewSession> {
 	let client = await connectAgentsViewDaemonClient(options.socketPath);
 	if (summary.activeSessionId) {
 		try {
@@ -183,10 +217,11 @@ async function openAgentsViewSession(
 		throw new Error("Cannot open agent without an active runtime or saved session file");
 	}
 
+	const { overrideCwd, notice } = resolveAgentsViewOpenCwd(summary, options.config.cwd);
 	try {
 		const response = await client.request({
 			type: "create",
-			config: createAgentsViewResumeConfig(options.config),
+			config: createAgentsViewResumeConfig(options.config, overrideCwd),
 			sessionPath: summary.sessionFile,
 		});
 		const createdSummary = expectSessionSummary(requireDaemonData(response));
@@ -194,7 +229,7 @@ async function openAgentsViewSession(
 		const connection = await DaemonAgentConnection.attach(client, activeSessionId, {
 			closeClientOnDispose: true,
 		});
-		return { connection, summary: createdSummary };
+		return { connection, summary: createdSummary, cwdFallbackNotice: notice };
 	} catch (error) {
 		client.close();
 		throw error;
@@ -232,12 +267,24 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 		if (result.type === "exit") {
 			return;
 		}
-		persistentState.selectedRowIdentity = getSummaryIdentity(result.summary);
-		persistentState.selectedSessionKey = getAgentsViewSelectionKey(result.summary);
+		if (result.subagent) {
+			// Returning from a subagent reopens the agents view with every ancestor
+			// list expanded and that subagent reselected.
+			persistentState.selectedRowIdentity = getSummaryIdentity(result.subagent);
+			persistentState.selectedSessionKey = getAgentsViewSelectionKey(result.subagent);
+			persistentState.pendingExpandedAncestorSessionIds = result.subagentAncestorSessionIds ?? [];
+		} else {
+			persistentState.selectedRowIdentity = getSummaryIdentity(result.summary);
+			persistentState.selectedSessionKey = getAgentsViewSelectionKey(result.summary);
+			persistentState.pendingExpandedAncestorSessionIds = undefined;
+		}
 
-		let opened: { connection: DaemonAgentConnection; summary: SessionSummary } | undefined;
+		let opened: OpenedAgentsViewSession | undefined;
 		try {
 			opened = await openAgentsViewSession(options, result.summary);
+			if (opened.cwdFallbackNotice) {
+				persistentState.statusMessage = opened.cwdFallbackNotice;
+			}
 			const uiServices = await resolveAgentsViewSessionUiServices(options, opened.summary);
 			const interactiveMode = new InteractiveMode({
 				agentConnection: opened.connection,
@@ -245,6 +292,7 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 				bindLocalSessionExtensions: false,
 				migratedProviders: options.migratedProviders,
 				modelFallbackMessage: resolveAttachModelFallbackMessage(opened.summary, options.modelFallbackMessage),
+				startupNotice: opened.cwdFallbackNotice,
 				verbose: options.verbose,
 				returnToAgentsView: true,
 				// The agents view renders the global notices itself, so suppress them in-session.
@@ -706,6 +754,33 @@ class AgentsViewMode implements Component, Focusable {
 		this.ui.requestRender();
 	}
 
+	// Resolve the persisted sessionId breadcrumb to live row identities once, so
+	// the rest of the expansion lifecycle stays uniformly identity-keyed.
+	private applyPendingAncestorExpansion(): void {
+		const sessionIds = this.persistentState.pendingExpandedAncestorSessionIds;
+		if (!sessionIds || sessionIds.length === 0) {
+			this.persistentState.pendingExpandedAncestorSessionIds = undefined;
+			return;
+		}
+		this.persistentState.pendingExpandedAncestorSessionIds = undefined;
+		const wanted = new Set(sessionIds);
+		// A nested ancestor's row only appears once its own parent is expanded, so
+		// expand-and-rebuild until a pass reveals nothing new.
+		let added = true;
+		while (added) {
+			added = false;
+			for (const row of this.rows) {
+				if (wanted.has(row.summary.sessionId) && !this.expandedSubagentParents.has(row.identity)) {
+					this.expandedSubagentParents.add(row.identity);
+					added = true;
+				}
+			}
+			if (added) {
+				this.rebuildRows();
+			}
+		}
+	}
+
 	/** Expanded subagent lists collapse back to their summary row once selection leaves them. */
 	private collapseSubagentListsOutsideSelection(): void {
 		if (this.expandedSubagentParents.size === 0) {
@@ -1061,7 +1136,27 @@ class AgentsViewMode implements Component, Focusable {
 			this.setStatusMessage("Cannot open subagent without its parent agent");
 			return;
 		}
-		this.finish({ type: "open", summary: root.summary, subagent: row.summary });
+		this.finish({
+			type: "open",
+			summary: root.summary,
+			subagent: row.summary,
+			subagentAncestorSessionIds: this.collectSubagentAncestorSessionIds(row),
+		});
+	}
+
+	/** Session ids of every ancestor of a subagent row, root-most first. */
+	private collectSubagentAncestorSessionIds(row: AgentsViewRow): string[] {
+		const ancestors: string[] = [];
+		let parentIdentity = row.parentIdentity;
+		while (parentIdentity !== undefined) {
+			const parent = this.rows.find((candidate) => candidate.identity === parentIdentity);
+			if (!parent) {
+				break;
+			}
+			ancestors.unshift(parent.summary.sessionId);
+			parentIdentity = parent.parentIdentity;
+		}
+		return ancestors;
 	}
 
 	/**
@@ -1371,13 +1466,13 @@ class AgentsViewMode implements Component, Focusable {
 					}
 				}
 			}
-			if (pending.sessionFile) {
-				// The kill above normally persists the archived state, but it can be
-				// skipped or hit an unknown session (e.g. the daemon died after
-				// listing). Make sure the file is not left marked active, or a
-				// restarted daemon would resurrect a deliberately deactivated agent.
+			// Skip a file deleted between listing and now: SessionManager.open would
+			// recreate a stub at the old path instead of loading it.
+			if (pending.sessionFile && existsSync(pending.sessionFile)) {
+				// Persist archived unless it already is: sessions with no prior
+				// session_state entry would otherwise resurface on the next scan.
 				const sessionManager = SessionManager.open(pending.sessionFile, this.options.config.sessionDir);
-				if (sessionManager.getSessionState()?.status === "active") {
+				if (sessionManager.getSessionState()?.status !== "archived") {
 					sessionManager.appendSessionState({ status: "archived" });
 				}
 			}
@@ -1473,7 +1568,7 @@ class AgentsViewMode implements Component, Focusable {
 	private async refreshSessions(): Promise<void> {
 		const client = this.requireClient();
 		try {
-			const response = await client.request(createAgentsViewListCommand(this.options.config));
+			const response = await client.request(createAgentsViewListCommand());
 			const data = requireDaemonData(response);
 			const sessions = expectSessionList(data);
 			const visibleSessions = sessions.filter((summary) =>
@@ -1485,6 +1580,7 @@ class AgentsViewMode implements Component, Focusable {
 				this.expandedSubagentParents,
 				this.programShownParents,
 			);
+			this.applyPendingAncestorExpansion();
 			this.restoreSelection();
 			this.ui.requestRender();
 		} catch (error) {

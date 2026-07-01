@@ -97,6 +97,21 @@ describe("IpythonKernelProvisioner", () => {
 		expect(provisioner.manager).toBeUndefined();
 	});
 
+	it("dispose() before the boot slot prevents the kernel from spawning", async () => {
+		const { python, countRuns } = writeFakePython();
+		let release: () => void = () => {};
+		const gate = new Promise<void>((r) => {
+			release = r;
+		});
+		const provisioner = new IpythonKernelProvisioner(tempDir, { python, readyGate: gate });
+
+		const started = provisioner.ensure().catch(() => {});
+		const disposed = provisioner.dispose(); // aborts while the boot waits on readyGate
+		release();
+		await Promise.all([started, disposed]);
+		expect(countRuns()).toBe(0); // disposed boot must never spawn a kernel
+	});
+
 	it("waits for readyGate before starting the kernel", async () => {
 		const { python, countRuns } = writeFakePython();
 		let release: () => void = () => {};

@@ -361,4 +361,37 @@ describe("SettingsManager", () => {
 			expect(manager.getSessionDir()).toBe(join(homedir(), "sessions"));
 		});
 	});
+
+	describe("mcpServers", () => {
+		it("returns undefined when unset", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "dark" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getMcpServers()).toBeUndefined();
+		});
+
+		it("merges global and project mcpServers, project winning per key", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					mcpServers: {
+						acme: { type: "http", url: "https://global.acme/mcp", oauth: true },
+						shared: { type: "http", url: "https://global.shared/mcp" },
+					},
+				}),
+			);
+			writeFileSync(
+				join(projectDir, ".prime", "agent", "settings.json"),
+				JSON.stringify({
+					mcpServers: {
+						shared: { type: "http", url: "https://project.shared/mcp" },
+					},
+				}),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const servers = manager.getMcpServers();
+			expect(servers?.acme).toEqual({ type: "http", url: "https://global.acme/mcp", oauth: true });
+			// Project override replaces the shared entry.
+			expect(servers?.shared).toEqual({ type: "http", url: "https://project.shared/mcp" });
+		});
+	});
 });

@@ -1,14 +1,5 @@
 import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type {
-	Api,
-	AssistantMessage,
-	ImageContent,
-	Model,
-	TextContent,
-	Transport,
-	Usage,
-	UserMessage,
-} from "@earendil-works/pi-ai";
+import type { Api, ImageContent, Model, TextContent, Transport, Usage } from "@earendil-works/pi-ai";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
 import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
@@ -425,51 +416,16 @@ export interface AgentConnectionExtensionUiRequest {
 
 export type AgentConnectionRlmChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
 
-export interface AgentConnectionRlmChildAgentTranscriptLine {
-	role: "user" | "assistant" | "tool" | "system";
-	text: string;
+export interface AgentConnectionRlmChildAgentActivity {
+	kind: "waiting" | "writing" | "executing";
+	toolName?: string;
 }
-
-export interface AgentConnectionRlmChildAgentToolResult {
-	content: (TextContent | ImageContent)[];
-	details?: unknown;
-	isError: boolean;
-}
-
-export interface AgentConnectionRlmChildAgentMessageTranscriptEntry {
-	type: "message";
-	role: "user" | "assistant";
-	text: string;
-	message: UserMessage | AssistantMessage;
-}
-
-export interface AgentConnectionRlmChildAgentToolTranscriptEntry {
-	type: "tool";
-	role: "tool";
-	text: string;
-	toolCallId: string;
-	toolName: string;
-	args: unknown;
-	result?: AgentConnectionRlmChildAgentToolResult;
-	isPartial: boolean;
-	executionStarted: boolean;
-	argsComplete: boolean;
-}
-
-export interface AgentConnectionRlmChildAgentSystemTranscriptEntry {
-	type: "system";
-	role: "system";
-	text: string;
-}
-
-export type AgentConnectionRlmChildAgentStructuredTranscriptEntry =
-	| AgentConnectionRlmChildAgentMessageTranscriptEntry
-	| AgentConnectionRlmChildAgentToolTranscriptEntry
-	| AgentConnectionRlmChildAgentSystemTranscriptEntry;
 
 export interface AgentConnectionRlmChildAgentSnapshot {
 	id: string;
 	parentId?: string;
+	/** The child's own daemon active-session id, for attaching to it directly. */
+	activeSessionId?: string;
 	label: string;
 	status: AgentConnectionRlmChildAgentStatus;
 	durationMs?: number;
@@ -481,8 +437,9 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 	/** Latest recap of what the subagent is doing. */
 	recap?: string;
 	sessionDir: string;
-	transcript: readonly AgentConnectionRlmChildAgentTranscriptLine[];
-	structuredTranscript?: readonly AgentConnectionRlmChildAgentStructuredTranscriptEntry[];
+	activity?: AgentConnectionRlmChildAgentActivity;
+	/** Failure reason when status is "error". */
+	error?: string;
 }
 
 export type AgentConnectionSessionEvent =
@@ -613,5 +570,15 @@ export interface AgentConnection {
 	renameSavedSession(sessionPath: string, name: string): Promise<void>;
 	deleteSavedSession(sessionPath: string): Promise<DeleteSessionFileResult>;
 
+	/** Read-only watcher on another live session (a subagent); undefined if the transport can't reach it. */
+	watchSession(activeSessionId: string): Promise<AgentConnectionSessionWatcher | undefined>;
+
 	dispose(): Promise<void>;
+}
+
+export interface AgentConnectionSessionWatcher {
+	getMessages(): Promise<AgentMessage[]>;
+	subscribe(listener: AgentConnectionEventListener): () => void;
+	getToolDefinition(name: string): Promise<AgentConnectionToolDefinition | undefined>;
+	close(): Promise<void>;
 }
