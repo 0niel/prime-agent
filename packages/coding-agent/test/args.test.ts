@@ -387,4 +387,43 @@ describe("parseArgs", () => {
 			expect(result.messages).toEqual(["Do the task"]);
 		});
 	});
+
+	describe("-- end-of-options separator", () => {
+		test("treats a dash-leading prompt after -- as a positional message", () => {
+			const result = parseArgs(["--", "- You are given a state dictionary (/app/weights.pt)..."]);
+			expect(result.messages).toEqual(["- You are given a state dictionary (/app/weights.pt)..."]);
+			expect(result.diagnostics).toEqual([]);
+			expect(result.unknownFlags.size).toBe(0);
+		});
+
+		test("a dash-leading prompt without -- still errors", () => {
+			const result = parseArgs(["- do the thing"]);
+			expect(result.messages).toEqual([]);
+			expect(result.diagnostics).toEqual([
+				{ type: "error", message: "Unknown option: - do the thing" },
+			]);
+		});
+
+		test("does not parse flags after -- as options", () => {
+			const result = parseArgs(["--", "--provider", "openai"]);
+			expect(result.provider).toBeUndefined();
+			expect(result.messages).toEqual(["--provider", "openai"]);
+			expect(result.unknownFlags.size).toBe(0);
+		});
+
+		test("parses flags before -- and treats the rest as messages", () => {
+			const result = parseArgs(["--provider", "openai", "--", "-p", "@file"]);
+			expect(result.provider).toBe("openai");
+			expect(result.print).toBeUndefined();
+			expect(result.fileArgs).toEqual([]);
+			expect(result.messages).toEqual(["-p", "@file"]);
+		});
+
+		test("a lone -- produces no messages and no diagnostics", () => {
+			const result = parseArgs(["--"]);
+			expect(result.messages).toEqual([]);
+			expect(result.diagnostics).toEqual([]);
+			expect(result.unknownFlags.size).toBe(0);
+		});
+	});
 });

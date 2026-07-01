@@ -68,8 +68,21 @@ export function parseArgs(args: string[]): Args {
 		diagnostics: [],
 	};
 
+	let endOfOptions = false;
+
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
+
+		// POSIX end-of-options: everything after a standalone "--" is a positional
+		// message, even if it starts with a dash (e.g. a Markdown-bullet prompt).
+		if (endOfOptions) {
+			result.messages.push(arg);
+			continue;
+		}
+		if (arg === "--") {
+			endOfOptions = true;
+			continue;
+		}
 
 		if (arg === "--help" || arg === "-h") {
 			result.help = true;
@@ -268,6 +281,7 @@ ${chalk.bold("Options:")}
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
   --help, -h                     Show this help
   --version, -v                  Show version number
+  --                             End of options; treat all following args as messages
 
 Extensions can register additional flags (e.g., --plan from plan-mode extension).${extensionFlagsText}
 
@@ -286,6 +300,9 @@ ${chalk.bold("Examples:")}
 
   # Multiple messages (interactive)
   ${APP_NAME} "Read package.json" "What dependencies do we have?"
+
+  # Prompt that starts with a dash (use -- to end option parsing)
+  ${APP_NAME} -- "- You are given a state dictionary..."
 
   # Continue previous session
   ${APP_NAME} --continue "What did we discuss?"
