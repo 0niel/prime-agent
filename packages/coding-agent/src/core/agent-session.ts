@@ -3446,6 +3446,8 @@ export class AgentSession {
 		);
 		const runner = this._extensionRunner;
 		const wrappedExtensionTools = wrapRegisteredTools(allCustomTools, runner);
+		// Resolve the runner at call time so a rebuild/reload rebinds built-in tools to the
+		// live runner instead of wedging them on the invalidated one's stale-ctx guard.
 		const wrappedBuiltInTools = wrapRegisteredTools(
 			Array.from(this._baseToolDefinitions.values())
 				.filter((definition) => isAllowedTool(definition.name))
@@ -3453,7 +3455,7 @@ export class AgentSession {
 					definition,
 					sourceInfo: createSyntheticSourceInfo(`<builtin:${definition.name}>`, { source: "builtin" }),
 				})),
-			runner,
+			() => this._extensionRunner,
 		);
 
 		const toolRegistry = new Map(wrappedBuiltInTools.map((tool) => [tool.name, tool]));
