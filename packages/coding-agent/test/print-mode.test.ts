@@ -178,8 +178,38 @@ describe("runPrintMode", () => {
 		});
 
 		expect(exitCode).toBe(1);
-		expect(errorSpy).toHaveBeenCalledWith("Autonomous quality gate still failing after attempt 34/999: exited 1");
+		expect(errorSpy).toHaveBeenCalledWith(
+			"Autonomous quality gate still failing after attempt 34/999: exited 1; autonomous limit reached: maxContinuations reached (999/999)",
+		);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+	});
+
+	it("reports the exact autonomous limit that stopped a still-failing gate", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), {
+			enabled: true,
+			continuationsUsed: 34,
+			turnsUsed: 92,
+			tokensUsed: 2_000_000,
+			limits: { maxContinuations: 999, maxTurns: 1000, maxTokens: 2_000_000, timeoutMs: 1_800_000 },
+			gates: { commands: ["verify-public"], maxRetries: 999, timeoutMs: 3_600_000 },
+			gateAttempts: { "verify-public": 34 },
+			lastGateFailure: {
+				command: "verify-public",
+				attempt: 34,
+				exitText: "exited 1",
+				output: "0/43",
+			},
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(1);
+		expect(errorSpy).toHaveBeenCalledWith(
+			"Autonomous quality gate still failing after attempt 34/999: exited 1; autonomous limit reached: maxTokens reached (2000000/2000000)",
+		);
 	});
 
 	it("keeps prompting while autonomous gates fail below retry limits", async () => {

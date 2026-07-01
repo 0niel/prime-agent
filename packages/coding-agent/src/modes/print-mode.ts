@@ -30,16 +30,33 @@ function latestGateAttempt(status: AgentAutonomousStatus): number {
 	return Math.max(status.lastGateFailure?.attempt ?? 0, 0, ...Object.values(status.gateAttempts));
 }
 
-function autonomousLimitsReached(status: AgentAutonomousStatus, now = Date.now()): boolean {
-	if (status.continuationsUsed >= status.limits.maxContinuations) return true;
-	if (status.turnsUsed >= status.limits.maxTurns) return true;
-	if (status.tokensUsed >= status.limits.maxTokens) return true;
-	return status.startedAt !== undefined && now - status.startedAt >= status.limits.timeoutMs;
+type AutonomousLimitReason = "maxContinuations" | "maxTurns" | "maxTokens" | "timeoutMs";
+
+function autonomousLimitReason(status: AgentAutonomousStatus, now = Date.now()): AutonomousLimitReason | undefined {
+	if (status.continuationsUsed >= status.limits.maxContinuations) return "maxContinuations";
+	if (status.turnsUsed >= status.limits.maxTurns) return "maxTurns";
+	if (status.tokensUsed >= status.limits.maxTokens) return "maxTokens";
+	if (status.startedAt !== undefined && now - status.startedAt >= status.limits.timeoutMs) return "timeoutMs";
+	return undefined;
+}
+
+function describeAutonomousLimit(status: AgentAutonomousStatus, reason: AutonomousLimitReason): string {
+	if (reason === "maxContinuations") {
+		return `maxContinuations reached (${status.continuationsUsed}/${status.limits.maxContinuations})`;
+	}
+	if (reason === "maxTurns") {
+		return `maxTurns reached (${status.turnsUsed}/${status.limits.maxTurns})`;
+	}
+	if (reason === "maxTokens") {
+		return `maxTokens reached (${status.tokensUsed}/${status.limits.maxTokens})`;
+	}
+	const elapsed = status.startedAt === undefined ? 0 : Math.max(0, Date.now() - status.startedAt);
+	return `timeoutMs reached (${elapsed}/${status.limits.timeoutMs})`;
 }
 
 function shouldContinuePrintModeAutonomousGates(status: AgentAutonomousStatus): boolean {
 	if (!status.enabled || status.gates.commands.length === 0 || !status.lastGateFailure) return false;
-	if (autonomousLimitsReached(status)) return false;
+	if (autonomousLimitReason(status)) return false;
 	return latestGateAttempt(status) <= status.gates.maxRetries;
 }
 
@@ -225,8 +242,12 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 		const autonomousStatus = session.getAutonomousStatus();
 		if (autonomousStatus.enabled && autonomousStatus.gates.commands.length > 0 && autonomousStatus.lastGateFailure) {
+			const limitReason = autonomousLimitReason(autonomousStatus);
+			const limitText = limitReason
+				? `; autonomous limit reached: ${describeAutonomousLimit(autonomousStatus, limitReason)}`
+				: "";
 			console.error(
-				`Autonomous quality gate still failing after attempt ${latestGateAttempt(autonomousStatus)}/${autonomousStatus.gates.maxRetries}: ${autonomousStatus.lastGateFailure.exitText}`,
+				`Autonomous quality gate still failing after attempt ${latestGateAttempt(autonomousStatus)}/${autonomousStatus.gates.maxRetries}: ${autonomousStatus.lastGateFailure.exitText}${limitText}`,
 			);
 			exitCode = 1;
 		}
