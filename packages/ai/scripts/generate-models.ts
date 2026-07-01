@@ -227,7 +227,8 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 		model.id.includes("opus-4-7") ||
 		model.id.includes("opus-4.7") ||
 		model.id.includes("opus-4-8") ||
-		model.id.includes("opus-4.8")
+		model.id.includes("opus-4.8") ||
+		model.id.includes("sonnet-5")
 	) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh", max: "max" });
 	}

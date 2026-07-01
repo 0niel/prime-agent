@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-07-01
+
+- Changed the agents view to list only sessions the daemon is actively holding, and stopped the daemon from auto-restoring on-disk sessions on startup, so a restarted daemon no longer surfaces a wall of weeks-old sessions; sessions come back via `/resume` or `--resume` ([#295](https://github.com/PrimeIntellect-ai/prime-agent/issues/295)).
+- Changed the kernel install progress line to name the current step and show a percentage instead of a static message ([#293](https://github.com/PrimeIntellect-ai/prime-agent/issues/293)).
+- Changed the CLI to honor a `--` end-of-options separator, so arguments after it are passed through instead of parsed as flags ([#296](https://github.com/PrimeIntellect-ai/prime-agent/issues/296)).
+- Changed provider stream failures to retry transient errors (content filter trips and prose 5xx responses) instead of failing the turn ([#297](https://github.com/PrimeIntellect-ai/prime-agent/issues/297)).
+- Fixed IPython and bash tool calls failing for the rest of a run after a session was rebuilt, by rebinding built-in tools to the live runtime at call time ([#299](https://github.com/PrimeIntellect-ai/prime-agent/issues/299)).
+- Fixed the kernel venv not rebuilding when the bundled runtime source changed, by tracking a content hash of the runtime (including its `pyproject.toml`) in the staleness check ([#291](https://github.com/PrimeIntellect-ai/prime-agent/issues/291)).
+- Fixed a large subagent fan-out spawning every IPython kernel at once and starving the machine, by bounding concurrent kernel boots (default `min(16, 2*cores)`, override with `PRIME_AGENT_MAX_CONCURRENT_KERNEL_BOOTS`) ([#294](https://github.com/PrimeIntellect-ai/prime-agent/issues/294)).
+- Added a Python forkserver (on by default on Linux, opt out with `PRIME_AGENT_KERNEL_FORKSERVER=0`) that forks subagent kernels from one pre-imported template process instead of a full cold boot each time, with automatic fallback to direct spawn on any failure ([#298](https://github.com/PrimeIntellect-ai/prime-agent/issues/298), [#300](https://github.com/PrimeIntellect-ai/prime-agent/issues/300)).
+- Fixed empty tool results on OpenAI-style providers being sent as a literal "(see attached image)" placeholder, which made models hallucinate a nonexistent image ([#290](https://github.com/PrimeIntellect-ai/prime-agent/issues/290)).
+
 ## [0.2.3] - 2026-06-30
 
 - Added built-in Linear and Notion integrations that the agent drives from Python in the kernel (no new agent tools); each is a bundled skill that talks to the service's official MCP server and auto-discovers its tools. They ship disabled and turn on after you sign in via the Services tab in `/login` or `/mcp login`, with credentials stored in the existing `auth.json` ([#280](https://github.com/PrimeIntellect-ai/prime-agent/issues/280)).

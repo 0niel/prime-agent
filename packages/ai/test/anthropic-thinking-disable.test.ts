@@ -6,6 +6,7 @@ import type { Context, Model, SimpleStreamOptions } from "../src/types.js";
 interface AnthropicThinkingPayload {
 	thinking?: { type: string; budget_tokens?: number; display?: string };
 	output_config?: { effort?: string };
+	temperature?: number;
 }
 
 function makePayloadCaptureContext(): Context {
@@ -161,6 +162,34 @@ describe("Anthropic thinking disable payload", () => {
 
 	it("maps max reasoning to effort=max for Claude Sonnet 4.6 (no native xhigh)", async () => {
 		const payload = await capturePayload(getModel("anthropic", "claude-sonnet-4-6"), { reasoning: "max" });
+
+		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.output_config).toEqual({ effort: "max" });
+	});
+
+	it("omits the thinking param for Claude Fable 5 when reasoning is off (explicit disabled is a 400)", async () => {
+		const payload = await capturePayload(getModel("anthropic", "claude-fable-5"));
+
+		expect(payload.thinking).toBeUndefined();
+		expect(payload.output_config).toBeUndefined();
+	});
+
+	it("drops temperature for Claude Fable 5 (sampling params are rejected)", async () => {
+		const payload = await capturePayload(getModel("anthropic", "claude-fable-5"), { temperature: 0.5 });
+
+		expect(payload.temperature).toBeUndefined();
+		expect(payload.thinking).toBeUndefined();
+	});
+
+	it("uses adaptive thinking with effort=xhigh for Claude Fable 5", async () => {
+		const payload = await capturePayload(getModel("anthropic", "claude-fable-5"), { reasoning: "xhigh" });
+
+		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.output_config).toEqual({ effort: "xhigh" });
+	});
+
+	it("maps max reasoning to effort=max for Claude Fable 5", async () => {
+		const payload = await capturePayload(getModel("anthropic", "claude-fable-5"), { reasoning: "max" });
 
 		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
 		expect(payload.output_config).toEqual({ effort: "max" });

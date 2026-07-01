@@ -202,7 +202,8 @@ export const streamBedrock: StreamFunction<"bedrock-converse-stream", BedrockOpt
 				system: buildSystemPrompt(context.systemPrompt, model, cacheRetention),
 				inferenceConfig: {
 					...(options.maxTokens !== undefined && { maxTokens: options.maxTokens }),
-					...(options.temperature !== undefined && { temperature: options.temperature }),
+					...(options.temperature !== undefined &&
+						!supportsAlwaysOnAdaptiveThinking(model.id, model.name) && { temperature: options.temperature }),
 				},
 				toolConfig: convertToolConfig(context.tools, options.toolChoice),
 				additionalModelRequestFields: buildAdditionalModelRequestFields(model, options),
@@ -497,10 +498,19 @@ function supportsAdaptiveThinking(modelId: string, modelName?: string): boolean 
 			s.includes("opus-4-7") ||
 			s.includes("opus-4-8") ||
 			s.includes("sonnet-4-6") ||
+			s.includes("sonnet-5") ||
 			s.includes("fable-5") ||
 			s.includes("mythos-5") ||
 			s.includes("mythos-preview"),
 	);
+}
+
+/**
+ * Fable/Mythos models think every turn and reject sampling params with a 400.
+ */
+function supportsAlwaysOnAdaptiveThinking(modelId: string, modelName?: string): boolean {
+	const candidates = getModelMatchCandidates(modelId, modelName);
+	return candidates.some((s) => s.includes("fable-5") || s.includes("mythos-5") || s.includes("mythos-preview"));
 }
 
 function mapThinkingLevelToEffort(

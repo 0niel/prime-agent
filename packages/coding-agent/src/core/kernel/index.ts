@@ -9,6 +9,7 @@ import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
 import { ensureKernelPython, type KernelBootstrapProgressHandler, type KernelPythonSkill } from "./bootstrap.js";
+import { ForkServerUnavailable, forkKernel, isForkServerEnabled } from "./fork-server.js";
 import {
 	buildListNamesCode,
 	buildRestoreCode,
@@ -30,6 +31,8 @@ const IOPUB_SUBSCRIBE_DELAY_MS = 50;
 const DEFAULT_MAX_OUTPUT_CHARS = 65536;
 const HOST_REQUEST_DISPOSE_TIMEOUT_MS = 5000;
 const DEFAULT_SNAPSHOT_DEBOUNCE_MS = 1500;
+// How often to poll a forked kernel's pid for unexpected death.
+const FORKED_LIVENESS_POLL_MS = 1000;
 // Snapshot/restore cells can be large to (de)serialize; give them room beyond the user cap.
 const SNAPSHOT_MAX_OUTPUT_CHARS = 1_000_000;
 // Cap how long a graceful dispose waits on the final snapshot; the debounced
@@ -409,6 +412,11 @@ export class KernelManager {
 	private readonly commTargets = new Map<string, string>();
 	private readonly handledHostRequestCommIds = new Set<string>();
 	private kernel?: ChildProcess;
+	// Set instead of `kernel` when the kernel was forked from the forkserver: it is
+	// not a direct child, so it has no ChildProcess handle and is killed by pid.
+	private kernelPid?: number;
+	/** Polls a forked kernel's pid for death (no "exit" event on a non-child). */
+	private forkedLivenessTimer?: ReturnType<typeof globalThis.setInterval>;
 	private shell?: Dealer;
 	private iopub?: Subscriber;
 	private control?: Dealer;
@@ -485,37 +493,71 @@ export class KernelManager {
 			throw new Error("Kernel was disposed during startup");
 		}
 
-		const { path: connectionPath, tempDir } = makeConnection();
-		this.tempDir = tempDir;
+		let connection = makeConnection();
+		this.tempDir = connection.tempDir;
 
-		const kernel = spawn(python, ["-m", "ipykernel_launcher", "-f", connectionPath], {
-			cwd: this.options.cwd,
-			env: this.options.env ? { ...process.env, ...this.options.env } : process.env,
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-		this.kernel = kernel;
-
-		kernel.stderr?.on("data", (buf: Buffer) => {
-			const s = buf.toString();
-			this.kernelStderr += s;
-		});
-
-		kernel.on("error", (err) => {
-			if (this.kernel !== kernel) return;
-			this.appendKernelDiagnostic(`spawn error: ${err.message}`);
-			this.state = "shutdown";
-			liveKernels.delete(this);
-		});
-
-		kernel.on("exit", (code, signal) => {
-			if (this.kernel !== kernel) return;
-			if (this.state !== "shutdown") {
-				this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
+		// Fast path: fork a pre-imported kernel from the forkserver. Any failure
+		// (disabled, unavailable, fork error) degrades to the direct-spawn path so
+		// correctness never depends on fork.
+		let forked = false;
+		if (isForkServerEnabled()) {
+			try {
+				this.kernelPid = await forkKernel(python, {
+					connectionPath: connection.path,
+					cwd: this.options.cwd,
+					// Match the direct-spawn env exactly: merge the current host env with
+					// the per-kernel overrides, applied fresh in the child (the template's
+					// inherited env snapshot may be stale by fork time).
+					env: this.options.env ? { ...process.env, ...this.options.env } : { ...process.env },
+				});
+				forked = true;
+			} catch (err) {
+				if (!(err instanceof ForkServerUnavailable)) throw err;
+				this.appendKernelDiagnostic(`forkserver unavailable, spawning directly: ${err.message}`);
+				this.kernelPid = undefined;
+				// A fork request that times out or loses its pid reply may still have
+				// forked a child that binds the ports in this connection file. Mint a
+				// fresh connection for the direct spawn so a possible orphan can never
+				// collide with it (write the same file / re-bind the same ports).
+				try {
+					rmSync(connection.tempDir, { recursive: true, force: true });
+				} catch {}
+				connection = makeConnection();
+				this.tempDir = connection.tempDir;
 			}
-			this.state = "shutdown";
-			liveKernels.delete(this);
-		});
+		}
 
+		if (!forked) {
+			const kernel = spawn(python, ["-m", "ipykernel_launcher", "-f", connection.path], {
+				cwd: this.options.cwd,
+				env: this.options.env ? { ...process.env, ...this.options.env } : process.env,
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			this.kernel = kernel;
+
+			kernel.stderr?.on("data", (buf: Buffer) => {
+				const s = buf.toString();
+				this.kernelStderr += s;
+			});
+
+			kernel.on("error", (err) => {
+				if (this.kernel !== kernel) return;
+				this.appendKernelDiagnostic(`spawn error: ${err.message}`);
+				this.state = "shutdown";
+				liveKernels.delete(this);
+			});
+
+			kernel.on("exit", (code, signal) => {
+				if (this.kernel !== kernel) return;
+				if (this.state !== "shutdown") {
+					this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
+				}
+				this.state = "shutdown";
+				liveKernels.delete(this);
+			});
+		}
+
+		const connectionPath = connection.path;
 		let conn: ConnectionInfo;
 		try {
 			conn = await this.waitForResolvedConnection(connectionPath);
@@ -549,12 +591,43 @@ export class KernelManager {
 		}
 
 		this.state = "running";
+		this.startForkedLivenessMonitor();
+	}
+
+	// A forked kernel isn't a direct child, so no "exit" fires when it dies. Poll its
+	// pid so a mid-run death tears down like the direct-spawn exit handler: mark
+	// shutdown, drop from liveKernels, and reject any in-flight execution.
+	private startForkedLivenessMonitor(): void {
+		if (this.kernelPid === undefined) return;
+		this.forkedLivenessTimer = globalThis.setInterval(() => {
+			if (this.state !== "running") return;
+			if (!this.forkedKernelDied()) return;
+			this.appendKernelDiagnostic("forked kernel exited unexpectedly");
+			this.state = "shutdown";
+			liveKernels.delete(this);
+			this.cleanupResources();
+		}, FORKED_LIVENESS_POLL_MS);
+		this.forkedLivenessTimer.unref?.();
+	}
+
+	// A forked kernel is not a direct child, so it emits no "exit" event; poll its
+	// pid so a dead child fails fast instead of burning the full resolve timeout.
+	private forkedKernelDied(): boolean {
+		if (this.kernelPid === undefined) return false;
+		try {
+			process.kill(this.kernelPid, 0);
+			return false;
+		} catch (error) {
+			// EPERM means the pid exists but isn't signalable by us — still alive.
+			// Only ESRCH (no such process) is genuine death.
+			return !(error instanceof Error && (error as NodeJS.ErrnoException).code === "EPERM");
+		}
 	}
 
 	private async waitForResolvedConnection(connectionPath: string): Promise<ConnectionInfo> {
 		const startedAt = Date.now();
 		while (Date.now() - startedAt < PORTS_RESOLVE_TIMEOUT_MS) {
-			if ((this.state as string) === "shutdown") {
+			if ((this.state as string) === "shutdown" || this.forkedKernelDied()) {
 				const tail = this.kernelStderr.slice(-1024);
 				throw new Error(`Kernel exited before resolving ports. stderr:\n${tail || "(empty)"}`);
 			}
@@ -583,7 +656,7 @@ export class KernelManager {
 
 		const startedAt = Date.now();
 		while (Date.now() - startedAt < READY_TIMEOUT_MS) {
-			if ((this.state as string) === "shutdown") {
+			if ((this.state as string) === "shutdown" || this.forkedKernelDied()) {
 				const tail = this.kernelStderr.slice(-1024);
 				throw new Error(`Kernel exited during startup. stderr:\n${tail || "(empty)"}`);
 			}
@@ -950,6 +1023,10 @@ export class KernelManager {
 
 	private cleanupResources(): void {
 		this.clearSnapshotTimer();
+		if (this.forkedLivenessTimer) {
+			globalThis.clearInterval(this.forkedLivenessTimer);
+			this.forkedLivenessTimer = undefined;
+		}
 		this.rejectActiveExecution(new Error("Kernel has been shut down"));
 		this.shell?.close();
 		this.iopub?.close();
@@ -959,9 +1036,16 @@ export class KernelManager {
 		this.control = undefined;
 		this.iopubPumpPromise = undefined;
 		try {
-			this.kernel?.kill("SIGTERM");
+			if (this.kernel) {
+				this.kernel.kill("SIGTERM");
+			} else if (this.kernelPid !== undefined && !this.forkedKernelDied()) {
+				// Only signal a forked kernel confirmed still alive: a dead pid may have
+				// been recycled by the OS, and SIGTERM would then hit an unrelated process.
+				process.kill(this.kernelPid, "SIGTERM");
+			}
 		} catch {}
 		this.kernel = undefined;
+		this.kernelPid = undefined;
 		this.connection = undefined;
 		if (this.tempDir) {
 			try {

@@ -676,6 +676,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 };
 
 /**
+ * Fable/Mythos models think every turn and reject an explicit
+ * `thinking: {type: "disabled"}` (and any sampling params) with a 400.
+ */
+function isAlwaysOnAdaptiveThinkingModel(modelId: string): boolean {
+	return modelId.includes("fable-5") || modelId.includes("mythos-5") || modelId.includes("mythos-preview");
+}
+
+/**
  * Check if a model supports adaptive thinking (Opus 4.6+, Sonnet 4.6)
  */
 function supportsAdaptiveThinking(modelId: string): boolean {
@@ -689,6 +697,7 @@ function supportsAdaptiveThinking(modelId: string): boolean {
 		modelId.includes("opus-4.8") ||
 		modelId.includes("sonnet-4-6") ||
 		modelId.includes("sonnet-4.6") ||
+		modelId.includes("sonnet-5") ||
 		modelId.includes("fable-5") ||
 		modelId.includes("mythos-5") ||
 		modelId.includes("mythos-preview")
@@ -920,8 +929,9 @@ function buildParams(
 		];
 	}
 
-	// Temperature is incompatible with extended thinking (adaptive or budget-based).
-	if (options?.temperature !== undefined && !options?.thinkingEnabled) {
+	// Temperature is incompatible with extended thinking (adaptive or budget-based),
+	// and always-on models reject sampling params outright.
+	if (options?.temperature !== undefined && !options?.thinkingEnabled && !isAlwaysOnAdaptiveThinkingModel(model.id)) {
 		params.temperature = options.temperature;
 	}
 
@@ -961,7 +971,7 @@ function buildParams(
 					display,
 				};
 			}
-		} else if (options?.thinkingEnabled === false) {
+		} else if (options?.thinkingEnabled === false && !isAlwaysOnAdaptiveThinkingModel(model.id)) {
 			params.thinking = { type: "disabled" };
 		}
 	}
