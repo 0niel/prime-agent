@@ -506,13 +506,8 @@ describe("agents view state", () => {
 		expect(resumeConfig.cwd).toBe("/tmp/launch");
 	});
 
-	test("requests all sessions (in-memory + on-disk) for the agents view refresh", () => {
-		expect(createAgentsViewListCommand({ cwd: "/tmp/project" })).toEqual({ type: "list", all: true });
-		expect(createAgentsViewListCommand({ cwd: "/tmp/project", sessionDir: "/tmp/sessions" })).toEqual({
-			type: "list",
-			all: true,
-			sessionDir: "/tmp/sessions",
-		});
+	test("requests only daemon-resident sessions for the agents view refresh", () => {
+		expect(createAgentsViewListCommand()).toEqual({ type: "list" });
 	});
 
 	test("derives the reply headline from the first line of the latest assistant text", () => {

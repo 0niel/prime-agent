@@ -153,17 +153,10 @@ export function createAgentsViewResumeConfig(
 	return resumeConfig;
 }
 
-export function createAgentsViewListCommand(
-	config: AgentSessionRuntimeConfig,
-): Extract<DaemonCommand, { type: "list" }> {
-	// `all` makes the daemon merge on-disk sessions with in-memory ones; without it
-	// only daemon-resident sessions return and live sessions saved to disk are lost
-	// from the view. No cwd is set so the fleet view spans every directory.
-	const command: Extract<DaemonCommand, { type: "list" }> = { type: "list", all: true };
-	if (config.sessionDir) {
-		command.sessionDir = config.sessionDir;
-	}
-	return command;
+export function createAgentsViewListCommand(): Extract<DaemonCommand, { type: "list" }> {
+	// Omitting `all` returns daemon-resident sessions only; on-disk ones come back
+	// via /resume.
+	return { type: "list" };
 }
 
 // Status messages render in a single-row hint slot below the editor; embedded
@@ -1575,7 +1568,7 @@ class AgentsViewMode implements Component, Focusable {
 	private async refreshSessions(): Promise<void> {
 		const client = this.requireClient();
 		try {
-			const response = await client.request(createAgentsViewListCommand(this.options.config));
+			const response = await client.request(createAgentsViewListCommand());
 			const data = requireDaemonData(response);
 			const sessions = expectSessionList(data);
 			const visibleSessions = sessions.filter((summary) =>
