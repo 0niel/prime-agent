@@ -679,7 +679,7 @@ export class AgentSession {
 	private _postCompactionContinuationScheduled = false;
 	private _postCompactionContinuationTimer: ReturnType<typeof setTimeout> | undefined;
 	private _postCompactionContinuationMessages: AgentMessage[] = [];
-	private _queuedAutonomousThresholdContinuations = new WeakSet<AssistantMessage>();
+	private _queuedAutonomousThresholdContinuations = new WeakMap<AssistantMessage, AgentMessage>();
 	private _pendingAutoRefineReview: { reason: AutoRefineReason; review: AutoRefineReview } | undefined;
 	private _autoRefineBranchVersion = 0;
 	private _autoRefineReviewAbort?: AbortController;
@@ -1341,14 +1341,15 @@ export class AgentSession {
 	}
 
 	private _queueAutonomousContinuationForThresholdCompaction(message: AssistantMessage): boolean {
-		if (this._queuedAutonomousThresholdContinuations.has(message)) {
+		const queuedMessage = this._queuedAutonomousThresholdContinuations.get(message);
+		if (queuedMessage && this._postCompactionContinuationMessages.includes(queuedMessage)) {
 			return true;
 		}
 		const autonomousMessage = nextAutonomousContinuation(this._autonomousState, message, { cwd: this._cwd });
 		if (!autonomousMessage) {
 			return false;
 		}
-		this._queuedAutonomousThresholdContinuations.add(message);
+		this._queuedAutonomousThresholdContinuations.set(message, autonomousMessage);
 		this._postCompactionContinuationMessages.push(autonomousMessage);
 		this.agent.followUp(autonomousMessage);
 		return true;
@@ -3691,17 +3692,35 @@ export class AgentSession {
 		}
 
 		this._postCompactionContinuationScheduled = false;
+		const continuationMessages = [...this._postCompactionContinuationMessages];
+		const continuationMessageSet = new Set(continuationMessages);
 		try {
-			const continuationMessages = this._postCompactionContinuationMessages.splice(0);
 			const lastMessage = this.agent.state.messages[this.agent.state.messages.length - 1];
 			if (continuationMessages.length > 0 && lastMessage?.role !== "assistant") {
-				const continuationMessageSet = new Set(continuationMessages);
+				this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
+					(message) => !continuationMessageSet.has(message),
+				);
 				this.agent.removeQueuedMessages((message) => continuationMessageSet.has(message));
 				await this.agent.prompt(continuationMessages);
 				return;
 			}
 			await this.agent.continue();
+			if (continuationMessages.length > 0) {
+				this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
+					(message) => !continuationMessageSet.has(message),
+				);
+			}
 		} catch (error) {
+			if (continuationMessages.length > 0) {
+				this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
+					(message) => !continuationMessageSet.has(message),
+				);
+				this._postCompactionContinuationMessages.unshift(...continuationMessages);
+				this.agent.removeQueuedMessages((message) => continuationMessageSet.has(message));
+				for (const continuationMessage of continuationMessages) {
+					this.agent.followUp(continuationMessage);
+				}
+			}
 			const message = error instanceof Error ? error.message : String(error);
 			if (message.includes("already processing")) {
 				this._schedulePostCompactionContinue();

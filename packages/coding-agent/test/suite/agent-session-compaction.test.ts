@@ -473,6 +473,46 @@ describe("AgentSession compaction characterization", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 	});
 
+	it("restores autonomous threshold continuations when post-compaction prompt must retry", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness({
+			autonomous: {
+				enabled: true,
+				maxContinuations: 2,
+				maxTurns: 100,
+				gates: { commands: [failingGateCommand()], maxRetries: 5 },
+			},
+			settings: { compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1 } },
+			models: [{ id: "faux-1", contextWindow: 200_000 }],
+		});
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as {
+			_runScheduledPostCompactionContinue(): Promise<void>;
+			_schedulePostCompactionContinue(): void;
+			_postCompactionContinuationMessages: AgentMessage[];
+		};
+		const queuedMessage = {
+			role: "user",
+			content: [{ type: "text", text: "autonomous follow-up" }],
+			timestamp: Date.now(),
+		} satisfies AgentMessage;
+		sessionInternals._postCompactionContinuationMessages = [queuedMessage];
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
+		];
+		const promptSpy = vi
+			.spyOn(harness.session.agent, "prompt")
+			.mockRejectedValueOnce(new Error("already processing"));
+		const followUpSpy = vi.spyOn(harness.session.agent, "followUp");
+
+		sessionInternals._schedulePostCompactionContinue();
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(promptSpy).toHaveBeenCalledWith([queuedMessage]);
+		expect(sessionInternals._postCompactionContinuationMessages).toEqual([queuedMessage]);
+		expect(followUpSpy).toHaveBeenCalledWith(queuedMessage);
+	});
+
 	it("clears queued autonomous threshold continuations when autonomous mode is disabled", async () => {
 		vi.useFakeTimers();
 		const harness = await createHarness({
