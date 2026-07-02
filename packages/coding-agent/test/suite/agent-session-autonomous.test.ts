@@ -158,6 +158,27 @@ describe("AgentSession autonomous mode", () => {
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBeGreaterThan(0);
 	});
 
+	it("runs autonomous gates before applying usage limits", () => {
+		const state = createAutonomousRuntimeState({
+			enabled: true,
+			maxTurns: 1,
+			gates: { commands: [`${process.execPath} -e "process.exit(0)"`] },
+		});
+		state.turnsUsed = 1;
+		state.lastGateFailure = {
+			command: "stale gate",
+			attempt: 1,
+			exitText: "exited 1",
+			output: "stale failure",
+		};
+
+		expect(shouldAutonomouslyContinue(state, fauxAssistantMessage("Done."), { cwd: process.cwd() })).toMatchObject({
+			shouldContinue: false,
+			reason: "not_needed",
+		});
+		expect(state.lastGateFailure).toBeUndefined();
+	});
+
 	it("lets passing autonomous gates complete the run under verifier control", async () => {
 		const harness = await createHarness({
 			autonomous: {

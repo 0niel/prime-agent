@@ -205,18 +205,18 @@ export function shouldAutonomouslyContinue(
 	if (!state.enabled || message.stopReason === "error" || message.stopReason === "aborted") {
 		return { shouldContinue: false, reason: "not_needed" };
 	}
-	if (autonomousLimitReached(state, now)) {
-		return { shouldContinue: false, reason: "limit_reached" };
-	}
 	if (state.gates.commands.length > 0) {
 		const gateResult = runAutonomousQualityGates(state, options.cwd);
 		if (gateResult === "passed") {
 			return { shouldContinue: false, reason: "not_needed" };
 		}
-		if (gateResult === "retry_exhausted") {
+		if (gateResult === "retry_exhausted" || autonomousLimitReached(state, now)) {
 			return { shouldContinue: false, reason: "limit_reached" };
 		}
 		return { shouldContinue: true, reason: "gate_failed" };
+	}
+	if (autonomousLimitReached(state, now)) {
+		return { shouldContinue: false, reason: "limit_reached" };
 	}
 	return { shouldContinue: true, reason: "missing_terminal_evidence" };
 }

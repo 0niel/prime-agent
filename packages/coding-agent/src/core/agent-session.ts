@@ -3695,15 +3695,6 @@ export class AgentSession {
 		const continuationMessages = [...this._postCompactionContinuationMessages];
 		const continuationMessageSet = new Set(continuationMessages);
 		try {
-			const lastMessage = this.agent.state.messages[this.agent.state.messages.length - 1];
-			if (continuationMessages.length > 0 && lastMessage?.role !== "assistant") {
-				this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
-					(message) => !continuationMessageSet.has(message),
-				);
-				this.agent.removeQueuedMessages((message) => continuationMessageSet.has(message));
-				await this.agent.prompt(continuationMessages);
-				return;
-			}
 			await this.agent.continue();
 			if (continuationMessages.length > 0) {
 				this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
@@ -3711,16 +3702,6 @@ export class AgentSession {
 				);
 			}
 		} catch (error) {
-			if (continuationMessages.length > 0) {
-				this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
-					(message) => !continuationMessageSet.has(message),
-				);
-				this._postCompactionContinuationMessages.unshift(...continuationMessages);
-				this.agent.removeQueuedMessages((message) => continuationMessageSet.has(message));
-				for (const continuationMessage of continuationMessages) {
-					this.agent.followUp(continuationMessage);
-				}
-			}
 			const message = error instanceof Error ? error.message : String(error);
 			if (message.includes("already processing")) {
 				this._schedulePostCompactionContinue();
