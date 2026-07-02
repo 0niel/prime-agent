@@ -636,6 +636,7 @@ export class InteractiveMode {
 
 	// One-line recap of the agent's recent work, rendered just above the editor.
 	private recapContainer!: Container;
+	private modeIndicatorContainer!: Container;
 	private sessionRecap: string | undefined;
 
 	// Custom footer from extension (undefined = use built-in footer)
@@ -700,6 +701,7 @@ export class InteractiveMode {
 		this.childAgentDetail.onKill = (nodeId) => void this.killChildAgent(nodeId);
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
+		this.modeIndicatorContainer = new Container();
 		this.recapContainer = new Container();
 		this.keybindings = KeybindingsManager.create();
 		setKeybindings(this.keybindings);
@@ -967,6 +969,7 @@ export class InteractiveMode {
 		this.mainContainer.addChild(this.recapContainer);
 		this.mainContainer.addChild(this.queuedMessagesContainer);
 		this.mainContainer.addChild(this.editorContainer);
+		this.mainContainer.addChild(this.modeIndicatorContainer);
 		this.mainContainer.addChild(this.childAgentSummary);
 		this.mainContainer.addChild(this.widgetContainerBelow);
 		this.mainContainer.addChild(this.footer);
@@ -6174,8 +6177,13 @@ export class InteractiveMode {
 	}
 
 	private updatePlanModeIndicator(enabled: boolean): void {
-		this.setExtensionStatus("plan-mode", enabled ? "⏸ plan" : undefined);
-		this.footer.invalidate();
+		if (!this.modeIndicatorContainer) return;
+		this.modeIndicatorContainer.clear();
+		if (enabled) {
+			const toggle = keyText("app.plan.toggle");
+			const hint = toggle ? theme.fg("dim", ` (${toggle} to toggle)`) : "";
+			this.modeIndicatorContainer.addChild(new Text(`${theme.fg("success", "⏸ plan mode on")}${hint}`, 1, 0));
+		}
 		this.ui.requestRender();
 	}
 
