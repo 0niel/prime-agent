@@ -206,6 +206,57 @@ describe("AgentSession compaction characterization", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 	});
 
+	it("clears queued autonomous continuations when threshold compaction is skipped", async () => {
+		const harness = await createHarness({
+			autonomous: {
+				enabled: true,
+				maxContinuations: 2,
+				maxTurns: 100,
+				gates: { commands: [failingGateCommand()], maxRetries: 5 },
+			},
+			settings: { compaction: { keepRecentTokens: 1 } },
+		});
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const successfulAssistant = createAssistant(harness, {
+			stopReason: "toolUse",
+			totalTokens: 10_000,
+			timestamp: Date.now(),
+		});
+		const toolResult: ToolResultMessage<unknown> = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "large-context",
+			content: [{ type: "text", text: "x".repeat(800_000) }],
+			isError: false,
+			timestamp: Date.now() + 500,
+		};
+		harness.session.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "hello" }], timestamp: Date.now() - 1000 },
+			successfulAssistant,
+			toolResult,
+		];
+
+		const shouldStop = await sessionInternals._shouldStopAfterTurn({
+			message: successfulAssistant,
+			toolResults: [toolResult],
+			context: {
+				systemPrompt: harness.session.systemPrompt,
+				messages: [successfulAssistant, toolResult],
+				tools: [],
+			},
+			newMessages: [successfulAssistant, toolResult],
+		});
+		expect(shouldStop).toBe(true);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
+
+		await sessionInternals._runAutoCompaction("threshold", false);
+
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);
+	});
+
 	it("emits a warning when auto-compaction has nothing to summarize", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

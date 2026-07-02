@@ -1355,16 +1355,30 @@ export class AgentSession {
 		return true;
 	}
 
-	private _clearQueuedAutonomousContinuations(): void {
+	private _clearQueuedAutonomousContinuations(options: { refund?: boolean } = {}): void {
 		const queuedMessages = this._postCompactionContinuationMessages.splice(0);
 		if (queuedMessages.length === 0) {
 			return;
 		}
 		const queuedMessageSet = new Set(queuedMessages);
 		this.agent.removeQueuedMessages((message) => queuedMessageSet.has(message));
+		if (options.refund) {
+			this._autonomousState.continuationsUsed = Math.max(
+				0,
+				this._autonomousState.continuationsUsed - queuedMessages.length,
+			);
+		}
 		this._continueAfterThresholdCompaction = false;
 		if (!this.agent.hasQueuedMessages()) {
 			this._cancelPostCompactionContinue();
+		}
+	}
+
+	private _clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
+		shouldContinueAfterThreshold: boolean,
+	): void {
+		if (shouldContinueAfterThreshold) {
+			this._clearQueuedAutonomousContinuations({ refund: true });
 		}
 	}
 
@@ -4188,6 +4202,7 @@ export class AgentSession {
 					aborted: false,
 					willRetry: false,
 				});
+				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(shouldContinueAfterThreshold);
 				return false;
 			}
 
@@ -4200,6 +4215,7 @@ export class AgentSession {
 					aborted: false,
 					willRetry: false,
 				});
+				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(shouldContinueAfterThreshold);
 				return false;
 			}
 			const { apiKey, headers } = authResult;
@@ -4217,6 +4233,7 @@ export class AgentSession {
 					errorMessage: "Auto-compaction skipped: nothing to summarize outside the recent-context window",
 					errorSeverity: "warning",
 				});
+				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(shouldContinueAfterThreshold);
 				return false;
 			}
 
@@ -4240,6 +4257,7 @@ export class AgentSession {
 						aborted: true,
 						willRetry: false,
 					});
+					this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(shouldContinueAfterThreshold);
 					return false;
 				}
 
@@ -4285,6 +4303,7 @@ export class AgentSession {
 					aborted: true,
 					willRetry: false,
 				});
+				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(shouldContinueAfterThreshold);
 				return false;
 			}
 
@@ -4337,6 +4356,7 @@ export class AgentSession {
 			}
 			return false;
 		} catch (error) {
+			this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(shouldContinueAfterThreshold);
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			this._emit({
 				type: "compaction_end",
