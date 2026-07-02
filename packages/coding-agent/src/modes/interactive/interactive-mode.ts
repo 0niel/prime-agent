@@ -636,7 +636,6 @@ export class InteractiveMode {
 
 	// One-line recap of the agent's recent work, rendered just above the editor.
 	private recapContainer!: Container;
-	private modeIndicatorContainer!: Container;
 	private sessionRecap: string | undefined;
 
 	// Custom footer from extension (undefined = use built-in footer)
@@ -701,7 +700,6 @@ export class InteractiveMode {
 		this.childAgentDetail.onKill = (nodeId) => void this.killChildAgent(nodeId);
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
-		this.modeIndicatorContainer = new Container();
 		this.recapContainer = new Container();
 		this.keybindings = KeybindingsManager.create();
 		setKeybindings(this.keybindings);
@@ -969,7 +967,6 @@ export class InteractiveMode {
 		this.mainContainer.addChild(this.recapContainer);
 		this.mainContainer.addChild(this.queuedMessagesContainer);
 		this.mainContainer.addChild(this.editorContainer);
-		this.mainContainer.addChild(this.modeIndicatorContainer);
 		this.mainContainer.addChild(this.childAgentSummary);
 		this.mainContainer.addChild(this.widgetContainerBelow);
 		this.mainContainer.addChild(this.footer);
@@ -4601,7 +4598,10 @@ export class InteractiveMode {
 
 	private getTrayLocationLabel(): string | undefined {
 		const agentsHint = this.getAgentsViewTrayHint();
-		return [agentsHint, this.getModelTrayLabel()].filter((label): label is string => label !== undefined).join("  ");
+		const planLabel = this.connectionState?.planMode ? theme.fg("success", "plan mode") : undefined;
+		return [agentsHint, this.getModelTrayLabel(), planLabel]
+			.filter((label): label is string => label !== undefined)
+			.join("  ");
 	}
 
 	private getModelTrayLabel(): string {
@@ -6176,12 +6176,9 @@ export class InteractiveMode {
 		}
 	}
 
-	private updatePlanModeIndicator(enabled: boolean): void {
-		if (!this.modeIndicatorContainer) return;
-		this.modeIndicatorContainer.clear();
-		if (enabled) {
-			this.modeIndicatorContainer.addChild(new Text(theme.fg("success", "plan mode · edits blocked"), 1, 0));
-		}
+	private updatePlanModeIndicator(_enabled: boolean): void {
+		// Shown inline in the tray line (getTrayLocationLabel); refresh it.
+		this.childAgentSummary.invalidate();
 		this.ui.requestRender();
 	}
 
