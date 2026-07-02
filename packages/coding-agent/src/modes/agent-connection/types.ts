@@ -550,7 +550,7 @@ export interface AgentConnection {
 	setAutoCompactionEnabled(enabled: boolean): Promise<void>;
 
 	compact(customInstructions?: string): Promise<CompactionResult>;
-	refine(options?: { instructions?: string; rollbackId?: string }): Promise<RefinementResult>;
+	refine(options?: { instructions?: string; rollbackId?: string; global?: boolean }): Promise<RefinementResult>;
 	abortCompaction(): Promise<void>;
 	abortBranchSummary(): Promise<void>;
 	abortRetry(): Promise<void>;

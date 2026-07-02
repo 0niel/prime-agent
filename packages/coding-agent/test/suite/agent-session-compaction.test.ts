@@ -83,6 +83,42 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
 	});
 
+	it("reschedules a pending post-compaction continuation after successful manual compaction", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "summary from extension",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: { source: "extension" },
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as {
+			_schedulePostCompactionContinue(): void;
+			_cancelPostCompactionContinue(): void;
+			_postCompactionContinuationScheduled: boolean;
+		};
+		try {
+			await harness.session.prompt("one");
+			await harness.session.prompt("two");
+			internals._schedulePostCompactionContinue();
+
+			await harness.session.compact();
+
+			expect(internals._postCompactionContinuationScheduled).toBe(true);
+		} finally {
+			internals._cancelPostCompactionContinue();
+		}
+	});
+
 	it("throws when compacting without a model", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

@@ -533,16 +533,25 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
-	async refine(options: { instructions?: string; rollbackId?: string } = {}): Promise<RefinementResult> {
-		return this.requestData<RefinementResult>(
-			{
-				type: "refine",
-				activeSessionId: this.activeSessionId,
-				instructions: options.instructions,
-				rollbackId: options.rollbackId,
-			},
-			DAEMON_REFINE_REQUEST_TIMEOUT_MS,
-		);
+	async refine(
+		options: { instructions?: string; rollbackId?: string; global?: boolean } = {},
+	): Promise<RefinementResult> {
+		const command: {
+			type: "refine";
+			activeSessionId: string;
+			instructions?: string;
+			rollbackId?: string;
+			global?: boolean;
+		} = {
+			type: "refine",
+			activeSessionId: this.activeSessionId,
+			instructions: options.instructions,
+			rollbackId: options.rollbackId,
+		};
+		if (options.global !== undefined) {
+			command.global = options.global;
+		}
+		return this.requestData<RefinementResult>(command, DAEMON_REFINE_REQUEST_TIMEOUT_MS);
 	}
 
 	async abortCompaction(): Promise<void> {

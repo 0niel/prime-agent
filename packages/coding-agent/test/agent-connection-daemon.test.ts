@@ -1090,6 +1090,7 @@ describe("DaemonAgentConnection", () => {
 			instructions: "remember this",
 			rollbackId: "refine_previous",
 		});
+		expect(fakeClient.requests[1]).not.toHaveProperty("global");
 		expect(fakeClient.requestTimeouts[0]).toBe(30000);
 		expect(fakeClient.requestTimeouts[1]).toBe(DAEMON_REFINE_REQUEST_TIMEOUT_MS);
 	});

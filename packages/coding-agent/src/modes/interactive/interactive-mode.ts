@@ -7692,9 +7692,14 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 	}
 
 	private async handleRefineCommand(args?: string): Promise<void> {
-		const trimmedArgs = args?.trim();
+		let trimmedArgs = args?.trim() ?? "";
+		const globalOption: { global: boolean } = { global: false };
+		if (/^--global(?=\s|$)/.test(trimmedArgs)) {
+			globalOption.global = true;
+			trimmedArgs = trimmedArgs.replace(/^--global(?=\s|$)/, "").trim();
+		}
 		const rollbackPrefix = "rollback ";
-		let options: { instructions?: string; rollbackId?: string };
+		let options: { instructions?: string; rollbackId?: string; global?: boolean };
 
 		if (trimmedArgs === "rollback") {
 			this.showWarning("Usage: /refine rollback <refinement-id>");
@@ -7704,7 +7709,12 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 		if (trimmedArgs?.startsWith(rollbackPrefix) && trimmedArgs.slice(rollbackPrefix.length).trim()) {
 			// Rollback uses the global refinement history, not the current trajectory,
 			// so it must work even in a fresh session with no messages yet.
-			options = { rollbackId: trimmedArgs.slice(rollbackPrefix.length).trim() };
+			let rollbackId = trimmedArgs.slice(rollbackPrefix.length).trim();
+			if (/\s--global$/.test(rollbackId)) {
+				globalOption.global = true;
+				rollbackId = rollbackId.replace(/\s--global$/, "").trim();
+			}
+			options = { rollbackId, ...globalOption };
 		} else {
 			let messageCount: number;
 			try {
@@ -7719,12 +7729,14 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 				this.showWarning("Nothing to refine (no trajectory yet)");
 				return;
 			}
-			options = { instructions: args };
+			options = { instructions: trimmedArgs || undefined, ...globalOption };
 		}
 
 		this.stopWorkingLoader();
 		this.showStatus(
-			options.rollbackId ? `Rolling back refinement ${options.rollbackId}...` : "Refining harness state...",
+			options.rollbackId
+				? `Rolling back refinement ${options.rollbackId}...`
+				: `Refining ${options.global ? "global" : "local"} continual harness state...`,
 		);
 
 		try {
@@ -7732,7 +7744,9 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 			const applied = result.appliedEdits.filter((edit) => edit.applied).length;
 			const failed = result.appliedEdits.length - applied;
 			const failedSuffix = failed > 0 ? `, ${failed} failed` : "";
-			this.showStatus(`Refined harness state: ${applied} edit${applied === 1 ? "" : "s"} applied${failedSuffix}`);
+			this.showStatus(
+				`Refined continual harness state: ${applied} edit${applied === 1 ? "" : "s"} applied${failedSuffix}`,
+			);
 			this.showStatus(`Harness state: ${result.harnessStatePath}`);
 		} catch (error) {
 			this.showError(`Refinement failed: ${error instanceof Error ? error.message : String(error)}`);

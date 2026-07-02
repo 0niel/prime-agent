@@ -44,7 +44,7 @@ export type RpcCommand =
 
 	// Compaction
 	| { id?: string; type: "compact"; customInstructions?: string }
-	| { id?: string; type: "refine"; instructions?: string; rollbackId?: string }
+	| { id?: string; type: "refine"; instructions?: string; rollbackId?: string; global?: boolean }
 	| { id?: string; type: "set_auto_compaction"; enabled: boolean }
 
 	// Retry

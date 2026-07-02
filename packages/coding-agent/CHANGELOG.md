@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added an opt-in auto-refine review hook that can ask whether `/refine` should run after turn intervals or compaction checkpoints.
+
 ## [0.2.4] - 2026-07-01
 
 - Changed the agents view to list only sessions the daemon is actively holding, and stopped the daemon from auto-restoring on-disk sessions on startup, so a restarted daemon no longer surfaces a wall of weeks-old sessions; sessions come back via `/resume` or `--resume` ([#295](https://github.com/PrimeIntellect-ai/prime-agent/issues/295)).

@@ -181,6 +181,49 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("preserves omitted global scope on daemon refine commands", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: {
+				agentDir: "/tmp/prime-agent-test-agent",
+				cwd: "/tmp",
+			},
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const refine = vi.fn(async () => ({
+			id: "refine_daemon",
+			appliedEdits: [],
+			harnessStatePath: "/tmp/harness_state.json",
+		}));
+		const state = makeState("active-1") as ActiveSessionState & {
+			runtime: ActiveSessionState["runtime"] & {
+				session: {
+					refine: typeof refine;
+				};
+			};
+		};
+		state.runtime.session = { refine } as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+
+		await internals.handleCommand(makeClient("client-1", state.activeSessionId), {
+			id: "command-1",
+			type: "refine",
+			activeSessionId: state.activeSessionId,
+			instructions: "record local lesson",
+		});
+
+		expect(refine).toHaveBeenCalledWith({
+			instructions: "record local lesson",
+			rollbackId: undefined,
+			global: undefined,
+		});
+	});
+
 	it("defers busy heartbeat cron jobs instead of queueing a follow-up", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: {

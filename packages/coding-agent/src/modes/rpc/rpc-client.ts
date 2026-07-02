@@ -277,12 +277,23 @@ export class RpcClient {
 	}
 
 	/**
-	 * Refine editable harness state.
+	 * Refine editable continual harness state.
 	 */
-	async refine(options: { instructions?: string; rollbackId?: string } = {}): Promise<RefinementResult> {
+	async refine(
+		options: { instructions?: string; rollbackId?: string; global?: boolean } = {},
+	): Promise<RefinementResult> {
 		// Refinement runs an LLM pass that routinely exceeds the default 30s response
 		// timeout, so use the same extended window as the daemon refine path.
-		const response = await this.send({ type: "refine", ...options }, REFINE_REQUEST_TIMEOUT_MS);
+		const command = { type: "refine", instructions: options.instructions, rollbackId: options.rollbackId } as {
+			type: "refine";
+			instructions?: string;
+			rollbackId?: string;
+			global?: boolean;
+		};
+		if (options.global !== undefined) {
+			command.global = options.global;
+		}
+		const response = await this.send(command, REFINE_REQUEST_TIMEOUT_MS);
 		return this.getData(response);
 	}
 

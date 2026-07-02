@@ -52,7 +52,88 @@ describe("InteractiveMode.handleRefineCommand", () => {
 		// Rollback uses global history, so the empty-trajectory guard must not block it.
 		expect(context.agentConnection.getSessionStats).not.toHaveBeenCalled();
 		expect(context.showWarning).not.toHaveBeenCalled();
-		expect(context.agentConnection.refine).toHaveBeenCalledWith({ rollbackId: "refine_123" });
+		expect(context.agentConnection.refine).toHaveBeenCalledWith({ rollbackId: "refine_123", global: false });
+	});
+
+	test("parses --global after rollback id", async () => {
+		const context = {
+			agentConnection: {
+				getSessionStats: vi.fn().mockResolvedValue({ totalMessages: 0 }),
+				refine: vi.fn().mockResolvedValue({ appliedEdits: [], harnessStatePath: "/tmp/harness_state.json" }),
+			},
+			stopWorkingLoader: vi.fn(),
+			showStatus: vi.fn(),
+			showWarning: vi.fn(),
+			showError: vi.fn(),
+		};
+
+		await handleRefineCommand.call(context, "rollback refine_123 --global");
+
+		expect(context.agentConnection.getSessionStats).not.toHaveBeenCalled();
+		expect(context.agentConnection.refine).toHaveBeenCalledWith({ rollbackId: "refine_123", global: true });
+	});
+
+	test("parses --global before refinement instructions", async () => {
+		const context = {
+			agentConnection: {
+				getSessionStats: vi.fn().mockResolvedValue({ totalMessages: 2 }),
+				refine: vi.fn().mockResolvedValue({ appliedEdits: [], harnessStatePath: "/tmp/harness_state.json" }),
+			},
+			stopWorkingLoader: vi.fn(),
+			showStatus: vi.fn(),
+			showWarning: vi.fn(),
+			showError: vi.fn(),
+		};
+
+		await handleRefineCommand.call(context, "--global focus on validation");
+
+		expect(context.showStatus).toHaveBeenCalledWith("Refining global continual harness state...");
+		expect(context.agentConnection.refine).toHaveBeenCalledWith({
+			instructions: "focus on validation",
+			global: true,
+		});
+	});
+
+	test("preserves trailing --global in ordinary refinement instructions", async () => {
+		const context = {
+			agentConnection: {
+				getSessionStats: vi.fn().mockResolvedValue({ totalMessages: 2 }),
+				refine: vi.fn().mockResolvedValue({ appliedEdits: [], harnessStatePath: "/tmp/harness_state.json" }),
+			},
+			stopWorkingLoader: vi.fn(),
+			showStatus: vi.fn(),
+			showWarning: vi.fn(),
+			showError: vi.fn(),
+		};
+
+		await handleRefineCommand.call(context, "update docs to explain --global");
+
+		expect(context.showStatus).toHaveBeenCalledWith("Refining local continual harness state...");
+		expect(context.agentConnection.refine).toHaveBeenCalledWith({
+			instructions: "update docs to explain --global",
+			global: false,
+		});
+	});
+
+	test("shows local scope in status for default refinement", async () => {
+		const context = {
+			agentConnection: {
+				getSessionStats: vi.fn().mockResolvedValue({ totalMessages: 2 }),
+				refine: vi.fn().mockResolvedValue({ appliedEdits: [], harnessStatePath: "/tmp/harness_state.json" }),
+			},
+			stopWorkingLoader: vi.fn(),
+			showStatus: vi.fn(),
+			showWarning: vi.fn(),
+			showError: vi.fn(),
+		};
+
+		await handleRefineCommand.call(context, "focus on validation");
+
+		expect(context.showStatus).toHaveBeenCalledWith("Refining local continual harness state...");
+		expect(context.agentConnection.refine).toHaveBeenCalledWith({
+			instructions: "focus on validation",
+			global: false,
+		});
 	});
 
 	test("blocks plain refinement when there is no trajectory", async () => {
