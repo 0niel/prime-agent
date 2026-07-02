@@ -451,6 +451,11 @@ type GoalSlashCommand =
 
 type AutonomousSlashCommand = { kind: "status" } | { kind: "on" } | { kind: "off" };
 
+type AutonomousRuntimeSnapshot = Pick<
+	AutonomousRuntimeState,
+	"continuationsUsed" | "gateAttempts" | "lastGateFailure" | "lastGateFailureSnapshot"
+>;
+
 interface RlmChildRun {
 	id: string;
 	prompt: string;
@@ -680,6 +685,7 @@ export class AgentSession {
 	private _postCompactionContinuationTimer: ReturnType<typeof setTimeout> | undefined;
 	private _postCompactionContinuationMessages: AgentMessage[] = [];
 	private _queuedAutonomousThresholdContinuations = new WeakMap<AssistantMessage, AgentMessage>();
+	private _queuedAutonomousContinuationSnapshots = new WeakMap<AgentMessage, AutonomousRuntimeSnapshot>();
 	private _pendingAutoRefineReview: { reason: AutoRefineReason; review: AutoRefineReview } | undefined;
 	private _autoRefineBranchVersion = 0;
 	private _autoRefineReviewAbort?: AbortController;
@@ -1340,33 +1346,63 @@ export class AgentSession {
 		return true;
 	}
 
+	private _snapshotAutonomousRuntimeState(): AutonomousRuntimeSnapshot {
+		return {
+			continuationsUsed: this._autonomousState.continuationsUsed,
+			gateAttempts: { ...this._autonomousState.gateAttempts },
+			lastGateFailure: this._autonomousState.lastGateFailure
+				? { ...this._autonomousState.lastGateFailure }
+				: undefined,
+			lastGateFailureSnapshot: this._autonomousState.lastGateFailureSnapshot
+				? { ...this._autonomousState.lastGateFailureSnapshot }
+				: undefined,
+		};
+	}
+
+	private _restoreAutonomousRuntimeSnapshot(snapshot: AutonomousRuntimeSnapshot): void {
+		this._autonomousState.continuationsUsed = snapshot.continuationsUsed;
+		this._autonomousState.gateAttempts = { ...snapshot.gateAttempts };
+		this._autonomousState.lastGateFailure = snapshot.lastGateFailure ? { ...snapshot.lastGateFailure } : undefined;
+		this._autonomousState.lastGateFailureSnapshot = snapshot.lastGateFailureSnapshot
+			? { ...snapshot.lastGateFailureSnapshot }
+			: undefined;
+	}
+
 	private _queueAutonomousContinuationForThresholdCompaction(message: AssistantMessage): boolean {
 		const queuedMessage = this._queuedAutonomousThresholdContinuations.get(message);
 		if (queuedMessage && this._postCompactionContinuationMessages.includes(queuedMessage)) {
 			return true;
 		}
+		const snapshot = this._snapshotAutonomousRuntimeState();
 		const autonomousMessage = nextAutonomousContinuation(this._autonomousState, message, { cwd: this._cwd });
 		if (!autonomousMessage) {
 			return false;
 		}
 		this._queuedAutonomousThresholdContinuations.set(message, autonomousMessage);
+		this._queuedAutonomousContinuationSnapshots.set(autonomousMessage, snapshot);
 		this._postCompactionContinuationMessages.push(autonomousMessage);
 		this.agent.followUp(autonomousMessage);
 		return true;
 	}
 
-	private _clearQueuedAutonomousContinuations(options: { refund?: boolean } = {}): void {
+	private _clearQueuedAutonomousContinuations(options: { restoreAutonomousState?: boolean } = {}): void {
 		const queuedMessages = this._postCompactionContinuationMessages.splice(0);
 		if (queuedMessages.length === 0) {
 			return;
 		}
 		const queuedMessageSet = new Set(queuedMessages);
 		this.agent.removeQueuedMessages((message) => queuedMessageSet.has(message));
-		if (options.refund) {
-			this._autonomousState.continuationsUsed = Math.max(
-				0,
-				this._autonomousState.continuationsUsed - queuedMessages.length,
-			);
+		if (options.restoreAutonomousState) {
+			for (const queuedMessage of queuedMessages) {
+				const snapshot = this._queuedAutonomousContinuationSnapshots.get(queuedMessage);
+				if (snapshot) {
+					this._restoreAutonomousRuntimeSnapshot(snapshot);
+					break;
+				}
+			}
+		}
+		for (const queuedMessage of queuedMessages) {
+			this._queuedAutonomousContinuationSnapshots.delete(queuedMessage);
 		}
 		this._continueAfterThresholdCompaction = false;
 		if (!this.agent.hasQueuedMessages()) {
@@ -1378,7 +1414,7 @@ export class AgentSession {
 		shouldContinueAfterThreshold: boolean,
 	): void {
 		if (shouldContinueAfterThreshold) {
-			this._clearQueuedAutonomousContinuations({ refund: true });
+			this._clearQueuedAutonomousContinuations({ restoreAutonomousState: true });
 		}
 	}
 
@@ -2542,7 +2578,7 @@ export class AgentSession {
 				// Check if we need to compact before sending (catches aborted responses)
 				const lastAssistant = this._findLastAssistantMessage();
 				if (lastAssistant) {
-					await this._checkCompaction(lastAssistant, false);
+					await this._checkCompaction(lastAssistant, false, false);
 				}
 
 				// Build messages array (custom message if any, then user message)
@@ -3727,6 +3763,11 @@ export class AgentSession {
 		for (const message of stillQueued) {
 			this.agent.followUp(message);
 		}
+		for (const message of continuationMessages) {
+			if (!stillQueued.has(message)) {
+				this._queuedAutonomousContinuationSnapshots.delete(message);
+			}
+		}
 		this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
 			(message) => !continuationMessageSet.has(message) || stillQueued.has(message),
 		);
@@ -4116,7 +4157,11 @@ export class AgentSession {
 		return calculateContextTokens(assistantMessage.usage);
 	}
 
-	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
+	private async _checkCompaction(
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck = true,
+		queueAutonomousContinuation = true,
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
@@ -4174,7 +4219,7 @@ export class AgentSession {
 		const contextTokens = this._getThresholdContextTokens(assistantMessage, compactionTimestamp);
 		if (contextTokens === undefined) return false;
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
-			if (this._queueAutonomousContinuationForThresholdCompaction(assistantMessage)) {
+			if (queueAutonomousContinuation && this._queueAutonomousContinuationForThresholdCompaction(assistantMessage)) {
 				this._continueAfterThresholdCompaction = true;
 			}
 			return await this._runAutoCompaction("threshold", false);
