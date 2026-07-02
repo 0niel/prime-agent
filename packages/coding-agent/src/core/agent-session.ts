@@ -113,7 +113,7 @@ import type { McpManager } from "./mcp/mcp-manager.js";
 import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
-import { PLAN_MODE_BLOCKED_TOOLS, PLAN_MODE_PROMPT } from "./prompts/plan-mode.js";
+import { createPlanModeContextMessage, PLAN_MODE_BLOCKED_TOOLS } from "./prompts/plan-mode.js";
 import {
 	appendGlobalRefinement,
 	applyRefinementProposal,
@@ -1334,7 +1334,11 @@ export class AgentSession {
 				lastError: undefined,
 			};
 			this._setGoalState(nextGoal);
-			return [createGoalContextMessage(this._goalState, "continuation")];
+			const continuation: AgentMessage[] = [createGoalContextMessage(this._goalState, "continuation")];
+			if (this._planModeController.enabled) {
+				continuation.push(createPlanModeContextMessage());
+			}
+			return continuation;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			try {
@@ -2043,6 +2047,14 @@ export class AgentSession {
 			}
 			this._pendingNextTurnMessages = [];
 
+			// Plan mode rides in as a per-turn context message (like goal_context),
+			// not a system-prompt append, so the system prompt and its provider cache
+			// stay stable across toggles. Placed before the user message so the user's
+			// actual turn stays last.
+			if (this._planModeController.enabled) {
+				messages.push(createPlanModeContextMessage());
+			}
+
 			// Add user message
 			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
 			if (currentImages) {
@@ -2074,12 +2086,7 @@ export class AgentSession {
 					});
 				}
 			}
-			// Apply extension-modified system prompt, or reset to base; plan mode
-			// appends per-turn so a toggle takes effect on the next turn.
-			const turnSystemPrompt = result?.systemPrompt || this._baseSystemPrompt;
-			this.agent.state.systemPrompt = this._planModeController.enabled
-				? `${turnSystemPrompt}\n\n${PLAN_MODE_PROMPT}`
-				: turnSystemPrompt;
+			this.agent.state.systemPrompt = result?.systemPrompt || this._baseSystemPrompt;
 		} catch (error) {
 			preflightResult?.(false);
 			throw error;

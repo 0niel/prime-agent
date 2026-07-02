@@ -13,8 +13,8 @@ import {
 	createAgentSessionServices,
 } from "../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import { convertToLlm } from "../src/core/messages.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
-import { PLAN_MODE_PROMPT } from "../src/core/prompts/plan-mode.js";
 import {
 	buildSessionContext,
 	type PlanModeChangeEntry,
@@ -160,14 +160,27 @@ describe("AgentSession plan mode", () => {
 		expect(planEntries).toHaveLength(1);
 	});
 
-	it("appends the plan-mode prompt per turn, only while active", async () => {
+	it("injects the plan-mode message per turn without touching the system prompt", async () => {
 		const seenSystemPrompts: string[] = [];
+		const planModeCounts: number[] = [];
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: "", tools: [] },
-			streamFn: () => {
+			convertToLlm,
+			streamFn: (_model, context) => {
 				seenSystemPrompts.push(agent.state.systemPrompt);
+				// convertToLlm turns the custom plan-mode message into a user message,
+				// so match on its rendered content rather than customType. Count occurrences:
+				// a fresh one is injected only on the plan-on turn, but it then persists in
+				// history, so turn 2 (plan off) still sees exactly the one from turn 1.
+				planModeCounts.push(
+					context.messages.filter(
+						(m) =>
+							Array.isArray(m.content) &&
+							m.content.some((c) => c.type === "text" && c.text.includes("<plan_mode>")),
+					).length,
+				);
 				const stream = new EventStream<AssistantMessageEvent, AssistantMessage>(
 					(event) => event.type === "done" || event.type === "error",
 					(event) => {
@@ -220,9 +233,13 @@ describe("AgentSession plan mode", () => {
 			mockSession.dispose();
 		}
 
+		// Turn 1 (plan on) injects exactly one plan-mode message; turn 2 (plan off)
+		// injects no new one — the single occurrence it sees is turn 1's, now history.
+		expect(planModeCounts).toEqual([1, 1]);
+		// System prompt stays stable across the toggle (never carries plan-mode text).
 		expect(seenSystemPrompts).toHaveLength(2);
-		expect(seenSystemPrompts[0].endsWith(PLAN_MODE_PROMPT)).toBe(true);
-		expect(seenSystemPrompts[1]).not.toContain("<plan_mode>");
+		expect(seenSystemPrompts[0]).not.toContain("<plan_mode>");
+		expect(seenSystemPrompts[0]).toBe(seenSystemPrompts[1]);
 	});
 
 	it("blocks mutating side tools while active", async () => {
