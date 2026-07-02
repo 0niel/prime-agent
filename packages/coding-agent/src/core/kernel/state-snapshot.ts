@@ -73,9 +73,9 @@ def _prime_agent_snapshot_state():
         ip = None
     ns = ip.user_ns if ip is not None else _b.globals()
     hidden = _b.set(_b.getattr(ip, "user_ns_hidden", {}) or {}) if ip is not None else _b.set()
-    # rlm and the wrapped skill modules are live, connection-bound handles that
-    # the bootstrap re-creates on restore; never snapshot them.
-    always_skip = {"rlm", "In", "Out", "get_ipython", "exit", "quit", "open"}
+    # rlm and asyncio are re-created by the kernel bootstrap on every start;
+    # never snapshot them.
+    always_skip = {"rlm", "asyncio", "In", "Out", "get_ipython", "exit", "quit", "open"}
 
     payload = {}
     skipped = []
@@ -205,7 +205,7 @@ def _prime_agent_list_state_names():
         ip = None
     ns = ip.user_ns if ip is not None else _b.globals()
     hidden = _b.set(_b.getattr(ip, "user_ns_hidden", {}) or {}) if ip is not None else _b.set()
-    always_skip = {"rlm", "In", "Out", "get_ipython", "exit", "quit", "open"}
+    always_skip = {"rlm", "asyncio", "In", "Out", "get_ipython", "exit", "quit", "open"}
     names = []
     for name in _b.list(ns.keys()):
         if name.startswith("_") or name in hidden or name in always_skip:

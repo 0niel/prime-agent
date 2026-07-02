@@ -18,6 +18,8 @@ import type { PythonSkillRuntimeInfo } from "../skills.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
 const RLM_BOOTSTRAP_BASE_CODE = `
+import asyncio
+
 try:
     import nest_asyncio as _prime_agent_nest_asyncio
     _prime_agent_nest_asyncio.apply()
