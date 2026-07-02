@@ -69,6 +69,7 @@ import {
 	type AgentAutonomousConfig,
 	type AgentAutonomousStatus,
 	type AutonomousRuntimeState,
+	addAutonomousContinuation,
 	addAutonomousUsage,
 	autonomousStatus,
 	createAutonomousRuntimeState,
@@ -2308,6 +2309,10 @@ export class AgentSession {
 
 	getAutonomousStatus(): AgentAutonomousStatus {
 		return autonomousStatus(this._autonomousState);
+	}
+
+	recordHostAutonomousContinuation(): void {
+		addAutonomousContinuation(this._autonomousState);
 	}
 
 	/** Scoped models for cycling (from --models flag) */

@@ -21,6 +21,7 @@ type FakeSession = {
 	prompt: ReturnType<typeof vi.fn>;
 	reload: ReturnType<typeof vi.fn>;
 	getAutonomousStatus: ReturnType<typeof vi.fn>;
+	recordHostAutonomousContinuation: ReturnType<typeof vi.fn>;
 };
 
 type FakeRuntimeHost = {
@@ -86,6 +87,7 @@ function createRuntimeHost(
 		prompt: vi.fn(async () => {}),
 		reload: vi.fn(async () => {}),
 		getAutonomousStatus: vi.fn(() => autonomousStatus),
+		recordHostAutonomousContinuation: vi.fn(),
 	};
 
 	return {
@@ -196,6 +198,7 @@ describe("runPrintMode", () => {
 
 		expect(exitCode).toBe(0);
 		expect(session.prompt).toHaveBeenCalledTimes(1);
+		expect(session.recordHostAutonomousContinuation).toHaveBeenCalledTimes(1);
 		expect(session.prompt.mock.calls[0][0]).toContain("Autonomous quality gate failed (attempt 4/3)");
 	});
 
@@ -280,9 +283,42 @@ describe("runPrintMode", () => {
 
 		expect(exitCode).toBe(0);
 		expect(session.prompt).toHaveBeenCalledTimes(2);
+		expect(session.recordHostAutonomousContinuation).toHaveBeenCalledTimes(2);
 		expect(errorSpy).not.toHaveBeenCalledWith("provider down");
 		expect(session.prompt.mock.calls[0][0]).toContain("Autonomous quality gate failed");
 		expect(session.prompt.mock.calls[1][0]).toContain("Autonomous quality gate failed");
+	});
+
+	it("does not issue host-driven gate prompts once maxContinuations is reached", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), {
+			enabled: true,
+			continuationsUsed: 3,
+			turnsUsed: 2,
+			tokensUsed: 100,
+			startedAt: Date.now(),
+			limits: { maxContinuations: 3, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+			gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+			gateAttempts: { "verify-public": 1 },
+			lastGateFailure: {
+				command: "verify-public",
+				attempt: 1,
+				exitText: "exited 1",
+				output: "0/9",
+			},
+		});
+		const { session } = runtimeHost;
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(1);
+		expect(session.prompt).not.toHaveBeenCalled();
+		expect(session.recordHostAutonomousContinuation).not.toHaveBeenCalled();
+		expect(errorSpy).toHaveBeenCalledWith(
+			"Autonomous quality gate still failing after attempt 1/3: exited 1; autonomous limit reached: maxContinuations reached (3/3)",
+		);
 	});
 
 	it("returns non-zero when autonomous gates are still failing", async () => {

@@ -157,6 +157,13 @@ export function addAutonomousUsage(state: AutonomousRuntimeState, usage: Usage |
 	state.tokensUsed += autonomousTokenDelta(usage);
 }
 
+export function addAutonomousContinuation(state: AutonomousRuntimeState): void {
+	if (!state.enabled) {
+		return;
+	}
+	state.continuationsUsed++;
+}
+
 function autonomousTokenDelta(usage: Usage | undefined): number {
 	if (!usage) {
 		return 0;

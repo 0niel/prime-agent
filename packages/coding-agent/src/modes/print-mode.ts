@@ -110,6 +110,7 @@ async function waitForPrintModeIdleWithAutonomousGates(
 		if (repeatedProgressPrompts > 0) {
 			await new Promise((resolve) => setTimeout(resolve, Math.min(1000, repeatedProgressPrompts * 50)));
 		}
+		session.recordHostAutonomousContinuation();
 		await session.prompt(
 			buildPrintModeGateContinuation(status.lastGateFailure, latestGateAttempt(status), status.gates.maxRetries),
 			{
