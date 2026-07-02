@@ -199,26 +199,78 @@ describe("runPrintMode", () => {
 		expect(session.prompt.mock.calls[0][0]).toContain("Autonomous quality gate failed (attempt 4/3)");
 	});
 
-	it("stops autonomous gate prompting after an assistant error", async () => {
-		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), {
-			enabled: true,
-			continuationsUsed: 1,
-			turnsUsed: 2,
-			tokensUsed: 100,
-			startedAt: Date.now(),
-			limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
-			gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
-			gateAttempts: { "verify-public": 1 },
-			lastGateFailure: {
-				command: "verify-public",
-				attempt: 1,
-				exitText: "exited 1",
-				output: "0/9",
+	it("keeps autonomous gate prompting after a transient assistant error while limits remain", async () => {
+		const statuses: AgentAutonomousStatus[] = [
+			{
+				enabled: true,
+				continuationsUsed: 1,
+				turnsUsed: 2,
+				tokensUsed: 100,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 1 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 1,
+					exitText: "exited 1",
+					output: "0/9",
+				},
 			},
-		});
+			{
+				enabled: true,
+				continuationsUsed: 1,
+				turnsUsed: 3,
+				tokensUsed: 200,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 2 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 2,
+					exitText: "exited 1",
+					output: "0/9",
+				},
+			},
+			{
+				enabled: true,
+				continuationsUsed: 1,
+				turnsUsed: 4,
+				tokensUsed: 300,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 2 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 2,
+					exitText: "exited 1",
+					output: "0/9",
+				},
+			},
+			{
+				enabled: true,
+				continuationsUsed: 1,
+				turnsUsed: 5,
+				tokensUsed: 400,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 2 },
+			},
+		];
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), statuses[0]);
 		const { session } = runtimeHost;
-		session.prompt.mockImplementation(async () => {
+		let statusIndex = 0;
+		session.getAutonomousStatus.mockImplementation(
+			() => statuses[Math.min(statusIndex++, statuses.length - 1)] as AgentAutonomousStatus,
+		);
+		session.prompt.mockImplementationOnce(async () => {
 			session.state.messages = [createAssistantMessage({ stopReason: "error", errorMessage: "provider down" })];
+		});
+		session.prompt.mockImplementationOnce(async () => {
+			session.state.messages = [createAssistantMessage({ text: "still failing" })];
 		});
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
@@ -226,9 +278,11 @@ describe("runPrintMode", () => {
 			mode: "text",
 		});
 
-		expect(exitCode).toBe(1);
-		expect(session.prompt).toHaveBeenCalledTimes(1);
-		expect(errorSpy).toHaveBeenCalledWith("provider down");
+		expect(exitCode).toBe(0);
+		expect(session.prompt).toHaveBeenCalledTimes(2);
+		expect(errorSpy).not.toHaveBeenCalledWith("provider down");
+		expect(session.prompt.mock.calls[0][0]).toContain("Autonomous quality gate failed");
+		expect(session.prompt.mock.calls[1][0]).toContain("Autonomous quality gate failed");
 	});
 
 	it("returns non-zero when autonomous gates are still failing", async () => {

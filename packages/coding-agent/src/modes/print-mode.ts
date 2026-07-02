@@ -120,6 +120,10 @@ async function waitForPrintModeIdleWithAutonomousGates(
 		if (lastMessage?.role === "assistant") {
 			const assistantMessage = lastMessage as AssistantMessage;
 			if (assistantMessage.stopReason === "error" || assistantMessage.stopReason === "aborted") {
+				const postErrorStatus = session.getAutonomousStatus();
+				if (shouldContinuePrintModeAutonomousGates(postErrorStatus) && postErrorStatus.lastGateFailure) {
+					continue;
+				}
 				return;
 			}
 		}
