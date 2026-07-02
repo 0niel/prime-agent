@@ -498,10 +498,10 @@ describe("runPrintMode", () => {
 		expect(session.prompt).toHaveBeenCalledTimes(2);
 		expect(session.prompt.mock.calls[0][0]).toContain("Autonomous quality gate failed (attempt 1/3)");
 		expect(session.prompt.mock.calls[0][0]).toContain("0/9");
-		expect(session.prompt.mock.calls[0][1]).toEqual({ streamingBehavior: "followUp" });
+		expect(session.prompt.mock.calls[0][1]).toEqual({ streamingBehavior: "followUp", internalPrompt: true });
 		expect(session.prompt.mock.calls[1][0]).toContain("Autonomous quality gate failed (attempt 2/3)");
 		expect(session.prompt.mock.calls[1][0]).toContain("0/9 summary");
-		expect(session.prompt.mock.calls[1][1]).toEqual({ streamingBehavior: "followUp" });
+		expect(session.prompt.mock.calls[1][1]).toEqual({ streamingBehavior: "followUp", internalPrompt: true });
 	});
 
 	it("continues prompting when gate attempts do not advance but autonomous usage does", async () => {

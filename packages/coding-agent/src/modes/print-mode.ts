@@ -115,6 +115,7 @@ async function waitForPrintModeIdleWithAutonomousGates(
 			buildPrintModeGateContinuation(status.lastGateFailure, latestGateAttempt(status), status.gates.maxRetries),
 			{
 				streamingBehavior: "followUp",
+				internalPrompt: true,
 			},
 		);
 		// followUp prompts can be accepted/queued before the actual retry turn has

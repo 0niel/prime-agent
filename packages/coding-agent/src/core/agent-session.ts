@@ -388,6 +388,8 @@ export interface PromptOptions {
 	preflightResult?: (success: boolean, queued?: boolean) => void;
 	/** Queue instead of starting immediately when the session is idle but already has queued work. */
 	queueIfBusy?: boolean;
+	/** Host-generated prompt that must bypass extension/slash/template input interception. */
+	internalPrompt?: boolean;
 }
 
 interface InternalPromptOptions extends PromptOptions {
@@ -2431,7 +2433,8 @@ export class AgentSession {
 	}
 
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
-		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
+		const isInternalPrompt = options?.internalPrompt === true;
+		const expandPromptTemplates = isInternalPrompt ? false : (options?.expandPromptTemplates ?? true);
 		const preflightResult = options?.preflightResult;
 		let preflightSettled = false;
 		const reportPreflight = (success: boolean, queued = false) => {
