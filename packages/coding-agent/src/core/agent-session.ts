@@ -1818,8 +1818,11 @@ export class AgentSession {
 				this._lastAssistantMessage = event.message;
 
 				const assistantMsg = event.message as AssistantMessage;
-				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
+				const assistantCompletedSuccessfully =
+					assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted";
+				if (assistantCompletedSuccessfully) {
 					this._assistantTurnsSinceAutoRefine++;
+					addAutonomousUsage(this._autonomousState, assistantMsg.usage);
 				}
 				if (assistantMsg.stopReason !== "error") {
 					this._overflowRecoveryAttempted = false;
@@ -1838,7 +1841,6 @@ export class AgentSession {
 				if (this._accountGoalUsageForAssistantMessage(assistantMsg)) {
 					this.agent.steer(createGoalContextMessage(this._goalState, "budget_limit"));
 				}
-				addAutonomousUsage(this._autonomousState, assistantMsg.usage);
 			}
 		}
 

@@ -87,6 +87,22 @@ describe("AgentSession autonomous mode", () => {
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
 	});
 
+	it("does not count failed assistant messages against autonomous usage limits", async () => {
+		const harness = await createHarness({
+			autonomous: { enabled: true, maxTurns: 1 },
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("failed", { stopReason: "error", errorMessage: "provider failed" })]);
+
+		await harness.session.prompt("try once");
+
+		expect(harness.session.getAutonomousStatus()).toMatchObject({
+			turnsUsed: 0,
+			tokensUsed: 0,
+			continuationsUsed: 0,
+		});
+	});
+
 	it("supports /autonomous on and off without calling the model", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
