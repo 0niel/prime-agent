@@ -206,6 +206,42 @@ describe("AgentSession compaction characterization", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 	});
 
+	it("keeps prior autonomous continuations when later threshold compaction is skipped", async () => {
+		const harness = await createHarness({
+			autonomous: {
+				enabled: true,
+				maxContinuations: 4,
+				maxTurns: 100,
+				gates: { commands: [failingGateCommand()], maxRetries: 5 },
+			},
+		});
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as {
+			_queueAutonomousContinuationForThresholdCompaction(message: AssistantMessage): AgentMessage | undefined;
+			_clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
+				shouldContinueAfterThreshold: boolean,
+				queuedMessages: AgentMessage[],
+			): void;
+			_postCompactionContinuationMessages: AgentMessage[];
+		};
+		const firstAssistant = createAssistant(harness, { stopReason: "toolUse", totalTokens: 10_000 });
+		const secondAssistant = createAssistant(harness, { stopReason: "toolUse", totalTokens: 10_000 });
+
+		const firstQueued = sessionInternals._queueAutonomousContinuationForThresholdCompaction(firstAssistant);
+		const secondQueued = sessionInternals._queueAutonomousContinuationForThresholdCompaction(secondAssistant);
+
+		expect(firstQueued).toBeDefined();
+		expect(secondQueued).toBeDefined();
+		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(2);
+		sessionInternals._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(true, [secondQueued!]);
+
+		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
+		expect(sessionInternals._postCompactionContinuationMessages).toEqual([firstQueued]);
+		expect(
+			harness.session.agent.removeQueuedMessages((message) => message === firstQueued || message === secondQueued),
+		).toEqual([firstQueued]);
+	});
+
 	it("clears queued autonomous continuations when threshold compaction is skipped", async () => {
 		const harness = await createHarness({
 			autonomous: {

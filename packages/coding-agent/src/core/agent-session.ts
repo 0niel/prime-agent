@@ -686,6 +686,7 @@ export class AgentSession {
 	private _postCompactionContinuationMessages: AgentMessage[] = [];
 	private _queuedAutonomousThresholdContinuations = new WeakMap<AssistantMessage, AgentMessage>();
 	private _queuedAutonomousContinuationSnapshots = new WeakMap<AgentMessage, AutonomousRuntimeSnapshot>();
+	private _pendingThresholdCompactionAutonomousMessages: AgentMessage[] = [];
 	private _pendingAutoRefineReview: { reason: AutoRefineReason; review: AutoRefineReview } | undefined;
 	private _autoRefineBranchVersion = 0;
 	private _autoRefineReviewAbort?: AbortController;
@@ -1368,29 +1369,39 @@ export class AgentSession {
 			: undefined;
 	}
 
-	private _queueAutonomousContinuationForThresholdCompaction(message: AssistantMessage): boolean {
+	private _queueAutonomousContinuationForThresholdCompaction(message: AssistantMessage): AgentMessage | undefined {
 		const queuedMessage = this._queuedAutonomousThresholdContinuations.get(message);
 		if (queuedMessage && this._postCompactionContinuationMessages.includes(queuedMessage)) {
-			return true;
+			return queuedMessage;
 		}
 		const snapshot = this._snapshotAutonomousRuntimeState();
 		const autonomousMessage = nextAutonomousContinuation(this._autonomousState, message, { cwd: this._cwd });
 		if (!autonomousMessage) {
-			return false;
+			return undefined;
 		}
 		this._queuedAutonomousThresholdContinuations.set(message, autonomousMessage);
 		this._queuedAutonomousContinuationSnapshots.set(autonomousMessage, snapshot);
 		this._postCompactionContinuationMessages.push(autonomousMessage);
+		this._pendingThresholdCompactionAutonomousMessages.push(autonomousMessage);
 		this.agent.followUp(autonomousMessage);
-		return true;
+		return autonomousMessage;
 	}
 
-	private _clearQueuedAutonomousContinuations(options: { restoreAutonomousState?: boolean } = {}): void {
-		const queuedMessages = this._postCompactionContinuationMessages.splice(0);
+	private _clearQueuedAutonomousContinuations(
+		options: { restoreAutonomousState?: boolean; messages?: AgentMessage[] } = {},
+	): void {
+		const requestedMessages = options.messages ?? [...this._postCompactionContinuationMessages];
+		const requestedMessageSet = new Set(requestedMessages);
+		const queuedMessages = this._postCompactionContinuationMessages.filter((message) =>
+			requestedMessageSet.has(message),
+		);
 		if (queuedMessages.length === 0) {
 			return;
 		}
 		const queuedMessageSet = new Set(queuedMessages);
+		this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
+			(message) => !queuedMessageSet.has(message),
+		);
 		this.agent.removeQueuedMessages((message) => queuedMessageSet.has(message));
 		if (options.restoreAutonomousState) {
 			for (const queuedMessage of queuedMessages) {
@@ -1404,7 +1415,12 @@ export class AgentSession {
 		for (const queuedMessage of queuedMessages) {
 			this._queuedAutonomousContinuationSnapshots.delete(queuedMessage);
 		}
-		this._continueAfterThresholdCompaction = false;
+		this._pendingThresholdCompactionAutonomousMessages = this._pendingThresholdCompactionAutonomousMessages.filter(
+			(message) => !queuedMessageSet.has(message),
+		);
+		if (options.messages === undefined) {
+			this._continueAfterThresholdCompaction = false;
+		}
 		if (!this.agent.hasQueuedMessages()) {
 			this._cancelPostCompactionContinue();
 		}
@@ -1412,9 +1428,10 @@ export class AgentSession {
 
 	private _clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
 		shouldContinueAfterThreshold: boolean,
+		queuedMessages: AgentMessage[],
 	): void {
 		if (shouldContinueAfterThreshold) {
-			this._clearQueuedAutonomousContinuations({ restoreAutonomousState: true });
+			this._clearQueuedAutonomousContinuations({ restoreAutonomousState: true, messages: queuedMessages });
 		}
 	}
 
@@ -4233,6 +4250,9 @@ export class AgentSession {
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		const shouldContinueAfterThreshold = reason === "threshold" && this._continueAfterThresholdCompaction;
+		const queuedAutonomousContinuationsForThisCompaction = shouldContinueAfterThreshold
+			? this._pendingThresholdCompactionAutonomousMessages.splice(0)
+			: [];
 		this._continueAfterThresholdCompaction = false;
 
 		this._emit({ type: "compaction_start", reason });
@@ -4247,7 +4267,10 @@ export class AgentSession {
 					aborted: false,
 					willRetry: false,
 				});
-				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(shouldContinueAfterThreshold);
+				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
+					shouldContinueAfterThreshold,
+					queuedAutonomousContinuationsForThisCompaction,
+				);
 				return false;
 			}
 
@@ -4260,7 +4283,10 @@ export class AgentSession {
 					aborted: false,
 					willRetry: false,
 				});
-				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(shouldContinueAfterThreshold);
+				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
+					shouldContinueAfterThreshold,
+					queuedAutonomousContinuationsForThisCompaction,
+				);
 				return false;
 			}
 			const { apiKey, headers } = authResult;
@@ -4278,7 +4304,10 @@ export class AgentSession {
 					errorMessage: "Auto-compaction skipped: nothing to summarize outside the recent-context window",
 					errorSeverity: "warning",
 				});
-				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(shouldContinueAfterThreshold);
+				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
+					shouldContinueAfterThreshold,
+					queuedAutonomousContinuationsForThisCompaction,
+				);
 				return false;
 			}
 
@@ -4302,7 +4331,10 @@ export class AgentSession {
 						aborted: true,
 						willRetry: false,
 					});
-					this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(shouldContinueAfterThreshold);
+					this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
+						shouldContinueAfterThreshold,
+						queuedAutonomousContinuationsForThisCompaction,
+					);
 					return false;
 				}
 
@@ -4348,7 +4380,10 @@ export class AgentSession {
 					aborted: true,
 					willRetry: false,
 				});
-				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(shouldContinueAfterThreshold);
+				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
+					shouldContinueAfterThreshold,
+					queuedAutonomousContinuationsForThisCompaction,
+				);
 				return false;
 			}
 
@@ -4401,7 +4436,10 @@ export class AgentSession {
 			}
 			return false;
 		} catch (error) {
-			this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(shouldContinueAfterThreshold);
+			this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
+				shouldContinueAfterThreshold,
+				queuedAutonomousContinuationsForThisCompaction,
+			);
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
 			this._emit({
 				type: "compaction_end",
