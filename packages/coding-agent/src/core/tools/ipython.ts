@@ -381,7 +381,9 @@ export function createIpythonToolDefinition(
 			const setWorkingMessage = (message?: string) => {
 				try {
 					ctx?.ui.setWorkingMessage(message);
-				} catch {}
+				} catch {
+					// Stale ctx; cosmetic only.
+				}
 			};
 			let reportedStartupProgress = false;
 			const reportStartupProgress: KernelBootstrapProgressHandler = (message) => {

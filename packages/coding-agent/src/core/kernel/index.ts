@@ -521,7 +521,9 @@ export class KernelManager {
 				// collide with it (write the same file / re-bind the same ports).
 				try {
 					rmSync(connection.tempDir, { recursive: true, force: true });
-				} catch {}
+				} catch {
+					// Leave the temp dir for OS tmp cleanup.
+				}
 				connection = makeConnection();
 				this.tempDir = connection.tempDir;
 			}
@@ -1043,14 +1045,18 @@ export class KernelManager {
 				// been recycled by the OS, and SIGTERM would then hit an unrelated process.
 				process.kill(this.kernelPid, "SIGTERM");
 			}
-		} catch {}
+		} catch {
+			// Kernel already exited.
+		}
 		this.kernel = undefined;
 		this.kernelPid = undefined;
 		this.connection = undefined;
 		if (this.tempDir) {
 			try {
 				rmSync(this.tempDir, { recursive: true, force: true });
-			} catch {}
+			} catch {
+				// Leave the temp dir for OS tmp cleanup.
+			}
 		}
 		this.tempDir = undefined;
 		this.startPromise = undefined;
@@ -1096,7 +1102,11 @@ export class KernelManager {
 				await this.control.send(encode(msg, this.connection.key));
 				await sleep(200);
 			}
-		} catch {}
+		} catch (error) {
+			this.appendKernelDiagnostic(
+				`shutdown_request send failed (killing instead): ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 
 		this.cleanupResources();
 	}

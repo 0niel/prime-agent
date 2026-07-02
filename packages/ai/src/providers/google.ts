@@ -22,6 +22,11 @@ import type {
 } from "../types.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
+import {
+	formatStreamFailureMessage,
+	recordStreamFailure,
+	streamFailureFromStopReason,
+} from "../utils/stream-failure.js";
 import type { GoogleThinkingLevel } from "./google-shared.js";
 import {
 	convertMessages,
@@ -207,6 +212,9 @@ export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions>
 					if (output.content.some((b) => b.type === "toolCall")) {
 						output.stopReason = "toolUse";
 					}
+					if (output.stopReason === "error") {
+						output.stopReasonRaw = candidate.finishReason;
+					}
 				}
 
 				if (chunk.usageMetadata) {
@@ -253,7 +261,7 @@ export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions>
 			}
 
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
-				throw new Error("An unknown error occurred");
+				throw streamFailureFromStopReason(output.stopReasonRaw);
 			}
 
 			stream.push({ type: "done", reason: output.stopReason, message: output });
@@ -266,7 +274,8 @@ export const streamGoogle: StreamFunction<"google-generative-ai", GoogleOptions>
 				}
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			output.errorMessage = formatStreamFailureMessage(error);
+			recordStreamFailure(model, output, error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

@@ -5311,6 +5311,14 @@ export class AgentSession {
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return false;
 
+		// Structured classification from the provider (stream-failure.ts) beats
+		// message-text matching. Safety/malformed/unknown kinds fall through to
+		// the regex, which distinguishes transient content_filter cases.
+		const failure = message.diagnostics?.find((d) => d.type === "provider_stream_failure");
+		const kind = failure?.details?.kind;
+		if (kind === "overloaded" || kind === "rate_limit" || kind === "server_error") return true;
+		if (kind === "refusal" || kind === "auth" || kind === "invalid_request") return false;
+
 		const err = message.errorMessage;
 		// Match: overloaded_error, provider returned error, rate limit, 429, 500, 502, 503, 504, service unavailable, network/connection errors (including connection lost), WebSocket transport closes/errors, fetch failed, request ended without sending chunks, HTTP/2 closed before response, terminated, retry delay exceeded, transient content_filter finish_reason, provider policy-flag prose, and prose-form transient 5xx ("an error occurred while processing your request. you can retry")
 		return /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|http2 request did not get a response|timed? out|timeout|terminated|retry delay|content.?filter|flagged .*(cybersecurity|usage polic|violat)|error occurred while processing|you can retry/i.test(

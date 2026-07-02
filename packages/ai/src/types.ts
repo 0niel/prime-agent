@@ -229,6 +229,7 @@ export interface AssistantMessage {
 	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
 	usage: Usage;
 	stopReason: StopReason;
+	stopReasonRaw?: string; // Provider's raw stop/finish reason when it mapped to "error" (e.g. "refusal", "SAFETY")
 	errorMessage?: string;
 	timestamp: number; // Unix timestamp in milliseconds
 }

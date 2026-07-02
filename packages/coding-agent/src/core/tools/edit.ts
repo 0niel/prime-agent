@@ -99,7 +99,9 @@ function prepareEditArguments(input: unknown): EditToolInput {
 		try {
 			const parsed = JSON.parse(args.edits);
 			if (Array.isArray(parsed)) args.edits = parsed;
-		} catch {}
+		} catch {
+			// Not JSON: leave as-is for schema validation to reject.
+		}
 	}
 
 	const legacy = args as LegacyEditToolInput;

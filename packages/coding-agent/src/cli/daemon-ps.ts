@@ -576,7 +576,9 @@ async function forceKillDaemon(pid: number): Promise<void> {
 	}
 	try {
 		process.kill(pid, "SIGKILL");
-	} catch {}
+	} catch {
+		// Process already exited between the liveness check and the kill.
+	}
 }
 
 function isProcessAlive(pid: number): boolean {

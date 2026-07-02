@@ -227,6 +227,8 @@ export function getPrimeTeamId(): string | undefined {
 			const teamId = (parsed as Record<string, unknown>).team_id;
 			if (typeof teamId === "string" && teamId.trim()) return teamId.trim();
 		}
-	} catch {}
+	} catch {
+		// Unreadable/malformed config.json: behave as if no team is configured.
+	}
 	return undefined;
 }

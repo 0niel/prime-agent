@@ -3,12 +3,14 @@
  */
 
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { type Api, type KnownProvider, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
+import { type Api, getLogger, type KnownProvider, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
 import chalk from "chalk";
 import { minimatch } from "minimatch";
 import { isValidThinkingLevel } from "../cli/args.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ModelRegistry } from "./model-registry.js";
+
+const log = getLogger("coding-agent.model-resolver");
 
 /** Default model IDs for each known provider */
 export const defaultModelPerProvider: Record<KnownProvider, string> = {
@@ -279,6 +281,7 @@ export function resolveModelScopeFromModels(patterns: string[], availableModels:
 			});
 
 			if (matchingModels.length === 0) {
+				log.warn("no models match pattern", { pattern });
 				console.warn(chalk.yellow(`Warning: No models match pattern "${pattern}"`));
 				continue;
 			}
@@ -294,10 +297,12 @@ export function resolveModelScopeFromModels(patterns: string[], availableModels:
 		const { model, thinkingLevel, warning } = parseModelPattern(pattern, availableModels);
 
 		if (warning) {
+			log.warn(warning, { pattern });
 			console.warn(chalk.yellow(`Warning: ${warning}`));
 		}
 
 		if (!model) {
+			log.warn("no models match pattern", { pattern });
 			console.warn(chalk.yellow(`Warning: No models match pattern "${pattern}"`));
 			continue;
 		}
@@ -516,6 +521,7 @@ export async function findInitialModel(options: {
 			modelRegistry,
 		});
 		if (resolved.error) {
+			log.error(resolved.error, { cliProvider, cliModel });
 			console.error(chalk.red(resolved.error));
 			process.exit(1);
 		}
@@ -594,6 +600,7 @@ export async function restoreModelFromSession(
 
 	// Model not found or no API key - fall back
 	const reason = !restoredModel ? "model no longer exists" : "no auth configured";
+	log.warn("could not restore model", { provider: savedProvider, model: savedModelId, reason });
 
 	if (shouldPrintMessages) {
 		console.error(chalk.yellow(`Warning: Could not restore model ${savedProvider}/${savedModelId} (${reason}).`));

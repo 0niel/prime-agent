@@ -8,6 +8,7 @@
 
 import { createServer, type Server, type Socket } from "node:net";
 import { resolve } from "node:path";
+import { getLogger } from "@earendil-works/pi-ai";
 import { appendRotatingLog, getCronJobsPath, getDaemonLogPath, VERSION } from "../../config.js";
 import {
 	AGENT_MESSAGE_SOURCE,
@@ -127,6 +128,8 @@ export interface DaemonModeOptions {
 export type { DaemonCommand, DaemonOutbound, DaemonResponse } from "./daemon-protocol.js";
 export type { SessionActivity, SessionLifecycle, SessionSummary } from "./daemon-session-list.js";
 export { defaultDaemonSocketPath } from "./daemon-socket.js";
+
+const structuredLog = getLogger("coding-agent.daemon");
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"list",
@@ -266,15 +269,17 @@ export class AgentDaemon {
 		this.cronScheduler = new AgentCronScheduler(this.cronStore, {
 			runJob: (job) => this.runCronJob(job),
 			onError: (job, error) => {
-				console.error(`Cron job ${job.id} failed: ${error instanceof Error ? error.message : String(error)}`);
+				this.log(`Cron job ${job.id} failed: ${error instanceof Error ? error.message : String(error)}`);
 			},
 		});
 	}
 
-	// The daemon runs detached with no terminal, so route its diagnostics to a
-	// rotating log file (and stderr too, for when it's run in the foreground).
+	// The daemon runs detached with no terminal, so route its diagnostics to its
+	// rotating log file and the shared structured log (and stderr too, for when
+	// it's run in the foreground).
 	private log(message: string): void {
 		console.error(message);
+		structuredLog.warn(message, { socketPath: this.socketPath });
 		appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] ${message}`);
 	}
 
