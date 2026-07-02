@@ -2,6 +2,8 @@ import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.js";
+import type { AgentSessionMessageController } from "./agent-messages.js";
+import type { AgentObserveController } from "./agent-observe.js";
 import { installAgentTraceUpload } from "./agent-traces.js";
 import { AuthStorage } from "./auth-storage.js";
 import type { AgentRlmHeartbeatController } from "./cron-jobs.js";
@@ -53,6 +55,8 @@ export interface AgentSessionCreationOptions {
 	initialActiveToolNames?: string[];
 	allowedToolNames?: string[];
 	includeGoals?: boolean;
+	agentMessageController?: AgentSessionMessageController;
+	agentObserveController?: AgentObserveController;
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
 	rlmSessionDir?: string;
@@ -231,6 +235,8 @@ export async function createAgentSessionFromServices(
 		initialActiveToolNames: options.initialActiveToolNames,
 		allowedToolNames: options.allowedToolNames,
 		includeGoals: options.includeGoals,
+		agentMessageController: options.agentMessageController,
+		agentObserveController: options.agentObserveController,
 		rlmDepth: options.rlmDepth,
 		rlmMaxDepth: options.rlmMaxDepth,
 		rlmSessionDir: options.rlmSessionDir,

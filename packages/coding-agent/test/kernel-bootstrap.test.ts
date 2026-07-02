@@ -65,6 +65,19 @@ version = "0.1.0"
 	};
 }
 
+function createPythonSkillWithDependency(name: string, dependencyName: string): KernelPythonSkill {
+	const skill = createPythonSkill(name);
+	writeFileSync(
+		skill.pyprojectPath,
+		`[project]
+name = "${name}"
+version = "0.1.0"
+dependencies = ["${dependencyName}"]
+`,
+	);
+	return skill;
+}
+
 function writeFakePython(filePath: string, importableModules: readonly string[]): void {
 	const cases = importableModules.map((moduleName) => `    "import ${moduleName}") exit 0 ;;`).join("\n");
 	const runtimeCase = importableModules.includes("rlm") ? '    *"_harness_methods"*) exit 0 ;;' : "";
@@ -253,6 +266,73 @@ describe("kernel bootstrap", () => {
 				pyprojectHash: pyprojectHash(pythonSkill.pyprojectPath),
 			},
 		]);
+	});
+
+	it("installs sibling Python skill dependencies with dependent editable packages", async () => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const dependencySkill = createPythonSkill("agent-observe");
+		const dependentSkill = createPythonSkillWithDependency("orchestration-heartbeat", "agent-observe");
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+
+		await expect(ensureKernelPython({ pythonSkills: [dependentSkill] })).resolves.toBe(join(venv, "bin", "python"));
+
+		const log = readFileSync(logPath, "utf8");
+		expect(log).toContain(`--editable ${dependencySkill.packagePath}`);
+		expect(log).toContain(`--editable ${dependentSkill.packagePath}`);
+		const version = JSON.parse(readFileSync(join(venv, ".bootstrap-version"), "utf8"));
+		expect(version.pythonSkills).toEqual([
+			{
+				importName: dependencySkill.importName,
+				packagePath: dependencySkill.packagePath,
+				pyprojectPath: dependencySkill.pyprojectPath,
+				pyprojectHash: pyprojectHash(dependencySkill.pyprojectPath),
+			},
+			{
+				importName: dependentSkill.importName,
+				packagePath: dependentSkill.packagePath,
+				pyprojectPath: dependentSkill.pyprojectPath,
+				pyprojectHash: pyprojectHash(dependentSkill.pyprojectPath),
+			},
+		]);
+	});
+
+	it("installs sibling Python skill dependencies when package and directory names differ", async () => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const dependencySkill = createPythonSkill("attach-image");
+		writeFileSync(
+			dependencySkill.pyprojectPath,
+			`[project]
+name = "prime-agent-skill-attach-image"
+version = "0.1.0"
+`,
+		);
+		const dependentSkill = createPythonSkillWithDependency(
+			"orchestration-heartbeat",
+			"prime-agent-skill-attach-image",
+		);
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+
+		await expect(ensureKernelPython({ pythonSkills: [dependentSkill] })).resolves.toBe(join(venv, "bin", "python"));
+
+		const log = readFileSync(logPath, "utf8");
+		expect(log).toContain(`--editable ${dependencySkill.packagePath}`);
+		expect(log).toContain(`--editable ${dependentSkill.packagePath}`);
+	});
+
+	it("parses Python skill dependencies with extras", async () => {
+		const logPath = installFakeUv();
+		const venv = join(tempDir, "kernel-venv");
+		const dependencySkill = createPythonSkill("gidgethub");
+		const dependentSkill = createPythonSkillWithDependency("orchestration-heartbeat", "gidgethub[httpx]>4.0.0");
+		process.env.PRIME_AGENT_KERNEL_VENV = venv;
+
+		await expect(ensureKernelPython({ pythonSkills: [dependentSkill] })).resolves.toBe(join(venv, "bin", "python"));
+
+		const log = readFileSync(logPath, "utf8");
+		expect(log).toContain(`--editable ${dependencySkill.packagePath}`);
+		expect(log).toContain(`--editable ${dependentSkill.packagePath}`);
 	});
 
 	it("syncs a warm venv when a Python skill pyproject changes", async () => {

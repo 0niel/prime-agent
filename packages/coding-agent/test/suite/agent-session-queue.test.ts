@@ -1413,6 +1413,33 @@ describe("AgentSession queue characterization", () => {
 		await promptPromise;
 	});
 
+	it("reports failed preflight when a duplicate follow-up queue key is not queued", async () => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		const preflightResults: boolean[] = [];
+
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		await waitForToolStart;
+		await harness.session.prompt("heartbeat", {
+			streamingBehavior: "followUp",
+			followUpQueueKey: "heartbeat:one",
+		});
+		await harness.session.prompt("heartbeat", {
+			streamingBehavior: "followUp",
+			followUpQueueKey: "heartbeat:one",
+			preflightResult: (didSucceed) => preflightResults.push(didSucceed),
+		});
+
+		expect(preflightResults).toEqual([false]);
+		expect(harness.session.getFollowUpMessages()).toEqual(["heartbeat"]);
+		releaseToolExecution();
+		await promptPromise;
+	});
+
 	it("keeps separate follow-up messages for different queue keys", async () => {
 		const waiting = await createWaitingHarness();
 		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
@@ -1749,6 +1776,166 @@ describe("AgentSession queue characterization", () => {
 
 		expect(countsAtQueuedMessageStart).toEqual([0]);
 		expect(harness.session.pendingMessageCount).toBe(0);
+	});
+
+	it("clears only internally queued agent-message prompts", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const spoofed =
+			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_spoof\n\nordinary user text";
+		const real =
+			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_real\n\nreal agent text";
+
+		await harness.session.followUp(spoofed);
+		await harness.session.queueAgentMessagePrompt(real, "followUp");
+
+		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
+			steering: [],
+			followUp: [real],
+		});
+		expect(harness.session.getFollowUpMessages()).toEqual([spoofed]);
+	});
+
+	it("clears internally queued agent-message steering prompts by message identity", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sharedText =
+			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_shared\n\nshared text";
+
+		await harness.session.steer(sharedText);
+		await harness.session.queueAgentMessagePrompt(sharedText, "steer");
+
+		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
+			steering: [sharedText],
+			followUp: [],
+		});
+		expect(harness.session.getSteeringMessages()).toEqual([sharedText]);
+	});
+
+	it("clears the agent queue when a queue update listener clears a newly queued steering prompt", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const agentPrompt =
+			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_queue_update_clear\n\nclear during update";
+		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_queue_update_clear");
+		let cleared = false;
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "queue_update" && !cleared) {
+				cleared = true;
+				harness.session.clearQueue();
+			}
+		});
+
+		await harness.session.queueAgentMessagePrompt(agentPrompt, "steer");
+		unsubscribe();
+		await expect(delivery).rejects.toThrow("cleared before delivery");
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+
+		let sawClearedPrompt = false;
+		harness.setResponses([
+			(context) => {
+				sawClearedPrompt = context.messages.some(
+					(message) => message.role === "user" && getMessageText(message).includes("agentmsg_queue_update_clear"),
+				);
+				return fauxAssistantMessage("normal response");
+			},
+		]);
+		await harness.session.prompt("normal");
+
+		expect(sawClearedPrompt).toBe(false);
+		expect(getUserTexts(harness)).toEqual(["normal"]);
+	});
+
+	it("settles late agent-message delivery waiters", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const deliveryInternals = harness.session as unknown as {
+			waitForAgentMessagePromptDelivery(agentMessageId: string): Promise<void>;
+			_resolveAgentMessageDelivery(agentMessageId: string): void;
+			_rejectAgentMessageDelivery(agentMessageId: string, error: Error): void;
+		};
+
+		deliveryInternals._resolveAgentMessageDelivery("agentmsg_delivered");
+		await expect(deliveryInternals.waitForAgentMessagePromptDelivery("agentmsg_delivered")).resolves.toBeUndefined();
+
+		deliveryInternals._rejectAgentMessageDelivery("agentmsg_failed", new Error("cleared before delivery"));
+		await expect(deliveryInternals.waitForAgentMessagePromptDelivery("agentmsg_failed")).rejects.toThrow(
+			"cleared before delivery",
+		);
+	});
+
+	it("keeps queued agent-message delivery waiters pending on abort until the message is delivered", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const agentPrompt =
+			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_abort\n\nsurvive the abort";
+		harness.setResponses([fauxAssistantMessage("x".repeat(20_000))]);
+
+		const sawMessageUpdate = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "message_update") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+		const promptPromise = harness.session.prompt("hi");
+		await sawMessageUpdate;
+
+		await harness.session.queueAgentMessagePrompt(agentPrompt, "followUp");
+		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_abort");
+		let deliverySettled = false;
+		void delivery.then(
+			() => {
+				deliverySettled = true;
+			},
+			() => {
+				deliverySettled = true;
+			},
+		);
+		expect(harness.session.pendingMessageCount).toBe(1);
+
+		await harness.session.abort();
+		await promptPromise;
+		await Promise.resolve();
+
+		// The waiter still represents actual delivery, and the surviving queued message has not delivered yet.
+		expect(deliverySettled).toBe(false);
+		expect(harness.session.pendingMessageCount).toBe(1);
+		expect(harness.session.getFollowUpMessages()).toEqual([agentPrompt]);
+
+		harness.setResponses([fauxAssistantMessage("answer"), fauxAssistantMessage("handled follow-up")]);
+		await harness.session.prompt("again");
+
+		await expect(delivery).resolves.toBeUndefined();
+		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(getUserTexts(harness)).toContain(agentPrompt);
+	});
+
+	it("resolves direct agent-message delivery waiters when the accepted prompt starts", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const agentPrompt =
+			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_direct\n\ndirect delivery";
+		harness.setResponses([fauxAssistantMessage("direct reply")]);
+
+		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_direct");
+		await harness.session.acceptAgentMessagePrompt(agentPrompt);
+
+		await expect(delivery).resolves.toBeUndefined();
+	});
+
+	it("rejects queued agent-message delivery waiters on dispose", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const agentPrompt =
+			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_dispose\n\ndispose me";
+		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_dispose");
+
+		await harness.session.queueAgentMessagePrompt(agentPrompt, "followUp");
+		harness.session.dispose();
+
+		await expect(delivery).rejects.toThrow("cleared before delivery");
 	});
 
 	it("throws when queueing an extension command with steer", async () => {
