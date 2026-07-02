@@ -10,6 +10,7 @@ import type { SessionStats } from "../../core/session-stats.js";
 import type { DaemonClient } from "../daemon/daemon-client.js";
 import { deserializeDaemonError } from "../daemon/daemon-errors.js";
 import {
+	collectDaemonClientEnv,
 	type DaemonAttachResult,
 	type DaemonCommand,
 	type DaemonDeleteSavedSessionResult,
@@ -59,6 +60,13 @@ export const DAEMON_REFINE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 
 export interface DaemonAgentConnectionOptions {
 	closeClientOnDispose?: boolean;
+	/**
+	 * Send this client's allowlisted env (herdr pane identity) with attach so
+	 * an env-less session (e.g. cron-created) adopts it. Set only by the
+	 * primary interactive connection — the daemon adopts-if-absent, never
+	 * rebinds, so watchers must not send env at all.
+	 */
+	sendClientEnv?: boolean;
 }
 
 /**
@@ -111,6 +119,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			supportsExtensionUi: true,
 			clientId: this.clientId,
 			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach"],
+			env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
 			resumeCursor:
 				this.lastEventSequence === undefined
 					? undefined

@@ -87,6 +87,7 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
  */
 export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private rebindSession?: (session: AgentSession) => Promise<void>;
+	private runtimeEnvScope?: <T>(fn: () => Promise<T>) => Promise<T>;
 	private beforeSessionInvalidate?: () => void;
 	private subagentRuntimeHost?: SubagentRuntimeHost;
 	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
@@ -140,6 +141,19 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 	setRebindSession(rebindSession?: (session: AgentSession) => Promise<void>): void {
 		this.rebindSession = rebindSession;
+	}
+
+	/**
+	 * Host-installed scope wrapping every runtime rebuild (new/switch/fork/
+	 * import and subagent creation), during which extensions re-load. The
+	 * daemon uses it to apply the session's client env for load-time captures.
+	 */
+	setRuntimeEnvScope(scope?: <T>(fn: () => Promise<T>) => Promise<T>): void {
+		this.runtimeEnvScope = scope;
+	}
+
+	private scopedBuild<T>(fn: () => Promise<T>): Promise<T> {
+		return this.runtimeEnvScope ? this.runtimeEnvScope(fn) : fn();
 	}
 
 	setSubagentRuntimeHost(host?: SubagentRuntimeHost): void {
@@ -260,37 +274,39 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		if (options.parentSession.sessionFile) {
 			sessionManager.newSession({ parentSession: options.parentSession.sessionFile });
 		}
-		const runtime = await createAgentSessionRuntime(this.createRuntime, {
-			cwd: sessionManager.getCwd(),
-			agentDir: this.services.agentDir,
-			sessionManager,
-			sessionStartEvent: { type: "session_start", reason: "startup" },
-			sessionConfig: this.sessionConfig,
-			sessionOptions: {
-				model: options.model,
-				thinkingLevel: options.thinkingLevel,
-				scopedModels: options.scopedModels,
-				initialActiveToolNames: options.activeToolNames,
-				allowedToolNames: options.allowedToolNames,
-				customTools: options.customTools,
-				includeGoals: options.includeGoals,
-				rlmDepth: options.rlmDepth,
-				rlmMaxDepth: options.rlmMaxDepth,
-				rlmSessionDir: options.sessionDir,
-				rlmParentNodeId: options.rlmParentNodeId,
-			},
-			runtimeMetadata: {
-				kind: "subagent",
-				createdAt: Date.now(),
-				parentSessionId: options.parentSession.sessionId,
-				parentSessionFile: options.parentSession.sessionFile,
-				rlmChildId: options.id,
-				rlmParentNodeId: options.rlmParentNodeId,
-				prompt: options.prompt,
-				spawnCode: options.spawnCode,
-				sessionDir: options.sessionDir,
-			},
-		});
+		const runtime = await this.scopedBuild(() =>
+			createAgentSessionRuntime(this.createRuntime, {
+				cwd: sessionManager.getCwd(),
+				agentDir: this.services.agentDir,
+				sessionManager,
+				sessionStartEvent: { type: "session_start", reason: "startup" },
+				sessionConfig: this.sessionConfig,
+				sessionOptions: {
+					model: options.model,
+					thinkingLevel: options.thinkingLevel,
+					scopedModels: options.scopedModels,
+					initialActiveToolNames: options.activeToolNames,
+					allowedToolNames: options.allowedToolNames,
+					customTools: options.customTools,
+					includeGoals: options.includeGoals,
+					rlmDepth: options.rlmDepth,
+					rlmMaxDepth: options.rlmMaxDepth,
+					rlmSessionDir: options.sessionDir,
+					rlmParentNodeId: options.rlmParentNodeId,
+				},
+				runtimeMetadata: {
+					kind: "subagent",
+					createdAt: Date.now(),
+					parentSessionId: options.parentSession.sessionId,
+					parentSessionFile: options.parentSession.sessionFile,
+					rlmChildId: options.id,
+					rlmParentNodeId: options.rlmParentNodeId,
+					prompt: options.prompt,
+					spawnCode: options.spawnCode,
+					sessionDir: options.sessionDir,
+				},
+			}),
+		);
 		this.subagentRuntimes.set(options.id, runtime);
 		try {
 			await runtime.session.bindExtensions({});
@@ -352,13 +368,15 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		assertSessionCwdExists(sessionManager, this.cwd);
 		await this.teardownCurrent("resume", sessionManager.getSessionFile());
 		this.apply(
-			await this.createRuntime({
-				cwd: sessionManager.getCwd(),
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
-				sessionConfig: this.sessionConfig,
-			}),
+			await this.scopedBuild(() =>
+				this.createRuntime({
+					cwd: sessionManager.getCwd(),
+					agentDir: this.services.agentDir,
+					sessionManager,
+					sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+					sessionConfig: this.sessionConfig,
+				}),
+			),
 		);
 		await this.finishSessionReplacement(options?.withSession);
 		return { cancelled: false };
@@ -383,13 +401,15 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 		await this.teardownCurrent("new", sessionManager.getSessionFile());
 		this.apply(
-			await this.createRuntime({
-				cwd: this.cwd,
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
-				sessionConfig: this.sessionConfig,
-			}),
+			await this.scopedBuild(() =>
+				this.createRuntime({
+					cwd: this.cwd,
+					agentDir: this.services.agentDir,
+					sessionManager,
+					sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
+					sessionConfig: this.sessionConfig,
+				}),
+			),
 		);
 		if (options?.setup) {
 			await options.setup(this.session.sessionManager);
@@ -438,13 +458,15 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				sessionManager.newSession({ parentSession: currentSessionFile });
 				await this.teardownCurrent("fork", sessionManager.getSessionFile());
 				this.apply(
-					await this.createRuntime({
-						cwd: this.cwd,
-						agentDir: this.services.agentDir,
-						sessionManager,
-						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
-						sessionConfig: this.sessionConfig,
-					}),
+					await this.scopedBuild(() =>
+						this.createRuntime({
+							cwd: this.cwd,
+							agentDir: this.services.agentDir,
+							sessionManager,
+							sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+							sessionConfig: this.sessionConfig,
+						}),
+					),
 				);
 				await this.finishSessionReplacement(options?.withSession);
 				return { cancelled: false, selectedText };
@@ -458,13 +480,15 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			const sessionManager = SessionManager.open(forkedSessionPath, sessionDir);
 			await this.teardownCurrent("fork", sessionManager.getSessionFile());
 			this.apply(
-				await this.createRuntime({
-					cwd: sessionManager.getCwd(),
-					agentDir: this.services.agentDir,
-					sessionManager,
-					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
-					sessionConfig: this.sessionConfig,
-				}),
+				await this.scopedBuild(() =>
+					this.createRuntime({
+						cwd: sessionManager.getCwd(),
+						agentDir: this.services.agentDir,
+						sessionManager,
+						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+						sessionConfig: this.sessionConfig,
+					}),
+				),
 			);
 			await this.finishSessionReplacement(options?.withSession);
 			return { cancelled: false, selectedText };
@@ -478,13 +502,15 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 		await this.teardownCurrent("fork", sessionManager.getSessionFile());
 		this.apply(
-			await this.createRuntime({
-				cwd: this.cwd,
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
-				sessionConfig: this.sessionConfig,
-			}),
+			await this.scopedBuild(() =>
+				this.createRuntime({
+					cwd: this.cwd,
+					agentDir: this.services.agentDir,
+					sessionManager,
+					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+					sessionConfig: this.sessionConfig,
+				}),
+			),
 		);
 		await this.finishSessionReplacement(options?.withSession);
 		return { cancelled: false, selectedText };
@@ -523,13 +549,15 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		assertSessionCwdExists(sessionManager, this.cwd);
 		await this.teardownCurrent("resume", sessionManager.getSessionFile());
 		this.apply(
-			await this.createRuntime({
-				cwd: sessionManager.getCwd(),
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
-				sessionConfig: this.sessionConfig,
-			}),
+			await this.scopedBuild(() =>
+				this.createRuntime({
+					cwd: sessionManager.getCwd(),
+					agentDir: this.services.agentDir,
+					sessionManager,
+					sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+					sessionConfig: this.sessionConfig,
+				}),
+			),
 		);
 		await this.finishSessionReplacement();
 		return { cancelled: false };

@@ -70,6 +70,43 @@ export interface DaemonAttachClientMetadata {
 	resumeCursor?: DaemonResumeCursor;
 }
 
+/**
+ * Client-side env vars forwarded to the daemon so extensions can reach them
+ * (e.g. HERDR_PANE_ID/HERDR_SOCKET_PATH that herdr sets per pane). The daemon
+ * scopes these to the created session and merges them over process.env for
+ * that session's pi.exec() subprocesses — it does not mutate the daemon's own
+ * env. Carried on create only: attach must not rebind a session's identity,
+ * since watchers (agents view, subagent viewers) also attach.
+ */
+export interface DaemonClientEnv {
+	env?: Record<string, string>;
+}
+
+/**
+ * The allowlist of env vars a client may forward. One shared list because it
+ * is the wire contract: clients filter before sending and the daemon
+ * re-filters on receipt (the socket peer is untrusted).
+ */
+export const DAEMON_CLIENT_ENV_KEYS = [
+	"HERDR_ENV",
+	"HERDR_PANE_ID",
+	"HERDR_SOCKET_PATH",
+	"HERDR_TAB_ID",
+	"HERDR_WORKSPACE_ID",
+] as const;
+
+/** Collect the allowlisted env vars from the client process for the create command. */
+export function collectDaemonClientEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> | undefined {
+	const env: Record<string, string> = {};
+	for (const key of DAEMON_CLIENT_ENV_KEYS) {
+		const value = source[key];
+		if (value !== undefined) {
+			env[key] = value;
+		}
+	}
+	return Object.keys(env).length > 0 ? env : undefined;
+}
+
 export interface DaemonReplayInfo {
 	status: DaemonReplayStatus;
 	fromSequence?: DaemonEventSequence;
@@ -151,20 +188,24 @@ export interface DaemonAttachResult {
 export type DaemonCommand =
 	| { id?: string; type: "list"; all?: boolean; cwd?: string; sessionDir?: string }
 	| { id?: string; type: "list_saved_sessions"; activeSessionId: string; scope: AgentConnectionSavedSessionScope }
-	| {
+	| ({
 			id?: string;
 			type: "create";
 			sessionPath?: string;
 			continueRecent?: boolean;
 			name?: string;
 			config?: AgentSessionRuntimeConfig;
-	  }
+	  } & DaemonClientEnv)
+	// Attach env is adopt-if-absent only: it fills identity for env-less
+	// sessions (e.g. cron-created) but never rebinds one, since watchers
+	// (agents view, subagent viewers) also attach.
 	| ({
 			id?: string;
 			type: "attach";
 			activeSessionId: string;
 			supportsExtensionUi?: boolean;
-	  } & DaemonAttachClientMetadata)
+	  } & DaemonAttachClientMetadata &
+			DaemonClientEnv)
 	| { id?: string; type: "detach"; activeSessionId?: string }
 	| { id?: string; type: "kill"; activeSessionId: string }
 	| { id?: string; type: "rename"; activeSessionId: string; name: string }

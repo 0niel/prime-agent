@@ -15,6 +15,11 @@ export interface ExecOptions {
 	timeout?: number;
 	/** Working directory */
 	cwd?: string;
+	/**
+	 * Extra env vars merged over the parent process env for this command.
+	 * A key with an undefined value is unset in the child.
+	 */
+	env?: Record<string, string | undefined>;
 }
 
 /**
@@ -25,6 +30,21 @@ export interface ExecResult {
 	stderr: string;
 	code: number;
 	killed: boolean;
+}
+
+function mergeExecEnv(env?: Record<string, string | undefined>): NodeJS.ProcessEnv | undefined {
+	if (!env) {
+		return undefined;
+	}
+	const merged: NodeJS.ProcessEnv = { ...process.env };
+	for (const [key, value] of Object.entries(env)) {
+		if (value === undefined) {
+			delete merged[key];
+		} else {
+			merged[key] = value;
+		}
+	}
+	return merged;
 }
 
 /**
@@ -42,6 +62,9 @@ export async function execCommand(
 			cwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
+			// Merge per-call env over the parent env so callers can scope vars
+			// (e.g. herdr pane identity) without mutating the shared process.env.
+			env: mergeExecEnv(options?.env),
 		});
 
 		let stdout = "";

@@ -2163,6 +2163,53 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("adopts client env on session reuse only when the session has none", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-env-"));
+		try {
+			const sessionPath = join(tempDir, "session.jsonl");
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+				return {
+					session: makeRuntimeSession(options.sessionManager),
+					extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["extensionsResult"],
+					services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["services"],
+					diagnostics: [],
+				};
+			});
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: tempDir },
+				createRuntime,
+			});
+			const create = (
+				daemon as unknown as {
+					createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				}
+			).createRuntime.bind(daemon);
+
+			// Created env-less (e.g. by a cron job), then opened by an env-carrying
+			// client: the session adopts the client's allowlisted identity.
+			const state = await create({ type: "create", sessionPath });
+			expect(state.clientEnv).toBeUndefined();
+			const adopted = await create({
+				type: "create",
+				sessionPath,
+				env: { HERDR_PANE_ID: "w1:p1", PATH: "/evil" },
+			});
+			expect(adopted).toBe(state);
+			expect(state.clientEnv).toEqual({ HERDR_PANE_ID: "w1:p1" });
+
+			// A later client with a different env must not rebind the identity
+			// that extensions already captured.
+			await create({ type: "create", sessionPath, env: { HERDR_PANE_ID: "w2:p9" } });
+			expect(state.clientEnv).toEqual({ HERDR_PANE_ID: "w1:p1" });
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("makes daemon host controllers available during session_start extension binding", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-controller-race-"));
 		try {
@@ -2897,6 +2944,7 @@ function makeRuntimeSession(
 		setSubagentRuntimeHost: vi.fn(),
 		subscribe: vi.fn(() => vi.fn()),
 		bindExtensions: vi.fn(async () => {}),
+		setExecEnvProvider: vi.fn(),
 		setSessionName: vi.fn(),
 		dispose: vi.fn(),
 		abort: vi.fn(async () => {}),

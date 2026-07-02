@@ -596,6 +596,7 @@ export class AgentSession {
 
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
+	private _execEnvProvider?: () => Record<string, string | undefined> | undefined;
 	private _turnIndex = 0;
 
 	private _resourceLoader: ResourceLoader;
@@ -4213,6 +4214,17 @@ export class AgentSession {
 		return this.settingsManager.getCompactionEnabled();
 	}
 
+	/**
+	 * Set the provider for extra env vars merged over process.env in extension
+	 * pi.exec() subprocesses. The function is read at exec time, so a host (e.g.
+	 * the daemon) can update the underlying value per attach without rebinding.
+	 */
+	setExecEnvProvider(provider: (() => Record<string, string | undefined> | undefined) | undefined): void {
+		this._execEnvProvider = provider;
+		const extensions = this._resourceLoader.getExtensions();
+		extensions.runtime.getExecEnv = provider;
+	}
+
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
@@ -4560,6 +4572,12 @@ export class AgentSession {
 			for (const [name, value] of options.flagValues) {
 				extensionsResult.runtime.flagValues.set(name, value);
 			}
+		}
+		// Re-apply on (re)build so the provider survives /reload. Guarded: the
+		// runtime object can be shared across sessions from one ResourceLoader
+		// (RLM children), so a provider-less session must not wipe the owner's.
+		if (this._execEnvProvider) {
+			extensionsResult.runtime.getExecEnv = this._execEnvProvider;
 		}
 
 		this._extensionRunner = new ExtensionRunner(
