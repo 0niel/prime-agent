@@ -117,6 +117,10 @@ async function waitForPrintModeIdleWithAutonomousGates(
 				streamingBehavior: "followUp",
 			},
 		);
+		// followUp prompts can be accepted/queued before the actual retry turn has
+		// produced a new assistant message. Wait for the session to become idle again
+		// so an earlier assistant error does not get mistaken for this retry result.
+		await session.agent.waitForIdle();
 		const lastMessage = session.state.messages[session.state.messages.length - 1];
 		if (lastMessage?.role === "assistant") {
 			const assistantMessage = lastMessage as AssistantMessage;

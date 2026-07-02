@@ -289,6 +289,64 @@ describe("runPrintMode", () => {
 		expect(session.prompt.mock.calls[1][0]).toContain("Autonomous quality gate failed");
 	});
 
+	it("waits for a queued follow-up turn before evaluating transient assistant errors", async () => {
+		const statuses: AgentAutonomousStatus[] = [
+			{
+				enabled: true,
+				continuationsUsed: 0,
+				turnsUsed: 1,
+				tokensUsed: 100,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 1, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 1 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 1,
+					exitText: "exited 1",
+					output: "0/9",
+				},
+			},
+			{
+				enabled: true,
+				continuationsUsed: 1,
+				turnsUsed: 2,
+				tokensUsed: 200,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 1, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 1 },
+			},
+		];
+		const runtimeHost = createRuntimeHost(
+			createAssistantMessage({ stopReason: "error", errorMessage: "provider down" }),
+			statuses[0],
+		);
+		const { session } = runtimeHost;
+		let statusIndex = 0;
+		session.getAutonomousStatus.mockImplementation(
+			() => statuses[Math.min(statusIndex++, statuses.length - 1)] as AgentAutonomousStatus,
+		);
+		let waitCount = 0;
+		session.agent.waitForIdle.mockImplementation(async () => {
+			waitCount++;
+			if (waitCount === 2) {
+				session.state.messages = [createAssistantMessage({ text: "queued retry completed" })];
+			}
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(0);
+		expect(session.prompt).toHaveBeenCalledTimes(1);
+		expect(session.recordHostAutonomousContinuation).toHaveBeenCalledTimes(1);
+		expect(session.agent.waitForIdle).toHaveBeenCalledTimes(3);
+		expect(errorSpy).not.toHaveBeenCalledWith("provider down");
+	});
+
 	it("does not issue host-driven gate prompts once maxContinuations is reached", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), {
 			enabled: true,
@@ -535,8 +593,9 @@ describe("runPrintMode", () => {
 		});
 
 		expect(exitCode).toBe(1);
-		expect(session.agent.waitForIdle).toHaveBeenCalledTimes(4);
+		expect(session.agent.waitForIdle).toHaveBeenCalledTimes(7);
 		expect(session.prompt).toHaveBeenCalledTimes(3);
+		expect(session.recordHostAutonomousContinuation).toHaveBeenCalledTimes(3);
 		expect(session.prompt.mock.calls[1][0]).toContain("workspace unchanged");
 		expect(session.prompt.mock.calls[2][0]).toContain("workspace unchanged");
 	});
