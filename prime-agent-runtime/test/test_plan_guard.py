@@ -155,11 +155,41 @@ pg._sandbox_prefix = lambda roots: None
 enable()
 out = subprocess.run(["git", "version"], capture_output=True, text=True)
 assert out.returncode == 0
+out = subprocess.run(["git", "-C", "/", "status", "--short"], capture_output=True, text=True)
+assert "PlanModeError" not in (out.stderr or ""), out.stderr
+expect_blocked(lambda: subprocess.run(["git", "-c", "core.fsmonitor=touch pwned", "status"]))
 subprocess.run("git log --oneline | head -2", shell=True, capture_output=True, text=True, cwd="/")
 expect_blocked(lambda: subprocess.run(["sed", "-i", "s/a/b/", "f"]))
 expect_blocked(lambda: subprocess.run(["touch", "f"]))
 expect_blocked(lambda: subprocess.run("echo hi > f", shell=True))
 expect_blocked(lambda: subprocess.run(["git", "commit", "-m", "x"]))
+""")
+
+    def test_fallback_shell_dash_c(self) -> None:
+        self.assert_ok("""
+import subprocess
+import rlm.plan_guard as pg
+pg._sandbox_prefix = lambda roots: None
+enable()
+out = subprocess.run(["bash", "-c", "git version | head -1"], capture_output=True, text=True)
+assert out.returncode == 0 and "git" in out.stdout, out.stderr
+expect_blocked(lambda: subprocess.run(["bash", "-c", "touch " + os.path.join(work, "f")]))
+""")
+
+    def test_fallback_stdin_shell_script(self) -> None:
+        # %%bash cells spawn a bare shell and feed the script over stdin.
+        self.assert_ok("""
+import subprocess
+import rlm.plan_guard as pg
+pg._sandbox_prefix = lambda roots: None
+enable()
+out = subprocess.run(["bash"], input="ls / | head -3", capture_output=True, text=True)
+assert out.returncode == 0 and out.stdout.strip(), out.stderr
+target = os.path.join(work, "f")
+out = subprocess.run(["bash"], input="echo x > " + target, capture_output=True, text=True)
+assert out.returncode != 0, "write script should be refused"
+assert "PlanModeError" in out.stderr, out.stderr
+assert not os.path.exists(target)
 """)
 
     def test_shell_true_wrapped(self) -> None:

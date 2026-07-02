@@ -34,6 +34,12 @@ class PlanModeError(RuntimeError):
         super().__init__(_PLAN_MODE_MESSAGE.format(action=action))
 
 
+_FALLBACK_BLOCK_ACTION = (
+    "running this command (no bwrap/sandbox-exec on this machine, so only "
+    "classifiable read-only commands run: git log/diff/status, rg, grep, ls, cat, ...)"
+)
+
+
 # io.open write intent letters / os.open write intent flags.
 _WRITE_MODE_CHARS = frozenset("wax+")
 _WRITE_OPEN_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
@@ -204,13 +210,55 @@ def _sandbox_prefix(roots: Iterable[str]) -> list[str] | None:
     return None
 
 
+# Shells whose script can be classified: `sh -c <script>` inline, or a bare
+# shell fed its script over stdin (how IPython's %%bash cells run).
+_SHELL_NAMES = frozenset({"bash", "dash", "sh", "zsh"})
+
+# Runs as `python -c _STDIN_SHIM <shell> <rlm-src-dir>`: buffer the stdin
+# script, classify it with the same fallback rules, then exec the real shell.
+_STDIN_SHIM = """
+import os, sys
+sys.path.insert(0, sys.argv[2])
+from rlm.plan_guard import _fallback_shell_allowed
+script = sys.stdin.read()
+if not _fallback_shell_allowed(script):
+    sys.stderr.write(
+        "PlanModeError: this shell script is blocked in plan mode. "
+        "Read-only commands (git log/diff/status, rg, grep, ls, cat, ...) are allowed.\\n"
+    )
+    sys.exit(1)
+os.execvp(sys.argv[1], [sys.argv[1], "-c", script])
+""".strip()
+
+
+def _stdin_shim_argv(shell_name: str) -> list[str]:
+    src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return [sys.executable, "-c", _STDIN_SHIM, shell_name, src_dir]
+
+
 def _fallback_command_allowed(argv: list[str]) -> bool:
     if not argv:
         return False
     name = os.path.basename(argv[0])
+    if name in _SHELL_NAMES:
+        return len(argv) >= 3 and argv[1] == "-c" and _fallback_shell_allowed(argv[2])
     if name == "git":
-        sub = next((a for a in argv[1:] if not a.startswith("-")), None)
-        return sub in _FALLBACK_GIT_SUBCOMMANDS
+        # Only known-harmless global options may precede the subcommand; -c,
+        # --exec-path, etc. can make even read subcommands run arbitrary code.
+        rest = argv[1:]
+        i = 0
+        while i < len(rest):
+            arg = rest[i]
+            if arg == "-C":
+                i += 2
+                continue
+            if arg in ("-P", "--no-pager", "--no-optional-locks", "--literal-pathspecs"):
+                i += 1
+                continue
+            if arg.startswith("-"):
+                return False
+            return arg in _FALLBACK_GIT_SUBCOMMANDS
+        return False
     if name == "find":
         return not any(a in ("-delete", "-exec", "-execdir", "-ok", "-okdir") for a in argv[1:])
     if name == "sed":
@@ -276,17 +324,21 @@ def _make_guard():
         executable = kwargs.pop("executable", None)
         prefix = _sandbox_prefix(state["roots"])
         if prefix is None:
-            allowed = _fallback_shell_allowed(args) if shell and isinstance(args, str) else False
-            if not allowed and not shell:
-                argv = [os.fsdecode(a) for a in ([args] if isinstance(args, (str, bytes, os.PathLike)) else list(args))]
-                if executable:
-                    argv[0] = os.fsdecode(executable)
-                allowed = _fallback_command_allowed(argv)
-            if not allowed:
-                raise PlanModeError("running this command (no read-only sandbox available on this machine)")
+            if shell:
+                if isinstance(args, (str, bytes)) and _fallback_shell_allowed(os.fsdecode(args)):
+                    if executable:
+                        kwargs["executable"] = executable
+                    return args, kwargs
+                raise PlanModeError(_FALLBACK_BLOCK_ACTION)
+            argv = [os.fsdecode(a) for a in ([args] if isinstance(args, (str, bytes, os.PathLike)) else list(args))]
             if executable:
-                kwargs["executable"] = executable
-            return args, kwargs
+                argv[0] = os.fsdecode(executable)
+            if len(argv) == 1 and os.path.basename(argv[0]) in _SHELL_NAMES:
+                # %%bash-style: the script arrives on stdin, so classify it there.
+                return _stdin_shim_argv(argv[0]), kwargs
+            if not _fallback_command_allowed(argv):
+                raise PlanModeError(_FALLBACK_BLOCK_ACTION)
+            return argv, kwargs
         kwargs["shell"] = False
         if shell:
             sh = os.fsdecode(executable) if executable else "/bin/sh"
