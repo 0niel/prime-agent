@@ -113,7 +113,12 @@ import type { McpManager } from "./mcp/mcp-manager.js";
 import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
-import { createPlanModeContextMessage, PLAN_MODE_BLOCKED_TOOLS } from "./prompts/plan-mode.js";
+import {
+	createPlanModeContextMessage,
+	createPlanModeExitedMessage,
+	PLAN_MODE_BLOCKED_TOOLS,
+	PLAN_MODE_EXITED_CUSTOM_TYPE,
+} from "./prompts/plan-mode.js";
 import {
 	appendGlobalRefinement,
 	applyRefinementProposal,
@@ -2545,6 +2550,15 @@ export class AgentSession {
 			throw error;
 		}
 		this.sessionManager.appendPlanModeChange(enabled);
+		if (enabled) {
+			// Re-enabling before the exited notice fires would tell the model plan
+			// mode is off on a turn where it's on; drop the stale queued notice.
+			this._pendingNextTurnMessages = this._pendingNextTurnMessages.filter(
+				(m) => m.customType !== PLAN_MODE_EXITED_CUSTOM_TYPE,
+			);
+		} else {
+			this._pendingNextTurnMessages.push(createPlanModeExitedMessage());
+		}
 		this._emit({ type: "plan_mode_changed", enabled });
 	}
 
