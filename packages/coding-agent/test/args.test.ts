@@ -321,6 +321,13 @@ describe("parseArgs", () => {
 			expect(result.autonomousMaxTokens).toBe(500000);
 			expect(result.autonomousTimeoutMs).toBe(1800000);
 		});
+
+		test("auto-enables autonomous mode when autonomous sub-options are supplied", () => {
+			const result = parseArgs(["--autonomous-max-turns", "1", "--autonomous-gate", "npm test"]);
+			expect(result.autonomous).toBe(true);
+			expect(result.autonomousMaxTurns).toBe(1);
+			expect(result.autonomousGates).toEqual(["npm test"]);
+		});
 	});
 
 	describe("tool flags", () => {

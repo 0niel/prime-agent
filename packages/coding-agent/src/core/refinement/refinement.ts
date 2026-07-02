@@ -128,6 +128,8 @@ Continual harness components:
 Scope and persistence policy:
 - The default editable continual harness store is local to the current Prime Agent session. Use it for session-specific progress, active task state, current-run coordination notes, temporary blockers, and project facts that should not affect other sessions.
 - A caller may explicitly request global refinement. Global edits must be stable cross-session lessons, durable user preferences, reusable skills/subagents, or tool/environment facts that should affect future sessions.
+- Entry ids in the harness overview may carry a display-only \`local:\` or \`global:\` prefix. Always use the bare id (no prefix) in edits.
+- All edits in one refinement apply only to the requested scope's store. During a local refinement, global entries are read-only context: never propose update or delete edits for them; create a local entry instead when a session-specific override is genuinely needed.
 - Project/workspace-specific lessons may be persisted globally only when the title, path, or content explicitly names the project/workspace and the lesson is likely to be reused in future sessions for that project. Prefer local edits when the lesson only belongs in the current conversation.
 - Use memory for declarative facts and preferences, skill for repeatable procedures exposed as Python calls, prompt for narrow behavioral policy addenda, and subagent for reusable delegation roles.
 - When an edit is persisted, include metadata such as \`{"scope":"local"}\` or \`{"scope":"global"}\` when that helps future review understand the intended blast radius.
@@ -323,10 +325,9 @@ function isRefinementResult(data: unknown): data is RefinementResult {
 }
 
 /**
- * Append a refinement result to the global, cross-session history log. The harness
- * state itself is global, so rollback evidence must also be global; relying only on
- * per-session JSONL entries makes a refinement applied in one session impossible to
- * roll back from another.
+ * Append a global-scope refinement to the cross-session history log so it can be
+ * rolled back from any session. Local-scope refinements are recorded only in the
+ * session JSONL and roll back via their recorded harnessStatePath.
  */
 export function appendGlobalRefinement(harnessStateDir: string, result: RefinementResult): string {
 	const historyPath = getRefinementHistoryPath(harnessStateDir);
@@ -756,7 +757,7 @@ export async function planRefinement(
 	const conversationText = serializeConversation(convertToLlm(messages)).slice(-80_000);
 	const scopeInstruction = options.global
 		? "Requested refinement scope: global. Only propose stable cross-session continual harness edits, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts that should affect future Prime Agent sessions. Do not persist session-only progress, temporary blockers, or current-run coordination globally."
-		: "Requested refinement scope: local. Prefer local continual harness edits for current task progress, temporary blockers, current-run coordination, and project facts that are not clearly reusable across Prime Agent sessions.";
+		: "Requested refinement scope: local. Prefer local continual harness edits for current task progress, temporary blockers, current-run coordination, and project facts that are not clearly reusable across Prime Agent sessions. Global entries in the overview are read-only context: do not propose update or delete edits for them; create a local entry instead if an override is needed.";
 	const userPrompt = [
 		`<current_harness_state>\n${overviewForPrompt(state)}\n</current_harness_state>`,
 		`<refinement_history>\n${historyForPrompt(history)}\n</refinement_history>`,

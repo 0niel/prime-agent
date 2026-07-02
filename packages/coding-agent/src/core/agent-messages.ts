@@ -10,6 +10,7 @@ export const DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY = 3;
 export const DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS = 1000;
 
 export type AgentSessionMessageDeliveryMode = "auto" | "steer" | "follow_up";
+export type AgentSessionMessageDeliveryStatus = "delivered" | "queued";
 export type AgentSessionMessageRuntimeKind = "top-level" | "subagent";
 
 export interface AgentSessionMessageEndpoint {
@@ -51,7 +52,12 @@ export interface AgentSessionMessageReceipt {
 	target: AgentSessionMessageEndpoint;
 	from?: AgentSessionMessageSender;
 	message: string;
-	deliveredAt: string;
+	// Not named "status": the kernel host bridge envelope reserves that key.
+	deliveryStatus: AgentSessionMessageDeliveryStatus;
+	/** Present when deliveryStatus is "delivered": the message reached the target's context. */
+	deliveredAt?: string;
+	/** Present when deliveryStatus is "queued": the message waits behind the target's current work. */
+	queuedAt?: string;
 	deliveryMode: AgentSessionMessageDeliveryMode;
 }
 
@@ -135,6 +141,23 @@ export function resolveAgentSessionMessageStreamingBehavior(
 	return "followUp";
 }
 
+export function parseAgentSessionMessagePromptId(text: string): string | undefined {
+	const lines = text.split("\n");
+	if (lines[0] !== "Agent-to-agent message received." || lines[1] !== `Source: ${AGENT_MESSAGE_SOURCE}`) {
+		return undefined;
+	}
+	const toLineIndex = lines[2]?.startsWith("From: ") ? 3 : 2;
+	if (!lines[toLineIndex]?.startsWith("To: ")) {
+		return undefined;
+	}
+	const match = /^Message id: (agentmsg_[^\n]+)$/.exec(lines[toLineIndex + 1] ?? "");
+	return match?.[1];
+}
+
+export function isAgentSessionMessagePrompt(text: string): boolean {
+	return parseAgentSessionMessagePromptId(text) !== undefined;
+}
+
 export function createAgentSessionMessagePrompt(payload: AgentSessionMessagePayload): string {
 	const lines = ["Agent-to-agent message received.", `Source: ${payload.source}`];
 	if (payload.from) {
@@ -149,7 +172,8 @@ export function createAgentSessionMessagePrompt(payload: AgentSessionMessagePayl
 
 export function createAgentSessionMessageReceipt(
 	payload: AgentSessionMessagePayload,
-	deliveredAt = new Date().toISOString(),
+	status: AgentSessionMessageDeliveryStatus,
+	at = new Date().toISOString(),
 ): AgentSessionMessageReceipt {
 	return {
 		id: payload.id,
@@ -157,7 +181,8 @@ export function createAgentSessionMessageReceipt(
 		target: payload.target,
 		from: payload.from,
 		message: payload.message,
-		deliveredAt,
+		deliveryStatus: status,
+		...(status === "delivered" ? { deliveredAt: at } : { queuedAt: at }),
 		deliveryMode: payload.deliveryMode,
 	};
 }
@@ -245,24 +270,31 @@ export function createAgentMessageHostHandlers(
 	};
 }
 
+function formatAgentSessionMessageMetadata(value: string): string {
+	return value.replace(/[\s,]+/g, " ").trim();
+}
+
 function formatAgentSessionMessageSender(sender: AgentSessionMessageSender): string {
 	const parts: string[] = [];
 	if (sender.sessionName) {
-		parts.push(sender.sessionName);
+		const sessionName = formatAgentSessionMessageMetadata(sender.sessionName);
+		if (sessionName) {
+			parts.push(sessionName);
+		}
 	}
 	if (sender.activeSessionId) {
-		parts.push(`active ${sender.activeSessionId}`);
+		parts.push(`active ${formatAgentSessionMessageMetadata(sender.activeSessionId)}`);
 	}
 	if (sender.sessionId) {
-		parts.push(`session ${sender.sessionId}`);
+		parts.push(`session ${formatAgentSessionMessageMetadata(sender.sessionId)}`);
 	}
 	if (sender.clientId) {
-		parts.push(`client ${sender.clientId}`);
+		parts.push(`client ${formatAgentSessionMessageMetadata(sender.clientId)}`);
 	}
 	return parts.length > 0 ? parts.join(", ") : "unknown sender";
 }
 
 function formatAgentSessionMessageEndpoint(endpoint: AgentSessionMessageEndpoint): string {
-	const name = endpoint.sessionName ? `${endpoint.sessionName}, ` : "";
-	return `${name}active ${endpoint.activeSessionId}, session ${endpoint.sessionId}`;
+	const name = endpoint.sessionName ? `${formatAgentSessionMessageMetadata(endpoint.sessionName)}, ` : "";
+	return `${name}active ${formatAgentSessionMessageMetadata(endpoint.activeSessionId)}, session ${formatAgentSessionMessageMetadata(endpoint.sessionId)}`;
 }

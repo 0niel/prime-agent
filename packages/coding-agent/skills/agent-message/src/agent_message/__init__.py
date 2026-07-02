@@ -27,6 +27,10 @@ async def send(target: str, message: str, mode: MessageMode = "auto") -> dict[st
         mode: "auto" queues as follow-up only if the target is streaming;
             "follow_up" always uses follow-up when the target is streaming;
             "steer" interrupts a streaming target.
+
+    Returns a receipt dict whose "deliveryStatus" is "delivered" (reached an
+    idle target's context) or "queued" (accepted; delivers when the target's
+    current work allows -- this call does not block waiting for that).
     """
     if not isinstance(target, str):
         raise TypeError(f"target must be str, got {type(target).__name__}")

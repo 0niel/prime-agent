@@ -154,6 +154,51 @@ describe("runPrintMode", () => {
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});
 
+	it("keeps prompting when gate retries are exhausted but autonomous limits remain", async () => {
+		const statuses: AgentAutonomousStatus[] = [
+			{
+				enabled: true,
+				continuationsUsed: 1,
+				turnsUsed: 2,
+				tokensUsed: 100,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 4 },
+				lastGateFailure: {
+					command: "verify-public",
+					attempt: 4,
+					exitText: "not rerun: workspace unchanged since previous failed gate",
+					output: "edit source files before attempting to finish again",
+				},
+			},
+			{
+				enabled: true,
+				continuationsUsed: 1,
+				turnsUsed: 3,
+				tokensUsed: 200,
+				startedAt: Date.now(),
+				limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+				gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+				gateAttempts: { "verify-public": 4 },
+			},
+		];
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), statuses[0]);
+		const { session } = runtimeHost;
+		let statusIndex = 0;
+		session.getAutonomousStatus.mockImplementation(
+			() => statuses[Math.min(statusIndex++, statuses.length - 1)] as AgentAutonomousStatus,
+		);
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(0);
+		expect(session.prompt).toHaveBeenCalledTimes(1);
+		expect(session.prompt.mock.calls[0][0]).toContain("Autonomous quality gate failed (attempt 4/3)");
+	});
+
 	it("returns non-zero when autonomous gates are still failing", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), {
 			enabled: true,

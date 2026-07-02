@@ -24,7 +24,11 @@ receipt = await agent_message.send("worker", "Please inspect the latest result."
 - `await agent_message.send(target, message, mode="auto")` — sends one direct
   text message to an active session. `target` is resolved by the daemon like
   other live-session selectors. `mode` is `"auto"`, `"follow_up"`, or
-  `"steer"`.
+  `"steer"`. Returns a receipt with a `deliveryStatus` field: `"delivered"`
+  means the message reached an idle target's context; `"queued"` means it was
+  accepted and will deliver when the target's current work allows (`send`
+  does not block waiting for that). Delivered receipts carry `deliveredAt`,
+  queued receipts carry `queuedAt`.
 
 ## Safety
 

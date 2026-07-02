@@ -190,19 +190,26 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--autonomous") {
 			result.autonomous = true;
 		} else if (arg === "--autonomous-gate" && i + 1 < args.length) {
+			result.autonomous = true;
 			result.autonomousGates = result.autonomousGates ?? [];
 			result.autonomousGates.push(args[++i]);
 		} else if (arg === "--autonomous-gate-retries" && i + 1 < args.length) {
+			result.autonomous = true;
 			result.autonomousGateRetries = parsePositiveInt(args[++i], "--autonomous-gate-retries", result);
 		} else if (arg === "--autonomous-gate-timeout-ms" && i + 1 < args.length) {
+			result.autonomous = true;
 			result.autonomousGateTimeoutMs = parsePositiveInt(args[++i], "--autonomous-gate-timeout-ms", result);
 		} else if (arg === "--autonomous-max-continuations" && i + 1 < args.length) {
+			result.autonomous = true;
 			result.autonomousMaxContinuations = parsePositiveInt(args[++i], "--autonomous-max-continuations", result);
 		} else if (arg === "--autonomous-max-turns" && i + 1 < args.length) {
+			result.autonomous = true;
 			result.autonomousMaxTurns = parsePositiveInt(args[++i], "--autonomous-max-turns", result);
 		} else if (arg === "--autonomous-max-tokens" && i + 1 < args.length) {
+			result.autonomous = true;
 			result.autonomousMaxTokens = parsePositiveInt(args[++i], "--autonomous-max-tokens", result);
 		} else if (arg === "--autonomous-timeout-ms" && i + 1 < args.length) {
+			result.autonomous = true;
 			result.autonomousTimeoutMs = parsePositiveInt(args[++i], "--autonomous-timeout-ms", result);
 		} else if (arg === "--list-models") {
 			// Check if next arg is a search pattern (not a flag or file arg)

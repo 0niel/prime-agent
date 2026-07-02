@@ -65,6 +65,33 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 		expect(merged.extensions).not.toBe(defaults.extensions);
 	});
 
+	it("deep-merges autonomous gate overrides", () => {
+		const defaults: AgentSessionRuntimeConfig = {
+			autonomous: {
+				enabled: true,
+				maxTurns: 20,
+				gates: { commands: ["npm test"], maxRetries: 3 },
+			},
+		};
+
+		const overrides: AgentSessionRuntimeConfig = {
+			autonomous: {
+				maxContinuations: 5,
+				gates: { timeoutMs: 1000 },
+			},
+		};
+
+		const merged = mergeAgentSessionRuntimeConfig(defaults, overrides);
+
+		expect(merged.autonomous).toEqual({
+			enabled: true,
+			maxTurns: 20,
+			maxContinuations: 5,
+			gates: { commands: ["npm test"], maxRetries: 3, timeoutMs: 1000 },
+		});
+		expect(merged.autonomous?.gates?.commands).not.toBe(defaults.autonomous?.gates?.commands);
+	});
+
 	it("ignores undefined override values", () => {
 		const defaults: AgentSessionRuntimeConfig = {
 			cwd: "/repo/default",

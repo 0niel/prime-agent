@@ -3,7 +3,7 @@ name = "orchestration-heartbeat"
 version = "0.1.0"
 description = "Prime Agent orchestration heartbeat skill"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["agent-observe", "rlm-heartbeat"]
 
 [build-system]
 requires = ["hatchling"]

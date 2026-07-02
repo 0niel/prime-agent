@@ -13,6 +13,7 @@ import { createAgentSessionFromServices, createAgentSessionServices } from "../s
 import { AuthStorage } from "../src/core/auth-storage.js";
 import type { AgentRlmHeartbeatController } from "../src/core/cron-jobs.js";
 import { SessionManager } from "../src/core/session-manager.js";
+import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 
 describe("createAgentSessionFromServices", () => {
 	const cleanupPaths: string[] = [];
@@ -45,9 +46,27 @@ describe("createAgentSessionFromServices", () => {
 			agentDir: tempDir,
 			authStorage,
 			resourceLoaderOptions: {
-				noSkills: true,
 				noPromptTemplates: true,
 				noThemes: true,
+				skillsOverride: () => ({
+					skills: [
+						{
+							name: AGENT_MESSAGE_SKILL_NAME,
+							description: "hidden agent message skill",
+							filePath: "<test:agent-message>",
+							baseDir: tempDir,
+							sourceInfo: createSyntheticSourceInfo("<test:agent-message>", { source: "test" }),
+							disableModelInvocation: true,
+							kind: "python" as const,
+							python: {
+								importName: "agent_message",
+								packagePath: tempDir,
+								pyprojectPath: join(tempDir, "pyproject.toml"),
+							},
+						},
+					],
+					diagnostics: [],
+				}),
 			},
 		});
 		services.modelRegistry.registerProvider(faux.getModel().provider, {
@@ -88,6 +107,13 @@ describe("createAgentSessionFromServices", () => {
 				current: { activeSessionId: "current" },
 				agents: [{ activeSessionId: "worker" }],
 			});
+			expect(
+				(
+					session as unknown as {
+						_createKernelHostHandlers(): Record<string, unknown>;
+					}
+				)._createKernelHostHandlers(),
+			).not.toHaveProperty("agent_message.send");
 		} finally {
 			session.dispose();
 		}
@@ -121,6 +147,12 @@ describe("createAgentSessionFromServices", () => {
 			)
 				._modelVisibleSkills()
 				.map((skill) => skill.name);
+		const kernelHostHandlers = (session: unknown) =>
+			(
+				session as {
+					_createKernelHostHandlers(): Record<string, unknown>;
+				}
+			)._createKernelHostHandlers();
 
 		const withoutControllers = await createSession({
 			services,
@@ -182,6 +214,27 @@ describe("createAgentSessionFromServices", () => {
 			expect(visibleSkillNames(withControllers)).not.toContain(AGENT_MESSAGE_SKILL_NAME);
 		} finally {
 			withControllers.dispose();
+		}
+
+		const agentMessageController: AgentSessionMessageController = {
+			listAgents: () => ({
+				current: { activeSessionId: "current", sessionId: "session-current" },
+				agents: [],
+			}),
+			sendAgentMessage: async () => {
+				throw new Error("not used");
+			},
+		};
+		const withMessageController = await createSession({
+			services,
+			sessionManager: SessionManager.create(tempDir, join(tempDir, "sessions-with-message")),
+			agentMessageController,
+		});
+		try {
+			expect(visibleSkillNames(withMessageController)).toContain(AGENT_MESSAGE_SKILL_NAME);
+			expect(kernelHostHandlers(withMessageController)).toHaveProperty("agent_message.send");
+		} finally {
+			withMessageController.dispose();
 		}
 	});
 });

@@ -119,6 +119,33 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.session.isRetrying).toBe(false);
 	});
 
+	it("accepted agent message prompts keep retry state queued after returning", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 40 } } });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" }),
+			fauxAssistantMessage("recovered"),
+		]);
+		const sawRetryStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "auto_retry_start") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+
+		await harness.session.acceptAgentMessagePrompt("agent-to-agent payload", { expandPromptTemplates: false });
+		await sawRetryStart;
+
+		expect(harness.session.isRetrying).toBe(true);
+		expect(harness.session.hasAcceptedPromptInFlight).toBe(true);
+		await expect(
+			harness.session.prompt("second", { queueIfBusy: true, streamingBehavior: "followUp" }),
+		).resolves.toBeUndefined();
+		expect(harness.session.pendingMessageCount).toBe(1);
+	});
+
 	it("does not retry when retry is disabled", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: false } } });
 		harnesses.push(harness);

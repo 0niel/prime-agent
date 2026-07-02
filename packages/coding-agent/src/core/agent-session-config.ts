@@ -76,21 +76,39 @@ function cloneAgentSessionRuntimeConfig(config: AgentSessionRuntimeConfig): Agen
 		skills: cloneArray(config.skills),
 		promptTemplates: cloneArray(config.promptTemplates),
 		themes: cloneArray(config.themes),
-		autonomous: config.autonomous ? { ...config.autonomous } : undefined,
+		autonomous: mergeAutonomousConfig(undefined, config.autonomous),
 		extensionFlagValues: config.extensionFlagValues ? { ...config.extensionFlagValues } : undefined,
 	};
 }
 
-function mergeAutonomousConfig(
+export function mergeAutonomousConfig(
 	base: AgentAutonomousConfig | undefined,
 	override: AgentAutonomousConfig | undefined,
 ): AgentAutonomousConfig | undefined {
 	if (!base && !override) {
 		return undefined;
 	}
+	const gates = mergeAutonomousGateConfig(base?.gates, override?.gates);
 	return {
 		...(base ?? {}),
 		...(override ?? {}),
+		...(gates ? { gates } : {}),
+	};
+}
+
+function mergeAutonomousGateConfig(
+	base: AgentAutonomousConfig["gates"] | undefined,
+	override: AgentAutonomousConfig["gates"] | undefined,
+): AgentAutonomousConfig["gates"] | undefined {
+	if (!base && !override) {
+		return undefined;
+	}
+	return {
+		...(base ?? {}),
+		...(override ?? {}),
+		...(override?.commands !== undefined || base?.commands !== undefined
+			? { commands: cloneArray(override?.commands ?? base?.commands) }
+			: {}),
 	};
 }
 

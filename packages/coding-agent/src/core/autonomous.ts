@@ -213,6 +213,9 @@ export function shouldAutonomouslyContinue(
 		if (gateResult === "passed") {
 			return { shouldContinue: false, reason: "not_needed" };
 		}
+		if (gateResult === "retry_exhausted") {
+			return { shouldContinue: false, reason: "limit_reached" };
+		}
 		return { shouldContinue: true, reason: "gate_failed" };
 	}
 	return { shouldContinue: true, reason: "missing_terminal_evidence" };
@@ -270,6 +273,7 @@ function runAutonomousQualityGates(state: AutonomousRuntimeState, cwd: string | 
 			timeout: state.gates.timeoutMs,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
+		const postRunSnapshot = captureGitWorktreeSnapshot(cwd);
 		if (result.status === 0 && !result.error) {
 			state.gateAttempts[command] = 0;
 			if (state.lastGateFailure?.command === command) {
@@ -289,7 +293,7 @@ function runAutonomousQualityGates(state: AutonomousRuntimeState, cwd: string | 
 			exitText,
 			output: truncateGateOutput([result.stdout, result.stderr].filter(Boolean).join("\n").trim()),
 		};
-		state.lastGateFailureSnapshot = currentSnapshot;
+		state.lastGateFailureSnapshot = postRunSnapshot;
 		return attempt > state.gates.maxRetries ? "retry_exhausted" : "failed";
 	}
 	state.lastGateFailure = undefined;

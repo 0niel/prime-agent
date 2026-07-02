@@ -5,10 +5,14 @@ harness features. It is intentionally artifact-oriented so later benchmark runs
 can replay the same surfaces.
 
 Current design note: refined prompt notes, memories, skills, subagent specs, and
-refinement events are global by default under the agent harness directory, for
-example `~/.prime/agent/harness/harness_state.json`. Session JSONL entries still
+refinement events are session-local by default under the session harness
+directory (`RLM_HARNESS_STATE_DIR`, falling back to `RLM_SESSION_DIR/harness`);
+explicitly global refinement writes the global agent harness directory
+(`RLM_GLOBAL_HARNESS_STATE_DIR`, for example
+`~/.prime/agent/harness/harness_state.json`). Session JSONL entries still
 record refinement results for auditability and rollback evidence. A compact
-overview of the global harness state is injected into the default system prompt
+overview of the merged global and local harness state is injected into the
+default system prompt
 so the agent can use learned state without first calling `rlm.harness.overview()`.
 The model-facing `rlm.harness` API uses explicit `create_*`, `update_*`, and
 `delete_*` calls for memory, skill, subagent, and prompt-note entries.
@@ -204,3 +208,10 @@ Covered validation and recovery cases:
 - Python runtime default backing store through `RLM_HARNESS_STATE_DIR`.
 - Python runtime unknown-kind rejection for `upsert`, `get`, `delete`, and
   `list`.
+
+## 2026-07-01 correction
+
+When the entries above were recorded, `RLM_HARNESS_STATE_DIR` pointed at the
+global harness directory. Since local-by-default refinement landed, the global
+directory is `RLM_GLOBAL_HARNESS_STATE_DIR` and `RLM_HARNESS_STATE_DIR` is the
+session-local store (falling back to `RLM_SESSION_DIR/harness`).

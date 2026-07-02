@@ -65,10 +65,10 @@ export interface HarnessOptions {
 	resourceLoader?: ResourceLoader;
 	extensionFactories?: Array<ExtensionFactory | CreateTestExtensionsResultInput>;
 	withConfiguredAuth?: boolean;
-	autonomous?: AgentAutonomousConfig;
 	agentObserveController?: AgentObserveController;
 	persistSession?: boolean;
 	rlmDepth?: number;
+	autonomous?: AgentAutonomousConfig;
 	autoRefineReviewer?: AutoRefineReviewer;
 }
 
@@ -184,8 +184,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		agentObserveController: options.agentObserveController,
 		baseToolsOverride: toolMap,
 		extensionRunnerRef,
-		autonomous: options.autonomous,
 		rlmDepth: options.rlmDepth,
+		autonomous: options.autonomous,
 		autoRefineReviewer: options.autoRefineReviewer,
 	});
 

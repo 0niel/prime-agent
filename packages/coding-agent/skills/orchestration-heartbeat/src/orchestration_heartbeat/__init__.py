@@ -24,14 +24,23 @@ def _first_value(agent: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def _safe_field(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    sanitized = "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in text)
+    sanitized = " ".join(sanitized.split())
+    return sanitized or None
+
+
 def _session_label(agent: dict[str, Any]) -> str:
-    name = _first_value(agent, "sessionName", "name")
-    session_id = _first_value(agent, "sessionId", "session_id")
-    active_session_id = _first_value(agent, "activeSessionId", "active_session_id")
-    cwd = agent.get("cwd")
-    status = agent.get("status")
-    streaming = _first_value(agent, "isStreaming", "streaming")
-    pending = _first_value(agent, "pendingMessageCount", "pending_message_count")
+    name = _safe_field(_first_value(agent, "sessionName", "name"))
+    session_id = _safe_field(_first_value(agent, "sessionId", "session_id"))
+    active_session_id = _safe_field(_first_value(agent, "activeSessionId", "active_session_id"))
+    cwd = _safe_field(agent.get("cwd"))
+    status = _safe_field(agent.get("status"))
+    streaming = _safe_field(_first_value(agent, "isStreaming", "streaming"))
+    pending = _safe_field(_first_value(agent, "pendingMessageCount", "pending_message_count"))
     parts = [
         f"name={name}" if name else None,
         f"session_id={session_id}" if session_id else None,
@@ -50,19 +59,42 @@ def _format_sessions(agents: list[dict[str, Any]]) -> str:
     return "\n".join(_session_label(agent) for agent in agents)
 
 
+def _same_session(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    for keys in (
+        ("activeSessionId", "active_session_id"),
+        ("sessionId", "session_id"),
+    ):
+        left_value = _first_value(left, *keys)
+        right_value = _first_value(right, *keys)
+        if left_value is not None and right_value is not None and left_value == right_value:
+            return True
+    return False
+
+
+def _other_agents(roster: dict[str, Any]) -> list[dict[str, Any]]:
+    agents = roster.get("agents", [])
+    if not isinstance(agents, list):
+        return []
+    current = roster.get("current")
+    if not isinstance(current, dict):
+        return agents
+    return [agent for agent in agents if not _same_session(agent, current)]
+
+
+def _normalize_interval_expression(value: str) -> str:
+    normalized = " ".join(value.strip().lower().split())
+    if normalized.startswith("every "):
+        return normalized[6:].strip()
+    return normalized
+
+
 def _interval_matches_schedule(interval: str, schedule: Any) -> bool:
     if not isinstance(schedule, dict):
         return False
     expression = schedule.get("expression")
     if not isinstance(expression, str):
         return False
-    normalized_interval = " ".join(interval.strip().lower().split())
-    normalized_expression = " ".join(expression.strip().lower().split())
-    if normalized_expression == normalized_interval:
-        return True
-    if not normalized_interval.startswith("every "):
-        return normalized_expression == f"every {normalized_interval}"
-    return False
+    return _normalize_interval_expression(expression) == _normalize_interval_expression(interval)
 
 
 def build_instruction(
@@ -120,9 +152,7 @@ async def initialize(
         raise TypeError(f"label must be str, got {type(label).__name__}")
 
     roster = await agent_observe.list_agents()
-    agents = roster.get("agents", [])
-    if not isinstance(agents, list):
-        agents = []
+    agents = _other_agents(roster)
     instruction = build_instruction(
         sessions=agents,
         focus=focus,
@@ -135,12 +165,19 @@ async def initialize(
                 "instruction": instruction,
                 "label": label,
             }
+            if heartbeat.get("status") == "paused":
+                update_args["status"] = "resume"
             if not _interval_matches_schedule(interval, heartbeat.get("schedule")):
                 update_args["interval"] = interval
             updated = await rlm_heartbeat.update(heartbeat["id"], **update_args)
+            updated_heartbeat = updated.get("heartbeat")
+            if updated_heartbeat is None:
+                raise RuntimeError(
+                    f"RLM heartbeat {heartbeat['id']} disappeared before it could be updated"
+                )
             return {
                 "action": "updated",
-                "heartbeat": updated.get("heartbeat"),
+                "heartbeat": updated_heartbeat,
                 "sessions": agents,
                 "instruction": instruction,
             }

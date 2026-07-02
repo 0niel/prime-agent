@@ -937,6 +937,14 @@ describe("harness refinement", () => {
 		expect(completeSimpleMock.mock.calls[0][1]).toMatchObject({
 			systemPrompt: expect.stringContaining("A caller may explicitly request global refinement"),
 		});
+		expect(completeSimpleMock.mock.calls[0][1]).toMatchObject({
+			systemPrompt: expect.stringContaining("Always use the bare id (no prefix) in edits"),
+		});
+		expect(completeSimpleMock.mock.calls[0][1]).toMatchObject({
+			systemPrompt: expect.stringContaining(
+				"During a local refinement, global entries are read-only context: never propose update or delete edits for them",
+			),
+		});
 		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({
 			maxTokens: 4096,
 			apiKey: "api-key",
@@ -1184,6 +1192,7 @@ describe("global refinement history", () => {
 		expect(plan.id).toMatch(/^refine_/);
 		const userPrompt = completeSimpleMock.mock.calls[0][1].messages[0].content[0].text;
 		expect(userPrompt).toContain("Requested refinement scope: local");
+		expect(userPrompt).toContain("Global entries in the overview are read-only context");
 		expect(state.entries.memory.planned_memory).toBeUndefined();
 		expect(state.refinements).toHaveLength(0);
 

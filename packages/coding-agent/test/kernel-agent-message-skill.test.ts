@@ -67,7 +67,8 @@ describe("agent-message skill over the kernel host bridge", () => {
 						target: { activeSessionId: payload.target, sessionId: "session-beta" },
 						from: { activeSessionId: "alpha", sessionId: "session-alpha" },
 						message: payload.message,
-						deliveredAt: "2026-06-16T00:00:00.000Z",
+						deliveryStatus: "queued",
+						queuedAt: "2026-06-16T00:00:00.000Z",
 						deliveryMode: payload.mode,
 					};
 				},
@@ -89,6 +90,7 @@ print(json.dumps({"agents": agents, "receipt": receipt}, sort_keys=True))
 			id: "agentmsg-test",
 			source: "agent_message",
 			message: "hello beta",
+			deliveryStatus: "queued",
 			deliveryMode: "follow_up",
 		});
 		expect(requests[0]).toMatchObject({ type: "agent_message.list", payload: { type: "agent_message.list" } });

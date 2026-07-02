@@ -1,4 +1,4 @@
-import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import {
 	createAgentObserveMessagePreview,
@@ -37,6 +37,17 @@ describe("agent observe helpers", () => {
 		expect(preview.text).toBe("[tool_call:bash]");
 		expect(preview.toolCalls).toEqual(["bash"]);
 		expect(preview.text).not.toContain("secret");
+	});
+
+	it("includes assistant thinking text in previews", () => {
+		const preview = createAgentObserveMessagePreview(
+			fauxAssistantMessage(fauxThinking("working through the plan")),
+			1,
+			200,
+		);
+
+		expect(preview.text).toBe("working through the plan");
+		expect(preview.truncated).toBe(false);
 	});
 
 	it("validates bounds", () => {

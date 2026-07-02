@@ -177,6 +177,9 @@ function contentText(content: unknown): string {
 			if (block.type === "text" && "text" in block && typeof block.text === "string") {
 				return block.text;
 			}
+			if (block.type === "thinking" && "thinking" in block && typeof block.thinking === "string") {
+				return block.thinking;
+			}
 			if (block.type === "image") {
 				return "[image]";
 			}

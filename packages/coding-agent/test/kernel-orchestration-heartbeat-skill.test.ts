@@ -34,20 +34,26 @@ describe("orchestration heartbeat skill over bundled host bridges", () => {
 	it("creates then refreshes a labeled RLM heartbeat from active session observations", async () => {
 		const requests: Array<{ type: string; payload: Record<string, unknown> }> = [];
 		let hasHeartbeat = false;
+		let missingOnce = false;
 		let scheduleExpression = "every 5m";
 
 		provisioner = new IpythonKernelProvisioner(tempDir, {
-			pythonSkills: [
-				bundledPythonSkill("agent-observe", "agent_observe"),
-				bundledPythonSkill("rlm-heartbeat", "rlm_heartbeat"),
-				bundledPythonSkill("orchestration-heartbeat", "orchestration_heartbeat"),
-			],
+			pythonSkills: [bundledPythonSkill("orchestration-heartbeat", "orchestration_heartbeat")],
 			hostHandlers: {
 				"agent_observe.list": async (payload) => {
 					requests.push({ type: "agent_observe.list", payload });
 					return {
-						current: { sessionName: "orch" },
+						current: { sessionName: "orch", sessionId: "sess-orch", activeSessionId: "active-orch" },
 						agents: [
+							{
+								sessionName: "orch",
+								sessionId: "sess-orch",
+								activeSessionId: "active-orch",
+								cwd: "/repo/orch",
+								status: "idle",
+								isStreaming: false,
+								pendingMessageCount: 0,
+							},
 							{
 								sessionName: "autoenv",
 								sessionId: "sess-autoenv",
@@ -81,6 +87,27 @@ describe("orchestration heartbeat skill over bundled host bridges", () => {
 										instruction: "old instruction",
 										schedule: { kind: "interval", expression: scheduleExpression },
 									},
+									{
+										id: "job-missing",
+										status: "active",
+										label: "missing-on-update",
+										instruction: "old instruction",
+										schedule: { kind: "interval", expression: scheduleExpression },
+									},
+									{
+										id: "job-paused",
+										status: "paused",
+										label: "paused-orchestrator",
+										instruction: "old instruction",
+										schedule: { kind: "interval", expression: scheduleExpression },
+									},
+									{
+										id: "job-plain",
+										status: "active",
+										label: "plain-schedule",
+										instruction: "old instruction",
+										schedule: { kind: "interval", expression: "10m" },
+									},
 								]
 							: [],
 					};
@@ -103,6 +130,10 @@ describe("orchestration heartbeat skill over bundled host bridges", () => {
 				},
 				"rlm_heartbeat.update": async (payload) => {
 					requests.push({ type: "rlm_heartbeat.update", payload });
+					if (payload.label === "missing-on-update" && !missingOnce) {
+						missingOnce = true;
+						return { heartbeat: null };
+					}
 					if (payload.interval) {
 						scheduleExpression = String(payload.interval).startsWith("every ")
 							? String(payload.interval)
@@ -126,11 +157,20 @@ describe("orchestration heartbeat skill over bundled host bridges", () => {
 import json
 created = await orchestration_heartbeat.initialize(focus="keep long-running sessions moving")
 updated = await orchestration_heartbeat.initialize(interval="10m")
+try:
+    await orchestration_heartbeat.initialize(interval="10m", label="missing-on-update")
+except RuntimeError as error:
+    missing_once_error = str(error)
+paused = await orchestration_heartbeat.initialize(interval="10m", label="paused-orchestrator")
 refreshed = await orchestration_heartbeat.initialize(interval="10m")
+plain = await orchestration_heartbeat.initialize(interval="every 10m", label="plain-schedule")
 print(json.dumps({
     "created_action": created["action"],
     "updated_action": updated["action"],
+    "missing_once_error": missing_once_error,
+    "paused_action": paused["action"],
     "refreshed_action": refreshed["action"],
+    "plain_action": plain["action"],
     "created_label": created["heartbeat"]["label"],
     "updated_label": updated["heartbeat"]["label"],
     "session_names": [agent.get("sessionName") for agent in updated["sessions"]],
@@ -143,14 +183,18 @@ print(json.dumps({
 		expect(output).toMatchObject({
 			created_action: "created",
 			updated_action: "updated",
+			paused_action: "updated",
 			refreshed_action: "updated",
+			plain_action: "updated",
 			created_label: "orchestrator",
 			updated_label: "orchestrator",
 			session_names: ["autoenv", "emulatorBench"],
 		});
+		expect(output.missing_once_error).toContain("RLM heartbeat job-missing disappeared");
 		expect(output.instruction).toContain("Use agent_observe to inspect active Prime Agent sessions");
 		expect(output.instruction).toContain("recommend the exact action and draft the target message");
 		expect(output.instruction).toContain("Do not send cross-session messages until the user approves");
+		expect(output.instruction).not.toContain("name=orch");
 		expect(output.instruction).toContain("name=autoenv");
 		expect(output.instruction).toContain("session_id=sess-autoenv");
 		expect(output.instruction).toContain("active_session_id=active-autoenv");
@@ -160,6 +204,15 @@ print(json.dumps({
 			"agent_observe.list",
 			"rlm_heartbeat.list",
 			"rlm_heartbeat.create",
+			"agent_observe.list",
+			"rlm_heartbeat.list",
+			"rlm_heartbeat.update",
+			"agent_observe.list",
+			"rlm_heartbeat.list",
+			"rlm_heartbeat.update",
+			"agent_observe.list",
+			"rlm_heartbeat.list",
+			"rlm_heartbeat.update",
 			"agent_observe.list",
 			"rlm_heartbeat.list",
 			"rlm_heartbeat.update",
@@ -181,10 +234,27 @@ print(json.dumps({
 		expect(requests[5].payload).not.toHaveProperty("status");
 		expect(requests[8].payload).toMatchObject({
 			type: "rlm_heartbeat.update",
+			id: "job-missing",
+			label: "missing-on-update",
+		});
+		expect(requests[11].payload).toMatchObject({
+			type: "rlm_heartbeat.update",
+			id: "job-paused",
+			label: "paused-orchestrator",
+			status: "resume",
+		});
+		expect(requests[14].payload).toMatchObject({
+			type: "rlm_heartbeat.update",
 			id: "job-orch",
 			label: "orchestrator",
 		});
-		expect(requests[8].payload).not.toHaveProperty("interval");
-		expect(requests[8].payload).not.toHaveProperty("status");
+		expect(requests[14].payload).not.toHaveProperty("interval");
+		expect(requests[14].payload).not.toHaveProperty("status");
+		expect(requests[17].payload).toMatchObject({
+			type: "rlm_heartbeat.update",
+			id: "job-plain",
+			label: "plain-schedule",
+		});
+		expect(requests[17].payload).not.toHaveProperty("interval");
 	});
 });

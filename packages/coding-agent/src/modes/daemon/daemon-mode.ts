@@ -12,6 +12,7 @@ import { appendRotatingLog, getCronJobsPath, getDaemonLogPath, VERSION } from ".
 import {
 	AGENT_MESSAGE_SOURCE,
 	type AgentSessionMessageAgentSummary,
+	type AgentSessionMessageDeliveryStatus,
 	type AgentSessionMessageEndpoint,
 	type AgentSessionMessageListResult,
 	type AgentSessionMessagePayload,
@@ -27,6 +28,7 @@ import {
 	DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY,
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS,
+	isAgentSessionMessagePrompt,
 	normalizeAgentSessionMessage,
 	resolveAgentSessionMessageStreamingBehavior,
 } from "../../core/agent-messages.js";
@@ -41,6 +43,7 @@ import {
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
 } from "../../core/agent-observe.js";
+import type { PromptOptions } from "../../core/agent-session.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
 	AgentSessionRuntime,
@@ -227,6 +230,13 @@ export class AgentDaemon {
 	private readonly agentMessageRateLimiter = new AgentSessionMessageRateLimiter();
 	private readonly agentMessagePendingReservations = new Map<string, number>();
 	private readonly agentMessageTargetLocks = new Map<string, Promise<void>>();
+	private readonly agentMessageAcceptingTargets = new Set<string>();
+	// Refcount of prompts in preflight (accepted but not yet streaming); >0 makes
+	// concurrent agent messages queue instead of racing agent.prompt.
+	private readonly agentMessagePreparingTargets = new Map<string, number>();
+	// Sessions inserted into `sessions` but still awaiting extension binding;
+	// visible to host controllers during bind, excluded from targeting.
+	private readonly bindingSessions = new Set<string>();
 	private agentMessagesPaused = false;
 	private readonly summarizer = new DaemonSessionSummarizer(
 		() => [...this.sessions.values()],
@@ -334,7 +344,11 @@ export class AgentDaemon {
 		cleanupDaemonSocketPath(this.socketPath);
 	}
 
-	private async addRuntime(runtime: AgentSessionRuntime, name?: string): Promise<ActiveSessionState> {
+	private async addRuntime(
+		runtime: AgentSessionRuntime,
+		name?: string,
+		onStateCreated?: (state: ActiveSessionState) => void,
+	): Promise<ActiveSessionState> {
 		const state: ActiveSessionState = {
 			activeSessionId: createActiveSessionId(this.sessions),
 			runtime,
@@ -342,6 +356,12 @@ export class AgentDaemon {
 			extensionUiRequests: new Map(),
 			lastEventSequence: 0,
 		};
+		if (name) {
+			state.runtime.session.setSessionName(name);
+		}
+		this.sessions.set(state.activeSessionId, state);
+		this.bindingSessions.add(state.activeSessionId);
+		onStateCreated?.(state);
 		try {
 			await bindActiveSessionState(state, {
 				broadcast: (targetSessionState, message) => this.broadcastToSession(targetSessionState, message),
@@ -352,13 +372,22 @@ export class AgentDaemon {
 			});
 		} catch (error) {
 			state.unsubscribe?.();
+			this.sessions.delete(state.activeSessionId);
 			await runtime.dispose().catch(() => undefined);
 			throw error;
+		} finally {
+			this.bindingSessions.delete(state.activeSessionId);
 		}
-		this.sessions.set(state.activeSessionId, state);
 		this.rebindCronJobsToState(state);
-		if (name) {
-			state.runtime.session.setSessionName(name);
+		if (runtime.metadata.kind !== "subagent") {
+			// Mark the session as daemon-resident so a restarted daemon can
+			// restore it. Closes for kill/completed/replaced flip this back to
+			// sleep; clean shutdowns leave it in place on purpose.
+			try {
+				runtime.session.sessionManager.appendSessionState({ status: "active" });
+			} catch {
+				// Marking is best-effort; the session still works unrestored.
+			}
 		}
 		// Restore the last persisted status so it shows before the first sweep.
 		this.summarizer.seed(state);
@@ -462,9 +491,9 @@ export class AgentDaemon {
 					agentObserveController: this.createAgentObserveController(() => stateRef),
 				},
 			});
-			const state = await this.addRuntime(runtime, command.name);
-			stateRef = state;
-			return state;
+			return this.addRuntime(runtime, command.name, (state) => {
+				stateRef = state;
+			});
 		};
 
 		const sessionFile = sessionManager.getSessionFile();
@@ -495,23 +524,76 @@ export class AgentDaemon {
 	private async runCronJob(job: AgentCronJob): Promise<"skipped" | undefined> {
 		const state = await this.getOrCreateCronJobSession(job);
 		if (!state) {
-			return;
-		}
-		if (shouldDeferHeartbeatCronJob(job, state.runtime.session)) {
 			return "skipped";
 		}
-		if (
-			!isHeartbeatCronJob(job) &&
-			(state.runtime.session.isStreaming || state.runtime.session.pendingMessageCount > 0)
-		) {
-			await state.runtime.session.followUp(job.prompt);
+		const session = state.runtime.session;
+		const isAgentMessagePromptInProgress =
+			this.agentMessageAcceptingTargets.has(state.activeSessionId) ||
+			this.agentMessagePreparingTargets.has(state.activeSessionId);
+		if (isHeartbeatCronJob(job) && isAgentMessagePromptInProgress) {
+			return "skipped";
+		}
+		if (shouldDeferHeartbeatCronJob(job, session)) {
+			return "skipped";
+		}
+		const shouldQueueCronPrompt =
+			isAgentMessagePromptInProgress ||
+			session.isStreaming ||
+			session.isCompacting ||
+			session.isRetrying ||
+			session.isBashRunning ||
+			session.hasAcceptedPromptInFlight ||
+			session.pendingMessageCount > 0;
+		if (!isHeartbeatCronJob(job) && shouldQueueCronPrompt) {
+			await session.followUp(job.prompt);
 			return;
 		}
-		await state.runtime.session.prompt(job.prompt, {
+		await this.promptWithAgentMessagePreparingGuard(state, job.prompt, {
 			streamingBehavior: "followUp",
 			followUpQueueKey: isHeartbeatCronJob(job) ? `heartbeat:${job.id}` : undefined,
 			source: "rpc",
 		});
+	}
+
+	// Wraps session.prompt so the target counts as "preparing" until the turn
+	// starts streaming (or the prompt settles); concurrent agent messages queue
+	// instead of racing agent.prompt during the preflight awaits. Refcounted so
+	// overlapping prompts each hold their own registration.
+	private async promptWithAgentMessagePreparingGuard(
+		state: ActiveSessionState,
+		message: string,
+		options?: PromptOptions,
+	): Promise<void> {
+		const activeSessionId = state.activeSessionId;
+		const session = state.runtime.session;
+		this.agentMessagePreparingTargets.set(
+			activeSessionId,
+			(this.agentMessagePreparingTargets.get(activeSessionId) ?? 0) + 1,
+		);
+		let cleared = false;
+		const clearPreparing = () => {
+			if (cleared) {
+				return;
+			}
+			cleared = true;
+			const next = (this.agentMessagePreparingTargets.get(activeSessionId) ?? 1) - 1;
+			if (next <= 0) {
+				this.agentMessagePreparingTargets.delete(activeSessionId);
+			} else {
+				this.agentMessagePreparingTargets.set(activeSessionId, next);
+			}
+		};
+		try {
+			await this.agentMessageTargetLocks.get(activeSessionId)?.catch(() => undefined);
+			await session.prompt(message, {
+				...options,
+				preflightResult: (didSucceed) => {
+					options?.preflightResult?.(didSucceed);
+				},
+			});
+		} finally {
+			clearPreparing();
+		}
 	}
 
 	private createCronJobForState(state: ActiveSessionState, schedule: string, prompt: string): AgentCronJob {
@@ -662,11 +744,16 @@ export class AgentDaemon {
 
 	private async getOrCreateCronJobSession(job: AgentCronJob): Promise<ActiveSessionState | undefined> {
 		const current = this.sessions.get(job.activeSessionId) ?? this.findSessionBySessionFile(job.sessionFile);
-		if (current) {
+		// A half-bound match falls through to createRuntime, which awaits the
+		// pending create for the same session file instead of prompting mid-bind.
+		if (current && !this.bindingSessions.has(current.activeSessionId)) {
 			this.rebindCronJobsToState(current);
 			return current;
 		}
 		if (job.source === "rlm_heartbeat" && job.runtimeKind === "subagent") {
+			if (current && this.bindingSessions.has(current.activeSessionId)) {
+				return undefined;
+			}
 			this.cronStore.cancel(job.id);
 			this.cronScheduler.wake();
 			return undefined;
@@ -690,6 +777,16 @@ export class AgentDaemon {
 
 	private getSessionState(id: string): ActiveSessionState {
 		return resolveActiveSessionState(this.sessions, id);
+	}
+
+	// A bind failure disposes the runtime, so half-bound sessions must not be
+	// targetable by attach, agent messages, or observe.
+	private getBoundSessionState(id: string): ActiveSessionState {
+		const state = this.getSessionState(id);
+		if (this.bindingSessions.has(state.activeSessionId)) {
+			throw new Error(`Active session ${state.activeSessionId} is still initializing`);
+		}
+		return state;
 	}
 
 	private findRuntimeState(runtime: RlmSubagentRuntime): ActiveSessionState | undefined {
@@ -789,27 +886,6 @@ export class AgentDaemon {
 						return this.deleteRlmHeartbeatForState(stateRef, id);
 					},
 				},
-				agentMessageController: {
-					listAgents: () => {
-						if (!stateRef) {
-							throw new Error("Agent message state is not ready for this session yet");
-						}
-						return this.createAgentMessageListResult(stateRef);
-					},
-					sendAgentMessage: (input) => {
-						if (!stateRef) {
-							throw new Error("Agent message state is not ready for this session yet");
-						}
-						return this.sendAgentSessionMessage({
-							targetSelector: input.target,
-							message: input.message,
-							fromState: stateRef,
-							deliveryMode: input.deliveryMode,
-							origin: "agent",
-						});
-					},
-				},
-				agentObserveController: this.createAgentObserveController(() => stateRef),
 				rlmDepth: options.rlmDepth,
 				rlmMaxDepth: options.rlmMaxDepth,
 				rlmSessionDir: options.sessionDir,
@@ -828,8 +904,9 @@ export class AgentDaemon {
 				sessionDir: options.sessionDir,
 			},
 		});
-		const state = await this.addRuntime(runtime);
-		stateRef = state;
+		await this.addRuntime(runtime, undefined, (state) => {
+			stateRef = state;
+		});
 		return runtime;
 	}
 
@@ -851,7 +928,9 @@ export class AgentDaemon {
 	private createAgentObserveListResult(currentState: ActiveSessionState): AgentObserveListResult {
 		return {
 			current: this.createAgentObserveSummary(currentState, currentState),
-			agents: [...this.sessions.values()].map((state) => this.createAgentObserveSummary(state, currentState)),
+			agents: this.listTargetableSessionStates(currentState).map((state) =>
+				this.createAgentObserveSummary(state, currentState),
+			),
 		};
 	}
 
@@ -860,7 +939,7 @@ export class AgentDaemon {
 		target: string,
 	): AgentObserveAgentSnapshot {
 		return {
-			agent: this.createAgentObserveSummary(this.getSessionState(target), currentState),
+			agent: this.createAgentObserveSummary(this.getBoundSessionState(target), currentState),
 		};
 	}
 
@@ -868,7 +947,7 @@ export class AgentDaemon {
 		currentState: ActiveSessionState,
 		input: AgentObserveRecentMessagesInput,
 	): AgentObserveRecentMessagesResult {
-		const targetState = this.getSessionState(input.target);
+		const targetState = this.getBoundSessionState(input.target);
 		const limit = normalizeObserveLimit(input.limit);
 		const maxChars = normalizeObserveMaxChars(input.maxChars);
 		const messages = targetState.runtime.session.messages;
@@ -889,15 +968,31 @@ export class AgentDaemon {
 		currentState: ActiveSessionState,
 	): AgentObserveAgentSummary {
 		const summary = summaryForActiveSession(state);
-		const messages = state.runtime.session.messages;
+		const session = state.runtime.session;
+		const messages = session.messages;
 		const latest = messages.at(-1);
+		const status = session.isStreaming
+			? session.state.pendingToolCalls.size > 0
+				? "tool"
+				: "model"
+			: session.isCompacting
+				? "compacting"
+				: session.isRetrying ||
+						session.isBashRunning ||
+						session.hasAcceptedPromptInFlight ||
+						session.pendingMessageCount > 0 ||
+						session.hasRunningRlmChildren()
+					? "busy"
+					: state.clients.size > 0
+						? "user"
+						: "idle";
 		return {
 			activeSessionId: state.activeSessionId,
 			sessionId: summary.sessionId,
 			...(summary.sessionName ? { sessionName: summary.sessionName } : {}),
 			...(summary.runtimeKind ? { runtimeKind: summary.runtimeKind } : {}),
 			cwd: summary.cwd,
-			status: `${summary.lifecycle}:${summary.activity}`,
+			status,
 			isCurrent: state.activeSessionId === currentState.activeSessionId,
 			isStreaming: summary.isStreaming,
 			isCompacting: summary.isCompacting,
@@ -1043,7 +1138,7 @@ export class AgentDaemon {
 			}
 
 			case "attach": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				if (command.clientId) {
 					client.id = command.clientId;
 				}
@@ -1130,17 +1225,16 @@ export class AgentDaemon {
 					responseSent = true;
 					this.write(client, success(command.id, "prompt"));
 				};
-				void state.runtime.session
-					.prompt(command.message, {
-						images: command.images,
-						streamingBehavior: command.streamingBehavior,
-						source: "rpc",
-						preflightResult: (didSucceed) => {
-							if (didSucceed) {
-								sendSuccessResponse();
-							}
-						},
-					})
+				void this.promptWithAgentMessagePreparingGuard(state, command.message, {
+					images: command.images,
+					streamingBehavior: command.streamingBehavior,
+					source: "rpc",
+					preflightResult: (didSucceed) => {
+						if (didSucceed) {
+							sendSuccessResponse();
+						}
+					},
+				})
 					.then(() => {
 						sendSuccessResponse();
 					})
@@ -1175,6 +1269,7 @@ export class AgentDaemon {
 					message: command.message,
 					fromState,
 					clientId: client.id,
+					senderKey: this.createCliAgentMessageSenderKey(),
 					deliveryMode: command.deliveryMode,
 					origin: "cli",
 				});
@@ -1187,6 +1282,8 @@ export class AgentDaemon {
 
 			case "agent_messages_pause": {
 				this.agentMessagesPaused = true;
+				this.agentMessageRateLimiter.clear();
+				await this.clearQueuedAgentSessionMessagesForAllStates();
 				return success(command.id, "agent_messages_pause", this.getAgentMessageSafetyStatus());
 			}
 
@@ -1197,8 +1294,11 @@ export class AgentDaemon {
 
 			case "agent_messages_clear": {
 				const state = this.getSessionState(command.activeSessionId);
-				this.agentMessageRateLimiter.clearMatching((key) => key.endsWith(`->${state.activeSessionId}`));
-				return success(command.id, "agent_messages_clear", state.runtime.session.clearQueue());
+				const cleared = await this.withAgentMessageTargetLock(state.activeSessionId, async () => {
+					this.agentMessageRateLimiter.clearMatching((key) => key.endsWith(`->${state.activeSessionId}`));
+					return state.runtime.session.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt);
+				});
+				return success(command.id, "agent_messages_clear", cleared);
 			}
 
 			case "abort": {
@@ -1691,7 +1791,8 @@ export class AgentDaemon {
 			...this.createAgentSessionMessageEndpoint(state),
 			cwd: state.runtime.cwd,
 			isStreaming: state.runtime.session.isStreaming,
-			pendingMessageCount: state.runtime.session.pendingMessageCount,
+			pendingMessageCount:
+				state.runtime.session.pendingMessageCount + (state.runtime.session.hasAcceptedPromptInFlight ? 1 : 0),
 			...(metadata.parentActiveSessionId ? { parentActiveSessionId: metadata.parentActiveSessionId } : {}),
 			...(metadata.rlmChildId ? { rlmChildId: metadata.rlmChildId } : {}),
 		};
@@ -1700,8 +1801,17 @@ export class AgentDaemon {
 	private createAgentMessageListResult(current: ActiveSessionState): AgentSessionMessageListResult {
 		return {
 			current: this.createAgentSessionMessageEndpoint(current),
-			agents: [...this.sessions.values()].map((state) => this.createAgentMessageAgentSummary(state)),
+			agents: this.listTargetableSessionStates(current).map((state) => this.createAgentMessageAgentSummary(state)),
 		};
+	}
+
+	// Half-bound sessions are hidden from other sessions' listings; the current
+	// session stays visible to itself (controllers run during its own bind).
+	private listTargetableSessionStates(current: ActiveSessionState): ActiveSessionState[] {
+		return [...this.sessions.values()].filter(
+			(state) =>
+				state.activeSessionId === current.activeSessionId || !this.bindingSessions.has(state.activeSessionId),
+		);
 	}
 
 	private getAgentMessageSafetyStatus() {
@@ -1714,11 +1824,29 @@ export class AgentDaemon {
 		};
 	}
 
+	private createCliAgentMessageSenderKey(): string {
+		return `cli:${this.socketPath}`;
+	}
+
+	private async clearQueuedAgentSessionMessagesForState(state: ActiveSessionState) {
+		return this.withAgentMessageTargetLock(state.activeSessionId, async () =>
+			state.runtime.session.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt),
+		);
+	}
+
+	private async clearQueuedAgentSessionMessagesForAllStates(): Promise<void> {
+		await Promise.all(
+			[...this.sessions.values()].map((state) => this.clearQueuedAgentSessionMessagesForState(state)),
+		);
+	}
+
 	private reserveAgentMessageQueueSlot(targetState: ActiveSessionState): () => void {
 		const activeSessionId = targetState.activeSessionId;
 		const reserved = this.agentMessagePendingReservations.get(activeSessionId) ?? 0;
 		assertAgentMessageQueueCapacity(
-			targetState.runtime.session.pendingMessageCount + reserved,
+			targetState.runtime.session.pendingMessageCount +
+				(targetState.runtime.session.hasAcceptedPromptInFlight ? 1 : 0) +
+				reserved,
 			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 		);
 		this.agentMessagePendingReservations.set(activeSessionId, reserved + 1);
@@ -1761,6 +1889,7 @@ export class AgentDaemon {
 		message: string;
 		fromState?: ActiveSessionState;
 		clientId?: string;
+		senderKey?: string;
 		deliveryMode?: AgentSessionMessagePayload["deliveryMode"];
 		origin: "agent" | "cli";
 	}): Promise<AgentSessionMessageReceipt> {
@@ -1768,13 +1897,14 @@ export class AgentDaemon {
 			throw new Error("Agent messaging is paused");
 		}
 		const targetSelector = assertDirectAgentMessageTarget(options.targetSelector);
-		const targetState = this.getSessionState(targetSelector);
+		const targetState = this.getBoundSessionState(targetSelector);
 		if (options.fromState?.activeSessionId === targetState.activeSessionId) {
 			throw new Error("Agent messaging cannot target the sending session");
 		}
 		const message = normalizeAgentSessionMessage(options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS);
 		const releaseQueueSlot = this.reserveAgentMessageQueueSlot(targetState);
-		const senderKey = options.fromState?.activeSessionId ?? `client:${options.clientId ?? "unknown"}`;
+		const senderKey =
+			options.senderKey ?? options.fromState?.activeSessionId ?? `client:${options.clientId ?? "unknown"}`;
 		const rateLimitKey = `${senderKey}->${targetState.activeSessionId}`;
 		const rateLimit = this.agentMessageRateLimiter.tryConsume(rateLimitKey);
 		if (!rateLimit.ok) {
@@ -1790,23 +1920,94 @@ export class AgentDaemon {
 			deliveryMode: options.deliveryMode ?? "auto",
 		};
 		try {
-			await this.withAgentMessageTargetLock(targetState.activeSessionId, () => {
-				const streamingBehavior = resolveAgentSessionMessageStreamingBehavior(
-					targetState.runtime.session.isStreaming,
-					payload.deliveryMode,
-				);
-				return targetState.runtime.session.prompt(createAgentSessionMessagePrompt(payload), {
-					expandPromptTemplates: false,
-					streamingBehavior,
-					source: "rpc",
-				});
+			const { status } = await this.withAgentMessageTargetLock(targetState.activeSessionId, async () => {
+				if (this.agentMessagesPaused) {
+					throw new Error("Agent messaging is paused");
+				}
+				if (
+					!this.sessions.has(targetState.activeSessionId) ||
+					this.closingSessions.has(targetState.activeSessionId)
+				) {
+					throw new Error("Target session is closing before agent message delivery");
+				}
+				if (targetState.runtime.session.sessionId !== payload.target.sessionId) {
+					throw new Error("Target session changed before agent message delivery");
+				}
+				return this.acceptAgentSessionMessage(targetState, payload, releaseQueueSlot);
 			});
-			return createAgentSessionMessageReceipt(payload);
+			return createAgentSessionMessageReceipt(payload, status);
 		} catch (error) {
 			this.agentMessageRateLimiter.refund(rateLimitKey);
 			throw error;
 		} finally {
+			// Error-path backstop; success paths release inside acceptAgentSessionMessage.
 			releaseQueueSlot();
+		}
+	}
+
+	private async acceptAgentSessionMessage(
+		targetState: ActiveSessionState,
+		payload: AgentSessionMessagePayload,
+		releaseReservation: () => void,
+	): Promise<{ status: AgentSessionMessageDeliveryStatus }> {
+		const session = targetState.runtime.session;
+		const reserved = this.agentMessagePendingReservations.get(targetState.activeSessionId) ?? 0;
+		const otherReservations = Math.max(0, reserved - 1);
+		assertAgentMessageQueueCapacity(
+			session.pendingMessageCount + (session.hasAcceptedPromptInFlight ? 1 : 0) + otherReservations,
+			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
+		);
+		const shouldQueue =
+			this.agentMessageAcceptingTargets.has(targetState.activeSessionId) ||
+			this.agentMessagePreparingTargets.has(targetState.activeSessionId) ||
+			session.isStreaming ||
+			session.isCompacting ||
+			session.isRetrying ||
+			session.isBashRunning ||
+			session.hasAcceptedPromptInFlight ||
+			session.pendingMessageCount > 0;
+		const streamingBehavior =
+			resolveAgentSessionMessageStreamingBehavior(shouldQueue, payload.deliveryMode) ??
+			(payload.deliveryMode === "steer" ? "steer" : "followUp");
+		const prompt = createAgentSessionMessagePrompt(payload);
+
+		if (shouldQueue) {
+			const didQueue = await session.queueAgentMessagePrompt(prompt, streamingBehavior);
+			if (!didQueue) {
+				throw new Error("Agent message was not queued");
+			}
+			// The queued message now counts in pendingMessageCount.
+			releaseReservation();
+			// Do not await delivery: a queued message delivers only when the target's
+			// turn progresses, and the sender is blocked inside its own turn — awaiting
+			// here deadlocks mutual sends between busy sessions.
+			return { status: "queued" };
+		}
+
+		this.agentMessageAcceptingTargets.add(targetState.activeSessionId);
+		let preflightFailed = false;
+		let preflightQueued = false;
+		try {
+			const acceptPrompt =
+				typeof session.acceptAgentMessagePrompt === "function"
+					? session.acceptAgentMessagePrompt.bind(session)
+					: session.prompt.bind(session);
+			await acceptPrompt(prompt, {
+				expandPromptTemplates: false,
+				streamingBehavior,
+				queueIfBusy: true,
+				preflightResult: (didSucceed, didQueue) => {
+					preflightFailed = !didSucceed;
+					preflightQueued = didSucceed && didQueue === true;
+				},
+			});
+			if (preflightFailed) {
+				throw new Error("Agent message was not accepted");
+			}
+			releaseReservation();
+			return { status: preflightQueued ? "queued" : "delivered" };
+		} finally {
+			this.agentMessageAcceptingTargets.delete(targetState.activeSessionId);
 		}
 	}
 

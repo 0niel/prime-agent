@@ -55,9 +55,9 @@ function describeAutonomousLimit(status: AgentAutonomousStatus, reason: Autonomo
 }
 
 function shouldContinuePrintModeAutonomousGates(status: AgentAutonomousStatus): boolean {
-	if (!status.enabled || status.gates.commands.length === 0 || !status.lastGateFailure) return false;
-	if (autonomousLimitReason(status)) return false;
-	return latestGateAttempt(status) <= status.gates.maxRetries;
+	return (
+		status.enabled && status.gates.commands.length > 0 && !!status.lastGateFailure && !autonomousLimitReason(status)
+	);
 }
 
 function buildPrintModeGateContinuation(

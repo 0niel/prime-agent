@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- Added autonomous mode with host-side continuations, configurable limits, and quality gates for evaluator-controlled runs.
+- Added daemon-backed user orchestration with agent-to-agent messaging and read-only observation of active sessions.
+- Added an orchestration heartbeat skill for compact multi-session progress, blocker, and action summaries.
+- Added an opt-in auto-refine review hook that can ask whether `/refine` should run after turn intervals or compaction checkpoints.
+- Changed the default thinking level to `xhigh` for models that support it.
+
 ## [0.2.4] - 2026-07-01
 
 - Changed the agents view to list only sessions the daemon is actively holding, and stopped the daemon from auto-restoring on-disk sessions on startup, so a restarted daemon no longer surfaces a wall of weeks-old sessions; sessions come back via `/resume` or `--resume` ([#295](https://github.com/PrimeIntellect-ai/prime-agent/issues/295)).
@@ -34,8 +40,6 @@
 
 ## [0.2.2] - 2026-06-25
 
-- Changed the default thinking level to `xhigh` for models that support it.
-- Added an opt-in auto-refine review hook that can ask whether `/refine` should run after turn intervals or compaction checkpoints.
 - Added a bundled `websearch` skill (Google search via the Serper API) that loads by default. Add a Serper key via `/login` ("Serper (web search)"); it is stored with your other credentials and supplied to the skill automatically. The skill can be disabled with `bundledSkills.websearch: false` and overridden by a same-named skill in any user, project, package, or `--skill` location ([#86](https://github.com/PrimeIntellect-ai/prime-agent/issues/86)).
 - Added image input support for vision-capable Prime Inference models (Claude, GPT-5.x, Grok, Kimi K2.7 Code, Qwen3-VL), which previously dropped attached images as unsupported ([#261](https://github.com/PrimeIntellect-ai/prime-agent/issues/261)).
 - Added a live subagent tree above the working loader showing each in-flight subagent with a prompt excerpt, tool-use and token counts, and its recap once generated; finished subagents drop out of the tree ([#254](https://github.com/PrimeIntellect-ai/prime-agent/issues/254)).
@@ -56,7 +60,6 @@
 
 ### Added
 
-- Added bundled `agent-observe`, `agent-message`, and `orchestration-heartbeat` skills for daemon-backed session observation, messaging, and orchestrator status reporting.
 - Added `/effort` (alias `/thinking`) to set the reasoning level, with argument autocomplete that lists the levels the current model supports.
 - Added a `/system-prompt` command that shows the exact prompt last sent to the model, labelling it honestly when no turn has run yet.
 - Added a `/rename` alias for `/name` and a `Ctrl+R` shortcut in the Agents View to rename the selected session inline.

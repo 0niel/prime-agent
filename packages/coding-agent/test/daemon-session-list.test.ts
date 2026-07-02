@@ -73,6 +73,21 @@ describe("buildSessionList", () => {
 		expect(entries[0]?.activity).toBe("working");
 	});
 
+	it("counts accepted in-flight agent prompts as pending work", () => {
+		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
+		const summary = summaryForActiveSession(
+			makeState({
+				activeSessionId: "accepted",
+				messages: oneMessage,
+				summaryState: { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"],
+				hasAcceptedPromptInFlight: true,
+			}),
+		);
+
+		expect(summary.pendingMessageCount).toBe(1);
+		expect(summary.activity).toBe("working");
+	});
+
 	it("marks a finished subagent idle instead of holding it at working", () => {
 		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
 		const entries = buildSessionList(
@@ -425,6 +440,7 @@ interface StateOptions {
 	summaryState?: ActiveSessionState["summaryState"];
 	childRunStatuses?: Record<string, "queued" | "running" | "done" | "error" | "cancelled">;
 	hasRunningRlmChildren?: boolean;
+	hasAcceptedPromptInFlight?: boolean;
 	metadata?: {
 		kind: "top-level" | "subagent";
 		createdAt: number;
@@ -468,6 +484,7 @@ function makeState(options: StateOptions): ActiveSessionState {
 				messages: options.messages ?? ([] as AgentMessage[]),
 				getRlmChildRunStatus: (childId: string) => options.childRunStatuses?.[childId],
 				hasRunningRlmChildren: () => options.hasRunningRlmChildren ?? false,
+				hasAcceptedPromptInFlight: options.hasAcceptedPromptInFlight ?? false,
 				getCurrentRecap: () => undefined,
 				pendingMessageCount: 0,
 				state: {

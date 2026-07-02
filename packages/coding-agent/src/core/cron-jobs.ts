@@ -61,7 +61,10 @@ export interface AgentCronSchedulerHooks {
 
 export interface HeartbeatCronSessionActivity {
 	isStreaming: boolean;
+	isCompacting?: boolean;
+	isRetrying?: boolean;
 	isBashRunning: boolean;
+	hasAcceptedPromptInFlight?: boolean;
 	pendingMessageCount: number;
 }
 
@@ -833,7 +836,13 @@ export function isHeartbeatCronJob(job: AgentCronJob): boolean {
 
 export function shouldDeferHeartbeatCronJob(job: AgentCronJob, activity: HeartbeatCronSessionActivity): boolean {
 	return (
-		isHeartbeatCronJob(job) && (activity.isStreaming || activity.isBashRunning || activity.pendingMessageCount > 0)
+		isHeartbeatCronJob(job) &&
+		(activity.isStreaming ||
+			activity.isCompacting === true ||
+			activity.isRetrying === true ||
+			activity.isBashRunning ||
+			activity.hasAcceptedPromptInFlight === true ||
+			activity.pendingMessageCount > 0)
 	);
 }
 

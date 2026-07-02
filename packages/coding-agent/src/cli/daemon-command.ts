@@ -102,7 +102,8 @@ function parseDaemonClientCommand(args: string[]): ParsedDaemonClientCommand {
 			continue;
 		}
 
-		if (arg === "--" && command === "cron") {
+		// send/cron parse "--" themselves as an end-of-flags separator
+		if (arg === "--" && (command === "cron" || command === "send")) {
 			positionals.push(arg);
 			passthrough = true;
 			continue;
@@ -816,17 +817,20 @@ async function runAgentMessages(client: DaemonClient, args: string[], json: bool
 	const subcommand = args[0];
 	switch (subcommand) {
 		case "status":
+			requireNoExtraArgs(args, "daemon agent-messages status");
 			await printResponseData(client, { type: "agent_messages_status" }, json);
 			return;
 		case "pause":
+			requireNoExtraArgs(args, "daemon agent-messages pause");
 			await printResponseData(client, { type: "agent_messages_pause" }, json);
 			return;
 		case "resume":
+			requireNoExtraArgs(args, "daemon agent-messages resume");
 			await printResponseData(client, { type: "agent_messages_resume" }, json);
 			return;
 		case "clear": {
 			const activeSessionId = args[1];
-			if (!activeSessionId) {
+			if (!activeSessionId || args.length !== 2) {
 				throw new Error("Usage: daemon agent-messages clear <session>");
 			}
 			await printResponseData(client, { type: "agent_messages_clear", activeSessionId }, json);
@@ -834,6 +838,12 @@ async function runAgentMessages(client: DaemonClient, args: string[], json: bool
 		}
 		default:
 			throw new Error("Usage: daemon agent-messages <status|pause|resume|clear>");
+	}
+}
+
+function requireNoExtraArgs(args: string[], usage: string): void {
+	if (args.length > 1) {
+		throw new Error(`Usage: ${usage}`);
 	}
 }
 
@@ -853,7 +863,7 @@ async function runSend(client: DaemonClient, args: string[], json: boolean): Pro
 	}
 	if (isAgentMessageReceipt(data)) {
 		const target = data.target.sessionName ?? data.target.activeSessionId;
-		console.log(`Sent to ${target}`);
+		console.log(data.deliveryStatus === "queued" ? `Queued for ${target}` : `Sent to ${target}`);
 		return;
 	}
 	console.log("ok");
@@ -869,11 +879,18 @@ interface ParsedSendArgs {
 function parseSendArgs(args: string[]): ParsedSendArgs {
 	let fromActiveSessionId: string | undefined;
 	let deliveryMode: "auto" | "steer" | "follow_up" | undefined;
-	const positionals: string[] = [];
+	let targetActiveSessionId: string | undefined;
+	let explicitMessage: string | undefined;
+	const messageParts: string[] = [];
+	let parseOptions = true;
 
 	for (let index = 0; index < args.length; index++) {
 		const arg = args[index];
-		if (arg === "--from") {
+		if (parseOptions && arg === "--") {
+			parseOptions = false;
+			continue;
+		}
+		if (parseOptions && arg === "--from") {
 			const value = args[index + 1];
 			if (!value) {
 				throw new Error("--from requires a session id or name");
@@ -882,25 +899,51 @@ function parseSendArgs(args: string[]): ParsedSendArgs {
 			index++;
 			continue;
 		}
-		if (arg === "--steer") {
+		if (parseOptions && arg === "--steer") {
 			deliveryMode = "steer";
 			continue;
 		}
-		if (arg === "--follow-up") {
+		if (parseOptions && arg === "--follow-up") {
 			deliveryMode = "follow_up";
 			continue;
 		}
-		if (arg === "--auto") {
+		if (parseOptions && arg === "--auto") {
 			deliveryMode = "auto";
 			continue;
 		}
-		positionals.push(arg);
+		if (parseOptions && arg === "--message") {
+			if (!targetActiveSessionId) {
+				throw new Error("--message must appear after the target session");
+			}
+			const value = args[index + 1];
+			if (!value) {
+				throw new Error("--message requires message text");
+			}
+			explicitMessage = value;
+			index++;
+			parseOptions = false;
+			continue;
+		}
+		if (parseOptions && arg.startsWith("--")) {
+			throw new Error(`Unknown option for daemon send: ${arg} (use -- before message text starting with --)`);
+		}
+		if (!targetActiveSessionId) {
+			targetActiveSessionId = arg;
+			continue;
+		}
+		messageParts.push(arg);
 	}
 
-	const targetActiveSessionId = positionals[0];
-	const message = positionals.slice(1).join(" ").trim();
+	if (explicitMessage !== undefined && messageParts.length > 0) {
+		throw new Error(
+			"Usage: daemon send [--from <session>] [--steer|--follow-up] <target-session> [--message <message>|<message>]",
+		);
+	}
+	const message = (explicitMessage ?? messageParts.join(" ")).trim();
 	if (!targetActiveSessionId || !message) {
-		throw new Error("Usage: daemon send [--from <session>] [--steer|--follow-up] <target-session> <message>");
+		throw new Error(
+			"Usage: daemon send [--from <session>] [--steer|--follow-up] <target-session> [--message <message>|<message>]",
+		);
 	}
 	return {
 		targetActiveSessionId,
@@ -1556,7 +1599,9 @@ function getCronJob(value: unknown): { id: string; nextRunAt?: string } | undefi
 	return { id: candidate.id, ...(typeof candidate.nextRunAt === "string" ? { nextRunAt: candidate.nextRunAt } : {}) };
 }
 
-function isAgentMessageReceipt(value: unknown): value is { target: { activeSessionId: string; sessionName?: string } } {
+function isAgentMessageReceipt(
+	value: unknown,
+): value is { target: { activeSessionId: string; sessionName?: string }; deliveryStatus?: string } {
 	if (!value || typeof value !== "object") {
 		return false;
 	}
@@ -1606,7 +1651,7 @@ ${chalk.bold("Options:")}
   --cwd <dir>                   Working directory for the created session
   --foreground, --no-detach     Keep daemon attached to this terminal for debugging
   --json                        Print raw JSON for commands with formatted output; attach streams raw protocol JSON
-  send options: --from <session>, --steer, --follow-up
+  send options: --from <session>, --steer, --follow-up, --message <message>
   agent-messages clear only clears one explicitly named session
   Agent options such as --model, --provider, --tools, and --thinking apply to created sessions.
 
@@ -1626,7 +1671,7 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock cron add <session> "*/30 * * * *" -- "Check progress"
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock cron list
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock prompt <session> "Say hello"
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock send --from planner worker "Use this context..."
+  ${APP_NAME} daemon --socket /tmp/prime-agent.sock send --from planner worker --message "Use this context..."
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock attach <session>
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock shutdown
   ${APP_NAME} daemon shutdown --all

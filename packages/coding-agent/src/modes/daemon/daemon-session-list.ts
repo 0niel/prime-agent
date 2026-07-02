@@ -114,8 +114,13 @@ export function buildSessionList(
 	return entries;
 }
 
+function effectivePendingMessageCount(session: ActiveSessionState["runtime"]["session"]): number {
+	return session.pendingMessageCount + (session.hasAcceptedPromptInFlight ? 1 : 0);
+}
+
 export function summaryForActiveSession(activeSession: ActiveSessionState, savedSession?: SessionInfo): SessionSummary {
 	const session = activeSession.runtime.session;
+	const pendingMessageCount = effectivePendingMessageCount(session);
 	const metadata = activeSession.runtime.metadata ?? { kind: "top-level" as const };
 	let modified = savedSession?.modified.toISOString();
 	if (!modified && session.sessionFile) {
@@ -144,7 +149,7 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		isRunningTools: session.isStreaming && session.state.pendingToolCalls.size > 0,
 		attachedClients: activeSession.clients.size,
 		messageCount: session.messages.length,
-		pendingMessageCount: session.pendingMessageCount,
+		pendingMessageCount,
 		streamingMessage: session.state.streamingMessage,
 		created: savedSession?.created.toISOString(),
 		modified,
@@ -266,7 +271,7 @@ function rlmChildSnapshotForActiveSession(
 	const runStatus = metadata.rlmChildId
 		? parent?.runtime.session.getRlmChildRunStatus(metadata.rlmChildId)
 		: undefined;
-	const status = runStatus ?? (session.isStreaming || session.pendingMessageCount > 0 ? "running" : "done");
+	const status = runStatus ?? (session.isStreaming || effectivePendingMessageCount(session) > 0 ? "running" : "done");
 	return {
 		id: metadata.rlmChildId ?? activeSession.activeSessionId,
 		parentId: parentNodeId,
@@ -317,7 +322,10 @@ export function isActiveSessionBusy(activeSession: ActiveSessionState): boolean 
 	const session = activeSession.runtime.session;
 	// Background subagents keep the parent "working" even after its own turn ends.
 	return (
-		session.isStreaming || session.isCompacting || session.pendingMessageCount > 0 || session.hasRunningRlmChildren()
+		session.isStreaming ||
+		session.isCompacting ||
+		effectivePendingMessageCount(session) > 0 ||
+		session.hasRunningRlmChildren()
 	);
 }
 
