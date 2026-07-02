@@ -415,7 +415,16 @@ export function formatHarnessStateForPrompt(
 			[a.path, a.title, a.id].join("\0").localeCompare([b.path, b.title, b.id].join("\0")),
 		);
 		totalEntries += entries.length;
-		lines.push(`${kind}: ${entries.length}`);
+		// Render subagent specs as a task-shaped roster the model can match against — the
+		// analogue of Claude Code's agent-type menu — rather than a bare count. The
+		// invocation hint makes clear each spec is reached through the single `rlm` entrypoint.
+		if (kind === "subagent" && entries.length > 0) {
+			lines.push(
+				`${kind}: ${entries.length} (invoke a spec by turning it into a concise task prompt and calling \`await rlm('<task>')\`)`,
+			);
+		} else {
+			lines.push(`${kind}: ${entries.length}`);
+		}
 		for (const entry of entries.slice(0, maxEntriesPerKind)) {
 			const argumentsText =
 				entry.kind === "skill" && Object.keys(entry.arguments).length > 0

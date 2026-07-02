@@ -2,7 +2,7 @@
  * System prompt construction and project context loading
  */
 
-import { buildRlmPrompt } from "./prompts/index.js";
+import { buildRlmPrompt, buildSubagentGuidance } from "./prompts/index.js";
 import { formatHarnessStateForPrompt, type HarnessState } from "./refinement/index.js";
 import { formatSkillsForPrompt, getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 
@@ -102,6 +102,13 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		activeTools: tools.filter((name) => name === "ipython" || name === "bash" || name === "edit"),
 		allowRecursion,
 	});
+
+	// Appended AFTER the trained buildRlmPrompt prefix, and before the harness-state
+	// menu, so the model reads when/why to delegate and then sees the concrete subagent
+	// specs it can match against — the same ordering as Claude Code's Agent tool.
+	if (allowRecursion ?? true) {
+		prompt += `\n\n${buildSubagentGuidance()}`;
+	}
 
 	if (harnessState) {
 		prompt += `\n\n${formatHarnessStateForPrompt(harnessState)}`;

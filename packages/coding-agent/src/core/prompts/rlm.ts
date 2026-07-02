@@ -87,3 +87,48 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 
 	return parts.join("\n");
 }
+
+/**
+ * Supplemental sub-agent delegation guidance, appended AFTER the trained
+ * `buildRlmPrompt` prefix (see system-prompt.ts). This is intentionally NOT part of
+ * `buildRlmPrompt`'s `parts` array: the text that function emits is frozen as the v1
+ * training prefix and must stay byte-identical. The trained recursion block already
+ * covers the mechanics (`await rlm(...)`, `asyncio.gather`, `asyncio.create_task`);
+ * this block adds the *when* and *why* — the decision guidance the trained prefix
+ * lacks — in the same When -> Why -> (menu) order Claude Code's Agent tool uses. The
+ * subagent-spec "menu" itself renders just after this, inside the harness-state block.
+ */
+export function buildSubagentGuidance(): string {
+	return [
+		"# Delegating to sub-agents",
+		"",
+		"You already have `rlm` in scope. This is about *when* to spawn one — which matters as much as how.",
+		"",
+		"Reach for `await rlm(...)` when:",
+		"- you have independent sub-tasks that can run in parallel — fan them out with `await asyncio.gather(rlm('task1'), rlm('task2'))` rather than working them one after another;",
+		"- a sub-task would mean reading across many files, outputs, or sources you don't need to keep — delegate it and you keep the answer, not the raw material;",
+		"- the sub-task matches one of your saved subagent specs (listed in the harness state below) — turn the spec into a concise task prompt and call `rlm` with it.",
+		"",
+		"Do it inline instead when the step is a single known lookup, edit, or command — there, a sub-agent just adds latency. Once you've delegated a sub-task, await its handle and use the result instead of redoing the work yourself.",
+		"",
+		"For example:",
+		"```python",
+		"# Independent sub-tasks in parallel — each returns just its conclusion, not the files it read",
+		"auth, api = await asyncio.gather(",
+		"    rlm('Summarize how authentication works in this repo: entrypoints, token flow, and key files.'),",
+		"    rlm('Summarize the HTTP API layer: routes, middleware, and error handling.'),",
+		")",
+		"",
+		"# Context isolation — a sub-agent digests a large file and hands back only the answer",
+		"res = await rlm('Read build.log, find the failing step and its root cause, and report it in 3 lines.')",
+		"print(res.answer)",
+		"",
+		"# Background — kick off a slow sub-task, keep working, collect it later",
+		"task = asyncio.create_task(rlm('Run the full test suite and report any failures with root causes.'))",
+		"# ... continue with other work while it runs ...",
+		"failures = (await task).answer",
+		"```",
+		"",
+		"These are illustrations, not a fixed menu: delegate any self-contained sub-task that fits the cases above.",
+	].join("\n");
+}
