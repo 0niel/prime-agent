@@ -199,6 +199,38 @@ describe("runPrintMode", () => {
 		expect(session.prompt.mock.calls[0][0]).toContain("Autonomous quality gate failed (attempt 4/3)");
 	});
 
+	it("stops autonomous gate prompting after an assistant error", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), {
+			enabled: true,
+			continuationsUsed: 1,
+			turnsUsed: 2,
+			tokensUsed: 100,
+			startedAt: Date.now(),
+			limits: { maxContinuations: 10, maxTurns: 20, maxTokens: 100_000, timeoutMs: 60_000 },
+			gates: { commands: ["verify-public"], maxRetries: 3, timeoutMs: 300_000 },
+			gateAttempts: { "verify-public": 1 },
+			lastGateFailure: {
+				command: "verify-public",
+				attempt: 1,
+				exitText: "exited 1",
+				output: "0/9",
+			},
+		});
+		const { session } = runtimeHost;
+		session.prompt.mockImplementation(async () => {
+			session.state.messages = [createAssistantMessage({ stopReason: "error", errorMessage: "provider down" })];
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(1);
+		expect(session.prompt).toHaveBeenCalledTimes(1);
+		expect(errorSpy).toHaveBeenCalledWith("provider down");
+	});
+
 	it("returns non-zero when autonomous gates are still failing", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "still failing" }), {
 			enabled: true,

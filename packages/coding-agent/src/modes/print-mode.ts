@@ -116,6 +116,13 @@ async function waitForPrintModeIdleWithAutonomousGates(
 				streamingBehavior: "followUp",
 			},
 		);
+		const lastMessage = session.state.messages[session.state.messages.length - 1];
+		if (lastMessage?.role === "assistant") {
+			const assistantMessage = lastMessage as AssistantMessage;
+			if (assistantMessage.stopReason === "error" || assistantMessage.stopReason === "aborted") {
+				return;
+			}
+		}
 	}
 }
 
