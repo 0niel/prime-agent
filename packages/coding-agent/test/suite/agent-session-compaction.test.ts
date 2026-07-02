@@ -473,6 +473,48 @@ describe("AgentSession compaction characterization", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 	});
 
+	it("keeps autonomous continuation bookkeeping when only steering queue is drained", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness({
+			autonomous: {
+				enabled: true,
+				maxContinuations: 2,
+				maxTurns: 100,
+				gates: { commands: [failingGateCommand()], maxRetries: 5 },
+			},
+			settings: { compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1 } },
+			models: [{ id: "faux-1", contextWindow: 200_000 }],
+		});
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as {
+			_schedulePostCompactionContinue(): void;
+			_postCompactionContinuationMessages: AgentMessage[];
+		};
+		const steeringMessage = {
+			role: "user",
+			content: [{ type: "text", text: "steer first" }],
+			timestamp: Date.now(),
+		} satisfies AgentMessage;
+		const autonomousMessage = {
+			role: "user",
+			content: [{ type: "text", text: "autonomous follow-up" }],
+			timestamp: Date.now(),
+		} satisfies AgentMessage;
+		sessionInternals._postCompactionContinuationMessages = [autonomousMessage];
+		harness.session.agent.state.messages = [{ ...fauxAssistantMessage("done"), timestamp: Date.now() - 1000 }];
+		harness.session.agent.steer(steeringMessage);
+		harness.session.agent.followUp(autonomousMessage);
+		const continueSpy = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
+		const followUpSpy = vi.spyOn(harness.session.agent, "followUp");
+
+		sessionInternals._schedulePostCompactionContinue();
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(sessionInternals._postCompactionContinuationMessages).toEqual([autonomousMessage]);
+		expect(followUpSpy).toHaveBeenCalledWith(autonomousMessage);
+	});
+
 	it("keeps autonomous threshold continuations when post-compaction continue must retry", async () => {
 		vi.useFakeTimers();
 		const harness = await createHarness({

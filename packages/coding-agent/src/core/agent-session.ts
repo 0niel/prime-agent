@@ -3693,20 +3693,29 @@ export class AgentSession {
 
 		this._postCompactionContinuationScheduled = false;
 		const continuationMessages = [...this._postCompactionContinuationMessages];
-		const continuationMessageSet = new Set(continuationMessages);
 		try {
 			await this.agent.continue();
-			if (continuationMessages.length > 0) {
-				this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
-					(message) => !continuationMessageSet.has(message),
-				);
-			}
+			this._forgetConsumedPostCompactionContinuations(continuationMessages);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			if (message.includes("already processing")) {
 				this._schedulePostCompactionContinue();
 			}
 		}
+	}
+
+	private _forgetConsumedPostCompactionContinuations(continuationMessages: AgentMessage[]): void {
+		if (continuationMessages.length === 0) {
+			return;
+		}
+		const continuationMessageSet = new Set(continuationMessages);
+		const stillQueued = new Set(this.agent.removeQueuedMessages((message) => continuationMessageSet.has(message)));
+		for (const message of stillQueued) {
+			this.agent.followUp(message);
+		}
+		this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
+			(message) => !continuationMessageSet.has(message) || stillQueued.has(message),
+		);
 	}
 
 	private _shouldSkipAutoRefineForActiveAgent(): boolean {
