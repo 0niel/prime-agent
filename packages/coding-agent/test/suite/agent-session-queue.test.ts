@@ -5,6 +5,7 @@ import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHeartbeatContextMessage, HEARTBEAT_CONTEXT_CUSTOM_TYPE } from "../../src/core/heartbeat-context.js";
 import {
 	applyRefinementProposal,
 	getGlobalHarnessStateDir,
@@ -1972,5 +1973,97 @@ describe("AgentSession queue characterization", () => {
 		await expect(harness.session.followUp("/testcmd queued")).rejects.toThrow(
 			'Extension command "/testcmd" cannot be queued. Use prompt() or execute the command when not streaming.',
 		);
+	});
+	describe("heartbeat context queue", () => {
+		it("keeps queued heartbeat contexts out of visible queue previews", async () => {
+			const harness = await createHarness();
+			try {
+				const job = {
+					id: "heartbeat-1",
+					status: "active" as const,
+					source: "heartbeat" as const,
+					activeSessionId: "active-1",
+					sessionId: "session-1",
+					sessionFile: "/tmp/session.jsonl",
+					cwd: "/tmp",
+					prompt: "check progress",
+					schedule: { kind: "interval" as const, expression: "every 5m", intervalMs: 300_000 },
+					createdAt: "2026-01-01T12:00:00.000Z",
+					updatedAt: "2026-01-01T12:00:00.000Z",
+					nextRunAt: "2026-01-01T12:05:00.000Z",
+					runCount: 0,
+				};
+
+				await expect(harness.session.queueHeartbeatContext(job)).resolves.toBe(true);
+
+				expect(harness.session.pendingMessageCount).toBe(1);
+				expect(harness.session.visiblePendingMessageCount).toBe(0);
+				expect(harness.session.getFollowUpMessages()).toEqual([]);
+				expect(harness.eventsOfType("queue_update")).toEqual([]);
+				expect(harness.session.removeQueuedFollowUp("heartbeat:heartbeat-1")).toBe(true);
+				expect(harness.session.pendingMessageCount).toBe(0);
+				expect(harness.eventsOfType("queue_update").at(-1)).toMatchObject({ steering: [], followUp: [] });
+			} finally {
+				harness.cleanup();
+			}
+		});
+
+		it("delivers heartbeat contexts as hidden custom messages", async () => {
+			const harness = await createHarness();
+			try {
+				const job = {
+					id: "heartbeat-1",
+					status: "active" as const,
+					source: "heartbeat" as const,
+					activeSessionId: "active-1",
+					sessionId: "session-1",
+					sessionFile: "/tmp/session.jsonl",
+					cwd: "/tmp",
+					prompt: "check progress",
+					schedule: { kind: "interval" as const, expression: "every 5m", intervalMs: 300_000 },
+					createdAt: "2026-01-01T12:00:00.000Z",
+					updatedAt: "2026-01-01T12:00:00.000Z",
+					nextRunAt: "2026-01-01T12:05:00.000Z",
+					runCount: 0,
+				};
+				harness.setResponses([fauxAssistantMessage("heartbeat handled")]);
+
+				await expect(harness.session.runHeartbeatContext(job)).resolves.toBe(true);
+
+				const customMessages = harness.session.messages.filter((message) => message.role === "custom");
+				expect(customMessages).toHaveLength(1);
+				expect(customMessages[0]).toMatchObject({ customType: HEARTBEAT_CONTEXT_CUSTOM_TYPE, display: false });
+				expect(getMessageText(customMessages[0])).toContain("check progress");
+				expect(getUserTexts(harness)).toEqual([]);
+				expect(getAssistantTexts(harness)).toEqual(["heartbeat handled"]);
+				expect(harness.session.pendingMessageCount).toBe(0);
+			} finally {
+				harness.cleanup();
+			}
+		});
+
+		it("builds heartbeat context messages as hidden custom data", () => {
+			const message = createHeartbeatContextMessage({
+				id: "rlm-1",
+				status: "active",
+				source: "rlm_heartbeat",
+				activeSessionId: "active-1",
+				sessionId: "session-1",
+				sessionFile: "/tmp/session.jsonl",
+				cwd: "/tmp",
+				label: "review",
+				prompt: "inspect CI",
+				schedule: { kind: "interval", expression: "every 5m", intervalMs: 300_000 },
+				createdAt: "2026-01-01T12:00:00.000Z",
+				updatedAt: "2026-01-01T12:00:00.000Z",
+				nextRunAt: "2026-01-01T12:05:00.000Z",
+				runCount: 0,
+			});
+
+			expect(message.customType).toBe(HEARTBEAT_CONTEXT_CUSTOM_TYPE);
+			expect(message.display).toBe(false);
+			expect(message.details).toEqual({ jobId: "rlm-1", source: "rlm_heartbeat", label: "review" });
+			expect(getMessageText(message)).toContain("inspect CI");
+		});
 	});
 });

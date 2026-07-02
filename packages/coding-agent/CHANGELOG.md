@@ -2,9 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
 - Added daemon-backed user orchestration with agent-to-agent messaging and read-only observation of active sessions.
 - Added an orchestration heartbeat skill for compact multi-session progress, blocker, and action summaries.
 - Added an opt-in auto-refine review hook that can ask whether `/refine` should run after turn intervals or compaction checkpoints.
+
+### Changed
+
+- Changed heartbeat cron delivery to use hidden context messages so scheduled heartbeat prompts do not appear in the visible chat queue.
 
 ## [0.2.4] - 2026-07-01
 
