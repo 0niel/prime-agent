@@ -6180,9 +6180,7 @@ export class InteractiveMode {
 		if (!this.modeIndicatorContainer) return;
 		this.modeIndicatorContainer.clear();
 		if (enabled) {
-			const toggle = keyText("app.plan.toggle");
-			const hint = toggle ? theme.fg("dim", ` (${toggle} to toggle)`) : "";
-			this.modeIndicatorContainer.addChild(new Text(`${theme.fg("success", "⏸ plan mode on")}${hint}`, 1, 0));
+			this.modeIndicatorContainer.addChild(new Text(theme.fg("success", "plan mode · edits blocked"), 1, 0));
 		}
 		this.ui.requestRender();
 	}
