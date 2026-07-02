@@ -473,6 +473,88 @@ describe("AgentSession compaction characterization", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 	});
 
+	it("clears queued autonomous threshold continuations when autonomous mode is disabled", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness({
+			autonomous: {
+				enabled: true,
+				maxContinuations: 2,
+				maxTurns: 100,
+				gates: { commands: [failingGateCommand()], maxRetries: 5 },
+			},
+			settings: { compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 1 } },
+			models: [{ id: "faux-1", contextWindow: 200_000 }],
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "auto compacted",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
+		const successfulAssistant = createAssistant(harness, {
+			stopReason: "toolUse",
+			totalTokens: 10_000,
+			timestamp: Date.now(),
+		});
+		const toolResult: ToolResultMessage<unknown> = {
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "large-context",
+			content: [{ type: "text", text: "x".repeat(800_000) }],
+			isError: false,
+			timestamp: Date.now() + 500,
+		};
+		const oldUser = {
+			role: "user",
+			content: [{ type: "text", text: "old" }],
+			timestamp: Date.now() - 3000,
+		} satisfies Parameters<typeof harness.sessionManager.appendMessage>[0];
+		const oldAssistant = createAssistant(harness, {
+			stopReason: "stop",
+			totalTokens: 100,
+			timestamp: Date.now() - 2000,
+		});
+		const currentUser = {
+			role: "user",
+			content: [{ type: "text", text: "hello" }],
+			timestamp: Date.now() - 1000,
+		} satisfies Parameters<typeof harness.sessionManager.appendMessage>[0];
+		for (const message of [oldUser, oldAssistant, currentUser, successfulAssistant]) {
+			harness.sessionManager.appendMessage(message);
+		}
+		harness.session.agent.state.messages = [oldUser, oldAssistant, currentUser, successfulAssistant, toolResult];
+		const continueSpy = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
+
+		await sessionInternals._shouldStopAfterTurn({
+			message: successfulAssistant,
+			toolResults: [toolResult],
+			context: {
+				systemPrompt: harness.session.systemPrompt,
+				messages: [currentUser, successfulAssistant, toolResult],
+				tools: [],
+			},
+			newMessages: [successfulAssistant, toolResult],
+		});
+		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+
+		await harness.session.prompt("/autonomous off");
+		expect(harness.session.getAutonomousStatus().enabled).toBe(false);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+
+		await sessionInternals._runAutoCompaction("threshold", false);
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(continueSpy).not.toHaveBeenCalled();
+	});
+
 	it("queues a failing autonomous gate continuation before post-turn threshold compaction", async () => {
 		vi.useFakeTimers();
 		const harness = await createHarness({

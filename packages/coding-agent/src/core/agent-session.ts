@@ -1143,6 +1143,7 @@ export class AgentSession {
 			setAutonomousEnabled(this._autonomousState, true, { cwd: this._cwd });
 		} else if (command.kind === "off") {
 			setAutonomousEnabled(this._autonomousState, false);
+			this._clearQueuedAutonomousContinuations();
 		}
 		this._emitAutonomousStatus();
 		return true;
@@ -1351,6 +1352,19 @@ export class AgentSession {
 		this._postCompactionContinuationMessages.push(autonomousMessage);
 		this.agent.followUp(autonomousMessage);
 		return true;
+	}
+
+	private _clearQueuedAutonomousContinuations(): void {
+		const queuedMessages = this._postCompactionContinuationMessages.splice(0);
+		if (queuedMessages.length === 0) {
+			return;
+		}
+		const queuedMessageSet = new Set(queuedMessages);
+		this.agent.removeQueuedMessages((message) => queuedMessageSet.has(message));
+		this._continueAfterThresholdCompaction = false;
+		if (!this.agent.hasQueuedMessages()) {
+			this._cancelPostCompactionContinue();
+		}
 	}
 
 	/**
