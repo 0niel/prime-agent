@@ -59,6 +59,10 @@ function canonicalizePath(path: string | undefined): string | undefined {
 	return _canonicalizePath(path);
 }
 
+function formatMutationError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
 class SessionSelectorHeader implements Component {
 	private scope: SessionScope;
 	private sortMode: SortMode;
@@ -129,6 +133,7 @@ class SessionSelectorHeader implements Component {
 			this.statusTimeout = null;
 			this.requestRender();
 		}, autoHideMs);
+		this.statusTimeout.unref?.();
 	}
 
 	invalidate(): void {}
@@ -814,7 +819,17 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 		// Handle session deletion
 		this.sessionList.onDeleteSession = async (sessionPath: string) => {
-			const result = await this.deleteSession(sessionPath);
+			let result: DeleteSessionFileResult;
+			try {
+				result = await this.deleteSession(sessionPath);
+			} catch (error) {
+				this.header.setStatusMessage(
+					{ type: "error", message: `Failed to delete: ${formatMutationError(error)}` },
+					3000,
+				);
+				this.requestRender();
+				return;
+			}
 
 			if (result.ok) {
 				if (this.currentSessions) {
@@ -829,8 +844,15 @@ export class SessionSelectorComponent extends Container implements Focusable {
 				this.sessionList.setSessions(sessions, showCwd);
 
 				const msg = result.method === "trash" ? "Session moved to trash" : "Session deleted";
-				this.header.setStatusMessage({ type: "info", message: msg }, 2000);
-				await this.refreshSessionsAfterMutation();
+				try {
+					await this.refreshSessionsAfterMutation();
+					this.header.setStatusMessage({ type: "info", message: msg }, 2000);
+				} catch (error) {
+					this.header.setStatusMessage(
+						{ type: "error", message: `${msg}; refresh failed: ${formatMutationError(error)}` },
+						3000,
+					);
+				}
 			} else {
 				const errorMessage = result.error ?? "Unknown error";
 				this.header.setStatusMessage({ type: "error", message: `Failed to delete: ${errorMessage}` }, 3000);
@@ -897,10 +919,29 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 		try {
 			await renameSession(target, next);
-			await this.refreshSessionsAfterMutation();
-		} finally {
+		} catch (error) {
 			this.exitRenameMode();
+			this.header.setStatusMessage(
+				{ type: "error", message: `Failed to rename: ${formatMutationError(error)}` },
+				4000,
+			);
+			this.requestRender();
+			return;
 		}
+
+		try {
+			await this.refreshSessionsAfterMutation();
+		} catch (error) {
+			this.exitRenameMode();
+			this.header.setStatusMessage(
+				{ type: "error", message: `Session renamed; refresh failed: ${formatMutationError(error)}` },
+				4000,
+			);
+			this.requestRender();
+			return;
+		}
+
+		this.exitRenameMode();
 	}
 
 	private async loadScope(scope: SessionScope, reason: "initial" | "refresh" | "toggle"): Promise<void> {

@@ -3,7 +3,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import type { AgentConnectionSavedSessionInfo } from "../src/modes/agent-connection/index.js";
 import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, preloadCodeHighlighter } from "../src/modes/interactive/theme/theme.js";
 
 async function flushPromises(): Promise<void> {
 	await new Promise<void>((resolve) => {
@@ -31,8 +31,9 @@ function makeSession(
 const CTRL_R = "\x1b[114;5u";
 
 describe("session selector rename", () => {
-	beforeAll(() => {
+	beforeAll(async () => {
 		initTheme("dark");
+		await preloadCodeHighlighter();
 	});
 
 	beforeEach(() => {
@@ -109,5 +110,70 @@ describe("session selector rename", () => {
 
 		expect(renameSession).toHaveBeenCalledTimes(1);
 		expect(renameSession).toHaveBeenCalledWith(sessions[0]!.path, "XOld");
+	});
+
+	it("shows an error when rename fails", async () => {
+		const sessions = [makeSession({ id: "a", name: "Old" })];
+		const renameSession = vi.fn(async () => {
+			throw new Error("daemon unavailable");
+		});
+
+		const keybindings = new KeybindingsManager();
+		const selector = new SessionSelectorComponent(
+			async () => sessions,
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ renameSession, showRenameHint: true, keybindings },
+		);
+		await flushPromises();
+
+		selector.getSessionList().handleInput(CTRL_R);
+		await flushPromises();
+
+		selector.handleInput("\r");
+		await flushPromises();
+
+		const output = selector.render(120).join("\n");
+		expect(renameSession).toHaveBeenCalledTimes(1);
+		expect(output).toContain("Resume Session");
+		expect(output).toContain("Failed to rename: daemon unavailable");
+	});
+
+	it("does not report rename failure when refresh after rename fails", async () => {
+		const sessions = [makeSession({ id: "a", name: "Old" })];
+		const renameSession = vi.fn(async () => {});
+		let loadCalls = 0;
+
+		const keybindings = new KeybindingsManager();
+		const selector = new SessionSelectorComponent(
+			async () => {
+				loadCalls++;
+				if (loadCalls > 1) {
+					throw new Error("refresh unavailable");
+				}
+				return sessions;
+			},
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ renameSession, showRenameHint: true, keybindings },
+		);
+		await flushPromises();
+
+		selector.getSessionList().handleInput(CTRL_R);
+		await flushPromises();
+
+		selector.handleInput("\r");
+		await flushPromises();
+
+		const output = selector.render(120).join("\n");
+		expect(renameSession).toHaveBeenCalledTimes(1);
+		expect(output).toContain("Resume Session");
+		expect(output).not.toContain("Failed to rename");
 	});
 });

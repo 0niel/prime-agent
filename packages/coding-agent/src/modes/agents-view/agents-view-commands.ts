@@ -16,7 +16,7 @@ import {
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
 
-const AGENTS_VIEW_COMMAND_NAMES = ["login", "logout", "model", "quit"] as const;
+const AGENTS_VIEW_COMMAND_NAMES = ["login", "logout", "model", "resume", "quit"] as const;
 
 export type AgentsViewCommandName = (typeof AGENTS_VIEW_COMMAND_NAMES)[number];
 

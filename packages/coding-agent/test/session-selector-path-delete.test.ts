@@ -6,7 +6,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import type { AgentConnectionSavedSessionInfo } from "../src/modes/agent-connection/index.js";
 import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, preloadCodeHighlighter } from "../src/modes/interactive/theme/theme.js";
 
 type Deferred<T> = {
 	promise: Promise<T>;
@@ -103,9 +103,10 @@ describe("session selector path/delete interactions", () => {
 		setKeybindings(new KeybindingsManager());
 	});
 
-	beforeAll(() => {
+	beforeAll(async () => {
 		// session selector uses the global theme instance
 		initTheme("dark");
+		await preloadCodeHighlighter();
 	});
 	it("does not treat Ctrl+Backspace as delete when search query is non-empty", async () => {
 		const sessions = [makeSession({ id: "a" }), makeSession({ id: "b" })];
@@ -208,6 +209,66 @@ describe("session selector path/delete interactions", () => {
 
 		expect(deleteSession).toHaveBeenCalledTimes(1);
 		expect(deleteSession).toHaveBeenCalledWith(sessions[0]!.path);
+	});
+
+	it("shows an error when the injected delete handler rejects", async () => {
+		const sessions = [makeSession({ id: "a" })];
+		const deleteSession = vi.fn(async () => {
+			throw new Error("Cannot delete the currently active session");
+		});
+
+		const selector = new SessionSelectorComponent(
+			async () => sessions,
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings, deleteSession },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		list.handleInput(CTRL_X);
+		list.handleInput(CTRL_X);
+		await flushPromises();
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(deleteSession).toHaveBeenCalledTimes(1);
+		expect(output).toContain("Failed to delete: Cannot delete the currently active session");
+	});
+
+	it("keeps delete success visible when refresh after deletion fails", async () => {
+		const sessions = [makeSession({ id: "a" })];
+		const deleteSession = vi.fn(async () => ({ ok: true as const, method: "unlink" as const }));
+		let loadCalls = 0;
+
+		const selector = new SessionSelectorComponent(
+			async () => {
+				loadCalls++;
+				if (loadCalls > 1) {
+					throw new Error("refresh unavailable");
+				}
+				return sessions;
+			},
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings, deleteSession },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		list.handleInput(CTRL_X);
+		list.handleInput(CTRL_X);
+		await flushPromises();
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(deleteSession).toHaveBeenCalledTimes(1);
+		expect(output).toContain("Session deleted");
+		expect(output).not.toContain("Failed to delete");
 	});
 
 	it("does not switch scope back to All when All load resolves after toggling back to Current", async () => {

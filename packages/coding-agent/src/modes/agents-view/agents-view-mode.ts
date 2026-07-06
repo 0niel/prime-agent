@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import type { Api, ImageContent, Model } from "@earendil-works/pi-ai";
 import type { AutocompleteItem, OverlayHandle, SlashCommand } from "@earendil-works/pi-tui";
 import {
@@ -17,16 +18,22 @@ import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSI
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
 import { findExactModelReferenceMatch } from "../../core/model-resolver.js";
-import { SessionManager } from "../../core/session-manager.js";
+import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import { type SessionInfo, SessionManager } from "../../core/session-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import { DaemonClient } from "../daemon/daemon-client.js";
 import { type DaemonCommand, type DaemonResponse, isUnknownDaemonCommandError } from "../daemon/daemon-protocol.js";
-import { resolveAttachModelFallbackMessage, type SessionSummary } from "../daemon/daemon-session-list.js";
+import {
+	resolveAttachModelFallbackMessage,
+	type SessionSummary,
+	summaryForInactiveSession,
+} from "../daemon/daemon-session-list.js";
 import { getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "../interactive/auth-flows.js";
 import { showFullPaneOverlay } from "../interactive/components/centered-overlay.js";
 import { CustomEditor } from "../interactive/components/custom-editor.js";
 import { keyText } from "../interactive/components/keybinding-hints.js";
 import { ModelSelectorComponent } from "../interactive/components/model-selector.js";
+import { SessionSelectorComponent } from "../interactive/components/session-selector.js";
 import { BrandSplashHeader, InteractiveMode } from "../interactive/interactive-mode.js";
 import type { InteractiveModeUiServices } from "../interactive/interactive-mode-services.js";
 import {
@@ -118,6 +125,7 @@ type AgentsViewPersistentState = {
 };
 
 type PromptCommand = Extract<DaemonCommand, { type: "prompt" }>;
+type DeleteSavedSessionCommand = Extract<DaemonCommand, { type: "delete_saved_session" }>;
 type PendingDeleteAgent = {
 	identity: string;
 	activeSessionId?: string;
@@ -157,6 +165,37 @@ export function createAgentsViewListCommand(): Extract<DaemonCommand, { type: "l
 	// Omitting `all` returns daemon-resident sessions only; on-disk ones come back
 	// via /resume.
 	return { type: "list" };
+}
+
+export function createAgentsViewDeleteSavedSessionCommand(sessionPath: string): DeleteSavedSessionCommand {
+	return { type: "delete_saved_session", sessionPath };
+}
+
+export function resolveAgentsViewResumeSummary(
+	sessionPath: string,
+	savedSessions: readonly SessionInfo[],
+	visibleSummaries: readonly SessionSummary[],
+): SessionSummary | undefined {
+	const activeSummary = resolveAgentsViewActiveSummaryForPath(sessionPath, visibleSummaries);
+	if (activeSummary) {
+		return activeSummary;
+	}
+	const selectedPath = resolvePath(sessionPath);
+	const savedSession = savedSessions.find((session) => resolvePath(session.path) === selectedPath);
+	return savedSession ? summaryForInactiveSession(savedSession) : undefined;
+}
+
+export function resolveAgentsViewActiveSummaryForPath(
+	sessionPath: string,
+	summaries: readonly SessionSummary[],
+): SessionSummary | undefined {
+	const selectedPath = resolvePath(sessionPath);
+	return summaries.find(
+		(summary) =>
+			summary.activeSessionId !== undefined &&
+			summary.sessionFile !== undefined &&
+			resolvePath(summary.sessionFile) === selectedPath,
+	);
 }
 
 // Status messages render in a single-row hint slot below the editor; embedded
@@ -341,6 +380,7 @@ class AgentsViewMode implements Component, Focusable {
 	private deleteConfirmTimer: ReturnType<typeof setTimeout> | undefined;
 	private workingIconFrame = 0;
 	private rows: AgentsViewRow[] = [];
+	private lastListedSummaries: SessionSummary[] = [];
 	private lastVisibleSummaries: SessionSummary[] = [];
 	private expandedSubagentParents = new Set<string>();
 	// Agent row identities whose full spawn program is currently shown.
@@ -907,6 +947,9 @@ class AgentsViewMode implements Component, Focusable {
 				await this.showModelSelector(searchTerm);
 				return;
 			}
+			case "resume":
+				await this.showSessionSelector();
+				return;
 			case "quit":
 				this.finish({ type: "exit" });
 				return;
@@ -982,6 +1025,97 @@ class AgentsViewMode implements Component, Focusable {
 			);
 			handle = showFullPaneOverlay(this.ui, selector, 96);
 		});
+	}
+
+	private showSessionSelector(): Promise<void> {
+		return new Promise((done) => {
+			let handle: OverlayHandle | undefined;
+			let settled = false;
+			const savedSessionsByPath = new Map<string, SessionInfo>();
+
+			const rememberSessions = (sessions: SessionInfo[]): SessionInfo[] => {
+				for (const session of sessions) {
+					savedSessionsByPath.set(resolvePath(session.path), session);
+				}
+				return sessions;
+			};
+
+			const close = () => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				handle?.hide();
+				this.ui.requestRender();
+				done();
+			};
+
+			const selector = new SessionSelectorComponent(
+				async (onProgress) =>
+					rememberSessions(
+						await SessionManager.list(this.getSavedSessionCwd(), this.options.config.sessionDir, onProgress),
+					),
+				async (onProgress) =>
+					rememberSessions(await SessionManager.listAll(onProgress, this.options.config.sessionDir)),
+				(sessionPath) => {
+					const summary = resolveAgentsViewResumeSummary(
+						sessionPath,
+						[...savedSessionsByPath.values()],
+						this.lastListedSummaries,
+					);
+					close();
+					if (!summary) {
+						this.setStatusMessage("Failed to resume session: selected session was not found");
+						return;
+					}
+					this.finish({ type: "open", summary });
+				},
+				close,
+				() => {
+					close();
+					this.finish({ type: "exit" });
+				},
+				() => this.ui.requestRender(),
+				{
+					renameSession: async (sessionPath, nextName) => {
+						const name = (nextName ?? "").trim();
+						if (!name) {
+							return;
+						}
+						await this.renameSavedSessionFromSelector(sessionPath, name);
+					},
+					deleteSession: (sessionPath) => this.deleteSavedSessionFromSelector(sessionPath),
+					showRenameHint: true,
+					keybindings: this.keybindings,
+				},
+			);
+			handle = showFullPaneOverlay(this.ui, selector, 96);
+		});
+	}
+
+	private getSavedSessionCwd(): string {
+		return this.options.config.cwd ?? this.options.uiServices.getInitialCwd();
+	}
+
+	private async renameSavedSessionFromSelector(sessionPath: string, name: string): Promise<void> {
+		const activeSummary = resolveAgentsViewActiveSummaryForPath(sessionPath, this.lastListedSummaries);
+		if (!activeSummary?.activeSessionId) {
+			SessionManager.open(sessionPath).appendSessionInfo(name);
+			return;
+		}
+		const response = await this.requireClient().request({
+			type: "rename_saved_session",
+			activeSessionId: activeSummary.activeSessionId,
+			sessionPath,
+			name,
+		});
+		requireDaemonData(response);
+		await this.refreshSessions();
+	}
+
+	private async deleteSavedSessionFromSelector(sessionPath: string): Promise<DeleteSessionFileResult> {
+		const response = await this.requireClient().request(createAgentsViewDeleteSavedSessionCommand(sessionPath));
+		return expectDeleteSessionFileResult(requireDaemonData(response));
 	}
 
 	private getDefaultModelForNewAgents(): Model<Api> | undefined {
@@ -1571,6 +1705,7 @@ class AgentsViewMode implements Component, Focusable {
 			const response = await client.request(createAgentsViewListCommand());
 			const data = requireDaemonData(response);
 			const sessions = expectSessionList(data);
+			this.lastListedSummaries = sessions;
 			const visibleSessions = sessions.filter((summary) =>
 				shouldShowAgentsViewSession(summary, this.inactiveAgentIdentities.has(getSummaryIdentity(summary))),
 			);
@@ -2044,6 +2179,22 @@ function expectSessionSummary(value: unknown): SessionSummary {
 		throw new Error("Daemon returned an invalid session summary");
 	}
 	return value;
+}
+
+function expectDeleteSessionFileResult(value: unknown): DeleteSessionFileResult {
+	if (!isRecord(value) || typeof value.ok !== "boolean") {
+		throw new Error("Daemon returned an invalid delete session response");
+	}
+	if (value.ok) {
+		if (value.method !== "trash" && value.method !== "unlink") {
+			throw new Error("Daemon returned an invalid delete session response");
+		}
+		return { ok: true, method: value.method };
+	}
+	if (typeof value.error !== "string") {
+		throw new Error("Daemon returned an invalid delete session response");
+	}
+	return { ok: false, error: value.error };
 }
 
 function isSessionSummary(value: unknown): value is SessionSummary {
