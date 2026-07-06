@@ -241,9 +241,9 @@ prime_agent_screen() {
 	prime_agent_screen_frame_text=$(prime_agent_render_screen)
 
 	if ( : <>/dev/tty ) 2>/dev/null; then
-		printf '%s%s%s\n%s' "$prime_agent_sync_start" "$prime_agent_screen_prefix" "$prime_agent_screen_frame_text" "$prime_agent_sync_end" >/dev/tty
+		printf '%s%s%s%s' "$prime_agent_sync_start" "$prime_agent_screen_prefix" "$prime_agent_screen_frame_text" "$prime_agent_sync_end" >/dev/tty
 	else
-		printf '%s%s%s\n%s' "$prime_agent_sync_start" "$prime_agent_screen_prefix" "$prime_agent_screen_frame_text" "$prime_agent_sync_end" >&2
+		printf '%s%s%s%s' "$prime_agent_sync_start" "$prime_agent_screen_prefix" "$prime_agent_screen_frame_text" "$prime_agent_sync_end" >&2
 	fi
 }
 
@@ -711,19 +711,11 @@ prime_agent_animation_step_index() {
 	printf '%s' "$detail_index"
 }
 
-prime_agent_animation_percent() {
-	details="$1"
-	detail_count=$(prime_agent_animation_detail_count "$details")
-	total_frames=$((detail_count * 24))
-	frame=$(prime_agent_animation_current_frame)
-	percent=$((frame * 100 / total_frames))
-	if [ "$percent" -lt 1 ]; then
-		percent=1
-	fi
-	if [ "$percent" -gt 99 ]; then
-		percent=99
-	fi
-	printf '%s' "$percent"
+prime_agent_static_progress_title() {
+	case "$1" in
+		*...) printf '%s' "$1" ;;
+		*) printf '%s...' "$1" ;;
+	esac
 }
 
 prime_agent_animation_status() {
@@ -731,7 +723,7 @@ prime_agent_animation_status() {
 	details="$2"
 	status_mode="$3"
 	case "$status_mode" in
-		static) printf '%s · %s%%' "$status" "$(prime_agent_animation_percent "$details")" ;;
+		static) prime_agent_static_progress_title "$status" ;;
 		*) printf '%s%s' "$status" "$(prime_agent_pulse)" ;;
 	esac
 }
