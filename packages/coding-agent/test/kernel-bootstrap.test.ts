@@ -218,33 +218,9 @@ describe("kernel bootstrap", () => {
 			stderrWrite.mockRestore();
 		}
 
-		// Fake uv is on PATH, so the uv-install step is skipped; the rest describe real steps.
-		expect(progress).toEqual([
-			"installing Python 3.11 · 0%",
-			expect.stringMatching(/^creating virtual environment · \d+%$/),
-			expect.stringMatching(/^installing packages \(.+\) · \d+%$/),
-			"✓ ready · 100%",
-		]);
-
-		const percents = progress.map((line) => Number(line.match(/(\d+)%$/)?.[1] ?? "0"));
-		expect(percents).toEqual([...percents].sort((a, b) => a - b));
-		expect(percents.at(-1)).toBe(100);
+		expect(progress).toEqual(expect.arrayContaining(["› setting up python kernel (one-time, ~30s)…", "✓ ready"]));
+		expect(stderrWrite).not.toHaveBeenCalledWith(expect.stringContaining("setting up python kernel"));
 		expect(stderrWrite).not.toHaveBeenCalledWith(expect.stringContaining("ready"));
-	});
-
-	it("does not show an installing-uv step when uv install is refused", async () => {
-		// uv absent from PATH and from the temp HOME, and install not permitted.
-		const emptyBin = join(tempDir, "empty-bin");
-		mkdirSync(emptyBin, { recursive: true });
-		process.env.PATH = emptyBin;
-		delete process.env.PRIME_AGENT_INSTALL_UV;
-		const venv = join(tempDir, "kernel-venv");
-		const progress: string[] = [];
-		process.env.PRIME_AGENT_KERNEL_VENV = venv;
-
-		await expect(ensureKernelPython({ onProgress: (message) => progress.push(message) })).rejects.toThrow(/uv/);
-		expect(progress).not.toContain(expect.stringContaining("installing uv"));
-		expect(progress.some((line) => line.startsWith("installing uv"))).toBe(false);
 	});
 
 	it("installs Python skills into the bootstrapped venv", async () => {

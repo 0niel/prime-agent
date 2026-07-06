@@ -442,43 +442,6 @@ function reportProgress(options: EnsureKernelPythonOptions, message: string): vo
 	process.stderr.write(`${message}\n`);
 }
 
-// Drives the single setup line shown during first-run bootstrap: each step
-// replaces the line with what's actually running plus a cumulative percentage.
-// Weights are rough wall-clock shares (the package install dwarfs the rest) so
-// the percentage tracks real work, not a flat 1/N. The caller builds the step
-// list from only the steps that will run, so the denominator stays honest.
-interface BootstrapStep {
-	label: string;
-	weight: number;
-}
-
-class BootstrapProgress {
-	private readonly total: number;
-	private completedWeight = 0;
-
-	constructor(
-		private readonly options: EnsureKernelPythonOptions,
-		steps: readonly BootstrapStep[],
-	) {
-		this.total = steps.reduce((sum, step) => sum + step.weight, 0) || 1;
-	}
-
-	// Announce a step as it begins; the percentage reflects work done before it.
-	begin(step: BootstrapStep): void {
-		const percent = Math.min(99, Math.round((this.completedWeight / this.total) * 100));
-		this.completedWeight += step.weight;
-		reportProgress(this.options, `${step.label} · ${percent}%`);
-	}
-}
-
-const BOOTSTRAP_STEP = {
-	uv: { label: "installing uv", weight: 3 },
-	python: { label: "installing Python 3.11", weight: 4 },
-	venv: { label: "creating virtual environment", weight: 2 },
-	packages: { label: "installing packages (ipykernel, numpy, pandas, …)", weight: 10 },
-	skills: { label: "installing Python skills", weight: 2 },
-} satisfies Record<string, BootstrapStep>;
-
 function bootstrapLockDir(venv: string): string {
 	return path.join(path.dirname(venv), `${path.basename(venv)}${BOOTSTRAP_LOCK_NAME}`);
 }
@@ -548,23 +511,13 @@ async function findExecutable(name: string): Promise<string | null> {
 	return null;
 }
 
-function localUvPath(): string {
-	return path.join(os.homedir(), ".local", "bin", process.platform === "win32" ? "uv.exe" : "uv");
-}
-
-// Resolve an existing uv without installing one. Returns null if uv is absent.
-async function locateUv(): Promise<string | null> {
+async function ensureUv(options: EnsureKernelPythonOptions): Promise<string> {
 	const fromPath = await findExecutable("uv");
 	if (fromPath) return fromPath;
-	const localUv = localUvPath();
-	return (await isExecutable(localUv)) ? localUv : null;
-}
 
-async function ensureUv(options: EnsureKernelPythonOptions, onAboutToInstall?: () => void): Promise<string> {
-	const existing = await locateUv();
-	if (existing) return existing;
+	const localUv = path.join(os.homedir(), ".local", "bin", process.platform === "win32" ? "uv.exe" : "uv");
+	if (await isExecutable(localUv)) return localUv;
 
-	const localUv = localUvPath();
 	const shouldInstallUv =
 		process.env.PRIME_AGENT_INSTALL_UV === "1" || (!options.onProgress && (await confirmUvInstall()));
 	if (!shouldInstallUv) {
@@ -574,10 +527,7 @@ async function ensureUv(options: EnsureKernelPythonOptions, onAboutToInstall?: (
 		);
 	}
 
-	// Announce only once an install is actually committed, so a refusal here never
-	// leaves a phantom "installing uv" step on screen.
-	onAboutToInstall?.();
-
+	reportProgress(options, "› installing uv (one-time)…");
 	try {
 		await run("sh", ["-c", UV_INSTALL_COMMAND], { stdio: options.onProgress ? "ignore" : "inherit" });
 	} catch (error) {
@@ -774,32 +724,14 @@ async function bootstrapVenv(
 	options: EnsureKernelPythonOptions,
 ): Promise<void> {
 	await mkdir(path.dirname(venv), { recursive: true });
+	const uv = await ensureUv(options);
 	const python = path.join(venv, "bin", "python");
 	const sourceDir = await resolveRuntimeSourceDir();
 	const runtimeRequirement = sourceDir ?? RUNTIME_REQUIREMENT;
 	const runtimeIdentity = await resolveRuntimeIdentity();
 
-	// Build the step list before running so the percentage denominator only
-	// counts work that will actually happen on this machine.
-	const needsUvInstall = (await locateUv()) === null;
-	const steps: BootstrapStep[] = [
-		...(needsUvInstall ? [BOOTSTRAP_STEP.uv] : []),
-		BOOTSTRAP_STEP.python,
-		BOOTSTRAP_STEP.venv,
-		BOOTSTRAP_STEP.packages,
-		...(pythonSkills.length > 0 ? [BOOTSTRAP_STEP.skills] : []),
-	];
-	const progress = new BootstrapProgress(options, steps);
-
-	const uv = await ensureUv(options, needsUvInstall ? () => progress.begin(BOOTSTRAP_STEP.uv) : undefined);
-
-	progress.begin(BOOTSTRAP_STEP.python);
 	await run(uv, ["python", "install", PYTHON_VERSION]);
-
-	progress.begin(BOOTSTRAP_STEP.venv);
 	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"]);
-
-	progress.begin(BOOTSTRAP_STEP.packages);
 	await run(uv, [
 		"pip",
 		"install",
@@ -810,9 +742,6 @@ async function bootstrapVenv(
 		STATE_SNAPSHOT_REQUIREMENT,
 		...DEFAULT_RLM_EXTRA_UV_ARGS,
 	]);
-	if (pythonSkills.length > 0) {
-		progress.begin(BOOTSTRAP_STEP.skills);
-	}
 	await syncPythonSkills(uv, venv, python, runtimeIdentity, pythonSkills, options);
 }
 
@@ -969,7 +898,10 @@ async function ensureKernelPythonUncached(
 			return python;
 		}
 
-		if (existsSync(venv)) {
+		const hadVenv = existsSync(venv);
+		reportProgress(options, "› setting up python kernel (one-time, ~30s)…");
+		if (hadVenv) {
+			reportProgress(options, "rebuilding kernel venv");
 			await rm(venv, { recursive: true, force: true });
 		}
 
@@ -980,7 +912,7 @@ async function ensureKernelPythonUncached(
 		await releaseLock().catch(() => undefined);
 	}
 
-	reportProgress(options, "✓ ready · 100%");
+	reportProgress(options, "✓ ready");
 	return python;
 }
 

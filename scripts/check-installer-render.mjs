@@ -58,7 +58,18 @@ render_case() {
 	printf '__RENDER_END__ second\\n'
 }
 
+progress_case() {
+	progress_details="Preparing global install.
+Linking command binaries.
+Finalizing npm install."
+	for progress_frame in 1 24 25 48 49 200; do
+		prime_agent_animation_frame="$progress_frame"
+		printf '__PROGRESS__ %s\t%s\t%s\t%s\\n' "$progress_frame" "$(prime_agent_animation_percent "$progress_details")" "$(prime_agent_animation_status "Installing Prime Agent" "$progress_details" static)" "$(prime_agent_animation_detail "$progress_details")"
+	done
+}
+
 render_case "$@"
+progress_case
 `;
 
 const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-installer-render-"));
@@ -74,6 +85,7 @@ try {
 		stableVisible.meta.first.lab_width === stableVisible.meta.second.lab_width,
 		"expected logo lab width to stay stable across a safe resize",
 	);
+	assertInstallerProgress(stableVisible.progress);
 
 	const stableExpand = runCase("stable expanded logo", 60, 24, 120, 32);
 	check(stableExpand.meta.first.visible === "1", "expected the initial medium render to show the logo");
@@ -151,12 +163,50 @@ function parseRenderOutput(output) {
 			activeRender = null;
 			continue;
 		}
+		if (line.startsWith("__PROGRESS__ ")) {
+			const [frame, percent, status, detail] = line.slice("__PROGRESS__ ".length).split("\t");
+			parsed.progress.push({ frame: Number(frame), percent: Number(percent), status, detail });
+			continue;
+		}
 		if (activeRender) {
 			parsed.renders[activeRender].push(line.replace(ansiPattern, ""));
 		}
 	}
 
 	return parsed;
+}
+
+function assertInstallerProgress(progress) {
+	check(progress.length === 6, `expected six progress samples, got ${progress.length}`);
+	if (progress.length !== 6) return;
+
+	const expectedDetails = [
+		"Preparing global install.",
+		"Preparing global install.",
+		"Linking command binaries.",
+		"Linking command binaries.",
+		"Finalizing npm install.",
+		"Finalizing npm install.",
+	];
+	for (const [index, expectedDetail] of expectedDetails.entries()) {
+		check(
+			progress[index].detail === expectedDetail,
+			`expected progress sample ${index + 1} to show "${expectedDetail}", got "${progress[index].detail}"`,
+		);
+		check(
+			progress[index].status === `Installing Prime Agent · ${progress[index].percent}%`,
+			`expected progress sample ${index + 1} to include percent in the status`,
+		);
+	}
+
+	for (let index = 1; index < progress.length; index++) {
+		check(
+			progress[index].percent >= progress[index - 1].percent,
+			`expected progress percent to be monotonic between samples ${index} and ${index + 1}`,
+		);
+	}
+	check(progress[0].percent > 0, "expected progress percent to start above zero");
+	check(progress[progress.length - 1].percent === 99, "expected in-flight progress percent to cap at 99");
 }
 
 function assertLineWidths(name, label, parsed, cols, rows) {
@@ -185,5 +235,6 @@ function emptyParsedCase() {
 			first: [],
 			second: [],
 		},
+		progress: [],
 	};
 }

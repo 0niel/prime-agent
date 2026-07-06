@@ -8,6 +8,7 @@
 - Changed `--resume` to accept an optional session path or ID.
 - Added prompt stashing so a draft can be temporarily saved, a separate prompt or command can run, and the draft is restored afterward.
 - Changed fullscreen TUI rendering to be enabled by default.
+- Changed the installer onboarding splash to show ordered setup phases with a percentage instead of cycling detail text ([ENG-4376](https://linear.app/primeintellect/issue/ENG-4376/onboarding-instructions-should-be-accurate-to-whats-happening)).
 
 ## [0.2.4] - 2026-07-01
 
