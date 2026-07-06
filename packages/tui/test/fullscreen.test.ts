@@ -11,6 +11,13 @@ class TestComponent implements Component {
 	invalidate(): void {}
 }
 
+class InputComponent extends TestComponent {
+	inputs: string[] = [];
+	handleInput(data: string): void {
+		this.inputs.push(data);
+	}
+}
+
 class LoggingVirtualTerminal extends VirtualTerminal {
 	private writes: string[] = [];
 
@@ -245,6 +252,233 @@ describe("TUI fullscreen mode", () => {
 		handle.hide();
 		await terminal.waitForRender();
 		assert.ok(!terminal.getViewport().some((line) => line.includes("OVERLAY CONTENT")));
+
+		tui.stop();
+	});
+
+	it("drag-selecting focused overlay text copies from the fullscreen frame", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80, 10);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		const url = "https://example.com/login";
+		const overlay = new InputComponent();
+		overlay.lines = ["Sign-in link", url];
+		tui.showOverlay(overlay, { anchor: "center", width: 40 });
+		await terminal.waitForRender();
+
+		const viewport = terminal.getViewport();
+		const row = viewport.findIndex((line) => line.includes(url));
+		assert.notStrictEqual(row, -1, "URL is visible in the focused overlay");
+		const col = viewport[row]!.indexOf(url);
+		const startX = col + 1;
+		const endX = startX + url.length;
+		const y = row + 1;
+
+		terminal.sendInput(`\x1b[<0;${startX};${y}M`);
+		terminal.sendInput(`\x1b[<32;${endX};${y}M`);
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("\x1b[7m"), "overlay selection is highlighted while dragging");
+
+		terminal.sendInput(`\x1b[<0;${endX};${y}m`);
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(copies, [url]);
+		assert.deepStrictEqual(overlay.inputs, [], "mouse reports are consumed before overlay input handlers");
+
+		tui.stop();
+	});
+
+	it("maps focused overlay selection to the painted viewport slice", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80, 5);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		const url = "https://example.com/visible";
+		const overlay = new InputComponent();
+		overlay.lines = [url, "overlay row 1", "overlay row 2", "overlay row 3", "overlay row 4", "overlay row 5"];
+		tui.showOverlay(overlay, { anchor: "top-left", width: 40 });
+		await terminal.waitForRender();
+
+		const viewport = terminal.getViewport();
+		const row = viewport.findIndex((line) => line.includes(url));
+		assert.notStrictEqual(row, -1, "URL is visible after the over-tall frame is sliced");
+		const col = viewport[row]!.indexOf(url);
+		const startX = col + 1;
+		const endX = startX + url.length;
+		const y = row + 1;
+
+		terminal.sendInput(`\x1b[<0;${startX};${y}M`);
+		terminal.sendInput(`\x1b[<32;${endX};${y}M`);
+		terminal.sendInput(`\x1b[<0;${endX};${y}m`);
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(copies, [url]);
+
+		tui.stop();
+	});
+
+	it("copies an active frame selection if focus changes before release", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80, 10);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		const url = "https://example.com/focus-change";
+		const overlay = new InputComponent();
+		overlay.lines = ["Sign-in link", url];
+		tui.showOverlay(overlay, { anchor: "center", width: 44 });
+		await terminal.waitForRender();
+
+		const viewport = terminal.getViewport();
+		const row = viewport.findIndex((line) => line.includes(url));
+		assert.notStrictEqual(row, -1, "URL is visible in the focused overlay");
+		const col = viewport[row]!.indexOf(url);
+		const startX = col + 1;
+		const endX = startX + url.length;
+		const y = row + 1;
+
+		terminal.sendInput(`\x1b[<0;${startX};${y}M`);
+		terminal.sendInput(`\x1b[<32;${endX};${y}M`);
+		tui.setFocus(chat);
+		tui.requestRender();
+		await terminal.waitForRender();
+		terminal.sendInput(`\x1b[<0;${endX};${y}m`);
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(copies, [url]);
+
+		tui.stop();
+	});
+
+	it("keeps focused overlay selection within visible overlay text", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80, 10);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		const url = "https://example.com/clamped";
+		const overlay = new InputComponent();
+		overlay.lines = ["Sign-in link", url];
+		tui.showOverlay(overlay, { anchor: "center", width: 44 });
+		await terminal.waitForRender();
+
+		const viewport = terminal.getViewport();
+		const row = viewport.findIndex((line) => line.includes(url));
+		assert.notStrictEqual(row, -1, "URL is visible in the focused overlay");
+		const outsideRow = viewport.findIndex((line, index) => index !== row && line.includes("Line "));
+		assert.notStrictEqual(outsideRow, -1, "transcript row is visible outside the overlay");
+		const col = viewport[row]!.indexOf(url);
+		const startX = col + 1;
+		const paddedEndX = startX + url.length + 6;
+		const y = row + 1;
+
+		terminal.sendInput(`\x1b[<0;${startX};${y}M`);
+		terminal.sendInput(`\x1b[<32;${paddedEndX};${y}M`);
+		terminal.sendInput(`\x1b[<32;1;${outsideRow + 1}M`);
+		terminal.sendInput(`\x1b[<0;1;${outsideRow + 1}m`);
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(copies, [url]);
+
+		tui.stop();
+	});
+
+	it("does not select lower overlay text covered by a higher overlay", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80, 10);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		const lower = new InputComponent();
+		lower.lines = ["https://lower.example/login"];
+		tui.showOverlay(lower, { anchor: "bottom-left", width: 32 });
+
+		const upper = new InputComponent();
+		upper.lines = ["TOP"];
+		tui.showOverlay(upper, { anchor: "bottom-left", width: 32 });
+		await terminal.waitForRender();
+
+		const row = terminal.getViewport().findIndex((line) => line.startsWith("TOP"));
+		assert.notStrictEqual(row, -1, "higher overlay is visible");
+		const hiddenLowerTextX = 11;
+		const y = row + 1;
+
+		terminal.sendInput(`\x1b[<0;${hiddenLowerTextX};${y}M`);
+		terminal.sendInput(`\x1b[<32;1;${y}M`);
+		terminal.sendInput(`\x1b[<0;1;${y}m`);
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(copies, []);
+
+		tui.stop();
+	});
+
+	it("maps focused overlay transcript fallback to the painted viewport slice", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 40, 5);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		const overlay = new InputComponent();
+		overlay.lines = ["", "", "", "", "", ""];
+		tui.showOverlay(overlay, { anchor: "top-left", width: 1 });
+		await terminal.waitForRender();
+
+		const viewport = terminal.getViewport();
+		assert.ok(viewport[0]?.includes("18"), "top painted row is shifted by the over-tall overlay");
+		const col = viewport[0]!.indexOf("18");
+		const startX = col + 1;
+		const endX = startX + 2;
+
+		terminal.sendInput(`\x1b[<0;${startX};1M`);
+		terminal.sendInput(`\x1b[<32;${endX};1M`);
+		terminal.sendInput(`\x1b[<0;${endX};1m`);
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(copies, ["18"]);
+
+		tui.stop();
+	});
+
+	it("does not select text from an unfocused visible overlay", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80, 10);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		const lowerUrl = "https://lower.example/login";
+		const lower = new InputComponent();
+		lower.lines = [lowerUrl];
+		tui.showOverlay(lower, { anchor: "bottom-left", width: 32 });
+
+		const upper = new InputComponent();
+		upper.lines = ["Focused dialog"];
+		tui.showOverlay(upper, { anchor: "top-right", width: 24 });
+		await terminal.waitForRender();
+
+		const row = terminal.getViewport().findIndex((line) => line.includes(lowerUrl));
+		assert.notStrictEqual(row, -1, "unfocused lower overlay is visible");
+		const col = terminal.getViewport()[row]!.indexOf(lowerUrl);
+		const startX = col + 1;
+		const endX = startX + lowerUrl.length;
+		const y = row + 1;
+
+		terminal.sendInput(`\x1b[<0;${startX};${y}M`);
+		terminal.sendInput(`\x1b[<32;${endX};${y}M`);
+		terminal.sendInput(`\x1b[<0;${endX};${y}m`);
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(copies, []);
 
 		tui.stop();
 	});

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed fullscreen overlay selection so login URLs can be copied.
+
 ## [0.2.5] - 2026-07-06
 
 - Added fullscreen viewport rendering with alternate-screen scrolling, follow controls, mouse selection, and clipboard copy hooks ([#316](https://github.com/PrimeIntellect-ai/prime-agent/pull/316)).

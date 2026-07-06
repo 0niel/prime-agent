@@ -12,7 +12,14 @@ import { isKeyRelease, matchesKey } from "./keys.js";
 import { isMouseSequence, isWheelDown, isWheelUp, MOUSE_BUTTON_LEFT, parseSgrMouseEvent } from "./mouse.js";
 import type { Terminal } from "./terminal.js";
 import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.js";
-import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.js";
+import {
+	extractSegments,
+	normalizeTerminalOutput,
+	sliceByColumn,
+	sliceWithWidth,
+	stripAnsi,
+	visibleWidth,
+} from "./utils.js";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 
@@ -67,6 +74,12 @@ export interface Component {
 
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
+
+interface FrameSelectionRegion {
+	line: number;
+	col: number;
+	width: number;
+}
 
 /**
  * Interface for components that can receive focus and display a hardware cursor.
@@ -267,6 +280,7 @@ export class TUI extends Container {
 	private fullRedrawCount = 0;
 	private preserveViewportOnNextRender = false; // One-shot: repaint visible viewport in place instead of replaying scrollback
 	private stopped = false;
+	private overlaySelectionRegions: FrameSelectionRegion[] = [];
 
 	// While set, doRender paints fixed frames via the viewport; the inline
 	// differ's bookkeeping stays frozen in `inlineState` until exit.
@@ -761,10 +775,27 @@ export class TUI extends Container {
 					viewport.beginSelection(event.y - 1, event.x - 1);
 					this.requestRender();
 				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && event.motion) {
-					viewport.extendSelection(event.y - 1, event.x - 1);
+					viewport.extendActiveSelection(event.y - 1, event.x - 1);
 					this.requestRender();
 				} else if (!event.press && viewport.hasSelection()) {
-					const text = viewport.endSelection();
+					const text = viewport.endActiveSelection();
+					if (text) this.copySelection(text);
+					this.requestRender();
+				} else if (!event.press) {
+					viewport.clearSelection();
+				}
+			} else if (event && overlayFocused) {
+				const viewport = fullscreen.viewport;
+				if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
+					if (!viewport.beginFrameSelection(event.y - 1, event.x - 1)) {
+						viewport.beginSelection(event.y - 1, event.x - 1);
+					}
+					this.requestRender();
+				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && event.motion) {
+					viewport.extendActiveSelection(event.y - 1, event.x - 1);
+					this.requestRender();
+				} else if (!event.press && viewport.hasSelection()) {
+					const text = viewport.endActiveSelection();
 					if (text) this.copySelection(text);
 					this.requestRender();
 				} else if (!event.press) {
@@ -958,9 +989,17 @@ export class TUI extends Container {
 	private compositeOverlays(lines: string[], termWidth: number, termHeight: number): string[] {
 		if (this.overlayStack.length === 0) return lines;
 		const result = [...lines];
+		const overlaySelectionRegions: FrameSelectionRegion[] = [];
 
 		// Pre-render all visible overlays and calculate positions
-		const rendered: { overlayLines: string[]; row: number; col: number; w: number; scrollback: boolean }[] = [];
+		const rendered: {
+			component: Component;
+			overlayLines: string[];
+			row: number;
+			col: number;
+			w: number;
+			scrollback: boolean;
+		}[] = [];
 		let minLinesNeeded = result.length;
 
 		const visibleEntries = this.overlayStack.filter((e) => this.isOverlayVisible(e));
@@ -984,7 +1023,7 @@ export class TUI extends Container {
 			// Get final row/col with actual overlay height
 			const { row, col } = this.resolveOverlayLayout(options, overlayLines.length, termWidth, termHeight);
 
-			rendered.push({ overlayLines, row, col, w: width, scrollback });
+			rendered.push({ component, overlayLines, row, col, w: width, scrollback });
 			minLinesNeeded = Math.max(minLinesNeeded, row + overlayLines.length);
 		}
 
@@ -1001,7 +1040,7 @@ export class TUI extends Container {
 		const viewportStart = Math.max(0, workingHeight - termHeight);
 
 		// Composite each overlay
-		for (const { overlayLines, row, col, w, scrollback } of rendered) {
+		for (const { component, overlayLines, row, col, w, scrollback } of rendered) {
 			const overlayStart = scrollback ? Math.max(0, workingHeight - (row + overlayLines.length)) : viewportStart;
 			for (let i = 0; i < overlayLines.length; i++) {
 				const idx = overlayStart + row + i;
@@ -1011,11 +1050,54 @@ export class TUI extends Container {
 					const truncatedOverlayLine =
 						visibleWidth(overlayLines[i]) > w ? sliceByColumn(overlayLines[i], 0, w, true) : overlayLines[i];
 					result[idx] = this.compositeLineAt(result[idx], truncatedOverlayLine, col, w, termWidth);
+					this.subtractSelectionCoverage(overlaySelectionRegions, idx, col, col + w);
+					const span = component === this.focusedComponent ? this.selectableSpan(truncatedOverlayLine, w) : null;
+					if (span) {
+						overlaySelectionRegions.push({ line: idx, col: col + span.from, width: span.to - span.from });
+					}
 				}
 			}
 		}
 
+		this.overlaySelectionRegions = overlaySelectionRegions;
 		return result;
+	}
+
+	private selectableSpan(line: string, maxWidth: number): { from: number; to: number } | null {
+		const width = Math.min(maxWidth, visibleWidth(line));
+		let from = -1;
+		let to = -1;
+		for (let col = 0; col < width; col++) {
+			const cell = stripAnsi(sliceByColumn(line, col, 1));
+			if (cell.trim().length === 0) continue;
+			if (from === -1) from = col;
+			to = col + 1;
+		}
+		return from === -1 ? null : { from, to };
+	}
+
+	private subtractSelectionCoverage(
+		regions: FrameSelectionRegion[],
+		line: number,
+		coverStart: number,
+		coverEnd: number,
+	): void {
+		for (let i = regions.length - 1; i >= 0; i--) {
+			const region = regions[i];
+			if (region.line !== line) continue;
+			const regionStart = region.col;
+			const regionEnd = region.col + region.width;
+			if (coverEnd <= regionStart || coverStart >= regionEnd) continue;
+
+			const replacements: FrameSelectionRegion[] = [];
+			if (regionStart < coverStart) {
+				replacements.push({ line, col: regionStart, width: coverStart - regionStart });
+			}
+			if (coverEnd < regionEnd) {
+				replacements.push({ line, col: coverEnd, width: regionEnd - coverEnd });
+			}
+			regions.splice(i, 1, ...replacements);
+		}
 	}
 
 	private static readonly SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07";
@@ -1157,6 +1239,7 @@ export class TUI extends Container {
 		if (!fullscreen) return;
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
+		this.overlaySelectionRegions = [];
 
 		const transcript: string[] = [];
 		for (const component of fullscreen.scroll) {
@@ -1184,6 +1267,7 @@ export class TUI extends Container {
 			frame = this.compositeOverlays(frame, width, height);
 		}
 		const cursorPos = this.extractCursorPosition(frame, height);
+		fullscreen.viewport.applyFrameSelection(frame, height, this.overlaySelectionRegions);
 		this.applyLineResets(frame);
 		fullscreen.viewport.paint((data) => this.terminal.write(data), frame, width, height, cursorPos);
 		if (cursorPos && this.showHardwareCursor) {
@@ -1201,6 +1285,7 @@ export class TUI extends Container {
 			return;
 		}
 		// One-shot: consume here so it never leaks into a later render.
+		this.overlaySelectionRegions = [];
 		const preserveViewport = this.preserveViewportOnNextRender;
 		this.preserveViewportOnNextRender = false;
 		const width = this.terminal.columns;
