@@ -237,7 +237,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 	it("should trigger threshold compaction for error messages using last successful usage", async () => {
 		const model = session.model!;
-		const highUsageTokens = model.contextWindow;
+		const totalTokens = model.contextWindow - 16_384 + 1;
 
 		// A successful assistant message with high token usage (near context limit)
 		const successfulAssistant: AssistantMessage = {
@@ -247,11 +247,11 @@ describe("AgentSession auto-compaction queue resume", () => {
 			provider: model.provider,
 			model: model.id,
 			usage: {
-				input: highUsageTokens,
-				output: 0,
+				input: totalTokens - 10_000,
+				output: 10_000,
 				cacheRead: 0,
 				cacheWrite: 0,
-				totalTokens: highUsageTokens,
+				totalTokens,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			stopReason: "stop",

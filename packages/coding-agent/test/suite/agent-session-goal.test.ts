@@ -750,7 +750,7 @@ describe("AgentSession goals", () => {
 		expect(harness.session.goalState).toMatchObject({
 			active: false,
 			status: "error",
-			lastError: "invalid_api_key",
+			lastError: "invalid_api_key\n\nRun /login to update credentials.",
 		});
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});

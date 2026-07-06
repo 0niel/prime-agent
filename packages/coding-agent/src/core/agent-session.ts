@@ -64,7 +64,13 @@ import {
 	ORCHESTRATION_HEARTBEAT_SKILL_NAME,
 } from "./agent-observe.js";
 import { flushAgentTraceUpload } from "./agent-traces.js";
-import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.js";
+import {
+	addLoginGuidanceToAuthError,
+	formatAuthenticationFailedMessage,
+	formatNoApiKeyFoundMessage,
+	formatNoModelSelectedMessage,
+	isLikelyAuthenticationError,
+} from "./auth-guidance.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import {
 	type CompactionResult,
@@ -743,11 +749,7 @@ export class AgentSession {
 
 		const isOAuth = this._modelRegistry.isUsingOAuth(model);
 		if (isOAuth) {
-			throw new Error(
-				`Authentication failed for "${model.provider}". ` +
-					`Credentials may have expired or network is unavailable. ` +
-					`Run '/login ${model.provider}' to re-authenticate.`,
-			);
+			throw new Error(formatAuthenticationFailedMessage(model.provider));
 		}
 		throw new Error(formatNoApiKeyFoundMessage(model.provider));
 	}
@@ -1081,11 +1083,7 @@ export class AgentSession {
 		if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
 			const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
 			if (isOAuth) {
-				throw new Error(
-					`Authentication failed for "${this.model.provider}". ` +
-						`Credentials may have expired or network is unavailable. ` +
-						`Run '/login ${this.model.provider}' to re-authenticate.`,
-				);
+				throw new Error(formatAuthenticationFailedMessage(this.model.provider));
 			}
 			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 		}
@@ -1615,6 +1613,22 @@ export class AgentSession {
 		return undefined;
 	}
 
+	private _addLoginGuidanceToAuthError(event: AgentEvent): void {
+		const message =
+			event.type === "message_end" && event.message.role === "assistant"
+				? (event.message as AssistantMessage)
+				: event.type === "agent_end"
+					? this._findLastAssistantInMessages(event.messages)
+					: undefined;
+		if (!message || message.stopReason !== "error" || !message.errorMessage) {
+			return;
+		}
+		if (!isLikelyAuthenticationError(message.errorMessage)) {
+			return;
+		}
+		message.errorMessage = addLoginGuidanceToAuthError(message.errorMessage);
+	}
+
 	private async _processAgentEvent(event: AgentEvent): Promise<void> {
 		const acceptedPrompt = this._acceptedAgentMessagePrompt;
 		if (acceptedPrompt && (event.type === "message_start" || event.type === "message_end")) {
@@ -1683,6 +1697,8 @@ export class AgentSession {
 			);
 			return;
 		}
+
+		this._addLoginGuidanceToAuthError(event);
 
 		// Notify all listeners
 		this._emit(event);
@@ -2349,11 +2365,7 @@ export class AgentSession {
 			if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
 				const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
 				if (isOAuth) {
-					throw new Error(
-						`Authentication failed for "${this.model.provider}". ` +
-							`Credentials may have expired or network is unavailable. ` +
-							`Run '/login ${this.model.provider}' to re-authenticate.`,
-					);
+					throw new Error(formatAuthenticationFailedMessage(this.model.provider));
 				}
 				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
 			}

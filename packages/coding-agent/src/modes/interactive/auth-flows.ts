@@ -294,6 +294,17 @@ export class ProviderAuthFlows {
 			});
 		}
 
+		if (!options.some((option) => option.id === PRIME_INFERENCE_PROVIDER_ID)) {
+			const primeInferenceStatus = authStorage.getAuthStatus(PRIME_INFERENCE_PROVIDER_ID);
+			if (primeInferenceStatus.source === "prime_cli") {
+				options.push({
+					id: PRIME_INFERENCE_PROVIDER_ID,
+					name: PRIME_INFERENCE_PROVIDER_NAME,
+					authType: "api_key",
+				});
+			}
+		}
+
 		return options.sort((a, b) => a.name.localeCompare(b.name));
 	}
 
@@ -303,13 +314,14 @@ export class ProviderAuthFlows {
 		authType: "oauth" | "api_key",
 		statusSuffix?: string,
 		kind: "provider" | "service" = "provider",
+		credentialPath: string = getAuthPath(),
 	): Promise<AuthenticationResult> {
 		this.host.modelRegistry.refresh();
 
 		const actionLabel = authType === "oauth" ? `Logged in to ${providerName}` : `Saved API key for ${providerName}`;
 		await this.host.onAuthChanged?.();
 		this.host.showStatus(
-			`${actionLabel}. Credentials saved to ${getAuthPath()}${statusSuffix ? `. ${statusSuffix}` : ""}`,
+			`${actionLabel}. Credentials saved to ${credentialPath}${statusSuffix ? `. ${statusSuffix}` : ""}`,
 		);
 		this.host.onLoginCompleted?.();
 		return {
@@ -409,6 +421,24 @@ export class ProviderAuthFlows {
 	}
 
 	private getPrimeInferenceDefaultTeamStatus(): string {
+		const configPath = this.host.modelRegistry.authStorage.getPrimeCliConfigPath();
+		if (configPath) {
+			let config: ReturnType<typeof loadPrimeCliConfig>;
+			try {
+				config = loadPrimeCliConfig(configPath);
+			} catch {
+				return "Using personal account.";
+			}
+			if (config.teamIdFromEnv) {
+				return "Using team from PRIME_TEAM_ID.";
+			}
+			if (config.teamName) {
+				return `Using team "${config.teamName}".`;
+			}
+			if (config.teamId) {
+				return "Using Prime CLI team.";
+			}
+		}
 		const storedTeam = this.host.modelRegistry.authStorage.getPrimeInferenceTeamSelection();
 		if (storedTeam) {
 			return `Using team "${storedTeam.name}".`;
@@ -416,27 +446,12 @@ export class ProviderAuthFlows {
 		if (storedTeam === null) {
 			return "Using personal account.";
 		}
-		let config: ReturnType<typeof loadPrimeCliConfig>;
-		try {
-			config = loadPrimeCliConfig();
-		} catch {
-			return "Using personal account.";
-		}
-		if (config.teamIdFromEnv) {
-			return "Using team from PRIME_TEAM_ID.";
-		}
-		if (config.teamName) {
-			return `Using team "${config.teamName}".`;
-		}
-		if (config.teamId) {
-			return "Using Prime CLI team.";
-		}
 		return "Using personal account.";
 	}
 
 	private async selectPrimeInferenceTeam(apiKey: string, dialog: LoginDialogComponent): Promise<string | undefined> {
 		try {
-			const config = loadPrimeCliConfig();
+			const config = loadPrimeCliConfig(this.host.modelRegistry.authStorage.getPrimeCliConfigPath());
 			if (config.teamIdFromEnv) {
 				this.host.modelRegistry.authStorage.reload();
 				return "Using team from PRIME_TEAM_ID.";
@@ -474,14 +489,7 @@ export class ProviderAuthFlows {
 		dialog: LoginDialogComponent,
 		closeDialog: () => void,
 	): Promise<AuthenticationResult> {
-		const previousPrimeCredential = this.host.modelRegistry.authStorage.get(PRIME_INFERENCE_PROVIDER_ID);
-		const previousPrimeTeam =
-			previousPrimeCredential?.type === "api_key" ? previousPrimeCredential.primeTeam : undefined;
-		this.host.modelRegistry.authStorage.set(PRIME_INFERENCE_PROVIDER_ID, {
-			type: "api_key",
-			key: apiKey,
-			...(previousPrimeTeam !== undefined ? { primeTeam: previousPrimeTeam } : {}),
-		});
+		this.host.modelRegistry.authStorage.setPrimeInferenceApiKey(apiKey);
 		const teamStatus = await this.selectPrimeInferenceTeam(apiKey, dialog);
 
 		closeDialog();
@@ -490,6 +498,8 @@ export class ProviderAuthFlows {
 			PRIME_INFERENCE_PROVIDER_NAME,
 			"api_key",
 			teamStatus,
+			"provider",
+			this.host.modelRegistry.authStorage.getPrimeCliConfigPath() ?? getAuthPath(),
 		);
 	}
 
@@ -549,16 +559,21 @@ export class ProviderAuthFlows {
 		};
 
 		try {
-			const browserLogin = loginPrimeInference({
-				onAuth: (info) => {
-					dialog.showAuth(info.url, info.instructions);
-					armManualInput("Complete the sign-in in your browser, or paste an API key below:");
+			const browserLogin = loginPrimeInference(
+				{
+					onAuth: (info) => {
+						dialog.showAuth(info.url, info.instructions);
+						armManualInput("Complete the sign-in in your browser, or paste an API key below:");
+					},
+					onProgress: (message) => {
+						dialog.showProgress(message);
+					},
+					signal: browserAbort.signal,
 				},
-				onProgress: (message) => {
-					dialog.showProgress(message);
+				{
+					configPath: this.host.modelRegistry.authStorage.getPrimeCliConfigPath(),
 				},
-				signal: browserAbort.signal,
-			});
+			);
 			// When the browser challenge cannot start or breaks down, keep the dialog
 			// open and fall back to plain API key entry instead of failing outright.
 			const browserLoginOrFallback = browserLogin.catch((error: unknown) => {
@@ -592,7 +607,7 @@ export class ProviderAuthFlows {
 			if (result.source === "manual") {
 				browserAbort.abort();
 				dialog.showProgress("Checking Prime Inference access...");
-				const config = loadPrimeCliConfig();
+				const config = loadPrimeCliConfig(this.host.modelRegistry.authStorage.getPrimeCliConfigPath());
 				const access = await checkPrimeInferenceAccess(result.apiKey, config.baseUrl, { signal: dialog.signal });
 				if (dialog.signal.aborted) {
 					closeDialog();
