@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-07-06
+
 - Fixed the installer splash flickering during animation and resize by stabilizing full-screen redraws and removing misleading synthetic percentages ([ENG-4481](https://linear.app/primeintellect/issue/ENG-4481/installer-screen-is-unstable-and-flickery)).
 - Fixed Prime Inference auth syncing with Prime CLI login and team selection.
 - Fixed provider auth failures showing provider-specific `/login` commands instead of the `/login` selector.

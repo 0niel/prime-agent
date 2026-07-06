@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-07-06
+
 ## [0.2.5] - 2026-07-06
 
 - Added Claude Fable 5 to the Prime Inference model catalog and refreshed generated model metadata ([#317](https://github.com/PrimeIntellect-ai/prime-agent/pull/317)).

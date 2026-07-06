@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-07-06
+
 - Fixed fullscreen overlay selection so login URLs can be copied.
 
 ## [0.2.5] - 2026-07-06
