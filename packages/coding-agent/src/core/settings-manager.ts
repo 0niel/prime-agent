@@ -43,7 +43,7 @@ export interface TerminalSettings {
 	imageWidthCells?: number; // default: 60 (preferred inline image width in terminal cells)
 	clearOnShrink?: boolean; // default: false (clear empty rows when content shrinks)
 	showTerminalProgress?: boolean; // default: false (OSC 9;4 terminal progress indicators)
-	fullscreen?: boolean; // default: false (alternate-screen rendering with scrollable transcript)
+	fullscreen?: boolean; // default: true (alternate-screen rendering with scrollable transcript)
 	fullscreenMouse?: boolean; // default: true (wheel scrolling in fullscreen; disable if it breaks selection)
 }
 
@@ -1041,7 +1041,7 @@ export class SettingsManager {
 		if (process.env.PI_FULLSCREEN !== undefined) {
 			return process.env.PI_FULLSCREEN === "1";
 		}
-		return this.settings.terminal?.fullscreen ?? false;
+		return this.settings.terminal?.fullscreen ?? true;
 	}
 
 	setFullscreen(enabled: boolean): void {

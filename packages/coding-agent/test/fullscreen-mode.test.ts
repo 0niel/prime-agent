@@ -31,26 +31,27 @@ describe("fullscreen mode settings", () => {
 		}
 	});
 
-	it("defaults to off with mouse enabled", () => {
+	it("defaults to on with mouse enabled", () => {
 		const manager = SettingsManager.create(projectDir, agentDir);
-		expect(manager.getFullscreen()).toBe(false);
+		expect(manager.getFullscreen()).toBe(true);
 		expect(manager.getFullscreenMouse()).toBe(true);
 	});
 
-	it("persists the fullscreen toggle", async () => {
+	it("persists the fullscreen off toggle", async () => {
 		const manager = SettingsManager.create(projectDir, agentDir);
-		manager.setFullscreen(true);
+		manager.setFullscreen(false);
 		await manager.flush();
 
 		const settings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
-		expect(settings.terminal.fullscreen).toBe(true);
+		expect(settings.terminal.fullscreen).toBe(false);
 
 		const reloaded = SettingsManager.create(projectDir, agentDir);
-		expect(reloaded.getFullscreen()).toBe(true);
+		expect(reloaded.getFullscreen()).toBe(false);
 	});
 
 	it("PI_FULLSCREEN env var overrides the setting in both directions", () => {
 		const manager = SettingsManager.create(projectDir, agentDir);
+		manager.setFullscreen(false);
 
 		process.env.PI_FULLSCREEN = "1";
 		expect(manager.getFullscreen()).toBe(true);
