@@ -6,7 +6,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
+import { FullscreenViewport, type ScrollInfo } from "./fullscreen.js";
+import { getKeybindings } from "./keybindings.js";
 import { isKeyRelease, matchesKey } from "./keys.js";
+import { isMouseSequence, isWheelDown, isWheelUp, MOUSE_BUTTON_LEFT, parseSgrMouseEvent } from "./mouse.js";
 import type { Terminal } from "./terminal.js";
 import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.js";
 import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.js";
@@ -249,6 +252,8 @@ export class TUI extends Container {
 
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	public onDebug?: () => void;
+	/** Copies fullscreen mouse selections; when unset, OSC 52 is written directly. */
+	public onCopy?: (text: string) => void;
 	private renderRequested = false;
 	private renderTimer: NodeJS.Timeout | undefined;
 	private lastRenderAt = 0;
@@ -262,6 +267,26 @@ export class TUI extends Container {
 	private fullRedrawCount = 0;
 	private preserveViewportOnNextRender = false; // One-shot: repaint visible viewport in place instead of replaying scrollback
 	private stopped = false;
+
+	// While set, doRender paints fixed frames via the viewport; the inline
+	// differ's bookkeeping stays frozen in `inlineState` until exit.
+	private fullscreen: {
+		viewport: FullscreenViewport;
+		scroll: Component[];
+		dock: Component;
+		mouse: boolean;
+		inlineState: {
+			previousLines: string[];
+			previousKittyImageIds: Set<number>;
+			previousWidth: number;
+			previousHeight: number;
+			cursorRow: number;
+			hardwareCursorRow: number;
+			maxLinesRendered: number;
+			previousViewportTop: number;
+		};
+	} | null = null;
+	private static readonly WHEEL_SCROLL_LINES = 3;
 
 	// Overlay stack for modal components rendered on top of base content
 	private focusOrderCounter = 0;
@@ -474,6 +499,8 @@ export class TUI extends Container {
 	}
 
 	stop(): void {
+		// before the exit bookkeeping below, which assumes the primary screen
+		this.exitFullscreen();
 		this.stopped = true;
 		if (this.renderTimer) {
 			clearTimeout(this.renderTimer);
@@ -497,6 +524,7 @@ export class TUI extends Container {
 
 	requestRender(force = false): void {
 		if (force) {
+			this.fullscreen?.viewport.reset();
 			this.previousLines = [];
 			this.previousWidth = -1; // -1 triggers widthChanged, forcing a full clear
 			this.previousHeight = -1; // -1 triggers heightChanged, forcing a full clear
@@ -536,6 +564,100 @@ export class TUI extends Container {
 	requestRenderPreservingViewport(): void {
 		this.preserveViewportOnNextRender = true;
 		this.requestRender();
+	}
+
+	/**
+	 * Render a scrollable transcript window on the alternate screen with `dock`
+	 * pinned to the bottom rows; the primary screen stays untouched until exit.
+	 * Wheel tracking is enabled blind — probing is not viable (tmux never
+	 * answers DECRQM) and unsupporting terminals ignore the mode-sets.
+	 */
+	enterFullscreen(options: { scroll: Component[]; dock: Component; mouse?: boolean }): void {
+		if (this.fullscreen) return;
+		this.fullscreen = {
+			viewport: new FullscreenViewport(),
+			scroll: options.scroll,
+			dock: options.dock,
+			mouse: options.mouse !== false,
+			inlineState: {
+				previousLines: this.previousLines,
+				previousKittyImageIds: this.previousKittyImageIds,
+				previousWidth: this.previousWidth,
+				previousHeight: this.previousHeight,
+				cursorRow: this.cursorRow,
+				hardwareCursorRow: this.hardwareCursorRow,
+				maxLinesRendered: this.maxLinesRendered,
+				previousViewportTop: this.previousViewportTop,
+			},
+		};
+		this.terminal.enterAltScreen();
+		this.terminal.hideCursor();
+		if (options.mouse !== false) {
+			this.terminal.setMouseTracking(true);
+		}
+		this.requestRender();
+	}
+
+	/**
+	 * Leave fullscreen. The inline differ resumes against the entry snapshot,
+	 * so content produced while fullscreen flows into native scrollback.
+	 */
+	exitFullscreen(): void {
+		if (!this.fullscreen) return;
+		const { inlineState } = this.fullscreen;
+		this.fullscreen = null;
+		this.terminal.setMouseTracking(false);
+		this.terminal.leaveAltScreen();
+		this.previousLines = inlineState.previousLines;
+		this.previousKittyImageIds = inlineState.previousKittyImageIds;
+		this.previousWidth = inlineState.previousWidth;
+		this.previousHeight = inlineState.previousHeight;
+		this.cursorRow = inlineState.cursorRow;
+		this.hardwareCursorRow = inlineState.hardwareCursorRow;
+		this.maxLinesRendered = inlineState.maxLinesRendered;
+		this.previousViewportTop = inlineState.previousViewportTop;
+		// synchronous so the flush also happens on shutdown, where a scheduled render never fires
+		if (!this.stopped) {
+			this.doRender();
+		}
+	}
+
+	isFullscreen(): boolean {
+		return this.fullscreen !== null;
+	}
+
+	/** Scroll the fullscreen transcript window (negative = up). */
+	scrollBy(lines: number): void {
+		if (!this.fullscreen) return;
+		this.fullscreen.viewport.scrollBy(lines);
+		this.requestRender();
+	}
+
+	scrollToTop(): void {
+		if (!this.fullscreen) return;
+		this.fullscreen.viewport.scrollToTop();
+		this.requestRender();
+	}
+
+	scrollToBottom(): void {
+		if (!this.fullscreen) return;
+		this.fullscreen.viewport.scrollToBottom();
+		this.requestRender();
+	}
+
+	/** Scroll state of the fullscreen window, or null when not fullscreen. */
+	getScrollInfo(): ScrollInfo | null {
+		return this.fullscreen?.viewport.scrollInfo() ?? null;
+	}
+
+	private copySelection(text: string): void {
+		if (this.onCopy) {
+			this.onCopy(text);
+			return;
+		}
+		// fallback: OSC 52 works locally, over SSH, and through tmux (set-clipboard)
+		const base64 = Buffer.from(text, "utf8").toString("base64");
+		this.terminal.write(`\x1b]52;c;${base64}\x07`);
 	}
 
 	private scheduleRender(): void {
@@ -587,6 +709,10 @@ export class TUI extends Container {
 			return;
 		}
 
+		if (this.fullscreen && this.handleFullscreenInput(data)) {
+			return;
+		}
+
 		// If focused component is an overlay, verify it's still visible
 		// (visibility can change due to terminal resize or visible() callback)
 		const focusedOverlay = this.overlayStack.find((o) => o.component === this.focusedComponent);
@@ -611,6 +737,63 @@ export class TUI extends Container {
 			this.focusedComponent.handleInput(data);
 			this.requestRender();
 		}
+	}
+
+	// Mouse reports are always consumed (nothing downstream understands them);
+	// viewport keys are skipped while an overlay has focus so selectors keep
+	// their own pageUp/pageDown.
+	private handleFullscreenInput(data: string): boolean {
+		const fullscreen = this.fullscreen;
+		if (!fullscreen) return false;
+
+		const overlayFocused = this.overlayStack.some((o) => o.component === this.focusedComponent);
+
+		if (isMouseSequence(data)) {
+			// consumed even when disabled — mouse reports are garbage downstream
+			const event = fullscreen.mouse ? parseSgrMouseEvent(data) : null;
+			if (event && !overlayFocused) {
+				const viewport = fullscreen.viewport;
+				if (isWheelUp(event)) {
+					this.scrollBy(-TUI.WHEEL_SCROLL_LINES);
+				} else if (isWheelDown(event)) {
+					this.scrollBy(TUI.WHEEL_SCROLL_LINES);
+				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
+					viewport.beginSelection(event.y - 1, event.x - 1);
+					this.requestRender();
+				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && event.motion) {
+					viewport.extendSelection(event.y - 1, event.x - 1);
+					this.requestRender();
+				} else if (!event.press && viewport.hasSelection()) {
+					const text = viewport.endSelection();
+					if (text) this.copySelection(text);
+					this.requestRender();
+				} else if (!event.press) {
+					viewport.clearSelection();
+				}
+			}
+			return true;
+		}
+
+		if (overlayFocused) return false;
+
+		const keybindings = getKeybindings();
+		if (keybindings.matches(data, "tui.viewport.pageUp")) {
+			this.scrollBy(-fullscreen.viewport.pageSize());
+			return true;
+		}
+		if (keybindings.matches(data, "tui.viewport.pageDown")) {
+			this.scrollBy(fullscreen.viewport.pageSize());
+			return true;
+		}
+		if (keybindings.matches(data, "tui.viewport.top")) {
+			this.scrollToTop();
+			return true;
+		}
+		if (keybindings.matches(data, "tui.viewport.follow")) {
+			this.scrollToBottom();
+			return true;
+		}
+		return false;
 	}
 
 	private consumeCellSizeResponse(data: string): boolean {
@@ -969,8 +1152,54 @@ export class TUI extends Container {
 		return null;
 	}
 
+	private renderFullscreen(): void {
+		const fullscreen = this.fullscreen;
+		if (!fullscreen) return;
+		const width = this.terminal.columns;
+		const height = this.terminal.rows;
+
+		const transcript: string[] = [];
+		for (const component of fullscreen.scroll) {
+			for (const line of component.render(width)) {
+				transcript.push(line);
+			}
+		}
+		const dock = fullscreen.dock.render(width);
+
+		let frame = fullscreen.viewport.composeFrame(transcript, dock, height);
+		const scrollInfo = fullscreen.viewport.scrollInfo();
+		if (!scrollInfo.following) {
+			// Follow hint composited over the bottom of the transcript window,
+			// just above the dock. Overlays still paint on top of it.
+			const followKey = getKeybindings().getKeys("tui.viewport.follow")[0] ?? "alt+down";
+			const label = ` ${followKey} to follow `;
+			const labelWidth = visibleWidth(label);
+			const row = fullscreen.viewport.windowHeight() - 1;
+			if (row >= 0 && row < frame.length && labelWidth <= width) {
+				const col = Math.floor((width - labelWidth) / 2);
+				frame[row] = this.compositeLineAt(frame[row], `\x1b[7m${label}\x1b[27m`, col, labelWidth, width);
+			}
+		}
+		if (this.overlayStack.length > 0) {
+			frame = this.compositeOverlays(frame, width, height);
+		}
+		const cursorPos = this.extractCursorPosition(frame, height);
+		this.applyLineResets(frame);
+		fullscreen.viewport.paint((data) => this.terminal.write(data), frame, width, height, cursorPos);
+		if (cursorPos && this.showHardwareCursor) {
+			this.terminal.showCursor();
+		} else {
+			this.terminal.hideCursor();
+		}
+	}
+
 	private doRender(): void {
 		if (this.stopped) return;
+		if (this.fullscreen) {
+			this.preserveViewportOnNextRender = false;
+			this.renderFullscreen();
+			return;
+		}
 		// One-shot: consume here so it never leaks into a later render.
 		const preserveViewport = this.preserveViewportOnNextRender;
 		this.preserveViewportOnNextRender = false;

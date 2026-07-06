@@ -507,6 +507,11 @@ export class InteractiveMode {
 	private fdPath: string | undefined;
 	private mainContainer: Container;
 	private mainViewContainer: Container;
+	// prompt bar (editor + footer slot) — the only thing pinned to the bottom in fullscreen
+	private promptDock: Container;
+	// wraps the active footer so custom-footer swaps reflect in both layouts
+	private footerSlot: Container;
+	private fullscreenEnabled = false;
 	private editorContainer: Container;
 	private footer: FooterComponent;
 	private footerDataProvider: FooterDataProvider;
@@ -681,6 +686,9 @@ export class InteractiveMode {
 		this.version = VERSION;
 		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
+		this.ui.onCopy = (text) => {
+			void copyToClipboard(text).catch(() => undefined);
+		};
 		this.headerContainer = new Container();
 		this.chatContainer = new Container();
 		this.pendingMessagesContainer = new Container();
@@ -709,10 +717,14 @@ export class InteractiveMode {
 			paddingX: editorPaddingX,
 			autocompleteMaxVisible,
 			isArgumentCommand: builtinSlashCommandTakesArgument,
+			placeholder: "Type a message, / for commands",
+			placeholderColor: (text) => theme.fg("dim", text),
 		});
 		this.editor = this.defaultEditor;
 		this.mainContainer = new Container();
 		this.mainViewContainer = new Container();
+		this.promptDock = new Container();
+		this.footerSlot = new Container();
 		this.restoreMainAgentView();
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
@@ -969,7 +981,11 @@ export class InteractiveMode {
 		this.mainContainer.addChild(this.editorContainer);
 		this.mainContainer.addChild(this.childAgentSummary);
 		this.mainContainer.addChild(this.widgetContainerBelow);
-		this.mainContainer.addChild(this.footer);
+		this.footerSlot.addChild(this.footer);
+		this.mainContainer.addChild(this.footerSlot);
+		this.promptDock.addChild(this.editorContainer);
+		this.promptDock.addChild(this.childAgentSummary);
+		this.promptDock.addChild(this.footerSlot);
 		this.ui.addChild(this.mainContainer);
 		this.ui.setFocus(this.editor);
 
@@ -978,6 +994,10 @@ export class InteractiveMode {
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
+		this.fullscreenEnabled = this.settingsManager.getFullscreen() && process.stdout.isTTY === true;
+		if (this.fullscreenEnabled) {
+			this.applyFullscreen(true);
+		}
 		this.isInitialized = true;
 
 		// Initialize extensions first so resources are shown before messages
@@ -2809,21 +2829,18 @@ export class InteractiveMode {
 			this.customFooter.dispose();
 		}
 
-		// Remove current footer from the main container (the footer lives there, not on the root UI)
 		if (this.customFooter) {
-			this.mainContainer.removeChild(this.customFooter);
+			this.footerSlot.removeChild(this.customFooter);
 		} else {
-			this.mainContainer.removeChild(this.footer);
+			this.footerSlot.removeChild(this.footer);
 		}
 
 		if (factory) {
-			// Create and add custom footer, passing the data provider
 			this.customFooter = factory(this.ui, theme, this.footerDataProvider);
-			this.mainContainer.addChild(this.customFooter);
+			this.footerSlot.addChild(this.customFooter);
 		} else {
-			// Restore built-in footer
 			this.customFooter = undefined;
-			this.mainContainer.addChild(this.footer);
+			this.footerSlot.addChild(this.footer);
 		}
 
 		this.ui.requestRender();
@@ -3634,6 +3651,17 @@ export class InteractiveMode {
 			if (commandName === "reload" && !commandArgs) {
 				this.editor.setText("");
 				await this.handleReloadCommand();
+				return;
+			}
+			if (commandName === "fullscreen") {
+				this.editor.setText("");
+				const arg = commandArgs?.trim().toLowerCase();
+				if (arg && arg !== "on" && arg !== "off") {
+					this.showError("Usage: /fullscreen [on|off]");
+					return;
+				}
+				const enable = arg === "on" ? true : arg === "off" ? false : !this.fullscreenEnabled;
+				this.setFullscreenMode(enable);
 				return;
 			}
 			if (commandName === "debug" && !commandArgs) {
@@ -5390,6 +5418,10 @@ export class InteractiveMode {
 			clearInterval(suspendKeepAlive);
 			process.removeListener("SIGINT", ignoreSigint);
 			this.ui.start();
+			// ui.stop() left the alt screen before suspending; re-enter it
+			if (this.fullscreenEnabled) {
+				this.applyFullscreen(true);
+			}
 			this.ui.requestRender(true);
 		});
 
@@ -5455,6 +5487,44 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	/** Enter or leave fullscreen rendering without touching the persisted setting. */
+	private applyFullscreen(enabled: boolean): void {
+		if (enabled) {
+			if (!process.stdout.isTTY) return;
+			this.ui.enterFullscreen({
+				scroll: [
+					this.headerContainer,
+					this.mainViewContainer,
+					this.widgetContainerAbove,
+					this.recapContainer,
+					this.queuedMessagesContainer,
+					this.widgetContainerBelow,
+				],
+				dock: this.promptDock,
+				mouse: this.settingsManager.getFullscreenMouse(),
+			});
+		} else {
+			this.ui.exitFullscreen();
+		}
+	}
+
+	private setFullscreenMode(enabled: boolean): void {
+		this.settingsManager.setFullscreen(enabled);
+		if (enabled && !process.stdout.isTTY) {
+			this.fullscreenEnabled = false;
+			this.showStatus("Fullscreen rendering requires an interactive terminal");
+			return;
+		}
+		this.fullscreenEnabled = enabled;
+		this.applyFullscreen(enabled);
+		const followKey = this.getEditorKeyDisplay("tui.viewport.follow");
+		this.showStatus(
+			enabled
+				? `Fullscreen rendering on — wheel/pageUp scroll, ${followKey} follows output`
+				: "Fullscreen rendering off",
+		);
+	}
+
 	private toggleToolOutputExpansion(): void {
 		this.setToolsExpanded(!this.toolOutputExpanded);
 	}
@@ -5474,7 +5544,12 @@ export class InteractiveMode {
 		// Expanding/collapsing changes blocks above the viewport, which would
 		// otherwise force a full redraw that scrolls to the top and replays the
 		// whole transcript. Keep the user anchored at their current position.
-		this.ui.requestRenderPreservingViewport();
+		// Fullscreen frames have no scrollback to preserve.
+		if (this.ui.isFullscreen()) {
+			this.ui.requestRender();
+		} else {
+			this.ui.requestRenderPreservingViewport();
+		}
 	}
 
 	private toggleThinkingBlockVisibility(): void {
@@ -5547,6 +5622,10 @@ export class InteractiveMode {
 
 			// Restart TUI
 			this.ui.start();
+			// ui.stop() left fullscreen so the editor got a clean terminal
+			if (this.fullscreenEnabled) {
+				this.applyFullscreen(true);
+			}
 			// Force full re-render since external editor uses alternate screen
 			this.ui.requestRender(true);
 		}
@@ -5840,6 +5919,7 @@ export class InteractiveMode {
 					quietStartup: this.settingsManager.getQuietStartup(),
 					clearOnShrink: this.settingsManager.getClearOnShrink(),
 					showTerminalProgress: this.settingsManager.getShowTerminalProgress(),
+					fullscreen: this.fullscreenEnabled,
 					warnings: this.settingsManager.getWarnings(),
 				},
 				{
@@ -5966,6 +6046,9 @@ export class InteractiveMode {
 					},
 					onShowTerminalProgressChange: (enabled) => {
 						this.settingsManager.setShowTerminalProgress(enabled);
+					},
+					onFullscreenChange: (enabled) => {
+						this.setFullscreenMode(enabled);
 					},
 					onWarningsChange: (warnings) => {
 						this.settingsManager.setWarnings(warnings);
@@ -7520,6 +7603,12 @@ export class InteractiveMode {
 		const dequeue = this.getAppKeyDisplay("app.message.dequeue");
 		const pasteImage = this.getAppKeyDisplay("app.clipboard.pasteImage");
 
+		// Fullscreen viewport keybindings
+		const viewportPageUp = this.getEditorKeyDisplay("tui.viewport.pageUp");
+		const viewportPageDown = this.getEditorKeyDisplay("tui.viewport.pageDown");
+		const viewportTop = this.getEditorKeyDisplay("tui.viewport.top");
+		const viewportFollow = this.getEditorKeyDisplay("tui.viewport.follow");
+
 		let hotkeys = `
 **Navigation**
 | Key | Action |
@@ -7562,6 +7651,14 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 | \`${dequeue}\` | Restore queued messages |
 | \`${pasteImage}\` | Paste image from clipboard |
 | \`/\` | Slash commands |
+
+**Fullscreen mode (\`/fullscreen\`)**
+| Key | Action |
+|-----|--------|
+| \`${viewportPageUp}\` / \`${viewportPageDown}\` | Scroll transcript by page |
+| \`${viewportTop}\` | Scroll to top |
+| \`${viewportFollow}\` | Scroll to bottom and follow output |
+| mouse wheel | Scroll transcript |
 `;
 
 		// Add extension-registered shortcuts

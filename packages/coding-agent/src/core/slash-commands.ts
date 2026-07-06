@@ -82,6 +82,12 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	},
 	{ name: "resume", description: "Resume a different session" },
 	{ name: "reload", description: "Reload keybindings, extensions, skills, prompts, and themes" },
+	{
+		name: "fullscreen",
+		description: "Toggle fullscreen (alternate screen) rendering with scrollable transcript",
+		argumentHint: "[on|off]",
+		takesArgument: true,
+	},
 	{ name: "quit", description: `Quit ${APP_NAME}` },
 ];
 

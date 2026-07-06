@@ -1485,7 +1485,11 @@ describe("InteractiveMode.setToolsExpanded", () => {
 			builtInHeader: header,
 			chatContainer: { children: [chatChild] },
 			childAgentDetail,
-			ui: { requestRender: vi.fn(), requestRenderPreservingViewport: vi.fn() },
+			ui: {
+				requestRender: vi.fn(),
+				requestRenderPreservingViewport: vi.fn(),
+				isFullscreen: vi.fn().mockReturnValue(false),
+			},
 		};
 
 		(InteractiveMode as any).prototype.setToolsExpanded.call(fakeThis, true);

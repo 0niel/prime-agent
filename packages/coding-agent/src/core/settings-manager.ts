@@ -43,6 +43,8 @@ export interface TerminalSettings {
 	imageWidthCells?: number; // default: 60 (preferred inline image width in terminal cells)
 	clearOnShrink?: boolean; // default: false (clear empty rows when content shrinks)
 	showTerminalProgress?: boolean; // default: false (OSC 9;4 terminal progress indicators)
+	fullscreen?: boolean; // default: false (alternate-screen rendering with scrollable transcript)
+	fullscreenMouse?: boolean; // default: true (wheel scrolling in fullscreen; disable if it breaks selection)
 }
 
 export interface ImageSettings {
@@ -1031,6 +1033,36 @@ export class SettingsManager {
 		}
 		this.globalSettings.terminal.clearOnShrink = enabled;
 		this.markModified("terminal", "clearOnShrink");
+		this.save();
+	}
+
+	getFullscreen(): boolean {
+		// Env var overrides the setting (both directions) for one-off runs
+		if (process.env.PI_FULLSCREEN !== undefined) {
+			return process.env.PI_FULLSCREEN === "1";
+		}
+		return this.settings.terminal?.fullscreen ?? false;
+	}
+
+	setFullscreen(enabled: boolean): void {
+		if (!this.globalSettings.terminal) {
+			this.globalSettings.terminal = {};
+		}
+		this.globalSettings.terminal.fullscreen = enabled;
+		this.markModified("terminal", "fullscreen");
+		this.save();
+	}
+
+	getFullscreenMouse(): boolean {
+		return this.settings.terminal?.fullscreenMouse ?? true;
+	}
+
+	setFullscreenMouse(enabled: boolean): void {
+		if (!this.globalSettings.terminal) {
+			this.globalSettings.terminal = {};
+		}
+		this.globalSettings.terminal.fullscreenMouse = enabled;
+		this.markModified("terminal", "fullscreenMouse");
 		this.save();
 	}
 

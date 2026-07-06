@@ -765,6 +765,11 @@ function wrapSingleLine(line: string, width: number): string[] {
 
 const PUNCTUATION_REGEX = /[(){}[\]<>.,;:'"!?+\-=*/\\|&%^$#@~`]/;
 
+/** Remove all escape sequences (CSI, OSC, DCS/APC, two-char) leaving plain text. */
+export function stripAnsi(str: string): string {
+	return str.replace(/\x1b(?:\[[0-9;:?<=>]*[\x40-\x7e]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[P_^X][^\x1b]*\x1b\\|.)/g, "");
+}
+
 /**
  * Check if a character is whitespace.
  */

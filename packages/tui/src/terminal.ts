@@ -57,6 +57,18 @@ export interface Terminal {
 	clearFromCursor(): void; // Clear from cursor to end of screen
 	clearScreen(): void; // Clear entire screen and move cursor to (0,0)
 
+	// Alternate screen buffer. The primary screen (and its scrollback) is left
+	// untouched while the alt screen is active, so a full-screen view can be
+	// shown and dismissed without disturbing the transcript history.
+	enterAltScreen(): void;
+	leaveAltScreen(): void;
+	get altScreenActive(): boolean;
+
+	// SGR mouse tracking (?1000 + ?1006); motion tracking is deliberately never
+	// enabled so native drag-selection keeps working.
+	setMouseTracking(enabled: boolean): void;
+	get mouseTrackingActive(): boolean;
+
 	// Title operations
 	setTitle(title: string): void; // Set terminal window title
 
@@ -73,6 +85,8 @@ export class ProcessTerminal implements Terminal {
 	private resizeHandler?: () => void;
 	private _kittyProtocolActive = false;
 	private _modifyOtherKeysActive = false;
+	private _altScreenActive = false;
+	private _mouseTrackingActive = false;
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
 	private progressInterval?: ReturnType<typeof setInterval>;
@@ -334,6 +348,16 @@ export class ProcessTerminal implements Terminal {
 			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}
 
+		// never strand the user on the alt screen or with mouse tracking on
+		if (this._mouseTrackingActive) {
+			process.stdout.write("\x1b[?1006l\x1b[?1002l");
+			this._mouseTrackingActive = false;
+		}
+		if (this._altScreenActive) {
+			process.stdout.write("\x1b[?1049l");
+			this._altScreenActive = false;
+		}
+
 		// Disable bracketed paste mode
 		process.stdout.write("\x1b[?2004l");
 
@@ -424,6 +448,34 @@ export class ProcessTerminal implements Terminal {
 
 	clearScreen(): void {
 		process.stdout.write("\x1b[2J\x1b[H"); // Clear screen and move to home (1,1)
+	}
+
+	enterAltScreen(): void {
+		if (this._altScreenActive) return;
+		this._altScreenActive = true;
+		this.write("\x1b[?1049h");
+	}
+
+	leaveAltScreen(): void {
+		if (!this._altScreenActive) return;
+		this._altScreenActive = false;
+		this.write("\x1b[?1049l");
+	}
+
+	get altScreenActive(): boolean {
+		return this._altScreenActive;
+	}
+
+	setMouseTracking(enabled: boolean): void {
+		if (enabled === this._mouseTrackingActive) return;
+		this._mouseTrackingActive = enabled;
+		// ?1002 (button-event tracking) reports drag motion for in-app selection
+		// but not hover, keeping passive mouse movement unreported.
+		this.write(enabled ? "\x1b[?1002h\x1b[?1006h" : "\x1b[?1006l\x1b[?1002l");
+	}
+
+	get mouseTrackingActive(): boolean {
+		return this._mouseTrackingActive;
 	}
 
 	setTitle(title: string): void {

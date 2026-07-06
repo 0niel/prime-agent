@@ -29,6 +29,8 @@ export { Text } from "./components/text.js";
 export { TruncatedText } from "./components/truncated-text.js";
 // Editor component interface (for custom editors)
 export type { EditorComponent } from "./editor-component.js";
+// Fullscreen (alternate-screen) viewport
+export { FullscreenViewport, type ScrollInfo } from "./fullscreen.js";
 // Fuzzy matching
 export { type FuzzyMatch, fuzzyFilter, fuzzyFilterScored, fuzzyMatch, type ScoredItem } from "./fuzzy.js";
 // Keybindings
@@ -59,6 +61,16 @@ export {
 } from "./keys.js";
 // LaTeX math to Unicode conversion
 export { latexToUnicode } from "./latex.js";
+// SGR mouse event parsing
+export {
+	isMouseSequence,
+	isWheelDown,
+	isWheelUp,
+	MOUSE_WHEEL_DOWN,
+	MOUSE_WHEEL_UP,
+	type MouseEvent,
+	parseSgrMouseEvent,
+} from "./mouse.js";
 // Render caching
 export { VersionedRenderCache } from "./render-cache.js";
 // Input buffering for batch splitting
