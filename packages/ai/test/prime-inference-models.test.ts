@@ -30,7 +30,6 @@ describe("Prime Inference models", () => {
 				"nvidia/nemotron-3-super-120b-a12b",
 				"openai/gpt-5.4",
 				"openai/gpt-5.5",
-				"prime-intellect/intellect-3",
 				"qwen/qwen3-coder-next",
 				"qwen/qwen3-vl-235b-a22b-thinking",
 				"x-ai/grok-4.20",

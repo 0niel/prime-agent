@@ -51,13 +51,12 @@ describeIfKernel("kernel state snapshot round-trip (real kernel)", () => {
 			await writer.execute("x = 42");
 			await writer.execute("df = [1, 2, 3]");
 			await writer.execute("def double(n):\n    return n * 2");
-			await writer.execute("import socket\nsock = socket.socket()");
+			await writer.execute("gen = (n for n in range(3))");
 
 			const snap = await writer.snapshotState();
 			expect(snap).not.toBeNull();
 			expect(snap?.saved).toEqual(expect.arrayContaining(["x", "df", "double"]));
-			// A live socket cannot be pickled and must be reported, not silently dropped.
-			expect(snap?.skipped.map((s) => s.name)).toContain("sock");
+			expect(snap?.skipped.map((s) => s.name)).toContain("gen");
 			expect(existsSync(snapshotPath)).toBe(true);
 			expect(existsSync(manifestPath)).toBe(true);
 		} finally {
