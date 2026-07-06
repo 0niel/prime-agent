@@ -2,13 +2,21 @@
 
 ## [Unreleased]
 
-- Added daemon-backed user orchestration with agent-to-agent messaging and read-only observation of active sessions.
-- Added an orchestration heartbeat skill for compact multi-session progress, blocker, and action summaries.
-- Added an opt-in auto-refine review hook that can ask whether `/refine` should run after turn intervals or compaction checkpoints.
-- Changed `--resume` to accept an optional session path or ID.
-- Added prompt stashing so a draft can be temporarily saved, a separate prompt or command can run, and the draft is restored afterward.
-- Changed fullscreen TUI rendering to be enabled by default.
-- Changed the installer onboarding splash to show ordered setup phases with a percentage instead of cycling detail text ([ENG-4376](https://linear.app/primeintellect/issue/ENG-4376/onboarding-instructions-should-be-accurate-to-whats-happening)).
+## [0.2.5] - 2026-07-06
+
+- Added daemon-backed user orchestration with agent-to-agent messaging and read-only observation of active sessions ([#207](https://github.com/PrimeIntellect-ai/prime-agent/pull/207) by [@sethkarten](https://github.com/sethkarten)).
+- Added an orchestration heartbeat skill for compact multi-session progress, blocker, and action summaries ([#207](https://github.com/PrimeIntellect-ai/prime-agent/pull/207) by [@sethkarten](https://github.com/sethkarten)).
+- Added an opt-in auto-refine review hook that can ask whether `/refine` should run after turn intervals or compaction checkpoints ([#201](https://github.com/PrimeIntellect-ai/prime-agent/pull/201) by [@sethkarten](https://github.com/sethkarten)).
+- Added opt-in fullscreen mode with a scrollable transcript, pinned prompt bar, mouse selection, and `/fullscreen` controls ([#316](https://github.com/PrimeIntellect-ai/prime-agent/pull/316)).
+- Added prompt stashing so a draft can be temporarily saved, a separate prompt or command can run, and the draft is restored afterward ([#321](https://github.com/PrimeIntellect-ai/prime-agent/pull/321)).
+- Added resume support to the agents view so stored sessions can be attached and managed without leaving the view ([#318](https://github.com/PrimeIntellect-ai/prime-agent/pull/318)).
+- Added subagent delegation guidance to encourage parallel and background `rlm` calls when recursion is available ([#306](https://github.com/PrimeIntellect-ai/prime-agent/pull/306) by [@alexzhang13](https://github.com/alexzhang13)).
+- Changed fullscreen TUI rendering to be enabled by default ([#325](https://github.com/PrimeIntellect-ai/prime-agent/pull/325)).
+- Changed `--resume` to accept an optional session path or ID ([#319](https://github.com/PrimeIntellect-ai/prime-agent/pull/319)).
+- Changed the installer onboarding splash to show ordered setup phases with a percentage instead of cycling detail text ([#327](https://github.com/PrimeIntellect-ai/prime-agent/pull/327), [ENG-4376](https://linear.app/primeintellect/issue/ENG-4376/onboarding-instructions-should-be-accurate-to-whats-happening)).
+- Changed provider stream failures to show classified diagnostics and request IDs, with structured agent logs for debugging ([#313](https://github.com/PrimeIntellect-ai/prime-agent/pull/313)).
+- Fixed daemon-hosted extensions sharing the wrong Herdr pane environment across concurrent sessions ([#303](https://github.com/PrimeIntellect-ai/prime-agent/pull/303)).
+- Fixed parallel subagent guidance failing on first use by pre-importing `asyncio` in the IPython kernel bootstrap ([#315](https://github.com/PrimeIntellect-ai/prime-agent/pull/315)).
 
 ## [0.2.4] - 2026-07-01
 
