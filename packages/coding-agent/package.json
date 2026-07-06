@@ -1,7 +1,7 @@
 {
 	"name": "@earendil-works/pi-coding-agent",
 	"version": "0.2.5",
-	"description": "Coding agent CLI with ipython, bash, edit tools and session management",
+	"description": "Coding agent CLI with IPython-backed tools and session management",
 	"type": "module",
 	"piConfig": {
 		"name": "prime-agent",

@@ -5,6 +5,7 @@ import { beforeAll, describe, expect, test } from "vitest";
 import type { ToolDefinition } from "../src/core/extensions/types.js";
 import { type BashOperations, createBashTool, createBashToolDefinition } from "../src/core/tools/bash.js";
 import { createEditToolDefinition } from "../src/core/tools/edit.js";
+import { createAgentConnectionToolDefinition } from "../src/modes/agent-connection/tool-definition.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../src/modes/interactive/theme/working-icon.js";
@@ -26,6 +27,14 @@ function createFakeTui(): TUI {
 	return {
 		requestRender: () => {},
 	} as unknown as TUI;
+}
+
+function createMetadataOnlyToolDefinition(definition: ToolDefinition<any, any>) {
+	const metadata = createAgentConnectionToolDefinition(definition);
+	if (!metadata) {
+		throw new Error("expected tool metadata");
+	}
+	return metadata;
 }
 
 async function waitForCondition(condition: () => boolean): Promise<void> {
@@ -198,7 +207,7 @@ describe("ToolExecutionComponent parity", () => {
 		}
 	});
 
-	test("uses built-in rendering for built-in overrides without custom renderers", () => {
+	test("does not apply legacy replay renderers to custom overrides without renderers", () => {
 		const overrideDefinition: ToolDefinition = {
 			...createBaseToolDefinition("edit"),
 		};
@@ -214,9 +223,9 @@ describe("ToolExecutionComponent parity", () => {
 		);
 		component.updateResult({ content: [], details: { diff: "+1 after", firstChangedLine: 1 }, isError: false });
 		const rendered = stripAnsi(component.render(120).join("\n"));
-		expect(rendered).toContain("edit");
-		expect(rendered).toContain("README.md");
-		expect(rendered).not.toContain(":1");
+		expect(rendered).toContain("edit · done");
+		expect(rendered).not.toContain("README.md");
+		expect(rendered).not.toContain("+1 after");
 	});
 
 	test("preserves legacy file_path rendering compatibility for built-in tools", () => {
@@ -232,6 +241,61 @@ describe("ToolExecutionComponent parity", () => {
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered).toContain("edit");
 		expect(rendered).toContain("README.md");
+	});
+
+	test("uses legacy replay renderers for metadata-only built-in definitions", () => {
+		const bashComponent = new ToolExecutionComponent(
+			"bash",
+			"tool-3b",
+			{ command: "echo hello" },
+			{},
+			createMetadataOnlyToolDefinition(createBashToolDefinition(process.cwd())),
+			createFakeTui(),
+			process.cwd(),
+		);
+		bashComponent.updateResult({ content: [{ type: "text", text: "hello" }], isError: false }, false);
+		expect(stripAnsi(bashComponent.render(120).join("\n"))).toContain("$ echo hello");
+
+		const legacyEditMetadata = {
+			...createMetadataOnlyToolDefinition(createEditToolDefinition(process.cwd())),
+			description: "Legacy edit metadata from an older session.",
+			promptSnippet: "Legacy edit prompt.",
+		};
+		const editComponent = new ToolExecutionComponent(
+			"edit",
+			"tool-3c",
+			{ path: "README.md", oldText: "before", newText: "after" },
+			{},
+			legacyEditMetadata,
+			createFakeTui(),
+			process.cwd(),
+		);
+		editComponent.updateResult({ content: [], details: { diff: "+1 after", firstChangedLine: 1 }, isError: false });
+		expect(stripAnsi(editComponent.render(120).join("\n"))).toContain("README.md");
+	});
+
+	test("does not use legacy replay renderers for metadata-only custom collisions", () => {
+		const customEditDefinition: ToolDefinition = {
+			...createBaseToolDefinition("edit"),
+			parameters: Type.Object({
+				path: Type.String(),
+			}),
+		};
+
+		const component = new ToolExecutionComponent(
+			"edit",
+			"tool-3d",
+			{ path: "README.md", oldText: "before", newText: "after" },
+			{},
+			createMetadataOnlyToolDefinition(customEditDefinition),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult({ content: [], details: { diff: "+1 after", firstChangedLine: 1 }, isError: false });
+		const rendered = stripAnsi(component.render(120).join("\n"));
+		expect(rendered).toContain("edit · done");
+		expect(rendered).not.toContain("README.md");
+		expect(rendered).not.toContain("+1 after");
 	});
 
 	test("bash execute emits an initial empty partial update before output arrives", async () => {
@@ -272,7 +336,7 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered.match(/\bedit\b/g)?.length ?? 0).toBe(1);
 	});
 
-	test("inherits missing built-in result renderer slot from the built-in tool", () => {
+	test("uses the generic result fallback for legacy-named custom tools", () => {
 		const overrideDefinition: ToolDefinition = {
 			...createBaseToolDefinition("bash"),
 			renderCall: () => new Text("override call", 0, 0),
@@ -293,7 +357,7 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).toContain("hello");
 	});
 
-	test("inherits missing built-in call renderer slot from the built-in tool", () => {
+	test("does not apply legacy replay call renderers to custom result renderers", () => {
 		const overrideDefinition: ToolDefinition = {
 			...createBaseToolDefinition("bash"),
 			renderResult: () => new Text("override result", 0, 0),
@@ -310,8 +374,8 @@ describe("ToolExecutionComponent parity", () => {
 		);
 		component.updateResult({ content: [{ type: "text", text: "hello" }], details: undefined, isError: false }, false);
 		const rendered = stripAnsi(component.render(120).join("\n"));
-		expect(rendered).toContain("echo hello");
 		expect(rendered).toContain("override result");
+		expect(rendered).not.toContain("echo hello");
 	});
 
 	test("uses custom renderers for built-in overrides that reuse built-in definition parameters", () => {

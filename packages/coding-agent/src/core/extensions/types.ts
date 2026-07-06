@@ -415,6 +415,8 @@ export interface ToolRenderContext<TState = any, TArgs = any> {
 	isError: boolean;
 }
 
+export type ReplayBuiltInToolName = "bash" | "edit";
+
 /**
  * Tool definition for registerTool().
  */
@@ -433,6 +435,8 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	parameters: TParams;
 	/** Controls whether ToolExecutionComponent renders the standard colored shell or the tool renders its own framing. */
 	renderShell?: "default" | "self";
+	/** Replay renderer to use for removed built-ins in saved transcripts. */
+	replayBuiltInToolName?: ReplayBuiltInToolName;
 
 	/** Optional compatibility shim to prepare raw tool call arguments before schema validation. Must return an object conforming to TParams. */
 	prepareArguments?: (args: unknown) => Static<TParams>;

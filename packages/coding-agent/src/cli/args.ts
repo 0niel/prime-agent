@@ -54,7 +54,7 @@ export interface Args {
 
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const REMOVED_BUILTIN_TOOL_NAMES = new Set(["read", "write", "grep", "find", "ls"]);
-const BUILTIN_TOOL_NAMES = ["ipython", "bash", "edit"];
+const BUILTIN_TOOL_NAMES = ["ipython"];
 
 export function isValidThinkingLevel(level: string): level is ThinkingLevel {
 	return VALID_THINKING_LEVELS.includes(level as ThinkingLevel);
@@ -345,9 +345,6 @@ ${chalk.bold("Examples:")}
   # Start with a specific thinking level
   ${APP_NAME} --thinking high "Solve this complex problem"
 
-  # Use only the bash tool
-  ${APP_NAME} --tools bash -p "Run the project checks"
-
   # Export a session file to HTML
   ${APP_NAME} --export ~/${CONFIG_DIR_NAME}/sessions/session.jsonl
   ${APP_NAME} --export session.jsonl output.html
@@ -405,7 +402,5 @@ ${chalk.bold("Environment Variables:")}
 
 ${chalk.bold("Built-in Tool Names:")}
   ipython - Execute Python in a persistent IPython kernel
-  bash    - Execute bash commands (off by default)
-  edit    - Edit files with find/replace (off by default)
 `);
 }

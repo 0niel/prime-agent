@@ -151,6 +151,10 @@ export interface IpythonToolOptions {
 	/** Python override. Must have `ipykernel` installed. */
 	python?: string;
 	env?: Record<string, string>;
+	/** Command prefix prepended to every %%bash cell. */
+	commandPrefix?: string;
+	/** Optional explicit shell path for bare %%bash cells. */
+	shellPath?: string;
 	sessionId?: string;
 	/** Typed host request handlers for the kernel↔host bridge (rlm.run, goal.*, …). */
 	hostHandlers?: HostRequestHandlers;
@@ -169,6 +173,31 @@ export interface IpythonToolOptions {
 	onRestore?: (result: RestoreResult) => void;
 	/** Shared provisioner owning the kernel lifecycle. When provided, the remaining options are ignored. */
 	provisioner?: IpythonKernelProvisioner;
+}
+
+function quoteScriptMagicArgument(value: string): string {
+	return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\"'\"'")}'`;
+}
+
+function applyShellSettingsToBashMagicCell(
+	code: string,
+	options: Pick<IpythonToolOptions, "commandPrefix" | "shellPath"> | undefined,
+): string {
+	const commandPrefix = options?.commandPrefix;
+	const shellPath = options?.shellPath?.trim();
+	if (!commandPrefix && !shellPath) return code;
+
+	const match = /^([ \t]*)%%bash\b([^\r\n]*)(\r?\n|$)/.exec(code);
+	if (!match) return code;
+
+	const [, indent, rest, lineBreak] = match;
+	const body = code.slice(match[0].length);
+	const firstLine =
+		shellPath && rest.trim().length === 0
+			? `${indent}%%script ${quoteScriptMagicArgument(shellPath)}`
+			: `${indent}%%bash${rest}`;
+	const nextBody = commandPrefix ? `${commandPrefix}${body ? `\n${body}` : ""}` : body;
+	return `${firstLine}${lineBreak || "\n"}${nextBody}`;
 }
 
 /**
@@ -397,7 +426,8 @@ export function createIpythonToolDefinition(
 
 			try {
 				const m = await provisioner.ensure(reportStartupProgress);
-				const r = await m.execute(params.code, {
+				const code = applyShellSettingsToBashMagicCell(params.code, options);
+				const r = await m.execute(code, {
 					signal,
 					onStream: (chunk) => {
 						onUpdate?.({

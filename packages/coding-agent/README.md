@@ -547,7 +547,7 @@ cat README.md | prime-agent -p "Summarize this text"
 | `--no-builtin-tools`, `-nbt` | Disable built-in tools by default but keep extension/custom tools enabled |
 | `--no-tools`, `-nt` | Disable all tools by default |
 
-Available built-in tools: `ipython`, `bash`, `edit`
+Available built-in tools: `ipython`
 
 ### Resource Options
 
@@ -609,8 +609,8 @@ prime-agent --model sonnet:high "Solve this complex problem"
 # Limit model cycling
 prime-agent --models "claude-*,gpt-4o"
 
-# Read-only mode
-prime-agent --tools bash,edit -p "Review the code"
+# Restrict to the built-in IPython tool
+prime-agent --tools ipython -p "Review the code"
 
 # High thinking level
 prime-agent --thinking high "Solve this complex problem"

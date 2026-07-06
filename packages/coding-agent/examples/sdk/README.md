@@ -61,7 +61,7 @@ await loader.reload();
 const { session } = await createAgentSession({ resourceLoader: loader, authStorage, modelRegistry });
 
 // Tool selection
-const { session } = await createAgentSession({ tools: ["ipython", "bash"], authStorage, modelRegistry });
+const { session } = await createAgentSession({ tools: ["ipython"], authStorage, modelRegistry });
 
 // In-memory
 const { session } = await createAgentSession({
@@ -89,7 +89,7 @@ const { session } = await createAgentSession({
   authStorage: customAuth,
   modelRegistry: customRegistry,
   resourceLoader,
-  tools: ["ipython", "bash"],
+  tools: ["ipython"],
   customTools: [{ tool: myTool }],
   sessionManager: SessionManager.inMemory(),
   settingsManager: SettingsManager.inMemory(),

@@ -3,6 +3,7 @@ import type { Api, ImageContent, Model, TextContent, Transport, Usage } from "@e
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
 import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
+import type { ReplayBuiltInToolName } from "../../core/extensions/index.js";
 import type { GoalState } from "../../core/goals.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
@@ -360,6 +361,7 @@ export interface AgentConnectionToolDefinition {
 	promptGuidelines?: string[];
 	parameters: unknown;
 	renderShell?: "default" | "self";
+	replayBuiltInToolName?: ReplayBuiltInToolName;
 }
 
 export interface AgentConnectionPromptOptions {

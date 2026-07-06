@@ -100,6 +100,7 @@ export type {
 	RegisteredCommand,
 	RegisteredTool,
 	ReplacedSessionContext,
+	ReplayBuiltInToolName,
 	ResolvedCommand,
 	// Events - Resources
 	ResourcesDiscoverEvent,

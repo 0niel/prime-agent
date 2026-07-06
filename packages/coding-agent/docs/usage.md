@@ -187,7 +187,7 @@ cat README.md | pi -p "Summarize this text"
 | `--no-builtin-tools`, `-nbt` | Disable built-in tools but keep extension/custom tools enabled |
 | `--no-tools`, `-nt` | Disable all tools |
 
-Built-in tools: `ipython`, `bash`, `edit`.
+Built-in tools: `ipython`.
 
 ### Resource Options
 
@@ -253,8 +253,8 @@ pi --model sonnet:high "Solve this complex problem"
 # Limit model cycling
 pi --models "claude-*,gpt-4o"
 
-# Enable optional shell/edit tools
-pi --tools bash,edit -p "Review the code"
+# Restrict to the built-in IPython tool
+pi --tools ipython -p "Review the code"
 ```
 
 ### Environment Variables

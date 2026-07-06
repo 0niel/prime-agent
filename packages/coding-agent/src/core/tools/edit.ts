@@ -292,7 +292,7 @@ export function createEditToolDefinition(
 	options?: EditToolOptions,
 ): ToolDefinition<typeof editSchema, EditToolDetails | undefined, EditRenderState> {
 	const ops = options?.operations ?? defaultEditOperations;
-	return {
+	const definition: ToolDefinition<typeof editSchema, EditToolDetails | undefined, EditRenderState> = {
 		name: "edit",
 		label: "edit",
 		description:
@@ -478,6 +478,7 @@ export function createEditToolDefinition(
 			return component;
 		},
 	};
+	return Object.assign(definition, { replayBuiltInToolName: "edit" as const });
 }
 
 export function createEditTool(cwd: string, options?: EditToolOptions): AgentTool<typeof editSchema> {

@@ -62,7 +62,7 @@ const { session } = await createAgentSession();
 // Custom: override specific options
 const { session } = await createAgentSession({
   model: myModel,
-  tools: ["ipython", "bash"],
+  tools: ["ipython"],
   sessionManager: SessionManager.inMemory(),
 });
 ```
@@ -474,7 +474,7 @@ const { session } = await createAgentSession({
 
 // Pick specific tools
 const { session } = await createAgentSession({
-  tools: ["bash", "edit"],
+  tools: ["ipython"],
 });
 ```
 
@@ -926,7 +926,7 @@ const { session } = await createAgentSession({
   authStorage,
   modelRegistry,
 
-  tools: ["ipython", "bash"],
+  tools: ["ipython"],
   customTools: [statusTool],
   resourceLoader: loader,
 
