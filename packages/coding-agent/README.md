@@ -202,13 +202,12 @@ Sessions auto-save to `~/.prime/agent/sessions/` organized by working directory.
 
 ```bash
 prime-agent -c                  # Continue most recent session
-prime-agent -r                  # Browse and select from past sessions
+prime-agent -r [path|id]        # Browse past sessions or resume one directly
 prime-agent --no-session        # Ephemeral mode (don't save)
-prime-agent --session <path|id> # Use specific session file or ID
 prime-agent --fork <path|id>    # Fork specific session file or ID into a new session
 ```
 
-Use `/session` in interactive mode to see the current session ID before reusing it with `--session <id>` or `--fork <id>`.
+Use `/session` in interactive mode to see the current session ID before reusing it with `--resume <id>` or `--fork <id>`.
 
 ### Branching
 
@@ -535,8 +534,7 @@ cat README.md | prime-agent -p "Summarize this text"
 | Option | Description |
 |--------|-------------|
 | `-c`, `--continue` | Continue most recent session |
-| `-r`, `--resume` | Browse and select session |
-| `--session <path\|id>` | Use specific session file or partial UUID |
+| `-r`, `--resume [path\|id]` | Browse and select session, or resume a specific session file or partial UUID |
 | `--fork <path\|id>` | Fork specific session file or partial UUID into a new session |
 | `--session-dir <dir>` | Custom session storage directory |
 | `--no-session` | Ephemeral mode (don't save) |

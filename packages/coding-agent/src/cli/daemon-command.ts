@@ -300,8 +300,6 @@ interface ParsedSessionArgs {
 const SESSION_BOOLEAN_FLAGS = new Set([
 	"--continue",
 	"-c",
-	"--resume",
-	"-r",
 	"--no-session",
 	"--no-tools",
 	"-nt",
@@ -416,7 +414,20 @@ function parseSessionOption(
 		apply(value);
 		return withValue(daemonArg, value);
 	};
+	const withSessionSelector = (value: string, consumed: number): ParsedSessionOption => {
+		if (!value) {
+			throw new Error(`${arg.split("=")[0]} requires a value`);
+		}
+		return {
+			consumed,
+			sessionPath: looksLikeSessionPath(value) ? resolvePathOption(value, config.cwd ?? pathBaseCwd) : value,
+		};
+	};
 	const boolean = (daemonArg = arg): ParsedSessionOption => ({ consumed: 0, daemonArg });
+
+	if (arg.startsWith("--resume=")) {
+		return withSessionSelector(arg.slice("--resume=".length), 0);
+	}
 
 	switch (arg) {
 		case "--continue":
@@ -424,14 +435,7 @@ function parseSessionOption(
 			return { consumed: 0, continueRecent: true };
 		case "--resume":
 		case "-r":
-			throw new Error(`${arg} is not supported for daemon sessions; use --session <selector> or --continue instead`);
-		case "--session": {
-			const value = readValue();
-			return {
-				consumed: 1,
-				sessionPath: looksLikeSessionPath(value) ? resolvePathOption(value, config.cwd ?? pathBaseCwd) : value,
-			};
-		}
+			return withSessionSelector(readValue(), 1);
 		case "--session-dir":
 			return withParsedValue(arg, (value) => {
 				config.sessionDir = expandTildePath(value);
@@ -1649,6 +1653,7 @@ ${chalk.bold("Options:")}
   --socket <path>               Socket path (default: ${defaultDaemonSocketPath()})
   --name <name>                 Name for the new session created by bare daemon
   --cwd <dir>                   Working directory for the created session
+  --resume <selector>           Resume a saved session file or partial UUID
   --foreground, --no-detach     Keep daemon attached to this terminal for debugging
   --json                        Print raw JSON for commands with formatted output; attach streams raw protocol JSON
   send options: --from <session>, --steer, --follow-up, --message <message>
@@ -1668,6 +1673,7 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock list
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock list -a
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock create scratch
+  ${APP_NAME} daemon --socket /tmp/prime-agent.sock create --resume <session>
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock cron add <session> "*/30 * * * *" -- "Check progress"
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock cron list
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock prompt <session> "Say hello"

@@ -1108,7 +1108,7 @@ export class SessionManager {
 		} else {
 			const explicitPath = this.sessionFile;
 			this.newSession();
-			this.sessionFile = explicitPath; // preserve explicit path from --session flag
+			this.sessionFile = explicitPath; // preserve explicit path from --resume selector
 		}
 	}
 

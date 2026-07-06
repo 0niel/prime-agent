@@ -352,7 +352,7 @@ PR #79 also supports rich TUI attach to existing active daemon sessions.
 The user-facing shape is:
 
 ```bash
-./prime-agent.sh --session <selector>
+./prime-agent.sh --resume <selector>
 ```
 
 If `<selector>` names a live active daemon session, startup attaches the rich TUI to that active session instead of opening the session file locally.
@@ -1106,7 +1106,7 @@ This uses the line-oriented daemon CLI, not rich TUI attach.
 Start or find an active daemon session id, then run:
 
 ```bash
-./prime-agent.sh --session <active-session-id>
+./prime-agent.sh --resume <active-session-id>
 ```
 
 or:

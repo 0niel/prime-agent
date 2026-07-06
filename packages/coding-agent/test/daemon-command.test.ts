@@ -217,9 +217,9 @@ describe("daemon command", () => {
 		});
 	});
 
-	it("keeps bare --session values as session id selectors", async () => {
+	it("keeps bare --resume values as session id selectors", async () => {
 		await expect(
-			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "create", "--session", "abc123"]),
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "create", "--resume", "abc123"]),
 		).resolves.toBe(true);
 
 		const client = daemonClientMock.instances[0];

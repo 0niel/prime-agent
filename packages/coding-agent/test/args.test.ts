@@ -82,6 +82,62 @@ describe("parseArgs", () => {
 			const result = parseArgs(["-r"]);
 			expect(result.resume).toBe(true);
 		});
+
+		test("parses --resume with a session selector", () => {
+			const result = parseArgs(["--resume", "/path/to/session.jsonl"]);
+			expect(result.resume).toBe("/path/to/session.jsonl");
+			expect(result.messages).toEqual([]);
+		});
+
+		test("parses -r with a session selector", () => {
+			const result = parseArgs(["-r", "1234abcd"]);
+			expect(result.resume).toBe("1234abcd");
+			expect(result.messages).toEqual([]);
+		});
+
+		test("parses --resume=value", () => {
+			const result = parseArgs(["--resume=1234abcd"]);
+			expect(result.resume).toBe("1234abcd");
+		});
+
+		test("parses --resume with a windows session path", () => {
+			const sessionPath = "C:\\Users\\me\\session.jsonl";
+			const result = parseArgs(["--resume", sessionPath]);
+			expect(result.resume).toBe(sessionPath);
+			expect(result.resumeSelectorFallback).toBe(sessionPath);
+			expect(result.messages).toEqual([]);
+		});
+
+		test("parses --resume with a slash-containing relative session path", () => {
+			const result = parseArgs(["--resume", "sessions/current"]);
+			expect(result.resume).toBe("sessions/current");
+			expect(result.resumeSelectorFallback).toBe("sessions/current");
+			expect(result.messages).toEqual([]);
+		});
+
+		test("records text after --resume as a selector candidate with message fallback", () => {
+			const result = parseArgs(["--resume", "fix", "the", "bug"]);
+			expect(result.resume).toBe("fix");
+			expect(result.resumeSelectorFallback).toBe("fix");
+			expect(result.messages).toEqual(["the", "bug"]);
+		});
+
+		test("records text after --resume= as a selector candidate with message fallback", () => {
+			const result = parseArgs(["--resume=fix"]);
+			expect(result.resume).toBe("fix");
+			expect(result.resumeSelectorFallback).toBe("fix");
+			expect(result.messages).toEqual([]);
+		});
+
+		test("treats empty --resume values as the bare resume picker flag", () => {
+			const separated = parseArgs(["--resume", ""]);
+			expect(separated.resume).toBe(true);
+			expect(separated.messages).toEqual([]);
+
+			const equals = parseArgs(["--resume="]);
+			expect(equals.resume).toBe(true);
+			expect(equals.messages).toEqual([]);
+		});
 	});
 
 	describe("--cwd flag", () => {
@@ -130,11 +186,6 @@ describe("parseArgs", () => {
 		test("parses --mode rpc", () => {
 			const result = parseArgs(["--mode", "rpc"]);
 			expect(result.mode).toBe("rpc");
-		});
-
-		test("parses --session", () => {
-			const result = parseArgs(["--session", "/path/to/session.jsonl"]);
-			expect(result.session).toBe("/path/to/session.jsonl");
 		});
 
 		test("parses --fork", () => {
