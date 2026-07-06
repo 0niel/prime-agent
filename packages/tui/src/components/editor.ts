@@ -1,4 +1,5 @@
 import type { AutocompleteProvider, AutocompleteSuggestions } from "../autocomplete.js";
+import type { EditorPasteSnapshot } from "../editor-component.js";
 import { getKeybindings } from "../keybindings.js";
 import { decodePrintableKey, matchesKey } from "../keys.js";
 import { KillRing } from "../kill-ring.js";
@@ -215,6 +216,11 @@ interface EditorState {
 	cursorCol: number;
 }
 
+interface EditorUndoSnapshot extends EditorState {
+	pastes: Map<number, string>;
+	pasteCounter: number;
+}
+
 interface LayoutLine {
 	text: string;
 	hasCursor: boolean;
@@ -309,7 +315,13 @@ export class Editor implements Component, Focusable {
 	private snappedFromCursorCol: number | null = null;
 
 	// Undo support
-	private undoStack = new UndoStack<EditorState>();
+	private undoStack = new UndoStack<EditorUndoSnapshot>((snapshot) => ({
+		lines: [...snapshot.lines],
+		cursorLine: snapshot.cursorLine,
+		cursorCol: snapshot.cursorCol,
+		pastes: new Map(snapshot.pastes),
+		pasteCounter: snapshot.pasteCounter,
+	}));
 
 	public onSubmit?: (text: string) => void;
 	public onChange?: (text: string) => void;
@@ -1063,6 +1075,18 @@ export class Editor implements Component, Focusable {
 	 */
 	getExpandedText(): string {
 		return this.expandPasteMarkers(this.state.lines.join("\n"));
+	}
+
+	getPasteSnapshot(): EditorPasteSnapshot {
+		return {
+			pastes: [...this.pastes],
+			pasteCounter: this.pasteCounter,
+		};
+	}
+
+	restorePasteSnapshot(snapshot: EditorPasteSnapshot): void {
+		this.pastes = new Map(snapshot.pastes);
+		this.pasteCounter = snapshot.pasteCounter;
 	}
 
 	getLines(): string[] {
@@ -2088,14 +2112,26 @@ export class Editor implements Component, Focusable {
 	}
 
 	private pushUndoSnapshot(): void {
-		this.undoStack.push(this.state);
+		this.undoStack.push({
+			lines: this.state.lines,
+			cursorLine: this.state.cursorLine,
+			cursorCol: this.state.cursorCol,
+			pastes: this.pastes,
+			pasteCounter: this.pasteCounter,
+		});
 	}
 
 	private undo(): void {
 		this.historyIndex = -1; // Exit history browsing mode
 		const snapshot = this.undoStack.pop();
 		if (!snapshot) return;
-		Object.assign(this.state, snapshot);
+		this.state = {
+			lines: snapshot.lines,
+			cursorLine: snapshot.cursorLine,
+			cursorCol: snapshot.cursorCol,
+		};
+		this.pastes = new Map(snapshot.pastes);
+		this.pasteCounter = snapshot.pasteCounter;
 		this.lastAction = null;
 		this.preferredVisualCol = null;
 		if (this.onChange) {

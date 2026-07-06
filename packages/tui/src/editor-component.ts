@@ -1,6 +1,11 @@
 import type { AutocompleteProvider } from "./autocomplete.js";
 import type { Component } from "./tui.js";
 
+export interface EditorPasteSnapshot {
+	pastes: readonly (readonly [number, string])[];
+	pasteCounter: number;
+}
+
 /**
  * Interface for custom editor components.
  *
@@ -57,6 +62,10 @@ export interface EditorComponent extends Component {
 	 * Falls back to getText() if not implemented.
 	 */
 	getExpandedText?(): string;
+
+	getPasteSnapshot?(): EditorPasteSnapshot;
+
+	restorePasteSnapshot?(snapshot: EditorPasteSnapshot): void;
 
 	// =========================================================================
 	// Autocomplete support (optional)

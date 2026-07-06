@@ -28,7 +28,7 @@ export { Spacer } from "./components/spacer.js";
 export { Text } from "./components/text.js";
 export { TruncatedText } from "./components/truncated-text.js";
 // Editor component interface (for custom editors)
-export type { EditorComponent } from "./editor-component.js";
+export type { EditorComponent, EditorPasteSnapshot } from "./editor-component.js";
 // Fullscreen (alternate-screen) viewport
 export { FullscreenViewport, type ScrollInfo } from "./fullscreen.js";
 // Fuzzy matching

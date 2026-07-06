@@ -480,6 +480,7 @@ describe("InteractiveMode pending bash components", () => {
 			queuedMessagesContainer: new Container(),
 			compactionQueuedMessages: [],
 			pastedImages: new Map(),
+			liveImageMarkerIds: () => new Set(),
 			defaultEditor: editorStub,
 			editor: editorStub,
 			streamingComponent: undefined,
