@@ -207,31 +207,37 @@ describe("restoreDaemonSessionSummaries", () => {
 		await Promise.all(cleanups.splice(0).map((fn) => fn()));
 	});
 
-	it("reopens each distinct restorable session file", async () => {
+	it("reopens each distinct top-level session file", async () => {
 		const createCommands: Array<Record<string, unknown>> = [];
 		const daemon = await startFakeDaemon({ createCommands });
 		cleanups.push(daemon.close);
 		const firstSessionFile = join(tmpdir(), "pa-session-restore-a.jsonl");
 		const secondSessionFile = join(tmpdir(), "pa-session-restore-b.jsonl");
+		const busySessionFile = join(tmpdir(), "pa-session-restore-busy.jsonl");
 
 		await expect(
 			restoreDaemonSessionSummaries(daemon.socketPath, [
 				sessionSummary({ activeSessionId: "a", sessionFile: firstSessionFile }),
 				sessionSummary({ activeSessionId: "a-duplicate", sessionFile: firstSessionFile }),
 				sessionSummary({ activeSessionId: "b", sessionFile: secondSessionFile }),
-				sessionSummary({ activeSessionId: "busy", sessionFile: join(tmpdir(), "busy.jsonl"), isStreaming: true }),
+				sessionSummary({ activeSessionId: "busy", sessionFile: busySessionFile, isStreaming: true }),
 				sessionSummary({
 					activeSessionId: "sub",
 					sessionFile: join(tmpdir(), "sub.jsonl"),
 					runtimeKind: "subagent",
 				}),
 			]),
-		).resolves.toEqual({ restored: 2, total: 2, failed: [] });
+		).resolves.toEqual({ restored: 3, total: 3, failed: [] });
 
-		expect(createCommands.map((command) => command.sessionPath)).toEqual([firstSessionFile, secondSessionFile]);
+		expect(createCommands.map((command) => command.sessionPath)).toEqual([
+			firstSessionFile,
+			secondSessionFile,
+			busySessionFile,
+		]);
 		expect(createCommands.map((command) => command.config)).toEqual([
 			{ sessionDir: dirname(firstSessionFile) },
 			{ sessionDir: dirname(secondSessionFile) },
+			{ sessionDir: dirname(busySessionFile) },
 		]);
 	});
 

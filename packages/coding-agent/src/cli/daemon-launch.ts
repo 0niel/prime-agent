@@ -175,7 +175,7 @@ function restoreCandidateSessionFiles(sessions: readonly SessionSummary[]): stri
 	return [
 		...new Set(
 			sessions
-				.filter(isSessionRestorableAfterDaemonStop)
+				.filter(isSessionReopenableAfterDaemonStop)
 				.map((session) => session.sessionFile)
 				.filter((sessionFile): sessionFile is string => sessionFile !== undefined)
 				.map((sessionFile) => resolve(sessionFile)),
