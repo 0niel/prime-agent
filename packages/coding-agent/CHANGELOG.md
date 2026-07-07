@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Changed subagent and refinement guidance to favor non-blocking subagent tasks by default, inspect live subagents with `agent_observe` when available, and capture reusable delegation roles, procedures, facts, preferences, and prompt addendums with `/refine`.
+- Changed subagent and refinement guidance to favor non-blocking subagent tasks by default, inspect or message live subagents when agent observation/messaging skills are available, and capture reusable delegation roles, procedures, facts, preferences, and prompt addendums with `/refine`.
 
 ## [0.2.6] - 2026-07-06
 
