@@ -330,6 +330,9 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("asyncio.create_task");
 		expect(prompt).toContain("Sub-agents should not block Prime Agent by default");
 		expect(prompt).toContain("Default to non-blocking subagents");
+		expect(prompt).toContain("agent_observe.list_agents");
+		expect(prompt).toContain('runtimeKind == "subagent"');
+		expect(prompt).toContain("agent_observe.recent_messages");
 		expect(prompt).toContain("sub-agent work that can run in the background");
 		expect(prompt).toContain("do not block the main execution path");
 		expect(prompt).toContain("keep the task handle");

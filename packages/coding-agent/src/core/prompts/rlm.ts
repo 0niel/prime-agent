@@ -104,6 +104,7 @@ export function buildSubagentGuidance(): string {
 		"You already have `rlm` in scope. This is about *when* to spawn one — which matters as much as how.",
 		"",
 		"Default to non-blocking subagents: create an `asyncio` task, keep the handle, continue independent work, and await only at the collection point where the result is needed.",
+		'If the `agent_observe` skill is installed, use it like the agents view to inspect live subagents without awaiting them: list agents with `await agent_observe.list_agents()`, filter `runtimeKind == "subagent"` or matching parent ids, and read bounded previews with `await agent_observe.recent_messages(target, limit=...)`.',
 		"",
 		"Reach for sub-agents when:",
 		"- you have independent sub-tasks that can run in parallel — fan them out with `asyncio.create_task(rlm('task'))` or collect a batch with `await asyncio.gather(rlm('task1'), rlm('task2'))` rather than working them one after another;",
