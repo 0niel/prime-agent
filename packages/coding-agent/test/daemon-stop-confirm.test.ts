@@ -16,11 +16,21 @@ const COPY: DaemonSessionLossCopy = {
 
 function session(overrides: Partial<SessionSummary>): SessionSummary {
 	return {
+		id: "session",
+		lifecycle: "live",
+		activity: "idle",
+		runtimeKind: "top-level",
+		activeSessionId: "active",
+		sessionId: "session",
+		sessionFile: "/tmp/session.jsonl",
+		cwd: "/tmp",
 		isStreaming: false,
 		isCompacting: false,
+		attachedClients: 0,
+		messageCount: 1,
 		pendingMessageCount: 0,
 		...overrides,
-	} as unknown as SessionSummary;
+	};
 }
 
 const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
@@ -57,11 +67,21 @@ describe("confirmDaemonSessionLoss", () => {
 		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(true);
 	});
 
-	it("aborts without prompting when not at a TTY and a live active session is idle", async () => {
+	it("proceeds without prompting when a live active session can be restored", async () => {
 		setTTY(false);
 		const probe: RunningDaemonProbe = {
 			reachable: true,
 			activeSessions: [session({ activeSessionId: "live-idle", isStreaming: false, pendingMessageCount: 0 })],
+		};
+		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(true);
+		expect(console.error).not.toHaveBeenCalled();
+	});
+
+	it("aborts without prompting when not at a TTY and a live active session cannot be restored", async () => {
+		setTTY(false);
+		const probe: RunningDaemonProbe = {
+			reachable: true,
+			activeSessions: [session({ activeSessionId: "live-idle", runtimeKind: "subagent" })],
 		};
 		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("hint"));
@@ -83,9 +103,14 @@ describe("confirmDaemonSessionLoss", () => {
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("unlistable"));
 	});
 
-	it("treats compacting, pending-message, and streaming sessions as at risk", async () => {
+	it("treats compacting, pending-message, streaming, and bash-running sessions as at risk", async () => {
 		setTTY(false);
-		for (const overrides of [{ isCompacting: true }, { pendingMessageCount: 1 }, { isStreaming: true }]) {
+		for (const overrides of [
+			{ isCompacting: true },
+			{ pendingMessageCount: 1 },
+			{ isStreaming: true },
+			{ isBashRunning: true },
+		] satisfies Partial<SessionSummary>[]) {
 			vi.mocked(console.error).mockClear();
 			const probe: RunningDaemonProbe = { reachable: true, activeSessions: [session(overrides)] };
 			expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);

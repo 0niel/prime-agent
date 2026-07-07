@@ -2,8 +2,9 @@
  * Shared confirmation for stopping a running daemon that has live sessions.
  *
  * Both `prime-agent update --self` and interactive startup (when taking over a
- * stale-version daemon) need to ask before discarding live active sessions.
- * They keep the same safety semantics here and only vary the wording via `copy`.
+ * stale-version daemon) need to ask before discarding live active sessions that
+ * cannot be restored after the daemon restarts. They keep the same safety
+ * semantics here and only vary the wording via `copy`.
  *
  * Kept out of daemon-launch.ts so the early fire-and-forget launch path stays
  * light on imports (no readline/chalk); this module is only reached on the
@@ -31,7 +32,7 @@ export function pluralizeSessions(count: number): { noun: string; pronoun: strin
 }
 
 export interface DaemonSessionLossCopy {
-	/** Full sentence describing the at-risk sessions and what stopping the daemon does. */
+	/** Full sentence describing the unrestorable sessions and what stopping the daemon does. */
 	atRiskDetail(count: number): string;
 	/** Full sentence for the reachable-but-unlistable case (work may be lost). */
 	unlistableDetail: string;
@@ -45,7 +46,8 @@ export interface DaemonSessionLossCopy {
  * Returns true when it is safe to proceed with stopping the daemon: it is not
  * reachable, `force` is set, no live sessions are at risk, or the user
  * confirmed at a TTY. Returns false to abort (at-risk/unlistable and either
- * declined or non-TTY). Saved-only sessions reload from disk on the fresh daemon.
+ * declined or non-TTY). Restorable top-level sessions are reopened after the
+ * fresh daemon starts.
  */
 export async function confirmDaemonSessionLoss(
 	probe: RunningDaemonProbe,

@@ -18,8 +18,8 @@ import {
 	isDaemonSessionSummary,
 	listActiveDaemonSessionSummaries,
 	probeRunningDaemonSessions,
+	relaunchDaemonAndRestoreSessions,
 	StaleDaemonError,
-	shutdownDaemonAndWait,
 } from "./cli/daemon-launch.js";
 import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions } from "./cli/daemon-stop-confirm.js";
 import { processFileArguments } from "./cli/file-processor.js";
@@ -369,12 +369,12 @@ async function promptConfirm(message: string): Promise<boolean> {
 	});
 }
 
-// Saved-only sessions reload from disk on the fresh daemon. Live active sessions
-// own runtime state and must not be terminated by startup takeover unless forced.
+// Idle persisted sessions are reopened after startup takeover. Sessions with
+// volatile in-memory work still require confirmation because they cannot be restored.
 const STARTUP_SESSION_LOSS_COPY: DaemonSessionLossCopy = {
 	atRiskDetail(count) {
 		const { noun, pronoun } = pluralizeSessions(count);
-		return `A background daemon from a different prime-agent version is running with ${count} live ${noun}. Stopping it will terminate ${pronoun}.`;
+		return `A background daemon from a different prime-agent version is running with ${count} active ${noun} that cannot be restored. Stopping it will terminate ${pronoun}.`;
 	},
 	unlistableDetail:
 		"A background daemon from a different prime-agent version is running and its sessions could not be listed. Stopping it may terminate active sessions.",
@@ -399,21 +399,14 @@ async function takeOverStaleDaemonOrExit(socketPath: string): Promise<DaemonRead
 		}
 		process.exit(1);
 	}
-	if (!(await shutdownDaemonAndWait(socketPath))) {
-		console.error(
-			chalk.red(`Could not stop the daemon on ${socketPath}. Run "prime-agent daemon shutdown" and retry.`),
-		);
-		process.exit(1);
-	}
-	const ready = ensureInteractiveDaemonRunning(socketPath);
 	try {
-		await ready;
+		await relaunchDaemonAndRestoreSessions(socketPath, probe.reachable ? (probe.activeSessions ?? []) : []);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		console.error(chalk.red(`Could not start the daemon: ${message}`));
+		console.error(chalk.red(`Could not restart the daemon: ${message}`));
 		process.exit(1);
 	}
-	return { ready };
+	return { ready: ensureInteractiveDaemonRunning(socketPath) };
 }
 
 // Resolves the daemon-ready promise, returning the promise to keep (the same

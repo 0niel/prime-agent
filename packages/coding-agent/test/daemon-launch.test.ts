@@ -1,11 +1,13 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	isSessionAtRiskFromDaemonStop,
+	isSessionRestorableAfterDaemonStop,
 	probeRunningDaemonSessions,
+	restoreDaemonSessionSummaries,
 	shutdownDaemonAndWait,
 } from "../src/cli/daemon-launch.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
@@ -17,6 +19,10 @@ interface FakeDaemonOptions {
 	failList?: boolean;
 	/** When false, the server ignores `shutdown` and stays up. */
 	respondToShutdown?: boolean;
+	/** Captures `create` commands sent by restore helpers. */
+	createCommands?: Array<Record<string, unknown>>;
+	/** Session files whose restore should fail. */
+	failCreateSessionFiles?: string[];
 }
 
 interface FakeDaemon {
@@ -44,7 +50,10 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 				if (!line.trim()) {
 					continue;
 				}
-				const command = JSON.parse(line) as { type: string; id: string };
+				const command = JSON.parse(line) as { type: string; id: string; sessionPath?: string } & Record<
+					string,
+					unknown
+				>;
 				if (command.type === "list") {
 					send(socket, {
 						type: "response",
@@ -53,6 +62,28 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 						...(options.failList
 							? { success: false, error: "list failed" }
 							: { success: true, data: { sessions: options.sessions ?? [] } }),
+					});
+				} else if (command.type === "create") {
+					options.createCommands?.push(command);
+					const shouldFail = command.sessionPath
+						? (options.failCreateSessionFiles ?? []).includes(command.sessionPath)
+						: false;
+					send(socket, {
+						type: "response",
+						command: "create",
+						id: command.id,
+						...(shouldFail
+							? { success: false, error: "restore failed" }
+							: {
+									success: true,
+									data: {
+										id: command.sessionPath ?? "created",
+										activeSessionId: command.sessionPath ?? "created",
+										isStreaming: false,
+										isCompacting: false,
+										pendingMessageCount: 0,
+									},
+								}),
 					});
 				} else if (command.type === "shutdown") {
 					if (options.respondToShutdown === false) {
@@ -117,22 +148,114 @@ describe("probeRunningDaemonSessions", () => {
 	});
 });
 
-describe("isSessionAtRiskFromDaemonStop", () => {
+function sessionSummary(overrides: Partial<SessionSummary>): SessionSummary {
+	return {
+		id: "session",
+		lifecycle: "live",
+		activity: "idle",
+		runtimeKind: "top-level",
+		activeSessionId: "active",
+		sessionId: "session",
+		sessionFile: "/tmp/session.jsonl",
+		cwd: "/tmp",
+		isStreaming: false,
+		isCompacting: false,
+		attachedClients: 0,
+		messageCount: 1,
+		pendingMessageCount: 0,
+		...overrides,
+	};
+}
+
+describe("daemon stop session classification", () => {
 	function session(overrides: Partial<SessionSummary>): SessionSummary {
-		return {
-			isStreaming: false,
-			isCompacting: false,
-			pendingMessageCount: 0,
-			...overrides,
-		} as unknown as SessionSummary;
+		return sessionSummary(overrides);
 	}
 
-	it("protects idle live sessions from daemon replacement", () => {
-		expect(isSessionAtRiskFromDaemonStop(session({ activeSessionId: "live-idle" }))).toBe(true);
+	it("treats idle persisted top-level sessions as restorable", () => {
+		const summary = session({ activeSessionId: "live-idle" });
+		expect(isSessionRestorableAfterDaemonStop(summary)).toBe(true);
+		expect(isSessionAtRiskFromDaemonStop(summary)).toBe(false);
+	});
+
+	it("protects live sessions that cannot be reopened", () => {
+		expect(isSessionAtRiskFromDaemonStop(session({ activeSessionId: "sub", runtimeKind: "subagent" }))).toBe(true);
+		expect(isSessionAtRiskFromDaemonStop(session({ activeSessionId: "missing-file", sessionFile: undefined }))).toBe(
+			true,
+		);
+	});
+
+	it("protects sessions with volatile in-memory work", () => {
+		for (const overrides of [
+			{ isStreaming: true },
+			{ isCompacting: true },
+			{ isBashRunning: true },
+			{ pendingMessageCount: 1 },
+		] satisfies Partial<SessionSummary>[]) {
+			expect(isSessionAtRiskFromDaemonStop(session({ activeSessionId: "busy", ...overrides }))).toBe(true);
+		}
 	});
 
 	it("does not protect saved-only idle sessions", () => {
 		expect(isSessionAtRiskFromDaemonStop(session({ activeSessionId: undefined }))).toBe(false);
+	});
+});
+
+describe("restoreDaemonSessionSummaries", () => {
+	const cleanups: Array<() => Promise<void>> = [];
+	afterEach(async () => {
+		await Promise.all(cleanups.splice(0).map((fn) => fn()));
+	});
+
+	it("reopens each distinct restorable session file", async () => {
+		const createCommands: Array<Record<string, unknown>> = [];
+		const daemon = await startFakeDaemon({ createCommands });
+		cleanups.push(daemon.close);
+		const firstSessionFile = join(tmpdir(), "pa-session-restore-a.jsonl");
+		const secondSessionFile = join(tmpdir(), "pa-session-restore-b.jsonl");
+
+		await expect(
+			restoreDaemonSessionSummaries(daemon.socketPath, [
+				sessionSummary({ activeSessionId: "a", sessionFile: firstSessionFile }),
+				sessionSummary({ activeSessionId: "a-duplicate", sessionFile: firstSessionFile }),
+				sessionSummary({ activeSessionId: "b", sessionFile: secondSessionFile }),
+				sessionSummary({ activeSessionId: "busy", sessionFile: join(tmpdir(), "busy.jsonl"), isStreaming: true }),
+				sessionSummary({
+					activeSessionId: "sub",
+					sessionFile: join(tmpdir(), "sub.jsonl"),
+					runtimeKind: "subagent",
+				}),
+			]),
+		).resolves.toEqual({ restored: 2, total: 2, failed: [] });
+
+		expect(createCommands.map((command) => command.sessionPath)).toEqual([firstSessionFile, secondSessionFile]);
+		expect(createCommands.map((command) => command.config)).toEqual([
+			{ sessionDir: dirname(firstSessionFile) },
+			{ sessionDir: dirname(secondSessionFile) },
+		]);
+	});
+
+	it("reports restore failures and continues with later sessions", async () => {
+		const createCommands: Array<Record<string, unknown>> = [];
+		const failedSessionFile = join(tmpdir(), "pa-session-restore-fail.jsonl");
+		const restoredSessionFile = join(tmpdir(), "pa-session-restore-ok.jsonl");
+		const daemon = await startFakeDaemon({
+			createCommands,
+			failCreateSessionFiles: [failedSessionFile],
+		});
+		cleanups.push(daemon.close);
+
+		await expect(
+			restoreDaemonSessionSummaries(daemon.socketPath, [
+				sessionSummary({ activeSessionId: "fail", sessionFile: failedSessionFile }),
+				sessionSummary({ activeSessionId: "ok", sessionFile: restoredSessionFile }),
+			]),
+		).resolves.toEqual({
+			restored: 1,
+			total: 2,
+			failed: [{ sessionFile: failedSessionFile, error: "restore failed" }],
+		});
+		expect(createCommands.map((command) => command.sessionPath)).toEqual([failedSessionFile, restoredSessionFile]);
 	});
 });
 
