@@ -133,6 +133,7 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	"anthropic/claude-opus-4.8": { contextWindow: 200000, maxTokens: 128000, vision: true },
 	"anthropic/claude-sonnet-4.5": { contextWindow: 200000, maxTokens: 64000, vision: true },
 	"anthropic/claude-sonnet-4.6": { contextWindow: 200000, maxTokens: 128000, vision: true },
+	"anthropic/claude-sonnet-5": { contextWindow: 200000, maxTokens: 128000, vision: true },
 	"deepseek/deepseek-v3.2": { contextWindow: 128000, maxTokens: 8000 },
 	"deepseek/deepseek-v4-flash": { contextWindow: 1000000, maxTokens: 384000 },
 	"deepseek/deepseek-v4-pro": { contextWindow: 1000000, maxTokens: 384000 },
@@ -350,7 +351,7 @@ function isPrimeInferenceReasoningModel(modelId: string, catalogReasoning?: bool
 		id.startsWith("x-ai/grok-4") ||
 		id.startsWith("z-ai/glm-") ||
 		(id.startsWith("openai/gpt-5") && !id.includes("-chat")) ||
-		/^anthropic\/claude-(?:fable-5|opus-4|sonnet-4)/.test(id)
+		/^anthropic\/claude-(?:fable-5|opus-4|sonnet-4|sonnet-5)/.test(id)
 	);
 }
 
