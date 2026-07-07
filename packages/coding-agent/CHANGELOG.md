@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Changed subagent and refinement guidance to favor non-blocking subagent tasks by default and to capture reusable delegation roles, procedures, facts, preferences, and prompt addendums with `/refine`.
+
 ## [0.2.6] - 2026-07-06
 
 - Fixed the installer splash flickering during animation and resize by stabilizing full-screen redraws and removing misleading synthetic percentages ([ENG-4481](https://linear.app/primeintellect/issue/ENG-4481/installer-screen-is-unstable-and-flickery)).
