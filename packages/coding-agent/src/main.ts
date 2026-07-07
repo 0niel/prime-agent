@@ -369,12 +369,12 @@ async function promptConfirm(message: string): Promise<boolean> {
 	});
 }
 
-// Only busy sessions (streaming, compacting, or pending messages) lose work;
-// idle loaded sessions reload from disk on the fresh daemon.
+// Saved-only sessions reload from disk on the fresh daemon. Live active sessions
+// own runtime state and must not be terminated by startup takeover unless forced.
 const STARTUP_SESSION_LOSS_COPY: DaemonSessionLossCopy = {
-	busyDetail(count) {
+	atRiskDetail(count) {
 		const { noun, pronoun } = pluralizeSessions(count);
-		return `A background daemon from a different prime-agent version is running with ${count} busy ${noun}. Stopping it will terminate ${pronoun}.`;
+		return `A background daemon from a different prime-agent version is running with ${count} live ${noun}. Stopping it will terminate ${pronoun}.`;
 	},
 	unlistableDetail:
 		"A background daemon from a different prime-agent version is running and its sessions could not be listed. Stopping it may terminate active sessions.",

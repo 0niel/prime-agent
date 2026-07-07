@@ -354,12 +354,12 @@ async function runSelfUpdate(command: SelfUpdateCommand): Promise<void> {
 	}
 }
 
-// Only busy sessions (streaming, compacting, or pending messages) would lose work;
-// idle loaded sessions reload from disk on the fresh daemon.
+// Saved-only sessions reload from disk on the fresh daemon. Live active sessions
+// own runtime state and must not be terminated by update unless forced.
 const UPDATE_SESSION_LOSS_COPY: DaemonSessionLossCopy = {
-	busyDetail(count) {
+	atRiskDetail(count) {
 		const { noun, pronoun } = pluralizeSessions(count);
-		return `The running daemon has ${count} busy ${noun}. Updating will stop the daemon and terminate ${pronoun}.`;
+		return `The running daemon has ${count} live ${noun}. Updating will stop the daemon and terminate ${pronoun}.`;
 	},
 	unlistableDetail:
 		"A running daemon's sessions could not be listed. Updating will stop the daemon and may terminate active sessions.",

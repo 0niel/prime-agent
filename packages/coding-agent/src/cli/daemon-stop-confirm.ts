@@ -2,8 +2,8 @@
  * Shared confirmation for stopping a running daemon that has live sessions.
  *
  * Both `prime-agent update --self` and interactive startup (when taking over a
- * stale-version daemon) need to ask before discarding busy sessions. They keep
- * the same busy-session semantics here and only vary the wording via `copy`.
+ * stale-version daemon) need to ask before discarding live active sessions.
+ * They keep the same safety semantics here and only vary the wording via `copy`.
  *
  * Kept out of daemon-launch.ts so the early fire-and-forget launch path stays
  * light on imports (no readline/chalk); this module is only reached on the
@@ -12,7 +12,7 @@
 
 import { createInterface } from "node:readline";
 import chalk from "chalk";
-import { isSessionBusy, type RunningDaemonProbe } from "./daemon-launch.js";
+import { isSessionAtRiskFromDaemonStop, type RunningDaemonProbe } from "./daemon-launch.js";
 
 /** Prompt for a yes/no answer at a TTY. Empty/anything-but-yes resolves false (default No). */
 export function promptYesNo(message: string): Promise<boolean> {
@@ -31,8 +31,8 @@ export function pluralizeSessions(count: number): { noun: string; pronoun: strin
 }
 
 export interface DaemonSessionLossCopy {
-	/** Full sentence describing the busy sessions and what stopping the daemon does. */
-	busyDetail(count: number): string;
+	/** Full sentence describing the at-risk sessions and what stopping the daemon does. */
+	atRiskDetail(count: number): string;
 	/** Full sentence for the reachable-but-unlistable case (work may be lost). */
 	unlistableDetail: string;
 	/** Question appended after the detail when prompting at a TTY (before " [y/N]"). */
@@ -43,10 +43,9 @@ export interface DaemonSessionLossCopy {
 
 /**
  * Returns true when it is safe to proceed with stopping the daemon: it is not
- * reachable, `force` is set, no sessions are busy, or the user confirmed at a
- * TTY. Returns false to abort (busy/unlistable and either declined or non-TTY).
- * Only busy sessions (streaming, compacting, or pending messages) lose work;
- * idle loaded sessions reload from disk on the fresh daemon.
+ * reachable, `force` is set, no live sessions are at risk, or the user
+ * confirmed at a TTY. Returns false to abort (at-risk/unlistable and either
+ * declined or non-TTY). Saved-only sessions reload from disk on the fresh daemon.
  */
 export async function confirmDaemonSessionLoss(
 	probe: RunningDaemonProbe,
@@ -61,11 +60,11 @@ export async function confirmDaemonSessionLoss(
 		// Reachable but couldn't list sessions: assume work may be lost.
 		detail = copy.unlistableDetail;
 	} else {
-		const busySessions = probe.activeSessions.filter(isSessionBusy);
-		if (busySessions.length === 0) {
+		const atRiskSessions = probe.activeSessions.filter(isSessionAtRiskFromDaemonStop);
+		if (atRiskSessions.length === 0) {
 			return true;
 		}
-		detail = copy.busyDetail(busySessions.length);
+		detail = copy.atRiskDetail(atRiskSessions.length);
 	}
 	if (!process.stdin.isTTY) {
 		console.error(chalk.red(`${detail} ${copy.nonTtyHint}`));

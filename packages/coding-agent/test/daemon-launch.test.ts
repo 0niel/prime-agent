@@ -3,7 +3,12 @@ import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { probeRunningDaemonSessions, shutdownDaemonAndWait } from "../src/cli/daemon-launch.js";
+import {
+	isSessionAtRiskFromDaemonStop,
+	probeRunningDaemonSessions,
+	shutdownDaemonAndWait,
+} from "../src/cli/daemon-launch.js";
+import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 
 interface FakeDaemonOptions {
 	/** Sessions returned for a `list` command. */
@@ -109,6 +114,25 @@ describe("probeRunningDaemonSessions", () => {
 		const daemon = await startFakeDaemon({ failList: true });
 		cleanups.push(daemon.close);
 		expect(await probeRunningDaemonSessions(daemon.socketPath)).toEqual({ reachable: true });
+	});
+});
+
+describe("isSessionAtRiskFromDaemonStop", () => {
+	function session(overrides: Partial<SessionSummary>): SessionSummary {
+		return {
+			isStreaming: false,
+			isCompacting: false,
+			pendingMessageCount: 0,
+			...overrides,
+		} as unknown as SessionSummary;
+	}
+
+	it("protects idle live sessions from daemon replacement", () => {
+		expect(isSessionAtRiskFromDaemonStop(session({ activeSessionId: "live-idle" }))).toBe(true);
+	});
+
+	it("does not protect saved-only idle sessions", () => {
+		expect(isSessionAtRiskFromDaemonStop(session({ activeSessionId: undefined }))).toBe(false);
 	});
 });
 

@@ -132,13 +132,19 @@ export async function shutdownDaemonAndWait(socketPath: string): Promise<boolean
 }
 
 // activeSessions is undefined when the daemon is reachable but its sessions couldn't
-// be listed — callers must treat that as "possibly busy", not idle.
+// be listed — callers must treat that as "possibly active", not idle.
 export type RunningDaemonProbe = { reachable: false } | { reachable: true; activeSessions?: SessionSummary[] };
 
-export function isSessionBusy(summary: SessionSummary): boolean {
-	// pendingMessageCount covers queued steering/follow-ups, which live only in
-	// memory and would be lost if the daemon were stopped.
-	return summary.isStreaming || summary.isCompacting || summary.pendingMessageCount > 0;
+export function isSessionAtRiskFromDaemonStop(summary: SessionSummary): boolean {
+	// Any live active session owns in-memory runtime state, subscriptions, queues,
+	// and scheduled work. Saved-only sessions have no activeSessionId and can be
+	// reloaded by the fresh daemon from disk.
+	return (
+		summary.activeSessionId !== undefined ||
+		summary.isStreaming ||
+		summary.isCompacting ||
+		summary.pendingMessageCount > 0
+	);
 }
 
 export async function probeRunningDaemonSessions(socketPath: string): Promise<RunningDaemonProbe> {
@@ -159,12 +165,12 @@ export async function probeRunningDaemonSessions(socketPath: string): Promise<Ru
 	}
 }
 
-// Idle-but-loaded sessions reload from disk on the fresh daemon, so only a busy
-// session blocks replacing a stale daemon.
-async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<boolean> {
+// Saved-only sessions reload from disk on the fresh daemon. Live active sessions
+// must not be terminated implicitly just because the CLI version changed.
+async function shutdownStaleDaemonIfNoLiveSessions(socketPath: string): Promise<boolean> {
 	const client = new DaemonClient(socketPath);
 	let connected = false;
-	let hasBusySessions = false;
+	let hasAtRiskSessions = false;
 	let loadedSessionCount = 0;
 	try {
 		await client.connect(1000);
@@ -172,10 +178,10 @@ async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<boolean
 		try {
 			const summaries = await listActiveDaemonSessionSummaries(client);
 			loadedSessionCount = summaries.length;
-			hasBusySessions = summaries.some(isSessionBusy);
+			hasAtRiskSessions = summaries.some(isSessionAtRiskFromDaemonStop);
 		} catch {
-			// Couldn't confirm idleness: treat as busy rather than risk interrupting work.
-			hasBusySessions = true;
+			// Couldn't confirm idleness: treat as active rather than risk interrupting work.
+			hasAtRiskSessions = true;
 		}
 	} catch {
 		// Couldn't reach it to inspect; don't send a blind shutdown, just verify below.
@@ -186,13 +192,11 @@ async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<boolean
 	if (!connected) {
 		return waitForDaemonGone(socketPath);
 	}
-	if (hasBusySessions) {
-		logDaemonLaunch(`refusing to replace stale daemon on ${socketPath}: busy session(s) present`);
+	if (hasAtRiskSessions) {
+		logDaemonLaunch(`refusing to replace stale daemon on ${socketPath}: live active session(s) present`);
 		return false;
 	}
-	logDaemonLaunch(
-		`replacing stale daemon on ${socketPath} (idle): ${loadedSessionCount} loaded session(s) will reload`,
-	);
+	logDaemonLaunch(`replacing stale daemon on ${socketPath}: ${loadedSessionCount} saved-only session(s) will reload`);
 	return shutdownDaemonAndWait(socketPath);
 }
 
@@ -202,7 +206,7 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 		return;
 	}
 	if (probe === "stale") {
-		const stopped = await shutdownStaleDaemonIfNotBusy(socketPath);
+		const stopped = await shutdownStaleDaemonIfNoLiveSessions(socketPath);
 		if (!stopped) {
 			throw new StaleDaemonError(socketPath);
 		}

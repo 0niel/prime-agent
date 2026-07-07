@@ -8,7 +8,7 @@ import {
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 
 const COPY: DaemonSessionLossCopy = {
-	busyDetail: (count) => `busy:${count}`,
+	atRiskDetail: (count) => `at-risk:${count}`,
 	unlistableDetail: "unlistable",
 	question: "Continue?",
 	nonTtyHint: "hint",
@@ -51,21 +51,29 @@ describe("confirmDaemonSessionLoss", () => {
 		expect(await confirmDaemonSessionLoss(probe, { force: true, copy: COPY })).toBe(true);
 	});
 
-	it("proceeds without prompting when no session is busy", async () => {
+	it("proceeds without prompting when there are no live active sessions", async () => {
 		setTTY(true);
-		const probe: RunningDaemonProbe = {
-			reachable: true,
-			activeSessions: [session({ isStreaming: false }), session({ pendingMessageCount: 0 })],
-		};
+		const probe: RunningDaemonProbe = { reachable: true, activeSessions: [] };
 		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(true);
 	});
 
-	it("aborts without prompting when not at a TTY and a session is busy", async () => {
+	it("aborts without prompting when not at a TTY and a live active session is idle", async () => {
+		setTTY(false);
+		const probe: RunningDaemonProbe = {
+			reachable: true,
+			activeSessions: [session({ activeSessionId: "live-idle", isStreaming: false, pendingMessageCount: 0 })],
+		};
+		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("hint"));
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("at-risk:1"));
+	});
+
+	it("aborts without prompting when not at a TTY and a session has queued work", async () => {
 		setTTY(false);
 		const probe: RunningDaemonProbe = { reachable: true, activeSessions: [session({ pendingMessageCount: 2 })] };
 		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("hint"));
-		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("busy:1"));
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("at-risk:1"));
 	});
 
 	it("aborts without prompting when not at a TTY and sessions cannot be listed", async () => {
@@ -75,7 +83,7 @@ describe("confirmDaemonSessionLoss", () => {
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("unlistable"));
 	});
 
-	it("treats compacting and pending-message sessions as busy", async () => {
+	it("treats compacting, pending-message, and streaming sessions as at risk", async () => {
 		setTTY(false);
 		for (const overrides of [{ isCompacting: true }, { pendingMessageCount: 1 }, { isStreaming: true }]) {
 			vi.mocked(console.error).mockClear();
