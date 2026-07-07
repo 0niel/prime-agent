@@ -34,6 +34,22 @@ describe("getSupportedThinkingLevels", () => {
 		expect(levels).not.toContain("xhigh");
 	});
 
+	it("includes both xhigh and max for Anthropic Sonnet 5 on anthropic-messages API", () => {
+		const model = getModel("anthropic", "claude-sonnet-5");
+		expect(model).toBeDefined();
+		const levels = getSupportedThinkingLevels(model!);
+		expect(levels).toContain("xhigh");
+		expect(levels).toContain("max");
+		expect(model!.contextWindow).toBe(1000000);
+		expect(model!.maxTokens).toBe(128000);
+		expect(model!.cost).toEqual({
+			input: 2,
+			output: 10,
+			cacheRead: 0.2,
+			cacheWrite: 2.5,
+		});
+	});
+
 	it("does not include max for older budget-based Claude models", () => {
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		expect(model).toBeDefined();

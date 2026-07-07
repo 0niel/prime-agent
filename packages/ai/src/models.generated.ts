@@ -13637,7 +13637,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 200000,
+			contextWindow: 1000000,
 			maxTokens: 128000,
 		} satisfies Model<"openai-completions">,
 		"anthropic/claude-haiku-4.5": {
@@ -13674,7 +13674,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 200000,
+			contextWindow: 1000000,
 			maxTokens: 128000,
 		} satisfies Model<"openai-completions">,
 		"anthropic/claude-opus-4.7": {
@@ -13693,7 +13693,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 200000,
+			contextWindow: 1000000,
 			maxTokens: 128000,
 		} satisfies Model<"openai-completions">,
 		"anthropic/claude-opus-4.8": {
@@ -13712,7 +13712,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 200000,
+			contextWindow: 1000000,
 			maxTokens: 128000,
 		} satisfies Model<"openai-completions">,
 		"anthropic/claude-sonnet-4.5": {
@@ -13730,7 +13730,7 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 200000,
+			contextWindow: 1000000,
 			maxTokens: 64000,
 		} satisfies Model<"openai-completions">,
 		"anthropic/claude-sonnet-4.6": {
@@ -13749,7 +13749,26 @@ export const MODELS = {
 				cacheRead: 0,
 				cacheWrite: 0,
 			},
-			contextWindow: 200000,
+			contextWindow: 1000000,
+			maxTokens: 128000,
+		} satisfies Model<"openai-completions">,
+		"anthropic/claude-sonnet-5": {
+			id: "anthropic/claude-sonnet-5",
+			name: "Claude Sonnet 5",
+			api: "openai-completions",
+			provider: "prime-inference",
+			baseUrl: "https://api.pinference.ai/api/v1",
+			compat: {"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":true,"maxTokensField":"max_tokens","supportsStrictMode":false},
+			reasoning: true,
+			thinkingLevelMap: {"xhigh":"xhigh","max":"max"},
+			input: ["text", "image"],
+			cost: {
+				input: 2,
+				output: 10,
+				cacheRead: 0,
+				cacheWrite: 0,
+			},
+			contextWindow: 1000000,
 			maxTokens: 128000,
 		} satisfies Model<"openai-completions">,
 		"deepseek/deepseek-v3.2": {

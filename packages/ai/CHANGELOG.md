@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added Claude Sonnet 5 to the Anthropic and Prime Inference model catalogs.
+
 ## [0.2.6] - 2026-07-06
 
 ## [0.2.5] - 2026-07-06

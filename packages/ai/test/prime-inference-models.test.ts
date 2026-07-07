@@ -24,6 +24,7 @@ describe("Prime Inference models", () => {
 			expect.arrayContaining([
 				"anthropic/claude-opus-4.7",
 				"anthropic/claude-opus-4.8",
+				"anthropic/claude-sonnet-5",
 				"deepseek/deepseek-v4-pro",
 				"minimax/minimax-m3",
 				"moonshotai/kimi-k2.7-code",
@@ -76,6 +77,21 @@ describe("Prime Inference models", () => {
 		expect(getSupportedThinkingLevels(opus48)).toContain("xhigh");
 		expect(getSupportedThinkingLevels(opus48)).toContain("max");
 
+		const sonnet5 = getModel("prime-inference", "anthropic/claude-sonnet-5");
+		expect(sonnet5.reasoning).toBe(true);
+		expect(sonnet5.thinkingLevelMap).toEqual({ xhigh: "xhigh", max: "max" });
+		expect(sonnet5.input).toEqual(["text", "image"]);
+		expect(sonnet5.contextWindow).toBe(1000000);
+		expect(sonnet5.maxTokens).toBe(128000);
+		expect(sonnet5.cost).toEqual({
+			input: 2,
+			output: 10,
+			cacheRead: 0,
+			cacheWrite: 0,
+		});
+		expect(getSupportedThinkingLevels(sonnet5)).toContain("xhigh");
+		expect(getSupportedThinkingLevels(sonnet5)).toContain("max");
+
 		expect(getModel("prime-inference", "anthropic/claude-opus-4.7").reasoning).toBe(true);
 		const deepseekV4Flash = getModel("prime-inference", "deepseek/deepseek-v4-flash");
 		expect(deepseekV4Flash.reasoning).toBe(true);
@@ -99,6 +115,17 @@ describe("Prime Inference models", () => {
 		expect(getModel("prime-inference", "x-ai/grok-4.20").reasoning).toBe(true);
 		expect(getModel("prime-inference", "minimax/minimax-m3").reasoning).toBe(true);
 		expect(getModel("prime-inference", "moonshotai/kimi-k2.7-code").reasoning).toBe(true);
+	});
+
+	it("uses route-specific context windows for Prime Inference Claude routes", () => {
+		expect(getModel("prime-inference", "anthropic/claude-fable-5").contextWindow).toBe(1000000);
+		expect(getModel("prime-inference", "anthropic/claude-opus-4.6").contextWindow).toBe(1000000);
+		expect(getModel("prime-inference", "anthropic/claude-opus-4.7").contextWindow).toBe(1000000);
+		expect(getModel("prime-inference", "anthropic/claude-opus-4.8").contextWindow).toBe(1000000);
+		expect(getModel("prime-inference", "anthropic/claude-sonnet-4.6").contextWindow).toBe(1000000);
+		expect(getModel("prime-inference", "anthropic/claude-sonnet-5").contextWindow).toBe(1000000);
+		expect(getModel("prime-inference", "anthropic/claude-haiku-4.5").contextWindow).toBe(200000);
+		expect(getModel("prime-inference", "anthropic/claude-sonnet-4.5").contextWindow).toBe(1000000);
 	});
 
 	it("resolves PRIME_API_KEY from the environment", () => {
