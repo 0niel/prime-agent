@@ -28,9 +28,9 @@ const IPYTHON_CONTROL_PROMPT = [
 	"",
 	"Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, IPython kernel, and native call interface exposed to the model.",
 	"",
-	"RLM-native call contract for refined continual harness entries: installed Python skills are called from IPython as `await <skill_import>(...)` with keyword arguments, or as `<skill_import> ...` from shell when a CLI exists. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are reusable delegation specs; invoke them by turning the spec into a concise task prompt and calling `await rlm('sub-task')`, or `await asyncio.gather(rlm('task1'), rlm('task2'))` for independent parallel subagents. Do not invent non-native wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
+	"RLM-native call contract for refined continual harness entries: installed Python skills are called from IPython as `await <skill_import>(...)` with keyword arguments, or as `<skill_import> ...` from shell when a CLI exists. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are reusable delegation specs; invoke them by turning the spec into a concise task prompt and starting `asyncio.create_task(rlm('sub-task'))` by default, then await the task only when its result is needed, or collect independent subagents with `await asyncio.gather(...)`. Use direct `await rlm('sub-task')` only when the result is immediately required. Do not invent non-native wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
 	"",
-	"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
+	"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `/refine` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
 ].join("\n");
 
 export function buildRlmPrompt(options: RlmPromptOptions): string {
@@ -75,8 +75,9 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	if (allowRecursion) {
 		parts.push(
 			"",
-			"A callable `rlm` is already in your global namespace — call it directly with `await rlm('sub-task')` to spawn a recursive sub-agent. Returns an `RLMResult` with `.answer` (string), `.usage`, `.turns`, and `.session_dir`.",
-			"For parallel sub-agents, use normal Python async patterns such as `await asyncio.gather(rlm('task1'), rlm('task2'))`; `asyncio` is already imported.",
+			"A callable `rlm` is already in your global namespace. It returns an `RLMResult` with `.answer` (string), `.usage`, `.turns`, and `.session_dir`. A direct `await rlm('sub-task')` is valid only when the result is immediately required.",
+			"Sub-agents should not block Prime Agent by default: start them with `task = asyncio.create_task(rlm('sub-task'))`, keep the task handle, continue any independent work, and await the task only when you need its result.",
+			"For parallel sub-agents, launch them together and collect them with normal Python async patterns such as `await asyncio.gather(rlm('task1'), rlm('task2'))`; `asyncio` is already imported.",
 			"For sub-agent work that can run in the background, keep the task handle from `asyncio.create_task(rlm('sub-task'))` so you do not block the main execution path; use normal task callbacks, `task.done()`, or `await task` later to observe completion and read the returned `RLMResult.answer`.",
 		);
 	}
@@ -89,14 +90,12 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 }
 
 /**
- * Supplemental sub-agent delegation guidance, appended AFTER the trained
- * `buildRlmPrompt` prefix (see system-prompt.ts). This is intentionally NOT part of
- * `buildRlmPrompt`'s `parts` array: the text that function emits is frozen as the v1
- * training prefix and must stay byte-identical. The trained recursion block already
- * covers the mechanics (`await rlm(...)`, `asyncio.gather`, `asyncio.create_task`);
- * this block adds the *when* and *why* — the decision guidance the trained prefix
- * lacks — in the same When -> Why -> (menu) order Claude Code's Agent tool uses. The
- * subagent-spec "menu" itself renders just after this, inside the harness-state block.
+ * Supplemental sub-agent delegation guidance, appended after the base RLM
+ * prompt (see system-prompt.ts). The recursion block covers the mechanics
+ * (`rlm(...)`, `asyncio.gather`, `asyncio.create_task`); this block adds the
+ * when and why in the same When -> Why -> menu order Claude Code's Agent tool
+ * uses. The subagent-spec menu itself renders just after this, inside the
+ * harness-state block.
  */
 export function buildSubagentGuidance(): string {
 	return [
@@ -104,12 +103,16 @@ export function buildSubagentGuidance(): string {
 		"",
 		"You already have `rlm` in scope. This is about *when* to spawn one — which matters as much as how.",
 		"",
-		"Reach for `await rlm(...)` when:",
-		"- you have independent sub-tasks that can run in parallel — fan them out with `await asyncio.gather(rlm('task1'), rlm('task2'))` rather than working them one after another;",
-		"- a sub-task would mean reading across many files, outputs, or sources you don't need to keep — delegate it and you keep the answer, not the raw material;",
-		"- the sub-task matches one of your saved subagent specs (listed in the harness state below) — turn the spec into a concise task prompt and call `rlm` with it.",
+		"Default to non-blocking subagents: create an `asyncio` task, keep the handle, continue independent work, and await only at the collection point where the result is needed.",
+		'If the `agent_observe` skill is installed, use it like the agents view to inspect live subagents without awaiting them: list agents with `await agent_observe.list_agents()`, filter `runtimeKind == "subagent"` or matching parent ids, and read bounded previews with `await agent_observe.recent_messages(target, limit=...)`.',
+		"If the `agent_message` skill is installed, live subagents are addressable like other active agents: list targets with `await agent_message.list_agents()` and send concise coordination or steering messages with `await agent_message.send(target, message, mode='auto')`; use `mode='steer'` only when you intend to interrupt current work.",
 		"",
-		"Do it inline instead when the step is a single known lookup, edit, or command — there, a sub-agent just adds latency. Once you've delegated a sub-task, await its handle and use the result instead of redoing the work yourself.",
+		"Reach for sub-agents when:",
+		"- you have independent sub-tasks that can run in parallel — fan them out with `asyncio.create_task(rlm('task'))` or collect a batch with `await asyncio.gather(rlm('task1'), rlm('task2'))` rather than working them one after another;",
+		"- a sub-task would mean reading across many files, outputs, or sources you don't need to keep — delegate it and keep the answer, not the raw material;",
+		"- the sub-task matches one of your saved subagent specs (listed in the harness state below) — turn the spec into a concise task prompt and start it with `asyncio.create_task(rlm('task'))` unless you need the result immediately.",
+		"",
+		"Do it inline instead when the step is a single known lookup, edit, or command — there, a sub-agent just adds latency. Once you've delegated a sub-task, keep its task handle and use the result instead of redoing the work yourself.",
 		"",
 		"For example:",
 		"```python",
@@ -130,5 +133,6 @@ export function buildSubagentGuidance(): string {
 		"```",
 		"",
 		"These are illustrations, not a fixed menu: delegate any self-contained sub-task that fits the cases above.",
+		"When you notice a delegation role, procedure, fact, preference, or behavior policy that should be reused, use `/refine` to create or update the smallest relevant subagent spec, skill, memory, or prompt addendum.",
 	].join("\n");
 }

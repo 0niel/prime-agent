@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Added autonomous mode with host-side continuations, configurable limits, and quality gates for evaluator-controlled runs.
+- Changed subagent and refinement guidance to favor non-blocking subagent tasks by default, inspect or message live subagents when agent observation/messaging skills are available, and capture reusable delegation roles, procedures, facts, preferences, and prompt addendums with `/refine`.
 - Changed the default thinking level to `xhigh` for models that support it.
 - Changed heartbeat cron delivery to use hidden context messages so scheduled heartbeat prompts do not appear in the visible chat queue.
 - Fixed daemon self-updates reopening previous restorable live sessions after relaunch.
