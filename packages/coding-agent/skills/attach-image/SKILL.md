@@ -39,5 +39,8 @@ print(await attach_image("diagram.png"))
 print(await attach_image("a.png", "b.jpg"))
 ```
 
+The skill automatically resizes and compresses large images before loading them
+into context. The original file is left untouched.
+
 Supported formats: PNG, JPEG, GIF, WebP. The skill errors if a file is not a
 supported image, or if the current model is not vision-capable.
