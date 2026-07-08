@@ -1,7 +1,8 @@
 #!/usr/bin/env tsx
 
-import { writeFileSync } from "fs";
-import { join, dirname } from "path";
+import { readFileSync, writeFileSync } from "fs";
+import { homedir } from "os";
+import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import {
 	CLOUDFLARE_AI_GATEWAY_ANTHROPIC_BASE_URL,
@@ -16,6 +17,7 @@ import {
 	Model,
 	type OpenAICompletionsCompat,
 } from "../src/types.js";
+import { MODELS as EXISTING_MODELS } from "../src/models.generated.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -118,6 +120,7 @@ interface PrimeInferenceModelMetadata {
 	contextWindow: number;
 	maxTokens: number;
 	vision?: boolean;
+	name?: string;
 }
 
 // Prime Inference intentionally exposes a curated subset of the catalog in the
@@ -137,6 +140,11 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	"deepseek/deepseek-v3.2": { contextWindow: 128000, maxTokens: 8000 },
 	"deepseek/deepseek-v4-flash": { contextWindow: 1000000, maxTokens: 384000 },
 	"deepseek/deepseek-v4-pro": { contextWindow: 1000000, maxTokens: 384000 },
+	"internal/glm-5.2-fast": {
+		contextWindow: 400000,
+		maxTokens: 131072,
+		name: "GLM 5.2 Fast",
+	},
 	"minimax/minimax-m3": { contextWindow: 204800, maxTokens: 131072 },
 	"moonshotai/kimi-k2.7-code": { contextWindow: 262144, maxTokens: 16000, vision: true },
 	"nvidia/nemotron-3-nano-30b-a3b": { contextWindow: 1000000, maxTokens: 228000 },
@@ -287,6 +295,75 @@ function getOptionalBoolean(value: unknown): boolean | undefined {
 	return typeof value === "boolean" ? value : undefined;
 }
 
+function readPrimeCliConfig(): Record<string, unknown> {
+	try {
+		const parsed = JSON.parse(readFileSync(join(homedir(), ".prime", "config.json"), "utf8"));
+		return isRecord(parsed) ? parsed : {};
+	} catch {
+		return {};
+	}
+}
+
+function getPrimeInferenceConfigValue(
+	envName: "PRIME_API_KEY" | "PRIME_TEAM_ID",
+	config: Record<string, unknown>,
+	configKeys: readonly string[],
+): string | undefined {
+	const fromEnv = process.env[envName]?.trim();
+	if (fromEnv) {
+		return fromEnv;
+	}
+
+	for (const key of configKeys) {
+		const value = config[key];
+		if (typeof value === "string" && value.trim()) {
+			return value.trim();
+		}
+	}
+
+	return undefined;
+}
+
+function getPrimeInferenceHeaders(apiKey: string | undefined, teamId: string | undefined): Record<string, string> | undefined {
+	const headers: Record<string, string> = {};
+	if (apiKey) {
+		headers.Authorization = `Bearer ${apiKey}`;
+	}
+	if (teamId) {
+		headers["X-Prime-Team-ID"] = teamId;
+	}
+
+	return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+function getExistingPrimeInferenceModels(): Model<"openai-completions">[] {
+	const models = EXISTING_MODELS["prime-inference"] as unknown as Record<string, Model<"openai-completions">>;
+	return Object.values(models)
+		.filter((model) => PRIME_INFERENCE_MODEL_METADATA[model.id.toLowerCase()] !== undefined)
+		.map((model) => ({
+			...model,
+			input: [...model.input],
+			cost: { ...model.cost },
+			...(model.compat ? { compat: { ...model.compat } } : {}),
+			...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
+			...(model.headers ? { headers: { ...model.headers } } : {}),
+		}));
+}
+
+function mergePrimeInferenceModels(
+	snapshotModels: Model<"openai-completions">[],
+	catalogModels: Model<"openai-completions">[],
+): Model<"openai-completions">[] {
+	const models = new Map<string, Model<"openai-completions">>();
+	for (const model of snapshotModels) {
+		models.set(model.id.toLowerCase(), model);
+	}
+	for (const model of catalogModels) {
+		models.set(model.id.toLowerCase(), model);
+	}
+	return Array.from(models.values());
+}
+
 function includesCatalogCapability(value: unknown, capabilities: readonly string[]): boolean {
 	if (!Array.isArray(value)) {
 		return false;
@@ -346,6 +423,7 @@ function isPrimeInferenceReasoningModel(modelId: string, catalogReasoning?: bool
 	return (
 		id.includes("thinking") ||
 		id.includes("deepseek-v4") ||
+		id.startsWith("internal/glm-") ||
 		id.startsWith("minimax/minimax-m") ||
 		id.startsWith("moonshotai/kimi") ||
 		id.startsWith("x-ai/grok-4") ||
@@ -363,7 +441,7 @@ function getPrimeInferenceCompat(modelId: string): OpenAICompletionsCompat {
 			...DEEPSEEK_V4_COMPAT,
 		};
 	}
-	if (id.startsWith("z-ai/glm-")) {
+	if (id.startsWith("z-ai/glm-") || id.startsWith("internal/glm-")) {
 		return {
 			...PRIME_INFERENCE_COMPAT,
 			...ZAI_THINKING_COMPAT,
@@ -405,28 +483,28 @@ function parsePrimeInferenceCatalog(data: unknown): PrimeInferenceCatalogEntry[]
 }
 
 async function fetchPrimeInferenceModels(): Promise<Model<"openai-completions">[]> {
-	const apiKey = process.env.PRIME_API_KEY;
+	const primeConfig = readPrimeCliConfig();
+	const apiKey = getPrimeInferenceConfigValue("PRIME_API_KEY", primeConfig, ["api_key", "apiKey"]);
+	const teamId = getPrimeInferenceConfigValue("PRIME_TEAM_ID", primeConfig, ["team_id", "teamId", "teamID"]);
+	let catalog: PrimeInferenceCatalogEntry[] = [];
 
 	try {
 		console.log("Fetching models from Prime Inference API...");
-		const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined;
 		const response = await fetch(`${PRIME_INFERENCE_BASE_URL}/models`, {
-			headers,
+			headers: getPrimeInferenceHeaders(apiKey, teamId),
 		});
-		const catalog = parsePrimeInferenceCatalog(await response.json());
-		if (catalog.length > 0) {
-			const models = catalog.flatMap((entry): Model<"openai-completions">[] => {
-				const metadata = PRIME_INFERENCE_MODEL_METADATA[entry.id.toLowerCase()];
-				return metadata === undefined ? [] : [createPrimeInferenceModel(entry, metadata)];
-			});
-			console.log(`Fetched ${models.length} curated models from Prime Inference`);
-			return models;
-		}
+		catalog = parsePrimeInferenceCatalog(await response.json());
 	} catch (error) {
 		console.error("Failed to fetch Prime Inference models:", error);
 	}
 
-	return [];
+	const catalogModels = catalog.flatMap((entry): Model<"openai-completions">[] => {
+		const metadata = PRIME_INFERENCE_MODEL_METADATA[entry.id.toLowerCase()];
+		return metadata === undefined ? [] : [createPrimeInferenceModel(entry, metadata)];
+	});
+	const models = mergePrimeInferenceModels(getExistingPrimeInferenceModels(), catalogModels);
+	console.log(`Loaded ${models.length} curated models from Prime Inference`);
+	return models;
 }
 
 function createPrimeInferenceModel(
@@ -435,7 +513,7 @@ function createPrimeInferenceModel(
 ): Model<"openai-completions"> {
 	return {
 		id: entry.id,
-		name: getPrimeInferenceDisplayName(entry.id),
+		name: metadata.name ?? getPrimeInferenceDisplayName(entry.id),
 		api: "openai-completions",
 		provider: "prime-inference",
 		baseUrl: PRIME_INFERENCE_BASE_URL,

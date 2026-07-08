@@ -19,13 +19,14 @@ describe("Prime Inference models", () => {
 		// Lower bound, not an exact count — the catalog grows with each release and an
 		// exact number breaks on every routine addition. The membership checks below
 		// are the meaningful assertions.
-		expect(modelIds.length).toBeGreaterThanOrEqual(28);
+		expect(modelIds.length).toBeGreaterThanOrEqual(29);
 		expect(modelIds).toEqual(
 			expect.arrayContaining([
 				"anthropic/claude-opus-4.7",
 				"anthropic/claude-opus-4.8",
 				"anthropic/claude-sonnet-5",
 				"deepseek/deepseek-v4-pro",
+				"internal/glm-5.2-fast",
 				"minimax/minimax-m3",
 				"moonshotai/kimi-k2.7-code",
 				"nvidia/nemotron-3-super-120b-a12b",
@@ -67,6 +68,34 @@ describe("Prime Inference models", () => {
 			supportsReasoningEffort: true,
 			maxTokensField: "max_tokens",
 			supportsStrictMode: false,
+		});
+	});
+
+	it("registers the internal GLM 5.2 Fast route", () => {
+		const model = getModel("prime-inference", "internal/glm-5.2-fast");
+
+		expect(model).toBeDefined();
+		expect(model.name).toBe("GLM 5.2 Fast");
+		expect(model.api).toBe("openai-completions");
+		expect(model.provider).toBe("prime-inference");
+		expect(model.baseUrl).toBe("https://api.pinference.ai/api/v1");
+		expect(model.reasoning).toBe(true);
+		expect(model.input).toEqual(["text"]);
+		expect(model.contextWindow).toBe(400000);
+		expect(model.maxTokens).toBe(131072);
+		expect(model.cost).toEqual({
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+		});
+		expect(model.compat).toEqual({
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: false,
+			maxTokensField: "max_tokens",
+			supportsStrictMode: false,
+			thinkingFormat: "zai",
 		});
 	});
 

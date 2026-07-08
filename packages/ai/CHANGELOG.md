@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added `internal/glm-5.2-fast` to the Prime Inference model catalog.
 - Added Claude Sonnet 5 to the Anthropic and Prime Inference model catalogs.
 
 ## [0.2.6] - 2026-07-06
