@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Container, type Terminal, Text, TUI } from "@earendil-works/pi-tui";
+import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createEditToolDefinition } from "../src/core/tools/edit.js";
 import { computeEditsDiff, type Edit } from "../src/core/tools/edit-diff.js";
@@ -41,7 +42,7 @@ class FakeTerminal implements Terminal {
 	}
 
 	get fullClearCount(): number {
-		return this.writes.filter((write) => write.includes("\x1b[2J\x1b[H\x1b[3J")).length;
+		return this.writes.filter((write) => write.includes("\x1b[2J\x1b[H")).length;
 	}
 }
 
@@ -61,7 +62,7 @@ async function waitForRenderedText(
 		onRetry?.();
 		await waitForRender();
 		lastRender = getRender();
-		if (lastRender.includes(expectedText)) {
+		if (stripAnsi(lastRender).includes(expectedText)) {
 			return lastRender;
 		}
 	}
@@ -135,8 +136,9 @@ describe("edit tool TUI rendering", () => {
 			"line 50 changed",
 			() => tui.requestRender(true),
 		);
-		expect(callOnlyRender).toContain("edit");
-		expect(callOnlyRender).toContain("line 950 changed");
+		const callOnlyRenderText = stripAnsi(callOnlyRender);
+		expect(callOnlyRenderText).toContain("edit");
+		expect(callOnlyRenderText).toContain("line 950 changed");
 
 		const redrawsBeforeResult = tui.fullRedraws;
 		const clearsBeforeResult = terminal.fullClearCount;
@@ -154,7 +156,7 @@ describe("edit tool TUI rendering", () => {
 		expect(tui.fullRedraws).toBe(redrawsBeforeResult);
 		expect(terminal.fullClearCount).toBe(clearsBeforeResult);
 
-		const settledRender = component.render(80).join("\n");
+		const settledRender = stripAnsi(component.render(80).join("\n"));
 		expect(settledRender).toContain("line 50 changed");
 		expect(settledRender).toContain("line 950 changed");
 		expect(settledRender).not.toContain("Successfully replaced");
@@ -204,7 +206,7 @@ describe("edit tool TUI rendering", () => {
 		await waitForRender();
 		await waitForRender();
 
-		const rendered = component.render(80).join("\n");
+		const rendered = stripAnsi(component.render(80).join("\n"));
 		expect(rendered).toContain("line 50 changed");
 		expect(rendered).toContain("line 150 changed");
 	});

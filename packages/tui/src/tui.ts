@@ -558,13 +558,12 @@ export class TUI extends Container {
 	requestRender(force = false): void {
 		if (force) {
 			this.fullscreen?.viewport.reset();
-			this.previousLines = [];
+			// Keep the previous frame metadata so the forced full repaint can
+			// clean up only the visible viewport and avoid touching scrollback.
 			this.previousWidth = -1; // -1 triggers widthChanged, forcing a full clear
-			this.previousHeight = -1; // -1 triggers heightChanged, forcing a full clear
 			this.cursorRow = 0;
 			this.hardwareCursorRow = 0;
 			this.maxLinesRendered = 0;
-			this.previousViewportTop = 0;
 			if (this.renderTimer) {
 				clearTimeout(this.renderTimer);
 				this.renderTimer = undefined;
@@ -588,11 +587,11 @@ export class TUI extends Container {
 	/**
 	 * Request a render that keeps the user anchored at their current scroll
 	 * position. Normally, when content above the visible viewport changes, the
-	 * renderer falls back to a full redraw that clears scrollback and replays
-	 * the entire transcript from the top. For deliberate toggles (e.g. expanding
-	 * all tool output) that is jarring — it scrolls to the top and reprints
-	 * everything. This instead repaints only the visible viewport in place,
-	 * leaving scrollback untouched.
+	 * renderer may fall back to a full screen redraw that replays the entire
+	 * transcript from the top. For deliberate toggles (e.g. expanding all tool
+	 * output) that is jarring: it scrolls to the top and reprints everything.
+	 * This instead repaints only the visible viewport in place, leaving
+	 * scrollback untouched.
 	 */
 	requestRenderPreservingViewport(): void {
 		this.preserveViewportOnNextRender = true;
@@ -1333,7 +1332,8 @@ export class TUI extends Container {
 
 		newLines = this.applyLineResets(newLines);
 
-		// Helper to clear scrollback and viewport and render all new lines
+		// Helper to clear the viewport and repaint the current screen. Do not
+		// clear terminal scrollback: users rely on it to read long prior messages.
 		const fullRender = (clear: boolean, preserveViewport = false): void => {
 			this.fullRedrawCount += 1;
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
@@ -1386,9 +1386,9 @@ export class TUI extends Container {
 				this.cursorRow = Math.max(0, newLines.length - 1);
 				this.hardwareCursorRow = this.cursorRow;
 				// Reset (not just grow) the high-water mark to the repainted content,
-				// mirroring the scrollback-clearing path. Otherwise a preserving
-				// collapse leaves maxLinesRendered inflated, and the next plain render
-				// would re-trigger clearOnShrink and do a destructive full redraw.
+				// mirroring the full-redraw path. Otherwise a preserving collapse
+				// leaves maxLinesRendered inflated, and the next plain render would
+				// re-trigger clearOnShrink.
 				this.maxLinesRendered = newLines.length;
 				this.previousViewportTop = windowStart;
 				this.positionHardwareCursor(cursorPos, newLines.length);
@@ -1399,12 +1399,15 @@ export class TUI extends Container {
 				return;
 			}
 
+			const renderStart = clear && this.previousLines.length > 0 ? Math.max(0, newLines.length - height) : 0;
 			if (clear) {
-				buffer += this.deleteKittyImages(this.previousKittyImageIds);
-				buffer += "\x1b[2J\x1b[H\x1b[3J"; // Clear screen, home, then clear scrollback
+				const previousVisibleTop = Math.min(prevViewportTop, Math.max(0, this.previousLines.length - height));
+				const previousVisibleBottom = Math.min(this.previousLines.length - 1, previousVisibleTop + height - 1);
+				buffer += this.deleteChangedKittyImages(previousVisibleTop, previousVisibleBottom);
+				buffer += "\x1b[2J\x1b[H"; // Clear screen and home while preserving scrollback
 			}
-			for (let i = 0; i < newLines.length; i++) {
-				if (i > 0) buffer += "\r\n";
+			for (let i = renderStart; i < newLines.length; i++) {
+				if (i > renderStart) buffer += "\r\n";
 				buffer += newLines[i];
 			}
 			buffer += "\x1b[?2026l"; // End synchronized output
@@ -1554,8 +1557,8 @@ export class TUI extends Container {
 		//
 		// When the transcript is taller than the viewport — e.g. attaching to a
 		// long or still-streaming session, where off-screen tool results keep
-		// resolving — clearing scrollback and replaying the whole transcript on
-		// every such change is what makes the screen flicker and scroll from the
+		// resolving — replaying the whole transcript on every such change is what
+		// makes the screen flicker and scroll from the
 		// top. Repaint only the visible window in place instead, leaving
 		// scrollback (and the user's history) untouched. Short transcripts that
 		// fit on screen keep the cheap full redraw.
@@ -1563,8 +1566,8 @@ export class TUI extends Container {
 		// Only do this while the transcript is growing (the streaming case). A
 		// shrink — a rebuild or compaction that replaces the transcript with
 		// fewer lines — leaves the now-removed lines stale in scrollback above the
-		// visible window, so it still needs the scrollback-clearing redraw. That
-		// is a one-time event, so it costs no recurring flicker.
+		// visible window, so it still needs a full screen redraw. That is a
+		// one-time event, so it costs no recurring flicker.
 		if (firstChanged < prevViewportTop) {
 			logRedraw(`firstChanged < viewportTop (${firstChanged} < ${prevViewportTop})`);
 			const preserveScrollback = newLines.length > height && newLines.length >= this.previousLines.length;
