@@ -24,7 +24,7 @@ async def send(target: str, message: str, mode: MessageMode = "auto") -> dict[st
     Args:
         target: Active session id, session id/name, or unambiguous suffix.
         message: Text payload to deliver.
-        mode: "auto" queues as follow-up only if the target is streaming;
+        mode: "auto" steers into a busy/streaming target so the message is visible promptly;
             "follow_up" always uses follow-up when the target is streaming;
             "steer" interrupts a streaming target.
 

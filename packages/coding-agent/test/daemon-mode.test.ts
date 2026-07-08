@@ -995,7 +995,7 @@ describe("daemon mode helpers", () => {
 		).resolves.toMatchObject({ target: { activeSessionId: targetState.activeSessionId } });
 
 		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("followUp");
+		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
 		expect(followUp).not.toHaveBeenCalled();
 		expect(prompt).not.toHaveBeenCalled();
 	});
@@ -1051,7 +1051,7 @@ describe("daemon mode helpers", () => {
 		).resolves.toMatchObject({ target: { activeSessionId: targetState.activeSessionId } });
 
 		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("followUp");
+		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
 		expect(followUp).not.toHaveBeenCalled();
 		expect(prompt).not.toHaveBeenCalled();
 	});
@@ -1106,7 +1106,7 @@ describe("daemon mode helpers", () => {
 		).resolves.toMatchObject({ target: { activeSessionId: targetState.activeSessionId } });
 
 		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("followUp");
+		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
 		expect(prompt).not.toHaveBeenCalled();
 	});
 
@@ -1160,7 +1160,7 @@ describe("daemon mode helpers", () => {
 		).resolves.toMatchObject({ target: { activeSessionId: targetState.activeSessionId } });
 
 		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("followUp");
+		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
 		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
 	});
 
@@ -1294,7 +1294,7 @@ describe("daemon mode helpers", () => {
 
 		expect(prompt).toHaveBeenCalledTimes(1);
 		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("followUp");
+		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
 		expect(followUp).not.toHaveBeenCalled();
 		await expect(second).resolves.toMatchObject({ message: "second" });
 	});
@@ -1462,7 +1462,7 @@ describe("daemon mode helpers", () => {
 		await send;
 		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
 		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("followUp");
+		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
 		resolvePrompt();
 	});
 
@@ -1596,7 +1596,7 @@ describe("daemon mode helpers", () => {
 
 		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
 		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("followUp");
+		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
 		resolvePrompt();
 		await cronRun;
 	});
