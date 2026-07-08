@@ -5191,7 +5191,7 @@ export class InteractiveMode {
 		if (messagesToRender.length < sessionContext.messages.length) {
 			this.chatContainer.addChild(
 				new Text(
-					this.getMarkdownThemeWithSettings().fg(
+					theme.fg(
 						"dim",
 						`Showing latest ${messagesToRender.length} of ${sessionContext.messages.length} messages for faster open.`,
 					),
