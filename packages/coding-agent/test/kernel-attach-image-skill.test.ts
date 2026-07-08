@@ -58,6 +58,161 @@ describe("attach-image skill over the kernel host bridge", () => {
 		expect(blocks).toEqual([{ type: "image", data: PNG_BASE64, mimeType: "image/png" }]);
 	});
 
+	it("compresses large attached images before storing them in the tool result", async () => {
+		const imagePath = join(tempDir, "large.png");
+
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledAttachImageSkill()],
+			hostHandlers: {
+				"model.info": async () => ({ id: "anthropic/claude-haiku-4.5", input: ["text", "image"] }),
+			},
+		});
+
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+from PIL import Image
+img = Image.new("RGB", (2400, 1800))
+pixels = img.load()
+for y in range(img.height):
+    for x in range(img.width):
+        pixels[x, y] = ((x * 17 + y * 3) % 256, (x * 5 + y * 11) % 256, (x * 13 + y * 7) % 256)
+img.save(${JSON.stringify(imagePath)})
+print(await attach_image(${JSON.stringify(imagePath)}))
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("Resized for efficient inline rendering/replay");
+		expect(result.attachments).toHaveLength(1);
+		expect(result.attachments?.[0]?.mimeType).toBe("image/jpeg");
+		expect(result.attachments?.[0]?.data.length).toBeLessThanOrEqual(350_000);
+	});
+
+	it("reports when compressed animated images are flattened to their first frame", async () => {
+		const imagePath = join(tempDir, "animated.gif");
+
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledAttachImageSkill()],
+			hostHandlers: {
+				"model.info": async () => ({ id: "anthropic/claude-haiku-4.5", input: ["text", "image"] }),
+			},
+		});
+
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+from PIL import Image
+frames = [Image.new("RGB", (1300, 10), color) for color in ("red", "blue")]
+frames[0].save(${JSON.stringify(imagePath)}, save_all=True, append_images=frames[1:], duration=50, loop=0)
+print(await attach_image(${JSON.stringify(imagePath)}))
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("animated image flattened to first frame");
+		expect(result.attachments).toHaveLength(1);
+		expect(result.attachments?.[0]?.mimeType).toBe("image/jpeg");
+		expect(result.attachments?.[0]?.data.length).toBeLessThanOrEqual(350_000);
+	});
+
+	it("uses a neutral background when compressing transparent images", async () => {
+		const imagePath = join(tempDir, "transparent.png");
+
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledAttachImageSkill()],
+			hostHandlers: {
+				"model.info": async () => ({ id: "anthropic/claude-haiku-4.5", input: ["text", "image"] }),
+			},
+		});
+
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+from PIL import Image, ImageDraw
+img = Image.new("RGBA", (1300, 10), (0, 0, 0, 0))
+draw = ImageDraw.Draw(img)
+draw.rectangle((0, 0, 1299, 9), fill=(255, 255, 255, 255))
+img.save(${JSON.stringify(imagePath)})
+print(await attach_image(${JSON.stringify(imagePath)}))
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("transparent pixels composited on #888888 background");
+		expect(result.attachments).toHaveLength(1);
+		expect(result.attachments?.[0]?.mimeType).toBe("image/jpeg");
+		expect(result.attachments?.[0]?.data.length).toBeLessThanOrEqual(350_000);
+	});
+
+	it("rejects oversized pixel counts before loading an image into context", async () => {
+		const imagePath = join(tempDir, "huge.png");
+
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledAttachImageSkill()],
+			hostHandlers: {
+				"model.info": async () => ({ id: "anthropic/claude-haiku-4.5", input: ["text", "image"] }),
+			},
+		});
+
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+import struct
+import zlib
+
+
+def png_chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+
+png = bytes([137, 80, 78, 71, 13, 10, 26, 10])
+png += png_chunk(b"IHDR", struct.pack(">IIBBBBB", 6001, 6001, 8, 2, 0, 0, 0))
+png += png_chunk(b"IEND", b"")
+with open(${JSON.stringify(imagePath)}, "wb") as file:
+    file.write(png)
+try:
+    await attach_image(${JSON.stringify(imagePath)})
+except ValueError as error:
+    print(f"ValueError: {error}")
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("images must be at most 36MP");
+		expect(result.attachments).toBeUndefined();
+	});
+
+	it("rejects undecodable images before emitting any attachment", async () => {
+		const validImagePath = join(tempDir, "valid.png");
+		const corruptImagePath = join(tempDir, "corrupt.png");
+		writeFileSync(validImagePath, Buffer.from(PNG_BASE64, "base64"));
+
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledAttachImageSkill()],
+			hostHandlers: {
+				"model.info": async () => ({ id: "anthropic/claude-haiku-4.5", input: ["text", "image"] }),
+			},
+		});
+
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+import struct
+import zlib
+
+
+def png_chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+
+png = bytes([137, 80, 78, 71, 13, 10, 26, 10])
+png += png_chunk(b"IHDR", struct.pack(">IIBBBBB", 10, 10, 8, 2, 0, 0, 0))
+png += png_chunk(b"IEND", b"")
+with open(${JSON.stringify(corruptImagePath)}, "wb") as file:
+    file.write(png)
+try:
+    await attach_image(${JSON.stringify(validImagePath)}, ${JSON.stringify(corruptImagePath)})
+except ValueError as error:
+    print(f"ValueError: {error}")
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("is not a readable supported image");
+		expect(result.attachments).toBeUndefined();
+	});
+
 	it("errors without emitting an attachment when the model is not vision-capable", async () => {
 		const imagePath = join(tempDir, "sample.png");
 		writeFileSync(imagePath, Buffer.from(PNG_BASE64, "base64"));
