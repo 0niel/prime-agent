@@ -235,6 +235,7 @@ describe("AgentCronJobStore", () => {
 			status: "cancelled",
 		});
 		expect(store.getHeartbeat("active-1")).toBeUndefined();
+		expect(store.getLatestHeartbeat("active-1")).toMatchObject({ id: job.id, status: "cancelled" });
 	});
 
 	it("rejects one-shot heartbeat schedules", () => {

@@ -192,6 +192,12 @@ export class AgentCronJobStore {
 			.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
 	}
 
+	getLatestHeartbeat(activeSessionId: string): AgentCronJob | undefined {
+		return this.readJobs()
+			.filter((job) => job.activeSessionId === activeSessionId && job.source === "heartbeat")
+			.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))[0];
+	}
+
 	createHeartbeat(input: CreateAgentCronJobInput): AgentCronJob {
 		const now = input.now ?? new Date();
 		const parsed = parseAgentCronSchedule(input.scheduleText, now);

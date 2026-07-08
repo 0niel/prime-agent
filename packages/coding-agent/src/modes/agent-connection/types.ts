@@ -276,6 +276,7 @@ export interface AgentConnectionState {
 	pendingMessageCount: number;
 	compactionCount: number;
 	goal: GoalState;
+	heartbeat?: AgentCronJob | null;
 	scopedModels: AgentConnectionScopedModel[];
 	activeToolNames: string[];
 	contextUsage: SessionStats["contextUsage"];

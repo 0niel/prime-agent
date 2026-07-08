@@ -2761,6 +2761,7 @@ describe("daemon mode helpers", () => {
 			},
 		});
 		const prompt = vi.fn(async () => {});
+		const promptHeartbeat = vi.fn(async () => {});
 		const followUp = vi.fn(async () => true);
 		const state = makeState("active-1") as ActiveSessionState & {
 			runtime: ActiveSessionState["runtime"] & {
@@ -2769,6 +2770,7 @@ describe("daemon mode helpers", () => {
 					isBashRunning: boolean;
 					pendingMessageCount: number;
 					prompt: typeof prompt;
+					promptHeartbeat: typeof promptHeartbeat;
 					followUp: typeof followUp;
 				};
 			};
@@ -2778,6 +2780,7 @@ describe("daemon mode helpers", () => {
 			isBashRunning: false,
 			pendingMessageCount: 0,
 			prompt,
+			promptHeartbeat,
 			followUp,
 		} as never;
 		(daemon as unknown as { sessions: Map<string, ActiveSessionState> }).sessions.set(state.activeSessionId, state);
@@ -2787,14 +2790,15 @@ describe("daemon mode helpers", () => {
 		);
 
 		// The preparing guard adds an internal preflightResult hook.
-		expect(prompt).toHaveBeenCalledWith(
-			"heartbeat prompt",
+		expect(promptHeartbeat).toHaveBeenCalledWith(
+			expect.objectContaining({ id: "heartbeat-1", prompt: "heartbeat prompt" }),
 			expect.objectContaining({
 				streamingBehavior: "followUp",
 				followUpQueueKey: "heartbeat:heartbeat-1",
 				source: "rpc",
 			}),
 		);
+		expect(prompt).not.toHaveBeenCalled();
 		expect(followUp).not.toHaveBeenCalled();
 	});
 
@@ -2805,7 +2809,12 @@ describe("daemon mode helpers", () => {
 				throw new Error("unexpected runtime creation");
 			},
 		});
-		const prompt = vi.fn(async () => {});
+		const prompt = vi.fn(
+			async (
+				_message: string,
+				_options?: { streamingBehavior?: "steer" | "followUp"; followUpQueueKey?: string; source?: string },
+			) => {},
+		);
 		const followUp = vi.fn(async () => true);
 		const state = makeState("active-1") as ActiveSessionState & {
 			runtime: ActiveSessionState["runtime"] & {
@@ -2836,10 +2845,10 @@ describe("daemon mode helpers", () => {
 			"heartbeat prompt",
 			expect.objectContaining({
 				streamingBehavior: "followUp",
-				followUpQueueKey: undefined,
 				source: "rpc",
 			}),
 		);
+		expect(prompt.mock.calls[0]?.[1]).not.toHaveProperty("followUpQueueKey");
 		expect(followUp).not.toHaveBeenCalled();
 	});
 

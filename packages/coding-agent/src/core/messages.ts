@@ -7,6 +7,7 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import type { AgentCronJob } from "./cron-jobs.js";
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
 
@@ -22,6 +23,9 @@ export const BRANCH_SUMMARY_PREFIX = `The following is a summary of a branch tha
 `;
 
 export const BRANCH_SUMMARY_SUFFIX = `</summary>`;
+
+export const HEARTBEAT_PROMPT_CUSTOM_TYPE = "heartbeat_prompt";
+export const HEARTBEAT_PROMPT_PREVIEW_LABEL = "Heartbeat prompt";
 
 /**
  * Message type for bash executions via the ! command.
@@ -50,6 +54,15 @@ export interface CustomMessage<T = unknown> {
 	display: boolean;
 	details?: T;
 	timestamp: number;
+}
+
+export interface HeartbeatPromptDetails {
+	jobId: string;
+	schedule: string;
+	status: AgentCronJob["status"];
+	runCount: number;
+	nextRunAt?: string;
+	lastRunAt?: string;
 }
 
 export interface BranchSummaryMessage {
@@ -138,6 +151,27 @@ export function createCustomMessage(
 		display,
 		details,
 		timestamp: new Date(timestamp).getTime(),
+	};
+}
+
+export function createHeartbeatPromptMessage(
+	job: AgentCronJob,
+	timestamp = Date.now(),
+): CustomMessage<HeartbeatPromptDetails> {
+	return {
+		role: "custom",
+		customType: HEARTBEAT_PROMPT_CUSTOM_TYPE,
+		content: job.prompt,
+		display: true,
+		details: {
+			jobId: job.id,
+			schedule: job.schedule.expression,
+			status: job.status,
+			runCount: job.runCount,
+			nextRunAt: job.nextRunAt,
+			lastRunAt: job.lastRunAt,
+		},
+		timestamp,
 	};
 }
 

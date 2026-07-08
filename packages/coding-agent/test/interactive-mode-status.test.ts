@@ -11,6 +11,7 @@ import {
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import { formatNoModelsAvailableMessage } from "../src/core/auth-guidance.js";
 import type { AuthStatus } from "../src/core/auth-storage.js";
+import type { AgentCronJob } from "../src/core/cron-jobs.js";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.js";
 import { emptyGoalState, type GoalState } from "../src/core/goals.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
@@ -409,6 +410,36 @@ describe("InteractiveMode pending bash components", () => {
 		).updatePendingMessagesDisplay.call(fakeThis);
 
 		expect(pendingMessagesContainer.children).toContain(component);
+	});
+
+	test("does not double-prefix labeled injected queue previews", () => {
+		const queuedMessagesContainer = new Container();
+		const fakeThis = {
+			pendingMessagesContainer: new Container(),
+			queuedMessagesContainer,
+			pendingBashComponents: [],
+			getAllQueuedMessages: () => ({
+				steering: ["Heartbeat prompt: check steering", "Goal context: steer goal", "plain steering"],
+				followUp: ["Heartbeat prompt: check status", "Goal context: continue goal", "plain follow-up"],
+			}),
+			getAppKeyDisplay: () => "Ctrl+Q",
+		} as unknown as InteractiveMode;
+
+		(
+			InteractiveMode.prototype as unknown as { updatePendingMessagesDisplay(this: unknown): void }
+		).updatePendingMessagesDisplay.call(fakeThis);
+
+		const rendered = normalizeRenderedOutput(queuedMessagesContainer);
+		expect(rendered).toContain("Heartbeat prompt: check steering");
+		expect(rendered).not.toContain("Steering: Heartbeat prompt");
+		expect(rendered).toContain("Goal context: steer goal");
+		expect(rendered).not.toContain("Steering: Goal context");
+		expect(rendered).toContain("Steering: plain steering");
+		expect(rendered).toContain("Heartbeat prompt: check status");
+		expect(rendered).not.toContain("Follow-up: Heartbeat prompt");
+		expect(rendered).toContain("Goal context: continue goal");
+		expect(rendered).not.toContain("Follow-up: Goal context");
+		expect(rendered).toContain("Follow-up: plain follow-up");
 	});
 
 	test("flushes pending bash components from the pending area to chat", () => {
@@ -1266,12 +1297,31 @@ describe("InteractiveMode tray goal label", () => {
 	type TrayLabelHarness = {
 		connectionState: {
 			goal: GoalState;
+			heartbeat?: AgentCronJob | null;
 			contextUsage: TrayUsage | undefined;
 		};
 		uiServices: { getContextUsage(): TrayUsage | undefined };
 		getTrayContextLabel(): string | undefined;
 	};
 	const getTrayContextLabel = (InteractiveMode.prototype as unknown as TrayLabelHarness).getTrayContextLabel;
+
+	function createHeartbeat(status: AgentCronJob["status"]): AgentCronJob {
+		return {
+			id: "heartbeat-1",
+			status,
+			source: "heartbeat",
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			prompt: "check whether there is follow-up work",
+			schedule: { kind: "interval", expression: "every 5m", intervalMs: 300_000 },
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			nextRunAt: "2026-01-01T00:05:00.000Z",
+			runCount: 0,
+		};
+	}
 
 	test("shows active goals in the lower tray without an objective", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
@@ -1307,6 +1357,25 @@ describe("InteractiveMode tray goal label", () => {
 		fakeThis.uiServices = { getContextUsage: () => undefined };
 
 		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · 75k (75%)");
+	});
+
+	test("combines active goals, active heartbeats, and context usage in one lower-tray label", () => {
+		const fakeThis = Object.create(InteractiveMode.prototype) as TrayLabelHarness;
+		fakeThis.connectionState = {
+			goal: {
+				active: true,
+				status: "active",
+				objective: "finish the task",
+				tokensUsed: 0,
+				timeUsedSeconds: 65,
+				continuationsUsed: 1,
+			} satisfies GoalState,
+			heartbeat: createHeartbeat("active"),
+			contextUsage: { contextWindow: 100_000, tokens: 75_000, percent: 75 },
+		};
+		fakeThis.uiServices = { getContextUsage: () => undefined };
+
+		expect(getTrayContextLabel.call(fakeThis)).toBe("Pursuing goal (1m 05s) · Heartbeat active (5m) · 75k (75%)");
 	});
 
 	test("omits the usage segment when token count is unknown", () => {

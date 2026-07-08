@@ -20,6 +20,7 @@ export { ExtensionEditorComponent } from "./extension-editor.js";
 export { ExtensionInputComponent } from "./extension-input.js";
 export { ExtensionSelectorComponent } from "./extension-selector.js";
 export { FooterComponent } from "./footer.js";
+export { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./injected-prompt-message.js";
 export {
 	getIpythonCodeFromArgs,
 	IPythonCellComponent,

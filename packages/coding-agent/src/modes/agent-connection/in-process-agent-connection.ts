@@ -144,8 +144,8 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async getQueue(): Promise<AgentConnectionQueueState> {
 		return {
-			steering: [...this.session.getSteeringMessages()],
-			followUp: [...this.session.getFollowUpMessages()],
+			steering: [...this.session.getSteeringMessagePreviews()],
+			followUp: [...this.session.getFollowUpMessagePreviews()],
 		};
 	}
 
