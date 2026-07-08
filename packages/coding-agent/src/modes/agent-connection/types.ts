@@ -452,12 +452,16 @@ export type AgentConnectionSessionEvent =
 			steering: readonly string[];
 			followUp: readonly string[];
 	  }
-	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow"; customInstructions?: string }
+	| {
+			type: "compaction_start";
+			reason: "manual" | "threshold" | "overflow" | "requested";
+			customInstructions?: string;
+	  }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| {
 			type: "compaction_end";
-			reason: "manual" | "threshold" | "overflow";
+			reason: "manual" | "threshold" | "overflow" | "requested";
 			result: CompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;

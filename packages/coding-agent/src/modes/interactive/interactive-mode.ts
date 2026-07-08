@@ -4291,7 +4291,9 @@ export class InteractiveMode {
 				const label =
 					event.reason === "manual"
 						? `Compacting context${focus}... ${cancelHint}`
-						: `${event.reason === "overflow" ? "Context overflow detected, " : ""}Auto-compacting... ${cancelHint}`;
+						: event.reason === "requested"
+							? `Agent requested compaction, compacting context${focus}... ${cancelHint}`
+							: `${event.reason === "overflow" ? "Context overflow detected, " : ""}Auto-compacting... ${cancelHint}`;
 				this.autoCompactionLoader = new Loader(
 					this.ui,
 					(spinner) => theme.fg("muted", spinner),

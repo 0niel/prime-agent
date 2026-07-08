@@ -11,6 +11,7 @@ export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
+	agentCallable?: boolean; // default: true - expose the compact skill so the model can request compaction
 }
 
 export interface BranchSummarySettings {
@@ -761,6 +762,10 @@ export class SettingsManager {
 
 	getCompactionKeepRecentTokens(): number {
 		return this.settings.compaction?.keepRecentTokens ?? 20000;
+	}
+
+	getCompactionAgentCallable(): boolean {
+		return this.settings.compaction?.agentCallable ?? true;
 	}
 
 	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {

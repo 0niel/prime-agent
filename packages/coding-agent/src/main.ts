@@ -703,6 +703,7 @@ export function resolveRuntimeSessionOptions(
 		initialActiveToolNames: runtimeSessionOptions?.initialActiveToolNames,
 		allowedToolNames: runtimeSessionOptions?.allowedToolNames,
 		includeGoals: runtimeSessionOptions?.includeGoals,
+		includeCompactSkill: runtimeSessionOptions?.includeCompactSkill,
 		rlmHeartbeatController: runtimeSessionOptions?.rlmHeartbeatController,
 		agentMessageController: runtimeSessionOptions?.agentMessageController,
 		agentObserveController: runtimeSessionOptions?.agentObserveController,

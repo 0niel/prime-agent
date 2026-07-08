@@ -902,6 +902,7 @@ export class AgentDaemon {
 					allowedToolNames: options.allowedToolNames,
 					customTools: options.customTools,
 					includeGoals: options.includeGoals,
+					includeCompactSkill: options.includeCompactSkill,
 					rlmHeartbeatController: {
 						listRlmHeartbeats: (listOptions) => {
 							if (!stateRef) {

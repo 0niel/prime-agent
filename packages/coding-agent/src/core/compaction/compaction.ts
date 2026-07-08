@@ -117,6 +117,8 @@ export interface CompactionResult<T = unknown> {
 // Types
 // ============================================================================
 
+export const COMPACT_SKILL_NAME = "compact";
+
 export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;

@@ -62,6 +62,7 @@ export interface CreateRlmSubagentRuntimeOptions {
 	allowedToolNames?: string[];
 	customTools: ToolDefinition[];
 	includeGoals: boolean;
+	includeCompactSkill: boolean;
 	rlmDepth: number;
 	rlmMaxDepth: number;
 	rlmParentNodeId: string;
