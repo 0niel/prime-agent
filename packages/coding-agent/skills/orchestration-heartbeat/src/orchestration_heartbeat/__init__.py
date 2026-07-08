@@ -24,14 +24,23 @@ def _first_value(agent: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def _safe_field(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    sanitized = "".join(" " if ord(char) < 32 or ord(char) == 127 else char for char in text)
+    sanitized = " ".join(sanitized.split())
+    return sanitized or None
+
+
 def _session_label(agent: dict[str, Any]) -> str:
-    name = _first_value(agent, "sessionName", "name")
-    session_id = _first_value(agent, "sessionId", "session_id")
-    active_session_id = _first_value(agent, "activeSessionId", "active_session_id")
-    cwd = agent.get("cwd")
-    status = agent.get("status")
-    streaming = _first_value(agent, "isStreaming", "streaming")
-    pending = _first_value(agent, "pendingMessageCount", "pending_message_count")
+    name = _safe_field(_first_value(agent, "sessionName", "name"))
+    session_id = _safe_field(_first_value(agent, "sessionId", "session_id"))
+    active_session_id = _safe_field(_first_value(agent, "activeSessionId", "active_session_id"))
+    cwd = _safe_field(agent.get("cwd"))
+    status = _safe_field(agent.get("status"))
+    streaming = _safe_field(_first_value(agent, "isStreaming", "streaming"))
+    pending = _safe_field(_first_value(agent, "pendingMessageCount", "pending_message_count"))
     parts = [
         f"name={name}" if name else None,
         f"session_id={session_id}" if session_id else None,

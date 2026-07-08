@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Added autonomous mode with host-side continuations, configurable limits, and quality gates for evaluator-controlled runs.
+- Changed the default thinking level to `xhigh` for models that support it.
+
 ## [0.2.6] - 2026-07-06
 
 - Fixed the installer splash flickering during animation and resize by stabilizing full-screen redraws and removing misleading synthetic percentages ([ENG-4481](https://linear.app/primeintellect/issue/ENG-4481/installer-screen-is-unstable-and-flickery)).
