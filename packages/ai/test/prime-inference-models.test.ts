@@ -70,6 +70,35 @@ describe("Prime Inference models", () => {
 		});
 	});
 
+	it("registers Claude Sonnet 5 on Prime Inference", () => {
+		const model = getModel("prime-inference", "anthropic/claude-sonnet-5");
+
+		expect(model).toBeDefined();
+		expect(model.api).toBe("openai-completions");
+		expect(model.provider).toBe("prime-inference");
+		expect(model.baseUrl).toBe("https://api.pinference.ai/api/v1");
+		expect(model.reasoning).toBe(true);
+		expect(model.thinkingLevelMap).toEqual({ xhigh: "xhigh", max: "max" });
+		expect(getSupportedThinkingLevels(model)).toContain("xhigh");
+		expect(getSupportedThinkingLevels(model)).toContain("max");
+		expect(model.input).toEqual(["text", "image"]);
+		expect(model.contextWindow).toBe(200000);
+		expect(model.maxTokens).toBe(128000);
+		expect(model.cost).toEqual({
+			input: 2,
+			output: 10,
+			cacheRead: 0,
+			cacheWrite: 0,
+		});
+		expect(model.compat).toEqual({
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: true,
+			maxTokensField: "max_tokens",
+			supportsStrictMode: false,
+		});
+	});
+
 	it("marks known reasoning-capable Prime Inference model families", () => {
 		const opus48 = getModel("prime-inference", "anthropic/claude-opus-4.8");
 		expect(opus48.reasoning).toBe(true);

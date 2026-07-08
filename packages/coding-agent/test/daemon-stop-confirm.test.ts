@@ -8,7 +8,7 @@ import {
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 
 const COPY: DaemonSessionLossCopy = {
-	busyDetail: (count) => `busy:${count}`,
+	atRiskDetail: (count) => `at-risk:${count}`,
 	unlistableDetail: "unlistable",
 	question: "Continue?",
 	nonTtyHint: "hint",
@@ -16,11 +16,21 @@ const COPY: DaemonSessionLossCopy = {
 
 function session(overrides: Partial<SessionSummary>): SessionSummary {
 	return {
+		id: "session",
+		lifecycle: "live",
+		activity: "idle",
+		runtimeKind: "top-level",
+		activeSessionId: "active",
+		sessionId: "session",
+		sessionFile: "/tmp/session.jsonl",
+		cwd: "/tmp",
 		isStreaming: false,
 		isCompacting: false,
+		attachedClients: 0,
+		messageCount: 1,
 		pendingMessageCount: 0,
 		...overrides,
-	} as unknown as SessionSummary;
+	};
 }
 
 const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
@@ -51,21 +61,39 @@ describe("confirmDaemonSessionLoss", () => {
 		expect(await confirmDaemonSessionLoss(probe, { force: true, copy: COPY })).toBe(true);
 	});
 
-	it("proceeds without prompting when no session is busy", async () => {
+	it("proceeds without prompting when there are no live active sessions", async () => {
 		setTTY(true);
-		const probe: RunningDaemonProbe = {
-			reachable: true,
-			activeSessions: [session({ isStreaming: false }), session({ pendingMessageCount: 0 })],
-		};
+		const probe: RunningDaemonProbe = { reachable: true, activeSessions: [] };
 		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(true);
 	});
 
-	it("aborts without prompting when not at a TTY and a session is busy", async () => {
+	it("proceeds without prompting when a live active session can be restored", async () => {
+		setTTY(false);
+		const probe: RunningDaemonProbe = {
+			reachable: true,
+			activeSessions: [session({ activeSessionId: "live-idle", isStreaming: false, pendingMessageCount: 0 })],
+		};
+		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(true);
+		expect(console.error).not.toHaveBeenCalled();
+	});
+
+	it("aborts without prompting when not at a TTY and a live active session cannot be restored", async () => {
+		setTTY(false);
+		const probe: RunningDaemonProbe = {
+			reachable: true,
+			activeSessions: [session({ activeSessionId: "live-idle", runtimeKind: "subagent" })],
+		};
+		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("hint"));
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("at-risk:1"));
+	});
+
+	it("aborts without prompting when not at a TTY and a session has queued work", async () => {
 		setTTY(false);
 		const probe: RunningDaemonProbe = { reachable: true, activeSessions: [session({ pendingMessageCount: 2 })] };
 		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("hint"));
-		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("busy:1"));
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("at-risk:1"));
 	});
 
 	it("aborts without prompting when not at a TTY and sessions cannot be listed", async () => {
@@ -75,9 +103,14 @@ describe("confirmDaemonSessionLoss", () => {
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("unlistable"));
 	});
 
-	it("treats compacting and pending-message sessions as busy", async () => {
+	it("treats compacting, pending-message, streaming, and bash-running sessions as at risk", async () => {
 		setTTY(false);
-		for (const overrides of [{ isCompacting: true }, { pendingMessageCount: 1 }, { isStreaming: true }]) {
+		for (const overrides of [
+			{ isCompacting: true },
+			{ pendingMessageCount: 1 },
+			{ isStreaming: true },
+			{ isBashRunning: true },
+		] satisfies Partial<SessionSummary>[]) {
 			vi.mocked(console.error).mockClear();
 			const probe: RunningDaemonProbe = { reachable: true, activeSessions: [session(overrides)] };
 			expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);

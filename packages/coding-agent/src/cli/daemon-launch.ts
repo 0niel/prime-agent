@@ -9,7 +9,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { appendRotatingLog, expandTildePath, getClientErrorLogPath, VERSION } from "../config.js";
 import { DaemonClient } from "../modes/daemon/daemon-client.js";
 import { DAEMON_PROTOCOL_VERSION } from "../modes/daemon/daemon-protocol.js";
@@ -132,13 +132,89 @@ export async function shutdownDaemonAndWait(socketPath: string): Promise<boolean
 }
 
 // activeSessions is undefined when the daemon is reachable but its sessions couldn't
-// be listed — callers must treat that as "possibly busy", not idle.
+// be listed — callers must treat that as "possibly active", not idle.
 export type RunningDaemonProbe = { reachable: false } | { reachable: true; activeSessions?: SessionSummary[] };
 
-export function isSessionBusy(summary: SessionSummary): boolean {
-	// pendingMessageCount covers queued steering/follow-ups, which live only in
-	// memory and would be lost if the daemon were stopped.
-	return summary.isStreaming || summary.isCompacting || summary.pendingMessageCount > 0;
+export interface DaemonSessionRestoreFailure {
+	sessionFile: string;
+	error: string;
+}
+
+export interface DaemonSessionRestoreResult {
+	restored: number;
+	total: number;
+	failed: DaemonSessionRestoreFailure[];
+}
+
+export function hasSessionVolatileWorkForDaemonStop(summary: SessionSummary): boolean {
+	// These states live in daemon memory and cannot be reconstructed by reopening
+	// the JSONL session file after the daemon restarts.
+	return (
+		summary.isStreaming || summary.isCompacting || summary.isBashRunning === true || summary.pendingMessageCount > 0
+	);
+}
+
+export function isSessionReopenableAfterDaemonStop(summary: SessionSummary): boolean {
+	return (
+		summary.activeSessionId !== undefined && summary.runtimeKind !== "subagent" && summary.sessionFile !== undefined
+	);
+}
+
+export function isSessionRestorableAfterDaemonStop(summary: SessionSummary): boolean {
+	return isSessionReopenableAfterDaemonStop(summary) && !hasSessionVolatileWorkForDaemonStop(summary);
+}
+
+export function isSessionAtRiskFromDaemonStop(summary: SessionSummary): boolean {
+	if (summary.activeSessionId === undefined) {
+		return hasSessionVolatileWorkForDaemonStop(summary);
+	}
+	return !isSessionRestorableAfterDaemonStop(summary);
+}
+
+function restoreCandidateSessionFiles(sessions: readonly SessionSummary[]): string[] {
+	return [
+		...new Set(
+			sessions
+				.filter(isSessionReopenableAfterDaemonStop)
+				.map((session) => session.sessionFile)
+				.filter((sessionFile): sessionFile is string => sessionFile !== undefined)
+				.map((sessionFile) => resolve(sessionFile)),
+		),
+	];
+}
+
+export async function restoreDaemonSessionSummaries(
+	socketPath: string,
+	sessions: readonly SessionSummary[],
+): Promise<DaemonSessionRestoreResult> {
+	const sessionFiles = restoreCandidateSessionFiles(sessions);
+	if (sessionFiles.length === 0) {
+		return { restored: 0, total: 0, failed: [] };
+	}
+
+	const client = new DaemonClient(socketPath);
+	await client.connect(3000);
+	let restored = 0;
+	const failed: DaemonSessionRestoreFailure[] = [];
+	try {
+		for (const sessionFile of sessionFiles) {
+			const response = await client.request({
+				type: "create",
+				sessionPath: sessionFile,
+				config: {
+					sessionDir: dirname(sessionFile),
+				},
+			});
+			if (response.success) {
+				restored++;
+			} else {
+				failed.push({ sessionFile, error: response.error });
+			}
+		}
+	} finally {
+		client.close();
+	}
+	return { restored, total: sessionFiles.length, failed };
 }
 
 export async function probeRunningDaemonSessions(socketPath: string): Promise<RunningDaemonProbe> {
@@ -159,23 +235,25 @@ export async function probeRunningDaemonSessions(socketPath: string): Promise<Ru
 	}
 }
 
-// Idle-but-loaded sessions reload from disk on the fresh daemon, so only a busy
-// session blocks replacing a stale daemon.
-async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<boolean> {
+interface StaleDaemonShutdownResult {
+	stopped: boolean;
+	restoreSessions: SessionSummary[];
+}
+
+// Sessions with volatile in-memory work still block implicit replacement. Idle
+// persisted top-level sessions can be reopened after the fresh daemon starts.
+async function shutdownStaleDaemonForReplacement(socketPath: string): Promise<StaleDaemonShutdownResult> {
 	const client = new DaemonClient(socketPath);
 	let connected = false;
-	let hasBusySessions = false;
-	let loadedSessionCount = 0;
+	let summaries: SessionSummary[] | undefined;
 	try {
 		await client.connect(1000);
 		connected = true;
 		try {
-			const summaries = await listActiveDaemonSessionSummaries(client);
-			loadedSessionCount = summaries.length;
-			hasBusySessions = summaries.some(isSessionBusy);
+			summaries = await listActiveDaemonSessionSummaries(client);
 		} catch {
-			// Couldn't confirm idleness: treat as busy rather than risk interrupting work.
-			hasBusySessions = true;
+			// Couldn't confirm the session state: treat as active rather than risk interrupting work.
+			summaries = undefined;
 		}
 	} catch {
 		// Couldn't reach it to inspect; don't send a blind shutdown, just verify below.
@@ -184,30 +262,25 @@ async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<boolean
 	}
 
 	if (!connected) {
-		return waitForDaemonGone(socketPath);
+		return { stopped: await waitForDaemonGone(socketPath), restoreSessions: [] };
 	}
-	if (hasBusySessions) {
-		logDaemonLaunch(`refusing to replace stale daemon on ${socketPath}: busy session(s) present`);
-		return false;
+	if (!summaries) {
+		logDaemonLaunch(`refusing to replace stale daemon on ${socketPath}: session list unavailable`);
+		return { stopped: false, restoreSessions: [] };
 	}
+	const atRiskSessions = summaries.filter(isSessionAtRiskFromDaemonStop);
+	if (atRiskSessions.length > 0) {
+		logDaemonLaunch(`refusing to replace stale daemon on ${socketPath}: unrestorable live session(s) present`);
+		return { stopped: false, restoreSessions: [] };
+	}
+	const restoreSessions = summaries.filter(isSessionRestorableAfterDaemonStop);
 	logDaemonLaunch(
-		`replacing stale daemon on ${socketPath} (idle): ${loadedSessionCount} loaded session(s) will reload`,
+		`replacing stale daemon on ${socketPath}: ${restoreSessions.length} live session(s) will be reopened`,
 	);
-	return shutdownDaemonAndWait(socketPath);
+	return { stopped: await shutdownDaemonAndWait(socketPath), restoreSessions };
 }
 
-async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promise<void> {
-	const probe = await probeDaemonVersion(socketPath);
-	if (probe === "current") {
-		return;
-	}
-	if (probe === "stale") {
-		const stopped = await shutdownStaleDaemonIfNotBusy(socketPath);
-		if (!stopped) {
-			throw new StaleDaemonError(socketPath);
-		}
-	}
-
+async function spawnDaemonAndWait(socketPath: string, spawnCwd?: string): Promise<void> {
 	const entrypoint = process.argv[1];
 	if (!entrypoint) {
 		throw new Error("Cannot determine current CLI entrypoint for daemon launch");
@@ -236,6 +309,51 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 	}
 
 	throw new Error(`Timed out waiting for daemon to start on ${socketPath}`);
+}
+
+export async function relaunchDaemonAndRestoreSessions(
+	socketPath: string,
+	sessions: readonly SessionSummary[],
+	spawnCwd?: string,
+): Promise<DaemonSessionRestoreResult> {
+	const stopped = await shutdownDaemonAndWait(socketPath);
+	if (!stopped) {
+		throw new Error(`Could not stop daemon on ${socketPath}`);
+	}
+	await spawnDaemonAndWait(socketPath, spawnCwd);
+	return restoreDaemonSessionSummaries(socketPath, sessions);
+}
+
+export async function spawnDaemonAndRestoreSessions(
+	socketPath: string,
+	sessions: readonly SessionSummary[],
+	spawnCwd?: string,
+): Promise<DaemonSessionRestoreResult> {
+	await spawnDaemonAndWait(socketPath, spawnCwd);
+	return restoreDaemonSessionSummaries(socketPath, sessions);
+}
+
+async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promise<void> {
+	const probe = await probeDaemonVersion(socketPath);
+	if (probe === "current") {
+		return;
+	}
+	let restoreSessions: SessionSummary[] = [];
+	if (probe === "stale") {
+		const result = await shutdownStaleDaemonForReplacement(socketPath);
+		if (!result.stopped) {
+			throw new StaleDaemonError(socketPath);
+		}
+		restoreSessions = result.restoreSessions;
+	}
+
+	const restoreResult = await spawnDaemonAndRestoreSessions(socketPath, restoreSessions, spawnCwd);
+	if (restoreResult.failed.length > 0) {
+		logDaemonLaunch(
+			`restored ${restoreResult.restored}/${restoreSessions.length} session(s) after daemon replacement; ` +
+				`${restoreResult.failed.length} failed`,
+		);
+	}
 }
 
 const ensurePromises = new Map<string, Promise<void>>();

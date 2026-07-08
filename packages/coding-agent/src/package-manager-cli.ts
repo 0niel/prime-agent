@@ -2,10 +2,10 @@ import chalk from "chalk";
 import { spawn } from "child_process";
 import { selectConfig } from "./cli/config-selector.js";
 import {
-	ensureInteractiveDaemonRunning,
+	type DaemonSessionRestoreResult,
 	probeRunningDaemonSessions,
 	type RunningDaemonProbe,
-	shutdownDaemonAndWait,
+	relaunchDaemonAndRestoreSessions,
 } from "./cli/daemon-launch.js";
 import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions } from "./cli/daemon-stop-confirm.js";
 import {
@@ -354,12 +354,12 @@ async function runSelfUpdate(command: SelfUpdateCommand): Promise<void> {
 	}
 }
 
-// Only busy sessions (streaming, compacting, or pending messages) would lose work;
-// idle loaded sessions reload from disk on the fresh daemon.
+// Idle persisted sessions are reopened after the update relaunch. Sessions with
+// volatile in-memory work still require confirmation because they cannot be restored.
 const UPDATE_SESSION_LOSS_COPY: DaemonSessionLossCopy = {
-	busyDetail(count) {
+	atRiskDetail(count) {
 		const { noun, pronoun } = pluralizeSessions(count);
-		return `The running daemon has ${count} busy ${noun}. Updating will stop the daemon and terminate ${pronoun}.`;
+		return `The running daemon has ${count} active ${noun} that cannot be restored. Updating will stop the daemon and terminate ${pronoun}.`;
 	},
 	unlistableDetail:
 		"A running daemon's sessions could not be listed. Updating will stop the daemon and may terminate active sessions.",
@@ -372,19 +372,27 @@ function confirmDaemonSessionLossBeforeUpdate(probe: RunningDaemonProbe, force: 
 	return confirmDaemonSessionLoss(probe, { force, copy: UPDATE_SESSION_LOSS_COPY });
 }
 
-async function restartDaemonAfterSelfUpdate(socketPath: string, daemonWasRunning: boolean): Promise<void> {
-	if (!daemonWasRunning) {
+function reportDaemonSessionRestoreWarnings(result: DaemonSessionRestoreResult): void {
+	if (result.failed.length === 0) {
 		return;
 	}
-	const stopped = await shutdownDaemonAndWait(socketPath);
-	if (!stopped) {
-		console.error(
-			chalk.yellow(`Warning: could not stop the old daemon on ${socketPath}; it will be replaced on next launch.`),
-		);
+	console.error(
+		chalk.yellow(
+			`Warning: restored ${result.restored}/${result.total} daemon session(s), but ${result.failed.length} session(s) failed to reopen.`,
+		),
+	);
+	for (const failure of result.failed) {
+		console.error(chalk.dim(`  ${failure.sessionFile}: ${failure.error}`));
+	}
+}
+
+async function restartDaemonAfterSelfUpdate(socketPath: string, daemonProbe: RunningDaemonProbe): Promise<void> {
+	if (!daemonProbe.reachable) {
 		return;
 	}
 	try {
-		await ensureInteractiveDaemonRunning(socketPath);
+		const restoreResult = await relaunchDaemonAndRestoreSessions(socketPath, daemonProbe.activeSessions ?? []);
+		reportDaemonSessionRestoreWarnings(restoreResult);
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(
@@ -583,7 +591,7 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 						return true;
 					}
 					console.log(chalk.green(`Updated ${APP_NAME}`));
-					await restartDaemonAfterSelfUpdate(daemonSocketPath, daemonProbe.reachable);
+					await restartDaemonAfterSelfUpdate(daemonSocketPath, daemonProbe);
 				}
 				return true;
 			}

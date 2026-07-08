@@ -5,6 +5,7 @@
 - Added autonomous mode with host-side continuations, configurable limits, and quality gates for evaluator-controlled runs.
 - Changed the default thinking level to `xhigh` for models that support it.
 - Changed heartbeat cron delivery to use hidden context messages so scheduled heartbeat prompts do not appear in the visible chat queue.
+- Fixed daemon self-updates reopening previous restorable live sessions after relaunch.
 
 ## [0.2.6] - 2026-07-06
 
