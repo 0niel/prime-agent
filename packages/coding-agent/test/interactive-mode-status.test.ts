@@ -272,6 +272,98 @@ describe("InteractiveMode.renderSessionContext", () => {
 			resetCapabilitiesCache();
 		}
 	});
+
+	test("renders only the recent tail for very long initial transcripts", async () => {
+		const chatContainer = new Container();
+		const addMessageToChat = vi.fn();
+		const fakeThis: any = {
+			pendingTools: new Map(),
+			toolOutputExpanded: false,
+			chatContainer,
+			footer: { invalidate: vi.fn() },
+			updateEditorBorderColor: vi.fn(),
+			resetPendingToolState: vi.fn(),
+			preloadToolDefinitions: vi.fn(async () => {}),
+			ui: { requestRender: vi.fn() },
+			getMarkdownThemeWithSettings: () => ({ fg: (_name: string, value: string) => value }),
+			addMessageToChat,
+		};
+		const messages = Array.from({ length: 405 }, (_, index) => ({
+			role: "user" as const,
+			content: `message ${index}`,
+			timestamp: index,
+		}));
+
+		await (InteractiveMode as any).prototype.renderSessionContext.call(fakeThis, {
+			messages,
+			thinkingLevel: "medium",
+			model: null,
+		});
+
+		expect(addMessageToChat).toHaveBeenCalledTimes(400);
+		expect(addMessageToChat.mock.calls[0]?.[0]).toMatchObject({ content: "message 5" });
+		expect(renderAll(chatContainer)).toContain("Showing latest 400 of 405 messages for faster open.");
+	});
+
+	test("only keeps the latest image-bearing message during initial render", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		try {
+			const chatContainer = new Container();
+			const fakeThis: any = {
+				pendingTools: new Map(),
+				toolOutputExpanded: false,
+				chatContainer,
+				footer: { invalidate: vi.fn() },
+				updateEditorBorderColor: vi.fn(),
+				resetPendingToolState: vi.fn(),
+				preloadToolDefinitions: vi.fn(async () => {}),
+				settingsManager: {
+					getShowImages: () => true,
+					getImageWidthCells: () => 60,
+				},
+				getCachedToolDefinition: () => undefined,
+				getCurrentCwd: () => process.cwd(),
+				getRetryAttempt: () => 0,
+				ui: { requestRender: vi.fn() },
+				addMessageToChat: vi.fn(() => {
+					chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
+				}),
+			};
+
+			await (InteractiveMode as any).prototype.renderSessionContext.call(fakeThis, {
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", name: "old_tool", id: "tool-old", arguments: {} }],
+					},
+					{
+						role: "toolResult",
+						toolCallId: "tool-old",
+						content: [{ type: "image", data: "OLD", mimeType: "image/png" }],
+						isError: false,
+					},
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", name: "new_tool", id: "tool-new", arguments: {} }],
+					},
+					{
+						role: "toolResult",
+						toolCallId: "tool-new",
+						content: [{ type: "image", data: "NEW", mimeType: "image/png" }],
+						isError: false,
+					},
+				],
+				thinkingLevel: "medium",
+				model: null,
+			});
+
+			const rendered = normalizeRenderedOutput(chatContainer);
+			expect(rendered).toContain("[older image omitted during initial render: image/png]");
+			expect(rendered.match(/\[Image: \[image\/png\]\]/g)).toHaveLength(1);
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
 });
 
 type SubmitHandlerHarness = {

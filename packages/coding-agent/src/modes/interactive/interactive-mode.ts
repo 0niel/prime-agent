@@ -387,6 +387,52 @@ const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 // inline limit before storing, so this holds many recent pastes; the oldest are
 // evicted past the cap to keep a long session bounded.
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
+const INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT = 400;
+
+function initialRenderMessages(messages: AgentMessage[], options: { clearChat?: boolean }): AgentMessage[] {
+	const visibleMessages =
+		options.clearChat || messages.length <= INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT
+			? messages
+			: messages.slice(-INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT);
+	return retainOnlyLatestImageMessage(visibleMessages);
+}
+
+function retainOnlyLatestImageMessage(messages: AgentMessage[]): AgentMessage[] {
+	let latestImageMessageIndex = -1;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messageHasImageContent(messages[i]!)) {
+			latestImageMessageIndex = i;
+			break;
+		}
+	}
+	if (latestImageMessageIndex === -1) {
+		return messages;
+	}
+	return messages.map((message, index) => (index === latestImageMessageIndex ? message : replaceImageBlocks(message)));
+}
+
+function messageHasImageContent(message: AgentMessage): boolean {
+	const content = "content" in message ? message.content : undefined;
+	return Array.isArray(content) && content.some((block) => block?.type === "image");
+}
+
+function replaceImageBlocks(message: AgentMessage): AgentMessage {
+	const content = "content" in message ? message.content : undefined;
+	if (!Array.isArray(content) || !content.some((block) => block?.type === "image")) {
+		return message;
+	}
+	return {
+		...message,
+		content: content.map((block) =>
+			block?.type === "image"
+				? {
+						type: "text",
+						text: `[older image omitted during initial render: ${block.mimeType ?? "image"}]`,
+					}
+				: block,
+		),
+	} as AgentMessage;
+}
 
 function isDeadTerminalError(error: unknown): boolean {
 	if (!error || typeof error !== "object" || !("code" in error)) {
@@ -5118,9 +5164,10 @@ export class InteractiveMode {
 		options: { updateFooter?: boolean; populateHistory?: boolean; clearChat?: boolean } = {},
 	): Promise<void> {
 		this.resetPendingToolState();
+		const messagesToRender = initialRenderMessages(sessionContext.messages, options);
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
 		const toolNames: string[] = [];
-		for (const message of sessionContext.messages) {
+		for (const message of messagesToRender) {
 			if (message.role !== "assistant") {
 				continue;
 			}
@@ -5141,7 +5188,21 @@ export class InteractiveMode {
 			this.updateEditorBorderColor();
 		}
 
-		for (const message of sessionContext.messages) {
+		if (messagesToRender.length < sessionContext.messages.length) {
+			this.chatContainer.addChild(
+				new Text(
+					this.getMarkdownThemeWithSettings().fg(
+						"dim",
+						`Showing latest ${messagesToRender.length} of ${sessionContext.messages.length} messages for faster open.`,
+					),
+					1,
+					0,
+				),
+			);
+			this.chatContainer.addChild(new Spacer(1));
+		}
+
+		for (const message of messagesToRender) {
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
 				this.addMessageToChat(message);
