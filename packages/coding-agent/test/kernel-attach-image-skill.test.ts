@@ -58,6 +58,35 @@ describe("attach-image skill over the kernel host bridge", () => {
 		expect(blocks).toEqual([{ type: "image", data: PNG_BASE64, mimeType: "image/png" }]);
 	});
 
+	it("compresses large attached images before storing them in the tool result", async () => {
+		const imagePath = join(tempDir, "large.png");
+
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledAttachImageSkill()],
+			hostHandlers: {
+				"model.info": async () => ({ id: "anthropic/claude-haiku-4.5", input: ["text", "image"] }),
+			},
+		});
+
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+from PIL import Image
+img = Image.new("RGB", (2400, 1800))
+pixels = img.load()
+for y in range(img.height):
+    for x in range(img.width):
+        pixels[x, y] = ((x * 17 + y * 3) % 256, (x * 5 + y * 11) % 256, (x * 13 + y * 7) % 256)
+img.save(${JSON.stringify(imagePath)})
+print(await attach_image(${JSON.stringify(imagePath)}))
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout).toContain("Resized for efficient inline rendering/replay");
+		expect(result.attachments).toHaveLength(1);
+		expect(result.attachments?.[0]?.mimeType).toBe("image/jpeg");
+		expect(result.attachments?.[0]?.data.length).toBeLessThanOrEqual(350_000);
+	});
+
 	it("errors without emitting an attachment when the model is not vision-capable", async () => {
 		const imagePath = join(tempDir, "sample.png");
 		writeFileSync(imagePath, Buffer.from(PNG_BASE64, "base64"));
