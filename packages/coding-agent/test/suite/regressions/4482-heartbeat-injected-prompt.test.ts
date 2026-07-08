@@ -258,7 +258,7 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		).toBe(true);
 	});
 
-	it("returns labeled previews when clearing queued heartbeat prompts", async () => {
+	it("returns raw text when clearing queued heartbeat prompts while previews remain labeled", async () => {
 		let releaseToolExecution: (() => void) | undefined;
 		const toolRelease = new Promise<void>((resolve) => {
 			releaseToolExecution = resolve;
@@ -278,7 +278,8 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		};
 		const harness = await createHarness({ tools: [waitTool] });
 		harnesses.push(harness);
-		const heartbeatPreview = "Heartbeat prompt: Check whether the long-running task needs another step.";
+		const heartbeatText = "Check whether the long-running task needs another step.";
+		const heartbeatPreview = `Heartbeat prompt: ${heartbeatText}`;
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
 			fauxAssistantMessage("original turn complete"),
@@ -297,7 +298,7 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		await harness.session.promptHeartbeat(createHeartbeat(), { streamingBehavior: "followUp" });
 
 		expect(harness.session.getFollowUpMessagePreviews()).toEqual([heartbeatPreview]);
-		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: [heartbeatPreview] });
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: [heartbeatText] });
 
 		releaseToolExecution?.();
 		await promptPromise;

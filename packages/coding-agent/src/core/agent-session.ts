@@ -1871,19 +1871,25 @@ export class AgentSession {
 
 			// Check for retryable errors first (overloaded, rate limit, server errors)
 			const concreteAuthFailure = this._isConcreteProviderAuthFailure(msg);
-			if (this._isRetryableError(msg) || concreteAuthFailure) {
-				if (concreteAuthFailure) {
+			const retryConcreteAuthFailure =
+				concreteAuthFailure && !this._isStructuredPermanentProviderRetryExhausted(msg);
+			if (this._isRetryableError(msg) || retryConcreteAuthFailure) {
+				if (retryConcreteAuthFailure) {
 					this._captureRetryAuthFailureSource(msg);
 				}
 				const didRetry = await this._handleRetryableError(msg, {
-					markAuthStaleOnFailure: concreteAuthFailure,
-					authSourceTokens: concreteAuthFailure ? this._retryAuthFailureSources : undefined,
+					markAuthStaleOnFailure: retryConcreteAuthFailure,
+					authSourceTokens: retryConcreteAuthFailure ? this._retryAuthFailureSources : undefined,
 				});
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
 			}
 
-			this._resolveRetry();
 			const compactionWillRetry = await this._checkCompaction(msg);
+			if (compactionWillRetry && this._retryAttempt > 0) {
+				return;
+			}
+			this._finishActiveRetryWithFailure(msg);
+			this._resolveRetry();
 			if (!compactionWillRetry) {
 				this._finishGoalForTerminalAssistantMessage(msg);
 				this._scheduleAutoRefineAfterAgentEnd();
@@ -3222,8 +3228,8 @@ export class AgentSession {
 	 * @returns Object with steering and followUp arrays
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
-		const steering = this._steeringMessages.map(queuedMessagePreview);
-		const followUp = this._followUpMessages.map(queuedMessagePreview);
+		const steering = this._steeringMessages.map((message) => message.text);
+		const followUp = this._followUpMessages.map((message) => message.text);
 		this._rejectQueuedAgentMessageDeliveries(new Error("Queued agent message was cleared before delivery."));
 		this._steeringMessages = [];
 		this._followUpMessages = [];
@@ -5626,34 +5632,64 @@ export class AgentSession {
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (isContextOverflow(message, contextWindow)) return false;
 
-		// Structured classification from the provider (stream-failure.ts) beats
-		// message-text matching. Safety/malformed/unknown kinds fall through to
-		// the regex, which distinguishes transient content_filter cases.
-		const failure = message.diagnostics?.find((d) => d.type === "provider_stream_failure");
-		const kind = failure?.details?.kind;
-		if (kind === "overloaded" || kind === "rate_limit" || kind === "server_error") return true;
-		if (kind === "refusal" || kind === "auth" || kind === "invalid_request") return false;
+		if (this._isFauxProviderQueueExhausted(message)) {
+			return false;
+		}
 
-		const err = message.errorMessage;
-		// Match: overloaded_error, provider returned error, rate limit, 429, 500, 502, 503, 504, service unavailable, network/connection errors (including connection lost), WebSocket transport closes/errors, fetch failed, request ended without sending chunks, HTTP/2 closed before response, terminated, retry delay exceeded, transient content_filter finish_reason, provider policy-flag prose, and prose-form transient 5xx ("an error occurred while processing your request. you can retry")
-		return /overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|http2 request did not get a response|timed? out|timeout|terminated|retry delay|content.?filter|flagged .*(cybersecurity|usage polic|violat)|error occurred while processing|you can retry/i.test(
-			err,
-		);
+		if (this._isAgentLifecycleFailure(message)) {
+			return false;
+		}
+
+		if (this._isStructuredPermanentProviderRetryExhausted(message)) {
+			return false;
+		}
+
+		return true;
 	}
 
-	private _getProviderStreamFailureAuthStatus(message: AssistantMessage): number | undefined {
+	private _isFauxProviderQueueExhausted(message: AssistantMessage): boolean {
+		return message.provider === "faux" && message.errorMessage === "No more faux responses queued";
+	}
+
+	private _isAgentLifecycleFailure(message: AssistantMessage): boolean {
+		return message.diagnostics?.some((diagnostic) => diagnostic.type === "agent_lifecycle_failure") ?? false;
+	}
+
+	private _getProviderStreamFailureDetails(message: AssistantMessage): Record<string, unknown> | undefined {
 		const failure = message.diagnostics?.find((diagnostic) => diagnostic.type === "provider_stream_failure");
 		const details = failure?.details;
 		if (!details || typeof details !== "object") {
 			return undefined;
 		}
+		return details;
+	}
 
-		const kind = "kind" in details ? details.kind : undefined;
+	private _getProviderStreamFailureKind(message: AssistantMessage): string | undefined {
+		const kind = this._getProviderStreamFailureDetails(message)?.kind;
+		return typeof kind === "string" ? kind : undefined;
+	}
+
+	private _isStructuredPermanentProviderFailure(message: AssistantMessage): boolean {
+		const kind = this._getProviderStreamFailureKind(message);
+		return kind === "auth" || kind === "invalid_request" || kind === "refusal";
+	}
+
+	private _isStructuredPermanentProviderRetryExhausted(message: AssistantMessage): boolean {
+		return this._retryAttempt > 0 && this._isStructuredPermanentProviderFailure(message);
+	}
+
+	private _getProviderStreamFailureAuthStatus(message: AssistantMessage): number | undefined {
+		const details = this._getProviderStreamFailureDetails(message);
+		if (!details) {
+			return undefined;
+		}
+
+		const kind = details.kind;
 		if (kind !== "auth") {
 			return undefined;
 		}
 
-		const status = "status" in details ? details.status : undefined;
+		const status = details.status;
 		if (typeof status === "number") {
 			return status;
 		}
@@ -5733,6 +5769,21 @@ export class AgentSession {
 			return marked;
 		}
 		return false;
+	}
+
+	private _finishActiveRetryWithFailure(message: AssistantMessage): void {
+		if (this._retryAttempt === 0) {
+			return;
+		}
+		this._markProviderAuthStaleForRetryFailure(message);
+		this._emit({
+			type: "auto_retry_end",
+			success: false,
+			attempt: this._retryAttempt,
+			finalError: message.errorMessage,
+		});
+		this._retryAttempt = 0;
+		this._retryAuthFailureSources = [];
 	}
 
 	/**
@@ -5831,6 +5882,17 @@ export class AgentSession {
 		if (this._retryAbortController) {
 			this._retryAbortController.abort();
 			return;
+		}
+		if (this._retryAttempt > 0) {
+			this._autoCompactionAbortController?.abort();
+			this._cancelPostCompactionContinue();
+			this._emit({
+				type: "auto_retry_end",
+				success: false,
+				attempt: this._retryAttempt,
+				finalError: "Retry cancelled",
+			});
+			this._retryAttempt = 0;
 		}
 		this._retryAuthFailureSources = [];
 		this._resolveRetry();

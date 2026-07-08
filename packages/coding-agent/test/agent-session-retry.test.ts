@@ -363,9 +363,11 @@ describe("AgentSession retry", () => {
 		expect(callCount).toBe(4);
 	});
 
-	// Transient provider stream artifacts the classifier previously missed (ENG-4390).
+	// Provider errors are retried within the bounded retry budget (ENG-4390, ENG-4503).
 	const transientProviderErrors: Array<[string, string]> = [
 		["content_filter finish_reason", "Provider finish_reason: content_filter"],
+		["empty provider response", "Provider returned an empty response"],
+		["plain invalid API key", "invalid_api_key"],
 		["cybersecurity policy flag", "Your request was flagged for cybersecurity risk and cannot be processed."],
 		["usage policy flag", "flagged as potentially violating our usage policy"],
 		["prose-form transient 5xx", "An error occurred while processing your request. You can retry your request."],

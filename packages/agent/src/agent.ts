@@ -1,4 +1,5 @@
 import {
+	createAssistantMessageDiagnostic,
 	type ImageContent,
 	type Message,
 	type Model,
@@ -502,6 +503,9 @@ export class Agent {
 			usage: EMPTY_USAGE,
 			stopReason: aborted ? "aborted" : "error",
 			errorMessage: error instanceof Error ? error.message : String(error),
+			diagnostics: aborted
+				? undefined
+				: [createAssistantMessageDiagnostic("agent_lifecycle_failure", error, { source: "run_with_lifecycle" })],
 			timestamp: Date.now(),
 		} satisfies AgentMessage;
 		this._state.messages.push(failureMessage);

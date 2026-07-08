@@ -51,7 +51,7 @@ describe("issue #4491 provider stale after repeated 401", () => {
 		}
 	});
 
-	it("retries concrete provider auth failures, then marks current auth stale", async () => {
+	it("retries structured provider auth failures once, then marks current auth stale", async () => {
 		const harness = await createHarness({
 			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
 		});
@@ -60,8 +60,8 @@ describe("issue #4491 provider stale after repeated 401", () => {
 
 		await harness.session.prompt("hello");
 
-		expect(harness.faux.state.callCount).toBe(3);
-		expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([1, 2]);
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([1]);
 		expect(harness.eventsOfType("auto_retry_end").map((event) => event.success)).toEqual([false]);
 		expect(harness.eventsOfType("auth_stale")).toHaveLength(1);
 
@@ -118,6 +118,24 @@ describe("issue #4491 provider stale after repeated 401", () => {
 		const session = harness.session as unknown as {
 			_createRetryPromiseForAgentEnd(event: AgentEvent): void;
 		};
+
+		session._createRetryPromiseForAgentEnd(event);
+
+		expect(harness.session.isRetrying).toBe(true);
+		harness.session.abortRetry();
+	});
+
+	it("creates retry promises for exhausted structured auth failures so cleanup is awaited", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		const event = { type: "agent_end", messages: [provider401Message()] } as AgentEvent;
+		const session = harness.session as unknown as {
+			_retryAttempt: number;
+			_createRetryPromiseForAgentEnd(event: AgentEvent): void;
+		};
+		session._retryAttempt = 1;
 
 		session._createRetryPromiseForAgentEnd(event);
 
@@ -186,7 +204,7 @@ describe("issue #4491 provider stale after repeated 401", () => {
 			settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
 		});
 		harnesses.push(harness);
-		harness.setResponses([provider401Message(), provider401Message(), provider500Message()]);
+		harness.setResponses([provider401Message(), provider500Message(), provider500Message()]);
 
 		await harness.session.prompt("hello");
 
