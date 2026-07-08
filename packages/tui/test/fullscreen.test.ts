@@ -256,6 +256,37 @@ describe("TUI fullscreen mode", () => {
 		tui.stop();
 	});
 
+	it("suspends fullscreen mouse tracking while a visible overlay requests native mouse", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 80, 10);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.mouseTrackingActive, true);
+
+		const overlay = new InputComponent();
+		overlay.lines = ["https://example.com/login"];
+		const handle = tui.showOverlay(overlay, {
+			anchor: "center",
+			width: 40,
+			suspendFullscreenMouse: true,
+		});
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.mouseTrackingActive, false);
+
+		handle.setHidden(true);
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.mouseTrackingActive, true);
+
+		handle.setHidden(false);
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.mouseTrackingActive, false);
+
+		handle.hide();
+		await terminal.waitForRender();
+		assert.strictEqual(terminal.mouseTrackingActive, true);
+
+		tui.stop();
+	});
+
 	it("drag-selecting focused overlay text copies from the fullscreen frame", async () => {
 		const { terminal, tui, chat, dock } = setup(lines(20), 80, 10);
 		const copies: string[] = [];

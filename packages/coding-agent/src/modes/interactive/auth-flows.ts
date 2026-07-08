@@ -527,7 +527,10 @@ export class ProviderAuthFlows {
 			PRIME_INFERENCE_PROVIDER_NAME,
 		);
 
-		const handle = showFullPaneOverlay(this.host.ui, dialog, 88);
+		const handle = showFullPaneOverlay(this.host.ui, dialog, {
+			maxContentWidth: 88,
+			suspendFullscreenMouse: true,
+		});
 
 		const closeDialog = () => {
 			handle.hide();
@@ -643,7 +646,10 @@ export class ProviderAuthFlows {
 			PRIME_AGENT_TRACES_PROVIDER_NAME,
 		);
 
-		const handle = showFullPaneOverlay(this.host.ui, dialog, 88);
+		const handle = showFullPaneOverlay(this.host.ui, dialog, {
+			maxContentWidth: 88,
+			suspendFullscreenMouse: true,
+		});
 
 		const closeDialog = () => {
 			handle.hide();
@@ -828,7 +834,10 @@ export class ProviderAuthFlows {
 			providerName,
 		);
 
-		const dialogHandle = showFullPaneOverlay(this.host.ui, dialog, 88);
+		const dialogHandle = showFullPaneOverlay(this.host.ui, dialog, {
+			maxContentWidth: 88,
+			suspendFullscreenMouse: true,
+		});
 
 		// Promise for manual code input (racing with callback server)
 		let manualCodeResolve: ((code: string) => void) | undefined;

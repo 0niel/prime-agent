@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed fullscreen overlays that request native mouse behavior suspending mouse tracking while visible.
+
 ## [0.2.6] - 2026-07-06
 
 - Fixed fullscreen overlay selection so login URLs can be copied.

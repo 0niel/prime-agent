@@ -192,6 +192,8 @@ export interface OverlayOptions {
 	visible?: (termWidth: number, termHeight: number) => boolean;
 	/** If true, don't capture keyboard focus when shown */
 	nonCapturing?: boolean;
+	/** If true, temporarily disable fullscreen mouse tracking while the overlay is visible. */
+	suspendFullscreenMouse?: boolean;
 }
 
 /**
@@ -381,6 +383,7 @@ export class TUI extends Container {
 		if (!options?.nonCapturing && this.isOverlayVisible(entry)) {
 			this.setFocus(component);
 		}
+		this.syncFullscreenMouseTracking();
 		this.terminal.hideCursor();
 		this.requestRender();
 
@@ -396,6 +399,7 @@ export class TUI extends Container {
 						this.setFocus(topVisible?.component ?? entry.preFocus);
 					}
 					if (this.overlayStack.length === 0) this.terminal.hideCursor();
+					this.syncFullscreenMouseTracking();
 					this.requestRender();
 				}
 			},
@@ -416,6 +420,7 @@ export class TUI extends Container {
 						this.setFocus(component);
 					}
 				}
+				this.syncFullscreenMouseTracking();
 				this.requestRender();
 			},
 			isHidden: () => entry.hidden,
@@ -425,12 +430,14 @@ export class TUI extends Container {
 					this.setFocus(component);
 				}
 				entry.focusOrder = ++this.focusOrderCounter;
+				this.syncFullscreenMouseTracking();
 				this.requestRender();
 			},
 			unfocus: () => {
 				if (this.focusedComponent !== component) return;
 				const topVisible = this.getTopmostVisibleOverlay();
 				this.setFocus(topVisible && topVisible !== entry ? topVisible.component : entry.preFocus);
+				this.syncFullscreenMouseTracking();
 				this.requestRender();
 			},
 			isFocused: () => this.focusedComponent === component,
@@ -447,6 +454,7 @@ export class TUI extends Container {
 			this.setFocus(topVisible?.component ?? overlay.preFocus);
 		}
 		if (this.overlayStack.length === 0) this.terminal.hideCursor();
+		this.syncFullscreenMouseTracking();
 		this.requestRender();
 	}
 
@@ -473,6 +481,17 @@ export class TUI extends Container {
 			}
 		}
 		return undefined;
+	}
+
+	private shouldEnableFullscreenMouseTracking(): boolean {
+		if (!this.fullscreen?.mouse) return false;
+		return !this.overlayStack.some(
+			(entry) => entry.options?.suspendFullscreenMouse === true && this.isOverlayVisible(entry),
+		);
+	}
+
+	private syncFullscreenMouseTracking(): void {
+		this.terminal.setMouseTracking(this.shouldEnableFullscreenMouseTracking());
 	}
 
 	override invalidate(): void {
@@ -606,9 +625,7 @@ export class TUI extends Container {
 		};
 		this.terminal.enterAltScreen();
 		this.terminal.hideCursor();
-		if (options.mouse !== false) {
-			this.terminal.setMouseTracking(true);
-		}
+		this.syncFullscreenMouseTracking();
 		this.requestRender();
 	}
 
@@ -620,7 +637,7 @@ export class TUI extends Container {
 		if (!this.fullscreen) return;
 		const { inlineState } = this.fullscreen;
 		this.fullscreen = null;
-		this.terminal.setMouseTracking(false);
+		this.syncFullscreenMouseTracking();
 		this.terminal.leaveAltScreen();
 		this.previousLines = inlineState.previousLines;
 		this.previousKittyImageIds = inlineState.previousKittyImageIds;
@@ -764,7 +781,7 @@ export class TUI extends Container {
 
 		if (isMouseSequence(data)) {
 			// consumed even when disabled — mouse reports are garbage downstream
-			const event = fullscreen.mouse ? parseSgrMouseEvent(data) : null;
+			const event = this.terminal.mouseTrackingActive ? parseSgrMouseEvent(data) : null;
 			if (event && !overlayFocused) {
 				const viewport = fullscreen.viewport;
 				if (isWheelUp(event)) {
@@ -1239,6 +1256,7 @@ export class TUI extends Container {
 		if (!fullscreen) return;
 		const width = this.terminal.columns;
 		const height = this.terminal.rows;
+		this.syncFullscreenMouseTracking();
 		this.overlaySelectionRegions = [];
 
 		const transcript: string[] = [];
