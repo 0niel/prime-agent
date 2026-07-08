@@ -1415,6 +1415,7 @@ class DaemonAttachTerminal {
 			case "turn_end":
 			case "message_start":
 			case "tool_execution_update":
+			case "auth_stale":
 				return;
 		}
 	}

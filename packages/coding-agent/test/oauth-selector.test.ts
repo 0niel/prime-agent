@@ -143,6 +143,142 @@ describe("OAuthSelectorComponent", () => {
 		expect(output).not.toContain("unconfigured");
 	});
 
+	it("shows stale auth as expired instead of configured", () => {
+		const authStorage = AuthStorage.inMemory({
+			anthropic: {
+				type: "oauth",
+				access: "stale-access-token",
+				refresh: "refresh-token",
+				expires: Date.now() + 60_000,
+			},
+		});
+		authStorage.markAuthStale("anthropic");
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			[{ id: "anthropic", name: "Anthropic", authType: "oauth" }],
+			() => {},
+			() => {},
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+
+		expect(output).toContain("Anthropic");
+		expect(output).toContain("expired");
+		expect(output).not.toContain("configured");
+	});
+
+	it("does not sort stale auth ahead of configured providers", () => {
+		process.env.OPENAI_API_KEY = "test-openai-key";
+		const authStorage = AuthStorage.inMemory({
+			anthropic: {
+				type: "oauth",
+				access: "stale-access-token",
+				refresh: "refresh-token",
+				expires: Date.now() + 60_000,
+			},
+		});
+		authStorage.markAuthStale("anthropic");
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			[
+				{ id: "anthropic", name: "Anthropic", authType: "oauth" },
+				{ id: "openai", name: "OpenAI", authType: "api_key" },
+			],
+			() => {},
+			() => {},
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+
+		expect(output.indexOf("OpenAI")).toBeLessThan(output.indexOf("Anthropic"));
+		expect(output).toContain("expired");
+	});
+
+	it("sorts stale auth ahead of unconfigured providers", () => {
+		process.env.OPENAI_API_KEY = "test-openai-key";
+		const authStorage = AuthStorage.inMemory({
+			"prime-inference": {
+				type: "api_key",
+				key: "stale-prime-key",
+			},
+		});
+		authStorage.markAuthStale("prime-inference");
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			[
+				{ id: "github-copilot", name: "GitHub Copilot", authType: "oauth" },
+				{ id: "amazon-bedrock", name: "Amazon Bedrock", authType: "api_key" },
+				{ id: "prime-inference", name: "Prime Inference", authType: "api_key" },
+				{ id: "openai", name: "OpenAI", authType: "api_key" },
+			],
+			() => {},
+			() => {},
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+
+		expect(output.indexOf("OpenAI")).toBeLessThan(output.indexOf("Prime Inference"));
+		expect(output.indexOf("Prime Inference")).toBeLessThan(output.indexOf("GitHub Copilot"));
+		expect(output.indexOf("Prime Inference")).toBeLessThan(output.indexOf("Amazon Bedrock"));
+		expect(output).toContain("expired");
+	});
+
+	it("shows models.json auth instead of stale stored auth on API key rows", () => {
+		const authStorage = AuthStorage.inMemory({
+			anthropic: {
+				type: "oauth",
+				access: "stale-access-token",
+				refresh: "refresh-token",
+				expires: Date.now() + 60_000,
+			},
+		});
+		authStorage.markAuthStale("anthropic");
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			[{ id: "anthropic", name: "Anthropic", authType: "api_key" }],
+			() => {},
+			() => {},
+			() => ({ configured: true, source: "models_json_key" }),
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+
+		expect(output).toContain("Anthropic");
+		expect(output).toContain("key in models.json");
+		expect(output).not.toContain("subscription configured");
+		expect(output).not.toContain("expired");
+	});
+
+	it("shows stale stored auth as expired when models.json auth is active for the provider", () => {
+		const authStorage = AuthStorage.inMemory({
+			anthropic: {
+				type: "oauth",
+				access: "stale-access-token",
+				refresh: "refresh-token",
+				expires: Date.now() + 60_000,
+			},
+		});
+		authStorage.markAuthStale("anthropic");
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			[{ id: "anthropic", name: "Anthropic", authType: "oauth" }],
+			() => {},
+			() => {},
+			() => ({ configured: true, source: "models_json_key" }),
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+
+		expect(output).toContain("Anthropic");
+		expect(output).toContain("expired");
+		expect(output).not.toContain("configured");
+	});
+
 	it("shows custom provider environment API key auth from status resolver", () => {
 		const authStorage = AuthStorage.inMemory();
 		const selector = new OAuthSelectorComponent(

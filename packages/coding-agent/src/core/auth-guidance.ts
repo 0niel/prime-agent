@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { getDocsPath } from "../config.js";
 
 const UNKNOWN_PROVIDER = "unknown";
-const LOGIN_RECOVERY_MESSAGE = "Run /login to update credentials.";
+export const LOGIN_RECOVERY_MESSAGE = "Run /login to update credentials.";
 
 export function getProviderLoginHelp(): string {
 	return [

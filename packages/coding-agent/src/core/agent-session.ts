@@ -71,6 +71,7 @@ import {
 	formatNoModelSelectedMessage,
 	isLikelyAuthenticationError,
 } from "./auth-guidance.js";
+import type { AuthSourceToken } from "./auth-storage.js";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import {
 	type CompactionResult,
@@ -246,6 +247,7 @@ export type AgentSessionEvent =
 	  }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| { type: "auth_stale"; provider: string; sourceTokens?: readonly AuthSourceToken[] }
 	| { type: "rlm_child_update"; child: RlmChildAgentSnapshot }
 	| { type: "recap_update"; recap: string | undefined }
 	| { type: "goal_update"; goal: GoalState }
@@ -588,6 +590,7 @@ export class AgentSession {
 	private _retryAttempt = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
+	private _retryAuthFailureSources: AuthSourceToken[] = [];
 	private _acceptedPromptCompletions = new Set<Promise<void>>();
 	private _acceptedAgentMessagePrompt: AcceptedAgentMessagePrompt | undefined = undefined;
 	private _agentMessageDeliveryWaiters = new Map<string, AgentMessageDeliveryWaiter>();
@@ -1594,8 +1597,12 @@ export class AgentSession {
 		}
 
 		const lastAssistant = this._findLastAssistantInMessages(event.messages);
-		if (!lastAssistant || !this._isRetryableError(lastAssistant)) {
+		const concreteAuthFailure = lastAssistant ? this._isConcreteProviderAuthFailure(lastAssistant) : false;
+		if (!lastAssistant || (!this._isRetryableError(lastAssistant) && !concreteAuthFailure)) {
 			return;
+		}
+		if (concreteAuthFailure) {
+			this._captureRetryAuthFailureSource(lastAssistant);
 		}
 
 		this._retryPromise = new Promise((resolve) => {
@@ -1733,6 +1740,9 @@ export class AgentSession {
 				if (assistantMsg.stopReason !== "error") {
 					this._overflowRecoveryAttempted = false;
 				}
+				if (this._isConcreteProviderAuthFailure(assistantMsg)) {
+					this._captureRetryAuthFailureSource(assistantMsg);
+				}
 
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
@@ -1743,6 +1753,7 @@ export class AgentSession {
 						attempt: this._retryAttempt,
 					});
 					this._retryAttempt = 0;
+					this._retryAuthFailureSources = [];
 				}
 				if (this._accountGoalUsageForAssistantMessage(assistantMsg)) {
 					this.agent.steer(createGoalContextMessage(this._goalState, "budget_limit"));
@@ -1755,13 +1766,26 @@ export class AgentSession {
 		}
 
 		// Check auto-retry and auto-compaction after agent completes
-		if (event.type === "agent_end" && this._lastAssistantMessage) {
-			const msg = this._lastAssistantMessage;
+		if (event.type === "agent_end") {
+			const msg =
+				this._lastAssistantMessage ??
+				(this._retryPromise ? this._findLastAssistantInMessages(event.messages) : undefined);
 			this._lastAssistantMessage = undefined;
+			if (!msg) {
+				this._resolveRetry();
+				return;
+			}
 
 			// Check for retryable errors first (overloaded, rate limit, server errors)
-			if (this._isRetryableError(msg)) {
-				const didRetry = await this._handleRetryableError(msg);
+			const concreteAuthFailure = this._isConcreteProviderAuthFailure(msg);
+			if (this._isRetryableError(msg) || concreteAuthFailure) {
+				if (concreteAuthFailure) {
+					this._captureRetryAuthFailureSource(msg);
+				}
+				const didRetry = await this._handleRetryableError(msg, {
+					markAuthStaleOnFailure: concreteAuthFailure,
+					authSourceTokens: concreteAuthFailure ? this._retryAuthFailureSources : undefined,
+				});
 				if (didRetry) return; // Retry was initiated, don't proceed to compaction
 			}
 
@@ -5344,13 +5368,112 @@ export class AgentSession {
 		);
 	}
 
+	private _getProviderStreamFailureAuthStatus(message: AssistantMessage): number | undefined {
+		const failure = message.diagnostics?.find((diagnostic) => diagnostic.type === "provider_stream_failure");
+		const details = failure?.details;
+		if (!details || typeof details !== "object") {
+			return undefined;
+		}
+
+		const kind = "kind" in details ? details.kind : undefined;
+		if (kind !== "auth") {
+			return undefined;
+		}
+
+		const status = "status" in details ? details.status : undefined;
+		if (typeof status === "number") {
+			return status;
+		}
+		if (typeof status === "string") {
+			const parsed = Number(status);
+			return Number.isInteger(parsed) ? parsed : undefined;
+		}
+		return undefined;
+	}
+
+	private _isConcreteProviderAuthFailure(message: AssistantMessage): boolean {
+		if (message.stopReason !== "error" || !message.errorMessage) return false;
+
+		const structuredStatus = this._getProviderStreamFailureAuthStatus(message);
+		if (structuredStatus === 401 || structuredStatus === 403) {
+			return true;
+		}
+
+		if (/\b(?:401|403)\b/.test(message.errorMessage) && /\bstatus code\b/i.test(message.errorMessage)) {
+			return true;
+		}
+
+		return (
+			/\b(?:401|403)\b/.test(message.errorMessage) &&
+			/auth|unauthori[sz]ed|forbidden|api.?key|token|credential/i.test(message.errorMessage)
+		);
+	}
+
+	private _captureRetryAuthFailureSource(message: AssistantMessage): AuthSourceToken | undefined {
+		const token = this._modelRegistry.getCurrentProviderAuthSourceToken(message.provider);
+		if (!token) {
+			return undefined;
+		}
+		if (
+			!this._retryAuthFailureSources.some(
+				(existing) =>
+					existing.provider === token.provider &&
+					existing.source === token.source &&
+					existing.identityFingerprint === token.identityFingerprint &&
+					existing.valueFingerprint === token.valueFingerprint,
+			)
+		) {
+			this._retryAuthFailureSources.push(token);
+		}
+		return token;
+	}
+
+	private _markProviderAuthStale(message: AssistantMessage, authSourceTokens?: readonly AuthSourceToken[]): boolean {
+		if (authSourceTokens && authSourceTokens.length > 0) {
+			let marked = false;
+			for (const token of authSourceTokens) {
+				marked = this._modelRegistry.markProviderAuthSourceStale(token) || marked;
+			}
+			if (marked) {
+				this._emit({ type: "auth_stale", provider: message.provider, sourceTokens: authSourceTokens });
+			}
+			return marked;
+		}
+		const marked = this._modelRegistry.markProviderAuthStale(message.provider);
+		if (marked) {
+			this._emit({ type: "auth_stale", provider: message.provider });
+		}
+		return marked;
+	}
+
+	private _markProviderAuthStaleForRetryFailure(
+		message: AssistantMessage,
+		options?: { markAuthStaleOnFailure?: boolean; authSourceTokens?: readonly AuthSourceToken[] },
+	): boolean {
+		const authSourceTokens =
+			this._retryAuthFailureSources.length > 0 ? this._retryAuthFailureSources : options?.authSourceTokens;
+		if ((authSourceTokens?.length ?? 0) > 0 || options?.markAuthStaleOnFailure) {
+			const marked = this._markProviderAuthStale(message, authSourceTokens);
+			if (marked && message.errorMessage) {
+				message.errorMessage = addLoginGuidanceToAuthError(message.errorMessage);
+			}
+			return marked;
+		}
+		return false;
+	}
+
 	/**
 	 * Handle retryable errors with exponential backoff.
 	 * @returns true if retry was initiated, false if max retries exceeded or disabled
 	 */
-	private async _handleRetryableError(message: AssistantMessage): Promise<boolean> {
+	private async _handleRetryableError(
+		message: AssistantMessage,
+		options?: { markAuthStaleOnFailure?: boolean; authSourceTokens?: readonly AuthSourceToken[] },
+	): Promise<boolean> {
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled) {
+			this._markProviderAuthStaleForRetryFailure(message, options);
+			this._retryAuthFailureSources = [];
 			this._resolveRetry();
 			return false;
 		}
@@ -5366,6 +5489,7 @@ export class AgentSession {
 		this._retryAttempt++;
 
 		if (this._retryAttempt > settings.maxRetries) {
+			this._markProviderAuthStaleForRetryFailure(message, options);
 			// Max retries exceeded, emit final failure and reset
 			this._emit({
 				type: "auto_retry_end",
@@ -5374,6 +5498,7 @@ export class AgentSession {
 				finalError: message.errorMessage,
 			});
 			this._retryAttempt = 0;
+			this._retryAuthFailureSources = [];
 			this._resolveRetry(); // Resolve so waitForRetry() completes
 			return false;
 		}
@@ -5401,6 +5526,7 @@ export class AgentSession {
 		} catch {
 			// Aborted during sleep - emit end event so UI can clean up
 			const attempt = this._retryAttempt;
+			this._markProviderAuthStaleForRetryFailure(message, options);
 			this._retryAttempt = 0;
 			this._retryAbortController = undefined;
 			this._emit({
@@ -5410,6 +5536,7 @@ export class AgentSession {
 				finalError: "Retry cancelled",
 			});
 			this._resolveRetry();
+			this._retryAuthFailureSources = [];
 			return false;
 		}
 		this._retryAbortController = undefined;
@@ -5428,8 +5555,11 @@ export class AgentSession {
 	 * Cancel in-progress retry.
 	 */
 	abortRetry(): void {
-		this._retryAbortController?.abort();
-		// Note: _retryAttempt is reset in the catch block of _autoRetry
+		if (this._retryAbortController) {
+			this._retryAbortController.abort();
+			return;
+		}
+		this._retryAuthFailureSources = [];
 		this._resolveRetry();
 	}
 

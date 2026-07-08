@@ -2,7 +2,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import stripAnsi from "strip-ansi";
 import { describe, expect, test } from "vitest";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
@@ -74,6 +74,45 @@ describe("AssistantMessageComponent", () => {
 
 		expect(rendered).toContain("/tmp/internal.py");
 		expect(rendered).not.toContain("Ctrl+O to expand");
+	});
+
+	test("renders auth recovery guidance inline for simple provider errors", () => {
+		initTheme("dark");
+
+		const message = {
+			...createAssistantMessage([]),
+			stopReason: "error" as const,
+			errorMessage: "401 status code (no body)\n\nRun /login to update credentials.",
+		};
+		const component = new AssistantMessageComponent(message);
+		const raw = component.render(120).join("\n");
+		const rendered = stripAnsi(raw);
+
+		expect(rendered).toContain("Error: 401 status code (no body) · Run /login to update credentials.");
+		expect(rendered).not.toContain("Ctrl+O to expand");
+		expect(raw).toContain(theme.getFgAnsi("error"));
+	});
+
+	test("renders collapsed multiline assistant errors as errors", () => {
+		initTheme("dark");
+
+		const message = {
+			...createAssistantMessage([]),
+			stopReason: "error" as const,
+			errorMessage: [
+				"Provider request failed",
+				"Traceback (most recent call last):",
+				'  File "/tmp/internal.py", line 12, in run',
+				"RuntimeError: backend crashed",
+			].join("\n"),
+		};
+		const component = new AssistantMessageComponent(message);
+		const raw = component.render(100).join("\n");
+		const rendered = stripAnsi(raw);
+
+		expect(rendered).toContain("Error: Provider request failed");
+		expect(rendered).toContain("to expand");
+		expect(raw).toContain(theme.getFgAnsi("error"));
 	});
 });
 

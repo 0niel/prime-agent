@@ -134,6 +134,52 @@ describe("AuthStorage", () => {
 			}
 		});
 
+		test("ambient environment credentials count as available auth", async () => {
+			const originalAwsProfile = process.env.AWS_PROFILE;
+			process.env.AWS_PROFILE = "pi-test-profile";
+
+			try {
+				authStorage = AuthStorage.inMemory();
+
+				expect(authStorage.hasAuth("amazon-bedrock")).toBe(true);
+				await expect(authStorage.getApiKey("amazon-bedrock")).resolves.toBe("<authenticated>");
+				expect(authStorage.getAuthStatus("amazon-bedrock")).toEqual({
+					configured: false,
+					source: "environment",
+					label: "ambient credentials",
+				});
+			} finally {
+				if (originalAwsProfile === undefined) {
+					delete process.env.AWS_PROFILE;
+				} else {
+					process.env.AWS_PROFILE = originalAwsProfile;
+				}
+			}
+		});
+
+		test("changed ambient environment credential no longer matches stale auth marker", async () => {
+			const originalAwsProfile = process.env.AWS_PROFILE;
+			process.env.AWS_PROFILE = "stale-profile";
+
+			try {
+				authStorage = AuthStorage.inMemory();
+				expect(authStorage.markAuthStale("amazon-bedrock")).toBe(true);
+				expect(authStorage.hasAuth("amazon-bedrock")).toBe(false);
+				await expect(authStorage.getApiKey("amazon-bedrock")).resolves.toBeUndefined();
+
+				process.env.AWS_PROFILE = "fresh-profile";
+
+				expect(authStorage.hasAuth("amazon-bedrock")).toBe(true);
+				await expect(authStorage.getApiKey("amazon-bedrock")).resolves.toBe("<authenticated>");
+			} finally {
+				if (originalAwsProfile === undefined) {
+					delete process.env.AWS_PROFILE;
+				} else {
+					process.env.AWS_PROFILE = originalAwsProfile;
+				}
+			}
+		});
+
 		test("apiKey as literal value is used directly when not an env var", async () => {
 			// Make sure this isn't an env var
 			delete process.env.literal_api_key_value;
@@ -180,6 +226,112 @@ describe("AuthStorage", () => {
 			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("prime-cli-key");
 			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "changed-prime-key" }));
 			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("changed-prime-key");
+		});
+
+		test("prime inference marks current Prime CLI auth stale", async () => {
+			const primeConfigPath = join(tempDir, "prime-config.json");
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
+			writeAuthJson({});
+
+			authStorage = AuthStorage.create(authJsonPath, {
+				primeCliConfigPath: primeConfigPath,
+				usePrimeCliConfig: true,
+			});
+
+			expect(authStorage.markAuthStale("prime-inference")).toBe(true);
+
+			expect(authStorage.hasAuth("prime-inference")).toBe(false);
+			await expect(authStorage.getApiKey("prime-inference")).resolves.toBeUndefined();
+			expect(authStorage.getAuthStatus("prime-inference")).toEqual({
+				configured: false,
+				source: "stale",
+				label: "expired",
+			});
+		});
+
+		test("changed Prime CLI key no longer matches stale auth marker", async () => {
+			const primeConfigPath = join(tempDir, "prime-config.json");
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
+			writeAuthJson({});
+
+			authStorage = AuthStorage.create(authJsonPath, {
+				primeCliConfigPath: primeConfigPath,
+				usePrimeCliConfig: true,
+			});
+			authStorage.markAuthStale("prime-inference");
+
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "changed-prime-key" }));
+
+			expect(authStorage.hasAuth("prime-inference")).toBe(true);
+			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("changed-prime-key");
+			expect(authStorage.getAuthStatus("prime-inference")).toEqual({
+				configured: false,
+				source: "prime_cli",
+				label: "Prime CLI",
+			});
+		});
+
+		test("setPrimeInferenceApiKey clears stale Prime CLI auth marker", async () => {
+			const primeConfigPath = join(tempDir, "prime-config.json");
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
+			writeAuthJson({});
+
+			authStorage = AuthStorage.create(authJsonPath, {
+				primeCliConfigPath: primeConfigPath,
+				usePrimeCliConfig: true,
+			});
+			authStorage.markAuthStale("prime-inference");
+
+			authStorage.setPrimeInferenceApiKey("new-prime-key");
+
+			expect(authStorage.hasAuth("prime-inference")).toBe(true);
+			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("new-prime-key");
+			expect(authStorage.getAuthStatus("prime-inference")).toEqual({
+				configured: false,
+				source: "prime_cli",
+				label: "Prime CLI",
+			});
+		});
+
+		test("stored credential updates do not revive stale runtime auth", async () => {
+			authStorage = AuthStorage.inMemory();
+			authStorage.setRuntimeApiKey("anthropic", "runtime-key");
+			expect(authStorage.markAuthStale("anthropic")).toBe(true);
+
+			authStorage.set("anthropic", { type: "api_key", key: "stored-key" });
+
+			expect(authStorage.getAuthStatus("anthropic")).toEqual({ configured: true, source: "stored" });
+			await expect(authStorage.getApiKey("anthropic")).resolves.toBe("stored-key");
+
+			authStorage.remove("anthropic");
+
+			expect(authStorage.getAuthStatus("anthropic")).toEqual({
+				configured: false,
+				source: "stale",
+				label: "expired",
+			});
+			await expect(authStorage.getApiKey("anthropic")).resolves.toBeUndefined();
+		});
+
+		test("changed command-backed stored key no longer matches stale auth marker", async () => {
+			const tokenFile = join(tempDir, "command-token");
+			writeFileSync(tokenFile, "stale-key");
+			const tokenPath = toShPath(tokenFile);
+			writeAuthJson({
+				anthropic: { type: "api_key", key: `!sh -c 'cat "${tokenPath}"'` },
+			});
+
+			authStorage = AuthStorage.create(authJsonPath);
+			await expect(authStorage.getApiKey("anthropic")).resolves.toBe("stale-key");
+			expect(authStorage.markAuthStale("anthropic")).toBe(true);
+			expect(authStorage.hasAuth("anthropic")).toBe(false);
+			await expect(authStorage.getApiKey("anthropic")).resolves.toBeUndefined();
+
+			writeFileSync(tokenFile, "fresh-key");
+
+			expect(authStorage.hasAuth("anthropic")).toBe(true);
+			await expect(authStorage.getApiKey("anthropic")).resolves.toBe("fresh-key");
+			expect(authStorage.getAuthStatus("anthropic")).toEqual({ configured: true, source: "stored" });
 		});
 
 		test("prime inference uses Prime CLI auth over legacy Prime Agent auth", async () => {

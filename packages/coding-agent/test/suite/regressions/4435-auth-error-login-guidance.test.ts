@@ -13,7 +13,7 @@ describe("issue #4435 auth error login guidance", () => {
 	});
 
 	it("adds /login guidance to provider authentication errors", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ settings: { retry: { enabled: false } } });
 		harnesses.push(harness);
 		harness.setResponses([
 			fauxAssistantMessage("", {

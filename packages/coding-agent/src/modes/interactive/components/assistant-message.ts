@@ -1,11 +1,18 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { type Component, Container, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
+import { LOGIN_RECOVERY_MESSAGE } from "../../../core/auth-guidance.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
-import { CollapsibleErrorComponent, shouldCollapseErrorDetails, summarizeErrorDetails } from "./collapsible-error.js";
+import {
+	CollapsibleErrorComponent,
+	normalizeErrorDetails,
+	shouldCollapseErrorDetails,
+	summarizeErrorDetails,
+} from "./collapsible-error.js";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
+const LOGIN_RECOVERY_SUFFIX = `\n\n${LOGIN_RECOVERY_MESSAGE}`;
 
 export interface AssistantMessageComponentOptions {
 	expanded?: boolean;
@@ -27,6 +34,18 @@ function getThinkingMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
 		listBullet: quiet,
 		highlightCode: (code: string) => code.split("\n").map((line) => quiet(line)),
 	};
+}
+
+function formatInlineLoginRecoveryMessage(message: string): string | undefined {
+	const normalized = normalizeErrorDetails(message);
+	if (!normalized.endsWith(LOGIN_RECOVERY_SUFFIX)) {
+		return undefined;
+	}
+	const base = normalized.slice(0, -LOGIN_RECOVERY_SUFFIX.length).trimEnd();
+	if (!base || shouldCollapseErrorDetails(base)) {
+		return undefined;
+	}
+	return `${base} · ${LOGIN_RECOVERY_MESSAGE}`;
 }
 
 /**
@@ -252,6 +271,12 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	private createErrorComponent(message: string, prefix?: string): Component {
+		const inlineLoginRecovery = formatInlineLoginRecoveryMessage(message);
+		if (inlineLoginRecovery) {
+			const text = prefix ? `${prefix}: ${inlineLoginRecovery}` : inlineLoginRecovery;
+			return new Text(theme.fg("error", text), 1, 0);
+		}
+
 		if (!shouldCollapseErrorDetails(message)) {
 			const text = prefix ? `${prefix}: ${message}` : message;
 			return new Text(theme.fg("error", text), 1, 0);

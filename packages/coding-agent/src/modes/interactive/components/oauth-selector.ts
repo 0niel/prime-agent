@@ -163,23 +163,49 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 
 	private sortProviders(providers: AuthSelectorProvider[]): AuthSelectorProvider[] {
 		return [...providers].sort((a, b) => {
-			const configuredDelta = Number(this.isProviderConfigured(b)) - Number(this.isProviderConfigured(a));
-			if (configuredDelta !== 0) {
-				return configuredDelta;
+			const rankDelta = this.getProviderSortRank(a) - this.getProviderSortRank(b);
+			if (rankDelta !== 0) {
+				return rankDelta;
 			}
 			return compareAuthSelectorProviders(a, b);
 		});
 	}
 
-	private isProviderConfigured(provider: AuthSelectorProvider): boolean {
+	private getProviderSortRank(provider: AuthSelectorProvider): number {
+		if (this.isProviderConfigured(provider)) {
+			return 0;
+		}
+		if (this.isProviderStale(provider)) {
+			return 1;
+		}
+		return 2;
+	}
+
+	private isProviderStale(provider: AuthSelectorProvider): boolean {
+		const status = this.getAuthStatus(provider.id);
 		const credential = this.authStorage.get(provider.id);
+		const storageStatus = this.authStorage.getAuthStatus(provider.id);
+		return status.source === "stale" || (storageStatus.source === "stale" && credential?.type === provider.authType);
+	}
+
+	private isProviderConfigured(provider: AuthSelectorProvider): boolean {
+		const status = this.getAuthStatus(provider.id);
+		const credential = this.authStorage.get(provider.id);
+		if (this.isProviderStale(provider)) {
+			return false;
+		}
+
+		if (status.source && status.source !== "stored") {
+			return provider.authType === "api_key";
+		}
+
 		if (credential) {
 			return true;
 		}
 		if (provider.authType !== "api_key") {
 			return false;
 		}
-		return this.getAuthStatus(provider.id).source !== undefined;
+		return status.source !== undefined;
 	}
 
 	override render(width: number): string[] {
@@ -239,7 +265,18 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 	}
 
 	private formatStatusIndicator(provider: AuthSelectorProvider): string {
+		const status = this.getAuthStatus(provider.id);
 		const credential = this.authStorage.get(provider.id);
+		if (this.isProviderStale(provider)) {
+			return theme.fg("warning", status.label ?? "expired");
+		}
+
+		if (status.source && status.source !== "stored") {
+			return provider.authType === "api_key"
+				? this.formatApiKeyStatusIndicator(status)
+				: theme.fg("muted", "unconfigured");
+		}
+
 		if (credential?.type === provider.authType) return theme.fg("success", "configured");
 		if (credential) {
 			const label = credential.type === "oauth" ? "subscription configured" : "API key configured";
@@ -247,7 +284,10 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		}
 		if (provider.authType !== "api_key") return theme.fg("muted", "unconfigured");
 
-		const status = this.getAuthStatus(provider.id);
+		return this.formatApiKeyStatusIndicator(status);
+	}
+
+	private formatApiKeyStatusIndicator(status: AuthStatus): string {
 		switch (status.source) {
 			case "environment":
 				return theme.fg("success", `env: ${status.label ?? "API key"}`);
