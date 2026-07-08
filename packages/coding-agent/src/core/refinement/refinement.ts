@@ -123,7 +123,7 @@ Continual harness components:
 - prompt: supplemental prompt notes only. The base system prompt is immutable and MUST NOT be rewritten.
 - memory: durable facts, decisions, failures, preferences, and outcomes.
 - skill: installed Python REPL skill. Skill create/update edits MUST include a \`reference\` object with \`{"type":"python"}\`, a Python import, and a callable or call pattern; they also MUST include an \`arguments\` object describing accepted inputs, required fields, defaults, and constraints. Use \`{}\` for \`arguments\` only when the Python callable truly needs no external inputs. Include the RLM-native call form \`await <skill_import>(...)\`.
-- subagent: reusable delegation specs, including purpose, instructions, and when to invoke. Include the RLM-native call form: create a concise task prompt and call \`await rlm("sub-task")\`; for independent parallel subagents use \`await asyncio.gather(rlm("task1"), rlm("task2"))\`. Do not invent wrappers like \`run_subagent(...)\`.
+- subagent: reusable delegation specs, including purpose, instructions, and when to invoke. Include the RLM-native call form: create a concise task prompt, start \`asyncio.create_task(rlm("sub-task"))\` by default, keep the task handle, and await only when the result is needed; for independent parallel subagents use \`await asyncio.gather(rlm("task1"), rlm("task2"))\`. Use direct \`await rlm("sub-task")\` only when the result is immediately required. Do not invent wrappers like \`run_subagent(...)\`.
 
 Scope and persistence policy:
 - The default editable continual harness store is local to the current Prime Agent session. Use it for session-specific progress, active task state, current-run coordination notes, temporary blockers, and project facts that should not affect other sessions.
@@ -131,7 +131,8 @@ Scope and persistence policy:
 - Entry ids in the harness overview may carry a display-only \`local:\` or \`global:\` prefix. Always use the bare id (no prefix) in edits.
 - All edits in one refinement apply only to the requested scope's store. During a local refinement, global entries are read-only context: never propose update or delete edits for them; create a local entry instead when a session-specific override is genuinely needed.
 - Project/workspace-specific lessons may be persisted globally only when the title, path, or content explicitly names the project/workspace and the lesson is likely to be reused in future sessions for that project. Prefer local edits when the lesson only belongs in the current conversation.
-- Use memory for declarative facts and preferences, skill for repeatable procedures exposed as Python calls, prompt for narrow behavioral policy addenda, and subagent for reusable delegation roles.
+- Use memory for declarative facts and preferences, skill for repeatable procedures exposed as Python calls, prompt for narrow behavioral policy addendums, and subagent for reusable delegation roles.
+- Create or update the smallest relevant component: repeated delegation roles should become subagent specs, repeated procedures should become skills, durable facts/preferences should become memories, and narrow behavioral policies should become prompt addendums.
 - When an edit is persisted, include metadata such as \`{"scope":"local"}\` or \`{"scope":"global"}\` when that helps future review understand the intended blast radius.
 
 Use the trajectory, current continual harness state, and prior refinement history. Prefer
@@ -390,11 +391,14 @@ export function formatHarnessStateForPrompt(
 		maxEntriesPerKind?: number;
 		maxRefinements?: number;
 		maxContentLength?: number;
+		includeIpythonExamples?: boolean;
+		includeShellExamples?: boolean;
 	} = {},
 ): string {
 	const maxEntriesPerKind = options.maxEntriesPerKind ?? DEFAULT_OVERVIEW_ENTRY_LIMIT;
 	const maxRefinements = options.maxRefinements ?? DEFAULT_OVERVIEW_REFINEMENT_LIMIT;
 	const maxContentLength = options.maxContentLength ?? DEFAULT_OVERVIEW_CONTENT_LIMIT;
+	const includeIpythonExamples = options.includeIpythonExamples ?? true;
 	const lines = [
 		"# Continual Harness State",
 		"",
@@ -403,9 +407,13 @@ export function formatHarnessStateForPrompt(
 		"Default to local continual harness refinement for current task progress, temporary blockers, and session coordination. Use global continual harness refinement only for stable cross-session lessons, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts.",
 		"Use these continual harness prompt notes, memories, skills, and subagent specs when they are relevant. The base system prompt is immutable; prompt entries below are supplemental notes only.",
 		"",
-		"When to call `/refine`: after a repeated failure, a reusable tactic emerges, a user corrects behavior that should persist locally or globally, validation shows a continual harness entry is wrong, or a skill/subagent/memory/prompt note should be created, updated, deleted, or rolled back. Keep `/refine` continual harness edits small and evidence-backed.",
+		"When to call `/refine`: after a repeated failure, a reusable tactic emerges, a repeated delegation role should become a subagent spec, a repeated procedure should become a skill, a durable fact/preference should become a memory, a narrow behavioral policy should become a prompt addendum, a user corrects behavior that should persist locally or globally, validation shows a continual harness entry is wrong, or a skill/subagent/memory/prompt note should be created, updated, deleted, or rolled back. Keep `/refine` continual harness edits small and evidence-backed.",
 		"",
-		"Call contract: use installed Python skills as `await <skill_import>(...)` in IPython, or `<skill_import> ...` in shell when a CLI exists. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are invoked by composing a concise task prompt and calling `await rlm('sub-task')`; use `await asyncio.gather(rlm('task1'), rlm('task2'))` for independent parallel subagents. Do not invent wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
+		includeIpythonExamples
+			? "Call contract: use installed Python skills as `await <skill_import>(...)` in IPython, or `<skill_import> ...` in shell when a CLI exists. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are invoked by composing a concise task prompt and starting `asyncio.create_task(rlm('sub-task'))` by default, then awaiting only when the result is needed; use `await asyncio.gather(rlm('task1'), rlm('task2'))` for independent parallel subagents. Use direct `await rlm('sub-task')` only when the result is immediately required. Do not invent wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries."
+			: options.includeShellExamples
+				? "Call contract: use installed skills as shell commands when available (for example `<skill_import> ...`). Continual harness entries are routing/context hints only in sessions without IPython; do not use Python `await`, `asyncio`, or `rlm` examples unless the prompt also documents an IPython kernel."
+				: "Call contract: continual harness entries are routing/context hints only in sessions without IPython or shell access; do not use Python `await`, `asyncio`, `rlm`, or shell skill commands unless the prompt also documents those interfaces.",
 		"",
 	];
 
@@ -416,11 +424,11 @@ export function formatHarnessStateForPrompt(
 		);
 		totalEntries += entries.length;
 		// Render subagent specs as a task-shaped roster the model can match against — the
-		// analogue of Claude Code's agent-type menu — rather than a bare count. The
-		// invocation hint makes clear each spec is reached through the single `rlm` entrypoint.
-		if (kind === "subagent" && entries.length > 0) {
+		// analogue of Claude Code's agent-type menu — rather than a bare count. In
+		// IPython sessions, include the native `rlm` invocation hint.
+		if (kind === "subagent" && entries.length > 0 && includeIpythonExamples) {
 			lines.push(
-				`${kind}: ${entries.length} (invoke a spec by turning it into a concise task prompt and calling \`await rlm('<task>')\`)`,
+				`${kind}: ${entries.length} (invoke a spec by turning it into a concise task prompt and starting \`asyncio.create_task(rlm('<task>'))\` by default)`,
 			);
 		} else {
 			lines.push(`${kind}: ${entries.length}`);

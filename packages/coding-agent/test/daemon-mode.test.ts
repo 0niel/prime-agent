@@ -145,6 +145,102 @@ describe("daemon mode helpers", () => {
 		});
 	});
 
+	it("lists and sends agent messages to live subagents", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const parentState = makeState("parent");
+		parentState.runtime = {
+			...parentState.runtime,
+			cwd: "/tmp",
+			metadata: { kind: "top-level", createdAt: 1 },
+			session: {
+				sessionId: "session-parent",
+				sessionName: "Parent",
+				isStreaming: false,
+				pendingMessageCount: 0,
+			},
+		} as never;
+		const subagentState = makeState("child", "parent") as ActiveSessionState & {
+			runtime: ActiveSessionState["runtime"] & {
+				session: {
+					sessionId: string;
+					sessionName: string;
+					isStreaming: boolean;
+					pendingMessageCount: number;
+					acceptAgentMessagePrompt: ReturnType<typeof vi.fn>;
+				};
+			};
+		};
+		const acceptAgentMessagePrompt = vi.fn(
+			(message: string, options?: { preflightResult?: (didSucceed: boolean) => void }) => {
+				options?.preflightResult?.(true);
+				return Promise.resolve(message);
+			},
+		);
+		subagentState.runtime = {
+			...subagentState.runtime,
+			cwd: "/tmp",
+			metadata: {
+				...subagentState.runtime.metadata,
+				rlmChildId: "child-1",
+			},
+			session: {
+				sessionId: "session-child",
+				sessionName: "Subagent",
+				isStreaming: false,
+				pendingMessageCount: 0,
+				acceptAgentMessagePrompt,
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createAgentMessageListResult(current: ActiveSessionState): {
+				agents: Array<{
+					activeSessionId: string;
+					runtimeKind?: string;
+					parentActiveSessionId?: string;
+					rlmChildId?: string;
+				}>;
+			};
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(parentState.activeSessionId, parentState);
+		internals.sessions.set(subagentState.activeSessionId, subagentState);
+
+		const subagentSummary = internals
+			.createAgentMessageListResult(parentState)
+			.agents.find((agent) => agent.activeSessionId === subagentState.activeSessionId);
+		expect(subagentSummary).toMatchObject({
+			runtimeKind: "subagent",
+			parentActiveSessionId: parentState.activeSessionId,
+			rlmChildId: "child-1",
+		});
+
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: subagentState.activeSessionId,
+				message: "report current progress",
+				fromState: parentState,
+				origin: "agent",
+			}),
+		).resolves.toMatchObject({
+			deliveryStatus: "delivered",
+			target: { activeSessionId: subagentState.activeSessionId, runtimeKind: "subagent" },
+		});
+		expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
+		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toContain("To: Subagent, active child");
+		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toContain("report current progress");
+	});
+
 	it("reports queued status when a direct accept races into the queue", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },

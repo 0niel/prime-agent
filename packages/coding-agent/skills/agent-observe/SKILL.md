@@ -23,7 +23,9 @@ recent = await agent_observe.recent_messages("worker", limit=6)
 - `await agent_observe.list_agents()` returns `current` and `agents`. Each
   agent includes active session id, session id, optional name, runtime kind,
   cwd, status, streaming state, message count, pending count, and a latest
-  message preview.
+  message preview. This includes subagents shown in the agents view; filter
+  by `runtimeKind == "subagent"` and `parentSessionId` or
+  `parentActiveSessionId` to inspect subagents that belong to your session.
 - `await agent_observe.get_agent(target)` returns one agent summary. `target`
   is resolved like other live-session selectors: active id, session id/name, or
   unambiguous suffix.
