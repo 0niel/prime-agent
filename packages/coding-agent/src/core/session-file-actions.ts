@@ -5,6 +5,10 @@ import { basename, dirname, join } from "node:path";
 
 export type DeleteSessionFileResult = { ok: true; method: "trash" | "unlink" } | { ok: false; error: string };
 
+export interface DeleteSessionFileOptions {
+	afterFileRemoved?: () => void;
+}
+
 /**
  * Permanently remove a session's artifact directory (kernel state snapshot, rlm
  * scratch files, …), which lives at `<dirname(sessionDir)>/session-artifacts/<id>`.
@@ -56,9 +60,13 @@ async function removeSessionFile(sessionPath: string): Promise<DeleteSessionFile
  * once the session file itself is gone — otherwise a failed delete would orphan a
  * session whose kernel snapshot has already been destroyed.
  */
-export async function deleteSessionFile(sessionPath: string): Promise<DeleteSessionFileResult> {
+export async function deleteSessionFile(
+	sessionPath: string,
+	options: DeleteSessionFileOptions = {},
+): Promise<DeleteSessionFileResult> {
 	const result = await removeSessionFile(sessionPath);
 	if (result.ok) {
+		options.afterFileRemoved?.();
 		await deleteSessionArtifacts(sessionPath);
 	}
 	return result;

@@ -2376,6 +2376,217 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("cancels scheduled jobs when a live session is killed", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-kill-cron-"));
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: {
+					agentDir: tempDir,
+					cwd: tempDir,
+				},
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const sessionFile = join(tempDir, "session.jsonl");
+			const removeQueuedFollowUp = vi.fn();
+			const abort = vi.fn(async () => {});
+			const dispose = vi.fn(async () => {});
+			const appendSessionState = vi.fn();
+			const state = makeState("active-1") as ActiveSessionState;
+			state.extensionUiRequests = new Map();
+			state.runtime = {
+				metadata: { kind: "top-level", createdAt: 1 },
+				cwd: tempDir,
+				dispose,
+				session: {
+					sessionId: "session-1",
+					sessionFile,
+					messages: ["user message"],
+					sessionManager: {
+						appendSessionState,
+						hasUserContent: () => true,
+					},
+					abort,
+					removeQueuedFollowUp,
+				},
+			} as never;
+			const internals = daemon as unknown as {
+				cronStore: AgentCronJobStore;
+				sessions: Map<string, ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+			const cron = internals.cronStore.create({
+				activeSessionId: state.activeSessionId,
+				sessionId: "session-1",
+				sessionFile,
+				cwd: tempDir,
+				scheduleText: "in 1h",
+				prompt: "check long run",
+				now: new Date("2026-01-01T12:00:00.000Z"),
+			});
+			const heartbeat = internals.cronStore.createHeartbeat({
+				activeSessionId: state.activeSessionId,
+				sessionId: "session-1",
+				sessionFile,
+				cwd: tempDir,
+				scheduleText: "every 5m",
+				prompt: "keep working",
+				now: new Date("2026-01-01T12:00:00.000Z"),
+			});
+			internals.cronStore.pauseHeartbeat(state.activeSessionId, new Date("2026-01-01T12:01:00.000Z"));
+			const rlmHeartbeat = internals.cronStore.createRlmHeartbeat({
+				activeSessionId: state.activeSessionId,
+				sessionId: "session-1",
+				sessionFile,
+				cwd: tempDir,
+				runtimeKind: "top-level",
+				scheduleText: "every 10m",
+				prompt: "keep internal work moving",
+				now: new Date("2026-01-01T12:00:00.000Z"),
+			});
+
+			await internals.handleCommand(makeClient("client-1", state.activeSessionId), {
+				id: "command-1",
+				type: "kill",
+				activeSessionId: state.activeSessionId,
+			});
+
+			for (const id of [cron.id, heartbeat.id, rlmHeartbeat.id]) {
+				expect(internals.cronStore.list().find((job) => job.id === id)).toMatchObject({ status: "cancelled" });
+				expect(internals.cronStore.list().find((job) => job.id === id)).not.toHaveProperty("nextRunAt");
+			}
+			expect(removeQueuedFollowUp).toHaveBeenCalledWith(`heartbeat:${heartbeat.id}`);
+			expect(removeQueuedFollowUp).toHaveBeenCalledWith(`heartbeat:${rlmHeartbeat.id}`);
+			expect(abort).toHaveBeenCalledOnce();
+			expect(dispose).toHaveBeenCalledOnce();
+			expect(appendSessionState).toHaveBeenCalledWith({ status: "archived" });
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("cancels scheduled jobs when a saved session is deleted", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-cron-"));
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: {
+					agentDir: tempDir,
+					cwd: tempDir,
+				},
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const internals = daemon as unknown as {
+				cronStore: AgentCronJobStore;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const sessionFile = join(tempDir, "saved-session.jsonl");
+			const otherSessionFile = join(tempDir, "other-session.jsonl");
+			const cron = internals.cronStore.create({
+				activeSessionId: "active-1",
+				sessionId: "session-1",
+				sessionFile,
+				cwd: tempDir,
+				scheduleText: "in 1h",
+				prompt: "check saved session",
+				now: new Date("2026-01-01T12:00:00.000Z"),
+			});
+			const heartbeat = internals.cronStore.createHeartbeat({
+				activeSessionId: "active-1",
+				sessionId: "session-1",
+				sessionFile,
+				cwd: tempDir,
+				scheduleText: "every 5m",
+				prompt: "keep saved session alive",
+				now: new Date("2026-01-01T12:00:00.000Z"),
+			});
+			const unrelated = internals.cronStore.create({
+				activeSessionId: "active-2",
+				sessionId: "session-2",
+				sessionFile: otherSessionFile,
+				cwd: tempDir,
+				scheduleText: "in 2h",
+				prompt: "keep other session alive",
+				now: new Date("2026-01-01T12:00:00.000Z"),
+			});
+
+			await internals.handleCommand(makeClient("client-1", "active-1"), {
+				id: "command-1",
+				type: "delete_saved_session",
+				sessionPath: sessionFile,
+			});
+
+			expect(internals.cronStore.list().find((job) => job.id === cron.id)).toMatchObject({ status: "cancelled" });
+			expect(internals.cronStore.list().find((job) => job.id === heartbeat.id)).toMatchObject({
+				status: "cancelled",
+			});
+			expect(internals.cronStore.list().find((job) => job.id === unrelated.id)).toMatchObject({ status: "active" });
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps saved session jobs when file deletion fails", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-cron-fail-"));
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: {
+					agentDir: tempDir,
+					cwd: tempDir,
+				},
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const deleteSavedSessionFile = vi.fn(async () => ({ ok: false, error: "delete failed" }) as const);
+			const internals = daemon as unknown as {
+				cronStore: AgentCronJobStore;
+				deleteSavedSessionFile: typeof deleteSavedSessionFile;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			internals.deleteSavedSessionFile = deleteSavedSessionFile;
+			const sessionFile = join(tempDir, "saved-session.jsonl");
+			const cron = internals.cronStore.create({
+				activeSessionId: "active-1",
+				sessionId: "session-1",
+				sessionFile,
+				cwd: tempDir,
+				scheduleText: "in 1h",
+				prompt: "check saved session",
+				now: new Date("2026-01-01T12:00:00.000Z"),
+			});
+			const heartbeat = internals.cronStore.createHeartbeat({
+				activeSessionId: "active-1",
+				sessionId: "session-1",
+				sessionFile,
+				cwd: tempDir,
+				scheduleText: "every 5m",
+				prompt: "keep saved session alive",
+				now: new Date("2026-01-01T12:00:00.000Z"),
+			});
+
+			const response = await internals.handleCommand(makeClient("client-1", "active-1"), {
+				id: "command-1",
+				type: "delete_saved_session",
+				sessionPath: sessionFile,
+			});
+
+			expect(response).toMatchObject({ data: { ok: false, error: "delete failed" } });
+			expect(deleteSavedSessionFile).toHaveBeenCalledWith(sessionFile, {
+				afterFileRemoved: expect.any(Function),
+			});
+			expect(internals.cronStore.list().find((job) => job.id === cron.id)).toMatchObject({ status: "active" });
+			expect(internals.cronStore.list().find((job) => job.id === heartbeat.id)).toMatchObject({
+				status: "active",
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("preserves omitted global scope on daemon refine commands", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: {

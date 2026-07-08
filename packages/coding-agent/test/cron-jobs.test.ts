@@ -462,6 +462,62 @@ describe("AgentCronJobStore", () => {
 		expect(store.listRlmHeartbeats("top-level-1")[0]).toMatchObject({ status: "active" });
 	});
 
+	it("cancels active and paused jobs for a removed session", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const sessionFile = "/tmp/session-to-remove.jsonl";
+		const cron = store.create({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile,
+			cwd: "/tmp/project",
+			scheduleText: "in 1h",
+			prompt: "check the long run",
+			now: start,
+		});
+		const heartbeat = store.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile,
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "continue the session",
+			now: start,
+		});
+		store.pauseHeartbeat("active-1", new Date("2026-01-01T12:35:00.000Z"));
+		const rlmHeartbeat = store.createRlmHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile,
+			cwd: "/tmp/project",
+			runtimeKind: "top-level",
+			label: "rlm",
+			scheduleText: "every 10m",
+			prompt: "continue internal work",
+			now: start,
+		});
+		const unrelated = store.create({
+			activeSessionId: "active-2",
+			sessionId: "session-2",
+			sessionFile: "/tmp/other-session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "in 2h",
+			prompt: "keep other session alive",
+			now: start,
+		});
+
+		const cancelled = store.cancelJobsForSession({ sessionId: "session-1" }, new Date("2026-01-01T12:40:00.000Z"));
+
+		expect(cancelled.map((job) => job.id)).toEqual(expect.arrayContaining([cron.id, heartbeat.id, rlmHeartbeat.id]));
+		for (const id of [cron.id, heartbeat.id, rlmHeartbeat.id]) {
+			expect(store.list().find((job) => job.id === id)).toMatchObject({
+				status: "cancelled",
+				updatedAt: "2026-01-01T12:40:00.000Z",
+			});
+			expect(store.list().find((job) => job.id === id)).not.toHaveProperty("nextRunAt");
+		}
+		expect(store.list().find((job) => job.id === unrelated.id)).toMatchObject({ status: "active" });
+	});
+
 	it("returns undefined when updating inactive RLM heartbeats", () => {
 		const store = new AgentCronJobStore(makeStorePath(tempDirs));
 		const rlmHeartbeat = store.createRlmHeartbeat({

@@ -820,6 +820,40 @@ export class AgentDaemon {
 		}
 	}
 
+	private cancelScheduledJobsForSession(state: ActiveSessionState): void {
+		const session = state.runtime.session;
+		const target: { activeSessionId: string; sessionId?: string; sessionFile?: string } = {
+			activeSessionId: state.activeSessionId,
+		};
+		if (session?.sessionId) {
+			target.sessionId = session.sessionId;
+		}
+		if (session?.sessionFile) {
+			target.sessionFile = session.sessionFile;
+		}
+		const cancelled = this.cronStore.cancelJobsForSession(target);
+		for (const job of cancelled) {
+			this.removeQueuedHeartbeatFollowUp(state, job);
+		}
+		if (cancelled.length > 0) {
+			this.cronScheduler.wake();
+		}
+	}
+
+	private cancelScheduledJobsForSessionFile(sessionFile: string): void {
+		const cancelled = this.cronStore.cancelJobsForSession({ sessionFile });
+		if (cancelled.length > 0) {
+			this.cronScheduler.wake();
+		}
+	}
+
+	private deleteSavedSessionFile(
+		sessionPath: string,
+		options?: Parameters<typeof deleteSessionFile>[1],
+	): ReturnType<typeof deleteSessionFile> {
+		return deleteSessionFile(sessionPath, options);
+	}
+
 	private removeQueuedHeartbeatFollowUp(state: ActiveSessionState, job: AgentCronJob): void {
 		if (!isHeartbeatCronJob(job)) {
 			return;
@@ -1302,7 +1336,12 @@ export class AgentDaemon {
 				if (this.findActiveSessionByFile(command.sessionPath)) {
 					throw new Error("Cannot delete the currently active session");
 				}
-				return success(command.id, "delete_saved_session", await deleteSessionFile(command.sessionPath));
+				const result = await this.deleteSavedSessionFile(command.sessionPath, {
+					afterFileRemoved: () => {
+						this.cancelScheduledJobsForSessionFile(command.sessionPath);
+					},
+				});
+				return success(command.id, "delete_saved_session", result);
 			}
 
 			case "prompt": {
@@ -2196,7 +2235,11 @@ export class AgentDaemon {
 		if (!this.sessions.has(state.activeSessionId)) {
 			return;
 		}
-		this.cancelSubagentRlmHeartbeats(state);
+		if (reason === "killed") {
+			this.cancelScheduledJobsForSession(state);
+		} else {
+			this.cancelSubagentRlmHeartbeats(state);
+		}
 		// Abort in-flight status work before any await/dispose so it can't write
 		// agent_status to a session being torn down.
 		this.summarizer.forget(state.activeSessionId);

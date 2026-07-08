@@ -382,6 +382,30 @@ export class AgentCronJobStore {
 		return cancelled;
 	}
 
+	cancelJobsForSession(
+		input: { activeSessionId?: string; sessionId?: string; sessionFile?: string },
+		now = new Date(),
+	): AgentCronJob[] {
+		const targetSessionFile = input.sessionFile ? resolve(input.sessionFile) : undefined;
+		const cancelled: AgentCronJob[] = [];
+		const jobs = this.readJobs().map((job) => {
+			const matches =
+				(input.activeSessionId !== undefined && job.activeSessionId === input.activeSessionId) ||
+				(input.sessionId !== undefined && job.sessionId === input.sessionId) ||
+				(targetSessionFile !== undefined && resolve(job.sessionFile) === targetSessionFile);
+			if (!matches || (job.status !== "active" && job.status !== "paused")) {
+				return job;
+			}
+			const cancelledJob = withoutNextRunAt({ ...job, status: "cancelled", updatedAt: now.toISOString() });
+			cancelled.push(cancelledJob);
+			return cancelledJob;
+		});
+		if (cancelled.length > 0) {
+			this.writeJobs(jobs);
+		}
+		return cancelled;
+	}
+
 	pauseHeartbeat(activeSessionId: string, now = new Date()): AgentCronJob | undefined {
 		let paused: AgentCronJob | undefined;
 		const current = this.getHeartbeat(activeSessionId);
