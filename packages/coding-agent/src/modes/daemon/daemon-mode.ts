@@ -570,11 +570,12 @@ export class AgentDaemon {
 		const isAgentMessagePromptInProgress =
 			this.agentMessageAcceptingTargets.has(state.activeSessionId) ||
 			this.agentMessagePreparingTargets.has(state.activeSessionId);
-		if (isHeartbeatCronJob(job) && isAgentMessagePromptInProgress) {
-			return "skipped";
-		}
-		if (shouldDeferHeartbeatCronJob(job, session)) {
-			return "skipped";
+		if (isHeartbeatCronJob(job)) {
+			if (isAgentMessagePromptInProgress || shouldDeferHeartbeatCronJob(job, session)) {
+				return "skipped";
+			}
+			const didQueue = await session.runHeartbeatContext(job);
+			return didQueue ? undefined : "skipped";
 		}
 		const shouldQueueCronPrompt =
 			isAgentMessagePromptInProgress ||
@@ -584,13 +585,13 @@ export class AgentDaemon {
 			session.isBashRunning ||
 			session.hasAcceptedPromptInFlight ||
 			session.pendingMessageCount > 0;
-		if (!isHeartbeatCronJob(job) && shouldQueueCronPrompt) {
+		if (shouldQueueCronPrompt) {
 			await session.followUp(job.prompt);
 			return;
 		}
 		await this.promptWithAgentMessagePreparingGuard(state, job.prompt, {
 			streamingBehavior: "followUp",
-			followUpQueueKey: isHeartbeatCronJob(job) ? `heartbeat:${job.id}` : undefined,
+			followUpQueueKey: undefined,
 			source: "rpc",
 		});
 	}
@@ -1041,7 +1042,8 @@ export class AgentDaemon {
 			isCompacting: summary.isCompacting,
 			attachedClients: summary.attachedClients,
 			messageCount: summary.messageCount,
-			pendingMessageCount: summary.pendingMessageCount,
+			pendingMessageCount:
+				state.runtime.session.visiblePendingMessageCount ?? state.runtime.session.pendingMessageCount,
 			...(summary.parentActiveSessionId ? { parentActiveSessionId: summary.parentActiveSessionId } : {}),
 			...(summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
 			...(summary.rlmChildId ? { rlmChildId: summary.rlmChildId } : {}),
@@ -1838,7 +1840,8 @@ export class AgentDaemon {
 			cwd: state.runtime.cwd,
 			isStreaming: state.runtime.session.isStreaming,
 			pendingMessageCount:
-				state.runtime.session.pendingMessageCount + (state.runtime.session.hasAcceptedPromptInFlight ? 1 : 0),
+				(state.runtime.session.visiblePendingMessageCount ?? state.runtime.session.pendingMessageCount) +
+				(state.runtime.session.hasAcceptedPromptInFlight ? 1 : 0),
 			...(metadata.parentActiveSessionId ? { parentActiveSessionId: metadata.parentActiveSessionId } : {}),
 			...(metadata.rlmChildId ? { rlmChildId: metadata.rlmChildId } : {}),
 		};

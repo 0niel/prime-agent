@@ -2753,7 +2753,7 @@ describe("daemon mode helpers", () => {
 		expect(prompt).not.toHaveBeenCalled();
 	});
 
-	it("prompts idle sessions with a followUp streaming behavior to survive a mid-call stream start", async () => {
+	it("runs idle heartbeat cron jobs through a hidden heartbeat context", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -2762,6 +2762,7 @@ describe("daemon mode helpers", () => {
 		});
 		const prompt = vi.fn(async () => {});
 		const followUp = vi.fn(async () => true);
+		const runHeartbeatContext = vi.fn(async () => true);
 		const state = makeState("active-1") as ActiveSessionState & {
 			runtime: ActiveSessionState["runtime"] & {
 				session: {
@@ -2770,6 +2771,7 @@ describe("daemon mode helpers", () => {
 					pendingMessageCount: number;
 					prompt: typeof prompt;
 					followUp: typeof followUp;
+					runHeartbeatContext: typeof runHeartbeatContext;
 				};
 			};
 		};
@@ -2779,22 +2781,15 @@ describe("daemon mode helpers", () => {
 			pendingMessageCount: 0,
 			prompt,
 			followUp,
+			runHeartbeatContext,
 		} as never;
 		(daemon as unknown as { sessions: Map<string, ActiveSessionState> }).sessions.set(state.activeSessionId, state);
+		const job = makeCronJob({ id: "heartbeat-1", source: "heartbeat", activeSessionId: state.activeSessionId });
 
-		await (daemon as unknown as { runCronJob(job: AgentCronJob): Promise<"skipped" | undefined> }).runCronJob(
-			makeCronJob({ id: "heartbeat-1", source: "heartbeat", activeSessionId: state.activeSessionId }),
-		);
+		await (daemon as unknown as { runCronJob(job: AgentCronJob): Promise<"skipped" | undefined> }).runCronJob(job);
 
-		// The preparing guard adds an internal preflightResult hook.
-		expect(prompt).toHaveBeenCalledWith(
-			"heartbeat prompt",
-			expect.objectContaining({
-				streamingBehavior: "followUp",
-				followUpQueueKey: "heartbeat:heartbeat-1",
-				source: "rpc",
-			}),
-		);
+		expect(runHeartbeatContext).toHaveBeenCalledWith(job);
+		expect(prompt).not.toHaveBeenCalled();
 		expect(followUp).not.toHaveBeenCalled();
 	});
 

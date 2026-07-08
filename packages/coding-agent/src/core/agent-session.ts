@@ -146,6 +146,7 @@ import {
 	validateGoalBudget,
 	validateGoalObjective,
 } from "./goals.js";
+import { createHeartbeatContextMessage, HEARTBEAT_CONTEXT_CUSTOM_TYPE } from "./heartbeat-context.js";
 import type { HostRequestHandlers } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
@@ -438,6 +439,11 @@ interface AgentMessageDeliveryWaiter {
 	reject: (error: Error) => void;
 }
 
+interface QueuedHeartbeatContextMessage {
+	queueKey: string;
+	message: CustomMessage;
+}
+
 /** Result from cycleModel() */
 export interface ModelCycleResult {
 	model: Model<any>;
@@ -590,6 +596,8 @@ export class AgentSession {
 	private _followUpMessages: QueuedFollowUpMessage[] = [];
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
+	/** Hidden heartbeat contexts queued through the agent follow-up queue. */
+	private _queuedHeartbeatContexts: QueuedHeartbeatContextMessage[] = [];
 
 	private _goalState: GoalState = emptyGoalState();
 	private _goalAccountingStartedAt: number | undefined = undefined;
@@ -869,6 +877,15 @@ export class AgentSession {
 		});
 	}
 
+	private _trackQueuedHeartbeatContext(queueKey: string, message: CustomMessage): void {
+		this._queuedHeartbeatContexts = this._queuedHeartbeatContexts.filter((queued) => queued.queueKey !== queueKey);
+		this._queuedHeartbeatContexts.push({ queueKey, message });
+	}
+
+	private _untrackQueuedHeartbeatContext(message: AgentMessage): void {
+		this._queuedHeartbeatContexts = this._queuedHeartbeatContexts.filter((queued) => queued.message !== message);
+	}
+
 	private _emitGoalUpdate(): void {
 		this._emit({ type: "goal_update", goal: this.goalState });
 	}
@@ -942,6 +959,19 @@ export class AgentSession {
 		this.agent.removeQueuedMessages(
 			(message) => message.role === "custom" && message.customType === GOAL_CONTEXT_CUSTOM_TYPE,
 		);
+	}
+
+	private _clearQueuedHeartbeatContextsMatching(predicate: (queueKey: string) => boolean): boolean {
+		const queued = this._queuedHeartbeatContexts.filter((message) => predicate(message.queueKey));
+		if (queued.length === 0) {
+			return false;
+		}
+		this._queuedHeartbeatContexts = this._queuedHeartbeatContexts.filter((message) => !predicate(message.queueKey));
+		const removedMessages = new Set(queued.map((message) => message.message));
+		this.agent.removeQueuedMessages(
+			(message) => message.role === "custom" && removedMessages.has(message as CustomMessage),
+		);
+		return true;
 	}
 
 	private _startGoal(objectiveText: string, tokenBudget: number | undefined): GoalState {
@@ -1857,6 +1887,15 @@ export class AgentSession {
 			this._resolveRetry();
 		}
 
+		if (
+			event.type === "message_start" &&
+			event.message.role === "custom" &&
+			event.message.customType === HEARTBEAT_CONTEXT_CUSTOM_TYPE
+		) {
+			this._untrackQueuedHeartbeatContext(event.message);
+			this._emitQueueUpdate();
+		}
+
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -2452,6 +2491,26 @@ export class AgentSession {
 			return true;
 		}
 		return this._queueFollowUp(text, undefined, { agentMessageId });
+	}
+
+	async queueHeartbeatContext(job: AgentCronJob): Promise<boolean> {
+		const queueKey = `heartbeat:${job.id}`;
+		if (this.hasQueuedFollowUp(queueKey)) {
+			return false;
+		}
+		const message = createHeartbeatContextMessage(job);
+		this._trackQueuedHeartbeatContext(queueKey, message);
+		this.agent.followUp(message);
+		return true;
+	}
+
+	async runHeartbeatContext(job: AgentCronJob): Promise<boolean> {
+		const queued = await this.queueHeartbeatContext(job);
+		if (!queued) {
+			return false;
+		}
+		await this._drainQueuedMessagesAfterBash();
+		return true;
 	}
 
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
@@ -3113,6 +3172,7 @@ export class AgentSession {
 		this._rejectQueuedAgentMessageDeliveries(new Error("Queued agent message was cleared before delivery."));
 		this._steeringMessages = [];
 		this._followUpMessages = [];
+		this._queuedHeartbeatContexts = [];
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		return { steering, followUp };
@@ -3179,6 +3239,10 @@ export class AgentSession {
 
 	/** Number of pending messages (includes both steering and follow-up) */
 	get pendingMessageCount(): number {
+		return this._steeringMessages.length + this._followUpMessages.length + this._queuedHeartbeatContexts.length;
+	}
+
+	get visiblePendingMessageCount(): number {
 		return this._steeringMessages.length + this._followUpMessages.length;
 	}
 
@@ -3193,12 +3257,16 @@ export class AgentSession {
 	}
 
 	hasQueuedFollowUp(queueKey: string): boolean {
-		return this._followUpMessages.some((message) => message.queueKey === queueKey);
+		return (
+			this._followUpMessages.some((message) => message.queueKey === queueKey) ||
+			this._queuedHeartbeatContexts.some((message) => message.queueKey === queueKey)
+		);
 	}
 
 	removeQueuedFollowUp(queueKey: string): boolean {
 		const removed = this._followUpMessages.filter((message) => message.queueKey === queueKey);
-		if (removed.length === 0) {
+		const removedHeartbeatContexts = this._clearQueuedHeartbeatContextsMatching((key) => key === queueKey);
+		if (removed.length === 0 && !removedHeartbeatContexts) {
 			return false;
 		}
 		this._followUpMessages = this._followUpMessages.filter((message) => message.queueKey !== queueKey);
@@ -5819,9 +5887,16 @@ export class AgentSession {
 
 		const steeringMessages = [...this._steeringMessages];
 		const followUpMessages = [...this._followUpMessages];
+		const heartbeatMessages = [...this._queuedHeartbeatContexts];
 		const drainedSteeringMessages = steeringMessages.length > 0 ? steeringMessages : [];
 		const drainedFollowUpMessages = steeringMessages.length > 0 ? [] : followUpMessages;
-		const queuedMessages = [...drainedSteeringMessages, ...drainedFollowUpMessages].map((message) => message.message);
+		const drainedHeartbeatMessages =
+			steeringMessages.length === 0 && followUpMessages.length === 0 ? heartbeatMessages : [];
+		const queuedMessages = [
+			...drainedSteeringMessages.map((message) => message.message),
+			...drainedFollowUpMessages.map((message) => message.message),
+			...drainedHeartbeatMessages.map((message) => message.message),
+		];
 		if (queuedMessages.length === 0) {
 			return;
 		}
@@ -5838,6 +5913,7 @@ export class AgentSession {
 			this._pendingNextTurnMessages.unshift(...nextTurnMessages.map((message) => ({ ...message })));
 			const queuedSteering = new Set(this._steeringMessages.map((message) => message.message));
 			const queuedFollowUps = new Set(this._followUpMessages.map((message) => message.message));
+			const queuedHeartbeats = new Set(this._queuedHeartbeatContexts.map((message) => message.message));
 			for (const queued of drainedSteeringMessages) {
 				if (queuedSteering.has(queued.message)) {
 					this.agent.steer(queued.message);
@@ -5845,6 +5921,11 @@ export class AgentSession {
 			}
 			for (const queued of drainedFollowUpMessages) {
 				if (queuedFollowUps.has(queued.message)) {
+					this.agent.followUp(queued.message);
+				}
+			}
+			for (const queued of drainedHeartbeatMessages) {
+				if (queuedHeartbeats.has(queued.message)) {
 					this.agent.followUp(queued.message);
 				}
 			}

@@ -115,7 +115,8 @@ export function buildSessionList(
 }
 
 function effectivePendingMessageCount(session: ActiveSessionState["runtime"]["session"]): number {
-	return session.pendingMessageCount + (session.hasAcceptedPromptInFlight ? 1 : 0);
+	const visiblePendingMessageCount = session.visiblePendingMessageCount ?? session.pendingMessageCount;
+	return visiblePendingMessageCount + (session.hasAcceptedPromptInFlight ? 1 : 0);
 }
 
 export function summaryForActiveSession(activeSession: ActiveSessionState, savedSession?: SessionInfo): SessionSummary {
