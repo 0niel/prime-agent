@@ -1,5 +1,6 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it } from "vitest";
+import { KeybindingsManager } from "../src/core/keybindings.js";
 import {
 	type ChildAgentInspectorNode,
 	ChildAgentSummaryComponent,
@@ -17,6 +18,7 @@ function node(id: string, status: ChildAgentInspectorNode["status"] = "running")
 
 describe("ChildAgentSummaryComponent inline list", () => {
 	beforeAll(() => {
+		setKeybindings(new KeybindingsManager());
 		initTheme("dark");
 	});
 
@@ -143,10 +145,53 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		let forwarded: string | undefined;
 		summary.onChatAction = (data) => {
 			forwarded = data;
+			return undefined;
 		};
 		// Ctrl+O isn't a list key, so it should bubble to the chat action handler.
 		summary.handleInput("\x0f");
 		expect(forwarded).toBe("\x0f");
+	});
+
+	it("forwards text input to the unhandled input callback", () => {
+		const summary = new ChildAgentSummaryComponent();
+		summary.focused = true;
+		summary.setNodes([node("a")]);
+		let forwarded: string | undefined;
+		summary.onUnhandledInput = (data) => {
+			forwarded = data;
+		};
+		summary.handleInput("h");
+		expect(forwarded).toBe("h");
+	});
+
+	it("does not forward handled chat actions as unhandled input", () => {
+		const summary = new ChildAgentSummaryComponent();
+		summary.focused = true;
+		summary.setNodes([node("a")]);
+		let unhandled: string | undefined;
+		summary.onChatAction = () => true;
+		summary.onUnhandledInput = (data) => {
+			unhandled = data;
+		};
+		summary.handleInput("\x0f");
+		expect(unhandled).toBeUndefined();
+	});
+
+	it("routes back through onExit without forwarding input", () => {
+		const summary = new ChildAgentSummaryComponent();
+		summary.focused = true;
+		summary.setNodes([node("a")]);
+		let exited = false;
+		let unhandled: string | undefined;
+		summary.onExit = () => {
+			exited = true;
+		};
+		summary.onUnhandledInput = (data) => {
+			unhandled = data;
+		};
+		summary.handleInput("\x1b[D");
+		expect(exited).toBe(true);
+		expect(unhandled).toBeUndefined();
 	});
 
 	it("opens the selected subagent's detail on confirm", () => {

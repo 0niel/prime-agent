@@ -208,7 +208,8 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 	onExit?: () => void;
 	onOpenDetail?: (nodeId: string) => void;
 	// Chat actions that should still work while the list holds focus.
-	onChatAction?: (data: string) => void;
+	onChatAction?: (data: string) => boolean | undefined;
+	onUnhandledInput?: (data: string) => void;
 
 	constructor(
 		private readonly getLocationLabel: () => string | undefined = () => undefined,
@@ -286,8 +287,10 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 			this.onCancel?.();
 			return;
 		}
-		// Keys the list doesn't own fall through to chat actions (expand tools, etc.).
-		this.onChatAction?.(data);
+		if (this.onChatAction?.(data)) {
+			return;
+		}
+		this.onUnhandledInput?.(data);
 	}
 
 	private isAtFirstRow(flat: readonly FlatChildAgentNode[]): boolean {
