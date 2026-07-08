@@ -16,6 +16,14 @@ describe("built-in slash commands", () => {
 		expect(commandNames).not.toContain("cron");
 	});
 
+	test("exposes heartbeat syntax guidance", () => {
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "heartbeat")).toMatchObject({
+			description: "Set or view a persistent heartbeat; supports pause, resume, stop, and clear",
+			argumentHint: "[status|pause|resume|stop|every <duration> <instruction>]",
+			takesArgument: true,
+		});
+	});
+
 	test("exposes /effort for selecting the thinking level", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "effort")).toMatchObject({
 			description: "Set reasoning/thinking level",
@@ -34,6 +42,7 @@ describe("built-in slash commands", () => {
 		expect(builtinSlashCommandTakesArgument("goal")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("effort")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("thinking")).toBe(true);
+		expect(builtinSlashCommandTakesArgument("heartbeat")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("new")).toBe(false);
 		expect(builtinSlashCommandTakesArgument("clear")).toBe(false);
 	});

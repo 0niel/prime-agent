@@ -63,6 +63,11 @@ describe("parseHeartbeatCommand", () => {
 			schedule: "every 30s",
 			instruction: "check on me",
 		});
+		expect(parseHeartbeatCommand("/heartbeat every 10m check status")).toEqual({
+			type: "set",
+			schedule: "every 10m",
+			instruction: "check status",
+		});
 		expect(parseHeartbeatCommand("/heartbeat every 10m -- check status")).toEqual({
 			type: "set",
 			schedule: "every 10m",
