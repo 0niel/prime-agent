@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed Anthropic-compatible endpoints receiving empty record-valued tool arguments by converting catch-all `patternProperties` schemas to `additionalProperties`.
+
 ## [0.2.8] - 2026-07-09
 
 - Registered the full Prime Inference catalog (97 models, up from 32) instead of a curated whitelist; context/output limits, vision, and reasoning now come from OpenRouter metadata with a small override table for limits the gateway enforces differently (verified against the live API), and raw/duplicate variants (BF16, HF-cased, `zai-org/`, fine-tune outputs) are skipped.
@@ -9,8 +11,6 @@
 - Removed `prime-intellect/intellect-3`, which no longer serves (404 from the gateway).
 - Added an optional `featured` flag to `Model` so pickers can pin flagship models above a provider's long tail; set for 30 Prime Inference flagships.
 - Added GPT-5.6 Sol, Terra, and Luna to OpenAI API-key and Codex subscription model catalogs, with their 1.05M API / 272k Codex context windows and `low` through `max` reasoning support.
-- Fixed Anthropic-compatible endpoints receiving empty record-valued tool arguments by converting catch-all `patternProperties` schemas to `additionalProperties`.
-
 ## [0.2.7] - 2026-07-08
 
 - Added `internal/glm-5.2-fast` to the Prime Inference model catalog.
