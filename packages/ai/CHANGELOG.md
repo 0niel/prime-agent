@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added GPT-5.6 Sol, Terra, and Luna to OpenAI API-key and Codex subscription model catalogs, with their 1.05M API / 272k Codex context windows and `low` through `max` reasoning support.
+
 ## [0.2.7] - 2026-07-08
 
 - Added `internal/glm-5.2-fast` to the Prime Inference model catalog.
