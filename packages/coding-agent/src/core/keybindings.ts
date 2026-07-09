@@ -14,6 +14,7 @@ export interface AppKeybindings {
 	"app.interrupt": true;
 	"app.clear": true;
 	"app.input.clear": true;
+	"app.shortcuts": true;
 	"app.exit": true;
 	"app.suspend": true;
 	"app.model.select": true;
@@ -72,7 +73,8 @@ export const KEYBINDINGS = {
 	...TUI_KEYBINDINGS,
 	"app.interrupt": { defaultKeys: [], description: "Interrupt current operation" },
 	"app.clear": { defaultKeys: "ctrl+c", description: "Interrupt current operation, then exit" },
-	"app.input.clear": { defaultKeys: "escape", description: "Clear input" },
+	"app.input.clear": { defaultKeys: "escape", description: "Interrupt response or clear prompt" },
+	"app.shortcuts": { defaultKeys: "?", description: "Show keyboard shortcuts" },
 	"app.exit": { defaultKeys: "ctrl+d", description: "Exit when editor is empty" },
 	"app.suspend": {
 		defaultKeys: process.platform === "win32" ? [] : "ctrl+z",

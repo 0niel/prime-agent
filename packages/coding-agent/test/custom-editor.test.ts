@@ -68,6 +68,75 @@ describe("CustomEditor", () => {
 		expect(editor.getText()).toBe("/");
 	});
 
+	it("routes Escape through its handler while dismissing autocomplete", async () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		const handler = vi.fn();
+
+		editor.setAutocompleteProvider(autocompleteProvider);
+		editor.onEscape = handler;
+		editor.handleInput("/");
+		await vi.waitFor(() => expect(editor.isShowingAutocomplete()).toBe(true));
+
+		editor.handleInput("\x1b");
+
+		expect(editor.isShowingAutocomplete()).toBe(false);
+		expect(handler).toHaveBeenCalledTimes(1);
+	});
+
+	it("handles the question-mark shortcut as an app action", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		const handler = vi.fn();
+
+		editor.onAction("app.shortcuts", handler);
+		editor.handleInput("?");
+
+		expect(handler).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
+	});
+
+	it("keeps question marks in a nonempty prompt", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		const handler = vi.fn();
+		editor.onAction("app.shortcuts", handler);
+		editor.setText("Can this contain");
+
+		editor.handleInput("?");
+
+		expect(handler).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("Can this contain?");
+	});
+
+	it("splits terminal-batched repeats for the configured clear-input binding", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		const handler = vi.fn();
+		editor.onEscape = handler;
+
+		editor.handleInput("\x1b\x1b");
+
+		expect(handler).toHaveBeenCalledTimes(2);
+	});
+
+	it("splits arbitrary terminal-batched clear-input repeats", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
+		const handler = vi.fn();
+		editor.onEscape = handler;
+
+		editor.handleInput("\x1b\x1b\x1b");
+
+		expect(handler).toHaveBeenCalledTimes(3);
+	});
+
+	it("uses custom clear-input bindings when splitting batched repeats", () => {
+		const keybindings = new KeybindingsManager({ "app.input.clear": "ctrl+x" });
+		const editor = new CustomEditor(fakeTui, editorTheme, keybindings);
+		const handler = vi.fn();
+		editor.onEscape = handler;
+
+		editor.handleInput("\x18\x18");
+
+		expect(handler).toHaveBeenCalledTimes(2);
+	});
+
 	it("renders a header line and blank spacer inside the top of the editor box", () => {
 		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager());
 		const withoutHeader = editor.render(40);

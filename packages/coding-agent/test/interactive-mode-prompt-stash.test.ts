@@ -34,6 +34,7 @@ type PromptStashHarness = {
 	promptStash?: PromptStash;
 	editor: FakeEditor;
 	showStatus: Mock;
+	clearShortcutGuide: Mock;
 };
 
 type PromptStashLiveMarkerHarness = PromptStashHarness & {
@@ -43,6 +44,7 @@ type PromptStashLiveMarkerHarness = PromptStashHarness & {
 
 type ResetHarness = PromptStashLiveMarkerHarness & {
 	chatContainer: { clear: Mock };
+	shortcutGuideContainer: { clear: Mock };
 	pendingMessagesContainer: { clear: Mock };
 	queuedMessagesContainer: { clear: Mock };
 	defaultEditor: FakeEditor;
@@ -126,6 +128,7 @@ function createPromptStashHarness(
 			pasteSnapshot: options.pasteSnapshot,
 		}),
 		showStatus: vi.fn(),
+		clearShortcutGuide: vi.fn(),
 	};
 	Object.setPrototypeOf(harness, InteractiveMode.prototype);
 	return harness;
@@ -330,6 +333,7 @@ describe("InteractiveMode prompt stash", () => {
 			compactionQueuedMessages: [],
 			connectionQueue: { steering: ["old [image #2]"], followUp: [] },
 			chatContainer: { clear: vi.fn() },
+			shortcutGuideContainer: { clear: vi.fn() },
 			pendingMessagesContainer: { clear: vi.fn() },
 			queuedMessagesContainer: { clear: vi.fn() },
 			pastedImages: new Map<number, unknown>([
@@ -363,6 +367,7 @@ describe("InteractiveMode prompt stash", () => {
 			compactionQueuedMessages: [],
 			connectionQueue: { steering: [], followUp: [] },
 			chatContainer: { clear: vi.fn() },
+			shortcutGuideContainer: { clear: vi.fn() },
 			pendingMessagesContainer: { clear: vi.fn() },
 			queuedMessagesContainer: { clear: vi.fn() },
 			pastedImages: new Map<number, unknown>([[1, {}]]),

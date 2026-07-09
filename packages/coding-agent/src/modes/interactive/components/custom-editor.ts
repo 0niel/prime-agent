@@ -149,6 +149,14 @@ export class CustomEditor extends Editor {
 			return;
 		}
 
+		const repeatedClearInput = this.splitRepeatedKeybinding(data, "app.input.clear");
+		if (repeatedClearInput) {
+			for (const input of repeatedClearInput) {
+				this.handleInput(input);
+			}
+			return;
+		}
+
 		// Check for paste image keybinding
 		if (this.keybindings.matches(data, "app.clipboard.pasteImage")) {
 			this.onPasteImage?.();
@@ -161,17 +169,20 @@ export class CustomEditor extends Editor {
 			return;
 		}
 
-		// Clear input - only if autocomplete is NOT active
+		// Clear input
 		if (this.keybindings.matches(data, "app.input.clear")) {
-			if (!this.isShowingAutocomplete()) {
-				// Use dynamic onEscape if set, otherwise registered handler
-				const handler = this.onEscape ?? this.actionHandlers.get("app.input.clear");
-				if (handler) {
-					handler();
-					return;
-				}
+			const hadAutocomplete = this.isShowingAutocomplete();
+			if (hadAutocomplete) {
+				this.cancelAutocomplete();
 			}
-			// Let parent handle escape for autocomplete cancellation
+			const handler = this.onEscape ?? this.actionHandlers.get("app.input.clear");
+			if (handler) {
+				handler();
+				return;
+			}
+			if (hadAutocomplete) {
+				return;
+			}
 			super.handleInput(data);
 			return;
 		}
@@ -188,7 +199,12 @@ export class CustomEditor extends Editor {
 
 		// Check all other app actions
 		for (const [action, handler] of this.actionHandlers) {
-			if (action !== "app.input.clear" && action !== "app.exit" && this.keybindings.matches(data, action)) {
+			if (
+				action !== "app.input.clear" &&
+				action !== "app.exit" &&
+				(action !== "app.shortcuts" || this.getText().length === 0) &&
+				this.keybindings.matches(data, action)
+			) {
 				if ((action === "app.clear" || action === "app.interrupt") && this.isShowingAutocomplete()) {
 					this.cancelAutocomplete();
 				}
@@ -209,6 +225,29 @@ export class CustomEditor extends Editor {
 
 		// Pass to parent for editor handling
 		super.handleInput(data);
+	}
+
+	private splitRepeatedKeybinding(data: string, keybinding: AppKeybinding): string[] | undefined {
+		const inputs: string[] = [];
+		let offset = 0;
+
+		while (offset < data.length) {
+			let match: string | undefined;
+			for (let end = offset + 1; end <= data.length; end++) {
+				const candidate = data.slice(offset, end);
+				if (this.keybindings.matches(candidate, keybinding)) {
+					match = candidate;
+					offset = end;
+					break;
+				}
+			}
+			if (!match) {
+				return undefined;
+			}
+			inputs.push(match);
+		}
+
+		return inputs.length > 1 ? inputs : undefined;
 	}
 
 	private getEffectivePaddingX(width: number): number {

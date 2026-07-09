@@ -302,6 +302,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 type SubmitHandlerHarness = {
 	defaultEditor: { onSubmit?: (text: string) => Promise<void> };
 	editor: { setText: (text: string) => void; addToHistory?: (text: string) => void };
+	clearShortcutGuide: () => void;
 	showWarning: (message: string) => void;
 	showError: (message: string) => void;
 	isBashRunning: () => boolean;
@@ -317,6 +318,7 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 	const fakeThis: SubmitHandlerHarness = {
 		defaultEditor: {},
 		editor: { setText: vi.fn(), addToHistory: vi.fn() },
+		clearShortcutGuide: vi.fn(),
 		showWarning: vi.fn(),
 		showError: vi.fn(),
 		isBashRunning: () => false,
@@ -531,6 +533,7 @@ describe("InteractiveMode pending bash components", () => {
 		const editorStub = { clearHistory: vi.fn(), setText: vi.fn() };
 		const fakeThis = {
 			chatContainer: new Container(),
+			shortcutGuideContainer: new Container(),
 			pendingMessagesContainer: new Container(),
 			queuedMessagesContainer: new Container(),
 			compactionQueuedMessages: [],
@@ -688,27 +691,23 @@ describe("InteractiveMode key handlers", () => {
 			onPasteImage?: () => void;
 			onAction(action: string, handler: () => void): void;
 		};
-		editor: { setText: ReturnType<typeof vi.fn> };
 		ui: { onDebug?: () => void; requestRender: ReturnType<typeof vi.fn> };
-		clearCtrlCExitHint(options?: { render?: boolean }): void;
+		handleEscape(): void;
 		setupKeyHandlers(): void;
 	};
 
-	test("escape clears the input bar without aborting streaming", () => {
+	test("routes Escape through the repeat handler", () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as KeyHandlerHarness;
 		fakeThis.defaultEditor = {
 			onAction: vi.fn(),
 		};
-		fakeThis.editor = { setText: vi.fn() };
 		fakeThis.ui = { requestRender: vi.fn() };
-		fakeThis.clearCtrlCExitHint = vi.fn();
+		fakeThis.handleEscape = vi.fn();
 
 		fakeThis.setupKeyHandlers();
 		fakeThis.defaultEditor.onEscape?.();
 
-		expect(fakeThis.clearCtrlCExitHint).toHaveBeenCalledWith({ render: false });
-		expect(fakeThis.editor.setText).toHaveBeenCalledWith("");
-		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(1);
+		expect(fakeThis.handleEscape).toHaveBeenCalledTimes(1);
 	});
 });
 

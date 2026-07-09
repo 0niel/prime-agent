@@ -250,23 +250,19 @@ export class AssistantMessageComponent extends Container {
 			}
 		}
 
-		// Check if aborted - show after partial content
-		// But only if there are no tool calls (tool execution components will show the error)
 		const hasToolCalls = message.content.some((c) => c.type === "toolCall");
 		this.hasToolCalls = hasToolCalls;
-		if (!hasToolCalls) {
-			if (message.stopReason === "aborted") {
-				const abortMessage =
-					message.errorMessage && message.errorMessage !== "Request was aborted"
-						? message.errorMessage
-						: "Operation aborted";
-				this.contentContainer.addChild(new Spacer(1));
-				this.contentContainer.addChild(this.createErrorComponent(abortMessage));
-			} else if (message.stopReason === "error") {
-				const errorMsg = message.errorMessage || "Unknown error";
-				this.contentContainer.addChild(new Spacer(1));
-				this.contentContainer.addChild(this.createErrorComponent(errorMsg, "Error"));
-			}
+		if (message.stopReason === "aborted") {
+			const abortMessage =
+				message.errorMessage && message.errorMessage !== "Request was aborted"
+					? message.errorMessage
+					: "Operation aborted";
+			this.contentContainer.addChild(new Spacer(1));
+			this.contentContainer.addChild(this.createErrorComponent(abortMessage));
+		} else if (!hasToolCalls && message.stopReason === "error") {
+			const errorMsg = message.errorMessage || "Unknown error";
+			this.contentContainer.addChild(new Spacer(1));
+			this.contentContainer.addChild(this.createErrorComponent(errorMsg, "Error"));
 		}
 	}
 

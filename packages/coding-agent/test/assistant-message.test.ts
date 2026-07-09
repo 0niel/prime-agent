@@ -56,6 +56,21 @@ describe("AssistantMessageComponent", () => {
 		expect(rendered.includes(OSC133_ZONE_FINAL)).toBe(false);
 	});
 
+	test("renders an abort status for messages with tool calls", () => {
+		initTheme("dark");
+
+		const message = {
+			...createAssistantMessage([
+				{ type: "toolCall" as const, id: "tool-1", name: "ipython", arguments: { code: "while True: pass" } },
+			]),
+			stopReason: "aborted" as const,
+			errorMessage: "Operation aborted",
+		};
+		const rendered = stripAnsi(new AssistantMessageComponent(message).render(80).join("\n"));
+
+		expect(rendered).toContain("Operation aborted");
+	});
+
 	test("honors initial expansion for multiline assistant errors", () => {
 		initTheme("dark");
 
