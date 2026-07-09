@@ -554,6 +554,8 @@ export interface InteractiveModeOptions {
 	onShutdown?: () => void | Promise<void>;
 	/** Allow returning from a full session to the agents view without stopping the daemon-owned agent. */
 	returnToAgentsView?: boolean;
+	/** Enter fullscreen regardless of the persisted fullscreen preference. */
+	forceFullscreen?: boolean;
 	/**
 	 * The agents view already surfaced global startup notices (app/extension updates, tmux setup),
 	 * so this session must not repeat them in its chat stream. Distinct from `returnToAgentsView`,
@@ -1081,7 +1083,9 @@ export class InteractiveMode {
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
-		this.fullscreenEnabled = this.settingsManager.getFullscreen() && process.stdout.isTTY === true;
+		this.fullscreenEnabled =
+			(this.options.forceFullscreen === true || this.settingsManager.getFullscreen()) &&
+			process.stdout.isTTY === true;
 		if (this.fullscreenEnabled) {
 			this.applyFullscreen(true);
 		}
@@ -5606,9 +5610,9 @@ export class InteractiveMode {
 	 * leak into the parent UI, then stops the renderer and theme watcher. Safe to
 	 * call from a crash path too; idempotent via stop().
 	 */
-	async teardownSessionUi(): Promise<void> {
+	async teardownSessionUi(options: { preserveAltScreen?: boolean } = {}): Promise<void> {
 		await this.ui.terminal.drainInput(1000).catch(() => undefined);
-		this.stop();
+		this.stop({ preserveAltScreen: options.preserveAltScreen });
 		stopThemeWatcher();
 	}
 
@@ -5618,12 +5622,21 @@ export class InteractiveMode {
 		this.isShuttingDown = true;
 		this.unregisterSignalHandlers();
 
-		await this.teardownSessionUi();
+		await this.teardownSessionUi({ preserveAltScreen: true });
+		let handoffComplete = false;
 		try {
-			await this.agentConnection.dispose();
+			try {
+				await this.agentConnection.dispose();
+			} finally {
+				await this.options.onShutdown?.();
+				this.onInputCallback?.(undefined);
+				handoffComplete = true;
+			}
 		} finally {
-			await this.options.onShutdown?.();
-			this.onInputCallback?.(undefined);
+			if (!handoffComplete) {
+				this.ui.terminal.leaveAltScreen();
+				this.ui.terminal.showCursor();
+			}
 		}
 	}
 
@@ -8256,7 +8269,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 		}
 	}
 
-	stop(): void {
+	stop(options: { preserveAltScreen?: boolean } = {}): void {
 		this.unregisterSignalHandlers();
 		this.clearCtrlCExitHint({ render: false });
 		if (this.settingsManager.getShowTerminalProgress()) {
@@ -8272,7 +8285,10 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}| \`${
 			this.unsubscribe();
 		}
 		if (this.isInitialized) {
-			this.ui.stop();
+			this.ui.stop({
+				preserveAltScreen: options.preserveAltScreen,
+				flushFullscreen: options.preserveAltScreen ? false : undefined,
+			});
 			this.isInitialized = false;
 		}
 	}

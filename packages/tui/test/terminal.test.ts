@@ -43,3 +43,137 @@ describe("ProcessTerminal dimensions", () => {
 		}
 	});
 });
+
+describe("ProcessTerminal alternate screen handoff", () => {
+	it("does not inherit an active alternate screen before it is preserved", () => {
+		const originalWrite = process.stdout.write;
+		const writes: string[] = [];
+		const patchedWrite = ((...args: Parameters<typeof process.stdout.write>): boolean => {
+			const chunk = args[0];
+			writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			const callback = args.find((arg): arg is (error?: Error | null) => void => typeof arg === "function");
+			callback?.();
+			return true;
+		}) as typeof process.stdout.write;
+
+		process.stdout.write = patchedWrite;
+		try {
+			const first = new ProcessTerminal();
+			first.enterAltScreen();
+
+			const second = new ProcessTerminal();
+			assert.equal(second.altScreenActive, false);
+			second.stop();
+
+			assert.equal(writes.filter((write) => write === "\x1b[?1049l").length, 0);
+			first.leaveAltScreen();
+			assert.equal(writes.filter((write) => write === "\x1b[?1049l").length, 1);
+		} finally {
+			const cleanup = new ProcessTerminal();
+			if (cleanup.altScreenActive) {
+				cleanup.stop();
+			}
+			process.stdout.write = originalWrite;
+		}
+	});
+
+	it("inherits a preserved alternate screen into the next terminal instance", () => {
+		const originalWrite = process.stdout.write;
+		const writes: string[] = [];
+		const patchedWrite = ((...args: Parameters<typeof process.stdout.write>): boolean => {
+			const chunk = args[0];
+			writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			const callback = args.find((arg): arg is (error?: Error | null) => void => typeof arg === "function");
+			callback?.();
+			return true;
+		}) as typeof process.stdout.write;
+
+		process.stdout.write = patchedWrite;
+		try {
+			const first = new ProcessTerminal();
+			first.enterAltScreen();
+			first.stop({ preserveAltScreen: true });
+
+			const second = new ProcessTerminal();
+			assert.equal(second.altScreenActive, true);
+			second.stop();
+			assert.equal(second.altScreenActive, false);
+
+			const third = new ProcessTerminal();
+			assert.equal(third.altScreenActive, false);
+			assert.ok(writes.includes("\x1b[?1049h"));
+			assert.ok(writes.includes("\x1b[?1049l"));
+		} finally {
+			const cleanup = new ProcessTerminal();
+			if (cleanup.altScreenActive) {
+				cleanup.stop();
+			}
+			process.stdout.write = originalWrite;
+		}
+	});
+
+	it("lets the preserving terminal cancel a handoff before it is consumed", () => {
+		const originalWrite = process.stdout.write;
+		const writes: string[] = [];
+		const patchedWrite = ((...args: Parameters<typeof process.stdout.write>): boolean => {
+			const chunk = args[0];
+			writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			const callback = args.find((arg): arg is (error?: Error | null) => void => typeof arg === "function");
+			callback?.();
+			return true;
+		}) as typeof process.stdout.write;
+
+		process.stdout.write = patchedWrite;
+		try {
+			const first = new ProcessTerminal();
+			first.enterAltScreen();
+			first.stop({ preserveAltScreen: true });
+			assert.equal(first.altScreenActive, false);
+
+			first.leaveAltScreen();
+			assert.equal(writes.filter((write) => write === "\x1b[?1049l").length, 1);
+
+			const second = new ProcessTerminal();
+			assert.equal(second.altScreenActive, false);
+		} finally {
+			const cleanup = new ProcessTerminal();
+			if (cleanup.altScreenActive) {
+				cleanup.stop();
+			}
+			process.stdout.write = originalWrite;
+		}
+	});
+
+	it("only hands a preserved alternate screen to one terminal instance", () => {
+		const originalWrite = process.stdout.write;
+		const writes: string[] = [];
+		const patchedWrite = ((...args: Parameters<typeof process.stdout.write>): boolean => {
+			const chunk = args[0];
+			writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+			const callback = args.find((arg): arg is (error?: Error | null) => void => typeof arg === "function");
+			callback?.();
+			return true;
+		}) as typeof process.stdout.write;
+
+		process.stdout.write = patchedWrite;
+		try {
+			const first = new ProcessTerminal();
+			first.enterAltScreen();
+			first.stop({ preserveAltScreen: true });
+
+			const second = new ProcessTerminal();
+			const third = new ProcessTerminal();
+			assert.equal(second.altScreenActive, true);
+			assert.equal(third.altScreenActive, false);
+
+			second.stop();
+			assert.equal(writes.filter((write) => write === "\x1b[?1049l").length, 1);
+		} finally {
+			const cleanup = new ProcessTerminal();
+			if (cleanup.altScreenActive) {
+				cleanup.stop();
+			}
+			process.stdout.write = originalWrite;
+		}
+	});
+});

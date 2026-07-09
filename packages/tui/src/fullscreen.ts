@@ -8,7 +8,12 @@
 import { isImageLine } from "./terminal-image.js";
 import { sliceByColumn, stripAnsi, visibleWidth } from "./utils.js";
 
-const MIN_TRANSCRIPT_ROWS = 3;
+export const FULLSCREEN_MIN_TRANSCRIPT_ROWS = 3;
+
+export function clippedFullscreenDockHeight(dockLength: number, height: number): number {
+	const maxDock = Math.max(0, height - FULLSCREEN_MIN_TRANSCRIPT_ROWS);
+	return Math.min(dockLength, maxDock);
+}
 
 // Kitty images span multiple physical rows and cannot be clipped to a window.
 const IMAGE_PLACEHOLDER = "\x1b[2m[image — view in inline mode]\x1b[0m";
@@ -71,10 +76,10 @@ export class FullscreenViewport {
 	 */
 	composeFrame(transcript: string[], dock: string[], height: number): string[] {
 		let dockLines = dock;
-		const maxDock = Math.max(0, height - MIN_TRANSCRIPT_ROWS);
-		if (dockLines.length > maxDock) {
+		const dockHeight = clippedFullscreenDockHeight(dockLines.length, height);
+		if (dockLines.length > dockHeight) {
 			// bottom of the dock (editor + footer) wins over widgets above it
-			dockLines = dockLines.slice(dockLines.length - maxDock);
+			dockLines = dockLines.slice(dockLines.length - dockHeight);
 		}
 		const windowHeight = height - dockLines.length;
 		const maxScroll = Math.max(0, transcript.length - windowHeight);

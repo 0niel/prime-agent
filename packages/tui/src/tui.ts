@@ -72,6 +72,23 @@ export interface Component {
 	invalidate(): void;
 }
 
+export interface TuiStopOptions {
+	preserveAltScreen?: boolean;
+	flushFullscreen?: boolean;
+}
+
+export interface FullscreenOptions {
+	scroll: Component[];
+	dock: Component;
+	mouse?: boolean;
+	viewportControls?: boolean;
+}
+
+interface ExitFullscreenOptions {
+	flush?: boolean;
+	leaveAltScreen?: boolean;
+}
+
 type InputListenerResult = { consume?: boolean; data?: string } | undefined;
 type InputListener = (data: string) => InputListenerResult;
 
@@ -291,6 +308,7 @@ export class TUI extends Container {
 		scroll: Component[];
 		dock: Component;
 		mouse: boolean;
+		viewportControls: boolean;
 		inlineState: {
 			previousLines: string[];
 			previousKittyImageIds: Set<number>;
@@ -531,16 +549,17 @@ export class TUI extends Container {
 		this.terminal.write("\x1b[16t");
 	}
 
-	stop(): void {
-		// before the exit bookkeeping below, which assumes the primary screen
-		this.exitFullscreen();
+	stop(options: TuiStopOptions = {}): void {
+		const preserveAltScreen = options.preserveAltScreen === true && this.terminal.altScreenActive;
+		const flushFullscreen = options.flushFullscreen ?? !preserveAltScreen;
+		this.exitFullscreen({ flush: flushFullscreen, leaveAltScreen: !preserveAltScreen });
 		this.stopped = true;
 		if (this.renderTimer) {
 			clearTimeout(this.renderTimer);
 			this.renderTimer = undefined;
 		}
 		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
-		if (this.previousLines.length > 0) {
+		if (!preserveAltScreen && this.previousLines.length > 0) {
 			const targetRow = this.previousLines.length; // Line after the last content
 			const lineDiff = targetRow - this.hardwareCursorRow;
 			if (lineDiff > 0) {
@@ -551,8 +570,12 @@ export class TUI extends Container {
 			this.terminal.write("\r\n");
 		}
 
-		this.terminal.showCursor();
-		this.terminal.stop();
+		if (preserveAltScreen) {
+			this.terminal.hideCursor();
+		} else {
+			this.terminal.showCursor();
+		}
+		this.terminal.stop({ preserveAltScreen });
 	}
 
 	requestRender(force = false): void {
@@ -604,13 +627,14 @@ export class TUI extends Container {
 	 * Wheel tracking is enabled blind — probing is not viable (tmux never
 	 * answers DECRQM) and unsupporting terminals ignore the mode-sets.
 	 */
-	enterFullscreen(options: { scroll: Component[]; dock: Component; mouse?: boolean }): void {
+	enterFullscreen(options: FullscreenOptions): void {
 		if (this.fullscreen) return;
 		this.fullscreen = {
 			viewport: new FullscreenViewport(),
 			scroll: options.scroll,
 			dock: options.dock,
 			mouse: options.mouse !== false,
+			viewportControls: options.viewportControls !== false,
 			inlineState: {
 				previousLines: this.previousLines,
 				previousKittyImageIds: this.previousKittyImageIds,
@@ -632,12 +656,14 @@ export class TUI extends Container {
 	 * Leave fullscreen. The inline differ resumes against the entry snapshot,
 	 * so content produced while fullscreen flows into native scrollback.
 	 */
-	exitFullscreen(): void {
+	exitFullscreen(options: ExitFullscreenOptions = {}): void {
 		if (!this.fullscreen) return;
 		const { inlineState } = this.fullscreen;
 		this.fullscreen = null;
 		this.syncFullscreenMouseTracking();
-		this.terminal.leaveAltScreen();
+		if (options.leaveAltScreen !== false) {
+			this.terminal.leaveAltScreen();
+		}
 		this.previousLines = inlineState.previousLines;
 		this.previousKittyImageIds = inlineState.previousKittyImageIds;
 		this.previousWidth = inlineState.previousWidth;
@@ -647,7 +673,7 @@ export class TUI extends Container {
 		this.maxLinesRendered = inlineState.maxLinesRendered;
 		this.previousViewportTop = inlineState.previousViewportTop;
 		// synchronous so the flush also happens on shutdown, where a scheduled render never fires
-		if (!this.stopped) {
+		if (options.flush !== false && !this.stopped) {
 			this.doRender();
 		}
 	}
@@ -821,7 +847,7 @@ export class TUI extends Container {
 			return true;
 		}
 
-		if (overlayFocused) return false;
+		if (overlayFocused || !fullscreen.viewportControls) return false;
 
 		const keybindings = getKeybindings();
 		if (keybindings.matches(data, "tui.viewport.pageUp")) {
@@ -1268,7 +1294,7 @@ export class TUI extends Container {
 
 		let frame = fullscreen.viewport.composeFrame(transcript, dock, height);
 		const scrollInfo = fullscreen.viewport.scrollInfo();
-		if (!scrollInfo.following) {
+		if (fullscreen.viewportControls && !scrollInfo.following) {
 			// Follow hint composited over the bottom of the transcript window,
 			// just above the dock. Overlays still paint on top of it.
 			const followKey = getKeybindings().getKeys("tui.viewport.follow")[0] ?? "alt+down";

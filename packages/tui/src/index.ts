@@ -30,7 +30,12 @@ export { TruncatedText } from "./components/truncated-text.js";
 // Editor component interface (for custom editors)
 export type { EditorComponent, EditorPasteSnapshot } from "./editor-component.js";
 // Fullscreen (alternate-screen) viewport
-export { FullscreenViewport, type ScrollInfo } from "./fullscreen.js";
+export {
+	clippedFullscreenDockHeight,
+	FULLSCREEN_MIN_TRANSCRIPT_ROWS,
+	FullscreenViewport,
+	type ScrollInfo,
+} from "./fullscreen.js";
 // Fuzzy matching
 export { type FuzzyMatch, fuzzyFilter, fuzzyFilterScored, fuzzyMatch, type ScoredItem } from "./fuzzy.js";
 // Keybindings
@@ -76,7 +81,7 @@ export { VersionedRenderCache } from "./render-cache.js";
 // Input buffering for batch splitting
 export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.js";
 // Terminal interface and implementations
-export { ProcessTerminal, type Terminal } from "./terminal.js";
+export { ProcessTerminal, type Terminal, type TerminalStopOptions } from "./terminal.js";
 export {
 	bestAnsiColor,
 	blendColor,
@@ -132,6 +137,7 @@ export {
 	Container,
 	CURSOR_MARKER,
 	type Focusable,
+	type FullscreenOptions,
 	isFocusable,
 	type OverlayAnchor,
 	type OverlayHandle,
@@ -139,6 +145,7 @@ export {
 	type OverlayOptions,
 	type SizeValue,
 	TUI,
+	type TuiStopOptions,
 } from "./tui.js";
 // Utilities
 export { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "./utils.js";

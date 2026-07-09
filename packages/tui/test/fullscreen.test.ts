@@ -1,5 +1,6 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
+import type { TerminalStopOptions } from "../src/terminal.js";
 import { type Component, TUI } from "../src/tui.js";
 import { VirtualTerminal } from "./virtual-terminal.js";
 
@@ -20,10 +21,16 @@ class InputComponent extends TestComponent {
 
 class LoggingVirtualTerminal extends VirtualTerminal {
 	private writes: string[] = [];
+	lastStopOptions: TerminalStopOptions | undefined;
 
 	override write(data: string): void {
 		this.writes.push(data);
 		super.write(data);
+	}
+
+	override stop(options?: TerminalStopOptions): void {
+		this.lastStopOptions = options;
+		super.stop(options);
 	}
 
 	getWrites(): string {
@@ -622,6 +629,66 @@ describe("TUI fullscreen mode", () => {
 		await terminal.waitForRender();
 
 		assert.deepStrictEqual(received, ["a"], "only keyboard input reaches the editor");
+
+		tui.stop();
+	});
+
+	it("can stop without leaving alt screen or flushing fullscreen content", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(30));
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.clearWrites();
+		tui.stop({ preserveAltScreen: true, flushFullscreen: false });
+		await terminal.flush();
+
+		assert.strictEqual(tui.isFullscreen(), false);
+		assert.strictEqual(terminal.getActiveBufferType(), "alternate");
+		assert.strictEqual(terminal.mouseTrackingActive, false);
+		assert.ok(!terminal.getWrites().includes("\x1b[?1049l"));
+		assert.ok(!terminal.getWrites().includes("Line 29"));
+
+		const next = new TUI(terminal);
+		const nextContent = new TestComponent();
+		nextContent.lines = ["Agents View"];
+		const nextDock = new TestComponent();
+		nextDock.lines = ["> prompt"];
+		next.start();
+		next.enterFullscreen({ scroll: [nextContent], dock: nextDock, mouse: false });
+		await terminal.waitForRender();
+
+		const viewport = terminal.getViewport();
+		assert.strictEqual(viewport[0], "Agents View");
+		assert.strictEqual(viewport.at(-1), "> prompt");
+
+		next.stop({ flushFullscreen: false });
+		await terminal.flush();
+		assert.strictEqual(terminal.getActiveBufferType(), "normal");
+	});
+
+	it("ignores preserve requests when no alternate screen is active", async () => {
+		const { terminal, tui } = setup(lines(3));
+		await terminal.waitForRender();
+
+		terminal.clearWrites();
+		tui.stop({ preserveAltScreen: true });
+		await terminal.flush();
+
+		assert.strictEqual(terminal.getActiveBufferType(), "normal");
+		assert.strictEqual(terminal.lastStopOptions?.preserveAltScreen, false);
+	});
+
+	it("can pass viewport keys to the focused component", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20));
+		const input = new InputComponent();
+		tui.setFocus(input);
+		tui.enterFullscreen({ scroll: [chat], dock, viewportControls: false });
+		await terminal.waitForRender();
+
+		terminal.sendInput(PAGE_UP);
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(input.inputs, [PAGE_UP]);
 
 		tui.stop();
 	});

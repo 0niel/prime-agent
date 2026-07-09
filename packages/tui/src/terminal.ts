@@ -17,6 +17,17 @@ const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
 
+// A preserved alternate screen is adopted by the next ProcessTerminal during in-process handoff.
+let pendingAltScreenHandoff: symbol | undefined;
+
+function consumeAltScreenHandoff(): boolean {
+	if (!pendingAltScreenHandoff) {
+		return false;
+	}
+	pendingAltScreenHandoff = undefined;
+	return true;
+}
+
 /**
  * Minimal terminal interface for TUI
  */
@@ -25,7 +36,7 @@ export interface Terminal {
 	start(onInput: (data: string) => void, onResize: () => void): void;
 
 	// Stop the terminal and restore state
-	stop(): void;
+	stop(options?: TerminalStopOptions): void;
 
 	/**
 	 * Drain stdin before exiting to prevent Kitty key release events from
@@ -76,6 +87,10 @@ export interface Terminal {
 	setProgress(active: boolean): void;
 }
 
+export interface TerminalStopOptions {
+	preserveAltScreen?: boolean;
+}
+
 /**
  * Real terminal using process.stdin/stdout
  */
@@ -85,7 +100,8 @@ export class ProcessTerminal implements Terminal {
 	private resizeHandler?: () => void;
 	private _kittyProtocolActive = false;
 	private _modifyOtherKeysActive = false;
-	private _altScreenActive = false;
+	private readonly altScreenHandoffToken = Symbol("altScreenHandoff");
+	private _altScreenActive = consumeAltScreenHandoff();
 	private _mouseTrackingActive = false;
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
@@ -341,21 +357,26 @@ export class ProcessTerminal implements Terminal {
 		}
 	}
 
-	stop(): void {
+	stop(options: TerminalStopOptions = {}): void {
 		this.finishDefaultColorProbe();
 
 		if (this.clearProgressInterval()) {
 			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		}
 
-		// never strand the user on the alt screen or with mouse tracking on
 		if (this._mouseTrackingActive) {
 			process.stdout.write("\x1b[?1006l\x1b[?1002l");
 			this._mouseTrackingActive = false;
 		}
 		if (this._altScreenActive) {
-			process.stdout.write("\x1b[?1049l");
-			this._altScreenActive = false;
+			if (options.preserveAltScreen) {
+				pendingAltScreenHandoff = this.altScreenHandoffToken;
+				this._altScreenActive = false;
+			} else {
+				this.releaseAltScreen();
+			}
+		} else if (!options.preserveAltScreen) {
+			this.releaseAltScreen();
 		}
 
 		// Disable bracketed paste mode
@@ -452,18 +473,35 @@ export class ProcessTerminal implements Terminal {
 
 	enterAltScreen(): void {
 		if (this._altScreenActive) return;
+		if (this.ownsPendingAltScreenHandoff()) {
+			pendingAltScreenHandoff = undefined;
+			this._altScreenActive = true;
+			return;
+		}
 		this._altScreenActive = true;
 		this.write("\x1b[?1049h");
 	}
 
 	leaveAltScreen(): void {
-		if (!this._altScreenActive) return;
+		this.releaseAltScreen();
+	}
+
+	private releaseAltScreen(): void {
+		const ownsPendingHandoff = this.ownsPendingAltScreenHandoff();
+		if (!this._altScreenActive && !ownsPendingHandoff) return;
 		this._altScreenActive = false;
+		if (ownsPendingHandoff) {
+			pendingAltScreenHandoff = undefined;
+		}
 		this.write("\x1b[?1049l");
 	}
 
 	get altScreenActive(): boolean {
 		return this._altScreenActive;
+	}
+
+	private ownsPendingAltScreenHandoff(): boolean {
+		return pendingAltScreenHandoff === this.altScreenHandoffToken;
 	}
 
 	setMouseTracking(enabled: boolean): void {

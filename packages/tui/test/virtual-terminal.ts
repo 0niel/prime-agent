@@ -1,6 +1,6 @@
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import xterm from "@xterm/headless";
-import type { Terminal } from "../src/terminal.js";
+import type { Terminal, TerminalStopOptions } from "../src/terminal.js";
 
 // Extract Terminal class from the module
 const XtermTerminal = xterm.Terminal;
@@ -42,7 +42,7 @@ export class VirtualTerminal implements Terminal {
 		// No-op for virtual terminal - no stdin to drain
 	}
 
-	stop(): void {
+	stop(_options?: TerminalStopOptions): void {
 		// Disable bracketed paste mode
 		this.xterm.write("\x1b[?2004l");
 		this.inputHandler = undefined;
