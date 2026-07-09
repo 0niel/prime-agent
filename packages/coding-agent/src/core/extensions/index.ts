@@ -4,6 +4,12 @@
 
 export type { SlashCommandInfo, SlashCommandSource } from "../slash-commands.js";
 export type { SourceInfo } from "../source-info.js";
+// Built-in extensions
+export {
+	createHerdrAgentStateExtension,
+	hasFileBasedHerdrIntegration,
+	herdrAgentStateExtension,
+} from "./builtin/herdr-agent-state.js";
 export {
 	createExtensionRuntime,
 	discoverAndLoadExtensions,

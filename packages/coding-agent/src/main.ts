@@ -733,6 +733,9 @@ async function prepareRuntimeServices(options: {
 		agentDir: effectiveAgentDir,
 		authStorage,
 		extensionFlagValues: new Map(Object.entries(config.extensionFlagValues ?? {})),
+		// Subagents share the parent's Herdr pane; their own reporter would race
+		// the parent's and a subagent quit would release the still-active pane.
+		noBuiltinHerdrReporter: (options.sessionOptionsOverride?.rlmDepth ?? 0) > 0,
 		resourceLoaderOptions: {
 			additionalExtensionPaths: config.extensions,
 			additionalSkillPaths: config.skills,
