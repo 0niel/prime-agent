@@ -82,7 +82,7 @@ describe("InteractiveMode update notifications", () => {
 		initTheme("dark");
 	});
 
-	test("shows the Prime Agent update command in one compact line", () => {
+	test("shows the slash update command in one compact line", () => {
 		const chatContainer = new Container();
 		const fakeThis = {
 			chatContainer,
@@ -96,7 +96,8 @@ describe("InteractiveMode update notifications", () => {
 		expect(output.split("\n")).toHaveLength(1);
 		expect(output).toContain("Update available:");
 		expect(output).toContain("v1.2.3");
-		expect(output).toContain("prime-agent update");
+		expect(output).toContain("/update");
+		expect(output).not.toContain("prime-agent update");
 		expect(output).not.toContain("pi update");
 		expect(output).not.toContain("Changelog:");
 	});
@@ -115,7 +116,8 @@ describe("InteractiveMode update notifications", () => {
 		expect(output.split("\n")).toHaveLength(1);
 		expect(output).toContain("Package updates available:");
 		expect(output).toContain("npm:@foo/bar");
-		expect(output).toContain("prime-agent update --extensions");
+		expect(output).toContain("/update --extensions");
+		expect(output).not.toContain("prime-agent update");
 		expect(output).not.toContain("pi update");
 	});
 });

@@ -49,12 +49,15 @@ import {
 } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "child_process";
 import {
+	APP_NAME,
 	APP_TITLE,
 	getAgentDir,
 	getAgentTracesLogPath,
 	getDebugLogPath,
 	getLogsDir,
 	getShareViewerUrl,
+	SELF_UPDATE_INTERACTIVE_CHILD_ENV,
+	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 	VERSION,
 } from "../../config.js";
 import {
@@ -86,6 +89,7 @@ import {
 } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
 import { resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
+import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { parseSkillBlock } from "../../core/skill-blocks.js";
@@ -472,6 +476,51 @@ function getPayloadWorkingIndicatorOptions(
 	};
 }
 
+function updateArgsIncludeSelf(args: readonly string[]): boolean {
+	let selfFlag = false;
+	let extensionsOnlyFlag = false;
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (arg === "--self") {
+			selfFlag = true;
+		} else if (arg === "--extensions") {
+			extensionsOnlyFlag = true;
+		} else if (arg === "--extension") {
+			extensionsOnlyFlag = true;
+			index++;
+		}
+	}
+	if (selfFlag) {
+		return true;
+	}
+	if (extensionsOnlyFlag) {
+		return false;
+	}
+	const positional = args.find((arg) => !arg.startsWith("-"));
+	if (!positional) {
+		return true;
+	}
+	const normalized = positional.toLowerCase();
+	return normalized === "self" || normalized === "pi" || normalized === APP_NAME.toLowerCase();
+}
+
+function argsIncludeSessionSelection(args: readonly string[]): boolean {
+	for (const arg of args) {
+		if (arg === "--resume" || arg === "-r" || arg === "--continue" || arg === "-c" || arg === "--fork") {
+			return true;
+		}
+	}
+	return false;
+}
+
+export function buildUpdateRelaunchArgs(args: readonly string[], sessionFile: string | undefined): string[] {
+	const relaunchArgs = [...args];
+	if (sessionFile && !argsIncludeSessionSelection(relaunchArgs)) {
+		relaunchArgs.push("--resume", sessionFile);
+	}
+	return relaunchArgs;
+}
+
 /**
  * Options for InteractiveMode initialization.
  */
@@ -770,7 +819,6 @@ export class InteractiveMode {
 		this.childAgentSummary.onCancel = () => this.focusEditor();
 		this.childAgentSummary.onExit = () => this.handleSubagentSummaryExit();
 		this.childAgentSummary.onChatAction = (data) => this.handleSubagentSummaryChatAction(data);
-		this.childAgentSummary.onUnhandledInput = (data) => this.handleSubagentSummaryUnhandledInput(data);
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
@@ -3603,6 +3651,7 @@ export class InteractiveMode {
 			text = text.trim();
 			if (!text) return;
 			const promptStashToRestore = this.promptStash;
+			let restorePromptStashAfterSubmit = true;
 
 			try {
 				const slashCommand = parseSlashCommand(text);
@@ -3721,6 +3770,7 @@ export class InteractiveMode {
 				}
 				if (commandName === "tree" && !commandArgs) {
 					this.editor.setText("");
+					restorePromptStashAfterSubmit = false;
 					await this.showTreeSelector();
 					return;
 				}
@@ -3759,6 +3809,19 @@ export class InteractiveMode {
 				if (commandName === "reload" && !commandArgs) {
 					this.editor.setText("");
 					await this.handleReloadCommand();
+					return;
+				}
+				if (commandName === "update") {
+					this.editor.setText("");
+					const updateArgs = parseCommandArgs(commandArgs);
+					if (
+						!updateArgsIncludeSelf(updateArgs) &&
+						(this.isAgentCompacting() || this.isAgentStreaming() || this.isBashRunning())
+					) {
+						this.showWarning("Wait for the current work to finish before updating.");
+						return;
+					}
+					await this.handleUpdateCommand(commandArgs);
 					return;
 				}
 				if (commandName === "fullscreen") {
@@ -3866,7 +3929,7 @@ export class InteractiveMode {
 				}
 				this.editor.addToHistory?.(text);
 			} finally {
-				if (promptStashToRestore !== undefined) {
+				if (restorePromptStashAfterSubmit && promptStashToRestore !== undefined) {
 					this.restorePromptStashIfEditorEmpty(promptStashToRestore);
 				}
 			}
@@ -4707,23 +4770,19 @@ export class InteractiveMode {
 		this.focusEditor();
 	}
 
-	private handleSubagentSummaryUnhandledInput(data: string): void {
-		this.focusEditor();
-		this.editor.handleInput(data);
-	}
-
 	// Chat actions stay live while the subagent list holds focus; the editor's
 	// own handlers are bypassed because input routes only to the focused list.
-	private handleSubagentSummaryChatAction(data: string): boolean {
+	private handleSubagentSummaryChatAction(data: string): void {
 		if (this.keybindings.matches(data, "app.tools.expand")) {
 			this.toggleToolOutputExpansion();
-			return true;
+			return;
 		}
 		if (this.keybindings.matches(data, "app.thinking.toggle")) {
 			this.toggleThinkingBlockVisibility();
-			return true;
+			return;
 		}
-		return false;
+		this.focusEditor();
+		this.editor.handleInput(data);
 	}
 
 	private getTrayOverrideLabel(): string | undefined {
@@ -7156,6 +7215,89 @@ export class InteractiveMode {
 	// =========================================================================
 	// Command handlers
 	// =========================================================================
+
+	private async handleUpdateCommand(args: string): Promise<void> {
+		const entrypoint = process.argv[1];
+		if (!entrypoint) {
+			this.showError("Cannot determine current CLI entrypoint for update");
+			return;
+		}
+
+		const updateArgs = parseCommandArgs(args);
+		const includesSelf = updateArgsIncludeSelf(updateArgs);
+		const updateCwd = this.getCurrentCwd();
+		this.stopWorkingLoader();
+		await this.ui.terminal.drainInput(1000).catch(() => undefined);
+		this.ui.stop();
+
+		const updateEnv = includesSelf ? { ...process.env, [SELF_UPDATE_INTERACTIVE_CHILD_ENV]: "1" } : process.env;
+		const updateResult = spawnSync(process.execPath, [...process.execArgv, entrypoint, "update", ...updateArgs], {
+			stdio: "inherit",
+			cwd: updateCwd,
+			env: updateEnv,
+		});
+		const updateExitCode = updateResult.status ?? (updateResult.signal ? 1 : 0);
+		const selfUpdateNotAttempted =
+			includesSelf && !updateResult.error && updateExitCode === SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE;
+
+		if (includesSelf && !selfUpdateNotAttempted) {
+			const relaunchArgs = buildUpdateRelaunchArgs(process.argv.slice(2), this.connectionState?.sessionFile);
+			if (updateResult.error) {
+				console.error(`Update failed: ${updateResult.error.message}`);
+				console.error(`Relaunching ${APP_NAME}...`);
+			} else if (updateExitCode !== 0) {
+				console.error(
+					updateResult.signal
+						? `Update terminated by signal ${updateResult.signal}`
+						: `Update exited with code ${updateExitCode}`,
+				);
+				console.error(`Relaunching ${APP_NAME}...`);
+			}
+			this.stop();
+			await this.agentConnection.dispose().catch(() => undefined);
+			try {
+				await this.options.onShutdown?.();
+			} catch {
+				// The update already completed; do not block relaunch on local teardown.
+			}
+			const relaunchResult = spawnSync(process.execPath, [...process.execArgv, entrypoint, ...relaunchArgs], {
+				stdio: "inherit",
+				cwd: updateCwd,
+				env: process.env,
+			});
+			if (relaunchResult.error) {
+				console.error(`Failed to relaunch ${APP_NAME}: ${relaunchResult.error.message}`);
+				process.exit(1);
+			}
+			process.exit(relaunchResult.status ?? (relaunchResult.signal ? 1 : 0));
+		}
+
+		this.ui.start();
+		if (this.fullscreenEnabled) {
+			this.applyFullscreen(true);
+		}
+		this.ui.requestRender(true);
+
+		if (selfUpdateNotAttempted) {
+			this.showStatus(`Update did not change ${APP_NAME}. Reloading resources...`);
+			await this.handleReloadCommand();
+			return;
+		}
+		if (updateResult.error) {
+			this.showError(`Update failed: ${updateResult.error.message}`);
+			return;
+		}
+		if (updateExitCode !== 0) {
+			this.showError(
+				updateResult.signal
+					? `Update terminated by signal ${updateResult.signal}`
+					: `Update exited with code ${updateExitCode}`,
+			);
+			return;
+		}
+		this.showStatus("Packages updated. Reloading resources...");
+		await this.handleReloadCommand();
+	}
 
 	private async handleReloadCommand(): Promise<void> {
 		if (this.isAgentStreaming()) {

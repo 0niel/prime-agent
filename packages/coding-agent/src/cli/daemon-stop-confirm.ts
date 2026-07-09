@@ -45,8 +45,8 @@ export interface DaemonSessionLossCopy {
  * Returns true when it is safe to proceed with stopping the daemon: it is not
  * reachable, `force` is set, no sessions are busy, or the user confirmed at a
  * TTY. Returns false to abort (busy/unlistable and either declined or non-TTY).
- * Only busy sessions (streaming, compacting, or pending messages) lose work;
- * idle loaded sessions reload from disk on the fresh daemon.
+ * Only busy sessions (streaming, compacting, running bash, or pending messages)
+ * require confirmation; idle loaded sessions are restored from disk.
  */
 export async function confirmDaemonSessionLoss(
 	probe: RunningDaemonProbe,

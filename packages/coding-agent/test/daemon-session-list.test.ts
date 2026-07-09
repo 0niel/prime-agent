@@ -71,6 +71,7 @@ describe("buildSessionList", () => {
 			[],
 		);
 		expect(entries[0]?.activity).toBe("working");
+		expect(entries[0]?.hasRunningRlmChildren).toBe(true);
 	});
 
 	it("counts accepted in-flight agent prompts as pending work", () => {

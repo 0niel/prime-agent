@@ -28,7 +28,7 @@ import {
 	type ShouldStopAfterTurnContext,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, ImageContent, Model, TextContent, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ImageContent, Model, TextContent, Usage, UserMessage } from "@earendil-works/pi-ai";
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
@@ -398,20 +398,25 @@ export interface PromptOptions {
 	preflightResult?: (success: boolean, queued?: boolean) => void;
 	/** Queue instead of starting immediately when the session is idle but already has queued work. */
 	queueIfBusy?: boolean;
+	/** Skip extension input handlers for replaying already-accepted input. */
+	skipInputHandlers?: boolean;
+	agentMessageId?: string;
+	content?: (TextContent | ImageContent)[];
 }
 
 interface InternalPromptOptions extends PromptOptions {
 	skipPrePromptWork?: boolean;
-	skipInputHandlers?: boolean;
 	returnAfterAccepted?: boolean;
 	agentMessageId?: string;
 }
+
+type QueuedAgentMessage = UserMessage | CustomMessage;
 
 interface QueuedSteeringMessage {
 	text: string;
 	previewLabel?: string;
 	agentMessageId?: string;
-	message: AgentMessage;
+	message: QueuedAgentMessage;
 }
 
 interface QueuedFollowUpMessage {
@@ -419,7 +424,54 @@ interface QueuedFollowUpMessage {
 	previewLabel?: string;
 	queueKey?: string;
 	agentMessageId?: string;
-	message: AgentMessage;
+	message: QueuedAgentMessage;
+}
+
+export interface QueuedAgentInputSnapshot {
+	text: string;
+	content?: (TextContent | ImageContent)[];
+	images?: ImageContent[];
+	queueKey?: string;
+	agentMessageId?: string;
+	customMessage?: CustomMessage;
+}
+
+export interface AcceptedAgentInputSnapshot extends QueuedAgentInputSnapshot {
+	nextTurn: CustomMessage[];
+}
+
+function cloneCustomMessage(message: CustomMessage): CustomMessage {
+	return {
+		...message,
+		content: Array.isArray(message.content) ? message.content.map((block) => ({ ...block })) : message.content,
+	};
+}
+
+function createQueuedAgentInputSnapshotFromUserMessage(
+	text: string,
+	message: QueuedAgentMessage,
+): QueuedAgentInputSnapshot {
+	if (message.role === "custom") {
+		return { text, customMessage: cloneCustomMessage(message) };
+	}
+	const messageContent = message.content;
+	if (!Array.isArray(messageContent)) {
+		return { text };
+	}
+	const content = messageContent.map((block) => ({ ...block }));
+	const images = content.filter((block): block is ImageContent => block.type === "image");
+	return { text, content, ...(images.length > 0 ? { images } : {}) };
+}
+
+function createQueuedAgentInputSnapshot(
+	message: QueuedSteeringMessage | QueuedFollowUpMessage,
+): QueuedAgentInputSnapshot {
+	const snapshot = createQueuedAgentInputSnapshotFromUserMessage(message.text, message.message);
+	return {
+		...snapshot,
+		...(message.agentMessageId ? { agentMessageId: message.agentMessageId } : {}),
+		...("queueKey" in message && message.queueKey ? { queueKey: message.queueKey } : {}),
+	};
 }
 
 function queuedMessagePreview(message: { text: string; previewLabel?: string }): string {
@@ -440,15 +492,20 @@ function injectedMessagePreviewLabel(message: CustomMessage): string | undefined
 interface AcceptedAgentMessagePrompt {
 	text: string;
 	agentMessageId: string;
-	message: AgentMessage;
+	message: UserMessage;
 	messages: Set<AgentMessage>;
 	/** Pending nextTurn messages drained into this prompt; restored to the queue if the prompt is cleared. */
 	pendingNextTurnMessages: CustomMessage[];
+	deliveredPendingNextTurnMessages: Set<CustomMessage>;
 	accepted: Promise<void>;
 	resolveAccepted: () => void;
 	rejectAccepted: (error: Error) => void;
 	turnStarted: boolean;
 	cleared: boolean;
+}
+
+function undeliveredPendingNextTurnMessages(accepted: AcceptedAgentMessagePrompt): CustomMessage[] {
+	return accepted.pendingNextTurnMessages.filter((message) => !accepted.deliveredPendingNextTurnMessages.has(message));
 }
 
 interface AgentMessageDeliveryWaiter {
@@ -1739,6 +1796,13 @@ export class AgentSession {
 			} else if (acceptedPrompt.turnStarted) {
 				acceptedPrompt.messages.add(event.message);
 			}
+			if (
+				event.type === "message_end" &&
+				event.message.role === "custom" &&
+				acceptedPrompt.pendingNextTurnMessages.includes(event.message)
+			) {
+				acceptedPrompt.deliveredPendingNextTurnMessages.add(event.message);
+			}
 			if (acceptedPrompt.cleared && acceptedPrompt.messages.has(event.message)) {
 				// Membership filter, not a positional slice: newer prompts or compaction may
 				// have rewritten state.messages since the clear.
@@ -2366,7 +2430,7 @@ export class AgentSession {
 			skipInputHandlers: true,
 			skipPrePromptWork: true,
 			returnAfterAccepted: true,
-			agentMessageId: parseAgentSessionMessagePromptId(text),
+			agentMessageId: options?.agentMessageId ?? parseAgentSessionMessagePromptId(text),
 		});
 	}
 
@@ -2658,8 +2722,10 @@ export class AgentSession {
 					messages.push(msg);
 				}
 				this._pendingNextTurnMessages = [];
-				const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
-				if (currentImages) {
+				const userContent: (TextContent | ImageContent)[] = options?.content
+					? options.content.map((block) => ({ ...block }))
+					: [{ type: "text", text: expandedText }];
+				if (!options?.content && currentImages) {
 					userContent.push(...currentImages);
 				}
 				const userMessage: AgentMessage = {
@@ -2681,6 +2747,7 @@ export class AgentSession {
 						message: userMessage,
 						messages: new Set<AgentMessage>([...drainedNextTurnMessages, userMessage]),
 						pendingNextTurnMessages: drainedNextTurnMessages,
+						deliveredPendingNextTurnMessages: new Set(),
 						accepted,
 						resolveAccepted,
 						rejectAccepted,
@@ -2706,8 +2773,10 @@ export class AgentSession {
 				this._pendingNextTurnMessages = [];
 
 				// Add user message
-				const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
-				if (currentImages) {
+				const userContent: (TextContent | ImageContent)[] = options?.content
+					? options.content.map((block) => ({ ...block }))
+					: [{ type: "text", text: expandedText }];
+				if (!options?.content && currentImages) {
 					userContent.push(...currentImages);
 				}
 				const userMessage: AgentMessage = {
@@ -2837,7 +2906,9 @@ export class AgentSession {
 				// The prompt was never accepted, so next-turn context drained for it
 				// was not consumed by the model and must remain available to retry.
 				this._pendingNextTurnMessages.unshift(
-					...acceptedAgentMessagePrompt.pendingNextTurnMessages.map((message) => ({ ...message })),
+					...undeliveredPendingNextTurnMessages(acceptedAgentMessagePrompt).map((message) => ({
+						...message,
+					})),
 				);
 			}
 			reportPreflight(false);
@@ -2961,7 +3032,11 @@ export class AgentSession {
 	 * @param images Optional image attachments to include with the message
 	 * @throws Error if text is an extension command
 	 */
-	async followUp(text: string, images?: ImageContent[], options: { queueKey?: string } = {}): Promise<boolean> {
+	async followUp(
+		text: string,
+		images?: ImageContent[],
+		options: { queueKey?: string; agentMessageId?: string } = {},
+	): Promise<boolean> {
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -2971,7 +3046,44 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		return this._queueFollowUp(expandedText, images, { queueKey: options.queueKey });
+		return this._queueFollowUp(expandedText, images, {
+			queueKey: options.queueKey,
+			agentMessageId: options.agentMessageId,
+		});
+	}
+
+	async restoreSteeringMessage(
+		text: string,
+		images?: ImageContent[],
+		options: {
+			agentMessageId?: string;
+			content?: (TextContent | ImageContent)[];
+			customMessage?: CustomMessage;
+		} = {},
+	): Promise<void> {
+		await this._queueSteer(text, images, {
+			agentMessageId: options.agentMessageId,
+			content: options.content,
+			message: options.customMessage,
+		});
+	}
+
+	async restoreFollowUpMessage(
+		text: string,
+		images?: ImageContent[],
+		options: {
+			queueKey?: string;
+			agentMessageId?: string;
+			content?: (TextContent | ImageContent)[];
+			customMessage?: CustomMessage;
+		} = {},
+	): Promise<boolean> {
+		return this._queueFollowUp(text, images, {
+			queueKey: options.queueKey,
+			agentMessageId: options.agentMessageId,
+			content: options.content,
+			message: options.customMessage,
+		});
 	}
 
 	private _buildPromptContent(
@@ -3060,18 +3172,18 @@ export class AgentSession {
 		options: {
 			agentMessageId?: string;
 			content?: (TextContent | ImageContent)[];
-			message?: AgentMessage;
+			message?: QueuedAgentMessage;
 			previewLabel?: string;
 		} = {},
 	): Promise<void> {
 		const content = options.content ?? this._buildPromptContent(text, images);
-		const message: AgentMessage =
+		const message: QueuedAgentMessage =
 			options.message ??
 			({
 				role: "user",
 				content,
 				timestamp: Date.now(),
-			} satisfies AgentMessage);
+			} satisfies UserMessage);
 		this._steeringMessages.push({
 			text,
 			previewLabel: options.previewLabel,
@@ -3092,7 +3204,7 @@ export class AgentSession {
 			queueKey?: string;
 			agentMessageId?: string;
 			content?: (TextContent | ImageContent)[];
-			message?: AgentMessage;
+			message?: QueuedAgentMessage;
 			previewLabel?: string;
 		} = {},
 	): Promise<boolean> {
@@ -3100,13 +3212,13 @@ export class AgentSession {
 			return false;
 		}
 		const content = options.content ?? this._buildPromptContent(text, images);
-		const message: AgentMessage =
+		const message: QueuedAgentMessage =
 			options.message ??
 			({
 				role: "user",
 				content,
 				timestamp: Date.now(),
-			} satisfies AgentMessage);
+			} satisfies UserMessage);
 		this._followUpMessages.push({
 			text,
 			previewLabel: options.previewLabel,
@@ -3286,7 +3398,9 @@ export class AgentSession {
 			this.agent.state.messages = this.agent.state.messages.filter((message) => !accepted.messages.has(message));
 			// Restore drained nextTurn messages the model never saw. Clones, so the cleared
 			// run's late-event cleanup cannot strip the restored copies from a newer run.
-			this._pendingNextTurnMessages.unshift(...accepted.pendingNextTurnMessages.map((message) => ({ ...message })));
+			this._pendingNextTurnMessages.unshift(
+				...undeliveredPendingNextTurnMessages(accepted).map((message) => ({ ...message })),
+			);
 			const error = new Error("Accepted agent message was cleared before delivery.");
 			this._rejectAgentMessageDelivery(accepted.agentMessageId, error);
 			accepted.rejectAccepted(error);
@@ -3320,6 +3434,39 @@ export class AgentSession {
 		return this._followUpMessages.map(queuedMessagePreview);
 	}
 
+	getSteeringQueueSnapshots(): readonly QueuedAgentInputSnapshot[] {
+		return this._steeringMessages.map((message) => createQueuedAgentInputSnapshot(message));
+	}
+
+	getFollowUpQueueSnapshots(): readonly QueuedAgentInputSnapshot[] {
+		return this._followUpMessages.map((message) => createQueuedAgentInputSnapshot(message));
+	}
+
+	getPendingNextTurnMessageSnapshots(): readonly CustomMessage[] {
+		const messages = this._pendingNextTurnMessages.map((message) => cloneCustomMessage(message));
+		const accepted = this._acceptedAgentMessagePrompt;
+		if (accepted && !accepted.cleared && accepted.turnStarted) {
+			messages.push(...undeliveredPendingNextTurnMessages(accepted).map((message) => cloneCustomMessage(message)));
+		}
+		return messages;
+	}
+
+	getAcceptedPromptSnapshot(): AcceptedAgentInputSnapshot | undefined {
+		const accepted = this._acceptedAgentMessagePrompt;
+		if (!accepted || accepted.cleared || accepted.turnStarted) {
+			return undefined;
+		}
+		return {
+			...createQueuedAgentInputSnapshotFromUserMessage(accepted.text, accepted.message),
+			agentMessageId: accepted.agentMessageId,
+			nextTurn: undeliveredPendingNextTurnMessages(accepted).map((message) => cloneCustomMessage(message)),
+		};
+	}
+
+	restorePendingNextTurnMessages(messages: readonly CustomMessage[]): void {
+		this._pendingNextTurnMessages.push(...messages.map((message) => cloneCustomMessage(message)));
+	}
+
 	hasQueuedFollowUp(queueKey: string): boolean {
 		return this._followUpMessages.some((message) => message.queueKey === queueKey);
 	}
@@ -3330,7 +3477,7 @@ export class AgentSession {
 			return false;
 		}
 		this._followUpMessages = this._followUpMessages.filter((message) => message.queueKey !== queueKey);
-		const removedMessages = new Set(removed.map((message) => message.message));
+		const removedMessages = new Set<AgentMessage>(removed.map((message) => message.message));
 		for (const message of removed) {
 			this._rejectAgentMessageDelivery(
 				message.agentMessageId,
@@ -3359,6 +3506,22 @@ export class AgentSession {
 			await this._agentEventQueue;
 		} finally {
 			this._goalAbortInProgress = false;
+		}
+	}
+
+	abortForUpdateRestart(): void {
+		this.abortRetry();
+		this._cancelActiveRlmChildRuns("Parent session aborted for update restart");
+		this._goalAbortInProgress = this._goalState.status === "active";
+		this.agent.abort();
+		if (this._goalAbortInProgress) {
+			void this.agent
+				.waitForIdle()
+				.then(() => this._agentEventQueue)
+				.catch(() => undefined)
+				.finally(() => {
+					this._goalAbortInProgress = false;
+				});
 		}
 	}
 

@@ -49,6 +49,16 @@ type GetUserInput = (this: {
 	returnToAgentsViewRequested: boolean;
 	onInputCallback?: (text: string | undefined) => void;
 }) => Promise<string | undefined>;
+type HandleSubagentSummaryChatAction = (
+	this: {
+		keybindings: { matches(data: string, action: string): boolean };
+		editor: { handleInput(data: string): void };
+		focusEditor(): void;
+		toggleToolOutputExpansion(): void;
+		toggleThinkingBlockVisibility(): void;
+	},
+	data: string,
+) => void;
 
 function createFakeInteractiveModeThis(): HandleEventThis {
 	const fakeThis = {
@@ -165,5 +175,44 @@ describe("InteractiveMode streaming events", () => {
 		const getUserInput = (InteractiveMode.prototype as unknown as { getUserInput: GetUserInput }).getUserInput;
 
 		await expect(getUserInput.call({ returnToAgentsViewRequested: true })).resolves.toBeUndefined();
+	});
+
+	test("forwards typed keys from focused subagent summary back to the editor", () => {
+		const handleSubagentSummaryChatAction = (
+			InteractiveMode.prototype as unknown as { handleSubagentSummaryChatAction: HandleSubagentSummaryChatAction }
+		).handleSubagentSummaryChatAction;
+		const fakeThis = {
+			keybindings: { matches: vi.fn(() => false) },
+			editor: { handleInput: vi.fn() },
+			focusEditor: vi.fn(),
+			toggleToolOutputExpansion: vi.fn(),
+			toggleThinkingBlockVisibility: vi.fn(),
+		};
+
+		handleSubagentSummaryChatAction.call(fakeThis, "x");
+
+		expect(fakeThis.focusEditor).toHaveBeenCalledOnce();
+		expect(fakeThis.editor.handleInput).toHaveBeenCalledWith("x");
+		expect(fakeThis.toggleToolOutputExpansion).not.toHaveBeenCalled();
+		expect(fakeThis.toggleThinkingBlockVisibility).not.toHaveBeenCalled();
+	});
+
+	test("keeps focused subagent summary shortcuts in the chat surface", () => {
+		const handleSubagentSummaryChatAction = (
+			InteractiveMode.prototype as unknown as { handleSubagentSummaryChatAction: HandleSubagentSummaryChatAction }
+		).handleSubagentSummaryChatAction;
+		const fakeThis = {
+			keybindings: { matches: vi.fn((_data: string, action: string) => action === "app.tools.expand") },
+			editor: { handleInput: vi.fn() },
+			focusEditor: vi.fn(),
+			toggleToolOutputExpansion: vi.fn(),
+			toggleThinkingBlockVisibility: vi.fn(),
+		};
+
+		handleSubagentSummaryChatAction.call(fakeThis, "\x0f");
+
+		expect(fakeThis.toggleToolOutputExpansion).toHaveBeenCalledOnce();
+		expect(fakeThis.focusEditor).not.toHaveBeenCalled();
+		expect(fakeThis.editor.handleInput).not.toHaveBeenCalled();
 	});
 });

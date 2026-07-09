@@ -1222,6 +1222,35 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
+	materializeSessionFile(sessionDir?: string): string {
+		if (this.sessionFile) {
+			return this.sessionFile;
+		}
+		const dir = sessionDir ?? (this.sessionDir || getDefaultSessionDir(this.cwd));
+		if (!existsSync(dir)) {
+			mkdirSync(dir, { recursive: true });
+		}
+		const target = createUniqueSessionFileTarget(dir);
+		this.sessionDir = dir;
+		this.sessionId = target.sessionId;
+		this.sessionFile = target.sessionFile;
+		this.persist = true;
+		const timestamp = new Date().toISOString();
+		const git = captureGitContext(this.cwd) ?? undefined;
+		const header: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: this.sessionId,
+			timestamp,
+			cwd: this.cwd,
+			git,
+		};
+		this.fileEntries = [header, ...this.getEntries()];
+		this._rewriteFile();
+		this.flushed = true;
+		return this.sessionFile;
+	}
+
 	getSessionArtifactDir(): string | undefined {
 		return this.persist ? getSessionArtifactPath(this.sessionDir, this.sessionId) : undefined;
 	}

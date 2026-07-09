@@ -38,6 +38,7 @@ export interface SessionSummary {
 	isStreaming: boolean;
 	isCompacting: boolean;
 	isBashRunning?: boolean;
+	hasRunningRlmChildren?: boolean;
 	/** True while the agent is streaming with tool calls pending; drives the "running tools" label. */
 	isRunningTools?: boolean;
 	attachedClients: number;
@@ -146,6 +147,7 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		isStreaming: session.isStreaming,
 		isCompacting: session.isCompacting,
 		isBashRunning: session.isBashRunning,
+		hasRunningRlmChildren: session.hasRunningRlmChildren(),
 		isRunningTools: session.isStreaming && session.state.pendingToolCalls.size > 0,
 		attachedClients: activeSession.clients.size,
 		messageCount: session.messages.length,
@@ -324,6 +326,7 @@ export function isActiveSessionBusy(activeSession: ActiveSessionState): boolean 
 	return (
 		session.isStreaming ||
 		session.isCompacting ||
+		session.isBashRunning ||
 		effectivePendingMessageCount(session) > 0 ||
 		session.hasRunningRlmChildren()
 	);

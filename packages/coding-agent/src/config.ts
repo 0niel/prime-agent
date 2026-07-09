@@ -34,6 +34,9 @@ export const isBunBinary =
 /** Detect if Bun is the runtime (compiled binary or bun run) */
 export const isBunRuntime = !!process.versions.bun;
 
+export const SELF_UPDATE_INTERACTIVE_CHILD_ENV = "PRIME_AGENT_INTERACTIVE_SELF_UPDATE";
+export const SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE = 75;
+
 // =============================================================================
 // Install Method Detection
 // =============================================================================
@@ -555,6 +558,10 @@ export function getAgentLogPath(): string {
 export function getDaemonLogPath(socketPath: string): string {
 	const hash = createHash("sha256").update(socketPath).digest("hex").slice(0, 8);
 	return join(getLogsDir(), `${basename(socketPath)}.${hash}.log`);
+}
+
+export function getDaemonUpdateRestartManifestPath(agentDir: string = getAgentDir()): string {
+	return join(agentDir, "daemon-update-restart.json");
 }
 
 const MAX_LOG_BYTES = 5 * 1024 * 1024;

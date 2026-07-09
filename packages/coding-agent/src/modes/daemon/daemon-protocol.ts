@@ -1,12 +1,14 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Transport } from "@earendil-works/pi-ai";
+import type { ImageContent, TextContent, Transport } from "@earendil-works/pi-ai";
 import type {
 	AgentSessionMessageDeliveryMode,
 	AgentSessionMessageReceipt,
 	AgentSessionMessageSafetyStatus,
 } from "../../core/agent-messages.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
+import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
 import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
+import type { CustomMessage } from "../../core/messages.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type {
@@ -185,6 +187,49 @@ export interface DaemonAttachResult {
 	};
 }
 
+export interface DaemonUpdateRestartQueuedMessage {
+	message: string;
+	content?: (TextContent | ImageContent)[];
+	images?: ImageContent[];
+	queueKey?: string;
+	agentMessageId?: string;
+	customMessage?: CustomMessage;
+}
+
+export interface DaemonUpdateRestartAcceptedPrompt extends DaemonUpdateRestartQueuedMessage {
+	nextTurn: CustomMessage[];
+}
+
+export interface DaemonUpdateRestartQueue {
+	steering: DaemonUpdateRestartQueuedMessage[];
+	followUp: DaemonUpdateRestartQueuedMessage[];
+	nextTurn: CustomMessage[];
+	acceptedPrompt?: DaemonUpdateRestartAcceptedPrompt;
+}
+
+export interface DaemonUpdateRestartSession {
+	activeSessionId: string;
+	sessionId: string;
+	sessionFile: string;
+	cwd: string;
+	config: AgentSessionRuntimeConfig;
+	runtimeMetadata?: AgentSessionRuntimeMetadata;
+	clientEnv?: Record<string, string>;
+	queue: DaemonUpdateRestartQueue;
+	shouldResume: boolean;
+	wasStreaming: boolean;
+	wasCompacting: boolean;
+	wasBashRunning: boolean;
+	hadRunningRlmChildren: boolean;
+	wasRetrying: boolean;
+	hadAcceptedPromptInFlight: boolean;
+}
+
+export interface DaemonUpdateRestartManifest {
+	createdAt: string;
+	sessions: DaemonUpdateRestartSession[];
+}
+
 export type DaemonCommand =
 	| { id?: string; type: "list"; all?: boolean; cwd?: string; sessionDir?: string }
 	| { id?: string; type: "list_saved_sessions"; activeSessionId: string; scope: AgentConnectionSavedSessionScope }
@@ -195,6 +240,7 @@ export type DaemonCommand =
 			continueRecent?: boolean;
 			name?: string;
 			config?: AgentSessionRuntimeConfig;
+			runtimeMetadata?: AgentSessionRuntimeMetadata;
 	  } & DaemonClientEnv)
 	// Attach env is adopt-if-absent only: it fills identity for env-less
 	// sessions (e.g. cron-created) but never rebinds one, since watchers
@@ -214,11 +260,37 @@ export type DaemonCommand =
 			type: "prompt";
 			activeSessionId: string;
 			message: string;
+			content?: (TextContent | ImageContent)[];
 			images?: ImageContent[];
 			streamingBehavior?: "steer" | "followUp";
+			expandPromptTemplates?: boolean;
+			agentMessageId?: string;
 	  }
-	| { id?: string; type: "steer"; activeSessionId: string; message: string; images?: ImageContent[] }
-	| { id?: string; type: "follow_up"; activeSessionId: string; message: string; images?: ImageContent[] }
+	| {
+			id?: string;
+			type: "steer";
+			activeSessionId: string;
+			message: string;
+			content?: (TextContent | ImageContent)[];
+			images?: ImageContent[];
+			expandPromptTemplates?: boolean;
+			agentMessageId?: string;
+			customMessage?: CustomMessage;
+	  }
+	| {
+			id?: string;
+			type: "follow_up";
+			activeSessionId: string;
+			message: string;
+			content?: (TextContent | ImageContent)[];
+			images?: ImageContent[];
+			queueKey?: string;
+			expandPromptTemplates?: boolean;
+			agentMessageId?: string;
+			customMessage?: CustomMessage;
+	  }
+	| { id?: string; type: "restore_next_turn"; activeSessionId: string; messages: CustomMessage[] }
+	| { id?: string; type: "resume_queue"; activeSessionId: string }
 	| {
 			id?: string;
 			type: "send_message";
@@ -313,6 +385,7 @@ export type DaemonCommand =
 			requestId: string;
 			response: DaemonExtensionUIResponse;
 	  }
+	| { id?: string; type: "prepare_update_restart" }
 	| { id?: string; type: "shutdown" };
 
 type DaemonCommandName = DaemonCommand["type"];
@@ -332,7 +405,7 @@ export type DaemonErrorInfo =
 	| { code: "missing_session_cwd"; issue: SessionCwdIssue }
 	| { code: "session_import_file_not_found"; filePath: string };
 
-export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced";
+export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
 
 export type DaemonExtensionUIResponse = { value: string } | { confirmed: boolean } | { cancelled: true };
 
