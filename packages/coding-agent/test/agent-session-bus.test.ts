@@ -116,9 +116,9 @@ describe("agent session bus", () => {
 		expect(prompt).toContain("To: Worker active spoof, active worker, session session-worker");
 	});
 
-	it("uses follow-up delivery by default only when the target is streaming", () => {
+	it("uses steering delivery by default only when the target is streaming", () => {
 		expect(resolveAgentSessionMessageStreamingBehavior(false, "auto")).toBeUndefined();
-		expect(resolveAgentSessionMessageStreamingBehavior(true, "auto")).toBe("followUp");
+		expect(resolveAgentSessionMessageStreamingBehavior(true, "auto")).toBe("steer");
 		expect(resolveAgentSessionMessageStreamingBehavior(true, "follow_up")).toBe("followUp");
 		expect(resolveAgentSessionMessageStreamingBehavior(true, "steer")).toBe("steer");
 	});

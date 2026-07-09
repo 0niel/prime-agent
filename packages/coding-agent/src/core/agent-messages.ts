@@ -138,7 +138,10 @@ export function resolveAgentSessionMessageStreamingBehavior(
 	if (mode === "steer") {
 		return "steer";
 	}
-	return "followUp";
+	if (mode === "follow_up") {
+		return "followUp";
+	}
+	return "steer";
 }
 
 export function parseAgentSessionMessagePromptId(text: string): string | undefined {
