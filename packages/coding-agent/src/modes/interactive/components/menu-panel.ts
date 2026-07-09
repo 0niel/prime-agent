@@ -183,28 +183,30 @@ export function getMenuListLayout(options: MenuListLayoutOptions): MenuListLayou
 		: { compact: false, visibleItems: comfortableLayout.visibleItems };
 }
 
-function surfaceLine(text: string, width: number, paddingX = PANEL_PADDING_X): string {
+function paddedBackgroundLine(
+	text: string,
+	width: number,
+	paddingX: number,
+	background: ((text: string) => string) | undefined,
+): string {
 	const innerWidth = Math.max(1, width - paddingX * 2);
 	const content = truncateToWidth(text, innerWidth, "");
 	const rightPadding = " ".repeat(Math.max(0, innerWidth - visibleWidth(content)));
-	const line = " ".repeat(paddingX) + content + rightPadding + " ".repeat(paddingX);
-	return theme.getEditorBackgroundColor()?.(line) ?? line;
+	const contentSpan = " ".repeat(paddingX) + content;
+	const trailingSpan = rightPadding + " ".repeat(paddingX);
+	if (!background) {
+		return contentSpan + trailingSpan;
+	}
+	return background(contentSpan) + background(trailingSpan);
+}
+
+function surfaceLine(text: string, width: number, paddingX = PANEL_PADDING_X): string {
+	return paddedBackgroundLine(text, width, paddingX, theme.getEditorBackgroundColor());
 }
 
 function surfaceWrappedLines(text: string, width: number, paddingX = PANEL_PADDING_X): string[] {
 	const innerWidth = Math.max(1, width - paddingX * 2);
-	return wrapTextWithAnsi(text, innerWidth).map((content) => {
-		const rightPadding = " ".repeat(Math.max(0, innerWidth - visibleWidth(content)));
-		const line = " ".repeat(paddingX) + content + rightPadding + " ".repeat(paddingX);
-		return theme.getEditorBackgroundColor()?.(line) ?? line;
-	});
-}
-
-function padLine(text: string, width: number, paddingX: number): string {
-	const innerWidth = Math.max(1, width - paddingX * 2);
-	const content = truncateToWidth(text, innerWidth, "");
-	const rightPadding = " ".repeat(Math.max(0, innerWidth - visibleWidth(content)));
-	return " ".repeat(paddingX) + content + rightPadding + " ".repeat(paddingX);
+	return wrapTextWithAnsi(text, innerWidth).map((content) => surfaceLine(content, width, paddingX));
 }
 
 export class MenuPanel extends Container {
@@ -300,8 +302,7 @@ export class MenuSearchInput implements Component, Focusable, FullWidthMenuCompo
 			this.getValue() === "" && !this.focused
 				? theme.fg("dim", this.placeholder)
 				: this.stripInputPrompt(this.input.render(innerWidth + 2)[0] ?? "");
-		const field = padLine(content, safeWidth, FIELD_PADDING_X);
-		return [theme.getEditorBackgroundColor()?.(field) ?? field];
+		return [paddedBackgroundLine(content, safeWidth, FIELD_PADDING_X, theme.getEditorBackgroundColor())];
 	}
 
 	private stripInputPrompt(line: string): string {
@@ -369,11 +370,10 @@ export class MenuRow implements Component, FullWidthMenuComponent {
 	}
 
 	private rowLine(text: string, width: number, selected: boolean): string {
-		const line = padLine(text, width, ROW_PADDING_X);
-		if (selected) {
-			return theme.bg("selectedBg", line);
-		}
-		return theme.getEditorBackgroundColor()?.(line) ?? line;
+		const background = selected
+			? (content: string) => theme.bg("selectedBg", content)
+			: theme.getEditorBackgroundColor();
+		return paddedBackgroundLine(text, width, ROW_PADDING_X, background);
 	}
 }
 

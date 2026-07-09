@@ -4,6 +4,15 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import { ExtensionSelectorComponent } from "../src/modes/interactive/components/extension-selector.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
+const BACKGROUND_START = /\x1b\[(?:4[0-8]|48;5;\d+|48;2;\d+;\d+;\d+)m/;
+
+function expectTrailingBackground(line: string | undefined, text: string): void {
+	const renderedLine = line ?? "";
+	const textEnd = renderedLine.indexOf(text) + text.length;
+	expect(textEnd).toBeGreaterThanOrEqual(text.length);
+	expect(renderedLine.slice(textEnd)).toMatch(BACKGROUND_START);
+}
+
 describe("ExtensionSelectorComponent", () => {
 	beforeAll(() => {
 		initTheme("dark");
@@ -33,6 +42,12 @@ describe("ExtensionSelectorComponent", () => {
 		expect(output).toContain("Waiting preserves the current kernel state");
 		expect(waitIndex).toBeGreaterThan(-1);
 		expect(killIndex).toBe(waitIndex + 1);
+		expectTrailingBackground(
+			lines.find((line) => line.includes("Interrupted IPython cell is still running")),
+			"Interrupted IPython cell is still running",
+		);
+		expectTrailingBackground(lines[waitIndex], "Wait and preserve state");
+		expectTrailingBackground(lines[killIndex], "Kill kernel and restart");
 		for (const line of lines) {
 			expect(visibleWidth(line)).toBe(88);
 		}
