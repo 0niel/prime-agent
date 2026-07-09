@@ -12,6 +12,7 @@ import type { CustomMessage } from "../../core/messages.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type {
+	AgentConnectionAgentStatus,
 	AgentConnectionQueueMode,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionRlmChildAgentSnapshot,
@@ -35,7 +36,7 @@ import type { SessionSummary } from "./daemon-session-list.js";
  */
 
 export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
-export const DAEMON_PROTOCOL_VERSION = 1;
+export const DAEMON_PROTOCOL_VERSION = 2;
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = typeof DAEMON_PROTOCOL_VERSION;
@@ -230,9 +231,19 @@ export interface DaemonUpdateRestartManifest {
 	sessions: DaemonUpdateRestartSession[];
 }
 
+export type DaemonSavedSessionListCommand =
+	| { id?: string; type: "list_saved_sessions"; activeSessionId: string; scope: AgentConnectionSavedSessionScope }
+	| {
+			id?: string;
+			type: "list_saved_sessions";
+			cwd: string;
+			sessionDir?: string;
+			scope: AgentConnectionSavedSessionScope;
+	  };
+
 export type DaemonCommand =
 	| { id?: string; type: "list"; all?: boolean; cwd?: string; sessionDir?: string }
-	| { id?: string; type: "list_saved_sessions"; activeSessionId: string; scope: AgentConnectionSavedSessionScope }
+	| DaemonSavedSessionListCommand
 	| ({
 			id?: string;
 			type: "create";
@@ -370,7 +381,7 @@ export type DaemonCommand =
 	| { id?: string; type: "export_html"; activeSessionId: string; outputPath?: string }
 	| { id?: string; type: "export_jsonl"; activeSessionId: string; outputPath?: string }
 	| { id?: string; type: "set_session_name"; activeSessionId: string; name: string }
-	| { id?: string; type: "rename_saved_session"; activeSessionId: string; sessionPath: string; name: string }
+	| { id?: string; type: "rename_saved_session"; activeSessionId?: string; sessionPath: string; name: string }
 	| { id?: string; type: "delete_saved_session"; activeSessionId?: string; sessionPath: string }
 	| { id?: string; type: "get_session_context"; activeSessionId: string }
 	| { id?: string; type: "get_session_tree"; activeSessionId: string }
@@ -422,14 +433,22 @@ export function isUnknownDaemonCommandError(error: unknown, command: DaemonComma
 	return error instanceof Error && error.message.includes(`Unknown daemon command: ${command}`);
 }
 
-export interface DaemonRequestProgress {
-	id?: string;
-	type: "session_list_progress";
-	command: "list_saved_sessions";
-	activeSessionId: string;
-	loaded: number;
-	total: number;
-}
+export type DaemonRequestProgress =
+	| {
+			id?: string;
+			type: "session_list_progress";
+			command: "list_saved_sessions";
+			activeSessionId?: string;
+			loaded: number;
+			total: number;
+	  }
+	| {
+			id?: string;
+			type: "session_list_item";
+			command: "list_saved_sessions";
+			activeSessionId?: string;
+			session: DaemonSavedSessionInfo;
+	  };
 
 export interface DaemonSavedSessionInfo {
 	path: string;
@@ -443,6 +462,7 @@ export interface DaemonSavedSessionInfo {
 	messageCount: number;
 	firstMessage: string;
 	allMessagesText: string;
+	agentStatus?: AgentConnectionAgentStatus;
 }
 
 export type DaemonDeleteSavedSessionResult = DeleteSessionFileResult;

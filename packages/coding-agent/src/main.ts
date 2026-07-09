@@ -529,9 +529,9 @@ export async function createSessionManager(
 		initTheme(settingsManager.getTheme(), true);
 		try {
 			const selectedPath = await selectSession(
-				(onProgress) => SessionManager.list(cwd, sessionDir, onProgress),
+				(callbacks) => SessionManager.list(cwd, sessionDir, callbacks),
 				SessionManager.listAll,
-				{ cwd },
+				{ cwd, sessionDir },
 			);
 			if (!selectedPath) {
 				console.log(chalk.dim("No session selected"));

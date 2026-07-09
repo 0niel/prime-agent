@@ -19,8 +19,9 @@ interface InputHandler {
 	handleInput(data: string): void;
 }
 
-interface FullPaneOverlayOptions {
+export interface FullPaneOverlayOptions {
 	maxContentWidth?: number;
+	fullWidth?: boolean;
 	suspendFullscreenMouse?: boolean;
 }
 
@@ -34,8 +35,13 @@ export function showFullPaneOverlay(
 	component: Component,
 	options: number | FullPaneOverlayOptions = 80,
 ): OverlayHandle {
-	const { maxContentWidth = 80, suspendFullscreenMouse } =
-		typeof options === "number" ? { maxContentWidth: options } : options;
+	const { maxContentWidth, suspendFullscreenMouse } =
+		typeof options === "number"
+			? { maxContentWidth: options, suspendFullscreenMouse: undefined }
+			: {
+					maxContentWidth: options.fullWidth ? undefined : (options.maxContentWidth ?? 80),
+					suspendFullscreenMouse: options.suspendFullscreenMouse,
+				};
 	const overlayOptions: OverlayOptions = {
 		width: "100%",
 		maxHeight: "100%",

@@ -6,6 +6,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import type { AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
+import { SessionManager } from "../src/core/session-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import {
 	AgentDaemon,
@@ -2638,6 +2639,91 @@ describe("daemon mode helpers", () => {
 				status: "cancelled",
 			});
 			expect(internals.cronStore.list().find((job) => job.id === unrelated.id)).toMatchObject({ status: "active" });
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("streams detached saved-session catalog requests", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-saved-session-catalog-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			const session = SessionManager.create(tempDir, sessionDir);
+			session.appendSessionState({ status: "active" });
+			session.appendAgentStatus({
+				summary: "Finished the task",
+				taskState: "completed",
+				basedOnMessageCount: 0,
+			});
+			session.appendSessionState({ status: "active" });
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const internals = daemon as unknown as {
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const writes: string[] = [];
+			const client = {
+				...makeClient("client-1", "detached"),
+				socket: {
+					destroyed: false,
+					write: (line: string) => {
+						writes.push(line);
+						return true;
+					},
+				} as unknown as Socket,
+			};
+
+			const response = (await internals.handleCommand(client, {
+				id: "list-1",
+				type: "list_saved_sessions",
+				cwd: tempDir,
+				sessionDir,
+				scope: "current",
+			})) as {
+				data: {
+					sessions: Array<{
+						id: string;
+						agentStatus?: {
+							summary: string;
+							taskState?: "needs_input" | "completed";
+							basedOnMessageCount: number;
+						};
+					}>;
+				};
+			};
+			const updates = writes.map((line) => JSON.parse(line) as { type: string; activeSessionId?: string });
+
+			expect(response.data.sessions).toEqual([
+				expect.objectContaining({
+					id: session.getSessionId(),
+					agentStatus: { summary: "Finished the task", taskState: "completed", basedOnMessageCount: 0 },
+				}),
+			]);
+			expect(updates).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						id: "list-1",
+						type: "session_list_progress",
+						command: "list_saved_sessions",
+						loaded: 1,
+						total: 1,
+					}),
+					expect.objectContaining({
+						id: "list-1",
+						type: "session_list_item",
+						command: "list_saved_sessions",
+						session: expect.objectContaining({
+							id: session.getSessionId(),
+							agentStatus: { summary: "Finished the task", taskState: "completed", basedOnMessageCount: 0 },
+						}),
+					}),
+				]),
+			);
+			expect(updates.every((update) => update.activeSessionId === undefined)).toBe(true);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

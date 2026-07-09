@@ -13,14 +13,17 @@ import {
 	collectDaemonClientEnv,
 	type DaemonAttachResult,
 	type DaemonCommand,
-	type DaemonDeleteSavedSessionResult,
 	type DaemonOutbound,
 	type DaemonReplayInfo,
-	type DaemonSavedSessionInfo,
 	type DaemonSessionSnapshot,
 	isUnknownDaemonCommandError,
 } from "../daemon/daemon-protocol.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
+import {
+	deleteDaemonSavedSession,
+	listDaemonSavedSessions,
+	renameDaemonSavedSession,
+} from "../daemon/saved-session-catalog.js";
 import type {
 	AgentConnection,
 	AgentConnectionBeforeSessionInvalidateListener,
@@ -42,7 +45,7 @@ import type {
 	AgentConnectionSavedSessionScope,
 	AgentConnectionScopedModel,
 	AgentConnectionSessionContext,
-	AgentConnectionSessionListProgress,
+	AgentConnectionSessionListCallbacks,
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSessionWatcher,
 	AgentConnectionSlashCommand,
@@ -273,26 +276,9 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	async listSavedSessions(
 		scope: AgentConnectionSavedSessionScope,
-		onProgress?: AgentConnectionSessionListProgress,
+		callbacks?: AgentConnectionSessionListCallbacks,
 	): Promise<AgentConnectionSavedSessionInfo[]> {
-		const response = await this.client.request(
-			{
-				type: "list_saved_sessions",
-				activeSessionId: this.activeSessionId,
-				scope,
-			},
-			30000,
-			{
-				onProgress: (progress) => {
-					onProgress?.(progress.loaded, progress.total);
-				},
-			},
-		);
-		if (!response.success) {
-			throw deserializeDaemonError(response);
-		}
-		const data = response.data as { sessions: DaemonSavedSessionInfo[] };
-		return data.sessions.map(deserializeSavedSessionInfo);
+		return listDaemonSavedSessions(this.client, { activeSessionId: this.activeSessionId }, scope, callbacks);
 	}
 
 	async getQueue(): Promise<AgentConnectionQueueState> {
@@ -672,20 +658,11 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async renameSavedSession(sessionPath: string, name: string): Promise<void> {
-		await this.requestOk({
-			type: "rename_saved_session",
-			activeSessionId: this.activeSessionId,
-			sessionPath,
-			name,
-		});
+		await renameDaemonSavedSession(this.client, { activeSessionId: this.activeSessionId }, sessionPath, name);
 	}
 
 	async deleteSavedSession(sessionPath: string): Promise<DeleteSessionFileResult> {
-		return this.requestData<DaemonDeleteSavedSessionResult>({
-			type: "delete_saved_session",
-			activeSessionId: this.activeSessionId,
-			sessionPath,
-		});
+		return deleteDaemonSavedSession(this.client, { activeSessionId: this.activeSessionId }, sessionPath);
 	}
 
 	async watchSession(activeSessionId: string): Promise<AgentConnectionSessionWatcher | undefined> {
@@ -898,20 +875,4 @@ function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): bool
 		default:
 			return true;
 	}
-}
-
-function deserializeSavedSessionInfo(session: DaemonSavedSessionInfo): AgentConnectionSavedSessionInfo {
-	return {
-		path: session.path,
-		id: session.id,
-		cwd: session.cwd,
-		name: session.name,
-		state: session.state,
-		parentSessionPath: session.parentSessionPath,
-		created: new Date(session.created),
-		modified: new Date(session.modified),
-		messageCount: session.messageCount,
-		firstMessage: session.firstMessage,
-		allMessagesText: session.allMessagesText,
-	};
 }

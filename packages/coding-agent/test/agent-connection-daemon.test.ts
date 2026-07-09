@@ -7,7 +7,11 @@ import {
 	DAEMON_REFINE_REQUEST_TIMEOUT_MS,
 	DaemonAgentConnection,
 } from "../src/modes/agent-connection/daemon-agent-connection.js";
-import type { AgentConnectionEvent, AgentConnectionState } from "../src/modes/agent-connection/types.js";
+import type {
+	AgentConnectionEvent,
+	AgentConnectionSavedSessionInfo,
+	AgentConnectionState,
+} from "../src/modes/agent-connection/types.js";
 import type {
 	DaemonClient,
 	DaemonClientCloseListener,
@@ -183,20 +187,38 @@ class FakeDaemonClient {
 					success: true,
 					data: { steering: ["aborted"], followUp: ["cleared"] },
 				};
-			case "list_saved_sessions":
+			case "list_saved_sessions": {
+				const activeSessionId = "activeSessionId" in command ? command.activeSessionId : undefined;
 				options.onProgress?.({
 					id: "daemon_test",
 					type: "session_list_progress",
 					command: "list_saved_sessions",
-					activeSessionId: command.activeSessionId,
+					...(activeSessionId ? { activeSessionId } : {}),
 					loaded: 1,
 					total: 2,
 				});
 				options.onProgress?.({
 					id: "daemon_test",
+					type: "session_list_item",
+					command: "list_saved_sessions",
+					...(activeSessionId ? { activeSessionId } : {}),
+					session: {
+						path: "/tmp/session-a.jsonl",
+						id: "session-a",
+						cwd: "/tmp",
+						name: "Saved session",
+						created: "2026-01-01T00:00:00.000Z",
+						modified: "2026-01-02T00:00:00.000Z",
+						messageCount: 2,
+						firstMessage: "hello",
+						allMessagesText: "hello world",
+					},
+				});
+				options.onProgress?.({
+					id: "daemon_test",
 					type: "session_list_progress",
 					command: "list_saved_sessions",
-					activeSessionId: command.activeSessionId,
+					...(activeSessionId ? { activeSessionId } : {}),
 					loaded: 2,
 					total: 2,
 				});
@@ -220,6 +242,7 @@ class FakeDaemonClient {
 						],
 					},
 				};
+			}
 			case "wait_for_idle":
 			case "set_scoped_models":
 			case "rename_saved_session":
@@ -1124,9 +1147,15 @@ describe("DaemonAgentConnection", () => {
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
 		await connection.attach();
 		const progress: Array<[number, number]> = [];
+		const discovered: AgentConnectionSavedSessionInfo[] = [];
 
-		const sessions = await connection.listSavedSessions("current", (loaded, total) => {
-			progress.push([loaded, total]);
+		const sessions = await connection.listSavedSessions("current", {
+			onProgress: (loaded, total) => {
+				progress.push([loaded, total]);
+			},
+			onSession: (session) => {
+				discovered.push(session);
+			},
 		});
 		await connection.renameSavedSession("/tmp/session-a.jsonl", "Next name");
 		await expect(connection.deleteSavedSession("/tmp/session-a.jsonl")).resolves.toEqual({
@@ -1151,6 +1180,7 @@ describe("DaemonAgentConnection", () => {
 			[1, 2],
 			[2, 2],
 		]);
+		expect(discovered).toEqual(sessions);
 		expect(fakeClient.requests[1]).toMatchObject({
 			type: "list_saved_sessions",
 			activeSessionId: "active-1",

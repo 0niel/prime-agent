@@ -143,7 +143,7 @@ import { AssistantMessageComponent } from "./components/assistant-message.js";
 import { BashExecutionComponent } from "./components/bash-execution.js";
 import { BorderedLoader } from "./components/bordered-loader.js";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.js";
-import { showFullPaneOverlay } from "./components/centered-overlay.js";
+import { type FullPaneOverlayOptions, showFullPaneOverlay } from "./components/centered-overlay.js";
 import {
 	ChildAgentDetailComponent,
 	type ChildAgentInspectorNode,
@@ -167,6 +167,7 @@ import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybin
 import { type ModelSelectorAction, ModelSelectorComponent } from "./components/model-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
+import { SessionPickerScreen } from "./components/session-picker-screen.js";
 import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
@@ -6197,8 +6198,8 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private showFullPaneOverlay(component: Component, maxContentWidth = 80): OverlayHandle {
-		return showFullPaneOverlay(this.ui, component, maxContentWidth);
+	private showFullPaneOverlay(component: Component, options: number | FullPaneOverlayOptions = 80): OverlayHandle {
+		return showFullPaneOverlay(this.ui, component, options);
 	}
 
 	private async showSettingsSelector(): Promise<void> {
@@ -7043,19 +7044,30 @@ export class InteractiveMode {
 			this.showError(error instanceof Error ? error.message : String(error));
 			return;
 		}
-		this.showSelector((done) => {
+		await new Promise<void>((done) => {
+			let handle: OverlayHandle | undefined;
+			let settled = false;
+			const close = () => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				handle?.hide();
+				this.ui.requestRender();
+				done();
+			};
 			const selector = new SessionSelectorComponent(
-				(onProgress) => this.agentConnection.listSavedSessions("current", onProgress),
-				(onProgress) => this.agentConnection.listSavedSessions("all", onProgress),
+				(callbacks) => this.agentConnection.listSavedSessions("current", callbacks),
+				(callbacks) => this.agentConnection.listSavedSessions("all", callbacks),
 				async (sessionPath) => {
-					done();
+					close();
 					await this.handleResumeSession(sessionPath);
 				},
 				() => {
-					done();
-					this.ui.requestRender();
+					close();
 				},
 				() => {
+					close();
 					void this.shutdown();
 				},
 				() => this.ui.requestRender(),
@@ -7068,11 +7080,17 @@ export class InteractiveMode {
 					deleteSession: (sessionFilePath: string) => this.agentConnection.deleteSavedSession(sessionFilePath),
 					showRenameHint: true,
 					keybindings: this.keybindings,
+					frameless: true,
 				},
 
 				state.sessionFile,
 			);
-			return { component: selector, focus: selector };
+			const splash = new BrandSplashHeader(
+				this.version,
+				() => this.getCurrentModelId(),
+				() => this.getCurrentCwd(),
+			);
+			handle = this.showFullPaneOverlay(new SessionPickerScreen(this.ui, splash, selector), { fullWidth: true });
 		});
 	}
 

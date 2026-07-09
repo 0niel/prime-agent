@@ -1270,24 +1270,45 @@ export class AgentDaemon {
 			}
 
 			case "list_saved_sessions": {
-				const state = this.getSessionState(command.activeSessionId);
-				const sessionManager = state.runtime.session.sessionManager;
-				const onProgress = command.id
-					? (loaded: number, total: number) => {
-							this.write(client, {
-								id: command.id,
-								type: "session_list_progress",
-								command: "list_saved_sessions",
-								activeSessionId: command.activeSessionId,
-								loaded,
-								total,
-							});
+				let activeSessionId: string | undefined;
+				let cwd: string;
+				let sessionDir: string | undefined;
+				if ("activeSessionId" in command) {
+					activeSessionId = command.activeSessionId;
+					const sessionManager = this.getSessionState(activeSessionId).runtime.session.sessionManager;
+					cwd = sessionManager.getCwd();
+					sessionDir = sessionManager.getSessionDir();
+				} else {
+					cwd = resolve(command.cwd);
+					sessionDir = command.sessionDir;
+				}
+				const callbacks = command.id
+					? {
+							onProgress: (loaded: number, total: number) => {
+								this.write(client, {
+									id: command.id,
+									type: "session_list_progress",
+									command: "list_saved_sessions",
+									...(activeSessionId ? { activeSessionId } : {}),
+									loaded,
+									total,
+								});
+							},
+							onSession: (session: SessionInfo) => {
+								this.write(client, {
+									id: command.id,
+									type: "session_list_item",
+									command: "list_saved_sessions",
+									...(activeSessionId ? { activeSessionId } : {}),
+									session: serializeSavedSessionInfo(session),
+								});
+							},
 						}
 					: undefined;
 				const savedSessions =
 					command.scope === "current"
-						? await SessionManager.list(sessionManager.getCwd(), sessionManager.getSessionDir(), onProgress)
-						: await SessionManager.listAll(onProgress, sessionManager.getSessionDir());
+						? await SessionManager.list(cwd, sessionDir, callbacks)
+						: await SessionManager.listAll(callbacks, sessionDir);
 				return success(command.id, "list_saved_sessions", {
 					sessions: savedSessions.map(serializeSavedSessionInfo),
 				});
@@ -1353,7 +1374,9 @@ export class AgentDaemon {
 			}
 
 			case "rename_saved_session": {
-				this.getSessionState(command.activeSessionId);
+				if (command.activeSessionId) {
+					this.getSessionState(command.activeSessionId);
+				}
 				const state = this.findActiveSessionByFile(command.sessionPath);
 				const name = command.name.trim();
 				if (!name) {
@@ -2728,6 +2751,7 @@ function serializeSavedSessionInfo(session: SessionInfo): DaemonSavedSessionInfo
 		messageCount: session.messageCount,
 		firstMessage: session.firstMessage,
 		allMessagesText: session.allMessagesText,
+		agentStatus: session.agentStatus,
 	};
 }
 

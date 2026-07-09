@@ -1,6 +1,12 @@
 import { createConnection, type Socket } from "node:net";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
-import type { DaemonCommand, DaemonOutbound, DaemonRequestProgress, DaemonResponse } from "./daemon-protocol.js";
+import type {
+	DaemonCommand,
+	DaemonOutbound,
+	DaemonRequestProgress,
+	DaemonResponse,
+	DaemonSavedSessionInfo,
+} from "./daemon-protocol.js";
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
@@ -250,13 +256,45 @@ function isDaemonRequestProgress(value: unknown): value is DaemonRequestProgress
 		activeSessionId?: unknown;
 		loaded?: unknown;
 		total?: unknown;
+		session?: unknown;
 	};
+	if (candidate.command !== "list_saved_sessions" || typeof candidate.id !== "string") {
+		return false;
+	}
+	if (candidate.type === "session_list_progress") {
+		return typeof candidate.loaded === "number" && typeof candidate.total === "number";
+	}
+	return candidate.type === "session_list_item" && isDaemonSavedSessionInfo(candidate.session);
+}
+
+function isDaemonSavedSessionInfo(value: unknown): value is DaemonSavedSessionInfo {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as Record<string, unknown>;
 	return (
-		candidate.type === "session_list_progress" &&
-		candidate.command === "list_saved_sessions" &&
+		typeof candidate.path === "string" &&
 		typeof candidate.id === "string" &&
-		typeof candidate.activeSessionId === "string" &&
-		typeof candidate.loaded === "number" &&
-		typeof candidate.total === "number"
+		typeof candidate.cwd === "string" &&
+		typeof candidate.created === "string" &&
+		typeof candidate.modified === "string" &&
+		typeof candidate.messageCount === "number" &&
+		typeof candidate.firstMessage === "string" &&
+		typeof candidate.allMessagesText === "string" &&
+		(candidate.agentStatus === undefined || isDaemonSavedSessionAgentStatus(candidate.agentStatus))
+	);
+}
+
+function isDaemonSavedSessionAgentStatus(value: unknown): boolean {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as Record<string, unknown>;
+	return (
+		typeof candidate.summary === "string" &&
+		typeof candidate.basedOnMessageCount === "number" &&
+		(candidate.taskState === undefined ||
+			candidate.taskState === "needs_input" ||
+			candidate.taskState === "completed")
 	);
 }

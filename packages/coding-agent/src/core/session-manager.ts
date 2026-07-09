@@ -988,10 +988,16 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 }
 
 export type SessionListProgress = (loaded: number, total: number) => void;
+export type SessionListItem = (session: SessionInfo) => void;
+
+export interface SessionListCallbacks {
+	onProgress?: SessionListProgress;
+	onSession?: SessionListItem;
+}
 
 async function listSessionsFromDir(
 	dir: string,
-	onProgress?: SessionListProgress,
+	callbacks?: SessionListCallbacks,
 	progressOffset = 0,
 	progressTotal?: number,
 ): Promise<SessionInfo[]> {
@@ -1017,9 +1023,10 @@ async function listSessionsFromDir(
 		for (const file of files) {
 			const info = await buildSessionInfo(file);
 			loaded++;
-			onProgress?.(progressOffset + loaded, total);
+			callbacks?.onProgress?.(progressOffset + loaded, total);
 			if (info) {
 				sessions.push(info);
+				callbacks?.onSession?.(info);
 			}
 		}
 	} catch {
@@ -1259,7 +1266,7 @@ export class SessionManager {
 		if (!this.persist || !this.sessionFile) return;
 
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-		const shouldPersistWithoutAssistant = entry.type === "session_state";
+		const shouldPersistWithoutAssistant = entry.type === "session_state" || entry.type === "session_info";
 		if (!hasAssistant && !shouldPersistWithoutAssistant) {
 			// Mark as not flushed so when assistant arrives, all entries get written
 			this.flushed = false;
@@ -2016,25 +2023,35 @@ export class SessionManager {
 	 * List all sessions for a directory.
 	 * @param cwd Working directory (used to compute default session directory)
 	 * @param sessionDir Optional session directory. If omitted, uses the configured session root.
-	 * @param onProgress Optional callback for progress updates (loaded, total)
+	 * @param callbacks Optional callbacks for progress and discovered sessions
 	 */
-	static async list(cwd: string, sessionDir?: string, onProgress?: SessionListProgress): Promise<SessionInfo[]> {
+	static async list(cwd: string, sessionDir?: string, callbacks?: SessionListCallbacks): Promise<SessionInfo[]> {
 		const dir = sessionDir ?? getDefaultSessionDir(cwd);
-		const sessions = (await listSessionsFromDir(dir, onProgress)).filter((session) =>
-			sessionInfoMatchesCwd(session, cwd),
-		);
+		const matchesCwd = (session: SessionInfo) => sessionInfoMatchesCwd(session, cwd);
+		const sessions = (
+			await listSessionsFromDir(dir, {
+				onProgress: callbacks?.onProgress,
+				onSession: callbacks?.onSession
+					? (session) => {
+							if (matchesCwd(session)) {
+								callbacks.onSession?.(session);
+							}
+						}
+					: undefined,
+			})
+		).filter(matchesCwd);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 		return sessions;
 	}
 
 	/**
 	 * List all sessions across all project directories.
-	 * @param onProgress Optional callback for progress updates (loaded, total)
+	 * @param callbacks Optional callbacks for progress and discovered sessions
 	 * @param sessionDir Optional session root. If omitted, uses the configured session root.
 	 */
-	static async listAll(onProgress?: SessionListProgress, sessionDir?: string): Promise<SessionInfo[]> {
+	static async listAll(callbacks?: SessionListCallbacks, sessionDir?: string): Promise<SessionInfo[]> {
 		const sessionsDir = sessionDir ?? getSessionsDir();
-		const sessions = await listSessionsFromDir(sessionsDir, onProgress);
+		const sessions = await listSessionsFromDir(sessionsDir, callbacks);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 		return sessions;
 	}

@@ -60,7 +60,7 @@ describe("session selector rename", () => {
 		expect(output).toContain("rename");
 	});
 
-	it("does not show rename hint in --resume picker configuration", async () => {
+	it("shows rename hint in --resume picker configuration", async () => {
 		const sessions = [makeSession({ id: "a" })];
 		const keybindings = new KeybindingsManager();
 		const selector = new SessionSelectorComponent(
@@ -70,13 +70,13 @@ describe("session selector rename", () => {
 			() => {},
 			() => {},
 			() => {},
-			{ showRenameHint: false, keybindings },
+			{ renameSession: async () => {}, showRenameHint: true, keybindings },
 		);
 		await flushPromises();
 
 		const output = selector.render(120).join("\n");
-		expect(output).not.toContain("Ctrl+R");
-		expect(output).not.toContain("rename");
+		expect(output).toContain("Ctrl+R");
+		expect(output).toContain("rename");
 	});
 
 	it("enters rename mode on Ctrl+R and submits with Enter", async () => {
@@ -95,7 +95,7 @@ describe("session selector rename", () => {
 		);
 		await flushPromises();
 
-		selector.getSessionList().handleInput(CTRL_R);
+		selector.handleInput(CTRL_R);
 		await flushPromises();
 
 		// Rename mode layout

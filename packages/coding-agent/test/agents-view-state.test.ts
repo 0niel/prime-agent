@@ -7,7 +7,6 @@ import type { ModelRegistry } from "../src/core/model-registry.js";
 import type { SessionInfo } from "../src/core/session-manager.js";
 import type { SettingsManager } from "../src/core/settings-manager.js";
 import {
-	createAgentsViewDeleteSavedSessionCommand,
 	createAgentsViewListCommand,
 	createAgentsViewReplyHeadline,
 	createAgentsViewResumeConfig,
@@ -520,6 +519,12 @@ describe("agents view state", () => {
 			id: "saved",
 			name: "Saved session",
 			cwd: "/tmp/project",
+			messageCount: 2,
+			agentStatus: {
+				summary: "Finished the task",
+				taskState: "completed",
+				basedOnMessageCount: 2,
+			},
 		});
 
 		const summary = resolveAgentsViewResumeSummary(savedSession.path, [savedSession], []);
@@ -531,6 +536,8 @@ describe("agents view state", () => {
 			sessionFile: savedSession.path,
 			sessionName: "Saved session",
 			cwd: "/tmp/project",
+			summary: "Finished the task",
+			taskState: "completed",
 		});
 		expect(summary?.activeSessionId).toBeUndefined();
 		expect(summary?.lifecycle).toBe("live");
@@ -572,17 +579,6 @@ describe("agents view state", () => {
 			resolveAgentsViewActiveSummaryForPath("/tmp/sessions/active.jsonl", [inactiveSummary, activeSummary]),
 		).toBe(activeSummary);
 		expect(resolveAgentsViewActiveSummaryForPath("/tmp/sessions/inactive.jsonl", [inactiveSummary])).toBeUndefined();
-	});
-
-	test("routes saved session deletes through the daemon file guard", () => {
-		expect(createAgentsViewDeleteSavedSessionCommand("/tmp/sessions/active.jsonl")).toEqual({
-			type: "delete_saved_session",
-			sessionPath: "/tmp/sessions/active.jsonl",
-		});
-		expect(createAgentsViewDeleteSavedSessionCommand("/tmp/sessions/inactive.jsonl")).toEqual({
-			type: "delete_saved_session",
-			sessionPath: "/tmp/sessions/inactive.jsonl",
-		});
 	});
 
 	test("derives the reply headline from the first line of the latest assistant text", () => {
