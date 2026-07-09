@@ -1056,7 +1056,6 @@ export class InteractiveMode {
 				verboseInstructions,
 				{ getHideStartHint: () => this.childAgentPanelMode !== undefined },
 			);
-			this.headerContainer.addChild(new Spacer(1));
 			this.headerContainer.addChild(this.builtInHeader);
 			this.headerContainer.addChild(new Spacer(1));
 		} else {
