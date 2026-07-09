@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-07-09
+
 ## [0.2.7] - 2026-07-08
 
 - Fixed full TUI redraws to preserve terminal scrollback on resize and shrink redraws ([#331](https://github.com/PrimeIntellect-ai/prime-agent/pull/331) by [@sethkarten](https://github.com/sethkarten)).
