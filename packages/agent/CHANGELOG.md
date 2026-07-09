@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-07-08
+
 - Fixed run-lifecycle failures carrying no diagnostics, so hosts can distinguish local failures from provider failures.
 
 ## [0.2.6] - 2026-07-06

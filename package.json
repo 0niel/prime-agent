@@ -48,9 +48,9 @@
 	"engines": {
 		"node": ">=20.0.0"
 	},
-	"version": "0.2.6",
+	"version": "0.2.7",
 	"dependencies": {
-		"@earendil-works/pi-coding-agent": "^0.2.6",
+		"@earendil-works/pi-coding-agent": "^0.2.7",
 		"get-east-asian-width": "^1.6.0"
 	},
 	"overrides": {
