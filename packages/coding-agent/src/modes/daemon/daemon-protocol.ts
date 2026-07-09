@@ -324,6 +324,7 @@ export type DaemonCommand =
 	| { id?: string; type: "get_available_models"; activeSessionId: string }
 	| { id?: string; type: "get_queue"; activeSessionId: string }
 	| { id?: string; type: "clear_queue"; activeSessionId: string }
+	| { id?: string; type: "abort_and_clear_queue"; activeSessionId: string }
 	| { id?: string; type: "cron_list"; activeSessionId?: string; includeInactive?: boolean }
 	| { id?: string; type: "cron_add"; activeSessionId: string; schedule: string; prompt: string }
 	| { id?: string; type: "cron_cancel"; jobId: string }

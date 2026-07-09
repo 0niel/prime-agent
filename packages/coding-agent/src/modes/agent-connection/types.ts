@@ -519,6 +519,7 @@ export interface AgentConnection {
 	): Promise<AgentConnectionSavedSessionInfo[]>;
 	getQueue(): Promise<AgentConnectionQueueState>;
 	clearQueue(): Promise<AgentConnectionQueueState>;
+	abortAndClearQueue(): Promise<AgentConnectionQueueState>;
 	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;
 	addCronJob(schedule: string, prompt: string): Promise<AgentCronJob>;
 	cancelCronJob(jobId: string): Promise<AgentCronJob>;
@@ -536,6 +537,7 @@ export interface AgentConnection {
 	prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void>;
 	steer(message: string, images?: ImageContent[]): Promise<void>;
 	followUp(message: string, images?: ImageContent[]): Promise<void>;
+	/** Request cancellation of the active turn and return once the request is accepted. */
 	abort(): Promise<void>;
 	cancelRlmChild(childId: string): Promise<boolean>;
 	waitForIdle(): Promise<void>;

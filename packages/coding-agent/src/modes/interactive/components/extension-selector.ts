@@ -16,8 +16,21 @@ export interface ExtensionSelectorOptions {
 }
 
 const PREFERRED_VISIBLE_OPTIONS = 8;
-const OPTION_LIST_RESERVED_ROWS = 6;
+const OPTION_LIST_RESERVED_BASE_ROWS = 5;
 const OPTION_SCROLL_INDICATOR_ROWS = 1;
+
+function splitTitleAndDescription(value: string): { title: string; description?: string; descriptionRows: number } {
+	const lines = value
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0);
+	const [title = "", ...descriptionLines] = lines;
+	return {
+		title,
+		description: descriptionLines.length > 0 ? descriptionLines.join("\n") : undefined,
+		descriptionRows: descriptionLines.length,
+	};
+}
 
 export class ExtensionSelectorComponent extends Container {
 	private options: string[];
@@ -28,10 +41,11 @@ export class ExtensionSelectorComponent extends Container {
 	private baseTitle: string;
 	private countdown: CountdownTimer | undefined;
 	private panel: MenuPanel;
+	private readonly reservedRows: number;
 	private listLayout = getMenuListLayout({
 		preferredVisibleItems: PREFERRED_VISIBLE_OPTIONS,
-		reservedRows: OPTION_LIST_RESERVED_ROWS,
-		comfortableItemRows: 2,
+		reservedRows: OPTION_LIST_RESERVED_BASE_ROWS,
+		comfortableItemRows: 1,
 		compactItemRows: 1,
 	});
 	private readonly viewport: MenuViewportProvider;
@@ -48,12 +62,15 @@ export class ExtensionSelectorComponent extends Container {
 		this.options = options;
 		this.onSelectCallback = onSelect;
 		this.onCancelCallback = onCancel;
-		this.baseTitle = title;
+		const header = splitTitleAndDescription(title);
+		this.baseTitle = header.title;
+		this.reservedRows = OPTION_LIST_RESERVED_BASE_ROWS + header.descriptionRows;
 		const tui = opts?.tui;
 		this.viewport = { getRows: opts?.getRows ?? (tui ? () => tui.terminal.rows : undefined) };
 
 		this.panel = new MenuPanel({
-			title,
+			title: header.title,
+			subtitle: header.description,
 		});
 		this.addChild(this.panel);
 
@@ -66,7 +83,7 @@ export class ExtensionSelectorComponent extends Container {
 			);
 		}
 
-		this.listContainer = new MenuList({ compact: () => this.listLayout.compact });
+		this.listContainer = new MenuList({ compact: true });
 		this.panel.addChild(this.listContainer);
 		this.panel.addChild(new Spacer(1));
 		this.panel.addChild(
@@ -146,8 +163,8 @@ export class ExtensionSelectorComponent extends Container {
 			getRows: this.viewport.getRows,
 			preferredVisibleItems: PREFERRED_VISIBLE_OPTIONS,
 			totalItems: this.options.length,
-			reservedRows: OPTION_LIST_RESERVED_ROWS,
-			comfortableItemRows: 2,
+			reservedRows: this.reservedRows,
+			comfortableItemRows: 1,
 			compactItemRows: 1,
 			scrollIndicatorRows: OPTION_SCROLL_INDICATOR_ROWS,
 		});

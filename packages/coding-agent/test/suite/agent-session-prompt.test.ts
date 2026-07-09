@@ -646,6 +646,7 @@ stale extension instructions`,
 
 		// The cleared run's events are still stalled in the session event queue;
 		// run a newer prompt so its messages land in state before the stale cleanup.
+		harness.setResponses([fauxAssistantMessage("after clear response")]);
 		gateAgentStart = false;
 		await harness.session.prompt("after clear");
 		releaseGate();

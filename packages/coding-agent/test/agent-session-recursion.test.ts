@@ -482,6 +482,40 @@ describe("AgentSession rlm recursion", () => {
 		await expect(runPromise).rejects.toThrow("Parent session aborted");
 	});
 
+	it("does not cancel active rlm children when only the parent turn is interrupted", async () => {
+		let releaseChild: () => void = () => {};
+		const release = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		let childStarted = false;
+		const root = createSession({
+			streamFn: (_model, context) => {
+				const text = userText(context);
+				const stream = createAssistantMessageEventStream();
+				if (text === "slow shard") {
+					childStarted = true;
+					void release.then(() => {
+						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
+					});
+				}
+				return stream;
+			},
+		});
+
+		const runPromise = root.runRlmChild("slow shard");
+		await waitFor(() => childStarted);
+		const runs = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
+		expect(runs.size).toBe(1);
+		const run = [...runs.values()][0];
+
+		root.requestAbort();
+
+		expect(run.status).toBe("running");
+		expect(run.error).toBeUndefined();
+		releaseChild();
+		await expect(runPromise).resolves.toMatchObject({ answer: "child answer: slow shard" });
+	});
+
 	it("cancels a single rlm child run by id and reports unknown ids", async () => {
 		let releaseChild: () => void = () => {};
 		const release = new Promise<void>((resolve) => {

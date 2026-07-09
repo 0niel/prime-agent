@@ -5,6 +5,7 @@ import {
 	Input,
 	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
 
@@ -190,6 +191,15 @@ function surfaceLine(text: string, width: number, paddingX = PANEL_PADDING_X): s
 	return theme.getEditorBackgroundColor()?.(line) ?? line;
 }
 
+function surfaceWrappedLines(text: string, width: number, paddingX = PANEL_PADDING_X): string[] {
+	const innerWidth = Math.max(1, width - paddingX * 2);
+	return wrapTextWithAnsi(text, innerWidth).map((content) => {
+		const rightPadding = " ".repeat(Math.max(0, innerWidth - visibleWidth(content)));
+		const line = " ".repeat(paddingX) + content + rightPadding + " ".repeat(paddingX);
+		return theme.getEditorBackgroundColor()?.(line) ?? line;
+	});
+}
+
 function padLine(text: string, width: number, paddingX: number): string {
 	const innerWidth = Math.max(1, width - paddingX * 2);
 	const content = truncateToWidth(text, innerWidth, "");
@@ -218,12 +228,14 @@ export class MenuPanel extends Container {
 			lines.push(surfaceLine("", safeWidth));
 		}
 		const hasTitle = this.title.trim().length > 0;
-		const hasHeader = hasTitle || this.options.subtitle !== undefined;
+		const subtitle = this.options.subtitle?.trim();
+		const hasSubtitle = subtitle !== undefined && subtitle.length > 0;
+		const hasHeader = hasTitle || hasSubtitle;
 		if (hasTitle) {
 			lines.push(surfaceLine(theme.bold(theme.fg("text", this.title)), safeWidth));
 		}
-		if (this.options.subtitle) {
-			lines.push(surfaceLine(theme.fg("muted", this.options.subtitle), safeWidth));
+		if (hasSubtitle) {
+			lines.push(...surfaceWrappedLines(theme.fg("muted", subtitle), safeWidth));
 		}
 		if (hasHeader) {
 			lines.push(surfaceLine("", safeWidth));

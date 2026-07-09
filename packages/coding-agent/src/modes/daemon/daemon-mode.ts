@@ -174,6 +174,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_available_models",
 	"get_queue",
 	"clear_queue",
+	"abort_and_clear_queue",
 	"cron_list",
 	"cron_add",
 	"cron_cancel",
@@ -1523,7 +1524,7 @@ export class AgentDaemon {
 
 			case "abort": {
 				const state = this.getSessionState(command.activeSessionId);
-				await state.runtime.session.abort();
+				state.runtime.session.requestAbort();
 				return success(command.id, "abort");
 			}
 
@@ -1624,6 +1625,13 @@ export class AgentDaemon {
 			case "clear_queue": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "clear_queue", state.runtime.session.clearQueue());
+			}
+
+			case "abort_and_clear_queue": {
+				const state = this.getSessionState(command.activeSessionId);
+				const queue = state.runtime.session.clearQueue();
+				state.runtime.session.requestAbort();
+				return success(command.id, "abort_and_clear_queue", queue);
 			}
 
 			case "cron_list": {

@@ -288,7 +288,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.abort();
 		await firstPrompt.catch(() => {});
 
+		expect(sawSteeringMessage).toBe(false);
+		expect(session.getSteeringMessages()).toContain("Steer from extension");
+		expect(session.pendingMessageCount).toBe(1);
+
+		await session.prompt("After abort");
+
 		expect(sawSteeringMessage).toBe(true);
+		expect(session.pendingMessageCount).toBe(0);
 	});
 
 	it("delivers accepted agent messages without extension input interception", async () => {
