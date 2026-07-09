@@ -1694,13 +1694,16 @@ export class AgentDaemon {
 				if (!model) {
 					throw new Error(`Model not found: ${command.provider}/${command.modelId}`);
 				}
-				await session.setModel(model);
+				await session.setModel(model, { waitForExtensions: !(session.isStreaming || session.isCompacting) });
 				return success(command.id, "set_model", model);
 			}
 
 			case "cycle_model": {
 				const state = this.getSessionState(command.activeSessionId);
-				const result = await state.runtime.session.cycleModel(command.direction);
+				const session = state.runtime.session;
+				const result = await session.cycleModel(command.direction, {
+					waitForExtensions: !(session.isStreaming || session.isCompacting),
+				});
 				return success(command.id, "cycle_model", result ?? null);
 			}
 

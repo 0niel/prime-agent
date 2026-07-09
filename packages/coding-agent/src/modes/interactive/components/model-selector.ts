@@ -167,37 +167,51 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.panel.addChild(this.listContainer);
 		this.updateResponsiveLayout();
 
-		// Load models and do initial render
-		this.loadModels().then(() => {
-			if (initialSearchInput) {
-				this.filterModels(initialSearchInput);
-			} else {
-				this.updateList();
-			}
-			// Request re-render after models are loaded
-			this.tui.requestRender();
-		});
+		this.loadModels();
+		if (initialSearchInput) {
+			this.filterModels(initialSearchInput);
+		} else {
+			this.updateList();
+		}
+		this.tui.requestRender();
 	}
 
-	private async loadModels(): Promise<void> {
+	updateAvailableModels(availableModels: ReadonlyArray<Model<any>>): void {
+		this.availableModels = availableModels;
+		const query = this.searchInput.getValue();
+		const selectedKey = this.getSelectedModelKey();
+
+		this.loadModels();
+		this.filterModels(query);
+
+		if (selectedKey) {
+			const selectedIndex = this.filteredModels.findIndex((item) => this.getModelKey(item) === selectedKey);
+			if (selectedIndex >= 0) {
+				this.selectedIndex = selectedIndex;
+				this.updateList();
+			}
+		}
+
+		this.tui.requestRender();
+	}
+
+	private loadModels(): void {
 		let models: ModelItem[];
+		this.errorMessage = undefined;
 
-		// Refresh to pick up any changes to models.json
-		this.modelRegistry.refresh();
-
-		// Check for models.json errors
-		const loadError = this.modelRegistry.getError();
-		if (loadError) {
-			this.errorMessage = loadError;
+		if (this.availableModels === undefined) {
+			this.modelRegistry.refresh();
+			const loadError = this.modelRegistry.getError();
+			if (loadError) {
+				this.errorMessage = loadError;
+			}
 		}
 
 		// Load available models (built-in models still work even if models.json failed)
 		let availableModels: ReadonlyArray<Model<any>>;
 		try {
-			// An empty snapshot may predate login; prefer a live query.
-			availableModels = this.availableModels?.length
-				? this.availableModels
-				: await this.modelRegistry.getAvailable();
+			availableModels =
+				this.availableModels !== undefined ? this.availableModels : this.modelRegistry.getAvailable();
 			models = availableModels.map((model: Model<any>) => ({
 				provider: model.provider,
 				id: model.id,
@@ -218,7 +232,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const scopedModelId = `${scoped.model.provider}/${scoped.model.id}`;
 			const refreshed =
 				availableModelsById.get(scopedModelId) ??
-				(this.availableModels?.length
+				(this.availableModels !== undefined
 					? undefined
 					: this.modelRegistry.find(scoped.model.provider, scoped.model.id));
 			return refreshed ? { ...scoped, model: refreshed } : scoped;
@@ -233,6 +247,15 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		const currentIndex = this.filteredModels.findIndex((item) => modelsAreEqual(this.currentModel, item.model));
 		this.selectedIndex =
 			currentIndex >= 0 ? currentIndex : Math.min(this.selectedIndex, Math.max(0, this.getSelectableCount() - 1));
+	}
+
+	private getModelKey(item: ModelItem): string {
+		return `${item.provider}/${item.id}`;
+	}
+
+	private getSelectedModelKey(): string | undefined {
+		const selected = this.filteredModels[this.selectedIndex];
+		return selected ? this.getModelKey(selected) : undefined;
 	}
 
 	private recentRankOf(item: ModelItem): number {
