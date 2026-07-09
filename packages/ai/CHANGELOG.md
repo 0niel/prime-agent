@@ -9,6 +9,7 @@
 - Removed `prime-intellect/intellect-3`, which no longer serves (404 from the gateway).
 - Added an optional `featured` flag to `Model` so pickers can pin flagship models above a provider's long tail; set for 30 Prime Inference flagships.
 - Added GPT-5.6 Sol, Terra, and Luna to OpenAI API-key and Codex subscription model catalogs, with their 1.05M API / 272k Codex context windows and `low` through `max` reasoning support.
+- Fixed Anthropic-compatible endpoints receiving empty record-valued tool arguments by converting catch-all `patternProperties` schemas to `additionalProperties`.
 
 ## [0.2.7] - 2026-07-08
 

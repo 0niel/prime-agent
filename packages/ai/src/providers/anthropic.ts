@@ -1208,6 +1208,40 @@ function shouldUseFineGrainedToolStreamingBeta(model: Model<"anthropic-messages"
 	return !!context.tools?.length && !getAnthropicCompat(model).supportsEagerToolInputStreaming;
 }
 
+const CATCH_ALL_PROPERTY_PATTERN = "^.*$";
+
+function isSchemaObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeAnthropicToolSchema(value: unknown): unknown {
+	if (Array.isArray(value)) {
+		return value.map(normalizeAnthropicToolSchema);
+	}
+	if (!isSchemaObject(value)) {
+		return value;
+	}
+
+	const normalized: Record<string, unknown> = {};
+	for (const [key, nestedValue] of Object.entries(value)) {
+		normalized[key] = normalizeAnthropicToolSchema(nestedValue);
+	}
+
+	const patternProperties = normalized.patternProperties;
+	if (
+		isSchemaObject(patternProperties) &&
+		Object.keys(patternProperties).length === 1 &&
+		Object.hasOwn(patternProperties, CATCH_ALL_PROPERTY_PATTERN)
+	) {
+		const catchAllSchema = patternProperties[CATCH_ALL_PROPERTY_PATTERN];
+		delete normalized.patternProperties;
+		normalized.additionalProperties =
+			isSchemaObject(catchAllSchema) && Object.keys(catchAllSchema).length === 0 ? true : catchAllSchema;
+	}
+
+	return normalized;
+}
+
 function convertTools(
 	tools: Tool[],
 	isOAuthToken: boolean,
@@ -1217,7 +1251,7 @@ function convertTools(
 	if (!tools) return [];
 
 	return tools.map((tool, index) => {
-		const schema = tool.parameters as { properties?: unknown; required?: string[] };
+		const schema = tool.parameters as { properties?: Record<string, unknown>; required?: string[] };
 
 		return {
 			name: isOAuthToken ? toClaudeCodeName(tool.name) : tool.name,
@@ -1225,7 +1259,7 @@ function convertTools(
 			...(supportsEagerToolInputStreaming ? { eager_input_streaming: true } : {}),
 			input_schema: {
 				type: "object",
-				properties: schema.properties ?? {},
+				properties: normalizeAnthropicToolSchema(schema.properties ?? {}) as Record<string, unknown>,
 				required: schema.required ?? [],
 			},
 			...(cacheControl && index === tools.length - 1 ? { cache_control: cacheControl } : {}),
