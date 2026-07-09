@@ -265,14 +265,20 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	private sortModels(models: ModelItem[]): ModelItem[] {
 		const sorted = [...models];
-		// Current model first, then most-recently-used, then provider.
+		// Current model first, then most-recently-used, then provider; within a
+		// provider, featured flagships before the long tail, each alphabetical.
 		sorted.sort((a, b) => {
 			const aIsCurrent = modelsAreEqual(this.currentModel, a.model);
 			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
 			if (aIsCurrent !== bIsCurrent) return aIsCurrent ? -1 : 1;
 			const rankDiff = this.recentRankOf(a) - this.recentRankOf(b);
 			if (rankDiff !== 0) return rankDiff;
-			return a.provider.localeCompare(b.provider);
+			const providerDiff = a.provider.localeCompare(b.provider);
+			if (providerDiff !== 0) return providerDiff;
+			const aFeatured = a.model.featured === true;
+			const bFeatured = b.model.featured === true;
+			if (aFeatured !== bFeatured) return aFeatured ? -1 : 1;
+			return a.id.localeCompare(b.id, undefined, { numeric: true });
 		});
 		return sorted;
 	}

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Registered the full Prime Inference catalog (97 models, up from 32) instead of a curated whitelist; context/output limits, vision, and reasoning now come from OpenRouter metadata with a small override table for limits the gateway enforces differently (verified against the live API), and raw/duplicate variants (BF16, HF-cased, `zai-org/`, fine-tune outputs) are skipped.
+- Fixed Prime Inference context windows that disagreed with the live gateway: `anthropic/claude-sonnet-4.5` capped at 200k (route rejects longer prompts), `z-ai/glm-5.2` and `internal/glm-5.2-fast` raised to 1M, `minimax/minimax-m3` corrected to 512k, `nvidia/nemotron-3-*` corrected to their enforced 262k/131k windows.
+- Removed `prime-intellect/intellect-3`, which no longer serves (404 from the gateway).
+- Added an optional `featured` flag to `Model` so pickers can pin flagship models above a provider's long tail; set for 30 Prime Inference flagships.
 - Added GPT-5.6 Sol, Terra, and Luna to OpenAI API-key and Codex subscription model catalogs, with their 1.05M API / 272k Codex context windows and `low` through `max` reasoning support.
 
 ## [0.2.7] - 2026-07-08

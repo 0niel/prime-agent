@@ -19,28 +19,69 @@ describe("Prime Inference models", () => {
 		// Lower bound, not an exact count — the catalog grows with each release and an
 		// exact number breaks on every routine addition. The membership checks below
 		// are the meaningful assertions.
-		expect(modelIds.length).toBeGreaterThanOrEqual(29);
+		expect(modelIds.length).toBeGreaterThanOrEqual(90);
 		expect(modelIds).toEqual(
 			expect.arrayContaining([
 				"anthropic/claude-opus-4.7",
 				"anthropic/claude-opus-4.8",
 				"anthropic/claude-sonnet-5",
 				"deepseek/deepseek-v4-pro",
+				"google/gemini-2.5-pro",
 				"internal/glm-5.2-fast",
+				"meta-llama/llama-4-maverick",
 				"minimax/minimax-m3",
 				"moonshotai/kimi-k2.7-code",
+				"nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B",
 				"nvidia/nemotron-3-super-120b-a12b",
 				"openai/gpt-5.4",
 				"openai/gpt-5.5",
+				"poolside/laguna-m.1",
 				"qwen/qwen3-coder-next",
 				"qwen/qwen3-vl-235b-a22b-thinking",
 				"x-ai/grok-4.20",
+				"z-ai/glm-4.6",
 				"z-ai/glm-5",
 				"z-ai/glm-5.1",
 				"z-ai/glm-5.2",
 			]),
 		);
-		expect(modelIds).not.toContain("google/gemini-2.5-pro");
+	});
+
+	it("skips raw and duplicate catalog variants", () => {
+		const modelIds = getModels("prime-inference").map((model) => model.id);
+
+		expect(modelIds).not.toContain("zai-org/GLM-4.7");
+		expect(modelIds).not.toContain("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16");
+		expect(modelIds).not.toContain("Qwen/Qwen3.5-4B");
+		expect(modelIds.filter((id) => id.includes(":"))).toEqual([]);
+	});
+
+	it("marks flagship models as featured so pickers can pin them above the long tail", () => {
+		expect(getModel("prime-inference", "openai/gpt-5.5").featured).toBe(true);
+		expect(getModel("prime-inference", "z-ai/glm-5.2").featured).toBe(true);
+		expect(getModel("prime-inference", "internal/glm-5.2-fast").featured).toBe(true);
+		expect(getModel("prime-inference", "google/gemini-2.5-pro").featured).toBeUndefined();
+		expect(getModel("prime-inference", "openai/gpt-4o").featured).toBeUndefined();
+	});
+
+	it("borrows OpenRouter metadata for non-curated catalog models", () => {
+		const gemini = getModel("prime-inference", "google/gemini-2.5-pro");
+		expect(gemini.contextWindow).toBe(1048576);
+		expect(gemini.maxTokens).toBe(65536);
+		expect(gemini.input).toEqual(["text", "image"]);
+		expect(gemini.reasoning).toBe(true);
+
+		// The HF-style ultra id maps onto OpenRouter's short id via alias for
+		// pricing/modality, but the gateway enforces a 131k window (measured
+		// 2026-07-08), so the curated override wins for contextWindow.
+		const ultra = getModel("prime-inference", "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B");
+		expect(ultra.contextWindow).toBe(131072);
+		expect(ultra.maxTokens).toBe(16384);
+
+		const maverick = getModel("prime-inference", "meta-llama/llama-4-maverick");
+		expect(maverick.contextWindow).toBe(1048576);
+		expect(maverick.input).toEqual(["text", "image"]);
+		expect(maverick.reasoning).toBe(false);
 	});
 
 	it("registers the default OpenAI-compatible model", () => {
@@ -81,8 +122,10 @@ describe("Prime Inference models", () => {
 		expect(model.baseUrl).toBe("https://api.pinference.ai/api/v1");
 		expect(model.reasoning).toBe(true);
 		expect(model.input).toEqual(["text"]);
-		expect(model.contextWindow).toBe(400000);
-		expect(model.maxTokens).toBe(131072);
+		// Mirrors z-ai/glm-5.2 — the internal fast route serves the same model.
+		const glm52 = getModel("prime-inference", "z-ai/glm-5.2");
+		expect(model.contextWindow).toBe(glm52.contextWindow);
+		expect(model.maxTokens).toBe(glm52.maxTokens);
 		expect(model.cost).toEqual({
 			input: 0,
 			output: 0,
@@ -154,7 +197,9 @@ describe("Prime Inference models", () => {
 		expect(getModel("prime-inference", "anthropic/claude-sonnet-4.6").contextWindow).toBe(1000000);
 		expect(getModel("prime-inference", "anthropic/claude-sonnet-5").contextWindow).toBe(1000000);
 		expect(getModel("prime-inference", "anthropic/claude-haiku-4.5").contextWindow).toBe(200000);
-		expect(getModel("prime-inference", "anthropic/claude-sonnet-4.5").contextWindow).toBe(1000000);
+		// Empirically verified: this route rejects prompts above 200k tokens even
+		// though OpenRouter reports 1M for the upstream model.
+		expect(getModel("prime-inference", "anthropic/claude-sonnet-4.5").contextWindow).toBe(200000);
 	});
 
 	it("resolves PRIME_API_KEY from the environment", () => {
