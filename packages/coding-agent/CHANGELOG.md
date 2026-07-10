@@ -8,8 +8,10 @@
 - Changed the new-chat splash to show only version, model, and cwd metadata and rotate among five example prompts.
 - Fixed self-updates losing restored daemon sessions to a socket cleanup race and leaving open session or agents-view windows disconnected.
 - Changed daemon connection errors to report the failed operation, session identity, recovery steps, socket, and diagnostic log instead of raw protocol reasons.
+- Changed the Agents View and new-chat splashes to keep one blank row above the butterfly.
 - Fixed Agents View retrying after an intentional daemon shutdown instead of stopping with restart guidance.
 - Fixed stale heartbeat jobs reopening archived, deleted, or concurrently terminated sessions ([ENG-4519](https://linear.app/primeintellect/issue/ENG-4519/heartbeats-rebirth-sessions-that-were-previously-killed)).
+- Fixed IPython Bash cells with leading blank lines being labeled and previewed as Python ([ENG-4529](https://linear.app/primeintellect/issue/ENG-4529/leading-newline-before-percentpercentbash-names-tool-call-as-python)).
 
 ## [0.2.8] - 2026-07-09
 

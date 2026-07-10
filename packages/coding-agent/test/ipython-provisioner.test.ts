@@ -237,6 +237,32 @@ describe("IpythonKernelProvisioner", () => {
 		expect(internals.startupListeners.has(onProgress)).toBe(false);
 	});
 
+	it("applies shell settings to bash cells after leading blank lines", async () => {
+		const execute = vi.fn<KernelManager["execute"]>().mockResolvedValueOnce(okExecuteResult());
+		const manager = { execute } as unknown as KernelManager;
+		const ensure = vi.fn(async () => manager);
+		const kill = vi.fn(async () => {});
+		const provisioner = { ensure, kill } as unknown as IpythonKernelProvisioner;
+		const tool = createIpythonToolDefinition(tempDir, {
+			provisioner,
+			commandPrefix: "export TEST_PREFIX=1",
+			shellPath: "/custom/bash",
+		});
+
+		await tool.execute(
+			"tool-call",
+			{ code: "\n \r\n\t%%bash\r\necho body" },
+			undefined,
+			undefined,
+			{} as ExtensionContext,
+		);
+
+		expect(execute).toHaveBeenCalledWith(
+			"\n \r\n\t%%script /custom/bash\r\nexport TEST_PREFIX=1\necho body",
+			expect.objectContaining({ signal: undefined, onStream: expect.any(Function) }),
+		);
+	});
+
 	it("lets the user wait when an interrupted kernel is still busy", async () => {
 		const execute = vi
 			.fn<KernelManager["execute"]>()

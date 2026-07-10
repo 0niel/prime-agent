@@ -34,19 +34,22 @@ describe("InteractiveMode startup hints", () => {
 		return mode;
 	}
 
-	it("keeps the splash metadata to version, model, and cwd", () => {
+	it("keeps a blank row above the shared splash and limits its metadata", () => {
 		const header = new BrandSplashHeader(
 			"0.0.0",
 			() => "test-model",
 			() => "/tmp/project",
 			undefined,
 			{
+				topPadding: true,
 				getStartHint: () => 'Try "refactor @<filepath>"',
 			},
 		);
 
-		const output = stripAnsi(header.render(120).join("\n"));
+		const lines = header.render(120);
+		const output = stripAnsi(lines.join("\n"));
 
+		expect(lines[0]).toBe("");
 		expect(output).toContain("version  v0.0.0");
 		expect(output).toContain("model    test-model");
 		expect(output).toContain("cwd      /tmp/project");
@@ -54,6 +57,13 @@ describe("InteractiveMode startup hints", () => {
 		expect(output).not.toContain("input");
 		expect(output).not.toContain("files");
 		expect(output).not.toContain("help");
+
+		const unpadded = new BrandSplashHeader(
+			"0.0.0",
+			() => "test-model",
+			() => "/tmp/project",
+		);
+		expect(unpadded.render(120)[0]).not.toBe("");
 	});
 
 	it("randomly selects from five concise filepath prompts", () => {

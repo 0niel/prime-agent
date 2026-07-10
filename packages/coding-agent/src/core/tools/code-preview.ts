@@ -1,6 +1,7 @@
+import { parseIpythonBashCell } from "./ipython-cell-code.js";
+
 const DESCRIPTOR_MAX_WIDTH = 64;
 
-const CELL_MAGIC_PATTERN = /^\s*%%bash\b/;
 const MAGIC_LINE_PATTERN = /^\s*!/;
 const COMMENT_LINE_PATTERN = /^\s*#/;
 const CD_PREFIX_PATTERN = /^\s*cd\s+([^&;|]+)(?:&&|;)\s*/;
@@ -434,9 +435,9 @@ export function previewPythonCode(code: string): CodePreview {
 
 export function previewIpythonCode(code: string): CodePreview {
 	const trimmedCode = code.trimEnd();
-	const lines = trimmedCode.split("\n");
-	if (CELL_MAGIC_PATTERN.test(lines[0] ?? "")) {
-		return previewBashCommand(lines.slice(1).join("\n"));
+	const bashCell = parseIpythonBashCell(trimmedCode);
+	if (bashCell) {
+		return previewBashCommand(bashCell.body);
 	}
 	return previewPythonCode(trimmedCode);
 }

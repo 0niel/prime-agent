@@ -318,6 +318,7 @@ export interface BrandSplashMetadataLine {
 
 export interface BrandSplashHeaderOptions {
 	logo?: string;
+	topPadding?: boolean;
 	getExtraMetadata?: () => readonly BrandSplashMetadataLine[];
 	getHideStartHint?: () => boolean;
 	getStartHint?: () => string;
@@ -369,15 +370,20 @@ export class BrandSplashHeader implements Component {
 				]
 			: [];
 		const metaStart = Math.max(0, Math.floor((this.logoRaw.length - metaLines.length) / 2));
-		const lines = this.logoRaw.map((line, index) => {
-			const colored = theme.fg("text", line);
-			const meta = index >= metaStart && index < metaStart + metaLines.length ? metaLines[index - metaStart] : "";
-			const padding = showMeta
-				? " ".repeat(Math.max(0, this.logoCanvasWidth - visibleWidth(line) + this.gutter))
-				: "";
-			const content = truncateToWidth(colored + padding + meta, contentWidth, "");
-			return " ".repeat(paddingX) + content + " ".repeat(Math.max(0, safeWidth - paddingX - visibleWidth(content)));
-		});
+		const lines = this.options.topPadding ? [""] : [];
+		lines.push(
+			...this.logoRaw.map((line, index) => {
+				const colored = theme.fg("text", line);
+				const meta = index >= metaStart && index < metaStart + metaLines.length ? metaLines[index - metaStart] : "";
+				const padding = showMeta
+					? " ".repeat(Math.max(0, this.logoCanvasWidth - visibleWidth(line) + this.gutter))
+					: "";
+				const content = truncateToWidth(colored + padding + meta, contentWidth, "");
+				return (
+					" ".repeat(paddingX) + content + " ".repeat(Math.max(0, safeWidth - paddingX - visibleWidth(content)))
+				);
+			}),
+		);
 
 		if (this.verboseInstructions) {
 			lines.push(" ".repeat(safeWidth));
@@ -1101,6 +1107,7 @@ export class InteractiveMode {
 				() => this.getCurrentCwd(),
 				verboseInstructions,
 				{
+					topPadding: true,
 					getHideStartHint: () => this.childAgentPanelMode !== undefined || !this.isNewChat(),
 					getStartHint: () => this.startHint,
 				},
