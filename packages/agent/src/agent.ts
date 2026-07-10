@@ -116,48 +116,51 @@ export interface AgentOptions {
 }
 
 class PendingMessageQueue {
-	private messages: AgentMessage[] = [];
+	private batches: AgentMessage[][] = [];
 
 	constructor(public mode: QueueMode) {}
 
-	enqueue(message: AgentMessage): void {
-		this.messages.push(message);
+	enqueue(message: AgentMessage | AgentMessage[]): void {
+		const batch = Array.isArray(message) ? message.slice() : [message];
+		if (batch.length > 0) {
+			this.batches.push(batch);
+		}
 	}
 
 	hasItems(): boolean {
-		return this.messages.length > 0;
+		return this.batches.length > 0;
 	}
 
 	drain(): AgentMessage[] {
 		if (this.mode === "all") {
-			const drained = this.messages.slice();
-			this.messages = [];
+			const drained = this.batches.flat();
+			this.batches = [];
 			return drained;
 		}
 
-		const first = this.messages[0];
+		const first = this.batches[0];
 		if (!first) {
 			return [];
 		}
-		this.messages = this.messages.slice(1);
-		return [first];
+		this.batches = this.batches.slice(1);
+		return first;
 	}
 
 	clear(): void {
-		this.messages = [];
+		this.batches = [];
 	}
 
 	removeWhere(predicate: (message: AgentMessage) => boolean): AgentMessage[] {
 		const removed: AgentMessage[] = [];
-		const retained: AgentMessage[] = [];
-		for (const message of this.messages) {
-			if (predicate(message)) {
-				removed.push(message);
+		const retained: AgentMessage[][] = [];
+		for (const batch of this.batches) {
+			if (batch.some(predicate)) {
+				removed.push(...batch);
 			} else {
-				retained.push(message);
+				retained.push(batch);
 			}
 		}
-		this.messages = retained;
+		this.batches = retained;
 		return removed;
 	}
 }
@@ -274,13 +277,13 @@ export class Agent {
 		return this.followUpQueue.mode;
 	}
 
-	/** Queue a message to be injected after the current assistant turn finishes. */
-	steer(message: AgentMessage): void {
+	/** Queue a message batch to be injected after the current assistant turn finishes. */
+	steer(message: AgentMessage | AgentMessage[]): void {
 		this.steeringQueue.enqueue(message);
 	}
 
-	/** Queue a message to run only after the agent would otherwise stop. */
-	followUp(message: AgentMessage): void {
+	/** Queue a message batch to run only after the agent would otherwise stop. */
+	followUp(message: AgentMessage | AgentMessage[]): void {
 		this.followUpQueue.enqueue(message);
 	}
 
@@ -300,7 +303,7 @@ export class Agent {
 		this.clearFollowUpQueue();
 	}
 
-	/** Remove queued messages matching the predicate from both queues. */
+	/** Remove queued batches containing a message matching the predicate from both queues. */
 	removeQueuedMessages(predicate: (message: AgentMessage) => boolean): AgentMessage[] {
 		return [...this.steeringQueue.removeWhere(predicate), ...this.followUpQueue.removeWhere(predicate)];
 	}

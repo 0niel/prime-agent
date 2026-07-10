@@ -188,7 +188,7 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		expect(sessionInternals._overflowRecoveryAttempted).toBe(false);
 	});
 
-	it("folds pending nextTurn context into queued heartbeat prompts", async () => {
+	it("keeps pending nextTurn context separate from queued heartbeat prompts", async () => {
 		let releaseToolExecution: (() => void) | undefined;
 		const toolRelease = new Promise<void>((resolve) => {
 			releaseToolExecution = resolve;
@@ -209,6 +209,7 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		const harness = await createHarness({ tools: [waitTool] });
 		harnesses.push(harness);
 		let queuedHeartbeatText = "";
+		let queuedPendingContextText = "";
 		const queueEvents: Array<{ steering: readonly string[]; followUp: readonly string[] }> = [];
 		harness.session.subscribe((event) => {
 			if (event.type === "queue_update") {
@@ -219,11 +220,15 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
 			fauxAssistantMessage("original turn complete"),
 			(context) => {
+				const pendingContextMessage = context.messages.find(
+					(message) => message.role === "user" && getMessageText(message) === "pending heartbeat context",
+				);
 				const queuedUserMessage = context.messages.find(
 					(message) =>
 						message.role === "user" &&
 						getMessageText(message).includes("Check whether the long-running task needs another step."),
 				);
+				queuedPendingContextText = getMessageText(pendingContextMessage);
 				queuedHeartbeatText = getMessageText(queuedUserMessage);
 				return fauxAssistantMessage("heartbeat handled");
 			},
@@ -249,8 +254,8 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		releaseToolExecution?.();
 		await promptPromise;
 
-		expect(queuedHeartbeatText).toContain("pending heartbeat context");
-		expect(queuedHeartbeatText).toContain("Check whether the long-running task needs another step.");
+		expect(queuedPendingContextText).toBe("pending heartbeat context");
+		expect(queuedHeartbeatText).toBe("Check whether the long-running task needs another step.");
 		expect(
 			queueEvents.some((event) =>
 				event.followUp.includes("Heartbeat prompt: Check whether the long-running task needs another step."),

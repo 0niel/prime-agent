@@ -37,6 +37,7 @@ interface MockQueuedMessage {
 	agentMessageId?: string;
 	queueKey?: string;
 	customMessage?: MockCustomMessage;
+	prefixMessages?: MockCustomMessage[];
 }
 
 interface MockUpdateRestartSession {
@@ -72,6 +73,7 @@ interface MockDaemonRequest {
 	message?: string;
 	agentMessageId?: string;
 	customMessage?: MockCustomMessage;
+	prefixMessages?: MockCustomMessage[];
 	content?: unknown;
 	messages?: MockCustomMessage[];
 	queueKey?: string;
@@ -552,11 +554,18 @@ describe("self-update daemon restart", () => {
 		}
 	});
 
-	it("preserves queued custom messages when restoring update restart queues", async () => {
+	it("preserves queued custom messages and prefixes when restoring update restart queues", async () => {
 		const customMessage: MockCustomMessage = {
 			role: "custom",
 			customType: "heartbeat_prompt",
 			content: "heartbeat body",
+			display: true,
+			timestamp: Date.now(),
+		};
+		const prefixMessage: MockCustomMessage = {
+			role: "custom",
+			customType: "ipython_state_restored",
+			content: "restore context",
 			display: true,
 			timestamp: Date.now(),
 		};
@@ -577,6 +586,7 @@ describe("self-update daemon restart", () => {
 								queueKey: "heartbeat:job-1",
 								agentMessageId: "agentmsg_followup",
 								customMessage,
+								prefixMessages: [prefixMessage],
 							},
 						],
 						nextTurn: [],
@@ -605,6 +615,7 @@ describe("self-update daemon restart", () => {
 					queueKey: "heartbeat:job-1",
 					agentMessageId: "agentmsg_followup",
 					customMessage,
+					prefixMessages: [prefixMessage],
 				}),
 			);
 		} finally {

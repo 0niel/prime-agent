@@ -26,6 +26,7 @@ export const BRANCH_SUMMARY_SUFFIX = `</summary>`;
 
 export const HEARTBEAT_PROMPT_CUSTOM_TYPE = "heartbeat_prompt";
 export const HEARTBEAT_PROMPT_PREVIEW_LABEL = "Heartbeat prompt";
+export const IPYTHON_STATE_RESTORED_CUSTOM_TYPE = "ipython_state_restored";
 
 /**
  * Message type for bash executions via the ! command.
@@ -63,6 +64,10 @@ export interface HeartbeatPromptDetails {
 	runCount: number;
 	nextRunAt?: string;
 	lastRunAt?: string;
+}
+
+export interface IpythonStateRestoredDetails {
+	restored: boolean;
 }
 
 export interface BranchSummaryMessage {
