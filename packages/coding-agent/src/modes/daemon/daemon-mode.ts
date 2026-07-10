@@ -79,6 +79,7 @@ import type {
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { type SessionInfo, SessionManager } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
+import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import {
 	createAgentConnectionCommands,
@@ -160,6 +161,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"agent_messages_resume",
 	"agent_messages_clear",
 	"abort",
+	"start_side_question",
+	"abort_side_question",
 	"execute_bash",
 	"abort_bash",
 	"cancel_rlm_child",
@@ -252,6 +255,10 @@ export class AgentDaemon {
 	private readonly sessions = new Map<string, ActiveSessionState>();
 	private readonly openingSessions = new Map<string, Promise<ActiveSessionState>>();
 	private readonly closingSessions = new Map<string, Promise<void>>();
+	private readonly sideQuestionRuns = new Map<
+		string,
+		{ run: SideQuestionRun; client: DaemonSocketClient; activeSessionId: string }
+	>();
 	private readonly signalCleanupHandlers: Array<() => void> = [];
 	private readonly cronStore: AgentCronJobStore;
 	private readonly cronScheduler: AgentCronScheduler;
@@ -447,6 +454,9 @@ export class AgentDaemon {
 	}
 
 	private refreshReplacedSessionState(state: ActiveSessionState): void {
+		for (const client of state.clients) {
+			this.abortSideQuestionsFor(client, state.activeSessionId);
+		}
 		this.summarizer.forget(state.activeSessionId);
 		state.summaryState = undefined;
 		state.runtime.session.setCurrentRecap(undefined);
@@ -1551,6 +1561,53 @@ export class AgentDaemon {
 				return success(command.id, "abort");
 			}
 
+			case "start_side_question": {
+				const state = this.getSessionState(command.activeSessionId);
+				if (this.sideQuestionRuns.has(command.sideQuestionId)) {
+					throw new Error(`Side question already exists: ${command.sideQuestionId}`);
+				}
+				if (this.hasActiveSideQuestionFor(client, state.activeSessionId)) {
+					throw new Error("A side question is already running for this client and session");
+				}
+				const run = startSideQuestion(
+					state.runtime.session.agent,
+					command.sideQuestionId,
+					command.question,
+					(event) => {
+						this.write(client, {
+							type: "side_question_event",
+							activeSessionId: state.activeSessionId,
+							event,
+						});
+						if (event.status !== "running") {
+							this.sideQuestionRuns.delete(event.id);
+						}
+					},
+				);
+				this.sideQuestionRuns.set(command.sideQuestionId, {
+					run,
+					client,
+					activeSessionId: state.activeSessionId,
+				});
+				void run.done.catch((error) => {
+					this.sideQuestionRuns.delete(command.sideQuestionId);
+					this.log(
+						`side question ${command.sideQuestionId} failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				});
+				return success(command.id, "start_side_question");
+			}
+
+			case "abort_side_question": {
+				this.getSessionState(command.activeSessionId);
+				const entry = this.sideQuestionRuns.get(command.sideQuestionId);
+				if (!entry || entry.client !== client || entry.activeSessionId !== command.activeSessionId) {
+					return success(command.id, "abort_side_question", { aborted: false });
+				}
+				entry.run.abort();
+				return success(command.id, "abort_side_question", { aborted: true });
+			}
+
 			case "execute_bash": {
 				const state = this.getSessionState(command.activeSessionId);
 				if (state.runtime.session.isBashRunning) {
@@ -2275,6 +2332,7 @@ export class AgentDaemon {
 	}
 
 	private detachClientFromSession(client: DaemonSocketClient, state: ActiveSessionState): void {
+		this.abortSideQuestionsFor(client, state.activeSessionId);
 		detachClientFromActiveSession(client, state);
 		this.write(client, { type: "session_detached", activeSessionId: state.activeSessionId });
 		// Abandoned new-chat: discard it so it doesn't linger in memory or leave an
@@ -2528,6 +2586,9 @@ export class AgentDaemon {
 	}
 
 	private async closeSession(state: ActiveSessionState, reason: DaemonSessionClosedReason): Promise<void> {
+		for (const client of state.clients) {
+			this.abortSideQuestionsFor(client, state.activeSessionId);
+		}
 		const existingClose = this.closingSessions.get(state.activeSessionId);
 		if (existingClose) {
 			await existingClose;
@@ -2686,6 +2747,25 @@ export class AgentDaemon {
 			return;
 		}
 		client.socket.write(serializeJsonLine(message));
+	}
+
+	private abortSideQuestionsFor(client: DaemonSocketClient, activeSessionId: string): void {
+		for (const [id, entry] of this.sideQuestionRuns) {
+			if (entry.client !== client || entry.activeSessionId !== activeSessionId) {
+				continue;
+			}
+			entry.run.abort();
+			this.sideQuestionRuns.delete(id);
+		}
+	}
+
+	private hasActiveSideQuestionFor(client: DaemonSocketClient, activeSessionId: string): boolean {
+		for (const entry of this.sideQuestionRuns.values()) {
+			if (entry.client === client && entry.activeSessionId === activeSessionId) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private registerSignalHandlers(): void {

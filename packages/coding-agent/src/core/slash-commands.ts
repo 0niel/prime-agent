@@ -44,6 +44,12 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "import", description: "Import and resume a session from a JSONL file" },
 	{ name: "share", description: "Share session as a secret GitHub gist" },
 	{ name: "copy", description: "Copy last agent message to clipboard" },
+	{
+		name: "btw",
+		description: "Ask one side question without adding it to the session",
+		argumentHint: "<question>",
+		takesArgument: true,
+	},
 	{ name: "name", description: "Set session display name" },
 	{ name: "session", description: "Show session info" },
 	{ name: "system-prompt", description: "Show the exact system prompt sent to the model" },
@@ -103,6 +109,7 @@ const BUILTIN_SLASH_COMMAND_ALIASES: ReadonlyArray<BuiltinSlashCommandAlias> = [
 	{ name: "usage", aliasFor: "context" },
 	{ name: "thinking", aliasFor: "effort" },
 	{ name: "rename", aliasFor: "name" },
+	{ name: "side", aliasFor: "btw" },
 ];
 
 function buildBuiltinSlashCommands(): ReadonlyArray<BuiltinSlashCommand> {

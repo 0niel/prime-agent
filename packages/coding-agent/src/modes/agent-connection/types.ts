@@ -379,6 +379,14 @@ export interface AgentConnectionPromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 }
 
+export interface AgentConnectionSideQuestionEvent {
+	id: string;
+	question: string;
+	answer: string;
+	status: "running" | "complete" | "cancelled" | "error";
+	errorMessage?: string;
+}
+
 export interface AgentConnectionExecuteBashOptions {
 	excludeFromContext?: boolean;
 }
@@ -499,6 +507,7 @@ export type AgentConnectionSessionEvent =
 
 export type AgentConnectionEvent =
 	| { type: "session_event"; event: AgentConnectionSessionEvent }
+	| { type: "side_question_event"; event: AgentConnectionSideQuestionEvent }
 	| { type: "session_replaced"; state: AgentConnectionState; messages: AgentMessage[] }
 	| { type: "session_status"; recap?: string }
 	| { type: "extension_ui_request"; request: AgentConnectionExtensionUiRequest }
@@ -543,6 +552,8 @@ export interface AgentConnection {
 	respondToExtensionUiRequest(requestId: string, response: AgentConnectionExtensionUiResponse): Promise<void>;
 
 	prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void>;
+	startSideQuestion(id: string, question: string): Promise<void>;
+	abortSideQuestion(id: string): Promise<boolean>;
 	steer(message: string, images?: ImageContent[]): Promise<void>;
 	followUp(message: string, images?: ImageContent[]): Promise<void>;
 	/** Request cancellation of the active turn and return once the request is accepted. */

@@ -302,6 +302,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 type SubmitHandlerHarness = {
 	defaultEditor: { onSubmit?: (text: string) => Promise<void> };
 	editor: { setText: (text: string) => void; addToHistory?: (text: string) => void };
+	clearSideQuestion: () => void;
 	clearShortcutGuide: () => void;
 	showWarning: (message: string) => void;
 	showError: (message: string) => void;
@@ -318,6 +319,7 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 	const fakeThis: SubmitHandlerHarness = {
 		defaultEditor: {},
 		editor: { setText: vi.fn(), addToHistory: vi.fn() },
+		clearSideQuestion: vi.fn(),
 		clearShortcutGuide: vi.fn(),
 		showWarning: vi.fn(),
 		showError: vi.fn(),
@@ -573,6 +575,7 @@ describe("InteractiveMode connection events", () => {
 					return vi.fn();
 				}),
 			},
+			resetSideQuestion: vi.fn(),
 			resetExtensionUI: vi.fn(),
 			applyConnectionStateSnapshot: vi.fn(),
 			resetCurrentSessionRenderState: vi.fn(),

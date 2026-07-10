@@ -22,6 +22,7 @@ import type {
 	AgentConnectionSessionContext,
 	AgentConnectionSessionEvent,
 	AgentConnectionSessionTreeNode,
+	AgentConnectionSideQuestionEvent,
 	AgentConnectionState,
 } from "../agent-connection/types.js";
 import type { SessionSummary } from "./daemon-session-list.js";
@@ -317,6 +318,14 @@ export type DaemonCommand =
 	| { id?: string; type: "abort"; activeSessionId: string }
 	| {
 			id?: string;
+			type: "start_side_question";
+			activeSessionId: string;
+			sideQuestionId: string;
+			question: string;
+	  }
+	| { id?: string; type: "abort_side_question"; activeSessionId: string; sideQuestionId: string }
+	| {
+			id?: string;
 			type: "execute_bash";
 			activeSessionId: string;
 			command: string;
@@ -486,6 +495,7 @@ export type DaemonOutbound =
 			serverCapabilities: readonly DaemonClientCapability[];
 	  }
 	| { type: "session_event"; activeSessionId: string; event: AgentConnectionSessionEvent; meta?: DaemonEventMeta }
+	| { type: "side_question_event"; activeSessionId: string; event: AgentConnectionSideQuestionEvent }
 	| { type: "session_status"; activeSessionId: string; recap?: string; meta?: DaemonEventMeta }
 	| {
 			type: "session_replaced";

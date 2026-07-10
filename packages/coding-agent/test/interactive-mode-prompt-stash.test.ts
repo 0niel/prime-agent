@@ -64,6 +64,7 @@ type ResetHarness = PromptStashLiveMarkerHarness & {
 
 type SubmitHarness = PromptStashHarness & {
 	defaultEditor: { onSubmit?: (text: string) => void | Promise<void> };
+	sideQuestionContainer: { clear: Mock };
 	isAgentCompacting: () => boolean;
 	isAgentStreaming: () => boolean;
 	flushPendingBashComponents: Mock;
@@ -227,6 +228,7 @@ describe("InteractiveMode prompt stash", () => {
 		const mode: SubmitHarness = {
 			...createPromptStashHarness({ stash: "half-written draft" }),
 			defaultEditor: {},
+			sideQuestionContainer: { clear: vi.fn() },
 			isAgentCompacting: () => false,
 			isAgentStreaming: () => false,
 			flushPendingBashComponents: vi.fn(),
@@ -248,6 +250,7 @@ describe("InteractiveMode prompt stash", () => {
 		mode = {
 			...createPromptStashHarness({ stash: "half-written draft" }),
 			defaultEditor: {},
+			sideQuestionContainer: { clear: vi.fn() },
 			isAgentCompacting: () => false,
 			isAgentStreaming: () => false,
 			flushPendingBashComponents: vi.fn(),
@@ -275,6 +278,7 @@ describe("InteractiveMode prompt stash", () => {
 		mode = {
 			...createPromptStashHarness({ stash: "half-written draft" }),
 			defaultEditor: {},
+			sideQuestionContainer: { clear: vi.fn() },
 			isAgentCompacting: () => false,
 			isAgentStreaming: () => false,
 			flushPendingBashComponents: vi.fn(),
@@ -305,6 +309,7 @@ describe("InteractiveMode prompt stash", () => {
 		const mode: SubmitHarness & { showSettingsSelector: Mock<() => Promise<void>> } = {
 			...createPromptStashHarness({ text: "/settings", stash: "half-written draft" }),
 			defaultEditor: {},
+			sideQuestionContainer: { clear: vi.fn() },
 			isAgentCompacting: () => false,
 			isAgentStreaming: () => false,
 			flushPendingBashComponents: vi.fn(),
@@ -398,6 +403,7 @@ describe("InteractiveMode prompt stash", () => {
 		} = {
 			...createPromptStashHarness({ text: "quick follow-up", stash: "half-written draft" }),
 			defaultEditor: {},
+			sideQuestionContainer: { clear: vi.fn() },
 			isAgentCompacting: () => false,
 			isAgentStreaming: () => true,
 			flushPendingBashComponents: vi.fn(),

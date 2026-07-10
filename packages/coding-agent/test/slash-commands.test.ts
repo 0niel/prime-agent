@@ -32,6 +32,16 @@ describe("built-in slash commands", () => {
 		});
 	});
 
+	test("exposes /btw as an argument command with /side as an alias", () => {
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "btw")).toMatchObject({
+			argumentHint: "<question>",
+			aliases: ["side"],
+			takesArgument: true,
+		});
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "side")).toBeUndefined();
+		expect(builtinSlashCommandTakesArgument("side")).toBe(true);
+	});
+
 	test("marks argument commands as taking a free-form argument", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "goal")).toMatchObject({
 			takesArgument: true,
@@ -114,6 +124,17 @@ describe("slash command aliases", () => {
 			name: "context",
 			args: "latest turn",
 			originalName: "usage",
+			isAlias: true,
+		});
+	});
+
+	test("resolves /side to /btw", () => {
+		const parsed = parseSlashCommand("/side Is this cached?");
+
+		expect(resolveSlashCommand(parsed!)).toEqual({
+			name: "btw",
+			args: "Is this cached?",
+			originalName: "side",
 			isAlias: true,
 		});
 	});

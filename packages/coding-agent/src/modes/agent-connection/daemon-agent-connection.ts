@@ -48,6 +48,7 @@ import type {
 	AgentConnectionSessionListCallbacks,
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSessionWatcher,
+	AgentConnectionSideQuestionEvent,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
 	AgentConnectionState,
@@ -86,6 +87,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private lastEventSequence: number | undefined;
 	private latestSnapshot: AgentConnectionSnapshot | undefined;
 	private latestSnapshotIsFresh = false;
+	private readonly activeSideQuestionIds = new Set<string>();
 
 	constructor(
 		private readonly client: DaemonClient,
@@ -421,6 +423,34 @@ export class DaemonAgentConnection implements AgentConnection {
 		});
 	}
 
+	async startSideQuestion(id: string, question: string): Promise<void> {
+		this.activeSideQuestionIds.add(id);
+		try {
+			await this.requestOk({
+				type: "start_side_question",
+				activeSessionId: this.activeSessionId,
+				sideQuestionId: id,
+				question,
+			});
+		} catch (error) {
+			this.activeSideQuestionIds.delete(id);
+			if (isUnknownDaemonCommandError(error, "start_side_question")) {
+				throw new Error("the daemon is running an older build; restart the daemon and try again");
+			}
+			throw error;
+		}
+	}
+
+	async abortSideQuestion(id: string): Promise<boolean> {
+		const data = await this.requestData<{ aborted: boolean }>({
+			type: "abort_side_question",
+			activeSessionId: this.activeSessionId,
+			sideQuestionId: id,
+		});
+		this.activeSideQuestionIds.delete(id);
+		return data.aborted;
+	}
+
 	async steer(message: string, images?: ImageContent[]): Promise<void> {
 		await this.requestOk({ type: "steer", activeSessionId: this.activeSessionId, message, images });
 	}
@@ -683,6 +713,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async dispose(): Promise<void> {
+		await Promise.allSettled([...this.activeSideQuestionIds].map((id) => this.abortSideQuestion(id)));
 		this.unsubscribeDaemonMessages();
 		this.unsubscribeDaemonClose();
 		await this.requestOk({ type: "detach", activeSessionId: this.activeSessionId }).catch(() => undefined);
@@ -718,6 +749,11 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (message.type === "session_event") {
 			this.latestSnapshotIsFresh = false;
 			await this.emit({ type: "session_event", event: message.event });
+			return;
+		}
+		if (message.type === "side_question_event") {
+			this.observeSideQuestionEvent(message.event);
+			await this.emit({ type: "side_question_event", event: message.event });
 			return;
 		}
 		if (message.type === "session_status") {
@@ -784,6 +820,12 @@ export class DaemonAgentConnection implements AgentConnection {
 	private async emit(event: AgentConnectionEvent): Promise<void> {
 		for (const listener of [...this.listeners]) {
 			await listener(event);
+		}
+	}
+
+	private observeSideQuestionEvent(event: AgentConnectionSideQuestionEvent): void {
+		if (event.status !== "running") {
+			this.activeSideQuestionIds.delete(event.id);
 		}
 	}
 }
@@ -869,6 +911,8 @@ function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): bool
 		case "get_last_assistant_text":
 		case "get_system_prompt":
 		case "get_tool_definition":
+		case "start_side_question":
+		case "abort_side_question":
 		case "export_html":
 		case "export_jsonl":
 			return false;
