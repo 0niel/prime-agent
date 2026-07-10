@@ -416,6 +416,41 @@ describe("InteractiveMode submit handling", () => {
 	});
 });
 
+describe("InteractiveMode MCP command", () => {
+	type McpCommandHarness = {
+		modelRegistry: { authStorage: { get(providerId: string): unknown } };
+		settingsManager: { getMcpServers(): Record<string, unknown> };
+		showOAuthSelector(mode: "login" | "logout", options?: { initialCategory?: string }): Promise<void>;
+		showStatus(message: string): void;
+		handleMcpCommand(args: string | undefined): Promise<void>;
+	};
+	const handleMcpCommand = (InteractiveMode.prototype as unknown as McpCommandHarness).handleMcpCommand;
+
+	test("opens bare /mcp on the Services category", async () => {
+		const fakeThis = {
+			showOAuthSelector: vi.fn(async () => {}),
+		} as unknown as McpCommandHarness;
+
+		await handleMcpCommand.call(fakeThis, undefined);
+
+		expect(fakeThis.showOAuthSelector).toHaveBeenCalledWith("login", { initialCategory: "service" });
+	});
+
+	test("preserves the explicit /mcp list status output", async () => {
+		const fakeThis = {
+			modelRegistry: { authStorage: { get: vi.fn(() => undefined) } },
+			settingsManager: { getMcpServers: vi.fn(() => ({})) },
+			showOAuthSelector: vi.fn(async () => {}),
+			showStatus: vi.fn(),
+		} as unknown as McpCommandHarness;
+
+		await handleMcpCommand.call(fakeThis, "list");
+
+		expect(fakeThis.showOAuthSelector).not.toHaveBeenCalled();
+		expect(fakeThis.showStatus).toHaveBeenCalledWith(expect.stringContaining("MCP integrations:"));
+	});
+});
+
 describe("InteractiveMode pending bash components", () => {
 	beforeAll(() => {
 		initTheme("dark");

@@ -407,6 +407,39 @@ describe("OAuthSelectorComponent", () => {
 		expect(chosen).toBe("serper");
 	});
 
+	it("can open with the Services tab active", () => {
+		const selector = new OAuthSelectorComponent(
+			"login",
+			AuthStorage.inMemory(),
+			[
+				{ id: "anthropic", name: "Anthropic", authType: "oauth", category: "provider" },
+				{ id: "serper", name: "Serper (web search)", authType: "api_key", category: "service" },
+			],
+			() => {},
+			() => {},
+			undefined,
+			{ initialCategory: "service" },
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(output).toContain("Serper (web search)");
+		expect(output).not.toContain("Anthropic");
+	});
+
+	it("falls back when the requested initial category is unavailable", () => {
+		const selector = new OAuthSelectorComponent(
+			"login",
+			AuthStorage.inMemory(),
+			[{ id: "anthropic", name: "Anthropic", authType: "oauth", category: "provider" }],
+			() => {},
+			() => {},
+			undefined,
+			{ initialCategory: "service" },
+		);
+
+		expect(stripAnsi(selector.render(120).join("\n"))).toContain("Anthropic");
+	});
+
 	it("shows no tab bar when only one category is present", () => {
 		const selector = new OAuthSelectorComponent(
 			"login",
