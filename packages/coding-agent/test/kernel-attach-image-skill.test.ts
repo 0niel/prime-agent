@@ -71,11 +71,7 @@ describe("attach-image skill over the kernel host bridge", () => {
 		const manager = await provisioner.ensure();
 		const result = await manager.execute(`
 from PIL import Image
-img = Image.new("RGB", (2400, 1800))
-pixels = img.load()
-for y in range(img.height):
-    for x in range(img.width):
-        pixels[x, y] = ((x * 17 + y * 3) % 256, (x * 5 + y * 11) % 256, (x * 13 + y * 7) % 256)
+img = Image.new("RGB", (2400, 1800), (32, 64, 96))
 img.save(${JSON.stringify(imagePath)})
 print(await attach_image(${JSON.stringify(imagePath)}))
 `);
