@@ -1,13 +1,14 @@
 import { randomUUID } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Transport } from "@earendil-works/pi-ai";
+import { getAgentLogPath, getDaemonLogPath } from "../../config.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
 import type { AgentCronJob, AgentHeartbeatDeliveryMode, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type { SessionStats } from "../../core/session-stats.js";
-import type { DaemonClient } from "../daemon/daemon-client.js";
+import { type DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
 import { deserializeDaemonError } from "../daemon/daemon-errors.js";
 import {
 	collectDaemonClientEnv,
@@ -15,6 +16,7 @@ import {
 	type DaemonCommand,
 	type DaemonOutbound,
 	type DaemonReplayInfo,
+	type DaemonSessionClosedReason,
 	type DaemonSessionSnapshot,
 	isUnknownDaemonCommandError,
 } from "../daemon/daemon-protocol.js";
@@ -61,6 +63,51 @@ type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : n
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 
 export const DAEMON_REFINE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
+const UPDATE_RECONNECT_TIMEOUT_MS = 120000;
+const UPDATE_RECONNECT_RETRY_MS = 100;
+const updateTransportReconnects = new WeakMap<DaemonClient, Promise<void>>();
+
+function delay(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatErrorSentence(error: unknown): string {
+	const message = (error instanceof Error ? error.message : String(error)).trim();
+	if (!message) {
+		return "Unknown daemon error.";
+	}
+	return /[.!?]$/.test(message) ? message : `${message}.`;
+}
+
+function reconnectDaemonTransportAfterUpdate(client: DaemonClient): Promise<void> {
+	const existing = updateTransportReconnects.get(client);
+	if (existing) {
+		return existing;
+	}
+	const reconnectPromise = Promise.resolve()
+		.then(async () => {
+			client.disconnectForReconnect("update");
+			const deadline = Date.now() + UPDATE_RECONNECT_TIMEOUT_MS;
+			let lastError: unknown;
+			while (Date.now() < deadline) {
+				try {
+					await client.reconnect(1000);
+					return;
+				} catch (error) {
+					lastError = error;
+				}
+				await delay(UPDATE_RECONNECT_RETRY_MS);
+			}
+			throw lastError ?? new Error("the updated daemon did not become available");
+		})
+		.finally(() => {
+			if (updateTransportReconnects.get(client) === reconnectPromise) {
+				updateTransportReconnects.delete(client);
+			}
+		});
+	updateTransportReconnects.set(client, reconnectPromise);
+	return reconnectPromise;
+}
 
 export interface DaemonAgentConnectionOptions {
 	closeClientOnDispose?: boolean;
@@ -87,6 +134,14 @@ export class DaemonAgentConnection implements AgentConnection {
 	private lastEventSequence: number | undefined;
 	private latestSnapshot: AgentConnectionSnapshot | undefined;
 	private latestSnapshotIsFresh = false;
+	private attachedSessionId: string | undefined;
+	private attachedSessionFile: string | undefined;
+	private daemonLogPath: string | undefined;
+	private updateRestartPending = false;
+	private updateReconnectFailed = false;
+	private terminalCloseEmitted = false;
+	private updateReconnectPromise?: Promise<void>;
+	private disposed = false;
 	private readonly activeSideQuestionIds = new Set<string>();
 
 	constructor(
@@ -97,8 +152,24 @@ export class DaemonAgentConnection implements AgentConnection {
 		this.unsubscribeDaemonMessages = this.client.onMessage((message) => {
 			void this.handleDaemonMessage(message);
 		});
+		this.captureDaemonLogPath();
 		this.unsubscribeDaemonClose = this.client.onClose((error) => {
-			void this.emit({ type: "closed", error: error.message });
+			if (this.disposed || this.terminalCloseEmitted) {
+				return;
+			}
+			const closeReason = getDaemonSocketCloseReason(error);
+			if (closeReason === "shutdown") {
+				this.terminalCloseEmitted = true;
+				void this.emit({ type: "closed", error: this.formatDaemonSessionClosedError("shutdown") });
+				return;
+			}
+			if ((this.updateRestartPending || closeReason === "update") && !this.updateReconnectFailed) {
+				this.updateRestartPending = true;
+				void this.reconnectAfterUpdate();
+				return;
+			}
+			this.terminalCloseEmitted = true;
+			void this.emit({ type: "closed", error: this.formatDaemonConnectionClosedError(error) });
 		});
 	}
 
@@ -134,6 +205,13 @@ export class DaemonAgentConnection implements AgentConnection {
 						},
 		});
 		this.activeSessionId = getAttachActiveSessionId(result);
+		const summary = "snapshot" in result ? result.snapshot.summary : result;
+		this.attachedSessionId = summary.sessionId;
+		this.attachedSessionFile =
+			summary.sessionFile ?? ("snapshot" in result ? result.snapshot.state.sessionFile : undefined);
+		this.captureDaemonLogPath();
+		this.updateReconnectFailed = false;
+		this.terminalCloseEmitted = false;
 		this.lastEventSequence = maxEventSequence(this.lastEventSequence, getAttachLastEventSequence(result));
 		if ("snapshot" in result) {
 			this.latestSnapshot = mapDaemonAttachSnapshot(result);
@@ -718,6 +796,8 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async dispose(): Promise<void> {
+		this.disposed = true;
+		this.updateRestartPending = false;
 		await Promise.allSettled([...this.activeSideQuestionIds].map((id) => this.abortSideQuestion(id)));
 		this.unsubscribeDaemonMessages();
 		this.unsubscribeDaemonClose();
@@ -773,6 +853,8 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		if (message.type === "session_replaced") {
+			this.attachedSessionId = message.state.sessionId;
+			this.attachedSessionFile = message.state.sessionFile;
 			const latestSnapshot: AgentConnectionSnapshot = {
 				state: message.state,
 				messages: message.messages,
@@ -797,8 +879,141 @@ export class DaemonAgentConnection implements AgentConnection {
 			return;
 		}
 		if (message.type === "session_closed") {
-			await this.emit({ type: "closed", error: message.reason });
+			if (message.reason === "update") {
+				this.captureDaemonLogPath();
+				this.updateRestartPending = true;
+				void this.reconnectAfterUpdate();
+				return;
+			}
+			this.terminalCloseEmitted = true;
+			await this.emit({ type: "closed", error: this.formatDaemonSessionClosedError(message.reason) });
 		}
+	}
+
+	private captureDaemonLogPath(): void {
+		const socketPath = this.client.hello?.socketPath;
+		if (socketPath) {
+			this.daemonLogPath = getDaemonLogPath(socketPath);
+		}
+	}
+
+	private formatDaemonSessionClosedError(reason: DaemonSessionClosedReason): string {
+		const explanation: Record<DaemonSessionClosedReason, string> = {
+			killed:
+				"The daemon stopped this agent session. Its transcript remains saved and can be reopened from Agents View.",
+			shutdown:
+				"The Prime Agent daemon shut down while this window was attached. The session transcript remains saved; restart Prime Agent and reopen it from Agents View.",
+			completed:
+				"The daemon closed this agent session after it completed. Its transcript remains available from Agents View.",
+			replaced:
+				"The daemon replaced this agent session with another session. Reopen the current session from Agents View.",
+			update:
+				"The Prime Agent daemon restarted for an update, but this window did not restore automatically. The session transcript remains saved; restart Prime Agent and reopen it from Agents View.",
+		};
+		return `${explanation[reason]} ${this.formatDaemonDiagnosticContext()}`;
+	}
+
+	private formatDaemonConnectionClosedError(error: Error): string {
+		return `Lost connection to the Prime Agent daemon. Cause: ${formatErrorSentence(error)} The session transcript remains saved; restart Prime Agent or reopen the session from Agents View. ${this.formatDaemonDiagnosticContext()}`;
+	}
+
+	private formatUpdateReconnectError(error: unknown): string {
+		return `The Prime Agent daemon restarted for an update, but this window could not reconnect to its restored session before the recovery timeout expired. Last error: ${formatErrorSentence(error)} The session transcript remains saved; restart Prime Agent and reopen it from Agents View. ${this.formatDaemonDiagnosticContext()}`;
+	}
+
+	private formatDaemonDiagnosticContext(): string {
+		const details: string[] = [];
+		if (this.attachedSessionId) {
+			details.push(`Session ID: ${this.attachedSessionId}.`);
+		}
+		if (this.attachedSessionFile) {
+			details.push(`Session file: ${this.attachedSessionFile}.`);
+		}
+		details.push(`Diagnostic log: ${this.daemonLogPath ?? getAgentLogPath()}.`);
+		return details.join(" ");
+	}
+
+	private reconnectAfterUpdate(): Promise<void> {
+		if (this.updateReconnectPromise) {
+			return this.updateReconnectPromise;
+		}
+		const reconnectPromise = reconnectDaemonTransportAfterUpdate(this.client)
+			.then(() => this.restoreConnectionAfterUpdate())
+			.catch(async (error: unknown) => {
+				this.updateRestartPending = false;
+				this.updateReconnectFailed = true;
+				if (!this.disposed) {
+					this.terminalCloseEmitted = true;
+					await this.emit({
+						type: "closed",
+						error: this.formatUpdateReconnectError(error),
+					});
+				}
+			})
+			.finally(() => {
+				if (this.updateReconnectPromise === reconnectPromise) {
+					this.updateReconnectPromise = undefined;
+				}
+			});
+		this.updateReconnectPromise = reconnectPromise;
+		return reconnectPromise;
+	}
+
+	private async restoreConnectionAfterUpdate(): Promise<void> {
+		const sessionId = this.attachedSessionId;
+		const sessionFile = this.attachedSessionFile;
+		if (!sessionId && !sessionFile) {
+			throw new Error("the previous session identity is unavailable");
+		}
+		const deadline = Date.now() + UPDATE_RECONNECT_TIMEOUT_MS;
+		let lastError: unknown;
+		while (!this.disposed && Date.now() < deadline) {
+			try {
+				await this.client.reconnect(1000);
+				if (this.disposed) {
+					return;
+				}
+				const response = await this.client.request({ type: "list" }, 30000);
+				if (this.disposed) {
+					return;
+				}
+				if (!response.success) {
+					throw deserializeDaemonError(response);
+				}
+				const sessions = readSessionSummaries(response.data);
+				const restored = sessions.find(
+					(summary) =>
+						summary.activeSessionId !== undefined &&
+						((sessionFile !== undefined && summary.sessionFile === sessionFile) ||
+							(sessionId !== undefined && summary.sessionId === sessionId)),
+				);
+				if (restored?.activeSessionId) {
+					if (this.disposed) {
+						return;
+					}
+					this.activeSessionId = restored.activeSessionId;
+					this.lastEventSequence = undefined;
+					await this.attach();
+					if (this.disposed) {
+						return;
+					}
+					const snapshot = await this.getInitialSnapshot();
+					if (this.disposed) {
+						return;
+					}
+					this.updateRestartPending = false;
+					await this.emit({ type: "session_replaced", state: snapshot.state, messages: snapshot.messages });
+					return;
+				}
+			} catch (error) {
+				lastError = error;
+			}
+			await delay(UPDATE_RECONNECT_RETRY_MS);
+		}
+		if (this.disposed) {
+			return;
+		}
+		throw lastError ?? new Error("the restored session did not become available");
 	}
 
 	private isMessageForActiveSession(message: DaemonOutbound): boolean {
@@ -833,6 +1048,13 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.activeSideQuestionIds.delete(event.id);
 		}
 	}
+}
+
+function readSessionSummaries(value: unknown): SessionSummary[] {
+	if (!value || typeof value !== "object" || !Array.isArray((value as { sessions?: unknown }).sessions)) {
+		throw new Error("Daemon returned an invalid session list response");
+	}
+	return (value as { sessions: SessionSummary[] }).sessions;
 }
 
 function getAttachActiveSessionId(result: SessionSummary | DaemonAttachResult): string {

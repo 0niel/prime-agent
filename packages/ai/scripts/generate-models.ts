@@ -427,6 +427,25 @@ function mergePrimeInferenceModels(
 	return Array.from(models.values());
 }
 
+function refreshPrimeInferenceAliasLimits(
+	snapshotModels: Model<"openai-completions">[],
+	catalogModels: Model<"openai-completions">[],
+): Model<"openai-completions">[] {
+	const liveModels = new Map(catalogModels.map((model) => [model.id.toLowerCase(), model]));
+	return snapshotModels.map((model) => {
+		const canonicalId = PRIME_INFERENCE_OPENROUTER_ALIASES[model.id.toLowerCase()];
+		const canonical = canonicalId ? liveModels.get(canonicalId) : undefined;
+		if (!canonical) {
+			return model;
+		}
+		return {
+			...model,
+			contextWindow: canonical.contextWindow,
+			maxTokens: canonical.maxTokens,
+		};
+	});
+}
+
 function includesCatalogCapability(value: unknown, capabilities: readonly string[]): boolean {
 	if (!Array.isArray(value)) {
 		return false;
@@ -633,6 +652,7 @@ async function fetchPrimeInferenceModels(): Promise<Model<"openai-completions">[
 			(model) => liveIds.has(model.id.toLowerCase()) || model.id.toLowerCase().startsWith("internal/"),
 		);
 	}
+	snapshotModels = refreshPrimeInferenceAliasLimits(snapshotModels, catalogModels);
 	const models = mergePrimeInferenceModels(snapshotModels, catalogModels);
 	console.log(`Loaded ${models.length} Prime Inference models (${catalogModels.length} from the live catalog)`);
 	return models;

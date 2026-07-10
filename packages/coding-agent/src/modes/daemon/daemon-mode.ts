@@ -107,6 +107,7 @@ import {
 	DAEMON_PROTOCOL_INFO,
 	type DaemonAttachResult,
 	type DaemonClientCapability,
+	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonOutbound,
 	type DaemonResponse,
@@ -128,7 +129,9 @@ import {
 import { DaemonSessionSummarizer } from "./daemon-session-summarizer.js";
 import {
 	cleanupDaemonSocketPath,
+	type DaemonSocketIdentity,
 	defaultDaemonSocketPath,
+	getDaemonSocketIdentity,
 	prepareDaemonSocketPath,
 	restrictDaemonSocketPath,
 } from "./daemon-socket.js";
@@ -258,6 +261,7 @@ export class AgentDaemon {
 	private shuttingDown = false;
 	private updateRestartPreparing = false;
 	private ownsSocketPath = false;
+	private socketIdentity?: DaemonSocketIdentity;
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly sessions = new Map<string, ActiveSessionState>();
 	private readonly openingSessions = new Map<string, Promise<ActiveSessionState>>();
@@ -351,6 +355,7 @@ export class AgentDaemon {
 				const onListening = () => {
 					this.server?.off("error", onError);
 					try {
+						this.socketIdentity = getDaemonSocketIdentity(this.socketPath);
 						this.ownsSocketPath = true;
 						if (process.platform !== "win32") {
 							restrictDaemonSocketPath(this.socketPath);
@@ -385,7 +390,9 @@ export class AgentDaemon {
 			return;
 		}
 		this.ownsSocketPath = false;
-		cleanupDaemonSocketPath(this.socketPath);
+		const socketIdentity = this.socketIdentity;
+		this.socketIdentity = undefined;
+		cleanupDaemonSocketPath(this.socketPath, socketIdentity);
 	}
 
 	/**
@@ -2998,6 +3005,10 @@ export class AgentDaemon {
 		}
 		this.shuttingDown = true;
 		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
+		const closingReason: DaemonClosingReason = this.updateRestartPreparing ? "update" : "shutdown";
+		for (const client of this.clients) {
+			this.write(client, { type: "daemon_closing", reason: closingReason });
+		}
 
 		this.summarizer.stop();
 		for (const cleanup of this.signalCleanupHandlers) {
@@ -3005,7 +3016,7 @@ export class AgentDaemon {
 		}
 		this.cronScheduler.stop();
 		for (const state of [...this.sessions.values()]) {
-			await this.closeSession(state, "shutdown");
+			await this.closeSession(state, closingReason);
 		}
 		for (const client of this.clients) {
 			client.detachInput();

@@ -435,6 +435,7 @@ export type DaemonErrorInfo =
 	| { code: "session_import_file_not_found"; filePath: string };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
+export type DaemonClosingReason = "shutdown" | "update";
 
 export type DaemonExtensionUIResponse = { value: string } | { confirmed: boolean } | { cancelled: true };
 
@@ -502,6 +503,7 @@ export type DaemonOutbound =
 			clientId: DaemonClientId;
 			serverCapabilities: readonly DaemonClientCapability[];
 	  }
+	| { type: "daemon_closing"; reason: DaemonClosingReason }
 	| { type: "session_event"; activeSessionId: string; event: AgentConnectionSessionEvent; meta?: DaemonEventMeta }
 	| { type: "side_question_event"; activeSessionId: string; event: AgentConnectionSideQuestionEvent }
 	| { type: "session_status"; activeSessionId: string; recap?: string; meta?: DaemonEventMeta }

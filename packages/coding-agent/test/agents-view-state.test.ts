@@ -17,6 +17,7 @@ import {
 	resolveAgentsViewOpenCwd,
 	resolveAgentsViewResumeSummary,
 	resolveAgentsViewSessionUiServices,
+	shouldReconnectAgentsViewDaemon,
 } from "../src/modes/agents-view/agents-view-mode.js";
 import {
 	buildAgentsViewRows,
@@ -607,6 +608,12 @@ describe("agents view state", () => {
 		);
 		expect(formatAgentsViewStatusLine("  already   flat  ")).toBe("already flat");
 		expect(formatAgentsViewStatusLine("\n \r\n ")).toBe("");
+	});
+
+	test("reconnects daemon restarts and crashes but stops after an intentional shutdown", () => {
+		expect(shouldReconnectAgentsViewDaemon("update")).toBe(true);
+		expect(shouldReconnectAgentsViewDaemon(undefined)).toBe(true);
+		expect(shouldReconnectAgentsViewDaemon("shutdown")).toBe(false);
 	});
 
 	test("caps generated session names at the configured limit", () => {

@@ -22,8 +22,13 @@ import { findExactModelReferenceMatch } from "../../core/model-resolver.js";
 import { SessionManager } from "../../core/session-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
-import { DaemonClient } from "../daemon/daemon-client.js";
-import { type DaemonCommand, type DaemonResponse, isUnknownDaemonCommandError } from "../daemon/daemon-protocol.js";
+import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
+import {
+	type DaemonClosingReason,
+	type DaemonCommand,
+	type DaemonResponse,
+	isUnknownDaemonCommandError,
+} from "../daemon/daemon-protocol.js";
 import {
 	resolveAttachModelFallbackMessage,
 	type SessionSummary,
@@ -81,6 +86,8 @@ import {
 } from "./agents-view-state.js";
 
 const POLL_INTERVAL_MS = 1000;
+const RECONNECT_TIMEOUT_MS = 120000;
+const RECONNECT_RETRY_MS = 1000;
 const EXIT_HINT_DURATION_MS = 2000;
 const DELETE_CONFIRM_DURATION_MS = 2000;
 const STATUS_MESSAGE_DURATION_MS = 4500;
@@ -206,6 +213,10 @@ export function resolveAgentsViewActiveSummaryForPath(
 // the input, so flatten all whitespace runs to single spaces.
 export function formatAgentsViewStatusLine(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
+}
+
+export function shouldReconnectAgentsViewDaemon(reason: DaemonClosingReason | undefined): boolean {
+	return reason !== "shutdown";
 }
 
 export function createAgentsViewReplyHeadline(text: string | undefined): string | undefined {
@@ -376,6 +387,10 @@ class AgentsViewMode implements Component, Focusable {
 	private readonly fullscreenDock: Component;
 	private readonly keybindings: KeybindingsManager;
 	private client: DaemonClient | undefined;
+	private unsubscribeClientClose: (() => void) | undefined;
+	private reconnectPromise: Promise<void> | undefined;
+	private reconnectTimedOut = false;
+	private daemonShutdownReceived = false;
 	private resolveRun: ((result: AgentsViewRunResult) => void) | undefined;
 	private pollTimer: NodeJS.Timeout | undefined;
 	private animationTimer: NodeJS.Timeout | undefined;
@@ -470,6 +485,7 @@ class AgentsViewMode implements Component, Focusable {
 	async run(): Promise<AgentsViewRunResult> {
 		this.client = new DaemonClient(this.options.socketPath);
 		await this.client.connect();
+		this.subscribeToClientClose(this.client);
 
 		this.ui.addChild(this);
 		this.ui.setFocus(this);
@@ -492,7 +508,6 @@ class AgentsViewMode implements Component, Focusable {
 		});
 
 		await this.refreshSessions();
-		await this.sendInitialPrompts();
 		this.loadStartupNotices();
 		this.pollTimer = setInterval(() => {
 			void this.refreshSessions();
@@ -772,7 +787,7 @@ class AgentsViewMode implements Component, Focusable {
 
 	/** Sticky messages (e.g. billing warnings) stay until the user acknowledges them with any keypress. */
 	private clearStickyStatusMessage(): void {
-		if (!this.statusMessageSticky) {
+		if (!this.statusMessageSticky || this.daemonShutdownReceived) {
 			return;
 		}
 		this.statusMessageSticky = false;
@@ -1725,27 +1740,40 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	private async refreshSessions(): Promise<void> {
+		if (this.reconnectPromise || this.daemonShutdownReceived) {
+			return;
+		}
 		const client = this.requireClient();
 		try {
 			const response = await client.request(createAgentsViewListCommand());
 			const data = requireDaemonData(response);
-			const sessions = expectSessionList(data);
-			this.lastListedSummaries = sessions;
-			const visibleSessions = sessions.filter((summary) =>
-				shouldShowAgentsViewSession(summary, this.inactiveAgentIdentities.has(getSummaryIdentity(summary))),
-			);
-			this.lastVisibleSummaries = this.withPendingDeleteSession(visibleSessions);
-			this.rows = buildAgentsViewRows(
-				this.lastVisibleSummaries,
-				this.expandedSubagentParents,
-				this.programShownParents,
-			);
-			this.applyPendingAncestorExpansion();
-			this.restoreSelection();
-			this.ui.requestRender();
+			this.applySessionList(expectSessionList(data));
+			await this.sendInitialPrompts();
 		} catch (error) {
-			this.setStatusMessage(formatError("Failed to refresh agents", error));
+			if (!this.reconnectPromise) {
+				if (client.isConnected) {
+					this.setStatusMessage(formatError("Failed to refresh agents", error));
+				} else {
+					this.startClientReconnect(client, error);
+				}
+			}
 		}
+	}
+
+	private applySessionList(sessions: SessionSummary[]): void {
+		this.lastListedSummaries = sessions;
+		const visibleSessions = sessions.filter((summary) =>
+			shouldShowAgentsViewSession(summary, this.inactiveAgentIdentities.has(getSummaryIdentity(summary))),
+		);
+		this.lastVisibleSummaries = this.withPendingDeleteSession(visibleSessions);
+		this.rows = buildAgentsViewRows(
+			this.lastVisibleSummaries,
+			this.expandedSubagentParents,
+			this.programShownParents,
+		);
+		this.applyPendingAncestorExpansion();
+		this.restoreSelection();
+		this.ui.requestRender();
 	}
 
 	private withPendingDeleteSession(sessions: readonly SessionSummary[]): SessionSummary[] {
@@ -1824,10 +1852,85 @@ class AgentsViewMode implements Component, Focusable {
 			flushFullscreen: false,
 		});
 		stopThemeWatcher();
+		this.unsubscribeClientClose?.();
+		this.unsubscribeClientClose = undefined;
 		this.client?.close();
 		this.client = undefined;
 		this.resolveRun?.(result);
 		this.resolveRun = undefined;
+	}
+
+	private subscribeToClientClose(client: DaemonClient): void {
+		this.unsubscribeClientClose?.();
+		this.unsubscribeClientClose = client.onClose((error) => {
+			if (!shouldReconnectAgentsViewDaemon(getDaemonSocketCloseReason(error))) {
+				this.handleDaemonShutdown(client, error);
+				return;
+			}
+			this.startClientReconnect(client, error);
+		});
+	}
+
+	private handleDaemonShutdown(client: DaemonClient, error: Error): void {
+		if (this.stopped || client !== this.client) {
+			return;
+		}
+		this.daemonShutdownReceived = true;
+		this.reconnectTimedOut = false;
+		this.setStatusMessage(`Prime Agent daemon shut down. Restart Prime Agent to reconnect. ${error.message}`, {
+			tone: "error",
+			sticky: true,
+		});
+		this.applySessionList([]);
+	}
+
+	private startClientReconnect(client: DaemonClient, error: unknown): void {
+		if (this.stopped || client !== this.client || this.reconnectPromise || this.daemonShutdownReceived) {
+			return;
+		}
+		if (!this.reconnectTimedOut) {
+			this.setStatusMessage("Daemon restarted; reconnecting...", { sticky: true });
+		}
+		const reconnectPromise = this.reconnectClient(client, error).finally(() => {
+			if (this.reconnectPromise === reconnectPromise) {
+				this.reconnectPromise = undefined;
+			}
+		});
+		this.reconnectPromise = reconnectPromise;
+	}
+
+	private async reconnectClient(client: DaemonClient, initialError: unknown): Promise<void> {
+		const deadline = Date.now() + RECONNECT_TIMEOUT_MS;
+		let lastError = initialError;
+		while (!this.stopped && !this.daemonShutdownReceived && client === this.client && Date.now() < deadline) {
+			try {
+				await client.reconnect(1000);
+				const response = await client.request(createAgentsViewListCommand());
+				const data = requireDaemonData(response);
+				const sessions = expectSessionList(data);
+				this.daemonShutdownReceived = false;
+				this.reconnectTimedOut = false;
+				this.setStatusMessage("Reconnected after daemon restart", { render: false });
+				this.applySessionList(sessions);
+				await this.sendInitialPrompts();
+				return;
+			} catch (error) {
+				lastError = error;
+			}
+			await new Promise<void>((resolve) => {
+				const retryTimer = setTimeout(resolve, RECONNECT_RETRY_MS);
+				retryTimer.unref?.();
+			});
+		}
+		if (!this.stopped && !this.daemonShutdownReceived && client === this.client) {
+			this.reconnectTimedOut = true;
+			this.setStatusMessage(formatError("Daemon unavailable; retrying", lastError), {
+				tone: "error",
+				sticky: true,
+				render: false,
+			});
+			this.applySessionList([]);
+		}
 	}
 
 	private requireClient(): DaemonClient {
