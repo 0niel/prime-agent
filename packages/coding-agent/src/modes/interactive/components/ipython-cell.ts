@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { previewIpythonCode } from "../../../core/tools/code-preview.js";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
+import { parseIpythonBashCell } from "../../../core/tools/ipython-cell-code.js";
 import { shortenPath } from "../../../core/tools/render-utils.js";
 import { getLanguageFromPath, highlightCode, theme } from "../theme/theme.js";
 import { getWorkingPulseFrame, WORKING_ICON_FRAMES, workingIconFrame } from "../theme/working-icon.js";
@@ -67,7 +68,6 @@ interface TracebackParts {
 }
 
 const MAGIC_LINE_PATTERN = /^\s*!/;
-const CELL_MAGIC_PATTERN = /^\s*%%bash\b/;
 
 // Two columns, matching the code body's "› "/"  " gutter so output aligns under it.
 const OUTPUT_INDENT = "  ";
@@ -322,7 +322,7 @@ export class IPythonCellComponent implements Component {
 
 	private collapsedLine(details: IpythonDetails): string {
 		const code = this.state.code.trimEnd();
-		const isBashCell = CELL_MAGIC_PATTERN.test(code.split("\n")[0] ?? "");
+		const isBashCell = parseIpythonBashCell(code) !== undefined;
 		const preview = previewIpythonCode(code);
 		const languageLabel = isBashCell && preview.language !== "bash" ? `bash · ${preview.language}` : preview.language;
 		const parts = [`${this.marker(details)} ${theme.fg("muted", languageLabel)}`];
@@ -371,9 +371,8 @@ export class IPythonCellComponent implements Component {
 	// `↑in ↓out lines` — the "lines" unit disambiguates from the token counts on
 	// the activity line. Output is omitted for edits (the diff shows on expand).
 	private lineCounts(details: IpythonDetails): string | undefined {
-		const codeLines = this.state.code.split("\n");
-		const isBashCell = CELL_MAGIC_PATTERN.test(codeLines[0] ?? "");
-		const body = isBashCell ? codeLines.slice(1) : codeLines;
+		const bashCell = parseIpythonBashCell(this.state.code);
+		const body = (bashCell?.body ?? this.state.code).split(/\r?\n/);
 		const input = body.filter((line) => line.trim().length > 0).length;
 
 		const hasDiffs = (details.diffs?.length ?? 0) > 0;
@@ -437,7 +436,7 @@ export class IPythonCellComponent implements Component {
 		}
 
 		this.addBlank(lines, width);
-		const isBashCell = CELL_MAGIC_PATTERN.test(code.split("\n")[0] ?? "");
+		const isBashCell = parseIpythonBashCell(code) !== undefined;
 		const rawLines = code.split("\n");
 		for (const [index, rawLine] of rawLines.entries()) {
 			const prefix = index === 0 ? theme.fg("dim", "› ") : theme.fg("dim", "  ");
@@ -449,7 +448,7 @@ export class IPythonCellComponent implements Component {
 	}
 
 	private highlightInputLine(line: string, isBashCell: boolean): string {
-		if (isBashCell || MAGIC_LINE_PATTERN.test(line) || CELL_MAGIC_PATTERN.test(line)) {
+		if (isBashCell || MAGIC_LINE_PATTERN.test(line) || parseIpythonBashCell(line) !== undefined) {
 			return theme.fg("bashMode", line);
 		}
 		const highlighted = highlightCode(line, "python");

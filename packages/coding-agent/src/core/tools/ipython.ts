@@ -17,6 +17,7 @@ import {
 } from "../kernel/index.js";
 import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
+import { parseIpythonBashCell } from "./ipython-cell-code.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
 const RLM_BOOTSTRAP_BASE_CODE = `
@@ -287,17 +288,15 @@ function applyShellSettingsToBashMagicCell(
 	const shellPath = options?.shellPath?.trim();
 	if (!commandPrefix && !shellPath) return code;
 
-	const match = /^([ \t]*)%%bash\b([^\r\n]*)(\r?\n|$)/.exec(code);
-	if (!match) return code;
+	const bashCell = parseIpythonBashCell(code);
+	if (!bashCell) return code;
 
-	const [, indent, rest, lineBreak] = match;
-	const body = code.slice(match[0].length);
 	const firstLine =
-		shellPath && rest.trim().length === 0
-			? `${indent}%%script ${quoteScriptMagicArgument(shellPath)}`
-			: `${indent}%%bash${rest}`;
-	const nextBody = commandPrefix ? `${commandPrefix}${body ? `\n${body}` : ""}` : body;
-	return `${firstLine}${lineBreak || "\n"}${nextBody}`;
+		shellPath && bashCell.magicArguments.trim().length === 0
+			? `${bashCell.indent}%%script ${quoteScriptMagicArgument(shellPath)}`
+			: `${bashCell.indent}%%bash${bashCell.magicArguments}`;
+	const nextBody = commandPrefix ? `${commandPrefix}${bashCell.body ? `\n${bashCell.body}` : ""}` : bashCell.body;
+	return `${bashCell.leadingWhitespace}${firstLine}${bashCell.lineBreak || "\n"}${nextBody}`;
 }
 
 /**

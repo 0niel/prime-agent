@@ -3,14 +3,20 @@
 ## [Unreleased]
 
 - Fixed `--no-env` leaking daemon and Prime CLI credentials, skipping manual Prime login, and repeatedly retrying bare authentication failures ([ENG-4528](https://linear.app/primeintellect/issue/ENG-4528/fix-no-env-prime-agent-ux-retry-loop)).
+- Fixed IPython state restore notices rendering as full user messages when prompts were queued or restored ([ENG-4530](https://linear.app/primeintellect/issue/ENG-4530/collapse-ipython-state-restore-messages-in-chat-tui)).
 - Changed bare `/mcp` to open the Services menu while preserving explicit `list`, `login`, and `logout` subcommands ([ENG-4535](https://linear.app/primeintellect/issue/ENG-4535/open-services-mcp-menu-from-mcp)).
 - Added `/btw` and `/side` for one-turn inline side questions that use the current context without changing the main session ([ENG-4509](https://linear.app/primeintellect/issue/ENG-4509/add-btw-and-side-side-question-flows)).
 - Changed scheduled heartbeat prompts to steer (interrupt the current turn) by default, with a `steer`/`follow_up` delivery mode selectable via `/heartbeat --steer|--follow-up` and the `rlm_heartbeat` skill's `delivery_mode` argument.
 - Changed the new-chat splash to show only version, model, and cwd metadata and rotate among five example prompts.
 - Fixed self-updates losing restored daemon sessions to a socket cleanup race and leaving open session or agents-view windows disconnected.
 - Changed daemon connection errors to report the failed operation, session identity, recovery steps, socket, and diagnostic log instead of raw protocol reasons.
+- Changed the Agents View and new-chat splashes to keep one blank row above the butterfly.
 - Fixed Agents View retrying after an intentional daemon shutdown instead of stopping with restart guidance.
 - Fixed stale heartbeat jobs reopening archived, deleted, or concurrently terminated sessions ([ENG-4519](https://linear.app/primeintellect/issue/ENG-4519/heartbeats-rebirth-sessions-that-were-previously-killed)).
+- Fixed onboarding blocking normal TUI use by reopening login or model selection after startup ([ENG-4537](https://linear.app/primeintellect/issue/ENG-4537/stop-onboarding-from-gating-normal-tui-use)).
+- Fixed IPython Bash cells with leading blank lines being labeled and previewed as Python ([ENG-4529](https://linear.app/primeintellect/issue/ENG-4529/leading-newline-before-percentpercentbash-names-tool-call-as-python)).
+- Fixed recap layout shifts by keeping the previous recap visible until its replacement arrives ([ENG-4533](https://linear.app/primeintellect/issue/ENG-4533/reserve-space-for-recap-to-prevent-layout-shift)).
+- Changed the new-chat tray to hide shortcut guidance while typing and keep the `agents` link visible.
 
 ## [0.2.8] - 2026-07-09
 

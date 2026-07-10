@@ -1666,6 +1666,7 @@ export class AgentDaemon {
 						agentMessageId: command.agentMessageId,
 						content: command.content,
 						customMessage: command.customMessage,
+						prefixMessages: command.prefixMessages,
 					});
 				} else {
 					await state.runtime.session.steer(command.message, command.images, {
@@ -1685,6 +1686,7 @@ export class AgentDaemon {
 						agentMessageId: command.agentMessageId,
 						content: command.content,
 						customMessage: command.customMessage,
+						prefixMessages: command.prefixMessages,
 					});
 				} else {
 					queued = await state.runtime.session.followUp(command.message, command.images, {
@@ -2597,6 +2599,7 @@ export class AgentDaemon {
 				...(message.queueKey ? { queueKey: message.queueKey } : {}),
 				...(message.agentMessageId ? { agentMessageId: message.agentMessageId } : {}),
 				...(message.customMessage ? { customMessage: message.customMessage } : {}),
+				...(message.prefixMessages ? { prefixMessages: message.prefixMessages } : {}),
 			})),
 			followUp: [...session.getFollowUpQueueSnapshots()].map((message) => ({
 				message: message.text,
@@ -2605,6 +2608,7 @@ export class AgentDaemon {
 				...(message.queueKey ? { queueKey: message.queueKey } : {}),
 				...(message.agentMessageId ? { agentMessageId: message.agentMessageId } : {}),
 				...(message.customMessage ? { customMessage: message.customMessage } : {}),
+				...(message.prefixMessages ? { prefixMessages: message.prefixMessages } : {}),
 			})),
 			nextTurn: [...session.getPendingNextTurnMessageSnapshots()],
 		};

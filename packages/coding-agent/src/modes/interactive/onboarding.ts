@@ -3,7 +3,7 @@ import type { AuthStatus } from "../../core/auth-storage.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "../../core/prime-inference-auth.js";
 
 export interface OnboardingSettingsReader {
-	getOnboardingCompleted(): boolean;
+	getOnboardingShown(): boolean;
 }
 
 export interface OnboardingModelRegistryReader {
@@ -19,7 +19,7 @@ export interface OnboardingStartupState {
 }
 
 export function shouldRunPrimeCliOnboardingSplash(state: OnboardingStartupState): boolean {
-	if (state.settingsManager.getOnboardingCompleted()) {
+	if (state.settingsManager.getOnboardingShown()) {
 		return false;
 	}
 	if (!state.model || state.model.provider !== PRIME_INFERENCE_PROVIDER_ID) {
@@ -34,6 +34,9 @@ export function isOnboardingModelReady(state: OnboardingStartupState): boolean {
 }
 
 export function shouldRunOnboarding(state: OnboardingStartupState): boolean {
+	if (state.settingsManager.getOnboardingShown()) {
+		return false;
+	}
 	state.modelRegistry.refresh();
 	if (shouldRunPrimeCliOnboardingSplash(state)) {
 		return true;
