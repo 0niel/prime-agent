@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Changed the new-chat splash to show only version, model, and cwd metadata and rotate among five example prompts.
+
 ## [0.2.8] - 2026-07-09
 
 - Added built-in Herdr integration that reports agent lifecycle state to Herdr panes automatically, without requiring `herdr integration install pi`.

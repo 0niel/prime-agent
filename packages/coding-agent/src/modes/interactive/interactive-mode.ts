@@ -228,6 +228,18 @@ const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS = 15_000;
 const HEARTBEAT_LEGACY_PROMPT_MAX_TOLERANCE_MS = 120_000;
 const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
 
+export const START_HINTS = [
+	'Try "refactor @<filepath>"',
+	'Try "fix bugs in @<filepath>"',
+	'Try "add tests for @<filepath>"',
+	'Try "explain how @<filepath> works"',
+	'Try "improve performance in @<filepath>"',
+] as const;
+
+export function getRandomStartHint(random = Math.random): (typeof START_HINTS)[number] {
+	return START_HINTS[Math.floor(random() * START_HINTS.length)] ?? START_HINTS[0];
+}
+
 function isLabeledQueuedPreview(message: string): boolean {
 	return (
 		message.startsWith(`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `) || message.startsWith(`${GOAL_CONTEXT_PREVIEW_LABEL}: `)
@@ -606,6 +618,7 @@ export class InteractiveMode {
 	// Stored so the same manager can be injected into custom editors, selectors, and extension UI.
 	private keybindings: KeybindingsManager;
 	private version: string;
+	private readonly startHint = getRandomStartHint();
 	private isInitialized = false;
 	private onInputCallback?: (text: string | undefined) => void;
 	private returnToAgentsViewRequested = false;
@@ -812,7 +825,7 @@ export class InteractiveMode {
 			paddingX: editorPaddingX,
 			autocompleteMaxVisible,
 			isArgumentCommand: builtinSlashCommandTakesArgument,
-			placeholder: 'Try "refactor @<filepath>"',
+			placeholder: this.startHint,
 			placeholderColor: (text) => theme.fg("dim", text),
 		});
 		this.editor = this.defaultEditor;
@@ -1064,9 +1077,8 @@ export class InteractiveMode {
 				() => this.getCurrentCwd(),
 				verboseInstructions,
 				{
-					getExtraMetadata: () => this.getStartupMetadata(),
 					getHideStartHint: () => this.childAgentPanelMode !== undefined || !this.isNewChat(),
-					getStartHint: () => 'Try "refactor @<filepath>"',
+					getStartHint: () => this.startHint,
 				},
 			);
 			this.headerContainer.addChild(this.builtInHeader);
@@ -4839,27 +4851,11 @@ export class InteractiveMode {
 		return [agentsHint, modelLabel, shortcutsHint].filter((label): label is string => label !== undefined).join("  ");
 	}
 
-	private getStartupMetadata(): BrandSplashMetadataLine[] {
-		if (this.childAgentPanelMode || !this.isNewChat()) {
-			return [];
-		}
-		return [
-			{ label: "input", value: "! shell · / commands" },
-			{ label: "files", value: "@ file paths" },
-			{ label: "help", value: this.getShortcutHelpHint() },
-		];
-	}
-
 	private getShortcutsTrayHint(): string | undefined {
 		if (!this.isNewChat()) {
 			return undefined;
 		}
 		return keyText("app.shortcuts") ? keyHint("app.shortcuts", "for shortcuts") : "/hotkeys for shortcuts";
-	}
-
-	private getShortcutHelpHint(): string {
-		const shortcuts = keyText("app.shortcuts");
-		return shortcuts ? `${shortcuts} for shortcuts` : "/hotkeys for shortcuts";
 	}
 
 	private isNewChat(): boolean {
