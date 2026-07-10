@@ -1228,10 +1228,13 @@ function normalizeAnthropicToolSchema(value: unknown): unknown {
 	}
 
 	const patternProperties = normalized.patternProperties;
+	const properties = normalized.properties;
+	const hasNamedProperties = isSchemaObject(properties) && Object.keys(properties).length > 0;
 	if (
 		isSchemaObject(patternProperties) &&
 		Object.keys(patternProperties).length === 1 &&
-		Object.hasOwn(patternProperties, CATCH_ALL_PROPERTY_PATTERN)
+		Object.hasOwn(patternProperties, CATCH_ALL_PROPERTY_PATTERN) &&
+		!hasNamedProperties
 	) {
 		const catchAllSchema = patternProperties[CATCH_ALL_PROPERTY_PATTERN];
 		delete normalized.patternProperties;
@@ -1251,16 +1254,21 @@ function convertTools(
 	if (!tools) return [];
 
 	return tools.map((tool, index) => {
-		const schema = tool.parameters as { properties?: Record<string, unknown>; required?: string[] };
+		const normalizedSchema = normalizeAnthropicToolSchema(tool.parameters);
+		const schema = isSchemaObject(normalizedSchema) ? normalizedSchema : {};
+		const required = Array.isArray(schema.required)
+			? schema.required.filter((value): value is string => typeof value === "string")
+			: [];
 
 		return {
 			name: isOAuthToken ? toClaudeCodeName(tool.name) : tool.name,
 			description: tool.description,
 			...(supportsEagerToolInputStreaming ? { eager_input_streaming: true } : {}),
 			input_schema: {
+				...schema,
 				type: "object",
-				properties: normalizeAnthropicToolSchema(schema.properties ?? {}) as Record<string, unknown>,
-				required: schema.required ?? [],
+				properties: schema.properties ?? {},
+				required,
 			},
 			...(cacheControl && index === tools.length - 1 ? { cache_control: cacheControl } : {}),
 		};

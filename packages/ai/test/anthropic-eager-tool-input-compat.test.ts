@@ -180,4 +180,50 @@ describe("Anthropic tool schema compatibility", () => {
 			patternProperties: { "^x-": { type: "string" } },
 		});
 	});
+
+	it("preserves catch-all patternProperties when named properties share the schema", async () => {
+		const request = await captureAnthropicRequest(
+			undefined,
+			createContext([
+				{
+					name: "report",
+					description: "Report metadata",
+					parameters: Type.Object({
+						metadata: Type.Unsafe({
+							type: "object",
+							properties: { fixed: Type.String() },
+							patternProperties: { "^.*$": Type.Number() },
+						}),
+					}),
+				},
+			]),
+		);
+		const properties = getInputSchema(request.body).properties as Record<string, unknown>;
+
+		expect(properties.metadata).toEqual({
+			type: "object",
+			properties: { fixed: { type: "string" } },
+			patternProperties: { "^.*$": { type: "number" } },
+		});
+	});
+
+	it("normalizes a record used as the root tool schema", async () => {
+		const request = await captureAnthropicRequest(
+			undefined,
+			createContext([
+				{
+					name: "labels",
+					description: "Submit labels",
+					parameters: Type.Record(Type.String(), Type.String()),
+				},
+			]),
+		);
+
+		expect(getInputSchema(request.body)).toEqual({
+			type: "object",
+			additionalProperties: { type: "string" },
+			properties: {},
+			required: [],
+		});
+	});
 });
