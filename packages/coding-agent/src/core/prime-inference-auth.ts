@@ -56,6 +56,7 @@ export type PrimeInferenceLoginOptions = {
 	fetchFn?: typeof fetch;
 	pollIntervalMs?: number;
 	requestTimeoutMs?: number;
+	reuseExistingApiKey?: boolean;
 };
 
 type PrimeChallengeConfig = {
@@ -169,10 +170,14 @@ function clearPrimeTeamFields(data: Record<string, unknown>): void {
 	delete data.team_role;
 }
 
-export function loadPrimeCliConfig(configPath: string = defaultPrimeCliConfigPath()): PrimeCliConfig {
+export function loadPrimeCliConfig(
+	configPath: string = defaultPrimeCliConfigPath(),
+	options: { includeCredentials?: boolean } = {},
+): PrimeCliConfig {
 	const data = readPrimeCliConfigData(configPath);
-	const teamIdFromEnv = stringEnv("PRIME_TEAM_ID");
-	const teamId = teamIdFromEnv ?? stringField(data, "team_id");
+	const includeCredentials = options.includeCredentials !== false;
+	const teamIdFromEnv = includeCredentials ? stringEnv("PRIME_TEAM_ID") : undefined;
+	const teamId = includeCredentials ? (teamIdFromEnv ?? stringField(data, "team_id")) : undefined;
 
 	const config: PrimeCliConfig = {
 		baseUrl: normalizeBaseUrl(stringField(data, "base_url")),
@@ -181,14 +186,14 @@ export function loadPrimeCliConfig(configPath: string = defaultPrimeCliConfigPat
 		path: configPath,
 		teamIdFromEnv: teamIdFromEnv !== undefined,
 	};
-	const apiKey = stringField(data, "api_key");
+	const apiKey = includeCredentials ? stringField(data, "api_key") : undefined;
 	if (apiKey) {
 		config.apiKey = apiKey;
 	}
 	if (teamId) {
 		config.teamId = teamId;
 	}
-	if (!teamIdFromEnv) {
+	if (includeCredentials && !teamIdFromEnv) {
 		const teamName = stringField(data, "team_name");
 		const teamRole = stringField(data, "team_role");
 		if (teamName) {
@@ -650,7 +655,7 @@ export async function loginPrimeInference(
 	const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 	const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
 
-	if (config.apiKey) {
+	if (options.reuseExistingApiKey !== false && config.apiKey) {
 		callbacks.onProgress?.("Checking existing Prime CLI credentials...");
 		const access = await checkPrimeInferenceAccess(config.apiKey, config.baseUrl, {
 			fetchFn,
@@ -664,8 +669,10 @@ export async function loginPrimeInference(
 		callbacks.onProgress?.(
 			`Existing Prime CLI key cannot access Prime Inference (${formatAccessFailure(access)}). Starting browser login...`,
 		);
-	} else {
+	} else if (options.reuseExistingApiKey !== false) {
 		callbacks.onProgress?.("No Prime CLI API key found. Starting browser login...");
+	} else {
+		callbacks.onProgress?.("Starting browser login...");
 	}
 
 	const apiKey = await runPrimeBrowserLogin(config, callbacks, fetchFn, requestTimeoutMs, pollIntervalMs);

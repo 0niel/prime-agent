@@ -166,6 +166,37 @@ describe("openai-completions empty tools handling", () => {
 		expect(clientOptions.defaultHeaders?.["x-session-affinity"]).toBe("session-1");
 	});
 
+	it("allows callers to suppress ambient Prime team headers", async () => {
+		const originalTeamId = process.env.PRIME_TEAM_ID;
+		process.env.PRIME_TEAM_ID = "ambient-team";
+		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
+		const model = {
+			...baseModel,
+			api: "openai-completions",
+			provider: "prime-inference",
+			baseUrl: "https://api.pinference.ai/api/v1",
+		} as const;
+
+		try {
+			await streamSimple(
+				model,
+				{
+					messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+				},
+				{ apiKey: "test", headers: { "X-Prime-Team-ID": "" } },
+			).result();
+
+			const clientOptions = mockState.lastClientOptions as { defaultHeaders?: Record<string, unknown> };
+			expect(clientOptions.defaultHeaders).not.toHaveProperty("X-Prime-Team-ID");
+		} finally {
+			if (originalTeamId === undefined) {
+				delete process.env.PRIME_TEAM_ID;
+			} else {
+				process.env.PRIME_TEAM_ID = originalTeamId;
+			}
+		}
+	});
+
 	it("still emits tools: [] for Anthropic/LiteLLM proxy when conversation has tool history", async () => {
 		const { compat: _compat, ...baseModel } = getModel("openai", "gpt-4o-mini")!;
 		const model = { ...baseModel, api: "openai-completions" } as const;

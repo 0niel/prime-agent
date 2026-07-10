@@ -190,6 +190,30 @@ describe("ProviderAuthFlows", () => {
 		});
 	});
 
+	it("shows manual Prime login when ambient credentials are disabled", async () => {
+		process.env.HOME = tempDir;
+		const defaultPrimeDir = join(tempDir, ".prime");
+		mkdirSync(defaultPrimeDir, { recursive: true });
+		writeFileSync(join(defaultPrimeDir, "config.json"), JSON.stringify({ api_key: "prime-cli-key" }));
+		const authStorage = AuthStorage.create(authJsonPath, {
+			usePrimeCliConfig: true,
+			allowAmbientCredentials: false,
+		});
+		const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("offline"));
+		const { host, overlays } = createHost(authStorage);
+
+		const loginResult = new ProviderAuthFlows(host).runPrimeInferenceLogin();
+
+		await vi.waitFor(() => {
+			expect(stripAnsi(overlays[0]?.render(80).join("\n") ?? "")).toContain("Paste a Prime API key below:");
+		});
+		overlays[0]?.handleInput?.("\x1b");
+
+		await expect(loginResult).resolves.toEqual({ status: "cancelled" });
+		expect(fetchMock).toHaveBeenCalledOnce();
+		expect(authStorage.hasAuth(PRIME_INFERENCE_PROVIDER_ID)).toBe(false);
+	});
+
 	it("offers Prime Inference logout when auth comes from the Prime CLI config", async () => {
 		writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
 		const authStorage = AuthStorage.create(authJsonPath, {

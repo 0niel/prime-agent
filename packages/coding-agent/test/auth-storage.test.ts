@@ -157,6 +157,36 @@ describe("AuthStorage", () => {
 			}
 		});
 
+		test("ambient credentials are ignored when disabled", async () => {
+			const originalPrimeApiKey = process.env.PRIME_API_KEY;
+			process.env.PRIME_API_KEY = "env-prime-key";
+			const primeConfigPath = join(tempDir, "prime-config.json");
+			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
+			writeAuthJson({});
+
+			try {
+				authStorage = AuthStorage.create(authJsonPath, {
+					primeCliConfigPath: primeConfigPath,
+					usePrimeCliConfig: true,
+					allowAmbientCredentials: false,
+				});
+
+				expect(authStorage.allowsAmbientCredentials()).toBe(false);
+				expect(authStorage.hasAuth("prime-inference")).toBe(false);
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBeUndefined();
+				expect(authStorage.getProviderHeaders("prime-inference")).toEqual({ "X-Prime-Team-ID": "" });
+
+				authStorage.set("prime-inference", { type: "api_key", key: "stored-key" });
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("stored-key");
+			} finally {
+				if (originalPrimeApiKey === undefined) {
+					delete process.env.PRIME_API_KEY;
+				} else {
+					process.env.PRIME_API_KEY = originalPrimeApiKey;
+				}
+			}
+		});
+
 		test("changed ambient environment credential no longer matches stale auth marker", async () => {
 			const originalAwsProfile = process.env.AWS_PROFILE;
 			process.env.AWS_PROFILE = "stale-profile";

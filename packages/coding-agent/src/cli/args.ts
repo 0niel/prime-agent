@@ -25,6 +25,7 @@ export interface Args {
 	mode?: Mode;
 	daemonSocket?: string;
 	noSession?: boolean;
+	noEnv?: boolean;
 	fork?: string;
 	sessionDir?: string;
 	models?: string[];
@@ -134,6 +135,8 @@ export function parseArgs(args: string[]): Args {
 			result.appendSystemPrompt.push(args[++i]);
 		} else if (arg === "--no-session") {
 			result.noSession = true;
+		} else if (arg === "--no-env") {
+			result.noEnv = true;
 		} else if (arg === "--fork" && i + 1 < args.length) {
 			result.fork = args[++i];
 		} else if (arg === "--session-dir" && i + 1 < args.length) {
@@ -276,6 +279,7 @@ ${chalk.bold("Options:")}
   --fork <path|id>               Fork specific session file or partial UUID into a new session
   --session-dir <dir>            Directory for session storage and lookup
   --no-session                   Don't save session (ephemeral)
+  --no-env                       Ignore ambient environment and Prime CLI credentials
   --models <patterns>            Comma-separated model patterns for Ctrl+P cycling
                                  Supports globs (anthropic/*, *sonnet*) and fuzzy matching
   --no-tools, -nt                Disable all tools by default (built-in and extension)

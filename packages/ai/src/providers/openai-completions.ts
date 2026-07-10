@@ -477,6 +477,9 @@ function createClient(
 	if (optionsHeaders) {
 		Object.assign(headers, optionsHeaders);
 	}
+	if (model.provider === "prime-inference" && headers["X-Prime-Team-ID"] === "") {
+		delete headers["X-Prime-Team-ID"];
+	}
 
 	const defaultHeaders =
 		model.provider === "cloudflare-ai-gateway"

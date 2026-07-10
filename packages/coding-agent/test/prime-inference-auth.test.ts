@@ -154,6 +154,36 @@ describe("Prime Inference auth", () => {
 		}
 	});
 
+	it("loads Prime CLI endpoints without ambient credentials", () => {
+		const originalTeamId = process.env.PRIME_TEAM_ID;
+		process.env.PRIME_TEAM_ID = "env-team";
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				api_key: "prime-key",
+				base_url: "https://prime-api.example/api/v1",
+				frontend_url: "https://prime-app.example",
+				team_id: "file-team",
+			}),
+		);
+
+		try {
+			expect(loadPrimeCliConfig(configPath, { includeCredentials: false })).toEqual({
+				baseUrl: "https://prime-api.example",
+				frontendUrl: "https://prime-app.example",
+				inferenceUrl: "https://api.pinference.ai/api/v1",
+				path: configPath,
+				teamIdFromEnv: false,
+			});
+		} finally {
+			if (originalTeamId === undefined) {
+				delete process.env.PRIME_TEAM_ID;
+			} else {
+				process.env.PRIME_TEAM_ID = originalTeamId;
+			}
+		}
+	});
+
 	it("fetches Prime teams across paginated responses", async () => {
 		const requestedUrls: string[] = [];
 		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -363,6 +393,49 @@ describe("Prime Inference auth", () => {
 			instructions: "Code: challenge-code",
 		});
 		expect(progress.join("\n")).toContain("Existing Prime CLI key cannot access Prime Inference");
+	});
+
+	it("skips an existing Prime CLI key when credential reuse is disabled", async () => {
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				api_key: "old-key",
+				base_url: "https://prime-api.example",
+				frontend_url: "https://prime-app.example",
+			}),
+		);
+		let challengePublicKey = "";
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const url = getUrl(input);
+			if (url === "https://prime-api.example/api/v1/auth_challenge/generate") {
+				challengePublicKey = String(getJsonBody(init).encryptionPublicKey);
+				return jsonResponse({ challenge: "challenge-code", status_auth_token: "status-token" });
+			}
+			if (url.startsWith("https://prime-api.example/api/v1/auth_challenge/status")) {
+				return jsonResponse({ result: encryptChallengeResult(challengePublicKey, "browser-key") });
+			}
+			if (url === "https://prime-api.example/api/v1/user/whoami") {
+				expect(getAuthorization(init)).toBe("Bearer browser-key");
+				return jsonResponse({ data: { scope: { inference: { write: true } } } });
+			}
+			throw new Error(`Unexpected fetch URL: ${url}`);
+		});
+		const onAuth = vi.fn();
+
+		const result = await loginPrimeInference(
+			{ onAuth },
+			{
+				configPath,
+				fetchFn: fetchMock,
+				pollIntervalMs: 0,
+				requestTimeoutMs: 1000,
+				reuseExistingApiKey: false,
+			},
+		);
+
+		expect(result).toEqual({ apiKey: "browser-key", source: "browser" });
+		expect(onAuth).toHaveBeenCalledOnce();
+		expect(fetchMock).toHaveBeenCalledTimes(3);
 	});
 
 	it("requests agent trace scope during Prime Agent trace browser login", async () => {

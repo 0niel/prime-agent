@@ -217,6 +217,14 @@ describe("parseArgs", () => {
 		});
 	});
 
+	describe("--no-env flag", () => {
+		test("parses --no-env as a built-in flag", () => {
+			const result = parseArgs(["--no-env"]);
+			expect(result.noEnv).toBe(true);
+			expect(result.unknownFlags.size).toBe(0);
+		});
+	});
+
 	describe("--extension flag", () => {
 		test("parses single --extension", () => {
 			const result = parseArgs(["--extension", "./my-extension.ts"]);

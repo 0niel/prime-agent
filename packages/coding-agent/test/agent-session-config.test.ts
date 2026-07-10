@@ -9,6 +9,7 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 			model: "openai/gpt-4o",
 			tools: ["ipython"],
 			noTools: true,
+			noEnv: true,
 			extensionFlagValues: { plan: true },
 		};
 
@@ -27,6 +28,7 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 			model: "anthropic/claude-sonnet-4-5",
 			tools: ["bash"],
 			noTools: false,
+			noEnv: true,
 			extensionFlagValues: { plan: true, mode: "fast" },
 		});
 		expect(merged.tools).not.toBe(overrides.tools);
@@ -37,6 +39,7 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 			model: "openai/gpt-4o",
 			tools: ["ipython"],
 			noTools: true,
+			noEnv: true,
 			extensionFlagValues: { plan: true },
 		});
 	});

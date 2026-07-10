@@ -107,6 +107,22 @@ describe("issue #4491 provider stale after repeated 401", () => {
 		});
 	});
 
+	it("retries bare auth failures once instead of exhausting the general retry budget", async () => {
+		const harness = await createHarness({
+			provider: "prime-inference",
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([bareProvider401Message(), bareProvider401Message(), bareProvider401Message()]);
+
+		await harness.session.prompt("hello");
+
+		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([1]);
+		expect(harness.eventsOfType("auto_retry_end").map((event) => event.attempt)).toEqual([1]);
+		expect(harness.eventsOfType("auth_stale")).toHaveLength(1);
+	});
+
 	it("classifies bare status-code auth failures before login guidance is appended", async () => {
 		const harness = await createHarness({
 			provider: "prime-inference",
