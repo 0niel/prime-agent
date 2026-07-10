@@ -13,6 +13,8 @@
 - Fixed stale heartbeat jobs reopening archived, deleted, or concurrently terminated sessions ([ENG-4519](https://linear.app/primeintellect/issue/ENG-4519/heartbeats-rebirth-sessions-that-were-previously-killed)).
 - Fixed onboarding blocking normal TUI use by reopening login or model selection after startup ([ENG-4537](https://linear.app/primeintellect/issue/ENG-4537/stop-onboarding-from-gating-normal-tui-use)).
 - Fixed IPython Bash cells with leading blank lines being labeled and previewed as Python ([ENG-4529](https://linear.app/primeintellect/issue/ENG-4529/leading-newline-before-percentpercentbash-names-tool-call-as-python)).
+- Fixed recap layout shifts by keeping the previous recap visible until its replacement arrives ([ENG-4533](https://linear.app/primeintellect/issue/ENG-4533/reserve-space-for-recap-to-prevent-layout-shift)).
+- Changed the new-chat tray to hide shortcut guidance while typing and keep the `agents` link visible.
 
 ## [0.2.8] - 2026-07-09
 

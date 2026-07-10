@@ -85,7 +85,6 @@ import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.j
 import {
 	createCompactionSummaryMessage,
 	createHeartbeatPromptMessage,
-	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
@@ -2896,24 +2895,16 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	/** Render the recap line above the editor, only when one exists. */
+	/** Render the recap line above the editor when one exists. */
 	private renderRecap(): void {
 		if (!this.recapContainer) return;
 		this.recapContainer.clear();
-		// The subagent panel shows its own recap; suppress the parent's while it's open.
 		const recap = this.childAgentPanelMode ? undefined : this.sessionRecap?.trim();
 		if (recap) {
-			this.recapContainer.addChild(new Text(theme.fg("dim", `Recap: ${recap}`), 1, 0));
-			// Blank line between the recap and the prompt bar below it.
+			this.recapContainer.addChild(new TruncatedText(theme.fg("dim", `Recap: ${recap}`), 1, 0));
 			this.recapContainer.addChild(new Spacer(1));
 		}
 		this.ui.requestRender();
-	}
-
-	private clearStaleRecapForPromptTurn(): void {
-		this.sessionRecap = undefined;
-		this.renderRecap();
-		this.updatePendingMessagesDisplay();
 	}
 
 	private renderWidgetContainer(
@@ -4371,13 +4362,9 @@ export class InteractiveMode {
 			case "message_start":
 				if (event.message.role === "custom") {
 					this.addMessageToChat(event.message);
-					if (event.message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE) {
-						this.clearStaleRecapForPromptTurn();
-					}
 					this.ui.requestRender();
 				} else if (event.message.role === "user") {
 					this.addMessageToChat(event.message);
-					this.clearStaleRecapForPromptTurn();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
 					this.startAssistantStreamingMessage(event.message);
@@ -4936,7 +4923,7 @@ export class InteractiveMode {
 	}
 
 	private getShortcutsTrayHint(): string | undefined {
-		if (!this.isNewChat()) {
+		if (!this.isNewChat() || this.editor.getText().length > 0) {
 			return undefined;
 		}
 		return keyText("app.shortcuts") ? keyHint("app.shortcuts", "for shortcuts") : "/hotkeys for shortcuts";
@@ -4971,10 +4958,7 @@ export class InteractiveMode {
 		if (!this.options.returnToAgentsView) {
 			return undefined;
 		}
-		if (this.editor.getText().trim()) {
-			return undefined;
-		}
-		return keyHint("app.agents.back", "agents view");
+		return keyHint("app.agents.back", "agents");
 	}
 
 	private getTrayContextLabel(): string | undefined {

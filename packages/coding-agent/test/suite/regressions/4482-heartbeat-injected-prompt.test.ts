@@ -371,16 +371,16 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		expect(expanded).toContain("Check whether the long-running task needs another step.");
 	});
 
-	it("clears stale recaps when heartbeat prompt turns start", async () => {
+	it("keeps the current recap when heartbeat prompt turns start", async () => {
 		const heartbeatMode = createMessageStartMode();
 		const heartbeatMessage = createHeartbeatPromptMessage(createHeartbeat());
 
 		await handleMessageStart(heartbeatMode, heartbeatMessage);
 
 		expect(heartbeatMode.addMessageToChat).toHaveBeenCalledWith(heartbeatMessage);
-		expect(heartbeatMode.sessionRecap).toBeUndefined();
-		expect(heartbeatMode.renderRecap).toHaveBeenCalled();
-		expect(heartbeatMode.updatePendingMessagesDisplay).toHaveBeenCalled();
+		expect(heartbeatMode.sessionRecap).toBe("previous recap");
+		expect(heartbeatMode.renderRecap).not.toHaveBeenCalled();
+		expect(heartbeatMode.updatePendingMessagesDisplay).not.toHaveBeenCalled();
 
 		const goalMode = createMessageStartMode();
 		const goal: GoalState = {
