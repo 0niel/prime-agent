@@ -687,16 +687,23 @@ export class ProviderAuthFlows {
 		};
 
 		try {
-			const browserLogin = loginPrimeAgentTraces({
-				onAuth: (info) => {
-					dialog.showAuth(info.url, info.instructions);
-					armManualInput("Complete the sign-in in your browser, or paste a Prime API key below:");
+			const authStorage = this.host.modelRegistry.authStorage;
+			const browserLogin = loginPrimeAgentTraces(
+				{
+					onAuth: (info) => {
+						dialog.showAuth(info.url, info.instructions);
+						armManualInput("Complete the sign-in in your browser, or paste a Prime API key below:");
+					},
+					onProgress: (message) => {
+						dialog.showProgress(message);
+					},
+					signal: browserAbort.signal,
 				},
-				onProgress: (message) => {
-					dialog.showProgress(message);
+				{
+					configPath: authStorage.getPrimeCliConfigPath(),
+					reuseExistingApiKey: authStorage.allowsAmbientCredentials(),
 				},
-				signal: browserAbort.signal,
-			});
+			);
 			const browserLoginOrFallback = browserLogin.catch((error: unknown) => {
 				if (browserAbort.signal.aborted) {
 					throw error;

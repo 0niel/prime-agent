@@ -480,6 +480,50 @@ describe("Prime Inference auth", () => {
 		});
 	});
 
+	it("skips an existing Prime CLI key for trace login when credential reuse is disabled", async () => {
+		process.env.PRIME_AGENT_TRACES_BASE_URL = "https://prime-api.example/api/v1";
+		writeFileSync(
+			configPath,
+			JSON.stringify({
+				api_key: "old-key",
+				base_url: "https://prime-api.example",
+				frontend_url: "https://prime-app.example",
+			}),
+		);
+		let challengePublicKey = "";
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const url = getUrl(input);
+			if (url === "https://prime-api.example/api/v1/auth_challenge/generate") {
+				challengePublicKey = String(getJsonBody(init).encryptionPublicKey);
+				return jsonResponse({ challenge: "challenge-code", status_auth_token: "status-token" });
+			}
+			if (url.startsWith("https://prime-api.example/api/v1/auth_challenge/status")) {
+				return jsonResponse({ result: encryptChallengeResult(challengePublicKey, "trace-key") });
+			}
+			if (url === "https://prime-api.example/api/v1/user/whoami") {
+				expect(getAuthorization(init)).toBe("Bearer trace-key");
+				return jsonResponse({ data: { scope: { agent_traces: { write: true } } } });
+			}
+			throw new Error(`Unexpected fetch URL: ${url}`);
+		});
+		const onAuth = vi.fn();
+
+		const result = await loginPrimeAgentTraces(
+			{ onAuth },
+			{
+				configPath,
+				fetchFn: fetchMock,
+				pollIntervalMs: 0,
+				requestTimeoutMs: 1000,
+				reuseExistingApiKey: false,
+			},
+		);
+
+		expect(result).toEqual({ apiKey: "trace-key", source: "browser" });
+		expect(onAuth).toHaveBeenCalledOnce();
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+	});
+
 	it("rejects an expired browser challenge", async () => {
 		writeFileSync(configPath, JSON.stringify({ base_url: "https://prime-api.example" }));
 		const fetchMock = vi.fn(async (input: string | URL | Request): Promise<Response> => {

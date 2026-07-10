@@ -701,7 +701,7 @@ export async function loginPrimeAgentTraces(
 	const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
 	const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
 
-	if (config.apiKey) {
+	if (options.reuseExistingApiKey !== false && config.apiKey) {
 		callbacks.onProgress?.("Checking existing Prime CLI credentials...");
 		const access = await checkPrimeAgentTracesAccess(config.apiKey, traceConfig.baseUrl, {
 			fetchFn,
@@ -715,8 +715,10 @@ export async function loginPrimeAgentTraces(
 		callbacks.onProgress?.(
 			`Existing Prime CLI key cannot upload Prime Agent traces (${formatAccessFailure(access)}). Starting browser login...`,
 		);
-	} else {
+	} else if (options.reuseExistingApiKey !== false) {
 		callbacks.onProgress?.("No Prime CLI API key found. Starting browser login...");
+	} else {
+		callbacks.onProgress?.("Starting browser login...");
 	}
 
 	const apiKey = await runPrimeBrowserLogin(
