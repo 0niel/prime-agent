@@ -20,6 +20,10 @@ export type AuthSelectorProvider = {
 	category?: AuthSelectorCategory;
 };
 
+export interface OAuthSelectorOptions extends MenuViewportProvider {
+	initialCategory?: AuthSelectorCategory;
+}
+
 export function compareAuthSelectorProviders(a: AuthSelectorProvider, b: AuthSelectorProvider): number {
 	if (a.authType !== b.authType) {
 		return a.authType === "oauth" ? -1 : 1;
@@ -77,14 +81,14 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		onSelect: (provider: AuthSelectorProvider) => void,
 		onCancel: () => void,
 		getAuthStatus?: (providerId: string) => AuthStatus,
-		viewport: MenuViewportProvider = {},
+		options: OAuthSelectorOptions = {},
 	) {
 		super();
 
 		this.mode = mode;
 		this.authStorage = authStorage;
 		this.getAuthStatus = getAuthStatus ?? ((providerId) => this.authStorage.getAuthStatus(providerId));
-		this.viewport = viewport;
+		this.viewport = options;
 		this.allProviders = this.sortProviders(providers);
 		this.filteredProviders = this.allProviders;
 		this.onSelectCallback = onSelect;
@@ -92,7 +96,10 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 
 		const present = new Set(providers.map((p) => p.category ?? "provider"));
 		this.categories = (["provider", "service"] as const).filter((c) => present.has(c));
-		this.activeCategory = this.categories[0] ?? "provider";
+		this.activeCategory =
+			options.initialCategory && this.categories.includes(options.initialCategory)
+				? options.initialCategory
+				: (this.categories[0] ?? "provider");
 
 		const panel = new MenuPanel({
 			title: mode === "login" ? "Providers" : "Saved Credentials",

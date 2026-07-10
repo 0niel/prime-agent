@@ -43,6 +43,14 @@ describe("built-in slash commands", () => {
 		expect(builtinSlashCommandTakesArgument("side")).toBe(true);
 	});
 
+	test("describes /mcp as the Services menu entry point", () => {
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "mcp")).toMatchObject({
+			description: "Open Services or manage MCP integrations",
+			argumentHint: "[list|login <name>|logout <name>]",
+			takesArgument: true,
+		});
+	});
+
 	test("marks argument commands as taking a free-form argument", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "goal")).toMatchObject({
 			takesArgument: true,
@@ -54,6 +62,7 @@ describe("built-in slash commands", () => {
 		expect(builtinSlashCommandTakesArgument("effort")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("thinking")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("heartbeat")).toBe(true);
+		expect(builtinSlashCommandTakesArgument("mcp")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("new")).toBe(false);
 		expect(builtinSlashCommandTakesArgument("clear")).toBe(false);
 	});

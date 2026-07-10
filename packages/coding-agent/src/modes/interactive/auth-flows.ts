@@ -32,6 +32,7 @@ import { showFullPaneOverlay } from "./components/centered-overlay.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { LoginDialogComponent } from "./components/login-dialog.js";
 import {
+	type AuthSelectorCategory,
 	type AuthSelectorProvider,
 	compareAuthSelectorProviders,
 	OAuthSelectorComponent,
@@ -114,6 +115,11 @@ export interface ProviderAuthFlowsHost {
 	onLoginCompleted?(): void;
 }
 
+export interface ProviderLoginOptions {
+	authType?: "oauth" | "api_key";
+	initialCategory?: AuthSelectorCategory;
+}
+
 export class ProviderAuthFlows {
 	constructor(private readonly host: ProviderAuthFlowsHost) {}
 
@@ -135,7 +141,8 @@ export class ProviderAuthFlows {
 		return this.showLoginDialog(providerId, label ?? provider.name, "service");
 	}
 
-	runLogin(authType?: "oauth" | "api_key"): Promise<AuthenticationResult> {
+	runLogin(options: ProviderLoginOptions = {}): Promise<AuthenticationResult> {
+		const { authType, initialCategory } = options;
 		const providerOptions = this.getLoginProviderOptions(authType);
 		if (providerOptions.length === 0) {
 			this.host.showStatus(
@@ -177,7 +184,7 @@ export class ProviderAuthFlows {
 					resolve({ status: "cancelled" });
 				},
 				(providerId) => this.host.modelRegistry.getProviderAuthStatus(providerId),
-				{ getRows: () => this.host.ui.terminal.rows },
+				{ getRows: () => this.host.ui.terminal.rows, initialCategory },
 			);
 			handle = showFullPaneOverlay(this.host.ui, selector, 78);
 		});

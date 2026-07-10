@@ -55,6 +55,7 @@ function createHost(authStorage: AuthStorage): {
 		refresh: vi.fn(),
 		getAll: () => [],
 		getProviderDisplayName: (providerId: string) => providerId,
+		getProviderAuthStatus: (providerId: string) => authStorage.getAuthStatus(providerId),
 	} as unknown as ModelRegistry;
 
 	return {
@@ -204,5 +205,19 @@ describe("ProviderAuthFlows", () => {
 		expect(stripAnsi(overlays[0]?.render(80).join("\n") ?? "")).toContain("Prime Inference");
 		overlays[0]?.handleInput?.("\x1b");
 		await expect(logoutResult).resolves.toBeNull();
+	});
+
+	it("opens login on the requested Services category", async () => {
+		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
+		const { host, overlays } = createHost(authStorage);
+
+		const loginResult = new ProviderAuthFlows(host).runLogin({ initialCategory: "service" });
+
+		expect(overlays).toHaveLength(1);
+		const output = stripAnsi(overlays[0]?.render(80).join("\n") ?? "");
+		expect(output).toContain("Serper (web search)");
+		expect(output).not.toContain("Anthropic");
+		overlays[0]?.handleInput?.("\x1b");
+		await expect(loginResult).resolves.toEqual({ status: "cancelled" });
 	});
 });
