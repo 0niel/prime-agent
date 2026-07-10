@@ -1265,10 +1265,13 @@ function convertTools(
 			description: tool.description,
 			...(supportsEagerToolInputStreaming ? { eager_input_streaming: true } : {}),
 			input_schema: {
-				...schema,
 				type: "object",
 				properties: schema.properties ?? {},
 				required,
+				...(Object.hasOwn(schema, "additionalProperties")
+					? { additionalProperties: schema.additionalProperties }
+					: {}),
+				...(Object.hasOwn(schema, "patternProperties") ? { patternProperties: schema.patternProperties } : {}),
 			},
 			...(cacheControl && index === tools.length - 1 ? { cache_control: cacheControl } : {}),
 		};

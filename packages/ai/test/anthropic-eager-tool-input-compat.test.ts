@@ -226,4 +226,32 @@ describe("Anthropic tool schema compatibility", () => {
 			required: [],
 		});
 	});
+
+	it("does not forward root schema metadata", async () => {
+		const request = await captureAnthropicRequest(
+			undefined,
+			createContext([
+				{
+					name: "labels",
+					description: "Submit labels",
+					parameters: Type.Unsafe({
+						$schema: "https://json-schema.org/draft/2020-12/schema",
+						$defs: { label: Type.String() },
+						definitions: { legacyLabel: Type.String() },
+						type: "object",
+						properties: { label: Type.String() },
+						required: ["label"],
+						additionalProperties: false,
+					}),
+				},
+			]),
+		);
+
+		expect(getInputSchema(request.body)).toEqual({
+			type: "object",
+			properties: { label: { type: "string" } },
+			required: ["label"],
+			additionalProperties: false,
+		});
+	});
 });
