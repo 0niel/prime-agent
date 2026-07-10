@@ -309,7 +309,7 @@ describe("ENG-4519 heartbeat rebirth", () => {
 		expect(promptHeartbeat).toHaveBeenCalledWith(
 			expect.objectContaining({ id: heartbeat.id, prompt: "continue scheduled work" }),
 			expect.objectContaining({
-				streamingBehavior: "followUp",
+				streamingBehavior: "steer",
 				followUpQueueKey: `heartbeat:${heartbeat.id}`,
 				source: "rpc",
 			}),

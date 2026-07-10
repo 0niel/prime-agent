@@ -67,7 +67,7 @@ import {
 	uploadAgentTraceFile,
 } from "../../core/agent-traces.js";
 import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
-import { type AgentCronJob, parseHeartbeatCommand } from "../../core/cron-jobs.js";
+import { type AgentCronJob, DEFAULT_HEARTBEAT_DELIVERY_MODE, parseHeartbeatCommand } from "../../core/cron-jobs.js";
 import type {
 	AutocompleteProviderFactory,
 	ContextUsage,
@@ -424,6 +424,16 @@ const HEARTBEAT_ARGUMENT_COMPLETIONS: AutocompleteItem[] = [
 		value: "every ",
 		label: "every <duration> <instruction>",
 		description: "Set an interval, then add an instruction: /heartbeat every 10s Scan the logs",
+	},
+	{
+		value: "--steer ",
+		label: "--steer <instruction>",
+		description: "Deliver by interrupting the current turn (default)",
+	},
+	{
+		value: "--follow-up ",
+		label: "--follow-up <instruction>",
+		description: "Deliver as a follow-up after the current turn finishes",
 	},
 ];
 
@@ -8196,9 +8206,15 @@ export class InteractiveMode {
 					return;
 				}
 				case "set": {
-					const heartbeat = await this.agentConnection.setHeartbeat(command.schedule, command.instruction);
+					const heartbeat = await this.agentConnection.setHeartbeat(
+						command.schedule,
+						command.instruction,
+						command.deliveryMode,
+					);
 					this.patchConnectionState({ heartbeat });
-					this.showStatus(`Heartbeat set\nNext run: ${heartbeat.nextRunAt ?? "-"}`);
+					this.showStatus(
+						`Heartbeat set\nDelivery: ${heartbeat.deliveryMode ?? DEFAULT_HEARTBEAT_DELIVERY_MODE}\nNext run: ${heartbeat.nextRunAt ?? "-"}`,
+					);
 					return;
 				}
 				case "pause": {
@@ -8249,6 +8265,7 @@ export class InteractiveMode {
 			"",
 			`${theme.fg("dim", "Status:")} ${job.status}`,
 			`${theme.fg("dim", "Every:")} ${job.schedule.expression}`,
+			`${theme.fg("dim", "Delivery:")} ${job.deliveryMode ?? DEFAULT_HEARTBEAT_DELIVERY_MODE}`,
 			`${theme.fg("dim", "Instruction:")} ${job.prompt}`,
 			`${theme.fg("dim", "Next:")} ${next}`,
 			`${theme.fg("dim", "Last:")} ${last}`,

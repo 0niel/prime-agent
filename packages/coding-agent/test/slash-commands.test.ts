@@ -18,8 +18,9 @@ describe("built-in slash commands", () => {
 
 	test("exposes heartbeat syntax guidance", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "heartbeat")).toMatchObject({
-			description: "Set or view a persistent heartbeat; supports pause, resume, stop, and clear",
-			argumentHint: "[status|pause|resume|stop|every <duration> <instruction>]",
+			description:
+				"Set or view a persistent heartbeat; delivery defaults to steer, use --follow-up to queue; supports pause, resume, stop, and clear",
+			argumentHint: "[status|pause|resume|stop|[every <duration>] [--steer|--follow-up] <instruction>]",
 			takesArgument: true,
 		});
 	});

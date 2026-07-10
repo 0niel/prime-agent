@@ -10,6 +10,11 @@ export type AgentCronJobSource = "cron" | "heartbeat" | "rlm_heartbeat";
 export type AgentCronJobRuntimeKind = "top-level" | "subagent";
 export type AgentHeartbeatUpdateAction = "pause" | "resume" | "clear";
 export type AgentRlmHeartbeatStatusUpdate = "pause" | "resume";
+/**
+ * How a scheduled heartbeat prompt is delivered when the target session is busy:
+ * "steer" interrupts the current turn, "follow_up" waits for it to finish.
+ */
+export type AgentHeartbeatDeliveryMode = "steer" | "follow_up";
 
 export interface AgentCronSchedule {
 	kind: AgentCronScheduleKind;
@@ -22,6 +27,8 @@ export interface AgentCronJob {
 	status: AgentCronJobStatus;
 	source?: AgentCronJobSource;
 	runtimeKind?: AgentCronJobRuntimeKind;
+	/** Delivery mode for heartbeat/rlm_heartbeat jobs when the session is busy. Defaults to "steer". */
+	deliveryMode?: AgentHeartbeatDeliveryMode;
 	activeSessionId: string;
 	sessionId: string;
 	sessionFile: string;
@@ -48,6 +55,7 @@ export interface CreateAgentCronJobInput {
 	scheduleText: string;
 	source?: AgentCronJobSource;
 	runtimeKind?: AgentCronJobRuntimeKind;
+	deliveryMode?: AgentHeartbeatDeliveryMode;
 	now?: Date;
 }
 
@@ -76,13 +84,14 @@ const MAX_TIMEOUT_MS = 2_147_483_647;
 const ONE_SECOND_MS = 1000;
 const ONE_MINUTE_MS = 60_000;
 export const DEFAULT_HEARTBEAT_SCHEDULE = "every 5m";
+export const DEFAULT_HEARTBEAT_DELIVERY_MODE: AgentHeartbeatDeliveryMode = "steer";
 
 export type ParsedHeartbeatCommand =
 	| { type: "status" }
 	| { type: "pause" }
 	| { type: "resume" }
 	| { type: "clear" }
-	| { type: "set"; schedule: string; instruction: string };
+	| { type: "set"; schedule: string; instruction: string; deliveryMode?: AgentHeartbeatDeliveryMode };
 
 export interface AgentCronToolController {
 	getHeartbeat(): AgentCronJob | undefined;
@@ -90,13 +99,19 @@ export interface AgentCronToolController {
 
 export interface AgentRlmHeartbeatController {
 	listRlmHeartbeats(options?: { includeInactive?: boolean }): AgentCronJob[];
-	createRlmHeartbeat(input: { instruction: string; interval?: string; label?: string }): AgentCronJob;
+	createRlmHeartbeat(input: {
+		instruction: string;
+		interval?: string;
+		label?: string;
+		deliveryMode?: AgentHeartbeatDeliveryMode;
+	}): AgentCronJob;
 	updateRlmHeartbeat(input: {
 		id: string;
 		instruction?: string;
 		interval?: string;
 		label?: string;
 		status?: AgentRlmHeartbeatStatusUpdate;
+		deliveryMode?: AgentHeartbeatDeliveryMode;
 	}): AgentCronJob | undefined;
 	deleteRlmHeartbeat(id: string): AgentCronJob | undefined;
 }
@@ -224,6 +239,7 @@ export class AgentCronJobStore {
 			status: "active",
 			source: "heartbeat",
 			runtimeKind: input.runtimeKind,
+			deliveryMode: input.deliveryMode ?? DEFAULT_HEARTBEAT_DELIVERY_MODE,
 			activeSessionId: input.activeSessionId,
 			sessionId: input.sessionId,
 			sessionFile: input.sessionFile,
@@ -270,6 +286,7 @@ export class AgentCronJobStore {
 			status: "active",
 			source: "rlm_heartbeat",
 			runtimeKind: input.runtimeKind,
+			deliveryMode: input.deliveryMode ?? DEFAULT_HEARTBEAT_DELIVERY_MODE,
 			activeSessionId: input.activeSessionId,
 			sessionId: input.sessionId,
 			sessionFile: input.sessionFile,
@@ -294,6 +311,7 @@ export class AgentCronJobStore {
 			prompt?: string;
 			scheduleText?: string;
 			status?: AgentRlmHeartbeatStatusUpdate;
+			deliveryMode?: AgentHeartbeatDeliveryMode;
 			now?: Date;
 		},
 	): AgentCronJob | undefined {
@@ -311,6 +329,9 @@ export class AgentCronJobStore {
 			let nextJob: AgentCronJob = { ...job };
 			if (update.label !== undefined) {
 				nextJob = { ...nextJob, label: normalizeOptionalLabel(update.label) };
+			}
+			if (update.deliveryMode !== undefined) {
+				nextJob = { ...nextJob, deliveryMode: update.deliveryMode };
 			}
 			if (update.prompt !== undefined) {
 				const prompt = update.prompt.trim();
@@ -744,6 +765,22 @@ export function normalizeHeartbeatSchedule(input: string | undefined): string {
 	return text;
 }
 
+export function normalizeHeartbeatDeliveryMode(value: unknown): AgentHeartbeatDeliveryMode | undefined {
+	if (value === undefined || value === null) {
+		return undefined;
+	}
+	if (value === "steer" || value === "follow_up") {
+		return value;
+	}
+	throw new Error('Heartbeat delivery mode must be "steer" or "follow_up"');
+}
+
+export function resolveHeartbeatStreamingBehavior(
+	deliveryMode: AgentHeartbeatDeliveryMode | undefined,
+): "steer" | "followUp" {
+	return (deliveryMode ?? DEFAULT_HEARTBEAT_DELIVERY_MODE) === "follow_up" ? "followUp" : "steer";
+}
+
 export function parseHeartbeatCommand(input: string): ParsedHeartbeatCommand {
 	const text = input.replace(/^\/heartbeat\b/, "").trim();
 	if (!text || text === "status") {
@@ -759,31 +796,50 @@ export function parseHeartbeatCommand(input: string): ParsedHeartbeatCommand {
 		return { type: "clear" };
 	}
 
-	const option = consumeEveryOption(text);
+	const leadingDelivery = consumeDeliveryOption(text);
+	let deliveryMode = leadingDelivery.deliveryMode;
+	let remaining = leadingDelivery.rest;
+
+	const option = consumeEveryOption(remaining);
 	if (option) {
-		if (!option.rest) {
-			throw new Error("Usage: /heartbeat [--every <interval>] <instruction>");
+		const trailingDelivery = consumeDeliveryOption(option.rest);
+		deliveryMode = trailingDelivery.deliveryMode ?? deliveryMode;
+		if (!trailingDelivery.rest) {
+			throw new Error("Usage: /heartbeat [--every <interval>] [--steer|--follow-up] <instruction>");
 		}
 		return {
 			type: "set",
 			schedule: normalizeHeartbeatSchedule(option.interval),
-			instruction: option.rest,
+			instruction: trailingDelivery.rest,
+			...(deliveryMode ? { deliveryMode } : {}),
 		};
 	}
 
-	const leadingSchedule = consumeLeadingEverySchedule(text);
+	const leadingSchedule = consumeLeadingEverySchedule(remaining);
 	if (leadingSchedule) {
-		if (!leadingSchedule.rest) {
-			throw new Error("Usage: /heartbeat [--every <interval>] <instruction>");
+		const trailingDelivery = consumeDeliveryOption(leadingSchedule.rest);
+		deliveryMode = trailingDelivery.deliveryMode ?? deliveryMode;
+		if (!trailingDelivery.rest) {
+			throw new Error("Usage: /heartbeat [--every <interval>] [--steer|--follow-up] <instruction>");
 		}
 		return {
 			type: "set",
 			schedule: normalizeHeartbeatSchedule(leadingSchedule.interval),
-			instruction: leadingSchedule.rest,
+			instruction: trailingDelivery.rest,
+			...(deliveryMode ? { deliveryMode } : {}),
 		};
 	}
 
-	return { type: "set", schedule: DEFAULT_HEARTBEAT_SCHEDULE, instruction: text };
+	remaining = remaining.trim();
+	if (!remaining) {
+		throw new Error("Usage: /heartbeat [--every <interval>] [--steer|--follow-up] <instruction>");
+	}
+	return {
+		type: "set",
+		schedule: DEFAULT_HEARTBEAT_SCHEDULE,
+		instruction: remaining,
+		...(deliveryMode ? { deliveryMode } : {}),
+	};
 }
 
 export function nextRunAtForSchedule(schedule: AgentCronSchedule, after: Date): Date | undefined {
@@ -830,6 +886,70 @@ export function createAgentHeartbeatToolDefinitions(controller: AgentCronToolCon
 	];
 }
 
+function consumeDeliveryOption(text: string): { deliveryMode: AgentHeartbeatDeliveryMode | undefined; rest: string } {
+	let rest = text.trim();
+	if (/(?:^|\s)--deliver=?$/i.test(rest)) {
+		throw new Error('Heartbeat delivery mode must be "steer" or "follow_up"');
+	}
+	let deliveryMode: AgentHeartbeatDeliveryMode | undefined;
+	let leading = consumeLeadingDeliveryFlag(rest);
+	while (leading) {
+		deliveryMode = leading.deliveryMode;
+		rest = leading.rest.trim();
+		leading = consumeLeadingDeliveryFlag(rest);
+	}
+
+	let trailing = consumeTrailingDeliveryFlag(rest);
+	let trailingDeliveryMode: AgentHeartbeatDeliveryMode | undefined;
+	while (trailing) {
+		// Consume all trailing flags, but keep the rightmost flag's mode because it
+		// is textually latest and should win over earlier flags.
+		trailingDeliveryMode ??= trailing.deliveryMode;
+		rest = trailing.rest.trim();
+		trailing = consumeTrailingDeliveryFlag(rest);
+	}
+	return { deliveryMode: trailingDeliveryMode ?? deliveryMode, rest };
+}
+
+function consumeLeadingDeliveryFlag(
+	text: string,
+): { deliveryMode: AgentHeartbeatDeliveryMode; rest: string } | undefined {
+	const match = /^--(?:deliver(?:=|\s+)(\S+)|(steer)|(follow[-_]up))(?:\s+|$)([\s\S]*)$/i.exec(text);
+	if (!match) {
+		return undefined;
+	}
+	return {
+		deliveryMode: parseDeliveryModeToken(match[1] ?? match[2] ?? match[3] ?? ""),
+		rest: match[4]?.trim() ?? "",
+	};
+}
+
+function consumeTrailingDeliveryFlag(
+	text: string,
+): { deliveryMode: AgentHeartbeatDeliveryMode; rest: string } | undefined {
+	const deliverWithSpace = /^([\s\S]*?)\s+--deliver\s+(\S+)$/i.exec(text);
+	if (deliverWithSpace) {
+		return { deliveryMode: parseDeliveryModeToken(deliverWithSpace[2] ?? ""), rest: deliverWithSpace[1] ?? "" };
+	}
+	const deliverWithEquals = /^([\s\S]*?)\s+--deliver=(\S+)$/i.exec(text);
+	if (deliverWithEquals) {
+		return { deliveryMode: parseDeliveryModeToken(deliverWithEquals[2] ?? ""), rest: deliverWithEquals[1] ?? "" };
+	}
+	const shorthand = /^([\s\S]*?)\s+--(steer|follow[-_]up)$/i.exec(text);
+	if (shorthand) {
+		return { deliveryMode: parseDeliveryModeToken(shorthand[2] ?? ""), rest: shorthand[1] ?? "" };
+	}
+	return undefined;
+}
+
+function parseDeliveryModeToken(token: string): AgentHeartbeatDeliveryMode {
+	const normalized = token.toLowerCase().replace("-", "_");
+	if (normalized === "steer" || normalized === "follow_up") {
+		return normalized;
+	}
+	throw new Error('Heartbeat delivery mode must be "steer" or "follow_up"');
+}
+
 function consumeEveryOption(text: string): { interval: string; rest: string } | undefined {
 	const match =
 		/^--every(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\d+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours))|(\S+))(?:\s+|$)([\s\S]*)$/i.exec(
@@ -855,7 +975,8 @@ function consumeLeadingEverySchedule(text: string): { interval: string; rest: st
 		rest: text
 			.slice(match[0].length)
 			.trim()
-			.replace(/^--\s*/, "")
+			// Strip only a standalone "--" separator, never a flag like "--follow-up".
+			.replace(/^--(?=\s|$)/, "")
 			.trim(),
 	};
 }
@@ -865,15 +986,26 @@ export function isHeartbeatCronJob(job: AgentCronJob): boolean {
 }
 
 export function shouldDeferHeartbeatCronJob(job: AgentCronJob, activity: HeartbeatCronSessionActivity): boolean {
-	return (
-		isHeartbeatCronJob(job) &&
-		(activity.isStreaming ||
-			activity.isCompacting === true ||
-			activity.isRetrying === true ||
-			activity.isBashRunning ||
-			activity.hasAcceptedPromptInFlight === true ||
-			activity.pendingMessageCount > 0)
-	);
+	if (!isHeartbeatCronJob(job)) {
+		return false;
+	}
+	// States where delivering a heartbeat is unsafe or would stack redundant work,
+	// regardless of delivery mode.
+	const busyBesidesStreaming =
+		activity.isCompacting === true ||
+		activity.isRetrying === true ||
+		activity.isBashRunning ||
+		activity.hasAcceptedPromptInFlight === true ||
+		activity.pendingMessageCount > 0;
+	if (busyBesidesStreaming) {
+		return true;
+	}
+	// "steer" heartbeats interrupt the current turn, so a plain streaming turn must
+	// not defer them; "follow_up" heartbeats wait, so streaming still defers.
+	if (resolveHeartbeatStreamingBehavior(job.deliveryMode) === "steer") {
+		return false;
+	}
+	return activity.isStreaming;
 }
 
 function nextCronRunAfter(expression: string, after: Date): Date {
@@ -1070,6 +1202,9 @@ function isAgentCronJob(value: unknown): value is AgentCronJob {
 		(candidate.runtimeKind === undefined ||
 			candidate.runtimeKind === "top-level" ||
 			candidate.runtimeKind === "subagent") &&
+		(candidate.deliveryMode === undefined ||
+			candidate.deliveryMode === "steer" ||
+			candidate.deliveryMode === "follow_up") &&
 		typeof candidate.activeSessionId === "string" &&
 		typeof candidate.sessionId === "string" &&
 		typeof candidate.sessionFile === "string" &&

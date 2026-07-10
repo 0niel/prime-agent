@@ -3,7 +3,7 @@ import type { Api, ImageContent, Model, TextContent, Transport, Usage } from "@e
 import type { AuthSourceToken } from "../../core/auth-storage.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
-import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
+import type { AgentCronJob, AgentHeartbeatDeliveryMode, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
 import type { ReplayBuiltInToolName } from "../../core/extensions/index.js";
 import type { GoalState } from "../../core/goals.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
@@ -541,7 +541,11 @@ export interface AgentConnection {
 	addCronJob(schedule: string, prompt: string): Promise<AgentCronJob>;
 	cancelCronJob(jobId: string): Promise<AgentCronJob>;
 	getHeartbeat(): Promise<AgentCronJob | undefined>;
-	setHeartbeat(schedule: string, instruction: string): Promise<AgentCronJob>;
+	setHeartbeat(
+		schedule: string,
+		instruction: string,
+		deliveryMode?: AgentHeartbeatDeliveryMode,
+	): Promise<AgentCronJob>;
 	updateHeartbeat(action: AgentHeartbeatUpdateAction): Promise<AgentCronJob | undefined>;
 	getUserMessagesForForking(): Promise<AgentConnectionUserMessage[]>;
 	getLastAssistantText(): Promise<string | undefined>;

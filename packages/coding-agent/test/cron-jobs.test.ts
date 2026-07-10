@@ -7,8 +7,10 @@ import {
 	AgentCronJobStore,
 	AgentCronScheduler,
 	createAgentHeartbeatToolDefinitions,
+	normalizeHeartbeatDeliveryMode,
 	parseAgentCronSchedule,
 	parseHeartbeatCommand,
+	resolveHeartbeatStreamingBehavior,
 	shouldDeferHeartbeatCronJob,
 } from "../src/core/cron-jobs.js";
 
@@ -49,7 +51,7 @@ describe("parseHeartbeatCommand", () => {
 		expect(parseHeartbeatCommand("/heartbeat stop")).toEqual({ type: "clear" });
 	});
 
-	it("defaults new heartbeat instructions to every five minutes", () => {
+	it("leaves delivery mode unset when an instruction omits the delivery option", () => {
 		expect(parseHeartbeatCommand("/heartbeat check on me")).toEqual({
 			type: "set",
 			schedule: "every 5m",
@@ -72,6 +74,82 @@ describe("parseHeartbeatCommand", () => {
 			type: "set",
 			schedule: "every 10m",
 			instruction: "check status",
+		});
+	});
+
+	it("opts into follow-up delivery via --follow-up before or after the interval", () => {
+		expect(parseHeartbeatCommand("/heartbeat check on me --follow-up")).toEqual({
+			type: "set",
+			schedule: "every 5m",
+			instruction: "check on me",
+			deliveryMode: "follow_up",
+		});
+		expect(parseHeartbeatCommand("/heartbeat --follow-up check on me")).toEqual({
+			type: "set",
+			schedule: "every 5m",
+			instruction: "check on me",
+			deliveryMode: "follow_up",
+		});
+		expect(parseHeartbeatCommand("/heartbeat --follow-up --every 30s check on me")).toEqual({
+			type: "set",
+			schedule: "every 30s",
+			instruction: "check on me",
+			deliveryMode: "follow_up",
+		});
+		expect(parseHeartbeatCommand("/heartbeat every 10m --follow-up check status")).toEqual({
+			type: "set",
+			schedule: "every 10m",
+			instruction: "check status",
+			deliveryMode: "follow_up",
+		});
+		expect(parseHeartbeatCommand("/heartbeat --deliver follow_up check status")).toEqual({
+			type: "set",
+			schedule: "every 5m",
+			instruction: "check status",
+			deliveryMode: "follow_up",
+		});
+		expect(parseHeartbeatCommand("/heartbeat check status --deliver=follow_up")).toEqual({
+			type: "set",
+			schedule: "every 5m",
+			instruction: "check status",
+			deliveryMode: "follow_up",
+		});
+	});
+
+	it("rejects invalid delivery mode values in delivery flag positions", () => {
+		for (const command of [
+			"/heartbeat --deliver",
+			"/heartbeat --deliver=",
+			"/heartbeat check status --deliver",
+			"/heartbeat check status --deliver=",
+		]) {
+			expect(() => parseHeartbeatCommand(command)).toThrow('Heartbeat delivery mode must be "steer" or "follow_up"');
+		}
+		expect(() => parseHeartbeatCommand("/heartbeat --deliver later check status")).toThrow(
+			'Heartbeat delivery mode must be "steer" or "follow_up"',
+		);
+		expect(() => parseHeartbeatCommand("/heartbeat check status --deliver=later")).toThrow(
+			'Heartbeat delivery mode must be "steer" or "follow_up"',
+		);
+		expect(() => parseHeartbeatCommand("/heartbeat every 10m --deliver later check status")).toThrow(
+			'Heartbeat delivery mode must be "steer" or "follow_up"',
+		);
+	});
+
+	it("keeps delivery-like flags in the middle of an instruction as instruction text", () => {
+		expect(parseHeartbeatCommand("/heartbeat remind me to mention --follow-up in docs")).toEqual({
+			type: "set",
+			schedule: "every 5m",
+			instruction: "remind me to mention --follow-up in docs",
+		});
+	});
+
+	it("accepts an explicit --steer flag that keeps the default delivery mode", () => {
+		expect(parseHeartbeatCommand("/heartbeat --steer check on me")).toEqual({
+			type: "set",
+			schedule: "every 5m",
+			instruction: "check on me",
+			deliveryMode: "steer",
 		});
 	});
 });
@@ -206,6 +284,54 @@ describe("AgentCronJobStore", () => {
 
 		expect(store.getHeartbeat("active-1")).toMatchObject({ id: second.id, prompt: "continue the work" });
 		expect(store.list().find((job) => job.id === first.id)).toMatchObject({ status: "cancelled" });
+	});
+
+	it("defaults heartbeats to steer delivery and persists an explicit follow_up opt-out", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const steerHeartbeat = store.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "steer by default",
+			now: start,
+		});
+		expect(steerHeartbeat.deliveryMode).toBe("steer");
+
+		const followUpHeartbeat = store.createHeartbeat({
+			activeSessionId: "active-2",
+			sessionId: "session-2",
+			sessionFile: "/tmp/session-2.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "queue as follow-up",
+			deliveryMode: "follow_up",
+			now: start,
+		});
+		expect(followUpHeartbeat.deliveryMode).toBe("follow_up");
+		expect(store.getHeartbeat("active-2")).toMatchObject({ deliveryMode: "follow_up" });
+	});
+
+	it("defaults RLM heartbeats to steer delivery and updates the delivery mode", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const rlmHeartbeat = store.createRlmHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "watch progress",
+			now: start,
+		});
+		expect(rlmHeartbeat.deliveryMode).toBe("steer");
+
+		const updated = store.updateRlmHeartbeat("active-1", rlmHeartbeat.id, {
+			deliveryMode: "follow_up",
+			now: new Date("2026-01-01T12:35:00.000Z"),
+		});
+		expect(updated).toMatchObject({ id: rlmHeartbeat.id, deliveryMode: "follow_up" });
+		expect(store.listRlmHeartbeats("active-1")[0]).toMatchObject({ deliveryMode: "follow_up" });
 	});
 
 	it("pauses, resumes, and clears heartbeat state", () => {
@@ -832,9 +958,9 @@ describe("shouldDeferHeartbeatCronJob", () => {
 		runCount: 0,
 	};
 
-	it("defers user and RLM heartbeats while the target session is working", () => {
+	it("defers follow-up heartbeats while the target session is working", () => {
 		for (const source of ["heartbeat", "rlm_heartbeat"] as const) {
-			const job = { ...baseJob, source };
+			const job = { ...baseJob, source, deliveryMode: "follow_up" as const };
 
 			expect(
 				shouldDeferHeartbeatCronJob(job, {
@@ -860,6 +986,67 @@ describe("shouldDeferHeartbeatCronJob", () => {
 		}
 	});
 
+	it("lets steer heartbeats interrupt a plain streaming turn", () => {
+		for (const source of ["heartbeat", "rlm_heartbeat"] as const) {
+			// Default (undefined) delivery mode is steer.
+			for (const job of [
+				{ ...baseJob, source },
+				{ ...baseJob, source, deliveryMode: "steer" as const },
+			]) {
+				expect(
+					shouldDeferHeartbeatCronJob(job, {
+						isStreaming: true,
+						isBashRunning: false,
+						pendingMessageCount: 0,
+					}),
+				).toBe(false);
+			}
+		}
+	});
+
+	it("defers steer heartbeats when delivering would be unsafe or would stack work", () => {
+		const job = { ...baseJob, source: "heartbeat" as const, deliveryMode: "steer" as const };
+
+		expect(
+			shouldDeferHeartbeatCronJob(job, {
+				isStreaming: true,
+				isCompacting: true,
+				isBashRunning: false,
+				pendingMessageCount: 0,
+			}),
+		).toBe(true);
+		expect(
+			shouldDeferHeartbeatCronJob(job, {
+				isStreaming: false,
+				isBashRunning: true,
+				pendingMessageCount: 0,
+			}),
+		).toBe(true);
+		expect(
+			shouldDeferHeartbeatCronJob(job, {
+				isStreaming: false,
+				isBashRunning: false,
+				pendingMessageCount: 1,
+			}),
+		).toBe(true);
+		expect(
+			shouldDeferHeartbeatCronJob(job, {
+				isStreaming: false,
+				isRetrying: true,
+				isBashRunning: false,
+				pendingMessageCount: 0,
+			}),
+		).toBe(true);
+		expect(
+			shouldDeferHeartbeatCronJob(job, {
+				isStreaming: false,
+				isBashRunning: false,
+				hasAcceptedPromptInFlight: true,
+				pendingMessageCount: 0,
+			}),
+		).toBe(true);
+	});
+
 	it("allows heartbeats when the target session is idle", () => {
 		expect(
 			shouldDeferHeartbeatCronJob(
@@ -876,6 +1063,24 @@ describe("shouldDeferHeartbeatCronJob", () => {
 				{ isStreaming: true, isBashRunning: true, pendingMessageCount: 2 },
 			),
 		).toBe(false);
+	});
+});
+
+describe("heartbeat delivery mode", () => {
+	it("normalizes valid delivery modes and rejects invalid ones", () => {
+		expect(normalizeHeartbeatDeliveryMode(undefined)).toBeUndefined();
+		expect(normalizeHeartbeatDeliveryMode(null)).toBeUndefined();
+		expect(normalizeHeartbeatDeliveryMode("steer")).toBe("steer");
+		expect(normalizeHeartbeatDeliveryMode("follow_up")).toBe("follow_up");
+		expect(() => normalizeHeartbeatDeliveryMode("followup")).toThrow(
+			'Heartbeat delivery mode must be "steer" or "follow_up"',
+		);
+	});
+
+	it("resolves delivery mode to a streaming behavior, defaulting to steer", () => {
+		expect(resolveHeartbeatStreamingBehavior(undefined)).toBe("steer");
+		expect(resolveHeartbeatStreamingBehavior("steer")).toBe("steer");
+		expect(resolveHeartbeatStreamingBehavior("follow_up")).toBe("followUp");
 	});
 });
 

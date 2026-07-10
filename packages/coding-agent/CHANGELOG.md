@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Added `/btw` and `/side` for one-turn inline side questions that use the current context without changing the main session ([ENG-4509](https://linear.app/primeintellect/issue/ENG-4509/add-btw-and-side-side-question-flows)).
+- Changed scheduled heartbeat prompts to steer (interrupt the current turn) by default, with a `steer`/`follow_up` delivery mode selectable via `/heartbeat --steer|--follow-up` and the `rlm_heartbeat` skill's `delivery_mode` argument.
 - Changed the new-chat splash to show only version, model, and cwd metadata and rotate among five example prompts.
 - Fixed stale heartbeat jobs reopening archived, deleted, or concurrently terminated sessions ([ENG-4519](https://linear.app/primeintellect/issue/ENG-4519/heartbeats-rebirth-sessions-that-were-previously-killed)).
 

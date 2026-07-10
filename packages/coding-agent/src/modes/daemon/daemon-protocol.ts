@@ -7,7 +7,7 @@ import type {
 } from "../../core/agent-messages.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
-import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
+import type { AgentCronJob, AgentHeartbeatDeliveryMode, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
 import type { CustomMessage } from "../../core/messages.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
@@ -285,6 +285,7 @@ export type DaemonCommand =
 			message: string;
 			content?: (TextContent | ImageContent)[];
 			images?: ImageContent[];
+			queueKey?: string;
 			expandPromptTemplates?: boolean;
 			agentMessageId?: string;
 			customMessage?: CustomMessage;
@@ -349,7 +350,14 @@ export type DaemonCommand =
 	| { id?: string; type: "cron_add"; activeSessionId: string; schedule: string; prompt: string }
 	| { id?: string; type: "cron_cancel"; jobId: string }
 	| { id?: string; type: "heartbeat_get"; activeSessionId: string }
-	| { id?: string; type: "heartbeat_set"; activeSessionId: string; schedule: string; prompt: string }
+	| {
+			id?: string;
+			type: "heartbeat_set";
+			activeSessionId: string;
+			schedule: string;
+			prompt: string;
+			deliveryMode?: AgentHeartbeatDeliveryMode;
+	  }
 	| { id?: string; type: "heartbeat_update"; activeSessionId: string; action: AgentHeartbeatUpdateAction }
 	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string }
 	| { id?: string; type: "cycle_model"; activeSessionId: string; direction?: "forward" | "backward" }

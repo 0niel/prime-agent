@@ -89,8 +89,9 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	},
 	{
 		name: "heartbeat",
-		description: "Set or view a persistent heartbeat; supports pause, resume, stop, and clear",
-		argumentHint: "[status|pause|resume|stop|every <duration> <instruction>]",
+		description:
+			"Set or view a persistent heartbeat; delivery defaults to steer, use --follow-up to queue; supports pause, resume, stop, and clear",
+		argumentHint: "[status|pause|resume|stop|[every <duration>] [--steer|--follow-up] <instruction>]",
 		takesArgument: true,
 	},
 	{ name: "resume", description: "Resume a different session" },

@@ -3,7 +3,7 @@ import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core"
 import type { ImageContent, Transport } from "@earendil-works/pi-ai";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
-import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
+import type { AgentCronJob, AgentHeartbeatDeliveryMode, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type { SessionStats } from "../../core/session-stats.js";
@@ -343,12 +343,17 @@ export class DaemonAgentConnection implements AgentConnection {
 		return data.heartbeat ?? undefined;
 	}
 
-	async setHeartbeat(schedule: string, instruction: string): Promise<AgentCronJob> {
+	async setHeartbeat(
+		schedule: string,
+		instruction: string,
+		deliveryMode?: AgentHeartbeatDeliveryMode,
+	): Promise<AgentCronJob> {
 		const data = await this.requestData<{ heartbeat: AgentCronJob }>({
 			type: "heartbeat_set",
 			activeSessionId: this.activeSessionId,
 			schedule,
 			prompt: instruction,
+			...(deliveryMode ? { deliveryMode } : {}),
 		});
 		return data.heartbeat;
 	}

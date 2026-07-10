@@ -306,6 +306,55 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		expect(harness.session.getFollowUpMessagePreviews()).toEqual([]);
 	});
 
+	it("removes queued steered heartbeat prompts by heartbeat queue key", async () => {
+		let releaseToolExecution: (() => void) | undefined;
+		const toolRelease = new Promise<void>((resolve) => {
+			releaseToolExecution = resolve;
+		});
+		const waitTool: AgentTool = {
+			name: "wait",
+			label: "Wait",
+			description: "Wait for release",
+			parameters: Type.Object({}),
+			execute: async () => {
+				await toolRelease;
+				return {
+					content: [{ type: "text", text: "released" }],
+					details: {},
+				};
+			},
+		};
+		const harness = await createHarness({ tools: [waitTool] });
+		harnesses.push(harness);
+		const heartbeatText = "Check whether the long-running task needs another step.";
+		const heartbeatPreview = `Heartbeat prompt: ${heartbeatText}`;
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("original turn complete"),
+		]);
+		const sawToolStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "tool_execution_start") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+
+		const promptPromise = harness.session.prompt("start");
+		await sawToolStart;
+		await harness.session.promptHeartbeat(createHeartbeat(), { streamingBehavior: "steer" });
+
+		expect(harness.session.getSteeringMessagePreviews()).toEqual([heartbeatPreview]);
+		expect(harness.session.removeQueuedFollowUp("heartbeat:heartbeat-1")).toBe(true);
+		expect(harness.session.getSteeringMessagePreviews()).toEqual([]);
+
+		releaseToolExecution?.();
+		await promptPromise;
+
+		expect(getUserTexts(harness)).toEqual(["start"]);
+	});
+
 	it("renders heartbeat prompts as expandable injected prompt panels", () => {
 		const component = new InjectedPromptMessageComponent(createHeartbeatPromptMessage(createHeartbeat()));
 		const collapsed = render(component);

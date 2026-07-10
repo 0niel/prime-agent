@@ -91,7 +91,7 @@ describe("RLM heartbeat skill over the kernel host bridge", () => {
 		const manager = await provisioner.ensure();
 		const result = await manager.execute(`
 import json
-created = await rlm_heartbeat.create("check tests", interval="5m", label="tests")
+created = await rlm_heartbeat.create("check tests", interval="5m", label="tests", delivery_mode="follow_up")
 listed = await rlm_heartbeat.list(include_inactive=True)
 updated = await rlm_heartbeat.update(created["heartbeat"]["id"], status="pause")
 deleted = await rlm_heartbeat.delete(created["heartbeat"]["id"])
@@ -121,6 +121,7 @@ print(json.dumps({
 			instruction: "check tests",
 			interval: "5m",
 			label: "tests",
+			delivery_mode: "follow_up",
 		});
 		expect(requests[1].payload).toMatchObject({ type: "rlm_heartbeat.list", include_inactive: true });
 		expect(requests[2].payload).toMatchObject({ type: "rlm_heartbeat.update", id: "job-1", status: "pause" });
@@ -144,5 +145,34 @@ except RuntimeError as error:
 		expect(unavailable.stdout.trim()).toBe(
 			'RuntimeError: host request type "rlm_heartbeat.list" is not available in this session',
 		);
+	});
+
+	it("rejects non-string delivery modes before calling the host", async () => {
+		let hostRequestCount = 0;
+		provisioner = new IpythonKernelProvisioner(tempDir, {
+			pythonSkills: [bundledRlmHeartbeatSkill()],
+			hostHandlers: {
+				"rlm_heartbeat.create": async () => {
+					hostRequestCount++;
+					return {};
+				},
+			},
+		});
+
+		const manager = await provisioner.ensure();
+		const result = await manager.execute(`
+for value in ([], {}):
+    try:
+        await rlm_heartbeat.create("check tests", delivery_mode=value)
+    except TypeError as error:
+        print(f"TypeError: {error}")
+`);
+
+		expect(result.status).toBe("ok");
+		expect(result.stdout.trim().split("\n")).toEqual([
+			"TypeError: delivery_mode must be str or None, got list",
+			"TypeError: delivery_mode must be str or None, got dict",
+		]);
+		expect(hostRequestCount).toBe(0);
 	});
 });

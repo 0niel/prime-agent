@@ -22,7 +22,12 @@ type AgentDaemonUpdateInternals = {
 };
 
 type QueueInternals = {
-	_steeringMessages: Array<{ text: string; agentMessageId?: string; message: UserMessage | CustomMessage }>;
+	_steeringMessages: Array<{
+		text: string;
+		queueKey?: string;
+		agentMessageId?: string;
+		message: UserMessage | CustomMessage;
+	}>;
 	_followUpMessages: Array<{
 		text: string;
 		queueKey?: string;
@@ -312,7 +317,9 @@ describe("issue #4257 update restart resume", () => {
 		};
 		const customFollowUp = createCustomMessage("custom heartbeat");
 		const queueInternals = parentHarness.session as unknown as QueueInternals;
-		queueInternals._steeringMessages = [{ text: "queued work", agentMessageId: "agentmsg_steer", message }];
+		queueInternals._steeringMessages = [
+			{ text: "queued work", queueKey: "heartbeat:steer", agentMessageId: "agentmsg_steer", message },
+		];
 		queueInternals._followUpMessages = [
 			{
 				text: "heartbeat",
@@ -371,7 +378,15 @@ describe("issue #4257 update restart resume", () => {
 			clientEnv: { PRIME_SESSION: "pane-1" },
 			runtimeMetadata: { kind: "top-level" },
 			queue: {
-				steering: [{ message: "queued work", content, images: [image], agentMessageId: "agentmsg_steer" }],
+				steering: [
+					{
+						message: "queued work",
+						content,
+						images: [image],
+						queueKey: "heartbeat:steer",
+						agentMessageId: "agentmsg_steer",
+					},
+				],
 				followUp: [
 					{
 						message: "heartbeat",
@@ -770,6 +785,7 @@ describe("issue #4257 update restart resume", () => {
 				activeSessionId: "active-1",
 				message: "restored steer",
 				content: restoredSteerContent,
+				queueKey: "heartbeat:steer",
 				expandPromptTemplates: false,
 				agentMessageId: "agentmsg_restored_steer",
 			}),
@@ -814,6 +830,7 @@ describe("issue #4257 update restart resume", () => {
 			expect.objectContaining({
 				text: "restored steer",
 				content: restoredSteerContent,
+				queueKey: "heartbeat:steer",
 				agentMessageId: "agentmsg_restored_steer",
 			}),
 		]);
