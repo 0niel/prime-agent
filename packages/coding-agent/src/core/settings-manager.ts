@@ -120,6 +120,7 @@ export type McpServerConfig =
 	  };
 
 export interface Settings {
+	onboardingShown?: boolean;
 	onboardingCompleted?: boolean;
 	defaultProvider?: string;
 	defaultModel?: string;
@@ -616,13 +617,13 @@ export class SettingsManager {
 		return drained;
 	}
 
-	getOnboardingCompleted(): boolean {
-		return this.settings.onboardingCompleted ?? false;
+	getOnboardingShown(): boolean {
+		return this.settings.onboardingShown ?? this.settings.onboardingCompleted ?? false;
 	}
 
-	setOnboardingCompleted(completed: boolean): void {
-		this.globalSettings.onboardingCompleted = completed;
-		this.markModified("onboardingCompleted");
+	setOnboardingShown(shown: boolean): void {
+		this.globalSettings.onboardingShown = shown;
+		this.markModified("onboardingShown");
 		this.save();
 	}
 
