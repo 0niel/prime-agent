@@ -862,7 +862,7 @@ interface SessionInfoCacheEntry {
 // content: cache list metadata and rescan only files that changed.
 const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
 
-async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
+export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
 	let stats: Awaited<ReturnType<typeof stat>>;
 	try {
 		stats = await stat(filePath);
@@ -1021,7 +1021,7 @@ async function listSessionsFromDir(
 
 		let loaded = 0;
 		for (const file of files) {
-			const info = await buildSessionInfo(file);
+			const info = await readSessionInfo(file);
 			loaded++;
 			callbacks?.onProgress?.(progressOffset + loaded, total);
 			if (info) {

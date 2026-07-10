@@ -4,6 +4,7 @@
 
 - Added `/btw` and `/side` for one-turn inline side questions that use the current context without changing the main session ([ENG-4509](https://linear.app/primeintellect/issue/ENG-4509/add-btw-and-side-side-question-flows)).
 - Changed the new-chat splash to show only version, model, and cwd metadata and rotate among five example prompts.
+- Fixed stale heartbeat jobs reopening archived, deleted, or concurrently terminated sessions ([ENG-4519](https://linear.app/primeintellect/issue/ENG-4519/heartbeats-rebirth-sessions-that-were-previously-killed)).
 
 ## [0.2.8] - 2026-07-09
 
