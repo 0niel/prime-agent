@@ -617,15 +617,18 @@ describe("marquee TUI components", () => {
 		const collapsed = stripAnsi(collapsedLines.join("\n"));
 		expect(collapsed).toContain("python");
 		expect(collapsed).toContain("12ms");
+		expect(collapsed).toContain("Ctrl+O to expand");
 		expect(collapsed).not.toContain("ipython");
 		expect(collapsed).not.toContain('"code"');
 
-		// Expanded keeps the identical top line — no restructuring — and just
-		// attaches the code and output below it, backgroundless like the top line.
+		// Expanded keeps the same status content while updating the toggle hint,
+		// then attaches the code and output below it, backgroundless like the top line.
 		component.setExpanded(true);
 		const expandedLines = component.render(100);
-		expect(stripAnsi(expandedLines[0])).toBe(stripAnsi(collapsedLines[0]));
 		const expanded = stripAnsi(expandedLines.join("\n"));
+		const expandedStatus = expandedLines.map(stripAnsi).find((line) => line.includes("python · print(55)"));
+		expect(expandedStatus).toContain("↑ 1 ↓ 1 lines · 12ms");
+		expect(expanded).toContain("Ctrl+O to collapse");
 		expect(expanded).toContain("print(55)");
 		expect(expanded).toContain("55");
 		expect(expanded).not.toContain('"code"');
