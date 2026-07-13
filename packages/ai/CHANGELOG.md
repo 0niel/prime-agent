@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-07-13
+
 ## [0.2.8] - 2026-07-09
 
 - Registered the full Prime Inference catalog (97 models, up from 32) instead of a curated whitelist; context/output limits, vision, and reasoning now come from OpenRouter metadata with a small override table for limits the gateway enforces differently (verified against the live API), and raw/duplicate variants (BF16, HF-cased, `zai-org/`, fine-tune outputs) are skipped.

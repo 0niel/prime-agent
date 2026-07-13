@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-07-13
+
 - Changed tool call groups to use one blank row above and below without blank rows between consecutive calls.
 - Changed the session tree to show only user messages by default.
 - Changed agent-to-agent messages to render as directional rows, with received messages expandable in chat and sent messages shown below their Python cell ([ENG-4531](https://linear.app/primeintellect/issue/ENG-4531/collapse-and-simplify-agent2agent-messages-in-chat-tui)).
