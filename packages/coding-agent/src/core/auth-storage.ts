@@ -481,13 +481,23 @@ export class AuthStorage {
 	}
 
 	private getAuthSourceCandidates(provider: string, options?: { includeFallback?: boolean }): AuthSourceCandidate[] {
-		const candidates = [
-			this.getRuntimeAuthCandidate(provider),
-			this.getStoredAuthCandidate(provider),
-			this.getEnvironmentAuthCandidate(provider),
-			provider === PRIME_INFERENCE_PROVIDER_ID ? this.getPrimeCliAuthCandidate(provider) : undefined,
-			options?.includeFallback === false ? undefined : this.getFallbackAuthCandidate(provider),
-		];
+		const fallbackCandidate =
+			options?.includeFallback === false ? undefined : this.getFallbackAuthCandidate(provider);
+		const candidates =
+			provider === PRIME_INFERENCE_PROVIDER_ID
+				? [
+						this.getRuntimeAuthCandidate(provider),
+						this.getEnvironmentAuthCandidate(provider),
+						this.getPrimeCliAuthCandidate(provider),
+						this.getStoredAuthCandidate(provider),
+						fallbackCandidate,
+					]
+				: [
+						this.getRuntimeAuthCandidate(provider),
+						this.getStoredAuthCandidate(provider),
+						this.getEnvironmentAuthCandidate(provider),
+						fallbackCandidate,
+					];
 		return candidates.filter((candidate): candidate is AuthSourceCandidate => candidate !== undefined);
 	}
 
@@ -801,11 +811,9 @@ export class AuthStorage {
 	 * Get API key for a provider.
 	 * Priority:
 	 * 1. Runtime override (CLI --api-key)
-	 * 2. API key from auth.json
-	 * 3. OAuth token from auth.json (auto-refreshed with locking)
-	 * 4. Environment variable
-	 * 5. Prime CLI config (Prime Inference only)
-	 * 6. Fallback resolver (models.json custom providers)
+	 * 2. Prime Inference: environment variable, Prime CLI config, auth.json
+	 * 3. Other providers: auth.json, environment variable
+	 * 4. Fallback resolver (models.json custom providers)
 	 */
 	async getApiKeyWithSourceToken(
 		providerId: string,
@@ -819,6 +827,31 @@ export class AuthStorage {
 				apiKey: runtimeKey,
 				sourceToken: this.getAuthSourceTokenForCandidate(providerId, runtimeCandidate),
 			};
+		}
+
+		const envCandidate = this.getEnvironmentAuthCandidate(providerId);
+		const envKey = getEnvApiKey(providerId);
+		if (
+			providerId === PRIME_INFERENCE_PROVIDER_ID &&
+			envKey &&
+			envCandidate &&
+			!this.isAuthSourceStale(providerId, envCandidate)
+		) {
+			return {
+				apiKey: envKey,
+				sourceToken: this.getAuthSourceTokenForCandidate(providerId, envCandidate),
+			};
+		}
+
+		if (providerId === PRIME_INFERENCE_PROVIDER_ID) {
+			const primeCliCandidate = this.getPrimeCliAuthCandidate(providerId);
+			const primeCliKey = this.getPrimeCliApiKey(providerId);
+			if (primeCliKey && primeCliCandidate && !this.isAuthSourceStale(providerId, primeCliCandidate)) {
+				return {
+					apiKey: primeCliKey,
+					sourceToken: this.getAuthSourceTokenForCandidate(providerId, primeCliCandidate),
+				};
+			}
 		}
 
 		const cred = this.data[providerId];
@@ -901,25 +934,17 @@ export class AuthStorage {
 			}
 		}
 
-		// Fall back to environment variable
-		const envCandidate = this.getEnvironmentAuthCandidate(providerId);
-		const envKey = getEnvApiKey(providerId);
-		if (envKey && envCandidate && !this.isAuthSourceStale(providerId, envCandidate)) {
+		// Other providers preserve auth.json priority over environment variables.
+		if (
+			providerId !== PRIME_INFERENCE_PROVIDER_ID &&
+			envKey &&
+			envCandidate &&
+			!this.isAuthSourceStale(providerId, envCandidate)
+		) {
 			return {
 				apiKey: envKey,
 				sourceToken: this.getAuthSourceTokenForCandidate(providerId, envCandidate),
 			};
-		}
-
-		if (providerId === PRIME_INFERENCE_PROVIDER_ID) {
-			const primeCliCandidate = this.getPrimeCliAuthCandidate(providerId);
-			const primeCliKey = this.getPrimeCliApiKey(providerId);
-			if (primeCliKey && primeCliCandidate && !this.isAuthSourceStale(providerId, primeCliCandidate)) {
-				return {
-					apiKey: primeCliKey,
-					sourceToken: this.getAuthSourceTokenForCandidate(providerId, primeCliCandidate),
-				};
-			}
 		}
 
 		// Fall back to custom resolver (e.g., models.json custom providers)

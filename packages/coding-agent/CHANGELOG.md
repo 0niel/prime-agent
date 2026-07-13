@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Fixed `PRIME_API_KEY` being ignored when the Prime CLI config contained an API key.
+- Fixed Prime Inference credential precedence to prefer `PRIME_API_KEY`, then the Prime CLI config, then `auth.json`.
 
 ## [0.2.9] - 2026-07-13
 
