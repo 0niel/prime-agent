@@ -359,14 +359,20 @@ describe("AuthStorage", () => {
 
 		test("prime inference uses environment auth over Prime CLI and stored auth", async () => {
 			const originalPrimeApiKey = process.env.PRIME_API_KEY;
+			const originalPrimeTeamId = process.env.PRIME_TEAM_ID;
 			process.env.PRIME_API_KEY = "env-prime-key";
+			delete process.env.PRIME_TEAM_ID;
 			try {
 				const primeConfigPath = join(tempDir, "prime-config.json");
-				writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
+				writeFileSync(
+					primeConfigPath,
+					JSON.stringify({ api_key: "prime-cli-key", team_id: "cli-team", team_name: "CLI Research" }),
+				);
 				writeAuthJson({
 					"prime-inference": {
 						type: "api_key",
 						key: "agent-key",
+						primeTeam: { teamId: "stored-team", name: "Stored Research" },
 					},
 				});
 
@@ -381,11 +387,18 @@ describe("AuthStorage", () => {
 					source: "environment",
 					label: "PRIME_API_KEY",
 				});
+				expect(authStorage.getProviderHeaders("prime-inference")).toBeUndefined();
+				expect(authStorage.getPrimeInferenceTeamSelection()).toBeUndefined();
 			} finally {
 				if (originalPrimeApiKey === undefined) {
 					delete process.env.PRIME_API_KEY;
 				} else {
 					process.env.PRIME_API_KEY = originalPrimeApiKey;
+				}
+				if (originalPrimeTeamId === undefined) {
+					delete process.env.PRIME_TEAM_ID;
+				} else {
+					process.env.PRIME_TEAM_ID = originalPrimeTeamId;
 				}
 			}
 		});

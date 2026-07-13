@@ -1033,30 +1033,33 @@ export class AuthStorage {
 			if (config?.teamIdFromEnv) {
 				return undefined;
 			}
-			const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
-			if (config?.apiKey) {
-				if (credential?.type === "api_key" && credential.primeTeam === null) {
-					return null;
-				}
-				if (config.teamId) {
-					return this.toPrimeTeamCredential({
-						teamId: config.teamId,
-						name: config.teamName ?? "Prime CLI team",
-						...(config.teamRole ? { role: config.teamRole } : {}),
-					});
-				}
-				if (credential?.type === "api_key" && credential.primeTeam) {
-					return credential.primeTeam;
-				}
-				return null;
-			}
 		}
 
 		const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
+		const authSource = this.getAuthStatus(PRIME_INFERENCE_PROVIDER_ID).source;
+		if (authSource === "runtime" || authSource === "environment") {
+			return undefined;
+		}
+		if (authSource === "prime_cli") {
+			if (credential?.type === "api_key" && credential.primeTeam === null) {
+				return null;
+			}
+			if (config?.teamId) {
+				return this.toPrimeTeamCredential({
+					teamId: config.teamId,
+					name: config.teamName ?? "Prime CLI team",
+					...(config.teamRole ? { role: config.teamRole } : {}),
+				});
+			}
+			if (credential?.type === "api_key" && credential.primeTeam) {
+				return credential.primeTeam;
+			}
+			return null;
+		}
 		if (credential?.type === "api_key" && credential.primeTeam !== undefined) {
 			return credential.primeTeam;
 		}
-		if (config?.teamId) {
+		if (!config?.apiKey && config?.teamId) {
 			return this.toPrimeTeamCredential({
 				teamId: config.teamId,
 				name: config.teamName ?? "Prime CLI team",
@@ -1076,30 +1079,7 @@ export class AuthStorage {
 			return primeCliConfig.teamId ? { "X-Prime-Team-ID": primeCliConfig.teamId } : undefined;
 		}
 
-		const credential = this.data[providerId];
-		if (primeCliConfig?.apiKey) {
-			if (credential?.type === "api_key" && credential.primeTeam === null) {
-				return undefined;
-			}
-			if (primeCliConfig.teamId) {
-				return { "X-Prime-Team-ID": primeCliConfig.teamId };
-			}
-			return credential?.type === "api_key" && credential.primeTeam?.teamId
-				? { "X-Prime-Team-ID": credential.primeTeam.teamId }
-				: undefined;
-		}
-
-		if (credential?.type === "api_key") {
-			if (credential.primeTeam === null) {
-				return undefined;
-			}
-			const selectedTeamId = credential.primeTeam?.teamId;
-			if (selectedTeamId) {
-				return { "X-Prime-Team-ID": selectedTeamId };
-			}
-		}
-
-		const teamId = primeCliConfig?.teamId;
+		const teamId = this.getPrimeInferenceTeamSelection()?.teamId;
 		return teamId ? { "X-Prime-Team-ID": teamId } : undefined;
 	}
 
