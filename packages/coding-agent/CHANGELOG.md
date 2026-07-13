@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed Prime Inference credential and team-header precedence to prefer `PRIME_API_KEY`, then the Prime CLI config, then `auth.json`.
+
 ## [0.2.9] - 2026-07-13
 
 - Changed tool call groups to use one blank row above and below without blank rows between consecutive calls.

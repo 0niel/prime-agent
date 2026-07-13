@@ -334,7 +334,7 @@ describe("AuthStorage", () => {
 			expect(authStorage.getAuthStatus("anthropic")).toEqual({ configured: true, source: "stored" });
 		});
 
-		test("prime inference uses Prime CLI auth over legacy Prime Agent auth", async () => {
+		test("prime inference uses Prime CLI auth over stored auth", async () => {
 			const primeConfigPath = join(tempDir, "prime-config.json");
 			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
 			writeAuthJson({
@@ -357,30 +357,48 @@ describe("AuthStorage", () => {
 			});
 		});
 
-		test("prime inference uses Prime CLI auth over environment auth", async () => {
+		test("prime inference uses environment auth over Prime CLI and stored auth", async () => {
 			const originalPrimeApiKey = process.env.PRIME_API_KEY;
+			const originalPrimeTeamId = process.env.PRIME_TEAM_ID;
 			process.env.PRIME_API_KEY = "env-prime-key";
+			delete process.env.PRIME_TEAM_ID;
 			try {
 				const primeConfigPath = join(tempDir, "prime-config.json");
-				writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
-				writeAuthJson({});
+				writeFileSync(
+					primeConfigPath,
+					JSON.stringify({ api_key: "prime-cli-key", team_id: "cli-team", team_name: "CLI Research" }),
+				);
+				writeAuthJson({
+					"prime-inference": {
+						type: "api_key",
+						key: "agent-key",
+						primeTeam: { teamId: "stored-team", name: "Stored Research" },
+					},
+				});
 
 				authStorage = AuthStorage.create(authJsonPath, {
 					primeCliConfigPath: primeConfigPath,
 					usePrimeCliConfig: true,
 				});
 
-				await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("prime-cli-key");
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("env-prime-key");
 				expect(authStorage.getAuthStatus("prime-inference")).toEqual({
 					configured: false,
-					source: "prime_cli",
-					label: "Prime CLI",
+					source: "environment",
+					label: "PRIME_API_KEY",
 				});
+				expect(authStorage.getProviderHeaders("prime-inference")).toBeUndefined();
+				expect(authStorage.getPrimeInferenceTeamSelection()).toBeUndefined();
 			} finally {
 				if (originalPrimeApiKey === undefined) {
 					delete process.env.PRIME_API_KEY;
 				} else {
 					process.env.PRIME_API_KEY = originalPrimeApiKey;
+				}
+				if (originalPrimeTeamId === undefined) {
+					delete process.env.PRIME_TEAM_ID;
+				} else {
+					process.env.PRIME_TEAM_ID = originalPrimeTeamId;
 				}
 			}
 		});
