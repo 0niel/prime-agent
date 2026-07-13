@@ -482,7 +482,9 @@ describe("ToolExecutionComponent parity", () => {
 			createFakeTui(),
 			process.cwd(),
 		);
-		expect(stripAnsi(component.render(100).join("\n"))).toContain("bash · queued");
+		const queuedLines = component.render(100);
+		expect(stripAnsi(queuedLines.join("\n"))).toContain("bash · queued");
+		expect(stripAnsi(queuedLines[0])).toContain("bash · queued");
 
 		component.markExecutionStarted();
 		// Running status leads with the animated working glyph for the current frame.

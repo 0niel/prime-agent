@@ -125,8 +125,6 @@ export class ToolExecutionComponent extends Container {
 		this.ui = ui;
 		this.cwd = cwd;
 
-		this.addChild(new Spacer(1));
-
 		// Always create both shell variants. contentPanel is the tool panel used
 		// for default renderer-based composition (and the generic fallback when no
 		// tool definition exists). selfRenderContainer is used when the tool

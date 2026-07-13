@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Changed tool call groups to use one blank row above and below without blank rows between consecutive calls.
 - Changed the session tree to show only user messages by default.
 - Changed agent-to-agent messages to render as directional rows, with received messages expandable in chat and sent messages shown below their Python cell ([ENG-4531](https://linear.app/primeintellect/issue/ENG-4531/collapse-and-simplify-agent2agent-messages-in-chat-tui)).
 - Fixed IPython state restore notices rendering as full user messages when prompts were queued or restored ([ENG-4530](https://linear.app/primeintellect/issue/ENG-4530/collapse-ipython-state-restore-messages-in-chat-tui)).

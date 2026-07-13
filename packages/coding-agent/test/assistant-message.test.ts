@@ -56,6 +56,35 @@ describe("AssistantMessageComponent", () => {
 		expect(rendered.includes(OSC133_ZONE_FINAL)).toBe(false);
 	});
 
+	test("adds one trailing spacer between visible assistant content and its tool batch", () => {
+		initTheme("dark");
+
+		const component = new AssistantMessageComponent(
+			createAssistantMessage([
+				{ type: "text", text: "calling tools" },
+				{ type: "toolCall", id: "tool-1", name: "bash", arguments: { command: "pwd" } },
+				{ type: "toolCall", id: "tool-2", name: "bash", arguments: { command: "ls" } },
+			]),
+		);
+		const lines = component.render(60);
+
+		expect(stripAnsi(lines.at(-2) ?? "")).toContain("calling tools");
+		expect(lines.at(-1)).toBe("");
+	});
+
+	test("does not add spacing for a tool-only assistant message", () => {
+		initTheme("dark");
+
+		const component = new AssistantMessageComponent(
+			createAssistantMessage([
+				{ type: "toolCall", id: "tool-1", name: "bash", arguments: { command: "pwd" } },
+				{ type: "toolCall", id: "tool-2", name: "bash", arguments: { command: "ls" } },
+			]),
+		);
+
+		expect(component.render(60)).toEqual([]);
+	});
+
 	test("renders an abort status for messages with tool calls", () => {
 		initTheme("dark");
 
