@@ -483,9 +483,9 @@ export class AuthStorage {
 	private getAuthSourceCandidates(provider: string, options?: { includeFallback?: boolean }): AuthSourceCandidate[] {
 		const candidates = [
 			this.getRuntimeAuthCandidate(provider),
-			provider === PRIME_INFERENCE_PROVIDER_ID ? this.getPrimeCliAuthCandidate(provider) : undefined,
 			this.getStoredAuthCandidate(provider),
 			this.getEnvironmentAuthCandidate(provider),
+			provider === PRIME_INFERENCE_PROVIDER_ID ? this.getPrimeCliAuthCandidate(provider) : undefined,
 			options?.includeFallback === false ? undefined : this.getFallbackAuthCandidate(provider),
 		];
 		return candidates.filter((candidate): candidate is AuthSourceCandidate => candidate !== undefined);
@@ -804,7 +804,8 @@ export class AuthStorage {
 	 * 2. API key from auth.json
 	 * 3. OAuth token from auth.json (auto-refreshed with locking)
 	 * 4. Environment variable
-	 * 5. Fallback resolver (models.json custom providers)
+	 * 5. Prime CLI config (Prime Inference only)
+	 * 6. Fallback resolver (models.json custom providers)
 	 */
 	async getApiKeyWithSourceToken(
 		providerId: string,
@@ -818,17 +819,6 @@ export class AuthStorage {
 				apiKey: runtimeKey,
 				sourceToken: this.getAuthSourceTokenForCandidate(providerId, runtimeCandidate),
 			};
-		}
-
-		if (providerId === PRIME_INFERENCE_PROVIDER_ID) {
-			const primeCliCandidate = this.getPrimeCliAuthCandidate(providerId);
-			const primeCliKey = this.getPrimeCliApiKey(providerId);
-			if (primeCliKey && primeCliCandidate && !this.isAuthSourceStale(providerId, primeCliCandidate)) {
-				return {
-					apiKey: primeCliKey,
-					sourceToken: this.getAuthSourceTokenForCandidate(providerId, primeCliCandidate),
-				};
-			}
 		}
 
 		const cred = this.data[providerId];
@@ -919,6 +909,17 @@ export class AuthStorage {
 				apiKey: envKey,
 				sourceToken: this.getAuthSourceTokenForCandidate(providerId, envCandidate),
 			};
+		}
+
+		if (providerId === PRIME_INFERENCE_PROVIDER_ID) {
+			const primeCliCandidate = this.getPrimeCliAuthCandidate(providerId);
+			const primeCliKey = this.getPrimeCliApiKey(providerId);
+			if (primeCliKey && primeCliCandidate && !this.isAuthSourceStale(providerId, primeCliCandidate)) {
+				return {
+					apiKey: primeCliKey,
+					sourceToken: this.getAuthSourceTokenForCandidate(providerId, primeCliCandidate),
+				};
+			}
 		}
 
 		// Fall back to custom resolver (e.g., models.json custom providers)

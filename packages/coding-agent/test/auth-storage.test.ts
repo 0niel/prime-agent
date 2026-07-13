@@ -334,7 +334,7 @@ describe("AuthStorage", () => {
 			expect(authStorage.getAuthStatus("anthropic")).toEqual({ configured: true, source: "stored" });
 		});
 
-		test("prime inference uses Prime CLI auth over legacy Prime Agent auth", async () => {
+		test("prime inference uses stored auth over Prime CLI auth", async () => {
 			const primeConfigPath = join(tempDir, "prime-config.json");
 			writeFileSync(primeConfigPath, JSON.stringify({ api_key: "prime-cli-key" }));
 			writeAuthJson({
@@ -349,15 +349,14 @@ describe("AuthStorage", () => {
 				usePrimeCliConfig: true,
 			});
 
-			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("prime-cli-key");
+			await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("agent-key");
 			expect(authStorage.getAuthStatus("prime-inference")).toEqual({
-				configured: false,
-				source: "prime_cli",
-				label: "Prime CLI",
+				configured: true,
+				source: "stored",
 			});
 		});
 
-		test("prime inference uses Prime CLI auth over environment auth", async () => {
+		test("prime inference uses environment auth over Prime CLI auth", async () => {
 			const originalPrimeApiKey = process.env.PRIME_API_KEY;
 			process.env.PRIME_API_KEY = "env-prime-key";
 			try {
@@ -370,11 +369,11 @@ describe("AuthStorage", () => {
 					usePrimeCliConfig: true,
 				});
 
-				await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("prime-cli-key");
+				await expect(authStorage.getApiKey("prime-inference")).resolves.toBe("env-prime-key");
 				expect(authStorage.getAuthStatus("prime-inference")).toEqual({
 					configured: false,
-					source: "prime_cli",
-					label: "Prime CLI",
+					source: "environment",
+					label: "PRIME_API_KEY",
 				});
 			} finally {
 				if (originalPrimeApiKey === undefined) {
