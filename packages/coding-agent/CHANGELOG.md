@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added autonomous mode with host-side continuations, configurable limits, and quality gates for evaluator-controlled runs ([#278](https://github.com/PrimeIntellect-ai/prime-agent/pull/278) by [@sethkarten](https://github.com/sethkarten)).
 - Fixed Prime Inference credential and team-header precedence to prefer `PRIME_API_KEY`, then the Prime CLI config, then `auth.json`.
 
 ## [0.2.9] - 2026-07-13

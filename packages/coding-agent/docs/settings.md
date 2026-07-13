@@ -17,7 +17,7 @@ Edit directly or use `/settings` for common options.
 |---------|------|---------|-------------|
 | `defaultProvider` | string | - | Default provider (e.g., `"anthropic"`, `"openai"`) |
 | `defaultModel` | string | - | Default model ID |
-| `defaultThinkingLevel` | string | - | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"` |
+| `defaultThinkingLevel` | string | `"xhigh"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"` |
 | `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
 
@@ -258,7 +258,7 @@ See [packages.md](packages.md) for package management details.
 {
   "defaultProvider": "anthropic",
   "defaultModel": "claude-sonnet-4-20250514",
-  "defaultThinkingLevel": "medium",
+  "defaultThinkingLevel": "xhigh",
   "theme": "dark",
   "compaction": {
     "enabled": true,

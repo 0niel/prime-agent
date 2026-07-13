@@ -42,6 +42,14 @@ export interface Args {
 	themes?: string[];
 	noThemes?: boolean;
 	noContextFiles?: boolean;
+	autonomous?: boolean;
+	autonomousGates?: string[];
+	autonomousGateRetries?: number;
+	autonomousGateTimeoutMs?: number;
+	autonomousMaxContinuations?: number;
+	autonomousMaxTurns?: number;
+	autonomousMaxTokens?: number;
+	autonomousTimeoutMs?: number;
 	listModels?: string | true;
 	offline?: boolean;
 	verbose?: boolean;
@@ -197,6 +205,44 @@ export function parseArgs(args: string[]): Args {
 			result.noThemes = true;
 		} else if (arg === "--no-context-files" || arg === "-nc") {
 			result.noContextFiles = true;
+		} else if (arg === "--autonomous") {
+			result.autonomous = true;
+		} else if (arg === "--autonomous-gate") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousGates = result.autonomousGates ?? [];
+				result.autonomousGates.push(args[++i]);
+			}
+		} else if (arg === "--autonomous-gate-retries") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousGateRetries = parsePositiveInt(args[++i], "--autonomous-gate-retries", result);
+			}
+		} else if (arg === "--autonomous-gate-timeout-ms") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousGateTimeoutMs = parsePositiveInt(args[++i], "--autonomous-gate-timeout-ms", result);
+			}
+		} else if (arg === "--autonomous-max-continuations") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousMaxContinuations = parsePositiveInt(args[++i], "--autonomous-max-continuations", result);
+			}
+		} else if (arg === "--autonomous-max-turns") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousMaxTurns = parsePositiveInt(args[++i], "--autonomous-max-turns", result);
+			}
+		} else if (arg === "--autonomous-max-tokens") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousMaxTokens = parsePositiveInt(args[++i], "--autonomous-max-tokens", result);
+			}
+		} else if (arg === "--autonomous-timeout-ms") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousTimeoutMs = parsePositiveInt(args[++i], "--autonomous-timeout-ms", result);
+			}
 		} else if (arg === "--list-models") {
 			// Check if next arg is a search pattern (not a flag or file arg)
 			if (i + 1 < args.length && !args[i + 1].startsWith("-") && !args[i + 1].startsWith("@")) {
@@ -292,6 +338,14 @@ ${chalk.bold("Options:")}
   --theme <path>                 Load a theme file or directory (can be used multiple times)
   --no-themes                    Disable theme discovery and loading
   --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
+  --autonomous                   Continue autonomously until host-observable terminal evidence exists
+  --autonomous-gate <command>    Run a command before autonomous mode may finish (repeatable)
+  --autonomous-gate-retries <n>  Max autonomous retries per failed gate (default: 3)
+  --autonomous-gate-timeout-ms <n> Timeout per autonomous gate command in milliseconds
+  --autonomous-max-continuations <n> Max autonomous follow-up messages (default: 3)
+  --autonomous-max-turns <n>     Max assistant turns while autonomous mode is active (default: 12)
+  --autonomous-max-tokens <n>    Max tokens while autonomous mode is active (default: 80000)
+  --autonomous-timeout-ms <n>    Max autonomous wall-clock time in milliseconds (default: 1800000)
   --export <file>                Export session file to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
@@ -403,4 +457,22 @@ ${chalk.bold("Environment Variables:")}
 ${chalk.bold("Built-in Tool Names:")}
   ipython - Execute Python in a persistent IPython kernel
 `);
+}
+
+function hasRequiredOptionValue(args: string[], index: number, flag: string, result: Args): boolean {
+	const next = args[index + 1];
+	if (next === undefined || next.startsWith("--")) {
+		result.diagnostics.push({ type: "error", message: `${flag} requires a value` });
+		return false;
+	}
+	return true;
+}
+
+function parsePositiveInt(value: string, flag: string, result: Args): number | undefined {
+	const parsed = Number(value);
+	if (!Number.isInteger(parsed) || parsed <= 0) {
+		result.diagnostics.push({ type: "error", message: `${flag} must be a positive integer` });
+		return undefined;
+	}
+	return parsed;
 }

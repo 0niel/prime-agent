@@ -118,6 +118,19 @@ describe("AgentSession queue characterization", () => {
 		}
 	});
 
+	it("does not count failed assistant messages toward the auto-refine interval", async () => {
+		const harness = await createAutoRefineHarness({
+			settings: { autoRefine: { enabled: true, turnInterval: 1, cooldownMs: 0 } },
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		harness.setResponses([fauxAssistantMessage("failed", { stopReason: "error", errorMessage: "provider failed" })]);
+
+		await harness.session.prompt("fail once");
+
+		expect(internals._assistantTurnsSinceAutoRefine).toBe(0);
+	});
+
 	it("auto-refine review runs after the configured turn interval", async () => {
 		const reviewer = vi.fn(async () => ({
 			shouldRefine: true,
