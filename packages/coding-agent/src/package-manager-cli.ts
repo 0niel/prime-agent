@@ -890,6 +890,7 @@ async function restoreDaemonUpdateRestartSession(
 				images: acceptedPrompt.images,
 				expandPromptTemplates: false,
 				agentMessageId: acceptedPrompt.agentMessageId,
+				customMessage: acceptedPrompt.customMessage,
 			},
 			120000,
 		);

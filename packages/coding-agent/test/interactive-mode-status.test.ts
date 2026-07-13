@@ -205,8 +205,12 @@ describe("InteractiveMode.renderSessionContext", () => {
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
 		try {
 			const chatContainer = new Container();
+			const ipythonToolComponents = new Map([["stale-tool", {}]]);
+			const lateIpythonSentAgentMessages = new Map([["stale-tool", []]]);
 			const fakeThis: any = {
 				pendingTools: new Map(),
+				ipythonToolComponents,
+				lateIpythonSentAgentMessages,
 				toolOutputExpanded: false,
 				chatContainer,
 				footer: { invalidate: vi.fn() },
@@ -225,6 +229,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 					chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
 				}),
 			};
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 
 			await (InteractiveMode as any).prototype.renderSessionContext.call(fakeThis, {
 				messages: [
@@ -246,6 +251,8 @@ describe("InteractiveMode.renderSessionContext", () => {
 			const rendered = renderAll(chatContainer);
 			expect(rendered).not.toContain("\x1b_G");
 			expect(normalizeRenderedOutput(chatContainer)).toContain("[Image: [image/png]]");
+			expect(ipythonToolComponents.size).toBe(0);
+			expect(lateIpythonSentAgentMessages.size).toBe(0);
 		} finally {
 			resetCapabilitiesCache();
 		}
@@ -258,6 +265,8 @@ describe("InteractiveMode.renderSessionContext", () => {
 			const pendingTools = new Map<string, ToolExecutionComponent>();
 			const fakeThis: any = {
 				pendingTools,
+				ipythonToolComponents: new Map(),
+				lateIpythonSentAgentMessages: new Map(),
 				toolOutputExpanded: false,
 				chatContainer,
 				footer: { invalidate: vi.fn() },
@@ -276,6 +285,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 					chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
 				}),
 			};
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 
 			await (InteractiveMode as any).prototype.renderSessionContext.call(fakeThis, {
 				messages: [
@@ -583,6 +593,8 @@ describe("InteractiveMode pending bash components", () => {
 			activeBashComponent: component,
 			pendingBashComponents: [component],
 			activityTracker: { reset: vi.fn() },
+			ipythonToolComponents: new Map(),
+			lateIpythonSentAgentMessages: new Map(),
 			resetPendingToolState: vi.fn(),
 			resetChildAgentInspector: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
@@ -767,6 +779,8 @@ describe("InteractiveMode tool event rendering", () => {
 			pendingTools: new Map<string, ToolExecutionComponent>(),
 			pendingToolCreations: new Set<string>(),
 			startedToolCalls: new Set<string>(),
+			ipythonToolComponents: new Map(),
+			lateIpythonSentAgentMessages: new Map(),
 			loadToolDefinition: vi.fn(() => definitionPromise),
 			uiServices: {
 				settingsManager: {

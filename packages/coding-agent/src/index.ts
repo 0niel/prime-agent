@@ -334,6 +334,7 @@ export {
 } from "./modes/index.js";
 // UI components for extensions
 export {
+	AgentMessageComponent,
 	ArminComponent,
 	AssistantMessageComponent,
 	BashExecutionComponent,

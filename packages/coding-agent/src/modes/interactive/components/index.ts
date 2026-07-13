@@ -1,4 +1,6 @@
 // UI Components for extensions
+
+export { AgentMessageComponent } from "./agent-message.js";
 export { ArminComponent } from "./armin.js";
 export { AssistantMessageComponent } from "./assistant-message.js";
 export { BashExecutionComponent } from "./bash-execution.js";

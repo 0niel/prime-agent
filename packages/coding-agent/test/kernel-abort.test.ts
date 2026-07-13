@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { KernelManager } from "../src/core/kernel/index.js";
+import { AGENT_MESSAGE_DISPLAY_MIME, KernelManager, type KernelSentAgentMessage } from "../src/core/kernel/index.js";
 
 async function waitForCalls(mock: { mock: { calls: unknown[][] } }, count: number): Promise<void> {
 	for (let i = 0; i < 20; i++) {
@@ -113,8 +113,12 @@ describe("KernelManager abort handling", () => {
 			},
 		);
 		const controller = new AbortController();
+		const lateSentAgentMessages: KernelSentAgentMessage[] = [];
 
-		const executePromise = manager.execute("while True: pass", { signal: controller.signal });
+		const executePromise = manager.execute("while True: pass", {
+			signal: controller.signal,
+			onLateSentAgentMessage: (message) => lateSentAgentMessages.push(message),
+		});
 		await waitForCalls(shellSend, 1);
 		expect(shellSend).toHaveBeenCalledTimes(1);
 
@@ -139,6 +143,29 @@ describe("KernelManager abort handling", () => {
 		if (!activeExecution) {
 			throw new Error("Expected active execution to remain until kernel idle");
 		}
+		internals.handleExecutionMessage({
+			header: { msg_type: "display_data" },
+			parent_header: { msg_id: activeExecution.requestMsgId },
+			metadata: {},
+			content: {
+				data: {
+					[AGENT_MESSAGE_DISPLAY_MIME]: {
+						id: "agentmsg-after-abort",
+						message: "still sent",
+						deliveryStatus: "delivered",
+						target: { activeSessionId: "beta", sessionId: "session-beta" },
+					},
+				},
+			},
+		});
+		expect(lateSentAgentMessages).toEqual([
+			{
+				id: "agentmsg-after-abort",
+				message: "still sent",
+				deliveryStatus: "delivered",
+				target: { activeSessionId: "beta", sessionId: "session-beta" },
+			},
+		]);
 		const secondExecutePromise = manager.execute("x = 1");
 		await Promise.resolve();
 		expect(shellSend).toHaveBeenCalledTimes(1);

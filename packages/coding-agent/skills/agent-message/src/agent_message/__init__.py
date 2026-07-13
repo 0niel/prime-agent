@@ -8,9 +8,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from IPython.display import display
 from rlm import host_request
 
 MessageMode = Literal["auto", "follow_up", "steer"]
+_MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-message+json"
 
 
 async def list_agents() -> dict[str, Any]:
@@ -38,7 +40,7 @@ async def send(target: str, message: str, mode: MessageMode = "auto") -> dict[st
         raise TypeError(f"message must be str, got {type(message).__name__}")
     if mode not in ("auto", "follow_up", "steer"):
         raise ValueError('mode must be "auto", "follow_up", or "steer"')
-    return await host_request(
+    receipt = await host_request(
         "agent_message.send",
         {
             "target": target,
@@ -46,3 +48,23 @@ async def send(target: str, message: str, mode: MessageMode = "auto") -> dict[st
             "mode": mode,
         },
     )
+    _emit_sent_message(receipt)
+    return receipt
+
+
+def _emit_sent_message(receipt: dict[str, Any]) -> None:
+    try:
+        label = (
+            "Agent message queued"
+            if receipt.get("deliveryStatus") == "queued"
+            else "Agent message sent"
+        )
+        display(
+            {
+                _MESSAGE_DISPLAY_MIME: receipt,
+                "text/plain": label,
+            },
+            raw=True,
+        )
+    except Exception:
+        pass

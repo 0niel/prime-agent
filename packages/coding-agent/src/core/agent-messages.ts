@@ -1,9 +1,13 @@
 import { randomUUID } from "node:crypto";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { HostRequestHandler } from "./kernel/index.js";
+import type { CustomMessage } from "./messages.js";
 
+export const AGENT_MESSAGE_CUSTOM_TYPE = "agent_message";
 export const AGENT_MESSAGE_SKILL_NAME = "agent-message";
 export const AGENT_MESSAGE_IMPORT_NAME = "agent_message";
 export const AGENT_MESSAGE_SOURCE = "agent_message";
+export const AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL = "Agent message received";
 export const DEFAULT_AGENT_MESSAGE_MAX_CHARS = 16_384;
 export const DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION = 20;
 export const DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY = 3;
@@ -44,6 +48,19 @@ export interface AgentSessionMessagePayload {
 	from?: AgentSessionMessageSender;
 	target: AgentSessionMessageEndpoint;
 	deliveryMode: AgentSessionMessageDeliveryMode;
+}
+
+export interface AgentSessionMessageDetails {
+	id: string;
+	message: string;
+	from?: AgentSessionMessageSender;
+	target?: AgentSessionMessageEndpoint;
+}
+
+export interface AgentSessionMessage extends CustomMessage<AgentSessionMessageDetails> {
+	customType: typeof AGENT_MESSAGE_CUSTOM_TYPE;
+	content: string;
+	details: AgentSessionMessageDetails;
 }
 
 export interface AgentSessionMessageReceipt {
@@ -171,6 +188,38 @@ export function createAgentSessionMessagePrompt(payload: AgentSessionMessagePayl
 	lines.push("");
 	lines.push(payload.message);
 	return lines.join("\n");
+}
+
+export function createAgentSessionMessage(
+	payload: AgentSessionMessagePayload,
+	timestamp = Date.now(),
+): AgentSessionMessage {
+	return {
+		role: "custom",
+		customType: AGENT_MESSAGE_CUSTOM_TYPE,
+		content: createAgentSessionMessagePrompt(payload),
+		display: true,
+		details: {
+			id: payload.id,
+			message: payload.message,
+			from: payload.from,
+			target: payload.target,
+		},
+		timestamp,
+	};
+}
+
+export function isAgentSessionMessage(message: AgentMessage): message is AgentSessionMessage {
+	if (message.role !== "custom" || message.customType !== AGENT_MESSAGE_CUSTOM_TYPE) {
+		return false;
+	}
+	const details = message.details;
+	return (
+		typeof details === "object" &&
+		details !== null &&
+		typeof (details as { id?: unknown }).id === "string" &&
+		typeof (details as { message?: unknown }).message === "string"
+	);
 }
 
 export function createAgentSessionMessageReceipt(

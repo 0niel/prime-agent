@@ -44,6 +44,17 @@ interface DiffDisplay {
 	startLine?: number;
 }
 
+interface SentAgentMessageDisplay {
+	id: string;
+	message: string;
+	deliveryStatus: "delivered" | "queued";
+	target: {
+		activeSessionId: string;
+		sessionId: string;
+		sessionName?: string;
+	};
+}
+
 interface IpythonDetails {
 	durationMs?: number;
 	status?: string;
@@ -52,6 +63,7 @@ interface IpythonDetails {
 	stderr?: string;
 	result?: string;
 	diffs?: DiffDisplay[];
+	sentAgentMessages?: SentAgentMessageDisplay[];
 	error?: IpythonErrorDetails;
 }
 
@@ -131,8 +143,48 @@ function readDetails(details: unknown): IpythonDetails {
 		stderr: typeof record.stderr === "string" ? record.stderr : undefined,
 		result: typeof record.result === "string" ? record.result : undefined,
 		diffs: readDiffDisplays(record.diffs),
+		sentAgentMessages: readSentAgentMessages(record.sentAgentMessages),
 		error,
 	};
+}
+
+function readSentAgentMessages(value: unknown): SentAgentMessageDisplay[] | undefined {
+	if (!Array.isArray(value)) {
+		return undefined;
+	}
+	const messages = value.flatMap((entry): SentAgentMessageDisplay[] => {
+		if (!entry || typeof entry !== "object") {
+			return [];
+		}
+		const record = entry as Record<string, unknown>;
+		const target = record.target;
+		if (!target || typeof target !== "object") {
+			return [];
+		}
+		const targetRecord = target as Record<string, unknown>;
+		if (
+			typeof record.id !== "string" ||
+			typeof record.message !== "string" ||
+			(record.deliveryStatus !== "delivered" && record.deliveryStatus !== "queued") ||
+			typeof targetRecord.activeSessionId !== "string" ||
+			typeof targetRecord.sessionId !== "string"
+		) {
+			return [];
+		}
+		return [
+			{
+				id: record.id,
+				message: record.message,
+				deliveryStatus: record.deliveryStatus,
+				target: {
+					activeSessionId: targetRecord.activeSessionId,
+					sessionId: targetRecord.sessionId,
+					...(typeof targetRecord.sessionName === "string" ? { sessionName: targetRecord.sessionName } : {}),
+				},
+			},
+		];
+	});
+	return messages.length > 0 ? messages : undefined;
 }
 
 function readDiffDisplays(value: unknown): DiffDisplay[] | undefined {
@@ -310,6 +362,9 @@ export class IPythonCellComponent implements Component {
 		if (hasDiffs) {
 			this.renderDiffs(lines, safeWidth, details.diffs ?? [], this.marker(details));
 		}
+		if ((details.sentAgentMessages?.length ?? 0) > 0) {
+			this.renderSentAgentMessages(lines, safeWidth, details.sentAgentMessages ?? []);
+		}
 
 		if (!this.state.expanded) {
 			return this.renderCache.set(safeWidth, cacheVersion, lines);
@@ -418,6 +473,7 @@ export class IPythonCellComponent implements Component {
 			details.result !== undefined ||
 			details.error !== undefined ||
 			(details.diffs?.length ?? 0) > 0 ||
+			(details.sentAgentMessages?.length ?? 0) > 0 ||
 			(this.state.content?.length ?? 0) > 0
 		);
 	}
@@ -523,6 +579,7 @@ export class IPythonCellComponent implements Component {
 			!traceback &&
 			!details.error &&
 			diffs.length === 0 &&
+			(details.sentAgentMessages?.length ?? 0) === 0 &&
 			this.state.executionStarted &&
 			imageCount === 0
 		) {
@@ -548,6 +605,26 @@ export class IPythonCellComponent implements Component {
 				? `${imageCount} image${imageCount === 1 ? "" : "s"} rendered below`
 				: `${imageCount} image${imageCount === 1 ? "" : "s"} hidden`;
 			this.addWrapped(lines, OUTPUT_INDENT, theme.fg("muted", text), width);
+		}
+	}
+
+	private renderSentAgentMessages(lines: string[], width: number, messages: readonly SentAgentMessageDisplay[]): void {
+		for (const message of messages) {
+			this.addPlain(lines, "");
+			const target =
+				message.target.sessionName?.trim() ||
+				message.target.activeSessionId.trim() ||
+				message.target.sessionId.trim() ||
+				"Unknown agent";
+			const label = message.deliveryStatus === "delivered" ? "Agent message sent" : "Agent message queued";
+			const text = message.message.replace(/\s+/g, " ").trim();
+			const line =
+				theme.fg("accent", "◆") +
+				` ${theme.fg("muted", label)}${theme.fg("dim", " · ")}` +
+				theme.fg("muted", target) +
+				theme.fg("dim", " · ") +
+				theme.fg("muted", text);
+			this.addPlain(lines, truncateToWidth(line, Math.max(1, width - 1), "…"));
 		}
 	}
 

@@ -61,6 +61,7 @@ import {
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 	VERSION,
 } from "../../config.js";
+import { AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL, isAgentSessionMessage } from "../../core/agent-messages.js";
 import {
 	type AgentTraceUploadResult,
 	getPrimeAgentTraceCredential,
@@ -81,6 +82,7 @@ import type {
 } from "../../core/extensions/index.js";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.js";
 import { emptyGoalState, formatGoalUsage, GOAL_CONTEXT_PREVIEW_LABEL, type GoalState } from "../../core/goals.js";
+import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import {
 	createCompactionSummaryMessage,
@@ -144,6 +146,7 @@ import {
 	ProviderAuthFlows,
 	type ProviderLoginOptions,
 } from "./auth-flows.js";
+import { AgentMessageComponent } from "./components/agent-message.js";
 import { ArminComponent } from "./components/armin.js";
 import { AssistantMessageComponent } from "./components/assistant-message.js";
 import { BashExecutionComponent } from "./components/bash-execution.js";
@@ -244,8 +247,14 @@ export function getRandomStartHint(random = Math.random): (typeof START_HINTS)[n
 
 function isLabeledQueuedPreview(message: string): boolean {
 	return (
-		message.startsWith(`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `) || message.startsWith(`${GOAL_CONTEXT_PREVIEW_LABEL}: `)
+		message.startsWith(`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `) ||
+		message.startsWith(`${GOAL_CONTEXT_PREVIEW_LABEL}: `) ||
+		message.startsWith(`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `)
 	);
+}
+
+export function formatQueuedMessagePreview(message: string, label: "Steering" | "Follow-up"): string {
+	return isLabeledQueuedPreview(message) ? message : `${label}: ${message}`;
 }
 
 function isExpandable(obj: unknown): obj is Expandable {
@@ -686,6 +695,8 @@ export class InteractiveMode {
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
+	private ipythonToolComponents = new Map<string, ToolExecutionComponent>();
+	private lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	private pendingToolCreations = new Set<string>();
 	private startedToolCalls = new Set<string>();
 	private pendingToolGeneration = 0;
@@ -2418,6 +2429,8 @@ export class InteractiveMode {
 		this.activityTracker.reset();
 		this.contextUsageTokenBaseline = 0;
 		this.resetPendingToolState();
+		this.ipythonToolComponents.clear();
+		this.lateIpythonSentAgentMessages.clear();
 		this.resetChildAgentInspector();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
@@ -2457,6 +2470,16 @@ export class InteractiveMode {
 		return this.streamingMessage?.content.find(
 			(content): content is ToolCall => content.type === "toolCall" && content.id === toolCallId,
 		);
+	}
+
+	private registerIpythonToolComponent(toolName: string, toolCallId: string, component: ToolExecutionComponent): void {
+		if (toolName !== "ipython") {
+			return;
+		}
+		this.ipythonToolComponents.set(toolCallId, component);
+		for (const lateMessage of this.lateIpythonSentAgentMessages.get(toolCallId) ?? []) {
+			component.appendSentAgentMessage(lateMessage);
+		}
 	}
 
 	private async getOrCreatePendingToolComponent(
@@ -2504,6 +2527,7 @@ export class InteractiveMode {
 			}
 			this.chatContainer.addChild(component);
 			this.pendingTools.set(latestToolCall.id, component);
+			this.registerIpythonToolComponent(latestToolCall.name, latestToolCall.id, component);
 			return component;
 		} finally {
 			this.pendingToolCreations.delete(toolCall.id);
@@ -4271,7 +4295,7 @@ export class InteractiveMode {
 		this.updateConnectionStateFromEvent(event);
 		// A new user message resets the activity tracker to 0, so the in-flight baseline must
 		// reset with it. (agent_start on auto-retry does not reset the tracker.)
-		if (event.type === "message_start" && event.message.role === "user") {
+		if (event.type === "message_start" && (event.message.role === "user" || isAgentSessionMessage(event.message))) {
 			this.contextUsageTokenBaseline = 0;
 			this.setSessionHasMessages(true);
 			this.clearShortcutGuide();
@@ -4463,6 +4487,17 @@ export class InteractiveMode {
 					this.startedToolCalls.delete(event.toolCallId);
 					this.ui.requestRender();
 				}
+				break;
+			}
+
+			case "ipython_sent_agent_message": {
+				const messages = this.lateIpythonSentAgentMessages.get(event.toolCallId) ?? [];
+				if (!messages.some((message) => message.id === event.message.id)) {
+					messages.push(event.message);
+					this.lateIpythonSentAgentMessages.set(event.toolCallId, messages);
+				}
+				this.ipythonToolComponents.get(event.toolCallId)?.appendSentAgentMessage(event.message);
+				this.ui.requestRender();
 				break;
 			}
 
@@ -5366,15 +5401,17 @@ export class InteractiveMode {
 			}
 			case "custom": {
 				if (message.display) {
-					const component = isInjectedPromptMessage(message)
-						? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
-						: new CustomMessageComponent(
-								message,
-								this.bindLocalSessionExtensions
-									? this.getLocalSessionHost().getExtensionRunner().getMessageRenderer(message.customType)
-									: undefined,
-								this.getMarkdownThemeWithSettings(),
-							);
+					const component = isAgentSessionMessage(message)
+						? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
+						: isInjectedPromptMessage(message)
+							? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
+							: new CustomMessageComponent(
+									message,
+									this.bindLocalSessionExtensions
+										? this.getLocalSessionHost().getExtensionRunner().getMessageRenderer(message.customType)
+										: undefined,
+									this.getMarkdownThemeWithSettings(),
+								);
 					component.setExpanded(this.toolOutputExpanded);
 					this.chatContainer.addChild(component);
 				}
@@ -5474,6 +5511,8 @@ export class InteractiveMode {
 		options: { updateFooter?: boolean; populateHistory?: boolean; clearChat?: boolean } = {},
 	): Promise<void> {
 		this.resetPendingToolState();
+		this.ipythonToolComponents.clear();
+		this.lateIpythonSentAgentMessages.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
 		const toolNames: string[] = [];
 		for (const message of sessionContext.messages) {
@@ -5520,6 +5559,7 @@ export class InteractiveMode {
 						);
 						component.setExpanded(this.toolOutputExpanded);
 						this.chatContainer.addChild(component);
+						this.registerIpythonToolComponent(content.name, content.id, component);
 
 						if (message.stopReason === "aborted" || message.stopReason === "error") {
 							let errorMessage: string;
@@ -6225,11 +6265,11 @@ export class InteractiveMode {
 		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
 			this.queuedMessagesContainer.addChild(new Spacer(1));
 			for (const message of steeringMessages) {
-				const text = theme.fg("dim", isLabeledQueuedPreview(message) ? message : `Steering: ${message}`);
+				const text = theme.fg("dim", formatQueuedMessagePreview(message, "Steering"));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			for (const message of followUpMessages) {
-				const text = theme.fg("dim", isLabeledQueuedPreview(message) ? message : `Follow-up: ${message}`);
+				const text = theme.fg("dim", formatQueuedMessagePreview(message, "Follow-up"));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			const dequeueHint = this.getAppKeyDisplay("app.message.dequeue");
