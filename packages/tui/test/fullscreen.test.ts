@@ -578,6 +578,26 @@ describe("TUI fullscreen mode", () => {
 		tui.stop();
 	});
 
+	it("drag-selecting dock text copies from the user input area", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20));
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		// rows=10 and dock=2, so the user prompt is visible at screen row 9.
+		terminal.sendInput("\x1b[<0;3;9M");
+		terminal.sendInput("\x1b[<32;9;9M");
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("\x1b[7m"), "dock selection highlighted while dragging");
+
+		terminal.sendInput("\x1b[<0;9;9m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, ["prompt"]);
+
+		tui.stop();
+	});
+
 	it("writes OSC 52 when no copy handler is set", async () => {
 		const { terminal, tui, chat, dock } = setup(lines(20));
 		tui.enterFullscreen({ scroll: [chat], dock });

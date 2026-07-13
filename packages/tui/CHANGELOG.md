@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed fullscreen dock selection so prompt text can be copied ([#342](https://github.com/PrimeIntellect-ai/prime-agent/pull/342)).
+
 ## [0.2.8] - 2026-07-09
 
 ## [0.2.7] - 2026-07-08
