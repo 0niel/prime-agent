@@ -670,6 +670,8 @@ interface RlmChildRun {
 	unsubscribe?: () => void;
 	/** Rejects the public rlm.run promise when deletion detaches stuck underlying work. */
 	rejectTask?: (error: Error) => void;
+	/** Snapshot retained until an in-flight runtime creation is released after early deletion. */
+	detachedDeletion?: RlmSubagentRegistryEntry;
 }
 
 // ============================================================================
@@ -6367,8 +6369,9 @@ export class AgentSession {
 			}
 
 			// Runtime creation has not published a session. Detach immediately rather
-			// than blocking on tool/runtime startup; its cancellation checks and final
-			// release path clean up anything that is published later.
+			// than blocking on tool/runtime startup; keep the selector snapshot until
+			// the eventual release succeeds or becomes hidden/retryable on failure.
+			run.detachedDeletion = subagent;
 			run.rejectTask?.(new Error("Deleted by parent orchestrator"));
 			this._deletedRlmChildIds.add(childId);
 			this._removeRlmSubagentTracking(childId, run);
@@ -6704,6 +6707,22 @@ export class AgentSession {
 					// delete attempt; drop its hidden retry entry and selector reservation.
 					if (!run.releaseError && releaseStatus !== "done" && this._retryableRlmSubagentDeletions.has(run.id)) {
 						this._removeRlmSubagentTracking(run.id, run);
+					}
+					if (run.releaseError && releaseStatus !== "done" && childSession && run.detachedDeletion) {
+						try {
+							// Early deletion returned before runtime creation completed. If normal
+							// release fails, use the host's delete path as a second cleanup attempt.
+							await this._deleteRlmSubagentSession(run.id, childSession);
+						} catch {
+							// Keep a hidden selector-addressable cleanup entry rather than orphaning
+							// a host runtime after delete already returned successfully.
+							if (!this._disposed && !this._disposing) {
+								this._retainedRlmChildSessions.set(run.id, childSession);
+								this._retryableRlmSubagentDeletions.set(run.id, run.detachedDeletion);
+							}
+						} finally {
+							run.detachedDeletion = undefined;
+						}
 					}
 					// A host release failure after successful work leaves a retryable parent
 					// entry. Failed/cancelled runs remain omitted from the public registry.

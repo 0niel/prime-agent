@@ -961,6 +961,58 @@ describe("AgentSession rlm recursion", () => {
 		expect(root.listRlmSubagents()).toEqual({ subagents: [] });
 	});
 
+	it("keeps late startup cleanup retryable when release and fallback delete fail", async () => {
+		let releaseRuntimeCreation: () => void = () => {};
+		const runtimeCreationGate = new Promise<void>((resolve) => {
+			releaseRuntimeCreation = resolve;
+		});
+		let runtimeCreationStarted = false;
+		const hostedChild = createSession();
+		let deleteAttempts = 0;
+		const deleteRuntime = vi.fn(async () => {
+			deleteAttempts++;
+			if (deleteAttempts === 1) {
+				throw new Error("fallback delete failed");
+			}
+			await hostedChild.disposeAsync();
+		});
+		const releaseRuntime = vi.fn(async () => {
+			throw new Error("cancelled release failed");
+		});
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					runtimeCreationStarted = true;
+					await runtimeCreationGate;
+					return { session: hostedChild };
+				},
+				deleteRlmSubagentRuntime: deleteRuntime,
+				releaseRlmSubagentRuntime: releaseRuntime,
+			},
+		});
+
+		const runPromise = root.runRlmChild("delete during runtime creation", { name: "starting-worker" });
+		const runFailure = expect(runPromise).rejects.toThrow("Deleted by parent orchestrator");
+		await waitFor(() => runtimeCreationStarted);
+		const starting = root.listRlmSubagents().subagents[0];
+		expect(starting).toBeDefined();
+
+		await expect(root.deleteRlmSubagent("starting-worker")).resolves.toEqual({ subagent: starting });
+		await runFailure;
+		expect(deleteRuntime).not.toHaveBeenCalled();
+		releaseRuntimeCreation();
+
+		const internals = root as unknown as InspectableRlmSession;
+		await waitFor(() => releaseRuntime.mock.calls.length === 1);
+		await waitFor(() => internals._retryableRlmSubagentDeletions.size === 1);
+		expect(root.listRlmSubagents()).toEqual({ subagents: [] });
+		expect(deleteRuntime).toHaveBeenCalledTimes(1);
+
+		await expect(root.deleteRlmSubagent("starting-worker")).resolves.toEqual({ subagent: starting });
+		expect(deleteRuntime).toHaveBeenCalledTimes(2);
+		expect(internals._retryableRlmSubagentDeletions.size).toBe(0);
+	});
+
 	it("deletes a running direct child by name and waits for runtime cleanup", async () => {
 		let releaseChild: () => void = () => {};
 		const release = new Promise<void>((resolve) => {
