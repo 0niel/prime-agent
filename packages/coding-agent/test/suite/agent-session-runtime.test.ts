@@ -233,12 +233,48 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(secondDispose).toHaveBeenCalledTimes(1);
 	});
 
+	it("deletes exact and replaced in-process RLM child runtimes and retained sessions", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		const childSession = {} as AgentSession;
+		const disposeRuntime = vi.fn(async () => {});
+		const childRuntime = { session: childSession, dispose: disposeRuntime } as unknown as AgentSessionRuntime;
+		const runtimeWithSubagents = runtime as unknown as RuntimeSubagentMapAccess;
+		runtimeWithSubagents.subagentRuntimes.set("child-1", childRuntime);
+
+		await runtime.deleteRlmSubagentRuntime("child-1", childSession);
+
+		expect(disposeRuntime).toHaveBeenCalledOnce();
+		expect(runtimeWithSubagents.subagentRuntimes.has("child-1")).toBe(false);
+
+		const currentSession = {} as AgentSession;
+		const disposeReplacedRuntime = vi.fn(async () => {});
+		const replacedRuntime = {
+			session: currentSession,
+			dispose: disposeReplacedRuntime,
+		} as unknown as AgentSessionRuntime;
+		const disposeStaleSession = vi.fn(async () => {});
+		const staleSession = { disposeAsync: disposeStaleSession } as unknown as AgentSession;
+		runtimeWithSubagents.subagentRuntimes.set("replaced-child", replacedRuntime);
+
+		await runtime.deleteRlmSubagentRuntime("replaced-child", staleSession);
+
+		expect(disposeReplacedRuntime).toHaveBeenCalledOnce();
+		expect(disposeStaleSession).toHaveBeenCalledOnce();
+		expect(runtimeWithSubagents.subagentRuntimes.has("replaced-child")).toBe(false);
+
+		const disposeRetained = vi.fn(async () => {});
+		const retainedSession = { disposeAsync: disposeRetained } as unknown as AgentSession;
+		await runtime.deleteRlmSubagentRuntime("retained-child", retainedSession);
+		expect(disposeRetained).toHaveBeenCalledOnce();
+	});
+
 	it("disposes hosted RLM children during session replacement", async () => {
 		const disposeRlmSubagentRuntimes = vi.fn(async () => {});
 		const host: SubagentRuntimeHost = {
 			createRlmSubagentRuntime: async () => {
 				throw new Error("unexpected child creation");
 			},
+			deleteRlmSubagentRuntime: async () => {},
 			disposeRlmSubagentRuntimes,
 		};
 		const { runtime } = await createRuntimeForTest(() => {});

@@ -23,6 +23,7 @@ import {
 import {
 	AGENT_MESSAGE_SOURCE,
 	type AgentSessionMessageAgentSummary,
+	type AgentSessionMessageController,
 	type AgentSessionMessageDeliveryStatus,
 	type AgentSessionMessageEndpoint,
 	type AgentSessionMessageListResult,
@@ -297,6 +298,7 @@ function delay(ms: number): Promise<void> {
 type RuntimeOpenGuard = () => boolean | Promise<boolean>;
 
 class RuntimeOpenCancelledError extends Error {}
+class BoundSessionUnavailableError extends Error {}
 
 export async function runDaemonMode(options: DaemonModeOptions): Promise<never> {
 	const socketPath = options.socketPath ?? defaultDaemonSocketPath();
@@ -837,26 +839,7 @@ export class AgentDaemon {
 								return this.deleteRlmHeartbeatForState(stateRef, id);
 							},
 						},
-						agentMessageController: {
-							listAgents: () => {
-								if (!stateRef) {
-									throw new Error("Agent message state is not ready for this session yet");
-								}
-								return this.createAgentMessageListResult(stateRef);
-							},
-							sendAgentMessage: (input) => {
-								if (!stateRef) {
-									throw new Error("Agent message state is not ready for this session yet");
-								}
-								return this.sendAgentSessionMessage({
-									targetSelector: input.target,
-									message: input.message,
-									fromState: stateRef,
-									deliveryMode: input.deliveryMode,
-									origin: "agent",
-								});
-							},
-						},
+						agentMessageController: this.createAgentMessageController(() => stateRef),
 						agentObserveController: this.createAgentObserveController(() => stateRef),
 					},
 				}),
@@ -1087,6 +1070,9 @@ export class AgentDaemon {
 		};
 		try {
 			await this.agentMessageTargetLocks.get(activeSessionId)?.catch(() => undefined);
+			if (this.sessions.get(activeSessionId) !== state || this.closingSessions.has(activeSessionId)) {
+				throw new Error("Target session is closing before prompt delivery");
+			}
 			if (canRun && !canRun()) {
 				return false;
 			}
@@ -1419,7 +1405,10 @@ export class AgentDaemon {
 	private getBoundSessionState(id: string): ActiveSessionState {
 		const state = this.getSessionState(id);
 		if (this.bindingSessions.has(state.activeSessionId)) {
-			throw new Error(`Active session ${state.activeSessionId} is still initializing`);
+			throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} is still initializing`);
+		}
+		if (this.closingSessions.has(state.activeSessionId)) {
+			throw new BoundSessionUnavailableError(`Active session ${state.activeSessionId} is closing`);
 		}
 		return state;
 	}
@@ -1439,6 +1428,26 @@ export class AgentDaemon {
 	private createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost {
 		return {
 			createRlmSubagentRuntime: async (options) => this.createRlmSubagentRuntime(parentState, options),
+			deleteRlmSubagentRuntime: async (childId, session) => {
+				const state = [...this.sessions.values()].find(
+					(candidate) =>
+						candidate.runtime.metadata.kind === "subagent" &&
+						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
+						candidate.runtime.metadata.rlmChildId === childId,
+				);
+				if (!state) {
+					await session.disposeAsync();
+					return;
+				}
+				const shouldDisposeStaleSession = state.runtime.session !== session;
+				try {
+					await this.closeSession(state, "killed", false);
+				} finally {
+					if (shouldDisposeStaleSession) {
+						await session.disposeAsync();
+					}
+				}
+			},
 			disposeRlmSubagentRuntimes: async () => {
 				const cascadeError = await this.closeChildSessions(parentState, "replaced");
 				if (cascadeError) {
@@ -1447,8 +1456,9 @@ export class AgentDaemon {
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status) => {
 				const state = this.findRuntimeState(runtime);
-				// A successful subagent stays resident so it's still viewable (torn down with the
-				// parent via closeChildSessions); errored/cancelled would re-seed as "done", so close them.
+				// A successful subagent stays resident so it's still viewable and messageable;
+				// closeChildSessions tears it down with the parent. Errored or cancelled children
+				// would re-seed as "done", so close them immediately.
 				if (state && status === "done") {
 					// Run shutdown side effects without disposing the still-readable session.
 					this.cancelSubagentRlmHeartbeats(state);
@@ -1498,6 +1508,8 @@ export class AgentDaemon {
 					customTools: options.customTools,
 					includeGoals: options.includeGoals,
 					includeCompactSkill: options.includeCompactSkill,
+					agentMessageController: this.createAgentMessageController(() => stateRef),
+					agentObserveController: this.createAgentObserveController(() => stateRef),
 					rlmHeartbeatController: {
 						listRlmHeartbeats: (listOptions) => {
 							if (!stateRef) {
@@ -1546,7 +1558,57 @@ export class AgentDaemon {
 		await this.addRuntime(runtime, undefined, parentState.clientEnv, (state) => {
 			stateRef = state;
 		});
+		if (runtime.session.sessionName !== options.sessionName) {
+			try {
+				runtime.session.setSessionName(options.sessionName);
+			} catch (error) {
+				const state = this.findRuntimeState(runtime);
+				if (state) {
+					try {
+						await this.closeSession(state, "completed");
+					} catch {
+						// Creation cannot return this runtime to the caller, so force the
+						// registration down even if normal close side effects failed early.
+						if (this.sessions.get(state.activeSessionId) === state) {
+							this.sessions.delete(state.activeSessionId);
+							try {
+								state.unsubscribe?.();
+							} catch {
+								// Best-effort cleanup after the original naming failure.
+							}
+							await runtime.dispose().catch(() => undefined);
+						}
+					}
+				} else {
+					await runtime.dispose().catch(() => undefined);
+				}
+				throw error;
+			}
+		}
 		return runtime;
+	}
+
+	private createAgentMessageController(
+		getCurrentState: () => ActiveSessionState | undefined,
+	): AgentSessionMessageController {
+		const requireCurrentState = () => {
+			const current = getCurrentState();
+			if (!current) {
+				throw new Error("Agent message state is not ready for this session yet");
+			}
+			return current;
+		};
+		return {
+			listAgents: () => this.createAgentMessageListResult(requireCurrentState()),
+			sendAgentMessage: (input) =>
+				this.sendAgentSessionMessage({
+					targetSelector: input.target,
+					message: input.message,
+					fromState: requireCurrentState(),
+					deliveryMode: input.deliveryMode,
+					origin: "agent",
+				}),
+		};
 	}
 
 	private createAgentObserveController(getCurrentState: () => ActiveSessionState | undefined): AgentObserveController {
@@ -2114,7 +2176,7 @@ export class AgentDaemon {
 			}
 
 			case "prompt": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				let responseSent = false;
 				const sendSuccessResponse = () => {
 					if (responseSent) {
@@ -2153,7 +2215,7 @@ export class AgentDaemon {
 			}
 
 			case "steer": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				if (command.expandPromptTemplates === false) {
 					await state.runtime.session.restoreSteeringMessage(command.message, command.images, {
 						queueKey: command.queueKey,
@@ -2173,7 +2235,7 @@ export class AgentDaemon {
 			}
 
 			case "follow_up": {
-				const state = this.getSessionState(command.activeSessionId);
+				const state = this.getBoundSessionState(command.activeSessionId);
 				let queued: boolean;
 				if (command.expandPromptTemplates === false) {
 					queued = await state.runtime.session.restoreFollowUpMessage(command.message, command.images, {
@@ -2969,7 +3031,9 @@ export class AgentDaemon {
 			current: this.createAgentSessionMessageEndpoint(current),
 			agents: [
 				...localAgents,
-				...[...this.remoteAgentPeers.values()].filter((peer) => !localIds.has(peer.activeSessionId)),
+				...[...this.remoteAgentPeers.values()].filter(
+					(peer) => !localIds.has(peer.activeSessionId) && !this.closingSessions.has(peer.activeSessionId),
+				),
 			],
 		};
 	}
@@ -2979,7 +3043,8 @@ export class AgentDaemon {
 	private listTargetableSessionStates(current: ActiveSessionState): ActiveSessionState[] {
 		return [...this.sessions.values()].filter(
 			(state) =>
-				state.activeSessionId === current.activeSessionId || !this.bindingSessions.has(state.activeSessionId),
+				state.activeSessionId === current.activeSessionId ||
+				(!this.bindingSessions.has(state.activeSessionId) && !this.closingSessions.has(state.activeSessionId)),
 		);
 	}
 
@@ -3071,6 +3136,9 @@ export class AgentDaemon {
 		try {
 			targetState = this.getBoundSessionState(targetSelector);
 		} catch (error) {
+			if (error instanceof BoundSessionUnavailableError) {
+				throw error;
+			}
 			if (this.options.worker && options.fromState) {
 				return this.sendRemoteAgentSessionMessage(
 					options.fromState,
@@ -3528,7 +3596,11 @@ export class AgentDaemon {
 		return undefined;
 	}
 
-	private async closeSession(state: ActiveSessionState, reason: DaemonSessionClosedReason): Promise<void> {
+	private async closeSession(
+		state: ActiveSessionState,
+		reason: DaemonSessionClosedReason,
+		waitForAbort = true,
+	): Promise<void> {
 		for (const client of state.clients) {
 			this.abortSideQuestionsFor(client, state.activeSessionId);
 		}
@@ -3537,7 +3609,7 @@ export class AgentDaemon {
 			await existingClose;
 			return;
 		}
-		const closePromise = Promise.resolve().then(() => this.closeSessionOnce(state, reason));
+		const closePromise = Promise.resolve().then(() => this.closeSessionOnce(state, reason, waitForAbort));
 		this.closingSessions.set(state.activeSessionId, closePromise);
 		try {
 			await closePromise;
@@ -3557,7 +3629,11 @@ export class AgentDaemon {
 		}
 	}
 
-	private async closeSessionOnce(state: ActiveSessionState, reason: DaemonSessionClosedReason): Promise<void> {
+	private async closeSessionOnce(
+		state: ActiveSessionState,
+		reason: DaemonSessionClosedReason,
+		waitForAbort: boolean,
+	): Promise<void> {
 		if (!this.sessions.has(state.activeSessionId)) {
 			return;
 		}
@@ -3569,7 +3645,7 @@ export class AgentDaemon {
 		// Abort in-flight status work before any await/dispose so it can't write
 		// agent_status to a session being torn down.
 		this.summarizer.forget(state.activeSessionId);
-		const cascadeError = await this.closeChildSessions(state, reason);
+		const cascadeError = await this.closeChildSessions(state, reason, waitForAbort);
 		// Empty draft (no messages, config, or jobs): discard rather than persist an
 		// empty session file. Mirrors the detach-time discard so a config-bearing
 		// draft closed via kill/completed is never wiped.
@@ -3591,12 +3667,22 @@ export class AgentDaemon {
 		if (reason === "update") {
 			state.runtime.session.abortForUpdateRestart();
 		}
-		if (reason === "killed" || reason === "shutdown" || reason === "replaced") {
+		if (reason === "killed") {
+			const abort = state.runtime.session.abort().catch(() => undefined);
+			if (waitForAbort) {
+				await abort;
+			}
+		} else if (reason === "shutdown" || reason === "replaced") {
 			await state.runtime.session.abort().catch(() => undefined);
 		}
 		this.recordWorkerRecoveryState(state, `closed:${reason}`, false);
 		state.unsubscribe?.();
-		await state.runtime.dispose();
+		let disposeError: unknown;
+		try {
+			await state.runtime.dispose();
+		} catch (error) {
+			disposeError = error;
+		}
 		this.broadcastToSession(state, { type: "session_closed", activeSessionId: state.activeSessionId, reason });
 		for (const client of state.clients) {
 			client.attachedActiveSessionIds.delete(state.activeSessionId);
@@ -3610,6 +3696,9 @@ export class AgentDaemon {
 				await deleteSessionFile(sessionFile).catch(() => undefined);
 			}
 		}
+		if (disposeError) {
+			throw disposeError;
+		}
 		if (persistError && !keepsResumeEntry && reason !== "completed") {
 			throw persistError;
 		}
@@ -3621,11 +3710,12 @@ export class AgentDaemon {
 	private async closeChildSessions(
 		parentState: ActiveSessionState,
 		reason: DaemonSessionClosedReason,
+		waitForAbort = true,
 	): Promise<unknown> {
 		let cascadeError: unknown;
 		for (const childState of getChildActiveSessionStates(this.sessions, parentState)) {
 			try {
-				await this.closeSession(childState, reason);
+				await this.closeSession(childState, reason, waitForAbort);
 			} catch (error) {
 				cascadeError ??= error;
 			}

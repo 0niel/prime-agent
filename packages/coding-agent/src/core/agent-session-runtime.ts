@@ -391,6 +391,23 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		return runtime;
 	}
 
+	async deleteRlmSubagentRuntime(childId: string, session: AgentSession): Promise<void> {
+		const runtime = this.subagentRuntimes.get(childId);
+		if (!runtime) {
+			await session.disposeAsync();
+			return;
+		}
+		this.subagentRuntimes.delete(childId);
+		const shouldDisposeStaleSession = runtime.session !== session;
+		try {
+			await runtime.dispose();
+		} finally {
+			if (shouldDisposeStaleSession) {
+				await session.disposeAsync();
+			}
+		}
+	}
+
 	async releaseRlmSubagentRuntime(
 		runtime: RlmSubagentRuntime,
 		options: CreateRlmSubagentRuntimeOptions,

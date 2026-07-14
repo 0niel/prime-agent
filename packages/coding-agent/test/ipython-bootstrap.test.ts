@@ -11,6 +11,13 @@ describe("IPython RLM bootstrap", () => {
 		expect(buildRlmBootstrapCode()).toMatch(/^import asyncio$/m);
 	});
 
+	it("gives subagent registry operations the actionable missing-runtime fallback", () => {
+		const code = buildRlmBootstrapCode();
+		expect(code).toContain("async def list_subagents(self)");
+		expect(code).toContain("async def delete_subagent(self, target)");
+		expect(code).toContain("self._raise_missing()");
+	});
+
 	it("guards Python skill imports so a broken skill does not abort bootstrap", () => {
 		const code = buildRlmBootstrapCode([
 			{
