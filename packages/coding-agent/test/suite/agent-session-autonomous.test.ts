@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
@@ -28,6 +28,17 @@ async function waitForProcessExit(pid: number, timeoutMs = 2000): Promise<boolea
 		await new Promise<void>((resolve) => setTimeout(resolve, 25));
 	}
 	return !isProcessRunning(pid);
+}
+
+async function waitForPidFile(path: string, timeoutMs = 2000): Promise<number> {
+	const deadline = Date.now() + timeoutMs;
+	while (!existsSync(path) && Date.now() < deadline) {
+		await new Promise<void>((resolve) => setTimeout(resolve, 25));
+	}
+	if (!existsSync(path)) {
+		throw new Error(`Timed out waiting for process ID file: ${path}`);
+	}
+	return Number.parseInt(readFileSync(path, "utf8"), 10);
 }
 
 describe("AgentSession autonomous mode", () => {
@@ -448,6 +459,40 @@ describe("AgentSession autonomous mode", () => {
 				process.kill(descendantPid, "SIGKILL");
 			}
 			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("terminates an autonomous gate without mutating retry state when the session is aborted", async () => {
+		const gate = `${process.execPath} -e "const fs=require('fs'); fs.writeFileSync('gate.pid', String(process.pid)); setTimeout(() => {}, 60000)"`;
+		const harness = await createHarness({
+			autonomous: {
+				enabled: true,
+				maxContinuations: 1,
+				gates: { commands: [gate], maxRetries: 1 },
+			},
+		});
+		harnesses.push(harness);
+		execFileSync("git", ["init"], { cwd: harness.tempDir, stdio: "ignore" });
+		const pidFile = join(harness.tempDir, "gate.pid");
+		let gatePid: number | undefined;
+		try {
+			harness.setResponses([fauxAssistantMessage("Done.")]);
+
+			const prompt = harness.session.prompt("make the change");
+			gatePid = await waitForPidFile(pidFile);
+			await harness.session.abort();
+			await prompt;
+
+			expect(await waitForProcessExit(gatePid)).toBe(true);
+			expect(harness.session.getAutonomousStatus()).toMatchObject({
+				continuationsUsed: 0,
+				gateAttempts: {},
+				lastGateFailure: undefined,
+			});
+		} finally {
+			if (gatePid && isProcessRunning(gatePid)) {
+				process.kill(gatePid, "SIGKILL");
+			}
 		}
 	});
 

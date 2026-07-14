@@ -2,7 +2,7 @@ import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { compactRlmText } from "../../core/agent-session.js";
+import { compactRlmText, rlmChildLabel } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.js";
 import type { AgentTaskState, SessionInfo } from "../../core/session-manager.js";
@@ -61,6 +61,10 @@ export interface SessionSummary {
 	summary?: string;
 	/** Completion verdict for an idle session; absent while working or unjudged. */
 	taskState?: AgentTaskState;
+	/** Resident session-host process state, populated by the global supervisor. */
+	workerState?: "starting" | "ready" | "recovering" | "failed";
+	/** Diagnostic process identity; clients must not use this as a stable session identifier. */
+	workerPid?: number;
 }
 
 /**
@@ -258,12 +262,18 @@ function rlmChildSnapshotForActiveSession(
 ): AgentConnectionRlmChildAgentSnapshot {
 	const session = activeSession.runtime.session;
 	let answerPreview: string | undefined;
-	for (const message of session.messages) {
+	let toolUseCount = 0;
+	const messages =
+		session.state.streamingMessage?.role === "assistant"
+			? [...session.messages, session.state.streamingMessage]
+			: session.messages;
+	for (const message of messages) {
 		if (message.role === "assistant") {
 			const text = compactRlmText(readMessageText(message.content));
 			if (text) {
 				answerPreview = text;
 			}
+			toolUseCount += message.content.filter((block) => block.type === "toolCall").length;
 		}
 	}
 	// The parent session's run tracker is the source of truth for child status;
@@ -278,9 +288,11 @@ function rlmChildSnapshotForActiveSession(
 		id: metadata.rlmChildId ?? activeSession.activeSessionId,
 		parentId: parentNodeId,
 		activeSessionId: activeSession.activeSessionId,
-		label: compactRlmText(metadata.prompt ?? "", 80) || "child agent",
+		label: rlmChildLabel(metadata.prompt ?? ""),
 		status,
 		answerPreview,
+		toolUseCount: toolUseCount > 0 ? toolUseCount : undefined,
+		tokenCount: session._contextTokensForCurrentMessages(),
 		recap: session.getCurrentRecap(),
 		sessionDir: metadata.sessionDir ?? session.sessionManager.getSessionDir(),
 		activity: status === "running" ? { kind: session.isStreaming ? "writing" : "waiting" } : undefined,

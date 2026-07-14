@@ -1,9 +1,10 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createAgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { MissingSessionCwdError } from "../src/core/session-cwd.js";
+import { SessionLease } from "../src/core/session-lease.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { createAgentsViewResumeConfig, resolveAgentsViewOpenCwd } from "../src/modes/agents-view/agents-view-mode.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
@@ -31,13 +32,17 @@ describe("agents view open with a missing session cwd", () => {
 
 			// With cwd stripped, the session resolves against its deleted cwd and throws.
 			const stripped = await SessionManager.openAsync(sessionFile, sessionDir);
+			const suppliedLease = new SessionLease(sessionFile, join(root, "missing-cwd-lease"), "lease-token");
+			const releaseLease = vi.spyOn(suppliedLease, "release");
 			await expect(
 				createAgentSessionRuntime(factory, {
 					cwd: stripped.getCwd(),
 					agentDir,
 					sessionManager: stripped,
+					sessionLease: suppliedLease,
 				}),
 			).rejects.toThrowError(MissingSessionCwdError);
+			expect(releaseLease).toHaveBeenCalledOnce();
 
 			const summary: SessionSummary = {
 				id: session.getSessionId(),

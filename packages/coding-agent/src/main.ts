@@ -25,6 +25,7 @@ import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions
 import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
+import { installOwnedSessionRecoveryTracking } from "./cli/owned-session-worker.js";
 import { selectSession } from "./cli/session-picker.js";
 import { expandTildePath, getAgentDir, getSessionDirEnvOverride, VERSION } from "./config.js";
 import {
@@ -32,7 +33,11 @@ import {
 	mergeAgentSessionRuntimeConfig,
 	mergeAutonomousConfig,
 } from "./core/agent-session-config.js";
-import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.js";
+import {
+	type AgentSessionRuntime,
+	type CreateAgentSessionRuntimeFactory,
+	createAgentSessionRuntime,
+} from "./core/agent-session-runtime.js";
 import {
 	type AgentSessionRuntimeDiagnostic,
 	type AgentSessionServices,
@@ -55,11 +60,18 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.js";
+import { SessionAlreadyActiveError } from "./core/session-lease.js";
 import { SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
+import { isDaemonCatalogProcess, runDaemonCatalogProcess } from "./modes/daemon/daemon-catalog-process.js";
 import { collectDaemonClientEnv } from "./modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	isDaemonWorkerProcess,
+	requireDaemonWorkerAuthenticationToken,
+} from "./modes/daemon/daemon-worker-protocol.js";
 import {
 	type AgentConnection,
 	createInteractiveModeLocalSessionHost,
@@ -72,6 +84,7 @@ import {
 	resolveAttachModelFallbackMessage,
 	runAgentsViewMode,
 	runDaemonMode,
+	runDaemonSupervisorMode,
 	runPrintMode,
 	runRpcMode,
 	type SessionSummary,
@@ -1017,6 +1030,7 @@ async function createDaemonInteractiveConnection(options: {
 			const connection = await DaemonAgentConnection.attach(client, getDaemonSummaryActiveSessionId(summary), {
 				closeClientOnDispose: true,
 				sendClientEnv: true,
+				recoverDaemon: () => ensureInteractiveDaemonRunning(options.socketPath),
 			});
 			return { connection, summary };
 		};
@@ -1078,6 +1092,10 @@ export interface MainOptions {
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
 	installFileLogSink();
+	if (isDaemonCatalogProcess()) {
+		await runDaemonCatalogProcess();
+		return;
+	}
 	// Client and daemon are separate processes; both need these in their registry.
 	registerBuiltinMcpOAuthProviders();
 	args = normalizeDaemonStartArgs(args) ?? args;
@@ -1293,11 +1311,22 @@ export async function main(args: string[], options?: MainOptions) {
 	// --help/--list-models still take the full path to print and exit.
 	if (appMode === "daemon" && !parsed.help && parsed.listModels === undefined) {
 		printTimings();
-		await runDaemonMode({
-			socketPath: parsed.daemonSocket,
-			defaultSessionConfig,
-			createRuntime,
-		});
+		if (isDaemonWorkerProcess()) {
+			await runDaemonMode({
+				socketPath: parsed.daemonSocket,
+				defaultSessionConfig,
+				createRuntime,
+				worker: {
+					authenticationToken: requireDaemonWorkerAuthenticationToken(),
+					restoreActiveSessionId: process.env[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV],
+				},
+			});
+		} else {
+			await runDaemonSupervisorMode({
+				socketPath: parsed.daemonSocket,
+				defaultSessionConfig,
+			});
+		}
 		return;
 	}
 	if (useDaemonInteractive) {
@@ -1355,6 +1384,7 @@ export async function main(args: string[], options?: MainOptions) {
 				socketPath: daemonSocketPath,
 				config: defaultSessionConfig,
 				uiServices: daemonUiServices,
+				recoverDaemon: () => ensureInteractiveDaemonRunning(daemonSocketPath),
 				createUiServicesForSession: async (summary) => {
 					const attachedSessionManager = createSessionManagerForActiveDaemonSummary(
 						summary,
@@ -1445,13 +1475,23 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 
-	const runtime = await createAgentSessionRuntime(createRuntime, {
-		cwd: sessionManager.getCwd(),
-		agentDir,
-		sessionManager,
-		sessionConfig: defaultSessionConfig,
-	});
+	let runtime: AgentSessionRuntime;
+	try {
+		runtime = await createAgentSessionRuntime(createRuntime, {
+			cwd: sessionManager.getCwd(),
+			agentDir,
+			sessionManager,
+			sessionConfig: defaultSessionConfig,
+		});
+	} catch (error) {
+		if (error instanceof SessionAlreadyActiveError) {
+			console.error(chalk.red(`Error: ${error.message}`));
+			process.exit(1);
+		}
+		throw error;
+	}
 	const { services, session, modelFallbackMessage } = runtime;
+	installOwnedSessionRecoveryTracking(runtime);
 	const { settingsManager, modelRegistry, resourceLoader } = services;
 
 	if (parsed.help) {

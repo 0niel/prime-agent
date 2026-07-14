@@ -96,6 +96,11 @@ interface GitWorktreeSnapshot {
 	untrackedHash: string;
 }
 
+interface AutonomousOperationOptions {
+	cwd?: string;
+	signal?: AbortSignal;
+}
+
 type GateFailure = AgentAutonomousGateFailure;
 
 export function createAutonomousRuntimeState(
@@ -191,13 +196,15 @@ function autonomousTokenDelta(usage: Usage | undefined): number {
 export async function nextAutonomousContinuation(
 	state: AutonomousRuntimeState,
 	message: AssistantMessage,
-	options: { cwd?: string } = {},
+	options: AutonomousOperationOptions = {},
 	now = Date.now(),
 ): Promise<UserMessage | undefined> {
+	options.signal?.throwIfAborted();
 	if (!state.enabled) {
 		return undefined;
 	}
 	const decision = await shouldAutonomouslyContinue(state, message, options, now);
+	options.signal?.throwIfAborted();
 	if (!decision.shouldContinue) {
 		return undefined;
 	}
@@ -220,13 +227,15 @@ export async function nextAutonomousContinuation(
 export async function shouldAutonomouslyContinue(
 	state: AutonomousRuntimeState,
 	message: AssistantMessage,
-	options: { cwd?: string } = {},
+	options: AutonomousOperationOptions = {},
 	now = Date.now(),
 ): Promise<AutonomousDecision> {
+	options.signal?.throwIfAborted();
 	if (!state.enabled || message.stopReason === "error" || message.stopReason === "aborted") {
 		return { shouldContinue: false, reason: "not_needed" };
 	}
 	const gateResult = await refreshAutonomousQualityGates(state, options);
+	options.signal?.throwIfAborted();
 	if (gateResult) {
 		if (gateResult === "passed") {
 			return { shouldContinue: false, reason: "not_needed" };
@@ -263,23 +272,27 @@ export function autonomousLimitReason(
 
 export async function refreshAutonomousQualityGates(
 	state: AutonomousRuntimeState,
-	options: { cwd?: string } = {},
+	options: AutonomousOperationOptions = {},
 ): Promise<AutonomousGateResult | undefined> {
+	options.signal?.throwIfAborted();
 	if (!state.enabled || state.gates.commands.length === 0) {
 		return undefined;
 	}
-	return await runAutonomousQualityGates(state, options.cwd);
+	return await runAutonomousQualityGates(state, options.cwd, options.signal);
 }
 
 async function runAutonomousQualityGates(
 	state: AutonomousRuntimeState,
 	cwd: string | undefined,
+	signal: AbortSignal | undefined,
 ): Promise<AutonomousGateResult> {
+	signal?.throwIfAborted();
 	if (!cwd) {
 		return "failed";
 	}
 	for (const command of state.gates.commands) {
-		const currentSnapshot = await captureGitWorktreeSnapshot(cwd);
+		const currentSnapshot = await captureGitWorktreeSnapshot(cwd, signal);
+		signal?.throwIfAborted();
 		if (
 			state.lastGateFailure?.command === command &&
 			state.lastGateFailureSnapshot &&
@@ -301,8 +314,11 @@ async function runAutonomousQualityGates(
 			shell: true,
 			timeoutMs: state.gates.timeoutMs,
 			maxOutputChars: MAX_GATE_OUTPUT_CHARS,
+			signal,
 		});
-		const postRunSnapshot = await captureGitWorktreeSnapshot(cwd);
+		signal?.throwIfAborted();
+		const postRunSnapshot = await captureGitWorktreeSnapshot(cwd, signal);
+		signal?.throwIfAborted();
 		if (result.status === 0 && !result.error && !result.timedOut) {
 			state.gateAttempts[command] = 0;
 			if (state.lastGateFailure?.command === command) {
@@ -331,23 +347,35 @@ async function runAutonomousQualityGates(
 	return "passed";
 }
 
+export function buildAutonomousGateFailureContinuation(
+	failure: AgentAutonomousGateFailure,
+	maxRetries: number,
+	timestamp = Date.now(),
+): string {
+	return (
+		`Autonomous quality gate failed (attempt ${failure.attempt}/${maxRetries}): \`${failure.command}\` ${failure.exitText}.\n` +
+		(failure.output ? `\nOutput:\n${failure.output}\n` : "\n") +
+		`\nContinue working. Fix the failure, then produce terminal evidence. Timestamp: ${new Date(timestamp).toISOString()}.`
+	);
+}
+
 function buildGateFailureContinuation(state: AutonomousRuntimeState, timestamp: number): string | undefined {
 	const failure = state.lastGateFailure;
 	if (!failure) {
 		return undefined;
 	}
-	return (
-		`Autonomous quality gate failed (attempt ${failure.attempt}/${state.gates.maxRetries}): \`${failure.command}\` ${failure.exitText}.\n` +
-		(failure.output ? `\nOutput:\n${failure.output}\n` : "\n") +
-		`\nContinue working. Fix the failure, then produce terminal evidence. Timestamp: ${new Date(timestamp).toISOString()}.`
-	);
+	return buildAutonomousGateFailureContinuation(failure, state.gates.maxRetries, timestamp);
 }
 
 function gitWorktreeSnapshotsEqual(a: GitWorktreeSnapshot | undefined, b: GitWorktreeSnapshot | undefined): boolean {
 	return !!a && !!b && a.status === b.status && a.diff === b.diff && a.untrackedHash === b.untrackedHash;
 }
 
-async function captureGitWorktreeSnapshot(cwd: string | undefined): Promise<GitWorktreeSnapshot | undefined> {
+async function captureGitWorktreeSnapshot(
+	cwd: string | undefined,
+	signal?: AbortSignal,
+): Promise<GitWorktreeSnapshot | undefined> {
+	signal?.throwIfAborted();
 	if (!cwd) {
 		return undefined;
 	}
@@ -367,8 +395,10 @@ async function captureGitWorktreeSnapshot(cwd: string | undefined): Promise<GitW
 		{
 			cwd,
 			timeoutMs: 10_000,
+			signal,
 		},
 	);
+	signal?.throwIfAborted();
 	if (status.status !== 0 || status.error || status.timedOut || status.outputTruncated) {
 		return undefined;
 	}
@@ -378,15 +408,17 @@ async function captureGitWorktreeSnapshot(cwd: string | undefined): Promise<GitW
 		{
 			cwd,
 			timeoutMs: 10_000,
+			signal,
 		},
 	);
+	signal?.throwIfAborted();
 	if (diff.status !== 0 || diff.error || diff.timedOut || diff.outputTruncated) {
 		return undefined;
 	}
 	return {
 		status: status.stdout,
 		diff: diff.stdout,
-		untrackedHash: await hashUntrackedFiles(cwd, status.stdout),
+		untrackedHash: await hashUntrackedFiles(cwd, status.stdout, signal),
 	};
 }
 
@@ -398,32 +430,40 @@ function untrackedPathsFromStatus(status: string): string[] {
 		.sort();
 }
 
-async function hashUntrackedFiles(cwd: string, status: string): Promise<string> {
+async function hashUntrackedFiles(cwd: string, status: string, signal?: AbortSignal): Promise<string> {
 	const aggregate = createHash("sha256");
 	for (const path of untrackedPathsFromStatus(status)) {
+		signal?.throwIfAborted();
 		aggregate.update(path);
 		aggregate.update("\0");
-		aggregate.update(await hashUntrackedPath(resolve(cwd, path)));
+		aggregate.update(await hashUntrackedPath(resolve(cwd, path), signal));
 		aggregate.update("\0");
 	}
+	signal?.throwIfAborted();
 	return aggregate.digest("hex");
 }
 
-async function hashUntrackedPath(path: string): Promise<string> {
+async function hashUntrackedPath(path: string, signal?: AbortSignal): Promise<string> {
 	try {
+		signal?.throwIfAborted();
 		const stat = await lstat(path);
+		signal?.throwIfAborted();
 		if (stat.isSymbolicLink()) {
-			return `symlink:${await readlink(path)}`;
+			const target = await readlink(path);
+			signal?.throwIfAborted();
+			return `symlink:${target}`;
 		}
 		if (!stat.isFile()) {
 			return `other:${stat.mode}:${stat.size}:${stat.mtimeMs}`;
 		}
 		const hash = createHash("sha256");
-		for await (const chunk of createReadStream(path)) {
+		for await (const chunk of createReadStream(path, { signal })) {
 			hash.update(chunk);
 		}
+		signal?.throwIfAborted();
 		return `file:${hash.digest("hex")}`;
 	} catch (error) {
+		signal?.throwIfAborted();
 		return `error:${error instanceof Error ? error.message : String(error)}`;
 	}
 }
@@ -441,8 +481,15 @@ interface ChildProcessResult {
 function runChildProcess(
 	command: string,
 	args: string[],
-	options: { cwd?: string; shell?: boolean; timeoutMs?: number; maxOutputChars?: number } = {},
+	options: {
+		cwd?: string;
+		shell?: boolean;
+		timeoutMs?: number;
+		maxOutputChars?: number;
+		signal?: AbortSignal;
+	} = {},
 ): Promise<ChildProcessResult> {
+	options.signal?.throwIfAborted();
 	return new Promise((resolve) => {
 		const child = spawn(command, args, {
 			cwd: options.cwd,
@@ -468,6 +515,7 @@ function runChildProcess(
 			if (timer) {
 				clearTimeout(timer);
 			}
+			options.signal?.removeEventListener("abort", abort);
 			if (child.pid) {
 				untrackDetachedChildPid(child.pid);
 			}
@@ -483,6 +531,17 @@ function runChildProcess(
 					}
 				}, options.timeoutMs)
 			: undefined;
+		const abort = () => {
+			if (child.pid) {
+				killProcessTree(child.pid);
+			} else {
+				child.kill("SIGKILL");
+			}
+		};
+		options.signal?.addEventListener("abort", abort, { once: true });
+		if (options.signal?.aborted) {
+			abort();
+		}
 		child.stdout?.setEncoding("utf8");
 		child.stderr?.setEncoding("utf8");
 		child.stdout?.on("data", (chunk: string) => {

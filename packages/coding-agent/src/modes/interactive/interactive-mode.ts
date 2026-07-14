@@ -181,7 +181,6 @@ import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SideQuestionComponent } from "./components/side-question.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
-import { SubagentTreeView } from "./components/subagent-tree-view.js";
 import { ToolExecutionComponent, type ToolExecutionDefinition } from "./components/tool-execution.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
@@ -288,6 +287,48 @@ export function formatSplashCwd(cwd: string): string {
 	}
 
 	return normalized;
+}
+
+export function mergeChildAgentSnapshots(
+	previous: AgentConnectionRlmChildAgentSnapshot,
+	incoming: AgentConnectionRlmChildAgentSnapshot,
+): AgentConnectionRlmChildAgentSnapshot {
+	const active = incoming.status === "running" || incoming.status === "queued";
+	return {
+		...previous,
+		...incoming,
+		parentId: incoming.parentId ?? previous.parentId,
+		activeSessionId: incoming.activeSessionId ?? previous.activeSessionId,
+		durationMs: incoming.durationMs ?? previous.durationMs,
+		answerPreview: incoming.answerPreview ?? previous.answerPreview,
+		toolUseCount:
+			incoming.toolUseCount === undefined
+				? previous.toolUseCount
+				: Math.max(previous.toolUseCount ?? 0, incoming.toolUseCount),
+		tokenCount: incoming.tokenCount ?? previous.tokenCount,
+		recap: incoming.recap ?? previous.recap,
+		activity: active ? (incoming.activity ?? previous.activity) : undefined,
+		error: incoming.status === "error" ? (incoming.error ?? previous.error) : undefined,
+	};
+}
+
+function childAgentSummaryChanged(
+	previous: AgentConnectionRlmChildAgentSnapshot,
+	next: AgentConnectionRlmChildAgentSnapshot,
+): boolean {
+	const previousTokens = previous.tokenCount === undefined ? undefined : formatTokenCount(previous.tokenCount);
+	const nextTokens = next.tokenCount === undefined ? undefined : formatTokenCount(next.tokenCount);
+	return (
+		previous.parentId !== next.parentId ||
+		previous.label !== next.label ||
+		previous.status !== next.status ||
+		previous.durationMs !== next.durationMs ||
+		previous.toolUseCount !== next.toolUseCount ||
+		previousTokens !== nextTokens ||
+		previous.recap !== next.recap ||
+		previous.activity?.kind !== next.activity?.kind ||
+		previous.activity?.toolName !== next.activity?.toolName
+	);
 }
 
 export function truncatePathMiddle(value: string, width: number): string {
@@ -704,9 +745,6 @@ export class InteractiveMode {
 
 	// RLM child-agent tray: inline list below the editor, full-screen detail on open.
 	private childAgentSummary: ChildAgentSummaryComponent;
-	// Live tree of the current turn's subagents, drawn above the working loader.
-	// Shown in addition to the inline list below the prompt bar.
-	private subagentTree = new SubagentTreeView();
 	private childAgentDetail: ChildAgentDetailComponent;
 	private childAgentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	private childAgentNodes: ChildAgentInspectorNode[] = [];
@@ -737,7 +775,6 @@ export class InteractiveMode {
 	private connectionModelsRefreshInFlight: { version: number; promise: Promise<AgentConnectionModel[]> } | undefined;
 	private connectionState: AgentConnectionState | undefined;
 	private connectionResourceSnapshot: AgentConnectionResourceSnapshot | undefined;
-	private initialConnectionSnapshotConsumed = false;
 	private sessionHasMessages = false;
 
 	// Registry of images pasted this session, keyed by the `[image #N]` marker
@@ -2449,6 +2486,35 @@ export class InteractiveMode {
 		this.syncWorkingLoader();
 	}
 
+	private async renderResyncedSession(snapshot: AgentConnectionSnapshot): Promise<void> {
+		const compactionFinished = this.isAgentCompacting() && !snapshot.state.isCompacting;
+		const bashFinished = this.isBashRunning() && !snapshot.state.isBashRunning;
+		this.applyConnectionStateSnapshot(snapshot.state);
+		this.streamingComponent = undefined;
+		this.streamingMessage = undefined;
+		this.replaceChildAgentInspector(snapshot.children);
+		await this.renderSessionContext(this.getSessionContextFromConnectionSnapshot(snapshot), {
+			clearChat: true,
+			updateFooter: true,
+		});
+		await this.restoreStreamingMessageFromSnapshot(snapshot.streamingMessage);
+		await this.refreshConnectionQueue();
+		if (compactionFinished) {
+			await this.flushCompactionQueue({ willRetry: false });
+		}
+		if (bashFinished && this.activeBashComponent) {
+			this.activeBashComponent.setComplete(undefined, false);
+			this.activeBashComponent = undefined;
+			if (!snapshot.state.isStreaming) {
+				this.flushPendingBashComponents();
+			}
+		}
+		this.updateTerminalTitle();
+		this.setGoalAnnouncementBaseline(this.getGoalState());
+		this.syncGoalTray(this.getGoalState());
+		this.syncWorkingLoader();
+	}
+
 	private getCachedToolDefinition(toolName: string): ToolExecutionDefinition | undefined {
 		return this.toolDefinitionCache.get(toolName);
 	}
@@ -4094,6 +4160,11 @@ export class InteractiveMode {
 					await this.rebindCurrentSession();
 					await this.renderInitialMessages();
 					this.ui.requestRender();
+				} else if (event.type === "session_resynced") {
+					const run = this.sessionEventQueue.then(() => this.renderResyncedSession(event.snapshot));
+					this.sessionEventQueue = run.catch(() => {});
+					await run;
+					this.ui.requestRender();
 				} else if (event.type === "session_status") {
 					this.sessionRecap = event.recap;
 					this.patchConnectionState({ recap: event.recap });
@@ -4102,6 +4173,11 @@ export class InteractiveMode {
 					this.handleSideQuestionEvent(event.event);
 				} else if (event.type === "extension_ui_request") {
 					await this.handleConnectionExtensionUiRequest(event.request);
+				} else if (event.type === "connection_status") {
+					this.showStatus(
+						event.status === "connected" ? "Daemon reconnected" : "Daemon connection lost; reconnecting…",
+						event.status === "reconnecting" ? "warning" : "dim",
+					);
 				} else if (event.type === "closed") {
 					this.showError(event.error ?? "Agent connection closed");
 				}
@@ -4823,13 +4899,31 @@ export class InteractiveMode {
 		if (!children?.length) {
 			return;
 		}
+		let changed = false;
 		for (const child of children) {
 			// Live rlm_child_update events are richer than the snapshot; never
 			// clobber state that already arrived from the event stream.
-			if (!this.childAgentSnapshots.has(child.id)) {
-				this.updateChildAgentInspector(child);
+			if (!this.childAgentSnapshots.has(child.id) && child.status !== "cancelled") {
+				this.childAgentSnapshots.set(child.id, child);
+				changed = true;
 			}
 		}
+		if (changed) {
+			this.refreshChildAgentInspector();
+		}
+	}
+
+	private replaceChildAgentInspector(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {
+		const next = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
+		for (const child of children ?? []) {
+			if (child.status === "cancelled") {
+				continue;
+			}
+			const previous = this.childAgentSnapshots.get(child.id);
+			next.set(child.id, previous ? mergeChildAgentSnapshots(previous, child) : child);
+		}
+		this.childAgentSnapshots = next;
+		this.refreshChildAgentInspector();
 	}
 
 	private updateChildAgentInspector(child: AgentConnectionRlmChildAgentSnapshot): void {
@@ -4837,12 +4931,20 @@ export class InteractiveMode {
 		// viewer instead of keeping a dead row around.
 		if (child.status === "cancelled") {
 			this.removeChildAgentSnapshot(child.id);
-		} else {
-			this.childAgentSnapshots.set(child.id, child);
+			this.refreshChildAgentInspector();
+			return;
 		}
+		const previous = this.childAgentSnapshots.get(child.id);
+		const next = previous ? mergeChildAgentSnapshots(previous, child) : child;
+		this.childAgentSnapshots.set(child.id, next);
+		if (!previous || childAgentSummaryChanged(previous, next) || this.childAgentDetailNodeId === child.id) {
+			this.refreshChildAgentInspector();
+		}
+	}
+
+	private refreshChildAgentInspector(): void {
 		this.childAgentNodes = this.buildChildAgentInspectorNodes();
 		this.childAgentSummary.setNodes(this.childAgentNodes);
-		this.subagentTree.setNodes(this.childAgentNodes);
 		this.updateWorkingPulse();
 		this.syncWorkingLoader();
 		this.updateWorkingLoaderMessage();
@@ -4872,8 +4974,6 @@ export class InteractiveMode {
 		this.mainViewContainer.addChild(this.chatContainer);
 		this.mainViewContainer.addChild(this.shortcutGuideContainer);
 		this.mainViewContainer.addChild(this.pendingMessagesContainer);
-		// Subagent tree sits directly above the loader, mirroring Claude's layout.
-		this.mainViewContainer.addChild(this.subagentTree);
 		this.mainViewContainer.addChild(this.statusContainer);
 	}
 
@@ -4881,7 +4981,6 @@ export class InteractiveMode {
 		this.childAgentSnapshots.clear();
 		this.childAgentNodes = [];
 		this.childAgentSummary.setNodes([]);
-		this.subagentTree.setNodes([]);
 		this.childAgentSummary.setHidden(false);
 		this.childAgentDetail.setNode(undefined);
 		this.childAgentDetailNodeId = undefined;
@@ -5082,6 +5181,10 @@ export class InteractiveMode {
 	}
 
 	private openChildAgentDetail(nodeId: string): boolean {
+		// Live text deltas are stored without redrawing the summary on every token.
+		// Rebuild once here so the detail opens with the latest preview and recap.
+		this.childAgentNodes = this.buildChildAgentInspectorNodes();
+		this.childAgentSummary.setNodes(this.childAgentNodes);
 		const node = this.findChildAgentInspectorNode(nodeId);
 		if (!node) {
 			return false;
@@ -5132,8 +5235,8 @@ export class InteractiveMode {
 			if (token !== this.childAgentWatcherToken) {
 				return;
 			}
-			// session_replaced carries a fresh messages array; both need a rebuild.
-			if (event.type === "session_event" || event.type === "session_replaced") {
+			// Replacement and resync snapshots both carry authoritative messages.
+			if (event.type === "session_event" || event.type === "session_replaced" || event.type === "session_resynced") {
 				void this.refreshChildAgentWatch(token, watcher);
 			}
 		});
@@ -5352,19 +5455,19 @@ export class InteractiveMode {
 	 * If multiple status messages are emitted back-to-back (without anything else being added to the chat),
 	 * we update the previous status line instead of appending new ones to avoid log spam.
 	 */
-	private showStatus(message: string): void {
+	private showStatus(message: string, tone: "dim" | "warning" = "dim"): void {
 		const children = this.chatContainer.children;
 		const last = children.length > 0 ? children[children.length - 1] : undefined;
 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
 
 		if (last && secondLast && last === this.lastStatusText && secondLast === this.lastStatusSpacer) {
-			this.lastStatusText.setText(theme.fg("dim", message));
+			this.lastStatusText.setText(theme.fg(tone, message));
 			this.ui.requestRender();
 			return;
 		}
 
 		const spacer = new Spacer(1);
-		const text = new Text(theme.fg("dim", message), 1, 0);
+		const text = new Text(theme.fg(tone, message), 1, 0);
 		this.chatContainer.addChild(spacer);
 		this.chatContainer.addChild(text);
 		this.lastStatusSpacer = spacer;
@@ -5602,32 +5705,36 @@ export class InteractiveMode {
 	}
 
 	async renderInitialMessages(): Promise<void> {
-		let context: AgentConnectionSessionContext;
-		let state: AgentConnectionState;
-		if (this.initialConnectionSnapshotConsumed) {
-			[context, state] = await Promise.all([
-				this.agentConnection.getSessionContext(),
-				this.agentConnection.getState(),
-			]);
-		} else {
-			const snapshot = await this.agentConnection.getInitialSnapshot();
-			this.initialConnectionSnapshotConsumed = true;
-			context = this.getSessionContextFromConnectionSnapshot(snapshot);
-			state = snapshot.state;
-			this.seedChildAgentInspector(snapshot.children);
-		}
+		const snapshot = await this.agentConnection.getInitialSnapshot();
+		const context = this.getSessionContextFromConnectionSnapshot(snapshot);
+		const state = snapshot.state;
+		const streamingMessage = snapshot.streamingMessage;
+		this.seedChildAgentInspector(snapshot.children);
 		this.setSessionHasMessages(context.messages.length > 0);
 		this.applyConnectionStateSnapshot(state);
 		await this.renderSessionContext(context, {
 			updateFooter: true,
 			populateHistory: true,
 		});
+		await this.restoreStreamingMessageFromSnapshot(streamingMessage);
 
 		// Show compaction info if session was compacted
 		const compactionCount = state.compactionCount;
 		if (compactionCount > 0) {
 			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
 			this.showStatus(`Session compacted ${times}`);
+		}
+	}
+
+	private async restoreStreamingMessageFromSnapshot(message: AgentMessage | undefined): Promise<void> {
+		if (message?.role === "assistant") {
+			this.startAssistantStreamingMessage(message);
+			for (const content of message.content) {
+				if (content.type === "toolCall") {
+					this.startedToolCalls.add(content.id);
+					await this.getOrCreatePendingToolComponent(content);
+				}
+			}
 		}
 	}
 

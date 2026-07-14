@@ -1,5 +1,6 @@
 import { MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
+import { SessionAlreadyActiveError } from "../../core/session-lease.js";
 import type { DaemonErrorInfo, DaemonResponse } from "./daemon-protocol.js";
 
 export function serializeDaemonError(error: unknown): DaemonErrorInfo | undefined {
@@ -8,6 +9,13 @@ export function serializeDaemonError(error: unknown): DaemonErrorInfo | undefine
 	}
 	if (error instanceof SessionImportFileNotFoundError) {
 		return { code: "session_import_file_not_found", filePath: error.filePath };
+	}
+	if (error instanceof SessionAlreadyActiveError) {
+		return {
+			code: "session_already_active",
+			sessionPath: error.sessionPath,
+			activeSessionId: error.activeSessionId,
+		};
 	}
 	return undefined;
 }
@@ -19,6 +27,9 @@ export function deserializeDaemonError(response: Extract<DaemonResponse, { succe
 	}
 	if (errorInfo?.code === "session_import_file_not_found") {
 		return new SessionImportFileNotFoundError(errorInfo.filePath);
+	}
+	if (errorInfo?.code === "session_already_active") {
+		return new SessionAlreadyActiveError(errorInfo.sessionPath, errorInfo.activeSessionId);
 	}
 	return new Error(response.error);
 }

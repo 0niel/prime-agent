@@ -9,10 +9,10 @@
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.js";
 import {
-	type AgentAutonomousGateFailure,
 	type AgentAutonomousStatus,
 	type AutonomousLimitReason,
 	autonomousLimitReason,
+	buildAutonomousGateFailureContinuation,
 } from "../core/autonomous.js";
 import { flushRawStdout, writeRawStdout } from "../core/output-guard.js";
 import { killTrackedDetachedChildren } from "../utils/shell.js";
@@ -59,18 +59,6 @@ function shouldContinuePrintModeAutonomousGates(status: AgentAutonomousStatus): 
 	);
 }
 
-function buildPrintModeGateContinuation(
-	failure: AgentAutonomousGateFailure,
-	attempt: number,
-	maxRetries: number,
-): string {
-	return (
-		`Autonomous quality gate failed (attempt ${attempt}/${maxRetries}): \`${failure.command}\` ${failure.exitText}.\n` +
-		(failure.output ? `\nOutput:\n${failure.output}\n` : "\n") +
-		`\nContinue working. Fix the failure, then produce terminal evidence. Timestamp: ${new Date().toISOString()}.`
-	);
-}
-
 function printModeAutonomousProgressKey(status: AgentAutonomousStatus): string {
 	return [
 		latestGateAttempt(status),
@@ -111,7 +99,10 @@ async function waitForPrintModeIdleWithAutonomousGates(
 		}
 		session.recordHostAutonomousContinuation();
 		await session.prompt(
-			buildPrintModeGateContinuation(status.lastGateFailure, latestGateAttempt(status), status.gates.maxRetries),
+			buildAutonomousGateFailureContinuation(
+				{ ...status.lastGateFailure, attempt: latestGateAttempt(status) },
+				status.gates.maxRetries,
+			),
 			{
 				streamingBehavior: "followUp",
 				internalPrompt: true,

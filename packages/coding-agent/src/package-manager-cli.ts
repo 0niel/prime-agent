@@ -31,6 +31,7 @@ import { DefaultPackageManager } from "./core/package-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { DaemonClient } from "./modes/daemon/daemon-client.js";
 import {
+	DAEMON_PROTOCOL_VERSION,
 	type DaemonUpdateRestartManifest,
 	type DaemonUpdateRestartQueuedMessage,
 	type DaemonUpdateRestartSession,
@@ -704,15 +705,21 @@ export async function prepareDaemonUpdateRestart(
 	try {
 		await client.connect(1000);
 		connected = true;
+		const hello = await client.waitForHello(2000).catch(() => undefined);
+		const useLegacyProtocol = hello !== undefined && hello.protocol.version < DAEMON_PROTOCOL_VERSION;
 		if (pendingManifest && pendingManifest.sessions.length > 0) {
-			const listResponse = await client.request({ type: "list" }, 30000);
+			const listResponse = useLegacyProtocol
+				? await client.requestLegacy({ type: "list" }, 30000)
+				: await client.request({ type: "list" }, 30000);
 			if (listResponse.success && !responseHasActiveDaemonSessions(listResponse.data)) {
 				return pendingManifest;
 			}
 		}
 		clearPreparedDaemonUpdateRestartManifest(agentDir);
 		startedAt = Date.now();
-		const response = await client.request({ type: "prepare_update_restart" }, 120000);
+		const response = useLegacyProtocol
+			? await client.requestLegacy({ type: "prepare_update_restart" }, 120000)
+			: await client.request({ type: "prepare_update_restart" }, 120000);
 		if (!response.success) {
 			throw new Error(response.error);
 		}

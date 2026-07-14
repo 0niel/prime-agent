@@ -1,6 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import {
+	closeSync,
+	existsSync,
+	fsyncSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	writeFileSync,
+} from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { lockSync } from "proper-lockfile";
 import { Type } from "typebox";
 import type { ToolDefinition } from "./extensions/types.js";
 
@@ -61,6 +71,11 @@ export interface CreateAgentCronJobInput {
 
 export type AgentCronJobRunResult = "ran" | "skipped";
 
+export interface AgentCronDispatch {
+	id: string;
+	job: AgentCronJob;
+}
+
 export interface AgentCronSchedulerHooks {
 	runJob: (job: AgentCronJob) => Promise<AgentCronJobRunResult | undefined>;
 	now?: () => Date;
@@ -78,7 +93,22 @@ export interface HeartbeatCronSessionActivity {
 
 interface CronJobsFile {
 	jobs?: unknown;
+	dispatches?: unknown;
 }
+
+interface AgentCronDispatchRecord {
+	id: string;
+	jobId: string;
+	claimedAt: string;
+	scheduledFor: string;
+}
+
+interface CronJobsState {
+	jobs: AgentCronJob[];
+	dispatches: AgentCronDispatchRecord[];
+}
+
+export const SESSION_SCHEDULED_JOBS_FILENAME = "scheduled-jobs.json";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const ONE_SECOND_MS = 1000;
@@ -117,7 +147,48 @@ export interface AgentRlmHeartbeatController {
 }
 
 export class AgentCronJobStore {
-	constructor(private readonly filePath: string) {}
+	private readonly sessionArtifactFiles = new Map<string, string>();
+
+	constructor(
+		private readonly filePath?: string,
+		private readonly sessionArtifactMode = false,
+	) {
+		if (!filePath && !sessionArtifactMode) {
+			throw new Error("Cron job store requires a file path");
+		}
+	}
+
+	static forSessionArtifacts(): AgentCronJobStore {
+		return new AgentCronJobStore(undefined, true);
+	}
+
+	registerSessionArtifact(sessionId: string, artifactDir: string): boolean {
+		if (!this.sessionArtifactMode) {
+			return false;
+		}
+		const path = join(artifactDir, SESSION_SCHEDULED_JOBS_FILENAME);
+		if (this.sessionArtifactFiles.get(sessionId) === path) {
+			return false;
+		}
+		this.sessionArtifactFiles.set(sessionId, path);
+		return true;
+	}
+
+	recoverSessionArtifact(sessionId: string, now = new Date()): AgentCronJob[] {
+		const path = this.sessionArtifactFiles.get(sessionId);
+		if (!path) {
+			return [];
+		}
+		return withCronJobsStateLocks([path], () => {
+			const state = readJobsState(path);
+			const recovered: AgentCronJob[] = [];
+			if (state.dispatches.length > 0) {
+				recoverInterruptedInState(state, now, recovered);
+				writeJobsState(path, state);
+			}
+			return recovered;
+		});
+	}
 
 	list(): AgentCronJob[] {
 		return this.readJobs().sort((a, b) => compareOptionalIso(a.nextRunAt, b.nextRunAt));
@@ -562,6 +633,71 @@ export class AgentCronJobStore {
 		return this.readJobs().filter((job) => isDueJob(job, now));
 	}
 
+	claimDue(dueAt = new Date(), claimedAt = dueAt): AgentCronDispatch[] {
+		return this.mutateStates((state) => claimDueInState(state, dueAt, claimedAt));
+	}
+
+	getClaimedJob(id: string): AgentCronJob | undefined {
+		for (const state of this.readStates()) {
+			if (!state.dispatches.some((dispatch) => dispatch.jobId === id)) {
+				continue;
+			}
+			return state.jobs.find((job) => job.id === id && job.status === "active");
+		}
+		return undefined;
+	}
+
+	recordDispatchResult(
+		dispatchId: string,
+		result: { now?: Date; outcome: AgentCronJobRunResult; error?: unknown },
+	): AgentCronJob | undefined {
+		let updated: AgentCronJob | undefined;
+		this.mutateStates((state) => {
+			const dispatch = state.dispatches.find((candidate) => candidate.id === dispatchId);
+			if (!dispatch) {
+				return [];
+			}
+			const now = result.now ?? new Date();
+			state.dispatches = state.dispatches.filter((candidate) => candidate.id !== dispatchId);
+			state.jobs = state.jobs.map((job) => {
+				if (job.id !== dispatch.jobId || job.status !== "active") {
+					return job;
+				}
+				if (result.outcome === "skipped" && result.error === undefined) {
+					const nextRunAt = nextRunAtForSchedule(job.schedule, now);
+					updated = {
+						...job,
+						status: job.schedule.kind === "once" ? "completed" : job.status,
+						nextRunAt: nextRunAt?.toISOString(),
+						lastSkippedAt: now.toISOString(),
+						updatedAt: now.toISOString(),
+					};
+					return updated;
+				}
+				updated = {
+					...job,
+					status: job.schedule.kind === "once" ? "completed" : job.status,
+					lastRunAt: now.toISOString(),
+					lastError: result.error === undefined ? undefined : errorMessage(result.error),
+					runCount: job.runCount + 1,
+					updatedAt: now.toISOString(),
+				};
+				return updated;
+			});
+			return [];
+		});
+		return updated;
+	}
+
+	recoverInterruptedDispatches(now = new Date()): AgentCronJob[] {
+		const recovered: AgentCronJob[] = [];
+		this.mutateStates((state) => {
+			recoverInterruptedInState(state, now, recovered);
+			return [];
+		});
+		return recovered;
+	}
+
 	getDueJob(id: string, now = new Date()): AgentCronJob | undefined {
 		return this.readJobs().find((job) => job.id === id && isDueJob(job, now));
 	}
@@ -576,29 +712,135 @@ export class AgentCronJobStore {
 	}
 
 	private readJobs(): AgentCronJob[] {
-		if (!existsSync(this.filePath)) {
-			return [];
+		return this.readStates().flatMap((state) => state.jobs);
+	}
+
+	private readStates(): CronJobsState[] {
+		if (this.sessionArtifactMode) {
+			return [...this.sessionArtifactFiles.values()].map((path) => readJobsState(path));
 		}
-		const parsed = JSON.parse(readFileSync(this.filePath, "utf-8")) as CronJobsFile;
-		if (!Array.isArray(parsed.jobs)) {
-			return [];
-		}
-		return parsed.jobs.filter(isAgentCronJob);
+		return [readJobsState(this.requireFilePath())];
+	}
+
+	private mutateStates(mutator: (state: CronJobsState) => AgentCronDispatch[]): AgentCronDispatch[] {
+		const paths = this.sessionArtifactMode ? [...this.sessionArtifactFiles.values()] : [this.requireFilePath()];
+		return withCronJobsStateLocks(paths, () => {
+			const dispatches: AgentCronDispatch[] = [];
+			for (const path of paths) {
+				const state = readJobsState(path);
+				const before = JSON.stringify(state);
+				dispatches.push(...mutator(state));
+				if (JSON.stringify(state) !== before) {
+					writeJobsState(path, state);
+				}
+			}
+			return dispatches;
+		});
 	}
 
 	private writeJobs(jobs: readonly AgentCronJob[]): void {
-		mkdirSync(dirname(this.filePath), { recursive: true });
-		const mergedJobs = mergeFreshJobs(this.readJobs(), jobs);
-		const tempPath = `${this.filePath}.tmp`;
-		writeFileSync(tempPath, `${JSON.stringify({ jobs: mergedJobs }, null, 2)}\n`, "utf-8");
-		renameSync(tempPath, this.filePath);
+		if (this.sessionArtifactMode) {
+			const registeredSessionIds = new Set(this.sessionArtifactFiles.keys());
+			const unregistered = jobs.find((job) => !registeredSessionIds.has(job.sessionId));
+			if (unregistered) {
+				throw new Error(`Cron job ${unregistered.id} targets an unregistered session artifact`);
+			}
+			const paths = [...this.sessionArtifactFiles.values()];
+			withCronJobsStateLocks(paths, () => {
+				const currentBySessionId = new Map(
+					[...this.sessionArtifactFiles].map(([sessionId, path]) => [sessionId, readJobsState(path)]),
+				);
+				const incomingById = new Map(jobs.map((job) => [job.id, job]));
+				const mergedJobsBySessionId = new Map<string, AgentCronJob[]>();
+				for (const [sessionId, current] of currentBySessionId) {
+					const retained = current.jobs.filter((job) => {
+						const incoming = incomingById.get(job.id);
+						return incoming === undefined || incoming.sessionId === sessionId;
+					});
+					mergedJobsBySessionId.set(
+						sessionId,
+						mergeFreshJobs(
+							retained,
+							jobs.filter((job) => job.sessionId === sessionId),
+						),
+					);
+				}
+				const sessionIdByJobId = new Map(
+					[...mergedJobsBySessionId].flatMap(([sessionId, sessionJobs]) =>
+						sessionJobs.map((job) => [job.id, sessionId] as const),
+					),
+				);
+				const dispatches = [...currentBySessionId.values()].flatMap((state) => state.dispatches);
+				for (const [sessionId, path] of this.sessionArtifactFiles) {
+					const current = currentBySessionId.get(sessionId) ?? { jobs: [], dispatches: [] };
+					const nextState = {
+						jobs: mergedJobsBySessionId.get(sessionId) ?? [],
+						dispatches: dispatches.filter((dispatch) => sessionIdByJobId.get(dispatch.jobId) === sessionId),
+					};
+					if (JSON.stringify(current) !== JSON.stringify(nextState)) {
+						writeJobsState(path, nextState);
+					}
+				}
+			});
+			return;
+		}
+		const path = this.requireFilePath();
+		withCronJobsStateLocks([path], () => writeJobsFile(path, jobs, true));
 	}
+
+	private requireFilePath(): string {
+		if (!this.filePath) {
+			throw new Error("Cron job store does not have a legacy file path");
+		}
+		return this.filePath;
+	}
+}
+
+export function migrateLegacyCronJobsToSessionArtifacts(
+	filePath: string,
+	options: { isSessionOwned?: (job: AgentCronJob) => boolean; now?: Date } = {},
+): number {
+	const now = options.now ?? new Date();
+	const legacyState = readJobsState(filePath);
+	recoverInterruptedInState(legacyState, now, []);
+	const jobs = legacyState.jobs.map((job) => {
+		if (
+			!options.isSessionOwned ||
+			options.isSessionOwned(job) ||
+			(job.status !== "active" && job.status !== "paused")
+		) {
+			return job;
+		}
+		return withoutNextRunAt({ ...job, status: "cancelled", updatedAt: now.toISOString() });
+	});
+	if (jobs.length === 0) {
+		return 0;
+	}
+	const jobsByArtifact = new Map<string, AgentCronJob[]>();
+	for (const job of jobs) {
+		const artifactPath = join(
+			dirname(dirname(resolve(job.sessionFile))),
+			"session-artifacts",
+			job.sessionId,
+			SESSION_SCHEDULED_JOBS_FILENAME,
+		);
+		const grouped = jobsByArtifact.get(artifactPath) ?? [];
+		grouped.push(job);
+		jobsByArtifact.set(artifactPath, grouped);
+	}
+	for (const [artifactPath, artifactJobs] of jobsByArtifact) {
+		writeJobsFile(artifactPath, artifactJobs, true);
+	}
+	renameSync(filePath, `${filePath}.migrated-${Date.now()}`);
+	return jobs.length;
 }
 
 export class AgentCronScheduler {
 	private timer: ReturnType<typeof setTimeout> | undefined;
 	private running = false;
 	private stopped = true;
+	private hasStarted = false;
+	private readonly dispatchLanes = new Map<string, Promise<void>>();
 
 	constructor(
 		private readonly store: AgentCronJobStore,
@@ -607,6 +849,10 @@ export class AgentCronScheduler {
 
 	start(): void {
 		this.stopped = false;
+		if (!this.hasStarted) {
+			this.hasStarted = true;
+			this.store.recoverInterruptedDispatches(this.now());
+		}
 		this.scheduleNext();
 	}
 
@@ -630,12 +876,29 @@ export class AgentCronScheduler {
 			return 0;
 		}
 		this.running = true;
-		let handled = 0;
+		let dispatches: AgentCronDispatch[] = [];
 		try {
-			for (const dueJob of this.store.due(now)) {
-				const job = this.store.getDueJob(dueJob.id, now);
+			dispatches = this.store.claimDue(now, this.now());
+		} finally {
+			this.running = false;
+			if (!this.stopped) {
+				this.scheduleNext();
+			}
+		}
+		const results = await Promise.all(dispatches.map((dispatch) => this.queueDispatch(dispatch)));
+		return results.filter((result) => result !== "skipped").length;
+	}
+
+	private queueDispatch(dispatch: AgentCronDispatch): Promise<AgentCronJobRunResult | undefined> {
+		const laneKey = dispatch.job.activeSessionId;
+		const previous = this.dispatchLanes.get(laneKey) ?? Promise.resolve();
+		const task = previous
+			.catch(() => undefined)
+			.then(async (): Promise<AgentCronJobRunResult | undefined> => {
+				const job = this.store.getClaimedJob(dispatch.job.id);
 				if (!job) {
-					continue;
+					this.store.recordDispatchResult(dispatch.id, { now: this.now(), outcome: "skipped" });
+					return "skipped";
 				}
 				let runResult: AgentCronJobRunResult | undefined;
 				let error: unknown;
@@ -645,20 +908,24 @@ export class AgentCronScheduler {
 					error = runError;
 					this.hooks.onError?.(job, runError);
 				}
-				if (runResult === "skipped" && error === undefined) {
-					this.store.recordSkipResult(job.id, { now: this.now() });
-					continue;
-				}
-				handled++;
-				this.store.recordRunResult(job.id, { now: this.now(), error });
+				this.store.recordDispatchResult(dispatch.id, {
+					now: this.now(),
+					outcome: runResult === "skipped" && error === undefined ? "skipped" : "ran",
+					error,
+				});
+				return runResult;
+			});
+		const lane = task.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.dispatchLanes.set(laneKey, lane);
+		void lane.finally(() => {
+			if (this.dispatchLanes.get(laneKey) === lane) {
+				this.dispatchLanes.delete(laneKey);
 			}
-		} finally {
-			this.running = false;
-			if (!this.stopped) {
-				this.scheduleNext();
-			}
-		}
-		return handled;
+		});
+		return task;
 	}
 
 	private scheduleNext(delayMs?: number): void {
@@ -1131,6 +1398,132 @@ function isDueJob(job: AgentCronJob, now: Date): boolean {
 	return job.status === "active" && job.nextRunAt !== undefined && Date.parse(job.nextRunAt) <= now.getTime();
 }
 
+function withCronJobsStateLocks<T>(paths: readonly string[], action: () => T): T {
+	const releases: Array<() => void> = [];
+	try {
+		for (const path of [...new Set(paths)].sort()) {
+			mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+			let release: (() => void) | undefined;
+			for (let attempt = 0; attempt < 100; attempt++) {
+				try {
+					release = lockSync(path, {
+						realpath: false,
+						lockfilePath: `${path}.lock`,
+						stale: 30_000,
+					});
+					break;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ELOCKED" || attempt === 99) {
+						throw error;
+					}
+					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+				}
+			}
+			if (!release) {
+				throw new Error(`Could not coordinate scheduled jobs: ${path}`);
+			}
+			releases.push(release);
+		}
+		return action();
+	} finally {
+		for (const release of releases.reverse()) {
+			release();
+		}
+	}
+}
+
+function readJobsState(path: string): CronJobsState {
+	if (!existsSync(path)) {
+		return { jobs: [], dispatches: [] };
+	}
+	const parsed = JSON.parse(readFileSync(path, "utf-8")) as CronJobsFile;
+	return {
+		jobs: Array.isArray(parsed.jobs) ? parsed.jobs.filter(isAgentCronJob) : [],
+		dispatches: Array.isArray(parsed.dispatches) ? parsed.dispatches.filter(isAgentCronDispatchRecord) : [],
+	};
+}
+
+function writeJobsFile(path: string, jobs: readonly AgentCronJob[], mergeCurrent: boolean): void {
+	const current = readJobsState(path);
+	writeJobsState(path, {
+		jobs: mergeCurrent ? mergeFreshJobs(current.jobs, jobs) : [...jobs],
+		dispatches: current.dispatches,
+	});
+}
+
+function writeJobsState(path: string, state: CronJobsState): void {
+	const directory = dirname(path);
+	mkdirSync(directory, { recursive: true, mode: 0o700 });
+	const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+	const descriptor = openSync(tempPath, "w", 0o600);
+	try {
+		writeFileSync(descriptor, `${JSON.stringify(state, null, 2)}\n`, "utf-8");
+		fsyncSync(descriptor);
+	} finally {
+		closeSync(descriptor);
+	}
+	renameSync(tempPath, path);
+	try {
+		const directoryDescriptor = openSync(directory, "r");
+		try {
+			fsyncSync(directoryDescriptor);
+		} finally {
+			closeSync(directoryDescriptor);
+		}
+	} catch {
+		// Directory fsync is unavailable on some platforms; the atomic rename still protects readers.
+	}
+}
+
+function claimDueInState(state: CronJobsState, dueAt: Date, claimedAt: Date): AgentCronDispatch[] {
+	const dispatches: AgentCronDispatch[] = [];
+	const claimedJobIds = new Set(state.dispatches.map((dispatch) => dispatch.jobId));
+	state.jobs = state.jobs.map((job) => {
+		if (!isDueJob(job, dueAt)) {
+			return job;
+		}
+		const scheduledFor = job.nextRunAt!;
+		const nextRunAt = nextRunAtForSchedule(job.schedule, claimedAt)?.toISOString();
+		const advanced = nextRunAt
+			? { ...job, nextRunAt, updatedAt: claimedAt.toISOString() }
+			: withoutNextRunAt({ ...job, updatedAt: claimedAt.toISOString() });
+		if (claimedJobIds.has(job.id)) {
+			return { ...advanced, lastSkippedAt: claimedAt.toISOString() };
+		}
+		const dispatch: AgentCronDispatchRecord = {
+			id: randomUUID(),
+			jobId: job.id,
+			claimedAt: claimedAt.toISOString(),
+			scheduledFor,
+		};
+		state.dispatches.push(dispatch);
+		dispatches.push({ id: dispatch.id, job: advanced });
+		return advanced;
+	});
+	return dispatches;
+}
+
+function recoverInterruptedInState(state: CronJobsState, now: Date, recovered: AgentCronJob[]): void {
+	if (state.dispatches.length === 0) {
+		return;
+	}
+	const interruptedIds = new Set(state.dispatches.map((dispatch) => dispatch.jobId));
+	state.dispatches = [];
+	state.jobs = state.jobs.map((job) => {
+		if (!interruptedIds.has(job.id) || job.status !== "active") {
+			return job;
+		}
+		const next = {
+			...job,
+			status: job.schedule.kind === "once" ? ("completed" as const) : job.status,
+			lastError: "Interrupted before scheduled operation completion",
+			updatedAt: now.toISOString(),
+		};
+		recovered.push(next);
+		return next;
+	});
+}
+
 function mergeFreshJobs(currentJobs: readonly AgentCronJob[], nextJobs: readonly AgentCronJob[]): AgentCronJob[] {
 	const merged = new Map<string, AgentCronJob>();
 	for (const job of currentJobs) {
@@ -1222,5 +1615,18 @@ function isAgentCronJob(value: unknown): value is AgentCronJob {
 		typeof candidate.createdAt === "string" &&
 		typeof candidate.updatedAt === "string" &&
 		typeof candidate.runCount === "number"
+	);
+}
+
+function isAgentCronDispatchRecord(value: unknown): value is AgentCronDispatchRecord {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as Partial<AgentCronDispatchRecord>;
+	return (
+		typeof candidate.id === "string" &&
+		typeof candidate.jobId === "string" &&
+		typeof candidate.claimedAt === "string" &&
+		typeof candidate.scheduledFor === "string"
 	);
 }

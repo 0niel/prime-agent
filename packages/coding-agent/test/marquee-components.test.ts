@@ -455,8 +455,8 @@ describe("marquee TUI components", () => {
 		const summaryText = summaryLines.join("\n");
 		expect(summaryText).toContain("agents-sidebar");
 		expect(summaryText).toContain("37% context left");
-		expect(summaryText).toContain("Subagent 1");
-		expect(summaryText).toContain("inspect training logs");
+		expect(summaryText).toContain("S1");
+		expect(summaryText).toContain("inspect training l…");
 		const infoRow = summary.render(90)[0] ?? "";
 		expect(visibleWidth(infoRow)).toBe(90);
 
@@ -563,7 +563,7 @@ describe("marquee TUI components", () => {
 		expect(visibleWidth(infoRow)).toBe(32);
 		expect(stripAnsi(infoRow)).toContain("Pursuing goal");
 		// The subagent itself renders as a list row below the info line.
-		expect(stripAnsi(lines.join("\n"))).toContain("Subagent 1");
+		expect(stripAnsi(lines.join("\n"))).toContain("S1");
 	});
 
 	test("renders full child agent detail without internal scroll controls", () => {

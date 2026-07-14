@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -10,6 +10,7 @@ import {
 	createAgentSessionServices,
 } from "../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
+import { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../src/core/session-lease.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import type {
 	ExtensionFactory,
@@ -32,6 +33,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		while (cleanups.length > 0) {
 			await cleanups.pop()?.();
 		}
+		vi.unstubAllEnvs();
 	});
 
 	async function createRuntimeHost(extensionFactory: ExtensionFactory) {
@@ -181,6 +183,20 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		);
 		runtimeHost.setBeforeSessionInvalidate(undefined);
 		runtimeHost.setRebindSession(undefined);
+	});
+
+	it("releases a replacement lease when current-session teardown fails", async () => {
+		vi.stubEnv(SESSION_LEASES_ENABLED_ENV, "1");
+		vi.stubEnv(SESSION_LEASE_OWNER_ID_ENV, "runtime-events");
+		const { runtimeHost } = await createRuntimeHost(() => undefined);
+		runtimeHost.setBeforeSessionInvalidate(() => {
+			throw new Error("teardown failed");
+		});
+
+		await expect(runtimeHost.newSession()).rejects.toThrow("teardown failed");
+		runtimeHost.setBeforeSessionInvalidate(undefined);
+		const leaseRoot = join(runtimeHost.services.agentDir, "session-leases");
+		expect(readdirSync(leaseRoot).filter((entry) => entry.endsWith(".lock"))).toHaveLength(1);
 	});
 
 	it("emits session_before_fork and session_start and honors cancellation", async () => {

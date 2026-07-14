@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed fullscreen TUI handoffs temporarily releasing raw input and leaking keyboard-protocol timers, which caused flicker and echoed arrow escape sequences while opening sessions.
+
 ## [0.2.9] - 2026-07-13
 
 - Fixed fullscreen dock selection so prompt text can be copied ([#342](https://github.com/PrimeIntellect-ai/prime-agent/pull/342)).

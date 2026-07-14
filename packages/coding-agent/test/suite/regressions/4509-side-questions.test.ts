@@ -178,6 +178,7 @@ describe("ENG-4509 side questions", () => {
 		const abortSideQuestionsFor = vi.fn();
 		const fakeThis = Object.assign(Object.create(AgentDaemon.prototype), {
 			abortSideQuestionsFor,
+			options: { worker: false },
 			summarizer: { forget: vi.fn(), seed: vi.fn() },
 			rebindCronJobsToState: vi.fn(),
 		});

@@ -113,6 +113,8 @@ export interface AgentsViewModeOptions {
 	initialImages?: ImageContent[];
 	initialMessages?: string[];
 	verbose?: boolean;
+	recoverDaemon?: () => Promise<void>;
+	reconnectTimeoutMs?: number;
 }
 
 type AgentsViewRunResult =
@@ -254,6 +256,8 @@ async function openAgentsViewSession(
 		try {
 			const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
 				closeClientOnDispose: true,
+				recoverDaemon: options.recoverDaemon,
+				reconnectTimeoutMs: options.reconnectTimeoutMs,
 			});
 			return { connection, summary };
 		} catch (error) {
@@ -281,6 +285,8 @@ async function openAgentsViewSession(
 		const activeSessionId = getRequiredActiveSessionId(createdSummary);
 		const connection = await DaemonAgentConnection.attach(client, activeSessionId, {
 			closeClientOnDispose: true,
+			recoverDaemon: options.recoverDaemon,
+			reconnectTimeoutMs: options.reconnectTimeoutMs,
 		});
 		return { connection, summary: createdSummary, cwdFallbackNotice: notice };
 	} catch (error) {
@@ -788,7 +794,7 @@ class AgentsViewMode implements Component, Focusable {
 
 	/** Sticky messages (e.g. billing warnings) stay until the user acknowledges them with any keypress. */
 	private clearStickyStatusMessage(): void {
-		if (!this.statusMessageSticky || this.daemonShutdownReceived) {
+		if (!this.statusMessageSticky || this.daemonShutdownReceived || this.reconnectPromise) {
 			return;
 		}
 		this.statusMessageSticky = false;
@@ -1890,7 +1896,7 @@ class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		if (!this.reconnectTimedOut) {
-			this.setStatusMessage("Daemon restarted; reconnecting...", { sticky: true });
+			this.setStatusMessage("Daemon connection lost; reconnecting…", { tone: "warning", sticky: true });
 		}
 		const reconnectPromise = this.reconnectClient(client, error).finally(() => {
 			if (this.reconnectPromise === reconnectPromise) {
@@ -1901,17 +1907,18 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	private async reconnectClient(client: DaemonClient, initialError: unknown): Promise<void> {
-		const deadline = Date.now() + RECONNECT_TIMEOUT_MS;
+		const deadline = Date.now() + (this.options.reconnectTimeoutMs ?? RECONNECT_TIMEOUT_MS);
 		let lastError = initialError;
 		while (!this.stopped && !this.daemonShutdownReceived && client === this.client && Date.now() < deadline) {
 			try {
+				await this.options.recoverDaemon?.();
 				await client.reconnect(1000);
 				const response = await client.request(createAgentsViewListCommand());
 				const data = requireDaemonData(response);
 				const sessions = expectSessionList(data);
 				this.daemonShutdownReceived = false;
 				this.reconnectTimedOut = false;
-				this.setStatusMessage("Reconnected after daemon restart", { render: false });
+				this.setStatusMessage("Daemon reconnected", { render: false });
 				this.applySessionList(sessions);
 				await this.sendInitialPrompts();
 				return;
