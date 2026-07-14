@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Changed IPython kernels to set `NO_COLOR=1`, preventing ANSI color escapes from inflating `%%bash` output.
+
 ## [0.3.0] - 2026-07-13
 
 - Changed daemon and headless execution to isolate each root session tree in a recoverable worker process, with protocol-v2 chunked snapshots, compact streaming, attachment-local backpressure, session leases, and unchanged print, JSON, and RPC interfaces.

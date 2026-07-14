@@ -11,6 +11,10 @@ describe("IPython RLM bootstrap", () => {
 		expect(buildRlmBootstrapCode()).toMatch(/^import asyncio$/m);
 	});
 
+	it("disables colored output for subprocesses launched by the kernel", () => {
+		expect(buildRlmBootstrapCode()).toContain('_prime_agent_os.environ["NO_COLOR"] = "1"');
+	});
+
 	it("guards Python skill imports so a broken skill does not abort bootstrap", () => {
 		const code = buildRlmBootstrapCode([
 			{
@@ -62,6 +66,10 @@ describeIfKernel("IPython RLM bootstrap (real kernel)", () => {
 			const result = await manager.execute("_t = asyncio.create_task(asyncio.sleep(0))\nprint(type(_t).__name__)");
 			expect(result.status).toBe("ok");
 			expect(result.stdout).toContain("Task");
+
+			const bashResult = await manager.execute('%%bash\nprintf %s "$NO_COLOR"');
+			expect(bashResult.status).toBe("ok");
+			expect(bashResult.stdout).toBe("1");
 		} finally {
 			await manager.dispose();
 		}
