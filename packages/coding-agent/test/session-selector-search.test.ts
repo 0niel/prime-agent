@@ -55,16 +55,16 @@ describe("session selector search", () => {
 		expect(result.map((s) => s.id)).toEqual(["a"]);
 	});
 
-	it("recent sort preserves input order", () => {
+	it("recent sort orders matches by modified date descending", () => {
 		const sessions: AgentConnectionSavedSessionInfo[] = [
-			makeSession({
-				id: "newer",
-				modified: new Date("2026-01-03T00:00:00.000Z"),
-				allMessagesText: "brave",
-			}),
 			makeSession({
 				id: "older",
 				modified: new Date("2026-01-01T00:00:00.000Z"),
+				allMessagesText: "brave",
+			}),
+			makeSession({
+				id: "newer",
+				modified: new Date("2026-01-03T00:00:00.000Z"),
 				allMessagesText: "brave",
 			}),
 			makeSession({
@@ -76,6 +76,25 @@ describe("session selector search", () => {
 
 		const result = filterAndSortSessions(sessions, '"brave"', "recent");
 		expect(result.map((s) => s.id)).toEqual(["newer", "older"]);
+	});
+
+	it("searches session names", () => {
+		const sessions: AgentConnectionSavedSessionInfo[] = [
+			makeSession({
+				id: "named",
+				name: "Release Planning",
+				modified: new Date("2026-01-01T00:00:00.000Z"),
+				allMessagesText: "unrelated messages",
+			}),
+			makeSession({
+				id: "other",
+				modified: new Date("2026-01-02T00:00:00.000Z"),
+				allMessagesText: "another topic",
+			}),
+		];
+
+		const result = filterAndSortSessions(sessions, '"release planning"', "recent");
+		expect(result.map((session) => session.id)).toEqual(["named"]);
 	});
 
 	it("relevance sort orders by score and tie-breaks by modified desc", () => {
@@ -153,7 +172,7 @@ describe("session selector search", () => {
 
 		it("returns all sessions when nameFilter is 'all'", () => {
 			const result = filterAndSortSessions(sessions, "", "recent", "all");
-			expect(result.map((session) => session.id)).toEqual(["named1", "named2", "other1", "other2"]);
+			expect(result.map((session) => session.id)).toEqual(["other1", "named1", "named2", "other2"]);
 		});
 
 		it("returns only named sessions when nameFilter is 'named'", () => {

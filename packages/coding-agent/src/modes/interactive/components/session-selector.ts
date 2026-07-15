@@ -68,6 +68,11 @@ function formatMutationError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+// truncateToWidth brackets its marker with a full SGR reset, which would clear a selected row's background.
+function truncateRowContent(text: string, width: number, ellipsis = "..."): string {
+	return truncateToWidth(text, width, ellipsis).replaceAll("\x1b[0m", "");
+}
+
 class SessionSelectorHeader implements Component {
 	private scope: SessionScope;
 	private sortMode: SortMode;
@@ -278,20 +283,20 @@ function flattenSessionTree(roots: SessionTreeNode[]): FlatSessionNode[] {
  * Custom session list component with multi-line items and search
  */
 class SessionList implements Component, Focusable {
-	public getSelectedSessionPath(): string | undefined {
-		const selected = this.filteredSessions[this.selectedIndex];
-		return selected?.session.path;
+	private getSelectedSessionPath(): string | undefined {
+		return this.filteredSessions[this.selectedIndex]?.session.path;
 	}
+
 	private allSessions: AgentConnectionSavedSessionInfo[] = [];
 	private filteredSessions: FlatSessionNode[] = [];
 	private selectedIndex: number = 0;
 	private searchInput: Input;
 	private showCwd = false;
-	private sortMode: SortMode = "threaded";
+	private sortMode: SortMode = "recent";
 	private nameFilter: NameFilter = "all";
 	private keybindings: KeybindingsManager;
 	private showPath = false;
-	private streaming = false;
+	private loading = false;
 	private confirmingDeletePath: string | null = null;
 	private deleteConfirmTimer: ReturnType<typeof setTimeout> | null = null;
 	private currentSessionCanonicalPath?: string;
@@ -351,6 +356,10 @@ class SessionList implements Component, Focusable {
 		this.maxVisible = Math.max(3, maxVisible);
 	}
 
+	setLoading(loading: boolean): void {
+		this.loading = loading;
+	}
+
 	setSortMode(sortMode: SortMode): void {
 		this.sortMode = sortMode;
 		this.filterSessions(this.searchInput.getValue());
@@ -361,11 +370,10 @@ class SessionList implements Component, Focusable {
 		this.filterSessions(this.searchInput.getValue());
 	}
 
-	setSessions(sessions: AgentConnectionSavedSessionInfo[], showCwd: boolean, streaming = false): void {
+	setSessions(sessions: AgentConnectionSavedSessionInfo[], showCwd: boolean): void {
 		const selectedPath = this.getSelectedSessionPath();
 		this.allSessions = sessions;
 		this.showCwd = showCwd;
-		this.streaming = streaming;
 		this.filterSessions(this.searchInput.getValue());
 		if (selectedPath) {
 			const selectedIndex = this.filteredSessions.findIndex((session) => session.session.path === selectedPath);
@@ -380,7 +388,7 @@ class SessionList implements Component, Focusable {
 		const nameFiltered =
 			this.nameFilter === "all" ? this.allSessions : this.allSessions.filter((session) => hasSessionName(session));
 
-		if (this.sortMode === "threaded" && !trimmed && !this.streaming) {
+		if (this.sortMode === "threaded" && !trimmed) {
 			// Threaded mode without search: show tree structure
 			const roots = buildSessionTree(nameFiltered);
 			this.filteredSessions = flattenSessionTree(roots);
@@ -452,6 +460,7 @@ class SessionList implements Component, Focusable {
 		// Render search input
 		lines.push(...this.searchInput.render(width));
 		lines.push(""); // Blank line after search
+		if (this.loading && this.filteredSessions.length === 0) return lines;
 
 		if (this.filteredSessions.length === 0) {
 			let emptyMessage: string;
@@ -520,7 +529,7 @@ class SessionList implements Component, Focusable {
 			const rightWidth = visibleWidth(rightPart) + 2; // +2 for spacing
 			const availableForMsg = width - 2 - prefixWidth - rightWidth - 2; // icon + gap
 
-			const truncatedMsg = truncateToWidth(normalizedMessage, Math.max(10, availableForMsg), "…");
+			const truncatedMsg = truncateRowContent(normalizedMessage, Math.max(10, availableForMsg), "…");
 
 			const styledMsg = isConfirmingDelete ? theme.fg("error", truncatedMsg) : truncatedMsg;
 
@@ -532,7 +541,7 @@ class SessionList implements Component, Focusable {
 
 			let line = leftPart + " ".repeat(spacing) + styledRight;
 			if (isSelected) {
-				const padded = truncateToWidth(line, width);
+				const padded = truncateRowContent(line, width);
 				line = theme.bg("selectedBg", padded + " ".repeat(Math.max(0, width - visibleWidth(padded))));
 			}
 			lines.push(truncateToWidth(line, width));
@@ -693,7 +702,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 	private header: SessionSelectorHeader;
 	private keybindings: KeybindingsManager;
 	private scope: SessionScope = "current";
-	private sortMode: SortMode = "threaded";
+	private sortMode: SortMode = "recent";
 	private nameFilter: NameFilter = "all";
 	private currentSessions: AgentConnectionSavedSessionInfo[] | null = null;
 	private allSessions: AgentConnectionSavedSessionInfo[] | null = null;
@@ -856,8 +865,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 				const sessions = this.scope === "all" ? (this.allSessions ?? []) : (this.currentSessions ?? []);
 				const showCwd = this.scope === "all";
-				const streaming = this.scope === "all" ? this.allLoading : this.currentLoading;
-				this.sessionList.setSessions(sessions, showCwd, streaming);
+				this.sessionList.setSessions(sessions, showCwd);
 
 				const msg = result.method === "trash" ? "Session moved to trash" : "Session deleted";
 				try {
@@ -973,33 +981,23 @@ export class SessionSelectorComponent extends Container implements Focusable {
 		const seq = scope === "current" ? ++this.currentLoadSeq : ++this.allLoadSeq;
 		this.header.setScope(scope);
 		this.header.setLoading(true);
+		this.sessionList.setLoading(true);
+		if (reason !== "refresh") {
+			this.sessionList.setSessions([], showCwd);
+		}
 		this.requestRender();
 		const isLatestLoad = () => seq === (scope === "current" ? this.currentLoadSeq : this.allLoadSeq);
 		const isCurrentView = () => scope === this.scope;
-		const streamedSessions = new Map<string, AgentConnectionSavedSessionInfo>();
-
 		const onProgress = (loaded: number, total: number) => {
 			if (!isLatestLoad() || !isCurrentView()) return;
 			this.header.setProgress(loaded, total);
 			this.requestRender();
 		};
-		const onSession = (session: AgentConnectionSavedSessionInfo) => {
-			if (reason === "refresh" || !isLatestLoad() || !isCurrentView()) return;
-			streamedSessions.set(session.path, session);
-			const sessions = [...streamedSessions.values()];
-			if (scope === "current") {
-				this.currentSessions = sessions;
-			} else {
-				this.allSessions = sessions;
-			}
-			this.sessionList.setSessions(sessions, showCwd, true);
-			this.requestRender();
-		};
 
 		try {
 			const sessions = await (scope === "current"
-				? this.currentSessionsLoader({ onProgress, onSession })
-				: this.allSessionsLoader({ onProgress, onSession }));
+				? this.currentSessionsLoader({ onProgress })
+				: this.allSessionsLoader({ onProgress }));
 
 			if (!isLatestLoad()) return;
 
@@ -1014,6 +1012,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 			if (!isCurrentView()) return;
 
 			this.header.setLoading(false);
+			this.sessionList.setLoading(false);
 			this.sessionList.setSessions(sessions, showCwd);
 			this.requestRender();
 
@@ -1033,6 +1032,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 			const message = err instanceof Error ? err.message : String(err);
 			this.header.setLoading(false);
+			this.sessionList.setLoading(false);
 			this.header.setStatusMessage({ type: "error", message: `Failed to load sessions: ${message}` }, 4000);
 
 			if (reason === "initial") {
@@ -1043,7 +1043,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 	}
 
 	private toggleSortMode(): void {
-		// Cycle: threaded -> recent -> relevance -> threaded
+		// Cycle: recent -> relevance -> threaded -> recent
 		this.sortMode = this.sortMode === "threaded" ? "recent" : this.sortMode === "recent" ? "relevance" : "threaded";
 		this.header.setSortMode(this.sortMode);
 		this.sessionList.setSortMode(this.sortMode);
@@ -1065,16 +1065,20 @@ export class SessionSelectorComponent extends Container implements Focusable {
 		if (this.scope === "current") {
 			this.scope = "all";
 			this.header.setScope(this.scope);
+			this.header.setLoading(this.allLoading);
+			this.sessionList.setLoading(this.allLoading);
 
 			if (this.allSessions !== null) {
-				this.header.setLoading(this.allLoading);
-				this.sessionList.setSessions(this.allSessions, true, this.allLoading);
+				this.sessionList.setSessions(this.allSessions, true);
 				this.requestRender();
 				return;
 			}
 
 			if (!this.allLoading) {
 				void this.loadScope("all", "toggle");
+			} else {
+				this.sessionList.setSessions([], true);
+				this.requestRender();
 			}
 			return;
 		}
@@ -1082,6 +1086,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 		this.scope = "current";
 		this.header.setScope(this.scope);
 		this.header.setLoading(this.currentLoading);
+		this.sessionList.setLoading(this.currentLoading);
 		this.sessionList.setSessions(this.currentSessions ?? [], false);
 		this.requestRender();
 	}
