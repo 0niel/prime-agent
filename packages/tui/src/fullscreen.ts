@@ -24,6 +24,8 @@ export interface ScrollInfo {
 	linesAbove: number;
 }
 
+export type SelectionScrollDirection = -1 | 1;
+
 // Transcript-anchored selection endpoint (line index + visible column), so
 // streaming appends and scrolling never shift what is selected.
 interface SelectionPoint {
@@ -153,6 +155,34 @@ export class FullscreenViewport {
 		this.selectionHead = { line, col: Math.max(0, screenCol) };
 	}
 
+	selectionAutoScrollDirection(screenRow: number): SelectionScrollDirection | null {
+		if (!this.selectionAnchor || !this.selectionHead || this.selectionMode !== "transcript") return null;
+		const bounds = this.transcriptScreenBounds();
+		if (!bounds) return null;
+		if (this.selectionHead.line < this.selectionAnchor.line && screenRow <= bounds.firstRow && this.scrollTop > 0) {
+			return -1;
+		}
+		if (
+			this.selectionHead.line > this.selectionAnchor.line &&
+			screenRow >= bounds.lastRow &&
+			this.scrollTop < this.lastMaxScroll
+		) {
+			return 1;
+		}
+		return null;
+	}
+
+	scrollSelection(direction: SelectionScrollDirection, screenCol: number): boolean {
+		if (!this.selectionAnchor || this.selectionMode !== "transcript") return false;
+		const previousScrollTop = this.scrollTop;
+		this.scrollBy(direction);
+		if (this.scrollTop === previousScrollTop) return false;
+		const bounds = this.transcriptScreenBounds();
+		if (!bounds) return false;
+		this.extendSelection(direction === -1 ? bounds.firstRow : bounds.lastRow, screenCol);
+		return true;
+	}
+
 	/** Finish the selection and return its plain text (null when empty). */
 	endSelection(): string | null {
 		if (this.selectionMode !== "transcript") {
@@ -271,20 +301,40 @@ export class FullscreenViewport {
 		return { line, col: Math.max(0, screenCol) };
 	}
 
-	private transcriptLineForScreenRow(screenRow: number, clamp: boolean): number | null {
+	private transcriptScreenBounds(): {
+		firstRow: number;
+		lastRow: number;
+		visibleStart: number;
+		visibleHeight: number;
+		transcriptStart: number;
+		transcriptEnd: number;
+	} | null {
 		if (this.lastWindowHeight <= 0) return null;
 		const visibleHeight = this.lastFrameVisibleHeight > 0 ? this.lastFrameVisibleHeight : this.lastWindowHeight;
 		if (visibleHeight <= 0) return null;
-		if (!clamp && (screenRow < 0 || screenRow >= visibleHeight)) return null;
-		const row = clamp ? Math.max(0, Math.min(screenRow, visibleHeight - 1)) : screenRow;
 		const visibleStart = this.lastFrameVisibleHeight > 0 ? this.lastFrameVisibleStart : 0;
 		const visibleEnd = visibleStart + visibleHeight - 1;
 		const transcriptStart = Math.max(0, visibleStart);
 		const transcriptEnd = Math.min(this.lastWindowHeight - 1, visibleEnd);
 		if (transcriptStart > transcriptEnd) return null;
-		const frameLine = visibleStart + row;
-		if (!clamp && (frameLine < transcriptStart || frameLine > transcriptEnd)) return null;
-		return this.scrollTop + Math.max(transcriptStart, Math.min(frameLine, transcriptEnd));
+		return {
+			firstRow: transcriptStart - visibleStart,
+			lastRow: transcriptEnd - visibleStart,
+			visibleStart,
+			visibleHeight,
+			transcriptStart,
+			transcriptEnd,
+		};
+	}
+
+	private transcriptLineForScreenRow(screenRow: number, clamp: boolean): number | null {
+		const bounds = this.transcriptScreenBounds();
+		if (!bounds) return null;
+		if (!clamp && (screenRow < 0 || screenRow >= bounds.visibleHeight)) return null;
+		const row = clamp ? Math.max(0, Math.min(screenRow, bounds.visibleHeight - 1)) : screenRow;
+		const frameLine = bounds.visibleStart + row;
+		if (!clamp && (frameLine < bounds.transcriptStart || frameLine > bounds.transcriptEnd)) return null;
+		return this.scrollTop + Math.max(bounds.transcriptStart, Math.min(frameLine, bounds.transcriptEnd));
 	}
 
 	private isFrameSelectable(point: SelectionPoint): boolean {

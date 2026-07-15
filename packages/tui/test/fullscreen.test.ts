@@ -89,6 +89,14 @@ function lines(count: number, prefix = "Line"): string[] {
 	return Array.from({ length: count }, (_, i) => `${prefix} ${i}`);
 }
 
+async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("Timed out waiting for condition");
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+}
+
 describe("TUI fullscreen mode", () => {
 	it("enters the alt screen and lays out transcript window above the dock", async () => {
 		const { terminal, tui, chat, dock } = setup(lines(20));
@@ -630,6 +638,78 @@ describe("TUI fullscreen mode", () => {
 		terminal.sendInput("\x1b[<0;6;2m");
 		await terminal.waitForRender();
 		assert.deepStrictEqual(copies, ["Line 12\nLine"]);
+
+		tui.stop();
+	});
+
+	it("auto-scrolls upward while selecting at the transcript edge", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(30));
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;8;4M");
+		terminal.sendInput("\x1b[<32;1;1M");
+		await waitFor(() => (tui.getScrollInfo()?.linesAbove ?? 22) < 22);
+		await terminal.waitForRender();
+
+		const scrollInfo = tui.getScrollInfo();
+		assert.ok(scrollInfo);
+		const { linesAbove } = scrollInfo;
+		terminal.sendInput("\x1b[<0;1;1m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, [lines(26).slice(linesAbove).join("\n")]);
+
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		assert.strictEqual(tui.getScrollInfo()?.linesAbove, linesAbove, "release stops auto-scrolling");
+
+		tui.stop();
+	});
+
+	it("auto-scrolls downward while selecting at the transcript edge", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(30));
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput(VIEWPORT_TOP);
+		await terminal.waitForRender();
+		terminal.sendInput("\x1b[<0;1;4M");
+		terminal.sendInput("\x1b[<32;8;8M");
+		await waitFor(() => (tui.getScrollInfo()?.linesAbove ?? 0) > 0);
+		await terminal.waitForRender();
+
+		const scrollInfo = tui.getScrollInfo();
+		assert.ok(scrollInfo);
+		const { linesAbove } = scrollInfo;
+		terminal.sendInput("\x1b[<0;8;8m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, [
+			lines(30)
+				.slice(3, linesAbove + 8)
+				.join("\n"),
+		]);
+
+		tui.stop();
+	});
+
+	it("does not auto-scroll a horizontal selection on the top row", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(30));
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;1;1M");
+		terminal.sendInput("\x1b[<32;8;1M");
+		await new Promise((resolve) => setTimeout(resolve, 250));
+		assert.strictEqual(tui.getScrollInfo()?.linesAbove, 22);
+
+		terminal.sendInput("\x1b[<0;8;1m");
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, ["Line 22"]);
 
 		tui.stop();
 	});
