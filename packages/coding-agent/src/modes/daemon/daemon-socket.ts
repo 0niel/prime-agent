@@ -11,6 +11,23 @@ const DAEMON_SOCKET_RELEASE_POLL_MS = 25;
 const DAEMON_SOCKET_LOCK_STALE_MS = 5000;
 const DAEMON_SOCKET_LOCK_UPDATE_MS = 1000;
 
+export class DaemonSocketPathLease {
+	private released = false;
+
+	constructor(
+		readonly socketPath: string,
+		private readonly releaseLock: () => Promise<void>,
+	) {}
+
+	async release(): Promise<void> {
+		if (this.released) {
+			return;
+		}
+		this.released = true;
+		await this.releaseLock();
+	}
+}
+
 export interface DaemonSocketIdentity {
 	dev: number;
 	ino: number;
@@ -23,17 +40,10 @@ export function defaultDaemonSocketPath(): string {
 	return join(defaultDaemonSocketDir(), "daemon.sock");
 }
 
-export async function prepareDaemonSocketPath(socketPath: string): Promise<void> {
+export async function acquireDaemonSocketPathLease(socketPath: string): Promise<DaemonSocketPathLease | undefined> {
 	ensureDefaultDaemonSocketDir(socketPath);
-
 	if (process.platform === "win32") {
-		return;
-	}
-	if (!existsSync(socketPath)) {
-		return;
-	}
-	if (await canConnectToUnixSocket(socketPath)) {
-		throw new Error(`Daemon socket already in use: ${socketPath}`);
+		return undefined;
 	}
 	const releaseLock = await lockfile.lock(socketPath, {
 		realpath: false,
@@ -46,10 +56,31 @@ export async function prepareDaemonSocketPath(socketPath: string): Promise<void>
 			maxTimeout: DAEMON_SOCKET_RELEASE_POLL_MS,
 		},
 	});
+	return new DaemonSocketPathLease(socketPath, releaseLock);
+}
+
+export async function prepareDaemonSocketPath(socketPath: string, lease?: DaemonSocketPathLease): Promise<void> {
+	ensureDefaultDaemonSocketDir(socketPath);
+
+	if (process.platform === "win32") {
+		return;
+	}
+	if (lease) {
+		assertSocketLease(socketPath, lease);
+		await prepareUnixDaemonSocketPath(socketPath);
+		return;
+	}
+	if (!existsSync(socketPath)) {
+		return;
+	}
+	if (await canConnectToUnixSocket(socketPath)) {
+		throw new Error(`Daemon socket already in use: ${socketPath}`);
+	}
+	const ownedLease = await acquireDaemonSocketPathLease(socketPath);
 	try {
 		await prepareUnixDaemonSocketPath(socketPath);
 	} finally {
-		await releaseLock();
+		await ownedLease?.release();
 	}
 }
 
@@ -116,8 +147,21 @@ export function getDaemonSocketIdentity(socketPath: string): DaemonSocketIdentit
 	return { dev: stat.dev, ino: stat.ino };
 }
 
-export function cleanupDaemonSocketPath(socketPath: string, expectedIdentity?: DaemonSocketIdentity): void {
+export function cleanupDaemonSocketPath(
+	socketPath: string,
+	expectedIdentity?: DaemonSocketIdentity,
+	lease?: DaemonSocketPathLease,
+): void {
 	if (process.platform === "win32") {
+		return;
+	}
+	if (lease) {
+		assertSocketLease(socketPath, lease);
+		try {
+			cleanupUnixDaemonSocketPath(socketPath, expectedIdentity);
+		} catch {
+			// Best effort cleanup; shutdown should not be blocked by socket unlink failures.
+		}
 		return;
 	}
 	let releaseLock: (() => void) | undefined;
@@ -132,20 +176,7 @@ export function cleanupDaemonSocketPath(socketPath: string, expectedIdentity?: D
 		return;
 	}
 	try {
-		if (!existsSync(socketPath)) {
-			return;
-		}
-		if (expectedIdentity) {
-			const currentIdentity = getDaemonSocketIdentity(socketPath);
-			if (
-				!currentIdentity ||
-				currentIdentity.dev !== expectedIdentity.dev ||
-				currentIdentity.ino !== expectedIdentity.ino
-			) {
-				return;
-			}
-		}
-		unlinkSync(socketPath);
+		cleanupUnixDaemonSocketPath(socketPath, expectedIdentity);
 	} catch {
 		// Best effort cleanup; shutdown should not be blocked by socket unlink failures.
 	} finally {
@@ -154,6 +185,29 @@ export function cleanupDaemonSocketPath(socketPath: string, expectedIdentity?: D
 		} catch {
 			// Best effort cleanup; a failed release is recoverable as a stale lock.
 		}
+	}
+}
+
+function cleanupUnixDaemonSocketPath(socketPath: string, expectedIdentity?: DaemonSocketIdentity): void {
+	if (!existsSync(socketPath)) {
+		return;
+	}
+	if (expectedIdentity) {
+		const currentIdentity = getDaemonSocketIdentity(socketPath);
+		if (
+			!currentIdentity ||
+			currentIdentity.dev !== expectedIdentity.dev ||
+			currentIdentity.ino !== expectedIdentity.ino
+		) {
+			return;
+		}
+	}
+	unlinkSync(socketPath);
+}
+
+function assertSocketLease(socketPath: string, lease: DaemonSocketPathLease): void {
+	if (lease.socketPath !== socketPath) {
+		throw new Error(`Daemon socket lease does not match ${socketPath}`);
 	}
 }
 

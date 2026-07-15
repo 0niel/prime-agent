@@ -534,6 +534,12 @@ export type DaemonOutbound =
 			supervisorGeneration?: string;
 			/** Diagnostic process identity for attributing supervisor replacement. */
 			supervisorPid?: number;
+			/** Durable owner marker for validating update handoff fences. */
+			supervisorOwnerToken?: string;
+			/** Process start identity captured when the durable owner was published. */
+			supervisorProcessStartId?: string;
+			/** Normalized socket identity stored in the durable owner record. */
+			supervisorSocketPath?: string;
 			clientId: DaemonClientId;
 			serverCapabilities: readonly DaemonClientCapability[];
 	  }

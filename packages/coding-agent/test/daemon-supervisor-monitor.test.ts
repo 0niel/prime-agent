@@ -34,6 +34,52 @@ describe("daemon worker supervisor monitoring", () => {
 		vi.useRealTimers();
 	});
 
+	it("attempts every shutdown cleanup step before exiting", async () => {
+		const cleanupSocket = vi.fn(() => {
+			throw new Error("daemon socket cleanup failed");
+		});
+		const leaseRelease = vi.fn(async () => {
+			throw new Error("lease cleanup failed");
+		});
+		const ownershipRelease = vi.fn(async () => undefined);
+		const log = vi.fn();
+		const exit = vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
+			throw new Error(`exit ${code}`);
+		}) as typeof process.exit);
+		type ShutdownHarness = {
+			socketLease?: { release(): Promise<void> };
+			ownership?: { release(): Promise<void> };
+			shutdown(exitCode: number, stopWorkers: boolean, relaunch?: boolean, forceWorkers?: boolean): Promise<never>;
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			shuttingDown: false,
+			signalCleanupHandlers: [],
+			workers: new Map(),
+			clients: new Set(),
+			catalog: { stop: vi.fn(async () => undefined) },
+			cleanupSocket,
+			snapshotCacheRoot: "\0",
+			socketLease: { release: leaseRelease },
+			ownership: { release: ownershipRelease },
+			log,
+		}) as ShutdownHarness;
+
+		try {
+			await expect(supervisor.shutdown(42, false)).rejects.toThrow("exit 42");
+			expect(cleanupSocket).toHaveBeenCalledOnce();
+			expect(leaseRelease).toHaveBeenCalledOnce();
+			expect(ownershipRelease).toHaveBeenCalledOnce();
+			expect(log).toHaveBeenCalledWith(expect.stringContaining("daemon socket"));
+			expect(log).toHaveBeenCalledWith(expect.stringContaining("supervisor cache"));
+			expect(log).toHaveBeenCalledWith(expect.stringContaining("daemon socket lock"));
+			expect(supervisor.socketLease).toBeUndefined();
+			expect(supervisor.ownership).toBeUndefined();
+			expect(exit).toHaveBeenCalledWith(42);
+		} finally {
+			exit.mockRestore();
+		}
+	});
+
 	it("does not poll a healthy supervisor after the startup check", async () => {
 		vi.useFakeTimers();
 		const daemon = createHarness(async () => true);

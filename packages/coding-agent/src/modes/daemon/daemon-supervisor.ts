@@ -55,12 +55,17 @@ import {
 import { matchesSessionIdSuffix } from "./daemon-session-id.js";
 import { type SessionSummary, summaryForInactiveSession } from "./daemon-session-list.js";
 import {
+	acquireDaemonSocketPathLease,
 	cleanupDaemonSocketPath,
+	type DaemonSocketIdentity,
+	type DaemonSocketPathLease,
 	defaultDaemonSocketDir,
 	defaultDaemonSocketPath,
+	getDaemonSocketIdentity,
 	prepareDaemonSocketPath,
 	restrictDaemonSocketPath,
 } from "./daemon-socket.js";
+import { acquireDaemonSupervisorOwnership, waitForDaemonStartupFence } from "./daemon-supervisor-ownership.js";
 import { DaemonWorkerClient } from "./daemon-worker-client.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
@@ -434,7 +439,12 @@ export class DaemonSupervisor {
 	private server?: Server;
 	private readonly ready: Promise<void>;
 	private markReady: () => void = () => {};
+	private rejectReady: (error: Error) => void = () => {};
 	private ownsSocketPath = false;
+	private socketIdentity?: DaemonSocketIdentity;
+	private socketLease?: DaemonSocketPathLease;
+	private ownership?: Awaited<ReturnType<typeof acquireDaemonSupervisorOwnership>>;
+	private cleanupPromise?: Promise<void>;
 	private shuttingDown = false;
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly workers = new Map<string, ResidentWorker>();
@@ -445,7 +455,7 @@ export class DaemonSupervisor {
 	private readonly supervisorConfigPath: string;
 	private readonly defaultSessionConfig: AgentSessionRuntimeConfig;
 	private readonly snapshotCacheRoot: string;
-	private readonly commandJournal: CommandRecoveryJournal;
+	private commandJournal!: CommandRecoveryJournal;
 	private readonly streamReconstructor = new CompactAssistantStreamReconstructor();
 	private readonly compactCatchupInProgress = new Set<string>();
 	private readonly pendingReplacementSnapshots = new WeakMap<
@@ -459,9 +469,11 @@ export class DaemonSupervisor {
 		private readonly socketPath: string,
 		options: DaemonSupervisorOptions,
 	) {
-		this.ready = new Promise<void>((resolveReady) => {
+		this.ready = new Promise<void>((resolveReady, rejectReady) => {
 			this.markReady = resolveReady;
+			this.rejectReady = rejectReady;
 		});
+		void this.ready.catch(() => undefined);
 		const agentDir = options.defaultSessionConfig.agentDir;
 		if (!agentDir) {
 			throw new Error("Daemon supervisor config is missing agentDir");
@@ -469,66 +481,102 @@ export class DaemonSupervisor {
 		this.descriptorDir = options.descriptorDir ?? defaultWorkerDescriptorDir(agentDir, socketPath);
 		this.supervisorConfigPath = join(this.descriptorDir, SUPERVISOR_CONFIG_FILE_NAME);
 		this.defaultSessionConfig = this.loadPersistedSupervisorConfig() ?? options.defaultSessionConfig;
-		this.snapshotCacheRoot = join(this.descriptorDir, "snapshot-cache");
-		this.commandJournal = new CommandRecoveryJournal(join(this.descriptorDir, "command-journal.jsonl"));
+		this.snapshotCacheRoot = join(this.descriptorDir, "snapshot-cache", this.generation);
 		this.catalog = new DaemonCatalogClient((message) => this.log(message));
 	}
 
 	async start(): Promise<void> {
-		await prepareDaemonSocketPath(this.socketPath);
-		mkdirSync(this.descriptorDir, { recursive: true, mode: 0o700 });
-		chmodSync(this.descriptorDir, 0o700);
-		this.persistSupervisorConfig();
-		rmSync(this.snapshotCacheRoot, { recursive: true, force: true });
-		mkdirSync(this.snapshotCacheRoot, { recursive: true, mode: 0o700 });
-		this.loadWorkerDescriptors();
-		const workersToAdopt = [...this.workers.values()];
+		try {
+			const agentDir = this.defaultSessionConfig.agentDir;
+			if (!agentDir) {
+				throw new Error("Daemon supervisor config is missing agentDir");
+			}
+			this.socketLease = await acquireDaemonSocketPathLease(this.socketPath);
+			await waitForDaemonStartupFence(this.socketPath);
+			this.ownership = await acquireDaemonSupervisorOwnership({
+				socketPath: this.socketPath,
+				descriptorDir: this.descriptorDir,
+				agentDir,
+				generation: this.generation,
+				appVersion: VERSION,
+			});
+			await prepareDaemonSocketPath(this.socketPath, this.socketLease);
 
-		this.server = createServer((socket) => this.handleConnection(socket));
-		await new Promise<void>((resolveListen, rejectListen) => {
+			mkdirSync(this.descriptorDir, { recursive: true, mode: 0o700 });
+			chmodSync(this.descriptorDir, 0o700);
+			this.persistSupervisorConfig();
+			rmSync(this.snapshotCacheRoot, { recursive: true, force: true });
+			mkdirSync(this.snapshotCacheRoot, { recursive: true, mode: 0o700 });
+			this.commandJournal = new CommandRecoveryJournal(join(this.descriptorDir, "command-journal.jsonl"));
+			this.loadWorkerDescriptors();
+			const workersToAdopt = [...this.workers.values()];
+
+			this.server = createServer((socket) => this.handleConnection(socket));
+			await this.listen();
+			this.socketIdentity = getDaemonSocketIdentity(this.socketPath);
+			if (process.platform !== "win32" && !this.socketIdentity) {
+				throw new Error(`Could not capture daemon socket identity: ${this.socketPath}`);
+			}
+			this.ownsSocketPath = true;
+			restrictDaemonSocketPath(this.socketPath);
+
+			this.registerSignalHandlers();
+			const ownedSessionFiles = new Set(
+				[...this.workers.values()]
+					.flatMap((worker) => [worker.descriptor.sessionFile, worker.descriptor.createCommand.sessionPath])
+					.filter((path): path is string => typeof path === "string")
+					.map((path) => resolve(path)),
+			);
+			const migratedJobs = migrateLegacyCronJobsToSessionArtifacts(getCronJobsPath(agentDir), {
+				isSessionOwned: (job) => ownedSessionFiles.has(resolve(job.sessionFile)),
+			});
+			if (migratedJobs > 0) {
+				this.log(`Migrated ${migratedJobs} scheduled jobs into session artifacts`);
+			}
+			await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
+			let adoptionFailure: unknown;
+			let adoptionFailed = false;
+			await Promise.all(
+				workersToAdopt.map(async (worker) => {
+					try {
+						await this.adoptOrRecoverWorker(worker);
+					} catch (error) {
+						if (!adoptionFailed) {
+							adoptionFailed = true;
+							adoptionFailure = error;
+						}
+					}
+				}),
+			);
+			if (adoptionFailed) {
+				throw adoptionFailure;
+			}
+			await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
+			await this.ownership.updatePhase("owner");
+			this.log(`Prime Agent daemon supervisor ${this.generation} listening on ${this.socketPath}`);
+			this.markReady();
+		} catch (error) {
+			const startupError = error instanceof Error ? error : new Error(String(error));
+			await this.cleanupSupervisorResources();
+			this.rejectReady(startupError);
+			throw startupError;
+		}
+	}
+
+	private listen(): Promise<void> {
+		return new Promise<void>((resolveListen, rejectListen) => {
 			const onError = (error: Error) => {
 				this.server?.off("listening", onListening);
 				rejectListen(error);
 			};
 			const onListening = () => {
 				this.server?.off("error", onError);
-				try {
-					this.ownsSocketPath = true;
-					if (process.platform !== "win32") {
-						restrictDaemonSocketPath(this.socketPath);
-					}
-					resolveListen();
-				} catch (error) {
-					rejectListen(error);
-				}
+				resolveListen();
 			};
 			this.server?.once("error", onError);
 			this.server?.once("listening", onListening);
 			this.server?.listen(this.socketPath);
 		});
-
-		this.registerSignalHandlers();
-		const agentDir = this.defaultSessionConfig.agentDir;
-		if (!agentDir) {
-			throw new Error("Daemon supervisor config is missing agentDir");
-		}
-		const ownedSessionFiles = new Set(
-			[...this.workers.values()]
-				.flatMap((worker) => [worker.descriptor.sessionFile, worker.descriptor.createCommand.sessionPath])
-				.filter((path): path is string => typeof path === "string")
-				.map((path) => resolve(path)),
-		);
-		const migratedJobs = migrateLegacyCronJobsToSessionArtifacts(getCronJobsPath(agentDir), {
-			isSessionOwned: (job) => ownedSessionFiles.has(resolve(job.sessionFile)),
-		});
-		if (migratedJobs > 0) {
-			this.log(`Migrated ${migratedJobs} scheduled jobs into session artifacts`);
-		}
-		await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
-		await Promise.all(workersToAdopt.map((worker) => this.adoptOrRecoverWorker(worker)));
-		await this.syncAgentPeers().catch((error) => this.log(`Could not synchronize agent peers: ${String(error)}`));
-		this.markReady();
-		this.log(`Prime Agent daemon supervisor ${this.generation} listening on ${this.socketPath}`);
 	}
 
 	private log(message: string): void {
@@ -642,26 +690,32 @@ export class DaemonSupervisor {
 			capabilities: new Set(DAEMON_DEFAULT_CLIENT_CAPABILITIES),
 		};
 		this.clients.add(client);
-		void this.ready.then(() => {
-			if (!client.socket.destroyed && this.clients.has(client)) {
-				this.write(client, {
-					type: "daemon_hello",
-					socketPath: this.socketPath,
-					protocol: DAEMON_PROTOCOL_INFO,
-					appVersion: VERSION,
-					supervisorGeneration: this.generation,
-					supervisorPid: process.pid,
-					clientId: client.id,
-					serverCapabilities: [
-						"attach_snapshot",
-						"event_sequence",
-						"extension_ui",
-						"slim_attach",
-						"chunked_snapshot",
-					],
-				});
-			}
-		});
+		void this.ready.then(
+			() => {
+				if (!client.socket.destroyed && this.clients.has(client)) {
+					this.write(client, {
+						type: "daemon_hello",
+						socketPath: this.socketPath,
+						protocol: DAEMON_PROTOCOL_INFO,
+						appVersion: VERSION,
+						supervisorGeneration: this.generation,
+						supervisorOwnerToken: this.ownership?.record.token,
+						supervisorPid: process.pid,
+						supervisorProcessStartId: this.ownership?.record.processStartId,
+						supervisorSocketPath: this.ownership?.record.socketPath,
+						clientId: client.id,
+						serverCapabilities: [
+							"attach_snapshot",
+							"event_sequence",
+							"extension_ui",
+							"slim_attach",
+							"chunked_snapshot",
+						],
+					});
+				}
+			},
+			() => client.socket.destroy(),
+		);
 
 		client.detachInput = attachJsonlLineReader(socket, (line) => void this.handleLine(client, line));
 		let cleaned = false;
@@ -690,7 +744,11 @@ export class DaemonSupervisor {
 	}
 
 	private async handleLine(client: DaemonSocketClient, line: string): Promise<void> {
-		await this.ready;
+		try {
+			await this.ready;
+		} catch {
+			return;
+		}
 		let command: DaemonCommand;
 		let envelopeClientId: string | undefined;
 		try {
@@ -2804,7 +2862,88 @@ export class DaemonSupervisor {
 			return;
 		}
 		this.ownsSocketPath = false;
-		cleanupDaemonSocketPath(this.socketPath);
+		const identity = this.socketIdentity;
+		this.socketIdentity = undefined;
+		cleanupDaemonSocketPath(this.socketPath, identity, this.socketLease);
+	}
+
+	private async cleanupSupervisorResources(): Promise<void> {
+		if (this.cleanupPromise) {
+			return this.cleanupPromise;
+		}
+		this.cleanupPromise = this.cleanupSupervisorResourcesOnce();
+		return this.cleanupPromise;
+	}
+
+	private async cleanupSupervisorResourcesOnce(): Promise<void> {
+		this.shuttingDown = true;
+		for (const cleanup of this.signalCleanupHandlers.splice(0)) {
+			await this.runCleanupStep("signal handler", cleanup);
+		}
+		const server = this.server;
+		this.server = undefined;
+		const serverClosed = new Promise<void>((resolveClose) => {
+			if (!server?.listening) {
+				resolveClose();
+				return;
+			}
+			try {
+				server.close(() => resolveClose());
+			} catch (error) {
+				this.reportCleanupFailure("daemon server", error);
+				resolveClose();
+			}
+		});
+		for (const client of this.clients) {
+			client.attachedActiveSessionIds.clear();
+			await this.runCleanupStep(`daemon client input ${client.id}`, () => client.detachInput());
+			await this.runCleanupStep(`daemon client socket ${client.id}`, () => {
+				client.socket.destroy();
+			});
+		}
+		this.clients.clear();
+		for (const worker of this.workers.values()) {
+			await this.runCleanupStep(`worker client ${worker.descriptor.workerId}`, () => worker.client?.close());
+			worker.client = undefined;
+			for (const transcript of worker.transcriptCaches.values()) {
+				await this.runCleanupStep(`worker transcript ${worker.descriptor.workerId}`, () => transcript.dispose());
+			}
+			worker.transcriptCaches.clear();
+			worker.incomingTranscriptActiveSessionIds.clear();
+			worker.snapshotCache.clear();
+			worker.snapshotLoads.clear();
+		}
+		this.workers.clear();
+		this.openingWorkers.clear();
+		await this.runCleanupStep("daemon catalog", () => this.catalog.stop());
+		await this.runCleanupStep("daemon server", () => serverClosed);
+		await this.runCleanupStep("daemon socket", () => this.cleanupSocket());
+		await this.runCleanupStep("supervisor cache", () => {
+			rmSync(this.snapshotCacheRoot, { recursive: true, force: true });
+		});
+		const lease = this.socketLease;
+		this.socketLease = undefined;
+		await this.runCleanupStep("daemon socket lock", async () => lease?.release());
+		const ownership = this.ownership;
+		this.ownership = undefined;
+		await this.runCleanupStep("daemon ownership", async () => ownership?.release());
+	}
+
+	private async runCleanupStep(label: string, action: () => void | Promise<void>): Promise<void> {
+		try {
+			await action();
+		} catch (error) {
+			this.reportCleanupFailure(label, error);
+		}
+	}
+
+	private reportCleanupFailure(label: string, error: unknown): void {
+		const message = `Failed to clean up ${label}: ${String(error)}`;
+		try {
+			this.log(message);
+		} catch {
+			console.error(message);
+		}
 	}
 
 	private async shutdown(
@@ -2841,7 +2980,16 @@ export class DaemonSupervisor {
 			client.socket.end();
 		}
 		await new Promise<void>((resolveClose) => this.server?.close(() => resolveClose()) ?? resolveClose());
-		this.cleanupSocket();
+		await this.runCleanupStep("daemon socket", () => this.cleanupSocket());
+		await this.runCleanupStep("supervisor cache", () => {
+			rmSync(this.snapshotCacheRoot, { recursive: true, force: true });
+		});
+		const lease = this.socketLease;
+		this.socketLease = undefined;
+		await this.runCleanupStep("daemon socket lock", async () => lease?.release());
+		const ownership = this.ownership;
+		this.ownership = undefined;
+		await this.runCleanupStep("daemon ownership", async () => ownership?.release());
 		if (relaunch) {
 			const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", this.socketPath]);
 			const environment = { ...process.env };
