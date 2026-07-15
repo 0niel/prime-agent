@@ -2442,10 +2442,11 @@ describe("daemon mode helpers", () => {
 				messages: [],
 			});
 
-			expect(write).toHaveBeenCalledTimes(1);
+			expect(write).toHaveBeenCalledTimes(2);
 			const replacementFrame = String(write.mock.calls[0]?.[0]);
 			expect(replacementFrame).toContain('"type":"session_replaced"');
-			expect(replacementFrame).not.toContain('"snapshotFollows":true');
+			expect(replacementFrame).toContain('"snapshotFollows":true');
+			expect(String(write.mock.calls[1]?.[0])).toContain('"type":"session_snapshot_begin"');
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

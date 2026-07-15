@@ -19,6 +19,58 @@ export interface SnapshotTranscriptCacheOptions {
 	memoryCacheBytes?: number;
 }
 
+export type SnapshotTranscriptChunkSource = (Iterable<Buffer> | AsyncIterable<Buffer>) & {
+	markFailed?(error: Error): void;
+	dispose?(): void;
+};
+
+export function createSnapshotTranscriptChunks(options: {
+	activeSessionId: string;
+	snapshotId: string;
+	messages: readonly AgentMessage[];
+	targetChunkBytes?: number;
+	signal?: AbortSignal;
+}): Iterable<Buffer> {
+	const messages = [...options.messages];
+	const targetChunkBytes = options.targetChunkBytes ?? SNAPSHOT_TARGET_CHUNK_BYTES;
+	return {
+		*[Symbol.iterator](): Iterator<Buffer> {
+			options.signal?.throwIfAborted();
+			let serializedMessages: string[] = [];
+			let serializedBytes = 0;
+			let index = 0;
+			const flush = (): Buffer | undefined => {
+				if (serializedMessages.length === 0) {
+					return undefined;
+				}
+				const prefix =
+					`{"type":"session_snapshot_chunk","activeSessionId":${JSON.stringify(options.activeSessionId)},` +
+					`"snapshotId":${JSON.stringify(options.snapshotId)},"index":${index},"messages":[`;
+				const line = Buffer.from(`${prefix}${serializedMessages.join(",")}]}\n`);
+				serializedMessages = [];
+				serializedBytes = 0;
+				index++;
+				return line;
+			};
+
+			for (const message of messages) {
+				options.signal?.throwIfAborted();
+				const serialized = JSON.stringify(message);
+				const bytes = Buffer.byteLength(serialized) + (serializedMessages.length > 0 ? 1 : 0);
+				if (serializedMessages.length > 0 && serializedBytes + bytes > targetChunkBytes) {
+					const chunk = flush();
+					if (chunk) yield chunk;
+				}
+				serializedMessages.push(serialized);
+				serializedBytes += bytes;
+			}
+			options.signal?.throwIfAborted();
+			const chunk = flush();
+			if (chunk) yield chunk;
+		},
+	};
+}
+
 export class SnapshotTranscriptCache {
 	private readonly chunks: SnapshotTranscriptChunk[] = [];
 	private cacheDirectory?: string;
@@ -74,6 +126,12 @@ export class SnapshotTranscriptCache {
 			throw new Error(`Snapshot transcript chunk ${index} has no backing storage`);
 		}
 		return readFileSync(chunk.path);
+	}
+
+	*[Symbol.iterator](): Iterator<Buffer> {
+		for (let index = 0; index < this.chunkCount; index++) {
+			yield this.readChunk(index);
+		}
 	}
 
 	appendEncodedChunk(buffer: Buffer): void {

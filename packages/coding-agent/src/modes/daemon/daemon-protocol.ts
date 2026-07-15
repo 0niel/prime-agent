@@ -594,6 +594,12 @@ export type DaemonOutbound =
 			lastEventSequence: DaemonEventSequence;
 			lastEventCursor?: DaemonEventCursor;
 	  }
+	| {
+			type: "session_snapshot_failed";
+			activeSessionId: string;
+			snapshotId: string;
+			error: string;
+	  }
 	| { type: "session_detached"; activeSessionId: string }
 	| { type: "session_closed"; activeSessionId: string; reason: DaemonSessionClosedReason; meta?: DaemonEventMeta }
 	| {

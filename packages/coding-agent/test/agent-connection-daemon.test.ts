@@ -42,6 +42,7 @@ class FakeDaemonClient {
 	reconnectError: Error | undefined;
 	attachFailures = 0;
 	connectionStateGate: Promise<void> | undefined;
+	connectionStateFactory: ((activeSessionId: string) => AgentConnectionState) | undefined;
 	abortBashUnknownCommand = false;
 	abortAndClearQueueUnknownCommand = false;
 	updateRestartSessions: Array<Record<string, unknown>> = [];
@@ -101,7 +102,9 @@ class FakeDaemonClient {
 					type: "response",
 					command: command.type,
 					success: true,
-					data: createConnectionState(command.activeSessionId, "session-current"),
+					data:
+						this.connectionStateFactory?.(command.activeSessionId) ??
+						createConnectionState(command.activeSessionId, "session-current"),
 				};
 			case "get_messages":
 				return {
@@ -1271,6 +1274,54 @@ describe("DaemonAgentConnection", () => {
 		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(0);
 	});
 
+	it("rejects one failed snapshot without interrupting another session on the shared client", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const sibling = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-2");
+		await sibling.attach();
+		const siblingEvents: AgentConnectionEvent[] = [];
+		sibling.subscribe((event) => {
+			siblingEvents.push(event);
+		});
+		fakeClient.attachResultFactory = (command) => {
+			const result = createAttachResult(command.activeSessionId, command.clientId, command.capabilities, 12);
+			if (command.activeSessionId !== "active-1") {
+				return result;
+			}
+			const { messages: _messages, ...snapshot } = result.snapshot;
+			queueMicrotask(() => {
+				fakeClient.emitMessage({
+					type: "session_snapshot_begin",
+					activeSessionId: command.activeSessionId,
+					snapshotId: "snapshot-failed",
+					snapshot,
+					messageCount: 0,
+					targetChunkBytes: 512 * 1024,
+				});
+				fakeClient.emitMessage({
+					type: "session_snapshot_failed",
+					activeSessionId: command.activeSessionId,
+					snapshotId: "snapshot-failed",
+					error: "snapshot encoder failed",
+				});
+			});
+			return {
+				...result,
+				snapshot: { ...result.snapshot, messages: [] },
+				snapshotStream: { id: "snapshot-failed", messageCount: 0, targetChunkBytes: 512 * 1024 },
+			};
+		};
+		const failed = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await expect(failed.attach()).rejects.toThrow("snapshot encoder failed");
+		emitSequencedQueueUpdate(fakeClient, "active-2", 13);
+		await vi.waitFor(() => expect(siblingEvents).toHaveLength(1));
+
+		expect(siblingEvents[0]).toMatchObject({ type: "session_event", event: { type: "queue_update" } });
+		expect(fakeClient.closeCount).toBe(0);
+		await failed.dispose();
+		await sibling.dispose();
+	});
+
 	it("assembles chunked attach snapshots even when chunks arrive before the attach response continuation", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const messages: AgentMessage[] = [
@@ -1405,6 +1456,99 @@ describe("DaemonAgentConnection", () => {
 		]);
 		expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(0);
 	});
+
+	it.each(["replacement", "resync"] as const)(
+		"recovers a failed chunked %s snapshot without interrupting a sibling session",
+		async (purpose) => {
+			const fakeClient = new FakeDaemonClient();
+			const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+			const sibling = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-2");
+			await Promise.all([connection.attach(), sibling.attach()]);
+			const events: AgentConnectionEvent[] = [];
+			const siblingEvents: AgentConnectionEvent[] = [];
+			connection.subscribe((event) => {
+				events.push(event);
+			});
+			sibling.subscribe((event) => {
+				siblingEvents.push(event);
+			});
+			const recoveredSessionId = purpose === "replacement" ? "session-next" : "session-current";
+			fakeClient.connectionStateFactory = (activeSessionId) =>
+				createConnectionState(
+					activeSessionId,
+					activeSessionId === "active-1" ? recoveredSessionId : "session-sibling",
+				);
+			fakeClient.requests.length = 0;
+			const snapshotId = `snapshot-failed-${purpose}`;
+			const full = createAttachResult("active-1", "client-1", undefined, 13, {
+				state: createConnectionState("active-1", recoveredSessionId),
+			});
+			const { messages: _messages, ...snapshot } = full.snapshot;
+			if (purpose === "replacement") {
+				fakeClient.emitMessage({
+					type: "session_replaced",
+					activeSessionId: "active-1",
+					state: createConnectionState("active-1", recoveredSessionId),
+					messages: [],
+					snapshotFollows: true,
+					meta: {
+						id: "active-1:13",
+						protocol: DAEMON_PROTOCOL_INFO,
+						activeSessionId: "active-1",
+						sequence: 13,
+						cursor: { generation: "generation-active-1", sequence: 13 },
+						emittedAt: "2026-01-01T00:00:00.000Z",
+					},
+				});
+			}
+			fakeClient.emitMessage({
+				type: "session_snapshot_begin",
+				activeSessionId: "active-1",
+				snapshotId,
+				snapshot,
+				messageCount: 1,
+				targetChunkBytes: 512 * 1024,
+				purpose,
+			});
+			fakeClient.emitMessage({
+				type: "session_snapshot_failed",
+				activeSessionId: "active-1",
+				snapshotId,
+				error: `${purpose} snapshot failed`,
+			});
+
+			await vi.waitFor(() => expect(events).toHaveLength(1));
+			if (purpose === "replacement") {
+				expect(events[0]).toMatchObject({
+					type: "session_replaced",
+					state: { sessionId: recoveredSessionId },
+					messages: [{ role: "user", content: "current prompt", timestamp: 4 }],
+				});
+			} else {
+				expect(events[0]).toMatchObject({
+					type: "session_resynced",
+					snapshot: {
+						state: { sessionId: recoveredSessionId },
+						messages: [{ role: "user", content: "current prompt", timestamp: 4 }],
+					},
+				});
+			}
+			expect(fakeClient.requests.map((request) => request.type)).toEqual([
+				"get_connection_state",
+				"get_messages",
+				"get_session_context",
+			]);
+			emitSequencedQueueUpdate(fakeClient, "active-2", 13);
+			await vi.waitFor(() => expect(siblingEvents).toHaveLength(1));
+			expect(siblingEvents[0]).toMatchObject({ type: "session_event", event: { type: "queue_update" } });
+			expect(fakeClient.closeCount).toBe(0);
+			expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(
+				0,
+			);
+			await connection.dispose();
+			await sibling.dispose();
+		},
+	);
 
 	it("keeps attach snapshots usable when the daemon omits duplicate session context", async () => {
 		const fakeClient = new FakeDaemonClient();

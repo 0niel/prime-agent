@@ -12,9 +12,12 @@ import {
 } from "../../../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../../../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../../../src/modes/daemon/daemon-supervisor.js";
-import type { DaemonWorkerFrameHeader } from "../../../src/modes/daemon/daemon-worker-protocol.js";
+import {
+	type DaemonWorkerFrameHeader,
+	isDaemonWorkerFrameHeader,
+} from "../../../src/modes/daemon/daemon-worker-protocol.js";
 import { SnapshotTranscriptCache } from "../../../src/modes/daemon/snapshot-transcript-cache.js";
-import type { PrivateFrame } from "../../../src/modes/session-worker/private-framing.js";
+import { type PrivateFrame, PrivateFrameDecoder } from "../../../src/modes/session-worker/private-framing.js";
 
 const activeSessionId = "active-4602";
 const snapshotId = "snapshot-4602";
@@ -217,7 +220,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(unhandled).not.toHaveBeenCalled();
 	});
 
-	it("fails the cache and worker channel when streaming rejects after begin", async () => {
+	it("fails one worker snapshot without dropping another session on the supervisor channel", async () => {
 		const daemon = new AgentDaemon("/tmp/eng-4602-stream.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -238,12 +241,13 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		const dispose = vi.spyOn(transcript, "dispose");
 		const socket = new PassThrough();
 		socket.on("error", () => {});
-		const destroy = vi.spyOn(socket, "destroy");
+		const written: Buffer[] = [];
+		socket.on("data", (chunk: Buffer) => written.push(Buffer.from(chunk)));
 		const client = {
 			id: "supervisor",
 			socket: socket as unknown as Socket,
 			transport: "private-framed",
-			attachedActiveSessionIds: new Set([activeSessionId]),
+			attachedActiveSessionIds: new Set([activeSessionId, "active-4602-sibling"]),
 			catchupActiveSessionIds: new Set<string>(),
 			detachInput: () => {},
 			supportsExtensionUi: false,
@@ -258,11 +262,65 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		};
 
 		await expect(internals.streamWorkerSnapshot(client, streamedResult([]), transcript)).rejects.toBe(streamError);
-		expect(socket.destroyed).toBe(true);
+		const decoder = new PrivateFrameDecoder(isDaemonWorkerFrameHeader);
+		const frames = decoder.push(Buffer.concat(written));
+		expect(frames.map((entry) => (entry.header.kind === "outbound" ? entry.header.outboundType : undefined))).toEqual(
+			["session_snapshot_begin", "session_snapshot_failed"],
+		);
+		expect(JSON.parse(frames[1]!.payload.toString("utf8"))).toMatchObject({
+			type: "session_snapshot_failed",
+			activeSessionId,
+			snapshotId,
+			error: streamError.message,
+		});
+		expect(socket.destroyed).toBe(false);
+		expect(client.attachedActiveSessionIds).toContain("active-4602-sibling");
 		expect(transcript.complete).toBe(false);
 		expect(client.snapshotStreaming).toBe(false);
 		expect(markFailed.mock.invocationCallOrder[0]).toBeLessThan(dispose.mock.invocationCallOrder[0]!);
-		expect(dispose.mock.invocationCallOrder[0]).toBeLessThan(destroy.mock.invocationCallOrder[0]!);
+		socket.destroy();
+	});
+
+	it("keeps a multi-session worker connected after a scoped snapshot failure frame", () => {
+		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-failure.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			descriptorDir: "/tmp/eng-4602-supervisor-failure-state",
+		});
+		const { close, worker } = workerHarness();
+		worker.summaries.set("active-4602-sibling", {
+			...summary(),
+			id: "active-4602-sibling",
+			activeSessionId: "active-4602-sibling",
+			sessionId: "session-4602-sibling",
+		});
+		const transcript = new SnapshotTranscriptCache({
+			activeSessionId,
+			snapshotId,
+			cacheRoot: "/tmp",
+		});
+		worker.snapshotCache.set(activeSessionId, streamedResult([]));
+		worker.transcriptCaches.set(activeSessionId, transcript);
+		worker.incomingTranscriptActiveSessionIds.add(activeSessionId);
+		const internals = supervisor as unknown as {
+			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+
+		internals.handleWorkerFrame(
+			worker,
+			frame({
+				type: "session_snapshot_failed",
+				activeSessionId,
+				snapshotId,
+				error: "snapshot encoder failed",
+			}),
+		);
+
+		expect(close).not.toHaveBeenCalled();
+		expect(worker.descriptor.lifecycle).toBe("ready");
+		expect(worker.summaries.has("active-4602-sibling")).toBe(true);
+		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
+		expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
+		expect(worker.incomingTranscriptActiveSessionIds.has(activeSessionId)).toBe(false);
 	});
 
 	it("quarantines a completed duplicate until exact replacement validation", () => {
@@ -696,7 +754,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(replaced.worker.transcriptCaches.get(activeSessionId)?.snapshotId).toBe("snapshot-4602-new");
 	});
 
-	it("isolates a public snapshot read failure to its destination", async () => {
+	it("fails one public snapshot without dropping another session on the shared client", async () => {
 		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-public.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			descriptorDir: "/tmp/eng-4602-supervisor-public-state",
@@ -714,8 +772,11 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		});
 		const failedSocket = new PassThrough();
 		failedSocket.on("error", () => {});
+		const failedWrites: Buffer[] = [];
+		failedSocket.on("data", (chunk: Buffer) => failedWrites.push(Buffer.from(chunk)));
 		const siblingSocket = new PassThrough();
 		const failedClient = socketClient("failed", failedSocket);
+		failedClient.attachedActiveSessionIds.add("active-4602-sibling");
 		const siblingClient = socketClient("sibling", siblingSocket);
 		const { close, worker } = workerHarness();
 		worker.snapshotCache.set(activeSessionId, result);
@@ -734,10 +795,25 @@ describe("ENG-4602 snapshot transfer containment", () => {
 
 		await expect(internals.streamSnapshot(failedClient, worker, result, transcript)).rejects.toBe(streamError);
 
-		expect(failedSocket.destroyed).toBe(true);
+		const records = Buffer.concat(failedWrites)
+			.toString("utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as DaemonOutbound);
+		expect(records.map((record) => record.type)).toEqual(["session_snapshot_begin", "session_snapshot_failed"]);
+		expect(records[1]).toMatchObject({
+			type: "session_snapshot_failed",
+			activeSessionId,
+			snapshotId,
+			error: streamError.message,
+		});
+		expect(failedSocket.destroyed).toBe(false);
+		expect(failedClient.attachedActiveSessionIds).toContain("active-4602-sibling");
 		expect(siblingSocket.destroyed).toBe(false);
 		expect(close).not.toHaveBeenCalled();
 		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
 		expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
+		failedSocket.destroy();
+		siblingSocket.destroy();
 	});
 });
