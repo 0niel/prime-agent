@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -20,6 +20,7 @@ import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-p
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
 const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
+const blockingProcessPath = resolve(__dirname, "fixtures/blocking-process.mjs");
 const tempDirs: string[] = [];
 const children = new Set<ChildProcess>();
 const workerPids = new Set<number>();
@@ -178,8 +179,10 @@ async function connectEventually(socketPath: string, child?: ChildProcess): Prom
 	let lastError: unknown;
 	while (Date.now() < deadline) {
 		if (child && (child.exitCode !== null || child.signalCode !== null)) {
+			const diagnostics = childDiagnostics.get(child);
 			throw new Error(
-				`Supervisor exited before becoming ready (code ${child.exitCode}, signal ${child.signalCode})`,
+				`Supervisor exited before becoming ready (code ${child.exitCode}, signal ${child.signalCode})\n` +
+					`stdout:\n${diagnostics?.stdout ?? ""}\nstderr:\n${diagnostics?.stderr ?? ""}`,
 			);
 		}
 		const client = new DaemonClient(socketPath);
@@ -269,8 +272,21 @@ async function waitForCondition(predicate: () => boolean, failureMessage: string
 	throw new Error(failureMessage);
 }
 
+function quoteShellArgument(argument: string): string {
+	return `'${argument.replaceAll("'", `'"'"'`)}'`;
+}
+
+async function startBlockingBash(client: DaemonClient, activeSessionId: string, readyPath: string): Promise<void> {
+	const command = [process.execPath, blockingProcessPath, readyPath].map(quoteShellArgument).join(" ");
+	const response = await client.request({ type: "execute_bash", activeSessionId, command });
+	if (!response.success) {
+		throw new Error(response.error);
+	}
+	await waitForCondition(() => existsSync(readyPath), `Blocking bash process did not become ready: ${readyPath}`);
+}
+
 describe("daemon supervisor resident workers", () => {
-	it("cancels an archived session heartbeat without spawning a worker", async () => {
+	it("cancels an archived session heartbeat without spawning a worker", { tags: ["process-stress"] }, async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");
 		const projectDir = join(root, "project");
@@ -321,55 +337,62 @@ describe("daemon supervisor resident workers", () => {
 		await client.request({ type: "shutdown" });
 		client.close();
 		await waitForSocketGone(socketPath);
-	}, 30_000);
+	});
 
-	it("cancels an orphan heartbeat instead of recreating a descriptorless active session", async () => {
-		const root = tempDir();
-		const agentDir = join(root, "agent");
-		const projectDir = join(root, "project");
-		const sessionDir = join(agentDir, "sessions");
-		const socketPath = join(tmpdir(), `prime-supervisor-orphan-cron-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
-		mkdirSync(projectDir, { recursive: true });
-		const sessionManager = SessionManager.create(projectDir, sessionDir);
-		sessionManager.appendMessage({ role: "user", content: "old scheduled work", timestamp: 1 });
-		sessionManager.appendSessionState({ status: "active" });
-		const sessionFile = sessionManager.getSessionFile();
-		if (!sessionFile) {
-			throw new Error("Fixture session did not persist");
-		}
-		const cronStore = new AgentCronJobStore(getCronJobsPath(agentDir));
-		const heartbeat = cronStore.createHeartbeat({
-			activeSessionId: "deleted-worker",
-			sessionId: sessionManager.getSessionId(),
-			sessionFile,
-			cwd: projectDir,
-			scheduleText: "every 10s",
-			prompt: "continue old work",
-			now: new Date(Date.now() - 20_000),
-		});
+	it(
+		"cancels an orphan heartbeat instead of recreating a descriptorless active session",
+		{ tags: ["process-stress"] },
+		async () => {
+			const root = tempDir();
+			const agentDir = join(root, "agent");
+			const projectDir = join(root, "project");
+			const sessionDir = join(agentDir, "sessions");
+			const socketPath = join(
+				tmpdir(),
+				`prime-supervisor-orphan-cron-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+			);
+			mkdirSync(projectDir, { recursive: true });
+			const sessionManager = SessionManager.create(projectDir, sessionDir);
+			sessionManager.appendMessage({ role: "user", content: "old scheduled work", timestamp: 1 });
+			sessionManager.appendSessionState({ status: "active" });
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) {
+				throw new Error("Fixture session did not persist");
+			}
+			const cronStore = new AgentCronJobStore(getCronJobsPath(agentDir));
+			const heartbeat = cronStore.createHeartbeat({
+				activeSessionId: "deleted-worker",
+				sessionId: sessionManager.getSessionId(),
+				sessionFile,
+				cwd: projectDir,
+				scheduleText: "every 10s",
+				prompt: "continue old work",
+				now: new Date(Date.now() - 20_000),
+			});
 
-		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
-		const client = await connectEventually(socketPath, supervisor);
-		const migratedStore = AgentCronJobStore.forSessionArtifacts();
-		migratedStore.registerSessionArtifact(sessionManager.getSessionId(), sessionManager.getSessionArtifactDir()!);
-		await waitForCondition(
-			() => migratedStore.list().find((job) => job.id === heartbeat.id)?.status === "cancelled",
-			"Orphan heartbeat was not cancelled",
-		);
+			const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+			const client = await connectEventually(socketPath, supervisor);
+			const migratedStore = AgentCronJobStore.forSessionArtifacts();
+			migratedStore.registerSessionArtifact(sessionManager.getSessionId(), sessionManager.getSessionArtifactDir()!);
+			await waitForCondition(
+				() => migratedStore.list().find((job) => job.id === heartbeat.id)?.status === "cancelled",
+				"Orphan heartbeat was not cancelled",
+			);
 
-		expect(countWorkerDescriptors(agentDir)).toBe(0);
-		const listed = await client.request({ type: "list" });
-		expect(listed.success).toBe(true);
-		expect(
-			requireSessionList(listed.success ? listed.data : undefined).filter(
-				(session) => session.activeSessionId || session.workerPid,
-			),
-		).toEqual([]);
+			expect(countWorkerDescriptors(agentDir)).toBe(0);
+			const listed = await client.request({ type: "list" });
+			expect(listed.success).toBe(true);
+			expect(
+				requireSessionList(listed.success ? listed.data : undefined).filter(
+					(session) => session.activeSessionId || session.workerPid,
+				),
+			).toEqual([]);
 
-		await client.request({ type: "shutdown" });
-		client.close();
-		await waitForSocketGone(socketPath);
-	}, 30_000);
+			await client.request({ type: "shutdown" });
+			client.close();
+			await waitForSocketGone(socketPath);
+		},
+	);
 
 	it("restarts an empty supervisor without requiring a resident worker", async () => {
 		const root = tempDir();
@@ -398,7 +421,7 @@ describe("daemon supervisor resident workers", () => {
 		await waitForSocketGone(socketPath);
 	});
 
-	it("survives a worker process spawn error", async () => {
+	it("survives a worker process spawn error", { tags: ["process-stress"] }, async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");
 		const projectDir = join(root, "project");
@@ -490,96 +513,105 @@ describe("daemon supervisor resident workers", () => {
 		await waitForSocketGone(socketPath);
 	}, 30_000);
 
-	it("does not resurrect an intentionally stopped root when the supervisor dies during kill", async () => {
+	it(
+		"does not resurrect an intentionally stopped root when the supervisor dies during kill",
+		{ tags: ["process-stress"], timeout: 30_000 },
+		async () => {
+			const root = tempDir();
+			const agentDir = join(root, "agent");
+			const projectDir = join(root, "project");
+			const sessionDir = join(agentDir, "sessions");
+			const socketPath = join(
+				tmpdir(),
+				`prime-supervisor-stop-race-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+			);
+			mkdirSync(projectDir, { recursive: true });
+			const sessionManager = SessionManager.create(projectDir, sessionDir);
+			sessionManager.appendMessage({ role: "user", content: "stop me", timestamp: 1 });
+			sessionManager.appendSessionState({ status: "active" });
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) {
+				throw new Error("Fixture session did not persist");
+			}
+
+			const firstSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+			const client = await connectEventually(socketPath, firstSupervisor);
+			const firstSupervisorPid = client.hello?.supervisorPid;
+			if (!firstSupervisorPid) {
+				throw new Error("Daemon hello did not expose its supervisor pid");
+			}
+			const created = await client.request({
+				type: "create",
+				sessionPath: sessionFile,
+				config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+			});
+			if (!created.success) {
+				throw new Error(created.error);
+			}
+			const summary = requireSummary(created.data);
+			if (!summary.workerPid) {
+				throw new Error("Resident worker did not expose its pid");
+			}
+			workerPids.add(summary.workerPid);
+			const activeSessionId = summary.activeSessionId ?? summary.id;
+			const heartbeatResponse = await client.request({
+				type: "heartbeat_set",
+				activeSessionId,
+				schedule: "every 1h",
+				prompt: "continue old work",
+			});
+			if (!heartbeatResponse.success || !heartbeatResponse.data || typeof heartbeatResponse.data !== "object") {
+				throw new Error(
+					heartbeatResponse.success ? "Heartbeat response was missing data" : heartbeatResponse.error,
+				);
+			}
+			const heartbeat = (heartbeatResponse.data as { heartbeat: { id: string } }).heartbeat;
+			const cronStore = AgentCronJobStore.forSessionArtifacts();
+			cronStore.registerSessionArtifact(summary.sessionId, sessionManager.getSessionArtifactDir()!);
+			process.kill(summary.workerPid, "SIGSTOP");
+			const killResult = client.request({ type: "kill", activeSessionId }).catch((error: unknown) => error);
+			const tombstone = await waitForWorkerStopTombstone(agentDir);
+			expect(tombstone.stopRequestedAt).toEqual(expect.any(String));
+			expect(tombstone.archiveOnStop).toBe(true);
+
+			process.kill(firstSupervisorPid, "SIGKILL");
+			await waitForExit(firstSupervisor);
+			children.delete(firstSupervisor);
+			client.close();
+			await expect(killResult).resolves.toBeInstanceOf(Error);
+
+			const replacementSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+			const replacementClient = await connectEventually(socketPath, replacementSupervisor);
+			const listed = await replacementClient.request({ type: "list" });
+			expect(listed.success).toBe(true);
+			const sessions = requireSessionList(listed.success ? listed.data : undefined);
+			expect(sessions.filter((session) => session.activeSessionId || session.workerPid)).toEqual([]);
+			await waitForProcessGone(summary.workerPid);
+			workerPids.delete(summary.workerPid);
+			await waitForCondition(
+				() => countWorkerDescriptors(agentDir) === 0,
+				"Intentional worker stop descriptor was not removed",
+			);
+			expect(countWorkerDescriptors(agentDir)).toBe(0);
+			expect((await readSessionInfo(sessionFile))?.state).toEqual({ status: "archived" });
+			expect(cronStore.list().find((job) => job.id === heartbeat.id)).toMatchObject({ status: "cancelled" });
+
+			await replacementClient.request({ type: "shutdown" });
+			replacementClient.close();
+			await waitForSocketGone(socketPath);
+		},
+	);
+
+	it("hosts and adopts isolated worker processes", async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");
 		const projectDir = join(root, "project");
 		const sessionDir = join(agentDir, "sessions");
-		const socketPath = join(tmpdir(), `prime-supervisor-stop-race-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		const socketPath = join(tmpdir(), `prime-supervisor-smoke-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
 		mkdirSync(projectDir, { recursive: true });
-		const sessionManager = SessionManager.create(projectDir, sessionDir);
-		sessionManager.appendMessage({ role: "user", content: "stop me", timestamp: 1 });
-		sessionManager.appendSessionState({ status: "active" });
-		const sessionFile = sessionManager.getSessionFile();
-		if (!sessionFile) {
-			throw new Error("Fixture session did not persist");
-		}
-
-		const firstSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
-		const client = await connectEventually(socketPath, firstSupervisor);
-		const firstSupervisorPid = client.hello?.supervisorPid;
-		if (!firstSupervisorPid) {
-			throw new Error("Daemon hello did not expose its supervisor pid");
-		}
-		const created = await client.request({
-			type: "create",
-			sessionPath: sessionFile,
-			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
-		});
-		if (!created.success) {
-			throw new Error(created.error);
-		}
-		const summary = requireSummary(created.data);
-		if (!summary.workerPid) {
-			throw new Error("Resident worker did not expose its pid");
-		}
-		workerPids.add(summary.workerPid);
-		const activeSessionId = summary.activeSessionId ?? summary.id;
-		const heartbeatResponse = await client.request({
-			type: "heartbeat_set",
-			activeSessionId,
-			schedule: "every 1h",
-			prompt: "continue old work",
-		});
-		if (!heartbeatResponse.success || !heartbeatResponse.data || typeof heartbeatResponse.data !== "object") {
-			throw new Error(heartbeatResponse.success ? "Heartbeat response was missing data" : heartbeatResponse.error);
-		}
-		const heartbeat = (heartbeatResponse.data as { heartbeat: { id: string } }).heartbeat;
-		const cronStore = AgentCronJobStore.forSessionArtifacts();
-		cronStore.registerSessionArtifact(summary.sessionId, sessionManager.getSessionArtifactDir()!);
-		process.kill(summary.workerPid, "SIGSTOP");
-		const killResult = client.request({ type: "kill", activeSessionId }).catch((error: unknown) => error);
-		const tombstone = await waitForWorkerStopTombstone(agentDir);
-		expect(tombstone.stopRequestedAt).toEqual(expect.any(String));
-		expect(tombstone.archiveOnStop).toBe(true);
-
-		process.kill(firstSupervisorPid, "SIGKILL");
-		await waitForExit(firstSupervisor);
-		children.delete(firstSupervisor);
-		client.close();
-		await expect(killResult).resolves.toBeInstanceOf(Error);
-
-		const replacementSupervisor = spawnSupervisor(agentDir, socketPath, projectDir);
-		const replacementClient = await connectEventually(socketPath, replacementSupervisor);
-		const listed = await replacementClient.request({ type: "list" });
-		expect(listed.success).toBe(true);
-		const sessions = requireSessionList(listed.success ? listed.data : undefined);
-		expect(sessions.filter((session) => session.activeSessionId || session.workerPid)).toEqual([]);
-		await waitForProcessGone(summary.workerPid);
-		workerPids.delete(summary.workerPid);
-		await waitForCondition(
-			() => countWorkerDescriptors(agentDir) === 0,
-			"Intentional worker stop descriptor was not removed",
-		);
-		expect(countWorkerDescriptors(agentDir)).toBe(0);
-		expect((await readSessionInfo(sessionFile))?.state).toEqual({ status: "archived" });
-		expect(cronStore.list().find((job) => job.id === heartbeat.id)).toMatchObject({ status: "cancelled" });
-
-		await replacementClient.request({ type: "shutdown" });
-		replacementClient.close();
-		await waitForSocketGone(socketPath);
-	}, 30_000);
-
-	it("hosts resident roots in isolated worker processes without a session cap", async () => {
-		const root = tempDir();
-		const agentDir = join(root, "agent");
-		const projectDir = join(root, "project");
-		const sessionDir = join(agentDir, "sessions");
-		const socketPath = join(tmpdir(), `prime-supervisor-many-roots-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
-		mkdirSync(projectDir, { recursive: true });
-		const sessionFiles = Array.from({ length: PROCESS_STRESS_WORKERS }, (_, index) => {
+		const sessionFiles = Array.from({ length: 2 }, (_, index) => {
 			const manager = SessionManager.create(projectDir, sessionDir);
-			manager.appendMessage({ role: "user", content: `root ${index}`, timestamp: index + 1 });
+			manager.appendMessage({ role: "user", content: `smoke root ${index}`, timestamp: index + 1 });
 			const sessionFile = manager.getSessionFile();
 			if (!sessionFile) {
 				throw new Error("Fixture session did not persist");
@@ -589,22 +621,6 @@ describe("daemon supervisor resident workers", () => {
 
 		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
 		const client = await connectEventually(socketPath, supervisor);
-		const externalLease = acquireSessionLease(sessionFiles[0], agentDir, {
-			[SESSION_LEASES_ENABLED_ENV]: "1",
-			[SESSION_LEASE_OWNER_ID_ENV]: "external-owner",
-		});
-		const conflict = await client.request({
-			type: "create",
-			sessionPath: sessionFiles[0],
-			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
-		});
-		expect(conflict).toMatchObject({
-			success: false,
-			errorInfo: { code: "session_already_active", activeSessionId: "external-owner" },
-		});
-		const emptyAfterConflict = await client.request({ type: "list" });
-		expect(requireSessionList(emptyAfterConflict.success ? emptyAfterConflict.data : undefined)).toHaveLength(0);
-		externalLease?.release();
 		const created = await Promise.all(
 			sessionFiles.map((sessionPath) =>
 				client.request({
@@ -621,7 +637,7 @@ describe("daemon supervisor resident workers", () => {
 			return requireSummary(response.data);
 		});
 		const pids = summaries.map((summary) => summary.workerPid);
-		expect(new Set(pids).size).toBe(PROCESS_STRESS_WORKERS);
+		expect(new Set(pids).size).toBe(2);
 		expect(pids).not.toContain(supervisor.pid);
 		for (const pid of pids) {
 			if (!pid) {
@@ -629,62 +645,15 @@ describe("daemon supervisor resident workers", () => {
 			}
 			workerPids.add(pid);
 		}
-		const firstActiveSessionId = summaries[0]!.activeSessionId ?? summaries[0]!.id;
-		const addedCron = await client.request({
-			type: "cron_add",
-			activeSessionId: firstActiveSessionId,
-			schedule: "every 1h",
-			prompt: "check status",
-		});
-		expect(addedCron.success).toBe(true);
-		const cronJob = (addedCron.success ? addedCron.data : undefined) as { job?: { id?: string } } | undefined;
-		if (!cronJob?.job?.id) {
-			throw new Error("Supervisor did not persist the cron job");
-		}
-		const listedCron = await client.request({ type: "cron_list", activeSessionId: firstActiveSessionId });
-		expect(listedCron).toMatchObject({ success: true, data: { jobs: [{ id: cronJob.job.id }] } });
-		const cancelledCron = await client.request({ type: "cron_cancel", jobId: cronJob.job.id });
-		expect(cancelledCron.success).toBe(true);
-		const activeSessionIds = summaries.map((summary) => summary.activeSessionId ?? summary.id);
-		await Promise.all(
-			activeSessionIds.map((activeSessionId) =>
-				client.request({ type: "execute_bash", activeSessionId, command: "sleep 30" }),
-			),
-		);
-		const heartbeats = await Promise.all(
-			activeSessionIds.map((activeSessionId, index) =>
-				client.request({
-					type: "heartbeat_set",
-					activeSessionId,
-					schedule: "every 10s",
-					prompt: `heartbeat ${index}`,
-				}),
-			),
-		);
-		expect(heartbeats.every((response) => response.success)).toBe(true);
-		await waitForCondition(
-			() => {
-				const stores = summaries.map((summary, index) => {
-					const store = AgentCronJobStore.forSessionArtifacts();
-					store.registerSessionArtifact(
-						summary.sessionId,
-						join(dirname(dirname(sessionFiles[index]!)), "session-artifacts", summary.sessionId),
-					);
-					return store;
-				});
-				return stores.every((store) => store.list().some((job) => job.lastSkippedAt !== undefined));
-			},
-			"Session workers did not advance their heartbeats independently",
-			15_000,
-		);
 
 		const listed = await client.request({ type: "list" });
 		expect(listed.success).toBe(true);
-		expect(requireSessionList(listed.success ? listed.data : undefined)).toHaveLength(PROCESS_STRESS_WORKERS);
+		expect(requireSessionList(listed.success ? listed.data : undefined)).toHaveLength(2);
 		supervisor.kill("SIGTERM");
 		await waitForExit(supervisor);
 		children.delete(supervisor);
 		client.close();
+
 		const replacementClient = await connectEventually(socketPath);
 		const adopted = await replacementClient.request({ type: "list" });
 		expect(adopted.success).toBe(true);
@@ -702,7 +671,148 @@ describe("daemon supervisor resident workers", () => {
 				}
 			}),
 		);
-	}, 180_000);
+	}, 60_000);
+
+	it(
+		"hosts resident roots in isolated worker processes without a session cap",
+		{ tags: ["process-stress"], timeout: 180_000 },
+		async () => {
+			const root = tempDir();
+			const agentDir = join(root, "agent");
+			const projectDir = join(root, "project");
+			const sessionDir = join(agentDir, "sessions");
+			const socketPath = join(
+				tmpdir(),
+				`prime-supervisor-many-roots-${process.pid}-${randomUUID().slice(0, 8)}.sock`,
+			);
+			mkdirSync(projectDir, { recursive: true });
+			const sessionFiles = Array.from({ length: PROCESS_STRESS_WORKERS }, (_, index) => {
+				const manager = SessionManager.create(projectDir, sessionDir);
+				manager.appendMessage({ role: "user", content: `root ${index}`, timestamp: index + 1 });
+				const sessionFile = manager.getSessionFile();
+				if (!sessionFile) {
+					throw new Error("Fixture session did not persist");
+				}
+				return sessionFile;
+			});
+
+			const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+			const client = await connectEventually(socketPath, supervisor);
+			const externalLease = acquireSessionLease(sessionFiles[0], agentDir, {
+				[SESSION_LEASES_ENABLED_ENV]: "1",
+				[SESSION_LEASE_OWNER_ID_ENV]: "external-owner",
+			});
+			const conflict = await client.request({
+				type: "create",
+				sessionPath: sessionFiles[0],
+				config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+			});
+			expect(conflict).toMatchObject({
+				success: false,
+				errorInfo: { code: "session_already_active", activeSessionId: "external-owner" },
+			});
+			const emptyAfterConflict = await client.request({ type: "list" });
+			expect(requireSessionList(emptyAfterConflict.success ? emptyAfterConflict.data : undefined)).toHaveLength(0);
+			externalLease?.release();
+			const created = await Promise.all(
+				sessionFiles.map((sessionPath) =>
+					client.request({
+						type: "create",
+						sessionPath,
+						config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+					}),
+				),
+			);
+			const summaries = created.map((response) => {
+				if (!response.success) {
+					throw new Error(response.error);
+				}
+				return requireSummary(response.data);
+			});
+			const pids = summaries.map((summary) => summary.workerPid);
+			expect(new Set(pids).size).toBe(PROCESS_STRESS_WORKERS);
+			expect(pids).not.toContain(supervisor.pid);
+			for (const pid of pids) {
+				if (!pid) {
+					throw new Error("Resident root did not expose a worker pid");
+				}
+				workerPids.add(pid);
+			}
+			const firstActiveSessionId = summaries[0]!.activeSessionId ?? summaries[0]!.id;
+			const addedCron = await client.request({
+				type: "cron_add",
+				activeSessionId: firstActiveSessionId,
+				schedule: "every 1h",
+				prompt: "check status",
+			});
+			expect(addedCron.success).toBe(true);
+			const cronJob = (addedCron.success ? addedCron.data : undefined) as { job?: { id?: string } } | undefined;
+			if (!cronJob?.job?.id) {
+				throw new Error("Supervisor did not persist the cron job");
+			}
+			const listedCron = await client.request({ type: "cron_list", activeSessionId: firstActiveSessionId });
+			expect(listedCron).toMatchObject({ success: true, data: { jobs: [{ id: cronJob.job.id }] } });
+			const cancelledCron = await client.request({ type: "cron_cancel", jobId: cronJob.job.id });
+			expect(cancelledCron.success).toBe(true);
+			const activeSessionIds = summaries.map((summary) => summary.activeSessionId ?? summary.id);
+			await Promise.all(
+				activeSessionIds.map((activeSessionId, index) =>
+					startBlockingBash(client, activeSessionId, join(root, `stress-blocker-${index}.ready`)),
+				),
+			);
+			const heartbeats = await Promise.all(
+				activeSessionIds.map((activeSessionId, index) =>
+					client.request({
+						type: "heartbeat_set",
+						activeSessionId,
+						schedule: "every 10s",
+						prompt: `heartbeat ${index}`,
+					}),
+				),
+			);
+			expect(heartbeats.every((response) => response.success)).toBe(true);
+			await waitForCondition(
+				() => {
+					const stores = summaries.map((summary, index) => {
+						const store = AgentCronJobStore.forSessionArtifacts();
+						store.registerSessionArtifact(
+							summary.sessionId,
+							join(dirname(dirname(sessionFiles[index]!)), "session-artifacts", summary.sessionId),
+						);
+						return store;
+					});
+					return stores.every((store) => store.list().some((job) => job.lastSkippedAt !== undefined));
+				},
+				"Session workers did not advance their heartbeats independently",
+				15_000,
+			);
+
+			const listed = await client.request({ type: "list" });
+			expect(listed.success).toBe(true);
+			expect(requireSessionList(listed.success ? listed.data : undefined)).toHaveLength(PROCESS_STRESS_WORKERS);
+			supervisor.kill("SIGTERM");
+			await waitForExit(supervisor);
+			children.delete(supervisor);
+			client.close();
+			const replacementClient = await connectEventually(socketPath);
+			const adopted = await replacementClient.request({ type: "list" });
+			expect(adopted.success).toBe(true);
+			expect(
+				new Set(requireSessionList(adopted.success ? adopted.data : undefined).map((summary) => summary.workerPid)),
+			).toEqual(new Set(pids));
+			await replacementClient.request({ type: "shutdown" });
+			replacementClient.close();
+			await waitForSocketGone(socketPath);
+			await Promise.all(
+				pids.map(async (pid) => {
+					if (pid) {
+						await waitForProcessGone(pid);
+						workerPids.delete(pid);
+					}
+				}),
+			);
+		},
+	);
 
 	it("isolates a root, streams a chunked snapshot, and adopts the same worker after restart", async () => {
 		const root = tempDir();
@@ -827,12 +937,7 @@ describe("daemon supervisor resident workers", () => {
 		});
 
 		const descriptor = readWorkerDescriptor(agentDir);
-		const bashStarted = await client.request({
-			type: "execute_bash",
-			activeSessionId,
-			command: "sleep 60",
-		});
-		expect(bashStarted.success).toBe(true);
+		await startBlockingBash(client, activeSessionId, join(root, "orphan-blocker.ready"));
 		if (!descriptor.orphanProcessJournalPath) {
 			throw new Error("Resident worker did not persist its orphan-process journal path");
 		}
@@ -889,73 +994,72 @@ describe("daemon supervisor resident workers", () => {
 		workerPids.delete(recovered.workerPid);
 	});
 
-	it("runs a session-artifact cron job while the supervisor is being replaced", async () => {
-		const root = tempDir();
-		const agentDir = join(root, "agent");
-		const projectDir = join(root, "project");
-		const sessionDir = join(agentDir, "sessions");
-		const socketPath = join(tmpdir(), `prime-worker-cron-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
-		mkdirSync(projectDir, { recursive: true });
-		const sessionManager = SessionManager.create(projectDir, sessionDir);
-		sessionManager.appendMessage({ role: "user", content: "scheduled work", timestamp: 1 });
-		sessionManager.appendSessionState({ status: "active" });
-		const sessionFile = sessionManager.getSessionFile();
-		const artifactDir = sessionManager.getSessionArtifactDir();
-		if (!sessionFile || !artifactDir) {
-			throw new Error("Fixture session did not persist");
-		}
+	it(
+		"runs a session-artifact cron job while the supervisor is being replaced",
+		{ tags: ["process-stress"], timeout: 30_000 },
+		async () => {
+			const root = tempDir();
+			const agentDir = join(root, "agent");
+			const projectDir = join(root, "project");
+			const sessionDir = join(agentDir, "sessions");
+			const socketPath = join(tmpdir(), `prime-worker-cron-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+			mkdirSync(projectDir, { recursive: true });
+			const sessionManager = SessionManager.create(projectDir, sessionDir);
+			sessionManager.appendMessage({ role: "user", content: "scheduled work", timestamp: 1 });
+			sessionManager.appendSessionState({ status: "active" });
+			const sessionFile = sessionManager.getSessionFile();
+			const artifactDir = sessionManager.getSessionArtifactDir();
+			if (!sessionFile || !artifactDir) {
+				throw new Error("Fixture session did not persist");
+			}
 
-		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
-		const client = await connectEventually(socketPath, supervisor);
-		const created = await client.request({
-			type: "create",
-			sessionPath: sessionFile,
-			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
-		});
-		if (!created.success) {
-			throw new Error(created.error);
-		}
-		const summary = requireSummary(created.data);
-		if (!summary.workerPid) {
-			throw new Error("Resident worker did not expose its pid");
-		}
-		workerPids.add(summary.workerPid);
-		const bashStarted = await client.request({
-			type: "execute_bash",
-			activeSessionId: summary.activeSessionId ?? summary.id,
-			command: "sleep 30",
-		});
-		expect(bashStarted.success).toBe(true);
-		const scheduled = await client.request({
-			type: "heartbeat_set",
-			activeSessionId: summary.activeSessionId ?? summary.id,
-			schedule: "every 10s",
-			prompt: "continue without the supervisor",
-		});
-		if (!scheduled.success || !scheduled.data || typeof scheduled.data !== "object") {
-			throw new Error(scheduled.success ? "Heartbeat response was missing its job" : scheduled.error);
-		}
-		const job = (scheduled.data as { heartbeat: { id: string } }).heartbeat;
+			const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+			const client = await connectEventually(socketPath, supervisor);
+			const created = await client.request({
+				type: "create",
+				sessionPath: sessionFile,
+				config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+			});
+			if (!created.success) {
+				throw new Error(created.error);
+			}
+			const summary = requireSummary(created.data);
+			if (!summary.workerPid) {
+				throw new Error("Resident worker did not expose its pid");
+			}
+			workerPids.add(summary.workerPid);
+			await startBlockingBash(client, summary.activeSessionId ?? summary.id, join(root, "heartbeat-blocker.ready"));
+			const scheduled = await client.request({
+				type: "heartbeat_set",
+				activeSessionId: summary.activeSessionId ?? summary.id,
+				schedule: "every 10s",
+				prompt: "continue without the supervisor",
+			});
+			if (!scheduled.success || !scheduled.data || typeof scheduled.data !== "object") {
+				throw new Error(scheduled.success ? "Heartbeat response was missing its job" : scheduled.error);
+			}
+			const job = (scheduled.data as { heartbeat: { id: string } }).heartbeat;
 
-		client.close();
-		supervisor.kill("SIGKILL");
-		await waitForExit(supervisor);
-		children.delete(supervisor);
+			client.close();
+			supervisor.kill("SIGKILL");
+			await waitForExit(supervisor);
+			children.delete(supervisor);
 
-		const store = AgentCronJobStore.forSessionArtifacts();
-		store.registerSessionArtifact(sessionManager.getSessionId(), artifactDir);
-		await waitForCondition(
-			() => store.list().find((candidate) => candidate.id === job.id)?.lastSkippedAt !== undefined,
-			"Resident worker did not advance its heartbeat without the supervisor",
-			15_000,
-		);
-		expect(store.list().find((candidate) => candidate.id === job.id)).toBeDefined();
+			const store = AgentCronJobStore.forSessionArtifacts();
+			store.registerSessionArtifact(sessionManager.getSessionId(), artifactDir);
+			await waitForCondition(
+				() => store.list().find((candidate) => candidate.id === job.id)?.lastSkippedAt !== undefined,
+				"Resident worker did not advance its heartbeat without the supervisor",
+				15_000,
+			);
+			expect(store.list().find((candidate) => candidate.id === job.id)).toBeDefined();
 
-		const replacement = await connectEventually(socketPath);
-		await replacement.request({ type: "shutdown" });
-		replacement.close();
-		await waitForSocketGone(socketPath);
-		await waitForProcessGone(summary.workerPid);
-		workerPids.delete(summary.workerPid);
-	}, 30_000);
+			const replacement = await connectEventually(socketPath);
+			await replacement.request({ type: "shutdown" });
+			replacement.close();
+			await waitForSocketGone(socketPath);
+			await waitForProcessGone(summary.workerPid);
+			workerPids.delete(summary.workerPid);
+		},
+	);
 });

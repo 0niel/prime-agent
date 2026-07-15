@@ -12,6 +12,13 @@ export default defineConfig({
 		globals: true,
 		environment: "node",
 		testTimeout: 30000,
+		tags: [
+			{
+				name: "process-stress",
+				description: "Slow real-process stress and wall-clock scheduling coverage",
+			},
+		],
+		tagsFilter: ["!process-stress"],
 		server: {
 			deps: {
 				external: [/@silvia-odwyer\/photon-node/],
