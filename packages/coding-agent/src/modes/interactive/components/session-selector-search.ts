@@ -36,6 +36,14 @@ function matchesNameFilter(session: AgentConnectionSavedSessionInfo, filter: Nam
 	return hasSessionName(session);
 }
 
+function compareSessionsByModifiedDesc(a: AgentConnectionSavedSessionInfo, b: AgentConnectionSavedSessionInfo): number {
+	const modifiedDiff = b.modified.getTime() - a.modified.getTime();
+	if (modifiedDiff !== 0) return modifiedDiff;
+	const createdDiff = b.created.getTime() - a.created.getTime();
+	if (createdDiff !== 0) return createdDiff;
+	return a.path.localeCompare(b.path);
+}
+
 export function parseSearchQuery(query: string): ParsedSearchQuery {
 	const trimmed = query.trim();
 	if (!trimmed) {
@@ -162,19 +170,21 @@ export function filterAndSortSessions(
 	const nameFiltered =
 		nameFilter === "all" ? sessions : sessions.filter((session) => matchesNameFilter(session, nameFilter));
 	const trimmed = query.trim();
-	if (!trimmed) return nameFiltered;
+	if (!trimmed) {
+		return sortMode === "recent" ? [...nameFiltered].sort(compareSessionsByModifiedDesc) : nameFiltered;
+	}
 
 	const parsed = parseSearchQuery(query);
 	if (parsed.error) return [];
 
-	// Recent mode: filter only, keep incoming order.
+	// Recent mode: filter, then order by the latest user or assistant message.
 	if (sortMode === "recent") {
 		const filtered: AgentConnectionSavedSessionInfo[] = [];
 		for (const s of nameFiltered) {
 			const res = matchSession(s, parsed);
 			if (res.matches) filtered.push(s);
 		}
-		return filtered;
+		return filtered.sort(compareSessionsByModifiedDesc);
 	}
 
 	// Relevance mode: sort by score, tie-break by modified desc.
@@ -187,7 +197,7 @@ export function filterAndSortSessions(
 
 	scored.sort((a, b) => {
 		if (a.score !== b.score) return a.score - b.score;
-		return b.session.modified.getTime() - a.session.modified.getTime();
+		return compareSessionsByModifiedDesc(a.session, b.session);
 	});
 
 	return scored.map((r) => r.session);
