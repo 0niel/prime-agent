@@ -303,6 +303,7 @@ class TreeList implements Component {
 				entry.type === "custom" ||
 				entry.type === "model_change" ||
 				entry.type === "thinking_level_change" ||
+				entry.type === "service_tier_change" ||
 				entry.type === "session_info" ||
 				entry.type === "child_usage_attributed";
 
@@ -547,6 +548,10 @@ class TreeList implements Component {
 			case "thinking_level_change":
 				parts.push("thinking", entry.thinkingLevel);
 				break;
+			case "service_tier_change":
+				parts.push("service tier", entry.serviceTier ?? "default");
+				if (entry.serviceTier === "priority") parts.push("fast on");
+				break;
 			case "custom":
 				parts.push("custom", entry.customType);
 				break;
@@ -769,6 +774,9 @@ class TreeList implements Component {
 				break;
 			case "thinking_level_change":
 				result = theme.fg("dim", `[thinking: ${entry.thinkingLevel}]`);
+				break;
+			case "service_tier_change":
+				result = theme.fg("dim", `[service tier: ${entry.serviceTier ?? "default"}]`);
 				break;
 			case "custom":
 				result = theme.fg("dim", `[custom: ${entry.customType}]`);

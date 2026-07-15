@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Transport } from "@earendil-works/pi-ai";
+import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
 import { getAgentLogPath, getDaemonLogPath } from "../../config.js";
 import type { AgentSessionEvent } from "../../core/agent-session.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
@@ -675,6 +675,10 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	async setThinkingLevel(level: ThinkingLevel): Promise<void> {
 		await this.requestOk({ type: "set_thinking_level", activeSessionId: this.activeSessionId, level });
+	}
+
+	async setServiceTier(serviceTier: ServiceTier): Promise<void> {
+		await this.requestOk({ type: "set_service_tier", activeSessionId: this.activeSessionId, serviceTier });
 	}
 
 	async cycleThinkingLevel(): Promise<ThinkingLevel | undefined> {

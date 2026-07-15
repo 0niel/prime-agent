@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added `/fast` for OpenAI Fast mode on supported ChatGPT models ([ENG-4620](https://linear.app/primeintellect/issue/ENG-4620/add-support-for-gpt-fast-mode-maybe-fast)).
 - Changed wrapped diff rows to use a blank hanging gutter.
 - Fixed team-gated Prime Inference routes being missing from model selectors by merging the authenticated team catalog during model refresh ([ENG-4645](https://linear.app/primeintellect/issue/ENG-4645/internalglm-52-fast-isnt-working)).
 - Added confirmation when fullscreen text selection copies to the clipboard ([ENG-4644](https://linear.app/primeintellect/issue/ENG-4644/copy-issues)).

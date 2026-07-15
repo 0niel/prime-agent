@@ -4,6 +4,7 @@ import {
 	buildSessionContext,
 	type CompactionEntry,
 	type ModelChangeEntry,
+	type ServiceTierChangeEntry,
 	type SessionEntry,
 	type SessionMessageEntry,
 	type ThinkingLevelChangeEntry,
@@ -60,12 +61,17 @@ function modelChange(id: string, parentId: string | null, provider: string, mode
 	return { type: "model_change", id, parentId, timestamp: "2025-01-01T00:00:00Z", provider, modelId };
 }
 
+function serviceTier(id: string, parentId: string | null, tier: "default" | "priority"): ServiceTierChangeEntry {
+	return { type: "service_tier_change", id, parentId, timestamp: "2025-01-01T00:00:00Z", serviceTier: tier };
+}
+
 describe("buildSessionContext", () => {
 	describe("trivial cases", () => {
 		it("empty entries returns empty context", () => {
 			const ctx = buildSessionContext([]);
 			expect(ctx.messages).toEqual([]);
 			expect(ctx.thinkingLevel).toBe("off");
+			expect(ctx.serviceTier).toBe("default");
 			expect(ctx.model).toBeNull();
 		});
 
@@ -97,6 +103,18 @@ describe("buildSessionContext", () => {
 			const ctx = buildSessionContext(entries);
 			expect(ctx.thinkingLevel).toBe("high");
 			expect(ctx.messages).toHaveLength(2);
+		});
+
+		it("tracks service tier changes on the active branch", () => {
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "hello"),
+				serviceTier("2", "1", "priority"),
+				msg("3", "2", "assistant", "fast response"),
+				serviceTier("4", "1", "default"),
+			];
+
+			expect(buildSessionContext(entries, "3").serviceTier).toBe("priority");
+			expect(buildSessionContext(entries, "4").serviceTier).toBe("default");
 		});
 
 		it("tracks model from assistant message", () => {

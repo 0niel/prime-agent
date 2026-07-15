@@ -68,6 +68,8 @@ export type CacheRetention = "none" | "short" | "long";
 
 export type Transport = "sse" | "websocket" | "websocket-cached" | "auto";
 
+export type ServiceTier = "auto" | "default" | "flex" | "scale" | "priority" | null;
+
 export interface ProviderResponse {
 	status: number;
 	headers: Record<string, string>;
@@ -83,6 +85,7 @@ export interface StreamOptions {
 	 * Providers that do not support this option ignore it.
 	 */
 	transport?: Transport;
+	serviceTier?: ServiceTier;
 	/**
 	 * Prompt cache retention preference. Providers map this to their supported values.
 	 * Default: "short".

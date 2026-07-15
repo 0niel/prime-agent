@@ -30,6 +30,7 @@ export function createAgentConnectionState(
 		cwd: sessionManager.getCwd(),
 		model: toConnectionModel(session.model),
 		thinkingLevel: session.thinkingLevel,
+		serviceTier: session.serviceTier,
 		availableThinkingLevels: session.getAvailableThinkingLevels(),
 		isStreaming: session.isStreaming,
 		isCompacting: session.isCompacting,

@@ -1,4 +1,4 @@
-import type { Transport } from "@earendil-works/pi-ai";
+import type { ServiceTier, Transport } from "@earendil-works/pi-ai";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
@@ -126,6 +126,7 @@ export interface Settings {
 	defaultModel?: string;
 	recentModels?: string[]; // "provider/id" keys, most-recently-used first
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	defaultServiceTier?: ServiceTier;
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
@@ -718,6 +719,16 @@ export class SettingsManager {
 	setDefaultThinkingLevel(level: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"): void {
 		this.globalSettings.defaultThinkingLevel = level;
 		this.markModified("defaultThinkingLevel");
+		this.save();
+	}
+
+	getDefaultServiceTier(): ServiceTier {
+		return this.settings.defaultServiceTier ?? "default";
+	}
+
+	setDefaultServiceTier(serviceTier: ServiceTier): void {
+		this.globalSettings.defaultServiceTier = serviceTier;
+		this.markModified("defaultServiceTier");
 		this.save();
 	}
 

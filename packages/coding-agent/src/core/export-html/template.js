@@ -357,6 +357,10 @@
           case 'thinking_level_change':
             parts.push('thinking', entry.thinkingLevel);
             break;
+          case 'service_tier_change':
+            parts.push('service tier', entry.serviceTier || 'default');
+            if (entry.serviceTier === 'priority') parts.push('fast on');
+            break;
         }
 
         return parts.join(' ').toLowerCase();
@@ -385,7 +389,13 @@
           }
 
           // Apply filter mode
-          const isSettingsEntry = ['label', 'custom', 'model_change', 'thinking_level_change'].includes(entry.type);
+          const isSettingsEntry = [
+            'label',
+            'custom',
+            'model_change',
+            'thinking_level_change',
+            'service_tier_change'
+          ].includes(entry.type);
           let passesFilter = true;
 
           switch (filterMode) {
@@ -681,6 +691,8 @@
             return labelHtml + `<span class="tree-muted">[model: ${escapeHtml(entry.modelId)}]</span>`;
           case 'thinking_level_change':
             return labelHtml + `<span class="tree-muted">[thinking: ${escapeHtml(entry.thinkingLevel)}]</span>`;
+          case 'service_tier_change':
+            return labelHtml + `<span class="tree-muted">[service tier: ${escapeHtml(entry.serviceTier || 'default')}]</span>`;
           default:
             return labelHtml + `<span class="tree-muted">[${escapeHtml(entry.type)}]</span>`;
         }

@@ -4,11 +4,13 @@ import { getDaemonLogPath } from "../../config.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import {
 	createDaemonCommandEnvelope,
+	DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
 	DAEMON_PROTOCOL_VERSION,
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonCommandEnvelope,
 	type DaemonOutbound,
+	type DaemonProtocolVersion,
 	type DaemonRequestProgress,
 	type DaemonResponse,
 	type DaemonSavedSessionInfo,
@@ -275,7 +277,13 @@ export class DaemonClient {
 			);
 		}
 		const hello = this.helloMessage ?? (await this.waitForHello());
-		return this.requestWire(command, timeoutMs, options, hello.protocol.version >= DAEMON_PROTOCOL_VERSION);
+		const envelopeProtocolVersion = Math.min(hello.protocol.version, DAEMON_PROTOCOL_VERSION);
+		return this.requestWire(
+			command,
+			timeoutMs,
+			options,
+			envelopeProtocolVersion >= DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION ? envelopeProtocolVersion : undefined,
+		);
 	}
 
 	/** One-release compatibility path for preparing and stopping a v1 daemon. */
@@ -284,26 +292,26 @@ export class DaemonClient {
 		timeoutMs = 30000,
 		options: DaemonClientRequestOptions = {},
 	): Promise<DaemonResponse> {
-		return this.requestWire(command, timeoutMs, options, false);
+		return this.requestWire(command, timeoutMs, options);
 	}
 
 	async authenticateWorker(token: string, timeoutMs = 3000): Promise<void> {
 		const legacyAuthentication = { type: "worker_auth", token } as DaemonWorkerCommandBody;
-		const response = await this.requestWire(legacyAuthentication, timeoutMs, {}, false);
+		const response = await this.requestWire(legacyAuthentication, timeoutMs);
 		if (!response.success) {
 			throw new Error(response.error);
 		}
 	}
 
 	async requestWorker(command: DaemonWorkerCommandBody, timeoutMs = 30000): Promise<DaemonResponse> {
-		return this.requestWire(command, timeoutMs, {}, false);
+		return this.requestWire(command, timeoutMs);
 	}
 
 	private async requestWire(
 		command: DaemonWireCommandBody,
 		timeoutMs: number,
 		options: DaemonClientRequestOptions = {},
-		usePublicEnvelope: boolean,
+		publicEnvelopeProtocolVersion?: DaemonProtocolVersion,
 	): Promise<DaemonResponse> {
 		if (!this.socket || this.socket.destroyed) {
 			throw new Error(
@@ -313,11 +321,17 @@ export class DaemonClient {
 
 		const id = `daemon_${++this.requestId}`;
 		const fullCommand = { ...command, id } as DaemonCommand | DaemonWorkerCommand;
-		const wireCommand: DaemonCommand | DaemonWorkerCommand | DaemonCommandEnvelope = usePublicEnvelope
-			? createDaemonCommandEnvelope(fullCommand as DaemonCommand, id, this.protocolClientId)
+		const wireCommand: DaemonCommand | DaemonWorkerCommand | DaemonCommandEnvelope = publicEnvelopeProtocolVersion
+			? createDaemonCommandEnvelope(
+					fullCommand as DaemonCommand,
+					id,
+					this.protocolClientId,
+					publicEnvelopeProtocolVersion,
+				)
 			: fullCommand;
 		const wireData = serializeJsonLine(wireCommand);
-		const acknowledgeResult = usePublicEnvelope && isDaemonMutatingCommand(fullCommand as DaemonCommand);
+		const acknowledgeResult =
+			publicEnvelopeProtocolVersion !== undefined && isDaemonMutatingCommand(fullCommand as DaemonCommand);
 
 		return new Promise((resolve, reject) => {
 			const pending: PendingDaemonRequest = {
@@ -429,12 +443,21 @@ export class DaemonClient {
 	}
 
 	private acknowledgeCommandResult(commandId: string): void {
-		if (!this.socket || this.socket.destroyed || (this.helloMessage?.protocol.version ?? 0) < 2) {
+		const hello = this.helloMessage;
+		if (
+			!this.socket ||
+			this.socket.destroyed ||
+			!hello ||
+			hello.protocol.version < DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION
+		) {
 			return;
 		}
 		const id = `daemon_ack_${++this.requestId}`;
 		const command: DaemonCommand = { id, type: "ack_result", commandId };
-		this.socket.write(serializeJsonLine(createDaemonCommandEnvelope(command, id, this.protocolClientId)));
+		const protocolVersion = Math.min(hello.protocol.version, DAEMON_PROTOCOL_VERSION);
+		this.socket.write(
+			serializeJsonLine(createDaemonCommandEnvelope(command, id, this.protocolClientId, protocolVersion)),
+		);
 	}
 
 	private rejectAll(error: Error, preservePendingRequests = false): void {

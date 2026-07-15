@@ -751,6 +751,7 @@ export function resolveRuntimeSessionOptions(
 	return {
 		model: runtimeSessionOptions?.model ?? sessionOptions.model,
 		thinkingLevel: runtimeSessionOptions?.thinkingLevel ?? sessionOptions.thinkingLevel,
+		serviceTier: runtimeSessionOptions?.serviceTier ?? sessionOptions.serviceTier,
 		scopedModels: runtimeSessionOptions?.scopedModels ?? sessionOptions.scopedModels,
 		tools: runtimeSessionOptions?.tools ?? sessionOptions.tools,
 		noTools: runtimeSessionOptions?.noTools ?? sessionOptions.noTools,

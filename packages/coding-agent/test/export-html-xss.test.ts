@@ -46,11 +46,13 @@ describe("export HTML markdown link sanitization", () => {
 		expect(templateJs).not.toMatch(/\[\$\{msg\.role\}\]/);
 		expect(templateJs).not.toMatch(/\[model: \$\{entry\.modelId\}\]/);
 		expect(templateJs).not.toMatch(/\[thinking: \$\{entry\.thinkingLevel\}\]/);
+		expect(templateJs).not.toMatch(/\[service tier: \$\{entry\.serviceTier\}\]/);
 		expect(templateJs).not.toMatch(/\[\$\{entry\.type\}\]/);
 		expect(templateJs).toMatch(/\$\{escapeHtml\(msg\.toolName \|\| 'tool'\)\}/);
 		expect(templateJs).toMatch(/\$\{escapeHtml\(msg\.role\)\}/);
 		expect(templateJs).toMatch(/\$\{escapeHtml\(entry\.modelId\)\}/);
 		expect(templateJs).toMatch(/\$\{escapeHtml\(entry\.thinkingLevel\)\}/);
+		expect(templateJs).toMatch(/\$\{escapeHtml\(entry\.serviceTier \|\| 'default'\)\}/);
 		expect(templateJs).toMatch(/\$\{escapeHtml\(entry\.type\)\}/);
 	});
 

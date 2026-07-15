@@ -29,7 +29,15 @@ import {
 	type ShouldStopAfterTurnContext,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, ImageContent, Model, TextContent, Usage, UserMessage } from "@earendil-works/pi-ai";
+import type {
+	AssistantMessage,
+	ImageContent,
+	Model,
+	ServiceTier,
+	TextContent,
+	Usage,
+	UserMessage,
+} from "@earendil-works/pi-ai";
 import {
 	clampThinkingLevel,
 	cleanupSessionResources,
@@ -37,6 +45,7 @@ import {
 	isContextOverflow,
 	modelsAreEqual,
 	resetApiProviders,
+	supportsFastMode,
 } from "@earendil-works/pi-ai";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
@@ -262,6 +271,7 @@ export type AgentSessionEvent =
 	| { type: "compaction_start"; reason: CompactionReason; customInstructions?: string }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	| { type: "service_tier_changed"; serviceTier: ServiceTier }
 	| {
 			type: "compaction_end";
 			reason: CompactionReason;
@@ -314,6 +324,7 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
+	serviceTierPreference?: ServiceTier;
 	cwd: string;
 	/** Config dir backing credentials (auth.json); exported to the kernel for skills. */
 	agentDir?: string;
@@ -615,6 +626,7 @@ interface AgentMessageDeliveryWaiter {
 export interface ModelCycleResult {
 	model: Model<any>;
 	thinkingLevel: ThinkingLevel;
+	serviceTier: ServiceTier;
 	/** Whether cycling through scoped models (--models flag) or all available */
 	isScoped: boolean;
 }
@@ -753,6 +765,7 @@ export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
+	private _serviceTierPreference: ServiceTier;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -898,6 +911,7 @@ export class AgentSession {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
+		this._serviceTierPreference = config.serviceTierPreference ?? config.agent.state.serviceTier;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
@@ -2605,6 +2619,10 @@ export class AgentSession {
 		return this.agent.state.thinkingLevel;
 	}
 
+	get serviceTier(): ServiceTier {
+		return this.agent.state.serviceTier;
+	}
+
 	/** Whether agent is currently streaming a response */
 	get isStreaming(): boolean {
 		return this.agent.state.isStreaming;
@@ -4116,12 +4134,14 @@ export class AgentSession {
 
 		const previousModel = this.model;
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+		const serviceTier = this._getServiceTierForModelSwitch();
 		this.agent.state.model = model;
 		this.sessionManager.appendModelChange(model.provider, model.id);
 		this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
 
 		// Re-clamp thinking level for new model's capabilities
 		this.setThinkingLevel(thinkingLevel);
+		this._clampServiceTierForModel(serviceTier);
 
 		const emitPromise = this._queueModelSelectEmit(model, previousModel, "set");
 		if (this._shouldWaitForModelSelectEmit(options)) {
@@ -4187,6 +4207,7 @@ export class AgentSession {
 		const nextIndex = direction === "forward" ? (currentIndex + 1) % len : (currentIndex - 1 + len) % len;
 		const next = scopedModels[nextIndex];
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.thinkingLevel);
+		const serviceTier = this._getServiceTierForModelSwitch();
 
 		// Apply model
 		this.agent.state.model = next.model;
@@ -4198,6 +4219,7 @@ export class AgentSession {
 		// - Undefined scoped model thinking level inherits the current session preference
 		// setThinkingLevel clamps to model capabilities.
 		this.setThinkingLevel(thinkingLevel);
+		this._clampServiceTierForModel(serviceTier);
 
 		const emitPromise = this._queueModelSelectEmit(next.model, currentModel, "cycle");
 		if (this._shouldWaitForModelSelectEmit(options)) {
@@ -4206,7 +4228,7 @@ export class AgentSession {
 			this._trackModelSelectEmitError(emitPromise);
 		}
 
-		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
+		return { model: next.model, thinkingLevel: this.thinkingLevel, serviceTier: this.serviceTier, isScoped: true };
 	}
 
 	private async _cycleAvailableModel(
@@ -4225,12 +4247,14 @@ export class AgentSession {
 		const nextModel = availableModels[nextIndex];
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch();
+		const serviceTier = this._getServiceTierForModelSwitch();
 		this.agent.state.model = nextModel;
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
 
 		// Re-clamp thinking level for new model's capabilities
 		this.setThinkingLevel(thinkingLevel);
+		this._clampServiceTierForModel(serviceTier);
 
 		const emitPromise = this._queueModelSelectEmit(nextModel, currentModel, "cycle");
 		if (this._shouldWaitForModelSelectEmit(options)) {
@@ -4239,7 +4263,7 @@ export class AgentSession {
 			this._trackModelSelectEmitError(emitPromise);
 		}
 
-		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
+		return { model: nextModel, thinkingLevel: this.thinkingLevel, serviceTier: this.serviceTier, isScoped: false };
 	}
 
 	// =========================================================================
@@ -4273,6 +4297,43 @@ export class AgentSession {
 				previousLevel,
 			});
 		}
+	}
+
+	setServiceTier(serviceTier: ServiceTier): void {
+		const effectiveServiceTier = this._getEffectiveServiceTier(serviceTier);
+		const preferenceChanged = effectiveServiceTier !== this._serviceTierPreference;
+		const effectiveTierChanged = effectiveServiceTier !== this.agent.state.serviceTier;
+		if (!preferenceChanged && !effectiveTierChanged) {
+			return;
+		}
+		this._serviceTierPreference = effectiveServiceTier;
+		if (preferenceChanged) {
+			this.sessionManager.appendServiceTierChange(effectiveServiceTier);
+			if (this.model && supportsFastMode(this.model)) {
+				this.settingsManager.setDefaultServiceTier(effectiveServiceTier);
+			}
+		}
+		if (effectiveTierChanged) {
+			this.agent.state.serviceTier = effectiveServiceTier;
+			this._emit({ type: "service_tier_changed", serviceTier: effectiveServiceTier });
+		}
+	}
+
+	private _getEffectiveServiceTier(serviceTier: ServiceTier): ServiceTier {
+		return serviceTier === "priority" && (!this.model || !supportsFastMode(this.model)) ? "default" : serviceTier;
+	}
+
+	private _getServiceTierForModelSwitch(): ServiceTier {
+		return this._serviceTierPreference;
+	}
+
+	private _clampServiceTierForModel(serviceTier: ServiceTier = this.serviceTier): void {
+		const effectiveServiceTier = this._getEffectiveServiceTier(serviceTier);
+		if (effectiveServiceTier === this.agent.state.serviceTier) {
+			return;
+		}
+		this.agent.state.serviceTier = effectiveServiceTier;
+		this._emit({ type: "service_tier_changed", serviceTier: effectiveServiceTier });
 	}
 
 	/**
@@ -6047,6 +6108,7 @@ export class AgentSession {
 			sessionDir: options.sessionDir,
 			model: options.model,
 			thinkingLevel: this.thinkingLevel,
+			serviceTier: this.serviceTier,
 			scopedModels: [...this._scopedModels],
 			activeToolNames: this.getActiveToolNames(),
 			allowedToolNames: this._allowedToolNames ? [...this._allowedToolNames] : undefined,
@@ -6097,12 +6159,16 @@ export class AgentSession {
 		}
 		childSessionManager.appendModelChange(options.model.provider, options.model.id);
 		childSessionManager.appendThinkingLevelChange(options.thinkingLevel);
+		const serviceTier =
+			options.serviceTier === "priority" && !supportsFastMode(options.model) ? "default" : options.serviceTier;
+		childSessionManager.appendServiceTierChange(serviceTier);
 
 		const childAgent = new Agent({
 			initialState: {
 				systemPrompt: "",
 				model: options.model,
 				thinkingLevel: options.thinkingLevel,
+				serviceTier,
 				tools: [],
 			},
 			convertToLlm: this.agent.convertToLlm,

@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, type Message, type Model, streamSimple, supportsFastMode } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import type { AgentSessionCreationOptions } from "./agent-session-services.js";
@@ -187,6 +187,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
+	const hasServiceTierEntry = sessionManager.getBranch().some((entry) => entry.type === "service_tier_change");
 
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
@@ -241,6 +242,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
 	}
 
+	const serviceTierPreference =
+		options.serviceTier ??
+		(hasServiceTierEntry ? existingSession.serviceTier : settingsManager.getDefaultServiceTier());
+	const serviceTier =
+		serviceTierPreference === "priority" && (!model || !supportsFastMode(model)) ? "default" : serviceTierPreference;
+
 	const allowedToolNames = options.allowedToolNames ?? options.tools ?? (options.noTools === "all" ? [] : undefined);
 	const includeGoals = options.includeGoals ?? (options.tools !== undefined || options.noTools !== "all");
 	const initialActiveToolNames: string[] =
@@ -292,6 +299,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			systemPrompt: "",
 			model,
 			thinkingLevel,
+			serviceTier,
 			tools: [],
 		},
 		convertToLlm: convertToLlmWithBlockImages,
@@ -348,17 +356,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
 	} else {
-		// Save initial model and thinking level for new sessions so they can be restored on resume
+		// Save initial configuration for new sessions so it can be restored on resume.
 		if (model) {
 			sessionManager.appendModelChange(model.provider, model.id);
 		}
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
+	}
+	if (!hasServiceTierEntry) {
+		sessionManager.appendServiceTierChange(serviceTierPreference);
 	}
 
 	const session = new AgentSession({
 		agent,
 		sessionManager,
 		settingsManager,
+		serviceTierPreference,
 		cwd,
 		// Only the explicit dir — the default may not match injected custom storage.
 		agentDir: options.agentDir,

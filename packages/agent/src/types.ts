@@ -4,6 +4,7 @@ import type {
 	ImageContent,
 	Message,
 	Model,
+	ServiceTier,
 	SimpleStreamOptions,
 	streamSimple,
 	TextContent,
@@ -309,6 +310,8 @@ export interface AgentState {
 	model: Model<any>;
 	/** Requested reasoning level for future turns. */
 	thinkingLevel: ThinkingLevel;
+	/** Requested provider service tier for future turns. */
+	serviceTier: ServiceTier;
 	/** Available tools. Assigning a new array copies the top-level array. */
 	set tools(tools: AgentTool<any>[]);
 	get tools(): AgentTool<any>[];

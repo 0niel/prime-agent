@@ -1,5 +1,5 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent, TextContent, Transport } from "@earendil-works/pi-ai";
+import type { ImageContent, ServiceTier, TextContent, Transport } from "@earendil-works/pi-ai";
 import type {
 	AgentSessionMessageDeliveryMode,
 	AgentSessionMessageReceipt,
@@ -37,10 +37,11 @@ import type { SessionSummary } from "./daemon-session-list.js";
  */
 
 export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
-export const DAEMON_PROTOCOL_VERSION = 2;
+export const DAEMON_PROTOCOL_VERSION = 3;
+export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 2;
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
-export type DaemonProtocolVersion = typeof DAEMON_PROTOCOL_VERSION;
+export type DaemonProtocolVersion = number;
 export type DaemonCommandId = string;
 export type DaemonEventId = string;
 export type DaemonEventSequence = number;
@@ -388,6 +389,7 @@ export type DaemonCommand =
 	| { id?: string; type: "cycle_model"; activeSessionId: string; direction?: "forward" | "backward" }
 	| { id?: string; type: "set_scoped_models"; activeSessionId: string; scopedModels: AgentConnectionScopedModel[] }
 	| { id?: string; type: "set_thinking_level"; activeSessionId: string; level: ThinkingLevel }
+	| { id?: string; type: "set_service_tier"; activeSessionId: string; serviceTier: ServiceTier }
 	| { id?: string; type: "cycle_thinking_level"; activeSessionId: string }
 	| { id?: string; type: "set_transport"; activeSessionId: string; transport: Transport }
 	| { id?: string; type: "set_steering_mode"; activeSessionId: string; mode: AgentConnectionQueueMode }
@@ -623,11 +625,12 @@ export function createDaemonCommandEnvelope<TCommand extends DaemonCommand>(
 	command: TCommand,
 	id: DaemonCommandId,
 	clientId?: DaemonClientId,
+	protocolVersion: DaemonProtocolVersion = DAEMON_PROTOCOL_VERSION,
 ): DaemonCommandEnvelope<TCommand> {
 	return {
 		type: "command",
 		id,
-		protocol: DAEMON_PROTOCOL_INFO,
+		protocol: { name: DAEMON_PROTOCOL_NAME, version: protocolVersion },
 		...(clientId ? { clientId } : {}),
 		command,
 	};
@@ -648,7 +651,9 @@ export function isDaemonCommandEnvelope(value: unknown): value is DaemonCommandE
 		candidate.type === "command" &&
 		typeof candidate.id === "string" &&
 		candidate.protocol?.name === DAEMON_PROTOCOL_NAME &&
-		candidate.protocol.version === DAEMON_PROTOCOL_VERSION &&
+		typeof candidate.protocol.version === "number" &&
+		candidate.protocol.version >= DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION &&
+		candidate.protocol.version <= DAEMON_PROTOCOL_VERSION &&
 		(candidate.clientId === undefined || typeof candidate.clientId === "string") &&
 		typeof candidate.command === "object" &&
 		candidate.command !== null

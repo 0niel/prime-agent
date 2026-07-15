@@ -71,6 +71,7 @@ describe("Agent", () => {
 		expect(agent.state.systemPrompt).toBe("");
 		expect(agent.state.model).toBeDefined();
 		expect(agent.state.thinkingLevel).toBe("off");
+		expect(agent.state.serviceTier).toBe("default");
 		expect(agent.state.tools).toEqual([]);
 		expect(agent.state.messages).toEqual([]);
 		expect(agent.state.isStreaming).toBe(false);
@@ -86,12 +87,14 @@ describe("Agent", () => {
 				systemPrompt: "You are a helpful assistant.",
 				model: customModel,
 				thinkingLevel: "low",
+				serviceTier: "priority",
 			},
 		});
 
 		expect(agent.state.systemPrompt).toBe("You are a helpful assistant.");
 		expect(agent.state.model).toBe(customModel);
 		expect(agent.state.thinkingLevel).toBe("low");
+		expect(agent.state.serviceTier).toBe("priority");
 	});
 
 	it("should subscribe to events", () => {
@@ -679,5 +682,23 @@ describe("Agent", () => {
 
 		await agent.prompt("hello again");
 		expect(receivedSessionId).toBe("session-def");
+	});
+
+	it("forwards the service tier to streamFn options", async () => {
+		let receivedServiceTier: string | null | undefined;
+		const agent = new Agent({
+			initialState: { serviceTier: "priority" },
+			streamFn: (_model, _context, options) => {
+				receivedServiceTier = options?.serviceTier;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("ok") });
+				});
+				return stream;
+			},
+		});
+
+		await agent.prompt("hello");
+		expect(receivedServiceTier).toBe("priority");
 	});
 });

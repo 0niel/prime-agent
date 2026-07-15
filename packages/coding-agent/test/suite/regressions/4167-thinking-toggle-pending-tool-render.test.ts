@@ -141,6 +141,7 @@ function createSessionContext(messages: AgentMessage[]): AgentConnectionSessionC
 	return {
 		messages,
 		thinkingLevel: "off",
+		serviceTier: "default",
 		model: null,
 	};
 }

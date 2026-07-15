@@ -566,8 +566,10 @@ describe("openai-codex streaming", () => {
 	it.each([
 		["gpt-5.1-codex", "flex", 0.5],
 		["gpt-5.1-codex", "priority", 2],
+		["gpt-5.4", "priority", 2],
 		["gpt-5.5", "flex", 0.5],
 		["gpt-5.5", "priority", 2.5],
+		["gpt-5.6-sol", "priority", 2.5],
 	] as const)(
 		"uses the client-sent %s service tier for %s when Codex echoes default",
 		async (modelId, serviceTier, multiplier) => {
@@ -614,7 +616,7 @@ describe("openai-codex streaming", () => {
 				},
 			});
 
-			global.fetch = vi.fn(async (input: string | URL) => {
+			global.fetch = vi.fn(async (input: string | URL, init?: RequestInit) => {
 				const url = typeof input === "string" ? input : input.toString();
 				if (url === "https://api.github.com/repos/openai/codex/releases/latest") {
 					return new Response(JSON.stringify({ tag_name: "rust-v0.0.0" }), { status: 200 });
@@ -623,6 +625,8 @@ describe("openai-codex streaming", () => {
 					return new Response("PROMPT", { status: 200, headers: { etag: '"etag"' } });
 				}
 				if (url === "https://chatgpt.com/backend-api/codex/responses") {
+					const body = JSON.parse(String(init?.body)) as { service_tier?: string };
+					expect(body.service_tier).toBe(serviceTier);
 					return new Response(stream, {
 						status: 200,
 						headers: { "content-type": "text/event-stream" },

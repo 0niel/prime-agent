@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added provider service-tier forwarding to shared stream options.
 - Removed team-gated internal Prime Inference routes from the public model catalog so clients can discover them from authenticated team catalogs instead.
 
 ## [0.3.0] - 2026-07-13

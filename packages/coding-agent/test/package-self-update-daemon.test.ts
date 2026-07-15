@@ -10,6 +10,7 @@ import {
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 } from "../src/config.js";
 import type { AgentSessionRuntimeMetadata } from "../src/core/agent-session-runtime.js";
+import { DAEMON_PROTOCOL_VERSION } from "../src/modes/daemon/daemon-protocol.js";
 import type * as DaemonSocketModule from "../src/modes/daemon/daemon-socket.js";
 import { handlePackageCommand, prepareDaemonUpdateRestart } from "../src/package-manager-cli.js";
 
@@ -91,7 +92,7 @@ const mockState = vi.hoisted(() => ({
 	createThrowSessionPaths: [] as string[],
 	daemonProbe: { reachable: true, activeSessions: [] } as MockRunningDaemonProbe,
 	globalPackageRoot: "",
-	hello: { protocol: { version: 2 } } as {
+	hello: { protocol: { version: 0 } } as {
 		protocol: { version: number };
 		supervisorGeneration?: string;
 		supervisorOwnerToken?: string;
@@ -114,7 +115,7 @@ const mockState = vi.hoisted(() => ({
 
 function useFixedOwnerHello(): void {
 	mockState.hello = {
-		protocol: { version: 2 },
+		protocol: { version: DAEMON_PROTOCOL_VERSION },
 		supervisorGeneration: "fixed-owner",
 		supervisorOwnerToken: "owner-token",
 		supervisorPid: process.pid,
@@ -259,7 +260,7 @@ describe("self-update daemon restart", () => {
 		projectDir = join(tempDir, "project");
 		packageDir = join(tempDir, "global-prefix", "lib", "node_modules", PACKAGE_NAME);
 		mockState.globalPackageRoot = join(tempDir, "global-prefix", "lib", "node_modules");
-		mockState.hello = { protocol: { version: 2 } };
+		mockState.hello = { protocol: { version: DAEMON_PROTOCOL_VERSION } };
 		mockState.listResponse = undefined;
 		mockState.socketPath = join(tempDir, "daemon.sock");
 		mockState.calls = [];

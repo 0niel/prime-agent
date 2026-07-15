@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
+import { DAEMON_PROTOCOL_VERSION } from "../src/modes/daemon/daemon-protocol.js";
 
 const netMock = vi.hoisted(() => {
 	type Listener = (...args: unknown[]) => void;
@@ -85,7 +86,7 @@ vi.mock("node:net", () => ({
 	createConnection: netMock.createConnection,
 }));
 
-function emitHello(socket: (typeof netMock.sockets)[number], version = 2): void {
+function emitHello(socket: (typeof netMock.sockets)[number], version = DAEMON_PROTOCOL_VERSION): void {
 	socket.emit(
 		"data",
 		`${JSON.stringify({
@@ -213,7 +214,7 @@ describe("DaemonClient", () => {
 		expect(envelope).toMatchObject({
 			type: "command",
 			clientId: expect.any(String),
-			protocol: { name: "prime-agent.daemon", version: 2 },
+			protocol: { name: "prime-agent.daemon", version: DAEMON_PROTOCOL_VERSION },
 			command: { type: "attach", activeSessionId: "active-1" },
 		});
 		expect(envelope.command).not.toHaveProperty("daemonSessionId");
@@ -307,6 +308,38 @@ describe("DaemonClient", () => {
 			`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true })}\n`,
 		);
 		await expect(response).resolves.toMatchObject({ success: true });
+		client.close();
+	});
+
+	it("keeps durable command envelopes when connected to a v2 daemon", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, 2);
+
+		const response = client.request({ type: "create" });
+		const request = JSON.parse(socket.writes[0]!.trim()) as {
+			id: string;
+			protocol: { version: number };
+		};
+		expect(request.protocol.version).toBe(2);
+
+		socket.emit(
+			"data",
+			`${JSON.stringify({ id: request.id, type: "response", command: "create", success: true })}\n`,
+		);
+		await response;
+
+		const acknowledgement = JSON.parse(socket.writes[1]!.trim()) as {
+			protocol: { version: number };
+			command: { type: string; commandId: string };
+		};
+		expect(acknowledgement).toMatchObject({
+			protocol: { version: 2 },
+			command: { type: "ack_result", commandId: request.id },
+		});
 		client.close();
 	});
 
@@ -468,7 +501,7 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
-	it("acknowledges durable mutating-command results on protocol v2", async () => {
+	it("acknowledges durable mutating-command results on the current protocol", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();
 		const socket = netMock.sockets[0]!;
@@ -639,7 +672,7 @@ describe("DaemonClient", () => {
 			`${JSON.stringify({
 				type: "daemon_hello",
 				socketPath: "/tmp/prime-agent.sock",
-				protocol: { name: "prime-agent.daemon", version: 2 },
+				protocol: { name: "prime-agent.daemon", version: DAEMON_PROTOCOL_VERSION },
 				clientId: "server-client-2",
 				serverCapabilities: [],
 			})}\n`,
@@ -721,7 +754,7 @@ describe("DaemonClient", () => {
 			`${JSON.stringify({
 				type: "daemon_hello",
 				socketPath: "/tmp/prime-agent.sock",
-				protocol: { name: "prime-agent.daemon", version: 2 },
+				protocol: { name: "prime-agent.daemon", version: DAEMON_PROTOCOL_VERSION },
 				clientId: "server-client-2",
 				serverCapabilities: [],
 			})}\n`,

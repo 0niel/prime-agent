@@ -45,6 +45,7 @@ export function startSideQuestion(
 			systemPrompt: parent.state.systemPrompt,
 			messages: structuredClone(parent.state.messages),
 			thinkingLevel: "off",
+			serviceTier: parent.state.serviceTier,
 			tools: [],
 		},
 		convertToLlm: parent.convertToLlm,

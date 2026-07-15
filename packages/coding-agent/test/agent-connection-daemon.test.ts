@@ -457,6 +457,7 @@ function createConnectionState(activeSessionId: string, sessionId: string): Agen
 		cwd: "/tmp/project",
 		model: undefined,
 		thinkingLevel: "medium",
+		serviceTier: "default",
 		availableThinkingLevels: ["minimal", "low", "medium", "high", "xhigh"],
 		isStreaming: false,
 		isCompacting: false,
@@ -539,6 +540,7 @@ function createAttachResult(
 							({
 								messages,
 								thinkingLevel: state.thinkingLevel,
+								serviceTier: state.serviceTier,
 								model: state.model ? { provider: state.model.provider, modelId: state.model.id } : null,
 							} satisfies NonNullable<DaemonAttachResult["snapshot"]["sessionContext"]>),
 					}),
@@ -1116,6 +1118,7 @@ describe("DaemonAgentConnection", () => {
 				sessionContext: {
 					messages,
 					thinkingLevel: "medium",
+					serviceTier: "default",
 					model: null,
 				},
 				sessionTree: {
@@ -1598,6 +1601,7 @@ describe("DaemonAgentConnection", () => {
 				sessionContext: {
 					messages: reconnectedMessages,
 					thinkingLevel: "medium",
+					serviceTier: "default",
 					model: null,
 				},
 				replay: {

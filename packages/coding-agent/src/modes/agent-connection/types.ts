@@ -1,5 +1,5 @@
 import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Api, ImageContent, Model, TextContent, Transport, Usage } from "@earendil-works/pi-ai";
+import type { Api, ImageContent, Model, ServiceTier, TextContent, Transport, Usage } from "@earendil-works/pi-ai";
 import type { AuthSourceToken } from "../../core/auth-storage.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
@@ -122,6 +122,11 @@ export interface AgentConnectionThinkingLevelChangeEntry extends AgentConnection
 	thinkingLevel: string;
 }
 
+export interface AgentConnectionServiceTierChangeEntry extends AgentConnectionSessionEntryBase {
+	type: "service_tier_change";
+	serviceTier: ServiceTier;
+}
+
 export interface AgentConnectionModelChangeEntry extends AgentConnectionSessionEntryBase {
 	type: "model_change";
 	provider: string;
@@ -199,6 +204,7 @@ export interface AgentConnectionGitStateEntry extends AgentConnectionSessionEntr
 export type AgentConnectionSessionEntry =
 	| AgentConnectionSessionMessageEntry
 	| AgentConnectionThinkingLevelChangeEntry
+	| AgentConnectionServiceTierChangeEntry
 	| AgentConnectionModelChangeEntry
 	| AgentConnectionCompactionEntry
 	| AgentConnectionBranchSummaryEntry
@@ -221,6 +227,7 @@ export interface AgentConnectionSessionTreeNode {
 export interface AgentConnectionSessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
+	serviceTier: ServiceTier;
 	model: { provider: string; modelId: string } | null;
 }
 
@@ -270,6 +277,7 @@ export interface AgentConnectionScopedModel {
 export interface AgentConnectionModelCycleResult {
 	model: AgentConnectionModel;
 	thinkingLevel: ThinkingLevel;
+	serviceTier: ServiceTier;
 	isScoped: boolean;
 }
 
@@ -278,6 +286,7 @@ export interface AgentConnectionState {
 	cwd: string;
 	model?: AgentConnectionModel;
 	thinkingLevel: ThinkingLevel;
+	serviceTier: ServiceTier;
 	availableThinkingLevels: ThinkingLevel[];
 	isStreaming: boolean;
 	isCompacting: boolean;
@@ -488,6 +497,7 @@ export type AgentConnectionSessionEvent =
 	  }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	| { type: "service_tier_changed"; serviceTier: ServiceTier }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow" | "requested";
@@ -591,6 +601,7 @@ export interface AgentConnection {
 	cycleModel(direction?: "forward" | "backward"): Promise<AgentConnectionModelCycleResult | undefined>;
 	setScopedModels(scopedModels: AgentConnectionScopedModel[]): Promise<void>;
 	setThinkingLevel(level: ThinkingLevel): Promise<void>;
+	setServiceTier(serviceTier: ServiceTier): Promise<void>;
 	cycleThinkingLevel(): Promise<ThinkingLevel | undefined>;
 	setTransport(transport: Transport): Promise<void>;
 	setSteeringMode(mode: AgentConnectionQueueMode): Promise<void>;

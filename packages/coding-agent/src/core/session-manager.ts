@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, TextContent, Usage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, ImageContent, Message, ServiceTier, TextContent, Usage } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
@@ -41,6 +41,7 @@ const CONTENT_ENTRY_TYPES = new Set([
 	"custom",
 	"model_change",
 	"thinking_level_change",
+	"service_tier_change",
 	"session_info",
 	"label",
 	"compaction",
@@ -81,6 +82,11 @@ type AssistantSessionMessageEntry = SessionMessageEntry & { message: AssistantMe
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
 	type: "thinking_level_change";
 	thinkingLevel: string;
+}
+
+export interface ServiceTierChangeEntry extends SessionEntryBase {
+	type: "service_tier_change";
+	serviceTier: ServiceTier;
 }
 
 export interface ModelChangeEntry extends SessionEntryBase {
@@ -214,6 +220,7 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 export type SessionEntry =
 	| SessionMessageEntry
 	| ThinkingLevelChangeEntry
+	| ServiceTierChangeEntry
 	| ModelChangeEntry
 	| CompactionEntry
 	| BranchSummaryEntry
@@ -242,6 +249,7 @@ export interface SessionTreeNode {
 export interface SessionContext {
 	messages: AgentMessage[];
 	thinkingLevel: string;
+	serviceTier: ServiceTier;
 	model: { provider: string; modelId: string } | null;
 }
 
@@ -449,7 +457,7 @@ export function buildSessionContext(
 	let leaf: SessionEntry | undefined;
 	if (leafId === null) {
 		// Explicitly null - return no messages (navigated to before first entry)
-		return { messages: [], thinkingLevel: "off", model: null };
+		return { messages: [], thinkingLevel: "off", serviceTier: "default", model: null };
 	}
 	if (leafId) {
 		leaf = byId.get(leafId);
@@ -460,7 +468,7 @@ export function buildSessionContext(
 	}
 
 	if (!leaf) {
-		return { messages: [], thinkingLevel: "off", model: null };
+		return { messages: [], thinkingLevel: "off", serviceTier: "default", model: null };
 	}
 
 	// push+reverse, not unshift-per-entry: unshift is O(n), making this O(n^2) on long sessions.
@@ -474,12 +482,15 @@ export function buildSessionContext(
 
 	// Extract settings and find compaction
 	let thinkingLevel = "off";
+	let serviceTier: ServiceTier = "default";
 	let model: { provider: string; modelId: string } | null = null;
 	let compaction: CompactionEntry | null = null;
 
 	for (const entry of path) {
 		if (entry.type === "thinking_level_change") {
 			thinkingLevel = entry.thinkingLevel;
+		} else if (entry.type === "service_tier_change") {
+			serviceTier = entry.serviceTier;
 		} else if (entry.type === "model_change") {
 			model = { provider: entry.provider, modelId: entry.modelId };
 		} else if (entry.type === "message" && entry.message.role === "assistant") {
@@ -546,7 +557,7 @@ export function buildSessionContext(
 		}
 	}
 
-	return { messages, thinkingLevel, model };
+	return { messages, thinkingLevel, serviceTier, model };
 }
 
 /**
@@ -1321,6 +1332,19 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Append a service tier change as child of current leaf, then advance leaf. Returns entry id. */
+	appendServiceTierChange(serviceTier: ServiceTier): string {
+		const entry: ServiceTierChangeEntry = {
+			type: "service_tier_change",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			serviceTier,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
 	/** Append a model change as child of current leaf, then advance leaf. Returns entry id. */
 	appendModelChange(provider: string, modelId: string): string {
 		const entry: ModelChangeEntry = {
@@ -1458,8 +1482,8 @@ export class SessionManager {
 	 * delete (that guard always also requires zero messages).
 	 *
 	 * createAgentSession opens a new session with an optional leading `model_change`
-	 * (only when a model is available) followed by `thinking_level_change`. That
-	 * creation prefix is skipped; anything beyond it is user content.
+	 * followed by `thinking_level_change` and `service_tier_change`. That creation
+	 * prefix is skipped; anything beyond it is user content.
 	 */
 	hasUserContent(): boolean {
 		const contentEntries = this.getEntries().filter((entry) => CONTENT_ENTRY_TYPES.has(entry.type));
@@ -1468,6 +1492,9 @@ export class SessionManager {
 			start++;
 		}
 		if (contentEntries[start]?.type === "thinking_level_change") {
+			start++;
+		}
+		if (contentEntries[start]?.type === "service_tier_change") {
 			start++;
 		}
 		return contentEntries.length > start;

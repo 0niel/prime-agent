@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Transport } from "@earendil-works/pi-ai";
+import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
@@ -295,6 +295,10 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async setThinkingLevel(level: ThinkingLevel): Promise<void> {
 		this.session.setThinkingLevel(level);
+	}
+
+	async setServiceTier(serviceTier: ServiceTier): Promise<void> {
+		this.session.setServiceTier(serviceTier);
 	}
 
 	async cycleThinkingLevel(): Promise<ThinkingLevel | undefined> {
