@@ -295,6 +295,57 @@ describe("runtime session option resolution", () => {
 			rlmSessionDir: "/tmp/rlm-session",
 		});
 	});
+
+	test("deep-merges autonomous runtime session overrides", () => {
+		const resolved = resolveRuntimeSessionOptions(
+			{
+				autonomous: {
+					enabled: true,
+					maxTurns: 20,
+					gates: { commands: ["npm test"], maxRetries: 3 },
+				},
+			},
+			{
+				autonomous: {
+					maxContinuations: 5,
+					gates: { timeoutMs: 1000 },
+				},
+			},
+		);
+
+		expect(resolved.autonomous).toEqual({
+			enabled: true,
+			maxTurns: 20,
+			maxContinuations: 5,
+			gates: { commands: ["npm test"], maxRetries: 3, timeoutMs: 1000 },
+		});
+	});
+
+	test("disables autonomous mode for subagent runtime sessions", () => {
+		const resolved = resolveRuntimeSessionOptions(
+			{
+				autonomous: {
+					enabled: true,
+					maxTurns: 20,
+					gates: { commands: ["npm test"], maxRetries: 3 },
+				},
+			},
+			{
+				rlmDepth: 1,
+				autonomous: {
+					maxContinuations: 5,
+					gates: { timeoutMs: 1000 },
+				},
+			},
+		);
+
+		expect(resolved.autonomous).toEqual({
+			enabled: false,
+			maxTurns: 20,
+			maxContinuations: 5,
+			gates: { commands: ["npm test"], maxRetries: 3, timeoutMs: 1000 },
+		});
+	});
 });
 
 function makeSessionSummary(overrides: Partial<SessionSummary>): SessionSummary {

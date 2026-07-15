@@ -5,7 +5,7 @@ import { createHarness, type Harness } from "./harness.js";
 
 type SessionInternals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
-	_shouldStopAfterTurn: (context: ShouldStopAfterTurnContext) => boolean;
+	_shouldStopAfterTurn: (context: ShouldStopAfterTurnContext) => Promise<boolean>;
 	_createKernelHostHandlers: () => Record<string, unknown>;
 };
 
@@ -109,9 +109,9 @@ describe("AgentSession compact skill host requests", () => {
 		setStreaming(harness, false);
 
 		const internals = harness.session as unknown as SessionInternals;
-		expect(internals._shouldStopAfterTurn({ message: createAssistant(harness) } as ShouldStopAfterTurnContext)).toBe(
-			true,
-		);
+		await expect(
+			internals._shouldStopAfterTurn({ message: createAssistant(harness) } as ShouldStopAfterTurnContext),
+		).resolves.toBe(true);
 		await internals._checkCompaction(createAssistant(harness));
 
 		const compactionEntries = harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction");

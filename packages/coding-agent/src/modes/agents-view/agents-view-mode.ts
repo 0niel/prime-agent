@@ -19,6 +19,7 @@ import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSI
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
 import { findExactModelReferenceMatch } from "../../core/model-resolver.js";
+import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { SessionManager } from "../../core/session-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
@@ -40,11 +41,16 @@ import {
 	listDaemonSavedSessions,
 	renameDaemonSavedSession,
 } from "../daemon/saved-session-catalog.js";
-import { getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "../interactive/auth-flows.js";
+import {
+	type AuthenticationResult,
+	getAnthropicSubscriptionAuthWarning,
+	ProviderAuthFlows,
+} from "../interactive/auth-flows.js";
 import { showFullPaneOverlay } from "../interactive/components/centered-overlay.js";
+import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "../interactive/components/configuration-menu.js";
 import { CustomEditor } from "../interactive/components/custom-editor.js";
 import { keyText } from "../interactive/components/keybinding-hints.js";
-import { ModelSelectorComponent } from "../interactive/components/model-selector.js";
+import type { AuthSelectorProvider } from "../interactive/components/oauth-selector.js";
 import { SessionPickerScreen } from "../interactive/components/session-picker-screen.js";
 import { type SessionListCallbacks, SessionSelectorComponent } from "../interactive/components/session-selector.js";
 import { BrandSplashHeader, InteractiveMode } from "../interactive/interactive-mode.js";
@@ -113,6 +119,8 @@ export interface AgentsViewModeOptions {
 	initialImages?: ImageContent[];
 	initialMessages?: string[];
 	verbose?: boolean;
+	recoverDaemon?: () => Promise<void>;
+	reconnectTimeoutMs?: number;
 }
 
 type AgentsViewRunResult =
@@ -254,6 +262,8 @@ async function openAgentsViewSession(
 		try {
 			const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
 				closeClientOnDispose: true,
+				recoverDaemon: options.recoverDaemon,
+				reconnectTimeoutMs: options.reconnectTimeoutMs,
 			});
 			return { connection, summary };
 		} catch (error) {
@@ -281,6 +291,8 @@ async function openAgentsViewSession(
 		const activeSessionId = getRequiredActiveSessionId(createdSummary);
 		const connection = await DaemonAgentConnection.attach(client, activeSessionId, {
 			closeClientOnDispose: true,
+			recoverDaemon: options.recoverDaemon,
+			reconnectTimeoutMs: options.reconnectTimeoutMs,
 		});
 		return { connection, summary: createdSummary, cwdFallbackNotice: notice };
 	} catch (error) {
@@ -788,7 +800,7 @@ class AgentsViewMode implements Component, Focusable {
 
 	/** Sticky messages (e.g. billing warnings) stay until the user acknowledges them with any keypress. */
 	private clearStickyStatusMessage(): void {
-		if (!this.statusMessageSticky || this.daemonShutdownReceived) {
+		if (!this.statusMessageSticky || this.daemonShutdownReceived || this.reconnectPromise) {
 			return;
 		}
 		this.statusMessageSticky = false;
@@ -952,10 +964,17 @@ class AgentsViewMode implements Component, Focusable {
 	private async runSlashCommand(command: ParsedSlashCommand): Promise<void> {
 		switch (command.name as AgentsViewCommandName) {
 			case "login":
-				await this.createAuthFlows().runLogin();
+				await this.showConfigurationMenu("providers");
 				return;
 			case "logout":
 				await this.createAuthFlows().runLogout();
+				return;
+			case "mcp":
+				if (command.args) {
+					this.setStatusMessage("MCP subcommands are only available inside an agent session.");
+					return;
+				}
+				await this.showConfigurationMenu("mcp-connections");
 				return;
 			case "model": {
 				const searchTerm = command.args || undefined;
@@ -971,7 +990,7 @@ class AgentsViewMode implements Component, Focusable {
 						return;
 					}
 				}
-				await this.showModelSelector(searchTerm);
+				await this.showConfigurationMenu("models", searchTerm);
 				return;
 			}
 			case "resume":
@@ -1001,6 +1020,27 @@ class AgentsViewMode implements Component, Focusable {
 		});
 	}
 
+	private async applyPrimeInferenceFallbackAfterLogin(authResult: AuthenticationResult): Promise<void> {
+		const currentModel = this.getDefaultModelForNewAgents();
+		const action = resolvePrimeInferencePostLoginModelAction(
+			authResult,
+			currentModel,
+			this.options.uiServices.modelRegistry,
+		);
+		if (!action.openModelPicker) {
+			return;
+		}
+
+		if (action.fallbackModel) {
+			this.applyDefaultModel(action.fallbackModel);
+			await this.options.uiServices.settingsManager.flush();
+		} else if (!currentModel) {
+			this.setStatusMessage("Prime Inference login succeeded, but the default GLM 5.2 model is unavailable.", {
+				tone: "error",
+			});
+		}
+	}
+
 	private async maybeWarnAboutAnthropicSubscriptionAuth(model: Model<Api> | undefined): Promise<void> {
 		if (this.options.uiServices.settingsManager.getWarnings().anthropicExtraUsage === false) {
 			return;
@@ -1016,41 +1056,76 @@ class AgentsViewMode implements Component, Focusable {
 		this.setStatusMessage(warning, { tone: "warning", sticky: true });
 	}
 
-	private showModelSelector(initialSearchInput?: string): Promise<void> {
+	private showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
 		const modelRegistry = this.options.uiServices.modelRegistry;
-		const availableModels = modelRegistry.getAvailable();
-		if (availableModels.length === 0) {
-			this.setStatusMessage("No models available. Add credentials with /login.");
-			return Promise.resolve();
-		}
+		const authFlows = this.createAuthFlows();
 		return new Promise((resolve) => {
 			let handle: OverlayHandle | undefined;
-			const close = () => {
+			let settled = false;
+			let hidden = false;
+			let menu: ConfigurationMenuComponent;
+			const hide = () => {
+				if (hidden) return;
+				hidden = true;
 				handle?.hide();
 				this.ui.requestRender();
 			};
-			const selector = new ModelSelectorComponent(
-				this.ui,
-				this.getDefaultModelForNewAgents(),
+			const finish = () => {
+				if (settled) return;
+				settled = true;
+				hide();
+				resolve();
+			};
+			const restore = () => {
+				if (settled) return;
+				hidden = false;
+				handle?.setHidden(false);
+				handle?.focus();
+				this.ui.requestRender();
+			};
+			const authenticate = (provider: AuthSelectorProvider, tab: "providers" | "mcp-connections") => {
+				if (settled) return;
+				handle?.setHidden(true);
+				void authFlows
+					.loginProvider(provider)
+					.then(async (authResult) => {
+						if (settled) return;
+						restore();
+						menu.refreshAuthentication();
+						if (authResult.status !== "success" || tab === "mcp-connections") return;
+
+						await this.applyPrimeInferenceFallbackAfterLogin(authResult);
+						menu.updateModels(this.getDefaultModelForNewAgents(), modelRegistry.getAvailable());
+						menu.setActiveTab("models");
+					})
+					.catch((error) => {
+						restore();
+						this.setStatusMessage(error instanceof Error ? error.message : String(error), { tone: "error" });
+					});
+			};
+
+			menu = new ConfigurationMenuComponent({
+				initialTab,
+				tui: this.ui,
+				authStorage: modelRegistry.authStorage,
+				providerOptions: authFlows.getLoginProviderOptions(),
 				modelRegistry,
-				[],
-				(model) => {
-					close();
+				currentModel: this.getDefaultModelForNewAgents(),
+				scopedModels: [],
+				availableModels: modelRegistry.getAvailable(),
+				recentModels: this.options.uiServices.settingsManager.getRecentModels(),
+				initialModelSearch,
+				getRows: () => this.ui.terminal.rows,
+				requestRender: () => this.ui.requestRender(),
+				onSelectProvider: (provider) => authenticate(provider, "providers"),
+				onSelectMcpConnection: (provider) => authenticate(provider, "mcp-connections"),
+				onSelectModel: (model) => {
 					this.applyDefaultModel(model);
-					resolve();
+					finish();
 				},
-				() => {
-					close();
-					resolve();
-				},
-				initialSearchInput,
-				{
-					availableModels,
-					getRows: () => this.ui.terminal.rows,
-					recentModels: this.options.uiServices.settingsManager.getRecentModels(),
-				},
-			);
-			handle = showFullPaneOverlay(this.ui, selector, 96);
+				onCancel: finish,
+			});
+			handle = showFullPaneOverlay(this.ui, menu, 96);
 		});
 	}
 
@@ -1890,7 +1965,7 @@ class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		if (!this.reconnectTimedOut) {
-			this.setStatusMessage("Daemon restarted; reconnecting...", { sticky: true });
+			this.setStatusMessage("Daemon connection lost; reconnecting…", { tone: "warning", sticky: true });
 		}
 		const reconnectPromise = this.reconnectClient(client, error).finally(() => {
 			if (this.reconnectPromise === reconnectPromise) {
@@ -1901,17 +1976,18 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	private async reconnectClient(client: DaemonClient, initialError: unknown): Promise<void> {
-		const deadline = Date.now() + RECONNECT_TIMEOUT_MS;
+		const deadline = Date.now() + (this.options.reconnectTimeoutMs ?? RECONNECT_TIMEOUT_MS);
 		let lastError = initialError;
 		while (!this.stopped && !this.daemonShutdownReceived && client === this.client && Date.now() < deadline) {
 			try {
+				await this.options.recoverDaemon?.();
 				await client.reconnect(1000);
 				const response = await client.request(createAgentsViewListCommand());
 				const data = requireDaemonData(response);
 				const sessions = expectSessionList(data);
 				this.daemonShutdownReceived = false;
 				this.reconnectTimedOut = false;
-				this.setStatusMessage("Reconnected after daemon restart", { render: false });
+				this.setStatusMessage("Daemon reconnected", { render: false });
 				this.applySessionList(sessions);
 				await this.sendInitialPrompts();
 				return;

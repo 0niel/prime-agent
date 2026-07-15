@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,10 +12,13 @@ import {
 	AgentDaemon,
 	cancelPendingExtensionUiRequests,
 	detachClientFromActiveSession,
+	finishClientSnapshotStreaming,
 	getChildActiveSessionStates,
+	markClientSnapshotStreaming,
+	setDaemonClientSessionCapabilities,
 	shouldSendDaemonOutboundToClient,
 } from "../src/modes/daemon/daemon-mode.js";
-import type { DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
+import type { DaemonAttachResult, DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
 
 describe("daemon mode helpers", () => {
 	it("finds only direct child active sessions", () => {
@@ -241,6 +244,73 @@ describe("daemon mode helpers", () => {
 		expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
 		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toContain("To: Subagent, active child");
 		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toContain("report current progress");
+	});
+
+	it("lists and routes agent messages to peers hosted by another worker", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+			worker: { authenticationToken: "worker-token" },
+		});
+		const source = makeState("source");
+		source.runtime = {
+			...source.runtime,
+			cwd: "/tmp",
+			session: {
+				sessionId: "session-source",
+				sessionName: "Source",
+				isStreaming: false,
+				pendingMessageCount: 0,
+			},
+		} as never;
+		const receipt = {
+			id: "agentmsg-remote",
+			source: "agent_message",
+			target: { activeSessionId: "remote", sessionId: "session-remote" },
+			message: "continue remotely",
+			deliveryStatus: "delivered",
+			deliveredAt: "2026-01-01T00:00:00.000Z",
+			deliveryMode: "auto",
+		};
+		const sendRemoteAgentSessionMessage = vi.fn().mockResolvedValue(receipt);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			remoteAgentPeers: Map<string, Record<string, unknown>>;
+			createAgentMessageListResult(current: ActiveSessionState): { agents: Array<{ activeSessionId: string }> };
+			sendRemoteAgentSessionMessage: typeof sendRemoteAgentSessionMessage;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState: ActiveSessionState;
+				origin: "agent";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(source.activeSessionId, source);
+		internals.remoteAgentPeers.set("remote", {
+			activeSessionId: "remote",
+			sessionId: "session-remote",
+			sessionName: "Remote",
+			runtimeKind: "top-level",
+			cwd: "/tmp/remote",
+			isStreaming: false,
+			pendingMessageCount: 0,
+		});
+		internals.sendRemoteAgentSessionMessage = sendRemoteAgentSessionMessage;
+
+		expect(internals.createAgentMessageListResult(source).agents).toContainEqual(
+			expect.objectContaining({ activeSessionId: "remote" }),
+		);
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: "remote",
+				message: "continue remotely",
+				fromState: source,
+				origin: "agent",
+			}),
+		).resolves.toEqual(receipt);
+		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(source, "remote", "continue remotely", undefined);
 	});
 
 	it("reports queued status when a direct accept races into the queue", async () => {
@@ -2224,6 +2294,161 @@ describe("daemon mode helpers", () => {
 				method: "notify",
 			}),
 		).toBe(true);
+
+		setDaemonClientSessionCapabilities(uiClient, "active", new Set(["extension_ui"]));
+		setDaemonClientSessionCapabilities(uiClient, "other", new Set());
+		expect(shouldSendDaemonOutboundToClient(uiClient, dialogRequest)).toBe(true);
+		expect(
+			shouldSendDaemonOutboundToClient(uiClient, {
+				...dialogRequest,
+				activeSessionId: "other",
+			}),
+		).toBe(false);
+	});
+
+	it("delivers session closure while a client is snapshotting and backpressured", () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const state = makeState("active");
+		state.eventGeneration = "generation-1";
+		const write = vi.fn((_data: unknown) => false);
+		const client = makeClient("client-1", state.activeSessionId);
+		client.socket = { destroyed: false, write } as unknown as Socket;
+		client.snapshotActiveSessionIds = new Set([state.activeSessionId]);
+		client.snapshotStreaming = true;
+		client.backpressured = true;
+		client.catchupActiveSessionIds = new Set([state.activeSessionId]);
+		state.clients.add(client);
+		const internals = daemon as unknown as {
+			broadcastToSession(
+				state: ActiveSessionState,
+				message: { type: "session_closed"; activeSessionId: string; reason: "killed" },
+			): void;
+		};
+
+		internals.broadcastToSession(state, {
+			type: "session_closed",
+			activeSessionId: state.activeSessionId,
+			reason: "killed",
+		});
+
+		expect(write).toHaveBeenCalledOnce();
+		expect(String(write.mock.calls[0]?.[0])).toContain('"type":"session_closed"');
+		expect(client.catchupActiveSessionIds).not.toContain(state.activeSessionId);
+	});
+
+	it("marks a chunked attach as snapshotting before deferred streaming", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-snapshot-order-"));
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const state = makeState("active");
+			state.eventGeneration = "generation-1";
+			const client = makeClient("client-1", state.activeSessionId);
+			client.transport = "private-framed";
+			const result = {
+				activeSessionId: state.activeSessionId,
+				snapshot: { summary: {}, state: {}, messages: [] },
+				lastEventSequence: 0,
+			} as unknown as DaemonAttachResult;
+			const streamWorkerSnapshot = vi.fn(async () => undefined);
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createAttachResult: () => DaemonAttachResult;
+				streamWorkerSnapshot: typeof streamWorkerSnapshot;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+			internals.createAttachResult = () => result;
+			internals.streamWorkerSnapshot = streamWorkerSnapshot;
+
+			await internals.handleCommand(client, {
+				type: "attach",
+				activeSessionId: state.activeSessionId,
+				capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+			});
+
+			expect(client.snapshotActiveSessionIds).toContain(state.activeSessionId);
+			expect(client.snapshotStreaming).toBe(true);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(streamWorkerSnapshot).toHaveBeenCalledOnce();
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps overlapping snapshots active until every stream finishes", () => {
+		const client = makeClient("client-1", "active");
+
+		markClientSnapshotStreaming(client, "active");
+		markClientSnapshotStreaming(client, "active");
+		finishClientSnapshotStreaming(client, "active");
+
+		expect(client.snapshotStreaming).toBe(true);
+		expect(client.snapshotActiveSessionIds).toContain("active");
+		expect(client.snapshotActiveSessionCounts?.get("active")).toBe(1);
+
+		finishClientSnapshotStreaming(client, "active");
+		expect(client.snapshotStreaming).toBe(false);
+		expect(client.snapshotActiveSessionIds).not.toContain("active");
+	});
+
+	it("falls back to a full replacement when snapshot cache creation fails", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-daemon-replacement-fallback-"));
+		try {
+			const invalidAgentDir = join(root, "not-a-directory");
+			writeFileSync(invalidAgentDir, "file");
+			const daemon = new AgentDaemon(join(root, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: invalidAgentDir, cwd: root },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const state = makeState("active");
+			state.eventGeneration = "generation-1";
+			const write = vi.fn((_data: unknown) => true);
+			const client = makeClient("client-1", state.activeSessionId);
+			client.socket = { destroyed: false, write } as unknown as Socket;
+			client.transport = "private-framed";
+			setDaemonClientSessionCapabilities(client, state.activeSessionId, new Set(["chunked_snapshot"]));
+			state.clients.add(client);
+			const result = {
+				activeSessionId: state.activeSessionId,
+				snapshot: {
+					summary: {},
+					state: {},
+					messages: [{ role: "user", content: "x".repeat(4 * 1024 * 1024 + 1), timestamp: 0 }],
+				},
+				lastEventSequence: 0,
+			} as unknown as DaemonAttachResult;
+			const internals = daemon as unknown as {
+				createAttachResult: () => DaemonAttachResult;
+				broadcastToSession(state: ActiveSessionState, message: unknown): void;
+			};
+			internals.createAttachResult = () => result;
+
+			internals.broadcastToSession(state, {
+				type: "session_replaced",
+				activeSessionId: state.activeSessionId,
+				state: {},
+				messages: [],
+			});
+
+			expect(write).toHaveBeenCalledTimes(1);
+			const replacementFrame = String(write.mock.calls[0]?.[0]);
+			expect(replacementFrame).toContain('"type":"session_replaced"');
+			expect(replacementFrame).not.toContain('"snapshotFollows":true');
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("deduplicates concurrent creates for the same session file", async () => {

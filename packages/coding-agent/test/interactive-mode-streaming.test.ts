@@ -5,6 +5,7 @@ import { beforeAll, describe, expect, test, vi } from "vitest";
 import type { AgentConnectionSessionEvent } from "../src/modes/agent-connection/index.js";
 import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import type { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
+import type { FileChangeSummary } from "../src/modes/interactive/components/edit-summary.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -27,21 +28,31 @@ const EMPTY_USAGE: Usage = {
 type HandleEventThis = {
 	isInitialized: boolean;
 	settingsManager: { getShowTerminalProgress(): boolean };
+	connectionState: { isStreaming: boolean };
+	toolOutputExpanded: boolean;
 	footer: { invalidate(): void };
 	ui: TUI;
 	chatContainer: Container;
+	recapContainer: Container;
+	sessionRecap: string | undefined;
+	childAgentPanelMode: undefined;
 	hideThinkingBlock: boolean;
 	hiddenThinkingLabel: string;
 	streamingComponent: AssistantMessageComponent | undefined;
 	streamingMessage: AssistantMessage | undefined;
 	pendingTools: Map<string, ToolExecutionComponent>;
+	agentRunFileChanges: Map<string, FileChangeSummary>;
 	updateConnectionStateFromEvent(event: AgentConnectionSessionEvent): void;
 	getMarkdownThemeWithSettings(): MarkdownTheme;
 	getOrCreatePendingToolComponent(): Promise<ToolExecutionComponent | undefined>;
 	getRetryAttempt(): number;
+	getCurrentCwd(): string;
 	stopWorkingLoader(): void;
 	resetPendingToolState(): void;
 	checkShutdownRequested(): Promise<void>;
+	setSessionHasMessages(hasMessages: boolean): void;
+	clearShortcutGuide(): void;
+	addMessageToChat(): void;
 };
 
 type HandleEvent = (this: HandleEventThis, event: AgentConnectionSessionEvent) => Promise<void>;
@@ -64,10 +75,15 @@ function createFakeInteractiveModeThis(): HandleEventThis {
 	const fakeThis = {
 		isInitialized: true,
 		settingsManager: { getShowTerminalProgress: () => false },
+		connectionState: { isStreaming: false },
+		toolOutputExpanded: false,
 		footer: { invalidate: vi.fn() },
 		activityTracker: new AgentActivityTracker(),
 		ui: { requestRender: vi.fn() } as unknown as TUI,
 		chatContainer: new Container(),
+		recapContainer: new Container(),
+		sessionRecap: "Updated files",
+		childAgentPanelMode: undefined,
 		hideThinkingBlock: false,
 		hiddenThinkingLabel: "Thinking...",
 		streamingComponent: undefined,
@@ -75,13 +91,18 @@ function createFakeInteractiveModeThis(): HandleEventThis {
 		pendingMessagesContainer: new Container(),
 		pendingBashComponents: [],
 		pendingTools: new Map<string, ToolExecutionComponent>(),
+		agentRunFileChanges: new Map<string, FileChangeSummary>(),
 		updateConnectionStateFromEvent: vi.fn(),
 		getMarkdownThemeWithSettings: () => getMarkdownTheme(),
 		getOrCreatePendingToolComponent: vi.fn(async () => undefined),
 		getRetryAttempt: () => 0,
+		getCurrentCwd: () => "/tmp",
 		stopWorkingLoader: vi.fn(),
 		resetPendingToolState: vi.fn(),
 		checkShutdownRequested: vi.fn(async () => {}),
+		setSessionHasMessages: vi.fn(),
+		clearShortcutGuide: vi.fn(),
+		addMessageToChat: vi.fn(),
 	};
 	Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 	return fakeThis;
@@ -169,6 +190,77 @@ describe("InteractiveMode streaming events", () => {
 		expect(renderChat(fakeThis.chatContainer)).toContain("partial response");
 		expect(fakeThis.streamingComponent).toBeUndefined();
 		expect(fakeThis.streamingMessage).toBeUndefined();
+	});
+
+	test("renders one agent-run edit total only when files changed", async () => {
+		const fakeThis = createFakeInteractiveModeThis();
+		const handleEvent = (InteractiveMode.prototype as unknown as { handleEvent: HandleEvent }).handleEvent;
+		const message = createAssistantMessage("");
+		message.content = [{ type: "toolCall", id: "edit-1", name: "edit", arguments: { path: "a.ts" } }];
+
+		await handleEvent.call(fakeThis, {
+			type: "turn_end",
+			message,
+			toolResults: [
+				{
+					role: "toolResult",
+					toolCallId: "edit-1",
+					toolName: "edit",
+					content: [],
+					details: { diff: "-1 old\n+1 new" },
+					isError: false,
+					timestamp: 0,
+				},
+			],
+		});
+		await handleEvent.call(fakeThis, { type: "agent_end", messages: [] });
+		const recap = renderChat(fakeThis.recapContainer);
+		expect(recap).toContain("Recap: Updated files");
+		expect(recap).toContain("1 file changed | +1 -1");
+		expect(recap.indexOf("1 file changed")).toBeLessThan(recap.indexOf("Recap:"));
+		expect(renderChat(fakeThis.chatContainer)).not.toContain("file changed");
+
+		const unchanged = createFakeInteractiveModeThis();
+		await handleEvent.call(unchanged, { type: "agent_end", messages: [] });
+		expect(renderChat(unchanged.recapContainer)).not.toContain("file changed");
+	});
+
+	test("keeps edit totals across automatic retries", async () => {
+		const fakeThis = createFakeInteractiveModeThis();
+		fakeThis.agentRunFileChanges.set("/tmp/a.ts", { path: "a.ts", added: 1, removed: 1 });
+		fakeThis.getRetryAttempt = () => 1;
+		const handleEvent = (InteractiveMode.prototype as unknown as { handleEvent: HandleEvent }).handleEvent;
+
+		await handleEvent.call(fakeThis, { type: "agent_start" });
+
+		expect([...fakeThis.agentRunFileChanges.values()]).toEqual([{ path: "a.ts", added: 1, removed: 1 }]);
+	});
+
+	test("keeps edit totals when compaction restarts the agent", async () => {
+		const fakeThis = createFakeInteractiveModeThis();
+		fakeThis.agentRunFileChanges.set("/tmp/a.ts", { path: "a.ts", added: 1, removed: 1 });
+		const handleEvent = (InteractiveMode.prototype as unknown as { handleEvent: HandleEvent }).handleEvent;
+
+		await handleEvent.call(fakeThis, { type: "agent_start" });
+
+		expect([...fakeThis.agentRunFileChanges.values()]).toEqual([{ path: "a.ts", added: 1, removed: 1 }]);
+	});
+
+	test("clears edit totals when a new user prompt starts", async () => {
+		const fakeThis = createFakeInteractiveModeThis();
+		fakeThis.agentRunFileChanges.set("/tmp/a.ts", { path: "a.ts", added: 1, removed: 1 });
+		const handleEvent = (InteractiveMode.prototype as unknown as { handleEvent: HandleEvent }).handleEvent;
+		await handleEvent.call(fakeThis, { type: "agent_end", messages: [] });
+		expect(renderChat(fakeThis.recapContainer)).toContain("1 file changed");
+
+		await handleEvent.call(fakeThis, {
+			type: "message_start",
+			message: { role: "user", content: "next task", timestamp: Date.now() },
+		});
+
+		expect(fakeThis.agentRunFileChanges.size).toBe(0);
+		expect(renderChat(fakeThis.recapContainer)).not.toContain("file changed");
+		expect(renderChat(fakeThis.recapContainer)).toContain("Recap: Updated files");
 	});
 
 	test("resolves input immediately after return to agents view was requested", async () => {

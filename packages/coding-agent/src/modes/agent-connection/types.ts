@@ -6,6 +6,7 @@ import type { ContextTreeNode } from "../../core/context-tree.js";
 import type { AgentCronJob, AgentHeartbeatDeliveryMode, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
 import type { ReplayBuiltInToolName } from "../../core/extensions/index.js";
 import type { GoalState } from "../../core/goals.js";
+import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type { SessionStats } from "../../core/session-stats.js";
@@ -229,7 +230,14 @@ export interface AgentConnectionReplayInfo {
 	status: AgentConnectionReplayStatus;
 	fromSequence?: number;
 	toSequence: number;
+	fromCursor?: AgentConnectionEventCursor;
+	toCursor?: AgentConnectionEventCursor;
 	reason?: string;
+}
+
+export interface AgentConnectionEventCursor {
+	generation: string;
+	sequence: number;
 }
 
 export interface AgentConnectionParentMetadata {
@@ -242,12 +250,15 @@ export interface AgentConnectionParentMetadata {
 export interface AgentConnectionSnapshot {
 	state: AgentConnectionState;
 	messages: AgentMessage[];
+	/** In-flight assistant message, kept separate from finalized transcript messages. */
+	streamingMessage?: AgentMessage;
 	sessionContext?: AgentConnectionSessionContext;
 	sessionTree?: { tree: AgentConnectionSessionTreeNode[]; leafId: string | null };
 	parent?: AgentConnectionParentMetadata;
 	/** Live RLM child agents (including grandchildren) known to the host at snapshot time. */
 	children?: AgentConnectionRlmChildAgentSnapshot[];
 	lastEventSequence?: number;
+	lastEventCursor?: AgentConnectionEventCursor;
 	replay?: AgentConnectionReplayInfo;
 }
 
@@ -464,6 +475,7 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 
 export type AgentConnectionSessionEvent =
 	| AgentEvent
+	| { type: "ipython_sent_agent_message"; toolCallId: string; message: KernelSentAgentMessage }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
@@ -509,8 +521,10 @@ export type AgentConnectionEvent =
 	| { type: "session_event"; event: AgentConnectionSessionEvent }
 	| { type: "side_question_event"; event: AgentConnectionSideQuestionEvent }
 	| { type: "session_replaced"; state: AgentConnectionState; messages: AgentMessage[] }
+	| { type: "session_resynced"; snapshot: AgentConnectionSnapshot }
 	| { type: "session_status"; recap?: string }
 	| { type: "extension_ui_request"; request: AgentConnectionExtensionUiRequest }
+	| { type: "connection_status"; status: "reconnecting" | "connected"; error?: string }
 	| { type: "closed"; error?: string };
 
 export type AgentConnectionEventListener = (event: AgentConnectionEvent) => void | Promise<void>;

@@ -255,6 +255,53 @@ export function visibleWidth(str: string): number {
 	return width;
 }
 
+/** Find the terminal-column span containing visible, non-whitespace content. */
+export function visibleContentSpan(line: string, maxWidth: number): { from: number; to: number } | null {
+	const limit = Math.floor(maxWidth);
+	if (line.length === 0 || !Number.isFinite(limit) || limit <= 0) {
+		return null;
+	}
+
+	let from = -1;
+	let to = -1;
+	let currentCol = 0;
+	let i = 0;
+
+	while (i < line.length && currentCol < limit) {
+		const ansi = extractAnsiCode(line, i);
+		if (ansi) {
+			i += ansi.length;
+			continue;
+		}
+
+		if (line[i] === "\t") {
+			currentCol += 3;
+			i++;
+			continue;
+		}
+
+		let textEnd = i;
+		while (textEnd < line.length && line[textEnd] !== "\t" && !extractAnsiCode(line, textEnd)) {
+			textEnd++;
+		}
+
+		for (const { segment } of segmenter.segment(line.slice(i, textEnd))) {
+			const width = graphemeWidth(segment);
+			const segmentStart = currentCol;
+			const segmentEnd = currentCol + width;
+			if (width > 0 && segment.trim().length > 0 && segmentStart < limit) {
+				if (from === -1) from = segmentStart;
+				to = Math.min(segmentEnd, limit);
+			}
+			currentCol = segmentEnd;
+			if (currentCol >= limit) break;
+		}
+		i = textEnd;
+	}
+
+	return from === -1 ? null : { from, to };
+}
+
 /**
  * Normalize text for terminal output without changing logical editor content.
  * Some terminals render precomposed Thai/Lao AM vowels inconsistently during

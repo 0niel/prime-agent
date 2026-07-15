@@ -121,7 +121,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getSessionContext(): Promise<AgentConnectionSessionContext> {
-		return this.session.sessionManager.buildSessionContext();
+		return this.session.buildSessionContext();
 	}
 
 	async getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }> {

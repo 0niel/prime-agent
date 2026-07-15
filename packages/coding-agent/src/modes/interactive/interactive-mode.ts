@@ -61,6 +61,7 @@ import {
 	SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE,
 	VERSION,
 } from "../../config.js";
+import { AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL, isAgentSessionMessage } from "../../core/agent-messages.js";
 import {
 	type AgentTraceUploadResult,
 	getPrimeAgentTraceCredential,
@@ -81,6 +82,7 @@ import type {
 } from "../../core/extensions/index.js";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.js";
 import { emptyGoalState, formatGoalUsage, GOAL_CONTEXT_PREVIEW_LABEL, type GoalState } from "../../core/goals.js";
+import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import {
 	createCompactionSummaryMessage,
@@ -89,6 +91,7 @@ import {
 } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
 import { resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
+import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
@@ -109,7 +112,7 @@ import { parseGitUrl } from "../../utils/git.js";
 import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
-import { ensureTool, MISSING_RIPGREP_MESSAGE } from "../../utils/tools-manager.js";
+import { ensureTool, ensureToolWithStatus, formatMissingRipgrepMessage } from "../../utils/tools-manager.js";
 import { checkForNewPiVersion } from "../../utils/version-check.js";
 import type {
 	AgentConnection,
@@ -138,12 +141,8 @@ import {
 	formatUpdateAvailableNotice,
 } from "../shared/startup-notices.js";
 import { AGENT_ACTIVITY_LABELS, AgentActivityTracker, formatTokenCount } from "./agent-activity.js";
-import {
-	type AuthenticationResult,
-	getAnthropicSubscriptionAuthWarning,
-	ProviderAuthFlows,
-	type ProviderLoginOptions,
-} from "./auth-flows.js";
+import { type AuthenticationResult, getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "./auth-flows.js";
+import { AgentMessageComponent } from "./components/agent-message.js";
 import { ArminComponent } from "./components/armin.js";
 import { AssistantMessageComponent } from "./components/assistant-message.js";
 import { BashExecutionComponent } from "./components/bash-execution.js";
@@ -156,6 +155,7 @@ import {
 	ChildAgentSummaryComponent,
 } from "./components/child-agent-inspector.js";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
+import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
 import { buildConversationComponents } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
@@ -164,13 +164,14 @@ import { CustomMessageComponent } from "./components/custom-message.js";
 import { DaxnutsComponent } from "./components/daxnuts.js";
 import { DynamicBorder } from "./components/dynamic-border.js";
 import { EarendilAnnouncementComponent } from "./components/earendil-announcement.js";
+import { type FileChangeSummary, formatTotalChangeSummary, mergeTurnFileChanges } from "./components/edit-summary.js";
 import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FooterComponent } from "./components/footer.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
-import { type ModelSelectorAction, ModelSelectorComponent } from "./components/model-selector.js";
+import type { AuthSelectorProvider } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
 import { SessionPickerScreen } from "./components/session-picker-screen.js";
@@ -178,8 +179,11 @@ import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SideQuestionComponent } from "./components/side-question.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
-import { SubagentTreeView } from "./components/subagent-tree-view.js";
-import { ToolExecutionComponent, type ToolExecutionDefinition } from "./components/tool-execution.js";
+import {
+	selectLatestToolExpandHint,
+	ToolExecutionComponent,
+	type ToolExecutionDefinition,
+} from "./components/tool-execution.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
@@ -244,8 +248,14 @@ export function getRandomStartHint(random = Math.random): (typeof START_HINTS)[n
 
 function isLabeledQueuedPreview(message: string): boolean {
 	return (
-		message.startsWith(`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `) || message.startsWith(`${GOAL_CONTEXT_PREVIEW_LABEL}: `)
+		message.startsWith(`${HEARTBEAT_PROMPT_PREVIEW_LABEL}: `) ||
+		message.startsWith(`${GOAL_CONTEXT_PREVIEW_LABEL}: `) ||
+		message.startsWith(`${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: `)
 	);
+}
+
+export function formatQueuedMessagePreview(message: string, label: "Steering" | "Follow-up"): string {
+	return isLabeledQueuedPreview(message) ? message : `${label}: ${message}`;
 }
 
 function isExpandable(obj: unknown): obj is Expandable {
@@ -279,6 +289,48 @@ export function formatSplashCwd(cwd: string): string {
 	}
 
 	return normalized;
+}
+
+export function mergeChildAgentSnapshots(
+	previous: AgentConnectionRlmChildAgentSnapshot,
+	incoming: AgentConnectionRlmChildAgentSnapshot,
+): AgentConnectionRlmChildAgentSnapshot {
+	const active = incoming.status === "running" || incoming.status === "queued";
+	return {
+		...previous,
+		...incoming,
+		parentId: incoming.parentId ?? previous.parentId,
+		activeSessionId: incoming.activeSessionId ?? previous.activeSessionId,
+		durationMs: incoming.durationMs ?? previous.durationMs,
+		answerPreview: incoming.answerPreview ?? previous.answerPreview,
+		toolUseCount:
+			incoming.toolUseCount === undefined
+				? previous.toolUseCount
+				: Math.max(previous.toolUseCount ?? 0, incoming.toolUseCount),
+		tokenCount: incoming.tokenCount ?? previous.tokenCount,
+		recap: incoming.recap ?? previous.recap,
+		activity: active ? (incoming.activity ?? previous.activity) : undefined,
+		error: incoming.status === "error" ? (incoming.error ?? previous.error) : undefined,
+	};
+}
+
+function childAgentSummaryChanged(
+	previous: AgentConnectionRlmChildAgentSnapshot,
+	next: AgentConnectionRlmChildAgentSnapshot,
+): boolean {
+	const previousTokens = previous.tokenCount === undefined ? undefined : formatTokenCount(previous.tokenCount);
+	const nextTokens = next.tokenCount === undefined ? undefined : formatTokenCount(next.tokenCount);
+	return (
+		previous.parentId !== next.parentId ||
+		previous.label !== next.label ||
+		previous.status !== next.status ||
+		previous.durationMs !== next.durationMs ||
+		previous.toolUseCount !== next.toolUseCount ||
+		previousTokens !== nextTokens ||
+		previous.recap !== next.recap ||
+		previous.activity?.kind !== next.activity?.kind ||
+		previous.activity?.toolName !== next.activity?.toolName
+	);
 }
 
 export function truncatePathMiddle(value: string, width: number): string {
@@ -406,13 +458,7 @@ type GoalAnnouncementSnapshot = {
 	lastError?: string;
 };
 
-type ModelSelectionResult = { status: "selected" } | { status: "cancelled" } | { status: "action"; actionId: string };
-
 type ModelFallbackWarningAction = "show" | "suppress";
-
-const MODEL_SELECTOR_ACTIONS: readonly ModelSelectorAction[] = [
-	{ id: "add_provider", label: "Add provider...", description: "subscription or API key" },
-];
 
 const THINKING_LEVEL_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	off: "No reasoning",
@@ -686,16 +732,16 @@ export class InteractiveMode {
 
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
+	private ipythonToolComponents = new Map<string, ToolExecutionComponent>();
+	private lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	private pendingToolCreations = new Set<string>();
 	private startedToolCalls = new Set<string>();
 	private pendingToolGeneration = 0;
 	private toolDefinitionCache = new Map<string, ToolExecutionDefinition | undefined>();
+	private agentRunFileChanges = new Map<string, FileChangeSummary>();
 
 	// RLM child-agent tray: inline list below the editor, full-screen detail on open.
 	private childAgentSummary: ChildAgentSummaryComponent;
-	// Live tree of the current turn's subagents, drawn above the working loader.
-	// Shown in addition to the inline list below the prompt bar.
-	private subagentTree = new SubagentTreeView();
 	private childAgentDetail: ChildAgentDetailComponent;
 	private childAgentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 	private childAgentNodes: ChildAgentInspectorNode[] = [];
@@ -726,7 +772,6 @@ export class InteractiveMode {
 	private connectionModelsRefreshInFlight: { version: number; promise: Promise<AgentConnectionModel[]> } | undefined;
 	private connectionState: AgentConnectionState | undefined;
 	private connectionResourceSnapshot: AgentConnectionResourceSnapshot | undefined;
-	private initialConnectionSnapshotConsumed = false;
 	private sessionHasMessages = false;
 
 	// Registry of images pasted this session, keyed by the `[image #N]` marker
@@ -1057,10 +1102,10 @@ export class InteractiveMode {
 
 		// Ensure fd and rg are available (downloads if missing, adds to PATH via getBinDir)
 		// fd powers autocomplete, and rg is available for shell commands.
-		const [fdPath, rgPath] = await Promise.all([ensureTool("fd"), ensureTool("rg")]);
+		const [fdPath, rgResult] = await Promise.all([ensureTool("fd"), ensureToolWithStatus("rg")]);
 		this.fdPath = fdPath;
-		if (!rgPath) {
-			this.showWarning(MISSING_RIPGREP_MESSAGE);
+		if (rgResult.status === "unavailable") {
+			this.showWarning(formatMissingRipgrepMessage(rgResult));
 		}
 
 		// Add header container as first child
@@ -1405,22 +1450,17 @@ export class InteractiveMode {
 				return;
 			}
 
-			await this.promptForModelSelection({ allowProviderSetup: true });
+			await this.showConfigurationMenu("models");
 			return;
 		}
 
 		const availableModels = await this.getModelCandidates();
 		if (availableModels.length > 0) {
-			await this.promptForModelSelection({ allowProviderSetup: true });
+			await this.showConfigurationMenu("models");
 			return;
 		}
 
-		const authResult = await this.showOnboardingPrimeLogin();
-		if (authResult.status !== "success") {
-			return;
-		}
-
-		await this.promptForModelSelection({ allowProviderSetup: true });
+		await this.showConfigurationMenu("providers");
 	}
 
 	private getMarkdownThemeWithSettings(): MarkdownTheme {
@@ -2418,6 +2458,10 @@ export class InteractiveMode {
 		this.activityTracker.reset();
 		this.contextUsageTokenBaseline = 0;
 		this.resetPendingToolState();
+		this.agentRunFileChanges.clear();
+		this.renderRecap();
+		this.ipythonToolComponents.clear();
+		this.lateIpythonSentAgentMessages.clear();
 		this.resetChildAgentInspector();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
@@ -2433,6 +2477,35 @@ export class InteractiveMode {
 	private async renderCurrentSessionState(): Promise<void> {
 		this.resetCurrentSessionRenderState();
 		await this.renderInitialMessages();
+		this.syncWorkingLoader();
+	}
+
+	private async renderResyncedSession(snapshot: AgentConnectionSnapshot): Promise<void> {
+		const compactionFinished = this.isAgentCompacting() && !snapshot.state.isCompacting;
+		const bashFinished = this.isBashRunning() && !snapshot.state.isBashRunning;
+		this.applyConnectionStateSnapshot(snapshot.state);
+		this.streamingComponent = undefined;
+		this.streamingMessage = undefined;
+		this.replaceChildAgentInspector(snapshot.children);
+		await this.renderSessionContext(this.getSessionContextFromConnectionSnapshot(snapshot), {
+			clearChat: true,
+			updateFooter: true,
+		});
+		await this.restoreStreamingMessageFromSnapshot(snapshot.streamingMessage);
+		await this.refreshConnectionQueue();
+		if (compactionFinished) {
+			await this.flushCompactionQueue({ willRetry: false });
+		}
+		if (bashFinished && this.activeBashComponent) {
+			this.activeBashComponent.setComplete(undefined, false);
+			this.activeBashComponent = undefined;
+			if (!snapshot.state.isStreaming) {
+				this.flushPendingBashComponents();
+			}
+		}
+		this.updateTerminalTitle();
+		this.setGoalAnnouncementBaseline(this.getGoalState());
+		this.syncGoalTray(this.getGoalState());
 		this.syncWorkingLoader();
 	}
 
@@ -2457,6 +2530,16 @@ export class InteractiveMode {
 		return this.streamingMessage?.content.find(
 			(content): content is ToolCall => content.type === "toolCall" && content.id === toolCallId,
 		);
+	}
+
+	private registerIpythonToolComponent(toolName: string, toolCallId: string, component: ToolExecutionComponent): void {
+		if (toolName !== "ipython") {
+			return;
+		}
+		this.ipythonToolComponents.set(toolCallId, component);
+		for (const lateMessage of this.lateIpythonSentAgentMessages.get(toolCallId) ?? []) {
+			component.appendSentAgentMessage(lateMessage);
+		}
 	}
 
 	private async getOrCreatePendingToolComponent(
@@ -2502,8 +2585,10 @@ export class InteractiveMode {
 			if (this.startedToolCalls.has(latestToolCall.id)) {
 				component.markExecutionStarted();
 			}
+			selectLatestToolExpandHint(this.chatContainer.children, component);
 			this.chatContainer.addChild(component);
 			this.pendingTools.set(latestToolCall.id, component);
+			this.registerIpythonToolComponent(latestToolCall.name, latestToolCall.id, component);
 			return component;
 		} finally {
 			this.pendingToolCreations.delete(toolCall.id);
@@ -2895,13 +2980,20 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	/** Render the recap line above the editor when one exists. */
 	private renderRecap(): void {
 		if (!this.recapContainer) return;
 		this.recapContainer.clear();
 		const recap = this.childAgentPanelMode ? undefined : this.sessionRecap?.trim();
+		const showChanges = !this.childAgentPanelMode && !this.isAgentStreaming() && this.agentRunFileChanges.size > 0;
+		if (showChanges) {
+			this.recapContainer.addChild(
+				new TruncatedText(formatTotalChangeSummary([...this.agentRunFileChanges.values()]), 1, 0),
+			);
+		}
 		if (recap) {
 			this.recapContainer.addChild(new TruncatedText(theme.fg("dim", `Recap: ${recap}`), 1, 0));
+		}
+		if (recap || showChanges) {
 			this.recapContainer.addChild(new Spacer(1));
 		}
 		this.ui.requestRender();
@@ -3889,12 +3981,12 @@ export class InteractiveMode {
 				}
 				if (commandName === "login" && !commandArgs) {
 					this.editor.setText("");
-					await this.showOAuthSelector("login");
+					await this.showConfigurationMenu("providers");
 					return;
 				}
 				if (commandName === "logout" && !commandArgs) {
 					this.editor.setText("");
-					await this.showOAuthSelector("logout");
+					await this.showLogoutSelector();
 					return;
 				}
 				if (commandName === "mcp") {
@@ -4070,6 +4162,11 @@ export class InteractiveMode {
 					await this.rebindCurrentSession();
 					await this.renderInitialMessages();
 					this.ui.requestRender();
+				} else if (event.type === "session_resynced") {
+					const run = this.sessionEventQueue.then(() => this.renderResyncedSession(event.snapshot));
+					this.sessionEventQueue = run.catch(() => {});
+					await run;
+					this.ui.requestRender();
 				} else if (event.type === "session_status") {
 					this.sessionRecap = event.recap;
 					this.patchConnectionState({ recap: event.recap });
@@ -4078,6 +4175,11 @@ export class InteractiveMode {
 					this.handleSideQuestionEvent(event.event);
 				} else if (event.type === "extension_ui_request") {
 					await this.handleConnectionExtensionUiRequest(event.request);
+				} else if (event.type === "connection_status") {
+					this.showStatus(
+						event.status === "connected" ? "Daemon reconnected" : "Daemon connection lost; reconnecting…",
+						event.status === "reconnecting" ? "warning" : "dim",
+					);
 				} else if (event.type === "closed") {
 					this.showError(event.error ?? "Agent connection closed");
 				}
@@ -4271,10 +4373,12 @@ export class InteractiveMode {
 		this.updateConnectionStateFromEvent(event);
 		// A new user message resets the activity tracker to 0, so the in-flight baseline must
 		// reset with it. (agent_start on auto-retry does not reset the tracker.)
-		if (event.type === "message_start" && event.message.role === "user") {
+		if (event.type === "message_start" && (event.message.role === "user" || isAgentSessionMessage(event.message))) {
 			this.contextUsageTokenBaseline = 0;
 			this.setSessionHasMessages(true);
 			this.clearShortcutGuide();
+			this.agentRunFileChanges.clear();
+			this.renderRecap();
 		}
 		this.activityTracker.handleEvent(event);
 		this.updateWorkingLoaderMessage();
@@ -4282,6 +4386,7 @@ export class InteractiveMode {
 		switch (event.type) {
 			case "agent_start":
 				this.resetPendingToolState();
+				this.renderRecap();
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
 				}
@@ -4466,6 +4571,21 @@ export class InteractiveMode {
 				break;
 			}
 
+			case "ipython_sent_agent_message": {
+				const messages = this.lateIpythonSentAgentMessages.get(event.toolCallId) ?? [];
+				if (!messages.some((message) => message.id === event.message.id)) {
+					messages.push(event.message);
+					this.lateIpythonSentAgentMessages.set(event.toolCallId, messages);
+				}
+				this.ipythonToolComponents.get(event.toolCallId)?.appendSentAgentMessage(event.message);
+				this.ui.requestRender();
+				break;
+			}
+
+			case "turn_end":
+				mergeTurnFileChanges(this.agentRunFileChanges, event.message, event.toolResults, this.getCurrentCwd());
+				break;
+
 			case "agent_end":
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(false);
@@ -4483,6 +4603,7 @@ export class InteractiveMode {
 				}
 				this.flushPendingBashComponents();
 				this.resetPendingToolState();
+				this.renderRecap();
 
 				this.applyOptimisticContextUsage();
 				await this.refreshConnectionContextUsage();
@@ -4788,13 +4909,31 @@ export class InteractiveMode {
 		if (!children?.length) {
 			return;
 		}
+		let changed = false;
 		for (const child of children) {
 			// Live rlm_child_update events are richer than the snapshot; never
 			// clobber state that already arrived from the event stream.
-			if (!this.childAgentSnapshots.has(child.id)) {
-				this.updateChildAgentInspector(child);
+			if (!this.childAgentSnapshots.has(child.id) && child.status !== "cancelled") {
+				this.childAgentSnapshots.set(child.id, child);
+				changed = true;
 			}
 		}
+		if (changed) {
+			this.refreshChildAgentInspector();
+		}
+	}
+
+	private replaceChildAgentInspector(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {
+		const next = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
+		for (const child of children ?? []) {
+			if (child.status === "cancelled") {
+				continue;
+			}
+			const previous = this.childAgentSnapshots.get(child.id);
+			next.set(child.id, previous ? mergeChildAgentSnapshots(previous, child) : child);
+		}
+		this.childAgentSnapshots = next;
+		this.refreshChildAgentInspector();
 	}
 
 	private updateChildAgentInspector(child: AgentConnectionRlmChildAgentSnapshot): void {
@@ -4802,12 +4941,20 @@ export class InteractiveMode {
 		// viewer instead of keeping a dead row around.
 		if (child.status === "cancelled") {
 			this.removeChildAgentSnapshot(child.id);
-		} else {
-			this.childAgentSnapshots.set(child.id, child);
+			this.refreshChildAgentInspector();
+			return;
 		}
+		const previous = this.childAgentSnapshots.get(child.id);
+		const next = previous ? mergeChildAgentSnapshots(previous, child) : child;
+		this.childAgentSnapshots.set(child.id, next);
+		if (!previous || childAgentSummaryChanged(previous, next) || this.childAgentDetailNodeId === child.id) {
+			this.refreshChildAgentInspector();
+		}
+	}
+
+	private refreshChildAgentInspector(): void {
 		this.childAgentNodes = this.buildChildAgentInspectorNodes();
 		this.childAgentSummary.setNodes(this.childAgentNodes);
-		this.subagentTree.setNodes(this.childAgentNodes);
 		this.updateWorkingPulse();
 		this.syncWorkingLoader();
 		this.updateWorkingLoaderMessage();
@@ -4837,8 +4984,6 @@ export class InteractiveMode {
 		this.mainViewContainer.addChild(this.chatContainer);
 		this.mainViewContainer.addChild(this.shortcutGuideContainer);
 		this.mainViewContainer.addChild(this.pendingMessagesContainer);
-		// Subagent tree sits directly above the loader, mirroring Claude's layout.
-		this.mainViewContainer.addChild(this.subagentTree);
 		this.mainViewContainer.addChild(this.statusContainer);
 	}
 
@@ -4846,7 +4991,6 @@ export class InteractiveMode {
 		this.childAgentSnapshots.clear();
 		this.childAgentNodes = [];
 		this.childAgentSummary.setNodes([]);
-		this.subagentTree.setNodes([]);
 		this.childAgentSummary.setHidden(false);
 		this.childAgentDetail.setNode(undefined);
 		this.childAgentDetailNodeId = undefined;
@@ -5047,6 +5191,10 @@ export class InteractiveMode {
 	}
 
 	private openChildAgentDetail(nodeId: string): boolean {
+		// Live text deltas are stored without redrawing the summary on every token.
+		// Rebuild once here so the detail opens with the latest preview and recap.
+		this.childAgentNodes = this.buildChildAgentInspectorNodes();
+		this.childAgentSummary.setNodes(this.childAgentNodes);
 		const node = this.findChildAgentInspectorNode(nodeId);
 		if (!node) {
 			return false;
@@ -5097,8 +5245,8 @@ export class InteractiveMode {
 			if (token !== this.childAgentWatcherToken) {
 				return;
 			}
-			// session_replaced carries a fresh messages array; both need a rebuild.
-			if (event.type === "session_event" || event.type === "session_replaced") {
+			// Replacement and resync snapshots both carry authoritative messages.
+			if (event.type === "session_event" || event.type === "session_replaced" || event.type === "session_resynced") {
 				void this.refreshChildAgentWatch(token, watcher);
 			}
 		});
@@ -5317,19 +5465,19 @@ export class InteractiveMode {
 	 * If multiple status messages are emitted back-to-back (without anything else being added to the chat),
 	 * we update the previous status line instead of appending new ones to avoid log spam.
 	 */
-	private showStatus(message: string): void {
+	private showStatus(message: string, tone: "dim" | "warning" = "dim"): void {
 		const children = this.chatContainer.children;
 		const last = children.length > 0 ? children[children.length - 1] : undefined;
 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
 
 		if (last && secondLast && last === this.lastStatusText && secondLast === this.lastStatusSpacer) {
-			this.lastStatusText.setText(theme.fg("dim", message));
+			this.lastStatusText.setText(theme.fg(tone, message));
 			this.ui.requestRender();
 			return;
 		}
 
 		const spacer = new Spacer(1);
-		const text = new Text(theme.fg("dim", message), 1, 0);
+		const text = new Text(theme.fg(tone, message), 1, 0);
 		this.chatContainer.addChild(spacer);
 		this.chatContainer.addChild(text);
 		this.lastStatusSpacer = spacer;
@@ -5366,15 +5514,17 @@ export class InteractiveMode {
 			}
 			case "custom": {
 				if (message.display) {
-					const component = isInjectedPromptMessage(message)
-						? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
-						: new CustomMessageComponent(
-								message,
-								this.bindLocalSessionExtensions
-									? this.getLocalSessionHost().getExtensionRunner().getMessageRenderer(message.customType)
-									: undefined,
-								this.getMarkdownThemeWithSettings(),
-							);
+					const component = isAgentSessionMessage(message)
+						? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
+						: isInjectedPromptMessage(message)
+							? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
+							: new CustomMessageComponent(
+									message,
+									this.bindLocalSessionExtensions
+										? this.getLocalSessionHost().getExtensionRunner().getMessageRenderer(message.customType)
+										: undefined,
+									this.getMarkdownThemeWithSettings(),
+								);
 					component.setExpanded(this.toolOutputExpanded);
 					this.chatContainer.addChild(component);
 				}
@@ -5474,6 +5624,8 @@ export class InteractiveMode {
 		options: { updateFooter?: boolean; populateHistory?: boolean; clearChat?: boolean } = {},
 	): Promise<void> {
 		this.resetPendingToolState();
+		this.ipythonToolComponents.clear();
+		this.lateIpythonSentAgentMessages.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
 		const toolNames: string[] = [];
 		for (const message of sessionContext.messages) {
@@ -5519,7 +5671,9 @@ export class InteractiveMode {
 							this.getCurrentCwd(),
 						);
 						component.setExpanded(this.toolOutputExpanded);
+						selectLatestToolExpandHint(this.chatContainer.children, component);
 						this.chatContainer.addChild(component);
+						this.registerIpythonToolComponent(content.name, content.id, component);
 
 						if (message.stopReason === "aborted" || message.stopReason === "error") {
 							let errorMessage: string;
@@ -5562,32 +5716,36 @@ export class InteractiveMode {
 	}
 
 	async renderInitialMessages(): Promise<void> {
-		let context: AgentConnectionSessionContext;
-		let state: AgentConnectionState;
-		if (this.initialConnectionSnapshotConsumed) {
-			[context, state] = await Promise.all([
-				this.agentConnection.getSessionContext(),
-				this.agentConnection.getState(),
-			]);
-		} else {
-			const snapshot = await this.agentConnection.getInitialSnapshot();
-			this.initialConnectionSnapshotConsumed = true;
-			context = this.getSessionContextFromConnectionSnapshot(snapshot);
-			state = snapshot.state;
-			this.seedChildAgentInspector(snapshot.children);
-		}
+		const snapshot = await this.agentConnection.getInitialSnapshot();
+		const context = this.getSessionContextFromConnectionSnapshot(snapshot);
+		const state = snapshot.state;
+		const streamingMessage = snapshot.streamingMessage;
+		this.seedChildAgentInspector(snapshot.children);
 		this.setSessionHasMessages(context.messages.length > 0);
 		this.applyConnectionStateSnapshot(state);
 		await this.renderSessionContext(context, {
 			updateFooter: true,
 			populateHistory: true,
 		});
+		await this.restoreStreamingMessageFromSnapshot(streamingMessage);
 
 		// Show compaction info if session was compacted
 		const compactionCount = state.compactionCount;
 		if (compactionCount > 0) {
 			const times = compactionCount === 1 ? "1 time" : `${compactionCount} times`;
 			this.showStatus(`Session compacted ${times}`);
+		}
+	}
+
+	private async restoreStreamingMessageFromSnapshot(message: AgentMessage | undefined): Promise<void> {
+		if (message?.role === "assistant") {
+			this.startAssistantStreamingMessage(message);
+			for (const content of message.content) {
+				if (content.type === "toolCall") {
+					this.startedToolCalls.add(content.id);
+					await this.getOrCreatePendingToolComponent(content);
+				}
+			}
 		}
 	}
 
@@ -6225,11 +6383,11 @@ export class InteractiveMode {
 		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
 			this.queuedMessagesContainer.addChild(new Spacer(1));
 			for (const message of steeringMessages) {
-				const text = theme.fg("dim", isLabeledQueuedPreview(message) ? message : `Steering: ${message}`);
+				const text = theme.fg("dim", formatQueuedMessagePreview(message, "Steering"));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			for (const message of followUpMessages) {
-				const text = theme.fg("dim", isLabeledQueuedPreview(message) ? message : `Follow-up: ${message}`);
+				const text = theme.fg("dim", formatQueuedMessagePreview(message, "Follow-up"));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			const dequeueHint = this.getAppKeyDisplay("app.message.dequeue");
@@ -6812,128 +6970,113 @@ export class InteractiveMode {
 	}
 
 	private showModelSelector(initialSearchInput?: string): void {
-		void this.showModelSelectorWithProviderSetup(initialSearchInput);
+		void this.showConfigurationMenu("models", initialSearchInput);
 	}
 
-	private async showModelSelectorWithProviderSetup(initialSearchInput?: string): Promise<void> {
-		let nextSearchInput = initialSearchInput;
-		while (true) {
-			const result = await this.showModelSelectorAsync(nextSearchInput, {
-				actions: MODEL_SELECTOR_ACTIONS,
-			});
-			if (result.status !== "action") {
-				return;
-			}
-			await this.showLoginProviderSelector();
-			this.invalidateConnectionModels();
-			nextSearchInput = undefined;
-		}
-	}
-
-	private async promptForModelSelection(options: { allowProviderSetup?: boolean } = {}): Promise<boolean> {
-		while (true) {
-			this.showStatus("Select a model to continue.");
-			const result = await this.showModelSelectorAsync(
-				undefined,
-				options.allowProviderSetup
-					? {
-							actions: MODEL_SELECTOR_ACTIONS,
-							subtitle: "Choose a Prime model, or add another provider.",
-						}
-					: undefined,
-			);
-			if (result.status === "selected") {
-				return true;
-			}
-			if (result.status !== "action") {
-				return false;
-			}
-
-			await this.showLoginProviderSelector();
-			this.invalidateConnectionModels();
-		}
-	}
-
-	private async showModelSelectorAsync(
-		initialSearchInput?: string,
-		options?: { actions?: ReadonlyArray<ModelSelectorAction>; subtitle?: string },
-	): Promise<ModelSelectionResult> {
+	private showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
 		const availableModels = this.getCachedModelCandidates();
+		const authFlows = this.createAuthFlows();
+		const providerOptions = authFlows.getLoginProviderOptions();
 
 		return new Promise((resolve) => {
 			let handle: OverlayHandle | undefined;
 			let settled = false;
-			let selector: ModelSelectorComponent | undefined;
-			const settle = (result: ModelSelectionResult) => {
-				if (settled) {
-					return;
-				}
-				settled = true;
-				resolve(result);
-			};
-			const close = () => {
+			let hidden = false;
+			let menu: ConfigurationMenuComponent;
+			const hide = () => {
+				if (hidden) return;
+				hidden = true;
 				handle?.hide();
 				this.ui.requestRender();
 			};
-
-			selector = new ModelSelectorComponent(
-				this.ui,
-				this.getCurrentModel(),
-				this.modelRegistry,
-				this.getScopedModelState(),
-				async (model) => {
-					close();
-					this.showStatus(`Switching model: ${model.id}`);
-					try {
-						await this.applySelectedModel(model);
-						this.showStatus(`Model: ${model.id}`);
-						void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
-						this.checkDaxnutsEasterEgg(model);
-						settle({ status: "selected" });
-					} catch (error) {
-						close();
-						this.showError(error instanceof Error ? error.message : String(error));
-						settle({ status: "cancelled" });
-					}
-				},
-				() => {
-					close();
-					settle({ status: "cancelled" });
-				},
-				initialSearchInput,
-				{
-					actions: options?.actions,
-					availableModels,
-					onAction: (actionId) => {
-						close();
-						settle({ status: "action", actionId });
-					},
-					subtitle: options?.subtitle,
-					getRows: () => this.ui.terminal.rows,
-					recentModels: this.settingsManager.getRecentModels(),
-				},
-			);
-			handle = this.showFullPaneOverlay(selector, 96);
-
-			const refreshPromise = this.getModelSelectorRefreshPromise({ force: initialSearchInput !== undefined });
-			if (refreshPromise) {
+			const finish = () => {
+				if (settled) return;
+				settled = true;
+				hide();
+				resolve();
+			};
+			const restore = () => {
+				if (settled) return;
+				hidden = false;
+				handle?.setHidden(false);
+				handle?.focus();
+				this.ui.requestRender();
+			};
+			const refreshModels = (force: boolean) => {
+				const refreshPromise = this.getModelSelectorRefreshPromise({ force });
+				if (!refreshPromise) return;
 				void refreshPromise
 					.then((models) => {
-						if (settled || !selector) {
-							return undefined;
-						}
-						return selector.updateAvailableModels(models);
+						if (!settled) menu.updateModels(this.getCurrentModel(), models);
 					})
 					.catch((error) => {
-						if (!settled) {
-							this.showError(error instanceof Error ? error.message : String(error));
-							if (availableModels.length === 0) {
-								close();
-								settle({ status: "cancelled" });
-							}
-						}
+						if (!settled) this.showError(error instanceof Error ? error.message : String(error));
 					});
-			}
+			};
+			const authenticate = (provider: AuthSelectorProvider, tab: "providers" | "mcp-connections") => {
+				if (settled) return;
+				handle?.setHidden(true);
+				void authFlows
+					.loginProvider(provider)
+					.then(async (authResult) => {
+						if (settled) return;
+						restore();
+						menu.refreshAuthentication();
+						if (authResult.status !== "success") return;
+
+						if (tab === "mcp-connections") {
+							if (!authResult.providerId.startsWith("mcp:")) return;
+							if (this.isAgentStreaming() || this.isAgentCompacting()) {
+								this.showStatus("Connected. Run /reload (after the current turn) to activate the integration.");
+								return;
+							}
+							finish();
+							await this.handleReloadCommand();
+							return;
+						}
+
+						await this.prepareForModelSelectionAfterLogin(authResult);
+						menu.updateModels(this.getCurrentModel());
+						menu.setActiveTab("models");
+						refreshModels(true);
+					})
+					.catch((error) => {
+						restore();
+						this.showError(error instanceof Error ? error.message : String(error));
+					});
+			};
+
+			menu = new ConfigurationMenuComponent({
+				initialTab,
+				tui: this.ui,
+				authStorage: this.modelRegistry.authStorage,
+				providerOptions,
+				modelRegistry: this.modelRegistry,
+				currentModel: this.getCurrentModel(),
+				scopedModels: this.getScopedModelState(),
+				availableModels,
+				recentModels: this.settingsManager.getRecentModels(),
+				initialModelSearch,
+				getRows: () => this.ui.terminal.rows,
+				requestRender: () => this.ui.requestRender(),
+				onSelectProvider: (provider) => authenticate(provider, "providers"),
+				onSelectMcpConnection: (provider) => authenticate(provider, "mcp-connections"),
+				onSelectModel: (model) => {
+					hide();
+					this.showStatus(`Switching model: ${model.id}`);
+					void this.applySelectedModel(model)
+						.then(() => {
+							this.showStatus(`Model: ${model.id}`);
+							void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
+							this.checkDaxnutsEasterEgg(model);
+						})
+						.catch((error) => this.showError(error instanceof Error ? error.message : String(error)))
+						.finally(finish);
+				},
+				onCancel: finish,
+			});
+			handle = this.showFullPaneOverlay(menu, 96);
+			refreshModels(initialModelSearch !== undefined);
 		});
 	}
 
@@ -7314,46 +7457,6 @@ export class InteractiveMode {
 		}
 	}
 
-	private showOnboardingPrimeLogin(): Promise<AuthenticationResult> {
-		return new Promise((resolve) => {
-			let settled = false;
-			let handle: OverlayHandle | undefined;
-			let selector: PrimeOnboardingSplashComponent | undefined;
-			const settle = (result: AuthenticationResult) => {
-				if (settled) {
-					return;
-				}
-				settled = true;
-				resolve(result);
-			};
-			const close = () => {
-				selector?.dispose();
-				handle?.hide();
-				this.ui.requestRender();
-			};
-			selector = new PrimeOnboardingSplashComponent(
-				() => {
-					close();
-					void this.createAuthFlows().runPrimeInferenceLogin().then(settle);
-				},
-				() => {
-					close();
-					settle({ status: "cancelled" });
-				},
-				{
-					getRows: () => this.ui.terminal.rows,
-					requestRender: () => this.ui.requestRender(),
-				},
-			);
-			handle = this.ui.showOverlay(selector, {
-				width: "100%",
-				maxHeight: "100%",
-				row: 0,
-				col: 0,
-			});
-		});
-	}
-
 	private showOnboardingModelSelectionSplash(): Promise<boolean> {
 		return new Promise((resolve) => {
 			let settled = false;
@@ -7413,14 +7516,53 @@ export class InteractiveMode {
 		});
 	}
 
-	private showLoginProviderSelector(options: ProviderLoginOptions = {}): Promise<AuthenticationResult> {
-		return this.createAuthFlows().runLogin(options);
+	private async prepareForModelSelectionAfterLogin(authResult: AuthenticationResult): Promise<boolean> {
+		if (authResult.status === "success" && authResult.kind !== "service") {
+			this.invalidateConnectionModels();
+		}
+
+		const currentModel = this.getCurrentModel();
+		// The agent core uses unknown/unknown as its no-model sentinel.
+		const selectedModel =
+			currentModel?.provider === "unknown" && currentModel.id === "unknown" ? undefined : currentModel;
+		let action = resolvePrimeInferencePostLoginModelAction(authResult, selectedModel, this.modelRegistry);
+		if (!action.openModelPicker) {
+			return false;
+		}
+
+		if (!selectedModel) {
+			try {
+				const availableModels = await this.getConnectionAvailableModels();
+				action = resolvePrimeInferencePostLoginModelAction(authResult, selectedModel, {
+					find: (provider, modelId) =>
+						availableModels.find((model) => model.provider === provider && model.id === modelId) ??
+						this.modelRegistry.find(provider, modelId),
+				});
+			} catch {
+				// Preserve the registry fallback so selection can still report a specific failure below.
+			}
+		}
+
+		if (action.fallbackModel) {
+			try {
+				await this.applySelectedModel(action.fallbackModel);
+				await this.settingsManager.flush();
+			} catch (error) {
+				this.showError(
+					`Prime Inference login succeeded, but the default model could not be selected: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		} else if (!selectedModel) {
+			this.showError("Prime Inference login succeeded, but the default GLM 5.2 model is unavailable.");
+		}
+
+		return true;
 	}
 
 	private async handleMcpCommand(args: string | undefined): Promise<void> {
 		const [sub, server] = (args ?? "").trim().split(/\s+/);
 		if (!sub) {
-			await this.showOAuthSelector("login", { initialCategory: "service" });
+			await this.showConfigurationMenu("mcp-connections");
 			return;
 		}
 
@@ -7481,24 +7623,7 @@ export class InteractiveMode {
 		this.showError(`Unknown /mcp subcommand: ${sub}. Use list, login, or logout.`);
 	}
 
-	private async showOAuthSelector(mode: "login" | "logout", loginOptions: ProviderLoginOptions = {}): Promise<void> {
-		if (mode === "login") {
-			const authResult = await this.showLoginProviderSelector(loginOptions);
-			if (authResult.status === "success" && authResult.kind !== "service") {
-				this.invalidateConnectionModels();
-			}
-			// An MCP integration login enables its skill, so reload resources — but a
-			// reload is refused mid-turn, so tell the user to /reload (matching /mcp login).
-			if (authResult.status === "success" && authResult.providerId.startsWith("mcp:")) {
-				if (this.isAgentStreaming() || this.isAgentCompacting()) {
-					this.showStatus("Connected. Run /reload (after the current turn) to activate the integration.");
-				} else {
-					await this.handleReloadCommand();
-				}
-			}
-			return;
-		}
-
+	private async showLogoutSelector(): Promise<void> {
 		// Only reload when an MCP integration was actually removed (its skill must
 		// be disabled); a cancelled or non-MCP logout needs no reload.
 		const loggedOut = await this.createAuthFlows().runLogout();

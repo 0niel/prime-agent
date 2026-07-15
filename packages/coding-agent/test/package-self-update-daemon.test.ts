@@ -160,6 +160,10 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 			mockState.calls.push(`daemon-connect:${this.socketPath}`);
 		}
 
+		async waitForHello(): Promise<{ protocol: { version: number } }> {
+			return { protocol: { version: 2 } };
+		}
+
 		async request(request: MockDaemonRequest): Promise<MockDaemonResponse> {
 			mockState.calls.push(`daemon-request:${request.type}`);
 			mockState.requestPayloads.push(request);

@@ -27,6 +27,7 @@ describe("deleteSessionFile removes the session artifact directory", () => {
 		mkdirSync(artifactDir, { recursive: true });
 		writeFileSync(join(artifactDir, "kernel-state.dill"), "payload");
 		writeFileSync(join(artifactDir, "kernel-state.json"), "{}");
+		writeFileSync(join(artifactDir, "scheduled-jobs.json"), '{"jobs":[],"dispatches":[]}\n');
 
 		const result = await deleteSessionFile(sessionPath);
 

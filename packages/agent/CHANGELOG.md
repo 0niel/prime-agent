@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-13
+
+## [0.2.9] - 2026-07-13
+
 - Changed steering and follow-up queues to preserve grouped messages as an atomic batch.
 
 ## [0.2.8] - 2026-07-09

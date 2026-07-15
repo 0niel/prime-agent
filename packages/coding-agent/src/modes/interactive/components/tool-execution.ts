@@ -1,6 +1,7 @@
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { type Component, Container, getCapabilities, Image, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
 import type { ToolDefinition, ToolRenderContext, ToolRenderResultOptions } from "../../../core/extensions/types.js";
+import type { KernelSentAgentMessage } from "../../../core/kernel/index.js";
 import { createBashToolDefinition } from "../../../core/tools/bash.js";
 import { createEditToolDefinition } from "../../../core/tools/edit.js";
 import { createAllToolDefinitions } from "../../../core/tools/index.js";
@@ -9,6 +10,7 @@ import { convertToPng } from "../../../utils/image-convert.js";
 import type { AgentConnectionToolDefinition } from "../../agent-connection/index.js";
 import { type Theme, theme } from "../theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
+import { FileChangeSummaryComponent, getToolFileChanges } from "./edit-summary.js";
 import { getIpythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.js";
 import { ToolPanel } from "./tool-panel.js";
 
@@ -84,6 +86,7 @@ export class ToolExecutionComponent extends Container {
 	private toolCallId: string;
 	private args: any;
 	private expanded = false;
+	private showExpandHint = true;
 	private showImages: boolean;
 	private allowInlineImages: boolean;
 	private imageWidthCells: number;
@@ -94,6 +97,7 @@ export class ToolExecutionComponent extends Container {
 	private cwd: string;
 	private executionStarted = false;
 	private argsComplete = false;
+	private pendingSentAgentMessages: KernelSentAgentMessage[] = [];
 	private result?: {
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
 		isError: boolean;
@@ -122,8 +126,6 @@ export class ToolExecutionComponent extends Container {
 		this.imageWidthCells = options.imageWidthCells ?? 60;
 		this.ui = ui;
 		this.cwd = cwd;
-
-		this.addChild(new Spacer(1));
 
 		// Always create both shell variants. contentPanel is the tool panel used
 		// for default renderer-based composition (and the generic fallback when no
@@ -202,6 +204,7 @@ export class ToolExecutionComponent extends Container {
 			argsComplete: this.argsComplete,
 			isPartial: this.isPartial,
 			expanded: this.expanded,
+			showExpandHint: this.showExpandHint,
 			showImages: renderInlineImages,
 			includeImageDimensions: this.allowInlineImages,
 			isError: this.result?.isError ?? false,
@@ -245,10 +248,34 @@ export class ToolExecutionComponent extends Container {
 		},
 		isPartial = false,
 	): void {
-		this.result = result;
+		const details =
+			typeof result.details === "object" && result.details !== null
+				? (result.details as Record<string, unknown>)
+				: {};
+		const sentAgentMessages = Array.isArray(details.sentAgentMessages) ? [...details.sentAgentMessages] : [];
+		for (const message of this.pendingSentAgentMessages) {
+			if (
+				!sentAgentMessages.some(
+					(entry) => typeof entry === "object" && entry !== null && "id" in entry && entry.id === message.id,
+				)
+			) {
+				sentAgentMessages.push(message);
+			}
+		}
+		this.result = sentAgentMessages.length > 0 ? { ...result, details: { ...details, sentAgentMessages } } : result;
 		this.isPartial = isPartial;
 		this.updateDisplay();
 		this.maybeConvertImagesForKitty();
+	}
+
+	appendSentAgentMessage(message: KernelSentAgentMessage): void {
+		if (this.pendingSentAgentMessages.some((entry) => entry.id === message.id)) {
+			return;
+		}
+		this.pendingSentAgentMessages.push(message);
+		if (this.result) {
+			this.updateResult(this.result, this.isPartial);
+		}
 	}
 
 	private maybeConvertImagesForKitty(): void {
@@ -277,6 +304,14 @@ export class ToolExecutionComponent extends Container {
 
 	setExpanded(expanded: boolean): void {
 		this.expanded = expanded;
+		this.updateDisplay();
+	}
+
+	setShowExpandHint(show: boolean): void {
+		if (this.showExpandHint === show) {
+			return;
+		}
+		this.showExpandHint = show;
 		this.updateDisplay();
 	}
 
@@ -350,6 +385,7 @@ export class ToolExecutionComponent extends Container {
 					expanded: this.expanded,
 					executionStarted: this.executionStarted,
 					argsComplete: this.argsComplete,
+					showExpandHint: this.showExpandHint,
 					showImages: renderInlineImages,
 					cwd: this.cwd,
 				};
@@ -411,6 +447,18 @@ export class ToolExecutionComponent extends Container {
 					this.imageComponents.push(imageComponent);
 					this.addChild(imageComponent);
 				}
+			}
+		}
+
+		const isBuiltInEdit =
+			this.toolName === "edit" &&
+			(this.toolDefinition === undefined || this.toolDefinition.replayBuiltInToolName === "edit");
+		if (!this.expanded && this.result && (isBuiltInEdit || this.shouldUseIpythonRenderer())) {
+			const changes = getToolFileChanges(this.toolName, this.args, this.result, this.cwd);
+			if (changes.length > 0) {
+				const container = this.usesSelfRenderShell() ? this.selfRenderContainer : this.contentPanel;
+				container.addChild(new FileChangeSummaryComponent(changes, this.cwd));
+				hasContent = true;
 			}
 		}
 
@@ -517,4 +565,18 @@ export class ToolExecutionComponent extends Container {
 		}
 		return parts.join("\n\n");
 	}
+}
+
+export function selectLatestToolExpandHint(
+	existingComponents: readonly Component[],
+	latestComponent: ToolExecutionComponent,
+): void {
+	for (let index = existingComponents.length - 1; index >= 0; index--) {
+		const component = existingComponents[index];
+		if (component instanceof ToolExecutionComponent) {
+			component.setShowExpandHint(false);
+			break;
+		}
+	}
+	latestComponent.setShowExpandHint(true);
 }

@@ -78,7 +78,11 @@ async function probeDaemonVersion(socketPath: string): Promise<DaemonVersionProb
 }
 
 export async function listActiveDaemonSessionSummaries(client: DaemonClient): Promise<SessionSummary[]> {
-	const response = await client.request({ type: "list" });
+	const hello = await client.waitForHello(2000).catch(() => undefined);
+	const response =
+		hello && hello.protocol.version < DAEMON_PROTOCOL_VERSION
+			? await client.requestLegacy({ type: "list" })
+			: await client.request({ type: "list" });
 	if (!response.success) {
 		throw new Error(response.error);
 	}
@@ -129,8 +133,13 @@ export async function shutdownDaemonAndWait(socketPath: string, timeoutMs = 5000
 	let shutdownAccepted = false;
 	try {
 		await client.connect(1000);
-		const response = await client.request({ type: "shutdown" });
-		shutdownAccepted = response.success;
+		const hello = await client.waitForHello(2000).catch(() => undefined);
+		const request =
+			hello && hello.protocol.version < DAEMON_PROTOCOL_VERSION
+				? client.requestLegacy.bind(client)
+				: client.request.bind(client);
+		const response = await request({ type: "shutdown" }).catch(() => undefined);
+		shutdownAccepted = response?.success === true;
 	} catch {
 		// A connect failure isn't treated as "gone"; waitForDaemonGone is the source of truth.
 	} finally {
@@ -265,9 +274,12 @@ export function ensureInteractiveDaemonRunning(socketPath: string, spawnCwd?: st
 	if (!promise) {
 		promise = ensureDaemonRunning(socketPath, spawnCwd);
 		ensurePromises.set(socketPath, promise);
-		promise.catch(() => {
-			ensurePromises.delete(socketPath);
-		});
+		const clear = () => {
+			if (ensurePromises.get(socketPath) === promise) {
+				ensurePromises.delete(socketPath);
+			}
+		};
+		promise.then(clear, clear);
 	}
 	return promise;
 }

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -9,6 +9,10 @@ import { buildRlmBootstrapCode } from "../src/core/tools/ipython.js";
 describe("IPython RLM bootstrap", () => {
 	it("pre-imports asyncio so the prompt's subagent patterns work without a manual import", () => {
 		expect(buildRlmBootstrapCode()).toMatch(/^import asyncio$/m);
+	});
+
+	it("disables colored output for subprocesses launched by the kernel", () => {
+		expect(buildRlmBootstrapCode()).toContain('_prime_agent_os.environ["NO_COLOR"] = "1"');
 	});
 
 	it("guards Python skill imports so a broken skill does not abort bootstrap", () => {
@@ -62,6 +66,52 @@ describeIfKernel("IPython RLM bootstrap (real kernel)", () => {
 			const result = await manager.execute("_t = asyncio.create_task(asyncio.sleep(0))\nprint(type(_t).__name__)");
 			expect(result.status).toBe("ok");
 			expect(result.stdout).toContain("Task");
+
+			const bashResult = await manager.execute('%%bash\nprintf %s "$NO_COLOR"');
+			expect(bashResult.status).toBe("ok");
+			expect(bashResult.stdout).toBe("1");
+		} finally {
+			await manager.dispose();
+		}
+	}, 60_000);
+
+	it("emits canonical paths for edits after the kernel changes directories", async () => {
+		const firstDir = join(dir, "first");
+		const secondDir = join(dir, "second");
+		mkdirSync(firstDir, { recursive: true });
+		mkdirSync(secondDir, { recursive: true });
+		writeFileSync(join(firstDir, "same.txt"), "old");
+		writeFileSync(join(secondDir, "same.txt"), "old");
+		const editSkillRoot = join(process.cwd(), "skills", "edit");
+		const manager = new KernelManager({
+			python: python as string,
+			cwd: dir,
+			env: { PYTHONPATH: join(editSkillRoot, "src") },
+		});
+		try {
+			await manager.start();
+			const bootstrap = await manager.execute(
+				buildRlmBootstrapCode([
+					{
+						name: "edit",
+						importName: "edit",
+						packagePath: editSkillRoot,
+						pyprojectPath: join(editSkillRoot, "pyproject.toml"),
+					},
+				]),
+			);
+			expect(bootstrap.status).toBe("ok");
+
+			const first = await manager.execute(
+				'import os\nos.chdir("first")\nawait edit(path="same.txt", old_str="old", new_str="new")',
+			);
+			const second = await manager.execute(
+				'os.chdir("../second")\nawait edit(path="same.txt", old_str="old", new_str="new")',
+			);
+
+			expect(first.diffs?.[0]?.path).toBe(realpathSync(join(firstDir, "same.txt")));
+			expect(second.diffs?.[0]?.path).toBe(realpathSync(join(secondDir, "same.txt")));
+			expect(first.diffs?.[0]?.path).not.toBe(second.diffs?.[0]?.path);
 		} finally {
 			await manager.dispose();
 		}
