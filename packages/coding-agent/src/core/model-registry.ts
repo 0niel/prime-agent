@@ -28,6 +28,12 @@ import type { Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
+import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
+import {
+	fetchAuthorizedPrivatePrimeInferenceModelIds,
+	getPrivatePrimeInferenceModels,
+	isPrivatePrimeInferenceModel,
+} from "./prime-inference-models.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "./provider-display-names.js";
 import {
 	clearConfigValueCache,
@@ -358,6 +364,9 @@ export class ModelRegistry {
 	private lastProviderAuthSourceTokens: Map<string, AuthSourceToken> = new Map();
 	private modelRequestHeaders: Map<string, Record<string, string>> = new Map();
 	private registeredProviders: Map<string, ProviderConfigInput> = new Map();
+	private authorizedPrivatePrimeInferenceModelIds = new Set<string>();
+	private authorizedPrivatePrimeInferenceTeamId: string | undefined;
+	private explicitPrivatePrimeInferenceModelIds = new Set<string>();
 	private loadError: string | undefined = undefined;
 
 	/** Re-register dynamic OAuth providers (e.g. user MCP servers) after refresh() resets the registry. */
@@ -389,6 +398,9 @@ export class ModelRegistry {
 		this.providerRequestConfigs.clear();
 		this.modelRequestHeaders.clear();
 		this.lastProviderAuthSourceTokens.clear();
+		this.authorizedPrivatePrimeInferenceModelIds.clear();
+		this.authorizedPrivatePrimeInferenceTeamId = undefined;
+		this.explicitPrivatePrimeInferenceModelIds.clear();
 		this.loadError = undefined;
 
 		// Credentials may have been written by another process (e.g. the UI
@@ -436,7 +448,10 @@ export class ModelRegistry {
 			// Keep built-in models even if custom models failed to load
 		}
 
-		const builtInModels = this.loadBuiltInModels(overrides, modelOverrides);
+		this.explicitPrivatePrimeInferenceModelIds = new Set(
+			customModels.filter(isPrivatePrimeInferenceModel).map((model) => model.id),
+		);
+		const builtInModels = [...this.loadBuiltInModels(overrides, modelOverrides), ...getPrivatePrimeInferenceModels()];
 		let combined = this.mergeCustomModels(builtInModels, customModels);
 
 		// Let OAuth providers modify their models (e.g., update baseUrl)
@@ -682,7 +697,54 @@ export class ModelRegistry {
 	 * This is a fast check that doesn't refresh OAuth tokens.
 	 */
 	getAvailable(): Model<Api>[] {
-		return this.models.filter((m) => this.hasConfiguredAuth(m));
+		return this.models.filter((model) => {
+			if (
+				isPrivatePrimeInferenceModel(model) &&
+				!this.explicitPrivatePrimeInferenceModelIds.has(model.id) &&
+				!this.authorizedPrivatePrimeInferenceModelIds.has(model.id)
+			) {
+				return false;
+			}
+			return this.hasConfiguredAuth(model);
+		});
+	}
+
+	async refreshAvailableModels(): Promise<Model<Api>[]> {
+		const previousPrivateModelIds = new Set(this.authorizedPrivatePrimeInferenceModelIds);
+		const previousTeamId = this.authorizedPrivatePrimeInferenceTeamId;
+		this.refresh();
+		const apiKey = await this.authStorage.getApiKey(PRIME_INFERENCE_PROVIDER_ID);
+		const teamHeaders = this.authStorage.getProviderHeaders(PRIME_INFERENCE_PROVIDER_ID);
+		const teamId = teamHeaders?.["X-Prime-Team-ID"];
+		if (!apiKey || !teamHeaders || !teamId) {
+			return this.getAvailable();
+		}
+
+		try {
+			this.authorizedPrivatePrimeInferenceModelIds = await fetchAuthorizedPrivatePrimeInferenceModelIds(
+				apiKey,
+				teamHeaders,
+			);
+			this.authorizedPrivatePrimeInferenceTeamId = teamId;
+		} catch {
+			if (teamId === previousTeamId) {
+				this.authorizedPrivatePrimeInferenceModelIds = previousPrivateModelIds;
+				this.authorizedPrivatePrimeInferenceTeamId = teamId;
+			}
+		}
+		return this.getAvailable();
+	}
+
+	async canUseModel(model: Model<Api>): Promise<boolean> {
+		if (!this.hasConfiguredAuth(model)) {
+			return false;
+		}
+		if (!isPrivatePrimeInferenceModel(model)) {
+			return true;
+		}
+
+		const availableModels = await this.refreshAvailableModels();
+		return availableModels.some((candidate) => candidate.provider === model.provider && candidate.id === model.id);
 	}
 
 	/**

@@ -108,8 +108,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getAvailableModels(): Promise<AgentConnectionModel[]> {
-		this.session.modelRegistry.refresh();
-		return this.session.modelRegistry.getAvailable();
+		return this.session.modelRegistry.refreshAvailableModels();
 	}
 
 	async getSessionStats(): Promise<SessionStats> {
@@ -273,8 +272,8 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async setModel(provider: string, modelId: string): Promise<AgentConnectionModel> {
-		this.session.modelRegistry.refresh();
-		const model = this.session.modelRegistry.getAvailable().find((candidate) => {
+		const availableModels = await this.session.modelRegistry.refreshAvailableModels();
+		const model = availableModels.find((candidate) => {
 			return candidate.provider === provider && candidate.id === modelId;
 		});
 		if (!model) {

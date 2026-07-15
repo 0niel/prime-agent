@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getModel } from "../src/models.js";
 import { streamSimple } from "../src/stream.js";
+import type { Model } from "../src/types.js";
 
 // Empty tools arrays must NOT be serialized as `tools: []` — some OpenAI-compatible
 // backends (e.g. DashScope / Aliyun Qwen via compatible-mode) reject the request with
@@ -127,6 +128,37 @@ describe("openai-completions empty tools handling", () => {
 		expect(clientOptions.baseURL).toBe("https://gateway.ai.cloudflare.com/v1/account-id/gateway-id/compat");
 		expect(clientOptions.defaultHeaders?.Authorization).toBeNull();
 		expect(clientOptions.defaultHeaders?.["cf-aig-authorization"]).toBe("Bearer test");
+	});
+
+	it("uses OpenAI reasoning fields for an explicitly configured private Prime Inference route", async () => {
+		const model: Model<"openai-completions"> = {
+			id: "internal/glm-5.2-fast",
+			name: "GLM 5.2 Fast",
+			api: "openai-completions",
+			provider: "prime-inference",
+			baseUrl: "https://api.pinference.ai/api/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 131072,
+			compat: {
+				supportsDeveloperRole: false,
+				maxTokensField: "max_tokens",
+			},
+		};
+
+		await streamSimple(
+			model,
+			{
+				messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+			},
+			{ apiKey: "test", reasoning: "medium" },
+		).result();
+
+		const params = mockState.lastParams as { reasoning_effort?: string; enable_thinking?: boolean };
+		expect(params.reasoning_effort).toBe("medium");
+		expect(params.enable_thinking).toBeUndefined();
 	});
 
 	it("preserves inline upstream Authorization for Cloudflare AI Gateway BYOK requests", async () => {

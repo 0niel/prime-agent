@@ -135,7 +135,6 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	// prompt (opus-4.7/4.8, sonnet-4.6/5, fable-5 verified individually).
 	"anthropic/claude-sonnet-4": { contextWindow: 200000 },
 	"anthropic/claude-sonnet-4.5": { contextWindow: 200000 },
-	"internal/glm-5.2-fast": { name: "GLM 5.2 Fast" },
 	// Enforced windows measured against the live gateway 2026-07-08 where they
 	// are SMALLER than OpenRouter's listing — over-declaring breaks context
 	// tracking. (Measured by binary-searching the max_tokens reject boundary.)
@@ -174,7 +173,6 @@ const PRIME_INFERENCE_FEATURED_MODELS = new Set([
 	"deepseek/deepseek-v3.2",
 	"deepseek/deepseek-v4-flash",
 	"deepseek/deepseek-v4-pro",
-	"internal/glm-5.2-fast",
 	"minimax/minimax-m3",
 	"moonshotai/kimi-k2.7-code",
 	"nvidia/nemotron-3-nano-30b-a3b",
@@ -195,10 +193,8 @@ const PRIME_INFERENCE_FEATURED_MODELS = new Set([
 	"z-ai/glm-5.2",
 ]);
 
-// Prime ids whose OpenRouter listing uses a different id. internal/glm-5.2-fast
-// serves the same underlying model as z-ai/glm-5.2, so it borrows its metadata.
+// Prime ids whose OpenRouter listing uses a different id.
 const PRIME_INFERENCE_OPENROUTER_ALIASES: Record<string, string> = {
-	"internal/glm-5.2-fast": "z-ai/glm-5.2",
 	"nvidia/nvidia-nemotron-3-ultra-550b-a55b": "nvidia/nemotron-3-ultra-550b-a55b",
 };
 
@@ -217,6 +213,10 @@ function isPrimeInferenceRawVariant(modelId: string): boolean {
 	}
 	const vendor = modelId.split("/")[0] ?? "";
 	return vendor === "zai-org" || vendor !== vendor.toLowerCase();
+}
+
+function isPrimeInferencePrivateModel(modelId: string): boolean {
+	return modelId.toLowerCase().startsWith("internal/");
 }
 
 const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
@@ -403,7 +403,7 @@ function getPrimeInferenceHeaders(apiKey: string | undefined, teamId: string | u
 function getExistingPrimeInferenceModels(): Model<"openai-completions">[] {
 	const models = EXISTING_MODELS["prime-inference"] as unknown as Record<string, Model<"openai-completions">>;
 	return Object.values(models)
-		.filter((model) => !isPrimeInferenceRawVariant(model.id))
+		.filter((model) => !isPrimeInferenceRawVariant(model.id) && !isPrimeInferencePrivateModel(model.id))
 		.map((model) => ({
 			...model,
 			input: [...model.input],
@@ -506,7 +506,6 @@ function isPrimeInferenceReasoningModel(modelId: string, catalogReasoning?: bool
 	return (
 		id.includes("thinking") ||
 		id.includes("deepseek-v4") ||
-		id.startsWith("internal/glm-") ||
 		id.startsWith("minimax/minimax-m") ||
 		id.startsWith("moonshotai/kimi") ||
 		id.startsWith("x-ai/grok-4") ||
@@ -524,7 +523,7 @@ function getPrimeInferenceCompat(modelId: string): OpenAICompletionsCompat {
 			...DEEPSEEK_V4_COMPAT,
 		};
 	}
-	if (id.startsWith("z-ai/glm-") || id.startsWith("internal/glm-")) {
+	if (id.startsWith("z-ai/glm-")) {
 		return {
 			...PRIME_INFERENCE_COMPAT,
 			...ZAI_THINKING_COMPAT,
@@ -633,7 +632,7 @@ async function fetchPrimeInferenceModels(): Promise<Model<"openai-completions">[
 	}
 
 	const catalogModels = catalog
-		.filter((entry) => !isPrimeInferenceRawVariant(entry.id))
+		.filter((entry) => !isPrimeInferenceRawVariant(entry.id) && !isPrimeInferencePrivateModel(entry.id))
 		.map((entry) =>
 			createPrimeInferenceModel(
 				entry,
@@ -643,15 +642,8 @@ async function fetchPrimeInferenceModels(): Promise<Model<"openai-completions">[
 		);
 	let snapshotModels = getExistingPrimeInferenceModels();
 	if (catalog.length > 0) {
-		// A successful fetch is authoritative for public routes, so delisted
-		// models drop out automatically. Snapshot-only entries survive just for
-		// the team-gated internal/ namespace, which vanishes from the catalog
-		// when the fetch runs without team credentials. (Retiring an internal
-		// route therefore requires pruning it from models.generated.ts by hand.)
-		const liveIds = new Set(catalog.map((entry) => entry.id.toLowerCase()));
-		snapshotModels = snapshotModels.filter(
-			(model) => liveIds.has(model.id.toLowerCase()) || model.id.toLowerCase().startsWith("internal/"),
-		);
+		const liveIds = new Set(catalogModels.map((model) => model.id.toLowerCase()));
+		snapshotModels = snapshotModels.filter((model) => liveIds.has(model.id.toLowerCase()));
 	}
 	snapshotModels = refreshPrimeInferenceAliasLimits(snapshotModels, catalogModels);
 	const models = mergePrimeInferenceModels(snapshotModels, catalogModels);

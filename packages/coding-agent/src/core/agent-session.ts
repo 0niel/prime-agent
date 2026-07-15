@@ -4103,12 +4103,15 @@ export class AgentSession {
 
 	/**
 	 * Set model directly.
-	 * Validates that auth is configured, saves to session and settings.
-	 * @throws Error if no auth is configured for the model
+	 * Validates that the model is available, saves to session and settings.
+	 * @throws Error if the model is not available
 	 */
 	async setModel(model: Model<any>, options: ModelSelectOptions = {}): Promise<void> {
 		if (!this._modelRegistry.hasConfiguredAuth(model)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
+		}
+		if (!(await this._modelRegistry.canUseModel(model))) {
+			throw new Error(`Model "${model.provider}/${model.id}" is not available for the current Prime team.`);
 		}
 
 		const previousModel = this.model;
@@ -4170,7 +4173,10 @@ export class AgentSession {
 		direction: "forward" | "backward",
 		options: ModelSelectOptions,
 	): Promise<ModelCycleResult | undefined> {
-		const scopedModels = this._scopedModels.filter((scoped) => this._modelRegistry.hasConfiguredAuth(scoped.model));
+		const availableModels = await this._modelRegistry.refreshAvailableModels();
+		const scopedModels = this._scopedModels.filter((scoped) =>
+			availableModels.some((model) => modelsAreEqual(model, scoped.model)),
+		);
 		if (scopedModels.length <= 1) return undefined;
 
 		const currentModel = this.model;
@@ -4207,7 +4213,7 @@ export class AgentSession {
 		direction: "forward" | "backward",
 		options: ModelSelectOptions,
 	): Promise<ModelCycleResult | undefined> {
-		const availableModels = await this._modelRegistry.getAvailable();
+		const availableModels = await this._modelRegistry.refreshAvailableModels();
 		if (availableModels.length <= 1) return undefined;
 
 		const currentModel = this.model;
