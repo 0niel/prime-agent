@@ -97,4 +97,38 @@ describe("snapshot transcript cache", () => {
 		release();
 		expect(() => cache.readChunk(0)).toThrow("Unknown snapshot transcript chunk");
 	});
+
+	it("fails pending readers before deferred disposal", async () => {
+		const cache = new SnapshotTranscriptCache({
+			activeSessionId: "active-e",
+			snapshotId: "snapshot-e",
+			cacheRoot: tempDir(),
+		});
+		const release = cache.retain();
+		const pending = cache.waitForChunk(0);
+		const failure = new Error("snapshot source failed");
+
+		cache.markFailed(failure);
+		cache.dispose();
+
+		await expect(pending).rejects.toBe(failure);
+		release();
+		expect(cache.complete).toBe(false);
+	});
+
+	it("completes repeated endings idempotently", () => {
+		const cache = new SnapshotTranscriptCache({
+			activeSessionId: "active-f",
+			snapshotId: "snapshot-f",
+			cacheRoot: tempDir(),
+		});
+		cache.appendEncodedChunk(Buffer.from("chunk"));
+
+		cache.markComplete();
+		cache.markComplete();
+
+		expect(cache.complete).toBe(true);
+		expect(() => cache.appendEncodedChunk(Buffer.from("stale"))).toThrow("is not writable");
+		cache.dispose();
+	});
 });

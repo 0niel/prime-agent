@@ -1722,7 +1722,9 @@ export class AgentDaemon {
 		socket.on("error", cleanup);
 		socket.on("drain", () => {
 			if (!client.snapshotStreaming) {
-				void this.catchUpBackpressuredClient(client);
+				void this.catchUpBackpressuredClient(client).catch((error) =>
+					this.log(`could not catch up snapshot client ${client.id}: ${String(error)}`),
+				);
 			}
 		});
 	}
@@ -2035,7 +2037,11 @@ export class AgentDaemon {
 							targetChunkBytes: transcript.targetChunkBytes,
 						},
 					};
-					setImmediate(() => void this.streamWorkerSnapshot(client, streamedResult, transcript, "attach", true));
+					setImmediate(() => {
+						void this.streamWorkerSnapshot(client, streamedResult, transcript, "attach", true).catch((error) =>
+							this.log(`could not stream attach snapshot: ${String(error)}`),
+						);
+					});
 					return success(command.id, "attach", streamedResult);
 				}
 				// Slim clients consume only the command response; legacy clients (e.g.
@@ -2865,11 +2871,19 @@ export class AgentDaemon {
 				},
 				purpose,
 			);
+		} catch (error) {
+			const streamError = error instanceof Error ? error : new Error(String(error));
+			transcript.markFailed(streamError);
+			transcript.dispose();
+			client.socket.destroy(streamError);
+			throw streamError;
 		} finally {
 			finishClientSnapshotStreaming(client, result.activeSessionId);
 			transcript.dispose();
 			if (!client.snapshotStreaming && client.catchupActiveSessionIds?.size) {
-				void this.catchUpBackpressuredClient(client);
+				void this.catchUpBackpressuredClient(client).catch((error) =>
+					this.log(`could not catch up snapshot client ${client.id}: ${String(error)}`),
+				);
 			}
 		}
 	}
