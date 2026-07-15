@@ -3,6 +3,7 @@ import type { EditorPasteSnapshot } from "../editor-component.js";
 import { getKeybindings } from "../keybindings.js";
 import { decodePrintableKey, matchesKey } from "../keys.js";
 import { KillRing } from "../kill-ring.js";
+import { getSlashCommandContext, type SlashCommandContext } from "../slash-command-context.js";
 import { type Component, CURSOR_MARKER, type Focusable, type TUI } from "../tui.js";
 import { UndoStack } from "../undo-stack.js";
 import { getSegmenter, isPunctuationChar, isWhitespaceChar, truncateToWidth, visibleWidth } from "../utils.js";
@@ -278,6 +279,7 @@ export class Editor implements Component, Focusable {
 	private autocompleteList?: SelectList;
 	private autocompleteState: "regular" | "force" | null = null;
 	private autocompletePrefix: string = "";
+	private autocompleteKind?: AutocompleteSuggestions["kind"];
 	private autocompleteMaxVisible: number = 5;
 	private autocompleteAbort?: AbortController;
 	private autocompleteDebounceTimer?: ReturnType<typeof setTimeout>;
@@ -761,6 +763,14 @@ export class Editor implements Component, Focusable {
 			if (kb.matches(data, "tui.select.confirm")) {
 				const selected = this.autocompleteList.getSelectedItem();
 				if (selected && this.autocompleteProvider) {
+					const slashContext = this.getCurrentSlashCommandContext();
+					const isSlashCommandCompletion =
+						this.autocompleteKind === "slash-command" ||
+						(this.autocompleteKind === undefined &&
+							this.autocompleteState === "regular" &&
+							this.autocompletePrefix.startsWith("/"));
+					const shouldSubmitSlashCommand =
+						isSlashCommandCompletion && slashContext?.kind === "name" && slashContext.isAtPromptStart;
 					this.pushUndoSnapshot();
 					this.lastAction = null;
 					const result = this.autocompleteProvider.applyCompletion(
@@ -774,9 +784,9 @@ export class Editor implements Component, Focusable {
 					this.state.cursorLine = result.cursorLine;
 					this.setCursorCol(result.cursorCol);
 
-					if (this.autocompletePrefix.startsWith("/")) {
+					if (isSlashCommandCompletion) {
 						this.cancelAutocomplete();
-						if (selected.takesArgument) {
+						if (!shouldSubmitSlashCommand || selected.takesArgument) {
 							if (this.onChange) this.onChange(this.getText());
 							return;
 						}
@@ -1210,8 +1220,8 @@ export class Editor implements Component, Focusable {
 
 		// Check if we should trigger or update autocomplete
 		if (!this.autocompleteState) {
-			// Auto-trigger for "/" at the start of a line (slash commands)
-			if (char === "/" && this.isAtStartOfMessage()) {
+			const slashContext = this.getCurrentSlashCommandContext();
+			if (char === "/" && slashContext?.kind === "name") {
 				this.tryTriggerAutocomplete();
 			}
 			// Auto-trigger for symbol-based completion like @ or # at token boundaries
@@ -1227,8 +1237,7 @@ export class Editor implements Component, Focusable {
 			else if (/[a-zA-Z0-9.\-_]/.test(char)) {
 				const currentLine = this.state.lines[this.state.cursorLine] || "";
 				const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
-				// Check if we're in a slash command (with or without space for arguments)
-				if (this.isInSlashCommandContext(textBeforeCursor)) {
+				if (slashContext) {
 					this.tryTriggerAutocomplete();
 				}
 				// Check if we're in a symbol-based completion context like @ or #
@@ -1414,8 +1423,7 @@ export class Editor implements Component, Focusable {
 			// If autocomplete was cancelled (no matches), re-trigger if we're in a completable context
 			const currentLine = this.state.lines[this.state.cursorLine] || "";
 			const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
-			// Slash command context
-			if (this.isInSlashCommandContext(textBeforeCursor)) {
+			if (this.getCurrentSlashCommandContext()) {
 				this.tryTriggerAutocomplete();
 			}
 			// Symbol-based completion context like @ or #
@@ -1781,8 +1789,7 @@ export class Editor implements Component, Focusable {
 		} else {
 			const currentLine = this.state.lines[this.state.cursorLine] || "";
 			const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
-			// Slash command context
-			if (this.isInSlashCommandContext(textBeforeCursor)) {
+			if (this.getCurrentSlashCommandContext()) {
 				this.tryTriggerAutocomplete();
 			}
 			// Symbol-based completion context like @ or #
@@ -2226,21 +2233,8 @@ export class Editor implements Component, Focusable {
 		this.setCursorCol(newCol);
 	}
 
-	// Slash menu only allowed on the first line of the editor
-	private isSlashMenuAllowed(): boolean {
-		return this.state.cursorLine === 0;
-	}
-
-	// Helper method to check if cursor is at start of message (for slash command detection)
-	private isAtStartOfMessage(): boolean {
-		if (!this.isSlashMenuAllowed()) return false;
-		const currentLine = this.state.lines[this.state.cursorLine] || "";
-		const beforeCursor = currentLine.slice(0, this.state.cursorCol);
-		return beforeCursor.trim() === "" || beforeCursor.trim() === "/";
-	}
-
-	private isInSlashCommandContext(textBeforeCursor: string): boolean {
-		return this.isSlashMenuAllowed() && textBeforeCursor.trimStart().startsWith("/");
+	private getCurrentSlashCommandContext(): SlashCommandContext | null {
+		return getSlashCommandContext(this.state.lines, this.state.cursorLine, this.state.cursorCol);
 	}
 
 	// Autocomplete methods
@@ -2273,12 +2267,12 @@ export class Editor implements Component, Focusable {
 		return firstPrefixIndex;
 	}
 
-	private createAutocompleteList(
-		prefix: string,
-		items: Array<{ value: string; label: string; description?: string }>,
-	): SelectList {
-		const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
-		return new SelectList(items, this.autocompleteMaxVisible, this.theme.selectList, layout);
+	private createAutocompleteList(suggestions: AutocompleteSuggestions): SelectList {
+		const layout =
+			suggestions.kind === "slash-command" || (suggestions.kind === undefined && suggestions.prefix.startsWith("/"))
+				? SLASH_COMMAND_SELECT_LIST_LAYOUT
+				: undefined;
+		return new SelectList(suggestions.items, this.autocompleteMaxVisible, this.theme.selectList, layout);
 	}
 
 	private tryTriggerAutocomplete(explicitTab: boolean = false): void {
@@ -2288,10 +2282,7 @@ export class Editor implements Component, Focusable {
 	private handleTabCompletion(): void {
 		if (!this.autocompleteProvider) return;
 
-		const currentLine = this.state.lines[this.state.cursorLine] || "";
-		const beforeCursor = currentLine.slice(0, this.state.cursorCol);
-
-		if (this.isInSlashCommandContext(beforeCursor) && !beforeCursor.trimStart().includes(" ")) {
+		if (this.getCurrentSlashCommandContext()?.kind === "name") {
 			this.handleSlashCommandCompletion();
 		} else {
 			this.forceFileAutocomplete(true);
@@ -2441,9 +2432,11 @@ export class Editor implements Component, Focusable {
 
 	private applyAutocompleteSuggestions(suggestions: AutocompleteSuggestions, state: "regular" | "force"): void {
 		this.autocompletePrefix = suggestions.prefix;
-		this.autocompleteList = this.createAutocompleteList(suggestions.prefix, suggestions.items);
+		this.autocompleteKind = suggestions.kind;
+		this.autocompleteList = this.createAutocompleteList(suggestions);
 
-		const bestMatchIndex = this.getBestAutocompleteMatchIndex(suggestions.items, suggestions.prefix);
+		const matchingPrefix = suggestions.kind === "slash-command" ? suggestions.prefix.slice(1) : suggestions.prefix;
+		const bestMatchIndex = this.getBestAutocompleteMatchIndex(suggestions.items, matchingPrefix);
 		if (bestMatchIndex >= 0) {
 			this.autocompleteList.setSelectedIndex(bestMatchIndex);
 		}
@@ -2465,6 +2458,7 @@ export class Editor implements Component, Focusable {
 		this.autocompleteState = null;
 		this.autocompleteList = undefined;
 		this.autocompletePrefix = "";
+		this.autocompleteKind = undefined;
 	}
 
 	protected cancelAutocomplete(): void {
