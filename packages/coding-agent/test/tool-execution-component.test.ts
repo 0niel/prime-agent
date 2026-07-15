@@ -546,4 +546,98 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).toContain("custom_tool");
 		expect(rendered).toContain("done");
 	});
+	test("does not add built-in edit stats to custom IPython renderers", () => {
+		const component = new ToolExecutionComponent(
+			"ipython",
+			"custom-ipython",
+			{},
+			{},
+			{
+				...createBaseToolDefinition("ipython"),
+				renderCall: () => new Text("custom ipython", 0, 0),
+			},
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult({
+			content: [],
+			details: { diffs: [{ path: "README.md", oldStr: "before", newStr: "after" }] },
+			isError: false,
+		});
+
+		const rendered = stripAnsi(component.render(120).join("\n"));
+		expect(rendered).toContain("custom ipython");
+		expect(rendered).not.toContain("README.md +1 -1");
+	});
+
+	test("globally expands built-in IPython source associated with diffs", () => {
+		const component = new ToolExecutionComponent(
+			"ipython",
+			"tool-ipython-edit",
+			{
+				code: 'hidden_side_effect = "only in full source"\nawait edit(path="README.md", old_str="before", new_str="after")',
+			},
+			{},
+			undefined,
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.markExecutionStarted();
+		component.setArgsComplete();
+		component.updateResult(
+			{
+				content: [],
+				details: {
+					status: "ok",
+					diffs: [{ path: "README.md", oldStr: "before", newStr: "after", startLine: 1 }],
+				},
+				isError: false,
+			},
+			false,
+		);
+
+		const collapsed = stripAnsi(component.render(120).join("\n"));
+		expect(collapsed).not.toContain("hidden_side_effect");
+		expect(collapsed).toContain("README.md +1 -1");
+
+		component.setExpanded(true);
+		const expanded = stripAnsi(component.render(120).join("\n"));
+		expect(expanded).toContain('hidden_side_effect = "only in full source"');
+		expect(expanded).toContain("before");
+		expect(expanded).toContain("after");
+	});
+
+	test("collapses built-in edit diffs to a one-line file stat", () => {
+		const component = new ToolExecutionComponent(
+			"edit",
+			"tool-collapsed-edit",
+			{ path: "README.md", edits: [{ oldText: "before", newText: "after" }] },
+			{},
+			createEditToolDefinition(process.cwd()),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.setArgsComplete();
+		component.updateResult(
+			{ content: [], details: { diff: "-1 before\n+1 after", firstChangedLine: 1 }, isError: false },
+			false,
+		);
+
+		const collapsed = stripAnsi(component.render(120).join("\n"));
+		expect(collapsed).toContain("╰─ README.md +1 -1");
+		expect(collapsed).toContain("to expand");
+		expect(collapsed).not.toContain("before");
+		expect(collapsed).not.toContain("after");
+
+		component.setShowExpandHint(false);
+		expect(stripAnsi(component.render(120).join("\n"))).not.toContain("to expand");
+
+		component.setShowExpandHint(true);
+		component.setExpanded(true);
+		const expanded = stripAnsi(component.render(120).join("\n"));
+		expect(expanded).toContain("before");
+		expect(expanded).toContain("after");
+		expect(expanded).toContain("to collapse");
+		expect(expanded).not.toContain("README.md +1 -1");
+	});
 });

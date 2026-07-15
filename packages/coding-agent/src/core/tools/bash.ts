@@ -204,6 +204,7 @@ function rebuildBashResultRenderComponent(
 	options: ToolRenderResultOptions,
 	showImages: boolean,
 	includeImageDimensions: boolean,
+	showExpandHint: boolean,
 	startedAt: number | undefined,
 	endedAt: number | undefined,
 ): void {
@@ -230,9 +231,10 @@ function rebuildBashResultRenderComponent(
 						state.cachedWidth = width;
 					}
 					if (state.cachedSkipped && state.cachedSkipped > 0) {
-						const hint =
-							theme.fg("muted", `... (${state.cachedSkipped} earlier lines,`) +
-							` ${keyHint("app.tools.expand", "to expand")})`;
+						const hint = showExpandHint
+							? theme.fg("muted", `... (${state.cachedSkipped} earlier lines,`) +
+								` ${keyHint("app.tools.expand", "to expand")})`
+							: theme.fg("muted", `... (${state.cachedSkipped} earlier lines)`);
 						return ["", truncateToWidth(hint, width, "..."), ...(state.cachedLines ?? [])];
 					}
 					return ["", ...(state.cachedLines ?? [])];
@@ -438,6 +440,7 @@ export function createBashToolDefinition(
 				options,
 				context.showImages,
 				context.includeImageDimensions,
+				context.showExpandHint !== false,
 				state.startedAt,
 				state.endedAt,
 			);

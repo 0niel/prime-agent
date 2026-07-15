@@ -2,7 +2,10 @@
 
 ## [Unreleased]
 
+- Added compact file change stats to collapsed tool calls and an agent-run edit total above the recap.
+- Changed tool expansion hints to appear only on the latest tool row instead of every tool call ([ENG-4583](https://linear.app/primeintellect/issue/ENG-4583/too-many-ctrlo-alerts)).
 - Changed IPython kernels to set `NO_COLOR=1`, preventing ANSI color escapes from inflating `%%bash` output.
+- Fixed tool-only responses rendering directly against the preceding user prompt.
 
 ## [0.3.0] - 2026-07-13
 

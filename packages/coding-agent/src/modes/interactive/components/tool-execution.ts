@@ -10,6 +10,7 @@ import { convertToPng } from "../../../utils/image-convert.js";
 import type { AgentConnectionToolDefinition } from "../../agent-connection/index.js";
 import { type Theme, theme } from "../theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
+import { FileChangeSummaryComponent, getToolFileChanges } from "./edit-summary.js";
 import { getIpythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.js";
 import { ToolPanel } from "./tool-panel.js";
 
@@ -85,6 +86,7 @@ export class ToolExecutionComponent extends Container {
 	private toolCallId: string;
 	private args: any;
 	private expanded = false;
+	private showExpandHint = true;
 	private showImages: boolean;
 	private allowInlineImages: boolean;
 	private imageWidthCells: number;
@@ -202,6 +204,7 @@ export class ToolExecutionComponent extends Container {
 			argsComplete: this.argsComplete,
 			isPartial: this.isPartial,
 			expanded: this.expanded,
+			showExpandHint: this.showExpandHint,
 			showImages: renderInlineImages,
 			includeImageDimensions: this.allowInlineImages,
 			isError: this.result?.isError ?? false,
@@ -304,6 +307,14 @@ export class ToolExecutionComponent extends Container {
 		this.updateDisplay();
 	}
 
+	setShowExpandHint(show: boolean): void {
+		if (this.showExpandHint === show) {
+			return;
+		}
+		this.showExpandHint = show;
+		this.updateDisplay();
+	}
+
 	setShowImages(show: boolean): void {
 		this.showImages = show;
 		if (show) {
@@ -374,6 +385,7 @@ export class ToolExecutionComponent extends Container {
 					expanded: this.expanded,
 					executionStarted: this.executionStarted,
 					argsComplete: this.argsComplete,
+					showExpandHint: this.showExpandHint,
 					showImages: renderInlineImages,
 					cwd: this.cwd,
 				};
@@ -435,6 +447,18 @@ export class ToolExecutionComponent extends Container {
 					this.imageComponents.push(imageComponent);
 					this.addChild(imageComponent);
 				}
+			}
+		}
+
+		const isBuiltInEdit =
+			this.toolName === "edit" &&
+			(this.toolDefinition === undefined || this.toolDefinition.replayBuiltInToolName === "edit");
+		if (!this.expanded && this.result && (isBuiltInEdit || this.shouldUseIpythonRenderer())) {
+			const changes = getToolFileChanges(this.toolName, this.args, this.result, this.cwd);
+			if (changes.length > 0) {
+				const container = this.usesSelfRenderShell() ? this.selfRenderContainer : this.contentPanel;
+				container.addChild(new FileChangeSummaryComponent(changes, this.cwd));
+				hasContent = true;
 			}
 		}
 
@@ -541,4 +565,18 @@ export class ToolExecutionComponent extends Container {
 		}
 		return parts.join("\n\n");
 	}
+}
+
+export function selectLatestToolExpandHint(
+	existingComponents: readonly Component[],
+	latestComponent: ToolExecutionComponent,
+): void {
+	for (let index = existingComponents.length - 1; index >= 0; index--) {
+		const component = existingComponents[index];
+		if (component instanceof ToolExecutionComponent) {
+			component.setShowExpandHint(false);
+			break;
+		}
+	}
+	latestComponent.setShowExpandHint(true);
 }

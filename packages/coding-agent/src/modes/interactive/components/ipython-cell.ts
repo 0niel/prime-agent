@@ -30,6 +30,7 @@ export interface IPythonCellState {
 	isPartial?: boolean;
 	isError?: boolean;
 	expanded?: boolean;
+	showExpandHint?: boolean;
 	executionStarted?: boolean;
 	argsComplete?: boolean;
 	showImages?: boolean;
@@ -358,8 +359,7 @@ export class IPythonCellComponent implements Component {
 		const lines = [truncateToWidth(` ${this.collapsedLine(details)}`, safeWidth, "")];
 
 		const hasDiffs = (details.diffs?.length ?? 0) > 0;
-		// Edits always show their diff under the top line, regardless of expand state.
-		if (hasDiffs) {
+		if (hasDiffs && this.state.expanded) {
 			this.renderDiffs(lines, safeWidth, details.diffs ?? [], this.marker(details));
 		}
 		if ((details.sentAgentMessages?.length ?? 0) > 0) {
@@ -370,7 +370,7 @@ export class IPythonCellComponent implements Component {
 			return this.renderCache.set(safeWidth, cacheVersion, lines);
 		}
 
-		const hasCode = this.renderCode(lines, safeWidth, hasDiffs);
+		const hasCode = this.renderCode(lines, safeWidth);
 		this.renderOutput(lines, safeWidth, details, hasCode);
 		return this.renderCache.set(safeWidth, cacheVersion, lines);
 	}
@@ -403,7 +403,9 @@ export class IPythonCellComponent implements Component {
 			parts.push(theme.fg("error", errorName));
 		}
 
-		parts.push(keyHint("app.tools.expand", this.state.expanded ? "to collapse" : "to expand"));
+		if (this.state.showExpandHint !== false) {
+			parts.push(keyHint("app.tools.expand", this.state.expanded ? "to collapse" : "to expand"));
+		}
 		return parts.join(theme.fg("dim", " · "));
 	}
 
@@ -479,11 +481,7 @@ export class IPythonCellComponent implements Component {
 	}
 
 	// Only runs when expanded — shows the full source below the fixed top line.
-	// Edits skip the source: their diff already renders above and conveys the change.
-	private renderCode(lines: string[], width: number, hasDiffs: boolean): boolean {
-		if (hasDiffs) {
-			return false;
-		}
+	private renderCode(lines: string[], width: number): boolean {
 		const code = this.state.code.trimEnd();
 		if (!code) {
 			this.addBlank(lines, width);
@@ -628,7 +626,6 @@ export class IPythonCellComponent implements Component {
 		}
 	}
 
-	// Edits always render in full, regardless of expand state. Grouped by file.
 	private renderDiffs(lines: string[], width: number, diffs: readonly DiffDisplay[], marker: string): void {
 		const diffsByPath = new Map<string, DiffDisplay[]>();
 		for (const diff of diffs) {
