@@ -362,6 +362,38 @@ describe("Markdown component", () => {
 			assert.ok(extracted.includes(url), "Should preserve URL");
 		});
 
+		it("should expose wrapped table cell boundaries without changing rendered text", () => {
+			setCapabilities({ images: null, trueColor: false, hyperlinks: false });
+			const url = "https://example.com/this/is/a/long/path";
+			const markdown = new Markdown(
+				`| URL | Status |
+| --- | --- |
+| ${url} | ready |`,
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const lines = markdown.render(32);
+			resetCapabilitiesCache();
+			const regions = markdown.getSelectionRegions();
+			const urlRegions = regions.filter((region) => region.row === 1 && region.column === 0);
+			const statusRegions = regions.filter((region) => region.row === 1 && region.column === 1);
+
+			assert.ok(urlRegions.length > 1, "URL cell should wrap across physical lines");
+			assert.strictEqual(statusRegions.length, urlRegions.length);
+			assert.ok(
+				lines.every((line) => !line.includes("\x1b_pi:table:")),
+				"metadata markers must be stripped",
+			);
+			assert.ok(urlRegions.every((region) => region.table === urlRegions[0].table));
+			assert.ok(urlRegions.every((region) => region.content === url));
+			for (let i = 0; i < urlRegions.length; i++) {
+				assert.strictEqual(urlRegions[i].line, statusRegions[i].line);
+				assert.ok(urlRegions[i].col + urlRegions[i].width < statusRegions[i].col);
+			}
+		});
+
 		it("should wrap styled inline code inside table cells without breaking borders", () => {
 			const markdown = new Markdown(
 				`| Code |

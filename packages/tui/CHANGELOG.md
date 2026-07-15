@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed fullscreen Markdown table selections copying borders instead of tab-separated cell content ([ENG-4629](https://linear.app/primeintellect/issue/ENG-4629/respect-table-boundaries-when-selecting)).
 - Fixed fullscreen drag selection so holding at a transcript edge scrolls through offscreen text ([ENG-4644](https://linear.app/primeintellect/issue/ENG-4644/copy-issues)).
 - Fixed slash-command and skill autocomplete not appearing for references typed in the middle of prompts ([ENG-4628](https://linear.app/primeintellect/issue/ENG-4628/support-skill-and-command-autocomplete-mid-prompt)).
 - Fixed focused full-pane overlays becoming slow to navigate on wider terminals.

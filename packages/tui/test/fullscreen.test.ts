@@ -1,7 +1,10 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
+import { Box } from "../src/components/box.js";
+import { Markdown } from "../src/components/markdown.js";
 import type { TerminalStopOptions } from "../src/terminal.js";
-import { type Component, TUI } from "../src/tui.js";
+import { type Component, Container, TUI } from "../src/tui.js";
+import { defaultMarkdownTheme } from "./test-themes.js";
 import { VirtualTerminal } from "./virtual-terminal.js";
 
 class TestComponent implements Component {
@@ -638,6 +641,97 @@ describe("TUI fullscreen mode", () => {
 		terminal.sendInput("\x1b[<0;6;2m");
 		await terminal.waitForRender();
 		assert.deepStrictEqual(copies, ["Line 12\nLine"]);
+
+		tui.stop();
+	});
+
+	it("keeps wrapped table-cell selection inside the originating cell", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 12);
+		const tui = new TUI(terminal);
+		const markdown = new Markdown(
+			`| URL | Status |
+| --- | --- |
+| https://example.com/this/is/a/very/long/path | should-not-copy |`,
+			0,
+			0,
+			defaultMarkdownTheme,
+		);
+		const box = new Box(1, 0);
+		box.addChild(markdown);
+		const chat = new Container();
+		chat.addChild(box);
+		const dock = new TestComponent();
+		dock.lines = ["> prompt", "footer"];
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.addChild(chat);
+		tui.addChild(dock);
+		tui.start();
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		const lines = chat.render(40);
+		const regions = chat
+			.getSelectionRegions()
+			.filter((region) => region.row === 1 && region.column === 0)
+			.sort((a, b) => a.segment - b.segment);
+		assert.ok(regions.length > 1, "URL cell should wrap across physical lines");
+		assert.ok(lines.length <= 10, "table should fit without scrolling");
+
+		const first = regions[0];
+		const last = regions.at(-1)!;
+		const expected = first.content;
+		terminal.sendInput(`\x1b[<0;${first.col + 1};${first.line + 1}M`);
+		terminal.sendInput(`\x1b[<32;${last.col + last.width + 1};${last.line + 1}M`);
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("\x1b[7m"), "cell selection should be highlighted");
+
+		terminal.sendInput(`\x1b[<0;${last.col + last.width + 1};${last.line + 1}m`);
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, [expected]);
+		assert.ok(!copies[0].includes("should-not-copy"));
+
+		tui.stop();
+	});
+
+	it("copies table selections as tab-separated content without borders", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 12);
+		const tui = new TUI(terminal);
+		const markdown = new Markdown(
+			`| Name | Score | City |
+| --- | --- | --- |
+| Avery | 87 | Seattle |
+| Jordan | 92 | Austin |
+| Morgan | 74 | Boston |`,
+			0,
+			0,
+			defaultMarkdownTheme,
+		);
+		const box = new Box(1, 0);
+		box.addChild(markdown);
+		const chat = new Container();
+		chat.addChild(box);
+		const dock = new TestComponent();
+		dock.lines = ["> prompt", "footer"];
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.addChild(chat);
+		tui.addChild(dock);
+		tui.start();
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		const tableRegions = chat.getSelectionRegions();
+		const { tableTop: top, tableBottom: bottom, tableLeft: left, tableRight: right } = tableRegions[0];
+		terminal.sendInput(`\x1b[<0;${left};${top + 1}M`);
+		terminal.sendInput(`\x1b[<32;${right};${bottom + 1}M`);
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("\x1b[7m"), "table cell contents should be highlighted");
+
+		terminal.sendInput(`\x1b[<0;${right};${bottom + 1}m`);
+		await terminal.waitForRender();
+		assert.deepStrictEqual(copies, ["Name\tScore\tCity\nAvery\t87\tSeattle\nJordan\t92\tAustin\nMorgan\t74\tBoston"]);
+		assert.ok(!/[┌┬┐├┼┤└┴┘│─]/.test(copies[0]));
 
 		tui.stop();
 	});

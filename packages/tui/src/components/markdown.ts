@@ -1,8 +1,15 @@
 import { Marked, type Token, Tokenizer, type TokenizerExtension, type Tokens } from "marked";
 import { latexToUnicode } from "../latex.js";
+import {
+	extractTableCellSelectionRegions,
+	markTableCell,
+	markTableEnd,
+	markTableStart,
+	type TableCellSelectionRegion,
+} from "../selection-metadata.js";
 import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.js";
 import type { Component } from "../tui.js";
-import { applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.js";
+import { applyBackgroundToLine, stripAnsi, visibleWidth, wrapTextWithAnsi } from "../utils.js";
 
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
 
@@ -184,6 +191,8 @@ export class Markdown implements Component {
 	private cachedText?: string;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
+	private selectionRegions: TableCellSelectionRegion[] = [];
+	private tableIdentities: object[] = [];
 	// Per-block render cache so streaming appends only re-render the changing
 	// final block instead of the whole document. Keyed by width/type/nextType/raw;
 	// rebuilt each render so it stays bounded to the current document's blocks.
@@ -210,12 +219,14 @@ export class Markdown implements Component {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		this.selectionRegions = [];
 	}
 
 	invalidate(): void {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		this.selectionRegions = [];
 		// External invalidation (e.g. theme change) affects rendered output, so
 		// the per-block cache must go too.
 		this.blockCache = new Map();
@@ -233,6 +244,7 @@ export class Markdown implements Component {
 		// Don't render anything if there's no actual text
 		if (!this.text || this.text.trim() === "") {
 			const result: string[] = [];
+			this.selectionRegions = [];
 			// Update cache
 			this.cachedText = this.text;
 			this.cachedWidth = width;
@@ -282,7 +294,12 @@ export class Markdown implements Component {
 		}
 
 		// Combine top padding, content, and bottom padding
-		const result = [...emptyLines, ...contentLines, ...emptyLines];
+		const markedResult = [...emptyLines, ...contentLines, ...emptyLines];
+		const { lines: result, regions } = extractTableCellSelectionRegions(markedResult, (index) => {
+			this.tableIdentities[index] ??= {};
+			return this.tableIdentities[index];
+		});
+		this.selectionRegions = regions;
 
 		// Update cache
 		this.cachedText = this.text;
@@ -290,6 +307,10 @@ export class Markdown implements Component {
 		this.cachedLines = result;
 
 		return result.length > 0 ? result : [""];
+	}
+
+	getSelectionRegions(): ReadonlyArray<TableCellSelectionRegion> {
+		return this.selectionRegions;
 	}
 
 	/** Render one top-level block: token lines, wrapping, margins, background. */
@@ -933,20 +954,20 @@ export class Markdown implements Component {
 
 		// Render top border
 		const topBorderCells = columnWidths.map((w) => "─".repeat(w));
-		lines.push(`┌─${topBorderCells.join("─┬─")}─┐`);
+		lines.push(markTableStart(`┌─${topBorderCells.join("─┬─")}─┐`));
 
 		// Render header with wrapping
-		const headerCellLines: string[][] = token.header.map((cell, i) => {
+		const headerCells = token.header.map((cell, i) => {
 			const text = this.renderInlineTokens(cell.tokens || [], styleContext);
-			return this.wrapCellText(text, columnWidths[i]);
+			return { lines: this.wrapCellText(text, columnWidths[i]), content: stripAnsi(text) };
 		});
-		const headerLineCount = Math.max(...headerCellLines.map((c) => c.length));
+		const headerLineCount = Math.max(...headerCells.map((cell) => cell.lines.length));
 
 		for (let lineIdx = 0; lineIdx < headerLineCount; lineIdx++) {
-			const rowParts = headerCellLines.map((cellLines, colIdx) => {
-				const text = cellLines[lineIdx] || "";
+			const rowParts = headerCells.map((cell, colIdx) => {
+				const text = cell.lines[lineIdx] || "";
 				const padded = text + " ".repeat(Math.max(0, columnWidths[colIdx] - visibleWidth(text)));
-				return this.theme.bold(padded);
+				return markTableCell(this.theme.bold(padded), 0, colIdx, lineIdx, cell.content);
 			});
 			lines.push(`│ ${rowParts.join(" │ ")} │`);
 		}
@@ -959,16 +980,17 @@ export class Markdown implements Component {
 		// Render rows with wrapping
 		for (let rowIndex = 0; rowIndex < token.rows.length; rowIndex++) {
 			const row = token.rows[rowIndex];
-			const rowCellLines: string[][] = row.map((cell, i) => {
+			const rowCells = row.map((cell, i) => {
 				const text = this.renderInlineTokens(cell.tokens || [], styleContext);
-				return this.wrapCellText(text, columnWidths[i]);
+				return { lines: this.wrapCellText(text, columnWidths[i]), content: stripAnsi(text) };
 			});
-			const rowLineCount = Math.max(...rowCellLines.map((c) => c.length));
+			const rowLineCount = Math.max(...rowCells.map((cell) => cell.lines.length));
 
 			for (let lineIdx = 0; lineIdx < rowLineCount; lineIdx++) {
-				const rowParts = rowCellLines.map((cellLines, colIdx) => {
-					const text = cellLines[lineIdx] || "";
-					return text + " ".repeat(Math.max(0, columnWidths[colIdx] - visibleWidth(text)));
+				const rowParts = rowCells.map((cell, colIdx) => {
+					const text = cell.lines[lineIdx] || "";
+					const padded = text + " ".repeat(Math.max(0, columnWidths[colIdx] - visibleWidth(text)));
+					return markTableCell(padded, rowIndex + 1, colIdx, lineIdx, cell.content);
 				});
 				lines.push(`│ ${rowParts.join(" │ ")} │`);
 			}
@@ -980,7 +1002,7 @@ export class Markdown implements Component {
 
 		// Render bottom border
 		const bottomBorderCells = columnWidths.map((w) => "─".repeat(w));
-		lines.push(`└─${bottomBorderCells.join("─┴─")}─┘`);
+		lines.push(markTableEnd(`└─${bottomBorderCells.join("─┴─")}─┘`));
 
 		if (nextTokenType && nextTokenType !== "space") {
 			lines.push(""); // Add spacing after table

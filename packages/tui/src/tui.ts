@@ -10,6 +10,7 @@ import { FullscreenViewport, type ScrollInfo, type SelectionScrollDirection } fr
 import { getKeybindings } from "./keybindings.js";
 import { isKeyRelease, matchesKey } from "./keys.js";
 import { isMouseSequence, isWheelDown, isWheelUp, MOUSE_BUTTON_LEFT, parseSgrMouseEvent } from "./mouse.js";
+import type { TableCellSelectionRegion } from "./selection-metadata.js";
 import type { Terminal } from "./terminal.js";
 import { deleteKittyImage, getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.js";
 import {
@@ -53,6 +54,8 @@ export interface Component {
 	 * @returns Array of strings, each representing a line
 	 */
 	render(width: number): string[];
+
+	getSelectionRegions?(): ReadonlyArray<TableCellSelectionRegion>;
 
 	/**
 	 * Optional handler for keyboard input when component has focus
@@ -238,23 +241,28 @@ export interface OverlayHandle {
  */
 export class Container implements Component {
 	children: Component[] = [];
+	private selectionRegions: TableCellSelectionRegion[] = [];
 
 	addChild(component: Component): void {
 		this.children.push(component);
+		this.selectionRegions = [];
 	}
 
 	removeChild(component: Component): void {
 		const index = this.children.indexOf(component);
 		if (index !== -1) {
 			this.children.splice(index, 1);
+			this.selectionRegions = [];
 		}
 	}
 
 	clear(): void {
 		this.children = [];
+		this.selectionRegions = [];
 	}
 
 	invalidate(): void {
+		this.selectionRegions = [];
 		for (const child of this.children) {
 			child.invalidate?.();
 		}
@@ -262,13 +270,28 @@ export class Container implements Component {
 
 	render(width: number): string[] {
 		const lines: string[] = [];
+		const selectionRegions: TableCellSelectionRegion[] = [];
 		for (const child of this.children) {
+			const lineOffset = lines.length;
 			const childLines = child.render(width);
+			for (const region of child.getSelectionRegions?.() ?? []) {
+				selectionRegions.push({
+					...region,
+					line: region.line + lineOffset,
+					tableTop: region.tableTop + lineOffset,
+					tableBottom: region.tableBottom + lineOffset,
+				});
+			}
 			for (const line of childLines) {
 				lines.push(line);
 			}
 		}
+		this.selectionRegions = selectionRegions;
 		return lines;
+	}
+
+	getSelectionRegions(): ReadonlyArray<TableCellSelectionRegion> {
+		return this.selectionRegions;
 	}
 }
 
@@ -1389,14 +1412,25 @@ export class TUI extends Container {
 		this.overlaySelectionRegions = [];
 
 		const transcript: string[] = [];
+		const selectionRegions: TableCellSelectionRegion[] = [];
 		for (const component of fullscreen.scroll) {
-			for (const line of component.render(width)) {
+			const lineOffset = transcript.length;
+			const componentLines = component.render(width);
+			for (const region of component.getSelectionRegions?.() ?? []) {
+				selectionRegions.push({
+					...region,
+					line: region.line + lineOffset,
+					tableTop: region.tableTop + lineOffset,
+					tableBottom: region.tableBottom + lineOffset,
+				});
+			}
+			for (const line of componentLines) {
 				transcript.push(line);
 			}
 		}
 		const dock = fullscreen.dock.render(width);
 
-		let frame = fullscreen.viewport.composeFrame(transcript, dock, height);
+		let frame = fullscreen.viewport.composeFrame(transcript, dock, height, selectionRegions);
 		this.overlaySelectionRegions.push(
 			...this.createDockSelectionRegions(frame, fullscreen.viewport.windowHeight(), width),
 		);
