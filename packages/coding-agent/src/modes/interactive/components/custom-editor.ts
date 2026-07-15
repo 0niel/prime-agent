@@ -1,4 +1,5 @@
 import {
+	CURSOR_MARKER,
 	Editor,
 	type EditorOptions,
 	type EditorTheme,
@@ -287,9 +288,12 @@ export class CustomEditor extends Editor {
 		const promptLeadingPadding = " ".repeat(promptPrefixInset);
 		const promptTrailingPadding = " ".repeat(Math.max(0, paddingX - promptPrefixInset));
 		const rightPadding = " ".repeat(paddingX);
-		const placeholderText = truncateToWidth(this.placeholder ?? "", inputWidth, "");
-		const displayText = this.placeholderColor(placeholderText);
-		const padding = " ".repeat(Math.max(0, inputWidth - visibleWidth(placeholderText)));
+		const placeholderWidth = Math.max(0, inputWidth - 1);
+		const placeholderText = truncateToWidth(this.placeholder ?? "", placeholderWidth, "");
+		const cursorMarker = this.focused && !this.isShowingAutocomplete() ? CURSOR_MARKER : "";
+		const cursorReset = this.backgroundColor ? "\x1b[27m" : "\x1b[0m";
+		const displayText = `${cursorMarker}\x1b[7m ${cursorReset}${this.placeholderColor(placeholderText)}`;
+		const padding = " ".repeat(Math.max(0, placeholderWidth - visibleWidth(placeholderText)));
 		const line = `${promptLeadingPadding}${promptPrefix}${promptTrailingPadding}${displayText}${padding}${rightPadding}`;
 		const padded = line + " ".repeat(Math.max(0, width - visibleWidth(line)));
 		return this.backgroundColor ? this.backgroundColor(padded) : padded;
