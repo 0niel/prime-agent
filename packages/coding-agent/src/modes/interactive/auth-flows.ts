@@ -167,17 +167,7 @@ export class ProviderAuthFlows {
 				providerOptions,
 				async (providerOption: AuthSelectorProvider) => {
 					close();
-
-					if (providerOption.authType === "oauth") {
-						resolve(await this.showLoginDialog(providerOption.id, providerOption.name, providerOption.category));
-					} else if (providerOption.id === PRIME_INFERENCE_PROVIDER_ID) {
-						resolve(await this.runPrimeInferenceLogin());
-					} else if (providerOption.id === BEDROCK_PROVIDER_ID) {
-						resolve(await this.showBedrockSetupDialog(providerOption.id, providerOption.name));
-					} else {
-						const kind = providerOption.id === SERPER_CREDENTIAL_ID ? "service" : "provider";
-						resolve(await this.showApiKeyLoginDialog(providerOption.id, providerOption.name, kind));
-					}
+					resolve(await this.loginProvider(providerOption));
 				},
 				() => {
 					close();
@@ -188,6 +178,20 @@ export class ProviderAuthFlows {
 			);
 			handle = showFullPaneOverlay(this.host.ui, selector, 78);
 		});
+	}
+
+	loginProvider(providerOption: AuthSelectorProvider): Promise<AuthenticationResult> {
+		const kind = providerOption.category === "service" ? "service" : "provider";
+		if (providerOption.authType === "oauth") {
+			return this.showLoginDialog(providerOption.id, providerOption.name, kind);
+		}
+		if (providerOption.id === PRIME_INFERENCE_PROVIDER_ID) {
+			return this.runPrimeInferenceLogin();
+		}
+		if (providerOption.id === BEDROCK_PROVIDER_ID) {
+			return this.showBedrockSetupDialog(providerOption.id, providerOption.name);
+		}
+		return this.showApiKeyLoginDialog(providerOption.id, providerOption.name, kind);
 	}
 
 	/** Shows the stored-credential selector and removes the chosen credential. */
@@ -240,7 +244,7 @@ export class ProviderAuthFlows {
 		});
 	}
 
-	private getLoginProviderOptions(authType?: "oauth" | "api_key"): AuthSelectorProvider[] {
+	getLoginProviderOptions(authType?: "oauth" | "api_key"): AuthSelectorProvider[] {
 		const authStorage = this.host.modelRegistry.authStorage;
 		const oauthProviders = authStorage.getOAuthProviders();
 		const oauthProviderIds = new Set(oauthProviders.map((provider) => provider.id));

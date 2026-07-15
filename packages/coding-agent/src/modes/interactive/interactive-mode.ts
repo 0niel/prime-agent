@@ -141,12 +141,7 @@ import {
 	formatUpdateAvailableNotice,
 } from "../shared/startup-notices.js";
 import { AGENT_ACTIVITY_LABELS, AgentActivityTracker, formatTokenCount } from "./agent-activity.js";
-import {
-	type AuthenticationResult,
-	getAnthropicSubscriptionAuthWarning,
-	ProviderAuthFlows,
-	type ProviderLoginOptions,
-} from "./auth-flows.js";
+import { type AuthenticationResult, getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "./auth-flows.js";
 import { AgentMessageComponent } from "./components/agent-message.js";
 import { ArminComponent } from "./components/armin.js";
 import { AssistantMessageComponent } from "./components/assistant-message.js";
@@ -160,6 +155,7 @@ import {
 	ChildAgentSummaryComponent,
 } from "./components/child-agent-inspector.js";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
+import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
 import { buildConversationComponents } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
@@ -175,7 +171,7 @@ import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FooterComponent } from "./components/footer.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
-import { type ModelSelectorAction, ModelSelectorComponent } from "./components/model-selector.js";
+import type { AuthSelectorProvider } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
 import { SessionPickerScreen } from "./components/session-picker-screen.js";
@@ -462,13 +458,7 @@ type GoalAnnouncementSnapshot = {
 	lastError?: string;
 };
 
-type ModelSelectionResult = { status: "selected" } | { status: "cancelled" } | { status: "action"; actionId: string };
-
 type ModelFallbackWarningAction = "show" | "suppress";
-
-const MODEL_SELECTOR_ACTIONS: readonly ModelSelectorAction[] = [
-	{ id: "add_provider", label: "Add provider...", description: "subscription or API key" },
-];
 
 const THINKING_LEVEL_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	off: "No reasoning",
@@ -1460,23 +1450,17 @@ export class InteractiveMode {
 				return;
 			}
 
-			await this.promptForModelSelection({ allowProviderSetup: true });
+			await this.showConfigurationMenu("models");
 			return;
 		}
 
 		const availableModels = await this.getModelCandidates();
 		if (availableModels.length > 0) {
-			await this.promptForModelSelection({ allowProviderSetup: true });
+			await this.showConfigurationMenu("models");
 			return;
 		}
 
-		const authResult = await this.showOnboardingPrimeLogin();
-		if (authResult.status !== "success") {
-			return;
-		}
-
-		await this.prepareForModelSelectionAfterLogin(authResult);
-		await this.promptForModelSelection({ allowProviderSetup: true });
+		await this.showConfigurationMenu("providers");
 	}
 
 	private getMarkdownThemeWithSettings(): MarkdownTheme {
@@ -3997,12 +3981,12 @@ export class InteractiveMode {
 				}
 				if (commandName === "login" && !commandArgs) {
 					this.editor.setText("");
-					await this.showOAuthSelector("login");
+					await this.showConfigurationMenu("providers");
 					return;
 				}
 				if (commandName === "logout" && !commandArgs) {
 					this.editor.setText("");
-					await this.showOAuthSelector("logout");
+					await this.showLogoutSelector();
 					return;
 				}
 				if (commandName === "mcp") {
@@ -6986,128 +6970,113 @@ export class InteractiveMode {
 	}
 
 	private showModelSelector(initialSearchInput?: string): void {
-		void this.showModelSelectorWithProviderSetup(initialSearchInput);
+		void this.showConfigurationMenu("models", initialSearchInput);
 	}
 
-	private async showModelSelectorWithProviderSetup(initialSearchInput?: string): Promise<void> {
-		let nextSearchInput = initialSearchInput;
-		while (true) {
-			const result = await this.showModelSelectorAsync(nextSearchInput, {
-				actions: MODEL_SELECTOR_ACTIONS,
-			});
-			if (result.status !== "action") {
-				return;
-			}
-			const authResult = await this.showLoginProviderSelector();
-			await this.prepareForModelSelectionAfterLogin(authResult);
-			nextSearchInput = undefined;
-		}
-	}
-
-	private async promptForModelSelection(options: { allowProviderSetup?: boolean } = {}): Promise<boolean> {
-		while (true) {
-			this.showStatus("Select a model to continue.");
-			const result = await this.showModelSelectorAsync(
-				undefined,
-				options.allowProviderSetup
-					? {
-							actions: MODEL_SELECTOR_ACTIONS,
-							subtitle: "Choose a Prime model, or add another provider.",
-						}
-					: undefined,
-			);
-			if (result.status === "selected") {
-				return true;
-			}
-			if (result.status !== "action") {
-				return false;
-			}
-
-			const authResult = await this.showLoginProviderSelector();
-			await this.prepareForModelSelectionAfterLogin(authResult);
-		}
-	}
-
-	private async showModelSelectorAsync(
-		initialSearchInput?: string,
-		options?: { actions?: ReadonlyArray<ModelSelectorAction>; subtitle?: string },
-	): Promise<ModelSelectionResult> {
+	private showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
 		const availableModels = this.getCachedModelCandidates();
+		const authFlows = this.createAuthFlows();
+		const providerOptions = authFlows.getLoginProviderOptions();
 
 		return new Promise((resolve) => {
 			let handle: OverlayHandle | undefined;
 			let settled = false;
-			let selector: ModelSelectorComponent | undefined;
-			const settle = (result: ModelSelectionResult) => {
-				if (settled) {
-					return;
-				}
-				settled = true;
-				resolve(result);
-			};
-			const close = () => {
+			let hidden = false;
+			let menu: ConfigurationMenuComponent;
+			const hide = () => {
+				if (hidden) return;
+				hidden = true;
 				handle?.hide();
 				this.ui.requestRender();
 			};
-
-			selector = new ModelSelectorComponent(
-				this.ui,
-				this.getCurrentModel(),
-				this.modelRegistry,
-				this.getScopedModelState(),
-				async (model) => {
-					close();
-					this.showStatus(`Switching model: ${model.id}`);
-					try {
-						await this.applySelectedModel(model);
-						this.showStatus(`Model: ${model.id}`);
-						void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
-						this.checkDaxnutsEasterEgg(model);
-						settle({ status: "selected" });
-					} catch (error) {
-						close();
-						this.showError(error instanceof Error ? error.message : String(error));
-						settle({ status: "cancelled" });
-					}
-				},
-				() => {
-					close();
-					settle({ status: "cancelled" });
-				},
-				initialSearchInput,
-				{
-					actions: options?.actions,
-					availableModels,
-					onAction: (actionId) => {
-						close();
-						settle({ status: "action", actionId });
-					},
-					subtitle: options?.subtitle,
-					getRows: () => this.ui.terminal.rows,
-					recentModels: this.settingsManager.getRecentModels(),
-				},
-			);
-			handle = this.showFullPaneOverlay(selector, 96);
-
-			const refreshPromise = this.getModelSelectorRefreshPromise({ force: initialSearchInput !== undefined });
-			if (refreshPromise) {
+			const finish = () => {
+				if (settled) return;
+				settled = true;
+				hide();
+				resolve();
+			};
+			const restore = () => {
+				if (settled) return;
+				hidden = false;
+				handle?.setHidden(false);
+				handle?.focus();
+				this.ui.requestRender();
+			};
+			const refreshModels = (force: boolean) => {
+				const refreshPromise = this.getModelSelectorRefreshPromise({ force });
+				if (!refreshPromise) return;
 				void refreshPromise
 					.then((models) => {
-						if (settled || !selector) {
-							return undefined;
-						}
-						return selector.updateAvailableModels(models);
+						if (!settled) menu.updateModels(this.getCurrentModel(), models);
 					})
 					.catch((error) => {
-						if (!settled) {
-							this.showError(error instanceof Error ? error.message : String(error));
-							if (availableModels.length === 0) {
-								close();
-								settle({ status: "cancelled" });
-							}
-						}
+						if (!settled) this.showError(error instanceof Error ? error.message : String(error));
 					});
-			}
+			};
+			const authenticate = (provider: AuthSelectorProvider, tab: "providers" | "mcp-connections") => {
+				if (settled) return;
+				handle?.setHidden(true);
+				void authFlows
+					.loginProvider(provider)
+					.then(async (authResult) => {
+						if (settled) return;
+						restore();
+						menu.refreshAuthentication();
+						if (authResult.status !== "success") return;
+
+						if (tab === "mcp-connections") {
+							if (!authResult.providerId.startsWith("mcp:")) return;
+							if (this.isAgentStreaming() || this.isAgentCompacting()) {
+								this.showStatus("Connected. Run /reload (after the current turn) to activate the integration.");
+								return;
+							}
+							finish();
+							await this.handleReloadCommand();
+							return;
+						}
+
+						await this.prepareForModelSelectionAfterLogin(authResult);
+						menu.updateModels(this.getCurrentModel());
+						menu.setActiveTab("models");
+						refreshModels(true);
+					})
+					.catch((error) => {
+						restore();
+						this.showError(error instanceof Error ? error.message : String(error));
+					});
+			};
+
+			menu = new ConfigurationMenuComponent({
+				initialTab,
+				tui: this.ui,
+				authStorage: this.modelRegistry.authStorage,
+				providerOptions,
+				modelRegistry: this.modelRegistry,
+				currentModel: this.getCurrentModel(),
+				scopedModels: this.getScopedModelState(),
+				availableModels,
+				recentModels: this.settingsManager.getRecentModels(),
+				initialModelSearch,
+				getRows: () => this.ui.terminal.rows,
+				requestRender: () => this.ui.requestRender(),
+				onSelectProvider: (provider) => authenticate(provider, "providers"),
+				onSelectMcpConnection: (provider) => authenticate(provider, "mcp-connections"),
+				onSelectModel: (model) => {
+					hide();
+					this.showStatus(`Switching model: ${model.id}`);
+					void this.applySelectedModel(model)
+						.then(() => {
+							this.showStatus(`Model: ${model.id}`);
+							void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
+							this.checkDaxnutsEasterEgg(model);
+						})
+						.catch((error) => this.showError(error instanceof Error ? error.message : String(error)))
+						.finally(finish);
+				},
+				onCancel: finish,
+			});
+			handle = this.showFullPaneOverlay(menu, 96);
+			refreshModels(initialModelSearch !== undefined);
 		});
 	}
 
@@ -7488,46 +7457,6 @@ export class InteractiveMode {
 		}
 	}
 
-	private showOnboardingPrimeLogin(): Promise<AuthenticationResult> {
-		return new Promise((resolve) => {
-			let settled = false;
-			let handle: OverlayHandle | undefined;
-			let selector: PrimeOnboardingSplashComponent | undefined;
-			const settle = (result: AuthenticationResult) => {
-				if (settled) {
-					return;
-				}
-				settled = true;
-				resolve(result);
-			};
-			const close = () => {
-				selector?.dispose();
-				handle?.hide();
-				this.ui.requestRender();
-			};
-			selector = new PrimeOnboardingSplashComponent(
-				() => {
-					close();
-					void this.createAuthFlows().runPrimeInferenceLogin().then(settle);
-				},
-				() => {
-					close();
-					settle({ status: "cancelled" });
-				},
-				{
-					getRows: () => this.ui.terminal.rows,
-					requestRender: () => this.ui.requestRender(),
-				},
-			);
-			handle = this.ui.showOverlay(selector, {
-				width: "100%",
-				maxHeight: "100%",
-				row: 0,
-				col: 0,
-			});
-		});
-	}
-
 	private showOnboardingModelSelectionSplash(): Promise<boolean> {
 		return new Promise((resolve) => {
 			let settled = false;
@@ -7587,19 +7516,31 @@ export class InteractiveMode {
 		});
 	}
 
-	private showLoginProviderSelector(options: ProviderLoginOptions = {}): Promise<AuthenticationResult> {
-		return this.createAuthFlows().runLogin(options);
-	}
-
 	private async prepareForModelSelectionAfterLogin(authResult: AuthenticationResult): Promise<boolean> {
 		if (authResult.status === "success" && authResult.kind !== "service") {
 			this.invalidateConnectionModels();
 		}
 
 		const currentModel = this.getCurrentModel();
-		const action = resolvePrimeInferencePostLoginModelAction(authResult, currentModel, this.modelRegistry);
+		// The agent core uses unknown/unknown as its no-model sentinel.
+		const selectedModel =
+			currentModel?.provider === "unknown" && currentModel.id === "unknown" ? undefined : currentModel;
+		let action = resolvePrimeInferencePostLoginModelAction(authResult, selectedModel, this.modelRegistry);
 		if (!action.openModelPicker) {
 			return false;
+		}
+
+		if (!selectedModel) {
+			try {
+				const availableModels = await this.getConnectionAvailableModels();
+				action = resolvePrimeInferencePostLoginModelAction(authResult, selectedModel, {
+					find: (provider, modelId) =>
+						availableModels.find((model) => model.provider === provider && model.id === modelId) ??
+						this.modelRegistry.find(provider, modelId),
+				});
+			} catch {
+				// Preserve the registry fallback so selection can still report a specific failure below.
+			}
 		}
 
 		if (action.fallbackModel) {
@@ -7611,7 +7552,7 @@ export class InteractiveMode {
 					`Prime Inference login succeeded, but the default model could not be selected: ${error instanceof Error ? error.message : String(error)}`,
 				);
 			}
-		} else if (!currentModel) {
+		} else if (!selectedModel) {
 			this.showError("Prime Inference login succeeded, but the default GLM 5.2 model is unavailable.");
 		}
 
@@ -7621,7 +7562,7 @@ export class InteractiveMode {
 	private async handleMcpCommand(args: string | undefined): Promise<void> {
 		const [sub, server] = (args ?? "").trim().split(/\s+/);
 		if (!sub) {
-			await this.showOAuthSelector("login", { initialCategory: "service" });
+			await this.showConfigurationMenu("mcp-connections");
 			return;
 		}
 
@@ -7682,25 +7623,7 @@ export class InteractiveMode {
 		this.showError(`Unknown /mcp subcommand: ${sub}. Use list, login, or logout.`);
 	}
 
-	private async showOAuthSelector(mode: "login" | "logout", loginOptions: ProviderLoginOptions = {}): Promise<void> {
-		if (mode === "login") {
-			const authResult = await this.showLoginProviderSelector(loginOptions);
-			const shouldOpenModelPicker = await this.prepareForModelSelectionAfterLogin(authResult);
-			// An MCP integration login enables its skill, so reload resources — but a
-			// reload is refused mid-turn, so tell the user to /reload (matching /mcp login).
-			if (authResult.status === "success" && authResult.providerId.startsWith("mcp:")) {
-				if (this.isAgentStreaming() || this.isAgentCompacting()) {
-					this.showStatus("Connected. Run /reload (after the current turn) to activate the integration.");
-				} else {
-					await this.handleReloadCommand();
-				}
-			}
-			if (shouldOpenModelPicker) {
-				await this.showModelSelectorWithProviderSetup();
-			}
-			return;
-		}
-
+	private async showLogoutSelector(): Promise<void> {
 		// Only reload when an MCP integration was actually removed (its skill must
 		// be disabled); a cancelled or non-MCP logout needs no reload.
 		const loggedOut = await this.createAuthFlows().runLogout();

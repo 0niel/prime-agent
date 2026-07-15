@@ -43,9 +43,9 @@ describe("built-in slash commands", () => {
 		expect(builtinSlashCommandTakesArgument("side")).toBe(true);
 	});
 
-	test("describes /mcp as the Services menu entry point", () => {
+	test("describes /mcp as the MCP Connections menu entry point", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "mcp")).toMatchObject({
-			description: "Open Services or manage MCP integrations",
+			description: "Open MCP Connections or manage MCP integrations",
 			argumentHint: "[list|login <name>|logout <name>]",
 			takesArgument: true,
 		});

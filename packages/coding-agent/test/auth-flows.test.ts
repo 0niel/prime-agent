@@ -207,7 +207,7 @@ describe("ProviderAuthFlows", () => {
 		await expect(logoutResult).resolves.toBeNull();
 	});
 
-	it("opens login on the requested Services category", async () => {
+	it("opens login on the requested MCP Connections category", async () => {
 		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
 		const { host, overlays } = createHost(authStorage);
 

@@ -47,9 +47,10 @@ import {
 	ProviderAuthFlows,
 } from "../interactive/auth-flows.js";
 import { showFullPaneOverlay } from "../interactive/components/centered-overlay.js";
+import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "../interactive/components/configuration-menu.js";
 import { CustomEditor } from "../interactive/components/custom-editor.js";
 import { keyText } from "../interactive/components/keybinding-hints.js";
-import { ModelSelectorComponent } from "../interactive/components/model-selector.js";
+import type { AuthSelectorProvider } from "../interactive/components/oauth-selector.js";
 import { SessionPickerScreen } from "../interactive/components/session-picker-screen.js";
 import { type SessionListCallbacks, SessionSelectorComponent } from "../interactive/components/session-selector.js";
 import { BrandSplashHeader, InteractiveMode } from "../interactive/interactive-mode.js";
@@ -962,13 +963,18 @@ class AgentsViewMode implements Component, Focusable {
 
 	private async runSlashCommand(command: ParsedSlashCommand): Promise<void> {
 		switch (command.name as AgentsViewCommandName) {
-			case "login": {
-				const authResult = await this.createAuthFlows().runLogin();
-				await this.handleProviderLoginResult(authResult);
+			case "login":
+				await this.showConfigurationMenu("providers");
 				return;
-			}
 			case "logout":
 				await this.createAuthFlows().runLogout();
+				return;
+			case "mcp":
+				if (command.args) {
+					this.setStatusMessage("MCP subcommands are only available inside an agent session.");
+					return;
+				}
+				await this.showConfigurationMenu("mcp-connections");
 				return;
 			case "model": {
 				const searchTerm = command.args || undefined;
@@ -984,7 +990,7 @@ class AgentsViewMode implements Component, Focusable {
 						return;
 					}
 				}
-				await this.showModelSelector(searchTerm);
+				await this.showConfigurationMenu("models", searchTerm);
 				return;
 			}
 			case "resume":
@@ -1014,7 +1020,7 @@ class AgentsViewMode implements Component, Focusable {
 		});
 	}
 
-	private async handleProviderLoginResult(authResult: AuthenticationResult): Promise<void> {
+	private async applyPrimeInferenceFallbackAfterLogin(authResult: AuthenticationResult): Promise<void> {
 		const currentModel = this.getDefaultModelForNewAgents();
 		const action = resolvePrimeInferencePostLoginModelAction(
 			authResult,
@@ -1033,7 +1039,6 @@ class AgentsViewMode implements Component, Focusable {
 				tone: "error",
 			});
 		}
-		await this.showModelSelector();
 	}
 
 	private async maybeWarnAboutAnthropicSubscriptionAuth(model: Model<Api> | undefined): Promise<void> {
@@ -1051,41 +1056,76 @@ class AgentsViewMode implements Component, Focusable {
 		this.setStatusMessage(warning, { tone: "warning", sticky: true });
 	}
 
-	private showModelSelector(initialSearchInput?: string): Promise<void> {
+	private showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
 		const modelRegistry = this.options.uiServices.modelRegistry;
-		const availableModels = modelRegistry.getAvailable();
-		if (availableModels.length === 0) {
-			this.setStatusMessage("No models available. Add credentials with /login.");
-			return Promise.resolve();
-		}
+		const authFlows = this.createAuthFlows();
 		return new Promise((resolve) => {
 			let handle: OverlayHandle | undefined;
-			const close = () => {
+			let settled = false;
+			let hidden = false;
+			let menu: ConfigurationMenuComponent;
+			const hide = () => {
+				if (hidden) return;
+				hidden = true;
 				handle?.hide();
 				this.ui.requestRender();
 			};
-			const selector = new ModelSelectorComponent(
-				this.ui,
-				this.getDefaultModelForNewAgents(),
+			const finish = () => {
+				if (settled) return;
+				settled = true;
+				hide();
+				resolve();
+			};
+			const restore = () => {
+				if (settled) return;
+				hidden = false;
+				handle?.setHidden(false);
+				handle?.focus();
+				this.ui.requestRender();
+			};
+			const authenticate = (provider: AuthSelectorProvider, tab: "providers" | "mcp-connections") => {
+				if (settled) return;
+				handle?.setHidden(true);
+				void authFlows
+					.loginProvider(provider)
+					.then(async (authResult) => {
+						if (settled) return;
+						restore();
+						menu.refreshAuthentication();
+						if (authResult.status !== "success" || tab === "mcp-connections") return;
+
+						await this.applyPrimeInferenceFallbackAfterLogin(authResult);
+						menu.updateModels(this.getDefaultModelForNewAgents(), modelRegistry.getAvailable());
+						menu.setActiveTab("models");
+					})
+					.catch((error) => {
+						restore();
+						this.setStatusMessage(error instanceof Error ? error.message : String(error), { tone: "error" });
+					});
+			};
+
+			menu = new ConfigurationMenuComponent({
+				initialTab,
+				tui: this.ui,
+				authStorage: modelRegistry.authStorage,
+				providerOptions: authFlows.getLoginProviderOptions(),
 				modelRegistry,
-				[],
-				(model) => {
-					close();
+				currentModel: this.getDefaultModelForNewAgents(),
+				scopedModels: [],
+				availableModels: modelRegistry.getAvailable(),
+				recentModels: this.options.uiServices.settingsManager.getRecentModels(),
+				initialModelSearch,
+				getRows: () => this.ui.terminal.rows,
+				requestRender: () => this.ui.requestRender(),
+				onSelectProvider: (provider) => authenticate(provider, "providers"),
+				onSelectMcpConnection: (provider) => authenticate(provider, "mcp-connections"),
+				onSelectModel: (model) => {
 					this.applyDefaultModel(model);
-					resolve();
+					finish();
 				},
-				() => {
-					close();
-					resolve();
-				},
-				initialSearchInput,
-				{
-					availableModels,
-					getRows: () => this.ui.terminal.rows,
-					recentModels: this.options.uiServices.settingsManager.getRecentModels(),
-				},
-			);
-			handle = showFullPaneOverlay(this.ui, selector, 96);
+				onCancel: finish,
+			});
+			handle = showFullPaneOverlay(this.ui, menu, 96);
 		});
 	}
 

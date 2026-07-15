@@ -3,6 +3,7 @@ import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
+import { PRIME_INFERENCE_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../src/core/provider-display-names.js";
 import { isApiKeyLoginProvider } from "../src/modes/interactive/auth-flows.js";
 import {
@@ -57,6 +58,22 @@ describe("OAuthSelectorComponent", () => {
 			"api_key:Anthropic",
 			"api_key:OpenAI",
 		]);
+	});
+
+	it("puts Prime Inference first within the same authentication state", () => {
+		const selector = new OAuthSelectorComponent(
+			"login",
+			AuthStorage.inMemory(),
+			[
+				{ id: "anthropic", name: "Anthropic", authType: "api_key" },
+				{ id: PRIME_INFERENCE_PROVIDER_ID, name: "Prime Inference", authType: "api_key" },
+			],
+			() => {},
+			() => {},
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(output.indexOf("Prime Inference")).toBeLessThan(output.indexOf("Anthropic"));
 	});
 
 	it("preserves auth type when selecting duplicate provider ids", () => {
@@ -361,7 +378,7 @@ describe("OAuthSelectorComponent", () => {
 		expect(output).toContain("(6/12)");
 	});
 
-	it("shows Providers/Services tabs and switches with left/right arrows", () => {
+	it("shows Providers/MCP Connections tabs and switches with left/right arrows", () => {
 		const selector = new OAuthSelectorComponent(
 			"login",
 			AuthStorage.inMemory(),
@@ -376,18 +393,18 @@ describe("OAuthSelectorComponent", () => {
 		// Providers tab active first: provider shown, service hidden.
 		let output = stripAnsi(selector.render(120).join("\n"));
 		expect(output).toContain("Providers");
-		expect(output).toContain("Services");
+		expect(output).toContain("MCP Connections");
 		expect(output).toContain("Anthropic");
 		expect(output).not.toContain("Serper");
 
-		// Right arrow switches to the Services tab.
+		// Right arrow switches to the MCP Connections tab.
 		selector.handleInput("\x1b[C");
 		output = stripAnsi(selector.render(120).join("\n"));
 		expect(output).toContain("Serper (web search)");
 		expect(output).not.toContain("Anthropic");
 	});
 
-	it("selecting on the Services tab returns the service entry", () => {
+	it("selecting on the MCP Connections tab returns the service entry", () => {
 		let chosen: string | undefined;
 		const selector = new OAuthSelectorComponent(
 			"login",
@@ -402,12 +419,12 @@ describe("OAuthSelectorComponent", () => {
 			() => {},
 		);
 
-		selector.handleInput("\x1b[C"); // -> Services tab
+		selector.handleInput("\x1b[C"); // -> MCP Connections tab
 		selector.handleInput("\r"); // confirm
 		expect(chosen).toBe("serper");
 	});
 
-	it("can open with the Services tab active", () => {
+	it("can open with the MCP Connections tab active", () => {
 		const selector = new OAuthSelectorComponent(
 			"login",
 			AuthStorage.inMemory(),

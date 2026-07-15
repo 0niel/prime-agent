@@ -12,7 +12,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import { formatNoModelsAvailableMessage } from "../src/core/auth-guidance.js";
-import type { AuthStatus } from "../src/core/auth-storage.js";
+import { type AuthStatus, AuthStorage } from "../src/core/auth-storage.js";
 import type { AgentCronJob } from "../src/core/cron-jobs.js";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.js";
 import { emptyGoalState, type GoalState } from "../src/core/goals.js";
@@ -33,7 +33,7 @@ import type {
 import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import type { AuthenticationResult } from "../src/modes/interactive/auth-flows.js";
 import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.js";
-import type { ModelSelectorComponent } from "../src/modes/interactive/components/model-selector.js";
+import type { ConfigurationMenuComponent } from "../src/modes/interactive/components/configuration-menu.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import {
 	formatSplashCwd,
@@ -486,33 +486,33 @@ describe("InteractiveMode MCP command", () => {
 	type McpCommandHarness = {
 		modelRegistry: { authStorage: { get(providerId: string): unknown } };
 		settingsManager: { getMcpServers(): Record<string, unknown> };
-		showOAuthSelector(mode: "login" | "logout", options?: { initialCategory?: string }): Promise<void>;
+		showConfigurationMenu(tab: "mcp-connections"): Promise<void>;
 		showStatus(message: string): void;
 		handleMcpCommand(args: string | undefined): Promise<void>;
 	};
 	const handleMcpCommand = (InteractiveMode.prototype as unknown as McpCommandHarness).handleMcpCommand;
 
-	test("opens bare /mcp on the Services category", async () => {
+	test("opens bare /mcp on the MCP Connections tab", async () => {
 		const fakeThis = {
-			showOAuthSelector: vi.fn(async () => {}),
+			showConfigurationMenu: vi.fn(async () => {}),
 		} as unknown as McpCommandHarness;
 
 		await handleMcpCommand.call(fakeThis, undefined);
 
-		expect(fakeThis.showOAuthSelector).toHaveBeenCalledWith("login", { initialCategory: "service" });
+		expect(fakeThis.showConfigurationMenu).toHaveBeenCalledWith("mcp-connections");
 	});
 
 	test("preserves the explicit /mcp list status output", async () => {
 		const fakeThis = {
 			modelRegistry: { authStorage: { get: vi.fn(() => undefined) } },
 			settingsManager: { getMcpServers: vi.fn(() => ({})) },
-			showOAuthSelector: vi.fn(async () => {}),
+			showConfigurationMenu: vi.fn(async () => {}),
 			showStatus: vi.fn(),
 		} as unknown as McpCommandHarness;
 
 		await handleMcpCommand.call(fakeThis, "list");
 
-		expect(fakeThis.showOAuthSelector).not.toHaveBeenCalled();
+		expect(fakeThis.showConfigurationMenu).not.toHaveBeenCalled();
 		expect(fakeThis.showStatus).toHaveBeenCalledWith(expect.stringContaining("MCP integrations:"));
 	});
 });
@@ -1276,12 +1276,19 @@ describe("InteractiveMode model selection persistence", () => {
 		getConnectionAvailableModels(): Promise<AgentConnectionModel[]>;
 		getCachedModelCandidates(): AgentConnectionModel[];
 		getModelSelectorRefreshPromise(options?: { force?: boolean }): Promise<AgentConnectionModel[]> | undefined;
+		createAuthFlows(): {
+			getLoginProviderOptions(): ReadonlyArray<never>;
+			loginProvider(): Promise<AuthenticationResult>;
+		};
 		applySelectedModel(model: AgentConnectionModel): Promise<void>;
-		showFullPaneOverlay(component: Component, maxContentWidth?: number): { hide(): void };
-		showModelSelectorAsync(
+		showFullPaneOverlay(
+			component: Component,
+			maxContentWidth?: number,
+		): { hide(): void; setHidden(hidden: boolean): void; focus(): void };
+		showConfigurationMenu(
+			tab: "providers" | "models" | "mcp-connections",
 			initialSearchInput?: string,
-			options?: { actions?: ReadonlyArray<unknown>; subtitle?: string },
-		): Promise<{ status: string; actionId?: string }>;
+		): Promise<void>;
 		maybeWarnAboutAnthropicSubscriptionAuth(model: AgentConnectionModel): Promise<void>;
 		checkDaxnutsEasterEgg(model: AgentConnectionModel): void;
 		setupAutocompleteProvider(): void;
@@ -1308,9 +1315,11 @@ describe("InteractiveMode model selection persistence", () => {
 		const hide = vi.fn();
 		const registryModels = [...(options.registryModels ?? options.connectionModels)];
 		const modelRegistry = {
+			authStorage: AuthStorage.inMemory(),
 			refresh: vi.fn(),
 			getError: vi.fn(() => undefined),
 			getAvailable: vi.fn(() => registryModels),
+			getProviderAuthStatus: vi.fn(() => ({ configured: false })),
 			find: vi.fn((provider: string, modelId: string) =>
 				registryModels.find((model) => model.provider === provider && model.id === modelId),
 			),
@@ -1350,12 +1359,16 @@ describe("InteractiveMode model selection persistence", () => {
 		fakeThis.getConnectionAvailableModels = overlayPrototype.getConnectionAvailableModels;
 		fakeThis.getCachedModelCandidates = overlayPrototype.getCachedModelCandidates;
 		fakeThis.getModelSelectorRefreshPromise = overlayPrototype.getModelSelectorRefreshPromise;
+		fakeThis.createAuthFlows = vi.fn(() => ({
+			getLoginProviderOptions: () => [],
+			loginProvider: async () => ({ status: "cancelled" as const }),
+		}));
 		fakeThis.applySelectedModel = options.applySelectedModel ?? vi.fn(async () => {});
 		fakeThis.showFullPaneOverlay = vi.fn((component: Component) => {
 			overlayComponent = component;
-			return { hide };
+			return { hide, setHidden: vi.fn(), focus: vi.fn() };
 		});
-		fakeThis.showModelSelectorAsync = overlayPrototype.showModelSelectorAsync;
+		fakeThis.showConfigurationMenu = overlayPrototype.showConfigurationMenu;
 		fakeThis.maybeWarnAboutAnthropicSubscriptionAuth = vi.fn(async () => {});
 		fakeThis.checkDaxnutsEasterEgg = vi.fn();
 		fakeThis.setupAutocompleteProvider = vi.fn();
@@ -1367,7 +1380,7 @@ describe("InteractiveMode model selection persistence", () => {
 				if (!overlayComponent) {
 					throw new Error("Expected model selector overlay to be shown");
 				}
-				return overlayComponent as ModelSelectorComponent;
+				return overlayComponent as ConfigurationMenuComponent;
 			},
 		};
 	}
@@ -1469,7 +1482,7 @@ describe("InteractiveMode model selection persistence", () => {
 			getAvailableModels,
 		});
 
-		const result = fakeThis.showModelSelectorAsync();
+		const result = fakeThis.showConfigurationMenu("models");
 
 		expect(fakeThis.showFullPaneOverlay).toHaveBeenCalledTimes(1);
 		expect(getAvailableModels).toHaveBeenCalledTimes(1);
@@ -1477,7 +1490,7 @@ describe("InteractiveMode model selection persistence", () => {
 		getSelector().handleInput("\x1b");
 		liveModels.resolve([cachedModel]);
 
-		await expect(result).resolves.toEqual({ status: "cancelled" });
+		await expect(result).resolves.toBeUndefined();
 	});
 
 	test("updates the model selector from an already in-flight refresh", async () => {
@@ -1492,7 +1505,7 @@ describe("InteractiveMode model selection persistence", () => {
 		});
 		fakeThis.connectionModelsRefreshInFlight = { version: 0, promise: liveModels.promise };
 
-		const result = fakeThis.showModelSelectorAsync("beta");
+		const result = fakeThis.showConfigurationMenu("models", "beta");
 		await flushAsyncWork();
 
 		expect(getAvailableModels).not.toHaveBeenCalled();
@@ -1504,7 +1517,7 @@ describe("InteractiveMode model selection persistence", () => {
 		expect(getSelector().render(120).join("\n")).toContain("Beta");
 
 		getSelector().handleInput("\x1b");
-		await expect(result).resolves.toEqual({ status: "cancelled" });
+		await expect(result).resolves.toBeUndefined();
 	});
 
 	test("refreshes cached candidates for exact model misses", async () => {
@@ -1557,7 +1570,7 @@ describe("InteractiveMode model selection persistence", () => {
 			getAvailableModels,
 		});
 
-		const result = fakeThis.showModelSelectorAsync();
+		const result = fakeThis.showConfigurationMenu("models");
 		await flushAsyncWork();
 
 		expect(getAvailableModels).toHaveBeenCalledTimes(1);
@@ -1566,7 +1579,7 @@ describe("InteractiveMode model selection persistence", () => {
 		liveModels.resolve([]);
 		await flushAsyncWork();
 		getSelector().handleInput("\x1b");
-		await expect(result).resolves.toEqual({ status: "cancelled" });
+		await expect(result).resolves.toBeUndefined();
 	});
 
 	test("keeps cached daemon models visible when scoped models are active", async () => {
@@ -1580,7 +1593,7 @@ describe("InteractiveMode model selection persistence", () => {
 			scopedModels: [{ model: scopedModel }],
 		});
 
-		const result = fakeThis.showModelSelectorAsync();
+		const result = fakeThis.showConfigurationMenu("models");
 
 		expect(getAvailableModels).not.toHaveBeenCalled();
 		expect(getSelector().render(120).join("\n")).toContain("scoped");
@@ -1592,7 +1605,7 @@ describe("InteractiveMode model selection persistence", () => {
 		expect(getAvailableModels).not.toHaveBeenCalled();
 
 		getSelector().handleInput("\x1b");
-		await expect(result).resolves.toEqual({ status: "cancelled" });
+		await expect(result).resolves.toBeUndefined();
 	});
 
 	test("uses a fresh cached model catalog without starting another refresh", async () => {
@@ -1604,13 +1617,13 @@ describe("InteractiveMode model selection persistence", () => {
 			getAvailableModels,
 		});
 
-		const result = fakeThis.showModelSelectorAsync();
+		const result = fakeThis.showConfigurationMenu("models");
 
 		expect(fakeThis.showFullPaneOverlay).toHaveBeenCalledTimes(1);
 		expect(getAvailableModels).not.toHaveBeenCalled();
 
 		getSelector().handleInput("\x1b");
-		await expect(result).resolves.toEqual({ status: "cancelled" });
+		await expect(result).resolves.toBeUndefined();
 	});
 
 	test("closes the model selector before the selected model finishes applying", async () => {
@@ -1621,12 +1634,12 @@ describe("InteractiveMode model selection persistence", () => {
 			applySelectedModel: vi.fn(() => apply.promise),
 		});
 
-		const result = fakeThis.showModelSelectorAsync();
+		const result = fakeThis.showConfigurationMenu("models");
 		await flushAsyncWork();
 
-		let resolved: { status: string } | undefined;
+		let resolved = false;
 		void result.then((nextResult) => {
-			resolved = nextResult;
+			resolved = nextResult === undefined;
 		});
 
 		getSelector().handleInput("\r");
@@ -1634,11 +1647,11 @@ describe("InteractiveMode model selection persistence", () => {
 
 		expect(hide).toHaveBeenCalledTimes(1);
 		expect(fakeThis.showStatus).toHaveBeenCalledWith("Switching model: gpt-5.5");
-		expect(resolved).toBeUndefined();
+		expect(resolved).toBe(false);
 
 		apply.resolve();
 
-		await expect(result).resolves.toEqual({ status: "selected" });
+		await expect(result).resolves.toBeUndefined();
 		expect(fakeThis.showStatus).toHaveBeenCalledWith("Model: gpt-5.5");
 	});
 
@@ -1651,21 +1664,21 @@ describe("InteractiveMode model selection persistence", () => {
 			getAvailableModels: vi.fn(() => liveModels.promise),
 		});
 
-		const result = fakeThis.showModelSelectorAsync("beta");
+		const result = fakeThis.showConfigurationMenu("models", "beta");
 		await flushAsyncWork();
 
 		const selector = getSelector();
-		expect(selector.getSearchInput().getValue()).toBe("beta");
+		expect(selector.getSearchValue()).toBe("beta");
 		expect(selector.render(120).join("\n")).not.toContain("Beta");
 
 		liveModels.resolve([beta]);
 		await flushAsyncWork();
 
-		expect(selector.getSearchInput().getValue()).toBe("beta");
+		expect(selector.getSearchValue()).toBe("beta");
 		expect(selector.render(120).join("\n")).toContain("Beta");
 
 		selector.handleInput("\x1b");
-		await expect(result).resolves.toEqual({ status: "cancelled" });
+		await expect(result).resolves.toBeUndefined();
 	});
 
 	test("refreshes fresh cached selector results when opened with a search", async () => {
@@ -1678,14 +1691,14 @@ describe("InteractiveMode model selection persistence", () => {
 			getAvailableModels,
 		});
 
-		const result = fakeThis.showModelSelectorAsync("beta");
+		const result = fakeThis.showConfigurationMenu("models", "beta");
 		await flushAsyncWork();
 
 		expect(getAvailableModels).toHaveBeenCalledTimes(1);
 		expect(getSelector().render(120).join("\n")).toContain("Beta");
 
 		getSelector().handleInput("\x1b");
-		await expect(result).resolves.toEqual({ status: "cancelled" });
+		await expect(result).resolves.toBeUndefined();
 	});
 
 	test("does not let a stale model refresh overwrite a newer catalog refresh", async () => {
@@ -1773,20 +1786,22 @@ describe("InteractiveMode model selection persistence", () => {
 		expect(fakeThis.connectionModelsFetchedAt).toBeGreaterThan(0);
 	});
 
-	test("closes an empty model selector when the background refresh fails", async () => {
+	test("keeps an empty configuration menu open when the background refresh fails", async () => {
 		const getAvailableModels = vi.fn(async () => {
 			throw new Error("models unavailable");
 		});
-		const { fakeThis, hide } = createSelectorOverlayHarness({
+		const { fakeThis, getSelector, hide } = createSelectorOverlayHarness({
 			connectionModels: [],
 			getAvailableModels,
 		});
 
-		const result = fakeThis.showModelSelectorAsync();
+		const result = fakeThis.showConfigurationMenu("models");
 		await flushAsyncWork();
 
-		await expect(result).resolves.toEqual({ status: "cancelled" });
 		expect(fakeThis.showError).toHaveBeenCalledWith("models unavailable");
+		expect(hide).not.toHaveBeenCalled();
+		getSelector().handleInput("\x1b");
+		await expect(result).resolves.toBeUndefined();
 		expect(hide).toHaveBeenCalledTimes(1);
 	});
 });
@@ -1830,8 +1845,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		checkDaxnutsEasterEgg?: (model: { provider: string; id: string }) => void;
 		findExactModelMatch?: (searchTerm: string) => Promise<AgentConnectionModel | undefined>;
 		showOnboardingModelSelectionSplash?: () => Promise<boolean>;
-		showOnboardingPrimeLogin?: () => Promise<AuthenticationResult>;
-		promptForModelSelection?: (options?: { allowProviderSetup?: boolean }) => Promise<boolean>;
+		showConfigurationMenu?: (tab: "providers" | "models" | "mcp-connections") => Promise<void>;
 		getModelCandidates?: () => Promise<AgentConnectionModel[]>;
 	};
 	const shouldRunOnboarding = (InteractiveMode.prototype as unknown as OnboardingHarness).shouldRunOnboarding;
@@ -1968,87 +1982,56 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		expect(fakeThis.runOnboardingFlow).toHaveBeenCalledWith(true);
 	});
 
-	test("cancelled model picker exits onboarding without a required-selection warning", async () => {
+	test("cancelled Prime CLI splash exits onboarding before opening configuration", async () => {
 		const fakeThis = createPrimeCliHarness(false);
-		fakeThis.showOnboardingModelSelectionSplash = vi.fn(async () => true);
-		fakeThis.promptForModelSelection = vi.fn(async () => false);
-		fakeThis.showStatus = vi.fn();
+		fakeThis.showOnboardingModelSelectionSplash = vi.fn(async () => false);
+		fakeThis.showConfigurationMenu = vi.fn(async () => {});
 
 		await expect(runOnboardingFlow.call(fakeThis)).resolves.toBeUndefined();
 
-		expect(fakeThis.promptForModelSelection).toHaveBeenCalledWith({ allowProviderSetup: true });
-		expect(fakeThis.uiServices.settingsManager.setOnboardingShown).not.toHaveBeenCalled();
-		expect(fakeThis.showStatus).not.toHaveBeenCalled();
+		expect(fakeThis.showConfigurationMenu).not.toHaveBeenCalled();
 	});
 
-	test("uses live connection models before falling back to Prime login during onboarding", async () => {
+	test("opens the Models tab after the Prime CLI splash", async () => {
+		const fakeThis = createPrimeCliHarness(false);
+		fakeThis.showOnboardingModelSelectionSplash = vi.fn(async () => true);
+		fakeThis.showConfigurationMenu = vi.fn(async () => {});
+
+		await expect(runOnboardingFlow.call(fakeThis)).resolves.toBeUndefined();
+
+		expect(fakeThis.showConfigurationMenu).toHaveBeenCalledWith("models");
+	});
+
+	test("opens the Models tab when models are already available", async () => {
 		const fakeThis = createPrimeCliHarness(false);
 		fakeThis.connectionState = createConnectionState({ model: undefined });
 		fakeThis.getModelCandidates = vi.fn(async () => [primeModel]);
-		fakeThis.promptForModelSelection = vi.fn(async () => true);
-		fakeThis.showOnboardingPrimeLogin = vi.fn(async () => ({ status: "failed" as const }));
-
-		await expect(runOnboardingFlow.call(fakeThis)).resolves.toBeUndefined();
-
-		expect(fakeThis.getModelCandidates).toHaveBeenCalledTimes(1);
-		expect(fakeThis.promptForModelSelection).toHaveBeenCalledWith({ allowProviderSetup: true });
-		expect(fakeThis.showOnboardingPrimeLogin).not.toHaveBeenCalled();
-	});
-
-	test("selects a fallback before opening the model picker after Prime login", async () => {
-		const fakeThis = createPrimeCliHarness(false);
-		fakeThis.connectionState = createConnectionState({ model: undefined });
-		fakeThis.getModelCandidates = vi.fn(async () => []);
-		fakeThis.showOnboardingPrimeLogin = vi.fn(async () => ({
-			status: "success" as const,
-			providerId: PRIME_INFERENCE_PROVIDER_ID,
-			providerName: "Prime Inference",
-			authType: "api_key" as const,
-			kind: "provider" as const,
-		}));
-		const prepareForModelSelectionAfterLogin = vi.fn(async () => true);
-		const promptForModelSelection = vi.fn(async () => false);
-		fakeThis.prepareForModelSelectionAfterLogin = prepareForModelSelectionAfterLogin;
-		fakeThis.promptForModelSelection = promptForModelSelection;
+		fakeThis.showConfigurationMenu = vi.fn(async () => {});
 
 		await expect(runOnboardingFlow.call(fakeThis, false)).resolves.toBeUndefined();
 
-		expect(prepareForModelSelectionAfterLogin).toHaveBeenCalledWith(
-			expect.objectContaining({ providerId: PRIME_INFERENCE_PROVIDER_ID }),
-		);
-		expect(promptForModelSelection).toHaveBeenCalledWith({ allowProviderSetup: true });
-		expect(prepareForModelSelectionAfterLogin.mock.invocationCallOrder[0]).toBeLessThan(
-			promptForModelSelection.mock.invocationCallOrder[0],
-		);
+		expect(fakeThis.getModelCandidates).toHaveBeenCalledTimes(1);
+		expect(fakeThis.showConfigurationMenu).toHaveBeenCalledWith("models");
 	});
 
-	test("cancelled model picker continues when current model is ready outside Prime CLI onboarding", async () => {
+	test("opens the Providers tab when no models are available", async () => {
 		const fakeThis = createPrimeCliHarness(false);
-		fakeThis.uiServices.modelRegistry.getProviderAuthStatus = vi.fn(
-			(): AuthStatus => ({
-				configured: true,
-				source: "stored",
-			}),
-		);
-		fakeThis.promptForModelSelection = vi.fn(async () => false);
-		fakeThis.showStatus = vi.fn();
+		fakeThis.connectionState = createConnectionState({ model: undefined });
+		fakeThis.getModelCandidates = vi.fn(async () => []);
+		fakeThis.showConfigurationMenu = vi.fn(async () => {});
 
-		await expect(runOnboardingFlow.call(fakeThis)).resolves.toBeUndefined();
+		await expect(runOnboardingFlow.call(fakeThis, false)).resolves.toBeUndefined();
 
-		expect(fakeThis.promptForModelSelection).toHaveBeenCalledWith({ allowProviderSetup: true });
-		expect(fakeThis.uiServices.settingsManager.setOnboardingShown).not.toHaveBeenCalled();
-		expect(fakeThis.showStatus).not.toHaveBeenCalled();
+		expect(fakeThis.showConfigurationMenu).toHaveBeenCalledWith("providers");
 	});
 });
 
-describe("InteractiveMode explicit login", () => {
+describe("InteractiveMode post-login model preparation", () => {
 	type LoginHarness = {
-		showOAuthSelector(mode: "login" | "logout"): Promise<void>;
-		showLoginProviderSelector(): Promise<AuthenticationResult>;
+		prepareForModelSelectionAfterLogin(authResult: AuthenticationResult): Promise<boolean>;
 		invalidateConnectionModels(): void;
 		getCurrentModel(): AgentConnectionModel | undefined;
 		applySelectedModel(model: AgentConnectionModel): Promise<void>;
-		showModelSelectorWithProviderSetup(): Promise<void>;
 		showError(message: string): void;
 		uiServices: {
 			modelRegistry: Pick<ModelRegistry, "find">;
@@ -2058,7 +2041,8 @@ describe("InteractiveMode explicit login", () => {
 		};
 	};
 
-	const showOAuthSelector = (InteractiveMode.prototype as unknown as LoginHarness).showOAuthSelector;
+	const prepareForModelSelectionAfterLogin = (InteractiveMode.prototype as unknown as LoginHarness)
+		.prepareForModelSelectionAfterLogin;
 	const loginPrimeModel: AgentConnectionModel = {
 		id: "openai/gpt-5.5",
 		name: "GPT-5.5",
@@ -2072,21 +2056,13 @@ describe("InteractiveMode explicit login", () => {
 		maxTokens: 128000,
 	} as AgentConnectionModel;
 
-	test("persists GLM 5.2 and opens model selection after Prime Inference login", async () => {
+	test("persists GLM 5.2 before model selection after Prime Inference login", async () => {
 		const fallbackModel = { ...loginPrimeModel, id: "z-ai/glm-5.2", name: "GLM 5.2" };
 		const flushSettings = vi.fn(async () => {});
 		const fakeThis = Object.create(InteractiveMode.prototype) as LoginHarness;
-		fakeThis.showLoginProviderSelector = vi.fn(async () => ({
-			status: "success" as const,
-			providerId: PRIME_INFERENCE_PROVIDER_ID,
-			providerName: "Prime Inference",
-			authType: "api_key" as const,
-			kind: "provider" as const,
-		}));
 		fakeThis.invalidateConnectionModels = vi.fn();
 		fakeThis.getCurrentModel = vi.fn(() => undefined);
 		fakeThis.applySelectedModel = vi.fn(async () => {});
-		fakeThis.showModelSelectorWithProviderSetup = vi.fn(async () => {});
 		fakeThis.showError = vi.fn();
 		fakeThis.uiServices = {
 			modelRegistry: {
@@ -2097,27 +2073,26 @@ describe("InteractiveMode explicit login", () => {
 			},
 		};
 
-		await showOAuthSelector.call(fakeThis, "login");
+		await expect(
+			prepareForModelSelectionAfterLogin.call(fakeThis, {
+				status: "success",
+				providerId: PRIME_INFERENCE_PROVIDER_ID,
+				providerName: "Prime Inference",
+				authType: "api_key",
+				kind: "provider",
+			}),
+		).resolves.toBe(true);
 
 		expect(fakeThis.invalidateConnectionModels).toHaveBeenCalledTimes(1);
 		expect(fakeThis.applySelectedModel).toHaveBeenCalledWith(fallbackModel);
 		expect(flushSettings).toHaveBeenCalledTimes(1);
-		expect(fakeThis.showModelSelectorWithProviderSetup).toHaveBeenCalledTimes(1);
 	});
 
-	test("does not open model selection after provider login", async () => {
+	test("invalidates cached models after any model-provider login", async () => {
 		const fakeThis = Object.create(InteractiveMode.prototype) as LoginHarness;
-		fakeThis.showLoginProviderSelector = vi.fn(async () => ({
-			status: "success" as const,
-			providerId: "anthropic",
-			providerName: "Anthropic",
-			authType: "oauth" as const,
-			kind: "provider" as const,
-		}));
 		fakeThis.invalidateConnectionModels = vi.fn();
 		fakeThis.getCurrentModel = vi.fn(() => loginPrimeModel);
 		fakeThis.applySelectedModel = vi.fn(async () => {});
-		fakeThis.showModelSelectorWithProviderSetup = vi.fn(async () => {});
 		fakeThis.showError = vi.fn();
 		fakeThis.uiServices = {
 			modelRegistry: {
@@ -2128,11 +2103,18 @@ describe("InteractiveMode explicit login", () => {
 			},
 		};
 
-		await showOAuthSelector.call(fakeThis, "login");
+		await expect(
+			prepareForModelSelectionAfterLogin.call(fakeThis, {
+				status: "success",
+				providerId: "anthropic",
+				providerName: "Anthropic",
+				authType: "oauth",
+				kind: "provider",
+			}),
+		).resolves.toBe(false);
 
 		expect(fakeThis.invalidateConnectionModels).toHaveBeenCalledTimes(1);
 		expect(fakeThis.applySelectedModel).not.toHaveBeenCalled();
-		expect(fakeThis.showModelSelectorWithProviderSetup).not.toHaveBeenCalled();
 	});
 });
 

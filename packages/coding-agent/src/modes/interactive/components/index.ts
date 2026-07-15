@@ -13,6 +13,10 @@ export {
 	ChildAgentSummaryComponent,
 } from "./child-agent-inspector.js";
 export { CompactionSummaryMessageComponent } from "./compaction-summary-message.js";
+export {
+	ConfigurationMenuComponent,
+	type ConfigurationMenuTab,
+} from "./configuration-menu.js";
 export { CustomEditor } from "./custom-editor.js";
 export { CustomMessageComponent } from "./custom-message.js";
 export { DaxnutsComponent } from "./daxnuts.js";
