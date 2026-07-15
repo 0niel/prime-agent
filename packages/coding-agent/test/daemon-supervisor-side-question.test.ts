@@ -20,6 +20,7 @@ describe("daemon supervisor side-question routing", () => {
 		const write = vi.fn();
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			ready: Promise.resolve(),
+			ownership: { assertCurrent: vi.fn(async () => undefined) },
 			handleCommand,
 			write,
 			log: vi.fn(),

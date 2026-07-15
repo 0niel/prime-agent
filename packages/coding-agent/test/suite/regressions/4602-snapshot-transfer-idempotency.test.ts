@@ -703,7 +703,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(worker.snapshotTransferFrames.size).toBe(0);
 	});
 
-	it("rejects same-ID reentrant begins and mismatched duplicate metadata", () => {
+	it("rejects same-ID reentrant begins and mismatched duplicate metadata", async () => {
 		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-invalid.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			descriptorDir: "/tmp/eng-4602-supervisor-invalid-state",
@@ -711,20 +711,26 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		const recoverWorker = vi.fn(async () => {});
 		const persistWorker = vi.fn();
 		const syncAgentPeers = vi.fn(async () => {});
+		const assertRecoveryAllowed = vi.fn(async () => {});
 		const internals = supervisor as unknown as {
+			workers: Map<string, WorkerHarness>;
 			recoverWorker: typeof recoverWorker;
 			persistWorker: typeof persistWorker;
 			syncAgentPeers: typeof syncAgentPeers;
+			assertRecoveryAllowed: typeof assertRecoveryAllowed;
 			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
 		};
 		internals.recoverWorker = recoverWorker;
 		internals.persistWorker = persistWorker;
 		internals.syncAgentPeers = syncAgentPeers;
+		internals.assertRecoveryAllowed = assertRecoveryAllowed;
 		const frames = snapshotFrames([{ role: "user", content: "stable", timestamp: 1 }]);
 
 		const reentrant = workerHarness();
+		internals.workers.set(reentrant.worker.descriptor.workerId, reentrant.worker);
 		internals.handleWorkerFrame(reentrant.worker, frame(frames.begin));
 		internals.handleWorkerFrame(reentrant.worker, frame(frames.begin));
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(reentrant.close).toHaveBeenCalledOnce();
 		expect(reentrant.worker.transcriptCaches.has(activeSessionId)).toBe(false);
 		expect(reentrant.worker.client).toBeUndefined();

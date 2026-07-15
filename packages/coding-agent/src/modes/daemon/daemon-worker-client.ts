@@ -13,6 +13,7 @@ type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : n
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 type DaemonWorkerWireCommandBody = DaemonCommandBody | DaemonWorkerCommandBody;
 type DaemonWorkerWireCommand = DaemonCommand | DaemonWorkerCommand;
+type DaemonWorkerAuthentication = Omit<Extract<DaemonWorkerCommand, { type: "worker_auth" }>, "id" | "type" | "token">;
 
 export type DaemonWorkerFrameListener = (frame: PrivateFrame<DaemonWorkerFrameHeader>) => void;
 export type DaemonWorkerCloseListener = (error: Error) => void;
@@ -115,8 +116,8 @@ export class DaemonWorkerClient {
 		return this.requestWire(command, timeoutMs);
 	}
 
-	async authenticateWorker(token: string, timeoutMs = 3000): Promise<void> {
-		const response = await this.requestWorker({ type: "worker_auth", token }, timeoutMs);
+	async authenticateWorker(token: string, owner: DaemonWorkerAuthentication, timeoutMs = 3000): Promise<void> {
+		const response = await this.requestWorker({ type: "worker_auth", token, ...owner }, timeoutMs);
 		if (!response.success) {
 			throw new Error(response.error);
 		}

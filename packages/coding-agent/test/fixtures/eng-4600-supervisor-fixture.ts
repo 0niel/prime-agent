@@ -1,10 +1,12 @@
 import { existsSync, unlinkSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import lockfile from "proper-lockfile";
+import { APP_NAME } from "../../src/config.js";
 import { isDaemonCatalogProcess, runDaemonCatalogProcess } from "../../src/modes/daemon/daemon-catalog-process.js";
 import { DaemonSupervisor } from "../../src/modes/daemon/daemon-supervisor.js";
 import { acquireDaemonSupervisorOwnership } from "../../src/modes/daemon/daemon-supervisor-ownership.js";
 
-type ControlMessage = { type: "go" | "probe" | "release" | "shutdown" | "cleanup" };
+type ControlMessage = { type: "go" | "probe" | "release" | "release_runtime" | "shutdown" | "cleanup" };
 
 function requiredEnvironment(name: string): string {
 	const value = process.env[name];
@@ -49,6 +51,8 @@ async function runOwnershipHolder(): Promise<never> {
 }
 
 async function runSupervisor(): Promise<never> {
+	process.argv[1] = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
+	process.title = APP_NAME;
 	const socketPath = requiredEnvironment("ENG_4600_SOCKET_PATH");
 	const agentDir = requiredEnvironment("ENG_4600_AGENT_DIR");
 	const descriptorDir = requiredEnvironment("ENG_4600_DESCRIPTOR_DIR");
@@ -66,11 +70,35 @@ async function runSupervisor(): Promise<never> {
 	try {
 		await supervisor.start();
 		send({ type: "ready" });
+		process.on("message", (message: unknown) => {
+			if (
+				!message ||
+				typeof message !== "object" ||
+				(message as Partial<ControlMessage>).type !== "release_runtime"
+			) {
+				return;
+			}
+			void releaseSupervisorRuntime(supervisor);
+		});
 		return await new Promise<never>(() => {});
 	} catch (error) {
 		send({ type: "failed", error: error instanceof Error ? error.message : String(error) });
 		process.exit(0);
 	}
+}
+
+async function releaseSupervisorRuntime(supervisor: DaemonSupervisor): Promise<void> {
+	const ownership = Reflect.get(supervisor, "ownership") as { release: () => Promise<void> } | undefined;
+	await ownership?.release();
+	Reflect.set(supervisor, "ownership", undefined);
+	const cleanupSocket = Reflect.get(supervisor, "cleanupSocket");
+	if (typeof cleanupSocket === "function") {
+		Reflect.apply(cleanupSocket, supervisor, []);
+	}
+	const lease = Reflect.get(supervisor, "socketLease") as { release: () => Promise<void> } | undefined;
+	await lease?.release();
+	Reflect.set(supervisor, "socketLease", undefined);
+	send({ type: "runtime_released" });
 }
 
 async function runLegacyCleanup(): Promise<never> {

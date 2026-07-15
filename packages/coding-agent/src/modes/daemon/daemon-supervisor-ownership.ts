@@ -22,6 +22,10 @@ const REGISTRY_LOCK_UPDATE_MS = 1000;
 const REGISTRY_LOCK_RETRIES = 500;
 const REGISTRY_LOCK_RETRY_MS = 10;
 const STARTUP_FENCE_POLL_MS = 250;
+const SHUTDOWN_ADMISSION_FILE_NAME = "shutdown-admission.json";
+const SHUTDOWN_ADMISSION_LEASE_MS = 5000;
+const SHUTDOWN_ADMISSION_REFRESH_MS = 1000;
+const SHUTDOWN_ADMISSION_WAIT_MS = 50;
 
 type DaemonSupervisorOwnerPhase = "starting" | "owner" | "stopping";
 
@@ -42,6 +46,14 @@ interface DaemonSupervisorOwnerRecord extends ProcessIdentity {
 	phase: DaemonSupervisorOwnerPhase;
 	createdAt: string;
 	updatedAt: string;
+}
+
+interface DaemonShutdownAdmissionRecord extends ProcessIdentity {
+	version: 1;
+	token: string;
+	createdAt: string;
+	updatedAt: string;
+	expiresAt: string;
 }
 
 interface DaemonSupervisorOwnerScope {
@@ -88,6 +100,24 @@ class DaemonSupervisorAlreadyRunningError extends Error {
 	}
 }
 
+class DaemonSupervisorOwnershipLostError extends Error {
+	readonly code = "supervisor_generation_stale" as const;
+
+	constructor(generation: string) {
+		super(`Daemon supervisor generation ${generation} no longer owns its registry entry`);
+		this.name = "DaemonSupervisorOwnershipLostError";
+	}
+}
+
+class DaemonShutdownAdmissionError extends Error {
+	readonly code = "daemon_shutdown_in_progress" as const;
+
+	constructor(message = "Daemon shutdown is in progress") {
+		super(message);
+		this.name = "DaemonShutdownAdmissionError";
+	}
+}
+
 class DaemonSupervisorOwnership {
 	private released = false;
 
@@ -96,6 +126,16 @@ class DaemonSupervisorOwnership {
 		private readonly registryDir: string,
 		private readonly ownerDirectory: string,
 	) {}
+
+	async assertCurrent(): Promise<void> {
+		if (this.released) {
+			throw new DaemonSupervisorOwnershipLostError(this.record.generation);
+		}
+		const current = readOwnerRecord(this.ownerDirectory);
+		if (!current || !sameOwnerRecord(current, this.record)) {
+			throw new DaemonSupervisorOwnershipLostError(this.record.generation);
+		}
+	}
 
 	async updatePhase(phase: DaemonSupervisorOwnerPhase): Promise<void> {
 		if (this.released) {
@@ -136,6 +176,73 @@ class DaemonSupervisorOwnership {
 				rmSync(releasedDirectory, { recursive: true, force: true });
 			}
 		}
+	}
+}
+
+class DaemonShutdownAdmission {
+	private released = false;
+	private lost = false;
+	private refreshPromise?: Promise<void>;
+	private readonly refreshTimer: ReturnType<typeof setInterval>;
+
+	constructor(
+		private readonly record: DaemonShutdownAdmissionRecord,
+		private readonly registryDir: string,
+	) {
+		this.refreshTimer = setInterval(() => {
+			this.refreshPromise ??= this.assertOrRenew()
+				.catch(() => undefined)
+				.finally(() => {
+					this.refreshPromise = undefined;
+				});
+		}, SHUTDOWN_ADMISSION_REFRESH_MS);
+		this.refreshTimer.unref();
+	}
+
+	async assertOrRenew(): Promise<void> {
+		if (this.released || this.lost) {
+			throw new DaemonShutdownAdmissionError("Daemon shutdown admission was lost");
+		}
+		try {
+			await withDaemonSupervisorRegistryGuard(this.registryDir, () => {
+				const path = shutdownAdmissionPath(this.registryDir);
+				const current = readShutdownAdmission(path);
+				if (
+					!current ||
+					current.token !== this.record.token ||
+					current.pid !== this.record.pid ||
+					current.processStartId !== this.record.processStartId ||
+					Date.parse(current.expiresAt) <= Date.now() ||
+					!matchesExactProcessIdentity(this.record)
+				) {
+					throw new DaemonShutdownAdmissionError("Daemon shutdown admission was lost");
+				}
+				const now = Date.now();
+				this.record.updatedAt = new Date(now).toISOString();
+				this.record.expiresAt = new Date(now + SHUTDOWN_ADMISSION_LEASE_MS).toISOString();
+				writeJsonAtomically(path, this.record);
+			});
+		} catch (error) {
+			this.lost = true;
+			clearInterval(this.refreshTimer);
+			throw error;
+		}
+	}
+
+	async release(): Promise<void> {
+		if (this.released) {
+			return;
+		}
+		this.released = true;
+		clearInterval(this.refreshTimer);
+		await this.refreshPromise;
+		await withDaemonSupervisorRegistryGuard(this.registryDir, () => {
+			const path = shutdownAdmissionPath(this.registryDir);
+			const current = readShutdownAdmission(path);
+			if (current?.token === this.record.token) {
+				rmSync(path, { force: true });
+			}
+		});
 	}
 }
 
@@ -224,6 +331,9 @@ export async function acquireDaemonSupervisorOwnership(
 		writeOwnerScope(candidateDirectory, record);
 		writeOwnerRecord(candidateDirectory, record);
 		await withDaemonSupervisorRegistryGuard(registryDir, () => {
+			if (readActiveShutdownAdmission(registryDir)) {
+				throw new DaemonShutdownAdmissionError();
+			}
 			for (const directory of listOwnerDirectories(registryDir)) {
 				const owner = readOwnerRecordForScope(directory, (scope) => ownerConflicts(scope, record));
 				if (!owner) {
@@ -250,6 +360,66 @@ export async function acquireDaemonSupervisorOwnership(
 		}
 	}
 	return new DaemonSupervisorOwnership(record, registryDir, ownerDirectory);
+}
+
+export async function assertDaemonSupervisorOwnerCurrent(
+	owner: {
+		generation: string;
+		pid: number;
+		processStartId?: string;
+		socketPath: string;
+	},
+	validatedFingerprint?: string,
+): Promise<string> {
+	const registryDir = defaultDaemonSupervisorRegistryDir();
+	const current = readOwnerRecord(ownerDirectoryPath(registryDir, owner.generation));
+	if (
+		!current ||
+		current.pid !== owner.pid ||
+		current.processStartId !== owner.processStartId ||
+		current.socketPath !== normalizeSocketPath(owner.socketPath) ||
+		!isProcessAlive(current.pid)
+	) {
+		throw new DaemonSupervisorOwnershipLostError(owner.generation);
+	}
+	const fingerprint = ownerRecordFingerprint(current);
+	if (fingerprint !== validatedFingerprint && !isProcessIdentityAlive(current)) {
+		throw new DaemonSupervisorOwnershipLostError(owner.generation);
+	}
+	return fingerprint;
+}
+
+export async function acquireDaemonShutdownAdmission(): Promise<DaemonShutdownAdmission> {
+	const registryDir = defaultDaemonSupervisorRegistryDir();
+	const processStartId = getProcessStartId(process.pid);
+	while (true) {
+		let acquired: DaemonShutdownAdmissionRecord | undefined;
+		await withDaemonSupervisorRegistryGuard(registryDir, () => {
+			if (readActiveShutdownAdmission(registryDir)) {
+				return;
+			}
+			const now = Date.now();
+			acquired = {
+				version: OWNER_VERSION,
+				token: randomUUID(),
+				pid: process.pid,
+				...(processStartId ? { processStartId } : {}),
+				createdAt: new Date(now).toISOString(),
+				updatedAt: new Date(now).toISOString(),
+				expiresAt: new Date(now + SHUTDOWN_ADMISSION_LEASE_MS).toISOString(),
+			};
+			writeJsonAtomically(shutdownAdmissionPath(registryDir), acquired);
+		});
+		if (acquired) {
+			return new DaemonShutdownAdmission(acquired, registryDir);
+		}
+		await delay(SHUTDOWN_ADMISSION_WAIT_MS);
+	}
+}
+
+export async function isDaemonShutdownAdmissionActive(): Promise<boolean> {
+	const registryDir = defaultDaemonSupervisorRegistryDir();
+	return withDaemonSupervisorRegistryGuard(registryDir, () => readActiveShutdownAdmission(registryDir) !== undefined);
 }
 
 export async function persistDaemonStartupFenceFromOwner(
@@ -349,16 +519,30 @@ export async function waitForDaemonStartupFence(
 }
 
 function isProcessIdentityAlive(identity: ProcessIdentity): boolean {
-	try {
-		process.kill(identity.pid, 0);
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	if (!isProcessAlive(identity.pid)) {
+		return false;
 	}
 	if (!identity.processStartId) {
 		return true;
 	}
 	const observed = getProcessStartId(identity.pid);
 	return observed === undefined || observed === identity.processStartId;
+}
+
+function matchesExactProcessIdentity(identity: ProcessIdentity): boolean {
+	if (!isProcessAlive(identity.pid)) {
+		return false;
+	}
+	return identity.processStartId === undefined || getProcessStartId(identity.pid) === identity.processStartId;
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
+	}
+	return true;
 }
 
 function normalizeSocketPath(socketPath: string): string {
@@ -393,6 +577,20 @@ function canonicalizeFilesystemPath(path: string): string {
 
 function ownerConflicts(left: DaemonSupervisorOwnerScope, right: DaemonSupervisorOwnerScope): boolean {
 	return left.socketPath === right.socketPath || left.descriptorDir === right.descriptorDir;
+}
+
+function sameOwnerRecord(left: DaemonSupervisorOwnerRecord, right: DaemonSupervisorOwnerRecord): boolean {
+	return (
+		left.token === right.token &&
+		left.generation === right.generation &&
+		left.pid === right.pid &&
+		left.processStartId === right.processStartId &&
+		left.socketPath === right.socketPath
+	);
+}
+
+function ownerRecordFingerprint(record: DaemonSupervisorOwnerRecord): string {
+	return createHash("sha256").update(JSON.stringify(record)).digest("hex");
 }
 
 function listOwnerDirectories(registryDir: string): string[] {
@@ -535,6 +733,48 @@ function readStartupFence(path: string): DaemonStartupFenceRecord | undefined {
 	}
 }
 
+function readActiveShutdownAdmission(registryDir: string): DaemonShutdownAdmissionRecord | undefined {
+	const path = shutdownAdmissionPath(registryDir);
+	const admission = readShutdownAdmission(path);
+	if (!admission) {
+		return undefined;
+	}
+	if (Date.parse(admission.expiresAt) > Date.now() && isProcessIdentityAlive(admission)) {
+		return admission;
+	}
+	rmSync(path, { force: true });
+	return undefined;
+}
+
+function readShutdownAdmission(path: string): DaemonShutdownAdmissionRecord | undefined {
+	try {
+		const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
+		if (!value || typeof value !== "object") {
+			throw new Error(`Invalid daemon shutdown admission: ${path}`);
+		}
+		const admission = value as Partial<DaemonShutdownAdmissionRecord>;
+		if (
+			admission.version !== OWNER_VERSION ||
+			typeof admission.token !== "string" ||
+			!Number.isInteger(admission.pid) ||
+			(admission.pid ?? 0) <= 0 ||
+			(admission.processStartId !== undefined && typeof admission.processStartId !== "string") ||
+			typeof admission.createdAt !== "string" ||
+			typeof admission.updatedAt !== "string" ||
+			typeof admission.expiresAt !== "string" ||
+			!Number.isFinite(Date.parse(admission.expiresAt))
+		) {
+			throw new Error(`Invalid daemon shutdown admission: ${path}`);
+		}
+		return admission as DaemonShutdownAdmissionRecord;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			return undefined;
+		}
+		throw error;
+	}
+}
+
 function writeJsonAtomically(path: string, value: unknown): void {
 	const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
 	try {
@@ -549,6 +789,10 @@ function writeJsonAtomically(path: string, value: unknown): void {
 function startupFencePath(directory: string, socketPath: string): string {
 	const key = createHash("sha256").update(normalizeSocketPath(socketPath)).digest("hex");
 	return resolve(directory, `${key}.json`);
+}
+
+function shutdownAdmissionPath(registryDir: string): string {
+	return resolve(registryDir, SHUTDOWN_ADMISSION_FILE_NAME);
 }
 
 function delay(ms: number): Promise<void> {

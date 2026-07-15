@@ -1,3 +1,4 @@
+import { closeSync, readFileSync } from "node:fs";
 import type {
 	AgentSessionMessageAgentSummary,
 	AgentSessionMessageDeliveryMode,
@@ -13,6 +14,8 @@ export const DAEMON_WORKER_TOKEN_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_TOKEN
 export const DAEMON_WORKER_ACTIVE_SESSION_ID_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_ACTIVE_SESSION_ID";
 export const DAEMON_WORKER_SUPERVISOR_SOCKET_ENV = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET";
 export const DAEMON_WORKER_RECOVERY_JOURNAL_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_RECOVERY_JOURNAL";
+export const DAEMON_WORKER_STARTUP_GATE_FD_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_STARTUP_GATE_FD";
+export const DAEMON_WORKER_STARTUP_GATE_COMMIT = "start\n";
 export type DaemonWorkerLifecycle = "starting" | "ready" | "recovering" | "failed";
 
 export type DaemonWorkerFrameHeader =
@@ -34,7 +37,15 @@ export type DaemonWorkerFrameHeader =
 export type DaemonCreateCommand = Extract<DaemonCommand, { type: "create" }>;
 
 export type DaemonWorkerCommand =
-	| { id?: string; type: "worker_auth"; token: string }
+	| {
+			id?: string;
+			type: "worker_auth";
+			token: string;
+			supervisorGeneration: string;
+			supervisorPid: number;
+			supervisorProcessStartId?: string;
+			supervisorSocketPath: string;
+	  }
 	| {
 			id?: string;
 			type: "worker_subscribe";
@@ -91,6 +102,27 @@ export interface DaemonWorkerDescriptor {
 
 export function isDaemonWorkerProcess(environment: NodeJS.ProcessEnv = process.env): boolean {
 	return environment[DAEMON_WORKER_ROLE_ENV] === "1";
+}
+
+export function waitForDaemonWorkerStartupGate(environment: NodeJS.ProcessEnv = process.env): void {
+	const rawFd = environment[DAEMON_WORKER_STARTUP_GATE_FD_ENV];
+	if (rawFd === undefined) {
+		return;
+	}
+	delete environment[DAEMON_WORKER_STARTUP_GATE_FD_ENV];
+	const fd = Number(rawFd);
+	if (!Number.isInteger(fd) || fd < 3) {
+		throw new Error("Daemon session worker has an invalid startup gate");
+	}
+	let marker: string;
+	try {
+		marker = readFileSync(fd, "utf8");
+	} finally {
+		closeSync(fd);
+	}
+	if (marker !== DAEMON_WORKER_STARTUP_GATE_COMMIT) {
+		throw new Error("Daemon session worker startup was cancelled");
+	}
 }
 
 export function requireDaemonWorkerAuthenticationToken(environment: NodeJS.ProcessEnv = process.env): string {

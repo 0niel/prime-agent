@@ -144,6 +144,7 @@ import {
 	prepareDaemonSocketPath,
 	restrictDaemonSocketPath,
 } from "./daemon-socket.js";
+import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } from "./daemon-supervisor-ownership.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -272,6 +273,7 @@ const DAEMON_SERVER_CAPABILITIES: readonly DaemonClientCapability[] = [
 
 const DAEMON_CLIENT_CAPABILITY_SET: ReadonlySet<string> = new Set(DAEMON_SERVER_CAPABILITIES);
 const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS = 5000;
+const SUPERVISOR_FENCE_POLL_MS = 250;
 const UPDATE_RESTART_MARKER =
 	"<prime_agent_update_interrupted>\n" +
 	"Prime Agent was updated and intentionally interrupted this session. Continue from the saved transcript and restored tool/kernel state. Any running model, tool, bash, or child-agent work may have been partially completed.\n" +
@@ -300,6 +302,12 @@ function delay(ms: number): Promise<void> {
 }
 
 type RuntimeOpenGuard = () => boolean | Promise<boolean>;
+type SupervisorGenerationClaim = Omit<Extract<DaemonWorkerCommand, { type: "worker_auth" }>, "id" | "type" | "token">;
+
+interface BoundSupervisorGenerationClaim {
+	claim: SupervisorGenerationClaim;
+	ownerFingerprint: string;
+}
 
 class RuntimeOpenCancelledError extends Error {}
 
@@ -342,7 +350,9 @@ export class AgentDaemon {
 	private readonly bindingSessions = new Set<string>();
 	private restoreActiveSessionId: string | undefined;
 	private supervisorMonitorTimer?: ReturnType<typeof setTimeout>;
+	private supervisorFenceTimer?: ReturnType<typeof setTimeout>;
 	private supervisorLaunchInProgress = false;
+	private readonly supervisorClaims = new Map<DaemonSocketClient, BoundSupervisorGenerationClaim>();
 	private agentMessagesPaused = false;
 	private readonly summarizer = new DaemonSessionSummarizer(
 		() => [...this.sessions.values()],
@@ -472,12 +482,20 @@ export class AgentDaemon {
 		}
 		this.supervisorMonitorTimer = setTimeout(() => {
 			this.supervisorMonitorTimer = undefined;
-			void this.checkSupervisorAvailability(supervisorSocketPath);
+			void this.checkSupervisorAvailability(supervisorSocketPath).catch(() => {
+				if (!this.shuttingDown && !this.hasAuthenticatedSupervisorConnection()) {
+					this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 5000);
+				}
+			});
 		}, delayMs);
 	}
 
 	private async checkSupervisorAvailability(supervisorSocketPath: string): Promise<void> {
 		if (this.shuttingDown || this.hasAuthenticatedSupervisorConnection()) {
+			return;
+		}
+		if (await isDaemonShutdownAdmissionActive()) {
+			this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 5000);
 			return;
 		}
 		if (await this.canConnectToSupervisor(supervisorSocketPath)) {
@@ -490,7 +508,7 @@ export class AgentDaemon {
 	}
 
 	private hasAuthenticatedSupervisorConnection(): boolean {
-		return [...this.clients].some((client) => client.authenticated === true);
+		return this.supervisorClaims.size > 0;
 	}
 
 	private clearSupervisorAvailabilityCheck(): void {
@@ -498,6 +516,49 @@ export class AgentDaemon {
 			clearTimeout(this.supervisorMonitorTimer);
 			this.supervisorMonitorTimer = undefined;
 		}
+		if (this.supervisorFenceTimer) {
+			clearTimeout(this.supervisorFenceTimer);
+			this.supervisorFenceTimer = undefined;
+		}
+	}
+
+	private scheduleSupervisorFenceCheck(): void {
+		if (this.shuttingDown || this.supervisorFenceTimer || this.supervisorClaims.size === 0) {
+			return;
+		}
+		this.supervisorFenceTimer = setTimeout(() => {
+			this.supervisorFenceTimer = undefined;
+			void this.checkSupervisorFences();
+		}, SUPERVISOR_FENCE_POLL_MS);
+	}
+
+	private async checkSupervisorFences(): Promise<void> {
+		for (const [client, boundClaim] of this.supervisorClaims) {
+			try {
+				boundClaim.ownerFingerprint = await this.assertSupervisorClaimCurrent(
+					boundClaim.claim,
+					boundClaim.ownerFingerprint,
+				);
+			} catch {
+				client.socket.end();
+			}
+		}
+		this.scheduleSupervisorFenceCheck();
+	}
+
+	private assertSupervisorClaimCurrent(
+		claim: SupervisorGenerationClaim,
+		validatedFingerprint?: string,
+	): Promise<string> {
+		return assertDaemonSupervisorOwnerCurrent(
+			{
+				generation: claim.supervisorGeneration,
+				pid: claim.supervisorPid,
+				...(claim.supervisorProcessStartId ? { processStartId: claim.supervisorProcessStartId } : {}),
+				socketPath: claim.supervisorSocketPath,
+			},
+			validatedFingerprint,
+		);
 	}
 
 	private canConnectToSupervisor(socketPath: string): Promise<boolean> {
@@ -568,6 +629,9 @@ export class AgentDaemon {
 				return;
 			}
 			if (await this.canConnectToSupervisor(supervisorSocketPath)) {
+				return;
+			}
+			if (await isDaemonShutdownAdmissionActive()) {
 				return;
 			}
 			const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", supervisorSocketPath]);
@@ -1718,6 +1782,7 @@ export class AgentDaemon {
 			this.detachClient(client);
 			client.detachInput();
 			this.clients.delete(client);
+			this.supervisorClaims.delete(client);
 			const supervisorSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 			if (this.options.worker && client.authenticated === true && supervisorSocketPath) {
 				this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 100);
@@ -1744,6 +1809,10 @@ export class AgentDaemon {
 				id?: unknown;
 				type?: unknown;
 				token?: unknown;
+				supervisorGeneration?: unknown;
+				supervisorPid?: unknown;
+				supervisorProcessStartId?: unknown;
+				supervisorSocketPath?: unknown;
 				activeSessionId?: unknown;
 				capabilities?: unknown;
 				supportsExtensionUi?: unknown;
@@ -1754,15 +1823,78 @@ export class AgentDaemon {
 			}
 			if (this.options.worker && client.authenticated !== true) {
 				const commandId = typeof parsed.id === "string" ? parsed.id : undefined;
-				if (parsed.type !== "worker_auth" || parsed.token !== this.options.worker.authenticationToken) {
+				if (
+					parsed.type !== "worker_auth" ||
+					parsed.token !== this.options.worker.authenticationToken ||
+					typeof parsed.supervisorGeneration !== "string" ||
+					!Number.isInteger(parsed.supervisorPid) ||
+					(parsed.supervisorPid as number) <= 0 ||
+					(parsed.supervisorProcessStartId !== undefined && typeof parsed.supervisorProcessStartId !== "string") ||
+					typeof parsed.supervisorSocketPath !== "string"
+				) {
 					this.write(client, failure(commandId, "worker_auth", "Worker authentication failed"));
 					client.socket.end();
 					return;
 				}
+				const claim: SupervisorGenerationClaim = {
+					supervisorGeneration: parsed.supervisorGeneration,
+					supervisorPid: parsed.supervisorPid as number,
+					...(typeof parsed.supervisorProcessStartId === "string"
+						? { supervisorProcessStartId: parsed.supervisorProcessStartId }
+						: {}),
+					supervisorSocketPath: parsed.supervisorSocketPath,
+				};
+				let ownerFingerprint: string;
+				try {
+					ownerFingerprint = await this.assertSupervisorClaimCurrent(claim);
+				} catch {
+					this.write(client, failure(commandId, "worker_auth", "supervisor_generation_stale"));
+					client.socket.end();
+					return;
+				}
+				for (const previous of this.supervisorClaims.keys()) {
+					if (previous !== client) {
+						previous.socket.end();
+					}
+				}
 				client.authenticated = true;
+				this.supervisorClaims.set(client, { claim, ownerFingerprint });
 				this.clearSupervisorAvailabilityCheck();
+				this.scheduleSupervisorFenceCheck();
 				this.write(client, { id: commandId, type: "response", command: "worker_auth", success: true });
 				return;
+			}
+			if (this.options.worker) {
+				const boundClaim = this.supervisorClaims.get(client);
+				if (!boundClaim) {
+					this.write(
+						client,
+						failure(
+							typeof parsed.id === "string" ? parsed.id : undefined,
+							"worker_auth",
+							"supervisor_generation_stale",
+						),
+					);
+					client.socket.end();
+					return;
+				}
+				try {
+					boundClaim.ownerFingerprint = await this.assertSupervisorClaimCurrent(
+						boundClaim.claim,
+						boundClaim.ownerFingerprint,
+					);
+				} catch {
+					this.write(
+						client,
+						failure(
+							typeof parsed.id === "string" ? parsed.id : undefined,
+							typeof parsed.type === "string" ? parsed.type : "worker_auth",
+							"supervisor_generation_stale",
+						),
+					);
+					client.socket.end();
+					return;
+				}
 			}
 			if (this.options.worker && typeof parsed.type === "string" && parsed.type.startsWith("worker_")) {
 				await this.handleWorkerCommand(client, parsed as DaemonWorkerCommand);
@@ -4134,6 +4266,10 @@ export class AgentDaemon {
 		if (this.supervisorMonitorTimer) {
 			clearTimeout(this.supervisorMonitorTimer);
 			this.supervisorMonitorTimer = undefined;
+		}
+		if (this.supervisorFenceTimer) {
+			clearTimeout(this.supervisorFenceTimer);
+			this.supervisorFenceTimer = undefined;
 		}
 		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
 		const closingReason: DaemonClosingReason = this.updateRestartPreparing ? "update" : "shutdown";
