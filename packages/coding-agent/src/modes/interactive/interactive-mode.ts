@@ -5661,6 +5661,18 @@ export class InteractiveMode {
 			this.updateEditorBorderColor();
 		}
 
+		let latestImageToolCallId: string | undefined;
+		for (const message of sessionContext.messages) {
+			if (
+				message.role === "toolResult" &&
+				message.content.some(
+					(block) => block.type === "image" && typeof block.data === "string" && block.data.length > 0,
+				)
+			) {
+				latestImageToolCallId = message.toolCallId;
+			}
+		}
+
 		for (const message of sessionContext.messages) {
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
@@ -5675,8 +5687,10 @@ export class InteractiveMode {
 							{
 								showImages: this.settingsManager.getShowImages(),
 								imageWidthCells: this.settingsManager.getImageWidthCells(),
-								// Do not replay historical inline image payloads on session load/rebuild.
-								allowInlineImages: false,
+								// Do not replay every historical inline image payload on
+								// session load/rebuild. Keep only the newest image visible
+								// so resume opens with useful visual context.
+								allowInlineImages: content.id === latestImageToolCallId,
 							},
 							this.getCachedToolDefinition(content.name),
 							this.ui,

@@ -5,7 +5,7 @@
  * scroll position is application state, not terminal scrollback.
  */
 
-import { isImageLine } from "./terminal-image.js";
+import { getCapabilities, isImageLine } from "./terminal-image.js";
 import { sliceByColumn, stripAnsi, visibleWidth } from "./utils.js";
 
 export const FULLSCREEN_MIN_TRANSCRIPT_ROWS = 3;
@@ -15,8 +15,41 @@ export function clippedFullscreenDockHeight(dockLength: number, height: number):
 	return Math.min(dockLength, maxDock);
 }
 
-// Kitty images span multiple physical rows and cannot be clipped to a window.
+const KITTY_SEQUENCE_PREFIX = "\x1b_G";
+
+// Kitty images can span multiple physical rows and cannot be partially clipped.
 const IMAGE_PLACEHOLDER = "\x1b[2m[image — view in inline mode]\x1b[0m";
+
+function kittyImageRows(line: string): number | null {
+	const sequenceStart = line.indexOf(KITTY_SEQUENCE_PREFIX);
+	if (sequenceStart === -1) return null;
+
+	const paramsStart = sequenceStart + KITTY_SEQUENCE_PREFIX.length;
+	const paramsEnd = line.indexOf(";", paramsStart);
+	if (paramsEnd === -1) return null;
+
+	const params = line.slice(paramsStart, paramsEnd);
+	for (const param of params.split(",")) {
+		const [key, value] = param.split("=", 2);
+		if (key !== "r" || value === undefined) continue;
+		const rows = Number(value);
+		if (Number.isInteger(rows) && rows > 0) return rows;
+	}
+	return 1;
+}
+
+function canRenderImageInFullscreen(window: readonly string[], index: number): boolean {
+	const caps = getCapabilities();
+	if (caps.images !== "kitty" || caps.imagePlacement !== "first-row") return false;
+
+	const line = window[index] ?? "";
+	if (!line.startsWith(KITTY_SEQUENCE_PREFIX)) return false;
+
+	const rows = kittyImageRows(line);
+	if (rows === null) return false;
+
+	return index + rows <= window.length;
+}
 
 export interface ScrollInfo {
 	following: boolean;
@@ -97,7 +130,9 @@ export class FullscreenViewport {
 
 		const window = transcript.slice(this.scrollTop, this.scrollTop + windowHeight);
 		for (let i = 0; i < window.length; i++) {
-			if (isImageLine(window[i])) window[i] = IMAGE_PLACEHOLDER;
+			if (isImageLine(window[i]) && !canRenderImageInFullscreen(window, i)) {
+				window[i] = IMAGE_PLACEHOLDER;
+			}
 		}
 		this.highlightSelection(window);
 		while (window.length < windowHeight) {

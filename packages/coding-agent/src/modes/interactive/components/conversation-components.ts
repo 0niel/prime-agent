@@ -35,6 +35,19 @@ function readUserText(content: string | Array<{ type: string; text?: string }>):
 		.join("");
 }
 
+function findLatestImageToolCallId(messages: readonly AgentMessage[]): string | undefined {
+	let latest: string | undefined;
+	for (const message of messages) {
+		if (
+			message.role === "toolResult" &&
+			message.content.some((block) => block.type === "image" && typeof block.data === "string" && block.data.length > 0)
+		) {
+			latest = message.toolCallId;
+		}
+	}
+	return latest;
+}
+
 /** Build conversation components from a message list, matching tool results to their calls. */
 export function buildConversationComponents(
 	messages: readonly AgentMessage[],
@@ -43,6 +56,7 @@ export function buildConversationComponents(
 	const components: Component[] = [];
 	const pendingTools = new Map<string, ToolExecutionComponent>();
 	const expanded = options.toolsExpanded ?? false;
+	const latestImageToolCallId = findLatestImageToolCallId(messages);
 
 	for (const message of messages) {
 		if (message.role === "assistant") {
@@ -63,8 +77,10 @@ export function buildConversationComponents(
 					content.name,
 					content.id,
 					content.arguments,
-					// Replayed history rebuilds on every event; don't re-emit inline images.
-					{ ...options.toolOptions, allowInlineImages: false },
+					// Replayed history rebuilds on every event. Keep old inline image
+					// payloads suppressed, but allow the latest image result to render
+					// so resumed image workflows don't come back as invisible output.
+					{ ...options.toolOptions, allowInlineImages: content.id === latestImageToolCallId },
 					options.getToolDefinition(content.name),
 					options.ui,
 					options.cwd,

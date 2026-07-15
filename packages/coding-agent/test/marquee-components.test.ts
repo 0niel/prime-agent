@@ -1,5 +1,12 @@
 import type { AssistantMessage, Usage, UserMessage } from "@earendil-works/pi-ai";
-import { type Component, setKeybindings, TUI, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	type Component,
+	resetCapabilitiesCache,
+	setCapabilities,
+	setKeybindings,
+	TUI,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, test } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.js";
@@ -513,6 +520,50 @@ describe("marquee TUI components", () => {
 
 		const expanded = stripAnsi(detailComponent.render(100).join("\n"));
 		expect(expanded).toContain("/tmp/internal.py");
+	});
+
+	test("renders only the latest historical image tool result inline", () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" });
+		try {
+			const image =
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+			const messages = [
+				{
+					...createAssistantMessage("old image"),
+					content: [{ type: "toolCall" as const, id: "old-image", name: "ipython", arguments: { code: "old" } }],
+					stopReason: "toolUse" as const,
+				},
+				{
+					role: "toolResult" as const,
+					toolCallId: "old-image",
+					toolName: "ipython",
+					content: [{ type: "image" as const, data: image, mimeType: "image/png" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+				{
+					...createAssistantMessage("new image"),
+					content: [{ type: "toolCall" as const, id: "new-image", name: "ipython", arguments: { code: "new" } }],
+					stopReason: "toolUse" as const,
+				},
+				{
+					role: "toolResult" as const,
+					toolCallId: "new-image",
+					toolName: "ipython",
+					content: [{ type: "image" as const, data: image, mimeType: "image/png" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+			];
+
+			const rendered = buildConversationComponents(messages, bodyOptions())
+				.flatMap((component) => component.render(120))
+				.join("\n");
+			const inlineImageCount = (rendered.match(/\x1b_G/g) ?? []).length;
+			expect(inlineImageCount).toBe(1);
+		} finally {
+			resetCapabilitiesCache();
+		}
 	});
 
 	test("routes child agent detail tool expansion through app keybindings", () => {

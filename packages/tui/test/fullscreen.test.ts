@@ -1,6 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import type { TerminalStopOptions } from "../src/terminal.js";
+import { encodeKitty, resetCapabilitiesCache, setCapabilities } from "../src/terminal-image.js";
 import { type Component, TUI } from "../src/tui.js";
 import { VirtualTerminal } from "./virtual-terminal.js";
 
@@ -98,6 +99,66 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void
 }
 
 describe("TUI fullscreen mode", () => {
+	it("renders complete Ghostty first-row Kitty images in fullscreen", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" });
+		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 55, moveCursor: false });
+		const { terminal, tui, chat, dock } = setup(["before", image, "", "after"], 80, 8);
+		try {
+			await terminal.waitForRender();
+			terminal.clearWrites();
+
+			tui.enterFullscreen({ scroll: [chat], dock });
+			await terminal.waitForRender();
+
+			const writes = terminal.getWrites();
+			assert.ok(writes.includes(image), "Ghostty first-row image should be rendered in fullscreen");
+			assert.ok(!writes.includes("view in inline mode"), "complete first-row image should not be replaced");
+		} finally {
+			tui.stop();
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("keeps the inline-mode placeholder for cursor-shim Kitty images in fullscreen", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 56, moveCursor: false });
+		const { terminal, tui, chat, dock } = setup(["before", "", image, "after"], 80, 8);
+		try {
+			await terminal.waitForRender();
+			terminal.clearWrites();
+
+			tui.enterFullscreen({ scroll: [chat], dock });
+			await terminal.waitForRender();
+
+			const writes = terminal.getWrites();
+			assert.ok(!writes.includes(image), "cursor-shim image should not be emitted inside fullscreen");
+			assert.ok(writes.includes("view in inline mode"), "cursor-shim image should use the safe placeholder");
+		} finally {
+			tui.stop();
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("keeps the inline-mode placeholder for clipped Ghostty image blocks", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" });
+		const image = encodeKitty("AAAA", { columns: 2, rows: 5, imageId: 57, moveCursor: false });
+		const { terminal, tui, chat, dock } = setup(["Line 0", "Line 1", "Line 2", "Line 3", image, "", ""], 80, 8);
+		try {
+			await terminal.waitForRender();
+			terminal.clearWrites();
+
+			tui.enterFullscreen({ scroll: [chat], dock });
+			await terminal.waitForRender();
+
+			const writes = terminal.getWrites();
+			assert.ok(!writes.includes(image), "clipped first-row image should not be emitted inside fullscreen");
+			assert.ok(writes.includes("view in inline mode"), "clipped first-row image should use the safe placeholder");
+		} finally {
+			tui.stop();
+			resetCapabilitiesCache();
+		}
+	});
+
 	it("enters the alt screen and lays out transcript window above the dock", async () => {
 		const { terminal, tui, chat, dock } = setup(lines(20));
 		await terminal.waitForRender();
