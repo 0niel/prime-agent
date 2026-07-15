@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed slash-command and skill autocomplete not appearing for references typed in the middle of prompts ([ENG-4628](https://linear.app/primeintellect/issue/ENG-4628/support-skill-and-command-autocomplete-mid-prompt)).
 - Fixed focused full-pane overlays becoming slow to navigate on wider terminals.
 
 ## [0.3.0] - 2026-07-13
