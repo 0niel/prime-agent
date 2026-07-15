@@ -19,6 +19,21 @@ class InputComponent extends TestComponent {
 	}
 }
 
+class SelectionOverlay extends TestComponent {
+	private selected = 0;
+
+	override render(width: number): string[] {
+		return ["first", "second"].map((label, index) => {
+			const line = label.padEnd(width);
+			return index === this.selected ? `\x1b[48;5;238m${line}\x1b[49m` : line;
+		});
+	}
+
+	handleInput(_data: string): void {
+		this.selected = (this.selected + 1) % 2;
+	}
+}
+
 class LoggingVirtualTerminal extends VirtualTerminal {
 	private writes: string[] = [];
 	lastStopOptions: TerminalStopOptions | undefined;
@@ -263,6 +278,26 @@ describe("TUI fullscreen mode", () => {
 		tui.stop();
 	});
 
+	it("repaints only changed rows when navigating a focused overlay", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20));
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		tui.showOverlay(new SelectionOverlay(), { anchor: "center", width: 20 });
+		await terminal.waitForRender();
+		terminal.clearWrites();
+
+		terminal.sendInput("j");
+		await terminal.waitForRender();
+
+		const writes = terminal.getWrites();
+		const repaintedRows = writes.match(/\x1b\[\d+;1H\x1b\[2K/g) ?? [];
+		assert.ok(!writes.includes("\x1b[2J"), "overlay navigation should not clear the screen");
+		assert.strictEqual(repaintedRows.length, 2, "only the old and new selected rows should repaint");
+
+		tui.stop();
+	});
+
 	it("suspends fullscreen mouse tracking while a visible overlay requests native mouse", async () => {
 		const { terminal, tui, chat, dock } = setup(lines(20), 80, 10);
 		tui.enterFullscreen({ scroll: [chat], dock });
@@ -326,6 +361,27 @@ describe("TUI fullscreen mode", () => {
 		assert.deepStrictEqual(copies, [url]);
 		assert.deepStrictEqual(overlay.inputs, [], "mouse reports are consumed before overlay input handlers");
 
+		tui.stop();
+	});
+
+	it("drag-selects ANSI-styled wide text from a focused overlay", async () => {
+		const { terminal, tui, chat, dock } = setup(lines(20), 40, 10);
+		const copies: string[] = [];
+		tui.onCopy = (text) => copies.push(text);
+		tui.enterFullscreen({ scroll: [chat], dock });
+		await terminal.waitForRender();
+
+		const overlay = new InputComponent();
+		overlay.lines = ["\x1b[48;5;236m  界🙂  \x1b[49m"];
+		tui.showOverlay(overlay, { anchor: "top-left", width: 20 });
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<0;3;1M");
+		terminal.sendInput("\x1b[<32;7;1M");
+		terminal.sendInput("\x1b[<0;7;1m");
+		await terminal.waitForRender();
+
+		assert.deepStrictEqual(copies, ["界🙂"]);
 		tui.stop();
 	});
 
