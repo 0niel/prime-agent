@@ -407,6 +407,8 @@ export interface ToolRenderContext<TState = any, TArgs = any> {
 	isPartial: boolean;
 	/** Whether the result view is expanded. */
 	expanded: boolean;
+	/** Whether this row should show the global tool expansion shortcut. */
+	showExpandHint?: boolean;
 	/** Whether inline images are currently shown in the TUI. */
 	showImages: boolean;
 	/** Whether image fallback labels may parse dimensions from base64 data. */

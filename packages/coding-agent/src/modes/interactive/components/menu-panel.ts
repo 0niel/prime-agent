@@ -45,6 +45,11 @@ const FIELD_PADDING_X = 2;
 const ROW_PADDING_X = 2;
 const ROW_PADDING_Y = 1;
 
+export function getMenuPanelInnerWidth(width: number): number {
+	const safeWidth = Math.max(PANEL_PADDING_X * 2 + 1, width);
+	return Math.max(1, safeWidth - PANEL_PADDING_X * 2);
+}
+
 interface FullWidthMenuComponent {
 	readonly fillsMenuPanel: true;
 }
@@ -223,7 +228,7 @@ export class MenuPanel extends Container {
 
 	override render(width: number): string[] {
 		const safeWidth = Math.max(PANEL_PADDING_X * 2 + 1, width);
-		const innerWidth = Math.max(1, safeWidth - PANEL_PADDING_X * 2);
+		const innerWidth = getMenuPanelInnerWidth(width);
 		const lines: string[] = [];
 
 		for (let i = 0; i < PANEL_PADDING_Y; i++) {

@@ -72,7 +72,7 @@ describe("AssistantMessageComponent", () => {
 		expect(lines.at(-1)).toBe("");
 	});
 
-	test("does not add spacing for a tool-only assistant message", () => {
+	test("adds one leading spacer before a tool-only batch", () => {
 		initTheme("dark");
 
 		const component = new AssistantMessageComponent(
@@ -82,7 +82,7 @@ describe("AssistantMessageComponent", () => {
 			]),
 		);
 
-		expect(component.render(60)).toEqual([]);
+		expect(component.render(60)).toEqual([""]);
 	});
 
 	test("renders an abort status for messages with tool calls", () => {

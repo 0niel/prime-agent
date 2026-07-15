@@ -55,6 +55,9 @@ type ResetHarness = PromptStashLiveMarkerHarness & {
 	pendingBashComponents: unknown[];
 	activityTracker: { reset: Mock };
 	contextUsageTokenBaseline: number;
+	agentRunFileChanges: Map<string, unknown>;
+	recapContainer: { clear: Mock };
+	ui: { requestRender: Mock };
 	ipythonToolComponents: Map<string, unknown>;
 	lateIpythonSentAgentMessages: Map<string, unknown>;
 	resetPendingToolState: Mock;
@@ -350,6 +353,9 @@ describe("InteractiveMode prompt stash", () => {
 			pendingBashComponents: [],
 			activityTracker: { reset: vi.fn() },
 			contextUsageTokenBaseline: 1,
+			agentRunFileChanges: new Map(),
+			recapContainer: { clear: vi.fn() },
+			ui: { requestRender: vi.fn() },
 			ipythonToolComponents: new Map(),
 			lateIpythonSentAgentMessages: new Map(),
 			resetPendingToolState: vi.fn(),
@@ -383,6 +389,9 @@ describe("InteractiveMode prompt stash", () => {
 			pendingBashComponents: [],
 			activityTracker: { reset: vi.fn() },
 			contextUsageTokenBaseline: 1,
+			agentRunFileChanges: new Map(),
+			recapContainer: { clear: vi.fn() },
+			ui: { requestRender: vi.fn() },
 			ipythonToolComponents: new Map(),
 			lateIpythonSentAgentMessages: new Map(),
 			resetPendingToolState: vi.fn(),

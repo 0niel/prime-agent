@@ -341,6 +341,8 @@ export {
 	BorderedLoader,
 	BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent,
+	ConfigurationMenuComponent,
+	type ConfigurationMenuTab,
 	CustomEditor,
 	CustomMessageComponent,
 	DynamicBorder,

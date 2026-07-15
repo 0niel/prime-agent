@@ -17,7 +17,7 @@ import {
 	normalizeTerminalOutput,
 	sliceByColumn,
 	sliceWithWidth,
-	stripAnsi,
+	visibleContentSpan,
 	visibleWidth,
 } from "./utils.js";
 
@@ -1108,16 +1108,7 @@ export class TUI extends Container {
 	}
 
 	private selectableSpan(line: string, maxWidth: number): { from: number; to: number } | null {
-		const width = Math.min(maxWidth, visibleWidth(line));
-		let from = -1;
-		let to = -1;
-		for (let col = 0; col < width; col++) {
-			const cell = stripAnsi(sliceByColumn(line, col, 1));
-			if (cell.trim().length === 0) continue;
-			if (from === -1) from = col;
-			to = col + 1;
-		}
-		return from === -1 ? null : { from, to };
+		return visibleContentSpan(line, maxWidth);
 	}
 
 	private createDockSelectionRegions(

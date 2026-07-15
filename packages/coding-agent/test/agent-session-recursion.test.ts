@@ -27,20 +27,7 @@ import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
-import { MISSING_RIPGREP_MESSAGE } from "../src/utils/tools-manager.js";
 import { createTestResourceLoader } from "./utilities.js";
-
-const toolsManagerMock = vi.hoisted(() => ({
-	ensureTool: vi.fn(async (): Promise<string | undefined> => "rg"),
-}));
-
-vi.mock("../src/utils/tools-manager.js", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("../src/utils/tools-manager.js")>();
-	return {
-		...actual,
-		ensureTool: toolsManagerMock.ensureTool,
-	};
-});
 
 const model = getModel("anthropic", "claude-sonnet-4-5")!;
 
@@ -224,8 +211,6 @@ describe("AgentSession rlm recursion", () => {
 	afterEach(() => {
 		session?.dispose();
 		session = undefined;
-		toolsManagerMock.ensureTool.mockReset();
-		toolsManagerMock.ensureTool.mockResolvedValue("rg");
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
@@ -499,24 +484,14 @@ describe("AgentSession rlm recursion", () => {
 		await runPromise;
 	});
 
-	it("surfaces missing ripgrep as one child-agent error before model work starts", async () => {
-		toolsManagerMock.ensureTool.mockResolvedValueOnce(undefined);
+	it("runs a child agent without requiring ripgrep", async () => {
 		const streamFn = vi.fn((_model, context: Context) => streamAnswer(`child answer: ${userText(context)}`));
 		const root = createSession({ streamFn });
-		const childUpdates: Array<{ status: string }> = [];
-		root.subscribe((event) => {
-			if (event.type === "rlm_child_update") {
-				childUpdates.push(event.child);
-			}
-		});
 
-		await expect(root.runRlmChild("summarize shard 1")).rejects.toThrow(MISSING_RIPGREP_MESSAGE);
+		const result = await root.runRlmChild("summarize shard 1");
 
-		expect(root.listRlmSubagents()).toEqual({ subagents: [] });
-		expect(toolsManagerMock.ensureTool).toHaveBeenCalledWith("rg", true);
-		expect(streamFn).not.toHaveBeenCalled();
-		const errorUpdate = [...childUpdates].reverse().find((update) => update.status === "error");
-		expect(errorUpdate).toBeDefined();
+		expect(result.answer).toBe("child answer: summarize shard 1");
+		expect(streamFn).toHaveBeenCalledOnce();
 	});
 
 	it("adds child usage to the parent session aggregate", async () => {
@@ -934,20 +909,29 @@ describe("AgentSession rlm recursion", () => {
 	});
 
 	it("deletes a queued child without waiting for blocked startup", async () => {
-		let releaseEnsureTool: () => void = () => {};
-		const ensureToolGate = new Promise<void>((resolve) => {
-			releaseEnsureTool = resolve;
+		let releaseRuntimeCreation: () => void = () => {};
+		const runtimeCreationGate = new Promise<void>((resolve) => {
+			releaseRuntimeCreation = resolve;
 		});
-		let ensureToolStarted = false;
-		toolsManagerMock.ensureTool.mockImplementationOnce(async () => {
-			ensureToolStarted = true;
-			await ensureToolGate;
-			return "rg";
+		let runtimeCreationStarted = false;
+		const hostedChild = createSession();
+		const releaseRuntime = vi.fn(async () => {
+			await hostedChild.disposeAsync();
 		});
-		const root = createSession();
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					runtimeCreationStarted = true;
+					await runtimeCreationGate;
+					return { session: hostedChild };
+				},
+				deleteRlmSubagentRuntime: async () => {},
+				releaseRlmSubagentRuntime: releaseRuntime,
+			},
+		});
 		const runPromise = root.runRlmChild("blocked before runtime creation", { name: "queued-worker" });
 		const runFailure = expect(runPromise).rejects.toThrow("Deleted by parent orchestrator");
-		await waitFor(() => ensureToolStarted);
+		await waitFor(() => runtimeCreationStarted);
 		const queued = root.listRlmSubagents().subagents[0];
 		expect(queued).toBeDefined();
 
@@ -956,8 +940,8 @@ describe("AgentSession rlm recursion", () => {
 		expect((root as unknown as InspectableRlmSession)._activeRlmChildRuns.size).toBe(0);
 		expect(root.listRlmSubagents()).toEqual({ subagents: [] });
 
-		releaseEnsureTool();
-		await Promise.resolve();
+		releaseRuntimeCreation();
+		await waitFor(() => releaseRuntime.mock.calls.length === 1);
 		expect(root.listRlmSubagents()).toEqual({ subagents: [] });
 	});
 

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed focused full-pane overlays becoming slow to navigate on wider terminals.
+
 ## [0.3.0] - 2026-07-13
 
 - Fixed fullscreen TUI handoffs temporarily releasing raw input and leaking keyboard-protocol timers, which caused flicker and echoed arrow escape sequences while opening sessions.

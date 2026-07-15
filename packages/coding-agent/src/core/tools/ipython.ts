@@ -23,6 +23,9 @@ import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
 const RLM_BOOTSTRAP_BASE_CODE = `
 import asyncio
+import os as _prime_agent_os
+
+_prime_agent_os.environ["NO_COLOR"] = "1"
 
 try:
     import nest_asyncio as _prime_agent_nest_asyncio

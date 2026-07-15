@@ -11,6 +11,27 @@ import { APP_NAME, getBinDir } from "../config.js";
 const TOOLS_DIR = getBinDir();
 const NETWORK_TIMEOUT_MS = 10_000;
 const DOWNLOAD_TIMEOUT_MS = 120_000;
+const COMMAND_TIMEOUT_MS = 5_000;
+const RIPGREP_INSTALL_URL = "https://github.com/BurntSushi/ripgrep#installation";
+
+export type ManagedTool = "fd" | "rg";
+
+export type ToolUnavailableReason = "offline" | "manual_install_required" | "unsupported_platform" | "download_failed";
+
+export interface ToolAvailableResult {
+	status: "available";
+	path: string;
+}
+
+export interface ToolUnavailableResult {
+	status: "unavailable";
+	reason: ToolUnavailableReason;
+	platform: string;
+	architecture: string;
+	detail?: string;
+}
+
+export type ToolEnsureResult = ToolAvailableResult | ToolUnavailableResult;
 
 function isOfflineModeEnabled(): boolean {
 	const value = process.env.PI_OFFLINE;
@@ -36,13 +57,16 @@ const TOOLS: Record<string, ToolConfig> = {
 		tagPrefix: "v",
 		getAssetName: (version, plat, architecture) => {
 			if (plat === "darwin") {
-				const archStr = architecture === "arm64" ? "aarch64" : "x86_64";
+				const archStr = architecture === "arm64" ? "aarch64" : architecture === "x64" ? "x86_64" : null;
+				if (!archStr) return null;
 				return `fd-v${version}-${archStr}-apple-darwin.tar.gz`;
 			} else if (plat === "linux") {
-				const archStr = architecture === "arm64" ? "aarch64" : "x86_64";
+				const archStr = architecture === "arm64" ? "aarch64" : architecture === "x64" ? "x86_64" : null;
+				if (!archStr) return null;
 				return `fd-v${version}-${archStr}-unknown-linux-gnu.tar.gz`;
 			} else if (plat === "win32") {
-				const archStr = architecture === "arm64" ? "aarch64" : "x86_64";
+				const archStr = architecture === "arm64" ? "aarch64" : architecture === "x64" ? "x86_64" : null;
+				if (!archStr) return null;
 				return `fd-v${version}-${archStr}-pc-windows-msvc.zip`;
 			}
 			return null;
@@ -55,15 +79,17 @@ const TOOLS: Record<string, ToolConfig> = {
 		tagPrefix: "",
 		getAssetName: (version, plat, architecture) => {
 			if (plat === "darwin") {
-				const archStr = architecture === "arm64" ? "aarch64" : "x86_64";
+				const archStr = architecture === "arm64" ? "aarch64" : architecture === "x64" ? "x86_64" : null;
+				if (!archStr) return null;
 				return `ripgrep-${version}-${archStr}-apple-darwin.tar.gz`;
 			} else if (plat === "linux") {
 				if (architecture === "arm64") {
 					return `ripgrep-${version}-aarch64-unknown-linux-gnu.tar.gz`;
 				}
-				return `ripgrep-${version}-x86_64-unknown-linux-musl.tar.gz`;
+				return architecture === "x64" ? `ripgrep-${version}-x86_64-unknown-linux-musl.tar.gz` : null;
 			} else if (plat === "win32") {
-				const archStr = architecture === "arm64" ? "aarch64" : "x86_64";
+				const archStr = architecture === "arm64" ? "aarch64" : architecture === "x64" ? "x86_64" : null;
+				if (!archStr) return null;
 				return `ripgrep-${version}-${archStr}-pc-windows-msvc.zip`;
 			}
 			return null;
@@ -71,32 +97,31 @@ const TOOLS: Record<string, ToolConfig> = {
 	},
 };
 
-// Check if a command exists in PATH by trying to run it
-function commandExists(cmd: string): boolean {
+// Check that a command both launches and reports a successful version.
+function commandWorks(cmd: string): boolean {
 	try {
-		const result = spawnSync(cmd, ["--version"], { stdio: "pipe" });
-		// Check for ENOENT error (command not found)
-		return result.error === undefined || result.error === null;
+		const result = spawnSync(cmd, ["--version"], { stdio: "pipe", timeout: COMMAND_TIMEOUT_MS });
+		return !result.error && result.status === 0;
 	} catch {
 		return false;
 	}
 }
 
 // Get the path to a tool (system-wide or in our tools dir)
-export function getToolPath(tool: "fd" | "rg"): string | null {
+export function getToolPath(tool: ManagedTool): string | null {
 	const config = TOOLS[tool];
 	if (!config) return null;
 
 	// Check our tools directory first
 	const localPath = join(TOOLS_DIR, config.binaryName + (platform() === "win32" ? ".exe" : ""));
-	if (existsSync(localPath)) {
+	if (existsSync(localPath) && commandWorks(localPath)) {
 		return localPath;
 	}
 
 	// Check system PATH - if found, just return the command name (it's in PATH)
 	const systemBinaryNames = config.systemBinaryNames ?? [config.binaryName];
 	for (const systemBinaryName of systemBinaryNames) {
-		if (commandExists(systemBinaryName)) {
+		if (commandWorks(systemBinaryName)) {
 			return systemBinaryName;
 		}
 	}
@@ -160,21 +185,23 @@ function findBinaryRecursively(rootDir: string, binaryFileName: string): string 
 }
 
 // Download and install a tool
-async function downloadTool(tool: "fd" | "rg"): Promise<string> {
+class UnsupportedToolPlatformError extends Error {}
+
+async function downloadTool(tool: ManagedTool): Promise<string> {
 	const config = TOOLS[tool];
 	if (!config) throw new Error(`Unknown tool: ${tool}`);
 
 	const plat = platform();
 	const architecture = arch();
 
-	// Get latest version
-	const version = await getLatestVersion(config.repo);
-
-	// Get asset name for this platform
-	const assetName = config.getAssetName(version, plat, architecture);
-	if (!assetName) {
-		throw new Error(`Unsupported platform: ${plat}/${architecture}`);
+	if (!config.getAssetName("VERSION", plat, architecture)) {
+		throw new UnsupportedToolPlatformError(`Unsupported platform: ${plat}/${architecture}`);
 	}
+
+	// Get latest version and the matching platform asset.
+	const version = await getLatestVersion(config.repo);
+	const assetName = config.getAssetName(version, plat, architecture);
+	if (!assetName) throw new UnsupportedToolPlatformError(`Unsupported platform: ${plat}/${architecture}`);
 
 	// Create tools directory
 	mkdirSync(TOOLS_DIR, { recursive: true });
@@ -220,6 +247,7 @@ async function downloadTool(tool: "fd" | "rg"): Promise<string> {
 		}
 
 		if (extractedBinary) {
+			rmSync(binaryPath, { force: true });
 			renameSync(extractedBinary, binaryPath);
 		} else {
 			throw new Error(`Binary not found in archive: expected ${binaryFileName} under ${extractDir}`);
@@ -228,6 +256,10 @@ async function downloadTool(tool: "fd" | "rg"): Promise<string> {
 		// Make executable (Unix only)
 		if (plat !== "win32") {
 			chmodSync(binaryPath, 0o755);
+		}
+		if (!commandWorks(binaryPath)) {
+			rmSync(binaryPath, { force: true });
+			throw new Error(`Installed ${config.name} binary failed its version check`);
 		}
 	} finally {
 		// Cleanup
@@ -244,34 +276,80 @@ const TERMUX_PACKAGES: Record<string, string> = {
 	rg: "ripgrep",
 };
 
-export const MISSING_RIPGREP_MESSAGE = "ripgrep (rg) is missing; search and sub-agents may fail until it is installed.";
+function getRipgrepInstallHint(platformName: string): string {
+	switch (platformName) {
+		case "darwin":
+			return "Install it with: brew install ripgrep";
+		case "linux":
+			return `Install it with your package manager (for example, sudo apt install ripgrep or sudo dnf install ripgrep). See ${RIPGREP_INSTALL_URL}`;
+		case "win32":
+			return "Install it with: winget install BurntSushi.ripgrep.MSVC";
+		case "android":
+			return "Install it with: pkg install ripgrep";
+		default:
+			return `Install ripgrep manually: ${RIPGREP_INSTALL_URL}`;
+	}
+}
 
-// Ensure a tool is available, downloading if necessary
-// Returns the path to the tool, or null if unavailable
-export async function ensureTool(tool: "fd" | "rg", silent: boolean = true): Promise<string | undefined> {
+export function formatMissingRipgrepMessage(result: ToolUnavailableResult): string {
+	let reason: string;
+	switch (result.reason) {
+		case "offline":
+			reason = "Automatic installation was skipped because PI_OFFLINE is enabled.";
+			break;
+		case "manual_install_required":
+			reason = "Prime Agent cannot install this helper automatically in Termux.";
+			break;
+		case "unsupported_platform":
+			reason = `Automatic installation is unavailable for ${result.platform}/${result.architecture}.`;
+			break;
+		case "download_failed": {
+			const detail = result.detail?.replace(/\s+/g, " ").trim();
+			reason = detail
+				? `Prime Agent could not install it automatically: ${detail}`
+				: "Prime Agent could not install it automatically.";
+			break;
+		}
+	}
+
+	return [
+		"ripgrep (rg) is an optional search helper. Without it, model-run file searches may be slower or fail; Prime Agent and subagents remain available.",
+		reason,
+		getRipgrepInstallHint(result.platform),
+	].join("\n");
+}
+
+// Ensure a tool is available, downloading if necessary, and retain why provisioning failed.
+export async function ensureToolWithStatus(tool: ManagedTool, silent: boolean = true): Promise<ToolEnsureResult> {
 	const existingPath = getToolPath(tool);
 	if (existingPath) {
-		return existingPath;
+		return { status: "available", path: existingPath };
 	}
 
 	const config = TOOLS[tool];
-	if (!config) return undefined;
+	const platformName = platform();
+	const architecture = arch();
 
 	if (isOfflineModeEnabled()) {
 		if (!silent) {
 			console.log(chalk.yellow(`${config.name} not found. Offline mode enabled, skipping download.`));
 		}
-		return undefined;
+		return { status: "unavailable", reason: "offline", platform: platformName, architecture };
 	}
 
 	// On Android/Termux, Linux binaries don't work due to Bionic libc incompatibility.
 	// Users must install via pkg.
-	if (platform() === "android") {
+	if (platformName === "android") {
 		const pkgName = TERMUX_PACKAGES[tool] ?? tool;
 		if (!silent) {
 			console.log(chalk.yellow(`${config.name} not found. Install with: pkg install ${pkgName}`));
 		}
-		return undefined;
+		return {
+			status: "unavailable",
+			reason: "manual_install_required",
+			platform: platformName,
+			architecture,
+		};
 	}
 
 	// Tool not found - download it
@@ -284,11 +362,23 @@ export async function ensureTool(tool: "fd" | "rg", silent: boolean = true): Pro
 		if (!silent) {
 			console.log(chalk.dim(`${config.name} installed to ${path}`));
 		}
-		return path;
+		return { status: "available", path };
 	} catch (e) {
 		if (!silent) {
 			console.log(chalk.yellow(`Failed to download ${config.name}: ${e instanceof Error ? e.message : e}`));
 		}
-		return undefined;
+		return {
+			status: "unavailable",
+			reason: e instanceof UnsupportedToolPlatformError ? "unsupported_platform" : "download_failed",
+			platform: platformName,
+			architecture,
+			detail: e instanceof Error ? e.message : String(e),
+		};
 	}
+}
+
+// Compatibility wrapper for callers that only need the resolved executable path.
+export async function ensureTool(tool: ManagedTool, silent: boolean = true): Promise<string | undefined> {
+	const result = await ensureToolWithStatus(tool, silent);
+	return result.status === "available" ? result.path : undefined;
 }

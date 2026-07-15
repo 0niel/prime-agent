@@ -3,6 +3,15 @@
 ## [Unreleased]
 
 - Added parent-scoped subagent lifecycle APIs: create children with readable default or orchestrator-chosen names, recover running or completed children through `rlm.list_subagents()`, continue them through agent messaging, and close/remove them with `rlm.delete_subagent()`.
+- Added compact file change stats to collapsed tool calls and an agent-run edit total above the recap.
+- Changed tool expansion hints to appear only on the latest tool row instead of every tool call ([ENG-4583](https://linear.app/primeintellect/issue/ENG-4583/too-many-ctrlo-alerts)).
+- Changed IPython kernels to set `NO_COLOR=1`, preventing ANSI color escapes from inflating `%%bash` output.
+- Changed provider, model, and MCP setup to use one tabbed configuration menu ([ENG-4539](https://linear.app/primeintellect/issue/ENG-4539/unify-providers-models-and-mcp-connections-menu)).
+- Changed the shared configuration menu to show prominent, responsive tabs with configurable navigation shortcuts ([ENG-4534](https://linear.app/primeintellect/issue/ENG-4534/make-login-tabs-more-obvious)).
+- Fixed Prime Inference login leaving new sessions without a persisted model selection ([ENG-4573](https://linear.app/primeintellect/issue/ENG-4573/prompt-for-model-selection-after-prime-inference-login)).
+- Fixed empty prompt placeholders hiding the input caret.
+- Fixed missing ripgrep blocking subagents and added actionable installation guidance for the optional search helper ([ENG-4572](https://linear.app/primeintellect/issue/ENG-4572/ripgrep-not-installed)).
+- Fixed tool-only responses rendering directly against the preceding user prompt.
 
 ## [0.3.0] - 2026-07-13
 

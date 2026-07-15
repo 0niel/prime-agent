@@ -8,6 +8,8 @@ type RecapRenderMode = {
 	recapContainer: Container;
 	childAgentPanelMode?: "detail";
 	sessionRecap?: string;
+	agentRunFileChanges: Map<string, never>;
+	isAgentStreaming: () => boolean;
 	ui: { requestRender: () => void };
 };
 
@@ -27,6 +29,7 @@ type MessageStartMode = {
 	addMessageToChat: (message: AgentMessage) => void;
 	ui: { requestRender: () => void };
 	sessionRecap?: string;
+	agentRunFileChanges: Map<string, never>;
 	renderRecap: () => void;
 	updatePendingMessagesDisplay: () => void;
 };
@@ -42,6 +45,8 @@ function createRenderMode(sessionRecap?: string): RecapRenderMode {
 	return Object.assign(Object.create(InteractiveMode.prototype), {
 		recapContainer: new Container(),
 		sessionRecap,
+		agentRunFileChanges: new Map(),
+		isAgentStreaming: () => false,
 		ui: { requestRender: vi.fn() },
 	}) as RecapRenderMode;
 }
@@ -59,6 +64,7 @@ function createMessageStartMode(): MessageStartMode {
 		addMessageToChat: vi.fn(),
 		ui: { requestRender: vi.fn() },
 		sessionRecap: "previous recap",
+		agentRunFileChanges: new Map(),
 		renderRecap: vi.fn(),
 		updatePendingMessagesDisplay: vi.fn(),
 	}) as MessageStartMode;
@@ -90,7 +96,7 @@ describe("ENG-4533 recap layout", () => {
 
 		expect(mode.addMessageToChat).toHaveBeenCalledWith(message);
 		expect(mode.sessionRecap).toBe("previous recap");
-		expect(mode.renderRecap).not.toHaveBeenCalled();
+		expect(mode.renderRecap).toHaveBeenCalledOnce();
 		expect(mode.updatePendingMessagesDisplay).not.toHaveBeenCalled();
 	});
 

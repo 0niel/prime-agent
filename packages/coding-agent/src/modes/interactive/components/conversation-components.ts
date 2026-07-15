@@ -4,7 +4,12 @@ import { isAgentSessionMessage } from "../../../core/agent-messages.js";
 import { AgentMessageComponent } from "./agent-message.js";
 import { AssistantMessageComponent } from "./assistant-message.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./injected-prompt-message.js";
-import { ToolExecutionComponent, type ToolExecutionDefinition, type ToolExecutionOptions } from "./tool-execution.js";
+import {
+	selectLatestToolExpandHint,
+	ToolExecutionComponent,
+	type ToolExecutionDefinition,
+	type ToolExecutionOptions,
+} from "./tool-execution.js";
 import { UserMessageComponent } from "./user-message.js";
 
 export interface ConversationComponentsOptions {
@@ -67,6 +72,7 @@ export function buildConversationComponents(
 				tool.setExpanded(expanded);
 				tool.markExecutionStarted();
 				tool.setArgsComplete();
+				selectLatestToolExpandHint(components, tool);
 				components.push(tool);
 				if (message.stopReason === "aborted" || message.stopReason === "error") {
 					tool.updateResult({
