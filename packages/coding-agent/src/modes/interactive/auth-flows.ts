@@ -32,6 +32,7 @@ import { showFullPaneOverlay } from "./components/centered-overlay.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { LoginDialogComponent } from "./components/login-dialog.js";
 import {
+	type AuthSelectorCategory,
 	type AuthSelectorProvider,
 	compareAuthSelectorProviders,
 	OAuthSelectorComponent,
@@ -114,6 +115,11 @@ export interface ProviderAuthFlowsHost {
 	onLoginCompleted?(): void;
 }
 
+export interface ProviderLoginOptions {
+	authType?: "oauth" | "api_key";
+	initialCategory?: AuthSelectorCategory;
+}
+
 export class ProviderAuthFlows {
 	constructor(private readonly host: ProviderAuthFlowsHost) {}
 
@@ -135,7 +141,8 @@ export class ProviderAuthFlows {
 		return this.showLoginDialog(providerId, label ?? provider.name, "service");
 	}
 
-	runLogin(authType?: "oauth" | "api_key"): Promise<AuthenticationResult> {
+	runLogin(options: ProviderLoginOptions = {}): Promise<AuthenticationResult> {
+		const { authType, initialCategory } = options;
 		const providerOptions = this.getLoginProviderOptions(authType);
 		if (providerOptions.length === 0) {
 			this.host.showStatus(
@@ -160,27 +167,31 @@ export class ProviderAuthFlows {
 				providerOptions,
 				async (providerOption: AuthSelectorProvider) => {
 					close();
-
-					if (providerOption.authType === "oauth") {
-						resolve(await this.showLoginDialog(providerOption.id, providerOption.name, providerOption.category));
-					} else if (providerOption.id === PRIME_INFERENCE_PROVIDER_ID) {
-						resolve(await this.runPrimeInferenceLogin());
-					} else if (providerOption.id === BEDROCK_PROVIDER_ID) {
-						resolve(await this.showBedrockSetupDialog(providerOption.id, providerOption.name));
-					} else {
-						const kind = providerOption.id === SERPER_CREDENTIAL_ID ? "service" : "provider";
-						resolve(await this.showApiKeyLoginDialog(providerOption.id, providerOption.name, kind));
-					}
+					resolve(await this.loginProvider(providerOption));
 				},
 				() => {
 					close();
 					resolve({ status: "cancelled" });
 				},
 				(providerId) => this.host.modelRegistry.getProviderAuthStatus(providerId),
-				{ getRows: () => this.host.ui.terminal.rows },
+				{ getRows: () => this.host.ui.terminal.rows, initialCategory },
 			);
 			handle = showFullPaneOverlay(this.host.ui, selector, 78);
 		});
+	}
+
+	loginProvider(providerOption: AuthSelectorProvider): Promise<AuthenticationResult> {
+		const kind = providerOption.category === "service" ? "service" : "provider";
+		if (providerOption.authType === "oauth") {
+			return this.showLoginDialog(providerOption.id, providerOption.name, kind);
+		}
+		if (providerOption.id === PRIME_INFERENCE_PROVIDER_ID) {
+			return this.runPrimeInferenceLogin();
+		}
+		if (providerOption.id === BEDROCK_PROVIDER_ID) {
+			return this.showBedrockSetupDialog(providerOption.id, providerOption.name);
+		}
+		return this.showApiKeyLoginDialog(providerOption.id, providerOption.name, kind);
 	}
 
 	/** Shows the stored-credential selector and removes the chosen credential. */
@@ -233,7 +244,7 @@ export class ProviderAuthFlows {
 		});
 	}
 
-	private getLoginProviderOptions(authType?: "oauth" | "api_key"): AuthSelectorProvider[] {
+	getLoginProviderOptions(authType?: "oauth" | "api_key"): AuthSelectorProvider[] {
 		const authStorage = this.host.modelRegistry.authStorage;
 		const oauthProviders = authStorage.getOAuthProviders();
 		const oauthProviderIds = new Set(oauthProviders.map((provider) => provider.id));

@@ -4,11 +4,12 @@ import type { ImageContent, Transport } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
-import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
+import type { AgentCronJob, AgentHeartbeatDeliveryMode, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
 import { SessionManager } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
+import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
 import {
 	createAgentConnectionCommands,
 	createAgentConnectionResourceSnapshot,
@@ -51,11 +52,13 @@ import type {
 export class InProcessAgentConnection implements AgentConnection {
 	private readonly listeners = new Set<AgentConnectionEventListener>();
 	private readonly beforeSessionInvalidateListeners = new Set<AgentConnectionBeforeSessionInvalidateListener>();
+	private readonly sideQuestionRuns = new Map<string, SideQuestionRun>();
 	private unsubscribeSessionEvents: (() => void) | undefined;
 
 	constructor(private readonly runtimeHost: AgentSessionRuntime) {
 		this.bindCurrentSessionEvents();
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
+			this.abortAllSideQuestions();
 			for (const listener of [...this.beforeSessionInvalidateListeners]) {
 				listener();
 			}
@@ -118,7 +121,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getSessionContext(): Promise<AgentConnectionSessionContext> {
-		return this.session.sessionManager.buildSessionContext();
+		return this.session.buildSessionContext();
 	}
 
 	async getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }> {
@@ -175,7 +178,11 @@ export class InProcessAgentConnection implements AgentConnection {
 		return undefined;
 	}
 
-	async setHeartbeat(_schedule: string, _instruction: string): Promise<AgentCronJob> {
+	async setHeartbeat(
+		_schedule: string,
+		_instruction: string,
+		_deliveryMode?: AgentHeartbeatDeliveryMode,
+	): Promise<AgentCronJob> {
 		throw new Error("Heartbeats require daemon mode");
 	}
 
@@ -212,6 +219,29 @@ export class InProcessAgentConnection implements AgentConnection {
 			images: options?.images,
 			streamingBehavior: options?.streamingBehavior,
 		});
+	}
+
+	async startSideQuestion(id: string, question: string): Promise<void> {
+		if (this.sideQuestionRuns.has(id)) {
+			throw new Error(`Side question already exists: ${id}`);
+		}
+		const run = startSideQuestion(this.session.agent, id, question, (event) =>
+			this.emit({ type: "side_question_event", event }),
+		);
+		this.sideQuestionRuns.set(id, run);
+		const removeRun = () => {
+			this.sideQuestionRuns.delete(id);
+		};
+		void run.done.then(removeRun, removeRun);
+	}
+
+	async abortSideQuestion(id: string): Promise<boolean> {
+		const run = this.sideQuestionRuns.get(id);
+		if (!run) {
+			return false;
+		}
+		run.abort();
+		return true;
 	}
 
 	async steer(message: string, images?: ImageContent[]): Promise<void> {
@@ -404,6 +434,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async dispose(): Promise<void> {
+		this.abortAllSideQuestions();
 		this.unsubscribeSessionEvents?.();
 		this.unsubscribeSessionEvents = undefined;
 		this.runtimeHost.setBeforeSessionInvalidate(undefined);
@@ -420,6 +451,13 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.unsubscribeSessionEvents = this.session.subscribe((event) => {
 			void this.emit({ type: "session_event", event });
 		});
+	}
+
+	private abortAllSideQuestions(): void {
+		for (const run of this.sideQuestionRuns.values()) {
+			run.abort();
+		}
+		this.sideQuestionRuns.clear();
 	}
 
 	private async emit(event: AgentConnectionEvent): Promise<void> {

@@ -17,7 +17,7 @@ import {
 	normalizeTerminalOutput,
 	sliceByColumn,
 	sliceWithWidth,
-	stripAnsi,
+	visibleContentSpan,
 	visibleWidth,
 } from "./utils.js";
 
@@ -814,7 +814,9 @@ export class TUI extends Container {
 				} else if (isWheelDown(event)) {
 					this.scrollBy(TUI.WHEEL_SCROLL_LINES);
 				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
-					viewport.beginSelection(event.y - 1, event.x - 1);
+					if (!viewport.beginSelection(event.y - 1, event.x - 1)) {
+						viewport.beginFrameSelection(event.y - 1, event.x - 1);
+					}
 					this.requestRender();
 				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && event.motion) {
 					viewport.extendActiveSelection(event.y - 1, event.x - 1);
@@ -1031,7 +1033,7 @@ export class TUI extends Container {
 	private compositeOverlays(lines: string[], termWidth: number, termHeight: number): string[] {
 		if (this.overlayStack.length === 0) return lines;
 		const result = [...lines];
-		const overlaySelectionRegions: FrameSelectionRegion[] = [];
+		const overlaySelectionRegions: FrameSelectionRegion[] = [...this.overlaySelectionRegions];
 
 		// Pre-render all visible overlays and calculate positions
 		const rendered: {
@@ -1106,16 +1108,22 @@ export class TUI extends Container {
 	}
 
 	private selectableSpan(line: string, maxWidth: number): { from: number; to: number } | null {
-		const width = Math.min(maxWidth, visibleWidth(line));
-		let from = -1;
-		let to = -1;
-		for (let col = 0; col < width; col++) {
-			const cell = stripAnsi(sliceByColumn(line, col, 1));
-			if (cell.trim().length === 0) continue;
-			if (from === -1) from = col;
-			to = col + 1;
+		return visibleContentSpan(line, maxWidth);
+	}
+
+	private createDockSelectionRegions(
+		frame: string[],
+		transcriptWindowHeight: number,
+		width: number,
+	): FrameSelectionRegion[] {
+		const regions: FrameSelectionRegion[] = [];
+		for (let row = Math.max(0, transcriptWindowHeight); row < frame.length; row++) {
+			const span = this.selectableSpan(frame[row] ?? "", width);
+			if (span) {
+				regions.push({ line: row, col: span.from, width: span.to - span.from });
+			}
 		}
-		return from === -1 ? null : { from, to };
+		return regions;
 	}
 
 	private subtractSelectionCoverage(
@@ -1293,6 +1301,9 @@ export class TUI extends Container {
 		const dock = fullscreen.dock.render(width);
 
 		let frame = fullscreen.viewport.composeFrame(transcript, dock, height);
+		this.overlaySelectionRegions.push(
+			...this.createDockSelectionRegions(frame, fullscreen.viewport.windowHeight(), width),
+		);
 		const scrollInfo = fullscreen.viewport.scrollInfo();
 		if (fullscreen.viewportControls && !scrollInfo.following) {
 			// Follow hint composited over the bottom of the transcript window,

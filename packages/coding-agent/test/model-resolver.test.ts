@@ -405,7 +405,7 @@ describe("default model selection", () => {
 	test("openai defaults track current models", () => {
 		expect(defaultModelPerProvider.openai).toBe("gpt-5.4");
 		expect(defaultModelPerProvider["openai-codex"]).toBe("gpt-5.5");
-		expect(defaultModelPerProvider["prime-inference"]).toBe("anthropic/claude-opus-4.8");
+		expect(defaultModelPerProvider["prime-inference"]).toBe("z-ai/glm-5.2");
 	});
 
 	test("zai, minimax, and cerebras defaults track current models", () => {
@@ -434,6 +434,48 @@ describe("default model selection", () => {
 
 		expect(result.model?.provider).toBe("openrouter");
 		expect(result.model?.id).toBe("openai/ghost-model");
+	});
+
+	test("findInitialModel uses medium as the built-in default thinking level", async () => {
+		const reasoningModel = mockModels[0];
+		const registry = {
+			getAvailable: async () => [reasoningModel],
+		} as unknown as Parameters<typeof findInitialModel>[0]["modelRegistry"];
+
+		const result = await findInitialModel({
+			scopedModels: [],
+			isContinuing: false,
+			modelRegistry: registry,
+		});
+
+		expect(result.model).toBe(reasoningModel);
+		expect(result.thinkingLevel).toBe("medium");
+	});
+
+	test("findInitialModel selects GLM 5.2 as the Prime Inference default", async () => {
+		const primeModel: Model<"anthropic-messages"> = {
+			id: "z-ai/glm-5.2",
+			name: "GLM 5.2",
+			api: "anthropic-messages",
+			provider: "prime-inference",
+			baseUrl: "https://api.pinference.ai/api/v1",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1048576,
+			maxTokens: 101376,
+		};
+		const registry = {
+			getAvailable: async () => [primeModel],
+		} as unknown as Parameters<typeof findInitialModel>[0]["modelRegistry"];
+
+		const result = await findInitialModel({
+			scopedModels: [],
+			isContinuing: false,
+			modelRegistry: registry,
+		});
+
+		expect(result.model).toBe(primeModel);
 	});
 
 	test("findInitialModel selects ai-gateway default when available", async () => {

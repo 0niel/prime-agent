@@ -33,7 +33,7 @@ describe("parseSlashCommand", () => {
 
 describe("classifyAgentsViewCommand", () => {
 	test("whitelisted global commands run in the agents view", () => {
-		for (const name of ["login", "logout", "model", "resume", "quit"]) {
+		for (const name of ["login", "logout", "model", "mcp", "resume", "quit"]) {
 			expect(classifyAgentsViewCommand(name)).toBe("agents-view");
 		}
 	});

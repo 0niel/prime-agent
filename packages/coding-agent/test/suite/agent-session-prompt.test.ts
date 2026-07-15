@@ -360,7 +360,7 @@ stale extension instructions`,
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
-	it("folds pending nextTurn context into accepted agent messages queued while busy", async () => {
+	it("keeps pending nextTurn context separate from accepted agent messages queued while busy", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const agentPrompt =
@@ -382,21 +382,27 @@ stale extension instructions`,
 		expect(harness.session.getFollowUpMessages()).toEqual([agentPrompt]);
 
 		sessionInternals._compactionAbortController = undefined;
-		let queuedTurnSawNextTurnContext = false;
+		let queuedTurnSawSeparateNextTurnContext = false;
 		harness.setResponses([
 			fauxAssistantMessage("first turn"),
 			(context) => {
+				const queuedContext = context.messages.find(
+					(message) => message.role === "user" && getMessageText(message) === "queued context",
+				);
 				const queuedUser = context.messages.find(
 					(message) => message.role === "user" && getMessageText(message).includes("agentmsg_next_turn_queued"),
 				);
-				queuedTurnSawNextTurnContext = queuedUser ? getMessageText(queuedUser).includes("queued context") : false;
+				queuedTurnSawSeparateNextTurnContext =
+					queuedContext !== undefined &&
+					queuedUser !== undefined &&
+					!getMessageText(queuedUser).includes("queued context");
 				return fauxAssistantMessage("queued turn");
 			},
 		]);
 
 		await harness.session.prompt("normal prompt");
 
-		expect(queuedTurnSawNextTurnContext).toBe(true);
+		expect(queuedTurnSawSeparateNextTurnContext).toBe(true);
 		expect(harness.session.pendingMessageCount).toBe(0);
 	});
 
@@ -767,6 +773,62 @@ stale extension instructions`,
 		expect(
 			(harness.session as unknown as { _acceptedAgentMessagePrompt?: unknown })._acceptedAgentMessagePrompt,
 		).toBeUndefined();
+	});
+
+	it("handles autonomous slash commands when template expansion is disabled", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+
+		await harness.session.prompt("/autonomous on", { expandPromptTemplates: false });
+
+		expect(harness.session.getAutonomousStatus().enabled).toBe(true);
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(harness.session.messages.some((message) => message.role === "custom")).toBe(true);
+	});
+
+	it("handles goal slash commands when template expansion is disabled", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+
+		await harness.session.prompt("/goal status", { expandPromptTemplates: false });
+
+		expect(harness.eventsOfType("goal_update")).toHaveLength(1);
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(getAssistantTexts(harness)).toEqual([]);
+	});
+
+	it("does not run built-in slash commands immediately while queueIfBusy backpressure is active", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as {
+			_compactionAbortController?: AbortController;
+		};
+		sessionInternals._compactionAbortController = new AbortController();
+
+		await expect(
+			harness.session.prompt("/autonomous on", {
+				queueIfBusy: true,
+				streamingBehavior: "followUp",
+			}),
+		).rejects.toThrow("Agent has queued work");
+		sessionInternals._compactionAbortController = undefined;
+
+		expect(harness.session.getAutonomousStatus().enabled).toBe(false);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("keeps built-in slash commands literal for accepted agent messages", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("literal")]);
+
+		await harness.session.acceptAgentMessagePrompt("/autonomous on", { expandPromptTemplates: false });
+		await harness.session.agent.waitForIdle();
+
+		expect(harness.session.getAutonomousStatus().enabled).toBe(false);
+		expect(getUserTexts(harness)).toEqual(["/autonomous on"]);
+		expect(getAssistantTexts(harness)).toEqual(["literal"]);
 	});
 
 	it("queues accepted agent messages without expanding slash commands or prompt templates", async () => {

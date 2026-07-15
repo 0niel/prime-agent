@@ -615,6 +615,46 @@ describe("Agent", () => {
 		expect(responseCount).toBe(2);
 	});
 
+	it("keeps queued message batches atomic in one-at-a-time mode", async () => {
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Processed") });
+				});
+				return stream;
+			},
+		});
+		const prefix = { role: "user" as const, content: "Prefix", timestamp: Date.now() };
+		const prompt = { role: "user" as const, content: "Prompt", timestamp: Date.now() + 1 };
+		const next = { role: "user" as const, content: "Next", timestamp: Date.now() + 2 };
+		agent.state.messages = [createAssistantMessage("Initial response")];
+		agent.followUp([prefix, prompt]);
+		agent.followUp(next);
+
+		await agent.continue();
+
+		expect(agent.state.messages.slice(1).map((message) => message.role)).toEqual([
+			"user",
+			"user",
+			"assistant",
+			"user",
+			"assistant",
+		]);
+	});
+
+	it("removes a whole queued batch when one message matches", () => {
+		const agent = new Agent();
+		const prefix = { role: "user" as const, content: "Prefix", timestamp: Date.now() };
+		const prompt = { role: "user" as const, content: "Prompt", timestamp: Date.now() + 1 };
+		const next = { role: "user" as const, content: "Next", timestamp: Date.now() + 2 };
+		agent.followUp([prefix, prompt]);
+		agent.followUp(next);
+
+		expect(agent.removeQueuedMessages((message) => message === prompt)).toEqual([prefix, prompt]);
+		expect(agent.hasQueuedMessages()).toBe(true);
+	});
+
 	it("forwards sessionId to streamFn options", async () => {
 		let receivedSessionId: string | undefined;
 		const agent = new Agent({

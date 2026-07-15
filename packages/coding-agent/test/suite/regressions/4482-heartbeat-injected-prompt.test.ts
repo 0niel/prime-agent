@@ -188,7 +188,7 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		expect(sessionInternals._overflowRecoveryAttempted).toBe(false);
 	});
 
-	it("folds pending nextTurn context into queued heartbeat prompts", async () => {
+	it("keeps pending nextTurn context separate from queued heartbeat prompts", async () => {
 		let releaseToolExecution: (() => void) | undefined;
 		const toolRelease = new Promise<void>((resolve) => {
 			releaseToolExecution = resolve;
@@ -209,6 +209,7 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		const harness = await createHarness({ tools: [waitTool] });
 		harnesses.push(harness);
 		let queuedHeartbeatText = "";
+		let queuedPendingContextText = "";
 		const queueEvents: Array<{ steering: readonly string[]; followUp: readonly string[] }> = [];
 		harness.session.subscribe((event) => {
 			if (event.type === "queue_update") {
@@ -219,11 +220,15 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
 			fauxAssistantMessage("original turn complete"),
 			(context) => {
+				const pendingContextMessage = context.messages.find(
+					(message) => message.role === "user" && getMessageText(message) === "pending heartbeat context",
+				);
 				const queuedUserMessage = context.messages.find(
 					(message) =>
 						message.role === "user" &&
 						getMessageText(message).includes("Check whether the long-running task needs another step."),
 				);
+				queuedPendingContextText = getMessageText(pendingContextMessage);
 				queuedHeartbeatText = getMessageText(queuedUserMessage);
 				return fauxAssistantMessage("heartbeat handled");
 			},
@@ -249,8 +254,8 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		releaseToolExecution?.();
 		await promptPromise;
 
-		expect(queuedHeartbeatText).toContain("pending heartbeat context");
-		expect(queuedHeartbeatText).toContain("Check whether the long-running task needs another step.");
+		expect(queuedPendingContextText).toBe("pending heartbeat context");
+		expect(queuedHeartbeatText).toBe("Check whether the long-running task needs another step.");
 		expect(
 			queueEvents.some((event) =>
 				event.followUp.includes("Heartbeat prompt: Check whether the long-running task needs another step."),
@@ -306,6 +311,55 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		expect(harness.session.getFollowUpMessagePreviews()).toEqual([]);
 	});
 
+	it("removes queued steered heartbeat prompts by heartbeat queue key", async () => {
+		let releaseToolExecution: (() => void) | undefined;
+		const toolRelease = new Promise<void>((resolve) => {
+			releaseToolExecution = resolve;
+		});
+		const waitTool: AgentTool = {
+			name: "wait",
+			label: "Wait",
+			description: "Wait for release",
+			parameters: Type.Object({}),
+			execute: async () => {
+				await toolRelease;
+				return {
+					content: [{ type: "text", text: "released" }],
+					details: {},
+				};
+			},
+		};
+		const harness = await createHarness({ tools: [waitTool] });
+		harnesses.push(harness);
+		const heartbeatText = "Check whether the long-running task needs another step.";
+		const heartbeatPreview = `Heartbeat prompt: ${heartbeatText}`;
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("original turn complete"),
+		]);
+		const sawToolStart = new Promise<void>((resolve) => {
+			const unsubscribe = harness.session.subscribe((event) => {
+				if (event.type === "tool_execution_start") {
+					unsubscribe();
+					resolve();
+				}
+			});
+		});
+
+		const promptPromise = harness.session.prompt("start");
+		await sawToolStart;
+		await harness.session.promptHeartbeat(createHeartbeat(), { streamingBehavior: "steer" });
+
+		expect(harness.session.getSteeringMessagePreviews()).toEqual([heartbeatPreview]);
+		expect(harness.session.removeQueuedFollowUp("heartbeat:heartbeat-1")).toBe(true);
+		expect(harness.session.getSteeringMessagePreviews()).toEqual([]);
+
+		releaseToolExecution?.();
+		await promptPromise;
+
+		expect(getUserTexts(harness)).toEqual(["start"]);
+	});
+
 	it("renders heartbeat prompts as expandable injected prompt panels", () => {
 		const component = new InjectedPromptMessageComponent(createHeartbeatPromptMessage(createHeartbeat()));
 		const collapsed = render(component);
@@ -322,16 +376,16 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		expect(expanded).toContain("Check whether the long-running task needs another step.");
 	});
 
-	it("clears stale recaps when heartbeat prompt turns start", async () => {
+	it("keeps the current recap when heartbeat prompt turns start", async () => {
 		const heartbeatMode = createMessageStartMode();
 		const heartbeatMessage = createHeartbeatPromptMessage(createHeartbeat());
 
 		await handleMessageStart(heartbeatMode, heartbeatMessage);
 
 		expect(heartbeatMode.addMessageToChat).toHaveBeenCalledWith(heartbeatMessage);
-		expect(heartbeatMode.sessionRecap).toBeUndefined();
-		expect(heartbeatMode.renderRecap).toHaveBeenCalled();
-		expect(heartbeatMode.updatePendingMessagesDisplay).toHaveBeenCalled();
+		expect(heartbeatMode.sessionRecap).toBe("previous recap");
+		expect(heartbeatMode.renderRecap).not.toHaveBeenCalled();
+		expect(heartbeatMode.updatePendingMessagesDisplay).not.toHaveBeenCalled();
 
 		const goalMode = createMessageStartMode();
 		const goal: GoalState = {

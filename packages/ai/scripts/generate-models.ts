@@ -144,7 +144,8 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	"minimax/minimax-m3": { contextWindow: 524288 },
 	"moonshotai/kimi-k2-0905": { contextWindow: 98304 },
 	"nvidia/nemotron-3-super-120b-a12b": { contextWindow: 262144, maxTokens: 4096 },
-	"nvidia/nvidia-nemotron-3-ultra-550b-a55b": { contextWindow: 131072 },
+	// Preserve the existing output cap when OpenRouter leaves it unspecified.
+	"nvidia/nvidia-nemotron-3-ultra-550b-a55b": { contextWindow: 131072, maxTokens: 16384 },
 	// Enforced window is LARGER than OpenRouter's listing.
 	"qwen/qwen3-30b-a3b-instruct-2507": { contextWindow: 262144 },
 	// OpenRouter has no max_completion_tokens for the rest of these.
@@ -427,6 +428,25 @@ function mergePrimeInferenceModels(
 	return Array.from(models.values());
 }
 
+function refreshPrimeInferenceAliasLimits(
+	snapshotModels: Model<"openai-completions">[],
+	catalogModels: Model<"openai-completions">[],
+): Model<"openai-completions">[] {
+	const liveModels = new Map(catalogModels.map((model) => [model.id.toLowerCase(), model]));
+	return snapshotModels.map((model) => {
+		const canonicalId = PRIME_INFERENCE_OPENROUTER_ALIASES[model.id.toLowerCase()];
+		const canonical = canonicalId ? liveModels.get(canonicalId) : undefined;
+		if (!canonical) {
+			return model;
+		}
+		return {
+			...model,
+			contextWindow: canonical.contextWindow,
+			maxTokens: canonical.maxTokens,
+		};
+	});
+}
+
 function includesCatalogCapability(value: unknown, capabilities: readonly string[]): boolean {
 	if (!Array.isArray(value)) {
 		return false;
@@ -633,6 +653,7 @@ async function fetchPrimeInferenceModels(): Promise<Model<"openai-completions">[
 			(model) => liveIds.has(model.id.toLowerCase()) || model.id.toLowerCase().startsWith("internal/"),
 		);
 	}
+	snapshotModels = refreshPrimeInferenceAliasLimits(snapshotModels, catalogModels);
 	const models = mergePrimeInferenceModels(snapshotModels, catalogModels);
 	console.log(`Loaded ${models.length} Prime Inference models (${catalogModels.length} from the live catalog)`);
 	return models;

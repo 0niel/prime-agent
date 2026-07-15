@@ -1,8 +1,15 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Component, MarkdownTheme, TUI } from "@earendil-works/pi-tui";
+import { isAgentSessionMessage } from "../../../core/agent-messages.js";
+import { AgentMessageComponent } from "./agent-message.js";
 import { AssistantMessageComponent } from "./assistant-message.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./injected-prompt-message.js";
-import { ToolExecutionComponent, type ToolExecutionDefinition, type ToolExecutionOptions } from "./tool-execution.js";
+import {
+	selectLatestToolExpandHint,
+	ToolExecutionComponent,
+	type ToolExecutionDefinition,
+	type ToolExecutionOptions,
+} from "./tool-execution.js";
 import { UserMessageComponent } from "./user-message.js";
 
 export interface ConversationComponentsOptions {
@@ -65,6 +72,7 @@ export function buildConversationComponents(
 				tool.setExpanded(expanded);
 				tool.markExecutionStarted();
 				tool.setArgsComplete();
+				selectLatestToolExpandHint(components, tool);
 				components.push(tool);
 				if (message.stopReason === "aborted" || message.stopReason === "error") {
 					tool.updateResult({
@@ -78,6 +86,10 @@ export function buildConversationComponents(
 		} else if (message.role === "toolResult") {
 			pendingTools.get(message.toolCallId)?.updateResult(message);
 			pendingTools.delete(message.toolCallId);
+		} else if (isAgentSessionMessage(message) && message.display) {
+			const component = new AgentMessageComponent(message, options.markdownTheme);
+			component.setExpanded(expanded);
+			components.push(component);
 		} else if (isInjectedPromptMessage(message) && message.display) {
 			const component = new InjectedPromptMessageComponent(message, options.markdownTheme);
 			component.setExpanded(expanded);

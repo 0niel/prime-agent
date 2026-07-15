@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -71,6 +72,51 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 	};
 }
 
+async function startCrashingDaemon(): Promise<FakeDaemon> {
+	const dir = mkdtempSync(join(tmpdir(), "pa-launch-crash-"));
+	const socketPath = join(dir, "d.sock");
+	const child = spawn(
+		process.execPath,
+		[
+			"-e",
+			`const { createServer } = require("node:net");
+const socketPath = process.argv[1];
+const send = (socket, message) => socket.write(JSON.stringify(message) + "\\n");
+const server = createServer((socket) => {
+	send(socket, { type: "daemon_hello", socketPath, protocol: { name: "prime-agent-daemon", version: 1 } });
+	let buffer = "";
+	socket.on("data", (chunk) => {
+		buffer += chunk.toString();
+		const newline = buffer.indexOf("\\n");
+		if (newline === -1) return;
+		const command = JSON.parse(buffer.slice(0, newline));
+		if (command.type !== "shutdown") return;
+		send(socket, { type: "response", command: "shutdown", id: command.id, success: true });
+		socket.end(() => process.kill(process.pid, "SIGKILL"));
+	});
+});
+server.listen(socketPath, () => process.stdout.write("ready\\n"));`,
+			socketPath,
+		],
+		{ stdio: ["ignore", "pipe", "ignore"] },
+	);
+	await new Promise<void>((resolve, reject) => {
+		child.stdout?.once("data", () => resolve());
+		child.once("error", reject);
+		child.once("exit", (code, signal) => reject(new Error(`Daemon exited before listening: ${code ?? signal}`)));
+	});
+	return {
+		socketPath,
+		close: async () => {
+			if (child.exitCode === null && child.signalCode === null) {
+				child.kill("SIGKILL");
+				await new Promise<void>((resolve) => child.once("close", () => resolve()));
+			}
+			rmSync(dir, { recursive: true, force: true });
+		},
+	};
+}
+
 describe("probeRunningDaemonSessions", () => {
 	const cleanups: Array<() => Promise<void>> = [];
 	afterEach(async () => {
@@ -126,5 +172,16 @@ describe("shutdownDaemonAndWait", () => {
 		const daemon = await startFakeDaemon({ sessions: [{ id: "a", activeSessionId: "a", isStreaming: false }] });
 		cleanups.push(daemon.close);
 		expect(await shutdownDaemonAndWait(daemon.socketPath)).toBe(true);
+	});
+
+	it("accepts an exited daemon that leaves a stale socket behind", async () => {
+		if (process.platform === "win32") {
+			return;
+		}
+
+		const daemon = await startCrashingDaemon();
+		cleanups.push(daemon.close);
+		expect(await shutdownDaemonAndWait(daemon.socketPath, 100)).toBe(true);
+		expect(existsSync(daemon.socketPath)).toBe(true);
 	});
 });

@@ -197,18 +197,24 @@ describe("SettingsManager", () => {
 		});
 	});
 
-	describe("onboardingCompleted", () => {
+	describe("onboardingShown", () => {
 		it("defaults to false and persists globally", async () => {
 			const manager = SettingsManager.create(projectDir, agentDir);
 
-			expect(manager.getOnboardingCompleted()).toBe(false);
+			expect(manager.getOnboardingShown()).toBe(false);
 
-			manager.setOnboardingCompleted(true);
+			manager.setOnboardingShown(true);
 			await manager.flush();
 
 			const savedSettings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
-			expect(savedSettings.onboardingCompleted).toBe(true);
-			expect(manager.getOnboardingCompleted()).toBe(true);
+			expect(savedSettings.onboardingShown).toBe(true);
+			expect(manager.getOnboardingShown()).toBe(true);
+		});
+
+		it("treats the legacy completion field as already shown", () => {
+			const manager = SettingsManager.inMemory({ onboardingCompleted: true });
+
+			expect(manager.getOnboardingShown()).toBe(true);
 		});
 	});
 

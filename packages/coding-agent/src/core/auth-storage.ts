@@ -481,13 +481,23 @@ export class AuthStorage {
 	}
 
 	private getAuthSourceCandidates(provider: string, options?: { includeFallback?: boolean }): AuthSourceCandidate[] {
-		const candidates = [
-			this.getRuntimeAuthCandidate(provider),
-			provider === PRIME_INFERENCE_PROVIDER_ID ? this.getPrimeCliAuthCandidate(provider) : undefined,
-			this.getStoredAuthCandidate(provider),
-			this.getEnvironmentAuthCandidate(provider),
-			options?.includeFallback === false ? undefined : this.getFallbackAuthCandidate(provider),
-		];
+		const fallbackCandidate =
+			options?.includeFallback === false ? undefined : this.getFallbackAuthCandidate(provider);
+		const candidates =
+			provider === PRIME_INFERENCE_PROVIDER_ID
+				? [
+						this.getRuntimeAuthCandidate(provider),
+						this.getEnvironmentAuthCandidate(provider),
+						this.getPrimeCliAuthCandidate(provider),
+						this.getStoredAuthCandidate(provider),
+						fallbackCandidate,
+					]
+				: [
+						this.getRuntimeAuthCandidate(provider),
+						this.getStoredAuthCandidate(provider),
+						this.getEnvironmentAuthCandidate(provider),
+						fallbackCandidate,
+					];
 		return candidates.filter((candidate): candidate is AuthSourceCandidate => candidate !== undefined);
 	}
 
@@ -801,10 +811,9 @@ export class AuthStorage {
 	 * Get API key for a provider.
 	 * Priority:
 	 * 1. Runtime override (CLI --api-key)
-	 * 2. API key from auth.json
-	 * 3. OAuth token from auth.json (auto-refreshed with locking)
-	 * 4. Environment variable
-	 * 5. Fallback resolver (models.json custom providers)
+	 * 2. Prime Inference: environment variable, Prime CLI config, auth.json
+	 * 3. Other providers: auth.json, environment variable
+	 * 4. Fallback resolver (models.json custom providers)
 	 */
 	async getApiKeyWithSourceToken(
 		providerId: string,
@@ -817,6 +826,20 @@ export class AuthStorage {
 			return {
 				apiKey: runtimeKey,
 				sourceToken: this.getAuthSourceTokenForCandidate(providerId, runtimeCandidate),
+			};
+		}
+
+		const envCandidate = this.getEnvironmentAuthCandidate(providerId);
+		const envKey = getEnvApiKey(providerId);
+		if (
+			providerId === PRIME_INFERENCE_PROVIDER_ID &&
+			envKey &&
+			envCandidate &&
+			!this.isAuthSourceStale(providerId, envCandidate)
+		) {
+			return {
+				apiKey: envKey,
+				sourceToken: this.getAuthSourceTokenForCandidate(providerId, envCandidate),
 			};
 		}
 
@@ -911,10 +934,13 @@ export class AuthStorage {
 			}
 		}
 
-		// Fall back to environment variable
-		const envCandidate = this.getEnvironmentAuthCandidate(providerId);
-		const envKey = getEnvApiKey(providerId);
-		if (envKey && envCandidate && !this.isAuthSourceStale(providerId, envCandidate)) {
+		// Other providers preserve auth.json priority over environment variables.
+		if (
+			providerId !== PRIME_INFERENCE_PROVIDER_ID &&
+			envKey &&
+			envCandidate &&
+			!this.isAuthSourceStale(providerId, envCandidate)
+		) {
 			return {
 				apiKey: envKey,
 				sourceToken: this.getAuthSourceTokenForCandidate(providerId, envCandidate),
@@ -1007,30 +1033,33 @@ export class AuthStorage {
 			if (config?.teamIdFromEnv) {
 				return undefined;
 			}
-			const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
-			if (config?.apiKey) {
-				if (credential?.type === "api_key" && credential.primeTeam === null) {
-					return null;
-				}
-				if (config.teamId) {
-					return this.toPrimeTeamCredential({
-						teamId: config.teamId,
-						name: config.teamName ?? "Prime CLI team",
-						...(config.teamRole ? { role: config.teamRole } : {}),
-					});
-				}
-				if (credential?.type === "api_key" && credential.primeTeam) {
-					return credential.primeTeam;
-				}
-				return null;
-			}
 		}
 
 		const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
+		const authSource = this.getAuthStatus(PRIME_INFERENCE_PROVIDER_ID).source;
+		if (authSource === "runtime" || authSource === "environment") {
+			return undefined;
+		}
+		if (authSource === "prime_cli") {
+			if (credential?.type === "api_key" && credential.primeTeam === null) {
+				return null;
+			}
+			if (config?.teamId) {
+				return this.toPrimeTeamCredential({
+					teamId: config.teamId,
+					name: config.teamName ?? "Prime CLI team",
+					...(config.teamRole ? { role: config.teamRole } : {}),
+				});
+			}
+			if (credential?.type === "api_key" && credential.primeTeam) {
+				return credential.primeTeam;
+			}
+			return null;
+		}
 		if (credential?.type === "api_key" && credential.primeTeam !== undefined) {
 			return credential.primeTeam;
 		}
-		if (config?.teamId) {
+		if (!config?.apiKey && config?.teamId) {
 			return this.toPrimeTeamCredential({
 				teamId: config.teamId,
 				name: config.teamName ?? "Prime CLI team",
@@ -1050,30 +1079,7 @@ export class AuthStorage {
 			return primeCliConfig.teamId ? { "X-Prime-Team-ID": primeCliConfig.teamId } : undefined;
 		}
 
-		const credential = this.data[providerId];
-		if (primeCliConfig?.apiKey) {
-			if (credential?.type === "api_key" && credential.primeTeam === null) {
-				return undefined;
-			}
-			if (primeCliConfig.teamId) {
-				return { "X-Prime-Team-ID": primeCliConfig.teamId };
-			}
-			return credential?.type === "api_key" && credential.primeTeam?.teamId
-				? { "X-Prime-Team-ID": credential.primeTeam.teamId }
-				: undefined;
-		}
-
-		if (credential?.type === "api_key") {
-			if (credential.primeTeam === null) {
-				return undefined;
-			}
-			const selectedTeamId = credential.primeTeam?.teamId;
-			if (selectedTeamId) {
-				return { "X-Prime-Team-ID": selectedTeamId };
-			}
-		}
-
-		const teamId = primeCliConfig?.teamId;
+		const teamId = this.getPrimeInferenceTeamSelection()?.teamId;
 		return teamId ? { "X-Prime-Team-ID": teamId } : undefined;
 	}
 

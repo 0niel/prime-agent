@@ -32,7 +32,7 @@ credentials in `auth.json`.
 
 Built-in integrations (Linear, Notion) ship **disabled**. Logging in enables them:
 
-- Open `/login`, switch to the **Services** tab, pick the integration, and
+- Open `/login`, switch to **MCP Connections**, pick the integration, and
   complete OAuth in the browser. `/mcp login <name>` does the same from the CLI.
 - Once connected, the integration's skill becomes visible to the model and is
   auto-imported into the kernel.
@@ -167,7 +167,7 @@ is a few lines — the package above is the whole integration.
 
 ### Authentication
 
-- **OAuth** (`"oauth": true`): the user runs `/login` → Services → your server (or
+- **OAuth** (`"oauth": true`): the user runs `/login` → MCP Connections → your server (or
   `/mcp login acme`). Works when the server supports OAuth 2.1 dynamic client
   registration (RFC 7591); login discovers the auth server, registers a client,
   and runs PKCE. Servers requiring a pre-registered client id are not yet
@@ -224,7 +224,7 @@ at call time with `NotEnabled` until credentials exist. So make the skill's
 the auth mode you configured:
 
 - **OAuth** (`"oauth": true`): instruct the user to run `/mcp login <server>` (or
-  `/login` → Services). `/mcp login` only works for OAuth servers.
+  `/login` → MCP Connections). `/mcp login` only works for OAuth servers.
 - **Bearer token** (`bearerTokenEnvVar`): instruct the user to set that env var —
   do *not* point them at `/mcp login`, which has no provider for a bearer-only
   server and reports "Unknown MCP integration".

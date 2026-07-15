@@ -26,9 +26,9 @@ recent = await agent_observe.recent_messages("worker", limit=6)
   message preview. This includes subagents shown in the agents view; filter
   by `runtimeKind == "subagent"` and `parentSessionId` or
   `parentActiveSessionId` to inspect subagents that belong to your session.
-- `await agent_observe.get_agent(target)` returns one agent summary. `target`
-  is resolved like other live-session selectors: active id, session id/name, or
-  unambiguous suffix.
+- `await agent_observe.get_agent(target)` returns `agent`, where `agent`
+  contains one agent summary. `target` is resolved like other live-session
+  selectors: active id, session id/name, or unambiguous suffix.
 - `await agent_observe.recent_messages(target, limit=8, max_chars=800)`
   returns up to `limit` recent bounded message previews for the target session.
   `limit` must be 1-50, and `max_chars` must be 80-2000.

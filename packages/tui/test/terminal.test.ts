@@ -45,6 +45,70 @@ describe("ProcessTerminal dimensions", () => {
 });
 
 describe("ProcessTerminal alternate screen handoff", () => {
+	it("keeps raw input active and discards keys until the next fullscreen TUI starts", () => {
+		const originalWrite = process.stdout.write;
+		const originalIsRaw = Object.getOwnPropertyDescriptor(process.stdin, "isRaw");
+		const originalSetRawMode = Object.getOwnPropertyDescriptor(process.stdin, "setRawMode");
+		const originalResume = Object.getOwnPropertyDescriptor(process.stdin, "resume");
+		const originalPause = Object.getOwnPropertyDescriptor(process.stdin, "pause");
+		let isRaw = false;
+		const rawModeChanges: boolean[] = [];
+		const firstInputs: string[] = [];
+		const secondInputs: string[] = [];
+
+		Object.defineProperty(process.stdin, "isRaw", { configurable: true, get: () => isRaw });
+		Object.defineProperty(process.stdin, "setRawMode", {
+			configurable: true,
+			value: (enabled: boolean) => {
+				isRaw = enabled;
+				rawModeChanges.push(enabled);
+				return process.stdin;
+			},
+		});
+		Object.defineProperty(process.stdin, "resume", { configurable: true, value: () => process.stdin });
+		Object.defineProperty(process.stdin, "pause", { configurable: true, value: () => process.stdin });
+		process.stdout.write = ((...args: Parameters<typeof process.stdout.write>): boolean => {
+			const callback = args.find((arg): arg is (error?: Error | null) => void => typeof arg === "function");
+			callback?.();
+			return true;
+		}) as typeof process.stdout.write;
+
+		try {
+			const first = new ProcessTerminal();
+			first.start(
+				(data) => firstInputs.push(data),
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?1u");
+			first.enterAltScreen();
+			first.stop({ preserveAltScreen: true });
+
+			assert.equal(isRaw, true);
+			process.stdin.emit("data", "\x1b[B");
+			assert.deepEqual(firstInputs, []);
+
+			const second = new ProcessTerminal();
+			second.start(
+				(data) => secondInputs.push(data),
+				() => {},
+			);
+			process.stdin.emit("data", "\x1b[?1u");
+			process.stdin.emit("data", "x");
+
+			assert.equal(isRaw, true);
+			assert.deepEqual(secondInputs, ["x"]);
+			second.stop();
+			assert.equal(isRaw, false);
+			assert.deepEqual(rawModeChanges, [true, true, false]);
+		} finally {
+			process.stdout.write = originalWrite;
+			restoreProperty(process.stdin, "isRaw", originalIsRaw);
+			restoreProperty(process.stdin, "setRawMode", originalSetRawMode);
+			restoreProperty(process.stdin, "resume", originalResume);
+			restoreProperty(process.stdin, "pause", originalPause);
+		}
+	});
+
 	it("does not inherit an active alternate screen before it is preserved", () => {
 		const originalWrite = process.stdout.write;
 		const writes: string[] = [];
@@ -177,3 +241,11 @@ describe("ProcessTerminal alternate screen handoff", () => {
 		}
 	});
 });
+
+function restoreProperty(object: object, key: PropertyKey, descriptor: PropertyDescriptor | undefined): void {
+	if (descriptor) {
+		Object.defineProperty(object, key, descriptor);
+	} else {
+		Reflect.deleteProperty(object, key);
+	}
+}

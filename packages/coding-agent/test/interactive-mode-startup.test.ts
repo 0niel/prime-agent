@@ -2,7 +2,12 @@ import { Container, setKeybindings } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
-import { BrandSplashHeader, InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
+import {
+	BrandSplashHeader,
+	getRandomStartHint,
+	InteractiveMode,
+	START_HINTS,
+} from "../src/modes/interactive/interactive-mode.js";
 import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.js";
 
 describe("InteractiveMode startup hints", () => {
@@ -14,12 +19,12 @@ describe("InteractiveMode startup hints", () => {
 		setKeybindings(new KeybindingsManager());
 	});
 
-	function createMode(sessionHasMessages = false, returnToAgentsView = false) {
+	function createMode(sessionHasMessages = false, returnToAgentsView = false, getEditorText = () => "") {
 		const mode = {
 			childAgentPanelMode: undefined,
 			sessionHasMessages,
 			options: { returnToAgentsView },
-			editor: { getText: () => "" },
+			editor: { getText: getEditorText },
 			connectionState: {
 				model: { name: "test-model", reasoning: true },
 				thinkingLevel: "high",
@@ -29,26 +34,46 @@ describe("InteractiveMode startup hints", () => {
 		return mode;
 	}
 
-	it("renders compact new-chat guidance and the configured shortcut hint", () => {
-		const mode = createMode();
-		const metadata = Reflect.get(InteractiveMode.prototype, "getStartupMetadata").call(mode);
+	it("keeps a blank row above the shared splash and limits its metadata", () => {
 		const header = new BrandSplashHeader(
 			"0.0.0",
 			() => "test-model",
 			() => "/tmp/project",
 			undefined,
 			{
-				getExtraMetadata: () => metadata,
+				topPadding: true,
 				getStartHint: () => 'Try "refactor @<filepath>"',
 			},
 		);
 
-		const output = stripAnsi(header.render(120).join("\n"));
+		const lines = header.render(120);
+		const output = stripAnsi(lines.join("\n"));
 
-		expect(output).toContain("! shell · / commands");
-		expect(output).toContain("@ file paths");
-		expect(output).toContain("? for shortcuts");
+		expect(lines[0]).toBe("");
+		expect(output).toContain("version  v0.0.0");
+		expect(output).toContain("model    test-model");
+		expect(output).toContain("cwd      /tmp/project");
 		expect(output).toContain('Try "refactor @<filepath>"');
+		expect(output).not.toContain("input");
+		expect(output).not.toContain("files");
+		expect(output).not.toContain("help");
+
+		const unpadded = new BrandSplashHeader(
+			"0.0.0",
+			() => "test-model",
+			() => "/tmp/project",
+		);
+		expect(unpadded.render(120)[0]).not.toBe("");
+	});
+
+	it("randomly selects from five concise filepath prompts", () => {
+		expect(START_HINTS).toHaveLength(5);
+		expect(new Set(START_HINTS).size).toBe(5);
+
+		for (const [index, hint] of START_HINTS.entries()) {
+			expect(getRandomStartHint(() => index / START_HINTS.length)).toBe(hint);
+			expect(hint).toMatch(/^Try ".*@<filepath>.*"$/);
+		}
 	});
 
 	it("places the fresh-chat shortcut hint after the model and effort", () => {
@@ -58,19 +83,38 @@ describe("InteractiveMode startup hints", () => {
 		expect(stripAnsi(label)).toBe("test-model • high  ? for shortcuts");
 	});
 
-	it("places the Agents View hint before the model and fresh-chat help", () => {
-		const mode = createMode(false, true);
-		const label = Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode);
+	it("keeps the lowercase agents hint while typing", () => {
+		let editorText = "";
+		const mode = createMode(false, true, () => editorText);
+		const getLabel = () => Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode);
 
-		expect(stripAnsi(label)).toBe("← agents view  test-model • high  ? for shortcuts");
+		expect(stripAnsi(getLabel())).toBe("← agents  test-model • high  ? for shortcuts");
+
+		editorText = "draft prompt";
+		expect(stripAnsi(getLabel())).toBe("← agents  test-model • high");
 	});
 
-	it("hides startup shortcut guidance for chats with history", () => {
+	it("hides the fresh-chat shortcut hint while the prompt has text", () => {
+		let editorText = "";
+		const mode = createMode(false, false, () => editorText);
+		const getLabel = () => Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode);
+
+		expect(stripAnsi(getLabel())).toBe("test-model • high  ? for shortcuts");
+
+		editorText = "draft prompt";
+		expect(stripAnsi(getLabel())).toBe("test-model • high");
+
+		editorText = " ";
+		expect(stripAnsi(getLabel())).toBe("test-model • high");
+
+		editorText = "";
+		expect(stripAnsi(getLabel())).toBe("test-model • high  ? for shortcuts");
+	});
+
+	it("hides the tray shortcut guidance for chats with history", () => {
 		const mode = createMode(true);
-		const metadata = Reflect.get(InteractiveMode.prototype, "getStartupMetadata").call(mode);
 		const label = Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode);
 
-		expect(metadata).toEqual([]);
 		expect(stripAnsi(label)).toBe("test-model • high");
 	});
 

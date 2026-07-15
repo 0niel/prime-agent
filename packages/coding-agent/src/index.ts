@@ -334,12 +334,15 @@ export {
 } from "./modes/index.js";
 // UI components for extensions
 export {
+	AgentMessageComponent,
 	ArminComponent,
 	AssistantMessageComponent,
 	BashExecutionComponent,
 	BorderedLoader,
 	BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent,
+	ConfigurationMenuComponent,
+	type ConfigurationMenuTab,
 	CustomEditor,
 	CustomMessageComponent,
 	DynamicBorder,

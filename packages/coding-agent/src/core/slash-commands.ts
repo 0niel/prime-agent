@@ -44,6 +44,12 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "import", description: "Import and resume a session from a JSONL file" },
 	{ name: "share", description: "Share session as a secret GitHub gist" },
 	{ name: "copy", description: "Copy last agent message to clipboard" },
+	{
+		name: "btw",
+		description: "Ask one side question without adding it to the session",
+		argumentHint: "<question>",
+		takesArgument: true,
+	},
 	{ name: "name", description: "Set session display name" },
 	{ name: "session", description: "Show session info" },
 	{ name: "system-prompt", description: "Show the exact system prompt sent to the model" },
@@ -67,7 +73,12 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "tree", description: "Navigate session tree (switch branches)" },
 	{ name: "login", description: "Configure provider authentication" },
 	{ name: "logout", description: "Remove provider authentication" },
-	{ name: "mcp", description: "Manage MCP integrations (list, login <name>, logout <name>)" },
+	{
+		name: "mcp",
+		description: "Open MCP Connections or manage MCP integrations",
+		argumentHint: "[list|login <name>|logout <name>]",
+		takesArgument: true,
+	},
 	{ name: "new", description: "Start a new session" },
 	{
 		name: "compact",
@@ -83,8 +94,9 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	},
 	{
 		name: "heartbeat",
-		description: "Set or view a persistent heartbeat; supports pause, resume, stop, and clear",
-		argumentHint: "[status|pause|resume|stop|every <duration> <instruction>]",
+		description:
+			"Set or view a persistent heartbeat; delivery defaults to steer, use --follow-up to queue; supports pause, resume, stop, and clear",
+		argumentHint: "[status|pause|resume|stop|[every <duration>] [--steer|--follow-up] <instruction>]",
 		takesArgument: true,
 	},
 	{ name: "resume", description: "Resume a different session" },
@@ -103,6 +115,7 @@ const BUILTIN_SLASH_COMMAND_ALIASES: ReadonlyArray<BuiltinSlashCommandAlias> = [
 	{ name: "usage", aliasFor: "context" },
 	{ name: "thinking", aliasFor: "effort" },
 	{ name: "rename", aliasFor: "name" },
+	{ name: "side", aliasFor: "btw" },
 ];
 
 function buildBuiltinSlashCommands(): ReadonlyArray<BuiltinSlashCommand> {

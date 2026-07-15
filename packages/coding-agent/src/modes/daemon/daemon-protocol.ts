@@ -7,7 +7,7 @@ import type {
 } from "../../core/agent-messages.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
-import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
+import type { AgentCronJob, AgentHeartbeatDeliveryMode, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
 import type { CustomMessage } from "../../core/messages.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
@@ -22,6 +22,7 @@ import type {
 	AgentConnectionSessionContext,
 	AgentConnectionSessionEvent,
 	AgentConnectionSessionTreeNode,
+	AgentConnectionSideQuestionEvent,
 	AgentConnectionState,
 } from "../agent-connection/types.js";
 import type { SessionSummary } from "./daemon-session-list.js";
@@ -43,8 +44,17 @@ export type DaemonProtocolVersion = typeof DAEMON_PROTOCOL_VERSION;
 export type DaemonCommandId = string;
 export type DaemonEventId = string;
 export type DaemonEventSequence = number;
+export interface DaemonEventCursor {
+	generation: string;
+	sequence: DaemonEventSequence;
+}
 export type DaemonClientId = string;
-export type DaemonClientCapability = "attach_snapshot" | "event_sequence" | "extension_ui" | "slim_attach";
+export type DaemonClientCapability =
+	| "attach_snapshot"
+	| "event_sequence"
+	| "extension_ui"
+	| "slim_attach"
+	| "chunked_snapshot";
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
 export interface DaemonProtocolInfo {
@@ -62,10 +72,9 @@ export const DAEMON_DEFAULT_CLIENT_CAPABILITIES: readonly DaemonClientCapability
 	"event_sequence",
 ];
 
-export interface DaemonResumeCursor {
-	activeSessionId?: string;
-	eventSequence: DaemonEventSequence;
-}
+export type DaemonResumeCursor =
+	| ({ activeSessionId?: string } & DaemonEventCursor)
+	| { activeSessionId?: string; eventSequence: DaemonEventSequence };
 
 export interface DaemonAttachClientMetadata {
 	clientId?: DaemonClientId;
@@ -114,6 +123,8 @@ export interface DaemonReplayInfo {
 	status: DaemonReplayStatus;
 	fromSequence?: DaemonEventSequence;
 	toSequence: DaemonEventSequence;
+	fromCursor?: DaemonEventCursor;
+	toCursor?: DaemonEventCursor;
 	reason?: string;
 }
 
@@ -122,6 +133,7 @@ export interface DaemonEventMeta {
 	protocol: DaemonProtocolInfo;
 	activeSessionId?: string;
 	sequence?: DaemonEventSequence;
+	cursor?: DaemonEventCursor;
 	emittedAt: string;
 	replayed?: boolean;
 }
@@ -134,12 +146,15 @@ export interface DaemonCommandEnvelope<TCommand extends DaemonCommand = DaemonCo
 	command: TCommand;
 }
 
+export type DaemonCommandWire = DaemonCommand | DaemonCommandEnvelope;
+
 export interface DaemonEventEnvelope<TEvent extends DaemonOutbound = DaemonOutbound> {
 	type: "event";
 	id: DaemonEventId;
 	protocol: DaemonProtocolInfo;
 	activeSessionId?: string;
 	sequence?: DaemonEventSequence;
+	cursor?: DaemonEventCursor;
 	emittedAt: string;
 	event: TEvent;
 }
@@ -162,6 +177,7 @@ export interface DaemonSessionSnapshot {
 	sessionContext?: AgentConnectionSessionContext;
 	sessionTree?: { tree: AgentConnectionSessionTreeNode[]; leafId: string | null };
 	lastEventSequence: DaemonEventSequence;
+	lastEventCursor?: DaemonEventCursor;
 	parent?: {
 		activeSessionId?: string;
 		sessionId?: string;
@@ -182,6 +198,12 @@ export interface DaemonAttachResult {
 	snapshot: DaemonSessionSnapshot;
 	replay: DaemonReplayInfo;
 	lastEventSequence: DaemonEventSequence;
+	lastEventCursor?: DaemonEventCursor;
+	snapshotStream?: {
+		id: string;
+		messageCount: number;
+		targetChunkBytes: number;
+	};
 	client: {
 		id: DaemonClientId;
 		capabilities: DaemonClientCapability[];
@@ -195,6 +217,7 @@ export interface DaemonUpdateRestartQueuedMessage {
 	queueKey?: string;
 	agentMessageId?: string;
 	customMessage?: CustomMessage;
+	prefixMessages?: CustomMessage[];
 }
 
 export interface DaemonUpdateRestartAcceptedPrompt extends DaemonUpdateRestartQueuedMessage {
@@ -276,6 +299,7 @@ export type DaemonCommand =
 			streamingBehavior?: "steer" | "followUp";
 			expandPromptTemplates?: boolean;
 			agentMessageId?: string;
+			customMessage?: CustomMessage;
 	  }
 	| {
 			id?: string;
@@ -284,9 +308,11 @@ export type DaemonCommand =
 			message: string;
 			content?: (TextContent | ImageContent)[];
 			images?: ImageContent[];
+			queueKey?: string;
 			expandPromptTemplates?: boolean;
 			agentMessageId?: string;
 			customMessage?: CustomMessage;
+			prefixMessages?: CustomMessage[];
 	  }
 	| {
 			id?: string;
@@ -299,6 +325,7 @@ export type DaemonCommand =
 			expandPromptTemplates?: boolean;
 			agentMessageId?: string;
 			customMessage?: CustomMessage;
+			prefixMessages?: CustomMessage[];
 	  }
 	| { id?: string; type: "restore_next_turn"; activeSessionId: string; messages: CustomMessage[] }
 	| { id?: string; type: "resume_queue"; activeSessionId: string }
@@ -315,6 +342,14 @@ export type DaemonCommand =
 	| { id?: string; type: "agent_messages_resume" }
 	| { id?: string; type: "agent_messages_clear"; activeSessionId: string }
 	| { id?: string; type: "abort"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "start_side_question";
+			activeSessionId: string;
+			sideQuestionId: string;
+			question: string;
+	  }
+	| { id?: string; type: "abort_side_question"; activeSessionId: string; sideQuestionId: string }
 	| {
 			id?: string;
 			type: "execute_bash";
@@ -340,7 +375,14 @@ export type DaemonCommand =
 	| { id?: string; type: "cron_add"; activeSessionId: string; schedule: string; prompt: string }
 	| { id?: string; type: "cron_cancel"; jobId: string }
 	| { id?: string; type: "heartbeat_get"; activeSessionId: string }
-	| { id?: string; type: "heartbeat_set"; activeSessionId: string; schedule: string; prompt: string }
+	| {
+			id?: string;
+			type: "heartbeat_set";
+			activeSessionId: string;
+			schedule: string;
+			prompt: string;
+			deliveryMode?: AgentHeartbeatDeliveryMode;
+	  }
 	| { id?: string; type: "heartbeat_update"; activeSessionId: string; action: AgentHeartbeatUpdateAction }
 	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string }
 	| { id?: string; type: "cycle_model"; activeSessionId: string; direction?: "forward" | "backward" }
@@ -397,8 +439,11 @@ export type DaemonCommand =
 			requestId: string;
 			response: DaemonExtensionUIResponse;
 	  }
+	| { id?: string; type: "ack_result"; commandId: string }
 	| { id?: string; type: "prepare_update_restart" }
-	| { id?: string; type: "shutdown" };
+	| { id?: string; type: "retry_worker"; activeSessionId: string }
+	| { id?: string; type: "restart" }
+	| { id?: string; type: "shutdown"; force?: boolean };
 
 type DaemonCommandName = DaemonCommand["type"];
 
@@ -415,9 +460,12 @@ export type DaemonResponse =
 
 export type DaemonErrorInfo =
 	| { code: "missing_session_cwd"; issue: SessionCwdIssue }
-	| { code: "session_import_file_not_found"; filePath: string };
+	| { code: "session_import_file_not_found"; filePath: string }
+	| { code: "session_already_active"; sessionPath: string; activeSessionId?: string }
+	| { code: "command_result_uncertain"; clientId: DaemonClientId; commandId: DaemonCommandId };
 
 export type DaemonSessionClosedReason = "killed" | "shutdown" | "completed" | "replaced" | "update";
+export type DaemonClosingReason = "shutdown" | "update";
 
 export type DaemonExtensionUIResponse = { value: string } | { confirmed: boolean } | { cancelled: true };
 
@@ -482,16 +530,29 @@ export type DaemonOutbound =
 			protocol: DaemonProtocolInfo;
 			/** App version of the daemon process, used to detect stale daemons after self-update. */
 			appVersion?: string;
+			/** Changes whenever the public supervisor process is replaced. */
+			supervisorGeneration?: string;
+			/** Diagnostic process identity for attributing supervisor replacement. */
+			supervisorPid?: number;
 			clientId: DaemonClientId;
 			serverCapabilities: readonly DaemonClientCapability[];
 	  }
+	| { type: "daemon_closing"; reason: DaemonClosingReason }
 	| { type: "session_event"; activeSessionId: string; event: AgentConnectionSessionEvent; meta?: DaemonEventMeta }
+	| { type: "side_question_event"; activeSessionId: string; event: AgentConnectionSideQuestionEvent }
 	| { type: "session_status"; activeSessionId: string; recap?: string; meta?: DaemonEventMeta }
 	| {
 			type: "session_replaced";
 			activeSessionId: string;
 			state: AgentConnectionState;
 			messages: AgentMessage[];
+			snapshotFollows?: boolean;
+			meta?: DaemonEventMeta;
+	  }
+	| {
+			type: "session_resynced";
+			activeSessionId: string;
+			snapshot: DaemonSessionSnapshot;
 			meta?: DaemonEventMeta;
 	  }
 	| {
@@ -502,6 +563,30 @@ export type DaemonOutbound =
 			snapshot?: DaemonSessionSnapshot;
 			replay?: DaemonReplayInfo;
 			lastEventSequence?: DaemonEventSequence;
+	  }
+	| {
+			type: "session_snapshot_begin";
+			activeSessionId: string;
+			snapshotId: string;
+			snapshot: Omit<DaemonSessionSnapshot, "messages">;
+			messageCount: number;
+			targetChunkBytes: number;
+			purpose?: "attach" | "replacement" | "resync";
+	  }
+	| {
+			type: "session_snapshot_chunk";
+			activeSessionId: string;
+			snapshotId: string;
+			index: number;
+			messages: AgentMessage[];
+	  }
+	| {
+			type: "session_snapshot_end";
+			activeSessionId: string;
+			snapshotId: string;
+			chunkCount: number;
+			lastEventSequence: DaemonEventSequence;
+			lastEventCursor?: DaemonEventCursor;
 	  }
 	| { type: "session_detached"; activeSessionId: string }
 	| { type: "session_closed"; activeSessionId: string; reason: DaemonSessionClosedReason; meta?: DaemonEventMeta }
@@ -536,6 +621,58 @@ export function createDaemonCommandEnvelope<TCommand extends DaemonCommand>(
 	};
 }
 
+export function isDaemonCommandEnvelope(value: unknown): value is DaemonCommandEnvelope {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as {
+		type?: unknown;
+		id?: unknown;
+		protocol?: { name?: unknown; version?: unknown };
+		clientId?: unknown;
+		command?: unknown;
+	};
+	return (
+		candidate.type === "command" &&
+		typeof candidate.id === "string" &&
+		candidate.protocol?.name === DAEMON_PROTOCOL_NAME &&
+		candidate.protocol.version === DAEMON_PROTOCOL_VERSION &&
+		(candidate.clientId === undefined || typeof candidate.clientId === "string") &&
+		typeof candidate.command === "object" &&
+		candidate.command !== null
+	);
+}
+
+const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
+	"ack_result",
+	"list",
+	"list_saved_sessions",
+	"attach",
+	"agent_messages_status",
+	"wait_for_idle",
+	"get_state",
+	"get_connection_state",
+	"get_messages",
+	"get_session_stats",
+	"get_context_tree",
+	"get_commands",
+	"get_resource_snapshot",
+	"get_available_models",
+	"get_queue",
+	"cron_list",
+	"heartbeat_get",
+	"get_session_context",
+	"get_session_tree",
+	"get_user_messages_for_forking",
+	"get_last_assistant_text",
+	"get_system_prompt",
+	"get_tool_definition",
+]);
+
+export function isDaemonMutatingCommand(command: Pick<DaemonCommand, "type">): boolean {
+	return !READ_ONLY_DAEMON_COMMANDS.has(command.type);
+}
+
 export function createDaemonEventEnvelope<TEvent extends DaemonOutbound>(
 	event: TEvent,
 	meta: DaemonEventMeta,
@@ -546,6 +683,7 @@ export function createDaemonEventEnvelope<TEvent extends DaemonOutbound>(
 		protocol: meta.protocol,
 		...(meta.activeSessionId ? { activeSessionId: meta.activeSessionId } : {}),
 		...(meta.sequence !== undefined ? { sequence: meta.sequence } : {}),
+		...(meta.cursor ? { cursor: meta.cursor } : {}),
 		emittedAt: meta.emittedAt,
 		event,
 	};
@@ -555,12 +693,14 @@ export function createDaemonEventMeta(
 	activeSessionId: string,
 	sequence: DaemonEventSequence,
 	emittedAt = new Date().toISOString(),
+	generation = activeSessionId,
 ): DaemonEventMeta {
 	return {
 		id: `${activeSessionId}:${sequence}`,
 		protocol: DAEMON_PROTOCOL_INFO,
 		activeSessionId,
 		sequence,
+		cursor: { generation, sequence },
 		emittedAt,
 	};
 }
@@ -568,35 +708,59 @@ export function createDaemonEventMeta(
 export function createDaemonReplayInfo(
 	resumeCursor: DaemonResumeCursor | undefined,
 	lastEventSequence: DaemonEventSequence,
+	generation = "legacy",
 ): DaemonReplayInfo {
+	const toCursor = { generation, sequence: lastEventSequence };
 	if (!resumeCursor) {
 		return {
 			status: "complete",
 			toSequence: lastEventSequence,
+			toCursor,
+		};
+	}
+	const resumeSequence = "sequence" in resumeCursor ? resumeCursor.sequence : resumeCursor.eventSequence;
+	const fromCursor =
+		"generation" in resumeCursor
+			? { generation: resumeCursor.generation, sequence: resumeCursor.sequence }
+			: undefined;
+	if (fromCursor && fromCursor.generation !== generation) {
+		return {
+			status: "unavailable",
+			fromSequence: resumeSequence,
+			toSequence: lastEventSequence,
+			fromCursor,
+			toCursor,
+			reason: "event_generation_changed",
 		};
 	}
 
-	if (resumeCursor.eventSequence > lastEventSequence) {
+	if (resumeSequence > lastEventSequence) {
 		return {
 			status: "unavailable",
-			fromSequence: resumeCursor.eventSequence,
+			fromSequence: resumeSequence,
 			toSequence: lastEventSequence,
+			...(fromCursor ? { fromCursor } : {}),
+			toCursor,
 			reason: "resume_cursor_ahead_of_session",
 		};
 	}
 
-	if (resumeCursor.eventSequence === lastEventSequence) {
+	if (resumeSequence === lastEventSequence) {
 		return {
 			status: "complete",
-			fromSequence: resumeCursor.eventSequence,
+			fromSequence: resumeSequence,
 			toSequence: lastEventSequence,
+			...(fromCursor ? { fromCursor } : {}),
+			toCursor,
 		};
 	}
 
 	return {
 		status: "unavailable",
-		fromSequence: resumeCursor.eventSequence,
+		fromSequence: resumeSequence,
 		toSequence: lastEventSequence,
+		...(fromCursor ? { fromCursor } : {}),
+		toCursor,
 		reason: "event_replay_not_available",
 	};
 }

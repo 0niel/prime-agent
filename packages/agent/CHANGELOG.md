@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-13
+
+## [0.2.9] - 2026-07-13
+
+- Changed steering and follow-up queues to preserve grouped messages as an atomic batch.
+
 ## [0.2.8] - 2026-07-09
 
 - Fixed abort settling for provider streams and tool executions that ignore cancellation ([ENG-4490](https://linear.app/primeintellect/issue/ENG-4490)).

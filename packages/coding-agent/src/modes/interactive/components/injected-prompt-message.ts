@@ -13,17 +13,21 @@ import {
 	type CustomMessage,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	type HeartbeatPromptDetails,
+	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+	type IpythonStateRestoredDetails,
 } from "../../../core/messages.js";
 import { getMarkdownTheme, theme } from "../theme/theme.js";
 import { keyText } from "./keybinding-hints.js";
 
-type InjectedPromptDetails = GoalContextDetails | HeartbeatPromptDetails;
+type InjectedPromptDetails = GoalContextDetails | HeartbeatPromptDetails | IpythonStateRestoredDetails;
 type InjectedPromptMessage = CustomMessage<InjectedPromptDetails>;
 
 export function isInjectedPromptMessage(message: AgentMessage): message is InjectedPromptMessage {
 	return (
 		message.role === "custom" &&
-		(message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE || message.customType === GOAL_CONTEXT_CUSTOM_TYPE)
+		(message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE ||
+			message.customType === GOAL_CONTEXT_CUSTOM_TYPE ||
+			message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE)
 	);
 }
 
@@ -96,7 +100,7 @@ export class InjectedPromptMessageComponent extends Container {
 		this.content.clear();
 		this.header.setText(this.headerText());
 		this.content.addChild(this.header);
-		if (this.expanded) {
+		if (this.expanded && this.message.customType !== IPYTHON_STATE_RESTORED_CUSTOM_TYPE) {
 			this.content.addChild(
 				new Markdown(readCustomText(this.message), 1, 0, this.markdownTheme, {
 					color: (text: string) => theme.fg("customMessageText", text),
@@ -109,6 +113,11 @@ export class InjectedPromptMessageComponent extends Container {
 	private headerText(): string {
 		if (this.message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE) {
 			return this.heartbeatHeaderText();
+		}
+		if (this.message.customType === IPYTHON_STATE_RESTORED_CUSTOM_TYPE) {
+			const details = this.message.details as IpythonStateRestoredDetails | undefined;
+			const label = details?.restored === false ? "Started fresh IPython kernel" : "Restored IPython kernel state";
+			return `${theme.fg("accent", "◆")} ${theme.fg("muted", label)}`;
 		}
 
 		const details = this.message.details;

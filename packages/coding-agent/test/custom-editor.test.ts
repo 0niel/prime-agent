@@ -1,5 +1,5 @@
 import type { AutocompleteProvider, EditorTheme, TUI } from "@earendil-works/pi-tui";
-import { setKeybindings } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { CustomEditor } from "../src/modes/interactive/components/custom-editor.js";
@@ -135,6 +135,75 @@ describe("CustomEditor", () => {
 		editor.handleInput("\x18\x18");
 
 		expect(handler).toHaveBeenCalledTimes(2);
+	});
+
+	it("renders the editor caret before an empty prompt placeholder", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager(), {
+			placeholder: "type to start",
+		});
+		editor.focused = true;
+
+		const line = editor.render(40)[1]!;
+
+		expect(line).toContain(`${CURSOR_MARKER}\x1b[7m \x1b[0mtype to start`);
+		expect(visibleWidth(line)).toBe(40);
+	});
+
+	it("omits the hardware cursor marker when the placeholder editor is unfocused", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager(), {
+			placeholder: "type to start",
+		});
+
+		const line = editor.render(40)[1]!;
+
+		expect(line).not.toContain(CURSOR_MARKER);
+		expect(line).toContain("\x1b[7m \x1b[0mtype to start");
+	});
+
+	it("suppresses the hardware cursor marker while placeholder autocomplete is visible", async () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager(), {
+			placeholder: "type to start",
+		});
+		editor.focused = true;
+		editor.setAutocompleteProvider(autocompleteProvider);
+
+		editor.handleInput("\t");
+		await vi.waitFor(() => expect(editor.isShowingAutocomplete()).toBe(true));
+		const line = editor.render(40)[1]!;
+
+		expect(line).not.toContain(CURSOR_MARKER);
+		expect(line).toContain("\x1b[7m \x1b[0mtype to start");
+	});
+
+	it("preserves the editor background and exact width around placeholder carets", () => {
+		const backgroundColor = (text: string) => `\x1b[48;5;234m${text}\x1b[49m`;
+		const editor = new CustomEditor(fakeTui, { ...editorTheme, backgroundColor }, new KeybindingsManager(), {
+			paddingX: 2,
+			placeholder: "type to start",
+		});
+		editor.focused = true;
+
+		for (const width of [1, 2, 3, 4, 8, 40]) {
+			const line = editor.render(width)[1]!;
+
+			expect(line).toContain(`${CURSOR_MARKER}\x1b[7m \x1b[27m`);
+			expect(visibleWidth(line)).toBe(width);
+		}
+	});
+
+	it("keeps the placeholder caret on the input row below a header", () => {
+		const editor = new CustomEditor(fakeTui, editorTheme, new KeybindingsManager(), {
+			placeholder: "reply to agent",
+		});
+		editor.focused = true;
+		editor.getHeaderLine = () => "6h last agent response";
+
+		const lines = editor.render(40);
+
+		expect(lines[1]).toContain("6h last agent response");
+		expect(lines[1]).not.toContain(CURSOR_MARKER);
+		expect(lines[2]).not.toContain(CURSOR_MARKER);
+		expect(lines[3]).toContain(`${CURSOR_MARKER}\x1b[7m \x1b[0mreply to agent`);
 	});
 
 	it("renders a header line and blank spacer inside the top of the editor box", () => {

@@ -12,6 +12,7 @@ import { registerFauxProvider } from "@earendil-works/pi-ai";
 import type { AgentObserveController } from "../../src/core/agent-observe.js";
 import { AgentSession, type AgentSessionEvent, type AutoRefineReviewer } from "../../src/core/agent-session.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
+import type { AgentAutonomousConfig } from "../../src/core/autonomous.js";
 import type { ExtensionRunner } from "../../src/core/extensions/index.js";
 import { convertToLlm } from "../../src/core/messages.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
@@ -68,6 +69,7 @@ export interface HarnessOptions {
 	agentObserveController?: AgentObserveController;
 	persistSession?: boolean;
 	rlmDepth?: number;
+	autonomous?: AgentAutonomousConfig;
 	autoRefineReviewer?: AutoRefineReviewer;
 }
 
@@ -185,6 +187,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		baseToolsOverride: toolMap,
 		extensionRunnerRef,
 		rlmDepth: options.rlmDepth,
+		autonomous: options.autonomous,
 		autoRefineReviewer: options.autoRefineReviewer,
 	});
 

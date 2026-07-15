@@ -44,6 +44,8 @@ const DAEMON_CLIENT_COMMANDS = new Set([
 	"stats",
 	"commands",
 	"cron",
+	"retry",
+	"restart",
 	"shutdown",
 ]);
 
@@ -252,13 +254,41 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 			case "cron":
 				await runCron(client, parsed.positionals, parsed.json);
 				return;
+			case "retry":
+				if (parsed.positionals.length !== 1) {
+					throw new Error("Usage: daemon retry <session>");
+				}
+				await printResponseData(
+					client,
+					{ type: "retry_worker", activeSessionId: parsed.positionals[0]! },
+					parsed.json,
+				);
+				return;
+			case "restart":
+				if (parsed.positionals.length !== 0) {
+					throw new Error("Usage: daemon restart");
+				}
+				await printResponseData(client, { type: "restart" }, parsed.json);
+				return;
 			case "shutdown":
-				await printResponseData(client, { type: "shutdown" }, parsed.json);
+				await runShutdown(client, parsed.positionals, parsed.json);
 				return;
 		}
 	} finally {
 		client.close();
 	}
+}
+
+async function runShutdown(client: DaemonClient, args: string[], json: boolean): Promise<void> {
+	let force = false;
+	for (const arg of args) {
+		if (arg === "--force" || arg === "-f") {
+			force = true;
+			continue;
+		}
+		throw new Error(`Unknown shutdown option: ${arg}`);
+	}
+	await printResponseData(client, { type: "shutdown", force }, json);
 }
 
 async function runOpen(parsed: ParsedDaemonClientCommand): Promise<void> {
@@ -1336,6 +1366,17 @@ class DaemonAttachTerminal {
 				}
 				this.rl?.prompt();
 				return;
+			case "session_resynced":
+				this.isStreaming = message.snapshot.state.isStreaming;
+				this.writeLine(
+					chalk.dim(`Session resynchronized: ${message.snapshot.state.sessionName ?? message.activeSessionId}`),
+				);
+				if (message.snapshot.messages.length > 0) {
+					this.writeLine(chalk.bold("Transcript"));
+					this.printTranscript(message.snapshot.messages);
+				}
+				this.rl?.prompt();
+				return;
 			case "session_detached":
 				return;
 			case "session_closed":
@@ -1648,7 +1689,9 @@ ${chalk.bold("Commands:")}
   cron add <session> <schedule> -- <message>
                                 Schedule a prompt for a session
   cron cancel <job-id>           Cancel a scheduled cron job
-  shutdown [--all]              Stop the daemon; --all force-stops every daemon on this machine
+  retry <session>               Retry a root worker marked failed
+  restart                       Restart only the supervisor and adopt existing workers
+  shutdown [--force|--all]      Stop workers and the daemon; --force kills unresponsive workers
 
 ${chalk.bold("Options:")}
   --socket <path>               Socket path (default: ${defaultDaemonSocketPath()})

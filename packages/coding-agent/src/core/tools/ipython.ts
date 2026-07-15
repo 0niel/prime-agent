@@ -14,13 +14,18 @@ import {
 	KernelBusyAfterInterruptError,
 	type KernelDiffDisplay,
 	KernelManager,
+	type KernelSentAgentMessage,
 } from "../kernel/index.js";
 import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
+import { parseIpythonBashCell } from "./ipython-cell-code.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
 const RLM_BOOTSTRAP_BASE_CODE = `
 import asyncio
+import os as _prime_agent_os
+
+_prime_agent_os.environ["NO_COLOR"] = "1"
 
 try:
     import nest_asyncio as _prime_agent_nest_asyncio
@@ -238,6 +243,8 @@ export interface IpythonToolDetails {
 	diffs?: KernelDiffDisplay[];
 	/** Media attachments loaded into context (e.g. by the attach-image skill). */
 	attachments?: KernelAttachment[];
+	/** Agent messages sent from this cell. */
+	sentAgentMessages?: KernelSentAgentMessage[];
 	/** True when this result came after killing and restarting a busy kernel. */
 	kernelRestarted?: boolean;
 	error?: {
@@ -271,6 +278,7 @@ export interface IpythonToolOptions {
 	 * (some names restored or some failed), so the session can tell the model.
 	 */
 	onRestore?: (result: RestoreResult) => void;
+	onLateSentAgentMessage?: (toolCallId: string, message: KernelSentAgentMessage) => void;
 	/** Shared provisioner owning the kernel lifecycle. When provided, the remaining options are ignored. */
 	provisioner?: IpythonKernelProvisioner;
 }
@@ -287,17 +295,15 @@ function applyShellSettingsToBashMagicCell(
 	const shellPath = options?.shellPath?.trim();
 	if (!commandPrefix && !shellPath) return code;
 
-	const match = /^([ \t]*)%%bash\b([^\r\n]*)(\r?\n|$)/.exec(code);
-	if (!match) return code;
+	const bashCell = parseIpythonBashCell(code);
+	if (!bashCell) return code;
 
-	const [, indent, rest, lineBreak] = match;
-	const body = code.slice(match[0].length);
 	const firstLine =
-		shellPath && rest.trim().length === 0
-			? `${indent}%%script ${quoteScriptMagicArgument(shellPath)}`
-			: `${indent}%%bash${rest}`;
-	const nextBody = commandPrefix ? `${commandPrefix}${body ? `\n${body}` : ""}` : body;
-	return `${firstLine}${lineBreak || "\n"}${nextBody}`;
+		shellPath && bashCell.magicArguments.trim().length === 0
+			? `${bashCell.indent}%%script ${quoteScriptMagicArgument(shellPath)}`
+			: `${bashCell.indent}%%bash${bashCell.magicArguments}`;
+	const nextBody = commandPrefix ? `${commandPrefix}${bashCell.body ? `\n${bashCell.body}` : ""}` : bashCell.body;
+	return `${bashCell.leadingWhitespace}${firstLine}${bashCell.lineBreak || "\n"}${nextBody}`;
 }
 
 /**
@@ -547,17 +553,28 @@ async function chooseBusyKernelAction(
 async function executeWithBusyKernelChoice(
 	provisioner: IpythonKernelProvisioner,
 	reportStartupProgress: KernelBootstrapProgressHandler,
+	toolCallId: string,
 	code: string,
 	signal: AbortSignal | undefined,
 	onStream: (chunk: string, name: "stdout" | "stderr") => void,
 	onWorkingMessage: (message?: string) => void,
+	onLateSentAgentMessage: ((toolCallId: string, message: KernelSentAgentMessage) => void) | undefined,
 	ctx: ExtensionContext | undefined,
 ): Promise<{ result: ExecuteResult; kernelRestarted: boolean }> {
 	let kernelRestarted = false;
 	while (true) {
 		const m = await provisioner.ensure(reportStartupProgress, signal);
 		try {
-			return { result: await m.execute(code, { signal, onStream }), kernelRestarted };
+			return {
+				result: await m.execute(code, {
+					signal,
+					onStream,
+					onLateSentAgentMessage: onLateSentAgentMessage
+						? (message) => onLateSentAgentMessage(toolCallId, message)
+						: undefined,
+				}),
+				kernelRestarted,
+			};
 		} catch (error) {
 			if (!(error instanceof KernelBusyAfterInterruptError) || signal?.aborted) {
 				throw error;
@@ -601,7 +618,7 @@ export function createIpythonToolDefinition(
 		// The kernel is single-threaded — pi must not run two ipython calls in parallel within a batch.
 		executionMode: "sequential",
 		parameters: ipythonSchema,
-		execute: async (_toolCallId, params, signal, onUpdate, ctx) => {
+		execute: async (toolCallId, params, signal, onUpdate, ctx) => {
 			let hasWorkingMessage = false;
 			const setToolWorkingMessage = (message?: string) => {
 				setWorkingMessage(ctx, message);
@@ -620,6 +637,7 @@ export function createIpythonToolDefinition(
 				const { result: r, kernelRestarted } = await executeWithBusyKernelChoice(
 					provisioner,
 					reportStartupProgress,
+					toolCallId,
 					code,
 					signal,
 					(chunk) => {
@@ -629,6 +647,7 @@ export function createIpythonToolDefinition(
 						});
 					},
 					setToolWorkingMessage,
+					options?.onLateSentAgentMessage,
 					ctx,
 				);
 
@@ -656,6 +675,7 @@ export function createIpythonToolDefinition(
 						result: r.result,
 						diffs: r.diffs,
 						attachments: r.attachments,
+						sentAgentMessages: r.sentAgentMessages,
 						kernelRestarted,
 						error: r.error,
 					},

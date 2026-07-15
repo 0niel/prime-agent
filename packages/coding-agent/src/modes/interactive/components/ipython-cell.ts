@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { previewIpythonCode } from "../../../core/tools/code-preview.js";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
+import { parseIpythonBashCell } from "../../../core/tools/ipython-cell-code.js";
 import { shortenPath } from "../../../core/tools/render-utils.js";
 import { getLanguageFromPath, highlightCode, theme } from "../theme/theme.js";
 import { getWorkingPulseFrame, WORKING_ICON_FRAMES, workingIconFrame } from "../theme/working-icon.js";
@@ -29,6 +30,7 @@ export interface IPythonCellState {
 	isPartial?: boolean;
 	isError?: boolean;
 	expanded?: boolean;
+	showExpandHint?: boolean;
 	executionStarted?: boolean;
 	argsComplete?: boolean;
 	showImages?: boolean;
@@ -43,6 +45,17 @@ interface DiffDisplay {
 	startLine?: number;
 }
 
+interface SentAgentMessageDisplay {
+	id: string;
+	message: string;
+	deliveryStatus: "delivered" | "queued";
+	target: {
+		activeSessionId: string;
+		sessionId: string;
+		sessionName?: string;
+	};
+}
+
 interface IpythonDetails {
 	durationMs?: number;
 	status?: string;
@@ -51,6 +64,7 @@ interface IpythonDetails {
 	stderr?: string;
 	result?: string;
 	diffs?: DiffDisplay[];
+	sentAgentMessages?: SentAgentMessageDisplay[];
 	error?: IpythonErrorDetails;
 }
 
@@ -67,7 +81,6 @@ interface TracebackParts {
 }
 
 const MAGIC_LINE_PATTERN = /^\s*!/;
-const CELL_MAGIC_PATTERN = /^\s*%%bash\b/;
 
 // Two columns, matching the code body's "› "/"  " gutter so output aligns under it.
 const OUTPUT_INDENT = "  ";
@@ -131,8 +144,48 @@ function readDetails(details: unknown): IpythonDetails {
 		stderr: typeof record.stderr === "string" ? record.stderr : undefined,
 		result: typeof record.result === "string" ? record.result : undefined,
 		diffs: readDiffDisplays(record.diffs),
+		sentAgentMessages: readSentAgentMessages(record.sentAgentMessages),
 		error,
 	};
+}
+
+function readSentAgentMessages(value: unknown): SentAgentMessageDisplay[] | undefined {
+	if (!Array.isArray(value)) {
+		return undefined;
+	}
+	const messages = value.flatMap((entry): SentAgentMessageDisplay[] => {
+		if (!entry || typeof entry !== "object") {
+			return [];
+		}
+		const record = entry as Record<string, unknown>;
+		const target = record.target;
+		if (!target || typeof target !== "object") {
+			return [];
+		}
+		const targetRecord = target as Record<string, unknown>;
+		if (
+			typeof record.id !== "string" ||
+			typeof record.message !== "string" ||
+			(record.deliveryStatus !== "delivered" && record.deliveryStatus !== "queued") ||
+			typeof targetRecord.activeSessionId !== "string" ||
+			typeof targetRecord.sessionId !== "string"
+		) {
+			return [];
+		}
+		return [
+			{
+				id: record.id,
+				message: record.message,
+				deliveryStatus: record.deliveryStatus,
+				target: {
+					activeSessionId: targetRecord.activeSessionId,
+					sessionId: targetRecord.sessionId,
+					...(typeof targetRecord.sessionName === "string" ? { sessionName: targetRecord.sessionName } : {}),
+				},
+			},
+		];
+	});
+	return messages.length > 0 ? messages : undefined;
 }
 
 function readDiffDisplays(value: unknown): DiffDisplay[] | undefined {
@@ -306,23 +359,25 @@ export class IPythonCellComponent implements Component {
 		const lines = [truncateToWidth(` ${this.collapsedLine(details)}`, safeWidth, "")];
 
 		const hasDiffs = (details.diffs?.length ?? 0) > 0;
-		// Edits always show their diff under the top line, regardless of expand state.
-		if (hasDiffs) {
+		if (hasDiffs && this.state.expanded) {
 			this.renderDiffs(lines, safeWidth, details.diffs ?? [], this.marker(details));
+		}
+		if ((details.sentAgentMessages?.length ?? 0) > 0) {
+			this.renderSentAgentMessages(lines, safeWidth, details.sentAgentMessages ?? []);
 		}
 
 		if (!this.state.expanded) {
 			return this.renderCache.set(safeWidth, cacheVersion, lines);
 		}
 
-		const hasCode = this.renderCode(lines, safeWidth, hasDiffs);
+		const hasCode = this.renderCode(lines, safeWidth);
 		this.renderOutput(lines, safeWidth, details, hasCode);
 		return this.renderCache.set(safeWidth, cacheVersion, lines);
 	}
 
 	private collapsedLine(details: IpythonDetails): string {
 		const code = this.state.code.trimEnd();
-		const isBashCell = CELL_MAGIC_PATTERN.test(code.split("\n")[0] ?? "");
+		const isBashCell = parseIpythonBashCell(code) !== undefined;
 		const preview = previewIpythonCode(code);
 		const languageLabel = isBashCell && preview.language !== "bash" ? `bash · ${preview.language}` : preview.language;
 		const parts = [`${this.marker(details)} ${theme.fg("muted", languageLabel)}`];
@@ -348,7 +403,9 @@ export class IPythonCellComponent implements Component {
 			parts.push(theme.fg("error", errorName));
 		}
 
-		parts.push(keyHint("app.tools.expand", this.state.expanded ? "to collapse" : "to expand"));
+		if (this.state.showExpandHint !== false) {
+			parts.push(keyHint("app.tools.expand", this.state.expanded ? "to collapse" : "to expand"));
+		}
 		return parts.join(theme.fg("dim", " · "));
 	}
 
@@ -371,9 +428,8 @@ export class IPythonCellComponent implements Component {
 	// `↑in ↓out lines` — the "lines" unit disambiguates from the token counts on
 	// the activity line. Output is omitted for edits (the diff shows on expand).
 	private lineCounts(details: IpythonDetails): string | undefined {
-		const codeLines = this.state.code.split("\n");
-		const isBashCell = CELL_MAGIC_PATTERN.test(codeLines[0] ?? "");
-		const body = isBashCell ? codeLines.slice(1) : codeLines;
+		const bashCell = parseIpythonBashCell(this.state.code);
+		const body = (bashCell?.body ?? this.state.code).split(/\r?\n/);
 		const input = body.filter((line) => line.trim().length > 0).length;
 
 		const hasDiffs = (details.diffs?.length ?? 0) > 0;
@@ -419,16 +475,13 @@ export class IPythonCellComponent implements Component {
 			details.result !== undefined ||
 			details.error !== undefined ||
 			(details.diffs?.length ?? 0) > 0 ||
+			(details.sentAgentMessages?.length ?? 0) > 0 ||
 			(this.state.content?.length ?? 0) > 0
 		);
 	}
 
 	// Only runs when expanded — shows the full source below the fixed top line.
-	// Edits skip the source: their diff already renders above and conveys the change.
-	private renderCode(lines: string[], width: number, hasDiffs: boolean): boolean {
-		if (hasDiffs) {
-			return false;
-		}
+	private renderCode(lines: string[], width: number): boolean {
 		const code = this.state.code.trimEnd();
 		if (!code) {
 			this.addBlank(lines, width);
@@ -437,7 +490,7 @@ export class IPythonCellComponent implements Component {
 		}
 
 		this.addBlank(lines, width);
-		const isBashCell = CELL_MAGIC_PATTERN.test(code.split("\n")[0] ?? "");
+		const isBashCell = parseIpythonBashCell(code) !== undefined;
 		const rawLines = code.split("\n");
 		for (const [index, rawLine] of rawLines.entries()) {
 			const prefix = index === 0 ? theme.fg("dim", "› ") : theme.fg("dim", "  ");
@@ -449,7 +502,7 @@ export class IPythonCellComponent implements Component {
 	}
 
 	private highlightInputLine(line: string, isBashCell: boolean): string {
-		if (isBashCell || MAGIC_LINE_PATTERN.test(line) || CELL_MAGIC_PATTERN.test(line)) {
+		if (isBashCell || MAGIC_LINE_PATTERN.test(line) || parseIpythonBashCell(line) !== undefined) {
 			return theme.fg("bashMode", line);
 		}
 		const highlighted = highlightCode(line, "python");
@@ -524,6 +577,7 @@ export class IPythonCellComponent implements Component {
 			!traceback &&
 			!details.error &&
 			diffs.length === 0 &&
+			(details.sentAgentMessages?.length ?? 0) === 0 &&
 			this.state.executionStarted &&
 			imageCount === 0
 		) {
@@ -552,7 +606,26 @@ export class IPythonCellComponent implements Component {
 		}
 	}
 
-	// Edits always render in full, regardless of expand state. Grouped by file.
+	private renderSentAgentMessages(lines: string[], width: number, messages: readonly SentAgentMessageDisplay[]): void {
+		for (const message of messages) {
+			this.addPlain(lines, "");
+			const target =
+				message.target.sessionName?.trim() ||
+				message.target.activeSessionId.trim() ||
+				message.target.sessionId.trim() ||
+				"Unknown agent";
+			const label = message.deliveryStatus === "delivered" ? "Agent message sent" : "Agent message queued";
+			const text = message.message.replace(/\s+/g, " ").trim();
+			const line =
+				theme.fg("accent", "◆") +
+				` ${theme.fg("muted", label)}${theme.fg("dim", " · ")}` +
+				theme.fg("muted", target) +
+				theme.fg("dim", " · ") +
+				theme.fg("muted", text);
+			this.addPlain(lines, truncateToWidth(line, Math.max(1, width - 1), "…"));
+		}
+	}
+
 	private renderDiffs(lines: string[], width: number, diffs: readonly DiffDisplay[], marker: string): void {
 		const diffsByPath = new Map<string, DiffDisplay[]>();
 		for (const diff of diffs) {

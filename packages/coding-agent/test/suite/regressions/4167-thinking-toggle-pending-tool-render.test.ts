@@ -32,6 +32,8 @@ const EMPTY_USAGE: Usage = {
 
 type RenderSessionContextThis = {
 	pendingTools: Map<string, ToolExecutionComponent>;
+	ipythonToolComponents: Map<string, ToolExecutionComponent>;
+	lateIpythonSentAgentMessages: Map<string, unknown[]>;
 	pendingToolCreations: Set<string>;
 	startedToolCalls: Set<string>;
 	resetPendingToolState(): void;
@@ -68,8 +70,10 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 	const pendingTools = new Map<string, ToolExecutionComponent>();
 	const pendingToolCreations = new Set<string>();
 	const startedToolCalls = new Set<string>();
-	return {
+	const fakeThis: RenderSessionContextThis = {
 		pendingTools,
+		ipythonToolComponents: new Map(),
+		lateIpythonSentAgentMessages: new Map(),
 		pendingToolCreations,
 		startedToolCalls,
 		resetPendingToolState() {
@@ -98,6 +102,8 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 			chatContainer.addChild(new Text(message.role, 0, 0));
 		},
 	};
+	Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+	return fakeThis;
 }
 
 function createAssistantToolCallMessage(): AssistantMessage {

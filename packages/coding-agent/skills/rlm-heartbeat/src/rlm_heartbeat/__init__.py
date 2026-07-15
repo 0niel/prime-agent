@@ -12,6 +12,17 @@ from typing import Any, Literal
 from rlm import host_request
 
 StatusUpdate = Literal["pause", "resume"]
+DeliveryMode = Literal["steer", "follow_up"]
+
+
+def _normalize_delivery_mode(delivery_mode: DeliveryMode | None) -> str | None:
+    if delivery_mode is None:
+        return None
+    if not isinstance(delivery_mode, str):
+        raise TypeError(f"delivery_mode must be str or None, got {type(delivery_mode).__name__}")
+    if delivery_mode not in {"steer", "follow_up"}:
+        raise ValueError('delivery_mode must be "steer", "follow_up", or None')
+    return delivery_mode
 
 
 async def list(include_inactive: bool = False) -> dict[str, Any]:
@@ -21,8 +32,18 @@ async def list(include_inactive: bool = False) -> dict[str, Any]:
     return await host_request("rlm_heartbeat.list", {"include_inactive": include_inactive})
 
 
-async def create(instruction: str, interval: str | None = None, label: str | None = None) -> dict[str, Any]:
-    """Create an internal recurring heartbeat for the current agent session."""
+async def create(
+    instruction: str,
+    interval: str | None = None,
+    label: str | None = None,
+    delivery_mode: DeliveryMode | None = None,
+) -> dict[str, Any]:
+    """Create an internal recurring heartbeat for the current agent session.
+
+    delivery_mode controls how the scheduled prompt is delivered when the
+    session is busy: "steer" (default) interrupts the current turn, "follow_up"
+    waits for it to finish.
+    """
     if not isinstance(instruction, str):
         raise TypeError(f"instruction must be str, got {type(instruction).__name__}")
     payload: dict[str, Any] = {"instruction": instruction}
@@ -34,6 +55,9 @@ async def create(instruction: str, interval: str | None = None, label: str | Non
         if not isinstance(label, str):
             raise TypeError(f"label must be str or None, got {type(label).__name__}")
         payload["label"] = label
+    normalized_delivery_mode = _normalize_delivery_mode(delivery_mode)
+    if normalized_delivery_mode is not None:
+        payload["delivery_mode"] = normalized_delivery_mode
     return await host_request("rlm_heartbeat.create", payload)
 
 
@@ -43,6 +67,7 @@ async def update(
     interval: str | None = None,
     label: str | None = None,
     status: StatusUpdate | None = None,
+    delivery_mode: DeliveryMode | None = None,
 ) -> dict[str, Any]:
     """Update one internal RLM heartbeat for the current agent session."""
     if not isinstance(id, str):
@@ -64,6 +89,9 @@ async def update(
         if status not in {"pause", "resume"}:
             raise ValueError('status must be "pause", "resume", or None')
         payload["status"] = status
+    normalized_delivery_mode = _normalize_delivery_mode(delivery_mode)
+    if normalized_delivery_mode is not None:
+        payload["delivery_mode"] = normalized_delivery_mode
     return await host_request("rlm_heartbeat.update", payload)
 
 
