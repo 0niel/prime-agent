@@ -88,7 +88,7 @@ describe("session cwd handling", () => {
 		expect(getMissingSessionCwdIssue(sessionManager, fallbackCwd)).toBeUndefined();
 	});
 
-	it("uses explicit --cwd as the cwd override when opening --session", async () => {
+	it("uses explicit --cwd as the cwd override when opening --resume", async () => {
 		const storedCwd = createTempDir("pi-session-cwd-stored");
 		const explicitCwd = createTempDir("pi-session-cwd-explicit");
 		const agentDir = createTempDir("pi-session-cwd-agent-dir");
@@ -97,7 +97,7 @@ describe("session cwd handling", () => {
 		cleanupPaths.push(storedCwd, explicitCwd, agentDir, sessionDir);
 		writeSessionFile(sessionFile, storedCwd);
 
-		const parsed = parseArgs(["--cwd", explicitCwd, "--session", sessionFile]);
+		const parsed = parseArgs(["--cwd", explicitCwd, "--resume", sessionFile]);
 		const sessionManager = await createSessionManager(
 			parsed,
 			explicitCwd,
@@ -106,6 +106,21 @@ describe("session cwd handling", () => {
 		);
 
 		expect(sessionManager.getCwd()).toBe(explicitCwd);
+	});
+
+	it("restores an unresolved resume selector as prompt text for a fresh session", async () => {
+		const cwd = createTempDir("pi-session-cwd-resume-fallback");
+		const agentDir = createTempDir("pi-session-cwd-resume-fallback-agent-dir");
+		const sessionDir = createTempDir("pi-session-cwd-resume-fallback-session-dir");
+		cleanupPaths.push(cwd, agentDir, sessionDir);
+
+		const parsed = parseArgs(["--resume", "fix", "the", "bug"]);
+		const sessionManager = await createSessionManager(parsed, cwd, sessionDir, SettingsManager.create(cwd, agentDir));
+
+		expect(sessionManager.getCwd()).toBe(cwd);
+		expect(parsed.resume).toBeUndefined();
+		expect(parsed.resumeSelectorFallback).toBeUndefined();
+		expect(parsed.messages).toEqual(["fix", "the", "bug"]);
 	});
 
 	it("throws a controlled error before runtime creation when the stored cwd is missing", async () => {

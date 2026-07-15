@@ -1,9 +1,9 @@
 export { DaemonAgentConnection } from "./daemon-agent-connection.js";
-export { DeferredAgentConnection, type DeferredAgentConnectionSeed } from "./deferred-agent-connection.js";
 export { InProcessAgentConnection } from "./in-process-agent-connection.js";
 export { createAgentConnectionCommands, createAgentConnectionState } from "./snapshot.js";
 export type {
 	AgentConnection,
+	AgentConnectionAgentStatus,
 	AgentConnectionArtifactReference,
 	AgentConnectionArtifactType,
 	AgentConnectionBeforeSessionInvalidateListener,
@@ -39,10 +39,9 @@ export type {
 	AgentConnectionResourceSkill,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionResourceTheme,
+	AgentConnectionRlmChildAgentActivity,
 	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionRlmChildAgentStatus,
-	AgentConnectionRlmChildAgentStructuredTranscriptEntry,
-	AgentConnectionRlmChildAgentTranscriptLine,
 	AgentConnectionSavedSessionInfo,
 	AgentConnectionSavedSessionScope,
 	AgentConnectionSavedSessionState,
@@ -53,10 +52,13 @@ export type {
 	AgentConnectionSessionEntryBase,
 	AgentConnectionSessionEvent,
 	AgentConnectionSessionInfoEntry,
+	AgentConnectionSessionListCallbacks,
 	AgentConnectionSessionListProgress,
 	AgentConnectionSessionMessageEntry,
 	AgentConnectionSessionStateEntry,
 	AgentConnectionSessionTreeNode,
+	AgentConnectionSessionWatcher,
+	AgentConnectionSideQuestionEvent,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
 	AgentConnectionSourceInfo,

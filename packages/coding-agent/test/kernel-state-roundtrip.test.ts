@@ -51,13 +51,12 @@ describeIfKernel("kernel state snapshot round-trip (real kernel)", () => {
 			await writer.execute("x = 42");
 			await writer.execute("df = [1, 2, 3]");
 			await writer.execute("def double(n):\n    return n * 2");
-			await writer.execute("import socket\nsock = socket.socket()");
+			await writer.execute("gen = (n for n in range(3))");
 
 			const snap = await writer.snapshotState();
 			expect(snap).not.toBeNull();
 			expect(snap?.saved).toEqual(expect.arrayContaining(["x", "df", "double"]));
-			// A live socket cannot be pickled and must be reported, not silently dropped.
-			expect(snap?.skipped.map((s) => s.name)).toContain("sock");
+			expect(snap?.skipped.map((s) => s.name)).toContain("gen");
 			expect(existsSync(snapshotPath)).toBe(true);
 			expect(existsSync(manifestPath)).toBe(true);
 		} finally {
@@ -138,6 +137,24 @@ describeIfKernel("kernel state snapshot round-trip (real kernel)", () => {
 		} finally {
 			await manager.dispose();
 			rmSync(badDir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it("lists live user-defined names, filtering internals and live handles", async () => {
+		const listDir = mkdtempSync(join(tmpdir(), "prime-agent-state-list-"));
+		const manager = new KernelManager({ python: python as string, cwd: listDir });
+		try {
+			// A fresh, unstarted kernel reports no names.
+			expect(await manager.listNamespaceNames()).toBeNull();
+			await manager.execute("alpha = 1\ndef helper(n):\n    return n\n_hidden = 2\nrlm = object()");
+			const names = await manager.listNamespaceNames();
+			expect(names).toEqual(expect.arrayContaining(["alpha", "helper"]));
+			// Underscore-prefixed names and the live rlm handle must be filtered out.
+			expect(names).not.toContain("_hidden");
+			expect(names).not.toContain("rlm");
+		} finally {
+			await manager.dispose();
+			rmSync(listDir, { recursive: true, force: true });
 		}
 	}, 60_000);
 

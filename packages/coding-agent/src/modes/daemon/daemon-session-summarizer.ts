@@ -9,9 +9,8 @@ const SWEEP_INTERVAL_MS = 25_000;
 // Collapse a tool-use loop's rapid turn_end bursts into one summarization.
 const SETTLE_DEBOUNCE_MS = 2_000;
 
-// Small self-hosted open-weight model, off the proxied frontier models.
 const SUMMARY_MODEL_PROVIDER = "prime-inference";
-const SUMMARY_MODEL_ID = "nvidia/nemotron-3-nano-30b-a3b";
+const SUMMARY_MODEL_ID = "qwen/qwen3-30b-a3b-instruct-2507";
 
 const SUMMARY_CONTEXT_MESSAGES = 8;
 const SUMMARY_MAX_CHARS_PER_MESSAGE = 600;
@@ -308,7 +307,11 @@ export class DaemonSessionSummarizer {
 		// always refresh so the recap keeps up with the in-progress turn.
 		const contentUnchanged = previous?.basedOnMessageCount === messageCount;
 		const owesIdleVerdict = !isWorking && previous?.taskState === undefined;
-		if (contentUnchanged && !isWorking && !owesIdleVerdict) {
+		// A blank recap means the model call hasn't succeeded yet (e.g. the
+		// needs_input fallback fired on a transient failure); keep retrying until a
+		// real summary lands so the recap isn't left permanently empty.
+		const owesSummary = !isWorking && !previous?.summary;
+		if (contentUnchanged && !isWorking && !owesIdleVerdict && !owesSummary) {
 			return;
 		}
 		// Include the in-progress message so a long streaming turn gets a live recap.
@@ -318,12 +321,20 @@ export class DaemonSessionSummarizer {
 		const controller = new AbortController();
 		this.inFlight.set(id, controller);
 		try {
-			const result = await this.generate({
+			const generated = await this.generate({
 				registry: session.modelRegistry,
 				messages: contextMessages,
 				isWorking,
 				signal: controller.signal,
 			});
+			// A failed classification on an idle session would spin at "working"
+			// forever (the activity axis holds unjudged idle sessions there), so
+			// settle it to needs_input.
+			const result =
+				generated ??
+				(!isWorking && (owesIdleVerdict || owesSummary)
+					? { summary: previous?.summary ?? "", taskState: "needs_input" as const }
+					: undefined);
 			if (!result) {
 				return;
 			}

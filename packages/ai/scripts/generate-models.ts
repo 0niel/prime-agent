@@ -1,7 +1,8 @@
 #!/usr/bin/env tsx
 
-import { writeFileSync } from "fs";
-import { join, dirname } from "path";
+import { readFileSync, writeFileSync } from "fs";
+import { homedir } from "os";
+import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import {
 	CLOUDFLARE_AI_GATEWAY_ANTHROPIC_BASE_URL,
@@ -16,6 +17,7 @@ import {
 	Model,
 	type OpenAICompletionsCompat,
 } from "../src/types.js";
+import { MODELS as EXISTING_MODELS } from "../src/models.generated.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -115,46 +117,107 @@ interface PrimeInferenceCatalogEntry {
 }
 
 interface PrimeInferenceModelMetadata {
-	contextWindow: number;
-	maxTokens: number;
+	contextWindow?: number;
+	maxTokens?: number;
 	vision?: boolean;
+	name?: string;
 }
 
-// Prime Inference intentionally exposes a curated subset of the catalog in the
-// model picker. Add new model IDs here, then rerun this script to refresh
-// src/models.generated.ts.
+// The full Prime Inference catalog is registered (minus raw/duplicate variants).
+// The /models endpoint publishes pricing only, so context/output limits and
+// modalities come from the OpenRouter catalog, which Prime routes most models
+// through. Entries here override OpenRouter where the Prime route enforces a
+// different limit (verified against the live API) or fill gaps for models
+// OpenRouter does not list or leaves incomplete.
 const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata> = {
-	// prime-inference proxies Anthropic models through OpenRouter without the
-	// context-1m beta header, so the enforced window is the standard 200k, not 1M.
-	"anthropic/claude-haiku-4.5": { contextWindow: 200000, maxTokens: 64000, vision: true },
-	"anthropic/claude-opus-4.6": { contextWindow: 200000, maxTokens: 128000, vision: true },
-	"anthropic/claude-opus-4.7": { contextWindow: 200000, maxTokens: 128000, vision: true },
-	"anthropic/claude-opus-4.8": { contextWindow: 200000, maxTokens: 128000, vision: true },
-	"anthropic/claude-sonnet-4.5": { contextWindow: 200000, maxTokens: 64000, vision: true },
-	"anthropic/claude-sonnet-4.6": { contextWindow: 200000, maxTokens: 128000, vision: true },
-	"deepseek/deepseek-v3.2": { contextWindow: 128000, maxTokens: 8000 },
-	"deepseek/deepseek-v4-flash": { contextWindow: 1000000, maxTokens: 384000 },
-	"deepseek/deepseek-v4-pro": { contextWindow: 1000000, maxTokens: 384000 },
-	"minimax/minimax-m3": { contextWindow: 204800, maxTokens: 131072 },
-	"moonshotai/kimi-k2.7-code": { contextWindow: 262144, maxTokens: 16000, vision: true },
-	"nvidia/nemotron-3-nano-30b-a3b": { contextWindow: 1000000, maxTokens: 228000 },
-	"nvidia/nemotron-3-super-120b-a12b": { contextWindow: 1000000, maxTokens: 4096 },
-	"openai/gpt-5.3-codex": { contextWindow: 400000, maxTokens: 128000, vision: true },
-	"openai/gpt-5.4": { contextWindow: 1050000, maxTokens: 128000, vision: true },
-	"openai/gpt-5.4-mini": { contextWindow: 400000, maxTokens: 128000, vision: true },
-	"openai/gpt-5.4-pro": { contextWindow: 1050000, maxTokens: 128000, vision: true },
-	"openai/gpt-5.5": { contextWindow: 1050000, maxTokens: 128000, vision: true },
-	"prime-intellect/intellect-3": { contextWindow: 131072, maxTokens: 131072 },
-	"qwen/qwen3-235b-a22b-thinking-2507": { contextWindow: 262144, maxTokens: 4096 },
-	"qwen/qwen3-coder-next": { contextWindow: 262144, maxTokens: 65536 },
-	"qwen/qwen3-max": { contextWindow: 262144, maxTokens: 65536 },
-	"qwen/qwen3-vl-235b-a22b-thinking": { contextWindow: 262144, maxTokens: 32768, vision: true },
-	"x-ai/grok-4.20": { contextWindow: 2000000, maxTokens: 30000, vision: true },
-	"x-ai/grok-4.20-multi-agent": { contextWindow: 2000000, maxTokens: 30000, vision: true },
-	"z-ai/glm-5": { contextWindow: 202752, maxTokens: 131072 },
-	"z-ai/glm-5.1": { contextWindow: 202800, maxTokens: 131072 },
-	"z-ai/glm-5.2": { contextWindow: 202800, maxTokens: 131072 },
+	// Verified 2026-07-08: these routes reject prompts above 200k tokens even
+	// though OpenRouter reports 1M. Every other Claude route accepted a >200k
+	// prompt (opus-4.7/4.8, sonnet-4.6/5, fable-5 verified individually).
+	"anthropic/claude-sonnet-4": { contextWindow: 200000 },
+	"anthropic/claude-sonnet-4.5": { contextWindow: 200000 },
+	"internal/glm-5.2-fast": { name: "GLM 5.2 Fast" },
+	// Enforced windows measured against the live gateway 2026-07-08 where they
+	// are SMALLER than OpenRouter's listing — over-declaring breaks context
+	// tracking. (Measured by binary-searching the max_tokens reject boundary.)
+	"meta-llama/llama-3.2-1b-instruct": { contextWindow: 60000 },
+	"meta-llama/llama-3.2-3b-instruct": { contextWindow: 80000 },
+	"minimax/minimax-m3": { contextWindow: 524288 },
+	"moonshotai/kimi-k2-0905": { contextWindow: 98304 },
+	"nvidia/nemotron-3-super-120b-a12b": { contextWindow: 262144, maxTokens: 4096 },
+	// Preserve the existing output cap when OpenRouter leaves it unspecified.
+	"nvidia/nvidia-nemotron-3-ultra-550b-a55b": { contextWindow: 131072, maxTokens: 16384 },
+	// Enforced window is LARGER than OpenRouter's listing.
+	"qwen/qwen3-30b-a3b-instruct-2507": { contextWindow: 262144 },
+	// OpenRouter has no max_completion_tokens for the rest of these.
+	"moonshotai/kimi-k2.5": { maxTokens: 65535 },
+	"openai/gpt-4.1": { maxTokens: 32768 },
+	"openai/gpt-5-nano": { maxTokens: 128000 },
+	"openai/gpt-oss-20b": { maxTokens: 131072 },
+	"qwen/qwen3.5-397b-a17b": { maxTokens: 65536 },
+	"x-ai/grok-4.20": { maxTokens: 30000 },
+	"x-ai/grok-4.20-multi-agent": { maxTokens: 30000 },
+	"xiaomi/mimo-v2.5": { maxTokens: 131072 },
+	"z-ai/glm-5": { maxTokens: 131072 },
 };
+
+// Flagship models pinned above the long tail in the model picker, so the full
+// catalog doesn't flood /model. Everything else stays selectable via search.
+const PRIME_INFERENCE_FEATURED_MODELS = new Set([
+	"anthropic/claude-fable-5",
+	"anthropic/claude-haiku-4.5",
+	"anthropic/claude-opus-4.6",
+	"anthropic/claude-opus-4.7",
+	"anthropic/claude-opus-4.8",
+	"anthropic/claude-sonnet-4.5",
+	"anthropic/claude-sonnet-4.6",
+	"anthropic/claude-sonnet-5",
+	"deepseek/deepseek-v3.2",
+	"deepseek/deepseek-v4-flash",
+	"deepseek/deepseek-v4-pro",
+	"internal/glm-5.2-fast",
+	"minimax/minimax-m3",
+	"moonshotai/kimi-k2.7-code",
+	"nvidia/nemotron-3-nano-30b-a3b",
+	"nvidia/nemotron-3-super-120b-a12b",
+	"openai/gpt-5.3-codex",
+	"openai/gpt-5.4",
+	"openai/gpt-5.4-mini",
+	"openai/gpt-5.4-pro",
+	"openai/gpt-5.5",
+	"qwen/qwen3-30b-a3b-instruct-2507",
+	"qwen/qwen3-coder-next",
+	"qwen/qwen3-max",
+	"qwen/qwen3-vl-235b-a22b-thinking",
+	"x-ai/grok-4.20",
+	"x-ai/grok-4.20-multi-agent",
+	"z-ai/glm-5",
+	"z-ai/glm-5.1",
+	"z-ai/glm-5.2",
+]);
+
+// Prime ids whose OpenRouter listing uses a different id. internal/glm-5.2-fast
+// serves the same underlying model as z-ai/glm-5.2, so it borrows its metadata.
+const PRIME_INFERENCE_OPENROUTER_ALIASES: Record<string, string> = {
+	"internal/glm-5.2-fast": "z-ai/glm-5.2",
+	"nvidia/nvidia-nemotron-3-ultra-550b-a55b": "nvidia/nemotron-3-ultra-550b-a55b",
+};
+
+// Conservative fallbacks for catalog models with no OpenRouter match and no
+// override above: an under-declared window degrades gracefully, an
+// over-declared one breaks context tracking.
+const PRIME_INFERENCE_DEFAULT_CONTEXT_WINDOW = 128000;
+const PRIME_INFERENCE_DEFAULT_MAX_TOKENS = 8192;
+
+// Raw checkpoints and duplicate routes that would clutter the picker: BF16
+// exports, fine-tune outputs, zai-org/ and HF-cased twins of canonical ids.
+function isPrimeInferenceRawVariant(modelId: string): boolean {
+	const id = modelId.toLowerCase();
+	if (id.endsWith("-bf16") || id.includes(":")) {
+		return true;
+	}
+	const vendor = modelId.split("/")[0] ?? "";
+	return vendor === "zai-org" || vendor !== vendor.toLowerCase();
+}
 
 const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
 	"gpt-5.1",
@@ -164,6 +227,10 @@ const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
 	"gpt-5.4-mini",
 	"gpt-5.4-nano",
 	"gpt-5.5",
+	"gpt-5.6",
+	"gpt-5.6-sol",
+	"gpt-5.6-terra",
+	"gpt-5.6-luna",
 ]);
 
 function mergeThinkingLevelMap(model: Model<any>, map: NonNullable<Model<any>["thinkingLevelMap"]>): void {
@@ -175,7 +242,8 @@ function supportsOpenAiXhigh(modelId: string): boolean {
 		modelId.includes("gpt-5.2") ||
 		modelId.includes("gpt-5.3") ||
 		modelId.includes("gpt-5.4") ||
-		modelId.includes("gpt-5.5")
+		modelId.includes("gpt-5.5") ||
+		modelId.includes("gpt-5.6")
 	);
 }
 
@@ -212,6 +280,9 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (supportsOpenAiXhigh(model.id)) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
 	}
+	if (model.id.includes("gpt-5.6")) {
+		mergeThinkingLevelMap(model, { minimal: null, max: "max" });
+	}
 	// Per-family effort support per the Anthropic effort docs. Opus 4.6 / Sonnet 4.6
 	// have no xhigh; Fable 5 / Mythos 5 / Mythos Preview think every turn (off: null).
 	if (
@@ -226,7 +297,8 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 		model.id.includes("opus-4-7") ||
 		model.id.includes("opus-4.7") ||
 		model.id.includes("opus-4-8") ||
-		model.id.includes("opus-4.8")
+		model.id.includes("opus-4.8") ||
+		model.id.includes("sonnet-5")
 	) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh", max: "max" });
 	}
@@ -251,7 +323,11 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (model.provider === "groq" && model.id === "qwen/qwen3-32b") {
 		mergeThinkingLevelMap(model, { minimal: null, low: null, medium: null, high: "default" });
 	}
-	if (model.provider === "openai-codex" && supportsOpenAiXhigh(model.id)) {
+	if (
+		model.provider === "openai-codex" &&
+		supportsOpenAiXhigh(model.id) &&
+		!model.id.includes("gpt-5.6")
+	) {
 		mergeThinkingLevelMap(model, { minimal: "low" });
 	}
 	if (model.provider === "openai-codex" && model.id === "gpt-5.1-codex-mini") {
@@ -281,6 +357,94 @@ function getOptionalNumber(value: unknown): number | undefined {
 
 function getOptionalBoolean(value: unknown): boolean | undefined {
 	return typeof value === "boolean" ? value : undefined;
+}
+
+function readPrimeCliConfig(): Record<string, unknown> {
+	try {
+		const parsed = JSON.parse(readFileSync(join(homedir(), ".prime", "config.json"), "utf8"));
+		return isRecord(parsed) ? parsed : {};
+	} catch {
+		return {};
+	}
+}
+
+function getPrimeInferenceConfigValue(
+	envName: "PRIME_API_KEY" | "PRIME_TEAM_ID",
+	config: Record<string, unknown>,
+	configKeys: readonly string[],
+): string | undefined {
+	const fromEnv = process.env[envName]?.trim();
+	if (fromEnv) {
+		return fromEnv;
+	}
+
+	for (const key of configKeys) {
+		const value = config[key];
+		if (typeof value === "string" && value.trim()) {
+			return value.trim();
+		}
+	}
+
+	return undefined;
+}
+
+function getPrimeInferenceHeaders(apiKey: string | undefined, teamId: string | undefined): Record<string, string> | undefined {
+	const headers: Record<string, string> = {};
+	if (apiKey) {
+		headers.Authorization = `Bearer ${apiKey}`;
+	}
+	if (teamId) {
+		headers["X-Prime-Team-ID"] = teamId;
+	}
+
+	return Object.keys(headers).length > 0 ? headers : undefined;
+}
+
+function getExistingPrimeInferenceModels(): Model<"openai-completions">[] {
+	const models = EXISTING_MODELS["prime-inference"] as unknown as Record<string, Model<"openai-completions">>;
+	return Object.values(models)
+		.filter((model) => !isPrimeInferenceRawVariant(model.id))
+		.map((model) => ({
+			...model,
+			input: [...model.input],
+			cost: { ...model.cost },
+			...(model.compat ? { compat: { ...model.compat } } : {}),
+			...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
+			...(model.headers ? { headers: { ...model.headers } } : {}),
+		}));
+}
+
+function mergePrimeInferenceModels(
+	snapshotModels: Model<"openai-completions">[],
+	catalogModels: Model<"openai-completions">[],
+): Model<"openai-completions">[] {
+	const models = new Map<string, Model<"openai-completions">>();
+	for (const model of snapshotModels) {
+		models.set(model.id.toLowerCase(), model);
+	}
+	for (const model of catalogModels) {
+		models.set(model.id.toLowerCase(), model);
+	}
+	return Array.from(models.values());
+}
+
+function refreshPrimeInferenceAliasLimits(
+	snapshotModels: Model<"openai-completions">[],
+	catalogModels: Model<"openai-completions">[],
+): Model<"openai-completions">[] {
+	const liveModels = new Map(catalogModels.map((model) => [model.id.toLowerCase(), model]));
+	return snapshotModels.map((model) => {
+		const canonicalId = PRIME_INFERENCE_OPENROUTER_ALIASES[model.id.toLowerCase()];
+		const canonical = canonicalId ? liveModels.get(canonicalId) : undefined;
+		if (!canonical) {
+			return model;
+		}
+		return {
+			...model,
+			contextWindow: canonical.contextWindow,
+			maxTokens: canonical.maxTokens,
+		};
+	});
 }
 
 function includesCatalogCapability(value: unknown, capabilities: readonly string[]): boolean {
@@ -342,12 +506,13 @@ function isPrimeInferenceReasoningModel(modelId: string, catalogReasoning?: bool
 	return (
 		id.includes("thinking") ||
 		id.includes("deepseek-v4") ||
+		id.startsWith("internal/glm-") ||
 		id.startsWith("minimax/minimax-m") ||
 		id.startsWith("moonshotai/kimi") ||
 		id.startsWith("x-ai/grok-4") ||
 		id.startsWith("z-ai/glm-") ||
 		(id.startsWith("openai/gpt-5") && !id.includes("-chat")) ||
-		/^anthropic\/claude-(?:opus-4|sonnet-4)/.test(id)
+		/^anthropic\/claude-(?:fable-5|opus-4|sonnet-(?:4|5))/.test(id)
 	);
 }
 
@@ -359,7 +524,7 @@ function getPrimeInferenceCompat(modelId: string): OpenAICompletionsCompat {
 			...DEEPSEEK_V4_COMPAT,
 		};
 	}
-	if (id.startsWith("z-ai/glm-")) {
+	if (id.startsWith("z-ai/glm-") || id.startsWith("internal/glm-")) {
 		return {
 			...PRIME_INFERENCE_COMPAT,
 			...ZAI_THINKING_COMPAT,
@@ -400,64 +565,155 @@ function parsePrimeInferenceCatalog(data: unknown): PrimeInferenceCatalogEntry[]
 	});
 }
 
+interface PrimeInferenceOpenRouterMetadata {
+	contextWindow?: number;
+	maxTokens?: number;
+	vision: boolean;
+	reasoning: boolean;
+}
+
+function buildPrimeInferenceOpenRouterIndex(catalog: unknown[]): Map<string, PrimeInferenceOpenRouterMetadata> {
+	const index = new Map<string, PrimeInferenceOpenRouterMetadata>();
+	for (const item of catalog) {
+		if (!isRecord(item) || typeof item.id !== "string") {
+			continue;
+		}
+		const topProvider = isRecord(item.top_provider) ? item.top_provider : {};
+		const architecture = isRecord(item.architecture) ? item.architecture : {};
+		const modalities = Array.isArray(architecture.input_modalities) ? architecture.input_modalities : [];
+		const supportedParameters = Array.isArray(item.supported_parameters) ? item.supported_parameters : [];
+		index.set(item.id.toLowerCase(), {
+			contextWindow: getOptionalNumber(item.context_length) ?? getOptionalNumber(topProvider.context_length),
+			maxTokens: getOptionalNumber(topProvider.max_completion_tokens),
+			vision: modalities.includes("image"),
+			// Same signal the OpenRouter provider path uses; the top-level
+			// `reasoning` object over-reports (e.g. qwen3-max carries one despite
+			// not accepting reasoning params).
+			reasoning: supportedParameters.includes("reasoning"),
+		});
+	}
+	return index;
+}
+
+function getPrimeInferenceOpenRouterMetadata(
+	index: Map<string, PrimeInferenceOpenRouterMetadata>,
+	modelId: string,
+): PrimeInferenceOpenRouterMetadata | undefined {
+	const id = modelId.toLowerCase();
+	return index.get(PRIME_INFERENCE_OPENROUTER_ALIASES[id] ?? id);
+}
+
 async function fetchPrimeInferenceModels(): Promise<Model<"openai-completions">[]> {
-	const apiKey = process.env.PRIME_API_KEY;
+	const primeConfig = readPrimeCliConfig();
+	const apiKey = getPrimeInferenceConfigValue("PRIME_API_KEY", primeConfig, ["api_key", "apiKey"]);
+	const teamId = getPrimeInferenceConfigValue("PRIME_TEAM_ID", primeConfig, ["team_id", "teamId", "teamID"]);
+	let catalog: PrimeInferenceCatalogEntry[] = [];
 
 	try {
 		console.log("Fetching models from Prime Inference API...");
-		const headers = apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined;
 		const response = await fetch(`${PRIME_INFERENCE_BASE_URL}/models`, {
-			headers,
+			headers: getPrimeInferenceHeaders(apiKey, teamId),
 		});
-		const catalog = parsePrimeInferenceCatalog(await response.json());
-		if (catalog.length > 0) {
-			const models = catalog.flatMap((entry): Model<"openai-completions">[] => {
-				const metadata = PRIME_INFERENCE_MODEL_METADATA[entry.id.toLowerCase()];
-				return metadata === undefined ? [] : [createPrimeInferenceModel(entry, metadata)];
-			});
-			console.log(`Fetched ${models.length} curated models from Prime Inference`);
-			return models;
-		}
+		catalog = parsePrimeInferenceCatalog(await response.json());
 	} catch (error) {
 		console.error("Failed to fetch Prime Inference models:", error);
 	}
 
-	return [];
+	let openRouterIndex = new Map<string, PrimeInferenceOpenRouterMetadata>();
+	try {
+		openRouterIndex = buildPrimeInferenceOpenRouterIndex(await fetchOpenRouterCatalog());
+	} catch (error) {
+		console.error("Failed to fetch OpenRouter catalog for Prime Inference metadata:", error);
+	}
+	if (openRouterIndex.size === 0) {
+		// Without OpenRouter metadata every model would regress to the defaults;
+		// keep the previous snapshot instead.
+		console.error("OpenRouter catalog unavailable; keeping snapshot Prime Inference models");
+		return getExistingPrimeInferenceModels();
+	}
+
+	const catalogModels = catalog
+		.filter((entry) => !isPrimeInferenceRawVariant(entry.id))
+		.map((entry) =>
+			createPrimeInferenceModel(
+				entry,
+				PRIME_INFERENCE_MODEL_METADATA[entry.id.toLowerCase()],
+				getPrimeInferenceOpenRouterMetadata(openRouterIndex, entry.id),
+			),
+		);
+	let snapshotModels = getExistingPrimeInferenceModels();
+	if (catalog.length > 0) {
+		// A successful fetch is authoritative for public routes, so delisted
+		// models drop out automatically. Snapshot-only entries survive just for
+		// the team-gated internal/ namespace, which vanishes from the catalog
+		// when the fetch runs without team credentials. (Retiring an internal
+		// route therefore requires pruning it from models.generated.ts by hand.)
+		const liveIds = new Set(catalog.map((entry) => entry.id.toLowerCase()));
+		snapshotModels = snapshotModels.filter(
+			(model) => liveIds.has(model.id.toLowerCase()) || model.id.toLowerCase().startsWith("internal/"),
+		);
+	}
+	snapshotModels = refreshPrimeInferenceAliasLimits(snapshotModels, catalogModels);
+	const models = mergePrimeInferenceModels(snapshotModels, catalogModels);
+	console.log(`Loaded ${models.length} Prime Inference models (${catalogModels.length} from the live catalog)`);
+	return models;
 }
 
 function createPrimeInferenceModel(
 	entry: PrimeInferenceCatalogEntry,
-	metadata: PrimeInferenceModelMetadata,
+	override: PrimeInferenceModelMetadata | undefined,
+	openRouter: PrimeInferenceOpenRouterMetadata | undefined,
 ): Model<"openai-completions"> {
+	const vision = override?.vision ?? openRouter?.vision ?? false;
+	const contextWindow =
+		entry.contextWindow ??
+		override?.contextWindow ??
+		openRouter?.contextWindow ??
+		PRIME_INFERENCE_DEFAULT_CONTEXT_WINDOW;
+	// Sources are independent, so an OpenRouter output cap can exceed a
+	// gateway-measured window override; clamp to keep the pair coherent.
+	const maxTokens = Math.min(
+		entry.maxTokens ?? override?.maxTokens ?? openRouter?.maxTokens ?? PRIME_INFERENCE_DEFAULT_MAX_TOKENS,
+		contextWindow,
+	);
 	return {
 		id: entry.id,
-		name: getPrimeInferenceDisplayName(entry.id),
+		...(PRIME_INFERENCE_FEATURED_MODELS.has(entry.id.toLowerCase()) ? { featured: true } : {}),
+		name: override?.name ?? getPrimeInferenceDisplayName(entry.id),
 		api: "openai-completions",
 		provider: "prime-inference",
 		baseUrl: PRIME_INFERENCE_BASE_URL,
-		reasoning: isPrimeInferenceReasoningModel(entry.id, entry.reasoning),
-		input: metadata.vision ? ["text", "image"] : ["text"],
+		reasoning: isPrimeInferenceReasoningModel(entry.id, entry.reasoning ?? openRouter?.reasoning),
+		input: vision ? ["text", "image"] : ["text"],
 		cost: {
 			input: entry.input,
 			output: entry.output,
 			cacheRead: 0,
 			cacheWrite: 0,
 		},
-		contextWindow: entry.contextWindow ?? metadata.contextWindow,
-		maxTokens: entry.maxTokens ?? metadata.maxTokens,
+		contextWindow,
+		maxTokens,
 		compat: getPrimeInferenceCompat(entry.id),
 	};
 }
 
-async function fetchOpenRouterModels(): Promise<Model<any>[]> {
-	try {
+let openRouterCatalogPromise: Promise<any[]> | undefined;
+
+function fetchOpenRouterCatalog(): Promise<any[]> {
+	openRouterCatalogPromise ??= (async () => {
 		console.log("Fetching models from OpenRouter API...");
 		const response = await fetch("https://openrouter.ai/api/v1/models");
 		const data = await response.json();
+		return Array.isArray(data?.data) ? data.data : [];
+	})();
+	return openRouterCatalogPromise;
+}
 
+async function fetchOpenRouterModels(): Promise<Model<any>[]> {
+	try {
 		const models: Model<any>[] = [];
 
-		for (const model of data.data) {
+		for (const model of await fetchOpenRouterCatalog()) {
 			// Only include models that support tools
 			if (!model.supported_parameters?.includes("tools")) continue;
 
@@ -1736,6 +1992,42 @@ async function generateModels() {
 			maxTokens: CODEX_MAX_TOKENS,
 		},
 		{
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
+			contextWindow: CODEX_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
+			id: "gpt-5.6-terra",
+			name: "GPT-5.6 Terra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 3.125 },
+			contextWindow: CODEX_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
+			id: "gpt-5.6-luna",
+			name: "GPT-5.6 Luna",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 1, output: 6, cacheRead: 0.1, cacheWrite: 1.25 },
+			contextWindow: CODEX_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
 			id: "gpt-5.4-mini",
 			name: "GPT-5.4 Mini",
 			api: "openai-codex-responses",
@@ -2064,6 +2356,9 @@ export const MODELS = {
 			output += `\t\t\t},\n`;
 			output += `\t\t\tcontextWindow: ${model.contextWindow},\n`;
 			output += `\t\t\tmaxTokens: ${model.maxTokens},\n`;
+			if (model.featured) {
+				output += `\t\t\tfeatured: true,\n`;
+			}
 			output += `\t\t} satisfies Model<"${model.api}">,\n`;
 		}
 

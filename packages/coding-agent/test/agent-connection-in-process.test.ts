@@ -69,6 +69,11 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 	const listeners = new Set<AgentSessionEventListener>();
 	let unsubscriptions = 0;
 	const thinkingLevel: AgentConnectionState["thinkingLevel"] = "medium";
+	const buildSessionContext = () => ({
+		messages,
+		thinkingLevel,
+		model: null,
+	});
 	const session = {
 		sessionManager: {
 			getCwd: () => `/tmp/${id}`,
@@ -76,12 +81,9 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 			getLeafId: () => `${id}-leaf`,
 			getEntries: () => [],
 			getTree: () => [],
-			buildSessionContext: () => ({
-				messages,
-				thinkingLevel,
-				model: null,
-			}),
+			buildSessionContext,
 		},
+		buildSessionContext,
 		model: undefined,
 		thinkingLevel,
 		getAvailableThinkingLevels: () => ["minimal", "low", "medium", "high", "xhigh"],

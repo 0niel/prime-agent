@@ -118,9 +118,12 @@ rlm.harness.record_refinement(
 print(rlm.harness.overview())
 ```
 
-The store writes `harness_state.json` in the global agent harness directory
-(`RLM_HARNESS_STATE_DIR`, e.g. `~/.prime/agent/harness/`), so learned state is
-shared across sessions. Because the long-lived kernel and the host `/refine`
+The store writes `harness_state.json` in the session-local harness directory by
+default (`RLM_HARNESS_STATE_DIR`, falling back to `RLM_SESSION_DIR/harness`), so
+learned state stays with the session. Explicitly global edits go to the global
+agent harness directory (`RLM_GLOBAL_HARNESS_STATE_DIR`, e.g.
+`~/.prime/agent/harness/`), which is shared across sessions. Because the
+long-lived kernel and the host `/refine`
 command write the same file from separate processes, the kernel-side store
 reloads the file whenever its on-disk mtime changes before reading or mutating,
 so concurrent host edits are merged rather than clobbered. It is intentionally a

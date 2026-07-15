@@ -3,6 +3,7 @@ import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
+import { PRIME_INFERENCE_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "../src/core/provider-display-names.js";
 import { isApiKeyLoginProvider } from "../src/modes/interactive/auth-flows.js";
 import {
@@ -57,6 +58,22 @@ describe("OAuthSelectorComponent", () => {
 			"api_key:Anthropic",
 			"api_key:OpenAI",
 		]);
+	});
+
+	it("puts Prime Inference first within the same authentication state", () => {
+		const selector = new OAuthSelectorComponent(
+			"login",
+			AuthStorage.inMemory(),
+			[
+				{ id: "anthropic", name: "Anthropic", authType: "api_key" },
+				{ id: PRIME_INFERENCE_PROVIDER_ID, name: "Prime Inference", authType: "api_key" },
+			],
+			() => {},
+			() => {},
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(output.indexOf("Prime Inference")).toBeLessThan(output.indexOf("Anthropic"));
 	});
 
 	it("preserves auth type when selecting duplicate provider ids", () => {
@@ -143,6 +160,142 @@ describe("OAuthSelectorComponent", () => {
 		expect(output).not.toContain("unconfigured");
 	});
 
+	it("shows stale auth as expired instead of configured", () => {
+		const authStorage = AuthStorage.inMemory({
+			anthropic: {
+				type: "oauth",
+				access: "stale-access-token",
+				refresh: "refresh-token",
+				expires: Date.now() + 60_000,
+			},
+		});
+		authStorage.markAuthStale("anthropic");
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			[{ id: "anthropic", name: "Anthropic", authType: "oauth" }],
+			() => {},
+			() => {},
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+
+		expect(output).toContain("Anthropic");
+		expect(output).toContain("expired");
+		expect(output).not.toContain("configured");
+	});
+
+	it("does not sort stale auth ahead of configured providers", () => {
+		process.env.OPENAI_API_KEY = "test-openai-key";
+		const authStorage = AuthStorage.inMemory({
+			anthropic: {
+				type: "oauth",
+				access: "stale-access-token",
+				refresh: "refresh-token",
+				expires: Date.now() + 60_000,
+			},
+		});
+		authStorage.markAuthStale("anthropic");
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			[
+				{ id: "anthropic", name: "Anthropic", authType: "oauth" },
+				{ id: "openai", name: "OpenAI", authType: "api_key" },
+			],
+			() => {},
+			() => {},
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+
+		expect(output.indexOf("OpenAI")).toBeLessThan(output.indexOf("Anthropic"));
+		expect(output).toContain("expired");
+	});
+
+	it("sorts stale auth ahead of unconfigured providers", () => {
+		process.env.OPENAI_API_KEY = "test-openai-key";
+		const authStorage = AuthStorage.inMemory({
+			"prime-inference": {
+				type: "api_key",
+				key: "stale-prime-key",
+			},
+		});
+		authStorage.markAuthStale("prime-inference");
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			[
+				{ id: "github-copilot", name: "GitHub Copilot", authType: "oauth" },
+				{ id: "amazon-bedrock", name: "Amazon Bedrock", authType: "api_key" },
+				{ id: "prime-inference", name: "Prime Inference", authType: "api_key" },
+				{ id: "openai", name: "OpenAI", authType: "api_key" },
+			],
+			() => {},
+			() => {},
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+
+		expect(output.indexOf("OpenAI")).toBeLessThan(output.indexOf("Prime Inference"));
+		expect(output.indexOf("Prime Inference")).toBeLessThan(output.indexOf("GitHub Copilot"));
+		expect(output.indexOf("Prime Inference")).toBeLessThan(output.indexOf("Amazon Bedrock"));
+		expect(output).toContain("expired");
+	});
+
+	it("shows models.json auth instead of stale stored auth on API key rows", () => {
+		const authStorage = AuthStorage.inMemory({
+			anthropic: {
+				type: "oauth",
+				access: "stale-access-token",
+				refresh: "refresh-token",
+				expires: Date.now() + 60_000,
+			},
+		});
+		authStorage.markAuthStale("anthropic");
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			[{ id: "anthropic", name: "Anthropic", authType: "api_key" }],
+			() => {},
+			() => {},
+			() => ({ configured: true, source: "models_json_key" }),
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+
+		expect(output).toContain("Anthropic");
+		expect(output).toContain("key in models.json");
+		expect(output).not.toContain("subscription configured");
+		expect(output).not.toContain("expired");
+	});
+
+	it("shows stale stored auth as expired when models.json auth is active for the provider", () => {
+		const authStorage = AuthStorage.inMemory({
+			anthropic: {
+				type: "oauth",
+				access: "stale-access-token",
+				refresh: "refresh-token",
+				expires: Date.now() + 60_000,
+			},
+		});
+		authStorage.markAuthStale("anthropic");
+		const selector = new OAuthSelectorComponent(
+			"login",
+			authStorage,
+			[{ id: "anthropic", name: "Anthropic", authType: "oauth" }],
+			() => {},
+			() => {},
+			() => ({ configured: true, source: "models_json_key" }),
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+
+		expect(output).toContain("Anthropic");
+		expect(output).toContain("expired");
+		expect(output).not.toContain("configured");
+	});
+
 	it("shows custom provider environment API key auth from status resolver", () => {
 		const authStorage = AuthStorage.inMemory();
 		const selector = new OAuthSelectorComponent(
@@ -225,7 +378,7 @@ describe("OAuthSelectorComponent", () => {
 		expect(output).toContain("(6/12)");
 	});
 
-	it("shows Providers/Services tabs and switches with left/right arrows", () => {
+	it("shows Providers/MCP Connections tabs and switches with left/right arrows", () => {
 		const selector = new OAuthSelectorComponent(
 			"login",
 			AuthStorage.inMemory(),
@@ -240,18 +393,18 @@ describe("OAuthSelectorComponent", () => {
 		// Providers tab active first: provider shown, service hidden.
 		let output = stripAnsi(selector.render(120).join("\n"));
 		expect(output).toContain("Providers");
-		expect(output).toContain("Services");
+		expect(output).toContain("MCP Connections");
 		expect(output).toContain("Anthropic");
 		expect(output).not.toContain("Serper");
 
-		// Right arrow switches to the Services tab.
+		// Right arrow switches to the MCP Connections tab.
 		selector.handleInput("\x1b[C");
 		output = stripAnsi(selector.render(120).join("\n"));
 		expect(output).toContain("Serper (web search)");
 		expect(output).not.toContain("Anthropic");
 	});
 
-	it("selecting on the Services tab returns the service entry", () => {
+	it("selecting on the MCP Connections tab returns the service entry", () => {
 		let chosen: string | undefined;
 		const selector = new OAuthSelectorComponent(
 			"login",
@@ -266,9 +419,42 @@ describe("OAuthSelectorComponent", () => {
 			() => {},
 		);
 
-		selector.handleInput("\x1b[C"); // -> Services tab
+		selector.handleInput("\x1b[C"); // -> MCP Connections tab
 		selector.handleInput("\r"); // confirm
 		expect(chosen).toBe("serper");
+	});
+
+	it("can open with the MCP Connections tab active", () => {
+		const selector = new OAuthSelectorComponent(
+			"login",
+			AuthStorage.inMemory(),
+			[
+				{ id: "anthropic", name: "Anthropic", authType: "oauth", category: "provider" },
+				{ id: "serper", name: "Serper (web search)", authType: "api_key", category: "service" },
+			],
+			() => {},
+			() => {},
+			undefined,
+			{ initialCategory: "service" },
+		);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(output).toContain("Serper (web search)");
+		expect(output).not.toContain("Anthropic");
+	});
+
+	it("falls back when the requested initial category is unavailable", () => {
+		const selector = new OAuthSelectorComponent(
+			"login",
+			AuthStorage.inMemory(),
+			[{ id: "anthropic", name: "Anthropic", authType: "oauth", category: "provider" }],
+			() => {},
+			() => {},
+			undefined,
+			{ initialCategory: "service" },
+		);
+
+		expect(stripAnsi(selector.render(120).join("\n"))).toContain("Anthropic");
 	});
 
 	it("shows no tab bar when only one category is present", () => {

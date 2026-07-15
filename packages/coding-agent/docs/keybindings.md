@@ -113,6 +113,15 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | `app.provider.add` | `ctrl+p` | Add provider from the model selector |
 | `app.thinking.toggle` | `ctrl+t` | Collapse or expand thinking blocks |
 
+### Configuration Menu
+
+Used inside the shared Providers, Models, and MCP Connections menu. When a search field contains text, its cursor movement takes precedence over these default arrow bindings.
+
+| Keybinding id | Default | Description |
+|--------|---------|-------------|
+| `app.configuration.previousTab` | `left` | Open the previous configuration tab |
+| `app.configuration.nextTab` | `right` | Open the next configuration tab |
+
 ### Display and Message Queue
 
 | Keybinding id | Default | Description |

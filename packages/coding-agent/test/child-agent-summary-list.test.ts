@@ -4,7 +4,7 @@ import {
 	type ChildAgentInspectorNode,
 	ChildAgentSummaryComponent,
 } from "../src/modes/interactive/components/child-agent-inspector.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 import { setWorkingPulseFrame, workingIconFrame } from "../src/modes/interactive/theme/working-icon.js";
 
 function stripAnsi(text: string): string {
@@ -12,7 +12,7 @@ function stripAnsi(text: string): string {
 }
 
 function node(id: string, status: ChildAgentInspectorNode["status"] = "running"): ChildAgentInspectorNode {
-	return { id, label: id, status, sessionDir: `/tmp/${id}`, transcript: [] };
+	return { id, label: id, status, sessionDir: `/tmp/${id}` };
 }
 
 describe("ChildAgentSummaryComponent inline list", () => {
@@ -37,6 +37,38 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		const rowLines = lines.filter((line) => /[◇◈◆✓✗]/.test(line));
 		expect(rowLines.length).toBe(5);
 		expect(lines.join("\n")).toContain("2 below");
+	});
+
+	it("keeps the active agents visible when a previously selected agent finishes", () => {
+		const summary = new ChildAgentSummaryComponent();
+		summary.setNodes([node("a"), node("b"), node("c"), node("d"), node("e"), node("f")]);
+		summary.selectNode("a");
+		summary.setNodes([node("a", "done"), node("b"), node("c"), node("d"), node("e"), node("f")]);
+		const out = summary.render(80).map(stripAnsi).join("\n");
+		expect(out).toContain("b");
+		expect(out).toContain("f");
+		expect(out).not.toContain(" a ");
+	});
+
+	it("shows tool and token usage beside each subagent", () => {
+		const summary = new ChildAgentSummaryComponent();
+		summary.setNodes([{ ...node("a"), toolUseCount: 3, tokenCount: 41_000 }]);
+		const out = stripAnsi(summary.render(80).join("\n"));
+		expect(out).toContain("3 tools");
+		expect(out).toContain("41k tok");
+	});
+
+	it("shows recaps in a fixed column and falls back to activity", () => {
+		const summary = new ChildAgentSummaryComponent();
+		summary.setNodes([
+			{ ...node("short"), recap: "Inspecting the scheduler queue" },
+			{ ...node("a much longer starting prompt"), activity: { kind: "executing", toolName: "ipython" } },
+		]);
+		const lines = summary.render(100).map(stripAnsi);
+		expect(lines.join("\n")).toContain("Inspecting the scheduler queue");
+		expect(lines.join("\n")).toContain("Executing ipython");
+		expect(lines[0]?.indexOf("Inspecting")).toBe(lines[1]?.indexOf("Executing"));
+		expect(lines.join("\n")).not.toContain("│");
 	});
 
 	it("scrolls the window and updates the indicator as selection moves down", () => {
@@ -77,18 +109,77 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		expect(opened).toBe("c");
 	});
 
-	it("prefixes rows with a fixed-width Subagent N column", () => {
+	it("uses compact fixed-width S-number labels", () => {
 		const summary = new ChildAgentSummaryComponent();
 		summary.setNodes([node("first task"), node("second task")]);
 		const out = stripAnsi(summary.render(80).join("\n"));
-		expect(out).toContain("Subagent 1");
-		expect(out).toContain("Subagent 2");
+		expect(out).toContain("S1");
+		expect(out).toContain("S2");
+		expect(out).not.toContain("Subagent");
+		expect(out).not.toContain("↳");
+	});
+
+	it("aligns the row icon and label with the agents-view tray hint", () => {
+		const summary = new ChildAgentSummaryComponent(() => "← agents view");
+		summary.setNodes([node("task", "done")]);
+		const [infoLine = "", row = ""] = summary.render(80).map(stripAnsi);
+		expect(row.indexOf("✓")).toBe(infoLine.indexOf("←"));
+		expect(row.indexOf("S1")).toBe(infoLine.indexOf("agents"));
+	});
+
+	it("keeps truncation ellipses in the prompt color", () => {
+		const summary = new ChildAgentSummaryComponent();
+		summary.setNodes([{ ...node("a"), label: "A starting prompt that is much too long for its fixed column" }]);
+		const out = summary.render(80).join("\n");
+		const ellipsisIndex = out.indexOf("…");
+		const beforeEllipsis = out.slice(0, ellipsisIndex);
+		const dimStart = theme.fg("dim", "").replace("\x1b[39m", "");
+		expect(ellipsisIndex).toBeGreaterThan(0);
+		expect(beforeEllipsis.lastIndexOf(dimStart)).toBeGreaterThan(beforeEllipsis.lastIndexOf("\x1b[39m"));
+		expect(out[ellipsisIndex - 1]).not.toBe(" ");
+	});
+
+	it("keeps the selected background active across the entire row", () => {
+		const summary = new ChildAgentSummaryComponent();
+		summary.focused = true;
+		summary.setNodes([
+			{
+				...node("a"),
+				label: "A starting prompt that is much too long for its fixed column",
+				recap: "A recap that is also much too long for its fixed column and must be truncated",
+				toolUseCount: 3,
+				tokenCount: 41_000,
+				durationMs: 5_000,
+			},
+		]);
+		const [line] = summary.render(80);
+		const backgroundStart = theme.bg("selectedBg", "").replace("\x1b[49m", "");
+		expect(line?.startsWith(backgroundStart)).toBe(true);
+		expect(line?.endsWith("\x1b[49m")).toBe(true);
+		expect(line).not.toContain("\x1b[0m");
+	});
+
+	it("adds extra space between token count and duration", () => {
+		const summary = new ChildAgentSummaryComponent();
+		summary.setNodes([{ ...node("a"), tokenCount: 41_000, durationMs: 5_000 }]);
+		const out = stripAnsi(summary.render(80).join("\n"));
+		expect(out).toMatch(/41k tok\s{3}5s/);
+	});
+
+	it("keeps the starting prompt compact so the recap gets more room", () => {
+		const summary = new ChildAgentSummaryComponent();
+		const prompt = "Investigate every scheduler dispatch path and identify all possible starvation conditions";
+		summary.setNodes([{ ...node("a"), label: prompt, recap: "Found an unfair queue rotation" }]);
+		const out = stripAnsi(summary.render(100).join("\n"));
+		expect(out).not.toContain(prompt);
+		expect(out).toContain("Investigate every");
+		expect(out).toContain("Found an unfair queue rotation");
 	});
 
 	it("never exceeds the row width with wide (CJK) characters", () => {
 		const wide = "実行するタスクは非常に長い説明を含んでいてこれは折り返しのテストです".repeat(3);
 		const summary = new ChildAgentSummaryComponent();
-		summary.setNodes([{ ...node("a"), label: wide }]);
+		summary.setNodes([{ ...node("a"), label: wide, recap: wide, toolUseCount: 12, tokenCount: 912_000 }]);
 		for (const width of [40, 60, 80]) {
 			for (const line of summary.render(width)) {
 				expect(visibleWidth(line)).toBeLessThanOrEqual(width);
@@ -116,8 +207,8 @@ describe("ChildAgentSummaryComponent inline list", () => {
 			{ ...node("b"), label: `${prefix}120 seconds then report done` },
 		]);
 		const out = stripAnsi(summary.render(130).join("\n"));
-		expect(out).toContain("30 seconds");
-		expect(out).toContain("120 seconds");
+		expect(out).toContain("exactly 30");
+		expect(out).toContain("exactly 120");
 	});
 
 	it("windows tightly around the diff when prompts share a head and tail", () => {
@@ -147,13 +238,6 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		// Ctrl+O isn't a list key, so it should bubble to the chat action handler.
 		summary.handleInput("\x0f");
 		expect(forwarded).toBe("\x0f");
-	});
-
-	it("renders a separator line above the list", () => {
-		const summary = new ChildAgentSummaryComponent();
-		summary.setNodes([node("only")]);
-		const lines = summary.render(40).map(stripAnsi);
-		expect(lines.some((line) => line.includes("─"))).toBe(true);
 	});
 
 	it("opens the selected subagent's detail on confirm", () => {

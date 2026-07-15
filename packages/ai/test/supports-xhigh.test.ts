@@ -34,6 +34,22 @@ describe("getSupportedThinkingLevels", () => {
 		expect(levels).not.toContain("xhigh");
 	});
 
+	it("includes both xhigh and max for Anthropic Sonnet 5 on anthropic-messages API", () => {
+		const model = getModel("anthropic", "claude-sonnet-5");
+		expect(model).toBeDefined();
+		const levels = getSupportedThinkingLevels(model!);
+		expect(levels).toContain("xhigh");
+		expect(levels).toContain("max");
+		expect(model!.contextWindow).toBe(1000000);
+		expect(model!.maxTokens).toBe(128000);
+		expect(model!.cost).toEqual({
+			input: 2,
+			output: 10,
+			cacheRead: 0.2,
+			cacheWrite: 2.5,
+		});
+	});
+
 	it("does not include max for older budget-based Claude models", () => {
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		expect(model).toBeDefined();
@@ -50,6 +66,29 @@ describe("getSupportedThinkingLevels", () => {
 		const model = getModel("openai-codex", modelId);
 		expect(model).toBeDefined();
 		expect(getSupportedThinkingLevels(model!)).toContain("xhigh");
+	});
+
+	it.each(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] as const)(
+		"includes xhigh and max for %s through the OpenAI API and Codex subscription",
+		(modelId) => {
+			const apiModel = getModel("openai", modelId);
+			const codexModel = getModel("openai-codex", modelId);
+
+			expect(apiModel).toBeDefined();
+			expect(codexModel).toBeDefined();
+			expect(getSupportedThinkingLevels(apiModel!)).toEqual(["off", "low", "medium", "high", "xhigh", "max"]);
+			expect(getSupportedThinkingLevels(codexModel!)).toEqual(["off", "low", "medium", "high", "xhigh", "max"]);
+			expect(apiModel!.contextWindow).toBe(1050000);
+			expect(apiModel!.maxTokens).toBe(128000);
+			expect(codexModel!.contextWindow).toBe(272000);
+			expect(codexModel!.maxTokens).toBe(128000);
+		},
+	);
+
+	it("supports disabling reasoning for the base GPT-5.6 API alias", () => {
+		const model = getModel("openai", "gpt-5.6");
+		expect(model).toBeDefined();
+		expect(getSupportedThinkingLevels(model!)).toContain("off");
 	});
 
 	it("includes only high/xhigh plus off for DeepSeek V4 Flash on the DeepSeek provider", () => {

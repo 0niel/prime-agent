@@ -82,9 +82,9 @@ function parseArgs(argv: string[]): Args {
 				turns = Number.parseInt(value, 10);
 				break;
 			}
-			case "--session": {
+			case "--output": {
 				const value = argv[++i];
-				if (!value) throw new Error("Missing value for --session");
+				if (!value) throw new Error("Missing value for --output");
 				sessionPath = resolve(value);
 				break;
 			}
@@ -127,7 +127,7 @@ function printHelp(): void {
 
 Options:
   --turns <n>         Number of turns to run. Must be between ${MIN_TURNS} and ${MAX_TURNS}. Default: ${DEFAULT_TURNS}
-  --session <path>    Specific session jsonl file to write
+  --output <path>     JSONL file to write
   --transport <mode>  sse | websocket | websocket-cached | auto. Default: sse
   --max-tokens <n>    Max output tokens per subrequest. Default: ${DEFAULT_MAX_TOKENS}
   --help              Show this message

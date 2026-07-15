@@ -12,28 +12,100 @@ import {
 } from "../src/modes/daemon/daemon-session-list.js";
 
 describe("buildSessionList", () => {
-	it("derives active session statuses", () => {
+	it("derives active session lifecycle and activity", () => {
+		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
+		const currentSummary = { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"];
 		const entries = buildSessionList(
 			[
-				makeState({ activeSessionId: "model", sessionFile: "/tmp/model.jsonl", isStreaming: true }),
+				makeState({
+					activeSessionId: "model",
+					sessionFile: "/tmp/model.jsonl",
+					isStreaming: true,
+					messages: oneMessage,
+				}),
 				makeState({
 					activeSessionId: "tool",
 					sessionFile: "/tmp/tool.jsonl",
 					isStreaming: true,
 					pendingToolCalls: ["tool-1"],
+					messages: oneMessage,
 				}),
-				makeState({ activeSessionId: "needs-user", sessionFile: "/tmp/needs-user.jsonl", clients: 1 }),
-				makeState({ activeSessionId: "done", sessionFile: "/tmp/done.jsonl" }),
+				makeState({
+					activeSessionId: "needs-user",
+					sessionFile: "/tmp/needs-user.jsonl",
+					clients: 1,
+					messages: oneMessage,
+					summaryState: currentSummary,
+				}),
+				makeState({
+					activeSessionId: "done",
+					sessionFile: "/tmp/done.jsonl",
+					messages: oneMessage,
+					summaryState: currentSummary,
+				}),
 			],
 			[],
 		);
 
-		expect(entries.map((entry) => [entry.id, entry.status])).toEqual([
-			["model", "model"],
-			["tool", "tool"],
-			["needs-user", "user"],
-			["done", "idle"],
+		expect(entries.map((entry) => [entry.id, entry.lifecycle, entry.activity])).toEqual([
+			["model", "live", "working"],
+			["tool", "live", "working"],
+			["needs-user", "live", "idle"],
+			["done", "live", "idle"],
 		]);
+	});
+
+	it("keeps a session working while background subagents run", () => {
+		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
+		const entries = buildSessionList(
+			[
+				makeState({
+					activeSessionId: "parent",
+					sessionFile: "/tmp/parent.jsonl",
+					isStreaming: false,
+					hasRunningRlmChildren: true,
+					messages: oneMessage,
+					summaryState: { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"],
+				}),
+			],
+			[],
+		);
+		expect(entries[0]?.activity).toBe("working");
+		expect(entries[0]?.hasRunningRlmChildren).toBe(true);
+	});
+
+	it("counts accepted in-flight agent prompts as pending work", () => {
+		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
+		const summary = summaryForActiveSession(
+			makeState({
+				activeSessionId: "accepted",
+				messages: oneMessage,
+				summaryState: { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"],
+				hasAcceptedPromptInFlight: true,
+			}),
+		);
+
+		expect(summary.pendingMessageCount).toBe(1);
+		expect(summary.activity).toBe("working");
+	});
+
+	it("marks a finished subagent idle instead of holding it at working", () => {
+		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
+		const entries = buildSessionList(
+			[
+				makeState({
+					activeSessionId: "child",
+					sessionFile: "/tmp/child.jsonl",
+					isStreaming: false,
+					hasRunningRlmChildren: false,
+					messages: oneMessage,
+					// No current summary verdict — a resident finished subagent never gets one.
+					metadata: { kind: "subagent", createdAt: 1, parentActiveSessionId: "parent", rlmChildId: "c1" },
+				}),
+			],
+			[],
+		);
+		expect(entries[0]?.activity).toBe("idle");
 	});
 
 	it("merges active records with saved sessions and marks inactive sessions", () => {
@@ -42,22 +114,118 @@ describe("buildSessionList", () => {
 		const crashedPath = resolve("/tmp/project/crashed.jsonl");
 		const savedSessions = [
 			makeSessionInfo({ path: activePath, id: "saved-active", name: "active saved" }),
-			makeSessionInfo({ path: sleepingPath, id: "saved-sleeping", name: "sleeping saved" }),
+			makeSessionInfo({
+				path: sleepingPath,
+				id: "saved-sleeping",
+				name: "sleeping saved",
+				state: { status: "archived" },
+			}),
 			makeSessionInfo({ path: crashedPath, id: "saved-crashed", state: { status: "crash" } }),
 		];
 
 		const entries = buildSessionList(
-			[makeState({ activeSessionId: "active-1", sessionFile: activePath, sessionId: "saved-active" })],
+			[
+				makeState({
+					activeSessionId: "active-1",
+					sessionFile: activePath,
+					sessionId: "saved-active",
+					messages: [{ role: "user", content: "hi" }] as unknown as AgentMessage[],
+					summaryState: { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"],
+				}),
+			],
 			savedSessions,
 		);
 
 		expect(entries).toHaveLength(3);
-		expect(entries.map((entry) => [entry.id, entry.sessionId, entry.status])).toEqual([
-			["active-1", "saved-active", "idle"],
-			["saved-sleeping", "saved-sleeping", "sleep"],
-			["saved-crashed", "saved-crashed", "crash"],
+		expect(entries.map((entry) => [entry.id, entry.sessionId, entry.lifecycle, entry.activity])).toEqual([
+			["active-1", "saved-active", "live", "idle"],
+			["saved-sleeping", "saved-sleeping", "archived", "idle"],
+			["saved-crashed", "saved-crashed", "archived", "idle"],
 		]);
 		expect(entries[0]!.sessionName).toBe("session active-1");
+	});
+
+	it("treats a message-less on-disk active session as a hidden draft", () => {
+		const emptyPath = resolve("/tmp/project/empty.jsonl");
+		const usedPath = resolve("/tmp/project/used.jsonl");
+		const entries = buildSessionList(
+			[],
+			[
+				// Active record, no messages: a draft, hidden from the view (lifecycle is
+				// message-based; any config it holds is still preserved on disk).
+				makeSessionInfo({
+					path: emptyPath,
+					id: "empty",
+					messageCount: 0,
+					name: "named draft",
+					state: { status: "active" },
+				}),
+				// Active record with a message: a real conversation, stays live.
+				makeSessionInfo({
+					path: usedPath,
+					id: "used",
+					messageCount: 1,
+					state: { status: "active" },
+				}),
+			],
+		);
+		expect(entries.map((entry) => [entry.id, entry.lifecycle])).toEqual([
+			["empty", "draft"],
+			["used", "live"],
+		]);
+	});
+
+	it("shows an off-daemon session with messages but no lifecycle entry as live", () => {
+		// Older sessions never wrote a session_state entry; a missing state must not
+		// be treated as archived, or those conversations vanish from the view.
+		const [entry] = buildSessionList(
+			[],
+			[
+				makeSessionInfo({
+					path: resolve("/tmp/project/legacy.jsonl"),
+					id: "legacy",
+					messageCount: 4,
+					state: undefined,
+				}),
+			],
+		);
+		expect(entry?.lifecycle).toBe("live");
+	});
+
+	it("carries the persisted recap and verdict for off-daemon sessions", () => {
+		const path = resolve("/tmp/project/done.jsonl");
+		const [entry] = buildSessionList(
+			[],
+			[
+				makeSessionInfo({
+					path,
+					id: "done",
+					messageCount: 3,
+					state: { status: "active" },
+					agentStatus: { summary: "Shipped the fix", taskState: "completed", basedOnMessageCount: 3 },
+				}),
+			],
+		);
+		expect(entry).toMatchObject({ summary: "Shipped the fix", taskState: "completed" });
+	});
+
+	it("drops a stale persisted verdict when later messages outpaced it", () => {
+		const path = resolve("/tmp/project/stale.jsonl");
+		const [entry] = buildSessionList(
+			[],
+			[
+				makeSessionInfo({
+					path,
+					id: "stale",
+					messageCount: 5,
+					state: { status: "active" },
+					// Verdict was based on an earlier turn (3 < 5), so it must not show.
+					agentStatus: { summary: "Old recap", taskState: "completed", basedOnMessageCount: 3 },
+				}),
+			],
+		);
+		expect(entry?.summary).toBeUndefined();
+		expect(entry?.taskState).toBeUndefined();
 	});
 
 	it("includes active subagent parent metadata", () => {
@@ -153,8 +321,15 @@ describe("buildRlmChildSnapshots", () => {
 			},
 			messages: [
 				{ role: "user", content: "Summarize the repo layout" },
-				{ role: "assistant", content: [{ type: "text", text: "The repo is an npm workspace." }] },
+				{
+					role: "assistant",
+					content: [
+						{ type: "text", text: "The repo is an npm workspace." },
+						{ type: "toolCall", id: "tool-1", name: "ipython", arguments: {} },
+					],
+				},
 			] as AgentMessage[],
+			contextTokens: 41_000,
 		});
 		const grandchild = makeState({
 			activeSessionId: "grandchild",
@@ -187,11 +362,10 @@ describe("buildRlmChildSnapshots", () => {
 		expect(snapshots[0]).toMatchObject({
 			label: "Summarize the repo layout",
 			answerPreview: "The repo is an npm workspace.",
+			toolUseCount: 1,
+			tokenCount: 41_000,
 			sessionDir: "/tmp/artifacts/sub-aaa",
-			transcript: [
-				{ role: "user", text: "Summarize the repo layout" },
-				{ role: "assistant", text: "The repo is an npm workspace." },
-			],
+			activeSessionId: "child",
 		});
 	});
 
@@ -222,6 +396,32 @@ describe("buildRlmChildSnapshots", () => {
 		expect(snapshots.map((snapshot) => [snapshot.id, snapshot.status])).toEqual([["sub-aaa", "running"]]);
 	});
 
+	it("includes in-flight assistant output in child snapshots", () => {
+		const parent = makeState({ activeSessionId: "parent" });
+		const child = makeState({
+			activeSessionId: "child",
+			isStreaming: true,
+			metadata: {
+				kind: "subagent",
+				createdAt: 1,
+				parentActiveSessionId: "parent",
+				rlmChildId: "sub-aaa",
+			},
+			streamingMessage: {
+				role: "assistant",
+				content: [
+					{ type: "text", text: "Still investigating" },
+					{ type: "toolCall", id: "tool-1", name: "search", arguments: {} },
+				],
+			} as AgentMessage,
+		});
+
+		expect(buildRlmChildSnapshots("parent", [parent, child])[0]).toMatchObject({
+			answerPreview: "Still investigating",
+			toolUseCount: 1,
+		});
+	});
+
 	it("returns no snapshots for sessions without children", () => {
 		const solo = makeState({ activeSessionId: "solo" });
 		expect(buildRlmChildSnapshots("solo", [solo])).toEqual([]);
@@ -234,7 +434,8 @@ describe("resolveAttachModelFallbackMessage", () => {
 	function makeSummary(overrides: Partial<SessionSummary>): SessionSummary {
 		return {
 			id: "active-1",
-			status: "idle",
+			lifecycle: "draft",
+			activity: "idle",
 			sessionId: "session-1",
 			cwd: "/tmp/project",
 			isStreaming: false,
@@ -271,8 +472,13 @@ interface StateOptions {
 	pendingToolCalls?: string[];
 	clients?: number;
 	messages?: AgentMessage[];
+	hasUserContent?: boolean;
 	summaryState?: ActiveSessionState["summaryState"];
 	childRunStatuses?: Record<string, "queued" | "running" | "done" | "error" | "cancelled">;
+	hasRunningRlmChildren?: boolean;
+	hasAcceptedPromptInFlight?: boolean;
+	contextTokens?: number;
+	streamingMessage?: AgentMessage;
 	metadata?: {
 		kind: "top-level" | "subagent";
 		createdAt: number;
@@ -311,12 +517,17 @@ function makeState(options: StateOptions): ActiveSessionState {
 				sessionManager: {
 					getCwd: () => "/tmp/project",
 					getSessionDir: () => "/tmp/sessions",
+					hasUserContent: () => options.hasUserContent ?? false,
 				},
 				messages: options.messages ?? ([] as AgentMessage[]),
 				getRlmChildRunStatus: (childId: string) => options.childRunStatuses?.[childId],
+				hasRunningRlmChildren: () => options.hasRunningRlmChildren ?? false,
+				hasAcceptedPromptInFlight: options.hasAcceptedPromptInFlight ?? false,
+				getCurrentRecap: () => undefined,
+				_contextTokensForCurrentMessages: () => options.contextTokens,
 				pendingMessageCount: 0,
 				state: {
-					streamingMessage: undefined,
+					streamingMessage: options.streamingMessage,
 					pendingToolCalls: new Set(options.pendingToolCalls ?? []),
 				},
 			},
@@ -333,8 +544,9 @@ function makeSessionInfo(overrides: Pick<SessionInfo, "path" | "id"> & Partial<S
 		state: overrides.state,
 		created: new Date("2026-05-01T00:00:00.000Z"),
 		modified: new Date("2026-05-02T00:00:00.000Z"),
-		messageCount: 2,
+		messageCount: overrides.messageCount ?? 2,
 		firstMessage: "hello",
 		allMessagesText: "hello world",
+		agentStatus: overrides.agentStatus,
 	};
 }

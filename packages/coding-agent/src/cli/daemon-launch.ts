@@ -78,7 +78,11 @@ async function probeDaemonVersion(socketPath: string): Promise<DaemonVersionProb
 }
 
 export async function listActiveDaemonSessionSummaries(client: DaemonClient): Promise<SessionSummary[]> {
-	const response = await client.request({ type: "list" });
+	const hello = await client.waitForHello(2000).catch(() => undefined);
+	const response =
+		hello && hello.protocol.version < DAEMON_PROTOCOL_VERSION
+			? await client.requestLegacy({ type: "list" })
+			: await client.request({ type: "list" });
 	if (!response.success) {
 		throw new Error(response.error);
 	}
@@ -107,28 +111,41 @@ export class StaleDaemonError extends Error {
 	}
 }
 
-async function waitForDaemonGone(socketPath: string, timeoutMs = 5000): Promise<boolean> {
+async function waitForDaemonGone(socketPath: string, timeoutMs = 5000, requireSocketCleanup = false): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
-		if (!(await canConnectToDaemon(socketPath, 250))) {
+		if (
+			!(await canConnectToDaemon(socketPath, 250)) &&
+			(!requireSocketCleanup || process.platform === "win32" || !existsSync(socketPath))
+		) {
 			return true;
 		}
 		await delay(25);
 	}
-	return false;
+	// A daemon can exit without removing its Unix socket (for example, after a crash
+	// during shutdown). Once the cleanup grace has elapsed, a non-listening socket
+	// is safe for the replacement daemon's guarded startup path to reclaim.
+	return requireSocketCleanup && !(await canConnectToDaemon(socketPath, 250));
 }
 
-export async function shutdownDaemonAndWait(socketPath: string): Promise<boolean> {
+export async function shutdownDaemonAndWait(socketPath: string, timeoutMs = 5000): Promise<boolean> {
 	const client = new DaemonClient(socketPath);
+	let shutdownAccepted = false;
 	try {
 		await client.connect(1000);
-		await client.request({ type: "shutdown" }).catch(() => undefined);
+		const hello = await client.waitForHello(2000).catch(() => undefined);
+		const request =
+			hello && hello.protocol.version < DAEMON_PROTOCOL_VERSION
+				? client.requestLegacy.bind(client)
+				: client.request.bind(client);
+		const response = await request({ type: "shutdown" }).catch(() => undefined);
+		shutdownAccepted = response?.success === true;
 	} catch {
 		// A connect failure isn't treated as "gone"; waitForDaemonGone is the source of truth.
 	} finally {
 		client.close();
 	}
-	return waitForDaemonGone(socketPath);
+	return waitForDaemonGone(socketPath, timeoutMs, shutdownAccepted);
 }
 
 // activeSessions is undefined when the daemon is reachable but its sessions couldn't
@@ -138,7 +155,13 @@ export type RunningDaemonProbe = { reachable: false } | { reachable: true; activ
 export function isSessionBusy(summary: SessionSummary): boolean {
 	// pendingMessageCount covers queued steering/follow-ups, which live only in
 	// memory and would be lost if the daemon were stopped.
-	return summary.isStreaming || summary.isCompacting || summary.pendingMessageCount > 0;
+	return (
+		summary.isStreaming ||
+		summary.isCompacting ||
+		summary.isBashRunning === true ||
+		summary.hasRunningRlmChildren === true ||
+		summary.pendingMessageCount > 0
+	);
 }
 
 export async function probeRunningDaemonSessions(socketPath: string): Promise<RunningDaemonProbe> {
@@ -251,9 +274,12 @@ export function ensureInteractiveDaemonRunning(socketPath: string, spawnCwd?: st
 	if (!promise) {
 		promise = ensureDaemonRunning(socketPath, spawnCwd);
 		ensurePromises.set(socketPath, promise);
-		promise.catch(() => {
-			ensurePromises.delete(socketPath);
-		});
+		const clear = () => {
+			if (ensurePromises.get(socketPath) === promise) {
+				ensurePromises.delete(socketPath);
+			}
+		};
+		promise.then(clear, clear);
 	}
 	return promise;
 }

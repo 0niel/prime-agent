@@ -328,17 +328,21 @@ export {
 	type RpcSessionState,
 	runPrintMode,
 	runRpcMode,
-	type SessionStatus,
+	type SessionActivity,
+	type SessionLifecycle,
 	type SessionSummary,
 } from "./modes/index.js";
 // UI components for extensions
 export {
+	AgentMessageComponent,
 	ArminComponent,
 	AssistantMessageComponent,
 	BashExecutionComponent,
 	BorderedLoader,
 	BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent,
+	ConfigurationMenuComponent,
+	type ConfigurationMenuTab,
 	CustomEditor,
 	CustomMessageComponent,
 	DynamicBorder,

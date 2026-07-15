@@ -2,6 +2,7 @@
  * Model registry - manages built-in and custom models, provides API key resolution.
  */
 
+import { createHash } from "node:crypto";
 import {
 	type AnthropicMessagesCompat,
 	type Api,
@@ -18,6 +19,7 @@ import {
 	resetApiProviders,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
 import { registerOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
@@ -25,7 +27,7 @@ import { type Static, type TProperties, Type } from "typebox";
 import type { Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir } from "../config.js";
-import type { AuthStatus, AuthStorage } from "./auth-storage.js";
+import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
 import { BUILT_IN_PROVIDER_DISPLAY_NAMES } from "./provider-display-names.js";
 import {
 	clearConfigValueCache,
@@ -245,6 +247,15 @@ interface ProviderRequestConfig {
 	authHeader?: boolean;
 }
 
+type ProviderRequestAuthSource = {
+	source: "environment" | "models_json_key" | "models_json_command";
+	configured: true;
+	label?: string;
+	identityFingerprint: string;
+	valueFingerprint?: string;
+	resolveValueFingerprint?: () => string | undefined;
+};
+
 export type ResolvedRequestAuth =
 	| {
 			ok: true;
@@ -343,15 +354,24 @@ export const clearApiKeyCache = clearConfigValueCache;
 export class ModelRegistry {
 	private models: Model<Api>[] = [];
 	private providerRequestConfigs: Map<string, ProviderRequestConfig> = new Map();
+	private staleProviderRequestAuthSources: Map<string, AuthSourceToken[]> = new Map();
+	private lastProviderAuthSourceTokens: Map<string, AuthSourceToken> = new Map();
 	private modelRequestHeaders: Map<string, Record<string, string>> = new Map();
 	private registeredProviders: Map<string, ProviderConfigInput> = new Map();
 	private loadError: string | undefined = undefined;
+
+	/** Re-register dynamic OAuth providers (e.g. user MCP servers) after refresh() resets the registry. */
+	private onOAuthProvidersReset?: () => void;
 
 	private constructor(
 		readonly authStorage: AuthStorage,
 		private modelsJsonPath: string | undefined,
 	) {
 		this.loadModels();
+	}
+
+	setOnOAuthProvidersReset(hook: () => void): void {
+		this.onOAuthProvidersReset = hook;
 	}
 
 	static create(authStorage: AuthStorage, modelsJsonPath: string = join(getAgentDir(), "models.json")): ModelRegistry {
@@ -368,6 +388,7 @@ export class ModelRegistry {
 	refresh(): void {
 		this.providerRequestConfigs.clear();
 		this.modelRequestHeaders.clear();
+		this.lastProviderAuthSourceTokens.clear();
 		this.loadError = undefined;
 
 		// Credentials may have been written by another process (e.g. the UI
@@ -377,6 +398,15 @@ export class ModelRegistry {
 		// Ensure dynamic API/OAuth registrations are rebuilt from current provider state.
 		resetApiProviders();
 		resetOAuthProviders();
+		// reset drops everything but model-provider built-ins; re-add MCP integrations
+		// (built-in catalog + this session's user-declared servers via the hook).
+		// NOTE: the OAuth registry is process-global. Built-in MCP providers are
+		// identical across sessions so they always survive; a user-declared server
+		// unique to another daemon session is dropped here and re-registered on that
+		// session's next refresh. Fully isolating it would require a session-scoped
+		// registry in pi-ai (out of scope here).
+		registerBuiltinMcpOAuthProviders();
+		this.onOAuthProvidersReset?.();
 
 		this.loadModels();
 
@@ -666,10 +696,239 @@ export class ModelRegistry {
 	 * Get API key for a model.
 	 */
 	hasConfiguredAuth(model: Model<Api>): boolean {
-		return (
-			this.authStorage.hasAuth(model.provider) ||
-			this.providerRequestConfigs.get(model.provider)?.apiKey !== undefined
+		return this.authStorage.hasAuth(model.provider) || this.hasConfiguredProviderRequestAuth(model.provider);
+	}
+
+	private fingerprintProviderRequestAuthSource(source: ProviderRequestAuthSource["source"], material: string): string {
+		const digest = createHash("sha256").update(source).update("\0").update(material).digest("hex");
+		return `${source}:${digest}`;
+	}
+
+	private createProviderRequestAuthSource(options: {
+		source: ProviderRequestAuthSource["source"];
+		identityMaterial: string;
+		valueMaterial?: string;
+		label?: string;
+		resolveValueMaterial?: () => string | undefined;
+	}): ProviderRequestAuthSource {
+		return {
+			configured: true,
+			source: options.source,
+			...(options.label ? { label: options.label } : {}),
+			identityFingerprint: this.fingerprintProviderRequestAuthSource(
+				options.source,
+				`identity:${options.identityMaterial}`,
+			),
+			...(options.valueMaterial !== undefined
+				? {
+						valueFingerprint: this.fingerprintProviderRequestAuthSource(
+							options.source,
+							`value:${options.identityMaterial}\0${options.valueMaterial}`,
+						),
+					}
+				: {}),
+			...(options.resolveValueMaterial
+				? {
+						resolveValueFingerprint: () => {
+							const valueMaterial = options.resolveValueMaterial?.();
+							return valueMaterial === undefined
+								? undefined
+								: this.fingerprintProviderRequestAuthSource(
+										options.source,
+										`value:${options.identityMaterial}\0${valueMaterial}`,
+									);
+						},
+					}
+				: {}),
+		};
+	}
+
+	private getProviderRequestAuthSource(
+		provider: string,
+		options?: { resolvedApiKey?: string },
+	): ProviderRequestAuthSource | undefined {
+		const providerApiKey = this.providerRequestConfigs.get(provider)?.apiKey;
+		if (!providerApiKey) {
+			return undefined;
+		}
+
+		if (providerApiKey.startsWith("!")) {
+			return this.createProviderRequestAuthSource({
+				source: "models_json_command",
+				identityMaterial: providerApiKey,
+				valueMaterial:
+					options?.resolvedApiKey === undefined ? undefined : `${providerApiKey}\0${options.resolvedApiKey}`,
+				resolveValueMaterial: () => {
+					const resolved = resolveConfigValueUncached(providerApiKey);
+					return resolved === undefined ? undefined : `${providerApiKey}\0${resolved}`;
+				},
+			});
+		}
+
+		const envValue = process.env[providerApiKey];
+		if (envValue) {
+			return this.createProviderRequestAuthSource({
+				source: "environment",
+				label: providerApiKey,
+				identityMaterial: providerApiKey,
+				valueMaterial: `${providerApiKey}\0${envValue}`,
+			});
+		}
+
+		return this.createProviderRequestAuthSource({
+			source: "models_json_key",
+			identityMaterial: provider,
+			valueMaterial: providerApiKey,
+		});
+	}
+
+	private isProviderRequestAuthStale(provider: string, source: ProviderRequestAuthSource): boolean {
+		const matchingStale = this.getMatchingStaleProviderRequestAuthSources(provider, source);
+		if (matchingStale.length === 0) {
+			return false;
+		}
+		const valueFingerprint = source.valueFingerprint ?? source.resolveValueFingerprint?.();
+		return Boolean(valueFingerprint && matchingStale.some((token) => token.valueFingerprint === valueFingerprint));
+	}
+
+	private isProviderRequestAuthStaleForStatus(provider: string, source: ProviderRequestAuthSource): boolean {
+		const matchingStale = this.getMatchingStaleProviderRequestAuthSources(provider, source);
+		if (matchingStale.length === 0) {
+			return false;
+		}
+		if (!source.valueFingerprint) {
+			return true;
+		}
+		const isStale = matchingStale.some((token) => token.valueFingerprint === source.valueFingerprint);
+		if (!isStale) {
+			this.clearStaleProviderRequestAuthSource(provider, source);
+		}
+		return isStale;
+	}
+
+	private getMatchingStaleProviderRequestAuthSources(
+		provider: string,
+		source: ProviderRequestAuthSource,
+	): AuthSourceToken[] {
+		const stale = this.staleProviderRequestAuthSources.get(provider);
+		if (!stale) {
+			return [];
+		}
+		return stale.filter(
+			(token) => token.source === source.source && token.identityFingerprint === source.identityFingerprint,
 		);
+	}
+
+	private clearStaleProviderRequestAuthSource(provider: string, source: ProviderRequestAuthSource): void {
+		const stale = this.staleProviderRequestAuthSources.get(provider);
+		if (!stale) {
+			return;
+		}
+		const next = stale.filter(
+			(token) => token.source !== source.source || token.identityFingerprint !== source.identityFingerprint,
+		);
+		if (next.length === 0) {
+			this.staleProviderRequestAuthSources.delete(provider);
+		} else {
+			this.staleProviderRequestAuthSources.set(provider, next);
+		}
+	}
+
+	private getProviderRequestAuthSourceToken(
+		provider: string,
+		source: ProviderRequestAuthSource,
+	): AuthSourceToken | undefined {
+		const valueFingerprint = source.valueFingerprint ?? source.resolveValueFingerprint?.();
+		if (!valueFingerprint) {
+			return undefined;
+		}
+		return {
+			provider,
+			source: source.source,
+			identityFingerprint: source.identityFingerprint,
+			valueFingerprint,
+		};
+	}
+
+	private setLastProviderAuthSourceToken(provider: string, token: AuthSourceToken | undefined): void {
+		if (token) {
+			this.lastProviderAuthSourceTokens.set(provider, token);
+		} else {
+			this.lastProviderAuthSourceTokens.delete(provider);
+		}
+	}
+
+	private hasConfiguredProviderRequestAuth(provider: string): boolean {
+		const source = this.getProviderRequestAuthSource(provider);
+		return source !== undefined && !this.isProviderRequestAuthStaleForStatus(provider, source);
+	}
+
+	markProviderAuthStale(provider: string): boolean {
+		if (this.authStorage.markAuthStale(provider)) {
+			return true;
+		}
+
+		const token = this.getCurrentProviderAuthSourceToken(provider);
+		return token ? this.markProviderAuthSourceStale(token) : false;
+	}
+
+	getCurrentProviderAuthSourceToken(provider: string): AuthSourceToken | undefined {
+		const lastRequestToken = this.lastProviderAuthSourceTokens.get(provider);
+		if (lastRequestToken) {
+			return lastRequestToken;
+		}
+
+		const authStorageToken = this.authStorage.getCurrentAuthSourceToken(provider);
+		if (authStorageToken) {
+			return authStorageToken;
+		}
+
+		const providerApiKey = this.providerRequestConfigs.get(provider)?.apiKey;
+		if (!providerApiKey) {
+			return undefined;
+		}
+		const resolvedApiKey = resolveConfigValueUncached(providerApiKey);
+		const source = this.getProviderRequestAuthSource(provider, { resolvedApiKey });
+		const valueFingerprint = source?.valueFingerprint ?? source?.resolveValueFingerprint?.();
+		if (!source || !valueFingerprint || this.isProviderRequestAuthStale(provider, source)) {
+			return undefined;
+		}
+
+		return {
+			provider,
+			source: source.source,
+			identityFingerprint: source.identityFingerprint,
+			valueFingerprint,
+		};
+	}
+
+	markProviderAuthSourceStale(token: AuthSourceToken): boolean {
+		let marked = false;
+		const providerRequestSource = this.getProviderRequestAuthSource(token.provider);
+		if (
+			providerRequestSource?.source === token.source &&
+			providerRequestSource.identityFingerprint === token.identityFingerprint
+		) {
+			const stale = this.staleProviderRequestAuthSources.get(token.provider) ?? [];
+			if (
+				!stale.some(
+					(existing) =>
+						existing.source === token.source &&
+						existing.identityFingerprint === token.identityFingerprint &&
+						existing.valueFingerprint === token.valueFingerprint,
+				)
+			) {
+				stale.push(token);
+			}
+			this.staleProviderRequestAuthSources.set(token.provider, stale);
+			marked = true;
+		}
+
+		if (token.source !== "models_json_key" && token.source !== "models_json_command") {
+			marked = this.authStorage.markAuthSourceStale(token) || marked;
+		}
+
+		return marked;
 	}
 
 	private getModelRequestKey(provider: string, modelId: string): string {
@@ -710,12 +969,27 @@ export class ModelRegistry {
 	async getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedRequestAuth> {
 		try {
 			const providerConfig = this.providerRequestConfigs.get(model.provider);
-			const apiKeyFromAuthStorage = await this.authStorage.getApiKey(model.provider, { includeFallback: false });
-			const apiKey =
-				apiKeyFromAuthStorage ??
-				(providerConfig?.apiKey
-					? resolveConfigValueOrThrow(providerConfig.apiKey, `API key for provider "${model.provider}"`)
-					: undefined);
+			const authStorageAuth = await this.authStorage.getApiKeyWithSourceToken(model.provider, {
+				includeFallback: false,
+			});
+			let apiKey = authStorageAuth.apiKey;
+			let authSourceToken = authStorageAuth.sourceToken;
+			if (apiKey === undefined && providerConfig?.apiKey) {
+				const resolvedApiKey = resolveConfigValueOrThrow(
+					providerConfig.apiKey,
+					`API key for provider "${model.provider}"`,
+				);
+				const providerRequestAuthSource = this.getProviderRequestAuthSource(model.provider, { resolvedApiKey });
+				if (
+					providerRequestAuthSource &&
+					!this.isProviderRequestAuthStale(model.provider, providerRequestAuthSource)
+				) {
+					this.clearStaleProviderRequestAuthSource(model.provider, providerRequestAuthSource);
+					apiKey = resolvedApiKey;
+					authSourceToken = this.getProviderRequestAuthSourceToken(model.provider, providerRequestAuthSource);
+				}
+			}
+			this.setLastProviderAuthSourceToken(model.provider, apiKey === undefined ? undefined : authSourceToken);
 
 			const providerHeaders = resolveHeadersOrThrow(providerConfig?.headers, `provider "${model.provider}"`);
 			const authStorageHeaders = this.authStorage.getProviderHeaders(model.provider);
@@ -755,24 +1029,24 @@ export class ModelRegistry {
 	 */
 	getProviderAuthStatus(provider: string): AuthStatus {
 		const authStatus = this.authStorage.getAuthStatus(provider);
-		if (authStatus.source) {
+		if (authStatus.source && authStatus.source !== "stale") {
 			return authStatus;
 		}
 
-		const providerApiKey = this.providerRequestConfigs.get(provider)?.apiKey;
-		if (!providerApiKey) {
+		const source = this.getProviderRequestAuthSource(provider);
+		if (!source) {
 			return authStatus;
 		}
 
-		if (providerApiKey.startsWith("!")) {
-			return { configured: true, source: "models_json_command" };
+		if (this.isProviderRequestAuthStaleForStatus(provider, source)) {
+			return { configured: false, source: "stale", label: "expired" };
 		}
 
-		if (process.env[providerApiKey]) {
-			return { configured: true, source: "environment", label: providerApiKey };
-		}
-
-		return { configured: true, source: "models_json_key" };
+		return {
+			configured: true,
+			source: source.source,
+			...(source.label ? { label: source.label } : {}),
+		};
 	}
 
 	/**
@@ -795,13 +1069,32 @@ export class ModelRegistry {
 	 * Get API key for a provider.
 	 */
 	async getApiKeyForProvider(provider: string): Promise<string | undefined> {
-		const apiKey = await this.authStorage.getApiKey(provider, { includeFallback: false });
-		if (apiKey !== undefined) {
-			return apiKey;
+		const authStorageAuth = await this.authStorage.getApiKeyWithSourceToken(provider, { includeFallback: false });
+		if (authStorageAuth.apiKey !== undefined) {
+			this.setLastProviderAuthSourceToken(provider, authStorageAuth.sourceToken);
+			return authStorageAuth.apiKey;
 		}
 
 		const providerApiKey = this.providerRequestConfigs.get(provider)?.apiKey;
-		return providerApiKey ? resolveConfigValueUncached(providerApiKey) : undefined;
+		if (!providerApiKey) {
+			this.setLastProviderAuthSourceToken(provider, undefined);
+			return undefined;
+		}
+
+		const resolvedApiKey = resolveConfigValueUncached(providerApiKey);
+		if (resolvedApiKey === undefined) {
+			this.setLastProviderAuthSourceToken(provider, undefined);
+			return undefined;
+		}
+		const source = this.getProviderRequestAuthSource(provider, { resolvedApiKey });
+		if (!source || this.isProviderRequestAuthStale(provider, source)) {
+			this.setLastProviderAuthSourceToken(provider, undefined);
+			return undefined;
+		}
+		this.clearStaleProviderRequestAuthSource(provider, source);
+		this.setLastProviderAuthSourceToken(provider, this.getProviderRequestAuthSourceToken(provider, source));
+
+		return resolvedApiKey;
 	}
 
 	/**

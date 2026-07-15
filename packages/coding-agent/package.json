@@ -1,7 +1,7 @@
 {
 	"name": "@earendil-works/pi-coding-agent",
-	"version": "0.2.2",
-	"description": "Coding agent CLI with ipython, bash, edit tools and session management",
+	"version": "0.3.0",
+	"description": "Coding agent CLI with IPython-backed tools and session management",
 	"type": "module",
 	"piConfig": {
 		"name": "prime-agent",
@@ -43,9 +43,9 @@
 		"bundle": "node scripts/bundle.mjs"
 	},
 	"dependencies": {
-		"@earendil-works/pi-agent-core": "^0.2.2",
-		"@earendil-works/pi-ai": "^0.2.2",
-		"@earendil-works/pi-tui": "^0.2.2",
+		"@earendil-works/pi-agent-core": "^0.3.0",
+		"@earendil-works/pi-ai": "^0.3.0",
+		"@earendil-works/pi-tui": "^0.3.0",
 		"@silvia-odwyer/photon-node": "^0.3.4",
 		"chalk": "^5.5.0",
 		"cli-highlight": "^2.1.11",
@@ -73,7 +73,7 @@
 		}
 	},
 	"optionalDependencies": {
-		"@mariozechner/clipboard": "^0.3.5"
+		"@mariozechner/clipboard": "^0.3.9"
 	},
 	"devDependencies": {
 		"@types/diff": "^7.0.2",
@@ -83,7 +83,7 @@
 		"@types/proper-lockfile": "^4.1.4",
 		"shx": "^0.4.0",
 		"typescript": "^5.7.3",
-		"vitest": "^4.1.8",
+		"vitest": "^4.1.9",
 		"esbuild": "^0.28.1"
 	},
 	"keywords": [

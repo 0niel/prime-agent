@@ -40,10 +40,10 @@ describe("regression #3592: no-builtin-tools keeps extension tools enabled", () 
 				(pi) => {
 					pi.on("session_start", () => {
 						pi.registerTool({
-							name: "dynamic_tool",
-							label: "Dynamic Tool",
+							name: "extension_tool",
+							label: "Extension Tool",
 							description: "Tool registered from session_start",
-							promptSnippet: "Run dynamic test behavior",
+							promptSnippet: "Run extension test behavior",
 							parameters: Type.Object({}),
 							execute: async () => ({
 								content: [{ type: "text", text: "ok" }],
@@ -78,11 +78,12 @@ describe("regression #3592: no-builtin-tools keeps extension tools enabled", () 
 				.getAllTools()
 				.map((tool) => tool.name)
 				.sort(),
-		).toEqual(["bash", "dynamic_tool", "edit", "ipython"]);
-		expect(session.getActiveToolNames()).toEqual(["dynamic_tool"]);
-		expect(session.systemPrompt).not.toContain("- dynamic_tool: Run dynamic test behavior");
+		).toEqual(["extension_tool", "ipython"]);
+		expect(session.getActiveToolNames()).toEqual(["extension_tool"]);
+		expect(session.systemPrompt).not.toContain("- extension_tool: Run extension test behavior");
 		expect(session.systemPrompt).not.toContain("- ipython:");
 		expect(session.systemPrompt).not.toContain("- bash:");
+		expect(session.systemPrompt).not.toContain("- edit:");
 		session.dispose();
 	});
 

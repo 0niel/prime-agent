@@ -180,10 +180,12 @@ describe("buildSummarizationPrompt", () => {
 		const prompt = buildSummarizationPrompt();
 		expect(prompt).not.toContain("<user-instructions>");
 		expect(prompt).toContain("## Goal");
-		expect(prompt).toContain("IPython kernel");
+		// The kernel keeps running across compaction — the note must not claim a wipe.
+		expect(prompt).toContain("IPython kernel keeps running");
+		expect(prompt).not.toMatch(/wiped|restarted/);
 	});
 
-	it("includes user instructions in a delimited block before the kernel warning", () => {
+	it("includes user instructions in a delimited block before the kernel note", () => {
 		const prompt = buildSummarizationPrompt("focus on the auth refactor, remember the migration command");
 		expect(prompt).toContain("<user-instructions>");
 		expect(prompt).toContain("focus on the auth refactor, remember the migration command");

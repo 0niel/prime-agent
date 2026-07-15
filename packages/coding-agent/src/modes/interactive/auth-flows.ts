@@ -32,6 +32,7 @@ import { showFullPaneOverlay } from "./components/centered-overlay.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { LoginDialogComponent } from "./components/login-dialog.js";
 import {
+	type AuthSelectorCategory,
 	type AuthSelectorProvider,
 	compareAuthSelectorProviders,
 	OAuthSelectorComponent,
@@ -114,11 +115,34 @@ export interface ProviderAuthFlowsHost {
 	onLoginCompleted?(): void;
 }
 
+export interface ProviderLoginOptions {
+	authType?: "oauth" | "api_key";
+	initialCategory?: AuthSelectorCategory;
+}
+
 export class ProviderAuthFlows {
 	constructor(private readonly host: ProviderAuthFlowsHost) {}
 
 	/** Runs the provider selector followed by the matching login dialog. */
-	runLogin(authType?: "oauth" | "api_key"): Promise<AuthenticationResult> {
+	/**
+	 * Run the OAuth login flow for an MCP integration server.
+	 *
+	 * The provider must already be registered (the McpManager does this as
+	 * `mcp:<server>`). On success the credentials land in auth.json and the
+	 * caller should reload resources so the integration's skill enables.
+	 */
+	runMcpLogin(server: string, label?: string): Promise<AuthenticationResult> {
+		const providerId = `mcp:${server}`;
+		const provider = this.host.modelRegistry.authStorage.getOAuthProviders().find((p) => p.id === providerId);
+		if (!provider) {
+			this.host.showError(`Unknown MCP integration: ${server}`);
+			return Promise.resolve({ status: "failed" });
+		}
+		return this.showLoginDialog(providerId, label ?? provider.name, "service");
+	}
+
+	runLogin(options: ProviderLoginOptions = {}): Promise<AuthenticationResult> {
+		const { authType, initialCategory } = options;
 		const providerOptions = this.getLoginProviderOptions(authType);
 		if (providerOptions.length === 0) {
 			this.host.showStatus(
@@ -143,37 +167,42 @@ export class ProviderAuthFlows {
 				providerOptions,
 				async (providerOption: AuthSelectorProvider) => {
 					close();
-
-					if (providerOption.authType === "oauth") {
-						resolve(await this.showLoginDialog(providerOption.id, providerOption.name));
-					} else if (providerOption.id === PRIME_INFERENCE_PROVIDER_ID) {
-						resolve(await this.runPrimeInferenceLogin());
-					} else if (providerOption.id === BEDROCK_PROVIDER_ID) {
-						resolve(await this.showBedrockSetupDialog(providerOption.id, providerOption.name));
-					} else {
-						const kind = providerOption.id === SERPER_CREDENTIAL_ID ? "service" : "provider";
-						resolve(await this.showApiKeyLoginDialog(providerOption.id, providerOption.name, kind));
-					}
+					resolve(await this.loginProvider(providerOption));
 				},
 				() => {
 					close();
 					resolve({ status: "cancelled" });
 				},
 				(providerId) => this.host.modelRegistry.getProviderAuthStatus(providerId),
-				{ getRows: () => this.host.ui.terminal.rows },
+				{ getRows: () => this.host.ui.terminal.rows, initialCategory },
 			);
 			handle = showFullPaneOverlay(this.host.ui, selector, 78);
 		});
 	}
 
+	loginProvider(providerOption: AuthSelectorProvider): Promise<AuthenticationResult> {
+		const kind = providerOption.category === "service" ? "service" : "provider";
+		if (providerOption.authType === "oauth") {
+			return this.showLoginDialog(providerOption.id, providerOption.name, kind);
+		}
+		if (providerOption.id === PRIME_INFERENCE_PROVIDER_ID) {
+			return this.runPrimeInferenceLogin();
+		}
+		if (providerOption.id === BEDROCK_PROVIDER_ID) {
+			return this.showBedrockSetupDialog(providerOption.id, providerOption.name);
+		}
+		return this.showApiKeyLoginDialog(providerOption.id, providerOption.name, kind);
+	}
+
 	/** Shows the stored-credential selector and removes the chosen credential. */
-	runLogout(): Promise<void> {
+	/** Returns the provider id that was logged out, or null if nothing changed (cancelled / none). */
+	runLogout(): Promise<string | null> {
 		const providerOptions = this.getLogoutProviderOptions();
 		if (providerOptions.length === 0) {
 			this.host.showStatus(
 				"No stored credentials to remove. /logout only removes credentials saved by /login; environment variables and models.json config are unchanged.",
 			);
-			return Promise.resolve();
+			return Promise.resolve(null);
 		}
 
 		return new Promise((resolve) => {
@@ -198,14 +227,15 @@ export class ProviderAuthFlows {
 								? `Logged out of ${providerOption.name}`
 								: `Removed stored API key for ${providerOption.name}. Environment variables and models.json config are unchanged.`;
 						this.host.showStatus(message);
+						resolve(providerOption.id);
 					} catch (error: unknown) {
 						this.host.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
+						resolve(null);
 					}
-					resolve();
 				},
 				() => {
 					close();
-					resolve();
+					resolve(null);
 				},
 				undefined,
 				{ getRows: () => this.host.ui.terminal.rows },
@@ -214,7 +244,7 @@ export class ProviderAuthFlows {
 		});
 	}
 
-	private getLoginProviderOptions(authType?: "oauth" | "api_key"): AuthSelectorProvider[] {
+	getLoginProviderOptions(authType?: "oauth" | "api_key"): AuthSelectorProvider[] {
 		const authStorage = this.host.modelRegistry.authStorage;
 		const oauthProviders = authStorage.getOAuthProviders();
 		const oauthProviderIds = new Set(oauthProviders.map((provider) => provider.id));
@@ -222,6 +252,8 @@ export class ProviderAuthFlows {
 			id: provider.id,
 			name: provider.name,
 			authType: "oauth",
+			// MCP integrations (mcp:<server>) are services, not model providers.
+			...(provider.id.startsWith("mcp:") ? { category: "service" as const } : {}),
 		}));
 
 		const modelProviders = new Set(this.host.modelRegistry.getAll().map((model) => model.provider));
@@ -252,18 +284,36 @@ export class ProviderAuthFlows {
 		const authStorage = this.host.modelRegistry.authStorage;
 		const options: AuthSelectorProvider[] = [];
 
+		const oauthProvidersById = new Map(authStorage.getOAuthProviders().map((p) => [p.id, p]));
 		for (const providerId of authStorage.list()) {
 			const credential = authStorage.get(providerId);
 			if (!credential) {
 				continue;
 			}
 			const isSerper = providerId === SERPER_CREDENTIAL_ID;
+			const isMcp = providerId.startsWith("mcp:");
+			const name = isSerper
+				? SERPER_CREDENTIAL_NAME
+				: isMcp
+					? (oauthProvidersById.get(providerId)?.name ?? providerId.slice("mcp:".length))
+					: this.host.modelRegistry.getProviderDisplayName(providerId);
 			options.push({
 				id: providerId,
-				name: isSerper ? SERPER_CREDENTIAL_NAME : this.host.modelRegistry.getProviderDisplayName(providerId),
+				name,
 				authType: credential.type,
-				category: isSerper ? "service" : "provider",
+				category: isSerper || isMcp ? "service" : "provider",
 			});
+		}
+
+		if (!options.some((option) => option.id === PRIME_INFERENCE_PROVIDER_ID)) {
+			const primeInferenceStatus = authStorage.getAuthStatus(PRIME_INFERENCE_PROVIDER_ID);
+			if (primeInferenceStatus.source === "prime_cli") {
+				options.push({
+					id: PRIME_INFERENCE_PROVIDER_ID,
+					name: PRIME_INFERENCE_PROVIDER_NAME,
+					authType: "api_key",
+				});
+			}
 		}
 
 		return options.sort((a, b) => a.name.localeCompare(b.name));
@@ -275,13 +325,14 @@ export class ProviderAuthFlows {
 		authType: "oauth" | "api_key",
 		statusSuffix?: string,
 		kind: "provider" | "service" = "provider",
+		credentialPath: string = getAuthPath(),
 	): Promise<AuthenticationResult> {
 		this.host.modelRegistry.refresh();
 
 		const actionLabel = authType === "oauth" ? `Logged in to ${providerName}` : `Saved API key for ${providerName}`;
 		await this.host.onAuthChanged?.();
 		this.host.showStatus(
-			`${actionLabel}. Credentials saved to ${getAuthPath()}${statusSuffix ? `. ${statusSuffix}` : ""}`,
+			`${actionLabel}. Credentials saved to ${credentialPath}${statusSuffix ? `. ${statusSuffix}` : ""}`,
 		);
 		this.host.onLoginCompleted?.();
 		return {
@@ -381,6 +432,24 @@ export class ProviderAuthFlows {
 	}
 
 	private getPrimeInferenceDefaultTeamStatus(): string {
+		const configPath = this.host.modelRegistry.authStorage.getPrimeCliConfigPath();
+		if (configPath) {
+			let config: ReturnType<typeof loadPrimeCliConfig>;
+			try {
+				config = loadPrimeCliConfig(configPath);
+			} catch {
+				return "Using personal account.";
+			}
+			if (config.teamIdFromEnv) {
+				return "Using team from PRIME_TEAM_ID.";
+			}
+			if (config.teamName) {
+				return `Using team "${config.teamName}".`;
+			}
+			if (config.teamId) {
+				return "Using Prime CLI team.";
+			}
+		}
 		const storedTeam = this.host.modelRegistry.authStorage.getPrimeInferenceTeamSelection();
 		if (storedTeam) {
 			return `Using team "${storedTeam.name}".`;
@@ -388,27 +457,12 @@ export class ProviderAuthFlows {
 		if (storedTeam === null) {
 			return "Using personal account.";
 		}
-		let config: ReturnType<typeof loadPrimeCliConfig>;
-		try {
-			config = loadPrimeCliConfig();
-		} catch {
-			return "Using personal account.";
-		}
-		if (config.teamIdFromEnv) {
-			return "Using team from PRIME_TEAM_ID.";
-		}
-		if (config.teamName) {
-			return `Using team "${config.teamName}".`;
-		}
-		if (config.teamId) {
-			return "Using Prime CLI team.";
-		}
 		return "Using personal account.";
 	}
 
 	private async selectPrimeInferenceTeam(apiKey: string, dialog: LoginDialogComponent): Promise<string | undefined> {
 		try {
-			const config = loadPrimeCliConfig();
+			const config = loadPrimeCliConfig(this.host.modelRegistry.authStorage.getPrimeCliConfigPath());
 			if (config.teamIdFromEnv) {
 				this.host.modelRegistry.authStorage.reload();
 				return "Using team from PRIME_TEAM_ID.";
@@ -446,14 +500,7 @@ export class ProviderAuthFlows {
 		dialog: LoginDialogComponent,
 		closeDialog: () => void,
 	): Promise<AuthenticationResult> {
-		const previousPrimeCredential = this.host.modelRegistry.authStorage.get(PRIME_INFERENCE_PROVIDER_ID);
-		const previousPrimeTeam =
-			previousPrimeCredential?.type === "api_key" ? previousPrimeCredential.primeTeam : undefined;
-		this.host.modelRegistry.authStorage.set(PRIME_INFERENCE_PROVIDER_ID, {
-			type: "api_key",
-			key: apiKey,
-			...(previousPrimeTeam !== undefined ? { primeTeam: previousPrimeTeam } : {}),
-		});
+		this.host.modelRegistry.authStorage.setPrimeInferenceApiKey(apiKey);
 		const teamStatus = await this.selectPrimeInferenceTeam(apiKey, dialog);
 
 		closeDialog();
@@ -462,6 +509,8 @@ export class ProviderAuthFlows {
 			PRIME_INFERENCE_PROVIDER_NAME,
 			"api_key",
 			teamStatus,
+			"provider",
+			this.host.modelRegistry.authStorage.getPrimeCliConfigPath() ?? getAuthPath(),
 		);
 	}
 
@@ -489,7 +538,10 @@ export class ProviderAuthFlows {
 			PRIME_INFERENCE_PROVIDER_NAME,
 		);
 
-		const handle = showFullPaneOverlay(this.host.ui, dialog, 88);
+		const handle = showFullPaneOverlay(this.host.ui, dialog, {
+			maxContentWidth: 88,
+			suspendFullscreenMouse: true,
+		});
 
 		const closeDialog = () => {
 			handle.hide();
@@ -521,16 +573,21 @@ export class ProviderAuthFlows {
 		};
 
 		try {
-			const browserLogin = loginPrimeInference({
-				onAuth: (info) => {
-					dialog.showAuth(info.url, info.instructions);
-					armManualInput("Complete the sign-in in your browser, or paste an API key below:");
+			const browserLogin = loginPrimeInference(
+				{
+					onAuth: (info) => {
+						dialog.showAuth(info.url, info.instructions);
+						armManualInput("Complete the sign-in in your browser, or paste an API key below:");
+					},
+					onProgress: (message) => {
+						dialog.showProgress(message);
+					},
+					signal: browserAbort.signal,
 				},
-				onProgress: (message) => {
-					dialog.showProgress(message);
+				{
+					configPath: this.host.modelRegistry.authStorage.getPrimeCliConfigPath(),
 				},
-				signal: browserAbort.signal,
-			});
+			);
 			// When the browser challenge cannot start or breaks down, keep the dialog
 			// open and fall back to plain API key entry instead of failing outright.
 			const browserLoginOrFallback = browserLogin.catch((error: unknown) => {
@@ -564,7 +621,7 @@ export class ProviderAuthFlows {
 			if (result.source === "manual") {
 				browserAbort.abort();
 				dialog.showProgress("Checking Prime Inference access...");
-				const config = loadPrimeCliConfig();
+				const config = loadPrimeCliConfig(this.host.modelRegistry.authStorage.getPrimeCliConfigPath());
 				const access = await checkPrimeInferenceAccess(result.apiKey, config.baseUrl, { signal: dialog.signal });
 				if (dialog.signal.aborted) {
 					closeDialog();
@@ -600,7 +657,10 @@ export class ProviderAuthFlows {
 			PRIME_AGENT_TRACES_PROVIDER_NAME,
 		);
 
-		const handle = showFullPaneOverlay(this.host.ui, dialog, 88);
+		const handle = showFullPaneOverlay(this.host.ui, dialog, {
+			maxContentWidth: 88,
+			suspendFullscreenMouse: true,
+		});
 
 		const closeDialog = () => {
 			handle.hide();
@@ -763,7 +823,11 @@ export class ProviderAuthFlows {
 		});
 	}
 
-	private async showLoginDialog(providerId: string, providerName: string): Promise<AuthenticationResult> {
+	private async showLoginDialog(
+		providerId: string,
+		providerName: string,
+		kind: "provider" | "service" = "provider",
+	): Promise<AuthenticationResult> {
 		const providerInfo = this.host.modelRegistry.authStorage
 			.getOAuthProviders()
 			.find((provider) => provider.id === providerId);
@@ -781,7 +845,10 @@ export class ProviderAuthFlows {
 			providerName,
 		);
 
-		const dialogHandle = showFullPaneOverlay(this.host.ui, dialog, 88);
+		const dialogHandle = showFullPaneOverlay(this.host.ui, dialog, {
+			maxContentWidth: 88,
+			suspendFullscreenMouse: true,
+		});
 
 		// Promise for manual code input (racing with callback server)
 		let manualCodeResolve: ((code: string) => void) | undefined;
@@ -842,7 +909,7 @@ export class ProviderAuthFlows {
 
 			// Success
 			closeDialog();
-			return await this.completeProviderAuthentication(providerId, providerName, "oauth");
+			return await this.completeProviderAuthentication(providerId, providerName, "oauth", undefined, kind);
 		} catch (error: unknown) {
 			closeDialog();
 			const errorMsg = error instanceof Error ? error.message : String(error);

@@ -13,6 +13,7 @@ Call directly from IPython:
 
 ```python
 await rlm_heartbeat.create("check test progress", interval="5m", label="tests")
+await rlm_heartbeat.create("watch build", delivery_mode="follow_up")
 await rlm_heartbeat.list()
 await rlm_heartbeat.update("job-id", status="pause")
 await rlm_heartbeat.delete("job-id")
@@ -22,14 +23,24 @@ await rlm_heartbeat.delete("job-id")
 
 - `await rlm_heartbeat.list(include_inactive=False)` — list this session's
   internal RLM heartbeats. By default this includes active and paused entries.
-- `await rlm_heartbeat.create(instruction, interval=None, label=None)` — create
-  a recurring heartbeat for this session. The default interval is every 5
-  minutes. Multiple RLM heartbeats may run at once; use labels to distinguish
-  them.
+- `await rlm_heartbeat.create(instruction, interval=None, label=None,
+  delivery_mode=None)` — create a recurring heartbeat for this session. The
+  default interval is every 5 minutes. Multiple RLM heartbeats may run at once;
+  use labels to distinguish them. `delivery_mode` is `"steer"` (default) or
+  `"follow_up"`.
 - `await rlm_heartbeat.update(id, instruction=None, interval=None, label=None,
-  status=None)` — update one RLM heartbeat by id. `status` may be `"pause"` or
-  `"resume"`.
+  status=None, delivery_mode=None)` — update one RLM heartbeat by id. `status`
+  may be `"pause"` or `"resume"`; `delivery_mode` may be `"steer"` or
+  `"follow_up"`.
 - `await rlm_heartbeat.delete(id)` — cancel one RLM heartbeat by id.
+
+## Delivery mode
+
+Each heartbeat has a delivery mode controlling how the scheduled prompt reaches
+the session when it is busy:
+
+- `steer` (default): interrupt the current turn so the heartbeat runs promptly.
+- `follow_up`: wait for the current turn to finish before running the heartbeat.
 
 ## Rules
 

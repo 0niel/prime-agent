@@ -31,6 +31,7 @@ import type { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
+import { classifyStreamFailure, StreamFailureError } from "../utils/stream-failure.js";
 import { transformMessages } from "./transform-messages.js";
 
 // =============================================================================
@@ -246,7 +247,7 @@ export function convertResponsesMessages<TApi extends Api>(
 
 				output = contentParts;
 			} else {
-				output = sanitizeSurrogates(hasText ? textResult : "(see attached image)");
+				output = sanitizeSurrogates(hasText ? textResult : hasImages ? "(see attached image)" : "");
 			}
 
 			messages.push({
@@ -514,17 +515,27 @@ export async function processResponsesStream<TApi extends Api>(
 			if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
 				output.stopReason = "toolUse";
 			}
+			if (output.stopReason === "error" && response?.status) {
+				output.stopReasonRaw = response.status;
+			}
 		} else if (event.type === "error") {
-			throw new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
+			throw new StreamFailureError(`Error Code ${event.code}: ${event.message}`, {
+				kind: classifyStreamFailure(event.code ?? undefined),
+				providerErrorType: event.code ?? undefined,
+			});
 		} else if (event.type === "response.failed") {
 			const error = event.response?.error;
 			const details = event.response?.incomplete_details;
+			const providerErrorType = error?.code ?? details?.reason;
 			const msg = error
 				? `${error.code || "unknown"}: ${error.message || "no message"}`
 				: details?.reason
 					? `incomplete: ${details.reason}`
 					: "Unknown error (no error details in response)";
-			throw new Error(msg);
+			throw new StreamFailureError(msg, {
+				kind: classifyStreamFailure(providerErrorType),
+				providerErrorType,
+			});
 		}
 	}
 }

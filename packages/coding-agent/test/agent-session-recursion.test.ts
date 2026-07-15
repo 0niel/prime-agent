@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -22,20 +22,7 @@ import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
-import { MISSING_RIPGREP_MESSAGE } from "../src/utils/tools-manager.js";
 import { createTestResourceLoader } from "./utilities.js";
-
-const toolsManagerMock = vi.hoisted(() => ({
-	ensureTool: vi.fn(async (): Promise<string | undefined> => "rg"),
-}));
-
-vi.mock("../src/utils/tools-manager.js", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("../src/utils/tools-manager.js")>();
-	return {
-		...actual,
-		ensureTool: toolsManagerMock.ensureTool,
-	};
-});
 
 const model = getModel("anthropic", "claude-sonnet-4-5")!;
 
@@ -211,8 +198,6 @@ describe("AgentSession rlm recursion", () => {
 	afterEach(() => {
 		session?.dispose();
 		session = undefined;
-		toolsManagerMock.ensureTool.mockReset();
-		toolsManagerMock.ensureTool.mockResolvedValue("rg");
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
@@ -255,8 +240,6 @@ describe("AgentSession rlm recursion", () => {
 			answerPreview?: string;
 			tokenCount?: number;
 			toolUseCount?: number;
-			transcript: readonly { role: string; text: string }[];
-			structuredTranscript?: readonly { type: string; role: string; text: string }[];
 		}> = [];
 		root.subscribe((event) => {
 			if (event.type === "rlm_child_update") {
@@ -281,14 +264,6 @@ describe("AgentSession rlm recursion", () => {
 		// Context tokens from the child's own assistant usage (input 7 + output 3); no tools ran.
 		expect(doneUpdate?.tokenCount).toBe(10);
 		expect(doneUpdate?.toolUseCount).toBeUndefined();
-		expect(doneUpdate?.transcript).toContainEqual({ role: "user", text: "summarize shard 1" });
-		expect(doneUpdate?.transcript).toContainEqual({ role: "assistant", text: "child answer: summarize shard 1" });
-		expect(doneUpdate?.structuredTranscript).toEqual(
-			expect.arrayContaining([
-				expect.objectContaining({ type: "message", role: "user", text: "summarize shard 1" }),
-				expect.objectContaining({ type: "message", role: "assistant", text: "child answer: summarize shard 1" }),
-			]),
-		);
 	});
 
 	it("surfaces a child's recap on its snapshot once the summarizer sets it", async () => {
@@ -332,23 +307,14 @@ describe("AgentSession rlm recursion", () => {
 		await runPromise;
 	});
 
-	it("surfaces missing ripgrep as one child-agent error before model work starts", async () => {
-		toolsManagerMock.ensureTool.mockResolvedValueOnce(undefined);
+	it("runs a child agent without requiring ripgrep", async () => {
 		const streamFn = vi.fn((_model, context: Context) => streamAnswer(`child answer: ${userText(context)}`));
 		const root = createSession({ streamFn });
-		const childUpdates: Array<{ status: string; transcript: readonly { role: string; text: string }[] }> = [];
-		root.subscribe((event) => {
-			if (event.type === "rlm_child_update") {
-				childUpdates.push(event.child);
-			}
-		});
 
-		await expect(root.runRlmChild("summarize shard 1")).rejects.toThrow(MISSING_RIPGREP_MESSAGE);
+		const result = await root.runRlmChild("summarize shard 1");
 
-		expect(toolsManagerMock.ensureTool).toHaveBeenCalledWith("rg", true);
-		expect(streamFn).not.toHaveBeenCalled();
-		const errorUpdate = [...childUpdates].reverse().find((update) => update.status === "error");
-		expect(errorUpdate?.transcript).toContainEqual({ role: "system", text: MISSING_RIPGREP_MESSAGE });
+		expect(result.answer).toBe("child answer: summarize shard 1");
+		expect(streamFn).toHaveBeenCalledOnce();
 	});
 
 	it("adds child usage to the parent session aggregate", async () => {
@@ -490,6 +456,40 @@ describe("AgentSession rlm recursion", () => {
 		expect(run.error).toBe("Parent session aborted");
 		releaseChild();
 		await expect(runPromise).rejects.toThrow("Parent session aborted");
+	});
+
+	it("does not cancel active rlm children when only the parent turn is interrupted", async () => {
+		let releaseChild: () => void = () => {};
+		const release = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		let childStarted = false;
+		const root = createSession({
+			streamFn: (_model, context) => {
+				const text = userText(context);
+				const stream = createAssistantMessageEventStream();
+				if (text === "slow shard") {
+					childStarted = true;
+					void release.then(() => {
+						stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
+					});
+				}
+				return stream;
+			},
+		});
+
+		const runPromise = root.runRlmChild("slow shard");
+		await waitFor(() => childStarted);
+		const runs = (root as unknown as InspectableRlmSession)._activeRlmChildRuns;
+		expect(runs.size).toBe(1);
+		const run = [...runs.values()][0];
+
+		root.requestAbort();
+
+		expect(run.status).toBe("running");
+		expect(run.error).toBeUndefined();
+		releaseChild();
+		await expect(runPromise).resolves.toMatchObject({ answer: "child answer: slow shard" });
 	});
 
 	it("cancels a single rlm child run by id and reports unknown ids", async () => {
@@ -910,6 +910,7 @@ describe("AgentSession RLM session dir", () => {
 		agentDir?: string,
 		serperKey?: string,
 		loadWebsearchSkill = false,
+		rlmSessionDir?: string,
 	): AgentSession {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
@@ -943,6 +944,7 @@ describe("AgentSession RLM session dir", () => {
 			agentDir,
 			modelRegistry: ModelRegistry.create(authStorage, join(tempDir, "models.json")),
 			resourceLoader: createTestResourceLoader({ skills }),
+			rlmSessionDir,
 		});
 		return session;
 	}
@@ -956,6 +958,8 @@ describe("AgentSession RLM session dir", () => {
 		expect(inspectable._ensureRlmSessionDir()).toBeUndefined();
 		const env = inspectable._rlmKernelEnv();
 		expect(env.RLM_SESSION_DIR).toBeUndefined();
+		expect(env.RLM_HARNESS_STATE_DIR).toBeUndefined();
+		expect(env.RLM_GLOBAL_HARNESS_STATE_DIR).toBeDefined();
 		expect(env).toMatchObject({ RLM_DEPTH: "0" });
 
 		const after = readdirSync(tmpdir()).filter((name) => name.startsWith("prime-agent-rlm-"));
@@ -971,6 +975,75 @@ describe("AgentSession RLM session dir", () => {
 		expect(artifactDir).toBeDefined();
 		expect(inspectable._ensureRlmSessionDir()).toBe(artifactDir);
 		expect(inspectable._rlmKernelEnv().RLM_SESSION_DIR).toBe(artifactDir);
+		expect(inspectable._rlmKernelEnv().RLM_HARNESS_STATE_DIR).toBe(join(artifactDir!, "harness"));
+		expect(inspectable._rlmKernelEnv().RLM_GLOBAL_HARNESS_STATE_DIR).toBeDefined();
+	});
+
+	it("points RLM_HARNESS_STATE_DIR at the session's own artifact dir for subagent sessions", () => {
+		// Subagent layout: the parent assigns rlmSessionDir, but the child's own
+		// sessionManager persists artifacts (and reads local harness state) elsewhere.
+		const subDir = join(tempDir, "parent-artifact", "sub-abc12345");
+		mkdirSync(subDir, { recursive: true });
+		const sessionManager = SessionManager.create(tempDir, subDir);
+		const root = createSession(sessionManager, undefined, undefined, false, subDir);
+		const inspectable = root as unknown as InspectableRlmDirSession;
+
+		const artifactDir = sessionManager.getSessionArtifactDir();
+		expect(artifactDir).toBeDefined();
+		expect(artifactDir).not.toBe(subDir);
+		const env = inspectable._rlmKernelEnv();
+		expect(env.RLM_SESSION_DIR).toBe(subDir);
+		expect(env.RLM_HARNESS_STATE_DIR).toBe(join(artifactDir!, "harness"));
+	});
+
+	it("falls back to the rlm session dir for RLM_HARNESS_STATE_DIR without an artifact dir", () => {
+		const ephemeralDir = join(tempDir, "ephemeral-rlm");
+		mkdirSync(ephemeralDir, { recursive: true });
+		const root = createSession(SessionManager.inMemory(tempDir), undefined, undefined, false, ephemeralDir);
+		const env = (root as unknown as InspectableRlmDirSession)._rlmKernelEnv();
+		expect(env.RLM_SESSION_DIR).toBe(ephemeralDir);
+		expect(env.RLM_HARNESS_STATE_DIR).toBe(join(ephemeralDir, "harness"));
+	});
+
+	it("loads the ephemeral RLM harness path into the host system prompt", () => {
+		const ephemeralDir = join(tempDir, "ephemeral-rlm");
+		mkdirSync(join(ephemeralDir, "harness"), { recursive: true });
+		writeFileSync(
+			join(ephemeralDir, "harness", "harness_state.json"),
+			JSON.stringify({
+				schema: 1,
+				entries: {
+					prompt: {},
+					memory: {
+						ephemeral_note: {
+							id: "ephemeral_note",
+							kind: "memory",
+							title: "Ephemeral note",
+							content: "Loaded from the RLM session harness path.",
+							path: "000",
+							scope: "local",
+							reference: {},
+							arguments: {},
+							metadata: {},
+							source: "test",
+							created_at: "2026-01-01T00:00:00.000Z",
+							updated_at: "2026-01-01T00:00:00.000Z",
+							version: 1,
+						},
+					},
+					skill: {},
+					subagent: {},
+				},
+				refinements: [],
+			}),
+			"utf8",
+		);
+		const root = createSession(SessionManager.inMemory(tempDir), undefined, undefined, false, ephemeralDir);
+
+		const prompt = root.systemPrompt;
+
+		expect(prompt).toContain("Ephemeral note");
+		expect(prompt).toContain("Loaded from the RLM session harness path.");
 	});
 
 	it("exports the configured agentDir to the kernel so skills find auth.json", () => {

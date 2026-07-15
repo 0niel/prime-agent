@@ -4,6 +4,7 @@ import { type BedrockOptions, streamBedrock } from "../src/providers/amazon-bedr
 import type { Context, Model } from "../src/types.js";
 
 interface BedrockThinkingPayload {
+	inferenceConfig?: { maxTokens?: number; temperature?: number };
 	additionalModelRequestFields?: {
 		thinking?: { type: string; budget_tokens?: number; display?: string };
 		output_config?: { effort?: string };
@@ -87,6 +88,23 @@ describe("Bedrock thinking payload", () => {
 		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
 		expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "max" });
 		expect(payload.additionalModelRequestFields?.anthropic_beta).toBeUndefined();
+	});
+
+	it("uses adaptive thinking with effort for Claude Fable 5", async () => {
+		const model = getModel("amazon-bedrock", "global.anthropic.claude-fable-5");
+
+		const payload = await capturePayload(model, { reasoning: "xhigh" });
+
+		expect(payload.additionalModelRequestFields?.thinking).toEqual({ type: "adaptive", display: "summarized" });
+		expect(payload.additionalModelRequestFields?.output_config).toEqual({ effort: "xhigh" });
+	});
+
+	it("drops temperature for Claude Fable 5 (sampling params are rejected)", async () => {
+		const model = getModel("amazon-bedrock", "global.anthropic.claude-fable-5");
+
+		const payload = await capturePayload(model, { reasoning: "high", temperature: 0.5 });
+
+		expect(payload.inferenceConfig?.temperature).toBeUndefined();
 	});
 
 	it("omits display for GovCloud model ids on non-adaptive Claude thinking", async () => {

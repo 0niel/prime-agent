@@ -571,12 +571,17 @@ async function* parseSSE(response: Response): AsyncGenerator<Record<string, unkn
 			}
 		}
 	} finally {
+		// Best-effort stream teardown: the reader may already be closed or errored.
 		try {
 			await reader.cancel();
-		} catch {}
+		} catch {
+			// Already closed.
+		}
 		try {
 			reader.releaseLock();
-		} catch {}
+		} catch {
+			// Lock already released.
+		}
 	}
 }
 
@@ -745,7 +750,9 @@ function isWebSocketReusable(socket: WebSocketLike): boolean {
 function closeWebSocketSilently(socket: WebSocketLike, code = 1000, reason = "done"): void {
 	try {
 		socket.close(code, reason);
-	} catch {}
+	} catch {
+		// Already closed.
+	}
 }
 
 function scheduleSessionWebSocketExpiry(sessionId: string, entry: CachedWebSocketConnection): void {
@@ -1237,7 +1244,9 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
 			}
 			message = err.message || friendlyMessage || message;
 		}
-	} catch {}
+	} catch {
+		// Unparseable error body: fall back to the raw message.
+	}
 
 	return { message, friendlyMessage };
 }

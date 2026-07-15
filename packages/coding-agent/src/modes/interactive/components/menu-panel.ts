@@ -5,6 +5,7 @@ import {
 	Input,
 	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.js";
 
@@ -43,6 +44,11 @@ const PANEL_PADDING_Y = 1;
 const FIELD_PADDING_X = 2;
 const ROW_PADDING_X = 2;
 const ROW_PADDING_Y = 1;
+
+export function getMenuPanelInnerWidth(width: number): number {
+	const safeWidth = Math.max(PANEL_PADDING_X * 2 + 1, width);
+	return Math.max(1, safeWidth - PANEL_PADDING_X * 2);
+}
 
 interface FullWidthMenuComponent {
 	readonly fillsMenuPanel: true;
@@ -182,19 +188,30 @@ export function getMenuListLayout(options: MenuListLayoutOptions): MenuListLayou
 		: { compact: false, visibleItems: comfortableLayout.visibleItems };
 }
 
-function surfaceLine(text: string, width: number, paddingX = PANEL_PADDING_X): string {
+function paddedBackgroundLine(
+	text: string,
+	width: number,
+	paddingX: number,
+	background: ((text: string) => string) | undefined,
+): string {
 	const innerWidth = Math.max(1, width - paddingX * 2);
 	const content = truncateToWidth(text, innerWidth, "");
 	const rightPadding = " ".repeat(Math.max(0, innerWidth - visibleWidth(content)));
-	const line = " ".repeat(paddingX) + content + rightPadding + " ".repeat(paddingX);
-	return theme.getEditorBackgroundColor()?.(line) ?? line;
+	const contentSpan = " ".repeat(paddingX) + content;
+	const trailingSpan = rightPadding + " ".repeat(paddingX);
+	if (!background) {
+		return contentSpan + trailingSpan;
+	}
+	return background(contentSpan) + background(trailingSpan);
 }
 
-function padLine(text: string, width: number, paddingX: number): string {
+function surfaceLine(text: string, width: number, paddingX = PANEL_PADDING_X): string {
+	return paddedBackgroundLine(text, width, paddingX, theme.getEditorBackgroundColor());
+}
+
+function surfaceWrappedLines(text: string, width: number, paddingX = PANEL_PADDING_X): string[] {
 	const innerWidth = Math.max(1, width - paddingX * 2);
-	const content = truncateToWidth(text, innerWidth, "");
-	const rightPadding = " ".repeat(Math.max(0, innerWidth - visibleWidth(content)));
-	return " ".repeat(paddingX) + content + rightPadding + " ".repeat(paddingX);
+	return wrapTextWithAnsi(text, innerWidth).map((content) => surfaceLine(content, width, paddingX));
 }
 
 export class MenuPanel extends Container {
@@ -211,19 +228,21 @@ export class MenuPanel extends Container {
 
 	override render(width: number): string[] {
 		const safeWidth = Math.max(PANEL_PADDING_X * 2 + 1, width);
-		const innerWidth = Math.max(1, safeWidth - PANEL_PADDING_X * 2);
+		const innerWidth = getMenuPanelInnerWidth(width);
 		const lines: string[] = [];
 
 		for (let i = 0; i < PANEL_PADDING_Y; i++) {
 			lines.push(surfaceLine("", safeWidth));
 		}
 		const hasTitle = this.title.trim().length > 0;
-		const hasHeader = hasTitle || this.options.subtitle !== undefined;
+		const subtitle = this.options.subtitle?.trim();
+		const hasSubtitle = subtitle !== undefined && subtitle.length > 0;
+		const hasHeader = hasTitle || hasSubtitle;
 		if (hasTitle) {
 			lines.push(surfaceLine(theme.bold(theme.fg("text", this.title)), safeWidth));
 		}
-		if (this.options.subtitle) {
-			lines.push(surfaceLine(theme.fg("muted", this.options.subtitle), safeWidth));
+		if (hasSubtitle) {
+			lines.push(...surfaceWrappedLines(theme.fg("muted", subtitle), safeWidth));
 		}
 		if (hasHeader) {
 			lines.push(surfaceLine("", safeWidth));
@@ -288,8 +307,7 @@ export class MenuSearchInput implements Component, Focusable, FullWidthMenuCompo
 			this.getValue() === "" && !this.focused
 				? theme.fg("dim", this.placeholder)
 				: this.stripInputPrompt(this.input.render(innerWidth + 2)[0] ?? "");
-		const field = padLine(content, safeWidth, FIELD_PADDING_X);
-		return [theme.getEditorBackgroundColor()?.(field) ?? field];
+		return [paddedBackgroundLine(content, safeWidth, FIELD_PADDING_X, theme.getEditorBackgroundColor())];
 	}
 
 	private stripInputPrompt(line: string): string {
@@ -357,11 +375,10 @@ export class MenuRow implements Component, FullWidthMenuComponent {
 	}
 
 	private rowLine(text: string, width: number, selected: boolean): string {
-		const line = padLine(text, width, ROW_PADDING_X);
-		if (selected) {
-			return theme.bg("selectedBg", line);
-		}
-		return theme.getEditorBackgroundColor()?.(line) ?? line;
+		const background = selected
+			? (content: string) => theme.bg("selectedBg", content)
+			: theme.getEditorBackgroundColor();
+		return paddedBackgroundLine(text, width, ROW_PADDING_X, background);
 	}
 }
 

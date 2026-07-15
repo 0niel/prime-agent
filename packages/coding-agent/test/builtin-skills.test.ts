@@ -236,6 +236,15 @@ describe("builtin skills", () => {
 			expect(goal?.kind === "python" && goal.python.importName).toBe("goal");
 		});
 
+		it("loads the bundled compact skill as a python skill", () => {
+			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
+
+			const compact = skills.find((s) => s.name === "compact");
+			expect(compact).toBeDefined();
+			expect(compact?.kind).toBe("python");
+			expect(compact?.kind === "python" && compact.python.importName).toBe("compact");
+		});
+
 		it("loads the bundled RLM heartbeat skill as a python skill", () => {
 			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
 
@@ -243,6 +252,17 @@ describe("builtin skills", () => {
 			expect(rlmHeartbeat).toBeDefined();
 			expect(rlmHeartbeat?.kind).toBe("python");
 			expect(rlmHeartbeat?.kind === "python" && rlmHeartbeat.python.importName).toBe("rlm_heartbeat");
+		});
+
+		it("loads the bundled orchestration heartbeat skill as a python skill", () => {
+			const { skills } = loadSkillsFromDir({ dir: getBundledSkillsDir(), source: "builtin" });
+
+			const orchestrationHeartbeat = skills.find((s) => s.name === "orchestration-heartbeat");
+			expect(orchestrationHeartbeat).toBeDefined();
+			expect(orchestrationHeartbeat?.kind).toBe("python");
+			expect(orchestrationHeartbeat?.kind === "python" && orchestrationHeartbeat.python.importName).toBe(
+				"orchestration_heartbeat",
+			);
 		});
 
 		it("ships the edit skill as a python skill importable as `edit`", () => {

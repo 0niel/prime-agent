@@ -407,11 +407,17 @@ export interface ToolRenderContext<TState = any, TArgs = any> {
 	isPartial: boolean;
 	/** Whether the result view is expanded. */
 	expanded: boolean;
+	/** Whether this row should show the global tool expansion shortcut. */
+	showExpandHint?: boolean;
 	/** Whether inline images are currently shown in the TUI. */
 	showImages: boolean;
+	/** Whether image fallback labels may parse dimensions from base64 data. */
+	includeImageDimensions: boolean;
 	/** Whether the current result is an error. */
 	isError: boolean;
 }
+
+export type ReplayBuiltInToolName = "bash" | "edit";
 
 /**
  * Tool definition for registerTool().
@@ -431,6 +437,8 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	parameters: TParams;
 	/** Controls whether ToolExecutionComponent renders the standard colored shell or the tool renders its own framing. */
 	renderShell?: "default" | "self";
+	/** Replay renderer to use for removed built-ins in saved transcripts. */
+	replayBuiltInToolName?: ReplayBuiltInToolName;
 
 	/** Optional compatibility shim to prepare raw tool call arguments before schema validation. Must return an object conforming to TParams. */
 	prepareArguments?: (args: unknown) => Static<TParams>;
@@ -1374,6 +1382,14 @@ export type SetLabelHandler = (entryId: string, label: string | undefined) => vo
  */
 export interface ExtensionRuntimeState {
 	flagValues: Map<string, boolean | string>;
+	/**
+	 * Extra env vars merged over process.env for pi.exec() subprocesses (an
+	 * undefined value unsets the key in the child). Read at call time (not load
+	 * time) so a host can scope per-session vars — e.g. the daemon supplying
+	 * each session's herdr pane identity — without mutating the shared
+	 * process.env. Returns undefined to use the parent env unchanged.
+	 */
+	getExecEnv?: () => Record<string, string | undefined> | undefined;
 	/** Provider registrations queued during extension loading, processed when runner binds */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; extensionPath: string }>;
 	/** Throws when this extension instance is stale after runtime replacement. */

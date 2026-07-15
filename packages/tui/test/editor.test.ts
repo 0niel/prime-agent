@@ -2296,6 +2296,80 @@ describe("Editor component", () => {
 			assert.strictEqual(editor.isShowingAutocomplete(), false);
 		});
 
+		it("accepts an inline slash command with Enter without submitting the prompt", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const submitted: string[] = [];
+			editor.onSubmit = (text) => submitted.push(text);
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider([{ name: "help", description: "Show help" }], process.cwd()),
+			);
+			editor.setText("Please use ");
+
+			editor.handleInput("/");
+			editor.handleInput("h");
+			editor.handleInput("e");
+			await flushAutocomplete();
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+
+			editor.handleInput("\r");
+			assert.strictEqual(editor.getText(), "Please use /help ");
+			assert.deepStrictEqual(submitted, []);
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+		});
+
+		it("accepts inline slash commands with Tab on later prompt lines", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider([{ name: "help", description: "Show help" }], process.cwd()),
+			);
+			editor.setText("First line\nThen ");
+
+			editor.handleInput("/");
+			editor.handleInput("h");
+			editor.handleInput("e");
+			await flushAutocomplete();
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+
+			editor.handleInput("\t");
+			assert.strictEqual(editor.getText(), "First line\nThen /help ");
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+		});
+
+		it("preserves standalone slash command submission", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const submitted: string[] = [];
+			editor.onSubmit = (text) => submitted.push(text);
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider([{ name: "help", description: "Show help" }], process.cwd()),
+			);
+
+			editor.handleInput("/");
+			editor.handleInput("h");
+			editor.handleInput("e");
+			await flushAutocomplete();
+			editor.handleInput("\r");
+
+			assert.deepStrictEqual(submitted, ["/help"]);
+			assert.strictEqual(editor.getText(), "");
+		});
+
+		it("does not trigger slash command autocomplete inside URLs or paths", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider([{ name: "help", description: "Show help" }], process.cwd()),
+			);
+
+			editor.setText("Visit https:/");
+			editor.handleInput("/");
+			await flushAutocomplete();
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+
+			editor.setText("Open src");
+			editor.handleInput("/");
+			await flushAutocomplete();
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+		});
+
 		it("applies exact typed slash-argument value on Enter even when first item is highlighted", async () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 
@@ -3656,6 +3730,85 @@ describe("Editor component", () => {
 
 			assert.match(editor.getText(), /\[paste #\d+ \+\d+ lines\]/);
 			assert.strictEqual(editor.getExpandedText(), pastedText);
+		});
+
+		it("restores expanded pasted content from a paste snapshot", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const pastedText = [
+				"line 1",
+				"line 2",
+				"line 3",
+				"line 4",
+				"line 5",
+				"line 6",
+				"line 7",
+				"line 8",
+				"line 9",
+				"line 10",
+				"line 11",
+			].join("\n");
+			let submitted = "";
+			editor.onSubmit = (text) => {
+				submitted = text;
+			};
+
+			editor.handleInput(`\x1b[200~${pastedText}\x1b[201~`);
+			const markerText = editor.getText();
+			const snapshot = editor.getPasteSnapshot();
+			editor.handleInput("\r");
+
+			const restored = new Editor(createTestTUI(), defaultEditorTheme);
+			restored.setText(markerText);
+			restored.restorePasteSnapshot(snapshot);
+
+			assert.match(markerText, /\[paste #\d+ \+\d+ lines\]/);
+			assert.strictEqual(submitted, pastedText);
+			assert.strictEqual(restored.getExpandedText(), pastedText);
+		});
+
+		it("restores paste snapshot state on undo", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const originalText = [
+				"original 1",
+				"original 2",
+				"original 3",
+				"original 4",
+				"original 5",
+				"original 6",
+				"original 7",
+				"original 8",
+				"original 9",
+				"original 10",
+				"original 11",
+			].join("\n");
+			const restoredText = [
+				"restored 1",
+				"restored 2",
+				"restored 3",
+				"restored 4",
+				"restored 5",
+				"restored 6",
+				"restored 7",
+				"restored 8",
+				"restored 9",
+				"restored 10",
+				"restored 11",
+				"restored 12",
+			].join("\n");
+			const restoredSource = new Editor(createTestTUI(), defaultEditorTheme);
+
+			editor.handleInput(`\x1b[200~${originalText}\x1b[201~`);
+			const originalMarker = editor.getText();
+			restoredSource.handleInput(`\x1b[200~${restoredText}\x1b[201~`);
+
+			editor.setText(restoredSource.getText());
+			editor.restorePasteSnapshot(restoredSource.getPasteSnapshot());
+			assert.strictEqual(editor.getExpandedText(), restoredText);
+
+			editor.handleInput("\x1b[45;5u");
+
+			assert.strictEqual(editor.getText(), originalMarker);
+			assert.strictEqual(editor.getExpandedText(), originalText);
 		});
 
 		it("snaps to the paste marker start when navigating down into it", () => {

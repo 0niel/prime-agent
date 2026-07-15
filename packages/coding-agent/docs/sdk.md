@@ -62,7 +62,7 @@ const { session } = await createAgentSession();
 // Custom: override specific options
 const { session } = await createAgentSession({
   model: myModel,
-  tools: ["ipython", "bash"],
+  tools: ["ipython"],
   sessionManager: SessionManager.inMemory(),
 });
 ```
@@ -474,7 +474,7 @@ const { session } = await createAgentSession({
 
 // Pick specific tools
 const { session } = await createAgentSession({
-  tools: ["bash", "edit"],
+  tools: ["ipython"],
 });
 ```
 
@@ -701,7 +701,7 @@ const { session: opened } = await createAgentSession({
 
 // List sessions
 const currentProjectSessions = await SessionManager.list(process.cwd());
-const allSessions = await SessionManager.listAll(process.cwd());
+const allSessions = await SessionManager.listAll();
 
 // Session replacement API for /new, /resume, /fork, /clone, and import flows.
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
@@ -743,7 +743,7 @@ const sm = SessionManager.open("/path/to/session.jsonl");
 
 // Session listing
 const currentProjectSessions = await SessionManager.list(process.cwd());
-const allSessions = await SessionManager.listAll(process.cwd());
+const allSessions = await SessionManager.listAll();
 
 // Tree traversal
 const entries = sm.getEntries();        // All entries (excludes header)
@@ -926,7 +926,7 @@ const { session } = await createAgentSession({
   authStorage,
   modelRegistry,
 
-  tools: ["ipython", "bash"],
+  tools: ["ipython"],
   customTools: [statusTool],
   resourceLoader: loader,
 

@@ -34,6 +34,9 @@ export const isBunBinary =
 /** Detect if Bun is the runtime (compiled binary or bun run) */
 export const isBunRuntime = !!process.versions.bun;
 
+export const SELF_UPDATE_INTERACTIVE_CHILD_ENV = "PRIME_AGENT_INTERACTIVE_SELF_UPDATE";
+export const SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE = 75;
+
 // =============================================================================
 // Install Method Detection
 // =============================================================================
@@ -542,6 +545,11 @@ export function getAgentTracesLogPath(): string {
 	return join(getLogsDir(), "agent-traces.log");
 }
 
+/** Shared structured (JSON lines) log for client, daemon, and provider diagnostics. */
+export function getAgentLogPath(): string {
+	return join(getLogsDir(), "agent.jsonl");
+}
+
 /**
  * Log file for a daemon. The basename keeps it readable; a hash of the full
  * socket path makes it unique so two sockets that share a basename (e.g.
@@ -552,6 +560,10 @@ export function getDaemonLogPath(socketPath: string): string {
 	return join(getLogsDir(), `${basename(socketPath)}.${hash}.log`);
 }
 
+export function getDaemonUpdateRestartManifestPath(agentDir: string = getAgentDir()): string {
+	return join(agentDir, "daemon-update-restart.json");
+}
+
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
 
 /**
@@ -560,11 +572,11 @@ const MAX_LOG_BYTES = 5 * 1024 * 1024;
  * — a long-lived writer rotates on the write that crosses the cap, not only at
  * startup. Best-effort: diagnostics must never throw into the caller.
  */
-export function appendRotatingLog(logPath: string, message: string): void {
+export function appendRotatingLog(logPath: string, message: string, maxBytes: number = MAX_LOG_BYTES): void {
 	try {
 		mkdirSync(dirname(logPath), { recursive: true });
 		try {
-			if (existsSync(logPath) && statSync(logPath).size > MAX_LOG_BYTES) {
+			if (existsSync(logPath) && statSync(logPath).size > maxBytes) {
 				// Drop any prior .old first: renameSync fails on Windows if it exists.
 				rmSync(`${logPath}.old`, { force: true });
 				renameSync(logPath, `${logPath}.old`);

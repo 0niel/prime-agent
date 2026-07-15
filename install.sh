@@ -50,6 +50,7 @@ prime_agent_screen_title=
 prime_agent_screen_status=
 prime_agent_screen_detail=
 prime_agent_screen_question=
+prime_agent_animation_frame=0
 
 main() {
 	if [ "$prime_agent_base_url" = "$prime_agent_unconfigured_base_url" ]; then
@@ -240,9 +241,9 @@ prime_agent_screen() {
 	prime_agent_screen_frame_text=$(prime_agent_render_screen)
 
 	if ( : <>/dev/tty ) 2>/dev/null; then
-		printf '%s%s%s\n%s' "$prime_agent_sync_start" "$prime_agent_screen_prefix" "$prime_agent_screen_frame_text" "$prime_agent_sync_end" >/dev/tty
+		printf '%s%s%s%s' "$prime_agent_sync_start" "$prime_agent_screen_prefix" "$prime_agent_screen_frame_text" "$prime_agent_sync_end" >/dev/tty
 	else
-		printf '%s%s%s\n%s' "$prime_agent_sync_start" "$prime_agent_screen_prefix" "$prime_agent_screen_frame_text" "$prime_agent_sync_end" >&2
+		printf '%s%s%s%s' "$prime_agent_sync_start" "$prime_agent_screen_prefix" "$prime_agent_screen_frame_text" "$prime_agent_sync_end" >&2
 	fi
 }
 
@@ -679,10 +680,51 @@ prime_agent_pulse() {
 	esac
 }
 
+prime_agent_animation_detail_count() {
+	details="$1"
+	case "$details" in
+		*'
+'*) printf '%s\n' "$details" | wc -l | tr -d ' ' ;;
+		*) printf '1' ;;
+	esac
+}
+
+prime_agent_animation_current_frame() {
+	frame="${prime_agent_animation_frame:-1}"
+	case "$frame" in
+		""|*[!0-9]*) frame=1 ;;
+	esac
+	if [ "$frame" -lt 1 ]; then
+		frame=1
+	fi
+	printf '%s' "$frame"
+}
+
+prime_agent_animation_step_index() {
+	details="$1"
+	detail_count=$(prime_agent_animation_detail_count "$details")
+	frame=$(prime_agent_animation_current_frame)
+	detail_index=$(((frame - 1) / 24 + 1))
+	if [ "$detail_index" -gt "$detail_count" ]; then
+		detail_index="$detail_count"
+	fi
+	printf '%s' "$detail_index"
+}
+
 prime_agent_static_progress_title() {
 	case "$1" in
 		*...) printf '%s' "$1" ;;
 		*) printf '%s...' "$1" ;;
+	esac
+}
+
+prime_agent_animation_status() {
+	status="$1"
+	details="$2"
+	status_mode="$3"
+	case "$status_mode" in
+		static) prime_agent_static_progress_title "$status" ;;
+		*) printf '%s%s' "$status" "$(prime_agent_pulse)" ;;
 	esac
 }
 
@@ -691,8 +733,7 @@ prime_agent_animation_detail() {
 	case "$details" in
 		*'
 '*)
-			detail_count=$(printf '%s\n' "$details" | wc -l | tr -d ' ')
-			detail_index=$(((prime_agent_screen_frame / 12) % detail_count + 1))
+			detail_index=$(prime_agent_animation_step_index "$details")
 			printf '%s\n' "$details" | sed -n "${detail_index}p"
 			;;
 		*) printf '%s' "$details" ;;
@@ -734,12 +775,11 @@ prime_agent_run_quiet_with_animation_command() {
 	output_file="$output_dir/output"
 	"$@" >"$output_file" 2>&1 &
 	command_pid=$!
+	prime_agent_animation_frame=0
 
 	while kill -0 "$command_pid" 2>/dev/null; do
-		case "$status_mode" in
-			static) status_display=$(prime_agent_static_progress_title "$status") ;;
-			*) status_display="$status$(prime_agent_pulse)" ;;
-		esac
+		prime_agent_animation_frame=$((prime_agent_animation_frame + 1))
+		status_display=$(prime_agent_animation_status "$status" "$details" "$status_mode")
 		prime_agent_screen "$title" "$status_display" "$(prime_agent_animation_detail "$details")" ""
 		sleep 0.18
 	done

@@ -35,6 +35,8 @@ const DAEMON_CLIENT_COMMANDS = new Set([
 	"kill",
 	"rename",
 	"prompt",
+	"send",
+	"agent-messages",
 	"steer",
 	"follow-up",
 	"state",
@@ -42,6 +44,8 @@ const DAEMON_CLIENT_COMMANDS = new Set([
 	"stats",
 	"commands",
 	"cron",
+	"retry",
+	"restart",
 	"shutdown",
 ]);
 
@@ -100,7 +104,8 @@ function parseDaemonClientCommand(args: string[]): ParsedDaemonClientCommand {
 			continue;
 		}
 
-		if (arg === "--" && command === "cron") {
+		// send/cron parse "--" themselves as an end-of-flags separator
+		if (arg === "--" && (command === "cron" || command === "send")) {
 			positionals.push(arg);
 			passthrough = true;
 			continue;
@@ -206,6 +211,12 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 			case "prompt":
 				await runPrompt(client, parsed.positionals);
 				return;
+			case "send":
+				await runSend(client, parsed.positionals, parsed.json);
+				return;
+			case "agent-messages":
+				await runAgentMessages(client, parsed.positionals, parsed.json);
+				return;
 			case "steer":
 				await runMessageCommand(client, "steer", parsed.positionals, parsed.json);
 				return;
@@ -243,13 +254,41 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 			case "cron":
 				await runCron(client, parsed.positionals, parsed.json);
 				return;
+			case "retry":
+				if (parsed.positionals.length !== 1) {
+					throw new Error("Usage: daemon retry <session>");
+				}
+				await printResponseData(
+					client,
+					{ type: "retry_worker", activeSessionId: parsed.positionals[0]! },
+					parsed.json,
+				);
+				return;
+			case "restart":
+				if (parsed.positionals.length !== 0) {
+					throw new Error("Usage: daemon restart");
+				}
+				await printResponseData(client, { type: "restart" }, parsed.json);
+				return;
 			case "shutdown":
-				await printResponseData(client, { type: "shutdown" }, parsed.json);
+				await runShutdown(client, parsed.positionals, parsed.json);
 				return;
 		}
 	} finally {
 		client.close();
 	}
+}
+
+async function runShutdown(client: DaemonClient, args: string[], json: boolean): Promise<void> {
+	let force = false;
+	for (const arg of args) {
+		if (arg === "--force" || arg === "-f") {
+			force = true;
+			continue;
+		}
+		throw new Error(`Unknown shutdown option: ${arg}`);
+	}
+	await printResponseData(client, { type: "shutdown", force }, json);
 }
 
 async function runOpen(parsed: ParsedDaemonClientCommand): Promise<void> {
@@ -291,8 +330,6 @@ interface ParsedSessionArgs {
 const SESSION_BOOLEAN_FLAGS = new Set([
 	"--continue",
 	"-c",
-	"--resume",
-	"-r",
 	"--no-session",
 	"--no-tools",
 	"-nt",
@@ -407,7 +444,20 @@ function parseSessionOption(
 		apply(value);
 		return withValue(daemonArg, value);
 	};
+	const withSessionSelector = (value: string, consumed: number): ParsedSessionOption => {
+		if (!value) {
+			throw new Error(`${arg.split("=")[0]} requires a value`);
+		}
+		return {
+			consumed,
+			sessionPath: looksLikeSessionPath(value) ? resolvePathOption(value, config.cwd ?? pathBaseCwd) : value,
+		};
+	};
 	const boolean = (daemonArg = arg): ParsedSessionOption => ({ consumed: 0, daemonArg });
+
+	if (arg.startsWith("--resume=")) {
+		return withSessionSelector(arg.slice("--resume=".length), 0);
+	}
 
 	switch (arg) {
 		case "--continue":
@@ -415,14 +465,7 @@ function parseSessionOption(
 			return { consumed: 0, continueRecent: true };
 		case "--resume":
 		case "-r":
-			throw new Error(`${arg} is not supported for daemon sessions; use --session <selector> or --continue instead`);
-		case "--session": {
-			const value = readValue();
-			return {
-				consumed: 1,
-				sessionPath: looksLikeSessionPath(value) ? resolvePathOption(value, config.cwd ?? pathBaseCwd) : value,
-			};
-		}
+			return withSessionSelector(readValue(), 1);
 		case "--session-dir":
 			return withParsedValue(arg, (value) => {
 				config.sessionDir = expandTildePath(value);
@@ -804,6 +847,146 @@ async function runPrompt(client: DaemonClient, args: string[]): Promise<void> {
 	}
 }
 
+async function runAgentMessages(client: DaemonClient, args: string[], json: boolean): Promise<void> {
+	const subcommand = args[0];
+	switch (subcommand) {
+		case "status":
+			requireNoExtraArgs(args, "daemon agent-messages status");
+			await printResponseData(client, { type: "agent_messages_status" }, json);
+			return;
+		case "pause":
+			requireNoExtraArgs(args, "daemon agent-messages pause");
+			await printResponseData(client, { type: "agent_messages_pause" }, json);
+			return;
+		case "resume":
+			requireNoExtraArgs(args, "daemon agent-messages resume");
+			await printResponseData(client, { type: "agent_messages_resume" }, json);
+			return;
+		case "clear": {
+			const activeSessionId = args[1];
+			if (!activeSessionId || args.length !== 2) {
+				throw new Error("Usage: daemon agent-messages clear <session>");
+			}
+			await printResponseData(client, { type: "agent_messages_clear", activeSessionId }, json);
+			return;
+		}
+		default:
+			throw new Error("Usage: daemon agent-messages <status|pause|resume|clear>");
+	}
+}
+
+function requireNoExtraArgs(args: string[], usage: string): void {
+	if (args.length > 1) {
+		throw new Error(`Usage: ${usage}`);
+	}
+}
+
+async function runSend(client: DaemonClient, args: string[], json: boolean): Promise<void> {
+	const parsed = parseSendArgs(args);
+	const response = await client.request({
+		type: "send_message",
+		targetActiveSessionId: parsed.targetActiveSessionId,
+		fromActiveSessionId: parsed.fromActiveSessionId,
+		deliveryMode: parsed.deliveryMode,
+		message: parsed.message,
+	});
+	const data = requireSuccess(response);
+	if (json) {
+		printJson(data);
+		return;
+	}
+	if (isAgentMessageReceipt(data)) {
+		const target = data.target.sessionName ?? data.target.activeSessionId;
+		console.log(data.deliveryStatus === "queued" ? `Queued for ${target}` : `Sent to ${target}`);
+		return;
+	}
+	console.log("ok");
+}
+
+interface ParsedSendArgs {
+	targetActiveSessionId: string;
+	fromActiveSessionId?: string;
+	deliveryMode?: "auto" | "steer" | "follow_up";
+	message: string;
+}
+
+function parseSendArgs(args: string[]): ParsedSendArgs {
+	let fromActiveSessionId: string | undefined;
+	let deliveryMode: "auto" | "steer" | "follow_up" | undefined;
+	let targetActiveSessionId: string | undefined;
+	let explicitMessage: string | undefined;
+	const messageParts: string[] = [];
+	let parseOptions = true;
+
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index];
+		if (parseOptions && arg === "--") {
+			parseOptions = false;
+			continue;
+		}
+		if (parseOptions && arg === "--from") {
+			const value = args[index + 1];
+			if (!value) {
+				throw new Error("--from requires a session id or name");
+			}
+			fromActiveSessionId = value;
+			index++;
+			continue;
+		}
+		if (parseOptions && arg === "--steer") {
+			deliveryMode = "steer";
+			continue;
+		}
+		if (parseOptions && arg === "--follow-up") {
+			deliveryMode = "follow_up";
+			continue;
+		}
+		if (parseOptions && arg === "--auto") {
+			deliveryMode = "auto";
+			continue;
+		}
+		if (parseOptions && arg === "--message") {
+			if (!targetActiveSessionId) {
+				throw new Error("--message must appear after the target session");
+			}
+			const value = args[index + 1];
+			if (!value) {
+				throw new Error("--message requires message text");
+			}
+			explicitMessage = value;
+			index++;
+			parseOptions = false;
+			continue;
+		}
+		if (parseOptions && arg.startsWith("--")) {
+			throw new Error(`Unknown option for daemon send: ${arg} (use -- before message text starting with --)`);
+		}
+		if (!targetActiveSessionId) {
+			targetActiveSessionId = arg;
+			continue;
+		}
+		messageParts.push(arg);
+	}
+
+	if (explicitMessage !== undefined && messageParts.length > 0) {
+		throw new Error(
+			"Usage: daemon send [--from <session>] [--steer|--follow-up] <target-session> [--message <message>|<message>]",
+		);
+	}
+	const message = (explicitMessage ?? messageParts.join(" ")).trim();
+	if (!targetActiveSessionId || !message) {
+		throw new Error(
+			"Usage: daemon send [--from <session>] [--steer|--follow-up] <target-session> [--message <message>|<message>]",
+		);
+	}
+	return {
+		targetActiveSessionId,
+		fromActiveSessionId,
+		deliveryMode,
+		message,
+	};
+}
+
 async function runMessageCommand(
 	client: DaemonClient,
 	type: "steer" | "follow_up",
@@ -1183,6 +1366,17 @@ class DaemonAttachTerminal {
 				}
 				this.rl?.prompt();
 				return;
+			case "session_resynced":
+				this.isStreaming = message.snapshot.state.isStreaming;
+				this.writeLine(
+					chalk.dim(`Session resynchronized: ${message.snapshot.state.sessionName ?? message.activeSessionId}`),
+				);
+				if (message.snapshot.messages.length > 0) {
+					this.writeLine(chalk.bold("Transcript"));
+					this.printTranscript(message.snapshot.messages);
+				}
+				this.rl?.prompt();
+				return;
 			case "session_detached":
 				return;
 			case "session_closed":
@@ -1262,6 +1456,7 @@ class DaemonAttachTerminal {
 			case "turn_end":
 			case "message_start":
 			case "tool_execution_update":
+			case "auth_stale":
 				return;
 		}
 	}
@@ -1416,7 +1611,8 @@ function isSessionSummary(value: unknown): value is SessionSummary {
 		typeof candidate.id === "string" &&
 		typeof candidate.sessionId === "string" &&
 		typeof candidate.cwd === "string" &&
-		typeof candidate.status === "string" &&
+		typeof candidate.lifecycle === "string" &&
+		typeof candidate.activity === "string" &&
 		typeof candidate.isStreaming === "boolean" &&
 		typeof candidate.isCompacting === "boolean" &&
 		typeof candidate.attachedClients === "number" &&
@@ -1449,6 +1645,20 @@ function getCronJob(value: unknown): { id: string; nextRunAt?: string } | undefi
 	return { id: candidate.id, ...(typeof candidate.nextRunAt === "string" ? { nextRunAt: candidate.nextRunAt } : {}) };
 }
 
+function isAgentMessageReceipt(
+	value: unknown,
+): value is { target: { activeSessionId: string; sessionName?: string }; deliveryStatus?: string } {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const target = (value as { target?: unknown }).target;
+	return (
+		!!target &&
+		typeof target === "object" &&
+		typeof (target as { activeSessionId?: unknown }).activeSessionId === "string"
+	);
+}
+
 function printDaemonHelp(): void {
 	console.log(`${chalk.bold("Usage:")}
   ${APP_NAME} daemon [options] [session name]
@@ -1465,6 +1675,8 @@ ${chalk.bold("Commands:")}
   attach <session>              Attach an interactive terminal to a live session
   detach [session]              Detach this client from one session or all sessions
   prompt <session> <message>    Send a prompt, stream events, and exit when idle
+  send [options] <target> <msg> Send an agent-to-agent message to another live session
+  agent-messages <cmd>          Safety controls: status, pause, resume, clear <session>
   steer <session> <message>     Queue a steering message
   follow-up <session> <message> Queue a follow-up message
   rename <session> <name>       Rename a live session
@@ -1477,14 +1689,19 @@ ${chalk.bold("Commands:")}
   cron add <session> <schedule> -- <message>
                                 Schedule a prompt for a session
   cron cancel <job-id>           Cancel a scheduled cron job
-  shutdown [--all]              Stop the daemon; --all force-stops every daemon on this machine
+  retry <session>               Retry a root worker marked failed
+  restart                       Restart only the supervisor and adopt existing workers
+  shutdown [--force|--all]      Stop workers and the daemon; --force kills unresponsive workers
 
 ${chalk.bold("Options:")}
   --socket <path>               Socket path (default: ${defaultDaemonSocketPath()})
   --name <name>                 Name for the new session created by bare daemon
   --cwd <dir>                   Working directory for the created session
+  --resume <selector>           Resume a saved session file or partial UUID
   --foreground, --no-detach     Keep daemon attached to this terminal for debugging
   --json                        Print raw JSON for commands with formatted output; attach streams raw protocol JSON
+  send options: --from <session>, --steer, --follow-up, --message <message>
+  agent-messages clear only clears one explicitly named session
   Agent options such as --model, --provider, --tools, and --thinking apply to created sessions.
 
 ${chalk.bold("Examples:")}
@@ -1500,9 +1717,11 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock list
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock list -a
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock create scratch
+  ${APP_NAME} daemon --socket /tmp/prime-agent.sock create --resume <session>
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock cron add <session> "*/30 * * * *" -- "Check progress"
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock cron list
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock prompt <session> "Say hello"
+  ${APP_NAME} daemon --socket /tmp/prime-agent.sock send --from planner worker --message "Use this context..."
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock attach <session>
   ${APP_NAME} daemon --socket /tmp/prime-agent.sock shutdown
   ${APP_NAME} daemon shutdown --all

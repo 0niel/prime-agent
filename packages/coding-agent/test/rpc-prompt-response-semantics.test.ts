@@ -95,6 +95,7 @@ function sleep(ms: number): Promise<void> {
 
 function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: number; model?: Model<any> }): {
 	runtimeHost: AgentSessionRuntime;
+	session: AgentSession;
 	cleanup: () => Promise<void>;
 } {
 	const tempDir = join(tmpdir(), `pi-rpc-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -152,6 +153,7 @@ function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: number
 
 	return {
 		runtimeHost,
+		session,
 		cleanup: async () => {
 			try {
 				if (session.isStreaming) {
@@ -170,16 +172,17 @@ function createRuntimeHost(options: { withAuth: boolean; responseDelayMs: number
 
 async function startRpcMode(options: { withAuth: boolean; responseDelayMs: number; model?: Model<any> }): Promise<{
 	lineHandler: (line: string) => void;
+	session: AgentSession;
 	cleanup: () => Promise<void>;
 }> {
 	rpcIo.outputLines = [];
 	rpcIo.lineHandler = undefined;
 
-	const { runtimeHost, cleanup } = createRuntimeHost(options);
+	const { runtimeHost, session, cleanup } = createRuntimeHost(options);
 	void runRpcMode(runtimeHost);
 	await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
 
-	return { lineHandler: rpcIo.lineHandler!, cleanup };
+	return { lineHandler: rpcIo.lineHandler!, session, cleanup };
 }
 
 describe("RPC prompt response semantics", () => {
@@ -279,6 +282,43 @@ describe("RPC prompt response semantics", () => {
 			});
 
 			await sleep(150);
+		} finally {
+			await cleanup();
+		}
+	});
+
+	it("preserves omitted global scope on RPC refine commands", async () => {
+		const { lineHandler, session, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 0 });
+		const refine = vi.spyOn(session, "refine").mockResolvedValue({
+			id: "refine_rpc",
+			summary: "RPC refinement",
+			rationale: "Test refine scope default",
+			expectedOutcome: "Preserve local default",
+			appliedEdits: [],
+			harnessStatePath: "/tmp/harness_state.json",
+			scope: "local",
+		});
+
+		try {
+			lineHandler(JSON.stringify({ id: "r1", type: "refine", instructions: "record local lesson" }));
+
+			await vi.waitFor(() => {
+				expect(refine).toHaveBeenCalledWith({
+					instructions: "record local lesson",
+					rollbackId: undefined,
+					global: undefined,
+				});
+				expect(parseOutputLines(rpcIo.outputLines)).toEqual(
+					expect.arrayContaining([
+						expect.objectContaining({
+							id: "r1",
+							type: "response",
+							command: "refine",
+							success: true,
+						}),
+					]),
+				);
+			});
 		} finally {
 			await cleanup();
 		}

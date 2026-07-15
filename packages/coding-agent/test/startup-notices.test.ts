@@ -17,15 +17,17 @@ describe("startup notice formatters", () => {
 		initTheme("dark");
 	});
 
-	test("update notice mentions the version and prime-agent update command", () => {
+	test("update notice mentions the version and slash update command", () => {
 		const output = stripAnsi(formatUpdateAvailableNotice("1.2.3"));
-		expect(output).toBe("Update available: v1.2.3. Run prime-agent update");
+		expect(output).toBe("Update available: v1.2.3. Run /update");
+		expect(output).not.toContain("prime-agent update");
 		expect(output).not.toContain("pi update");
 	});
 
 	test("package update notice lists packages and the extensions command", () => {
 		const output = stripAnsi(formatPackageUpdateNotice(["npm:@foo/bar", "npm:@baz/qux"]));
-		expect(output).toBe("Package updates available: npm:@foo/bar, npm:@baz/qux. Run prime-agent update --extensions");
+		expect(output).toBe("Package updates available: npm:@foo/bar, npm:@baz/qux. Run /update --extensions");
+		expect(output).not.toContain("prime-agent update");
 	});
 
 	test("tmux warning notice is prefixed with the warning glyph", () => {

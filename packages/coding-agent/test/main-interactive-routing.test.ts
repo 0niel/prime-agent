@@ -9,6 +9,7 @@ import {
 	parseAgentsViewCommand,
 	parseDaemonRichTuiAttachShortcut,
 	resolveRuntimeSessionOptions,
+	restoreResumeSelectorFallback,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
 	shouldOpenAgentsViewForDaemonInteractive,
 	shouldUseDaemonInteractive,
@@ -92,8 +93,8 @@ describe("daemon-backed interactive session manager routing", () => {
 		],
 		["pending onboarding", { useDaemonInteractive: true, needsOnboarding: true, explicitAgentsView: true }],
 		[
-			"explicit session",
-			{ useDaemonInteractive: true, needsOnboarding: false, explicitAgentsView: true, session: "active-1" },
+			"resume selector",
+			{ useDaemonInteractive: true, needsOnboarding: false, explicitAgentsView: true, resume: "active-1" },
 		],
 		["resume picker", { useDaemonInteractive: true, needsOnboarding: false, explicitAgentsView: true, resume: true }],
 		[
@@ -114,19 +115,19 @@ describe("daemon-backed interactive session manager routing", () => {
 		expect(
 			shouldEnsureDaemonBeforeActiveSessionLookup({
 				useDaemonInteractive: true,
-				session: "active-1",
+				resumeSelector: "active-1",
 			}),
 		).toBe(true);
 		expect(
 			shouldEnsureDaemonBeforeActiveSessionLookup({
 				useDaemonInteractive: true,
-				session: "/tmp/session.jsonl",
+				resumeSelector: "/tmp/session.jsonl",
 			}),
 		).toBe(false);
 		expect(
 			shouldEnsureDaemonBeforeActiveSessionLookup({
 				useDaemonInteractive: false,
-				session: "active-1",
+				resumeSelector: "active-1",
 			}),
 		).toBe(false);
 	});
@@ -144,7 +145,8 @@ describe("daemon-backed interactive session manager routing", () => {
 			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", async () => ({
 				id: "active-1",
 				activeSessionId: "active-1",
-				status: "idle",
+				lifecycle: "draft",
+				activity: "idle",
 				sessionId: "session-1",
 				cwd: "/tmp/project",
 				isStreaming: false,
@@ -162,7 +164,7 @@ describe("daemon-backed interactive session manager routing", () => {
 
 	const persistentSelectionCases: Array<[string, DaemonInteractiveSessionManagerDecision]> = [
 		["active daemon attach", { hasActiveDaemonSession: true }],
-		["explicit saved session", { session: "saved-session-id" }],
+		["explicit saved session", { resume: "saved-session-id" }],
 		["resume picker", { resume: true }],
 		["continue recent", { continue: true }],
 		["fork", { fork: "source-session-id" }],
@@ -170,6 +172,22 @@ describe("daemon-backed interactive session manager routing", () => {
 
 	test.each(persistentSelectionCases)("keeps %s on a concrete local session manager", (_label, decision) => {
 		expect(shouldUseEphemeralSessionManagerForDaemonInteractive(decision)).toBe(false);
+	});
+
+	test("restores an unresolved resume selector candidate as prompt text", () => {
+		const parsed = {
+			resume: "fix",
+			resumeSelectorFallback: "fix",
+			messages: ["the", "bug"],
+			fileArgs: [],
+			unknownFlags: new Map(),
+			diagnostics: [],
+		};
+
+		expect(restoreResumeSelectorFallback(parsed, "fix")).toBe(true);
+		expect(parsed.resume).toBeUndefined();
+		expect(parsed.resumeSelectorFallback).toBeUndefined();
+		expect(parsed.messages).toEqual(["fix", "the", "bug"]);
 	});
 
 	test("finds an active daemon session by resolved session file", () => {
@@ -277,12 +295,64 @@ describe("runtime session option resolution", () => {
 			rlmSessionDir: "/tmp/rlm-session",
 		});
 	});
+
+	test("deep-merges autonomous runtime session overrides", () => {
+		const resolved = resolveRuntimeSessionOptions(
+			{
+				autonomous: {
+					enabled: true,
+					maxTurns: 20,
+					gates: { commands: ["npm test"], maxRetries: 3 },
+				},
+			},
+			{
+				autonomous: {
+					maxContinuations: 5,
+					gates: { timeoutMs: 1000 },
+				},
+			},
+		);
+
+		expect(resolved.autonomous).toEqual({
+			enabled: true,
+			maxTurns: 20,
+			maxContinuations: 5,
+			gates: { commands: ["npm test"], maxRetries: 3, timeoutMs: 1000 },
+		});
+	});
+
+	test("disables autonomous mode for subagent runtime sessions", () => {
+		const resolved = resolveRuntimeSessionOptions(
+			{
+				autonomous: {
+					enabled: true,
+					maxTurns: 20,
+					gates: { commands: ["npm test"], maxRetries: 3 },
+				},
+			},
+			{
+				rlmDepth: 1,
+				autonomous: {
+					maxContinuations: 5,
+					gates: { timeoutMs: 1000 },
+				},
+			},
+		);
+
+		expect(resolved.autonomous).toEqual({
+			enabled: false,
+			maxTurns: 20,
+			maxContinuations: 5,
+			gates: { commands: ["npm test"], maxRetries: 3, timeoutMs: 1000 },
+		});
+	});
 });
 
 function makeSessionSummary(overrides: Partial<SessionSummary>): SessionSummary {
 	return {
 		id: "session-1",
-		status: "idle",
+		lifecycle: "draft",
+		activity: "idle",
 		sessionId: "session-1",
 		cwd: "/tmp/project",
 		isStreaming: false,

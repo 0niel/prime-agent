@@ -10,8 +10,8 @@ import {
 	type ChildAgentInspectorNode,
 	ChildAgentSummaryComponent,
 } from "../src/modes/interactive/components/child-agent-inspector.js";
+import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import { IPythonCellComponent, type IPythonCellState } from "../src/modes/interactive/components/ipython-cell.js";
-import { SubAgentTreeComponent } from "../src/modes/interactive/components/sub-agent-tree.js";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
@@ -66,6 +66,16 @@ function createAssistantMessage(text: string, thinking?: string): AssistantMessa
 		usage: EMPTY_USAGE,
 		stopReason: "stop",
 		timestamp: Date.now(),
+	};
+}
+
+function bodyOptions(toolsExpanded = false) {
+	return {
+		ui: { requestRender() {} } as unknown as TUI,
+		cwd: "/tmp",
+		toolOptions: {},
+		getToolDefinition: () => undefined,
+		toolsExpanded,
 	};
 }
 
@@ -336,51 +346,6 @@ describe("marquee TUI components", () => {
 		expect(component.render(100)).toBe(expanded);
 	});
 
-	test("renders sub-agent tree nodes with status, previews, and transcript expansion", async () => {
-		const component = new SubAgentTreeComponent({
-			rootLabel: "root: triage logs",
-			nodes: [
-				{
-					id: "shard-0",
-					label: "shard-0",
-					status: "done",
-					durationMs: 12300,
-					tokenCount: 4200,
-					costUsd: 0.25,
-					answerPreview: "no anomaly, normal loss curve",
-					transcript: [{ role: "assistant", text: "no anomaly found in this shard" }],
-				},
-				{
-					id: "shard-1",
-					label: "shard-1",
-					status: "running",
-					durationMs: 7800,
-				},
-				{
-					id: "shard-2",
-					label: "shard-2",
-					status: "done",
-					durationMs: 11100,
-					tokenCount: 4700,
-					answerPreview: "NaN at step 2103",
-				},
-			],
-		});
-
-		const collapsed = await renderInVirtualTerminal(component);
-		expect(collapsed).toContain("root: triage logs");
-		expect(collapsed).toContain(' ├─ done shard-0 · 12.3s · "no anomaly, normal loss curve"');
-		expect(collapsed).toContain(" ├─ running shard-1 · 7.8s");
-		expect(collapsed).toContain(' └─ done shard-2 · 11.1s · "NaN at step 2103"');
-		expect(collapsed).not.toContain("tok");
-		expect(collapsed).not.toContain("$0.25");
-		expect(collapsed).not.toContain("no anomaly found in this shard");
-
-		component.setExpanded("shard-0", true);
-		const expanded = await renderInVirtualTerminal(component);
-		expect(expanded).toContain("assistant: no anomaly found in this shard");
-	});
-
 	test("renders assistant thinking as quiet text without background styling", () => {
 		const component = new AssistantMessageComponent(
 			createAssistantMessage("answer", "Check **bold** and `code` first.\n```ts\nconst value = 1;\n```"),
@@ -473,47 +438,12 @@ describe("marquee TUI components", () => {
 			label: "inspect training logs",
 			status: "running",
 			sessionDir: "/tmp/session/sub-a",
-			transcript: [
-				{ role: "user", text: "inspect training logs" },
-				{ role: "assistant", text: "reading shard metrics" },
-				{ role: "tool", text: "bash: hi" },
-			],
-			structuredTranscript: [
-				{
-					type: "message",
-					role: "user",
-					text: "inspect training logs",
-					message: createUserMessage("inspect training logs"),
-				},
-				{
-					type: "message",
-					role: "assistant",
-					text: "reading shard metrics",
-					message: createAssistantMessage("reading shard metrics", "checking loss curve"),
-				},
-				{
-					type: "tool",
-					role: "tool",
-					text: "bash: hi",
-					toolCallId: "tool-sub-a",
-					toolName: "bash",
-					args: { command: "echo hi" },
-					result: {
-						content: [{ type: "text", text: "hi" }],
-						isError: false,
-					},
-					isPartial: false,
-					executionStarted: true,
-					argsComplete: true,
-				},
-			],
 			children: [
 				{
 					id: "sub-b",
 					label: "check shard 2",
 					status: "done",
 					sessionDir: "/tmp/session/sub-b",
-					transcript: [{ role: "assistant", text: "no anomaly" }],
 				},
 			],
 		};
@@ -525,9 +455,8 @@ describe("marquee TUI components", () => {
 		const summaryText = summaryLines.join("\n");
 		expect(summaryText).toContain("agents-sidebar");
 		expect(summaryText).toContain("37% context left");
-		expect(summaryText).toContain("Subagent 1");
-		expect(summaryText).toContain("inspect training logs");
-		expect(summaryLines.some((line) => line.includes("─"))).toBe(true);
+		expect(summaryText).toContain("S1");
+		expect(summaryText).toContain("inspect training l…");
 		const infoRow = summary.render(90)[0] ?? "";
 		expect(visibleWidth(infoRow)).toBe(90);
 
@@ -542,50 +471,25 @@ describe("marquee TUI components", () => {
 
 		const detailComponent = new ChildAgentDetailComponent(() => 20);
 		detailComponent.setNode(node);
+		detailComponent.setBodyComponents(
+			buildConversationComponents(
+				[
+					createUserMessage("inspect training logs"),
+					createAssistantMessage("reading shard metrics", "checking loss curve"),
+				],
+				bodyOptions(),
+			),
+		);
 		const detailLines = detailComponent.render(42);
 		const detail = stripAnsi(detailLines.join("\n"));
-		expect(detail).toContain("running inspect training logs");
-		expect(detail).toContain("sub-a");
 		expect(detail).toContain("inspect training logs");
-		expect(detail).toContain("checking loss curve");
 		expect(detail).toContain("reading shard metrics");
-		expect(detail).toContain("$ echo hi");
-		expect(detail).toContain("hi");
 		expect(detail).toContain("← back to chat");
 		expect(detail).not.toContain("user: inspect training logs");
 		expect(detail).not.toContain("assistant: reading shard metrics");
-		expect(detail).not.toContain("tool: bash");
 	});
 
-	test("collapses multiline child agent system errors in detail view", () => {
-		const detailComponent = new ChildAgentDetailComponent(() => 20);
-		const errorText = [
-			"ChildProcessError: child exited with status 1",
-			"Traceback (most recent call last):",
-			'  File "/tmp/rlm_harness/internal.py", line 10, in run',
-			"ChildProcessError: child exited with status 1",
-		].join("\n");
-		detailComponent.setNode({
-			id: "sub-error",
-			label: "inspect failure",
-			status: "error",
-			sessionDir: "/tmp/session/sub-error",
-			transcript: [],
-			structuredTranscript: [{ type: "system", role: "system", text: errorText }],
-		});
-
-		const collapsed = stripAnsi(detailComponent.render(100).join("\n"));
-		expect(collapsed).toContain("ChildProcessError: child exited with status 1");
-		expect(collapsed).toContain("Ctrl+O to expand");
-		expect(collapsed).not.toContain("error details collapsed");
-		expect(collapsed).not.toContain("/tmp/rlm_harness/internal.py");
-
-		detailComponent.setToolsExpanded(true);
-		const expanded = stripAnsi(detailComponent.render(100).join("\n"));
-		expect(expanded).toContain("/tmp/rlm_harness/internal.py");
-	});
-
-	test("keeps child agent assistant errors expanded after transcript rebuilds", () => {
+	test("renders child agent assistant errors in the detail view", () => {
 		const detailComponent = new ChildAgentDetailComponent(() => 20);
 		detailComponent.setToolsExpanded(true);
 		const assistantError: AssistantMessage = {
@@ -604,25 +508,11 @@ describe("marquee TUI components", () => {
 			label: "inspect failure",
 			status: "error",
 			sessionDir: "/tmp/session/sub-assistant-error",
-			transcript: [],
-			structuredTranscript: [
-				{
-					type: "message",
-					role: "assistant",
-					text: assistantError.errorMessage ?? "",
-					message: assistantError,
-				},
-			],
 		});
+		detailComponent.setBodyComponents(buildConversationComponents([assistantError], bodyOptions(true)));
 
 		const expanded = stripAnsi(detailComponent.render(100).join("\n"));
 		expect(expanded).toContain("/tmp/internal.py");
-		expect(expanded).not.toContain("Ctrl+O to expand");
-
-		detailComponent.invalidate();
-		const afterInvalidate = stripAnsi(detailComponent.render(100).join("\n"));
-		expect(afterInvalidate).toContain("/tmp/internal.py");
-		expect(afterInvalidate).not.toContain("Ctrl+O to expand");
 	});
 
 	test("routes child agent detail tool expansion through app keybindings", () => {
@@ -638,24 +528,6 @@ describe("marquee TUI components", () => {
 				label: "inspect training logs",
 				status: "running",
 				sessionDir: "/tmp/session/sub-a",
-				transcript: [],
-				structuredTranscript: [
-					{
-						type: "tool",
-						role: "tool",
-						text: "bash: hi",
-						toolCallId: "tool-sub-a",
-						toolName: "bash",
-						args: { command: "echo hi" },
-						result: {
-							content: [{ type: "text", text: "hi" }],
-							isError: false,
-						},
-						isPartial: false,
-						executionStarted: true,
-						argsComplete: true,
-					},
-				],
 			});
 
 			const before = stripAnsi(detailComponent.render(80).join("\n"));
@@ -682,7 +554,6 @@ describe("marquee TUI components", () => {
 				label: "inspect training logs",
 				status: "running",
 				sessionDir: "/tmp/session/sub-a",
-				transcript: [],
 			},
 		]);
 
@@ -692,7 +563,7 @@ describe("marquee TUI components", () => {
 		expect(visibleWidth(infoRow)).toBe(32);
 		expect(stripAnsi(infoRow)).toContain("Pursuing goal");
 		// The subagent itself renders as a list row below the info line.
-		expect(stripAnsi(lines.join("\n"))).toContain("Subagent 1");
+		expect(stripAnsi(lines.join("\n"))).toContain("S1");
 	});
 
 	test("renders full child agent detail without internal scroll controls", () => {
@@ -702,16 +573,20 @@ describe("marquee TUI components", () => {
 			label: "inspect long output",
 			status: "done",
 			sessionDir: "/tmp/session/sub-scroll",
-			transcript: Array.from({ length: 12 }, (_, index) => ({
-				role: "assistant" as const,
-				text: `fallback transcript row ${String(index + 1).padStart(2, "0")}`,
-			})),
 		});
+		detailComponent.setBodyComponents(
+			buildConversationComponents(
+				Array.from({ length: 12 }, (_, index) =>
+					createAssistantMessage(`conversation row ${String(index + 1).padStart(2, "0")}`),
+				),
+				bodyOptions(),
+			),
+		);
 
 		const firstLines = detailComponent.render(48);
 		const first = stripAnsi(firstLines.join("\n"));
-		expect(first).toContain("fallback transcript row 01");
-		expect(first).toContain("fallback transcript row 12");
+		expect(first).toContain("conversation row 01");
+		expect(first).toContain("conversation row 12");
 		expect(first).toContain("← back to chat");
 		expect(first).not.toContain("↑");
 		expect(first).not.toContain("↓");
@@ -738,23 +613,25 @@ describe("marquee TUI components", () => {
 
 		// Collapsed: routed through the cell renderer (a status line), not the
 		// generic JSON arg dump.
-		const collapsed = stripAnsi(component.render(100).join("\n"));
+		const collapsedLines = component.render(100);
+		const collapsed = stripAnsi(collapsedLines.join("\n"));
 		expect(collapsed).toContain("python");
 		expect(collapsed).toContain("12ms");
+		expect(collapsed).toContain("Ctrl+O to expand");
 		expect(collapsed).not.toContain("ipython");
 		expect(collapsed).not.toContain('"code"');
 
-		// Expanded: full panel with the code and output on the panel background.
+		// Expanded keeps the same status content while updating the toggle hint,
+		// then attaches the code and output below it, backgroundless like the top line.
 		component.setExpanded(true);
-		const rawOutput = component.render(100).join("\n");
-		expect(rawOutput).toMatch(/\x1b\[48;(?:2|5);/);
-		const panelLine = component.render(100).find((line) => line.includes("\x1b[48;")) ?? "";
-		expect(panelLine.startsWith("\x1b[48;")).toBe(true);
-		expect(panelLine.endsWith("\x1b[49m")).toBe(true);
-		expect(visibleWidth(panelLine)).toBe(100);
-		const expanded = stripAnsi(rawOutput);
+		const expandedLines = component.render(100);
+		const expanded = stripAnsi(expandedLines.join("\n"));
+		const expandedStatus = expandedLines.map(stripAnsi).find((line) => line.includes("python · print(55)"));
+		expect(expandedStatus).toContain("↑ 1 ↓ 1 lines · 12ms");
+		expect(expanded).toContain("Ctrl+O to collapse");
 		expect(expanded).toContain("print(55)");
 		expect(expanded).toContain("55");
 		expect(expanded).not.toContain('"code"');
+		expect(expandedLines.some((line) => /\x1b\[48;/.test(line))).toBe(false);
 	});
 });

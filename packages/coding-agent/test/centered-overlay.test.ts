@@ -1,6 +1,6 @@
-import { type Component, type Focusable, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, type Focusable, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
-import { CenteredOverlayComponent } from "../src/modes/interactive/components/centered-overlay.js";
+import { CenteredOverlayComponent, showFullPaneOverlay } from "../src/modes/interactive/components/centered-overlay.js";
 
 class TestComponent implements Component, Focusable {
 	focused = false;
@@ -51,5 +51,20 @@ describe("CenteredOverlayComponent", () => {
 
 		expect(inner.focused).toBe(true);
 		expect(inner.inputs).toEqual(["x"]);
+	});
+
+	it("uses the full terminal width when requested", () => {
+		let overlay: Component | undefined;
+		const ui = {
+			terminal: { rows: 1 },
+			showOverlay: (component: Component) => {
+				overlay = component;
+				return {};
+			},
+		} as unknown as TUI;
+
+		showFullPaneOverlay(ui, new TestComponent(), { fullWidth: true });
+
+		expect(overlay?.render(120)[0]).toContain("content 120");
 	});
 });

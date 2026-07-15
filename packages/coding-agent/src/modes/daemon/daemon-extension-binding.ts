@@ -8,8 +8,10 @@ import type {
 } from "../../core/extensions/index.js";
 import type { SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import { createAgentConnectionState } from "../agent-connection/snapshot.js";
+import type { AgentConnectionState } from "../agent-connection/types.js";
 import { type Theme, theme } from "../interactive/theme/theme.js";
 import type { ActiveSessionState } from "./active-session-state.js";
+import { execEnvForSession, withClientEnv } from "./daemon-client-env.js";
 import {
 	type DaemonExtensionUIResponse,
 	type DaemonOutbound,
@@ -18,6 +20,8 @@ import {
 
 export interface ActiveSessionBindingCallbacks {
 	broadcast: (state: ActiveSessionState, message: DaemonOutbound) => void;
+	createConnectionState?: (state: ActiveSessionState) => AgentConnectionState;
+	sessionReplaced?: (state: ActiveSessionState) => void;
 	shutdown: () => void;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 }
@@ -48,6 +52,11 @@ export async function bindActiveSessionState(
 ): Promise<void> {
 	const session = state.runtime.session;
 
+	session.setExecEnvProvider(() => execEnvForSession(state.clientEnv));
+	// Every runtime rebuild (new/switch/fork/import, subagent spawn) re-loads
+	// extensions, which capture client env synchronously at that moment.
+	state.runtime.setRuntimeEnvScope((fn) => withClientEnv(state.clientEnv, fn));
+
 	state.unsubscribe?.();
 	state.runtime.setSubagentRuntimeHost(callbacks.subagentRuntimeHost);
 	state.unsubscribe = session.subscribe((event) => {
@@ -60,10 +69,13 @@ export async function bindActiveSessionState(
 
 	state.runtime.setRebindSession(async () => {
 		await bindActiveSessionState(state, callbacks);
+		callbacks.sessionReplaced?.(state);
 		callbacks.broadcast(state, {
 			type: "session_replaced",
 			activeSessionId: state.activeSessionId,
-			state: createAgentConnectionState(state.runtime, state.activeSessionId),
+			state:
+				callbacks.createConnectionState?.(state) ??
+				createAgentConnectionState(state.runtime, state.activeSessionId),
 			messages: state.runtime.session.messages,
 		});
 	});
@@ -103,7 +115,9 @@ function createCommandContextActions(state: ActiveSessionState): ExtensionComman
 		},
 		switchSession: async (sessionPath, options) => state.runtime.switchSession(sessionPath, options),
 		reload: async () => {
-			await state.runtime.session.reload();
+			// Reload re-evaluates extension modules, which capture client env
+			// (e.g. herdr pane identity) synchronously at load.
+			await withClientEnv(state.clientEnv, () => state.runtime.session.reload());
 		},
 	};
 }

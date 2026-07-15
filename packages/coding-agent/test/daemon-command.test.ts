@@ -7,6 +7,10 @@ const daemonClientMock = vi.hoisted(() => {
 		type: string;
 		name?: string;
 		activeSessionId?: string;
+		targetActiveSessionId?: string;
+		fromActiveSessionId?: string;
+		deliveryMode?: string;
+		message?: string;
 		schedule?: string;
 		prompt?: string;
 		sessionPath?: string;
@@ -213,15 +217,139 @@ describe("daemon command", () => {
 		});
 	});
 
-	it("keeps bare --session values as session id selectors", async () => {
+	it("keeps bare --resume values as session id selectors", async () => {
 		await expect(
-			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "create", "--session", "abc123"]),
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "create", "--resume", "abc123"]),
 		).resolves.toBe(true);
 
 		const client = daemonClientMock.instances[0];
 		expect(client?.requests[0]).toMatchObject({
 			type: "create",
 			sessionPath: "abc123",
+		});
+	});
+
+	it("honors send delivery-mode flags after the target", async () => {
+		await expect(
+			handleDaemonCommand([
+				"daemon",
+				"--socket",
+				"/tmp/prime-agent.sock",
+				"send",
+				"worker",
+				"--steer",
+				"stop",
+				"and",
+				"re-plan",
+			]),
+		).resolves.toBe(true);
+
+		const client = daemonClientMock.instances[0];
+		expect(client?.requests[0]).toEqual({
+			type: "send_message",
+			targetActiveSessionId: "worker",
+			fromActiveSessionId: undefined,
+			deliveryMode: "steer",
+			message: "stop and re-plan",
+		});
+	});
+
+	it("rejects unknown send options instead of folding them into the message", async () => {
+		await expect(
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "send", "worker", "--bogus", "hello"]),
+		).rejects.toThrow("exit 1");
+
+		expect(daemonClientMock.instances[0]?.requests).toEqual([]);
+		expect(
+			consoleErrorMessages.some(
+				(message) => typeof message === "string" && message.includes("Unknown option for daemon send: --bogus"),
+			),
+		).toBe(true);
+	});
+
+	it("supports send separator after the target for flag-like message text", async () => {
+		await expect(
+			handleDaemonCommand([
+				"daemon",
+				"--socket",
+				"/tmp/prime-agent.sock",
+				"send",
+				"--follow-up",
+				"worker",
+				"--",
+				"--from",
+				"literal",
+				"--steer",
+			]),
+		).resolves.toBe(true);
+
+		const client = daemonClientMock.instances[0];
+		expect(client?.requests[0]).toEqual({
+			type: "send_message",
+			targetActiveSessionId: "worker",
+			fromActiveSessionId: undefined,
+			deliveryMode: "follow_up",
+			message: "--from literal --steer",
+		});
+	});
+
+	it("supports send separator before a flag-like target or message", async () => {
+		await expect(
+			handleDaemonCommand([
+				"daemon",
+				"--socket",
+				"/tmp/prime-agent.sock",
+				"send",
+				"--",
+				"--target-like",
+				"--from",
+				"literal",
+			]),
+		).resolves.toBe(true);
+
+		const client = daemonClientMock.instances[0];
+		expect(client?.requests[0]).toMatchObject({
+			type: "send_message",
+			targetActiveSessionId: "--target-like",
+			message: "--from literal",
+		});
+	});
+
+	it("rejects extra agent-messages status arguments", async () => {
+		await expect(
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "agent-messages", "pause", "active-1"]),
+		).rejects.toThrow("exit 1");
+
+		expect(daemonClientMock.instances[0]?.requests).toEqual([]);
+		expect(
+			consoleErrorMessages.some(
+				(message) => typeof message === "string" && message.includes("Usage: daemon agent-messages pause"),
+			),
+		).toBe(true);
+	});
+
+	it("parses send message text from an explicit --message value", async () => {
+		await expect(
+			handleDaemonCommand([
+				"daemon",
+				"--socket",
+				"/tmp/prime-agent.sock",
+				"send",
+				"--from",
+				"planner",
+				"worker",
+				"--message",
+				"please keep --from literal --steer",
+			]),
+		).resolves.toBe(true);
+
+		const client = daemonClientMock.instances[0];
+		expect(client?.requests[0]).toEqual({
+			type: "send_message",
+			targetActiveSessionId: "worker",
+			fromActiveSessionId: "planner",
+			deliveryMode: undefined,
+			message: "please keep --from literal --steer",
 		});
 	});
 

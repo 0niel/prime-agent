@@ -1,12 +1,12 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { setKeybindings } from "@earendil-works/pi-tui";
+import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import type { AgentConnectionSavedSessionInfo } from "../src/modes/agent-connection/index.js";
 import { SessionSelectorComponent } from "../src/modes/interactive/components/session-selector.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, preloadCodeHighlighter, theme } from "../src/modes/interactive/theme/theme.js";
 
 type Deferred<T> = {
 	promise: Promise<T>;
@@ -86,6 +86,7 @@ function createSymlinkedSessionPaths(): {
 }
 
 const CTRL_X = "\x18";
+const CTRL_S = "\x13";
 const CTRL_BACKSPACE = "\x1b[127;5u";
 
 describe("session selector path/delete interactions", () => {
@@ -103,9 +104,10 @@ describe("session selector path/delete interactions", () => {
 		setKeybindings(new KeybindingsManager());
 	});
 
-	beforeAll(() => {
+	beforeAll(async () => {
 		// session selector uses the global theme instance
 		initTheme("dark");
+		await preloadCodeHighlighter();
 	});
 	it("does not treat Ctrl+Backspace as delete when search query is non-empty", async () => {
 		const sessions = [makeSession({ id: "a" }), makeSession({ id: "b" })];
@@ -210,6 +212,197 @@ describe("session selector path/delete interactions", () => {
 		expect(deleteSession).toHaveBeenCalledWith(sessions[0]!.path);
 	});
 
+	it("shows an error when the injected delete handler rejects", async () => {
+		const sessions = [makeSession({ id: "a" })];
+		const deleteSession = vi.fn(async () => {
+			throw new Error("Cannot delete the currently active session");
+		});
+
+		const selector = new SessionSelectorComponent(
+			async () => sessions,
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings, deleteSession },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		list.handleInput(CTRL_X);
+		list.handleInput(CTRL_X);
+		await flushPromises();
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(deleteSession).toHaveBeenCalledTimes(1);
+		expect(output).toContain("Failed to delete: Cannot delete the currently active session");
+	});
+
+	it("keeps delete success visible when refresh after deletion fails", async () => {
+		const sessions = [makeSession({ id: "a" })];
+		const deleteSession = vi.fn(async () => ({ ok: true as const, method: "unlink" as const }));
+		let loadCalls = 0;
+
+		const selector = new SessionSelectorComponent(
+			async () => {
+				loadCalls++;
+				if (loadCalls > 1) {
+					throw new Error("refresh unavailable");
+				}
+				return sessions;
+			},
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings, deleteSession },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		list.handleInput(CTRL_X);
+		list.handleInput(CTRL_X);
+		await flushPromises();
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(deleteSession).toHaveBeenCalledTimes(1);
+		expect(output).toContain("Session deleted");
+		expect(output).not.toContain("Failed to delete");
+	});
+
+	it("waits for the complete session list while reporting load progress", async () => {
+		const session = makeSession({ id: "complete", name: "Complete session" });
+		const sessionsDeferred = createDeferred<AgentConnectionSavedSessionInfo[]>();
+		let receivedItemCallback = false;
+
+		const selector = new SessionSelectorComponent(
+			async (callbacks) => {
+				callbacks?.onProgress?.(1, 2);
+				receivedItemCallback = callbacks?.onSession !== undefined;
+				return sessionsDeferred.promise;
+			},
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		const loadingOutput = stripAnsi(selector.render(120).join("\n"));
+		expect(loadingOutput).toContain("loading 1/2");
+		expect(loadingOutput).not.toContain("Complete session");
+		expect(receivedItemCallback).toBe(false);
+
+		sessionsDeferred.resolve([session]);
+		await flushPromises();
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(output).toContain("current folder");
+		expect(output).toContain("Complete session");
+	});
+
+	it("selects the newest session from an unsorted completed list", async () => {
+		const older = makeSession({
+			id: "older",
+			name: "Older session",
+			modified: new Date("2026-01-01T00:00:00.000Z"),
+		});
+		const newer = makeSession({
+			id: "newer",
+			name: "Newer session",
+			modified: new Date("2026-01-03T00:00:00.000Z"),
+		});
+		const sessionsDeferred = createDeferred<AgentConnectionSavedSessionInfo[]>();
+		const onSelect = vi.fn();
+
+		const selector = new SessionSelectorComponent(
+			async () => sessionsDeferred.promise,
+			async () => [],
+			onSelect,
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		sessionsDeferred.resolve([older, newer]);
+		await flushPromises();
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(output).toContain("sort: recent");
+		expect(output.indexOf("Newer session")).toBeLessThan(output.indexOf("Older session"));
+
+		const list = selector.getSessionList();
+		list.handleInput("\r");
+		expect(onSelect).toHaveBeenCalledWith(newer.path);
+	});
+
+	it("keeps the selected session when a completed reload reorders the list", async () => {
+		const selected = makeSession({
+			id: "selected",
+			name: "Selected session",
+			modified: new Date("2026-01-02T00:00:00.000Z"),
+		});
+		const previousNewest = makeSession({
+			id: "previous-newest",
+			name: "Previous newest session",
+			modified: new Date("2026-01-03T00:00:00.000Z"),
+		});
+		const newNewest = makeSession({
+			id: "new-newest",
+			name: "New newest session",
+			modified: new Date("2026-01-04T00:00:00.000Z"),
+		});
+		const onSelect = vi.fn();
+		const selector = new SessionSelectorComponent(
+			async () => [selected, previousNewest],
+			async () => [],
+			onSelect,
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		list.handleInput("\x1b[B");
+		list.setSessions([selected, previousNewest, newNewest], false);
+		list.handleInput("\r");
+
+		expect(onSelect).toHaveBeenCalledWith(selected.path);
+	});
+
+	it("keeps the selected background across a truncated session row", async () => {
+		const session = makeSession({
+			id: "long",
+			name: "A session prompt that is much too long to fit within the available row width",
+		});
+		const selector = new SessionSelectorComponent(
+			async () => [session],
+			async () => [],
+			() => {},
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		const line = selector.render(60).find((candidate) => stripAnsi(candidate).includes("A session prompt"));
+		const backgroundStart = theme.bg("selectedBg", "").replace("\x1b[49m", "");
+		expect(stripAnsi(line ?? "")).toContain("…");
+		expect(line?.startsWith(backgroundStart)).toBe(true);
+		expect(line?.endsWith("\x1b[49m")).toBe(true);
+		expect(line).not.toContain("\x1b[0m");
+		expect(visibleWidth(line ?? "")).toBe(60);
+	});
+
 	it("does not switch scope back to All when All load resolves after toggling back to Current", async () => {
 		const currentSessions = [makeSession({ id: "current" })];
 		const allDeferred = createDeferred<AgentConnectionSavedSessionInfo[]>();
@@ -242,8 +435,38 @@ describe("session selector path/delete interactions", () => {
 		expect(output).not.toContain("all projects");
 	});
 
+	it("hides current-folder rows while all projects are loading", async () => {
+		const currentSession = makeSession({ id: "current", name: "Current folder session" });
+		const allDeferred = createDeferred<AgentConnectionSavedSessionInfo[]>();
+		const onSelect = vi.fn();
+		const selector = new SessionSelectorComponent(
+			async () => [currentSession],
+			async () => allDeferred.promise,
+			onSelect,
+			() => {},
+			() => {},
+			() => {},
+			{ keybindings },
+		);
+		await flushPromises();
+
+		const list = selector.getSessionList();
+		list.handleInput("\t");
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(output).toContain("loading");
+		expect(output).not.toContain("Current folder session");
+		expect(output).not.toContain("No sessions found");
+
+		list.handleInput("\r");
+		expect(onSelect).not.toHaveBeenCalled();
+
+		allDeferred.resolve([makeSession({ id: "all", name: "All projects session" })]);
+		await flushPromises();
+	});
+
 	it("does not start redundant All loads when toggling scopes while All is already loading", async () => {
-		const currentSessions = [makeSession({ id: "current" })];
+		const currentSessions = [makeSession({ id: "current", name: "Current folder session" })];
 		const allDeferred = createDeferred<AgentConnectionSavedSessionInfo[]>();
 		let allLoadCalls = 0;
 
@@ -267,6 +490,9 @@ describe("session selector path/delete interactions", () => {
 		list.handleInput("\t"); // current -> all again while load pending
 
 		expect(allLoadCalls).toBe(1);
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(output).toContain("loading");
+		expect(output).not.toContain("Current folder session");
 
 		allDeferred.resolve([makeSession({ id: "all" })]);
 		await flushPromises();
@@ -302,6 +528,10 @@ describe("session selector path/delete interactions", () => {
 			{ keybindings },
 		);
 		await flushPromises();
+
+		const list = selector.getSessionList();
+		list.handleInput(CTRL_S);
+		list.handleInput(CTRL_S);
 
 		const output = stripAnsi(selector.render(120).join("\n"));
 		expect(output).toContain("Parent");

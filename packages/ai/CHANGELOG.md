@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-13
+
+## [0.2.9] - 2026-07-13
+
+## [0.2.8] - 2026-07-09
+
+- Registered the full Prime Inference catalog (97 models, up from 32) instead of a curated whitelist; context/output limits, vision, and reasoning now come from OpenRouter metadata with a small override table for limits the gateway enforces differently (verified against the live API), and raw/duplicate variants (BF16, HF-cased, `zai-org/`, fine-tune outputs) are skipped.
+- Fixed Prime Inference context windows that disagreed with the live gateway: `anthropic/claude-sonnet-4.5` capped at 200k (route rejects longer prompts), `z-ai/glm-5.2` and `internal/glm-5.2-fast` raised to 1M, `minimax/minimax-m3` corrected to 512k, `nvidia/nemotron-3-*` corrected to their enforced 262k/131k windows.
+- Removed `prime-intellect/intellect-3`, which no longer serves (404 from the gateway).
+- Added an optional `featured` flag to `Model` so pickers can pin flagship models above a provider's long tail; set for 30 Prime Inference flagships.
+- Added GPT-5.6 Sol, Terra, and Luna to OpenAI API-key and Codex subscription model catalogs, with their 1.05M API / 272k Codex context windows and `low` through `max` reasoning support.
+
+## [0.2.7] - 2026-07-08
+
+- Added `internal/glm-5.2-fast` to the Prime Inference model catalog.
+- Added Claude Sonnet 5 to the Anthropic and Prime Inference model catalogs.
+
+## [0.2.6] - 2026-07-06
+
+## [0.2.5] - 2026-07-06
+
+- Added Claude Fable 5 to the Prime Inference model catalog and refreshed generated model metadata ([#317](https://github.com/PrimeIntellect-ai/prime-agent/pull/317)).
+- Changed provider stream failures to preserve classified causes, raw stop reasons, and request IDs instead of collapsing them into generic unknown errors ([#313](https://github.com/PrimeIntellect-ai/prime-agent/pull/313)).
+
+## [0.2.4] - 2026-07-01
+
+- Added Claude Fable 5 support on the Anthropic and Bedrock providers, handling its always-on adaptive thinking by never sending an explicit `thinking: disabled` or sampling params (which Fable rejects with a 400) ([#302](https://github.com/PrimeIntellect-ai/prime-agent/issues/302)).
+- Fixed the `openai-completions` and `openai-responses` providers serializing empty tool results as a literal "(see attached image)" placeholder; the placeholder is now gated on the result actually having images, matching the google-shared and mistral providers ([#290](https://github.com/PrimeIntellect-ai/prime-agent/issues/290)).
+
+## [0.2.3] - 2026-06-30
+
+- Added a `./mcp` entry point with a built-in MCP server catalog (Linear, Notion) and generic OAuth 2.1 (PKCE + dynamic client registration) providers stored as `mcp:<server>` in `auth.json`; the local OAuth callback server tries a range of ports so a stale or concurrent login can't block sign-in ([#280](https://github.com/PrimeIntellect-ai/prime-agent/issues/280)).
+- Added the `qwen/qwen3-30b-a3b-instruct-2507` model to the Prime Inference catalog ([#284](https://github.com/PrimeIntellect-ai/prime-agent/issues/284)).
+
 ## [0.2.2] - 2026-06-25
 
 - Added a curated `vision` flag on Prime Inference model metadata so vision-capable models advertise `["text", "image"]` input, since the Prime Inference models API reports no modality data ([#261](https://github.com/PrimeIntellect-ai/prime-agent/issues/261)).

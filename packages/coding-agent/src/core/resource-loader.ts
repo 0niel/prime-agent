@@ -130,6 +130,8 @@ export interface DefaultResourceLoaderOptions {
 	noContextFiles?: boolean;
 	/** Directory of built-in skills shipped with the package. Defaults to the bundled skills dir; pass null to disable. */
 	bundledSkillsDir?: string | null;
+	/** Extra force-exclude patterns for built-in skills (e.g. unauthenticated MCP integrations). */
+	extraBuiltinSkillOverrides?: () => string[];
 	systemPrompt?: string;
 	appendSystemPrompt?: string[];
 	extensionsOverride?: (base: LoadExtensionsResult) => LoadExtensionsResult;
@@ -191,6 +193,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	private appendSystemPromptOverride?: (base: string[]) => string[];
 
 	private extensionsResult: LoadExtensionsResult;
+	private loadedExtensionPaths: string[] = [];
 	private skills: Skill[];
 	private skillDiagnostics: ResourceDiagnostic[];
 	private prompts: PromptTemplate[];
@@ -218,6 +221,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 			agentDir: this.agentDir,
 			settingsManager: this.settingsManager,
 			bundledSkillsDir: this.bundledSkillsDir,
+			extraBuiltinSkillOverrides: options.extraBuiltinSkillOverrides,
 		});
 		this.additionalExtensionPaths = options.additionalExtensionPaths ?? [];
 		this.additionalSkillPaths = options.additionalSkillPaths ?? [];
@@ -258,6 +262,11 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	getExtensions(): LoadExtensionsResult {
 		return this.extensionsResult;
+	}
+
+	/** Extension file paths the last reload actually loaded (after settings overrides). */
+	getLoadedExtensionPaths(): string[] {
+		return this.loadedExtensionPaths;
 	}
 
 	getSkills(): { skills: Skill[]; diagnostics: ResourceDiagnostic[] } {
@@ -402,6 +411,10 @@ export class DefaultResourceLoader implements ResourceLoader {
 			: this.mergePaths(cliEnabledExtensions, enabledExtensions);
 
 		const extensionsResult = await loadExtensions(extensionPaths, this.cwd, this.eventBus);
+		// Set before inline factories run so a factory can see which file-based
+		// extensions actually loaded this cycle (e.g. the built-in Herdr reporter
+		// defers to Herdr's own file-based integration only when it is active).
+		this.loadedExtensionPaths = extensionPaths;
 		const inlineExtensions = await this.loadExtensionFactories(extensionsResult.runtime);
 		extensionsResult.extensions.push(...inlineExtensions.extensions);
 		extensionsResult.errors.push(...inlineExtensions.errors);

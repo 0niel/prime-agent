@@ -16,14 +16,14 @@ afterAll(() => {
 });
 
 describe("formatResumeHint", () => {
-	test("returns hint with --session and the session id for a persisted session", () => {
+	test("returns hint with --resume and the session id for a persisted session", () => {
 		const hint = formatResumeHint({
 			sessionId: SESSION_ID,
 			sessionFile: existingSessionFile,
 			userMessages: 3,
 		});
 		expect(hint).toBeDefined();
-		expect(hint).toContain(`${APP_NAME} --session ${SESSION_ID}`);
+		expect(hint).toContain(`${APP_NAME} --resume ${SESSION_ID}`);
 	});
 
 	test("returns undefined for an in-memory session", () => {

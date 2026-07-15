@@ -18,13 +18,13 @@ export interface Args {
 	appendSystemPrompt?: string[];
 	thinking?: ThinkingLevel;
 	continue?: boolean;
-	resume?: boolean;
+	resume?: true | string;
+	resumeSelectorFallback?: string;
 	help?: boolean;
 	version?: boolean;
 	mode?: Mode;
 	daemonSocket?: string;
 	noSession?: boolean;
-	session?: string;
 	fork?: string;
 	sessionDir?: string;
 	models?: string[];
@@ -42,6 +42,14 @@ export interface Args {
 	themes?: string[];
 	noThemes?: boolean;
 	noContextFiles?: boolean;
+	autonomous?: boolean;
+	autonomousGates?: string[];
+	autonomousGateRetries?: number;
+	autonomousGateTimeoutMs?: number;
+	autonomousMaxContinuations?: number;
+	autonomousMaxTurns?: number;
+	autonomousMaxTokens?: number;
+	autonomousTimeoutMs?: number;
 	listModels?: string | true;
 	offline?: boolean;
 	verbose?: boolean;
@@ -54,7 +62,7 @@ export interface Args {
 
 const VALID_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const REMOVED_BUILTIN_TOOL_NAMES = new Set(["read", "write", "grep", "find", "ls"]);
-const BUILTIN_TOOL_NAMES = ["ipython", "bash", "edit"];
+const BUILTIN_TOOL_NAMES = ["ipython"];
 
 export function isValidThinkingLevel(level: string): level is ThinkingLevel {
 	return VALID_THINKING_LEVELS.includes(level as ThinkingLevel);
@@ -68,8 +76,21 @@ export function parseArgs(args: string[]): Args {
 		diagnostics: [],
 	};
 
+	let endOfOptions = false;
+
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
+
+		// POSIX end-of-options: everything after a standalone "--" is a positional
+		// message, even if it starts with a dash (e.g. a Markdown-bullet prompt).
+		if (endOfOptions) {
+			result.messages.push(arg);
+			continue;
+		}
+		if (arg === "--") {
+			endOfOptions = true;
+			continue;
+		}
 
 		if (arg === "--help" || arg === "-h") {
 			result.help = true;
@@ -85,7 +106,27 @@ export function parseArgs(args: string[]): Args {
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
 		} else if (arg === "--resume" || arg === "-r") {
-			result.resume = true;
+			const next = args[i + 1];
+			if (next !== undefined && !next.startsWith("-") && !next.startsWith("@")) {
+				if (next === "") {
+					result.resume = true;
+					i++;
+				} else {
+					result.resume = next;
+					result.resumeSelectorFallback = next;
+					i++;
+				}
+			} else {
+				result.resume = true;
+			}
+		} else if (arg.startsWith("--resume=")) {
+			const value = arg.slice("--resume=".length);
+			if (!value) {
+				result.resume = true;
+			} else {
+				result.resume = value;
+				result.resumeSelectorFallback = value;
+			}
 		} else if (arg === "--provider" && i + 1 < args.length) {
 			result.provider = args[++i];
 		} else if (arg === "--model" && i + 1 < args.length) {
@@ -101,8 +142,6 @@ export function parseArgs(args: string[]): Args {
 			result.appendSystemPrompt.push(args[++i]);
 		} else if (arg === "--no-session") {
 			result.noSession = true;
-		} else if (arg === "--session" && i + 1 < args.length) {
-			result.session = args[++i];
 		} else if (arg === "--fork" && i + 1 < args.length) {
 			result.fork = args[++i];
 		} else if (arg === "--session-dir" && i + 1 < args.length) {
@@ -166,6 +205,44 @@ export function parseArgs(args: string[]): Args {
 			result.noThemes = true;
 		} else if (arg === "--no-context-files" || arg === "-nc") {
 			result.noContextFiles = true;
+		} else if (arg === "--autonomous") {
+			result.autonomous = true;
+		} else if (arg === "--autonomous-gate") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousGates = result.autonomousGates ?? [];
+				result.autonomousGates.push(args[++i]);
+			}
+		} else if (arg === "--autonomous-gate-retries") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousGateRetries = parsePositiveInt(args[++i], "--autonomous-gate-retries", result);
+			}
+		} else if (arg === "--autonomous-gate-timeout-ms") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousGateTimeoutMs = parsePositiveInt(args[++i], "--autonomous-gate-timeout-ms", result);
+			}
+		} else if (arg === "--autonomous-max-continuations") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousMaxContinuations = parsePositiveInt(args[++i], "--autonomous-max-continuations", result);
+			}
+		} else if (arg === "--autonomous-max-turns") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousMaxTurns = parsePositiveInt(args[++i], "--autonomous-max-turns", result);
+			}
+		} else if (arg === "--autonomous-max-tokens") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousMaxTokens = parsePositiveInt(args[++i], "--autonomous-max-tokens", result);
+			}
+		} else if (arg === "--autonomous-timeout-ms") {
+			result.autonomous = true;
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.autonomousTimeoutMs = parsePositiveInt(args[++i], "--autonomous-timeout-ms", result);
+			}
 		} else if (arg === "--list-models") {
 			// Check if next arg is a search pattern (not a flag or file arg)
 			if (i + 1 < args.length && !args[i + 1].startsWith("-") && !args[i + 1].startsWith("@")) {
@@ -241,8 +318,7 @@ ${chalk.bold("Options:")}
   --daemon-socket <path>         Socket path for daemon mode
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
-  --resume, -r                   Select a session to resume
-  --session <path|id>            Use specific session file or partial UUID
+  --resume, -r [path|id]         Resume specific session, or browse when omitted
   --fork <path|id>               Fork specific session file or partial UUID into a new session
   --session-dir <dir>            Directory for session storage and lookup
   --no-session                   Don't save session (ephemeral)
@@ -262,12 +338,21 @@ ${chalk.bold("Options:")}
   --theme <path>                 Load a theme file or directory (can be used multiple times)
   --no-themes                    Disable theme discovery and loading
   --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
+  --autonomous                   Continue autonomously until host-observable terminal evidence exists
+  --autonomous-gate <command>    Run a command before autonomous mode may finish (repeatable)
+  --autonomous-gate-retries <n>  Max autonomous retries per failed gate (default: 3)
+  --autonomous-gate-timeout-ms <n> Timeout per autonomous gate command in milliseconds
+  --autonomous-max-continuations <n> Max autonomous follow-up messages (default: 3)
+  --autonomous-max-turns <n>     Max assistant turns while autonomous mode is active (default: 12)
+  --autonomous-max-tokens <n>    Max tokens while autonomous mode is active (default: 80000)
+  --autonomous-timeout-ms <n>    Max autonomous wall-clock time in milliseconds (default: 1800000)
   --export <file>                Export session file to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
   --help, -h                     Show this help
   --version, -v                  Show version number
+  --                             End of options; treat all following args as messages
 
 Extensions can register additional flags (e.g., --plan from plan-mode extension).${extensionFlagsText}
 
@@ -286,6 +371,9 @@ ${chalk.bold("Examples:")}
 
   # Multiple messages (interactive)
   ${APP_NAME} "Read package.json" "What dependencies do we have?"
+
+  # Prompt that starts with a dash (use -- to end option parsing)
+  ${APP_NAME} -- "- You are given a state dictionary..."
 
   # Continue previous session
   ${APP_NAME} --continue "What did we discuss?"
@@ -310,9 +398,6 @@ ${chalk.bold("Examples:")}
 
   # Start with a specific thinking level
   ${APP_NAME} --thinking high "Solve this complex problem"
-
-  # Use only the bash tool
-  ${APP_NAME} --tools bash -p "Run the project checks"
 
   # Export a session file to HTML
   ${APP_NAME} --export ~/${CONFIG_DIR_NAME}/sessions/session.jsonl
@@ -371,7 +456,23 @@ ${chalk.bold("Environment Variables:")}
 
 ${chalk.bold("Built-in Tool Names:")}
   ipython - Execute Python in a persistent IPython kernel
-  bash    - Execute bash commands (off by default)
-  edit    - Edit files with find/replace (off by default)
 `);
+}
+
+function hasRequiredOptionValue(args: string[], index: number, flag: string, result: Args): boolean {
+	const next = args[index + 1];
+	if (next === undefined || next.startsWith("--")) {
+		result.diagnostics.push({ type: "error", message: `${flag} requires a value` });
+		return false;
+	}
+	return true;
+}
+
+function parsePositiveInt(value: string, flag: string, result: Args): number | undefined {
+	const parsed = Number(value);
+	if (!Number.isInteger(parsed) || parsed <= 0) {
+		result.diagnostics.push({ type: "error", message: `${flag} must be a positive integer` });
+		return undefined;
+	}
+	return parsed;
 }

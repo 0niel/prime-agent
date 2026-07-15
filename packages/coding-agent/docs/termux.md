@@ -14,7 +14,7 @@ Pi runs on Android via [Termux](https://termux.dev/), a terminal emulator and Li
 pkg update && pkg upgrade
 
 # Install dependencies
-pkg install nodejs termux-api git
+pkg install nodejs termux-api git ripgrep
 
 # Install pi
 npm install -g @earendil-works/pi-coding-agent

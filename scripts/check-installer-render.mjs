@@ -7,6 +7,7 @@ const installerSource = readFileSync("install.sh", "utf-8");
 const mainCall = '\nmain "$@"';
 const mainCallIndex = installerSource.lastIndexOf(mainCall);
 const ansiPattern = /\x1b\[[0-?]*[ -/]*[@-~]/g;
+const syncEnd = "\x1b[?2026l";
 const failures = [];
 
 if (mainCallIndex === -1) {
@@ -15,6 +16,14 @@ if (mainCallIndex === -1) {
 }
 
 const harnessSource = `${installerSource.slice(0, mainCallIndex)}
+
+prime_agent_test_cols=80
+prime_agent_test_rows=24
+
+prime_agent_read_terminal_size() {
+	prime_agent_screen_cols="$prime_agent_test_cols"
+	prime_agent_screen_rows="$prime_agent_test_rows"
+}
 
 print_render_meta() {
 	label="$1"
@@ -58,7 +67,44 @@ render_case() {
 	printf '__RENDER_END__ second\\n'
 }
 
+screen_case() {
+	prime_agent_screen_enabled=1
+	prime_agent_screen_drawn=0
+	prime_agent_screen_last_cols=0
+	prime_agent_screen_last_rows=0
+	prime_agent_screen_layout_ready=0
+	prime_agent_screen_layout_show_logo=0
+	prime_agent_screen_layout_lab_width=0
+	prime_agent_screen_render_lab_width=0
+	prime_agent_screen_compact=0
+	prime_agent_screen_frame=0
+
+	prime_agent_test_cols="$1"
+	prime_agent_test_rows="$2"
+	printf '__SCREEN_START__ first\\n' >&2
+	prime_agent_screen "Installing Prime Agent" "Installing Prime Agent" "Fetching the verified package." ""
+	printf '__SCREEN_END__ first\\n' >&2
+
+	prime_agent_test_cols="$3"
+	prime_agent_test_rows="$4"
+	printf '__SCREEN_START__ second\\n' >&2
+	prime_agent_screen "Installing Prime Agent" "Installing Prime Agent" "Fetching the verified package." ""
+	printf '__SCREEN_END__ second\\n' >&2
+}
+
+progress_case() {
+	progress_details="Preparing global install.
+Linking command binaries.
+Finalizing npm install."
+	for progress_frame in 1 24 25 48 49 200; do
+		prime_agent_animation_frame="$progress_frame"
+		printf '__PROGRESS__ %s\t%s\t%s\\n' "$progress_frame" "$(prime_agent_animation_status "Installing Prime Agent" "$progress_details" static)" "$(prime_agent_animation_detail "$progress_details")"
+	done
+}
+
 render_case "$@"
+screen_case "$@"
+progress_case
 `;
 
 const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-installer-render-"));
@@ -74,6 +120,7 @@ try {
 		stableVisible.meta.first.lab_width === stableVisible.meta.second.lab_width,
 		"expected logo lab width to stay stable across a safe resize",
 	);
+	assertInstallerProgress(stableVisible.progress);
 
 	const stableExpand = runCase("stable expanded logo", 60, 24, 120, 32);
 	check(stableExpand.meta.first.visible === "1", "expected the initial medium render to show the logo");
@@ -118,6 +165,7 @@ console.log("Installer render check passed.");
 
 function runCase(name, initialCols, initialRows, resizedCols, resizedRows) {
 	const result = spawnSync("sh", [harnessPath, String(initialCols), String(initialRows), String(resizedCols), String(resizedRows)], {
+		detached: true,
 		encoding: "utf-8",
 	});
 	if (result.status !== 0) {
@@ -126,8 +174,11 @@ function runCase(name, initialCols, initialRows, resizedCols, resizedRows) {
 	}
 
 	const parsed = parseRenderOutput(result.stdout);
+	parsed.screens = parseScreenOutput(result.stderr);
 	assertLineWidths(name, "first", parsed, initialCols, initialRows);
 	assertLineWidths(name, "second", parsed, resizedCols, resizedRows);
+	assertScreenFrame(name, "first", parsed, initialCols, initialRows);
+	assertScreenFrame(name, "second", parsed, resizedCols, resizedRows);
 	return parsed;
 }
 
@@ -151,12 +202,63 @@ function parseRenderOutput(output) {
 			activeRender = null;
 			continue;
 		}
+		if (line.startsWith("__PROGRESS__ ")) {
+			const [frame, status, detail] = line.slice("__PROGRESS__ ".length).split("\t");
+			parsed.progress.push({ frame: Number(frame), status, detail });
+			continue;
+		}
 		if (activeRender) {
 			parsed.renders[activeRender].push(line.replace(ansiPattern, ""));
 		}
 	}
 
 	return parsed;
+}
+
+function parseScreenOutput(output) {
+	const screens = {};
+	for (const label of ["first", "second"]) {
+		const startToken = `__SCREEN_START__ ${label}\n`;
+		const endToken = `__SCREEN_END__ ${label}\n`;
+		const startIndex = output.indexOf(startToken);
+		if (startIndex === -1) {
+			failures.push(`missing ${label} screen start marker`);
+			continue;
+		}
+		const contentStart = startIndex + startToken.length;
+		const endIndex = output.indexOf(endToken, contentStart);
+		if (endIndex === -1) {
+			failures.push(`missing ${label} screen end marker`);
+			continue;
+		}
+		screens[label] = output.slice(contentStart, endIndex);
+	}
+	return screens;
+}
+
+function assertInstallerProgress(progress) {
+	check(progress.length === 6, `expected six progress samples, got ${progress.length}`);
+	if (progress.length !== 6) return;
+
+	const expectedDetails = [
+		"Preparing global install.",
+		"Preparing global install.",
+		"Linking command binaries.",
+		"Linking command binaries.",
+		"Finalizing npm install.",
+		"Finalizing npm install.",
+	];
+	for (const [index, expectedDetail] of expectedDetails.entries()) {
+		check(
+			progress[index].detail === expectedDetail,
+			`expected progress sample ${index + 1} to show "${expectedDetail}", got "${progress[index].detail}"`,
+		);
+		check(
+			progress[index].status === "Installing Prime Agent...",
+			`expected progress sample ${index + 1} to use indeterminate status`,
+		);
+		check(!progress[index].status.includes("%"), `expected progress sample ${index + 1} not to include a percent`);
+	}
 }
 
 function assertLineWidths(name, label, parsed, cols, rows) {
@@ -167,6 +269,28 @@ function assertLineWidths(name, label, parsed, cols, rows) {
 	for (const [index, line] of lines.entries()) {
 		check(line.length <= maxWidth, `${name}: ${label} render line ${index + 1} reached ${line.length} columns in a ${cols}-column terminal`);
 	}
+}
+
+function assertScreenFrame(name, label, parsed, cols, rows) {
+	const screen = parsed.screens[label] ?? "";
+	check(screen.endsWith(syncEnd), `${name}: expected ${label} screen frame to end with synchronized update close`);
+	check(!screen.endsWith(`\n${syncEnd}`), `${name}: expected ${label} screen frame not to emit a trailing row newline`);
+	check(countNewlines(screen) === rows - 1, `${name}: expected ${label} screen frame to contain ${rows - 1} line breaks`);
+
+	const lines = screen.replace(ansiPattern, "").split("\n");
+	check(lines.length === rows, `${name}: expected ${label} screen frame to contain ${rows} rows, got ${lines.length}`);
+	const maxWidth = Math.max(cols - 1, 0);
+	for (const [index, line] of lines.entries()) {
+		check(line.length <= maxWidth, `${name}: ${label} screen line ${index + 1} reached ${line.length} columns in a ${cols}-column terminal`);
+	}
+}
+
+function countNewlines(text) {
+	let count = 0;
+	for (const char of text) {
+		if (char === "\n") count++;
+	}
+	return count;
 }
 
 function check(condition, message) {
@@ -185,5 +309,7 @@ function emptyParsedCase() {
 			first: [],
 			second: [],
 		},
+		screens: {},
+		progress: [],
 	};
 }

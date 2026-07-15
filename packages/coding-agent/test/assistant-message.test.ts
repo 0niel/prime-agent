@@ -2,7 +2,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import stripAnsi from "strip-ansi";
 import { describe, expect, test } from "vitest";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
@@ -56,6 +56,50 @@ describe("AssistantMessageComponent", () => {
 		expect(rendered.includes(OSC133_ZONE_FINAL)).toBe(false);
 	});
 
+	test("adds one trailing spacer between visible assistant content and its tool batch", () => {
+		initTheme("dark");
+
+		const component = new AssistantMessageComponent(
+			createAssistantMessage([
+				{ type: "text", text: "calling tools" },
+				{ type: "toolCall", id: "tool-1", name: "bash", arguments: { command: "pwd" } },
+				{ type: "toolCall", id: "tool-2", name: "bash", arguments: { command: "ls" } },
+			]),
+		);
+		const lines = component.render(60);
+
+		expect(stripAnsi(lines.at(-2) ?? "")).toContain("calling tools");
+		expect(lines.at(-1)).toBe("");
+	});
+
+	test("adds one leading spacer before a tool-only batch", () => {
+		initTheme("dark");
+
+		const component = new AssistantMessageComponent(
+			createAssistantMessage([
+				{ type: "toolCall", id: "tool-1", name: "bash", arguments: { command: "pwd" } },
+				{ type: "toolCall", id: "tool-2", name: "bash", arguments: { command: "ls" } },
+			]),
+		);
+
+		expect(component.render(60)).toEqual([""]);
+	});
+
+	test("renders an abort status for messages with tool calls", () => {
+		initTheme("dark");
+
+		const message = {
+			...createAssistantMessage([
+				{ type: "toolCall" as const, id: "tool-1", name: "ipython", arguments: { code: "while True: pass" } },
+			]),
+			stopReason: "aborted" as const,
+			errorMessage: "Operation aborted",
+		};
+		const rendered = stripAnsi(new AssistantMessageComponent(message).render(80).join("\n"));
+
+		expect(rendered).toContain("Operation aborted");
+	});
+
 	test("honors initial expansion for multiline assistant errors", () => {
 		initTheme("dark");
 
@@ -74,6 +118,45 @@ describe("AssistantMessageComponent", () => {
 
 		expect(rendered).toContain("/tmp/internal.py");
 		expect(rendered).not.toContain("Ctrl+O to expand");
+	});
+
+	test("renders auth recovery guidance inline for simple provider errors", () => {
+		initTheme("dark");
+
+		const message = {
+			...createAssistantMessage([]),
+			stopReason: "error" as const,
+			errorMessage: "401 status code (no body)\n\nRun /login to update credentials.",
+		};
+		const component = new AssistantMessageComponent(message);
+		const raw = component.render(120).join("\n");
+		const rendered = stripAnsi(raw);
+
+		expect(rendered).toContain("Error: 401 status code (no body) · Run /login to update credentials.");
+		expect(rendered).not.toContain("Ctrl+O to expand");
+		expect(raw).toContain(theme.getFgAnsi("error"));
+	});
+
+	test("renders collapsed multiline assistant errors as errors", () => {
+		initTheme("dark");
+
+		const message = {
+			...createAssistantMessage([]),
+			stopReason: "error" as const,
+			errorMessage: [
+				"Provider request failed",
+				"Traceback (most recent call last):",
+				'  File "/tmp/internal.py", line 12, in run',
+				"RuntimeError: backend crashed",
+			].join("\n"),
+		};
+		const component = new AssistantMessageComponent(message);
+		const raw = component.render(100).join("\n");
+		const rendered = stripAnsi(raw);
+
+		expect(rendered).toContain("Error: Provider request failed");
+		expect(rendered).toContain("to expand");
+		expect(raw).toContain(theme.getFgAnsi("error"));
 	});
 });
 

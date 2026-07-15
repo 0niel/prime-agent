@@ -3,6 +3,7 @@ import {
 	type Focusable,
 	isFocusable,
 	type OverlayHandle,
+	type OverlayOptions,
 	type TUI,
 	truncateToWidth,
 	visibleWidth,
@@ -18,23 +19,45 @@ interface InputHandler {
 	handleInput(data: string): void;
 }
 
+export interface FullPaneOverlayOptions {
+	maxContentWidth?: number;
+	fullWidth?: boolean;
+	suspendFullscreenMouse?: boolean;
+}
+
 function hasInputHandler(component: Component): component is Component & InputHandler {
 	return typeof (component as { handleInput?: unknown }).handleInput === "function";
 }
 
 /** Shows a component as a full-pane centered overlay on the given TUI. */
-export function showFullPaneOverlay(ui: TUI, component: Component, maxContentWidth = 80): OverlayHandle {
+export function showFullPaneOverlay(
+	ui: TUI,
+	component: Component,
+	options: number | FullPaneOverlayOptions = 80,
+): OverlayHandle {
+	const { maxContentWidth, suspendFullscreenMouse } =
+		typeof options === "number"
+			? { maxContentWidth: options, suspendFullscreenMouse: undefined }
+			: {
+					maxContentWidth: options.fullWidth ? undefined : (options.maxContentWidth ?? 80),
+					suspendFullscreenMouse: options.suspendFullscreenMouse,
+				};
+	const overlayOptions: OverlayOptions = {
+		width: "100%",
+		maxHeight: "100%",
+		row: 0,
+		col: 0,
+	};
+	if (suspendFullscreenMouse) {
+		overlayOptions.suspendFullscreenMouse = true;
+	}
+
 	return ui.showOverlay(
 		new CenteredOverlayComponent(component, {
 			getRows: () => ui.terminal.rows,
 			maxContentWidth,
 		}),
-		{
-			width: "100%",
-			maxHeight: "100%",
-			row: 0,
-			col: 0,
-		},
+		overlayOptions,
 	);
 }
 

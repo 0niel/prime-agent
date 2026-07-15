@@ -265,7 +265,11 @@ function createExtensionAPI(
 
 		exec(command: string, args: string[], options?: ExecOptions) {
 			runtime.assertActive();
-			return execCommand(command, args, options?.cwd ?? cwd, options);
+			// Read the host-supplied env at call time so per-session vars (e.g.
+			// herdr pane identity) are current, then let an explicit options.env win.
+			const sessionEnv = runtime.getExecEnv?.();
+			const env = sessionEnv || options?.env ? { ...sessionEnv, ...options?.env } : undefined;
+			return execCommand(command, args, options?.cwd ?? cwd, { ...options, env });
 		},
 
 		getActiveTools(): string[] {

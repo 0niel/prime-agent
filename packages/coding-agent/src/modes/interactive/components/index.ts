@@ -1,4 +1,6 @@
 // UI Components for extensions
+
+export { AgentMessageComponent } from "./agent-message.js";
 export { ArminComponent } from "./armin.js";
 export { AssistantMessageComponent } from "./assistant-message.js";
 export { BashExecutionComponent } from "./bash-execution.js";
@@ -9,9 +11,12 @@ export {
 	type ChildAgentInspectorNode,
 	type ChildAgentStatus,
 	ChildAgentSummaryComponent,
-	type ChildAgentTranscriptLine,
 } from "./child-agent-inspector.js";
 export { CompactionSummaryMessageComponent } from "./compaction-summary-message.js";
+export {
+	ConfigurationMenuComponent,
+	type ConfigurationMenuTab,
+} from "./configuration-menu.js";
 export { CustomEditor } from "./custom-editor.js";
 export { CustomMessageComponent } from "./custom-message.js";
 export { DaxnutsComponent } from "./daxnuts.js";
@@ -21,6 +26,7 @@ export { ExtensionEditorComponent } from "./extension-editor.js";
 export { ExtensionInputComponent } from "./extension-input.js";
 export { ExtensionSelectorComponent } from "./extension-selector.js";
 export { FooterComponent } from "./footer.js";
+export { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./injected-prompt-message.js";
 export {
 	getIpythonCodeFromArgs,
 	IPythonCellComponent,
@@ -37,14 +43,6 @@ export { SessionSelectorComponent } from "./session-selector.js";
 export { type SettingsCallbacks, type SettingsConfig, SettingsSelectorComponent } from "./settings-selector.js";
 export { ShowImagesSelectorComponent } from "./show-images-selector.js";
 export { SkillInvocationMessageComponent } from "./skill-invocation-message.js";
-export {
-	type SubAgentStatus,
-	type SubAgentTranscriptLine,
-	SubAgentTreeComponent,
-	type SubAgentTreeNode,
-	type SubAgentTreeOptions,
-} from "./sub-agent-tree.js";
-export { SubagentTreeView } from "./subagent-tree-view.js";
 export { ThemeSelectorComponent } from "./theme-selector.js";
 export { ThinkingSelectorComponent } from "./thinking-selector.js";
 export { ToolExecutionComponent, type ToolExecutionOptions } from "./tool-execution.js";

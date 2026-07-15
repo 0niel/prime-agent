@@ -6,8 +6,10 @@ import { AgentSession } from "./agent-session.js";
 import type { AgentSessionCreationOptions } from "./agent-session-services.js";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
 import { AuthStorage } from "./auth-storage.js";
+import type { AgentAutonomousConfig } from "./autonomous.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
+import { McpManager } from "./mcp/mcp-manager.js";
 import { convertToLlm } from "./messages.js";
 import { ModelRegistry } from "./model-registry.js";
 import { findInitialModel } from "./model-resolver.js";
@@ -58,6 +60,9 @@ export interface CreateAgentSessionOptions extends AgentSessionCreationOptions {
 	/** Resource loader. When omitted, DefaultResourceLoader is used. */
 	resourceLoader?: ResourceLoader;
 
+	/** MCP integration manager. When omitted, MCP host handlers are not wired. */
+	mcpManager?: McpManager;
+
 	/** Session manager. Default: SessionManager.create(cwd) */
 	sessionManager?: SessionManager;
 
@@ -65,6 +70,8 @@ export interface CreateAgentSessionOptions extends AgentSessionCreationOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Host-side autonomous continuation policy. */
+	autonomous?: AgentAutonomousConfig;
 }
 
 /** Result from createAgentSession */
@@ -139,7 +146,7 @@ function getDefaultAgentDir(): string {
  * await loader.reload();
  * const { session } = await createAgentSession({
  *   model: myModel,
- *   tools: ["ipython", "bash"],
+ *   tools: ["ipython"],
  *   resourceLoader: loader,
  *   sessionManager: SessionManager.inMemory(),
  * });
@@ -159,8 +166,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
+	// Ensure MCP providers are registered and built-in MCP skills are gated by
+	// auth even on the bare SDK path (not just the CLI's createAgentSessionServices).
+	const mcpManager =
+		options.mcpManager ?? new McpManager({ authStorage, getUserServers: () => settingsManager.getMcpServers() });
+	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerUserProviders());
+
 	if (!resourceLoader) {
-		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
+		resourceLoader = new DefaultResourceLoader({
+			cwd,
+			agentDir,
+			settingsManager,
+			extraBuiltinSkillOverrides: () => mcpManager.getDisabledBuiltinSkillOverrides(),
+		});
 		await resourceLoader.reload();
 		time("resourceLoader.reload");
 	}
@@ -348,10 +366,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		resourceLoader,
 		customTools: options.customTools,
 		modelRegistry,
+		mcpManager,
 		initialActiveToolNames,
 		allowedToolNames,
 		includeGoals,
+		includeCompactSkill: options.includeCompactSkill,
 		rlmHeartbeatController: options.rlmHeartbeatController,
+		agentMessageController: options.agentMessageController,
+		agentObserveController: options.agentObserveController,
 		extensionRunnerRef,
 		rlmDepth: options.rlmDepth,
 		rlmMaxDepth: options.rlmMaxDepth,
@@ -360,6 +382,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		sessionStartEvent: options.sessionStartEvent,
 		prewarmIpythonKernel: options.prewarmIpythonKernel,
+		autonomous: options.autonomous,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
 

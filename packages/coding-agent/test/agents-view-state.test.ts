@@ -1,6 +1,10 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntimeConfig } from "../src/core/agent-session-config.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
+import type { SessionInfo } from "../src/core/session-manager.js";
 import type { SettingsManager } from "../src/core/settings-manager.js";
 import {
 	createAgentsViewListCommand,
@@ -9,11 +13,17 @@ import {
 	createAgentsViewSessionName,
 	formatAgentsViewRelativeTime,
 	formatAgentsViewStatusLine,
+	resolveAgentsViewActiveSummaryForPath,
+	resolveAgentsViewOpenCwd,
+	resolveAgentsViewResumeSummary,
 	resolveAgentsViewSessionUiServices,
+	shouldReconnectAgentsViewDaemon,
 } from "../src/modes/agents-view/agents-view-mode.js";
 import {
 	buildAgentsViewRows,
 	classifyAgentsViewSession,
+	getAgentsViewSelectionKey,
+	resolveAgentsViewSelectionIndex,
 	type SessionSummary,
 	shouldShowAgentsViewSession,
 } from "../src/modes/index.js";
@@ -22,34 +32,54 @@ import type { Theme } from "../src/modes/interactive/theme/theme.js";
 
 describe("agents view state", () => {
 	test("classifies active daemon sessions into coarse fleet sections", () => {
-		expect(classifyAgentsViewSession(makeSummary({ isStreaming: true, status: "model" }))).toBe("working");
-		expect(classifyAgentsViewSession(makeSummary({ pendingMessageCount: 1 }))).toBe("working");
-		expect(classifyAgentsViewSession(makeSummary({ status: "tool" }))).toBe("working");
-		expect(classifyAgentsViewSession(makeSummary({ status: "user", messageCount: 2 }))).toBe("completed");
-		expect(classifyAgentsViewSession(makeSummary({ status: "idle", messageCount: 0 }))).toBe("completed");
-		expect(classifyAgentsViewSession(makeSummary({ status: "idle", messageCount: 4 }))).toBe("completed");
+		expect(classifyAgentsViewSession(makeSummary({ isStreaming: true, activity: "working" }))).toBe("working");
+		expect(classifyAgentsViewSession(makeSummary({ pendingMessageCount: 1, activity: "working" }))).toBe("working");
+		expect(classifyAgentsViewSession(makeSummary({ activity: "working" }))).toBe("working");
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 2 }))).toBe("needs-input");
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 0 }))).toBe("needs-input");
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 4 }))).toBe("needs-input");
 	});
 
 	test("idle sessions split by the summarizer's completion verdict", () => {
 		// Working is heuristic and ignores taskState.
-		expect(classifyAgentsViewSession(makeSummary({ isStreaming: true, taskState: "completed" }))).toBe("working");
-		// Idle sessions follow the verdict; absent one they stay completed.
-		expect(classifyAgentsViewSession(makeSummary({ status: "idle", taskState: "needs_input" }))).toBe("needs-input");
-		expect(classifyAgentsViewSession(makeSummary({ status: "idle", taskState: "completed" }))).toBe("completed");
-		expect(classifyAgentsViewSession(makeSummary({ status: "idle", taskState: undefined }))).toBe("completed");
+		expect(
+			classifyAgentsViewSession(makeSummary({ isStreaming: true, activity: "working", taskState: "completed" })),
+		).toBe("working");
+		// Idle sessions follow the verdict; absent one they default to needs-input.
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: "needs_input" }))).toBe(
+			"needs-input",
+		);
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: "completed" }))).toBe("completed");
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: undefined }))).toBe("needs-input");
 	});
 
-	test("defaults an idle session with no verdict to completed", () => {
+	test("defaults an idle session with no verdict to needs-input", () => {
 		// A slow, failed, or absent classification never lingers in Working; only
-		// an explicit needs_input verdict moves an idle session out of completed.
-		expect(classifyAgentsViewSession(makeSummary({ status: "idle", taskState: undefined }))).toBe("completed");
+		// an explicit completed verdict moves an idle session out of needs-input.
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: undefined }))).toBe("needs-input");
 	});
 
 	test("sorts rows by section and most recent modified time", () => {
 		const rows = buildAgentsViewRows([
-			makeSummary({ sessionName: "completed", status: "idle", messageCount: 2, modified: "2026-01-01T00:00:00Z" }),
-			makeSummary({ sessionName: "older working", isStreaming: true, modified: "2026-01-01T00:00:00Z" }),
-			makeSummary({ sessionName: "newer working", isStreaming: true, modified: "2026-01-02T00:00:00Z" }),
+			makeSummary({
+				sessionName: "completed",
+				activity: "idle",
+				taskState: "completed",
+				messageCount: 2,
+				modified: "2026-01-01T00:00:00Z",
+			}),
+			makeSummary({
+				sessionName: "older working",
+				activity: "working",
+				isStreaming: true,
+				modified: "2026-01-01T00:00:00Z",
+			}),
+			makeSummary({
+				sessionName: "newer working",
+				activity: "working",
+				isStreaming: true,
+				modified: "2026-01-02T00:00:00Z",
+			}),
 		]);
 
 		expect(rows.map((row) => row.title)).toEqual(["newer working", "older working", "completed"]);
@@ -67,7 +97,7 @@ describe("agents view state", () => {
 				parentActiveSessionId: "parent-active",
 				parentSessionId: "parent-session",
 				isStreaming: true,
-				status: "model",
+				activity: "working",
 			}),
 			makeSummary({
 				id: "second-child-active",
@@ -77,7 +107,7 @@ describe("agents view state", () => {
 				runtimeKind: "subagent",
 				parentActiveSessionId: "parent-active",
 				parentSessionId: "parent-session",
-				status: "tool",
+				activity: "working",
 			}),
 			makeSummary({
 				id: "completed-child-active",
@@ -87,7 +117,7 @@ describe("agents view state", () => {
 				runtimeKind: "subagent",
 				parentActiveSessionId: "parent-active",
 				parentSessionId: "parent-session",
-				status: "idle",
+				activity: "idle",
 				messageCount: 2,
 			}),
 			makeSummary({
@@ -96,14 +126,15 @@ describe("agents view state", () => {
 				sessionId: "parent-session",
 				sessionName: "Parent",
 				isStreaming: true,
-				status: "tool",
+				activity: "working",
 			}),
 			makeSummary({
 				id: "other-active",
 				activeSessionId: "other-active",
 				sessionId: "other-session",
 				sessionName: "Other",
-				status: "idle",
+				activity: "idle",
+				taskState: "completed",
 				messageCount: 2,
 			}),
 		]);
@@ -131,7 +162,7 @@ describe("agents view state", () => {
 				runtimeKind: "subagent",
 				parentActiveSessionId: "parent-active",
 				isStreaming: true,
-				status: "model",
+				activity: "working",
 			}),
 			makeSummary({
 				id: "completed-child-active",
@@ -141,7 +172,8 @@ describe("agents view state", () => {
 				sessionName: "Completed child",
 				runtimeKind: "subagent",
 				parentActiveSessionId: "parent-active",
-				status: "idle",
+				activity: "idle",
+				taskState: "completed",
 				messageCount: 2,
 			}),
 			makeSummary({
@@ -151,7 +183,7 @@ describe("agents view state", () => {
 				sessionFile: "/tmp/parent.jsonl",
 				sessionName: "Parent",
 				isStreaming: true,
-				status: "tool",
+				activity: "working",
 			}),
 		];
 
@@ -169,6 +201,58 @@ describe("agents view state", () => {
 		expect(expanded.slice(1).every((row) => row.selectable && row.parentIdentity === parentIdentity)).toBe(true);
 	});
 
+	test("reveals a nested subagent only after its parent is also expanded", () => {
+		const summaries = [
+			makeSummary({
+				id: "grandchild-active",
+				activeSessionId: "grandchild-active",
+				sessionId: "grandchild-session",
+				sessionName: "Grandchild",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "child-active",
+				parentSessionId: "child-session",
+				isStreaming: true,
+				activity: "working",
+			}),
+			makeSummary({
+				id: "child-active",
+				activeSessionId: "child-active",
+				sessionId: "child-session",
+				sessionName: "Child",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "root-active",
+				parentSessionId: "root-session",
+				isStreaming: true,
+				activity: "working",
+			}),
+			makeSummary({
+				id: "root-active",
+				activeSessionId: "root-active",
+				sessionId: "root-session",
+				sessionName: "Root",
+				isStreaming: true,
+				activity: "working",
+			}),
+		];
+
+		const rootIdentity = buildAgentsViewRows(summaries)[0]?.identity ?? "";
+		// Expanding only the root reveals the child but not the grandchild.
+		const oneLevel = buildAgentsViewRows(summaries, new Set([rootIdentity]));
+		expect(oneLevel.map((row) => [row.title, row.kind])).toEqual([
+			["Root", "agent"],
+			["Child", "subagent"],
+			["1 subagent running", "subagent-summary"],
+		]);
+
+		const childIdentity = oneLevel.find((row) => row.title === "Child")?.identity ?? "";
+		const twoLevel = buildAgentsViewRows(summaries, new Set([rootIdentity, childIdentity]));
+		expect(twoLevel.map((row) => [row.title, row.kind, row.depth])).toEqual([
+			["Root", "agent", 0],
+			["Child", "subagent", 1],
+			["Grandchild", "subagent", 2],
+		]);
+	});
+
 	test("keeps finished subagents reachable via the summary row", () => {
 		const rows = buildAgentsViewRows([
 			makeSummary({
@@ -179,7 +263,7 @@ describe("agents view state", () => {
 				sessionName: "Done child",
 				runtimeKind: "subagent",
 				parentActiveSessionId: "parent-active",
-				status: "idle",
+				activity: "idle",
 				messageCount: 2,
 			}),
 			makeSummary({
@@ -188,7 +272,7 @@ describe("agents view state", () => {
 				sessionId: "parent-session",
 				sessionFile: "/tmp/parent.jsonl",
 				sessionName: "Parent",
-				status: "idle",
+				activity: "idle",
 				messageCount: 4,
 			}),
 		]);
@@ -209,7 +293,7 @@ describe("agents view state", () => {
 				sessionName: "Legacy child",
 				parentActiveSessionId: "parent-active",
 				isStreaming: true,
-				status: "model",
+				activity: "working",
 			}),
 			makeSummary({
 				id: "legacy-rlm-child",
@@ -217,7 +301,7 @@ describe("agents view state", () => {
 				sessionId: "legacy-rlm-session",
 				sessionName: "Legacy rlm child",
 				rlmChildId: "node-1",
-				status: "idle",
+				activity: "idle",
 				messageCount: 2,
 			}),
 			makeSummary({
@@ -226,7 +310,7 @@ describe("agents view state", () => {
 				sessionId: "parent-session",
 				sessionName: "Parent",
 				isStreaming: true,
-				status: "tool",
+				activity: "working",
 			}),
 		]);
 
@@ -277,7 +361,7 @@ describe("agents view state", () => {
 				sessionId: "parent-session",
 				sessionName: "Parent",
 				isStreaming: true,
-				status: "tool",
+				activity: "working",
 			}),
 		];
 
@@ -333,7 +417,7 @@ describe("agents view state", () => {
 				sessionId: "parent-session",
 				sessionName: "Parent",
 				isStreaming: true,
-				status: "tool",
+				activity: "working",
 			}),
 		];
 		const parentIdentity = buildAgentsViewRows(summaries)[0]?.identity ?? "";
@@ -357,14 +441,14 @@ describe("agents view state", () => {
 				parentActiveSessionId: "removed-parent-active",
 				parentSessionId: "removed-parent-session",
 				isStreaming: true,
-				status: "model",
+				activity: "working",
 			}),
 			makeSummary({
 				id: "other-active",
 				activeSessionId: "other-active",
 				sessionId: "other-session",
 				sessionName: "Other",
-				status: "idle",
+				activity: "idle",
 				messageCount: 2,
 			}),
 		]);
@@ -373,12 +457,12 @@ describe("agents view state", () => {
 	});
 
 	test("shows daemon-resident sessions only", () => {
-		const inactiveSleep = makeSummary({ status: "sleep" });
+		const inactiveSleep = makeSummary({ lifecycle: "archived", activity: "idle" });
 		delete inactiveSleep.activeSessionId;
 
 		expect(shouldShowAgentsViewSession(inactiveSleep)).toBe(false);
-		expect(shouldShowAgentsViewSession(makeSummary({ status: "idle" }))).toBe(true);
-		expect(shouldShowAgentsViewSession(makeSummary({ status: "idle" }), true)).toBe(false);
+		expect(shouldShowAgentsViewSession(makeSummary({ lifecycle: "live", activity: "idle" }))).toBe(true);
+		expect(shouldShowAgentsViewSession(makeSummary({ lifecycle: "live", activity: "idle" }), true)).toBe(false);
 	});
 
 	test("does not override saved session cwd when reopening inactive agents", () => {
@@ -398,12 +482,104 @@ describe("agents view state", () => {
 		expect(config.cwd).toBe("/tmp/dashboard");
 	});
 
+	test("opens an existing-cwd session in its own directory with no override or notice", () => {
+		const dir = mkdtempSync(join(tmpdir(), "agents-view-cwd-"));
+		try {
+			expect(resolveAgentsViewOpenCwd(makeSummary({ cwd: dir }), "/tmp/launch")).toEqual({});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("falls back to the launch cwd and explains it when the stored cwd is gone", () => {
+		const missing = join(tmpdir(), "agents-view-missing-worktree-does-not-exist");
+		const { overrideCwd, notice } = resolveAgentsViewOpenCwd(makeSummary({ cwd: missing }), "/tmp/launch");
+		expect(overrideCwd).toBe("/tmp/launch");
+		expect(notice).toContain(missing);
+		expect(notice).toContain("/tmp/launch");
+	});
+
+	test("does not override when there is no fallback cwd to use", () => {
+		const missing = join(tmpdir(), "agents-view-missing-worktree-does-not-exist");
+		expect(resolveAgentsViewOpenCwd(makeSummary({ cwd: missing }), undefined)).toEqual({});
+	});
+
+	test("passes the override cwd through the resume config when the stored cwd is missing", () => {
+		const config: AgentSessionRuntimeConfig = { cwd: "/tmp/launch", agentDir: "/tmp/agents" };
+		const resumeConfig = createAgentsViewResumeConfig(config, "/tmp/launch");
+		expect(resumeConfig.cwd).toBe("/tmp/launch");
+	});
+
 	test("requests only daemon-resident sessions for the agents view refresh", () => {
-		expect(createAgentsViewListCommand({ cwd: "/tmp/project" })).toEqual({ type: "list" });
-		expect(createAgentsViewListCommand({ cwd: "/tmp/project", sessionDir: "/tmp/sessions" })).toEqual({
-			type: "list",
-			sessionDir: "/tmp/sessions",
+		expect(createAgentsViewListCommand()).toEqual({ type: "list" });
+	});
+
+	test("creates an inactive summary for a saved session selected from resume", () => {
+		const savedSession = makeSessionInfo({
+			path: "/tmp/sessions/saved.jsonl",
+			id: "saved",
+			name: "Saved session",
+			cwd: "/tmp/project",
+			messageCount: 2,
+			agentStatus: {
+				summary: "Finished the task",
+				taskState: "completed",
+				basedOnMessageCount: 2,
+			},
 		});
+
+		const summary = resolveAgentsViewResumeSummary(savedSession.path, [savedSession], []);
+
+		expect(summary).toMatchObject({
+			id: "saved",
+			activity: "idle",
+			sessionId: "saved",
+			sessionFile: savedSession.path,
+			sessionName: "Saved session",
+			cwd: "/tmp/project",
+			summary: "Finished the task",
+			taskState: "completed",
+		});
+		expect(summary?.activeSessionId).toBeUndefined();
+		expect(summary?.lifecycle).toBe("live");
+	});
+
+	test("reuses the live daemon summary when resuming an already-active saved session", () => {
+		const savedSession = makeSessionInfo({
+			path: "/tmp/sessions/active.jsonl",
+			id: "saved-active",
+			cwd: "/tmp/project",
+		});
+		const activeSummary = makeSummary({
+			id: "active-runtime",
+			activeSessionId: "active-runtime",
+			sessionId: "saved-active",
+			sessionFile: savedSession.path,
+			sessionName: "Running",
+		});
+
+		expect(resolveAgentsViewResumeSummary(savedSession.path, [savedSession], [activeSummary])).toBe(activeSummary);
+	});
+
+	test("resolves active summaries by session file path", () => {
+		const activeSummary = makeSummary({
+			id: "active-runtime",
+			activeSessionId: "active-runtime",
+			sessionId: "saved-active",
+			sessionFile: "/tmp/sessions/active.jsonl",
+			sessionName: "Running",
+		});
+		const inactiveSummary = makeSummary({
+			id: "inactive",
+			activeSessionId: undefined,
+			sessionId: "inactive",
+			sessionFile: "/tmp/sessions/inactive.jsonl",
+		});
+
+		expect(
+			resolveAgentsViewActiveSummaryForPath("/tmp/sessions/active.jsonl", [inactiveSummary, activeSummary]),
+		).toBe(activeSummary);
+		expect(resolveAgentsViewActiveSummaryForPath("/tmp/sessions/inactive.jsonl", [inactiveSummary])).toBeUndefined();
 	});
 
 	test("derives the reply headline from the first line of the latest assistant text", () => {
@@ -434,6 +610,12 @@ describe("agents view state", () => {
 		expect(formatAgentsViewStatusLine("\n \r\n ")).toBe("");
 	});
 
+	test("reconnects daemon restarts and crashes but stops after an intentional shutdown", () => {
+		expect(shouldReconnectAgentsViewDaemon("update")).toBe(true);
+		expect(shouldReconnectAgentsViewDaemon(undefined)).toBe(true);
+		expect(shouldReconnectAgentsViewDaemon("shutdown")).toBe(false);
+	});
+
 	test("caps generated session names at the configured limit", () => {
 		expect(createAgentsViewSessionName("x".repeat(120))).toHaveLength(80);
 		expect(createAgentsViewSessionName("short")).toBe("short");
@@ -456,13 +638,71 @@ describe("agents view state", () => {
 		).resolves.toBe(sessionServices);
 		expect(createUiServicesForSession).toHaveBeenCalledWith(summary);
 	});
+
+	describe("restores selection to the previously open session", () => {
+		const opened = makeSummary({
+			id: "active-open",
+			activeSessionId: "active-open",
+			sessionId: "session-open",
+			sessionFile: "/tmp/project/open.jsonl",
+			sessionName: "open",
+		});
+		const other = makeSummary({
+			id: "active-other",
+			activeSessionId: "active-other",
+			sessionId: "session-other",
+			sessionFile: "/tmp/project/other.jsonl",
+			sessionName: "other",
+		});
+		const identity = `file:${opened.sessionFile}`;
+		const key = getAgentsViewSelectionKey(opened);
+
+		test("re-finds the session after the list reorders", () => {
+			// Returning bumps the opened session's modified time so it sorts first.
+			const rows = buildAgentsViewRows([
+				{ ...opened, modified: "2026-01-02T00:00:00Z" },
+				{ ...other, modified: "2026-01-01T00:00:00Z" },
+			]);
+			expect(rows[0]?.summary.sessionId).toBe("session-open");
+			expect(resolveAgentsViewSelectionIndex(rows, identity, key)).toBe(0);
+		});
+
+		test("falls back to activeSessionId when the row identity changed", () => {
+			// Selected before the session had a file, so the stored identity is active:...
+			const rows = buildAgentsViewRows([other, opened]);
+			const staleIdentity = "active:active-open";
+			expect(resolveAgentsViewSelectionIndex(rows, staleIdentity, key)).toBe(
+				rows.findIndex((row) => row.summary.sessionId === "session-open"),
+			);
+		});
+
+		test("falls back to sessionId after a daemon re-attach regenerates the active id", () => {
+			// Re-attach gives a fresh activeSessionId, so only the sessionId still matches.
+			const reattached = { ...opened, id: "active-open-2", activeSessionId: "active-open-2" };
+			const rows = buildAgentsViewRows([other, reattached]);
+			expect(resolveAgentsViewSelectionIndex(rows, identity, key)).toBe(
+				rows.findIndex((row) => row.summary.sessionId === "session-open"),
+			);
+		});
+
+		test("returns -1 when the session is gone so callers pick a default", () => {
+			const rows = buildAgentsViewRows([other]);
+			expect(resolveAgentsViewSelectionIndex(rows, identity, key)).toBe(-1);
+		});
+
+		test("returns -1 with no stored selection", () => {
+			const rows = buildAgentsViewRows([opened, other]);
+			expect(resolveAgentsViewSelectionIndex(rows, undefined, undefined)).toBe(-1);
+		});
+	});
 });
 
 function makeSummary(overrides: Partial<SessionSummary>): SessionSummary {
 	return {
 		id: "active-1",
 		activeSessionId: "active-1",
-		status: "idle",
+		lifecycle: "live",
+		activity: "idle",
 		sessionId: "session-1",
 		cwd: "/tmp/project",
 		isStreaming: false,
@@ -471,6 +711,23 @@ function makeSummary(overrides: Partial<SessionSummary>): SessionSummary {
 		messageCount: 1,
 		pendingMessageCount: 0,
 		...overrides,
+	};
+}
+
+function makeSessionInfo(overrides: Partial<SessionInfo> & { path: string; id: string }): SessionInfo {
+	return {
+		path: overrides.path,
+		id: overrides.id,
+		cwd: overrides.cwd ?? "/tmp/project",
+		name: overrides.name,
+		state: overrides.state,
+		parentSessionPath: overrides.parentSessionPath,
+		created: overrides.created ?? new Date("2026-01-01T00:00:00Z"),
+		modified: overrides.modified ?? new Date("2026-01-01T00:00:00Z"),
+		messageCount: overrides.messageCount ?? 1,
+		firstMessage: overrides.firstMessage ?? "hello",
+		allMessagesText: overrides.allMessagesText ?? "hello",
+		agentStatus: overrides.agentStatus,
 	};
 }
 

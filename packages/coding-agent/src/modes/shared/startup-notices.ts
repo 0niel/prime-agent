@@ -111,7 +111,7 @@ export async function checkTmuxKeyboardSetup(): Promise<string | undefined> {
 export function formatUpdateAvailableNotice(newVersion: string): string {
 	return (
 		`${theme.bold(theme.fg("accent", "Update available:"))} ` +
-		`${theme.fg("muted", `v${newVersion}. Run `)}${theme.fg("accent", "prime-agent update")}`
+		`${theme.fg("muted", `v${newVersion}. Run `)}${theme.fg("accent", "/update")}`
 	);
 }
 
@@ -119,7 +119,7 @@ export function formatPackageUpdateNotice(packages: string[]): string {
 	const packageList = packages.join(", ");
 	return (
 		`${theme.bold(theme.fg("warning", "Package updates available:"))} ` +
-		`${theme.fg("muted", `${packageList}. Run `)}${theme.fg("accent", "prime-agent update --extensions")}`
+		`${theme.fg("muted", `${packageList}. Run `)}${theme.fg("accent", "/update --extensions")}`
 	);
 }
 

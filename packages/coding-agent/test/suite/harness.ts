@@ -9,8 +9,10 @@ import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { FauxModelDefinition, FauxProviderRegistration, FauxResponseStep, Model } from "@earendil-works/pi-ai";
 import { registerFauxProvider } from "@earendil-works/pi-ai";
-import { AgentSession, type AgentSessionEvent } from "../../src/core/agent-session.js";
+import type { AgentObserveController } from "../../src/core/agent-observe.js";
+import { AgentSession, type AgentSessionEvent, type AutoRefineReviewer } from "../../src/core/agent-session.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
+import type { AgentAutonomousConfig } from "../../src/core/autonomous.js";
 import type { ExtensionRunner } from "../../src/core/extensions/index.js";
 import { convertToLlm } from "../../src/core/messages.js";
 import { ModelRegistry } from "../../src/core/model-registry.js";
@@ -56,6 +58,7 @@ export function getAssistantTexts(harness: Harness): string[] {
 }
 
 export interface HarnessOptions {
+	provider?: string;
 	models?: FauxModelDefinition[];
 	settings?: Partial<Settings>;
 	systemPrompt?: string;
@@ -63,6 +66,11 @@ export interface HarnessOptions {
 	resourceLoader?: ResourceLoader;
 	extensionFactories?: Array<ExtensionFactory | CreateTestExtensionsResultInput>;
 	withConfiguredAuth?: boolean;
+	agentObserveController?: AgentObserveController;
+	persistSession?: boolean;
+	rlmDepth?: number;
+	autonomous?: AgentAutonomousConfig;
+	autoRefineReviewer?: AutoRefineReviewer;
 }
 
 export interface Harness {
@@ -92,6 +100,7 @@ function createTempDir(): string {
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
 	const tempDir = createTempDir();
 	const fauxProvider: FauxProviderRegistration = registerFauxProvider({
+		provider: options.provider,
 		models: options.models,
 	});
 	fauxProvider.setResponses([]);
@@ -100,7 +109,9 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	const sessionManager = SessionManager.inMemory();
+	const sessionManager = options.persistSession
+		? SessionManager.create(tempDir, join(tempDir, "sessions"))
+		: SessionManager.inMemory();
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();
@@ -172,8 +183,12 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		cwd: tempDir,
 		modelRegistry,
 		resourceLoader,
+		agentObserveController: options.agentObserveController,
 		baseToolsOverride: toolMap,
 		extensionRunnerRef,
+		rlmDepth: options.rlmDepth,
+		autonomous: options.autonomous,
+		autoRefineReviewer: options.autoRefineReviewer,
 	});
 
 	const events: AgentSessionEvent[] = [];

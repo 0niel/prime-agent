@@ -29,26 +29,19 @@ export interface AgentsViewRow {
 }
 
 export function classifyAgentsViewSession(summary: SessionSummary): AgentsViewSection {
-	if (summary.isStreaming || summary.isCompacting || summary.pendingMessageCount > 0) {
+	if (summary.activity === "working") {
 		return "working";
 	}
-	if (summary.status === "model" || summary.status === "tool") {
-		return "working";
-	}
-	// Idle defaults to Completed; only an explicit verdict moves it to Needs Input.
-	if (summary.taskState === "needs_input") {
-		return "needs-input";
-	}
-	return "completed";
+	// Idle defaults to Needs Input; only an explicit completed verdict moves it on.
+	return summary.taskState === "completed" ? "completed" : "needs-input";
 }
 
-// The agents view shows daemon-resident sessions only; saved (slept) sessions
-// stay out of the list until they are resumed back into the daemon.
+// Live sessions only; drafts and archived stay out.
 export function shouldShowAgentsViewSession(summary: SessionSummary, manuallyInactive = false): boolean {
 	if (manuallyInactive) {
 		return false;
 	}
-	return summary.activeSessionId !== undefined;
+	return summary.lifecycle === "live";
 }
 
 export function sectionTitle(section: AgentsViewSection): string {
@@ -74,6 +67,46 @@ export function getAgentsViewSummaryIdentity(summary: SessionSummary): string {
 		return `active:${summary.activeSessionId}`;
 	}
 	return `session:${summary.sessionId}`;
+}
+
+export interface AgentsViewSelectionKey {
+	sessionId: string;
+	activeSessionId?: string;
+}
+
+export function getAgentsViewSelectionKey(summary: SessionSummary): AgentsViewSelectionKey {
+	return { sessionId: summary.sessionId, activeSessionId: summary.activeSessionId };
+}
+
+// Matches by identity, then activeSessionId, then sessionId: a row's identity
+// changes when a session is persisted or re-attached, so the latter two keys
+// re-find the same session across those transitions. Returns -1 when gone.
+export function resolveAgentsViewSelectionIndex(
+	rows: readonly AgentsViewRow[],
+	identity: string | undefined,
+	key: AgentsViewSelectionKey | undefined,
+): number {
+	const findSelectable = (predicate: (row: AgentsViewRow) => boolean): number =>
+		rows.findIndex((row) => row.selectable && predicate(row));
+
+	if (identity !== undefined) {
+		const index = findSelectable((row) => row.identity === identity);
+		if (index >= 0) {
+			return index;
+		}
+	}
+	if (key?.activeSessionId !== undefined) {
+		const activeSessionId = key.activeSessionId;
+		const index = findSelectable((row) => (row.summary.activeSessionId ?? row.summary.id) === activeSessionId);
+		if (index >= 0) {
+			return index;
+		}
+	}
+	if (key?.sessionId !== undefined) {
+		const sessionId = key.sessionId;
+		return findSelectable((row) => row.summary.sessionId === sessionId);
+	}
+	return -1;
 }
 
 export function buildAgentsViewRows(
@@ -350,19 +383,16 @@ function getSessionStatusLabel(summary: SessionSummary): string {
 		return "compacting";
 	}
 	if (summary.isStreaming) {
-		return summary.status === "tool" ? "running tools" : "thinking";
+		return summary.isRunningTools ? "running tools" : "thinking";
 	}
 	if (summary.pendingMessageCount > 0) {
 		return `${summary.pendingMessageCount} queued`;
 	}
-	if (summary.status === "crash") {
-		return "crashed";
+	if (summary.lifecycle === "archived") {
+		return "archived";
 	}
-	if (summary.status === "sleep") {
-		return "saved";
+	if (summary.activity === "working") {
+		return "classifying";
 	}
-	if (summary.messageCount === 0) {
-		return "new";
-	}
-	return summary.status;
+	return summary.taskState === "completed" ? "completed" : "needs input";
 }

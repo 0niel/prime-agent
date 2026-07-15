@@ -26,7 +26,7 @@ if (process.env.MY_ANTHROPIC_KEY) {
 // Model registry with no custom models.json
 const modelRegistry = ModelRegistry.inMemory(authStorage);
 
-const model = getModel("anthropic", "claude-sonnet-4-20250514");
+const model = getModel("anthropic", "claude-sonnet-5");
 if (!model) throw new Error("Model not found");
 
 // In-memory settings with overrides
@@ -44,7 +44,7 @@ const resourceLoader: ResourceLoader = {
 	getThemes: () => ({ themes: [], diagnostics: [] }),
 	getAgentsFiles: () => ({ agentsFiles: [] }),
 	getSystemPrompt: () => `You are a minimal assistant.
-Available: ipython, bash. Be concise.`,
+Available: ipython. Be concise.`,
 	getAppendSystemPrompt: () => [],
 	extendResources: () => {},
 	reload: async () => {},
@@ -58,7 +58,7 @@ const { session } = await createAgentSession({
 	authStorage,
 	modelRegistry,
 	resourceLoader,
-	tools: ["ipython", "bash"],
+	tools: ["ipython"],
 	sessionManager: SessionManager.inMemory(cwd),
 	settingsManager,
 });

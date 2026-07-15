@@ -33,13 +33,13 @@ describe("parseSlashCommand", () => {
 
 describe("classifyAgentsViewCommand", () => {
 	test("whitelisted global commands run in the agents view", () => {
-		for (const name of ["login", "logout", "model", "quit"]) {
+		for (const name of ["login", "logout", "model", "mcp", "resume", "quit"]) {
 			expect(classifyAgentsViewCommand(name)).toBe("agents-view");
 		}
 	});
 
 	test("other built-ins are session-only", () => {
-		for (const name of ["compact", "fork", "settings", "resume", "new", "clear", "export"]) {
+		for (const name of ["compact", "fork", "settings", "new", "clear", "export"]) {
 			expect(classifyAgentsViewCommand(name)).toBe("session-only");
 		}
 	});

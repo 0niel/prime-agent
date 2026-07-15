@@ -4,11 +4,12 @@ import type { ImageContent, Transport } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
-import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
+import type { AgentCronJob, AgentHeartbeatDeliveryMode, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
 import { SessionManager } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
+import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
 import {
 	createAgentConnectionCommands,
 	createAgentConnectionResourceSnapshot,
@@ -37,8 +38,9 @@ import type {
 	AgentConnectionSavedSessionScope,
 	AgentConnectionScopedModel,
 	AgentConnectionSessionContext,
-	AgentConnectionSessionListProgress,
+	AgentConnectionSessionListCallbacks,
 	AgentConnectionSessionTreeNode,
+	AgentConnectionSessionWatcher,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
 	AgentConnectionState,
@@ -50,11 +52,13 @@ import type {
 export class InProcessAgentConnection implements AgentConnection {
 	private readonly listeners = new Set<AgentConnectionEventListener>();
 	private readonly beforeSessionInvalidateListeners = new Set<AgentConnectionBeforeSessionInvalidateListener>();
+	private readonly sideQuestionRuns = new Map<string, SideQuestionRun>();
 	private unsubscribeSessionEvents: (() => void) | undefined;
 
 	constructor(private readonly runtimeHost: AgentSessionRuntime) {
 		this.bindCurrentSessionEvents();
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
+			this.abortAllSideQuestions();
 			for (const listener of [...this.beforeSessionInvalidateListeners]) {
 				listener();
 			}
@@ -117,7 +121,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getSessionContext(): Promise<AgentConnectionSessionContext> {
-		return this.session.sessionManager.buildSessionContext();
+		return this.session.buildSessionContext();
 	}
 
 	async getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }> {
@@ -129,27 +133,33 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async listSavedSessions(
 		scope: AgentConnectionSavedSessionScope,
-		onProgress?: AgentConnectionSessionListProgress,
+		callbacks?: AgentConnectionSessionListCallbacks,
 	): Promise<AgentConnectionSavedSessionInfo[]> {
 		if (scope === "current") {
 			return SessionManager.list(
 				this.session.sessionManager.getCwd(),
 				this.session.sessionManager.getSessionDir(),
-				onProgress,
+				callbacks,
 			);
 		}
-		return SessionManager.listAll(onProgress, this.session.sessionManager.getSessionDir());
+		return SessionManager.listAll(callbacks, this.session.sessionManager.getSessionDir());
 	}
 
 	async getQueue(): Promise<AgentConnectionQueueState> {
 		return {
-			steering: [...this.session.getSteeringMessages()],
-			followUp: [...this.session.getFollowUpMessages()],
+			steering: [...this.session.getSteeringMessagePreviews()],
+			followUp: [...this.session.getFollowUpMessagePreviews()],
 		};
 	}
 
 	async clearQueue(): Promise<AgentConnectionQueueState> {
 		return this.session.clearQueue();
+	}
+
+	async abortAndClearQueue(): Promise<AgentConnectionQueueState> {
+		const queue = this.session.clearQueue();
+		this.session.requestAbort();
+		return queue;
 	}
 
 	async listCronJobs(_options: { includeInactive?: boolean } = {}): Promise<AgentCronJob[]> {
@@ -168,7 +178,11 @@ export class InProcessAgentConnection implements AgentConnection {
 		return undefined;
 	}
 
-	async setHeartbeat(_schedule: string, _instruction: string): Promise<AgentCronJob> {
+	async setHeartbeat(
+		_schedule: string,
+		_instruction: string,
+		_deliveryMode?: AgentHeartbeatDeliveryMode,
+	): Promise<AgentCronJob> {
 		throw new Error("Heartbeats require daemon mode");
 	}
 
@@ -207,6 +221,29 @@ export class InProcessAgentConnection implements AgentConnection {
 		});
 	}
 
+	async startSideQuestion(id: string, question: string): Promise<void> {
+		if (this.sideQuestionRuns.has(id)) {
+			throw new Error(`Side question already exists: ${id}`);
+		}
+		const run = startSideQuestion(this.session.agent, id, question, (event) =>
+			this.emit({ type: "side_question_event", event }),
+		);
+		this.sideQuestionRuns.set(id, run);
+		const removeRun = () => {
+			this.sideQuestionRuns.delete(id);
+		};
+		void run.done.then(removeRun, removeRun);
+	}
+
+	async abortSideQuestion(id: string): Promise<boolean> {
+		const run = this.sideQuestionRuns.get(id);
+		if (!run) {
+			return false;
+		}
+		run.abort();
+		return true;
+	}
+
 	async steer(message: string, images?: ImageContent[]): Promise<void> {
 		await this.session.steer(message, images);
 	}
@@ -216,7 +253,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async abort(): Promise<void> {
-		await this.session.abort();
+		this.session.requestAbort();
 	}
 
 	async cancelRlmChild(childId: string): Promise<boolean> {
@@ -286,7 +323,9 @@ export class InProcessAgentConnection implements AgentConnection {
 		return this.session.compact(customInstructions);
 	}
 
-	async refine(options: { instructions?: string; rollbackId?: string } = {}): Promise<RefinementResult> {
+	async refine(
+		options: { instructions?: string; rollbackId?: string; global?: boolean } = {},
+	): Promise<RefinementResult> {
 		return this.session.refine(options);
 	}
 
@@ -368,7 +407,34 @@ export class InProcessAgentConnection implements AgentConnection {
 		return deleteSessionFile(sessionPath);
 	}
 
+	async watchSession(childId: string): Promise<AgentConnectionSessionWatcher | undefined> {
+		const child = this.session.getRlmChildSession(childId);
+		if (!child) {
+			return undefined;
+		}
+		const unsubscribes = new Set<() => void>();
+		return {
+			getMessages: async () => child.messages,
+			subscribe: (listener) => {
+				const unsubscribe = child.subscribe((event) => void listener({ type: "session_event", event }));
+				unsubscribes.add(unsubscribe);
+				return () => {
+					unsubscribes.delete(unsubscribe);
+					unsubscribe();
+				};
+			},
+			getToolDefinition: async (name) => createAgentConnectionToolDefinition(child.getToolDefinition(name)),
+			close: async () => {
+				for (const unsubscribe of unsubscribes) {
+					unsubscribe();
+				}
+				unsubscribes.clear();
+			},
+		};
+	}
+
 	async dispose(): Promise<void> {
+		this.abortAllSideQuestions();
 		this.unsubscribeSessionEvents?.();
 		this.unsubscribeSessionEvents = undefined;
 		this.runtimeHost.setBeforeSessionInvalidate(undefined);
@@ -385,6 +451,13 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.unsubscribeSessionEvents = this.session.subscribe((event) => {
 			void this.emit({ type: "session_event", event });
 		});
+	}
+
+	private abortAllSideQuestions(): void {
+		for (const run of this.sideQuestionRuns.values()) {
+			run.abort();
+		}
+		this.sideQuestionRuns.clear();
 	}
 
 	private async emit(event: AgentConnectionEvent): Promise<void> {

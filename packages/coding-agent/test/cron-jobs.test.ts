@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,8 +7,13 @@ import {
 	AgentCronJobStore,
 	AgentCronScheduler,
 	createAgentHeartbeatToolDefinitions,
+	migrateLegacyCronJobsToSessionArtifacts,
+	normalizeHeartbeatDeliveryMode,
 	parseAgentCronSchedule,
 	parseHeartbeatCommand,
+	resolveHeartbeatStreamingBehavior,
+	SESSION_SCHEDULED_JOBS_FILENAME,
+	shouldDeferHeartbeatCronJob,
 } from "../src/core/cron-jobs.js";
 
 const start = new Date("2026-01-01T12:34:00.000Z");
@@ -48,7 +53,7 @@ describe("parseHeartbeatCommand", () => {
 		expect(parseHeartbeatCommand("/heartbeat stop")).toEqual({ type: "clear" });
 	});
 
-	it("defaults new heartbeat instructions to every five minutes", () => {
+	it("leaves delivery mode unset when an instruction omits the delivery option", () => {
 		expect(parseHeartbeatCommand("/heartbeat check on me")).toEqual({
 			type: "set",
 			schedule: "every 5m",
@@ -62,10 +67,91 @@ describe("parseHeartbeatCommand", () => {
 			schedule: "every 30s",
 			instruction: "check on me",
 		});
+		expect(parseHeartbeatCommand("/heartbeat every 10m check status")).toEqual({
+			type: "set",
+			schedule: "every 10m",
+			instruction: "check status",
+		});
 		expect(parseHeartbeatCommand("/heartbeat every 10m -- check status")).toEqual({
 			type: "set",
 			schedule: "every 10m",
 			instruction: "check status",
+		});
+	});
+
+	it("opts into follow-up delivery via --follow-up before or after the interval", () => {
+		expect(parseHeartbeatCommand("/heartbeat check on me --follow-up")).toEqual({
+			type: "set",
+			schedule: "every 5m",
+			instruction: "check on me",
+			deliveryMode: "follow_up",
+		});
+		expect(parseHeartbeatCommand("/heartbeat --follow-up check on me")).toEqual({
+			type: "set",
+			schedule: "every 5m",
+			instruction: "check on me",
+			deliveryMode: "follow_up",
+		});
+		expect(parseHeartbeatCommand("/heartbeat --follow-up --every 30s check on me")).toEqual({
+			type: "set",
+			schedule: "every 30s",
+			instruction: "check on me",
+			deliveryMode: "follow_up",
+		});
+		expect(parseHeartbeatCommand("/heartbeat every 10m --follow-up check status")).toEqual({
+			type: "set",
+			schedule: "every 10m",
+			instruction: "check status",
+			deliveryMode: "follow_up",
+		});
+		expect(parseHeartbeatCommand("/heartbeat --deliver follow_up check status")).toEqual({
+			type: "set",
+			schedule: "every 5m",
+			instruction: "check status",
+			deliveryMode: "follow_up",
+		});
+		expect(parseHeartbeatCommand("/heartbeat check status --deliver=follow_up")).toEqual({
+			type: "set",
+			schedule: "every 5m",
+			instruction: "check status",
+			deliveryMode: "follow_up",
+		});
+	});
+
+	it("rejects invalid delivery mode values in delivery flag positions", () => {
+		for (const command of [
+			"/heartbeat --deliver",
+			"/heartbeat --deliver=",
+			"/heartbeat check status --deliver",
+			"/heartbeat check status --deliver=",
+		]) {
+			expect(() => parseHeartbeatCommand(command)).toThrow('Heartbeat delivery mode must be "steer" or "follow_up"');
+		}
+		expect(() => parseHeartbeatCommand("/heartbeat --deliver later check status")).toThrow(
+			'Heartbeat delivery mode must be "steer" or "follow_up"',
+		);
+		expect(() => parseHeartbeatCommand("/heartbeat check status --deliver=later")).toThrow(
+			'Heartbeat delivery mode must be "steer" or "follow_up"',
+		);
+		expect(() => parseHeartbeatCommand("/heartbeat every 10m --deliver later check status")).toThrow(
+			'Heartbeat delivery mode must be "steer" or "follow_up"',
+		);
+	});
+
+	it("keeps delivery-like flags in the middle of an instruction as instruction text", () => {
+		expect(parseHeartbeatCommand("/heartbeat remind me to mention --follow-up in docs")).toEqual({
+			type: "set",
+			schedule: "every 5m",
+			instruction: "remind me to mention --follow-up in docs",
+		});
+	});
+
+	it("accepts an explicit --steer flag that keeps the default delivery mode", () => {
+		expect(parseHeartbeatCommand("/heartbeat --steer check on me")).toEqual({
+			type: "set",
+			schedule: "every 5m",
+			instruction: "check on me",
+			deliveryMode: "steer",
 		});
 	});
 });
@@ -106,6 +192,139 @@ describe("AgentCronJobStore", () => {
 		expect(cancelled).toMatchObject({ id: job.id, status: "cancelled" });
 		expect(store.list()[0]).toMatchObject({ id: job.id, status: "cancelled" });
 		expect(store.list()[0]).not.toHaveProperty("nextRunAt");
+	});
+
+	it("isolates worker-owned jobs in registered session artifact stores", () => {
+		const root = makeTempDir(tempDirs);
+		const firstArtifactDir = join(root, "session-artifacts", "session-1");
+		const secondArtifactDir = join(root, "session-artifacts", "session-2");
+		const store = AgentCronJobStore.forSessionArtifacts();
+		store.registerSessionArtifact("session-1", firstArtifactDir);
+		store.registerSessionArtifact("session-2", secondArtifactDir);
+		const first = store.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: join(root, "sessions", "session-1.jsonl"),
+			cwd: root,
+			scheduleText: "every 5m",
+			prompt: "first heartbeat",
+			now: start,
+		});
+		const second = store.createHeartbeat({
+			activeSessionId: "active-2",
+			sessionId: "session-2",
+			sessionFile: join(root, "sessions", "session-2.jsonl"),
+			cwd: root,
+			scheduleText: "every 5m",
+			prompt: "second heartbeat",
+			now: start,
+		});
+
+		const firstOnly = AgentCronJobStore.forSessionArtifacts();
+		firstOnly.registerSessionArtifact("session-1", firstArtifactDir);
+		expect(firstOnly.list().map((job) => job.id)).toEqual([first.id]);
+		expect(firstOnly.list().map((job) => job.id)).not.toContain(second.id);
+		expect(existsSync(join(firstArtifactDir, SESSION_SCHEDULED_JOBS_FILENAME))).toBe(true);
+		expect(existsSync(join(secondArtifactDir, SESSION_SCHEDULED_JOBS_FILENAME))).toBe(true);
+		expect(join(firstArtifactDir, SESSION_SCHEDULED_JOBS_FILENAME)).not.toBe(
+			join(secondArtifactDir, SESSION_SCHEDULED_JOBS_FILENAME),
+		);
+	});
+
+	it("moves active-session jobs to the replacement session artifact store", () => {
+		const root = makeTempDir(tempDirs);
+		const firstArtifactDir = join(root, "session-artifacts", "session-1");
+		const secondArtifactDir = join(root, "session-artifacts", "session-2");
+		const store = AgentCronJobStore.forSessionArtifacts();
+		store.registerSessionArtifact("session-1", firstArtifactDir);
+		store.registerSessionArtifact("session-2", secondArtifactDir);
+		const heartbeat = store.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: join(root, "sessions", "session-1.jsonl"),
+			cwd: root,
+			scheduleText: "every 5m",
+			prompt: "follow the active root",
+			now: start,
+		});
+
+		store.rebindSessionJobs({
+			activeSessionId: "active-1",
+			sessionId: "session-2",
+			sessionFile: join(root, "sessions", "session-2.jsonl"),
+			cwd: root,
+		});
+
+		const firstOnly = AgentCronJobStore.forSessionArtifacts();
+		firstOnly.registerSessionArtifact("session-1", firstArtifactDir);
+		expect(firstOnly.list()).toEqual([]);
+		const secondOnly = AgentCronJobStore.forSessionArtifacts();
+		secondOnly.registerSessionArtifact("session-2", secondArtifactDir);
+		expect(secondOnly.list()).toEqual([
+			expect.objectContaining({ id: heartbeat.id, sessionId: "session-2", activeSessionId: "active-1" }),
+		]);
+	});
+
+	it("migrates the legacy global store into per-session artifact stores", () => {
+		const root = makeTempDir(tempDirs);
+		const legacyPath = join(root, "cron-jobs.json");
+		const legacy = new AgentCronJobStore(legacyPath);
+		const first = legacy.create({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: join(root, "sessions", "session-1.jsonl"),
+			cwd: root,
+			scheduleText: "in 1h",
+			prompt: "first migrated job",
+			now: start,
+		});
+		const second = legacy.create({
+			activeSessionId: "active-2",
+			sessionId: "session-2",
+			sessionFile: join(root, "sessions", "session-2.jsonl"),
+			cwd: root,
+			scheduleText: "in 2h",
+			prompt: "second migrated job",
+			now: start,
+		});
+
+		expect(migrateLegacyCronJobsToSessionArtifacts(legacyPath)).toBe(2);
+		expect(existsSync(legacyPath)).toBe(false);
+		const migrated = AgentCronJobStore.forSessionArtifacts();
+		migrated.registerSessionArtifact("session-1", join(root, "session-artifacts", "session-1"));
+		migrated.registerSessionArtifact("session-2", join(root, "session-artifacts", "session-2"));
+		expect(migrated.list().map((job) => job.id)).toEqual(expect.arrayContaining([first.id, second.id]));
+	});
+
+	it("marks in-flight legacy dispatches interrupted during migration", () => {
+		const root = makeTempDir(tempDirs);
+		const legacyPath = join(root, "cron-jobs.json");
+		const legacy = new AgentCronJobStore(legacyPath);
+		const heartbeat = legacy.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: join(root, "sessions", "session-1.jsonl"),
+			cwd: root,
+			scheduleText: "every 10s",
+			prompt: "migrated heartbeat",
+			now: start,
+		});
+		legacy.claimDue(new Date("2026-01-01T12:34:10.000Z"));
+
+		expect(
+			migrateLegacyCronJobsToSessionArtifacts(legacyPath, {
+				now: new Date("2026-01-01T12:34:11.000Z"),
+			}),
+		).toBe(1);
+		const migrated = AgentCronJobStore.forSessionArtifacts();
+		migrated.registerSessionArtifact("session-1", join(root, "session-artifacts", "session-1"));
+		expect(migrated.list()).toEqual([
+			expect.objectContaining({
+				id: heartbeat.id,
+				lastError: "Interrupted before scheduled operation completion",
+				nextRunAt: "2026-01-01T12:34:20.000Z",
+			}),
+		]);
 	});
 
 	it("keeps overdue jobs eligible for the scheduler after restart", () => {
@@ -177,6 +396,41 @@ describe("AgentCronJobStore", () => {
 		});
 	});
 
+	it("preserves session-artifact dispatches when a stale snapshot is written", () => {
+		const root = makeTempDir(tempDirs);
+		const artifactDir = join(root, "session-artifacts", "session-1");
+		const artifactPath = join(artifactDir, SESSION_SCHEDULED_JOBS_FILENAME);
+		const writer = AgentCronJobStore.forSessionArtifacts();
+		const dispatcher = AgentCronJobStore.forSessionArtifacts();
+		writer.registerSessionArtifact("session-1", artifactDir);
+		dispatcher.registerSessionArtifact("session-1", artifactDir);
+		const heartbeat = writer.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: join(root, "sessions", "session-1.jsonl"),
+			cwd: root,
+			scheduleText: "every 10s",
+			prompt: "check progress",
+			now: start,
+		});
+		const staleCancellation = {
+			...heartbeat,
+			status: "cancelled" as const,
+			nextRunAt: undefined,
+			updatedAt: "2026-01-01T12:34:20.000Z",
+		};
+
+		expect(dispatcher.claimDue(new Date("2026-01-01T12:34:10.000Z"))).toHaveLength(1);
+		writeJobsForTest(writer, [staleCancellation]);
+
+		const state = JSON.parse(readFileSync(artifactPath, "utf8")) as {
+			jobs: AgentCronJob[];
+			dispatches: Array<{ jobId: string }>;
+		};
+		expect(state.jobs).toContainEqual(expect.objectContaining({ id: heartbeat.id, status: "cancelled" }));
+		expect(state.dispatches).toContainEqual(expect.objectContaining({ jobId: heartbeat.id }));
+	});
+
 	it("keeps one persistent heartbeat per active session", () => {
 		const store = new AgentCronJobStore(makeStorePath(tempDirs));
 		const first = store.createHeartbeat({
@@ -200,6 +454,54 @@ describe("AgentCronJobStore", () => {
 
 		expect(store.getHeartbeat("active-1")).toMatchObject({ id: second.id, prompt: "continue the work" });
 		expect(store.list().find((job) => job.id === first.id)).toMatchObject({ status: "cancelled" });
+	});
+
+	it("defaults heartbeats to steer delivery and persists an explicit follow_up opt-out", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const steerHeartbeat = store.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "steer by default",
+			now: start,
+		});
+		expect(steerHeartbeat.deliveryMode).toBe("steer");
+
+		const followUpHeartbeat = store.createHeartbeat({
+			activeSessionId: "active-2",
+			sessionId: "session-2",
+			sessionFile: "/tmp/session-2.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "queue as follow-up",
+			deliveryMode: "follow_up",
+			now: start,
+		});
+		expect(followUpHeartbeat.deliveryMode).toBe("follow_up");
+		expect(store.getHeartbeat("active-2")).toMatchObject({ deliveryMode: "follow_up" });
+	});
+
+	it("defaults RLM heartbeats to steer delivery and updates the delivery mode", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const rlmHeartbeat = store.createRlmHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "watch progress",
+			now: start,
+		});
+		expect(rlmHeartbeat.deliveryMode).toBe("steer");
+
+		const updated = store.updateRlmHeartbeat("active-1", rlmHeartbeat.id, {
+			deliveryMode: "follow_up",
+			now: new Date("2026-01-01T12:35:00.000Z"),
+		});
+		expect(updated).toMatchObject({ id: rlmHeartbeat.id, deliveryMode: "follow_up" });
+		expect(store.listRlmHeartbeats("active-1")[0]).toMatchObject({ deliveryMode: "follow_up" });
 	});
 
 	it("pauses, resumes, and clears heartbeat state", () => {
@@ -229,6 +531,7 @@ describe("AgentCronJobStore", () => {
 			status: "cancelled",
 		});
 		expect(store.getHeartbeat("active-1")).toBeUndefined();
+		expect(store.getLatestHeartbeat("active-1")).toMatchObject({ id: job.id, status: "cancelled" });
 	});
 
 	it("rejects one-shot heartbeat schedules", () => {
@@ -453,6 +756,62 @@ describe("AgentCronJobStore", () => {
 			]),
 		);
 		expect(store.listRlmHeartbeats("top-level-1")[0]).toMatchObject({ status: "active" });
+	});
+
+	it("cancels active and paused jobs for a removed session", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const sessionFile = "/tmp/session-to-remove.jsonl";
+		const cron = store.create({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile,
+			cwd: "/tmp/project",
+			scheduleText: "in 1h",
+			prompt: "check the long run",
+			now: start,
+		});
+		const heartbeat = store.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile,
+			cwd: "/tmp/project",
+			scheduleText: "every 5m",
+			prompt: "continue the session",
+			now: start,
+		});
+		store.pauseHeartbeat("active-1", new Date("2026-01-01T12:35:00.000Z"));
+		const rlmHeartbeat = store.createRlmHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile,
+			cwd: "/tmp/project",
+			runtimeKind: "top-level",
+			label: "rlm",
+			scheduleText: "every 10m",
+			prompt: "continue internal work",
+			now: start,
+		});
+		const unrelated = store.create({
+			activeSessionId: "active-2",
+			sessionId: "session-2",
+			sessionFile: "/tmp/other-session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "in 2h",
+			prompt: "keep other session alive",
+			now: start,
+		});
+
+		const cancelled = store.cancelJobsForSession({ sessionId: "session-1" }, new Date("2026-01-01T12:40:00.000Z"));
+
+		expect(cancelled.map((job) => job.id)).toEqual(expect.arrayContaining([cron.id, heartbeat.id, rlmHeartbeat.id]));
+		for (const id of [cron.id, heartbeat.id, rlmHeartbeat.id]) {
+			expect(store.list().find((job) => job.id === id)).toMatchObject({
+				status: "cancelled",
+				updatedAt: "2026-01-01T12:40:00.000Z",
+			});
+			expect(store.list().find((job) => job.id === id)).not.toHaveProperty("nextRunAt");
+		}
+		expect(store.list().find((job) => job.id === unrelated.id)).toMatchObject({ status: "active" });
 	});
 
 	it("returns undefined when updating inactive RLM heartbeats", () => {
@@ -702,6 +1061,7 @@ describe("AgentCronScheduler", () => {
 			id: job.id,
 			status: "active",
 			nextRunAt: "2026-01-01T12:45:00.000Z",
+			lastSkippedAt: "2026-01-01T12:40:00.000Z",
 			runCount: 0,
 		});
 		expect(store.getHeartbeat("active-1")).not.toHaveProperty("lastRunAt");
@@ -749,6 +1109,293 @@ describe("AgentCronScheduler", () => {
 				expect.objectContaining({ id: second.id, status: "cancelled", runCount: 0 }),
 			]),
 		);
+	});
+
+	it("dispatches different sessions concurrently and advances their schedules before completion", async () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		for (const index of [1, 2]) {
+			store.createHeartbeat({
+				activeSessionId: `active-${index}`,
+				sessionId: `session-${index}`,
+				sessionFile: `/tmp/session-${index}.jsonl`,
+				cwd: "/tmp/project",
+				scheduleText: "every 10s",
+				prompt: `heartbeat ${index}`,
+				now: start,
+			});
+		}
+		const started: string[] = [];
+		const releases = new Map<string, () => void>();
+		const scheduler = new AgentCronScheduler(store, {
+			now: () => new Date("2026-01-01T12:34:10.000Z"),
+			runJob: async (job) => {
+				started.push(job.activeSessionId);
+				await new Promise<void>((resolve) => releases.set(job.activeSessionId, resolve));
+				return undefined;
+			},
+		});
+
+		const run = scheduler.runDue(new Date("2026-01-01T12:34:10.000Z"));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		expect(started).toEqual(expect.arrayContaining(["active-1", "active-2"]));
+		expect(store.list().map((job) => job.nextRunAt)).toEqual([
+			"2026-01-01T12:34:20.000Z",
+			"2026-01-01T12:34:20.000Z",
+		]);
+		for (const release of releases.values()) {
+			release();
+		}
+		await run;
+	});
+
+	it("serializes simultaneous jobs that target the same session", async () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		for (const prompt of ["first", "second"]) {
+			store.create({
+				activeSessionId: "active-1",
+				sessionId: "session-1",
+				sessionFile: "/tmp/session.jsonl",
+				cwd: "/tmp/project",
+				scheduleText: "in 1m",
+				prompt,
+				now: start,
+			});
+		}
+		const started: string[] = [];
+		let releaseFirst: () => void = () => {};
+		const scheduler = new AgentCronScheduler(store, {
+			now: () => new Date("2026-01-01T12:35:00.000Z"),
+			runJob: async (job) => {
+				started.push(job.prompt);
+				if (job.prompt === "first") {
+					await new Promise<void>((resolve) => {
+						releaseFirst = resolve;
+					});
+				}
+				return undefined;
+			},
+		});
+
+		const run = scheduler.runDue(new Date("2026-01-01T12:35:00.000Z"));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(started).toEqual(["first"]);
+		releaseFirst();
+		await run;
+		expect(started).toEqual(["first", "second"]);
+	});
+
+	it("coalesces a missed interval while its previous dispatch is still active", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const heartbeat = store.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 10s",
+			prompt: "check progress",
+			now: start,
+		});
+
+		expect(store.claimDue(new Date("2026-01-01T12:34:10.000Z"))).toHaveLength(1);
+		expect(store.claimDue(new Date("2026-01-01T12:34:20.000Z"))).toEqual([]);
+		expect(store.list().find((job) => job.id === heartbeat.id)).toMatchObject({
+			nextRunAt: "2026-01-01T12:34:30.000Z",
+			lastSkippedAt: "2026-01-01T12:34:20.000Z",
+			runCount: 0,
+		});
+	});
+
+	it("reschedules a skipped dispatch from the skip time", () => {
+		const store = new AgentCronJobStore(makeStorePath(tempDirs));
+		const heartbeat = store.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 10s",
+			prompt: "check progress",
+			now: start,
+		});
+		const [dispatch] = store.claimDue(new Date("2026-01-01T12:34:10.000Z"));
+		if (!dispatch) {
+			throw new Error("Expected heartbeat dispatch");
+		}
+
+		store.recordDispatchResult(dispatch.id, {
+			now: new Date("2026-01-01T12:34:17.000Z"),
+			outcome: "skipped",
+		});
+
+		expect(store.list().find((job) => job.id === heartbeat.id)).toMatchObject({
+			nextRunAt: "2026-01-01T12:34:27.000Z",
+			lastSkippedAt: "2026-01-01T12:34:17.000Z",
+			runCount: 0,
+		});
+	});
+
+	it("does not replay an uncertain claimed dispatch after recovery", () => {
+		const storePath = makeStorePath(tempDirs);
+		const store = new AgentCronJobStore(storePath);
+		const heartbeat = store.createHeartbeat({
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionFile: "/tmp/session.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 10s",
+			prompt: "check progress",
+			now: start,
+		});
+		store.claimDue(new Date("2026-01-01T12:34:10.000Z"));
+
+		const recovered = new AgentCronJobStore(storePath);
+		expect(recovered.recoverInterruptedDispatches(new Date("2026-01-01T12:34:11.000Z"))).toEqual([
+			expect.objectContaining({ id: heartbeat.id, lastError: "Interrupted before scheduled operation completion" }),
+		]);
+		expect(recovered.getClaimedJob(heartbeat.id)).toBeUndefined();
+		expect(recovered.getDueJob(heartbeat.id, new Date("2026-01-01T12:34:11.000Z"))).toBeUndefined();
+	});
+});
+
+describe("shouldDeferHeartbeatCronJob", () => {
+	const baseJob: AgentCronJob = {
+		id: "job-1",
+		status: "active",
+		activeSessionId: "active-1",
+		sessionId: "session-1",
+		sessionFile: "/tmp/session.jsonl",
+		cwd: "/tmp/project",
+		prompt: "check progress",
+		schedule: { kind: "interval", expression: "every 5m", intervalMs: 300_000 },
+		createdAt: "2026-01-01T12:34:00.000Z",
+		updatedAt: "2026-01-01T12:34:00.000Z",
+		nextRunAt: "2026-01-01T12:39:00.000Z",
+		runCount: 0,
+	};
+
+	it("defers follow-up heartbeats while the target session is working", () => {
+		for (const source of ["heartbeat", "rlm_heartbeat"] as const) {
+			const job = { ...baseJob, source, deliveryMode: "follow_up" as const };
+
+			expect(
+				shouldDeferHeartbeatCronJob(job, {
+					isStreaming: true,
+					isBashRunning: false,
+					pendingMessageCount: 0,
+				}),
+			).toBe(true);
+			expect(
+				shouldDeferHeartbeatCronJob(job, {
+					isStreaming: false,
+					isBashRunning: true,
+					pendingMessageCount: 0,
+				}),
+			).toBe(true);
+			expect(
+				shouldDeferHeartbeatCronJob(job, {
+					isStreaming: false,
+					isBashRunning: false,
+					pendingMessageCount: 1,
+				}),
+			).toBe(true);
+		}
+	});
+
+	it("lets steer heartbeats interrupt a plain streaming turn", () => {
+		for (const source of ["heartbeat", "rlm_heartbeat"] as const) {
+			// Default (undefined) delivery mode is steer.
+			for (const job of [
+				{ ...baseJob, source },
+				{ ...baseJob, source, deliveryMode: "steer" as const },
+			]) {
+				expect(
+					shouldDeferHeartbeatCronJob(job, {
+						isStreaming: true,
+						isBashRunning: false,
+						pendingMessageCount: 0,
+					}),
+				).toBe(false);
+			}
+		}
+	});
+
+	it("defers steer heartbeats when delivering would be unsafe or would stack work", () => {
+		const job = { ...baseJob, source: "heartbeat" as const, deliveryMode: "steer" as const };
+
+		expect(
+			shouldDeferHeartbeatCronJob(job, {
+				isStreaming: true,
+				isCompacting: true,
+				isBashRunning: false,
+				pendingMessageCount: 0,
+			}),
+		).toBe(true);
+		expect(
+			shouldDeferHeartbeatCronJob(job, {
+				isStreaming: false,
+				isBashRunning: true,
+				pendingMessageCount: 0,
+			}),
+		).toBe(true);
+		expect(
+			shouldDeferHeartbeatCronJob(job, {
+				isStreaming: false,
+				isBashRunning: false,
+				pendingMessageCount: 1,
+			}),
+		).toBe(true);
+		expect(
+			shouldDeferHeartbeatCronJob(job, {
+				isStreaming: false,
+				isRetrying: true,
+				isBashRunning: false,
+				pendingMessageCount: 0,
+			}),
+		).toBe(true);
+		expect(
+			shouldDeferHeartbeatCronJob(job, {
+				isStreaming: false,
+				isBashRunning: false,
+				hasAcceptedPromptInFlight: true,
+				pendingMessageCount: 0,
+			}),
+		).toBe(true);
+	});
+
+	it("allows heartbeats when the target session is idle", () => {
+		expect(
+			shouldDeferHeartbeatCronJob(
+				{ ...baseJob, source: "heartbeat" },
+				{ isStreaming: false, isBashRunning: false, pendingMessageCount: 0 },
+			),
+		).toBe(false);
+	});
+
+	it("does not defer ordinary cron jobs", () => {
+		expect(
+			shouldDeferHeartbeatCronJob(
+				{ ...baseJob, source: "cron" },
+				{ isStreaming: true, isBashRunning: true, pendingMessageCount: 2 },
+			),
+		).toBe(false);
+	});
+});
+
+describe("heartbeat delivery mode", () => {
+	it("normalizes valid delivery modes and rejects invalid ones", () => {
+		expect(normalizeHeartbeatDeliveryMode(undefined)).toBeUndefined();
+		expect(normalizeHeartbeatDeliveryMode(null)).toBeUndefined();
+		expect(normalizeHeartbeatDeliveryMode("steer")).toBe("steer");
+		expect(normalizeHeartbeatDeliveryMode("follow_up")).toBe("follow_up");
+		expect(() => normalizeHeartbeatDeliveryMode("followup")).toThrow(
+			'Heartbeat delivery mode must be "steer" or "follow_up"',
+		);
+	});
+
+	it("resolves delivery mode to a streaming behavior, defaulting to steer", () => {
+		expect(resolveHeartbeatStreamingBehavior(undefined)).toBe("steer");
+		expect(resolveHeartbeatStreamingBehavior("steer")).toBe("steer");
+		expect(resolveHeartbeatStreamingBehavior("follow_up")).toBe("followUp");
 	});
 });
 
@@ -800,7 +1447,12 @@ function writeJobsForTest(store: AgentCronJobStore, jobs: readonly AgentCronJob[
 }
 
 function makeStorePath(tempDirs: string[]): string {
+	const dir = makeTempDir(tempDirs);
+	return join(dir, "cron-jobs.json");
+}
+
+function makeTempDir(tempDirs: string[]): string {
 	const dir = mkdtempSync(join(tmpdir(), "prime-agent-cron-"));
 	tempDirs.push(dir);
-	return join(dir, "cron-jobs.json");
+	return dir;
 }

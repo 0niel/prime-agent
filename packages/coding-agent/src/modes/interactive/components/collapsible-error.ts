@@ -103,7 +103,7 @@ export class CollapsibleErrorComponent implements Component {
 
 		const summary = normalizeErrorDetails(this.options.summary ?? summarizeErrorDetails(text));
 		const inlineHint = `${summary} ${theme.fg("dim", "·")} ${keyHint("app.tools.expand", "to expand")}`;
-		return this.renderText(inlineHint, width, "muted");
+		return this.renderText(inlineHint, width, "error");
 	}
 
 	private renderText(text: string, width: number, color: "error" | "muted" = "error"): string[] {

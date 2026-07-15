@@ -197,18 +197,81 @@ describe("SettingsManager", () => {
 		});
 	});
 
-	describe("onboardingCompleted", () => {
+	describe("onboardingShown", () => {
 		it("defaults to false and persists globally", async () => {
 			const manager = SettingsManager.create(projectDir, agentDir);
 
-			expect(manager.getOnboardingCompleted()).toBe(false);
+			expect(manager.getOnboardingShown()).toBe(false);
 
-			manager.setOnboardingCompleted(true);
+			manager.setOnboardingShown(true);
 			await manager.flush();
 
 			const savedSettings = JSON.parse(readFileSync(join(agentDir, "settings.json"), "utf-8"));
-			expect(savedSettings.onboardingCompleted).toBe(true);
-			expect(manager.getOnboardingCompleted()).toBe(true);
+			expect(savedSettings.onboardingShown).toBe(true);
+			expect(manager.getOnboardingShown()).toBe(true);
+		});
+
+		it("treats the legacy completion field as already shown", () => {
+			const manager = SettingsManager.inMemory({ onboardingCompleted: true });
+
+			expect(manager.getOnboardingShown()).toBe(true);
+		});
+	});
+
+	describe("autoRefine", () => {
+		it("defaults to enabled while preserving explicit opt-out", () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getAutoRefineSettings()).toEqual({
+				enabled: true,
+				turnInterval: 25,
+				compact: true,
+				cooldownMs: 20 * 60_000,
+			});
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ autoRefine: { enabled: false } }));
+			const optedOut = SettingsManager.create(projectDir, agentDir);
+
+			expect(optedOut.getAutoRefineSettings().enabled).toBe(false);
+		});
+
+		it("falls back to defaults for non-numeric turnInterval and cooldownMs", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ autoRefine: { turnInterval: "oops", cooldownMs: "nope" } }),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			const settings = manager.getAutoRefineSettings();
+			expect(settings.turnInterval).toBe(25);
+			expect(settings.cooldownMs).toBe(20 * 60_000);
+			expect(Number.isFinite(settings.turnInterval)).toBe(true);
+			expect(Number.isFinite(settings.cooldownMs)).toBe(true);
+		});
+
+		it("ignores non-finite numeric values that parse to Infinity", () => {
+			// 1e999 is valid JSON that JSON.parse turns into Infinity.
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				`{ "autoRefine": { "turnInterval": 1e999, "cooldownMs": 1e999 } }`,
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			const settings = manager.getAutoRefineSettings();
+			expect(settings.turnInterval).toBe(25);
+			expect(settings.cooldownMs).toBe(20 * 60_000);
+		});
+
+		it("preserves valid numeric overrides", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ autoRefine: { turnInterval: 5, cooldownMs: 1000 } }),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			const settings = manager.getAutoRefineSettings();
+			expect(settings.turnInterval).toBe(5);
+			expect(settings.cooldownMs).toBe(1000);
 		});
 	});
 
@@ -359,6 +422,39 @@ describe("SettingsManager", () => {
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ sessionDir: "~/sessions" }));
 			const manager = SettingsManager.create(projectDir, agentDir);
 			expect(manager.getSessionDir()).toBe(join(homedir(), "sessions"));
+		});
+	});
+
+	describe("mcpServers", () => {
+		it("returns undefined when unset", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "dark" }));
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.getMcpServers()).toBeUndefined();
+		});
+
+		it("merges global and project mcpServers, project winning per key", () => {
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({
+					mcpServers: {
+						acme: { type: "http", url: "https://global.acme/mcp", oauth: true },
+						shared: { type: "http", url: "https://global.shared/mcp" },
+					},
+				}),
+			);
+			writeFileSync(
+				join(projectDir, ".prime", "agent", "settings.json"),
+				JSON.stringify({
+					mcpServers: {
+						shared: { type: "http", url: "https://project.shared/mcp" },
+					},
+				}),
+			);
+			const manager = SettingsManager.create(projectDir, agentDir);
+			const servers = manager.getMcpServers();
+			expect(servers?.acme).toEqual({ type: "http", url: "https://global.acme/mcp", oauth: true });
+			// Project override replaces the shared entry.
+			expect(servers?.shared).toEqual({ type: "http", url: "https://project.shared/mcp" });
 		});
 	});
 });

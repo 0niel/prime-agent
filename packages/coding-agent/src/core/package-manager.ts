@@ -115,6 +115,8 @@ interface PackageManagerOptions {
 	settingsManager: SettingsManager;
 	/** Directory of built-in skills shipped with the package. Defaults to the bundled skills dir; pass null to disable. */
 	bundledSkillsDir?: string | null;
+	/** Extra force-exclude patterns for built-in skills (e.g. unauthenticated MCP integrations). */
+	extraBuiltinSkillOverrides?: () => string[];
 }
 
 type SourceScope = "user" | "project" | "temporary";
@@ -252,7 +254,9 @@ function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
 			if (patterns.length > 0) {
 				ig.add(patterns);
 			}
-		} catch {}
+		} catch {
+			// Unreadable ignore file: skip it rather than failing resource loading.
+		}
 	}
 }
 
@@ -766,6 +770,7 @@ export class DefaultPackageManager implements PackageManager {
 	private agentDir: string;
 	private settingsManager: SettingsManager;
 	private bundledSkillsDir: string | null;
+	private extraBuiltinSkillOverrides: () => string[];
 	private globalNpmRoot: string | undefined;
 	private globalNpmRootCommandKey: string | undefined;
 	private progressCallback: ProgressCallback | undefined;
@@ -775,6 +780,7 @@ export class DefaultPackageManager implements PackageManager {
 		this.agentDir = options.agentDir;
 		this.settingsManager = options.settingsManager;
 		this.bundledSkillsDir = options.bundledSkillsDir === undefined ? getBundledSkillsDir() : options.bundledSkillsDir;
+		this.extraBuiltinSkillOverrides = options.extraBuiltinSkillOverrides ?? (() => []);
 	}
 
 	setProgressCallback(callback: ProgressCallback | undefined): void {
@@ -2258,9 +2264,13 @@ export class DefaultPackageManager implements PackageManager {
 					path: this.bundledSkillsDir,
 				});
 			}
-			const builtinSkillOverrides = this.settingsManager.getBundledWebsearchEnabled()
-				? userOverrides.skills
-				: [...userOverrides.skills, "-websearch/SKILL.md"];
+			const builtinSkillOverrides = [
+				...userOverrides.skills,
+				// Disable the bundled websearch skill unless explicitly enabled…
+				...(this.settingsManager.getBundledWebsearchEnabled() ? [] : ["-websearch/SKILL.md"]),
+				// …and disable any MCP integration the user hasn't logged into.
+				...this.extraBuiltinSkillOverrides(),
+			];
 			addResources("skills", builtinEntries, builtinMetadata, builtinSkillOverrides, this.bundledSkillsDir);
 		}
 		addResources(
