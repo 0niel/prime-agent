@@ -111,7 +111,7 @@ import { parseGitUrl } from "../../utils/git.js";
 import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
-import { ensureTool, MISSING_RIPGREP_MESSAGE } from "../../utils/tools-manager.js";
+import { ensureTool, ensureToolWithStatus, formatMissingRipgrepMessage } from "../../utils/tools-manager.js";
 import { checkForNewPiVersion } from "../../utils/version-check.js";
 import type {
 	AgentConnection,
@@ -1111,10 +1111,10 @@ export class InteractiveMode {
 
 		// Ensure fd and rg are available (downloads if missing, adds to PATH via getBinDir)
 		// fd powers autocomplete, and rg is available for shell commands.
-		const [fdPath, rgPath] = await Promise.all([ensureTool("fd"), ensureTool("rg")]);
+		const [fdPath, rgResult] = await Promise.all([ensureTool("fd"), ensureToolWithStatus("rg")]);
 		this.fdPath = fdPath;
-		if (!rgPath) {
-			this.showWarning(MISSING_RIPGREP_MESSAGE);
+		if (rgResult.status === "unavailable") {
+			this.showWarning(formatMissingRipgrepMessage(rgResult));
 		}
 
 		// Add header container as first child

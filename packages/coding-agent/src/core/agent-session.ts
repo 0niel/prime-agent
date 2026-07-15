@@ -41,7 +41,6 @@ import {
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";
 import { sleep } from "../utils/sleep.js";
-import { ensureTool, MISSING_RIPGREP_MESSAGE } from "../utils/tools-manager.js";
 import {
 	AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL,
 	AGENT_MESSAGE_SKILL_NAME,
@@ -6316,9 +6315,6 @@ export class AgentSession {
 
 		const task = (async (): Promise<RlmInternalRunResult> => {
 			try {
-				if (!(await ensureTool("rg", true))) {
-					throw new Error(MISSING_RIPGREP_MESSAGE);
-				}
 				if (isRlmChildRunCancelled(run)) {
 					throw new Error(run.error ?? "RLM child cancelled");
 				}
