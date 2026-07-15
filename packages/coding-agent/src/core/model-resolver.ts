@@ -177,6 +177,25 @@ function buildFallbackModel(provider: string, modelId: string, availableModels: 
 	};
 }
 
+function findPreferredDefaultModel(availableModels: Model<Api>[]): Model<Api> | undefined {
+	const primeInferenceDefault = availableModels.find(
+		(model) => model.provider === "prime-inference" && model.id === PRIME_INFERENCE_DEFAULT_MODEL_ID,
+	);
+	if (primeInferenceDefault) {
+		return primeInferenceDefault;
+	}
+
+	for (const provider of Object.keys(defaultModelPerProvider) as KnownProvider[]) {
+		const defaultId = defaultModelPerProvider[provider];
+		const match = availableModels.find((model) => model.provider === provider && model.id === defaultId);
+		if (match) {
+			return match;
+		}
+	}
+
+	return undefined;
+}
+
 /**
  * Parse a pattern to extract model and thinking level.
  * Handles models with colons in their IDs (e.g., OpenRouter's :exacto suffix).
@@ -561,13 +580,9 @@ export async function findInitialModel(options: {
 	const availableModels = await modelRegistry.getAvailable();
 
 	if (availableModels.length > 0) {
-		// Try to find a default model from known providers
-		for (const provider of Object.keys(defaultModelPerProvider) as KnownProvider[]) {
-			const defaultId = defaultModelPerProvider[provider];
-			const match = availableModels.find((m) => m.provider === provider && m.id === defaultId);
-			if (match) {
-				return { model: match, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
-			}
+		const defaultModel = findPreferredDefaultModel(availableModels);
+		if (defaultModel) {
+			return { model: defaultModel, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
 		}
 
 		// If no default found, use first available
@@ -623,21 +638,7 @@ export async function restoreModelFromSession(
 	const availableModels = await modelRegistry.getAvailable();
 
 	if (availableModels.length > 0) {
-		// Try to find a default model from known providers
-		let fallbackModel: Model<Api> | undefined;
-		for (const provider of Object.keys(defaultModelPerProvider) as KnownProvider[]) {
-			const defaultId = defaultModelPerProvider[provider];
-			const match = availableModels.find((m) => m.provider === provider && m.id === defaultId);
-			if (match) {
-				fallbackModel = match;
-				break;
-			}
-		}
-
-		// If no default found, use first available
-		if (!fallbackModel) {
-			fallbackModel = availableModels[0];
-		}
+		const fallbackModel = findPreferredDefaultModel(availableModels) ?? availableModels[0];
 
 		if (shouldPrintMessages) {
 			console.log(chalk.dim(`Falling back to: ${fallbackModel.provider}/${fallbackModel.id}`));
