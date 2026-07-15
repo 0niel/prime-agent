@@ -240,6 +240,8 @@ export interface RlmChildAgentSnapshot {
 	id: string;
 	parentId?: string;
 	activeSessionId?: string;
+	/** Stable daemon-visible session name for addressing/displaying the child. */
+	sessionName?: string;
 	label: string;
 	status: RlmChildAgentStatus;
 	durationMs?: number;
@@ -6562,6 +6564,7 @@ export class AgentSession {
 				child: {
 					id: childNodeId,
 					parentId: this._rlmParentNodeId,
+					sessionName,
 					label,
 					status: run.status,
 					durationMs,

@@ -139,6 +139,22 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		expect(out[ellipsisIndex - 1]).not.toBe(" ");
 	});
 
+	it("prefers stable session names over spawn prompts in the summary row", () => {
+		const summary = new ChildAgentSummaryComponent();
+		summary.setNodes([
+			{
+				...node("a"),
+				sessionName: "anticheat-review",
+				label: "You are doing a manual trajectory review for anti-cheat evidence",
+				recap: "Extracting and analyzing test results",
+			},
+		]);
+		const out = stripAnsi(summary.render(120).join("\n"));
+		expect(out).toContain("anticheat-review");
+		expect(out).not.toContain("manual trajectory");
+		expect(out).toContain("Extracting and analyzing test results");
+	});
+
 	it("keeps the selected background active across the entire row", () => {
 		const summary = new ChildAgentSummaryComponent();
 		summary.focused = true;

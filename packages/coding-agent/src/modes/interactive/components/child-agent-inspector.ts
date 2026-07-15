@@ -24,6 +24,8 @@ export interface ChildAgentInspectorNode {
 	id: string;
 	/** The child's own daemon active-session id, for attaching directly to its stream. */
 	activeSessionId?: string;
+	/** Stable daemon-visible session name for addressing/displaying the child. */
+	sessionName?: string;
 	label: string;
 	status: ChildAgentStatus;
 	durationMs?: number;
@@ -389,7 +391,7 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 		if (flat.length < 2) {
 			return "";
 		}
-		const labels = flat.map((entry) => entry.node.label);
+		const labels = flat.map((entry) => this.entryLabel(entry));
 		let prefix = labels[0] ?? "";
 		for (const label of labels) {
 			let i = 0;
@@ -411,7 +413,7 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 		if (flat.length < 2 || !prefix) {
 			return "";
 		}
-		const labels = flat.map((entry) => entry.node.label);
+		const labels = flat.map((entry) => this.entryLabel(entry));
 		let suffix = labels[0] ?? "";
 		for (const label of labels) {
 			let i = 0;
@@ -447,7 +449,7 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 		const icon = formatChildAgentStatusIcon(entry.node.status, rawIcon);
 		const agentLabel = `S${number}`;
 		const agentCell = theme.fg("muted", padTableCell(agentLabel, agentWidth));
-		const promptCell = this.elidePrompt(entry.node.label, sharedPrefix, sharedSuffix, promptWidth);
+		const promptCell = this.elidePrompt(this.entryLabel(entry), sharedPrefix, sharedSuffix, promptWidth);
 		const recapCell = theme.fg("muted", padTableCell(childAgentRecap(entry.node), recapWidth, "…"));
 		const tools =
 			entry.node.toolUseCount === undefined
@@ -461,6 +463,10 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 		const metrics = `${toolsCell} ${tokensCell}${" ".repeat(SUMMARY_TOKEN_TIME_GAP)}${durationCell}`;
 		const gap = " ".repeat(SUMMARY_COLUMN_GAP);
 		return `${indent}${icon} ${agentCell}${gap}${promptCell}${gap}${recapCell}${gap}${theme.fg("muted", metrics)}`;
+	}
+
+	private entryLabel(entry: FlatChildAgentNode): string {
+		return entry.node.sessionName?.trim() || entry.node.label;
 	}
 
 	private elidePrompt(label: string, sharedPrefix: string, sharedSuffix: string, width: number): string {
