@@ -1,9 +1,12 @@
 import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, TextContent, Transport, Usage } from "@earendil-works/pi-ai";
+import type { AuthSourceToken } from "../../core/auth-storage.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
-import type { AgentCronJob, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
+import type { AgentCronJob, AgentHeartbeatDeliveryMode, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
+import type { ReplayBuiltInToolName } from "../../core/extensions/index.js";
 import type { GoalState } from "../../core/goals.js";
+import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type { SessionStats } from "../../core/session-stats.js";
@@ -65,6 +68,12 @@ export interface AgentConnectionSavedSessionState {
 	status: AgentConnectionSavedSessionStateStatus;
 }
 
+export interface AgentConnectionAgentStatus {
+	summary: string;
+	taskState?: "needs_input" | "completed";
+	basedOnMessageCount: number;
+}
+
 /**
  * Saved-session registry row for the current local TUI migration.
  *
@@ -86,9 +95,15 @@ export interface AgentConnectionSavedSessionInfo {
 	messageCount: number;
 	firstMessage: string;
 	allMessagesText: string;
+	agentStatus?: AgentConnectionAgentStatus;
 }
 
 export type AgentConnectionSessionListProgress = (loaded: number, total: number) => void;
+
+export interface AgentConnectionSessionListCallbacks {
+	onProgress?: AgentConnectionSessionListProgress;
+	onSession?: (session: AgentConnectionSavedSessionInfo) => void;
+}
 
 export interface AgentConnectionSessionEntryBase {
 	type: string;
@@ -169,11 +184,7 @@ export interface AgentConnectionSessionStateEntry extends AgentConnectionSession
 
 export interface AgentConnectionAgentStatusEntry extends AgentConnectionSessionEntryBase {
 	type: "agent_status";
-	status: {
-		summary: string;
-		taskState?: "needs_input" | "completed";
-		basedOnMessageCount: number;
-	};
+	status: AgentConnectionAgentStatus;
 }
 
 export interface AgentConnectionGitStateEntry extends AgentConnectionSessionEntryBase {
@@ -225,7 +236,14 @@ export interface AgentConnectionReplayInfo {
 	status: AgentConnectionReplayStatus;
 	fromSequence?: number;
 	toSequence: number;
+	fromCursor?: AgentConnectionEventCursor;
+	toCursor?: AgentConnectionEventCursor;
 	reason?: string;
+}
+
+export interface AgentConnectionEventCursor {
+	generation: string;
+	sequence: number;
 }
 
 export interface AgentConnectionParentMetadata {
@@ -238,12 +256,15 @@ export interface AgentConnectionParentMetadata {
 export interface AgentConnectionSnapshot {
 	state: AgentConnectionState;
 	messages: AgentMessage[];
+	/** In-flight assistant message, kept separate from finalized transcript messages. */
+	streamingMessage?: AgentMessage;
 	sessionContext?: AgentConnectionSessionContext;
 	sessionTree?: { tree: AgentConnectionSessionTreeNode[]; leafId: string | null };
 	parent?: AgentConnectionParentMetadata;
 	/** Live RLM child agents (including grandchildren) known to the host at snapshot time. */
 	children?: AgentConnectionRlmChildAgentSnapshot[];
 	lastEventSequence?: number;
+	lastEventCursor?: AgentConnectionEventCursor;
 	replay?: AgentConnectionReplayInfo;
 }
 
@@ -281,6 +302,7 @@ export interface AgentConnectionState {
 	pendingMessageCount: number;
 	compactionCount: number;
 	goal: GoalState;
+	heartbeat?: AgentCronJob | null;
 	scopedModels: AgentConnectionScopedModel[];
 	activeToolNames: string[];
 	contextUsage: SessionStats["contextUsage"];
@@ -367,11 +389,20 @@ export interface AgentConnectionToolDefinition {
 	promptGuidelines?: string[];
 	parameters: unknown;
 	renderShell?: "default" | "self";
+	replayBuiltInToolName?: ReplayBuiltInToolName;
 }
 
 export interface AgentConnectionPromptOptions {
 	images?: ImageContent[];
 	streamingBehavior?: "steer" | "followUp";
+}
+
+export interface AgentConnectionSideQuestionEvent {
+	id: string;
+	question: string;
+	answer: string;
+	status: "running" | "complete" | "cancelled" | "error";
+	errorMessage?: string;
 }
 
 export interface AgentConnectionExecuteBashOptions {
@@ -451,18 +482,23 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 
 export type AgentConnectionSessionEvent =
 	| AgentEvent
+	| { type: "ipython_sent_agent_message"; toolCallId: string; message: KernelSentAgentMessage }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
 			followUp: readonly string[];
 	  }
-	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow"; customInstructions?: string }
+	| {
+			type: "compaction_start";
+			reason: "manual" | "threshold" | "overflow" | "requested";
+			customInstructions?: string;
+	  }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| { type: "plan_mode_changed"; enabled: boolean }
 	| {
 			type: "compaction_end";
-			reason: "manual" | "threshold" | "overflow";
+			reason: "manual" | "threshold" | "overflow" | "requested";
 			result: CompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
@@ -473,6 +509,7 @@ export type AgentConnectionSessionEvent =
 	  }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| { type: "auth_stale"; provider: string; sourceTokens?: readonly AuthSourceToken[] }
 	| { type: "rlm_child_update"; child: AgentConnectionRlmChildAgentSnapshot }
 	| { type: "recap_update"; recap: string | undefined }
 	| { type: "goal_update"; goal: GoalState }
@@ -490,9 +527,12 @@ export type AgentConnectionSessionEvent =
 
 export type AgentConnectionEvent =
 	| { type: "session_event"; event: AgentConnectionSessionEvent }
+	| { type: "side_question_event"; event: AgentConnectionSideQuestionEvent }
 	| { type: "session_replaced"; state: AgentConnectionState; messages: AgentMessage[] }
+	| { type: "session_resynced"; snapshot: AgentConnectionSnapshot }
 	| { type: "session_status"; recap?: string }
 	| { type: "extension_ui_request"; request: AgentConnectionExtensionUiRequest }
+	| { type: "connection_status"; status: "reconnecting" | "connected"; error?: string }
 	| { type: "closed"; error?: string };
 
 export type AgentConnectionEventListener = (event: AgentConnectionEvent) => void | Promise<void>;
@@ -514,15 +554,20 @@ export interface AgentConnection {
 	getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }>;
 	listSavedSessions(
 		scope: AgentConnectionSavedSessionScope,
-		onProgress?: AgentConnectionSessionListProgress,
+		callbacks?: AgentConnectionSessionListCallbacks,
 	): Promise<AgentConnectionSavedSessionInfo[]>;
 	getQueue(): Promise<AgentConnectionQueueState>;
 	clearQueue(): Promise<AgentConnectionQueueState>;
+	abortAndClearQueue(): Promise<AgentConnectionQueueState>;
 	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;
 	addCronJob(schedule: string, prompt: string): Promise<AgentCronJob>;
 	cancelCronJob(jobId: string): Promise<AgentCronJob>;
 	getHeartbeat(): Promise<AgentCronJob | undefined>;
-	setHeartbeat(schedule: string, instruction: string): Promise<AgentCronJob>;
+	setHeartbeat(
+		schedule: string,
+		instruction: string,
+		deliveryMode?: AgentHeartbeatDeliveryMode,
+	): Promise<AgentCronJob>;
 	updateHeartbeat(action: AgentHeartbeatUpdateAction): Promise<AgentCronJob | undefined>;
 	getUserMessagesForForking(): Promise<AgentConnectionUserMessage[]>;
 	getLastAssistantText(): Promise<string | undefined>;
@@ -533,8 +578,11 @@ export interface AgentConnection {
 	respondToExtensionUiRequest(requestId: string, response: AgentConnectionExtensionUiResponse): Promise<void>;
 
 	prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void>;
+	startSideQuestion(id: string, question: string): Promise<void>;
+	abortSideQuestion(id: string): Promise<boolean>;
 	steer(message: string, images?: ImageContent[]): Promise<void>;
 	followUp(message: string, images?: ImageContent[]): Promise<void>;
+	/** Request cancellation of the active turn and return once the request is accepted. */
 	abort(): Promise<void>;
 	cancelRlmChild(childId: string): Promise<boolean>;
 	waitForIdle(): Promise<void>;
@@ -559,7 +607,7 @@ export interface AgentConnection {
 	setAutoCompactionEnabled(enabled: boolean): Promise<void>;
 
 	compact(customInstructions?: string): Promise<CompactionResult>;
-	refine(options?: { instructions?: string; rollbackId?: string }): Promise<RefinementResult>;
+	refine(options?: { instructions?: string; rollbackId?: string; global?: boolean }): Promise<RefinementResult>;
 	abortCompaction(): Promise<void>;
 	abortBranchSummary(): Promise<void>;
 	abortRetry(): Promise<void>;

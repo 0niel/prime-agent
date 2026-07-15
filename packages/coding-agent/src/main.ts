@@ -25,10 +25,19 @@ import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions
 import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
+import { installOwnedSessionRecoveryTracking } from "./cli/owned-session-worker.js";
 import { selectSession } from "./cli/session-picker.js";
 import { expandTildePath, getAgentDir, getSessionDirEnvOverride, VERSION } from "./config.js";
-import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "./core/agent-session-config.js";
-import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.js";
+import {
+	type AgentSessionRuntimeConfig,
+	mergeAgentSessionRuntimeConfig,
+	mergeAutonomousConfig,
+} from "./core/agent-session-config.js";
+import {
+	type AgentSessionRuntime,
+	type CreateAgentSessionRuntimeFactory,
+	createAgentSessionRuntime,
+} from "./core/agent-session-runtime.js";
 import {
 	type AgentSessionRuntimeDiagnostic,
 	type AgentSessionServices,
@@ -40,6 +49,7 @@ import { AuthStorage } from "./core/auth-storage.js";
 import { exportFromFile } from "./core/export-html/index.js";
 import type { ExtensionFactory } from "./core/extensions/types.js";
 import { KeybindingsManager } from "./core/keybindings.js";
+import { installFileLogSink, setLogContext } from "./core/logging.js";
 import type { ModelRegistry } from "./core/model-registry.js";
 import { findInitialModel, resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.js";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.js";
@@ -50,10 +60,18 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.js";
+import { SessionAlreadyActiveError } from "./core/session-lease.js";
 import { SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
+import { isDaemonCatalogProcess, runDaemonCatalogProcess } from "./modes/daemon/daemon-catalog-process.js";
+import { collectDaemonClientEnv } from "./modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	isDaemonWorkerProcess,
+	requireDaemonWorkerAuthenticationToken,
+} from "./modes/daemon/daemon-worker-protocol.js";
 import {
 	type AgentConnection,
 	createInteractiveModeLocalSessionHost,
@@ -66,6 +84,7 @@ import {
 	resolveAttachModelFallbackMessage,
 	runAgentsViewMode,
 	runDaemonMode,
+	runDaemonSupervisorMode,
 	runPrintMode,
 	runRpcMode,
 	type SessionSummary,
@@ -175,8 +194,7 @@ export interface AgentsViewStartupDecision {
 	useDaemonInteractive: boolean;
 	needsOnboarding: boolean;
 	explicitAgentsView?: boolean;
-	session?: string;
-	resume?: boolean;
+	resume?: true | string;
 	continue?: boolean;
 	fork?: string;
 }
@@ -191,7 +209,6 @@ export function shouldOpenAgentsViewForDaemonInteractive(options: AgentsViewStar
 		// direct session path; the agents view would otherwise require creating
 		// an agent before the onboarding splash ever renders.
 		!options.needsOnboarding &&
-		!options.session &&
 		!options.resume &&
 		!options.continue &&
 		!options.fork
@@ -199,8 +216,7 @@ export function shouldOpenAgentsViewForDaemonInteractive(options: AgentsViewStar
 }
 
 export interface DaemonInteractiveSessionManagerDecision {
-	session?: string;
-	resume?: boolean;
+	resume?: true | string;
 	continue?: boolean;
 	fork?: string;
 	hasActiveDaemonSession?: boolean;
@@ -209,16 +225,20 @@ export interface DaemonInteractiveSessionManagerDecision {
 export function shouldUseEphemeralSessionManagerForDaemonInteractive(
 	options: DaemonInteractiveSessionManagerDecision,
 ): boolean {
-	return !options.hasActiveDaemonSession && !options.session && !options.resume && !options.continue && !options.fork;
+	return !options.hasActiveDaemonSession && !options.resume && !options.continue && !options.fork;
 }
 
 export interface DaemonActiveSessionLookupDecision {
 	useDaemonInteractive: boolean;
-	session?: string;
+	resumeSelector?: string;
 }
 
 export function shouldEnsureDaemonBeforeActiveSessionLookup(options: DaemonActiveSessionLookupDecision): boolean {
-	return options.useDaemonInteractive && options.session !== undefined && !looksLikeSessionPath(options.session);
+	return (
+		options.useDaemonInteractive &&
+		options.resumeSelector !== undefined &&
+		!looksLikeSessionPath(options.resumeSelector)
+	);
 }
 
 type ActiveDaemonSessionSummaryLookup = (socketPath: string, selector: string) => Promise<SessionSummary | undefined>;
@@ -435,7 +455,6 @@ function validateForkFlags(parsed: Args): void {
 	if (!parsed.fork) return;
 
 	const conflictingFlags = [
-		parsed.session ? "--session" : undefined,
 		parsed.continue ? "--continue" : undefined,
 		parsed.resume ? "--resume" : undefined,
 		parsed.noSession ? "--no-session" : undefined,
@@ -455,6 +474,18 @@ function forkSessionOrExit(sourcePath: string, cwd: string, sessionDir?: string)
 		console.error(chalk.red(`Error: ${message}`));
 		process.exit(1);
 	}
+}
+
+function getResumeSelector(parsed: Pick<Args, "resume">): string | undefined {
+	return typeof parsed.resume === "string" ? parsed.resume : undefined;
+}
+
+export function restoreResumeSelectorFallback(parsed: Args, selector: string): boolean {
+	if (parsed.resumeSelectorFallback !== selector) return false;
+	delete parsed.resume;
+	delete parsed.resumeSelectorFallback;
+	parsed.messages.unshift(selector);
+	return true;
 }
 
 export async function createSessionManager(
@@ -479,13 +510,15 @@ export async function createSessionManager(
 				return forkSessionOrExit(resolved.path, cwd, sessionDir);
 
 			case "not_found":
+				if (restoreResumeSelectorFallback(parsed, resolved.arg)) break;
 				console.error(chalk.red(`No session found matching '${resolved.arg}'`));
 				process.exit(1);
 		}
 	}
 
-	if (parsed.session) {
-		const resolved = await resolveSessionPath(parsed.session, cwd, sessionDir);
+	const resumeSelector = getResumeSelector(parsed);
+	if (resumeSelector) {
+		const resolved = await resolveSessionPath(resumeSelector, cwd, sessionDir);
 
 		switch (resolved.type) {
 			case "path":
@@ -503,6 +536,7 @@ export async function createSessionManager(
 			}
 
 			case "not_found":
+				if (restoreResumeSelectorFallback(parsed, resolved.arg)) break;
 				console.error(chalk.red(`No session found matching '${resolved.arg}'`));
 				process.exit(1);
 		}
@@ -512,9 +546,9 @@ export async function createSessionManager(
 		initTheme(settingsManager.getTheme(), true);
 		try {
 			const selectedPath = await selectSession(
-				(onProgress) => SessionManager.list(cwd, sessionDir, onProgress),
+				(callbacks) => SessionManager.list(cwd, sessionDir, callbacks),
 				SessionManager.listAll,
-				{ cwd },
+				{ cwd, sessionDir },
 			);
 			if (!selectedPath) {
 				console.log(chalk.dim("No session selected"));
@@ -627,12 +661,48 @@ function buildSessionOptions(
 	if (config.tools) {
 		options.tools = [...config.tools];
 	}
+	if (config.autonomous) {
+		options.autonomous = mergeAutonomousConfig(undefined, config.autonomous);
+	}
 
 	return { options, cliThinkingFromModel, diagnostics };
 }
 
 function resolveCliPaths(cwd: string, paths: string[] | undefined): string[] | undefined {
 	return paths?.map((value) => (isLocalPath(value) ? resolve(cwd, value) : value));
+}
+
+function runtimeAutonomousConfigFromArgs(parsed: Args): AgentSessionRuntimeConfig["autonomous"] {
+	const hasAutonomousOptions =
+		parsed.autonomous === true ||
+		parsed.autonomousGates !== undefined ||
+		parsed.autonomousGateRetries !== undefined ||
+		parsed.autonomousGateTimeoutMs !== undefined ||
+		parsed.autonomousMaxContinuations !== undefined ||
+		parsed.autonomousMaxTurns !== undefined ||
+		parsed.autonomousMaxTokens !== undefined ||
+		parsed.autonomousTimeoutMs !== undefined;
+	if (!hasAutonomousOptions) {
+		return undefined;
+	}
+	const hasGateOptions =
+		parsed.autonomousGates !== undefined ||
+		parsed.autonomousGateRetries !== undefined ||
+		parsed.autonomousGateTimeoutMs !== undefined;
+	return {
+		enabled: true,
+		maxContinuations: parsed.autonomousMaxContinuations,
+		maxTurns: parsed.autonomousMaxTurns,
+		maxTokens: parsed.autonomousMaxTokens,
+		timeoutMs: parsed.autonomousTimeoutMs,
+		gates: hasGateOptions
+			? {
+					commands: parsed.autonomousGates,
+					maxRetries: parsed.autonomousGateRetries,
+					timeoutMs: parsed.autonomousGateTimeoutMs,
+				}
+			: undefined,
+	};
 }
 
 function runtimeConfigFromArgs(
@@ -665,6 +735,7 @@ function runtimeConfigFromArgs(
 		themes: resolveCliPaths(cwd, parsed.themes),
 		noThemes: parsed.noThemes,
 		noContextFiles: parsed.noContextFiles,
+		autonomous: runtimeAutonomousConfigFromArgs(parsed),
 		extensionFlagValues: parsed.unknownFlags.size > 0 ? Object.fromEntries(parsed.unknownFlags.entries()) : undefined,
 	};
 }
@@ -692,7 +763,14 @@ export function resolveRuntimeSessionOptions(
 		initialActiveToolNames: runtimeSessionOptions?.initialActiveToolNames,
 		allowedToolNames: runtimeSessionOptions?.allowedToolNames,
 		includeGoals: runtimeSessionOptions?.includeGoals,
+		includeCompactSkill: runtimeSessionOptions?.includeCompactSkill,
 		rlmHeartbeatController: runtimeSessionOptions?.rlmHeartbeatController,
+		agentMessageController: runtimeSessionOptions?.agentMessageController,
+		agentObserveController: runtimeSessionOptions?.agentObserveController,
+		autonomous:
+			(runtimeSessionOptions?.rlmDepth ?? 0) > 0
+				? mergeAutonomousConfig(sessionOptions.autonomous, { ...runtimeSessionOptions?.autonomous, enabled: false })
+				: mergeAutonomousConfig(sessionOptions.autonomous, runtimeSessionOptions?.autonomous),
 		rlmDepth: runtimeSessionOptions?.rlmDepth,
 		rlmMaxDepth: runtimeSessionOptions?.rlmMaxDepth,
 		rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,
@@ -719,6 +797,9 @@ async function prepareRuntimeServices(options: {
 		agentDir: effectiveAgentDir,
 		authStorage,
 		extensionFlagValues: new Map(Object.entries(config.extensionFlagValues ?? {})),
+		// Subagents share the parent's Herdr pane; their own reporter would race
+		// the parent's and a subagent quit would release the still-active pane.
+		noBuiltinHerdrReporter: (options.sessionOptionsOverride?.rlmDepth ?? 0) > 0,
 		resourceLoaderOptions: {
 			additionalExtensionPaths: config.extensions,
 			additionalSkillPaths: config.skills,
@@ -904,7 +985,7 @@ async function normalizeDaemonRichTuiAttachArgs(args: string[]): Promise<string[
 		return undefined;
 	}
 
-	return ["--daemon-socket", shortcut.socketPath, "--session", getDaemonSummaryActiveSessionId(summary)];
+	return ["--daemon-socket", shortcut.socketPath, "--resume", getDaemonSummaryActiveSessionId(summary)];
 }
 
 function createSessionManagerForActiveDaemonSummary(summary: SessionSummary, fallbackCwd: string): SessionManager {
@@ -920,7 +1001,7 @@ function createSessionManagerForActiveDaemonSummary(summary: SessionSummary, fal
 }
 
 function getInteractiveDaemonSessionPath(parsed: Args, sessionManager: SessionManager): string | undefined {
-	if (!parsed.session && !parsed.resume && !parsed.continue && !parsed.fork) {
+	if (!parsed.resume && !parsed.continue && !parsed.fork) {
 		return undefined;
 	}
 	return sessionManager.getSessionFile();
@@ -954,6 +1035,8 @@ async function createDaemonInteractiveConnection(options: {
 		const attach = async (summary: SessionSummary) => {
 			const connection = await DaemonAgentConnection.attach(client, getDaemonSummaryActiveSessionId(summary), {
 				closeClientOnDispose: true,
+				sendClientEnv: true,
+				recoverDaemon: () => ensureInteractiveDaemonRunning(options.socketPath),
 			});
 			return { connection, summary };
 		};
@@ -978,6 +1061,7 @@ async function createDaemonInteractiveConnection(options: {
 			config: options.config,
 			sessionPath: options.sessionPath,
 			continueRecent: options.continueRecent,
+			env: collectDaemonClientEnv(),
 		});
 		if (!response.success) {
 			throw new Error(response.error);
@@ -1013,6 +1097,11 @@ export interface MainOptions {
 
 export async function main(args: string[], options?: MainOptions) {
 	resetTimings();
+	installFileLogSink();
+	if (isDaemonCatalogProcess()) {
+		await runDaemonCatalogProcess();
+		return;
+	}
 	// Client and daemon are separate processes; both need these in their registry.
 	registerBuiltinMcpOAuthProviders();
 	args = normalizeDaemonStartArgs(args) ?? args;
@@ -1059,6 +1148,7 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("parseArgs");
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY);
+	setLogContext({ mode: appMode });
 	const shouldTakeOverStdout = appMode !== "interactive";
 	if (shouldTakeOverStdout) {
 		takeOverStdout();
@@ -1122,7 +1212,7 @@ export async function main(args: string[], options?: MainOptions) {
 	});
 
 	// Decide the final runtime cwd before creating cwd-bound runtime services.
-	// --session and --resume may select a session from another project, so project-local
+	// --resume may select a session from another project, so project-local
 	// settings, resources, provider registrations, and models must be resolved only after
 	// the target session cwd is known. The startup-cwd settings manager is used only for
 	// sessionDir lookup during session selection.
@@ -1137,16 +1227,17 @@ export async function main(args: string[], options?: MainOptions) {
 	// Errors are rethrown at the await sites below; this only avoids an unhandled
 	// rejection if startup exits before reaching them.
 	daemonReady?.catch(() => {});
+	const resumeSelector = getResumeSelector(parsed);
 	const shouldLookupDaemonActiveSession = shouldEnsureDaemonBeforeActiveSessionLookup({
 		useDaemonInteractive,
-		session: parsed.session,
+		resumeSelector,
 	});
 	if (shouldLookupDaemonActiveSession && daemonReady) {
 		daemonReady = (await awaitDaemonReady(daemonReady)).ready;
 	}
 	const activeDaemonSessionSummary =
-		shouldLookupDaemonActiveSession && parsed.session
-			? await findActiveDaemonSessionSummaryForInteractiveStartup(daemonSocketPath, parsed.session)
+		shouldLookupDaemonActiveSession && resumeSelector
+			? await findActiveDaemonSessionSummaryForInteractiveStartup(daemonSocketPath, resumeSelector)
 			: undefined;
 	let sessionManager: SessionManager;
 	if (activeDaemonSessionSummary) {
@@ -1154,7 +1245,6 @@ export async function main(args: string[], options?: MainOptions) {
 	} else if (
 		useDaemonInteractive &&
 		shouldUseEphemeralSessionManagerForDaemonInteractive({
-			session: parsed.session,
 			resume: parsed.resume,
 			continue: parsed.continue,
 			fork: parsed.fork,
@@ -1227,11 +1317,22 @@ export async function main(args: string[], options?: MainOptions) {
 	// --help/--list-models still take the full path to print and exit.
 	if (appMode === "daemon" && !parsed.help && parsed.listModels === undefined) {
 		printTimings();
-		await runDaemonMode({
-			socketPath: parsed.daemonSocket,
-			defaultSessionConfig,
-			createRuntime,
-		});
+		if (isDaemonWorkerProcess()) {
+			await runDaemonMode({
+				socketPath: parsed.daemonSocket,
+				defaultSessionConfig,
+				createRuntime,
+				worker: {
+					authenticationToken: requireDaemonWorkerAuthenticationToken(),
+					restoreActiveSessionId: process.env[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV],
+				},
+			});
+		} else {
+			await runDaemonSupervisorMode({
+				socketPath: parsed.daemonSocket,
+				defaultSessionConfig,
+			});
+		}
 		return;
 	}
 	if (useDaemonInteractive) {
@@ -1289,6 +1390,7 @@ export async function main(args: string[], options?: MainOptions) {
 				socketPath: daemonSocketPath,
 				config: defaultSessionConfig,
 				uiServices: daemonUiServices,
+				recoverDaemon: () => ensureInteractiveDaemonRunning(daemonSocketPath),
 				createUiServicesForSession: async (summary) => {
 					const attachedSessionManager = createSessionManagerForActiveDaemonSummary(
 						summary,
@@ -1324,7 +1426,6 @@ export async function main(args: string[], options?: MainOptions) {
 					modelRegistry: services.modelRegistry,
 					model: startupModel.model,
 				}),
-				session: parsed.session,
 				resume: parsed.resume,
 				continue: parsed.continue,
 				fork: parsed.fork,
@@ -1380,13 +1481,23 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 
-	const runtime = await createAgentSessionRuntime(createRuntime, {
-		cwd: sessionManager.getCwd(),
-		agentDir,
-		sessionManager,
-		sessionConfig: defaultSessionConfig,
-	});
+	let runtime: AgentSessionRuntime;
+	try {
+		runtime = await createAgentSessionRuntime(createRuntime, {
+			cwd: sessionManager.getCwd(),
+			agentDir,
+			sessionManager,
+			sessionConfig: defaultSessionConfig,
+		});
+	} catch (error) {
+		if (error instanceof SessionAlreadyActiveError) {
+			console.error(chalk.red(`Error: ${error.message}`));
+			process.exit(1);
+		}
+		throw error;
+	}
 	const { services, session, modelFallbackMessage } = runtime;
+	installOwnedSessionRecoveryTracking(runtime);
 	const { settingsManager, modelRegistry, resourceLoader } = services;
 
 	if (parsed.help) {

@@ -8,9 +8,8 @@ Sessions auto-save to `~/.pi/agent/sessions/`, organized by working directory. E
 
 ```bash
 pi -c                  # Continue most recent session
-pi -r                  # Browse and select from past sessions
+pi -r [path|id]        # Browse past sessions or resume one directly
 pi --no-session        # Ephemeral mode; do not save
-pi --session <path|id> # Use a specific session file or partial session ID
 pi --fork <path|id>    # Fork a session file or partial session ID into a new session
 ```
 
@@ -36,7 +35,7 @@ For the JSONL file format and SessionManager API, see [Session Format](session-f
 
 ## Resuming and Deleting Sessions
 
-`/resume` opens an interactive session picker for the current project. `pi -r` opens the same picker at startup.
+`/resume` opens an interactive session picker for the current project. `pi -r` opens the same picker at startup, and `pi -r <path|id>` resumes a specific session.
 
 In the picker you can:
 

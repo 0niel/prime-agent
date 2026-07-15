@@ -17,6 +17,63 @@ const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
 
+// A preserved alternate screen is adopted by the next ProcessTerminal during in-process handoff.
+let pendingAltScreenHandoff: symbol | undefined;
+
+interface PendingInputHandoff {
+	token: symbol;
+	wasRaw: boolean;
+	discardHandler: (data: string) => void;
+}
+
+// Keep stdin raw and drain input while a preserved fullscreen frame waits for
+// the next in-process TUI. Worker-backed session attach can make this handoff
+// noticeably longer; restoring cooked mode during the gap makes arrow escape
+// sequences echo into the preserved frame.
+let pendingInputHandoff: PendingInputHandoff | undefined;
+
+function consumeAltScreenHandoff(): boolean {
+	if (!pendingAltScreenHandoff) {
+		return false;
+	}
+	pendingAltScreenHandoff = undefined;
+	return true;
+}
+
+function beginInputHandoff(token: symbol, wasRaw: boolean): void {
+	const inheritedWasRaw = pendingInputHandoff?.wasRaw ?? wasRaw;
+	if (pendingInputHandoff) {
+		process.stdin.removeListener("data", pendingInputHandoff.discardHandler);
+	}
+	const discardHandler = (_data: string) => {};
+	pendingInputHandoff = { token, wasRaw: inheritedWasRaw, discardHandler };
+	process.stdin.on("data", discardHandler);
+	process.stdin.resume();
+}
+
+function consumeInputHandoff(): boolean | undefined {
+	const handoff = pendingInputHandoff;
+	if (!handoff) {
+		return undefined;
+	}
+	process.stdin.removeListener("data", handoff.discardHandler);
+	pendingInputHandoff = undefined;
+	return handoff.wasRaw;
+}
+
+function cancelInputHandoff(token: symbol): void {
+	const handoff = pendingInputHandoff;
+	if (!handoff || handoff.token !== token) {
+		return;
+	}
+	process.stdin.removeListener("data", handoff.discardHandler);
+	pendingInputHandoff = undefined;
+	process.stdin.pause();
+	if (process.stdin.setRawMode) {
+		process.stdin.setRawMode(handoff.wasRaw);
+	}
+}
+
 /**
  * Minimal terminal interface for TUI
  */
@@ -25,7 +82,7 @@ export interface Terminal {
 	start(onInput: (data: string) => void, onResize: () => void): void;
 
 	// Stop the terminal and restore state
-	stop(): void;
+	stop(options?: TerminalStopOptions): void;
 
 	/**
 	 * Drain stdin before exiting to prevent Kitty key release events from
@@ -57,6 +114,18 @@ export interface Terminal {
 	clearFromCursor(): void; // Clear from cursor to end of screen
 	clearScreen(): void; // Clear entire screen and move cursor to (0,0)
 
+	// Alternate screen buffer. The primary screen (and its scrollback) is left
+	// untouched while the alt screen is active, so a full-screen view can be
+	// shown and dismissed without disturbing the transcript history.
+	enterAltScreen(): void;
+	leaveAltScreen(): void;
+	get altScreenActive(): boolean;
+
+	// SGR mouse tracking (?1000 + ?1006); motion tracking is deliberately never
+	// enabled so native drag-selection keeps working.
+	setMouseTracking(enabled: boolean): void;
+	get mouseTrackingActive(): boolean;
+
 	// Title operations
 	setTitle(title: string): void; // Set terminal window title
 
@@ -64,17 +133,26 @@ export interface Terminal {
 	setProgress(active: boolean): void;
 }
 
+export interface TerminalStopOptions {
+	preserveAltScreen?: boolean;
+}
+
 /**
  * Real terminal using process.stdin/stdout
  */
 export class ProcessTerminal implements Terminal {
 	private wasRaw = false;
+	private started = false;
 	private inputHandler?: (data: string) => void;
 	private resizeHandler?: () => void;
 	private _kittyProtocolActive = false;
 	private _modifyOtherKeysActive = false;
+	private readonly altScreenHandoffToken = Symbol("altScreenHandoff");
+	private _altScreenActive = consumeAltScreenHandoff();
+	private _mouseTrackingActive = false;
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
+	private keyboardProtocolFallbackTimer?: ReturnType<typeof setTimeout>;
 	private progressInterval?: ReturnType<typeof setInterval>;
 	private defaultColorProbe?: {
 		foreground?: Rgb;
@@ -101,11 +179,12 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	start(onInput: (data: string) => void, onResize: () => void): void {
+		this.started = true;
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
 
 		// Save previous state and enable raw mode
-		this.wasRaw = process.stdin.isRaw || false;
+		this.wasRaw = consumeInputHandoff() ?? process.stdin.isRaw ?? false;
 		if (process.stdin.setRawMode) {
 			process.stdin.setRawMode(true);
 		}
@@ -160,6 +239,7 @@ export class ProcessTerminal implements Terminal {
 			if (!this._kittyProtocolActive) {
 				const match = sequence.match(kittyResponsePattern);
 				if (match) {
+					this.clearKeyboardProtocolFallbackTimer();
 					this._kittyProtocolActive = true;
 					setKittyProtocolActive(true);
 
@@ -210,12 +290,22 @@ export class ProcessTerminal implements Terminal {
 		process.stdin.on("data", this.stdinDataHandler!);
 		this.queryDefaultTerminalColors();
 		process.stdout.write("\x1b[?u");
-		setTimeout(() => {
+		this.clearKeyboardProtocolFallbackTimer();
+		this.keyboardProtocolFallbackTimer = setTimeout(() => {
+			this.keyboardProtocolFallbackTimer = undefined;
 			if (!this._kittyProtocolActive && !this._modifyOtherKeysActive) {
 				process.stdout.write("\x1b[>4;2m");
 				this._modifyOtherKeysActive = true;
 			}
 		}, 150);
+	}
+
+	private clearKeyboardProtocolFallbackTimer(): void {
+		if (!this.keyboardProtocolFallbackTimer) {
+			return;
+		}
+		clearTimeout(this.keyboardProtocolFallbackTimer);
+		this.keyboardProtocolFallbackTimer = undefined;
 	}
 
 	private queryDefaultTerminalColors(): void {
@@ -327,11 +417,29 @@ export class ProcessTerminal implements Terminal {
 		}
 	}
 
-	stop(): void {
+	stop(options: TerminalStopOptions = {}): void {
+		const wasStarted = this.started;
+		this.started = false;
 		this.finishDefaultColorProbe();
+		this.clearKeyboardProtocolFallbackTimer();
 
 		if (this.clearProgressInterval()) {
 			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+		}
+
+		if (this._mouseTrackingActive) {
+			process.stdout.write("\x1b[?1006l\x1b[?1002l");
+			this._mouseTrackingActive = false;
+		}
+		if (this._altScreenActive) {
+			if (options.preserveAltScreen) {
+				pendingAltScreenHandoff = this.altScreenHandoffToken;
+				this._altScreenActive = false;
+			} else {
+				this.releaseAltScreen();
+			}
+		} else if (!options.preserveAltScreen) {
+			this.releaseAltScreen();
 		}
 
 		// Disable bracketed paste mode
@@ -365,14 +473,18 @@ export class ProcessTerminal implements Terminal {
 			this.resizeHandler = undefined;
 		}
 
-		// Pause stdin to prevent any buffered input (e.g., Ctrl+D) from being
-		// re-interpreted after raw mode is disabled. This fixes a race condition
-		// where Ctrl+D could close the parent shell over SSH.
-		process.stdin.pause();
+		if (options.preserveAltScreen && wasStarted) {
+			beginInputHandoff(this.altScreenHandoffToken, this.wasRaw);
+		} else {
+			// Pause stdin to prevent any buffered input (e.g., Ctrl+D) from being
+			// re-interpreted after raw mode is disabled. This fixes a race condition
+			// where Ctrl+D could close the parent shell over SSH.
+			process.stdin.pause();
 
-		// Restore raw mode state
-		if (process.stdin.setRawMode) {
-			process.stdin.setRawMode(this.wasRaw);
+			// Restore raw mode state
+			if (process.stdin.setRawMode) {
+				process.stdin.setRawMode(this.wasRaw);
+			}
 		}
 	}
 
@@ -424,6 +536,52 @@ export class ProcessTerminal implements Terminal {
 
 	clearScreen(): void {
 		process.stdout.write("\x1b[2J\x1b[H"); // Clear screen and move to home (1,1)
+	}
+
+	enterAltScreen(): void {
+		if (this._altScreenActive) return;
+		if (this.ownsPendingAltScreenHandoff()) {
+			pendingAltScreenHandoff = undefined;
+			this._altScreenActive = true;
+			return;
+		}
+		this._altScreenActive = true;
+		this.write("\x1b[?1049h");
+	}
+
+	leaveAltScreen(): void {
+		this.releaseAltScreen();
+	}
+
+	private releaseAltScreen(): void {
+		const ownsPendingHandoff = this.ownsPendingAltScreenHandoff();
+		if (!this._altScreenActive && !ownsPendingHandoff) return;
+		this._altScreenActive = false;
+		if (ownsPendingHandoff) {
+			pendingAltScreenHandoff = undefined;
+			cancelInputHandoff(this.altScreenHandoffToken);
+		}
+		this.write("\x1b[?1049l");
+	}
+
+	get altScreenActive(): boolean {
+		return this._altScreenActive;
+	}
+
+	private ownsPendingAltScreenHandoff(): boolean {
+		return pendingAltScreenHandoff === this.altScreenHandoffToken;
+	}
+
+	setMouseTracking(enabled: boolean): void {
+		if (enabled === this._mouseTrackingActive) return;
+		this._mouseTrackingActive = enabled;
+		// ?1002 (button-event tracking) reports drag motion for in-app selection
+		// but not hover, keeping passive mouse movement unreported.
+		this.write(enabled ? "\x1b[?1002h\x1b[?1006h" : "\x1b[?1006l\x1b[?1002l");
+	}
+
+	get mouseTrackingActive(): boolean {
+		return this._mouseTrackingActive;
 	}
 
 	setTitle(title: string): void {

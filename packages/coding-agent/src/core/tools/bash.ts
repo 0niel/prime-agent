@@ -204,6 +204,7 @@ function rebuildBashResultRenderComponent(
 	options: ToolRenderResultOptions,
 	showImages: boolean,
 	includeImageDimensions: boolean,
+	showExpandHint: boolean,
 	startedAt: number | undefined,
 	endedAt: number | undefined,
 ): void {
@@ -230,9 +231,10 @@ function rebuildBashResultRenderComponent(
 						state.cachedWidth = width;
 					}
 					if (state.cachedSkipped && state.cachedSkipped > 0) {
-						const hint =
-							theme.fg("muted", `... (${state.cachedSkipped} earlier lines,`) +
-							` ${keyHint("app.tools.expand", "to expand")})`;
+						const hint = showExpandHint
+							? theme.fg("muted", `... (${state.cachedSkipped} earlier lines,`) +
+								` ${keyHint("app.tools.expand", "to expand")})`
+							: theme.fg("muted", `... (${state.cachedSkipped} earlier lines)`);
 						return ["", truncateToWidth(hint, width, "..."), ...(state.cachedLines ?? [])];
 					}
 					return ["", ...(state.cachedLines ?? [])];
@@ -279,7 +281,7 @@ export function createBashToolDefinition(
 	const ops = options?.operations ?? createLocalBashOperations({ shellPath: options?.shellPath });
 	const commandPrefix = options?.commandPrefix;
 	const spawnHook = options?.spawnHook;
-	return {
+	const definition: ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> = {
 		name: "bash",
 		label: "bash",
 		description: `Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
@@ -438,6 +440,7 @@ export function createBashToolDefinition(
 				options,
 				context.showImages,
 				context.includeImageDimensions,
+				context.showExpandHint !== false,
 				state.startedAt,
 				state.endedAt,
 			);
@@ -445,6 +448,7 @@ export function createBashToolDefinition(
 			return component;
 		},
 	};
+	return Object.assign(definition, { replayBuiltInToolName: "bash" as const });
 }
 
 export function createBashTool(cwd: string, options?: BashToolOptions): AgentTool<typeof bashSchema> {

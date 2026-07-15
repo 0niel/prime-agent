@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	AgentSessionRuntime,
 	type CreateAgentSessionRuntimeFactory,
@@ -13,6 +13,12 @@ import {
 } from "../../../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../../../src/core/auth-storage.js";
 import { ModelRegistry } from "../../../src/core/model-registry.js";
+import {
+	acquireSessionLease,
+	SESSION_LEASE_OWNER_ID_ENV,
+	SESSION_LEASES_ENABLED_ENV,
+	SessionAlreadyActiveError,
+} from "../../../src/core/session-lease.js";
 import { SessionManager } from "../../../src/core/session-manager.js";
 
 async function waitFor(condition: () => boolean): Promise<void> {
@@ -32,11 +38,14 @@ describe("ENG-3885 subagent runtime host", () => {
 		while (cleanups.length > 0) {
 			await cleanups.pop()?.();
 		}
+		vi.unstubAllEnvs();
 	});
 
 	it("creates running RLM children as tracked AgentSessionRuntime instances", async () => {
 		const tempDir = join(tmpdir(), `pi-3885-subagent-runtime-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
+		vi.stubEnv(SESSION_LEASES_ENABLED_ENV, "1");
+		vi.stubEnv(SESSION_LEASE_OWNER_ID_ENV, "test-parent");
 
 		const faux = registerFauxProvider({
 			models: [
@@ -160,6 +169,10 @@ describe("ENG-3885 subagent runtime host", () => {
 		expect(result.session_dir).not.toBeNull();
 		const childSessions = await SessionManager.list(tempDir, result.session_dir!);
 		expect(childSessions.some((session) => session.parentSessionPath === runtime.session.sessionFile)).toBe(true);
+		expect(() => acquireSessionLease(childSessions[0]!.path, tempDir)).toThrow(SessionAlreadyActiveError);
+		await runtime.dispose();
+		const retainedChildLease = acquireSessionLease(childSessions[0]!.path, tempDir);
+		retainedChildLease?.release();
 		expect(runtime.listSubagentRuntimes()).toEqual([]);
 	});
 

@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { getDocsPath } from "../config.js";
 
 const UNKNOWN_PROVIDER = "unknown";
+export const LOGIN_RECOVERY_MESSAGE = "Run /login to update credentials.";
 
 export function getProviderLoginHelp(): string {
 	return [
@@ -34,4 +35,27 @@ export function formatNoModelSelectedMessage(): string {
 export function formatNoApiKeyFoundMessage(provider: string): string {
 	const providerDisplay = provider === UNKNOWN_PROVIDER ? "the selected model" : provider;
 	return `No API key found for ${providerDisplay}.\n\n${getProviderLoginHelp()}`;
+}
+
+export function formatAuthenticationFailedMessage(provider: string): string {
+	return (
+		`Authentication failed for "${provider}". Credentials may have expired or network is unavailable.\n\n` +
+		LOGIN_RECOVERY_MESSAGE
+	);
+}
+
+export function isLikelyAuthenticationError(message: string): boolean {
+	return (
+		/\b(401|403)\b/i.test(message) ||
+		/unauthorized|forbidden|invalid[_ -]?api[_ -]?key|api key.*invalid/i.test(message) ||
+		/authentication failed|invalid authentication|missing authentication/i.test(message) ||
+		/(expired|invalid) token|token expired|access denied|permission denied/i.test(message)
+	);
+}
+
+export function addLoginGuidanceToAuthError(message: string): string {
+	if (/\/login\b/.test(message)) {
+		return message;
+	}
+	return `${message}\n\n${LOGIN_RECOVERY_MESSAGE}`;
 }

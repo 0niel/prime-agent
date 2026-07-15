@@ -9,9 +9,20 @@ export interface DaemonSocketClient {
 	id: string;
 	socket: Socket;
 	attachedActiveSessionIds: Set<string>;
+	/** Session events are dropped while the socket is blocked and replaced with one catch-up snapshot on drain. */
+	catchupActiveSessionIds?: Set<string>;
+	/** A real runtime replacement takes precedence over an ordinary resync for the same queued catch-up. */
+	catchupPurposes?: Map<string, "replacement" | "resync">;
+	backpressured?: boolean;
+	authenticated?: boolean;
+	transport?: "jsonl" | "private-framed";
+	snapshotStreaming?: boolean;
+	snapshotActiveSessionIds?: Set<string>;
+	snapshotActiveSessionCounts?: Map<string, number>;
 	detachInput: () => void;
 	supportsExtensionUi: boolean;
 	capabilities: Set<DaemonClientCapability>;
+	capabilitiesByActiveSessionId?: Map<string, Set<DaemonClientCapability>>;
 }
 
 export interface ActiveSessionState {
@@ -19,10 +30,19 @@ export interface ActiveSessionState {
 	runtime: AgentSessionRuntime;
 	clients: Set<DaemonSocketClient>;
 	extensionUiRequests: Map<string, ActiveSessionExtensionUiRequest>;
+	eventGeneration: string;
 	lastEventSequence: DaemonEventSequence;
 	unsubscribe?: () => void;
 	/** Latest background status summary, surfaced in the agents view. */
 	summaryState?: AgentStatus;
+	/**
+	 * Client env (e.g. herdr pane identity), merged over process.env for this
+	 * session's pi.exec() subprocesses. Bound when the runtime is created (or
+	 * adopted from the first env-carrying create that reuses an env-less
+	 * session); never overwritten after that — watchers also attach, and
+	 * extensions capture identity at load. Subagents inherit the parent's.
+	 */
+	clientEnv?: Record<string, string>;
 }
 
 export interface ActiveSessionExtensionUiRequest {

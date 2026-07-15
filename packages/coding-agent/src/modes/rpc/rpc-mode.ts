@@ -521,7 +521,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			}
 
 			case "refine": {
-				const result = await session.refine({ instructions: command.instructions, rollbackId: command.rollbackId });
+				const result = await session.refine({
+					instructions: command.instructions,
+					rollbackId: command.rollbackId,
+					global: command.global,
+				});
 				return success(id, "refine", result);
 			}
 

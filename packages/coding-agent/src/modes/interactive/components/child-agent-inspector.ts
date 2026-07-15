@@ -8,7 +8,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import { AGENT_ACTIVITY_LABELS } from "../agent-activity.js";
+import { AGENT_ACTIVITY_LABELS, formatTokenCount } from "../agent-activity.js";
 import { theme } from "../theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
 import { keyText } from "./keybinding-hints.js";
@@ -43,7 +43,6 @@ export interface ChildAgentDetailOptions {
 
 interface FlatChildAgentNode {
 	node: ChildAgentInspectorNode;
-	depth: number;
 }
 
 interface DetailSections {
@@ -66,14 +65,14 @@ function childAgentSortRank(status: ChildAgentStatus): number {
 
 function flattenChildAgentNodes(nodes: readonly ChildAgentInspectorNode[]): FlatChildAgentNode[] {
 	const result: FlatChildAgentNode[] = [];
-	const walk = (items: readonly ChildAgentInspectorNode[], depth: number): void => {
+	const walk = (items: readonly ChildAgentInspectorNode[]): void => {
 		const ordered = [...items].sort((a, b) => childAgentSortRank(a.status) - childAgentSortRank(b.status));
 		for (const node of ordered) {
-			result.push({ node, depth });
-			walk(node.children ?? [], depth + 1);
+			result.push({ node });
+			walk(node.children ?? []);
 		}
 	};
-	walk(nodes, 0);
+	walk(nodes);
 	return result;
 }
 
@@ -180,21 +179,35 @@ function formatChildAgentDuration(durationMs: number | undefined): string {
 	return `${Math.floor(minutes / 60)}h`;
 }
 
-function padTableCell(value: string, width: number): string {
-	const truncated = truncateToWidth(value, width, "");
+function childAgentRecap(node: ChildAgentInspectorNode): string {
+	const recap = node.recap?.replace(/\s+/g, " ").trim();
+	return recap || nodeActivityLabel(node);
+}
+
+function padTableCell(value: string, width: number, ellipsis = ""): string {
+	// truncateToWidth emits full ANSI resets around its marker even for plain text.
+	// Strip those generated resets before applying foreground/background styling.
+	const truncated = truncateToWidth(value, width, ellipsis).replaceAll("\x1b[0m", "");
 	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
 }
 
 // Rows shown at once in the inline list below the prompt; extras scroll.
 const SUMMARY_VISIBLE_ROWS = 5;
-const SUMMARY_LIST_INDENT = 1;
+const SUMMARY_LIST_INDENT = 0;
 const SHARED_PREFIX_MIN = 12;
-// Gap between the "Subagent N" column and the prompt.
-const SUMMARY_LABEL_GAP = 4;
+const SUMMARY_COLUMN_GAP = 2;
+const SUMMARY_PROMPT_MAX_WIDTH = 24;
+const SUMMARY_RECAP_MIN_WIDTH = 12;
+const SUMMARY_TOOLS_WIDTH = 7;
+const SUMMARY_TOKENS_WIDTH = 8;
+const SUMMARY_DURATION_WIDTH = 4;
+const SUMMARY_TOKEN_TIME_GAP = 2;
+const SUMMARY_METRICS_WIDTH =
+	SUMMARY_TOOLS_WIDTH + 1 + SUMMARY_TOKENS_WIDTH + SUMMARY_TOKEN_TIME_GAP + SUMMARY_DURATION_WIDTH;
 // Opening chars of the prompt kept for context before eliding a shared prefix.
-const PROMPT_LEADING_CONTEXT = 14;
+const PROMPT_LEADING_CONTEXT = 6;
 // Words of context kept on each side of the divergence.
-const PROMPT_DIFF_CONTEXT_WORDS = 2;
+const PROMPT_DIFF_CONTEXT_WORDS = 1;
 
 export class ChildAgentSummaryComponent implements Component, Focusable {
 	focused = false;
@@ -223,8 +236,10 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 			this.selectedId = undefined;
 			return;
 		}
-		if (!this.selectedId || !flat.some((entry) => entry.node.id === this.selectedId)) {
-			this.selectedId = flat.find((entry) => entry.node.status === "running")?.node.id ?? flat[0]?.node.id;
+		if (!this.focused || !this.selectedId || !flat.some((entry) => entry.node.id === this.selectedId)) {
+			this.selectedId =
+				flat.find((entry) => entry.node.status === "running" || entry.node.status === "queued")?.node.id ??
+				flat[0]?.node.id;
 		}
 	}
 
@@ -334,14 +349,19 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 			0,
 			flat.findIndex((entry) => entry.node.id === this.selectedId),
 		);
-		const start = Math.max(
-			0,
-			Math.min(selectedIndex - (SUMMARY_VISIBLE_ROWS - 1), flat.length - SUMMARY_VISIBLE_ROWS),
-		);
+		const start = this.focused
+			? Math.max(0, Math.min(selectedIndex - (SUMMARY_VISIBLE_ROWS - 1), flat.length - SUMMARY_VISIBLE_ROWS))
+			: 0;
 		const clampedStart = Math.max(0, start);
 		const window = flat.slice(clampedStart, clampedStart + SUMMARY_VISIBLE_ROWS);
 
-		const labelWidth = `Subagent ${flat.length}`.length;
+		const agentWidth = `S${flat.length}`.length;
+		const fixedWidth = SUMMARY_LIST_INDENT + 2 + agentWidth + SUMMARY_COLUMN_GAP * 3 + SUMMARY_METRICS_WIDTH;
+		const flexibleWidth = Math.max(0, contentWidth - fixedWidth);
+		const recapMinimum = Math.min(SUMMARY_RECAP_MIN_WIDTH, Math.floor(flexibleWidth / 2));
+		const promptTarget = Math.min(SUMMARY_PROMPT_MAX_WIDTH, Math.max(10, Math.floor(flexibleWidth * 0.34)));
+		const promptWidth = Math.max(0, Math.min(promptTarget, flexibleWidth - recapMinimum));
+		const recapWidth = Math.max(0, flexibleWidth - promptWidth);
 		const promptPrefix = this.sharedPromptPrefix(window);
 		const promptSuffix = this.sharedPromptSuffix(window, promptPrefix);
 
@@ -351,7 +371,7 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 			const number = flat.indexOf(entry) + 1;
 			lines.push(
 				this.panelLine(
-					this.renderListEntry(entry, number, labelWidth, promptPrefix, promptSuffix, contentWidth),
+					this.renderListEntry(entry, number, agentWidth, promptPrefix, promptSuffix, promptWidth, recapWidth),
 					width,
 					selected,
 				),
@@ -412,52 +432,47 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 	private renderListEntry(
 		entry: FlatChildAgentNode,
 		number: number,
-		labelWidth: number,
+		agentWidth: number,
 		sharedPrefix: string,
 		sharedSuffix: string,
-		width: number,
+		promptWidth: number,
+		recapWidth: number,
 	): string {
-		const indent = " ".repeat(SUMMARY_LIST_INDENT + Math.min(6, entry.depth * 2));
+		const indent = " ".repeat(SUMMARY_LIST_INDENT);
 		// Running rows pulse the shared working glyph; other states stay static.
 		const rawIcon =
 			entry.node.status === "running"
 				? workingIconFrame(getWorkingPulseFrame())
 				: childAgentStatusIcon(entry.node.status);
 		const icon = formatChildAgentStatusIcon(entry.node.status, rawIcon);
-		const numberCell = theme.fg("muted", padTableCell(`Subagent ${number}`, labelWidth));
-		const time = formatChildAgentDuration(entry.node.durationMs);
-		const timeWidth = 6;
-		// Fixed columns consume: icon + space, the label gap, and a space before time.
-		const fixed = visibleWidth(indent) + visibleWidth(rawIcon) + 1 + labelWidth + SUMMARY_LABEL_GAP + 1 + timeWidth;
-		// The prompt may use all remaining space; the elision keeps it short and the
-		// gap fill still right-aligns the time.
-		const promptWidth = Math.max(0, width - fixed);
-		const prompt = this.elidePrompt(entry.node.label, sharedPrefix, sharedSuffix, promptWidth);
-		const promptCell = theme.fg("dim", prompt);
-		const labelGap = " ".repeat(SUMMARY_LABEL_GAP);
-		const fillWidth = Math.max(
-			0,
-			width -
-				visibleWidth(indent) -
-				visibleWidth(rawIcon) -
-				1 -
-				labelWidth -
-				SUMMARY_LABEL_GAP -
-				visibleWidth(prompt) -
-				visibleWidth(time) -
-				1,
-		);
-		const fill = " ".repeat(fillWidth);
-		const timeCell = theme.fg("muted", time);
-		return `${indent}${icon} ${numberCell}${labelGap}${promptCell}${fill} ${timeCell}`;
+		const agentLabel = `S${number}`;
+		const agentCell = theme.fg("muted", padTableCell(agentLabel, agentWidth));
+		const promptCell = this.elidePrompt(entry.node.label, sharedPrefix, sharedSuffix, promptWidth);
+		const recapCell = theme.fg("muted", padTableCell(childAgentRecap(entry.node), recapWidth, "…"));
+		const tools =
+			entry.node.toolUseCount === undefined
+				? ""
+				: `${entry.node.toolUseCount} ${entry.node.toolUseCount === 1 ? "tool" : "tools"}`;
+		const tokens = entry.node.tokenCount === undefined ? "" : `${formatTokenCount(entry.node.tokenCount)} tok`;
+		const duration = formatChildAgentDuration(entry.node.durationMs);
+		const toolsCell = padTableCell(tools, SUMMARY_TOOLS_WIDTH, "…");
+		const tokensCell = padTableCell(tokens, SUMMARY_TOKENS_WIDTH, "…");
+		const durationCell = padTableCell(duration, SUMMARY_DURATION_WIDTH, "…");
+		const metrics = `${toolsCell} ${tokensCell}${" ".repeat(SUMMARY_TOKEN_TIME_GAP)}${durationCell}`;
+		const gap = " ".repeat(SUMMARY_COLUMN_GAP);
+		return `${indent}${icon} ${agentCell}${gap}${promptCell}${gap}${recapCell}${gap}${theme.fg("muted", metrics)}`;
 	}
 
-	// Coloring is applied by the caller so the trailing ellipsis matches the text.
 	private elidePrompt(label: string, sharedPrefix: string, sharedSuffix: string, width: number): string {
 		const text = this.elideAroundDiff(label, sharedPrefix, sharedSuffix);
-		// Column-aware truncation (handles wide/combining chars), with the ellipsis
-		// reserved inside the budget rather than appended past it.
-		return truncateToWidth(text, Math.max(0, width), "…");
+		const safeWidth = Math.max(0, width);
+		const truncated =
+			visibleWidth(text) > safeWidth
+				? `${truncateToWidth(text, Math.max(0, safeWidth - 1), "")
+						.replaceAll("\x1b[0m", "")
+						.trimEnd()}…`
+				: text;
+		return theme.fg("dim", padTableCell(truncated, safeWidth));
 	}
 
 	// Window the prompt around its divergence: "<leading context>…<~2 words before

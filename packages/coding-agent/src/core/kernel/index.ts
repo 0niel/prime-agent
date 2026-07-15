@@ -38,6 +38,19 @@ const SNAPSHOT_MAX_OUTPUT_CHARS = 1_000_000;
 // Cap how long a graceful dispose waits on the final snapshot; the debounced
 // on-disk copy is the fallback if this is exceeded.
 const SNAPSHOT_DISPOSE_TIMEOUT_MS = 5000;
+const KERNEL_ABORT_GRACE_MS = 1000;
+const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
+const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
+const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS = 256;
+const KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE =
+	"IPython kernel is still running the previously interrupted cell. Wait and try again, or kill the IPython kernel to start fresh.";
+
+export class KernelBusyAfterInterruptError extends Error {
+	constructor() {
+		super(KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE);
+		this.name = "KernelBusyAfterInterruptError";
+	}
+}
 
 /** Comm target the kernel-side `rlm.host_request` shim opens for typed host requests. */
 export const HOST_COMM_TARGET = "host.request";
@@ -79,12 +92,14 @@ export interface KernelManagerOptions {
 
 export interface KernelStartOptions {
 	onBootstrapProgress?: KernelBootstrapProgressHandler;
+	signal?: AbortSignal;
 }
 
 export interface ExecuteOptions {
 	/** Aborting interrupts the kernel via the control channel. */
 	signal?: AbortSignal;
 	onStream?: (chunk: string, name: "stdout" | "stderr") => void;
+	onLateSentAgentMessage?: (message: KernelSentAgentMessage) => void;
 	/** Cap stdout / stderr / result at this many characters. Default 65536. */
 	maxOutputChars?: number;
 	/** Synthetic host cell (snapshot/restore/list); excluded from lastCellCode attribution. */
@@ -98,6 +113,9 @@ export const DIFF_DISPLAY_MIME = "application/vnd.prime-agent.diff+json";
 
 /** MIME tag the `attach-image` skill emits media payloads under, via `display_data`. */
 export const ATTACHMENT_DISPLAY_MIME = "application/vnd.prime-agent.attachment+json";
+
+/** MIME tag the `agent-message` skill emits after sending a message. */
+export const AGENT_MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-message+json";
 
 /**
  * Hard ceiling on a single attachment's base64 payload, a defensive guard
@@ -125,6 +143,17 @@ export interface KernelAttachment {
 	path?: string;
 }
 
+export interface KernelSentAgentMessage {
+	id: string;
+	message: string;
+	deliveryStatus: "delivered" | "queued";
+	target: {
+		activeSessionId: string;
+		sessionId: string;
+		sessionName?: string;
+	};
+}
+
 export interface ExecuteResult {
 	stdout: string;
 	stderr: string;
@@ -134,6 +163,8 @@ export interface ExecuteResult {
 	diffs?: KernelDiffDisplay[];
 	/** Media attachments emitted via display_data, in order. */
 	attachments?: KernelAttachment[];
+	/** Agent messages sent from this cell, in order. */
+	sentAgentMessages?: KernelSentAgentMessage[];
 	status: "ok" | "error" | "aborted";
 	error?: { ename: string; evalue: string; traceback: string[] };
 	durationMs: number;
@@ -169,6 +200,77 @@ function parseAttachmentDisplay(payload: unknown): KernelAttachment | "oversized
 		return "oversized";
 	}
 	return { mimeType, data, path: typeof path === "string" ? path : undefined };
+}
+
+function parseSentAgentMessage(payload: unknown): KernelSentAgentMessage | undefined {
+	if (!isRecord(payload) || !isRecord(payload.target)) {
+		return undefined;
+	}
+	const { id, message, deliveryStatus, target } = payload;
+	const { activeSessionId, sessionId, sessionName } = target;
+	if (
+		typeof id !== "string" ||
+		typeof message !== "string" ||
+		(deliveryStatus !== "delivered" && deliveryStatus !== "queued") ||
+		typeof activeSessionId !== "string" ||
+		typeof sessionId !== "string"
+	) {
+		return undefined;
+	}
+	return {
+		id,
+		message,
+		deliveryStatus,
+		target: {
+			activeSessionId,
+			sessionId,
+			...(typeof sessionName === "string" ? { sessionName } : {}),
+		},
+	};
+}
+
+function createKernelStartupAbortError(): Error {
+	return new Error("Kernel startup aborted");
+}
+
+function raceStartupWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+	if (!signal) {
+		return promise;
+	}
+	if (signal.aborted) {
+		return Promise.reject(createKernelStartupAbortError());
+	}
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		const cleanup = () => signal.removeEventListener("abort", abort);
+		const abort = () => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			cleanup();
+			reject(createKernelStartupAbortError());
+		};
+		signal.addEventListener("abort", abort, { once: true });
+		promise.then(
+			(value) => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				resolve(value);
+			},
+			(error: unknown) => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				reject(error);
+			},
+		);
+	});
 }
 
 interface ConnectionInfo {
@@ -212,8 +314,10 @@ interface ActiveExecution {
 	result?: string;
 	diffs: KernelDiffDisplay[];
 	attachments: KernelAttachment[];
+	sentAgentMessages: KernelSentAgentMessage[];
 	error?: ExecuteResult["error"];
 	status: ExecuteResult["status"];
+	settled: boolean;
 	resolve: (result: ExecuteResult) => void;
 	reject: (error: Error) => void;
 }
@@ -429,6 +533,8 @@ export class KernelManager {
 	/** Serializes execute() calls — Jupyter shell channel is request/reply. */
 	private executionQueue: Promise<unknown> = Promise.resolve();
 	private activeExecution?: ActiveExecution;
+	private readonly activeExecutionIdleWaiters = new Set<() => void>();
+	private readonly lateSentAgentMessageHandlers = new Map<string, (message: KernelSentAgentMessage) => void>();
 	// Source of the most recently started cell, retained after it finishes so
 	// rlm.run spawns from detached asyncio tasks (cell already idle) can still
 	// attribute their spawning program.
@@ -464,10 +570,16 @@ export class KernelManager {
 	}
 
 	async start(options: KernelStartOptions = {}): Promise<void> {
-		if (!this.startPromise) {
-			this.startPromise = this.doStart(options);
+		if (options.signal?.aborted) {
+			throw createKernelStartupAbortError();
 		}
-		return this.startPromise;
+		if (!this.startPromise) {
+			this.startPromise = this.doStart({ onBootstrapProgress: options.onBootstrapProgress }).catch((error) => {
+				this.startPromise = undefined;
+				throw error;
+			});
+		}
+		return raceStartupWithAbort(this.startPromise, options.signal);
 	}
 
 	private async doStart(startOptions: KernelStartOptions): Promise<void> {
@@ -525,7 +637,9 @@ export class KernelManager {
 				// collide with it (write the same file / re-bind the same ports).
 				try {
 					rmSync(connection.tempDir, { recursive: true, force: true });
-				} catch {}
+				} catch {
+					// Leave the temp dir for OS tmp cleanup.
+				}
 				connection = makeConnection();
 				this.tempDir = connection.tempDir;
 			}
@@ -549,6 +663,7 @@ export class KernelManager {
 				this.appendKernelDiagnostic(`spawn error: ${err.message}`);
 				this.state = "shutdown";
 				liveKernels.delete(this);
+				this.cleanupResources();
 			});
 
 			kernel.on("exit", (code, signal) => {
@@ -558,6 +673,7 @@ export class KernelManager {
 				}
 				this.state = "shutdown";
 				liveKernels.delete(this);
+				this.cleanupResources();
 			});
 		}
 
@@ -701,7 +817,7 @@ export class KernelManager {
 		if (opts.signal?.aborted) {
 			return { stdout: "", stderr: "", status: "aborted", durationMs: 0 };
 		}
-		await this.start();
+		await this.start({ signal: opts.signal });
 		if ((this.state as string) === "shutdown") {
 			throw new Error("Kernel has been shut down");
 		}
@@ -715,6 +831,7 @@ export class KernelManager {
 
 		const started = Date.now();
 		try {
+			await this.waitForActiveExecutionToClearForReuse(opts.signal);
 			if (opts.signal?.aborted) {
 				return { stdout: "", stderr: "", status: "aborted", durationMs: Date.now() - started };
 			}
@@ -754,35 +871,64 @@ export class KernelManager {
 			throw new Error("Kernel already has an active execution");
 		}
 
-		const onAbort = () => {
-			this.interrupt().catch(() => {});
+		const result = createDeferred<ExecuteResult>();
+		const execution: ActiveExecution = {
+			requestMsgId,
+			code,
+			started,
+			maxChars,
+			opts,
+			stdout: "",
+			stderr: "",
+			stdoutTruncated: false,
+			stderrTruncated: false,
+			diffs: [],
+			attachments: [],
+			sentAgentMessages: [],
+			status: "ok",
+			settled: false,
+			resolve: result.resolve,
+			reject: result.reject,
 		};
-		opts.signal?.addEventListener("abort", onAbort);
+		let abortTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
+		const clearAbortTimer = () => {
+			if (abortTimer) {
+				globalThis.clearTimeout(abortTimer);
+				abortTimer = undefined;
+			}
+		};
+		const forceAbort = () => {
+			if (this.activeExecution !== execution) {
+				return;
+			}
+			execution.status = "aborted";
+			this.resolveExecution(execution, { clearActive: false });
+		};
+		const onAbort = () => {
+			void this.interrupt().catch(() => undefined);
+			clearAbortTimer();
+			abortTimer = globalThis.setTimeout(forceAbort, KERNEL_ABORT_GRACE_MS);
+			if (abortTimer && typeof abortTimer === "object" && "unref" in abortTimer) {
+				abortTimer.unref();
+			}
+		};
 
 		try {
-			const result = createDeferred<ExecuteResult>();
-			const execution: ActiveExecution = {
-				requestMsgId,
-				code,
-				started,
-				maxChars,
-				opts,
-				stdout: "",
-				stderr: "",
-				stdoutTruncated: false,
-				stderrTruncated: false,
-				diffs: [],
-				attachments: [],
-				status: "ok",
-				resolve: result.resolve,
-				reject: result.reject,
-			};
 			this.activeExecution = execution;
+			opts.signal?.addEventListener("abort", onAbort, { once: true });
+			if (opts.signal?.aborted) {
+				onAbort();
+			}
 			if (!opts.internal) {
 				this.lastCellCode = code;
 			}
 			try {
-				await shell.send(encode(msg, conn.key));
+				const sendPromise = shell.send(encode(msg, conn.key));
+				sendPromise.catch(() => undefined);
+				await Promise.race([sendPromise, result.promise.then(() => undefined)]);
+				if (this.activeExecution === execution && execution.status !== "aborted") {
+					await sendPromise;
+				}
 			} catch (error) {
 				if (this.activeExecution === execution) {
 					this.activeExecution = undefined;
@@ -791,6 +937,7 @@ export class KernelManager {
 			}
 			return await result.promise;
 		} finally {
+			clearAbortTimer();
 			opts.signal?.removeEventListener("abort", onAbort);
 		}
 	}
@@ -833,14 +980,22 @@ export class KernelManager {
 
 	private handleExecutionMessage(incoming: JupyterMessage): void {
 		const execution = this.activeExecution;
-		if (!execution) {
-			return;
-		}
-		if ((incoming.parent_header as { msg_id?: string }).msg_id !== execution.requestMsgId) {
+		const parentMessageId = (incoming.parent_header as { msg_id?: string }).msg_id;
+		if (!execution || parentMessageId !== execution.requestMsgId) {
+			if (incoming.header.msg_type === "display_data" || incoming.header.msg_type === "update_display_data") {
+				const content = incoming.content as { data?: Record<string, unknown> };
+				this.dispatchLateSentAgentMessage(parentMessageId, content.data?.[AGENT_MESSAGE_DISPLAY_MIME]);
+			}
 			return;
 		}
 
 		const t = incoming.header.msg_type;
+		if (execution.settled && (t === "display_data" || t === "update_display_data")) {
+			const content = incoming.content as { data?: Record<string, unknown> };
+			if (this.dispatchLateSentAgentMessage(parentMessageId, content.data?.[AGENT_MESSAGE_DISPLAY_MIME])) {
+				return;
+			}
+		}
 		if (t === "stream") {
 			const c = incoming.content as { name: "stdout" | "stderr"; text: string };
 			if (c.name === "stdout") {
@@ -875,6 +1030,8 @@ export class KernelManager {
 			} else if (attachment) {
 				execution.attachments.push(attachment);
 			}
+			const sentAgentMessage = parseSentAgentMessage(c.data?.[AGENT_MESSAGE_DISPLAY_MIME]);
+			if (sentAgentMessage) execution.sentAgentMessages.push(sentAgentMessage);
 		} else if (t === "error") {
 			const c = incoming.content as { ename: string; evalue: string; traceback: string[] };
 			execution.error = c;
@@ -891,30 +1048,76 @@ export class KernelManager {
 		if (this.activeExecution !== execution) {
 			return;
 		}
-		this.activeExecution = undefined;
+		this.resolveExecution(execution, { clearActive: true });
+	}
 
-		let stdout = execution.stdout;
-		let stderr = execution.stderr;
-		let result = execution.result;
-		let status = execution.status;
-		if (execution.stdoutTruncated) stdout += `\n[... output truncated at ${execution.maxChars} chars ...]`;
-		if (execution.stderrTruncated) stderr += `\n[... output truncated at ${execution.maxChars} chars ...]`;
-		if (result !== undefined && result.length > execution.maxChars) {
-			result = `${result.slice(0, execution.maxChars)}\n[... output truncated at ${execution.maxChars} chars ...]`;
+	private resolveExecution(execution: ActiveExecution, options: { clearActive: boolean }): void {
+		const didClearActive = options.clearActive && this.activeExecution === execution;
+		if (options.clearActive && this.activeExecution === execution) {
+			this.activeExecution = undefined;
 		}
+		if (!execution.settled) {
+			execution.settled = true;
+			if (execution.opts.onLateSentAgentMessage) {
+				this.registerLateSentAgentMessageHandler(execution.requestMsgId, execution.opts.onLateSentAgentMessage);
+			}
 
-		if (execution.opts.signal?.aborted) status = "aborted";
+			let stdout = execution.stdout;
+			let stderr = execution.stderr;
+			let result = execution.result;
+			let status = execution.status;
+			if (execution.stdoutTruncated) stdout += `\n[... output truncated at ${execution.maxChars} chars ...]`;
+			if (execution.stderrTruncated) stderr += `\n[... output truncated at ${execution.maxChars} chars ...]`;
+			if (result !== undefined && result.length > execution.maxChars) {
+				result = `${result.slice(0, execution.maxChars)}\n[... output truncated at ${execution.maxChars} chars ...]`;
+			}
 
-		execution.resolve({
-			stdout,
-			stderr,
-			result,
-			diffs: execution.diffs.length > 0 ? execution.diffs : undefined,
-			attachments: execution.attachments.length > 0 ? execution.attachments : undefined,
-			error: execution.error,
-			status,
-			durationMs: Date.now() - execution.started,
-		});
+			if (execution.opts.signal?.aborted) status = "aborted";
+
+			execution.resolve({
+				stdout,
+				stderr,
+				result,
+				diffs: execution.diffs.length > 0 ? execution.diffs : undefined,
+				attachments: execution.attachments.length > 0 ? execution.attachments : undefined,
+				sentAgentMessages: execution.sentAgentMessages.length > 0 ? execution.sentAgentMessages : undefined,
+				error: execution.error,
+				status,
+				durationMs: Date.now() - execution.started,
+			});
+		}
+		if (didClearActive) {
+			this.notifyActiveExecutionIdle();
+		}
+	}
+
+	private dispatchLateSentAgentMessage(parentMessageId: string | undefined, value: unknown): boolean {
+		const sentAgentMessage = parseSentAgentMessage(value);
+		if (!sentAgentMessage || !parentMessageId) {
+			return false;
+		}
+		const handler = this.lateSentAgentMessageHandlers.get(parentMessageId);
+		if (!handler) {
+			return false;
+		}
+		this.lateSentAgentMessageHandlers.delete(parentMessageId);
+		this.lateSentAgentMessageHandlers.set(parentMessageId, handler);
+		handler(sentAgentMessage);
+		return true;
+	}
+
+	private registerLateSentAgentMessageHandler(
+		requestMessageId: string,
+		handler: (message: KernelSentAgentMessage) => void,
+	): void {
+		this.lateSentAgentMessageHandlers.set(requestMessageId, handler);
+		while (this.lateSentAgentMessageHandlers.size > MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS) {
+			const oldestRequestMessageId = this.lateSentAgentMessageHandlers.keys().next().value;
+			if (oldestRequestMessageId === undefined) {
+				break;
+			}
+			this.lateSentAgentMessageHandlers.delete(oldestRequestMessageId);
+		}
 	}
 
 	private rejectActiveExecution(error: Error): void {
@@ -924,6 +1127,65 @@ export class KernelManager {
 		}
 		this.activeExecution = undefined;
 		execution.reject(error);
+		this.notifyActiveExecutionIdle();
+	}
+
+	private notifyActiveExecutionIdle(): void {
+		for (const resolve of this.activeExecutionIdleWaiters) {
+			resolve();
+		}
+		this.activeExecutionIdleWaiters.clear();
+	}
+
+	private waitForActiveExecutionToClear(signal: AbortSignal | undefined, timeoutMs: number): Promise<boolean> {
+		if (!this.activeExecution) {
+			return Promise.resolve(true);
+		}
+		return new Promise<boolean>((resolve) => {
+			let settled = false;
+			let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
+			const finish = (cleared: boolean) => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				if (timeout) {
+					globalThis.clearTimeout(timeout);
+				}
+				this.activeExecutionIdleWaiters.delete(onIdle);
+				signal?.removeEventListener("abort", onAbort);
+				resolve(cleared);
+			};
+			const onIdle = () => finish(true);
+			const onAbort = () => finish(false);
+			this.activeExecutionIdleWaiters.add(onIdle);
+			signal?.addEventListener("abort", onAbort, { once: true });
+			timeout = globalThis.setTimeout(() => finish(false), timeoutMs);
+			if (timeout && typeof timeout === "object" && "unref" in timeout) {
+				timeout.unref();
+			}
+		});
+	}
+
+	private async waitForActiveExecutionToClearForReuse(signal?: AbortSignal): Promise<void> {
+		const started = Date.now();
+		while (this.activeExecution && Date.now() - started < KERNEL_BUSY_REUSE_WAIT_MS) {
+			if ((this.state as string) === "shutdown") {
+				throw new Error("Kernel has been shut down");
+			}
+			void this.interrupt().catch(() => undefined);
+			const remaining = KERNEL_BUSY_REUSE_WAIT_MS - (Date.now() - started);
+			const cleared = await this.waitForActiveExecutionToClear(
+				signal,
+				Math.max(1, Math.min(KERNEL_BUSY_INTERRUPT_INTERVAL_MS, remaining)),
+			);
+			if (cleared || signal?.aborted) {
+				return;
+			}
+		}
+		if (this.activeExecution) {
+			throw new KernelBusyAfterInterruptError();
+		}
 	}
 
 	private handleCommMessage(incoming: JupyterMessage): void {
@@ -1025,8 +1287,9 @@ export class KernelManager {
 		await this.control.send(encode(msg, this.connection.key));
 	}
 
-	private cleanupResources(): void {
+	private cleanupResources(killSignal: NodeJS.Signals = "SIGTERM"): void {
 		this.clearSnapshotTimer();
+		this.lateSentAgentMessageHandlers.clear();
 		if (this.forkedLivenessTimer) {
 			globalThis.clearInterval(this.forkedLivenessTimer);
 			this.forkedLivenessTimer = undefined;
@@ -1041,20 +1304,24 @@ export class KernelManager {
 		this.iopubPumpPromise = undefined;
 		try {
 			if (this.kernel) {
-				this.kernel.kill("SIGTERM");
+				this.kernel.kill(killSignal);
 			} else if (this.kernelPid !== undefined && !this.forkedKernelDied()) {
 				// Only signal a forked kernel confirmed still alive: a dead pid may have
-				// been recycled by the OS, and SIGTERM would then hit an unrelated process.
-				process.kill(this.kernelPid, "SIGTERM");
+				// been recycled by the OS, and a kill would then hit an unrelated process.
+				process.kill(this.kernelPid, killSignal);
 			}
-		} catch {}
+		} catch {
+			// Kernel already exited.
+		}
 		this.kernel = undefined;
 		this.kernelPid = undefined;
 		this.connection = undefined;
 		if (this.tempDir) {
 			try {
 				rmSync(this.tempDir, { recursive: true, force: true });
-			} catch {}
+			} catch {
+				// Leave the temp dir for OS tmp cleanup.
+			}
 		}
 		this.tempDir = undefined;
 		this.startPromise = undefined;
@@ -1100,7 +1367,11 @@ export class KernelManager {
 				await this.control.send(encode(msg, this.connection.key));
 				await sleep(200);
 			}
-		} catch {}
+		} catch (error) {
+			this.appendKernelDiagnostic(
+				`shutdown_request send failed (killing instead): ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 
 		this.cleanupResources();
 	}
@@ -1121,6 +1392,12 @@ export class KernelManager {
 		} finally {
 			resolveNext();
 		}
+	}
+
+	async kill(): Promise<void> {
+		this.state = "shutdown";
+		liveKernels.delete(this);
+		this.cleanupResources("SIGKILL");
 	}
 
 	/**

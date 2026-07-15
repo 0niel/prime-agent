@@ -17,6 +17,7 @@ const DEFAULT_OVERVIEW_CONTENT_LIMIT = 180;
 
 export type RefinementKind = "prompt" | "memory" | "skill" | "subagent";
 export type RefinementAction = "create" | "update" | "delete";
+export type HarnessScope = "local" | "global";
 
 export interface HarnessEntry {
 	id: string;
@@ -24,6 +25,7 @@ export interface HarnessEntry {
 	title: string;
 	content: string;
 	path: string;
+	scope?: HarnessScope;
 	reference: Record<string, unknown>;
 	arguments: Record<string, unknown>;
 	metadata: Record<string, unknown>;
@@ -84,26 +86,56 @@ export interface RefinementResult {
 	appliedEdits: AppliedRefinementEdit[];
 	harnessStatePath: string;
 	rollbackOf?: string;
+	scope?: HarnessScope;
 }
 
 export interface RefineOptions {
 	instructions?: string;
 	rollbackId?: string;
+	global?: boolean;
 }
 
-const REFINEMENT_SYSTEM_PROMPT = `You are Prime Agent's /refine subsystem.
+export type AutoRefineReason = "turn_interval" | "compact";
 
-Your job is to improve the editable harness state from the current trajectory.
+export interface AutoRefineReviewContext {
+	reason: AutoRefineReason;
+	turnsSinceLastReview: number;
+}
+
+export interface AutoRefineReview {
+	shouldRefine: boolean;
+	rationale: string;
+	instructions?: string;
+}
+
+const REFINEMENT_SYSTEM_PROMPT = `You are Prime Agent's /refine continual harness subsystem.
+
+Your job is to improve the editable continual harness state from the current trajectory.
 This is similar in spirit to context compaction, but instead of summarizing the
 conversation you emit precise Create, Update, or Delete edits to reusable state.
+The continual harness is the persistent, editable set of prompt notes, memories,
+skills, and subagent specs that lets Prime Agent improve reusable behavior
+outside the token history.
+Use "continual harness" for that persistent artifact layer; keep "RLM" for the
+runtime, IPython kernel, and native call interface that executes those artifacts.
 
-Editable components:
+Continual harness components:
 - prompt: supplemental prompt notes only. The base system prompt is immutable and MUST NOT be rewritten.
 - memory: durable facts, decisions, failures, preferences, and outcomes.
 - skill: installed Python REPL skill. Skill create/update edits MUST include a \`reference\` object with \`{"type":"python"}\`, a Python import, and a callable or call pattern; they also MUST include an \`arguments\` object describing accepted inputs, required fields, defaults, and constraints. Use \`{}\` for \`arguments\` only when the Python callable truly needs no external inputs. Include the RLM-native call form \`await <skill_import>(...)\`.
-- subagent: reusable delegation specs, including purpose, instructions, and when to invoke. Include the RLM-native call form: create a concise task prompt and call \`await rlm("sub-task")\`; for independent parallel subagents use \`await asyncio.gather(rlm("task1"), rlm("task2"))\`. Do not invent wrappers like \`run_subagent(...)\`.
+- subagent: reusable delegation specs, including purpose, instructions, and when to invoke. Include the RLM-native call form: create a concise task prompt, start \`asyncio.create_task(rlm("sub-task"))\` by default, keep the task handle, and await only when the result is needed; for independent parallel subagents use \`await asyncio.gather(rlm("task1"), rlm("task2"))\`. Use direct \`await rlm("sub-task")\` only when the result is immediately required. Do not invent wrappers like \`run_subagent(...)\`.
 
-Use the trajectory, current harness state, and prior refinement history. Prefer
+Scope and persistence policy:
+- The default editable continual harness store is local to the current Prime Agent session. Use it for session-specific progress, active task state, current-run coordination notes, temporary blockers, and project facts that should not affect other sessions.
+- A caller may explicitly request global refinement. Global edits must be stable cross-session lessons, durable user preferences, reusable skills/subagents, or tool/environment facts that should affect future sessions.
+- Entry ids in the harness overview may carry a display-only \`local:\` or \`global:\` prefix. Always use the bare id (no prefix) in edits.
+- All edits in one refinement apply only to the requested scope's store. During a local refinement, global entries are read-only context: never propose update or delete edits for them; create a local entry instead when a session-specific override is genuinely needed.
+- Project/workspace-specific lessons may be persisted globally only when the title, path, or content explicitly names the project/workspace and the lesson is likely to be reused in future sessions for that project. Prefer local edits when the lesson only belongs in the current conversation.
+- Use memory for declarative facts and preferences, skill for repeatable procedures exposed as Python calls, prompt for narrow behavioral policy addendums, and subagent for reusable delegation roles.
+- Create or update the smallest relevant component: repeated delegation roles should become subagent specs, repeated procedures should become skills, durable facts/preferences should become memories, and narrow behavioral policies should become prompt addendums.
+- When an edit is persisted, include metadata such as \`{"scope":"local"}\` or \`{"scope":"global"}\` when that helps future review understand the intended blast radius.
+
+Use the trajectory, current continual harness state, and prior refinement history. Prefer
 small evidence-backed edits. If prior refinements caused issues, rollback or
 replace the faulty editable entries. Never edit source files directly. Output
 JSON only with this exact shape:
@@ -126,6 +158,18 @@ JSON only with this exact shape:
       "reason": "why this edit is useful"
     }
   ]
+}`;
+
+const AUTO_REFINE_REVIEW_SYSTEM_PROMPT = `You are Prime Agent's automatic /refine review gate.
+
+Decide whether this checkpoint should run /refine. Auto /refine writes local continual harness state by default, so approve when the trajectory contains evidence useful to this session's future turns.
+Reject one-off noise, unsupported hypotheses, and transient tool outputs. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified lessons likely to be reused in future sessions.
+
+Return JSON only:
+{
+  "shouldRefine": true|false,
+  "rationale": "short reason",
+  "instructions": "optional concise instructions for /refine if shouldRefine is true"
 }`;
 
 function now(): string {
@@ -166,15 +210,46 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 	return value as Record<string, unknown>;
 }
 
+function normalizeHarnessScope(value: unknown, fallback: HarnessScope): HarnessScope {
+	return value === "global" || value === "local" ? value : fallback;
+}
+
+function inferRefinementResultScope(result: RefinementResult): HarnessScope | undefined {
+	if (result.scope) {
+		return result.scope;
+	}
+
+	const scopes = new Set<HarnessScope>();
+	for (const edit of result.appliedEdits) {
+		const scope = edit.after?.scope ?? edit.before?.scope;
+		if (scope) {
+			scopes.add(scope);
+		}
+	}
+	return scopes.size === 1 ? [...scopes][0] : undefined;
+}
+
+function withDefaultRefinementScope(result: RefinementResult, scope: HarnessScope): RefinementResult {
+	const inferred = inferRefinementResultScope(result);
+	return { ...result, scope: inferred ?? scope };
+}
+
 export function getGlobalHarnessStateDir(agentDir: string = getAgentDir()): string {
 	return join(agentDir, HARNESS_STATE_DIR_NAME);
+}
+
+export function getLocalHarnessStateDir(sessionArtifactDir: string | undefined): string | undefined {
+	return sessionArtifactDir ? join(sessionArtifactDir, HARNESS_STATE_DIR_NAME) : undefined;
 }
 
 export function getHarnessStatePath(harnessStateDir: string = getGlobalHarnessStateDir()): string {
 	return join(harnessStateDir, "harness_state.json");
 }
 
-export function loadHarnessState(harnessStateDir: string = getGlobalHarnessStateDir()): HarnessState {
+export function loadHarnessState(
+	harnessStateDir: string = getGlobalHarnessStateDir(),
+	scope: HarnessScope = "global",
+): HarnessState {
 	const statePath = getHarnessStatePath(harnessStateDir);
 	if (!existsSync(statePath)) {
 		return emptyHarnessState();
@@ -202,6 +277,7 @@ export function loadHarnessState(harnessStateDir: string = getGlobalHarnessState
 				if (!entry) continue;
 				state.entries[kind][id] = {
 					...(entry as unknown as HarnessEntry),
+					scope: normalizeHarnessScope(entry.scope, scope),
 					reference: objectRecord(entry.reference) ?? {},
 					arguments: objectRecord(entry.arguments) ?? {},
 					metadata: objectRecord(entry.metadata) ?? {},
@@ -213,6 +289,25 @@ export function loadHarnessState(harnessStateDir: string = getGlobalHarnessState
 		state.refinements = parsed.refinements;
 	}
 	return state;
+}
+
+export function mergeHarnessStates(globalState: HarnessState, localState?: HarnessState): HarnessState {
+	const merged = emptyHarnessState();
+	merged.schema = Math.max(globalState.schema, localState?.schema ?? 1);
+	for (const kind of Object.keys(merged.entries) as RefinementKind[]) {
+		for (const [id, entry] of Object.entries(globalState.entries[kind])) {
+			const cloned = cloneEntry(entry)!;
+			merged.entries[kind][id] = { ...cloned, scope: normalizeHarnessScope(cloned.scope, "global") };
+		}
+		for (const [id, entry] of Object.entries(localState?.entries[kind] ?? {})) {
+			const cloned = cloneEntry(entry)!;
+			const scopedEntry = { ...cloned, scope: normalizeHarnessScope(cloned.scope, "local") };
+			const mergedId = merged.entries[kind][id] ? `${scopedEntry.scope}:${id}` : id;
+			merged.entries[kind][mergedId] = scopedEntry;
+		}
+	}
+	merged.refinements = [...globalState.refinements, ...(localState?.refinements ?? [])];
+	return merged;
 }
 
 export function saveHarnessState(harnessStateDir: string, state: HarnessState): string {
@@ -231,10 +326,9 @@ function isRefinementResult(data: unknown): data is RefinementResult {
 }
 
 /**
- * Append a refinement result to the global, cross-session history log. The harness
- * state itself is global, so rollback evidence must also be global; relying only on
- * per-session JSONL entries makes a refinement applied in one session impossible to
- * roll back from another.
+ * Append a global-scope refinement to the cross-session history log so it can be
+ * rolled back from any session. Local-scope refinements are recorded only in the
+ * session JSONL and roll back via their recorded harnessStatePath.
  */
 export function appendGlobalRefinement(harnessStateDir: string, result: RefinementResult): string {
 	const historyPath = getRefinementHistoryPath(harnessStateDir);
@@ -255,7 +349,7 @@ export function loadGlobalRefinementHistory(harnessStateDir: string = getGlobalH
 		try {
 			const parsed = JSON.parse(trimmed);
 			if (isRefinementResult(parsed)) {
-				results.push(parsed);
+				results.push(withDefaultRefinementScope(parsed, "global"));
 			}
 		} catch {
 			// Skip malformed lines so a single bad append cannot break rollback.
@@ -277,7 +371,8 @@ export function mergeRefinementHistory(
 		byId.set(result.id, result);
 	}
 	for (const result of session) {
-		byId.set(result.id, result);
+		const existing = byId.get(result.id);
+		byId.set(result.id, result.scope || !existing?.scope ? result : { ...result, scope: existing.scope });
 	}
 	return [...byId.values()];
 }
@@ -296,20 +391,29 @@ export function formatHarnessStateForPrompt(
 		maxEntriesPerKind?: number;
 		maxRefinements?: number;
 		maxContentLength?: number;
+		includeIpythonExamples?: boolean;
+		includeShellExamples?: boolean;
 	} = {},
 ): string {
 	const maxEntriesPerKind = options.maxEntriesPerKind ?? DEFAULT_OVERVIEW_ENTRY_LIMIT;
 	const maxRefinements = options.maxRefinements ?? DEFAULT_OVERVIEW_REFINEMENT_LIMIT;
 	const maxContentLength = options.maxContentLength ?? DEFAULT_OVERVIEW_CONTENT_LIMIT;
+	const includeIpythonExamples = options.includeIpythonExamples ?? true;
 	const lines = [
-		"# Global Harness State",
+		"# Continual Harness State",
 		"",
-		"Persistent harness state is global by default and should influence this session without requiring a tool call.",
-		"Use these prompt notes, memories, skills, and subagent specs when they are relevant. The base system prompt is immutable; prompt entries below are supplemental notes only.",
+		"Local continual harness entries belong to this Prime Agent session. Global continual harness entries persist across Prime Agent sessions.",
+		"The continual harness entries below are compact summaries, not full descriptions. Use them as routing/context hints; inspect or refine the underlying continual harness entry only when detail matters.",
+		"Default to local continual harness refinement for current task progress, temporary blockers, and session coordination. Use global continual harness refinement only for stable cross-session lessons, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts.",
+		"Use these continual harness prompt notes, memories, skills, and subagent specs when they are relevant. The base system prompt is immutable; prompt entries below are supplemental notes only.",
 		"",
-		"When to call `/refine`: after a repeated failure, a reusable tactic emerges, a user corrects behavior that should persist, validation shows a harness entry is wrong, or a skill/subagent/memory/prompt note should be created, updated, deleted, or rolled back. Keep `/refine` edits small and evidence-backed.",
+		"When to call `/refine`: after a repeated failure, a reusable tactic emerges, a repeated delegation role should become a subagent spec, a repeated procedure should become a skill, a durable fact/preference should become a memory, a narrow behavioral policy should become a prompt addendum, a user corrects behavior that should persist locally or globally, validation shows a continual harness entry is wrong, or a skill/subagent/memory/prompt note should be created, updated, deleted, or rolled back. Keep `/refine` continual harness edits small and evidence-backed.",
 		"",
-		"Call contract: use installed Python skills as `await <skill_import>(...)` in IPython, or `<skill_import> ...` in shell when a CLI exists. Harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Harness subagent entries are invoked by composing a concise task prompt and calling `await rlm('sub-task')`; use `await asyncio.gather(rlm('task1'), rlm('task2'))` for independent parallel subagents. Do not invent wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
+		includeIpythonExamples
+			? "Call contract: use installed Python skills as `await <skill_import>(...)` in IPython, or `<skill_import> ...` in shell when a CLI exists. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are invoked by composing a concise task prompt and starting `asyncio.create_task(rlm('sub-task'))` by default, then awaiting only when the result is needed; use `await asyncio.gather(rlm('task1'), rlm('task2'))` for independent parallel subagents. Use direct `await rlm('sub-task')` only when the result is immediately required. Do not invent wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries."
+			: options.includeShellExamples
+				? "Call contract: use installed skills as shell commands when available (for example `<skill_import> ...`). Continual harness entries are routing/context hints only in sessions without IPython; do not use Python `await`, `asyncio`, or `rlm` examples unless the prompt also documents an IPython kernel."
+				: "Call contract: continual harness entries are routing/context hints only in sessions without IPython or shell access; do not use Python `await`, `asyncio`, `rlm`, or shell skill commands unless the prompt also documents those interfaces.",
 		"",
 	];
 
@@ -319,7 +423,16 @@ export function formatHarnessStateForPrompt(
 			[a.path, a.title, a.id].join("\0").localeCompare([b.path, b.title, b.id].join("\0")),
 		);
 		totalEntries += entries.length;
-		lines.push(`${kind}: ${entries.length}`);
+		// Render subagent specs as a task-shaped roster the model can match against — the
+		// analogue of Claude Code's agent-type menu — rather than a bare count. In
+		// IPython sessions, include the native `rlm` invocation hint.
+		if (kind === "subagent" && entries.length > 0 && includeIpythonExamples) {
+			lines.push(
+				`${kind}: ${entries.length} (invoke a spec by turning it into a concise task prompt and starting \`asyncio.create_task(rlm('<task>'))\` by default)`,
+			);
+		} else {
+			lines.push(`${kind}: ${entries.length}`);
+		}
 		for (const entry of entries.slice(0, maxEntriesPerKind)) {
 			const argumentsText =
 				entry.kind === "skill" && Object.keys(entry.arguments).length > 0
@@ -330,7 +443,7 @@ export function formatHarnessStateForPrompt(
 					? ` ref=${compactText(JSON.stringify(entry.reference), maxContentLength)}`
 					: "";
 			lines.push(
-				`- [${entry.id}] ${entry.title} (${entry.path}, v${entry.version})${referenceText}${argumentsText}: ${compactText(
+				`- [${entry.scope ?? "global"}:${entry.id}] ${entry.title} (${entry.path}, v${entry.version})${referenceText}${argumentsText}: ${compactText(
 					entry.content,
 					maxContentLength,
 				)}`,
@@ -377,7 +490,7 @@ function overviewForPrompt(state: HarnessState): string {
 					? ` ref=${JSON.stringify(entry.reference).slice(0, 240)}`
 					: "";
 			lines.push(
-				`- [${entry.id}] ${entry.title} (${entry.path}, v${entry.version})${referenceText}${argumentsText}: ${content}`,
+				`- [${entry.scope ?? "global"}:${entry.id}] ${entry.title} (${entry.path}, v${entry.version})${referenceText}${argumentsText}: ${content}`,
 			);
 		}
 		if (entries.length > 40) {
@@ -428,7 +541,7 @@ function parseProposal(text: string): RefinementProposal {
 	const record = value as Record<string, unknown>;
 	const edits = Array.isArray(record.edits) ? record.edits : [];
 	return {
-		summary: typeof record.summary === "string" ? record.summary : "Refined harness state",
+		summary: typeof record.summary === "string" ? record.summary : "Refined continual harness state",
 		rationale: typeof record.rationale === "string" ? record.rationale : "",
 		expectedOutcome: typeof record.expectedOutcome === "string" ? record.expectedOutcome : "",
 		edits: edits
@@ -497,7 +610,7 @@ function validateEdit(edit: RefinementEdit, computedId?: string): string | undef
 export function applyRefinementProposal(
 	state: HarnessState,
 	proposal: RefinementProposal,
-	options: { id: string; rollbackOf?: string },
+	options: { id: string; rollbackOf?: string; scope?: HarnessScope },
 ): RefinementResult {
 	const appliedEdits: AppliedRefinementEdit[] = [];
 	for (const edit of proposal.edits) {
@@ -537,6 +650,7 @@ export function applyRefinementProposal(
 			title: edit.title ?? before?.title ?? id,
 			content: edit.content ?? before?.content ?? "",
 			path: edit.path ?? before?.path ?? "general",
+			scope: before?.scope ?? options.scope ?? "local",
 			reference: edit.reference ?? before?.reference ?? {},
 			arguments: edit.arguments ?? before?.arguments ?? {},
 			metadata: edit.metadata ?? before?.metadata ?? {},
@@ -567,6 +681,7 @@ export function applyRefinementProposal(
 		appliedEdits,
 		harnessStatePath: "",
 		rollbackOf: options.rollbackOf,
+		scope: options.scope,
 	};
 }
 
@@ -598,7 +713,7 @@ function rollbackProposal(target: RefinementResult): RefinementProposal {
 	}
 	return {
 		summary: `Rollback refinement ${target.id}`,
-		rationale: `Restores harness state snapshots from refinement ${target.id}.`,
+		rationale: `Restores continual harness state snapshots from refinement ${target.id}.`,
 		expectedOutcome: "Faulty refinement edits are reverted.",
 		edits,
 	};
@@ -617,6 +732,7 @@ export interface RefinementPlan {
 	proposal: RefinementProposal;
 	id: string;
 	rollbackOf?: string;
+	rollbackScope?: HarnessScope;
 }
 
 /**
@@ -646,14 +762,24 @@ export async function planRefinement(
 		if (!target) {
 			throw new Error(`Refinement ${options.rollbackId} not found`);
 		}
-		return { proposal: rollbackProposal(target), id, rollbackOf: target.id };
+		const fallbackScope: HarnessScope = options.global ? "global" : "local";
+		return {
+			proposal: rollbackProposal(target),
+			id,
+			rollbackOf: target.id,
+			rollbackScope: inferRefinementResultScope(target) ?? fallbackScope,
+		};
 	}
 
 	const conversationText = serializeConversation(convertToLlm(messages)).slice(-80_000);
+	const scopeInstruction = options.global
+		? "Requested refinement scope: global. Only propose stable cross-session continual harness edits, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts that should affect future Prime Agent sessions. Do not persist session-only progress, temporary blockers, or current-run coordination globally."
+		: "Requested refinement scope: local. Prefer local continual harness edits for current task progress, temporary blockers, current-run coordination, and project facts that are not clearly reusable across Prime Agent sessions. Global entries in the overview are read-only context: do not propose update or delete edits for them; create a local entry instead if an override is needed.";
 	const userPrompt = [
 		`<current_harness_state>\n${overviewForPrompt(state)}\n</current_harness_state>`,
 		`<refinement_history>\n${historyForPrompt(history)}\n</refinement_history>`,
 		`<conversation>\n${conversationText}\n</conversation>`,
+		`<scope_policy>\n${scopeInstruction}\n</scope_policy>`,
 		options.instructions ? `<user_refine_instructions>\n${options.instructions}\n</user_refine_instructions>` : "",
 		"Return only JSON edits. If no useful edit is justified, return an empty edits array with a rationale.",
 	]
@@ -686,6 +812,67 @@ export async function planRefinement(
 	return { proposal: parseProposal(text), id };
 }
 
+function parseAutoRefineReview(text: string): AutoRefineReview {
+	const value = extractJsonObject(text);
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new Error("Auto-refine review JSON must be an object");
+	}
+	const record = value as Record<string, unknown>;
+	return {
+		shouldRefine: record.shouldRefine === true,
+		rationale: typeof record.rationale === "string" ? record.rationale : "No rationale provided.",
+		instructions: typeof record.instructions === "string" ? record.instructions : undefined,
+	};
+}
+
+export async function reviewAutoRefine(
+	messages: AgentMessage[],
+	state: HarnessState,
+	history: RefinementResult[],
+	model: Model<any>,
+	apiKey: string,
+	context: AutoRefineReviewContext,
+	headers?: Record<string, string>,
+	signal?: AbortSignal,
+	thinkingLevel?: ThinkingLevel,
+): Promise<AutoRefineReview> {
+	const conversationText = serializeConversation(convertToLlm(messages)).slice(-40_000);
+	const userPrompt = [
+		`<trigger>
+${context.reason}; ${context.turnsSinceLastReview} assistant turns since last auto-refine review
+</trigger>`,
+		`<current_harness_state>
+${overviewForPrompt(state)}
+</current_harness_state>`,
+		`<refinement_history>
+${historyForPrompt(history)}
+</refinement_history>`,
+		`<conversation>
+${conversationText}
+</conversation>`,
+		"Return shouldRefine=true when the trajectory contains evidence useful to this session's future turns. Prefer local harness edits for current task progress, temporary blockers, and current-run coordination. Ask for global refinement only for durable cross-session lessons or explicitly project-qualified facts likely to be reused in future sessions.",
+	].join("\n\n");
+	// Auto-refine review requires parseable JSON. Keep it non-reasoning so
+	// reasoning-capable models use final text budget for the JSON object.
+	void thinkingLevel;
+	const response = await completeSimple(
+		model,
+		{
+			systemPrompt: AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
+			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
+		},
+		{ maxTokens: 1024, signal, apiKey, headers },
+	);
+	if (response.stopReason === "error") {
+		throw new Error(`Auto-refine review failed: ${response.errorMessage || "Unknown error"}`);
+	}
+	const text = response.content
+		.filter((content): content is { type: "text"; text: string } => content.type === "text")
+		.map((content) => content.text)
+		.join("\n");
+	return parseAutoRefineReview(text);
+}
+
 export async function refineHarness(
 	messages: AgentMessage[],
 	state: HarnessState,
@@ -698,5 +885,9 @@ export async function refineHarness(
 	thinkingLevel?: ThinkingLevel,
 ): Promise<RefinementResult> {
 	const plan = await planRefinement(messages, state, history, model, apiKey, options, headers, signal, thinkingLevel);
-	return applyRefinementProposal(state, plan.proposal, { id: plan.id, rollbackOf: plan.rollbackOf });
+	return applyRefinementProposal(state, plan.proposal, {
+		id: plan.id,
+		rollbackOf: plan.rollbackOf,
+		scope: plan.rollbackScope ?? (options.global ? "global" : "local"),
+	});
 }

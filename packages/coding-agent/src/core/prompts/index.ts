@@ -1,1 +1,1 @@
-export { buildRlmPrompt, type RlmPromptOptions } from "./rlm.js";
+export { buildRlmPrompt, buildSubagentGuidance, type RlmPromptOptions } from "./rlm.js";

@@ -1,6 +1,6 @@
 import { type KeyId, setKeybindings, type TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
-import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { ModelSelectorComponent } from "../src/modes/interactive/components/model-selector.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -77,7 +77,7 @@ describe("ModelSelectorComponent provider actions", () => {
 		expect(selectedAction).toBe("add_provider");
 	});
 
-	it("uses injected available models when refreshing scoped models", async () => {
+	it("renders injected daemon models without refreshing the local registry", async () => {
 		const harness = await createHarness({
 			models: [{ id: "faux-1", name: "Local One", reasoning: true }],
 		});
@@ -85,6 +85,7 @@ describe("ModelSelectorComponent provider actions", () => {
 
 		const localModel = harness.getModel("faux-1")!;
 		const connectionModel = { ...localModel, name: "Connection One" };
+		const refresh = vi.spyOn(harness.session.modelRegistry, "refresh");
 		const selector = new ModelSelectorComponent(
 			createFakeTui(),
 			localModel,
@@ -98,11 +99,79 @@ describe("ModelSelectorComponent provider actions", () => {
 			},
 		);
 
-		await waitForAsyncRender();
-
 		const output = stripAnsi(selector.render(120).join("\n"));
 		expect(output).toContain("Connection One");
 		expect(output).not.toContain("Local One");
+		expect(refresh).not.toHaveBeenCalled();
+
+		selector.updateAvailableModels([connectionModel]);
+
+		expect(refresh).not.toHaveBeenCalled();
+	});
+
+	it("updates injected models without clearing the current search", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "alpha", name: "Alpha", reasoning: true },
+				{ id: "beta", name: "Beta", reasoning: true },
+			],
+		});
+		harnesses.push(harness);
+
+		const alpha = harness.getModel("alpha")!;
+		const beta = harness.getModel("beta")!;
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			undefined,
+			harness.session.modelRegistry,
+			[],
+			() => {},
+			() => {},
+			"beta",
+			{
+				availableModels: [alpha],
+			},
+		);
+
+		await waitForAsyncRender();
+		expect(stripAnsi(selector.render(120).join("\n"))).not.toContain("Beta");
+
+		await selector.updateAvailableModels([beta]);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(selector.getSearchInput().getValue()).toBe("beta");
+		expect(output).toContain("beta");
+		expect(output).toContain("Beta");
+	});
+
+	it("keeps an empty injected model snapshot empty instead of falling back to local models", async () => {
+		const harness = await createHarness({
+			models: [{ id: "alpha", name: "Alpha", reasoning: true }],
+		});
+		harnesses.push(harness);
+
+		const alpha = harness.getModel("alpha")!;
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			undefined,
+			harness.session.modelRegistry,
+			[],
+			() => {},
+			() => {},
+			undefined,
+			{
+				availableModels: [alpha],
+			},
+		);
+
+		await waitForAsyncRender();
+		expect(stripAnsi(selector.render(120).join("\n"))).toContain("Alpha");
+
+		await selector.updateAvailableModels([]);
+
+		const output = stripAnsi(selector.render(120).join("\n"));
+		expect(output).not.toContain("Alpha");
+		expect(output).toContain("No matching models");
 	});
 
 	it("keeps the model menu within a short terminal viewport", async () => {

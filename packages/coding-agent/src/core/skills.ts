@@ -1,3 +1,4 @@
+import { getLogger } from "@earendil-works/pi-ai";
 import { existsSync, readdirSync, readFileSync, statSync } from "fs";
 import ignore from "ignore";
 import { homedir } from "os";
@@ -7,6 +8,8 @@ import { parseFrontmatter } from "../utils/frontmatter.js";
 import { canonicalizePath } from "../utils/paths.js";
 import type { ResourceDiagnostic } from "./diagnostics.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
+
+const log = getLogger("coding-agent.skills");
 
 /** Max name length per spec */
 const MAX_NAME_LENGTH = 64;
@@ -61,7 +64,9 @@ function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
 			if (patterns.length > 0) {
 				ig.add(patterns);
 			}
-		} catch {}
+		} catch {
+			// Unreadable ignore file: skip it rather than failing skill discovery.
+		}
 	}
 }
 
@@ -371,7 +376,12 @@ function loadSkillsFromDirInternal(
 			}
 			diagnostics.push(...result.diagnostics);
 		}
-	} catch {}
+	} catch (error) {
+		log.warn("skill directory scan failed", {
+			dir,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
 
 	return { skills, diagnostics };
 }

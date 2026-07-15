@@ -873,7 +873,7 @@ interface SessionInfoCacheEntry {
 // content: cache list metadata and rescan only files that changed.
 const sessionInfoCache = new Map<string, SessionInfoCacheEntry>();
 
-async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
+export async function readSessionInfo(filePath: string): Promise<SessionInfo | null> {
 	let stats: Awaited<ReturnType<typeof stat>>;
 	try {
 		stats = await stat(filePath);
@@ -999,10 +999,16 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 }
 
 export type SessionListProgress = (loaded: number, total: number) => void;
+export type SessionListItem = (session: SessionInfo) => void;
+
+export interface SessionListCallbacks {
+	onProgress?: SessionListProgress;
+	onSession?: SessionListItem;
+}
 
 async function listSessionsFromDir(
 	dir: string,
-	onProgress?: SessionListProgress,
+	callbacks?: SessionListCallbacks,
 	progressOffset = 0,
 	progressTotal?: number,
 ): Promise<SessionInfo[]> {
@@ -1026,11 +1032,12 @@ async function listSessionsFromDir(
 
 		let loaded = 0;
 		for (const file of files) {
-			const info = await buildSessionInfo(file);
+			const info = await readSessionInfo(file);
 			loaded++;
-			onProgress?.(progressOffset + loaded, total);
+			callbacks?.onProgress?.(progressOffset + loaded, total);
 			if (info) {
 				sessions.push(info);
+				callbacks?.onSession?.(info);
 			}
 		}
 	} catch {
@@ -1119,7 +1126,7 @@ export class SessionManager {
 		} else {
 			const explicitPath = this.sessionFile;
 			this.newSession();
-			this.sessionFile = explicitPath; // preserve explicit path from --session flag
+			this.sessionFile = explicitPath; // preserve explicit path from --resume selector
 		}
 	}
 
@@ -1233,6 +1240,35 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
+	materializeSessionFile(sessionDir?: string): string {
+		if (this.sessionFile) {
+			return this.sessionFile;
+		}
+		const dir = sessionDir ?? (this.sessionDir || getDefaultSessionDir(this.cwd));
+		if (!existsSync(dir)) {
+			mkdirSync(dir, { recursive: true });
+		}
+		const target = createUniqueSessionFileTarget(dir);
+		this.sessionDir = dir;
+		this.sessionId = target.sessionId;
+		this.sessionFile = target.sessionFile;
+		this.persist = true;
+		const timestamp = new Date().toISOString();
+		const git = captureGitContext(this.cwd) ?? undefined;
+		const header: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: this.sessionId,
+			timestamp,
+			cwd: this.cwd,
+			git,
+		};
+		this.fileEntries = [header, ...this.getEntries()];
+		this._rewriteFile();
+		this.flushed = true;
+		return this.sessionFile;
+	}
+
 	getSessionArtifactDir(): string | undefined {
 		return this.persist ? getSessionArtifactPath(this.sessionDir, this.sessionId) : undefined;
 	}
@@ -1241,7 +1277,7 @@ export class SessionManager {
 		if (!this.persist || !this.sessionFile) return;
 
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-		const shouldPersistWithoutAssistant = entry.type === "session_state";
+		const shouldPersistWithoutAssistant = entry.type === "session_state" || entry.type === "session_info";
 		if (!hasAssistant && !shouldPersistWithoutAssistant) {
 			// Mark as not flushed so when assistant arrives, all entries get written
 			this.flushed = false;
@@ -2011,25 +2047,35 @@ export class SessionManager {
 	 * List all sessions for a directory.
 	 * @param cwd Working directory (used to compute default session directory)
 	 * @param sessionDir Optional session directory. If omitted, uses the configured session root.
-	 * @param onProgress Optional callback for progress updates (loaded, total)
+	 * @param callbacks Optional callbacks for progress and discovered sessions
 	 */
-	static async list(cwd: string, sessionDir?: string, onProgress?: SessionListProgress): Promise<SessionInfo[]> {
+	static async list(cwd: string, sessionDir?: string, callbacks?: SessionListCallbacks): Promise<SessionInfo[]> {
 		const dir = sessionDir ?? getDefaultSessionDir(cwd);
-		const sessions = (await listSessionsFromDir(dir, onProgress)).filter((session) =>
-			sessionInfoMatchesCwd(session, cwd),
-		);
+		const matchesCwd = (session: SessionInfo) => sessionInfoMatchesCwd(session, cwd);
+		const sessions = (
+			await listSessionsFromDir(dir, {
+				onProgress: callbacks?.onProgress,
+				onSession: callbacks?.onSession
+					? (session) => {
+							if (matchesCwd(session)) {
+								callbacks.onSession?.(session);
+							}
+						}
+					: undefined,
+			})
+		).filter(matchesCwd);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 		return sessions;
 	}
 
 	/**
 	 * List all sessions across all project directories.
-	 * @param onProgress Optional callback for progress updates (loaded, total)
+	 * @param callbacks Optional callbacks for progress and discovered sessions
 	 * @param sessionDir Optional session root. If omitted, uses the configured session root.
 	 */
-	static async listAll(onProgress?: SessionListProgress, sessionDir?: string): Promise<SessionInfo[]> {
+	static async listAll(callbacks?: SessionListCallbacks, sessionDir?: string): Promise<SessionInfo[]> {
 		const sessionsDir = sessionDir ?? getSessionsDir();
-		const sessions = await listSessionsFromDir(sessionsDir, onProgress);
+		const sessions = await listSessionsFromDir(sessionsDir, callbacks);
 		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 		return sessions;
 	}

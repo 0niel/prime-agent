@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntimeConfig } from "../src/core/agent-session-config.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
+import type { SessionInfo } from "../src/core/session-manager.js";
 import type { SettingsManager } from "../src/core/settings-manager.js";
 import {
 	createAgentsViewListCommand,
@@ -12,8 +13,11 @@ import {
 	createAgentsViewSessionName,
 	formatAgentsViewRelativeTime,
 	formatAgentsViewStatusLine,
+	resolveAgentsViewActiveSummaryForPath,
 	resolveAgentsViewOpenCwd,
+	resolveAgentsViewResumeSummary,
 	resolveAgentsViewSessionUiServices,
+	shouldReconnectAgentsViewDaemon,
 } from "../src/modes/agents-view/agents-view-mode.js";
 import {
 	buildAgentsViewRows,
@@ -510,6 +514,74 @@ describe("agents view state", () => {
 		expect(createAgentsViewListCommand()).toEqual({ type: "list" });
 	});
 
+	test("creates an inactive summary for a saved session selected from resume", () => {
+		const savedSession = makeSessionInfo({
+			path: "/tmp/sessions/saved.jsonl",
+			id: "saved",
+			name: "Saved session",
+			cwd: "/tmp/project",
+			messageCount: 2,
+			agentStatus: {
+				summary: "Finished the task",
+				taskState: "completed",
+				basedOnMessageCount: 2,
+			},
+		});
+
+		const summary = resolveAgentsViewResumeSummary(savedSession.path, [savedSession], []);
+
+		expect(summary).toMatchObject({
+			id: "saved",
+			activity: "idle",
+			sessionId: "saved",
+			sessionFile: savedSession.path,
+			sessionName: "Saved session",
+			cwd: "/tmp/project",
+			summary: "Finished the task",
+			taskState: "completed",
+		});
+		expect(summary?.activeSessionId).toBeUndefined();
+		expect(summary?.lifecycle).toBe("live");
+	});
+
+	test("reuses the live daemon summary when resuming an already-active saved session", () => {
+		const savedSession = makeSessionInfo({
+			path: "/tmp/sessions/active.jsonl",
+			id: "saved-active",
+			cwd: "/tmp/project",
+		});
+		const activeSummary = makeSummary({
+			id: "active-runtime",
+			activeSessionId: "active-runtime",
+			sessionId: "saved-active",
+			sessionFile: savedSession.path,
+			sessionName: "Running",
+		});
+
+		expect(resolveAgentsViewResumeSummary(savedSession.path, [savedSession], [activeSummary])).toBe(activeSummary);
+	});
+
+	test("resolves active summaries by session file path", () => {
+		const activeSummary = makeSummary({
+			id: "active-runtime",
+			activeSessionId: "active-runtime",
+			sessionId: "saved-active",
+			sessionFile: "/tmp/sessions/active.jsonl",
+			sessionName: "Running",
+		});
+		const inactiveSummary = makeSummary({
+			id: "inactive",
+			activeSessionId: undefined,
+			sessionId: "inactive",
+			sessionFile: "/tmp/sessions/inactive.jsonl",
+		});
+
+		expect(
+			resolveAgentsViewActiveSummaryForPath("/tmp/sessions/active.jsonl", [inactiveSummary, activeSummary]),
+		).toBe(activeSummary);
+		expect(resolveAgentsViewActiveSummaryForPath("/tmp/sessions/inactive.jsonl", [inactiveSummary])).toBeUndefined();
+	});
+
 	test("derives the reply headline from the first line of the latest assistant text", () => {
 		expect(createAgentsViewReplyHeadline("  Done.\nNext step?  ")).toBe("Done.");
 		expect(createAgentsViewReplyHeadline("\n\n  spread   over \nlines")).toBe("spread over");
@@ -536,6 +608,12 @@ describe("agents view state", () => {
 		);
 		expect(formatAgentsViewStatusLine("  already   flat  ")).toBe("already flat");
 		expect(formatAgentsViewStatusLine("\n \r\n ")).toBe("");
+	});
+
+	test("reconnects daemon restarts and crashes but stops after an intentional shutdown", () => {
+		expect(shouldReconnectAgentsViewDaemon("update")).toBe(true);
+		expect(shouldReconnectAgentsViewDaemon(undefined)).toBe(true);
+		expect(shouldReconnectAgentsViewDaemon("shutdown")).toBe(false);
 	});
 
 	test("caps generated session names at the configured limit", () => {
@@ -633,6 +711,23 @@ function makeSummary(overrides: Partial<SessionSummary>): SessionSummary {
 		messageCount: 1,
 		pendingMessageCount: 0,
 		...overrides,
+	};
+}
+
+function makeSessionInfo(overrides: Partial<SessionInfo> & { path: string; id: string }): SessionInfo {
+	return {
+		path: overrides.path,
+		id: overrides.id,
+		cwd: overrides.cwd ?? "/tmp/project",
+		name: overrides.name,
+		state: overrides.state,
+		parentSessionPath: overrides.parentSessionPath,
+		created: overrides.created ?? new Date("2026-01-01T00:00:00Z"),
+		modified: overrides.modified ?? new Date("2026-01-01T00:00:00Z"),
+		messageCount: overrides.messageCount ?? 1,
+		firstMessage: overrides.firstMessage ?? "hello",
+		allMessagesText: overrides.allMessagesText ?? "hello",
+		agentStatus: overrides.agentStatus,
 	};
 }
 

@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { delimiter } from "node:path";
 import { spawn, spawnSync } from "child_process";
 import { getBinDir } from "../config.js";
+import { recordOrphanProcessState } from "../core/orphan-process-journal.js";
 
 export interface ShellConfig {
 	shell: string;
@@ -167,15 +168,18 @@ const trackedDetachedChildPids = new Set<number>();
 
 export function trackDetachedChildPid(pid: number): void {
 	trackedDetachedChildPids.add(pid);
+	recordOrphanProcessState(pid, true);
 }
 
 export function untrackDetachedChildPid(pid: number): void {
 	trackedDetachedChildPids.delete(pid);
+	recordOrphanProcessState(pid, false);
 }
 
 export function killTrackedDetachedChildren(): void {
 	for (const pid of trackedDetachedChildPids) {
 		killProcessTree(pid);
+		recordOrphanProcessState(pid, false);
 	}
 	trackedDetachedChildPids.clear();
 }

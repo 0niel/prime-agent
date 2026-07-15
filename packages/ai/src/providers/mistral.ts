@@ -26,6 +26,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { shortHash } from "../utils/hash.js";
 import { parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
+import { recordStreamFailure, streamFailureFromStopReason } from "../utils/stream-failure.js";
 import { buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 
@@ -85,7 +86,7 @@ export const streamMistral: StreamFunction<"mistral-conversations", MistralOptio
 			}
 
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
-				throw new Error("An unknown error occurred");
+				throw streamFailureFromStopReason(output.stopReasonRaw);
 			}
 
 			stream.push({ type: "done", reason: output.stopReason, message: output });
@@ -97,6 +98,7 @@ export const streamMistral: StreamFunction<"mistral-conversations", MistralOptio
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = formatMistralError(error);
+			recordStreamFailure(model, output, error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -319,6 +321,9 @@ async function consumeChatStream(
 
 		if (choice.finishReason) {
 			output.stopReason = mapChatStopReason(choice.finishReason);
+			if (output.stopReason === "error") {
+				output.stopReasonRaw = choice.finishReason;
+			}
 		}
 
 		const delta = choice.delta;

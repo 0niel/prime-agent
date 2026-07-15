@@ -148,6 +148,7 @@ export class LoginDialogComponent extends Container implements Focusable {
 		this.addLabel("Sign-in link");
 		const linkedUrl = getCapabilities().hyperlinks ? `\x1b]8;;${url}\x07${url}\x1b]8;;\x07` : url;
 		this.contentContainer.addChild(new Text(theme.fg("text", linkedUrl), 0, 0));
+		this.contentContainer.addChild(new Text(theme.fg("muted", keyHint("tui.select.cancel", "cancel")), 0, 0));
 
 		if (instructions) {
 			this.contentContainer.addChild(new Spacer(1));

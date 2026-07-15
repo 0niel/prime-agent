@@ -25,6 +25,11 @@ import { filterAndSortSessions, hasSessionName, type NameFilter, type SortMode }
 
 type SessionScope = "current" | "all";
 
+export interface SessionListCallbacks {
+	onProgress?: AgentConnectionSessionListProgress;
+	onSession?: (session: AgentConnectionSavedSessionInfo) => void;
+}
+
 // Mirrors the agents view delete flow: press the delete key once to arm, again
 // within this window to confirm; anything else (or the timeout) cancels.
 const DELETE_CONFIRM_DURATION_MS = 2000;
@@ -57,6 +62,10 @@ function formatSessionDate(date: Date): string {
 function canonicalizePath(path: string | undefined): string | undefined {
 	if (!path) return path;
 	return _canonicalizePath(path);
+}
+
+function formatMutationError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 class SessionSelectorHeader implements Component {
@@ -129,6 +138,7 @@ class SessionSelectorHeader implements Component {
 			this.statusTimeout = null;
 			this.requestRender();
 		}, autoHideMs);
+		this.statusTimeout.unref?.();
 	}
 
 	invalidate(): void {}
@@ -281,6 +291,7 @@ class SessionList implements Component, Focusable {
 	private nameFilter: NameFilter = "all";
 	private keybindings: KeybindingsManager;
 	private showPath = false;
+	private streaming = false;
 	private confirmingDeletePath: string | null = null;
 	private deleteConfirmTimer: ReturnType<typeof setTimeout> | null = null;
 	private currentSessionCanonicalPath?: string;
@@ -350,10 +361,18 @@ class SessionList implements Component, Focusable {
 		this.filterSessions(this.searchInput.getValue());
 	}
 
-	setSessions(sessions: AgentConnectionSavedSessionInfo[], showCwd: boolean): void {
+	setSessions(sessions: AgentConnectionSavedSessionInfo[], showCwd: boolean, streaming = false): void {
+		const selectedPath = this.getSelectedSessionPath();
 		this.allSessions = sessions;
 		this.showCwd = showCwd;
+		this.streaming = streaming;
 		this.filterSessions(this.searchInput.getValue());
+		if (selectedPath) {
+			const selectedIndex = this.filteredSessions.findIndex((session) => session.session.path === selectedPath);
+			if (selectedIndex >= 0) {
+				this.selectedIndex = selectedIndex;
+			}
+		}
 	}
 
 	private filterSessions(query: string): void {
@@ -361,7 +380,7 @@ class SessionList implements Component, Focusable {
 		const nameFiltered =
 			this.nameFilter === "all" ? this.allSessions : this.allSessions.filter((session) => hasSessionName(session));
 
-		if (this.sortMode === "threaded" && !trimmed) {
+		if (this.sortMode === "threaded" && !trimmed && !this.streaming) {
 			// Threaded mode without search: show tree structure
 			const roots = buildSessionTree(nameFiltered);
 			this.filteredSessions = flattenSessionTree(roots);
@@ -647,7 +666,7 @@ class SessionList implements Component, Focusable {
 	}
 }
 
-type SessionsLoader = (onProgress?: AgentConnectionSessionListProgress) => Promise<AgentConnectionSavedSessionInfo[]>;
+type SessionsLoader = (callbacks?: SessionListCallbacks) => Promise<AgentConnectionSavedSessionInfo[]>;
 type SessionDeleter = (sessionPath: string) => Promise<DeleteSessionFileResult>;
 
 /**
@@ -686,6 +705,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 	private deleteSession: SessionDeleter;
 	private currentLoading = false;
 	private allLoading = false;
+	private currentLoadSeq = 0;
 	private allLoadSeq = 0;
 
 	private mode: "list" | "rename" = "list";
@@ -814,7 +834,17 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 		// Handle session deletion
 		this.sessionList.onDeleteSession = async (sessionPath: string) => {
-			const result = await this.deleteSession(sessionPath);
+			let result: DeleteSessionFileResult;
+			try {
+				result = await this.deleteSession(sessionPath);
+			} catch (error) {
+				this.header.setStatusMessage(
+					{ type: "error", message: `Failed to delete: ${formatMutationError(error)}` },
+					3000,
+				);
+				this.requestRender();
+				return;
+			}
 
 			if (result.ok) {
 				if (this.currentSessions) {
@@ -826,11 +856,19 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 				const sessions = this.scope === "all" ? (this.allSessions ?? []) : (this.currentSessions ?? []);
 				const showCwd = this.scope === "all";
-				this.sessionList.setSessions(sessions, showCwd);
+				const streaming = this.scope === "all" ? this.allLoading : this.currentLoading;
+				this.sessionList.setSessions(sessions, showCwd, streaming);
 
 				const msg = result.method === "trash" ? "Session moved to trash" : "Session deleted";
-				this.header.setStatusMessage({ type: "info", message: msg }, 2000);
-				await this.refreshSessionsAfterMutation();
+				try {
+					await this.refreshSessionsAfterMutation();
+					this.header.setStatusMessage({ type: "info", message: msg }, 2000);
+				} catch (error) {
+					this.header.setStatusMessage(
+						{ type: "error", message: `${msg}; refresh failed: ${formatMutationError(error)}` },
+						3000,
+					);
+				}
 			} else {
 				const errorMessage = result.error ?? "Unknown error";
 				this.header.setStatusMessage({ type: "error", message: `Failed to delete: ${errorMessage}` }, 3000);
@@ -897,10 +935,29 @@ export class SessionSelectorComponent extends Container implements Focusable {
 
 		try {
 			await renameSession(target, next);
-			await this.refreshSessionsAfterMutation();
-		} finally {
+		} catch (error) {
 			this.exitRenameMode();
+			this.header.setStatusMessage(
+				{ type: "error", message: `Failed to rename: ${formatMutationError(error)}` },
+				4000,
+			);
+			this.requestRender();
+			return;
 		}
+
+		try {
+			await this.refreshSessionsAfterMutation();
+		} catch (error) {
+			this.exitRenameMode();
+			this.header.setStatusMessage(
+				{ type: "error", message: `Session renamed; refresh failed: ${formatMutationError(error)}` },
+				4000,
+			);
+			this.requestRender();
+			return;
+		}
+
+		this.exitRenameMode();
 	}
 
 	private async loadScope(scope: SessionScope, reason: "initial" | "refresh" | "toggle"): Promise<void> {
@@ -913,22 +970,38 @@ export class SessionSelectorComponent extends Container implements Focusable {
 			this.allLoading = true;
 		}
 
-		const seq = scope === "all" ? ++this.allLoadSeq : undefined;
+		const seq = scope === "current" ? ++this.currentLoadSeq : ++this.allLoadSeq;
 		this.header.setScope(scope);
 		this.header.setLoading(true);
 		this.requestRender();
+		const isLatestLoad = () => seq === (scope === "current" ? this.currentLoadSeq : this.allLoadSeq);
+		const isCurrentView = () => scope === this.scope;
+		const streamedSessions = new Map<string, AgentConnectionSavedSessionInfo>();
 
 		const onProgress = (loaded: number, total: number) => {
-			if (scope !== this.scope) return;
-			if (seq !== undefined && seq !== this.allLoadSeq) return;
+			if (!isLatestLoad() || !isCurrentView()) return;
 			this.header.setProgress(loaded, total);
+			this.requestRender();
+		};
+		const onSession = (session: AgentConnectionSavedSessionInfo) => {
+			if (reason === "refresh" || !isLatestLoad() || !isCurrentView()) return;
+			streamedSessions.set(session.path, session);
+			const sessions = [...streamedSessions.values()];
+			if (scope === "current") {
+				this.currentSessions = sessions;
+			} else {
+				this.allSessions = sessions;
+			}
+			this.sessionList.setSessions(sessions, showCwd, true);
 			this.requestRender();
 		};
 
 		try {
 			const sessions = await (scope === "current"
-				? this.currentSessionsLoader(onProgress)
-				: this.allSessionsLoader(onProgress));
+				? this.currentSessionsLoader({ onProgress, onSession })
+				: this.allSessionsLoader({ onProgress, onSession }));
+
+			if (!isLatestLoad()) return;
 
 			if (scope === "current") {
 				this.currentSessions = sessions;
@@ -938,8 +1011,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 				this.allLoading = false;
 			}
 
-			if (scope !== this.scope) return;
-			if (seq !== undefined && seq !== this.allLoadSeq) return;
+			if (!isCurrentView()) return;
 
 			this.header.setLoading(false);
 			this.sessionList.setSessions(sessions, showCwd);
@@ -949,14 +1021,15 @@ export class SessionSelectorComponent extends Container implements Focusable {
 				this.onCancel();
 			}
 		} catch (err) {
+			if (!isLatestLoad()) return;
+
 			if (scope === "current") {
 				this.currentLoading = false;
 			} else {
 				this.allLoading = false;
 			}
 
-			if (scope !== this.scope) return;
-			if (seq !== undefined && seq !== this.allLoadSeq) return;
+			if (!isCurrentView()) return;
 
 			const message = err instanceof Error ? err.message : String(err);
 			this.header.setLoading(false);
@@ -994,8 +1067,8 @@ export class SessionSelectorComponent extends Container implements Focusable {
 			this.header.setScope(this.scope);
 
 			if (this.allSessions !== null) {
-				this.header.setLoading(false);
-				this.sessionList.setSessions(this.allSessions, true);
+				this.header.setLoading(this.allLoading);
+				this.sessionList.setSessions(this.allSessions, true, this.allLoading);
 				this.requestRender();
 				return;
 			}

@@ -1,5 +1,14 @@
-import { Container, type Focusable, fuzzyFilter, getKeybindings, Spacer, TruncatedText } from "@earendil-works/pi-tui";
+import {
+	type Component,
+	Container,
+	type Focusable,
+	fuzzyFilter,
+	getKeybindings,
+	Spacer,
+	TruncatedText,
+} from "@earendil-works/pi-tui";
 import type { AuthStatus, AuthStorage } from "../../../core/auth-storage.js";
+import { PRIME_INFERENCE_PROVIDER_ID } from "../../../core/prime-inference-auth.js";
 import { theme } from "../theme/theme.js";
 import {
 	getMenuListLayout,
@@ -20,6 +29,15 @@ export type AuthSelectorProvider = {
 	category?: AuthSelectorCategory;
 };
 
+export interface OAuthSelectorOptions extends MenuViewportProvider {
+	initialCategory?: AuthSelectorCategory;
+	header?: Component;
+	getHeaderRows?: () => number;
+	title?: string;
+	subtitle?: string;
+	searchPlaceholder?: string;
+}
+
 export function compareAuthSelectorProviders(a: AuthSelectorProvider, b: AuthSelectorProvider): number {
 	if (a.authType !== b.authType) {
 		return a.authType === "oauth" ? -1 : 1;
@@ -29,7 +47,7 @@ export function compareAuthSelectorProviders(a: AuthSelectorProvider, b: AuthSel
 
 const PREFERRED_VISIBLE_PROVIDERS = 8;
 const PROVIDER_LIST_RESERVED_ROWS = 7;
-/** Extra fixed rows the Providers/Services tab bar (text + spacer) consumes. */
+/** Extra fixed rows the Providers/MCP Connections tab bar (text + spacer) consumes. */
 const TAB_BAR_RESERVED_ROWS = 2;
 const PROVIDER_SCROLL_INDICATOR_ROWS = 1;
 
@@ -69,6 +87,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		compactItemRows: 2,
 	});
 	private readonly viewport: MenuViewportProvider;
+	private readonly getHeaderRows: () => number;
 
 	constructor(
 		mode: "login" | "logout",
@@ -77,14 +96,15 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		onSelect: (provider: AuthSelectorProvider) => void,
 		onCancel: () => void,
 		getAuthStatus?: (providerId: string) => AuthStatus,
-		viewport: MenuViewportProvider = {},
+		options: OAuthSelectorOptions = {},
 	) {
 		super();
 
 		this.mode = mode;
 		this.authStorage = authStorage;
 		this.getAuthStatus = getAuthStatus ?? ((providerId) => this.authStorage.getAuthStatus(providerId));
-		this.viewport = viewport;
+		this.viewport = options;
+		this.getHeaderRows = options.header ? (options.getHeaderRows ?? (() => TAB_BAR_RESERVED_ROWS)) : () => 0;
 		this.allProviders = this.sortProviders(providers);
 		this.filteredProviders = this.allProviders;
 		this.onSelectCallback = onSelect;
@@ -92,13 +112,22 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 
 		const present = new Set(providers.map((p) => p.category ?? "provider"));
 		this.categories = (["provider", "service"] as const).filter((c) => present.has(c));
-		this.activeCategory = this.categories[0] ?? "provider";
+		this.activeCategory =
+			options.initialCategory && this.categories.includes(options.initialCategory)
+				? options.initialCategory
+				: (this.categories[0] ?? "provider");
 
 		const panel = new MenuPanel({
-			title: mode === "login" ? "Providers" : "Saved Credentials",
-			subtitle: mode === "login" ? "Connect with a subscription or API key." : "Choose a credential to remove.",
+			title: options.title ?? (mode === "login" ? "Providers" : "Saved Credentials"),
+			subtitle:
+				options.subtitle ??
+				(mode === "login" ? "Connect with a subscription or API key." : "Choose a credential to remove."),
 		});
 		this.addChild(panel);
+		if (options.header) {
+			panel.addChild(options.header);
+			panel.addChild(new Spacer(1));
+		}
 
 		if (this.categories.length > 1) {
 			this.tabBar = new TruncatedText("");
@@ -106,7 +135,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			panel.addChild(new Spacer(1));
 		}
 
-		this.searchInput = new MenuSearchInput("Search providers");
+		this.searchInput = new MenuSearchInput(options.searchPlaceholder ?? "Search providers");
 		this.searchInput.onSubmit = () => {
 			const selectedProvider = this.filteredProviders[this.selectedIndex];
 			if (selectedProvider) {
@@ -140,7 +169,10 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 
 	private updateTabBar(): void {
 		if (!this.tabBar) return;
-		const labels: Record<AuthSelectorCategory, string> = { provider: "Providers", service: "Services" };
+		const labels: Record<AuthSelectorCategory, string> = {
+			provider: "Providers",
+			service: "MCP Connections",
+		};
 		const rendered = this.categories
 			.map((category) =>
 				category === this.activeCategory
@@ -163,23 +195,72 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 
 	private sortProviders(providers: AuthSelectorProvider[]): AuthSelectorProvider[] {
 		return [...providers].sort((a, b) => {
-			const configuredDelta = Number(this.isProviderConfigured(b)) - Number(this.isProviderConfigured(a));
-			if (configuredDelta !== 0) {
-				return configuredDelta;
+			const rankDelta = this.getProviderSortRank(a) - this.getProviderSortRank(b);
+			if (rankDelta !== 0) {
+				return rankDelta;
+			}
+			if (this.mode === "login" && a.id !== b.id) {
+				if (a.id === PRIME_INFERENCE_PROVIDER_ID) return -1;
+				if (b.id === PRIME_INFERENCE_PROVIDER_ID) return 1;
 			}
 			return compareAuthSelectorProviders(a, b);
 		});
 	}
 
-	private isProviderConfigured(provider: AuthSelectorProvider): boolean {
+	refresh(): void {
+		const selected = this.filteredProviders[this.selectedIndex];
+		this.allProviders = this.sortProviders(this.allProviders);
+		this.filterProviders(this.searchInput.getValue());
+		if (selected) {
+			const selectedIndex = this.filteredProviders.findIndex(
+				(provider) => provider.id === selected.id && provider.authType === selected.authType,
+			);
+			if (selectedIndex >= 0) {
+				this.selectedIndex = selectedIndex;
+				this.updateList();
+			}
+		}
+	}
+
+	getSearchInput(): MenuSearchInput {
+		return this.searchInput;
+	}
+
+	private getProviderSortRank(provider: AuthSelectorProvider): number {
+		if (this.isProviderConfigured(provider)) {
+			return 0;
+		}
+		if (this.isProviderStale(provider)) {
+			return 1;
+		}
+		return 2;
+	}
+
+	private isProviderStale(provider: AuthSelectorProvider): boolean {
+		const status = this.getAuthStatus(provider.id);
 		const credential = this.authStorage.get(provider.id);
+		const storageStatus = this.authStorage.getAuthStatus(provider.id);
+		return status.source === "stale" || (storageStatus.source === "stale" && credential?.type === provider.authType);
+	}
+
+	private isProviderConfigured(provider: AuthSelectorProvider): boolean {
+		const status = this.getAuthStatus(provider.id);
+		const credential = this.authStorage.get(provider.id);
+		if (this.isProviderStale(provider)) {
+			return false;
+		}
+
+		if (status.source && status.source !== "stored") {
+			return provider.authType === "api_key";
+		}
+
 		if (credential) {
 			return true;
 		}
 		if (provider.authType !== "api_key") {
 			return false;
 		}
-		return this.getAuthStatus(provider.id).source !== undefined;
+		return status.source !== undefined;
 	}
 
 	override render(width: number): string[] {
@@ -239,7 +320,18 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 	}
 
 	private formatStatusIndicator(provider: AuthSelectorProvider): string {
+		const status = this.getAuthStatus(provider.id);
 		const credential = this.authStorage.get(provider.id);
+		if (this.isProviderStale(provider)) {
+			return theme.fg("warning", status.label ?? "expired");
+		}
+
+		if (status.source && status.source !== "stored") {
+			return provider.authType === "api_key"
+				? this.formatApiKeyStatusIndicator(status)
+				: theme.fg("muted", "unconfigured");
+		}
+
 		if (credential?.type === provider.authType) return theme.fg("success", "configured");
 		if (credential) {
 			const label = credential.type === "oauth" ? "subscription configured" : "API key configured";
@@ -247,7 +339,10 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		}
 		if (provider.authType !== "api_key") return theme.fg("muted", "unconfigured");
 
-		const status = this.getAuthStatus(provider.id);
+		return this.formatApiKeyStatusIndicator(status);
+	}
+
+	private formatApiKeyStatusIndicator(status: AuthStatus): string {
 		switch (status.source) {
 			case "environment":
 				return theme.fg("success", `env: ${status.label ?? "API key"}`);
@@ -314,7 +409,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 	}
 
 	private get reservedRows(): number {
-		return this.tabBar ? PROVIDER_LIST_RESERVED_ROWS + TAB_BAR_RESERVED_ROWS : PROVIDER_LIST_RESERVED_ROWS;
+		return PROVIDER_LIST_RESERVED_ROWS + this.getHeaderRows() + (this.tabBar ? TAB_BAR_RESERVED_ROWS : 0);
 	}
 
 	private updateLayout(): void {

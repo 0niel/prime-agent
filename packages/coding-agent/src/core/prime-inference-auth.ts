@@ -1,8 +1,18 @@
 import { Buffer } from "node:buffer";
 import { constants, generateKeyPairSync, privateDecrypt } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import {
+	chmodSync,
+	closeSync,
+	existsSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { OAuthAuthInfo } from "@earendil-works/pi-ai";
 
 export const PRIME_INFERENCE_PROVIDER_ID = "prime-inference";
@@ -80,6 +90,10 @@ function defaultPrimeCliConfigPath(): string {
 	return join(homedir(), ".prime", "config.json");
 }
 
+export function getPrimeCliConfigPath(configPath?: string): string {
+	return configPath ?? defaultPrimeCliConfigPath();
+}
+
 function normalizeBaseUrl(value: string | undefined): string {
 	return (value?.trim() || DEFAULT_PRIME_API_BASE_URL).replace(/\/+$/, "").replace(/\/api\/v1$/, "");
 }
@@ -122,6 +136,39 @@ function readPrimeCliConfigData(configPath: string): Record<string, unknown> {
 	return data;
 }
 
+function writePrimeCliConfigData(configPath: string, data: Record<string, unknown>): void {
+	const dir = dirname(configPath);
+	if (!existsSync(dir)) {
+		mkdirSync(dir, { recursive: true, mode: 0o700 });
+	}
+	const tempPath = join(
+		dir,
+		`.${basename(configPath)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`,
+	);
+	let fd: number | undefined = openSync(tempPath, "wx", 0o600);
+	try {
+		writeFileSync(fd, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
+		closeSync(fd);
+		fd = undefined;
+		chmodSync(tempPath, 0o600);
+		renameSync(tempPath, configPath);
+		chmodSync(configPath, 0o600);
+	} finally {
+		if (fd !== undefined) {
+			closeSync(fd);
+		}
+		if (existsSync(tempPath)) {
+			rmSync(tempPath, { force: true });
+		}
+	}
+}
+
+function clearPrimeTeamFields(data: Record<string, unknown>): void {
+	delete data.team_id;
+	delete data.team_name;
+	delete data.team_role;
+}
+
 export function loadPrimeCliConfig(configPath: string = defaultPrimeCliConfigPath()): PrimeCliConfig {
 	const data = readPrimeCliConfigData(configPath);
 	const teamIdFromEnv = stringEnv("PRIME_TEAM_ID");
@@ -152,6 +199,42 @@ export function loadPrimeCliConfig(configPath: string = defaultPrimeCliConfigPat
 		}
 	}
 	return config;
+}
+
+export function savePrimeCliApiKey(apiKey: string, configPath: string = defaultPrimeCliConfigPath()): PrimeCliConfig {
+	const data = readPrimeCliConfigData(configPath);
+	data.api_key = apiKey;
+	clearPrimeTeamFields(data);
+	writePrimeCliConfigData(configPath, data);
+	return loadPrimeCliConfig(configPath);
+}
+
+export function clearPrimeCliCredentials(configPath: string = defaultPrimeCliConfigPath()): PrimeCliConfig {
+	const data = readPrimeCliConfigData(configPath);
+	delete data.api_key;
+	clearPrimeTeamFields(data);
+	writePrimeCliConfigData(configPath, data);
+	return loadPrimeCliConfig(configPath);
+}
+
+export function savePrimeCliTeamSelection(
+	team: PrimeTeam | null,
+	configPath: string = defaultPrimeCliConfigPath(),
+): PrimeCliConfig {
+	const data = readPrimeCliConfigData(configPath);
+	if (team) {
+		data.team_id = team.teamId;
+		data.team_name = team.name;
+		if (team.role) {
+			data.team_role = team.role;
+		} else {
+			delete data.team_role;
+		}
+	} else {
+		clearPrimeTeamFields(data);
+	}
+	writePrimeCliConfigData(configPath, data);
+	return loadPrimeCliConfig(configPath);
 }
 
 export function resolvePrimeAgentTracesBaseUrl(baseUrl?: string): string {

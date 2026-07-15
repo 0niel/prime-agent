@@ -3,6 +3,7 @@ export { InProcessAgentConnection } from "./in-process-agent-connection.js";
 export { createAgentConnectionCommands, createAgentConnectionState } from "./snapshot.js";
 export type {
 	AgentConnection,
+	AgentConnectionAgentStatus,
 	AgentConnectionArtifactReference,
 	AgentConnectionArtifactType,
 	AgentConnectionBeforeSessionInvalidateListener,
@@ -51,11 +52,13 @@ export type {
 	AgentConnectionSessionEntryBase,
 	AgentConnectionSessionEvent,
 	AgentConnectionSessionInfoEntry,
+	AgentConnectionSessionListCallbacks,
 	AgentConnectionSessionListProgress,
 	AgentConnectionSessionMessageEntry,
 	AgentConnectionSessionStateEntry,
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSessionWatcher,
+	AgentConnectionSideQuestionEvent,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
 	AgentConnectionSourceInfo,

@@ -31,6 +31,15 @@ import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
+import {
+	classifyStreamFailure,
+	formatStreamFailureMessage,
+	recordStreamFailure,
+	StreamFailureError,
+	streamFailureFromStopReason,
+	streamFailureMessage,
+	truncateRawPayload,
+} from "../utils/stream-failure.js";
 
 import { resolveCloudflareBaseUrl } from "./cloudflare.js";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.js";
@@ -377,9 +386,32 @@ async function* iterateSseMessages(
 	}
 }
 
+/** Turn an in-stream `error` SSE event (how Anthropic delivers overloads etc.) into a classified failure. */
+function anthropicSseError(data: string, requestId?: string): StreamFailureError {
+	let errorType: string | undefined;
+	let detail: string | undefined;
+	try {
+		const parsed = parseJsonWithRepair<{ error?: { type?: string; message?: string }; request_id?: string }>(data);
+		errorType = parsed.error?.type;
+		detail = parsed.error?.message;
+		// Proxies may strip the request-id header; the error body carries it too.
+		requestId ??= typeof parsed.request_id === "string" ? parsed.request_id : undefined;
+	} catch {
+		detail = data;
+	}
+	const info = {
+		kind: classifyStreamFailure(errorType),
+		providerErrorType: errorType,
+		requestId,
+		raw: truncateRawPayload(data),
+	};
+	return new StreamFailureError(streamFailureMessage(info, detail), info);
+}
+
 async function* iterateAnthropicEvents(
 	response: Response,
 	signal?: AbortSignal,
+	requestId?: string,
 ): AsyncGenerator<RawMessageStreamEvent> {
 	if (!response.body) {
 		throw new Error("Attempted to iterate over an Anthropic response with no body");
@@ -390,7 +422,7 @@ async function* iterateAnthropicEvents(
 
 	for await (const sse of iterateSseMessages(response.body, signal)) {
 		if (sse.event === "error") {
-			throw new Error(sse.data);
+			throw anthropicSseError(sse.data, requestId);
 		}
 
 		if (!ANTHROPIC_MESSAGE_EVENTS.has(sse.event ?? "")) {
@@ -407,14 +439,18 @@ async function* iterateAnthropicEvents(
 			yield event;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			throw new Error(
+			throw new StreamFailureError(
 				`Could not parse Anthropic SSE event ${sse.event}: ${message}; data=${sse.data}; raw=${sse.raw.join("\\n")}`,
+				{ kind: "malformed_response", requestId, raw: truncateRawPayload(sse.data) },
 			);
 		}
 	}
 
 	if (sawMessageStart && !sawMessageEnd) {
-		throw new Error("Anthropic stream ended before message_stop");
+		throw new StreamFailureError("Anthropic stream ended before message_stop", {
+			kind: "malformed_response",
+			requestId,
+		});
 	}
 }
 
@@ -486,12 +522,13 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			};
 			const response = await client.messages.create({ ...params, stream: true }, requestOptions).asResponse();
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			const requestId = response.headers.get("request-id") ?? undefined;
 			stream.push({ type: "start", partial: output });
 
 			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
 			const blocks = output.content as Block[];
 
-			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
+			for await (const event of iterateAnthropicEvents(response, options?.signal, requestId)) {
 				if (event.type === "message_start") {
 					output.responseId = event.message.id;
 					// Capture initial token usage from message_start event
@@ -627,6 +664,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 				} else if (event.type === "message_delta") {
 					if (event.delta.stop_reason) {
 						output.stopReason = mapStopReason(event.delta.stop_reason);
+						if (output.stopReason === "error") {
+							output.stopReasonRaw = event.delta.stop_reason;
+						}
 					}
 					// Only update usage fields if present (not null).
 					// Preserves input_tokens from message_start when proxies omit it in message_delta.
@@ -654,7 +694,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 			}
 
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
-				throw new Error("An unknown error occurred");
+				throw streamFailureFromStopReason(output.stopReasonRaw, { requestId });
 			}
 
 			stream.push({ type: "done", reason: output.stopReason, message: output });
@@ -666,7 +706,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			output.errorMessage = formatStreamFailureMessage(error);
+			recordStreamFailure(model, output, error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

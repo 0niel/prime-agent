@@ -2,9 +2,13 @@ import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.js";
+import type { AgentSessionMessageController } from "./agent-messages.js";
+import type { AgentObserveController } from "./agent-observe.js";
 import { installAgentTraceUpload } from "./agent-traces.js";
 import { AuthStorage } from "./auth-storage.js";
+import type { AgentAutonomousConfig } from "./autonomous.js";
 import type { AgentRlmHeartbeatController } from "./cron-jobs.js";
+import { createHerdrAgentStateExtension } from "./extensions/builtin/herdr-agent-state.js";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { McpManager } from "./mcp/mcp-manager.js";
 import { ModelRegistry } from "./model-registry.js";
@@ -41,6 +45,13 @@ export interface CreateAgentSessionServicesOptions {
 	modelRegistry?: ModelRegistry;
 	extensionFlagValues?: Map<string, boolean | string>;
 	resourceLoaderOptions?: Omit<DefaultResourceLoaderOptions, "cwd" | "agentDir" | "settingsManager">;
+	/**
+	 * Skip the built-in Herdr reporter for these services. Set for RLM subagent
+	 * runtimes: they inherit the parent's HERDR_* pane identity, so their own
+	 * reporter would race the parent's on the same pane and a subagent quit
+	 * would release the pane while the parent is still running.
+	 */
+	noBuiltinHerdrReporter?: boolean;
 }
 
 export interface AgentSessionCreationOptions {
@@ -54,6 +65,9 @@ export interface AgentSessionCreationOptions {
 	initialActiveToolNames?: string[];
 	allowedToolNames?: string[];
 	includeGoals?: boolean;
+	includeCompactSkill?: boolean;
+	agentMessageController?: AgentSessionMessageController;
+	agentObserveController?: AgentObserveController;
 	rlmDepth?: number;
 	rlmMaxDepth?: number;
 	rlmSessionDir?: string;
@@ -61,6 +75,7 @@ export interface AgentSessionCreationOptions {
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	rlmHeartbeatController?: AgentRlmHeartbeatController;
 	prewarmIpythonKernel?: boolean;
+	autonomous?: AgentAutonomousConfig;
 }
 
 /**
@@ -163,8 +178,21 @@ export async function createAgentSessionServices(
 	// refresh() resets the OAuth registry to built-ins; re-add user MCP providers too.
 	modelRegistry.setOnOAuthProvidersReset(() => mcpManager.registerUserProviders());
 
-	const resourceLoader = new DefaultResourceLoader({
+	const userExtensionFactories = options.resourceLoaderOptions?.extensionFactories ?? [];
+	// The built-in Herdr reporter defers to Herdr's own file-based integration
+	// when the loader actually loaded it; two reporters would race on the same
+	// pane. Deferral is late-bound to the loader's loaded paths (inline
+	// factories run after file extensions load), so a file that exists but is
+	// disabled or never discovered does not silence the built-in.
+	// noExtensions is a full opt-out: it disables the built-in reporter too,
+	// not just discovered extension files.
+	const skipHerdrReporter = options.noBuiltinHerdrReporter || options.resourceLoaderOptions?.noExtensions;
+	const builtinExtensionFactories = skipHerdrReporter
+		? []
+		: [createHerdrAgentStateExtension(() => resourceLoader.getLoadedExtensionPaths())];
+	const resourceLoader: DefaultResourceLoader = new DefaultResourceLoader({
 		...(options.resourceLoaderOptions ?? {}),
+		extensionFactories: [...builtinExtensionFactories, ...userExtensionFactories],
 		cwd,
 		agentDir,
 		settingsManager,
@@ -233,6 +261,9 @@ export async function createAgentSessionFromServices(
 		initialActiveToolNames: options.initialActiveToolNames,
 		allowedToolNames: options.allowedToolNames,
 		includeGoals: options.includeGoals,
+		includeCompactSkill: options.includeCompactSkill,
+		agentMessageController: options.agentMessageController,
+		agentObserveController: options.agentObserveController,
 		rlmDepth: options.rlmDepth,
 		rlmMaxDepth: options.rlmMaxDepth,
 		rlmSessionDir: options.rlmSessionDir,
@@ -241,5 +272,6 @@ export async function createAgentSessionFromServices(
 		rlmHeartbeatController: options.rlmHeartbeatController,
 		sessionStartEvent: options.sessionStartEvent,
 		prewarmIpythonKernel: options.prewarmIpythonKernel,
+		autonomous: options.autonomous,
 	});
 }

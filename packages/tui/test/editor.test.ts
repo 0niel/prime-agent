@@ -3658,6 +3658,85 @@ describe("Editor component", () => {
 			assert.strictEqual(editor.getExpandedText(), pastedText);
 		});
 
+		it("restores expanded pasted content from a paste snapshot", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const pastedText = [
+				"line 1",
+				"line 2",
+				"line 3",
+				"line 4",
+				"line 5",
+				"line 6",
+				"line 7",
+				"line 8",
+				"line 9",
+				"line 10",
+				"line 11",
+			].join("\n");
+			let submitted = "";
+			editor.onSubmit = (text) => {
+				submitted = text;
+			};
+
+			editor.handleInput(`\x1b[200~${pastedText}\x1b[201~`);
+			const markerText = editor.getText();
+			const snapshot = editor.getPasteSnapshot();
+			editor.handleInput("\r");
+
+			const restored = new Editor(createTestTUI(), defaultEditorTheme);
+			restored.setText(markerText);
+			restored.restorePasteSnapshot(snapshot);
+
+			assert.match(markerText, /\[paste #\d+ \+\d+ lines\]/);
+			assert.strictEqual(submitted, pastedText);
+			assert.strictEqual(restored.getExpandedText(), pastedText);
+		});
+
+		it("restores paste snapshot state on undo", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const originalText = [
+				"original 1",
+				"original 2",
+				"original 3",
+				"original 4",
+				"original 5",
+				"original 6",
+				"original 7",
+				"original 8",
+				"original 9",
+				"original 10",
+				"original 11",
+			].join("\n");
+			const restoredText = [
+				"restored 1",
+				"restored 2",
+				"restored 3",
+				"restored 4",
+				"restored 5",
+				"restored 6",
+				"restored 7",
+				"restored 8",
+				"restored 9",
+				"restored 10",
+				"restored 11",
+				"restored 12",
+			].join("\n");
+			const restoredSource = new Editor(createTestTUI(), defaultEditorTheme);
+
+			editor.handleInput(`\x1b[200~${originalText}\x1b[201~`);
+			const originalMarker = editor.getText();
+			restoredSource.handleInput(`\x1b[200~${restoredText}\x1b[201~`);
+
+			editor.setText(restoredSource.getText());
+			editor.restorePasteSnapshot(restoredSource.getPasteSnapshot());
+			assert.strictEqual(editor.getExpandedText(), restoredText);
+
+			editor.handleInput("\x1b[45;5u");
+
+			assert.strictEqual(editor.getText(), originalMarker);
+			assert.strictEqual(editor.getExpandedText(), originalText);
+		});
+
 		it("snaps to the paste marker start when navigating down into it", () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 

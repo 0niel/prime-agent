@@ -67,6 +67,26 @@ describe("SessionManager session state", () => {
 		}
 	});
 
+	it("persists renamed sessions without assistant messages", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "session-state-rename-empty-"));
+		try {
+			const cwd = join(tempDir, "project");
+			const sessionDir = join(tempDir, "sessions");
+			const session = SessionManager.create(cwd, sessionDir);
+			session.appendSessionState({ status: "active" });
+			const sessionFile = session.getSessionFile();
+			expect(sessionFile).toBeDefined();
+
+			SessionManager.open(sessionFile!, sessionDir).appendSessionInfo("Renamed draft");
+
+			await expect(SessionManager.list(cwd, sessionDir)).resolves.toEqual([
+				expect.objectContaining({ id: session.getSessionId(), name: "Renamed draft" }),
+			]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("archives a deactivated session that has no prior state entry", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "session-state-deactivate-"));
 		try {

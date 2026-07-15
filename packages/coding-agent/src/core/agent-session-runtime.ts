@@ -20,6 +20,7 @@ import type {
 import type { CreateAgentSessionResult } from "./sdk.js";
 import { assertSessionCwdExists } from "./session-cwd.js";
 import { SessionImportFileNotFoundError } from "./session-import-errors.js";
+import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "./session-lease.js";
 import { SessionManager } from "./session-manager.js";
 
 export { SessionImportFileNotFoundError } from "./session-import-errors.js";
@@ -87,6 +88,8 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
  */
 export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private rebindSession?: (session: AgentSession) => Promise<void>;
+	private readonly sessionReplacedListeners = new Set<(session: AgentSession) => void | Promise<void>>();
+	private runtimeEnvScope?: <T>(fn: () => Promise<T>) => Promise<T>;
 	private beforeSessionInvalidate?: () => void;
 	private subagentRuntimeHost?: SubagentRuntimeHost;
 	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
@@ -100,6 +103,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		private _modelFallbackMessage?: string,
 		private readonly sessionConfig?: AgentSessionRuntimeConfig,
 		private readonly _metadata: AgentSessionRuntimeMetadata = { kind: "top-level", createdAt: Date.now() },
+		private _sessionLease?: SessionLease,
 	) {
 		this.bindRuntimeHost();
 	}
@@ -140,6 +144,24 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 	setRebindSession(rebindSession?: (session: AgentSession) => Promise<void>): void {
 		this.rebindSession = rebindSession;
+	}
+
+	onSessionReplaced(listener: (session: AgentSession) => void | Promise<void>): () => void {
+		this.sessionReplacedListeners.add(listener);
+		return () => this.sessionReplacedListeners.delete(listener);
+	}
+
+	/**
+	 * Host-installed scope wrapping every runtime rebuild (new/switch/fork/
+	 * import and subagent creation), during which extensions re-load. The
+	 * daemon uses it to apply the session's client env for load-time captures.
+	 */
+	setRuntimeEnvScope(scope?: <T>(fn: () => Promise<T>) => Promise<T>): void {
+		this.runtimeEnvScope = scope;
+	}
+
+	private scopedBuild<T>(fn: () => Promise<T>): Promise<T> {
+		return this.runtimeEnvScope ? this.runtimeEnvScope(fn) : fn();
 	}
 
 	setSubagentRuntimeHost(host?: SubagentRuntimeHost): void {
@@ -218,6 +240,70 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		this.bindRuntimeHost();
 	}
 
+	private acquireReplacementLease(sessionPath: string | undefined): SessionLease | undefined {
+		if (sessionPath && this._sessionLease?.sessionPath === canonicalSessionPath(sessionPath)) {
+			return this._sessionLease;
+		}
+		return acquireSessionLease(sessionPath, this.services.agentDir);
+	}
+
+	private releaseUncommittedLease(lease: SessionLease | undefined): void {
+		if (lease !== this._sessionLease) {
+			lease?.release();
+		}
+	}
+
+	private releaseSessionLease(): void {
+		this._sessionLease?.release();
+		this._sessionLease = undefined;
+	}
+
+	private transferSessionLeaseToSession(): void {
+		const lease = this._sessionLease;
+		if (!lease) {
+			return;
+		}
+		this._sessionLease = undefined;
+		this.session.registerDisposeCallback(() => lease.release());
+	}
+
+	private commitReplacementLease(lease: SessionLease | undefined): void {
+		if (lease === this._sessionLease) {
+			return;
+		}
+		const previous = this._sessionLease;
+		this._sessionLease = lease;
+		previous?.release();
+	}
+
+	private async buildAndApplyReplacement(
+		build: () => Promise<CreateAgentSessionRuntimeResult>,
+		lease: SessionLease | undefined,
+	): Promise<void> {
+		let result: CreateAgentSessionRuntimeResult;
+		try {
+			result = await build();
+		} catch (error) {
+			this.releaseUncommittedLease(lease);
+			throw error;
+		}
+		this.apply(result);
+		this.commitReplacementLease(lease);
+	}
+
+	private async teardownForReplacement(
+		reason: SessionShutdownEvent["reason"],
+		targetSessionFile: string | undefined,
+		lease: SessionLease | undefined,
+	): Promise<void> {
+		try {
+			await this.teardownCurrent(reason, targetSessionFile);
+		} catch (error) {
+			this.releaseUncommittedLease(lease);
+			throw error;
+		}
+	}
+
 	private async disposeSubagentRuntimes(): Promise<void> {
 		const runtimes = [...this.subagentRuntimes.values()];
 		this.subagentRuntimes.clear();
@@ -260,38 +346,41 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		if (options.parentSession.sessionFile) {
 			sessionManager.newSession({ parentSession: options.parentSession.sessionFile });
 		}
-		const runtime = await createAgentSessionRuntime(this.createRuntime, {
-			cwd: sessionManager.getCwd(),
-			agentDir: this.services.agentDir,
-			sessionManager,
-			sessionStartEvent: { type: "session_start", reason: "startup" },
-			sessionConfig: this.sessionConfig,
-			sessionOptions: {
-				model: options.model,
-				thinkingLevel: options.thinkingLevel,
-				planMode: options.planMode,
-				scopedModels: options.scopedModels,
-				initialActiveToolNames: options.activeToolNames,
-				allowedToolNames: options.allowedToolNames,
-				customTools: options.customTools,
-				includeGoals: options.includeGoals,
-				rlmDepth: options.rlmDepth,
-				rlmMaxDepth: options.rlmMaxDepth,
-				rlmSessionDir: options.sessionDir,
-				rlmParentNodeId: options.rlmParentNodeId,
-			},
-			runtimeMetadata: {
-				kind: "subagent",
-				createdAt: Date.now(),
-				parentSessionId: options.parentSession.sessionId,
-				parentSessionFile: options.parentSession.sessionFile,
-				rlmChildId: options.id,
-				rlmParentNodeId: options.rlmParentNodeId,
-				prompt: options.prompt,
-				spawnCode: options.spawnCode,
-				sessionDir: options.sessionDir,
-			},
-		});
+		const runtime = await this.scopedBuild(() =>
+			createAgentSessionRuntime(this.createRuntime, {
+				cwd: sessionManager.getCwd(),
+				agentDir: this.services.agentDir,
+				sessionManager,
+				sessionStartEvent: { type: "session_start", reason: "startup" },
+				sessionConfig: this.sessionConfig,
+				sessionOptions: {
+					model: options.model,
+					thinkingLevel: options.thinkingLevel,
+					planMode: options.planMode,
+					scopedModels: options.scopedModels,
+					initialActiveToolNames: options.activeToolNames,
+					allowedToolNames: options.allowedToolNames,
+					customTools: options.customTools,
+					includeGoals: options.includeGoals,
+					includeCompactSkill: options.includeCompactSkill,
+					rlmDepth: options.rlmDepth,
+					rlmMaxDepth: options.rlmMaxDepth,
+					rlmSessionDir: options.sessionDir,
+					rlmParentNodeId: options.rlmParentNodeId,
+				},
+				runtimeMetadata: {
+					kind: "subagent",
+					createdAt: Date.now(),
+					parentSessionId: options.parentSession.sessionId,
+					parentSessionFile: options.parentSession.sessionFile,
+					rlmChildId: options.id,
+					rlmParentNodeId: options.rlmParentNodeId,
+					prompt: options.prompt,
+					spawnCode: options.spawnCode,
+					sessionDir: options.sessionDir,
+				},
+			}),
+		);
 		this.subagentRuntimes.set(options.id, runtime);
 		try {
 			await runtime.session.bindExtensions({});
@@ -317,6 +406,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		if (status === "done") {
 			// Flush traces now since the runtime's own shutdown path is skipped while retained.
 			await flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
+			if (runtime instanceof AgentSessionRuntime) {
+				runtime.transferSessionLeaseToSession();
+			}
 			// Retention can decline if the parent is already tearing down; if so, fall
 			// through and dispose the runtime instead of leaving it dangling.
 			if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
@@ -334,6 +426,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		if (this.rebindSession) {
 			await this.rebindSession(this.session);
 		}
+		for (const listener of this.sessionReplacedListeners) {
+			await listener(this.session);
+		}
 		if (withSession) {
 			await withSession(this.session.createReplacedSessionContext());
 		}
@@ -349,17 +444,28 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 
 		const previousSessionFile = this.session.sessionFile;
-		const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
-		assertSessionCwdExists(sessionManager, this.cwd);
-		await this.teardownCurrent("resume", sessionManager.getSessionFile());
-		this.apply(
-			await this.createRuntime({
-				cwd: sessionManager.getCwd(),
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
-				sessionConfig: this.sessionConfig,
-			}),
+		const lease = this.acquireReplacementLease(sessionPath);
+		let sessionManager: SessionManager;
+		try {
+			sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
+			assertSessionCwdExists(sessionManager, this.cwd);
+		} catch (error) {
+			this.releaseUncommittedLease(lease);
+			throw error;
+		}
+		await this.teardownForReplacement("resume", sessionManager.getSessionFile(), lease);
+		await this.buildAndApplyReplacement(
+			() =>
+				this.scopedBuild(() =>
+					this.createRuntime({
+						cwd: sessionManager.getCwd(),
+						agentDir: this.services.agentDir,
+						sessionManager,
+						sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+						sessionConfig: this.sessionConfig,
+					}),
+				),
+			lease,
 		);
 		await this.finishSessionReplacement(options?.withSession);
 		return { cancelled: false };
@@ -381,16 +487,21 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		if (options?.parentSession) {
 			sessionManager.newSession({ parentSession: options.parentSession });
 		}
+		const lease = this.acquireReplacementLease(sessionManager.getSessionFile());
 
-		await this.teardownCurrent("new", sessionManager.getSessionFile());
-		this.apply(
-			await this.createRuntime({
-				cwd: this.cwd,
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
-				sessionConfig: this.sessionConfig,
-			}),
+		await this.teardownForReplacement("new", sessionManager.getSessionFile(), lease);
+		await this.buildAndApplyReplacement(
+			() =>
+				this.scopedBuild(() =>
+					this.createRuntime({
+						cwd: this.cwd,
+						agentDir: this.services.agentDir,
+						sessionManager,
+						sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
+						sessionConfig: this.sessionConfig,
+					}),
+				),
+			lease,
 		);
 		if (options?.setup) {
 			await options.setup(this.session.sessionManager);
@@ -437,15 +548,20 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			if (!targetLeafId) {
 				const sessionManager = SessionManager.create(this.cwd, sessionDir);
 				sessionManager.newSession({ parentSession: currentSessionFile });
-				await this.teardownCurrent("fork", sessionManager.getSessionFile());
-				this.apply(
-					await this.createRuntime({
-						cwd: this.cwd,
-						agentDir: this.services.agentDir,
-						sessionManager,
-						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
-						sessionConfig: this.sessionConfig,
-					}),
+				const lease = this.acquireReplacementLease(sessionManager.getSessionFile());
+				await this.teardownForReplacement("fork", sessionManager.getSessionFile(), lease);
+				await this.buildAndApplyReplacement(
+					() =>
+						this.scopedBuild(() =>
+							this.createRuntime({
+								cwd: this.cwd,
+								agentDir: this.services.agentDir,
+								sessionManager,
+								sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+								sessionConfig: this.sessionConfig,
+							}),
+						),
+					lease,
 				);
 				await this.finishSessionReplacement(options?.withSession);
 				return { cancelled: false, selectedText };
@@ -457,15 +573,20 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				throw new Error("Failed to create forked session");
 			}
 			const sessionManager = SessionManager.open(forkedSessionPath, sessionDir);
-			await this.teardownCurrent("fork", sessionManager.getSessionFile());
-			this.apply(
-				await this.createRuntime({
-					cwd: sessionManager.getCwd(),
-					agentDir: this.services.agentDir,
-					sessionManager,
-					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
-					sessionConfig: this.sessionConfig,
-				}),
+			const lease = this.acquireReplacementLease(sessionManager.getSessionFile());
+			await this.teardownForReplacement("fork", sessionManager.getSessionFile(), lease);
+			await this.buildAndApplyReplacement(
+				() =>
+					this.scopedBuild(() =>
+						this.createRuntime({
+							cwd: sessionManager.getCwd(),
+							agentDir: this.services.agentDir,
+							sessionManager,
+							sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+							sessionConfig: this.sessionConfig,
+						}),
+					),
+				lease,
 			);
 			await this.finishSessionReplacement(options?.withSession);
 			return { cancelled: false, selectedText };
@@ -477,15 +598,20 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		} else {
 			sessionManager.createBranchedSession(targetLeafId);
 		}
-		await this.teardownCurrent("fork", sessionManager.getSessionFile());
-		this.apply(
-			await this.createRuntime({
-				cwd: this.cwd,
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
-				sessionConfig: this.sessionConfig,
-			}),
+		const lease = this.acquireReplacementLease(sessionManager.getSessionFile());
+		await this.teardownForReplacement("fork", sessionManager.getSessionFile(), lease);
+		await this.buildAndApplyReplacement(
+			() =>
+				this.scopedBuild(() =>
+					this.createRuntime({
+						cwd: this.cwd,
+						agentDir: this.services.agentDir,
+						sessionManager,
+						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+						sessionConfig: this.sessionConfig,
+					}),
+				),
+			lease,
 		);
 		await this.finishSessionReplacement(options?.withSession);
 		return { cancelled: false, selectedText };
@@ -516,21 +642,32 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 
 		const previousSessionFile = this.session.sessionFile;
-		if (resolve(destinationPath) !== resolvedPath) {
-			copyFileSync(resolvedPath, destinationPath);
-		}
+		const lease = this.acquireReplacementLease(destinationPath);
+		let sessionManager: SessionManager;
+		try {
+			if (resolve(destinationPath) !== resolvedPath) {
+				copyFileSync(resolvedPath, destinationPath);
+			}
 
-		const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
-		assertSessionCwdExists(sessionManager, this.cwd);
-		await this.teardownCurrent("resume", sessionManager.getSessionFile());
-		this.apply(
-			await this.createRuntime({
-				cwd: sessionManager.getCwd(),
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
-				sessionConfig: this.sessionConfig,
-			}),
+			sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
+			assertSessionCwdExists(sessionManager, this.cwd);
+		} catch (error) {
+			this.releaseUncommittedLease(lease);
+			throw error;
+		}
+		await this.teardownForReplacement("resume", sessionManager.getSessionFile(), lease);
+		await this.buildAndApplyReplacement(
+			() =>
+				this.scopedBuild(() =>
+					this.createRuntime({
+						cwd: sessionManager.getCwd(),
+						agentDir: this.services.agentDir,
+						sessionManager,
+						sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+						sessionConfig: this.sessionConfig,
+					}),
+				),
+			lease,
 		);
 		await this.finishSessionReplacement();
 		return { cancelled: false };
@@ -567,8 +704,12 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		} catch (error) {
 			disposeError ??= error;
 		}
-		if (disposeError) {
-			throw disposeError;
+		try {
+			if (disposeError) {
+				throw disposeError;
+			}
+		} finally {
+			this.releaseSessionLease();
 		}
 	}
 
@@ -596,19 +737,29 @@ export async function createAgentSessionRuntime(
 		sessionConfig?: AgentSessionRuntimeConfig;
 		sessionOptions?: AgentSessionCreationOptions;
 		runtimeMetadata?: AgentSessionRuntimeMetadata;
+		sessionLease?: SessionLease;
 	},
 ): Promise<AgentSessionRuntime> {
-	assertSessionCwdExists(options.sessionManager, options.cwd);
-	const result = await createRuntime(options);
-	return new AgentSessionRuntime(
-		result.session,
-		result.services,
-		createRuntime,
-		result.diagnostics,
-		result.modelFallbackMessage,
-		options.sessionConfig,
-		options.runtimeMetadata,
-	);
+	const { sessionLease, ...runtimeOptions } = options;
+	const lease =
+		sessionLease ?? acquireSessionLease(runtimeOptions.sessionManager.getSessionFile(), runtimeOptions.agentDir);
+	try {
+		assertSessionCwdExists(runtimeOptions.sessionManager, runtimeOptions.cwd);
+		const result = await createRuntime(runtimeOptions);
+		return new AgentSessionRuntime(
+			result.session,
+			result.services,
+			createRuntime,
+			result.diagnostics,
+			result.modelFallbackMessage,
+			runtimeOptions.sessionConfig,
+			runtimeOptions.runtimeMetadata,
+			lease,
+		);
+	} catch (error) {
+		lease?.release();
+		throw error;
+	}
 }
 
 export {

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AnthropicMessagesCompat, Api, Context, Model, OpenAICompletionsCompat } from "@earendil-works/pi-ai";
 import { getApiProvider } from "@earendil-works/pi-ai";
-import { getOAuthProvider } from "@earendil-works/pi-ai/oauth";
+import { getOAuthProvider, registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { clearApiKeyCache, ModelRegistry, type ProviderConfigInput } from "../src/core/model-registry.js";
@@ -1393,6 +1393,97 @@ describe("ModelRegistry", () => {
 				});
 			});
 
+			test("provider auth status reports models.json auth when stored auth is stale", async () => {
+				authStorage.setRuntimeApiKey("custom-provider", "stale-runtime-key");
+				expect(authStorage.markAuthStale("custom-provider")).toBe(true);
+				writeRawModelsJson({
+					"custom-provider": providerWithApiKey("literal_api_key_value"),
+				});
+
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+				const model = registry.find("custom-provider", "test-model");
+				expect(model).toBeDefined();
+
+				expect(registry.getProviderAuthStatus("custom-provider")).toEqual({
+					configured: true,
+					source: "models_json_key",
+				});
+				await expect(registry.getApiKeyForProvider("custom-provider")).resolves.toBe("literal_api_key_value");
+				await expect(registry.getApiKeyAndHeaders(model!)).resolves.toMatchObject({
+					ok: true,
+					apiKey: "literal_api_key_value",
+				});
+			});
+
+			test("stale marking uses the auth source resolved for the last request", async () => {
+				const providerId = `test-oauth-fallback-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+				registerOAuthProvider({
+					id: providerId,
+					name: "Test OAuth Fallback",
+					async login() {
+						throw new Error("Not used in this test");
+					},
+					async refreshToken() {
+						throw new Error("refresh failed");
+					},
+					getApiKey(credentials) {
+						return `Bearer ${credentials.access}`;
+					},
+				});
+				authStorage.set(providerId, {
+					type: "oauth",
+					refresh: "refresh-token",
+					access: "expired-access-token",
+					expires: Date.now() - 10_000,
+				});
+				writeRawModelsJson({
+					[providerId]: providerWithApiKey("literal_api_key_value"),
+				});
+
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+
+				await expect(registry.getApiKeyForProvider(providerId)).resolves.toBe("literal_api_key_value");
+				const token = registry.getCurrentProviderAuthSourceToken(providerId);
+				expect(token?.source).toBe("models_json_key");
+				expect(token).toBeDefined();
+				expect(registry.markProviderAuthSourceStale(token!)).toBe(true);
+
+				await expect(registry.getApiKeyForProvider(providerId)).resolves.toBeUndefined();
+				expect(authStorage.getAuthStatus(providerId)).toEqual({
+					configured: true,
+					source: "stored",
+				});
+			});
+
+			test("changed literal models.json apiKey no longer matches stale provider marker", async () => {
+				writeRawModelsJson({
+					"custom-provider": providerWithApiKey("stale-key"),
+				});
+
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+
+				await expect(registry.getApiKeyForProvider("custom-provider")).resolves.toBe("stale-key");
+				expect(registry.markProviderAuthStale("custom-provider")).toBe(true);
+				expect(registry.getProviderAuthStatus("custom-provider")).toEqual({
+					configured: false,
+					source: "stale",
+					label: "expired",
+				});
+				expect(registry.getAvailable().some((model) => model.provider === "custom-provider")).toBe(false);
+
+				writeRawModelsJson({
+					"custom-provider": providerWithApiKey("fresh-key"),
+				});
+				registry.refresh();
+
+				expect(registry.getProviderAuthStatus("custom-provider")).toEqual({
+					configured: true,
+					source: "models_json_key",
+				});
+				expect(registry.getAvailable().some((model) => model.provider === "custom-provider")).toBe(true);
+				await expect(registry.getApiKeyForProvider("custom-provider")).resolves.toBe("fresh-key");
+			});
+
 			test("provider auth status reports command apiKey values from models.json without executing them", () => {
 				const counterFile = join(tempDir, "status-counter");
 				writeFileSync(counterFile, "0");
@@ -1409,6 +1500,29 @@ describe("ModelRegistry", () => {
 					source: "models_json_command",
 				});
 				expect(readFileSync(counterFile, "utf-8")).toBe("0");
+			});
+
+			test("provider auth status reports stale command auth without executing it", () => {
+				const counterFile = join(tempDir, "stale-status-counter");
+				writeFileSync(counterFile, "0");
+				const counterPath = toShPath(counterFile);
+				const command = `!sh -c 'count=$(cat "${counterPath}"); echo $((count + 1)) > "${counterPath}"; echo key-value'`;
+				writeRawModelsJson({
+					"custom-provider": providerWithApiKey(command),
+				});
+
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+
+				expect(registry.markProviderAuthStale("custom-provider")).toBe(true);
+				expect(readFileSync(counterFile, "utf-8").trim()).toBe("1");
+				writeFileSync(counterFile, "0");
+
+				expect(registry.getProviderAuthStatus("custom-provider")).toEqual({
+					configured: false,
+					source: "stale",
+					label: "expired",
+				});
+				expect(readFileSync(counterFile, "utf-8").trim()).toBe("0");
 			});
 
 			test("environment variables are not cached (changes are picked up)", async () => {
@@ -1456,6 +1570,35 @@ describe("ModelRegistry", () => {
 				expect(available.some((m) => m.provider === "custom-provider")).toBe(true);
 				const count = parseInt(readFileSync(counterFile, "utf-8").trim(), 10);
 				expect(count).toBe(0);
+			});
+
+			test("changed command-backed apiKey no longer matches stale models.json marker", async () => {
+				const tokenFile = join(tempDir, "models-json-token");
+				writeFileSync(tokenFile, "stale-key");
+				const tokenPath = toShPath(tokenFile);
+
+				writeRawModelsJson({
+					"custom-provider": providerWithApiKey(`!sh -c 'cat "${tokenPath}"'`),
+				});
+
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+
+				await expect(registry.getApiKeyForProvider("custom-provider")).resolves.toBe("stale-key");
+				expect(registry.markProviderAuthStale("custom-provider")).toBe(true);
+				await expect(registry.getApiKeyForProvider("custom-provider")).resolves.toBeUndefined();
+				expect(registry.getProviderAuthStatus("custom-provider")).toEqual({
+					configured: false,
+					source: "stale",
+					label: "expired",
+				});
+
+				writeFileSync(tokenFile, "fresh-key");
+
+				await expect(registry.getApiKeyForProvider("custom-provider")).resolves.toBe("fresh-key");
+				expect(registry.getProviderAuthStatus("custom-provider")).toEqual({
+					configured: true,
+					source: "models_json_command",
+				});
 			});
 
 			test("getApiKeyAndHeaders resolves authHeader on every request", async () => {

@@ -254,7 +254,9 @@ function addIgnoreRules(ig: IgnoreMatcher, dir: string, rootDir: string): void {
 			if (patterns.length > 0) {
 				ig.add(patterns);
 			}
-		} catch {}
+		} catch {
+			// Unreadable ignore file: skip it rather than failing resource loading.
+		}
 	}
 }
 

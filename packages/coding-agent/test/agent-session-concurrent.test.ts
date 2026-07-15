@@ -288,7 +288,138 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.abort();
 		await firstPrompt.catch(() => {});
 
+		expect(sawSteeringMessage).toBe(false);
+		expect(session.getSteeringMessages()).toContain("Steer from extension");
+		expect(session.pendingMessageCount).toBe(1);
+
+		await session.prompt("After abort");
+
 		expect(sawSteeringMessage).toBe(true);
+		expect(session.pendingMessageCount).toBe(0);
+	});
+
+	it("delivers accepted agent messages without extension input interception", async () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		let inputCalls = 0;
+		let receivedUserText: string | undefined;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: "Test",
+				tools: [],
+			},
+			streamFn: (_model, context) => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const userMessages = context.messages.filter((message) => message.role === "user");
+					const user = userMessages.at(-1);
+					if (user && typeof user.content !== "string") {
+						receivedUserText = user.content
+							.filter(
+								(part): part is TextContent =>
+									typeof part === "object" && part !== null && part.type === "text",
+							)
+							.map((part) => part.text)
+							.join("\n");
+					}
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Delivered") });
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = ModelRegistry.create(authStorage, tempDir);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const extensionsResult = await createTestExtensionsResult([
+			(pi) => {
+				pi.on("input", async () => {
+					inputCalls++;
+					return { action: "handled" };
+				});
+			},
+		]);
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRegistry,
+			resourceLoader: createTestResourceLoader({ extensionsResult }),
+		});
+
+		await session.acceptAgentMessagePrompt("agent-to-agent payload", { expandPromptTemplates: false });
+		await session.agent.waitForIdle();
+
+		expect(inputCalls).toBe(0);
+		expect(receivedUserText).toBe("agent-to-agent payload");
+	});
+
+	it("delivers internal prompts without extension input interception", async () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		let inputCalls = 0;
+		let receivedUserText: string | undefined;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: "Test",
+				tools: [],
+			},
+			streamFn: (_model, context) => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					const userMessages = context.messages.filter((message) => message.role === "user");
+					const user = userMessages.at(-1);
+					if (user && typeof user.content !== "string") {
+						receivedUserText = user.content
+							.filter(
+								(part): part is TextContent =>
+									typeof part === "object" && part !== null && part.type === "text",
+							)
+							.map((part) => part.text)
+							.join("\n");
+					}
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Delivered") });
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = ModelRegistry.create(authStorage, tempDir);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const extensionsResult = await createTestExtensionsResult([
+			(pi) => {
+				pi.on("input", async () => {
+					inputCalls++;
+					return { action: "handled" };
+				});
+			},
+		]);
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRegistry,
+			resourceLoader: createTestResourceLoader({ extensionsResult }),
+		});
+
+		await session.prompt("host gate follow-up", { internalPrompt: true });
+		await session.agent.waitForIdle();
+
+		expect(inputCalls).toBe(0);
+		expect(receivedUserText).toBe("host gate follow-up");
 	});
 
 	it("should allow prompt() after previous completes", async () => {

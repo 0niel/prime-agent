@@ -14,16 +14,20 @@ export interface AppKeybindings {
 	"app.interrupt": true;
 	"app.clear": true;
 	"app.input.clear": true;
+	"app.shortcuts": true;
 	"app.exit": true;
 	"app.suspend": true;
 	"app.model.select": true;
 	"app.provider.add": true;
+	"app.configuration.previousTab": true;
+	"app.configuration.nextTab": true;
 	"app.tools.expand": true;
 	"app.thinking.toggle": true;
 	"app.plan.toggle": true;
 	"app.subagents.focus": true;
 	"app.session.toggleNamedFilter": true;
 	"app.editor.external": true;
+	"app.prompt.stash": true;
 	"app.message.followUp": true;
 	"app.message.dequeue": true;
 	"app.clipboard.pasteImage": true;
@@ -72,7 +76,8 @@ export const KEYBINDINGS = {
 	...TUI_KEYBINDINGS,
 	"app.interrupt": { defaultKeys: [], description: "Interrupt current operation" },
 	"app.clear": { defaultKeys: "ctrl+c", description: "Interrupt current operation, then exit" },
-	"app.input.clear": { defaultKeys: "escape", description: "Clear input" },
+	"app.input.clear": { defaultKeys: "escape", description: "Interrupt response or clear prompt" },
+	"app.shortcuts": { defaultKeys: "?", description: "Show keyboard shortcuts" },
 	"app.exit": { defaultKeys: "ctrl+d", description: "Exit when editor is empty" },
 	"app.suspend": {
 		defaultKeys: process.platform === "win32" ? [] : "ctrl+z",
@@ -80,6 +85,8 @@ export const KEYBINDINGS = {
 	},
 	"app.model.select": { defaultKeys: "ctrl+l", description: "Open model selector" },
 	"app.provider.add": { defaultKeys: "ctrl+p", description: "Add provider" },
+	"app.configuration.previousTab": { defaultKeys: "left", description: "Open previous configuration tab" },
+	"app.configuration.nextTab": { defaultKeys: "right", description: "Open next configuration tab" },
 	"app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
 	"app.thinking.toggle": {
 		defaultKeys: "ctrl+t",
@@ -100,6 +107,10 @@ export const KEYBINDINGS = {
 	"app.editor.external": {
 		defaultKeys: "ctrl+g",
 		description: "Open external editor",
+	},
+	"app.prompt.stash": {
+		defaultKeys: "ctrl+s",
+		description: "Stash or restore draft prompt",
 	},
 	"app.message.followUp": {
 		defaultKeys: "alt+enter",

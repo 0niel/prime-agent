@@ -50,6 +50,7 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/clone` | Duplicate the current active branch into a new session |
 | `/compact [prompt]` | Manually compact context, optionally with custom instructions |
 | `/copy` | Copy last assistant message to clipboard |
+| `/btw <question>`, `/side <question>` | Ask one inline side question without adding it to the session |
 | `/export [file]` | Export session to HTML |
 | `/share` | Upload as private GitHub gist with shareable HTML link |
 | `/reload` | Reload keybindings, extensions, skills, prompts, and context files |
@@ -77,9 +78,8 @@ Sessions are saved automatically to `~/.pi/agent/sessions/`, organized by workin
 
 ```bash
 pi -c                  # Continue most recent session
-pi -r                  # Browse and select a session
+pi -r [path|id]        # Browse sessions or resume one directly
 pi --no-session        # Ephemeral mode; do not save
-pi --session <path|id> # Use a specific session file or session ID
 pi --fork <path|id>    # Fork a session into a new session file
 ```
 
@@ -175,8 +175,7 @@ cat README.md | pi -p "Summarize this text"
 | Option | Description |
 |--------|-------------|
 | `-c`, `--continue` | Continue the most recent session |
-| `-r`, `--resume` | Browse and select a session |
-| `--session <path\|id>` | Use a specific session file or partial UUID |
+| `-r`, `--resume [path\|id]` | Browse and select a session, or resume a specific session file or partial UUID |
 | `--fork <path\|id>` | Fork a session file or partial UUID into a new session |
 | `--session-dir <dir>` | Custom session storage directory |
 | `--no-session` | Ephemeral mode; do not save |
@@ -189,7 +188,7 @@ cat README.md | pi -p "Summarize this text"
 | `--no-builtin-tools`, `-nbt` | Disable built-in tools but keep extension/custom tools enabled |
 | `--no-tools`, `-nt` | Disable all tools |
 
-Built-in tools: `ipython`, `bash`, `edit`.
+Built-in tools: `ipython`.
 
 ### Resource Options
 
@@ -255,8 +254,8 @@ pi --model sonnet:high "Solve this complex problem"
 # Limit model cycling
 pi --models "claude-*,gpt-4o"
 
-# Enable optional shell/edit tools
-pi --tools bash,edit -p "Review the code"
+# Restrict to the built-in IPython tool
+pi --tools ipython -p "Review the code"
 ```
 
 ### Environment Variables

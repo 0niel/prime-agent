@@ -16,11 +16,38 @@ describe("built-in slash commands", () => {
 		expect(commandNames).not.toContain("cron");
 	});
 
+	test("exposes heartbeat syntax guidance", () => {
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "heartbeat")).toMatchObject({
+			description:
+				"Set or view a persistent heartbeat; delivery defaults to steer, use --follow-up to queue; supports pause, resume, stop, and clear",
+			argumentHint: "[status|pause|resume|stop|[every <duration>] [--steer|--follow-up] <instruction>]",
+			takesArgument: true,
+		});
+	});
+
 	test("exposes /effort for selecting the thinking level", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "effort")).toMatchObject({
 			description: "Set reasoning/thinking level",
 			argumentHint: "[level]",
 			aliases: ["thinking"],
+		});
+	});
+
+	test("exposes /btw as an argument command with /side as an alias", () => {
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "btw")).toMatchObject({
+			argumentHint: "<question>",
+			aliases: ["side"],
+			takesArgument: true,
+		});
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "side")).toBeUndefined();
+		expect(builtinSlashCommandTakesArgument("side")).toBe(true);
+	});
+
+	test("describes /mcp as the MCP Connections menu entry point", () => {
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "mcp")).toMatchObject({
+			description: "Open MCP Connections or manage MCP integrations",
+			argumentHint: "[list|login <name>|logout <name>]",
+			takesArgument: true,
 		});
 	});
 
@@ -34,6 +61,8 @@ describe("built-in slash commands", () => {
 		expect(builtinSlashCommandTakesArgument("goal")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("effort")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("thinking")).toBe(true);
+		expect(builtinSlashCommandTakesArgument("heartbeat")).toBe(true);
+		expect(builtinSlashCommandTakesArgument("mcp")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("new")).toBe(false);
 		expect(builtinSlashCommandTakesArgument("clear")).toBe(false);
 	});
@@ -105,6 +134,17 @@ describe("slash command aliases", () => {
 			name: "context",
 			args: "latest turn",
 			originalName: "usage",
+			isAlias: true,
+		});
+	});
+
+	test("resolves /side to /btw", () => {
+		const parsed = parseSlashCommand("/side Is this cached?");
+
+		expect(resolveSlashCommand(parsed!)).toEqual({
+			name: "btw",
+			args: "Is this cached?",
+			originalName: "side",
 			isAlias: true,
 		});
 	});

@@ -212,7 +212,9 @@ class ForkServer {
 				if (this.abandoned.delete(msg.id) && typeof msg.pid === "number") {
 					try {
 						process.kill(msg.pid, "SIGTERM");
-					} catch {}
+					} catch {
+						// Orphan already exited.
+					}
 				}
 				continue;
 			}
@@ -271,19 +273,28 @@ class ForkServer {
 		// those events), so this early flag flip can't strand them on a timeout.
 		this.dead = true;
 		this.rejectPending(reason);
+		// Best-effort teardown: each resource may already be gone.
 		try {
 			this.conn?.destroy();
-		} catch {}
+		} catch {
+			// Already destroyed.
+		}
 		try {
 			this.server?.close();
-		} catch {}
+		} catch {
+			// Already closed.
+		}
 		try {
 			this.proc?.kill("SIGTERM");
-		} catch {}
+		} catch {
+			// Already exited.
+		}
 		if (this.socketDir) {
 			try {
 				rmSync(this.socketDir, { recursive: true, force: true });
-			} catch {}
+			} catch {
+				// Leave the socket dir for OS tmp cleanup.
+			}
 			this.socketDir = undefined;
 		}
 	}

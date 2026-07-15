@@ -11,11 +11,19 @@ export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
+	agentCallable?: boolean; // default: true - expose the compact skill so the model can request compaction
 }
 
 export interface BranchSummarySettings {
 	reserveTokens?: number; // default: 16384 (tokens reserved for prompt + LLM response)
 	skipPrompt?: boolean; // default: false - when true, skips "Summarize branch?" prompt and defaults to no summary
+}
+
+export interface AutoRefineSettings {
+	enabled?: boolean; // default: true
+	turnInterval?: number; // default: 25 assistant turns
+	compact?: boolean; // default: true
+	cooldownMs?: number; // default: 20 minutes
 }
 
 export interface ProviderRetrySettings {
@@ -36,6 +44,8 @@ export interface TerminalSettings {
 	imageWidthCells?: number; // default: 60 (preferred inline image width in terminal cells)
 	clearOnShrink?: boolean; // default: false (clear empty rows when content shrinks)
 	showTerminalProgress?: boolean; // default: false (OSC 9;4 terminal progress indicators)
+	fullscreen?: boolean; // default: true (alternate-screen rendering with scrollable transcript)
+	fullscreenMouse?: boolean; // default: true (wheel scrolling in fullscreen; disable if it breaks selection)
 }
 
 export interface ImageSettings {
@@ -110,6 +120,7 @@ export type McpServerConfig =
 	  };
 
 export interface Settings {
+	onboardingShown?: boolean;
 	onboardingCompleted?: boolean;
 	defaultProvider?: string;
 	defaultModel?: string;
@@ -120,6 +131,7 @@ export interface Settings {
 	followUpMode?: "all" | "one-at-a-time";
 	theme?: string;
 	compaction?: CompactionSettings;
+	autoRefine?: AutoRefineSettings;
 	agentTraces?: AgentTracesSettings;
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
@@ -140,7 +152,7 @@ export interface Settings {
 	terminal?: TerminalSettings;
 	images?: ImageSettings;
 	enabledModels?: string[]; // Model patterns for cycling (same format as --models CLI flag)
-	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // Default filter when opening /tree
+	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // Default: "user-only"
 	thinkingBudgets?: ThinkingBudgetsSettings; // Custom token budgets for thinking levels
 	editorPaddingX?: number; // Horizontal padding for input editor (default: 0)
 	autocompleteMaxVisible?: number; // Max visible items in autocomplete dropdown (default: 5)
@@ -605,13 +617,13 @@ export class SettingsManager {
 		return drained;
 	}
 
-	getOnboardingCompleted(): boolean {
-		return this.settings.onboardingCompleted ?? false;
+	getOnboardingShown(): boolean {
+		return this.settings.onboardingShown ?? this.settings.onboardingCompleted ?? false;
 	}
 
-	setOnboardingCompleted(completed: boolean): void {
-		this.globalSettings.onboardingCompleted = completed;
-		this.markModified("onboardingCompleted");
+	setOnboardingShown(shown: boolean): void {
+		this.globalSettings.onboardingShown = shown;
+		this.markModified("onboardingShown");
 		this.save();
 	}
 
@@ -753,11 +765,32 @@ export class SettingsManager {
 		return this.settings.compaction?.keepRecentTokens ?? 20000;
 	}
 
+	getCompactionAgentCallable(): boolean {
+		return this.settings.compaction?.agentCallable ?? true;
+	}
+
 	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
+		};
+	}
+
+	getAutoRefineSettings(): { enabled: boolean; turnInterval: number; compact: boolean; cooldownMs: number } {
+		const turnInterval = this.settings.autoRefine?.turnInterval;
+		const cooldownMs = this.settings.autoRefine?.cooldownMs;
+		return {
+			enabled: this.settings.autoRefine?.enabled ?? true,
+			turnInterval: Math.max(
+				1,
+				typeof turnInterval === "number" && Number.isFinite(turnInterval) ? turnInterval : 25,
+			),
+			compact: this.settings.autoRefine?.compact ?? true,
+			cooldownMs: Math.max(
+				0,
+				typeof cooldownMs === "number" && Number.isFinite(cooldownMs) ? cooldownMs : 20 * 60_000,
+			),
 		};
 	}
 
@@ -1017,6 +1050,36 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getFullscreen(): boolean {
+		// Env var overrides the setting (both directions) for one-off runs
+		if (process.env.PI_FULLSCREEN !== undefined) {
+			return process.env.PI_FULLSCREEN === "1";
+		}
+		return this.settings.terminal?.fullscreen ?? true;
+	}
+
+	setFullscreen(enabled: boolean): void {
+		if (!this.globalSettings.terminal) {
+			this.globalSettings.terminal = {};
+		}
+		this.globalSettings.terminal.fullscreen = enabled;
+		this.markModified("terminal", "fullscreen");
+		this.save();
+	}
+
+	getFullscreenMouse(): boolean {
+		return this.settings.terminal?.fullscreenMouse ?? true;
+	}
+
+	setFullscreenMouse(enabled: boolean): void {
+		if (!this.globalSettings.terminal) {
+			this.globalSettings.terminal = {};
+		}
+		this.globalSettings.terminal.fullscreenMouse = enabled;
+		this.markModified("terminal", "fullscreenMouse");
+		this.save();
+	}
+
 	getShowTerminalProgress(): boolean {
 		return this.settings.terminal?.showTerminalProgress ?? false;
 	}
@@ -1073,7 +1136,7 @@ export class SettingsManager {
 	getTreeFilterMode(): "default" | "no-tools" | "user-only" | "labeled-only" | "all" {
 		const mode = this.settings.treeFilterMode;
 		const valid = ["default", "no-tools", "user-only", "labeled-only", "all"];
-		return mode && valid.includes(mode) ? mode : "default";
+		return mode && valid.includes(mode) ? mode : "user-only";
 	}
 
 	setTreeFilterMode(mode: "default" | "no-tools" | "user-only" | "labeled-only" | "all"): void {

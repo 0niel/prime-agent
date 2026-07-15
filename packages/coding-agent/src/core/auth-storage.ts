@@ -6,6 +6,7 @@
  * try to refresh tokens simultaneously.
  */
 
+import { createHash } from "node:crypto";
 import {
 	findEnvKeys,
 	getEnvApiKey,
@@ -19,12 +20,16 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
 import {
+	clearPrimeCliCredentials,
+	getPrimeCliConfigPath,
 	loadPrimeCliConfig,
 	PRIME_INFERENCE_PROVIDER_ID,
 	type PrimeCliConfig,
 	type PrimeTeam,
+	savePrimeCliApiKey,
+	savePrimeCliTeamSelection,
 } from "./prime-inference-auth.js";
-import { resolveConfigValue } from "./resolve-config-value.js";
+import { resolveConfigValue, resolveConfigValueUncached } from "./resolve-config-value.js";
 
 export type PrimeTeamCredential = {
 	teamId: string;
@@ -50,7 +55,15 @@ export type AuthStorageData = Record<string, AuthCredential>;
 
 export type AuthStatus = {
 	configured: boolean;
-	source?: "stored" | "runtime" | "environment" | "prime_cli" | "fallback" | "models_json_key" | "models_json_command";
+	source?:
+		| "stored"
+		| "runtime"
+		| "environment"
+		| "prime_cli"
+		| "fallback"
+		| "models_json_key"
+		| "models_json_command"
+		| "stale";
 	label?: string;
 };
 
@@ -62,6 +75,29 @@ export type AuthStorageOptions = {
 type LockResult<T> = {
 	result: T;
 	next?: string;
+};
+
+type ActiveAuthStatusSource = Exclude<NonNullable<AuthStatus["source"]>, "stale">;
+
+export type AuthSourceToken = {
+	provider: string;
+	source: ActiveAuthStatusSource;
+	identityFingerprint: string;
+	valueFingerprint: string;
+};
+
+type AuthSourceCandidate = {
+	source: ActiveAuthStatusSource;
+	configured: boolean;
+	label?: string;
+	identityFingerprint: string;
+	valueFingerprint?: string;
+	resolveValueFingerprint?: () => string | undefined;
+};
+
+type AuthApiKeyResult = {
+	apiKey?: string;
+	sourceToken?: AuthSourceToken;
 };
 
 export interface AuthStorageBackend {
@@ -211,11 +247,10 @@ export class InMemoryAuthStorageBackend implements AuthStorageBackend {
 export class AuthStorage {
 	private data: AuthStorageData = {};
 	private runtimeOverrides: Map<string, string> = new Map();
+	private staleAuthSources: Map<string, AuthSourceToken[]> = new Map();
 	private fallbackResolver?: (provider: string) => string | undefined;
 	private loadError: Error | null = null;
 	private errors: Error[] = [];
-	private primeCliConfigCache: PrimeCliConfig | undefined;
-	private primeCliConfigCacheLoaded = false;
 
 	private constructor(
 		private storage: AuthStorageBackend,
@@ -244,6 +279,7 @@ export class AuthStorage {
 	 * Used for CLI --api-key flag.
 	 */
 	setRuntimeApiKey(provider: string, apiKey: string): void {
+		this.clearStaleAuthSource(provider, "runtime");
 		this.runtimeOverrides.set(provider, apiKey);
 	}
 
@@ -251,6 +287,7 @@ export class AuthStorage {
 	 * Remove a runtime API key override.
 	 */
 	removeRuntimeApiKey(provider: string): void {
+		this.clearStaleAuthSource(provider, "runtime");
 		this.runtimeOverrides.delete(provider);
 	}
 
@@ -267,6 +304,317 @@ export class AuthStorage {
 		this.errors.push(normalizedError);
 	}
 
+	private fingerprintAuthSource(source: ActiveAuthStatusSource, material: string): string {
+		const digest = createHash("sha256").update(source).update("\0").update(material).digest("hex");
+		return `${source}:${digest}`;
+	}
+
+	private createAuthSourceCandidate(options: {
+		source: ActiveAuthStatusSource;
+		configured: boolean;
+		identityMaterial: string;
+		valueMaterial?: string;
+		label?: string;
+		resolveValueMaterial?: () => string | undefined;
+	}): AuthSourceCandidate {
+		return {
+			configured: options.configured,
+			source: options.source,
+			...(options.label ? { label: options.label } : {}),
+			identityFingerprint: this.fingerprintAuthSource(options.source, `identity:${options.identityMaterial}`),
+			...(options.valueMaterial !== undefined
+				? {
+						valueFingerprint: this.fingerprintAuthSource(
+							options.source,
+							`value:${options.identityMaterial}\0${options.valueMaterial}`,
+						),
+					}
+				: {}),
+			...(options.resolveValueMaterial
+				? {
+						resolveValueFingerprint: () => {
+							const valueMaterial = options.resolveValueMaterial?.();
+							return valueMaterial === undefined
+								? undefined
+								: this.fingerprintAuthSource(
+										options.source,
+										`value:${options.identityMaterial}\0${valueMaterial}`,
+									);
+						},
+					}
+				: {}),
+		};
+	}
+
+	private getStoredCredentialValueMaterial(providerId: string, credential: AuthCredential): string | undefined {
+		if (credential.type === "api_key") {
+			if (credential.key.startsWith("!")) {
+				const resolvedKey = resolveConfigValueUncached(credential.key);
+				return resolvedKey === undefined ? undefined : `api_key:command:${credential.key}\0${resolvedKey}`;
+			}
+			return `api_key:${credential.key}\0${resolveConfigValue(credential.key) ?? ""}`;
+		}
+		const provider = getOAuthProvider(providerId);
+		const apiKey = provider?.getApiKey(credential) ?? credential.access;
+		return `oauth:${apiKey}\0${credential.refresh}\0${credential.expires}`;
+	}
+
+	private getRuntimeAuthCandidate(provider: string): AuthSourceCandidate | undefined {
+		const apiKey = this.runtimeOverrides.get(provider);
+		if (!apiKey) {
+			return undefined;
+		}
+		return {
+			label: "--api-key",
+			...this.createAuthSourceCandidate({
+				configured: false,
+				source: "runtime",
+				identityMaterial: provider,
+				valueMaterial: apiKey,
+			}),
+		};
+	}
+
+	private getPrimeCliAuthCandidate(provider: string): AuthSourceCandidate | undefined {
+		const apiKey = this.getPrimeCliApiKey(provider);
+		if (!apiKey) {
+			return undefined;
+		}
+		return {
+			label: "Prime CLI",
+			...this.createAuthSourceCandidate({
+				configured: false,
+				source: "prime_cli",
+				identityMaterial: provider,
+				valueMaterial: apiKey,
+			}),
+		};
+	}
+
+	private getStoredAuthCandidate(
+		provider: string,
+		options?: { resolveCommandValue?: boolean; resolvedCommandValue?: string },
+	): AuthSourceCandidate | undefined {
+		const credential = this.data[provider];
+		if (!credential) {
+			return undefined;
+		}
+		const isCommandApiKey = credential.type === "api_key" && credential.key.startsWith("!");
+		const identityMaterial = isCommandApiKey ? `api_key:command:${credential.key}` : `${provider}:${credential.type}`;
+		const commandValueMaterial =
+			isCommandApiKey && options?.resolvedCommandValue !== undefined
+				? `api_key:command:${credential.key}\0${options.resolvedCommandValue}`
+				: undefined;
+		return this.createAuthSourceCandidate({
+			configured: true,
+			source: "stored",
+			identityMaterial,
+			valueMaterial:
+				commandValueMaterial ??
+				(isCommandApiKey && !options?.resolveCommandValue
+					? undefined
+					: this.getStoredCredentialValueMaterial(provider, credential)),
+			resolveValueMaterial: isCommandApiKey
+				? () => this.getStoredCredentialValueMaterial(provider, credential)
+				: undefined,
+		});
+	}
+
+	private getEnvironmentAuthCandidate(provider: string): AuthSourceCandidate | undefined {
+		const envKeys = findEnvKeys(provider);
+		const envKey = envKeys?.[0];
+		const apiKey = getEnvApiKey(provider);
+		if (!apiKey) {
+			return undefined;
+		}
+		const label = envKey ?? "ambient credentials";
+		const identityMaterial = envKey ?? this.getAmbientEnvironmentIdentityMaterial(provider);
+		return this.createAuthSourceCandidate({
+			configured: false,
+			source: "environment",
+			label,
+			identityMaterial,
+			valueMaterial: `${identityMaterial}\0${apiKey}`,
+		});
+	}
+
+	private getAmbientEnvironmentIdentityMaterial(provider: string): string {
+		if (provider === "amazon-bedrock") {
+			if (process.env.AWS_PROFILE) return `amazon-bedrock:profile:${process.env.AWS_PROFILE}`;
+			if (process.env.AWS_ACCESS_KEY_ID) {
+				return `amazon-bedrock:access-key:${process.env.AWS_ACCESS_KEY_ID}:${process.env.AWS_SECRET_ACCESS_KEY ?? ""}:${process.env.AWS_SESSION_TOKEN ?? ""}`;
+			}
+			if (process.env.AWS_BEARER_TOKEN_BEDROCK) {
+				return `amazon-bedrock:bearer:${process.env.AWS_BEARER_TOKEN_BEDROCK}`;
+			}
+			if (process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI) {
+				return `amazon-bedrock:ecs-relative:${process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI}`;
+			}
+			if (process.env.AWS_CONTAINER_CREDENTIALS_FULL_URI) {
+				return `amazon-bedrock:ecs-full:${process.env.AWS_CONTAINER_CREDENTIALS_FULL_URI}`;
+			}
+			if (process.env.AWS_WEB_IDENTITY_TOKEN_FILE) {
+				return `amazon-bedrock:web-identity:${process.env.AWS_WEB_IDENTITY_TOKEN_FILE}`;
+			}
+		}
+		if (provider === "google-vertex") {
+			const project = process.env.GOOGLE_CLOUD_PROJECT ?? process.env.GCLOUD_PROJECT ?? "";
+			const location = process.env.GOOGLE_CLOUD_LOCATION ?? "";
+			const credentialsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS ?? "application-default";
+			return `google-vertex:${project}:${location}:${credentialsPath}`;
+		}
+		return provider;
+	}
+
+	private getFallbackAuthCandidate(provider: string): AuthSourceCandidate | undefined {
+		const apiKey = this.fallbackResolver?.(provider);
+		if (!apiKey) {
+			return undefined;
+		}
+		return this.createAuthSourceCandidate({
+			configured: false,
+			source: "fallback",
+			label: "custom provider config",
+			identityMaterial: provider,
+			valueMaterial: apiKey,
+		});
+	}
+
+	private getAuthSourceCandidates(provider: string, options?: { includeFallback?: boolean }): AuthSourceCandidate[] {
+		const fallbackCandidate =
+			options?.includeFallback === false ? undefined : this.getFallbackAuthCandidate(provider);
+		const candidates =
+			provider === PRIME_INFERENCE_PROVIDER_ID
+				? [
+						this.getRuntimeAuthCandidate(provider),
+						this.getEnvironmentAuthCandidate(provider),
+						this.getPrimeCliAuthCandidate(provider),
+						this.getStoredAuthCandidate(provider),
+						fallbackCandidate,
+					]
+				: [
+						this.getRuntimeAuthCandidate(provider),
+						this.getStoredAuthCandidate(provider),
+						this.getEnvironmentAuthCandidate(provider),
+						fallbackCandidate,
+					];
+		return candidates.filter((candidate): candidate is AuthSourceCandidate => candidate !== undefined);
+	}
+
+	private isAuthSourceStale(provider: string, candidate: AuthSourceCandidate): boolean {
+		const matchingStale = this.getMatchingStaleAuthSources(provider, candidate);
+		if (matchingStale.length === 0) {
+			return false;
+		}
+		const valueFingerprint = candidate.valueFingerprint ?? candidate.resolveValueFingerprint?.();
+		return Boolean(valueFingerprint && matchingStale.some((token) => token.valueFingerprint === valueFingerprint));
+	}
+
+	private getMatchingStaleAuthSources(provider: string, candidate: AuthSourceCandidate): AuthSourceToken[] {
+		const stale = this.staleAuthSources.get(provider);
+		if (!stale) {
+			return [];
+		}
+		return stale.filter(
+			(token) => token.source === candidate.source && token.identityFingerprint === candidate.identityFingerprint,
+		);
+	}
+
+	private getAvailableAuthCandidate(
+		provider: string,
+		options?: { includeFallback?: boolean },
+	): { candidate?: AuthSourceCandidate; hasStaleCandidate: boolean } {
+		let hasStaleCandidate = false;
+		for (const candidate of this.getAuthSourceCandidates(provider, options)) {
+			if (this.isAuthSourceStale(provider, candidate)) {
+				hasStaleCandidate = true;
+				continue;
+			}
+			return { candidate, hasStaleCandidate };
+		}
+		return { hasStaleCandidate };
+	}
+
+	private toAuthStatus(candidate: AuthSourceCandidate): AuthStatus {
+		return {
+			configured: candidate.configured,
+			source: candidate.source,
+			...(candidate.label ? { label: candidate.label } : {}),
+		};
+	}
+
+	private getAuthStatusFromCandidates(provider: string): AuthStatus {
+		const { candidate, hasStaleCandidate } = this.getAvailableAuthCandidate(provider);
+		if (candidate) {
+			return this.toAuthStatus(candidate);
+		}
+		if (hasStaleCandidate) {
+			return { configured: false, source: "stale", label: "expired" };
+		}
+		return { configured: false };
+	}
+
+	markAuthStale(provider: string): boolean {
+		const token = this.getCurrentAuthSourceToken(provider);
+		return token ? this.markAuthSourceStale(token) : false;
+	}
+
+	private getAuthSourceTokenForCandidate(
+		provider: string,
+		candidate: AuthSourceCandidate,
+	): AuthSourceToken | undefined {
+		const valueFingerprint = candidate.valueFingerprint ?? candidate.resolveValueFingerprint?.();
+		if (!valueFingerprint) {
+			return undefined;
+		}
+		return {
+			provider,
+			source: candidate.source,
+			identityFingerprint: candidate.identityFingerprint,
+			valueFingerprint,
+		};
+	}
+
+	getCurrentAuthSourceToken(provider: string): AuthSourceToken | undefined {
+		const { candidate } = this.getAvailableAuthCandidate(provider);
+		if (!candidate) {
+			return undefined;
+		}
+		return this.getAuthSourceTokenForCandidate(provider, candidate);
+	}
+
+	markAuthSourceStale(token: AuthSourceToken): boolean {
+		if (token.provider.length === 0) {
+			return false;
+		}
+		const stale = this.staleAuthSources.get(token.provider) ?? [];
+		if (
+			!stale.some(
+				(existing) =>
+					existing.source === token.source &&
+					existing.identityFingerprint === token.identityFingerprint &&
+					existing.valueFingerprint === token.valueFingerprint,
+			)
+		) {
+			stale.push(token);
+		}
+		this.staleAuthSources.set(token.provider, stale);
+		return true;
+	}
+
+	private clearStaleAuthSource(provider: string, source: ActiveAuthStatusSource): void {
+		const stale = this.staleAuthSources.get(provider);
+		if (!stale) {
+			return;
+		}
+		const next = stale.filter((token) => token.source !== source);
+		if (next.length === 0) {
+			this.staleAuthSources.delete(provider);
+		} else {
+			this.staleAuthSources.set(provider, next);
+		}
+	}
+
 	private parseStorageData(content: string | undefined): AuthStorageData {
 		if (!content) {
 			return {};
@@ -278,8 +626,6 @@ export class AuthStorage {
 	 * Reload credentials from storage.
 	 */
 	reload(): void {
-		this.primeCliConfigCache = undefined;
-		this.primeCliConfigCacheLoaded = false;
 		let content: string | undefined;
 		try {
 			this.storage.withLock((current) => {
@@ -326,6 +672,7 @@ export class AuthStorage {
 	 * Set credential for a provider.
 	 */
 	set(provider: string, credential: AuthCredential): void {
+		this.clearStaleAuthSource(provider, "stored");
 		this.data[provider] = credential;
 		this.persistProviderChange(provider, credential);
 	}
@@ -334,6 +681,7 @@ export class AuthStorage {
 	 * Remove credential for a provider.
 	 */
 	remove(provider: string): void {
+		this.clearStaleAuthSource(provider, "stored");
 		delete this.data[provider];
 		this.persistProviderChange(provider, undefined);
 	}
@@ -357,40 +705,14 @@ export class AuthStorage {
 	 * Unlike getApiKey(), this doesn't refresh OAuth tokens.
 	 */
 	hasAuth(provider: string): boolean {
-		if (this.runtimeOverrides.has(provider)) return true;
-		if (this.data[provider]) return true;
-		if (getEnvApiKey(provider)) return true;
-		if (this.getPrimeCliApiKey(provider)) return true;
-		if (this.fallbackResolver?.(provider)) return true;
-		return false;
+		return this.getAvailableAuthCandidate(provider).candidate !== undefined;
 	}
 
 	/**
 	 * Return auth status without exposing credential values or refreshing tokens.
 	 */
 	getAuthStatus(provider: string): AuthStatus {
-		if (this.data[provider]) {
-			return { configured: true, source: "stored" };
-		}
-
-		if (this.runtimeOverrides.has(provider)) {
-			return { configured: false, source: "runtime", label: "--api-key" };
-		}
-
-		const envKeys = findEnvKeys(provider);
-		if (envKeys?.[0]) {
-			return { configured: false, source: "environment", label: envKeys[0] };
-		}
-
-		if (this.getPrimeCliApiKey(provider)) {
-			return { configured: false, source: "prime_cli", label: "Prime CLI" };
-		}
-
-		if (this.fallbackResolver?.(provider)) {
-			return { configured: false, source: "fallback", label: "custom provider config" };
-		}
-
-		return { configured: false };
+		return this.getAuthStatusFromCandidates(provider);
 	}
 
 	/**
@@ -423,6 +745,15 @@ export class AuthStorage {
 	 * Logout from a provider.
 	 */
 	logout(provider: string): void {
+		if (provider === PRIME_INFERENCE_PROVIDER_ID && this.isPrimeCliConfigEnabled()) {
+			try {
+				clearPrimeCliCredentials(this.getEnabledPrimeCliConfigPath());
+				this.clearStaleAuthSource(provider, "prime_cli");
+			} catch (error) {
+				this.recordError(error);
+				throw error;
+			}
+		}
 		this.remove(provider);
 	}
 
@@ -480,75 +811,159 @@ export class AuthStorage {
 	 * Get API key for a provider.
 	 * Priority:
 	 * 1. Runtime override (CLI --api-key)
-	 * 2. API key from auth.json
-	 * 3. OAuth token from auth.json (auto-refreshed with locking)
-	 * 4. Environment variable
-	 * 5. Fallback resolver (models.json custom providers)
+	 * 2. Prime Inference: environment variable, Prime CLI config, auth.json
+	 * 3. Other providers: auth.json, environment variable
+	 * 4. Fallback resolver (models.json custom providers)
 	 */
-	async getApiKey(providerId: string, options?: { includeFallback?: boolean }): Promise<string | undefined> {
+	async getApiKeyWithSourceToken(
+		providerId: string,
+		options?: { includeFallback?: boolean },
+	): Promise<AuthApiKeyResult> {
 		// Runtime override takes highest priority
+		const runtimeCandidate = this.getRuntimeAuthCandidate(providerId);
 		const runtimeKey = this.runtimeOverrides.get(providerId);
-		if (runtimeKey) {
-			return runtimeKey;
+		if (runtimeKey && runtimeCandidate && !this.isAuthSourceStale(providerId, runtimeCandidate)) {
+			return {
+				apiKey: runtimeKey,
+				sourceToken: this.getAuthSourceTokenForCandidate(providerId, runtimeCandidate),
+			};
+		}
+
+		const envCandidate = this.getEnvironmentAuthCandidate(providerId);
+		const envKey = getEnvApiKey(providerId);
+		if (
+			providerId === PRIME_INFERENCE_PROVIDER_ID &&
+			envKey &&
+			envCandidate &&
+			!this.isAuthSourceStale(providerId, envCandidate)
+		) {
+			return {
+				apiKey: envKey,
+				sourceToken: this.getAuthSourceTokenForCandidate(providerId, envCandidate),
+			};
+		}
+
+		if (providerId === PRIME_INFERENCE_PROVIDER_ID) {
+			const primeCliCandidate = this.getPrimeCliAuthCandidate(providerId);
+			const primeCliKey = this.getPrimeCliApiKey(providerId);
+			if (primeCliKey && primeCliCandidate && !this.isAuthSourceStale(providerId, primeCliCandidate)) {
+				return {
+					apiKey: primeCliKey,
+					sourceToken: this.getAuthSourceTokenForCandidate(providerId, primeCliCandidate),
+				};
+			}
 		}
 
 		const cred = this.data[providerId];
 
 		if (cred?.type === "api_key") {
-			return resolveConfigValue(cred.key);
+			const storedCandidate = this.getStoredAuthCandidate(providerId);
+			if (storedCandidate && !this.isAuthSourceStale(providerId, storedCandidate)) {
+				const hasStaleRecord = this.getMatchingStaleAuthSources(providerId, storedCandidate).length > 0;
+				const apiKey =
+					cred.key.startsWith("!") && hasStaleRecord
+						? resolveConfigValueUncached(cred.key)
+						: resolveConfigValue(cred.key);
+				const sourceToken =
+					apiKey === undefined
+						? undefined
+						: this.getAuthSourceTokenForCandidate(
+								providerId,
+								cred.key.startsWith("!")
+									? (this.getStoredAuthCandidate(providerId, { resolvedCommandValue: apiKey }) ??
+											storedCandidate)
+									: storedCandidate,
+							);
+				return { apiKey, sourceToken };
+			}
 		}
 
 		if (cred?.type === "oauth") {
-			const provider = getOAuthProvider(providerId);
-			if (!provider) {
-				// Unknown OAuth provider, can't get API key
-				return undefined;
-			}
-
-			// Check if token needs refresh
-			const needsRefresh = Date.now() >= cred.expires;
-
-			if (needsRefresh) {
-				// Use locked refresh to prevent race conditions
-				try {
-					const result = await this.refreshOAuthTokenWithLock(providerId);
-					if (result) {
-						return result.apiKey;
-					}
-				} catch (error) {
-					this.recordError(error);
-					// Refresh failed - re-read file to check if another instance succeeded
-					this.reload();
-					const updatedCred = this.data[providerId];
-
-					if (updatedCred?.type === "oauth" && Date.now() < updatedCred.expires) {
-						// Another instance refreshed successfully, use those credentials
-						return provider.getApiKey(updatedCred);
-					}
-
-					// Refresh truly failed - return undefined so model discovery skips this provider
-					// User can /login to re-authenticate (credentials preserved for retry)
-					return undefined;
+			const storedCandidate = this.getStoredAuthCandidate(providerId);
+			if (storedCandidate && !this.isAuthSourceStale(providerId, storedCandidate)) {
+				const provider = getOAuthProvider(providerId);
+				if (!provider) {
+					// Unknown OAuth provider, can't get API key
+					return {};
 				}
-			} else {
-				// Token not expired, use current access token
-				return provider.getApiKey(cred);
+
+				// Check if token needs refresh
+				const needsRefresh = Date.now() >= cred.expires;
+
+				if (needsRefresh) {
+					// Use locked refresh to prevent race conditions
+					try {
+						const result = await this.refreshOAuthTokenWithLock(providerId);
+						if (result) {
+							const refreshedCandidate = this.getStoredAuthCandidate(providerId);
+							return {
+								apiKey: result.apiKey,
+								sourceToken: refreshedCandidate
+									? this.getAuthSourceTokenForCandidate(providerId, refreshedCandidate)
+									: undefined,
+							};
+						}
+					} catch (error) {
+						this.recordError(error);
+						// Refresh failed - re-read file to check if another instance succeeded
+						this.reload();
+						const updatedCred = this.data[providerId];
+
+						if (updatedCred?.type === "oauth" && Date.now() < updatedCred.expires) {
+							// Another instance refreshed successfully, use those credentials
+							const updatedCandidate = this.getStoredAuthCandidate(providerId);
+							return {
+								apiKey: provider.getApiKey(updatedCred),
+								sourceToken: updatedCandidate
+									? this.getAuthSourceTokenForCandidate(providerId, updatedCandidate)
+									: undefined,
+							};
+						}
+
+						// Refresh truly failed - return undefined so model discovery skips this provider
+						// User can /login to re-authenticate (credentials preserved for retry)
+						return {};
+					}
+				} else {
+					// Token not expired, use current access token
+					return {
+						apiKey: provider.getApiKey(cred),
+						sourceToken: this.getAuthSourceTokenForCandidate(providerId, storedCandidate),
+					};
+				}
 			}
 		}
 
-		// Fall back to environment variable
-		const envKey = getEnvApiKey(providerId);
-		if (envKey) return envKey;
-
-		const primeCliKey = this.getPrimeCliApiKey(providerId);
-		if (primeCliKey) return primeCliKey;
+		// Other providers preserve auth.json priority over environment variables.
+		if (
+			providerId !== PRIME_INFERENCE_PROVIDER_ID &&
+			envKey &&
+			envCandidate &&
+			!this.isAuthSourceStale(providerId, envCandidate)
+		) {
+			return {
+				apiKey: envKey,
+				sourceToken: this.getAuthSourceTokenForCandidate(providerId, envCandidate),
+			};
+		}
 
 		// Fall back to custom resolver (e.g., models.json custom providers)
 		if (options?.includeFallback !== false) {
-			return this.fallbackResolver?.(providerId) ?? undefined;
+			const fallbackCandidate = this.getFallbackAuthCandidate(providerId);
+			if (fallbackCandidate && !this.isAuthSourceStale(providerId, fallbackCandidate)) {
+				return {
+					apiKey: this.fallbackResolver?.(providerId) ?? undefined,
+					sourceToken: this.getAuthSourceTokenForCandidate(providerId, fallbackCandidate),
+				};
+			}
 		}
 
-		return undefined;
+		return {};
+	}
+
+	async getApiKey(providerId: string, options?: { includeFallback?: boolean }): Promise<string | undefined> {
+		const result = await this.getApiKeyWithSourceToken(providerId, options);
+		return result.apiKey;
 	}
 
 	/**
@@ -559,6 +974,16 @@ export class AuthStorage {
 	}
 
 	setPrimeInferenceTeamSelection(team: PrimeTeam | null): void {
+		if (this.isPrimeCliConfigEnabled()) {
+			try {
+				savePrimeCliTeamSelection(team, this.getEnabledPrimeCliConfigPath());
+			} catch (error) {
+				this.recordError(error);
+				throw error;
+			}
+			return;
+		}
+
 		const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
 		if (credential?.type !== "api_key") {
 			return;
@@ -569,9 +994,79 @@ export class AuthStorage {
 		});
 	}
 
+	setPrimeInferenceApiKey(apiKey: string): void {
+		if (this.isPrimeCliConfigEnabled()) {
+			try {
+				const configPath = this.getEnabledPrimeCliConfigPath();
+				const config = loadPrimeCliConfig(configPath);
+				const existingCredential = this.data[PRIME_INFERENCE_PROVIDER_ID];
+				const legacyPrimeTeam = existingCredential?.type === "api_key" ? existingCredential.primeTeam : undefined;
+				if (config.apiKey !== apiKey) {
+					savePrimeCliApiKey(apiKey, configPath);
+				} else if (!config.teamIdFromEnv && (legacyPrimeTeam === null || (!config.teamId && legacyPrimeTeam))) {
+					savePrimeCliTeamSelection(legacyPrimeTeam, configPath);
+				}
+				this.clearStaleAuthSource(PRIME_INFERENCE_PROVIDER_ID, "prime_cli");
+			} catch (error) {
+				this.recordError(error);
+				throw error;
+			}
+			if (this.data[PRIME_INFERENCE_PROVIDER_ID]) {
+				this.remove(PRIME_INFERENCE_PROVIDER_ID);
+			}
+			return;
+		}
+
+		const existingCredential = this.data[PRIME_INFERENCE_PROVIDER_ID];
+		const existingPrimeTeam = existingCredential?.type === "api_key" ? existingCredential.primeTeam : undefined;
+		this.set(PRIME_INFERENCE_PROVIDER_ID, {
+			type: "api_key",
+			key: apiKey,
+			...(existingPrimeTeam !== undefined ? { primeTeam: existingPrimeTeam } : {}),
+		});
+	}
+
 	getPrimeInferenceTeamSelection(): PrimeTeamCredential | null | undefined {
+		let config: PrimeCliConfig | undefined;
+		if (this.isPrimeCliConfigEnabled()) {
+			config = this.getPrimeCliConfig(PRIME_INFERENCE_PROVIDER_ID);
+			if (config?.teamIdFromEnv) {
+				return undefined;
+			}
+		}
+
 		const credential = this.data[PRIME_INFERENCE_PROVIDER_ID];
-		return credential?.type === "api_key" ? credential.primeTeam : undefined;
+		const authSource = this.getAuthStatus(PRIME_INFERENCE_PROVIDER_ID).source;
+		if (authSource === "runtime" || authSource === "environment") {
+			return undefined;
+		}
+		if (authSource === "prime_cli") {
+			if (credential?.type === "api_key" && credential.primeTeam === null) {
+				return null;
+			}
+			if (config?.teamId) {
+				return this.toPrimeTeamCredential({
+					teamId: config.teamId,
+					name: config.teamName ?? "Prime CLI team",
+					...(config.teamRole ? { role: config.teamRole } : {}),
+				});
+			}
+			if (credential?.type === "api_key" && credential.primeTeam) {
+				return credential.primeTeam;
+			}
+			return null;
+		}
+		if (credential?.type === "api_key" && credential.primeTeam !== undefined) {
+			return credential.primeTeam;
+		}
+		if (!config?.apiKey && config?.teamId) {
+			return this.toPrimeTeamCredential({
+				teamId: config.teamId,
+				name: config.teamName ?? "Prime CLI team",
+				...(config.teamRole ? { role: config.teamRole } : {}),
+			});
+		}
+		return undefined;
 	}
 
 	getProviderHeaders(providerId: string): Record<string, string> | undefined {
@@ -584,19 +1079,15 @@ export class AuthStorage {
 			return primeCliConfig.teamId ? { "X-Prime-Team-ID": primeCliConfig.teamId } : undefined;
 		}
 
-		const credential = this.data[providerId];
-		if (credential?.type === "api_key") {
-			if (credential.primeTeam === null) {
-				return undefined;
-			}
-			const selectedTeamId = credential.primeTeam?.teamId;
-			if (selectedTeamId) {
-				return { "X-Prime-Team-ID": selectedTeamId };
-			}
-		}
-
-		const teamId = primeCliConfig?.teamId;
+		const teamId = this.getPrimeInferenceTeamSelection()?.teamId;
 		return teamId ? { "X-Prime-Team-ID": teamId } : undefined;
+	}
+
+	getPrimeCliConfigPath(): string | undefined {
+		if (!this.isPrimeCliConfigEnabled()) {
+			return undefined;
+		}
+		return getPrimeCliConfigPath(this.options.primeCliConfigPath);
 	}
 
 	private toPrimeTeamCredential(team: PrimeTeam): PrimeTeamCredential {
@@ -620,17 +1111,25 @@ export class AuthStorage {
 		if (providerId !== PRIME_INFERENCE_PROVIDER_ID) {
 			return undefined;
 		}
-		if (!this.options.usePrimeCliConfig && !this.options.primeCliConfigPath) {
+		if (!this.isPrimeCliConfigEnabled()) {
 			return undefined;
 		}
-		if (!this.primeCliConfigCacheLoaded) {
-			this.primeCliConfigCache = loadPrimeCliConfig(this.options.primeCliConfigPath);
-			this.primeCliConfigCacheLoaded = true;
-		}
-		return this.primeCliConfigCache;
+		return loadPrimeCliConfig(this.options.primeCliConfigPath);
 	}
 
 	private getPrimeCliApiKey(providerId: string): string | undefined {
 		return this.getPrimeCliConfig(providerId)?.apiKey;
+	}
+
+	private getEnabledPrimeCliConfigPath(): string {
+		const configPath = this.getPrimeCliConfigPath();
+		if (!configPath) {
+			throw new Error("Prime CLI config is not enabled");
+		}
+		return configPath;
+	}
+
+	private isPrimeCliConfigEnabled(): boolean {
+		return Boolean(this.options.usePrimeCliConfig || this.options.primeCliConfigPath);
 	}
 }

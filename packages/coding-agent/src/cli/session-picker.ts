@@ -2,48 +2,22 @@
  * TUI session selector for --resume flag
  */
 
-import { type Component, ProcessTerminal, setKeybindings, TUI } from "@earendil-works/pi-tui";
+import { ProcessTerminal, setKeybindings, TUI } from "@earendil-works/pi-tui";
 import { VERSION } from "../config.js";
 import { KeybindingsManager } from "../core/keybindings.js";
-import type { SessionInfo, SessionListProgress } from "../core/session-manager.js";
+import { type SessionInfo, type SessionListCallbacks, SessionManager } from "../core/session-manager.js";
+import { SessionPickerScreen } from "../modes/interactive/components/session-picker-screen.js";
 import { SessionSelectorComponent } from "../modes/interactive/components/session-selector.js";
 import { BrandSplashHeader } from "../modes/interactive/interactive-mode.js";
 
-type SessionsLoader = (onProgress?: SessionListProgress) => Promise<SessionInfo[]>;
-
-/** Full-screen layout matching the agents view: brand splash on top, selector below. */
-class SessionPickerScreen implements Component {
-	constructor(
-		private readonly ui: TUI,
-		private readonly splash: BrandSplashHeader,
-		private readonly selector: SessionSelectorComponent,
-	) {}
-
-	invalidate(): void {
-		this.splash.invalidate();
-		this.selector.invalidate();
-	}
-
-	render(width: number): string[] {
-		const safeWidth = Math.max(1, width);
-		const height = Math.max(1, this.ui.terminal.rows);
-		const splashLines = this.splash.render(safeWidth);
-		// Selector chrome (header, hints, search, spacers) takes ~8 rows; give the
-		// list the rest of the terminal instead of its compact default.
-		this.selector.setListMaxVisible(height - splashLines.length - 10);
-		const lines = [...splashLines, ...this.selector.render(safeWidth)];
-		while (lines.length < height) {
-			lines.push("");
-		}
-		return lines.slice(0, height);
-	}
-}
+type SessionsLoader = (callbacks?: SessionListCallbacks) => Promise<SessionInfo[]>;
+type AllSessionsLoader = (callbacks?: SessionListCallbacks, sessionDir?: string) => Promise<SessionInfo[]>;
 
 /** Show TUI session selector and return selected session path or null if cancelled */
 export async function selectSession(
 	currentSessionsLoader: SessionsLoader,
-	allSessionsLoader: SessionsLoader,
-	options?: { cwd?: string; modelId?: string },
+	allSessionsLoader: AllSessionsLoader,
+	options?: { cwd?: string; modelId?: string; sessionDir?: string },
 ): Promise<string | null> {
 	return new Promise((resolve) => {
 		const ui = new TUI(new ProcessTerminal());
@@ -52,8 +26,19 @@ export async function selectSession(
 		let resolved = false;
 
 		const selector = new SessionSelectorComponent(
-			currentSessionsLoader,
-			allSessionsLoader,
+			(callbacks) =>
+				currentSessionsLoader({
+					onProgress: callbacks?.onProgress,
+					onSession: callbacks?.onSession,
+				}),
+			(callbacks) =>
+				allSessionsLoader(
+					{
+						onProgress: callbacks?.onProgress,
+						onSession: callbacks?.onSession,
+					},
+					options?.sessionDir,
+				),
 			(path: string) => {
 				if (!resolved) {
 					resolved = true;
@@ -73,7 +58,16 @@ export async function selectSession(
 				process.exit(0);
 			},
 			() => ui.requestRender(),
-			{ showRenameHint: false, keybindings, frameless: true },
+			{
+				renameSession: async (sessionPath, nextName) => {
+					const name = (nextName ?? "").trim();
+					if (!name) return;
+					SessionManager.open(sessionPath, options?.sessionDir).appendSessionInfo(name);
+				},
+				showRenameHint: true,
+				keybindings,
+				frameless: true,
+			},
 		);
 
 		const splash = new BrandSplashHeader(
@@ -82,7 +76,7 @@ export async function selectSession(
 			() => options?.cwd ?? process.cwd(),
 		);
 		ui.addChild(new SessionPickerScreen(ui, splash, selector));
-		ui.setFocus(selector.getSessionList());
+		ui.setFocus(selector);
 		ui.start();
 	});
 }

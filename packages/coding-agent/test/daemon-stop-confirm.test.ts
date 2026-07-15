@@ -77,7 +77,13 @@ describe("confirmDaemonSessionLoss", () => {
 
 	it("treats compacting and pending-message sessions as busy", async () => {
 		setTTY(false);
-		for (const overrides of [{ isCompacting: true }, { pendingMessageCount: 1 }, { isStreaming: true }]) {
+		for (const overrides of [
+			{ isCompacting: true },
+			{ pendingMessageCount: 1 },
+			{ isStreaming: true },
+			{ isBashRunning: true },
+			{ hasRunningRlmChildren: true },
+		]) {
 			vi.mocked(console.error).mockClear();
 			const probe: RunningDaemonProbe = { reachable: true, activeSessions: [session(overrides)] };
 			expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);

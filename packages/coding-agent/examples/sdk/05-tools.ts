@@ -1,7 +1,7 @@
 /**
  * Tools Configuration
  *
- * Use tool names to choose which built-in tools are enabled.
+ * Use tool names to choose which built-in, extension, or custom tools are enabled.
  *
  * Tool names are matched against all available tools. If you use a custom `cwd`,
  * createAgentSession() applies that cwd when it builds the actual built-in tools.
@@ -21,16 +21,16 @@ console.log("IPython session created");
 
 // Custom tool selection
 await createAgentSession({
-	tools: ["ipython", "bash"],
+	tools: ["ipython"],
 	sessionManager: SessionManager.inMemory(),
 });
-console.log("Custom tools session created");
+console.log("Explicit IPython session created");
 
 // With custom cwd
 const customCwd = "/path/to/project";
 await createAgentSession({
 	cwd: customCwd,
-	tools: ["ipython", "bash", "edit"],
+	tools: ["ipython"],
 	sessionManager: SessionManager.inMemory(customCwd),
 });
 console.log("Custom cwd session created");
@@ -38,7 +38,7 @@ console.log("Custom cwd session created");
 // Or pick specific tools for custom cwd
 await createAgentSession({
 	cwd: customCwd,
-	tools: ["bash", "edit"],
+	tools: ["ipython"],
 	sessionManager: SessionManager.inMemory(customCwd),
 });
 console.log("Specific tools with custom cwd session created");

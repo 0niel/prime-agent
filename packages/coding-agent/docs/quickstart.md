@@ -110,8 +110,7 @@ Sessions are saved automatically:
 
 ```bash
 pi -c                  # Continue most recent session
-pi -r                  # Browse previous sessions
-pi --session <path|id> # Open a specific session
+pi -r [path|id]        # Browse previous sessions or open a specific session
 ```
 
 Inside pi, use `/resume`, `/new`, `/tree`, `/fork`, and `/clone` to manage sessions.

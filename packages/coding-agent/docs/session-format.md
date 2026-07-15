@@ -370,8 +370,10 @@ Key methods for working with sessions programmatically.
 - `SessionManager.forkFrom(sourcePath, targetCwd, sessionDir?)` - Fork session from another project
 
 ### Static Listing Methods
-- `SessionManager.list(cwd, sessionDir?, onProgress?)` - List sessions for a directory
-- `SessionManager.listAll(onProgress?)` - List all sessions across all projects
+- `SessionManager.list(cwd, sessionDir?, callbacks?)` - List sessions for a directory
+- `SessionManager.listAll(callbacks?, sessionDir?)` - List all sessions across all projects
+
+`callbacks` can provide `onProgress(loaded, total)` and `onSession(session)` handlers.
 
 ### Instance Methods - Session Management
 - `newSession(options?)` - Start a new session (options: `{ parentSession?: string }`)

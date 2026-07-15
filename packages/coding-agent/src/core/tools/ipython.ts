@@ -4,20 +4,29 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import { IMAGE_MIME_TYPES } from "../../utils/mime.js";
-import type { ToolDefinition } from "../extensions/types.js";
+import type { ExtensionContext, ToolDefinition } from "../extensions/types.js";
 import { withKernelBootPermit } from "../kernel/boot-gate.js";
 import type { KernelBootstrapProgressHandler } from "../kernel/bootstrap.js";
 import {
+	type ExecuteResult,
 	type HostRequestHandlers,
 	type KernelAttachment,
+	KernelBusyAfterInterruptError,
 	type KernelDiffDisplay,
 	KernelManager,
+	type KernelSentAgentMessage,
 } from "../kernel/index.js";
 import { manifestPathIn, type RestoreResult, snapshotPathIn } from "../kernel/state-snapshot.js";
 import type { PythonSkillRuntimeInfo } from "../skills.js";
+import { parseIpythonBashCell } from "./ipython-cell-code.js";
 import { wrapToolDefinition } from "./tool-definition-wrapper.js";
 
 const RLM_BOOTSTRAP_BASE_CODE = `
+import asyncio
+import os as _prime_agent_os
+
+_prime_agent_os.environ["NO_COLOR"] = "1"
+
 try:
     import nest_asyncio as _prime_agent_nest_asyncio
     _prime_agent_nest_asyncio.apply()
@@ -125,6 +134,102 @@ const ipythonSchema = Type.Object({
 	}),
 });
 
+const BUSY_KERNEL_WAIT_CHOICE = "Wait and preserve state";
+const BUSY_KERNEL_KILL_CHOICE = "Kill kernel and restart";
+const BUSY_KERNEL_PROMPT = [
+	"Interrupted IPython cell is still running",
+	"Ctrl+C sent an interrupt, but the previous cell has not stopped yet. A new IPython command cannot start until it finishes.",
+	"Waiting preserves the current kernel state. Killing restarts IPython and loses in-memory variables, imports, and running tasks.",
+].join("\n");
+const KERNEL_RESTART_NOTICE = [
+	"<ipython_kernel_reset>",
+	"The IPython kernel was restarted after a previous interrupted cell kept running. Variables, imports, async tasks, and open resources from before the restart are no longer available; recreate them before using them.",
+	"</ipython_kernel_reset>",
+].join("\n");
+
+function createAbortError(): Error {
+	return new Error("IPython execution aborted");
+}
+
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, onAbort?: () => void): Promise<T> {
+	if (!signal) {
+		return promise;
+	}
+	if (signal.aborted) {
+		onAbort?.();
+		return Promise.reject(createAbortError());
+	}
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		const cleanup = () => signal.removeEventListener("abort", abort);
+		const abort = () => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			cleanup();
+			onAbort?.();
+			reject(createAbortError());
+		};
+		signal.addEventListener("abort", abort, { once: true });
+		promise.then(
+			(value) => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				resolve(value);
+			},
+			(error: unknown) => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				reject(error);
+			},
+		);
+	});
+}
+
+function createLinkedAbortSignal(sources: readonly (AbortSignal | undefined)[]): {
+	signal: AbortSignal;
+	cleanup: () => void;
+} {
+	const controller = new AbortController();
+	const cleanups: Array<() => void> = [];
+	const abort = () => controller.abort();
+	for (const source of sources) {
+		if (!source) {
+			continue;
+		}
+		if (source.aborted) {
+			controller.abort();
+			continue;
+		}
+		const listener = () => abort();
+		source.addEventListener("abort", listener, { once: true });
+		cleanups.push(() => source.removeEventListener("abort", listener));
+	}
+	return {
+		signal: controller.signal,
+		cleanup: () => {
+			for (const cleanup of cleanups) {
+				cleanup();
+			}
+		},
+	};
+}
+
+function setWorkingMessage(ctx: ExtensionContext | undefined, message?: string): void {
+	try {
+		ctx?.ui.setWorkingMessage(message);
+	} catch {
+		// Stale UI context; cosmetic only.
+	}
+}
+
 export type IpythonToolInput = Static<typeof ipythonSchema>;
 
 export interface IpythonToolDetails {
@@ -138,6 +243,10 @@ export interface IpythonToolDetails {
 	diffs?: KernelDiffDisplay[];
 	/** Media attachments loaded into context (e.g. by the attach-image skill). */
 	attachments?: KernelAttachment[];
+	/** Agent messages sent from this cell. */
+	sentAgentMessages?: KernelSentAgentMessage[];
+	/** True when this result came after killing and restarting a busy kernel. */
+	kernelRestarted?: boolean;
 	error?: {
 		ename: string;
 		evalue: string;
@@ -154,6 +263,10 @@ export interface IpythonToolOptions {
 	/** Python override. Must have `ipykernel` installed. */
 	python?: string;
 	env?: Record<string, string>;
+	/** Command prefix prepended to every %%bash cell. */
+	commandPrefix?: string;
+	/** Optional explicit shell path for bare %%bash cells. */
+	shellPath?: string;
 	sessionId?: string;
 	/** Typed host request handlers for the kernel↔host bridge (rlm.run, goal.*, …). */
 	hostHandlers?: HostRequestHandlers;
@@ -172,8 +285,32 @@ export interface IpythonToolOptions {
 	onRestore?: (result: RestoreResult) => void;
 	/** Plan-mode (no-edit) state, read at kernel start and on toggle. */
 	planMode?: PlanModeController;
+	onLateSentAgentMessage?: (toolCallId: string, message: KernelSentAgentMessage) => void;
 	/** Shared provisioner owning the kernel lifecycle. When provided, the remaining options are ignored. */
 	provisioner?: IpythonKernelProvisioner;
+}
+
+function quoteScriptMagicArgument(value: string): string {
+	return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\"'\"'")}'`;
+}
+
+function applyShellSettingsToBashMagicCell(
+	code: string,
+	options: Pick<IpythonToolOptions, "commandPrefix" | "shellPath"> | undefined,
+): string {
+	const commandPrefix = options?.commandPrefix;
+	const shellPath = options?.shellPath?.trim();
+	if (!commandPrefix && !shellPath) return code;
+
+	const bashCell = parseIpythonBashCell(code);
+	if (!bashCell) return code;
+
+	const firstLine =
+		shellPath && bashCell.magicArguments.trim().length === 0
+			? `${bashCell.indent}%%script ${quoteScriptMagicArgument(shellPath)}`
+			: `${bashCell.indent}%%bash${bashCell.magicArguments}`;
+	const nextBody = commandPrefix ? `${commandPrefix}${bashCell.body ? `\n${bashCell.body}` : ""}` : bashCell.body;
+	return `${bashCell.leadingWhitespace}${firstLine}${bashCell.lineBreak || "\n"}${nextBody}`;
 }
 
 /**
@@ -248,6 +385,9 @@ export class IpythonKernelProvisioner {
 		const pending = this.managerPromise;
 		this.managerPromise = undefined;
 		this.startedManager = undefined;
+		if (this.options?.kernelManagerRef) {
+			this.options.kernelManagerRef.current = undefined;
+		}
 		if (!pending) return;
 		try {
 			const m = await pending;
@@ -257,16 +397,41 @@ export class IpythonKernelProvisioner {
 		}
 	}
 
-	ensure(onProgress?: KernelBootstrapProgressHandler): Promise<KernelManager> {
+	async kill(): Promise<void> {
+		const pending = this.managerPromise;
+		this.managerPromise = undefined;
+		this.startedManager = undefined;
+		if (this.options?.kernelManagerRef) {
+			this.options.kernelManagerRef.current = undefined;
+		}
+		if (!pending) return;
+		try {
+			const m = await pending;
+			await m.kill();
+		} catch {
+			// a failed startup already cleaned up after itself
+		}
+	}
+
+	ensure(onProgress?: KernelBootstrapProgressHandler, signal?: AbortSignal): Promise<KernelManager> {
+		if (signal?.aborted) {
+			return Promise.reject(createAbortError());
+		}
+		let cleanupProgressListener: (() => void) | undefined;
 		if (onProgress && !this.startedManager) {
 			this.startupListeners.add(onProgress);
+			cleanupProgressListener = () => {
+				this.startupListeners.delete(onProgress);
+				signal?.removeEventListener("abort", cleanupProgressListener!);
+			};
+			signal?.addEventListener("abort", cleanupProgressListener, { once: true });
 			// Joining an in-flight startup: replay the current stage.
 			if (this.managerPromise && this.lastStartupMessage) {
 				onProgress(this.lastStartupMessage);
 			}
 		}
 		if (!this.managerPromise) {
-			const startup = this.startKernel();
+			const startup = this.startKernel(signal);
 			this.managerPromise = startup;
 			startup.then(
 				(m) => {
@@ -285,7 +450,9 @@ export class IpythonKernelProvisioner {
 				},
 			);
 		}
-		return this.managerPromise;
+		return raceWithAbort(this.managerPromise, signal).finally(() => {
+			cleanupProgressListener?.();
+		});
 	}
 
 	private settleStartup(): void {
@@ -300,58 +467,79 @@ export class IpythonKernelProvisioner {
 		}
 	}
 
-	private async startKernel(): Promise<KernelManager> {
+	private async startKernel(signal?: AbortSignal): Promise<KernelManager> {
+		const startupAbort = createLinkedAbortSignal([this.disposeController.signal, signal]);
+		const startupSignal = startupAbort.signal;
 		// Wait for a previous provisioner (e.g. on /reload) to finish disposing — and
 		// flushing its final snapshot — before we read that snapshot back, so the two
 		// kernels can't race over the same on-disk file. Guarded so the common
 		// no-gate path stays synchronous (callers rely on prompt startup progress).
-		if (this.options?.readyGate) {
-			await this.options.readyGate.catch(() => {});
-		}
-		const snapshotDir = this.options?.snapshotDir;
-		const m = new KernelManager({
-			python: this.options?.python,
-			cwd: this.cwd,
-			env: this.options?.env,
-			sessionId: this.options?.sessionId,
-			hostHandlers: this.options?.hostHandlers,
-			pythonSkills: this.options?.pythonSkills,
-			// Only persistent sessions (which have an artifact dir) get a revivable snapshot.
-			snapshot: snapshotDir
-				? { path: snapshotPathIn(snapshotDir), manifestPath: manifestPathIn(snapshotDir) }
-				: undefined,
-		});
-		// Emitted synchronously (before the permit await) so a listener attaching
-		// mid-flight can replay the current stage.
-		this.emitStartupProgress("Starting IPython kernel...");
-		// Only the process spawn + port resolve contends for OS resources under a
-		// fan-out, and it is bounded by start()'s own timeouts — so the permit
-		// covers only start(). Restore/bootstrap run per-kernel afterwards and are
-		// unbounded execute()s; holding the global permit across them could pin it
-		// forever on a wedged bootstrap and starve every other session's boot.
-		const signal = this.disposeController.signal;
-		await withKernelBootPermit(() => {
-			// Disposed while queued for the permit — don't spawn a kernel nobody wants.
-			if (signal.aborted) throw new Error("Kernel provisioner disposed before start");
-			return m.start({ onBootstrapProgress: (message) => this.emitStartupProgress(message) });
-		}, signal);
-		let pendingRestore: RestoreResult | undefined;
 		try {
-			// Revive a prior session's namespace before the bootstrap, so the bootstrap
-			// then overwrites live handles (rlm, skills) on top of anything restored.
-			if (snapshotDir) {
-				const snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
-				this.emitStartupProgress("Restoring IPython state...");
-				const restore = await m.restoreState();
-				if (snapshotExisted) {
-					pendingRestore = restore ?? { restored: [], failed: [], path: snapshotPathIn(snapshotDir) };
-				}
+			if (this.options?.readyGate) {
+				await raceWithAbort(
+					this.options.readyGate.catch(() => {}),
+					startupSignal,
+				);
 			}
-			this.emitStartupProgress("Preparing IPython runtime...");
-			const bootstrap = await m.execute(buildRlmBootstrapCode(this.options?.pythonSkills));
-			if (bootstrap.status !== "ok") {
-				const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
-				throw new Error(`Failed to initialize rlm runtime in the IPython kernel:\n${details}`);
+			const snapshotDir = this.options?.snapshotDir;
+			const m = new KernelManager({
+				python: this.options?.python,
+				cwd: this.cwd,
+				env: this.options?.env,
+				sessionId: this.options?.sessionId,
+				hostHandlers: this.options?.hostHandlers,
+				pythonSkills: this.options?.pythonSkills,
+				// Only persistent sessions (which have an artifact dir) get a revivable snapshot.
+				snapshot: snapshotDir
+					? { path: snapshotPathIn(snapshotDir), manifestPath: manifestPathIn(snapshotDir) }
+					: undefined,
+			});
+			let pendingRestore: RestoreResult | undefined;
+			try {
+				// Emitted synchronously (before the permit await) so a listener attaching
+				// mid-flight can replay the current stage.
+				this.emitStartupProgress("Starting IPython kernel...");
+				// Only the process spawn + port resolve contends for OS resources under a
+				// fan-out, and it is bounded by start()'s own timeouts — so the permit
+				// covers only start(). Restore/bootstrap run per-kernel afterwards and are
+				// unbounded execute()s; holding the global permit across them could pin it
+				// forever on a wedged bootstrap and starve every other session's boot.
+				await withKernelBootPermit(() => {
+					// Disposed while queued for the permit — don't spawn a kernel nobody wants.
+					if (startupSignal.aborted) throw new Error("Kernel provisioner disposed before start");
+					return m.start({
+						onBootstrapProgress: (message) => this.emitStartupProgress(message),
+						signal: startupSignal,
+					});
+				}, startupSignal);
+				// Revive a prior session's namespace before the bootstrap, so the bootstrap
+				// then overwrites live handles (rlm, skills) on top of anything restored.
+				if (snapshotDir) {
+					const snapshotExisted = existsSync(snapshotPathIn(snapshotDir));
+					this.emitStartupProgress("Restoring IPython state...");
+					const restore = await raceWithAbort(m.restoreState(), startupSignal);
+					if (snapshotExisted) {
+						pendingRestore = restore ?? { restored: [], failed: [], path: snapshotPathIn(snapshotDir) };
+					}
+				}
+				this.emitStartupProgress("Preparing IPython runtime...");
+				const bootstrap = await m.execute(buildRlmBootstrapCode(this.options?.pythonSkills), {
+					signal: startupSignal,
+				});
+				if (bootstrap.status !== "ok") {
+					const details = [bootstrap.stderr, bootstrap.error?.traceback.join("\n")].filter(Boolean).join("\n");
+					throw new Error(`Failed to initialize rlm runtime in the IPython kernel:\n${details}`);
+				}
+			} catch (error) {
+				// Never leak the kernel's ZMQ sockets / temp dir if startup fails after spawn.
+				void m.dispose();
+				throw error;
+			}
+			// Only tell the model what was revived once the kernel is actually usable —
+			// a notice claiming restored state must never outlive a failed bootstrap.
+			if (pendingRestore) {
+				this._lastRestore = pendingRestore;
+				this.options?.onRestore?.(pendingRestore);
 			}
 			// Bind the plan-guard token before any model code can run. An outdated
 			// kernel runtime without the guard only fails startup when plan mode is
@@ -361,21 +549,77 @@ export class IpythonKernelProvisioner {
 			} catch (error) {
 				if (this.options?.planMode?.enabled) throw error;
 			}
+			if (this.options?.kernelManagerRef) {
+				this.options.kernelManagerRef.current = m;
+			}
+			return m;
+		} finally {
+			startupAbort.cleanup();
+		}
+	}
+}
+
+async function chooseBusyKernelAction(
+	ctx: ExtensionContext | undefined,
+	signal: AbortSignal | undefined,
+): Promise<"wait" | "kill" | "cancel"> {
+	if (!ctx?.hasUI) {
+		return "cancel";
+	}
+	const choice = await ctx.ui.select(BUSY_KERNEL_PROMPT, [BUSY_KERNEL_WAIT_CHOICE, BUSY_KERNEL_KILL_CHOICE], {
+		signal,
+	});
+	if (choice === BUSY_KERNEL_WAIT_CHOICE) {
+		return "wait";
+	}
+	if (choice === BUSY_KERNEL_KILL_CHOICE) {
+		return "kill";
+	}
+	return "cancel";
+}
+
+async function executeWithBusyKernelChoice(
+	provisioner: IpythonKernelProvisioner,
+	reportStartupProgress: KernelBootstrapProgressHandler,
+	toolCallId: string,
+	code: string,
+	signal: AbortSignal | undefined,
+	onStream: (chunk: string, name: "stdout" | "stderr") => void,
+	onWorkingMessage: (message?: string) => void,
+	onLateSentAgentMessage: ((toolCallId: string, message: KernelSentAgentMessage) => void) | undefined,
+	ctx: ExtensionContext | undefined,
+): Promise<{ result: ExecuteResult; kernelRestarted: boolean }> {
+	let kernelRestarted = false;
+	while (true) {
+		const m = await provisioner.ensure(reportStartupProgress, signal);
+		try {
+			return {
+				result: await m.execute(code, {
+					signal,
+					onStream,
+					onLateSentAgentMessage: onLateSentAgentMessage
+						? (message) => onLateSentAgentMessage(toolCallId, message)
+						: undefined,
+				}),
+				kernelRestarted,
+			};
 		} catch (error) {
-			// Never leak the kernel's ZMQ sockets / temp dir if startup fails after spawn.
-			void m.dispose();
+			if (!(error instanceof KernelBusyAfterInterruptError) || signal?.aborted) {
+				throw error;
+			}
+			const action = await chooseBusyKernelAction(ctx, signal);
+			if (action === "wait") {
+				onWorkingMessage("Waiting for IPython kernel...");
+				continue;
+			}
+			if (action === "kill") {
+				onWorkingMessage("Restarting IPython kernel...");
+				await provisioner.kill();
+				kernelRestarted = true;
+				continue;
+			}
 			throw error;
 		}
-		// Only tell the model what was revived once the kernel is actually usable —
-		// a notice claiming restored state must never outlive a failed bootstrap.
-		if (pendingRestore) {
-			this._lastRestore = pendingRestore;
-			this.options?.onRestore?.(pendingRestore);
-		}
-		if (this.options?.kernelManagerRef) {
-			this.options.kernelManagerRef.current = m;
-		}
-		return m;
 	}
 }
 
@@ -402,17 +646,14 @@ export function createIpythonToolDefinition(
 		// The kernel is single-threaded — pi must not run two ipython calls in parallel within a batch.
 		executionMode: "sequential",
 		parameters: ipythonSchema,
-		execute: async (_toolCallId, params, signal, onUpdate, ctx) => {
-			// Cosmetic; ctx.ui can throw on a stale ctx, but must never fail the cell.
-			const setWorkingMessage = (message?: string) => {
-				try {
-					ctx?.ui.setWorkingMessage(message);
-				} catch {}
+		execute: async (toolCallId, params, signal, onUpdate, ctx) => {
+			let hasWorkingMessage = false;
+			const setToolWorkingMessage = (message?: string) => {
+				setWorkingMessage(ctx, message);
+				hasWorkingMessage = message !== undefined;
 			};
-			let reportedStartupProgress = false;
 			const reportStartupProgress: KernelBootstrapProgressHandler = (message) => {
-				reportedStartupProgress = true;
-				setWorkingMessage(message);
+				setToolWorkingMessage(message);
 				onUpdate?.({
 					content: [{ type: "text", text: message }],
 					details: { status: "starting" },
@@ -420,22 +661,32 @@ export function createIpythonToolDefinition(
 			};
 
 			try {
-				const m = await provisioner.ensure(reportStartupProgress);
-				const r = await m.execute(params.code, {
+				const code = applyShellSettingsToBashMagicCell(params.code, options);
+				const { result: r, kernelRestarted } = await executeWithBusyKernelChoice(
+					provisioner,
+					reportStartupProgress,
+					toolCallId,
+					code,
 					signal,
-					onStream: (chunk) => {
+					(chunk) => {
 						onUpdate?.({
 							content: [{ type: "text", text: chunk }],
 							details: { status: "ok" },
 						});
 					},
-				});
+					setToolWorkingMessage,
+					options?.onLateSentAgentMessage,
+					ctx,
+				);
 
 				let text = r.stdout;
 				if (r.stderr) text += (text ? "\n" : "") + r.stderr;
 				if (r.result) text += (text ? "\n" : "") + r.result;
 				if (r.status === "error" && r.error) {
 					text += (text ? "\n" : "") + r.error.traceback.join("\n");
+				}
+				if (kernelRestarted) {
+					text = text ? `${KERNEL_RESTART_NOTICE}\n\n${text}` : KERNEL_RESTART_NOTICE;
 				}
 
 				const imageBlocks = imageBlocksFromAttachments(r.attachments);
@@ -452,13 +703,15 @@ export function createIpythonToolDefinition(
 						result: r.result,
 						diffs: r.diffs,
 						attachments: r.attachments,
+						sentAgentMessages: r.sentAgentMessages,
+						kernelRestarted,
 						error: r.error,
 					},
 					isError: r.status === "error" || r.status === "aborted",
 				};
 			} finally {
-				if (reportedStartupProgress) {
-					setWorkingMessage();
+				if (hasWorkingMessage) {
+					setToolWorkingMessage();
 				}
 			}
 		},

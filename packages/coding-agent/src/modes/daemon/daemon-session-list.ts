@@ -2,7 +2,7 @@ import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { compactRlmText } from "../../core/agent-session.js";
+import { compactRlmText, rlmChildLabel } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.js";
 import type { AgentTaskState, SessionInfo } from "../../core/session-manager.js";
@@ -38,6 +38,7 @@ export interface SessionSummary {
 	isStreaming: boolean;
 	isCompacting: boolean;
 	isBashRunning?: boolean;
+	hasRunningRlmChildren?: boolean;
 	/** True while the agent is streaming with tool calls pending; drives the "running tools" label. */
 	isRunningTools?: boolean;
 	attachedClients: number;
@@ -60,6 +61,10 @@ export interface SessionSummary {
 	summary?: string;
 	/** Completion verdict for an idle session; absent while working or unjudged. */
 	taskState?: AgentTaskState;
+	/** Resident session-host process state, populated by the global supervisor. */
+	workerState?: "starting" | "ready" | "recovering" | "failed";
+	/** Diagnostic process identity; clients must not use this as a stable session identifier. */
+	workerPid?: number;
 }
 
 /**
@@ -114,8 +119,13 @@ export function buildSessionList(
 	return entries;
 }
 
+function effectivePendingMessageCount(session: ActiveSessionState["runtime"]["session"]): number {
+	return session.pendingMessageCount + (session.hasAcceptedPromptInFlight ? 1 : 0);
+}
+
 export function summaryForActiveSession(activeSession: ActiveSessionState, savedSession?: SessionInfo): SessionSummary {
 	const session = activeSession.runtime.session;
+	const pendingMessageCount = effectivePendingMessageCount(session);
 	const metadata = activeSession.runtime.metadata ?? { kind: "top-level" as const };
 	let modified = savedSession?.modified.toISOString();
 	if (!modified && session.sessionFile) {
@@ -141,10 +151,11 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		isStreaming: session.isStreaming,
 		isCompacting: session.isCompacting,
 		isBashRunning: session.isBashRunning,
+		hasRunningRlmChildren: session.hasRunningRlmChildren(),
 		isRunningTools: session.isStreaming && session.state.pendingToolCalls.size > 0,
 		attachedClients: activeSession.clients.size,
 		messageCount: session.messages.length,
-		pendingMessageCount: session.pendingMessageCount,
+		pendingMessageCount,
 		streamingMessage: session.state.streamingMessage,
 		created: savedSession?.created.toISOString(),
 		modified,
@@ -251,12 +262,18 @@ function rlmChildSnapshotForActiveSession(
 ): AgentConnectionRlmChildAgentSnapshot {
 	const session = activeSession.runtime.session;
 	let answerPreview: string | undefined;
-	for (const message of session.messages) {
+	let toolUseCount = 0;
+	const messages =
+		session.state.streamingMessage?.role === "assistant"
+			? [...session.messages, session.state.streamingMessage]
+			: session.messages;
+	for (const message of messages) {
 		if (message.role === "assistant") {
 			const text = compactRlmText(readMessageText(message.content));
 			if (text) {
 				answerPreview = text;
 			}
+			toolUseCount += message.content.filter((block) => block.type === "toolCall").length;
 		}
 	}
 	// The parent session's run tracker is the source of truth for child status;
@@ -266,14 +283,16 @@ function rlmChildSnapshotForActiveSession(
 	const runStatus = metadata.rlmChildId
 		? parent?.runtime.session.getRlmChildRunStatus(metadata.rlmChildId)
 		: undefined;
-	const status = runStatus ?? (session.isStreaming || session.pendingMessageCount > 0 ? "running" : "done");
+	const status = runStatus ?? (session.isStreaming || effectivePendingMessageCount(session) > 0 ? "running" : "done");
 	return {
 		id: metadata.rlmChildId ?? activeSession.activeSessionId,
 		parentId: parentNodeId,
 		activeSessionId: activeSession.activeSessionId,
-		label: compactRlmText(metadata.prompt ?? "", 80) || "child agent",
+		label: rlmChildLabel(metadata.prompt ?? ""),
 		status,
 		answerPreview,
+		toolUseCount: toolUseCount > 0 ? toolUseCount : undefined,
+		tokenCount: session._contextTokensForCurrentMessages(),
 		recap: session.getCurrentRecap(),
 		sessionDir: metadata.sessionDir ?? session.sessionManager.getSessionDir(),
 		activity: status === "running" ? { kind: session.isStreaming ? "writing" : "waiting" } : undefined,
@@ -317,7 +336,11 @@ export function isActiveSessionBusy(activeSession: ActiveSessionState): boolean 
 	const session = activeSession.runtime.session;
 	// Background subagents keep the parent "working" even after its own turn ends.
 	return (
-		session.isStreaming || session.isCompacting || session.pendingMessageCount > 0 || session.hasRunningRlmChildren()
+		session.isStreaming ||
+		session.isCompacting ||
+		session.isBashRunning ||
+		effectivePendingMessageCount(session) > 0 ||
+		session.hasRunningRlmChildren()
 	);
 }
 
