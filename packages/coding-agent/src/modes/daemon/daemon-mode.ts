@@ -8,7 +8,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { getLogger } from "@earendil-works/pi-ai";
@@ -296,6 +296,24 @@ function delay(ms: number): Promise<void> {
 }
 
 type RuntimeOpenGuard = () => boolean | Promise<boolean>;
+
+const RLM_SUBAGENT_REGISTRY_FILE = "rlm-subagents.jsonl";
+
+interface PersistedRlmSubagentRegistryEntry {
+	type: "rlm_subagent";
+	childId: string;
+	sessionName: string;
+	sessionDir: string;
+	sessionFile: string;
+	parentSessionId: string;
+	parentSessionFile?: string;
+	rlmParentNodeId?: string;
+	prompt?: string;
+	spawnCode?: string;
+	status: "running" | "completed";
+	createdAt: number;
+	updatedAt: string;
+}
 
 class RuntimeOpenCancelledError extends Error {}
 class BoundSessionUnavailableError extends Error {}
@@ -639,6 +657,95 @@ export class AgentDaemon {
 		}
 	}
 
+	private rlmSubagentRegistryPath(parentSession: AgentSession): string | undefined {
+		const artifactDir = parentSession.sessionManager.getSessionArtifactDir();
+		if (!artifactDir) {
+			return undefined;
+		}
+		return join(artifactDir, RLM_SUBAGENT_REGISTRY_FILE);
+	}
+
+	private appendRlmSubagentRegistryEntry(
+		parentState: ActiveSessionState,
+		entry: PersistedRlmSubagentRegistryEntry,
+	): void {
+		const path = this.rlmSubagentRegistryPath(parentState.runtime.session);
+		if (!path) {
+			return;
+		}
+		try {
+			mkdirSync(dirname(path), { recursive: true });
+			appendFileSync(path, `${JSON.stringify(entry)}\n`);
+		} catch (error) {
+			this.log(
+				`failed to persist RLM subagent registry entry: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+
+	private recordRlmSubagentRegistryEntry(
+		parentState: ActiveSessionState,
+		input: {
+			childId: string;
+			sessionName: string;
+			sessionDir: string;
+			sessionFile: string;
+			rlmParentNodeId?: string;
+			prompt?: string;
+			spawnCode?: string;
+			status: PersistedRlmSubagentRegistryEntry["status"];
+			createdAt?: number;
+		},
+	): void {
+		const parentSession = parentState.runtime.session;
+		this.appendRlmSubagentRegistryEntry(parentState, {
+			type: "rlm_subagent",
+			childId: input.childId,
+			sessionName: input.sessionName,
+			sessionDir: input.sessionDir,
+			sessionFile: input.sessionFile,
+			parentSessionId: parentSession.sessionId,
+			...(parentSession.sessionFile ? { parentSessionFile: parentSession.sessionFile } : {}),
+			...(input.rlmParentNodeId ? { rlmParentNodeId: input.rlmParentNodeId } : {}),
+			...(input.prompt ? { prompt: input.prompt } : {}),
+			...(input.spawnCode ? { spawnCode: input.spawnCode } : {}),
+			status: input.status,
+			createdAt: input.createdAt ?? Date.now(),
+			updatedAt: new Date().toISOString(),
+		});
+	}
+
+	private readLatestRlmSubagentRegistry(parentState: ActiveSessionState): PersistedRlmSubagentRegistryEntry[] {
+		const path = this.rlmSubagentRegistryPath(parentState.runtime.session);
+		if (!path || !existsSync(path)) {
+			return [];
+		}
+		const latest = new Map<string, PersistedRlmSubagentRegistryEntry>();
+		try {
+			for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
+				const trimmed = line.trim();
+				if (!trimmed) {
+					continue;
+				}
+				const entry = JSON.parse(trimmed) as Partial<PersistedRlmSubagentRegistryEntry>;
+				if (
+					entry.type !== "rlm_subagent" ||
+					typeof entry.childId !== "string" ||
+					typeof entry.sessionName !== "string" ||
+					typeof entry.sessionDir !== "string" ||
+					typeof entry.sessionFile !== "string" ||
+					(entry.status !== "running" && entry.status !== "completed")
+				) {
+					continue;
+				}
+				latest.set(entry.childId, entry as PersistedRlmSubagentRegistryEntry);
+			}
+		} catch (error) {
+			this.log(`failed to read RLM subagent registry: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		return [...latest.values()];
+	}
+
 	private async addRuntime(
 		runtime: AgentSessionRuntime,
 		name?: string,
@@ -848,7 +955,7 @@ export class AgentDaemon {
 				await runtime.dispose().catch(() => undefined);
 				throw new RuntimeOpenCancelledError();
 			}
-			return this.addRuntime(
+			const state = await this.addRuntime(
 				runtime,
 				command.name,
 				clientEnv,
@@ -857,6 +964,10 @@ export class AgentDaemon {
 				},
 				runtimeOpenGuard,
 			);
+			if (state.runtime.metadata.kind === "top-level") {
+				await this.rehydrateCompletedRlmSubagents(state);
+			}
+			return state;
 		};
 
 		const sessionFile = sessionManager.getSessionFile();
@@ -1463,6 +1574,19 @@ export class AgentDaemon {
 					// Run shutdown side effects without disposing the still-readable session.
 					this.cancelSubagentRlmHeartbeats(state);
 					await flushAgentTraceUpload(state.runtime.session.sessionManager).catch(() => undefined);
+					if (runtime.session.sessionFile) {
+						this.recordRlmSubagentRegistryEntry(parentState, {
+							childId: options.id,
+							sessionName: options.sessionName,
+							sessionDir: options.sessionDir,
+							sessionFile: runtime.session.sessionFile,
+							rlmParentNodeId: options.rlmParentNodeId,
+							prompt: options.prompt.length <= 4096 ? options.prompt : undefined,
+							spawnCode: options.spawnCode,
+							status: "completed",
+							createdAt: state.runtime.metadata.createdAt,
+						});
+					}
 					// Retention can decline if the parent is already tearing down; if so, close
 					// the session here so it doesn't linger in the registry.
 					if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
@@ -1585,7 +1709,120 @@ export class AgentDaemon {
 				throw error;
 			}
 		}
+		if (runtime.session.sessionFile) {
+			this.recordRlmSubagentRegistryEntry(parentState, {
+				childId: options.id,
+				sessionName: options.sessionName,
+				sessionDir: options.sessionDir,
+				sessionFile: runtime.session.sessionFile,
+				rlmParentNodeId: options.rlmParentNodeId,
+				prompt: options.prompt.length <= 4096 ? options.prompt : undefined,
+				spawnCode: options.spawnCode,
+				status: "running",
+				createdAt: runtime.metadata.createdAt,
+			});
+		}
 		return runtime;
+	}
+
+	private hasRlmSubagentState(parentState: ActiveSessionState, childId: string, sessionFile?: string): boolean {
+		const targetSessionFile = sessionFile ? resolve(sessionFile) : undefined;
+		return [...this.sessions.values()].some((state) => {
+			const metadata = state.runtime.metadata;
+			if (metadata.kind !== "subagent") {
+				return false;
+			}
+			if (metadata.parentActiveSessionId === parentState.activeSessionId && metadata.rlmChildId === childId) {
+				return true;
+			}
+			const existingFile = state.runtime.session.sessionFile;
+			return !!targetSessionFile && !!existingFile && resolve(existingFile) === targetSessionFile;
+		});
+	}
+
+	private async rehydrateCompletedRlmSubagents(parentState: ActiveSessionState): Promise<void> {
+		for (const entry of this.readLatestRlmSubagentRegistry(parentState)) {
+			if (entry.status !== "completed") {
+				continue;
+			}
+			if (
+				!existsSync(entry.sessionFile) ||
+				this.hasRlmSubagentState(parentState, entry.childId, entry.sessionFile)
+			) {
+				continue;
+			}
+			let stateRef: ActiveSessionState | undefined;
+			try {
+				const sessionManager = await SessionManager.openAsync(entry.sessionFile, entry.sessionDir);
+				const runtime = await withClientEnv(parentState.clientEnv, () =>
+					createAgentSessionRuntime(this.options.createRuntime, {
+						cwd: sessionManager.getCwd(),
+						agentDir: parentState.runtime.services.agentDir,
+						sessionManager,
+						sessionStartEvent: { type: "session_start", reason: "startup" },
+						sessionConfig: parentState.runtime.runtimeConfig,
+						sessionOptions: {
+							agentMessageController: this.createAgentMessageController(() => stateRef),
+							agentObserveController: this.createAgentObserveController(() => stateRef),
+							rlmHeartbeatController: {
+								listRlmHeartbeats: (listOptions) => {
+									if (!stateRef) {
+										throw new Error("RLM heartbeat state is not ready for this session yet");
+									}
+									return this.cronStore.listRlmHeartbeats(stateRef.activeSessionId, listOptions);
+								},
+								createRlmHeartbeat: (input) => {
+									if (!stateRef) {
+										throw new Error("RLM heartbeat state is not ready for this session yet");
+									}
+									return this.createRlmHeartbeatForState(stateRef, input);
+								},
+								updateRlmHeartbeat: (input) => {
+									if (!stateRef) {
+										throw new Error("RLM heartbeat state is not ready for this session yet");
+									}
+									return this.updateRlmHeartbeatForState(stateRef, input);
+								},
+								deleteRlmHeartbeat: (id) => {
+									if (!stateRef) {
+										throw new Error("RLM heartbeat state is not ready for this session yet");
+									}
+									return this.deleteRlmHeartbeatForState(stateRef, id);
+								},
+							},
+							rlmSessionDir: entry.sessionDir,
+							rlmParentNodeId: entry.rlmParentNodeId ?? entry.childId,
+						},
+						runtimeMetadata: {
+							kind: "subagent",
+							createdAt: entry.createdAt,
+							parentActiveSessionId: parentState.activeSessionId,
+							parentSessionId: parentState.runtime.session.sessionId,
+							...(parentState.runtime.session.sessionFile
+								? { parentSessionFile: parentState.runtime.session.sessionFile }
+								: {}),
+							rlmChildId: entry.childId,
+							rlmParentNodeId: entry.rlmParentNodeId ?? entry.childId,
+							...(entry.prompt ? { prompt: entry.prompt } : {}),
+							...(entry.spawnCode ? { spawnCode: entry.spawnCode } : {}),
+							sessionDir: entry.sessionDir,
+						},
+					}),
+				);
+				await this.addRuntime(runtime, undefined, parentState.clientEnv, (state) => {
+					stateRef = state;
+				});
+				if (runtime.session.sessionName !== entry.sessionName) {
+					runtime.session.setSessionName(entry.sessionName);
+				}
+			} catch (error) {
+				this.log(
+					`failed to rehydrate completed RLM subagent ${entry.sessionName}: ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				);
+			}
+		}
 	}
 
 	private createAgentMessageController(
@@ -3038,6 +3275,15 @@ export class AgentDaemon {
 		};
 	}
 
+	private findRemoteAgentPeer(selector: string): AgentSessionMessageAgentSummary | undefined {
+		for (const peer of this.remoteAgentPeers.values()) {
+			if (peer.activeSessionId === selector || peer.sessionId === selector || peer.sessionName === selector) {
+				return peer;
+			}
+		}
+		return undefined;
+	}
+
 	// Half-bound sessions are hidden from other sessions' listings; the current
 	// session stays visible to itself (controllers run during its own bind).
 	private listTargetableSessionStates(current: ActiveSessionState): ActiveSessionState[] {
@@ -3139,7 +3385,7 @@ export class AgentDaemon {
 			if (error instanceof BoundSessionUnavailableError) {
 				throw error;
 			}
-			if (this.options.worker && options.fromState) {
+			if (this.options.worker && options.fromState && this.findRemoteAgentPeer(targetSelector)) {
 				return this.sendRemoteAgentSessionMessage(
 					options.fromState,
 					targetSelector,
@@ -3234,6 +3480,9 @@ export class AgentDaemon {
 				return response.data as AgentSessionMessageReceipt;
 			} catch (error) {
 				lastError = error;
+				if (error instanceof Error && error.message.startsWith("Unknown active session:")) {
+					throw error;
+				}
 			} finally {
 				client.close();
 			}

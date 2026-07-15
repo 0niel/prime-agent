@@ -433,6 +433,47 @@ describe("AgentSession rlm recursion", () => {
 		expect(root.listRlmSubagents()).toEqual({ subagents: [] });
 	});
 
+	it("disposes an inline child when setting its session name fails", async () => {
+		const root = createSession();
+		const appendSessionInfo = vi.spyOn(SessionManager.prototype, "appendSessionInfo").mockImplementation(() => {
+			throw new Error("session info failed");
+		});
+		const dispose = vi.spyOn(AgentSession.prototype, "dispose");
+		try {
+			await expect(root.runRlmChild("inline naming failure", { name: "bad-name" })).rejects.toThrow(
+				"session info failed",
+			);
+			expect(dispose).toHaveBeenCalled();
+		} finally {
+			appendSessionInfo.mockRestore();
+			dispose.mockRestore();
+		}
+	});
+
+	it("emits updated child session names after a retained child is renamed", async () => {
+		const root = createSession();
+		const events: unknown[] = [];
+		root.subscribe((event) => events.push(event));
+
+		const result = await root.runRlmChild("rename after completion", { name: "original-worker" });
+		if (!result.session_dir) {
+			throw new Error("Missing child session directory");
+		}
+		const childId = basename(result.session_dir);
+		const child = root.getRlmChildSession(childId);
+		if (!child) {
+			throw new Error("Missing retained child session");
+		}
+
+		child.setSessionName("renamed-worker");
+
+		const childUpdates = events.filter(
+			(event): event is { type: "rlm_child_update"; child: { sessionName?: string } } =>
+				typeof event === "object" && event !== null && (event as { type?: string }).type === "rlm_child_update",
+		);
+		expect(childUpdates.at(-1)?.child.sessionName).toBe("renamed-worker");
+	});
+
 	it("surfaces a child's recap on its snapshot once the summarizer sets it", async () => {
 		let releaseChild: () => void = () => {};
 		const release = new Promise<void>((resolve) => {

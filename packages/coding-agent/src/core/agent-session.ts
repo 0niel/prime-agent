@@ -6167,7 +6167,12 @@ export class AgentSession {
 			sessionStartEvent: { type: "session_start", reason: "startup" },
 		});
 		if (child.sessionName !== options.sessionName) {
-			child.setSessionName(options.sessionName);
+			try {
+				child.setSessionName(options.sessionName);
+			} catch (error) {
+				child.dispose();
+				throw error;
+			}
 		}
 
 		return { session: child };
@@ -6564,7 +6569,7 @@ export class AgentSession {
 				child: {
 					id: childNodeId,
 					parentId: this._rlmParentNodeId,
-					sessionName,
+					sessionName: childSession?.sessionName ?? sessionName,
 					label,
 					status: run.status,
 					durationMs,
@@ -6616,6 +6621,7 @@ export class AgentSession {
 						return;
 					}
 					switch (event.type) {
+						case "session_info_changed":
 						case "recap_update":
 							emitChildUpdate();
 							break;

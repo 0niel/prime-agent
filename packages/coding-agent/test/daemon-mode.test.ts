@@ -494,6 +494,50 @@ describe("daemon mode helpers", () => {
 		);
 	});
 
+	it("fails unknown local agent-message targets without worker remote retries", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+			worker: { authenticationToken: "worker-token" },
+		});
+		const source = makeState("source");
+		source.runtime = {
+			...source.runtime,
+			cwd: "/tmp",
+			session: {
+				sessionId: "session-source",
+				sessionName: "Source",
+				isStreaming: false,
+				pendingMessageCount: 0,
+			},
+		} as never;
+		const sendRemoteAgentSessionMessage = vi.fn();
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			sendRemoteAgentSessionMessage: typeof sendRemoteAgentSessionMessage;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState: ActiveSessionState;
+				origin: "agent";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(source.activeSessionId, source);
+		internals.sendRemoteAgentSessionMessage = sendRemoteAgentSessionMessage;
+
+		await expect(
+			internals.sendAgentSessionMessage({
+				targetSelector: "deleted-child",
+				message: "continue",
+				fromState: source,
+				origin: "agent",
+			}),
+		).rejects.toThrow("Unknown active session: deleted-child");
+		expect(sendRemoteAgentSessionMessage).not.toHaveBeenCalled();
+	});
+
 	it("reports queued status when a direct accept races into the queue", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -2766,6 +2810,86 @@ describe("daemon mode helpers", () => {
 			await create({ type: "create", sessionPath: join(tempDir, "session.jsonl") });
 
 			expect(listedAgentsDuringBind).toBe(1);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rehydrates completed RLM subagents from the parent registry", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-rlm-rehydrate-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			const parentManager = SessionManager.create(tempDir, sessionDir);
+			parentManager.newSession();
+			parentManager.appendSessionInfo("Parent");
+			const parentSessionFile = parentManager.getSessionFile();
+			const parentArtifactDir = parentManager.getSessionArtifactDir();
+			if (!parentSessionFile || !parentArtifactDir) {
+				throw new Error("Missing parent session paths");
+			}
+
+			const childId = "child-1";
+			const childSessionDir = join(parentArtifactDir, childId);
+			const childManager = SessionManager.create(tempDir, childSessionDir);
+			childManager.newSession({ parentSession: parentSessionFile });
+			childManager.appendSessionInfo("completed-worker");
+			const childSessionFile = childManager.getSessionFile();
+			if (!childSessionFile) {
+				throw new Error("Missing child session file");
+			}
+			writeFileSync(
+				join(parentArtifactDir, "rlm-subagents.jsonl"),
+				`${JSON.stringify({
+					type: "rlm_subagent",
+					childId,
+					sessionName: "completed-worker",
+					sessionDir: childSessionDir,
+					sessionFile: childSessionFile,
+					parentSessionId: parentManager.getSessionId(),
+					parentSessionFile,
+					rlmParentNodeId: childId,
+					status: "completed",
+					createdAt: 1,
+					updatedAt: "2026-01-01T00:00:00.000Z",
+				})}\n`,
+			);
+
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+				return {
+					session: makeRuntimeSession(options.sessionManager),
+					extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["extensionsResult"],
+					services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["services"],
+					diagnostics: [],
+				};
+			});
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir },
+				createRuntime,
+			});
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+			};
+
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: parentSessionFile });
+			const childState = [...internals.sessions.values()].find(
+				(state) => state.runtime.metadata.rlmChildId === childId,
+			);
+
+			expect(createRuntime).toHaveBeenCalledTimes(2);
+			expect(childState?.runtime.session.sessionName).toBe("completed-worker");
+			expect(childState?.runtime.metadata).toMatchObject({
+				kind: "subagent",
+				parentActiveSessionId: parentState.activeSessionId,
+				parentSessionId: parentState.runtime.session.sessionId,
+				rlmChildId: childId,
+				rlmParentNodeId: childId,
+				sessionDir: childSessionDir,
+			});
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
