@@ -598,16 +598,22 @@ describe("ToolExecutionComponent parity", () => {
 
 		const collapsed = stripAnsi(component.render(120).join("\n"));
 		expect(collapsed).not.toContain("hidden_side_effect");
-		expect(collapsed).toContain("README.md +1 -1");
+		expect(collapsed).toMatch(/✓ README\.md\s+\+1 -1/);
+		expect(collapsed).toMatch(/1 - before/);
+		expect(collapsed).toMatch(/1 \+ after/);
 
 		component.setExpanded(true);
 		const expanded = stripAnsi(component.render(120).join("\n"));
 		expect(expanded).toContain('hidden_side_effect = "only in full source"');
 		expect(expanded).toContain("before");
 		expect(expanded).toContain("after");
+		const expandedLines = expanded.split("\n");
+		expect(expandedLines.findIndex((line) => line.includes("hidden_side_effect ="))).toBeLessThan(
+			expandedLines.findIndex((line) => /✓ README\.md\s+\+1 -1/.test(line)),
+		);
 	});
 
-	test("collapses built-in edit diffs to a one-line file stat", () => {
+	test("always renders built-in edit diffs", () => {
 		const component = new ToolExecutionComponent(
 			"edit",
 			"tool-collapsed-edit",
@@ -624,20 +630,13 @@ describe("ToolExecutionComponent parity", () => {
 		);
 
 		const collapsed = stripAnsi(component.render(120).join("\n"));
-		expect(collapsed).toContain("╰─ README.md +1 -1");
-		expect(collapsed).toContain("to expand");
-		expect(collapsed).not.toContain("before");
-		expect(collapsed).not.toContain("after");
+		expect(collapsed).toContain("before");
+		expect(collapsed).toContain("after");
+		expect(collapsed).not.toContain("╰─ README.md +1 -1");
+		expect(collapsed).not.toContain("to expand");
 
-		component.setShowExpandHint(false);
-		expect(stripAnsi(component.render(120).join("\n"))).not.toContain("to expand");
-
-		component.setShowExpandHint(true);
 		component.setExpanded(true);
 		const expanded = stripAnsi(component.render(120).join("\n"));
-		expect(expanded).toContain("before");
-		expect(expanded).toContain("after");
-		expect(expanded).toContain("to collapse");
-		expect(expanded).not.toContain("README.md +1 -1");
+		expect(expanded).toBe(collapsed);
 	});
 });

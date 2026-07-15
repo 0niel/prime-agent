@@ -358,8 +358,8 @@ export class IPythonCellComponent implements Component {
 		// Cached by state version so unrelated repaints don't re-render (flicker).
 		const lines = [truncateToWidth(` ${this.collapsedLine(details)}`, safeWidth, "")];
 
-		const hasDiffs = (details.diffs?.length ?? 0) > 0;
-		if (hasDiffs && this.state.expanded) {
+		const hasCode = this.state.expanded ? this.renderCode(lines, safeWidth) : false;
+		if ((details.diffs?.length ?? 0) > 0) {
 			this.renderDiffs(lines, safeWidth, details.diffs ?? [], this.marker(details));
 		}
 		if ((details.sentAgentMessages?.length ?? 0) > 0) {
@@ -370,7 +370,6 @@ export class IPythonCellComponent implements Component {
 			return this.renderCache.set(safeWidth, cacheVersion, lines);
 		}
 
-		const hasCode = this.renderCode(lines, safeWidth);
 		this.renderOutput(lines, safeWidth, details, hasCode);
 		return this.renderCache.set(safeWidth, cacheVersion, lines);
 	}

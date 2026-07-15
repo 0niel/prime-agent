@@ -201,7 +201,7 @@ describe("IPythonCellComponent diff rendering", () => {
 		expect(addedRows.slice(1).every((line) => !line.includes("+"))).toBe(true);
 	});
 
-	it("separates the diff from the summary line with a blank line", () => {
+	it("renders expanded source before the always-visible diff", () => {
 		const out = renderCell({
 			code: "await edit(...)",
 			details: { status: "ok", durationMs: 4, diffs: [{ path: "a.ts", oldStr: "x", newStr: "X", startLine: 1 }] },
@@ -211,10 +211,11 @@ describe("IPythonCellComponent diff rendering", () => {
 		}).split("\n");
 		expect(out[0]).toContain("to collapse");
 		expect(out[1].trim()).toBe("");
-		expect(out[2]).toContain("a.ts");
+		expect(out[2]).toContain("await edit(...)");
+		expect(out.findIndex((line) => line.includes("a.ts"))).toBeGreaterThan(2);
 	});
 
-	it("hides the full diff when collapsed", () => {
+	it("shows the full diff when collapsed", () => {
 		const collapsed = renderCell({
 			code: "await edit(...)",
 			details: { status: "ok", diffs: [{ path: "big.py", oldStr: "old", newStr: "NEW", startLine: 1 }] },
@@ -223,8 +224,9 @@ describe("IPythonCellComponent diff rendering", () => {
 			expanded: false,
 		});
 		expect(collapsed).toContain("to expand");
-		expect(collapsed).not.toContain("big.py");
-		expect(collapsed).not.toContain("NEW");
+		expect(collapsed).toContain("big.py");
+		expect(collapsed).toContain("old");
+		expect(collapsed).toContain("NEW");
 	});
 
 	it("hides edit source when collapsed and shows it when globally expanded", () => {
@@ -238,8 +240,13 @@ describe("IPythonCellComponent diff rendering", () => {
 		const expanded = renderCell({ ...state, expanded: true });
 
 		expect(collapsed).not.toContain("hidden_side_effect");
+		expect(collapsed).toContain("a.py");
 		expect(expanded).toContain('hidden_side_effect = "only in full source"');
 		expect(expanded).toContain("a.py");
+		const expandedLines = expanded.split("\n");
+		expect(expandedLines.findIndex((line) => line.includes("hidden_side_effect ="))).toBeLessThan(
+			expandedLines.findIndex((line) => /✓ a\.py\s+\+1 -1/.test(line)),
+		);
 	});
 
 	it("keeps non-edit cells collapsed to a single summary line", () => {

@@ -1,12 +1,10 @@
-import { isAbsolute } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
-import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { EditToolDetails } from "../../../core/tools/edit.js";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
 import type { IpythonToolDetails } from "../../../core/tools/ipython.js";
 import { resolveToCwd } from "../../../core/tools/path-utils.js";
-import { canonicalizePath, formatPathRelativeToCwdOrAbsolute } from "../../../utils/paths.js";
+import { canonicalizePath } from "../../../utils/paths.js";
 import { theme } from "../theme/theme.js";
 
 export interface FileChangeSummary {
@@ -14,8 +12,6 @@ export interface FileChangeSummary {
 	added: number;
 	removed: number;
 }
-
-const FILE_SUMMARY_LIMIT = 5;
 
 function countChangedLines(diff: string): { added: number; removed: number } {
 	let added = 0;
@@ -37,15 +33,6 @@ function mergeFileChange(target: Map<string, FileChangeSummary>, change: FileCha
 	} else {
 		target.set(key, { ...change });
 	}
-}
-
-function formatFileChangePath(path: string, cwd: string): string {
-	const resolvedPath = resolveToCwd(path, cwd);
-	const lexicalPath = formatPathRelativeToCwdOrAbsolute(resolvedPath, cwd);
-	if (!isAbsolute(lexicalPath)) {
-		return lexicalPath;
-	}
-	return formatPathRelativeToCwdOrAbsolute(canonicalizePath(resolvedPath), canonicalizePath(cwd));
 }
 
 export function getToolFileChanges(
@@ -92,42 +79,6 @@ export function mergeTurnFileChanges(
 
 function counts(change: Pick<FileChangeSummary, "added" | "removed">): string {
 	return `${theme.fg("toolDiffAdded", `+${change.added}`)} ${theme.fg("toolDiffRemoved", `-${change.removed}`)}`;
-}
-
-export class FileChangeSummaryComponent implements Component {
-	constructor(
-		private readonly changes: readonly FileChangeSummary[],
-		private readonly cwd: string,
-	) {}
-
-	render(width: number): string[] {
-		const safeWidth = Math.max(1, width);
-		const prefix = theme.fg("dim", "    ╰─ ");
-		const shown = this.changes.slice(0, FILE_SUMMARY_LIMIT).map((change) => {
-			const suffix = `${theme.fg("dim", " ")}${counts(change)}`;
-			const available = Math.max(1, safeWidth - visibleWidth(prefix) - visibleWidth(suffix));
-			const path = truncateToWidth(formatFileChangePath(change.path, this.cwd), available, "…");
-			return truncateToWidth(`${prefix}${theme.fg("muted", path)}${suffix}`, safeWidth, "");
-		});
-		if (this.changes.length > FILE_SUMMARY_LIMIT) {
-			const hidden = this.changes.slice(FILE_SUMMARY_LIMIT);
-			const hiddenTotals = hidden.reduce(
-				(sum, change) => ({ added: sum.added + change.added, removed: sum.removed + change.removed }),
-				{ added: 0, removed: 0 },
-			);
-			const files = `${hidden.length} more file${hidden.length === 1 ? "" : "s"}`;
-			shown.push(
-				truncateToWidth(
-					`${prefix}${theme.fg("muted", `[${files}`)}${theme.fg("dim", " ")}${counts(hiddenTotals)}${theme.fg("muted", "]")}`,
-					safeWidth,
-					"",
-				),
-			);
-		}
-		return shown;
-	}
-
-	invalidate(): void {}
 }
 
 export function formatTotalChangeSummary(changes: readonly FileChangeSummary[]): string {
