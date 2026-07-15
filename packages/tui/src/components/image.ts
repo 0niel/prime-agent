@@ -82,19 +82,26 @@ export class Image implements Component {
 					this.imageId = result.imageId;
 				}
 
-				// Return `rows` lines so TUI accounts for image height.
-				// First (rows-1) lines are empty and cleared before the image is drawn.
-				// Last line: move cursor back up, draw the image, then move back down
-				// for Kitty (this component disables Kitty's terminal-side cursor movement)
-				// so TUI cursor accounting stays inside the scroll area.
 				lines = [];
-				for (let i = 0; i < result.rows - 1; i++) {
-					lines.push("");
+				if (caps.images === "kitty" && caps.imagePlacement === "first-row") {
+					lines.push(result.sequence);
+					for (let i = 1; i < result.rows; i++) {
+						lines.push("");
+					}
+				} else {
+					// Return `rows` lines so TUI accounts for image height.
+					// First (rows-1) lines are empty and cleared before the image is drawn.
+					// Last line: move cursor back up, draw the image, then move back down
+					// for Kitty (this component disables Kitty's terminal-side cursor movement)
+					// so TUI cursor accounting stays inside the scroll area.
+					for (let i = 0; i < result.rows - 1; i++) {
+						lines.push("");
+					}
+					const rowOffset = result.rows - 1;
+					const moveUp = rowOffset > 0 ? `\x1b[${rowOffset}A` : "";
+					const moveDown = caps.images === "kitty" && rowOffset > 0 ? `\x1b[${rowOffset}B` : "";
+					lines.push(moveUp + result.sequence + moveDown);
 				}
-				const rowOffset = result.rows - 1;
-				const moveUp = rowOffset > 0 ? `\x1b[${rowOffset}A` : "";
-				const moveDown = caps.images === "kitty" && rowOffset > 0 ? `\x1b[${rowOffset}B` : "";
-				lines.push(moveUp + result.sequence + moveDown);
 			} else {
 				const fallback = imageFallback(this.mimeType, this.dimensions, this.options.filename);
 				lines = [this.theme.fallbackColor(fallback)];

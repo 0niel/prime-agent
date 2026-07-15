@@ -4,6 +4,13 @@ export interface TerminalCapabilities {
 	images: ImageProtocol;
 	trueColor: boolean;
 	hyperlinks: boolean;
+	/**
+	 * Kitty-compatible terminals do not all handle cursor-shim image placement
+	 * the same way. Most are drawn from the last reserved row after clearing the
+	 * block above it. Ghostty is more reliable when the image escape is emitted
+	 * on the first reserved row and the TUI advances through the remaining rows.
+	 */
+	imagePlacement?: "first-row";
 }
 
 export interface CellDimensions {
@@ -59,7 +66,7 @@ export function detectCapabilities(): TerminalCapabilities {
 	}
 
 	if (termProgram === "ghostty" || term.includes("ghostty") || process.env.GHOSTTY_RESOURCES_DIR) {
-		return { images: "kitty", trueColor: true, hyperlinks: true };
+		return { images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" };
 	}
 
 	if (process.env.WEZTERM_PANE || termProgram === "wezterm") {

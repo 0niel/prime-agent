@@ -240,6 +240,16 @@ describe("detectCapabilities", () => {
 		withEnv({ TERM_PROGRAM: "ghostty", CMUX_WORKSPACE_ID: "workspace" }, () => {
 			const caps = detectCapabilities();
 			assert.strictEqual(caps.images, "kitty");
+			assert.strictEqual(caps.imagePlacement, "first-row");
+			assert.strictEqual(caps.hyperlinks, true);
+		});
+	});
+
+	it("uses first-row image placement for Ghostty", () => {
+		withEnv({ TERM_PROGRAM: "ghostty" }, () => {
+			const caps = detectCapabilities();
+			assert.strictEqual(caps.images, "kitty");
+			assert.strictEqual(caps.imagePlacement, "first-row");
 			assert.strictEqual(caps.hyperlinks, true);
 		});
 	});
@@ -331,6 +341,33 @@ describe("Kitty image cursor movement", () => {
 			assert.ok(lines[1].includes(",C=1,"));
 			assert.ok(lines[1].includes(`,i=${imageId}`));
 			assert.ok(lines[1].endsWith("\x1b[1B"));
+		} finally {
+			resetCapabilitiesCache();
+			setCellDimensions({ widthPx: 9, heightPx: 18 });
+		}
+	});
+
+	it("places Ghostty Kitty images on the first reserved row without cursor shims", () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" });
+		setCellDimensions({ widthPx: 10, heightPx: 10 });
+		try {
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ maxWidthCells: 2 },
+				{ widthPx: 20, heightPx: 20 },
+			);
+			const lines = image.render(4);
+			const imageId = image.getImageId();
+			assert.strictEqual(typeof imageId, "number");
+			assert.strictEqual(lines.length, 2);
+			assert.ok(lines[0].startsWith("\x1b_G"));
+			assert.ok(lines[0].includes(",C=1,"));
+			assert.ok(lines[0].includes(`,i=${imageId}`));
+			assert.strictEqual(lines[1], "");
+			assert.ok(!lines.join("").includes("\x1b[1A"));
+			assert.ok(!lines.join("").includes("\x1b[1B"));
 		} finally {
 			resetCapabilitiesCache();
 			setCellDimensions({ widthPx: 9, heightPx: 18 });

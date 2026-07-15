@@ -102,6 +102,34 @@ describe("ToolExecutionComponent parity", () => {
 		}
 	});
 
+	test("renders Ghostty inline images before reserved spacer rows", () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" });
+		try {
+			const onePixelPng =
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+			const component = new ToolExecutionComponent(
+				"custom_tool",
+				"tool-image-ghostty",
+				{},
+				{ showImages: true },
+				undefined,
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.setImageWidthCells(20);
+			component.updateResult({ content: [{ type: "image", data: onePixelPng, mimeType: "image/png" }], isError: false });
+
+			const rendered = component.render(120);
+			const imageLineIndex = rendered.findIndex((line) => line.includes("\x1b_G"));
+			expect(imageLineIndex).toBeGreaterThanOrEqual(0);
+			expect(rendered[imageLineIndex]).toMatch(/^\x1b_G/);
+			expect(rendered[imageLineIndex]).not.toContain("\x1b[A");
+			expect(rendered[imageLineIndex]).not.toContain("\x1b[B");
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
 	test("can suppress inline image escape sequences for session history", () => {
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
 		try {
