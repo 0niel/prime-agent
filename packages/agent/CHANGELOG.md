@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-15
+
 - Added provider service-tier propagation to agent requests.
 
 ## [0.3.0] - 2026-07-13
