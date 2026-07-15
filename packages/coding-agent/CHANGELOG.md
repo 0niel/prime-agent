@@ -10,6 +10,7 @@
 - Fixed update restarts starting concurrent daemon supervisors or unlinking a replacement supervisor's socket ([ENG-4600](https://linear.app/primeintellect/issue/ENG-4600/prevent-concurrent-daemon-supervisors-after-update-restart)).
 - Changed provider, model, and MCP setup to use one tabbed configuration menu ([ENG-4539](https://linear.app/primeintellect/issue/ENG-4539/unify-providers-models-and-mcp-connections-menu)).
 - Changed the shared configuration menu to show prominent, responsive tabs with configurable navigation shortcuts ([ENG-4534](https://linear.app/primeintellect/issue/ENG-4534/make-login-tabs-more-obvious)).
+- Fixed IPython edit diffs replacing syntax highlighting with a single foreground color ([ENG-4616](https://linear.app/primeintellect/issue/ENG-4616/syntax-highlighting-is-overridden-in-diff-view)).
 - Fixed Prime Inference login leaving new sessions without a persisted model selection ([ENG-4573](https://linear.app/primeintellect/issue/ENG-4573/prompt-for-model-selection-after-prime-inference-login)).
 - Fixed empty prompt placeholders hiding the input caret.
 - Fixed automatic model selection preferring other configured providers over Prime Inference's GLM 5.2 default.

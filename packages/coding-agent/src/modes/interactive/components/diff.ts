@@ -267,7 +267,7 @@ export function renderRichDiff(diffText: string, contentWidth: number, options: 
 					content: text,
 					language,
 					width,
-					contentFg: useBlocks ? "toolDiffText" : "toolDiffAdded",
+					contentFg: useBlocks ? undefined : "toolDiffAdded",
 				}),
 			);
 		} else if (prefix === "-") {
@@ -280,7 +280,7 @@ export function renderRichDiff(diffText: string, contentWidth: number, options: 
 					content: text,
 					language,
 					width,
-					contentFg: useBlocks ? "toolDiffText" : "toolDiffRemoved",
+					contentFg: useBlocks ? undefined : "toolDiffRemoved",
 				}),
 			);
 		} else {

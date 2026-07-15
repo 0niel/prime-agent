@@ -1,7 +1,8 @@
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { renderRichDiff } from "../src/modes/interactive/components/diff.js";
 import { IPythonCellComponent } from "../src/modes/interactive/components/ipython-cell.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, preloadCodeHighlighter, theme } from "../src/modes/interactive/theme/theme.js";
 
 function stripAnsi(text: string): string {
 	return text.replace(/\x1b\[[0-9;]*m/g, "");
@@ -9,6 +10,23 @@ function stripAnsi(text: string): string {
 
 function hasBackground(line: string): boolean {
 	return /\x1b\[4[0-9]m|\x1b\[48[;:]/.test(line);
+}
+
+type ThemeFg = Parameters<typeof theme.fg>[0];
+type ThemeBg = Parameters<typeof theme.bg>[0];
+
+function fgAnsi(color: ThemeFg): string {
+	return theme.fg(color, "").replace(/\x1b\[39m$/, "");
+}
+
+function bgAnsi(color: ThemeBg): string {
+	return theme.bg(color, "").replace(/\x1b\[49m$/, "");
+}
+
+function changedRow(rows: readonly string[], prefix: "+" | "-"): string {
+	const row = rows.find((line) => stripAnsi(line).startsWith(` 1 ${prefix} `));
+	expect(row).toBeDefined();
+	return row ?? "";
 }
 
 function renderCell(state: ConstructorParameters<typeof IPythonCellComponent>[0]): string {
@@ -314,6 +332,114 @@ describe("IPythonCellComponent diff rendering", () => {
 				lines.every((line) => visibleWidth(line) <= width),
 				`width=${width}`,
 			).toBe(true);
+		}
+	});
+});
+
+describe("renderRichDiff syntax highlighting", () => {
+	let previousColorTerm: string | undefined;
+	let previousTerm: string | undefined;
+	let previousWtSession: string | undefined;
+
+	beforeAll(async () => {
+		previousColorTerm = process.env.COLORTERM;
+		previousTerm = process.env.TERM;
+		previousWtSession = process.env.WT_SESSION;
+		await preloadCodeHighlighter();
+	});
+
+	afterAll(() => {
+		if (previousColorTerm === undefined) {
+			delete process.env.COLORTERM;
+		} else {
+			process.env.COLORTERM = previousColorTerm;
+		}
+		if (previousTerm === undefined) {
+			delete process.env.TERM;
+		} else {
+			process.env.TERM = previousTerm;
+		}
+		if (previousWtSession === undefined) {
+			delete process.env.WT_SESSION;
+		} else {
+			process.env.WT_SESSION = previousWtSession;
+		}
+		initTheme("dark");
+	});
+
+	function useTruecolor(themeName: "dark" | "light" = "dark"): void {
+		process.env.COLORTERM = "truecolor";
+		process.env.TERM = "xterm-256color";
+		initTheme(themeName);
+	}
+
+	function use256Color(): void {
+		delete process.env.COLORTERM;
+		delete process.env.WT_SESSION;
+		process.env.TERM = "dumb";
+		initTheme("dark");
+	}
+
+	it("keeps syntax token foregrounds on truecolor added and removed backgrounds", () => {
+		useTruecolor();
+		const rows = renderRichDiff("-1 const answer: number = 1;\n+1 const answer: number = 2;", 72, {
+			language: "typescript",
+		});
+		const removed = changedRow(rows, "-");
+		const added = changedRow(rows, "+");
+
+		expect(removed).toContain(bgAnsi("toolDiffRemovedBg"));
+		expect(added).toContain(bgAnsi("toolDiffAddedBg"));
+		for (const row of [removed, added]) {
+			expect(row).toContain(fgAnsi("syntaxKeyword"));
+			expect(row).toContain(fgAnsi("syntaxType"));
+			expect(row).toContain(fgAnsi("syntaxNumber"));
+			expect(row).not.toContain(fgAnsi("toolDiffText"));
+		}
+	});
+
+	it("uses the code-block foreground when the language is unknown", () => {
+		useTruecolor();
+		const rows = renderRichDiff("-1 old value\n+1 new value", 48, { language: "not-a-language" });
+
+		expect(changedRow(rows, "-")).toContain(fgAnsi("mdCodeBlock"));
+		expect(changedRow(rows, "+")).toContain(fgAnsi("mdCodeBlock"));
+	});
+
+	it("keeps the flat red and green fallback in 256-color mode", () => {
+		use256Color();
+		const rows = renderRichDiff("-1 const answer: number = 1;\n+1 const answer: number = 2;", 72, {
+			language: "typescript",
+		});
+		const removed = changedRow(rows, "-");
+		const added = changedRow(rows, "+");
+
+		expect(removed).toContain(bgAnsi("toolPanelBg"));
+		expect(removed).toContain(fgAnsi("toolDiffRemoved"));
+		expect(added).toContain(bgAnsi("toolPanelBg"));
+		expect(added).toContain(fgAnsi("toolDiffAdded"));
+		expect(removed).not.toContain(fgAnsi("syntaxKeyword"));
+		expect(added).not.toContain(fgAnsi("syntaxKeyword"));
+	});
+
+	it("preserves themed syntax and the diff background across wrapped rows", () => {
+		const source = `const values: number[] = [${Array.from({ length: 20 }, (_, index) => index).join(", ")}];`;
+		for (const themeName of ["dark", "light"] as const) {
+			useTruecolor(themeName);
+			const keyword = fgAnsi("syntaxKeyword");
+			const background = bgAnsi("toolDiffAddedBg");
+			const rows = renderRichDiff(`+1 ${source}`, 28, { language: "typescript" });
+
+			expect(rows.length).toBeGreaterThan(1);
+			expect(rows.map(stripAnsi).join("")).toContain("19");
+			for (const row of rows) {
+				expect(visibleWidth(row)).toBe(28);
+				expect(row).toContain(background);
+				expect(row).not.toContain("\x1b[0m");
+				expect(row.match(/\x1b\[49m/g)).toHaveLength(1);
+				expect(row.endsWith("\x1b[49m")).toBe(true);
+			}
+			expect(rows.join("")).toContain(keyword);
 		}
 	});
 });
