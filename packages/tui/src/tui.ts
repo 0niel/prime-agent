@@ -6,7 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
-import { FullscreenViewport, type ScrollInfo } from "./fullscreen.js";
+import { FullscreenViewport, type ScrollInfo, type SelectionScrollDirection } from "./fullscreen.js";
 import { getKeybindings } from "./keybindings.js";
 import { isKeyRelease, matchesKey } from "./keys.js";
 import { isMouseSequence, isWheelDown, isWheelUp, MOUSE_BUTTON_LEFT, parseSgrMouseEvent } from "./mouse.js";
@@ -321,6 +321,12 @@ export class TUI extends Container {
 		};
 	} | null = null;
 	private static readonly WHEEL_SCROLL_LINES = 3;
+	private static readonly SELECTION_AUTO_SCROLL_DELAY_MS = 150;
+	private static readonly SELECTION_AUTO_SCROLL_INTERVAL_MS = 50;
+	private selectionAutoScrollTimer: NodeJS.Timeout | undefined;
+	private selectionAutoScrollDirection: SelectionScrollDirection | null = null;
+	private selectionAutoScrollRow = 0;
+	private selectionAutoScrollColumn = 0;
 
 	// Overlay stack for modal components rendered on top of base content
 	private focusOrderCounter = 0;
@@ -508,8 +514,19 @@ export class TUI extends Container {
 		);
 	}
 
+	private isFullscreenOverlayFocused(): boolean {
+		return this.overlayStack.some((entry) => entry.component === this.focusedComponent);
+	}
+
 	private syncFullscreenMouseTracking(): void {
-		this.terminal.setMouseTracking(this.shouldEnableFullscreenMouseTracking());
+		const enabled = this.shouldEnableFullscreenMouseTracking();
+		if (!enabled) {
+			this.stopSelectionAutoScroll();
+			this.fullscreen?.viewport.clearSelection();
+		} else if (this.isFullscreenOverlayFocused()) {
+			this.stopSelectionAutoScroll();
+		}
+		this.terminal.setMouseTracking(enabled);
 	}
 
 	override invalidate(): void {
@@ -657,6 +674,7 @@ export class TUI extends Container {
 	 * so content produced while fullscreen flows into native scrollback.
 	 */
 	exitFullscreen(options: ExitFullscreenOptions = {}): void {
+		this.stopSelectionAutoScroll();
 		if (!this.fullscreen) return;
 		const { inlineState } = this.fullscreen;
 		this.fullscreen = null;
@@ -714,6 +732,46 @@ export class TUI extends Container {
 		// fallback: OSC 52 works locally, over SSH, and through tmux (set-clipboard)
 		const base64 = Buffer.from(text, "utf8").toString("base64");
 		this.terminal.write(`\x1b]52;c;${base64}\x07`);
+	}
+
+	private updateSelectionAutoScroll(viewport: FullscreenViewport, screenRow: number, screenColumn: number): void {
+		const direction = viewport.selectionAutoScrollDirection(screenRow);
+		this.selectionAutoScrollRow = screenRow;
+		this.selectionAutoScrollColumn = screenColumn;
+		if (direction === this.selectionAutoScrollDirection && this.selectionAutoScrollTimer) return;
+		this.stopSelectionAutoScroll();
+		if (direction === null) return;
+		this.selectionAutoScrollDirection = direction;
+		this.scheduleSelectionAutoScroll(TUI.SELECTION_AUTO_SCROLL_DELAY_MS);
+	}
+
+	private scheduleSelectionAutoScroll(delay: number): void {
+		this.selectionAutoScrollTimer = setTimeout(() => {
+			this.selectionAutoScrollTimer = undefined;
+			const fullscreen = this.fullscreen;
+			const direction = this.selectionAutoScrollDirection;
+			if (
+				!fullscreen ||
+				this.isFullscreenOverlayFocused() ||
+				direction === null ||
+				fullscreen.viewport.selectionAutoScrollDirection(this.selectionAutoScrollRow) !== direction ||
+				!fullscreen.viewport.scrollSelection(direction, this.selectionAutoScrollColumn)
+			) {
+				this.stopSelectionAutoScroll();
+				return;
+			}
+			this.requestRender();
+			this.scheduleSelectionAutoScroll(TUI.SELECTION_AUTO_SCROLL_INTERVAL_MS);
+		}, delay);
+		this.selectionAutoScrollTimer.unref();
+	}
+
+	private stopSelectionAutoScroll(): void {
+		if (this.selectionAutoScrollTimer) {
+			clearTimeout(this.selectionAutoScrollTimer);
+			this.selectionAutoScrollTimer = undefined;
+		}
+		this.selectionAutoScrollDirection = null;
 	}
 
 	private scheduleRender(): void {
@@ -802,7 +860,7 @@ export class TUI extends Container {
 		const fullscreen = this.fullscreen;
 		if (!fullscreen) return false;
 
-		const overlayFocused = this.overlayStack.some((o) => o.component === this.focusedComponent);
+		const overlayFocused = this.isFullscreenOverlayFocused();
 
 		if (isMouseSequence(data)) {
 			// consumed even when disabled — mouse reports are garbage downstream
@@ -810,25 +868,32 @@ export class TUI extends Container {
 			if (event && !overlayFocused) {
 				const viewport = fullscreen.viewport;
 				if (isWheelUp(event)) {
+					this.stopSelectionAutoScroll();
 					this.scrollBy(-TUI.WHEEL_SCROLL_LINES);
 				} else if (isWheelDown(event)) {
+					this.stopSelectionAutoScroll();
 					this.scrollBy(TUI.WHEEL_SCROLL_LINES);
 				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
+					this.stopSelectionAutoScroll();
 					if (!viewport.beginSelection(event.y - 1, event.x - 1)) {
 						viewport.beginFrameSelection(event.y - 1, event.x - 1);
 					}
 					this.requestRender();
 				} else if (event.button === MOUSE_BUTTON_LEFT && event.press && event.motion) {
 					viewport.extendActiveSelection(event.y - 1, event.x - 1);
+					this.updateSelectionAutoScroll(viewport, event.y - 1, event.x - 1);
 					this.requestRender();
 				} else if (!event.press && viewport.hasSelection()) {
+					this.stopSelectionAutoScroll();
 					const text = viewport.endActiveSelection();
 					if (text) this.copySelection(text);
 					this.requestRender();
 				} else if (!event.press) {
+					this.stopSelectionAutoScroll();
 					viewport.clearSelection();
 				}
 			} else if (event && overlayFocused) {
+				this.stopSelectionAutoScroll();
 				const viewport = fullscreen.viewport;
 				if (event.button === MOUSE_BUTTON_LEFT && event.press && !event.motion) {
 					if (!viewport.beginFrameSelection(event.y - 1, event.x - 1)) {
@@ -848,6 +913,7 @@ export class TUI extends Container {
 			}
 			return true;
 		}
+		this.stopSelectionAutoScroll();
 
 		if (overlayFocused || !fullscreen.viewportControls) return false;
 

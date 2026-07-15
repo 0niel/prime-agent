@@ -862,7 +862,7 @@ export class InteractiveMode {
 		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		this.ui.onCopy = (text) => {
-			void copyToClipboard(text).catch(() => undefined);
+			void this.copyFullscreenSelection(text);
 		};
 		this.headerContainer = new Container();
 		this.chatContainer = new Container();
@@ -5485,6 +5485,15 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private async copyFullscreenSelection(text: string): Promise<void> {
+		try {
+			await copyToClipboard(text);
+			this.showStatus("Copied selection to clipboard");
+		} catch (error) {
+			this.showError(`Failed to copy selection: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
 	// Local slash commands (/context, /system-prompt, …) print into the chat
 	// without round-tripping through the agent, so no user message event echoes
 	// the typed command. Render the turn ourselves, mirroring the "user" case
@@ -8512,6 +8521,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 | \`${viewportTop}\` | Scroll to top |
 | \`${viewportFollow}\` | Scroll to bottom and follow output |
 | mouse wheel | Scroll transcript |
+| mouse drag | Select and copy text |
 `;
 
 		const shortcuts = this.bindLocalSessionExtensions
