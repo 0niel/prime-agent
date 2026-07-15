@@ -6344,8 +6344,14 @@ export class AgentSession {
 					await this._deleteRlmSubagentSession(childId, liveSession);
 				} catch (error) {
 					// The initial run was cancelled even though host closure failed. Reject its
-					// public promise now, then keep a retryable parent entry for runtime cleanup.
+					// public promise now. Parent teardown owns cleanup once it starts, so do not
+					// repopulate maps that dispose() has already cleared.
 					run.rejectTask?.(new Error("Deleted by parent orchestrator"));
+					if (this._disposed || this._disposing) {
+						this._removeRlmSubagentTracking(childId, run);
+						void liveSession.disposeAsync().catch(() => undefined);
+						throw error;
+					}
 					this._retainedRlmChildSessions.set(childId, liveSession);
 					this._retryableRlmSubagentDeletions.set(childId, subagent);
 					if (run.unsubscribe) {

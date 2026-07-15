@@ -111,6 +111,8 @@ interface InspectableRlmSession {
 		{ subagent: ReturnType<AgentSession["listRlmSubagents"]>["subagents"][number]; promise: Promise<unknown> }
 	>;
 	_retryableRlmSubagentDeletions: Map<string, ReturnType<AgentSession["listRlmSubagents"]>["subagents"][number]>;
+	_retainedRlmChildSessions: Map<string, AgentSession>;
+	_retainedRlmChildUnsubscribes: Map<string, () => void>;
 	_createKernelHostHandlers(): HostRequestHandlers;
 }
 
@@ -823,6 +825,48 @@ describe("AgentSession rlm recursion", () => {
 		releaseChild();
 		await Promise.resolve();
 		expect(root.listRlmSubagents()).toEqual({ subagents: [] });
+	});
+
+	it("does not restore failed delete retry state after parent teardown", async () => {
+		let rejectDelete: (error: Error) => void = () => {};
+		const deleteGate = new Promise<void>((_resolve, reject) => {
+			rejectDelete = reject;
+		});
+		let childStarted = false;
+		const hostedChild = createSession({
+			streamFn: () => {
+				const stream = createAssistantMessageEventStream();
+				childStarted = true;
+				return stream;
+			},
+		});
+		const deleteRuntime = vi.fn(async () => {
+			await deleteGate;
+		});
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: hostedChild }),
+				deleteRlmSubagentRuntime: deleteRuntime,
+			},
+		});
+
+		const runPromise = root.runRlmChild("delete during parent teardown", { name: "teardown-worker" });
+		const runFailure = expect(runPromise).rejects.toThrow("Deleted by parent orchestrator");
+		await waitFor(() => childStarted);
+		const deletion = root.deleteRlmSubagent("teardown-worker");
+		const deletionFailure = expect(deletion).rejects.toThrow("close failed during teardown");
+		await waitFor(() => deleteRuntime.mock.calls.length === 1);
+
+		await root.disposeAsync();
+		rejectDelete(new Error("close failed during teardown"));
+		await deletionFailure;
+		await runFailure;
+
+		const internals = root as unknown as InspectableRlmSession;
+		expect(internals._activeRlmChildRuns.size).toBe(0);
+		expect(internals._retainedRlmChildSessions.size).toBe(0);
+		expect(internals._retainedRlmChildUnsubscribes.size).toBe(0);
+		expect(internals._retryableRlmSubagentDeletions.size).toBe(0);
 	});
 
 	it("drops a hidden delete retry after detached runtime release succeeds", async () => {
