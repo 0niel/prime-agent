@@ -19,6 +19,7 @@ import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSI
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
 import { findExactModelReferenceMatch } from "../../core/model-resolver.js";
+import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { SessionManager } from "../../core/session-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
@@ -40,7 +41,11 @@ import {
 	listDaemonSavedSessions,
 	renameDaemonSavedSession,
 } from "../daemon/saved-session-catalog.js";
-import { getAnthropicSubscriptionAuthWarning, ProviderAuthFlows } from "../interactive/auth-flows.js";
+import {
+	type AuthenticationResult,
+	getAnthropicSubscriptionAuthWarning,
+	ProviderAuthFlows,
+} from "../interactive/auth-flows.js";
 import { showFullPaneOverlay } from "../interactive/components/centered-overlay.js";
 import { CustomEditor } from "../interactive/components/custom-editor.js";
 import { keyText } from "../interactive/components/keybinding-hints.js";
@@ -957,9 +962,11 @@ class AgentsViewMode implements Component, Focusable {
 
 	private async runSlashCommand(command: ParsedSlashCommand): Promise<void> {
 		switch (command.name as AgentsViewCommandName) {
-			case "login":
-				await this.createAuthFlows().runLogin();
+			case "login": {
+				const authResult = await this.createAuthFlows().runLogin();
+				await this.handleProviderLoginResult(authResult);
 				return;
+			}
 			case "logout":
 				await this.createAuthFlows().runLogout();
 				return;
@@ -1005,6 +1012,28 @@ class AgentsViewMode implements Component, Focusable {
 				void this.maybeWarnAboutAnthropicSubscriptionAuth(this.getDefaultModelForNewAgents());
 			},
 		});
+	}
+
+	private async handleProviderLoginResult(authResult: AuthenticationResult): Promise<void> {
+		const currentModel = this.getDefaultModelForNewAgents();
+		const action = resolvePrimeInferencePostLoginModelAction(
+			authResult,
+			currentModel,
+			this.options.uiServices.modelRegistry,
+		);
+		if (!action.openModelPicker) {
+			return;
+		}
+
+		if (action.fallbackModel) {
+			this.applyDefaultModel(action.fallbackModel);
+			await this.options.uiServices.settingsManager.flush();
+		} else if (!currentModel) {
+			this.setStatusMessage("Prime Inference login succeeded, but the default GLM 5.2 model is unavailable.", {
+				tone: "error",
+			});
+		}
+		await this.showModelSelector();
 	}
 
 	private async maybeWarnAboutAnthropicSubscriptionAuth(model: Model<Api> | undefined): Promise<void> {
