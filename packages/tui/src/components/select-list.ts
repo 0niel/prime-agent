@@ -1,6 +1,6 @@
 import { getKeybindings } from "../keybindings.js";
 import type { Component } from "../tui.js";
-import { truncateToWidth, visibleWidth } from "../utils.js";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "../utils.js";
 
 const DEFAULT_PRIMARY_COLUMN_WIDTH = 32;
 const PRIMARY_COLUMN_GAP = 2;
@@ -36,6 +36,7 @@ export interface SelectListLayoutOptions {
 	minPrimaryColumnWidth?: number;
 	maxPrimaryColumnWidth?: number;
 	truncatePrimary?: (context: SelectListTruncatePrimaryContext) => string;
+	showSelectedDescription?: boolean;
 }
 
 export class SelectList implements Component {
@@ -107,6 +108,10 @@ export class SelectList implements Component {
 			lines.push(this.theme.scrollInfo(truncateToWidth(scrollText, width - 2, "")));
 		}
 
+		if (this.layout.showSelectedDescription) {
+			this.renderSelectedDescription(lines, width);
+		}
+
 		return lines;
 	}
 
@@ -157,7 +162,7 @@ export class SelectList implements Component {
 			const remainingWidth = width - descriptionStart - 2; // -2 for safety
 
 			if (remainingWidth > MIN_DESCRIPTION_WIDTH) {
-				const truncatedDesc = truncateToWidth(descriptionSingleLine, remainingWidth, "");
+				const truncatedDesc = truncateToWidth(descriptionSingleLine, remainingWidth, "…");
 				if (isSelected) {
 					return this.theme.selectedText(`${prefix}${truncatedValue}${spacing}${truncatedDesc}`);
 				}
@@ -214,6 +219,18 @@ export class SelectList implements Component {
 
 	private getDisplayValue(item: SelectItem): string {
 		return item.label || item.value;
+	}
+
+	private renderSelectedDescription(lines: string[], width: number): void {
+		const description = this.filteredItems[this.selectedIndex]?.description?.trim();
+		if (!description) return;
+
+		const indent = width >= 4 ? "  " : "";
+		const contentWidth = Math.max(1, width - visibleWidth(indent) - 2);
+		lines.push("");
+		for (const line of wrapTextWithAnsi(description, contentWidth)) {
+			lines.push(this.theme.description(indent + line));
+		}
 	}
 
 	private notifySelectionChange(): void {

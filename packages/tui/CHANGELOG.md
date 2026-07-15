@@ -5,6 +5,7 @@
 - Fixed fullscreen drag selection so holding at a transcript edge scrolls through offscreen text ([ENG-4644](https://linear.app/primeintellect/issue/ENG-4644/copy-issues)).
 - Fixed slash-command and skill autocomplete not appearing for references typed in the middle of prompts ([ENG-4628](https://linear.app/primeintellect/issue/ENG-4628/support-skill-and-command-autocomplete-mid-prompt)).
 - Fixed focused full-pane overlays becoming slow to navigate on wider terminals.
+- Fixed plain-text truncation emitting ANSI resets, marked shortened descriptions with an ellipsis, and rendered autocomplete in content-sized popup surfaces that close when editing leaves the completion context ([ENG-4542](https://linear.app/primeintellect/issue/ENG-4542/command-descriptions-are-cut-off-on-narrow-screens)).
 
 ## [0.3.0] - 2026-07-13
 

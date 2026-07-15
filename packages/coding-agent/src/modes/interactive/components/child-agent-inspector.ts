@@ -185,9 +185,7 @@ function childAgentRecap(node: ChildAgentInspectorNode): string {
 }
 
 function padTableCell(value: string, width: number, ellipsis = ""): string {
-	// truncateToWidth emits full ANSI resets around its marker even for plain text.
-	// Strip those generated resets before applying foreground/background styling.
-	const truncated = truncateToWidth(value, width, ellipsis).replaceAll("\x1b[0m", "");
+	const truncated = truncateToWidth(value, width, ellipsis);
 	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
 }
 
@@ -467,11 +465,7 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 		const text = this.elideAroundDiff(label, sharedPrefix, sharedSuffix);
 		const safeWidth = Math.max(0, width);
 		const truncated =
-			visibleWidth(text) > safeWidth
-				? `${truncateToWidth(text, Math.max(0, safeWidth - 1), "")
-						.replaceAll("\x1b[0m", "")
-						.trimEnd()}…`
-				: text;
+			visibleWidth(text) > safeWidth ? `${truncateToWidth(text, Math.max(0, safeWidth - 1), "").trimEnd()}…` : text;
 		return theme.fg("dim", padTableCell(truncated, safeWidth));
 	}
 

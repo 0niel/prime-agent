@@ -416,6 +416,10 @@ export class Theme {
 		return this.surfaceBackgroundColor("userMessageBg");
 	}
 
+	getPopupBackgroundColor(): (str: string) => string {
+		return this.surfaceBackgroundColor("toolPanelBg");
+	}
+
 	private surfaceBackgroundColor(color: ThemeBg): (str: string) => string {
 		const terminalBg = getDefaultTerminalColors()?.background;
 		const surfaceRgb = colorValueToRgb(this.bgColorValues.get(color));
@@ -1264,6 +1268,7 @@ export function getEditorTheme(): EditorTheme {
 	return {
 		borderColor: (text: string) => theme.fg("borderMuted", text),
 		backgroundColor: theme.getEditorBackgroundColor(),
+		autocompleteBackgroundColor: (text: string) => theme.getPopupBackgroundColor()(text),
 		selectList: getSelectListTheme(),
 		commandColor: (text: string) => theme.fg("accent", text),
 	};

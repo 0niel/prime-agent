@@ -35,6 +35,59 @@ describe("SelectList", () => {
 		assert.ok(rendered[0].includes("Line one Line two Line three"));
 	});
 
+	it("marks truncated descriptions without resetting outer styles", () => {
+		const items = [
+			{
+				value: "test",
+				label: "test",
+				description: "This description is much too long for the available terminal width",
+			},
+		];
+		const styledTheme = {
+			...testTheme,
+			selectedText: (text: string) => `\x1b[35m${text}\x1b[39m`,
+		};
+
+		const list = new SelectList(items, 5, styledTheme);
+		const [line] = list.render(50);
+
+		assert.ok(line?.includes("…"));
+		assert.ok(visibleWidth(line ?? "") <= 50);
+		assert.doesNotMatch(line ?? "", /\x1b\[0m/);
+	});
+
+	it("shows the selected description in a wrapped detail area", () => {
+		const description = "This description is too long to fit on the selected row but remains available in full";
+		const items = [{ value: "test", label: "test", description }];
+		const list = new SelectList(items, 5, testTheme, { showSelectedDescription: true });
+
+		const rendered = list.render(50);
+		const detailLines = rendered.slice(2).map((line) => line.trim());
+
+		assert.ok(rendered[0]?.includes("…"));
+		assert.equal(detailLines.join(" "), description);
+		assert.ok(rendered.every((line) => visibleWidth(line) <= 50));
+	});
+
+	it("sizes the detail area to the selected description", () => {
+		const items = [
+			{
+				value: "long",
+				label: "long",
+				description: "A selected description that wraps across several lines at this terminal width",
+			},
+			{ value: "short", label: "short", description: "Short description" },
+		];
+		const list = new SelectList(items, 5, testTheme, { showSelectedDescription: true });
+
+		const longSelection = list.render(32);
+		list.setSelectedIndex(1);
+		const shortSelection = list.render(32);
+
+		assert.ok(shortSelection.length < longSelection.length);
+		assert.equal(shortSelection.at(-1)?.trim(), "Short description");
+	});
+
 	it("keeps descriptions aligned when the primary text is truncated", () => {
 		const items = [
 			{ value: "short", label: "short", description: "short description" },

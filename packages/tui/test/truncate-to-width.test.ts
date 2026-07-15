@@ -8,7 +8,13 @@ describe("truncateToWidth", () => {
 		const truncated = truncateToWidth(text, 40, "…");
 
 		assert.ok(visibleWidth(truncated) <= 40);
-		assert.strictEqual(truncated.endsWith("…\x1b[0m"), true);
+		assert.strictEqual(truncated.endsWith("…"), true);
+		assert.doesNotMatch(truncated, /\x1b\[0m/);
+	});
+
+	it("does not add ANSI resets when truncating plain text", () => {
+		assert.strictEqual(truncateToWidth("abcdef", 4, ""), "abcd");
+		assert.strictEqual(truncateToWidth("abcdef", 4, "…"), "abc…");
 	});
 
 	it("preserves ANSI styling for kept text and resets before and after ellipsis", () => {
@@ -27,9 +33,9 @@ describe("truncateToWidth", () => {
 		assert.ok(visibleWidth(truncated) <= 20);
 	});
 
-	it("clips wide ellipsis safely and brackets it with resets", () => {
+	it("clips wide ellipsis safely without adding resets to plain text", () => {
 		assert.strictEqual(truncateToWidth("abcdef", 1, "🙂"), "");
-		assert.strictEqual(truncateToWidth("abcdef", 2, "🙂"), "\x1b[0m🙂\x1b[0m");
+		assert.strictEqual(truncateToWidth("abcdef", 2, "🙂"), "🙂");
 		assert.ok(visibleWidth(truncateToWidth("abcdef", 2, "🙂")) <= 2);
 	});
 
@@ -51,7 +57,7 @@ describe("truncateToWidth", () => {
 
 	it("keeps a contiguous prefix instead of skipping a wide grapheme and resuming later", () => {
 		const truncated = truncateToWidth("🙂\t界 \x1b_abc\x07", 7, "…", true);
-		assert.strictEqual(truncated, "🙂\t\x1b[0m…\x1b[0m ");
+		assert.strictEqual(truncated, "🙂\t… ");
 	});
 });
 

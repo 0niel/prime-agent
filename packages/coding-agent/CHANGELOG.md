@@ -13,6 +13,7 @@
 - Fixed empty prompt placeholders hiding the input caret.
 - Fixed automatic model selection preferring other configured providers over Prime Inference's GLM 5.2 default.
 - Fixed missing ripgrep blocking subagents and added actionable installation guidance for the optional search helper ([ENG-4572](https://linear.app/primeintellect/issue/ENG-4572/ripgrep-not-installed)).
+- Fixed narrow slash-command descriptions ending abruptly or clearing the prompt background, and added a content-sized popup above the input with the same distinct surface as `/btw` ([ENG-4542](https://linear.app/primeintellect/issue/ENG-4542/command-descriptions-are-cut-off-on-narrow-screens)).
 - Fixed snapshot transfers terminating resident workers, stranding partial readers, or rejecting identical retries ([ENG-4602](https://linear.app/primeintellect/issue/ENG-4602/make-snapshot-transfers-idempotent-and-non-fatal)).
 - Fixed the resume picker opening on an older session instead of the newest session ([ENG-4630](https://linear.app/primeintellect/issue/ENG-4630/show-latest-sessions-first-in-resume-list)).
 - Fixed tool-only responses rendering directly against the preceding user prompt.

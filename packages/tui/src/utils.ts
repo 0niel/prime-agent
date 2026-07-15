@@ -137,13 +137,12 @@ function finalizeTruncatedResult(
 ): string {
 	const reset = "\x1b[0m";
 	const visibleWidth = prefixWidth + ellipsisWidth;
-	let result: string;
-
-	if (ellipsis.length > 0) {
-		result = `${prefix}${reset}${ellipsis}${reset}`;
-	} else {
-		result = `${prefix}${reset}`;
-	}
+	const prefixHasAnsi = prefix.includes("\x1b");
+	const ellipsisHasAnsi = ellipsis.includes("\x1b");
+	const beforeEllipsis = prefixHasAnsi ? reset : "";
+	const afterEllipsis = prefixHasAnsi || ellipsisHasAnsi ? reset : "";
+	const result =
+		ellipsis.length > 0 ? `${prefix}${beforeEllipsis}${ellipsis}${afterEllipsis}` : `${prefix}${beforeEllipsis}`;
 
 	return pad ? result + " ".repeat(Math.max(0, maxWidth - visibleWidth)) : result;
 }

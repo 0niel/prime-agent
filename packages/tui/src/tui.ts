@@ -195,6 +195,8 @@ export interface OverlayOptions {
 	row?: SizeValue;
 	/** Column position: absolute number, or percentage (e.g., "50%" = centered horizontally) */
 	col?: SizeValue;
+	/** Zero-width marker in base content; positions the overlay immediately above its row. */
+	aboveMarker?: string;
 
 	// === Margin from terminal edges ===
 	/** Margin from terminal edges. Number applies to all sides. */
@@ -1109,6 +1111,7 @@ export class TUI extends Container {
 			col: number;
 			w: number;
 			scrollback: boolean;
+			aboveMarker?: { line: number; col: number };
 		}[] = [];
 		let minLinesNeeded = result.length;
 
@@ -1117,6 +1120,18 @@ export class TUI extends Container {
 		for (const entry of visibleEntries) {
 			const { component, options } = entry;
 			const scrollback = options?.scrollback === true;
+			let aboveMarker: { line: number; col: number } | undefined;
+			if (options?.aboveMarker) {
+				for (let line = result.length - 1; line >= 0; line--) {
+					const markerIndex = result[line].indexOf(options.aboveMarker);
+					if (markerIndex === -1) continue;
+					aboveMarker = { line, col: visibleWidth(result[line].slice(0, markerIndex)) };
+					result[line] =
+						result[line].slice(0, markerIndex) + result[line].slice(markerIndex + options.aboveMarker.length);
+					break;
+				}
+				if (!aboveMarker) continue;
+			}
 
 			// Get layout with height=0 first to determine width and maxHeight
 			// (width and maxHeight don't depend on overlay height)
@@ -1133,8 +1148,10 @@ export class TUI extends Container {
 			// Get final row/col with actual overlay height
 			const { row, col } = this.resolveOverlayLayout(options, overlayLines.length, termWidth, termHeight);
 
-			rendered.push({ component, overlayLines, row, col, w: width, scrollback });
-			minLinesNeeded = Math.max(minLinesNeeded, row + overlayLines.length);
+			rendered.push({ component, overlayLines, row, col, w: width, scrollback, aboveMarker });
+			if (!aboveMarker) {
+				minLinesNeeded = Math.max(minLinesNeeded, row + overlayLines.length);
+			}
 		}
 
 		// Pad to at least terminal height so overlays have screen-relative positions.
@@ -1150,8 +1167,21 @@ export class TUI extends Container {
 		const viewportStart = Math.max(0, workingHeight - termHeight);
 
 		// Composite each overlay
-		for (const { component, overlayLines, row, col, w, scrollback } of rendered) {
-			const overlayStart = scrollback ? Math.max(0, workingHeight - (row + overlayLines.length)) : viewportStart;
+		for (const renderedOverlay of rendered) {
+			const { component, w, scrollback, aboveMarker } = renderedOverlay;
+			let { overlayLines, row, col } = renderedOverlay;
+			if (aboveMarker) {
+				const markerRow = aboveMarker.line - viewportStart;
+				if (markerRow <= 0 || markerRow >= termHeight) continue;
+				if (overlayLines.length > markerRow) {
+					overlayLines = overlayLines.slice(overlayLines.length - markerRow);
+				}
+				row = markerRow - overlayLines.length;
+				col = Math.max(0, Math.min(aboveMarker.col, termWidth - w));
+			}
+
+			const overlayStart =
+				scrollback && !aboveMarker ? Math.max(0, workingHeight - (row + overlayLines.length)) : viewportStart;
 			for (let i = 0; i < overlayLines.length; i++) {
 				const idx = overlayStart + row + i;
 				if (idx >= 0 && idx < result.length) {

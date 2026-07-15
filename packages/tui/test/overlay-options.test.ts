@@ -501,6 +501,74 @@ describe("TUI overlay options", () => {
 		});
 	});
 
+	describe("marker anchoring", () => {
+		it("renders above its marker without moving the anchored content", async () => {
+			const terminal = new VirtualTerminal(20, 8);
+			const tui = new TUI(terminal);
+			const marker = "\x1b_pi:test-overlay\x07";
+			const content = new StaticOverlay([
+				"transcript 1",
+				"transcript 2",
+				"transcript 3",
+				"transcript 4",
+				"underlay 1",
+				"underlay 2",
+				`${marker}input`,
+				"footer",
+			]);
+
+			tui.addChild(content);
+			tui.showOverlay(new StaticOverlay(["suggestion", "description"]), {
+				width: "100%",
+				aboveMarker: marker,
+				nonCapturing: true,
+			});
+			tui.start();
+			await renderAndFlush(tui, terminal);
+
+			const viewport = terminal.getViewport();
+			assert.equal(viewport[4]?.trimEnd(), "suggestion");
+			assert.equal(viewport[5]?.trimEnd(), "description");
+			assert.equal(viewport[6], "input");
+			assert.equal(viewport[7], "footer");
+			assert.ok(viewport.every((line) => !line.includes(marker)));
+			tui.stop();
+		});
+
+		it("anchors above fullscreen dock content", async () => {
+			const terminal = new VirtualTerminal(20, 8);
+			const tui = new TUI(terminal);
+			const marker = "\x1b_pi:fullscreen-overlay\x07";
+			const transcript = new StaticOverlay([
+				"transcript 1",
+				"transcript 2",
+				"transcript 3",
+				"transcript 4",
+				"underlay 1",
+				"underlay 2",
+			]);
+			const dock = new StaticOverlay([`${marker}input`, "footer"]);
+
+			tui.addChild(transcript);
+			tui.addChild(dock);
+			tui.start();
+			tui.enterFullscreen({ scroll: [transcript], dock, mouse: false });
+			tui.showOverlay(new StaticOverlay(["suggestion", "description"]), {
+				width: "100%",
+				aboveMarker: marker,
+				nonCapturing: true,
+			});
+			await renderAndFlush(tui, terminal);
+
+			const viewport = terminal.getViewport();
+			assert.equal(viewport[4]?.trimEnd(), "suggestion");
+			assert.equal(viewport[5]?.trimEnd(), "description");
+			assert.equal(viewport[6], "input");
+			assert.equal(viewport[7], "footer");
+			tui.stop();
+		});
+	});
+
 	describe("stacked overlays", () => {
 		it("should render multiple overlays with later ones on top", async () => {
 			const terminal = new VirtualTerminal(80, 24);

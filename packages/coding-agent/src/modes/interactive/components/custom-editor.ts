@@ -296,6 +296,6 @@ export class CustomEditor extends Editor {
 		const padding = " ".repeat(Math.max(0, placeholderWidth - visibleWidth(placeholderText)));
 		const line = `${promptLeadingPadding}${promptPrefix}${promptTrailingPadding}${displayText}${padding}${rightPadding}`;
 		const padded = line + " ".repeat(Math.max(0, width - visibleWidth(line)));
-		return this.backgroundColor ? this.backgroundColor(padded) : padded;
+		return this.getAutocompleteAnchorMarker() + (this.backgroundColor ? this.backgroundColor(padded) : padded);
 	}
 }

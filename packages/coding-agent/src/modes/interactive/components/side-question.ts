@@ -61,7 +61,7 @@ export class SideQuestionComponent implements Component {
 
 	private applySurface(line: string, width: number): string {
 		const padded = line + " ".repeat(Math.max(0, width - visibleWidth(line)));
-		const background = theme.getUserMessageBackgroundColor();
+		const background = theme.getPopupBackgroundColor();
 		return padded
 			.split("\x1b[0m")
 			.map((segment) => background(segment))

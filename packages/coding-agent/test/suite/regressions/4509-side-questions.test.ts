@@ -6,7 +6,7 @@ import { type SideQuestionEvent, startSideQuestion } from "../../../src/core/sid
 import { AgentDaemon } from "../../../src/modes/daemon/daemon-mode.js";
 import { SideQuestionComponent } from "../../../src/modes/interactive/components/side-question.js";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.js";
-import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
+import { getEditorTheme, initTheme, theme } from "../../../src/modes/interactive/theme/theme.js";
 import { createHarness, getMessageText } from "../harness.js";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -226,9 +226,12 @@ describe("ENG-4509 side questions", () => {
 		);
 		const lines = component.render(40);
 		const rendered = stripAnsi(lines.join("\n"));
+		const blankPopupLine = theme.getPopupBackgroundColor()(" ".repeat(40));
 
 		expect(lines).toHaveLength(8);
 		expect(lines.every((line) => line.includes("\x1b[48"))).toBe(true);
+		expect(lines[0]).toBe(blankPopupLine);
+		expect(getEditorTheme().autocompleteBackgroundColor?.(" ".repeat(40))).toBe(blankPopupLine);
 		expect(rendered).toContain("  /btw  What changed?");
 		expect(rendered).not.toContain("  answer");
 		expect(rendered).toContain("First line");
