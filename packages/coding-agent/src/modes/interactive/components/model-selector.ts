@@ -43,6 +43,7 @@ export interface ModelSelectorOptions {
 	actions?: ReadonlyArray<ModelSelectorAction>;
 	availableModels?: ReadonlyArray<Model<any>>;
 	header?: Component;
+	getHeaderRows?: () => number;
 	onAction?: (actionId: string) => void;
 	subtitle?: string;
 	getRows?: () => number;
@@ -106,7 +107,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	});
 	private responsiveLayoutKey = "";
 	private readonly viewport: MenuViewportProvider;
-	private readonly headerRows: number;
+	private readonly getHeaderRows: () => number;
 
 	constructor(
 		tui: TUI,
@@ -132,7 +133,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.onActionCallback = options.onAction;
 		this.recentRank = new Map((options.recentModels ?? []).map((key, i) => [key, i]));
 		this.viewport = { getRows: options.getRows };
-		this.headerRows = options.header ? 2 : 0;
+		this.getHeaderRows = options.header ? (options.getHeaderRows ?? (() => 2)) : () => 0;
 
 		this.panel = new MenuPanel({
 			title: "Models",
@@ -481,9 +482,10 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			headerHelpRows += 1;
 		}
 
+		const headerRows = this.getHeaderRows();
 		const reservedRows =
 			MODEL_LIST_RESERVED_ROWS.base +
-			this.headerRows +
+			headerRows +
 			headerHelpRows +
 			(this.shouldShowSelectedDetails() ? MODEL_LIST_RESERVED_ROWS.detail : 0);
 		this.listLayout = getMenuListLayout({
@@ -496,6 +498,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			scrollIndicatorRows: MODEL_SCROLL_INDICATOR_ROWS,
 		});
 		this.responsiveLayoutKey = [
+			headerRows,
 			showHeaderHelp ? "help" : "no-help",
 			headerHelpRows,
 			this.shouldShowSelectedDetails() ? "detail" : "no-detail",

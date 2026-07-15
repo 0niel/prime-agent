@@ -32,6 +32,7 @@ export type AuthSelectorProvider = {
 export interface OAuthSelectorOptions extends MenuViewportProvider {
 	initialCategory?: AuthSelectorCategory;
 	header?: Component;
+	getHeaderRows?: () => number;
 	title?: string;
 	subtitle?: string;
 	searchPlaceholder?: string;
@@ -86,7 +87,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		compactItemRows: 2,
 	});
 	private readonly viewport: MenuViewportProvider;
-	private readonly headerRows: number;
+	private readonly getHeaderRows: () => number;
 
 	constructor(
 		mode: "login" | "logout",
@@ -103,7 +104,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		this.authStorage = authStorage;
 		this.getAuthStatus = getAuthStatus ?? ((providerId) => this.authStorage.getAuthStatus(providerId));
 		this.viewport = options;
-		this.headerRows = options.header ? TAB_BAR_RESERVED_ROWS : 0;
+		this.getHeaderRows = options.header ? (options.getHeaderRows ?? (() => TAB_BAR_RESERVED_ROWS)) : () => 0;
 		this.allProviders = this.sortProviders(providers);
 		this.filteredProviders = this.allProviders;
 		this.onSelectCallback = onSelect;
@@ -408,7 +409,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 	}
 
 	private get reservedRows(): number {
-		return PROVIDER_LIST_RESERVED_ROWS + this.headerRows + (this.tabBar ? TAB_BAR_RESERVED_ROWS : 0);
+		return PROVIDER_LIST_RESERVED_ROWS + this.getHeaderRows() + (this.tabBar ? TAB_BAR_RESERVED_ROWS : 0);
 	}
 
 	private updateLayout(): void {

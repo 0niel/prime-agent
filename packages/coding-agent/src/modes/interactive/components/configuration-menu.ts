@@ -5,11 +5,14 @@ import {
 	type Focusable,
 	getKeybindings,
 	type TUI,
-	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { AuthStorage } from "../../../core/auth-storage.js";
 import type { ModelRegistry } from "../../../core/model-registry.js";
 import { theme } from "../theme/theme.js";
+import { keyText } from "./keybinding-hints.js";
+import { getMenuPanelInnerWidth } from "./menu-panel.js";
 import { type ModelSelectorAction, ModelSelectorComponent } from "./model-selector.js";
 import { type AuthSelectorProvider, OAuthSelectorComponent } from "./oauth-selector.js";
 
@@ -55,11 +58,52 @@ class ConfigurationMenuTabBar implements Component {
 	constructor(private readonly getActiveTab: () => ConfigurationMenuTab) {}
 
 	render(width: number): string[] {
+		return this.getLines(width);
+	}
+
+	getRowCount(width: number): number {
+		return this.getLines(width).length;
+	}
+
+	private getLines(width: number): string[] {
+		const safeWidth = Math.max(1, width);
 		const activeTab = this.getActiveTab();
-		const labels = CONFIGURATION_MENU_TABS.map((tab) =>
-			tab === activeTab ? theme.bold(theme.fg("accent", TAB_LABELS[tab])) : theme.fg("muted", TAB_LABELS[tab]),
-		).join(theme.fg("muted", "  ·  "));
-		return [truncateToWidth(`${labels}   ${theme.fg("muted", "←/→ switch")}`, Math.max(1, width), "")];
+		const labels = CONFIGURATION_MENU_TABS.map((tab) => {
+			const label = `[${tab === activeTab ? "▶" : " "} ${TAB_LABELS[tab]}]`;
+			return tab === activeTab ? theme.bold(theme.fg("accent", label)) : theme.fg("text", label);
+		});
+		const lines = this.wrapItems(
+			[theme.bold(theme.fg("muted", "Tabs:")), ...labels],
+			theme.fg("muted", "  "),
+			safeWidth,
+		);
+		const previousKey = keyText("app.configuration.previousTab", { primaryOnly: true });
+		const nextKey = keyText("app.configuration.nextTab", { primaryOnly: true });
+		const hint = `${theme.fg("dim", `${previousKey}/${nextKey}`)}${theme.fg("muted", " switch tabs")}`;
+		const lastLine = lines.at(-1);
+		if (lastLine && visibleWidth(`${lastLine}   ${hint}`) <= safeWidth) {
+			lines[lines.length - 1] = `${lastLine}   ${hint}`;
+			return lines;
+		}
+		return [...lines, ...wrapTextWithAnsi(hint, safeWidth)];
+	}
+
+	private wrapItems(items: string[], separator: string, width: number): string[] {
+		const lines: string[] = [];
+		let line = "";
+		for (const item of items) {
+			const candidate = line ? `${line}${separator}${item}` : item;
+			if (line && visibleWidth(candidate) > width) {
+				lines.push(...wrapTextWithAnsi(line, width));
+				line = item;
+			} else {
+				line = candidate;
+			}
+		}
+		if (line) {
+			lines.push(...wrapTextWithAnsi(line, width));
+		}
+		return lines;
 	}
 
 	invalidate(): void {}
@@ -73,11 +117,13 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 	};
 	private activeTab: ConfigurationMenuTab;
 	private _focused = false;
+	private renderWidth = 78;
 
 	constructor(private readonly options: ConfigurationMenuOptions) {
 		super();
 		this.activeTab = options.initialTab;
 		const tabBar = new ConfigurationMenuTabBar(() => this.activeTab);
+		const getHeaderRows = () => tabBar.getRowCount(getMenuPanelInnerWidth(this.renderWidth)) + 1;
 		const providerOptions = options.providerOptions.filter(
 			(provider) => (provider.category ?? "provider") === "provider",
 		);
@@ -93,6 +139,7 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 			{
 				getRows: options.getRows,
 				header: tabBar,
+				getHeaderRows,
 				title: "Providers",
 				subtitle: "Connect with a subscription or API key.",
 				searchPlaceholder: "Search providers",
@@ -110,6 +157,7 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 				actions: MODEL_SELECTOR_ACTIONS,
 				availableModels: options.availableModels,
 				header: tabBar,
+				getHeaderRows,
 				onAction: () => this.setActiveTab("providers"),
 				getRows: options.getRows,
 				recentModels: options.recentModels,
@@ -125,6 +173,7 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 			{
 				getRows: options.getRows,
 				header: tabBar,
+				getHeaderRows,
 				title: "MCP Connections",
 				subtitle: "Connect MCP integrations and service credentials.",
 				searchPlaceholder: "Search MCP connections",
@@ -146,6 +195,11 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 	set focused(value: boolean) {
 		this._focused = value;
 		this.activeBody.focused = value;
+	}
+
+	override render(width: number): string[] {
+		this.renderWidth = width;
+		return super.render(width);
 	}
 
 	getActiveTab(): ConfigurationMenuTab {
@@ -178,11 +232,17 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
-		if (this.activeSearchIsEmpty() && kb.matches(keyData, "tui.editor.cursorLeft")) {
+		if (
+			kb.matches(keyData, "app.configuration.previousTab") &&
+			(this.activeSearchIsEmpty() || !kb.matches(keyData, "tui.editor.cursorLeft"))
+		) {
 			this.switchTab(-1);
 			return;
 		}
-		if (this.activeSearchIsEmpty() && kb.matches(keyData, "tui.editor.cursorRight")) {
+		if (
+			kb.matches(keyData, "app.configuration.nextTab") &&
+			(this.activeSearchIsEmpty() || !kb.matches(keyData, "tui.editor.cursorRight"))
+		) {
 			this.switchTab(1);
 			return;
 		}
