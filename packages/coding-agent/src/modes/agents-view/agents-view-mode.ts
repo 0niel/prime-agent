@@ -1108,21 +1108,13 @@ class AgentsViewMode implements Component, Focusable {
 				hide();
 				resolve();
 			};
-			const restore = () => {
-				if (settled) return;
-				hidden = false;
-				handle?.setHidden(false);
-				handle?.focus();
-				this.ui.requestRender();
-			};
 			const authenticate = (provider: AuthSelectorProvider, tab: "providers" | "mcp-connections") => {
 				if (settled) return;
-				handle?.setHidden(true);
 				void authFlows
 					.loginProvider(provider)
 					.then(async (authResult) => {
 						if (settled) return;
-						restore();
+						handle?.focus();
 						menu.refreshAuthentication();
 						if (authResult.status !== "success" || tab === "mcp-connections") return;
 
@@ -1131,7 +1123,7 @@ class AgentsViewMode implements Component, Focusable {
 						menu.setActiveTab("models");
 					})
 					.catch((error) => {
-						restore();
+						handle?.focus();
 						this.setStatusMessage(error instanceof Error ? error.message : String(error), { tone: "error" });
 					});
 			};

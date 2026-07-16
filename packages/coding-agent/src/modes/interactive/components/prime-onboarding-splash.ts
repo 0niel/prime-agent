@@ -51,6 +51,7 @@ interface QuietZone {
 export class PrimeOnboardingSplashComponent implements Component {
 	private frame = 0;
 	private animationInterval?: ReturnType<typeof setInterval>;
+	private progressMessage?: string;
 
 	constructor(
 		private readonly onSelect: () => void,
@@ -77,6 +78,12 @@ export class PrimeOnboardingSplashComponent implements Component {
 		this.animationInterval = undefined;
 	}
 
+	showProgress(message: string): void {
+		this.progressMessage = message;
+		this.dispose();
+		this.options.requestRender?.();
+	}
+
 	render(width: number): string[] {
 		const safeWidth = Math.max(1, width);
 		const panelLines = this.renderPanel(safeWidth);
@@ -91,6 +98,9 @@ export class PrimeOnboardingSplashComponent implements Component {
 	}
 
 	handleInput(keyData: string): void {
+		if (this.progressMessage) {
+			return;
+		}
 		const kb = getKeybindings();
 		if (kb.matches(keyData, "tui.select.confirm")) {
 			this.onSelect();
@@ -102,6 +112,9 @@ export class PrimeOnboardingSplashComponent implements Component {
 	}
 
 	private formatContinueHint(): PanelTextLine {
+		if (this.progressMessage) {
+			return [{ text: this.progressMessage, tone: "muted" }];
+		}
 		const actionLabel = this.options.continueActionLabel ?? "login with Prime Intellect";
 		return [
 			{ text: "Press ", tone: "muted" },
