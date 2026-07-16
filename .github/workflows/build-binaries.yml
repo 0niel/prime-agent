@@ -30,6 +30,7 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
       - name: Resolve release context
@@ -58,7 +59,7 @@ jobs:
             version=$(node -p "require('./package.json').version")
             release_tag="v${version}"
             build_ref="$GITHUB_SHA_VALUE"
-            if git ls-remote --exit-code --tags origin "refs/tags/${release_tag}" >/dev/null 2>&1; then
+            if git show-ref --verify --quiet "refs/tags/${release_tag}"; then
               echo "Tag ${release_tag} already exists; skipping release."
               should_release=false
             fi
