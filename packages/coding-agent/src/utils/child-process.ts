@@ -12,6 +12,20 @@ export function shouldUseWindowsShell(command: string): boolean {
 	return commandName.endsWith(".cmd") || commandName.endsWith(".bat") || WINDOWS_SHELL_COMMANDS.has(commandName);
 }
 
+export function signalProcessGroupOrProcess(pid: number, signal: NodeJS.Signals): void {
+	try {
+		process.kill(-pid, signal);
+		return;
+	} catch {
+		// Fall back when process groups are unavailable or the group already exited.
+	}
+	try {
+		process.kill(pid, signal);
+	} catch {
+		// The process may already be fully reaped.
+	}
+}
+
 /**
  * Wait for a child process to terminate without hanging on inherited stdio handles.
  *

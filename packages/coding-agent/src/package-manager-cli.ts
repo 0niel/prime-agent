@@ -46,6 +46,10 @@ export type PackageCommand = "install" | "remove" | "update" | "list";
 
 type UpdateTarget = { type: "all" } | { type: "self" } | { type: "extensions"; source?: string };
 
+export function isSelfUpdateSource(source: string): boolean {
+	return source === "self" || source === "pi" || source === APP_NAME;
+}
+
 interface PackageCommandOptions {
 	command: PackageCommand;
 	source?: string;
@@ -72,13 +76,13 @@ function reportSettingsErrors(settingsManager: SettingsManager, context: string)
 function getPackageCommandUsage(command: PackageCommand): string {
 	switch (command) {
 		case "install":
-			return `${APP_NAME} install <source> [-l]`;
+			return `${APP_NAME} package install <source> [--local]`;
 		case "remove":
-			return `${APP_NAME} remove <source> [-l]`;
+			return `${APP_NAME} package remove <source> [--local]`;
 		case "update":
-			return `${APP_NAME} update [source|self|${APP_NAME}] [--self] [--extensions] [--extension <source>] [--force]`;
+			return `${APP_NAME} update [--force] or ${APP_NAME} package update [source]`;
 		case "list":
-			return `${APP_NAME} list`;
+			return `${APP_NAME} package list`;
 	}
 }
 
@@ -91,15 +95,15 @@ function printPackageCommandHelp(command: PackageCommand): void {
 Install a package and add it to settings.
 
 Options:
-  -l, --local    Install project-locally (${CONFIG_DIR_NAME}/settings.json)
+  --local    Install project-locally (${CONFIG_DIR_NAME}/settings.json)
 
 Examples:
-  ${APP_NAME} install npm:@foo/bar
-  ${APP_NAME} install git:github.com/user/repo
-  ${APP_NAME} install git:git@github.com:user/repo
-  ${APP_NAME} install https://github.com/user/repo
-  ${APP_NAME} install ssh://git@github.com/user/repo
-  ${APP_NAME} install ./local/path
+  ${APP_NAME} package install npm:@foo/bar
+  ${APP_NAME} package install git:github.com/user/repo
+  ${APP_NAME} package install git:git@github.com:user/repo
+  ${APP_NAME} package install https://github.com/user/repo
+  ${APP_NAME} package install ssh://git@github.com/user/repo
+  ${APP_NAME} package install ./local/path
 `);
 			return;
 
@@ -108,14 +112,12 @@ Examples:
   ${getPackageCommandUsage("remove")}
 
 Remove a package and its source from settings.
-Alias: ${APP_NAME} uninstall <source> [-l]
 
 Options:
-  -l, --local    Remove from project settings (${CONFIG_DIR_NAME}/settings.json)
+  --local    Remove from project settings (${CONFIG_DIR_NAME}/settings.json)
 
 Examples:
-  ${APP_NAME} remove npm:@foo/bar
-  ${APP_NAME} uninstall npm:@foo/bar
+  ${APP_NAME} package remove npm:@foo/bar
 `);
 			return;
 
@@ -123,7 +125,7 @@ Examples:
 			console.log(`${chalk.bold("Usage:")}
   ${getPackageCommandUsage("update")}
 
-Update ${APP_NAME} and installed packages.
+Update ${APP_NAME} or installed packages.
 
 Options:
   --self                  Update ${APP_NAME} only
@@ -131,10 +133,10 @@ Options:
   --extension <source>    Update one package only
   --force                 Reinstall ${APP_NAME} even if the current version is latest
 
-Short forms:
-  ${APP_NAME} update                Update ${APP_NAME} and all extensions
-  ${APP_NAME} update <source>       Update one package
-  ${APP_NAME} update ${APP_NAME}             Update ${APP_NAME} only (self works as an alias)
+Commands:
+  ${APP_NAME} update                Update ${APP_NAME}
+  ${APP_NAME} package update        Update installed packages
+  ${APP_NAME} package update <source> Update one package
 `);
 			return;
 
@@ -179,7 +181,7 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 			continue;
 		}
 
-		if (arg === "-l" || arg === "--local") {
+		if (arg === "--local") {
 			if (command === "install" || command === "remove") {
 				local = true;
 			} else {
@@ -257,7 +259,7 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 			}
 			updateTarget = { type: "extensions", source: extensionFlagSource };
 		} else if (source) {
-			const sourceIsSelf = source === "self" || source === "pi" || source === APP_NAME;
+			const sourceIsSelf = isSelfUpdateSource(source);
 			if (sourceIsSelf) {
 				updateTarget = extensionsFlag ? { type: "all" } : { type: "self" };
 			} else {
@@ -383,10 +385,10 @@ const UPDATE_RESTART_CONTINUATION_PROMPT =
 const UPDATE_SESSION_LOSS_COPY: DaemonSessionLossCopy = {
 	busyDetail(count) {
 		const { noun, pronoun } = pluralizeSessions(count);
-		return `The running daemon has ${count} busy ${noun}. After the update installs, Prime Agent will stop ${pronoun}, restart the daemon, and resume interrupted work.`;
+		return `Prime Agent has ${count} busy ${noun}. After the update installs, it will stop ${pronoun}, restart its background service, and resume interrupted work.`;
 	},
 	unlistableDetail:
-		"A running daemon's sessions could not be listed. After the update installs, Prime Agent will stop resident sessions, restart the daemon, and resume interrupted work where possible.",
+		"Running agents could not be listed. After the update installs, Prime Agent will stop resident agents, restart its background service, and resume interrupted work where possible.",
 	question: "Continue?",
 	nonTtyHint: "Re-run with --force to proceed.",
 };
@@ -1010,7 +1012,7 @@ async function restoreDaemonUpdateRestart(socketPath: string, manifest: DaemonUp
 	} finally {
 		client.close();
 	}
-	console.log(chalk.green(`Restored ${restored} daemon session${restored === 1 ? "" : "s"}`));
+	console.log(chalk.green(`Restored ${restored} agent session${restored === 1 ? "" : "s"}`));
 	if (resumed > 0) {
 		console.log(chalk.green(`Resumed ${resumed} interrupted session${resumed === 1 ? "" : "s"}`));
 	}
@@ -1035,7 +1037,7 @@ async function tryRestoreDaemonUpdateRestart(
 		return true;
 	} catch (error: unknown) {
 		console.error(
-			chalk.yellow(`Warning: could not restore daemon sessions ${failureContext}: ${formatUnknownError(error)}`),
+			chalk.yellow(`Warning: could not restore agent sessions ${failureContext}: ${formatUnknownError(error)}`),
 		);
 		return false;
 	}
@@ -1054,14 +1056,14 @@ async function restartDaemonAfterSelfUpdate(socketPath: string, agentDir: string
 			if (daemonProbeMayHaveBusySessions(daemonProbe) || !daemonLacksPrepareCommand) {
 				console.error(
 					chalk.yellow(
-						`Warning: updated, but could not prepare daemon sessions for automatic resume (${message}); leaving the running daemon on the previous version.`,
+						`Warning: updated, but could not prepare agent sessions for automatic resume (${message}); leaving the background service on the previous version.`,
 					),
 				);
 				return;
 			}
 			console.error(
 				chalk.yellow(
-					`Warning: the old daemon cannot prepare idle sessions for automatic resume (${message}); restarting the daemon without restored sessions.`,
+					`Warning: the old background service cannot prepare idle sessions for automatic resume (${message}); restarting without restored sessions.`,
 				),
 			);
 		}
@@ -1075,7 +1077,9 @@ async function restartDaemonAfterSelfUpdate(socketPath: string, agentDir: string
 	const stopped = oldDaemonAlreadyStopped || (await shutdownDaemonAndWait(socketPath));
 	if (!stopped) {
 		console.error(
-			chalk.yellow(`Warning: could not stop the old daemon on ${socketPath}; it will be replaced on next launch.`),
+			chalk.yellow(
+				`Warning: could not stop the old background service on ${socketPath}; it will be replaced on next launch.`,
+			),
 		);
 		await tryRestoreDaemonUpdateRestart(socketPath, agentDir, manifest, "after daemon stop failed");
 		return;
@@ -1086,7 +1090,7 @@ async function restartDaemonAfterSelfUpdate(socketPath: string, agentDir: string
 		const message = formatUnknownError(error);
 		console.error(
 			chalk.yellow(
-				`Warning: updated, but could not relaunch the daemon (${message}); it will start on next launch.`,
+				`Warning: updated, but could not relaunch the background service (${message}); it will start on next launch.`,
 			),
 		);
 		await tryRestoreDaemonUpdateRestart(socketPath, agentDir, manifest, "after relaunch failed");
@@ -1131,6 +1135,11 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 	}
 
 	if (options.invalidOption) {
+		if (options.invalidOption === "-l" && (options.command === "install" || options.command === "remove")) {
+			console.error(chalk.red('Option -l was removed. Use "--local".'));
+			process.exitCode = 1;
+			return true;
+		}
 		console.error(chalk.red(`Unknown option ${options.invalidOption} for "${options.command}".`));
 		console.error(chalk.dim(`Use "${APP_NAME} --help" or "${getPackageCommandUsage(options.command)}".`));
 		process.exitCode = 1;

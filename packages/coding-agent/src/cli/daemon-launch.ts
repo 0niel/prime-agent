@@ -15,6 +15,7 @@ import { DaemonClient } from "../modes/daemon/daemon-client.js";
 import { DAEMON_PROTOCOL_VERSION } from "../modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
+import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
 
 export function isDaemonSessionSummary(value: unknown): value is SessionSummary {
 	if (!value || typeof value !== "object") {
@@ -104,8 +105,8 @@ export async function listActiveDaemonSessionSummaries(client: DaemonClient): Pr
 export class StaleDaemonError extends Error {
 	constructor(readonly socketPath: string) {
 		super(
-			`A background daemon from a different prime-agent version is running on ${socketPath} and can't be driven by ` +
-				`this version. Run "prime-agent daemon shutdown" to stop it, then retry.`,
+			`A background service from a different Prime Agent version is running on ${socketPath} and can't be driven by ` +
+				`this version. Run "prime-agent shutdown" to stop it, then retry.`,
 		);
 		this.name = "StaleDaemonError";
 	}
@@ -297,8 +298,6 @@ const EARLY_LAUNCH_EXCLUDED_FLAGS = new Set([
 	"--export",
 ]);
 
-const EARLY_LAUNCH_EXCLUDED_COMMANDS = new Set(["daemon", "install", "remove", "update", "list", "config"]);
-
 /** Conservative pre-parse of argv: true only when startup clearly heads into daemon-backed interactive mode. */
 export function shouldStartInteractiveDaemonEarly(
 	args: readonly string[],
@@ -308,8 +307,16 @@ export function shouldStartInteractiveDaemonEarly(
 	if (startupBenchmark || !stdinIsTTY) {
 		return false;
 	}
-	const firstPositional = args.find((arg) => arg.length > 0 && !arg.startsWith("-"));
-	if (firstPositional && EARLY_LAUNCH_EXCLUDED_COMMANDS.has(firstPositional)) {
+	const firstPositionalIndex = args.findIndex((arg) => arg.length > 0 && !arg.startsWith("-"));
+	const firstPositional = args[firstPositionalIndex];
+	const isHelpCommand = firstPositional === "help" && isHelpCommandRequest(args.slice(firstPositionalIndex + 1));
+	if (
+		firstPositional &&
+		(REMOVED_COMMAND_NAMES.has(firstPositional) ||
+			(PUBLIC_COMMAND_NAMES.has(firstPositional) &&
+				firstPositional !== "agents" &&
+				(firstPositional !== "help" || isHelpCommand)))
+	) {
 		return false;
 	}
 	return !args.some((arg) => EARLY_LAUNCH_EXCLUDED_FLAGS.has(arg));

@@ -68,3 +68,14 @@ Authenticate in the TUI with:
 ```text
 /login
 ```
+
+## Common Commands
+
+```bash
+prime-agent                          # Start a new session
+prime-agent agents                   # Open the agents view
+prime-agent --resume [path|id]       # Browse or resume a previous session
+prime-agent doctor [--fix]           # Inspect or repair background services
+prime-agent update [--force]         # Update Prime Agent
+prime-agent shutdown [--force]       # Stop every agent, worker, and background service
+```

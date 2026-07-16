@@ -35,9 +35,9 @@ Normal interactive sessions use resident workers:
 - Workers monitor the public supervisor socket. If it disappears, one worker acquires an atomic launch lease and starts a replacement supervisor.
 - A replacement supervisor adopts the existing worker PIDs and active-session IDs.
 - A worker crash affects only its root tree. Recovery retries after 250 ms, 1 second, and 5 seconds; three failed attempts mark that root failed.
-- `prime-agent daemon retry <session>` retries a failed root.
-- `prime-agent daemon restart` replaces only the supervisor and adopts workers.
-- `prime-agent daemon shutdown` stops workers before the supervisor; `--force` sends `SIGKILL` to workers that do not stop gracefully.
+- The agents view can retry a failed root through the internal supervisor protocol.
+- Supervisor replacement adopts workers automatically.
+- `prime-agent shutdown` stops every worker and supervisor; `--force` also sends `SIGKILL` to unresponsive workers and their tracked child processes.
 
 There are no session, worker, client, or workload caps in this layer.
 

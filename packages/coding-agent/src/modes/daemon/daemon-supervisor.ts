@@ -29,6 +29,7 @@ import {
 } from "../../core/orphan-process-journal.js";
 import { getProcessStartId } from "../../core/session-lease.js";
 import type { SessionInfo } from "../../core/session-manager.js";
+import { signalProcessGroupOrProcess } from "../../utils/child-process.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
@@ -436,20 +437,6 @@ function isProcessAlive(pid: number): boolean {
 		return true;
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "EPERM";
-	}
-}
-
-function signalProcessGroupOrProcess(pid: number, signal: NodeJS.Signals): void {
-	try {
-		process.kill(-pid, signal);
-		return;
-	} catch {
-		// Fall back when process groups are unavailable or the group already exited.
-	}
-	try {
-		process.kill(pid, signal);
-	} catch {
-		// The process may already be fully reaped.
 	}
 }
 

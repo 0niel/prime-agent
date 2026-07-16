@@ -200,7 +200,7 @@ If your command is slow, expensive, rate-limited, or should keep using a previou
 | `compat` | No | provider `compat` | Provider compatibility overrides. Merged with provider-level `compat` when both are set. |
 
 Current behavior:
-- `/model` and `--list-models` list entries by model `id`.
+- `/model` and `prime-agent model list` list entries by model `id`.
 - The configured `name` is used for model matching and detail/status text.
 
 ### Thinking Level Map

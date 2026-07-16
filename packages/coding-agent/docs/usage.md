@@ -127,18 +127,26 @@ If you use pi for open source work and want to publish sessions for model, promp
 pi [options] [@files...] [messages...]
 ```
 
-### Package Commands
+### Shell Commands
 
 ```bash
-pi install <source> [-l]     # Install package, -l for project-local
-pi remove <source> [-l]      # Remove package
-pi uninstall <source> [-l]   # Alias for remove
-prime-agent update [source|self|prime-agent]   # Update Prime Agent and packages; skips pinned packages
-prime-agent update --extensions                # Update packages only
-prime-agent update --self                      # Update Prime Agent only
-prime-agent update --extension <src>           # Update one package
-pi list                      # List installed packages
-pi config                    # Enable/disable package resources
+prime-agent agents
+prime-agent list [--all]
+prime-agent attach <agent>
+prime-agent stop <agent>
+prime-agent rename <agent> <name>
+prime-agent send <agent> <message>
+prime-agent schedule <list|add|cancel>
+prime-agent status
+prime-agent doctor [--fix]
+prime-agent shutdown [--force]
+
+prime-agent package install <source> [--local]
+prime-agent package remove <source> [--local]
+prime-agent package list
+prime-agent package update [source]
+prime-agent update [--force]
+prime-agent config
 ```
 
 See [Pi Packages](packages.md) for package sources and security notes.
@@ -151,7 +159,6 @@ See [Pi Packages](packages.md) for package sources and security notes.
 | `-p`, `--print` | Print response and exit |
 | `--mode json` | Output all events as JSON lines; see [JSON mode](json.md) |
 | `--mode rpc` | RPC mode over stdin/stdout; see [RPC mode](rpc.md) |
-| `--export <in> [out]` | Export a session to HTML |
 
 In print mode, pi also reads piped stdin and merges it into the initial prompt:
 
@@ -168,7 +175,8 @@ cat README.md | pi -p "Summarize this text"
 | `--api-key <key>` | API key, overriding environment variables |
 | `--thinking <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh` |
 | `--models <patterns>` | Comma-separated patterns for Ctrl+P cycling |
-| `--list-models [search]` | List available models |
+
+Use `prime-agent model list [search]` to list available models.
 
 ### Session Options
 
@@ -179,6 +187,8 @@ cat README.md | pi -p "Summarize this text"
 | `--fork <path\|id>` | Fork a session file or partial UUID into a new session |
 | `--session-dir <dir>` | Custom session storage directory |
 | `--no-session` | Ephemeral mode; do not save |
+
+Use `prime-agent session export <file> [output]` to export a session to HTML.
 
 ### Tool Options
 

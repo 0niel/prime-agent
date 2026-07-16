@@ -986,7 +986,7 @@ describe("ENG-4603 worker recovery convergence", () => {
 		}
 	}, 15_000);
 
-	it("shutdown --all removes hidden supervisors and workers without changing CLI contracts", async () => {
+	it("shutdown --force removes hidden supervisors and workers through the public CLI", async () => {
 		if (process.platform === "win32") return;
 		const paths = await createPaths();
 		const predecessor = spawnSupervisor(paths);
@@ -1026,7 +1026,7 @@ describe("ENG-4603 worker recovery convergence", () => {
 		expect(listenersBeforeShutdown).toContain(`p${predecessor.child.pid}`);
 		expect(listenersBeforeShutdown).toContain(`p${successor.child.pid}`);
 
-		const shutdown = await runCli(paths, ["daemon", "shutdown", "--all", "--json"], 60_000, lsofEnvironment);
+		const shutdown = await runCli(paths, ["shutdown", "--force", "--json"], 60_000, lsofEnvironment);
 		expect(shutdown.code).toBe(0);
 		const shutdownResult = JSON.parse(shutdown.stdout) as { stopped: unknown[]; failed: unknown[] };
 		const survivingIdentities = [
@@ -1047,9 +1047,9 @@ describe("ENG-4603 worker recovery convergence", () => {
 		expect(exactProcessIsAlive(workerPid, workerStartId)).toBe(false);
 
 		const contracts = [
-			{ args: ["daemon", "ps", "--json"], json: [] },
-			{ args: ["daemon", "ps", "--reap", "--json"], json: { reaped: [], skipped: [] } },
-			{ args: ["daemon", "shutdown", "--all", "--json"], json: { stopped: [], failed: [] } },
+			{ args: ["status", "--json"], json: [] },
+			{ args: ["doctor", "--fix", "--json"], json: { reaped: [], skipped: [] } },
+			{ args: ["shutdown", "--force", "--json"], json: { stopped: [], failed: [] } },
 		];
 		for (const contract of contracts) {
 			const result = await runCli(paths, contract.args, 60_000, lsofEnvironment);
@@ -1058,14 +1058,10 @@ describe("ENG-4603 worker recovery convergence", () => {
 			}
 			expect(JSON.parse(result.stdout)).toEqual(contract.json);
 		}
-		for (const args of [
-			["daemon", "ps"],
-			["daemon", "ps", "--reap"],
-			["daemon", "shutdown", "--all"],
-		]) {
+		for (const args of [["status"], ["doctor", "--fix"], ["shutdown", "--force"]]) {
 			const result = await runCli(paths, args, 60_000, lsofEnvironment);
 			expect(result.code).toBe(0);
-			expect(result.stdout).toBe("No daemons found.\n");
+			expect(result.stdout).toBe("No background services found.\n");
 		}
 	}, 150_000);
 });
