@@ -16,6 +16,7 @@ type FakeInteractiveMode = {
 	escapeRepeatAction: "tree" | "clear" | undefined;
 	escapeRepeatExpiresAt: number;
 	escapeRepeatTimer: ReturnType<typeof setTimeout> | undefined;
+	traceUploadAllAbortController: AbortController | undefined;
 	isShuttingDown: boolean;
 	editor: FakeEditor;
 	connectionState: {
@@ -85,6 +86,7 @@ function createInteractiveFake(options: {
 		escapeRepeatAction: undefined,
 		escapeRepeatExpiresAt: 0,
 		escapeRepeatTimer: undefined,
+		traceUploadAllAbortController: undefined,
 		isShuttingDown: false,
 		editor,
 		connectionState: {
@@ -147,6 +149,21 @@ describe("InteractiveMode interrupt shortcuts", () => {
 
 		expect(mode.agentConnection.abortBash).toHaveBeenCalledTimes(1);
 		expect(mode.restoreQueuedMessagesToEditor).toHaveBeenCalledWith({ abort: true });
+		expect(mode.shutdown).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		["Ctrl+C", "handleCtrlC"],
+		["Escape", "handleEscape"],
+	] as const)("cancels an upload-all operation on %s", (_label, handlerName) => {
+		const mode = createInteractiveFake({});
+		const controller = new AbortController();
+		mode.traceUploadAllAbortController = controller;
+
+		Reflect.get(InteractiveMode.prototype, handlerName).call(mode);
+
+		expect(controller.signal.aborted).toBe(true);
+		expect(controller.signal.reason).toEqual(new Error("Trace upload cancelled"));
 		expect(mode.shutdown).not.toHaveBeenCalled();
 	});
 

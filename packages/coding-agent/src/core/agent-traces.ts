@@ -1,7 +1,8 @@
 import { Buffer } from "node:buffer";
-import { readFile, stat } from "node:fs/promises";
-import { dirname, isAbsolute, resolve } from "node:path";
-import { appendRotatingLog, getAgentTracesLogPath, VERSION } from "../config.js";
+import type { Dirent } from "node:fs";
+import { readdir, readFile, stat } from "node:fs/promises";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { appendRotatingLog, getAgentTracesLogPath, getSessionsDir, VERSION } from "../config.js";
 import { readFirstLineSync } from "../utils/file-lines.js";
 import type { AuthStorage } from "./auth-storage.js";
 import {
@@ -17,7 +18,17 @@ const MAX_TRACE_BYTES = 20 * 1024 * 1024;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const TRACE_UPLOAD_DEBOUNCE_MS = 1_000;
 const TRACE_UPLOAD_MIN_INTERVAL_MS = 60_000;
-const TRACE_UPLOAD_RETRY_DELAY_MS = 500;
+const TRACE_UPLOAD_RETRY_BASE_DELAY_MS = 500;
+const TRACE_UPLOAD_RETRY_MAX_DELAY_MS = 10_000;
+const TRACE_UPLOAD_MAX_RETRIES = 3;
+const TRACE_UPLOAD_RETRY_JITTER = 0.2;
+const TRACE_PREVIEW_MAX_CHARS = 8_000;
+const TRACE_UPLOAD_ALL_CONCURRENCY = 4;
+const TRACE_UPLOAD_RATE_LIMIT_REQUESTS = 5;
+const TRACE_UPLOAD_RATE_LIMIT_WINDOW_MS = 60_000;
+const TRACE_UPLOAD_RATE_LIMIT_SAFETY_MS = 100;
+const TRACE_UPLOAD_ALL_MIN_REQUEST_INTERVAL_MS =
+	Math.ceil(TRACE_UPLOAD_RATE_LIMIT_WINDOW_MS / TRACE_UPLOAD_RATE_LIMIT_REQUESTS) + TRACE_UPLOAD_RATE_LIMIT_SAFETY_MS;
 
 export type AgentTraceCredentialSource = "environment" | "stored" | "prime-inference" | "prime-cli";
 
@@ -47,6 +58,8 @@ export interface AgentTraceUploadOptions {
 	sessionFile: string | undefined;
 	authStorage: AuthStorage;
 	settingsManager: SettingsManager;
+	/** Require the global automatic-sharing opt-in. Set false only for an explicit one-shot upload command. */
+	requireEnabled?: boolean;
 	baseUrl?: string;
 	configPath?: string;
 	fetchFn?: typeof fetch;
@@ -66,6 +79,56 @@ export interface AgentTraceUploadInstallOptions {
 	configPath?: string;
 	fetchFn?: typeof fetch;
 	requestTimeoutMs?: number;
+}
+
+export type AgentTracePreviewResult =
+	| {
+			status: "ready";
+			sessionFile: string;
+			sessionId: string;
+			traceId: string;
+			parentSessionId?: string;
+			cwd: string;
+			size: number;
+			maxBytes: number;
+			uploadable: boolean;
+			endpoint: string;
+			gitRepo?: string;
+			gitCommit?: string;
+			contentPreview: string;
+			truncated: boolean;
+	  }
+	| { status: "no_session_file" }
+	| { status: "empty_session" }
+	| { status: "invalid_session"; message: string }
+	| { status: "failed"; message: string };
+
+export interface AgentTracePreviewOptions {
+	sessionFile: string | undefined;
+	baseUrl?: string;
+	maxContentChars?: number;
+}
+
+export interface AgentTraceUploadAllProgress {
+	completed: number;
+	total: number;
+	sessionFile?: string;
+	result?: AgentTraceUploadResult;
+}
+
+export interface AgentTraceUploadAllOptions extends Omit<AgentTraceUploadOptions, "sessionFile"> {
+	sessionDir?: string;
+	concurrency?: number;
+	onProgress?: (progress: AgentTraceUploadAllProgress) => void;
+}
+
+export interface AgentTraceUploadAllResult {
+	total: number;
+	uploaded: number;
+	failed: number;
+	skipped: number;
+	bytesStored: number;
+	results: Array<{ sessionFile: string; result: AgentTraceUploadResult }>;
 }
 
 function stringEnv(name: string): string | undefined {
@@ -93,6 +156,13 @@ function describeError(error: unknown): string {
 	return error.message;
 }
 
+class TraceUploadTimeoutError extends Error {
+	constructor(timeoutMs: number) {
+		super(`Trace upload timed out after ${timeoutMs}ms`);
+		this.name = "TraceUploadTimeoutError";
+	}
+}
+
 const RETRIABLE_NETWORK_CODES = new Set([
 	"ECONNRESET",
 	"ECONNREFUSED",
@@ -106,7 +176,12 @@ const RETRIABLE_NETWORK_CODES = new Set([
 	"UND_ERR_CONNECT_TIMEOUT",
 ]);
 
+const RETRIABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+
 function isRetriableNetworkError(error: unknown): boolean {
+	if (error instanceof TraceUploadTimeoutError) {
+		return true;
+	}
 	if (!(error instanceof Error) || error.name === "AbortError") {
 		return false;
 	}
@@ -260,12 +335,26 @@ async function fetchWithTimeout(
 	signal?: AbortSignal,
 ): Promise<Response> {
 	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), timeoutMs);
-	const onAbort = () => controller.abort();
-	signal?.addEventListener("abort", onAbort, { once: true });
+	const timeoutError = new TraceUploadTimeoutError(timeoutMs);
+	let timedOut = false;
+	const timeout = setTimeout(() => {
+		timedOut = true;
+		controller.abort(timeoutError);
+	}, timeoutMs);
+	const onAbort = () => controller.abort(signal?.reason);
+	if (signal?.aborted) {
+		onAbort();
+	} else {
+		signal?.addEventListener("abort", onAbort, { once: true });
+	}
 
 	try {
 		return await fetchFn(url, { ...init, signal: controller.signal });
+	} catch (error) {
+		if (timedOut) {
+			throw timeoutError;
+		}
+		throw error;
 	} finally {
 		clearTimeout(timeout);
 		signal?.removeEventListener("abort", onAbort);
@@ -274,6 +363,10 @@ async function fetchWithTimeout(
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve) => {
+		if (signal?.aborted) {
+			resolve();
+			return;
+		}
 		const timeout = setTimeout(finish, ms);
 		const onAbort = () => finish();
 		function finish() {
@@ -285,28 +378,258 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
+function traceUploadRetryDelay(retryIndex: number): number {
+	const exponentialDelay = Math.min(
+		TRACE_UPLOAD_RETRY_MAX_DELAY_MS,
+		TRACE_UPLOAD_RETRY_BASE_DELAY_MS * 2 ** retryIndex,
+	);
+	const jitterMultiplier = 1 - TRACE_UPLOAD_RETRY_JITTER + Math.random() * TRACE_UPLOAD_RETRY_JITTER * 2;
+	return Math.max(0, Math.round(exponentialDelay * jitterMultiplier));
+}
+
+function retryAfterDelay(response: Response): number | undefined {
+	const value = response.headers.get("retry-after")?.trim();
+	if (!value) {
+		return undefined;
+	}
+	const seconds = Number(value);
+	if (Number.isFinite(seconds) && seconds >= 0) {
+		return Math.min(Math.ceil(seconds * 1_000), TRACE_UPLOAD_RATE_LIMIT_WINDOW_MS);
+	}
+	const retryAt = Date.parse(value);
+	return Number.isFinite(retryAt)
+		? Math.min(Math.max(0, retryAt - Date.now()), TRACE_UPLOAD_RATE_LIMIT_WINDOW_MS)
+		: undefined;
+}
+
+type BeforeTraceUploadRequest = () => Promise<void>;
+
 async function fetchWithRetry(
 	fetchFn: typeof fetch,
 	url: string,
 	init: RequestInit,
 	timeoutMs: number,
 	signal?: AbortSignal,
+	beforeRequest?: BeforeTraceUploadRequest,
 ): Promise<Response> {
-	try {
-		return await fetchWithTimeout(fetchFn, url, init, timeoutMs, signal);
-	} catch (error) {
+	for (let attempt = 0; ; attempt += 1) {
+		let retryDelayMs: number | undefined;
+		try {
+			await beforeRequest?.();
+			if (signal?.aborted) {
+				throw signal.reason ?? new Error("Trace upload cancelled");
+			}
+			const response = await fetchWithTimeout(fetchFn, url, init, timeoutMs, signal);
+			if (attempt >= TRACE_UPLOAD_MAX_RETRIES || !RETRIABLE_HTTP_STATUSES.has(response.status)) {
+				return response;
+			}
+			if (response.status === 429) {
+				retryDelayMs = retryAfterDelay(response) ?? TRACE_UPLOAD_RATE_LIMIT_WINDOW_MS;
+			} else if (response.status === 503) {
+				retryDelayMs = retryAfterDelay(response);
+			}
+			await response.body?.cancel().catch(() => undefined);
+		} catch (error) {
+			if (signal?.aborted) {
+				throw signal.reason ?? error;
+			}
+			if (attempt >= TRACE_UPLOAD_MAX_RETRIES || !isRetriableNetworkError(error)) {
+				throw error;
+			}
+		}
+
+		await delay(retryDelayMs ?? traceUploadRetryDelay(attempt), signal);
 		if (signal?.aborted) {
-			throw signal.reason ?? error;
+			throw signal.reason ?? new Error("Trace upload cancelled");
 		}
-		if (!isRetriableNetworkError(error)) {
-			throw error;
-		}
-		await delay(TRACE_UPLOAD_RETRY_DELAY_MS, signal);
-		if (signal?.aborted) {
-			throw signal.reason ?? error;
-		}
-		return await fetchWithTimeout(fetchFn, url, init, timeoutMs, signal);
 	}
+}
+
+function traceContentPreview(body: string, maxChars: number): { content: string; truncated: boolean } {
+	if (body.length <= maxChars) {
+		return { content: body.trimEnd(), truncated: false };
+	}
+	const marker = "\n... middle of trace omitted ...\n";
+	const available = Math.max(0, maxChars - marker.length);
+	const headChars = Math.ceil(available / 2);
+	const tailChars = Math.floor(available / 2);
+	return {
+		content: `${body.slice(0, headChars).trimEnd()}${marker}${body.slice(body.length - tailChars).trimStart()}`,
+		truncated: true,
+	};
+}
+
+export async function previewAgentTraceFile(options: AgentTracePreviewOptions): Promise<AgentTracePreviewResult> {
+	if (!options.sessionFile) {
+		return { status: "no_session_file" };
+	}
+
+	let fileSize: number;
+	try {
+		const stats = await stat(options.sessionFile);
+		if (!stats.isFile()) {
+			return { status: "no_session_file" };
+		}
+		fileSize = stats.size;
+	} catch {
+		return { status: "no_session_file" };
+	}
+	if (fileSize === 0) {
+		return { status: "empty_session" };
+	}
+
+	const header = readSessionHeader(options.sessionFile);
+	if (!header) {
+		return { status: "invalid_session", message: "Session file is missing a valid session header" };
+	}
+
+	let body = "";
+	if (fileSize <= MAX_TRACE_BYTES) {
+		try {
+			body = await readFile(options.sessionFile, "utf8");
+		} catch (error) {
+			return { status: "failed", message: describeError(error) };
+		}
+		if (!body.trim()) {
+			return { status: "empty_session" };
+		}
+	}
+
+	const traceContext = resolveTraceContext(options.sessionFile, header);
+	const baseUrl = resolvePrimeAgentTracesBaseUrl(options.baseUrl);
+	const git = body ? activeGitContext(body, header) : header.git;
+	const preview = body
+		? traceContentPreview(body, Math.max(256, options.maxContentChars ?? TRACE_PREVIEW_MAX_CHARS))
+		: { content: "", truncated: true };
+	return {
+		status: "ready",
+		sessionFile: options.sessionFile,
+		sessionId: header.id,
+		traceId: traceContext.traceId,
+		parentSessionId: traceContext.parentSessionId,
+		cwd: header.cwd,
+		size: fileSize,
+		maxBytes: MAX_TRACE_BYTES,
+		uploadable: fileSize <= MAX_TRACE_BYTES,
+		endpoint: `${baseUrl}/api/v1/agent-traces/sessions/${encodeURIComponent(header.id)}`,
+		gitRepo: git?.repoUrl,
+		gitCommit: git?.commit,
+		contentPreview: preview.content,
+		truncated: preview.truncated,
+	};
+}
+
+async function findSessionFilesUnder(root: string, files: Set<string>): Promise<void> {
+	let entries: Dirent[];
+	try {
+		entries = await readdir(root, { withFileTypes: true });
+	} catch {
+		return;
+	}
+
+	for (const entry of entries) {
+		const entryPath = join(root, entry.name);
+		if (entry.isDirectory()) {
+			await findSessionFilesUnder(entryPath, files);
+			continue;
+		}
+		if (entry.isFile() && entry.name.endsWith(".jsonl") && readSessionHeader(entryPath)) {
+			files.add(entryPath);
+		}
+	}
+}
+
+export async function findAgentTraceFiles(sessionDir: string = getSessionsDir()): Promise<string[]> {
+	const files = new Set<string>();
+	const roots = new Set([resolve(sessionDir), resolve(dirname(sessionDir), "session-artifacts")]);
+	await Promise.all([...roots].map((root) => findSessionFilesUnder(root, files)));
+	return [...files].sort();
+}
+
+function createTraceUploadAllRequestGate(signal?: AbortSignal): BeforeTraceUploadRequest {
+	let nextRequestAt = 0;
+	let queue = Promise.resolve();
+	return () => {
+		const slot = queue.then(async () => {
+			const waitMs = Math.max(0, nextRequestAt - Date.now());
+			if (waitMs > 0) {
+				await delay(waitMs, signal);
+			}
+			if (!signal?.aborted) {
+				nextRequestAt = Date.now() + TRACE_UPLOAD_ALL_MIN_REQUEST_INTERVAL_MS;
+			}
+		});
+		queue = slot.catch(() => undefined);
+		return slot;
+	};
+}
+
+export async function uploadAllAgentTraces(options: AgentTraceUploadAllOptions): Promise<AgentTraceUploadAllResult> {
+	const { sessionDir, concurrency, onProgress, ...uploadOptions } = options;
+	const sessionFiles = await findAgentTraceFiles(sessionDir);
+	type UploadResultItem = AgentTraceUploadAllResult["results"][number];
+	const results: Array<UploadResultItem | undefined> = new Array(sessionFiles.length);
+	let cursor = 0;
+	let completed = 0;
+	const beforeRequest = createTraceUploadAllRequestGate(uploadOptions.signal);
+	onProgress?.({ completed, total: sessionFiles.length });
+
+	const worker = async () => {
+		while (true) {
+			if (uploadOptions.signal?.aborted) {
+				return;
+			}
+			const index = cursor;
+			cursor += 1;
+			const sessionFile = sessionFiles[index];
+			if (!sessionFile) {
+				return;
+			}
+			const result = await uploadAgentTraceFileWithRequestGate(
+				{
+					...uploadOptions,
+					sessionFile,
+					reloadConfig: false,
+				},
+				beforeRequest,
+			);
+			if (uploadOptions.signal?.aborted && result.status === "failed") {
+				return;
+			}
+			results[index] = { sessionFile, result };
+			completed += 1;
+			onProgress?.({ completed, total: sessionFiles.length, sessionFile, result });
+		}
+	};
+
+	const requestedConcurrency = concurrency ?? TRACE_UPLOAD_ALL_CONCURRENCY;
+	const normalizedConcurrency =
+		Number.isFinite(requestedConcurrency) && requestedConcurrency > 0
+			? Math.max(1, Math.floor(requestedConcurrency))
+			: TRACE_UPLOAD_ALL_CONCURRENCY;
+	const workerCount = Math.min(sessionFiles.length, normalizedConcurrency);
+	await Promise.all(Array.from({ length: workerCount }, worker));
+
+	const completedResults = results.filter((item): item is UploadResultItem => item !== undefined);
+	let uploaded = 0;
+	let failed = 0;
+	let bytesStored = 0;
+	for (const item of completedResults) {
+		if (item.result.status === "uploaded") {
+			uploaded += 1;
+			bytesStored += item.result.bytesStored;
+		} else if (item.result.status === "failed") {
+			failed += 1;
+		}
+	}
+	return {
+		total: sessionFiles.length,
+		uploaded,
+		failed,
+		skipped: sessionFiles.length - uploaded - failed,
+		bytesStored,
+		results: completedResults,
+	};
 }
 
 export async function getPrimeAgentTraceCredential(
@@ -357,10 +680,17 @@ async function getAgentTracesEnabled(
 	return options.settingsManager.getAgentTracesEnabled();
 }
 
-export async function uploadAgentTraceFile(options: AgentTraceUploadOptions): Promise<AgentTraceUploadResult> {
-	const result = await performAgentTraceUpload(options);
+async function uploadAgentTraceFileWithRequestGate(
+	options: AgentTraceUploadOptions,
+	beforeRequest?: BeforeTraceUploadRequest,
+): Promise<AgentTraceUploadResult> {
+	const result = await performAgentTraceUpload(options, beforeRequest);
 	logAgentTraceOutcome(options.sessionFile, result);
 	return result;
+}
+
+export function uploadAgentTraceFile(options: AgentTraceUploadOptions): Promise<AgentTraceUploadResult> {
+	return uploadAgentTraceFileWithRequestGate(options);
 }
 
 function logAgentTraceOutcome(sessionFile: string | undefined, result: AgentTraceUploadResult): void {
@@ -388,8 +718,12 @@ function logAgentTraceOutcome(sessionFile: string | undefined, result: AgentTrac
 	appendRotatingLog(getAgentTracesLogPath(), `[${new Date().toISOString()}] ${line}${suffix}`);
 }
 
-async function performAgentTraceUpload(options: AgentTraceUploadOptions): Promise<AgentTraceUploadResult> {
-	if (!(await getAgentTracesEnabled(options))) {
+async function performAgentTraceUpload(
+	options: AgentTraceUploadOptions,
+	beforeRequest?: BeforeTraceUploadRequest,
+): Promise<AgentTraceUploadResult> {
+	const requireEnabled = options.requireEnabled !== false;
+	if (requireEnabled && !(await getAgentTracesEnabled(options))) {
 		return { status: "disabled" };
 	}
 	if (!options.sessionFile) {
@@ -426,7 +760,7 @@ async function performAgentTraceUpload(options: AgentTraceUploadOptions): Promis
 		return { status: "missing_credentials" };
 	}
 
-	if (!(await getAgentTracesEnabled(options))) {
+	if (requireEnabled && !(await getAgentTracesEnabled(options))) {
 		return { status: "disabled" };
 	}
 
@@ -461,7 +795,7 @@ async function performAgentTraceUpload(options: AgentTraceUploadOptions): Promis
 		headers["X-Git-Commit"] = git.commit;
 	}
 
-	if (!(await getAgentTracesEnabled(options))) {
+	if (requireEnabled && !(await getAgentTracesEnabled(options))) {
 		return { status: "disabled" };
 	}
 
@@ -481,6 +815,7 @@ async function performAgentTraceUpload(options: AgentTraceUploadOptions): Promis
 			},
 			options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
 			options.signal,
+			beforeRequest,
 		);
 	} catch (error) {
 		return { status: "failed", message: describeError(error) };

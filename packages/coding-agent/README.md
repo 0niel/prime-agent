@@ -148,7 +148,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/new`, `/clear` | Start a new session |
 | `/name <name>` | Set session display name |
 | `/session` | Show session info (file, ID, messages) |
-| `/traces [status\|on\|off\|upload\|login]` | Manage opt-in Prime Agent trace sharing |
+| `/traces [status\|on\|off\|preview\|upload-current\|upload-all\|login]` | Preview traces, run one-shot current/all uploads, and manage automatic sharing (`upload` aliases `upload-current`) |
 | `/usage` | Show token, cost, and context usage |
 | `/tree` | Jump to any point in the session and continue from there |
 | `/fork` | Create a new session from a previous user message |
