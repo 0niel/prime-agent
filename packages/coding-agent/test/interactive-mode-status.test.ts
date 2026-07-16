@@ -257,7 +257,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 		initTheme("dark");
 	});
 
-	test("renders historical tool result images as fallbacks instead of replaying inline payloads", async () => {
+	test("renders non-latest historical tool result images as fallbacks instead of replaying inline payloads", async () => {
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
 		try {
 			const chatContainer = new Container();
@@ -299,13 +299,23 @@ describe("InteractiveMode.renderSessionContext", () => {
 						content: [{ type: "image", data: "AAAA", mimeType: "image/png" }],
 						isError: false,
 					},
+					{
+						role: "assistant",
+						content: [{ type: "toolCall", name: "custom_tool", id: "tool-2", arguments: {} }],
+					},
+					{
+						role: "toolResult",
+						toolCallId: "tool-2",
+						content: [{ type: "image", data: "BBBB", mimeType: "image/png" }],
+						isError: false,
+					},
 				],
 				thinkingLevel: "medium",
 				model: null,
 			});
 
 			const rendered = renderAll(chatContainer);
-			expect(rendered).not.toContain("\x1b_G");
+			expect((rendered.match(/\x1b_G/g) ?? []).length).toBe(1);
 			expect(normalizeRenderedOutput(chatContainer)).toContain("[Image: [image/png]]");
 			expect(ipythonToolComponents.size).toBe(0);
 			expect(lateIpythonSentAgentMessages.size).toBe(0);

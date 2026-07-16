@@ -61,6 +61,35 @@ describe("snapshot transcript cache", () => {
 		cache.dispose();
 	});
 
+	it("keeps concurrent file-backed caches for the same snapshot id isolated", () => {
+		const cacheRoot = tempDir();
+		const first = new SnapshotTranscriptCache({
+			activeSessionId: "active-shared",
+			snapshotId: "snapshot-shared",
+			messages: messages(6, 100),
+			cacheRoot,
+			targetChunkBytes: 180,
+			memoryCacheBytes: 300,
+		});
+		const second = new SnapshotTranscriptCache({
+			activeSessionId: "active-shared",
+			snapshotId: "snapshot-shared",
+			messages: messages(6, 100),
+			cacheRoot,
+			targetChunkBytes: 180,
+			memoryCacheBytes: 300,
+		});
+
+		expect(first.fileBacked).toBe(true);
+		expect(second.fileBacked).toBe(true);
+		const secondChunk = second.readChunk(0);
+
+		first.dispose();
+
+		expect(second.readChunk(0)).toEqual(secondChunk);
+		second.dispose();
+	});
+
 	it("streams opaque worker chunks to waiting attachments", async () => {
 		const cache = new SnapshotTranscriptCache({
 			activeSessionId: "active-c",

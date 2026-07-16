@@ -292,13 +292,17 @@ export class ToolExecutionComponent extends Container {
 			if (this.convertedImages.has(i)) continue;
 
 			const index = i;
-			convertToPng(img.data, img.mimeType).then((converted) => {
-				if (converted) {
-					this.convertedImages.set(index, converted);
-					this.updateDisplay();
-					this.ui.requestRender();
-				}
-			});
+			convertToPng(img.data, img.mimeType)
+				.then((converted) => {
+					if (converted) {
+						this.convertedImages.set(index, converted);
+						this.updateDisplay();
+						this.ui.requestRender();
+					}
+				})
+				.catch(() => {
+					// Conversion is best-effort UI work. Leave the text fallback in place.
+				});
 		}
 	}
 

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -22,6 +23,7 @@ export interface SnapshotTranscriptCacheOptions {
 export class SnapshotTranscriptCache {
 	private readonly chunks: SnapshotTranscriptChunk[] = [];
 	private cacheDirectory?: string;
+	private readonly cacheDirectoryName: string;
 	private totalBytes = 0;
 	private completed = false;
 	private readers = 0;
@@ -40,6 +42,7 @@ export class SnapshotTranscriptCache {
 		this.targetChunkBytes = options.targetChunkBytes ?? SNAPSHOT_TARGET_CHUNK_BYTES;
 		this.snapshotId = options.snapshotId;
 		this.activeSessionId = options.activeSessionId;
+		this.cacheDirectoryName = `${options.snapshotId.replaceAll(/[^a-zA-Z0-9_-]/g, "_")}-${randomUUID()}`;
 		if (options.messages) {
 			this.encodeMessages(options.messages);
 			this.completed = true;
@@ -186,7 +189,7 @@ export class SnapshotTranscriptCache {
 		this.totalBytes += buffer.length;
 		const memoryLimit = this.options.memoryCacheBytes ?? SNAPSHOT_MEMORY_CACHE_BYTES;
 		if (!this.cacheDirectory && this.totalBytes > memoryLimit) {
-			this.cacheDirectory = join(this.options.cacheRoot, this.options.snapshotId.replaceAll(/[^a-zA-Z0-9_-]/g, "_"));
+			this.cacheDirectory = join(this.options.cacheRoot, this.cacheDirectoryName);
 			mkdirSync(this.cacheDirectory, { recursive: true, mode: 0o700 });
 			for (let index = 0; index < this.chunks.length; index++) {
 				const existing = this.chunks[index]!;
