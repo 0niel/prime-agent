@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import type { CreateAgentSessionOptions } from "../src/core/sdk.js";
 import {
@@ -243,6 +246,25 @@ describe("daemon-backed interactive session manager routing", () => {
 				"/tmp/project/../project/session.jsonl",
 			),
 		).toBe(activeSummary);
+	});
+
+	test("finds an active daemon session through a symlinked resume path", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-agent-resume-"));
+		try {
+			const sessionFile = join(directory, "session.jsonl");
+			const symlink = join(directory, "session-link.jsonl");
+			writeFileSync(sessionFile, "");
+			symlinkSync(sessionFile, symlink);
+			const activeSummary = makeSessionSummary({
+				id: "active-1",
+				activeSessionId: "active-1",
+				sessionFile,
+			});
+
+			expect(findActiveDaemonSessionSummaryForSessionFile([activeSummary], symlink)).toBe(activeSummary);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 });
 

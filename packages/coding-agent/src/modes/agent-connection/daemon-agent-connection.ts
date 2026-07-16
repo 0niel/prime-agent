@@ -13,6 +13,7 @@ import type {
 } from "../../core/cron-jobs.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import { SessionAlreadyActiveError } from "../../core/session-lease.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
 import { deserializeDaemonError } from "../daemon/daemon-errors.js";
@@ -86,6 +87,7 @@ export const DAEMON_SNAPSHOT_TIMEOUT_MS = 30_000;
 const MAX_IGNORED_SNAPSHOT_IDS = 128;
 const UPDATE_RECONNECT_TIMEOUT_MS = 120000;
 const UPDATE_RECONNECT_RETRY_MS = 100;
+const MAX_COMPLETED_SNAPSHOTS = 128;
 const updateTransportReconnects = new WeakMap<DaemonClient, Promise<void>>();
 
 function delay(ms: number): Promise<void> {
@@ -172,6 +174,9 @@ export class DaemonAgentConnection implements AgentConnection {
 	private updateReconnectPromise?: Promise<void>;
 	private readonly activeSideQuestionIds = new Set<string>();
 	private readonly snapshotAssemblies = new Map<string, DaemonSnapshotAssembly>();
+	private readonly completedSnapshots = new Map<string, DaemonSessionSnapshot>();
+	private readonly pendingReattachActiveSessionIds = new Set<string>();
+	private readonly snapshotRecoveryPromises = new Map<string, Promise<void>>();
 	private readonly ignoredSnapshotIds = new Set<string>();
 	private reconnectPromise?: Promise<void>;
 	private disposed = false;
@@ -787,12 +792,91 @@ export class DaemonAgentConnection implements AgentConnection {
 		sessionPath: string,
 		options?: AgentConnectionSwitchSessionOptions,
 	): Promise<{ cancelled: boolean }> {
-		return this.requestData<{ cancelled: boolean }>({
-			type: "switch_session",
-			activeSessionId: this.activeSessionId,
-			sessionPath,
-			cwdOverride: options?.cwdOverride,
-		});
+		const sourceActiveSessionId = this.activeSessionId;
+		try {
+			return await this.requestData<{ cancelled: boolean }>({
+				type: "switch_session",
+				activeSessionId: sourceActiveSessionId,
+				sessionPath,
+				cwdOverride: options?.cwdOverride,
+			});
+		} catch (error) {
+			if (!(error instanceof SessionAlreadyActiveError) || !error.activeSessionId) {
+				throw error;
+			}
+			if (error.activeSessionId === sourceActiveSessionId) {
+				return { cancelled: false };
+			}
+			return this.reattachSession(sourceActiveSessionId, error.activeSessionId);
+		}
+	}
+
+	private async reattachSession(
+		sourceActiveSessionId: string,
+		targetActiveSessionId: string,
+	): Promise<{ cancelled: false }> {
+		const previousState = {
+			lastEventCursor: this.lastEventCursor,
+			lastEventSequence: this.lastEventSequence,
+			latestSnapshot: this.latestSnapshot,
+			latestSnapshotIsFresh: this.latestSnapshotIsFresh,
+			retiredEventGenerations: new Set(this.retiredEventGenerations),
+		};
+		this.activeSessionId = targetActiveSessionId;
+		this.lastEventCursor = undefined;
+		this.lastEventSequence = undefined;
+		this.latestSnapshot = undefined;
+		this.latestSnapshotIsFresh = false;
+		this.retiredEventGenerations.clear();
+		this.pendingReattachActiveSessionIds.add(targetActiveSessionId);
+		let reattached = false;
+		try {
+			const result = await this.requestData<DaemonAttachResult>({
+				type: "reattach",
+				activeSessionId: sourceActiveSessionId,
+				targetActiveSessionId,
+				supportsExtensionUi: true,
+				clientId: this.clientId,
+				capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"],
+				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
+			});
+			reattached = true;
+			this.activeSessionId = result.activeSessionId;
+			this.activeSideQuestionIds.clear();
+			if (result.snapshotStream) {
+				try {
+					await this.waitForSnapshot(result.snapshotStream.id);
+				} catch (snapshotError) {
+					await this.snapshotRecoveryPromises.get(result.snapshotStream.id);
+					if (!this.latestSnapshotIsFresh) {
+						throw snapshotError;
+					}
+				}
+			} else {
+				this.applyReplacementSnapshot(result.snapshot, result.replay);
+				await this.emit({
+					type: "session_replaced",
+					state: result.snapshot.state,
+					messages: result.snapshot.messages,
+				});
+			}
+			return { cancelled: false };
+		} catch (error) {
+			if (!reattached) {
+				this.activeSessionId = sourceActiveSessionId;
+				this.lastEventCursor = previousState.lastEventCursor;
+				this.lastEventSequence = previousState.lastEventSequence;
+				this.latestSnapshot = previousState.latestSnapshot;
+				this.latestSnapshotIsFresh = previousState.latestSnapshotIsFresh;
+				this.retiredEventGenerations.clear();
+				for (const generation of previousState.retiredEventGenerations) {
+					this.retiredEventGenerations.add(generation);
+				}
+			}
+			throw error;
+		} finally {
+			this.pendingReattachActiveSessionIds.delete(targetActiveSessionId);
+		}
 	}
 
 	async fork(
@@ -986,10 +1070,21 @@ export class DaemonAgentConnection implements AgentConnection {
 			const assembly = this.getSnapshotAssembly(message.snapshotId);
 			const purpose = assembly.begin?.purpose ?? "attach";
 			const snapshotError = new Error(message.error);
+			const recoveryPromise =
+				purpose === "replacement" || purpose === "resync"
+					? this.recoverFailedSnapshot(purpose, snapshotError)
+					: undefined;
+			if (recoveryPromise) {
+				this.snapshotRecoveryPromises.set(message.snapshotId, recoveryPromise);
+			}
 			this.rejectSnapshotAssembly(message.snapshotId, assembly, snapshotError);
 			this.ignoreSnapshotId(message.snapshotId);
-			if (purpose === "replacement" || purpose === "resync") {
-				await this.recoverFailedSnapshot(purpose, snapshotError);
+			if (recoveryPromise) {
+				try {
+					await recoveryPromise;
+				} finally {
+					this.snapshotRecoveryPromises.delete(message.snapshotId);
+				}
 			}
 			return;
 		}
@@ -1245,6 +1340,8 @@ export class DaemonAgentConnection implements AgentConnection {
 			assembly.reject(error);
 		}
 		this.snapshotAssemblies.clear();
+		this.completedSnapshots.clear();
+		this.snapshotRecoveryPromises.clear();
 		this.ignoredSnapshotIds.clear();
 	}
 
@@ -1297,13 +1394,30 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	private async waitForSnapshot(snapshotId: string): Promise<DaemonSessionSnapshot> {
+		const completed = this.completedSnapshots.get(snapshotId);
+		if (completed) {
+			this.completedSnapshots.delete(snapshotId);
+			return completed;
+		}
 		const assembly = this.getSnapshotAssembly(snapshotId);
 		try {
 			return await assembly.promise;
 		} finally {
 			clearTimeout(assembly.timeout);
 			this.snapshotAssemblies.delete(snapshotId);
+			this.completedSnapshots.delete(snapshotId);
 		}
+	}
+
+	private applyReplacementSnapshot(snapshot: DaemonSessionSnapshot, replay?: DaemonReplayInfo): void {
+		if (snapshot.lastEventCursor) {
+			this.observeEventCursor(snapshot.lastEventCursor);
+		}
+		this.lastEventSequence = maxEventSequence(this.lastEventSequence, snapshot.lastEventSequence);
+		this.attachedSessionId = snapshot.state.sessionId;
+		this.attachedSessionFile = snapshot.state.sessionFile;
+		this.latestSnapshot = mapDaemonSessionSnapshot(snapshot, replay);
+		this.latestSnapshotIsFresh = true;
 	}
 
 	private async completeSnapshotAssembly(
@@ -1370,6 +1484,16 @@ export class DaemonAgentConnection implements AgentConnection {
 		clearTimeout(assembly.timeout);
 		if (purpose !== "attach") {
 			this.snapshotAssemblies.delete(message.snapshotId);
+			if (this.pendingReattachActiveSessionIds.has(message.activeSessionId)) {
+				this.completedSnapshots.set(message.snapshotId, snapshot);
+				while (this.completedSnapshots.size > MAX_COMPLETED_SNAPSHOTS) {
+					const oldest = this.completedSnapshots.keys().next().value;
+					if (oldest === undefined) {
+						break;
+					}
+					this.completedSnapshots.delete(oldest);
+				}
+			}
 		}
 		if (purpose === "replacement") {
 			await this.emit({ type: "session_replaced", state: snapshot.state, messages });
@@ -1542,6 +1666,7 @@ function getDaemonMessageCursor(message: DaemonOutbound): DaemonEventCursor | un
 function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): boolean {
 	switch (commandType) {
 		case "attach":
+		case "reattach":
 		case "detach":
 		case "list":
 		case "list_saved_sessions":

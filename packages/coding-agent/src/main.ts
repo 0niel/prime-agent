@@ -60,7 +60,7 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.js";
-import { SessionAlreadyActiveError } from "./core/session-lease.js";
+import { canonicalSessionPath, SessionAlreadyActiveError } from "./core/session-lease.js";
 import { SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
@@ -955,12 +955,12 @@ export function findActiveDaemonSessionSummaryForSessionFile(
 	summaries: readonly SessionSummary[],
 	sessionPath: string,
 ): SessionSummary | undefined {
-	const resolvedSessionPath = resolve(sessionPath);
+	const resolvedSessionPath = canonicalSessionPath(sessionPath);
 	return summaries.find(
 		(summary) =>
 			summary.activeSessionId !== undefined &&
 			summary.sessionFile !== undefined &&
-			resolve(summary.sessionFile) === resolvedSessionPath,
+			canonicalSessionPath(summary.sessionFile) === resolvedSessionPath,
 	);
 }
 
