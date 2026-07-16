@@ -286,11 +286,15 @@ function compareAgentsViewRows(a: AgentsViewRow, b: AgentsViewRow): number {
 	if (sectionDiff !== 0) {
 		return sectionDiff;
 	}
-	const modifiedDiff = getTimestamp(b.summary.modified) - getTimestamp(a.summary.modified);
-	if (modifiedDiff !== 0) {
-		return modifiedDiff;
+	const createdDiff = getTimestamp(b.summary.created) - getTimestamp(a.summary.created);
+	if (createdDiff !== 0) {
+		return createdDiff;
 	}
-	return a.title.localeCompare(b.title);
+	const titleDiff = a.title.localeCompare(b.title);
+	if (titleDiff !== 0) {
+		return titleDiff;
+	}
+	return a.summary.sessionId.localeCompare(b.summary.sessionId);
 }
 
 function buildRowKeyMap(rows: readonly MutableAgentsViewRow[]): Map<string, MutableAgentsViewRow> {

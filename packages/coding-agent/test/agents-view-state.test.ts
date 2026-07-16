@@ -80,26 +80,32 @@ describe("agents view state", () => {
 		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: undefined }))).toBe("needs-input");
 	});
 
-	test("sorts rows by section and most recent modified time", () => {
+	test("sorts rows by section and creation time", () => {
 		const rows = buildAgentsViewRows([
 			makeSummary({
+				id: "completed",
+				sessionId: "completed",
 				sessionName: "completed",
 				activity: "idle",
 				taskState: "completed",
 				messageCount: 2,
-				modified: "2026-01-01T00:00:00Z",
+				created: "2026-01-03T00:00:00Z",
 			}),
 			makeSummary({
+				id: "older-working",
+				sessionId: "older-working",
 				sessionName: "older working",
 				activity: "working",
 				isStreaming: true,
-				modified: "2026-01-01T00:00:00Z",
+				created: "2026-01-01T00:00:00Z",
 			}),
 			makeSummary({
+				id: "newer-working",
+				sessionId: "newer-working",
 				sessionName: "newer working",
 				activity: "working",
 				isStreaming: true,
-				modified: "2026-01-02T00:00:00Z",
+				created: "2026-01-02T00:00:00Z",
 			}),
 			makeSummary({
 				sessionName: "heartbeat",
@@ -111,6 +117,44 @@ describe("agents view state", () => {
 
 		expect(rows.map((row) => row.title)).toEqual(["newer working", "older working", "heartbeat", "completed"]);
 		expect(rows.map((row) => row.section)).toEqual(["working", "working", "heartbeats", "completed"]);
+	});
+
+	test("keeps row order stable when modification times and daemon input order change", () => {
+		const older = makeSummary({
+			id: "older",
+			sessionId: "older",
+			sessionName: "older",
+			activity: "working",
+			created: "2026-01-01T00:00:00Z",
+			modified: "2026-01-04T00:00:00Z",
+		});
+		const newer = makeSummary({
+			id: "newer",
+			sessionId: "newer",
+			sessionName: "newer",
+			activity: "working",
+			created: "2026-01-02T00:00:00Z",
+			modified: "2026-01-03T00:00:00Z",
+		});
+
+		const initialOrder = buildAgentsViewRows([older, newer]).map((row) => row.summary.sessionId);
+		const refreshedOrder = buildAgentsViewRows([
+			{ ...newer, modified: "2026-01-05T00:00:00Z" },
+			{ ...older, modified: "2026-01-06T00:00:00Z" },
+		]).map((row) => row.summary.sessionId);
+
+		expect(initialOrder).toEqual(["newer", "older"]);
+		expect(refreshedOrder).toEqual(initialOrder);
+	});
+
+	test("uses deterministic fallbacks when creation times are unavailable", () => {
+		const rows = buildAgentsViewRows([
+			makeSummary({ id: "beta-2", sessionId: "beta-2", sessionName: "beta", modified: "2026-01-03T00:00:00Z" }),
+			makeSummary({ id: "alpha", sessionId: "alpha", sessionName: "alpha", modified: "2026-01-02T00:00:00Z" }),
+			makeSummary({ id: "beta-1", sessionId: "beta-1", sessionName: "beta", modified: "2026-01-01T00:00:00Z" }),
+		]);
+
+		expect(rows.map((row) => row.summary.sessionId)).toEqual(["alpha", "beta-1", "beta-2"]);
 	});
 
 	test("summarizes subagents on their parent and omits subagent rows", () => {
@@ -737,14 +781,10 @@ printf 'src/referenced.ts\n'
 		const identity = `file:${opened.sessionFile}`;
 		const key = getAgentsViewSelectionKey(opened);
 
-		test("re-finds the session after the list reorders", () => {
-			// Returning bumps the opened session's modified time so it sorts first.
-			const rows = buildAgentsViewRows([
-				{ ...opened, modified: "2026-01-02T00:00:00Z" },
-				{ ...other, modified: "2026-01-01T00:00:00Z" },
-			]);
-			expect(rows[0]?.summary.sessionId).toBe("session-open");
-			expect(resolveAgentsViewSelectionIndex(rows, identity, key)).toBe(0);
+		test("re-finds the session after a section change reorders the list", () => {
+			const rows = buildAgentsViewRows([{ ...opened, activity: "working" }, other]);
+			expect(rows[1]?.summary.sessionId).toBe("session-open");
+			expect(resolveAgentsViewSelectionIndex(rows, identity, key)).toBe(1);
 		});
 
 		test("falls back to activeSessionId when the row identity changed", () => {
