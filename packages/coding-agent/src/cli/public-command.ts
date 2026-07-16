@@ -1,5 +1,5 @@
 import chalk from "chalk";
-import { APP_NAME } from "../config.js";
+import { APP_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
 import { handlePackageCommand, isSelfUpdateSource } from "../package-manager-cli.js";
 import { INTERNAL_RUNTIME_COMMAND_MARKER, parseArgs } from "./args.js";
 import {
@@ -14,6 +14,7 @@ import {
 } from "./command-registry.js";
 import { handleDaemonCommand } from "./daemon-command.js";
 import { runPs, runReap, runShutdownAll } from "./daemon-ps.js";
+import { DAEMON_UPDATE_RESTART_COORDINATOR_FLAG } from "./daemon-update-restart.js";
 
 export interface PublicCommandResult {
 	handled: boolean;
@@ -48,6 +49,14 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 
 	if (!PUBLIC_COMMAND_NAMES.has(command)) {
 		return continueWith(args);
+	}
+	if (command === "update" && process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV] === "1") {
+		await handlePackageCommand(args);
+		return HANDLED;
+	}
+	if (command === "update" && args.includes(DAEMON_UPDATE_RESTART_COORDINATOR_FLAG)) {
+		await handlePackageCommand(args);
+		return HANDLED;
 	}
 
 	const separatorIndex = args.indexOf("--");

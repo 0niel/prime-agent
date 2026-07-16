@@ -115,6 +115,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"steer",
 	"follow_up",
 	"restore_next_turn",
+	"append_custom_message",
 	"resume_queue",
 	"send_message",
 	"agent_messages_status",
@@ -3128,7 +3129,7 @@ export class DaemonSupervisor {
 		if (!agentDir) {
 			throw new Error("Daemon supervisor config is missing agentDir");
 		}
-		const path = getDaemonUpdateRestartManifestPath(agentDir);
+		const path = getDaemonUpdateRestartManifestPath(this.socketPath, agentDir);
 		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
 		const tempPath = `${path}.${process.pid}.tmp`;
 		writeFileSync(tempPath, `${JSON.stringify(manifest)}\n`, { mode: 0o600 });

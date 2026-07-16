@@ -1415,6 +1415,7 @@ export async function main(args: string[], options?: MainOptions) {
 
 		const interactiveMode = new InteractiveMode({
 			agentConnection,
+			daemonSocketPath,
 			uiServices: daemonUiServices,
 			promptStashStore,
 			promptStashSessionId: summary.sessionId,

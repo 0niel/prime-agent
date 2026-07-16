@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { APP_NAME, ENV_AGENT_DIR, PACKAGE_NAME, VERSION } from "../src/config.js";
+import { APP_NAME, ENV_AGENT_DIR, PACKAGE_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV, VERSION } from "../src/config.js";
 import { main } from "../src/main.js";
 
 function restoreEnv(name: string, value: string | undefined): void {
@@ -11,6 +11,16 @@ function restoreEnv(name: string, value: string | undefined): void {
 		return;
 	}
 	process.env[name] = value;
+}
+
+async function runSelfUpdateInstallChild(args: string[]): Promise<void> {
+	const previousValue = process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV];
+	process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV] = "1";
+	try {
+		await main(args);
+	} finally {
+		restoreEnv(SELF_UPDATE_INTERACTIVE_CHILD_ENV, previousValue);
+	}
 }
 
 describe("package commands", () => {
@@ -207,7 +217,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(main(["update", "--force"])).resolves.toBeUndefined();
+			await expect(runSelfUpdateInstallChild(["update", "--self", "--force"])).resolves.toBeUndefined();
 
 			expect(process.exitCode).toBeUndefined();
 			expect(errorSpy).not.toHaveBeenCalled();
@@ -251,7 +261,7 @@ else fs.writeFileSync(${JSON.stringify(recordPath)},JSON.stringify(args));
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(main(["update"])).resolves.toBeUndefined();
+			await expect(runSelfUpdateInstallChild(["update", "--self"])).resolves.toBeUndefined();
 
 			expect(process.exitCode).toBeUndefined();
 			expect(errorSpy).not.toHaveBeenCalled();
@@ -300,7 +310,7 @@ else {
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(main(["update"])).resolves.toBeUndefined();
+			await expect(runSelfUpdateInstallChild(["update", "--self"])).resolves.toBeUndefined();
 
 			expect(process.exitCode).toBeUndefined();
 			expect(errorSpy).not.toHaveBeenCalled();
@@ -353,7 +363,7 @@ else {
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 
 		try {
-			await expect(main(["update"])).resolves.toBeUndefined();
+			await expect(runSelfUpdateInstallChild(["update", "--self"])).resolves.toBeUndefined();
 
 			expect(process.exitCode).toBeUndefined();
 			expect(errorSpy).not.toHaveBeenCalled();

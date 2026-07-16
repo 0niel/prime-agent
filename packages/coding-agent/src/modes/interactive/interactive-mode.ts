@@ -50,6 +50,11 @@ import {
 } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "child_process";
 import {
+	buildDaemonUpdateRestartReport,
+	launchDaemonUpdateRestartCoordinator,
+	resolveDaemonUpdateRestartSocketPath,
+} from "../../cli/daemon-update-restart.js";
+import {
 	APP_NAME,
 	APP_TITLE,
 	getAgentDir,
@@ -565,9 +570,10 @@ function getPayloadWorkingIndicatorOptions(
 	};
 }
 
-function updateArgsIncludeSelf(args: readonly string[]): boolean {
+export function updateArgsIncludeSelf(args: readonly string[]): boolean {
 	let selfFlag = false;
 	let extensionsOnlyFlag = false;
+	let positional: string | undefined;
 	for (let index = 0; index < args.length; index++) {
 		const arg = args[index];
 		if (arg === "--self") {
@@ -577,6 +583,10 @@ function updateArgsIncludeSelf(args: readonly string[]): boolean {
 		} else if (arg === "--extension") {
 			extensionsOnlyFlag = true;
 			index++;
+		} else if (arg === "--daemon-socket") {
+			index++;
+		} else if (arg && !arg.startsWith("-") && positional === undefined) {
+			positional = arg;
 		}
 	}
 	if (selfFlag) {
@@ -585,7 +595,6 @@ function updateArgsIncludeSelf(args: readonly string[]): boolean {
 	if (extensionsOnlyFlag) {
 		return false;
 	}
-	const positional = args.find((arg) => !arg.startsWith("-"));
 	if (!positional) {
 		return true;
 	}
@@ -610,6 +619,18 @@ export function buildUpdateRelaunchArgs(args: readonly string[], sessionFile: st
 	return relaunchArgs;
 }
 
+export function buildUpdateChildArgs(args: readonly string[], daemonSocketPath: string): string[] {
+	return args.includes("--daemon-socket") ? [...args] : [...args, "--daemon-socket", daemonSocketPath];
+}
+
+export function resolveInteractiveUpdateDaemonSocketPath(
+	args: readonly string[],
+	activeDaemonSocketPath: string,
+): string {
+	const socketFlagIndex = args.indexOf("--daemon-socket");
+	return socketFlagIndex === -1 ? activeDaemonSocketPath : (args[socketFlagIndex + 1] ?? activeDaemonSocketPath);
+}
+
 /**
  * Options for InteractiveMode initialization.
  */
@@ -630,6 +651,8 @@ export interface InteractiveModeOptions {
 	verbose?: boolean;
 	/** Agent execution boundary. InteractiveMode never talks directly to AgentSession for core execution. */
 	agentConnection: AgentConnection;
+	/** Exact daemon socket to preserve across an interactive self-update restart. */
+	daemonSocketPath?: string;
 	/**
 	 * Local-only host for in-process extension binding and callback-bearing session operations.
 	 * This must remain optional adapter glue, not a generic execution dependency.
@@ -7872,16 +7895,25 @@ export class InteractiveMode {
 		const updateArgs = parseCommandArgs(args);
 		const includesSelf = updateArgsIncludeSelf(updateArgs);
 		const updateCwd = this.getCurrentCwd();
+		const daemonSocketPath = resolveInteractiveUpdateDaemonSocketPath(
+			updateArgs,
+			resolveDaemonUpdateRestartSocketPath(this.options.daemonSocketPath),
+		);
+		const updateChildArgs = includesSelf ? buildUpdateChildArgs(updateArgs, daemonSocketPath) : updateArgs;
 		this.stopWorkingLoader();
 		await this.ui.terminal.drainInput(1000).catch(() => undefined);
 		this.ui.stop();
 
 		const updateEnv = includesSelf ? { ...process.env, [SELF_UPDATE_INTERACTIVE_CHILD_ENV]: "1" } : process.env;
-		const updateResult = spawnSync(process.execPath, [...process.execArgv, entrypoint, "update", ...updateArgs], {
-			stdio: "inherit",
-			cwd: updateCwd,
-			env: updateEnv,
-		});
+		const updateResult = spawnSync(
+			process.execPath,
+			[...process.execArgv, entrypoint, "update", ...updateChildArgs],
+			{
+				stdio: "inherit",
+				cwd: updateCwd,
+				env: updateEnv,
+			},
+		);
 		const updateExitCode = updateResult.status ?? (updateResult.signal ? 1 : 0);
 		const selfUpdateNotAttempted =
 			includesSelf && !updateResult.error && updateExitCode === SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE;
@@ -7905,6 +7937,27 @@ export class InteractiveMode {
 				await this.options.onShutdown?.();
 			} catch {
 				// The update already completed; do not block relaunch on local teardown.
+			}
+			if (!updateResult.error && updateExitCode === 0) {
+				try {
+					const status = await launchDaemonUpdateRestartCoordinator({
+						socketPath: daemonSocketPath,
+						agentDir: getAgentDir(),
+						cwd: updateCwd,
+						originActiveSessionId: this.connectionState?.activeSessionId,
+					});
+					const report = buildDaemonUpdateRestartReport(status);
+					for (const message of report.info) {
+						console.log(message);
+					}
+					for (const warning of report.warnings) {
+						console.error(`Warning: ${warning}`);
+					}
+				} catch (error: unknown) {
+					console.error(
+						`Warning: updated, but could not coordinate the daemon restart (${error instanceof Error ? error.message : String(error)}).`,
+					);
+				}
 			}
 			const relaunchResult = spawnSync(process.execPath, [...process.execArgv, entrypoint, ...relaunchArgs], {
 				stdio: "inherit",

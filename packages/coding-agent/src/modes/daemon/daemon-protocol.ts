@@ -335,6 +335,12 @@ export type DaemonCommand =
 			prefixMessages?: CustomMessage[];
 	  }
 	| { id?: string; type: "restore_next_turn"; activeSessionId: string; messages: CustomMessage[] }
+	| {
+			id?: string;
+			type: "append_custom_message";
+			activeSessionId: string;
+			message: Pick<CustomMessage, "customType" | "content" | "display" | "details">;
+	  }
 	| { id?: string; type: "resume_queue"; activeSessionId: string }
 	| {
 			id?: string;

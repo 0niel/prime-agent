@@ -207,6 +207,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"steer",
 	"follow_up",
 	"restore_next_turn",
+	"append_custom_message",
 	"resume_queue",
 	"send_message",
 	"agent_messages_status",
@@ -2843,6 +2844,12 @@ export class AgentDaemon {
 				return success(command.id, "restore_next_turn");
 			}
 
+			case "append_custom_message": {
+				const state = this.getSessionState(command.activeSessionId);
+				await state.runtime.session.sendCustomMessage(command.message);
+				return success(command.id, "append_custom_message");
+			}
+
 			case "resume_queue": {
 				const state = this.getSessionState(command.activeSessionId);
 				let checkedStart = false;
@@ -4173,7 +4180,7 @@ export class AgentDaemon {
 	}
 
 	private writeUpdateRestartManifest(manifest: DaemonUpdateRestartManifest): void {
-		const path = getDaemonUpdateRestartManifestPath(this.agentDir);
+		const path = getDaemonUpdateRestartManifestPath(this.socketPath, this.agentDir);
 		mkdirSync(dirname(path), { recursive: true });
 		writeFileSync(path, `${JSON.stringify(manifest)}\n`);
 	}
