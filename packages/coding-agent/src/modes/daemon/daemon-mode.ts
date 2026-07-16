@@ -2284,6 +2284,7 @@ export class AgentDaemon {
 		socket.on("close", cleanup);
 		socket.on("error", cleanup);
 		socket.on("drain", () => {
+			client.backpressured = false;
 			if (!client.snapshotStreaming) {
 				void this.catchUpBackpressuredClient(client).catch((error) =>
 					this.log(`could not catch up snapshot client ${client.id}: ${String(error)}`),
@@ -4602,11 +4603,37 @@ export class AgentDaemon {
 		}
 	}
 
-	private async catchUpBackpressuredClient(client: DaemonSocketClient): Promise<void> {
+	private catchUpBackpressuredClient(client: DaemonSocketClient): Promise<void> {
+		if (client.catchupPromise) {
+			return client.catchupPromise;
+		}
+		if (client.snapshotStreaming || client.backpressured) {
+			return Promise.resolve();
+		}
+		const catchup = this.drainBackpressuredClientCatchupQueue(client).finally(() => {
+			if (client.catchupPromise === catchup) {
+				client.catchupPromise = undefined;
+			}
+		});
+		client.catchupPromise = catchup;
+		return catchup;
+	}
+
+	private async drainBackpressuredClientCatchupQueue(client: DaemonSocketClient): Promise<void> {
+		while (
+			!client.socket.destroyed &&
+			!client.snapshotStreaming &&
+			!client.backpressured &&
+			client.catchupActiveSessionIds?.size
+		) {
+			await this.drainBackpressuredClientCatchups(client);
+		}
+	}
+
+	private async drainBackpressuredClientCatchups(client: DaemonSocketClient): Promise<void> {
 		if (client.socket.destroyed) {
 			return;
 		}
-		client.backpressured = false;
 		const pending = [...(client.catchupActiveSessionIds ?? [])].map((activeSessionId) => ({
 			activeSessionId,
 			purpose: client.catchupPurposes?.get(activeSessionId) ?? ("resync" as const),
@@ -4771,6 +4798,9 @@ export class AgentDaemon {
 							outboundType: message.type,
 							...("id" in message && typeof message.id === "string" ? { requestId: message.id } : {}),
 							...(hasDaemonOutboundActiveSessionId(message) ? { activeSessionId: message.activeSessionId } : {}),
+							...("snapshotId" in message && typeof message.snapshotId === "string"
+								? { snapshotId: message.snapshotId }
+								: {}),
 							...(message.type === "session_event" ? { sessionEventType: message.event.type } : {}),
 							payloadEncoding,
 							...(snapshotPurpose ? { snapshotPurpose } : {}),

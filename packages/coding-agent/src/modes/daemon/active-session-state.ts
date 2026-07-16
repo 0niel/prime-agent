@@ -13,6 +13,8 @@ export interface DaemonSocketClient {
 	catchupActiveSessionIds?: Set<string>;
 	/** A real runtime replacement takes precedence over an ordinary resync for the same queued catch-up. */
 	catchupPurposes?: Map<string, "replacement" | "resync">;
+	/** The single catch-up drain currently serving this client. */
+	catchupPromise?: Promise<void>;
 	backpressured?: boolean;
 	authenticated?: boolean;
 	transport?: "jsonl" | "private-framed";

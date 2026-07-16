@@ -1483,7 +1483,7 @@ export class InteractiveMode {
 			// the text was restored to the editor by onboarding, history, or a retry.
 			const images = this.collectImagesFor(userInput);
 			try {
-				await this.agentConnection.prompt(userInput, { images });
+				await this.agentConnection.prompt(userInput, { streamingBehavior: "steer", images });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);

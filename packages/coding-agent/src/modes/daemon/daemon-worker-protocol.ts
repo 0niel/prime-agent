@@ -29,6 +29,7 @@ export type DaemonWorkerFrameHeader =
 			requestId?: string;
 			outboundType: DaemonOutbound["type"];
 			activeSessionId?: string;
+			snapshotId?: string;
 			sessionEventType?: string;
 			payloadEncoding?: "jsonl" | "assistant-delta";
 			snapshotPurpose?: "attach" | "replacement" | "catchup";
@@ -146,6 +147,7 @@ export function isDaemonWorkerFrameHeader(value: unknown): value is DaemonWorker
 		typeof candidate.outboundType === "string" &&
 		(candidate.requestId === undefined || typeof candidate.requestId === "string") &&
 		(candidate.activeSessionId === undefined || typeof candidate.activeSessionId === "string") &&
+		(candidate.snapshotId === undefined || typeof candidate.snapshotId === "string") &&
 		(candidate.sessionEventType === undefined || typeof candidate.sessionEventType === "string") &&
 		(candidate.snapshotPurpose === undefined ||
 			candidate.snapshotPurpose === "attach" ||

@@ -1935,7 +1935,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		await expect(InteractiveMode.prototype.run.call(fakeThis as never)).resolves.toBe("agents_view");
 
 		expect(prompt).toHaveBeenNthCalledWith(1, "initial prompt", { images: undefined });
-		expect(prompt).toHaveBeenNthCalledWith(2, "interactive prompt", { images: [] });
+		expect(prompt).toHaveBeenNthCalledWith(2, "interactive prompt", { streamingBehavior: "steer", images: [] });
 		expect(prompt).toHaveBeenCalledTimes(2);
 	});
 
