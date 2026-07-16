@@ -5,7 +5,7 @@
  * scroll position is application state, not terminal scrollback.
  */
 
-import { getCapabilities, isImageLine } from "./terminal-image.js";
+import { deleteKittyImage, getCapabilities, isImageLine } from "./terminal-image.js";
 import { sliceByColumn, stripAnsi, visibleWidth } from "./utils.js";
 
 export const FULLSCREEN_MIN_TRANSCRIPT_ROWS = 3;
@@ -38,7 +38,32 @@ function kittyImageRows(line: string): number | null {
 	return 1;
 }
 
-function canRenderImageInFullscreen(window: readonly string[], index: number): boolean {
+function kittyImageIds(line: string): number[] {
+	const ids: number[] = [];
+	let searchFrom = 0;
+	while (searchFrom < line.length) {
+		const sequenceStart = line.indexOf(KITTY_SEQUENCE_PREFIX, searchFrom);
+		if (sequenceStart === -1) break;
+		const paramsStart = sequenceStart + KITTY_SEQUENCE_PREFIX.length;
+		const paramsEnd = line.indexOf(";", paramsStart);
+		if (paramsEnd === -1) break;
+		const params = line.slice(paramsStart, paramsEnd);
+		for (const param of params.split(",")) {
+			const [key, value] = param.split("=", 2);
+			if (key !== "i" || value === undefined) continue;
+			const id = Number(value);
+			if (Number.isInteger(id) && id > 0 && id <= 0xffffffff) {
+				ids.push(id);
+			}
+		}
+		searchFrom = paramsEnd + 1;
+	}
+	return ids;
+}
+
+function canRenderImageInFullscreen(window: readonly string[], index: number, following: boolean): boolean {
+	if (!following) return false;
+
 	const caps = getCapabilities();
 	if (caps.images !== "kitty" || caps.imagePlacement !== "first-row") return false;
 
@@ -130,7 +155,7 @@ export class FullscreenViewport {
 
 		const window = transcript.slice(this.scrollTop, this.scrollTop + windowHeight);
 		for (let i = 0; i < window.length; i++) {
-			if (isImageLine(window[i]) && !canRenderImageInFullscreen(window, i)) {
+			if (isImageLine(window[i]) && !canRenderImageInFullscreen(window, i, this.following)) {
 				window[i] = IMAGE_PLACEHOLDER;
 			}
 		}
@@ -486,13 +511,27 @@ export class FullscreenViewport {
 		}
 
 		let buffer = "\x1b[?2026h";
+		const deletedImageIds = new Set<number>();
+		const deleteImagesInLine = (line: string | undefined): void => {
+			if (line === undefined) return;
+			for (const id of kittyImageIds(line)) {
+				if (deletedImageIds.has(id)) continue;
+				deletedImageIds.add(id);
+				buffer += deleteKittyImage(id);
+			}
+		};
+
 		if (width !== this.prevWidth || height !== this.prevHeight || this.prevFrame.length === 0) {
+			for (const line of this.prevFrame) {
+				deleteImagesInLine(line);
+			}
 			buffer += "\x1b[2J\x1b[H";
 			this.prevFrame = [];
 		}
 		for (let row = 0; row < height; row++) {
 			const line = frame[row] ?? "";
 			if (this.prevFrame[row] === line) continue;
+			deleteImagesInLine(this.prevFrame[row]);
 			buffer += `\x1b[${row + 1};1H\x1b[2K`;
 			// an overwide line would wrap and shear the grid; clamp instead of crash
 			buffer += visibleWidth(line) > width ? sliceByColumn(line, 0, width, true) : line;

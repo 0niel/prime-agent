@@ -1,7 +1,7 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import type { TerminalStopOptions } from "../src/terminal.js";
-import { encodeKitty, resetCapabilitiesCache, setCapabilities } from "../src/terminal-image.js";
+import { deleteKittyImage, encodeKitty, resetCapabilitiesCache, setCapabilities } from "../src/terminal-image.js";
 import { type Component, TUI } from "../src/tui.js";
 import { VirtualTerminal } from "./virtual-terminal.js";
 
@@ -153,6 +153,29 @@ describe("TUI fullscreen mode", () => {
 			const writes = terminal.getWrites();
 			assert.ok(!writes.includes(image), "clipped first-row image should not be emitted inside fullscreen");
 			assert.ok(writes.includes("view in inline mode"), "clipped first-row image should use the safe placeholder");
+		} finally {
+			tui.stop();
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("uses the placeholder for Ghostty images while fullscreen history is scrolled", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" });
+		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 58, moveCursor: false });
+		const { terminal, tui, chat, dock } = setup([...lines(11), image, "", "after", "tail"], 80, 8);
+		try {
+			tui.enterFullscreen({ scroll: [chat], dock });
+			await terminal.waitForRender();
+			assert.ok(terminal.getWrites().includes(image), "image is rendered while following");
+			terminal.clearWrites();
+
+			terminal.sendInput(WHEEL_UP);
+			await terminal.waitForRender();
+
+			const writes = terminal.getWrites();
+			assert.ok(writes.includes(deleteKittyImage(58)), "scrolling should delete the old visible image placement");
+			assert.ok(!writes.includes(image), "scrolled history should not re-emit the image");
+			assert.ok(writes.includes("view in inline mode"), "scrolled history should use the placeholder");
 		} finally {
 			tui.stop();
 			resetCapabilitiesCache();
