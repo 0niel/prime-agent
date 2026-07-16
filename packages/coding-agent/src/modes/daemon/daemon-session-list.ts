@@ -309,6 +309,7 @@ function rlmChildSnapshotForActiveSession(
 		id: metadata.rlmChildId ?? activeSession.activeSessionId,
 		parentId: parentNodeId,
 		activeSessionId: activeSession.activeSessionId,
+		sessionName: session.sessionName,
 		label: rlmChildLabel(metadata.prompt ?? ""),
 		status,
 		answerPreview,

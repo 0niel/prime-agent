@@ -233,12 +233,97 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(secondDispose).toHaveBeenCalledTimes(1);
 	});
 
+	it("deletes exact and replaced in-process RLM child runtimes and retained sessions", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		const childSession = {} as AgentSession;
+		const disposeRuntime = vi.fn(async () => {});
+		const childRuntime = { session: childSession, dispose: disposeRuntime } as unknown as AgentSessionRuntime;
+		const runtimeWithSubagents = runtime as unknown as RuntimeSubagentMapAccess;
+		runtimeWithSubagents.subagentRuntimes.set("child-1", childRuntime);
+
+		await runtime.deleteRlmSubagentRuntime("child-1", childSession);
+
+		expect(disposeRuntime).toHaveBeenCalledOnce();
+		expect(runtimeWithSubagents.subagentRuntimes.has("child-1")).toBe(false);
+
+		const currentSession = {} as AgentSession;
+		const disposeReplacedRuntime = vi.fn(async () => {});
+		const replacedRuntime = {
+			session: currentSession,
+			dispose: disposeReplacedRuntime,
+		} as unknown as AgentSessionRuntime;
+		const disposeStaleSession = vi.fn(async () => {});
+		const staleSession = { disposeAsync: disposeStaleSession } as unknown as AgentSession;
+		runtimeWithSubagents.subagentRuntimes.set("replaced-child", replacedRuntime);
+
+		await runtime.deleteRlmSubagentRuntime("replaced-child", staleSession);
+
+		expect(disposeReplacedRuntime).toHaveBeenCalledOnce();
+		expect(disposeStaleSession).toHaveBeenCalledOnce();
+		expect(runtimeWithSubagents.subagentRuntimes.has("replaced-child")).toBe(false);
+
+		const disposeRetained = vi.fn(async () => {});
+		const retainedSession = { disposeAsync: disposeRetained } as unknown as AgentSession;
+		await runtime.deleteRlmSubagentRuntime("retained-child", retainedSession);
+		expect(disposeRetained).toHaveBeenCalledOnce();
+	});
+
+	it("publishes in-process RLM sessions before create resolves and rejects cancelled startup", async () => {
+		const { runtime, faux, tempDir } = await createRuntimeForTest(() => {});
+		const parentSession = runtime.session;
+		const getRunStatus = vi.spyOn(parentSession, "getRlmChildRunStatus").mockReturnValue("running");
+		let createResolved = false;
+		const onSessionPublished = vi.fn((session: AgentSession) => {
+			expect(createResolved).toBe(false);
+			expect(session.sessionName).toBe("in-process-worker");
+		});
+		const baseOptions = {
+			parentSession,
+			prompt: "run in process",
+			model: faux.getModel(),
+			thinkingLevel: "off" as const,
+			serviceTier: null,
+			scopedModels: [],
+			activeToolNames: [],
+			customTools: [],
+			includeGoals: false,
+			includeCompactSkill: false,
+			rlmDepth: 1,
+			rlmMaxDepth: 2,
+		};
+
+		const childRuntime = await runtime.createRlmSubagentRuntime({
+			...baseOptions,
+			id: "in-process-child",
+			sessionName: "in-process-worker",
+			sessionDir: join(tempDir, "in-process-child"),
+			rlmParentNodeId: "in-process-child",
+			onSessionPublished,
+		});
+		createResolved = true;
+		expect(onSessionPublished).toHaveBeenCalledOnce();
+		await runtime.deleteRlmSubagentRuntime("in-process-child", childRuntime.session);
+
+		getRunStatus.mockReturnValue("cancelled");
+		await expect(
+			runtime.createRlmSubagentRuntime({
+				...baseOptions,
+				id: "cancelled-child",
+				sessionName: "cancelled-worker",
+				sessionDir: join(tempDir, "cancelled-child"),
+				rlmParentNodeId: "cancelled-child",
+			}),
+		).rejects.toThrow("startup was cancelled");
+		expect((runtime as unknown as RuntimeSubagentMapAccess).subagentRuntimes.has("cancelled-child")).toBe(false);
+	});
+
 	it("disposes hosted RLM children during session replacement", async () => {
 		const disposeRlmSubagentRuntimes = vi.fn(async () => {});
 		const host: SubagentRuntimeHost = {
 			createRlmSubagentRuntime: async () => {
 				throw new Error("unexpected child creation");
 			},
+			deleteRlmSubagentRuntime: async () => {},
 			disposeRlmSubagentRuntimes,
 		};
 		const { runtime } = await createRuntimeForTest(() => {});

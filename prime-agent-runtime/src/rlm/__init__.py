@@ -43,6 +43,16 @@ class RLMResult:
     turns: int = 0
 
 
+@dataclass(frozen=True)
+class RLMSubagent:
+    rlm_child_id: str
+    active_session_id: str | None
+    session_id: str | None
+    session_name: str
+    session_dir: Path
+    status: str
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -164,6 +174,60 @@ async def run(prompt: str, **kwargs: Any) -> RLMResult:
     return _result_from_payload(payload)
 
 
+def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") -> RLMSubagent:
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{operation} returned an invalid subagent entry")
+    child_id = payload.get("rlm_child_id")
+    active_session_id = payload.get("active_session_id")
+    session_id = payload.get("session_id")
+    session_name = payload.get("session_name")
+    session_dir = payload.get("session_dir")
+    status = payload.get("status")
+    if not isinstance(child_id, str) or not child_id:
+        raise RuntimeError(f"{operation} entry is missing rlm_child_id")
+    if active_session_id is not None and not isinstance(active_session_id, str):
+        raise RuntimeError(f"{operation} entry has invalid active_session_id")
+    if session_id is not None and not isinstance(session_id, str):
+        raise RuntimeError(f"{operation} entry has invalid session_id")
+    if not isinstance(session_name, str) or not session_name:
+        raise RuntimeError(f"{operation} entry is missing session_name")
+    if not isinstance(session_dir, str) or not session_dir:
+        raise RuntimeError(f"{operation} entry is missing session_dir")
+    if status not in {"running", "completed"}:
+        raise RuntimeError(f"{operation} entry has invalid status")
+    return RLMSubagent(
+        rlm_child_id=child_id,
+        active_session_id=active_session_id,
+        session_id=session_id,
+        session_name=session_name,
+        session_dir=Path(session_dir),
+        status=status,
+    )
+
+
+async def list_subagents() -> list[RLMSubagent]:
+    """List direct RLM children retained by the current parent session."""
+    payload = await host_request("rlm.list_subagents")
+    entries = payload.get("subagents")
+    if not isinstance(entries, list):
+        raise RuntimeError("rlm.list_subagents returned an invalid subagents registry")
+    return [_subagent_from_payload(entry) for entry in entries]
+
+
+async def delete_subagent(target: str | RLMSubagent) -> RLMSubagent:
+    """Delete one running or retained direct child from the current parent session."""
+    if isinstance(target, RLMSubagent):
+        selector = target.rlm_child_id
+    elif isinstance(target, str):
+        selector = target.strip()
+        if not selector:
+            raise ValueError("target must not be empty")
+    else:
+        raise TypeError(f"target must be str or RLMSubagent, got {type(target).__name__}")
+    payload = await host_request("rlm.delete_subagent", {"target": selector})
+    return _subagent_from_payload(payload.get("subagent"), "rlm.delete_subagent")
+
+
 class _HarnessProxy:
     """Resolve the harness state against the current environment on every access.
 
@@ -222,6 +286,12 @@ class _RLMCallable:
     async def run(self, prompt: str, **kwargs: Any) -> RLMResult:
         return await run(prompt, **kwargs)
 
+    async def list_subagents(self) -> list[RLMSubagent]:
+        return await list_subagents()
+
+    async def delete_subagent(self, target: str | RLMSubagent) -> RLMSubagent:
+        return await delete_subagent(target)
+
     async def __call__(self, prompt: str, **kwargs: Any) -> RLMResult:
         return await run(prompt, **kwargs)
 
@@ -245,11 +315,14 @@ __all__ = [
     "McpToolError",
     "NotEnabled",
     "RLMResult",
+    "RLMSubagent",
     "RefinementEvent",
     "TokenUsage",
+    "delete_subagent",
     "get_harness_state",
     "harness",
     "host_request",
+    "list_subagents",
     "rlm",
     "run",
 ]

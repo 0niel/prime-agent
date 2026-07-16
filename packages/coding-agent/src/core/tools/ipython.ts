@@ -40,13 +40,22 @@ except Exception as _prime_agent_rlm_error:
     _PRIME_AGENT_RLM_IMPORT_ERROR = str(_prime_agent_rlm_error)
 
     class _PrimeAgentMissingRlm:
-        async def run(self, prompt, **kwargs):
+        def _raise_missing(self):
             raise RuntimeError(
                 "prime-agent-runtime is not installed in this IPython kernel. "
                 "Remove ~/.prime/agent/kernel-venv so prime-agent can rebuild it, or set "
                 "PRIME_AGENT_KERNEL_PYTHON to a kernel environment with prime-agent-runtime installed. "
                 f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
             )
+
+        async def run(self, prompt, **kwargs):
+            self._raise_missing()
+
+        async def list_subagents(self):
+            self._raise_missing()
+
+        async def delete_subagent(self, target):
+            self._raise_missing()
 
         async def __call__(self, prompt, **kwargs):
             return await self.run(prompt, **kwargs)

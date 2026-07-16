@@ -126,7 +126,7 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).not.toContain("Read each skill's SKILL.md for its API");
 	});
 
-	test("mentions agent observation recovery only when the skill is installed", () => {
+	test("exposes the automatic child registry independently of observation skills", () => {
 		const withoutObserve = buildRlmPrompt({
 			cwd: "/repo",
 			messagesPath: "/repo/.pi/sessions/session.jsonl",
@@ -139,11 +139,12 @@ describe("buildRlmPrompt", () => {
 			activeTools: ["ipython"],
 		});
 
-		expect(withoutObserve).toContain(
-			"Write a small disk registry under `os.environ.get('RLM_SESSION_DIR')` when set",
-		);
-		expect(withoutObserve).not.toContain("recover status later with `agent_observe`");
-		expect(withObserve).toContain("recover status later with `agent_observe`");
+		for (const prompt of [withoutObserve, withObserve]) {
+			expect(prompt).toContain("await rlm.list_subagents()");
+			expect(prompt).toContain("await rlm.delete_subagent(child)");
+			expect(prompt).toContain("automatic child registry");
+			expect(prompt).not.toContain("Write a small disk registry");
+		}
 	});
 
 	test("documents the %%bash first-line rule when ipython is active", () => {
@@ -379,18 +380,28 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("asyncio.create_task");
 		expect(prompt).toContain("Sub-agents should not block Prime Agent by default");
 		expect(prompt).toContain("Default to non-blocking subagents");
-		expect(prompt).toContain("disk-backed registry");
-		expect(prompt).toContain("RLM_SESSION_DIR");
-		expect(prompt).toContain("from pathlib import Path");
-		expect(prompt).toContain("import os");
-		expect(prompt).toContain("kernel restarts, state restore, or compaction");
-		expect(prompt).toContain("agent_observe.list_agents");
-		expect(prompt).toContain('runtimeKind == "subagent"');
-		expect(prompt).toContain("parentSessionId");
-		expect(prompt).toContain("parentActiveSessionId");
+		expect(prompt).toContain("automatic child registry");
+		expect(prompt).toContain("parent-scoped subagent registry");
+		expect(prompt).toContain("kernel restarts, state restore, and compaction");
+		expect(prompt).toContain("rlm.list_subagents");
+		expect(prompt).toContain("rlm.delete_subagent");
+		expect(prompt).toContain("rlm_child_id");
+		expect(prompt).toContain("active_session_id");
+		expect(prompt).toContain("session_name");
+		expect(prompt).toContain("name='api-reviewer'");
+		expect(prompt).toContain("names must be non-empty and unique");
+		expect(prompt).toContain("session_dir");
+		expect(prompt).toContain("`agent_observe` skill is installed and a registry entry has `active_session_id`");
+		expect(prompt).toContain("agent_observe.get_agent");
 		expect(prompt).toContain("agent_observe.recent_messages");
-		expect(prompt).toContain("agent_message.list_agents");
+		expect(prompt).toContain("Successful subagent sessions remain in that registry");
+		expect(prompt).toContain("current parent session remains open");
+		expect(prompt).toContain("retained children close when their parent session closes");
 		expect(prompt).toContain("agent_message.send");
+		expect(prompt).toContain("agent_message.send(child.session_name");
+		expect(prompt).toContain("readable, unique default `session_name`");
+		expect(prompt).toContain("same child");
+		expect(prompt).not.toContain("disk-backed registry");
 		expect(prompt).toContain("mode='steer'");
 		expect(prompt).toContain("sub-agent work that can run in the background");
 		expect(prompt).toContain("do not block the main execution path");

@@ -13,9 +13,13 @@ mutate another session.
 Call directly from the kernel:
 
 ```python
-agents = await agent_observe.list_agents()
-worker = await agent_observe.get_agent("worker")
-recent = await agent_observe.recent_messages("worker", limit=6)
+children = await rlm.list_subagents()
+child = next((item for item in children if item.active_session_id), None)
+if child is not None:
+    worker = await agent_observe.get_agent(child.session_name)
+    recent = await agent_observe.recent_messages(child.session_name, limit=6)
+    # Deletion is a parent-owned RLM operation, not an observe mutation:
+    await rlm.delete_subagent(child)
 ```
 
 ## API
@@ -23,9 +27,12 @@ recent = await agent_observe.recent_messages("worker", limit=6)
 - `await agent_observe.list_agents()` returns `current` and `agents`. Each
   agent includes active session id, session id, optional name, runtime kind,
   cwd, status, streaming state, message count, pending count, and a latest
-  message preview. This includes subagents shown in the agents view; filter
-  by `runtimeKind == "subagent"` and `parentSessionId` or
-  `parentActiveSessionId` to inspect subagents that belong to your session.
+  message preview. This includes live subagents and successful completed
+  subagents retained by an open parent. For the current parent session's direct
+  children, prefer `await rlm.list_subagents()` over filtering this global
+  list. Every RLM child gets a readable unique `session_name`, or the
+  orchestrator can choose one with `rlm("task", name="api-reviewer")`; use that
+  name directly as an observation target.
 - `await agent_observe.get_agent(target)` returns `agent`, where `agent`
   contains one agent summary. `target` is resolved like other live-session
   selectors: active id, session id/name, or unambiguous suffix.

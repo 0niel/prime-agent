@@ -11,6 +11,13 @@ describe("IPython RLM bootstrap", () => {
 		expect(buildRlmBootstrapCode()).toMatch(/^import asyncio$/m);
 	});
 
+	it("gives subagent registry operations the actionable missing-runtime fallback", () => {
+		const code = buildRlmBootstrapCode();
+		expect(code).toContain("async def list_subagents(self)");
+		expect(code).toContain("async def delete_subagent(self, target)");
+		expect(code).toContain("self._raise_missing()");
+	});
+
 	it("disables colored output for subprocesses launched by the kernel", () => {
 		expect(buildRlmBootstrapCode()).toContain('_prime_agent_os.environ["NO_COLOR"] = "1"');
 	});
