@@ -105,6 +105,7 @@ const DEFAULT_PROMPT_PLACEHOLDER = "Describe a task for a new session";
 const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "Write a reply to this agent";
 const COMPLETED_ROW_ICON = "✓";
 const NEEDS_INPUT_ROW_ICON = "●";
+const HEARTBEAT_ROW_ICON = "♥";
 const SELECTED_ROW_MARKER = "\0agents-view-selected-row\0";
 // Tags a spawn-code line so finalize can wrap the whole row in a panel
 // background, visually segmenting the program from the agent rows.
@@ -2037,7 +2038,11 @@ class AgentsViewMode implements Component, Focusable {
 		if (counts["needs-input"] > 0) {
 			parts.push(`${counts["needs-input"]} needs input`);
 		}
-		parts.push(`${counts.working} working`, `${counts.completed} completed`);
+		parts.push(`${counts.working} working`);
+		if (counts.heartbeats > 0) {
+			parts.push(`${counts.heartbeats} heartbeats`);
+		}
+		parts.push(`${counts.completed} completed`);
 		return parts.join(", ");
 	}
 
@@ -2250,6 +2255,8 @@ class AgentsViewMode implements Component, Focusable {
 				return workingIconFrame(this.workingIconFrame);
 			case "needs-input":
 				return NEEDS_INPUT_ROW_ICON;
+			case "heartbeats":
+				return HEARTBEAT_ROW_ICON;
 			case "completed":
 				return COMPLETED_ROW_ICON;
 			default: {
@@ -2265,6 +2272,8 @@ class AgentsViewMode implements Component, Focusable {
 				return theme.bold(icon);
 			case "needs-input":
 				return theme.fg("warning", icon);
+			case "heartbeats":
+				return theme.fg("error", icon);
 			case "completed":
 				return theme.fg("success", icon);
 			default: {
@@ -2283,7 +2292,7 @@ type DisplayItem =
 
 function buildDisplayItems(rows: readonly AgentsViewRow[]): DisplayItem[] {
 	const items: DisplayItem[] = [];
-	const sections: AgentsViewSection[] = ["needs-input", "working", "completed"];
+	const sections: AgentsViewSection[] = ["needs-input", "working", "heartbeats", "completed"];
 	for (const [index, section] of sections.entries()) {
 		if (index > 0) {
 			items.push({ type: "spacer" });
@@ -2322,6 +2331,7 @@ function countRowsBySection(rows: readonly AgentsViewRow[]): Record<AgentsViewSe
 	return {
 		working: agents.filter((row) => row.section === "working").length,
 		"needs-input": agents.filter((row) => row.section === "needs-input").length,
+		heartbeats: agents.filter((row) => row.section === "heartbeats").length,
 		completed: agents.filter((row) => row.section === "completed").length,
 	};
 }

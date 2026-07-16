@@ -28,6 +28,7 @@ import {
 	getAgentsViewSelectionKey,
 	resolveAgentsViewSelectionIndex,
 	type SessionSummary,
+	sectionTitle,
 	shouldShowAgentsViewSession,
 } from "../src/modes/index.js";
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
@@ -54,6 +55,23 @@ describe("agents view state", () => {
 		);
 		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: "completed" }))).toBe("completed");
 		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: undefined }))).toBe("needs-input");
+	});
+
+	test("active heartbeats use their own section regardless of current activity", () => {
+		expect(classifyAgentsViewSession(makeSummary({ activity: "working", hasActiveHeartbeat: true }))).toBe(
+			"heartbeats",
+		);
+		expect(
+			classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: "completed", hasActiveHeartbeat: true })),
+		).toBe("heartbeats");
+
+		const [row] = buildAgentsViewRows([makeSummary({ activity: "idle", hasActiveHeartbeat: true })]);
+		expect(row).toMatchObject({ section: "heartbeats", statusLabel: "heartbeat active" });
+		const [busyRow] = buildAgentsViewRows([
+			makeSummary({ activity: "working", hasActiveHeartbeat: true, isStreaming: true, isRunningTools: true }),
+		]);
+		expect(busyRow).toMatchObject({ section: "heartbeats", statusLabel: "running tools" });
+		expect(sectionTitle("heartbeats")).toBe("Heartbeats");
 	});
 
 	test("defaults an idle session with no verdict to needs-input", () => {
@@ -83,10 +101,16 @@ describe("agents view state", () => {
 				isStreaming: true,
 				modified: "2026-01-02T00:00:00Z",
 			}),
+			makeSummary({
+				sessionName: "heartbeat",
+				activity: "idle",
+				hasActiveHeartbeat: true,
+				modified: "2026-01-03T00:00:00Z",
+			}),
 		]);
 
-		expect(rows.map((row) => row.title)).toEqual(["newer working", "older working", "completed"]);
-		expect(rows.map((row) => row.section)).toEqual(["working", "working", "completed"]);
+		expect(rows.map((row) => row.title)).toEqual(["newer working", "older working", "heartbeat", "completed"]);
+		expect(rows.map((row) => row.section)).toEqual(["working", "working", "heartbeats", "completed"]);
 	});
 
 	test("summarizes subagents on their parent and omits subagent rows", () => {
@@ -110,6 +134,7 @@ describe("agents view state", () => {
 				runtimeKind: "subagent",
 				parentActiveSessionId: "parent-active",
 				parentSessionId: "parent-session",
+				hasActiveHeartbeat: true,
 				activity: "working",
 			}),
 			makeSummary({
