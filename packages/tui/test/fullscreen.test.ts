@@ -64,7 +64,7 @@ const WHEEL_UP = "\x1b[<64;5;5M";
 const WHEEL_DOWN = "\x1b[<65;5;5M";
 const PAGE_UP = "\x1b[5~";
 const VIEWPORT_TOP = "\x1b[1;4A"; // shift+alt+up
-const FOLLOW = "\x1b[1;3B"; // alt+down
+const FOLLOW = "\x1b[1;6B"; // ctrl+shift+down
 
 interface Setup {
 	terminal: LoggingVirtualTerminal;
@@ -158,7 +158,7 @@ describe("TUI fullscreen mode", () => {
 		assert.strictEqual(viewport[0], "Line 9", "appended content does not move the window");
 		assert.strictEqual(viewport[8], "> prompt", "dock still visible");
 		assert.strictEqual(tui.getScrollInfo()?.linesBelow, 23);
-		assert.ok(viewport[7]?.includes("to follow"), "follow hint composited above the dock");
+		assert.ok(viewport[7]?.includes("ctrl+shift+down to follow"), "follow hint composited above the dock");
 
 		tui.stop();
 	});

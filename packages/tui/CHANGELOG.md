@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Changed the fullscreen follow shortcut from `Alt+Down` to `Ctrl+Shift+Down` for more reliable terminal input ([ENG-4684](https://linear.app/primeintellect/issue/ENG-4684/altdown-doesnt-work)).
 ## [0.3.1] - 2026-07-15
 
 - Fixed fullscreen Markdown table selections copying borders instead of tab-separated cell content ([ENG-4629](https://linear.app/primeintellect/issue/ENG-4629/respect-table-boundaries-when-selecting)).
