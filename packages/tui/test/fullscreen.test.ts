@@ -139,9 +139,10 @@ describe("TUI fullscreen mode", () => {
 		}
 	});
 
-	it("keeps the inline-mode placeholder for clipped Ghostty image blocks", async () => {
+	it("renders bottom-clipped Ghostty image blocks with the visible row count", async () => {
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" });
 		const image = encodeKitty("AAAA", { columns: 2, rows: 5, imageId: 57, moveCursor: false });
+		const clippedImage = encodeKitty("AAAA", { columns: 2, rows: 3, imageId: 57, moveCursor: false });
 		const { terminal, tui, chat, dock } = setup(["Line 0", "Line 1", "Line 2", "Line 3", image, "", ""], 80, 8);
 		try {
 			await terminal.waitForRender();
@@ -151,8 +152,28 @@ describe("TUI fullscreen mode", () => {
 			await terminal.waitForRender();
 
 			const writes = terminal.getWrites();
-			assert.ok(!writes.includes(image), "clipped first-row image should not be emitted inside fullscreen");
-			assert.ok(writes.includes("view in inline mode"), "clipped first-row image should use the safe placeholder");
+			assert.ok(writes.includes(clippedImage), "bottom-clipped first-row image should be resized to visible rows");
+			assert.ok(!writes.includes(image), "bottom-clipped first-row image should not overdraw into the dock");
+			assert.ok(!writes.includes("view in inline mode"), "bottom-clipped first-row image should not use the placeholder");
+		} finally {
+			tui.stop();
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("renders top-clipped Ghostty image blocks with the remaining visible row count", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" });
+		const image = encodeKitty("AAAA", { columns: 2, rows: 5, imageId: 62, moveCursor: false });
+		const clippedImage = encodeKitty("AAAA", { columns: 2, rows: 3, imageId: 62, moveCursor: false });
+		const { terminal, tui, chat, dock } = setup(["lead 0", "lead 1", image, "", "", "", "", "after", "tail", "tail 2"], 80, 8);
+		try {
+			tui.enterFullscreen({ scroll: [chat], dock });
+			await terminal.waitForRender();
+
+			const writes = terminal.getWrites();
+			assert.ok(writes.includes(clippedImage), "top-clipped first-row image should be redrawn from the first visible row");
+			assert.ok(!writes.includes(image), "top-clipped first-row image should not use the offscreen full-height placement");
+			assert.ok(!writes.includes("view in inline mode"), "top-clipped first-row image should not use the placeholder");
 		} finally {
 			tui.stop();
 			resetCapabilitiesCache();
@@ -182,9 +203,10 @@ describe("TUI fullscreen mode", () => {
 		}
 	});
 
-	it("uses the placeholder for clipped Ghostty images while fullscreen history is scrolled", async () => {
+	it("renders clipped Ghostty images while fullscreen history is scrolled", async () => {
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" });
 		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 61, moveCursor: false });
+		const clippedImage = encodeKitty("AAAA", { columns: 2, rows: 1, imageId: 61, moveCursor: false });
 		const { terminal, tui, chat, dock } = setup([...lines(11), image, "", "after", "tail"], 80, 8);
 		try {
 			tui.enterFullscreen({ scroll: [chat], dock });
@@ -197,8 +219,35 @@ describe("TUI fullscreen mode", () => {
 
 			const writes = terminal.getWrites();
 			assert.ok(writes.includes(deleteKittyImage(61)), "scrolling should delete the old visible image placement");
-			assert.ok(!writes.includes(image), "clipped scrolled image should not be re-emitted");
-			assert.ok(writes.includes("view in inline mode"), "clipped scrolled image should use the placeholder");
+			assert.ok(!writes.includes(image), "clipped scrolled image should not overdraw with the full-height placement");
+			assert.ok(writes.includes(clippedImage), "clipped scrolled image should be redrawn with the visible row count");
+			assert.ok(!writes.includes("view in inline mode"), "clipped scrolled image should not use the placeholder");
+		} finally {
+			tui.stop();
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("renders multiple Ghostty images in the same fullscreen frame", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" });
+		const firstImage = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 63, moveCursor: false });
+		const secondImage = encodeKitty("BBBB", { columns: 2, rows: 2, imageId: 64, moveCursor: false });
+		const { terminal, tui, chat, dock } = setup(["lead", firstImage, "", "between", secondImage, "", "after"], 80, 10);
+		try {
+			await terminal.waitForRender();
+			terminal.clearWrites();
+
+			tui.enterFullscreen({ scroll: [chat], dock });
+			await terminal.waitForRender();
+
+			const writes = terminal.getWrites();
+			const firstDrawIndex = writes.indexOf(firstImage);
+			const secondDrawIndex = writes.indexOf(secondImage);
+			assert.ok(firstDrawIndex >= 0, "first image should be drawn");
+			assert.ok(secondDrawIndex >= 0, "second image should be drawn");
+			assert.ok(!writes.includes("view in inline mode"), "multiple images should not force placeholders");
+			const clearAfterFirstDraw = writes.indexOf("\x1b[3;1H\x1b[2K", firstDrawIndex);
+			assert.strictEqual(clearAfterFirstDraw, -1, "reserved rows should be cleared before image drawing, not after");
 		} finally {
 			tui.stop();
 			resetCapabilitiesCache();

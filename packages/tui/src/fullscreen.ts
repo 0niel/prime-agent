@@ -17,7 +17,8 @@ export function clippedFullscreenDockHeight(dockLength: number, height: number):
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 
-// Kitty images can span multiple physical rows and cannot be partially clipped.
+// Kitty images span physical rows. Ghostty first-row placements can be safely
+// resized to the visible row count in fullscreen; cursor-shim placements cannot.
 const IMAGE_PLACEHOLDER = "\x1b[2m[image — view in inline mode]\x1b[0m";
 
 function kittyImageRows(line: string): number | null {
@@ -36,6 +37,28 @@ function kittyImageRows(line: string): number | null {
 		if (Number.isInteger(rows) && rows > 0) return rows;
 	}
 	return 1;
+}
+
+function resizeKittyImageRows(line: string, rows: number): string {
+	const sequenceStart = line.indexOf(KITTY_SEQUENCE_PREFIX);
+	if (sequenceStart === -1) return line;
+
+	const paramsStart = sequenceStart + KITTY_SEQUENCE_PREFIX.length;
+	const paramsEnd = line.indexOf(";", paramsStart);
+	if (paramsEnd === -1) return line;
+
+	const params = line.slice(paramsStart, paramsEnd).split(",");
+	let foundRows = false;
+	for (let i = 0; i < params.length; i++) {
+		if (params[i].startsWith("r=")) {
+			params[i] = `r=${rows}`;
+			foundRows = true;
+			break;
+		}
+	}
+	if (!foundRows) params.push(`r=${rows}`);
+
+	return line.slice(0, paramsStart) + params.join(",") + line.slice(paramsEnd);
 }
 
 function kittyImageIds(line: string): number[] {
@@ -61,17 +84,57 @@ function kittyImageIds(line: string): number[] {
 	return ids;
 }
 
-function canRenderImageInFullscreen(window: readonly string[], index: number): boolean {
+function canRenderImageInFullscreen(line: string): boolean {
 	const caps = getCapabilities();
 	if (caps.images !== "kitty" || caps.imagePlacement !== "first-row") return false;
 
-	const line = window[index] ?? "";
 	if (!line.startsWith(KITTY_SEQUENCE_PREFIX)) return false;
 
 	const rows = kittyImageRows(line);
 	if (rows === null) return false;
 
-	return index + rows <= window.length;
+	return true;
+}
+
+function prepareFullscreenImages(window: string[], transcript: readonly string[], scrollTop: number, windowHeight: number): void {
+	const caps = getCapabilities();
+	const canRenderFirstRowKitty = caps.images === "kitty" && caps.imagePlacement === "first-row";
+
+	if (!canRenderFirstRowKitty) {
+		for (let i = 0; i < window.length; i++) {
+			if (isImageLine(window[i])) window[i] = IMAGE_PLACEHOLDER;
+		}
+		return;
+	}
+
+	for (let i = scrollTop - 1; i >= 0; i--) {
+		const line = transcript[i] ?? "";
+		if (line.length > 0 && !isImageLine(line)) break;
+		if (!canRenderImageInFullscreen(line)) continue;
+		const rows = kittyImageRows(line);
+		if (rows === null) break;
+		if (i + rows > scrollTop) {
+			const visibleRows = Math.min(i + rows - scrollTop, windowHeight);
+			if (visibleRows > 0) window[0] = resizeKittyImageRows(line, visibleRows);
+		}
+		break;
+	}
+
+	for (let i = 0; i < window.length; i++) {
+		const line = window[i];
+		if (!isImageLine(line)) continue;
+		if (!canRenderImageInFullscreen(line)) {
+			window[i] = IMAGE_PLACEHOLDER;
+			continue;
+		}
+		const rows = kittyImageRows(line);
+		if (rows === null) {
+			window[i] = IMAGE_PLACEHOLDER;
+			continue;
+		}
+		const visibleRows = Math.min(rows, windowHeight - i);
+		window[i] = visibleRows > 0 ? resizeKittyImageRows(line, visibleRows) : "";
+	}
 }
 
 export interface ScrollInfo {
@@ -152,11 +215,7 @@ export class FullscreenViewport {
 		this.lastTranscript = transcript;
 
 		const window = transcript.slice(this.scrollTop, this.scrollTop + windowHeight);
-		for (let i = 0; i < window.length; i++) {
-			if (isImageLine(window[i]) && !canRenderImageInFullscreen(window, i)) {
-				window[i] = IMAGE_PLACEHOLDER;
-			}
-		}
+		prepareFullscreenImages(window, transcript, this.scrollTop, windowHeight);
 		this.highlightSelection(window);
 		while (window.length < windowHeight) {
 			window.push("");
@@ -536,10 +595,13 @@ export class FullscreenViewport {
 		}
 		buffer += imageDeletes.join("");
 		for (const row of changedRows) {
-			const line = frame[row] ?? "";
 			buffer += `\x1b[${row + 1};1H\x1b[2K`;
+		}
+		for (const row of changedRows) {
+			const line = frame[row] ?? "";
 			// an overwide line would wrap and shear the grid; clamp instead of crash
-			buffer += visibleWidth(line) > width ? sliceByColumn(line, 0, width, true) : line;
+			const drawable = visibleWidth(line) > width ? sliceByColumn(line, 0, width, true) : line;
+			if (drawable.length > 0) buffer += `\x1b[${row + 1};1H${drawable}`;
 		}
 		if (cursorPos) {
 			buffer += `\x1b[${Math.min(cursorPos.row, height - 1) + 1};${cursorPos.col + 1}H`;
