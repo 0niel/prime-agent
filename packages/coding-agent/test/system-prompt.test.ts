@@ -57,8 +57,8 @@ describe("buildRlmPrompt", () => {
 				`Pre-installed Python packages: ${DEFAULT_RLM_EXTRA_IMPORT_LABELS.join(", ")}.`,
 				"Install additional packages with `uv pip install <pkg>` (this is a uv-managed venv with no pip module).",
 				"",
-				"Installed skills (pre-imported): `websearch`.",
-				"Each skill is an async function by the same name. Inspect with `help(<skill>)` or `inspect.signature(<skill>.run)`.",
+				"Installed Python skill modules (pre-imported): `websearch`.",
+				"Read each skill's SKILL.md for its API. Inspect a module with `help(<skill>)` or `dir(<skill>)`, then inspect a documented callable with `inspect.signature(<skill>.<function>)`.",
 				"Each skill is also available as a shell command by the same name: `<skill> ...`. Discover its CLI usage with `<skill> --help`.",
 				"",
 				"IPython is the agent's long-lived notebook: a persistent control environment for reasoning, context management, state, tool orchestration, and recursive subcalls. Use it to keep intermediate variables, inspect and transform outputs, write small helper functions, and preserve useful state across turns or compaction.",
@@ -79,7 +79,7 @@ describe("buildRlmPrompt", () => {
 				"",
 				"Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, IPython kernel, and native call interface exposed to the model.",
 				"",
-				"RLM-native call contract for refined continual harness entries: installed Python skills are called from IPython as `await <skill_import>(...)` with keyword arguments, or as `<skill_import> ...` from shell when a CLI exists. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are reusable delegation specs; invoke them by turning the spec into a concise task prompt and starting `asyncio.create_task(rlm('sub-task'))` by default, then await the task only when its result is needed, or collect independent subagents with `await asyncio.gather(...)`. Use direct `await rlm('sub-task')` only when the result is immediately required. Do not invent non-native wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
+				"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are reusable delegation specs; invoke them by turning the spec into a concise task prompt and starting `asyncio.create_task(rlm('sub-task'))` by default, then await the task only when its result is needed, or collect independent subagents with `await asyncio.gather(...)`. Use direct `await rlm('sub-task')` only when the result is immediately required. Do not invent non-native wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
 				"",
 				"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `/refine` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
 			].join("\n"),
@@ -93,7 +93,7 @@ describe("buildRlmPrompt", () => {
 			installedSkills: ["websearch"],
 		});
 
-		expect(prompt).toContain("Installed skills (pre-imported): `websearch`.");
+		expect(prompt).toContain("Installed Python skill modules (pre-imported): `websearch`.");
 		expect(prompt).toContain("A callable `rlm` is already in your global namespace");
 		expect(prompt).toContain("IPython is the agent's long-lived notebook");
 		expect(prompt).toContain("Each `%%bash` cell runs in a throw-away subshell");
@@ -122,8 +122,8 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain("Installed skills available as shell commands: `websearch`.");
 		expect(prompt).toContain("Each skill is also available as a shell command");
 		expect(prompt).toContain("`<skill> --help`");
-		expect(prompt).not.toContain("Installed skills (pre-imported)");
-		expect(prompt).not.toContain("Each skill is an async function");
+		expect(prompt).not.toContain("Installed Python skill modules (pre-imported)");
+		expect(prompt).not.toContain("Read each skill's SKILL.md for its API");
 	});
 
 	test("mentions agent observation recovery only when the skill is installed", () => {
@@ -296,7 +296,7 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("The continual harness entries below are compact summaries, not full descriptions");
 		expect(prompt).toContain("Use global continual harness refinement only for stable cross-session lessons");
 		expect(prompt).toContain("When to call `/refine`");
-		expect(prompt).toContain("Call contract: use installed Python skills as `await <skill_import>(...)`");
+		expect(prompt).toContain("Call contract: read each installed Python skill's SKILL.md");
 		expect(prompt).toContain("Continual harness skill entries are Python REPL skills");
 		expect(prompt).toContain("Continual harness subagent entries are invoked by composing a concise task prompt");
 		expect(prompt).toContain("asyncio.create_task(rlm('sub-task'))");
@@ -422,8 +422,8 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).not.toContain("rlm.harness.upsert_skill");
 		expect(prompt).toContain("rlm.harness.record_refinement");
 		expect(prompt).toContain("continual harness names the persisted prompt");
-		expect(prompt).toContain("RLM-native call contract for refined continual harness entries");
-		expect(prompt).toContain("await <skill_import>(...)");
+		expect(prompt).toContain("RLM-native call contract: installed Python skills are pre-imported modules");
+		expect(prompt).toContain("await <skill_import>.<function>(...)");
 		expect(prompt).toContain("Python `reference` and `arguments` contract");
 		expect(prompt).toContain("await asyncio.gather(rlm('task1'), rlm('task2'))");
 		expect(prompt).toContain("Use `/refine` to turn repeated delegation patterns into reusable subagent specs");
@@ -618,7 +618,7 @@ describe("buildSystemPrompt", () => {
 			cwd: "/repo",
 		});
 
-		expect(prompt).not.toContain("Installed skills (pre-imported)");
+		expect(prompt).not.toContain("Installed Python skill modules (pre-imported)");
 		expect(prompt).toContain("<available_skills>");
 		expect(prompt).toContain("<name>websearch</name>");
 		expect(prompt).toContain("<type>markdown</type>");
@@ -633,7 +633,7 @@ describe("buildSystemPrompt", () => {
 			cwd: "/repo",
 		});
 
-		expect(prompt).toContain("Installed skills (pre-imported): `web_search`.");
+		expect(prompt).toContain("Installed Python skill modules (pre-imported): `web_search`.");
 		expect(prompt).toContain("<name>web-search</name>");
 		expect(prompt).toContain("<type>python</type>");
 		expect(prompt).toContain("<python_import>web_search</python_import>");

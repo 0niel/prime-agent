@@ -1,6 +1,6 @@
 ---
 name: rlm-heartbeat
-description: Manage internal RLM heartbeats from IPython. Use to schedule recurring self-checks for the current agent session without touching the user's /heartbeat.
+description: Manage agent-owned RLM heartbeats from IPython. Use when the user asks the agent to start, create, schedule, or manage a heartbeat, unless they explicitly request the user's /heartbeat.
 ---
 
 # RLM Heartbeat
@@ -44,6 +44,8 @@ the session when it is busy:
 
 ## Rules
 
+- Use this when the user asks you to start, create, schedule, or manage your own
+  heartbeat without explicitly referring to `/heartbeat`.
 - Use this only for agent-internal recurring checks and long-running task
   coordination.
 - Do not use this skill to satisfy a user's request to configure `/heartbeat`;

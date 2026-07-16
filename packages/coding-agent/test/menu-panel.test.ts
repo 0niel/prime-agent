@@ -1,4 +1,4 @@
-import { type Component, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, TruncatedText, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
@@ -8,7 +8,7 @@ import {
 	MenuRow,
 	MenuSearchInput,
 } from "../src/modes/interactive/components/menu-panel.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 class StaticComponent implements Component {
 	invalidate(): void {
@@ -53,6 +53,18 @@ describe("MenuPanel", () => {
 		expect(output).toContain("Search models");
 		expect(output).not.toContain("> ");
 		expect(visibleWidth(output)).toBe(24);
+	});
+
+	it("keeps the menu background behind ellipses", () => {
+		const panel = new MenuPanel({ title: "Menu" });
+		panel.addChild(new TruncatedText(theme.fg("muted", "A long line that must be truncated")));
+
+		const line = panel.render(24).find((value) => stripAnsi(value).includes("A long line"));
+		const backgroundEllipsis = theme.getEditorBackgroundColor()?.("...");
+
+		expect(line).toBeDefined();
+		expect(backgroundEllipsis).toBeDefined();
+		expect(line).toContain(backgroundEllipsis);
 	});
 
 	it("renders selected rows as full-width surfaces without a cursor glyph", () => {

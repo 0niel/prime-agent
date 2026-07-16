@@ -5,7 +5,12 @@ import { getAgentLogPath, getDaemonLogPath } from "../../config.js";
 import type { AgentSessionEvent } from "../../core/agent-session.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
-import type { AgentCronJob, AgentHeartbeatDeliveryMode, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
+import type {
+	AgentCronJob,
+	AgentHeartbeatDeliveryMode,
+	AgentHeartbeatManagementAction,
+	AgentHeartbeatUpdateAction,
+} from "../../core/cron-jobs.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type { SessionStats } from "../../core/session-stats.js";
@@ -36,6 +41,7 @@ import type {
 	AgentConnectionExecuteBashOptions,
 	AgentConnectionExtensionUiResponse,
 	AgentConnectionForkOptions,
+	AgentConnectionHeartbeat,
 	AgentConnectionModel,
 	AgentConnectionModelCycleResult,
 	AgentConnectionNavigateTreeOptions,
@@ -450,6 +456,25 @@ export class DaemonAgentConnection implements AgentConnection {
 			includeInactive: options.includeInactive,
 		});
 		return data.jobs;
+	}
+
+	async listHeartbeats(): Promise<AgentConnectionHeartbeat[]> {
+		const data = await this.requestData<{ heartbeats: AgentConnectionHeartbeat[] }>({ type: "heartbeats_list" });
+		return data.heartbeats;
+	}
+
+	async manageHeartbeat(
+		activeSessionId: string,
+		jobId: string,
+		action: AgentHeartbeatManagementAction,
+	): Promise<AgentCronJob> {
+		const data = await this.requestData<{ heartbeat: AgentCronJob }>({
+			type: "heartbeat_manage",
+			activeSessionId,
+			jobId,
+			action,
+		});
+		return data.heartbeat;
 	}
 
 	async addCronJob(schedule: string, prompt: string): Promise<AgentCronJob> {
@@ -931,6 +956,10 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	private async handleDaemonMessage(message: DaemonOutbound): Promise<void> {
+		if (message.type === "heartbeats_changed") {
+			await this.emit({ type: "heartbeats_changed" });
+			return;
+		}
 		if (!this.isMessageForActiveSession(message)) {
 			return;
 		}
@@ -1526,6 +1555,7 @@ function invalidatesCachedSnapshot(commandType: DaemonCommandBody["type"]): bool
 		case "get_available_models":
 		case "get_queue":
 		case "cron_list":
+		case "heartbeats_list":
 		case "get_session_context":
 		case "get_session_tree":
 		case "get_user_messages_for_forking":

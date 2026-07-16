@@ -3879,6 +3879,45 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("manages a persisted heartbeat after its session unloads", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-unloaded-heartbeat-"));
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const internals = daemon as unknown as {
+				cronStore: AgentCronJobStore;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const heartbeat = internals.cronStore.createHeartbeat({
+				activeSessionId: "unloaded-session",
+				sessionId: "session-1",
+				sessionFile: join(tempDir, "session.jsonl"),
+				cwd: tempDir,
+				scheduleText: "every 5m",
+				prompt: "check on the session",
+			});
+
+			const response = await internals.handleCommand(makeClient("client-1", "unloaded-session"), {
+				id: "command-1",
+				type: "heartbeat_manage",
+				activeSessionId: "unloaded-session",
+				jobId: heartbeat.id,
+				action: "stop",
+			});
+
+			expect(response).toMatchObject({
+				success: true,
+				data: { heartbeat: { id: heartbeat.id, status: "cancelled" } },
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("sets models without waiting for model_select extension handlers while running", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },

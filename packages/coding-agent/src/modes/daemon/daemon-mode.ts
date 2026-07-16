@@ -68,8 +68,8 @@ import {
 	AgentCronJobStore,
 	AgentCronScheduler,
 	type AgentHeartbeatDeliveryMode,
+	type AgentHeartbeatManagementAction,
 	type AgentHeartbeatUpdateAction,
-	createAgentHeartbeatToolDefinitions,
 	DEFAULT_HEARTBEAT_SCHEDULE,
 	isHeartbeatCronJob,
 	normalizeHeartbeatDeliveryMode,
@@ -95,6 +95,7 @@ import {
 	createAgentConnectionState,
 } from "../agent-connection/snapshot.js";
 import { createAgentConnectionToolDefinition } from "../agent-connection/tool-definition.js";
+import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import { encodePrivateFrame, PrivateFrameDecoder } from "../session-worker/private-framing.js";
 import {
@@ -219,6 +220,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"clear_queue",
 	"abort_and_clear_queue",
 	"cron_list",
+	"heartbeats_list",
+	"heartbeat_manage",
 	"cron_add",
 	"cron_cancel",
 	"heartbeat_get",
@@ -394,6 +397,7 @@ export class AgentDaemon {
 				this.log(`Cron job ${job.id} failed: ${error instanceof Error ? error.message : String(error)}`);
 			},
 		});
+		this.cronStore.onHeartbeatChange(() => this.broadcastGlobal({ type: "heartbeats_changed" }));
 	}
 
 	// The daemon runs detached with no terminal, so route its diagnostics to its
@@ -871,16 +875,6 @@ export class AgentDaemon {
 					runtimeMetadata: command.runtimeMetadata,
 					sessionLease,
 					sessionOptions: {
-						customTools: [
-							...createAgentHeartbeatToolDefinitions({
-								getHeartbeat: () => {
-									if (!stateRef) {
-										throw new Error("Heartbeat state is not ready for this session yet");
-									}
-									return this.cronStore.getHeartbeat(stateRef.activeSessionId);
-								},
-							}),
-						],
 						rlmHeartbeatController: {
 							listRlmHeartbeats: (listOptions) => {
 								if (!stateRef) {
@@ -1293,6 +1287,37 @@ export class AgentDaemon {
 		const job = this.cronStore.deleteRlmHeartbeat(state.activeSessionId, id);
 		if (job) {
 			this.removeQueuedHeartbeatFollowUp(state, job);
+			this.cronScheduler.wake();
+		}
+		return job;
+	}
+
+	private listHeartbeats(): AgentConnectionHeartbeat[] {
+		return this.cronStore
+			.list()
+			.filter((job) => isHeartbeatCronJob(job) && (job.status === "active" || job.status === "paused"))
+			.map((job) => {
+				const state = this.sessions.get(job.activeSessionId);
+				const summary = state ? summaryForActiveSession(state) : undefined;
+				return {
+					job,
+					...(summary?.sessionName ? { sessionName: summary.sessionName } : {}),
+					...(summary?.firstMessage ? { firstMessage: summary.firstMessage } : {}),
+				};
+			});
+	}
+
+	private manageHeartbeat(
+		activeSessionId: string,
+		jobId: string,
+		action: AgentHeartbeatManagementAction,
+	): AgentCronJob | undefined {
+		const job = this.cronStore.manageHeartbeat(activeSessionId, jobId, action);
+		const state = this.sessions.get(activeSessionId);
+		if (job && action !== "resume" && state) {
+			this.removeQueuedHeartbeatFollowUp(state, job);
+		}
+		if (job) {
 			this.cronScheduler.wake();
 		}
 		return job;
@@ -2585,6 +2610,17 @@ export class AgentDaemon {
 					return true;
 				});
 				return success(command.id, "cron_list", { jobs });
+			}
+
+			case "heartbeats_list":
+				return success(command.id, "heartbeats_list", { heartbeats: this.listHeartbeats() });
+
+			case "heartbeat_manage": {
+				const heartbeat = this.manageHeartbeat(command.activeSessionId, command.jobId, command.action);
+				if (!heartbeat) {
+					throw new Error(`No active heartbeat found: ${command.jobId}`);
+				}
+				return success(command.id, "heartbeat_manage", { heartbeat });
 			}
 
 			case "cron_add": {
@@ -4022,6 +4058,12 @@ export class AgentDaemon {
 					sequencedMessage.type === "session_replaced" ? "replacement" : "resync",
 				);
 			}
+		}
+	}
+
+	private broadcastGlobal(message: DaemonOutbound): void {
+		for (const client of this.clients) {
+			this.write(client, message);
 		}
 	}
 

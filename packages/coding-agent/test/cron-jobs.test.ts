@@ -6,7 +6,6 @@ import {
 	type AgentCronJob,
 	AgentCronJobStore,
 	AgentCronScheduler,
-	createAgentHeartbeatToolDefinitions,
 	migrateLegacyCronJobsToSessionArtifacts,
 	normalizeHeartbeatDeliveryMode,
 	parseAgentCronSchedule,
@@ -1396,45 +1395,6 @@ describe("heartbeat delivery mode", () => {
 		expect(resolveHeartbeatStreamingBehavior(undefined)).toBe("steer");
 		expect(resolveHeartbeatStreamingBehavior("steer")).toBe("steer");
 		expect(resolveHeartbeatStreamingBehavior("follow_up")).toBe("followUp");
-	});
-});
-
-describe("createAgentHeartbeatToolDefinitions", () => {
-	it("exposes only read-only user heartbeat inspection to the model", () => {
-		const tools = createAgentHeartbeatToolDefinitions({
-			getHeartbeat: () => undefined,
-		});
-
-		expect(tools.map((tool) => tool.name)).toEqual(["get_heartbeat"]);
-	});
-
-	it("lets the model inspect heartbeat state without mutating it", async () => {
-		const tools = createAgentHeartbeatToolDefinitions({
-			getHeartbeat: () =>
-				({
-					id: "job-1",
-					status: "active",
-					source: "heartbeat",
-					activeSessionId: "active-1",
-					sessionId: "session-1",
-					sessionFile: "/tmp/session.jsonl",
-					cwd: "/tmp/project",
-					prompt: "check on me",
-					schedule: { kind: "interval", expression: "every 30s", intervalMs: 30_000 },
-					createdAt: start.toISOString(),
-					updatedAt: start.toISOString(),
-					nextRunAt: "2026-01-01T12:34:30.000Z",
-					runCount: 0,
-				}) as const,
-		});
-
-		const getResult = await tools
-			.find((candidate) => candidate.name === "get_heartbeat")!
-			.execute("tool-1", {}, undefined, undefined, {} as never);
-
-		expect(getResult.details).toMatchObject({ id: "job-1", status: "active" });
-		expect(tools.find((candidate) => candidate.name === "create_heartbeat")).toBeUndefined();
-		expect(tools.find((candidate) => candidate.name === "update_heartbeat")).toBeUndefined();
 	});
 });
 
