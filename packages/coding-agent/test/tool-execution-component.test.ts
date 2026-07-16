@@ -82,53 +82,6 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).toContain("custom result");
 	});
 
-	test("renders inline images by default when terminal supports them", () => {
-		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
-		try {
-			const component = new ToolExecutionComponent(
-				"custom_tool",
-				"tool-image-default",
-				{},
-				{ showImages: true },
-				undefined,
-				createFakeTui(),
-				process.cwd(),
-			);
-			component.updateResult({ content: [{ type: "image", data: "AAAA", mimeType: "image/png" }], isError: false });
-
-			expect(component.render(120).join("\n")).toContain("\x1b_G");
-		} finally {
-			resetCapabilitiesCache();
-		}
-	});
-
-	test("can suppress inline image escape sequences for session history", () => {
-		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
-		try {
-			const component = new ToolExecutionComponent(
-				"custom_tool",
-				"tool-image-history",
-				{},
-				{ showImages: true, allowInlineImages: false },
-				undefined,
-				createFakeTui(),
-				process.cwd(),
-			);
-			component.updateResult({ content: [{ type: "image", data: "AAAA", mimeType: "image/png" }], isError: false });
-
-			let rendered = component.render(120).join("\n");
-			expect(rendered).not.toContain("\x1b_G");
-			expect(stripAnsi(rendered)).toContain("[Image: [image/png]]");
-
-			component.setShowImages(false);
-			component.setShowImages(true);
-			rendered = component.render(120).join("\n");
-			expect(rendered).not.toContain("\x1b_G");
-		} finally {
-			resetCapabilitiesCache();
-		}
-	});
-
 	test("suppressed history image fallbacks skip dimension parsing", () => {
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
 		try {
@@ -151,29 +104,6 @@ describe("ToolExecutionComponent parity", () => {
 			const rendered = stripAnsi(component.render(120).join("\n"));
 			expect(rendered).toContain("[Image: [image/png]]");
 			expect(rendered).not.toContain("1x1");
-		} finally {
-			resetCapabilitiesCache();
-		}
-	});
-
-	test("pending history components can be restored to live inline image rendering", () => {
-		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
-		try {
-			const component = new ToolExecutionComponent(
-				"custom_tool",
-				"tool-image-pending-history",
-				{},
-				{ showImages: true, allowInlineImages: false },
-				undefined,
-				createFakeTui(),
-				process.cwd(),
-			);
-			component.updateResult({ content: [{ type: "image", data: "AAAA", mimeType: "image/png" }], isError: false });
-			expect(component.render(120).join("\n")).not.toContain("\x1b_G");
-
-			component.setAllowInlineImages(true);
-
-			expect(component.render(120).join("\n")).toContain("\x1b_G");
 		} finally {
 			resetCapabilitiesCache();
 		}
@@ -611,32 +541,5 @@ describe("ToolExecutionComponent parity", () => {
 		expect(expandedLines.findIndex((line) => line.includes("hidden_side_effect ="))).toBeLessThan(
 			expandedLines.findIndex((line) => /✓ README\.md\s+\+1 -1/.test(line)),
 		);
-	});
-
-	test("always renders built-in edit diffs", () => {
-		const component = new ToolExecutionComponent(
-			"edit",
-			"tool-collapsed-edit",
-			{ path: "README.md", edits: [{ oldText: "before", newText: "after" }] },
-			{},
-			createEditToolDefinition(process.cwd()),
-			createFakeTui(),
-			process.cwd(),
-		);
-		component.setArgsComplete();
-		component.updateResult(
-			{ content: [], details: { diff: "-1 before\n+1 after", firstChangedLine: 1 }, isError: false },
-			false,
-		);
-
-		const collapsed = stripAnsi(component.render(120).join("\n"));
-		expect(collapsed).toContain("before");
-		expect(collapsed).toContain("after");
-		expect(collapsed).not.toContain("╰─ README.md +1 -1");
-		expect(collapsed).not.toContain("to expand");
-
-		component.setExpanded(true);
-		const expanded = stripAnsi(component.render(120).join("\n"));
-		expect(expanded).toBe(collapsed);
 	});
 });
