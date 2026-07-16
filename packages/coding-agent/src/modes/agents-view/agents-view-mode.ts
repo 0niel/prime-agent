@@ -57,6 +57,7 @@ import { SessionPickerScreen } from "../interactive/components/session-picker-sc
 import { type SessionListCallbacks, SessionSelectorComponent } from "../interactive/components/session-selector.js";
 import { BrandSplashHeader, InteractiveMode } from "../interactive/interactive-mode.js";
 import type { InteractiveModeUiServices } from "../interactive/interactive-mode-services.js";
+import { ClientPromptStashStore } from "../interactive/prompt-stash-state.js";
 import {
 	getEditorTheme,
 	initTheme,
@@ -123,6 +124,7 @@ export interface AgentsViewModeOptions {
 	verbose?: boolean;
 	recoverDaemon?: () => Promise<void>;
 	reconnectTimeoutMs?: number;
+	promptStashStore?: ClientPromptStashStore;
 }
 
 type AgentsViewRunResult =
@@ -347,6 +349,7 @@ function isUnknownActiveSessionError(error: unknown): boolean {
 
 export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise<void> {
 	const persistentState: AgentsViewPersistentState = {};
+	const promptStashStore = options.promptStashStore ?? new ClientPromptStashStore();
 
 	while (true) {
 		const view = new AgentsViewMode(options, persistentState);
@@ -376,6 +379,8 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 			const interactiveMode = new InteractiveMode({
 				agentConnection: opened.connection,
 				uiServices,
+				promptStashStore,
+				promptStashSessionId: opened.summary.sessionId,
 				bindLocalSessionExtensions: false,
 				migratedProviders: options.migratedProviders,
 				modelFallbackMessage: resolveAttachModelFallbackMessage(opened.summary, options.modelFallbackMessage),

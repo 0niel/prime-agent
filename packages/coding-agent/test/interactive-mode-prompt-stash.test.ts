@@ -1,6 +1,8 @@
+import type { ImageContent } from "@earendil-works/pi-ai";
 import { describe, expect, it, type Mock, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
+import { ClientPromptStashStore, type PromptStashState } from "../src/modes/interactive/prompt-stash-state.js";
 
 type FakePasteSnapshot = {
 	pastes: readonly (readonly [number, string])[];
@@ -11,6 +13,7 @@ type PromptStash = {
 	text: string;
 	expandedText?: string;
 	pasteSnapshot?: FakePasteSnapshot;
+	images?: readonly (readonly [number, ImageContent])[];
 };
 
 type FakeEditor = {
@@ -40,6 +43,14 @@ type PromptStashHarness = {
 type PromptStashLiveMarkerHarness = PromptStashHarness & {
 	compactionQueuedMessages: Array<{ text: string; mode: "steer" | "followUp" }>;
 	connectionQueue: { steering: string[]; followUp: string[] };
+};
+
+type SharedPromptStashHarness = PromptStashHarness & {
+	promptStashStore: ClientPromptStashStore;
+	promptStashSessionId: string;
+	promptStashState: PromptStashState;
+	pastedImages: Map<number, ImageContent>;
+	nextImageMarkerId: number;
 };
 
 type ResetHarness = PromptStashLiveMarkerHarness & {
@@ -77,8 +88,10 @@ type SubmitHarness = PromptStashHarness & {
 };
 
 type PromptStashMethods = {
+	bindPromptStashSession: (this: SharedPromptStashHarness, sessionId: string) => void;
 	handleFollowUp: (this: SubmitHarness) => Promise<void>;
 	handlePromptStash: (this: PromptStashHarness) => void;
+	hydratePromptStash: (this: SharedPromptStashHarness) => void;
 	resetCurrentSessionRenderState: (this: ResetHarness, options?: { clearPromptStash?: boolean }) => void;
 	restorePromptStashIfEditorEmpty: (this: PromptStashHarness, stash?: PromptStash) => boolean;
 	liveImageMarkerIds: (this: PromptStashLiveMarkerHarness) => Set<number>;
@@ -140,11 +153,93 @@ function createPromptStashHarness(
 	return harness;
 }
 
+function createSharedPromptStashHarness(
+	store: ClientPromptStashStore,
+	sessionId: string,
+	options: {
+		text?: string;
+		expandedText?: string;
+		pasteSnapshot?: FakePasteSnapshot;
+		pastedImages?: readonly (readonly [number, ImageContent])[];
+	} = {},
+): SharedPromptStashHarness {
+	const harness = {
+		promptStashStore: store,
+		promptStashSessionId: sessionId,
+		promptStashState: store.forSession(sessionId),
+		editor: createEditor(options),
+		showStatus: vi.fn(),
+		clearShortcutGuide: vi.fn(),
+		pastedImages: new Map(options.pastedImages),
+		nextImageMarkerId: 1,
+	} as SharedPromptStashHarness;
+	Object.setPrototypeOf(harness, InteractiveMode.prototype);
+	return harness;
+}
+
 describe("InteractiveMode prompt stash", () => {
 	it("uses Ctrl+S as the default configurable stash keybinding", () => {
 		const keybindings = new KeybindingsManager();
 
 		expect(keybindings.getKeys("app.prompt.stash")).toEqual(["ctrl+s"]);
+	});
+
+	it("isolates stashes for separate TUI clients attached to the same session", () => {
+		const firstClient = new ClientPromptStashStore();
+		const secondClient = new ClientPromptStashStore();
+		const firstState = firstClient.forSession("shared-session");
+		firstState.stash = { text: "first client draft" };
+
+		expect(firstClient.forSession("shared-session")).toBe(firstState);
+		expect(secondClient.forSession("shared-session").stash).toBeUndefined();
+
+		const emptyState = firstClient.forSession("empty-session");
+		firstClient.release("empty-session", emptyState);
+		expect(firstClient.forSession("empty-session")).not.toBe(emptyState);
+	});
+
+	it("restores a session stash after recreating its interactive mode", () => {
+		const store = new ClientPromptStashStore();
+		const pasteSnapshot: FakePasteSnapshot = {
+			pastes: [[1, "line one\nline two"]],
+			pasteCounter: 1,
+		};
+		const image: ImageContent = { type: "image", data: "aW1hZ2U=", mimeType: "image/png" };
+		const firstMode = createSharedPromptStashHarness(store, "session-a", {
+			text: "draft [image #7] [paste #1 +2 lines]",
+			expandedText: "draft [image #7] line one\nline two",
+			pasteSnapshot,
+			pastedImages: [[7, image]],
+		});
+
+		interactiveModeMethods.handlePromptStash.call(firstMode);
+
+		const reopenedMode = createSharedPromptStashHarness(store, "session-a");
+		interactiveModeMethods.hydratePromptStash.call(reopenedMode);
+
+		expect(reopenedMode.promptStash?.text).toBe("draft [image #7] [paste #1 +2 lines]");
+		expect(reopenedMode.pastedImages.get(7)).toBe(image);
+		expect(reopenedMode.nextImageMarkerId).toBe(8);
+
+		interactiveModeMethods.restorePromptStashIfEditorEmpty.call(reopenedMode);
+
+		expect(reopenedMode.editor.getText()).toBe("draft [image #7] [paste #1 +2 lines]");
+		expect(reopenedMode.editor.restoredPasteSnapshot).toBe(pasteSnapshot);
+		expect(reopenedMode.promptStashState.stash).toBeUndefined();
+	});
+
+	it("rebinds prompt stash state when the connected session changes", () => {
+		const store = new ClientPromptStashStore();
+		const firstState = store.forSession("session-a");
+		const secondState = store.forSession("session-b");
+		firstState.stash = { text: "session a draft" };
+		secondState.stash = { text: "session b draft" };
+		const mode = createSharedPromptStashHarness(store, "session-a");
+
+		interactiveModeMethods.bindPromptStashSession.call(mode, "session-b");
+
+		expect(mode.promptStash?.text).toBe("session b draft");
+		expect(firstState.stash?.text).toBe("session a draft");
 	});
 
 	it("stashes editor text without expanding paste markers", () => {
@@ -374,7 +469,7 @@ describe("InteractiveMode prompt stash", () => {
 		expect(mode.pastedImages.has(2)).toBe(false);
 	});
 
-	it("clears stashed prompt state on external session replacement resets", () => {
+	it("clears stashed prompt state when explicitly requested", () => {
 		const base = createPromptStashHarness({ stash: "drop [image #1]" });
 		const mode: ResetHarness = {
 			...base,

@@ -75,6 +75,7 @@ import {
 } from "./modes/daemon/daemon-worker-protocol.js";
 import {
 	type AgentConnection,
+	ClientPromptStashStore,
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServicesFromServices,
 	DaemonAgentConnection,
@@ -1334,6 +1335,7 @@ export async function main(args: string[], options?: MainOptions) {
 			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Ctrl+P to cycle)")}`));
 		}
 
+		const promptStashStore = new ClientPromptStashStore();
 		const daemonUiServices = createInteractiveModeUiServicesFromServices({
 			services,
 			sessionManager,
@@ -1365,6 +1367,7 @@ export async function main(args: string[], options?: MainOptions) {
 				},
 				migratedProviders,
 				modelFallbackMessage: startupModel.modelFallbackMessage,
+				promptStashStore,
 				startupModelId: startupModel.model?.id,
 				...(includeInitialPrompts ? { initialMessage, initialImages, initialMessages: parsed.messages } : {}),
 				verbose: parsed.verbose,
@@ -1413,6 +1416,8 @@ export async function main(args: string[], options?: MainOptions) {
 		const interactiveMode = new InteractiveMode({
 			agentConnection,
 			uiServices: daemonUiServices,
+			promptStashStore,
+			promptStashSessionId: summary.sessionId,
 			bindLocalSessionExtensions: false,
 			migratedProviders,
 			modelFallbackMessage: attachModelFallbackMessage,
@@ -1521,6 +1526,8 @@ export async function main(args: string[], options?: MainOptions) {
 		const interactiveMode = new InteractiveMode({
 			agentConnection: new InProcessAgentConnection(runtime),
 			localSessionHost: createInteractiveModeLocalSessionHost(runtime),
+			promptStashStore: new ClientPromptStashStore(),
+			promptStashSessionId: session.sessionId,
 			bindLocalSessionExtensions: true,
 			migratedProviders,
 			modelFallbackMessage,

@@ -751,7 +751,7 @@ describe("InteractiveMode connection events", () => {
 		expect(resetRenderOrder).toBeLessThan(rebindOrder);
 		expect(rebindOrder).toBeLessThan(renderMessagesOrder);
 		expect(fakeThis.applyConnectionStateSnapshot).toHaveBeenCalledWith(state);
-		expect(fakeThis.resetCurrentSessionRenderState).toHaveBeenCalledWith({ clearPromptStash: true });
+		expect(fakeThis.resetCurrentSessionRenderState).toHaveBeenCalledWith();
 		expect(fakeThis.rebindCurrentSession).toHaveBeenCalledWith();
 		expect(fakeThis.renderInitialMessages).toHaveBeenCalledWith();
 		expect(fakeThis.ui.requestRender).toHaveBeenCalledWith();

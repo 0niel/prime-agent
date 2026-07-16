@@ -76,6 +76,11 @@ export {
 	type InteractiveModeLocalSessionHost,
 	type InteractiveModeUiServices,
 } from "./interactive/interactive-mode-services.js";
+export {
+	ClientPromptStashStore,
+	type PromptStash,
+	type PromptStashState,
+} from "./interactive/prompt-stash-state.js";
 export { type PrintModeOptions, runPrintMode } from "./print-mode.js";
 export { type ModelInfo, RpcClient, type RpcClientOptions, type RpcEventListener } from "./rpc/rpc-client.js";
 export { runRpcMode } from "./rpc/rpc-mode.js";
