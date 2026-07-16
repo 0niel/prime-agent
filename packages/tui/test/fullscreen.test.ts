@@ -159,10 +159,10 @@ describe("TUI fullscreen mode", () => {
 		}
 	});
 
-	it("uses the placeholder for Ghostty images while fullscreen history is scrolled", async () => {
+	it("keeps complete Ghostty images rendered while fullscreen history is scrolled", async () => {
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" });
 		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 58, moveCursor: false });
-		const { terminal, tui, chat, dock } = setup([...lines(11), image, "", "after", "tail"], 80, 8);
+		const { terminal, tui, chat, dock } = setup([...lines(10), image, "", "after", "tail", "tail 2"], 80, 8);
 		try {
 			tui.enterFullscreen({ scroll: [chat], dock });
 			await terminal.waitForRender();
@@ -174,8 +174,61 @@ describe("TUI fullscreen mode", () => {
 
 			const writes = terminal.getWrites();
 			assert.ok(writes.includes(deleteKittyImage(58)), "scrolling should delete the old visible image placement");
-			assert.ok(!writes.includes(image), "scrolled history should not re-emit the image");
-			assert.ok(writes.includes("view in inline mode"), "scrolled history should use the placeholder");
+			assert.ok(writes.includes(image), "complete image should be re-emitted in scrolled history");
+			assert.ok(!writes.includes("view in inline mode"), "complete scrolled image should not use the placeholder");
+		} finally {
+			tui.stop();
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("uses the placeholder for clipped Ghostty images while fullscreen history is scrolled", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" });
+		const image = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 61, moveCursor: false });
+		const { terminal, tui, chat, dock } = setup([...lines(11), image, "", "after", "tail"], 80, 8);
+		try {
+			tui.enterFullscreen({ scroll: [chat], dock });
+			await terminal.waitForRender();
+			assert.ok(terminal.getWrites().includes(image), "image is rendered while following");
+			terminal.clearWrites();
+
+			terminal.sendInput(WHEEL_UP);
+			await terminal.waitForRender();
+
+			const writes = terminal.getWrites();
+			assert.ok(writes.includes(deleteKittyImage(61)), "scrolling should delete the old visible image placement");
+			assert.ok(!writes.includes(image), "clipped scrolled image should not be re-emitted");
+			assert.ok(writes.includes("view in inline mode"), "clipped scrolled image should use the placeholder");
+		} finally {
+			tui.stop();
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("deletes old fullscreen image placements before drawing moved and sequential Ghostty images", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true, imagePlacement: "first-row" });
+		const firstImage = encodeKitty("AAAA", { columns: 2, rows: 2, imageId: 59, moveCursor: false });
+		const secondImage = encodeKitty("BBBB", { columns: 2, rows: 2, imageId: 60, moveCursor: false });
+		const { terminal, tui, chat, dock } = setup(["lead", firstImage, "", "after first", "gap", "tail"], 80, 10);
+		try {
+			tui.enterFullscreen({ scroll: [chat], dock });
+			await terminal.waitForRender();
+			assert.ok(terminal.getWrites().includes(firstImage), "initial image is rendered while following");
+			terminal.clearWrites();
+
+			chat.lines = [...chat.lines, secondImage, "", "after second"];
+			tui.requestRender();
+			await terminal.waitForRender();
+
+			const writes = terminal.getWrites();
+			const deleteIndex = writes.indexOf(deleteKittyImage(59));
+			const firstDrawIndex = writes.indexOf(firstImage);
+			const secondDrawIndex = writes.indexOf(secondImage);
+			assert.ok(deleteIndex >= 0, "old first image placement should be deleted when it moves");
+			assert.ok(firstDrawIndex >= 0, "moved first image should be redrawn");
+			assert.ok(secondDrawIndex >= 0, "sequential second image should be drawn");
+			assert.ok(deleteIndex < firstDrawIndex, "delete must happen before moved first image is redrawn");
+			assert.ok(deleteIndex < secondDrawIndex, "delete must happen before later sequential images are drawn");
 		} finally {
 			tui.stop();
 			resetCapabilitiesCache();

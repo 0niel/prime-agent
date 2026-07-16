@@ -61,9 +61,7 @@ function kittyImageIds(line: string): number[] {
 	return ids;
 }
 
-function canRenderImageInFullscreen(window: readonly string[], index: number, following: boolean): boolean {
-	if (!following) return false;
-
+function canRenderImageInFullscreen(window: readonly string[], index: number): boolean {
 	const caps = getCapabilities();
 	if (caps.images !== "kitty" || caps.imagePlacement !== "first-row") return false;
 
@@ -155,7 +153,7 @@ export class FullscreenViewport {
 
 		const window = transcript.slice(this.scrollTop, this.scrollTop + windowHeight);
 		for (let i = 0; i < window.length; i++) {
-			if (isImageLine(window[i]) && !canRenderImageInFullscreen(window, i, this.following)) {
+			if (isImageLine(window[i]) && !canRenderImageInFullscreen(window, i)) {
 				window[i] = IMAGE_PLACEHOLDER;
 			}
 		}
@@ -511,19 +509,21 @@ export class FullscreenViewport {
 		}
 
 		let buffer = "\x1b[?2026h";
+		const imageDeletes: string[] = [];
 		const deletedImageIds = new Set<number>();
-		const deleteImagesInLine = (line: string | undefined): void => {
+		const queueImageDeletesInLine = (line: string | undefined): void => {
 			if (line === undefined) return;
 			for (const id of kittyImageIds(line)) {
 				if (deletedImageIds.has(id)) continue;
 				deletedImageIds.add(id);
-				buffer += deleteKittyImage(id);
+				imageDeletes.push(deleteKittyImage(id));
 			}
 		};
 
+		const changedRows: number[] = [];
 		if (width !== this.prevWidth || height !== this.prevHeight || this.prevFrame.length === 0) {
 			for (const line of this.prevFrame) {
-				deleteImagesInLine(line);
+				queueImageDeletesInLine(line);
 			}
 			buffer += "\x1b[2J\x1b[H";
 			this.prevFrame = [];
@@ -531,7 +531,12 @@ export class FullscreenViewport {
 		for (let row = 0; row < height; row++) {
 			const line = frame[row] ?? "";
 			if (this.prevFrame[row] === line) continue;
-			deleteImagesInLine(this.prevFrame[row]);
+			queueImageDeletesInLine(this.prevFrame[row]);
+			changedRows.push(row);
+		}
+		buffer += imageDeletes.join("");
+		for (const row of changedRows) {
+			const line = frame[row] ?? "";
 			buffer += `\x1b[${row + 1};1H\x1b[2K`;
 			// an overwide line would wrap and shear the grid; clamp instead of crash
 			buffer += visibleWidth(line) > width ? sliceByColumn(line, 0, width, true) : line;
