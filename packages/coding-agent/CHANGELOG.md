@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added `@` file-path autocomplete to new-agent and reply prompts in the Agents View.
+
 ## [0.3.1] - 2026-07-15
 
 - Added `/fast` for OpenAI Fast mode on supported ChatGPT models ([ENG-4620](https://linear.app/primeintellect/issue/ENG-4620/add-support-for-gpt-fast-mode-maybe-fast)).

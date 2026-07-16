@@ -22,6 +22,7 @@ import type { ModelRegistry } from "../../core/model-registry.js";
 import { findExactModelReferenceMatch } from "../../core/model-resolver.js";
 import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { SessionManager } from "../../core/session-manager.js";
+import { ensureTool } from "../../utils/tools-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
@@ -451,6 +452,7 @@ class AgentsViewMode implements Component, Focusable {
 	private pendingKillSubagent: PendingKillSubagent | undefined;
 	private renameTarget: { activeSessionId: string; identity: string } | undefined;
 	private readonly inactiveAgentIdentities = new Set<string>();
+	private fdPath: string | undefined;
 	private statusMessage: string | undefined;
 	private statusMessageTone: "muted" | "error" | "warning" = "muted";
 	private statusMessageSticky = false;
@@ -520,6 +522,8 @@ class AgentsViewMode implements Component, Focusable {
 		this.client = new DaemonClient(this.options.socketPath);
 		await this.client.connect();
 		this.subscribeToClientClose(this.client);
+		this.fdPath = await ensureTool("fd");
+		this.editor.setAutocompleteProvider(this.createAutocompleteProvider());
 
 		this.ui.addChild(this);
 		this.ui.setFocus(this);
@@ -1275,17 +1279,13 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	private createAutocompleteProvider(): CombinedAutocompleteProvider {
-		const commands: SlashCommand[] = AGENTS_VIEW_SLASH_COMMANDS.map((command) => ({
-			name: command.name,
-			description: command.description,
-			...(command.argumentHint ? { argumentHint: command.argumentHint } : {}),
-		}));
-		const modelCommand = commands.find((command) => command.name === "model");
-		if (modelCommand) {
-			modelCommand.getArgumentCompletions = (prefix: string) =>
-				getAgentsViewModelArgumentCompletions(prefix, this.options.uiServices.modelRegistry);
-		}
-		return new CombinedAutocompleteProvider(commands, this.options.uiServices.getInitialCwd(), null);
+		const cwd = resolveAgentsViewAutocompleteCwd(
+			this.options.uiServices.getInitialCwd(),
+			this.replyActiveSessionId ? this.findSummaryByActiveSessionId(this.replyActiveSessionId) : undefined,
+		);
+		return createAgentsViewAutocompleteProvider(cwd, this.fdPath, (prefix) =>
+			getAgentsViewModelArgumentCompletions(prefix, this.options.uiServices.modelRegistry),
+		);
 	}
 
 	private openSelected(): void {
@@ -1471,6 +1471,7 @@ class AgentsViewMode implements Component, Focusable {
 		// Captured once on entry so the header does not count up while reply mode stays open.
 		this.replyHeaderTime = activeSessionId ? this.getReplyHeaderTime(activeSessionId) : "";
 		this.editor.setPlaceholder(activeSessionId ? REPLY_PROMPT_FALLBACK_PLACEHOLDER : DEFAULT_PROMPT_PLACEHOLDER);
+		this.editor.setAutocompleteProvider(this.createAutocompleteProvider());
 		this.ui.requestRender();
 	}
 
@@ -2331,6 +2332,28 @@ function rowHasSpawnCode(row: AgentsViewRow): boolean {
 
 function isRunningSessionSummary(summary: SessionSummary): boolean {
 	return summary.activity === "working";
+}
+
+export function resolveAgentsViewAutocompleteCwd(initialCwd: string, replyTarget?: SessionSummary): string {
+	const replyCwd = replyTarget?.cwd;
+	return replyCwd && existsSync(replyCwd) ? replyCwd : initialCwd;
+}
+
+export function createAgentsViewAutocompleteProvider(
+	cwd: string,
+	fdPath: string | undefined,
+	getModelArgumentCompletions: NonNullable<SlashCommand["getArgumentCompletions"]>,
+): CombinedAutocompleteProvider {
+	const commands: SlashCommand[] = AGENTS_VIEW_SLASH_COMMANDS.map((command) => ({
+		name: command.name,
+		description: command.description,
+		...(command.argumentHint ? { argumentHint: command.argumentHint } : {}),
+	}));
+	const modelCommand = commands.find((command) => command.name === "model");
+	if (modelCommand) {
+		modelCommand.getArgumentCompletions = getModelArgumentCompletions;
+	}
+	return new CombinedAutocompleteProvider(commands, cwd, fdPath ?? null);
 }
 
 export function createAgentsViewSessionName(text: string): string {

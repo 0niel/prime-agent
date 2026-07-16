@@ -1,12 +1,14 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntimeConfig } from "../src/core/agent-session-config.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import type { SessionInfo } from "../src/core/session-manager.js";
 import type { SettingsManager } from "../src/core/settings-manager.js";
 import {
+	createAgentsViewAutocompleteProvider,
 	createAgentsViewListCommand,
 	createAgentsViewReplyHeadline,
 	createAgentsViewResumeConfig,
@@ -14,6 +16,7 @@ import {
 	formatAgentsViewRelativeTime,
 	formatAgentsViewStatusLine,
 	resolveAgentsViewActiveSummaryForPath,
+	resolveAgentsViewAutocompleteCwd,
 	resolveAgentsViewOpenCwd,
 	resolveAgentsViewResumeSummary,
 	resolveAgentsViewSessionUiServices,
@@ -512,6 +515,58 @@ describe("agents view state", () => {
 
 	test("requests only daemon-resident sessions for the agents view refresh", () => {
 		expect(createAgentsViewListCommand()).toEqual({ type: "list" });
+	});
+
+	test("uses the active-chat file autocomplete for new-agent prompts", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "agents-view-autocomplete-"));
+		const fdPath = join(dir, "fd");
+		writeFileSync(
+			fdPath,
+			`#!/bin/sh
+printf 'src/referenced.ts\n'
+`,
+		);
+		chmodSync(fdPath, 0o755);
+
+		try {
+			const provider = createAgentsViewAutocompleteProvider(dir, fdPath, () => []);
+			const suggestions = await provider.getSuggestions(["review @refer"], 0, 13, {
+				signal: new AbortController().signal,
+			});
+
+			expect(suggestions).toEqual({
+				prefix: "@refer",
+				items: [{ value: "@src/referenced.ts", label: "referenced.ts", description: "src/referenced.ts" }],
+				kind: "file",
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("uses the reply target cwd for file autocomplete", () => {
+		const missing = mkdtempSync(join(tmpdir(), "agents-view-autocomplete-missing-"));
+		rmSync(missing, { recursive: true, force: true });
+
+		expect(resolveAgentsViewAutocompleteCwd("/launch", makeSummary({ cwd: tmpdir() }))).toBe(tmpdir());
+		expect(resolveAgentsViewAutocompleteCwd("/launch")).toBe("/launch");
+		expect(resolveAgentsViewAutocompleteCwd("/launch", makeSummary({ cwd: missing }))).toBe("/launch");
+		expect(resolveAgentsViewAutocompleteCwd("/launch", makeSummary({ cwd: "" }))).toBe("/launch");
+	});
+
+	test("reads current models for each autocomplete request", async () => {
+		let completions: AutocompleteItem[] | null = null;
+		const provider = createAgentsViewAutocompleteProvider("/tmp", undefined, () => completions);
+
+		expect(
+			await provider.getSuggestions(["/model fresh"], 0, 12, { signal: new AbortController().signal }),
+		).toBeNull();
+
+		completions = [{ value: "test-provider/fresh-model", label: "fresh-model", description: "test-provider" }];
+		expect(await provider.getSuggestions(["/model fresh"], 0, 12, { signal: new AbortController().signal })).toEqual({
+			prefix: "fresh",
+			items: [{ value: "test-provider/fresh-model", label: "fresh-model", description: "test-provider" }],
+		});
 	});
 
 	test("creates an inactive summary for a saved session selected from resume", () => {
