@@ -4236,7 +4236,7 @@ describe("daemon mode helpers", () => {
 
 		await internals.runCronJob(makeCronJob({ id: "cron-1", source: "cron", activeSessionId: state.activeSessionId }));
 
-		expect(followUp).toHaveBeenCalledWith("heartbeat prompt");
+		expect(followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, { resumeIfIdle: true });
 		expect(prompt).not.toHaveBeenCalled();
 	});
 
@@ -4313,7 +4313,7 @@ describe("daemon mode helpers", () => {
 			makeCronJob({ id: "cron-1", source: "cron", activeSessionId: state.activeSessionId }),
 		);
 
-		expect(followUp).toHaveBeenCalledWith("heartbeat prompt");
+		expect(followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, { resumeIfIdle: true });
 		expect(prompt).not.toHaveBeenCalled();
 	});
 
@@ -4343,7 +4343,7 @@ describe("daemon mode helpers", () => {
 			makeCronJob({ id: "cron-1", source: "cron", activeSessionId: state.activeSessionId }),
 		);
 
-		expect(followUp).toHaveBeenCalledWith("heartbeat prompt");
+		expect(followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, { resumeIfIdle: true });
 		expect(prompt).not.toHaveBeenCalled();
 	});
 
@@ -4609,6 +4609,7 @@ describe("daemon mode helpers", () => {
 		expect(steer).toHaveBeenCalledWith("queued heartbeat", undefined, {
 			queueKey: "heartbeat:job-1",
 			agentMessageId: "agentmsg_steer",
+			resumeIfIdle: true,
 		});
 		expect(restoreSteeringMessage).not.toHaveBeenCalled();
 	});

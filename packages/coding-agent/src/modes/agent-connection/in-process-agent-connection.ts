@@ -262,11 +262,11 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.session.steer(message, images);
+		await this.session.steer(message, images, { resumeIfIdle: true });
 	}
 
 	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.session.followUp(message, images);
+		await this.session.followUp(message, images, { resumeIfIdle: true });
 	}
 
 	async abort(): Promise<void> {

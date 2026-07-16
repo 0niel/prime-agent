@@ -401,12 +401,12 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			}
 
 			case "steer": {
-				await session.steer(command.message, command.images);
+				await session.steer(command.message, command.images, { resumeIfIdle: true });
 				return success(id, "steer");
 			}
 
 			case "follow_up": {
-				await session.followUp(command.message, command.images);
+				await session.followUp(command.message, command.images, { resumeIfIdle: true });
 				return success(id, "follow_up");
 			}
 
