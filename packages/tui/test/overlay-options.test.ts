@@ -535,6 +535,39 @@ describe("TUI overlay options", () => {
 			tui.stop();
 		});
 
+		it("applies vertical offsets to marker-anchored overlays", async () => {
+			const terminal = new VirtualTerminal(20, 8);
+			const tui = new TUI(terminal);
+			const marker = "\x1b_pi:offset-overlay\x07";
+			const content = new StaticOverlay([
+				"transcript 1",
+				"transcript 2",
+				"transcript 3",
+				"underlay 1",
+				"prompt edge",
+				`${marker}input`,
+				"footer 1",
+				"footer 2",
+			]);
+
+			tui.addChild(content);
+			tui.showOverlay(new StaticOverlay(["suggestion", "description"]), {
+				width: "100%",
+				aboveMarker: marker,
+				offsetY: -1,
+				nonCapturing: true,
+			});
+			tui.start();
+			await renderAndFlush(tui, terminal);
+
+			const viewport = terminal.getViewport();
+			assert.equal(viewport[2]?.trimEnd(), "suggestion");
+			assert.equal(viewport[3]?.trimEnd(), "description");
+			assert.equal(viewport[4], "prompt edge");
+			assert.equal(viewport[5], "input");
+			tui.stop();
+		});
+
 		it("anchors above fullscreen dock content", async () => {
 			const terminal = new VirtualTerminal(20, 8);
 			const tui = new TUI(terminal);

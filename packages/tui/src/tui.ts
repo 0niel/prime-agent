@@ -18,6 +18,7 @@ import {
 	normalizeTerminalOutput,
 	sliceByColumn,
 	sliceWithWidth,
+	stripAnsi,
 	visibleContentSpan,
 	visibleWidth,
 } from "./utils.js";
@@ -1134,7 +1135,7 @@ export class TUI extends Container {
 			col: number;
 			w: number;
 			scrollback: boolean;
-			aboveMarker?: { line: number; col: number };
+			aboveMarker?: { line: number; col: number; offsetY: number };
 		}[] = [];
 		let minLinesNeeded = result.length;
 
@@ -1143,12 +1144,16 @@ export class TUI extends Container {
 		for (const entry of visibleEntries) {
 			const { component, options } = entry;
 			const scrollback = options?.scrollback === true;
-			let aboveMarker: { line: number; col: number } | undefined;
+			let aboveMarker: { line: number; col: number; offsetY: number } | undefined;
 			if (options?.aboveMarker) {
 				for (let line = result.length - 1; line >= 0; line--) {
 					const markerIndex = result[line].indexOf(options.aboveMarker);
 					if (markerIndex === -1) continue;
-					aboveMarker = { line, col: visibleWidth(result[line].slice(0, markerIndex)) };
+					aboveMarker = {
+						line,
+						col: visibleWidth(result[line].slice(0, markerIndex)),
+						offsetY: options.offsetY ?? 0,
+					};
 					result[line] =
 						result[line].slice(0, markerIndex) + result[line].slice(markerIndex + options.aboveMarker.length);
 					break;
@@ -1194,8 +1199,14 @@ export class TUI extends Container {
 			const { component, w, scrollback, aboveMarker } = renderedOverlay;
 			let { overlayLines, row, col } = renderedOverlay;
 			if (aboveMarker) {
-				const markerRow = aboveMarker.line - viewportStart;
-				if (markerRow <= 0 || markerRow >= termHeight) continue;
+				const markerRow = Math.max(1, aboveMarker.line - viewportStart + aboveMarker.offsetY);
+				if (markerRow >= termHeight) continue;
+				while (overlayLines.length > markerRow && stripAnsi(overlayLines[0] ?? "").trim().length === 0) {
+					overlayLines = overlayLines.slice(1);
+				}
+				while (overlayLines.length > markerRow && stripAnsi(overlayLines.at(-1) ?? "").trim().length === 0) {
+					overlayLines = overlayLines.slice(0, -1);
+				}
 				if (overlayLines.length > markerRow) {
 					overlayLines = overlayLines.slice(overlayLines.length - markerRow);
 				}
