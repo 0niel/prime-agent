@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Fixed agents with heartbeat-owning subagents appearing completed and showing completion checkmarks in the Agents View.
+- Fixed the heartbeat tray and manager showing heartbeats from unrelated sessions.
 - Fixed daemon backpressure triggering redundant catch-up snapshots for events already queued by the socket.
 - Fixed incompatible daemon builds crashing startup or respawning after shutdown, with capability negotiation, verified provenance, and convergent force shutdown ([ENG-4687](https://linear.app/primeintellect/issue/ENG-4687/make-daemon-version-mismatches-self-healing)).
 - Changed tool-result and announcement images to show compact metadata instead of terminal graphics ([#437](https://github.com/PrimeIntellect-ai/prime-agent/pull/437) by [@snimu](https://github.com/snimu)).

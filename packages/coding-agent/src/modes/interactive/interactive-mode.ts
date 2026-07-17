@@ -206,6 +206,7 @@ import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
 import { FeatureHintDeck } from "./feature-hints.js";
+import { scopeHeartbeatsToSession } from "./heartbeat-scope.js";
 import { collectMarkedImages, evictImagesToBudget, formatImageMarker, imageMarkerIds } from "./image-markers.js";
 import type {
 	InteractiveModeLocalSessionHost,
@@ -339,6 +340,7 @@ function childAgentSummaryChanged(
 	const nextTokens = next.tokenCount === undefined ? undefined : formatTokenCount(next.tokenCount);
 	return (
 		previous.parentId !== next.parentId ||
+		previous.activeSessionId !== next.activeSessionId ||
 		previous.sessionName !== next.sessionName ||
 		previous.model !== next.model ||
 		previous.label !== next.label ||
@@ -830,6 +832,7 @@ export class InteractiveMode {
 	private connectionState: AgentConnectionState | undefined;
 	private connectionResourceSnapshot: AgentConnectionResourceSnapshot | undefined;
 	private sessionHasMessages = false;
+	private heartbeatCatalog: AgentConnectionHeartbeat[] = [];
 	private heartbeats: AgentConnectionHeartbeat[] = [];
 	private heartbeatRefreshPromise: Promise<void> | undefined;
 	private heartbeatRefreshRequested = false;
@@ -2363,6 +2366,22 @@ export class InteractiveMode {
 	}
 
 	private applyHeartbeatCatalog(heartbeats: AgentConnectionHeartbeat[]): void {
+		this.heartbeatCatalog = heartbeats;
+		this.updateScopedHeartbeats();
+	}
+
+	private updateScopedHeartbeats(): void {
+		const heartbeats = scopeHeartbeatsToSession(
+			this.heartbeatCatalog,
+			this.connectionState,
+			this.childAgentSnapshots.values(),
+		);
+		if (
+			heartbeats.length === this.heartbeats.length &&
+			heartbeats.every((heartbeat, index) => heartbeat === this.heartbeats[index])
+		) {
+			return;
+		}
 		this.heartbeats = heartbeats;
 		this.heartbeatManager?.setHeartbeats(heartbeats);
 		this.scheduleHeartbeatManagerRefresh();
@@ -2373,6 +2392,7 @@ export class InteractiveMode {
 	private applyConnectionStateSnapshot(state: AgentConnectionState): void {
 		this.bindPromptStashSession(state.sessionId);
 		this.connectionState = state;
+		this.updateScopedHeartbeats();
 		// Don't touch contextUsageTokenBaseline: a mid-stream snapshot reflects only completed
 		// turns (the in-flight message isn't persisted yet), so the in-flight delta must keep
 		// accumulating. The baseline is managed at turn end (refreshConnectionContextUsage) and
@@ -5261,6 +5281,7 @@ export class InteractiveMode {
 	private refreshChildAgentInspector(): void {
 		this.childAgentNodes = this.buildChildAgentInspectorNodes();
 		this.childAgentSummary.setNodes(this.childAgentNodes);
+		this.updateScopedHeartbeats();
 		this.updateWorkingPulse();
 		this.syncWorkingLoader();
 		this.updateWorkingLoaderMessage();
@@ -5297,6 +5318,7 @@ export class InteractiveMode {
 		this.childAgentSnapshots.clear();
 		this.childAgentNodes = [];
 		this.childAgentSummary.setNodes([]);
+		this.updateScopedHeartbeats();
 		this.childAgentSummary.setHidden(false);
 		this.childAgentDetail.setNode(undefined);
 		this.childAgentDetailNodeId = undefined;
@@ -8911,7 +8933,7 @@ export class InteractiveMode {
 		if (updated.source === "heartbeat" && updated.activeSessionId === this.connectionState?.activeSessionId) {
 			this.patchConnectionState({ heartbeat: action === "stop" ? null : updated });
 		}
-		const remaining = this.heartbeats.filter((entry) => entry.job.id !== updated.id);
+		const remaining = this.heartbeatCatalog.filter((entry) => entry.job.id !== updated.id);
 		this.applyHeartbeatCatalog(
 			updated.status === "active" || updated.status === "paused"
 				? [...remaining, { ...heartbeat, job: updated }]
