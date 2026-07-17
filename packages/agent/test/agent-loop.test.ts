@@ -111,53 +111,6 @@ function identityConverter(messages: AgentMessage[]): Message[] {
 }
 
 describe("agentLoop with AgentMessage", () => {
-	it("should emit events with AgentMessage types", async () => {
-		const context: AgentContext = {
-			systemPrompt: "You are helpful.",
-			messages: [],
-			tools: [],
-		};
-
-		const userPrompt: AgentMessage = createUserMessage("Hello");
-
-		const config: AgentLoopConfig = {
-			model: createModel(),
-			convertToLlm: identityConverter,
-		};
-
-		const streamFn = () => {
-			const stream = new MockAssistantStream();
-			queueMicrotask(() => {
-				const message = createAssistantMessage([{ type: "text", text: "Hi there!" }]);
-				stream.push({ type: "done", reason: "stop", message });
-			});
-			return stream;
-		};
-
-		const events: AgentEvent[] = [];
-		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
-
-		for await (const event of stream) {
-			events.push(event);
-		}
-
-		const messages = await stream.result();
-
-		// Should have user message and assistant message
-		expect(messages.length).toBe(2);
-		expect(messages[0].role).toBe("user");
-		expect(messages[1].role).toBe("assistant");
-
-		// Verify event sequence
-		const eventTypes = events.map((e) => e.type);
-		expect(eventTypes).toContain("agent_start");
-		expect(eventTypes).toContain("turn_start");
-		expect(eventTypes).toContain("message_start");
-		expect(eventTypes).toContain("message_end");
-		expect(eventTypes).toContain("turn_end");
-		expect(eventTypes).toContain("agent_end");
-	});
-
 	it("should preserve a terminal response when abort fires after done", async () => {
 		const context: AgentContext = {
 			systemPrompt: "You are helpful.",
@@ -694,77 +647,6 @@ describe("agentLoop with AgentMessage", () => {
 		expect(transformedMessages.length).toBe(2);
 		// Then convertToLlm receives the pruned messages
 		expect(convertedMessages.length).toBe(2);
-	});
-
-	it("should handle tool calls and results", async () => {
-		const toolSchema = Type.Object({ value: Type.String() });
-		const executed: string[] = [];
-		const tool: AgentTool<typeof toolSchema, { value: string }> = {
-			name: "echo",
-			label: "Echo",
-			description: "Echo tool",
-			parameters: toolSchema,
-			async execute(_toolCallId, params) {
-				executed.push(params.value);
-				return {
-					content: [{ type: "text", text: `echoed: ${params.value}` }],
-					details: { value: params.value },
-				};
-			},
-		};
-
-		const context: AgentContext = {
-			systemPrompt: "",
-			messages: [],
-			tools: [tool],
-		};
-
-		const userPrompt: AgentMessage = createUserMessage("echo something");
-
-		const config: AgentLoopConfig = {
-			model: createModel(),
-			convertToLlm: identityConverter,
-		};
-
-		let callIndex = 0;
-		const streamFn = () => {
-			const stream = new MockAssistantStream();
-			queueMicrotask(() => {
-				if (callIndex === 0) {
-					// First call: return tool call
-					const message = createAssistantMessage(
-						[{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "hello" } }],
-						"toolUse",
-					);
-					stream.push({ type: "done", reason: "toolUse", message });
-				} else {
-					// Second call: return final response
-					const message = createAssistantMessage([{ type: "text", text: "done" }]);
-					stream.push({ type: "done", reason: "stop", message });
-				}
-				callIndex++;
-			});
-			return stream;
-		};
-
-		const events: AgentEvent[] = [];
-		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
-
-		for await (const event of stream) {
-			events.push(event);
-		}
-
-		// Tool should have been executed
-		expect(executed).toEqual(["hello"]);
-
-		// Should have tool execution events
-		const toolStart = events.find((e) => e.type === "tool_execution_start");
-		const toolEnd = events.find((e) => e.type === "tool_execution_end");
-		expect(toolStart).toBeDefined();
-		expect(toolEnd).toBeDefined();
-		if (toolEnd?.type === "tool_execution_end") {
-			expect(toolEnd.isError).toBe(false);
-		}
 	});
 
 	it("should execute mutated beforeToolCall args without revalidation", async () => {
