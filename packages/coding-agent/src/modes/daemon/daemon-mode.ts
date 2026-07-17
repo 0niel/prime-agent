@@ -985,6 +985,7 @@ export class AgentDaemon {
 		}
 		if (this.cronStore.registerSessionArtifact(session.sessionId, artifactDir)) {
 			this.cronStore.recoverSessionArtifact(session.sessionId);
+			this.cronScheduler.wake();
 		}
 	}
 
@@ -1603,9 +1604,7 @@ export class AgentDaemon {
 			if (current && this.bindingSessions.has(current.activeSessionId)) {
 				return undefined;
 			}
-			this.cronStore.cancel(dueJob.id);
-			this.cronScheduler.wake();
-			return undefined;
+			return this.restoreRlmHeartbeatSession(dueJob);
 		}
 		if (!(await this.isPersistedCronJobRunnable(dueJob.id))) {
 			return undefined;
@@ -1619,6 +1618,49 @@ export class AgentDaemon {
 				return undefined;
 			}
 			throw error;
+		}
+	}
+
+	private async restoreRlmHeartbeatSession(job: AgentCronJob): Promise<ActiveSessionState | undefined> {
+		const childInfo = await readSessionInfo(job.sessionFile);
+		const parentSessionPath = childInfo?.parentSessionPath;
+		const parentInfo = parentSessionPath ? await readSessionInfo(parentSessionPath) : undefined;
+		if (
+			!childInfo ||
+			childInfo.id !== job.sessionId ||
+			!parentSessionPath ||
+			!parentInfo ||
+			parentInfo.state?.status !== "active"
+		) {
+			this.cancelRlmHeartbeat(job.id);
+			return undefined;
+		}
+
+		try {
+			const parentState = await this.createRuntime(
+				{ type: "create", sessionPath: parentSessionPath },
+				() => this.getRunnableCronJob(job.id) !== undefined,
+			);
+			await this.rehydrateCompletedRlmSubagents(parentState);
+			const childState = this.findSessionBySessionFile(job.sessionFile);
+			if (!childState || childState.runtime.metadata.kind !== "subagent") {
+				this.cancelRlmHeartbeat(job.id);
+				return undefined;
+			}
+			this.rebindCronJobsToState(childState);
+			const reboundJob = this.getRunnableCronJob(job.id);
+			return reboundJob && this.isCronJobRunnableForState(reboundJob, childState, true) ? childState : undefined;
+		} catch (error) {
+			if (error instanceof RuntimeOpenCancelledError) {
+				return undefined;
+			}
+			throw error;
+		}
+	}
+
+	private cancelRlmHeartbeat(jobId: string): void {
+		if (this.cronStore.cancel(jobId)) {
+			this.cronScheduler.wake();
 		}
 	}
 
@@ -1750,8 +1792,6 @@ export class AgentDaemon {
 				// closeChildSessions tears it down with the parent. Errored or cancelled children
 				// would re-seed as "done", so close them immediately.
 				if (state && status === "done") {
-					// Run shutdown side effects without disposing the still-readable session.
-					this.cancelSubagentRlmHeartbeats(state);
 					await flushAgentTraceUpload(state.runtime.session.sessionManager).catch(() => undefined);
 					// Retention can decline if deletion or parent teardown won while the trace
 					// flush was in flight. Persist completion only after retention succeeds, so
@@ -4352,7 +4392,7 @@ export class AgentDaemon {
 		}
 		if (reason === "killed") {
 			this.cancelScheduledJobsForSession(state);
-		} else {
+		} else if (reason !== "shutdown" && reason !== "update") {
 			this.cancelSubagentRlmHeartbeats(state);
 		}
 		// Abort in-flight status work before any await/dispose so it can't write
