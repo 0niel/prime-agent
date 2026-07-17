@@ -11,7 +11,8 @@ import { type Api, type ImageContent, type Model, modelsAreEqual } from "@earend
 import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
 import { ProcessTerminal, setKeybindings, TUI } from "@earendil-works/pi-tui";
 import chalk from "chalk";
-import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.js";
+import { type Args, type Mode, parseArgs } from "./cli/args.js";
+import { formatTopLevelHelp } from "./cli/command-registry.js";
 import {
 	ensureInteractiveDaemonRunning,
 	isDaemonSessionSummary,
@@ -181,7 +182,6 @@ export interface InteractiveDaemonStartupDecision {
 	appMode: AppMode;
 	startupBenchmark: boolean;
 	noSession?: boolean;
-	help?: boolean;
 	listModels?: string | true;
 }
 
@@ -190,7 +190,6 @@ export function shouldUseDaemonInteractive(options: InteractiveDaemonStartupDeci
 		options.appMode === "interactive" &&
 		!options.startupBenchmark &&
 		!options.noSession &&
-		!options.help &&
 		options.listModels === undefined
 	);
 }
@@ -1095,6 +1094,10 @@ export async function main(args: string[], options?: MainOptions) {
 		console.log(VERSION);
 		process.exit(0);
 	}
+	if (parsed.help) {
+		console.log(formatTopLevelHelp());
+		process.exit(0);
+	}
 
 	if (parsed.export) {
 		let result: string;
@@ -1144,7 +1147,6 @@ export async function main(args: string[], options?: MainOptions) {
 		appMode,
 		startupBenchmark,
 		noSession: parsed.noSession,
-		help: parsed.help,
 		listModels: parsed.listModels,
 	});
 
@@ -1268,8 +1270,8 @@ export async function main(args: string[], options?: MainOptions) {
 	// Daemon mode never uses the bootstrap runtime, so skip the heavy
 	// createAgentSessionRuntime below and start listening immediately; sessions
 	// are created on demand through the daemon protocol via createRuntime.
-	// --help/--list-models still take the full path to print and exit.
-	if (appMode === "daemon" && !parsed.help && parsed.listModels === undefined) {
+	// --list-models still takes the full path to print and exit.
+	if (appMode === "daemon" && parsed.listModels === undefined) {
 		printTimings();
 		if (isDaemonWorkerProcess()) {
 			await runDaemonMode({
@@ -1457,15 +1459,7 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	const { services, session, modelFallbackMessage } = runtime;
 	installOwnedSessionRecoveryTracking(runtime);
-	const { settingsManager, modelRegistry, resourceLoader } = services;
-
-	if (parsed.help) {
-		const extensionFlags = resourceLoader
-			.getExtensions()
-			.extensions.flatMap((extension) => Array.from(extension.flags.values()));
-		printHelp(extensionFlags);
-		process.exit(0);
-	}
+	const { settingsManager, modelRegistry } = services;
 
 	if (parsed.listModels !== undefined) {
 		const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;

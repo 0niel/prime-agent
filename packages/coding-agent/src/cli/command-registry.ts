@@ -158,6 +158,17 @@ export const PUBLIC_COMMAND_NAMES = new Set(
 
 export const REMOVED_COMMAND_NAMES = new Set(["app", "daemon", "install", "manage", "remove", "uninstall"]);
 
+const TOP_LEVEL_OPTIONS = [
+	["-p, --print", "Print a response and exit"],
+	["-c, --continue", "Continue the previous session"],
+	["-r, --resume [path|id]", "Resume a session, or browse when omitted"],
+	["--model <pattern>", "Choose a model"],
+	["--thinking <level>", "Set the reasoning level"],
+	["--offline", "Disable startup network operations"],
+	["-v, --version", "Show version and exit"],
+	["-h, --help", "Show this help"],
+] as const;
+
 export function getCommandSpec(path: readonly string[]): CommandSpec | undefined {
 	return COMMAND_SPECS.find(
 		(spec) => spec.path.length === path.length && spec.path.every((segment, index) => segment === path[index]),
@@ -201,15 +212,19 @@ export function findCommandSuggestion(input: string, candidates: readonly string
 
 export function formatTopLevelHelp(): string {
 	const commands = COMMAND_SPECS.filter((spec) => spec.path.length === 1);
-	const width = Math.max(...commands.map((spec) => spec.path[0]!.length));
+	const commandWidth = Math.max(...commands.map((spec) => spec.path[0]!.length));
+	const optionWidth = Math.max(...TOP_LEVEL_OPTIONS.map(([option]) => option.length));
 	return `${APP_NAME} - AI coding assistant with an IPython tool
 
 Usage:
   ${APP_NAME} [options] [@files...] [message...]
   ${APP_NAME} <command> [args...]
 
+Options:
+${TOP_LEVEL_OPTIONS.map(([option, summary]) => `  ${option.padEnd(optionWidth)}  ${summary}`).join("\n")}
+
 Commands:
-${commands.map((spec) => `  ${spec.path[0]!.padEnd(width)}  ${spec.summary}`).join("\n")}
+${commands.map((spec) => `  ${spec.path[0]!.padEnd(commandWidth)}  ${spec.summary}`).join("\n")}
 
 Run "${APP_NAME} help <command>" for command details.`;
 }

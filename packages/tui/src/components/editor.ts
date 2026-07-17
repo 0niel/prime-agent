@@ -2463,6 +2463,7 @@ export class Editor implements Component, Focusable {
 			this.autocompleteOverlay = this.tui.showOverlay(this.autocompleteOverlayComponent, {
 				width: "100%",
 				aboveMarker: this.autocompleteAnchorMarker,
+				offsetY: -1,
 				nonCapturing: true,
 				visible: () => this.focused && this.autocompleteState !== null,
 			});
