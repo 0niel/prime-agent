@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { getModel } from "../src/models.js";
 import { complete } from "../src/stream.js";
 import type { Api, Context, Model, StreamOptions, Tool } from "../src/types.js";
+import { getKimiCodingTestModel } from "./kimi-test-model.js";
 
 type StreamOptionsWithExtras = StreamOptions & Record<string, unknown>;
 
@@ -248,7 +249,7 @@ describe("Tool Call Without Result Tests", () => {
 	});
 
 	describe.skipIf(!process.env.KIMI_API_KEY)("Kimi For Coding Provider", () => {
-		const model = getModel("kimi-coding", "kimi-k2-thinking");
+		const model = getKimiCodingTestModel();
 
 		it("should filter out tool calls without corresponding tool results", { retry: 3, timeout: 30000 }, async () => {
 			await testToolCallWithoutResult(model);

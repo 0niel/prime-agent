@@ -20,6 +20,7 @@ import type { AssistantMessage, Context, Model, Usage } from "../src/types.js";
 import { isContextOverflow } from "../src/utils/overflow.js";
 import { hasAzureOpenAICredentials } from "./azure-utils.js";
 import { hasBedrockCredentials } from "./bedrock-utils.js";
+import { getKimiCodingTestModel } from "./kimi-test-model.js";
 import { resolveApiKey } from "./oauth.js";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -449,8 +450,8 @@ describe("Context overflow error handling", () => {
 	// =============================================================================
 
 	describe.skipIf(!process.env.KIMI_API_KEY)("Kimi For Coding", () => {
-		it("kimi-k2-thinking - should detect overflow via isContextOverflow", async () => {
-			const model = getModel("kimi-coding", "kimi-k2-thinking");
+		it("should detect overflow via isContextOverflow", async () => {
+			const model = getKimiCodingTestModel();
 			const result = await testContextOverflow(model, process.env.KIMI_API_KEY!);
 			logResult(result);
 

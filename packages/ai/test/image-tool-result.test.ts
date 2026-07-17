@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import type { Api, Context, Model, Tool, ToolResultMessage } from "../src/index.js";
 import { complete, getModel } from "../src/index.js";
 import type { StreamOptions } from "../src/types.js";
+import { getKimiCodingTestModel } from "./kimi-test-model.js";
 
 type StreamOptionsWithExtras = StreamOptions & Record<string, unknown>;
 
@@ -368,8 +369,8 @@ describe("Tool Results with Images", () => {
 		},
 	);
 
-	describe.skipIf(!process.env.KIMI_API_KEY)("Kimi For Coding Provider (kimi-for-coding)", () => {
-		const llm = getModel("kimi-coding", "kimi-for-coding");
+	describe.skipIf(!process.env.KIMI_API_KEY)("Kimi For Coding Provider (image-capable model)", () => {
+		const llm = getKimiCodingTestModel({ image: true });
 
 		it("should handle tool result with only image", { retry: 3, timeout: 30000 }, async () => {
 			await handleToolWithImageResult(llm);

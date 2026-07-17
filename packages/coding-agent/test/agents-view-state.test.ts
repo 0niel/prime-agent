@@ -213,7 +213,7 @@ describe("agents view state", () => {
 
 		expect(rows.map((row) => [row.title, row.kind])).toEqual([
 			["Parent", "agent"],
-			["2 subagents running", "subagent-summary"],
+			["2 subagents running · 1 heartbeat active", "subagent-summary"],
 			["Other", "agent"],
 		]);
 		expect(rows.map((row) => row.runningSubagentCount)).toEqual([2, 2, 0]);
@@ -221,6 +221,42 @@ describe("agents view state", () => {
 		expect(rows.map((row) => row.selectable)).toEqual([true, true, true]);
 		expect(rows[1]?.parentIdentity).toBe(rows[0]?.identity);
 		expect(rows[1]?.identity).not.toBe(rows[0]?.identity);
+	});
+
+	test("surfaces an idle retained subagent heartbeat while its parent is collapsed", () => {
+		const summaries = [
+			makeSummary({
+				id: "heartbeat-child",
+				activeSessionId: "heartbeat-child",
+				sessionId: "heartbeat-child-session",
+				sessionName: "Heartbeat child",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "parent-active",
+				hasActiveHeartbeat: true,
+				activity: "idle",
+				messageCount: 2,
+			}),
+			makeSummary({
+				id: "parent-active",
+				activeSessionId: "parent-active",
+				sessionId: "parent-session",
+				sessionName: "Parent",
+				activity: "idle",
+				messageCount: 2,
+			}),
+		];
+
+		const collapsed = buildAgentsViewRows(summaries);
+		expect(collapsed[1]).toMatchObject({
+			kind: "subagent-summary",
+			title: "1 subagent · 1 heartbeat active",
+		});
+		const expanded = buildAgentsViewRows(summaries, new Set([collapsed[0]?.identity ?? ""]));
+		expect(expanded[1]).toMatchObject({
+			kind: "subagent",
+			section: "heartbeats",
+			statusLabel: "heartbeat active",
+		});
 	});
 
 	test("expands subagent rows for expanded parents and collapses otherwise", () => {
