@@ -2977,6 +2977,9 @@ export class InteractiveMode {
 
 	private startFeatureHintPresentation(): void {
 		this.clearFeatureHintPresentation();
+		if (this.childAgentPanelMode) {
+			return;
+		}
 		if (this.featureHintEligibleAt === 0) {
 			this.featureHintEligibleAt = Date.now() + FEATURE_HINT_DELAY_MS;
 		}
@@ -3035,6 +3038,16 @@ export class InteractiveMode {
 		if (this.featureHintComponent) {
 			this.featureHintContainer.removeChild(this.featureHintComponent);
 			this.featureHintComponent = undefined;
+		}
+	}
+
+	private resumeFeatureHintPresentation(): void {
+		if (
+			this.loadingAnimation &&
+			this.shouldShowWorkingLoader() &&
+			this.statusContainer.children.includes(this.loadingAnimation)
+		) {
+			this.startFeatureHintPresentation();
 		}
 	}
 
@@ -3637,8 +3650,9 @@ export class InteractiveMode {
 			this.enteredSessionViaSubagentDetail = false;
 			this.childAgentDetail.setBackHintLabel("back to chat");
 			this.childAgentDetail.setNode(undefined);
+			this.childAgentPanelMode = undefined;
+			this.resumeFeatureHintPresentation();
 		}
-		this.childAgentPanelMode = undefined;
 		this.childAgentSummary.setHidden(false);
 
 		// Save text from current editor before switching
@@ -5518,6 +5532,7 @@ export class InteractiveMode {
 			return false;
 		}
 		this.childAgentPanelMode = "detail";
+		this.clearFeatureHintPresentation();
 		this.childAgentDetailNodeId = nodeId;
 		this.childAgentDetail.setNode(node);
 		this.childAgentDetail.setBodyComponents([]);
@@ -5656,6 +5671,7 @@ export class InteractiveMode {
 		this.childAgentDetail.setBodyComponents([]);
 		this.childAgentSummary.setHidden(false);
 		this.restoreMainAgentView();
+		this.resumeFeatureHintPresentation();
 		// Restore the parent recap that was suppressed while the panel was open.
 		this.renderRecap();
 		// Re-render queued previews cleared on panel entry; the queue may still hold messages.
