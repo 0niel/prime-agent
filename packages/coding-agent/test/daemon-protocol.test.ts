@@ -45,6 +45,10 @@ describe("daemon protocol helpers", () => {
 			minProtocol: 3,
 			capability: "heartbeat_management",
 		});
+		expect(DAEMON_COMMAND_COMPATIBILITY.complete_owned_session).toEqual({
+			minProtocol: DAEMON_PROTOCOL_VERSION,
+			capability: "client_owned_sessions",
+		});
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.heartbeats_changed).toEqual({
 			minProtocol: 3,
 			capability: "heartbeat_catalog",
@@ -95,6 +99,7 @@ describe("daemon protocol helpers", () => {
 	it("keeps attachment routing out of the durable mutation journal", () => {
 		expect(isDaemonMutatingCommand({ type: "attach" })).toBe(false);
 		expect(isDaemonMutatingCommand({ type: "reattach" })).toBe(false);
+		expect(isDaemonMutatingCommand({ type: "wait_for_headless_completion" })).toBe(true);
 		expect(isDaemonMutatingCommand({ type: "switch_session" })).toBe(true);
 	});
 

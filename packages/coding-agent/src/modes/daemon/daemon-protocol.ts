@@ -7,12 +7,15 @@ import type {
 } from "../../core/agent-messages.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
+import type { AgentAutonomousStatus } from "../../core/autonomous.js";
+import type { BashResult } from "../../core/bash-executor.js";
 import type {
 	AgentCronJob,
 	AgentHeartbeatDeliveryMode,
 	AgentHeartbeatManagementAction,
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
+import type { InputSource } from "../../core/extensions/types.js";
 import type { CustomMessage } from "../../core/messages.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
@@ -27,6 +30,7 @@ import type {
 	AgentConnectionScopedModel,
 	AgentConnectionSessionContext,
 	AgentConnectionSessionEvent,
+	AgentConnectionSessionHeader,
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSideQuestionEvent,
 	AgentConnectionState,
@@ -46,7 +50,7 @@ export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
 export const DAEMON_PROTOCOL_VERSION = 4;
 export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 2;
 export const DAEMON_SCHEMA_REVISION = 1;
-export const DAEMON_SCHEMA_ID = "protocol-4-schema-1-07ce10c7f10a";
+export const DAEMON_SCHEMA_ID = "protocol-4-schema-1-f55df8742274";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -63,7 +67,8 @@ export type DaemonClientCapability =
 	| "event_sequence"
 	| "extension_ui"
 	| "slim_attach"
-	| "chunked_snapshot";
+	| "chunked_snapshot"
+	| "client_owned_sessions";
 export type DaemonServerCapability = DaemonClientCapability | "heartbeat_catalog" | "heartbeat_management";
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -88,6 +93,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 	"extension_ui",
 	"slim_attach",
 	"chunked_snapshot",
+	"client_owned_sessions",
 ];
 
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
@@ -125,6 +131,12 @@ export interface DaemonClientEnv {
 	env?: Record<string, string>;
 }
 
+export type DaemonSessionLifecycle = "resident" | "client_owned";
+
+export interface DaemonLaunchEnv {
+	launchEnv?: Record<string, string>;
+}
+
 /**
  * The allowlist of env vars a client may forward. One shared list because it
  * is the wire contract: clients filter before sending and the daemon
@@ -148,6 +160,16 @@ export function collectDaemonClientEnv(source: NodeJS.ProcessEnv = process.env):
 		}
 	}
 	return Object.keys(env).length > 0 ? env : undefined;
+}
+
+export function collectDaemonLaunchEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(source)) {
+		if (value !== undefined && !key.startsWith("PRIME_AGENT_INTERNAL_")) {
+			env[key] = value;
+		}
+	}
+	return env;
 }
 
 export interface DaemonReplayInfo {
@@ -296,17 +318,27 @@ export type DaemonSavedSessionListCommand =
 	  };
 
 export type DaemonCommand =
-	| { id?: string; type: "list"; all?: boolean; cwd?: string; sessionDir?: string }
+	| {
+			id?: string;
+			type: "list";
+			all?: boolean;
+			cwd?: string;
+			sessionDir?: string;
+			includeClientOwned?: boolean;
+	  }
 	| DaemonSavedSessionListCommand
 	| ({
 			id?: string;
 			type: "create";
 			sessionPath?: string;
 			continueRecent?: boolean;
+			noSession?: boolean;
 			name?: string;
 			config?: AgentSessionRuntimeConfig;
 			runtimeMetadata?: AgentSessionRuntimeMetadata;
-	  } & DaemonClientEnv)
+			lifecycle?: DaemonSessionLifecycle;
+	  } & DaemonClientEnv &
+			DaemonLaunchEnv)
 	// Attach env is adopt-if-absent only: it fills identity for env-less
 	// sessions (e.g. cron-created) but never rebinds one, since watchers
 	// (agents view, subagent viewers) also attach.
@@ -316,7 +348,8 @@ export type DaemonCommand =
 			activeSessionId: string;
 			supportsExtensionUi?: boolean;
 	  } & DaemonAttachClientMetadata &
-			DaemonClientEnv)
+			DaemonClientEnv &
+			DaemonLaunchEnv)
 	| ({
 			id?: string;
 			type: "reattach";
@@ -324,8 +357,11 @@ export type DaemonCommand =
 			targetActiveSessionId: string;
 			supportsExtensionUi?: boolean;
 	  } & DaemonAttachClientMetadata &
-			DaemonClientEnv)
+			DaemonClientEnv &
+			DaemonLaunchEnv)
 	| { id?: string; type: "detach"; activeSessionId?: string }
+	| { id?: string; type: "complete_owned_session"; activeSessionId: string }
+	| { id?: string; type: "promote_owned_session"; activeSessionId: string }
 	| { id?: string; type: "kill"; activeSessionId: string }
 	| { id?: string; type: "rename"; activeSessionId: string; name: string }
 	| {
@@ -337,8 +373,20 @@ export type DaemonCommand =
 			images?: ImageContent[];
 			streamingBehavior?: "steer" | "followUp";
 			expandPromptTemplates?: boolean;
+			source?: InputSource;
 			agentMessageId?: string;
 			customMessage?: CustomMessage;
+	  }
+	| {
+			id?: string;
+			type: "prompt_and_wait";
+			activeSessionId: string;
+			message: string;
+			content?: (TextContent | ImageContent)[];
+			images?: ImageContent[];
+			streamingBehavior?: "steer" | "followUp";
+			expandPromptTemplates?: boolean;
+			source?: InputSource;
 	  }
 	| {
 			id?: string;
@@ -382,9 +430,9 @@ export type DaemonCommand =
 			fromActiveSessionId?: string;
 			deliveryMode?: AgentSessionMessageDeliveryMode;
 	  }
-	| { id?: string; type: "agent_messages_status" }
-	| { id?: string; type: "agent_messages_pause" }
-	| { id?: string; type: "agent_messages_resume" }
+	| { id?: string; type: "agent_messages_status"; activeSessionId?: string }
+	| { id?: string; type: "agent_messages_pause"; activeSessionId?: string }
+	| { id?: string; type: "agent_messages_resume"; activeSessionId?: string }
 	| { id?: string; type: "agent_messages_clear"; activeSessionId: string }
 	| { id?: string; type: "abort"; activeSessionId: string }
 	| {
@@ -405,6 +453,8 @@ export type DaemonCommand =
 	| { id?: string; type: "abort_bash"; activeSessionId: string }
 	| { id?: string; type: "cancel_rlm_child"; activeSessionId: string; childId: string }
 	| { id?: string; type: "wait_for_idle"; activeSessionId: string }
+	| { id?: string; type: "wait_for_headless_completion"; activeSessionId: string }
+	| { id?: string; type: "get_session_header"; activeSessionId: string }
 	| { id?: string; type: "get_state"; activeSessionId: string }
 	| { id?: string; type: "get_connection_state"; activeSessionId: string }
 	| { id?: string; type: "get_messages"; activeSessionId: string }
@@ -417,7 +467,7 @@ export type DaemonCommand =
 	| { id?: string; type: "clear_queue"; activeSessionId: string }
 	| { id?: string; type: "abort_and_clear_queue"; activeSessionId: string }
 	| { id?: string; type: "cron_list"; activeSessionId?: string; includeInactive?: boolean }
-	| { id?: string; type: "heartbeats_list" }
+	| { id?: string; type: "heartbeats_list"; activeSessionId?: string }
 	| {
 			id?: string;
 			type: "heartbeat_manage";
@@ -425,8 +475,15 @@ export type DaemonCommand =
 			jobId: string;
 			action: AgentHeartbeatManagementAction;
 	  }
-	| { id?: string; type: "cron_add"; activeSessionId: string; schedule: string; prompt: string }
-	| { id?: string; type: "cron_cancel"; jobId: string }
+	| {
+			id?: string;
+			type: "cron_add";
+			activeSessionId: string;
+			schedule: string;
+			prompt: string;
+			promoteOwnedSession?: boolean;
+	  }
+	| { id?: string; type: "cron_cancel"; activeSessionId?: string; jobId: string }
 	| { id?: string; type: "heartbeat_get"; activeSessionId: string }
 	| {
 			id?: string;
@@ -435,6 +492,7 @@ export type DaemonCommand =
 			schedule: string;
 			prompt: string;
 			deliveryMode?: AgentHeartbeatDeliveryMode;
+			promoteOwnedSession?: boolean;
 	  }
 	| { id?: string; type: "heartbeat_update"; activeSessionId: string; action: AgentHeartbeatUpdateAction }
 	| { id?: string; type: "set_model"; activeSessionId: string; provider: string; modelId: string }
@@ -447,6 +505,7 @@ export type DaemonCommand =
 	| { id?: string; type: "set_steering_mode"; activeSessionId: string; mode: AgentConnectionQueueMode }
 	| { id?: string; type: "set_follow_up_mode"; activeSessionId: string; mode: AgentConnectionQueueMode }
 	| { id?: string; type: "set_auto_compaction"; activeSessionId: string; enabled: boolean }
+	| { id?: string; type: "set_auto_retry"; activeSessionId: string; enabled: boolean }
 	| { id?: string; type: "compact"; activeSessionId: string; customInstructions?: string }
 	| {
 			id?: string;
@@ -459,6 +518,7 @@ export type DaemonCommand =
 	| { id?: string; type: "abort_compaction"; activeSessionId: string }
 	| { id?: string; type: "abort_branch_summary"; activeSessionId: string }
 	| { id?: string; type: "abort_retry"; activeSessionId: string }
+	| { id?: string; type: "execute_bash_and_wait"; activeSessionId: string; command: string }
 	| { id?: string; type: "reload"; activeSessionId: string }
 	| { id?: string; type: "new_session"; activeSessionId: string; parentSession?: string }
 	| { id?: string; type: "switch_session"; activeSessionId: string; sessionPath: string; cwdOverride?: string }
@@ -507,6 +567,11 @@ export interface DaemonCommandCompatibility {
 }
 
 const LEGACY_DAEMON_COMMAND = { minProtocol: 1 } as const;
+const CURRENT_DAEMON_COMMAND = { minProtocol: DAEMON_PROTOCOL_VERSION } as const;
+const CLIENT_OWNED_DAEMON_COMMAND = {
+	minProtocol: DAEMON_PROTOCOL_VERSION,
+	capability: "client_owned_sessions",
+} as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
@@ -516,9 +581,12 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	attach: LEGACY_DAEMON_COMMAND,
 	reattach: LEGACY_DAEMON_COMMAND,
 	detach: LEGACY_DAEMON_COMMAND,
+	complete_owned_session: CLIENT_OWNED_DAEMON_COMMAND,
+	promote_owned_session: CLIENT_OWNED_DAEMON_COMMAND,
 	kill: LEGACY_DAEMON_COMMAND,
 	rename: LEGACY_DAEMON_COMMAND,
 	prompt: LEGACY_DAEMON_COMMAND,
+	prompt_and_wait: CURRENT_DAEMON_COMMAND,
 	steer: LEGACY_DAEMON_COMMAND,
 	follow_up: LEGACY_DAEMON_COMMAND,
 	restore_next_turn: LEGACY_DAEMON_COMMAND,
@@ -536,6 +604,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	abort_bash: LEGACY_DAEMON_COMMAND,
 	cancel_rlm_child: LEGACY_DAEMON_COMMAND,
 	wait_for_idle: LEGACY_DAEMON_COMMAND,
+	wait_for_headless_completion: CURRENT_DAEMON_COMMAND,
+	get_session_header: CURRENT_DAEMON_COMMAND,
 	get_state: LEGACY_DAEMON_COMMAND,
 	get_connection_state: LEGACY_DAEMON_COMMAND,
 	get_messages: LEGACY_DAEMON_COMMAND,
@@ -565,11 +635,13 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	set_steering_mode: LEGACY_DAEMON_COMMAND,
 	set_follow_up_mode: LEGACY_DAEMON_COMMAND,
 	set_auto_compaction: LEGACY_DAEMON_COMMAND,
+	set_auto_retry: CURRENT_DAEMON_COMMAND,
 	compact: LEGACY_DAEMON_COMMAND,
 	refine: LEGACY_DAEMON_COMMAND,
 	abort_compaction: LEGACY_DAEMON_COMMAND,
 	abort_branch_summary: LEGACY_DAEMON_COMMAND,
 	abort_retry: LEGACY_DAEMON_COMMAND,
+	execute_bash_and_wait: CURRENT_DAEMON_COMMAND,
 	reload: LEGACY_DAEMON_COMMAND,
 	new_session: LEGACY_DAEMON_COMMAND,
 	switch_session: LEGACY_DAEMON_COMMAND,
@@ -662,6 +734,9 @@ export interface DaemonSavedSessionInfo {
 }
 
 export type DaemonDeleteSavedSessionResult = DeleteSessionFileResult;
+export type DaemonAutonomousStatus = AgentAutonomousStatus;
+export type DaemonBashResult = BashResult;
+export type DaemonSessionHeader = AgentConnectionSessionHeader;
 
 export type DaemonResourceSnapshot = AgentConnectionResourceSnapshot;
 
@@ -841,6 +916,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"reattach",
 	"agent_messages_status",
 	"wait_for_idle",
+	"get_session_header",
 	"get_state",
 	"get_connection_state",
 	"get_messages",

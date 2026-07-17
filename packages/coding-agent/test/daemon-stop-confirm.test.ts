@@ -68,6 +68,17 @@ describe("confirmDaemonSessionLoss", () => {
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("busy:1"));
 	});
 
+	it("counts busy client-owned sessions without exposing their identities", async () => {
+		setTTY(false);
+		const probe: RunningDaemonProbe = {
+			reachable: true,
+			activeSessions: [],
+			busyClientOwnedSessionCount: 2,
+		};
+		expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);
+		expect(console.error).toHaveBeenCalledWith(expect.stringContaining("busy:2"));
+	});
+
 	it("aborts without prompting when not at a TTY and sessions cannot be listed", async () => {
 		setTTY(false);
 		const probe: RunningDaemonProbe = { reachable: true };

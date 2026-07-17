@@ -86,6 +86,8 @@ export interface DaemonWorkerDescriptor {
 	supervisorSocketPath: string;
 	authenticationToken: string;
 	rootActiveSessionId: string;
+	/** Stable protocol client that owns this worker. Omitted for resident sessions. */
+	ownerClientId?: string;
 	rootSessionId?: string;
 	sessionFile?: string;
 	createdAt: string;

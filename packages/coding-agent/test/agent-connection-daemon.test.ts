@@ -46,6 +46,7 @@ class FakeDaemonClient {
 	connectionStateFactory: ((activeSessionId: string) => AgentConnectionState) | undefined;
 	abortBashUnknownCommand = false;
 	abortAndClearQueueUnknownCommand = false;
+	cronAddGate: Promise<void> | undefined;
 	legacyHeartbeatCommandsSupported = false;
 	serverCapabilities = new Set<string>();
 	updateRestartSessions: Array<Record<string, unknown>> = [];
@@ -223,7 +224,7 @@ class FakeDaemonClient {
 					data: { steering: ["aborted"], followUp: ["cleared"] },
 				};
 			case "heartbeats_list":
-				return this.legacyHeartbeatCommandsSupported
+				return this.legacyHeartbeatCommandsSupported || this.serverCapabilities.has("heartbeat_catalog")
 					? { type: "response", command: command.type, success: true, data: { heartbeats: [] } }
 					: {
 							type: "response",
@@ -232,7 +233,7 @@ class FakeDaemonClient {
 							error: "Unknown daemon command: heartbeats_list",
 						};
 			case "heartbeat_manage":
-				return this.legacyHeartbeatCommandsSupported
+				return this.legacyHeartbeatCommandsSupported || this.serverCapabilities.has("heartbeat_management")
 					? {
 							type: "response",
 							command: command.type,
@@ -361,6 +362,29 @@ class FakeDaemonClient {
 						expectedOutcome: "Refine request completes",
 						appliedEdits: [],
 						harnessStatePath: "/tmp/harness_state.json",
+					},
+				};
+			case "cron_add":
+				await this.cronAddGate;
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: {
+						job: {
+							id: `cron-${this.requests.filter((request) => request.type === "cron_add").length}`,
+							status: "active",
+							source: "cron",
+							activeSessionId: command.activeSessionId,
+							sessionId: "session-current",
+							sessionFile: "/tmp/session-current.jsonl",
+							cwd: "/tmp/project",
+							prompt: command.prompt,
+							schedule: { kind: "cron", expression: command.schedule },
+							createdAt: "2026-01-01T00:00:00.000Z",
+							updatedAt: "2026-01-01T00:00:00.000Z",
+							runCount: 0,
+						},
 					},
 				};
 			case "switch_session":
@@ -630,6 +654,48 @@ function emitSequencedQueueUpdate(client: FakeDaemonClient, activeSessionId: str
 }
 
 describe("DaemonAgentConnection", () => {
+	it("uses fleet heartbeat scope for residents and session scope for owned workers", async () => {
+		const residentClient = new FakeDaemonClient();
+		residentClient.serverCapabilities.add("heartbeat_catalog");
+		const resident = new DaemonAgentConnection(asDaemonClient(residentClient), "resident-1");
+		await resident.listHeartbeats();
+
+		const ownedClient = new FakeDaemonClient();
+		ownedClient.serverCapabilities.add("heartbeat_catalog");
+		const owned = new DaemonAgentConnection(asDaemonClient(ownedClient), "owned-1", { ownedSession: true });
+		await owned.listHeartbeats();
+
+		expect(residentClient.requests.at(-1)).toEqual(expect.objectContaining({ type: "heartbeats_list" }));
+		expect(residentClient.requests.at(-1)).not.toHaveProperty("activeSessionId");
+		expect(ownedClient.requests.at(-1)).toEqual(
+			expect.objectContaining({ type: "heartbeats_list", activeSessionId: "owned-1" }),
+		);
+	});
+
+	it("serializes concurrent owned-session promotion commands", async () => {
+		const fakeClient = new FakeDaemonClient();
+		let releaseFirst = () => {};
+		fakeClient.cronAddGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
+			ownedSession: true,
+		});
+
+		const first = connection.addCronJob("0 * * * *", "first");
+		const second = connection.addCronJob("30 * * * *", "second");
+		await vi.waitFor(() => {
+			expect(fakeClient.requests.filter((request) => request.type === "cron_add")).toHaveLength(1);
+		});
+		releaseFirst();
+		await Promise.all([first, second]);
+
+		const commands = fakeClient.requests.filter(
+			(command): command is Extract<DaemonCommand, { type: "cron_add" }> => command.type === "cron_add",
+		);
+		expect(commands.map((command) => command.promoteOwnedSession)).toEqual([true, false]);
+	});
+
 	it("degrades an unavailable heartbeat catalog without sending an unsupported command", async () => {
 		const fakeClient = new FakeDaemonClient();
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");

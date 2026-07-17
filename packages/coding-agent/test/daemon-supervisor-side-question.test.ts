@@ -21,6 +21,9 @@ describe("daemon supervisor side-question routing", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			ready: Promise.resolve(),
 			ownership: { assertCurrent: vi.fn(async () => undefined) },
+			workers: new Map(),
+			clients: new Set(),
+			protocolClientIds: new WeakMap(),
 			handleCommand,
 			write,
 			log: vi.fn(),

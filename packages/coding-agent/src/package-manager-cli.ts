@@ -500,7 +500,12 @@ function confirmDaemonSessionLossBeforeUpdate(probe: RunningDaemonProbe, force: 
 }
 
 function daemonProbeMayHaveBusySessions(probe: RunningDaemonProbe): boolean {
-	return probe.reachable && (probe.activeSessions === undefined || probe.activeSessions.some(isSessionBusy));
+	return (
+		probe.reachable &&
+		(probe.activeSessions === undefined ||
+			(probe.busyClientOwnedSessionCount ?? 0) > 0 ||
+			probe.activeSessions.some(isSessionBusy))
+	);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

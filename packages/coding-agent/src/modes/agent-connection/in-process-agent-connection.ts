@@ -1,7 +1,14 @@
 import { resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
+import type {
+	AgentSessionMessageDeliveryMode,
+	AgentSessionMessageReceipt,
+	AgentSessionMessageSafetyStatus,
+} from "../../core/agent-messages.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
+import type { AgentAutonomousStatus } from "../../core/autonomous.js";
+import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
 import type {
@@ -10,11 +17,13 @@ import type {
 	AgentHeartbeatManagementAction,
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
+import type { ExtensionUIContext } from "../../core/extensions/types.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import { type DeleteSessionFileResult, deleteSessionFile } from "../../core/session-file-actions.js";
 import { SessionManager } from "../../core/session-manager.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
+import { waitForHeadlessCompletion } from "../headless-completion.js";
 import {
 	createAgentConnectionCommands,
 	createAgentConnectionResourceSnapshot,
@@ -44,6 +53,7 @@ import type {
 	AgentConnectionSavedSessionScope,
 	AgentConnectionScopedModel,
 	AgentConnectionSessionContext,
+	AgentConnectionSessionHeader,
 	AgentConnectionSessionListCallbacks,
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSessionWatcher,
@@ -55,28 +65,44 @@ import type {
 	AgentConnectionUserMessage,
 } from "./types.js";
 
+export interface InProcessHeadlessExtensionOptions {
+	uiContext?: ExtensionUIContext;
+	shutdownHandler?: () => void;
+}
+
 export class InProcessAgentConnection implements AgentConnection {
 	private readonly listeners = new Set<AgentConnectionEventListener>();
 	private readonly beforeSessionInvalidateListeners = new Set<AgentConnectionBeforeSessionInvalidateListener>();
 	private readonly sideQuestionRuns = new Map<string, SideQuestionRun>();
+	private headlessExtensionOptions: InProcessHeadlessExtensionOptions | undefined;
 	private unsubscribeSessionEvents: (() => void) | undefined;
 
 	constructor(private readonly runtimeHost: AgentSessionRuntime) {
 		this.bindCurrentSessionEvents();
-		this.runtimeHost.setBeforeSessionInvalidate(() => {
-			this.abortAllSideQuestions();
-			for (const listener of [...this.beforeSessionInvalidateListeners]) {
-				listener();
-			}
-		});
+		if (typeof this.runtimeHost.setBeforeSessionInvalidate === "function") {
+			this.runtimeHost.setBeforeSessionInvalidate(() => {
+				this.abortAllSideQuestions();
+				for (const listener of [...this.beforeSessionInvalidateListeners]) {
+					listener();
+				}
+			});
+		}
 		this.runtimeHost.setRebindSession(async () => {
 			this.bindCurrentSessionEvents();
+			if (this.headlessExtensionOptions) {
+				await this.bindCurrentSessionExtensions();
+			}
 			await this.emit({
 				type: "session_replaced",
 				state: createAgentConnectionState(this.runtimeHost),
 				messages: this.runtimeHost.session.messages,
 			});
 		});
+	}
+
+	async bindHeadlessExtensions(options: InProcessHeadlessExtensionOptions = {}): Promise<void> {
+		this.headlessExtensionOptions = options;
+		await this.bindCurrentSessionExtensions();
 	}
 
 	subscribe(listener: AgentConnectionEventListener): () => void {
@@ -102,7 +128,11 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getMessages(): Promise<AgentMessage[]> {
-		return this.session.messages;
+		return this.session.state.messages;
+	}
+
+	async getSessionHeader(): Promise<AgentConnectionSessionHeader | undefined> {
+		return this.session.sessionManager.getHeader() ?? undefined;
 	}
 
 	async getCommands(): Promise<AgentConnectionSlashCommand[]> {
@@ -207,6 +237,30 @@ export class InProcessAgentConnection implements AgentConnection {
 		throw new Error("Heartbeats require daemon mode");
 	}
 
+	async sendAgentMessage(
+		_targetActiveSessionId: string,
+		_message: string,
+		_deliveryMode?: AgentSessionMessageDeliveryMode,
+	): Promise<AgentSessionMessageReceipt> {
+		throw new Error("Agent messaging requires daemon mode");
+	}
+
+	async getAgentMessageStatus(): Promise<AgentSessionMessageSafetyStatus> {
+		throw new Error("Agent messaging requires daemon mode");
+	}
+
+	async pauseAgentMessages(): Promise<AgentSessionMessageSafetyStatus> {
+		throw new Error("Agent messaging requires daemon mode");
+	}
+
+	async resumeAgentMessages(): Promise<AgentSessionMessageSafetyStatus> {
+		throw new Error("Agent messaging requires daemon mode");
+	}
+
+	async clearAgentMessages(): Promise<number> {
+		throw new Error("Agent messaging requires daemon mode");
+	}
+
 	async getUserMessagesForForking(): Promise<AgentConnectionUserMessage[]> {
 		return this.session.getUserMessagesForForking();
 	}
@@ -232,9 +286,39 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
+		await new Promise<void>((resolve, reject) => {
+			let settled = false;
+			const resolveOnce = () => {
+				if (settled) return;
+				settled = true;
+				resolve();
+			};
+			const rejectOnce = (error: unknown) => {
+				if (settled) return;
+				settled = true;
+				reject(error);
+			};
+			const prompt = this.session.prompt(message, {
+				images: options?.images,
+				streamingBehavior: options?.streamingBehavior,
+				source: options?.source,
+				preflightResult: (success) => {
+					if (success) resolveOnce();
+				},
+			});
+			void prompt.then(resolveOnce, rejectOnce);
+		});
+	}
+
+	async promptAndWait(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
+		if (!options) {
+			await this.session.prompt(message);
+			return;
+		}
 		await this.session.prompt(message, {
-			images: options?.images,
-			streamingBehavior: options?.streamingBehavior,
+			images: options.images,
+			streamingBehavior: options.streamingBehavior,
+			source: options.source,
 		});
 	}
 
@@ -281,8 +365,16 @@ export class InProcessAgentConnection implements AgentConnection {
 		await this.session.agent.waitForIdle();
 	}
 
+	async waitForHeadlessCompletion(): Promise<AgentAutonomousStatus> {
+		return waitForHeadlessCompletion(this.session);
+	}
+
 	async executeBash(command: string, options?: AgentConnectionExecuteBashOptions): Promise<void> {
 		await this.session.runUserBash(command, options);
+	}
+
+	async executeBashAndWait(command: string): Promise<BashResult> {
+		return this.session.executeBash(command);
 	}
 
 	async abortBash(): Promise<void> {
@@ -338,6 +430,10 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async setAutoCompactionEnabled(enabled: boolean): Promise<void> {
 		this.session.setAutoCompactionEnabled(enabled);
+	}
+
+	async setAutoRetryEnabled(enabled: boolean): Promise<void> {
+		this.session.setAutoRetryEnabled(enabled);
 	}
 
 	async compact(customInstructions?: string): Promise<CompactionResult> {
@@ -458,7 +554,9 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.abortAllSideQuestions();
 		this.unsubscribeSessionEvents?.();
 		this.unsubscribeSessionEvents = undefined;
-		this.runtimeHost.setBeforeSessionInvalidate(undefined);
+		if (typeof this.runtimeHost.setBeforeSessionInvalidate === "function") {
+			this.runtimeHost.setBeforeSessionInvalidate(undefined);
+		}
 		this.runtimeHost.setRebindSession(undefined);
 		await this.runtimeHost.dispose();
 	}
@@ -471,6 +569,36 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.unsubscribeSessionEvents?.();
 		this.unsubscribeSessionEvents = this.session.subscribe((event) => {
 			void this.emit({ type: "session_event", event });
+		});
+	}
+
+	private async bindCurrentSessionExtensions(): Promise<void> {
+		const session = this.session;
+		await session.bindExtensions({
+			uiContext: this.headlessExtensionOptions?.uiContext,
+			commandContextActions: {
+				waitForIdle: () => session.agent.waitForIdle(),
+				newSession: (options) => this.runtimeHost.newSession(options),
+				fork: async (entryId, options) => {
+					const result = await this.runtimeHost.fork(entryId, options);
+					return { cancelled: result.cancelled };
+				},
+				navigateTree: async (targetId, options) => {
+					const result = await session.navigateTree(targetId, options);
+					return { cancelled: result.cancelled };
+				},
+				switchSession: (sessionPath, options) => this.runtimeHost.switchSession(sessionPath, options),
+				reload: () => session.reload(),
+			},
+			shutdownHandler: this.headlessExtensionOptions?.shutdownHandler,
+			onError: (error) => {
+				void this.emit({
+					type: "extension_error",
+					extensionPath: error.extensionPath,
+					event: error.event,
+					error: error.error,
+				});
+			},
 		});
 	}
 

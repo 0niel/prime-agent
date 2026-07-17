@@ -5,18 +5,14 @@ Prime Agent isolates each persistent root session tree in its own process. Proce
 ## Process Topology
 
 ```text
-interactive clients
-        |
-        v
-detached supervisor
-  |- catalog subprocess
-  |- resident worker: root A + RLM descendants + kernels
-  `- resident worker: root B + RLM descendants + kernels
-
-print / JSON / RPC / interactive --no-session
-        |
-        v
-frontend process --private owner channel--> owned worker + root tree
+interactive / print / JSON / RPC clients
+                    |
+                    v
+            detached supervisor
+              |- catalog subprocess
+              |- resident worker: root A + RLM descendants + kernels
+              |- resident worker: root B + RLM descendants + kernels
+              `- client-owned worker: hidden root + RLM descendants + kernels
 ```
 
 The supervisor owns public sockets, client attachments, routing, global agent-message routing, worker health, and update coordination. Each resident worker owns scheduling and execution for its root tree. The supervisor does not execute providers, tools, compaction, bash, kernels, session schedules, or session-history scans.
@@ -41,25 +37,27 @@ Normal interactive sessions use resident workers:
 
 There are no session, worker, client, or workload caps in this layer.
 
-## Owned Workers
+## Client-Owned Workers
 
-Headless and ephemeral modes use the same process isolation without joining the resident daemon registry:
+Headless and ephemeral clients use the same supervisor, worker process, `AgentSessionRuntime`, extension binding, scheduler, RLM host, and kernel lifecycle as interactive clients. Their workers have a client-owned lifecycle:
 
-- `prime-agent -p`, piped stdin, and JSON mode proxy stdin/stdout/stderr through an owned worker and return its existing exit status.
-- RPC keeps stdin/stdout in the frontend. It forwards strict LF-delimited JSONL to the worker and preserves every public command, response, event, and extension-UI shape.
-- If a persisted RPC worker crashes, the frontend reports an ordinary failure for commands whose result is uncertain, reopens the exact persisted session, and continues accepting commands. It never replays an uncertain command.
-- RPC EOF and frontend `SIGTERM`/`SIGHUP` stop only the owned worker and its subprocesses.
-- Interactive `--no-session` uses an owned in-memory worker and creates no recovery descriptor.
-- Owned workers never appear in the agents view and never require the global daemon.
+- `prime-agent -p`, piped stdin, and JSON mode remain one-shot clients and return their existing output and exit status.
+- RPC retains strict LF-delimited JSONL framing, accepts repeated prompts until EOF, and preserves every public command, response, event, and extension-UI shape.
+- Interactive `--no-session` uses a client-owned in-memory session.
+- Normal completion or RPC EOF explicitly removes the worker without archiving its session. `SIGTERM` and `SIGHUP` retain their existing exit codes.
+- Unexpected client loss starts a bounded cleanup grace period. Reconnection with the same stable protocol client ID cancels cleanup and reattaches to the same worker.
+- The supervisor can recover a crashed client-owned worker while the owner remains connected. After supervisor replacement, the owner resupplies its launch environment before a dead worker is restarted.
+- Default session listings, the agents view, global peer routing, and global schedule aggregation omit client-owned workers. Owner-scoped heartbeat and cron operations still reach the hidden worker.
+- The full launch environment is held only in supervisor memory and is never written to the worker descriptor.
 - Direct SDK calls to `runPrintMode(runtime, ...)` and `runRpcMode(runtime)` remain in-process and source-compatible. Non-serializable extension factories therefore continue to work for embedders.
 
-An inherited, unreferenced IPC owner channel links the worker to its frontend. Frontend loss disconnects the channel and terminates the worker, which reaps its kernels and detached children; the unreferenced channel does not prevent clean RPC EOF or print completion.
+The daemon is infrastructure, not a client mode. `interactive`, `print`, `json`, and `rpc` describe client behavior; the retained `--mode daemon` command is the compatible internal process entrypoint used to start the supervisor and session workers.
 
 ## Session Ownership
 
-Persisted sessions use process-safe leases keyed by canonical JSONL path. Resident and owned workers both acquire leases.
+Persisted sessions use process-safe leases keyed by canonical JSONL path. Resident and client-owned workers both acquire leases.
 
-- Resident workers acquire a target lease before opening an existing session. Owned CLI workers acquire it before runtime writes, and all workers acquire the replacement lease before switching runtimes.
+- Workers acquire a target lease before opening an existing session and acquire the replacement lease before switching runtimes.
 - The previous lease is released only after replacement succeeds.
 - Concurrent opens return `session_already_active` with the owning active-session ID.
 - Concurrent daemon creates for the same path share one worker launch.
@@ -68,7 +66,7 @@ This prevents a script and resident daemon worker from writing the same session 
 
 ## Scheduled Jobs
 
-Each resident worker runs one scheduler for the root and RLM descendant sessions it owns. Schedule state is persisted per session at `session-artifacts/<session-id>/scheduled-jobs.json`; workers never scan or write a shared global cron file.
+Each worker runs one scheduler for the root and RLM descendant sessions it owns. Schedule state is persisted per session at `session-artifacts/<session-id>/scheduled-jobs.json`; workers never scan or write a shared global cron file.
 
 - Creating or changing a heartbeat writes its session store and wakes the same worker's scheduler.
 - Due ticks are claimed and advanced durably before prompt delivery, so a crash never replays an uncertain prompt.
@@ -80,9 +78,9 @@ Each resident worker runs one scheduler for the root and RLM descendant sessions
 
 The first worker-owned release migrates the legacy global `cron-jobs.json` into the corresponding session artifact directories before adopting workers. Archived, deleted, or descriptorless sessions are cancelled rather than revived.
 
-## Public Protocol v2
+## Public Protocol v3
 
-The public daemon socket remains JSONL-framed. Version 2 adds:
+The public daemon socket remains JSONL-framed. Versions 2 and 3 add:
 
 - stable command envelopes carrying protocol version, client ID, and command ID;
 - generation-aware event cursors `{ generation, sequence }`;
@@ -91,6 +89,9 @@ The public daemon socket remains JSONL-framed. Version 2 adds:
 - attach acknowledgement followed by `session_snapshot_begin`, `session_snapshot_chunk`, and `session_snapshot_end`;
 - 512 KiB target transcript chunks;
 - file-backed transcript caches above 4 MiB.
+- client-owned worker creation, completion, and promotion;
+- owner-scoped recovery with in-memory launch environments;
+- daemon-side headless completion, session-header, synchronous bash, and retry-setting commands.
 
 The one-release v1 update handoff uses raw v1 requests only to prepare and stop the old daemon. Busy older daemons that cannot produce a recovery manifest are left running.
 

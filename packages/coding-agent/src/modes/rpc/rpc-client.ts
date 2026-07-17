@@ -7,12 +7,30 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
+import type {
+	AgentSessionMessageDeliveryMode,
+	AgentSessionMessageReceipt,
+	AgentSessionMessageSafetyStatus,
+} from "../../core/agent-messages.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
+import type {
+	AgentCronJob,
+	AgentHeartbeatDeliveryMode,
+	AgentHeartbeatManagementAction,
+	AgentHeartbeatUpdateAction,
+} from "../../core/cron-jobs.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
 import type { SessionStats } from "../../core/session-stats.js";
+import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.js";
-import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.js";
+import type {
+	RpcCommand,
+	RpcObservedSessionEvent,
+	RpcResponse,
+	RpcSessionState,
+	RpcSlashCommand,
+} from "./rpc-types.js";
 
 // ============================================================================
 // Types
@@ -50,6 +68,7 @@ export interface ModelInfo {
 }
 
 export type RpcEventListener = (event: AgentEvent) => void;
+export type RpcObservedSessionListener = (event: RpcObservedSessionEvent) => void;
 
 // ============================================================================
 // RPC Client
@@ -59,6 +78,7 @@ export class RpcClient {
 	private process: ChildProcess | null = null;
 	private stopReadingStdout: (() => void) | null = null;
 	private eventListeners: RpcEventListener[] = [];
+	private observedSessionListeners: RpcObservedSessionListener[] = [];
 	private pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
 	private requestId = 0;
@@ -148,6 +168,16 @@ export class RpcClient {
 			const index = this.eventListeners.indexOf(listener);
 			if (index !== -1) {
 				this.eventListeners.splice(index, 1);
+			}
+		};
+	}
+
+	onObservedSessionEvent(listener: RpcObservedSessionListener): () => void {
+		this.observedSessionListeners.push(listener);
+		return () => {
+			const index = this.observedSessionListeners.indexOf(listener);
+			if (index !== -1) {
+				this.observedSessionListeners.splice(index, 1);
 			}
 		};
 	}
@@ -407,6 +437,102 @@ export class RpcClient {
 		return this.getData<{ messages: AgentMessage[] }>(response).messages;
 	}
 
+	async sendAgentMessage(
+		targetActiveSessionId: string,
+		message: string,
+		deliveryMode?: AgentSessionMessageDeliveryMode,
+	): Promise<AgentSessionMessageReceipt> {
+		const response = await this.send({
+			type: "send_message",
+			targetActiveSessionId,
+			message,
+			deliveryMode,
+		});
+		return this.getData(response);
+	}
+
+	async getAgentMessageStatus(): Promise<AgentSessionMessageSafetyStatus> {
+		return this.getData(await this.send({ type: "agent_messages_status" }));
+	}
+
+	async pauseAgentMessages(): Promise<AgentSessionMessageSafetyStatus> {
+		return this.getData(await this.send({ type: "agent_messages_pause" }));
+	}
+
+	async resumeAgentMessages(): Promise<AgentSessionMessageSafetyStatus> {
+		return this.getData(await this.send({ type: "agent_messages_resume" }));
+	}
+
+	async clearAgentMessages(): Promise<number> {
+		const response = await this.send({ type: "agent_messages_clear" });
+		return this.getData<{ cleared: number }>(response).cleared;
+	}
+
+	async listSchedules(includeInactive?: boolean): Promise<AgentCronJob[]> {
+		const response = await this.send({ type: "list_schedules", includeInactive });
+		return this.getData<{ jobs: AgentCronJob[] }>(response).jobs;
+	}
+
+	async addSchedule(schedule: string, prompt: string): Promise<AgentCronJob> {
+		const response = await this.send({ type: "add_schedule", schedule, prompt });
+		return this.getData<{ job: AgentCronJob }>(response).job;
+	}
+
+	async cancelSchedule(jobId: string): Promise<AgentCronJob> {
+		const response = await this.send({ type: "cancel_schedule", jobId });
+		return this.getData<{ job: AgentCronJob }>(response).job;
+	}
+
+	async listHeartbeats(): Promise<AgentConnectionHeartbeat[]> {
+		const response = await this.send({ type: "list_heartbeats" });
+		return this.getData<{ heartbeats: AgentConnectionHeartbeat[] }>(response).heartbeats;
+	}
+
+	async getHeartbeat(): Promise<AgentCronJob | null> {
+		const response = await this.send({ type: "get_heartbeat" });
+		return this.getData<{ heartbeat: AgentCronJob | null }>(response).heartbeat;
+	}
+
+	async setHeartbeat(
+		schedule: string,
+		prompt: string,
+		deliveryMode?: AgentHeartbeatDeliveryMode,
+	): Promise<AgentCronJob> {
+		const response = await this.send({ type: "set_heartbeat", schedule, prompt, deliveryMode });
+		const heartbeat = this.getData<{ heartbeat: AgentCronJob | null }>(response).heartbeat;
+		if (!heartbeat) {
+			throw new Error("Daemon did not return the created heartbeat");
+		}
+		return heartbeat;
+	}
+
+	async updateHeartbeat(action: AgentHeartbeatUpdateAction): Promise<AgentCronJob | null> {
+		const response = await this.send({ type: "update_heartbeat", action });
+		return this.getData<{ heartbeat: AgentCronJob | null }>(response).heartbeat;
+	}
+
+	async manageHeartbeat(
+		activeSessionId: string,
+		jobId: string,
+		action: AgentHeartbeatManagementAction,
+	): Promise<AgentCronJob> {
+		const response = await this.send({ type: "manage_heartbeat", activeSessionId, jobId, action });
+		const heartbeat = this.getData<{ heartbeat: AgentCronJob | null }>(response).heartbeat;
+		if (!heartbeat) {
+			throw new Error("Daemon did not return the managed heartbeat");
+		}
+		return heartbeat;
+	}
+
+	async observe(activeSessionId: string): Promise<AgentMessage[]> {
+		const response = await this.send({ type: "observe", activeSessionId });
+		return this.getData<{ messages: AgentMessage[] }>(response).messages;
+	}
+
+	async unobserve(activeSessionId: string): Promise<void> {
+		await this.send({ type: "unobserve", activeSessionId });
+	}
+
 	/**
 	 * Get available commands (extension commands, prompt templates, skills).
 	 */
@@ -486,10 +612,24 @@ export class RpcClient {
 				pending.resolve(data as RpcResponse);
 				return;
 			}
+			if (data.type === "observed_session_event" || data.type === "observed_session_closed") {
+				for (const listener of [...this.observedSessionListeners]) {
+					try {
+						listener(data as RpcObservedSessionEvent);
+					} catch {
+						// Listener failures must not block other RPC subscribers.
+					}
+				}
+				return;
+			}
 
 			// Otherwise it's an event
-			for (const listener of this.eventListeners) {
-				listener(data as AgentEvent);
+			for (const listener of [...this.eventListeners]) {
+				try {
+					listener(data as AgentEvent);
+				} catch {
+					// Listener failures must not block other RPC subscribers.
+				}
 			}
 		} catch {
 			// Ignore non-JSON lines
