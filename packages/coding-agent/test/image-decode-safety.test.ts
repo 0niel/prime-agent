@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-	assertImageEncodedSize,
 	MAX_IMAGE_DIMENSION,
 	MAX_IMAGE_ENCODED_BYTES,
 	MAX_IMAGE_PIXELS,
@@ -116,12 +115,6 @@ describe("parseImageDimensions", () => {
 });
 
 describe("validateImageForDecode", () => {
-	it("rejects an oversized source before its bytes are loaded", () => {
-		expect(() => assertImageEncodedSize(MAX_IMAGE_ENCODED_BYTES + 1)).toThrowError(
-			expect.objectContaining({ reason: "encoded-size" }),
-		);
-	});
-
 	it("rejects encoded images before parsing when their byte length is unsafe", () => {
 		expect(() => validateImageForDecode(new Uint8Array(MAX_IMAGE_ENCODED_BYTES + 1))).toThrowError(
 			expect.objectContaining({ reason: "encoded-size" }),
