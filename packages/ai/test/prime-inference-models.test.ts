@@ -59,8 +59,33 @@ describe("Prime Inference models", () => {
 	it("marks flagship models as featured so pickers can pin them above the long tail", () => {
 		expect(getModel("prime-inference", "openai/gpt-5.5").featured).toBe(true);
 		expect(getModel("prime-inference", "z-ai/glm-5.2").featured).toBe(true);
+		expect(getModel("prime-inference", "moonshotai/kimi-k3").featured).toBe(true);
 		expect(getModel("prime-inference", "google/gemini-2.5-pro").featured).toBeUndefined();
 		expect(getModel("prime-inference", "openai/gpt-4o").featured).toBeUndefined();
+	});
+
+	it("registers Kimi K3 on Prime Inference and OpenRouter", () => {
+		for (const provider of ["prime-inference", "openrouter"] as const) {
+			const model = getModel(provider, "moonshotai/kimi-k3");
+
+			expect(model.api).toBe("openai-completions");
+			expect(model.reasoning).toBe(true);
+			expect(model.thinkingLevelMap).toEqual({
+				off: null,
+				minimal: null,
+				low: null,
+				medium: null,
+				high: null,
+				xhigh: null,
+				max: "max",
+			});
+			expect(getSupportedThinkingLevels(model)).toEqual(["max"]);
+			expect(model.input).toEqual(["text", "image"]);
+			expect(model.contextWindow).toBe(1048576);
+			expect(model.maxTokens).toBe(1048576);
+			expect(model.cost.input).toBe(3);
+			expect(model.cost.output).toBe(15);
+		}
 	});
 
 	it("borrows OpenRouter metadata for non-curated catalog models", () => {

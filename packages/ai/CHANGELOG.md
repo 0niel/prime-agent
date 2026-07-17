@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added Kimi K3 to the Prime Inference and OpenRouter model catalogs with multimodal input and mandatory max reasoning.
+
 ## [0.3.1] - 2026-07-15
 
 - Added provider service-tier forwarding to shared stream options.

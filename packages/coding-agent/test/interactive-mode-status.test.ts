@@ -636,7 +636,9 @@ describe("InteractiveMode pending bash components", () => {
 		expect(loader.intervalId).not.toBeNull();
 
 		const editorStub = { clearHistory: vi.fn(), setText: vi.fn() };
+		const endFeatureHintRun = vi.fn();
 		const fakeThis = {
+			endFeatureHintRun,
 			chatContainer: new Container(),
 			shortcutGuideContainer: new Container(),
 			pendingMessagesContainer: new Container(),
@@ -668,6 +670,7 @@ describe("InteractiveMode pending bash components", () => {
 		).resetCurrentSessionRenderState.call(fakeThis);
 
 		expect(loader.intervalId).toBeNull();
+		expect(endFeatureHintRun).toHaveBeenCalledOnce();
 		expect((fakeThis as unknown as { activeBashComponent: unknown }).activeBashComponent).toBeUndefined();
 	});
 });

@@ -303,9 +303,16 @@ describe("public command routing", () => {
 		});
 	});
 
-	it("keeps daemon terminology out of public help", () => {
+	it("formats concise top-level help", () => {
 		const help = formatTopLevelHelp();
+		expect(help).toContain("Options:");
+		expect(help).toContain("-p, --print");
+		expect(help).toContain("Commands:");
 		expect(help).toContain("shutdown");
 		expect(help).not.toContain("daemon");
+		expect(help).not.toContain("Environment Variables:");
+		expect(help).not.toContain("Examples:");
+		expect(help).not.toContain("Built-in Tool Names:");
+		expect(help).not.toContain("--autonomous");
 	});
 });

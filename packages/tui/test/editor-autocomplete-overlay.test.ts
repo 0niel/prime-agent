@@ -72,8 +72,30 @@ describe("editor autocomplete overlay", () => {
 		await terminal.waitForRender();
 
 		const viewport = terminal.getViewport();
-		assert.ok(viewport.some((line) => line.includes("help")));
+		assert.ok(viewport[0]?.includes("help"));
+		assert.ok(viewport[1]?.includes("hotkeys"));
 		assert.ok(viewport[3]?.includes("/"));
+		tui.stop();
+	});
+
+	it("keeps one suggestion visible when the editor is at the terminal top edge", async () => {
+		const terminal = new VirtualTerminal(40, 3);
+		const tui = new TUI(terminal);
+		const editor = new Editor(tui, defaultEditorTheme);
+		tui.addChild(editor);
+		tui.setFocus(editor);
+		editor.setAutocompleteProvider(autocompleteProvider);
+		tui.start();
+
+		editor.handleInput("/");
+		await Promise.resolve();
+		await new Promise((resolve) => setImmediate(resolve));
+		tui.requestRender(true);
+		await terminal.waitForRender();
+
+		const viewport = terminal.getViewport();
+		assert.ok(viewport[0]?.includes("hotkeys"));
+		assert.ok(viewport[1]?.includes("/"));
 		tui.stop();
 	});
 });
