@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
-import { getAgentLogPath, getDaemonLogPath } from "../../config.js";
+import { appendRotatingLog, getAgentLogPath, getDaemonLogPath } from "../../config.js";
 import type { AgentSessionEvent } from "../../core/agent-session.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
@@ -190,7 +190,16 @@ export class DaemonAgentConnection implements AgentConnection {
 			this.client.enableRequestRecovery();
 		}
 		this.unsubscribeDaemonMessages = this.client.onMessage((message) => {
-			void this.handleDaemonMessage(message);
+			void this.handleDaemonMessage(message).catch((error: unknown) => {
+				try {
+					appendRotatingLog(
+						getAgentLogPath(),
+						`[${new Date().toISOString()}] daemon-message: ignored ${message.type} failure: ${String(error)}`,
+					);
+				} catch {
+					// Logging failure must not turn an isolated message error into a connection failure.
+				}
+			});
 		});
 		this.captureDaemonLogPath();
 		this.unsubscribeDaemonClose = this.client.onClose((error) => {
@@ -464,8 +473,22 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async listHeartbeats(): Promise<AgentConnectionHeartbeat[]> {
-		const data = await this.requestData<{ heartbeats: AgentConnectionHeartbeat[] }>({ type: "heartbeats_list" });
-		return data.heartbeats;
+		const hasCapability = this.client.supportsServerCapability("heartbeat_catalog");
+		if (!hasCapability && this.client.hello?.protocol.version !== 3) {
+			return [];
+		}
+		try {
+			const command = { type: "heartbeats_list" } as const;
+			const data = hasCapability
+				? await this.requestData<{ heartbeats: AgentConnectionHeartbeat[] }>(command)
+				: await this.requestLegacyData<{ heartbeats: AgentConnectionHeartbeat[] }>(command);
+			return data.heartbeats;
+		} catch (error) {
+			if (isUnknownDaemonCommandError(error, "heartbeats_list")) {
+				return [];
+			}
+			throw error;
+		}
 	}
 
 	async manageHeartbeat(
@@ -473,13 +496,27 @@ export class DaemonAgentConnection implements AgentConnection {
 		jobId: string,
 		action: AgentHeartbeatManagementAction,
 	): Promise<AgentCronJob> {
-		const data = await this.requestData<{ heartbeat: AgentCronJob }>({
-			type: "heartbeat_manage",
-			activeSessionId,
-			jobId,
-			action,
-		});
-		return data.heartbeat;
+		const hasCapability = this.client.supportsServerCapability("heartbeat_management");
+		if (!hasCapability && this.client.hello?.protocol.version !== 3) {
+			throw new Error("Heartbeat management requires a newer Prime Agent daemon.");
+		}
+		try {
+			const command = {
+				type: "heartbeat_manage",
+				activeSessionId,
+				jobId,
+				action,
+			} as const;
+			const data = hasCapability
+				? await this.requestData<{ heartbeat: AgentCronJob }>(command)
+				: await this.requestLegacyData<{ heartbeat: AgentCronJob }>(command);
+			return data.heartbeat;
+		} catch (error) {
+			if (isUnknownDaemonCommandError(error, "heartbeat_manage")) {
+				throw new Error("Heartbeat management requires a newer Prime Agent daemon.");
+			}
+			throw error;
+		}
 	}
 
 	async addCronJob(schedule: string, prompt: string): Promise<AgentCronJob> {
@@ -980,7 +1017,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			return this.reconnectPromise;
 		}
 		this.reconnectPromise = (async () => {
-			await this.emit({ type: "connection_status", status: "reconnecting", error: cause.message });
+			void this.emit({ type: "connection_status", status: "reconnecting", error: cause.message });
 			const deadline = Date.now() + (this.options.reconnectTimeoutMs ?? DAEMON_RECONNECT_TIMEOUT_MS);
 			let attempt = 0;
 			let lastError: Error = cause;
@@ -995,8 +1032,8 @@ export class DaemonAgentConnection implements AgentConnection {
 					await this.attach();
 					if (!this.disposed) {
 						const snapshot = await this.getInitialSnapshot();
-						await this.emit({ type: "session_resynced", snapshot });
-						await this.emit({ type: "connection_status", status: "connected" });
+						void this.emit({ type: "session_resynced", snapshot });
+						void this.emit({ type: "connection_status", status: "connected" });
 					}
 					return;
 				} catch (error) {
@@ -1026,6 +1063,14 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	private async requestOk(command: DaemonCommandBody): Promise<void> {
 		await this.requestData<unknown>(command);
+	}
+
+	private async requestLegacyData<T>(command: DaemonCommandBody, timeoutMs?: number): Promise<T> {
+		const response = await this.client.requestLegacy(command, timeoutMs);
+		if (!response.success) {
+			throw deserializeDaemonError(response);
+		}
+		return response.data as T;
 	}
 
 	private async requestData<T>(command: DaemonCommandBody, timeoutMs?: number): Promise<T> {
@@ -1221,8 +1266,18 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (this.updateReconnectPromise) {
 			return this.updateReconnectPromise;
 		}
+		void this.emit({
+			type: "connection_status",
+			status: "reconnecting",
+			error: "The Prime Agent daemon is restarting for an update.",
+		});
 		const reconnectPromise = reconnectDaemonTransportAfterUpdate(this.client)
 			.then(() => this.restoreConnectionAfterUpdate())
+			.then(() => {
+				if (!this.disposed) {
+					void this.emit({ type: "connection_status", status: "connected" });
+				}
+			})
 			.catch(async (error: unknown) => {
 				this.updateRestartPending = false;
 				this.updateReconnectFailed = true;
@@ -1288,7 +1343,7 @@ export class DaemonAgentConnection implements AgentConnection {
 						return;
 					}
 					this.updateRestartPending = false;
-					await this.emit({ type: "session_resynced", snapshot });
+					void this.emit({ type: "session_resynced", snapshot });
 					return;
 				}
 			} catch (error) {
@@ -1569,13 +1624,15 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	private async emit(event: AgentConnectionEvent): Promise<void> {
+		const deliveries: Promise<void>[] = [];
 		for (const listener of [...this.listeners]) {
 			try {
-				await listener(event);
+				deliveries.push(Promise.resolve(listener(event)));
 			} catch {
 				// One attachment must not interrupt delivery or transport recovery for the others.
 			}
 		}
+		await Promise.allSettled(deliveries);
 	}
 
 	private observeSideQuestionEvent(event: AgentConnectionSideQuestionEvent): void {

@@ -42,9 +42,12 @@ import {
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
 	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
+	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_PROTOCOL_INFO,
+	DAEMON_SCHEMA_ID,
 	type DaemonAttachResult,
 	type DaemonClientCapability,
+	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonOutbound,
 	type DaemonResponse,
@@ -55,6 +58,7 @@ import {
 	isDaemonMutatingCommand,
 	success,
 } from "./daemon-protocol.js";
+import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
 import { matchesSessionIdSuffix } from "./daemon-session-id.js";
 import { type SessionSummary, summaryForInactiveSession } from "./daemon-session-list.js";
 import {
@@ -795,20 +799,16 @@ export class DaemonSupervisor {
 						type: "daemon_hello",
 						socketPath: this.socketPath,
 						protocol: DAEMON_PROTOCOL_INFO,
+						schemaId: DAEMON_SCHEMA_ID,
 						appVersion: VERSION,
+						runtime: getDaemonRuntimeIdentity(),
 						supervisorGeneration: this.generation,
 						supervisorOwnerToken: this.ownership?.record.token,
 						supervisorPid: process.pid,
 						supervisorProcessStartId: this.ownership?.record.processStartId,
 						supervisorSocketPath: this.ownership?.record.socketPath,
 						clientId: client.id,
-						serverCapabilities: [
-							"attach_snapshot",
-							"event_sequence",
-							"extension_ui",
-							"slim_attach",
-							"chunked_snapshot",
-						],
+						serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
 					});
 				}
 			},
@@ -1052,10 +1052,10 @@ export class DaemonSupervisor {
 				return success(command.id, command.type, summary ? this.publicSummary(worker, summary) : undefined);
 			}
 			case "restart":
-				setImmediate(() => void this.shutdown(0, false, true));
+				setImmediate(() => void this.shutdown(0, false, true, false, "update"));
 				return success(command.id, command.type);
 			case "shutdown":
-				setImmediate(() => void this.shutdown(0, true, false, command.force === true));
+				setImmediate(() => void this.shutdown(0, true, false, command.force === true, "shutdown"));
 				return success(command.id, "shutdown");
 			case "prepare_update_restart": {
 				const manifest = await this.prepareUpdateRestart();
@@ -3685,11 +3685,17 @@ export class DaemonSupervisor {
 		stopWorkers: boolean,
 		relaunch = false,
 		forceWorkers = false,
+		closingReason?: DaemonClosingReason,
 	): Promise<never> {
 		if (this.shuttingDown) {
 			process.exit(exitCode);
 		}
 		this.shuttingDown = true;
+		if (closingReason) {
+			for (const client of this.clients) {
+				this.write(client, { type: "daemon_closing", reason: closingReason });
+			}
+		}
 		for (const cleanup of this.signalCleanupHandlers) {
 			cleanup();
 		}

@@ -678,6 +678,56 @@ describe("InteractiveMode pending bash components", () => {
 });
 
 describe("InteractiveMode connection events", () => {
+	test("degrades heartbeat refresh failures without hiding queue refresh failures during rebind", async () => {
+		const rebindCurrentSession = (
+			InteractiveMode.prototype as unknown as { rebindCurrentSession(this: InteractiveMode): Promise<void> }
+		).rebindCurrentSession;
+		const createHarness = (
+			refreshConnectionQueue: () => Promise<void>,
+			refreshHeartbeatCatalog: () => Promise<void>,
+		) =>
+			({
+				unsubscribe: undefined,
+				localSessionHost: undefined,
+				toolDefinitionCache: { clear: vi.fn() },
+				applyRuntimeSettings: vi.fn(),
+				bindLocalSessionExtensions: true,
+				bindCurrentSessionExtensions: vi.fn(async () => {}),
+				subscribeToAgent: vi.fn(),
+				refreshConnectionQueue,
+				refreshHeartbeatCatalog,
+				updateAvailableProviderCount: vi.fn(async () => {}),
+				updateEditorBorderColor: vi.fn(),
+				updateTerminalTitle: vi.fn(),
+				setGoalAnnouncementBaseline: vi.fn(),
+				syncGoalTray: vi.fn(),
+				syncWorkingLoader: vi.fn(),
+				getGoalState: () => emptyGoalState(),
+			}) as unknown as InteractiveMode;
+
+		await expect(
+			rebindCurrentSession.call(
+				createHarness(
+					vi.fn(async () => {}),
+					vi.fn(async () => {
+						throw new Error("heartbeat unavailable");
+					}),
+				),
+			),
+		).resolves.toBeUndefined();
+
+		await expect(
+			rebindCurrentSession.call(
+				createHarness(
+					vi.fn(async () => {
+						throw new Error("queue unavailable");
+					}),
+					vi.fn(async () => {}),
+				),
+			),
+		).rejects.toThrow("queue unavailable");
+	});
+
 	test("restores in-flight assistant state on every session render", async () => {
 		const streamingMessage = {
 			role: "assistant",

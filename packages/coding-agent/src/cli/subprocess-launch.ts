@@ -5,6 +5,19 @@ export interface CliSubprocessLaunchSpec {
 	args: string[];
 }
 
+function quoteCommandArgument(value: string): string {
+	return /^[A-Za-z0-9_./:@%+=,-]+$/.test(value) ? value : `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+export function formatCurrentCliCommand(args: readonly string[], environment: NodeJS.ProcessEnv = process.env): string {
+	const launcherPath = environment.PRIME_AGENT_LAUNCHER_PATH;
+	if (launcherPath) {
+		return [launcherPath, ...args].map(quoteCommandArgument).join(" ");
+	}
+	const launch = createCliSubprocessLaunchSpec(args);
+	return [launch.command, ...launch.args].map(quoteCommandArgument).join(" ");
+}
+
 export function createCliSubprocessLaunchSpec(
 	args: readonly string[],
 	executable = process.execPath,

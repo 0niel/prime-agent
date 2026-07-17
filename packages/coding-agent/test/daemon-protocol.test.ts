@@ -1,16 +1,59 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	createDaemonCommandEnvelope,
 	createDaemonEventEnvelope,
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
+	DAEMON_COMMAND_COMPATIBILITY,
+	DAEMON_DEFAULT_SERVER_CAPABILITIES,
+	DAEMON_OUTBOUND_COMPATIBILITY,
 	DAEMON_PROTOCOL_INFO,
+	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_ID,
+	DAEMON_SCHEMA_REVISION,
 	type DaemonOutbound,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
 } from "../src/modes/daemon/daemon-protocol.js";
 
 describe("daemon protocol helpers", () => {
+	it("keeps the advertised schema identity synchronized with wire type shapes", () => {
+		const source = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-protocol.ts"), "utf8");
+		const commandSource = source.slice(
+			source.indexOf("export type DaemonCommand ="),
+			source.indexOf("type DaemonCommandName"),
+		);
+		const outboundSource = source.slice(
+			source.indexOf("export type DaemonOutbound ="),
+			source.indexOf("export const DAEMON_OUTBOUND_COMPATIBILITY"),
+		);
+		const digest = createHash("sha256").update(`${commandSource}\n${outboundSource}`).digest("hex").slice(0, 12);
+		expect(DAEMON_SCHEMA_ID).toBe(`protocol-${DAEMON_PROTOCOL_VERSION}-schema-${DAEMON_SCHEMA_REVISION}-${digest}`);
+	});
+
+	it("requires compatibility metadata for the heartbeat protocol surface", () => {
+		expect(DAEMON_PROTOCOL_VERSION).toBe(4);
+		expect(DAEMON_SCHEMA_ID).toContain(`protocol-${DAEMON_PROTOCOL_VERSION}`);
+		expect(DAEMON_COMMAND_COMPATIBILITY.heartbeats_list).toEqual({
+			minProtocol: 3,
+			capability: "heartbeat_catalog",
+		});
+		expect(DAEMON_COMMAND_COMPATIBILITY.heartbeat_manage).toEqual({
+			minProtocol: 3,
+			capability: "heartbeat_management",
+		});
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.heartbeats_changed).toEqual({
+			minProtocol: 3,
+			capability: "heartbeat_catalog",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toEqual(
+			expect.arrayContaining(["heartbeat_catalog", "heartbeat_management"]),
+		);
+	});
+
 	it("creates versioned command and event envelopes", () => {
 		const command = { id: "cmd-1", type: "attach", activeSessionId: "active-1" } as const;
 		const commandEnvelope = createDaemonCommandEnvelope(command, "cmd-1", "client-1");
