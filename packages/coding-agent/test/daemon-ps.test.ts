@@ -2,15 +2,20 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	type DaemonInfo,
+	evaluateShutdownQuietPeriod,
 	isWorkerSocketPath,
+	mergeDiscoveredDaemonProcesses,
 	parseLsofListeners,
+	parsePrimeAgentProcessIds,
 	parsePsEtimes,
 	parseSsListeners,
 	planReap,
 	planShutdownAll,
 	planShutdownConfirmation,
 	sortDaemons,
+	verifyHelloSupervisorPid,
 } from "../src/cli/daemon-ps.js";
+import { getProcessStartId } from "../src/core/session-lease.js";
 import { defaultDaemonSocketDir } from "../src/modes/daemon/daemon-socket.js";
 
 describe("worker socket classification", () => {
@@ -57,6 +62,57 @@ describe("parseLsofListeners", () => {
 			{ pid: 1234, socketPath: "/tmp/a.sock" },
 			{ pid: 5678, socketPath: "/tmp/b.sock" },
 		]);
+	});
+});
+
+describe("parsePrimeAgentProcessIds", () => {
+	it("finds process.title names even when lsof reports the executable as node", () => {
+		const stdout = [
+			"  123 node prime-agent --mode daemon",
+			"  456 prime-agent prime-agent",
+			"  789 /usr/local/bin/prime-agent prime-agent",
+			"  900 node unrelated.js",
+			"",
+		].join("\n");
+		expect(parsePrimeAgentProcessIds(stdout, "prime-agent")).toEqual([123, 456, 789]);
+	});
+});
+
+describe("mergeDiscoveredDaemonProcesses", () => {
+	it("keeps process-title discoveries when lsof by name returned only a partial set", () => {
+		expect(
+			mergeDiscoveredDaemonProcesses(
+				[
+					{ pid: 123, socketPath: "/tmp/by-name.sock" },
+					{ pid: 456, socketPath: "/tmp/shared.sock" },
+				],
+				[
+					{ pid: 456, socketPath: "/tmp/shared.sock" },
+					{ pid: 789, socketPath: "/tmp/by-pid.sock" },
+				],
+			),
+		).toEqual([
+			{ pid: 123, socketPath: "/tmp/by-name.sock" },
+			{ pid: 456, socketPath: "/tmp/shared.sock" },
+			{ pid: 789, socketPath: "/tmp/by-pid.sock" },
+		]);
+	});
+});
+
+describe("evaluateShutdownQuietPeriod", () => {
+	it("requires a full quiet period independently of the convergence window", () => {
+		expect(evaluateShutdownQuietPeriod(10_500, 10_000)).toBe("waiting");
+		expect(evaluateShutdownQuietPeriod(11_000, 10_000)).toBe("complete");
+	});
+});
+
+describe("verifyHelloSupervisorPid", () => {
+	it("accepts the hello pid only while its process identity still matches", () => {
+		const processStartId = getProcessStartId(process.pid);
+		expect(verifyHelloSupervisorPid(process.pid, processStartId)).toBe(process.pid);
+		if (processStartId) {
+			expect(verifyHelloSupervisorPid(process.pid, `${processStartId}-stale`)).toBeUndefined();
+		}
 	});
 });
 

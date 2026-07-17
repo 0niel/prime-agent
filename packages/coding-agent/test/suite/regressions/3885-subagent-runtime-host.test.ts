@@ -41,7 +41,7 @@ describe("ENG-3885 subagent runtime host", () => {
 		vi.unstubAllEnvs();
 	});
 
-	it("creates running RLM children as tracked AgentSessionRuntime instances", async () => {
+	it("creates explicitly modeled RLM children as tracked AgentSessionRuntime instances", async () => {
 		const tempDir = join(tmpdir(), `pi-3885-subagent-runtime-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
 		vi.stubEnv(SESSION_LEASES_ENABLED_ENV, "1");
@@ -129,8 +129,6 @@ describe("ENG-3885 subagent runtime host", () => {
 			}
 		});
 
-		await runtime.session.setModel(faux.getModel("faux-child")!);
-
 		let releaseChild: () => void = () => {};
 		const release = new Promise<void>((resolve) => {
 			releaseChild = resolve;
@@ -146,7 +144,9 @@ describe("ENG-3885 subagent runtime host", () => {
 			},
 		]);
 
-		const resultPromise = runtime.session.runRlmChild("inspect child runtime");
+		const resultPromise = runtime.session.runRlmChild("inspect child runtime", {
+			model: `${faux.getModel("faux-child")!.provider}/faux-child`,
+		});
 
 		await waitFor(() => childStarted && runtime.listSubagentRuntimes().length === 1);
 		const [childRuntime] = runtime.listSubagentRuntimes();

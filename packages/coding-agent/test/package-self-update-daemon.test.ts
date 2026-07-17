@@ -19,7 +19,7 @@ import {
 	VERSION,
 } from "../src/config.js";
 import type { AgentSessionRuntimeMetadata } from "../src/core/agent-session-runtime.js";
-import { DAEMON_PROTOCOL_VERSION } from "../src/modes/daemon/daemon-protocol.js";
+import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
 import type * as DaemonSocketModule from "../src/modes/daemon/daemon-socket.js";
 import {
 	handlePackageCommand,
@@ -108,6 +108,7 @@ const mockState = vi.hoisted(() => ({
 	globalPackageRoot: "",
 	hello: { protocol: { version: 0 } } as {
 		protocol: { version: number };
+		schemaId?: string;
 		supervisorGeneration?: string;
 		supervisorOwnerToken?: string;
 		supervisorPid?: number;
@@ -140,6 +141,7 @@ const mockState = vi.hoisted(() => ({
 function useFixedOwnerHello(): void {
 	mockState.hello = {
 		protocol: { version: DAEMON_PROTOCOL_VERSION },
+		schemaId: DAEMON_SCHEMA_ID,
 		supervisorGeneration: "fixed-owner",
 		supervisorOwnerToken: "owner-token",
 		supervisorPid: process.pid,
@@ -269,6 +271,7 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 
 		async waitForHello(): Promise<{
 			protocol: { version: number };
+			schemaId?: string;
 			appVersion: string;
 			supervisorGeneration?: string;
 			supervisorOwnerToken?: string;
@@ -289,6 +292,7 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 						}
 					: {
 							protocol: { version: DAEMON_PROTOCOL_VERSION },
+							schemaId: DAEMON_SCHEMA_ID,
 							appVersion: VERSION,
 							supervisorPid: 1002,
 							supervisorGeneration: "replacement-generation",
@@ -390,7 +394,7 @@ describe("self-update daemon restart", () => {
 		projectDir = join(tempDir, "project");
 		packageDir = join(tempDir, "global-prefix", "lib", "node_modules", PACKAGE_NAME);
 		mockState.globalPackageRoot = join(tempDir, "global-prefix", "lib", "node_modules");
-		mockState.hello = { protocol: { version: DAEMON_PROTOCOL_VERSION } };
+		mockState.hello = { protocol: { version: DAEMON_PROTOCOL_VERSION }, schemaId: DAEMON_SCHEMA_ID };
 		mockState.helloCount = 0;
 		mockState.lastCoordinatorStatus = undefined;
 		mockState.listResponse = undefined;

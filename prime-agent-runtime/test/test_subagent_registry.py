@@ -39,23 +39,76 @@ class RlmSubagentRegistryTest(unittest.TestCase):
         self.assertEqual(subagents[0].status, "completed")
         host_request.assert_awaited_once_with("rlm.list_subagents")
 
-    def test_forwards_orchestrator_chosen_name_to_host(self) -> None:
+    def test_forwards_orchestrator_chosen_name_and_model_to_host(self) -> None:
         host_request = AsyncMock(
             return_value={
                 "answer": "done",
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1},
                 "turns": 1,
                 "session_dir": "/tmp/parent/sub-a1b2c3d4",
+                "model": "openai/gpt-5.4",
+                "warning": "Requested model unavailable; tell the user about the fallback.",
             }
         )
 
         with patch.object(rlm_module, "host_request", host_request):
-            asyncio.run(rlm_module.rlm("check the API", name="api-reviewer"))
+            result = asyncio.run(
+                rlm_module.rlm(
+                    "check the API",
+                    name="api-reviewer",
+                    model="deepseek/deepseek-v4-flash",
+                )
+            )
 
         host_request.assert_awaited_once_with(
             "rlm.run",
-            {"prompt": "check the API", "kwargs": {"name": "api-reviewer"}},
+            {
+                "prompt": "check the API",
+                "kwargs": {
+                    "name": "api-reviewer",
+                    "model": "deepseek/deepseek-v4-flash",
+                },
+            },
         )
+        self.assertEqual(result.model, "openai/gpt-5.4")
+        self.assertIn("tell the user", result.warning)
+
+    def test_finds_authenticated_models_through_host(self) -> None:
+        host_request = AsyncMock(
+            return_value={
+                "models": [
+                    {
+                        "provider": "anthropic",
+                        "id": "claude-opus-4-7",
+                        "name": "Claude Opus 4.7",
+                        "selector": "anthropic/claude-opus-4-7",
+                    }
+                ]
+            }
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            models = asyncio.run(rlm_module.rlm.find_models("opus", limit=3))
+
+        self.assertEqual(models[0].provider, "anthropic")
+        self.assertEqual(models[0].id, "claude-opus-4-7")
+        self.assertEqual(models[0].name, "Claude Opus 4.7")
+        self.assertEqual(models[0].selector, "anthropic/claude-opus-4-7")
+        host_request.assert_awaited_once_with(
+            "rlm.find_models",
+            {"query": "opus", "limit": 3},
+        )
+
+    def test_rejects_invalid_model_search_input_and_response(self) -> None:
+        with self.assertRaisesRegex(TypeError, "query must be str"):
+            asyncio.run(rlm_module.find_models(123))
+        with self.assertRaisesRegex(TypeError, "limit must be int"):
+            asyncio.run(rlm_module.find_models("opus", limit="3"))
+
+        host_request = AsyncMock(return_value={"models": [{"provider": "anthropic"}]})
+        with patch.object(rlm_module, "host_request", host_request):
+            with self.assertRaisesRegex(RuntimeError, "invalid model entry"):
+                asyncio.run(rlm_module.find_models("opus"))
 
     def test_deletes_subagent_by_name_through_host(self) -> None:
         deleted_payload = {

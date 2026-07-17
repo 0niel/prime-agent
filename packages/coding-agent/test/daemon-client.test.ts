@@ -191,6 +191,38 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("rejects unsupported optional commands without writing them to an older daemon", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, 3);
+
+		expect(client.supportsServerCapability("heartbeat_catalog")).toBe(false);
+		await expect(client.request({ type: "heartbeats_list" })).rejects.toThrow("does not support heartbeat_catalog");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("isolates a message consumer failure from the rest of the client", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket);
+		let delivered = 0;
+		client.onMessage(() => {
+			throw new Error("broken optional consumer");
+		});
+		client.onMessage(() => delivered++);
+
+		expect(() => socket.emit("data", `${JSON.stringify({ type: "heartbeats_changed" })}\n`)).not.toThrow();
+		expect(delivered).toBe(1);
+		client.close();
+	});
+
 	it("serializes activeSessionId for session commands", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 

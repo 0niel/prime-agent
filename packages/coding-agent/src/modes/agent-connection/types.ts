@@ -479,6 +479,8 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 	activeSessionId?: string;
 	/** Stable daemon-visible session name for addressing/displaying the child. */
 	sessionName?: string;
+	/** Exact provider/model selector used by the child. */
+	model?: string;
 	label: string;
 	status: AgentConnectionRlmChildAgentStatus;
 	durationMs?: number;
