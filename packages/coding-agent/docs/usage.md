@@ -173,7 +173,7 @@ cat README.md | pi -p "Summarize this text"
 | `--provider <name>` | Provider, such as `anthropic`, `openai`, or `google` |
 | `--model <pattern>` | Model pattern or ID; supports `provider/id` and optional `:<thinking>` |
 | `--api-key <key>` | API key, overriding environment variables |
-| `--thinking <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh` |
+| `--thinking <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` |
 | `--models <patterns>` | Comma-separated patterns for Ctrl+P cycling |
 
 Use `prime-agent model list [search]` to list available models.
@@ -205,11 +205,11 @@ Built-in tools: `ipython`.
 | Option | Description |
 |--------|-------------|
 | `-e`, `--extension <source>` | Load an extension from path, npm, or git; repeatable |
-| `--no-extensions` | Disable extension discovery |
+| `--no-extensions`, `-ne` | Disable extension discovery |
 | `--skill <path>` | Load a skill; repeatable |
-| `--no-skills` | Disable skill discovery |
+| `--no-skills`, `-ns` | Disable skill discovery |
 | `--prompt-template <path>` | Load a prompt template; repeatable |
-| `--no-prompt-templates` | Disable prompt template discovery |
+| `--no-prompt-templates`, `-np` | Disable prompt template discovery |
 | `--theme <path>` | Load a theme; repeatable |
 | `--no-themes` | Disable theme discovery |
 | `--no-context-files`, `-nc` | Disable `AGENTS.md` and `CLAUDE.md` discovery |
@@ -220,15 +220,31 @@ Combine `--no-*` with explicit flags to load exactly what you need, ignoring set
 pi --no-extensions -e ./my-extension.ts
 ```
 
+### Autonomous Options
+
+| Option | Description |
+|--------|-------------|
+| `--autonomous` | Continue until host-observable terminal evidence exists |
+| `--autonomous-gate <command>` | Run a command before autonomous mode may finish; repeatable |
+| `--autonomous-gate-retries <n>` | Maximum retries for each failed gate; default is 3 |
+| `--autonomous-gate-timeout-ms <n>` | Timeout for each gate command |
+| `--autonomous-max-continuations <n>` | Maximum autonomous follow-up messages; default is 3 |
+| `--autonomous-max-turns <n>` | Maximum assistant turns; default is 12 |
+| `--autonomous-max-tokens <n>` | Maximum tokens; default is 80000 |
+| `--autonomous-timeout-ms <n>` | Maximum wall-clock duration; default is 1800000 milliseconds |
+
 ### Other Options
 
 | Option | Description |
 |--------|-------------|
+| `--cwd <dir>` | Use a specific working directory for the session |
 | `--system-prompt <text>` | Replace default prompt; context files and skills are still appended |
 | `--append-system-prompt <text>` | Append to system prompt |
 | `--verbose` | Force verbose startup |
+| `--offline` | Disable startup network operations |
 | `-h`, `--help` | Show help |
 | `-v`, `--version` | Show version |
+| `--` | End option parsing and treat all following arguments as messages |
 
 ### File Arguments
 

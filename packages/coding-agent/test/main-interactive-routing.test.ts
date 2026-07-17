@@ -48,13 +48,12 @@ describe("interactive startup routing", () => {
 	});
 
 	type InteractiveFallbackOverrides = Partial<
-		Pick<InteractiveDaemonStartupDecision, "startupBenchmark" | "noSession" | "help" | "listModels">
+		Pick<InteractiveDaemonStartupDecision, "startupBenchmark" | "noSession" | "listModels">
 	>;
 
 	const fallbackCases: Array<[string, InteractiveFallbackOverrides]> = [
 		["startup benchmark", { startupBenchmark: true }],
 		["--no-session", { noSession: true }],
-		["--help", { help: true }],
 		["--list-models", { listModels: true }],
 		["--list-models search", { listModels: "claude" }],
 	];
