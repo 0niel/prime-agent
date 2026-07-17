@@ -234,6 +234,7 @@ describe("agents view state", () => {
 				parentActiveSessionId: "parent-active",
 				hasActiveHeartbeat: true,
 				activity: "idle",
+				taskState: "completed",
 				messageCount: 2,
 			}),
 			makeSummary({
@@ -242,13 +243,20 @@ describe("agents view state", () => {
 				sessionId: "parent-session",
 				sessionName: "Parent",
 				activity: "idle",
+				taskState: "completed",
 				messageCount: 2,
 			}),
 		];
 
 		const collapsed = buildAgentsViewRows(summaries);
+		expect(collapsed[0]).toMatchObject({
+			kind: "agent",
+			section: "heartbeats",
+			statusLabel: "heartbeat active",
+		});
 		expect(collapsed[1]).toMatchObject({
 			kind: "subagent-summary",
+			section: "heartbeats",
 			title: "1 subagent · 1 heartbeat active",
 		});
 		const expanded = buildAgentsViewRows(summaries, new Set([collapsed[0]?.identity ?? ""]));
@@ -257,6 +265,58 @@ describe("agents view state", () => {
 			section: "heartbeats",
 			statusLabel: "heartbeat active",
 		});
+	});
+
+	test("propagates a descendant heartbeat through completed subagent ancestors", () => {
+		const summaries = [
+			makeSummary({
+				id: "heartbeat-grandchild",
+				activeSessionId: "heartbeat-grandchild",
+				sessionId: "heartbeat-grandchild-session",
+				sessionName: "Heartbeat grandchild",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "child-active",
+				hasActiveHeartbeat: true,
+				activity: "idle",
+				taskState: "completed",
+			}),
+			makeSummary({
+				id: "child-active",
+				activeSessionId: "child-active",
+				sessionId: "child-session",
+				sessionName: "Child",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "root-active",
+				activity: "idle",
+				taskState: "completed",
+			}),
+			makeSummary({
+				id: "root-active",
+				activeSessionId: "root-active",
+				sessionId: "root-session",
+				sessionName: "Root",
+				activity: "idle",
+				taskState: "completed",
+			}),
+		];
+
+		const rootIdentity = buildAgentsViewRows(summaries)[0]?.identity ?? "";
+		const oneLevel = buildAgentsViewRows(summaries, new Set([rootIdentity]));
+		const child = oneLevel.find((row) => row.title === "Child");
+		expect(oneLevel[0]).toMatchObject({ section: "heartbeats", statusLabel: "heartbeat active" });
+		expect(child).toMatchObject({ section: "heartbeats", statusLabel: "heartbeat active" });
+
+		const childIdentity = child?.identity ?? "";
+		const expanded = buildAgentsViewRows(summaries, new Set([rootIdentity, childIdentity]));
+		expect(
+			expanded
+				.filter((row) => row.kind === "agent" || row.kind === "subagent")
+				.map((row) => [row.title, row.section, row.statusLabel]),
+		).toEqual([
+			["Root", "heartbeats", "heartbeat active"],
+			["Child", "heartbeats", "heartbeat active"],
+			["Heartbeat grandchild", "heartbeats", "heartbeat active"],
+		]);
 	});
 
 	test("expands subagent rows for expanded parents and collapses otherwise", () => {
