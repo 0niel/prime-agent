@@ -231,13 +231,14 @@ describe("ToolExecutionComponent parity", () => {
 				.mockReset()
 				.mockReturnValueOnce(first.promise)
 				.mockReturnValueOnce(second.promise);
+			const requestRender = vi.fn();
 			const component = new ToolExecutionComponent(
 				"custom_tool",
 				"tool-image-queue",
 				{},
 				{},
 				undefined,
-				createFakeTui(),
+				{ requestRender } as unknown as TUI,
 				process.cwd(),
 			);
 			const result = {
@@ -257,7 +258,7 @@ describe("ToolExecutionComponent parity", () => {
 			await waitForCondition(() => imageConvertMocks.convertToPng.mock.calls.length === 2);
 			expect(imageConvertMocks.convertToPng).toHaveBeenCalledTimes(2);
 			second.resolve({ data: "second-png", mimeType: "image/png" });
-			await waitForCondition(() => (component as any).convertedImages.size === 2);
+			await waitForCondition(() => requestRender.mock.calls.length === 2);
 		} finally {
 			resetCapabilitiesCache();
 		}
