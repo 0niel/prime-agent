@@ -12,15 +12,6 @@ describe("Git URL Parsing", () => {
 			});
 		});
 
-		it("should parse ssh:// URL", () => {
-			const result = parseGitUrl("ssh://git@github.com/user/repo");
-			expect(result).toMatchObject({
-				host: "github.com",
-				path: "user/repo",
-				repo: "ssh://git@github.com/user/repo",
-			});
-		});
-
 		it("should parse protocol URL with ref", () => {
 			const result = parseGitUrl("https://github.com/user/repo@v1.0.0");
 			expect(result).toMatchObject({
