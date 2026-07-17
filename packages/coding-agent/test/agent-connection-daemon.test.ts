@@ -18,6 +18,7 @@ import {
 	type DaemonClientCloseListener,
 	type DaemonClientMessageListener,
 	type DaemonClientRequestOptions,
+	type DaemonHello,
 	DaemonSocketClosedError,
 } from "../src/modes/daemon/daemon-client.js";
 import {
@@ -45,7 +46,10 @@ class FakeDaemonClient {
 	connectionStateFactory: ((activeSessionId: string) => AgentConnectionState) | undefined;
 	abortBashUnknownCommand = false;
 	abortAndClearQueueUnknownCommand = false;
+	legacyHeartbeatCommandsSupported = false;
+	serverCapabilities = new Set<string>();
 	updateRestartSessions: Array<Record<string, unknown>> = [];
+	hello: DaemonHello | undefined;
 	private readonly messageListeners = new Set<DaemonClientMessageListener>();
 	private readonly closeListeners = new Set<DaemonClientCloseListener>();
 
@@ -218,6 +222,29 @@ class FakeDaemonClient {
 					success: true,
 					data: { steering: ["aborted"], followUp: ["cleared"] },
 				};
+			case "heartbeats_list":
+				return this.legacyHeartbeatCommandsSupported
+					? { type: "response", command: command.type, success: true, data: { heartbeats: [] } }
+					: {
+							type: "response",
+							command: command.type,
+							success: false,
+							error: "Unknown daemon command: heartbeats_list",
+						};
+			case "heartbeat_manage":
+				return this.legacyHeartbeatCommandsSupported
+					? {
+							type: "response",
+							command: command.type,
+							success: true,
+							data: { heartbeat: { id: command.jobId } },
+						}
+					: {
+							type: "response",
+							command: command.type,
+							success: false,
+							error: "Unknown daemon command: heartbeat_manage",
+						};
 			case "list_saved_sessions": {
 				const activeSessionId = "activeSessionId" in command ? command.activeSessionId : undefined;
 				options.onProgress?.({
@@ -365,6 +392,18 @@ class FakeDaemonClient {
 			default:
 				throw new Error(`Unexpected command: ${command.type}`);
 		}
+	}
+
+	async requestLegacy(
+		command: DaemonCommand,
+		timeoutMs = 30000,
+		options: DaemonClientRequestOptions = {},
+	): Promise<DaemonResponse> {
+		return this.request(command, timeoutMs, options);
+	}
+
+	supportsServerCapability(capability: string): boolean {
+		return this.serverCapabilities.has(capability);
 	}
 
 	onMessage(listener: DaemonClientMessageListener): () => void {
@@ -591,6 +630,55 @@ function emitSequencedQueueUpdate(client: FakeDaemonClient, activeSessionId: str
 }
 
 describe("DaemonAgentConnection", () => {
+	it("degrades an unavailable heartbeat catalog without sending an unsupported command", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+
+		await expect(connection.listHeartbeats()).resolves.toEqual([]);
+		expect(fakeClient.requests).toEqual([]);
+		await expect(connection.manageHeartbeat("active-original", "job-1", "pause")).rejects.toThrow(
+			"requires a newer Prime Agent daemon",
+		);
+		expect(fakeClient.requests).toEqual([]);
+	});
+
+	it("uses heartbeat commands supported by a retained protocol-3 daemon", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.hello = {
+			type: "daemon_hello",
+			socketPath: "/tmp/prime-agent.sock",
+			protocol: { ...DAEMON_PROTOCOL_INFO, version: 3 },
+			clientId: "legacy-client",
+			serverCapabilities: [],
+		};
+		fakeClient.legacyHeartbeatCommandsSupported = true;
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+
+		await expect(connection.listHeartbeats()).resolves.toEqual([]);
+		await expect(connection.manageHeartbeat("active-original", "job-1", "pause")).resolves.toMatchObject({
+			id: "job-1",
+		});
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["heartbeats_list", "heartbeat_manage"]);
+	});
+
+	it("degrades heartbeat commands missing from an older protocol-3 daemon", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.hello = {
+			type: "daemon_hello",
+			socketPath: "/tmp/prime-agent.sock",
+			protocol: { ...DAEMON_PROTOCOL_INFO, version: 3 },
+			clientId: "legacy-client",
+			serverCapabilities: [],
+		};
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+
+		await expect(connection.listHeartbeats()).resolves.toEqual([]);
+		await expect(connection.manageHeartbeat("active-original", "job-1", "pause")).rejects.toThrow(
+			"Heartbeat management requires a newer Prime Agent daemon.",
+		);
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["heartbeats_list", "heartbeat_manage"]);
+	});
+
 	it("reattaches an open window to its restored session after an update restart", async () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.emitCloseOnClose = true;
@@ -625,9 +713,10 @@ describe("DaemonAgentConnection", () => {
 			activeSessionId: "active-original",
 			reason: "update",
 		});
-		await Promise.resolve();
-		expect(fakeClient.closeCount).toBe(1);
-		expect(fakeClient.reconnectCount).toBe(1);
+		await vi.waitFor(() => {
+			expect(fakeClient.closeCount).toBe(1);
+			expect(fakeClient.reconnectCount).toBe(1);
+		});
 
 		await expect(restored).resolves.toMatchObject({
 			type: "session_resynced",
@@ -643,14 +732,18 @@ describe("DaemonAgentConnection", () => {
 			activeSessionId: "active-restored",
 			resumeCursor: undefined,
 		});
-		expect(events).toEqual([
-			expect.objectContaining({
-				type: "session_resynced",
-				snapshot: expect.objectContaining({
-					state: expect.objectContaining({ activeSessionId: "active-restored" }),
+		await vi.waitFor(() => {
+			expect(events).toEqual([
+				expect.objectContaining({ type: "connection_status", status: "reconnecting" }),
+				expect.objectContaining({
+					type: "session_resynced",
+					snapshot: expect.objectContaining({
+						state: expect.objectContaining({ activeSessionId: "active-restored" }),
+					}),
 				}),
-			}),
-		]);
+				{ type: "connection_status", status: "connected" },
+			]);
+		});
 	});
 
 	it("reattaches when an update socket close arrives before the session notice", async () => {
@@ -914,7 +1007,7 @@ describe("DaemonAgentConnection", () => {
 			await Promise.resolve();
 		}
 
-		expect(events).toEqual([]);
+		expect(events).toEqual([expect.objectContaining({ type: "connection_status", status: "reconnecting" })]);
 		expect(fakeClient.requests.at(-1)).toMatchObject({ type: "detach", activeSessionId: "active-restored" });
 	});
 
@@ -1723,6 +1816,35 @@ describe("DaemonAgentConnection", () => {
 
 		await vi.waitFor(() => expect(statuses).toEqual(["reconnecting", "connected"]));
 		expect(fakeClient.reconnectCount).toBe(1);
+	});
+
+	it("does not let a stalled subscriber block update recovery", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.updateRestartSessions = [
+			{
+				id: "active-restored",
+				activeSessionId: "active-restored",
+				sessionId: "session-current",
+				sessionFile: "/tmp/session-current.jsonl",
+			},
+		];
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-original");
+		const statuses: string[] = [];
+		connection.subscribe(() => new Promise<void>(() => undefined));
+		connection.subscribe((event) => {
+			if (event.type === "connection_status") {
+				statuses.push(event.status);
+			}
+		});
+		await connection.attach();
+
+		fakeClient.emitClose(new DaemonSocketClosedError("/tmp/prime-agent.sock", "update"));
+
+		await vi.waitFor(() => expect(statuses).toEqual(["reconnecting", "connected"]));
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "attach",
+			activeSessionId: "active-restored",
+		});
 	});
 
 	it("refreshes initial snapshots after live events make the cached snapshot stale", async () => {

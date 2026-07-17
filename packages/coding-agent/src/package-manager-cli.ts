@@ -49,6 +49,7 @@ import { SettingsManager } from "./core/settings-manager.js";
 import { DaemonClient, type DaemonHello } from "./modes/daemon/daemon-client.js";
 import {
 	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_ID,
 	type DaemonUpdateRestartManifest,
 	type DaemonUpdateRestartQueuedMessage,
 	type DaemonUpdateRestartSession,
@@ -1240,9 +1241,14 @@ function validateReplacementDaemon(
 	hello: DaemonHello,
 	predecessor: DaemonUpdateRestartProcessIdentity | undefined,
 ): DaemonUpdateRestartProcessIdentity {
-	if (hello.protocol.version !== DAEMON_PROTOCOL_VERSION || hello.appVersion !== VERSION) {
+	if (
+		hello.protocol.version !== DAEMON_PROTOCOL_VERSION ||
+		hello.schemaId !== DAEMON_SCHEMA_ID ||
+		hello.appVersion !== VERSION
+	) {
 		throw new Error(
-			`Replacement daemon is v${hello.appVersion}/proto${hello.protocol.version}, expected v${VERSION}/proto${DAEMON_PROTOCOL_VERSION}`,
+			`Replacement daemon is v${hello.appVersion}/proto${hello.protocol.version}/schema ${hello.schemaId ?? "legacy"}, ` +
+				`expected v${VERSION}/proto${DAEMON_PROTOCOL_VERSION}/schema ${DAEMON_SCHEMA_ID}`,
 		);
 	}
 	if (

@@ -6,7 +6,11 @@ import { APP_NAME, getAgentDir, VERSION } from "../config.js";
 import { isOrphanProcessIdentityCurrent, readActiveOrphanProcesses } from "../core/orphan-process-journal.js";
 import { getProcessStartId } from "../core/session-lease.js";
 import { DaemonClient } from "../modes/daemon/daemon-client.js";
-import { DAEMON_PROTOCOL_VERSION } from "../modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_ID,
+	type DaemonRuntimeIdentity,
+} from "../modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
 import { acquireDaemonShutdownAdmission } from "../modes/daemon/daemon-supervisor-ownership.js";
 import type { DaemonWorkerDescriptor } from "../modes/daemon/daemon-worker-protocol.js";
@@ -46,6 +50,10 @@ export interface DaemonInfo {
 	uptimeSeconds?: number;
 	version?: string;
 	protocolVersion?: number;
+	schemaId?: string;
+	buildId?: string;
+	executablePath?: string;
+	pidSource?: "listener" | "hello";
 	sessionCount?: number;
 	status: DaemonStatus;
 	isDefault: boolean;
@@ -58,6 +66,15 @@ const STATUS_ORDER: Record<DaemonStatus, number> = {
 	unreachable: 2,
 	"orphan-file": 3,
 };
+const SHUTDOWN_QUIET_PERIOD_MS = 1000;
+const SHUTDOWN_CONVERGENCE_TIMEOUT_MS = 10_000;
+
+export function evaluateShutdownQuietPeriod(now: number, quietSince: number | undefined): "complete" | "waiting" {
+	if (quietSince !== undefined && now - quietSince >= SHUTDOWN_QUIET_PERIOD_MS) {
+		return "complete";
+	}
+	return "waiting";
+}
 
 // Linux comm names (and thus the process name ss reports) are capped at 15 chars.
 const MAX_COMM_LENGTH = 15;
@@ -117,6 +134,34 @@ export function parseLsofListeners(stdout: string): DiscoveredDaemonProcess[] {
 	return daemons;
 }
 
+export function parsePrimeAgentProcessIds(stdout: string, appName: string): number[] {
+	const pids: number[] = [];
+	for (const line of stdout.split("\n")) {
+		const match = line.trim().match(/^(\d+)\s+(\S+)(?:\s+(.*))?$/);
+		if (!match) {
+			continue;
+		}
+		const command = basename(match[2]!);
+		const argv0 = basename(match[3]?.trim().split(/\s+/, 1)[0] ?? "");
+		if (processNameMatches(command, appName) || processNameMatches(argv0, appName)) {
+			pids.push(Number.parseInt(match[1]!, 10));
+		}
+	}
+	return pids;
+}
+
+export function mergeDiscoveredDaemonProcesses(
+	...groups: readonly DiscoveredDaemonProcess[][]
+): DiscoveredDaemonProcess[] {
+	const byIdentity = new Map<string, DiscoveredDaemonProcess>();
+	for (const group of groups) {
+		for (const daemon of group) {
+			byIdentity.set(`${daemon.pid}:${daemon.socketPath}`, daemon);
+		}
+	}
+	return [...byIdentity.values()];
+}
+
 /** Parse `ps -o pid=,etimes=` output into a pid → uptime-seconds map. */
 export function parsePsEtimes(stdout: string): Map<number, number> {
 	const uptimes = new Map<number, number>();
@@ -138,10 +183,21 @@ function scanListeningDaemons(): DiscoveredDaemonProcess[] {
 		return enrichUptimes(parseSsListeners(ss.stdout, APP_NAME));
 	}
 	const lsof = spawnSync("lsof", ["-nP", "-F", "pn", "-U", "-a", "-c", APP_NAME], { encoding: "utf8" });
-	if (!lsof.error && typeof lsof.stdout === "string") {
-		return enrichUptimes(parseLsofListeners(lsof.stdout));
+	const byName = !lsof.error && typeof lsof.stdout === "string" ? parseLsofListeners(lsof.stdout) : [];
+	let byPid: DiscoveredDaemonProcess[] = [];
+	const ps = spawnSync("ps", ["-axo", "pid=,comm=,args="], { encoding: "utf8" });
+	if (!ps.error && ps.status === 0 && typeof ps.stdout === "string") {
+		const pids = parsePrimeAgentProcessIds(ps.stdout, APP_NAME);
+		if (pids.length > 0) {
+			const lsofByPid = spawnSync("lsof", ["-nP", "-F", "pn", "-U", "-a", "-p", pids.join(",")], {
+				encoding: "utf8",
+			});
+			if (!lsofByPid.error && typeof lsofByPid.stdout === "string") {
+				byPid = parseLsofListeners(lsofByPid.stdout);
+			}
+		}
 	}
-	return [];
+	return enrichUptimes(mergeDiscoveredDaemonProcesses(byName, byPid));
 }
 
 function isDaemonProcessListening(pid: number, socketPath: string): boolean {
@@ -188,8 +244,11 @@ function scanSocketDir(): string[] {
 interface ProbeResult {
 	version?: string;
 	protocolVersion?: number;
+	schemaId?: string;
+	runtime?: DaemonRuntimeIdentity;
 	sessionCount?: number;
 	supervisorPid?: number;
+	supervisorProcessStartId?: string;
 	reachable: boolean;
 }
 
@@ -204,13 +263,19 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 	try {
 		let version: string | undefined;
 		let protocolVersion: number | undefined;
+		let schemaId: string | undefined;
+		let runtime: DaemonRuntimeIdentity | undefined;
 		let supervisorPid: number | undefined;
+		let supervisorProcessStartId: string | undefined;
 		let greeted = false;
 		try {
 			const hello = await client.waitForHello(1500);
 			version = hello.appVersion;
 			protocolVersion = hello.protocol.version;
+			schemaId = hello.schemaId;
+			runtime = hello.runtime;
 			supervisorPid = hello.supervisorPid;
+			supervisorProcessStartId = hello.supervisorProcessStartId;
 			greeted = true;
 		} catch {
 			// Connected but no recognizable greeting: an old/foreign daemon.
@@ -227,17 +292,53 @@ async function probeDaemon(socketPath: string): Promise<ProbeResult> {
 		} catch {
 			// Leave sessionCount undefined when the daemon will not answer list.
 		}
-		return { version, protocolVersion, sessionCount, supervisorPid, reachable: true };
+		return {
+			version,
+			protocolVersion,
+			schemaId,
+			runtime,
+			sessionCount,
+			supervisorPid,
+			supervisorProcessStartId,
+			reachable: true,
+		};
 	} finally {
 		client.close();
 	}
 }
 
 function classifyReachable(probe: ProbeResult): DaemonStatus {
-	if (probe.protocolVersion === DAEMON_PROTOCOL_VERSION && probe.version === VERSION) {
+	if (
+		probe.protocolVersion === DAEMON_PROTOCOL_VERSION &&
+		probe.schemaId === DAEMON_SCHEMA_ID &&
+		probe.version === VERSION
+	) {
 		return "current";
 	}
 	return "stale";
+}
+
+export function verifyHelloSupervisorPid(
+	pid: number | undefined,
+	expectedProcessStartId: string | undefined,
+): number | undefined {
+	if (!Number.isInteger(pid) || pid === undefined || pid <= 0) {
+		return undefined;
+	}
+	try {
+		process.kill(pid, 0);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EPERM") {
+			return undefined;
+		}
+	}
+	if (expectedProcessStartId) {
+		const observedStartId = getProcessStartId(pid);
+		if (observedStartId !== expectedProcessStartId) {
+			return undefined;
+		}
+	}
+	return pid;
 }
 
 /** Discover every daemon on the machine and probe each for version + session count. */
@@ -264,6 +365,7 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 		[...sockets].map(async (socketPath): Promise<DaemonInfo> => {
 			const proc = processBySocket.get(socketPath);
 			const probe = await probeDaemon(socketPath);
+			const pid = proc?.pid ?? verifyHelloSupervisorPid(probe.supervisorPid, probe.supervisorProcessStartId);
 			const hasTrackedWorkers = workerSockets.has(socketPath);
 			const status: DaemonStatus = probe.reachable
 				? classifyReachable(probe)
@@ -272,10 +374,15 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 					: "orphan-file";
 			return {
 				socketPath,
-				pid: proc?.pid,
+				pid,
 				uptimeSeconds: proc?.uptimeSeconds,
 				version: probe.version,
 				protocolVersion: probe.protocolVersion,
+				schemaId: probe.schemaId,
+				buildId: probe.runtime?.buildId,
+				executablePath:
+					probe.runtime?.launcherPath ?? probe.runtime?.entrypointPath ?? probe.runtime?.executablePath,
+				...(pid !== undefined ? { pidSource: proc ? ("listener" as const) : ("hello" as const) } : {}),
 				sessionCount: probe.sessionCount,
 				status,
 				isDefault: socketPath === defaultSocket,
@@ -632,24 +739,30 @@ async function terminateVerifiedResiduals(
 	assertAdmission: () => Promise<void>,
 ): Promise<void> {
 	let previousSignature: string | undefined;
+	let quietSince: number | undefined;
+	const deadline = Date.now() + SHUTDOWN_CONVERGENCE_TIMEOUT_MS;
 	while (true) {
+		await assertAdmission();
 		const listeners = scanListeningDaemons();
+		const now = Date.now();
 		if (listeners.length === 0) {
+			previousSignature = undefined;
+			quietSince ??= now;
+			const quietPeriod = evaluateShutdownQuietPeriod(now, quietSince);
+			if (quietPeriod === "complete") {
+				return;
+			}
+			await delay(100);
+			continue;
+		}
+		quietSince = undefined;
+		const signature = daemonListenerSignature(listeners);
+		if (now >= deadline) {
+			recordResidualListenerFailures(listeners, failed, reportedFailures, "kept respawning during shutdown");
 			return;
 		}
-		const signature = daemonListenerSignature(listeners);
 		if (signature === previousSignature) {
-			for (const listener of listeners) {
-				const processStartId = getProcessStartId(listener.pid);
-				if (processStartId && getProcessStartId(listener.pid) === processStartId) {
-					recordShutdownFailure(
-						failed,
-						reportedFailures,
-						listener.socketPath,
-						`daemon process remained after shutdown (pid ${listener.pid}, start ${processStartId})`,
-					);
-				}
-			}
+			recordResidualListenerFailures(listeners, failed, reportedFailures, "remained after shutdown");
 			return;
 		}
 		previousSignature = signature;
@@ -671,6 +784,37 @@ async function terminateVerifiedResiduals(
 			}
 		}
 	}
+}
+
+function recordResidualListenerFailures(
+	listeners: readonly DiscoveredDaemonProcess[],
+	failed: Array<{ socketPath: string; reason: string }>,
+	reportedFailures: Set<string>,
+	reason: string,
+): void {
+	for (const listener of listeners) {
+		const processStartId = getProcessStartId(listener.pid);
+		const identity = processStartId
+			? `pid ${listener.pid}, start ${processStartId}`
+			: `pid ${listener.pid}, process identity unavailable`;
+		recordShutdownFailure(
+			failed,
+			reportedFailures,
+			listener.socketPath,
+			`daemon ${reason} (${identity})${describeDaemonParent(listener.pid)}`,
+		);
+	}
+}
+function describeDaemonParent(pid: number): string {
+	const result = spawnSync("ps", ["-o", "ppid=,tty=,command=", "-p", String(pid)], { encoding: "utf8" });
+	if (result.error || result.status !== 0 || typeof result.stdout !== "string") {
+		return "";
+	}
+	const match = result.stdout.trim().match(/^(\d+)\s+(\S+)\s+(.+)$/);
+	if (!match) {
+		return "";
+	}
+	return `; close parent PID ${match[1]} on ${match[2]} (${match[3]}) and retry shutdown`;
 }
 
 async function terminateVerifiedListener(

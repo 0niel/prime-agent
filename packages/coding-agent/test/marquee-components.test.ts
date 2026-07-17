@@ -436,12 +436,14 @@ describe("marquee TUI components", () => {
 		const node: ChildAgentInspectorNode = {
 			id: "sub-a",
 			label: "inspect training logs",
+			model: "openai/gpt-5.4",
 			status: "running",
 			sessionDir: "/tmp/session/sub-a",
 			children: [
 				{
 					id: "sub-b",
 					label: "check shard 2",
+					model: "anthropic/claude-sonnet-4-5",
 					status: "done",
 					sessionDir: "/tmp/session/sub-b",
 				},
@@ -456,7 +458,8 @@ describe("marquee TUI components", () => {
 		expect(summaryText).toContain("agents-sidebar");
 		expect(summaryText).toContain("37% context left");
 		expect(summaryText).toContain("S1");
-		expect(summaryText).toContain("inspect training l…");
+		expect(summaryText).toContain("inspect train…");
+		expect(summaryText).toContain("openai/gpt-5.4");
 		const infoRow = summary.render(90)[0] ?? "";
 		expect(visibleWidth(infoRow)).toBe(90);
 
@@ -485,6 +488,7 @@ describe("marquee TUI components", () => {
 		expect(detail).toContain("inspect training logs");
 		expect(detail).toContain("reading shard metrics");
 		expect(detail).toContain("← back to chat");
+		expect(stripAnsi(detailComponent.render(80).at(-1) ?? "")).toContain("openai/gpt-5.4");
 		expect(detail).not.toContain("user: inspect training logs");
 		expect(detail).not.toContain("assistant: reading shard metrics");
 	});

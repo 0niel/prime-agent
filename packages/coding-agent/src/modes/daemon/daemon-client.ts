@@ -4,6 +4,7 @@ import { getDaemonLogPath } from "../../config.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import {
 	createDaemonCommandEnvelope,
+	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
 	DAEMON_PROTOCOL_VERSION,
 	type DaemonClosingReason,
@@ -14,6 +15,7 @@ import {
 	type DaemonRequestProgress,
 	type DaemonResponse,
 	type DaemonSavedSessionInfo,
+	type DaemonServerCapability,
 	isDaemonMutatingCommand,
 } from "./daemon-protocol.js";
 import type { DaemonWorkerCommand, DaemonWorkerCommandBody } from "./daemon-worker-protocol.js";
@@ -61,6 +63,20 @@ export class DaemonSocketClosedError extends Error {
 			`Connection to the Prime Agent daemon closed.${reasonDetails}${causeDetails} ${daemonEndpointDetails(socketPath)}`,
 		);
 		this.name = "DaemonSocketClosedError";
+	}
+}
+
+export class DaemonCapabilityUnavailableError extends Error {
+	constructor(
+		readonly command: DaemonCommand["type"],
+		readonly capability: DaemonServerCapability | undefined,
+	) {
+		super(
+			capability
+				? `The running Prime Agent daemon does not support ${capability}.`
+				: `The running Prime Agent daemon does not support ${command}.`,
+		);
+		this.name = "DaemonCapabilityUnavailableError";
 	}
 }
 
@@ -113,6 +129,10 @@ export class DaemonClient {
 
 	get isConnected(): boolean {
 		return this.socket !== undefined && !this.socket.destroyed;
+	}
+
+	supportsServerCapability(capability: DaemonServerCapability): boolean {
+		return this.helloMessage?.serverCapabilities?.includes(capability) === true;
 	}
 
 	/** Wait for the daemon_hello greeting sent on connect. */
@@ -277,6 +297,16 @@ export class DaemonClient {
 			);
 		}
 		const hello = this.helloMessage ?? (await this.waitForHello());
+		const compatibility = DAEMON_COMMAND_COMPATIBILITY[command.type];
+		if (
+			hello.protocol.version < compatibility.minProtocol ||
+			("capability" in compatibility && !this.supportsServerCapability(compatibility.capability))
+		) {
+			throw new DaemonCapabilityUnavailableError(
+				command.type,
+				"capability" in compatibility ? compatibility.capability : undefined,
+			);
+		}
 		const envelopeProtocolVersion = Math.min(hello.protocol.version, DAEMON_PROTOCOL_VERSION);
 		return this.requestWire(
 			command,
@@ -438,7 +468,11 @@ export class DaemonClient {
 		}
 
 		for (const listener of this.listeners) {
-			listener(message as DaemonOutbound);
+			try {
+				listener(message as DaemonOutbound);
+			} catch {
+				// A consumer failure must not interrupt protocol parsing for other clients.
+			}
 		}
 	}
 

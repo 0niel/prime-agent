@@ -2,6 +2,7 @@
  * Model registry - manages built-in and custom models, provides API key resolution.
  */
 
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import {
 	type AnthropicMessagesCompat,
@@ -26,7 +27,7 @@ import { join } from "path";
 import { type Static, type TProperties, Type } from "typebox";
 import type { Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
-import { getAgentDir } from "../config.js";
+import { getAgentDir, VERSION } from "../config.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
@@ -354,6 +355,47 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 /** Clear the config value command cache. Exported for testing. */
 export const clearApiKeyCache = clearConfigValueCache;
 
+function readOpenAICodexAccountId(token: string): string | undefined {
+	try {
+		const payload = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8")) as {
+			"https://api.openai.com/auth"?: { chatgpt_account_id?: unknown };
+		};
+		const accountId = payload["https://api.openai.com/auth"]?.chatgpt_account_id;
+		return typeof accountId === "string" && accountId.length > 0 ? accountId : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function openAICodexModelsUrl(baseUrl: string): string {
+	const normalized = baseUrl.replace(/\/+$/, "");
+	let path: string;
+	if (normalized.endsWith("/codex/responses")) {
+		path = `${normalized.slice(0, -"/responses".length)}/models`;
+	} else if (normalized.endsWith("/codex")) {
+		path = `${normalized}/models`;
+	} else {
+		path = `${normalized}/codex/models`;
+	}
+	const url = new URL(path);
+	url.searchParams.set("client_version", VERSION);
+	return url.toString();
+}
+
+function readOpenAICodexModelIds(value: unknown): Set<string> {
+	if (!value || typeof value !== "object" || !("models" in value) || !Array.isArray(value.models)) {
+		throw new Error("Invalid OpenAI Codex model catalog");
+	}
+	return new Set(
+		value.models.flatMap((model) => {
+			if (!model || typeof model !== "object" || !("slug" in model) || typeof model.slug !== "string") {
+				return [];
+			}
+			return [model.slug];
+		}),
+	);
+}
+
 /**
  * Model registry - loads and manages models, resolves API keys via AuthStorage.
  */
@@ -367,6 +409,7 @@ export class ModelRegistry {
 	private authorizedPrivatePrimeInferenceModelIds = new Set<string>();
 	private authorizedPrivatePrimeInferenceTeamId: string | undefined;
 	private explicitPrivatePrimeInferenceModelIds = new Set<string>();
+	private openAICodexModelsCache: { authFingerprint: string; modelIds: Set<string>; refreshedAt: number } | undefined;
 	private loadError: string | undefined = undefined;
 
 	/** Re-register dynamic OAuth providers (e.g. user MCP servers) after refresh() resets the registry. */
@@ -713,11 +756,21 @@ export class ModelRegistry {
 		const previousPrivateModelIds = new Set(this.authorizedPrivatePrimeInferenceModelIds);
 		const previousTeamId = this.authorizedPrivatePrimeInferenceTeamId;
 		this.refresh();
+		await this.refreshPrivatePrimeInferenceAuthorization(previousPrivateModelIds, previousTeamId);
+		return this.getAvailable();
+	}
+
+	private async refreshPrivatePrimeInferenceAuthorization(
+		previousPrivateModelIds = new Set(this.authorizedPrivatePrimeInferenceModelIds),
+		previousTeamId = this.authorizedPrivatePrimeInferenceTeamId,
+	): Promise<void> {
 		const apiKey = await this.authStorage.getApiKey(PRIME_INFERENCE_PROVIDER_ID);
 		const teamHeaders = this.authStorage.getProviderHeaders(PRIME_INFERENCE_PROVIDER_ID);
 		const teamId = teamHeaders?.["X-Prime-Team-ID"];
 		if (!apiKey || !teamHeaders || !teamId) {
-			return this.getAvailable();
+			this.authorizedPrivatePrimeInferenceModelIds.clear();
+			this.authorizedPrivatePrimeInferenceTeamId = undefined;
+			return;
 		}
 
 		try {
@@ -730,9 +783,11 @@ export class ModelRegistry {
 			if (teamId === previousTeamId) {
 				this.authorizedPrivatePrimeInferenceModelIds = previousPrivateModelIds;
 				this.authorizedPrivatePrimeInferenceTeamId = teamId;
+			} else {
+				this.authorizedPrivatePrimeInferenceModelIds.clear();
+				this.authorizedPrivatePrimeInferenceTeamId = undefined;
 			}
 		}
-		return this.getAvailable();
 	}
 
 	async canUseModel(model: Model<Api>): Promise<boolean> {
@@ -745,6 +800,54 @@ export class ModelRegistry {
 
 		const availableModels = await this.refreshAvailableModels();
 		return availableModels.some((candidate) => candidate.provider === model.provider && candidate.id === model.id);
+	}
+
+	async getExecutableModels(): Promise<Model<Api>[]> {
+		await this.refreshPrivatePrimeInferenceAuthorization();
+		const availableModels = this.getAvailable();
+		const codexModels = availableModels.filter((model) => model.provider === "openai-codex");
+		if (codexModels.length === 0) {
+			return availableModels;
+		}
+
+		const auth = await this.getApiKeyAndHeaders(codexModels[0]!);
+		if (!auth.ok || !auth.apiKey) {
+			return availableModels.filter((model) => model.provider !== "openai-codex");
+		}
+		const authFingerprint = createHash("sha256").update(auth.apiKey).digest("hex");
+		const cached = this.openAICodexModelsCache;
+		if (cached?.authFingerprint === authFingerprint && Date.now() - cached.refreshedAt < 300_000) {
+			return availableModels.filter((model) => model.provider !== "openai-codex" || cached.modelIds.has(model.id));
+		}
+
+		const accountId = readOpenAICodexAccountId(auth.apiKey);
+		if (!accountId) {
+			return availableModels.filter((model) => model.provider !== "openai-codex");
+		}
+		try {
+			const response = await fetch(openAICodexModelsUrl(codexModels[0]!.baseUrl), {
+				headers: {
+					...auth.headers,
+					Authorization: `Bearer ${auth.apiKey}`,
+					"chatgpt-account-id": accountId,
+					originator: "pi",
+				},
+				signal: AbortSignal.timeout(5_000),
+			});
+			if (!response.ok) {
+				throw new Error(`OpenAI Codex model discovery failed with HTTP ${response.status}`);
+			}
+			const modelIds = readOpenAICodexModelIds(await response.json());
+			this.openAICodexModelsCache = { authFingerprint, modelIds, refreshedAt: Date.now() };
+			return availableModels.filter((model) => model.provider !== "openai-codex" || modelIds.has(model.id));
+		} catch {
+			if (cached?.authFingerprint === authFingerprint && Date.now() - cached.refreshedAt < 300_000) {
+				return availableModels.filter(
+					(model) => model.provider !== "openai-codex" || cached.modelIds.has(model.id),
+				);
+			}
+			return availableModels.filter((model) => model.provider !== "openai-codex");
+		}
 	}
 
 	/**

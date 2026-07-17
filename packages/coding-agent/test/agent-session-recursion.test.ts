@@ -723,8 +723,8 @@ describe("AgentSession rlm recursion", () => {
 	it("rejects unsupported rlm.run kwargs loudly", async () => {
 		const root = createSession();
 
-		await expect(root.runRlmChild("nested", { model: "other-model" })).rejects.toThrow(
-			"Unsupported rlm.run kwargs: model",
+		await expect(root.runRlmChild("nested", { temperature: 0 })).rejects.toThrow(
+			"Unsupported rlm.run kwargs: temperature",
 		);
 	});
 
@@ -1322,6 +1322,7 @@ describe("AgentSession rlm recursion", () => {
 						usage: { prompt_tokens: 1, completion_tokens: 1 },
 						turns: 1,
 						session_dir: null,
+						model: "test/model",
 					};
 				}),
 			},
@@ -1349,6 +1350,7 @@ describe("AgentSession rlm recursion", () => {
 				usage: { prompt_tokens: 1, completion_tokens: 1 },
 				turns: 1,
 				session_dir: null,
+				model: "test/model",
 			});
 			expect(byCommId.get("comm-b")).toEqual({
 				status: "ok",
@@ -1356,6 +1358,7 @@ describe("AgentSession rlm recursion", () => {
 				usage: { prompt_tokens: 1, completion_tokens: 1 },
 				turns: 1,
 				session_dir: null,
+				model: "test/model",
 			});
 		} finally {
 			await manager.dispose();
@@ -1375,6 +1378,7 @@ describe("AgentSession rlm recursion", () => {
 						usage: { prompt_tokens: 1, completion_tokens: 1 },
 						turns: 1,
 						session_dir: null,
+						model: "test/model",
 					};
 				}),
 			},
@@ -1400,6 +1404,7 @@ describe("AgentSession rlm recursion", () => {
 					usage: { prompt_tokens: 1, completion_tokens: 1 },
 					turns: 1,
 					session_dir: null,
+					model: "test/model",
 				},
 			});
 		} finally {
@@ -1419,6 +1424,7 @@ describe("AgentSession rlm recursion", () => {
 						usage: { prompt_tokens: 1, completion_tokens: 1 },
 						turns: 1,
 						session_dir: null,
+						model: "test/model",
 					};
 				}),
 			},
@@ -1496,6 +1502,7 @@ print(_result.answer)
 					usage: { prompt_tokens: 1, completion_tokens: 1 },
 					turns: 1,
 					session_dir: null,
+					model: "test/model",
 				})),
 			},
 		});

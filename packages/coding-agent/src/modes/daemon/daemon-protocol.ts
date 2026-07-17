@@ -43,8 +43,10 @@ import type { SessionSummary } from "./daemon-session-list.js";
  */
 
 export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
-export const DAEMON_PROTOCOL_VERSION = 3;
+export const DAEMON_PROTOCOL_VERSION = 4;
 export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 2;
+export const DAEMON_SCHEMA_REVISION = 1;
+export const DAEMON_SCHEMA_ID = "protocol-4-schema-1-07ce10c7f10a";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -62,6 +64,7 @@ export type DaemonClientCapability =
 	| "extension_ui"
 	| "slim_attach"
 	| "chunked_snapshot";
+export type DaemonServerCapability = DaemonClientCapability | "heartbeat_catalog" | "heartbeat_management";
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
 export interface DaemonProtocolInfo {
@@ -78,6 +81,27 @@ export const DAEMON_DEFAULT_CLIENT_CAPABILITIES: readonly DaemonClientCapability
 	"attach_snapshot",
 	"event_sequence",
 ];
+
+export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapability[] = [
+	"attach_snapshot",
+	"event_sequence",
+	"extension_ui",
+	"slim_attach",
+	"chunked_snapshot",
+];
+
+export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
+	...DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
+	"heartbeat_catalog",
+	"heartbeat_management",
+];
+
+export interface DaemonRuntimeIdentity {
+	buildId: string;
+	executablePath: string;
+	entrypointPath?: string;
+	launcherPath?: string;
+}
 
 export type DaemonResumeCursor =
 	| ({ activeSessionId?: string } & DaemonEventCursor)
@@ -477,6 +501,100 @@ export type DaemonCommand =
 
 type DaemonCommandName = DaemonCommand["type"];
 
+export interface DaemonCommandCompatibility {
+	minProtocol: number;
+	capability?: DaemonServerCapability;
+}
+
+const LEGACY_DAEMON_COMMAND = { minProtocol: 1 } as const;
+
+export const DAEMON_COMMAND_COMPATIBILITY = {
+	ack_result: LEGACY_DAEMON_COMMAND,
+	list: LEGACY_DAEMON_COMMAND,
+	list_saved_sessions: LEGACY_DAEMON_COMMAND,
+	create: LEGACY_DAEMON_COMMAND,
+	attach: LEGACY_DAEMON_COMMAND,
+	reattach: LEGACY_DAEMON_COMMAND,
+	detach: LEGACY_DAEMON_COMMAND,
+	kill: LEGACY_DAEMON_COMMAND,
+	rename: LEGACY_DAEMON_COMMAND,
+	prompt: LEGACY_DAEMON_COMMAND,
+	steer: LEGACY_DAEMON_COMMAND,
+	follow_up: LEGACY_DAEMON_COMMAND,
+	restore_next_turn: LEGACY_DAEMON_COMMAND,
+	append_custom_message: LEGACY_DAEMON_COMMAND,
+	resume_queue: LEGACY_DAEMON_COMMAND,
+	send_message: LEGACY_DAEMON_COMMAND,
+	agent_messages_status: LEGACY_DAEMON_COMMAND,
+	agent_messages_pause: LEGACY_DAEMON_COMMAND,
+	agent_messages_resume: LEGACY_DAEMON_COMMAND,
+	agent_messages_clear: LEGACY_DAEMON_COMMAND,
+	abort: LEGACY_DAEMON_COMMAND,
+	start_side_question: LEGACY_DAEMON_COMMAND,
+	abort_side_question: LEGACY_DAEMON_COMMAND,
+	execute_bash: LEGACY_DAEMON_COMMAND,
+	abort_bash: LEGACY_DAEMON_COMMAND,
+	cancel_rlm_child: LEGACY_DAEMON_COMMAND,
+	wait_for_idle: LEGACY_DAEMON_COMMAND,
+	get_state: LEGACY_DAEMON_COMMAND,
+	get_connection_state: LEGACY_DAEMON_COMMAND,
+	get_messages: LEGACY_DAEMON_COMMAND,
+	get_session_stats: LEGACY_DAEMON_COMMAND,
+	get_context_tree: LEGACY_DAEMON_COMMAND,
+	get_commands: LEGACY_DAEMON_COMMAND,
+	get_resource_snapshot: LEGACY_DAEMON_COMMAND,
+	get_available_models: LEGACY_DAEMON_COMMAND,
+	get_queue: LEGACY_DAEMON_COMMAND,
+	clear_queue: LEGACY_DAEMON_COMMAND,
+	abort_and_clear_queue: LEGACY_DAEMON_COMMAND,
+	cron_list: LEGACY_DAEMON_COMMAND,
+	heartbeats_list: { minProtocol: 3, capability: "heartbeat_catalog" },
+	heartbeat_manage: { minProtocol: 3, capability: "heartbeat_management" },
+	cron_add: LEGACY_DAEMON_COMMAND,
+	cron_cancel: LEGACY_DAEMON_COMMAND,
+	heartbeat_get: LEGACY_DAEMON_COMMAND,
+	heartbeat_set: LEGACY_DAEMON_COMMAND,
+	heartbeat_update: LEGACY_DAEMON_COMMAND,
+	set_model: LEGACY_DAEMON_COMMAND,
+	cycle_model: LEGACY_DAEMON_COMMAND,
+	set_scoped_models: LEGACY_DAEMON_COMMAND,
+	set_thinking_level: LEGACY_DAEMON_COMMAND,
+	set_service_tier: LEGACY_DAEMON_COMMAND,
+	cycle_thinking_level: LEGACY_DAEMON_COMMAND,
+	set_transport: LEGACY_DAEMON_COMMAND,
+	set_steering_mode: LEGACY_DAEMON_COMMAND,
+	set_follow_up_mode: LEGACY_DAEMON_COMMAND,
+	set_auto_compaction: LEGACY_DAEMON_COMMAND,
+	compact: LEGACY_DAEMON_COMMAND,
+	refine: LEGACY_DAEMON_COMMAND,
+	abort_compaction: LEGACY_DAEMON_COMMAND,
+	abort_branch_summary: LEGACY_DAEMON_COMMAND,
+	abort_retry: LEGACY_DAEMON_COMMAND,
+	reload: LEGACY_DAEMON_COMMAND,
+	new_session: LEGACY_DAEMON_COMMAND,
+	switch_session: LEGACY_DAEMON_COMMAND,
+	fork: LEGACY_DAEMON_COMMAND,
+	navigate_tree: LEGACY_DAEMON_COMMAND,
+	import_jsonl: LEGACY_DAEMON_COMMAND,
+	export_html: LEGACY_DAEMON_COMMAND,
+	export_jsonl: LEGACY_DAEMON_COMMAND,
+	set_session_name: LEGACY_DAEMON_COMMAND,
+	rename_saved_session: LEGACY_DAEMON_COMMAND,
+	delete_saved_session: LEGACY_DAEMON_COMMAND,
+	get_session_context: LEGACY_DAEMON_COMMAND,
+	get_session_tree: LEGACY_DAEMON_COMMAND,
+	get_user_messages_for_forking: LEGACY_DAEMON_COMMAND,
+	get_last_assistant_text: LEGACY_DAEMON_COMMAND,
+	get_system_prompt: LEGACY_DAEMON_COMMAND,
+	get_tool_definition: LEGACY_DAEMON_COMMAND,
+	set_session_entry_label: LEGACY_DAEMON_COMMAND,
+	extension_ui_response: LEGACY_DAEMON_COMMAND,
+	prepare_update_restart: LEGACY_DAEMON_COMMAND,
+	retry_worker: LEGACY_DAEMON_COMMAND,
+	restart: LEGACY_DAEMON_COMMAND,
+	shutdown: LEGACY_DAEMON_COMMAND,
+} as const satisfies Record<DaemonCommandName, DaemonCommandCompatibility>;
+
 export type DaemonResponse =
 	| { id?: string; type: "response"; command: string; success: true; data?: unknown }
 	| {
@@ -559,8 +677,10 @@ export type DaemonOutbound =
 			type: "daemon_hello";
 			socketPath: string;
 			protocol: DaemonProtocolInfo;
+			schemaId?: string;
 			/** App version of the daemon process, used to detect stale daemons after self-update. */
 			appVersion?: string;
+			runtime?: DaemonRuntimeIdentity;
 			/** Changes whenever the public supervisor process is replaced. */
 			supervisorGeneration?: string;
 			/** Diagnostic process identity for attributing supervisor replacement. */
@@ -572,7 +692,7 @@ export type DaemonOutbound =
 			/** Normalized socket identity stored in the durable owner record. */
 			supervisorSocketPath?: string;
 			clientId: DaemonClientId;
-			serverCapabilities: readonly DaemonClientCapability[];
+			serverCapabilities: readonly DaemonServerCapability[];
 	  }
 	| { type: "daemon_closing"; reason: DaemonClosingReason }
 	| { type: "heartbeats_changed" }
@@ -650,6 +770,29 @@ export type DaemonOutbound =
 			error: string;
 			meta?: DaemonEventMeta;
 	  };
+
+export const DAEMON_OUTBOUND_COMPATIBILITY = {
+	response: LEGACY_DAEMON_COMMAND,
+	session_list_progress: LEGACY_DAEMON_COMMAND,
+	session_list_item: LEGACY_DAEMON_COMMAND,
+	daemon_hello: LEGACY_DAEMON_COMMAND,
+	daemon_closing: LEGACY_DAEMON_COMMAND,
+	heartbeats_changed: { minProtocol: 3, capability: "heartbeat_catalog" },
+	session_event: LEGACY_DAEMON_COMMAND,
+	side_question_event: LEGACY_DAEMON_COMMAND,
+	session_status: LEGACY_DAEMON_COMMAND,
+	session_replaced: LEGACY_DAEMON_COMMAND,
+	session_resynced: LEGACY_DAEMON_COMMAND,
+	session_attached: LEGACY_DAEMON_COMMAND,
+	session_snapshot_begin: LEGACY_DAEMON_COMMAND,
+	session_snapshot_chunk: LEGACY_DAEMON_COMMAND,
+	session_snapshot_end: LEGACY_DAEMON_COMMAND,
+	session_snapshot_failed: LEGACY_DAEMON_COMMAND,
+	session_detached: LEGACY_DAEMON_COMMAND,
+	session_closed: LEGACY_DAEMON_COMMAND,
+	extension_ui_request: LEGACY_DAEMON_COMMAND,
+	extension_error: LEGACY_DAEMON_COMMAND,
+} as const satisfies Record<DaemonOutbound["type"], DaemonCommandCompatibility>;
 
 export function createDaemonCommandEnvelope<TCommand extends DaemonCommand>(
 	command: TCommand,

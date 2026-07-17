@@ -125,7 +125,10 @@ import {
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
 	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
+	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_PROTOCOL_INFO,
+	DAEMON_SCHEMA_ID,
+	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	type DaemonAttachResult,
 	type DaemonClientCapability,
 	type DaemonClosingReason,
@@ -142,6 +145,7 @@ import {
 	isDaemonDialogExtensionUiRequest,
 	success,
 } from "./daemon-protocol.js";
+import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
 import {
 	buildRlmChildSnapshots,
 	buildSessionList,
@@ -280,15 +284,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"shutdown",
 ]);
 
-const DAEMON_SERVER_CAPABILITIES: readonly DaemonClientCapability[] = [
-	"attach_snapshot",
-	"event_sequence",
-	"extension_ui",
-	"slim_attach",
-	"chunked_snapshot",
-];
-
-const DAEMON_CLIENT_CAPABILITY_SET: ReadonlySet<string> = new Set(DAEMON_SERVER_CAPABILITIES);
+const DAEMON_CLIENT_CAPABILITY_SET: ReadonlySet<string> = new Set(DAEMON_SUPPORTED_CLIENT_CAPABILITIES);
 const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS = 5000;
 const SUPERVISOR_FENCE_POLL_MS = 250;
 const UPDATE_RESTART_MARKER =
@@ -2267,9 +2263,11 @@ export class AgentDaemon {
 			type: "daemon_hello",
 			socketPath: this.socketPath,
 			protocol: DAEMON_PROTOCOL_INFO,
+			schemaId: DAEMON_SCHEMA_ID,
 			appVersion: VERSION,
+			runtime: getDaemonRuntimeIdentity(),
 			clientId: client.id,
-			serverCapabilities: DAEMON_SERVER_CAPABILITIES,
+			serverCapabilities: DAEMON_DEFAULT_SERVER_CAPABILITIES,
 		});
 
 		if (client.transport === "private-framed") {
