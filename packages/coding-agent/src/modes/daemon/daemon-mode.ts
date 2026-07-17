@@ -985,6 +985,7 @@ export class AgentDaemon {
 		}
 		if (this.cronStore.registerSessionArtifact(session.sessionId, artifactDir)) {
 			this.cronStore.recoverSessionArtifact(session.sessionId);
+			this.cronScheduler.wake();
 		}
 	}
 
