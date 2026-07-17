@@ -137,6 +137,40 @@ describe("buildSessionList", () => {
 		expect(entries[0]?.activity).toBe("idle");
 	});
 
+	it("marks a retained completed subagent with an active RLM heartbeat", () => {
+		const messages = [{ role: "user", content: "initialize a heartbeat" }] as unknown as AgentMessage[];
+		const entries = buildSessionList(
+			[
+				makeState({
+					activeSessionId: "parent",
+					sessionId: "parent-session",
+					messages,
+				}),
+				makeState({
+					activeSessionId: "child",
+					sessionId: "child-session",
+					sessionFile: "/tmp/child.jsonl",
+					messages,
+					metadata: {
+						kind: "subagent",
+						createdAt: 1,
+						parentActiveSessionId: "parent",
+						parentSessionId: "parent-session",
+						rlmChildId: "child-1",
+					},
+				}),
+			],
+			[],
+			[makeCronJob({ id: "rlm-job", activeSessionId: "child", source: "rlm_heartbeat" })],
+		);
+
+		expect(entries.find((entry) => entry.id === "child")).toMatchObject({
+			runtimeKind: "subagent",
+			activity: "idle",
+			hasActiveHeartbeat: true,
+		});
+	});
+
 	it("merges active records with saved sessions and marks inactive sessions", () => {
 		const activePath = resolve("/tmp/project/active.jsonl");
 		const sleepingPath = resolve("/tmp/project/sleeping.jsonl");

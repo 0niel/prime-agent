@@ -179,7 +179,7 @@ export function buildAgentsViewRows(
 				}
 			}
 		} else {
-			flattened.push(createSubagentSummaryRow(row, children.length, depth + 1, childHasSpawnCode));
+			flattened.push(createSubagentSummaryRow(row, children, depth + 1, childHasSpawnCode));
 		}
 	};
 	for (const root of roots.sort(compareAgentsViewRows)) {
@@ -192,17 +192,23 @@ type MutableAgentsViewRow = AgentsViewRow;
 
 function createSubagentSummaryRow(
 	parent: AgentsViewRow,
-	totalCount: number,
+	children: readonly AgentsViewRow[],
 	depth: number,
 	hasSpawnCode: boolean,
 ): AgentsViewRow {
+	const totalCount = children.length;
 	const running = parent.runningSubagentCount;
+	const heartbeatCount = children.filter((child) => child.summary.hasActiveHeartbeat).length;
 	// Finished subagents stay reachable through the summary row even when
 	// nothing is running anymore.
-	const title =
+	const subagentTitle =
 		running > 0
 			? `${running} ${running === 1 ? "subagent" : "subagents"} running`
 			: `${totalCount} ${totalCount === 1 ? "subagent" : "subagents"}`;
+	const title =
+		heartbeatCount > 0
+			? `${subagentTitle} · ${heartbeatCount} ${heartbeatCount === 1 ? "heartbeat" : "heartbeats"} active`
+			: subagentTitle;
 	return {
 		kind: "subagent-summary",
 		section: parent.section,
