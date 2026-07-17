@@ -2,8 +2,10 @@
 
 ## [Unreleased]
 
+- Changed top-level CLI help to show concise common options and commands without loading runtime resources ([ENG-4688](https://linear.app/primeintellect/issue/ENG-4688/help-command-is-obscenely-verbose)).
 - Fixed completed subagents cancelling their RLM heartbeats before the first run ([ENG-4652](https://linear.app/primeintellect/issue/ENG-4652/subagent-heartbeats-dont-work)).
 - Changed the fullscreen follow shortcut from `Alt+Down` to `Ctrl+Shift+Down` for more reliable terminal input ([ENG-4684](https://linear.app/primeintellect/issue/ENG-4684/altdown-doesnt-work)).
+- Added subtle feature hints to longer-running agent turns ([ENG-4521](https://linear.app/primeintellect/issue/ENG-4521/add-subtle-hints-for-new-prime-agent-features)).
 - Fixed active heartbeats not resuming after Prime Agent updates ([ENG-4657](https://linear.app/primeintellect/issue/ENG-4657/heartbeats-dont-survive-updatesdaemon-reboots)).
 - Fixed the Agents View reordering sessions whenever prompts or heartbeats updated their activity timestamps ([ENG-4650](https://linear.app/primeintellect/issue/ENG-4650/agents-view-shifts-session-list-constantly)).
 - Added parent-scoped subagent lifecycle APIs: create children with readable default or orchestrator-chosen names, recover running or completed children through `rlm.list_subagents()`, continue them through agent messaging, and close/remove them with `rlm.delete_subagent()`.

@@ -2055,6 +2055,36 @@ describe("Editor component", () => {
 			assert.equal(tui.hasOverlay(), false);
 		});
 
+		it("keeps the prompt top edge visible below autocomplete", async () => {
+			const terminal = new VirtualTerminal(60, 12);
+			const tui = new TUI(terminal);
+			const editor = new Editor(tui, defaultEditorTheme);
+			tui.addChild(editor);
+			tui.start();
+			tui.enterFullscreen({ scroll: [], dock: editor, mouse: false });
+			tui.setFocus(editor);
+			editor.setAutocompleteProvider({
+				getSuggestions: async () => ({
+					items: [
+						{ value: "/model", label: "model", description: "Change model" },
+						{ value: "/help", label: "help", description: "Show help" },
+					],
+					prefix: "/",
+				}),
+				applyCompletion,
+			});
+
+			editor.handleInput("/");
+			await flushAutocomplete();
+			tui.requestRender(true);
+			await new Promise<void>((resolve) => process.nextTick(resolve));
+			await terminal.waitForRender();
+
+			const viewport = terminal.getViewport();
+			assert.match(viewport[9] ?? "", /^─+$/);
+			tui.stop();
+		});
+
 		it("auto-applies single force-file suggestion without showing menu", async () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 

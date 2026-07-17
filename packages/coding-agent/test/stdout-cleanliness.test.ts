@@ -81,23 +81,28 @@ async function runCli(args: string[]): Promise<{ stdout: string; stderr: string;
 }
 
 describe("stdout cleanliness in non-interactive modes", () => {
-	it("keeps stdout empty for --mode json --help while routing startup chatter to stderr", async () => {
+	it("keeps stdout empty for --mode json --help without starting runtime packages", async () => {
 		const result = await runCli(["--mode", "json", "--help"]);
 
 		expect(result.code).toBe(0);
 		expect(result.stdout).toBe("");
-		expect(result.stderr).toContain("changed 1 package in 471ms");
-		expect(result.stderr).toContain("found 0 vulnerabilities");
+		expect(result.stderr).not.toContain("changed 1 package in 471ms");
+		expect(result.stderr).not.toContain("found 0 vulnerabilities");
 		expect(result.stderr).toContain("Usage:");
+		expect(result.stderr).toContain("Options:");
+		expect(result.stderr).toContain("Commands:");
+		expect(result.stderr).not.toContain("Environment Variables:");
 	});
 
-	it("keeps stdout empty for -p --help while routing startup chatter to stderr", async () => {
-		const result = await runCli(["-p", "--help"]);
+	it("keeps stdout empty for -p -h without starting runtime packages", async () => {
+		const result = await runCli(["-p", "-h"]);
 
 		expect(result.code).toBe(0);
 		expect(result.stdout).toBe("");
-		expect(result.stderr).toContain("changed 1 package in 471ms");
-		expect(result.stderr).toContain("found 0 vulnerabilities");
+		expect(result.stderr).not.toContain("changed 1 package in 471ms");
+		expect(result.stderr).not.toContain("found 0 vulnerabilities");
 		expect(result.stderr).toContain("Usage:");
+		expect(result.stderr).not.toContain("Examples:");
+		expect(result.stderr).not.toContain("Built-in Tool Names:");
 	});
 });

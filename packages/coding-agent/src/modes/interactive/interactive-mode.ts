@@ -101,6 +101,7 @@ import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.j
 import {
 	createCompactionSummaryMessage,
 	createHeartbeatPromptMessage,
+	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
@@ -183,6 +184,7 @@ import { type FileChangeSummary, formatTotalChangeSummary, mergeTurnFileChanges 
 import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
+import { FEATURE_HINT_ANIMATION_INTERVAL_MS, FeatureHintComponent } from "./components/feature-hint.js";
 import { FooterComponent } from "./components/footer.js";
 import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
@@ -203,6 +205,7 @@ import {
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
+import { FeatureHintDeck } from "./feature-hints.js";
 import { collectMarkedImages, evictImagesToBudget, formatImageMarker, imageMarkerIds } from "./image-markers.js";
 import type {
 	InteractiveModeLocalSessionHost,
@@ -244,6 +247,7 @@ interface PendingToolCallRenderInput {
 const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS = 15_000;
 const HEARTBEAT_LEGACY_PROMPT_MAX_TOLERANCE_MS = 120_000;
 const MODEL_CATALOG_REFRESH_TTL_MS = 60_000;
+const FEATURE_HINT_DELAY_MS = 5_000;
 
 export const START_HINTS = [
 	'Try "refactor @<filepath>"',
@@ -703,6 +707,7 @@ export class InteractiveMode {
 	private statusContainer: Container;
 	private queuedMessagesContainer: Container;
 	private sideQuestionContainer: Container;
+	private featureHintContainer: Container;
 	private defaultEditor: CustomEditor;
 	private editor: EditorComponent;
 	private readonly promptStashStore: ClientPromptStashStore | undefined;
@@ -735,6 +740,13 @@ export class InteractiveMode {
 	private workingIndicatorOptions: LoaderIndicatorOptions | undefined = undefined;
 	private workingStartedAt: number | undefined = undefined;
 	private workingTimer: NodeJS.Timeout | undefined = undefined;
+	private readonly featureHintDeck = new FeatureHintDeck();
+	private currentFeatureHint: string | undefined;
+	private featureHintEligibleAt = 0;
+	private featureHintTimer: NodeJS.Timeout | undefined;
+	private featureHintAnimationTimer: NodeJS.Timeout | undefined;
+	private featureHintComponent: FeatureHintComponent | undefined;
+	private featureHintRunPending = false;
 	private pulseTimer: NodeJS.Timeout | undefined = undefined;
 	private pulseFrame = 0;
 	private readonly activityTracker = new AgentActivityTracker();
@@ -928,6 +940,7 @@ export class InteractiveMode {
 		this.statusContainer = new Container();
 		this.queuedMessagesContainer = new Container();
 		this.sideQuestionContainer = new Container();
+		this.featureHintContainer = new Container();
 		this.childAgentDetail = new ChildAgentDetailComponent(() => this.getChildAgentPanelRows(), {
 			ui: this.ui,
 		});
@@ -1262,12 +1275,14 @@ export class InteractiveMode {
 		this.mainContainer.addChild(this.recapContainer);
 		this.mainContainer.addChild(this.queuedMessagesContainer);
 		this.mainContainer.addChild(this.sideQuestionContainer);
+		this.mainContainer.addChild(this.featureHintContainer);
 		this.mainContainer.addChild(this.editorContainer);
 		this.mainContainer.addChild(this.childAgentSummary);
 		this.mainContainer.addChild(this.widgetContainerBelow);
 		this.footerSlot.addChild(this.footer);
 		this.mainContainer.addChild(this.footerSlot);
 		this.promptDock.addChild(this.sideQuestionContainer);
+		this.promptDock.addChild(this.featureHintContainer);
 		this.promptDock.addChild(this.editorContainer);
 		this.promptDock.addChild(this.childAgentSummary);
 		this.promptDock.addChild(this.footerSlot);
@@ -2578,6 +2593,7 @@ export class InteractiveMode {
 	}
 
 	private resetCurrentSessionRenderState(options?: { clearPromptStash?: boolean }): void {
+		this.endFeatureHintRun();
 		this.chatContainer.clear();
 		this.shortcutGuideContainer.clear();
 		this.pendingMessagesContainer.clear();
@@ -2921,9 +2937,11 @@ export class InteractiveMode {
 		this.loadingAnimation = this.createWorkingLoader();
 		this.statusContainer.addChild(this.loadingAnimation);
 		this.startWorkingTimer();
+		this.startFeatureHintPresentation();
 	}
 
 	private stopWorkingLoader(): void {
+		this.clearFeatureHintPresentation();
 		if (this.workingTimer) {
 			clearInterval(this.workingTimer);
 			this.workingTimer = undefined;
@@ -2934,6 +2952,94 @@ export class InteractiveMode {
 			this.loadingAnimation = undefined;
 		}
 		this.statusContainer.clear();
+	}
+
+	private startFeatureHintPresentation(): void {
+		this.clearFeatureHintPresentation();
+		if (this.featureHintEligibleAt === 0) {
+			this.featureHintEligibleAt = Date.now() + FEATURE_HINT_DELAY_MS;
+		}
+		const delay = Math.max(0, this.featureHintEligibleAt - Date.now());
+		if (delay === 0) {
+			this.showFeatureHint();
+			return;
+		}
+		this.featureHintTimer = setTimeout(() => {
+			this.featureHintTimer = undefined;
+			this.showFeatureHint();
+		}, delay);
+		this.featureHintTimer.unref?.();
+	}
+
+	private showFeatureHint(): void {
+		if (
+			!this.loadingAnimation ||
+			!this.shouldShowWorkingLoader() ||
+			!this.statusContainer.children.includes(this.loadingAnimation)
+		) {
+			return;
+		}
+		if (!this.currentFeatureHint) {
+			const hint = this.featureHintDeck.next({
+				getKeybinding: (action) => {
+					const key = keyText(action);
+					return key ? this.capitalizeKey(key) : undefined;
+				},
+				isResidentSession: this.options.returnToAgentsView === true,
+			});
+			this.currentFeatureHint = hint?.text;
+		}
+		if (!this.currentFeatureHint) {
+			return;
+		}
+		this.featureHintComponent = new FeatureHintComponent(this.currentFeatureHint);
+		this.featureHintContainer.addChild(this.featureHintComponent);
+		this.featureHintAnimationTimer = setInterval(() => {
+			this.featureHintComponent?.advance();
+			this.ui.requestRender();
+		}, FEATURE_HINT_ANIMATION_INTERVAL_MS);
+		this.featureHintAnimationTimer.unref?.();
+		this.ui.requestRender();
+	}
+
+	private clearFeatureHintPresentation(): void {
+		if (this.featureHintTimer) {
+			clearTimeout(this.featureHintTimer);
+			this.featureHintTimer = undefined;
+		}
+		if (this.featureHintAnimationTimer) {
+			clearInterval(this.featureHintAnimationTimer);
+			this.featureHintAnimationTimer = undefined;
+		}
+		if (this.featureHintComponent) {
+			this.featureHintContainer.removeChild(this.featureHintComponent);
+			this.featureHintComponent = undefined;
+		}
+	}
+
+	private endFeatureHintRun(): void {
+		this.clearFeatureHintPresentation();
+		this.currentFeatureHint = undefined;
+		this.featureHintEligibleAt = 0;
+		this.featureHintRunPending = false;
+	}
+
+	private prepareFeatureHintRun(message: AgentMessage): void {
+		if (!this.featureHintRunPending) return;
+		if (message.role === "assistant") {
+			this.featureHintRunPending = false;
+			return;
+		}
+		const startsNewRun =
+			message.role === "user" ||
+			isAgentSessionMessage(message) ||
+			(message.role === "custom" && message.customType === HEARTBEAT_PROMPT_CUSTOM_TYPE);
+		if (!startsNewRun) return;
+
+		this.endFeatureHintRun();
+		if (this.shouldShowWorkingLoader()) {
+			this.startFeatureHintPresentation();
+		}
 	}
 
 	private updateWorkingPulse(): void {
@@ -4562,6 +4668,9 @@ export class InteractiveMode {
 		this.updateConnectionStateFromEvent(event);
 		// A new user message resets the activity tracker to 0, so the in-flight baseline must
 		// reset with it. (agent_start on auto-retry does not reset the tracker.)
+		if (event.type === "message_start") {
+			this.prepareFeatureHintRun(event.message);
+		}
 		if (event.type === "message_start" && (event.message.role === "user" || isAgentSessionMessage(event.message))) {
 			this.contextUsageTokenBaseline = 0;
 			this.setSessionHasMessages(true);
@@ -4574,6 +4683,7 @@ export class InteractiveMode {
 
 		switch (event.type) {
 			case "agent_start":
+				this.featureHintRunPending = this.getRetryAttempt() === 0;
 				this.resetPendingToolState();
 				this.renderRecap();
 				if (this.settingsManager.getShowTerminalProgress()) {
@@ -9236,6 +9346,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 			this.ui.terminal.setProgress(false);
 		}
 		this.stopWorkingLoader();
+		this.endFeatureHintRun();
 		this.stopWorkingPulse();
 		this.stopGoalTrayTimer();
 		this.closeHeartbeatManager();
