@@ -2,9 +2,11 @@
  * Tests for image processing utilities using Photon.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { convertToPng } from "../src/utils/image-convert.js";
+import { MAX_IMAGE_DIMENSION } from "../src/utils/image-decode-safety.js";
 import { formatDimensionNote, resizeImage } from "../src/utils/image-resize.js";
+import { loadPhoton } from "../src/utils/photon.js";
 
 // Small 2x2 red PNG image (base64) - generated with ImageMagick
 const TINY_PNG =
@@ -13,6 +15,10 @@ const TINY_PNG =
 // Small 2x2 blue JPEG image (base64) - generated with ImageMagick
 const TINY_JPEG =
 	"/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAACAAIDAREAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAVAQEBAAAAAAAAAAAAAAAAAAAGCf/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AD3VTB3/2Q==";
+
+// Same JPEG with EXIF orientation 6, which enters the allocating orientation path.
+const ORIENTED_TINY_JPEG =
+	"/9j/4QAiRXhpZgAASUkqAAgAAAABABIBAwABAAAABgAAAAAAAAD/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAACAAIDAREAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAVAQEBAAAAAAAAAAAAAAAAAAAGCf/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AD3VTB3/2Q==";
 
 // 100x100 gray PNG
 const MEDIUM_PNG_100x100 =
@@ -23,6 +29,37 @@ const LARGE_PNG_200x200 =
 	"iVBORw0KGgoAAAANSUhEUgAAAMgAAADIEAIAAAByquWKAAAAIGNIUk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAAGYktHRP///////wlY99wAAAAHdElNRQfqAQ4AMzqU03BFAAAEEElEQVR42u3dvWqUURSF4XXMRAyIhSAWQvwnWtjaWusFx9bW1kKD/wELESxEiBjDjJdwysOC57mCXW32+zGcGbtdACpsdi+T8Xz1GABzm91xMl6sHgNgblzcT/Y+rh4DYG6cv0/2H64eA2BOEgI1fHQHaoyzbXIwVo8BMCcJgRqSEKgxft9Lrn5aPQbA3Ph1klw7Wj0GwJwkBGpYWECN8fMiub63egyAORcWUMPCAmqMH3eTG59XjwEwN76/S24+Wj0GwJwkBGpYWECN8e1fcmuzegyAORcWUMPCAmqM09vJ4dfVYwDMjS9vkzuPV48BMCcJgRqeSAZqjA/nyYP91WMAzElCoIYkBGqMk8Pk6HT1GABzm+3L5JIkBApIQqCGj+5AjfHmb/Lk8uoxAOYkIVBDEgI1LCygxmZ7nFyShEABFxZQw8ICaozXf5KnV1aPATDnwgJqWFhADQsLqOFnDUANFxZQw8ICaoxXZ8mzg9VjAMy5sIAaFhZQw3tYQA1/QgHUkIRADUkI1JCEQA1JCNSQhEANFxZQwzcsoIYkBGpIQqCGJARqSEKghiQEalhYQA1/QgHUcGEBNSwsoIYkBGq4sIAaFhZQw8ICaviGBdRwYQE1LCyghiQEariwgBoWFlDDe1hADS+OAjUkIVBDEgI1JCFQQxICNSQhUMOFBdTwDQuoIQmBGpIQqCEJgRqSEKghCYEaFhZQw4ujQA0XFlDDwgJqSEKghgsLqGFhATUsLKCGb1hADRcWUMPCAmpIQqCGCwuoYWEBNbyHBdTw4ihQQxICNSQhUEMSAjUkIVBDEgI1XFhADd+wgBqSEKghCYEakhCoIQmBGpIQqGFhATW8OArUcGEBNSwsoIYkBGq4sIAaFhZQw8ICaviGBdRwYQE1LCyghiQEariwgBoWFlDDe1hADS+OAjUkIVBDEgI1JCFQQxICNSQhUMOFBdTwDQuoIQmBGpIQqCEJgRqSEKghCYEa49lB8ups9RgAc14cBWpIQqCGhQXUkIRADRcWUMPCAmqMp1eS139WjwEw5xsWUEMSAjUsLKCGJARquLCAGhYWUGM8uZy8+bt6DIA5L44CNSQhUMMTyUCNcXSanByuHgNgThICNSQhUGM82E8+nK8eA2DOzxqAGpIQqDHuPE6+vF09BsDcOPyanN5ePQbAnCQEavgdFlBj3Nok3/6tHgNgzoujQA1JCNQYNx8l39+tHgNgbtz4nPy4u3oMgDlJCNSwsIAa4/pe8vNi9RgAc37WANSQhECNce0o+XWyegyAuXH1U/L73uoxAOYkIVDDwgJqjIORnG1XjwEw508ogBqSEKgx9h8m5+9XjwEwN/Y+Jhf3V48BMCcJgRpjPE+2x6vHAJgbSbLbrR4DYO4/GqiSgXN+ksgAAAAldEVYdGRhdGU6Y3JlYXRlADIwMjYtMDEtMTRUMDA6NTE6NTcrMDA6MDDpysx4AAAAJXRFWHRkYXRlOm1vZGlmeQAyMDI2LTAxLTE0VDAwOjUxOjU3KzAwOjAwmJd0xAAAACh0RVh0ZGF0ZTp0aW1lc3RhbXAAMjAyNi0wMS0xNFQwMDo1MTo1NyswMDowMM+CVRsAAAAASUVORK5CYII=";
 
 describe("convertToPng", () => {
+	it("rejects unsafe dimensions before converting with Photon", async () => {
+		const bytes = Buffer.from(TINY_PNG, "base64");
+		bytes.writeUInt32BE(MAX_IMAGE_DIMENSION + 1, 16);
+		const photon = await loadPhoton();
+		if (!photon) throw new Error("Photon is required for this test");
+		const decode = vi.spyOn(photon.PhotonImage, "new_from_byteslice");
+
+		await expect(convertToPng(bytes.toString("base64"), "image/jpeg")).rejects.toMatchObject({
+			reason: "dimensions",
+		});
+		expect(decode).not.toHaveBeenCalled();
+		decode.mockRestore();
+	});
+
+	it("frees the decoded Photon image when orientation fails", async () => {
+		const photon = await loadPhoton();
+		if (!photon) throw new Error("Photon is required for this test");
+		const free = vi.spyOn(photon.PhotonImage.prototype, "free");
+		const getRawPixels = vi.spyOn(photon.PhotonImage.prototype, "get_raw_pixels").mockImplementation(() => {
+			throw new Error("orientation failed");
+		});
+
+		try {
+			expect(await convertToPng(ORIENTED_TINY_JPEG, "image/jpeg")).toBeNull();
+			expect(free).toHaveBeenCalledTimes(1);
+		} finally {
+			getRawPixels.mockRestore();
+			free.mockRestore();
+		}
+	});
+
 	it("should return original data for PNG input", async () => {
 		const result = await convertToPng(TINY_PNG, "image/png");
 		expect(result).not.toBeNull();
@@ -46,6 +83,37 @@ describe("convertToPng", () => {
 });
 
 describe("resizeImage", () => {
+	it("rejects unsafe dimensions before Photon decodes the image", async () => {
+		const bytes = Buffer.from(TINY_PNG, "base64");
+		bytes.writeUInt32BE(MAX_IMAGE_DIMENSION + 1, 16);
+		const photon = await loadPhoton();
+		if (!photon) throw new Error("Photon is required for this test");
+		const decode = vi.spyOn(photon.PhotonImage, "new_from_byteslice");
+
+		await expect(
+			resizeImage({ type: "image", data: bytes.toString("base64"), mimeType: "image/png" }),
+		).rejects.toMatchObject({ reason: "dimensions" });
+		expect(decode).not.toHaveBeenCalled();
+		decode.mockRestore();
+	});
+
+	it("frees the decoded Photon image when resize orientation fails", async () => {
+		const photon = await loadPhoton();
+		if (!photon) throw new Error("Photon is required for this test");
+		const free = vi.spyOn(photon.PhotonImage.prototype, "free");
+		const getRawPixels = vi.spyOn(photon.PhotonImage.prototype, "get_raw_pixels").mockImplementation(() => {
+			throw new Error("orientation failed");
+		});
+
+		try {
+			expect(await resizeImage({ type: "image", data: ORIENTED_TINY_JPEG, mimeType: "image/jpeg" })).toBeNull();
+			expect(free).toHaveBeenCalledTimes(1);
+		} finally {
+			getRawPixels.mockRestore();
+			free.mockRestore();
+		}
+	});
+
 	it("should return original image if within limits", async () => {
 		const result = await resizeImage(
 			{ type: "image", data: TINY_PNG, mimeType: "image/png" },

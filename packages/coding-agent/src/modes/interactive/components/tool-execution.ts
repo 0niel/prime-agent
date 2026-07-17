@@ -72,6 +72,8 @@ function createReplayBuiltInToolDefinition(
 	}
 }
 
+let toolImageConversionQueue: Promise<void> = Promise.resolve();
+
 export class ToolExecutionComponent extends Container {
 	private contentPanel: ToolPanel;
 	private selfRenderContainer: Container;
@@ -102,7 +104,11 @@ export class ToolExecutionComponent extends Container {
 		isError: boolean;
 		details?: any;
 	};
-	private convertedImages: Map<number, { data: string; mimeType: string }> = new Map();
+	private convertedImages: Map<
+		number,
+		{ data: string; mimeType: string; sourceData: string; sourceMimeType: string }
+	> = new Map();
+	private imageConversionAttempts = new Map<number, { data: string; mimeType: string }>();
 	private hideComponent = false;
 
 	constructor(
@@ -288,16 +294,26 @@ export class ToolExecutionComponent extends Container {
 			const img = imageBlocks[i];
 			if (!img.data || !img.mimeType) continue;
 			if (img.mimeType === "image/png") continue;
-			if (this.convertedImages.has(i)) continue;
+			const cached = this.convertedImages.get(i);
+			if (cached?.sourceData === img.data && cached.sourceMimeType === img.mimeType) continue;
+			const attempt = this.imageConversionAttempts.get(i);
+			if (attempt?.data === img.data && attempt.mimeType === img.mimeType) continue;
 
 			const index = i;
-			convertToPng(img.data, img.mimeType).then((converted) => {
-				if (converted) {
-					this.convertedImages.set(index, converted);
-					this.updateDisplay();
-					this.ui.requestRender();
-				}
-			});
+			const data = img.data;
+			const mimeType = img.mimeType;
+			this.imageConversionAttempts.set(index, { data, mimeType });
+			toolImageConversionQueue = toolImageConversionQueue
+				.then(async () => {
+					const converted = await convertToPng(data, mimeType);
+					const current = this.result?.content.filter((content) => content.type === "image")[index];
+					if (converted && current?.data === data && current.mimeType === mimeType) {
+						this.convertedImages.set(index, { ...converted, sourceData: data, sourceMimeType: mimeType });
+						this.updateDisplay();
+						this.ui.requestRender();
+					}
+				})
+				.catch(() => {});
 		}
 	}
 
@@ -429,7 +445,9 @@ export class ToolExecutionComponent extends Container {
 			for (let i = 0; i < imageBlocks.length; i++) {
 				const img = imageBlocks[i];
 				if (caps.images && renderInlineImages && img.data && img.mimeType) {
-					const converted = this.convertedImages.get(i);
+					const cached = this.convertedImages.get(i);
+					const converted =
+						cached?.sourceData === img.data && cached.sourceMimeType === img.mimeType ? cached : undefined;
 					const imageData = converted?.data ?? img.data;
 					const imageMimeType = converted?.mimeType ?? img.mimeType;
 					if (caps.images === "kitty" && imageMimeType !== "image/png") continue;

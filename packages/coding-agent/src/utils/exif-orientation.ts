@@ -165,15 +165,25 @@ export function applyExifOrientation(
 			return image;
 		case 5: {
 			const rotated = rotate90(photon, image, (x, y, _w, h) => x * h + (h - 1 - y));
-			photon.fliph(rotated);
-			return rotated;
+			try {
+				photon.fliph(rotated);
+				return rotated;
+			} catch (error) {
+				rotated.free();
+				throw error;
+			}
 		}
 		case 6:
 			return rotate90(photon, image, (x, y, _w, h) => x * h + (h - 1 - y));
 		case 7: {
 			const rotated = rotate90(photon, image, (x, y, w, h) => (w - 1 - x) * h + y);
-			photon.fliph(rotated);
-			return rotated;
+			try {
+				photon.fliph(rotated);
+				return rotated;
+			} catch (error) {
+				rotated.free();
+				throw error;
+			}
 		}
 		case 8:
 			return rotate90(photon, image, (x, y, w, h) => (w - 1 - x) * h + y);

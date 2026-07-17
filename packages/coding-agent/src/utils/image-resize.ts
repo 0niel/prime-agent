@@ -1,5 +1,10 @@
 import type { ImageContent } from "@earendil-works/pi-ai";
 import { applyExifOrientation } from "./exif-orientation.js";
+import {
+	assertBase64ImageWithinEncodedLimit,
+	ImageDecodeSafetyError,
+	validateImageForDecode,
+} from "./image-decode-safety.js";
 import { loadPhoton } from "./photon.js";
 
 export interface ImageResizeOptions {
@@ -59,7 +64,11 @@ function encodeCandidate(buffer: Uint8Array, mimeType: string): EncodedCandidate
  */
 export async function resizeImage(img: ImageContent, options?: ImageResizeOptions): Promise<ResizedImage | null> {
 	const opts = { ...DEFAULT_OPTIONS, ...options };
+	assertBase64ImageWithinEncodedLimit(img.data);
 	const inputBuffer = Buffer.from(img.data, "base64");
+	if (!validateImageForDecode(inputBuffer)) {
+		return null;
+	}
 	const inputBase64Size = Buffer.byteLength(img.data, "utf-8");
 
 	const photon = await loadPhoton();
@@ -70,9 +79,12 @@ export async function resizeImage(img: ImageContent, options?: ImageResizeOption
 	let image: ReturnType<typeof photon.PhotonImage.new_from_byteslice> | undefined;
 	try {
 		const inputBytes = new Uint8Array(inputBuffer);
-		const rawImage = photon.PhotonImage.new_from_byteslice(inputBytes);
-		image = applyExifOrientation(photon, rawImage, inputBytes);
-		if (image !== rawImage) rawImage.free();
+		image = photon.PhotonImage.new_from_byteslice(inputBytes);
+		const orientedImage = applyExifOrientation(photon, image, inputBytes);
+		if (orientedImage !== image) {
+			image.free();
+			image = orientedImage;
+		}
 
 		const originalWidth = image.get_width();
 		const originalHeight = image.get_height();
@@ -153,7 +165,8 @@ export async function resizeImage(img: ImageContent, options?: ImageResizeOption
 		}
 
 		return null;
-	} catch {
+	} catch (error) {
+		if (error instanceof ImageDecodeSafetyError) throw error;
 		return null;
 	} finally {
 		if (image) {

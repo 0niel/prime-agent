@@ -1,10 +1,16 @@
 import { spawnSync } from "child_process";
 import { randomUUID } from "crypto";
-import { readFileSync, unlinkSync } from "fs";
+import { readFileSync, statSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 
 import { clipboard } from "./clipboard-native.js";
+import {
+	assertImageEncodedSize,
+	ImageDecodeSafetyError,
+	MAX_IMAGE_ENCODED_BYTES,
+	validateImageForDecode,
+} from "./image-decode-safety.js";
 import { loadPhoton } from "./photon.js";
 
 export type ClipboardImage = {
@@ -17,7 +23,7 @@ const SUPPORTED_IMAGE_MIME_TYPES = ["image/png", "image/jpeg", "image/webp", "im
 const DEFAULT_LIST_TIMEOUT_MS = 1000;
 const DEFAULT_READ_TIMEOUT_MS = 3000;
 const DEFAULT_POWERSHELL_TIMEOUT_MS = 5000;
-const DEFAULT_MAX_BUFFER_BYTES = 50 * 1024 * 1024;
+const DEFAULT_MAX_BUFFER_BYTES = MAX_IMAGE_ENCODED_BYTES;
 
 export function isWaylandSession(env: NodeJS.ProcessEnv = process.env): boolean {
 	return Boolean(env.WAYLAND_DISPLAY) || env.XDG_SESSION_TYPE === "wayland";
@@ -69,6 +75,10 @@ function isSupportedImageMimeType(mimeType: string): boolean {
  * Returns null if conversion is unavailable or fails.
  */
 async function convertToPng(bytes: Uint8Array): Promise<Uint8Array | null> {
+	if (!validateImageForDecode(bytes)) {
+		return null;
+	}
+
 	const photon = await loadPhoton();
 	if (!photon) {
 		return null;
@@ -101,6 +111,12 @@ function runCommand(
 	});
 
 	if (result.error) {
+		if ((result.error as NodeJS.ErrnoException).code === "ENOBUFS") {
+			throw new ImageDecodeSafetyError(
+				"encoded-size",
+				`Image omitted: encoded input exceeds the safe decode limit of ${MAX_IMAGE_ENCODED_BYTES} bytes.`,
+			);
+		}
 		return { ok: false, stdout: Buffer.alloc(0) };
 	}
 
@@ -193,13 +209,15 @@ function readClipboardImageViaPowerShell(): ClipboardImage | null {
 			return null;
 		}
 
+		assertImageEncodedSize(statSync(tmpFile).size);
 		const bytes = readFileSync(tmpFile);
 		if (bytes.length === 0) {
 			return null;
 		}
 
 		return { bytes: new Uint8Array(bytes), mimeType: "image/png" };
-	} catch {
+	} catch (error) {
+		if (error instanceof ImageDecodeSafetyError) throw error;
 		return null;
 	} finally {
 		try {
@@ -237,6 +255,11 @@ function readClipboardImageViaXclip(): ClipboardImage | null {
 	return null;
 }
 
+/**
+ * The native module returns an already-decoded PNG. Validation below can bound
+ * subsequent Photon work, but cannot protect that upstream decode without a new
+ * native API that exposes encoded bytes or dimensions first.
+ */
 async function readClipboardImageViaNativeClipboard(): Promise<ClipboardImage | null> {
 	if (!clipboard || !clipboard.hasImage()) {
 		return null;
@@ -287,7 +310,11 @@ export async function readClipboardImage(options?: {
 		return null;
 	}
 
-	// Convert unsupported formats (e.g., BMP from WSLg) to PNG
+	if (!validateImageForDecode(image.bytes)) {
+		return null;
+	}
+
+	// Convert Photon-decodable clipboard formats (for example BMP from WSLg) to PNG; omit all others
 	if (!isSupportedImageMimeType(image.mimeType)) {
 		const pngBytes = await convertToPng(image.bytes);
 		if (!pngBytes) {

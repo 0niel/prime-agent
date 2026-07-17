@@ -7,7 +7,8 @@ import type { ImageContent } from "@earendil-works/pi-ai";
 import chalk from "chalk";
 import { resolve } from "path";
 import { resolveReadPath } from "../core/tools/path-utils.js";
-import { formatDimensionNote, resizeImage } from "../utils/image-resize.js";
+import { assertImageEncodedSize, ImageDecodeSafetyError } from "../utils/image-decode-safety.js";
+import { formatDimensionNote, type ResizedImage, resizeImage } from "../utils/image-resize.js";
 import { detectSupportedImageMimeTypeFromFile } from "../utils/mime.js";
 
 export interface ProcessedFiles {
@@ -48,7 +49,14 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 		const mimeType = await detectSupportedImageMimeTypeFromFile(absolutePath);
 
 		if (mimeType) {
-			// Handle image file
+			// Reject oversized images before reading the whole file into memory.
+			try {
+				assertImageEncodedSize(stats.size);
+			} catch (error) {
+				if (!(error instanceof ImageDecodeSafetyError)) throw error;
+				text += `<file name="${absolutePath}">[${error.message}]</file>\n`;
+				continue;
+			}
 			const content = await readFile(absolutePath);
 			const base64Content = content.toString("base64");
 
@@ -56,7 +64,14 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 			let dimensionNote: string | undefined;
 
 			if (autoResizeImages) {
-				const resized = await resizeImage({ type: "image", data: base64Content, mimeType });
+				let resized: ResizedImage | null;
+				try {
+					resized = await resizeImage({ type: "image", data: base64Content, mimeType });
+				} catch (error) {
+					if (!(error instanceof ImageDecodeSafetyError)) throw error;
+					text += `<file name="${absolutePath}">[${error.message}]</file>\n`;
+					continue;
+				}
 				if (!resized) {
 					text += `<file name="${absolutePath}">[Image omitted: could not be resized below the inline image size limit.]</file>\n`;
 					continue;

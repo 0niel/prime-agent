@@ -123,6 +123,7 @@ import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { readClipboardImage } from "../../utils/clipboard-image.js";
 import { parseGitUrl } from "../../utils/git.js";
+import { ImageDecodeSafetyError } from "../../utils/image-decode-safety.js";
 import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
@@ -3826,17 +3827,19 @@ export class InteractiveMode {
 			}
 
 			// Resize down to the inline image size limit, mirroring the CLI @file
-			// path, so large screenshots don't exceed provider limits. Fall back to
-			// the raw bytes if resizing is unavailable.
-			const raw: ImageContent = {
+			// path, so large screenshots don't exceed provider limits. Native clipboard
+			// APIs have already decoded the image before this point; their peak decode
+			// memory cannot be bounded without support from the upstream clipboard API.
+			const resized = await resizeImage({
 				type: "image",
 				data: Buffer.from(image.bytes).toString("base64"),
 				mimeType: image.mimeType,
-			};
-			const resized = await resizeImage(raw);
-			const attachment: ImageContent = resized
-				? { type: "image", data: resized.data, mimeType: resized.mimeType }
-				: raw;
+			});
+			if (!resized) {
+				this.showStatus("Image omitted: could not be resized below the inline image size limit.");
+				return;
+			}
+			const attachment: ImageContent = { type: "image", data: resized.data, mimeType: resized.mimeType };
 
 			// Register the image and insert a visible marker. The image is attached to
 			// the prompt as multimodal content rather than written to disk, so a vision
@@ -3850,8 +3853,11 @@ export class InteractiveMode {
 			if (model && !model.input.includes("image")) {
 				this.showStatus("Current model does not support images; the attachment will be omitted.");
 			}
-		} catch {
-			// Silently ignore clipboard errors (may not have permission, etc.)
+		} catch (error) {
+			if (error instanceof ImageDecodeSafetyError) {
+				this.showStatus(error.message);
+			}
+			// Silently ignore ordinary clipboard errors (may not have permission, etc.)
 		}
 	}
 

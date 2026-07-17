@@ -1,4 +1,5 @@
 import { applyExifOrientation } from "./exif-orientation.js";
+import { assertBase64ImageWithinEncodedLimit, validateImageForDecode } from "./image-decode-safety.js";
 import { loadPhoton } from "./photon.js";
 
 /**
@@ -9,6 +10,12 @@ export async function convertToPng(
 	base64Data: string,
 	mimeType: string,
 ): Promise<{ data: string; mimeType: string } | null> {
+	assertBase64ImageWithinEncodedLimit(base64Data);
+	const bytes = new Uint8Array(Buffer.from(base64Data, "base64"));
+	if (!validateImageForDecode(bytes)) {
+		return null;
+	}
+
 	// Already PNG, no conversion needed
 	if (mimeType === "image/png") {
 		return { data: base64Data, mimeType };
@@ -20,22 +27,23 @@ export async function convertToPng(
 		return null;
 	}
 
+	let image: ReturnType<typeof photon.PhotonImage.new_from_byteslice> | undefined;
 	try {
-		const bytes = new Uint8Array(Buffer.from(base64Data, "base64"));
-		const rawImage = photon.PhotonImage.new_from_byteslice(bytes);
-		const image = applyExifOrientation(photon, rawImage, bytes);
-		if (image !== rawImage) rawImage.free();
-		try {
-			const pngBuffer = image.get_bytes();
-			return {
-				data: Buffer.from(pngBuffer).toString("base64"),
-				mimeType: "image/png",
-			};
-		} finally {
+		image = photon.PhotonImage.new_from_byteslice(bytes);
+		const orientedImage = applyExifOrientation(photon, image, bytes);
+		if (orientedImage !== image) {
 			image.free();
+			image = orientedImage;
 		}
+		const pngBuffer = image.get_bytes();
+		return {
+			data: Buffer.from(pngBuffer).toString("base64"),
+			mimeType: "image/png",
+		};
 	} catch {
 		// Conversion failed
 		return null;
+	} finally {
+		image?.free();
 	}
 }

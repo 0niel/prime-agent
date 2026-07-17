@@ -1,7 +1,7 @@
 import { resetCapabilitiesCache, setCapabilities, Text, type TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { Type } from "typebox";
-import { beforeAll, describe, expect, test } from "vitest";
+import { beforeAll, describe, expect, test, vi } from "vitest";
 import type { ToolDefinition } from "../src/core/extensions/types.js";
 import { type BashOperations, createBashTool, createBashToolDefinition } from "../src/core/tools/bash.js";
 import { createEditToolDefinition } from "../src/core/tools/edit.js";
@@ -9,6 +9,12 @@ import { createAgentConnectionToolDefinition } from "../src/modes/agent-connecti
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 import { getWorkingPulseFrame, workingIconFrame } from "../src/modes/interactive/theme/working-icon.js";
+
+const imageConvertMocks = vi.hoisted(() => ({
+	convertToPng: vi.fn(),
+}));
+
+vi.mock("../src/utils/image-convert.js", () => imageConvertMocks);
 
 function createBaseToolDefinition(name = "custom_tool"): ToolDefinition {
 	return {
@@ -35,6 +41,14 @@ function createMetadataOnlyToolDefinition(definition: ToolDefinition<any, any>) 
 		throw new Error("expected tool metadata");
 	}
 	return metadata;
+}
+
+function createDeferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((nextResolve) => {
+		resolve = nextResolve;
+	});
+	return { promise, resolve };
 }
 
 async function waitForCondition(condition: () => boolean): Promise<void> {
@@ -182,6 +196,7 @@ describe("ToolExecutionComponent parity", () => {
 	test("converts kitty images even if image display is toggled off when the result arrives", async () => {
 		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
 		try {
+			imageConvertMocks.convertToPng.mockResolvedValue({ data: "AAAA", mimeType: "image/png" });
 			const tinyJpeg =
 				"/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAACAAIDAREAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAVAQEBAAAAAAAAAAAAAAAAAAAGCf/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AD3VTB3/2Q==";
 			const component = new ToolExecutionComponent(
@@ -202,6 +217,47 @@ describe("ToolExecutionComponent parity", () => {
 			component.setShowImages(true);
 
 			expect(component.render(120).join("\n")).toContain("\x1b_G");
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
+	test("deduplicates and serializes kitty image conversion", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		try {
+			const first = createDeferred<{ data: string; mimeType: string } | null>();
+			const second = createDeferred<{ data: string; mimeType: string } | null>();
+			imageConvertMocks.convertToPng
+				.mockReset()
+				.mockReturnValueOnce(first.promise)
+				.mockReturnValueOnce(second.promise);
+			const component = new ToolExecutionComponent(
+				"custom_tool",
+				"tool-image-queue",
+				{},
+				{},
+				undefined,
+				createFakeTui(),
+				process.cwd(),
+			);
+			const result = {
+				content: [
+					{ type: "image", data: "first", mimeType: "image/jpeg" },
+					{ type: "image", data: "second", mimeType: "image/webp" },
+				],
+				isError: false,
+			};
+
+			component.updateResult(result);
+			component.updateResult(result);
+			await waitForCondition(() => imageConvertMocks.convertToPng.mock.calls.length === 1);
+			expect(imageConvertMocks.convertToPng).toHaveBeenCalledTimes(1);
+
+			first.resolve({ data: "first-png", mimeType: "image/png" });
+			await waitForCondition(() => imageConvertMocks.convertToPng.mock.calls.length === 2);
+			expect(imageConvertMocks.convertToPng).toHaveBeenCalledTimes(2);
+			second.resolve({ data: "second-png", mimeType: "image/png" });
+			await waitForCondition(() => (component as any).convertedImages.size === 2);
 		} finally {
 			resetCapabilitiesCache();
 		}
