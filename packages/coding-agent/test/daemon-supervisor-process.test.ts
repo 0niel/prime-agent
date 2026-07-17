@@ -14,7 +14,7 @@ import {
 } from "../src/core/session-lease.js";
 import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
-import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
+import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import type { DaemonWorkerDescriptor } from "../src/modes/daemon/daemon-worker-protocol.js";
 
@@ -489,9 +489,13 @@ describe("daemon supervisor resident workers", () => {
 		const heartbeat = (heartbeatResponse.data as { heartbeat: { id: string } }).heartbeat;
 		const cronStore = AgentCronJobStore.forSessionArtifacts();
 		cronStore.registerSessionArtifact(summary.sessionId, sessionManager.getSessionArtifactDir()!);
+		const observer = await connectEventually(socketPath, supervisor);
+		const observerClosed = new Promise<Error>((resolveClose) => observer.onClose(resolveClose));
 
 		expect((await client.request({ type: "shutdown" })).success).toBe(true);
 		client.close();
+		expect(getDaemonSocketCloseReason(await observerClosed)).toBe("shutdown");
+		observer.close();
 		await waitForSocketGone(socketPath);
 		await waitForProcessGone(summary.workerPid);
 		workerPids.delete(summary.workerPid);

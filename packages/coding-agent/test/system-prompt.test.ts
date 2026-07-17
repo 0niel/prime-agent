@@ -99,6 +99,22 @@ describe("buildRlmPrompt", () => {
 		expect(prompt).toContain("Each `%%bash` cell runs in a throw-away subshell");
 	});
 
+	test("discovers requested models through a bounded authenticated host search", () => {
+		const prompt = buildRlmPrompt({
+			cwd: "/repo",
+			messagesPath: "/repo/.pi/sessions/session.jsonl",
+			activeTools: ["ipython"],
+		});
+
+		expect(prompt).toContain("await rlm.find_models('requested model')");
+		expect(prompt).toContain("bounded authenticated catalog");
+		expect(prompt).toContain("exact `provider/model` selector");
+		expect(prompt).toContain("If an `RLMResult.warning` is set");
+		expect(prompt).toContain("tell the user which model actually ran");
+		expect(prompt).toContain("Do not choose a different model on your own");
+		expect(prompt).not.toContain("model choices for subagents");
+	});
+
 	test("only documents ipython shell prefixes when ipython is active", () => {
 		const prompt = buildRlmPrompt({
 			cwd: "/repo",

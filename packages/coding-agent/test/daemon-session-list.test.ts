@@ -372,6 +372,7 @@ describe("buildRlmChildSnapshots", () => {
 		const parent = makeState({ activeSessionId: "parent", sessionFile: "/tmp/parent.jsonl" });
 		const child = makeState({
 			activeSessionId: "child",
+			model: { provider: "anthropic", id: "claude-opus-4-7" },
 			isStreaming: true,
 			metadata: {
 				kind: "subagent",
@@ -423,6 +424,7 @@ describe("buildRlmChildSnapshots", () => {
 			["sub-bbb", "sub-aaa", "done"],
 		]);
 		expect(snapshots[0]).toMatchObject({
+			model: "anthropic/claude-opus-4-7",
 			label: "Summarize the repo layout",
 			answerPreview: "The repo is an npm workspace.",
 			toolUseCount: 1,
@@ -529,6 +531,7 @@ describe("resolveAttachModelFallbackMessage", () => {
 
 interface StateOptions {
 	activeSessionId: string;
+	model?: { provider: string; id: string };
 	sessionFile?: string;
 	sessionId?: string;
 	isStreaming?: boolean;
@@ -570,7 +573,7 @@ function makeState(options: StateOptions): ActiveSessionState {
 			metadata: options.metadata ?? { kind: "top-level", createdAt: 1 },
 			diagnostics: [],
 			session: {
-				model: undefined,
+				model: options.model,
 				thinkingLevel: "off",
 				isStreaming: options.isStreaming ?? false,
 				isCompacting: false,

@@ -32,6 +32,15 @@
 - For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` plus the faux provider. Do not use real provider APIs, real API keys, or paid tokens.
 - Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` and name them `<issue-number>-<short-slug>.test.ts`.
 
+## Daemon Protocol Changes
+
+- Classify every daemon command, event, and response-shape change as backward-compatible, capability-gated, or incompatible.
+- Add optional features behind a negotiated server capability. Clients must check the capability before sending the command or depending on the event.
+- Bump `DAEMON_PROTOCOL_VERSION` for incompatible changes or when startup begins requiring behavior an older daemon cannot provide.
+- Update `DAEMON_SCHEMA_REVISION`, the command/event compatibility maps, and both new-client/old-daemon and old-client/new-daemon tests for every wire change.
+- Optional daemon metadata and UI features must degrade locally. They must not prevent the agent, session attachment, or interactive startup from working.
+- Never make a new daemon command part of startup without a protocol or capability gate.
+
 ## Dependencies
 
 - A 7-day minimum release age applies to all dependency updates: `.npmrc` sets `min-release-age=7` and `.github/dependabot.yml` uses a matching `cooldown`. Never bypass it for routine updates.

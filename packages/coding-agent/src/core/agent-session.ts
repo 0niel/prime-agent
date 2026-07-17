@@ -30,6 +30,7 @@ import {
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import type {
+	Api,
 	AssistantMessage,
 	ImageContent,
 	Model,
@@ -201,10 +202,14 @@ import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
 	createRlmDeleteSubagentHostHandler,
+	createRlmFindModelsHostHandler,
 	createRlmListSubagentsHostHandler,
 	createRlmRunHostHandler,
+	findRlmModelMatches,
+	normalizeRequestedRlmSubagentModel,
 	normalizeRequestedRlmSubagentSessionName,
 	type RlmDeleteSubagentResult,
+	type RlmFindModelsResult,
 	type RlmInternalRunResult,
 	type RlmListSubagentsResult,
 	type RlmRunResult,
@@ -251,6 +256,8 @@ export interface RlmChildAgentSnapshot {
 	activeSessionId?: string;
 	/** Stable daemon-visible session name for addressing/displaying the child. */
 	sessionName?: string;
+	/** Exact provider/model selector used by the child. */
+	model?: string;
 	label: string;
 	status: RlmChildAgentStatus;
 	durationMs?: number;
@@ -688,6 +695,11 @@ interface RlmChildRun {
 	detachedDeletion?: RlmSubagentRegistryEntry;
 }
 
+interface RlmSubagentModelSelection {
+	model: Model<Api>;
+	warning?: string;
+}
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -889,6 +901,7 @@ export class AgentSession {
 	private _rlmParentNodeId?: string;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
 	private _activeRlmChildRuns = new Map<string, RlmChildRun>();
+	private _pendingRlmSubagentSessionNames = new Set<string>();
 	// Inline mode keeps finished child sessions so the inspector can still read them;
 	// the daemon does the same by leaving the child session resident in its registry.
 	private _retainedRlmChildSessions = new Map<string, AgentSession>();
@@ -6005,6 +6018,7 @@ export class AgentSession {
 			"rlm.run": createRlmRunHostHandler(({ prompt, kwargs, cellSourceCode }) =>
 				this.runRlmChild(prompt, kwargs, cellSourceCode),
 			),
+			"rlm.find_models": createRlmFindModelsHostHandler((query, limit) => this.findRlmModels(query, limit)),
 			"rlm.list_subagents": createRlmListSubagentsHostHandler(() => this.listRlmSubagents()),
 			"rlm.delete_subagent": createRlmDeleteSubagentHostHandler((target) => this.deleteRlmSubagent(target)),
 			"model.info": async () => ({
@@ -6263,8 +6277,9 @@ export class AgentSession {
 			spawnCode: options.spawnCode,
 			sessionDir: options.sessionDir,
 			model: options.model,
-			thinkingLevel: this.thinkingLevel,
-			serviceTier: this.serviceTier,
+			thinkingLevel: clampThinkingLevel(options.model, this.thinkingLevel) as ThinkingLevel,
+			serviceTier:
+				this.serviceTier === "priority" && !supportsFastMode(options.model) ? "default" : this.serviceTier,
 			scopedModels: [...this._scopedModels],
 			activeToolNames: this.getActiveToolNames(),
 			allowedToolNames: this._allowedToolNames ? [...this._allowedToolNames] : undefined,
@@ -6315,16 +6330,14 @@ export class AgentSession {
 		}
 		childSessionManager.appendModelChange(options.model.provider, options.model.id);
 		childSessionManager.appendThinkingLevelChange(options.thinkingLevel);
-		const serviceTier =
-			options.serviceTier === "priority" && !supportsFastMode(options.model) ? "default" : options.serviceTier;
-		childSessionManager.appendServiceTierChange(serviceTier);
+		childSessionManager.appendServiceTierChange(options.serviceTier);
 
 		const childAgent = new Agent({
 			initialState: {
 				systemPrompt: "",
 				model: options.model,
 				thinkingLevel: options.thinkingLevel,
-				serviceTier,
+				serviceTier: options.serviceTier,
 				tools: [],
 			},
 			convertToLlm: this.agent.convertToLlm,
@@ -6696,6 +6709,9 @@ export class AgentSession {
 	}
 
 	private _assertRlmSubagentSessionNameAvailable(name: string): void {
+		if (this._pendingRlmSubagentSessionNames.has(name)) {
+			throw new Error(`RLM subagent session name "${name}" is already in use`);
+		}
 		const conflictsWithSelector = (endpoint: {
 			activeSessionId: string;
 			sessionId: string;
@@ -6736,25 +6752,86 @@ export class AgentSession {
 		}
 	}
 
-	private _startRlmChildRun(prompt: string, kwargs: Record<string, unknown> = {}, spawnCode?: string): RlmChildRun {
-		const { name: rawName, ...unsupported } = kwargs;
+	private async _authenticatedRlmModels(): Promise<Model<Api>[]> {
+		return (await this._modelRegistry.getExecutableModels()).filter((model) => {
+			const status = this._modelRegistry.getProviderAuthStatus(model.provider);
+			return status.source !== "stale" && status.label !== "expired";
+		});
+	}
+
+	async findRlmModels(query: string, limit: number): Promise<RlmFindModelsResult> {
+		return { models: findRlmModelMatches(query, await this._authenticatedRlmModels(), limit) };
+	}
+
+	private _rlmModelFallback(reference: string, parentModel: Model<Api>, reason: string): RlmSubagentModelSelection {
+		const parentSelector = `${parentModel.provider}/${parentModel.id}`;
+		return {
+			model: parentModel,
+			warning: `Requested subagent model "${reference}" ${reason}. Used the parent model "${parentSelector}" instead. Tell the user the subagent ran with "${parentSelector}", not "${reference}".`,
+		};
+	}
+
+	private async _resolveRlmSubagentModel(reference: string | undefined): Promise<RlmSubagentModelSelection> {
+		const parentModel = this.model;
+		if (!parentModel) {
+			throw new Error(formatNoModelSelectedMessage());
+		}
+		if (!reference) {
+			return { model: parentModel };
+		}
+
+		const normalizedReference = reference.toLowerCase();
+		if (`${parentModel.provider}/${parentModel.id}`.toLowerCase() === normalizedReference) {
+			return { model: parentModel };
+		}
+		const model = (await this._authenticatedRlmModels()).find(
+			(candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === normalizedReference,
+		);
+		if (!model) {
+			return this._rlmModelFallback(reference, parentModel, "is unavailable, unauthenticated, or expired");
+		}
+
+		const auth = await this._modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth.ok) {
+			return this._rlmModelFallback(reference, parentModel, "failed authentication preflight");
+		}
+		return { model };
+	}
+
+	private async _startRlmChildRun(
+		prompt: string,
+		kwargs: Record<string, unknown> = {},
+		spawnCode?: string,
+	): Promise<RlmChildRun> {
+		const { name: rawName, model: rawModel, ...unsupported } = kwargs;
 		const unsupportedKwargs = Object.keys(unsupported);
 		if (unsupportedKwargs.length > 0) {
 			throw new Error(`Unsupported rlm.run kwargs: ${unsupportedKwargs.sort().join(", ")}`);
 		}
 		const requestedSessionName = normalizeRequestedRlmSubagentSessionName(rawName);
+		const requestedModel = normalizeRequestedRlmSubagentModel(rawModel);
 		if (requestedSessionName) {
 			assertDirectAgentMessageTarget(requestedSessionName);
-			this._assertRlmSubagentSessionNameAvailable(requestedSessionName);
 		}
 		if (this._rlmDepth >= this._rlmMaxDepth) {
 			throw new Error(
 				`RLM recursion depth limit reached (RLM_DEPTH=${this._rlmDepth}, RLM_MAX_DEPTH=${this._rlmMaxDepth})`,
 			);
 		}
-		const model = this.model;
-		if (!model) {
-			throw new Error(formatNoModelSelectedMessage());
+		if (requestedSessionName) {
+			this._assertRlmSubagentSessionNameAvailable(requestedSessionName);
+			this._pendingRlmSubagentSessionNames.add(requestedSessionName);
+		}
+		let modelSelection: RlmSubagentModelSelection;
+		try {
+			modelSelection = await this._resolveRlmSubagentModel(requestedModel);
+		} finally {
+			if (requestedSessionName) {
+				this._pendingRlmSubagentSessionNames.delete(requestedSessionName);
+			}
+		}
+		if (this._disposed || this._disposing) {
+			throw new Error("Cannot start a subagent after the parent session has been disposed");
 		}
 
 		const childSessionDir = this._createChildRlmSessionDir();
@@ -6785,12 +6862,14 @@ export class AgentSession {
 		this._activeRlmChildRuns.set(run.id, run);
 		// Status-only relay; the conversation is read from the child's own session.
 		const emitChildUpdate = () => {
+			const childModel = childSession?.model ?? modelSelection.model;
 			this._emit({
 				type: "rlm_child_update",
 				child: {
 					id: childNodeId,
 					parentId: this._rlmParentNodeId,
 					sessionName: childSession?.sessionName ?? sessionName,
+					model: `${childModel.provider}/${childModel.id}`,
 					label,
 					status: run.status,
 					durationMs,
@@ -6826,7 +6905,7 @@ export class AgentSession {
 				sessionName,
 				spawnCode,
 				sessionDir: childSessionDir,
-				model,
+				model: modelSelection.model,
 			}),
 			onSessionPublished: publishChildSession,
 		};
@@ -6923,6 +7002,8 @@ export class AgentSession {
 					usage,
 					turns: child._assistantTurnCount(),
 					session_dir: childSessionDir,
+					model: `${modelSelection.model.provider}/${modelSelection.model.id}`,
+					...(modelSelection.warning ? { warning: modelSelection.warning } : {}),
 				};
 				run.result = result;
 				return { ...result, assistantUsage };
@@ -7010,7 +7091,7 @@ export class AgentSession {
 	}
 
 	async runRlmChild(prompt: string, kwargs: Record<string, unknown> = {}, spawnCode?: string): Promise<RlmRunResult> {
-		const run = this._startRlmChildRun(prompt, kwargs, spawnCode);
+		const run = await this._startRlmChildRun(prompt, kwargs, spawnCode);
 		if (!run.task) {
 			throw new Error("RLM child failed to start");
 		}
@@ -7020,6 +7101,8 @@ export class AgentSession {
 			usage: result.usage,
 			turns: result.turns,
 			session_dir: result.session_dir,
+			model: result.model,
+			...(result.warning ? { warning: result.warning } : {}),
 		};
 	}
 

@@ -69,13 +69,15 @@ packages/coding-agent/src/core/agent-session.ts
   Parent session owns recursion settings and implements runRlmChild().
 
 packages/coding-agent/src/core/rlm-runtime.ts
-  TypeScript request/result types for rlm.run, rlm.list_subagents, and
-  rlm.delete_subagent plus their typed host request handlers.
+  TypeScript request/result types for rlm.run, rlm.find_models,
+  rlm.list_subagents, and rlm.delete_subagent plus their typed host request
+  handlers.
 
 prime-agent-runtime/src/rlm/__init__.py
   Python shim installed into ~/.prime/agent/kernel-venv. Exposes rlm, rlm.run(),
-  rlm.list_subagents(), rlm.delete_subagent(), host_request(), RLMResult,
-  RLMSubagent, TokenUsage, and the session-backed harness state helper.
+  rlm.find_models(), rlm.list_subagents(), rlm.delete_subagent(),
+  host_request(), RLMResult, RLMModel, RLMSubagent, TokenUsage, and the
+  session-backed harness state helper.
 
 prime-agent-runtime/src/rlm/harness.py
   Session-backed JSON store for reset-free harness refinement notes: prompt
@@ -382,9 +384,11 @@ It exports:
 ```python
 rlm
 run(prompt: str, **kwargs)
+find_models(query: str = "", limit: int = 8)
 list_subagents()
 host_request(request_type: str, payload: dict | None = None)
 RLMResult
+RLMModel
 RLMSubagent
 TokenUsage
 ```
@@ -396,6 +400,8 @@ result.answer       # str
 result.usage        # TokenUsage
 result.turns        # int
 result.session_dir  # pathlib.Path | None
+result.model        # exact provider/model selector
+result.warning      # fallback notice to surface to the user, or None
 ```
 
 The shim also makes the module callable so `import rlm; await rlm("...")` can work, but the ipython tool normally injects the callable object directly as `rlm`.
@@ -442,7 +448,7 @@ awaits the Future
 
 The callback strips the reply's `status` field and converts the payload into `RLMResult`, or raises `RuntimeError` when the host reports an error. The comm-open/await machinery is the public `host_request()`; `run()` is a typed wrapper around it, and other kernel-side skills reuse `host_request()` for their own request types.
 
-The shim accepts `**kwargs` and includes them in the comm payload. The TypeScript host supports `name="..."` for an orchestrator-chosen child session name; all other kwargs are rejected with a clear error instead of being ignored.
+The shim accepts `**kwargs` and includes them in the comm payload. The TypeScript host supports `name="..."` for an orchestrator-chosen child session name and `model="provider/model"` for an exact model selection; all other kwargs are rejected with a clear error instead of being ignored. `find_models()` searches a bounded catalog containing only models backed by active, non-expired credentials and returns `provider`, `id`, `name`, and exact `selector` fields.
 
 ### Why Control-Channel Comm Replies Exist
 
@@ -510,8 +516,7 @@ options.hostHandlers[data.type](data)
 sendCommMessage(comm_id, { status: "ok", ...result })
 ```
 
-The RLM handlers include `rlm.run` for child creation and
-`rlm.list_subagents` for the current parent session's automatic child registry.
+The RLM handlers include `rlm.run` for child creation, `rlm.find_models` for bounded authenticated model discovery, and `rlm.list_subagents` for the current parent session's automatic child registry.
 
 Unknown types fail with `host request type "<type>" is not available in this session`.
 
@@ -544,10 +549,12 @@ hostHandlers: {
 Sequence:
 
 ```text
-runRlmChild(prompt)
+runRlmChild(prompt, kwargs)
   |
   | check current depth < max depth
-  | require selected model
+  | resolve an exact optional model selector against authenticated models
+  | fall back to the parent model with a user-facing warning if unavailable
+  | otherwise inherit the parent model
   v
 create child session dir
   |
@@ -555,7 +562,7 @@ create child session dir
   v
 create child SessionManager
   |
-  | append model change
+  | append selected model change
   | append thinking level change
   v
 create child Agent
@@ -592,6 +599,8 @@ The child returns:
   };
   turns: number;
   session_dir: string | null;
+  model: string;
+  warning?: string;
 }
 ```
 
@@ -605,6 +614,30 @@ completion_tokens = output
 Turns are counted as assistant messages in the child transcript.
 
 The answer is the child's final assistant text. This matches the RLM-1 training surface: the model stops calling tools and the final assistant text is the answer.
+
+By default, a child inherits the parent's current model. When a user or skill
+requests a different model, the orchestrator first searches the bounded
+authenticated catalog, chooses a candidate, and passes its exact selector:
+
+```python
+matches = await rlm.find_models("DeepSeek V4 Flash")
+result = await rlm(
+    "Check the API",
+    model=matches[0].selector,
+)
+```
+
+`find_models()` returns up to eight matches by default and never more than 20.
+Each match exposes `provider`, `id`, `name`, and the exact `provider/model`
+`selector`; only models backed by active, non-expired credentials are included.
+The full catalog is never injected into the system prompt.
+
+`rlm.run(model=...)` intentionally accepts only an exact selector. If that
+selector is unknown, unauthenticated, expired, unavailable, or fails auth
+preflight, the child uses the parent model and the result returns the actual
+`.model` plus a `.warning` that the parent must surface to the user. A selected
+model is persisted with the child and remains active on later turns; changing
+the parent model does not update existing children.
 
 ### Parent-Scoped Subagent Registry
 
@@ -822,6 +855,9 @@ no selected model
 
 unsupported rlm.run kwargs
   -> TS runRlmChild throws "Unsupported rlm.run kwargs: ..."
+
+unknown, unauthenticated, expired, or unavailable rlm.run model
+  -> TS runRlmChild uses the parent model and returns RLMResult.warning
 
 child provider error
   -> child agent final error behavior is reflected in its final assistant state

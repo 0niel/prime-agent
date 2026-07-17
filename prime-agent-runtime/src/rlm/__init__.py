@@ -41,6 +41,16 @@ class RLMResult:
     session_dir: Path | None = None
     usage: TokenUsage = field(default_factory=TokenUsage)
     turns: int = 0
+    model: str | None = None
+    warning: str | None = None
+
+
+@dataclass(frozen=True)
+class RLMModel:
+    provider: str
+    id: str
+    name: str
+    selector: str
 
 
 @dataclass(frozen=True)
@@ -103,6 +113,8 @@ def _result_from_payload(payload: dict[str, Any]) -> RLMResult:
         usage=usage,
         turns=int(payload.get("turns", 0)),
         session_dir=session_dir,
+        model=payload.get("model") if isinstance(payload.get("model"), str) else None,
+        warning=payload.get("warning") if isinstance(payload.get("warning"), str) else None,
     )
 
 
@@ -166,12 +178,40 @@ async def host_request(request_type: str, payload: dict[str, Any] | None = None)
 
 
 async def run(prompt: str, **kwargs: Any) -> RLMResult:
-    """Run a recursive Prime Agent child through the TypeScript host."""
+    """Run a recursive Prime Agent child through the TypeScript host.
+
+    ``model`` selects a child with an exact ``provider/model`` selector.
+    """
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
     _ensure_recursion_allowed()
     payload = await host_request("rlm.run", {"prompt": prompt, "kwargs": kwargs})
     return _result_from_payload(payload)
+
+
+def _model_from_payload(payload: Any) -> RLMModel:
+    if not isinstance(payload, dict):
+        raise RuntimeError("rlm.find_models returned an invalid model entry")
+    provider = payload.get("provider")
+    model_id = payload.get("id")
+    name = payload.get("name")
+    selector = payload.get("selector")
+    if not all(isinstance(value, str) and value for value in (provider, model_id, name, selector)):
+        raise RuntimeError("rlm.find_models returned an invalid model entry")
+    return RLMModel(provider=provider, id=model_id, name=name, selector=selector)
+
+
+async def find_models(query: str = "", limit: int = 8) -> list[RLMModel]:
+    """Search a bounded list of models backed by active user credentials."""
+    if not isinstance(query, str):
+        raise TypeError(f"query must be str, got {type(query).__name__}")
+    if not isinstance(limit, int):
+        raise TypeError(f"limit must be int, got {type(limit).__name__}")
+    payload = await host_request("rlm.find_models", {"query": query, "limit": limit})
+    models = payload.get("models")
+    if not isinstance(models, list):
+        raise RuntimeError("rlm.find_models returned an invalid models list")
+    return [_model_from_payload(model) for model in models]
 
 
 def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") -> RLMSubagent:
@@ -286,6 +326,9 @@ class _RLMCallable:
     async def run(self, prompt: str, **kwargs: Any) -> RLMResult:
         return await run(prompt, **kwargs)
 
+    async def find_models(self, query: str = "", limit: int = 8) -> list[RLMModel]:
+        return await find_models(query, limit)
+
     async def list_subagents(self) -> list[RLMSubagent]:
         return await list_subagents()
 
@@ -314,11 +357,13 @@ __all__ = [
     "McpIntegration",
     "McpToolError",
     "NotEnabled",
+    "RLMModel",
     "RLMResult",
     "RLMSubagent",
     "RefinementEvent",
     "TokenUsage",
     "delete_subagent",
+    "find_models",
     "get_harness_state",
     "harness",
     "host_request",

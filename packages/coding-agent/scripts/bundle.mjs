@@ -11,13 +11,23 @@
  * compiled Bun binary), keyed off the __PI_BUNDLED__ define below, so extension
  * imports of pi packages share the bundle's module instances.
  */
-import { chmodSync, rmSync } from "node:fs";
+import { chmodSync, readFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const outdir = join(packageDir, "dist", "bundle");
+let buildId;
+try {
+	buildId = execFileSync("git", ["describe", "--tags", "--always", "--dirty"], {
+		cwd: dirname(packageDir),
+		encoding: "utf8",
+	}).trim();
+} catch {
+	buildId = `release-${JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")).version}`;
+}
 
 rmSync(outdir, { recursive: true, force: true });
 
@@ -31,7 +41,7 @@ await build({
 	// Native or interop-sensitive packages stay external; they resolve from
 	// node_modules at runtime (and are loaded via createRequire/lazily anyway).
 	external: ["zeromq", "koffi", "undici", "@silvia-odwyer/photon-node", "@mariozechner/clipboard"],
-	define: { __PI_BUNDLED__: "true" },
+	define: { __PI_BUNDLED__: "true", __PI_BUILD_ID__: JSON.stringify(buildId) },
 	banner: {
 		js: "import { createRequire as __piBundleCreateRequire } from 'node:module'; const require = __piBundleCreateRequire(import.meta.url);",
 	},

@@ -1,6 +1,8 @@
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it } from "vitest";
+import { KeybindingsManager } from "../src/core/keybindings.js";
 import {
+	ChildAgentDetailComponent,
 	type ChildAgentInspectorNode,
 	ChildAgentSummaryComponent,
 } from "../src/modes/interactive/components/child-agent-inspector.js";
@@ -18,6 +20,7 @@ function node(id: string, status: ChildAgentInspectorNode["status"] = "running")
 describe("ChildAgentSummaryComponent inline list", () => {
 	beforeAll(() => {
 		initTheme("dark");
+		setKeybindings(new KeybindingsManager());
 	});
 
 	it("renders one row per subagent when within the cap", () => {
@@ -50,12 +53,21 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		expect(out).not.toContain(" a ");
 	});
 
-	it("shows tool and token usage beside each subagent", () => {
+	it("shows the model and token usage without a tool column", () => {
 		const summary = new ChildAgentSummaryComponent();
-		summary.setNodes([{ ...node("a"), toolUseCount: 3, tokenCount: 41_000 }]);
+		summary.setNodes([{ ...node("a"), model: "openai/gpt-5.4", toolUseCount: 3, tokenCount: 41_000 }]);
 		const out = stripAnsi(summary.render(80).join("\n"));
-		expect(out).toContain("3 tools");
+		expect(out).toContain("openai/gpt-5.4");
 		expect(out).toContain("41k tok");
+		expect(out).not.toContain("tools");
+	});
+
+	it("preserves the model suffix when its selector is truncated", () => {
+		const summary = new ChildAgentSummaryComponent();
+		summary.setNodes([{ ...node("a"), model: "prime-inference/internal/glm-5.2-fast" }]);
+		const out = stripAnsi(summary.render(80).join("\n"));
+		expect(out).toContain("prime-…/glm-5.2-fast");
+		expect(out).not.toContain("prime-inference/int…");
 	});
 
 	it("shows recaps in a fixed column and falls back to activity", () => {
@@ -180,6 +192,28 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		summary.setNodes([{ ...node("a"), tokenCount: 41_000, durationMs: 5_000 }]);
 		const out = stripAnsi(summary.render(80).join("\n"));
 		expect(out).toMatch(/41k tok\s{3}5s/);
+	});
+
+	it("shows the model to the right of the back action in detail view", () => {
+		const detail = new ChildAgentDetailComponent();
+		detail.setNode({ ...node("a"), model: "anthropic/claude-opus-4-7" });
+		const hint = stripAnsi(detail.render(100).at(-1) ?? "");
+		expect(hint).toContain("back to chat");
+		expect(hint).toContain("anthropic/claude-opus-4-7");
+		expect(hint.indexOf("anthropic/claude-opus-4-7")).toBeGreaterThan(hint.indexOf("back to chat"));
+	});
+
+	it("truncates long models before hiding detail actions", () => {
+		const detail = new ChildAgentDetailComponent();
+		detail.setNode({
+			...node("a"),
+			model: "provider-with-a-long-name/model-with-an-even-longer-name",
+		});
+		const hint = stripAnsi(detail.render(60).at(-1) ?? "");
+		expect(hint).toContain("back to chat");
+		expect(hint).toContain("provider-…");
+		expect(hint).toContain("to expand");
+		expect(hint).toContain("stop");
 	});
 
 	it("keeps the starting prompt compact so the recap gets more room", () => {
