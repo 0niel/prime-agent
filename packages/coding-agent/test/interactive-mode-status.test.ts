@@ -113,6 +113,7 @@ describe("mergeChildAgentSnapshots", () => {
 	const rich: AgentConnectionRlmChildAgentSnapshot = {
 		id: "child-1",
 		activeSessionId: "active-child-1",
+		model: "openai/gpt-5.4",
 		label: "Inspect the scheduler",
 		status: "running",
 		durationMs: 5_000,
@@ -134,6 +135,7 @@ describe("mergeChildAgentSnapshots", () => {
 
 		expect(merged).toMatchObject({
 			activeSessionId: "active-child-1",
+			model: "openai/gpt-5.4",
 			durationMs: 5_000,
 			answerPreview: "Reading the queue",
 			toolUseCount: 4,

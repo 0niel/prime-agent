@@ -310,6 +310,7 @@ function rlmChildSnapshotForActiveSession(
 		parentId: parentNodeId,
 		activeSessionId: activeSession.activeSessionId,
 		sessionName: session.sessionName,
+		model: session.model ? `${session.model.provider}/${session.model.id}` : undefined,
 		label: rlmChildLabel(metadata.prompt ?? ""),
 		status,
 		answerPreview,
