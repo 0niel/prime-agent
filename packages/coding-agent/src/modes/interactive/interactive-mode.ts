@@ -2746,7 +2746,6 @@ export class InteractiveMode {
 				latestToolCall.arguments,
 				{
 					showImages: this.settingsManager.getShowImages(),
-					imageWidthCells: this.settingsManager.getImageWidthCells(),
 				},
 				toolDefinition,
 				this.ui,
@@ -5606,7 +5605,6 @@ export class InteractiveMode {
 				cwd: this.getCurrentCwd(),
 				toolOptions: {
 					showImages: this.settingsManager.getShowImages(),
-					imageWidthCells: this.settingsManager.getImageWidthCells(),
 				},
 				getToolDefinition: (name) => definitions.get(name),
 				markdownTheme: this.getMarkdownThemeWithSettings(),
@@ -5970,9 +5968,7 @@ export class InteractiveMode {
 							content.arguments,
 							{
 								showImages: this.settingsManager.getShowImages(),
-								imageWidthCells: this.settingsManager.getImageWidthCells(),
-								// Do not replay historical inline image payloads on session load/rebuild.
-								allowInlineImages: false,
+								includeImageDimensions: false,
 							},
 							this.getCachedToolDefinition(content.name),
 							this.ui,
@@ -6016,8 +6012,7 @@ export class InteractiveMode {
 		}
 
 		for (const [toolCallId, component] of renderedPendingTools) {
-			// These tool calls have no historical result yet, so future updates are live output.
-			component.setAllowInlineImages(true);
+			component.setIncludeImageDimensions(true);
 			this.pendingTools.set(toolCallId, component);
 		}
 		this.ui.requestRender();
@@ -6873,7 +6868,6 @@ export class InteractiveMode {
 				{
 					autoCompact: state.autoCompactionEnabled,
 					showImages: this.settingsManager.getShowImages(),
-					imageWidthCells: this.settingsManager.getImageWidthCells(),
 					autoResizeImages: this.settingsManager.getImageAutoResize(),
 					blockImages: this.settingsManager.getBlockImages(),
 					enableSkillCommands: this.settingsManager.getEnableSkillCommands(),
@@ -6909,14 +6903,6 @@ export class InteractiveMode {
 						for (const child of this.chatContainer.children) {
 							if (child instanceof ToolExecutionComponent) {
 								child.setShowImages(enabled);
-							}
-						}
-					},
-					onImageWidthCellsChange: (width) => {
-						this.settingsManager.setImageWidthCells(width);
-						for (const child of this.chatContainer.children) {
-							if (child instanceof ToolExecutionComponent) {
-								child.setImageWidthCells(width);
 							}
 						}
 					},

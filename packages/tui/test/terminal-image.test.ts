@@ -336,6 +336,23 @@ describe("Kitty image cursor movement", () => {
 			setCellDimensions({ widthPx: 9, heightPx: 18 });
 		}
 	});
+
+	it("keeps compact metadata and its prefix when terminal graphics are unavailable", () => {
+		setCapabilities({ images: null, trueColor: true, hyperlinks: true });
+		try {
+			const image = new Image(
+				"AAAA",
+				"image/png",
+				{ fallbackColor: (value) => value },
+				{ filename: "result.png", fallbackOnly: true, fallbackPrefix: "    ╰─ " },
+				{ widthPx: 20, heightPx: 10 },
+			);
+
+			assert.deepStrictEqual(image.render(80), ["    ╰─ [result.png · image/png · 20×10]"]);
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
 });
 
 describe("hyperlink", () => {
