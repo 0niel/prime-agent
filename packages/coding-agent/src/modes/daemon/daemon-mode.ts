@@ -4534,15 +4534,11 @@ export class AgentDaemon {
 						activeSessionId: state.activeSessionId,
 					});
 					const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
-					const accepted = this.write(client, {
+					this.write(client, {
 						...sequencedMessage,
 						messages: [],
 						snapshotFollows: true,
 					});
-					if (!accepted) {
-						this.queueClientCatchup(client, state.activeSessionId, "replacement");
-						continue;
-					}
 					const snapshotSignal = markClientSnapshotStreaming(client, state.activeSessionId);
 					let transcript: SnapshotTranscriptChunkSource;
 					try {
@@ -4585,32 +4581,20 @@ export class AgentDaemon {
 				} catch (error) {
 					this.log(`could not prepare replacement snapshot: ${String(error)}`);
 					// Continue below with the complete replacement event.
-					let accepted: boolean;
 					if (client.transport === "private-framed") {
-						accepted = this.write(client, sequencedMessage);
+						this.write(client, sequencedMessage);
 					} else {
 						serialized ??= serializeJsonLine(sequencedMessage);
-						accepted = this.writeSerialized(client, serialized, sequencedMessage);
-					}
-					if (!accepted) {
-						this.queueClientCatchup(client, state.activeSessionId, "replacement");
+						this.writeSerialized(client, serialized, sequencedMessage);
 					}
 				}
 				continue;
 			}
-			let accepted: boolean;
 			if (client.transport === "private-framed") {
-				accepted = this.write(client, sequencedMessage);
+				this.write(client, sequencedMessage);
 			} else {
 				serialized ??= serializeJsonLine(sequencedMessage);
-				accepted = this.writeSerialized(client, serialized, sequencedMessage);
-			}
-			if (!accepted) {
-				this.queueClientCatchup(
-					client,
-					state.activeSessionId,
-					sequencedMessage.type === "session_replaced" ? "replacement" : "resync",
-				);
+				this.writeSerialized(client, serialized, sequencedMessage);
 			}
 		}
 	}

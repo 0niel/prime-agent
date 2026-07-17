@@ -4,12 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import type { DaemonAttachResult } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
-import { DAEMON_WORKER_STARTUP_GATE_COMMIT } from "../src/modes/daemon/daemon-worker-protocol.js";
+import {
+	DAEMON_WORKER_STARTUP_GATE_COMMIT,
+	type DaemonWorkerFrameHeader,
+} from "../src/modes/daemon/daemon-worker-protocol.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
+import type { PrivateFrame } from "../src/modes/session-worker/private-framing.js";
 
 const workerLaunchTestState = vi.hoisted(() => ({
 	capture: false,
@@ -1347,6 +1352,59 @@ describe("daemon worker supervisor monitoring", () => {
 		await supervisor.attachClient(client, { type: "attach", activeSessionId });
 
 		expect(seed).toHaveBeenCalledWith(activeSessionId, streamingMessage);
+	});
+
+	it("catches up only after worker events are skipped behind a backpressured write", async () => {
+		const activeSessionId = "active-backpressure";
+		const writes: string[] = [];
+		const write = vi.fn((data: unknown) => {
+			writes.push(String(data));
+			return false;
+		});
+		const client = {
+			id: "client-1",
+			socket: { destroyed: false, write },
+			attachedActiveSessionIds: new Set([activeSessionId]),
+			catchupActiveSessionIds: new Set<string>(),
+			backpressured: false,
+			supportsExtensionUi: false,
+			capabilities: new Set(),
+		} as unknown as DaemonSocketClient;
+		const worker = {
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			incomingTranscriptActiveSessionIds: new Set(),
+			duplicateIncomingTranscriptChunkIndexes: new Map(),
+			snapshotTransferFrames: new Map(),
+		};
+		const catchUpClient = vi.fn(async () => undefined);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			clients: new Set([client]),
+			streamReconstructor: { observe: vi.fn() },
+			catchUpClient,
+			invalidateWorkerSnapshot: vi.fn(),
+		}) as {
+			handleWorkerFrame(residentWorker: typeof worker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+		const frame = (error: string, extensionPath: string): PrivateFrame<DaemonWorkerFrameHeader> => ({
+			header: { kind: "outbound", outboundType: "extension_error", activeSessionId },
+			payload: Buffer.from(
+				`${JSON.stringify({ type: "extension_error", activeSessionId, extensionPath, event: "load", error })}\n`,
+			),
+		});
+
+		supervisor.handleWorkerFrame(worker, frame("first", "x".repeat(1024 * 1024)));
+
+		expect(client.backpressured).toBe(true);
+		expect(client.catchupActiveSessionIds).toEqual(new Set());
+		expect(writes).toHaveLength(1);
+		expect(writes[0]).toContain('"error":"first"');
+
+		supervisor.handleWorkerFrame(worker, frame("skipped", "/tmp/extension.ts"));
+
+		expect(writes).toHaveLength(1);
+		expect(client.catchupActiveSessionIds).toEqual(new Set([activeSessionId]));
+		expect(catchUpClient).not.toHaveBeenCalled();
 	});
 
 	it("subscribes to worker updates with chunked snapshots", async () => {

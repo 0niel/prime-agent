@@ -3110,9 +3110,7 @@ export class DaemonSupervisor {
 				this.queueCatchup(client, activeSessionId, outboundType === "session_replaced" ? "replacement" : "resync");
 				continue;
 			}
-			if (!this.writeSerialized(client, publicPayload)) {
-				this.queueCatchup(client, activeSessionId, outboundType === "session_replaced" ? "replacement" : "resync");
-			}
+			this.writeSerialized(client, publicPayload);
 		}
 		if (outboundType === "session_replaced" || outboundType === "session_closed") {
 			void this.refreshWorkerSummaries(worker)
