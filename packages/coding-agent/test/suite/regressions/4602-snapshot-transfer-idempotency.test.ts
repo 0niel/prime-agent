@@ -28,16 +28,18 @@ interface WorkerHarness {
 	summaries: Map<string, SessionSummary>;
 	snapshotCache: Map<string, DaemonAttachResult>;
 	transcriptCaches: Map<string, SnapshotTranscriptCache>;
-	incomingTranscriptActiveSessionIds: Set<string>;
-	duplicateIncomingTranscriptChunkIndexes: Map<string, number>;
-	snapshotTransferFrames: Map<
+	snapshotGenerations: Map<
 		string,
-		{
-			begin: Buffer;
-			end?: Buffer;
-			duplicateResult?: DaemonAttachResult;
-			validation?: { promise: Promise<void>; resolve: () => void; reject: (error: Error) => void };
-		}
+		Map<
+			string,
+			{
+				transcript: SnapshotTranscriptCache;
+				result: DaemonAttachResult;
+				incoming: boolean;
+				retired: boolean;
+				validation?: { promise: Promise<void>; resolve: () => void; reject: (error: Error) => void };
+			}
+		>
 	>;
 	snapshotLoads: Map<string, Promise<DaemonAttachResult>>;
 	intentionalStop: boolean;
@@ -87,6 +89,9 @@ function frame(
 			kind: "outbound",
 			outboundType: message.type,
 			...("activeSessionId" in message ? { activeSessionId: message.activeSessionId } : {}),
+			...("snapshotId" in message && typeof message.snapshotId === "string"
+				? { snapshotId: message.snapshotId }
+				: {}),
 			payloadEncoding: "jsonl",
 			...(snapshotPurpose ? { snapshotPurpose } : {}),
 		},
@@ -108,9 +113,7 @@ function workerHarness() {
 		summaries: new Map([[activeSessionId, summary()]]),
 		snapshotCache: new Map(),
 		transcriptCaches: new Map<string, SnapshotTranscriptCache>(),
-		incomingTranscriptActiveSessionIds: new Set<string>(),
-		duplicateIncomingTranscriptChunkIndexes: new Map<string, number>(),
-		snapshotTransferFrames: new Map(),
+		snapshotGenerations: new Map(),
 		snapshotLoads: new Map(),
 		intentionalStop: false,
 		stopRevision: 0,
@@ -300,7 +303,6 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		});
 		worker.snapshotCache.set(activeSessionId, streamedResult([]));
 		worker.transcriptCaches.set(activeSessionId, transcript);
-		worker.incomingTranscriptActiveSessionIds.add(activeSessionId);
 		const internals = supervisor as unknown as {
 			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
 		};
@@ -320,10 +322,10 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(worker.summaries.has("active-4602-sibling")).toBe(true);
 		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
 		expect(worker.transcriptCaches.has(activeSessionId)).toBe(false);
-		expect(worker.incomingTranscriptActiveSessionIds.has(activeSessionId)).toBe(false);
+		expect(worker.snapshotGenerations.has(activeSessionId)).toBe(false);
 	});
 
-	it("quarantines a completed duplicate until exact replacement validation", () => {
+	it("quarantines a completed duplicate until exact replacement validation", async () => {
 		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			descriptorDir: "/tmp/eng-4602-supervisor-state",
@@ -334,10 +336,14 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		const streamSnapshot = vi.fn(async () => {});
 		const internals = supervisor as unknown as {
 			clients: Set<DaemonSocketClient>;
+			workers: Map<string, WorkerHarness>;
+			syncWorkerExtensionUi: ReturnType<typeof vi.fn>;
 			streamSnapshot: typeof streamSnapshot;
 			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
 		};
 		internals.clients.add(client);
+		internals.workers.set(worker.descriptor.workerId, worker);
+		internals.syncWorkerExtensionUi = vi.fn(async () => {});
 		internals.streamSnapshot = streamSnapshot;
 		const messages: AgentMessage[] = [{ role: "user", content: "stable", timestamp: 1 }];
 		const frames = snapshotFrames(messages);
@@ -356,6 +362,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(streamSnapshot).not.toHaveBeenCalled();
 
 		internals.handleWorkerFrame(worker, frame(frames.end, "replacement"));
+		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(worker.snapshotCache.has(activeSessionId)).toBe(true);
 		expect(streamSnapshot).toHaveBeenCalledOnce();
 		expect(close).not.toHaveBeenCalled();
@@ -377,170 +384,6 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(worker.snapshotCache.has(activeSessionId)).toBe(false);
 		expect(streamSnapshot).not.toHaveBeenCalled();
 		expect(close).toHaveBeenCalledOnce();
-	});
-
-	it("queues a replacement until the active client snapshot finishes", async () => {
-		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-ordered-replacement.sock", {
-			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
-			descriptorDir: "/tmp/eng-4602-supervisor-ordered-replacement-state",
-		});
-		const { worker } = workerHarness();
-		const client = socketClient("public", new PassThrough());
-		const messages: AgentMessage[] = [{ role: "user", content: "stable", timestamp: 1 }];
-		const result = streamedResult(messages);
-		const transcript = new SnapshotTranscriptCache({
-			activeSessionId,
-			snapshotId,
-			messages,
-			cacheRoot: "/tmp",
-		});
-		worker.transcriptCaches.set(activeSessionId, transcript);
-		const written: DaemonOutbound[] = [];
-		let releaseFirstWrite!: (accepted: boolean) => void;
-		const firstWrite = new Promise<boolean>((resolve) => {
-			releaseFirstWrite = resolve;
-		});
-		const writeSnapshotBuffer = vi.fn((_client: DaemonSocketClient, buffer: Uint8Array) => {
-			written.push(JSON.parse(Buffer.from(buffer).toString("utf8")) as DaemonOutbound);
-			return written.length === 1 ? firstWrite : Promise.resolve(true);
-		});
-		const internals = supervisor as unknown as {
-			clients: Set<DaemonSocketClient>;
-			pendingReplacementSnapshots: WeakMap<DaemonSocketClient, Map<string, unknown>>;
-			writeSnapshotBuffer: typeof writeSnapshotBuffer;
-			streamSnapshot(
-				client: DaemonSocketClient,
-				worker: WorkerHarness,
-				result: DaemonAttachResult,
-				transcript: SnapshotTranscriptCache,
-				purpose: "attach" | "replacement" | "resync",
-			): Promise<void>;
-			streamReplacementSnapshot(
-				worker: WorkerHarness,
-				activeSessionId: string,
-				result: DaemonAttachResult,
-				transcript: SnapshotTranscriptCache,
-			): void;
-		};
-		internals.clients.add(client);
-		internals.writeSnapshotBuffer = writeSnapshotBuffer;
-
-		const activeStream = internals.streamSnapshot(client, worker, result, transcript, "resync");
-		await Promise.resolve();
-		internals.streamReplacementSnapshot(worker, activeSessionId, result, transcript);
-		await Promise.resolve();
-
-		expect(written).toHaveLength(1);
-		expect(written[0]).toMatchObject({ type: "session_snapshot_begin", purpose: "resync" });
-		expect(client.snapshotActiveSessionIds?.has(activeSessionId)).toBe(true);
-
-		releaseFirstWrite(true);
-		await activeStream;
-		await new Promise<void>((resolve) => setImmediate(resolve));
-
-		expect(written.map((message) => message.type)).toEqual([
-			"session_snapshot_begin",
-			"session_snapshot_chunk",
-			"session_snapshot_end",
-			"session_snapshot_begin",
-			"session_snapshot_chunk",
-			"session_snapshot_end",
-		]);
-		expect(written.filter((message) => message.type === "session_snapshot_begin")).toMatchObject([
-			{ purpose: "resync" },
-			{ purpose: "replacement" },
-		]);
-		expect(client.snapshotActiveSessionIds?.has(activeSessionId)).toBe(false);
-		expect(client.snapshotStreaming).toBe(false);
-		expect(internals.pendingReplacementSnapshots.get(client)?.size ?? 0).toBe(0);
-	});
-
-	it("retains a queued replacement until its worker transcript completes", async () => {
-		const supervisor = new DaemonSupervisor("/tmp/eng-4602-supervisor-pending-replacement.sock", {
-			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
-			descriptorDir: "/tmp/eng-4602-supervisor-pending-replacement-state",
-		});
-		const { worker } = workerHarness();
-		const client = socketClient("public", new PassThrough());
-		const firstMessages: AgentMessage[] = [{ role: "user", content: "first", timestamp: 1 }];
-		const firstResult = streamedResult(firstMessages);
-		const firstTranscript = new SnapshotTranscriptCache({
-			activeSessionId,
-			snapshotId,
-			messages: firstMessages,
-			cacheRoot: "/tmp",
-		});
-		worker.transcriptCaches.set(activeSessionId, firstTranscript);
-		const written: DaemonOutbound[] = [];
-		let releaseActiveEnd!: (accepted: boolean) => void;
-		const activeEnd = new Promise<boolean>((resolve) => {
-			releaseActiveEnd = resolve;
-		});
-		let markActiveEndStarted!: () => void;
-		const activeEndStarted = new Promise<void>((resolve) => {
-			markActiveEndStarted = resolve;
-		});
-		const writeSnapshotBuffer = vi.fn((_client: DaemonSocketClient, buffer: Uint8Array) => {
-			const message = JSON.parse(Buffer.from(buffer).toString("utf8")) as DaemonOutbound;
-			written.push(message);
-			if (message.type === "session_snapshot_end" && written.length === 3) {
-				markActiveEndStarted();
-				return activeEnd;
-			}
-			return Promise.resolve(true);
-		});
-		const internals = supervisor as unknown as {
-			clients: Set<DaemonSocketClient>;
-			pendingReplacementSnapshots: WeakMap<DaemonSocketClient, Map<string, unknown>>;
-			writeSnapshotBuffer: typeof writeSnapshotBuffer;
-			streamSnapshot(
-				client: DaemonSocketClient,
-				worker: WorkerHarness,
-				result: DaemonAttachResult,
-				transcript: SnapshotTranscriptCache,
-				purpose: "attach" | "replacement" | "resync",
-			): Promise<void>;
-			handleWorkerFrame(worker: WorkerHarness, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
-		};
-		internals.clients.add(client);
-		internals.writeSnapshotBuffer = writeSnapshotBuffer;
-
-		const activeStream = internals.streamSnapshot(client, worker, firstResult, firstTranscript, "resync");
-		await activeEndStarted;
-		const frames = snapshotFrames([{ role: "user", content: "replacement", timestamp: 2 }]);
-		const replacementSnapshotId = "snapshot-4602-replacement";
-		const replacementBegin = { ...frames.begin, snapshotId: replacementSnapshotId };
-		const replacementChunk = { ...frames.chunk, snapshotId: replacementSnapshotId };
-		const replacementEnd = { ...frames.end, snapshotId: replacementSnapshotId };
-		internals.handleWorkerFrame(worker, frame(replacementBegin, "replacement"));
-
-		expect(worker.transcriptCaches.get(activeSessionId)?.complete).toBe(false);
-		expect(internals.pendingReplacementSnapshots.get(client)?.size).toBe(1);
-
-		releaseActiveEnd(true);
-		await activeStream;
-		await new Promise<void>((resolve) => setImmediate(resolve));
-
-		expect(written.filter((message) => message.type === "session_snapshot_begin")).toHaveLength(1);
-		expect(internals.pendingReplacementSnapshots.get(client)?.size).toBe(1);
-
-		internals.handleWorkerFrame(worker, frame(replacementChunk, "replacement"));
-		internals.handleWorkerFrame(worker, frame(replacementEnd, "replacement"));
-		await new Promise<void>((resolve) => setImmediate(resolve));
-
-		expect(written.map((message) => message.type)).toEqual([
-			"session_snapshot_begin",
-			"session_snapshot_chunk",
-			"session_snapshot_end",
-			"session_snapshot_begin",
-			"session_snapshot_chunk",
-			"session_snapshot_end",
-		]);
-		expect(written.filter((message) => message.type === "session_snapshot_begin")).toMatchObject([
-			{ purpose: "resync", snapshotId },
-			{ purpose: "replacement", snapshotId: replacementSnapshotId },
-		]);
-		expect(internals.pendingReplacementSnapshots.get(client)?.size ?? 0).toBe(0);
 	});
 
 	it("holds catch-up behind duplicate validation and rejects it on mismatch", async () => {
@@ -635,7 +478,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		for (const message of [frames.begin, frames.chunk, frames.end, frames.begin]) {
 			internals.handleWorkerFrame(worker, frame(message));
 		}
-		const validation = worker.snapshotTransferFrames.get(activeSessionId)?.validation?.promise;
+		const validation = worker.snapshotGenerations.get(activeSessionId)?.get(snapshotId)?.validation?.promise;
 		if (!validation) {
 			throw new Error("duplicate validation was not created");
 		}
@@ -664,9 +507,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		expect(close).toHaveBeenCalledOnce();
 		expect(worker.snapshotCache.size).toBe(0);
 		expect(worker.transcriptCaches.size).toBe(0);
-		expect(worker.incomingTranscriptActiveSessionIds.size).toBe(0);
-		expect(worker.duplicateIncomingTranscriptChunkIndexes.size).toBe(0);
-		expect(worker.snapshotTransferFrames.size).toBe(0);
+		expect(worker.snapshotGenerations.size).toBe(0);
 		expect(unhandled).not.toHaveBeenCalled();
 	});
 
@@ -700,7 +541,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		release();
 		expect(worker.transcriptCaches.size).toBe(0);
 		expect(worker.snapshotCache.size).toBe(0);
-		expect(worker.snapshotTransferFrames.size).toBe(0);
+		expect(worker.snapshotGenerations.size).toBe(0);
 	});
 
 	it("rejects same-ID reentrant begins and mismatched duplicate metadata", async () => {

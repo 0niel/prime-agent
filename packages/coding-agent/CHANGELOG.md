@@ -2,7 +2,23 @@
 
 ## [Unreleased]
 
+- Fixed completed subagents cancelling their RLM heartbeats before the first run ([ENG-4652](https://linear.app/primeintellect/issue/ENG-4652/subagent-heartbeats-dont-work)).
+- Changed the fullscreen follow shortcut from `Alt+Down` to `Ctrl+Shift+Down` for more reliable terminal input ([ENG-4684](https://linear.app/primeintellect/issue/ENG-4684/altdown-doesnt-work)).
+- Fixed active heartbeats not resuming after Prime Agent updates ([ENG-4657](https://linear.app/primeintellect/issue/ENG-4657/heartbeats-dont-survive-updatesdaemon-reboots)).
+- Fixed the Agents View reordering sessions whenever prompts or heartbeats updated their activity timestamps ([ENG-4650](https://linear.app/primeintellect/issue/ENG-4650/agents-view-shifts-session-list-constantly)).
+- Added parent-scoped subagent lifecycle APIs: create children with readable default or orchestrator-chosen names, recover running or completed children through `rlm.list_subagents()`, continue them through agent messaging, and close/remove them with `rlm.delete_subagent()`.
+- Changed shell commands to use discoverable agent, schedule, package, model, session, update, doctor, and full-shutdown verbs without exposing the background daemon hierarchy ([ENG-4538](https://linear.app/primeintellect/issue/ENG-4538/standardize-bash-command-conventions-and-improve-command-discovery)).
+- Fixed unsupported Node versions crashing before startup by requiring Node 22.8.0 or newer and showing upgrade guidance before loading the CLI ([ENG-4260](https://linear.app/primeintellect/issue/ENG-4260/incorrect-node-version-breaks-first-launch)).
 - Added `@` file-path autocomplete to new-agent and reply prompts in the Agents View.
+- Fixed slow daemon clients becoming stuck when newer session snapshots arrived during catch-up.
+- Fixed queued messages getting stranded when an agent turn ended ([ENG-4653](https://linear.app/primeintellect/issue/ENG-4653/queued-messages-can-get-stuck-with-heartbeats)).
+- Changed `/traces upload-all` to pace requests within the platform rate limit, honor bounded `Retry-After` responses, and support interruption.
+- Fixed resuming a daemon-resident session to attach the requesting client to its existing worker without disturbing other clients ([ENG-4656](https://linear.app/primeintellect/issue/ENG-4656/resuming-prime-agent-sessions-should-attach)).
+- Fixed daemon-owned updates terminating their updater before the daemon restart and session restore completed ([ENG-4606](https://linear.app/primeintellect/issue/ENG-4606/benign-error-on-prime-agent-update)).
+- Fixed first-launch Prime login and kept onboarding visible between team and model selection ([ENG-4658](https://linear.app/primeintellect/issue/ENG-4658/fix-onboarding-login-enter-key-and-model-selector-flicker)).
+- Fixed active heartbeat sessions appearing under Needs Input or Completed instead of a dedicated Heartbeats section ([ENG-4654](https://linear.app/primeintellect/issue/ENG-4654/categorize-heartbeat-sessions-as-working)).
+- Fixed stashed prompts being lost when leaving and reopening a session from the Agents View ([ENG-4659](https://linear.app/primeintellect/issue/ENG-4659/stashed-prompts-should-persist)).
+- Added a combined heartbeat indicator and manager for pausing, resuming, or stopping user and agent heartbeats ([ENG-4536](https://linear.app/primeintellect/issue/ENG-4536/add-heartbeat-observability-and-management-ui)).
 
 ## [0.3.1] - 2026-07-15
 
@@ -33,6 +49,9 @@
 
 - Changed daemon and headless execution to isolate each root session tree in a recoverable worker process, with protocol-v2 chunked snapshots, compact streaming, attachment-local backpressure, session leases, and unchanged print, JSON, and RPC interfaces.
 - Added autonomous mode with host-side continuations, configurable limits, and quality gates for evaluator-controlled runs ([#278](https://github.com/PrimeIntellect-ai/prime-agent/pull/278) by [@sethkarten](https://github.com/sethkarten)).
+- Added `/traces preview` and `/traces upload-all` for inspecting the current payload and backfilling saved parent and subagent traces.
+- Changed `/traces upload` and `/traces upload-all` to be explicit one-shot uploads that do not enable automatic sharing.
+- Changed trace uploads to retry transient network and HTTP failures with bounded exponential backoff and jitter.
 - Fixed Prime Inference credential and team-header precedence to prefer `PRIME_API_KEY`, then the Prime CLI config, then `auth.json`.
 - Fixed aborted autonomous gates leaving detached process trees and supervisor recovery retaining intentionally stopped workers after stale scheduler locks.
 - Fixed supervisor replacement surfacing fatal socket errors or recovering roots that were intentionally stopped ([ENG-4526](https://linear.app/primeintellect/issue/ENG-4526/reconnect-daemon-clients-transparently-after-supervisor-replacement)).

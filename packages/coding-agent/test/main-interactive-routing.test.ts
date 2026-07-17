@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import type { CreateAgentSessionOptions } from "../src/core/sdk.js";
 import {
@@ -7,11 +10,12 @@ import {
 	findActiveDaemonSessionSummaryForSessionFile,
 	type InteractiveDaemonStartupDecision,
 	parseAgentsViewCommand,
-	parseDaemonRichTuiAttachShortcut,
 	resolveRuntimeSessionOptions,
 	restoreResumeSelectorFallback,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
+	shouldEnsureInteractiveDaemonForStartup,
 	shouldOpenAgentsViewForDaemonInteractive,
+	shouldRejectNonInteractiveAttach,
 	shouldUseDaemonInteractive,
 	shouldUseEphemeralSessionManagerForDaemonInteractive,
 } from "../src/main.js";
@@ -64,6 +68,18 @@ describe("interactive startup routing", () => {
 			}),
 		).toBe(false);
 	});
+
+	test("rejects attach before non-interactive startup", () => {
+		expect(shouldRejectNonInteractiveAttach("worker", "print")).toBe(true);
+		expect(shouldRejectNonInteractiveAttach("worker", "interactive")).toBe(false);
+		expect(shouldRejectNonInteractiveAttach(undefined, "print")).toBe(false);
+	});
+
+	test("does not start the daemon for attach", () => {
+		expect(shouldEnsureInteractiveDaemonForStartup(true, undefined)).toBe(true);
+		expect(shouldEnsureInteractiveDaemonForStartup(true, "worker")).toBe(false);
+		expect(shouldEnsureInteractiveDaemonForStartup(false, undefined)).toBe(false);
+	});
 });
 
 describe("daemon-backed interactive session manager routing", () => {
@@ -76,7 +92,7 @@ describe("daemon-backed interactive session manager routing", () => {
 		).toBe(false);
 	});
 
-	test("opens the agents view when explicitly requested via the agents/manage command", () => {
+	test("opens the agents view when explicitly requested", () => {
 		expect(
 			shouldOpenAgentsViewForDaemonInteractive({
 				useDaemonInteractive: true,
@@ -126,6 +142,13 @@ describe("daemon-backed interactive session manager routing", () => {
 		).toBe(false);
 		expect(
 			shouldEnsureDaemonBeforeActiveSessionLookup({
+				useDaemonInteractive: true,
+				resumeSelector: "/tmp/session.jsonl",
+				explicitAttach: true,
+			}),
+		).toBe(true);
+		expect(
+			shouldEnsureDaemonBeforeActiveSessionLookup({
 				useDaemonInteractive: false,
 				resumeSelector: "active-1",
 			}),
@@ -134,27 +157,42 @@ describe("daemon-backed interactive session manager routing", () => {
 
 	test("falls back to local session lookup when daemon active-session probing fails", async () => {
 		await expect(
-			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "saved-session-id", async () => {
-				throw new Error("Daemon returned an invalid active session summary");
+			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "saved-session-id", {
+				lookup: async () => {
+					throw new Error("Daemon returned an invalid active session summary");
+				},
 			}),
 		).resolves.toBeUndefined();
 	});
 
+	test("propagates active-session lookup failures for explicit attach", async () => {
+		await expect(
+			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", {
+				fallbackOnError: false,
+				lookup: async () => {
+					throw new Error("protocol mismatch");
+				},
+			}),
+		).rejects.toThrow("protocol mismatch");
+	});
+
 	test("uses daemon active-session summary when probing succeeds", async () => {
 		await expect(
-			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", async () => ({
-				id: "active-1",
-				activeSessionId: "active-1",
-				lifecycle: "draft",
-				activity: "idle",
-				sessionId: "session-1",
-				cwd: "/tmp/project",
-				isStreaming: false,
-				isCompacting: false,
-				attachedClients: 0,
-				messageCount: 0,
-				pendingMessageCount: 0,
-			})),
+			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", {
+				lookup: async () => ({
+					id: "active-1",
+					activeSessionId: "active-1",
+					lifecycle: "draft",
+					activity: "idle",
+					sessionId: "session-1",
+					cwd: "/tmp/project",
+					isStreaming: false,
+					isCompacting: false,
+					attachedClients: 0,
+					messageCount: 0,
+					pendingMessageCount: 0,
+				}),
+			}),
 		).resolves.toMatchObject({ activeSessionId: "active-1" });
 	});
 
@@ -209,6 +247,25 @@ describe("daemon-backed interactive session manager routing", () => {
 			),
 		).toBe(activeSummary);
 	});
+
+	test("finds an active daemon session through a symlinked resume path", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-agent-resume-"));
+		try {
+			const sessionFile = join(directory, "session.jsonl");
+			const symlink = join(directory, "session-link.jsonl");
+			writeFileSync(sessionFile, "");
+			symlinkSync(sessionFile, symlink);
+			const activeSummary = makeSessionSummary({
+				id: "active-1",
+				activeSessionId: "active-1",
+				sessionFile,
+			});
+
+			expect(findActiveDaemonSessionSummaryForSessionFile([activeSummary], symlink)).toBe(activeSummary);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("agents view command parsing", () => {
@@ -216,10 +273,10 @@ describe("agents view command parsing", () => {
 		expect(parseAgentsViewCommand(["agents"])).toEqual({ explicitAgentsView: true, args: [] });
 	});
 
-	test("treats manage as an alias for agents", () => {
+	test("does not treat manage as an alias", () => {
 		expect(parseAgentsViewCommand(["manage", "--verbose"])).toEqual({
-			explicitAgentsView: true,
-			args: ["--verbose"],
+			explicitAgentsView: false,
+			args: ["manage", "--verbose"],
 		});
 	});
 
@@ -234,27 +291,6 @@ describe("agents view command parsing", () => {
 		expect(parseAgentsViewCommand(["--verbose", "agents"])).toEqual({
 			explicitAgentsView: false,
 			args: ["--verbose", "agents"],
-		});
-	});
-});
-
-describe("daemon rich TUI attach shortcut parsing", () => {
-	test("recognizes daemon active-session shorthand", () => {
-		expect(parseDaemonRichTuiAttachShortcut(["daemon", "d5c1e83e2182"])).toMatchObject({
-			selector: "d5c1e83e2182",
-		});
-	});
-
-	test("preserves explicit daemon client commands", () => {
-		expect(parseDaemonRichTuiAttachShortcut(["daemon", "attach", "d5c1e83e2182"])).toBeUndefined();
-		expect(parseDaemonRichTuiAttachShortcut(["daemon", "list"])).toBeUndefined();
-		expect(parseDaemonRichTuiAttachShortcut(["daemon", "create", "scratch"])).toBeUndefined();
-	});
-
-	test("carries daemon socket option into shorthand attach", () => {
-		expect(parseDaemonRichTuiAttachShortcut(["daemon", "--socket", "/tmp/prime.sock", "d5c1e83e2182"])).toEqual({
-			socketPath: "/tmp/prime.sock",
-			selector: "d5c1e83e2182",
 		});
 	});
 });

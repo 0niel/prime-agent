@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { getModel } from "../src/models.js";
 import { complete, stream } from "../src/stream.js";
 import type { Api, Context, Model, StreamOptions } from "../src/types.js";
+import { getKimiCodingTestModel } from "./kimi-test-model.js";
 
 type StreamOptionsWithExtras = StreamOptions & Record<string, unknown>;
 
@@ -239,7 +240,7 @@ describe("AI Providers Abort Tests", () => {
 	});
 
 	describe.skipIf(!process.env.KIMI_API_KEY)("Kimi For Coding Provider Abort", () => {
-		const llm = getModel("kimi-coding", "kimi-k2-thinking");
+		const llm = getKimiCodingTestModel();
 
 		it("should abort mid-stream", { retry: 3 }, async () => {
 			await testAbortSignal(llm);

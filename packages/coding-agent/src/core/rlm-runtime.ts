@@ -27,7 +27,68 @@ export interface RlmInternalRunResult extends RlmRunResult {
 	assistantUsage: Usage;
 }
 
+export type RlmSubagentRegistryStatus = "running" | "completed";
+
+export interface RlmSubagentRegistryEntry {
+	rlm_child_id: string;
+	active_session_id: string | null;
+	session_id: string | null;
+	session_name: string;
+	session_dir: string;
+	status: RlmSubagentRegistryStatus;
+}
+
+export interface RlmListSubagentsResult {
+	subagents: RlmSubagentRegistryEntry[];
+}
+
+export interface RlmDeleteSubagentResult {
+	subagent: RlmSubagentRegistryEntry;
+}
+
 export type RlmRunHandler = (request: RlmRunRequest) => Promise<RlmRunResult>;
+export type RlmListSubagentsHandler = () => RlmListSubagentsResult;
+export type RlmDeleteSubagentHandler = (target: string) => Promise<RlmDeleteSubagentResult>;
+
+const RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH = 64;
+
+/** Validate and normalize an orchestrator-supplied subagent session name. */
+export function normalizeRequestedRlmSubagentSessionName(value: unknown): string | undefined {
+	if (value === undefined) {
+		return undefined;
+	}
+	if (typeof value !== "string") {
+		throw new Error("rlm.run name must be a string");
+	}
+	const name = value.trim();
+	if (!name) {
+		throw new Error("rlm.run name must not be empty");
+	}
+	if (name.length > RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH) {
+		throw new Error(`rlm.run name must be at most ${RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH} characters`);
+	}
+	return name;
+}
+
+/** Create a readable, collision-resistant default name usable as an agent-message selector. */
+export function createDefaultRlmSubagentSessionName(prompt: string, childId: string): string {
+	const promptSlug = prompt
+		.normalize("NFKD")
+		.replace(/[\u0300-\u036f]/g, "")
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+	const idSuffix =
+		childId
+			.replace(/^sub-/, "")
+			.replace(/[^A-Za-z0-9]+/g, "")
+			.slice(-8) || "child";
+	const fixedLength = "subagent--".length + idSuffix.length;
+	const promptPart = (promptSlug || "worker")
+		.slice(0, Math.max(1, RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH - fixedLength))
+		.replace(/-+$/g, "");
+	return `subagent-${promptPart || "worker"}-${idSuffix}`;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -46,6 +107,25 @@ export function createRlmRunHostHandler(handler: RlmRunHandler): HostRequestHand
 	};
 }
 
+/** Expose the current parent session's RLM child registry to its kernel. */
+export function createRlmListSubagentsHostHandler(handler: RlmListSubagentsHandler): HostRequestHandler {
+	return async () => {
+		const { subagents } = handler();
+		return { subagents };
+	};
+}
+
+/** Delete one direct child selected from the current parent session's registry. */
+export function createRlmDeleteSubagentHostHandler(handler: RlmDeleteSubagentHandler): HostRequestHandler {
+	return async (payload) => {
+		if (typeof payload.target !== "string" || !payload.target.trim()) {
+			throw new Error("rlm.delete_subagent target must be a non-empty string");
+		}
+		const { subagent } = await handler(payload.target.trim());
+		return { subagent };
+	};
+}
+
 export interface RlmSubagentRuntime {
 	session: AgentSession;
 }
@@ -54,6 +134,7 @@ export interface CreateRlmSubagentRuntimeOptions {
 	parentSession: AgentSession;
 	id: string;
 	prompt: string;
+	sessionName: string;
 	sessionDir: string;
 	model: Model<any>;
 	thinkingLevel: ThinkingLevel;
@@ -69,6 +150,8 @@ export interface CreateRlmSubagentRuntimeOptions {
 	rlmParentNodeId: string;
 	/** Source of the IPython cell that spawned this subagent, for display. */
 	spawnCode?: string;
+	/** Publish the session to the parent before a host makes the runtime addressable. */
+	onSessionPublished?: (session: AgentSession) => void;
 }
 
 /** Terminal status of an RLM child run, passed to the host when releasing its runtime. */
@@ -76,6 +159,8 @@ export type RlmSubagentReleaseStatus = "done" | "error" | "cancelled";
 
 export interface SubagentRuntimeHost {
 	createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime>;
+	/** Close the host-owned child identified by childId; session may predate an in-child session replacement. */
+	deleteRlmSubagentRuntime(childId: string, session: AgentSession): Promise<void>;
 	releaseRlmSubagentRuntime?(
 		runtime: RlmSubagentRuntime,
 		options: CreateRlmSubagentRuntimeOptions,

@@ -210,13 +210,17 @@ describe("issue #4257 update restart resume", () => {
 			wasBashRunning: true,
 		});
 		const persistedManifest = JSON.parse(
-			readFileSync(getDaemonUpdateRestartManifestPath(harness.tempDir), "utf-8"),
+			readFileSync(getDaemonUpdateRestartManifestPath(`${harness.tempDir}/daemon.sock`, harness.tempDir), "utf-8"),
 		) as DaemonUpdateRestartManifest;
 		expect(persistedManifest).toEqual(manifest);
-		writeFileSync(getDaemonUpdateRestartManifestPath(harness.tempDir), JSON.stringify(manifest));
+		writeFileSync(
+			getDaemonUpdateRestartManifestPath(`${harness.tempDir}/missing.sock`, harness.tempDir),
+			JSON.stringify(manifest),
+		);
 		await expect(prepareDaemonUpdateRestart(`${harness.tempDir}/missing.sock`, harness.tempDir)).resolves.toEqual(
 			manifest,
 		);
+		await expect(prepareDaemonUpdateRestart(`${harness.tempDir}/unrelated.sock`, harness.tempDir)).rejects.toThrow();
 		expect(hasArchivedState(harness)).toBe(false);
 		expect(
 			harness.sessionManager

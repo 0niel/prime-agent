@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { parseArgs } from "../src/cli/args.js";
+import { INTERNAL_RUNTIME_COMMAND_MARKER, parseArgs } from "../src/cli/args.js";
 
 describe("parseArgs", () => {
 	describe("--version flag", () => {
@@ -194,9 +194,34 @@ describe("parseArgs", () => {
 			expect(result.messages).toEqual([]);
 		});
 
-		test("parses --export", () => {
+		test("rejects removed --export syntax", () => {
 			const result = parseArgs(["--export", "session.jsonl"]);
+			expect(result.export).toBeUndefined();
+			expect(result.messages).toEqual([]);
+			expect(result.diagnostics).toContainEqual({
+				type: "error",
+				message: '--export was removed. Use "prime-agent session export <file> [output]".',
+			});
+		});
+
+		test("parses session export only through the internal command marker", () => {
+			const result = parseArgs([INTERNAL_RUNTIME_COMMAND_MARKER, "--export", "session.jsonl"]);
 			expect(result.export).toBe("session.jsonl");
+		});
+
+		test("rejects removed --list-models syntax", () => {
+			const result = parseArgs(["--list-models", "sonnet"]);
+			expect(result.listModels).toBeUndefined();
+			expect(result.messages).toEqual([]);
+			expect(result.diagnostics).toContainEqual({
+				type: "error",
+				message: '--list-models was removed. Use "prime-agent model list [search]".',
+			});
+		});
+
+		test("parses model list only through the internal command marker", () => {
+			const result = parseArgs([INTERNAL_RUNTIME_COMMAND_MARKER, "--list-models", "sonnet"]);
+			expect(result.listModels).toBe("sonnet");
 		});
 
 		test("parses --thinking", () => {

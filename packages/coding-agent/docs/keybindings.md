@@ -78,6 +78,15 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | `tui.select.confirm` | `enter` | Confirm selection |
 | `tui.select.cancel` | `escape`, `ctrl+c` | Cancel selection |
 
+### TUI Fullscreen Transcript
+
+| Keybinding id | Default | Description |
+|--------|---------|-------------|
+| `tui.viewport.pageUp` | `pageUp` | Scroll transcript up a page |
+| `tui.viewport.pageDown` | `pageDown` | Scroll transcript down a page |
+| `tui.viewport.top` | `shift+alt+up` | Scroll transcript to top |
+| `tui.viewport.follow` | `ctrl+shift+down` | Scroll to bottom and follow output |
+
 ### Application
 
 | Keybinding id | Default | Description |

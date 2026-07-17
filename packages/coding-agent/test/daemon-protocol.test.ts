@@ -7,6 +7,7 @@ import {
 	DAEMON_PROTOCOL_INFO,
 	type DaemonOutbound,
 	isDaemonCommandEnvelope,
+	isDaemonMutatingCommand,
 } from "../src/modes/daemon/daemon-protocol.js";
 
 describe("daemon protocol helpers", () => {
@@ -46,6 +47,12 @@ describe("daemon protocol helpers", () => {
 
 		expect(isDaemonCommandEnvelope(createDaemonCommandEnvelope(command, "cmd-1", "client-1", 2))).toBe(true);
 		expect(isDaemonCommandEnvelope(createDaemonCommandEnvelope(command, "cmd-1", "client-1", 1))).toBe(false);
+	});
+
+	it("keeps attachment routing out of the durable mutation journal", () => {
+		expect(isDaemonMutatingCommand({ type: "attach" })).toBe(false);
+		expect(isDaemonMutatingCommand({ type: "reattach" })).toBe(false);
+		expect(isDaemonMutatingCommand({ type: "switch_session" })).toBe(true);
 	});
 
 	it("reports replay availability from resume cursors", () => {

@@ -4,7 +4,11 @@ import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { probeRunningDaemonSessions, shutdownDaemonAndWait } from "../src/cli/daemon-launch.js";
+import {
+	probeRunningDaemonSessions,
+	shouldStartInteractiveDaemonEarly,
+	shutdownDaemonAndWait,
+} from "../src/cli/daemon-launch.js";
 
 interface FakeDaemonOptions {
 	/** Sessions returned for a `list` command. */
@@ -155,6 +159,36 @@ describe("probeRunningDaemonSessions", () => {
 		const daemon = await startFakeDaemon({ failList: true });
 		cleanups.push(daemon.close);
 		expect(await probeRunningDaemonSessions(daemon.socketPath)).toEqual({ reachable: true });
+	});
+});
+
+describe("shouldStartInteractiveDaemonEarly", () => {
+	it("starts early for default interactive use and the agents view", () => {
+		expect(shouldStartInteractiveDaemonEarly([], true, false)).toBe(true);
+		expect(shouldStartInteractiveDaemonEarly(["agents"], true, false)).toBe(true);
+		expect(shouldStartInteractiveDaemonEarly(["review this change"], true, false)).toBe(true);
+		expect(shouldStartInteractiveDaemonEarly(["help", "me", "fix", "this"], true, false)).toBe(true);
+	});
+
+	it("does not start a service for standalone management commands", () => {
+		for (const command of [
+			"list",
+			"attach",
+			"status",
+			"doctor",
+			"shutdown",
+			"package",
+			"update",
+			"model",
+			"session",
+		]) {
+			expect(shouldStartInteractiveDaemonEarly([command], true, false)).toBe(false);
+		}
+	});
+
+	it("does not start a service for help or removed command forms", () => {
+		expect(shouldStartInteractiveDaemonEarly(["help"], true, false)).toBe(false);
+		expect(shouldStartInteractiveDaemonEarly(["daemon", "list"], true, false)).toBe(false);
 	});
 });
 

@@ -560,7 +560,13 @@ export function getDaemonLogPath(socketPath: string): string {
 	return join(getLogsDir(), `${basename(socketPath)}.${hash}.log`);
 }
 
-export function getDaemonUpdateRestartManifestPath(agentDir: string = getAgentDir()): string {
+export function getDaemonUpdateRestartManifestPath(socketPath: string, agentDir: string = getAgentDir()): string {
+	const normalizedSocketPath = process.platform === "win32" ? socketPath.toLowerCase() : resolve(socketPath);
+	const socketHash = createHash("sha256").update(normalizedSocketPath).digest("hex");
+	return join(agentDir, "daemon-update-restarts", `${socketHash}.json`);
+}
+
+export function getLegacyDaemonUpdateRestartManifestPath(agentDir: string = getAgentDir()): string {
 	return join(agentDir, "daemon-update-restart.json");
 }
 

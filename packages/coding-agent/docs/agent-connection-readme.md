@@ -140,7 +140,7 @@ This matters because the in-process path still exists for explicit fallbacks:
 - startup benchmark
 - `--no-session`
 - `--help`
-- `--list-models`
+- `prime-agent model list`
 - other non-interactive modes that are not daemon-backed TUI clients
 
 The adapter preserves local behavior without preserving the old TUI ownership model.
@@ -328,7 +328,7 @@ Current explicit fallbacks include:
 - `PI_STARTUP_BENCHMARK`
 - `--no-session`
 - `--help`
-- `--list-models`
+- `prime-agent model list`
 
 In this path, startup creates the runtime and wraps it:
 
@@ -352,29 +352,10 @@ PR #79 also supports rich TUI attach to existing active daemon sessions.
 The user-facing shape is:
 
 ```bash
-./prime-agent.sh --resume <selector>
+./prime-agent.sh attach <selector>
 ```
 
 If `<selector>` names a live active daemon session, startup attaches the rich TUI to that active session instead of opening the session file locally.
-
-There is also a convenience shortcut:
-
-```bash
-./prime-agent.sh daemon <selector>
-```
-
-That shorthand becomes rich TUI attach only when `<selector>` names a live active session. Explicit daemon CLI commands keep their line-oriented behavior:
-
-```bash
-./prime-agent.sh daemon list
-./prime-agent.sh daemon attach <selector>
-./prime-agent.sh daemon create scratch
-```
-
-The difference is intentional:
-
-- `daemon attach` is the line-oriented daemon client.
-- `daemon <active-id>` is a convenience shorthand for rich TUI attach when the id is live.
 
 ## Execution Surface
 
@@ -1063,8 +1044,7 @@ These verify:
 
 - normal interactive startup uses daemon-backed mode
 - explicit fallback paths remain in-process
-- rich TUI daemon attach shorthand parsing works
-- explicit daemon line-oriented commands are preserved
+- `prime-agent attach` resolves active agents through the rich TUI path
 
 ### Daemon Extension Binding Tests
 
@@ -1091,28 +1071,20 @@ Expected behavior:
 - interactive mode is backed by `DaemonAgentConnection`
 - user-visible behavior should match normal interactive use
 
-### Active Daemon Session List
+### Active Agent List
 
 Run:
 
 ```bash
-./prime-agent.sh daemon list
+./prime-agent.sh list
 ```
-
-This uses the line-oriented daemon CLI, not rich TUI attach.
 
 ### Rich TUI Attach
 
 Start or find an active daemon session id, then run:
 
 ```bash
-./prime-agent.sh --resume <active-session-id>
-```
-
-or:
-
-```bash
-./prime-agent.sh daemon <active-session-id>
+./prime-agent.sh attach <active-session-id>
 ```
 
 Expected behavior:
@@ -1120,21 +1092,6 @@ Expected behavior:
 - rich TUI opens
 - it attaches to the existing active daemon session
 - it does not create a new local in-process runtime for the TUI
-
-### Explicit Line-Oriented Attach
-
-Run:
-
-```bash
-./prime-agent.sh daemon attach <active-session-id>
-```
-
-Expected behavior:
-
-- line-oriented daemon attach behavior
-- not the rich TUI
-
-This distinction is intentional.
 
 ## Common Misunderstandings
 

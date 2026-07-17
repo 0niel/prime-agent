@@ -284,6 +284,7 @@ export {
 } from "./modes/agent-connection/index.js";
 // Run modes for programmatic SDK usage
 export {
+	ClientPromptStashStore,
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServices,
 	createInteractiveModeUiServicesFromServices,
@@ -320,6 +321,8 @@ export {
 	type InteractiveModeUiServices,
 	type ModelInfo,
 	type PrintModeOptions,
+	type PromptStash,
+	type PromptStashState,
 	RpcClient,
 	type RpcClientOptions,
 	type RpcCommand,

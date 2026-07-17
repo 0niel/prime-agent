@@ -5,6 +5,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { compactRlmText, rlmChildLabel } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.js";
+import { type AgentCronJob, isHeartbeatCronJob } from "../../core/cron-jobs.js";
 import type { AgentTaskState, SessionInfo } from "../../core/session-manager.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
 import type { ActiveSessionState } from "./active-session-state.js";
@@ -27,6 +28,7 @@ export interface SessionSummary {
 	id: string;
 	lifecycle: SessionLifecycle;
 	activity: SessionActivity;
+	hasActiveHeartbeat?: boolean;
 	runtimeKind?: "top-level" | "subagent";
 	activeSessionId?: string;
 	sessionId: string;
@@ -88,8 +90,14 @@ export function resolveAttachModelFallbackMessage(
 export function buildSessionList(
 	activeSessions: readonly ActiveSessionState[],
 	savedSessions: readonly SessionInfo[],
+	scheduledJobs: readonly AgentCronJob[] = [],
 ): SessionSummary[] {
 	const activeBySessionFile = new Map<string, ActiveSessionState>();
+	const heartbeatSessionIds = new Set(
+		scheduledJobs
+			.filter((job) => job.status === "active" && isHeartbeatCronJob(job))
+			.map((job) => job.activeSessionId),
+	);
 
 	for (const activeSession of activeSessions) {
 		const sessionFile = activeSession.runtime.session.sessionFile;
@@ -104,7 +112,13 @@ export function buildSessionList(
 		const sessionFile = resolve(savedSession.path);
 		const activeSession = activeBySessionFile.get(sessionFile);
 		if (activeSession) {
-			entries.push(summaryForActiveSession(activeSession, savedSession));
+			entries.push(
+				summaryForActiveSession(
+					activeSession,
+					savedSession,
+					heartbeatSessionIds.has(activeSession.activeSessionId),
+				),
+			);
 			seenActiveSessionIds.add(activeSession.activeSessionId);
 			continue;
 		}
@@ -113,7 +127,9 @@ export function buildSessionList(
 
 	for (const activeSession of activeSessions) {
 		if (!seenActiveSessionIds.has(activeSession.activeSessionId)) {
-			entries.push(summaryForActiveSession(activeSession));
+			entries.push(
+				summaryForActiveSession(activeSession, undefined, heartbeatSessionIds.has(activeSession.activeSessionId)),
+			);
 		}
 	}
 	return entries;
@@ -123,7 +139,11 @@ function effectivePendingMessageCount(session: ActiveSessionState["runtime"]["se
 	return session.pendingMessageCount + (session.hasAcceptedPromptInFlight ? 1 : 0);
 }
 
-export function summaryForActiveSession(activeSession: ActiveSessionState, savedSession?: SessionInfo): SessionSummary {
+export function summaryForActiveSession(
+	activeSession: ActiveSessionState,
+	savedSession?: SessionInfo,
+	hasActiveHeartbeat = false,
+): SessionSummary {
 	const session = activeSession.runtime.session;
 	const pendingMessageCount = effectivePendingMessageCount(session);
 	const metadata = activeSession.runtime.metadata ?? { kind: "top-level" as const };
@@ -140,6 +160,7 @@ export function summaryForActiveSession(activeSession: ActiveSessionState, saved
 		id: activeSession.activeSessionId,
 		lifecycle: activeLifecycleForSession(activeSession),
 		activity: activeActivityForSession(activeSession),
+		hasActiveHeartbeat: hasActiveHeartbeat || undefined,
 		runtimeKind: metadata.kind,
 		activeSessionId: activeSession.activeSessionId,
 		sessionId: session.sessionId,
@@ -288,6 +309,7 @@ function rlmChildSnapshotForActiveSession(
 		id: metadata.rlmChildId ?? activeSession.activeSessionId,
 		parentId: parentNodeId,
 		activeSessionId: activeSession.activeSessionId,
+		sessionName: session.sessionName,
 		label: rlmChildLabel(metadata.prompt ?? ""),
 		status,
 		answerPreview,

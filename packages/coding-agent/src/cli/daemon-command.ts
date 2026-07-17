@@ -4,18 +4,19 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import chalk from "chalk";
 import { spawn } from "child_process";
-import { APP_NAME, expandTildePath } from "../config.js";
+import { expandTildePath } from "../config.js";
 import type { AgentSessionEvent } from "../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js";
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
 import { DaemonClient, type DaemonClientMessageListener } from "../modes/daemon/daemon-client.js";
 import type { DaemonOutbound, DaemonResponse } from "../modes/daemon/daemon-protocol.js";
+import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
 import { isLocalPath } from "../utils/paths.js";
 import { isValidThinkingLevel } from "./args.js";
 import { formatSessionListTable } from "./daemon-list-format.js";
-import { runPs, runReap, runShutdownAll } from "./daemon-ps.js";
+import { runPs, runReap } from "./daemon-ps.js";
 
 interface ParsedDaemonClientCommand {
 	command: string;
@@ -25,7 +26,6 @@ interface ParsedDaemonClientCommand {
 }
 
 const DAEMON_CLIENT_COMMANDS = new Set([
-	"help",
 	"start",
 	"ps",
 	"list",
@@ -49,25 +49,6 @@ const DAEMON_CLIENT_COMMANDS = new Set([
 	"shutdown",
 ]);
 
-export function normalizeDaemonStartArgs(args: string[]): string[] | undefined {
-	if (args[0] !== "daemon" || args[1] !== "start") {
-		return undefined;
-	}
-	if (!args.slice(2).some((arg) => arg === "--foreground" || arg === "--no-detach")) {
-		return undefined;
-	}
-
-	const normalized = ["--mode", "daemon"];
-	for (let index = 2; index < args.length; index++) {
-		const arg = args[index];
-		if (arg === "--foreground" || arg === "--no-detach" || arg === "--background" || arg === "-d") {
-			continue;
-		}
-		normalized.push(arg === "--socket" ? "--daemon-socket" : arg);
-	}
-	return normalized;
-}
-
 export async function handleDaemonCommand(args: string[]): Promise<boolean> {
 	if (args[0] !== "daemon") {
 		return false;
@@ -75,17 +56,13 @@ export async function handleDaemonCommand(args: string[]): Promise<boolean> {
 
 	try {
 		const parsed = parseDaemonClientCommand(args.slice(1));
-		if (parsed.command === "help") {
-			printDaemonHelp();
-			return true;
-		}
-
 		await runDaemonClientCommand(parsed);
 		return true;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(chalk.red(`Error: ${message}`));
-		process.exit(1);
+		process.exitCode = 1;
+		return true;
 	}
 }
 
@@ -165,11 +142,6 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 
 	if (parsed.command === "ps") {
 		await runPsCommand(parsed);
-		return;
-	}
-
-	if (parsed.command === "shutdown" && parsed.positionals.some((arg) => arg === "--all" || arg === "-a")) {
-		await runShutdownAll(parsed.json);
 		return;
 	}
 
@@ -654,11 +626,6 @@ function nextDefaultSessionName(sessions: SessionSummary[]): string {
 }
 
 async function runStart(parsed: ParsedDaemonClientCommand): Promise<void> {
-	if (parsed.positionals.length === 1 && parsed.positionals[0] === "help") {
-		printDaemonHelp();
-		return;
-	}
-
 	if (await canConnectToDaemon(parsed.socketPath, 250)) {
 		console.log(`Daemon already running on ${parsed.socketPath}`);
 		return;
@@ -746,7 +713,7 @@ async function runList(client: DaemonClient, args: string[], json: boolean): Pro
 	}
 
 	if (sessions.length === 0) {
-		console.log(all ? "No sessions." : "No active sessions.");
+		console.log(all ? "No agents." : "No active agents.");
 		return;
 	}
 
@@ -810,7 +777,7 @@ async function runRename(client: DaemonClient, args: string[], json: boolean): P
 	const activeSessionId = requireActiveSessionId(args);
 	const name = args.slice(1).join(" ").trim();
 	if (!name) {
-		throw new Error("Usage: daemon rename <session> <name>");
+		throw new Error("Usage: prime-agent rename <agent> <name>");
 	}
 	const response = await client.request({ type: "rename", activeSessionId, name });
 	const data = requireSuccess(response);
@@ -934,14 +901,23 @@ function parseSendArgs(args: string[]): ParsedSendArgs {
 			continue;
 		}
 		if (parseOptions && arg === "--steer") {
+			if (deliveryMode !== undefined) {
+				throw new Error("Only one send delivery mode may be specified: --steer or --follow-up");
+			}
 			deliveryMode = "steer";
 			continue;
 		}
 		if (parseOptions && arg === "--follow-up") {
+			if (deliveryMode !== undefined) {
+				throw new Error("Only one send delivery mode may be specified: --steer or --follow-up");
+			}
 			deliveryMode = "follow_up";
 			continue;
 		}
 		if (parseOptions && arg === "--auto") {
+			if (deliveryMode !== undefined) {
+				throw new Error("Only one send delivery mode may be specified: --steer or --follow-up");
+			}
 			deliveryMode = "auto";
 			continue;
 		}
@@ -959,7 +935,7 @@ function parseSendArgs(args: string[]): ParsedSendArgs {
 			continue;
 		}
 		if (parseOptions && arg.startsWith("--")) {
-			throw new Error(`Unknown option for daemon send: ${arg} (use -- before message text starting with --)`);
+			throw new Error(`Unknown option for send: ${arg} (use -- before message text starting with --)`);
 		}
 		if (!targetActiveSessionId) {
 			targetActiveSessionId = arg;
@@ -970,13 +946,13 @@ function parseSendArgs(args: string[]): ParsedSendArgs {
 
 	if (explicitMessage !== undefined && messageParts.length > 0) {
 		throw new Error(
-			"Usage: daemon send [--from <session>] [--steer|--follow-up] <target-session> [--message <message>|<message>]",
+			"Usage: prime-agent send [--from <agent>] [--steer|--follow-up] <agent> [--message <message>|<message>]",
 		);
 	}
 	const message = (explicitMessage ?? messageParts.join(" ")).trim();
 	if (!targetActiveSessionId || !message) {
 		throw new Error(
-			"Usage: daemon send [--from <session>] [--steer|--follow-up] <target-session> [--message <message>|<message>]",
+			"Usage: prime-agent send [--from <agent>] [--steer|--follow-up] <agent> [--message <message>|<message>]",
 		);
 	}
 	return {
@@ -1006,7 +982,8 @@ async function runCron(client: DaemonClient, args: string[], json: boolean): Pro
 	const subcommand = args[0] ?? "list";
 	if (subcommand === "list") {
 		const includeInactive = args.includes("--all") || args.includes("-a");
-		const activeSessionId = args.find((arg) => !arg.startsWith("-") && arg !== "list");
+		const selector = args.find((arg) => !arg.startsWith("-") && arg !== "list");
+		const activeSessionId = selector ? await resolveLiveSessionSelector(client, selector) : undefined;
 		const response = await client.request({ type: "cron_list", activeSessionId, includeInactive });
 		const data = requireSuccess(response);
 		if (json) {
@@ -1019,7 +996,7 @@ async function runCron(client: DaemonClient, args: string[], json: boolean): Pro
 			return;
 		}
 		if (jobs.length === 0) {
-			console.log("No cron jobs.");
+			console.log("No scheduled prompts.");
 			return;
 		}
 		for (const job of jobs) {
@@ -1031,11 +1008,11 @@ async function runCron(client: DaemonClient, args: string[], json: boolean): Pro
 	if (subcommand === "add" || subcommand === "schedule") {
 		const separator = args.indexOf("--");
 		if (separator < 0) {
-			throw new Error("Usage: daemon cron add <session> <schedule> -- <message>");
+			throw new Error("Usage: prime-agent schedule add <agent> <schedule> -- <message>");
 		}
 		const activeSessionId = args[1];
 		if (!activeSessionId) {
-			throw new Error("Usage: daemon cron add <session> <schedule> -- <message>");
+			throw new Error("Usage: prime-agent schedule add <agent> <schedule> -- <message>");
 		}
 		const schedule = args.slice(2, separator).join(" ").trim();
 		const message = args
@@ -1043,7 +1020,7 @@ async function runCron(client: DaemonClient, args: string[], json: boolean): Pro
 			.join(" ")
 			.trim();
 		if (!schedule || !message) {
-			throw new Error("Usage: daemon cron add <session> <schedule> -- <message>");
+			throw new Error("Usage: prime-agent schedule add <agent> <schedule> -- <message>");
 		}
 		const response = await client.request({ type: "cron_add", activeSessionId, schedule, prompt: message });
 		const data = requireSuccess(response);
@@ -1052,14 +1029,14 @@ async function runCron(client: DaemonClient, args: string[], json: boolean): Pro
 			return;
 		}
 		const job = getCronJob(data);
-		console.log(job ? `Scheduled ${job.id} next=${job.nextRunAt ?? "-"}` : "Scheduled cron job.");
+		console.log(job ? `Scheduled ${job.id} next=${job.nextRunAt ?? "-"}` : "Scheduled prompt.");
 		return;
 	}
 
 	if (subcommand === "cancel" || subcommand === "delete" || subcommand === "remove") {
 		const jobId = args[1];
 		if (!jobId) {
-			throw new Error("Usage: daemon cron cancel <job-id>");
+			throw new Error("Usage: prime-agent schedule cancel <job-id>");
 		}
 		const response = await client.request({ type: "cron_cancel", jobId });
 		const data = requireSuccess(response);
@@ -1072,7 +1049,30 @@ async function runCron(client: DaemonClient, args: string[], json: boolean): Pro
 		return;
 	}
 
-	throw new Error(`Unknown cron command: ${subcommand}`);
+	throw new Error(`Unknown schedule command: ${subcommand}`);
+}
+
+async function resolveLiveSessionSelector(client: DaemonClient, selector: string): Promise<string> {
+	const sessions = (await getLiveSessions(client)).filter(
+		(session): session is SessionSummary & { activeSessionId: string } => typeof session.activeSessionId === "string",
+	);
+	const exact = sessions.filter(
+		(session) =>
+			session.activeSessionId === selector || session.sessionId === selector || session.sessionName === selector,
+	);
+	const suffix = sessions.filter(
+		(session) =>
+			matchesSessionIdSuffix(session.activeSessionId, selector) ||
+			matchesSessionIdSuffix(session.sessionId, selector),
+	);
+	const matches = exact.length > 0 ? exact : suffix;
+	if (matches.length === 1) {
+		return matches[0]!.activeSessionId;
+	}
+	if (matches.length > 1) {
+		throw new Error(`Ambiguous active session "${selector}"`);
+	}
+	throw new Error(`Unknown active session: ${selector}`);
 }
 
 async function printResponseData(
@@ -1092,7 +1092,7 @@ async function printResponseData(
 function requireActiveSessionId(args: string[]): string {
 	const activeSessionId = args[0];
 	if (!activeSessionId) {
-		throw new Error("Missing active session id");
+		throw new Error("Missing agent id or name");
 	}
 	return activeSessionId;
 }
@@ -1657,73 +1657,4 @@ function isAgentMessageReceipt(
 		typeof target === "object" &&
 		typeof (target as { activeSessionId?: unknown }).activeSessionId === "string"
 	);
-}
-
-function printDaemonHelp(): void {
-	console.log(`${chalk.bold("Usage:")}
-  ${APP_NAME} daemon [options] [session name]
-  ${APP_NAME} daemon --name <name> [agent options]
-  ${APP_NAME} daemon [--socket <path>] <command> [args...]
-  ${APP_NAME} daemon help
-
-${chalk.bold("Commands:")}
-  help                          Show daemon help
-  start                         Start the background daemon and return
-  ps [--reap [--force]]         List all daemons on this machine; --reap stops idle/orphaned ones
-  list [-a|--all]               List active sessions; include inactive sessions with -a
-  create [name]                 Create a new active session
-  attach <session>              Attach an interactive terminal to a live session
-  detach [session]              Detach this client from one session or all sessions
-  prompt <session> <message>    Send a prompt, stream events, and exit when idle
-  send [options] <target> <msg> Send an agent-to-agent message to another live session
-  agent-messages <cmd>          Safety controls: status, pause, resume, clear <session>
-  steer <session> <message>     Queue a steering message
-  follow-up <session> <message> Queue a follow-up message
-  rename <session> <name>       Rename a live session
-  kill <session>                Kill a live session
-  state <session>               Print session state as JSON
-  messages <session>            Print messages as JSON
-  stats <session>               Print session stats as JSON
-  commands <session>            Print available commands as JSON
-  cron list [-a|--all] [session] List scheduled cron jobs
-  cron add <session> <schedule> -- <message>
-                                Schedule a prompt for a session
-  cron cancel <job-id>           Cancel a scheduled cron job
-  retry <session>               Retry a root worker marked failed
-  restart                       Restart only the supervisor and adopt existing workers
-  shutdown [--force|--all]      Stop workers and the daemon; --force kills unresponsive workers
-
-${chalk.bold("Options:")}
-  --socket <path>               Socket path (default: ${defaultDaemonSocketPath()})
-  --name <name>                 Name for the new session created by bare daemon
-  --cwd <dir>                   Working directory for the created session
-  --resume <selector>           Resume a saved session file or partial UUID
-  --foreground, --no-detach     Keep daemon attached to this terminal for debugging
-  --json                        Print raw JSON for commands with formatted output; attach streams raw protocol JSON
-  send options: --from <session>, --steer, --follow-up, --message <message>
-  agent-messages clear only clears one explicitly named session
-  Agent options such as --model, --provider, --tools, and --thinking apply to created sessions.
-
-${chalk.bold("Examples:")}
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock --model openai/gpt-4o-mini
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock create scratch --model openai/gpt-4o-mini
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock create audit --model anthropic/claude-sonnet-4-5 --cwd ../other-repo
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock --name scratch --model openai/gpt-4o-mini
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock scratch
-  ${APP_NAME} daemon start --socket /tmp/prime-agent.sock --model openai/gpt-4o-mini
-  ${APP_NAME} daemon start --foreground --socket /tmp/prime-agent.sock --offline
-  ${APP_NAME} daemon ps
-  ${APP_NAME} daemon ps --reap
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock list
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock list -a
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock create scratch
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock create --resume <session>
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock cron add <session> "*/30 * * * *" -- "Check progress"
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock cron list
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock prompt <session> "Say hello"
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock send --from planner worker --message "Use this context..."
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock attach <session>
-  ${APP_NAME} daemon --socket /tmp/prime-agent.sock shutdown
-  ${APP_NAME} daemon shutdown --all
-`);
 }

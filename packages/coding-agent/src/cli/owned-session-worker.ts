@@ -13,6 +13,7 @@ import {
 } from "../core/orphan-process-journal.js";
 import { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../modes/rpc/jsonl.js";
+import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
 import { type CliSubprocessLaunchSpec, createCliSubprocessLaunchSpec } from "./subprocess-launch.js";
 
 const OWNED_WORKER_ENV = "PRIME_AGENT_INTERNAL_OWNED_WORKER";
@@ -34,17 +35,7 @@ interface OwnedSessionRecoveryDescriptor {
 
 const NON_SESSION_FLAGS = new Set(["--help", "-h", "--version", "-v", "--list-models", "--export"]);
 
-const NON_SESSION_COMMANDS = new Set([
-	"agents",
-	"manage",
-	"daemon",
-	"install",
-	"remove",
-	"uninstall",
-	"update",
-	"list",
-	"config",
-]);
+const NON_SESSION_COMMANDS = new Set([...PUBLIC_COMMAND_NAMES, ...REMOVED_COMMAND_NAMES]);
 
 function valueAfter(args: readonly string[], flag: string): string | undefined {
 	const index = args.indexOf(flag);
@@ -56,6 +47,9 @@ function hasNonSessionOperation(args: readonly string[]): boolean {
 		return true;
 	}
 	const first = args[0];
+	if (first === "help") {
+		return isHelpCommandRequest(args.slice(1));
+	}
 	return first !== undefined && NON_SESSION_COMMANDS.has(first);
 }
 

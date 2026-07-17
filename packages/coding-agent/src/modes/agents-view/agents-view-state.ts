@@ -1,7 +1,7 @@
 import { basename } from "node:path";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
 
-export type AgentsViewSection = "working" | "needs-input" | "completed";
+export type AgentsViewSection = "working" | "needs-input" | "heartbeats" | "completed";
 
 export type AgentsViewRowKind = "agent" | "subagent-summary" | "subagent" | "subagent-code";
 
@@ -29,6 +29,9 @@ export interface AgentsViewRow {
 }
 
 export function classifyAgentsViewSession(summary: SessionSummary): AgentsViewSection {
+	if (summary.hasActiveHeartbeat) {
+		return "heartbeats";
+	}
 	if (summary.activity === "working") {
 		return "working";
 	}
@@ -50,6 +53,8 @@ export function sectionTitle(section: AgentsViewSection): string {
 			return "Working";
 		case "needs-input":
 			return "Needs Input";
+		case "heartbeats":
+			return "Heartbeats";
 		case "completed":
 			return "Completed";
 		default: {
@@ -141,7 +146,7 @@ export function buildAgentsViewRows(
 		if (!parent || parent === row) {
 			continue;
 		}
-		if (row.section === "working") {
+		if (row.summary.activity === "working") {
 			parent.runningSubagentCount += 1;
 		}
 		const siblings = childrenByParent.get(parent) ?? [];
@@ -174,7 +179,7 @@ export function buildAgentsViewRows(
 				}
 			}
 		} else {
-			flattened.push(createSubagentSummaryRow(row, children.length, depth + 1, childHasSpawnCode));
+			flattened.push(createSubagentSummaryRow(row, children, depth + 1, childHasSpawnCode));
 		}
 	};
 	for (const root of roots.sort(compareAgentsViewRows)) {
@@ -187,17 +192,23 @@ type MutableAgentsViewRow = AgentsViewRow;
 
 function createSubagentSummaryRow(
 	parent: AgentsViewRow,
-	totalCount: number,
+	children: readonly AgentsViewRow[],
 	depth: number,
 	hasSpawnCode: boolean,
 ): AgentsViewRow {
+	const totalCount = children.length;
 	const running = parent.runningSubagentCount;
+	const heartbeatCount = children.filter((child) => child.summary.hasActiveHeartbeat).length;
 	// Finished subagents stay reachable through the summary row even when
 	// nothing is running anymore.
-	const title =
+	const subagentTitle =
 		running > 0
 			? `${running} ${running === 1 ? "subagent" : "subagents"} running`
 			: `${totalCount} ${totalCount === 1 ? "subagent" : "subagents"}`;
+	const title =
+		heartbeatCount > 0
+			? `${subagentTitle} · ${heartbeatCount} ${heartbeatCount === 1 ? "heartbeat" : "heartbeats"} active`
+			: subagentTitle;
 	return {
 		kind: "subagent-summary",
 		section: parent.section,
@@ -281,11 +292,15 @@ function compareAgentsViewRows(a: AgentsViewRow, b: AgentsViewRow): number {
 	if (sectionDiff !== 0) {
 		return sectionDiff;
 	}
-	const modifiedDiff = getTimestamp(b.summary.modified) - getTimestamp(a.summary.modified);
-	if (modifiedDiff !== 0) {
-		return modifiedDiff;
+	const createdDiff = getTimestamp(b.summary.created) - getTimestamp(a.summary.created);
+	if (createdDiff !== 0) {
+		return createdDiff;
 	}
-	return a.title.localeCompare(b.title);
+	const titleDiff = a.title.localeCompare(b.title);
+	if (titleDiff !== 0) {
+		return titleDiff;
+	}
+	return a.summary.sessionId.localeCompare(b.summary.sessionId);
 }
 
 function buildRowKeyMap(rows: readonly MutableAgentsViewRow[]): Map<string, MutableAgentsViewRow> {
@@ -341,8 +356,10 @@ function sectionRank(section: AgentsViewSection): number {
 			return 0;
 		case "working":
 			return 1;
-		case "completed":
+		case "heartbeats":
 			return 2;
+		case "completed":
+			return 3;
 		default: {
 			const _exhaustive: never = section;
 			return _exhaustive;
@@ -390,6 +407,9 @@ function getSessionStatusLabel(summary: SessionSummary): string {
 	}
 	if (summary.lifecycle === "archived") {
 		return "archived";
+	}
+	if (summary.hasActiveHeartbeat) {
+		return "heartbeat active";
 	}
 	if (summary.activity === "working") {
 		return "classifying";

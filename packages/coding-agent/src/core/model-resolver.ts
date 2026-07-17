@@ -7,6 +7,7 @@ import { type Api, getLogger, type KnownProvider, type Model, modelsAreEqual } f
 import chalk from "chalk";
 import { minimatch } from "minimatch";
 import { isValidThinkingLevel } from "../cli/args.js";
+import { APP_NAME } from "../config.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { isPrivatePrimeInferenceModel } from "./prime-inference-models.js";
@@ -398,7 +399,7 @@ export function resolveCliModel(options: {
 		return {
 			model: undefined,
 			warning: undefined,
-			error: `Unknown provider "${cliProvider}". Use --list-models to see available providers/models.`,
+			error: `Unknown provider "${cliProvider}". Use "${APP_NAME} model list" to see available providers/models.`,
 		};
 	}
 
@@ -493,7 +494,7 @@ export function resolveCliModel(options: {
 		model: undefined,
 		thinkingLevel: undefined,
 		warning,
-		error: `Model "${display}" not found. Use --list-models to see available models.`,
+		error: `Model "${display}" not found. Use "${APP_NAME} model list" to see available models.`,
 	};
 }
 

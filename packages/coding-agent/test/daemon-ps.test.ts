@@ -1,13 +1,25 @@
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	type DaemonInfo,
+	isWorkerSocketPath,
 	parseLsofListeners,
 	parsePsEtimes,
 	parseSsListeners,
 	planReap,
 	planShutdownAll,
+	planShutdownConfirmation,
 	sortDaemons,
 } from "../src/cli/daemon-ps.js";
+import { defaultDaemonSocketDir } from "../src/modes/daemon/daemon-socket.js";
+
+describe("worker socket classification", () => {
+	it.runIf(process.platform !== "win32")("recognizes only worker sockets in the default service directory", () => {
+		expect(isWorkerSocketPath(join(defaultDaemonSocketDir(), "worker-abc.sock"))).toBe(true);
+		expect(isWorkerSocketPath(join(defaultDaemonSocketDir(), "daemon.sock"))).toBe(false);
+		expect(isWorkerSocketPath("/tmp/worker-abc.sock")).toBe(false);
+	});
+});
 
 describe("parseSsListeners", () => {
 	const stdout = [
@@ -113,7 +125,9 @@ describe("planReap", () => {
 
 	it("only kills unreachable daemons with --force", () => {
 		const daemon = makeDaemon({ socketPath: "/tmp/hung.sock", status: "unreachable", pid: 7 });
-		expect(planReap([daemon], false)[0]!.kind).toBe("skip");
+		const skipped = planReap([daemon], false)[0]!;
+		expect(skipped.kind).toBe("skip");
+		expect(skipped.kind === "skip" ? skipped.reason : "").toContain("prime-agent shutdown --force");
 		expect(planReap([daemon], true)[0]!.kind).toBe("kill");
 	});
 
@@ -132,27 +146,62 @@ describe("planReap", () => {
 });
 
 describe("planShutdownAll", () => {
-	it("targets every daemon reap would skip", () => {
-		const plan = planShutdownAll([
-			makeDaemon({ socketPath: "/tmp/default.sock", status: "current", isDefault: true, sessionCount: 0, pid: 1 }),
-			makeDaemon({ socketPath: "/tmp/busy.sock", status: "current", sessionCount: 3, pid: 2 }),
-			makeDaemon({ socketPath: "/tmp/hung.sock", status: "unreachable", pid: 7 }),
-			makeDaemon({ socketPath: "/tmp/orphan.sock", status: "orphan-file" }),
-		]);
+	it("targets every service when forced", () => {
+		const plan = planShutdownAll(
+			[
+				makeDaemon({
+					socketPath: "/tmp/default.sock",
+					status: "current",
+					isDefault: true,
+					sessionCount: 0,
+					pid: 1,
+				}),
+				makeDaemon({ socketPath: "/tmp/busy.sock", status: "current", sessionCount: 3, pid: 2 }),
+				makeDaemon({ socketPath: "/tmp/hung.sock", status: "unreachable", pid: 7 }),
+				makeDaemon({ socketPath: "/tmp/orphan.sock", status: "orphan-file" }),
+			],
+			true,
+		);
 		expect(plan.map((action) => action.kind)).toEqual(["shutdown", "shutdown", "kill", "remove-file"]);
 	});
 
-	it("never skips a daemon", () => {
-		const plan = planShutdownAll([
-			makeDaemon({ socketPath: "/tmp/a.sock", status: "stale", pid: 9 }),
-			makeDaemon({ socketPath: "/tmp/b.sock", status: "unreachable", pid: 10 }),
-		]);
+	it("never skips a service when forced", () => {
+		const plan = planShutdownAll(
+			[
+				makeDaemon({ socketPath: "/tmp/a.sock", status: "stale", pid: 9 }),
+				makeDaemon({ socketPath: "/tmp/b.sock", status: "unreachable", pid: 10 }),
+			],
+			true,
+		);
 		expect(plan.some((action) => action.kind === "skip")).toBe(false);
 	});
 
 	it("removes the socket file for an unreachable daemon with no pid", () => {
-		const plan = planShutdownAll([makeDaemon({ socketPath: "/tmp/c.sock", status: "unreachable" })]);
+		const plan = planShutdownAll([makeDaemon({ socketPath: "/tmp/c.sock", status: "unreachable" })], false);
 		expect(plan[0]!.kind).toBe("remove-file");
+	});
+
+	it("requires force for unreachable tracked workers", () => {
+		const daemon = makeDaemon({
+			socketPath: "/tmp/worker-only.sock",
+			status: "unreachable",
+			hasTrackedWorkers: true,
+		});
+		expect(planShutdownAll([daemon], false)[0]!.kind).toBe("skip");
+		expect(planShutdownAll([daemon], true)[0]!.kind).toBe("remove-file");
+	});
+});
+
+describe("planShutdownConfirmation", () => {
+	it("never prompts when JSON output was requested", () => {
+		expect(planShutdownConfirmation(1, true, false, true)).toBe("json-error");
+	});
+
+	it("prompts only for non-JSON shutdown at a TTY", () => {
+		expect(planShutdownConfirmation(1, false, false, true)).toBe("prompt");
+		expect(planShutdownConfirmation(1, false, false, false)).toBe("tty-error");
+		expect(planShutdownConfirmation(1, true, true, true)).toBe("none");
+		expect(planShutdownConfirmation(0, false, false, true)).toBe("none");
 	});
 });
 

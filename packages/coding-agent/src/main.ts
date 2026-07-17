@@ -12,7 +12,6 @@ import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
 import { ProcessTerminal, setKeybindings, TUI } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.js";
-import { handleDaemonCommand, normalizeDaemonStartArgs } from "./cli/daemon-command.js";
 import {
 	ensureInteractiveDaemonRunning,
 	isDaemonSessionSummary,
@@ -26,6 +25,7 @@ import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
 import { installOwnedSessionRecoveryTracking } from "./cli/owned-session-worker.js";
+import { handlePublicCommand } from "./cli/public-command.js";
 import { selectSession } from "./cli/session-picker.js";
 import { expandTildePath, getAgentDir, getSessionDirEnvOverride, VERSION } from "./config.js";
 import {
@@ -60,7 +60,7 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.js";
-import { SessionAlreadyActiveError } from "./core/session-lease.js";
+import { canonicalSessionPath, SessionAlreadyActiveError } from "./core/session-lease.js";
 import { SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { printTimings, resetTimings, time } from "./core/timings.js";
@@ -75,6 +75,7 @@ import {
 } from "./modes/daemon/daemon-worker-protocol.js";
 import {
 	type AgentConnection,
+	ClientPromptStashStore,
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServicesFromServices,
 	DaemonAgentConnection,
@@ -93,7 +94,7 @@ import {
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.js";
 import { shouldRunOnboarding } from "./modes/interactive/onboarding.js";
 import { initTheme, preloadCodeHighlighter, stopThemeWatcher } from "./modes/interactive/theme/theme.js";
-import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.js";
+import { handleConfigCommand } from "./package-manager-cli.js";
 import { isLocalPath } from "./utils/paths.js";
 
 /**
@@ -144,6 +145,10 @@ function isTruthyEnvFlag(value: string | undefined): boolean {
 
 export type AppMode = "interactive" | "print" | "json" | "rpc" | "daemon";
 
+export function shouldRejectNonInteractiveAttach(attachAgent: string | undefined, appMode: AppMode): boolean {
+	return attachAgent !== undefined && appMode !== "interactive";
+}
+
 function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
 	if (parsed.mode === "daemon") {
 		return "daemon";
@@ -164,10 +169,9 @@ function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc" | "daemon"> {
 	return appMode === "json" ? "json" : "text";
 }
 
-// `prime-agent agents` / `prime-agent manage` open the agents view directly; the
-// leading verb is stripped so the remaining args parse as usual.
+// `prime-agent agents` opens the agents view directly.
 export function parseAgentsViewCommand(args: string[]): { explicitAgentsView: boolean; args: string[] } {
-	if (args[0] === "agents" || args[0] === "manage") {
+	if (args[0] === "agents") {
 		return { explicitAgentsView: true, args: args.slice(1) };
 	}
 	return { explicitAgentsView: false, args };
@@ -191,6 +195,13 @@ export function shouldUseDaemonInteractive(options: InteractiveDaemonStartupDeci
 	);
 }
 
+export function shouldEnsureInteractiveDaemonForStartup(
+	useDaemonInteractive: boolean,
+	attachAgent: string | undefined,
+): boolean {
+	return useDaemonInteractive && attachAgent === undefined;
+}
+
 export interface AgentsViewStartupDecision {
 	useDaemonInteractive: boolean;
 	needsOnboarding: boolean;
@@ -204,7 +215,7 @@ export function shouldOpenAgentsViewForDaemonInteractive(options: AgentsViewStar
 	return (
 		options.useDaemonInteractive &&
 		// `prime-agent` opens a new chat by default; the agents view is reached via
-		// left-arrow from a session or requested explicitly (`agents`/`manage`).
+		// left-arrow from a session or requested explicitly (`agents`).
 		!!options.explicitAgentsView &&
 		// Onboarding lives in InteractiveMode, so a first run must take the
 		// direct session path; the agents view would otherwise require creating
@@ -232,82 +243,37 @@ export function shouldUseEphemeralSessionManagerForDaemonInteractive(
 export interface DaemonActiveSessionLookupDecision {
 	useDaemonInteractive: boolean;
 	resumeSelector?: string;
+	explicitAttach?: boolean;
 }
 
 export function shouldEnsureDaemonBeforeActiveSessionLookup(options: DaemonActiveSessionLookupDecision): boolean {
 	return (
 		options.useDaemonInteractive &&
 		options.resumeSelector !== undefined &&
-		!looksLikeSessionPath(options.resumeSelector)
+		(options.explicitAttach || !looksLikeSessionPath(options.resumeSelector))
 	);
 }
 
 type ActiveDaemonSessionSummaryLookup = (socketPath: string, selector: string) => Promise<SessionSummary | undefined>;
 
+interface ActiveDaemonSessionSummaryLookupOptions {
+	fallbackOnError?: boolean;
+	lookup?: ActiveDaemonSessionSummaryLookup;
+}
+
 export async function findActiveDaemonSessionSummaryForInteractiveStartup(
 	socketPath: string,
 	selector: string,
-	lookup: ActiveDaemonSessionSummaryLookup = findActiveDaemonSessionSummary,
+	options: ActiveDaemonSessionSummaryLookupOptions = {},
 ): Promise<SessionSummary | undefined> {
 	try {
-		return await lookup(socketPath, selector);
-	} catch {
+		return await (options.lookup ?? findActiveDaemonSessionSummary)(socketPath, selector);
+	} catch (error) {
+		if (options.fallbackOnError === false) {
+			throw error;
+		}
 		return undefined;
 	}
-}
-
-const DAEMON_RICH_TUI_SHORTCUT_COMMANDS = new Set([
-	"help",
-	"start",
-	"list",
-	"create",
-	"attach",
-	"detach",
-	"kill",
-	"rename",
-	"prompt",
-	"steer",
-	"follow-up",
-	"state",
-	"messages",
-	"stats",
-	"commands",
-	"shutdown",
-]);
-
-export interface DaemonRichTuiAttachShortcut {
-	socketPath: string;
-	selector: string;
-}
-
-export function parseDaemonRichTuiAttachShortcut(args: string[]): DaemonRichTuiAttachShortcut | undefined {
-	if (args[0] !== "daemon") {
-		return undefined;
-	}
-
-	let socketPath = defaultDaemonSocketPath();
-	let selector: string | undefined;
-	for (let index = 1; index < args.length; index++) {
-		const arg = args[index];
-		if (arg === "--socket" || arg === "--daemon-socket") {
-			const value = args[index + 1];
-			if (!value) {
-				return undefined;
-			}
-			socketPath = value;
-			index++;
-			continue;
-		}
-		if (arg === "--json" || arg.startsWith("-") || DAEMON_RICH_TUI_SHORTCUT_COMMANDS.has(arg)) {
-			return undefined;
-		}
-		if (selector) {
-			return undefined;
-		}
-		selector = arg;
-	}
-
-	return selector ? { socketPath, selector } : undefined;
 }
 
 function looksLikeSessionPath(sessionArg: string): boolean {
@@ -392,12 +358,12 @@ async function promptConfirm(message: string): Promise<boolean> {
 const STARTUP_SESSION_LOSS_COPY: DaemonSessionLossCopy = {
 	busyDetail(count) {
 		const { noun, pronoun } = pluralizeSessions(count);
-		return `A background daemon from a different prime-agent version is running with ${count} busy ${noun}. Stopping it will terminate ${pronoun}.`;
+		return `A background service from a different Prime Agent version is running with ${count} busy ${noun}. Stopping it will terminate ${pronoun}.`;
 	},
 	unlistableDetail:
-		"A background daemon from a different prime-agent version is running and its sessions could not be listed. Stopping it may terminate active sessions.",
+		"A background service from a different Prime Agent version is running and its sessions could not be listed. Stopping it may terminate active sessions.",
 	question: "Stop it and continue?",
-	nonTtyHint: 'Run "prime-agent daemon shutdown" to stop it, then retry.',
+	nonTtyHint: 'Run "prime-agent shutdown" to stop it, then retry.',
 };
 
 // The promise to keep after awaiting readiness. Wrapped in an object so it
@@ -419,7 +385,7 @@ async function takeOverStaleDaemonOrExit(socketPath: string): Promise<DaemonRead
 	}
 	if (!(await shutdownDaemonAndWait(socketPath))) {
 		console.error(
-			chalk.red(`Could not stop the daemon on ${socketPath}. Run "prime-agent daemon shutdown" and retry.`),
+			chalk.red(`Could not stop the background service on ${socketPath}. Run "prime-agent shutdown" and retry.`),
 		);
 		process.exit(1);
 	}
@@ -428,7 +394,7 @@ async function takeOverStaleDaemonOrExit(socketPath: string): Promise<DaemonRead
 		await ready;
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
-		console.error(chalk.red(`Could not start the daemon: ${message}`));
+		console.error(chalk.red(`Could not start the background service: ${message}`));
 		process.exit(1);
 	}
 	return { ready };
@@ -947,11 +913,7 @@ async function findActiveDaemonSessionSummary(
 	selector: string,
 ): Promise<SessionSummary | undefined> {
 	const client = new DaemonClient(socketPath);
-	try {
-		await client.connect(250);
-	} catch {
-		return undefined;
-	}
+	await client.connect(250);
 
 	try {
 		const response = await client.request({ type: "get_state", activeSessionId: selector }, 3000);
@@ -968,20 +930,6 @@ async function findActiveDaemonSessionSummary(
 	} finally {
 		client.close();
 	}
-}
-
-async function normalizeDaemonRichTuiAttachArgs(args: string[]): Promise<string[] | undefined> {
-	const shortcut = parseDaemonRichTuiAttachShortcut(args);
-	if (!shortcut) {
-		return undefined;
-	}
-
-	const summary = await findActiveDaemonSessionSummary(shortcut.socketPath, shortcut.selector);
-	if (!summary) {
-		return undefined;
-	}
-
-	return ["--daemon-socket", shortcut.socketPath, "--resume", getDaemonSummaryActiveSessionId(summary)];
 }
 
 function createSessionManagerForActiveDaemonSummary(summary: SessionSummary, fallbackCwd: string): SessionManager {
@@ -1007,12 +955,12 @@ export function findActiveDaemonSessionSummaryForSessionFile(
 	summaries: readonly SessionSummary[],
 	sessionPath: string,
 ): SessionSummary | undefined {
-	const resolvedSessionPath = resolve(sessionPath);
+	const resolvedSessionPath = canonicalSessionPath(sessionPath);
 	return summaries.find(
 		(summary) =>
 			summary.activeSessionId !== undefined &&
 			summary.sessionFile !== undefined &&
-			resolve(summary.sessionFile) === resolvedSessionPath,
+			canonicalSessionPath(summary.sessionFile) === resolvedSessionPath,
 	);
 }
 
@@ -1103,37 +1051,23 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	// Client and daemon are separate processes; both need these in their registry.
 	registerBuiltinMcpOAuthProviders();
-	args = normalizeDaemonStartArgs(args) ?? args;
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
 		process.env.PI_OFFLINE = "1";
 		process.env.PI_SKIP_VERSION_CHECK = "1";
 	}
 
-	if (await handlePackageCommand(args)) {
+	const publicCommand = await handlePublicCommand(args);
+	if (publicCommand.handled) {
 		return;
 	}
+	args = publicCommand.args;
 
 	if (await handleConfigCommand(args)) {
 		return;
 	}
 
-	try {
-		args = (await normalizeDaemonRichTuiAttachArgs(args)) ?? args;
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		console.error(chalk.red(`Error: ${message}`));
-		process.exit(1);
-	}
-
-	if (await handleDaemonCommand(args)) {
-		return;
-	}
-
-	// `prime-agent agents` / `prime-agent manage` open the agents view directly.
-	const agentsViewCommand = parseAgentsViewCommand(args);
-	const explicitAgentsView = agentsViewCommand.explicitAgentsView;
-	args = agentsViewCommand.args;
+	const explicitAgentsView = publicCommand.explicitAgentsView;
 
 	const parsed = parseArgs(args);
 	if (parsed.diagnostics.length > 0) {
@@ -1147,6 +1081,10 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("parseArgs");
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY);
+	if (shouldRejectNonInteractiveAttach(publicCommand.attachAgent, appMode)) {
+		console.error(chalk.red("Error: attach requires an interactive terminal"));
+		process.exit(1);
+	}
 	setLogContext({ mode: appMode });
 	const shouldTakeOverStdout = appMode !== "interactive";
 	if (shouldTakeOverStdout) {
@@ -1221,8 +1159,10 @@ export async function main(args: string[], options?: MainOptions) {
 		startupSettingsManager.getSessionDir();
 	const daemonSocketPath = parsed.daemonSocket ?? defaultDaemonSocketPath();
 	// Kick off daemon spawn/readiness immediately so it overlaps session-manager
-	// and runtime-services preparation; awaited wherever the daemon is first used.
-	let daemonReady = useDaemonInteractive ? ensureInteractiveDaemonRunning(daemonSocketPath) : undefined;
+	// and runtime-services preparation; attach only connects to an existing daemon.
+	let daemonReady = shouldEnsureInteractiveDaemonForStartup(useDaemonInteractive, publicCommand.attachAgent)
+		? ensureInteractiveDaemonRunning(daemonSocketPath)
+		: undefined;
 	// Errors are rethrown at the await sites below; this only avoids an unhandled
 	// rejection if startup exits before reaching them.
 	daemonReady?.catch(() => {});
@@ -1230,14 +1170,29 @@ export async function main(args: string[], options?: MainOptions) {
 	const shouldLookupDaemonActiveSession = shouldEnsureDaemonBeforeActiveSessionLookup({
 		useDaemonInteractive,
 		resumeSelector,
+		explicitAttach: publicCommand.attachAgent !== undefined,
 	});
 	if (shouldLookupDaemonActiveSession && daemonReady) {
 		daemonReady = (await awaitDaemonReady(daemonReady)).ready;
 	}
-	const activeDaemonSessionSummary =
-		shouldLookupDaemonActiveSession && resumeSelector
-			? await findActiveDaemonSessionSummaryForInteractiveStartup(daemonSocketPath, resumeSelector)
-			: undefined;
+	let activeDaemonSessionSummary: SessionSummary | undefined;
+	if (shouldLookupDaemonActiveSession && resumeSelector) {
+		try {
+			activeDaemonSessionSummary = await findActiveDaemonSessionSummaryForInteractiveStartup(
+				daemonSocketPath,
+				resumeSelector,
+				{ fallbackOnError: !publicCommand.attachAgent },
+			);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error(chalk.red(`Error: Could not look up active agent '${resumeSelector}': ${message}`));
+			process.exit(1);
+		}
+	}
+	if (publicCommand.attachAgent && !activeDaemonSessionSummary) {
+		console.error(chalk.red(`Error: No active agent found matching '${publicCommand.attachAgent}'`));
+		process.exit(1);
+	}
 	let sessionManager: SessionManager;
 	if (activeDaemonSessionSummary) {
 		sessionManager = createSessionManagerForActiveDaemonSummary(activeDaemonSessionSummary, cwd);
@@ -1380,6 +1335,7 @@ export async function main(args: string[], options?: MainOptions) {
 			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Ctrl+P to cycle)")}`));
 		}
 
+		const promptStashStore = new ClientPromptStashStore();
 		const daemonUiServices = createInteractiveModeUiServicesFromServices({
 			services,
 			sessionManager,
@@ -1411,6 +1367,7 @@ export async function main(args: string[], options?: MainOptions) {
 				},
 				migratedProviders,
 				modelFallbackMessage: startupModel.modelFallbackMessage,
+				promptStashStore,
 				startupModelId: startupModel.model?.id,
 				...(includeInitialPrompts ? { initialMessage, initialImages, initialMessages: parsed.messages } : {}),
 				verbose: parsed.verbose,
@@ -1458,7 +1415,10 @@ export async function main(args: string[], options?: MainOptions) {
 
 		const interactiveMode = new InteractiveMode({
 			agentConnection,
+			daemonSocketPath,
 			uiServices: daemonUiServices,
+			promptStashStore,
+			promptStashSessionId: summary.sessionId,
 			bindLocalSessionExtensions: false,
 			migratedProviders,
 			modelFallbackMessage: attachModelFallbackMessage,
@@ -1567,6 +1527,8 @@ export async function main(args: string[], options?: MainOptions) {
 		const interactiveMode = new InteractiveMode({
 			agentConnection: new InProcessAgentConnection(runtime),
 			localSessionHost: createInteractiveModeLocalSessionHost(runtime),
+			promptStashStore: new ClientPromptStashStore(),
+			promptStashSessionId: session.sessionId,
 			bindLocalSessionExtensions: true,
 			migratedProviders,
 			modelFallbackMessage,

@@ -148,7 +148,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/new`, `/clear` | Start a new session |
 | `/name <name>` | Set session display name |
 | `/session` | Show session info (file, ID, messages) |
-| `/traces [status\|on\|off\|upload\|login]` | Manage opt-in Prime Agent trace sharing |
+| `/traces [status\|on\|off\|preview\|upload-current\|upload-all\|login]` | Preview traces, run one-shot current/all uploads, and manage automatic sharing (`upload` aliases `upload-current`) |
 | `/usage` | Show token, cost, and context usage |
 | `/tree` | Jump to any point in the session and continue from there |
 | `/fork` | Create a new session from a previous user message |
@@ -400,28 +400,23 @@ Bundle and share extensions, skills, prompts, and themes via npm or git.
 > **Security:** Prime Agent packages run with full system access. Extensions execute arbitrary code, and skills can instruct the model to perform any action including running executables. Review source code before installing third-party packages.
 
 ```bash
-prime-agent install npm:@foo/prime-agent-tools
-prime-agent install npm:@foo/prime-agent-tools@1.2.3      # pinned version
-prime-agent install git:github.com/user/repo
-prime-agent install git:github.com/user/repo@v1  # tag or commit
-prime-agent install git:git@github.com:user/repo
-prime-agent install git:git@github.com:user/repo@v1  # tag or commit
-prime-agent install https://github.com/user/repo
-prime-agent install https://github.com/user/repo@v1      # tag or commit
-prime-agent install ssh://git@github.com/user/repo
-prime-agent install ssh://git@github.com/user/repo@v1    # tag or commit
-prime-agent remove npm:@foo/prime-agent-tools
-prime-agent uninstall npm:@foo/prime-agent-tools          # alias for remove
-prime-agent list
-prime-agent update                      # update Prime Agent and packages (skips pinned packages)
-prime-agent update --extensions         # update packages only
-prime-agent update --self               # update Prime Agent only
-prime-agent update --self --force       # reinstall Prime Agent even if current
-prime-agent update npm:@foo/prime-agent-tools    # update one package
-prime-agent config                      # enable/disable extensions, skills, prompts, themes
+prime-agent package install npm:@foo/prime-agent-tools
+prime-agent package install npm:@foo/prime-agent-tools@1.2.3  # pinned version
+prime-agent package install git:github.com/user/repo
+prime-agent package install git:github.com/user/repo@v1       # tag or commit
+prime-agent package install git:git@github.com:user/repo
+prime-agent package install https://github.com/user/repo
+prime-agent package install ssh://git@github.com/user/repo
+prime-agent package remove npm:@foo/prime-agent-tools
+prime-agent package list
+prime-agent package update                                  # update packages, except pinned versions
+prime-agent package update npm:@foo/prime-agent-tools       # update one package
+prime-agent update                                          # update Prime Agent
+prime-agent update --force                                  # reinstall Prime Agent even if current
+prime-agent config                                          # enable/disable package resources
 ```
 
-Packages install to `~/.prime/agent/git/` (git) or global npm. Use `-l` for project-local installs (`.prime/agent/git/`, `.prime/agent/npm/`). Git packages install dependencies with `npm install --omit=dev` by default, so runtime deps must be listed under `dependencies`; when `npmCommand` is configured, git packages use plain `install` for compatibility with wrappers. If you use a Node version manager and want package installs to reuse a stable npm context, set `npmCommand` in `settings.json`, for example `["mise", "exec", "node@20", "--", "npm"]`.
+Packages install to `~/.prime/agent/git/` (git) or global npm. Use `--local` for project-local installs (`.prime/agent/git/`, `.prime/agent/npm/`). Git packages install dependencies with `npm install --omit=dev` by default, so runtime deps must be listed under `dependencies`; when `npmCommand` is configured, git packages use plain `install` for compatibility with wrappers. If you use a Node version manager and want package installs to reuse a stable npm context, set `npmCommand` in `settings.json`, for example `["mise", "exec", "node@20", "--", "npm"]`.
 
 Create a package by adding the inherited `pi` manifest key to `package.json`:
 
@@ -488,19 +483,45 @@ The package architecture, extension model, and source package names still reflec
 prime-agent [options] [@files...] [messages...]
 ```
 
-### Package Commands
+Run `prime-agent help` for the command list and `prime-agent help <command>` for details.
+
+### Agent Commands
 
 ```bash
-prime-agent install <source> [-l]     # Install package, -l for project-local
-prime-agent remove <source> [-l]      # Remove package
-prime-agent uninstall <source> [-l]   # Alias for remove
-prime-agent update [source|self|prime-agent]   # Update Prime Agent and packages (skips pinned packages)
-prime-agent update --extensions                # Update packages only
-prime-agent update --self                      # Update Prime Agent only
-prime-agent update --self --force              # Reinstall Prime Agent even if current
-prime-agent update --extension <src>           # Update one package
-prime-agent list                      # List installed packages
-prime-agent config                    # Enable/disable package resources
+prime-agent agents                         # Open the agents view
+prime-agent list [--all]                   # List active or saved agents
+prime-agent attach <agent>                 # Attach the interactive UI
+prime-agent stop <agent>                   # Stop one agent
+prime-agent rename <agent> <name>          # Rename an agent
+prime-agent send <agent> <message>         # Send an agent-to-agent message
+prime-agent status                         # Show background service status
+prime-agent doctor [--fix]                 # Inspect or safely clean up background services
+prime-agent shutdown [--force]             # Stop every agent, worker, and background service
+```
+
+`shutdown` asks for confirmation. `shutdown --force` skips confirmation and kills unresponsive workers and their tracked child processes.
+
+### Scheduled Prompts
+
+```bash
+prime-agent schedule list [--all] [agent]
+prime-agent schedule add <agent> <schedule> -- <message>
+prime-agent schedule cancel <job-id>
+```
+
+Schedules run prompts later or repeatedly. A schedule can be a supported one-time expression such as `in 5m` or a cron expression.
+
+### Package and Update Commands
+
+Packages bundle capabilities such as extensions, skills, prompts, and themes.
+
+```bash
+prime-agent package install <source> [--local]
+prime-agent package remove <source> [--local]
+prime-agent package list
+prime-agent package update [source]
+prime-agent update [--force]                   # Update Prime Agent itself
+prime-agent config                             # Enable/disable package resources
 ```
 
 ### Modes
@@ -511,7 +532,6 @@ prime-agent config                    # Enable/disable package resources
 | `-p`, `--print` | Print response and exit |
 | `--mode json` | Output all events as JSON lines (see [docs/json.md](docs/json.md)) |
 | `--mode rpc` | RPC mode for process integration (see [docs/rpc.md](docs/rpc.md)) |
-| `--export <in> [out]` | Export session to HTML |
 
 In print mode, Prime Agent also reads piped stdin and merges it into the initial prompt:
 
@@ -528,7 +548,8 @@ cat README.md | prime-agent -p "Summarize this text"
 | `--api-key <key>` | API key (overrides env vars) |
 | `--thinking <level>` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh` |
 | `--models <patterns>` | Comma-separated patterns for Ctrl+P cycling |
-| `--list-models [search]` | List available models |
+
+Use `prime-agent model list [search]` to list available models.
 
 ### Session Options
 
@@ -539,6 +560,8 @@ cat README.md | prime-agent -p "Summarize this text"
 | `--fork <path\|id>` | Fork specific session file or partial UUID into a new session |
 | `--session-dir <dir>` | Custom session storage directory |
 | `--no-session` | Ephemeral mode (don't save) |
+
+Use `prime-agent session export <file> [output]` to export a saved session to HTML.
 
 ### Tool Options
 

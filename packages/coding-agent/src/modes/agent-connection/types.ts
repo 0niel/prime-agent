@@ -3,7 +3,12 @@ import type { Api, ImageContent, Model, ServiceTier, TextContent, Transport, Usa
 import type { AuthSourceToken } from "../../core/auth-storage.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
-import type { AgentCronJob, AgentHeartbeatDeliveryMode, AgentHeartbeatUpdateAction } from "../../core/cron-jobs.js";
+import type {
+	AgentCronJob,
+	AgentHeartbeatDeliveryMode,
+	AgentHeartbeatManagementAction,
+	AgentHeartbeatUpdateAction,
+} from "../../core/cron-jobs.js";
 import type { ReplayBuiltInToolName } from "../../core/extensions/index.js";
 import type { GoalState } from "../../core/goals.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
@@ -446,6 +451,12 @@ export interface AgentConnectionQueueState {
 	followUp: string[];
 }
 
+export interface AgentConnectionHeartbeat {
+	job: AgentCronJob;
+	sessionName?: string;
+	firstMessage?: string;
+}
+
 export type AgentConnectionExtensionUiResponse = { value: string } | { confirmed: boolean } | { cancelled: true };
 
 export interface AgentConnectionExtensionUiRequest {
@@ -466,6 +477,8 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 	parentId?: string;
 	/** The child's own daemon active-session id, for attaching to it directly. */
 	activeSessionId?: string;
+	/** Stable daemon-visible session name for addressing/displaying the child. */
+	sessionName?: string;
 	label: string;
 	status: AgentConnectionRlmChildAgentStatus;
 	durationMs?: number;
@@ -535,6 +548,7 @@ export type AgentConnectionEvent =
 	| { type: "session_status"; recap?: string }
 	| { type: "extension_ui_request"; request: AgentConnectionExtensionUiRequest }
 	| { type: "connection_status"; status: "reconnecting" | "connected"; error?: string }
+	| { type: "heartbeats_changed" }
 	| { type: "closed"; error?: string };
 
 export type AgentConnectionEventListener = (event: AgentConnectionEvent) => void | Promise<void>;
@@ -562,6 +576,12 @@ export interface AgentConnection {
 	clearQueue(): Promise<AgentConnectionQueueState>;
 	abortAndClearQueue(): Promise<AgentConnectionQueueState>;
 	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;
+	listHeartbeats(): Promise<AgentConnectionHeartbeat[]>;
+	manageHeartbeat(
+		activeSessionId: string,
+		jobId: string,
+		action: AgentHeartbeatManagementAction,
+	): Promise<AgentCronJob>;
 	addCronJob(schedule: string, prompt: string): Promise<AgentCronJob>;
 	cancelCronJob(jobId: string): Promise<AgentCronJob>;
 	getHeartbeat(): Promise<AgentCronJob | undefined>;

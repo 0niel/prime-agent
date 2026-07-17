@@ -69,13 +69,13 @@ packages/coding-agent/src/core/agent-session.ts
   Parent session owns recursion settings and implements runRlmChild().
 
 packages/coding-agent/src/core/rlm-runtime.ts
-  TypeScript request/result types for rlm.run and the adapter that registers
-  it as a typed host request handler.
+  TypeScript request/result types for rlm.run, rlm.list_subagents, and
+  rlm.delete_subagent plus their typed host request handlers.
 
 prime-agent-runtime/src/rlm/__init__.py
   Python shim installed into ~/.prime/agent/kernel-venv. Exposes rlm, rlm.run(),
-  host_request(), RLMResult, TokenUsage, and the session-backed harness state
-  helper.
+  rlm.list_subagents(), rlm.delete_subagent(), host_request(), RLMResult,
+  RLMSubagent, TokenUsage, and the session-backed harness state helper.
 
 prime-agent-runtime/src/rlm/harness.py
   Session-backed JSON store for reset-free harness refinement notes: prompt
@@ -382,8 +382,10 @@ It exports:
 ```python
 rlm
 run(prompt: str, **kwargs)
+list_subagents()
 host_request(request_type: str, payload: dict | None = None)
 RLMResult
+RLMSubagent
 TokenUsage
 ```
 
@@ -440,7 +442,7 @@ awaits the Future
 
 The callback strips the reply's `status` field and converts the payload into `RLMResult`, or raises `RuntimeError` when the host reports an error. The comm-open/await machinery is the public `host_request()`; `run()` is a typed wrapper around it, and other kernel-side skills reuse `host_request()` for their own request types.
 
-The shim accepts `**kwargs` for API compatibility with `rlm-harness` and includes them in the comm payload. V1 does not apply any kwargs on the TypeScript side. Unsupported kwargs are rejected with a clear error instead of being ignored.
+The shim accepts `**kwargs` and includes them in the comm payload. The TypeScript host supports `name="..."` for an orchestrator-chosen child session name; all other kwargs are rejected with a clear error instead of being ignored.
 
 ### Why Control-Channel Comm Replies Exist
 
@@ -507,6 +509,9 @@ options.hostHandlers[data.type](data)
   v
 sendCommMessage(comm_id, { status: "ok", ...result })
 ```
+
+The RLM handlers include `rlm.run` for child creation and
+`rlm.list_subagents` for the current parent session's automatic child registry.
 
 Unknown types fail with `host request type "<type>" is not available in this session`.
 
@@ -600,6 +605,83 @@ completion_tokens = output
 Turns are counted as assistant messages in the child transcript.
 
 The answer is the child's final assistant text. This matches the RLM-1 training surface: the model stops calling tools and the final assistant text is the answer.
+
+### Parent-Scoped Subagent Registry
+
+The host exposes the current parent session's direct children without relying on
+Python task handles or a model-maintained file:
+
+```python
+children = await rlm.list_subagents()
+for child in children:
+    print(
+        child.rlm_child_id,
+        child.active_session_id,
+        child.session_id,
+        child.session_name,
+        child.session_dir,
+        child.status,
+    )
+```
+
+Entries have status `running` while the initial `rlm()` call is active and
+`completed` after a successful call returns. Every child also gets a readable,
+collision-resistant default `session_name` derived from its task and child ID,
+for example `subagent-check-the-http-api-a1b2c3d4`. The orchestrator can choose
+an exact name at spawn time with `await rlm("Check the API", name="api-reviewer")`;
+empty, overlong, or already-addressable names are rejected. Users and
+orchestrators can rename it later without changing the child ID. Failed or
+cancelled children are
+removed. Because the registry is owned by the TypeScript parent session, it
+remains available after kernel restart, state restore, or compaction even if the
+original Python `asyncio.Task` handle was lost.
+
+In daemon mode `active_session_id` identifies the retained child session. The
+same parent/orchestrator can continue it directly:
+
+```python
+children = await rlm.list_subagents()
+child = next((item for item in children if item.active_session_id), None)
+if child is not None:
+    await agent_message.send(child.session_name, "Check the latest change.")
+```
+
+That message starts an ordinary follow-up turn in the existing child context; it
+does not reopen or alter the completed `rlm()` result. Inline and in-process
+children have `active_session_id=None`, so they remain inspectable but are not
+addressable through daemon agent messaging.
+
+Delete a direct child by passing its registry entry or any exact registry
+identifier (`session_name`, `rlm_child_id`, `session_id`, or
+`active_session_id`):
+
+```python
+child = (await rlm.list_subagents())[0]
+deleted = await rlm.delete_subagent(child)
+# Equivalent when the child has a chosen name:
+# deleted = await rlm.delete_subagent("api-reviewer")
+```
+
+Deletion cancels a running child and waits for its runtime to close. A completed
+retained child closes immediately. In both cases it is removed from
+`rlm.list_subagents()` and, in daemon mode, from agent messaging and observation.
+Deletion does not erase the child's session transcript or artifacts on disk.
+Only direct children in the current parent registry can be selected; unknown or
+ambiguous selectors raise an error. The returned `RLMSubagent` is the deleted
+entry's final registry snapshot.
+
+Together these APIs provide the parent-scoped lifecycle operations: create with
+`rlm(...)`, read with `rlm.list_subagents()` and `agent_observe`, continue/update
+with `agent_message.send(...)`, and delete with `rlm.delete_subagent(...)`.
+
+The registry is scoped to the parent session transcript. Closing or replacing a
+daemon runtime cascades cleanup to its resident children; reopening that same
+parent session rehydrates its successfully completed children from the
+parent's artifact registry so they remain listable, messageable, and deletable.
+An unrelated new parent session inherits nothing, and inline children are not
+rehydrated. Deletion writes a durable tombstone before it reports success, so a
+deleted child stays removed while its transcript and artifacts remain on disk.
+There is no task/result migration or general cross-session reopen API.
 
 ### Cost Accounting
 

@@ -13,17 +13,19 @@ const daemonClientMock = vi.hoisted(() => {
 		message?: string;
 		schedule?: string;
 		prompt?: string;
+		includeInactive?: boolean;
 		sessionPath?: string;
 		config?: { extensionFlagValues?: Record<string, boolean | string> };
 	};
 	type Response =
-		| { type: "response"; command: string; success: true }
+		| { type: "response"; command: string; success: true; data?: unknown }
 		| { type: "response"; command: string; success: false; error: string };
 
 	const instances: MockDaemonClient[] = [];
 	const behavior = {
 		promptSucceeds: false,
 		emitStaleAgentEndOnAttach: false,
+		sessions: [] as Array<Record<string, unknown>>,
 	};
 
 	class MockDaemonClient {
@@ -41,6 +43,9 @@ const daemonClientMock = vi.hoisted(() => {
 
 		async request(command: Command): Promise<Response> {
 			this.requests.push(command);
+			if (command.type === "list") {
+				return { type: "response", command: command.type, success: true, data: { sessions: behavior.sessions } };
+			}
 			if (command.type === "attach" && behavior.emitStaleAgentEndOnAttach) {
 				this.emitMessage({ type: "session_event", activeSessionId: "active-1", event: { type: "agent_end" } });
 			}
@@ -95,9 +100,11 @@ describe("daemon command", () => {
 	let consoleErrorMessages: unknown[];
 
 	beforeEach(() => {
+		process.exitCode = undefined;
 		daemonClientMock.instances.length = 0;
 		daemonClientMock.behavior.promptSucceeds = false;
 		daemonClientMock.behavior.emitStaleAgentEndOnAttach = false;
+		daemonClientMock.behavior.sessions = [];
 		consoleErrorMessages = [];
 		vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null | undefined) => {
 			throw new Error(`exit ${code}`);
@@ -109,13 +116,14 @@ describe("daemon command", () => {
 	});
 
 	afterEach(() => {
+		process.exitCode = undefined;
 		vi.restoreAllMocks();
 	});
 
 	it("cleans prompt listeners when the prompt request fails", async () => {
 		await expect(
 			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "prompt", "active-1", "hello"]),
-		).rejects.toThrow("exit 1");
+		).resolves.toBe(true);
 
 		const client = daemonClientMock.instances[0];
 		expect(client?.messageListenerCountAtClose).toBe(0);
@@ -257,12 +265,12 @@ describe("daemon command", () => {
 	it("rejects unknown send options instead of folding them into the message", async () => {
 		await expect(
 			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "send", "worker", "--bogus", "hello"]),
-		).rejects.toThrow("exit 1");
+		).resolves.toBe(true);
 
 		expect(daemonClientMock.instances[0]?.requests).toEqual([]);
 		expect(
 			consoleErrorMessages.some(
-				(message) => typeof message === "string" && message.includes("Unknown option for daemon send: --bogus"),
+				(message) => typeof message === "string" && message.includes("Unknown option for send: --bogus"),
 			),
 		).toBe(true);
 	});
@@ -315,10 +323,32 @@ describe("daemon command", () => {
 		});
 	});
 
+	it("rejects conflicting send delivery modes", async () => {
+		await expect(
+			handleDaemonCommand([
+				"daemon",
+				"--socket",
+				"/tmp/prime-agent.sock",
+				"send",
+				"--steer",
+				"--follow-up",
+				"worker",
+				"hello",
+			]),
+		).resolves.toBe(true);
+
+		expect(daemonClientMock.instances[0]?.requests).toEqual([]);
+		expect(
+			consoleErrorMessages.some(
+				(message) => typeof message === "string" && message.includes("Only one send delivery mode"),
+			),
+		).toBe(true);
+	});
+
 	it("rejects extra agent-messages status arguments", async () => {
 		await expect(
 			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "agent-messages", "pause", "active-1"]),
-		).rejects.toThrow("exit 1");
+		).resolves.toBe(true);
 
 		expect(daemonClientMock.instances[0]?.requests).toEqual([]);
 		expect(
@@ -376,7 +406,37 @@ describe("daemon command", () => {
 			prompt: "check status",
 		});
 	});
+
+	it("resolves agent names before filtering scheduled prompts", async () => {
+		daemonClientMock.behavior.sessions = [makeSessionSummary("active-1", "session-1", "alpha")];
+
+		await expect(
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "--json", "cron", "list", "alpha"]),
+		).resolves.toBe(true);
+
+		expect(daemonClientMock.instances[0]?.requests).toEqual([
+			{ type: "list" },
+			{ type: "cron_list", activeSessionId: "active-1", includeInactive: false },
+		]);
+	});
 });
+
+function makeSessionSummary(activeSessionId: string, sessionId: string, sessionName: string): Record<string, unknown> {
+	return {
+		id: activeSessionId,
+		activeSessionId,
+		sessionId,
+		sessionName,
+		cwd: "/tmp/project",
+		lifecycle: "ready",
+		activity: "idle",
+		isStreaming: false,
+		isCompacting: false,
+		attachedClients: 0,
+		messageCount: 0,
+		pendingMessageCount: 0,
+	};
+}
 
 async function flushPromises(): Promise<void> {
 	await Promise.resolve();

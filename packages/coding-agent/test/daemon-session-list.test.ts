@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, it } from "vitest";
+import type { AgentCronJob } from "../src/core/cron-jobs.js";
 import type { SessionInfo } from "../src/core/session-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import {
@@ -74,6 +75,34 @@ describe("buildSessionList", () => {
 		expect(entries[0]?.hasRunningRlmChildren).toBe(true);
 	});
 
+	it("marks sessions with active standard or RLM heartbeats", () => {
+		const messages = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
+		const summaryState = { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"];
+		const activeSessionIds = ["heartbeat", "rlm-heartbeat", "paused-heartbeat", "cron"];
+		const entries = buildSessionList(
+			activeSessionIds.map((activeSessionId) => makeState({ activeSessionId, messages, summaryState })),
+			[],
+			[
+				makeCronJob({ id: "heartbeat-job", activeSessionId: "heartbeat", source: "heartbeat" }),
+				makeCronJob({ id: "rlm-job", activeSessionId: "rlm-heartbeat", source: "rlm_heartbeat" }),
+				makeCronJob({
+					id: "paused-job",
+					activeSessionId: "paused-heartbeat",
+					source: "heartbeat",
+					status: "paused",
+				}),
+				makeCronJob({ id: "cron-job", activeSessionId: "cron", source: "cron" }),
+			],
+		);
+
+		expect(Object.fromEntries(entries.map((entry) => [entry.id, entry.hasActiveHeartbeat]))).toEqual({
+			heartbeat: true,
+			"rlm-heartbeat": true,
+			"paused-heartbeat": undefined,
+			cron: undefined,
+		});
+	});
+
 	it("counts accepted in-flight agent prompts as pending work", () => {
 		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
 		const summary = summaryForActiveSession(
@@ -106,6 +135,40 @@ describe("buildSessionList", () => {
 			[],
 		);
 		expect(entries[0]?.activity).toBe("idle");
+	});
+
+	it("marks a retained completed subagent with an active RLM heartbeat", () => {
+		const messages = [{ role: "user", content: "initialize a heartbeat" }] as unknown as AgentMessage[];
+		const entries = buildSessionList(
+			[
+				makeState({
+					activeSessionId: "parent",
+					sessionId: "parent-session",
+					messages,
+				}),
+				makeState({
+					activeSessionId: "child",
+					sessionId: "child-session",
+					sessionFile: "/tmp/child.jsonl",
+					messages,
+					metadata: {
+						kind: "subagent",
+						createdAt: 1,
+						parentActiveSessionId: "parent",
+						parentSessionId: "parent-session",
+						rlmChildId: "child-1",
+					},
+				}),
+			],
+			[],
+			[makeCronJob({ id: "rlm-job", activeSessionId: "child", source: "rlm_heartbeat" })],
+		);
+
+		expect(entries.find((entry) => entry.id === "child")).toMatchObject({
+			runtimeKind: "subagent",
+			activity: "idle",
+			hasActiveHeartbeat: true,
+		});
 	});
 
 	it("merges active records with saved sessions and marks inactive sessions", () => {
@@ -548,5 +611,23 @@ function makeSessionInfo(overrides: Pick<SessionInfo, "path" | "id"> & Partial<S
 		firstMessage: "hello",
 		allMessagesText: "hello world",
 		agentStatus: overrides.agentStatus,
+	};
+}
+
+function makeCronJob(overrides: Pick<AgentCronJob, "id" | "activeSessionId"> & Partial<AgentCronJob>): AgentCronJob {
+	return {
+		id: overrides.id,
+		status: overrides.status ?? "active",
+		source: overrides.source,
+		activeSessionId: overrides.activeSessionId,
+		sessionId: `session-${overrides.activeSessionId}`,
+		sessionFile: `/tmp/${overrides.activeSessionId}.jsonl`,
+		cwd: "/tmp/project",
+		prompt: "Check for follow-up work",
+		schedule: { kind: "interval", expression: "every 5m", intervalMs: 300_000 },
+		createdAt: "2026-05-01T00:00:00.000Z",
+		updatedAt: "2026-05-01T00:00:00.000Z",
+		nextRunAt: "2026-05-01T00:05:00.000Z",
+		runCount: 0,
 	};
 }

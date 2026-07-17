@@ -23,7 +23,6 @@ import type {
 	AutocompleteItem,
 	AutocompleteProvider,
 	EditorComponent,
-	EditorPasteSnapshot,
 	Keybinding,
 	KeyId,
 	MarkdownTheme,
@@ -51,6 +50,11 @@ import {
 } from "@earendil-works/pi-tui";
 import { spawn, spawnSync } from "child_process";
 import {
+	buildDaemonUpdateRestartReport,
+	launchDaemonUpdateRestartCoordinator,
+	resolveDaemonUpdateRestartSocketPath,
+} from "../../cli/daemon-update-restart.js";
+import {
 	APP_NAME,
 	APP_TITLE,
 	getAgentDir,
@@ -64,12 +68,21 @@ import {
 } from "../../config.js";
 import { AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL, isAgentSessionMessage } from "../../core/agent-messages.js";
 import {
+	type AgentTracePreviewResult,
+	type AgentTraceUploadAllResult,
 	type AgentTraceUploadResult,
 	getPrimeAgentTraceCredential,
+	previewAgentTraceFile,
 	uploadAgentTraceFile,
+	uploadAllAgentTraces,
 } from "../../core/agent-traces.js";
 import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
-import { type AgentCronJob, DEFAULT_HEARTBEAT_DELIVERY_MODE, parseHeartbeatCommand } from "../../core/cron-jobs.js";
+import {
+	type AgentCronJob,
+	type AgentHeartbeatManagementAction,
+	DEFAULT_HEARTBEAT_DELIVERY_MODE,
+	parseHeartbeatCommand,
+} from "../../core/cron-jobs.js";
 import type {
 	AutocompleteProviderFactory,
 	ContextUsage,
@@ -119,6 +132,7 @@ import type {
 	AgentConnection,
 	AgentConnectionExtensionUiRequest,
 	AgentConnectionExtensionUiResponse,
+	AgentConnectionHeartbeat,
 	AgentConnectionModel,
 	AgentConnectionQueueState,
 	AgentConnectionResourceDiagnostic,
@@ -170,6 +184,7 @@ import { ExtensionEditorComponent } from "./components/extension-editor.js";
 import { ExtensionInputComponent } from "./components/extension-input.js";
 import { ExtensionSelectorComponent } from "./components/extension-selector.js";
 import { FooterComponent } from "./components/footer.js";
+import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
@@ -195,6 +210,7 @@ import type {
 	InteractiveModeUiServices,
 } from "./interactive-mode-services.js";
 import { type OnboardingStartupState, shouldRunOnboarding, shouldRunPrimeCliOnboardingSplash } from "./onboarding.js";
+import type { ClientPromptStashStore, PromptStash, PromptStashState } from "./prompt-stash-state.js";
 import { formatResumeHint } from "./resume-hint.js";
 import {
 	getAvailableThemes,
@@ -218,12 +234,6 @@ import { setWorkingPulseFrame, WORKING_ICON_INTERVAL_MS } from "./theme/working-
 interface Expandable {
 	setExpanded(expanded: boolean): void;
 }
-
-type PromptStash = {
-	text: string;
-	expandedText?: string;
-	pasteSnapshot?: EditorPasteSnapshot;
-};
 
 interface PendingToolCallRenderInput {
 	id: string;
@@ -302,6 +312,7 @@ export function mergeChildAgentSnapshots(
 		...incoming,
 		parentId: incoming.parentId ?? previous.parentId,
 		activeSessionId: incoming.activeSessionId ?? previous.activeSessionId,
+		sessionName: incoming.sessionName ?? previous.sessionName,
 		durationMs: incoming.durationMs ?? previous.durationMs,
 		answerPreview: incoming.answerPreview ?? previous.answerPreview,
 		toolUseCount:
@@ -323,6 +334,7 @@ function childAgentSummaryChanged(
 	const nextTokens = next.tokenCount === undefined ? undefined : formatTokenCount(next.tokenCount);
 	return (
 		previous.parentId !== next.parentId ||
+		previous.sessionName !== next.sessionName ||
 		previous.label !== next.label ||
 		previous.status !== next.status ||
 		previous.durationMs !== next.durationMs ||
@@ -461,6 +473,11 @@ type GoalAnnouncementSnapshot = {
 
 type ModelFallbackWarningAction = "show" | "suppress";
 
+interface OnboardingSplashHandle {
+	showProgress(message: string): void;
+	dismiss(): void;
+}
+
 const THINKING_LEVEL_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	off: "No reasoning",
 	minimal: "Very brief reasoning",
@@ -557,9 +574,10 @@ function getPayloadWorkingIndicatorOptions(
 	};
 }
 
-function updateArgsIncludeSelf(args: readonly string[]): boolean {
+export function updateArgsIncludeSelf(args: readonly string[]): boolean {
 	let selfFlag = false;
 	let extensionsOnlyFlag = false;
+	let positional: string | undefined;
 	for (let index = 0; index < args.length; index++) {
 		const arg = args[index];
 		if (arg === "--self") {
@@ -569,6 +587,10 @@ function updateArgsIncludeSelf(args: readonly string[]): boolean {
 		} else if (arg === "--extension") {
 			extensionsOnlyFlag = true;
 			index++;
+		} else if (arg === "--daemon-socket") {
+			index++;
+		} else if (arg && !arg.startsWith("-") && positional === undefined) {
+			positional = arg;
 		}
 	}
 	if (selfFlag) {
@@ -577,7 +599,6 @@ function updateArgsIncludeSelf(args: readonly string[]): boolean {
 	if (extensionsOnlyFlag) {
 		return false;
 	}
-	const positional = args.find((arg) => !arg.startsWith("-"));
 	if (!positional) {
 		return true;
 	}
@@ -602,6 +623,18 @@ export function buildUpdateRelaunchArgs(args: readonly string[], sessionFile: st
 	return relaunchArgs;
 }
 
+export function buildUpdateChildArgs(args: readonly string[], daemonSocketPath: string): string[] {
+	return args.includes("--daemon-socket") ? [...args] : [...args, "--daemon-socket", daemonSocketPath];
+}
+
+export function resolveInteractiveUpdateDaemonSocketPath(
+	args: readonly string[],
+	activeDaemonSocketPath: string,
+): string {
+	const socketFlagIndex = args.indexOf("--daemon-socket");
+	return socketFlagIndex === -1 ? activeDaemonSocketPath : (args[socketFlagIndex + 1] ?? activeDaemonSocketPath);
+}
+
 /**
  * Options for InteractiveMode initialization.
  */
@@ -622,6 +655,8 @@ export interface InteractiveModeOptions {
 	verbose?: boolean;
 	/** Agent execution boundary. InteractiveMode never talks directly to AgentSession for core execution. */
 	agentConnection: AgentConnection;
+	/** Exact daemon socket to preserve across an interactive self-update restart. */
+	daemonSocketPath?: string;
 	/**
 	 * Local-only host for in-process extension binding and callback-bearing session operations.
 	 * This must remain optional adapter glue, not a generic execution dependency.
@@ -645,6 +680,10 @@ export interface InteractiveModeOptions {
 	agentsViewOwnsStartupNotices?: boolean;
 	/** Open the read-only detail view for this subagent node right after startup. */
 	initialSubagentNodeId?: string;
+	/** Client-owned stash store shared across chat views in this TUI process. */
+	promptStashStore?: ClientPromptStashStore;
+	/** Initial stable session id used to scope prompt stash state. */
+	promptStashSessionId?: string;
 }
 
 export type InteractiveModeRunResult = "agents_view";
@@ -666,7 +705,9 @@ export class InteractiveMode {
 	private sideQuestionContainer: Container;
 	private defaultEditor: CustomEditor;
 	private editor: EditorComponent;
-	private promptStash: PromptStash | undefined;
+	private readonly promptStashStore: ClientPromptStashStore | undefined;
+	private promptStashSessionId: string | undefined;
+	private promptStashState: PromptStashState;
 	private editorComponentFactory: EditorFactory | undefined;
 	private autocompleteProvider: AutocompleteProvider | undefined;
 	private autocompleteProviderWrappers: AutocompleteProviderFactory[] = [];
@@ -775,6 +816,12 @@ export class InteractiveMode {
 	private connectionState: AgentConnectionState | undefined;
 	private connectionResourceSnapshot: AgentConnectionResourceSnapshot | undefined;
 	private sessionHasMessages = false;
+	private heartbeats: AgentConnectionHeartbeat[] = [];
+	private heartbeatRefreshPromise: Promise<void> | undefined;
+	private heartbeatRefreshRequested = false;
+	private heartbeatManager: HeartbeatManagerComponent | undefined;
+	private heartbeatManagerHandle: OverlayHandle | undefined;
+	private heartbeatManagerRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 
 	// Registry of images pasted this session, keyed by the `[image #N]` marker
 	// shown to the user. Insertion-ordered; the bytes persist (bounded by
@@ -794,6 +841,7 @@ export class InteractiveMode {
 	// Auto-retry state
 	private retryLoader: Loader | undefined = undefined;
 	private retryCountdown: CountdownTimer | undefined = undefined;
+	private traceUploadAllAbortController: AbortController | undefined = undefined;
 
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
@@ -851,6 +899,13 @@ export class InteractiveMode {
 		}
 		this.uiServices = uiServices;
 		this.agentConnection = options.agentConnection;
+		this.promptStashStore = options.promptStashStore;
+		this.promptStashSessionId = options.promptStashSessionId;
+		this.promptStashState =
+			this.promptStashStore && this.promptStashSessionId
+				? this.promptStashStore.forSession(this.promptStashSessionId)
+				: {};
+		this.hydratePromptStash();
 		this.localSessionHost = options.localSessionHost;
 		this.bindLocalSessionExtensions = options.bindLocalSessionExtensions ?? options.localSessionHost !== undefined;
 		if (this.bindLocalSessionExtensions && !options.localSessionHost) {
@@ -929,6 +984,43 @@ export class InteractiveMode {
 		// Register themes from resource loader and initialize
 		setRegisteredThemes(this.uiServices.getThemes());
 		initTheme(this.settingsManager.getTheme(), true);
+	}
+
+	private get promptStash(): PromptStash | undefined {
+		return this.promptStashState.stash;
+	}
+
+	private set promptStash(stash: PromptStash | undefined) {
+		this.promptStashState.stash = stash;
+	}
+
+	private hydratePromptStash(): void {
+		const stash = this.promptStash;
+		if (!stash) {
+			return;
+		}
+		for (const [markerId, image] of stash.images ?? []) {
+			this.pastedImages.set(markerId, image);
+		}
+		for (const markerId of imageMarkerIds(stash.text)) {
+			this.nextImageMarkerId = Math.max(this.nextImageMarkerId, markerId + 1);
+		}
+	}
+
+	private bindPromptStashSession(sessionId: string): void {
+		if (!this.promptStashStore || this.promptStashSessionId === sessionId) {
+			return;
+		}
+		this.releasePromptStashSession();
+		this.promptStashSessionId = sessionId;
+		this.promptStashState = this.promptStashStore.forSession(sessionId);
+		this.hydratePromptStash();
+	}
+
+	private releasePromptStashSession(): void {
+		if (this.promptStashStore && this.promptStashSessionId) {
+			this.promptStashStore.release(this.promptStashSessionId, this.promptStashState);
+		}
 	}
 
 	private getAutocompleteSourceTag(sourceInfo?: AgentConnectionSourceInfo): string | undefined {
@@ -1391,7 +1483,7 @@ export class InteractiveMode {
 			// the text was restored to the editor by onboarding, history, or a retry.
 			const images = this.collectImagesFor(userInput);
 			try {
-				await this.agentConnection.prompt(userInput, { images });
+				await this.agentConnection.prompt(userInput, { streamingBehavior: "steer", images });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -1446,15 +1538,23 @@ export class InteractiveMode {
 		return true;
 	}
 
+	private async showOnboardingModelSelection(splash: OnboardingSplashHandle): Promise<void> {
+		try {
+			await this.showConfigurationMenu("models");
+		} finally {
+			splash.dismiss();
+		}
+	}
+
 	private async runOnboardingFlow(showPrimeCliSplash = this.shouldRunPrimeCliOnboardingSplash()): Promise<void> {
 		this.modelRegistry.refresh();
 		if (showPrimeCliSplash) {
-			const shouldContinue = await this.showOnboardingModelSelectionSplash();
-			if (!shouldContinue) {
+			const splash = await this.showOnboardingSplash("choose a model");
+			if (!splash) {
 				return;
 			}
 
-			await this.showConfigurationMenu("models");
+			await this.showOnboardingModelSelection(splash);
 			return;
 		}
 
@@ -1464,7 +1564,21 @@ export class InteractiveMode {
 			return;
 		}
 
-		await this.showConfigurationMenu("providers");
+		const splash = await this.showOnboardingSplash();
+		if (!splash) {
+			return;
+		}
+
+		splash.showProgress("Signing in to Prime Intellect...");
+		const authResult = await this.createAuthFlows().runPrimeInferenceLogin();
+		if (authResult.status !== "success") {
+			splash.dismiss();
+			return;
+		}
+
+		splash.showProgress("Preparing models...");
+		await this.prepareForModelSelectionAfterLogin(authResult);
+		await this.showOnboardingModelSelection(splash);
 	}
 
 	private getMarkdownThemeWithSettings(): MarkdownTheme {
@@ -2209,7 +2323,38 @@ export class InteractiveMode {
 		this.connectionResourceSnapshot = resources;
 	}
 
+	private refreshHeartbeatCatalog(): Promise<void> {
+		if (this.heartbeatRefreshPromise) {
+			this.heartbeatRefreshRequested = true;
+			return this.heartbeatRefreshPromise;
+		}
+		const connection = this.agentConnection;
+		const refresh = (async () => {
+			do {
+				this.heartbeatRefreshRequested = false;
+				const heartbeats = await connection.listHeartbeats();
+				if (this.agentConnection !== connection) return;
+				this.applyHeartbeatCatalog(heartbeats);
+			} while (this.heartbeatRefreshRequested);
+		})().finally(() => {
+			if (this.heartbeatRefreshPromise === refresh) {
+				this.heartbeatRefreshPromise = undefined;
+			}
+		});
+		this.heartbeatRefreshPromise = refresh;
+		return refresh;
+	}
+
+	private applyHeartbeatCatalog(heartbeats: AgentConnectionHeartbeat[]): void {
+		this.heartbeats = heartbeats;
+		this.heartbeatManager?.setHeartbeats(heartbeats);
+		this.scheduleHeartbeatManagerRefresh();
+		this.childAgentSummary.invalidate();
+		this.ui.requestRender();
+	}
+
 	private applyConnectionStateSnapshot(state: AgentConnectionState): void {
+		this.bindPromptStashSession(state.sessionId);
 		this.connectionState = state;
 		// Don't touch contextUsageTokenBaseline: a mid-stream snapshot reflects only completed
 		// turns (the in-flight message isn't persisted yet), so the in-flight delta must keep
@@ -2355,6 +2500,7 @@ export class InteractiveMode {
 			this.isAgentCompacting() ||
 			this.isBashRunning() ||
 			this.getRetryAttempt() > 0 ||
+			this.traceUploadAllAbortController !== undefined ||
 			this.sideQuestionEvent?.status === "running"
 		);
 	}
@@ -2414,7 +2560,7 @@ export class InteractiveMode {
 			this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		}
 		this.subscribeToAgent();
-		await this.refreshConnectionQueue();
+		await Promise.all([this.refreshConnectionQueue(), this.refreshHeartbeatCatalog()]);
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
@@ -2944,6 +3090,7 @@ export class InteractiveMode {
 
 	private resetExtensionUI(): void {
 		this.cancelActiveConnectionExtensionUiRequests();
+		this.closeHeartbeatManager();
 		if (this.extensionSelector) {
 			this.hideExtensionSelector();
 		}
@@ -3575,6 +3722,9 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
 		this.defaultEditor.onAction("app.subagents.focus", () => this.focusChildAgentSummary());
+		this.defaultEditor.onAction("app.heartbeats.open", () => {
+			void this.showHeartbeatManager();
+		});
 		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
 		this.defaultEditor.onAction("app.prompt.stash", () => this.handlePromptStash());
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
@@ -3628,10 +3778,12 @@ export class InteractiveMode {
 			return;
 		}
 		const pasteSnapshot = this.editor.getPasteSnapshot?.();
+		const images = this.getPromptStashImages(text);
 		this.promptStash = {
 			text,
 			expandedText: pasteSnapshot ? (this.editor.getExpandedText?.() ?? text) : undefined,
 			pasteSnapshot,
+			...(images.length > 0 ? { images } : {}),
 		};
 		this.editor.setText("");
 		this.showStatus("Stashed prompt");
@@ -3653,6 +3805,17 @@ export class InteractiveMode {
 		}
 		this.showStatus("Restored stashed prompt");
 		return true;
+	}
+
+	private getPromptStashImages(text: string): readonly (readonly [number, ImageContent])[] {
+		const images: Array<readonly [number, ImageContent]> = [];
+		for (const markerId of imageMarkerIds(text)) {
+			const image = this.pastedImages.get(markerId);
+			if (image) {
+				images.push([markerId, image]);
+			}
+		}
+		return images;
 	}
 
 	private async handleClipboardImagePaste(): Promise<void> {
@@ -3967,6 +4130,11 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
+				if (commandName === "heartbeats") {
+					this.editor.setText("");
+					await this.showHeartbeatManager();
+					return;
+				}
 				if (commandName === "changelog" && !commandArgs) {
 					this.echoLocalCommand(text);
 					this.handleChangelogCommand();
@@ -4174,7 +4342,7 @@ export class InteractiveMode {
 					this.resetSideQuestion();
 					this.resetExtensionUI();
 					this.applyConnectionStateSnapshot(event.state);
-					this.resetCurrentSessionRenderState({ clearPromptStash: true });
+					this.resetCurrentSessionRenderState();
 					await this.rebindCurrentSession();
 					await this.renderInitialMessages();
 					this.ui.requestRender();
@@ -4196,6 +4364,11 @@ export class InteractiveMode {
 						event.status === "connected" ? "Daemon reconnected" : "Daemon connection lost; reconnecting…",
 						event.status === "reconnecting" ? "warning" : "dim",
 					);
+					if (event.status === "connected") {
+						await this.refreshHeartbeatCatalog();
+					}
+				} else if (event.type === "heartbeats_changed") {
+					await this.refreshHeartbeatCatalog();
 				} else if (event.type === "closed") {
 					this.showError(event.error ?? "Agent connection closed");
 				}
@@ -5145,30 +5318,14 @@ export class InteractiveMode {
 	}
 
 	private getTrayHeartbeatLabel(): string | undefined {
-		const heartbeat = this.connectionState?.heartbeat;
-		if (!heartbeat) {
+		if (this.heartbeats.length === 0) {
 			return undefined;
 		}
-		const schedule = this.formatHeartbeatScheduleLabel(heartbeat);
-		const suffix = schedule ? ` (${schedule})` : "";
-		switch (heartbeat.status) {
-			case "active":
-				return `Heartbeat active${suffix}`;
-			case "paused":
-				return `Heartbeat paused${suffix}`;
-			case "completed":
-			case "cancelled":
-				return undefined;
-			default: {
-				const _exhaustive: never = heartbeat.status;
-				return _exhaustive;
-			}
-		}
-	}
-
-	private formatHeartbeatScheduleLabel(heartbeat: AgentCronJob): string | undefined {
-		const schedule = heartbeat.schedule.expression.trim().replace(/^every\s+/i, "");
-		return schedule || undefined;
+		const paused = this.heartbeats.filter((heartbeat) => heartbeat.job.status === "paused").length;
+		const count = `${this.heartbeats.length} heartbeat${this.heartbeats.length === 1 ? "" : "s"}`;
+		const pausedLabel = paused ? ` · ${paused} paused` : "";
+		const shortcut = keyText("app.heartbeats.open");
+		return `${count}${pausedLabel}${shortcut ? ` (${shortcut})` : ""}`;
 	}
 
 	private getTrayGoalLabel(): string | undefined {
@@ -5395,6 +5552,7 @@ export class InteractiveMode {
 		const build = (child: AgentConnectionRlmChildAgentSnapshot): ChildAgentInspectorNode => ({
 			id: child.id,
 			activeSessionId: child.activeSessionId,
+			sessionName: child.sessionName,
 			label: child.label,
 			status: child.status,
 			durationMs: child.durationMs,
@@ -5887,6 +6045,7 @@ export class InteractiveMode {
 	}
 
 	private interruptOrClearInput(): void {
+		this.traceUploadAllAbortController?.abort(new Error("Trace upload cancelled"));
 		if (this.sideQuestionEvent?.status === "running") {
 			this.abortSideQuestion(this.sideQuestionEvent.id, true);
 		}
@@ -5990,6 +6149,7 @@ export class InteractiveMode {
 	 */
 	async teardownSessionUi(options: { preserveAltScreen?: boolean } = {}): Promise<void> {
 		await this.ui.terminal.drainInput(1000).catch(() => undefined);
+		this.releasePromptStashSession();
 		this.stop({ preserveAltScreen: options.preserveAltScreen });
 		stopThemeWatcher();
 	}
@@ -7091,13 +7251,6 @@ export class InteractiveMode {
 				hide();
 				resolve();
 			};
-			const restore = () => {
-				if (settled) return;
-				hidden = false;
-				handle?.setHidden(false);
-				handle?.focus();
-				this.ui.requestRender();
-			};
 			const refreshModels = (force: boolean) => {
 				const refreshPromise = this.getModelSelectorRefreshPromise({ force });
 				if (!refreshPromise) return;
@@ -7111,12 +7264,11 @@ export class InteractiveMode {
 			};
 			const authenticate = (provider: AuthSelectorProvider, tab: "providers" | "mcp-connections") => {
 				if (settled) return;
-				handle?.setHidden(true);
 				void authFlows
 					.loginProvider(provider)
 					.then(async (authResult) => {
 						if (settled) return;
-						restore();
+						handle?.focus();
 						menu.refreshAuthentication();
 						if (authResult.status !== "success") return;
 
@@ -7137,7 +7289,7 @@ export class InteractiveMode {
 						refreshModels(true);
 					})
 					.catch((error) => {
-						restore();
+						handle?.focus();
 						this.showError(error instanceof Error ? error.message : String(error));
 					});
 			};
@@ -7553,36 +7705,44 @@ export class InteractiveMode {
 		}
 	}
 
-	private showOnboardingModelSelectionSplash(): Promise<boolean> {
+	private showOnboardingSplash(continueActionLabel?: string): Promise<OnboardingSplashHandle | undefined> {
 		return new Promise((resolve) => {
 			let settled = false;
+			let dismissed = false;
 			let handle: OverlayHandle | undefined;
 			let selector: PrimeOnboardingSplashComponent | undefined;
-			const settle = (result: boolean) => {
+			const settle = (result: OnboardingSplashHandle | undefined) => {
 				if (settled) {
 					return;
 				}
 				settled = true;
 				resolve(result);
 			};
-			const close = () => {
+			const dismiss = () => {
+				if (dismissed) {
+					return;
+				}
+				dismissed = true;
 				selector?.dispose();
 				handle?.hide();
 				this.ui.requestRender();
 			};
 			selector = new PrimeOnboardingSplashComponent(
 				() => {
-					close();
-					settle(true);
+					selector?.dispose();
+					settle({
+						showProgress: (message) => selector?.showProgress(message),
+						dismiss,
+					});
 				},
 				() => {
-					close();
-					settle(false);
+					dismiss();
+					settle(undefined);
 				},
 				{
 					getRows: () => this.ui.terminal.rows,
 					requestRender: () => this.ui.requestRender(),
-					continueActionLabel: "choose a model",
+					...(continueActionLabel ? { continueActionLabel } : {}),
 				},
 			);
 			handle = this.ui.showOverlay(selector, {
@@ -7742,16 +7902,25 @@ export class InteractiveMode {
 		const updateArgs = parseCommandArgs(args);
 		const includesSelf = updateArgsIncludeSelf(updateArgs);
 		const updateCwd = this.getCurrentCwd();
+		const daemonSocketPath = resolveInteractiveUpdateDaemonSocketPath(
+			updateArgs,
+			resolveDaemonUpdateRestartSocketPath(this.options.daemonSocketPath),
+		);
+		const updateChildArgs = includesSelf ? buildUpdateChildArgs(updateArgs, daemonSocketPath) : updateArgs;
 		this.stopWorkingLoader();
 		await this.ui.terminal.drainInput(1000).catch(() => undefined);
 		this.ui.stop();
 
 		const updateEnv = includesSelf ? { ...process.env, [SELF_UPDATE_INTERACTIVE_CHILD_ENV]: "1" } : process.env;
-		const updateResult = spawnSync(process.execPath, [...process.execArgv, entrypoint, "update", ...updateArgs], {
-			stdio: "inherit",
-			cwd: updateCwd,
-			env: updateEnv,
-		});
+		const updateResult = spawnSync(
+			process.execPath,
+			[...process.execArgv, entrypoint, "update", ...updateChildArgs],
+			{
+				stdio: "inherit",
+				cwd: updateCwd,
+				env: updateEnv,
+			},
+		);
 		const updateExitCode = updateResult.status ?? (updateResult.signal ? 1 : 0);
 		const selfUpdateNotAttempted =
 			includesSelf && !updateResult.error && updateExitCode === SELF_UPDATE_NOT_ATTEMPTED_EXIT_CODE;
@@ -7775,6 +7944,27 @@ export class InteractiveMode {
 				await this.options.onShutdown?.();
 			} catch {
 				// The update already completed; do not block relaunch on local teardown.
+			}
+			if (!updateResult.error && updateExitCode === 0) {
+				try {
+					const status = await launchDaemonUpdateRestartCoordinator({
+						socketPath: daemonSocketPath,
+						agentDir: getAgentDir(),
+						cwd: updateCwd,
+						originActiveSessionId: this.connectionState?.activeSessionId,
+					});
+					const report = buildDaemonUpdateRestartReport(status);
+					for (const message of report.info) {
+						console.log(message);
+					}
+					for (const warning of report.warnings) {
+						console.error(`Warning: ${warning}`);
+					}
+				} catch (error: unknown) {
+					console.error(
+						`Warning: updated, but could not coordinate the daemon restart (${error instanceof Error ? error.message : String(error)}).`,
+					);
+				}
 			}
 			const relaunchResult = spawnSync(process.execPath, [...process.execArgv, entrypoint, ...relaunchArgs], {
 				stdio: "inherit",
@@ -8195,9 +8385,9 @@ export class InteractiveMode {
 			case "missing_credentials":
 				return "Trace sharing needs a Prime API key. Run /traces login.";
 			case "no_session_file":
-				return "Trace sharing enabled. Current session will upload after the first assistant response.";
+				return "Current session has no persisted trace yet.";
 			case "empty_session":
-				return "Trace sharing enabled. Current session is empty.";
+				return "Current session trace is empty.";
 			case "invalid_session":
 				return `Trace upload skipped: ${result.message}.`;
 			case "too_large":
@@ -8216,7 +8406,83 @@ export class InteractiveMode {
 			sessionFile: state.sessionFile,
 			authStorage: this.modelRegistry.authStorage,
 			settingsManager: this.settingsManager,
+			requireEnabled: false,
 			reloadConfig: false,
+		});
+	}
+
+	private async previewCurrentTrace(): Promise<void> {
+		const state = await this.agentConnection.getState();
+		const result = await previewAgentTraceFile({ sessionFile: state.sessionFile });
+		let info: string;
+		switch (result.status) {
+			case "no_session_file":
+				info = "Trace preview is unavailable until the current session has a persisted assistant response.";
+				break;
+			case "empty_session":
+				info = "The current trace is empty.";
+				break;
+			case "invalid_session":
+			case "failed":
+				info = `Trace preview failed: ${result.message}.`;
+				break;
+			case "ready":
+				info = this.formatTracePreview(result);
+				break;
+		}
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(info, 1, 0));
+		this.ui.requestRender();
+	}
+
+	private formatTracePreview(result: Extract<AgentTracePreviewResult, { status: "ready" }>): string {
+		const lines = [
+			theme.bold("Trace Preview"),
+			theme.fg("dim", "Nothing has been uploaded by this command."),
+			"",
+			`${theme.fg("dim", "File:")} ${result.sessionFile}`,
+			`${theme.fg("dim", "Size:")} ${result.size.toLocaleString()} bytes`,
+			`${theme.fg("dim", "Uploadable:")} ${result.uploadable ? "Yes" : `No (limit ${result.maxBytes.toLocaleString()} bytes)`}`,
+			`${theme.fg("dim", "Endpoint:")} ${result.endpoint}`,
+			`${theme.fg("dim", "Session ID:")} ${result.sessionId}`,
+			`${theme.fg("dim", "Trace ID:")} ${result.traceId}`,
+		];
+		if (result.parentSessionId) {
+			lines.push(`${theme.fg("dim", "Parent session:")} ${result.parentSessionId}`);
+		}
+		if (result.gitRepo) {
+			lines.push(`${theme.fg("dim", "Git repository:")} ${result.gitRepo}`);
+		}
+		if (result.gitCommit) {
+			lines.push(`${theme.fg("dim", "Git commit:")} ${result.gitCommit}`);
+		}
+		lines.push("", theme.bold("Raw JSONL payload preview"));
+		if (result.contentPreview) {
+			lines.push(result.contentPreview);
+			if (result.truncated) {
+				lines.push("", theme.fg("dim", "Preview truncated; upload sends the complete file."));
+			}
+		} else {
+			lines.push(theme.fg("dim", "Payload omitted because the trace exceeds the upload limit."));
+		}
+		return lines.join("\n");
+	}
+
+	private async uploadAllTraces(sessionDir?: string, signal?: AbortSignal): Promise<AgentTraceUploadAllResult> {
+		return uploadAllAgentTraces({
+			authStorage: this.modelRegistry.authStorage,
+			settingsManager: this.settingsManager,
+			sessionDir,
+			requireEnabled: false,
+			reloadConfig: false,
+			signal,
+			onProgress: ({ completed, total }) => {
+				if (total > 0 && (completed === 0 || completed === total || completed % 10 === 0)) {
+					this.showStatus(
+						`Uploading traces: ${completed.toLocaleString()}/${total.toLocaleString()} (${keyText("app.clear")} to cancel)`,
+					);
+				}
+			},
 		});
 	}
 
@@ -8234,12 +8500,15 @@ export class InteractiveMode {
 			const info = [
 				theme.bold("Trace Sharing"),
 				"",
-				`${theme.fg("dim", "Status:")} ${this.settingsManager.getAgentTracesEnabled() ? "Enabled" : "Disabled"}`,
+				`${theme.fg("dim", "Automatic uploads:")} ${this.settingsManager.getAgentTracesEnabled() ? "Enabled" : "Disabled"}`,
 				`${theme.fg("dim", "Credential:")} ${credential?.label ?? "Not configured"}`,
 				`${theme.fg("dim", "Endpoint:")} ${resolvePrimeAgentTracesBaseUrl()}`,
 				`${theme.fg("dim", "Session file:")} ${state.sessionFile ?? "In-memory"}`,
 				"",
-				theme.fg("dim", "Commands: /traces on, /traces off, /traces upload, /traces login"),
+				theme.fg(
+					"dim",
+					"Commands: /traces on, /traces off, /traces preview, /traces upload-current, /traces upload-all, /traces login",
+				),
 			].join("\n");
 			this.chatContainer.addChild(new Spacer(1));
 			this.chatContainer.addChild(new Text(info, 1, 0));
@@ -8256,6 +8525,11 @@ export class InteractiveMode {
 
 		if (command === "login") {
 			await this.createAuthFlows().runPrimeAgentTracesLogin();
+			return;
+		}
+
+		if (command === "preview") {
+			await this.previewCurrentTrace();
 			return;
 		}
 
@@ -8276,18 +8550,18 @@ export class InteractiveMode {
 			this.settingsManager.setAgentTracesEnabled(true);
 			await this.settingsManager.flush();
 			const uploadResult = await this.uploadCurrentTraceOnce();
-			const uploadMessage = this.formatTraceUploadResult(uploadResult);
-			this.showStatus(
+			const uploadMessage =
 				uploadResult.status === "no_session_file" || uploadResult.status === "empty_session"
-					? uploadMessage
-					: `Trace sharing enabled. ${uploadMessage}`,
-			);
+					? "Current session will upload after the first assistant response."
+					: this.formatTraceUploadResult(uploadResult);
+			this.showStatus(`Trace sharing enabled. ${uploadMessage}`);
 			return;
 		}
 
-		if (command === "upload") {
-			if (!this.settingsManager.getAgentTracesEnabled()) {
-				this.showStatus("Trace sharing is disabled. Run /traces on first.");
+		if (command === "upload" || command === "upload-current") {
+			const credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
+			if (!credential) {
+				this.showError("Trace sharing needs a Prime API key. Run /traces login.");
 				return;
 			}
 			const uploadResult = await this.uploadCurrentTraceOnce();
@@ -8300,7 +8574,52 @@ export class InteractiveMode {
 			return;
 		}
 
-		this.showWarning("Usage: /traces [status|on|off|upload|login]");
+		if (command === "upload-all") {
+			const credential = await getPrimeAgentTraceCredential(this.modelRegistry.authStorage);
+			if (!credential) {
+				this.showError("Trace sharing needs a Prime API key. Run /traces login.");
+				return;
+			}
+			if (this.traceUploadAllAbortController) {
+				this.showWarning("A trace upload is already running. Cancel it before starting another.");
+				return;
+			}
+			const state = await this.agentConnection.getState();
+			const abortController = new AbortController();
+			this.traceUploadAllAbortController = abortController;
+			let result: AgentTraceUploadAllResult;
+			try {
+				result = await this.uploadAllTraces(state.sessionDir, abortController.signal);
+			} finally {
+				if (this.traceUploadAllAbortController === abortController) {
+					this.traceUploadAllAbortController = undefined;
+				}
+			}
+			if (abortController.signal.aborted) {
+				this.showStatus("Trace upload cancelled.");
+				return;
+			}
+			if (result.total === 0) {
+				this.showStatus("No persisted traces were found.");
+				return;
+			}
+			const summary = [
+				`Uploaded ${result.uploaded.toLocaleString()} of ${result.total.toLocaleString()} traces`,
+				result.skipped > 0 ? `${result.skipped.toLocaleString()} skipped` : undefined,
+				result.failed > 0 ? `${result.failed.toLocaleString()} failed` : undefined,
+				`${result.bytesStored.toLocaleString()} bytes stored`,
+			]
+				.filter((part): part is string => part !== undefined)
+				.join("; ");
+			if (result.failed > 0) {
+				this.showWarning(`${summary}. See ${getAgentTracesLogPath()} for details.`);
+			} else {
+				this.showStatus(`${summary}.`);
+			}
+			return;
+		}
+
+		this.showWarning("Usage: /traces [status|on|off|preview|upload|upload-current|upload-all|login]");
 	}
 
 	private async handleContextCommand(): Promise<void> {
@@ -8361,6 +8680,7 @@ export class InteractiveMode {
 				case "status": {
 					const heartbeat = await this.agentConnection.getHeartbeat();
 					this.patchConnectionState({ heartbeat: heartbeat ?? null });
+					await this.refreshHeartbeatCatalog();
 					this.showHeartbeat(heartbeat);
 					return;
 				}
@@ -8371,6 +8691,7 @@ export class InteractiveMode {
 						command.deliveryMode,
 					);
 					this.patchConnectionState({ heartbeat });
+					await this.refreshHeartbeatCatalog();
 					this.showStatus(
 						`Heartbeat set\nDelivery: ${heartbeat.deliveryMode ?? DEFAULT_HEARTBEAT_DELIVERY_MODE}\nNext run: ${heartbeat.nextRunAt ?? "-"}`,
 					);
@@ -8383,6 +8704,7 @@ export class InteractiveMode {
 						return;
 					}
 					this.patchConnectionState({ heartbeat });
+					await this.refreshHeartbeatCatalog();
 					this.showStatus("Heartbeat paused");
 					return;
 				}
@@ -8393,6 +8715,7 @@ export class InteractiveMode {
 						return;
 					}
 					this.patchConnectionState({ heartbeat });
+					await this.refreshHeartbeatCatalog();
 					this.showStatus(`Heartbeat resumed\nNext run: ${heartbeat.nextRunAt ?? "-"}`);
 					return;
 				}
@@ -8402,7 +8725,8 @@ export class InteractiveMode {
 						this.showStatus("No active heartbeat");
 						return;
 					}
-					this.patchConnectionState({ heartbeat });
+					this.patchConnectionState({ heartbeat: null });
+					await this.refreshHeartbeatCatalog();
 					this.showStatus("Heartbeat cleared");
 					return;
 				}
@@ -8410,6 +8734,91 @@ export class InteractiveMode {
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 		}
+	}
+
+	private async showHeartbeatManager(): Promise<void> {
+		if (this.heartbeatManagerHandle) {
+			this.heartbeatManagerHandle.focus();
+			return;
+		}
+		try {
+			await this.refreshHeartbeatCatalog();
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+			return;
+		}
+		const manager = new HeartbeatManagerComponent(this.heartbeats, {
+			getRows: () => this.ui.terminal.rows,
+			onAction: (heartbeat, action) => this.manageHeartbeat(heartbeat, action),
+			onClose: () => this.closeHeartbeatManager(),
+			requestRender: () => this.ui.requestRender(),
+		});
+		this.heartbeatManager = manager;
+		this.heartbeatManagerHandle = this.showFullPaneOverlay(manager, {
+			fullWidth: true,
+			suspendFullscreenMouse: true,
+		});
+		this.scheduleHeartbeatManagerRefresh();
+	}
+
+	private closeHeartbeatManager(): void {
+		if (this.heartbeatManagerRefreshTimer) {
+			clearTimeout(this.heartbeatManagerRefreshTimer);
+			this.heartbeatManagerRefreshTimer = undefined;
+		}
+		this.heartbeatManagerHandle?.hide();
+		this.heartbeatManagerHandle = undefined;
+		this.heartbeatManager = undefined;
+		this.ui.requestRender();
+	}
+
+	private scheduleHeartbeatManagerRefresh(): void {
+		if (this.heartbeatManagerRefreshTimer) {
+			clearTimeout(this.heartbeatManagerRefreshTimer);
+			this.heartbeatManagerRefreshTimer = undefined;
+		}
+		if (!this.heartbeatManager) {
+			return;
+		}
+		const nextRunAt = this.heartbeats
+			.filter((heartbeat) => heartbeat.job.status === "active" && heartbeat.job.nextRunAt)
+			.map((heartbeat) => Date.parse(heartbeat.job.nextRunAt!))
+			.filter(Number.isFinite)
+			.sort((left, right) => left - right)[0];
+		if (nextRunAt === undefined) {
+			return;
+		}
+		const untilNextRun = nextRunAt - Date.now();
+		const delay = untilNextRun > 0 ? Math.min(60_000, untilNextRun + 250) : 5_000;
+		this.heartbeatManagerRefreshTimer = setTimeout(() => {
+			this.heartbeatManagerRefreshTimer = undefined;
+			if (!this.heartbeatManager) {
+				return;
+			}
+			void this.refreshHeartbeatCatalog().catch(() => this.scheduleHeartbeatManagerRefresh());
+		}, delay);
+		this.heartbeatManagerRefreshTimer.unref?.();
+	}
+
+	private async manageHeartbeat(
+		heartbeat: AgentConnectionHeartbeat,
+		action: AgentHeartbeatManagementAction,
+	): Promise<void> {
+		const updated = await this.agentConnection.manageHeartbeat(
+			heartbeat.job.activeSessionId,
+			heartbeat.job.id,
+			action,
+		);
+		if (updated.source === "heartbeat" && updated.activeSessionId === this.connectionState?.activeSessionId) {
+			this.patchConnectionState({ heartbeat: action === "stop" ? null : updated });
+		}
+		const remaining = this.heartbeats.filter((entry) => entry.job.id !== updated.id);
+		this.applyHeartbeatCatalog(
+			updated.status === "active" || updated.status === "paused"
+				? [...remaining, { ...heartbeat, job: updated }]
+				: remaining,
+		);
+		void this.refreshHeartbeatCatalog().catch(() => undefined);
 	}
 
 	private showHeartbeat(job: AgentCronJob | undefined): void {
@@ -8548,6 +8957,7 @@ ${shortcutsKey ? `\`${shortcutsKey}\` quick shortcuts · ` : ""}\`/hotkeys\` ful
 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
 		const toggleThinking = this.getAppKeyDisplay("app.thinking.toggle");
 		const focusSubagents = this.getAppKeyDisplay("app.subagents.focus");
+		const manageHeartbeats = this.getAppKeyDisplay("app.heartbeats.open");
 		const externalEditor = this.getAppKeyDisplay("app.editor.external");
 		const promptStash = this.getAppKeyDisplay("app.prompt.stash");
 		const followUp = this.getAppKeyDisplay("app.message.followUp");
@@ -8594,6 +9004,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 | \`${expandTools}\` | Toggle tool output expansion |
 | \`${toggleThinking}\` | Toggle thinking block visibility |
 | \`${focusSubagents}\` | Open subagent inspector |
+| \`${manageHeartbeats}\` | Manage heartbeats |
 | \`${externalEditor}\` | Edit message in external editor |
 | \`${promptStash}\` | Stash or restore draft prompt |
 | \`${followUp}\` | Queue follow-up message |
@@ -8827,6 +9238,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		this.stopWorkingLoader();
 		this.stopWorkingPulse();
 		this.stopGoalTrayTimer();
+		this.closeHeartbeatManager();
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();
 		this.footerDataProvider.dispose();

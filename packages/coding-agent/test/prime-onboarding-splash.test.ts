@@ -91,6 +91,22 @@ describe("PrimeOnboardingSplashComponent", () => {
 		expect(output).not.toContain("Press Enter to login with Prime Intellect");
 	});
 
+	it("shows progress and ignores input while onboarding advances", () => {
+		const onSelect = vi.fn();
+		const onCancel = vi.fn();
+		const component = new PrimeOnboardingSplashComponent(onSelect, onCancel, { getRows: () => 36 });
+
+		component.showProgress("Preparing models...");
+		component.handleInput("\r");
+		component.handleInput("\x1b");
+
+		const output = stripAnsi(component.render(100).join("\n"));
+		expect(output).toContain("Preparing models...");
+		expect(output).not.toContain("Press Enter");
+		expect(onSelect).not.toHaveBeenCalled();
+		expect(onCancel).not.toHaveBeenCalled();
+	});
+
 	it("animates the splash at an interactive cadence", () => {
 		vi.useFakeTimers();
 		let renderRequests = 0;

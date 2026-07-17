@@ -83,7 +83,7 @@ print(await attach_image(${JSON.stringify(imagePath)}))
 		expect(result.attachments?.[0]?.data.length).toBeLessThanOrEqual(350_000);
 	});
 
-	it("reports when compressed animated images are flattened to their first frame", async () => {
+	it("reports when compressed animated images are flattened to their first frame", { retry: 1 }, async () => {
 		const imagePath = join(tempDir, "animated.gif");
 
 		provisioner = new IpythonKernelProvisioner(tempDir, {

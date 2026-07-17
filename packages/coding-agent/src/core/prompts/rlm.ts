@@ -28,7 +28,7 @@ const IPYTHON_CONTROL_PROMPT = [
 	"",
 	"Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, IPython kernel, and native call interface exposed to the model.",
 	"",
-	"RLM-native call contract for refined continual harness entries: installed Python skills are called from IPython as `await <skill_import>(...)` with keyword arguments, or as `<skill_import> ...` from shell when a CLI exists. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are reusable delegation specs; invoke them by turning the spec into a concise task prompt and starting `asyncio.create_task(rlm('sub-task'))` by default, then await the task only when its result is needed, or collect independent subagents with `await asyncio.gather(...)`. Use direct `await rlm('sub-task')` only when the result is immediately required. Do not invent non-native wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
+	"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are reusable delegation specs; invoke them by turning the spec into a concise task prompt and starting `asyncio.create_task(rlm('sub-task'))` by default, then await the task only when its result is needed, or collect independent subagents with `await asyncio.gather(...)`. Use direct `await rlm('sub-task')` only when the result is immediately required. Do not invent non-native wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
 	"",
 	"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `/refine` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
 ].join("\n");
@@ -40,7 +40,6 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	const activeTools = options.activeTools ?? [];
 	const hasIpython = options.activeTools === undefined ? true : activeTools.includes("ipython");
 	const canRunShellSkills = hasIpython || activeTools.includes("bash");
-	const hasAgentObserveSkill = installedSkills.includes("agent_observe");
 	const parts = [
 		"You are a general purpose agent that uses code to solve tasks.",
 		"You solve tasks by breaking down problems into sub-tasks, writing and executing code, observing results, and iterating one step at a time.",
@@ -59,9 +58,9 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	if (installedSkills.length > 0) {
 		const installed = installedSkills.map((skill) => `\`${skill}\``).join(", ");
 		if (hasIpython) {
-			skillLines.push(`Installed skills (pre-imported): ${installed}.`);
+			skillLines.push(`Installed Python skill modules (pre-imported): ${installed}.`);
 			skillLines.push(
-				"Each skill is an async function by the same name. Inspect with `help(<skill>)` or `inspect.signature(<skill>.run)`.",
+				"Read each skill's SKILL.md for its API. Inspect a module with `help(<skill>)` or `dir(<skill>)`, then inspect a documented callable with `inspect.signature(<skill>.<function>)`.",
 			);
 		} else if (canRunShellSkills) {
 			skillLines.push(`Installed skills available as shell commands: ${installed}.`);
@@ -85,10 +84,10 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		parts.push(
 			"",
 			"A callable `rlm` is already in your global namespace. It returns an `RLMResult` with `.answer` (string), `.usage`, `.turns`, and `.session_dir`. A direct `await rlm('sub-task')` is valid only when the result is immediately required.",
+			"Choose a stable child name with `await rlm('sub-task', name='api-reviewer')`; names must be non-empty and unique among addressable sessions. If omitted, the host generates a readable unique name.",
 			"Sub-agents should not block Prime Agent by default: start them with `task = asyncio.create_task(rlm('sub-task'))`, keep the task handle, continue any independent work, and await the task only when you need its result.",
-			hasAgentObserveSkill
-				? "For long-running fan-out, do not rely only on in-memory `asyncio.Task` handles: they can be lost if the kernel restarts or state is restored. Write a small disk registry under `os.environ.get('RLM_SESSION_DIR')` when set, or another explicit project path otherwise, with each subtask prompt/label and observed active session or child ids; recover status later with `agent_observe`."
-				: "For long-running fan-out, do not rely only on in-memory `asyncio.Task` handles: they can be lost if the kernel restarts or state is restored. Write a small disk registry under `os.environ.get('RLM_SESSION_DIR')` when set, or another explicit project path otherwise, with each subtask prompt/label and observed active session or child ids so work can be reconciled after restore.",
+			"For long-running fan-out, do not rely only on in-memory `asyncio.Task` handles: they can be lost if the kernel restarts or state is restored. Recover the current parent session's automatic child registry with `children = await rlm.list_subagents()`; each entry exposes `rlm_child_id`, `active_session_id`, `session_id`, `session_name`, `session_dir`, and `status`.",
+			"Delete a running or retained direct child with `await rlm.delete_subagent(child)` (or pass its name/ID); deletion cancels running work, closes the child runtime, and removes it from the registry and daemon addressability.",
 			"For parallel sub-agents, launch them together and collect them with normal Python async patterns such as `await asyncio.gather(rlm('task1'), rlm('task2'))`; `asyncio` is already imported.",
 			"For sub-agent work that can run in the background, keep the task handle from `asyncio.create_task(rlm('sub-task'))` so you do not block the main execution path; use normal task callbacks, `task.done()`, or `await task` later to observe completion and read the returned `RLMResult.answer`.",
 		);
@@ -116,9 +115,11 @@ export function buildSubagentGuidance(): string {
 		"You already have `rlm` in scope. This is about *when* to spawn one — which matters as much as how.",
 		"",
 		"Default to non-blocking subagents: create an `asyncio` task, keep the handle, continue independent work, and await only at the collection point where the result is needed.",
-		"For subagent work that must survive kernel restarts, state restore, or compaction, persist a disk-backed registry before or immediately after spawning: after importing `os` and `Path`, store the subtask label, prompt, start time, and any observed `activeSessionId`, `rlmChildId`, or `session_dir` under `Path(os.environ['RLM_SESSION_DIR'])` when that variable is set, or another explicit project path otherwise. Treat in-memory `asyncio.Task` objects as convenience handles only; after restore, reload the registry and recover status from live subagent sessions instead of assuming those task objects still exist.",
-		'If the `agent_observe` skill is installed, use it like the agents view to inspect live subagents without awaiting them: list agents with `await agent_observe.list_agents()`, filter `runtimeKind == "subagent"` and `parentSessionId` or `parentActiveSessionId`, and read bounded previews with `await agent_observe.recent_messages(target, limit=...)`.',
-		"If the `agent_message` skill is installed, live subagents are addressable like other active agents: list targets with `await agent_message.list_agents()` and send concise coordination or steering messages with `await agent_message.send(target, message, mode='auto')`; use `mode='steer'` only when you intend to interrupt current work.",
+		"The host automatically keeps a parent-scoped subagent registry across kernel restarts, state restore, and compaction. Recover it with `children = await rlm.list_subagents()` instead of maintaining a separate registry file or relying on lost `asyncio.Task` handles.",
+		"Successful subagent sessions remain in that registry after their initial `rlm()` call finishes, but only while the current parent session remains open. Failed or cancelled children are removed, and retained children close when their parent session closes.",
+		"Choose a child name at spawn time with `rlm('task', name='api-reviewer')`, or let the host generate a readable, unique default `session_name`. If the `agent_observe` skill is installed and a registry entry has `active_session_id`, inspect it by name with `await agent_observe.get_agent(child.session_name)` or read bounded previews with `await agent_observe.recent_messages(child.session_name, limit=...)`.",
+		"If the `agent_message` skill is installed and a registry entry has `active_session_id`, continue that same child by name with `await agent_message.send(child.session_name, message, mode='auto')`; use `mode='steer'` only when you intend to interrupt current work.",
+		"Delete a direct child by registry entry or selector with `await rlm.delete_subagent(child)` or `await rlm.delete_subagent('api-reviewer')`. Deleting a running child cancels it first; deleting any child closes its runtime, removes it from the parent registry, and makes it unavailable to messaging and observation.",
 		"",
 		"Reach for sub-agents when:",
 		"- you have independent sub-tasks that can run in parallel — fan them out with `asyncio.create_task(rlm('task'))` or collect a batch with `await asyncio.gather(rlm('task1'), rlm('task2'))` rather than working them one after another;",
@@ -129,9 +130,6 @@ export function buildSubagentGuidance(): string {
 		"",
 		"For example:",
 		"```python",
-		"from pathlib import Path",
-		"import os",
-		"",
 		"# Independent sub-tasks in parallel — each returns just its conclusion, not the files it read",
 		"auth, api = await asyncio.gather(",
 		"    rlm('Summarize how authentication works in this repo: entrypoints, token flow, and key files.'),",
@@ -143,12 +141,10 @@ export function buildSubagentGuidance(): string {
 		"print(res.answer)",
 		"",
 		"# Background — kick off a slow sub-task, keep working, collect it later",
-		"task = asyncio.create_task(rlm('Run the full test suite and report any failures with root causes.'))",
-		"# For long-running fan-out, also persist a label/prompt/id registry.",
-		"# Use RLM_SESSION_DIR when set; otherwise choose an explicit project path.",
-		"# Example: registry_root = Path(os.environ['RLM_SESSION_DIR']) if os.environ.get('RLM_SESSION_DIR') else Path('subagent-registry')",
-		"# registry_root.joinpath('subagents.jsonl').write_text(...)",
-		"# ... continue with other work while it runs ...",
+		"task = asyncio.create_task(rlm('Run the full test suite and report any failures with root causes.', name='test-runner'))",
+		"# The host registry remains available even if the Python task handle is later lost",
+		"children = await rlm.list_subagents()",
+		"# ... continue independent work ...",
 		"failures = (await task).answer",
 		"```",
 		"",

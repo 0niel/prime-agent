@@ -214,7 +214,7 @@ export default async function (pi: ExtensionAPI) {
 }
 ```
 
-This pattern makes the fetched models available during normal startup and to `pi --list-models`.
+This pattern makes the fetched models available during normal startup and to `prime-agent model list`.
 
 ### Extension Styles
 
@@ -1545,7 +1545,7 @@ Register or override a model provider dynamically. Useful for proxies, custom en
 
 Calls made during the extension factory function are queued and applied once the runner initialises. Calls made after that — for example from a command handler following a user setup flow — take effect immediately without requiring a `/reload`.
 
-If you need to discover models from a remote endpoint, prefer an async extension factory over deferring the fetch to `session_start`. pi waits for the factory before startup continues, so the registered models are available immediately, including to `pi --list-models`.
+If you need to discover models from a remote endpoint, prefer an async extension factory over deferring the fetch to `session_start`. pi waits for the factory before startup continues, so the registered models are available immediately, including to `prime-agent model list`.
 
 ```typescript
 // Register a new provider with custom models

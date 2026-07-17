@@ -44,6 +44,7 @@ const PANEL_PADDING_Y = 1;
 const FIELD_PADDING_X = 2;
 const ROW_PADDING_X = 2;
 const ROW_PADDING_Y = 1;
+const ANSI_RESET = "\x1b[0m";
 
 export function getMenuPanelInnerWidth(width: number): number {
 	const safeWidth = Math.max(PANEL_PADDING_X * 2 + 1, width);
@@ -202,7 +203,14 @@ function paddedBackgroundLine(
 	if (!background) {
 		return contentSpan + trailingSpan;
 	}
-	return background(contentSpan) + background(trailingSpan);
+	return applyBackground(contentSpan, background) + background(trailingSpan);
+}
+
+function applyBackground(text: string, background: (text: string) => string): string {
+	return text
+		.split(ANSI_RESET)
+		.map((segment) => background(segment))
+		.join(ANSI_RESET);
 }
 
 function surfaceLine(text: string, width: number, paddingX = PANEL_PADDING_X): string {

@@ -11,10 +11,12 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { appendRotatingLog, expandTildePath, getClientErrorLogPath, VERSION } from "../config.js";
-import { DaemonClient } from "../modes/daemon/daemon-client.js";
+import { getProcessStartId } from "../core/session-lease.js";
+import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js";
 import { DAEMON_PROTOCOL_VERSION } from "../modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
+import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
 
 export function isDaemonSessionSummary(value: unknown): value is SessionSummary {
 	if (!value || typeof value !== "object") {
@@ -104,19 +106,57 @@ export async function listActiveDaemonSessionSummaries(client: DaemonClient): Pr
 export class StaleDaemonError extends Error {
 	constructor(readonly socketPath: string) {
 		super(
-			`A background daemon from a different prime-agent version is running on ${socketPath} and can't be driven by ` +
-				`this version. Run "prime-agent daemon shutdown" to stop it, then retry.`,
+			`A background service from a different Prime Agent version is running on ${socketPath} and can't be driven by ` +
+				`this version. Run "prime-agent shutdown" to stop it, then retry.`,
 		);
 		this.name = "StaleDaemonError";
 	}
 }
 
-async function waitForDaemonGone(socketPath: string, timeoutMs = 5000, requireSocketCleanup = false): Promise<boolean> {
+interface DaemonProcessIdentity {
+	pid: number;
+	processStartId?: string;
+}
+
+const PROCESS_START_ID_POLL_INTERVAL_MS = 1000;
+
+function hasProcessIdentityExited(identity: DaemonProcessIdentity | undefined, verifyProcessStartId = true): boolean {
+	if (!identity) {
+		return true;
+	}
+	try {
+		process.kill(identity.pid, 0);
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ESRCH";
+	}
+	if (!identity.processStartId || !verifyProcessStartId) {
+		return false;
+	}
+	const currentStartId = getProcessStartId(identity.pid);
+	return currentStartId !== undefined && currentStartId !== identity.processStartId;
+}
+
+async function waitForDaemonGone(
+	socketPath: string,
+	timeoutMs = 5000,
+	requireSocketCleanup = false,
+	expectedIdentity?: DaemonProcessIdentity,
+): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
+	let nextProcessStartIdPollAt = 0;
+	const hasExpectedProcessExited = (forceStartIdPoll = false) => {
+		const now = Date.now();
+		const verifyProcessStartId = forceStartIdPoll || now >= nextProcessStartIdPollAt;
+		if (verifyProcessStartId) {
+			nextProcessStartIdPollAt = now + PROCESS_START_ID_POLL_INTERVAL_MS;
+		}
+		return hasProcessIdentityExited(expectedIdentity, verifyProcessStartId);
+	};
 	while (Date.now() < deadline) {
 		if (
 			!(await canConnectToDaemon(socketPath, 250)) &&
-			(!requireSocketCleanup || process.platform === "win32" || !existsSync(socketPath))
+			(!requireSocketCleanup || process.platform === "win32" || !existsSync(socketPath)) &&
+			hasExpectedProcessExited()
 		) {
 			return true;
 		}
@@ -125,15 +165,29 @@ async function waitForDaemonGone(socketPath: string, timeoutMs = 5000, requireSo
 	// A daemon can exit without removing its Unix socket (for example, after a crash
 	// during shutdown). Once the cleanup grace has elapsed, a non-listening socket
 	// is safe for the replacement daemon's guarded startup path to reclaim.
-	return requireSocketCleanup && !(await canConnectToDaemon(socketPath, 250));
+	return requireSocketCleanup && !(await canConnectToDaemon(socketPath, 250)) && hasExpectedProcessExited(true);
 }
 
-export async function shutdownDaemonAndWait(socketPath: string, timeoutMs = 5000): Promise<boolean> {
-	const client = new DaemonClient(socketPath);
+function processIdentityFromDaemonHello(hello: DaemonHello | undefined): DaemonProcessIdentity | undefined {
+	if (!hello?.supervisorPid || !Number.isInteger(hello.supervisorPid) || hello.supervisorPid <= 0) {
+		return undefined;
+	}
+	const processStartId = hello.supervisorProcessStartId ?? getProcessStartId(hello.supervisorPid);
+	return {
+		pid: hello.supervisorPid,
+		...(processStartId ? { processStartId } : {}),
+	};
+}
+
+export async function shutdownConnectedDaemonAndWait(
+	client: DaemonClient,
+	socketPath: string,
+	timeoutMs = 5000,
+	hello: DaemonHello | undefined = client.hello,
+): Promise<boolean> {
 	let shutdownAccepted = false;
+	const expectedIdentity = processIdentityFromDaemonHello(hello);
 	try {
-		await client.connect(1000);
-		const hello = await client.waitForHello(2000).catch(() => undefined);
 		const request =
 			hello && hello.protocol.version < DAEMON_PROTOCOL_VERSION
 				? client.requestLegacy.bind(client)
@@ -145,7 +199,19 @@ export async function shutdownDaemonAndWait(socketPath: string, timeoutMs = 5000
 	} finally {
 		client.close();
 	}
-	return waitForDaemonGone(socketPath, timeoutMs, shutdownAccepted);
+	return waitForDaemonGone(socketPath, timeoutMs, shutdownAccepted, expectedIdentity);
+}
+
+export async function shutdownDaemonAndWait(socketPath: string, timeoutMs = 5000): Promise<boolean> {
+	const client = new DaemonClient(socketPath);
+	try {
+		await client.connect(1000);
+		const hello = await client.waitForHello(2000).catch(() => undefined);
+		return shutdownConnectedDaemonAndWait(client, socketPath, timeoutMs, hello);
+	} catch {
+		client.close();
+		return waitForDaemonGone(socketPath, timeoutMs);
+	}
 }
 
 // activeSessions is undefined when the daemon is reachable but its sessions couldn't
@@ -297,8 +363,6 @@ const EARLY_LAUNCH_EXCLUDED_FLAGS = new Set([
 	"--export",
 ]);
 
-const EARLY_LAUNCH_EXCLUDED_COMMANDS = new Set(["daemon", "install", "remove", "update", "list", "config"]);
-
 /** Conservative pre-parse of argv: true only when startup clearly heads into daemon-backed interactive mode. */
 export function shouldStartInteractiveDaemonEarly(
 	args: readonly string[],
@@ -308,8 +372,16 @@ export function shouldStartInteractiveDaemonEarly(
 	if (startupBenchmark || !stdinIsTTY) {
 		return false;
 	}
-	const firstPositional = args.find((arg) => arg.length > 0 && !arg.startsWith("-"));
-	if (firstPositional && EARLY_LAUNCH_EXCLUDED_COMMANDS.has(firstPositional)) {
+	const firstPositionalIndex = args.findIndex((arg) => arg.length > 0 && !arg.startsWith("-"));
+	const firstPositional = args[firstPositionalIndex];
+	const isHelpCommand = firstPositional === "help" && isHelpCommandRequest(args.slice(firstPositionalIndex + 1));
+	if (
+		firstPositional &&
+		(REMOVED_COMMAND_NAMES.has(firstPositional) ||
+			(PUBLIC_COMMAND_NAMES.has(firstPositional) &&
+				firstPositional !== "agents" &&
+				(firstPositional !== "help" || isHelpCommand)))
+	) {
 		return false;
 	}
 	return !args.some((arg) => EARLY_LAUNCH_EXCLUDED_FLAGS.has(arg));
