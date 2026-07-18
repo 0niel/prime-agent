@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -2882,6 +2883,89 @@ describe("daemon mode helpers", () => {
 		expect(write).toHaveBeenCalledOnce();
 		expect(String(write.mock.calls[0]?.[0])).toContain('"type":"session_closed"');
 		expect(client.catchupActiveSessionIds).not.toContain(state.activeSessionId);
+	});
+
+	it("catches up on drain only after events are skipped behind a backpressured write", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const state = makeState("active");
+		state.eventGeneration = "generation-1";
+		const writes: string[] = [];
+		const write = vi.fn((data: unknown) => {
+			writes.push(String(data));
+			return writes.length === 1;
+		});
+		const socket = Object.assign(new EventEmitter(), { destroyed: false, write }) as unknown as Socket;
+		const internals = daemon as unknown as {
+			clients: Set<DaemonSocketClient>;
+			sessions: Map<string, ActiveSessionState>;
+			handleConnection(socket: Socket): void;
+			createAttachResult(client: DaemonSocketClient, state: ActiveSessionState): DaemonAttachResult;
+			broadcastToSession(
+				state: ActiveSessionState,
+				message: {
+					type: "extension_error";
+					activeSessionId: string;
+					extensionPath: string;
+					event: string;
+					error: string;
+				},
+			): void;
+		};
+		internals.handleConnection(socket);
+		const client = [...internals.clients][0]!;
+		client.attachedActiveSessionIds.add(state.activeSessionId);
+		state.clients.add(client);
+		internals.sessions.set(state.activeSessionId, state);
+		internals.createAttachResult = () =>
+			({
+				activeSessionId: state.activeSessionId,
+				snapshot: { lastEventSequence: state.lastEventSequence },
+				lastEventSequence: state.lastEventSequence,
+			}) as unknown as DaemonAttachResult;
+
+		internals.broadcastToSession(state, {
+			type: "extension_error",
+			activeSessionId: state.activeSessionId,
+			extensionPath: "x".repeat(1024 * 1024),
+			event: "load",
+			error: "first",
+		});
+
+		expect(client.backpressured).toBe(true);
+		expect(client.catchupActiveSessionIds).toEqual(new Set());
+		expect(writes).toHaveLength(2);
+		expect(writes[1]).toContain('"error":"first"');
+
+		internals.broadcastToSession(state, {
+			type: "extension_error",
+			activeSessionId: state.activeSessionId,
+			extensionPath: "/tmp/extension.ts",
+			event: "load",
+			error: "skipped",
+		});
+
+		expect(writes).toHaveLength(2);
+		expect(client.catchupActiveSessionIds).toEqual(new Set([state.activeSessionId]));
+
+		write.mockImplementation((data: unknown) => {
+			writes.push(String(data));
+			return true;
+		});
+		socket.emit("drain");
+		await vi.waitFor(() => expect(writes).toHaveLength(3));
+
+		expect(JSON.parse(writes[2] ?? "{}")).toMatchObject({
+			type: "session_resynced",
+			activeSessionId: state.activeSessionId,
+			meta: { sequence: 2, cursor: { generation: "generation-1", sequence: 2 } },
+			snapshot: { lastEventSequence: 2 },
+		});
+		expect(client.catchupActiveSessionIds).toEqual(new Set());
 	});
 
 	it("marks a chunked attach as snapshotting before deferred streaming", async () => {

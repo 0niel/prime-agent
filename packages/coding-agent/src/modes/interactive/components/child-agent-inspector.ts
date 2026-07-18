@@ -1,3 +1,4 @@
+import { getModels, type KnownProvider } from "@earendil-works/pi-ai";
 import {
 	type Component,
 	type Focusable,
@@ -193,7 +194,20 @@ function padTableCell(value: string, width: number, ellipsis = ""): string {
 	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
 }
 
-function truncateModelSelector(value: string, width: number): string {
+function childAgentModelLabel(selector: string | undefined): string {
+	if (!selector) {
+		return "";
+	}
+	const separatorIndex = selector.indexOf("/");
+	if (separatorIndex === -1) {
+		return selector;
+	}
+	const provider = selector.slice(0, separatorIndex);
+	const modelId = selector.slice(separatorIndex + 1);
+	return getModels(provider as KnownProvider).find((model) => model.id === modelId)?.name ?? modelId;
+}
+
+function truncateModelLabel(value: string, width: number): string {
 	if (visibleWidth(value) <= width) {
 		return value;
 	}
@@ -470,10 +484,10 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 		const agentCell = theme.fg("muted", padTableCell(agentLabel, agentWidth));
 		const promptCell = this.elidePrompt(this.entryLabel(entry), sharedPrefix, sharedSuffix, promptWidth);
 		const recapCell = theme.fg("muted", padTableCell(childAgentRecap(entry.node), recapWidth, "…"));
-		const model = entry.node.model ?? "";
+		const model = childAgentModelLabel(entry.node.model);
 		const tokens = entry.node.tokenCount === undefined ? "" : `${formatTokenCount(entry.node.tokenCount)} tok`;
 		const duration = formatChildAgentDuration(entry.node.durationMs);
-		const modelCell = padTableCell(truncateModelSelector(model, SUMMARY_MODEL_WIDTH), SUMMARY_MODEL_WIDTH);
+		const modelCell = padTableCell(truncateModelLabel(model, SUMMARY_MODEL_WIDTH), SUMMARY_MODEL_WIDTH);
 		const tokensCell = padTableCell(tokens, SUMMARY_TOKENS_WIDTH, "…");
 		const durationCell = padTableCell(duration, SUMMARY_DURATION_WIDTH, "…");
 		const metrics = `${modelCell} ${tokensCell}${" ".repeat(SUMMARY_TOKEN_TIME_GAP)}${durationCell}`;
@@ -833,10 +847,9 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 		const actions = [backAction, expandAction, stopAction];
 		const separatorWidth = visibleWidth(joinHints(["", ""]));
 		const modelWidth = Math.max(0, width - visibleWidth(joinHints(actions)) - separatorWidth);
+		const modelLabel = childAgentModelLabel(this.node?.model);
 		const model =
-			this.node?.model && modelWidth >= 4
-				? theme.fg("muted", truncateToWidth(this.node.model, modelWidth, "…"))
-				: undefined;
+			modelLabel && modelWidth >= 4 ? theme.fg("muted", truncateToWidth(modelLabel, modelWidth, "…")) : undefined;
 		return hintLine([backAction, model, expandAction, stopAction], width);
 	}
 

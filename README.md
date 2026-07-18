@@ -50,6 +50,14 @@ Install the latest stable release:
 curl -fsSL https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/install.sh | sh
 ```
 
+Install the latest beta built from `main`:
+
+```bash
+curl -fsSL https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/install-beta.sh | sh
+```
+
+Stable advances when a version bump lands on `main`; beta advances on every commit to `main`.
+
 Then start Prime Agent:
 
 ```bash

@@ -8,7 +8,8 @@ import {
 	ensureInteractiveDaemonRunning,
 	probeDaemonVersion,
 	probeRunningDaemonSessions,
-	shouldStartInteractiveDaemonEarly,
+	shouldStartDaemonEarly,
+	shouldUseLegacyOwnedSessionWorkerFrontend,
 	shutdownDaemonAndWait,
 } from "../src/cli/daemon-launch.js";
 import { VERSION } from "../src/config.js";
@@ -17,6 +18,7 @@ import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/d
 interface FakeDaemonOptions {
 	/** Sessions returned for a `list` command. */
 	sessions?: Array<Record<string, unknown>>;
+	busyClientOwnedSessionCount?: number;
 	/** When true, the `list` command responds with a failure. */
 	failList?: boolean;
 	/** When false, the server ignores `shutdown` and stays up. */
@@ -24,6 +26,7 @@ interface FakeDaemonOptions {
 	protocolVersion?: number;
 	appVersion?: string;
 	schemaId?: string;
+	serverCapabilities?: string[];
 	onCommand?: (command: { type: string }) => void;
 }
 
@@ -48,7 +51,7 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 			appVersion: options.appVersion,
 			schemaId: options.schemaId,
 			clientId: "fake-client",
-			serverCapabilities: [],
+			serverCapabilities: options.serverCapabilities ?? [],
 		});
 		let buffer = "";
 		socket.on("data", (chunk) => {
@@ -75,7 +78,13 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 						id: command.id,
 						...(options.failList
 							? { success: false, error: "list failed" }
-							: { success: true, data: { sessions: options.sessions ?? [] } }),
+							: {
+									success: true,
+									data: {
+										sessions: options.sessions ?? [],
+										busyClientOwnedSessionCount: options.busyClientOwnedSessionCount ?? 0,
+									},
+								}),
 					});
 				} else if (command.type === "shutdown") {
 					if (options.respondToShutdown === false) {
@@ -185,33 +194,26 @@ describe("probeRunningDaemonSessions", () => {
 	});
 });
 
-describe("shouldStartInteractiveDaemonEarly", () => {
-	it("starts early for default interactive use and the agents view", () => {
-		expect(shouldStartInteractiveDaemonEarly([], true, false)).toBe(true);
-		expect(shouldStartInteractiveDaemonEarly(["agents"], true, false)).toBe(true);
-		expect(shouldStartInteractiveDaemonEarly(["review this change"], true, false)).toBe(true);
-		expect(shouldStartInteractiveDaemonEarly(["help", "me", "fix", "this"], true, false)).toBe(true);
+describe("shouldStartDaemonEarly", () => {
+	it.each([
+		["interactive", []],
+		["print", ["--print", "hello"]],
+		["json", ["--mode", "json", "hello"]],
+		["rpc", ["--mode", "rpc"]],
+		["no-session", ["--no-session"]],
+	])("starts early for the %s client", (_label, args) => {
+		expect(shouldStartDaemonEarly(args, false)).toBe(true);
 	});
 
-	it("does not start a service for standalone management commands", () => {
-		for (const command of [
-			"list",
-			"attach",
-			"status",
-			"doctor",
-			"shutdown",
-			"package",
-			"update",
-			"model",
-			"session",
-		]) {
-			expect(shouldStartInteractiveDaemonEarly([command], true, false)).toBe(false);
-		}
-	});
-
-	it("does not start a service for help or removed command forms", () => {
-		expect(shouldStartInteractiveDaemonEarly(["help"], true, false)).toBe(false);
-		expect(shouldStartInteractiveDaemonEarly(["daemon", "list"], true, false)).toBe(false);
+	it.each([
+		["daemon process", ["--mode", "daemon"]],
+		["help", ["--help"]],
+		["version", ["--version"]],
+		["model listing", ["--list-models"]],
+		["management command after global flags", ["--daemon-socket", "/tmp/prime.sock", "status"]],
+		["startup benchmark", []],
+	])("does not start early for %s", (label, args) => {
+		expect(shouldStartDaemonEarly(args, label === "startup benchmark")).toBe(false);
 	});
 });
 
@@ -234,6 +236,34 @@ describe("ensureInteractiveDaemonRunning", () => {
 		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).resolves.toBeUndefined();
 		expect(commands).toContain("list");
 		expect(commands).not.toContain("shutdown");
+	});
+
+	it("does not replace a stale daemon with busy private client sessions", async () => {
+		const commands: string[] = [];
+		const daemon = await startFakeDaemon({
+			protocolVersion: DAEMON_PROTOCOL_VERSION,
+			appVersion: VERSION,
+			schemaId: "stale-schema",
+			busyClientOwnedSessionCount: 1,
+			onCommand: (command) => commands.push(command.type),
+		});
+		cleanups.push(daemon.close);
+
+		await expect(shouldUseLegacyOwnedSessionWorkerFrontend(daemon.socketPath)).resolves.toBe(true);
+		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).rejects.toThrow("stale");
+		expect(commands).toContain("list");
+		expect(commands).not.toContain("shutdown");
+	});
+
+	it("routes owned clients through the legacy frontend while a compatible legacy daemon is busy", async () => {
+		const daemon = await startFakeDaemon({
+			protocolVersion: 3,
+			appVersion: VERSION,
+			sessions: [{ id: "active-1", activeSessionId: "active-1", isStreaming: true }],
+		});
+		cleanups.push(daemon.close);
+
+		await expect(shouldUseLegacyOwnedSessionWorkerFrontend(daemon.socketPath)).resolves.toBe(true);
 	});
 
 	it("does not treat a live daemon as absent when cold startup delays the first connection", async () => {

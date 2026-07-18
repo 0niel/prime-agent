@@ -25,7 +25,7 @@ Minimal terminal UI framework with differential rendering and synchronized outpu
 - **Component-based**: Simple Component interface with render() method
 - **Theme Support**: Components accept theme interfaces for customizable styling
 - **Built-in Components**: Text, TruncatedText, Input, Editor, Markdown, Loader, SelectList, SettingsList, Spacer, Image, Box, Container
-- **Inline Images**: Renders images in terminals that support Kitty or iTerm2 graphics protocols
+- **Image Support**: Renders terminal graphics or compact image metadata
 - **Autocomplete Support**: File paths and slash commands
 
 ## Quick Start
@@ -514,7 +514,7 @@ const spacer = new Spacer(2); // 2 empty lines (default: 1)
 
 ### Image
 
-Renders images inline for terminals that support the Kitty graphics protocol (Kitty, Ghostty, WezTerm) or iTerm2 inline images. Falls back to a text placeholder on unsupported terminals.
+Renders Kitty or iTerm2 terminal graphics when supported. Set `fallbackOnly: true` to show compact image metadata instead; Prime Agent uses this metadata-only mode.
 
 ```typescript
 interface ImageTheme {
@@ -525,6 +525,7 @@ interface ImageOptions {
   maxWidthCells?: number;
   maxHeightCells?: number;
   filename?: string;
+  fallbackOnly?: boolean;
 }
 
 const image = new Image(

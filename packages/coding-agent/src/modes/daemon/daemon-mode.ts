@@ -23,7 +23,7 @@ import {
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { getLogger } from "@earendil-works/pi-ai";
-import { createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
+import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	appendRotatingLog,
 	getCronJobsPath,
@@ -108,6 +108,7 @@ import {
 } from "../agent-connection/snapshot.js";
 import { createAgentConnectionToolDefinition } from "../agent-connection/tool-definition.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
+import { waitForHeadlessCompletion } from "../headless-completion.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import { encodePrivateFrame, PrivateFrameDecoder } from "../session-worker/private-framing.js";
 import {
@@ -208,6 +209,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"kill",
 	"rename",
 	"prompt",
+	"prompt_and_wait",
 	"steer",
 	"follow_up",
 	"restore_next_turn",
@@ -222,9 +224,12 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"start_side_question",
 	"abort_side_question",
 	"execute_bash",
+	"execute_bash_and_wait",
 	"abort_bash",
 	"cancel_rlm_child",
 	"wait_for_idle",
+	"wait_for_headless_completion",
+	"get_session_header",
 	"get_state",
 	"get_connection_state",
 	"get_messages",
@@ -232,6 +237,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_context_tree",
 	"get_commands",
 	"get_resource_snapshot",
+	"get_model_catalog",
 	"get_available_models",
 	"get_queue",
 	"clear_queue",
@@ -254,6 +260,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"set_steering_mode",
 	"set_follow_up_mode",
 	"set_auto_compaction",
+	"set_auto_retry",
 	"compact",
 	"refine",
 	"abort_compaction",
@@ -459,6 +466,11 @@ export class AgentDaemon {
 	}
 
 	async start(): Promise<void> {
+		if (this.options.worker) {
+			process.stderr.on("error", () => {
+				// A detached worker must survive the supervisor closing its diagnostic pipe.
+			});
+		}
 		this.installCrashHandlers();
 		await prepareDaemonSocketPath(this.socketPath);
 
@@ -674,7 +686,7 @@ export class AgentDaemon {
 				return;
 			}
 			const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", supervisorSocketPath]);
-			const environment = { ...process.env };
+			const environment = createCliSubprocessEnv();
 			delete environment[DAEMON_WORKER_ROLE_ENV];
 			delete environment[DAEMON_WORKER_TOKEN_ENV];
 			delete environment[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV];
@@ -1010,9 +1022,11 @@ export class AgentDaemon {
 			sessionLease = acquireSessionLease(sessionPath, agentDir);
 			sessionManager = sessionPath
 				? await SessionManager.openAsync(sessionPath, config.sessionDir, cwdOverride)
-				: command.continueRecent
-					? SessionManager.continueRecent(cwd, config.sessionDir)
-					: SessionManager.create(cwd, config.sessionDir);
+				: command.noSession
+					? SessionManager.inMemory(cwd)
+					: command.continueRecent
+						? SessionManager.continueRecent(cwd, config.sessionDir)
+						: SessionManager.create(cwd, config.sessionDir);
 		} catch (error) {
 			sessionLease?.release();
 			throw error;
@@ -2813,7 +2827,7 @@ export class AgentDaemon {
 					agentMessageId: command.agentMessageId,
 					customMessage: command.customMessage,
 					skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
-					source: "rpc",
+					source: command.source,
 					preflightResult: (didSucceed) => {
 						if (didSucceed) {
 							this.recordWorkerRecoveryState(state, "prompt_accepted", true);
@@ -2832,6 +2846,24 @@ export class AgentDaemon {
 						}
 					});
 				return undefined;
+			}
+
+			case "prompt_and_wait": {
+				const state = this.getBoundSessionState(command.activeSessionId);
+				await this.promptWithAgentMessagePreparingGuard(state, command.message, {
+					content: command.content,
+					images: command.images,
+					streamingBehavior: command.streamingBehavior,
+					expandPromptTemplates: command.expandPromptTemplates,
+					skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
+					source: command.source,
+					preflightResult: (didSucceed) => {
+						if (didSucceed) {
+							this.recordWorkerRecoveryState(state, "prompt_accepted", true);
+						}
+					},
+				});
+				return success(command.id, command.type);
 			}
 
 			case "steer": {
@@ -3026,6 +3058,15 @@ export class AgentDaemon {
 				return success(command.id, "execute_bash");
 			}
 
+			case "execute_bash_and_wait": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(
+					command.id,
+					"execute_bash_and_wait",
+					await state.runtime.session.executeBash(command.command),
+				);
+			}
+
 			case "abort_bash": {
 				const state = this.getSessionState(command.activeSessionId);
 				state.runtime.session.abortBash();
@@ -3042,6 +3083,22 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				await state.runtime.session.agent.waitForIdle();
 				return success(command.id, "wait_for_idle");
+			}
+
+			case "wait_for_headless_completion": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(
+					command.id,
+					"wait_for_headless_completion",
+					await waitForHeadlessCompletion(state.runtime.session),
+				);
+			}
+
+			case "get_session_header": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "get_session_header", {
+					header: state.runtime.session.sessionManager.getHeader(),
+				});
 			}
 
 			case "get_state": {
@@ -3091,6 +3148,15 @@ export class AgentDaemon {
 				return success(command.id, "get_available_models", {
 					models: await state.runtime.session.modelRegistry.refreshAvailableModels(),
 				});
+			}
+
+			case "get_model_catalog": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(
+					command.id,
+					"get_model_catalog",
+					await state.runtime.session.modelRegistry.refreshModelCatalog(),
+				);
 			}
 
 			case "get_queue": {
@@ -3245,6 +3311,12 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				state.runtime.session.setAutoCompactionEnabled(command.enabled);
 				return success(command.id, "set_auto_compaction");
+			}
+
+			case "set_auto_retry": {
+				const state = this.getSessionState(command.activeSessionId);
+				state.runtime.session.setAutoRetryEnabled(command.enabled);
+				return success(command.id, "set_auto_retry");
 			}
 
 			case "compact": {
@@ -4534,15 +4606,11 @@ export class AgentDaemon {
 						activeSessionId: state.activeSessionId,
 					});
 					const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
-					const accepted = this.write(client, {
+					this.write(client, {
 						...sequencedMessage,
 						messages: [],
 						snapshotFollows: true,
 					});
-					if (!accepted) {
-						this.queueClientCatchup(client, state.activeSessionId, "replacement");
-						continue;
-					}
 					const snapshotSignal = markClientSnapshotStreaming(client, state.activeSessionId);
 					let transcript: SnapshotTranscriptChunkSource;
 					try {
@@ -4585,32 +4653,20 @@ export class AgentDaemon {
 				} catch (error) {
 					this.log(`could not prepare replacement snapshot: ${String(error)}`);
 					// Continue below with the complete replacement event.
-					let accepted: boolean;
 					if (client.transport === "private-framed") {
-						accepted = this.write(client, sequencedMessage);
+						this.write(client, sequencedMessage);
 					} else {
 						serialized ??= serializeJsonLine(sequencedMessage);
-						accepted = this.writeSerialized(client, serialized, sequencedMessage);
-					}
-					if (!accepted) {
-						this.queueClientCatchup(client, state.activeSessionId, "replacement");
+						this.writeSerialized(client, serialized, sequencedMessage);
 					}
 				}
 				continue;
 			}
-			let accepted: boolean;
 			if (client.transport === "private-framed") {
-				accepted = this.write(client, sequencedMessage);
+				this.write(client, sequencedMessage);
 			} else {
 				serialized ??= serializeJsonLine(sequencedMessage);
-				accepted = this.writeSerialized(client, serialized, sequencedMessage);
-			}
-			if (!accepted) {
-				this.queueClientCatchup(
-					client,
-					state.activeSessionId,
-					sequencedMessage.type === "session_replaced" ? "replacement" : "resync",
-				);
+				this.writeSerialized(client, serialized, sequencedMessage);
 			}
 		}
 	}

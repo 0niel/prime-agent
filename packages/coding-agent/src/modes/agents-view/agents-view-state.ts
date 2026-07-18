@@ -135,6 +135,7 @@ export function buildAgentsViewRows(
 	);
 	const rowsByKey = buildRowKeyMap(baseRows);
 	const childrenByParent = new Map<MutableAgentsViewRow, MutableAgentsViewRow[]>();
+	const parentByChild = new Map<MutableAgentsViewRow, MutableAgentsViewRow>();
 	const nestedRows = new Set<MutableAgentsViewRow>();
 
 	for (const row of baseRows) {
@@ -146,6 +147,7 @@ export function buildAgentsViewRows(
 		if (!parent || parent === row) {
 			continue;
 		}
+		parentByChild.set(row, parent);
 		if (row.summary.activity === "working") {
 			parent.runningSubagentCount += 1;
 		}
@@ -153,6 +155,7 @@ export function buildAgentsViewRows(
 		siblings.push(row);
 		childrenByParent.set(parent, siblings);
 	}
+	propagateHeartbeatStateToAncestors(baseRows, parentByChild);
 
 	const roots = baseRows.filter((row) => !nestedRows.has(row));
 	const flattened: AgentsViewRow[] = [];
@@ -186,6 +189,25 @@ export function buildAgentsViewRows(
 		emit(root, 0);
 	}
 	return flattened;
+}
+
+function propagateHeartbeatStateToAncestors(
+	rows: readonly MutableAgentsViewRow[],
+	parentByChild: ReadonlyMap<MutableAgentsViewRow, MutableAgentsViewRow>,
+): void {
+	for (const row of rows) {
+		if (!row.summary.hasActiveHeartbeat) {
+			continue;
+		}
+		const visited = new Set<MutableAgentsViewRow>([row]);
+		let ancestor = parentByChild.get(row);
+		while (ancestor && !visited.has(ancestor)) {
+			visited.add(ancestor);
+			ancestor.section = "heartbeats";
+			ancestor.statusLabel = getSessionStatusLabel(ancestor.summary, true);
+			ancestor = parentByChild.get(ancestor);
+		}
+	}
 }
 
 type MutableAgentsViewRow = AgentsViewRow;
@@ -395,7 +417,7 @@ function getSessionSubtitle(summary: SessionSummary): string {
 	return parts.join("  ");
 }
 
-function getSessionStatusLabel(summary: SessionSummary): string {
+function getSessionStatusLabel(summary: SessionSummary, hasActiveHeartbeat = summary.hasActiveHeartbeat): string {
 	if (summary.isCompacting) {
 		return "compacting";
 	}
@@ -408,7 +430,7 @@ function getSessionStatusLabel(summary: SessionSummary): string {
 	if (summary.lifecycle === "archived") {
 		return "archived";
 	}
-	if (summary.hasActiveHeartbeat) {
+	if (hasActiveHeartbeat) {
 		return "heartbeat active";
 	}
 	if (summary.activity === "working") {

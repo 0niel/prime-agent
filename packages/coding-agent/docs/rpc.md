@@ -211,6 +211,46 @@ Response:
 
 Messages are `AgentMessage` objects (see [Message Types](#message-types)).
 
+### Daemon Coordination
+
+RPC clients can use the same daemon-owned coordination features as the interactive client. These commands are additive; existing commands and event shapes are unchanged.
+
+| Command | Fields | Successful response data |
+|---------|--------|--------------------------|
+| `send_message` | `targetActiveSessionId`, `message`, optional `deliveryMode` (`auto`, `steer`, `follow_up`) | Agent-message delivery receipt |
+| `agent_messages_status` | none | Messaging safety status |
+| `agent_messages_pause` | none | Updated messaging safety status |
+| `agent_messages_resume` | none | Updated messaging safety status |
+| `agent_messages_clear` | none | `{ "cleared": number }` |
+| `list_schedules` | optional `includeInactive` | `{ "jobs": [...] }` |
+| `add_schedule` | `schedule`, `prompt` | `{ "job": {...} }` |
+| `cancel_schedule` | `jobId` | `{ "job": {...} }` |
+| `list_heartbeats` | none | `{ "heartbeats": [...] }` |
+| `get_heartbeat` | none | `{ "heartbeat": {...} }` or `null` |
+| `set_heartbeat` | `schedule`, `prompt`, optional `deliveryMode` (`steer`, `follow_up`) | `{ "heartbeat": {...} }` |
+| `update_heartbeat` | `action` (`pause`, `resume`, `clear`) | `{ "heartbeat": {...} }` or `null` |
+| `manage_heartbeat` | `activeSessionId`, `jobId`, `action` (`pause`, `resume`, `stop`) | `{ "heartbeat": {...} }` |
+
+Adding a schedule or heartbeat promotes an invocation-local RPC session to a resident daemon session so the scheduled work remains available after RPC stdin closes.
+
+Use `observe` to subscribe to another active root or subagent session:
+
+```json
+{"id":"watch-1","type":"observe","activeSessionId":"target-session-id"}
+```
+
+The response contains the target's current messages. Later target events are wrapped so they cannot be confused with events from the RPC client's own session:
+
+```json
+{"type":"observed_session_event","activeSessionId":"target-session-id","event":{"type":"agent_start"}}
+```
+
+When the target closes, RPC emits `observed_session_closed`. Stop watching explicitly with:
+
+```json
+{"type":"unobserve","activeSessionId":"target-session-id"}
+```
+
 ### Model
 
 #### set_model

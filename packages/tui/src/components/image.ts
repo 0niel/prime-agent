@@ -8,6 +8,18 @@ import {
 } from "../terminal-image.js";
 import type { Component } from "../tui.js";
 
+let fullscreenFallback = false;
+
+export function withFullscreenImageFallback<T>(render: () => T): T {
+	const previous = fullscreenFallback;
+	fullscreenFallback = true;
+	try {
+		return render();
+	} finally {
+		fullscreenFallback = previous;
+	}
+}
+
 export interface ImageTheme {
 	fallbackColor: (str: string) => string;
 }
@@ -16,6 +28,9 @@ export interface ImageOptions {
 	maxWidthCells?: number;
 	maxHeightCells?: number;
 	filename?: string;
+	/** Render metadata instead of terminal graphics. */
+	fallbackOnly?: boolean;
+	fallbackPrefix?: string;
 	/** Kitty image ID. If provided, reuses this ID (for animations/updates). */
 	imageId?: number;
 }
@@ -30,6 +45,7 @@ export class Image implements Component {
 
 	private cachedLines?: string[];
 	private cachedWidth?: number;
+	private cachedFullscreenFallback?: boolean;
 
 	constructor(
 		base64Data: string,
@@ -54,10 +70,11 @@ export class Image implements Component {
 	invalidate(): void {
 		this.cachedLines = undefined;
 		this.cachedWidth = undefined;
+		this.cachedFullscreenFallback = undefined;
 	}
 
 	render(width: number): string[] {
-		if (this.cachedLines && this.cachedWidth === width) {
+		if (this.cachedLines && this.cachedWidth === width && this.cachedFullscreenFallback === fullscreenFallback) {
 			return this.cachedLines;
 		}
 
@@ -66,7 +83,12 @@ export class Image implements Component {
 		const caps = getCapabilities();
 		let lines: string[];
 
-		if (caps.images) {
+		if (fullscreenFallback || this.options.fallbackOnly === true) {
+			const parts = [this.mimeType];
+			parts.push(`${this.dimensions.widthPx}×${this.dimensions.heightPx}`);
+			if (this.options.filename) parts.unshift(this.options.filename);
+			lines = [this.theme.fallbackColor(`${this.options.fallbackPrefix ?? ""}[${parts.join(" · ")}]`)];
+		} else if (caps.images) {
 			if (caps.images === "kitty" && this.imageId === undefined) {
 				this.imageId = allocateImageId();
 			}
@@ -106,6 +128,7 @@ export class Image implements Component {
 
 		this.cachedLines = lines;
 		this.cachedWidth = width;
+		this.cachedFullscreenFallback = fullscreenFallback;
 
 		return lines;
 	}

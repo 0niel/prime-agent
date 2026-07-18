@@ -53,7 +53,7 @@ describe("ENG-4583 latest tool expand hint", () => {
 		const components = buildConversationComponents(harness.session.messages, {
 			ui: { requestRender: vi.fn() } as unknown as TUI,
 			cwd: harness.tempDir,
-			toolOptions: { allowInlineImages: false },
+			toolOptions: {},
 			getToolDefinition: () => undefined,
 		});
 		const tools = components.filter(

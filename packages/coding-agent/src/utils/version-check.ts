@@ -1,7 +1,8 @@
 import { getPiUserAgent } from "./pi-user-agent.js";
 
 const DEFAULT_PRIME_AGENT_DOWNLOAD_BASE_URL = "https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev";
-const LATEST_VERSION_MANIFEST_PATH = "latest.json";
+const STABLE_VERSION_MANIFEST_PATH = "latest.json";
+const BETA_VERSION_MANIFEST_PATH = "beta.json";
 const DEFAULT_VERSION_CHECK_TIMEOUT_MS = 10000;
 
 export interface LatestPiRelease {
@@ -15,6 +16,36 @@ interface ParsedVersion {
 	minor: number;
 	patch: number;
 	prerelease?: string;
+}
+
+function comparePrereleaseIdentifiers(leftPrerelease: string, rightPrerelease: string): number {
+	const leftIdentifiers = leftPrerelease.split(".");
+	const rightIdentifiers = rightPrerelease.split(".");
+	const length = Math.max(leftIdentifiers.length, rightIdentifiers.length);
+
+	for (let index = 0; index < length; index += 1) {
+		const left = leftIdentifiers[index];
+		const right = rightIdentifiers[index];
+		if (left === right) continue;
+		if (left === undefined) return -1;
+		if (right === undefined) return 1;
+
+		const leftIsNumeric = /^\d+$/.test(left);
+		const rightIsNumeric = /^\d+$/.test(right);
+		if (leftIsNumeric && rightIsNumeric) {
+			const leftNumber = left.replace(/^0+(?=\d)/, "");
+			const rightNumber = right.replace(/^0+(?=\d)/, "");
+			if (leftNumber.length !== rightNumber.length) return leftNumber.length - rightNumber.length;
+			const comparison = leftNumber.localeCompare(rightNumber);
+			if (comparison !== 0) return comparison;
+			continue;
+		}
+		if (leftIsNumeric) return -1;
+		if (rightIsNumeric) return 1;
+		return left.localeCompare(right);
+	}
+
+	return 0;
 }
 
 function parsePackageVersion(version: string): ParsedVersion | undefined {
@@ -43,7 +74,7 @@ export function comparePackageVersions(leftVersion: string, rightVersion: string
 	if (left.prerelease === right.prerelease) return 0;
 	if (!left.prerelease) return 1;
 	if (!right.prerelease) return -1;
-	return left.prerelease.localeCompare(right.prerelease);
+	return comparePrereleaseIdentifiers(left.prerelease, right.prerelease);
 }
 
 export function isNewerPackageVersion(candidateVersion: string, currentVersion: string): boolean {
@@ -65,6 +96,11 @@ function normalizeReleaseVersion(version: string): string {
 	return version.trim().replace(/^v/, "");
 }
 
+function getReleaseManifestPath(currentVersion: string): string {
+	const prerelease = parsePackageVersion(currentVersion)?.prerelease;
+	return prerelease?.match(/^beta(?:\.|$)/) ? BETA_VERSION_MANIFEST_PATH : STABLE_VERSION_MANIFEST_PATH;
+}
+
 function resolveReleaseUrl(baseUrl: string, pathOrUrl: string): string | undefined {
 	const trimmed = pathOrUrl.trim();
 	if (!trimmed) return undefined;
@@ -82,7 +118,7 @@ export async function getLatestPiRelease(
 	if (process.env.PI_SKIP_VERSION_CHECK || process.env.PI_OFFLINE) return undefined;
 
 	const baseUrl = getPrimeAgentDownloadBaseUrl();
-	const response = await fetch(`${baseUrl}/${LATEST_VERSION_MANIFEST_PATH}`, {
+	const response = await fetch(`${baseUrl}/${getReleaseManifestPath(currentVersion)}`, {
 		headers: {
 			"User-Agent": getPiUserAgent(currentVersion),
 			accept: "application/json",

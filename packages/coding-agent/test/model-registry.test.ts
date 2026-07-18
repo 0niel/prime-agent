@@ -1122,6 +1122,36 @@ describe("ModelRegistry", () => {
 	});
 
 	describe("auth refresh across processes", () => {
+		test("model catalog includes unauthenticated public models and hides private Prime routes", async () => {
+			const savedPrimeApiKey = process.env.PRIME_API_KEY;
+			const savedOpenAiApiKey = process.env.OPENAI_API_KEY;
+			delete process.env.PRIME_API_KEY;
+			delete process.env.OPENAI_API_KEY;
+			try {
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+
+				const unauthenticated = await registry.refreshModelCatalog();
+				expect(unauthenticated.models.some((model) => model.provider === "openai")).toBe(true);
+				expect(unauthenticated.configuredProviders).not.toContain("openai");
+				expect(
+					unauthenticated.models.some(
+						(model) => model.provider === "prime-inference" && model.id.startsWith("internal/"),
+					),
+				).toBe(false);
+
+				authStorage.setRuntimeApiKey("openai", "test-key");
+				const authenticated = await registry.refreshModelCatalog();
+				expect(authenticated.configuredProviders).toContain("openai");
+			} finally {
+				if (savedPrimeApiKey !== undefined) {
+					process.env.PRIME_API_KEY = savedPrimeApiKey;
+				}
+				if (savedOpenAiApiKey !== undefined) {
+					process.env.OPENAI_API_KEY = savedOpenAiApiKey;
+				}
+			}
+		});
+
 		test("refresh() picks up credentials written by another process", () => {
 			const savedEnvKey = process.env.PRIME_API_KEY;
 			delete process.env.PRIME_API_KEY;

@@ -13,7 +13,7 @@ import type { ModelRegistry } from "../../../core/model-registry.js";
 import { theme } from "../theme/theme.js";
 import { keyText } from "./keybinding-hints.js";
 import { getMenuPanelInnerWidth } from "./menu-panel.js";
-import { type ModelSelectorAction, ModelSelectorComponent } from "./model-selector.js";
+import { ModelSelectorComponent } from "./model-selector.js";
 import { type AuthSelectorProvider, OAuthSelectorComponent } from "./oauth-selector.js";
 
 export const CONFIGURATION_MENU_TABS = ["providers", "models", "mcp-connections"] as const;
@@ -34,6 +34,7 @@ export interface ConfigurationMenuOptions {
 	currentModel: Model<Api> | undefined;
 	scopedModels: ReadonlyArray<ConfigurationMenuScopedModel>;
 	availableModels: ReadonlyArray<Model<Api>>;
+	configuredProviders: ReadonlySet<string>;
 	recentModels?: ReadonlyArray<string>;
 	initialModelSearch?: string;
 	getRows?: () => number;
@@ -43,10 +44,6 @@ export interface ConfigurationMenuOptions {
 	onSelectModel: (model: Model<Api>) => void;
 	onCancel: () => void;
 }
-
-const MODEL_SELECTOR_ACTIONS: readonly ModelSelectorAction[] = [
-	{ id: "add_provider", label: "Add provider...", description: "subscription or API key" },
-];
 
 const TAB_LABELS: Record<ConfigurationMenuTab, string> = {
 	providers: "Providers",
@@ -77,14 +74,9 @@ class ConfigurationMenuTabBar implements Component {
 			theme.fg("muted", "  "),
 			safeWidth,
 		);
-		const previousKey = keyText("app.configuration.previousTab", { primaryOnly: true });
-		const nextKey = keyText("app.configuration.nextTab", { primaryOnly: true });
-		const hint = `${theme.fg("dim", `${previousKey}/${nextKey}`)}${theme.fg("muted", " switch tabs")}`;
-		const lastLine = lines.at(-1);
-		if (lastLine && visibleWidth(`${lastLine}   ${hint}`) <= safeWidth) {
-			lines[lines.length - 1] = `${lastLine}   ${hint}`;
-			return lines;
-		}
+		const tabKey = keyText("tui.input.tab", { primaryOnly: true });
+		const closeKey = keyText("tui.select.cancel", { primaryOnly: true });
+		const hint = `${theme.fg("dim", tabKey)}${theme.fg("muted", " switch tabs · ")}${theme.fg("dim", closeKey)}${theme.fg("muted", " close")}`;
 		return [...lines, ...wrapTextWithAnsi(hint, safeWidth)];
 	}
 
@@ -154,11 +146,10 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 			options.onCancel,
 			options.initialModelSearch,
 			{
-				actions: MODEL_SELECTOR_ACTIONS,
 				availableModels: options.availableModels,
+				configuredProviders: options.configuredProviders,
 				header: tabBar,
 				getHeaderRows,
-				onAction: () => this.setActiveTab("providers"),
 				getRows: options.getRows,
 				recentModels: options.recentModels,
 			},
@@ -226,24 +217,25 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 		this.options.requestRender();
 	}
 
-	updateModels(currentModel: Model<Api> | undefined, models?: ReadonlyArray<Model<Api>>): void {
-		this.bodies.models.updateState(currentModel, models);
+	updateModels(
+		currentModel: Model<Api> | undefined,
+		models?: ReadonlyArray<Model<Api>>,
+		configuredProviders?: ReadonlySet<string>,
+	): void {
+		this.bodies.models.updateState(currentModel, models, configuredProviders);
 	}
 
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
-		if (
-			kb.matches(keyData, "app.configuration.previousTab") &&
-			(this.activeSearchIsEmpty() || !kb.matches(keyData, "tui.editor.cursorLeft"))
-		) {
-			this.switchTab(-1);
+		if (kb.matches(keyData, "tui.input.tab")) {
+			this.switchTab();
 			return;
 		}
 		if (
-			kb.matches(keyData, "app.configuration.nextTab") &&
-			(this.activeSearchIsEmpty() || !kb.matches(keyData, "tui.editor.cursorRight"))
+			this.activeTab === "models" &&
+			(kb.matches(keyData, "tui.editor.cursorLeft") || kb.matches(keyData, "tui.editor.cursorRight"))
 		) {
-			this.switchTab(1);
+			this.activeBody.getSearchInput().handleInput(keyData);
 			return;
 		}
 		this.activeBody.handleInput(keyData);
@@ -253,13 +245,9 @@ export class ConfigurationMenuComponent extends Container implements Focusable {
 		return this.bodies[this.activeTab];
 	}
 
-	private activeSearchIsEmpty(): boolean {
-		return this.activeBody.getSearchInput().getValue() === "";
-	}
-
-	private switchTab(direction: -1 | 1): void {
+	private switchTab(): void {
 		const currentIndex = CONFIGURATION_MENU_TABS.indexOf(this.activeTab);
-		const nextIndex = (currentIndex + direction + CONFIGURATION_MENU_TABS.length) % CONFIGURATION_MENU_TABS.length;
+		const nextIndex = (currentIndex + 1) % CONFIGURATION_MENU_TABS.length;
 		this.setActiveTab(CONFIGURATION_MENU_TABS[nextIndex] ?? "providers");
 	}
 }

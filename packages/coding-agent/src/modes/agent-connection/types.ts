@@ -1,6 +1,13 @@
 import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, ServiceTier, TextContent, Transport, Usage } from "@earendil-works/pi-ai";
+import type {
+	AgentSessionMessageDeliveryMode,
+	AgentSessionMessageReceipt,
+	AgentSessionMessageSafetyStatus,
+} from "../../core/agent-messages.js";
 import type { AuthSourceToken } from "../../core/auth-storage.js";
+import type { AgentAutonomousStatus } from "../../core/autonomous.js";
+import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
 import type {
@@ -10,6 +17,7 @@ import type {
 	AgentHeartbeatUpdateAction,
 } from "../../core/cron-jobs.js";
 import type { ReplayBuiltInToolName } from "../../core/extensions/index.js";
+import type { InputSource } from "../../core/extensions/types.js";
 import type { GoalState } from "../../core/goals.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
@@ -38,7 +46,25 @@ import type { SessionStats } from "../../core/session-stats.js";
  */
 export type AgentConnectionQueueMode = "all" | "one-at-a-time";
 export type AgentConnectionModel = Model<Api>;
+export interface AgentConnectionModelCatalog {
+	models: AgentConnectionModel[];
+	configuredProviders: string[];
+}
 export type AgentConnectionSavedSessionScope = "current" | "all";
+
+export interface AgentConnectionSessionHeader {
+	type: "session";
+	version?: number;
+	id: string;
+	timestamp: string;
+	cwd: string;
+	parentSession?: string;
+	git?: {
+		repoUrl?: string;
+		commit?: string;
+		branch?: string;
+	};
+}
 
 export type AgentConnectionSavedSessionStateStatus = "active" | "archived" | "crash";
 
@@ -402,6 +428,7 @@ export interface AgentConnectionToolDefinition {
 export interface AgentConnectionPromptOptions {
 	images?: ImageContent[];
 	streamingBehavior?: "steer" | "followUp";
+	source?: InputSource;
 }
 
 export interface AgentConnectionSideQuestionEvent {
@@ -549,6 +576,7 @@ export type AgentConnectionEvent =
 	| { type: "session_resynced"; snapshot: AgentConnectionSnapshot }
 	| { type: "session_status"; recap?: string }
 	| { type: "extension_ui_request"; request: AgentConnectionExtensionUiRequest }
+	| { type: "extension_error"; extensionPath: string; event: string; error: string }
 	| { type: "connection_status"; status: "reconnecting" | "connected"; error?: string }
 	| { type: "heartbeats_changed" }
 	| { type: "closed"; error?: string };
@@ -563,8 +591,10 @@ export interface AgentConnection {
 	getState(): Promise<AgentConnectionState>;
 	getInitialSnapshot(): Promise<AgentConnectionSnapshot>;
 	getMessages(): Promise<AgentMessage[]>;
+	getSessionHeader(): Promise<AgentConnectionSessionHeader | undefined>;
 	getCommands(): Promise<AgentConnectionSlashCommand[]>;
 	getResourceSnapshot(): Promise<AgentConnectionResourceSnapshot>;
+	getModelCatalog(): Promise<AgentConnectionModelCatalog>;
 	getAvailableModels(): Promise<AgentConnectionModel[]>;
 	getSessionStats(): Promise<SessionStats>;
 	getContextTree(): Promise<ContextTreeNode>;
@@ -593,6 +623,15 @@ export interface AgentConnection {
 		deliveryMode?: AgentHeartbeatDeliveryMode,
 	): Promise<AgentCronJob>;
 	updateHeartbeat(action: AgentHeartbeatUpdateAction): Promise<AgentCronJob | undefined>;
+	sendAgentMessage(
+		targetActiveSessionId: string,
+		message: string,
+		deliveryMode?: AgentSessionMessageDeliveryMode,
+	): Promise<AgentSessionMessageReceipt>;
+	getAgentMessageStatus(): Promise<AgentSessionMessageSafetyStatus>;
+	pauseAgentMessages(): Promise<AgentSessionMessageSafetyStatus>;
+	resumeAgentMessages(): Promise<AgentSessionMessageSafetyStatus>;
+	clearAgentMessages(): Promise<number>;
 	getUserMessagesForForking(): Promise<AgentConnectionUserMessage[]>;
 	getLastAssistantText(): Promise<string | undefined>;
 	/** The system prompt currently in effect for the model (with any per-turn extension changes). */
@@ -602,6 +641,7 @@ export interface AgentConnection {
 	respondToExtensionUiRequest(requestId: string, response: AgentConnectionExtensionUiResponse): Promise<void>;
 
 	prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void>;
+	promptAndWait(message: string, options?: AgentConnectionPromptOptions): Promise<void>;
 	startSideQuestion(id: string, question: string): Promise<void>;
 	abortSideQuestion(id: string): Promise<boolean>;
 	steer(message: string, images?: ImageContent[]): Promise<void>;
@@ -610,6 +650,7 @@ export interface AgentConnection {
 	abort(): Promise<void>;
 	cancelRlmChild(childId: string): Promise<boolean>;
 	waitForIdle(): Promise<void>;
+	waitForHeadlessCompletion(): Promise<AgentAutonomousStatus>;
 
 	/**
 	 * Run a user-initiated bash command (! / !! prefix). Resolution timing is
@@ -617,6 +658,7 @@ export interface AgentConnection {
 	 * bash_end session events, which reach every attached client.
 	 */
 	executeBash(command: string, options?: AgentConnectionExecuteBashOptions): Promise<void>;
+	executeBashAndWait(command: string): Promise<BashResult>;
 	abortBash(): Promise<void>;
 
 	setModel(provider: string, modelId: string): Promise<AgentConnectionModel>;
@@ -629,6 +671,7 @@ export interface AgentConnection {
 	setSteeringMode(mode: AgentConnectionQueueMode): Promise<void>;
 	setFollowUpMode(mode: AgentConnectionQueueMode): Promise<void>;
 	setAutoCompactionEnabled(enabled: boolean): Promise<void>;
+	setAutoRetryEnabled(enabled: boolean): Promise<void>;
 
 	compact(customInstructions?: string): Promise<CompactionResult>;
 	refine(options?: { instructions?: string; rollbackId?: string; global?: boolean }): Promise<RefinementResult>;

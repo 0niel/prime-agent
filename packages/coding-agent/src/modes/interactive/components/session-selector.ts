@@ -290,6 +290,7 @@ class SessionList implements Component, Focusable {
 	private allSessions: AgentConnectionSavedSessionInfo[] = [];
 	private filteredSessions: FlatSessionNode[] = [];
 	private selectedIndex: number = 0;
+	private searchQuery = "";
 	private searchInput: Input;
 	private showCwd = false;
 	private sortMode: SortMode = "recent";
@@ -384,6 +385,8 @@ class SessionList implements Component, Focusable {
 	}
 
 	private filterSessions(query: string): void {
+		const queryChanged = query !== this.searchQuery;
+		this.searchQuery = query;
 		const trimmed = query.trim();
 		const nameFiltered =
 			this.nameFilter === "all" ? this.allSessions : this.allSessions.filter((session) => hasSessionName(session));
@@ -402,7 +405,9 @@ class SessionList implements Component, Focusable {
 				ancestorContinues: [],
 			}));
 		}
-		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredSessions.length - 1));
+		this.selectedIndex = queryChanged
+			? 0
+			: Math.min(this.selectedIndex, Math.max(0, this.filteredSessions.length - 1));
 	}
 
 	private setConfirmingDeletePath(path: string | null): void {

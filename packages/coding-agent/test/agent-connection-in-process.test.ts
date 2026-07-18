@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { getModel } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import type { AgentSessionEvent, AgentSessionEventListener } from "../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
@@ -74,6 +75,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 		thinkingLevel,
 		model: null,
 	});
+	const model = getModel("openai", "gpt-5.1");
 	const session = {
 		sessionManager: {
 			getCwd: () => `/tmp/${id}`,
@@ -99,6 +101,9 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 		messages,
 		pendingMessageCount: 0,
 		goalState: emptyGoalState(),
+		modelRegistry: {
+			refreshModelCatalog: async () => ({ models: model ? [model] : [], configuredProviders: ["openai"] }),
+		},
 		scopedModels: [],
 		getActiveToolNames: () => ["ipython"],
 		getContextUsage: () => undefined,
@@ -137,6 +142,18 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 }
 
 describe("InProcessAgentConnection", () => {
+	it("loads the full model catalog through the connection boundary", async () => {
+		const session = createFakeSession("models", []);
+		const runtime = new FakeRuntime(session.session);
+		const connection = new InProcessAgentConnection(asRuntime(runtime));
+
+		const catalog = await connection.getModelCatalog();
+
+		expect(catalog.configuredProviders).toEqual(["openai"]);
+		expect(catalog.models).toHaveLength(1);
+		expect(catalog.models[0]).toMatchObject({ provider: "openai", id: "gpt-5.1" });
+	});
+
 	it("exposes serializable tool metadata without local execution or renderer callbacks", async () => {
 		const session = createFakeSession("tools", []);
 		const runtime = new FakeRuntime(session.session);
