@@ -133,7 +133,7 @@ export class RpcClient {
 			startupError ??= error;
 			this.cleanupProcess(child, error);
 		});
-		child.once("exit", (code, signal) => {
+		child.once("close", (code, signal) => {
 			const status = signal ? `signal ${signal}` : `code ${code}`;
 			const error = new Error(`Agent process exited with ${status}. Stderr: ${this.stderr}`);
 			startupError ??= error;

@@ -76,6 +76,14 @@ describe("RpcClient lifecycle", () => {
 		await expect(client.getState()).rejects.toThrow("Client not started");
 	});
 
+	it("delivers a final response before cleaning up an exited process", async () => {
+		const client = createClient(["--respond-then-exit"]);
+		clients.push(client);
+		await client.start();
+
+		await expect(client.getState()).resolves.toMatchObject({ sessionId: "final" });
+	});
+
 	it("rejects pending requests and clears their timers when the process errors", async () => {
 		vi.useFakeTimers();
 		const client = new RpcClient({ cliPath: fixturePath, env: { PATH: "" } });
