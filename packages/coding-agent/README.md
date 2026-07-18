@@ -46,6 +46,12 @@ This workspace still keeps an inherited source package name internally. The dist
 curl -fsSL https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/install.sh | sh
 ```
 
+To install the beta built from the latest commit on `main`:
+
+```bash
+curl -fsSL https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/install-beta.sh | sh
+```
+
 Authenticate with an API key:
 
 ```bash
@@ -249,7 +255,7 @@ See [docs/settings.md](docs/settings.md) for all options.
 
 ### Update checks
 
-Prime Agent can fetch the release manifest at `https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/latest.json` to check whether a newer version exists. Override the base URL with `PRIME_AGENT_DOWNLOAD_BASE_URL`. Disable it with `PI_SKIP_VERSION_CHECK=1`.
+Prime Agent stable builds fetch `https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/latest.json` to check whether a newer version exists. Beta builds fetch `beta.json` and remain on the beta channel. Override the base URL with `PRIME_AGENT_DOWNLOAD_BASE_URL`. Disable version checks with `PI_SKIP_VERSION_CHECK=1`.
 
 Use `--offline` or `PI_OFFLINE=1` to disable startup network operations, including update checks and package update checks.
 

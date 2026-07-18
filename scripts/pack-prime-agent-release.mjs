@@ -23,6 +23,7 @@ const defaultOutputDir = join(root, "packages", "coding-agent", "release");
 const defaultBaseUrl = process.env.PRIME_AGENT_DOWNLOAD_BASE_URL;
 const publicPackageName = process.env.PRIME_AGENT_PACKAGE_NAME || "prime-agent";
 const publicCommandName = process.env.PRIME_AGENT_CMD || "prime-agent";
+const releaseChannels = new Set(["stable", "beta"]);
 
 const releasePackages = [
 	{ packageDir: "ai", publicName: undefined, artifactName: "prime-agent-ai" },
@@ -34,6 +35,7 @@ const releasePackages = [
 function parseArgs(args) {
 	const parsed = {
 		baseUrl: defaultBaseUrl,
+		channel: "stable",
 		outDir: defaultOutputDir,
 		version: undefined,
 	};
@@ -41,6 +43,15 @@ function parseArgs(args) {
 	for (let i = 0; i < args.length; i += 1) {
 		const arg = args[i];
 		switch (arg) {
+			case "--channel": {
+				const value = args[i + 1];
+				if (!value || !releaseChannels.has(value)) {
+					throw new Error("--channel must be stable or beta");
+				}
+				parsed.channel = value;
+				i += 1;
+				break;
+			}
 			case "--base-url": {
 				const value = args[i + 1];
 				if (!value) throw new Error("--base-url requires a value");
@@ -81,7 +92,7 @@ function parseArgs(args) {
 }
 
 function printHelp() {
-	console.log(`Usage: node scripts/pack-prime-agent-release.mjs --base-url url [--version x.y.z] [--out-dir path]
+	console.log(`Usage: node scripts/pack-prime-agent-release.mjs --base-url url [--channel stable|beta] [--version x.y.z] [--out-dir path]
 
 Creates private npm tarballs for R2 distribution:
 
@@ -90,8 +101,8 @@ Creates private npm tarballs for R2 distribution:
   <out-dir>/artifacts/prime-agent-core-<version>.tgz
   <out-dir>/artifacts/prime-agent-tui-<version>.tgz
   <out-dir>/artifacts/SHA256SUMS
-  <out-dir>/artifacts/stable
-  <out-dir>/artifacts/latest.json
+  <out-dir>/artifacts/<channel>
+  <out-dir>/artifacts/latest.json (stable) or beta.json (beta)
 `);
 }
 
@@ -315,8 +326,9 @@ function main() {
 		join(artifactsDir, "SHA256SUMS"),
 		tarballs.map((tarball) => `${tarball.sha256}  ${tarball.file}`).join("\n") + "\n",
 	);
-	writeFileSync(join(artifactsDir, "stable"), `v${releaseVersion}\n`);
-	writeJson(join(artifactsDir, "latest.json"), {
+	writeFileSync(join(artifactsDir, args.channel), `v${releaseVersion}\n`);
+	const manifestName = args.channel === "stable" ? "latest.json" : "beta.json";
+	writeJson(join(artifactsDir, manifestName), {
 		version: `v${releaseVersion}`,
 		package: publicPackageName,
 		tarball: `releases/v${releaseVersion}/${artifactFiles.get("coding-agent")}`,

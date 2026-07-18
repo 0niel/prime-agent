@@ -93,6 +93,7 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 	private enabledIds: EnabledIds = null;
 	private filteredItems: ModelItem[] = [];
 	private selectedIndex = 0;
+	private searchQuery = "";
 	private searchInput: Input;
 
 	// Focusable implementation - propagate to searchInput for IME cursor positioning
@@ -181,9 +182,11 @@ export class ScopedModelsSelectorComponent extends Container implements Focusabl
 
 	private refresh(): void {
 		const query = this.searchInput.getValue();
+		const queryChanged = query !== this.searchQuery;
+		this.searchQuery = query;
 		const items = this.buildItems();
 		this.filteredItems = query ? fuzzyFilter(items, query, (i) => `${i.model.id} ${i.model.provider}`) : items;
-		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredItems.length - 1));
+		this.selectedIndex = queryChanged ? 0 : Math.min(this.selectedIndex, Math.max(0, this.filteredItems.length - 1));
 		this.updateList();
 		this.footerText.setText(this.getFooterText());
 	}

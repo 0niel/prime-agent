@@ -32,6 +32,7 @@ describe("version checks", () => {
 		expect(comparePackageVersions("0.70.6", "0.70.5")).toBeGreaterThan(0);
 		expect(comparePackageVersions("0.70.5", "0.70.5")).toBe(0);
 		expect(comparePackageVersions("0.70.4", "0.70.5")).toBeLessThan(0);
+		expect(comparePackageVersions("0.70.5-beta.10.1.abcdef0", "0.70.5-beta.9.1.1234567")).toBeGreaterThan(0);
 		expect(isNewerPackageVersion("0.70.5", "0.70.5")).toBe(false);
 		expect(isNewerPackageVersion("0.70.6", "0.70.5")).toBe(true);
 	});
@@ -58,6 +59,14 @@ describe("version checks", () => {
 				}),
 			}),
 		);
+	});
+
+	it("keeps beta installations on the beta release manifest", async () => {
+		const fetchMock = vi.fn(async () => Response.json({ version: "v1.2.4-beta.124.1.abcdef0" }));
+		vi.stubGlobal("fetch", fetchMock);
+
+		await expect(getLatestPiVersion("1.2.4-beta.123.1.1234567")).resolves.toBe("1.2.4-beta.124.1.abcdef0");
+		expect(fetchMock).toHaveBeenCalledWith(`${defaultPrimeAgentDownloadBaseUrl}/beta.json`, expect.any(Object));
 	});
 
 	it("returns the active package and tarball install spec from the release manifest", async () => {

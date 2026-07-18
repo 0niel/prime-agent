@@ -7,7 +7,6 @@ import {
 	type Component,
 	clippedFullscreenDockHeight,
 	type Focusable,
-	fuzzyFilter,
 	ProcessTerminal,
 	setKeybindings,
 	TUI,
@@ -18,7 +17,7 @@ import {
 import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSION } from "../../config.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
-import type { ModelRegistry } from "../../core/model-registry.js";
+import type { ModelCatalogSnapshot, ModelRegistry } from "../../core/model-registry.js";
 import { findExactModelReferenceMatch } from "../../core/model-resolver.js";
 import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { SessionManager } from "../../core/session-manager.js";
@@ -67,6 +66,7 @@ import {
 	theme,
 } from "../interactive/theme/theme.js";
 import { WORKING_ICON_INTERVAL_MS, workingIconFrame } from "../interactive/theme/working-icon.js";
+import { getModelArgumentCompletions } from "../model-autocomplete.js";
 import {
 	formatPackageUpdateNotice,
 	formatTmuxWarningNotice,
@@ -230,22 +230,19 @@ export function formatAgentsViewStatusLine(text: string): string {
 
 export async function getAgentsViewModelArgumentCompletions(
 	prefix: string,
-	modelRegistry: Pick<ModelRegistry, "refreshAvailableModels">,
+	modelRegistry: Pick<ModelRegistry, "refreshModelCatalog">,
 ): Promise<AutocompleteItem[] | null> {
-	const models = await modelRegistry.refreshAvailableModels();
-	if (models.length === 0) {
-		return null;
-	}
-	const items = models.map((model) => ({
-		id: model.id,
-		provider: model.provider,
-		label: `${model.provider}/${model.id}`,
-	}));
-	const filtered = fuzzyFilter(items, prefix, (item) => `${item.id} ${item.provider}`);
-	if (filtered.length === 0) {
-		return null;
-	}
-	return filtered.map((item) => ({ value: item.label, label: item.id, description: item.provider }));
+	const catalog = await modelRegistry.refreshModelCatalog();
+	return getModelArgumentCompletions(prefix, catalog.models);
+}
+
+export function syncAgentsViewModelMenuAfterAuth(
+	menu: Pick<ConfigurationMenuComponent, "refreshAuthentication" | "updateModels">,
+	currentModel: Model<Api> | undefined,
+	catalog: ModelCatalogSnapshot,
+): void {
+	menu.refreshAuthentication();
+	menu.updateModels(currentModel, catalog.models, new Set(catalog.configuredProviders));
 }
 
 export function shouldReconnectAgentsViewDaemon(reason: DaemonClosingReason | undefined): boolean {
@@ -1011,14 +1008,15 @@ class AgentsViewMode implements Component, Focusable {
 			case "model": {
 				const searchTerm = command.args || undefined;
 				if (searchTerm) {
-					// Mirror the in-session /model behavior: an exact provider/id or
-					// unique model id reference applies directly without the picker.
-					const match = findExactModelReferenceMatch(
-						searchTerm,
-						await this.options.uiServices.modelRegistry.refreshAvailableModels(),
-					);
+					const authFlows = this.createAuthFlows();
+					const providerOptions = authFlows.getLoginProviderOptions();
+					const catalog = await this.options.uiServices.modelRegistry.refreshModelCatalog();
+					const match = findExactModelReferenceMatch(searchTerm, catalog.models);
 					if (match) {
-						this.applyDefaultModel(match);
+						const { ready } = await this.ensureDefaultModelProviderConfigured(match, authFlows, providerOptions);
+						if (ready) {
+							this.applyDefaultModel(match);
+						}
 						return;
 					}
 				}
@@ -1088,10 +1086,41 @@ class AgentsViewMode implements Component, Focusable {
 		this.setStatusMessage(warning, { tone: "warning", sticky: true });
 	}
 
+	private async ensureDefaultModelProviderConfigured(
+		model: Model<Api>,
+		authFlows: ProviderAuthFlows,
+		providerOptions: ReadonlyArray<AuthSelectorProvider>,
+	): Promise<{ ready: boolean; refreshedCatalog?: ModelCatalogSnapshot }> {
+		const modelRegistry = this.options.uiServices.modelRegistry;
+		if (modelRegistry.hasConfiguredAuth(model)) return { ready: true };
+
+		const provider = providerOptions.find(
+			(option) => option.id === model.provider && (option.category ?? "provider") === "provider",
+		);
+		if (!provider) {
+			this.setStatusMessage(`Authentication for ${model.provider} must be configured externally.`, {
+				tone: "error",
+			});
+			return { ready: false };
+		}
+
+		const result = await authFlows.loginProvider(provider);
+		if (result.status !== "success") return { ready: false };
+
+		const refreshedCatalog = await modelRegistry.refreshModelCatalog();
+		if (modelRegistry.hasConfiguredAuth(model)) return { ready: true, refreshedCatalog };
+
+		this.setStatusMessage(`Authentication completed, but ${model.provider} is still unavailable.`, {
+			tone: "error",
+		});
+		return { ready: false, refreshedCatalog };
+	}
+
 	private async showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
 		const modelRegistry = this.options.uiServices.modelRegistry;
 		const authFlows = this.createAuthFlows();
-		const availableModels = await modelRegistry.refreshAvailableModels();
+		const providerOptions = authFlows.getLoginProviderOptions();
+		const initialCatalog = await modelRegistry.refreshModelCatalog();
 		return new Promise((resolve) => {
 			let handle: OverlayHandle | undefined;
 			let settled = false;
@@ -1116,11 +1145,14 @@ class AgentsViewMode implements Component, Focusable {
 					.then(async (authResult) => {
 						if (settled) return;
 						handle?.focus();
-						menu.refreshAuthentication();
-						if (authResult.status !== "success" || tab === "mcp-connections") return;
+						if (authResult.status !== "success" || tab === "mcp-connections") {
+							menu.refreshAuthentication();
+							return;
+						}
 
 						await this.applyPrimeInferenceFallbackAfterLogin(authResult);
-						menu.updateModels(this.getDefaultModelForNewAgents(), await modelRegistry.refreshAvailableModels());
+						const catalog = await modelRegistry.refreshModelCatalog();
+						syncAgentsViewModelMenuAfterAuth(menu, this.getDefaultModelForNewAgents(), catalog);
 						menu.setActiveTab("models");
 					})
 					.catch((error) => {
@@ -1133,11 +1165,12 @@ class AgentsViewMode implements Component, Focusable {
 				initialTab,
 				tui: this.ui,
 				authStorage: modelRegistry.authStorage,
-				providerOptions: authFlows.getLoginProviderOptions(),
+				providerOptions,
 				modelRegistry,
 				currentModel: this.getDefaultModelForNewAgents(),
 				scopedModels: [],
-				availableModels,
+				availableModels: initialCatalog.models,
+				configuredProviders: new Set(initialCatalog.configuredProviders),
 				recentModels: this.options.uiServices.settingsManager.getRecentModels(),
 				initialModelSearch,
 				getRows: () => this.ui.terminal.rows,
@@ -1145,8 +1178,26 @@ class AgentsViewMode implements Component, Focusable {
 				onSelectProvider: (provider) => authenticate(provider, "providers"),
 				onSelectMcpConnection: (provider) => authenticate(provider, "mcp-connections"),
 				onSelectModel: (model) => {
-					this.applyDefaultModel(model);
-					finish();
+					void (async () => {
+						try {
+							const result = await this.ensureDefaultModelProviderConfigured(model, authFlows, providerOptions);
+							handle?.focus();
+							if (result.refreshedCatalog) {
+								syncAgentsViewModelMenuAfterAuth(
+									menu,
+									this.getDefaultModelForNewAgents(),
+									result.refreshedCatalog,
+								);
+							} else {
+								menu.refreshAuthentication();
+							}
+							if (!result.ready || settled) return;
+							this.applyDefaultModel(model);
+							finish();
+						} catch (error) {
+							this.setStatusMessage(error instanceof Error ? error.message : String(error), { tone: "error" });
+						}
+					})();
 				},
 				onCancel: finish,
 			});

@@ -248,14 +248,14 @@ md.setText("Updated markdown");
 
 ### Image
 
-Renders images in supported terminals (Kitty, iTerm2, Ghostty, WezTerm).
+Prime Agent shows compact image metadata and does not emit terminal graphics for images.
 
 ```typescript
 const image = new Image(
   base64Data,   // base64-encoded image
   "image/png",  // MIME type
   theme,        // ImageTheme
-  { maxWidthCells: 80, maxHeightCells: 24 }
+  { filename: "result.png", fallbackOnly: true }
 );
 ```
 

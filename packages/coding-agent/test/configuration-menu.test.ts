@@ -1,4 +1,4 @@
-import { type KeyId, setKeybindings, type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { setKeybindings, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
@@ -24,6 +24,7 @@ describe("ConfigurationMenuComponent", () => {
 			getRows?: () => number;
 			requestRender?: () => void;
 			onSelectProvider?: () => void;
+			onCancel?: () => void;
 		} = {},
 	): Promise<ConfigurationMenuComponent> {
 		const harness = await createHarness({
@@ -48,12 +49,13 @@ describe("ConfigurationMenuComponent", () => {
 			currentModel: model,
 			scopedModels: [],
 			availableModels: [model],
+			configuredProviders: new Set([model.provider]),
 			getRows: options.getRows,
 			requestRender: options.requestRender ?? (() => {}),
 			onSelectProvider: options.onSelectProvider ?? (() => {}),
 			onSelectMcpConnection: () => {},
 			onSelectModel: () => {},
-			onCancel: () => {},
+			onCancel: options.onCancel ?? (() => {}),
 		});
 	}
 
@@ -108,27 +110,25 @@ describe("ConfigurationMenuComponent", () => {
 		expect(output).not.toContain("Anthropic");
 	});
 
-	it("switches tabs with configured bindings and preserves focus and search state", async () => {
-		setKeybindings(
-			new KeybindingsManager({
-				"app.configuration.previousTab": "ctrl+y" as KeyId,
-				"app.configuration.nextTab": "ctrl+x" as KeyId,
-			}),
-		);
+	it("switches tabs with Tab and preserves focus and search state", async () => {
 		const menu = await createMenu();
 		menu.focused = true;
-		expect(stripAnsi(menu.render(120).join("\n"))).toContain("Ctrl+Y/Ctrl+X switch tabs");
+		const lines = stripAnsi(menu.render(120).join("\n")).split("\n");
+		const tabsLine = lines.findIndex((line) => line.includes("[▶ Providers]"));
+		const shortcutsLine = lines.findIndex((line) => line.includes("Tab switch tabs"));
+		expect(shortcutsLine).toBeGreaterThan(tabsLine);
+		expect(lines[shortcutsLine]).toContain("Esc close");
 
-		menu.handleInput("\x18");
+		menu.handleInput("\t");
 		expect(menu.getActiveTab()).toBe("models");
 		expect(menu.focused).toBe(true);
 		menu.handleInput("f");
 		expect(menu.getSearchValue("models")).toBe("f");
-		menu.handleInput("\x18");
+		menu.handleInput("\t");
 		expect(menu.getActiveTab()).toBe("mcp-connections");
 		expect(menu.getSearchValue("models")).toBe("f");
-		menu.handleInput("\x19");
-		expect(menu.getActiveTab()).toBe("models");
+		menu.handleInput("\t");
+		expect(menu.getActiveTab()).toBe("providers");
 	});
 
 	it("keeps the existing catalog while syncing a post-login current model", async () => {
@@ -150,6 +150,7 @@ describe("ConfigurationMenuComponent", () => {
 			currentModel: undefined,
 			scopedModels: [],
 			availableModels: [firstModel],
+			configuredProviders: new Set([firstModel.provider]),
 			initialModelSearch: "faux",
 			requestRender: () => {},
 			onSelectProvider: () => {},
@@ -169,16 +170,24 @@ describe("ConfigurationMenuComponent", () => {
 		expect(postLoginRow).toContain("current");
 	});
 
-	it("keeps default arrow keys in the active search field while it contains text", async () => {
-		const menu = await createMenu();
+	it("keeps arrow keys in the active search field and uses Escape to close", async () => {
+		const onCancel = vi.fn();
+		const menu = await createMenu({ initialTab: "models", onCancel });
+
+		menu.handleInput("\x1b[D");
+		expect(menu.getActiveTab()).toBe("models");
+		expect(onCancel).not.toHaveBeenCalled();
 
 		menu.handleInput("a");
 		menu.handleInput("n");
 		menu.handleInput("\x1b[D");
 		menu.handleInput("\x1b[C");
 
-		expect(menu.getActiveTab()).toBe("providers");
+		expect(menu.getActiveTab()).toBe("models");
 		expect(menu.getSearchValue()).toBe("an");
+
+		menu.handleInput("\x1b");
+		expect(onCancel).toHaveBeenCalledOnce();
 	});
 
 	it("wraps complete tab labels at narrow widths without overflowing the viewport", async () => {

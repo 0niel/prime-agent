@@ -61,11 +61,12 @@ export async function confirmDaemonSessionLoss(
 		// Reachable but couldn't list sessions: assume work may be lost.
 		detail = copy.unlistableDetail;
 	} else {
-		const busySessions = probe.activeSessions.filter(isSessionBusy);
-		if (busySessions.length === 0) {
+		const busySessionCount =
+			probe.activeSessions.filter(isSessionBusy).length + (probe.busyClientOwnedSessionCount ?? 0);
+		if (busySessionCount === 0) {
 			return true;
 		}
-		detail = copy.busyDetail(busySessions.length);
+		detail = copy.busyDetail(busySessionCount);
 	}
 	if (!process.stdin.isTTY) {
 		console.error(chalk.red(`${detail} ${copy.nonTtyHint}`));

@@ -1,10 +1,8 @@
 /**
- * Interactive-daemon launch/readiness helpers.
+ * Daemon launch/readiness helpers.
  *
- * This module is deliberately light on imports: cli.ts calls
- * maybeStartInteractiveDaemonEarly() BEFORE the heavy main module graph loads,
- * so a cold daemon boots concurrently with this process's own imports instead
- * of serially after them. main.ts reuses the same memoized promise.
+ * This module stays light on imports so clients can start a cold daemon before
+ * the heavy main module graph loads. main.ts reuses the same memoized promise.
  */
 
 import { spawn } from "node:child_process";
@@ -15,10 +13,12 @@ import { getProcessStartId } from "../core/session-lease.js";
 import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../modes/daemon/daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
-import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
+import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
 import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
-import { formatCurrentCliCommand } from "./subprocess-launch.js";
+import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
+
+const DAEMON_STARTUP_TIMEOUT_MS = 30_000;
 
 export function isDaemonSessionSummary(value: unknown): value is SessionSummary {
 	if (!value || typeof value !== "object") {
@@ -102,12 +102,22 @@ export async function probeDaemonVersion(socketPath: string): Promise<DaemonVers
 	}
 }
 
-export async function listActiveDaemonSessionSummaries(client: DaemonClient): Promise<SessionSummary[]> {
+export async function listActiveDaemonSessionSummaries(
+	client: DaemonClient,
+	options: { includeClientOwned?: boolean } = {},
+): Promise<SessionSummary[]> {
+	return (await queryActiveDaemonSessions(client, options)).sessions;
+}
+
+async function queryActiveDaemonSessions(
+	client: DaemonClient,
+	options: { includeClientOwned?: boolean } = {},
+): Promise<{ sessions: SessionSummary[]; busyClientOwnedSessionCount: number }> {
 	const hello = await client.waitForHello(2000).catch(() => undefined);
 	const response =
 		hello && hello.protocol.version < DAEMON_PROTOCOL_VERSION
-			? await client.requestLegacy({ type: "list" })
-			: await client.request({ type: "list" });
+			? await client.requestLegacy({ type: "list", includeClientOwned: options.includeClientOwned })
+			: await client.request({ type: "list", includeClientOwned: options.includeClientOwned });
 	if (!response.success) {
 		throw new Error(response.error);
 	}
@@ -122,7 +132,16 @@ export async function listActiveDaemonSessionSummaries(client: DaemonClient): Pr
 	if (!sessions.every(isDaemonSessionSummary)) {
 		throw new Error("Daemon returned an invalid session list response");
 	}
-	return sessions;
+	const busyClientOwnedSessionCount = (data as { busyClientOwnedSessionCount?: unknown }).busyClientOwnedSessionCount;
+	if (
+		busyClientOwnedSessionCount !== undefined &&
+		(typeof busyClientOwnedSessionCount !== "number" ||
+			!Number.isInteger(busyClientOwnedSessionCount) ||
+			busyClientOwnedSessionCount < 0)
+	) {
+		throw new Error("Daemon returned an invalid client-owned session count");
+	}
+	return { sessions, busyClientOwnedSessionCount: busyClientOwnedSessionCount ?? 0 };
 }
 
 /** Thrown when a stale-version daemon can't be replaced. The message is user-facing. */
@@ -250,18 +269,12 @@ export async function shutdownDaemonAndWait(socketPath: string, timeoutMs = 5000
 
 // activeSessions is undefined when the daemon is reachable but its sessions couldn't
 // be listed — callers must treat that as "possibly busy", not idle.
-export type RunningDaemonProbe = { reachable: false } | { reachable: true; activeSessions?: SessionSummary[] };
+export type RunningDaemonProbe =
+	| { reachable: false }
+	| { reachable: true; activeSessions?: SessionSummary[]; busyClientOwnedSessionCount?: number };
 
 export function isSessionBusy(summary: SessionSummary): boolean {
-	// pendingMessageCount covers queued steering/follow-ups, which live only in
-	// memory and would be lost if the daemon were stopped.
-	return (
-		summary.isStreaming ||
-		summary.isCompacting ||
-		summary.isBashRunning === true ||
-		summary.hasRunningRlmChildren === true ||
-		summary.pendingMessageCount > 0
-	);
+	return isSessionSummaryBusy(summary);
 }
 
 export async function probeRunningDaemonSessions(socketPath: string): Promise<RunningDaemonProbe> {
@@ -273,13 +286,33 @@ export async function probeRunningDaemonSessions(socketPath: string): Promise<Ru
 		return { reachable: false };
 	}
 	try {
-		const summaries = await listActiveDaemonSessionSummaries(client);
-		return { reachable: true, activeSessions: summaries.filter((summary) => summary.activeSessionId !== undefined) };
+		const result = await queryActiveDaemonSessions(client, { includeClientOwned: true });
+		return {
+			reachable: true,
+			activeSessions: result.sessions.filter((summary) => summary.activeSessionId !== undefined),
+			...(result.busyClientOwnedSessionCount > 0
+				? { busyClientOwnedSessionCount: result.busyClientOwnedSessionCount }
+				: {}),
+		};
 	} catch {
 		return { reachable: true };
 	} finally {
 		client.close();
 	}
+}
+
+export async function shouldUseLegacyOwnedSessionWorkerFrontend(socketPath: string): Promise<boolean> {
+	const version = await probeDaemonVersion(socketPath);
+	if (version.status !== "stale") {
+		return false;
+	}
+	const running = await probeRunningDaemonSessions(socketPath);
+	return (
+		running.reachable &&
+		(running.activeSessions === undefined ||
+			(running.busyClientOwnedSessionCount ?? 0) > 0 ||
+			running.activeSessions.some((summary) => isSessionBusy(summary)))
+	);
 }
 
 // Idle-but-loaded sessions reload from disk on the fresh daemon, so only a busy
@@ -293,9 +326,10 @@ async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<boolean
 		await client.connect(1000);
 		connected = true;
 		try {
-			const summaries = await listActiveDaemonSessionSummaries(client);
-			loadedSessionCount = summaries.length;
-			hasBusySessions = summaries.some(isSessionBusy);
+			const result = await queryActiveDaemonSessions(client, { includeClientOwned: true });
+			loadedSessionCount = result.sessions.length;
+			hasBusySessions =
+				result.busyClientOwnedSessionCount !== 0 || result.sessions.some((summary) => isSessionBusy(summary));
 		} catch {
 			// Couldn't confirm idleness: treat as busy rather than risk interrupting work.
 			hasBusySessions = true;
@@ -346,7 +380,7 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 		{
 			cwd: spawnCwd ?? process.cwd(),
 			detached: true,
-			env: process.env,
+			env: createCliSubprocessEnv(),
 			// The daemon writes its own rotating log (see daemon-mode); nothing here
 			// needs its stdout/stderr, so leave them detached.
 			stdio: "ignore",
@@ -354,7 +388,7 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 	);
 	child.unref();
 
-	const deadline = Date.now() + 10000;
+	const deadline = Date.now() + DAEMON_STARTUP_TIMEOUT_MS;
 	while (Date.now() < deadline) {
 		const started = await probeDaemonVersion(socketPath);
 		if (started.status === "current") {
@@ -389,66 +423,101 @@ export function ensureInteractiveDaemonRunning(socketPath: string, spawnCwd?: st
 	return promise;
 }
 
-const EARLY_LAUNCH_EXCLUDED_FLAGS = new Set([
+const EARLY_LAUNCH_EXCLUDED_FLAGS = new Set(["--help", "-h", "--version", "-v", "--list-models", "--export"]);
+const EARLY_LAUNCH_VALUE_FLAGS = new Set([
 	"--mode",
-	"--print",
-	"-p",
-	"--help",
-	"-h",
-	"--version",
-	"-v",
-	"--no-session",
-	"--list-models",
-	"--export",
+	"--daemon-socket",
+	"--provider",
+	"--model",
+	"--api-key",
+	"--cwd",
+	"--system-prompt",
+	"--append-system-prompt",
+	"--fork",
+	"--session-dir",
+	"--models",
+	"--tools",
+	"-t",
+	"--thinking",
+	"--extension",
+	"-e",
+	"--skill",
+	"--prompt-template",
+	"--theme",
+	"--autonomous-gate",
+	"--autonomous-gate-retries",
+	"--autonomous-gate-timeout-ms",
+	"--autonomous-max-continuations",
+	"--autonomous-max-turns",
+	"--autonomous-max-tokens",
+	"--autonomous-timeout-ms",
 ]);
 
-/** Conservative pre-parse of argv: true only when startup clearly heads into daemon-backed interactive mode. */
-export function shouldStartInteractiveDaemonEarly(
-	args: readonly string[],
-	stdinIsTTY: boolean | undefined,
-	startupBenchmark: boolean,
-): boolean {
-	if (startupBenchmark || !stdinIsTTY) {
+function findFirstEarlyLaunchPositional(args: readonly string[]): { index: number; value: string } | undefined {
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index]!;
+		if (arg === "--") {
+			return args[index + 1] === undefined ? undefined : { index: index + 1, value: args[index + 1]! };
+		}
+		if (EARLY_LAUNCH_VALUE_FLAGS.has(arg)) {
+			index++;
+			continue;
+		}
+		if (arg === "--resume" || arg === "-r") {
+			if (args[index + 1] && !args[index + 1]!.startsWith("-")) {
+				index++;
+			}
+			continue;
+		}
+		if (!arg.startsWith("-")) {
+			return { index, value: arg };
+		}
+	}
+	return undefined;
+}
+
+export function shouldStartDaemonEarly(args: readonly string[], startupBenchmark: boolean): boolean {
+	if (startupBenchmark) {
 		return false;
 	}
-	const firstPositionalIndex = args.findIndex((arg) => arg.length > 0 && !arg.startsWith("-"));
-	const firstPositional = args[firstPositionalIndex];
-	const isHelpCommand = firstPositional === "help" && isHelpCommandRequest(args.slice(firstPositionalIndex + 1));
+	const modeIndex = args.indexOf("--mode");
+	if (modeIndex !== -1 && args[modeIndex + 1] === "daemon") {
+		return false;
+	}
+	if (args.some((arg) => EARLY_LAUNCH_EXCLUDED_FLAGS.has(arg))) {
+		return false;
+	}
+	if (args.includes("--print") || args.includes("-p")) {
+		return true;
+	}
+	const firstPositional = findFirstEarlyLaunchPositional(args);
+	const isHelpCommand =
+		firstPositional?.value === "help" && isHelpCommandRequest(args.slice(firstPositional.index + 1));
 	if (
 		firstPositional &&
-		(REMOVED_COMMAND_NAMES.has(firstPositional) ||
-			(PUBLIC_COMMAND_NAMES.has(firstPositional) &&
-				firstPositional !== "agents" &&
-				(firstPositional !== "help" || isHelpCommand)))
+		(REMOVED_COMMAND_NAMES.has(firstPositional.value) ||
+			(PUBLIC_COMMAND_NAMES.has(firstPositional.value) &&
+				firstPositional.value !== "agents" &&
+				(firstPositional.value !== "help" || isHelpCommand)))
 	) {
 		return false;
 	}
-	return !args.some((arg) => EARLY_LAUNCH_EXCLUDED_FLAGS.has(arg));
+	return true;
 }
 
-/**
- * Fire-and-forget daemon launch for interactive startups, called from cli.ts
- * before the heavy module graph is imported. A wrong "yes" merely starts the
- * daemon that the next interactive run would need anyway; a wrong "no" only
- * means main.ts starts it later, as before. Never throws — errors surface when
- * main.ts awaits the memoized promise.
- */
-export function maybeStartInteractiveDaemonEarly(args: readonly string[]): void {
+export function maybeStartDaemonEarly(args: readonly string[]): void {
 	const benchmarkFlag = (process.env.PI_STARTUP_BENCHMARK ?? "").toLowerCase();
 	const startupBenchmark = benchmarkFlag === "1" || benchmarkFlag === "true" || benchmarkFlag === "yes";
-	if (!shouldStartInteractiveDaemonEarly(args, process.stdin.isTTY, startupBenchmark)) {
+	if (!shouldStartDaemonEarly(args, startupBenchmark)) {
 		return;
 	}
 	const socketIndex = args.indexOf("--daemon-socket");
 	const socketPath =
 		socketIndex !== -1 && args[socketIndex + 1] ? (args[socketIndex + 1] as string) : defaultDaemonSocketPath();
-	// Honor --cwd: main() chdirs after parsing, but this runs before; spawn the
-	// daemon from the target directory so it matches the old post-chdir behavior.
 	const cwdIndex = args.indexOf("--cwd");
 	const cwdArg = cwdIndex !== -1 ? args[cwdIndex + 1] : undefined;
 	const spawnCwd = cwdArg ? resolve(expandTildePath(cwdArg)) : undefined;
 	if (spawnCwd && !existsSync(spawnCwd)) {
-		// Invalid --cwd: skip the early spawn; main() reports the error.
 		return;
 	}
 	void ensureInteractiveDaemonRunning(socketPath, spawnCwd);

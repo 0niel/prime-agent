@@ -57,17 +57,18 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		const summary = new ChildAgentSummaryComponent();
 		summary.setNodes([{ ...node("a"), model: "openai/gpt-5.4", toolUseCount: 3, tokenCount: 41_000 }]);
 		const out = stripAnsi(summary.render(80).join("\n"));
-		expect(out).toContain("openai/gpt-5.4");
+		expect(out).toContain("GPT-5.4");
+		expect(out).not.toContain("openai/gpt-5.4");
 		expect(out).toContain("41k tok");
 		expect(out).not.toContain("tools");
 	});
 
-	it("preserves the model suffix when its selector is truncated", () => {
+	it("preserves nested model ids when the label is truncated", () => {
 		const summary = new ChildAgentSummaryComponent();
 		summary.setNodes([{ ...node("a"), model: "prime-inference/internal/glm-5.2-fast" }]);
 		const out = stripAnsi(summary.render(80).join("\n"));
-		expect(out).toContain("prime-…/glm-5.2-fast");
-		expect(out).not.toContain("prime-inference/int…");
+		expect(out).toContain("intern…/glm-5.2-fast");
+		expect(out).not.toContain("prime-inference");
 	});
 
 	it("shows recaps in a fixed column and falls back to activity", () => {
@@ -199,8 +200,9 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		detail.setNode({ ...node("a"), model: "anthropic/claude-opus-4-7" });
 		const hint = stripAnsi(detail.render(100).at(-1) ?? "");
 		expect(hint).toContain("back to chat");
-		expect(hint).toContain("anthropic/claude-opus-4-7");
-		expect(hint.indexOf("anthropic/claude-opus-4-7")).toBeGreaterThan(hint.indexOf("back to chat"));
+		expect(hint).toContain("Claude Opus 4.7");
+		expect(hint).not.toContain("anthropic/claude-opus-4-7");
+		expect(hint.indexOf("Claude Opus 4.7")).toBeGreaterThan(hint.indexOf("back to chat"));
 	});
 
 	it("truncates long models before hiding detail actions", () => {
@@ -211,7 +213,8 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		});
 		const hint = stripAnsi(detail.render(60).at(-1) ?? "");
 		expect(hint).toContain("back to chat");
-		expect(hint).toContain("provider-…");
+		expect(hint).toContain("model-wit…");
+		expect(hint).not.toContain("provider-with-a-long-name");
 		expect(hint).toContain("to expand");
 		expect(hint).toContain("stop");
 	});

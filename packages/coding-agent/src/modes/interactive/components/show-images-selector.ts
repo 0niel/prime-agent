@@ -17,7 +17,7 @@ export class ShowImagesSelectorComponent extends Container {
 		super();
 
 		const items: SelectItem[] = [
-			{ value: "yes", label: "Yes", description: "Show images inline in terminal" },
+			{ value: "yes", label: "Yes", description: "Show image type and dimensions" },
 			{ value: "no", label: "No", description: "Show text placeholder instead" },
 		];
 

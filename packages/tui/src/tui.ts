@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
+import { withFullscreenImageFallback } from "./components/image.js";
 import { FullscreenViewport, type ScrollInfo, type SelectionScrollDirection } from "./fullscreen.js";
 import { getKeybindings } from "./keybindings.js";
 import { isKeyRelease, matchesKey } from "./keys.js";
@@ -1424,22 +1425,22 @@ export class TUI extends Container {
 
 		const transcript: string[] = [];
 		const selectionRegions: TableCellSelectionRegion[] = [];
-		for (const component of fullscreen.scroll) {
-			const lineOffset = transcript.length;
-			const componentLines = component.render(width);
-			for (const region of component.getSelectionRegions?.() ?? []) {
-				selectionRegions.push({
-					...region,
-					line: region.line + lineOffset,
-					tableTop: region.tableTop + lineOffset,
-					tableBottom: region.tableBottom + lineOffset,
-				});
+		const dock = withFullscreenImageFallback(() => {
+			for (const component of fullscreen.scroll) {
+				const lineOffset = transcript.length;
+				const componentLines = component.render(width);
+				for (const region of component.getSelectionRegions?.() ?? []) {
+					selectionRegions.push({
+						...region,
+						line: region.line + lineOffset,
+						tableTop: region.tableTop + lineOffset,
+						tableBottom: region.tableBottom + lineOffset,
+					});
+				}
+				transcript.push(...componentLines);
 			}
-			for (const line of componentLines) {
-				transcript.push(line);
-			}
-		}
-		const dock = fullscreen.dock.render(width);
+			return fullscreen.dock.render(width);
+		});
 
 		let frame = fullscreen.viewport.composeFrame(transcript, dock, height, selectionRegions);
 		this.overlaySelectionRegions.push(
@@ -1459,7 +1460,7 @@ export class TUI extends Container {
 			}
 		}
 		if (this.overlayStack.length > 0) {
-			frame = this.compositeOverlays(frame, width, height);
+			frame = withFullscreenImageFallback(() => this.compositeOverlays(frame, width, height));
 		}
 		const cursorPos = this.extractCursorPosition(frame, height);
 		fullscreen.viewport.applyFrameSelection(frame, height, this.overlaySelectionRegions);

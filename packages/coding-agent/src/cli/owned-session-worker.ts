@@ -24,6 +24,10 @@ let closeOwnerWatch: (() => void) | undefined;
 
 export type OwnedSessionWorkerProfile = "print" | "json" | "rpc" | "interactive-ephemeral";
 
+export function isOwnedSessionWorkerProcess(environment: NodeJS.ProcessEnv = process.env): boolean {
+	return environment[OWNED_WORKER_ENV] === "1";
+}
+
 interface OwnedSessionRecoveryDescriptor {
 	version: 1;
 	profile: OwnedSessionWorkerProfile;
@@ -63,7 +67,7 @@ export function classifyOwnedSessionWorkerInvocation(
 	stdinIsTTY: boolean | undefined,
 	environment: NodeJS.ProcessEnv = process.env,
 ): OwnedSessionWorkerProfile | undefined {
-	if (environment[OWNED_WORKER_ENV] === "1" || hasNonSessionOperation(args)) {
+	if (isOwnedSessionWorkerProcess(environment) || hasNonSessionOperation(args)) {
 		return undefined;
 	}
 
@@ -472,7 +476,13 @@ export async function runOwnedSessionWorkerFrontend(
 	}
 }
 
-export async function maybeRunOwnedSessionWorkerFrontend(args: readonly string[]): Promise<boolean> {
+export async function maybeRunOwnedSessionWorkerFrontend(
+	args: readonly string[],
+	forceLegacyFrontend = false,
+): Promise<boolean> {
+	if (!forceLegacyFrontend && process.env.PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND !== "1") {
+		return false;
+	}
 	const profile = classifyOwnedSessionWorkerInvocation(args, process.stdin.isTTY);
 	if (!profile) {
 		return false;
@@ -482,7 +492,7 @@ export async function maybeRunOwnedSessionWorkerFrontend(args: readonly string[]
 }
 
 export function installOwnedSessionWorkerOwnerWatch(): void {
-	if (process.env[OWNED_WORKER_ENV] !== "1") {
+	if (!isOwnedSessionWorkerProcess()) {
 		return;
 	}
 	if (!process.channel) {
