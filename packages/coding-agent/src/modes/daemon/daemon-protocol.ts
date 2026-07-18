@@ -49,8 +49,8 @@ import type { SessionSummary } from "./daemon-session-list.js";
 export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
 export const DAEMON_PROTOCOL_VERSION = 4;
 export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 2;
-export const DAEMON_SCHEMA_REVISION = 1;
-export const DAEMON_SCHEMA_ID = "protocol-4-schema-1-f55df8742274";
+export const DAEMON_SCHEMA_REVISION = 2;
+export const DAEMON_SCHEMA_ID = "protocol-4-schema-2-cbdbe20e7ce4";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -69,7 +69,11 @@ export type DaemonClientCapability =
 	| "slim_attach"
 	| "chunked_snapshot"
 	| "client_owned_sessions";
-export type DaemonServerCapability = DaemonClientCapability | "heartbeat_catalog" | "heartbeat_management";
+export type DaemonServerCapability =
+	| DaemonClientCapability
+	| "heartbeat_catalog"
+	| "heartbeat_management"
+	| "model_catalog";
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
 export interface DaemonProtocolInfo {
@@ -100,6 +104,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	...DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	"heartbeat_catalog",
 	"heartbeat_management",
+	"model_catalog",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -462,6 +467,7 @@ export type DaemonCommand =
 	| { id?: string; type: "get_context_tree"; activeSessionId: string }
 	| { id?: string; type: "get_commands"; activeSessionId: string }
 	| { id?: string; type: "get_resource_snapshot"; activeSessionId: string }
+	| { id?: string; type: "get_model_catalog"; activeSessionId: string }
 	| { id?: string; type: "get_available_models"; activeSessionId: string }
 	| { id?: string; type: "get_queue"; activeSessionId: string }
 	| { id?: string; type: "clear_queue"; activeSessionId: string }
@@ -613,6 +619,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_context_tree: LEGACY_DAEMON_COMMAND,
 	get_commands: LEGACY_DAEMON_COMMAND,
 	get_resource_snapshot: LEGACY_DAEMON_COMMAND,
+	get_model_catalog: { minProtocol: 4, capability: "model_catalog" },
 	get_available_models: LEGACY_DAEMON_COMMAND,
 	get_queue: LEGACY_DAEMON_COMMAND,
 	clear_queue: LEGACY_DAEMON_COMMAND,
@@ -924,6 +931,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"get_context_tree",
 	"get_commands",
 	"get_resource_snapshot",
+	"get_model_catalog",
 	"get_available_models",
 	"get_queue",
 	"cron_list",

@@ -41,6 +41,7 @@ import type {
 	AgentConnectionForkOptions,
 	AgentConnectionHeartbeat,
 	AgentConnectionModel,
+	AgentConnectionModelCatalog,
 	AgentConnectionModelCycleResult,
 	AgentConnectionNavigateTreeOptions,
 	AgentConnectionNavigateTreeResult,
@@ -145,6 +146,10 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async getAvailableModels(): Promise<AgentConnectionModel[]> {
 		return this.session.modelRegistry.refreshAvailableModels();
+	}
+
+	async getModelCatalog(): Promise<AgentConnectionModelCatalog> {
+		return this.session.modelRegistry.refreshModelCatalog();
 	}
 
 	async getSessionStats(): Promise<SessionStats> {

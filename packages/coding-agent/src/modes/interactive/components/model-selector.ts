@@ -11,7 +11,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { ModelRegistry } from "../../../core/model-registry.js";
 import { theme } from "../theme/theme.js";
-import { keyHint, keyText } from "./keybinding-hints.js";
+import { keyHint } from "./keybinding-hints.js";
 import {
 	getMenuListLayout,
 	MenuList,
@@ -33,18 +33,11 @@ interface ScopedModelItem {
 	thinkingLevel?: string;
 }
 
-export interface ModelSelectorAction {
-	id: string;
-	label: string;
-	description: string;
-}
-
 export interface ModelSelectorOptions {
-	actions?: ReadonlyArray<ModelSelectorAction>;
 	availableModels?: ReadonlyArray<Model<any>>;
+	configuredProviders?: ReadonlySet<string>;
 	header?: Component;
 	getHeaderRows?: () => number;
-	onAction?: (actionId: string) => void;
 	subtitle?: string;
 	getRows?: () => number;
 	recentModels?: ReadonlyArray<string>;
@@ -82,13 +75,13 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private activeModels: ModelItem[] = [];
 	private filteredModels: ModelItem[] = [];
 	private selectedIndex: number = 0;
+	private searchQuery = "";
 	private currentModel?: Model<any>;
 	private modelRegistry: ModelRegistry;
 	private onSelectCallback: (model: Model<any>) => void;
 	private onCancelCallback: () => void;
-	private actions: ReadonlyArray<ModelSelectorAction>;
 	private availableModels?: ReadonlyArray<Model<any>>;
-	private onActionCallback?: (actionId: string) => void;
+	private configuredProviders?: ReadonlySet<string>;
 	private recentRank: Map<string, number>;
 	private errorMessage?: string;
 	private tui: TUI;
@@ -128,16 +121,15 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.scope = scopedModels.length > 0 ? "scoped" : "all";
 		this.onSelectCallback = onSelect;
 		this.onCancelCallback = onCancel;
-		this.actions = options.actions ?? [];
 		this.availableModels = options.availableModels;
-		this.onActionCallback = options.onAction;
+		this.configuredProviders = options.configuredProviders;
 		this.recentRank = new Map((options.recentModels ?? []).map((key, i) => [key, i]));
 		this.viewport = { getRows: options.getRows };
 		this.getHeaderRows = options.header ? (options.getHeaderRows ?? (() => 2)) : () => 0;
 
 		this.panel = new MenuPanel({
 			title: "Models",
-			subtitle: options.subtitle ?? "Available from configured providers.",
+			subtitle: options.subtitle ?? "All models across supported providers.",
 		});
 		this.addChild(this.panel);
 		if (options.header) {
@@ -150,11 +142,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			this.scopeText = new Text(this.getScopeText(), 0, 0);
 			this.scopeHintText = new Text(this.getScopeHintText(), 0, 0);
 		} else {
-			const hintText =
-				this.actions.length > 0
-					? `Only showing models from configured providers. ${keyText("app.provider.add")} to add providers and access more models.`
-					: "Only showing models from configured providers. Use /login to add providers and see more models.";
-			this.warningText = new Text(theme.fg("warning", hintText), 0, 0);
+			const hintText = "Signed-in providers first. Other models prompt sign-in.";
+			this.warningText = new Text(theme.fg("muted", hintText), 0, 0);
 		}
 		this.headerHelpContainer = new Container();
 		this.panel.addChild(this.headerHelpContainer);
@@ -189,9 +178,14 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.updateState(this.currentModel, availableModels);
 	}
 
-	updateState(currentModel: Model<any> | undefined, availableModels = this.availableModels): void {
+	updateState(
+		currentModel: Model<any> | undefined,
+		availableModels = this.availableModels,
+		configuredProviders = this.configuredProviders,
+	): void {
 		this.currentModel = currentModel;
 		this.availableModels = availableModels;
+		this.configuredProviders = configuredProviders;
 		const query = this.searchInput.getValue();
 		const selectedKey = this.getSelectedModelKey();
 
@@ -277,11 +271,15 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		return this.recentRank.get(`${item.provider}/${item.id}`) ?? Number.MAX_SAFE_INTEGER;
 	}
 
+	private isProviderConfigured(item: ModelItem): boolean {
+		return this.configuredProviders?.has(item.provider) || this.modelRegistry.hasConfiguredAuth(item.model);
+	}
+
 	private sortModels(models: ModelItem[]): ModelItem[] {
 		const sorted = [...models];
-		// Current model first, then most-recently-used, then provider; within a
-		// provider, featured flagships before the long tail, each alphabetical.
 		sorted.sort((a, b) => {
+			const configuredDiff = Number(this.isProviderConfigured(b)) - Number(this.isProviderConfigured(a));
+			if (configuredDiff !== 0) return configuredDiff;
 			const aIsCurrent = modelsAreEqual(this.currentModel, a.model);
 			const bIsCurrent = modelsAreEqual(this.currentModel, b.model);
 			if (aIsCurrent !== bIsCurrent) return aIsCurrent ? -1 : 1;
@@ -304,7 +302,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private getScopeHintText(): string {
-		return keyHint("tui.input.tab", "scope") + theme.fg("muted", " (all/scoped)");
+		return keyHint("app.model.toggleScope", "scope") + theme.fg("muted", " (all/scoped)");
 	}
 
 	private setScope(scope: ModelScope): void {
@@ -320,19 +318,25 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	}
 
 	private filterModels(query: string): void {
+		const queryChanged = query !== this.searchQuery;
+		this.searchQuery = query;
 		if (query.trim()) {
 			const scored = fuzzyFilterScored(
 				this.activeModels,
 				query,
 				({ id, provider }) => `${id} ${provider} ${provider}/${id} ${provider} ${id}`,
 			);
-			// Among equally-good matches (e.g. glm-5 / glm-5.1 / glm-5.2), prefer the most-recently-used.
-			scored.sort((a, b) => a.score - b.score || this.recentRankOf(a.item) - this.recentRankOf(b.item));
+			scored.sort(
+				(a, b) =>
+					a.score - b.score ||
+					Number(this.isProviderConfigured(b.item)) - Number(this.isProviderConfigured(a.item)) ||
+					this.recentRankOf(a.item) - this.recentRankOf(b.item),
+			);
 			this.filteredModels = scored.map((r) => r.item);
 		} else {
 			this.filteredModels = this.activeModels;
 		}
-		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.getSelectableCount() - 1));
+		this.selectedIndex = queryChanged ? 0 : Math.min(this.selectedIndex, Math.max(0, this.getSelectableCount() - 1));
 		this.updateList();
 	}
 
@@ -364,12 +368,18 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 			const isSelected = i === this.selectedIndex;
 			const isCurrent = modelsAreEqual(this.currentModel, item.model);
+			const isConfigured = this.isProviderConfigured(item);
+			const meta = isConfigured
+				? isCurrent
+					? theme.fg("success", "current")
+					: undefined
+				: theme.fg("warning", isCurrent ? "current · sign in" : "sign in");
 
 			this.listContainer.addChild(
 				new MenuRow({
 					primary: item.id,
 					secondary: item.provider,
-					meta: isCurrent ? theme.fg("success", "current") : undefined,
+					meta,
 					selected: isSelected,
 				}),
 			);
@@ -401,12 +411,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
-		const addProviderAction = this.actions[0];
-		if (addProviderAction && kb.matches(keyData, "app.provider.add")) {
-			this.onActionCallback?.(addProviderAction.id);
-			return;
-		}
-		if (kb.matches(keyData, "tui.input.tab")) {
+		if (kb.matches(keyData, "app.model.toggleScope")) {
 			if (this.scopedModelItems.length > 0) {
 				const nextScope: ModelScope = this.scope === "all" ? "scoped" : "all";
 				this.setScope(nextScope);

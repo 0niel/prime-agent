@@ -34,7 +34,6 @@ import {
 	CombinedAutocompleteProvider,
 	type Component,
 	Container,
-	fuzzyFilter,
 	Loader,
 	type LoaderIndicatorOptions,
 	Markdown,
@@ -135,6 +134,7 @@ import type {
 	AgentConnectionExtensionUiResponse,
 	AgentConnectionHeartbeat,
 	AgentConnectionModel,
+	AgentConnectionModelCatalog,
 	AgentConnectionQueueState,
 	AgentConnectionResourceDiagnostic,
 	AgentConnectionResourceSnapshot,
@@ -150,6 +150,7 @@ import type {
 	AgentConnectionState,
 	AgentConnectionToolDefinition,
 } from "../agent-connection/index.js";
+import { getModelArgumentCompletions } from "../model-autocomplete.js";
 import {
 	checkForPackageUpdates,
 	checkTmuxKeyboardSetup,
@@ -826,6 +827,8 @@ export class InteractiveMode {
 	private skillCommands = new Map<string, string>();
 	private connectionCommands: AgentConnectionSlashCommand[] = [];
 	private connectionModels: AgentConnectionModel[] = [];
+	private connectionModelCatalog: AgentConnectionModel[] = [];
+	private connectionConfiguredProviders = new Set<string>();
 	private connectionModelsFetchedAt = 0;
 	private connectionModelsRefreshVersion = 0;
 	private connectionModelsRefreshInFlight: { version: number; promise: Promise<AgentConnectionModel[]> } | undefined;
@@ -1111,32 +1114,8 @@ export class InteractiveMode {
 
 		const modelCommand = slashCommands.find((command) => command.name === "model");
 		if (modelCommand) {
-			modelCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
-				const models =
-					this.connectionState && this.connectionState.scopedModels.length > 0
-						? this.connectionState.scopedModels.map((s) => s.model)
-						: this.connectionModels;
-
-				if (models.length === 0) return null;
-
-				// Create items with provider/id format
-				const items = models.map((m) => ({
-					id: m.id,
-					provider: m.provider,
-					label: `${m.provider}/${m.id}`,
-				}));
-
-				// Fuzzy filter by model ID + provider (allows "opus anthropic" to match)
-				const filtered = fuzzyFilter(items, prefix, (item) => `${item.id} ${item.provider}`);
-
-				if (filtered.length === 0) return null;
-
-				return filtered.map((item) => ({
-					value: item.label,
-					label: item.id,
-					description: item.provider,
-				}));
-			};
+			modelCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null =>
+				getModelArgumentCompletions(prefix, this.getCachedModelCandidates());
 		}
 
 		const effortCommand = slashCommands.find((command) => command.name === "effort");
@@ -2330,15 +2309,15 @@ export class InteractiveMode {
 
 	private async refreshConnectionCatalog(): Promise<void> {
 		this.invalidateConnectionModelRefresh();
-		const [state, commands, models, resources] = await Promise.all([
+		const [state, commands, modelCatalog, resources] = await Promise.all([
 			this.agentConnection.getState(),
 			this.agentConnection.getCommands(),
-			this.agentConnection.getAvailableModels(),
+			this.agentConnection.getModelCatalog(),
 			this.agentConnection.getResourceSnapshot(),
 		]);
 		this.applyConnectionStateSnapshot(state);
 		this.connectionCommands = commands;
-		this.connectionModels = models;
+		this.applyConnectionModelCatalog(modelCatalog);
 		this.connectionModelsFetchedAt = Date.now();
 		this.connectionResourceSnapshot = resources;
 	}
@@ -7070,11 +7049,10 @@ export class InteractiveMode {
 		const model = await this.findExactModelMatch(searchTerm);
 		if (model) {
 			try {
-				this.showStatus(`Switching model: ${model.id}`);
-				await this.applySelectedModel(model);
-				this.showStatus(`Model: ${model.id}`);
-				void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
-				this.checkDaxnutsEasterEgg(model);
+				const authFlows = this.createAuthFlows();
+				const providerOptions = authFlows.getLoginProviderOptions();
+				if (!(await this.ensureModelProviderConfigured(model, authFlows, providerOptions))) return;
+				await this.completeModelSelection(model);
 			} catch (error) {
 				this.showError(error instanceof Error ? error.message : String(error));
 			}
@@ -7127,6 +7105,50 @@ export class InteractiveMode {
 		this.setupAutocompleteProvider();
 	}
 
+	private async completeModelSelection(model: AgentConnectionModel): Promise<void> {
+		this.showStatus(`Switching model: ${model.id}`);
+		await this.applySelectedModel(model);
+		this.showStatus(`Model: ${model.id}`);
+		void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
+		this.checkDaxnutsEasterEgg(model);
+	}
+
+	private async ensureModelProviderConfigured(
+		model: AgentConnectionModel,
+		authFlows: ProviderAuthFlows,
+		providerOptions: ReadonlyArray<AuthSelectorProvider>,
+	): Promise<boolean> {
+		if (this.isModelProviderConfigured(model)) return true;
+
+		const provider = providerOptions.find(
+			(option) => option.id === model.provider && (option.category ?? "provider") === "provider",
+		);
+		if (!provider) {
+			this.showError(`Authentication for ${model.provider} must be configured externally.`);
+			return false;
+		}
+
+		const result = await authFlows.loginProvider(provider);
+		if (result.status !== "success") return false;
+
+		this.invalidateConnectionModels();
+		await this.getConnectionAvailableModels();
+		if (this.isModelProviderConfigured(model)) return true;
+
+		this.showError(`Authentication completed, but ${model.provider} is still unavailable.`);
+		return false;
+	}
+
+	private isModelProviderConfigured(model: AgentConnectionModel): boolean {
+		return this.connectionConfiguredProviders.has(model.provider) || this.modelRegistry.hasConfiguredAuth(model);
+	}
+
+	private applyConnectionModelCatalog(catalog: AgentConnectionModelCatalog): void {
+		this.connectionModelCatalog = [...catalog.models];
+		this.connectionConfiguredProviders = new Set(catalog.configuredProviders);
+		this.connectionModels = catalog.models.filter((model) => this.connectionConfiguredProviders.has(model.provider));
+	}
+
 	private async getConnectionAvailableModels(): Promise<AgentConnectionModel[]> {
 		const inFlight = this.connectionModelsRefreshInFlight;
 		if (inFlight && inFlight.version === this.connectionModelsRefreshVersion) {
@@ -7134,14 +7156,13 @@ export class InteractiveMode {
 		}
 
 		const version = this.connectionModelsRefreshVersion;
-		const promise = this.agentConnection.getAvailableModels().then((models) => {
-			const nextModels = [...models];
+		const promise = this.agentConnection.getModelCatalog().then((catalog) => {
 			if (version !== this.connectionModelsRefreshVersion) {
 				return [...this.connectionModels];
 			}
-			this.connectionModels = nextModels;
+			this.applyConnectionModelCatalog(catalog);
 			this.connectionModelsFetchedAt = Date.now();
-			return nextModels;
+			return [...this.connectionModels];
 		});
 		this.connectionModelsRefreshInFlight = { version, promise };
 
@@ -7154,12 +7175,17 @@ export class InteractiveMode {
 		}
 	}
 
+	private async getConnectionModelCatalog(): Promise<AgentConnectionModel[]> {
+		await this.getConnectionAvailableModels();
+		return [...this.connectionModelCatalog];
+	}
+
 	private getCachedModelCandidates(): AgentConnectionModel[] {
 		const modelsById = new Map<string, AgentConnectionModel>();
 		for (const scoped of this.getScopedModelState()) {
 			modelsById.set(`${scoped.model.provider}/${scoped.model.id}`, scoped.model);
 		}
-		for (const model of this.connectionModels) {
+		for (const model of this.connectionModelCatalog) {
 			modelsById.set(`${model.provider}/${model.id}`, model);
 		}
 		return [...modelsById.values()];
@@ -7168,14 +7194,15 @@ export class InteractiveMode {
 	private getModelSelectorRefreshPromise(
 		options: { force?: boolean } = {},
 	): Promise<AgentConnectionModel[]> | undefined {
+		const refreshCatalog = () => this.getConnectionAvailableModels().then(() => this.getCachedModelCandidates());
 		if (this.connectionModelsRefreshInFlight) {
-			return this.getConnectionAvailableModels();
+			return refreshCatalog();
 		}
 		if (options.force || this.connectionModelsFetchedAt === 0) {
-			return this.getConnectionAvailableModels();
+			return refreshCatalog();
 		}
 		if (Date.now() - this.connectionModelsFetchedAt > MODEL_CATALOG_REFRESH_TTL_MS) {
-			return this.getConnectionAvailableModels();
+			return refreshCatalog();
 		}
 		return undefined;
 	}
@@ -7187,8 +7214,14 @@ export class InteractiveMode {
 
 	private invalidateConnectionModels(): void {
 		this.connectionModels = [];
+		this.connectionConfiguredProviders = new Set();
 		this.connectionModelsFetchedAt = 0;
 		this.invalidateConnectionModelRefresh();
+	}
+
+	private async refreshConnectionModelsAfterAuthChange(): Promise<void> {
+		this.invalidateConnectionModels();
+		await this.getConnectionAvailableModels();
 	}
 
 	private async getModelCandidates(): Promise<AgentConnectionModel[]> {
@@ -7367,7 +7400,7 @@ export class InteractiveMode {
 	}
 
 	private showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
-		const availableModels = this.getCachedModelCandidates();
+		const modelCatalog = this.getCachedModelCandidates();
 		const authFlows = this.createAuthFlows();
 		const providerOptions = authFlows.getLoginProviderOptions();
 
@@ -7375,11 +7408,26 @@ export class InteractiveMode {
 			let handle: OverlayHandle | undefined;
 			let settled = false;
 			let hidden = false;
+			let removed = false;
 			let menu: ConfigurationMenuComponent;
 			const hide = () => {
-				if (hidden) return;
+				if (removed) return;
+				removed = true;
 				hidden = true;
 				handle?.hide();
+				this.ui.requestRender();
+			};
+			const conceal = () => {
+				if (hidden || removed) return;
+				hidden = true;
+				handle?.setHidden(true);
+				this.ui.requestRender();
+			};
+			const show = () => {
+				if (!hidden || removed || settled) return;
+				hidden = false;
+				handle?.setHidden(false);
+				handle?.focus();
 				this.ui.requestRender();
 			};
 			const finish = () => {
@@ -7393,7 +7441,7 @@ export class InteractiveMode {
 				if (!refreshPromise) return;
 				void refreshPromise
 					.then((models) => {
-						if (!settled) menu.updateModels(this.getCurrentModel(), models);
+						if (!settled) menu.updateModels(this.getCurrentModel(), models, this.connectionConfiguredProviders);
 					})
 					.catch((error) => {
 						if (!settled) this.showError(error instanceof Error ? error.message : String(error));
@@ -7421,7 +7469,11 @@ export class InteractiveMode {
 						}
 
 						await this.prepareForModelSelectionAfterLogin(authResult);
-						menu.updateModels(this.getCurrentModel());
+						menu.updateModels(
+							this.getCurrentModel(),
+							this.getCachedModelCandidates(),
+							this.connectionConfiguredProviders,
+						);
 						menu.setActiveTab("models");
 						refreshModels(true);
 					})
@@ -7439,7 +7491,8 @@ export class InteractiveMode {
 				modelRegistry: this.modelRegistry,
 				currentModel: this.getCurrentModel(),
 				scopedModels: this.getScopedModelState(),
-				availableModels,
+				availableModels: modelCatalog,
+				configuredProviders: this.connectionConfiguredProviders,
 				recentModels: this.settingsManager.getRecentModels(),
 				initialModelSearch,
 				getRows: () => this.ui.terminal.rows,
@@ -7447,16 +7500,28 @@ export class InteractiveMode {
 				onSelectProvider: (provider) => authenticate(provider, "providers"),
 				onSelectMcpConnection: (provider) => authenticate(provider, "mcp-connections"),
 				onSelectModel: (model) => {
-					hide();
-					this.showStatus(`Switching model: ${model.id}`);
-					void this.applySelectedModel(model)
-						.then(() => {
-							this.showStatus(`Model: ${model.id}`);
-							void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
-							this.checkDaxnutsEasterEgg(model);
-						})
-						.catch((error) => this.showError(error instanceof Error ? error.message : String(error)))
-						.finally(finish);
+					void (async () => {
+						let completed = false;
+						try {
+							const ready = await this.ensureModelProviderConfigured(model, authFlows, providerOptions);
+							handle?.focus();
+							menu.refreshAuthentication();
+							menu.updateModels(
+								this.getCurrentModel(),
+								this.getCachedModelCandidates(),
+								this.connectionConfiguredProviders,
+							);
+							if (!ready || settled) return;
+							conceal();
+							await this.completeModelSelection(model);
+							completed = true;
+						} catch (error) {
+							show();
+							this.showError(error instanceof Error ? error.message : String(error));
+						} finally {
+							if (completed) finish();
+						}
+					})();
 				},
 				onCancel: finish,
 			});
@@ -7468,7 +7533,7 @@ export class InteractiveMode {
 	private async showModelsSelector(): Promise<void> {
 		let allModels: AgentConnectionModel[];
 		try {
-			allModels = await this.getConnectionAvailableModels();
+			allModels = await this.getConnectionModelCatalog();
 		} catch (error) {
 			this.showError(error instanceof Error ? error.message : String(error));
 			return;
@@ -7899,6 +7964,7 @@ export class InteractiveMode {
 			showError: (message) => this.showError(message),
 			getAvailableModels: () => this.getConnectionAvailableModels(),
 			onAuthChanged: async () => {
+				await this.refreshConnectionModelsAfterAuthChange();
 				await this.updateAvailableProviderCount();
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
@@ -7910,10 +7976,6 @@ export class InteractiveMode {
 	}
 
 	private async prepareForModelSelectionAfterLogin(authResult: AuthenticationResult): Promise<boolean> {
-		if (authResult.status === "success" && authResult.kind !== "service") {
-			this.invalidateConnectionModels();
-		}
-
 		const currentModel = this.getCurrentModel();
 		// The agent core uses unknown/unknown as its no-model sentinel.
 		const selectedModel =

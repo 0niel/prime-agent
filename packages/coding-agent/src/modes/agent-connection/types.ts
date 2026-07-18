@@ -46,6 +46,10 @@ import type { SessionStats } from "../../core/session-stats.js";
  */
 export type AgentConnectionQueueMode = "all" | "one-at-a-time";
 export type AgentConnectionModel = Model<Api>;
+export interface AgentConnectionModelCatalog {
+	models: AgentConnectionModel[];
+	configuredProviders: string[];
+}
 export type AgentConnectionSavedSessionScope = "current" | "all";
 
 export interface AgentConnectionSessionHeader {
@@ -590,6 +594,7 @@ export interface AgentConnection {
 	getSessionHeader(): Promise<AgentConnectionSessionHeader | undefined>;
 	getCommands(): Promise<AgentConnectionSlashCommand[]>;
 	getResourceSnapshot(): Promise<AgentConnectionResourceSnapshot>;
+	getModelCatalog(): Promise<AgentConnectionModelCatalog>;
 	getAvailableModels(): Promise<AgentConnectionModel[]>;
 	getSessionStats(): Promise<SessionStats>;
 	getContextTree(): Promise<ContextTreeNode>;

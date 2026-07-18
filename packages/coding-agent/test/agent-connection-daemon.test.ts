@@ -150,6 +150,23 @@ class FakeDaemonClient {
 						},
 					},
 				};
+			case "get_model_catalog":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: {
+						models: [getModel("openai", "gpt-5.1")],
+						configuredProviders: ["openai"],
+					},
+				};
+			case "get_available_models":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: { models: [getModel("openai", "gpt-5.1")] },
+				};
 			case "get_session_context":
 				return {
 					type: "response",
@@ -2096,6 +2113,37 @@ describe("DaemonAgentConnection", () => {
 
 		expect(fakeClient.requests[1]).toMatchObject({
 			type: "get_resource_snapshot",
+			activeSessionId: "active-1",
+		});
+	});
+
+	it("loads the full model catalog through the daemon protocol", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("model_catalog");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		const catalog = await connection.getModelCatalog();
+
+		expect(catalog.configuredProviders).toEqual(["openai"]);
+		expect(catalog.models[0]).toMatchObject({ provider: "openai", id: "gpt-5.1" });
+		expect(fakeClient.requests[1]).toMatchObject({
+			type: "get_model_catalog",
+			activeSessionId: "active-1",
+		});
+	});
+
+	it("falls back to configured models when the daemon lacks model catalog support", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		const catalog = await connection.getModelCatalog();
+
+		expect(catalog.configuredProviders).toEqual(["openai"]);
+		expect(catalog.models[0]).toMatchObject({ provider: "openai", id: "gpt-5.1" });
+		expect(fakeClient.requests[1]).toMatchObject({
+			type: "get_available_models",
 			activeSessionId: "active-1",
 		});
 	});

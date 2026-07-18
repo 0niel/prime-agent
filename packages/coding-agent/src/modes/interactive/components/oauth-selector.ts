@@ -72,6 +72,7 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 	private allProviders: AuthSelectorProvider[];
 	private filteredProviders: AuthSelectorProvider[];
 	private selectedIndex: number = 0;
+	private searchQuery = "";
 	private mode: "login" | "logout";
 	/** Tabs present in the data, in display order. Empty/single → no tab bar. */
 	private categories: AuthSelectorCategory[] = [];
@@ -184,11 +185,15 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 	}
 
 	private filterProviders(query: string): void {
+		const queryChanged = query !== this.searchQuery;
+		this.searchQuery = query;
 		const inCategory = this.allProviders.filter((p) => this.inActiveCategory(p));
 		this.filteredProviders = query
 			? fuzzyFilter(inCategory, query, (provider) => `${provider.name} ${provider.id} ${provider.authType}`)
 			: inCategory;
-		this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, Math.max(0, this.filteredProviders.length - 1)));
+		this.selectedIndex = queryChanged
+			? 0
+			: Math.max(0, Math.min(this.selectedIndex, Math.max(0, this.filteredProviders.length - 1)));
 		this.updateTabBar();
 		this.updateList();
 	}

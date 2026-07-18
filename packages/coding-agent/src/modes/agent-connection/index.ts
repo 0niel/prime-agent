@@ -20,6 +20,7 @@ export type {
 	AgentConnectionHeartbeat,
 	AgentConnectionLabelEntry,
 	AgentConnectionModel,
+	AgentConnectionModelCatalog,
 	AgentConnectionModelChangeEntry,
 	AgentConnectionModelCycleResult,
 	AgentConnectionNavigateTreeOptions,

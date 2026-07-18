@@ -58,6 +58,14 @@ describe("daemon protocol helpers", () => {
 		);
 	});
 
+	it("capability-gates the optional model catalog surface", () => {
+		expect(DAEMON_COMMAND_COMPATIBILITY.get_model_catalog).toEqual({
+			minProtocol: 4,
+			capability: "model_catalog",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("model_catalog");
+	});
+
 	it("creates versioned command and event envelopes", () => {
 		const command = { id: "cmd-1", type: "attach", activeSessionId: "active-1" } as const;
 		const commandEnvelope = createDaemonCommandEnvelope(command, "cmd-1", "client-1");

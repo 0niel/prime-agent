@@ -274,6 +274,11 @@ export type ResolvedRequestAuth =
 			error: string;
 	  };
 
+export interface ModelCatalogSnapshot {
+	models: Model<Api>[];
+	configuredProviders: string[];
+}
+
 /** Result of loading custom models from models.json */
 interface CustomModelsResult {
 	models: Model<Api>[];
@@ -788,6 +793,20 @@ export class ModelRegistry {
 				this.authorizedPrivatePrimeInferenceTeamId = undefined;
 			}
 		}
+	}
+
+	async refreshModelCatalog(): Promise<ModelCatalogSnapshot> {
+		const availableModels = await this.refreshAvailableModels();
+		const availablePrivateModels = new Set(
+			availableModels.filter(isPrivatePrimeInferenceModel).map((model) => `${model.provider}/${model.id}`),
+		);
+		return {
+			models: this.models.filter(
+				(model) =>
+					!isPrivatePrimeInferenceModel(model) || availablePrivateModels.has(`${model.provider}/${model.id}`),
+			),
+			configuredProviders: [...new Set(availableModels.map((model) => model.provider))],
+		};
 	}
 
 	async canUseModel(model: Model<Api>): Promise<boolean> {

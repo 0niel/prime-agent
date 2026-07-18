@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Changed `/model` to show all public models with authenticated providers first and open provider authentication when an unavailable model is selected ([ENG-4575](https://linear.app/primeintellect/issue/ENG-4575/show-all-models-in-model-and-prompt-auth-on-selection)).
+- Changed the shared configuration menu to cycle tabs with Tab, use Shift+Tab for model scope, show an Escape close hint, preserve arrow-key search editing, and remove the model selector's provider shortcut.
+- Fixed searchable selectors retaining their previous scroll position after the query changed.
 - Changed interactive, print, JSON, RPC, piped-stdin, and no-session clients to use the same daemon-owned runtime while preserving their existing commands, output protocols, and lifecycle behavior ([ENG-4685](https://linear.app/primeintellect/issue/ENG-4685)).
 - Added RPC controls for schedules, heartbeats, agent messaging, and live session observation ([ENG-4685](https://linear.app/primeintellect/issue/ENG-4685)).
 - Fixed daemon-backed headless startup, rollback routing, RPC wire compatibility, and duplicate client runtime preparation ([ENG-4685](https://linear.app/primeintellect/issue/ENG-4685)).

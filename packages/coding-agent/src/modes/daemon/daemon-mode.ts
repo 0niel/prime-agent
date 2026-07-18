@@ -237,6 +237,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_context_tree",
 	"get_commands",
 	"get_resource_snapshot",
+	"get_model_catalog",
 	"get_available_models",
 	"get_queue",
 	"clear_queue",
@@ -3147,6 +3148,15 @@ export class AgentDaemon {
 				return success(command.id, "get_available_models", {
 					models: await state.runtime.session.modelRegistry.refreshAvailableModels(),
 				});
+			}
+
+			case "get_model_catalog": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(
+					command.id,
+					"get_model_catalog",
+					await state.runtime.session.modelRegistry.refreshModelCatalog(),
+				);
 			}
 
 			case "get_queue": {

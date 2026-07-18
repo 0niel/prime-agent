@@ -18,9 +18,7 @@ export interface AppKeybindings {
 	"app.exit": true;
 	"app.suspend": true;
 	"app.model.select": true;
-	"app.provider.add": true;
-	"app.configuration.previousTab": true;
-	"app.configuration.nextTab": true;
+	"app.model.toggleScope": true;
 	"app.tools.expand": true;
 	"app.thinking.toggle": true;
 	"app.subagents.focus": true;
@@ -85,9 +83,7 @@ export const KEYBINDINGS = {
 		description: "Suspend to background",
 	},
 	"app.model.select": { defaultKeys: "ctrl+l", description: "Open model selector" },
-	"app.provider.add": { defaultKeys: "ctrl+p", description: "Add provider" },
-	"app.configuration.previousTab": { defaultKeys: "left", description: "Open previous configuration tab" },
-	"app.configuration.nextTab": { defaultKeys: "right", description: "Open next configuration tab" },
+	"app.model.toggleScope": { defaultKeys: "shift+tab", description: "Toggle model selector scope" },
 	"app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
 	"app.thinking.toggle": {
 		defaultKeys: "ctrl+t",
