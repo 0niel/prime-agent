@@ -1986,6 +1986,26 @@ describe("AgentSession queue characterization", () => {
 			'Extension command "/testcmd" cannot be queued. Use prompt() or execute the command when not streaming.',
 		);
 	});
+	it("does not drain queued commands as model messages after bash", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const compact = vi.spyOn(harness.session, "compact").mockResolvedValue({
+			summary: "compacted",
+			firstKeptEntryId: "kept",
+			tokensBefore: 100,
+		});
+		harness.setResponses([fauxAssistantMessage("after command")]);
+		await harness.session.queueSessionSlashCommand("/compact after bash", "followUp");
+		await harness.session.followUp("after command");
+		const internals = harness.session as unknown as { _drainQueuedMessagesAfterBash(): Promise<void> };
+
+		await internals._drainQueuedMessagesAfterBash();
+		await vi.waitFor(() => expect(harness.session.pendingMessageCount).toBe(0));
+
+		expect(compact).toHaveBeenCalledWith("after bash");
+		expect(getUserTexts(harness)).toEqual(["after command"]);
+	});
+
 	it("executes consecutive queued commands without starving completion", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
