@@ -278,6 +278,15 @@ describe("estimateCompactedContextTokens", () => {
 
 		expect(estimateCompactedContextTokens(1_000, before, after)).toBe(854);
 	});
+
+	it("subtracts images removed by compaction", () => {
+		const image = {
+			role: "user",
+			content: [{ type: "image", data: "data", mimeType: "image/png" }],
+			timestamp: 1,
+		} as AgentMessage;
+		expect(estimateCompactedContextTokens(1_500, [image], [])).toBe(300);
+	});
 });
 
 describe("shouldCompact", () => {

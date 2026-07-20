@@ -277,6 +277,8 @@ export function estimateTokens(message: AgentMessage): number {
 				for (const block of content) {
 					if (block.type === "text" && block.text) {
 						chars += block.text.length;
+					} else if (block.type === "image") {
+						chars += 4800;
 					}
 				}
 			}
