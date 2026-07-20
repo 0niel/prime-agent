@@ -75,6 +75,31 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).toContain("custom result");
 	});
 
+	test("hydrates a fallback component without losing its result", () => {
+		const component = new ToolExecutionComponent(
+			"remote_tool",
+			"tool-hydrated",
+			{ value: 42 },
+			{},
+			undefined,
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.updateResult({ content: [{ type: "text", text: "preserved result" }], isError: false }, false);
+
+		component.setToolDefinition({
+			...createBaseToolDefinition("remote_tool"),
+			renderShell: "self",
+			renderCall: () => new Text("hydrated call", 0, 0),
+			renderResult: (result) =>
+				new Text(`hydrated ${result.content.find((content) => content.type === "text")?.text ?? ""}`, 0, 0),
+		});
+
+		const rendered = stripAnsi(component.render(120).join("\n"));
+		expect(rendered).toContain("hydrated call");
+		expect(rendered).toContain("hydrated preserved result");
+	});
+
 	test.each(["kitty", null] as const)("renders one compact image metadata row for %s capability", (protocol) => {
 		setCapabilities({ images: protocol, trueColor: true, hyperlinks: true });
 		try {

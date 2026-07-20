@@ -212,6 +212,23 @@ export class ToolExecutionComponent extends Container {
 		this.updateDisplay();
 	}
 
+	setToolDefinition(toolDefinition: ToolExecutionDefinition | undefined): void {
+		const usedSelfRenderShell = this.usesSelfRenderShell();
+		this.toolDefinition = toolDefinition;
+		this.builtInToolDefinition = createReplayBuiltInToolDefinition(this.toolName, this.cwd, toolDefinition);
+		this.callRendererComponent = undefined;
+		this.resultRendererComponent = undefined;
+		this.rendererState = {};
+
+		if (usedSelfRenderShell !== this.usesSelfRenderShell()) {
+			this.clear();
+			this.addChild(this.usesSelfRenderShell() ? this.selfRenderContainer : this.contentPanel);
+		}
+
+		this.updateDisplay();
+		this.ui.requestRender();
+	}
+
 	markExecutionStarted(): void {
 		this.executionStarted = true;
 		this.updateDisplay();

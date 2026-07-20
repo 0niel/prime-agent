@@ -281,7 +281,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 				footer: { invalidate: vi.fn() },
 				updateEditorBorderColor: vi.fn(),
 				resetPendingToolState: vi.fn(),
-				preloadToolDefinitions: vi.fn(async () => {}),
+				hydrateToolDefinitions: vi.fn(),
 				settingsManager: {
 					getShowImages: () => true,
 				},
@@ -335,7 +335,7 @@ describe("InteractiveMode.renderSessionContext", () => {
 				footer: { invalidate: vi.fn() },
 				updateEditorBorderColor: vi.fn(),
 				resetPendingToolState: vi.fn(),
-				preloadToolDefinitions: vi.fn(async () => {}),
+				hydrateToolDefinitions: vi.fn(),
 				settingsManager: {
 					getShowImages: () => true,
 				},
@@ -693,7 +693,9 @@ describe("InteractiveMode connection events", () => {
 			({
 				unsubscribe: undefined,
 				localSessionHost: undefined,
+				toolDefinitionGeneration: 0,
 				toolDefinitionCache: { clear: vi.fn() },
+				toolDefinitionLoads: { clear: vi.fn() },
 				applyRuntimeSettings: vi.fn(),
 				bindLocalSessionExtensions: true,
 				bindCurrentSessionExtensions: vi.fn(async () => {}),

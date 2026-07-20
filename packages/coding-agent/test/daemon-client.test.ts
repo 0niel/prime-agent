@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
-import { DAEMON_PROTOCOL_VERSION } from "../src/modes/daemon/daemon-protocol.js";
+import { DAEMON_PROTOCOL_VERSION, type DaemonServerCapability } from "../src/modes/daemon/daemon-protocol.js";
 
 const netMock = vi.hoisted(() => {
 	type Listener = (...args: unknown[]) => void;
@@ -86,7 +86,11 @@ vi.mock("node:net", () => ({
 	createConnection: netMock.createConnection,
 }));
 
-function emitHello(socket: (typeof netMock.sockets)[number], version = DAEMON_PROTOCOL_VERSION): void {
+function emitHello(
+	socket: (typeof netMock.sockets)[number],
+	version = DAEMON_PROTOCOL_VERSION,
+	serverCapabilities: readonly DaemonServerCapability[] = [],
+): void {
 	socket.emit(
 		"data",
 		`${JSON.stringify({
@@ -95,7 +99,7 @@ function emitHello(socket: (typeof netMock.sockets)[number], version = DAEMON_PR
 			protocol: { name: "prime-agent.daemon", version },
 			appVersion: "9.9.9",
 			clientId: "client-1",
-			serverCapabilities: [],
+			serverCapabilities,
 		})}\n`,
 	);
 }
@@ -716,6 +720,118 @@ describe("DaemonClient", () => {
 			`${JSON.stringify({ id: firstEnvelope.id, type: "response", command: "prompt", success: true })}\n`,
 		);
 		await expect(response).resolves.toMatchObject({ id: firstEnvelope.id, success: true });
+		client.close();
+	});
+
+	it("queues commands created during a recoverable disconnect", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket);
+		firstSocket.emit("close");
+
+		const response = client.request({
+			type: "get_tool_definition",
+			activeSessionId: "active-1",
+			name: "bash",
+		});
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		expect(secondSocket.writes).toEqual([]);
+		emitHello(secondSocket);
+
+		expect(secondSocket.writes).toHaveLength(1);
+		const envelope = JSON.parse(secondSocket.writes[0]!) as { id: string; command: { type: string } };
+		expect(envelope.command.type).toBe("get_tool_definition");
+		secondSocket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "response",
+				command: "get_tool_definition",
+				success: true,
+				data: {},
+			})}\n`,
+		);
+
+		await expect(response).resolves.toMatchObject({ id: envelope.id, success: true });
+		client.close();
+	});
+
+	it("uses the last negotiated capabilities for commands queued during recovery", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket, DAEMON_PROTOCOL_VERSION, ["model_catalog"]);
+		firstSocket.emit("close");
+
+		const response = client.request({ type: "get_model_catalog", activeSessionId: "active-1" });
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		emitHello(secondSocket, DAEMON_PROTOCOL_VERSION, ["model_catalog"]);
+
+		const envelope = JSON.parse(secondSocket.writes[0]!) as { id: string };
+		secondSocket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "response",
+				command: "get_model_catalog",
+				success: true,
+				data: { models: [], providers: [] },
+			})}\n`,
+		);
+
+		await expect(response).resolves.toMatchObject({ id: envelope.id, success: true });
+		client.close();
+	});
+
+	it("does not time out a command queued for recoverable reconnection", async () => {
+		vi.useFakeTimers();
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket);
+		firstSocket.emit("close");
+
+		const response = client.request({ type: "list" }, 50);
+		let settled = false;
+		void response.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		await vi.advanceTimersByTimeAsync(500);
+		expect(settled).toBe(false);
+
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		emitHello(secondSocket);
+		const envelope = JSON.parse(secondSocket.writes[0]!) as { id: string };
+		secondSocket.emit(
+			"data",
+			`${JSON.stringify({ id: envelope.id, type: "response", command: "list", success: true })}\n`,
+		);
+
+		await expect(response).resolves.toMatchObject({ id: envelope.id, success: true });
 		client.close();
 	});
 

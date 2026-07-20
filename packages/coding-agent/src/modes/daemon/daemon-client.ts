@@ -113,6 +113,7 @@ export class DaemonClient {
 	private autoReconnectPromise?: Promise<void>;
 	private closed = false;
 	private helloMessage?: DaemonHello;
+	private lastHelloMessage?: DaemonHello;
 	private daemonClosingReason?: DaemonClosingReason;
 	private reconnectPromise?: Promise<void>;
 	private readonly helloWaiters = new Set<{
@@ -291,16 +292,19 @@ export class DaemonClient {
 		timeoutMs = 30000,
 		options: DaemonClientRequestOptions = {},
 	): Promise<DaemonResponse> {
-		if (!this.socket || this.socket.destroyed) {
+		if ((!this.socket || this.socket.destroyed) && !this.canQueueForReconnect()) {
 			throw new Error(
 				`Cannot send daemon command "${command.type}" because the Prime Agent daemon is not connected. ${daemonEndpointDetails(this.socketPath)}`,
 			);
 		}
-		const hello = this.helloMessage ?? (await this.waitForHello());
+		const hello =
+			this.helloMessage ??
+			(this.requestRecoveryEnabled ? this.lastHelloMessage : undefined) ??
+			(await this.waitForHello());
 		const compatibility = DAEMON_COMMAND_COMPATIBILITY[command.type];
 		if (
 			hello.protocol.version < compatibility.minProtocol ||
-			("capability" in compatibility && !this.supportsServerCapability(compatibility.capability))
+			("capability" in compatibility && hello.serverCapabilities?.includes(compatibility.capability) !== true)
 		) {
 			throw new DaemonCapabilityUnavailableError(
 				command.type,
@@ -343,7 +347,7 @@ export class DaemonClient {
 		options: DaemonClientRequestOptions = {},
 		publicEnvelopeProtocolVersion?: DaemonProtocolVersion,
 	): Promise<DaemonResponse> {
-		if (!this.socket || this.socket.destroyed) {
+		if ((!this.socket || this.socket.destroyed) && !this.canQueueForReconnect()) {
 			throw new Error(
 				`Cannot send daemon command "${command.type}" because the Prime Agent daemon is not connected. ${daemonEndpointDetails(this.socketPath)}`,
 			);
@@ -364,6 +368,9 @@ export class DaemonClient {
 			publicEnvelopeProtocolVersion !== undefined && isDaemonMutatingCommand(fullCommand as DaemonCommand);
 
 		return new Promise((resolve, reject) => {
+			const socket = this.socket;
+			const awaitingReconnect =
+				!socket || socket.destroyed || (this.requestRecoveryEnabled && this.helloMessage === undefined);
 			const pending: PendingDaemonRequest = {
 				resolve,
 				reject,
@@ -371,13 +378,19 @@ export class DaemonClient {
 				commandType: command.type,
 				onProgress: options.onProgress,
 				wireData,
-				awaitingReconnect: false,
+				awaitingReconnect,
 				acknowledgeResult,
 			};
 			this.pendingRequests.set(id, pending);
-			this.armPendingRequestTimeout(id, pending);
-			this.socket!.write(wireData);
+			if (!awaitingReconnect) {
+				this.armPendingRequestTimeout(id, pending);
+				socket.write(wireData);
+			}
 		});
+	}
+
+	private canQueueForReconnect(): boolean {
+		return this.requestRecoveryEnabled && !this.closed && this.lastHelloMessage !== undefined;
 	}
 
 	private armPendingRequestTimeout(id: string, pending: PendingDaemonRequest): void {
@@ -425,6 +438,7 @@ export class DaemonClient {
 
 		if (isDaemonHello(message)) {
 			this.helloMessage = message;
+			this.lastHelloMessage = message;
 			for (const waiter of [...this.helloWaiters]) {
 				clearTimeout(waiter.timeout);
 				this.helloWaiters.delete(waiter);

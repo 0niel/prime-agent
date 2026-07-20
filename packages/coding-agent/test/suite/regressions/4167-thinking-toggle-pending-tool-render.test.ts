@@ -51,7 +51,7 @@ type RenderSessionContextThis = {
 	updateConnectionStateFromEvent(event: AgentConnectionSessionEvent): void;
 	getCurrentCwd(): string;
 	getRetryAttempt(): number;
-	preloadToolDefinitions(toolNames: Iterable<string>): Promise<void>;
+	hydrateToolDefinitions(componentsByToolName: Map<string, ToolExecutionComponent[]>, generation: number): void;
 	getCachedToolDefinition(toolName: string): undefined;
 	addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void;
 };
@@ -94,7 +94,7 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 		updateConnectionStateFromEvent: vi.fn(),
 		getCurrentCwd: () => process.cwd(),
 		getRetryAttempt: () => 0,
-		preloadToolDefinitions: async (_toolNames: Iterable<string>) => undefined,
+		hydrateToolDefinitions: (_componentsByToolName, _generation) => undefined,
 		getCachedToolDefinition: (_toolName: string) => undefined,
 		addMessageToChat(message: AgentMessage) {
 			chatContainer.addChild(new Text(message.role, 0, 0));

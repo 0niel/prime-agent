@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed daemon attach restoration hiding transcripts or crashing when tool metadata was delayed by reconnection ([ENG-4742](https://linear.app/primeintellect/issue/ENG-4742/attach-can-hang-or-crash-while-restoring-transcript)).
 - Changed `/model` to show all public models with authenticated providers first and open provider authentication when an unavailable model is selected ([ENG-4575](https://linear.app/primeintellect/issue/ENG-4575/show-all-models-in-model-and-prompt-auth-on-selection)).
 - Changed the shared configuration menu to cycle tabs with Tab, use Shift+Tab for model scope, show an Escape close hint, preserve arrow-key search editing, and remove the model selector's provider shortcut.
 - Fixed searchable selectors retaining their previous scroll position after the query changed.
