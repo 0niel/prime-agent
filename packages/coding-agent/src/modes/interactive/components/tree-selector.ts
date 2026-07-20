@@ -762,8 +762,10 @@ class TreeList implements Component {
 				break;
 			}
 			case "compaction": {
-				const tokens = Math.round(entry.tokensBefore / 1000);
-				result = theme.fg("borderAccent", `[compaction: ${tokens}k tokens]`);
+				const before = Math.round(entry.tokensBefore / 1000);
+				const tokens =
+					entry.tokensAfter === undefined ? `${before}k` : `${before}k → ${Math.round(entry.tokensAfter / 1000)}k`;
+				result = theme.fg("borderAccent", `[compaction: ${tokens} tokens]`);
 				break;
 			}
 			case "branch_summary":

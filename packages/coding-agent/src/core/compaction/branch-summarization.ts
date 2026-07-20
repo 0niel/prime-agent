@@ -162,6 +162,8 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 				entry.tokensBefore,
 				entry.timestamp,
 				entry.customInstructions,
+				entry.tokensAfter,
+				entry.commandVisible,
 			);
 
 		// These don't contribute to conversation content

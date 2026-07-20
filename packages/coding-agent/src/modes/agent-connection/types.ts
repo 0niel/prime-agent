@@ -169,6 +169,8 @@ export interface AgentConnectionCompactionEntry extends AgentConnectionSessionEn
 	summary: string;
 	firstKeptEntryId: string;
 	tokensBefore: number;
+	tokensAfter?: number;
+	commandVisible?: boolean;
 	details?: unknown;
 	fromHook?: boolean;
 }

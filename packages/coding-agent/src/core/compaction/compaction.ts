@@ -109,6 +109,8 @@ export interface CompactionResult<T = unknown> {
 	summary: string;
 	firstKeptEntryId: string;
 	tokensBefore: number;
+	tokensAfter?: number;
+	commandVisible?: boolean;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
 }
@@ -235,6 +237,17 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 // ============================================================================
 // Cut point detection
 // ============================================================================
+
+/** Estimate post-compaction context while preserving provider-observed fixed overhead. */
+export function estimateCompactedContextTokens(
+	tokensBefore: number,
+	beforeMessages: AgentMessage[],
+	afterMessages: AgentMessage[],
+): number {
+	const estimatedBefore = beforeMessages.reduce((total, message) => total + estimateTokens(message), 0);
+	const estimatedAfter = afterMessages.reduce((total, message) => total + estimateTokens(message), 0);
+	return Math.max(0, tokensBefore - estimatedBefore) + estimatedAfter;
+}
 
 /**
  * Estimate token count for a message using chars/4 heuristic.

@@ -106,6 +106,7 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	estimateCompactedContextTokens,
 	estimateContextTokens,
 	generateBranchSummary,
 	prepareCompaction,
@@ -223,6 +224,7 @@ import {
 } from "./rlm-runtime.js";
 import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
 import {
+	buildSessionContext,
 	CURRENT_SESSION_VERSION,
 	getLatestCompactionEntry,
 	type SessionHeader,
@@ -4907,6 +4909,25 @@ export class AgentSession {
 			throw new Error("Compaction cancelled");
 		}
 
+		const beforeMessages = this.sessionManager.buildSessionContext().messages;
+		const previousEntry = this.sessionManager.getBranch().at(-1);
+		const commandVisible =
+			previousEntry?.type === "custom_message" && previousEntry.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE;
+		const syntheticCompaction: CompactionEntry = {
+			type: "compaction",
+			id: "tokens-after-preview",
+			parentId: this.sessionManager.getLeafId(),
+			timestamp: new Date().toISOString(),
+			summary,
+			firstKeptEntryId,
+			tokensBefore,
+			commandVisible,
+			details,
+			fromHook: fromExtension,
+			customInstructions,
+		};
+		const afterMessages = buildSessionContext([...this.sessionManager.getBranch(), syntheticCompaction]).messages;
+		const tokensAfter = estimateCompactedContextTokens(tokensBefore, beforeMessages, afterMessages);
 		this.sessionManager.appendCompaction(
 			summary,
 			firstKeptEntryId,
@@ -4914,6 +4935,8 @@ export class AgentSession {
 			details,
 			fromExtension,
 			customInstructions,
+			tokensAfter,
+			commandVisible,
 		);
 		const newEntries = this.sessionManager.getEntries();
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
@@ -4932,7 +4955,7 @@ export class AgentSession {
 		}
 		await this._notifyKernelStateAfterCompaction();
 
-		return { summary, firstKeptEntryId, tokensBefore, details };
+		return { summary, firstKeptEntryId, tokensBefore, tokensAfter, commandVisible, details };
 	}
 
 	/**

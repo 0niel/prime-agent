@@ -10,6 +10,7 @@ import {
 	calculateContextTokens,
 	compact,
 	DEFAULT_COMPACTION_SETTINGS,
+	estimateCompactedContextTokens,
 	estimateContextTokens,
 	findCutPoint,
 	getLastAssistantUsage,
@@ -249,6 +250,15 @@ describe("getLastAssistantUsage", () => {
 	it("should return undefined if no assistant messages", () => {
 		const entries: SessionEntry[] = [createMessageEntry(createUserMessage("Hello"))];
 		expect(getLastAssistantUsage(entries)).toBeUndefined();
+	});
+});
+
+describe("estimateCompactedContextTokens", () => {
+	it("preserves fixed overhead while replacing compacted messages", () => {
+		const before = [createUserMessage("x".repeat(400)), createAssistantMessage("y".repeat(200))];
+		const after = [createUserMessage("summary"), createUserMessage("recent")];
+
+		expect(estimateCompactedContextTokens(1_000, before, after)).toBe(854);
 	});
 });
 

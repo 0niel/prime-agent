@@ -175,13 +175,20 @@ describe("buildSessionContext", () => {
 			const entries: SessionEntry[] = [
 				msg("1", null, "user", "first"),
 				msg("2", "1", "assistant", "response"),
-				{ ...compaction("3", "2", "Summary", "1"), customInstructions: "focus on the auth refactor" },
+				{
+					...compaction("3", "2", "Summary", "1"),
+					customInstructions: "focus on the auth refactor",
+					tokensAfter: 250,
+					commandVisible: true,
+				},
 				msg("4", "3", "user", "second"),
 			];
 			const ctx = buildSessionContext(entries);
 
 			expect((ctx.messages[0] as any).summary).toContain("Summary");
 			expect((ctx.messages[0] as any).customInstructions).toBe("focus on the auth refactor");
+			expect((ctx.messages[0] as any).tokensAfter).toBe(250);
+			expect((ctx.messages[0] as any).commandVisible).toBe(true);
 		});
 
 		it("multiple compactions uses latest", () => {

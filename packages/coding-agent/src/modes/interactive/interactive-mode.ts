@@ -4996,6 +4996,8 @@ export class InteractiveMode {
 							event.result.tokensBefore,
 							new Date().toISOString(),
 							event.customInstructions,
+							event.result.tokensAfter,
+							event.result.commandVisible,
 						),
 					);
 					await this.refreshConnectionContextUsage();

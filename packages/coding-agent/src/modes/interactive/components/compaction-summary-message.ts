@@ -33,14 +33,18 @@ export class CompactionSummaryMessageComponent extends Box {
 		this.clear();
 
 		const tokenStr = this.message.tokensBefore.toLocaleString();
+		const tokenReduction =
+			this.message.tokensAfter === undefined
+				? `from ${tokenStr}`
+				: `${tokenStr} → ${this.message.tokensAfter.toLocaleString()}`;
 		const label = theme.fg("customMessageLabel", `\x1b[1m[compaction]\x1b[22m`);
 		this.addChild(new Text(label, 0, 0));
 		this.addChild(new Spacer(1));
 
 		const instructions = this.message.customInstructions;
 		if (this.expanded) {
-			let header = `**Compacted from ${tokenStr} tokens**\n\n`;
-			if (instructions) {
+			let header = `**Compacted ${tokenReduction} tokens**\n\n`;
+			if (instructions && !this.message.commandVisible) {
 				header += `**Focus:** ${instructions}\n\n`;
 			}
 			this.addChild(
@@ -52,7 +56,7 @@ export class CompactionSummaryMessageComponent extends Box {
 			const focus = instructions ? ` · focus: ${instructions}` : "";
 			this.addChild(
 				new Text(
-					theme.fg("customMessageText", `Compacted from ${tokenStr} tokens${focus} (`) +
+					theme.fg("customMessageText", `Compacted ${tokenReduction} tokens${focus} (`) +
 						theme.fg("dim", keyText("app.tools.expand")) +
 						theme.fg("customMessageText", " to expand)"),
 					0,
