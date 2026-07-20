@@ -796,6 +796,161 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("rejects a queued command when the replacement daemon loses its required capability", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket, DAEMON_PROTOCOL_VERSION, ["model_catalog"]);
+		firstSocket.emit("close");
+
+		const response = client.request({ type: "get_model_catalog", activeSessionId: "active-1" });
+		const rejection = expect(response).rejects.toThrow("does not support model_catalog");
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		emitHello(secondSocket, DAEMON_PROTOCOL_VERSION);
+
+		await rejection;
+		expect(secondSocket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("re-encodes a queued command for a replacement daemon with an older protocol", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket);
+		firstSocket.emit("close");
+
+		const response = client.request({ type: "list" });
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		emitHello(secondSocket, 1);
+
+		expect(secondSocket.writes).toHaveLength(1);
+		const command = JSON.parse(secondSocket.writes[0]!.trim()) as { id: string; type: string };
+		expect(command.type).toBe("list");
+		expect(command).not.toHaveProperty("protocol");
+		secondSocket.emit(
+			"data",
+			`${JSON.stringify({ id: command.id, type: "response", command: "list", success: true })}\n`,
+		);
+
+		await expect(response).resolves.toMatchObject({ id: command.id, success: true });
+		client.close();
+	});
+
+	it("does not replay an in-flight mutation without durable envelopes", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket);
+
+		const response = client.request({ type: "prompt", activeSessionId: "active-1", message: "hello" });
+		const rejection = expect(response).rejects.toThrow("does not support durable command envelopes");
+		firstSocket.emit("close");
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		emitHello(secondSocket, 1);
+
+		await rejection;
+		expect(secondSocket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("replays a restoration read when the worker closes during daemon teardown", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket);
+
+		const response = client.request({ type: "get_messages", activeSessionId: "active-1" });
+		const firstEnvelope = JSON.parse(firstSocket.writes[0]!) as { id: string };
+		firstSocket.emit(
+			"data",
+			`${JSON.stringify({
+				id: firstEnvelope.id,
+				type: "response",
+				command: "get_messages",
+				success: false,
+				error: "Daemon worker client closed",
+			})}\n`,
+		);
+		firstSocket.emit("close");
+
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		emitHello(secondSocket);
+		const secondEnvelope = JSON.parse(secondSocket.writes[0]!) as { id: string };
+		expect(secondEnvelope.id).toBe(firstEnvelope.id);
+		secondSocket.emit(
+			"data",
+			`${JSON.stringify({
+				id: secondEnvelope.id,
+				type: "response",
+				command: "get_messages",
+				success: true,
+				data: { messages: [] },
+			})}\n`,
+		);
+
+		await expect(response).resolves.toMatchObject({ id: firstEnvelope.id, success: true });
+		client.close();
+	});
+
+	it("surfaces a worker-close response when the daemon transport stays connected", async () => {
+		vi.useFakeTimers();
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket);
+
+		const response = client.request({ type: "get_messages", activeSessionId: "active-1" });
+		const envelope = JSON.parse(socket.writes[0]!) as { id: string };
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "response",
+				command: "get_messages",
+				success: false,
+				error: "Daemon worker client closed",
+			})}\n`,
+		);
+		let settled = false;
+		void response.finally(() => {
+			settled = true;
+		});
+		await vi.advanceTimersByTimeAsync(999);
+		expect(settled).toBe(false);
+		await vi.advanceTimersByTimeAsync(1);
+
+		await expect(response).resolves.toMatchObject({ id: envelope.id, success: false });
+		client.close();
+	});
+
 	it("does not time out a command queued for recoverable reconnection", async () => {
 		vi.useFakeTimers();
 		const client = new DaemonClient("/tmp/prime-agent.sock");
