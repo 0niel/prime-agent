@@ -473,6 +473,7 @@ export class BrandSplashHeader implements Component {
 type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
+	command?: boolean;
 };
 
 type GoalAnnouncementSnapshot = {
@@ -4153,10 +4154,14 @@ export class InteractiveMode {
 				const canonicalCommandText = commandName ? `/${commandName}${commandArgs ? ` ${commandArgs}` : ""}` : text;
 				const sessionCommand = parseSessionSlashCommand(canonicalCommandText);
 				if (sessionCommand && (this.isAgentStreaming() || this.isAgentCompacting())) {
-					this.editor.addToHistory?.(text);
-					this.editor.setText("");
-					await this.agentConnection.queueSessionSlashCommand(canonicalCommandText, "steering");
-					this.updatePendingMessagesDisplay();
+					if (this.isAgentCompacting()) {
+						this.queueCompactionMessage(canonicalCommandText, "steer", true);
+					} else {
+						this.editor.addToHistory?.(text);
+						this.editor.setText("");
+						await this.agentConnection.queueSessionSlashCommand(canonicalCommandText, "steering");
+						this.updatePendingMessagesDisplay();
+					}
 					return;
 				}
 
@@ -6423,12 +6428,16 @@ export class InteractiveMode {
 		try {
 			const sessionCommand = parseSessionSlashCommand(text);
 			if (sessionCommand && (this.isAgentStreaming() || this.isAgentCompacting())) {
-				this.editor.addToHistory?.(text);
-				clearedSubmittedText = text;
-				this.editor.setText("");
-				await this.agentConnection.queueSessionSlashCommand(text, "followUp");
-				clearedSubmittedText = undefined;
-				this.updatePendingMessagesDisplay();
+				if (this.isAgentCompacting()) {
+					this.queueCompactionMessage(text, "followUp", true);
+				} else {
+					this.editor.addToHistory?.(text);
+					clearedSubmittedText = text;
+					this.editor.setText("");
+					await this.agentConnection.queueSessionSlashCommand(text, "followUp");
+					clearedSubmittedText = undefined;
+					this.updatePendingMessagesDisplay();
+				}
 				return;
 			}
 
@@ -6781,8 +6790,8 @@ export class InteractiveMode {
 		return allQueued.length;
 	}
 
-	private queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.compactionQueuedMessages.push({ text, mode });
+	private queueCompactionMessage(text: string, mode: "steer" | "followUp", command = false): void {
+		this.compactionQueuedMessages.push({ text, mode, ...(command ? { command: true } : {}) });
 		this.editor.addToHistory?.(text);
 		this.editor.setText("");
 		this.updatePendingMessagesDisplay();
@@ -6822,7 +6831,12 @@ export class InteractiveMode {
 			if (options?.willRetry) {
 				// When retry is pending, queue messages for the retry turn
 				for (const message of queuedMessages) {
-					if (this.isExtensionCommand(message.text)) {
+					if (message.command) {
+						await this.agentConnection.queueSessionSlashCommand(
+							message.text,
+							message.mode === "steer" ? "steering" : "followUp",
+						);
+					} else if (this.isExtensionCommand(message.text)) {
 						await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
 					} else if (message.mode === "followUp") {
 						await this.agentConnection.followUp(message.text, this.collectImagesFor(message.text));
@@ -6835,11 +6849,19 @@ export class InteractiveMode {
 			}
 
 			// Find first non-extension-command message to use as prompt
-			const firstPromptIndex = queuedMessages.findIndex((message) => !this.isExtensionCommand(message.text));
+			const firstPromptIndex = queuedMessages.findIndex(
+				(message) => !message.command && !this.isExtensionCommand(message.text),
+			);
 			if (firstPromptIndex === -1) {
-				// All extension commands - execute them all
 				for (const message of queuedMessages) {
-					await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
+					if (message.command) {
+						await this.agentConnection.queueSessionSlashCommand(
+							message.text,
+							message.mode === "steer" ? "steering" : "followUp",
+						);
+					} else {
+						await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
+					}
 				}
 				return;
 			}
@@ -6850,7 +6872,12 @@ export class InteractiveMode {
 			const rest = queuedMessages.slice(firstPromptIndex + 1);
 
 			for (const message of preCommands) {
-				await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
+				if (message.command)
+					await this.agentConnection.queueSessionSlashCommand(
+						message.text,
+						message.mode === "steer" ? "steering" : "followUp",
+					);
+				else await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
 			}
 
 			// Send first prompt (starts streaming)
@@ -6862,7 +6889,12 @@ export class InteractiveMode {
 
 			// Queue remaining messages
 			for (const message of rest) {
-				if (this.isExtensionCommand(message.text)) {
+				if (message.command) {
+					await this.agentConnection.queueSessionSlashCommand(
+						message.text,
+						message.mode === "steer" ? "steering" : "followUp",
+					);
+				} else if (this.isExtensionCommand(message.text)) {
 					await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
 				} else if (message.mode === "followUp") {
 					await this.agentConnection.followUp(message.text, this.collectImagesFor(message.text));
