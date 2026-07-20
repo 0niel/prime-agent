@@ -121,4 +121,15 @@ describe("RpcClient lifecycle", () => {
 		await startError;
 		expect(vi.getTimerCount()).toBe(0);
 	});
+
+	it("stops safely while the process is failing to spawn", async () => {
+		const client = new RpcClient({ cliPath: fixturePath, env: { PATH: "" } });
+		clients.push(client);
+
+		const start = client.start();
+		const startError = expect(start).rejects.toThrow("Agent process error");
+
+		await expect(client.stop()).resolves.toBeUndefined();
+		await startError;
+	});
 });

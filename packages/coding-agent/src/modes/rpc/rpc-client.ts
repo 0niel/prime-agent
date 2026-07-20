@@ -171,10 +171,9 @@ export class RpcClient {
 		);
 		this.stopReadingStdout?.();
 		this.stopReadingStdout = null;
-		child.kill("SIGTERM");
 
 		this.stopPromise = new Promise<void>((resolve) => {
-			if (child.exitCode !== null || child.signalCode !== null) {
+			if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
 				resolve();
 				return;
 			}
@@ -185,6 +184,7 @@ export class RpcClient {
 				clearTimeout(timeout);
 				resolve();
 			});
+			child.kill("SIGTERM");
 		}).finally(() => {
 			if (this.process === child) this.process = null;
 			this.stopPromise = null;
