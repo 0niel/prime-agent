@@ -2560,7 +2560,7 @@ export class InteractiveMode {
 		return this.connectionState?.scopedModels ?? [];
 	}
 
-	private async rebindCurrentSession(): Promise<void> {
+	private async rebindCurrentSession(options: { syncWorkingLoader?: boolean } = {}): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		if (this.localSessionHost) {
@@ -2585,7 +2585,9 @@ export class InteractiveMode {
 		this.updateTerminalTitle();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
-		this.syncWorkingLoader();
+		if (options.syncWorkingLoader !== false) {
+			this.syncWorkingLoader();
+		}
 	}
 
 	private async restoreInitialSession(): Promise<void> {
@@ -2599,7 +2601,7 @@ export class InteractiveMode {
 		this.statusContainer.addChild(loader);
 		this.ui.requestRender();
 		try {
-			await this.rebindCurrentSession();
+			await this.rebindCurrentSession({ syncWorkingLoader: false });
 			await this.renderInitialMessages();
 		} finally {
 			loader.stop();
@@ -2834,21 +2836,17 @@ export class InteractiveMode {
 		return definition;
 	}
 
-	private hydrateToolDefinitions(
-		componentsByToolName: Map<string, ToolExecutionComponent[]>,
-		generation: number,
-	): void {
+	private hydrateToolDefinitions(componentsByToolName: Map<string, ToolExecutionComponent[]>): void {
 		for (const [toolName, components] of componentsByToolName) {
 			if (this.toolDefinitionCache.has(toolName)) {
 				continue;
 			}
 			void this.loadToolDefinition(toolName)
 				.then((definition) => {
-					if (generation !== this.pendingToolGeneration) {
-						return;
-					}
 					for (const component of components) {
-						component.setToolDefinition(definition);
+						if (this.chatContainer.children.includes(component)) {
+							component.setToolDefinition(definition);
+						}
 					}
 				})
 				.catch(() => undefined);
@@ -5998,7 +5996,6 @@ export class InteractiveMode {
 		this.resetPendingToolState();
 		this.ipythonToolComponents.clear();
 		this.lateIpythonSentAgentMessages.clear();
-		const generation = this.pendingToolGeneration;
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
 		const componentsByToolName = new Map<string, ToolExecutionComponent[]>();
 
@@ -6074,7 +6071,7 @@ export class InteractiveMode {
 			component.setIncludeImageDimensions(true);
 			this.pendingTools.set(toolCallId, component);
 		}
-		this.hydrateToolDefinitions(componentsByToolName, generation);
+		this.hydrateToolDefinitions(componentsByToolName);
 		this.ui.requestRender();
 	}
 

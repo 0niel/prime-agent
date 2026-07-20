@@ -872,6 +872,59 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("does not replay an in-flight mutation between legacy daemons", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket, 1);
+
+		const response = client.request({ type: "prompt", activeSessionId: "active-1", message: "hello" });
+		const rejection = expect(response).rejects.toThrow("does not support durable command envelopes");
+		expect(firstSocket.writes).toHaveLength(1);
+		firstSocket.emit("close");
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		emitHello(secondSocket, 1);
+
+		await rejection;
+		expect(secondSocket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("sends a legacy mutation once when it was queued during recovery", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket, 1);
+		firstSocket.emit("close");
+
+		const response = client.request({ type: "prompt", activeSessionId: "active-1", message: "hello" });
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		emitHello(secondSocket, 1);
+
+		expect(secondSocket.writes).toHaveLength(1);
+		const command = JSON.parse(secondSocket.writes[0]!.trim()) as { id: string; type: string };
+		expect(command.type).toBe("prompt");
+		secondSocket.emit(
+			"data",
+			`${JSON.stringify({ id: command.id, type: "response", command: "prompt", success: true })}\n`,
+		);
+
+		await expect(response).resolves.toMatchObject({ id: command.id, success: true });
+		client.close();
+	});
+
 	it("replays a restoration read when the worker closes during daemon teardown", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		client.enableRequestRecovery();

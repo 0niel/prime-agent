@@ -474,7 +474,11 @@ export class DaemonClient {
 						try {
 							this.assertCommandCompatible(pending.publicCommand.type, message);
 							const prepared = this.preparePublicCommand(pending.publicCommand, id, message);
-							if (pending.hasBeenSent && pending.acknowledgeResult && !prepared.acknowledgeResult) {
+							if (
+								pending.hasBeenSent &&
+								isDaemonMutatingCommand(pending.publicCommand) &&
+								(!pending.acknowledgeResult || !prepared.acknowledgeResult)
+							) {
 								throw new Error(
 									`Cannot safely replay daemon command "${pending.commandType}" because the replacement daemon does not support durable command envelopes.`,
 								);

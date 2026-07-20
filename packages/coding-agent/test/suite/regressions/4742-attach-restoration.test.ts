@@ -4,9 +4,9 @@ import { Container, Text, type TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentConnectionSessionContext } from "../../../src/modes/agent-connection/index.js";
-import type {
+import {
 	ToolExecutionComponent,
-	ToolExecutionDefinition,
+	type ToolExecutionDefinition,
 } from "../../../src/modes/interactive/components/tool-execution.js";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
@@ -60,7 +60,7 @@ type RenderSessionContext = (
 type RestoreInitialSessionThis = {
 	ui: TUI;
 	statusContainer: Container;
-	rebindCurrentSession(): Promise<void>;
+	rebindCurrentSession(options?: { syncWorkingLoader?: boolean }): Promise<void>;
 	renderInitialMessages(): Promise<void>;
 	syncWorkingLoader(): void;
 };
@@ -158,7 +158,7 @@ describe("ENG-4742 attach restoration", () => {
 		initTheme("dark");
 	});
 
-	it("renders the transcript before delayed tool definitions resolve", async () => {
+	it("hydrates a restored transcript after unrelated live tool state changes", async () => {
 		const definition = deferred<ToolExecutionDefinition | undefined>();
 		const fakeThis = createRenderThis(() => definition.promise);
 		const renderSessionContext = (
@@ -169,6 +169,7 @@ describe("ENG-4742 attach restoration", () => {
 
 		expect(render(fakeThis.chatContainer)).toContain("RESTORED_RESULT");
 		expect(render(fakeThis.chatContainer)).toContain(TOOL_NAME);
+		fakeThis.resetPendingToolState();
 
 		definition.resolve({
 			name: TOOL_NAME,
@@ -193,13 +194,42 @@ describe("ENG-4742 attach restoration", () => {
 		expect(render(fakeThis.chatContainer)).toContain(TOOL_NAME);
 	});
 
+	it("does not hydrate transcript components after they are removed", async () => {
+		const definition = deferred<ToolExecutionDefinition | undefined>();
+		const fakeThis = createRenderThis(() => definition.promise);
+		const setToolDefinition = vi.spyOn(ToolExecutionComponent.prototype, "setToolDefinition");
+		const renderSessionContext = (
+			InteractiveMode.prototype as unknown as { renderSessionContext: RenderSessionContext }
+		).renderSessionContext;
+
+		await renderSessionContext.call(fakeThis, createSessionContext());
+		fakeThis.chatContainer.clear();
+		definition.resolve({
+			name: TOOL_NAME,
+			label: "Hydrated Tool",
+			description: "Remote definition",
+			parameters: { type: "object" },
+		});
+		await definition.promise;
+		await Promise.resolve();
+
+		expect(setToolDefinition).not.toHaveBeenCalled();
+		setToolDefinition.mockRestore();
+	});
+
 	it("shows restoration progress until initial messages are available", async () => {
 		const rebind = deferred<void>();
 		const statusContainer = new Container();
+		const rebindCurrentSession = vi.fn((options?: { syncWorkingLoader?: boolean }) => {
+			if (options?.syncWorkingLoader !== false) {
+				statusContainer.clear();
+			}
+			return rebind.promise;
+		});
 		const fakeThis: RestoreInitialSessionThis = {
 			ui: { requestRender: vi.fn() } as unknown as TUI,
 			statusContainer,
-			rebindCurrentSession: () => rebind.promise,
+			rebindCurrentSession,
 			renderInitialMessages: vi.fn(async () => undefined),
 			syncWorkingLoader: vi.fn(),
 		};
@@ -208,6 +238,7 @@ describe("ENG-4742 attach restoration", () => {
 		).restoreInitialSession;
 
 		const restoration = restoreInitialSession.call(fakeThis);
+		expect(rebindCurrentSession).toHaveBeenCalledWith({ syncWorkingLoader: false });
 		expect(render(statusContainer)).toContain("Restoring transcript…");
 
 		rebind.resolve(undefined);
