@@ -6550,11 +6550,29 @@ export class AgentSession {
 		}
 	}
 
+	private _emitRlmSubagentRemoval(subagent: RlmSubagentRegistryEntry): void {
+		this._emit({
+			type: "rlm_child_update",
+			child: {
+				id: subagent.rlm_child_id,
+				parentId: this._rlmParentNodeId,
+				activeSessionId: subagent.active_session_id ?? undefined,
+				sessionName: subagent.session_name,
+				label: subagent.session_name,
+				status: "cancelled",
+				sessionDir: subagent.session_dir,
+				error: "Deleted by parent orchestrator",
+			},
+		});
+	}
+
 	private async _deleteResolvedRlmSubagent(subagent: RlmSubagentRegistryEntry): Promise<RlmDeleteSubagentResult> {
 		const childId = subagent.rlm_child_id;
 		const run = this._activeRlmChildRuns.get(childId);
 		if (run) {
-			this._cancelRlmChildRun(run, "Deleted by parent orchestrator");
+			if (!this._cancelRlmChildRun(run, "Deleted by parent orchestrator")) {
+				this._emitRlmSubagentRemoval(subagent);
+			}
 			const liveSession = run.session;
 			if (liveSession) {
 				try {
@@ -6601,6 +6619,8 @@ export class AgentSession {
 			// open guard tear the half-bound runtime down before it becomes addressable.
 			return { subagent };
 		}
+
+		this._emitRlmSubagentRemoval(subagent);
 
 		const retained = this._retainedRlmChildSessions.get(childId);
 		if (retained) {

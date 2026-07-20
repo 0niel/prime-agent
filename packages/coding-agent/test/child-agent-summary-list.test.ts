@@ -109,6 +109,17 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		expect(frame0).not.toBe(frame1);
 	});
 
+	it("shows heartbeating completed subagents as active with heartbeat icons", () => {
+		const summary = new ChildAgentSummaryComponent();
+		summary.setNodes([{ ...node("done", "done") }, { ...node("heartbeat", "done"), hasActiveHeartbeat: true }]);
+		const lines = summary.render(80).map(stripAnsi);
+
+		expect(lines[0]).toContain("♥");
+		expect(lines[0]).toContain("heartbeat");
+		expect(lines[0]).toContain("Heartbeat active");
+		expect(lines[1]).toContain("✓");
+	});
+
 	it("can reselect a node by id when returning from its detail view", () => {
 		const summary = new ChildAgentSummaryComponent();
 		summary.focused = true;

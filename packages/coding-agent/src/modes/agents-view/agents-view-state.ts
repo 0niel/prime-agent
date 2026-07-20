@@ -148,7 +148,7 @@ export function buildAgentsViewRows(
 			continue;
 		}
 		parentByChild.set(row, parent);
-		if (row.summary.activity === "working") {
+		if (row.summary.activity === "working" || row.summary.hasActiveHeartbeat) {
 			parent.runningSubagentCount += 1;
 		}
 		const siblings = childrenByParent.get(parent) ?? [];

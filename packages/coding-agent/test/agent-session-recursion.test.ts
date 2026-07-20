@@ -351,6 +351,12 @@ describe("AgentSession rlm recursion", () => {
 		child.setSessionName("restored-worker");
 		const disposeChild = vi.spyOn(child, "disposeAsync");
 		const root = createSession();
+		const childStatuses: string[] = [];
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update" && event.child.id === childId) {
+				childStatuses.push(event.child.status);
+			}
+		});
 
 		expect(root.retainFinishedRlmChildSession(childId, child)).toBe(true);
 		expect(root.listRlmSubagents().subagents).toEqual([
@@ -366,6 +372,7 @@ describe("AgentSession rlm recursion", () => {
 		});
 		expect(disposeChild).toHaveBeenCalledOnce();
 		expect(root.listRlmSubagents()).toEqual({ subagents: [] });
+		expect(childStatuses).toEqual(["cancelled"]);
 	});
 
 	it("hides a retained child after failed deletion and keeps it selector-retryable", async () => {

@@ -38,6 +38,7 @@ export interface ChildAgentInspectorNode {
 	recap?: string;
 	sessionDir: string;
 	activity?: ChildAgentActivity;
+	hasActiveHeartbeat?: boolean;
 	error?: string;
 	children?: readonly ChildAgentInspectorNode[];
 }
@@ -64,14 +65,14 @@ function isExpandableComponent(component: Component): component is ExpandableCom
 }
 
 // Active before finished, so completed agents settle to the bottom.
-function childAgentSortRank(status: ChildAgentStatus): number {
-	return status === "running" || status === "queued" ? 0 : 1;
+function childAgentSortRank(node: ChildAgentInspectorNode): number {
+	return node.status === "running" || node.status === "queued" || node.hasActiveHeartbeat ? 0 : 1;
 }
 
 function flattenChildAgentNodes(nodes: readonly ChildAgentInspectorNode[]): FlatChildAgentNode[] {
 	const result: FlatChildAgentNode[] = [];
 	const walk = (items: readonly ChildAgentInspectorNode[]): void => {
-		const ordered = [...items].sort((a, b) => childAgentSortRank(a.status) - childAgentSortRank(b.status));
+		const ordered = [...items].sort((a, b) => childAgentSortRank(a) - childAgentSortRank(b));
 		for (const node of ordered) {
 			result.push({ node });
 			walk(node.children ?? []);
@@ -132,8 +133,11 @@ export function nodeActivityLabel(node: ChildAgentInspectorNode): string {
 }
 
 // Subagent list entries mirror the agents view row format: icon, title, right-aligned time.
-function childAgentStatusIcon(status: ChildAgentStatus): string {
-	switch (status) {
+function childAgentStatusIcon(node: ChildAgentInspectorNode): string {
+	if (node.hasActiveHeartbeat) {
+		return "♥";
+	}
+	switch (node.status) {
 		case "queued":
 			return "◇";
 		case "running":
@@ -144,14 +148,17 @@ function childAgentStatusIcon(status: ChildAgentStatus): string {
 		case "cancelled":
 			return "✗";
 		default: {
-			const _exhaustive: never = status;
+			const _exhaustive: never = node.status;
 			return _exhaustive;
 		}
 	}
 }
 
-function formatChildAgentStatusIcon(status: ChildAgentStatus, icon: string): string {
-	switch (status) {
+function formatChildAgentStatusIcon(node: ChildAgentInspectorNode, icon: string): string {
+	if (node.hasActiveHeartbeat) {
+		return theme.fg("error", icon);
+	}
+	switch (node.status) {
 		case "queued":
 			return theme.fg("dim", icon);
 		case "running":
@@ -163,7 +170,7 @@ function formatChildAgentStatusIcon(status: ChildAgentStatus, icon: string): str
 		case "cancelled":
 			return theme.fg("warning", icon);
 		default: {
-			const _exhaustive: never = status;
+			const _exhaustive: never = node.status;
 			return _exhaustive;
 		}
 	}
@@ -186,7 +193,7 @@ function formatChildAgentDuration(durationMs: number | undefined): string {
 
 function childAgentRecap(node: ChildAgentInspectorNode): string {
 	const recap = node.recap?.replace(/\s+/g, " ").trim();
-	return recap || nodeActivityLabel(node);
+	return recap || (node.hasActiveHeartbeat ? "Heartbeat active" : nodeActivityLabel(node));
 }
 
 function padTableCell(value: string, width: number, ellipsis = ""): string {
@@ -273,8 +280,10 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 		}
 		if (!this.focused || !this.selectedId || !flat.some((entry) => entry.node.id === this.selectedId)) {
 			this.selectedId =
-				flat.find((entry) => entry.node.status === "running" || entry.node.status === "queued")?.node.id ??
-				flat[0]?.node.id;
+				flat.find(
+					(entry) =>
+						entry.node.status === "running" || entry.node.status === "queued" || entry.node.hasActiveHeartbeat,
+				)?.node.id ?? flat[0]?.node.id;
 		}
 	}
 
@@ -475,11 +484,12 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 	): string {
 		const indent = " ".repeat(SUMMARY_LIST_INDENT);
 		// Running rows pulse the shared working glyph; other states stay static.
-		const rawIcon =
-			entry.node.status === "running"
+		const rawIcon = entry.node.hasActiveHeartbeat
+			? childAgentStatusIcon(entry.node)
+			: entry.node.status === "running"
 				? workingIconFrame(getWorkingPulseFrame())
-				: childAgentStatusIcon(entry.node.status);
-		const icon = formatChildAgentStatusIcon(entry.node.status, rawIcon);
+				: childAgentStatusIcon(entry.node);
+		const icon = formatChildAgentStatusIcon(entry.node, rawIcon);
 		const agentLabel = `S${number}`;
 		const agentCell = theme.fg("muted", padTableCell(agentLabel, agentWidth));
 		const promptCell = this.elidePrompt(this.entryLabel(entry), sharedPrefix, sharedSuffix, promptWidth);

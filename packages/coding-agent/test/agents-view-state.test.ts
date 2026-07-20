@@ -257,13 +257,48 @@ describe("agents view state", () => {
 		expect(collapsed[1]).toMatchObject({
 			kind: "subagent-summary",
 			section: "heartbeats",
-			title: "1 subagent · 1 heartbeat active",
+			title: "1 subagent running · 1 heartbeat active",
+			runningSubagentCount: 1,
 		});
 		const expanded = buildAgentsViewRows(summaries, new Set([collapsed[0]?.identity ?? ""]));
 		expect(expanded[1]).toMatchObject({
 			kind: "subagent",
 			section: "heartbeats",
 			statusLabel: "heartbeat active",
+		});
+	});
+
+	test("counts every idle heartbeating subagent as running", () => {
+		const heartbeatChildren = Array.from({ length: 10 }, (_, index) =>
+			makeSummary({
+				id: `heartbeat-child-${index}`,
+				activeSessionId: `heartbeat-child-${index}`,
+				sessionId: `heartbeat-child-session-${index}`,
+				sessionName: `Heartbeat child ${index}`,
+				runtimeKind: "subagent",
+				parentActiveSessionId: "parent-active",
+				hasActiveHeartbeat: true,
+				activity: "idle",
+				taskState: "completed",
+			}),
+		);
+		const rows = buildAgentsViewRows([
+			...heartbeatChildren,
+			makeSummary({
+				id: "parent-active",
+				activeSessionId: "parent-active",
+				sessionId: "parent-session",
+				sessionName: "Parent",
+				activity: "idle",
+				taskState: "completed",
+			}),
+		]);
+
+		expect(rows[0]).toMatchObject({ section: "heartbeats", runningSubagentCount: 10 });
+		expect(rows[1]).toMatchObject({
+			kind: "subagent-summary",
+			title: "10 subagents running · 10 heartbeats active",
+			runningSubagentCount: 10,
 		});
 	});
 
