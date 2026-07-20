@@ -104,29 +104,31 @@ describe("parseArgs", () => {
 			const sessionPath = "C:\\Users\\me\\session.jsonl";
 			const result = parseArgs(["--resume", sessionPath]);
 			expect(result.resume).toBe(sessionPath);
-			expect(result.resumeSelectorFallback).toBe(sessionPath);
 			expect(result.messages).toEqual([]);
 		});
 
 		test("parses --resume with a slash-containing relative session path", () => {
 			const result = parseArgs(["--resume", "sessions/current"]);
 			expect(result.resume).toBe("sessions/current");
-			expect(result.resumeSelectorFallback).toBe("sessions/current");
 			expect(result.messages).toEqual([]);
 		});
 
-		test("records text after --resume as a selector candidate with message fallback", () => {
+		test("treats the value after --resume as an authoritative selector", () => {
 			const result = parseArgs(["--resume", "fix", "the", "bug"]);
 			expect(result.resume).toBe("fix");
-			expect(result.resumeSelectorFallback).toBe("fix");
 			expect(result.messages).toEqual(["the", "bug"]);
 		});
 
-		test("records text after --resume= as a selector candidate with message fallback", () => {
+		test("treats the value after --resume= as an authoritative selector", () => {
 			const result = parseArgs(["--resume=fix"]);
 			expect(result.resume).toBe("fix");
-			expect(result.resumeSelectorFallback).toBe("fix");
 			expect(result.messages).toEqual([]);
+		});
+
+		test("supports an initial prompt after the bare resume picker", () => {
+			const result = parseArgs(["--resume", "--", "continue", "the", "session"]);
+			expect(result.resume).toBe(true);
+			expect(result.messages).toEqual(["continue", "the", "session"]);
 		});
 
 		test("treats empty --resume values as the bare resume picker flag", () => {

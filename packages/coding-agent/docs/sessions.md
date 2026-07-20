@@ -37,6 +37,8 @@ For the JSONL file format and SessionManager API, see [Session Format](session-f
 
 `/resume` opens an interactive session picker for the current project. `pi -r` opens the same picker at startup, and `pi -r <path|id>` resumes a specific session.
 
+An invalid ID exits with the closest unambiguous session ID when one is available. To open the picker and send an initial prompt after selecting a session, separate the prompt with `--`: `pi -r -- "continue this work"`.
+
 In the picker you can:
 
 - search by typing
