@@ -3648,7 +3648,11 @@ export class AgentSession {
 		if (!command) throw new Error(`Not a session command: ${text}`);
 		if (
 			!atQueueBoundary &&
-			(this.isStreaming || this.isCompacting || this.isBashRunning || this.hasAcceptedPromptInFlight)
+			(this.isStreaming ||
+				this.isCompacting ||
+				this.isBashRunning ||
+				this.hasAcceptedPromptInFlight ||
+				this.pendingMessageCount > 0)
 		) {
 			await this.queueSessionSlashCommand(text, "steering", { resumeIfIdle: true });
 			return {};
