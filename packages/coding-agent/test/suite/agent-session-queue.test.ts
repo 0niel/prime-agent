@@ -1986,6 +1986,25 @@ describe("AgentSession queue characterization", () => {
 			'Extension command "/testcmd" cannot be queued. Use prompt() or execute the command when not streaming.',
 		);
 	});
+	it("executes consecutive queued commands without starving completion", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const compact = vi.spyOn(harness.session, "compact").mockResolvedValue({
+			summary: "compacted",
+			firstKeptEntryId: "kept",
+			tokensBefore: 100,
+		});
+		harness.setResponses([fauxAssistantMessage("after commands")]);
+		await harness.session.queueSessionSlashCommand("/compact first", "followUp", { resumeIfIdle: true });
+		await harness.session.queueSessionSlashCommand("/compact second", "followUp", { resumeIfIdle: true });
+		await harness.session.followUp("after commands", undefined, { resumeIfIdle: true });
+
+		await vi.waitFor(() => expect(harness.session.pendingMessageCount).toBe(0));
+
+		expect(compact.mock.calls).toEqual([["first"], ["second"]]);
+		expect(getUserTexts(harness)).toEqual(["after commands"]);
+	});
+
 	it("executes a queued session command at its follow-up position", async () => {
 		const { harness, releaseToolExecution, promptPromise, waitForToolStart } = await createWaitingHarness();
 		harnesses.push(harness);

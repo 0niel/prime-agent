@@ -821,7 +821,7 @@ export class AgentSession {
 	private _steeringMessages: QueuedSteeringMessage[] = [];
 	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
 	private _followUpMessages: QueuedFollowUpMessage[] = [];
-	private _executingSessionCommand = false;
+	private _executingSessionCommand?: Promise<void>;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
@@ -3614,12 +3614,23 @@ export class AgentSession {
 		barrier: AgentQueueBarrier,
 		lane: "steering" | "followUp",
 	): Promise<void> {
-		if (this._executingSessionCommand) return;
+		if (this._executingSessionCommand) {
+			await this._executingSessionCommand;
+		}
+		const execution = this._runQueuedSessionCommand(barrier, lane);
+		this._executingSessionCommand = execution;
+		try {
+			await execution;
+		} finally {
+			if (this._executingSessionCommand === execution) this._executingSessionCommand = undefined;
+		}
+	}
+
+	private async _runQueuedSessionCommand(barrier: AgentQueueBarrier, lane: "steering" | "followUp"): Promise<void> {
 		const queue = lane === "steering" ? this._steeringMessages : this._followUpMessages;
 		const index = queue.findIndex((message) => message.command && message.barrierId === barrier.id);
 		const queued = index >= 0 ? queue[index] : undefined;
 		if (!queued?.command) return;
-		this._executingSessionCommand = true;
 		queue.splice(index, 1);
 		this.agent.completeQueueBarrier(barrier.id, lane);
 		this._emitQueueUpdate();
@@ -3628,7 +3639,6 @@ export class AgentSession {
 		} catch {
 			// executeSessionSlashCommand emits the terminal error event.
 		} finally {
-			this._executingSessionCommand = false;
 			this._schedulePendingMessageResume(true);
 		}
 	}

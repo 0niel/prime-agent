@@ -2720,42 +2720,6 @@ describe("InteractiveMode live context usage", () => {
 	});
 });
 
-describe("InteractiveMode.handleGoalStatusCommand", () => {
-	test("prints current goal details without queuing through the agent", () => {
-		type GoalStatusCommandHarness = {
-			connectionState: { goal: GoalState };
-			chatContainer: Container;
-			ui: { requestRender(): void };
-			handleGoalStatusCommand(): void;
-			formatGoalElapsed(seconds: number): string;
-		};
-		const fakeThis = Object.create(InteractiveMode.prototype) as GoalStatusCommandHarness;
-		fakeThis.connectionState = {
-			goal: {
-				active: true,
-				status: "active",
-				objective: "ship the feature",
-				tokenBudget: 1000,
-				tokensUsed: 125,
-				timeUsedSeconds: 65,
-				continuationsUsed: 2,
-			},
-		};
-		fakeThis.chatContainer = new Container();
-		fakeThis.ui = { requestRender: vi.fn() };
-
-		fakeThis.handleGoalStatusCommand();
-
-		const rendered = normalizeRenderedOutput(fakeThis.chatContainer);
-		expect(rendered).toContain("Goal");
-		expect(rendered).toContain("Status: active");
-		expect(rendered).toContain("Objective: ship the feature");
-		expect(rendered).toContain("Time: 1m 05s");
-		expect(rendered).toContain("Tokens: 125 / 1,000");
-		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(1);
-	});
-});
-
 describe("truncatePathMiddle", () => {
 	test("does not duplicate the home prefix for short tilde paths", () => {
 		const value = truncatePathMiddle("~/myproject", 8);

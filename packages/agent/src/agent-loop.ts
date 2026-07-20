@@ -316,6 +316,10 @@ async function runLoop(
 	let lastTurn: Parameters<NonNullable<AgentLoopConfig["getContinuationMessages"]>>[0] | undefined;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = await pollMessagesUnlessAborted(config.getSteeringMessages, signal);
+	if (pendingMessages.length === 0 && config.shouldStopForQueueBarrier?.()) {
+		await emit({ type: "agent_end", messages: newMessages });
+		return;
+	}
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
