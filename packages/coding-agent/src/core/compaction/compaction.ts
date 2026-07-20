@@ -244,8 +244,14 @@ export function estimateCompactedContextTokens(
 	beforeMessages: AgentMessage[],
 	afterMessages: AgentMessage[],
 ): number {
-	const estimatedBefore = beforeMessages.reduce((total, message) => total + estimateTokens(message), 0);
-	const estimatedAfter = afterMessages.reduce((total, message) => total + estimateTokens(message), 0);
+	const estimatedBefore = convertToLlm(beforeMessages).reduce(
+		(total, message) => total + estimateTokens(message as AgentMessage),
+		0,
+	);
+	const estimatedAfter = convertToLlm(afterMessages).reduce(
+		(total, message) => total + estimateTokens(message as AgentMessage),
+		0,
+	);
 	return Math.max(0, tokensBefore - estimatedBefore) + estimatedAfter;
 }
 
