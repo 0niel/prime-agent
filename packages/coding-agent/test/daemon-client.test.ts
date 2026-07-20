@@ -896,6 +896,33 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("marks a mutation as sent before writing it to the socket", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket, 1);
+		vi.spyOn(firstSocket, "write").mockImplementation((chunk) => {
+			firstSocket.writes.push(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+			throw new Error("write failed after accepting data");
+		});
+
+		const response = client.request({ type: "prompt", activeSessionId: "active-1", message: "hello" });
+		const rejection = expect(response).rejects.toThrow("write failed after accepting data");
+		firstSocket.emit("close");
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		emitHello(secondSocket, 1);
+
+		await rejection;
+		expect(secondSocket.writes).toEqual([]);
+		client.close();
+	});
+
 	it("sends a legacy mutation once when it was queued during recovery", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		client.enableRequestRecovery();
@@ -981,6 +1008,40 @@ describe("DaemonClient", () => {
 		emitHello(socket);
 
 		const response = client.request({ type: "get_messages", activeSessionId: "active-1" });
+		const envelope = JSON.parse(socket.writes[0]!) as { id: string };
+		socket.emit(
+			"data",
+			`${JSON.stringify({
+				id: envelope.id,
+				type: "response",
+				command: "get_messages",
+				success: false,
+				error: "Daemon worker client closed",
+			})}\n`,
+		);
+		let settled = false;
+		void response.finally(() => {
+			settled = true;
+		});
+		await vi.advanceTimersByTimeAsync(999);
+		expect(settled).toBe(false);
+		await vi.advanceTimersByTimeAsync(1);
+
+		await expect(response).resolves.toMatchObject({ id: envelope.id, success: false });
+		client.close();
+	});
+
+	it("pauses the request timeout while waiting for a recoverable worker close", async () => {
+		vi.useFakeTimers();
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket);
+
+		const response = client.request({ type: "get_messages", activeSessionId: "active-1" }, 50);
 		const envelope = JSON.parse(socket.writes[0]!) as { id: string };
 		socket.emit(
 			"data",

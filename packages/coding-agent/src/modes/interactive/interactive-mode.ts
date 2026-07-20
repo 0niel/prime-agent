@@ -2566,9 +2566,7 @@ export class InteractiveMode {
 		if (this.localSessionHost) {
 			this.uiServices = this.localSessionHost.createUiServices();
 		}
-		this.toolDefinitionGeneration++;
-		this.toolDefinitionCache.clear();
-		this.toolDefinitionLoads.clear();
+		this.invalidateToolDefinitions();
 		this.applyRuntimeSettings();
 		if (this.bindLocalSessionExtensions) {
 			await this.bindCurrentSessionExtensions();
@@ -2707,6 +2705,12 @@ export class InteractiveMode {
 
 	private getCachedToolDefinition(toolName: string): ToolExecutionDefinition | undefined {
 		return this.toolDefinitionCache.get(toolName);
+	}
+
+	private invalidateToolDefinitions(): void {
+		this.toolDefinitionGeneration++;
+		this.toolDefinitionCache.clear();
+		this.toolDefinitionLoads.clear();
 	}
 
 	private async loadToolDefinition(toolName: string): Promise<ToolExecutionDefinition | undefined> {
@@ -8282,7 +8286,7 @@ export class InteractiveMode {
 
 		try {
 			await this.agentConnection.reload();
-			this.toolDefinitionCache.clear();
+			this.invalidateToolDefinitions();
 			this.keybindings.reload();
 			const activeHeader = this.customHeader ?? this.builtInHeader;
 			if (isExpandable(activeHeader)) {

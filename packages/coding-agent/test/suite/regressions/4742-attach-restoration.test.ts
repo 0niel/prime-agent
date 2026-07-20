@@ -194,6 +194,46 @@ describe("ENG-4742 attach restoration", () => {
 		expect(render(fakeThis.chatContainer)).toContain(TOOL_NAME);
 	});
 
+	it("invalidates in-flight tool definitions when resources reload", async () => {
+		const staleDefinition = deferred<ToolExecutionDefinition | undefined>();
+		const getToolDefinition = vi
+			.fn<() => Promise<ToolExecutionDefinition | undefined>>()
+			.mockReturnValueOnce(staleDefinition.promise)
+			.mockResolvedValueOnce({
+				name: TOOL_NAME,
+				label: "Fresh Tool",
+				description: "Reloaded definition",
+				parameters: { type: "object" },
+			});
+		const fakeThis = {
+			toolDefinitionGeneration: 0,
+			toolDefinitionCache: new Map<string, ToolExecutionDefinition | undefined>(),
+			toolDefinitionLoads: new Map<string, Promise<ToolExecutionDefinition | undefined>>(),
+			agentConnection: { getToolDefinition },
+			localSessionHost: undefined,
+		};
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+		const prototype = InteractiveMode.prototype as unknown as {
+			invalidateToolDefinitions(this: typeof fakeThis): void;
+			loadToolDefinition(this: typeof fakeThis, toolName: string): Promise<ToolExecutionDefinition | undefined>;
+		};
+
+		const staleLoad = prototype.loadToolDefinition.call(fakeThis, TOOL_NAME);
+		prototype.invalidateToolDefinitions.call(fakeThis);
+		const freshLoad = prototype.loadToolDefinition.call(fakeThis, TOOL_NAME);
+		staleDefinition.resolve({
+			name: TOOL_NAME,
+			label: "Stale Tool",
+			description: "Pre-reload definition",
+			parameters: { type: "object" },
+		});
+
+		await expect(freshLoad).resolves.toMatchObject({ label: "Fresh Tool" });
+		await staleLoad;
+		expect(getToolDefinition).toHaveBeenCalledTimes(2);
+		expect(fakeThis.toolDefinitionCache.get(TOOL_NAME)).toMatchObject({ label: "Fresh Tool" });
+	});
+
 	it("does not hydrate transcript components after they are removed", async () => {
 		const definition = deferred<ToolExecutionDefinition | undefined>();
 		const fakeThis = createRenderThis(() => definition.promise);

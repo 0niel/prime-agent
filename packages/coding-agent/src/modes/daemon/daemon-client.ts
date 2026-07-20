@@ -368,8 +368,8 @@ export class DaemonClient {
 			this.pendingRequests.set(id, pending);
 			if (!awaitingReconnect) {
 				this.armPendingRequestTimeout(id, pending);
-				socket.write(prepared.wireData);
 				pending.hasBeenSent = true;
+				socket.write(prepared.wireData);
 			}
 		});
 	}
@@ -493,8 +493,8 @@ export class DaemonClient {
 					}
 					pending.awaitingReconnect = false;
 					this.armPendingRequestTimeout(id, pending);
-					this.socket.write(pending.wireData);
 					pending.hasBeenSent = true;
+					this.socket.write(pending.wireData);
 				}
 			}
 		}
@@ -507,6 +507,10 @@ export class DaemonClient {
 			const pending = this.pendingRequests.get(responseId);
 			if (pending) {
 				if (this.shouldWaitForRecoverableDisconnect(message, pending)) {
+					if (pending.timeout) {
+						clearTimeout(pending.timeout);
+						pending.timeout = undefined;
+					}
 					if (pending.recoverableFailureTimeout) {
 						clearTimeout(pending.recoverableFailureTimeout);
 					}

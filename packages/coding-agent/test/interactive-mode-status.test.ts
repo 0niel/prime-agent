@@ -689,8 +689,8 @@ describe("InteractiveMode connection events", () => {
 		const createHarness = (
 			refreshConnectionQueue: () => Promise<void>,
 			refreshHeartbeatCatalog: () => Promise<void>,
-		) =>
-			({
+		) => {
+			const harness = {
 				unsubscribe: undefined,
 				localSessionHost: undefined,
 				toolDefinitionGeneration: 0,
@@ -709,7 +709,10 @@ describe("InteractiveMode connection events", () => {
 				syncGoalTray: vi.fn(),
 				syncWorkingLoader: vi.fn(),
 				getGoalState: () => emptyGoalState(),
-			}) as unknown as InteractiveMode;
+			};
+			Object.setPrototypeOf(harness, InteractiveMode.prototype);
+			return harness as unknown as InteractiveMode;
+		};
 
 		await expect(
 			rebindCurrentSession.call(
