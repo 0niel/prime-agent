@@ -184,8 +184,14 @@ export interface ContextUsageEstimate {
 }
 
 function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; index: number } | undefined {
+	let latestCompactionAt = -Infinity;
+	for (const message of messages) {
+		if (message.role === "compactionSummary") latestCompactionAt = Math.max(latestCompactionAt, message.timestamp);
+	}
 	for (let i = messages.length - 1; i >= 0; i--) {
-		const usage = getAssistantUsage(messages[i]);
+		const message = messages[i];
+		if (message.timestamp <= latestCompactionAt) continue;
+		const usage = getAssistantUsage(message);
 		if (usage) return { usage, index: i };
 	}
 	return undefined;

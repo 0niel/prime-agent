@@ -215,6 +215,24 @@ describe("Token calculation", () => {
 	});
 });
 
+describe("post-compaction usage", () => {
+	it("ignores assistant usage from before the latest compaction", () => {
+		const stale = createAssistantMessage("old", createMockUsage(10_000, 1_000));
+		stale.timestamp = 1;
+		const messages: AgentMessage[] = [
+			{
+				role: "compactionSummary",
+				summary: "short summary",
+				tokensBefore: 11_000,
+				timestamp: 2,
+			},
+			stale,
+		];
+
+		expect(estimateContextTokens(messages).usageTokens).toBe(0);
+	});
+});
+
 describe("getLastAssistantUsage", () => {
 	it("should find the last non-aborted assistant message usage", () => {
 		const entries: SessionEntry[] = [
