@@ -647,8 +647,8 @@ export interface AgentConnection {
 	abortSideQuestion(id: string): Promise<boolean>;
 	steer(message: string, images?: ImageContent[]): Promise<void>;
 	followUp(message: string, images?: ImageContent[]): Promise<void>;
-	executeSessionSlashCommand(text: string): Promise<void>;
-	queueSessionSlashCommand(text: string, lane: "steering" | "followUp"): Promise<void>;
+	executeSessionSlashCommand?(text: string): Promise<void>;
+	queueSessionSlashCommand?(text: string, lane: "steering" | "followUp"): Promise<void>;
 	/** Request cancellation of the active turn and return once the request is accepted. */
 	abort(): Promise<void>;
 	cancelRlmChild(childId: string): Promise<boolean>;

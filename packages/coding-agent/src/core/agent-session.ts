@@ -3646,6 +3646,10 @@ export class AgentSession {
 	async executeSessionSlashCommand(text: string): Promise<{ message?: string }> {
 		const command = parseSessionSlashCommand(text);
 		if (!command) throw new Error(`Not a session command: ${text}`);
+		if (this.isStreaming || this.isCompacting || this.isBashRunning || this.hasAcceptedPromptInFlight) {
+			await this.queueSessionSlashCommand(text, "steering", { resumeIfIdle: true });
+			return {};
+		}
 		this._emitSessionSlashCommandMessage(command);
 		try {
 			const result = await this._runSessionSlashCommand(command);
@@ -7640,13 +7644,17 @@ export class AgentSession {
 	private async _promptPendingMessagesWithNextTurnContext(): Promise<void> {
 		const steeringMessages = [...this._steeringMessages];
 		const followUpMessages = [...this._followUpMessages];
-		const drainedSteeringMessages = steeringMessages.length > 0 ? steeringMessages : [];
-		const drainedFollowUpMessages = steeringMessages.length > 0 ? [] : followUpMessages;
+		const selected = steeringMessages.length > 0 ? steeringMessages : followUpMessages;
+		const commandIndex = selected.findIndex((message) => message.command !== undefined);
+		const drained = commandIndex === -1 ? selected : selected.slice(0, commandIndex);
+		const drainedSteeringMessages = steeringMessages.length > 0 ? drained : [];
+		const drainedFollowUpMessages = steeringMessages.length > 0 ? [] : drained;
 		const queuedMessages = [...drainedSteeringMessages, ...drainedFollowUpMessages].flatMap((message) => [
 			...message.prefixMessages,
 			message.message,
 		]);
 		if (queuedMessages.length === 0) {
+			await this.agent.continue();
 			return;
 		}
 

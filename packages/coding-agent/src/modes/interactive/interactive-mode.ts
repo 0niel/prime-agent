@@ -4139,6 +4139,20 @@ export class InteractiveMode {
 		return Math.max(6, Math.min(12, Math.floor(this.ui.terminal.rows * 0.3)));
 	}
 
+	private executeSessionCommand(text: string): Promise<void> {
+		if (!this.agentConnection.executeSessionSlashCommand) {
+			throw new Error("This connection does not support session slash commands");
+		}
+		return this.agentConnection.executeSessionSlashCommand(text);
+	}
+
+	private queueSessionCommand(text: string, lane: "steering" | "followUp"): Promise<void> {
+		if (!this.agentConnection.queueSessionSlashCommand) {
+			throw new Error("This connection does not support queued session slash commands");
+		}
+		return this.agentConnection.queueSessionSlashCommand(text, lane);
+	}
+
 	private setupEditorSubmitHandler(): void {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
@@ -4160,7 +4174,7 @@ export class InteractiveMode {
 						this.editor.addToHistory?.(text);
 						this.editor.setText("");
 						try {
-							await this.agentConnection.queueSessionSlashCommand(canonicalCommandText, "steering");
+							await this.queueSessionCommand(canonicalCommandText, "steering");
 						} catch (error) {
 							this.editor.setText(text);
 							throw error;
@@ -4320,7 +4334,7 @@ export class InteractiveMode {
 				}
 				if (sessionCommand) {
 					this.editor.setText("");
-					await this.agentConnection.executeSessionSlashCommand(canonicalCommandText).catch(() => undefined);
+					await this.executeSessionCommand(canonicalCommandText).catch(() => undefined);
 					return;
 				}
 				if (commandName === "reload" && !commandArgs) {
@@ -6433,7 +6447,7 @@ export class InteractiveMode {
 					this.editor.addToHistory?.(text);
 					clearedSubmittedText = text;
 					this.editor.setText("");
-					await this.agentConnection.queueSessionSlashCommand(text, "followUp");
+					await this.queueSessionCommand(text, "followUp");
 					clearedSubmittedText = undefined;
 					this.updatePendingMessagesDisplay();
 				}
@@ -6831,10 +6845,7 @@ export class InteractiveMode {
 				// When retry is pending, queue messages for the retry turn
 				for (const message of queuedMessages) {
 					if (message.command) {
-						await this.agentConnection.queueSessionSlashCommand(
-							message.text,
-							message.mode === "steer" ? "steering" : "followUp",
-						);
+						await this.queueSessionCommand(message.text, message.mode === "steer" ? "steering" : "followUp");
 					} else if (this.isExtensionCommand(message.text)) {
 						await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
 					} else if (message.mode === "followUp") {
@@ -6854,10 +6865,7 @@ export class InteractiveMode {
 			if (firstPromptIndex === -1) {
 				for (const message of queuedMessages) {
 					if (message.command) {
-						await this.agentConnection.queueSessionSlashCommand(
-							message.text,
-							message.mode === "steer" ? "steering" : "followUp",
-						);
+						await this.queueSessionCommand(message.text, message.mode === "steer" ? "steering" : "followUp");
 					} else {
 						await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
 					}
@@ -6872,10 +6880,7 @@ export class InteractiveMode {
 
 			for (const message of preCommands) {
 				if (message.command)
-					await this.agentConnection.queueSessionSlashCommand(
-						message.text,
-						message.mode === "steer" ? "steering" : "followUp",
-					);
+					await this.queueSessionCommand(message.text, message.mode === "steer" ? "steering" : "followUp");
 				else await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
 			}
 
@@ -6889,10 +6894,7 @@ export class InteractiveMode {
 			// Queue remaining messages
 			for (const message of rest) {
 				if (message.command) {
-					await this.agentConnection.queueSessionSlashCommand(
-						message.text,
-						message.mode === "steer" ? "steering" : "followUp",
-					);
+					await this.queueSessionCommand(message.text, message.mode === "steer" ? "steering" : "followUp");
 				} else if (this.isExtensionCommand(message.text)) {
 					await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
 				} else if (message.mode === "followUp") {
