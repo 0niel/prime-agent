@@ -897,6 +897,124 @@ describe("self-update daemon restart", () => {
 		expect(existsSync(getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir))).toBe(false);
 	});
 
+	it("merges a pending restart with live daemon sessions before restoring them", async () => {
+		useFixedOwnerHello();
+		const parentSessionFile = join(projectDir, "parent.jsonl");
+		const childSessionFile = join(projectDir, "child.jsonl");
+		const currentSessionFile = join(projectDir, "current.jsonl");
+		const pendingManifest: MockUpdateRestartManifest = {
+			createdAt: "2026-07-06T00:00:00.000Z",
+			sessions: [
+				{
+					activeSessionId: "pending-parent",
+					sessionId: "parent-session",
+					sessionFile: parentSessionFile,
+					cwd: projectDir,
+					config: { cwd: projectDir, agentDir },
+					runtimeMetadata: { kind: "top-level", createdAt: 1 },
+					queue: { steering: [], followUp: [], nextTurn: [] },
+					shouldResume: true,
+					wasStreaming: true,
+					wasCompacting: false,
+					wasBashRunning: false,
+					hadRunningRlmChildren: true,
+					wasRetrying: false,
+					hadAcceptedPromptInFlight: false,
+				},
+				{
+					activeSessionId: "pending-child",
+					sessionId: "child-session",
+					sessionFile: childSessionFile,
+					cwd: projectDir,
+					config: { cwd: projectDir, agentDir },
+					runtimeMetadata: {
+						kind: "subagent",
+						createdAt: 2,
+						parentActiveSessionId: "pending-parent",
+						parentSessionId: "parent-session",
+						parentSessionFile,
+						rlmChildId: "child-1",
+						prompt: "child task",
+					},
+					queue: { steering: [], followUp: [], nextTurn: [] },
+					shouldResume: false,
+					wasStreaming: false,
+					wasCompacting: false,
+					wasBashRunning: false,
+					hadRunningRlmChildren: false,
+					wasRetrying: false,
+					hadAcceptedPromptInFlight: false,
+				},
+			],
+		};
+		writeFileSync(
+			getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir),
+			JSON.stringify(pendingManifest),
+		);
+		mockState.listResponse = {
+			success: true,
+			data: {
+				sessions: [{ id: "live-parent", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }],
+			},
+		};
+		mockState.prepareManifest = {
+			createdAt: "2026-07-07T00:00:00.000Z",
+			sessions: [
+				{
+					activeSessionId: "live-parent",
+					sessionId: "parent-session",
+					sessionFile: parentSessionFile,
+					cwd: projectDir,
+					config: { cwd: projectDir, agentDir },
+					runtimeMetadata: { kind: "top-level", createdAt: 1 },
+					queue: { steering: [], followUp: [], nextTurn: [] },
+					shouldResume: false,
+					wasStreaming: false,
+					wasCompacting: false,
+					wasBashRunning: false,
+					hadRunningRlmChildren: true,
+					wasRetrying: false,
+					hadAcceptedPromptInFlight: false,
+				},
+				{
+					activeSessionId: "live-current",
+					sessionId: "current-session",
+					sessionFile: currentSessionFile,
+					cwd: projectDir,
+					config: { cwd: projectDir, agentDir },
+					queue: { steering: [], followUp: [], nextTurn: [] },
+					shouldResume: false,
+					wasStreaming: false,
+					wasCompacting: false,
+					wasBashRunning: false,
+					hadRunningRlmChildren: false,
+					wasRetrying: false,
+					hadAcceptedPromptInFlight: false,
+				},
+			],
+		};
+		mockState.createActiveSessionIds = ["restored-parent", "restored-child", "restored-current"];
+
+		await performUpdateAndRunCoordinator();
+
+		const createRequests = mockState.requestPayloads.filter((request) => request.type === "create");
+		expect(createRequests.map((request) => request.sessionPath)).toEqual([
+			parentSessionFile,
+			childSessionFile,
+			currentSessionFile,
+		]);
+		expect(createRequests[1]).toMatchObject({
+			runtimeMetadata: { parentActiveSessionId: "restored-parent" },
+		});
+		expect(mockState.lastCoordinatorStatus?.counts).toEqual({
+			total: 3,
+			restored: 3,
+			resumed: 0,
+			failed: 0,
+		});
+		expect(existsSync(getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir))).toBe(false);
+	});
+
 	it("fences a pending prepared restart only after verifying the live daemon is empty", async () => {
 		useFixedOwnerHello();
 		const pendingManifest: MockUpdateRestartManifest = {
@@ -961,7 +1079,7 @@ describe("self-update daemon restart", () => {
 		await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).rejects.toThrow(
 			"prepare_update_restart disconnected",
 		);
-		expect(existsSync(getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir))).toBe(false);
+		expect(existsSync(getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir))).toBe(true);
 	});
 
 	it("skips predecessor fencing when the daemon hello has no fixed-owner identity", async () => {

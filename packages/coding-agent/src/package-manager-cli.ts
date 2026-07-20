@@ -1,6 +1,6 @@
 import chalk from "chalk";
 import { spawn } from "child_process";
-import { readFileSync, rmSync, statSync } from "fs";
+import { readFileSync, statSync } from "fs";
 import { resolve, sep } from "path";
 import { selectConfig } from "./cli/config-selector.js";
 import {
@@ -12,6 +12,13 @@ import {
 	shutdownConnectedDaemonAndWait,
 } from "./cli/daemon-launch.js";
 import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions } from "./cli/daemon-stop-confirm.js";
+import {
+	clearPreparedDaemonUpdateRestartManifest,
+	getDaemonUpdateRestartManifestCandidates,
+	manifestForFailedDaemonUpdateRestores,
+	mergeDaemonUpdateRestartManifests,
+	writePreparedDaemonUpdateRestartManifest,
+} from "./cli/daemon-update-manifest.js";
 import {
 	acquireDaemonUpdateRestartCoordinator,
 	buildDaemonUpdateRestartReport,
@@ -31,8 +38,6 @@ import {
 	APP_NAME,
 	CONFIG_DIR_NAME,
 	getAgentDir,
-	getDaemonUpdateRestartManifestPath,
-	getLegacyDaemonUpdateRestartManifestPath,
 	getSelfUpdateCommand,
 	getSelfUpdateUnavailableInstruction,
 	PACKAGE_NAME,
@@ -758,41 +763,42 @@ function parseDaemonUpdateRestartManifest(value: unknown): DaemonUpdateRestartMa
 	};
 }
 
-function clearPreparedDaemonUpdateRestartManifest(socketPath: string, agentDir: string): void {
-	for (const manifestPath of [
-		getDaemonUpdateRestartManifestPath(socketPath, agentDir),
-		getLegacyDaemonUpdateRestartManifestPath(agentDir),
-	]) {
-		try {
-			rmSync(manifestPath, { force: true });
-		} catch {
-			// Best effort only; the mtime guard below prevents stale fallback use.
-		}
-	}
-}
-
 function readPreparedDaemonUpdateRestartManifest(
 	socketPath: string,
 	agentDir: string,
 	notBeforeMs?: number,
+	changedSince?: ReadonlyMap<string, string>,
 ): DaemonUpdateRestartManifest | undefined {
-	for (const manifestPath of [
-		getDaemonUpdateRestartManifestPath(socketPath, agentDir),
-		getLegacyDaemonUpdateRestartManifestPath(agentDir),
-	]) {
-		let modifiedAt: number;
+	for (const manifestPath of getDaemonUpdateRestartManifestCandidates(socketPath, agentDir)) {
+		let stat: ReturnType<typeof statSync>;
 		try {
-			modifiedAt = statSync(manifestPath).mtimeMs;
+			stat = statSync(manifestPath);
 		} catch {
 			continue;
 		}
-		if (notBeforeMs !== undefined && modifiedAt < notBeforeMs - 1000) {
+		if (notBeforeMs !== undefined && stat.mtimeMs < notBeforeMs - 1000) {
+			continue;
+		}
+		if (changedSince?.get(manifestPath) === `${stat.ino}:${stat.size}:${stat.mtimeMs}`) {
 			continue;
 		}
 		const parsed = JSON.parse(readFileSync(manifestPath, "utf-8")) as unknown;
 		return parseDaemonUpdateRestartManifest(parsed);
 	}
 	return undefined;
+}
+
+function snapshotPreparedDaemonUpdateRestartManifestFiles(socketPath: string, agentDir: string): Map<string, string> {
+	const snapshot = new Map<string, string>();
+	for (const manifestPath of getDaemonUpdateRestartManifestCandidates(socketPath, agentDir)) {
+		try {
+			const stat = statSync(manifestPath);
+			snapshot.set(manifestPath, `${stat.ino}:${stat.size}:${stat.mtimeMs}`);
+		} catch {
+			// A missing candidate has no baseline and is eligible as a newly persisted fallback.
+		}
+	}
+	return snapshot;
 }
 
 function tryReadPreparedDaemonUpdateRestartManifest(
@@ -847,6 +853,7 @@ async function prepareConnectedDaemonUpdateRestart(
 ): Promise<DaemonUpdateRestartManifest> {
 	const pendingManifest = tryReadPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
 	let startedAt: number | undefined;
+	let manifestFilesBeforePrepare: ReadonlyMap<string, string> | undefined;
 	let fixedOwnerIdentity: FixedDaemonSupervisorOwnerIdentity | undefined;
 	let fencePersistenceStarted = false;
 	const persistPreparedRestartFence = async () => {
@@ -874,15 +881,19 @@ async function prepareConnectedDaemonUpdateRestart(
 				return pendingManifest;
 			}
 		}
-		clearPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
 		startedAt = Date.now();
+		manifestFilesBeforePrepare = snapshotPreparedDaemonUpdateRestartManifestFiles(socketPath, agentDir);
 		const response = useLegacyProtocol
 			? await client.requestLegacy({ type: "prepare_update_restart" }, 120000)
 			: await client.request({ type: "prepare_update_restart" }, 120000);
 		if (!response.success) {
 			throw new Error(response.error);
 		}
-		const manifest = parseDaemonUpdateRestartManifest(response.data);
+		const currentManifest = parseDaemonUpdateRestartManifest(response.data);
+		const manifest = pendingManifest
+			? mergeDaemonUpdateRestartManifests(pendingManifest, currentManifest)
+			: currentManifest;
+		writePreparedDaemonUpdateRestartManifest(socketPath, agentDir, manifest);
 		await persistPreparedRestartFence();
 		return manifest;
 	} catch (error) {
@@ -890,10 +901,17 @@ async function prepareConnectedDaemonUpdateRestart(
 			throw error;
 		}
 		if (startedAt !== undefined) {
-			const fallback = readPreparedDaemonUpdateRestartManifest(socketPath, agentDir, startedAt);
+			const fallback = readPreparedDaemonUpdateRestartManifest(
+				socketPath,
+				agentDir,
+				startedAt,
+				manifestFilesBeforePrepare,
+			);
 			if (fallback) {
+				const manifest = pendingManifest ? mergeDaemonUpdateRestartManifests(pendingManifest, fallback) : fallback;
+				writePreparedDaemonUpdateRestartManifest(socketPath, agentDir, manifest);
 				await persistPreparedRestartFence();
-				return fallback;
+				return manifest;
 			}
 		}
 		throw error;
@@ -1219,6 +1237,23 @@ async function restoreDaemonUpdateRestart(
 	};
 }
 
+function persistDaemonUpdateRestartRemainder(
+	socketPath: string,
+	agentDir: string,
+	manifest: DaemonUpdateRestartManifest,
+	failures: readonly DaemonUpdateRestartFailure[],
+): void {
+	const remainder = manifestForFailedDaemonUpdateRestores(
+		manifest,
+		failures.map((failure) => failure.sessionFile),
+	);
+	if (remainder) {
+		writePreparedDaemonUpdateRestartManifest(socketPath, agentDir, remainder);
+		return;
+	}
+	clearPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
+}
+
 function formatUnknownError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -1371,7 +1406,12 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 								reportRestoreProgress,
 							);
 							const { failures: restoreFailures, ...counts } = restoreResult;
-							clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+							persistDaemonUpdateRestartRemainder(
+								options.socketPath,
+								options.agentDir,
+								manifest,
+								restoreFailures,
+							);
 							statusWriter.update({
 								counts,
 								...(restoreFailures.length > 0 ? { failures: restoreFailures } : {}),
@@ -1424,7 +1464,7 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 				failed: restoreResult.failed,
 			};
 			failures = restoreResult.failures;
-			clearPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			persistDaemonUpdateRestartRemainder(options.socketPath, options.agentDir, manifest, failures);
 		}
 		statusWriter.update({
 			phase: "complete",

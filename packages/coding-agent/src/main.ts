@@ -22,6 +22,8 @@ import {
 	shutdownDaemonAndWait,
 } from "./cli/daemon-launch.js";
 import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions } from "./cli/daemon-stop-confirm.js";
+import { hasPendingDaemonUpdateRestartManifest } from "./cli/daemon-update-manifest.js";
+import { buildDaemonUpdateRestartReport, launchDaemonUpdateRestartCoordinator } from "./cli/daemon-update-restart.js";
 import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
@@ -403,6 +405,25 @@ async function awaitDaemonReady(daemonReady: Promise<void> | undefined): Promise
 			return takeOverStaleDaemonOrExit(error.socketPath);
 		}
 		throw error;
+	}
+}
+
+async function recoverPendingDaemonUpdateRestart(socketPath: string, agentDir: string, cwd: string): Promise<void> {
+	if (!hasPendingDaemonUpdateRestartManifest(socketPath, agentDir)) {
+		return;
+	}
+	try {
+		const status = await launchDaemonUpdateRestartCoordinator({ socketPath, agentDir, cwd });
+		const report = buildDaemonUpdateRestartReport(status);
+		for (const message of report.info) {
+			console.log(chalk.green(message));
+		}
+		for (const warning of report.warnings) {
+			console.error(chalk.yellow(`Warning: ${warning}`));
+		}
+	} catch (error: unknown) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(chalk.yellow(`Warning: could not recover sessions from the interrupted update (${message}).`));
 	}
 }
 
@@ -1150,6 +1171,9 @@ export async function main(args: string[], options?: MainOptions) {
 		getSessionDirEnvOverride() ??
 		startupSettingsManager.getSessionDir();
 	const daemonSocketPath = parsed.daemonSocket ?? defaultDaemonSocketPath();
+	if (useDaemonClient) {
+		await recoverPendingDaemonUpdateRestart(daemonSocketPath, agentDir, cwd);
+	}
 	// Kick off daemon spawn/readiness immediately so it overlaps session-manager
 	// and runtime-services preparation; attach only connects to an existing daemon.
 	let daemonReady = shouldEnsureInteractiveDaemonForStartup(useDaemonClient, publicCommand.attachAgent)

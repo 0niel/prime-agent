@@ -8,7 +8,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { appendRotatingLog, expandTildePath, getClientErrorLogPath, VERSION } from "../config.js";
+import { appendRotatingLog, expandTildePath, getAgentDir, getClientErrorLogPath, VERSION } from "../config.js";
 import { getProcessStartId } from "../core/session-lease.js";
 import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../modes/daemon/daemon-protocol.js";
@@ -16,6 +16,7 @@ import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identit
 import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
 import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
+import { hasPendingDaemonUpdateRestartManifest } from "./daemon-update-manifest.js";
 import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
 
 const DAEMON_STARTUP_TIMEOUT_MS = 30_000;
@@ -476,8 +477,12 @@ function findFirstEarlyLaunchPositional(args: readonly string[]): { index: numbe
 	return undefined;
 }
 
-export function shouldStartDaemonEarly(args: readonly string[], startupBenchmark: boolean): boolean {
-	if (startupBenchmark) {
+export function shouldStartDaemonEarly(
+	args: readonly string[],
+	startupBenchmark: boolean,
+	pendingUpdateRecovery = false,
+): boolean {
+	if (startupBenchmark || pendingUpdateRecovery) {
 		return false;
 	}
 	const modeIndex = args.indexOf("--mode");
@@ -508,12 +513,16 @@ export function shouldStartDaemonEarly(args: readonly string[], startupBenchmark
 export function maybeStartDaemonEarly(args: readonly string[]): void {
 	const benchmarkFlag = (process.env.PI_STARTUP_BENCHMARK ?? "").toLowerCase();
 	const startupBenchmark = benchmarkFlag === "1" || benchmarkFlag === "true" || benchmarkFlag === "yes";
-	if (!shouldStartDaemonEarly(args, startupBenchmark)) {
-		return;
-	}
 	const socketIndex = args.indexOf("--daemon-socket");
 	const socketPath =
 		socketIndex !== -1 && args[socketIndex + 1] ? (args[socketIndex + 1] as string) : defaultDaemonSocketPath();
+	const pendingUpdateRecovery = hasPendingDaemonUpdateRestartManifest(socketPath, getAgentDir());
+	if (!shouldStartDaemonEarly(args, startupBenchmark, pendingUpdateRecovery)) {
+		if (pendingUpdateRecovery) {
+			logDaemonLaunch(`deferring daemon startup on ${socketPath} until pending update recovery completes`);
+		}
+		return;
+	}
 	const cwdIndex = args.indexOf("--cwd");
 	const cwdArg = cwdIndex !== -1 ? args[cwdIndex + 1] : undefined;
 	const spawnCwd = cwdArg ? resolve(expandTildePath(cwdArg)) : undefined;

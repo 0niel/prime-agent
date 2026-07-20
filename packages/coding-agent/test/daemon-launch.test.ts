@@ -215,6 +215,10 @@ describe("shouldStartDaemonEarly", () => {
 	])("does not start early for %s", (label, args) => {
 		expect(shouldStartDaemonEarly(args, label === "startup benchmark")).toBe(false);
 	});
+
+	it("defers early startup while interrupted update recovery is pending", () => {
+		expect(shouldStartDaemonEarly([], false, true)).toBe(false);
+	});
 });
 
 describe("ensureInteractiveDaemonRunning", () => {
