@@ -685,6 +685,51 @@ describe("Agent", () => {
 		expect(agent.state.messages.some((message) => message.role === "user" && message.content === "After")).toBe(true);
 	});
 
+	it("executes a head barrier without an extra model turn", async () => {
+		let responses = 0;
+		const barriers: string[] = [];
+		const agent = new Agent({
+			streamFn: () => {
+				responses++;
+				return new MockAssistantStream();
+			},
+			onQueueBarrier: ({ id }) => {
+				barriers.push(id);
+			},
+		});
+		agent.state.messages = [createAssistantMessage("Initial response")];
+		agent.queueBarrier({ kind: "barrier", id: "compact" }, "steering");
+
+		await agent.continue();
+
+		expect(responses).toBe(0);
+		expect(barriers).toEqual(["compact"]);
+	});
+
+	it("does not execute a barrier cleared by an agent-end listener", async () => {
+		const barriers: string[] = [];
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				queueMicrotask(() =>
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") }),
+				);
+				return stream;
+			},
+			onQueueBarrier: ({ id }) => {
+				barriers.push(id);
+			},
+		});
+		agent.subscribe((event) => {
+			if (event.type === "agent_end") agent.clearAllQueues();
+		});
+		agent.queueBarrier({ kind: "barrier", id: "compact" }, "followUp");
+
+		await agent.prompt("work");
+
+		expect(barriers).toEqual([]);
+	});
+
 	it("removes a whole queued batch when one message matches", () => {
 		const agent = new Agent();
 		const prefix = { role: "user" as const, content: "Prefix", timestamp: Date.now() };

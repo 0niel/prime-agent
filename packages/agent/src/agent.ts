@@ -114,7 +114,7 @@ export interface AgentOptions {
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
 	getContinuationMessages?: (context: GetContinuationMessagesContext, signal?: AbortSignal) => Promise<AgentMessage[]>;
-	onQueueBarrier?: (barrier: AgentQueueBarrier, lane: "steering" | "followUp") => void;
+	onQueueBarrier?: (barrier: AgentQueueBarrier, lane: "steering" | "followUp") => void | Promise<void>;
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
 	sessionId?: string;
@@ -159,6 +159,10 @@ class PendingMessageQueue {
 	peekBarrier(): AgentQueueBarrier | undefined {
 		const first = this.batches[0];
 		return first?.kind === "barrier" ? first : undefined;
+	}
+
+	isBarrierAtHead(id: string): boolean {
+		return this.batches[0]?.kind === "barrier" && this.batches[0].id === id;
 	}
 
 	shiftBarrier(id: string): boolean {
@@ -220,7 +224,7 @@ export class Agent {
 		context: GetContinuationMessagesContext,
 		signal?: AbortSignal,
 	) => Promise<AgentMessage[]>;
-	public onQueueBarrier?: (barrier: AgentQueueBarrier, lane: "steering" | "followUp") => void;
+	public onQueueBarrier?: (barrier: AgentQueueBarrier, lane: "steering" | "followUp") => void | Promise<void>;
 	private activeRun?: ActiveRun;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
@@ -390,58 +394,47 @@ export class Agent {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
 
-		const runQueuedMessages = (): Promise<void> | undefined => {
+		const runQueuedMessages = async (): Promise<boolean> => {
 			const steeringBarrier = this.steeringQueue.peekBarrier();
 			if (steeringBarrier) {
-				queueMicrotask(() => this.onQueueBarrier?.(steeringBarrier, "steering"));
-				return Promise.resolve();
+				await this.onQueueBarrier?.(steeringBarrier, "steering");
+				return true;
 			}
 			const queuedSteering = this.steeringQueue.drain();
 			if (queuedSteering.length > 0) {
-				return this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
+				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
+				return true;
 			}
 
 			const followUpBarrier = this.followUpQueue.peekBarrier();
 			if (followUpBarrier) {
-				queueMicrotask(() => this.onQueueBarrier?.(followUpBarrier, "followUp"));
-				return Promise.resolve();
+				await this.onQueueBarrier?.(followUpBarrier, "followUp");
+				return true;
 			}
 			const queuedFollowUps = this.followUpQueue.drain();
 			if (queuedFollowUps.length > 0) {
-				return this.runPromptMessages(queuedFollowUps);
+				await this.runPromptMessages(queuedFollowUps);
+				return true;
 			}
-
-			return undefined;
+			return false;
 		};
 
 		const lastMessage = this._state.messages[this._state.messages.length - 1];
 		if (!lastMessage) {
-			const queuedRun = runQueuedMessages();
-			if (queuedRun) {
-				await queuedRun;
-				return;
-			}
+			if (await runQueuedMessages()) return;
 
 			throw new Error("No messages to continue from");
 		}
 
 		if (lastMessage.role === "assistant") {
-			const queuedRun = runQueuedMessages();
-			if (queuedRun) {
-				await queuedRun;
-				return;
-			}
+			if (await runQueuedMessages()) return;
 
 			throw new Error("Cannot continue from message role: assistant");
 		}
 
 		const lastMessageRole: string = lastMessage.role;
 		if (lastMessageRole === "custom") {
-			const queuedRun = runQueuedMessages();
-			if (queuedRun) {
-				await queuedRun;
-				return;
-			}
+			if (await runQueuedMessages()) return;
 		}
 
 		await this.runContinuation();
@@ -563,7 +556,10 @@ export class Agent {
 		} catch (error) {
 			await this.handleRunFailure(error, abortController.signal.aborted);
 		} finally {
-			this.finishRun();
+			const pendingBarrier = this.finishRun();
+			if (pendingBarrier) {
+				await this.onQueueBarrier?.(pendingBarrier.barrier, pendingBarrier.lane);
+			}
 		}
 	}
 
@@ -588,7 +584,7 @@ export class Agent {
 		await this.processEvents({ type: "agent_end", messages: [failureMessage] });
 	}
 
-	private finishRun(): void {
+	private finishRun(): { barrier: AgentQueueBarrier; lane: "steering" | "followUp" } | undefined {
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
@@ -596,9 +592,9 @@ export class Agent {
 		this.activeRun = undefined;
 		const pendingBarrier = this.pendingBarrier;
 		this.pendingBarrier = undefined;
-		if (pendingBarrier) {
-			queueMicrotask(() => this.onQueueBarrier?.(pendingBarrier.barrier, pendingBarrier.lane));
-		}
+		if (!pendingBarrier) return undefined;
+		const queue = pendingBarrier.lane === "steering" ? this.steeringQueue : this.followUpQueue;
+		return queue.isBarrierAtHead(pendingBarrier.barrier.id) ? pendingBarrier : undefined;
 	}
 
 	/**

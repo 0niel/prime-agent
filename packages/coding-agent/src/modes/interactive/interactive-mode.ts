@@ -4159,7 +4159,12 @@ export class InteractiveMode {
 					} else {
 						this.editor.addToHistory?.(text);
 						this.editor.setText("");
-						await this.agentConnection.queueSessionSlashCommand(canonicalCommandText, "steering");
+						try {
+							await this.agentConnection.queueSessionSlashCommand(canonicalCommandText, "steering");
+						} catch (error) {
+							this.editor.setText(text);
+							throw error;
+						}
 						this.updatePendingMessagesDisplay();
 					}
 					return;
@@ -4252,12 +4257,6 @@ export class InteractiveMode {
 				if (commandName === "logs" && !commandArgs) {
 					this.echoLocalCommand(text);
 					this.handleLogsCommand();
-					this.editor.setText("");
-					return;
-				}
-				if (commandName === "goal" && (!commandArgs || commandArgs === "status")) {
-					this.echoLocalCommand(text);
-					this.handleGoalStatusCommand();
 					this.editor.setText("");
 					return;
 				}
@@ -8899,41 +8898,6 @@ export class InteractiveMode {
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(info, 1, 0));
-		this.ui.requestRender();
-	}
-
-	private handleGoalStatusCommand(): void {
-		const goal = this.getGoalState();
-		if (goal.status === "idle" || !goal.objective) {
-			this.showStatus("No active goal");
-			return;
-		}
-
-		const lines = [
-			theme.bold("Goal"),
-			"",
-			`${theme.fg("dim", "Status:")} ${goal.status}`,
-			`${theme.fg("dim", "Objective:")} ${goal.objective}`,
-			`${theme.fg("dim", "Time:")} ${this.formatGoalElapsed(goal.timeUsedSeconds)}`,
-			`${theme.fg("dim", "Continuations:")} ${goal.continuationsUsed}`,
-			`${theme.fg("dim", "Tokens:")} ${goal.tokensUsed.toLocaleString()}${
-				goal.tokenBudget === undefined ? "" : ` / ${goal.tokenBudget.toLocaleString()}`
-			}`,
-		];
-		if (goal.tokenBudget !== undefined) {
-			lines.push(
-				`${theme.fg("dim", "Remaining:")} ${Math.max(0, goal.tokenBudget - goal.tokensUsed).toLocaleString()}`,
-			);
-		}
-		if (goal.lastReason) {
-			lines.push(`${theme.fg("dim", "Reason:")} ${goal.lastReason}`);
-		}
-		if (goal.lastError) {
-			lines.push(`${theme.fg("dim", "Error:")} ${goal.lastError}`);
-		}
-
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(lines.join("\n"), 1, 0));
 		this.ui.requestRender();
 	}
 

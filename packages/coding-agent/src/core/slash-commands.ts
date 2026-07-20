@@ -112,6 +112,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		name: "autonomous",
 		description: "Set or view autonomous mode",
 		argumentHint: "[status|on|off]",
+		takesArgument: true,
 		execution: "session",
 	},
 	{
