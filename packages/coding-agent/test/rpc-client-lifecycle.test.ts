@@ -48,6 +48,18 @@ describe("RpcClient lifecycle", () => {
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
+	it("cleans up event collection when a prompt is rejected during stop", async () => {
+		const client = createClient();
+		clients.push(client);
+		await client.start();
+		vi.useFakeTimers();
+
+		const stop = client.stop();
+		await expect(client.promptAndWait("too late")).rejects.toThrow("Client is stopping");
+		await stop;
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
 	it("shares concurrent stop calls and prevents restart until termination completes", async () => {
 		const client = createClient(["--ignore-sigterm"]);
 		clients.push(client);
@@ -82,6 +94,17 @@ describe("RpcClient lifecycle", () => {
 		await client.start();
 
 		await expect(client.getState()).resolves.toMatchObject({ sessionId: "final" });
+	});
+
+	it("rejects a new request safely while final output is draining", async () => {
+		const client = createClient(["--respond-then-exit"]);
+		clients.push(client);
+		await client.start();
+
+		await expect(client.getState()).resolves.toMatchObject({ sessionId: "final" });
+		await expect(client.getState()).rejects.toThrow(
+			/Client not started|Agent process input error|Agent process exited/,
+		);
 	});
 
 	it("rejects pending requests and clears their timers when the process errors", async () => {

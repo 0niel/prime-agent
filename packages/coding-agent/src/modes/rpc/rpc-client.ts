@@ -84,6 +84,7 @@ export class RpcClient {
 	private requestId = 0;
 	private stderr = "";
 	private stopPromise: Promise<void> | null = null;
+	private acceptsRequests = false;
 	private lifecycleRejectors = new Set<(error: Error) => void>();
 
 	constructor(private options: RpcClientOptions = {}) {}
@@ -115,6 +116,7 @@ export class RpcClient {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.process = child;
+		this.acceptsRequests = true;
 		let startupError: Error | undefined;
 
 		// Collect stderr for debugging
@@ -132,6 +134,13 @@ export class RpcClient {
 			const error = new Error(`Agent process error: ${cause.message}. Stderr: ${this.stderr}`, { cause });
 			startupError ??= error;
 			this.cleanupProcess(child, error);
+		});
+		child.stdin?.on("error", () => {
+			if (this.process !== child) return;
+			this.acceptsRequests = false;
+		});
+		child.once("exit", () => {
+			if (this.process === child) this.acceptsRequests = false;
 		});
 		child.once("close", (code, signal) => {
 			const status = signal ? `signal ${signal}` : `code ${code}`;
@@ -156,6 +165,7 @@ export class RpcClient {
 		const child = this.process;
 		if (!child) return;
 
+		this.acceptsRequests = false;
 		this.rejectPendingRequests(
 			new Error(`RPC client stopped before the operation completed. Stderr: ${this.stderr}`),
 		);
@@ -600,19 +610,27 @@ export class RpcClient {
 	 * Collect events until agent becomes idle.
 	 */
 	collectEvents(timeout = 60000): Promise<AgentEvent[]> {
-		return new Promise((resolve, reject) => {
+		return this.createEventCollector(timeout).promise;
+	}
+
+	private createEventCollector(timeout: number): {
+		promise: Promise<AgentEvent[]>;
+		reject: (error: Error) => void;
+	} {
+		let rejectCollector: (error: Error) => void = () => {};
+		const promise = new Promise<AgentEvent[]>((resolve, reject) => {
 			const events: AgentEvent[] = [];
 			const cleanup = () => {
 				clearTimeout(timer);
 				unsubscribe();
-				this.lifecycleRejectors.delete(rejectLifecycle);
+				this.lifecycleRejectors.delete(rejectCollector);
 			};
-			const rejectLifecycle = (error: Error) => {
+			rejectCollector = (error: Error) => {
 				cleanup();
 				reject(error);
 			};
 			const timer = setTimeout(() => {
-				rejectLifecycle(new Error(`Timeout collecting events. Stderr: ${this.stderr}`));
+				rejectCollector(new Error(`Timeout collecting events. Stderr: ${this.stderr}`));
 			}, timeout);
 			const unsubscribe = this.onEvent((event) => {
 				events.push(event);
@@ -621,17 +639,25 @@ export class RpcClient {
 					resolve(events);
 				}
 			});
-			this.lifecycleRejectors.add(rejectLifecycle);
+			this.lifecycleRejectors.add(rejectCollector);
 		});
+		return { promise, reject: rejectCollector };
 	}
 
 	/**
 	 * Send prompt and wait for completion, returning all events.
 	 */
 	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
-		const eventsPromise = this.collectEvents(timeout);
-		await this.prompt(message, images);
-		return eventsPromise;
+		const collector = this.createEventCollector(timeout);
+		try {
+			await this.prompt(message, images);
+		} catch (cause) {
+			const collectorSettled = collector.promise.catch(() => undefined);
+			collector.reject(cause instanceof Error ? cause : new Error(String(cause)));
+			await collectorSettled;
+			throw cause;
+		}
+		return collector.promise;
 	}
 
 	// =========================================================================
@@ -643,6 +669,7 @@ export class RpcClient {
 		this.stopReadingStdout?.();
 		this.stopReadingStdout = null;
 		this.process = null;
+		this.acceptsRequests = false;
 		this.rejectPendingRequests(error);
 	}
 
@@ -690,7 +717,9 @@ export class RpcClient {
 	}
 
 	private async send(command: RpcCommandBody, timeoutMs = 30000): Promise<RpcResponse> {
-		if (!this.process?.stdin || this.stopPromise) {
+		const child = this.process;
+		const stdin = child?.stdin;
+		if (!stdin || !this.acceptsRequests || this.stopPromise) {
 			throw new Error(this.stopPromise ? "Client is stopping" : "Client not started");
 		}
 
@@ -716,7 +745,19 @@ export class RpcClient {
 				},
 			});
 
-			this.process!.stdin!.write(serializeJsonLine(fullCommand));
+			const rejectWrite = (cause: Error) => {
+				const pending = this.pendingRequests.get(id);
+				if (!pending) return;
+				this.pendingRequests.delete(id);
+				pending.reject(new Error(`Agent process input error: ${cause.message}. Stderr: ${this.stderr}`, { cause }));
+			};
+			try {
+				stdin.write(serializeJsonLine(fullCommand), (cause) => {
+					if (cause) rejectWrite(cause);
+				});
+			} catch (cause) {
+				rejectWrite(cause instanceof Error ? cause : new Error(String(cause)));
+			}
 		});
 	}
 

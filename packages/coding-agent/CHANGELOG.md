@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed RPC clients leaving operations pending or crashing when their frontend process stopped while output was draining ([#459](https://github.com/PrimeIntellect-ai/prime-agent/pull/459) by [@snimu](https://github.com/snimu)).
 - Changed `/model` to show all public models with authenticated providers first and open provider authentication when an unavailable model is selected ([ENG-4575](https://linear.app/primeintellect/issue/ENG-4575/show-all-models-in-model-and-prompt-auth-on-selection)).
 - Changed the shared configuration menu to cycle tabs with Tab, use Shift+Tab for model scope, show an Escape close hint, preserve arrow-key search editing, and remove the model selector's provider shortcut.
 - Fixed searchable selectors retaining their previous scroll position after the query changed.
