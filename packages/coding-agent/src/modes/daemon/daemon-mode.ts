@@ -2887,6 +2887,19 @@ export class AgentDaemon {
 				return success(command.id, "steer");
 			}
 
+			case "execute_session_command": {
+				const state = this.getBoundSessionState(command.activeSessionId);
+				await state.runtime.session.executeSessionSlashCommand(command.text);
+				return success(command.id, "execute_session_command");
+			}
+
+			case "queue_session_command": {
+				const state = this.getBoundSessionState(command.activeSessionId);
+				await state.runtime.session.queueSessionSlashCommand(command.text, command.lane, { resumeIfIdle: true });
+				this.recordWorkerRecoveryState(state, "session_command_queued", true);
+				return success(command.id, "queue_session_command");
+			}
+
 			case "follow_up": {
 				const state = this.getBoundSessionState(command.activeSessionId);
 				let queued: boolean;
@@ -4185,6 +4198,7 @@ export class AgentDaemon {
 		const queue = {
 			steering: [...session.getSteeringQueueSnapshots()].map((message) => ({
 				message: message.text,
+				...(message.command ? { command: message.command } : {}),
 				...(message.content ? { content: message.content } : {}),
 				...(message.images ? { images: message.images } : {}),
 				...(message.queueKey ? { queueKey: message.queueKey } : {}),
@@ -4194,6 +4208,7 @@ export class AgentDaemon {
 			})),
 			followUp: [...session.getFollowUpQueueSnapshots()].map((message) => ({
 				message: message.text,
+				...(message.command ? { command: message.command } : {}),
 				...(message.content ? { content: message.content } : {}),
 				...(message.images ? { images: message.images } : {}),
 				...(message.queueKey ? { queueKey: message.queueKey } : {}),

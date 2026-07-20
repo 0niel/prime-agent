@@ -1986,4 +1986,33 @@ describe("AgentSession queue characterization", () => {
 			'Extension command "/testcmd" cannot be queued. Use prompt() or execute the command when not streaming.',
 		);
 	});
+	it("executes a queued session command at its follow-up position", async () => {
+		const { harness, releaseToolExecution, promptPromise, waitForToolStart } = await createWaitingHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("first turn complete"),
+			fauxAssistantMessage("after command"),
+		]);
+		await waitForToolStart;
+		const compact = vi.spyOn(harness.session, "compact").mockResolvedValue({
+			summary: "compacted",
+			firstKeptEntryId: "kept",
+			tokensBefore: 100,
+		});
+		await harness.session.followUp("before command");
+		await harness.session.queueSessionSlashCommand("/compact focus on queues", "followUp");
+		await harness.session.followUp("after command");
+
+		releaseToolExecution();
+		await promptPromise;
+		await vi.waitFor(() => expect(harness.session.pendingMessageCount).toBe(0));
+
+		expect(compact).toHaveBeenCalledWith("focus on queues");
+		expect(getUserTexts(harness)).toEqual(["start", "before command", "after command"]);
+		const command = harness.session.messages.find(
+			(message) => message.role === "custom" && message.customType === "session_slash_command",
+		);
+		expect(command).toMatchObject({ content: "/compact focus on queues", display: true });
+	});
 });

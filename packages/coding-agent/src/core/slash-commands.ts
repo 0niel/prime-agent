@@ -10,9 +10,18 @@ export interface SlashCommandInfo {
 	sourceInfo: SourceInfo;
 }
 
+export type SessionSlashCommandName = "compact" | "refine" | "goal" | "autonomous";
+
+export interface SessionSlashCommand {
+	name: SessionSlashCommandName;
+	args: string;
+	text: string;
+}
+
 export interface BuiltinSlashCommand {
 	name: string;
 	description: string;
+	execution?: "client" | "session";
 	/** Shown in autocomplete before the description, e.g. "[instructions]" */
 	argumentHint?: string;
 	/** Hidden names that resolve to this command without being shown as commands. */
@@ -85,13 +94,25 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		name: "compact",
 		description: "Compact the session context; optional instructions focus the summary",
 		argumentHint: "[instructions]",
+		execution: "session",
 	},
-	{ name: "refine", description: "Refine continual harness prompt notes, skills, subagents, and memory" },
+	{
+		name: "refine",
+		description: "Refine continual harness prompt notes, skills, subagents, and memory",
+		execution: "session",
+	},
 	{
 		name: "goal",
 		description: "Set or view a persistent goal; supports pause, resume, and clear",
 		argumentHint: "[objective]",
 		takesArgument: true,
+		execution: "session",
+	},
+	{
+		name: "autonomous",
+		description: "Set or view autonomous mode",
+		argumentHint: "[status|on|off]",
+		execution: "session",
 	},
 	{
 		name: "heartbeat",
@@ -180,4 +201,13 @@ export function resolveSlashCommand(command: ParsedSlashCommand): ResolvedSlashC
 		originalName: command.name,
 		isAlias: name !== command.name,
 	};
+}
+
+export function parseSessionSlashCommand(text: string): SessionSlashCommand | undefined {
+	const parsed = parseSlashCommand(text);
+	if (!parsed) return undefined;
+	const name = resolveBuiltinSlashCommandName(parsed.name);
+	const command = BUILTIN_SLASH_COMMAND_BY_NAME.get(name);
+	if (command?.execution !== "session") return undefined;
+	return { name: name as SessionSlashCommandName, args: parsed.args, text };
 }

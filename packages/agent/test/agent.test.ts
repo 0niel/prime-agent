@@ -646,6 +646,45 @@ describe("Agent", () => {
 		]);
 	});
 
+	it("stops at queue barriers and resumes messages after the barrier", async () => {
+		let responseCount = 0;
+		let barrierReached: (() => void) | undefined;
+		const reached = new Promise<void>((resolve) => {
+			barrierReached = resolve;
+		});
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				responseCount++;
+				queueMicrotask(() =>
+					stream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage(`Processed ${responseCount}`),
+					}),
+				);
+				return stream;
+			},
+			onQueueBarrier: () => barrierReached?.(),
+		});
+		agent.state.messages = [createAssistantMessage("Initial response")];
+		agent.followUp({ role: "user", content: "Before", timestamp: Date.now() });
+		agent.queueBarrier({ kind: "barrier", id: "compact" }, "followUp");
+		agent.followUp({ role: "user", content: "After", timestamp: Date.now() + 1 });
+
+		await agent.continue();
+		await reached;
+		expect(responseCount).toBe(1);
+		expect(agent.state.messages.some((message) => message.role === "user" && message.content === "After")).toBe(
+			false,
+		);
+
+		expect(agent.completeQueueBarrier("compact", "followUp")).toBe(true);
+		await agent.continue();
+		expect(responseCount).toBe(2);
+		expect(agent.state.messages.some((message) => message.role === "user" && message.content === "After")).toBe(true);
+	});
+
 	it("removes a whole queued batch when one message matches", () => {
 		const agent = new Agent();
 		const prefix = { role: "user" as const, content: "Prefix", timestamp: Date.now() };

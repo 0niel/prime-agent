@@ -217,6 +217,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	getFollowUpMessages?: () => Promise<AgentMessage[]>;
 
+	/** Returns true when an opaque queue barrier should end this run before another LLM turn. */
+	shouldStopForQueueBarrier?: () => boolean;
+
 	/**
 	 * Returns continuation messages when the agent would otherwise stop.
 	 *

@@ -19,6 +19,7 @@ import type { InputSource } from "../../core/extensions/types.js";
 import type { CustomMessage } from "../../core/messages.js";
 import type { SessionCwdIssue } from "../../core/session-cwd.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
+import type { SessionSlashCommand } from "../../core/slash-commands.js";
 import type {
 	AgentConnectionAgentStatus,
 	AgentConnectionHeartbeat,
@@ -49,8 +50,8 @@ import type { SessionSummary } from "./daemon-session-list.js";
 export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
 export const DAEMON_PROTOCOL_VERSION = 4;
 export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 2;
-export const DAEMON_SCHEMA_REVISION = 2;
-export const DAEMON_SCHEMA_ID = "protocol-4-schema-2-cbdbe20e7ce4";
+export const DAEMON_SCHEMA_REVISION = 3;
+export const DAEMON_SCHEMA_ID = "protocol-4-schema-3-04879e7cd613";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -270,6 +271,7 @@ export interface DaemonAttachResult {
 
 export interface DaemonUpdateRestartQueuedMessage {
 	message: string;
+	command?: SessionSlashCommand;
 	content?: (TextContent | ImageContent)[];
 	images?: ImageContent[];
 	queueKey?: string;
@@ -418,6 +420,14 @@ export type DaemonCommand =
 			agentMessageId?: string;
 			customMessage?: CustomMessage;
 			prefixMessages?: CustomMessage[];
+	  }
+	| { id?: string; type: "execute_session_command"; activeSessionId: string; text: string }
+	| {
+			id?: string;
+			type: "queue_session_command";
+			activeSessionId: string;
+			text: string;
+			lane: "steering" | "followUp";
 	  }
 	| { id?: string; type: "restore_next_turn"; activeSessionId: string; messages: CustomMessage[] }
 	| {
@@ -595,6 +605,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	prompt_and_wait: CURRENT_DAEMON_COMMAND,
 	steer: LEGACY_DAEMON_COMMAND,
 	follow_up: LEGACY_DAEMON_COMMAND,
+	execute_session_command: CURRENT_DAEMON_COMMAND,
+	queue_session_command: CURRENT_DAEMON_COMMAND,
 	restore_next_turn: LEGACY_DAEMON_COMMAND,
 	append_custom_message: LEGACY_DAEMON_COMMAND,
 	resume_queue: LEGACY_DAEMON_COMMAND,

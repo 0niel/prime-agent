@@ -102,6 +102,7 @@ import {
 	createHeartbeatPromptMessage,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
+	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
 import { resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
@@ -114,6 +115,7 @@ import {
 	BUILTIN_SLASH_COMMANDS,
 	builtinSlashCommandTakesArgument,
 	isBuiltinSlashCommandName,
+	parseSessionSlashCommand,
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
@@ -198,6 +200,7 @@ import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SideQuestionComponent } from "./components/side-question.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
+import { SlashCommandMessageComponent, styleSlashCommandText } from "./components/slash-command-message.js";
 import {
 	selectLatestToolExpandHint,
 	ToolExecutionComponent,
@@ -4148,6 +4151,14 @@ export class InteractiveMode {
 				const commandName = slashCommand ? resolveBuiltinSlashCommandName(slashCommand.name) : undefined;
 				const commandArgs = slashCommand?.args ?? "";
 				const canonicalCommandText = commandName ? `/${commandName}${commandArgs ? ` ${commandArgs}` : ""}` : text;
+				const sessionCommand = parseSessionSlashCommand(canonicalCommandText);
+				if (sessionCommand && (this.isAgentStreaming() || this.isAgentCompacting())) {
+					this.editor.addToHistory?.(text);
+					this.editor.setText("");
+					await this.agentConnection.queueSessionSlashCommand(canonicalCommandText, "steering");
+					this.updatePendingMessagesDisplay();
+					return;
+				}
 
 				// Handle commands
 				if (commandName === "btw") {
@@ -4303,16 +4314,9 @@ export class InteractiveMode {
 					await this.handleClearCommand();
 					return;
 				}
-				if (commandName === "compact") {
-					const customInstructions = commandArgs || undefined;
+				if (sessionCommand) {
 					this.editor.setText("");
-					await this.handleCompactCommand(customInstructions);
-					return;
-				}
-				if (commandName === "refine") {
-					const refineArgs = commandArgs || undefined;
-					this.editor.setText("");
-					await this.handleRefineCommand(refineArgs);
+					await this.agentConnection.executeSessionSlashCommand(canonicalCommandText).catch(() => undefined);
 					return;
 				}
 				if (commandName === "reload" && !commandArgs) {
@@ -4930,6 +4934,11 @@ export class InteractiveMode {
 				await this.checkShutdownRequested();
 
 				this.ui.requestRender();
+				break;
+
+			case "session_command_end":
+				if (event.error) this.showError(`Command failed: ${event.error}`);
+				else if (event.message) this.showStatus(event.message);
 				break;
 
 			case "compaction_start": {
@@ -5816,7 +5825,7 @@ export class InteractiveMode {
 		if (this.chatContainer.children.length > 0) {
 			this.chatContainer.addChild(new Spacer(1));
 		}
-		this.chatContainer.addChild(new UserMessageComponent(text, this.getMarkdownThemeWithSettings()));
+		this.chatContainer.addChild(new SlashCommandMessageComponent(text, this.getMarkdownThemeWithSettings()));
 	}
 
 	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
@@ -5837,17 +5846,22 @@ export class InteractiveMode {
 			}
 			case "custom": {
 				if (message.display) {
-					const component = isAgentSessionMessage(message)
-						? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
-						: isInjectedPromptMessage(message)
-							? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
-							: new CustomMessageComponent(
-									message,
-									this.bindLocalSessionExtensions
-										? this.getLocalSessionHost().getExtensionRunner().getMessageRenderer(message.customType)
-										: undefined,
-									this.getMarkdownThemeWithSettings(),
-								);
+					const component =
+						message.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE && typeof message.content === "string"
+							? new SlashCommandMessageComponent(message.content, this.getMarkdownThemeWithSettings())
+							: isAgentSessionMessage(message)
+								? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
+								: isInjectedPromptMessage(message)
+									? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
+									: new CustomMessageComponent(
+											message,
+											this.bindLocalSessionExtensions
+												? this.getLocalSessionHost()
+														.getExtensionRunner()
+														.getMessageRenderer(message.customType)
+												: undefined,
+											this.getMarkdownThemeWithSettings(),
+										);
 					component.setExpanded(this.toolOutputExpanded);
 					this.chatContainer.addChild(component);
 				}
@@ -6407,6 +6421,17 @@ export class InteractiveMode {
 		let clearedSubmittedText: string | undefined;
 
 		try {
+			const sessionCommand = parseSessionSlashCommand(text);
+			if (sessionCommand && (this.isAgentStreaming() || this.isAgentCompacting())) {
+				this.editor.addToHistory?.(text);
+				clearedSubmittedText = text;
+				this.editor.setText("");
+				await this.agentConnection.queueSessionSlashCommand(text, "followUp");
+				clearedSubmittedText = undefined;
+				this.updatePendingMessagesDisplay();
+				return;
+			}
+
 			// Queue input during compaction (extension commands execute immediately)
 			if (this.isAgentCompacting()) {
 				if (this.isExtensionCommand(text)) {
@@ -6706,11 +6731,17 @@ export class InteractiveMode {
 		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
 			this.queuedMessagesContainer.addChild(new Spacer(1));
 			for (const message of steeringMessages) {
-				const text = theme.fg("dim", formatQueuedMessagePreview(message, "Steering"));
+				const preview = formatQueuedMessagePreview(message, "Steering");
+				const text = parseSessionSlashCommand(message)
+					? `${theme.fg("dim", "Steering: ")}${styleSlashCommandText(message)}`
+					: theme.fg("dim", preview);
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			for (const message of followUpMessages) {
-				const text = theme.fg("dim", formatQueuedMessagePreview(message, "Follow-up"));
+				const preview = formatQueuedMessagePreview(message, "Follow-up");
+				const text = parseSessionSlashCommand(message)
+					? `${theme.fg("dim", "Follow-up: ")}${styleSlashCommandText(message)}`
+					: theme.fg("dim", preview);
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			const dequeueHint = this.getAppKeyDisplay("app.message.dequeue");
@@ -9341,7 +9372,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		}
 	}
 
-	private async handleCompactCommand(customInstructions?: string): Promise<void> {
+	async handleCompactCommand(customInstructions?: string): Promise<void> {
 		let messageCount: number;
 		try {
 			const stats = await this.agentConnection.getSessionStats();
@@ -9365,7 +9396,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		}
 	}
 
-	private async handleRefineCommand(args?: string): Promise<void> {
+	async handleRefineCommand(args?: string): Promise<void> {
 		let trimmedArgs = args?.trim() ?? "";
 		const globalOption: { global: boolean } = { global: false };
 		if (/^--global(?=\s|$)/.test(trimmedArgs)) {

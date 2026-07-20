@@ -49,6 +49,7 @@ interface MockCustomMessage {
 
 interface MockQueuedMessage {
 	message: string;
+	command?: { name: "compact"; args: string; text: string };
 	content?: Array<{ type: "text"; text: string }>;
 	agentMessageId?: string;
 	queueKey?: string;
@@ -1234,7 +1235,12 @@ describe("self-update daemon restart", () => {
 					cwd: projectDir,
 					config: { cwd: projectDir, agentDir },
 					queue: {
-						steering: [],
+						steering: [
+							{
+								message: "/compact focus on queues",
+								command: { name: "compact", args: "focus on queues", text: "/compact focus on queues" },
+							},
+						],
 						followUp: [
 							{
 								message: "heartbeat body",
@@ -1261,6 +1267,15 @@ describe("self-update daemon restart", () => {
 
 		try {
 			await expect(performUpdateAndRunCoordinator()).resolves.toBeUndefined();
+
+			expect(mockState.requestPayloads).toContainEqual(
+				expect.objectContaining({
+					type: "queue_session_command",
+					activeSessionId: "restored-active",
+					text: "/compact focus on queues",
+					lane: "steering",
+				}),
+			);
 
 			expect(mockState.requestPayloads).toContainEqual(
 				expect.objectContaining({

@@ -532,6 +532,7 @@ export type AgentConnectionSessionEvent =
 			steering: readonly string[];
 			followUp: readonly string[];
 	  }
+	| { type: "session_command_end"; text: string; message?: string; error?: string }
 	| {
 			type: "compaction_start";
 			reason: "manual" | "threshold" | "overflow" | "requested";
@@ -646,6 +647,8 @@ export interface AgentConnection {
 	abortSideQuestion(id: string): Promise<boolean>;
 	steer(message: string, images?: ImageContent[]): Promise<void>;
 	followUp(message: string, images?: ImageContent[]): Promise<void>;
+	executeSessionSlashCommand(text: string): Promise<void>;
+	queueSessionSlashCommand(text: string, lane: "steering" | "followUp"): Promise<void>;
 	/** Request cancellation of the active turn and return once the request is accepted. */
 	abort(): Promise<void>;
 	cancelRlmChild(childId: string): Promise<boolean>;

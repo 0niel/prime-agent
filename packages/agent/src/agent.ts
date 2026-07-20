@@ -57,6 +57,13 @@ const DEFAULT_MODEL = {
 
 type QueueMode = "all" | "one-at-a-time";
 
+export interface AgentQueueBarrier {
+	kind: "barrier";
+	id: string;
+}
+
+type PendingQueueBatch = { kind: "messages"; messages: AgentMessage[] } | AgentQueueBarrier;
+
 type MutableAgentState = Omit<AgentState, "isStreaming" | "streamingMessage" | "pendingToolCalls" | "errorMessage"> & {
 	isStreaming: boolean;
 	streamingMessage?: AgentMessage;
@@ -107,6 +114,7 @@ export interface AgentOptions {
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
 	getContinuationMessages?: (context: GetContinuationMessagesContext, signal?: AbortSignal) => Promise<AgentMessage[]>;
+	onQueueBarrier?: (barrier: AgentQueueBarrier, lane: "steering" | "followUp") => void;
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
 	sessionId?: string;
@@ -117,15 +125,17 @@ export interface AgentOptions {
 }
 
 class PendingMessageQueue {
-	private batches: AgentMessage[][] = [];
+	private batches: PendingQueueBatch[] = [];
 
 	constructor(public mode: QueueMode) {}
 
 	enqueue(message: AgentMessage | AgentMessage[]): void {
-		const batch = Array.isArray(message) ? message.slice() : [message];
-		if (batch.length > 0) {
-			this.batches.push(batch);
-		}
+		const messages = Array.isArray(message) ? message.slice() : [message];
+		if (messages.length > 0) this.batches.push({ kind: "messages", messages });
+	}
+
+	enqueueBarrier(barrier: AgentQueueBarrier): void {
+		this.batches.push(barrier);
 	}
 
 	hasItems(): boolean {
@@ -133,18 +143,28 @@ class PendingMessageQueue {
 	}
 
 	drain(): AgentMessage[] {
-		if (this.mode === "all") {
-			const drained = this.batches.flat();
-			this.batches = [];
-			return drained;
-		}
-
 		const first = this.batches[0];
-		if (!first) {
-			return [];
+		if (!first || first.kind === "barrier") return [];
+		if (this.mode === "one-at-a-time") {
+			this.batches = this.batches.slice(1);
+			return first.messages;
 		}
-		this.batches = this.batches.slice(1);
-		return first;
+		const drained: AgentMessage[] = [];
+		while (this.batches[0]?.kind === "messages") {
+			drained.push(...(this.batches.shift() as { kind: "messages"; messages: AgentMessage[] }).messages);
+		}
+		return drained;
+	}
+
+	peekBarrier(): AgentQueueBarrier | undefined {
+		const first = this.batches[0];
+		return first?.kind === "barrier" ? first : undefined;
+	}
+
+	shiftBarrier(id: string): boolean {
+		if (this.batches[0]?.kind !== "barrier" || this.batches[0].id !== id) return false;
+		this.batches.shift();
+		return true;
 	}
 
 	clear(): void {
@@ -153,15 +173,11 @@ class PendingMessageQueue {
 
 	removeWhere(predicate: (message: AgentMessage) => boolean): AgentMessage[] {
 		const removed: AgentMessage[] = [];
-		const retained: AgentMessage[][] = [];
-		for (const batch of this.batches) {
-			if (batch.some(predicate)) {
-				removed.push(...batch);
-			} else {
-				retained.push(batch);
-			}
-		}
-		this.batches = retained;
+		this.batches = this.batches.filter((batch) => {
+			if (batch.kind === "barrier" || !batch.messages.some(predicate)) return true;
+			removed.push(...batch.messages);
+			return false;
+		});
 		return removed;
 	}
 }
@@ -183,6 +199,7 @@ export class Agent {
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
 	private readonly steeringQueue: PendingMessageQueue;
 	private readonly followUpQueue: PendingMessageQueue;
+	private pendingBarrier?: { barrier: AgentQueueBarrier; lane: "steering" | "followUp" };
 
 	public convertToLlm: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	public transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
@@ -203,6 +220,7 @@ export class Agent {
 		context: GetContinuationMessagesContext,
 		signal?: AbortSignal,
 	) => Promise<AgentMessage[]>;
+	public onQueueBarrier?: (barrier: AgentQueueBarrier, lane: "steering" | "followUp") => void;
 	private activeRun?: ActiveRun;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
@@ -227,6 +245,7 @@ export class Agent {
 		this.afterToolCall = options.afterToolCall;
 		this.shouldStopAfterTurn = options.shouldStopAfterTurn;
 		this.getContinuationMessages = options.getContinuationMessages;
+		this.onQueueBarrier = options.onQueueBarrier;
 		this.steeringQueue = new PendingMessageQueue(options.steeringMode ?? "one-at-a-time");
 		this.followUpQueue = new PendingMessageQueue(options.followUpMode ?? "one-at-a-time");
 		this.sessionId = options.sessionId;
@@ -286,6 +305,14 @@ export class Agent {
 	/** Queue a message batch to run only after the agent would otherwise stop. */
 	followUp(message: AgentMessage | AgentMessage[]): void {
 		this.followUpQueue.enqueue(message);
+	}
+
+	queueBarrier(barrier: AgentQueueBarrier, lane: "steering" | "followUp"): void {
+		(lane === "steering" ? this.steeringQueue : this.followUpQueue).enqueueBarrier(barrier);
+	}
+
+	completeQueueBarrier(id: string, lane: "steering" | "followUp"): boolean {
+		return (lane === "steering" ? this.steeringQueue : this.followUpQueue).shiftBarrier(id);
 	}
 
 	/** Remove all queued steering messages. */
@@ -364,11 +391,21 @@ export class Agent {
 		}
 
 		const runQueuedMessages = (): Promise<void> | undefined => {
+			const steeringBarrier = this.steeringQueue.peekBarrier();
+			if (steeringBarrier) {
+				queueMicrotask(() => this.onQueueBarrier?.(steeringBarrier, "steering"));
+				return Promise.resolve();
+			}
 			const queuedSteering = this.steeringQueue.drain();
 			if (queuedSteering.length > 0) {
 				return this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
 			}
 
+			const followUpBarrier = this.followUpQueue.peekBarrier();
+			if (followUpBarrier) {
+				queueMicrotask(() => this.onQueueBarrier?.(followUpBarrier, "followUp"));
+				return Promise.resolve();
+			}
 			const queuedFollowUps = this.followUpQueue.drain();
 			if (queuedFollowUps.length > 0) {
 				return this.runPromptMessages(queuedFollowUps);
@@ -489,9 +526,18 @@ export class Agent {
 					skipInitialSteeringPoll = false;
 					return [];
 				}
-				return this.steeringQueue.drain();
+				const messages = this.steeringQueue.drain();
+				const barrier = messages.length === 0 ? this.steeringQueue.peekBarrier() : undefined;
+				if (barrier) this.pendingBarrier = { barrier, lane: "steering" };
+				return messages;
 			},
-			getFollowUpMessages: async () => this.followUpQueue.drain(),
+			getFollowUpMessages: async () => {
+				const messages = this.followUpQueue.drain();
+				const barrier = messages.length === 0 ? this.followUpQueue.peekBarrier() : undefined;
+				if (barrier) this.pendingBarrier = { barrier, lane: "followUp" };
+				return messages;
+			},
+			shouldStopForQueueBarrier: () => this.pendingBarrier !== undefined,
 			getContinuationMessages: async (context, signal) => this.getContinuationMessages?.(context, signal) ?? [],
 		};
 	}
@@ -548,6 +594,11 @@ export class Agent {
 		this._state.pendingToolCalls = new Set<string>();
 		this.activeRun?.resolve();
 		this.activeRun = undefined;
+		const pendingBarrier = this.pendingBarrier;
+		this.pendingBarrier = undefined;
+		if (pendingBarrier) {
+			queueMicrotask(() => this.onQueueBarrier?.(pendingBarrier.barrier, pendingBarrier.lane));
+		}
 	}
 
 	/**

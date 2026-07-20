@@ -410,6 +410,10 @@ async function runLoop(
 				return;
 			}
 			pendingMessages = steeringMessagesResult.value;
+			if (pendingMessages.length === 0 && config.shouldStopForQueueBarrier?.()) {
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
 		}
 
 		// Agent would stop here. Check for follow-up messages.
@@ -422,6 +426,10 @@ async function runLoop(
 			return;
 		}
 		const followUpMessages = followUpMessagesResult.value;
+		if (followUpMessages.length === 0 && config.shouldStopForQueueBarrier?.()) {
+			await emit({ type: "agent_end", messages: newMessages });
+			return;
+		}
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them
 			pendingMessages = followUpMessages;

@@ -23,6 +23,7 @@ import {
 	type AgentContext,
 	type AgentEvent,
 	type AgentMessage,
+	type AgentQueueBarrier,
 	type AgentState,
 	type AgentTool,
 	type GetContinuationMessagesContext,
@@ -175,6 +176,7 @@ import {
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
@@ -229,7 +231,7 @@ import {
 import type { SessionStats } from "./session-stats.js";
 import type { SettingsManager } from "./settings-manager.js";
 import { getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
-import type { SlashCommandInfo } from "./slash-commands.js";
+import { parseSessionSlashCommand, type SessionSlashCommand, type SlashCommandInfo } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
@@ -285,6 +287,7 @@ export type AgentSessionEvent =
 			steering: readonly string[];
 			followUp: readonly string[];
 	  }
+	| { type: "session_command_end"; text: string; message?: string; error?: string }
 	| { type: "compaction_start"; reason: CompactionReason; customInstructions?: string }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
@@ -468,6 +471,8 @@ type QueuedAgentMessage = UserMessage | CustomMessage;
 
 interface QueuedSteeringMessage {
 	text: string;
+	command?: SessionSlashCommand;
+	barrierId?: string;
 	previewLabel?: string;
 	queueKey?: string;
 	agentMessageId?: string;
@@ -477,6 +482,8 @@ interface QueuedSteeringMessage {
 
 interface QueuedFollowUpMessage {
 	text: string;
+	command?: SessionSlashCommand;
+	barrierId?: string;
 	previewLabel?: string;
 	queueKey?: string;
 	agentMessageId?: string;
@@ -486,6 +493,7 @@ interface QueuedFollowUpMessage {
 
 export interface QueuedAgentInputSnapshot {
 	text: string;
+	command?: SessionSlashCommand;
 	content?: (TextContent | ImageContent)[];
 	images?: ImageContent[];
 	queueKey?: string;
@@ -527,6 +535,7 @@ function createQueuedAgentInputSnapshot(
 	const snapshot = createQueuedAgentInputSnapshotFromUserMessage(message.text, message.message);
 	return {
 		...snapshot,
+		...(message.command ? { command: message.command } : {}),
 		...(message.prefixMessages.length > 0
 			? { prefixMessages: message.prefixMessages.map((prefix) => cloneCustomMessage(prefix)) }
 			: {}),
@@ -812,6 +821,7 @@ export class AgentSession {
 	private _steeringMessages: QueuedSteeringMessage[] = [];
 	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
 	private _followUpMessages: QueuedFollowUpMessage[] = [];
+	private _executingSessionCommand = false;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
@@ -990,6 +1000,9 @@ export class AgentSession {
 		this._installAgentToolHooks();
 		this._installAgentTurnHook();
 		this._installAgentContinuationHook();
+		this.agent.onQueueBarrier = (barrier, lane) => {
+			void this._executeQueuedSessionCommand(barrier, lane);
+		};
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -3573,6 +3586,112 @@ export class AgentSession {
 	 * @param images Optional image attachments to include with the message
 	 * @throws Error if text is an extension command
 	 */
+	async queueSessionSlashCommand(
+		text: string,
+		lane: "steering" | "followUp",
+		options: { resumeIfIdle?: boolean } = {},
+	): Promise<void> {
+		const command = parseSessionSlashCommand(text);
+		if (!command) throw new Error(`Not a queueable session command: ${text}`);
+		const id = randomUUID();
+		const message: CustomMessage = {
+			role: "custom",
+			customType: SESSION_SLASH_COMMAND_CUSTOM_TYPE,
+			content: text,
+			display: false,
+			details: { command: command.name },
+			timestamp: Date.now(),
+		};
+		const queued = { text, command, barrierId: id, prefixMessages: [], message };
+		if (lane === "steering") this._steeringMessages.push(queued);
+		else this._followUpMessages.push(queued);
+		this.agent.queueBarrier({ kind: "barrier", id }, lane);
+		this._emitQueueUpdate();
+		if (options.resumeIfIdle) this._schedulePendingMessageResume(true);
+	}
+
+	private async _executeQueuedSessionCommand(
+		barrier: AgentQueueBarrier,
+		lane: "steering" | "followUp",
+	): Promise<void> {
+		if (this._executingSessionCommand) return;
+		const queue = lane === "steering" ? this._steeringMessages : this._followUpMessages;
+		const index = queue.findIndex((message) => message.command && message.barrierId === barrier.id);
+		const queued = index >= 0 ? queue[index] : undefined;
+		if (!queued?.command) return;
+		this._executingSessionCommand = true;
+		queue.splice(index, 1);
+		this.agent.completeQueueBarrier(barrier.id, lane);
+		this._emitQueueUpdate();
+		try {
+			await this.executeSessionSlashCommand(queued.command.text);
+		} catch {
+			// executeSessionSlashCommand emits the terminal error event.
+		} finally {
+			this._executingSessionCommand = false;
+			this._schedulePendingMessageResume(true);
+		}
+	}
+
+	async executeSessionSlashCommand(text: string): Promise<{ message?: string }> {
+		const command = parseSessionSlashCommand(text);
+		if (!command) throw new Error(`Not a session command: ${text}`);
+		this._emitSessionSlashCommandMessage(command);
+		try {
+			const result = await this._runSessionSlashCommand(command);
+			this._emit({ type: "session_command_end", text, ...(result.message ? { message: result.message } : {}) });
+			return result;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			this._emit({ type: "session_command_end", text, error: message });
+			throw error;
+		}
+	}
+
+	private _emitSessionSlashCommandMessage(command: SessionSlashCommand): void {
+		const message: CustomMessage = {
+			role: "custom",
+			customType: SESSION_SLASH_COMMAND_CUSTOM_TYPE,
+			content: command.text,
+			display: true,
+			details: { command: command.name },
+			timestamp: Date.now(),
+		};
+		this.agent.state.messages.push(message);
+		this.sessionManager.appendCustomMessageEntry(message.customType, message.content, true, message.details);
+		this._emit({ type: "message_start", message });
+		this._emit({ type: "message_end", message });
+	}
+
+	private async _runSessionSlashCommand(command: SessionSlashCommand): Promise<{ message?: string }> {
+		switch (command.name) {
+			case "compact":
+				await this.compact(command.args || undefined);
+				return {};
+			case "refine": {
+				let args = command.args;
+				let global = /^--global(?=\s|$)/.test(args);
+				if (global) args = args.replace(/^--global(?=\s|$)/, "").trim();
+				if (args === "rollback") throw new Error("Usage: /refine rollback <refinement-id>");
+				if (args.startsWith("rollback ") && /\s--global$/.test(args)) {
+					global = true;
+					args = args.replace(/\s--global$/, "").trim();
+				}
+				const result = args.startsWith("rollback ")
+					? await this.refine({ rollbackId: args.slice("rollback ".length).trim(), global })
+					: await this.refine({ instructions: args || undefined, global });
+				const applied = result.appliedEdits.filter((edit) => edit.applied).length;
+				return { message: `Refined continual harness state: ${applied} edit${applied === 1 ? "" : "s"} applied` };
+			}
+			case "goal":
+				await this._handleGoalSlashCommand(command.text, undefined);
+				return {};
+			case "autonomous":
+				await this._handleAutonomousSlashCommand(command.text);
+				return {};
+		}
+	}
+
 	async steer(
 		text: string,
 		images?: ImageContent[],

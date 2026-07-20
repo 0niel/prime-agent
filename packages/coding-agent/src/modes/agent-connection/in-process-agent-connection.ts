@@ -358,6 +358,14 @@ export class InProcessAgentConnection implements AgentConnection {
 		await this.session.followUp(message, images, { resumeIfIdle: true });
 	}
 
+	async executeSessionSlashCommand(text: string): Promise<void> {
+		await this.session.executeSessionSlashCommand(text);
+	}
+
+	async queueSessionSlashCommand(text: string, lane: "steering" | "followUp"): Promise<void> {
+		await this.session.queueSessionSlashCommand(text, lane, { resumeIfIdle: true });
+	}
+
 	async abort(): Promise<void> {
 		this.session.requestAbort();
 	}

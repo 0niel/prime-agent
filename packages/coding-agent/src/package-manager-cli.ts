@@ -46,6 +46,7 @@ import type { AgentSessionRuntimeMetadata } from "./core/agent-session-runtime.j
 import type { CustomMessage } from "./core/messages.js";
 import { DefaultPackageManager } from "./core/package-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
+import { parseSessionSlashCommand } from "./core/slash-commands.js";
 import { DaemonClient, type DaemonHello } from "./modes/daemon/daemon-client.js";
 import {
 	DAEMON_PROTOCOL_VERSION,
@@ -612,6 +613,10 @@ function parseDaemonUpdateRestartQueuedMessage(value: unknown): DaemonUpdateRest
 		throw new Error("Daemon update restart response contains an invalid queued message");
 	}
 	const message = readString(value.message, "queue.message");
+	const command = value.command === undefined ? undefined : parseSessionSlashCommand(message);
+	if (value.command !== undefined && !command) {
+		throw new Error("Daemon update restart response contains an invalid queued command");
+	}
 	const content = readOptionalMessageContent(value.content, "queue.content");
 	const images = readOptionalImages(value.images, "queue.images");
 	const queueKey = readOptionalString(value.queueKey, "queue.queueKey");
@@ -629,6 +634,7 @@ function parseDaemonUpdateRestartQueuedMessage(value: unknown): DaemonUpdateRest
 		readOptionalString(value.agentMessageId, "queue.agentMessageId") ?? parseAgentSessionMessagePromptId(message);
 	return {
 		message,
+		...(command ? { command } : {}),
 		...(content ? { content } : {}),
 		...(images ? { images } : {}),
 		...(queueKey ? { queueKey } : {}),
@@ -1056,17 +1062,24 @@ async function restoreDaemonUpdateRestartSession(
 	}
 	for (const queued of steeringQueue) {
 		const response = await client.request(
-			{
-				type: "steer",
-				activeSessionId,
-				message: queued.message,
-				content: queued.content,
-				images: queued.images,
-				expandPromptTemplates: false,
-				agentMessageId: queued.agentMessageId,
-				customMessage: queued.customMessage,
-				prefixMessages: queued.prefixMessages,
-			},
+			queued.command
+				? {
+						type: "queue_session_command",
+						activeSessionId,
+						text: queued.message,
+						lane: "steering",
+					}
+				: {
+						type: "steer",
+						activeSessionId,
+						message: queued.message,
+						content: queued.content,
+						images: queued.images,
+						expandPromptTemplates: false,
+						agentMessageId: queued.agentMessageId,
+						customMessage: queued.customMessage,
+						prefixMessages: queued.prefixMessages,
+					},
 			30000,
 		);
 		if (response.success) {
@@ -1081,18 +1094,25 @@ async function restoreDaemonUpdateRestartSession(
 	}
 	for (const queued of followUpQueue) {
 		const response = await client.request(
-			{
-				type: "follow_up",
-				activeSessionId,
-				message: queued.message,
-				content: queued.content,
-				images: queued.images,
-				queueKey: queued.queueKey,
-				expandPromptTemplates: false,
-				agentMessageId: queued.agentMessageId,
-				customMessage: queued.customMessage,
-				prefixMessages: queued.prefixMessages,
-			},
+			queued.command
+				? {
+						type: "queue_session_command",
+						activeSessionId,
+						text: queued.message,
+						lane: "followUp",
+					}
+				: {
+						type: "follow_up",
+						activeSessionId,
+						message: queued.message,
+						content: queued.content,
+						images: queued.images,
+						queueKey: queued.queueKey,
+						expandPromptTemplates: false,
+						agentMessageId: queued.agentMessageId,
+						customMessage: queued.customMessage,
+						prefixMessages: queued.prefixMessages,
+					},
 			30000,
 		);
 		if (response.success && wasFollowUpQueued(response)) {

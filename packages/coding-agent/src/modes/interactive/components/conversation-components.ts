@@ -1,9 +1,11 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Component, MarkdownTheme, TUI } from "@earendil-works/pi-tui";
 import { isAgentSessionMessage } from "../../../core/agent-messages.js";
+import { SESSION_SLASH_COMMAND_CUSTOM_TYPE } from "../../../core/messages.js";
 import { AgentMessageComponent } from "./agent-message.js";
 import { AssistantMessageComponent } from "./assistant-message.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./injected-prompt-message.js";
+import { SlashCommandMessageComponent } from "./slash-command-message.js";
 import {
 	selectLatestToolExpandHint,
 	ToolExecutionComponent,
@@ -85,6 +87,13 @@ export function buildConversationComponents(
 		} else if (message.role === "toolResult") {
 			pendingTools.get(message.toolCallId)?.updateResult(message);
 			pendingTools.delete(message.toolCallId);
+		} else if (
+			message.role === "custom" &&
+			message.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE &&
+			message.display &&
+			typeof message.content === "string"
+		) {
+			components.push(new SlashCommandMessageComponent(message.content, options.markdownTheme));
 		} else if (isAgentSessionMessage(message) && message.display) {
 			const component = new AgentMessageComponent(message, options.markdownTheme);
 			component.setExpanded(expanded);

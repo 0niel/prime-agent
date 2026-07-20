@@ -782,6 +782,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		await this.requestOk({ type: "follow_up", activeSessionId: this.activeSessionId, message, images });
 	}
 
+	async executeSessionSlashCommand(text: string): Promise<void> {
+		await this.requestOk({ type: "execute_session_command", activeSessionId: this.activeSessionId, text });
+	}
+
+	async queueSessionSlashCommand(text: string, lane: "steering" | "followUp"): Promise<void> {
+		await this.requestOk({ type: "queue_session_command", activeSessionId: this.activeSessionId, text, lane });
+	}
+
 	async abort(): Promise<void> {
 		await this.requestOk({ type: "abort", activeSessionId: this.activeSessionId });
 	}
