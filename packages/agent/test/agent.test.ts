@@ -685,6 +685,33 @@ describe("Agent", () => {
 		expect(agent.state.messages.some((message) => message.role === "user" && message.content === "After")).toBe(true);
 	});
 
+	it("prioritizes a steering barrier over pending follow-ups", async () => {
+		let responseCount = 0;
+		const barriers: string[] = [];
+		const agent = new Agent({
+			streamFn: () => {
+				const stream = new MockAssistantStream();
+				responseCount++;
+				if (responseCount === 1) {
+					agent.followUp({ role: "user", content: "Follow-up", timestamp: Date.now() });
+					agent.queueBarrier({ kind: "barrier", id: "compact" }, "steering");
+				}
+				queueMicrotask(() =>
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") }),
+				);
+				return stream;
+			},
+			onQueueBarrier: ({ id }) => {
+				barriers.push(id);
+			},
+		});
+
+		await agent.prompt("Start");
+
+		expect(barriers).toEqual(["compact"]);
+		expect(responseCount).toBe(1);
+	});
+
 	it("executes a head barrier without an extra model turn", async () => {
 		let responses = 0;
 		const barriers: string[] = [];
