@@ -11,7 +11,6 @@ import {
 	type InteractiveDaemonStartupDecision,
 	parseAgentsViewCommand,
 	resolveRuntimeSessionOptions,
-	restoreResumeSelectorFallback,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
 	shouldEnsureInteractiveDaemonForStartup,
 	shouldOpenAgentsViewForDaemonInteractive,
@@ -262,22 +261,6 @@ describe("daemon-backed interactive session manager routing", () => {
 
 	test.each(persistentSelectionCases)("keeps %s on a concrete local session manager", (_label, decision) => {
 		expect(shouldUseEphemeralSessionManagerForDaemonInteractive(decision)).toBe(false);
-	});
-
-	test("restores an unresolved resume selector candidate as prompt text", () => {
-		const parsed = {
-			resume: "fix",
-			resumeSelectorFallback: "fix",
-			messages: ["the", "bug"],
-			fileArgs: [],
-			unknownFlags: new Map(),
-			diagnostics: [],
-		};
-
-		expect(restoreResumeSelectorFallback(parsed, "fix")).toBe(true);
-		expect(parsed.resume).toBeUndefined();
-		expect(parsed.resumeSelectorFallback).toBeUndefined();
-		expect(parsed.messages).toEqual(["fix", "the", "bug"]);
 	});
 
 	test("finds an active daemon session by resolved session file", () => {

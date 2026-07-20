@@ -28,7 +28,13 @@ import { listModels } from "./cli/list-models.js";
 import { installOwnedSessionRecoveryTracking, isOwnedSessionWorkerProcess } from "./cli/owned-session-worker.js";
 import { handlePublicCommand } from "./cli/public-command.js";
 import { selectSession } from "./cli/session-picker.js";
-import { expandTildePath, getAgentDir, getSessionDirEnvOverride, VERSION } from "./config.js";
+import {
+	looksLikeSessionPath,
+	resolveSessionPath,
+	SessionSelectorError,
+	SessionSelectorNotFoundError,
+} from "./cli/session-resolver.js";
+import { APP_NAME, expandTildePath, getAgentDir, getSessionDirEnvOverride, VERSION } from "./config.js";
 import {
 	type AgentSessionRuntimeConfig,
 	mergeAgentSessionRuntimeConfig,
@@ -300,10 +306,6 @@ export async function findActiveDaemonSessionSummaryForInteractiveStartup(
 	}
 }
 
-function looksLikeSessionPath(sessionArg: string): boolean {
-	return sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl");
-}
-
 async function prepareInitialMessage(
 	parsed: Args,
 	autoResizeImages: boolean,
@@ -323,44 +325,6 @@ async function prepareInitialMessage(
 		fileImages: images,
 		stdinContent,
 	});
-}
-
-/** Result from resolving a session argument */
-type ResolvedSession =
-	| { type: "path"; path: string } // Direct file path
-	| { type: "local"; path: string } // Found in current project
-	| { type: "global"; path: string; cwd: string } // Found in different project
-	| { type: "not_found"; arg: string }; // Not found anywhere
-
-/**
- * Resolve a session argument to a file path.
- * If it looks like a path, use as-is. Otherwise try to match as session ID prefix.
- */
-async function resolveSessionPath(sessionArg: string, cwd: string, sessionDir?: string): Promise<ResolvedSession> {
-	// If it looks like a file path, use as-is
-	if (looksLikeSessionPath(sessionArg)) {
-		return { type: "path", path: sessionArg };
-	}
-
-	// Try to match as session ID in current project first
-	const localSessions = await SessionManager.list(cwd, sessionDir);
-	const localMatches = localSessions.filter((s) => s.id.startsWith(sessionArg));
-
-	if (localMatches.length >= 1) {
-		return { type: "local", path: localMatches[0].path };
-	}
-
-	// Try global search across all projects
-	const allSessions = await SessionManager.listAll();
-	const globalMatches = allSessions.filter((s) => s.id.startsWith(sessionArg));
-
-	if (globalMatches.length >= 1) {
-		const match = globalMatches[0];
-		return { type: "global", path: match.path, cwd: match.cwd };
-	}
-
-	// Not found anywhere
-	return { type: "not_found", arg: sessionArg };
 }
 
 /** Prompt user for yes/no confirmation */
@@ -471,14 +435,6 @@ function getResumeSelector(parsed: Pick<Args, "resume">): string | undefined {
 	return typeof parsed.resume === "string" ? parsed.resume : undefined;
 }
 
-export function restoreResumeSelectorFallback(parsed: Args, selector: string): boolean {
-	if (parsed.resumeSelectorFallback !== selector) return false;
-	delete parsed.resume;
-	delete parsed.resumeSelectorFallback;
-	parsed.messages.unshift(selector);
-	return true;
-}
-
 export async function createSessionManager(
 	parsed: Args,
 	cwd: string,
@@ -499,11 +455,6 @@ export async function createSessionManager(
 			case "local":
 			case "global":
 				return forkSessionOrExit(resolved.path, cwd, sessionDir);
-
-			case "not_found":
-				if (restoreResumeSelectorFallback(parsed, resolved.arg)) break;
-				console.error(chalk.red(`No session found matching '${resolved.arg}'`));
-				process.exit(1);
 		}
 	}
 
@@ -525,11 +476,6 @@ export async function createSessionManager(
 				}
 				return forkSessionOrExit(resolved.path, cwd, sessionDir);
 			}
-
-			case "not_found":
-				if (restoreResumeSelectorFallback(parsed, resolved.arg)) break;
-				console.error(chalk.red(`No session found matching '${resolved.arg}'`));
-				process.exit(1);
 		}
 	}
 
@@ -1252,7 +1198,20 @@ export async function main(args: string[], options?: MainOptions) {
 	) {
 		sessionManager = SessionManager.inMemory(cwd);
 	} else {
-		sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+		try {
+			sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+		} catch (error) {
+			if (!(error instanceof SessionSelectorError)) {
+				throw error;
+			}
+			const suggestion =
+				error instanceof SessionSelectorNotFoundError && error.suggestion
+					? ` Did you mean '${error.suggestion}'?`
+					: "";
+			console.error(chalk.red(`Error: ${error.message}.${suggestion}`));
+			console.error(chalk.dim(`Run "${APP_NAME} --resume" to browse sessions.`));
+			process.exit(1);
+		}
 	}
 	const missingSessionCwdIssue = getMissingSessionCwdIssue(sessionManager, cwd);
 	if (missingSessionCwdIssue) {

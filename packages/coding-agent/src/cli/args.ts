@@ -17,7 +17,6 @@ export interface Args {
 	thinking?: ThinkingLevel;
 	continue?: boolean;
 	resume?: true | string;
-	resumeSelectorFallback?: string;
 	help?: boolean;
 	version?: boolean;
 	mode?: Mode;
@@ -115,7 +114,6 @@ export function parseArgs(args: string[]): Args {
 					i++;
 				} else {
 					result.resume = next;
-					result.resumeSelectorFallback = next;
 					i++;
 				}
 			} else {
@@ -127,7 +125,6 @@ export function parseArgs(args: string[]): Args {
 				result.resume = true;
 			} else {
 				result.resume = value;
-				result.resumeSelectorFallback = value;
 			}
 		} else if (arg === "--provider" && i + 1 < args.length) {
 			result.provider = args[++i];

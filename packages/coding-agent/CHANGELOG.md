@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed invalid `--resume` session IDs being submitted as prompts, with nearest-session guidance instead ([ENG-4722](https://linear.app/primeintellect/issue/ENG-4722/prime-agent-resume-accepts-incorrect-session-ids)).
 - Changed `/model` to show all public models with authenticated providers first and open provider authentication when an unavailable model is selected ([ENG-4575](https://linear.app/primeintellect/issue/ENG-4575/show-all-models-in-model-and-prompt-auth-on-selection)).
 - Changed the shared configuration menu to cycle tabs with Tab, use Shift+Tab for model scope, show an Escape close hint, preserve arrow-key search editing, and remove the model selector's provider shortcut.
 - Fixed searchable selectors retaining their previous scroll position after the query changed.

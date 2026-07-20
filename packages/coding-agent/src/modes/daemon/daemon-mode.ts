@@ -98,6 +98,7 @@ import type {
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { acquireSessionLease, type SessionLease } from "../../core/session-lease.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
+import { resolveSessionPath } from "../../core/session-resolver.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
@@ -5166,43 +5167,5 @@ export function shouldSendDaemonOutboundToClient(client: DaemonSocketClient, mes
 }
 
 export async function resolveDaemonSessionPath(selector: string, cwd: string, sessionDir?: string): Promise<string> {
-	if (looksLikeSessionPath(selector)) {
-		return selector;
-	}
-
-	const localMatches = (await SessionManager.list(cwd, sessionDir)).filter((session) =>
-		session.id.startsWith(selector),
-	);
-	const localMatch = resolveUniqueSavedSessionMatch(selector, localMatches);
-	if (localMatch) {
-		return localMatch.path;
-	}
-
-	const allSessions =
-		sessionDir !== undefined ? await SessionManager.listAll(undefined, sessionDir) : await SessionManager.listAll();
-	const globalMatches = allSessions.filter((session) => session.id.startsWith(selector));
-	const globalMatch = resolveUniqueSavedSessionMatch(selector, globalMatches);
-	if (globalMatch) {
-		return globalMatch.path;
-	}
-
-	throw new Error(`No session found matching "${selector}"`);
-}
-
-function resolveUniqueSavedSessionMatch(selector: string, matches: readonly SessionInfo[]): SessionInfo | undefined {
-	if (matches.length === 0) {
-		return undefined;
-	}
-	if (matches.length > 1) {
-		throw new Error(
-			`Ambiguous saved session "${selector}": matches ${matches
-				.map((session) => `${session.id}${session.name ? ` (${session.name})` : ""}`)
-				.join(", ")}`,
-		);
-	}
-	return matches[0];
-}
-
-function looksLikeSessionPath(selector: string): boolean {
-	return selector.includes("/") || selector.includes("\\") || selector.endsWith(".jsonl");
+	return (await resolveSessionPath(selector, cwd, sessionDir)).path;
 }
