@@ -397,7 +397,7 @@ export class Agent {
 		const runQueuedMessages = async (): Promise<boolean> => {
 			const steeringBarrier = this.steeringQueue.peekBarrier();
 			if (steeringBarrier) {
-				await this.onQueueBarrier?.(steeringBarrier, "steering");
+				await this.runQueueBarrier(steeringBarrier, "steering");
 				return true;
 			}
 			const queuedSteering = this.steeringQueue.drain();
@@ -408,7 +408,7 @@ export class Agent {
 
 			const followUpBarrier = this.followUpQueue.peekBarrier();
 			if (followUpBarrier) {
-				await this.onQueueBarrier?.(followUpBarrier, "followUp");
+				await this.runQueueBarrier(followUpBarrier, "followUp");
 				return true;
 			}
 			const queuedFollowUps = this.followUpQueue.drain();
@@ -530,9 +530,24 @@ export class Agent {
 				if (barrier) this.pendingBarrier = { barrier, lane: "followUp" };
 				return messages;
 			},
-			shouldStopForQueueBarrier: () => this.pendingBarrier !== undefined,
+			shouldStopForQueueBarrier: () => {
+				if (this.pendingBarrier) return true;
+				const steering = this.steeringQueue.peekBarrier();
+				if (steering) this.pendingBarrier = { barrier: steering, lane: "steering" };
+				else {
+					const followUp = this.followUpQueue.peekBarrier();
+					if (followUp) this.pendingBarrier = { barrier: followUp, lane: "followUp" };
+				}
+				return this.pendingBarrier !== undefined;
+			},
 			getContinuationMessages: async (context, signal) => this.getContinuationMessages?.(context, signal) ?? [],
 		};
+	}
+
+	private async runQueueBarrier(barrier: AgentQueueBarrier, lane: "steering" | "followUp"): Promise<void> {
+		await this.runWithLifecycle(async () => {
+			await this.onQueueBarrier?.(barrier, lane);
+		});
 	}
 
 	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
@@ -556,10 +571,11 @@ export class Agent {
 		} catch (error) {
 			await this.handleRunFailure(error, abortController.signal.aborted);
 		} finally {
-			const pendingBarrier = this.finishRun();
+			const pendingBarrier = this.takePendingBarrier();
 			if (pendingBarrier) {
 				await this.onQueueBarrier?.(pendingBarrier.barrier, pendingBarrier.lane);
 			}
+			this.finishRun();
 		}
 	}
 
@@ -584,17 +600,20 @@ export class Agent {
 		await this.processEvents({ type: "agent_end", messages: [failureMessage] });
 	}
 
-	private finishRun(): { barrier: AgentQueueBarrier; lane: "steering" | "followUp" } | undefined {
-		this._state.isStreaming = false;
-		this._state.streamingMessage = undefined;
-		this._state.pendingToolCalls = new Set<string>();
-		this.activeRun?.resolve();
-		this.activeRun = undefined;
+	private takePendingBarrier(): { barrier: AgentQueueBarrier; lane: "steering" | "followUp" } | undefined {
 		const pendingBarrier = this.pendingBarrier;
 		this.pendingBarrier = undefined;
 		if (!pendingBarrier) return undefined;
 		const queue = pendingBarrier.lane === "steering" ? this.steeringQueue : this.followUpQueue;
 		return queue.isBarrierAtHead(pendingBarrier.barrier.id) ? pendingBarrier : undefined;
+	}
+
+	private finishRun(): void {
+		this._state.isStreaming = false;
+		this._state.streamingMessage = undefined;
+		this._state.pendingToolCalls = new Set<string>();
+		this.activeRun?.resolve();
+		this.activeRun = undefined;
 	}
 
 	/**

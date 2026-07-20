@@ -3637,7 +3637,7 @@ export class AgentSession {
 		this.agent.completeQueueBarrier(barrier.id, lane);
 		this._emitQueueUpdate();
 		try {
-			await this.executeSessionSlashCommand(queued.command.text);
+			await this.executeSessionSlashCommand(queued.command.text, true);
 		} catch {
 			// executeSessionSlashCommand emits the terminal error event.
 		} finally {
@@ -3645,16 +3645,19 @@ export class AgentSession {
 		}
 	}
 
-	async executeSessionSlashCommand(text: string): Promise<{ message?: string }> {
+	async executeSessionSlashCommand(text: string, atQueueBoundary = false): Promise<{ message?: string }> {
 		const command = parseSessionSlashCommand(text);
 		if (!command) throw new Error(`Not a session command: ${text}`);
-		if (this.isStreaming || this.isCompacting || this.isBashRunning || this.hasAcceptedPromptInFlight) {
+		if (
+			!atQueueBoundary &&
+			(this.isStreaming || this.isCompacting || this.isBashRunning || this.hasAcceptedPromptInFlight)
+		) {
 			await this.queueSessionSlashCommand(text, "steering", { resumeIfIdle: true });
 			return {};
 		}
 		this._emitSessionSlashCommandMessage(command);
 		try {
-			const result = await this._runSessionSlashCommand(command);
+			const result = await this._runSessionSlashCommand(command, atQueueBoundary);
 			this._emit({ type: "session_command_end", text, ...(result.message ? { message: result.message } : {}) });
 			return result;
 		} catch (error) {
@@ -3679,10 +3682,13 @@ export class AgentSession {
 		this._emit({ type: "message_end", message });
 	}
 
-	private async _runSessionSlashCommand(command: SessionSlashCommand): Promise<{ message?: string }> {
+	private async _runSessionSlashCommand(
+		command: SessionSlashCommand,
+		atQueueBoundary: boolean,
+	): Promise<{ message?: string }> {
 		switch (command.name) {
 			case "compact":
-				await this.compact(command.args || undefined);
+				await this._compact(command.args || undefined, atQueueBoundary);
 				return {};
 			case "refine": {
 				let args = command.args;
@@ -3694,8 +3700,8 @@ export class AgentSession {
 					args = args.replace(/\s--global$/, "").trim();
 				}
 				const result = args.startsWith("rollback ")
-					? await this.refine({ rollbackId: args.slice("rollback ".length).trim(), global })
-					: await this.refine({ instructions: args || undefined, global });
+					? await this.refine({ rollbackId: args.slice("rollback ".length).trim(), global }, atQueueBoundary)
+					: await this.refine({ instructions: args || undefined, global }, atQueueBoundary);
 				const applied = result.appliedEdits.filter((edit) => edit.applied).length;
 				return { message: `Refined continual harness state: ${applied} edit${applied === 1 ? "" : "s"} applied` };
 			}
@@ -4796,9 +4802,13 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		return this._compact(customInstructions, false);
+	}
+
+	private async _compact(customInstructions: string | undefined, skipAbort: boolean): Promise<CompactionResult> {
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
 		this._disconnectFromAgent();
-		await this.abort();
+		if (!skipAbort) await this.abort();
 		let didCompact = false;
 		this._compactionAbortController = new AbortController();
 		let resolveCompactionOperation: () => void = () => {};
@@ -5303,12 +5313,13 @@ export class AgentSession {
 	 */
 	async refine(
 		options: { instructions?: string; rollbackId?: string; global?: boolean } = {},
+		skipAbort = false,
 	): Promise<RefinementResult> {
 		while (this._refineInFlight) {
 			await this._refineInFlight;
 		}
 
-		const run = this._refine(options);
+		const run = this._refine(options, skipAbort);
 		// Refine detaches session event handling for its whole LLM pass; expose a
 		// settled promise so turn entry points can wait instead of losing events.
 		const settled = run.then(
@@ -5339,6 +5350,7 @@ export class AgentSession {
 
 	private async _refine(
 		options: { instructions?: string; rollbackId?: string; global?: boolean } = {},
+		skipAbort = false,
 	): Promise<RefinementResult> {
 		if (this._disposed) {
 			throw new Error("Cannot refine a disposed session.");
@@ -5348,7 +5360,7 @@ export class AgentSession {
 		this._disconnectFromAgent();
 
 		try {
-			await this.abort();
+			if (!skipAbort) await this.abort();
 
 			if (!this.model) {
 				throw new Error(formatNoModelSelectedMessage());

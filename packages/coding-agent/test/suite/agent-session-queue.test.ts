@@ -1989,7 +1989,7 @@ describe("AgentSession queue characterization", () => {
 	it("does not drain queued commands as model messages after bash", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		const compact = vi.spyOn(harness.session, "compact").mockResolvedValue({
+		const compact = vi.spyOn(harness.session as any, "_compact").mockResolvedValue({
 			summary: "compacted",
 			firstKeptEntryId: "kept",
 			tokensBefore: 100,
@@ -2002,14 +2002,14 @@ describe("AgentSession queue characterization", () => {
 		await internals._drainQueuedMessagesAfterBash();
 		await vi.waitFor(() => expect(harness.session.pendingMessageCount).toBe(0));
 
-		expect(compact).toHaveBeenCalledWith("after bash");
+		expect(compact).toHaveBeenCalledWith("after bash", true);
 		expect(getUserTexts(harness)).toEqual(["after command"]);
 	});
 
 	it("executes consecutive queued commands without starving completion", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		const compact = vi.spyOn(harness.session, "compact").mockResolvedValue({
+		const compact = vi.spyOn(harness.session as any, "_compact").mockResolvedValue({
 			summary: "compacted",
 			firstKeptEntryId: "kept",
 			tokensBefore: 100,
@@ -2021,7 +2021,10 @@ describe("AgentSession queue characterization", () => {
 
 		await vi.waitFor(() => expect(harness.session.pendingMessageCount).toBe(0));
 
-		expect(compact.mock.calls).toEqual([["first"], ["second"]]);
+		expect(compact.mock.calls).toEqual([
+			["first", true],
+			["second", true],
+		]);
 		expect(getUserTexts(harness)).toEqual(["after commands"]);
 	});
 
@@ -2034,7 +2037,7 @@ describe("AgentSession queue characterization", () => {
 			fauxAssistantMessage("after command"),
 		]);
 		await waitForToolStart;
-		const compact = vi.spyOn(harness.session, "compact").mockResolvedValue({
+		const compact = vi.spyOn(harness.session as any, "_compact").mockResolvedValue({
 			summary: "compacted",
 			firstKeptEntryId: "kept",
 			tokensBefore: 100,
@@ -2047,7 +2050,7 @@ describe("AgentSession queue characterization", () => {
 		await promptPromise;
 		await vi.waitFor(() => expect(harness.session.pendingMessageCount).toBe(0));
 
-		expect(compact).toHaveBeenCalledWith("focus on queues");
+		expect(compact).toHaveBeenCalledWith("focus on queues", true);
 		expect(getUserTexts(harness)).toEqual(["start", "before command", "after command"]);
 		const command = harness.session.messages.find(
 			(message) => message.role === "custom" && message.customType === "session_slash_command",

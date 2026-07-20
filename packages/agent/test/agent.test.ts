@@ -706,6 +706,27 @@ describe("Agent", () => {
 		expect(barriers).toEqual(["compact"]);
 	});
 
+	it("stays busy until an asynchronous barrier callback settles", async () => {
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const agent = new Agent({ onQueueBarrier: async () => gate });
+		agent.state.messages = [createAssistantMessage("Initial response")];
+		agent.queueBarrier({ kind: "barrier", id: "compact" }, "steering");
+
+		const continuation = agent.continue();
+		let idle = false;
+		void agent.waitForIdle().then(() => {
+			idle = true;
+		});
+		await Promise.resolve();
+		expect(idle).toBe(false);
+		release?.();
+		await continuation;
+		expect(idle).toBe(true);
+	});
+
 	it("does not execute a barrier cleared by an agent-end listener", async () => {
 		const barriers: string[] = [];
 		const agent = new Agent({
