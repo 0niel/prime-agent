@@ -154,8 +154,8 @@ describe("Prime Inference models", () => {
 		expect(sonnet5.cost).toEqual({
 			input: 2,
 			output: 10,
-			cacheRead: 0,
-			cacheWrite: 0,
+			cacheRead: 0.2,
+			cacheWrite: 2.5,
 		});
 		expect(getSupportedThinkingLevels(sonnet5)).toContain("xhigh");
 		expect(getSupportedThinkingLevels(sonnet5)).toContain("max");
@@ -186,7 +186,14 @@ describe("Prime Inference models", () => {
 	});
 
 	it("uses route-specific context windows for Prime Inference Claude routes", () => {
-		expect(getModel("prime-inference", "anthropic/claude-fable-5").contextWindow).toBe(1000000);
+		const fable = getModel("prime-inference", "anthropic/claude-fable-5");
+		expect(fable.contextWindow).toBe(1000000);
+		expect(fable.cost).toEqual({
+			input: 10,
+			output: 50,
+			cacheRead: 1,
+			cacheWrite: 12.5,
+		});
 		expect(getModel("prime-inference", "anthropic/claude-opus-4.6").contextWindow).toBe(1000000);
 		expect(getModel("prime-inference", "anthropic/claude-opus-4.7").contextWindow).toBe(1000000);
 		expect(getModel("prime-inference", "anthropic/claude-opus-4.8").contextWindow).toBe(1000000);

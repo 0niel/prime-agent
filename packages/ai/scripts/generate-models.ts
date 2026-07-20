@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
+import { getAnthropicCacheCosts } from "../src/cache-pricing.js";
 import {
 	CLOUDFLARE_AI_GATEWAY_ANTHROPIC_BASE_URL,
 	CLOUDFLARE_AI_GATEWAY_COMPAT_BASE_URL,
@@ -116,7 +117,6 @@ const PRIME_INFERENCE_COMPAT: OpenAICompletionsCompat = {
 	maxTokensField: "max_tokens",
 	supportsStrictMode: false,
 };
-
 interface PrimeInferenceCatalogEntry {
 	id: string;
 	input: number;
@@ -415,6 +415,12 @@ function getPrimeInferenceHeaders(apiKey: string | undefined, teamId: string | u
 	return Object.keys(headers).length > 0 ? headers : undefined;
 }
 
+function getPrimeInferenceCacheCosts(modelId: string, inputCost: number): { cacheRead: number; cacheWrite: number } {
+	return modelId.toLowerCase().startsWith("anthropic/")
+		? getAnthropicCacheCosts(inputCost, "5m")
+		: { cacheRead: 0, cacheWrite: 0 };
+}
+
 function getExistingPrimeInferenceModels(): Model<"openai-completions">[] {
 	const models = EXISTING_MODELS["prime-inference"] as unknown as Record<string, Model<"openai-completions">>;
 	return Object.values(models)
@@ -422,7 +428,10 @@ function getExistingPrimeInferenceModels(): Model<"openai-completions">[] {
 		.map((model) => ({
 			...model,
 			input: [...model.input],
-			cost: { ...model.cost },
+			cost: {
+				...model.cost,
+				...getPrimeInferenceCacheCosts(model.id, model.cost.input),
+			},
 			...(model.compat ? { compat: { ...model.compat } } : {}),
 			...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
 			...(model.headers ? { headers: { ...model.headers } } : {}),
@@ -672,6 +681,7 @@ function createPrimeInferenceModel(
 	openRouter: PrimeInferenceOpenRouterMetadata | undefined,
 ): Model<"openai-completions"> {
 	const vision = override?.vision ?? openRouter?.vision ?? false;
+	const cacheCosts = getPrimeInferenceCacheCosts(entry.id, entry.input);
 	const contextWindow =
 		entry.contextWindow ??
 		override?.contextWindow ??
@@ -695,8 +705,7 @@ function createPrimeInferenceModel(
 		cost: {
 			input: entry.input,
 			output: entry.output,
-			cacheRead: 0,
-			cacheWrite: 0,
+			...cacheCosts,
 		},
 		contextWindow,
 		maxTokens,
