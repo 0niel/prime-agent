@@ -39,6 +39,8 @@ import type {
 /** Extended response timeout for refine requests, which run an LLM pass. */
 export const REFINE_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 
+const PROCESS_EXIT_DRAIN_TIMEOUT_MS = 1000;
+
 /** Distributive Omit that works with union types */
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 
@@ -86,6 +88,7 @@ export class RpcClient {
 	private stopPromise: Promise<void> | null = null;
 	private acceptsRequests = false;
 	private lifecycleRejectors = new Set<(error: Error) => void>();
+	private exitDrainTimers = new Map<ChildProcess, ReturnType<typeof setTimeout>>();
 
 	constructor(private options: RpcClientOptions = {}) {}
 
@@ -118,6 +121,10 @@ export class RpcClient {
 		this.process = child;
 		this.acceptsRequests = true;
 		let startupError: Error | undefined;
+		const createExitError = (code: number | null, signal: NodeJS.Signals | null) => {
+			const status = signal ? `signal ${signal}` : `code ${code}`;
+			return new Error(`Agent process exited with ${status}. Stderr: ${this.stderr}`);
+		};
 
 		// Collect stderr for debugging
 		child.stderr?.on("data", (data) => {
@@ -139,12 +146,20 @@ export class RpcClient {
 			if (this.process !== child) return;
 			this.acceptsRequests = false;
 		});
-		child.once("exit", () => {
-			if (this.process === child) this.acceptsRequests = false;
+		child.once("exit", (code, signal) => {
+			if (this.process !== child) return;
+			this.acceptsRequests = false;
+			const error = createExitError(code, signal);
+			startupError ??= error;
+			this.exitDrainTimers.set(
+				child,
+				setTimeout(() => {
+					this.cleanupProcess(child, error, true);
+				}, PROCESS_EXIT_DRAIN_TIMEOUT_MS),
+			);
 		});
 		child.once("close", (code, signal) => {
-			const status = signal ? `signal ${signal}` : `code ${code}`;
-			const error = new Error(`Agent process exited with ${status}. Stderr: ${this.stderr}`);
+			const error = createExitError(code, signal);
 			startupError ??= error;
 			this.cleanupProcess(child, error);
 		});
@@ -152,8 +167,10 @@ export class RpcClient {
 		// Wait a moment for process to initialize
 		await new Promise((resolve) => setTimeout(resolve, 100));
 
-		if (this.process !== child) {
-			throw startupError ?? new Error(`Agent process exited immediately. Stderr: ${this.stderr}`);
+		if (this.process !== child || startupError) {
+			const error = startupError ?? new Error(`Agent process exited immediately. Stderr: ${this.stderr}`);
+			this.cleanupProcess(child, error, true);
+			throw error;
 		}
 	}
 
@@ -166,9 +183,8 @@ export class RpcClient {
 		if (!child) return;
 
 		this.acceptsRequests = false;
-		this.rejectPendingRequests(
-			new Error(`RPC client stopped before the operation completed. Stderr: ${this.stderr}`),
-		);
+		const stopError = new Error(`RPC client stopped before the operation completed. Stderr: ${this.stderr}`);
+		this.rejectPendingRequests(stopError);
 		this.stopReadingStdout?.();
 		this.stopReadingStdout = null;
 
@@ -186,7 +202,7 @@ export class RpcClient {
 			});
 			child.kill("SIGTERM");
 		}).finally(() => {
-			if (this.process === child) this.process = null;
+			this.cleanupProcess(child, stopError, true);
 			this.stopPromise = null;
 		});
 		return this.stopPromise;
@@ -664,12 +680,25 @@ export class RpcClient {
 	// Internal
 	// =========================================================================
 
-	private cleanupProcess(child: ChildProcess, error: Error): void {
-		if (this.process !== child) return;
-		this.stopReadingStdout?.();
-		this.stopReadingStdout = null;
-		this.process = null;
-		this.acceptsRequests = false;
+	private cleanupProcess(child: ChildProcess, error: Error, destroyStreams = false): void {
+		const exitDrainTimer = this.exitDrainTimers.get(child);
+		if (exitDrainTimer) {
+			clearTimeout(exitDrainTimer);
+			this.exitDrainTimers.delete(child);
+		}
+		const isCurrentProcess = this.process === child;
+		if (isCurrentProcess) {
+			this.stopReadingStdout?.();
+			this.stopReadingStdout = null;
+			this.process = null;
+			this.acceptsRequests = false;
+		}
+		if (destroyStreams) {
+			child.stdin?.destroy();
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+		}
+		if (!isCurrentProcess) return;
 		this.rejectPendingRequests(error);
 	}
 

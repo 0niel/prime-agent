@@ -88,6 +88,27 @@ describe("RpcClient lifecycle", () => {
 		await expect(client.getState()).rejects.toThrow("Client not started");
 	});
 
+	it("bounds output draining when a descendant keeps stdout open after exit", async () => {
+		const client = createClient(["--hold-stdout-after-exit"]);
+		clients.push(client);
+		await client.start();
+
+		const startedAt = Date.now();
+		await expect(client.getState()).rejects.toThrow("Agent process exited with code 23");
+		expect(Date.now() - startedAt).toBeLessThan(2500);
+		await expect(client.start()).resolves.toBeUndefined();
+	});
+
+	it("rejects startup when an exited process leaves stdout open", async () => {
+		const client = createClient(["--exit-during-start"]);
+		clients.push(client);
+
+		const startedAt = Date.now();
+		await expect(client.start()).rejects.toThrow("Agent process exited with code 23");
+		expect(Date.now() - startedAt).toBeLessThan(2500);
+		await expect(client.getState()).rejects.toThrow("Client not started");
+	});
+
 	it("delivers a final response before cleaning up an exited process", async () => {
 		const client = createClient(["--respond-then-exit"]);
 		clients.push(client);
