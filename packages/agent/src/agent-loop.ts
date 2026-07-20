@@ -429,7 +429,7 @@ async function runLoop(
 			return;
 		}
 		const followUpMessages = followUpMessagesResult.value;
-		if (followUpMessages.length === 0 && config.shouldStopForQueueBarrier?.()) {
+		if (config.shouldStopForQueueBarrier?.()) {
 			await emit({ type: "agent_end", messages: newMessages });
 			return;
 		}

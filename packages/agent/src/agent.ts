@@ -525,6 +525,11 @@ export class Agent {
 				return messages;
 			},
 			getFollowUpMessages: async () => {
+				const steeringBarrier = this.steeringQueue.peekBarrier();
+				if (steeringBarrier) {
+					this.pendingBarrier = { barrier: steeringBarrier, lane: "steering" };
+					return [];
+				}
 				const messages = this.followUpQueue.drain();
 				const barrier = messages.length === 0 ? this.followUpQueue.peekBarrier() : undefined;
 				if (barrier) this.pendingBarrier = { barrier, lane: "followUp" };
