@@ -53,7 +53,7 @@ export class CompactionSummaryMessageComponent extends Box {
 				}),
 			);
 		} else {
-			const focus = instructions ? ` · focus: ${instructions}` : "";
+			const focus = instructions && !this.message.commandVisible ? ` · focus: ${instructions}` : "";
 			this.addChild(
 				new Text(
 					theme.fg("customMessageText", `Compacted ${tokenReduction} tokens${focus} (`) +
