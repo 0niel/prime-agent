@@ -26,7 +26,6 @@ type FakeInteractiveMode = {
 		retryAttempt: number;
 	};
 	connectionQueue: { steering: string[]; followUp: string[] };
-	compactionQueuedMessages: Array<{ text: string; mode: "steer" | "followUp" }>;
 	agentConnection: {
 		abort: Mock;
 		clearQueue: Mock;
@@ -96,7 +95,6 @@ function createInteractiveFake(options: {
 			retryAttempt: options.retryAttempt ?? 0,
 		},
 		connectionQueue: { steering: [], followUp: [] },
-		compactionQueuedMessages: [],
 		agentConnection: {
 			abort: vi.fn().mockResolvedValue(undefined),
 			clearQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),

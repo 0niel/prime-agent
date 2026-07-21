@@ -428,6 +428,7 @@ export interface AgentConnectionToolDefinition {
 export interface AgentConnectionPromptOptions {
 	images?: ImageContent[];
 	streamingBehavior?: "steer" | "followUp";
+	queueIfBusy?: boolean;
 	source?: InputSource;
 }
 

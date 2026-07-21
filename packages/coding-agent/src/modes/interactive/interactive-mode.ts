@@ -103,6 +103,8 @@ import {
 	createHeartbeatPromptMessage,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
+	isSessionSlashCommandMessage,
+	isSessionSlashCommandResultMessage,
 } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
 import { resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
@@ -200,6 +202,8 @@ import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SideQuestionComponent } from "./components/side-question.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
+import { SlashCommandMessageComponent } from "./components/slash-command-message.js";
+import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
 import {
 	selectLatestToolExpandHint,
 	ToolExecutionComponent,
@@ -468,11 +472,6 @@ export class BrandSplashHeader implements Component {
 		return lines;
 	}
 }
-
-type CompactionQueuedMessage = {
-	text: string;
-	mode: "steer" | "followUp";
-};
 
 type GoalAnnouncementSnapshot = {
 	goalId?: string;
@@ -830,6 +829,8 @@ export class InteractiveMode {
 	private readonly startHint = getRandomStartHint();
 	private isInitialized = false;
 	private onInputCallback?: (text: string | undefined) => void;
+	private submittedInputBehavior: "steer" | "followUp" = "steer";
+	private inputSubmissionGeneration = 0;
 	private returnToAgentsViewRequested = false;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
@@ -969,8 +970,7 @@ export class InteractiveMode {
 	private retryCountdown: CountdownTimer | undefined = undefined;
 	private traceUploadAllAbortController: AbortController | undefined = undefined;
 
-	// Messages queued while compaction is running
-	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
+	// Session-owned queued messages mirrored from connection events.
 	private connectionQueue: AgentConnectionQueueState = { steering: [], followUp: [] };
 
 	// Shutdown state
@@ -1477,39 +1477,52 @@ export class InteractiveMode {
 			this.showError(`models.json error: ${modelsJsonError}`);
 		}
 
-		let initialPromptsSent = false;
+		const initialPrompts = [
+			...(initialMessage ? [{ text: initialMessage, images: initialImages }] : []),
+			...(initialMessages ?? []).map((text) => ({ text, images: undefined })),
+		];
+		let nextInitialPrompt = 0;
+		let initialPromptFailures = 0;
+		let initialPromptDelivery: Promise<void> | undefined;
+		let initialPromptRetry: ReturnType<typeof setInterval> | undefined;
+		const clearInitialPromptRetry = () => {
+			if (initialPromptRetry) clearInterval(initialPromptRetry);
+			initialPromptRetry = undefined;
+		};
 		const sendInitialPrompts = async () => {
-			if (initialPromptsSent) {
+			if (nextInitialPrompt >= initialPrompts.length) {
+				clearInitialPromptRetry();
 				return;
 			}
-			if (!initialMessage && !initialMessages?.length) {
-				initialPromptsSent = true;
-				return;
-			}
-			if (!this.getCurrentModel()) {
-				return;
-			}
-			initialPromptsSent = true;
-
-			if (initialMessage) {
-				try {
-					await this.agentConnection.prompt(initialMessage, { images: initialImages });
-				} catch (error: unknown) {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-					this.showError(errorMessage);
-				}
-			}
-
-			if (initialMessages) {
-				for (const message of initialMessages) {
+			if (!this.getCurrentModel()) return;
+			if (initialPromptDelivery) return initialPromptDelivery;
+			initialPromptDelivery = (async () => {
+				while (nextInitialPrompt < initialPrompts.length && this.getCurrentModel()) {
+					const prompt = initialPrompts[nextInitialPrompt]!;
 					try {
-						await this.agentConnection.prompt(message);
-					} catch (error: unknown) {
-						const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-						this.showError(errorMessage);
+						await this.agentConnection.prompt(prompt.text, {
+							images: prompt.images,
+							streamingBehavior: nextInitialPrompt === 0 ? "steer" : "followUp",
+							queueIfBusy: true,
+						});
+						initialPromptFailures = 0;
+						nextInitialPrompt++;
+					} catch (error) {
+						this.showError(error instanceof Error ? error.message : "Unknown error occurred");
+						initialPromptFailures++;
+						if (initialPromptFailures > 1) {
+							initialPromptFailures = 0;
+							nextInitialPrompt++;
+							continue;
+						}
+						return;
 					}
 				}
-			}
+				if (nextInitialPrompt >= initialPrompts.length) clearInitialPromptRetry();
+			})().finally(() => {
+				initialPromptDelivery = undefined;
+			});
+			return initialPromptDelivery;
 		};
 
 		let deferredStartupNotificationsShown = false;
@@ -1568,27 +1581,19 @@ export class InteractiveMode {
 		showModelFallbackWarning();
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 		await sendInitialPrompts();
-
-		// Main interactive loop
-		while (true) {
-			const userInput = await this.getUserInput();
-			if (userInput === undefined || this.returnToAgentsViewRequested) {
-				return "agents_view";
-			}
-			showDeferredStartupNotifications();
-			showModelFallbackWarning();
-			await sendInitialPrompts();
-			// Collect images from the markers in the submitted text. The registry
-			// still holds them (it is not cleared on submit), so this works even after
-			// the text was restored to the editor by onboarding, history, or a retry.
-			const images = this.collectImagesFor(userInput);
-			try {
-				await this.agentConnection.prompt(userInput, { streamingBehavior: "steer", images });
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				this.showError(errorMessage);
-			}
+		if (nextInitialPrompt < initialPrompts.length) {
+			initialPromptRetry = setInterval(() => void sendInitialPrompts(), 250);
+			initialPromptRetry.unref?.();
 		}
+
+		// Enter/Alt+Enter submit directly through AgentConnection. Keep run alive
+		// until shutdown or a return to the agents view resolves the lifecycle wait.
+		try {
+			await this.getUserInput();
+		} finally {
+			clearInitialPromptRetry();
+		}
+		return "agents_view";
 	}
 
 	private getModelFallbackWarningAction(modelFallbackMessage: string | undefined): ModelFallbackWarningAction {
@@ -2699,7 +2704,6 @@ export class InteractiveMode {
 		this.shortcutGuideContainer.clear();
 		this.pendingMessagesContainer.clear();
 		this.queuedMessagesContainer.clear();
-		this.compactionQueuedMessages = [];
 		this.connectionQueue = { steering: [], followUp: [] };
 		this.featureHintSuppressedByQueue = false;
 		if (options?.clearPromptStash) {
@@ -4129,9 +4133,6 @@ export class InteractiveMode {
 		for (const entry of this.editor.getHistory?.() ?? []) {
 			add(entry);
 		}
-		for (const msg of this.compactionQueuedMessages) {
-			add(msg.text);
-		}
 		for (const msg of [...this.connectionQueue.steering, ...this.connectionQueue.followUp]) {
 			add(msg);
 		}
@@ -4312,11 +4313,12 @@ export class InteractiveMode {
 			this.editor.setText(result.editorText);
 		}
 		this.showStatus("Navigated to selected point");
-		void this.flushCompactionQueue({ willRetry: false });
 	}
 
 	private setupEditorSubmitHandler(): void {
 		this.defaultEditor.onSubmit = async (text: string) => {
+			const streamingBehavior = this.submittedInputBehavior;
+			this.submittedInputBehavior = "steer";
 			text = text.trim();
 			if (!text) return;
 			this.clearShortcutGuide();
@@ -4442,12 +4444,6 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "goal" && (!commandArgs || commandArgs === "status")) {
-					this.echoLocalCommand(text);
-					this.handleGoalStatusCommand();
-					this.editor.setText("");
-					return;
-				}
 				if (commandName === "heartbeat") {
 					await this.handleHeartbeatCommand(canonicalCommandText);
 					this.editor.setText("");
@@ -4504,18 +4500,6 @@ export class InteractiveMode {
 				if (commandName === "new" && !commandArgs) {
 					this.editor.setText("");
 					await this.handleClearCommand();
-					return;
-				}
-				if (commandName === "compact") {
-					const customInstructions = commandArgs || undefined;
-					this.editor.setText("");
-					await this.handleCompactCommand(customInstructions);
-					return;
-				}
-				if (commandName === "refine") {
-					const refineArgs = commandArgs || undefined;
-					this.editor.setText("");
-					await this.handleRefineCommand(refineArgs);
 					return;
 				}
 				if (commandName === "reload" && !commandArgs) {
@@ -4675,39 +4659,35 @@ export class InteractiveMode {
 				}
 
 				this.clearSideQuestion({ abort: true });
-
-				// Queue input during compaction (extension commands execute immediately)
-				if (this.isAgentCompacting()) {
-					if (this.isExtensionCommand(text)) {
-						this.editor.addToHistory?.(text);
-						this.editor.setText("");
-						await this.agentConnection.prompt(text, { images: this.collectImagesFor(text) });
-					} else {
-						this.queueCompactionMessage(text, "steer");
-					}
-					return;
-				}
-
-				// If streaming, use prompt() with steer behavior
-				// This handles extension commands (execute immediately), prompt template expansion, and queueing
-				if (this.isAgentStreaming()) {
-					const images = this.collectImagesFor(text);
-					this.editor.addToHistory?.(text);
-					this.editor.setText("");
-					await this.agentConnection.prompt(text, { streamingBehavior: "steer", images });
-					this.updatePendingMessagesDisplay();
-					this.ui.requestRender();
-					return;
-				}
-
-				// Normal message submission
-				// First, move any pending bash components to chat
 				this.flushPendingBashComponents();
-
-				if (this.onInputCallback) {
-					this.onInputCallback(text);
-				}
+				const images = this.collectImagesFor(text);
 				this.editor.addToHistory?.(text);
+				this.editor.setText("");
+				const promptStashAfterClear = this.promptStash;
+				const submissionGeneration = ++this.inputSubmissionGeneration;
+				try {
+					await this.agentConnection.prompt(text, {
+						streamingBehavior,
+						queueIfBusy: true,
+						images,
+					});
+				} catch (error) {
+					// Admission failed, so put the exact submitted input back. Accepted
+					// inputs are session-owned and must never be restored by the client.
+					if (submissionGeneration === this.inputSubmissionGeneration && this.editor.getText().length === 0) {
+						this.editor.setText(text);
+					}
+					if (
+						submissionGeneration === this.inputSubmissionGeneration &&
+						this.promptStash === promptStashAfterClear
+					) {
+						this.promptStash = promptStashToRestore;
+					}
+					this.showError(error instanceof Error ? error.message : String(error));
+					return;
+				}
+				this.updatePendingMessagesDisplay();
+				this.ui.requestRender();
 			} finally {
 				if (restorePromptStashAfterSubmit && promptStashToRestore !== undefined) {
 					this.restorePromptStashIfEditorEmpty(promptStashToRestore);
@@ -5310,7 +5290,6 @@ export class InteractiveMode {
 						this.chatContainer.addChild(new Text(theme.fg("error", event.errorMessage), 1, 0));
 					}
 				}
-				void this.flushCompactionQueue({ willRetry: event.willRetry });
 				this.ui.requestRender();
 				break;
 			}
@@ -6169,18 +6148,27 @@ export class InteractiveMode {
 			}
 			case "custom": {
 				if (message.display) {
-					const component = isAgentSessionMessage(message)
-						? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
-						: isInjectedPromptMessage(message)
-							? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
-							: new CustomMessageComponent(
-									message,
-									this.bindLocalSessionExtensions
-										? this.getLocalSessionHost().getExtensionRunner().getMessageRenderer(message.customType)
-										: undefined,
-									this.getMarkdownThemeWithSettings(),
-								);
+					const component = isSessionSlashCommandMessage(message)
+						? new SlashCommandMessageComponent(message.content)
+						: isSessionSlashCommandResultMessage(message)
+							? new SlashCommandResultMessageComponent(message)
+							: isAgentSessionMessage(message)
+								? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
+								: isInjectedPromptMessage(message)
+									? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
+									: new CustomMessageComponent(
+											message,
+											this.bindLocalSessionExtensions
+												? this.getLocalSessionHost()
+														.getExtensionRunner()
+														.getMessageRenderer(message.customType)
+												: undefined,
+											this.getMarkdownThemeWithSettings(),
+										);
 					component.setExpanded(this.toolOutputExpanded);
+					if (isSessionSlashCommandMessage(message) && this.chatContainer.children.length > 0) {
+						this.chatContainer.addChild(new Spacer(1));
+					}
 					this.chatContainer.addChild(component);
 				}
 				break;
@@ -6766,55 +6754,11 @@ export class InteractiveMode {
 
 	private async handleFollowUp(): Promise<void> {
 		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
-		if (!text) return;
-		const promptStashToRestore = this.promptStash;
-		let clearedSubmittedText: string | undefined;
-
-		try {
-			// Queue input during compaction (extension commands execute immediately)
-			if (this.isAgentCompacting()) {
-				if (this.isExtensionCommand(text)) {
-					this.editor.addToHistory?.(text);
-					clearedSubmittedText = text;
-					this.editor.setText("");
-					await this.agentConnection.prompt(text, { images: this.collectImagesFor(text) });
-					clearedSubmittedText = undefined;
-				} else {
-					this.queueCompactionMessage(text, "followUp");
-				}
-				return;
-			}
-
-			// Alt+Enter queues a follow-up message (waits until agent finishes)
-			// This handles extension commands (execute immediately), prompt template expansion, and queueing
-			if (this.isAgentStreaming()) {
-				const images = this.collectImagesFor(text);
-				this.editor.addToHistory?.(text);
-				clearedSubmittedText = text;
-				this.editor.setText("");
-				await this.agentConnection.prompt(text, { streamingBehavior: "followUp", images });
-				clearedSubmittedText = undefined;
-				this.updatePendingMessagesDisplay();
-				this.ui.requestRender();
-			}
-			// If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
-			else if (this.editor.onSubmit) {
-				clearedSubmittedText = text;
-				this.editor.setText("");
-				await this.editor.onSubmit(text);
-				clearedSubmittedText = undefined;
-			}
-		} catch (error) {
-			if (clearedSubmittedText !== undefined) {
-				this.editor.setText(clearedSubmittedText);
-				this.promptStash = promptStashToRestore;
-			}
-			throw error;
-		} finally {
-			if (promptStashToRestore !== undefined && clearedSubmittedText === undefined) {
-				this.restorePromptStashIfEditorEmpty(promptStashToRestore);
-			}
-		}
+		if (!text || !this.editor.onSubmit) return;
+		this.submittedInputBehavior = "followUp";
+		const submission = this.editor.onSubmit(text);
+		this.submittedInputBehavior = "steer";
+		await submission;
 	}
 
 	private async handleDequeue(): Promise<void> {
@@ -7021,27 +6965,15 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	/**
-	 * Get all queued messages (read-only).
-	 * Combines session queue and compaction queue.
-	 */
+	/** Get all queued messages from the session-owned connection queue. */
 	private getAllQueuedMessages(): { steering: string[]; followUp: string[] } {
 		return {
-			steering: [
-				...this.connectionQueue.steering,
-				...this.compactionQueuedMessages.filter((msg) => msg.mode === "steer").map((msg) => msg.text),
-			],
-			followUp: [
-				...this.connectionQueue.followUp,
-				...this.compactionQueuedMessages.filter((msg) => msg.mode === "followUp").map((msg) => msg.text),
-			],
+			steering: [...this.connectionQueue.steering],
+			followUp: [...this.connectionQueue.followUp],
 		};
 	}
 
-	/**
-	 * Clear all queued messages and return their contents.
-	 * Clears both session queue and compaction queue.
-	 */
+	/** Clear all session-owned queued messages and return their contents. */
 	private async clearAllQueues(
 		options: { abort?: boolean } = {},
 	): Promise<{ steering: string[]; followUp: string[] }> {
@@ -7049,17 +6981,7 @@ export class InteractiveMode {
 			? await this.agentConnection.abortAndClearQueue()
 			: await this.agentConnection.clearQueue();
 		this.connectionQueue = { steering: [], followUp: [] };
-		const compactionSteering = this.compactionQueuedMessages
-			.filter((msg) => msg.mode === "steer")
-			.map((msg) => msg.text);
-		const compactionFollowUp = this.compactionQueuedMessages
-			.filter((msg) => msg.mode === "followUp")
-			.map((msg) => msg.text);
-		this.compactionQueuedMessages = [];
-		return {
-			steering: [...steering, ...compactionSteering],
-			followUp: [...followUp, ...compactionFollowUp],
-		};
+		return { steering, followUp };
 	}
 
 	private updatePendingMessagesDisplay(): void {
@@ -7127,102 +7049,6 @@ export class InteractiveMode {
 		}
 		this.updatePendingMessagesDisplay();
 		return allQueued.length;
-	}
-
-	private queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.compactionQueuedMessages.push({ text, mode });
-		this.editor.addToHistory?.(text);
-		this.editor.setText("");
-		this.updatePendingMessagesDisplay();
-		this.showStatus("Queued message for after compaction");
-	}
-
-	private isExtensionCommand(text: string): boolean {
-		if (!text.startsWith("/")) return false;
-
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-		return this.connectionCommands.some((command) => command.source === "extension" && command.name === commandName);
-	}
-
-	private async flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
-		if (this.compactionQueuedMessages.length === 0) {
-			return;
-		}
-
-		const queuedMessages = [...this.compactionQueuedMessages];
-		this.compactionQueuedMessages = [];
-		this.updatePendingMessagesDisplay();
-
-		const restoreQueue = async (error: unknown) => {
-			await this.agentConnection.clearQueue().catch(() => undefined);
-			this.connectionQueue = { steering: [], followUp: [] };
-			this.compactionQueuedMessages = queuedMessages;
-			this.updatePendingMessagesDisplay();
-			this.showError(
-				`Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}: ${
-					error instanceof Error ? error.message : String(error)
-				}`,
-			);
-		};
-
-		try {
-			if (options?.willRetry) {
-				// When retry is pending, queue messages for the retry turn
-				for (const message of queuedMessages) {
-					if (this.isExtensionCommand(message.text)) {
-						await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
-					} else if (message.mode === "followUp") {
-						await this.agentConnection.followUp(message.text, this.collectImagesFor(message.text));
-					} else {
-						await this.agentConnection.steer(message.text, this.collectImagesFor(message.text));
-					}
-				}
-				this.updatePendingMessagesDisplay();
-				return;
-			}
-
-			// Find first non-extension-command message to use as prompt
-			const firstPromptIndex = queuedMessages.findIndex((message) => !this.isExtensionCommand(message.text));
-			if (firstPromptIndex === -1) {
-				// All extension commands - execute them all
-				for (const message of queuedMessages) {
-					await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
-				}
-				return;
-			}
-
-			// Execute any extension commands before the first prompt
-			const preCommands = queuedMessages.slice(0, firstPromptIndex);
-			const firstPrompt = queuedMessages[firstPromptIndex];
-			const rest = queuedMessages.slice(firstPromptIndex + 1);
-
-			for (const message of preCommands) {
-				await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
-			}
-
-			// Send first prompt (starts streaming)
-			const promptPromise = this.agentConnection
-				.prompt(firstPrompt.text, { images: this.collectImagesFor(firstPrompt.text) })
-				.catch((error) => {
-					void restoreQueue(error);
-				});
-
-			// Queue remaining messages
-			for (const message of rest) {
-				if (this.isExtensionCommand(message.text)) {
-					await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
-				} else if (message.mode === "followUp") {
-					await this.agentConnection.followUp(message.text, this.collectImagesFor(message.text));
-				} else {
-					await this.agentConnection.steer(message.text, this.collectImagesFor(message.text));
-				}
-			}
-			this.updatePendingMessagesDisplay();
-			void promptPromise;
-		} catch (error) {
-			await restoreQueue(error);
-		}
 	}
 
 	// =========================================================================
@@ -9213,41 +9039,6 @@ export class InteractiveMode {
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(info, 1, 0));
-		this.ui.requestRender();
-	}
-
-	private handleGoalStatusCommand(): void {
-		const goal = this.getGoalState();
-		if (goal.status === "idle" || !goal.objective) {
-			this.showStatus("No active goal");
-			return;
-		}
-
-		const lines = [
-			theme.bold("Goal"),
-			"",
-			`${theme.fg("dim", "Status:")} ${goal.status}`,
-			`${theme.fg("dim", "Objective:")} ${goal.objective}`,
-			`${theme.fg("dim", "Time:")} ${this.formatGoalElapsed(goal.timeUsedSeconds)}`,
-			`${theme.fg("dim", "Continuations:")} ${goal.continuationsUsed}`,
-			`${theme.fg("dim", "Tokens:")} ${goal.tokensUsed.toLocaleString()}${
-				goal.tokenBudget === undefined ? "" : ` / ${goal.tokenBudget.toLocaleString()}`
-			}`,
-		];
-		if (goal.tokenBudget !== undefined) {
-			lines.push(
-				`${theme.fg("dim", "Remaining:")} ${Math.max(0, goal.tokenBudget - goal.tokensUsed).toLocaleString()}`,
-			);
-		}
-		if (goal.lastReason) {
-			lines.push(`${theme.fg("dim", "Reason:")} ${goal.lastReason}`);
-		}
-		if (goal.lastError) {
-			lines.push(`${theme.fg("dim", "Error:")} ${goal.lastError}`);
-		}
-
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(lines.join("\n"), 1, 0));
 		this.ui.requestRender();
 	}
 

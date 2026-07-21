@@ -41,7 +41,6 @@ type PromptStashHarness = {
 };
 
 type PromptStashLiveMarkerHarness = PromptStashHarness & {
-	compactionQueuedMessages: Array<{ text: string; mode: "steer" | "followUp" }>;
 	connectionQueue: { steering: string[]; followUp: string[] };
 };
 
@@ -85,6 +84,14 @@ type SubmitHarness = PromptStashHarness & {
 	isAgentStreaming: () => boolean;
 	flushPendingBashComponents: Mock;
 	onInputCallback: Mock;
+	clearSideQuestion: Mock;
+	collectImagesFor: Mock;
+	agentConnection: { prompt: Mock };
+	updatePendingMessagesDisplay: Mock;
+	ui: { requestRender: Mock };
+	showError: Mock;
+	submittedInputBehavior: "steer" | "followUp";
+	inputSubmissionGeneration: number;
 };
 
 type PromptStashMethods = {
@@ -333,16 +340,62 @@ describe("InteractiveMode prompt stash", () => {
 			isAgentStreaming: () => false,
 			flushPendingBashComponents: vi.fn(),
 			onInputCallback: vi.fn(),
+			clearSideQuestion: vi.fn(),
+			collectImagesFor: vi.fn(() => []),
+			agentConnection: { prompt: vi.fn(async () => {}) },
+			updatePendingMessagesDisplay: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			showError: vi.fn(),
+			submittedInputBehavior: "steer",
+			inputSubmissionGeneration: 0,
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
 		interactiveModeMethods.setupEditorSubmitHandler.call(mode);
 
 		await mode.defaultEditor.onSubmit?.("temporary prompt");
 
-		expect(mode.onInputCallback).toHaveBeenCalledWith("temporary prompt");
+		expect(mode.agentConnection.prompt).toHaveBeenCalledWith("temporary prompt", {
+			streamingBehavior: "steer",
+			queueIfBusy: true,
+			images: [],
+		});
 		expect(mode.editor.addToHistory).toHaveBeenCalledWith("temporary prompt");
 		expect(mode.promptStash).toBeUndefined();
 		expect(mode.editor.getText()).toBe("half-written draft");
+	});
+
+	it("routes session-owned commands through canonical prompt admission", async () => {
+		const mode: SubmitHarness = {
+			...createPromptStashHarness(),
+			defaultEditor: {},
+			sideQuestionContainer: { clear: vi.fn() },
+			isAgentCompacting: () => true,
+			isAgentStreaming: () => false,
+			flushPendingBashComponents: vi.fn(),
+			onInputCallback: vi.fn(),
+			clearSideQuestion: vi.fn(),
+			collectImagesFor: vi.fn(() => []),
+			agentConnection: { prompt: vi.fn(async () => {}) },
+			updatePendingMessagesDisplay: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			showError: vi.fn(),
+			submittedInputBehavior: "steer",
+			inputSubmissionGeneration: 0,
+		};
+		Object.setPrototypeOf(mode, InteractiveMode.prototype);
+		interactiveModeMethods.setupEditorSubmitHandler.call(mode);
+
+		for (const command of ["/compact focus on tools", "/refine --global", "/goal ship it", "/autonomous on"]) {
+			await mode.defaultEditor.onSubmit?.(command);
+		}
+
+		for (const command of ["/compact focus on tools", "/refine --global", "/goal ship it", "/autonomous on"]) {
+			expect(mode.agentConnection.prompt).toHaveBeenCalledWith(command, {
+				streamingBehavior: "steer",
+				queueIfBusy: true,
+				images: [],
+			});
+		}
 	});
 
 	it("restores a stashed prompt after a session reset clears prompt state", async () => {
@@ -355,6 +408,14 @@ describe("InteractiveMode prompt stash", () => {
 			isAgentStreaming: () => false,
 			flushPendingBashComponents: vi.fn(),
 			onInputCallback: vi.fn(),
+			clearSideQuestion: vi.fn(),
+			collectImagesFor: vi.fn(() => []),
+			agentConnection: { prompt: vi.fn(async () => {}) },
+			updatePendingMessagesDisplay: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			showError: vi.fn(),
+			submittedInputBehavior: "steer",
+			inputSubmissionGeneration: 0,
 			handleClearCommand: vi.fn(async () => {
 				mode.editor.setText("");
 			}),
@@ -383,6 +444,14 @@ describe("InteractiveMode prompt stash", () => {
 			isAgentStreaming: () => false,
 			flushPendingBashComponents: vi.fn(),
 			onInputCallback: vi.fn(),
+			clearSideQuestion: vi.fn(),
+			collectImagesFor: vi.fn(() => []),
+			agentConnection: { prompt: vi.fn(async () => {}) },
+			updatePendingMessagesDisplay: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			showError: vi.fn(),
+			submittedInputBehavior: "steer",
+			inputSubmissionGeneration: 0,
 			showUserMessageSelector: vi.fn(async () => {
 				await selectorDone;
 				mode.editor.setText("");
@@ -414,6 +483,14 @@ describe("InteractiveMode prompt stash", () => {
 			isAgentStreaming: () => false,
 			flushPendingBashComponents: vi.fn(),
 			onInputCallback: vi.fn(),
+			clearSideQuestion: vi.fn(),
+			collectImagesFor: vi.fn(() => []),
+			agentConnection: { prompt: vi.fn(async () => {}) },
+			updatePendingMessagesDisplay: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			showError: vi.fn(),
+			submittedInputBehavior: "steer",
+			inputSubmissionGeneration: 0,
 			showSettingsSelector: vi.fn(() => settingsDone),
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
@@ -435,7 +512,6 @@ describe("InteractiveMode prompt stash", () => {
 		const mode: ResetHarness = {
 			...base,
 			defaultEditor: base.editor,
-			compactionQueuedMessages: [],
 			connectionQueue: { steering: ["old [image #2]"], followUp: [] },
 			chatContainer: { clear: vi.fn() },
 			shortcutGuideContainer: { clear: vi.fn() },
@@ -474,7 +550,6 @@ describe("InteractiveMode prompt stash", () => {
 		const mode: ResetHarness = {
 			...base,
 			defaultEditor: base.editor,
-			compactionQueuedMessages: [],
 			connectionQueue: { steering: [], followUp: [] },
 			chatContainer: { clear: vi.fn() },
 			shortcutGuideContainer: { clear: vi.fn() },
@@ -503,6 +578,86 @@ describe("InteractiveMode prompt stash", () => {
 		expect(mode.pastedImages.has(1)).toBe(false);
 	});
 
+	it("does not let a delayed prompt rejection overwrite a newer draft or stash", async () => {
+		let rejectPrompt: (error: Error) => void = () => {};
+		const prompt = new Promise<void>((_resolve, reject) => {
+			rejectPrompt = reject;
+		});
+		const mode: SubmitHarness = {
+			...createPromptStashHarness({ stash: "older stash" }),
+			defaultEditor: {},
+			sideQuestionContainer: { clear: vi.fn() },
+			isAgentCompacting: () => false,
+			isAgentStreaming: () => false,
+			flushPendingBashComponents: vi.fn(),
+			onInputCallback: vi.fn(),
+			clearSideQuestion: vi.fn(),
+			collectImagesFor: vi.fn(() => []),
+			agentConnection: { prompt: vi.fn(() => prompt) },
+			updatePendingMessagesDisplay: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			showError: vi.fn(),
+			submittedInputBehavior: "steer",
+			inputSubmissionGeneration: 0,
+		};
+		Object.setPrototypeOf(mode, InteractiveMode.prototype);
+		interactiveModeMethods.setupEditorSubmitHandler.call(mode);
+
+		const submission = mode.defaultEditor.onSubmit?.("submitted prompt");
+		await Promise.resolve();
+		const newerStash = { text: "newer stash" };
+		mode.editor.setText("newer editor draft");
+		mode.promptStash = newerStash;
+		rejectPrompt(new Error("late rejection"));
+		await submission;
+
+		expect(mode.editor.getText()).toBe("newer editor draft");
+		expect(mode.promptStash).toBe(newerStash);
+		expect(mode.showError).toHaveBeenCalledWith("late rejection");
+	});
+
+	it("does not restore a stale submission after a newer submission is accepted", async () => {
+		let rejectFirst: (error: Error) => void = () => {};
+		const firstPrompt = new Promise<void>((_resolve, reject) => {
+			rejectFirst = reject;
+		});
+		const prompt = vi
+			.fn()
+			.mockImplementationOnce(() => firstPrompt)
+			.mockResolvedValueOnce(undefined);
+		const mode: SubmitHarness = {
+			...createPromptStashHarness(),
+			defaultEditor: {},
+			sideQuestionContainer: { clear: vi.fn() },
+			isAgentCompacting: () => false,
+			isAgentStreaming: () => false,
+			flushPendingBashComponents: vi.fn(),
+			onInputCallback: vi.fn(),
+			clearSideQuestion: vi.fn(),
+			collectImagesFor: vi.fn(() => []),
+			agentConnection: { prompt },
+			updatePendingMessagesDisplay: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			showError: vi.fn(),
+			submittedInputBehavior: "steer",
+			inputSubmissionGeneration: 0,
+		};
+		Object.setPrototypeOf(mode, InteractiveMode.prototype);
+		interactiveModeMethods.setupEditorSubmitHandler.call(mode);
+
+		const firstSubmission = mode.defaultEditor.onSubmit?.("stale first prompt");
+		await Promise.resolve();
+		await mode.defaultEditor.onSubmit?.("accepted second prompt");
+		expect(mode.editor.getText()).toBe("");
+
+		rejectFirst(new Error("late first rejection"));
+		await firstSubmission;
+
+		expect(mode.editor.getText()).toBe("");
+		expect(mode.promptStash).toBeUndefined();
+		expect(mode.showError).toHaveBeenCalledWith("late first rejection");
+	});
+
 	it("restores failed follow-up text without dropping the stashed prompt", async () => {
 		const error = new Error("send failed");
 		const mode: SubmitHarness & {
@@ -518,19 +673,31 @@ describe("InteractiveMode prompt stash", () => {
 			isAgentStreaming: () => true,
 			flushPendingBashComponents: vi.fn(),
 			onInputCallback: vi.fn(),
+			clearSideQuestion: vi.fn(),
+			collectImagesFor: vi.fn(() => []),
 			agentConnection: {
 				prompt: vi.fn(async () => {
 					throw error;
 				}),
 			},
-			collectImagesFor: vi.fn(),
 			updatePendingMessagesDisplay: vi.fn(),
 			ui: { requestRender: vi.fn() },
+			showError: vi.fn(),
+			submittedInputBehavior: "steer",
+			inputSubmissionGeneration: 0,
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);
+		interactiveModeMethods.setupEditorSubmitHandler.call(mode);
+		mode.editor.onSubmit = mode.defaultEditor.onSubmit;
 
-		await expect(interactiveModeMethods.handleFollowUp.call(mode)).rejects.toThrow(error);
+		await expect(interactiveModeMethods.handleFollowUp.call(mode)).resolves.toBeUndefined();
 
+		expect(mode.agentConnection.prompt).toHaveBeenCalledWith("quick follow-up", {
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+			images: [],
+		});
+		expect(mode.showError).toHaveBeenCalledWith("send failed");
 		expect(mode.editor.getText()).toBe("quick follow-up");
 		expect(mode.promptStash?.text).toBe("half-written draft");
 	});
@@ -538,7 +705,6 @@ describe("InteractiveMode prompt stash", () => {
 	it("keeps image markers in a stashed prompt live", () => {
 		const mode: PromptStashLiveMarkerHarness = {
 			...createPromptStashHarness({ stash: "look at [image #7]" }),
-			compactionQueuedMessages: [],
 			connectionQueue: { steering: [], followUp: [] },
 		};
 		Object.setPrototypeOf(mode, InteractiveMode.prototype);

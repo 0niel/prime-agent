@@ -876,7 +876,6 @@ describe("InteractiveMode pending bash components", () => {
 			shortcutGuideContainer: new Container(),
 			pendingMessagesContainer: new Container(),
 			queuedMessagesContainer: new Container(),
-			compactionQueuedMessages: [],
 			pastedImages: new Map(),
 			liveImageMarkerIds: () => new Set(),
 			defaultEditor: editorStub,
@@ -1095,7 +1094,6 @@ describe("InteractiveMode connection events", () => {
 	});
 
 	test("preserves client-local work while rendering a resynchronized snapshot", async () => {
-		const compactionQueue = [{ text: "send after compaction", mode: "followUp" as const }];
 		const sideQuestion = { id: "side-1", status: "running" };
 		const extensionRequests = new Map([["request-1", { cancelLocal: vi.fn() }]]);
 		const activeBashComponent = {};
@@ -1115,7 +1113,6 @@ describe("InteractiveMode connection events", () => {
 			}
 		});
 		const fakeThis = {
-			compactionQueuedMessages: compactionQueue,
 			sideQuestionEvent: sideQuestion,
 			activeConnectionExtensionUiRequests: extensionRequests,
 			activeBashComponent,
@@ -1133,7 +1130,6 @@ describe("InteractiveMode connection events", () => {
 			renderSessionContext: vi.fn(async () => {}),
 			restoreStreamingMessageFromSnapshot,
 			refreshConnectionQueue: vi.fn(async () => {}),
-			flushCompactionQueue: vi.fn(async () => {}),
 			flushPendingBashComponents: vi.fn(),
 			updateTerminalTitle: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
@@ -1148,9 +1144,6 @@ describe("InteractiveMode connection events", () => {
 			}
 		).renderResyncedSession.call(fakeThis, snapshot);
 
-		expect((fakeThis as unknown as { compactionQueuedMessages: unknown }).compactionQueuedMessages).toBe(
-			compactionQueue,
-		);
 		expect((fakeThis as unknown as { sideQuestionEvent: unknown }).sideQuestionEvent).toBe(sideQuestion);
 		expect(
 			(fakeThis as unknown as { activeConnectionExtensionUiRequests: unknown }).activeConnectionExtensionUiRequests,
@@ -1162,9 +1155,8 @@ describe("InteractiveMode connection events", () => {
 		expect(startAssistantStreamingMessage).toHaveBeenCalledWith(streamingMessage);
 	});
 
-	test("finishes local compaction and bash UI when a resync proves the operations ended", async () => {
+	test("finishes local bash UI when a resync proves the operation ended", async () => {
 		const bashComponent = { setComplete: vi.fn() };
-		const flushCompactionQueue = vi.fn(async () => {});
 		const flushPendingBashComponents = vi.fn();
 		const snapshot: AgentConnectionSnapshot = {
 			state: createConnectionState({ isCompacting: false, isBashRunning: false, isStreaming: false }),
@@ -1186,7 +1178,6 @@ describe("InteractiveMode connection events", () => {
 			renderSessionContext: vi.fn(async () => {}),
 			restoreStreamingMessageFromSnapshot: vi.fn(),
 			refreshConnectionQueue: vi.fn(async () => {}),
-			flushCompactionQueue,
 			flushPendingBashComponents,
 			updateTerminalTitle: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
@@ -1201,7 +1192,6 @@ describe("InteractiveMode connection events", () => {
 			}
 		).renderResyncedSession.call(fakeThis, snapshot);
 
-		expect(flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
 		expect(bashComponent.setComplete).toHaveBeenCalledWith(undefined, false);
 		expect((fakeThis as unknown as { activeBashComponent: unknown }).activeBashComponent).toBeUndefined();
 		expect(flushPendingBashComponents).toHaveBeenCalledOnce();
@@ -2400,30 +2390,101 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		maxTokens: 128000,
 	} as AgentConnectionModel;
 
-	test("defers CLI initial prompts until a model is selected after onboarding dismissal", async () => {
-		let currentModel: AgentConnectionModel | undefined;
-		const prompt = vi.fn(async () => {});
-		const getUserInput = vi
-			.fn<() => Promise<string | undefined>>()
-			.mockImplementationOnce(async () => {
-				currentModel = primeModel;
-				return "interactive prompt";
-			})
-			.mockResolvedValueOnce(undefined);
+	test("retries an initial CLI prompt once and preserves steer/follow-up ordering", async () => {
+		vi.useFakeTimers();
+		let finishInput: () => void = () => {};
+		const inputDone = new Promise<void>((resolve) => {
+			finishInput = resolve;
+		});
+		const prompt = vi
+			.fn<() => Promise<void>>()
+			.mockRejectedValueOnce(new Error("transient admission failure"))
+			.mockRejectedValueOnce(new Error("repeated admission failure"))
+			.mockResolvedValue(undefined);
 		const fakeThis = {
 			init: vi.fn(async () => {}),
 			options: {
 				agentsViewOwnsStartupNotices: true,
-				initialMessage: "initial prompt",
+				initialMessage: "first",
+				initialMessages: ["second"],
 			},
 			modelRegistry: { getError: vi.fn(() => undefined) },
 			runStartupOnboarding: vi.fn(async () => true),
 			getModelFallbackWarningAction: vi.fn(() => "suppress"),
-			getCurrentModel: vi.fn(() => currentModel),
+			getCurrentModel: vi.fn(() => primeModel),
 			maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(),
-			getUserInput,
-			collectImagesFor: vi.fn(() => []),
+			getUserInput: vi.fn(() => inputDone),
 			agentConnection: { prompt },
+			showWarning: vi.fn(),
+			showError: vi.fn(),
+			sessionHasMessages: false,
+		};
+
+		try {
+			const run = InteractiveMode.prototype.run.call(fakeThis as never);
+			await vi.advanceTimersByTimeAsync(250);
+			expect(prompt.mock.calls).toEqual([
+				["first", { images: undefined, streamingBehavior: "steer", queueIfBusy: true }],
+				["first", { images: undefined, streamingBehavior: "steer", queueIfBusy: true }],
+				["second", { images: undefined, streamingBehavior: "followUp", queueIfBusy: true }],
+			]);
+			finishInput();
+			await expect(run).resolves.toBe("agents_view");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("defers an initial prompt until a model appears and cleans up its retry timer", async () => {
+		vi.useFakeTimers();
+		let model: AgentConnectionModel | undefined;
+		let finishInput: () => void = () => {};
+		const inputDone = new Promise<void>((resolve) => {
+			finishInput = resolve;
+		});
+		const prompt = vi.fn(async () => {});
+		const fakeThis = {
+			init: vi.fn(async () => {}),
+			options: { agentsViewOwnsStartupNotices: true, initialMessage: "deferred" },
+			modelRegistry: { getError: vi.fn(() => undefined) },
+			runStartupOnboarding: vi.fn(async () => true),
+			getModelFallbackWarningAction: vi.fn(() => "suppress"),
+			getCurrentModel: vi.fn(() => model),
+			maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(),
+			getUserInput: vi.fn(() => inputDone),
+			agentConnection: { prompt },
+			showWarning: vi.fn(),
+			showError: vi.fn(),
+			sessionHasMessages: false,
+		};
+
+		try {
+			const run = InteractiveMode.prototype.run.call(fakeThis as never);
+			await vi.advanceTimersByTimeAsync(250);
+			expect(prompt).not.toHaveBeenCalled();
+			model = primeModel;
+			await vi.advanceTimersByTimeAsync(250);
+			expect(prompt).toHaveBeenCalledOnce();
+			await vi.advanceTimersByTimeAsync(1_000);
+			expect(prompt).toHaveBeenCalledOnce();
+			finishInput();
+			await expect(run).resolves.toBe("agents_view");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	test("keeps the TUI alive while direct editor submissions own prompt delivery", async () => {
+		const fakeThis = {
+			init: vi.fn(async () => {}),
+			options: { agentsViewOwnsStartupNotices: true },
+			modelRegistry: { getError: vi.fn(() => undefined) },
+			runStartupOnboarding: vi.fn(async () => true),
+			getModelFallbackWarningAction: vi.fn(() => "suppress"),
+			getCurrentModel: vi.fn(() => primeModel),
+			maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(),
+			getUserInput: vi.fn(async () => undefined),
+			agentConnection: { prompt: vi.fn() },
 			showWarning: vi.fn(),
 			showError: vi.fn(),
 			returnToAgentsViewRequested: false,
@@ -2431,10 +2492,8 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		};
 
 		await expect(InteractiveMode.prototype.run.call(fakeThis as never)).resolves.toBe("agents_view");
-
-		expect(prompt).toHaveBeenNthCalledWith(1, "initial prompt", { images: undefined });
-		expect(prompt).toHaveBeenNthCalledWith(2, "interactive prompt", { streamingBehavior: "steer", images: [] });
-		expect(prompt).toHaveBeenCalledTimes(2);
+		expect(fakeThis.getUserInput).toHaveBeenCalledOnce();
+		expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
 	});
 
 	function createPrimeCliHarness(shown: boolean): OnboardingFake {
@@ -2959,42 +3018,6 @@ describe("InteractiveMode live context usage", () => {
 
 		// Stats belonged to session-A; must not overwrite session-B.
 		expect(patched).toHaveLength(0);
-	});
-});
-
-describe("InteractiveMode.handleGoalStatusCommand", () => {
-	test("prints current goal details without queuing through the agent", () => {
-		type GoalStatusCommandHarness = {
-			connectionState: { goal: GoalState };
-			chatContainer: Container;
-			ui: { requestRender(): void };
-			handleGoalStatusCommand(): void;
-			formatGoalElapsed(seconds: number): string;
-		};
-		const fakeThis = Object.create(InteractiveMode.prototype) as GoalStatusCommandHarness;
-		fakeThis.connectionState = {
-			goal: {
-				active: true,
-				status: "active",
-				objective: "ship the feature",
-				tokenBudget: 1000,
-				tokensUsed: 125,
-				timeUsedSeconds: 65,
-				continuationsUsed: 2,
-			},
-		};
-		fakeThis.chatContainer = new Container();
-		fakeThis.ui = { requestRender: vi.fn() };
-
-		fakeThis.handleGoalStatusCommand();
-
-		const rendered = normalizeRenderedOutput(fakeThis.chatContainer);
-		expect(rendered).toContain("Goal");
-		expect(rendered).toContain("Status: active");
-		expect(rendered).toContain("Objective: ship the feature");
-		expect(rendered).toContain("Time: 1m 05s");
-		expect(rendered).toContain("Tokens: 125 / 1,000");
-		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(1);
 	});
 });
 

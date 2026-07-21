@@ -292,22 +292,29 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
+		if (!options?.streamingBehavior && options?.queueIfBusy === undefined && !options?.source) {
+			await this.session.prompt(message, options?.images ? { images: options.images } : undefined);
+			return;
+		}
 		await new Promise<void>((resolve, reject) => {
 			let settled = false;
 			const resolveOnce = () => {
-				if (settled) return;
-				settled = true;
-				resolve();
+				if (!settled) {
+					settled = true;
+					resolve();
+				}
 			};
 			const rejectOnce = (error: unknown) => {
-				if (settled) return;
-				settled = true;
-				reject(error);
+				if (!settled) {
+					settled = true;
+					reject(error);
+				}
 			};
 			const prompt = this.session.prompt(message, {
-				images: options?.images,
-				streamingBehavior: options?.streamingBehavior,
-				source: options?.source,
+				...(options?.images ? { images: options.images } : {}),
+				...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
+				...(options?.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
+				...(options?.source ? { source: options.source } : {}),
 				preflightResult: (success) => {
 					if (success) resolveOnce();
 				},
@@ -322,9 +329,10 @@ export class InProcessAgentConnection implements AgentConnection {
 			return;
 		}
 		await this.session.prompt(message, {
-			images: options.images,
-			streamingBehavior: options.streamingBehavior,
-			source: options.source,
+			...(options.images ? { images: options.images } : {}),
+			...(options.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
+			...(options.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
+			...(options.source ? { source: options.source } : {}),
 		});
 	}
 

@@ -2735,4 +2735,42 @@ prepared:${event.prompt}`,
 		await waiting;
 		expect(idle).toBe(true);
 	});
+	it("parses queued refine rollback ids and global placement without consuming instruction text", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue(emptyRefinementResult());
+
+		for (const [command, options] of [
+			["/refine rollback refine_123", { rollbackId: "refine_123", global: false }],
+			["/refine rollback refine_456 --global", { rollbackId: "refine_456", global: true }],
+			["/refine --global rollback refine_789", { rollbackId: "refine_789", global: true }],
+			["/refine --global focus on validation", { instructions: "focus on validation", global: true }],
+			[
+				"/refine update docs to explain --global",
+				{ instructions: "update docs to explain --global", global: false },
+			],
+		] as const) {
+			await harness.session.prompt(command);
+			expect(refine).toHaveBeenLastCalledWith(options, { skipAbort: true });
+		}
+	});
+
+	it("reports a missing queued refine rollback id without invoking refine", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const refine = vi.spyOn(harness.session, "refine");
+
+		await harness.session.prompt("/refine rollback");
+
+		expect(refine).not.toHaveBeenCalled();
+		expect(
+			harness.session.messages.some(
+				(message) =>
+					message.role === "custom" &&
+					message.customType === "session_slash_command_result" &&
+					message.content === "Command failed: Usage: /refine rollback <refinement-id>",
+			),
+		).toBe(true);
+	});
+
 });

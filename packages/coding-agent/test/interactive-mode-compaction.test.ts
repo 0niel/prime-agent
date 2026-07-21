@@ -22,7 +22,6 @@ describe("InteractiveMode compaction events", () => {
 			showError: vi.fn(),
 			showWarning: vi.fn(),
 			showStatus: vi.fn(),
-			flushCompactionQueue: vi.fn().mockResolvedValue(undefined),
 			settingsManager: { getShowTerminalProgress: () => false },
 			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
 		};
@@ -62,8 +61,6 @@ describe("InteractiveMode compaction events", () => {
 				summary: "summary",
 			}),
 		);
-		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
-
 		await handleEvent.call(fakeThis, {
 			type: "compaction_end",
 			reason: "manual",
