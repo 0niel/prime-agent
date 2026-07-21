@@ -1,7 +1,7 @@
 import type { AgentMessage, ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage, type Model, type ToolResultMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createHarness, getMessageText, type Harness } from "./harness.js";
+import { createHarness, type Harness } from "./harness.js";
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (
@@ -293,9 +293,7 @@ describe("AgentSession compaction characterization", () => {
 
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
 		expect(sessionInternals._postCompactionContinuationMessages).toEqual([firstQueued]);
-		expect(
-			harness.session.agent.removeQueuedMessages((message) => message === firstQueued || message === secondQueued),
-		).toEqual([firstQueued]);
+		expect(harness.session.getFollowUpMessages()).toHaveLength(1);
 	});
 
 	it("clears queued autonomous continuations when threshold compaction is skipped", async () => {
@@ -340,7 +338,7 @@ describe("AgentSession compaction characterization", () => {
 			newMessages: [successfulAssistant, toolResult],
 		});
 		expect(shouldStop).toBe(true);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.session.getFollowUpMessages()).toHaveLength(1);
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
 
 		await sessionInternals._runAutoCompaction("threshold", false);
@@ -605,8 +603,8 @@ describe("AgentSession compaction characterization", () => {
 			continuationsUsed: 1,
 			gates: expect.objectContaining({ maxRetries: 5 }),
 		});
-		expect(followUpSpy).toHaveBeenCalledTimes(1);
-		const queuedText = getMessageText(followUpSpy.mock.calls[0]?.[0]);
+		expect(followUpSpy).not.toHaveBeenCalled();
+		const queuedText = harness.session.getFollowUpMessages()[0] ?? "";
 		expect(queuedText).toContain("Autonomous quality gate failed (attempt 1/5)");
 		expect(queuedText).toContain("gate failed");
 
@@ -755,7 +753,6 @@ describe("AgentSession compaction characterization", () => {
 			harness.sessionManager.appendMessage(message);
 		}
 		harness.session.agent.state.messages = [oldUser, oldAssistant, currentUser, successfulAssistant, toolResult];
-		const continueSpy = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
 
 		await sessionInternals._shouldStopAfterTurn({
 			message: successfulAssistant,
@@ -767,16 +764,16 @@ describe("AgentSession compaction characterization", () => {
 			},
 			newMessages: [successfulAssistant, toolResult],
 		});
-		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(harness.session.getFollowUpMessages()).toHaveLength(1);
 
 		await harness.session.prompt("/autonomous off");
 		expect(harness.session.getAutonomousStatus().enabled).toBe(false);
-		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
 
 		await sessionInternals._runAutoCompaction("threshold", false);
 		await vi.advanceTimersByTimeAsync(100);
 
-		expect(continueSpy).not.toHaveBeenCalled();
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
 	});
 
 	it("queues a failing autonomous gate continuation before post-turn threshold compaction", async () => {
@@ -818,9 +815,9 @@ describe("AgentSession compaction characterization", () => {
 		await sessionInternals._checkCompaction(successfulAssistant, false);
 
 		expect(runCompactionSpy).toHaveBeenCalledWith("threshold", false);
-		expect(followUpSpy).toHaveBeenCalledTimes(1);
+		expect(followUpSpy).not.toHaveBeenCalled();
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(1);
-		const queuedText = getMessageText(followUpSpy.mock.calls[0]?.[0]);
+		const queuedText = harness.session.getFollowUpMessages()[0] ?? "";
 		expect(queuedText).toContain("Autonomous quality gate failed (attempt 1/5)");
 		expect(queuedText).toContain("gate failed");
 	});

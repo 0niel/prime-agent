@@ -1212,16 +1212,17 @@ stale post-hook extension instructions`,
 		};
 		sessionInternals._compactionAbortController = new AbortController();
 
-		await expect(
-			harness.session.prompt("/autonomous on", {
-				queueIfBusy: true,
-				streamingBehavior: "followUp",
-			}),
-		).rejects.toThrow("Agent has queued work");
-		sessionInternals._compactionAbortController = undefined;
+		await harness.session.prompt("/autonomous on", {
+			queueIfBusy: true,
+			streamingBehavior: "followUp",
+		});
 
 		expect(harness.session.getAutonomousStatus().enabled).toBe(false);
-		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.session.getFollowUpMessages()).toEqual(["/autonomous on"]);
+		sessionInternals._compactionAbortController = undefined;
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await harness.session.waitForSessionInputIdle();
+		expect(harness.session.getAutonomousStatus().enabled).toBe(true);
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 

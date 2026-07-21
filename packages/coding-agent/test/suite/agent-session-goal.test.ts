@@ -625,7 +625,9 @@ describe("AgentSession goals", () => {
 
 		await harness.session.prompt("/goal clear");
 
-		expect(harness.session.messages).toEqual([]);
+		expect(
+			harness.session.messages.map((message) => (message.role === "custom" ? message.customType : message.role)),
+		).toEqual(["session_slash_command", "session_slash_command_result"]);
 		expect(harness.eventsOfType("goal_update").at(-1)?.goal.status).toBe("idle");
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
@@ -634,13 +636,17 @@ describe("AgentSession goals", () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 
-		await expect(harness.session.prompt("/goal do task")).rejects.toThrow();
+		await harness.session.prompt("/goal do task");
 
 		expect(harness.session.goalState).toMatchObject({
 			active: false,
 			status: "idle",
 		});
-		expect(harness.session.messages).toEqual([]);
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "custom",
+			customType: "session_slash_command_result",
+			details: { success: false },
+		});
 	});
 
 	it("completes a goal whose completing turn crosses the budget without a stale budget-limit steer", async () => {
@@ -737,7 +743,12 @@ describe("AgentSession goals", () => {
 			harnesses.push(harness);
 			harness.setResponses([fauxAssistantMessage("unused")]);
 
-			await expect(harness.session.prompt(command)).rejects.toThrow("Goal token budget must be a positive integer.");
+			await harness.session.prompt(command);
+			expect(harness.session.messages.at(-1)).toMatchObject({
+				role: "custom",
+				customType: "session_slash_command_result",
+				details: { success: false, error: "Goal token budget must be a positive integer." },
+			});
 
 			expect(harness.session.goalState).toMatchObject({
 				active: false,
@@ -834,7 +845,9 @@ describe("AgentSession goals", () => {
 
 		await harness.session.prompt("/goal status");
 
-		expect(harness.session.messages).toEqual([]);
+		expect(
+			harness.session.messages.map((message) => (message.role === "custom" ? message.customType : message.role)),
+		).toEqual(["session_slash_command", "session_slash_command_result"]);
 		expect(harness.eventsOfType("goal_update").at(-1)?.goal.status).toBe("idle");
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
