@@ -25,6 +25,8 @@ Public releases are currently installed from versioned release artifacts. The in
 
 - [Quickstart](quickstart.md) - install, authenticate, and run a first session.
 - [Using Prime Agent](usage.md) - interactive mode, RLM subagents, slash commands, context files, and CLI reference.
+- [RLM programming model](rlm.md) - programmatic execution, native subagents, Python skills, and durable state.
+- [Long-running and background agents](long-running-agents.md) - daemon workers, messaging, heartbeats, goals, schedules, and autonomous mode.
 - [Providers](providers.md) - subscription and API-key setup for built-in providers.
 - [Settings](settings.md) - global and project settings.
 - [Keybindings](keybindings.md) - default shortcuts and custom keybindings.
@@ -34,7 +36,7 @@ Public releases are currently installed from versioned release artifacts. The in
 ## Customization
 
 - [Extensions](extensions.md) - TypeScript modules for tools, commands, events, and custom UI.
-- [Skills](skills.md) - Agent Skills and Python packages exposed in the persistent kernel.
+- [Skills](skills.md) - markdown and Python-backed skills, including how to ask Prime Agent to create them.
 - [MCP integrations](mcp-integrations.md) - use MCP servers through Python skills without expanding the model's tool surface.
 - [Prompt templates](prompt-templates.md) - reusable prompts that expand from slash commands.
 - [Themes](themes.md) - built-in and custom terminal themes.

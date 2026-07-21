@@ -27,22 +27,18 @@ Prime Agent: RLM-native Coding and Research Harness
   </a>
 </p>
 
-## Overview
+Prime Agent is a coding and research agent built for long-running tasks.
 
-Prime Agent is an RLM-native coding and research harness.
+Most agents are optimized for short, single-threaded sessions. As tasks grow, logs and tool output lead to context rot, compaction drops useful details, and one model becomes the bottleneck. Their skills are simply markdown instructions, and sessions require a client to remain open.
 
-The model-facing runtime is centered on a persistent IPython kernel with recursive subagents exposed through a small `rlm` API. The TypeScript host owns model calls, tools, sessions, scheduling, and child-agent execution while Python provides a durable control environment for composing that functionality.
+Prime Agent combines a [Recursive Language Model (RLM)](https://www.primeintellect.ai/blog/rlm) runtime with durable background processes:
 
-Prime Agent is designed for workflows where the model should work inside a durable Python state, compose tools through code, and delegate independent subtasks to child agents without leaving the same harness.
-
-What sets it apart:
-
-1. Persistent IPython execution as the primary model tool.
-2. Recursive child agents through `await rlm("subtask")` and normal Python async patterns.
-3. Live terminal UI for messages, IPython cells, session history, and child-agent state.
-4. Shared provider and auth stack for API-key providers, subscription providers, custom models, and OAuth flows.
-5. Python skill surface for Prime workflows such as environments, evals, training, and analysis.
-6. JSONL session storage with branching, resume, fork, clone, export, and compaction support.
+- **Everything is programmatic:** persistent IPython is the only built-in model tool; file operations, shell commands, tool use, and context management happen through code.
+- **Subagents are built in:** `rlm(...)` spawns real child agents from Python for parallel or background work and returns their results programmatically.
+- **Skills are executable:** skills are importable Python packages, and the built-in skill creator can turn recurring workflows into project or personal skills.
+- **Sessions run in the background:** daemon-backed agents keep running when the terminal disconnects and can be reattached later.
+- **Agents communicate directly:** running agents can exchange messages and orchestrate one another without routing everything through the user.
+- **Long tasks keep moving:** automatic compaction, persistent goals, heartbeats, cron schedules, autonomous mode, and retained subagents preserve progress across turns and terminal sessions.
 
 ## Getting Started
 
@@ -66,25 +62,11 @@ Then start Prime Agent:
 prime-agent
 ```
 
-Alternatively, to test local changes, clone this repository and use the source runner:
-
-```bash
-npm ci
-./prime-agent.sh
-```
-
-Authenticate in the TUI with:
-
-```text
-/login
-```
-
 Public releases are currently installed from versioned release artifacts through these installer scripts. The repository still contains inherited npm workspace identifiers for source compatibility; they are not the user-facing Prime Agent install path.
 
-## Common Commands
+Other useful commands:
 
 ```bash
-prime-agent                          # Start a new session
 prime-agent agents                   # Open the agents view
 prime-agent --resume [path|id]       # Browse or resume a previous session
 prime-agent doctor [--fix]           # Inspect or repair background services
@@ -92,14 +74,20 @@ prime-agent update [--force]         # Update Prime Agent
 prime-agent shutdown [--force]       # Stop every agent, worker, and background service
 ```
 
+## Built for Long-Running Work
+
+- **Direct agent-to-agent communication:** running agents and retained subagents can discover one another, exchange messages, steer active work, or queue follow-ups.
+- **Daemon-backed continuity:** active sessions, IPython state, schedules, and subagents keep running when the terminal detaches and can be reattached later.
+- **Heartbeats and schedules:** `/heartbeat`, `rlm_heartbeat`, and `prime-agent schedule` can re-enter a session periodically or at a specific time.
+- **Persistent goals:** `/goal` keeps an objective and its progress active across turns until it is completed, paused, or cleared.
+- **Bounded autonomous mode:** `/autonomous` continues working until its quality gates pass or a configured turn, token, or time limit is reached.
+
 ## Documentation
 
 - [Documentation index](packages/coding-agent/docs/index.md)
 - [Quickstart](packages/coding-agent/docs/quickstart.md)
+- [RLM programming model](packages/coding-agent/docs/rlm.md)
+- [Long-running and background agents](packages/coding-agent/docs/long-running-agents.md)
 - [Usage and CLI reference](packages/coding-agent/docs/usage.md)
 - [Provider setup](packages/coding-agent/docs/providers.md)
 - [Development](packages/coding-agent/docs/development.md)
-
-## Upstream and License
-
-Prime Agent is licensed under the MIT License. The root [LICENSE](LICENSE) preserves attribution for pi-mono by Mario Zechner and identifies Prime Intellect's subsequent work.
