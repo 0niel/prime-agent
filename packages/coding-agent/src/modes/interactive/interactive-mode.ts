@@ -521,6 +521,96 @@ const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
 // inline limit before storing, so this holds many recent pastes; the oldest are
 // evicted past the cap to keep a long session bounded.
 const MAX_PASTED_IMAGE_BYTES = 64 * 1024 * 1024;
+const INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT = 400;
+
+function initialRenderMessages(messages: AgentMessage[]): AgentMessage[] {
+	if (messages.length <= INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT) {
+		return messages;
+	}
+	const toolCallMessages = new Map<string, { index: number; message: Extract<AgentMessage, { role: "assistant" }> }>();
+	for (const [index, message] of messages.entries()) {
+		if (message.role !== "assistant") {
+			continue;
+		}
+		for (const content of message.content) {
+			if (content.type === "toolCall") {
+				toolCallMessages.set(content.id, { index, message });
+			}
+		}
+	}
+
+	const initialStartIndex = messages.length - INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT;
+	for (let startIndex = initialStartIndex; startIndex < messages.length; startIndex++) {
+		const visibleMessages = messages.slice(startIndex);
+		const visibleToolCallIds = new Set<string>();
+		for (const message of visibleMessages) {
+			if (message.role !== "assistant") {
+				continue;
+			}
+			for (const content of message.content) {
+				if (content.type === "toolCall") {
+					visibleToolCallIds.add(content.id);
+				}
+			}
+		}
+
+		const requiredToolCallIdsByMessage = new Map<
+			number,
+			{ message: Extract<AgentMessage, { role: "assistant" }>; toolCallIds: Set<string> }
+		>();
+		for (const message of visibleMessages) {
+			if (message.role !== "toolResult" || visibleToolCallIds.has(message.toolCallId)) {
+				continue;
+			}
+			const toolCallMessage = toolCallMessages.get(message.toolCallId);
+			if (!toolCallMessage || toolCallMessage.index >= startIndex) {
+				continue;
+			}
+			const requiredMessage = requiredToolCallIdsByMessage.get(toolCallMessage.index) ?? {
+				message: toolCallMessage.message,
+				toolCallIds: new Set<string>(),
+			};
+			requiredMessage.toolCallIds.add(message.toolCallId);
+			requiredToolCallIdsByMessage.set(toolCallMessage.index, requiredMessage);
+		}
+
+		if (visibleMessages.length + requiredToolCallIdsByMessage.size > INITIAL_TRANSCRIPT_RENDER_MESSAGE_LIMIT) {
+			continue;
+		}
+
+		const requiredToolCallMessages = [...requiredToolCallIdsByMessage.entries()]
+			.sort(([leftIndex], [rightIndex]) => leftIndex - rightIndex)
+			.map(([, { message, toolCallIds }]) => ({
+				...message,
+				content: message.content.filter((content) => content.type !== "toolCall" || toolCallIds.has(content.id)),
+			}));
+		return omitOrphanToolResults([...requiredToolCallMessages, ...visibleMessages]);
+	}
+
+	return [];
+}
+
+function omitOrphanToolResults(messages: AgentMessage[]): AgentMessage[] {
+	const renderedToolCallIds = new Set<string>();
+	const renderableMessages: AgentMessage[] = [];
+	for (const message of messages) {
+		if (message.role === "assistant") {
+			for (const content of message.content) {
+				if (content.type === "toolCall") {
+					renderedToolCallIds.add(content.id);
+				}
+			}
+			renderableMessages.push(message);
+		} else if (message.role === "toolResult") {
+			if (renderedToolCallIds.has(message.toolCallId)) {
+				renderableMessages.push(message);
+			}
+		} else {
+			renderableMessages.push(message);
+		}
+	}
+	return renderableMessages;
+}
 
 function isDeadTerminalError(error: unknown): boolean {
 	if (!error || typeof error !== "object" || !("code" in error)) {
@@ -5824,6 +5914,16 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new UserMessageComponent(text, this.getMarkdownThemeWithSettings()));
 	}
 
+	private addMessageToEditorHistory(message: AgentMessage): void {
+		if (message.role !== "user") {
+			return;
+		}
+		const textContent = this.getUserMessageText(message);
+		if (textContent && !this.createLegacyHeartbeatPromptMessage(message, textContent)) {
+			this.editor.addToHistory?.(textContent);
+		}
+	}
+
 	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
 		switch (message.role) {
 			case "bashExecution": {
@@ -5946,17 +6046,26 @@ export class InteractiveMode {
 	 * @param options.updateFooter Update footer state
 	 * @param options.populateHistory Add user messages to editor history
 	 * @param options.clearChat Clear the current transcript immediately before rendering
+	 * @param options.limitTranscript Limit transcript replay to the recent tail
 	 */
 	private async renderSessionContext(
 		sessionContext: AgentConnectionSessionContext,
-		options: { updateFooter?: boolean; populateHistory?: boolean; clearChat?: boolean } = {},
+		options: {
+			updateFooter?: boolean;
+			populateHistory?: boolean;
+			clearChat?: boolean;
+			limitTranscript?: boolean;
+		} = {},
 	): Promise<void> {
 		this.resetPendingToolState();
+		const messagesToRender = options.limitTranscript
+			? initialRenderMessages(sessionContext.messages)
+			: sessionContext.messages;
 		this.ipythonToolComponents.clear();
 		this.lateIpythonSentAgentMessages.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
 		const toolNames: string[] = [];
-		for (const message of sessionContext.messages) {
+		for (const message of messagesToRender) {
 			if (message.role !== "assistant") {
 				continue;
 			}
@@ -5977,7 +6086,29 @@ export class InteractiveMode {
 			this.updateEditorBorderColor();
 		}
 
-		for (const message of sessionContext.messages) {
+		if (options.populateHistory) {
+			for (const message of sessionContext.messages) {
+				this.addMessageToEditorHistory(message);
+			}
+		}
+
+		const renderOptions = { ...options, populateHistory: false };
+
+		if (messagesToRender.length < sessionContext.messages.length) {
+			this.chatContainer.addChild(
+				new Text(
+					theme.fg(
+						"dim",
+						`Showing latest ${messagesToRender.length} of ${sessionContext.messages.length} messages for faster open.`,
+					),
+					1,
+					0,
+				),
+			);
+			this.chatContainer.addChild(new Spacer(1));
+		}
+
+		for (const message of messagesToRender) {
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
 				this.addMessageToChat(message);
@@ -6029,7 +6160,7 @@ export class InteractiveMode {
 				}
 			} else {
 				// All other messages use standard rendering
-				this.addMessageToChat(message, options);
+				this.addMessageToChat(message, renderOptions);
 			}
 		}
 
@@ -6051,6 +6182,7 @@ export class InteractiveMode {
 		await this.renderSessionContext(context, {
 			updateFooter: true,
 			populateHistory: true,
+			limitTranscript: true,
 		});
 		await this.restoreStreamingMessageFromSnapshot(streamingMessage);
 
