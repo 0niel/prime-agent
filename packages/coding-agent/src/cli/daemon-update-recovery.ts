@@ -1,5 +1,5 @@
 import chalk from "chalk";
-import { hasPendingDaemonUpdateRestartManifest } from "./daemon-update-manifest.js";
+import { getPendingDaemonUpdateRestartRecoveryKind } from "./daemon-update-manifest.js";
 import { buildDaemonUpdateRestartReport, launchDaemonUpdateRestartCoordinator } from "./daemon-update-restart.js";
 
 export async function recoverPendingDaemonUpdateRestart(
@@ -7,11 +7,17 @@ export async function recoverPendingDaemonUpdateRestart(
 	agentDir: string,
 	cwd: string,
 ): Promise<void> {
-	if (!hasPendingDaemonUpdateRestartManifest(socketPath, agentDir)) {
+	const recoveryKind = getPendingDaemonUpdateRestartRecoveryKind(socketPath, agentDir);
+	if (!recoveryKind) {
 		return;
 	}
 	try {
-		const status = await launchDaemonUpdateRestartCoordinator({ socketPath, agentDir, cwd });
+		const status = await launchDaemonUpdateRestartCoordinator({
+			socketPath,
+			agentDir,
+			cwd,
+			retryOnly: recoveryKind === "retry",
+		});
 		const report = buildDaemonUpdateRestartReport(status);
 		for (const message of report.info) {
 			console.log(chalk.green(message));

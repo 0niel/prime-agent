@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	getDaemonUpdateRestartManifestCandidates,
+	getPendingDaemonUpdateRestartRecoveryKind,
 	hasPendingDaemonUpdateRestartManifest,
 	manifestForFailedDaemonUpdateRestores,
 	mergeDaemonUpdateRestartManifests,
@@ -92,6 +93,16 @@ describe("ENG-4746 interrupted update recovery", () => {
 			manifest("2026-07-20T23:14:05.579Z", [updateSession("pending", "/sessions/pending.jsonl")]),
 		);
 		expect(hasPendingDaemonUpdateRestartManifest(customSocket, agentDir)).toBe(true);
+		expect(getPendingDaemonUpdateRestartRecoveryKind(customSocket, agentDir)).toBe("restart");
+		const retryManifest = manifestForFailedDaemonUpdateRestores(
+			manifest("2026-07-20T23:15:05.579Z", [updateSession("failed", "/sessions/failed.jsonl")]),
+			["/sessions/failed.jsonl"],
+		);
+		if (!retryManifest) {
+			throw new Error("Expected a retry manifest");
+		}
+		writePreparedDaemonUpdateRestartManifest(customSocket, agentDir, retryManifest);
+		expect(getPendingDaemonUpdateRestartRecoveryKind(customSocket, agentDir)).toBe("retry");
 	});
 
 	it("removes legacy recovery state when persisting canonical default-daemon state", () => {
@@ -122,6 +133,7 @@ describe("ENG-4746 interrupted update recovery", () => {
 		);
 
 		expect(remainder?.sessions).toEqual([failed]);
+		expect(remainder?.retryOnly).toBe(true);
 		expect(manifestForFailedDaemonUpdateRestores(manifest("now", [restored]), [])).toBeUndefined();
 	});
 

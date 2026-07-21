@@ -5,6 +5,12 @@ import { getDaemonUpdateRestartManifestPath, getLegacyDaemonUpdateRestartManifes
 import type { DaemonUpdateRestartManifest, DaemonUpdateRestartSession } from "../modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
 
+export type DaemonUpdateRestartRecoveryKind = "restart" | "retry";
+
+export interface PreparedDaemonUpdateRestartManifest extends DaemonUpdateRestartManifest {
+	retryOnly?: true;
+}
+
 function normalizedSocketPath(path: string): string {
 	return process.platform === "win32" ? path.toLowerCase() : resolve(path);
 }
@@ -26,24 +32,35 @@ export function getDaemonUpdateRestartManifestCandidates(socketPath: string, age
 	return candidates;
 }
 
-export function hasPendingDaemonUpdateRestartManifest(socketPath: string, agentDir: string): boolean {
+export function getPendingDaemonUpdateRestartRecoveryKind(
+	socketPath: string,
+	agentDir: string,
+): DaemonUpdateRestartRecoveryKind | undefined {
+	let retryPending = false;
 	for (const path of getDaemonUpdateRestartManifestCandidates(socketPath, agentDir)) {
 		try {
-			const value = JSON.parse(readFileSync(path, "utf8")) as { sessions?: unknown };
+			const value = JSON.parse(readFileSync(path, "utf8")) as { sessions?: unknown; retryOnly?: unknown };
 			if (Array.isArray(value.sessions) && value.sessions.length > 0) {
-				return true;
+				if (value.retryOnly !== true) {
+					return "restart";
+				}
+				retryPending = true;
 			}
 		} catch {
 			// Full validation and diagnostics happen in the recovery coordinator.
 		}
 	}
-	return false;
+	return retryPending ? "retry" : undefined;
+}
+
+export function hasPendingDaemonUpdateRestartManifest(socketPath: string, agentDir: string): boolean {
+	return getPendingDaemonUpdateRestartRecoveryKind(socketPath, agentDir) !== undefined;
 }
 
 export function writePreparedDaemonUpdateRestartManifest(
 	socketPath: string,
 	agentDir: string,
-	manifest: DaemonUpdateRestartManifest,
+	manifest: PreparedDaemonUpdateRestartManifest,
 ): void {
 	const path = getDaemonUpdateRestartManifestPath(socketPath, agentDir);
 	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -169,7 +186,7 @@ export function mergeDaemonUpdateRestartManifests(
 export function manifestForFailedDaemonUpdateRestores(
 	manifest: DaemonUpdateRestartManifest,
 	failedSessionFiles: readonly string[],
-): DaemonUpdateRestartManifest | undefined {
+): PreparedDaemonUpdateRestartManifest | undefined {
 	const failed = new Set(failedSessionFiles.map(sessionKey));
 	const retained = new Set(failed);
 	const byActiveSessionId = new Map(manifest.sessions.map((session) => [session.activeSessionId, session]));
@@ -204,5 +221,5 @@ export function manifestForFailedDaemonUpdateRestores(
 				hadAcceptedPromptInFlight: false,
 			};
 		});
-	return sessions.length > 0 ? { createdAt: manifest.createdAt, sessions } : undefined;
+	return sessions.length > 0 ? { createdAt: manifest.createdAt, sessions, retryOnly: true } : undefined;
 }

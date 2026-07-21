@@ -19,6 +19,7 @@ import { createCliSubprocessLaunchSpec } from "./subprocess-launch.js";
 export const DAEMON_UPDATE_RESTART_COORDINATOR_FLAG = "--internal-update-restart-coordinator";
 export const DAEMON_UPDATE_RESTART_STATUS_FLAG = "--internal-update-restart-status";
 export const DAEMON_UPDATE_RESTART_ORIGIN_FLAG = "--internal-update-restart-origin";
+export const DAEMON_UPDATE_RETRY_ONLY_FLAG = "--internal-update-retry-only";
 
 export type DaemonUpdateRestartPhase =
 	| "starting"
@@ -84,6 +85,7 @@ export interface LaunchDaemonUpdateRestartCoordinatorOptions {
 	agentDir: string;
 	cwd?: string;
 	originActiveSessionId?: string;
+	retryOnly?: boolean;
 	timeoutMs?: number;
 }
 
@@ -546,6 +548,7 @@ export async function launchDaemonUpdateRestartCoordinator(
 		DAEMON_UPDATE_RESTART_STATUS_FLAG,
 		statusPath,
 		...(originActiveSessionId ? [DAEMON_UPDATE_RESTART_ORIGIN_FLAG, originActiveSessionId] : []),
+		...(options.retryOnly ? [DAEMON_UPDATE_RETRY_ONLY_FLAG] : []),
 	]);
 	const child = spawn(launch.command, launch.args, {
 		cwd: options.cwd ?? process.cwd(),

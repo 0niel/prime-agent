@@ -25,6 +25,7 @@ import {
 	DAEMON_UPDATE_RESTART_COORDINATOR_FLAG,
 	DAEMON_UPDATE_RESTART_ORIGIN_FLAG,
 	DAEMON_UPDATE_RESTART_STATUS_FLAG,
+	DAEMON_UPDATE_RETRY_ONLY_FLAG,
 	DaemonUpdateRestartCoordinatorAlreadyRunningError,
 	type DaemonUpdateRestartCounts,
 	type DaemonUpdateRestartFailure,
@@ -60,6 +61,7 @@ import {
 	type DaemonUpdateRestartSession,
 	isUnknownDaemonCommandError,
 } from "./modes/daemon/daemon-protocol.js";
+import type { SessionSummary } from "./modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath } from "./modes/daemon/daemon-socket.js";
 import {
 	acquireDaemonShutdownAdmission,
@@ -92,6 +94,7 @@ interface PackageCommandOptions {
 	help: boolean;
 	daemonSocketPath?: string;
 	restartCoordinator: boolean;
+	restartRetryOnly: boolean;
 	restartStatusPath?: string;
 	restartOriginActiveSessionId?: string;
 	invalidOption?: string;
@@ -213,6 +216,7 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 	let extensionFlagSource: string | undefined;
 	let daemonSocketPath: string | undefined;
 	let restartCoordinator = false;
+	let restartRetryOnly = false;
 	let restartStatusPath: string | undefined;
 	let restartOriginActiveSessionId: string | undefined;
 
@@ -280,6 +284,15 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 		if (arg === DAEMON_UPDATE_RESTART_COORDINATOR_FLAG) {
 			if (command === "update") {
 				restartCoordinator = true;
+			} else {
+				invalidOption = invalidOption ?? arg;
+			}
+			continue;
+		}
+
+		if (arg === DAEMON_UPDATE_RETRY_ONLY_FLAG) {
+			if (command === "update") {
+				restartRetryOnly = true;
 			} else {
 				invalidOption = invalidOption ?? arg;
 			}
@@ -377,6 +390,7 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 		help,
 		daemonSocketPath,
 		restartCoordinator,
+		restartRetryOnly,
 		restartStatusPath,
 		restartOriginActiveSessionId,
 		invalidOption,
@@ -828,7 +842,9 @@ function tryReadPreparedDaemonUpdateRestartManifest(
 	}
 }
 
-function hasRestorableDaemonUpdateRestart(manifest: DaemonUpdateRestartManifest | undefined): boolean {
+function hasRestorableDaemonUpdateRestart(
+	manifest: DaemonUpdateRestartManifest | undefined,
+): manifest is DaemonUpdateRestartManifest {
 	return manifest !== undefined && manifest.sessions.length > 0;
 }
 
@@ -991,6 +1007,11 @@ interface RestoreDaemonUpdateRestartSessionResult {
 
 interface RestoreDaemonUpdateRestartResult extends DaemonUpdateRestartCounts {
 	failures: DaemonUpdateRestartFailure[];
+}
+
+function normalizedSessionFile(sessionFile: string): string {
+	const normalized = resolve(sessionFile);
+	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 function remapDaemonUpdateRestartRuntimeMetadata(
@@ -1193,9 +1214,25 @@ async function restoreDaemonUpdateRestart(
 	manifest: DaemonUpdateRestartManifest,
 	restartOriginActiveSessionId?: string,
 	onProgress?: (progress: RestoreDaemonUpdateRestartResult) => void,
+	activeSessions: readonly SessionSummary[] = [],
 ): Promise<RestoreDaemonUpdateRestartResult> {
 	const restoredActiveSessionIds = new Map<string, string>();
-	if (manifest.sessions.length === 0) {
+	const activeBySessionFile = new Map(
+		activeSessions.flatMap((session) =>
+			session.sessionFile && session.activeSessionId
+				? [[normalizedSessionFile(session.sessionFile), session.activeSessionId] as const]
+				: [],
+		),
+	);
+	const sessionsToRestore = manifest.sessions.filter((session) => {
+		const activeSessionId = activeBySessionFile.get(normalizedSessionFile(session.sessionFile));
+		if (!activeSessionId) {
+			return true;
+		}
+		restoredActiveSessionIds.set(session.activeSessionId, activeSessionId);
+		return false;
+	});
+	if (sessionsToRestore.length === 0) {
 		return { total: 0, restored: 0, resumed: 0, failed: 0, failures: [] };
 	}
 	const client = new DaemonClient(socketPath);
@@ -1204,7 +1241,7 @@ async function restoreDaemonUpdateRestart(
 	const failures: DaemonUpdateRestartFailure[] = [];
 	try {
 		await client.connect(10000);
-		for (const session of manifest.sessions) {
+		for (const session of sessionsToRestore) {
 			try {
 				const result = await restoreDaemonUpdateRestartSession(
 					client,
@@ -1230,7 +1267,7 @@ async function restoreDaemonUpdateRestart(
 				failures.push({ sessionFile: session.sessionFile, message });
 			}
 			onProgress?.({
-				total: manifest.sessions.length,
+				total: sessionsToRestore.length,
 				restored,
 				resumed,
 				failed: failures.length,
@@ -1245,10 +1282,10 @@ async function restoreDaemonUpdateRestart(
 		console.log(chalk.green(`Resumed ${resumed} interrupted session${resumed === 1 ? "" : "s"}`));
 	}
 	return {
-		total: manifest.sessions.length,
+		total: sessionsToRestore.length,
 		restored,
 		resumed,
-		failed: manifest.sessions.length - restored,
+		failed: sessionsToRestore.length - restored,
 		failures,
 	};
 }
@@ -1268,6 +1305,26 @@ function persistDaemonUpdateRestartRemainder(
 		return;
 	}
 	clearPreparedDaemonUpdateRestartManifest(socketPath, agentDir);
+}
+
+async function restoreAndPersistDaemonUpdateRestart(
+	socketPath: string,
+	agentDir: string,
+	manifest: DaemonUpdateRestartManifest,
+	restartOriginActiveSessionId?: string,
+	onProgress?: (progress: RestoreDaemonUpdateRestartResult) => void,
+	activeSessions?: readonly SessionSummary[],
+): Promise<{ counts: DaemonUpdateRestartCounts; failures: DaemonUpdateRestartFailure[] }> {
+	const restoreResult = await restoreDaemonUpdateRestart(
+		socketPath,
+		manifest,
+		restartOriginActiveSessionId,
+		onProgress,
+		activeSessions,
+	);
+	const { failures, ...counts } = restoreResult;
+	persistDaemonUpdateRestartRemainder(socketPath, agentDir, manifest, failures);
+	return { counts, failures };
 }
 
 function formatUnknownError(error: unknown): string {
@@ -1337,6 +1394,7 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 	agentDir: string;
 	statusPath: string;
 	originActiveSessionId?: string;
+	retryOnly?: boolean;
 }): Promise<DaemonUpdateRestartStatus> {
 	const statusWriter = new DaemonUpdateRestartStatusWriter(
 		options.statusPath,
@@ -1376,6 +1434,41 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 			const { failures, ...counts } = progress;
 			statusWriter.update({ counts, failures });
 		};
+		if (options.retryOnly && daemonProbe.reachable) {
+			manifest = tryReadPreparedDaemonUpdateRestartManifest(options.socketPath, options.agentDir);
+			if (!hasRestorableDaemonUpdateRestart(manifest)) {
+				statusWriter.update({ phase: "skipped", message: "No failed daemon sessions needed to be retried" });
+				return statusWriter.current();
+			}
+			if (!daemonProbe.activeSessions) {
+				statusWriter.update({
+					phase: "skipped",
+					message: "Could not list live daemon sessions before retrying failed restores",
+				});
+				return statusWriter.current();
+			}
+			await shutdownAdmission.release();
+			shutdownAdmission = undefined;
+			statusWriter.update({ phase: "restoring" });
+			const { counts, failures } = await restoreAndPersistDaemonUpdateRestart(
+				options.socketPath,
+				options.agentDir,
+				manifest,
+				options.originActiveSessionId,
+				reportRestoreProgress,
+				daemonProbe.activeSessions,
+			);
+			statusWriter.update({
+				phase: "complete",
+				counts,
+				...(failures.length > 0 ? { failures } : {}),
+				message:
+					counts.failed > 0
+						? `Retried daemon session restores with ${counts.failed} failure${counts.failed === 1 ? "" : "s"}`
+						: "Retried pending daemon session restores",
+			});
+			return statusWriter.current();
+		}
 		let predecessor: DaemonUpdateRestartProcessIdentity | undefined;
 		if (daemonProbe.reachable) {
 			connectedClient = new DaemonClient(options.socketPath);
@@ -1415,22 +1508,16 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 				if (remainingDaemon.reachable) {
 					if (manifest) {
 						try {
-							const restoreResult = await restoreDaemonUpdateRestart(
+							const { counts, failures } = await restoreAndPersistDaemonUpdateRestart(
 								options.socketPath,
+								options.agentDir,
 								manifest,
 								options.originActiveSessionId,
 								reportRestoreProgress,
 							);
-							const { failures: restoreFailures, ...counts } = restoreResult;
-							persistDaemonUpdateRestartRemainder(
-								options.socketPath,
-								options.agentDir,
-								manifest,
-								restoreFailures,
-							);
 							statusWriter.update({
 								counts,
-								...(restoreFailures.length > 0 ? { failures: restoreFailures } : {}),
+								...(failures.length > 0 ? { failures } : {}),
 							});
 						} catch {
 							// Keep the manifest for a later recovery attempt when fallback restoration fails.
@@ -1467,20 +1554,15 @@ export async function runDaemonUpdateRestartCoordinator(options: {
 		let counts: DaemonUpdateRestartCounts = { total: 0, restored: 0, resumed: 0, failed: 0 };
 		let failures: DaemonUpdateRestartFailure[] = [];
 		if (manifest) {
-			const restoreResult = await restoreDaemonUpdateRestart(
+			const result = await restoreAndPersistDaemonUpdateRestart(
 				options.socketPath,
+				options.agentDir,
 				manifest,
 				options.originActiveSessionId,
 				reportRestoreProgress,
 			);
-			counts = {
-				total: restoreResult.total,
-				restored: restoreResult.restored,
-				resumed: restoreResult.resumed,
-				failed: restoreResult.failed,
-			};
-			failures = restoreResult.failures;
-			persistDaemonUpdateRestartRemainder(options.socketPath, options.agentDir, manifest, failures);
+			counts = result.counts;
+			failures = result.failures;
 		}
 		statusWriter.update({
 			phase: "complete",
@@ -1583,6 +1665,7 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 			agentDir,
 			statusPath,
 			originActiveSessionId: options.restartOriginActiveSessionId,
+			retryOnly: options.restartRetryOnly,
 		});
 		if (status.phase === "failed") {
 			process.exitCode = 1;
@@ -1590,7 +1673,7 @@ export async function handlePackageCommand(args: string[]): Promise<boolean> {
 		return true;
 	}
 
-	if (options.restartStatusPath || options.restartOriginActiveSessionId) {
+	if (options.restartStatusPath || options.restartOriginActiveSessionId || options.restartRetryOnly) {
 		console.error(chalk.red("Invalid daemon update restart coordinator invocation."));
 		process.exitCode = 1;
 		return true;

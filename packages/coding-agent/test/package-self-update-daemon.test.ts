@@ -30,6 +30,7 @@ import {
 interface MockSessionSummary {
 	id: string;
 	activeSessionId?: string;
+	sessionFile?: string;
 	isStreaming: boolean;
 	isCompacting: boolean;
 	isBashRunning?: boolean;
@@ -81,6 +82,7 @@ interface MockUpdateRestartSession {
 interface MockUpdateRestartManifest {
 	createdAt: string;
 	sessions: MockUpdateRestartSession[];
+	retryOnly?: true;
 }
 
 interface MockDaemonRequest {
@@ -471,6 +473,90 @@ describe("self-update daemon restart", () => {
 		expect(getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir)).not.toBe(
 			getDaemonUpdateRestartManifestPath(otherSocketPath, agentDir),
 		);
+	});
+
+	it("retries failed restores without restarting healthy daemon sessions", async () => {
+		const parentSessionFile = join(projectDir, "parent.jsonl");
+		const childSessionFile = join(projectDir, "child.jsonl");
+		mockState.daemonProbe = {
+			reachable: true,
+			activeSessions: [
+				{
+					id: "live-parent",
+					activeSessionId: "live-parent",
+					sessionFile: parentSessionFile,
+					isStreaming: false,
+					isCompacting: false,
+					pendingMessageCount: 0,
+				},
+			],
+		};
+		const retryManifest: MockUpdateRestartManifest = {
+			createdAt: "2026-07-07T00:00:00.000Z",
+			retryOnly: true,
+			sessions: [
+				{
+					activeSessionId: "old-parent",
+					sessionId: "parent-session",
+					sessionFile: parentSessionFile,
+					cwd: projectDir,
+					config: { cwd: projectDir, agentDir },
+					runtimeMetadata: { kind: "top-level", createdAt: 1 },
+					queue: { steering: [], followUp: [], nextTurn: [] },
+					shouldResume: false,
+					wasStreaming: false,
+					wasCompacting: false,
+					wasBashRunning: false,
+					hadRunningRlmChildren: false,
+					wasRetrying: false,
+					hadAcceptedPromptInFlight: false,
+				},
+				{
+					activeSessionId: "old-child",
+					sessionId: "child-session",
+					sessionFile: childSessionFile,
+					cwd: projectDir,
+					config: { cwd: projectDir, agentDir },
+					runtimeMetadata: {
+						kind: "subagent",
+						createdAt: 2,
+						parentActiveSessionId: "old-parent",
+					},
+					queue: { steering: [], followUp: [], nextTurn: [] },
+					shouldResume: false,
+					wasStreaming: false,
+					wasCompacting: false,
+					wasBashRunning: false,
+					hadRunningRlmChildren: false,
+					wasRetrying: false,
+					hadAcceptedPromptInFlight: false,
+				},
+			],
+		};
+		writeFileSync(mockState.preparedManifestPath, JSON.stringify(retryManifest));
+		mockState.createActiveSessionIds = ["restored-child"];
+
+		const status = await runDaemonUpdateRestartCoordinator({
+			socketPath: mockState.socketPath,
+			agentDir,
+			statusPath: join(agentDir, "retry-status.json"),
+			retryOnly: true,
+		});
+
+		expect(status).toMatchObject({
+			phase: "complete",
+			counts: { total: 1, restored: 1, resumed: 0, failed: 0 },
+		});
+		expect(mockState.calls).not.toContain("daemon-request:prepare_update_restart");
+		expect(mockState.calls).not.toContain("shutdown-daemon");
+		expect(mockState.calls).not.toContain("ensure-daemon");
+		expect(mockState.requestPayloads.filter((request) => request.type === "create")).toEqual([
+			expect.objectContaining({
+				sessionPath: childSessionFile,
+				runtimeMetadata: expect.objectContaining({ parentActiveSessionId: "live-parent" }),
+			}),
+		]);
+		expect(existsSync(mockState.preparedManifestPath)).toBe(false);
 	});
 
 	it("uses the interactive no-change sentinel only when self-update is unchanged", async () => {
