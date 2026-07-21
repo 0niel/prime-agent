@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -94,6 +94,25 @@ describe("ENG-4746 interrupted update recovery", () => {
 		expect(hasPendingDaemonUpdateRestartManifest(customSocket, agentDir)).toBe(true);
 	});
 
+	it("removes legacy recovery state when persisting canonical default-daemon state", () => {
+		const agentDir = mkdtempSync(join(tmpdir(), "eng-4746-manifest-"));
+		tempDirs.push(agentDir);
+		const defaultSocket = defaultDaemonSocketPath();
+		const legacyPath = getLegacyDaemonUpdateRestartManifestPath(agentDir);
+		writeFileSync(
+			legacyPath,
+			`${JSON.stringify(manifest("old", [updateSession("restored", "/sessions/restored.jsonl")]))}\n`,
+		);
+
+		writePreparedDaemonUpdateRestartManifest(
+			defaultSocket,
+			agentDir,
+			manifest("new", [updateSession("failed", "/sessions/failed.jsonl")]),
+		);
+
+		expect(existsSync(legacyPath)).toBe(false);
+	});
+
 	it("retains only sessions whose restore failed", () => {
 		const restored = updateSession("restored", "/sessions/restored.jsonl");
 		const failed = updateSession("failed", "/sessions/failed.jsonl");
@@ -108,12 +127,48 @@ describe("ENG-4746 interrupted update recovery", () => {
 
 	it("retains parent context needed to retry a failed subagent restore", () => {
 		const parent = updateSession("parent", "/sessions/parent.jsonl");
+		parent.queue = {
+			steering: [{ message: "steer again" }],
+			followUp: [{ message: "follow up again" }],
+			nextTurn: [
+				{
+					role: "custom",
+					customType: "test.next-turn",
+					content: "next turn again",
+					display: true,
+					timestamp: 1,
+				},
+			],
+			acceptedPrompt: { message: "accepted again", nextTurn: [] },
+		};
+		parent.shouldResume = true;
+		parent.wasStreaming = true;
+		parent.wasCompacting = true;
+		parent.wasBashRunning = true;
+		parent.hadRunningRlmChildren = true;
+		parent.wasRetrying = true;
+		parent.hadAcceptedPromptInFlight = true;
 		const failedChild = updateSession("child", "/sessions/child.jsonl", "parent");
+		failedChild.shouldResume = true;
+		failedChild.wasStreaming = true;
 		const remainder = manifestForFailedDaemonUpdateRestores(
 			manifest("2026-07-20T23:14:05.579Z", [parent, failedChild]),
 			[failedChild.sessionFile],
 		);
 
-		expect(remainder?.sessions).toEqual([parent, failedChild]);
+		expect(remainder?.sessions).toEqual([
+			{
+				...parent,
+				queue: { steering: [], followUp: [], nextTurn: [] },
+				shouldResume: false,
+				wasStreaming: false,
+				wasCompacting: false,
+				wasBashRunning: false,
+				hadRunningRlmChildren: false,
+				wasRetrying: false,
+				hadAcceptedPromptInFlight: false,
+			},
+			failedChild,
+		]);
 	});
 });

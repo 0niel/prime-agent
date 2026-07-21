@@ -1030,7 +1030,10 @@ export class DaemonSupervisor {
 					}
 					const activeSessionId = response.data.activeSessionId ?? response.data.id;
 					parent.worker.summaries.set(activeSessionId, response.data);
-					await this.syncAgentPeers();
+					await this.subscribeWorker(parent.worker, activeSessionId);
+					await this.syncAgentPeers().catch((error) =>
+						this.log(`Could not synchronize agent peers after subagent creation: ${String(error)}`),
+					);
 					return { ...response, data: this.publicSummary(parent.worker, response.data) };
 				}
 				const worker = await this.createOrReuseWorker(this.protocolClientId(client), command);

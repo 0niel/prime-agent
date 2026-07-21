@@ -90,8 +90,16 @@ const daemonClientMock = vi.hoisted(() => {
 	return { MockDaemonClient, behavior, instances };
 });
 
+const updateRecoveryMock = vi.hoisted(() => ({ calls: [] as Array<[string, string, string]> }));
+
 vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 	DaemonClient: daemonClientMock.MockDaemonClient,
+}));
+
+vi.mock("../src/cli/daemon-update-recovery.js", () => ({
+	recoverPendingDaemonUpdateRestart: async (socketPath: string, agentDir: string, cwd: string) => {
+		updateRecoveryMock.calls.push([socketPath, agentDir, cwd]);
+	},
 }));
 
 import { handleDaemonCommand } from "../src/cli/daemon-command.js";
@@ -105,6 +113,7 @@ describe("daemon command", () => {
 		daemonClientMock.behavior.promptSucceeds = false;
 		daemonClientMock.behavior.emitStaleAgentEndOnAttach = false;
 		daemonClientMock.behavior.sessions = [];
+		updateRecoveryMock.calls.length = 0;
 		consoleErrorMessages = [];
 		vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null | undefined) => {
 			throw new Error(`exit ${code}`);
@@ -133,6 +142,13 @@ describe("daemon command", () => {
 		).toBe(true);
 	});
 
+	it("recovers interrupted updates before connecting public agent commands", async () => {
+		await expect(handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "list"])).resolves.toBe(true);
+
+		expect(updateRecoveryMock.calls).toEqual([["/tmp/prime-agent.sock", expect.any(String), process.cwd()]]);
+		expect(daemonClientMock.instances).toHaveLength(1);
+	});
+
 	it("ignores stale agent_end events before a daemon prompt starts", async () => {
 		daemonClientMock.behavior.promptSucceeds = true;
 		daemonClientMock.behavior.emitStaleAgentEndOnAttach = true;
@@ -148,7 +164,9 @@ describe("daemon command", () => {
 		await flushPromises();
 
 		const client = daemonClientMock.instances[0];
-		expect(client?.requests.map((request) => request.type)).toEqual(["attach", "prompt"]);
+		await vi.waitFor(() => {
+			expect(client?.requests.map((request) => request.type)).toEqual(["attach", "prompt"]);
+		});
 
 		let resolved = false;
 		void command.then(() => {

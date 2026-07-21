@@ -51,6 +51,11 @@ export function writePreparedDaemonUpdateRestartManifest(
 	try {
 		writeFileSync(tempPath, `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
 		renameSync(tempPath, path);
+		for (const candidate of getDaemonUpdateRestartManifestCandidates(socketPath, agentDir)) {
+			if (candidate !== path) {
+				rmSync(candidate, { force: true });
+			}
+		}
 	} catch (error) {
 		rmSync(tempPath, { force: true });
 		throw error;
@@ -165,7 +170,8 @@ export function manifestForFailedDaemonUpdateRestores(
 	manifest: DaemonUpdateRestartManifest,
 	failedSessionFiles: readonly string[],
 ): DaemonUpdateRestartManifest | undefined {
-	const retained = new Set(failedSessionFiles.map(sessionKey));
+	const failed = new Set(failedSessionFiles.map(sessionKey));
+	const retained = new Set(failed);
 	const byActiveSessionId = new Map(manifest.sessions.map((session) => [session.activeSessionId, session]));
 	for (const failedSession of manifest.sessions.filter((session) => retained.has(sessionKey(session.sessionFile)))) {
 		let parentActiveSessionId = failedSession.runtimeMetadata?.parentActiveSessionId;
@@ -180,6 +186,23 @@ export function manifestForFailedDaemonUpdateRestores(
 			parentActiveSessionId = parent.runtimeMetadata?.parentActiveSessionId;
 		}
 	}
-	const sessions = manifest.sessions.filter((session) => retained.has(sessionKey(session.sessionFile)));
+	const sessions = manifest.sessions
+		.filter((session) => retained.has(sessionKey(session.sessionFile)))
+		.map((session) => {
+			if (failed.has(sessionKey(session.sessionFile))) {
+				return session;
+			}
+			return {
+				...session,
+				queue: { steering: [], followUp: [], nextTurn: [] },
+				shouldResume: false,
+				wasStreaming: false,
+				wasCompacting: false,
+				wasBashRunning: false,
+				hadRunningRlmChildren: false,
+				wasRetrying: false,
+				hadAcceptedPromptInFlight: false,
+			};
+		});
 	return sessions.length > 0 ? { createdAt: manifest.createdAt, sessions } : undefined;
 }

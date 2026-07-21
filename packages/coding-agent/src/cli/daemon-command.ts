@@ -4,7 +4,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import chalk from "chalk";
 import { spawn } from "child_process";
-import { expandTildePath } from "../config.js";
+import { expandTildePath, getAgentDir } from "../config.js";
 import type { AgentSessionEvent } from "../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js";
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
@@ -17,6 +17,7 @@ import { isLocalPath } from "../utils/paths.js";
 import { isValidThinkingLevel } from "./args.js";
 import { formatSessionListTable } from "./daemon-list-format.js";
 import { runPs, runReap } from "./daemon-ps.js";
+import { recoverPendingDaemonUpdateRestart } from "./daemon-update-recovery.js";
 
 interface ParsedDaemonClientCommand {
 	command: string;
@@ -130,6 +131,10 @@ function parseDaemonClientCommand(args: string[]): ParsedDaemonClientCommand {
 }
 
 async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promise<void> {
+	if (parsed.command !== "ps" && parsed.command !== "shutdown") {
+		await recoverPendingDaemonUpdateRestart(parsed.socketPath, getAgentDir(), process.cwd());
+	}
+
 	if (parsed.command === "open") {
 		await runOpen(parsed);
 		return;
