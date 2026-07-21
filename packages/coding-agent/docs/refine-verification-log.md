@@ -1,6 +1,6 @@
 # /refine verification log
 
-This log records manual benchmark-verification checks for PrimeAgent continual
+This log records manual benchmark-verification checks for Prime Agent continual
 harness features. It is intentionally artifact-oriented so later benchmark runs
 can replay the same surfaces.
 
@@ -23,13 +23,14 @@ The model-facing `rlm.harness` API uses explicit `create_*`, `update_*`, and
 - Repo: `/Users/milkkarten/Research/prime-agent`
 - CLI launch: `./prime-agent.sh` in tmux session `PrimeAgentCLI`
 - Model shown by CLI: `openai/gpt-5.5`
-- Session file:
+- Legacy session file (before sessions moved to the flat session store):
   `/Users/milkkarten/.prime/agent/sessions/--Users-milkkarten-Research-prime-agent--/2026-06-08T19-08-33-915Z_019ea8a2-fafa-741b-902a-c00b6b8b997d.jsonl`
 - Harness state file:
   `/Users/milkkarten/.prime/agent/sessions/--Users-milkkarten-Research-prime-agent--/2026-06-08T19-08-33-915Z_019ea8a2-fafa-741b-902a-c00b6b8b997d/harness_state.json`
 
 Historical note: this manual run happened before the harness store was switched
-from session-backed to global-by-default persistence.
+from session-backed to global-by-default persistence and before session JSONL
+files moved to `~/.prime/agent/sessions/<session-id>.jsonl`.
 
 ### Harness availability
 
@@ -69,7 +70,7 @@ Observed result:
 - Pass. Created `manual_cli_test_prompt`, `manual_cli_test_memory`,
   `manual_cli_test_skill`, `manual_cli_test_subagent`, and `refine_0001`.
 - Defect found: `record_refinement(..., "single change")` stored a character
-  list because the helper called `list(changes)`. Patched runtime helper to
+  list because the helper called `list(changes)`. The runtime helper was patched to
   normalize a single string into a one-item list and added a Python unit test.
 
 ### `/refine` create, update, delete

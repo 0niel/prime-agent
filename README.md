@@ -29,7 +29,9 @@ Prime Agent: RLM-native Coding and Research Harness
 
 ## Overview
 
-Prime Agent is a fork of [pi-mono](https://github.com/badlogic/pi-mono) rebuilt around an RLM-native coding and research workflow. The TypeScript host keeps the original terminal UI, provider layer, session tree, slash commands, and extension system. The model-facing runtime is centered on a persistent IPython kernel with recursive subagents exposed through a small `rlm` API.
+Prime Agent is an RLM-native coding and research harness.
+
+The model-facing runtime is centered on a persistent IPython kernel with recursive subagents exposed through a small `rlm` API. The TypeScript host owns model calls, tools, sessions, scheduling, and child-agent execution while Python provides a durable control environment for composing that functionality.
 
 Prime Agent is designed for workflows where the model should work inside a durable Python state, compose tools through code, and delegate independent subtasks to child agents without leaving the same harness.
 
@@ -77,6 +79,8 @@ Authenticate in the TUI with:
 /login
 ```
 
+Public releases are currently installed from versioned release artifacts through these installer scripts. The repository still contains inherited npm workspace identifiers for source compatibility; they are not the user-facing Prime Agent install path.
+
 ## Common Commands
 
 ```bash
@@ -87,3 +91,15 @@ prime-agent doctor [--fix]           # Inspect or repair background services
 prime-agent update [--force]         # Update Prime Agent
 prime-agent shutdown [--force]       # Stop every agent, worker, and background service
 ```
+
+## Documentation
+
+- [Documentation index](packages/coding-agent/docs/index.md)
+- [Quickstart](packages/coding-agent/docs/quickstart.md)
+- [Usage and CLI reference](packages/coding-agent/docs/usage.md)
+- [Provider setup](packages/coding-agent/docs/providers.md)
+- [Development](packages/coding-agent/docs/development.md)
+
+## Upstream and License
+
+Prime Agent is licensed under the MIT License. The root [LICENSE](LICENSE) preserves attribution for pi-mono by Mario Zechner and identifies Prime Intellect's subsequent work.

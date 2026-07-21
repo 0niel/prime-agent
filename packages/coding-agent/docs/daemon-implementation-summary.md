@@ -1,6 +1,6 @@
 # Daemon and Session Worker Architecture
 
-Prime Agent isolates each persistent root session tree in its own process. Process isolation is internal: interactive, print, JSON, RPC, piped-stdin, and `--no-session` invocations keep their existing commands and public I/O contracts.
+Prime Agent isolates each active root session tree in its own process. The daemon is internal infrastructure: interactive, print, JSON, RPC, piped-stdin, and `--no-session` describe client behavior and retain their public I/O contracts.
 
 ## Process Topology
 
@@ -15,87 +15,87 @@ interactive / print / JSON / RPC clients
               `- client-owned worker: hidden root + RLM descendants + kernels
 ```
 
-The supervisor owns public sockets, client attachments, routing, global agent-message routing, worker health, and update coordination. Each resident worker owns scheduling and execution for its root tree. The supervisor does not execute providers, tools, compaction, bash, kernels, session schedules, or session-history scans.
+The supervisor owns public sockets, client attachments, routing, global agent-message delivery, worker health, command journals, and coordinated updates. It does not execute providers, tools, compaction, bash, kernels, schedules, or transcript scans.
 
-Each worker owns one root `AgentSessionRuntime` and every RLM descendant below it. New, switch, fork, and import operations replace the root runtime inside that worker while preserving the root active-session ID.
+The catalog subprocess owns saved-session scans and inactive-session file operations. A catalog failure can fail a catalog request without interrupting active workers.
 
-The catalog subprocess owns saved-session scans and inactive-session file operations. A catalog failure can make a catalog request fail, but cannot interrupt active workers.
+Each worker owns one root `AgentSessionRuntime`, its root `AgentSession`, scheduler, kernels, and every RLM descendant below that root. New, switch, fork, and import operations replace the root runtime inside the worker while preserving the public active-session ID.
 
 ## Resident Workers
 
 Normal interactive sessions use resident workers:
 
-- The supervisor dynamically starts one detached process group per root tree.
+- The supervisor starts one detached process group per active root tree.
 - Closing the TUI detaches the client; it does not stop the worker.
-- Worker descriptors, authentication tokens, active-session IDs, session paths, and recovery journals are stored with mode `0600` below the agent directory.
+- Worker descriptors, authentication tokens, active-session IDs, session paths, and recovery journals are written with owner-only permissions under the agent directory.
 - Workers monitor the public supervisor socket. If it disappears, one worker acquires an atomic launch lease and starts a replacement supervisor.
-- A replacement supervisor adopts the existing worker PIDs and active-session IDs.
-- A worker crash affects only its root tree. Recovery retries after 250 ms, 1 second, and 5 seconds; three failed attempts mark that root failed.
-- The agents view can retry a failed root through the internal supervisor protocol.
-- Supervisor replacement adopts workers automatically.
-- `prime-agent shutdown` stops every worker and supervisor; `--force` also sends `SIGKILL` to unresponsive workers and their tracked child processes.
+- A replacement supervisor adopts live workers and their active-session IDs.
+- A worker crash affects one root tree. Recovery retries after 250 ms, 1 second, and 5 seconds; three failures mark that root failed.
+- `prime-agent shutdown` stops the supervisor and all workers; `--force` also terminates unresponsive worker process groups and tracked children.
 
-There are no session, worker, client, or workload caps in this layer.
+There is no fixed session, worker, client, or workload cap in this layer.
 
 ## Client-Owned Workers
 
-Headless and ephemeral clients use the same supervisor, worker process, `AgentSessionRuntime`, extension binding, scheduler, RLM host, and kernel lifecycle as interactive clients. Their workers have a client-owned lifecycle:
+Headless and ephemeral clients use the same worker runtime as interactive clients but give the worker a client-owned lifecycle:
 
-- `prime-agent -p`, piped stdin, and JSON mode remain one-shot clients and return their existing output and exit status.
-- RPC retains strict LF-delimited JSONL framing, accepts repeated prompts until EOF, and preserves every public command, response, event, and extension-UI shape.
-- Interactive `--no-session` uses a client-owned in-memory session.
-- Normal completion or RPC EOF explicitly removes the worker without archiving its session. `SIGTERM` and `SIGHUP` retain their existing exit codes.
-- Unexpected client loss starts a bounded cleanup grace period. Reconnection with the same stable protocol client ID cancels cleanup and reattaches to the same worker.
-- The supervisor can recover a crashed client-owned worker while the owner remains connected. After supervisor replacement, the owner resupplies its launch environment before a dead worker is restarted.
-- Default session listings, the agents view, global peer routing, and global schedule aggregation omit client-owned workers. Owner-scoped heartbeat and cron operations still reach the hidden worker.
-- The full launch environment is held only in supervisor memory and is never written to the worker descriptor.
-- Direct SDK calls to `runPrintMode(runtime, ...)` and `runRpcMode(runtime)` remain in-process and source-compatible. Non-serializable extension factories therefore continue to work for embedders.
+- print, piped stdin, and JSON mode remain one-shot;
+- RPC keeps LF-delimited JSONL framing and accepts prompts until EOF;
+- interactive `--no-session` uses an in-memory session;
+- normal completion explicitly removes the worker without archiving it;
+- unexpected client loss starts a bounded cleanup grace period;
+- reconnect with the same stable client identity cancels cleanup; and
+- default lists, global schedules, and peer routing omit client-owned workers unless the owner explicitly addresses them.
 
-The daemon is infrastructure, not a client mode. `interactive`, `print`, `json`, and `rpc` describe client behavior; the retained `--mode daemon` command is the compatible internal process entrypoint used to start the supervisor and session workers.
+The full launch environment remains in supervisor memory and is not written to the worker descriptor. Direct SDK calls to print and RPC modes remain in-process so embedders can pass non-serializable extension factories.
 
-## Session Ownership
+## Session Ownership and Leases
 
-Persisted sessions use process-safe leases keyed by canonical JSONL path. Resident and client-owned workers both acquire leases.
+Every persisted session is protected by a process-safe lease keyed by canonical JSONL path.
 
-- Workers acquire a target lease before opening an existing session and acquire the replacement lease before switching runtimes.
-- The previous lease is released only after replacement succeeds.
+- A worker acquires a target lease before opening a session.
+- Runtime replacement acquires the new lease before releasing the old one.
 - Concurrent opens return `session_already_active` with the owning active-session ID.
-- Concurrent daemon creates for the same path share one worker launch.
+- Concurrent creates for the same path converge on one worker launch.
 
-This prevents a script and resident daemon worker from writing the same session concurrently.
+This prevents daemon workers and one-shot clients from writing the same transcript concurrently.
 
-## Scheduled Jobs
+## Scheduling
 
-Each worker runs one scheduler for the root and RLM descendant sessions it owns. Schedule state is persisted per session at `session-artifacts/<session-id>/scheduled-jobs.json`; workers never scan or write a shared global cron file.
+Each worker runs one scheduler for its root and descendants. Jobs are persisted per session in `session-artifacts/<session-id>/scheduled-jobs.json`; workers do not share a global cron file.
 
-- Creating or changing a heartbeat writes its session store and wakes the same worker's scheduler.
-- Due ticks are claimed and advanced durably before prompt delivery, so a crash never replays an uncertain prompt.
-- The timer loop dispatches different target sessions independently and does not wait for complete model or tool turns before scheduling its next pass.
-- A still-active claim coalesces later missed ticks instead of accumulating a backlog.
-- Supervisor replacement does not pause timers or scheduled work because resident workers remain alive.
-- Worker recovery marks uncertain claims interrupted, preserves the advanced schedule, and resumes only future ticks.
-- The supervisor routes cron commands to workers and merges their job summaries for global listing.
+Due ticks are claimed and advanced before prompt delivery. A crash therefore does not replay an uncertain prompt. Different target sessions dispatch independently, and a still-active claim coalesces later missed ticks instead of building an unbounded backlog.
 
-The first worker-owned release migrates the legacy global `cron-jobs.json` into the corresponding session artifact directories before adopting workers. Archived, deleted, or descriptorless sessions are cancelled rather than revived.
+Resident workers keep scheduling across supervisor replacement. Worker recovery marks uncertain claims interrupted, keeps the advanced schedule, and resumes future ticks only. The supervisor routes schedule commands and merges worker summaries for global listing.
 
-## Public Protocol v3
+## Public Daemon Protocol v4
 
-The public daemon socket remains JSONL-framed. Versions 2 and 3 add:
+The public local socket is JSONL-framed. The current protocol provides:
 
-- stable command envelopes carrying protocol version, client ID, and command ID;
+- versioned command envelopes with stable client and command IDs;
+- capability negotiation and per-command compatibility metadata;
 - generation-aware event cursors `{ generation, sequence }`;
-- worker states `starting`, `ready`, `recovering`, and `failed` in session summaries;
-- reconnectable clients that retain their stable identity and cursor;
-- attach acknowledgement followed by `session_snapshot_begin`, `session_snapshot_chunk`, and `session_snapshot_end`;
-- 512 KiB target transcript chunks;
-- file-backed transcript caches above 4 MiB.
-- client-owned worker creation, completion, and promotion;
-- owner-scoped recovery with in-memory launch environments;
-- daemon-side headless completion, session-header, synchronous bash, and retry-setting commands.
+- reconnect with a stable identity and resume cursor;
+- attach acknowledgment plus coherent snapshots;
+- begin/chunk/end snapshot streaming with a 512 KiB target chunk size;
+- file-backed transcript caches above 4 MiB;
+- resident and client-owned worker lifecycle commands;
+- daemon-side headless completion, session-header, bash, and retry operations; and
+- structured errors for recoverable cases such as an already-active session or uncertain mutation result.
 
-The one-release v1 update handoff uses raw v1 requests only to prepare and stop the old daemon. Busy older daemons that cannot produce a recovery manifest are left running.
+Protocol version and schema revision are independent. A compatible addition can be capability-gated or require a schema revision; an incompatible wire change requires a protocol bump.
 
-JSON mode and RPC never expose daemon greetings, envelopes, lifecycle messages, snapshot records, or connection metadata.
+Protocol v1 is retained only for the one-release update handoff that prepares and stops an older daemon. A busy older daemon that cannot produce a recovery manifest is left running.
+
+JSON and RPC client modes do not expose daemon greetings, envelopes, snapshot records, lifecycle events, or connection metadata.
+
+## Reconnect, Replay, and Snapshots
+
+Every sequenced event belongs to a worker generation. Clients retain the last `{ generation, sequence }` cursor and present it on attach. The server reports whether the requested interval is complete, partial, or unavailable.
+
+A generation change invalidates comparison with the old sequence. Missing replay is not fatal: the attach snapshot is the durable recovery baseline. `DaemonAgentConnection` applies the snapshot, ignores duplicate or retired-generation events, and reports a resynchronized session to the UI.
+
+Large snapshots are encoded in the worker and streamed as opaque chunks through a bounded supervisor cache. The supervisor never constructs a history-sized object.
 
 ## Private Worker Transport
 
@@ -108,46 +108,47 @@ small JSON routing header
 opaque payload bytes
 ```
 
-Workers serialize an outbound public event once. The supervisor reads the routing header and writes the same payload buffer to every eligible client.
+Workers serialize a public event once. The supervisor reads only the routing header and forwards the same payload buffer to eligible clients.
 
-Assistant streaming uses compact start/delta/end payloads on the private channel. The supervisor reconstructs the existing full public `message_update` once per delta. A growing assistant message is therefore not serialized or transferred in full for every token.
+Assistant streaming uses compact start/delta/end payloads privately. The supervisor reconstructs the existing public `message_update` once per delta, so the full growing assistant message is not repeatedly transferred from worker to supervisor.
 
-Transcript snapshots are encoded in the worker, not the supervisor. The worker streams opaque chunks to a bounded supervisor cache. The supervisor forwards chunks while they arrive and never parses a history-sized JSON object.
+Private worker connections authenticate with per-worker tokens and are fenced to the current supervisor generation. This prevents an obsolete replacement supervisor from continuing to command an adopted worker. It is process coordination, not a sandbox boundary: all processes still run as the same OS user.
 
 ## Backpressure
 
 Backpressure is attachment-local:
 
-- A blocked client stops receiving incremental events.
-- Other clients and workers continue normally.
-- The supervisor retains no unbounded per-client event queue.
-- On drain, that attachment receives a cursor catch-up or a new chunked snapshot.
-- Finalized transcript caching is separate from live partial-message reconstruction.
+- a blocked client stops receiving incremental events;
+- other clients and workers continue;
+- the supervisor retains no unbounded per-client queue; and
+- after drain, the attachment catches up from its cursor or receives a fresh snapshot.
 
-## Recovery and Idempotency
+Final transcript caching is separate from live partial-message reconstruction.
+
+## Idempotency and Crash Recovery
 
 Mutating commands are keyed by `clientId + commandId` and recorded before dispatch in an append-only journal.
 
-- A repeated completed command returns its stored result.
-- A received command with no durable result is reported as uncertain and is not replayed.
-- Read and mutation envelopes survive transient supervisor reconnects with the same command ID.
-- Clients durably acknowledge completed mutations, allowing acknowledged journal entries to be compacted away.
+- Repeating a completed command returns the stored result.
+- A received command without a durable result is reported as uncertain and is not replayed.
+- Reconnect retains the same command ID.
+- Clients acknowledge completed mutations so journal entries can be compacted.
 
-Workers journal operation transitions and detached subprocess identities. After a crash, the supervisor reaps the old process group plus tracked detached bash trees, appends a visible recovery marker to the persisted transcript, restores the root under the same active-session ID, and holds uncertain side effects rather than replaying them.
+Workers journal operation transitions and detached subprocess identities. After a worker crash, recovery reaps its old process group and tracked detached bash trees, appends a visible recovery marker to the transcript, restores the root under the same active-session ID, and does not replay uncertain side effects.
 
 ## Coordinated Updates
 
 Update preparation is two-phase:
 
-1. Every resident worker creates a non-destructive checkpoint in parallel.
+1. Resident workers create non-destructive checkpoints in parallel.
 2. The supervisor validates and atomically persists the aggregate manifest.
-3. Only after all prepares and validation succeed does it commit and stop workers.
+3. Only after every prepare succeeds does it commit and stop workers.
 
-If any prepare or manifest validation fails, prepared workers are released and all roots keep running.
+If preparation or manifest validation fails, prepared workers are released and all roots continue running.
 
-## Performance Benchmark
+## Benchmarks
 
-Run from `packages/coding-agent`:
+From `packages/coding-agent`:
 
 ```sh
 npx tsx test/daemon-multiclient-bench.ts
@@ -157,4 +158,4 @@ npx tsx test/daemon-multiclient-bench.ts --session-file /path/to/session.jsonl
 PRIME_AGENT_STRESS_WORKERS=50 npx tsx ../../node_modules/vitest/dist/cli.js --run test/daemon-supervisor-process.test.ts -t "hosts resident roots"
 ```
 
-The benchmark reports legacy and v2 fanout/attach paths side by side, including serialization count, elapsed time, throughput, and sampled RSS growth. The process stress case starts the requested number of resident roots, gives every root a simultaneous heartbeat while its own session is busy, and verifies that all schedules advance independently.
+The benchmark compares fanout and attach paths, including serialization count, throughput, elapsed time, and sampled RSS. The stress case starts many resident roots and verifies that their schedules advance independently while sessions are busy.

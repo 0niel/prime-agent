@@ -10,10 +10,10 @@
 <h1 align="center">Prime Agent CLI</h1>
 
 <p align="center">
-  Terminal coding harness.
+  RLM-native terminal coding and research harness.
 </p>
 
-This workspace still keeps an inherited source package name internally. The distributed release package and command are branded as `prime-agent`.
+Prime Agent began as a hard fork of [pi-mono](https://github.com/badlogic/pi-mono), but it is now developed and distributed independently. This workspace retains inherited `@earendil-works/pi-*` source package identifiers, the `pi` package manifest key, and a source-package `pi` bin entry for internal compatibility. Public releases are currently versioned tarball artifacts installed by the scripts below; release packaging rewrites the application package and command to `prime-agent`. Do not use the inherited npm package as the Prime Agent install path.
 
 ## Table of Contents
 
@@ -177,9 +177,9 @@ See `/hotkeys` for the full list. Customize via `~/.prime/agent/keybindings.json
 
 | Key | Action |
 |-----|--------|
-| Ctrl+C | Clear editor |
-| Ctrl+C twice | Quit |
-| Escape | Cancel/abort |
+| Ctrl+C | Interrupt active work, or show the exit hint when idle |
+| Ctrl+C twice | Exit while the exit hint is visible |
+| Escape | Clear the input without interrupting active work |
 | Escape twice | Open `/tree` |
 | Ctrl+L | Open model selector |
 | Ctrl+P / Shift+Ctrl+P | Cycle scoped models forward/backward |
@@ -192,7 +192,8 @@ Submit messages while the agent is working:
 
 - **Enter** queues a *steering* message, delivered after the current assistant turn finishes executing its tool calls
 - **Alt+Enter** queues a *follow-up* message, delivered only after the agent finishes all work
-- **Escape** aborts and restores queued messages to editor
+- **Ctrl+C** interrupts active work and restores queued messages to the editor
+- **Escape** clears the input without interrupting active work
 - **Alt+Up** retrieves queued messages back to editor
 
 On Windows Terminal, `Alt+Enter` is fullscreen by default. Remap it in [docs/terminal-setup.md](docs/terminal-setup.md) so Prime Agent can receive the follow-up shortcut.
@@ -205,7 +206,7 @@ Sessions are stored as JSONL files with a tree structure. Each entry has an `id`
 
 ### Management
 
-Sessions auto-save to `~/.prime/agent/sessions/` organized by working directory.
+Sessions auto-save as flat JSONL files under `~/.prime/agent/sessions/`. Each session header records its working directory, which the session picker uses for project-scoped views.
 
 ```bash
 prime-agent -c                  # Continue most recent session
@@ -335,7 +336,7 @@ Credentials are stored once in `~/.prime/agent/auth.json` (under `mcp:<name>`); 
 **Add your own server.** Declare it under `mcpServers` in settings, then ship a tiny Python skill package that subclasses `McpIntegration`:
 
 ```jsonc
-// ~/.prime/settings.json
+// ~/.prime/agent/settings.json
 {
   "mcpServers": {
     "acme": { "type": "http", "url": "https://mcp.acme.com/mcp", "oauth": true }
@@ -379,7 +380,7 @@ The default export can also be `async`. Prime Agent waits for async extension fa
 
 **What's possible:**
 - Custom tools (or replace built-in tools entirely)
-- Sub-agents and plan mode
+- Additional orchestration workflows and plan modes
 - Custom compaction and summarization
 - Permission gates and path protection
 - Custom editors and UI components
@@ -651,7 +652,8 @@ prime-agent --thinking high "Solve this complex problem"
 | Variable | Description |
 |----------|-------------|
 | `PRIME_AGENT_CODING_AGENT_DIR` | Override config directory (default: `~/.prime/agent`) |
-| `PRIME_AGENT_CODING_AGENT_SESSION_DIR` | Override session storage directory (overridden by `--session-dir`) |
+| `PRIME_AGENT_SESSION_DIR` | Override session storage directory (overridden by `--session-dir`) |
+| `PRIME_AGENT_CODING_AGENT_SESSION_DIR` | Legacy alias for `PRIME_AGENT_SESSION_DIR` |
 | `PI_PACKAGE_DIR` | Override package directory (useful for Nix/Guix where store paths tokenize poorly) |
 | `PI_OFFLINE` | Disable startup network operations, including update checks and package update checks |
 | `PI_SKIP_VERSION_CHECK` | Skip the Prime Agent version update check at startup. This prevents the release manifest request |
@@ -662,6 +664,8 @@ prime-agent --thinking high "Solve this complex problem"
 | `PRIME_AGENT_TRACES_BASE_URL` | Override the Prime Agent trace upload API base URL |
 | `PRIME_AGENT_KERNEL_PYTHON` | Use an existing Python environment with `ipykernel` instead of auto-bootstrapping `~/.prime/agent/kernel-venv` |
 | `VISUAL`, `EDITOR` | External editor for Ctrl+G |
+
+The remaining `PI_*` variables in this table are compatibility names still read by the current runtime. They do not change the application name, command, or default `~/.prime/agent` configuration path.
 
 ## Contributing & Development
 
