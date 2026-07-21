@@ -2,6 +2,46 @@
 
 Prime Agent combines daemon-backed session workers with persistent state, scheduled prompts, direct agent messaging, goals, and bounded autonomous continuations. These features serve different purposes but share the same session and worker runtime.
 
+## Runtime Flow
+
+```mermaid
+flowchart TD
+    client["TUI or CLI client"]
+    peer["Peer agent or retained subagent"]
+    supervisor["Daemon supervisor<br/>routing + attachments"]
+
+    subgraph worker["Resident session worker"]
+        heartbeat["User + RLM heartbeats"]
+        schedule["One-time + cron schedules"]
+        goal["Persistent goal"]
+        autonomous["Autonomous mode"]
+        policy["Continuation policy"]
+        queue["Session prompt queue"]
+        session["AgentSession"]
+        kernel["Persistent IPython kernel"]
+        children["RLM child sessions"]
+
+        heartbeat --> queue
+        schedule --> queue
+        goal --> policy
+        autonomous --> policy
+        policy --> queue
+        queue --> session
+        session --> kernel
+        session <--> children
+    end
+
+    artifacts["JSONL transcript + session artifacts"]
+
+    client <-->|"attach · detach · commands"| supervisor
+    peer -->|"direct message"| supervisor
+    supervisor --> queue
+    session --> artifacts
+    artifacts -. "restore after restart" .-> session
+```
+
+The client can detach at any point. The resident worker continues to own the queue, schedules, session, kernel, descendants, and persisted state.
+
 ## Daemon-Backed Sessions
 
 Normal interactive sessions run in resident worker processes managed by a local supervisor. The worker owns the root session, its IPython kernel, scheduled jobs, and RLM descendants.
@@ -193,4 +233,4 @@ await compact.run("Preserve the failing tests and remaining migration steps")
 
 Compaction is not a completion signal. It does not stop goals, autonomous continuations, heartbeats, or existing child sessions; later parent turns continue from the compacted context.
 
-For lower-level process and recovery behavior, see [Daemon and Session Worker Architecture](daemon-implementation-summary.md). For recursive child lifecycle details, see [RLM Programming Model](rlm.md) and [Kernel and RLM Recursion](kernel-and-rlm-recursion.md).
+For lower-level process and recovery behavior, see [Daemon Architecture](daemon.md). For recursive child lifecycle details, see [RLM Programming Model](rlm.md) and [RLM Runtime Architecture](rlm-runtime.md).

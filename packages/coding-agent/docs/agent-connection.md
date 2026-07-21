@@ -1,17 +1,20 @@
-# AgentConnection Architecture
+# Agent Connection Architecture
 
 `AgentConnection` is the client-side boundary between an interactive user interface and the process that owns agent execution. It lets the terminal UI remain transport-agnostic while normal local sessions run in daemon workers.
 
 The normal interactive path is:
 
-```text
-InteractiveMode
-    -> AgentConnection
-    -> DaemonAgentConnection
-    -> local daemon protocol
-    -> session worker
-    -> AgentSessionRuntime
-    -> AgentSession
+```mermaid
+flowchart LR
+    ui["InteractiveMode<br/>terminal UI"]
+    connection["AgentConnection<br/>client interface"]
+    adapter["DaemonAgentConnection<br/>transport adapter"]
+    protocol["Local daemon protocol<br/>commands · snapshots · events"]
+    worker["Session worker<br/>execution owner"]
+    runtime["AgentSessionRuntime"]
+    session["AgentSession"]
+
+    ui --> connection --> adapter --> protocol --> worker --> runtime --> session
 ```
 
 Explicit fallback and embedding paths may use `InProcessAgentConnection`, but `InteractiveMode` still talks to the same interface.
@@ -47,7 +50,7 @@ On attach it advertises supported capabilities and receives a coherent session s
 
 The adapter rejects duplicate or retired-generation events. After a transient socket loss it reconnects with the same client identity and last cursor, reattaches, and emits a resynchronized snapshot. If incremental replay is unavailable, the session snapshot is the source of truth.
 
-Current implementation:
+Key files:
 
 - `src/modes/agent-connection/daemon-agent-connection.ts`
 - `src/modes/daemon/daemon-client.ts`
@@ -59,7 +62,7 @@ Current implementation:
 
 In-process startup can also provide `InteractiveModeLocalSessionHost` for local callback-bearing extension behavior. JavaScript functions and render callbacks never cross the generic connection boundary.
 
-Current implementation:
+Key files:
 
 - `src/modes/agent-connection/in-process-agent-connection.ts`
 - `src/modes/interactive/interactive-mode-services.ts`
@@ -83,7 +86,7 @@ Some connection types still reuse internal `AgentMessage`, `AgentEvent`, and mod
 
 ## Reconnect and Replay
 
-The local protocol already implements the recovery mechanisms that the original boundary design left for later work:
+Reconnect and recovery use the following mechanisms:
 
 1. Commands use a stable client ID and command ID.
 2. Mutations are journaled by `clientId + commandId`.

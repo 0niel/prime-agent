@@ -2,6 +2,30 @@
 
 Prime Agent is built around a recursive language model (RLM) runtime: the model works inside a persistent Python control environment and composes capabilities as code. Provider calls, session persistence, child lifecycles, scheduling, and safety policy remain in the TypeScript host; IPython is the model-facing programming surface.
 
+## RLM Loop
+
+```mermaid
+flowchart LR
+    task["Task + working context"]
+    parent["Parent model"]
+    kernel["Persistent IPython kernel"]
+    data["Files · data · shell commands"]
+    skills["Python-backed skills"]
+    children["rlm(...) child agents"]
+    answer["Answer or next turn"]
+
+    task --> parent
+    parent -->|"IPython call"| kernel
+    kernel <-->|"inspect · search · transform"| data
+    kernel <-->|"call functions"| skills
+    kernel -->|"delegate focused work"| children
+    children -->|"return results"| kernel
+    kernel -->|"tool result"| parent
+    parent --> answer
+```
+
+The parent keeps its own context focused while Python holds working state and child agents receive only the context needed for their subtasks.
+
 ## Core Invariants
 
 ### 1. Execution is programmatic
@@ -113,4 +137,4 @@ This keeps credentials, provider execution, transcript writes, worker routing, a
 
 The IPython kernel runs model-generated Python and project commands with the worker's operating-system permissions. It is a durable control environment, not a security sandbox. Review third-party Python skills and use an external sandbox or restricted environment for untrusted repositories and instructions.
 
-For implementation details, see [Kernel and RLM Recursion](kernel-and-rlm-recursion.md).
+For implementation details, see [RLM Runtime Architecture](rlm-runtime.md).

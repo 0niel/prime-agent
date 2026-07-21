@@ -85,7 +85,7 @@ You can prompt the model to use that capability directly:
 Review authentication and test coverage as independent subtasks. Run them in parallel, then synthesize the findings.
 ```
 
-See [Kernel and RLM Recursion](kernel-and-rlm-recursion.md) for the API and execution model.
+See [RLM Runtime Architecture](rlm-runtime.md) for the API and execution model.
 
 ## Give Prime Agent Project Instructions
 

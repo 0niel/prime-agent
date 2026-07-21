@@ -85,6 +85,7 @@ prime-agent shutdown [--force]       # Stop every agent, worker, and background 
 ## Documentation
 
 - [Documentation index](packages/coding-agent/docs/index.md)
+- [Architecture overview](packages/coding-agent/docs/architecture.md)
 - [Quickstart](packages/coding-agent/docs/quickstart.md)
 - [RLM programming model](packages/coding-agent/docs/rlm.md)
 - [Long-running and background agents](packages/coding-agent/docs/long-running-agents.md)

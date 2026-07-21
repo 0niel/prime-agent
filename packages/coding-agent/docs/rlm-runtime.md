@@ -1,23 +1,23 @@
-# Kernel and RLM Recursion
+# RLM Runtime Architecture
 
 Prime Agent gives each agent session a persistent IPython kernel and a native recursive sub-agent interface. The Python `rlm` package is a model-facing shim; the TypeScript host owns child execution, persistence, usage accounting, and lifecycle.
 
 ## Architecture
 
-```text
-AgentSession (TypeScript)
-  |
-  | owns the ipython tool and host request handlers
-  v
-KernelManager (TypeScript)
-  |
-  | ZeroMQ / Jupyter protocol
-  v
-IPython kernel process (Python)
-  |
-  | prime-agent-runtime installed as module "rlm"
-  v
-model-executed Python code
+```mermaid
+flowchart TD
+    session["AgentSession · TypeScript<br/>IPython tool + host request handlers"]
+    manager["KernelManager · TypeScript<br/>execution + comm dispatch"]
+    kernel["IPython kernel process · Python"]
+    runtime["prime-agent-runtime<br/>rlm module + Python skills"]
+    code["Model-executed Python code"]
+
+    session -->|"owns"| manager
+    manager <-->|"Jupyter protocol over ZeroMQ"| kernel
+    kernel --> runtime --> code
+    code -->|"rlm.run · goal.* · agent_message.*"| runtime
+    runtime -->|"comm target: host.request"| manager
+    manager -->|"typed dispatch"| session
 ```
 
 When the model delegates work:
@@ -30,6 +30,32 @@ print(result.answer)
 the call travels through a Jupyter comm target named `host.request`. `KernelManager` dispatches request type `rlm.run` to the parent `AgentSession`, which starts a child through the same TypeScript agent machinery as the parent. The final answer and usage return over the comm as an `RLMResult`.
 
 The same bridge supports other typed host requests. Bundled Python skills such as `goal` call `rlm.host_request("goal.get", ...)`; state and policy remain in the TypeScript host.
+
+## Delegation Flow
+
+```mermaid
+sequenceDiagram
+    participant M as Parent model
+    participant H as Parent AgentSession
+    participant K as IPython kernel
+    participant C as Child AgentSession
+    participant P as Model provider
+
+    M->>H: IPython tool call
+    H->>K: execute await rlm("inspect the API")
+    K->>H: host.request · rlm.run
+    H->>H: check depth and resolve model
+    H->>C: create child runtime and prompt
+    loop Child agent loop
+        C->>P: stream model request
+        P-->>C: response or tool call
+    end
+    C-->>H: final answer and usage
+    H->>H: update registry and attribute usage
+    H-->>K: RLMResult
+    K-->>H: tool output
+    H-->>M: IPython result
+```
 
 ## Component Ownership
 

@@ -25,6 +25,7 @@ Public releases are currently installed from versioned release artifacts. The in
 
 - [Quickstart](quickstart.md) - install, authenticate, and run a first session.
 - [Using Prime Agent](usage.md) - interactive mode, RLM subagents, slash commands, context files, and CLI reference.
+- [Architecture overview](architecture.md) - client, daemon, worker, session, kernel, provider, and storage boundaries.
 - [RLM programming model](rlm.md) - programmatic execution, native subagents, Python skills, and durable state.
 - [Long-running and background agents](long-running-agents.md) - daemon workers, messaging, heartbeats, goals, schedules, and autonomous mode.
 - [Providers](providers.md) - subscription and API-key setup for built-in providers.
@@ -67,6 +68,7 @@ Public releases are currently installed from versioned release artifacts. The in
 ## Development
 
 - [Development](development.md) - local setup, configuration, debugging, and validation.
-- [Daemon and Session Worker Architecture](daemon-implementation-summary.md) - supervisor, catalog, worker, lifecycle, and recovery details.
-- [AgentConnection Architecture](agent-connection-readme.md) - client/runtime connection boundary.
-- [Kernel and RLM Recursion](kernel-and-rlm-recursion.md) - ZeroMQ kernel transport and recursive subagent execution.
+- [Architecture overview](architecture.md) - system topology and end-to-end prompt flow.
+- [Daemon Architecture](daemon.md) - supervisor, catalog, worker, lifecycle, and recovery details.
+- [Agent Connection Architecture](agent-connection.md) - client/runtime connection boundary.
+- [RLM Runtime Architecture](rlm-runtime.md) - ZeroMQ kernel transport and recursive subagent execution.
