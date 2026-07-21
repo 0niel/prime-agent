@@ -624,12 +624,16 @@ export class DaemonClient {
 		if (this.socket !== socket) {
 			return;
 		}
+		const shouldRecoverRequests = this.requestRecoveryEnabled && this.daemonClosingReason !== "shutdown";
+		if (this.daemonClosingReason === "shutdown") {
+			this.lastHelloMessage = undefined;
+		}
 		this.clearSocketReference(socket);
-		this.rejectAll(error, this.requestRecoveryEnabled);
+		this.rejectAll(error, shouldRecoverRequests);
 		for (const listener of [...this.closeListeners]) {
 			listener(error);
 		}
-		if (this.reconnectOptions && !this.closed) {
+		if (this.reconnectOptions && !this.closed && shouldRecoverRequests) {
 			void this.autoReconnect(error);
 		}
 	}

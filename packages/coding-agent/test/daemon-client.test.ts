@@ -604,6 +604,44 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("rejects pending and new requests after a terminal daemon shutdown", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket);
+
+		const response = client.request({ type: "list" });
+		const rejection = expect(response).rejects.toThrow("Reason: shutdown");
+		socket.emit("data", `${JSON.stringify({ type: "daemon_closing", reason: "shutdown" })}\n`);
+		socket.emit("close");
+
+		await rejection;
+		await expect(client.request({ type: "list" })).rejects.toThrow("daemon is not connected");
+		client.close();
+	});
+
+	it("does not auto-reconnect after a terminal daemon shutdown", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket);
+		const recoverDaemon = vi.fn(async () => {});
+		client.enableAutoReconnect({ recoverDaemon });
+
+		socket.emit("data", `${JSON.stringify({ type: "daemon_closing", reason: "shutdown" })}\n`);
+		socket.emit("close");
+		await Promise.resolve();
+
+		expect(recoverDaemon).not.toHaveBeenCalled();
+		expect(netMock.sockets).toHaveLength(1);
+		client.close();
+	});
+
 	it("notifies every listener before disconnecting a shared client for update reconnect", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();

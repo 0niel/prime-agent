@@ -788,6 +788,7 @@ export class InteractiveMode {
 
 	// Serializes session event handling; see subscribeToAgent
 	private sessionEventQueue: Promise<void> = Promise.resolve();
+	private sessionResyncGeneration = 0;
 	private fastModeToggleQueue: Promise<void> = Promise.resolve();
 
 	// Tool execution tracking: toolCallId -> component
@@ -2589,6 +2590,7 @@ export class InteractiveMode {
 	}
 
 	private async restoreInitialSession(): Promise<void> {
+		const resyncGeneration = this.sessionResyncGeneration;
 		const loader = new Loader(
 			this.ui,
 			(spinner) => theme.fg("accent", spinner),
@@ -2600,7 +2602,7 @@ export class InteractiveMode {
 		this.ui.requestRender();
 		try {
 			await this.rebindCurrentSession({ syncWorkingLoader: false });
-			await this.renderInitialMessages();
+			await this.renderInitialMessages({ resyncGeneration });
 		} finally {
 			loader.stop();
 			this.statusContainer.removeChild(loader);
@@ -2675,6 +2677,7 @@ export class InteractiveMode {
 	}
 
 	private async renderResyncedSession(snapshot: AgentConnectionSnapshot): Promise<void> {
+		this.sessionResyncGeneration++;
 		const compactionFinished = this.isAgentCompacting() && !snapshot.state.isCompacting;
 		const bashFinished = this.isBashRunning() && !snapshot.state.isBashRunning;
 		this.applyConnectionStateSnapshot(snapshot.state);
@@ -6079,7 +6082,8 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	async renderInitialMessages(): Promise<void> {
+	async renderInitialMessages(options: { resyncGeneration?: number } = {}): Promise<void> {
+		const resyncGeneration = options.resyncGeneration ?? this.sessionResyncGeneration;
 		const snapshot = await this.agentConnection.getInitialSnapshot();
 		const context = this.getSessionContextFromConnectionSnapshot(snapshot);
 		const state = snapshot.state;
@@ -6088,6 +6092,7 @@ export class InteractiveMode {
 		this.setSessionHasMessages(context.messages.length > 0);
 		this.applyConnectionStateSnapshot(state);
 		await this.renderSessionContext(context, {
+			clearChat: resyncGeneration !== this.sessionResyncGeneration,
 			updateFooter: true,
 			populateHistory: true,
 		});

@@ -61,11 +61,38 @@ type RestoreInitialSessionThis = {
 	ui: TUI;
 	statusContainer: Container;
 	rebindCurrentSession(options?: { syncWorkingLoader?: boolean }): Promise<void>;
-	renderInitialMessages(): Promise<void>;
+	renderInitialMessages(options?: { resyncGeneration?: number }): Promise<void>;
+	sessionResyncGeneration: number;
 	syncWorkingLoader(): void;
 };
 
 type RestoreInitialSession = (this: RestoreInitialSessionThis) => Promise<void>;
+
+type InitialSnapshot = {
+	state: { compactionCount: number };
+	streamingMessage: AgentMessage | undefined;
+	children: unknown[];
+};
+
+type RenderInitialMessagesThis = {
+	sessionResyncGeneration: number;
+	agentConnection: { getInitialSnapshot(): Promise<InitialSnapshot> };
+	getSessionContextFromConnectionSnapshot(snapshot: InitialSnapshot): AgentConnectionSessionContext;
+	seedChildAgentInspector(children: unknown[]): void;
+	setSessionHasMessages(hasMessages: boolean): void;
+	applyConnectionStateSnapshot(state: InitialSnapshot["state"]): void;
+	renderSessionContext(
+		context: AgentConnectionSessionContext,
+		options: { clearChat?: boolean; updateFooter?: boolean; populateHistory?: boolean },
+	): Promise<void>;
+	restoreStreamingMessageFromSnapshot(message: AgentMessage | undefined): Promise<void>;
+	showStatus(message: string): void;
+};
+
+type RenderInitialMessages = (
+	this: RenderInitialMessagesThis,
+	options?: { resyncGeneration?: number },
+) => Promise<void>;
 
 function deferred<T>(): { promise: Promise<T>; resolve(value: T): void; reject(error: Error): void } {
 	let resolve!: (value: T) => void;
@@ -271,6 +298,7 @@ describe("ENG-4742 attach restoration", () => {
 			statusContainer,
 			rebindCurrentSession,
 			renderInitialMessages: vi.fn(async () => undefined),
+			sessionResyncGeneration: 3,
 			syncWorkingLoader: vi.fn(),
 		};
 		const restoreInitialSession = (
@@ -285,6 +313,55 @@ describe("ENG-4742 attach restoration", () => {
 		await restoration;
 
 		expect(render(statusContainer)).not.toContain("Restoring transcript…");
-		expect(fakeThis.renderInitialMessages).toHaveBeenCalledOnce();
+		expect(fakeThis.renderInitialMessages).toHaveBeenCalledWith({ resyncGeneration: 3 });
+	});
+
+	it.each([
+		{
+			scenario: "without a concurrent resync",
+			startingGeneration: 0,
+			resyncCount: 0,
+			baseline: undefined,
+			clearChat: false,
+		},
+		{ scenario: "after a resync during rebind", startingGeneration: 1, resyncCount: 0, baseline: 0, clearChat: true },
+		{
+			scenario: "after a resync during snapshot loading",
+			startingGeneration: 0,
+			resyncCount: 1,
+			baseline: 0,
+			clearChat: true,
+		},
+	])("renders initial messages $scenario", async ({ startingGeneration, resyncCount, baseline, clearChat }) => {
+		const initialSnapshot = deferred<InitialSnapshot>();
+		const context = createSessionContext();
+		const fakeThis: RenderInitialMessagesThis = {
+			sessionResyncGeneration: startingGeneration,
+			agentConnection: { getInitialSnapshot: () => initialSnapshot.promise },
+			getSessionContextFromConnectionSnapshot: () => context,
+			seedChildAgentInspector: vi.fn(),
+			setSessionHasMessages: vi.fn(),
+			applyConnectionStateSnapshot: vi.fn(),
+			renderSessionContext: vi.fn(async () => undefined),
+			restoreStreamingMessageFromSnapshot: vi.fn(async () => undefined),
+			showStatus: vi.fn(),
+		};
+		const renderInitialMessages = (
+			InteractiveMode.prototype as unknown as { renderInitialMessages: RenderInitialMessages }
+		).renderInitialMessages;
+
+		const restoration = renderInitialMessages.call(
+			fakeThis,
+			baseline === undefined ? undefined : { resyncGeneration: baseline },
+		);
+		fakeThis.sessionResyncGeneration += resyncCount;
+		initialSnapshot.resolve({ state: { compactionCount: 0 }, streamingMessage: undefined, children: [] });
+		await restoration;
+
+		expect(fakeThis.renderSessionContext).toHaveBeenCalledWith(context, {
+			clearChat,
+			updateFooter: true,
+			populateHistory: true,
+		});
 	});
 });
