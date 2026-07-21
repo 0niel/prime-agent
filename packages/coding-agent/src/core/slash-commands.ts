@@ -10,9 +10,26 @@ export interface SlashCommandInfo {
 	sourceInfo: SourceInfo;
 }
 
+export const SESSION_SLASH_COMMAND_NAMES = ["compact", "refine", "goal", "autonomous"] as const;
+
+export type SessionSlashCommandName = (typeof SESSION_SLASH_COMMAND_NAMES)[number];
+
+const SESSION_SLASH_COMMAND_NAME_SET: ReadonlySet<string> = new Set(SESSION_SLASH_COMMAND_NAMES);
+
+export function isSessionSlashCommandName(value: unknown): value is SessionSlashCommandName {
+	return typeof value === "string" && SESSION_SLASH_COMMAND_NAME_SET.has(value);
+}
+
+export interface SessionSlashCommand {
+	name: SessionSlashCommandName;
+	args: string;
+	text: string;
+}
+
 export interface BuiltinSlashCommand {
 	name: string;
 	description: string;
+	execution?: "client" | "session";
 	/** Shown in autocomplete before the description, e.g. "[instructions]" */
 	argumentHint?: string;
 	/** Hidden names that resolve to this command without being shown as commands. */
@@ -86,11 +103,20 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		description: "Compact the session context; optional instructions focus the summary",
 		argumentHint: "[instructions]",
 	},
-	{ name: "refine", description: "Refine continual harness prompt notes, skills, subagents, and memory" },
+	{
+		name: "refine",
+		description: "Refine continual harness prompt notes, skills, subagents, and memory",
+	},
 	{
 		name: "goal",
 		description: "Set or view a persistent goal; supports pause, resume, and clear",
 		argumentHint: "[objective]",
+		takesArgument: true,
+	},
+	{
+		name: "autonomous",
+		description: "Set or view autonomous mode",
+		argumentHint: "[status|on|off]",
 		takesArgument: true,
 	},
 	{
@@ -137,6 +163,7 @@ function buildBuiltinSlashCommands(): ReadonlyArray<BuiltinSlashCommand> {
 	}
 	return CANONICAL_BUILTIN_SLASH_COMMANDS.map((command) => ({
 		...command,
+		...(isSessionSlashCommandName(command.name) ? { execution: "session" as const } : {}),
 		...(aliasesByTarget.has(command.name) ? { aliases: aliasesByTarget.get(command.name) } : {}),
 	}));
 }
@@ -152,12 +179,12 @@ export function parseSlashCommand(text: string): ParsedSlashCommand | undefined 
 	if (!text.startsWith("/")) {
 		return undefined;
 	}
-	const spaceIndex = text.indexOf(" ");
-	const name = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+	const whitespaceIndex = text.search(/[\t\p{Zs}]/u);
+	const name = whitespaceIndex === -1 ? text.slice(1) : text.slice(1, whitespaceIndex);
 	if (!name) {
 		return undefined;
 	}
-	return { name, args: spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim() };
+	return { name, args: whitespaceIndex === -1 ? "" : text.slice(whitespaceIndex).trim() };
 }
 
 export function resolveBuiltinSlashCommandName(name: string): string {
@@ -180,4 +207,13 @@ export function resolveSlashCommand(command: ParsedSlashCommand): ResolvedSlashC
 		originalName: command.name,
 		isAlias: name !== command.name,
 	};
+}
+
+export function parseSessionSlashCommand(text: string): SessionSlashCommand | undefined {
+	const parsed = parseSlashCommand(text);
+	if (!parsed) return undefined;
+	const name = resolveBuiltinSlashCommandName(parsed.name);
+	const command = BUILTIN_SLASH_COMMAND_BY_NAME.get(name);
+	if (command?.execution !== "session" || !isSessionSlashCommandName(name)) return undefined;
+	return { name, args: parsed.args, text };
 }

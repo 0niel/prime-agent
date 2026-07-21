@@ -8,6 +8,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
 import type { AgentCronJob } from "./cron-jobs.js";
+import { isSessionSlashCommandName, parseSessionSlashCommand, type SessionSlashCommand } from "./slash-commands.js";
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
 
@@ -27,6 +28,33 @@ export const BRANCH_SUMMARY_SUFFIX = `</summary>`;
 export const HEARTBEAT_PROMPT_CUSTOM_TYPE = "heartbeat_prompt";
 export const HEARTBEAT_PROMPT_PREVIEW_LABEL = "Heartbeat prompt";
 export const IPYTHON_STATE_RESTORED_CUSTOM_TYPE = "ipython_state_restored";
+export const SESSION_SLASH_COMMAND_CUSTOM_TYPE = "session_slash_command";
+export const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE = "session_slash_command_result";
+
+export interface SessionSlashCommandDetails {
+	command: SessionSlashCommand;
+	commandEntryId?: string;
+}
+
+export interface SessionSlashCommandResultDetails {
+	command: SessionSlashCommand;
+	success: boolean;
+	severity: "info" | "warning" | "error";
+	error?: string;
+	commandEntryId?: string;
+}
+
+export interface SessionSlashCommandMessage extends CustomMessage<SessionSlashCommandDetails> {
+	customType: typeof SESSION_SLASH_COMMAND_CUSTOM_TYPE;
+	content: string;
+	details: SessionSlashCommandDetails;
+}
+
+export interface SessionSlashCommandResultMessage extends CustomMessage<SessionSlashCommandResultDetails> {
+	customType: typeof SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE;
+	content: string;
+	details: SessionSlashCommandResultDetails;
+}
 
 /**
  * Message type for bash executions via the ! command.
@@ -176,6 +204,99 @@ export function createCustomMessage(
 	};
 }
 
+export function createSessionSlashCommandMessage(
+	command: SessionSlashCommand,
+	details: Omit<SessionSlashCommandDetails, "command"> = {},
+	display = true,
+	timestamp = Date.now(),
+): SessionSlashCommandMessage {
+	return {
+		role: "custom",
+		customType: SESSION_SLASH_COMMAND_CUSTOM_TYPE,
+		content: command.text,
+		display,
+		details: { ...details, command: { ...command } },
+		timestamp,
+	};
+}
+
+export function createSessionSlashCommandResultMessage(
+	content: string,
+	details: SessionSlashCommandResultDetails,
+	display = true,
+	timestamp = Date.now(),
+): SessionSlashCommandResultMessage {
+	return {
+		role: "custom",
+		customType: SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
+		content,
+		display,
+		details: { ...details, command: { ...details.command } },
+		timestamp,
+	};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function hasValidCustomMessageEnvelope(message: Record<string, unknown>, customType: string): boolean {
+	return (
+		message.role === "custom" &&
+		message.customType === customType &&
+		typeof message.content === "string" &&
+		typeof message.display === "boolean" &&
+		typeof message.timestamp === "number" &&
+		Number.isFinite(message.timestamp)
+	);
+}
+
+function isSessionSlashCommand(value: unknown): value is SessionSlashCommand {
+	return (
+		isRecord(value) &&
+		isSessionSlashCommandName(value.name) &&
+		typeof value.args === "string" &&
+		typeof value.text === "string"
+	);
+}
+
+function isValidCommandEntryId(value: unknown): value is string | undefined {
+	return value === undefined || (typeof value === "string" && value.length > 0);
+}
+
+export function isSessionSlashCommandMessage(message: unknown): message is SessionSlashCommandMessage {
+	if (
+		!isRecord(message) ||
+		!hasValidCustomMessageEnvelope(message, SESSION_SLASH_COMMAND_CUSTOM_TYPE) ||
+		typeof message.content !== "string"
+	) {
+		return false;
+	}
+	if (!isRecord(message.details) || !isSessionSlashCommand(message.details.command)) return false;
+	const parsed = parseSessionSlashCommand(message.content);
+	return (
+		parsed !== undefined &&
+		parsed.name === message.details.command.name &&
+		parsed.args === message.details.command.args &&
+		parsed.text === message.details.command.text &&
+		isValidCommandEntryId(message.details.commandEntryId)
+	);
+}
+
+export function isSessionSlashCommandResultMessage(message: unknown): message is SessionSlashCommandResultMessage {
+	if (!isRecord(message) || !hasValidCustomMessageEnvelope(message, SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE))
+		return false;
+	if (!isRecord(message.details) || !isSessionSlashCommand(message.details.command)) return false;
+	return (
+		typeof message.details.success === "boolean" &&
+		(message.details.severity === "info" ||
+			message.details.severity === "warning" ||
+			message.details.severity === "error") &&
+		(message.details.error === undefined || typeof message.details.error === "string") &&
+		isValidCommandEntryId(message.details.commandEntryId)
+	);
+}
+
 export function createHeartbeatPromptMessage(
 	job: AgentCronJob,
 	timestamp = Date.now(),
@@ -220,6 +341,12 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						timestamp: m.timestamp,
 					};
 				case "custom": {
+					if (
+						m.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||
+						m.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE
+					) {
+						return undefined;
+					}
 					const content = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
 					return {
 						role: "user",
