@@ -897,6 +897,57 @@ describe("self-update daemon restart", () => {
 		expect(existsSync(getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir))).toBe(false);
 	});
 
+	it("merges a legacy manifest when the scoped manifest is empty", async () => {
+		useFixedOwnerHello();
+		mockState.daemonProbe = { reachable: false };
+		const sessionFile = join(tempDir, "legacy-session.jsonl");
+		const scopedManifestPath = getDaemonUpdateRestartManifestPath(mockState.socketPath, agentDir);
+		const legacyManifestPath = getLegacyDaemonUpdateRestartManifestPath(agentDir);
+		writeFileSync(scopedManifestPath, JSON.stringify({ createdAt: "2026-07-07T00:00:00.000Z", sessions: [] }));
+		writeFileSync(
+			legacyManifestPath,
+			JSON.stringify({
+				createdAt: "2026-07-06T00:00:00.000Z",
+				sessions: [
+					{
+						activeSessionId: "legacy-active",
+						sessionId: "legacy-session",
+						sessionFile,
+						cwd: projectDir,
+						config: { cwd: projectDir, agentDir },
+						runtimeMetadata: { kind: "top-level", createdAt: 1 },
+						queue: { steering: [], followUp: [], nextTurn: [] },
+						shouldResume: false,
+						wasStreaming: false,
+						wasCompacting: false,
+						wasBashRunning: false,
+						hadRunningRlmChildren: false,
+						wasRetrying: false,
+						hadAcceptedPromptInFlight: false,
+					},
+				],
+			}),
+		);
+
+		const statusDirectory = join(agentDir, "update-restarts");
+		mkdirSync(statusDirectory, { recursive: true });
+		const status = await runDaemonUpdateRestartCoordinator({
+			socketPath: mockState.socketPath,
+			agentDir,
+			statusPath: join(statusDirectory, "legacy-merge-status.json"),
+		});
+
+		expect(status).toMatchObject({
+			phase: "complete",
+			counts: { total: 1, restored: 1, resumed: 0, failed: 0 },
+		});
+		expect(mockState.requestPayloads).toContainEqual(
+			expect.objectContaining({ type: "create", sessionPath: sessionFile }),
+		);
+		expect(existsSync(scopedManifestPath)).toBe(false);
+		expect(existsSync(legacyManifestPath)).toBe(false);
+	});
+
 	it("merges a pending restart with live daemon sessions before restoring them", async () => {
 		useFixedOwnerHello();
 		const parentSessionFile = join(projectDir, "parent.jsonl");

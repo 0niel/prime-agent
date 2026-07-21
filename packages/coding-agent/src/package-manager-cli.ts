@@ -769,6 +769,8 @@ function readPreparedDaemonUpdateRestartManifest(
 	notBeforeMs?: number,
 	changedSince?: ReadonlyMap<string, string>,
 ): DaemonUpdateRestartManifest | undefined {
+	const manifests: DaemonUpdateRestartManifest[] = [];
+	let invalidManifestError: unknown;
 	for (const manifestPath of getDaemonUpdateRestartManifestCandidates(socketPath, agentDir)) {
 		let stat: ReturnType<typeof statSync>;
 		try {
@@ -782,10 +784,24 @@ function readPreparedDaemonUpdateRestartManifest(
 		if (changedSince?.get(manifestPath) === `${stat.ino}:${stat.size}:${stat.mtimeMs}`) {
 			continue;
 		}
-		const parsed = JSON.parse(readFileSync(manifestPath, "utf-8")) as unknown;
-		return parseDaemonUpdateRestartManifest(parsed);
+		try {
+			const parsed = JSON.parse(readFileSync(manifestPath, "utf-8")) as unknown;
+			manifests.push(parseDaemonUpdateRestartManifest(parsed));
+		} catch (error: unknown) {
+			invalidManifestError ??= error;
+		}
 	}
-	return undefined;
+	if (manifests.length === 0) {
+		if (invalidManifestError !== undefined) {
+			throw invalidManifestError;
+		}
+		return undefined;
+	}
+	let merged = manifests[manifests.length - 1]!;
+	for (let index = manifests.length - 2; index >= 0; index--) {
+		merged = mergeDaemonUpdateRestartManifests(merged, manifests[index]!);
+	}
+	return merged;
 }
 
 function snapshotPreparedDaemonUpdateRestartManifestFiles(socketPath: string, agentDir: string): Map<string, string> {

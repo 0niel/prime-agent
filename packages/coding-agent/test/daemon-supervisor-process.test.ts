@@ -286,6 +286,93 @@ async function startBlockingBash(client: DaemonClient, activeSessionId: string, 
 }
 
 describe("daemon supervisor resident workers", () => {
+	it("restores subagents inside their parent worker", async () => {
+		const root = tempDir();
+		const agentDir = join(root, "agent");
+		const projectDir = join(root, "project");
+		const sessionDir = join(agentDir, "sessions");
+		const socketPath = join(tmpdir(), `prime-supervisor-subagent-${process.pid}-${randomUUID().slice(0, 8)}.sock`);
+		mkdirSync(projectDir, { recursive: true });
+		const parentManager = SessionManager.create(projectDir, sessionDir);
+		parentManager.newSession();
+		parentManager.appendMessage({ role: "user", content: "parent fixture", timestamp: 1 });
+		const parentSessionFile = parentManager.getSessionFile();
+		const parentArtifactDir = parentManager.getSessionArtifactDir();
+		if (!parentSessionFile || !parentArtifactDir) {
+			throw new Error("Parent fixture did not persist");
+		}
+		const childSessionDir = join(parentArtifactDir, "child-1");
+		const childManager = SessionManager.create(projectDir, childSessionDir);
+		childManager.newSession({ parentSession: parentSessionFile });
+		childManager.appendMessage({ role: "user", content: "child fixture", timestamp: 1 });
+		const childSessionFile = childManager.getSessionFile();
+		if (!childSessionFile) {
+			throw new Error("Child fixture did not persist");
+		}
+
+		const supervisor = spawnSupervisor(agentDir, socketPath, projectDir);
+		const client = await connectEventually(socketPath, supervisor);
+		const parentResponse = await client.request({
+			type: "create",
+			sessionPath: parentSessionFile,
+			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+			runtimeMetadata: { kind: "top-level", createdAt: 1 },
+		});
+		if (!parentResponse.success) {
+			throw new Error(parentResponse.error);
+		}
+		const parent = requireSummary(parentResponse.data);
+		if (!parent.workerPid || !parent.activeSessionId) {
+			throw new Error("Parent worker did not expose its process identity");
+		}
+		workerPids.add(parent.workerPid);
+
+		const childResponse = await client.request({
+			type: "create",
+			sessionPath: childSessionFile,
+			config: { cwd: projectDir, agentDir, sessionDir: childSessionDir, noTools: true, noExtensions: true },
+			runtimeMetadata: {
+				kind: "subagent",
+				createdAt: 2,
+				parentActiveSessionId: parent.activeSessionId,
+				parentSessionId: parent.sessionId,
+				parentSessionFile,
+				rlmChildId: "child-1",
+				prompt: "child fixture",
+			},
+		});
+		if (!childResponse.success) {
+			throw new Error(childResponse.error);
+		}
+		const child = requireSummary(childResponse.data);
+		expect(child).toMatchObject({
+			runtimeKind: "subagent",
+			parentActiveSessionId: parent.activeSessionId,
+			workerPid: parent.workerPid,
+		});
+		expect(child.activeSessionId).not.toBe(parent.activeSessionId);
+		expect(countWorkerDescriptors(agentDir)).toBe(1);
+
+		const listed = await client.request({ type: "list" });
+		expect(listed.success).toBe(true);
+		expect(requireSessionList(listed.success ? listed.data : undefined)).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ activeSessionId: parent.activeSessionId, runtimeKind: "top-level" }),
+				expect.objectContaining({
+					activeSessionId: child.activeSessionId,
+					runtimeKind: "subagent",
+					parentActiveSessionId: parent.activeSessionId,
+				}),
+			]),
+		);
+
+		await client.request({ type: "shutdown" });
+		client.close();
+		await waitForSocketGone(socketPath);
+		await waitForProcessGone(parent.workerPid);
+		workerPids.delete(parent.workerPid);
+	}, 60_000);
+
 	it("keeps client-owned workers hidden and removes them without archiving", async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");

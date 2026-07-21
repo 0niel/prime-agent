@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed interrupted updates leaving prepared daemon sessions unrestored on the next launch ([ENG-4746](https://linear.app/primeintellect/issue/ENG-4746/updating-still-doesnt-restore-old-running-sessions)).
+
 ## [0.3.2] - 2026-07-20
 
 - Fixed invalid `--resume` session IDs being submitted as prompts, with nearest-session guidance instead ([ENG-4722](https://linear.app/primeintellect/issue/ENG-4722/prime-agent-resume-accepts-incorrect-session-ids)).
@@ -33,7 +35,6 @@
 - Changed `/traces upload-all` to pace requests within the platform rate limit, honor bounded `Retry-After` responses, and support interruption.
 - Fixed resuming a daemon-resident session to attach the requesting client to its existing worker without disturbing other clients ([ENG-4656](https://linear.app/primeintellect/issue/ENG-4656/resuming-prime-agent-sessions-should-attach)).
 - Fixed daemon-owned updates terminating their updater before the daemon restart and session restore completed ([ENG-4606](https://linear.app/primeintellect/issue/ENG-4606/benign-error-on-prime-agent-update)).
-- Fixed interrupted updates leaving prepared daemon sessions unrestored on the next launch ([ENG-4746](https://linear.app/primeintellect/issue/ENG-4746/updating-still-doesnt-restore-old-running-sessions)).
 - Fixed first-launch Prime login and kept onboarding visible between team and model selection ([ENG-4658](https://linear.app/primeintellect/issue/ENG-4658/fix-onboarding-login-enter-key-and-model-selector-flicker)).
 - Fixed active heartbeat sessions appearing under Needs Input or Completed instead of a dedicated Heartbeats section ([ENG-4654](https://linear.app/primeintellect/issue/ENG-4654/categorize-heartbeat-sessions-as-working)).
 - Fixed stashed prompts being lost when leaving and reopening a session from the Agents View ([ENG-4659](https://linear.app/primeintellect/issue/ENG-4659/stashed-prompts-should-persist)).
