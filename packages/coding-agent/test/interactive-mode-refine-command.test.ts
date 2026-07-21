@@ -153,4 +153,67 @@ describe("InteractiveMode.handleRefineCommand", () => {
 		expect(context.showWarning).toHaveBeenCalledWith("Nothing to refine (no trajectory yet)");
 		expect(context.agentConnection.refine).not.toHaveBeenCalled();
 	});
+
+	test("shows success status after refine resolves without blocking the caller", async () => {
+		let resolveRefine: ((value: unknown) => void) | undefined;
+		const refinePromise = new Promise((resolve) => {
+			resolveRefine = resolve;
+		});
+		const context = {
+			agentConnection: {
+				getSessionStats: vi.fn().mockResolvedValue({ totalMessages: 2 }),
+				refine: vi.fn().mockReturnValue(refinePromise),
+			},
+			stopWorkingLoader: vi.fn(),
+			showStatus: vi.fn(),
+			showWarning: vi.fn(),
+			showError: vi.fn(),
+		};
+
+		await handleRefineCommand.call(context, "focus on validation");
+
+		// The "Refining..." status is shown synchronously.
+		expect(context.showStatus).toHaveBeenCalledWith("Refining local continual harness state...");
+		// The success status is NOT shown yet because refine has not resolved.
+		expect(context.showStatus).not.toHaveBeenCalledWith("Refined continual harness state: 2 edits applied, 1 failed");
+
+		// Resolve the refine promise and let the microtask queue drain.
+		resolveRefine?.({
+			appliedEdits: [{ applied: true }, { applied: true }, { applied: false, error: "entry not found" }],
+			harnessStatePath: "/tmp/harness_state.json",
+		});
+		await vi.waitFor(() => {
+			expect(context.showStatus).toHaveBeenCalledWith("Refined continual harness state: 2 edits applied, 1 failed");
+		});
+		expect(context.showStatus).toHaveBeenCalledWith("Harness state: /tmp/harness_state.json");
+	});
+
+	test("shows error status after refine rejects without blocking the caller", async () => {
+		let rejectRefine: ((error: Error) => void) | undefined;
+		const refinePromise = new Promise<never>((_, reject) => {
+			rejectRefine = reject;
+		});
+		const context = {
+			agentConnection: {
+				getSessionStats: vi.fn().mockResolvedValue({ totalMessages: 2 }),
+				refine: vi.fn().mockReturnValue(refinePromise),
+			},
+			stopWorkingLoader: vi.fn(),
+			showStatus: vi.fn(),
+			showWarning: vi.fn(),
+			showError: vi.fn(),
+		};
+
+		await handleRefineCommand.call(context, "focus on validation");
+
+		// The "Refining..." status is shown synchronously.
+		expect(context.showStatus).toHaveBeenCalledWith("Refining local continual harness state...");
+		// The error is NOT shown yet because refine has not rejected.
+		expect(context.showError).not.toHaveBeenCalled();
+
+		rejectRefine?.(new Error("LLM timed out"));
+		await vi.waitFor(() => {
+			expect(context.showError).toHaveBeenCalledWith("Refinement failed: LLM timed out");
+		});
+	});
 });

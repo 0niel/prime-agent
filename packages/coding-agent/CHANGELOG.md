@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Changed long live session opens to render a bounded recent transcript tail while preserving full prompt history ([#343](https://github.com/PrimeIntellect-ai/prime-agent/pull/343) by [@sethkarten](https://github.com/sethkarten)).
+- Changed `/refine` to run planning in the background so the conversation is not blocked during the LLM pass.
 
 ## [0.3.2] - 2026-07-20
 

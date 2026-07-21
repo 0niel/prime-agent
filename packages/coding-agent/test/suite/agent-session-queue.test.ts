@@ -1199,9 +1199,11 @@ describe("AgentSession queue characterization", () => {
 
 			const promptPromise = harness.session.prompt("hello during refine");
 			await new Promise((resolve) => setTimeout(resolve, 10));
-			// The prompt must wait for the refine (its response is still queued);
-			// running now would drop its events while the session is detached.
-			expect(harness.getPendingResponseCount()).toBe(1);
+			// With backgrounded refine planning, the prompt does NOT wait for the
+			// planning LLM pass. It starts immediately and streams its response
+			// while planning is still in flight. The application phase waits for
+			// the agent to be idle before disconnecting and applying.
+			expect(harness.getPendingResponseCount()).toBe(0);
 
 			releasePlan?.();
 			await refinePromise;
