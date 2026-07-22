@@ -1,7 +1,7 @@
 import { Container, resetCapabilitiesCache, setCapabilities, Text, TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { Type } from "typebox";
-import { beforeAll, describe, expect, test } from "vitest";
+import { beforeAll, describe, expect, test, vi } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.js";
 import type { ToolDefinition } from "../src/core/extensions/types.js";
 import { type BashOperations, createBashTool, createBashToolDefinition } from "../src/core/tools/bash.js";
@@ -73,6 +73,27 @@ describe("ToolExecutionComponent parity", () => {
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered).toContain("custom call");
 		expect(rendered).toContain("custom result");
+	});
+
+	test("freezes the final duration when a timed tool settles", () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(6_000);
+			const component = new ToolExecutionComponent(
+				"bash",
+				"tool-timed",
+				{ command: "sleep 5" },
+				{},
+				undefined,
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.markExecutionStarted(1_000);
+			component.updateResult({ content: [{ type: "text", text: "done" }], isError: false });
+			expect(stripAnsi(component.render(100).join("\n"))).toContain("done   5s");
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	test.each(["kitty", null] as const)("renders one compact image metadata row for %s capability", (protocol) => {

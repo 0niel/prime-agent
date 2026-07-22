@@ -1891,6 +1891,7 @@ function mapDaemonSessionSnapshot(snapshot: DaemonSessionSnapshot, replay?: Daem
 		state: snapshot.state,
 		messages: snapshot.messages,
 		...(snapshot.summary.streamingMessage ? { streamingMessage: snapshot.summary.streamingMessage } : {}),
+		...(snapshot.runningToolStartedAt ? { runningToolStartedAt: snapshot.runningToolStartedAt } : {}),
 		lastEventSequence: snapshot.lastEventSequence,
 		lastEventCursor: snapshot.lastEventCursor,
 	};

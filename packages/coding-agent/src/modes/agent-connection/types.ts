@@ -290,6 +290,8 @@ export interface AgentConnectionSnapshot {
 	messages: AgentMessage[];
 	/** In-flight assistant message, kept separate from finalized transcript messages. */
 	streamingMessage?: AgentMessage;
+	/** Start times for tool calls that are actively executing in the streaming message. */
+	runningToolStartedAt?: Record<string, number>;
 	sessionContext?: AgentConnectionSessionContext;
 	sessionTree?: { tree: AgentConnectionSessionTreeNode[]; leafId: string | null };
 	parent?: AgentConnectionParentMetadata;
@@ -511,6 +513,7 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 	label: string;
 	status: AgentConnectionRlmChildAgentStatus;
 	durationMs?: number;
+	startedAt?: number;
 	answerPreview?: string;
 	/** Number of tool executions the subagent has started so far. */
 	toolUseCount?: number;

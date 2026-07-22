@@ -69,6 +69,7 @@ export function createAgentConnectionSnapshot(
 		state: createAgentConnectionState(runtime, activeSessionId),
 		messages: [...session.messages],
 		...(session.state?.streamingMessage ? { streamingMessage: session.state.streamingMessage } : {}),
+		runningToolStartedAt: session.getRunningToolStartedAt(),
 		sessionContext: session.buildSessionContext(),
 		sessionTree: {
 			tree: sessionManager.getTree(),

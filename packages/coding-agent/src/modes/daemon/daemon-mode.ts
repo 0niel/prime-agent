@@ -1807,7 +1807,8 @@ export class AgentDaemon {
 					// Retention can decline if deletion or parent teardown won while the trace
 					// flush was in flight. Persist completion only after retention succeeds, so
 					// a late completion cannot overwrite a durable deletion tombstone.
-					if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
+					const timing = options.parentSession.getRlmChildRunState(options.id);
+					if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session, timing)) {
 						if (runtime.session.sessionFile) {
 							this.recordRlmSubagentRegistryEntry(parentState, {
 								childId: options.id,
@@ -3569,6 +3570,7 @@ export class AgentDaemon {
 			summary: summaryForActiveSession(state),
 			state: connectionState,
 			messages: state.runtime.session.messages,
+			runningToolStartedAt: state.runtime.session.getRunningToolStartedAt(),
 			// Omit duplicate heavy payloads from attach. The client can derive render
 			// context from messages + state, and fetch the full session tree lazily
 			// when the tree/branch selector opens.

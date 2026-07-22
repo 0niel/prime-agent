@@ -261,6 +261,7 @@ export interface RlmChildAgentSnapshot {
 	label: string;
 	status: RlmChildAgentStatus;
 	durationMs?: number;
+	startedAt?: number;
 	answerPreview?: string;
 	/** Number of tool executions the subagent has started so far. */
 	toolUseCount?: number;
@@ -678,6 +679,8 @@ interface RlmChildRun {
 	sessionName: string;
 	sessionDir: string;
 	status: RlmChildAgentStatus;
+	startedAt: number;
+	durationMs?: number;
 	result?: RlmRunResult;
 	error?: string;
 	releaseError?: unknown;
@@ -905,6 +908,7 @@ export class AgentSession {
 	// Inline mode keeps finished child sessions so the inspector can still read them;
 	// the daemon does the same by leaving the child session resident in its registry.
 	private _retainedRlmChildSessions = new Map<string, AgentSession>();
+	private _retainedRlmChildTiming = new Map<string, { startedAt: number; durationMs?: number }>();
 	private _deletedRlmChildIds = new Set<string>();
 	private _retryableRlmSubagentDeletions = new Map<string, RlmSubagentRegistryEntry>();
 	private _deletingRlmChildren = new Map<
@@ -2585,6 +2589,7 @@ export class AgentSession {
 			await session.disposeAsync().catch(() => undefined);
 		}
 		this._retainedRlmChildSessions.clear();
+		this._retainedRlmChildTiming.clear();
 		this._deletedRlmChildIds.clear();
 		this._retryableRlmSubagentDeletions.clear();
 		try {
@@ -2616,6 +2621,7 @@ export class AgentSession {
 				session.dispose();
 			}
 			this._retainedRlmChildSessions.clear();
+			this._retainedRlmChildTiming.clear();
 			this._deletedRlmChildIds.clear();
 			this._retryableRlmSubagentDeletions.clear();
 			this._pendingNextTurnMessages = [];
@@ -2691,6 +2697,10 @@ export class AgentSession {
 	 * Get the names of currently active tools.
 	 * Returns the names of tools currently set on the agent.
 	 */
+	getRunningToolStartedAt(): Record<string, number> {
+		return Object.fromEntries(this.agent.state.runningToolStartedAt);
+	}
+
 	getActiveToolNames(): string[] {
 		return this.agent.state.tools.map((t) => t.name);
 	}
@@ -6399,6 +6409,7 @@ export class AgentSession {
 			return false;
 		}
 		run.status = "cancelled";
+		run.durationMs = Date.now() - run.startedAt;
 		run.error = reason;
 		run.abort();
 		// Surface the cancellation immediately; the run's own terminal update is
@@ -6408,9 +6419,18 @@ export class AgentSession {
 		return true;
 	}
 
-	/** Status of a direct RLM child run, while the run is still tracked. */
+	/** Canonical lifecycle and timing state for an active or retained direct RLM child. */
+	getRlmChildRunState(
+		childId: string,
+	): { status: RlmChildAgentStatus; startedAt: number; durationMs?: number } | undefined {
+		const run = this._activeRlmChildRuns.get(childId);
+		if (run) return { status: run.status, startedAt: run.startedAt, durationMs: run.durationMs };
+		const timing = this._retainedRlmChildTiming.get(childId);
+		return timing ? { status: "done", ...timing } : undefined;
+	}
+
 	getRlmChildRunStatus(childId: string): RlmChildAgentStatus | undefined {
-		return this._activeRlmChildRuns.get(childId)?.status;
+		return this.getRlmChildRunState(childId)?.status;
 	}
 
 	/** Current direct-child registry for the model-facing rlm.list_subagents API. */
@@ -6538,6 +6558,7 @@ export class AgentSession {
 		this._retainedRlmChildUnsubscribes.get(childId)?.();
 		this._retainedRlmChildUnsubscribes.delete(childId);
 		this._retainedRlmChildSessions.delete(childId);
+		this._retainedRlmChildTiming.delete(childId);
 		this._retryableRlmSubagentDeletions.delete(childId);
 		if (!run || this._activeRlmChildRuns.get(childId) === run) {
 			this._activeRlmChildRuns.delete(childId);
@@ -6649,17 +6670,31 @@ export class AgentSession {
 	 * the child) when the parent is already tearing down, so the caller can drop the
 	 * matching event forwarder too.
 	 */
-	retainFinishedRlmChildSession(childId: string, session: AgentSession): boolean {
+	retainFinishedRlmChildSession(
+		childId: string,
+		session: AgentSession,
+		timing: { startedAt: number; durationMs?: number } | undefined = this._activeRlmChildRuns.get(childId),
+	): boolean {
 		// A child can finish concurrently while the parent is (or has) torn down; don't
 		// resurrect the map (it would never be disposed), just drop the child now.
 		if (this._disposed || this._disposing) {
 			void session.disposeAsync().catch(() => undefined);
 			return false;
 		}
-		if (this._deletingRlmChildren.has(childId) || this._deletedRlmChildIds.has(childId)) {
+		if (
+			this._deletingRlmChildren.has(childId) ||
+			this._deletedRlmChildIds.has(childId) ||
+			this._retryableRlmSubagentDeletions.has(childId)
+		) {
 			return false;
 		}
 		this._retainedRlmChildSessions.set(childId, session);
+		if (timing) {
+			this._retainedRlmChildTiming.set(childId, {
+				startedAt: timing.startedAt,
+				durationMs: timing.durationMs,
+			});
+		}
 		return true;
 	}
 
@@ -6864,7 +6899,6 @@ export class AgentSession {
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		const label = rlmChildLabel(prompt);
 		let answerPreview: string | undefined;
-		let durationMs: number | undefined;
 		let toolUseCount = 0;
 		let runningToolCount = 0;
 		let activity: RlmChildAgentActivity | undefined;
@@ -6877,6 +6911,7 @@ export class AgentSession {
 			sessionName,
 			sessionDir: childSessionDir,
 			status: "running",
+			startedAt,
 			abort: noopRlmChildAbort,
 		};
 		this._activeRlmChildRuns.set(run.id, run);
@@ -6892,7 +6927,8 @@ export class AgentSession {
 					model: `${childModel.provider}/${childModel.id}`,
 					label,
 					status: run.status,
-					durationMs,
+					durationMs: run.durationMs,
+					startedAt,
 					answerPreview,
 					toolUseCount: toolUseCount > 0 ? toolUseCount : undefined,
 					tokenCount: childSession?._contextTokensForCurrentMessages(),
@@ -7010,7 +7046,7 @@ export class AgentSession {
 				const assistantUsage = child._assistantUsageForCurrentMessages();
 				this._attributeRlmChildUsageToParent(assistantUsage, parentAssistantForUsage);
 				run.status = "done";
-				durationMs = Date.now() - startedAt;
+				run.durationMs = Date.now() - run.startedAt;
 				activity = undefined;
 				const compactAnswer = compactRlmText(answer);
 				if (compactAnswer) {
@@ -7030,9 +7066,9 @@ export class AgentSession {
 			} catch (error) {
 				if (run.status !== "cancelled") {
 					run.status = "error";
+					run.durationMs = Date.now() - run.startedAt;
+					run.error = error instanceof Error ? error.message : String(error);
 				}
-				durationMs = Date.now() - startedAt;
-				run.error = error instanceof Error ? error.message : String(error);
 				activity = undefined;
 				emitChildUpdate();
 				throw error;
@@ -7078,7 +7114,7 @@ export class AgentSession {
 						!this._disposing &&
 						!this._deletedRlmChildIds.has(run.id)
 					) {
-						this._retainedRlmChildSessions.set(run.id, childSession);
+						this.retainFinishedRlmChildSession(run.id, childSession, run);
 					} else if (
 						run.releaseError &&
 						releaseStatus !== "done" &&

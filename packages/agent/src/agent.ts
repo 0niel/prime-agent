@@ -57,15 +57,24 @@ const DEFAULT_MODEL = {
 
 type QueueMode = "all" | "one-at-a-time";
 
-type MutableAgentState = Omit<AgentState, "isStreaming" | "streamingMessage" | "pendingToolCalls" | "errorMessage"> & {
+type MutableAgentState = Omit<
+	AgentState,
+	"isStreaming" | "streamingMessage" | "pendingToolCalls" | "runningToolStartedAt" | "errorMessage"
+> & {
 	isStreaming: boolean;
 	streamingMessage?: AgentMessage;
 	pendingToolCalls: Set<string>;
+	runningToolStartedAt: Map<string, number>;
 	errorMessage?: string;
 };
 
 function createMutableAgentState(
-	initialState?: Partial<Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">>,
+	initialState?: Partial<
+		Omit<
+			AgentState,
+			"pendingToolCalls" | "runningToolStartedAt" | "isStreaming" | "streamingMessage" | "errorMessage"
+		>
+	>,
 ): MutableAgentState {
 	let tools = initialState?.tools?.slice() ?? [];
 	let messages = initialState?.messages?.slice() ?? [];
@@ -90,13 +99,19 @@ function createMutableAgentState(
 		isStreaming: false,
 		streamingMessage: undefined,
 		pendingToolCalls: new Set<string>(),
+		runningToolStartedAt: new Map<string, number>(),
 		errorMessage: undefined,
 	};
 }
 
 /** Options for constructing an {@link Agent}. */
 export interface AgentOptions {
-	initialState?: Partial<Omit<AgentState, "pendingToolCalls" | "isStreaming" | "streamingMessage" | "errorMessage">>;
+	initialState?: Partial<
+		Omit<
+			AgentState,
+			"pendingToolCalls" | "runningToolStartedAt" | "isStreaming" | "streamingMessage" | "errorMessage"
+		>
+	>;
 	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 	streamFn?: StreamFn;
@@ -339,6 +354,7 @@ export class Agent {
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
+		this._state.runningToolStartedAt = new Map<string, number>();
 		this._state.errorMessage = undefined;
 		this.clearFollowUpQueue();
 		this.clearSteeringQueue();
@@ -546,6 +562,7 @@ export class Agent {
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
+		this._state.runningToolStartedAt = new Map<string, number>();
 		this.activeRun?.resolve();
 		this.activeRun = undefined;
 	}
@@ -573,9 +590,13 @@ export class Agent {
 				break;
 
 			case "tool_execution_start": {
+				event.startedAt ??= Date.now();
 				const pendingToolCalls = new Set(this._state.pendingToolCalls);
 				pendingToolCalls.add(event.toolCallId);
 				this._state.pendingToolCalls = pendingToolCalls;
+				const runningToolStartedAt = new Map(this._state.runningToolStartedAt);
+				runningToolStartedAt.set(event.toolCallId, event.startedAt);
+				this._state.runningToolStartedAt = runningToolStartedAt;
 				break;
 			}
 
@@ -583,6 +604,9 @@ export class Agent {
 				const pendingToolCalls = new Set(this._state.pendingToolCalls);
 				pendingToolCalls.delete(event.toolCallId);
 				this._state.pendingToolCalls = pendingToolCalls;
+				const runningToolStartedAt = new Map(this._state.runningToolStartedAt);
+				runningToolStartedAt.delete(event.toolCallId);
+				this._state.runningToolStartedAt = runningToolStartedAt;
 				break;
 			}
 

@@ -35,7 +35,7 @@ type RenderSessionContextThis = {
 	ipythonToolComponents: Map<string, ToolExecutionComponent>;
 	lateIpythonSentAgentMessages: Map<string, unknown[]>;
 	pendingToolCreations: Set<string>;
-	startedToolCalls: Set<string>;
+	toolExecutionStarts: Map<string, number | undefined>;
 	resetPendingToolState(): void;
 	chatContainer: Container;
 	footer: { invalidate(): void };
@@ -68,17 +68,17 @@ function createFakeInteractiveModeThis(): RenderSessionContextThis {
 	const chatContainer = new Container();
 	const pendingTools = new Map<string, ToolExecutionComponent>();
 	const pendingToolCreations = new Set<string>();
-	const startedToolCalls = new Set<string>();
+	const toolExecutionStarts = new Map<string, number | undefined>();
 	const fakeThis: RenderSessionContextThis = {
 		pendingTools,
 		ipythonToolComponents: new Map(),
 		lateIpythonSentAgentMessages: new Map(),
 		pendingToolCreations,
-		startedToolCalls,
+		toolExecutionStarts,
 		resetPendingToolState() {
 			pendingTools.clear();
 			pendingToolCreations.clear();
-			startedToolCalls.clear();
+			toolExecutionStarts.clear();
 		},
 		chatContainer,
 		footer: { invalidate: vi.fn() },
@@ -188,6 +188,9 @@ describe("InteractiveMode.renderSessionContext", () => {
 		);
 
 		expect(fakeThis.pendingTools.size).toBe(0);
-		expect(renderChat(fakeThis.chatContainer)).toContain("HISTORICAL_RESULT");
+		const rendered = renderChat(fakeThis.chatContainer);
+		expect(rendered).toContain("HISTORICAL_RESULT");
+		expect(rendered).toContain(`${TOOL_NAME} · done`);
+		expect(rendered).not.toContain("done   0s");
 	});
 });

@@ -639,6 +639,7 @@ async function executeToolCallsSequential(
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
 			args: toolCall.arguments,
+			startedAt: Date.now(),
 		});
 
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
@@ -694,6 +695,7 @@ async function executeToolCallsParallel(
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
 			args: toolCall.arguments,
+			startedAt: Date.now(),
 		});
 
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);

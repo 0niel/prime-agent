@@ -571,6 +571,7 @@ interface CreateAttachResultOptions {
 	state?: AgentConnectionState;
 	messages?: AgentMessage[];
 	streamingMessage?: AgentMessage;
+	runningToolStartedAt?: Record<string, number>;
 	sessionContext?: DaemonAttachResult["snapshot"]["sessionContext"];
 	omitSessionContext?: boolean;
 	sessionTree?: DaemonAttachResult["snapshot"]["sessionTree"];
@@ -612,6 +613,7 @@ function createAttachResult(
 			summary,
 			state,
 			messages,
+			...(options.runningToolStartedAt ? { runningToolStartedAt: options.runningToolStartedAt } : {}),
 			...(options.omitSessionContext
 				? {}
 				: {
@@ -1254,6 +1256,7 @@ describe("DaemonAgentConnection", () => {
 			state: { ...createConnectionState("active-1", "session-current"), isStreaming: true },
 			messages,
 			streamingMessage,
+			runningToolStartedAt: { "tool-1": 1_000 },
 		}).snapshot;
 
 		fakeClient.emitMessage({
@@ -1277,6 +1280,7 @@ describe("DaemonAgentConnection", () => {
 					state: expect.objectContaining({ sessionId: "session-current" }),
 					messages,
 					streamingMessage,
+					runningToolStartedAt: { "tool-1": 1_000 },
 					lastEventSequence: 13,
 				}),
 			},

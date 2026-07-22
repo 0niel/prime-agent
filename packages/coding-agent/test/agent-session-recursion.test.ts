@@ -463,9 +463,36 @@ describe("AgentSession rlm recursion", () => {
 		expect(childUpdates[0]?.label).toBe("summarize shard 1");
 		const doneUpdate = [...childUpdates].reverse().find((update) => update.status === "done");
 		expect(doneUpdate?.answerPreview).toBe("child answer: summarize shard 1");
+		const childId = root.listRlmSubagents().subagents[0]?.rlm_child_id;
+		expect(childId ? root.getRlmChildRunState(childId) : undefined).toMatchObject({
+			status: "done",
+			startedAt: expect.any(Number),
+			durationMs: expect.any(Number),
+		});
 		// Context tokens from the child's own assistant usage (input 7 + output 3); no tools ran.
 		expect(doneUpdate?.tokenCount).toBe(10);
 		expect(doneUpdate?.toolUseCount).toBeUndefined();
+	});
+
+	it("retains canonical timing when successful runtime release fails", async () => {
+		const hostedChild = createSession();
+		const root = createSession({
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => ({ session: hostedChild }),
+				deleteRlmSubagentRuntime: async () => {},
+				releaseRlmSubagentRuntime: async () => {
+					throw new Error("release failed");
+				},
+			},
+		});
+
+		await expect(root.runRlmChild("successful work")).rejects.toThrow("release failed");
+		const childId = root.listRlmSubagents().subagents[0]?.rlm_child_id;
+		expect(childId ? root.getRlmChildRunState(childId) : undefined).toMatchObject({
+			status: "done",
+			startedAt: expect.any(Number),
+			durationMs: expect.any(Number),
+		});
 	});
 
 	it("lists a completed child with its parent-scoped messaging identity until disposal", async () => {
@@ -974,11 +1001,15 @@ describe("AgentSession rlm recursion", () => {
 
 		const runPromise = root.runRlmChild("slow release", { name: "release-worker" });
 		await waitFor(() => childStarted);
+		const childId = root.listRlmSubagents().subagents[0]?.rlm_child_id;
+		if (!childId) throw new Error("Missing running child");
 		const runFailure = expect(runPromise).rejects.toThrow("Deleted by parent orchestrator");
 		const deletion = root.deleteRlmSubagent("release-worker");
 		expect(root.listRlmSubagents()).toEqual({ subagents: [] });
 		await expect(deletion).rejects.toThrow("close failed");
 		await runFailure;
+		// Completion must not retain or re-publish a child hidden behind a failed deletion.
+		expect(root.retainFinishedRlmChildSession(childId, hostedChild)).toBe(false);
 		expect((root as unknown as InspectableRlmSession)._activeRlmChildRuns.size).toBe(0);
 		expect(root.listRlmSubagents()).toEqual({ subagents: [] });
 

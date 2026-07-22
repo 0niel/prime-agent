@@ -77,7 +77,23 @@ describe("Agent", () => {
 		expect(agent.state.isStreaming).toBe(false);
 		expect(agent.state.streamingMessage).toBe(undefined);
 		expect(agent.state.pendingToolCalls).toEqual(new Set());
+		expect(agent.state.runningToolStartedAt).toEqual(new Map());
 		expect(agent.state.errorMessage).toBeUndefined();
+	});
+
+	it("should reset pending tool lifecycle state together", () => {
+		const agent = new Agent();
+		const state = agent.state as unknown as {
+			pendingToolCalls: Set<string>;
+			runningToolStartedAt: Map<string, number>;
+		};
+		state.pendingToolCalls.add("tool-1");
+		state.runningToolStartedAt.set("tool-1", 1_000);
+
+		agent.reset();
+
+		expect(agent.state.pendingToolCalls.size).toBe(0);
+		expect(agent.state.runningToolStartedAt.size).toBe(0);
 	});
 
 	it("should create an agent instance with custom initial state", () => {
@@ -355,6 +371,8 @@ describe("Agent", () => {
 		});
 		agent.subscribe((event) => {
 			if (event.type === "tool_execution_start") {
+				expect(event.startedAt).toEqual(expect.any(Number));
+				expect(agent.state.runningToolStartedAt.get(event.toolCallId)).toBe(event.startedAt);
 				toolStarted();
 			}
 		});
@@ -373,6 +391,7 @@ describe("Agent", () => {
 			expect(toolResult.content).toEqual([{ type: "text", text: "Tool execution aborted" }]);
 		}
 		expect(agent.state.pendingToolCalls.size).toBe(0);
+		expect(agent.state.runningToolStartedAt.size).toBe(0);
 		expect(agent.state.isStreaming).toBe(false);
 	});
 

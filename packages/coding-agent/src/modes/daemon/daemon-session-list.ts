@@ -311,10 +311,9 @@ function rlmChildSnapshotForActiveSession(
 	// a daemon-hosted child whose agent is momentarily idle is still part of an
 	// active run. The streaming heuristic only covers parents the daemon does
 	// not host (e.g. children attributed to a session created by an older build).
-	const runStatus = metadata.rlmChildId
-		? parent?.runtime.session.getRlmChildRunStatus(metadata.rlmChildId)
-		: undefined;
-	const status = runStatus ?? (session.isStreaming || effectivePendingMessageCount(session) > 0 ? "running" : "done");
+	const runState = metadata.rlmChildId ? parent?.runtime.session.getRlmChildRunState(metadata.rlmChildId) : undefined;
+	const status =
+		runState?.status ?? (session.isStreaming || effectivePendingMessageCount(session) > 0 ? "running" : "done");
 	return {
 		id: metadata.rlmChildId ?? activeSession.activeSessionId,
 		parentId: parentNodeId,
@@ -323,6 +322,8 @@ function rlmChildSnapshotForActiveSession(
 		model: session.model ? `${session.model.provider}/${session.model.id}` : undefined,
 		label: rlmChildLabel(metadata.prompt ?? ""),
 		status,
+		startedAt: runState?.startedAt ?? metadata.createdAt,
+		durationMs: runState?.durationMs,
 		answerPreview,
 		toolUseCount: toolUseCount > 0 ? toolUseCount : undefined,
 		tokenCount: session._contextTokensForCurrentMessages(),

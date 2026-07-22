@@ -233,7 +233,7 @@ import {
 	type ThemeColor,
 	theme,
 } from "./theme/theme.js";
-import { setWorkingPulseFrame, WORKING_ICON_INTERVAL_MS } from "./theme/working-icon.js";
+import { formatLiveDuration, setWorkingPulseFrame, WORKING_ICON_INTERVAL_MS } from "./theme/working-icon.js";
 
 /** Interface for components that can be expanded/collapsed */
 interface Expandable {
@@ -321,6 +321,12 @@ export function mergeChildAgentSnapshots(
 		sessionName: incoming.sessionName ?? previous.sessionName,
 		model: incoming.model ?? previous.model,
 		durationMs: incoming.durationMs ?? previous.durationMs,
+		startedAt:
+			incoming.startedAt === undefined
+				? previous.startedAt
+				: previous.startedAt === undefined
+					? incoming.startedAt
+					: Math.min(previous.startedAt, incoming.startedAt),
 		answerPreview: incoming.answerPreview ?? previous.answerPreview,
 		toolUseCount:
 			incoming.toolUseCount === undefined
@@ -347,6 +353,7 @@ function childAgentSummaryChanged(
 		previous.label !== next.label ||
 		previous.status !== next.status ||
 		previous.durationMs !== next.durationMs ||
+		previous.startedAt !== next.startedAt ||
 		previous.toolUseCount !== next.toolUseCount ||
 		previousTokens !== nextTokens ||
 		previous.recap !== next.recap ||
@@ -885,7 +892,7 @@ export class InteractiveMode {
 	private ipythonToolComponents = new Map<string, ToolExecutionComponent>();
 	private lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	private pendingToolCreations = new Set<string>();
-	private startedToolCalls = new Set<string>();
+	private toolExecutionStarts = new Map<string, number>();
 	private pendingToolGeneration = 0;
 	private toolDefinitionCache = new Map<string, ToolExecutionDefinition | undefined>();
 	private agentRunFileChanges = new Map<string, FileChangeSummary>();
@@ -2728,7 +2735,7 @@ export class InteractiveMode {
 		this.pendingToolGeneration++;
 		this.pendingTools.clear();
 		this.pendingToolCreations.clear();
-		this.startedToolCalls.clear();
+		this.toolExecutionStarts.clear();
 	}
 
 	private async renderCurrentSessionState(): Promise<void> {
@@ -2747,6 +2754,7 @@ export class InteractiveMode {
 		await this.renderSessionContext(this.getSessionContextFromConnectionSnapshot(snapshot), {
 			clearChat: true,
 			updateFooter: true,
+			...(snapshot.runningToolStartedAt ? { runningToolStartedAt: snapshot.runningToolStartedAt } : {}),
 		});
 		await this.restoreStreamingMessageFromSnapshot(snapshot.streamingMessage);
 		await this.refreshConnectionQueue();
@@ -2838,9 +2846,8 @@ export class InteractiveMode {
 				this.getCurrentCwd(),
 			);
 			component.setExpanded(this.toolOutputExpanded);
-			if (this.startedToolCalls.has(latestToolCall.id)) {
-				component.markExecutionStarted();
-			}
+			const startedAt = this.toolExecutionStarts.get(latestToolCall.id);
+			if (startedAt !== undefined) component.markExecutionStarted(startedAt);
 			selectLatestToolExpandHint(this.chatContainer.children, component);
 			this.chatContainer.addChild(component);
 			this.pendingTools.set(latestToolCall.id, component);
@@ -2963,9 +2970,7 @@ export class InteractiveMode {
 
 	private getWorkingLoaderMessage(): string {
 		const elapsed =
-			this.workingStartedAt === undefined
-				? undefined
-				: this.formatWorkingElapsed(Date.now() - this.workingStartedAt);
+			this.workingStartedAt === undefined ? undefined : formatLiveDuration(Date.now() - this.workingStartedAt);
 		const status = this.activityTracker.getStatus();
 		// The subagent count/recaps live in the tree above the loader, so the loader
 		// message itself no longer repeats "N subagents running".
@@ -2994,16 +2999,6 @@ export class InteractiveMode {
 			this.getWorkingLoaderMessage(),
 			this.workingIndicatorOptions,
 		);
-	}
-
-	private formatWorkingElapsed(elapsedMs: number): string {
-		const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
-		if (totalSeconds < 60) {
-			return `${totalSeconds}s`;
-		}
-		const minutes = Math.floor(totalSeconds / 60);
-		const seconds = totalSeconds % 60;
-		return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
 	}
 
 	private updateWorkingLoaderMessage(): void {
@@ -4907,7 +4902,7 @@ export class InteractiveMode {
 						const elapsedSuffix =
 							this.workingStartedAt === undefined
 								? ""
-								: ` · ${this.formatWorkingElapsed(Date.now() - this.workingStartedAt)}`;
+								: ` · ${formatLiveDuration(Date.now() - this.workingStartedAt)}`;
 						errorMessage =
 							retryAttempt > 0
 								? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}${elapsedSuffix}`
@@ -4941,7 +4936,7 @@ export class InteractiveMode {
 				break;
 
 			case "tool_execution_start": {
-				this.startedToolCalls.add(event.toolCallId);
+				if (event.startedAt !== undefined) this.toolExecutionStarts.set(event.toolCallId, event.startedAt);
 				let component = this.pendingTools.get(event.toolCallId);
 				if (!component) {
 					component = await this.getOrCreatePendingToolComponent({
@@ -4950,9 +4945,7 @@ export class InteractiveMode {
 						arguments: event.args,
 					});
 				}
-				if (component) {
-					component.markExecutionStarted();
-				}
+				component?.markExecutionStarted(event.startedAt);
 				this.ui.requestRender();
 				break;
 			}
@@ -4971,7 +4964,7 @@ export class InteractiveMode {
 				if (component) {
 					component.updateResult({ ...event.result, isError: event.isError });
 					this.pendingTools.delete(event.toolCallId);
-					this.startedToolCalls.delete(event.toolCallId);
+					this.toolExecutionStarts.delete(event.toolCallId);
 					this.ui.requestRender();
 				}
 				break;
@@ -5775,6 +5768,7 @@ export class InteractiveMode {
 			label: child.label,
 			status: child.status,
 			durationMs: child.durationMs,
+			startedAt: child.startedAt,
 			answerPreview: child.answerPreview,
 			toolUseCount: child.toolUseCount,
 			tokenCount: child.tokenCount,
@@ -6053,9 +6047,13 @@ export class InteractiveMode {
 			populateHistory?: boolean;
 			clearChat?: boolean;
 			limitTranscript?: boolean;
+			runningToolStartedAt?: Record<string, number>;
 		} = {},
 	): Promise<void> {
 		this.resetPendingToolState();
+		for (const [toolCallId, startedAt] of Object.entries(options.runningToolStartedAt ?? {})) {
+			this.toolExecutionStarts.set(toolCallId, startedAt);
+		}
 		const messagesToRender = options.limitTranscript
 			? initialRenderMessages(sessionContext.messages)
 			: sessionContext.messages;
@@ -6126,6 +6124,8 @@ export class InteractiveMode {
 							this.getCurrentCwd(),
 						);
 						component.setExpanded(this.toolOutputExpanded);
+						const startedAt = options.runningToolStartedAt?.[content.id];
+						if (startedAt !== undefined) component.markExecutionStarted(startedAt);
 						selectLatestToolExpandHint(this.chatContainer.children, component);
 						this.chatContainer.addChild(component);
 						this.registerIpythonToolComponent(content.name, content.id, component);
@@ -6181,6 +6181,7 @@ export class InteractiveMode {
 			updateFooter: true,
 			populateHistory: true,
 			limitTranscript: true,
+			...(snapshot.runningToolStartedAt ? { runningToolStartedAt: snapshot.runningToolStartedAt } : {}),
 		});
 		await this.restoreStreamingMessageFromSnapshot(streamingMessage);
 
@@ -6197,7 +6198,6 @@ export class InteractiveMode {
 			this.startAssistantStreamingMessage(message);
 			for (const content of message.content) {
 				if (content.type === "toolCall") {
-					this.startedToolCalls.add(content.id);
 					await this.getOrCreatePendingToolComponent(content);
 				}
 			}

@@ -270,6 +270,11 @@ describe("daemon mode helpers", () => {
 			});
 			const parentState = makeState("parent");
 			const parentSession = makeRuntimeSession(parentManager);
+			vi.mocked(parentSession.getRlmChildRunState).mockReturnValue({
+				status: "done",
+				startedAt: 500,
+				durationMs: 750,
+			});
 			parentState.runtime = {
 				...parentState.runtime,
 				metadata: { kind: "top-level", createdAt: 1 },
@@ -353,7 +358,11 @@ describe("daemon mode helpers", () => {
 				status: "active",
 				runCount: 0,
 			});
-			expect(parentSession.retainFinishedRlmChildSession).toHaveBeenCalledWith("child-1", childSession);
+			expect(parentSession.retainFinishedRlmChildSession).toHaveBeenCalledWith("child-1", childSession, {
+				status: "done",
+				startedAt: 500,
+				durationMs: 750,
+			});
 			const dueRuns = await internals.cronScheduler.runDue(new Date("2026-07-16T00:00:00.000Z"));
 			expect(dueRuns).toBe(1);
 			expect(promptHeartbeat).toHaveBeenCalledOnce();
@@ -5631,6 +5640,7 @@ function makeRuntimeSession(
 		},
 		setSubagentRuntimeHost: vi.fn(),
 		getRlmChildRunStatus: vi.fn(() => "running"),
+		getRlmChildRunState: vi.fn(() => undefined),
 		retainFinishedRlmChildSession: vi.fn(() => true),
 		subscribe: vi.fn(() => vi.fn()),
 		bindExtensions: vi.fn(async () => {}),

@@ -11,7 +11,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { AGENT_ACTIVITY_LABELS, formatTokenCount } from "../agent-activity.js";
 import { theme } from "../theme/theme.js";
-import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
+import { formatDuration, formatLiveDuration, getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
 import { keyText } from "./keybinding-hints.js";
 
 export type ChildAgentStatus = "queued" | "running" | "done" | "error" | "cancelled";
@@ -32,6 +32,7 @@ export interface ChildAgentInspectorNode {
 	label: string;
 	status: ChildAgentStatus;
 	durationMs?: number;
+	startedAt?: number;
 	answerPreview?: string;
 	toolUseCount?: number;
 	tokenCount?: number;
@@ -176,19 +177,14 @@ function formatChildAgentStatusIcon(node: ChildAgentInspectorNode, icon: string)
 	}
 }
 
-function formatChildAgentDuration(durationMs: number | undefined): string {
-	if (durationMs === undefined) {
+function formatChildAgentDuration(node: ChildAgentInspectorNode): string {
+	if (node.status === "running" || node.status === "queued") {
+		if (node.startedAt !== undefined) return formatLiveDuration(Date.now() - node.startedAt);
+		// Fall back to durationMs for daemon-seeded snapshots that lack startedAt.
+		if (node.durationMs !== undefined) return formatDuration(node.durationMs);
 		return "";
 	}
-	const seconds = Math.max(0, Math.floor(durationMs / 1000));
-	if (seconds < 60) {
-		return `${seconds}s`;
-	}
-	const minutes = Math.floor(seconds / 60);
-	if (minutes < 60) {
-		return `${minutes}m`;
-	}
-	return `${Math.floor(minutes / 60)}h`;
+	return node.durationMs !== undefined ? formatDuration(node.durationMs) : "";
 }
 
 function childAgentRecap(node: ChildAgentInspectorNode): string {
@@ -242,10 +238,9 @@ const SUMMARY_PROMPT_MAX_WIDTH = 24;
 const SUMMARY_RECAP_MIN_WIDTH = 12;
 const SUMMARY_MODEL_WIDTH = 20;
 const SUMMARY_TOKENS_WIDTH = 8;
-const SUMMARY_DURATION_WIDTH = 4;
+const SUMMARY_DURATION_MIN_WIDTH = 4;
 const SUMMARY_TOKEN_TIME_GAP = 2;
-const SUMMARY_METRICS_WIDTH =
-	SUMMARY_MODEL_WIDTH + 1 + SUMMARY_TOKENS_WIDTH + SUMMARY_TOKEN_TIME_GAP + SUMMARY_DURATION_WIDTH;
+const SUMMARY_METRICS_BASE_WIDTH = SUMMARY_MODEL_WIDTH + 1 + SUMMARY_TOKENS_WIDTH + SUMMARY_TOKEN_TIME_GAP;
 // Opening chars of the prompt kept for context before eliding a shared prefix.
 const PROMPT_LEADING_CONTEXT = 6;
 // Words of context kept on each side of the divergence.
@@ -400,7 +395,13 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 		const window = flat.slice(clampedStart, clampedStart + SUMMARY_VISIBLE_ROWS);
 
 		const agentWidth = `S${flat.length}`.length;
-		const fixedWidth = SUMMARY_LIST_INDENT + 2 + agentWidth + SUMMARY_COLUMN_GAP * 3 + SUMMARY_METRICS_WIDTH;
+		const durations = new Map(window.map((entry) => [entry.node.id, formatChildAgentDuration(entry.node)]));
+		const durationWidth = Math.max(
+			SUMMARY_DURATION_MIN_WIDTH,
+			...[...durations.values()].map((duration) => visibleWidth(duration)),
+		);
+		const fixedWidth =
+			SUMMARY_LIST_INDENT + 2 + agentWidth + SUMMARY_COLUMN_GAP * 3 + SUMMARY_METRICS_BASE_WIDTH + durationWidth;
 		const flexibleWidth = Math.max(0, contentWidth - fixedWidth);
 		const recapMinimum = Math.min(SUMMARY_RECAP_MIN_WIDTH, Math.floor(flexibleWidth / 2));
 		const promptTarget = Math.min(SUMMARY_PROMPT_MAX_WIDTH, Math.max(10, Math.floor(flexibleWidth * 0.34)));
@@ -415,7 +416,17 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 			const number = flat.indexOf(entry) + 1;
 			lines.push(
 				this.panelLine(
-					this.renderListEntry(entry, number, agentWidth, promptPrefix, promptSuffix, promptWidth, recapWidth),
+					this.renderListEntry(
+						entry,
+						number,
+						agentWidth,
+						promptPrefix,
+						promptSuffix,
+						promptWidth,
+						recapWidth,
+						durations.get(entry.node.id) ?? "",
+						durationWidth,
+					),
 					width,
 					selected,
 				),
@@ -481,6 +492,8 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 		sharedSuffix: string,
 		promptWidth: number,
 		recapWidth: number,
+		duration: string,
+		durationWidth: number,
 	): string {
 		const indent = " ".repeat(SUMMARY_LIST_INDENT);
 		// Running rows pulse the shared working glyph; other states stay static.
@@ -496,10 +509,9 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 		const recapCell = theme.fg("muted", padTableCell(childAgentRecap(entry.node), recapWidth, "…"));
 		const model = childAgentModelLabel(entry.node.model);
 		const tokens = entry.node.tokenCount === undefined ? "" : `${formatTokenCount(entry.node.tokenCount)} tok`;
-		const duration = formatChildAgentDuration(entry.node.durationMs);
 		const modelCell = padTableCell(truncateModelLabel(model, SUMMARY_MODEL_WIDTH), SUMMARY_MODEL_WIDTH);
 		const tokensCell = padTableCell(tokens, SUMMARY_TOKENS_WIDTH, "…");
-		const durationCell = padTableCell(duration, SUMMARY_DURATION_WIDTH, "…");
+		const durationCell = padTableCell(duration, durationWidth, "…");
 		const metrics = `${modelCell} ${tokensCell}${" ".repeat(SUMMARY_TOKEN_TIME_GAP)}${durationCell}`;
 		const gap = " ".repeat(SUMMARY_COLUMN_GAP);
 		return `${indent}${icon} ${agentCell}${gap}${promptCell}${gap}${recapCell}${gap}${theme.fg("muted", metrics)}`;
@@ -730,17 +742,11 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 	}
 
 	private panelStatusLabel(node: ChildAgentInspectorNode): string {
-		if (node.status === "queued") {
-			return AGENT_ACTIVITY_LABELS.waiting;
-		}
-		switch (node.activity?.kind) {
-			case "executing":
-				return AGENT_ACTIVITY_LABELS.executing;
-			case "writing":
-				return AGENT_ACTIVITY_LABELS.writing;
-			default:
-				return AGENT_ACTIVITY_LABELS.waiting;
-		}
+		const activity = node.status === "queued" ? "waiting" : (node.activity?.kind ?? "waiting");
+		const label = activity === "executing" ? AGENT_ACTIVITY_LABELS.executing : AGENT_ACTIVITY_LABELS[activity];
+		return node.startedAt === undefined
+			? label
+			: `${label} ${formatLiveDuration(Date.now() - node.startedAt).padStart(7)}`;
 	}
 
 	private indent(line: string, width: number, spaces = CONTENT_INDENT): string {

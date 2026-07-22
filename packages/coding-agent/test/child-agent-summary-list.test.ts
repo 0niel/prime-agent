@@ -1,5 +1,5 @@
 import { setKeybindings, visibleWidth } from "@earendil-works/pi-tui";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
 import {
 	ChildAgentDetailComponent,
@@ -204,6 +204,28 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		summary.setNodes([{ ...node("a"), tokenCount: 41_000, durationMs: 5_000 }]);
 		const out = stripAnsi(summary.render(80).join("\n"));
 		expect(out).toMatch(/41k tok\s{3}5s/);
+	});
+
+	it("renders the full live clock when its width grows", () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(600_000);
+			const summary = new ChildAgentSummaryComponent();
+			summary.setNodes([{ ...node("a"), startedAt: 0 }]);
+			const output = stripAnsi(summary.render(80).join("\n"));
+			expect(output).toContain("10:00");
+			expect(output).not.toContain("10:…");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("preserves running detail timers across refreshes", () => {
+		const detail = new ChildAgentDetailComponent();
+		const startedAt = Date.now() - 61_000;
+		detail.setNode({ ...node("a"), startedAt });
+		detail.setNode({ ...node("a"), startedAt, activity: { kind: "executing", toolName: "ipython" } });
+		expect(stripAnsi(detail.render(100).join("\n"))).toContain("   1:01");
 	});
 
 	it("shows the model to the right of the back action in detail view", () => {

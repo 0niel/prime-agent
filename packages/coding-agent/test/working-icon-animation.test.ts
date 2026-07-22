@@ -2,6 +2,8 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { IPythonCellComponent } from "../src/modes/interactive/components/ipython-cell.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 import {
+	formatDuration,
+	formatLiveDuration,
 	setWorkingPulseFrame,
 	WORKING_ICON_FRAMES,
 	workingIconFrame,
@@ -18,6 +20,26 @@ describe("workingIconFrame", () => {
 		}
 		expect(workingIconFrame(WORKING_ICON_FRAMES.length)).toBe(WORKING_ICON_FRAMES[0]);
 		expect(workingIconFrame(-1)).toBe(WORKING_ICON_FRAMES[WORKING_ICON_FRAMES.length - 1]);
+	});
+});
+
+describe("timer duration formatting", () => {
+	it.each([
+		[59_000, "59s"],
+		[60_000, "1:00"],
+		[61_000, "1:01"],
+		[3_600_000, "1:00:00"],
+		[3_661_000, "1:01:01"],
+	])("keeps live timers second-precise for %i ms", (durationMs, expected) => {
+		expect(formatLiveDuration(durationMs)).toBe(expected);
+	});
+
+	it.each([
+		[59_000, "59s"],
+		[60_000, "1m"],
+		[3_600_000, "1h"],
+	])("keeps settled durations compact for %i ms", (durationMs, expected) => {
+		expect(formatDuration(durationMs)).toBe(expected);
 	});
 });
 

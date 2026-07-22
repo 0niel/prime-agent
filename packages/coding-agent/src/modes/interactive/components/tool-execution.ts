@@ -8,7 +8,7 @@ import { createAllToolDefinitions } from "../../../core/tools/index.js";
 import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.js";
 import type { AgentConnectionToolDefinition } from "../../agent-connection/index.js";
 import { type Theme, theme } from "../theme/theme.js";
-import { getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
+import { formatDuration, formatLiveDuration, getWorkingPulseFrame, workingIconFrame } from "../theme/working-icon.js";
 import { getIpythonCodeFromArgs, IPythonCellComponent } from "./ipython-cell.js";
 import { ToolPanel } from "./tool-panel.js";
 
@@ -87,6 +87,8 @@ export class ToolExecutionComponent extends Container {
 	private ui: TUI;
 	private cwd: string;
 	private executionStarted = false;
+	private executionStartedAt: number | undefined;
+	private finalDurationMs: number | undefined;
 	private argsComplete = false;
 	private pendingSentAgentMessages: KernelSentAgentMessage[] = [];
 	private result?: {
@@ -212,8 +214,9 @@ export class ToolExecutionComponent extends Container {
 		this.updateDisplay();
 	}
 
-	markExecutionStarted(): void {
+	markExecutionStarted(startedAt?: number): void {
 		this.executionStarted = true;
+		this.executionStartedAt ??= startedAt;
 		this.updateDisplay();
 		this.ui.requestRender();
 	}
@@ -248,6 +251,9 @@ export class ToolExecutionComponent extends Container {
 		}
 		this.result = sentAgentMessages.length > 0 ? { ...result, details: { ...details, sentAgentMessages } } : result;
 		this.isPartial = isPartial;
+		if (!isPartial && this.executionStartedAt !== undefined && this.finalDurationMs === undefined) {
+			this.finalDurationMs = Date.now() - this.executionStartedAt;
+		}
 		this.updateDisplay();
 	}
 
@@ -461,13 +467,21 @@ export class ToolExecutionComponent extends Container {
 
 	private panelStatus(): string {
 		if (this.result && !this.isPartial) {
-			return this.result.isError ? theme.fg("error", "error") : theme.fg("success", "done");
+			const statusText = this.result.isError ? "error" : "done";
+			const statusColor = this.result.isError ? "error" : "success";
+			const timer =
+				this.finalDurationMs !== undefined ? formatDuration(this.finalDurationMs).padStart(4) : undefined;
+			return timer !== undefined
+				? `${theme.fg(statusColor, statusText)} ${theme.fg("muted", timer)}`
+				: theme.fg(statusColor, statusText);
 		}
 		if (this.result?.isError) {
 			return theme.fg("error", "error");
 		}
 		if (this.executionStarted) {
-			return theme.fg("bashMode", `${workingIconFrame(getWorkingPulseFrame())} running`);
+			const status = theme.fg("bashMode", `${workingIconFrame(getWorkingPulseFrame())} running`);
+			if (this.executionStartedAt === undefined) return status;
+			return `${status} ${theme.fg("muted", formatLiveDuration(Date.now() - this.executionStartedAt).padStart(7))}`;
 		}
 		return theme.fg("muted", "queued");
 	}

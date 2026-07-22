@@ -434,31 +434,32 @@ describe("buildRlmChildSnapshots", () => {
 		});
 	});
 
-	it("prefers the parent's run status over the streaming heuristic", () => {
-		// An idle child session is still part of an active run; only the parent's
-		// run tracker knows that.
+	it.each([
+		{
+			state: { status: "running" as const, startedAt: 500 },
+			expected: { status: "running", startedAt: 500 },
+		},
+		{
+			state: { status: "done" as const, startedAt: 500, durationMs: 750 },
+			expected: { status: "done", startedAt: 500, durationMs: 750 },
+		},
+	])("uses canonical parent timing for $state.status child seeds", ({ state, expected }) => {
 		const parent = makeState({
 			activeSessionId: "parent",
-			sessionFile: "/tmp/parent.jsonl",
-			childRunStatuses: { "sub-aaa": "running" },
+			childRunStates: { "sub-aaa": state },
 		});
-		const idleChild = makeState({
+		const child = makeState({
 			activeSessionId: "child",
 			isStreaming: false,
 			metadata: {
 				kind: "subagent",
-				createdAt: 1,
+				createdAt: 1_000,
 				parentActiveSessionId: "parent",
 				rlmChildId: "sub-aaa",
-				rlmParentNodeId: "sub-aaa",
-				prompt: "Slow task",
-				sessionDir: "/tmp/artifacts/sub-aaa",
 			},
 		});
 
-		const snapshots = buildRlmChildSnapshots("parent", [parent, idleChild]);
-
-		expect(snapshots.map((snapshot) => [snapshot.id, snapshot.status])).toEqual([["sub-aaa", "running"]]);
+		expect(buildRlmChildSnapshots("parent", [parent, child])).toMatchObject([{ id: "sub-aaa", ...expected }]);
 	});
 
 	it("includes in-flight assistant output in child snapshots", () => {
@@ -540,7 +541,10 @@ interface StateOptions {
 	messages?: AgentMessage[];
 	hasUserContent?: boolean;
 	summaryState?: ActiveSessionState["summaryState"];
-	childRunStatuses?: Record<string, "queued" | "running" | "done" | "error" | "cancelled">;
+	childRunStates?: Record<
+		string,
+		{ status: "queued" | "running" | "done" | "error" | "cancelled"; startedAt: number; durationMs?: number }
+	>;
 	hasRunningRlmChildren?: boolean;
 	hasAcceptedPromptInFlight?: boolean;
 	contextTokens?: number;
@@ -586,7 +590,7 @@ function makeState(options: StateOptions): ActiveSessionState {
 					hasUserContent: () => options.hasUserContent ?? false,
 				},
 				messages: options.messages ?? ([] as AgentMessage[]),
-				getRlmChildRunStatus: (childId: string) => options.childRunStatuses?.[childId],
+				getRlmChildRunState: (childId: string) => options.childRunStates?.[childId],
 				hasRunningRlmChildren: () => options.hasRunningRlmChildren ?? false,
 				hasAcceptedPromptInFlight: options.hasAcceptedPromptInFlight ?? false,
 				getCurrentRecap: () => undefined,

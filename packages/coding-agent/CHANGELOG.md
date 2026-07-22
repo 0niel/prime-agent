@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added live elapsed-time timers to running tool calls, showing the final duration when they settle.
+- Added live incrementing elapsed-time timers to running subagents, with final duration preserved after completion.
 - Changed selection cursors from `→` to `›` across model selectors, scoped-models, and the theme default for consistency with tree and user-message selectors.
 - Changed the queued follow-up hint connector from `↳` to `╰─` to match the tool-execution continuation connector.
 - Changed `/context` tree connectors from `├ `/`└ ` to `├─ `/`└─ ` to match the tree selector and session picker.
@@ -10,7 +12,6 @@
 - Fixed cancelled extension commands remaining alive when spawned processes ignored SIGTERM ([#458](https://github.com/PrimeIntellect-ai/prime-agent/pull/458) by [@snimu](https://github.com/snimu)).
 - Fixed OAuth browser launch URLs being interpreted by the system shell.
 - Changed long live session opens to render a bounded recent transcript tail while preserving full prompt history ([#343](https://github.com/PrimeIntellect-ai/prime-agent/pull/343) by [@sethkarten](https://github.com/sethkarten)).
-
 
 ## [0.3.2] - 2026-07-20
 

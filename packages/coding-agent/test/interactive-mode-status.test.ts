@@ -33,12 +33,10 @@ import type {
 	AgentConnectionResourceSnapshot,
 	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionSessionContext,
-	AgentConnectionSessionEvent,
 	AgentConnectionSnapshot,
 	AgentConnectionSourceInfo,
 	AgentConnectionState,
 } from "../src/modes/agent-connection/types.js";
-import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import type { AuthenticationResult } from "../src/modes/interactive/auth-flows.js";
 import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.js";
 import type { ConfigurationMenuComponent } from "../src/modes/interactive/components/configuration-menu.js";
@@ -124,6 +122,7 @@ describe("mergeChildAgentSnapshots", () => {
 		model: "openai/gpt-5.4",
 		label: "Inspect the scheduler",
 		status: "running",
+		startedAt: 1_000,
 		durationMs: 5_000,
 		answerPreview: "Reading the queue",
 		toolUseCount: 4,
@@ -138,11 +137,13 @@ describe("mergeChildAgentSnapshots", () => {
 			id: "child-1",
 			label: "Inspect the scheduler",
 			status: "running",
+			startedAt: 2_000,
 			sessionDir: "/tmp/child-1",
 		});
 
 		expect(merged).toMatchObject({
 			activeSessionId: "active-child-1",
+			startedAt: 1_000,
 			model: "openai/gpt-5.4",
 			durationMs: 5_000,
 			answerPreview: "Reading the queue",
@@ -266,6 +267,7 @@ describe("InteractiveMode.showStatus", () => {
 
 type RenderSessionContextHarness = {
 	pendingTools: Map<string, ToolExecutionComponent>;
+	toolExecutionStarts: Map<string, number>;
 	ipythonToolComponents: Map<string, unknown>;
 	lateIpythonSentAgentMessages: Map<string, unknown[]>;
 	toolOutputExpanded: boolean;
@@ -289,6 +291,7 @@ type RenderSessionContextOptions = {
 	populateHistory?: boolean;
 	clearChat?: boolean;
 	limitTranscript?: boolean;
+	runningToolStartedAt?: Record<string, number>;
 };
 
 const renderSessionContext = (
@@ -308,12 +311,15 @@ function createRenderSessionContextHarness(overrides: Partial<RenderSessionConte
 	addToHistory: ReturnType<typeof vi.fn>;
 } {
 	const chatContainer = overrides.chatContainer ?? new Container();
+	const pendingTools = overrides.pendingTools ?? new Map<string, ToolExecutionComponent>();
+	const toolExecutionStarts = overrides.toolExecutionStarts ?? new Map<string, number>();
 	const addMessageToChat = vi.fn(() => {
 		chatContainer.addChild({ render: () => ["assistant"], invalidate: () => {} });
 	});
 	const addToHistory = vi.fn();
 	const harness: RenderSessionContextHarness = {
-		pendingTools: new Map<string, ToolExecutionComponent>(),
+		pendingTools,
+		toolExecutionStarts,
 		ipythonToolComponents: new Map<string, unknown>(),
 		lateIpythonSentAgentMessages: new Map<string, unknown[]>(),
 		toolOutputExpanded: false,
@@ -321,7 +327,10 @@ function createRenderSessionContextHarness(overrides: Partial<RenderSessionConte
 		editor: { addToHistory },
 		footer: { invalidate: vi.fn() },
 		updateEditorBorderColor: vi.fn(),
-		resetPendingToolState: vi.fn(),
+		resetPendingToolState: vi.fn(() => {
+			pendingTools.clear();
+			toolExecutionStarts.clear();
+		}),
 		preloadToolDefinitions: vi.fn(async () => {}),
 		settingsManager: { getShowImages: () => true },
 		getCachedToolDefinition: () => undefined,
@@ -1115,6 +1124,7 @@ describe("InteractiveMode connection events", () => {
 			state: createConnectionState({ isCompacting: true, isBashRunning: true, isStreaming: true }),
 			messages: [],
 			streamingMessage,
+			runningToolStartedAt: { "tool-1": 1_000 },
 		};
 		const startAssistantStreamingMessage = vi.fn();
 		const restoreStreamingMessageFromSnapshot = vi.fn((message: AgentConnectionSnapshot["streamingMessage"]) => {
@@ -1166,7 +1176,11 @@ describe("InteractiveMode connection events", () => {
 		expect((fakeThis as unknown as { activeBashComponent: unknown }).activeBashComponent).toBe(activeBashComponent);
 		expect(
 			(fakeThis as unknown as { renderSessionContext: ReturnType<typeof vi.fn> }).renderSessionContext,
-		).toHaveBeenCalledWith(expect.anything(), { clearChat: true, updateFooter: true });
+		).toHaveBeenCalledWith(expect.anything(), {
+			clearChat: true,
+			updateFooter: true,
+			runningToolStartedAt: { "tool-1": 1_000 },
+		});
 		expect(startAssistantStreamingMessage).toHaveBeenCalledWith(streamingMessage);
 	});
 
@@ -1321,86 +1335,69 @@ describe("InteractiveMode key handlers", () => {
 });
 
 describe("InteractiveMode tool event rendering", () => {
-	test("reserves streaming tool call ids before loading tool definitions", async () => {
-		let resolveDefinition!: () => void;
-		const definitionPromise = new Promise<undefined>((resolve) => {
-			resolveDefinition = () => resolve(undefined);
-		});
-		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
-			isInitialized: true,
-			init: vi.fn(async () => {}),
-			footer: { invalidate: vi.fn() },
-			updateConnectionStateFromEvent: vi.fn(),
-			activityTracker: new AgentActivityTracker(),
-			streamingComponent: { updateContent: vi.fn() },
-			streamingMessage: undefined,
-			chatContainer: new Container(),
-			pendingTools: new Map<string, ToolExecutionComponent>(),
-			pendingToolCreations: new Set<string>(),
-			startedToolCalls: new Set<string>(),
-			ipythonToolComponents: new Map(),
-			lateIpythonSentAgentMessages: new Map(),
-			loadToolDefinition: vi.fn(() => definitionPromise),
-			uiServices: {
-				settingsManager: {
-					getShowImages: () => true,
-				},
-			},
-			toolOutputExpanded: false,
-			ui: { requestRender: vi.fn() },
-			getCurrentCwd: () => "/tmp/project",
-		});
-		const message = {
-			role: "assistant",
-			content: [
-				{
-					type: "toolCall",
-					id: "tool-1",
-					name: "ipython",
-					arguments: { code: "print(1)" },
-				},
-			],
-			api: "anthropic-messages",
-			provider: "anthropic",
-			model: "claude-sonnet-4-5",
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					total: 0,
-				},
-			},
-			stopReason: "stop",
-			timestamp: 1,
-		};
-		const event = {
-			type: "message_update",
-			message,
-			assistantMessageEvent: { type: "toolcall_start", contentIndex: 0, partial: message },
-		} as unknown as AgentConnectionSessionEvent;
-		const handleEvent = (
-			InteractiveMode.prototype as unknown as {
-				handleEvent(this: typeof fakeThis, event: AgentConnectionSessionEvent): Promise<void>;
-			}
-		).handleEvent;
+	test("reserves one component and preserves start time across asynchronous definition loading", async () => {
+		vi.useFakeTimers();
+		try {
+			let resolveDefinition!: () => void;
+			const definitionPromise = new Promise<undefined>((resolve) => {
+				resolveDefinition = () => resolve(undefined);
+			});
+			const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
+				streamingMessage: undefined,
+				chatContainer: new Container(),
+				pendingTools: new Map<string, ToolExecutionComponent>(),
+				pendingToolCreations: new Set<string>(),
+				pendingToolGeneration: 0,
+				toolExecutionStarts: new Map([["tool-1", Date.now()]]),
+				ipythonToolComponents: new Map(),
+				lateIpythonSentAgentMessages: new Map(),
+				loadToolDefinition: vi.fn(() => definitionPromise),
+				uiServices: { settingsManager: { getShowImages: () => true } },
+				toolOutputExpanded: false,
+				ui: { requestRender: vi.fn() },
+				getCurrentCwd: () => "/tmp/project",
+			});
+			const create = (
+				InteractiveMode.prototype as unknown as {
+					getOrCreatePendingToolComponent(
+						this: typeof fakeThis,
+						toolCall: { id: string; name: string; arguments: unknown },
+					): Promise<ToolExecutionComponent | undefined>;
+				}
+			).getOrCreatePendingToolComponent;
+			const toolCall = { id: "tool-1", name: "bash", arguments: { command: "sleep 5" } };
 
-		const firstUpdate = handleEvent.call(fakeThis, event);
-		const secondUpdate = handleEvent.call(fakeThis, event);
-		await Promise.resolve();
-		expect(fakeThis.loadToolDefinition).toHaveBeenCalledTimes(1);
+			const first = create.call(fakeThis, toolCall);
+			const second = create.call(fakeThis, toolCall);
+			await Promise.resolve();
+			expect(fakeThis.loadToolDefinition).toHaveBeenCalledOnce();
+			await vi.advanceTimersByTimeAsync(61_000);
+			resolveDefinition();
+			await Promise.all([first, second]);
 
-		resolveDefinition();
-		await Promise.all([firstUpdate, secondUpdate]);
+			expect(fakeThis.pendingTools.size).toBe(1);
+			expect(fakeThis.chatContainer.children).toHaveLength(1);
+			expect(fakeThis.pendingTools.get("tool-1")?.render(100).join("\n")).toContain("1:01");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 
-		expect(fakeThis.pendingTools.size).toBe(1);
-		expect(fakeThis.chatContainer.children).toHaveLength(1);
+	test("restores transcript-resident in-flight tool timers from canonical timestamps", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(6_000);
+			const { harness } = createRenderSessionContextHarness();
+			const message = toolCallMessage("tool-restored", "bash");
+
+			await renderMessages(harness, [message], { runningToolStartedAt: { "tool-restored": 1_000 } });
+			expect(harness.pendingTools.get("tool-restored")?.render(100).join("\n")).toContain("5s");
+
+			await renderMessages(harness, [message]);
+			expect(harness.pendingTools.get("tool-restored")?.render(100).join("\n")).not.toContain("0s");
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });
 
