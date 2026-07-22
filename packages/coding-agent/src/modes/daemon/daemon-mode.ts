@@ -1822,7 +1822,9 @@ export class AgentDaemon {
 								rlmParentNodeId: options.rlmParentNodeId,
 								prompt: options.prompt.length <= 4096 ? options.prompt : undefined,
 								spawnCode: options.spawnCode,
-								model: { provider: options.model.provider, modelId: options.model.id },
+								...(options.model
+									? { model: { provider: options.model.provider, modelId: options.model.id } }
+									: {}),
 								status: "completed",
 								createdAt: state.runtime.metadata.createdAt,
 							});
