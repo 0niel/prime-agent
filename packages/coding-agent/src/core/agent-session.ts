@@ -3054,7 +3054,7 @@ export class AgentSession {
 					});
 				}
 			}
-			this.agent.state.systemPrompt = this._baseSystemPrompt;
+			this.agent.state.systemPrompt = extensionResult?.systemPrompt ?? this._baseSystemPrompt;
 		} catch (error) {
 			reportPreflight(false);
 			throw error;
