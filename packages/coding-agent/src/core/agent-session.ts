@@ -2972,6 +2972,7 @@ export class AgentSession {
 		let messages: AgentMessage[] | undefined;
 		let drainedNextTurnMessages: CustomMessage[] = [];
 		const previewLabel = injectedMessagePreviewLabel(message);
+		let extensionResult: Awaited<ReturnType<typeof this._extensionRunner.emitBeforeAgentStart>> | undefined;
 		try {
 			const shouldQueueForStreaming = this.isStreaming;
 			const shouldQueueForPendingWork =
@@ -3036,7 +3037,7 @@ export class AgentSession {
 			this._pendingNextTurnMessages = [];
 			messages = [...drainedNextTurnMessages, message];
 
-			const extensionResult = await this._extensionRunner.emitBeforeAgentStart(
+			extensionResult = await this._extensionRunner.emitBeforeAgentStart(
 				text,
 				undefined,
 				this._baseSystemPrompt,
@@ -3069,7 +3070,7 @@ export class AgentSession {
 			// A refine may have completed during the wait and rewritten
 			// _baseSystemPrompt. Re-apply the extension-modified prompt if
 			// the extension provided one, otherwise use the refreshed base.
-			this.agent.state.systemPrompt = this._baseSystemPrompt;
+			this.agent.state.systemPrompt = extensionResult?.systemPrompt ?? this._baseSystemPrompt;
 		}
 		const shouldQueueAtHandoff =
 			options?.queueIfBusy === true &&
