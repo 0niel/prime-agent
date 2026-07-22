@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed Vertex Gemini 2.5 Flash-Lite minimal reasoning requests to use the supported 512-token thinking budget.
+
 ## [0.3.2] - 2026-07-20
 
 - Added Kimi K3 to the Prime Inference and OpenRouter model catalogs with multimodal input and mandatory max reasoning.
