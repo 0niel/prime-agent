@@ -1353,7 +1353,6 @@ export class InteractiveMode {
 		this.mainContainer.addChild(this.widgetContainerBelow);
 		this.footerSlot.addChild(this.footer);
 		this.mainContainer.addChild(this.footerSlot);
-		this.promptDock.addChild(this.sideQuestionContainer);
 		this.promptDock.addChild(this.featureHintContainer);
 		this.promptDock.addChild(this.editorContainer);
 		this.promptDock.addChild(this.childAgentSummary);
@@ -4142,11 +4141,7 @@ export class InteractiveMode {
 		};
 		this.activeSideQuestionId = event.id;
 		this.sideQuestionEvent = event;
-		this.sideQuestionComponent = new SideQuestionComponent(
-			event,
-			() => this.getSideQuestionMaxLines(),
-			this.settingsManager.getEditorPaddingX(),
-		);
+		this.sideQuestionComponent = new SideQuestionComponent(event, this.settingsManager.getEditorPaddingX());
 		this.sideQuestionContainer.addChild(new Spacer(1));
 		this.sideQuestionContainer.addChild(this.sideQuestionComponent);
 		this.ui.requestRender();
@@ -4216,10 +4211,6 @@ export class InteractiveMode {
 		}
 		this.showStatus("Navigated to selected point");
 		void this.flushCompactionQueue({ willRetry: false });
-	}
-
-	private getSideQuestionMaxLines(): number {
-		return Math.max(6, Math.min(12, Math.floor(this.ui.terminal.rows * 0.3)));
 	}
 
 	private setupEditorSubmitHandler(): void {
@@ -6615,6 +6606,7 @@ export class InteractiveMode {
 					this.widgetContainerAbove,
 					this.recapContainer,
 					this.queuedMessagesContainer,
+					this.sideQuestionContainer,
 					this.widgetContainerBelow,
 				],
 				dock: this.promptDock,

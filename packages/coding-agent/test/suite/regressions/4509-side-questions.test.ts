@@ -214,39 +214,34 @@ describe("ENG-4509 side questions", () => {
 		expect(hasActiveSideQuestionFor.call(fakeThis, otherClient, "session-1")).toBe(false);
 	});
 
-	it("renders a bounded one-turn panel above the prompt", () => {
-		const component = new SideQuestionComponent(
-			{
-				id: "question-4",
-				question: "What changed?",
-				answer: "First line\n\nSecond line\n\nThird line\n\nFourth line",
-				status: "complete",
-			},
-			() => 8,
-		);
+	it("renders the complete side-question answer", () => {
+		const component = new SideQuestionComponent({
+			id: "question-4",
+			question: "What changed?",
+			answer: "First line\n\nSecond line\n\nThird line\n\nFourth line",
+			status: "complete",
+		});
 		const lines = component.render(40);
 		const rendered = stripAnsi(lines.join("\n"));
 		const blankPopupLine = theme.getPopupBackgroundColor()(" ".repeat(40));
 
-		expect(lines).toHaveLength(8);
 		expect(lines.every((line) => line.includes("\x1b[48"))).toBe(true);
 		expect(lines[0]).toBe(blankPopupLine);
 		expect(getEditorTheme().autocompleteBackgroundColor?.(" ".repeat(40))).toBe(blankPopupLine);
 		expect(rendered).toContain("  /btw  What changed?");
 		expect(rendered).not.toContain("  answer");
 		expect(rendered).toContain("First line");
-		expect(rendered).toContain("…");
+		expect(rendered).toContain("Fourth line");
+		expect(rendered).not.toContain("…");
 	});
 
 	it("aligns the thinking placeholder with the streamed response", () => {
 		const running = new SideQuestionComponent(
 			{ id: "question-5", question: "Still running?", answer: "", status: "running" },
-			() => 8,
 			4,
 		);
 		const complete = new SideQuestionComponent(
 			{ id: "question-5", question: "Still running?", answer: "Aligned response", status: "complete" },
-			() => 8,
 			4,
 		);
 		const runningLines = running.render(40).map(stripAnsi);
@@ -260,10 +255,12 @@ describe("ENG-4509 side questions", () => {
 	});
 
 	it("uses the user-message foreground for pane content", () => {
-		const component = new SideQuestionComponent(
-			{ id: "question-5", question: "Readable question", answer: "Readable response", status: "complete" },
-			() => 8,
-		);
+		const component = new SideQuestionComponent({
+			id: "question-5",
+			question: "Readable question",
+			answer: "Readable response",
+			status: "complete",
+		});
 		const rendered = component.render(40).join("\n");
 
 		expect(rendered).toContain("\x1b[39mReadable question\x1b[39m");
@@ -271,10 +268,12 @@ describe("ENG-4509 side questions", () => {
 	});
 
 	it("keeps streamed text when a side question is cancelled", () => {
-		const component = new SideQuestionComponent(
-			{ id: "question-5", question: "Partial?", answer: "Useful partial response", status: "cancelled" },
-			() => 8,
-		);
+		const component = new SideQuestionComponent({
+			id: "question-5",
+			question: "Partial?",
+			answer: "Useful partial response",
+			status: "cancelled",
+		});
 		const rendered = stripAnsi(component.render(40).join("\n"));
 
 		expect(rendered).toContain("Useful partial response");
