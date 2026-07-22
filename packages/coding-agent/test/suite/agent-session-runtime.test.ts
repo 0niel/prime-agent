@@ -50,6 +50,7 @@ describe("AgentSessionRuntime characterization", () => {
 			cwd?: string;
 			bootstrapModel?: boolean;
 			bootstrapThinkingLevel?: boolean;
+			inMemory?: boolean;
 			sessionConfig?: AgentSessionRuntimeConfig;
 			onCreateRuntime?: (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => void;
 		},
@@ -122,7 +123,9 @@ describe("AgentSessionRuntime characterization", () => {
 		const runtime = await createAgentSessionRuntime(createRuntime, {
 			cwd: tempDir,
 			agentDir: tempDir,
-			sessionManager: SessionManager.create(tempDir, join(tempDir, "sessions")),
+			sessionManager: options?.inMemory
+				? SessionManager.inMemory(tempDir)
+				: SessionManager.create(tempDir, join(tempDir, "sessions")),
 			sessionConfig: options?.sessionConfig,
 		});
 		await runtime.session.bindExtensions({});
@@ -502,6 +505,44 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(events).toEqual([{ type: "session_before_fork", entryId: "missing-entry", position: "at" }]);
 	});
 
+	it("forks before a selected middle prompt and preserves its selection metadata", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("Say one");
+		await runtime.session.prompt("Say two");
+		await runtime.session.prompt("Say three");
+		const userMessages = runtime.session.getUserMessagesForForking();
+		expect(userMessages.map((message) => message.text)).toEqual(["Say one", "Say two", "Say three"]);
+
+		const result = await runtime.fork(userMessages[1]!.entryId);
+
+		expect(result).toEqual({ cancelled: false, selectedText: "Say two" });
+		expect(
+			runtime.session.messages.map((message) =>
+				message.role === "user"
+					? typeof message.content === "string"
+						? message.content
+						: message.content
+								.filter((part): part is { type: "text"; text: string } => part.type === "text")
+								.map((part) => part.text)
+								.join("")
+					: message.role,
+			),
+		).toEqual(["Say one", "assistant"]);
+		expect(runtime.session.sessionFile).toBeDefined();
+	});
+
+	it("forks before the first prompt in-memory and preserves its selection metadata", async () => {
+		const { runtime } = await createRuntimeForTest(() => {}, { inMemory: true });
+		await runtime.session.prompt("Say one");
+		const userMessages = runtime.session.getUserMessagesForForking();
+
+		const result = await runtime.fork(userMessages[0]!.entryId);
+
+		expect(result).toEqual({ cancelled: false, selectedText: "Say one" });
+		expect(runtime.session.messages).toEqual([]);
+		expect(runtime.session.sessionFile).toBeUndefined();
+	});
+
 	it("duplicates the current active branch when forking at the current position", async () => {
 		const { runtime } = await createRuntimeForTest(() => {});
 		await runtime.session.prompt("hello");
@@ -543,78 +584,7 @@ describe("AgentSessionRuntime characterization", () => {
 	});
 
 	it("duplicates the current active branch in-memory when forking at the current position", async () => {
-		const tempDir = join(tmpdir(), `pi-runtime-suite-in-memory-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		mkdirSync(tempDir, { recursive: true });
-
-		const faux = registerFauxProvider({
-			models: [
-				{ id: "faux-1", reasoning: true },
-				{ id: "faux-2", reasoning: false },
-			],
-		});
-		faux.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two"), fauxAssistantMessage("three")]);
-
-		const authStorage = AuthStorage.inMemory();
-		authStorage.setRuntimeApiKey(faux.getModel().provider, "faux-key");
-
-		const runtimeOptions = {
-			agentDir: tempDir,
-			authStorage,
-			model: faux.getModel(),
-			resourceLoaderOptions: {
-				extensionFactories: [
-					(pi: ExtensionAPI) => {
-						pi.registerProvider(faux.getModel().provider, {
-							baseUrl: faux.getModel().baseUrl,
-							apiKey: "faux-key",
-							api: faux.api,
-							models: faux.models.map((registeredModel) => ({
-								id: registeredModel.id,
-								name: registeredModel.name,
-								api: registeredModel.api,
-								reasoning: registeredModel.reasoning,
-								input: registeredModel.input,
-								cost: registeredModel.cost,
-								contextWindow: registeredModel.contextWindow,
-								maxTokens: registeredModel.maxTokens,
-							})),
-						});
-					},
-				],
-				noSkills: true,
-				noPromptTemplates: true,
-				noThemes: true,
-			},
-		};
-		const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
-			const services = await createAgentSessionServices({
-				...runtimeOptions,
-				cwd,
-			});
-			return {
-				...(await createAgentSessionFromServices({
-					services,
-					sessionManager,
-					sessionStartEvent,
-					model: runtimeOptions.model,
-				})),
-				services,
-				diagnostics: services.diagnostics,
-			};
-		};
-		const runtime = await createAgentSessionRuntime(createRuntime, {
-			cwd: tempDir,
-			agentDir: tempDir,
-			sessionManager: SessionManager.inMemory(tempDir),
-		});
-		await runtime.session.bindExtensions({});
-		cleanups.push(async () => {
-			await runtime.dispose();
-			faux.unregister();
-			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true, force: true });
-			}
-		});
+		const { runtime } = await createRuntimeForTest(() => {}, { inMemory: true });
 
 		await runtime.session.prompt("hello");
 		await runtime.session.prompt("again");
