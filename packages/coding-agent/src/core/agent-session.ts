@@ -3036,14 +3036,14 @@ export class AgentSession {
 			this._pendingNextTurnMessages = [];
 			messages = [...drainedNextTurnMessages, message];
 
-			const result = await this._extensionRunner.emitBeforeAgentStart(
+			const extensionResult = await this._extensionRunner.emitBeforeAgentStart(
 				text,
 				undefined,
 				this._baseSystemPrompt,
 				this._baseSystemPromptOptions,
 			);
-			if (result?.messages) {
-				for (const msg of result.messages) {
+			if (extensionResult?.messages) {
+				for (const msg of extensionResult.messages) {
 					messages.push({
 						role: "custom",
 						customType: msg.customType,
@@ -3054,7 +3054,7 @@ export class AgentSession {
 					});
 				}
 			}
-			this.agent.state.systemPrompt = result?.systemPrompt ?? this._baseSystemPrompt;
+			this.agent.state.systemPrompt = this._baseSystemPrompt;
 		} catch (error) {
 			reportPreflight(false);
 			throw error;
@@ -3067,7 +3067,8 @@ export class AgentSession {
 		if (this._refineInFlight || this._refineApplyPending) {
 			await this._waitForRefineIdle();
 			// A refine may have completed during the wait and rewritten
-			// _baseSystemPrompt. Re-sync so the agent uses the latest version.
+			// _baseSystemPrompt. Re-apply the extension-modified prompt if
+			// the extension provided one, otherwise use the refreshed base.
 			this.agent.state.systemPrompt = this._baseSystemPrompt;
 		}
 		const shouldQueueAtHandoff =
@@ -3349,15 +3350,15 @@ export class AgentSession {
 				}
 
 				// Emit before_agent_start extension event
-				const result = await this._extensionRunner.emitBeforeAgentStart(
+				const extensionResult = await this._extensionRunner.emitBeforeAgentStart(
 					expandedText,
 					currentImages,
 					this._baseSystemPrompt,
 					this._baseSystemPromptOptions,
 				);
 				// Add all custom messages from extensions
-				if (result?.messages) {
-					for (const msg of result.messages) {
+				if (extensionResult?.messages) {
+					for (const msg of extensionResult.messages) {
 						messages.push({
 							role: "custom",
 							customType: msg.customType,
@@ -3369,8 +3370,8 @@ export class AgentSession {
 					}
 				}
 				// Apply extension-modified system prompt, or reset to base
-				if (result?.systemPrompt) {
-					this.agent.state.systemPrompt = result.systemPrompt;
+				if (extensionResult?.systemPrompt) {
+					this.agent.state.systemPrompt = extensionResult.systemPrompt;
 				} else {
 					// Ensure we're using the base prompt (in case previous turn had modifications)
 					this.agent.state.systemPrompt = this._baseSystemPrompt;
@@ -3393,7 +3394,8 @@ export class AgentSession {
 		if (this._refineInFlight || this._refineApplyPending) {
 			await this._waitForRefineIdle();
 			// A refine may have completed during the wait and rewritten
-			// _baseSystemPrompt. Re-sync so the agent uses the latest version.
+			// _baseSystemPrompt. Re-apply the extension-modified prompt if
+			// the extension provided one, otherwise use the refreshed base.
 			this.agent.state.systemPrompt = this._baseSystemPrompt;
 		}
 		if (acceptedAgentMessagePrompt?.cleared) {
@@ -5210,6 +5212,7 @@ export class AgentSession {
 			if (this._refineAbortController === refineAbort) {
 				this._refineAbortController = undefined;
 			}
+			this._schedulePendingMessageResume();
 			throw e;
 		} finally {
 			if (this._refinePlanInFlight === planSettled) {
@@ -5228,20 +5231,24 @@ export class AgentSession {
 			this._refineApplyPending = false;
 		}
 		if (this._disposed || refineAbort.signal.aborted) {
+			this._schedulePendingMessageResume();
 			throw new Error("Refinement cancelled because the session was disposed.");
 		}
 
 		// Application phase — blocks turn entry points via _refineInFlight.
 		// _refineInFlight only covers the brief disconnect+apply+reconnect.
-		const applyRun = this._applyRefine(plan, options, refineAbort);
-		const applySettled = applyRun.then(
-			() => undefined,
-			() => undefined,
-		);
+		// Set _refineInFlight before starting _applyRefine so synchronous
+		// listeners on the refine_complete event see the guard.
+		let resolveApplySettled: () => void = () => {};
+		const applySettled = new Promise<void>((resolve) => {
+			resolveApplySettled = resolve;
+		});
 		this._refineInFlight = applySettled;
+		const applyRun = this._applyRefine(plan, options, refineAbort);
 		try {
 			return await applyRun;
 		} finally {
+			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {
 				this._refineInFlight = undefined;
 			}
@@ -5391,7 +5398,12 @@ export class AgentSession {
 			this.sessionManager.appendCustomEntry("prime-agent.refinement", result);
 			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 			this.agent.state.systemPrompt = this._baseSystemPrompt;
-			this._emit({ type: "refine_complete", result });
+			try {
+				this._emit({ type: "refine_complete", result });
+			} catch {
+				// Listener failures must not flip a successful refinement into
+				// a reported failure — the refinement is already persisted.
+			}
 			return result;
 		} finally {
 			if (this._refineAbortController === refineAbort) {
