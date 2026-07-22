@@ -485,6 +485,31 @@ Do something`,
 		expect(tmpl!.argumentHint).toBeUndefined();
 	});
 
+	test("should ignore non-string frontmatter metadata", () => {
+		writeTemplate(
+			"invalid-metadata",
+			`---
+description:
+  - not
+  - a string
+argument-hint: [temporary-value]
+---
+Fallback description from the template body`,
+		);
+
+		const templates = loadPromptTemplates({
+			cwd: process.cwd(),
+			agentDir: getAgentDir(),
+			promptPaths: [testDir],
+			includeDefaults: false,
+		});
+
+		const tmpl = templates.find((t) => t.name === "invalid-metadata");
+		expect(tmpl).toBeDefined();
+		expect(tmpl!.argumentHint).toBeUndefined();
+		expect(tmpl!.description).toBe("Fallback description from the template body");
+	});
+
 	test("should preserve argument-hint with special characters", () => {
 		writeTemplate(
 			"is",

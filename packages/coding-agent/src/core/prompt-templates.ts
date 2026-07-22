@@ -104,12 +104,12 @@ export function substituteArgs(content: string, args: string[]): string {
 function loadTemplateFromFile(filePath: string, sourceInfo: SourceInfo): PromptTemplate | null {
 	try {
 		const rawContent = readFileSync(filePath, "utf-8");
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(rawContent);
+		const { frontmatter, body } = parseFrontmatter(rawContent);
 
 		const name = basename(filePath).replace(/\.md$/, "");
 
 		// Get description from frontmatter or first non-empty line
-		let description = frontmatter.description || "";
+		let description = typeof frontmatter.description === "string" ? frontmatter.description : "";
 		if (!description) {
 			const firstLine = body.split("\n").find((line) => line.trim());
 			if (firstLine) {
@@ -118,11 +118,12 @@ function loadTemplateFromFile(filePath: string, sourceInfo: SourceInfo): PromptT
 				if (firstLine.length > 60) description += "...";
 			}
 		}
+		const argumentHint = typeof frontmatter["argument-hint"] === "string" ? frontmatter["argument-hint"] : undefined;
 
 		return {
 			name,
 			description,
-			...(frontmatter["argument-hint"] && { argumentHint: frontmatter["argument-hint"] }),
+			...(argumentHint && { argumentHint }),
 			content: body,
 			sourceInfo,
 			filePath,
