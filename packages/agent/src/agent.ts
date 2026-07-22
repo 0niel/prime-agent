@@ -539,7 +539,7 @@ export class Agent {
 		this._state.errorMessage = failureMessage.errorMessage;
 		await this.processEvents({ type: "message_start", message: failureMessage }).catch(() => undefined);
 		await this.processEvents({ type: "message_end", message: failureMessage }).catch(() => undefined);
-		await this.processEvents({ type: "agent_end", messages: [failureMessage] });
+		await this.processEvents({ type: "agent_end", messages: [failureMessage] }).catch(() => undefined);
 	}
 
 	private finishRun(): void {

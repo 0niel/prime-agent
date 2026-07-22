@@ -6,11 +6,11 @@ import { initTheme } from "../src/modes/interactive/theme/theme.js";
 import { PRIME_BUTTERFLY_LOGO } from "../src/themes/prime-logo.js";
 
 const mocks = vi.hoisted(() => ({
-	exec: vi.fn(),
+	execFile: vi.fn(),
 }));
 
 vi.mock("child_process", () => ({
-	exec: mocks.exec,
+	execFile: mocks.execFile,
 }));
 
 function createFakeTui(): TUI {
@@ -25,7 +25,7 @@ describe("LoginDialogComponent", () => {
 	});
 
 	beforeEach(() => {
-		mocks.exec.mockClear();
+		mocks.execFile.mockClear();
 	});
 
 	afterEach(() => {
@@ -47,7 +47,30 @@ describe("LoginDialogComponent", () => {
 		expect(output).not.toContain("click to open");
 		expect(output).not.toContain("─");
 		expect(output).not.toContain("> ");
-		expect(mocks.exec).toHaveBeenCalledOnce();
+	});
+
+	it.each([
+		["darwin", []],
+		["linux", []],
+		["win32", ["url.dll,FileProtocolHandler"]],
+	] as const)("passes hostile URLs as a single argument on %s", (platform, prefixArgs) => {
+		const platformSpy = vi.spyOn(process, "platform", "get").mockReturnValue(platform);
+		try {
+			const dialog = new LoginDialogComponent(createFakeTui(), "anthropic", () => {}, "Anthropic");
+			const url = "https://example.com/oauth?state=$(touch /tmp/pwned);whoami&pipe=|id";
+			const command =
+				platform === "darwin"
+					? "open"
+					: platform === "linux"
+						? "xdg-open"
+						: `${process.env.SystemRoot ?? String.raw`C:\Windows`}\\System32\\rundll32.exe`;
+
+			dialog.showAuth(url);
+
+			expect(mocks.execFile).toHaveBeenCalledWith(command, [...prefixArgs, url], expect.any(Function));
+		} finally {
+			platformSpy.mockRestore();
+		}
 	});
 
 	it("renders sign-in URLs as OSC 8 hyperlinks when supported", () => {

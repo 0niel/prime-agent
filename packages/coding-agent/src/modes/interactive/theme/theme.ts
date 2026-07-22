@@ -1259,6 +1259,8 @@ export function getSelectListTheme(): SelectListTheme {
 		selectedPrefix: (text: string) => theme.fg("accent", text),
 		selectedText: (text: string) => theme.fg("accent", text),
 		description: (text: string) => theme.fg("muted", text),
+		argumentHint: (text: string) => theme.fg("mdCode", text),
+		sourceTag: (text: string) => theme.fg("dim", text),
 		scrollInfo: (text: string) => theme.fg("muted", text),
 		noMatch: (text: string) => theme.fg("muted", text),
 	};
@@ -1279,7 +1281,7 @@ export function getSettingsListTheme(): import("@earendil-works/pi-tui").Setting
 		label: (text: string, selected: boolean) => (selected ? theme.fg("accent", text) : text),
 		value: (text: string, selected: boolean) => (selected ? theme.fg("accent", text) : theme.fg("muted", text)),
 		description: (text: string) => theme.fg("dim", text),
-		cursor: theme.fg("accent", "→ "),
+		cursor: theme.fg("accent", "› "),
 		hint: (text: string) => theme.fg("dim", text),
 	};
 }

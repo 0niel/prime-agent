@@ -420,7 +420,7 @@ export class IPythonCellComponent implements Component {
 			case "running":
 				return theme.fg("bashMode", workingIconFrame(getWorkingPulseFrame()));
 			default: // queued
-				return theme.fg("muted", "▸");
+				return theme.fg("muted", "◇");
 		}
 	}
 

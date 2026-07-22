@@ -245,6 +245,8 @@ export interface EditorOptions {
 const SLASH_COMMAND_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 	minPrimaryColumnWidth: 12,
 	maxPrimaryColumnWidth: 32,
+	showItemMetadata: true,
+	showDirectionalScrollInfo: true,
 	showSelectedDescription: true,
 };
 

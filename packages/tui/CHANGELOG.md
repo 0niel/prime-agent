@@ -2,10 +2,15 @@
 
 ## [Unreleased]
 
+- Changed `SelectList` selection cursor from `→` to `›` for consistency with tree and user-message selectors.
+- Changed slash-command autocomplete to show argument hints and source tags inline, selected descriptions separately, and directional hidden-result counts.
+
+
 ## [0.3.2] - 2026-07-20
 
 - Removed the fullscreen image fallback instruction and kept fullscreen overlays from emitting terminal graphics ([#437](https://github.com/PrimeIntellect-ai/prime-agent/pull/437) by [@snimu](https://github.com/snimu)).
 - Changed the fullscreen follow shortcut from `Alt+Down` to `Ctrl+Shift+Down` for more reliable terminal input ([ENG-4684](https://linear.app/primeintellect/issue/ENG-4684/altdown-doesnt-work)).
+- Fixed terminal width, slicing, and wrapping helpers misreading standard CSI and DCS escape sequences.
 - Fixed autocomplete popups overlapping the prompt's top edge.
 
 ## [0.3.1] - 2026-07-15

@@ -1,3 +1,4 @@
+import { win32 } from "node:path";
 import { getOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import {
 	type Component,
@@ -11,7 +12,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import { PRIME_BUTTERFLY_LOGO } from "../../../themes/prime-logo.js";
 import { theme } from "../theme/theme.js";
 import { keyHint } from "./keybinding-hints.js";
@@ -156,8 +157,17 @@ export class LoginDialogComponent extends Container implements Focusable {
 		}
 
 		// Try to open browser
-		const openCmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
-		exec(`${openCmd} "${url}"`);
+		const [command, ...args] =
+			process.platform === "darwin"
+				? ["open", url]
+				: process.platform === "win32"
+					? [
+							win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "rundll32.exe"),
+							"url.dll,FileProtocolHandler",
+							url,
+						]
+					: ["xdg-open", url];
+		execFile(command, args, () => {});
 
 		this.tui.requestRender();
 	}
