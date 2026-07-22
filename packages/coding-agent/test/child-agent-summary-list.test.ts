@@ -53,6 +53,22 @@ describe("ChildAgentSummaryComponent inline list", () => {
 		expect(out).not.toContain(" a ");
 	});
 
+	it("shows cancellation instead of stale activity in summary and detail", () => {
+		const cancelled = {
+			...node("cancelled task", "cancelled"),
+			recap: "Executing a stale task",
+			hasActiveHeartbeat: true,
+		};
+		const summary = new ChildAgentSummaryComponent();
+		summary.setNodes([cancelled]);
+		const detail = new ChildAgentDetailComponent();
+		detail.setNode(cancelled);
+
+		const output = stripAnsi([...summary.render(80), ...detail.render(80)].join("\n"));
+		expect(output).toContain("Cancelled");
+		expect(output).not.toContain("Executing a stale task");
+	});
+
 	it("shows the model and token usage without a tool column", () => {
 		const summary = new ChildAgentSummaryComponent();
 		summary.setNodes([{ ...node("a"), model: "openai/gpt-5.4", toolUseCount: 3, tokenCount: 41_000 }]);

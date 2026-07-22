@@ -333,6 +333,9 @@ export function mergeChildAgentSnapshots(
 	};
 }
 
+function isDeletedChildAgentSnapshot(child: AgentConnectionRlmChildAgentSnapshot): boolean {
+	return child.status === "cancelled" && child.error === "Deleted by parent orchestrator";
+}
 function childAgentSummaryChanged(
 	previous: AgentConnectionRlmChildAgentSnapshot,
 	next: AgentConnectionRlmChildAgentSnapshot,
@@ -894,6 +897,7 @@ export class InteractiveMode {
 	private childAgentSummary: ChildAgentSummaryComponent;
 	private childAgentDetail: ChildAgentDetailComponent;
 	private childAgentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
+	private readonly stoppingChildAgentIds = new Set<string>();
 	private childAgentNodes: ChildAgentInspectorNode[] = [];
 	private childAgentDetailNodeId: string | undefined;
 	private childAgentPanelMode: "detail" | undefined;
@@ -5343,8 +5347,7 @@ export class InteractiveMode {
 	}
 
 	private updateChildAgentInspector(child: AgentConnectionRlmChildAgentSnapshot): void {
-		// Cancellation is also the lifecycle tombstone for deleted subagents.
-		if (child.status === "cancelled") {
+		if (isDeletedChildAgentSnapshot(child)) {
 			this.removeChildAgentSnapshot(child.id);
 			this.refreshChildAgentInspector();
 			return;
@@ -5394,6 +5397,7 @@ export class InteractiveMode {
 	}
 
 	private resetChildAgentInspector(): void {
+		this.stoppingChildAgentIds.clear();
 		this.childAgentSnapshots.clear();
 		this.childAgentNodes = [];
 		this.childAgentSummary.setNodes([]);
@@ -5576,13 +5580,18 @@ export class InteractiveMode {
 	}
 
 	private async killChildAgent(nodeId: string): Promise<void> {
+		if (this.stoppingChildAgentIds.has(nodeId)) {
+			return;
+		}
+		this.stoppingChildAgentIds.add(nodeId);
+		this.showStatus("Stopping subagent...");
 		try {
 			const cancelled = await this.agentConnection.cancelRlmChild(nodeId);
-			if (!cancelled) {
-				this.showError("Subagent already finished");
-			}
+			this.showStatus(cancelled ? "Subagent stopped" : "Subagent is no longer running");
 		} catch (error) {
 			this.showError(`Failed to stop subagent: ${error instanceof Error ? error.message : String(error)}`);
+		} finally {
+			this.stoppingChildAgentIds.delete(nodeId);
 		}
 		this.ui.requestRender();
 	}

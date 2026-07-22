@@ -856,10 +856,10 @@ describe("AgentSession rlm recursion", () => {
 				return stream;
 			},
 		});
-		const childStatuses: string[] = [];
+		const childSnapshots: Array<{ status: string; durationMs?: number; activity?: unknown }> = [];
 		root.subscribe((event) => {
 			if (event.type === "rlm_child_update") {
-				childStatuses.push(event.child.status);
+				childSnapshots.push(event.child);
 			}
 		});
 
@@ -876,19 +876,66 @@ describe("AgentSession rlm recursion", () => {
 		expect(root.cancelRlmChildRun("unknown-child")).toBe(false);
 		expect(run?.status).toBe("running");
 
+		const rejection = expect(runPromise).rejects.toThrow("Cancelled by user");
 		expect(root.cancelRlmChildRun(childId)).toBe(true);
 		expect(run?.status).toBe("cancelled");
 		expect(run?.error).toBe("Cancelled by user");
 		// The cancelled update is pushed at cancel time, before the (possibly
 		// stuck) child unwinds; viewers must not keep showing a running child.
-		expect(childStatuses[childStatuses.length - 1]).toBe("cancelled");
+		expect(childSnapshots[childSnapshots.length - 1]).toMatchObject({
+			status: "cancelled",
+			durationMs: expect.any(Number),
+		});
+		expect(childSnapshots[childSnapshots.length - 1]?.activity).toBeUndefined();
+		// Duplicate requests that race teardown acknowledge the same cancellation.
+		expect(root.cancelRlmChildRun(childId)).toBe(true);
+		await rejection;
 		releaseChild();
-		await expect(runPromise).rejects.toThrow("Cancelled by user");
-		expect(childStatuses[childStatuses.length - 1]).toBe("cancelled");
+		await waitFor(() => !runs.has(childId));
+		expect(childSnapshots[childSnapshots.length - 1]?.activity).toBeUndefined();
 		expect(root.listRlmSubagents()).toEqual({ subagents: [] });
 
-		// The run has finished; a second cancel finds nothing to stop.
+		// Once teardown removes the run, a later cancel finds nothing to stop.
 		expect(root.cancelRlmChildRun(childId)).toBe(false);
+	});
+
+	it("does not let result collection overwrite cancellation with done", async () => {
+		let releaseChild: () => void = () => {};
+		const release = new Promise<void>((resolve) => {
+			releaseChild = resolve;
+		});
+		let childStarted = false;
+		const root = createSession({
+			streamFn: (_model, context) => {
+				const stream = createAssistantMessageEventStream();
+				childStarted = true;
+				void release.then(() => {
+					stream.push({ type: "done", reason: "stop", message: assistantMessage(userText(context)) });
+				});
+				return stream;
+			},
+		});
+		const statuses: string[] = [];
+		root.subscribe((event) => {
+			if (event.type === "rlm_child_update") statuses.push(event.child.status);
+		});
+
+		const runPromise = root.runRlmChild("finish concurrently");
+		await waitFor(() => childStarted);
+		const run = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0];
+		if (!run?.session) throw new Error("Missing running child");
+		const child = run.session as unknown as { _assistantUsageForCurrentMessages(): Usage };
+		const readUsage = child._assistantUsageForCurrentMessages.bind(run.session);
+		vi.spyOn(child, "_assistantUsageForCurrentMessages").mockImplementation(() => {
+			expect(root.cancelRlmChildRun(run.id)).toBe(true);
+			return readUsage();
+		});
+
+		const rejection = expect(runPromise).rejects.toThrow("Cancelled by user");
+		releaseChild();
+		await rejection;
+		expect(statuses.at(-1)).toBe("cancelled");
+		expect(statuses).not.toContain("done");
 	});
 
 	it("does not let completion retention resurrect a child being deleted", async () => {
@@ -1114,6 +1161,7 @@ describe("AgentSession rlm recursion", () => {
 		releaseChild();
 
 		await expect(runPromise).rejects.toThrow();
+		await waitFor(() => disposeHostedChild.mock.calls.length === 1);
 		expect(disposeHostedChild).toHaveBeenCalledOnce();
 		expect(root.listRlmSubagents()).toEqual({ subagents: [] });
 	});

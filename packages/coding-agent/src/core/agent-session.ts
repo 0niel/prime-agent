@@ -678,6 +678,8 @@ interface RlmChildRun {
 	sessionName: string;
 	sessionDir: string;
 	status: RlmChildAgentStatus;
+	startedAt: number;
+	durationMs?: number;
 	result?: RlmRunResult;
 	error?: string;
 	releaseError?: unknown;
@@ -689,7 +691,7 @@ interface RlmChildRun {
 	emitUpdate?: () => void;
 	/** Idempotent child-event forwarder cleanup, once the child runtime exists. */
 	unsubscribe?: () => void;
-	/** Rejects the public rlm.run promise when deletion detaches stuck underlying work. */
+	/** Rejects the public rlm.run promise when cancellation detaches stuck underlying work. */
 	rejectTask?: (error: Error) => void;
 	/** Snapshot retained until an in-flight runtime creation is released after early deletion. */
 	detachedDeletion?: RlmSubagentRegistryEntry;
@@ -6395,11 +6397,16 @@ export class AgentSession {
 	}
 
 	private _cancelRlmChildRun(run: RlmChildRun, reason: string): boolean {
+		if (run.status === "cancelled") {
+			return true;
+		}
 		if (run.status !== "running" && run.status !== "queued") {
 			return false;
 		}
 		run.status = "cancelled";
+		run.durationMs = Date.now() - run.startedAt;
 		run.error = reason;
+		run.rejectTask?.(new Error(reason));
 		run.abort();
 		// Surface the cancellation immediately; the run's own terminal update is
 		// delayed indefinitely when the child is stuck mid-stream, which is
@@ -6864,7 +6871,6 @@ export class AgentSession {
 		const parentAssistantForUsage = this._findLastAssistantMessage();
 		const label = rlmChildLabel(prompt);
 		let answerPreview: string | undefined;
-		let durationMs: number | undefined;
 		let toolUseCount = 0;
 		let runningToolCount = 0;
 		let activity: RlmChildAgentActivity | undefined;
@@ -6877,12 +6883,14 @@ export class AgentSession {
 			sessionName,
 			sessionDir: childSessionDir,
 			status: "running",
+			startedAt,
 			abort: noopRlmChildAbort,
 		};
 		this._activeRlmChildRuns.set(run.id, run);
 		// Status-only relay; the conversation is read from the child's own session.
 		const emitChildUpdate = () => {
 			const childModel = childSession?.model ?? modelSelection.model;
+			const active = run.status === "running" || run.status === "queued";
 			this._emit({
 				type: "rlm_child_update",
 				child: {
@@ -6892,13 +6900,13 @@ export class AgentSession {
 					model: `${childModel.provider}/${childModel.id}`,
 					label,
 					status: run.status,
-					durationMs,
+					durationMs: run.durationMs,
 					answerPreview,
 					toolUseCount: toolUseCount > 0 ? toolUseCount : undefined,
 					tokenCount: childSession?._contextTokensForCurrentMessages(),
 					recap: childSession?.getCurrentRecap(),
 					sessionDir: childSessionDir,
-					activity,
+					activity: active ? activity : undefined,
 					error: run.error,
 				},
 			});
@@ -7002,15 +7010,17 @@ export class AgentSession {
 				}
 				await child.prompt(prompt, { expandPromptTemplates: false, source: "extension" });
 				await child.agent.waitForIdle();
-				if (isRlmChildRunCancelled(run)) {
-					throw new Error(run.error ?? "RLM child cancelled");
-				}
 				const answer = child.getLastAssistantText() ?? "";
 				const usage = child._usageForCurrentMessages();
 				const assistantUsage = child._assistantUsageForCurrentMessages();
-				this._attributeRlmChildUsageToParent(assistantUsage, parentAssistantForUsage);
+				// Result collection can invoke synchronous observers. Make this the
+				// completion linearization point so cancellation cannot become done.
+				if (isRlmChildRunCancelled(run)) {
+					throw new Error(run.error ?? "RLM child cancelled");
+				}
 				run.status = "done";
-				durationMs = Date.now() - startedAt;
+				run.durationMs = Date.now() - run.startedAt;
+				this._attributeRlmChildUsageToParent(assistantUsage, parentAssistantForUsage);
 				activity = undefined;
 				const compactAnswer = compactRlmText(answer);
 				if (compactAnswer) {
@@ -7030,9 +7040,9 @@ export class AgentSession {
 			} catch (error) {
 				if (run.status !== "cancelled") {
 					run.status = "error";
+					run.durationMs = Date.now() - run.startedAt;
+					run.error = error instanceof Error ? error.message : String(error);
 				}
-				durationMs = Date.now() - startedAt;
-				run.error = error instanceof Error ? error.message : String(error);
 				activity = undefined;
 				emitChildUpdate();
 				throw error;

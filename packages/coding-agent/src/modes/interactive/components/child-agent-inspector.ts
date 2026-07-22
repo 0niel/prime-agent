@@ -192,6 +192,9 @@ function formatChildAgentDuration(durationMs: number | undefined): string {
 }
 
 function childAgentRecap(node: ChildAgentInspectorNode): string {
+	if (node.status === "cancelled") {
+		return "Cancelled";
+	}
 	const recap = node.recap?.replace(/\s+/g, " ").trim();
 	return recap || (node.hasActiveHeartbeat ? "Heartbeat active" : nodeActivityLabel(node));
 }
@@ -708,7 +711,7 @@ export class ChildAgentDetailComponent implements Component, Focusable {
 			}
 			lines.push(...loader.render(width).map((line) => this.indent(line, width, 1)));
 		}
-		const recap = node.recap?.trim();
+		const recap = node.status === "cancelled" ? "Cancelled" : node.recap?.trim();
 		if (recap) {
 			lines.push("");
 			lines.push(this.indent(this.truncate(theme.fg("dim", `Recap: ${recap}`), width - CONTENT_INDENT), width));

@@ -167,6 +167,83 @@ describe("mergeChildAgentSnapshots", () => {
 	});
 });
 
+describe("InteractiveMode subagent cancellation", () => {
+	type CancellationHarness = {
+		stoppingChildAgentIds: Set<string>;
+		childAgentSnapshots: Map<string, AgentConnectionRlmChildAgentSnapshot>;
+		childAgentDetailNodeId: string | undefined;
+		agentConnection: { cancelRlmChild(childId: string): Promise<boolean> };
+		refreshChildAgentInspector(): void;
+		removeChildAgentSnapshot(id: string): void;
+		showStatus(message: string): void;
+		showError(message: string): void;
+		ui: { requestRender(): void };
+		killChildAgent(nodeId: string): Promise<void>;
+		updateChildAgentInspector(child: AgentConnectionRlmChildAgentSnapshot): void;
+	};
+	const prototype = InteractiveMode.prototype as unknown as CancellationHarness;
+	const snapshot: AgentConnectionRlmChildAgentSnapshot = {
+		id: "child-1",
+		label: "Investigate cancellation",
+		status: "running",
+		sessionDir: "/tmp/child-1",
+		activity: { kind: "writing" },
+	};
+
+	function createHarness(result: boolean | Promise<boolean>): CancellationHarness {
+		return {
+			stoppingChildAgentIds: new Set(),
+			childAgentSnapshots: new Map([[snapshot.id, snapshot]]),
+			childAgentDetailNodeId: undefined,
+			agentConnection: { cancelRlmChild: vi.fn(async () => await result) },
+			refreshChildAgentInspector: vi.fn(),
+			removeChildAgentSnapshot: prototype.removeChildAgentSnapshot,
+			showStatus: vi.fn(),
+			showError: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			killChildAgent: prototype.killChildAgent,
+			updateChildAgentInspector: prototype.updateChildAgentInspector,
+		};
+	}
+
+	test("shows progress immediately and coalesces duplicate stop input", async () => {
+		const deferred = createDeferred<boolean>();
+		const harness = createHarness(deferred.promise);
+
+		const stopping = harness.killChildAgent(snapshot.id);
+		await harness.killChildAgent(snapshot.id);
+		expect(harness.showStatus).toHaveBeenCalledWith("Stopping subagent...");
+		expect(harness.agentConnection.cancelRlmChild).toHaveBeenCalledOnce();
+		deferred.resolve(true);
+		await stopping;
+
+		expect(harness.showStatus).toHaveBeenLastCalledWith("Subagent stopped");
+		expect(harness.stoppingChildAgentIds).toEqual(new Set());
+	});
+
+	test.each([
+		{ result: "finished", status: "Subagent is no longer running", error: undefined },
+		{ result: "failed", status: undefined, error: "Failed to stop subagent: transport unavailable" },
+	] as const)("reports completion races and failures without mutating the row", async ({ result, status, error }) => {
+		const harness = createHarness(result === "finished" ? false : Promise.reject(new Error("transport unavailable")));
+		await harness.killChildAgent(snapshot.id);
+
+		expect(harness.childAgentSnapshots.get(snapshot.id)).toBe(snapshot);
+		if (status) expect(harness.showStatus).toHaveBeenLastCalledWith(status);
+		if (error) expect(harness.showError).toHaveBeenCalledWith(error);
+	});
+
+	test("keeps user cancellation visible but removes deletion tombstones", () => {
+		const harness = createHarness(true);
+		const cancelled = { ...snapshot, status: "cancelled" as const, activity: undefined, error: "Cancelled by user" };
+		harness.updateChildAgentInspector(cancelled);
+		expect(harness.childAgentSnapshots.get(snapshot.id)).toMatchObject({ status: "cancelled", activity: undefined });
+
+		harness.updateChildAgentInspector({ ...cancelled, error: "Deleted by parent orchestrator" });
+		expect(harness.childAgentSnapshots.has(snapshot.id)).toBe(false);
+	});
+});
+
 describe("InteractiveMode update notifications", () => {
 	beforeAll(() => {
 		initTheme("dark");

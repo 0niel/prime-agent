@@ -37,6 +37,50 @@ describe("daemon mode helpers", () => {
 		expect(getChildActiveSessionStates(sessions, parent).map((state) => state.activeSessionId)).toEqual(["child"]);
 	});
 
+	it("acknowledges cancellation before awaiting hosted child shutdown", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const parent = makeState("parent");
+		const direct = makeState("direct", "parent", "direct-child");
+		const nested = makeState("nested", "direct", "nested-child");
+		parent.runtime = {
+			...parent.runtime,
+			session: { cancelRlmChildRun: vi.fn(() => true) },
+		} as unknown as ActiveSessionState["runtime"];
+		let finishClose: () => void = () => {};
+		const closeSession = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					finishClose = resolve;
+				}),
+		);
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			closeSession: typeof closeSession;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(parent.activeSessionId, parent);
+		internals.sessions.set(direct.activeSessionId, direct);
+		internals.sessions.set(nested.activeSessionId, nested);
+		internals.closeSession = closeSession;
+
+		await expect(
+			internals.handleCommand(makeClient("client", parent.activeSessionId), {
+				id: "cancel",
+				type: "cancel_rlm_child",
+				activeSessionId: parent.activeSessionId,
+				childId: "nested-child",
+			}),
+		).resolves.toMatchObject({ data: { cancelled: true } });
+		await Promise.resolve();
+		expect(closeSession).toHaveBeenCalledWith(nested, "killed");
+		finishClose();
+	});
+
 	it("cancels pending extension UI requests when the last client detaches", () => {
 		const firstClient = makeClient("client-1", "active");
 		const secondClient = makeClient("client-2", "active");
@@ -5642,7 +5686,7 @@ function makeRuntimeSession(
 	} as unknown as Awaited<ReturnType<CreateAgentSessionRuntimeFactory>>["session"];
 }
 
-function makeState(activeSessionId: string, parentActiveSessionId?: string): ActiveSessionState {
+function makeState(activeSessionId: string, parentActiveSessionId?: string, rlmChildId?: string): ActiveSessionState {
 	return {
 		activeSessionId,
 		clients: new Set(),
@@ -5652,6 +5696,7 @@ function makeState(activeSessionId: string, parentActiveSessionId?: string): Act
 				kind: "subagent",
 				createdAt: 1,
 				parentActiveSessionId,
+				rlmChildId,
 			},
 		},
 	} as unknown as ActiveSessionState;

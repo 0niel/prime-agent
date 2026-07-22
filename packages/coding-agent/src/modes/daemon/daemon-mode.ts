@@ -3077,6 +3077,17 @@ export class AgentDaemon {
 			case "cancel_rlm_child": {
 				const state = this.getSessionState(command.activeSessionId);
 				const cancelled = state.runtime.session.cancelRlmChildRun(command.childId);
+				if (cancelled) {
+					const child = [...this.sessions.values()].find(
+						(candidate) =>
+							candidate.runtime.metadata.kind === "subagent" &&
+							candidate.runtime.metadata.rlmChildId === command.childId &&
+							this.isRlmAncestorState(candidate, state),
+					);
+					if (child) {
+						void this.closeSession(child, "killed").catch(() => undefined);
+					}
+				}
 				return success(command.id, "cancel_rlm_child", { cancelled });
 			}
 
