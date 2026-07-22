@@ -106,6 +106,7 @@ export interface AgentOptions {
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
 	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
+	shouldStopBeforeTurn?: () => boolean;
 	getContinuationMessages?: (context: GetContinuationMessagesContext, signal?: AbortSignal) => Promise<AgentMessage[]>;
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
@@ -199,6 +200,7 @@ export class Agent {
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined>;
 	public shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
+	public shouldStopBeforeTurn?: () => boolean;
 	public getContinuationMessages?: (
 		context: GetContinuationMessagesContext,
 		signal?: AbortSignal,
@@ -226,6 +228,7 @@ export class Agent {
 		this.beforeToolCall = options.beforeToolCall;
 		this.afterToolCall = options.afterToolCall;
 		this.shouldStopAfterTurn = options.shouldStopAfterTurn;
+		this.shouldStopBeforeTurn = options.shouldStopBeforeTurn;
 		this.getContinuationMessages = options.getContinuationMessages;
 		this.steeringQueue = new PendingMessageQueue(options.steeringMode ?? "one-at-a-time");
 		this.followUpQueue = new PendingMessageQueue(options.followUpMode ?? "one-at-a-time");
@@ -481,6 +484,7 @@ export class Agent {
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
 			shouldStopAfterTurn: async (context) => this.shouldStopAfterTurn?.(context) ?? false,
+			shouldStopBeforeTurn: () => this.shouldStopBeforeTurn?.() ?? false,
 			convertToLlm: this.convertToLlm,
 			transformContext: this.transformContext,
 			getApiKey: this.getApiKey,

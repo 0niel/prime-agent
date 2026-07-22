@@ -540,6 +540,40 @@ describe("Agent", () => {
 		await firstPrompt.catch(() => {});
 	});
 
+	it("forwards shouldStopBeforeTurn from Agent options", async () => {
+		const shouldStopBeforeTurn = vi.fn(() => true);
+		let responseCount = 0;
+		const agent = new Agent({
+			shouldStopBeforeTurn,
+			streamFn: () => {
+				responseCount++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					stream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createToolUseMessage("work"),
+					});
+				});
+				return stream;
+			},
+		});
+		agent.state.tools = [
+			{
+				name: "work",
+				label: "Work",
+				description: "Work",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "done" }], details: {} }),
+			},
+		];
+
+		await agent.prompt("start");
+
+		expect(responseCount).toBe(1);
+		expect(shouldStopBeforeTurn).toHaveBeenCalledOnce();
+	});
+
 	it("continue() should process queued follow-up messages after an assistant turn", async () => {
 		const agent = new Agent({
 			streamFn: () => {
