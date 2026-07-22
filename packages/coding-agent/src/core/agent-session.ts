@@ -3140,6 +3140,7 @@ export class AgentSession {
 		let drainedNextTurnMessages: CustomMessage[] = [];
 		let expandedText = text;
 		let currentImages = options?.images;
+		let extensionResult: Awaited<ReturnType<typeof this._extensionRunner.emitBeforeAgentStart>> | undefined;
 
 		try {
 			let currentText = text;
@@ -3351,7 +3352,7 @@ export class AgentSession {
 				}
 
 				// Emit before_agent_start extension event
-				const extensionResult = await this._extensionRunner.emitBeforeAgentStart(
+				extensionResult = await this._extensionRunner.emitBeforeAgentStart(
 					expandedText,
 					currentImages,
 					this._baseSystemPrompt,
@@ -3397,7 +3398,7 @@ export class AgentSession {
 			// A refine may have completed during the wait and rewritten
 			// _baseSystemPrompt. Re-apply the extension-modified prompt if
 			// the extension provided one, otherwise use the refreshed base.
-			this.agent.state.systemPrompt = this._baseSystemPrompt;
+			this.agent.state.systemPrompt = extensionResult?.systemPrompt ?? this._baseSystemPrompt;
 		}
 		if (acceptedAgentMessagePrompt?.cleared) {
 			reportPreflight(false);
