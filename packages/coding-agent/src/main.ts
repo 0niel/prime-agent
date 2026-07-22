@@ -74,7 +74,7 @@ import { printTimings, resetTimings, time } from "./core/timings.js";
 import { runMigrations, showDeprecationWarnings } from "./migrations.js";
 import { isDaemonCatalogProcess, runDaemonCatalogProcess } from "./modes/daemon/daemon-catalog-process.js";
 import { deserializeDaemonError } from "./modes/daemon/daemon-errors.js";
-import { collectDaemonClientEnv, collectDaemonLaunchEnv } from "./modes/daemon/daemon-protocol.js";
+import { collectDaemonClientEnv } from "./modes/daemon/daemon-protocol.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	isDaemonWorkerProcess,
@@ -87,7 +87,6 @@ import {
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServicesFromServices,
 	DaemonAgentConnection,
-	DaemonCapabilityUnavailableError,
 	DaemonClient,
 	defaultDaemonSocketPath,
 	InProcessAgentConnection,
@@ -940,7 +939,6 @@ async function createDaemonClientConnection(options: {
 	sessionPath?: string;
 	continueRecent?: boolean;
 	activeSessionId?: string;
-	clientOwned?: boolean;
 	noSession?: boolean;
 	supportsExtensionUi?: boolean;
 }): Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }> {
@@ -953,7 +951,6 @@ async function createDaemonClientConnection(options: {
 			const connection = await DaemonAgentConnection.attach(client, getDaemonSummaryActiveSessionId(summary), {
 				closeClientOnDispose: true,
 				sendClientEnv: true,
-				ownedSession: options.clientOwned,
 				supportsExtensionUi: options.supportsExtensionUi,
 				recoverDaemon: () => ensureInteractiveDaemonRunning(options.socketPath),
 			});
@@ -965,7 +962,7 @@ async function createDaemonClientConnection(options: {
 			return await attach(summary);
 		}
 
-		if (options.sessionPath && !options.clientOwned) {
+		if (options.sessionPath) {
 			const activeSummary = findActiveDaemonSessionSummaryForSessionFile(
 				await listActiveDaemonSessionSummaries(client),
 				options.sessionPath,
@@ -974,13 +971,6 @@ async function createDaemonClientConnection(options: {
 				return await attach(activeSummary);
 			}
 		}
-		if (options.clientOwned) {
-			await client.waitForHello();
-			if (!client.supportsServerCapability("client_owned_sessions")) {
-				throw new DaemonCapabilityUnavailableError("create", "client_owned_sessions");
-			}
-		}
-
 		const response = await client.request({
 			type: "create",
 			config: options.config,
@@ -988,8 +978,6 @@ async function createDaemonClientConnection(options: {
 			continueRecent: options.continueRecent,
 			noSession: options.noSession,
 			env: collectDaemonClientEnv(),
-			lifecycle: options.clientOwned ? "client_owned" : "resident",
-			launchEnv: options.clientOwned ? collectDaemonLaunchEnv() : undefined,
 		});
 		if (!response.success) {
 			throw deserializeDaemonError(response);
@@ -1400,8 +1388,7 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 
 		daemonReady = (await awaitDaemonReady(daemonReady)).ready;
-		// A fresh default chat opens a real but message-less session; the lifecycle
-		// axis treats it as a draft (hidden, discarded on detach if never used), so
+		// A fresh default chat opens a real but message-less supervisor session, so
 		// no DeferredAgentConnection is needed to avoid creating it up front.
 		const isFreshDefaultSession =
 			!activeDaemonSessionSummary && !getInteractiveDaemonSessionPath(parsed, sessionManager);
@@ -1412,7 +1399,6 @@ export async function main(args: string[], options?: MainOptions) {
 				? getDaemonSummaryActiveSessionId(activeDaemonSessionSummary)
 				: undefined,
 			sessionPath: getInteractiveDaemonSessionPath(parsed, sessionManager),
-			clientOwned: parsed.noSession,
 			noSession: parsed.noSession,
 			supportsExtensionUi: true,
 		});
@@ -1475,7 +1461,6 @@ export async function main(args: string[], options?: MainOptions) {
 				config: defaultSessionConfig,
 				sessionPath: parsed.noSession ? undefined : sessionManager.getSessionFile(),
 				continueRecent: parsed.continue,
-				clientOwned: true,
 				noSession: parsed.noSession,
 				supportsExtensionUi: appMode === "rpc",
 			}));

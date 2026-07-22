@@ -3,13 +3,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../../src/cli/subprocess-launch.js";
 import { ENV_AGENT_DIR } from "../../../src/config.js";
 import type { AutonomousRuntimeState } from "../../../src/core/autonomous.js";
-import type { DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import { DaemonClient } from "../../../src/modes/daemon/daemon-client.js";
-import { DaemonSupervisor } from "../../../src/modes/daemon/daemon-supervisor.js";
 import { waitForHeadlessCompletion } from "../../../src/modes/headless-completion.js";
 import { RpcClient } from "../../../src/modes/rpc/rpc-client.js";
 import { createRpcExtensionUiBridge } from "../../../src/modes/rpc/rpc-extension-ui-context.js";
@@ -142,62 +140,6 @@ async function runRpc(
 }
 
 describe("ENG-4685 daemon-backed client modes", () => {
-	it("commits owned-worker promotion before best-effort peer synchronization", async () => {
-		const client = { id: "client-1" } as DaemonSocketClient;
-		const worker = {
-			descriptor: { ownerClientId: "protocol-client" },
-			launchEnv: { TEST: "value" },
-		};
-		const persistWorker = vi.fn();
-		const syncAgentPeers = vi.fn(async () => {
-			throw new Error("peer unavailable");
-		});
-		const log = vi.fn();
-		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-			protocolClientId: () => "protocol-client",
-			persistWorker,
-			syncAgentPeers,
-			log,
-		}) as {
-			promoteOwnedWorker(client: DaemonSocketClient, resident: typeof worker): Promise<void>;
-		};
-
-		await supervisor.promoteOwnedWorker(client, worker);
-		await supervisor.promoteOwnedWorker(client, worker);
-
-		expect(worker.descriptor.ownerClientId).toBeUndefined();
-		expect(worker.launchEnv).toBeUndefined();
-		expect(persistWorker).toHaveBeenCalledOnce();
-		expect(syncAgentPeers).toHaveBeenCalledOnce();
-		expect(log).toHaveBeenCalledWith(expect.stringContaining("peer unavailable"));
-	});
-
-	it("rolls back owned-worker promotion when persistence fails", async () => {
-		const client = { id: "client-1" } as DaemonSocketClient;
-		const descriptor = { ownerClientId: "protocol-client" };
-		const timer = setTimeout(() => {}, 60_000);
-		const worker = {
-			descriptor,
-			launchEnv: { TEST: "value" },
-			ownerCleanupTimer: timer,
-		};
-		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-			protocolClientId: () => "protocol-client",
-			persistWorker: () => {
-				throw new Error("disk full");
-			},
-		}) as {
-			promoteOwnedWorker(client: DaemonSocketClient, resident: typeof worker): Promise<void>;
-		};
-
-		await expect(supervisor.promoteOwnedWorker(client, worker)).rejects.toThrow("disk full");
-
-		expect(worker.descriptor).toBe(descriptor);
-		expect(worker.launchEnv).toEqual({ TEST: "value" });
-		expect(worker.ownerCleanupTimer).toBe(timer);
-		clearTimeout(timer);
-	});
-
 	it("runs host-owned autonomous gate retries through the shared completion loop", async () => {
 		const gate = `${process.execPath} -e "process.exit(0)"`;
 		const harness = await createHarness({

@@ -671,46 +671,27 @@ function emitSequencedQueueUpdate(client: FakeDaemonClient, activeSessionId: str
 }
 
 describe("DaemonAgentConnection", () => {
-	it("uses fleet heartbeat scope for residents and session scope for owned workers", async () => {
-		const residentClient = new FakeDaemonClient();
-		residentClient.serverCapabilities.add("heartbeat_catalog");
-		const resident = new DaemonAgentConnection(asDaemonClient(residentClient), "resident-1");
-		await resident.listHeartbeats();
+	it("uses fleet heartbeat scope for supervisor-owned workers", async () => {
+		const client = new FakeDaemonClient();
+		client.serverCapabilities.add("heartbeat_catalog");
+		const connection = new DaemonAgentConnection(asDaemonClient(client), "resident-1");
+		await connection.listHeartbeats();
 
-		const ownedClient = new FakeDaemonClient();
-		ownedClient.serverCapabilities.add("heartbeat_catalog");
-		const owned = new DaemonAgentConnection(asDaemonClient(ownedClient), "owned-1", { ownedSession: true });
-		await owned.listHeartbeats();
-
-		expect(residentClient.requests.at(-1)).toEqual(expect.objectContaining({ type: "heartbeats_list" }));
-		expect(residentClient.requests.at(-1)).not.toHaveProperty("activeSessionId");
-		expect(ownedClient.requests.at(-1)).toEqual(
-			expect.objectContaining({ type: "heartbeats_list", activeSessionId: "owned-1" }),
-		);
+		expect(client.requests.at(-1)).toEqual(expect.objectContaining({ type: "heartbeats_list" }));
+		expect(client.requests.at(-1)).not.toHaveProperty("activeSessionId");
 	});
 
-	it("serializes concurrent owned-session promotion commands", async () => {
+	it("does not couple scheduled jobs to a client lifecycle", async () => {
 		const fakeClient = new FakeDaemonClient();
-		let releaseFirst = () => {};
-		fakeClient.cronAddGate = new Promise<void>((resolve) => {
-			releaseFirst = resolve;
-		});
-		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1", {
-			ownedSession: true,
-		});
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
 
-		const first = connection.addCronJob("0 * * * *", "first");
-		const second = connection.addCronJob("30 * * * *", "second");
-		await vi.waitFor(() => {
-			expect(fakeClient.requests.filter((request) => request.type === "cron_add")).toHaveLength(1);
-		});
-		releaseFirst();
-		await Promise.all([first, second]);
+		await Promise.all([connection.addCronJob("0 * * * *", "first"), connection.addCronJob("30 * * * *", "second")]);
 
 		const commands = fakeClient.requests.filter(
 			(command): command is Extract<DaemonCommand, { type: "cron_add" }> => command.type === "cron_add",
 		);
-		expect(commands.map((command) => command.promoteOwnedSession)).toEqual([true, false]);
+		expect(commands).toHaveLength(2);
+		expect(commands.every((command) => command.promoteOwnedSession === undefined)).toBe(true);
 	});
 
 	it("degrades an unavailable heartbeat catalog without sending an unsupported command", async () => {

@@ -136,6 +136,7 @@ export interface DaemonClientEnv {
 	env?: Record<string, string>;
 }
 
+/** Legacy create hint retained for older clients. Supervisors host every worker as resident. */
 export type DaemonSessionLifecycle = "resident" | "client_owned";
 
 export interface DaemonLaunchEnv {
