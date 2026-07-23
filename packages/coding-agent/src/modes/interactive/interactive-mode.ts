@@ -863,6 +863,8 @@ export interface InteractiveModeRunResult {
 	source: Pick<AgentConnectionState, "activeSessionId" | "sessionFile" | "sessionId" | "sessionName" | "cwd">;
 }
 
+type LocalSessionViewResult = { type: "exit" } | { type: "cancelled" } | { type: "opened" };
+
 export class InteractiveMode {
 	private static readonly EXIT_HINT_DURATION_MS = 2000;
 	private static readonly ESCAPE_REPEAT_WINDOW_MS = 500;
@@ -1534,10 +1536,7 @@ export class InteractiveMode {
 	async run(): Promise<InteractiveModeRunResult> {
 		await this.init();
 		if (this.options.openSessionViewOnStartup) {
-			const result = await this.showLocalSessionView();
-			if (result === "exit") {
-				await this.shutdown();
-			}
+			await this.openLocalSessionViewOnStartup();
 		}
 
 		// Global, environment-scoped notices (app update, extension updates, tmux setup)
@@ -8393,14 +8392,19 @@ export class InteractiveMode {
 		});
 	}
 
-	private async showLocalSessionView(): Promise<"exit" | "opened"> {
+	private async openLocalSessionViewOnStartup(): Promise<void> {
+		const result = await this.showLocalSessionView();
+		if (result.type === "exit") await this.shutdown();
+	}
+
+	private async showLocalSessionView(): Promise<LocalSessionViewResult> {
 		const adapter = createLocalSessionViewAdapter(this.agentConnection, (sessionPath) =>
 			this.handleResumeSession(sessionPath),
 		);
 		this.ui.stop({ preserveAltScreen: true, flushFullscreen: false });
-		let selected: SessionSummary | undefined;
+		let result: Awaited<ReturnType<typeof runLocalSessionView>>;
 		try {
-			selected = await runLocalSessionView(
+			result = await runLocalSessionView(
 				{
 					config: { cwd: this.getCurrentCwd(), sessionDir: this.connectionState?.sessionDir },
 					uiServices: this.uiServices,
@@ -8420,9 +8424,9 @@ export class InteractiveMode {
 			if (this.fullscreenEnabled) this.applyFullscreen(true);
 			this.ui.requestRender(true);
 		}
-		if (!selected) return "exit";
-		const opened = await adapter.open(selected);
-		return opened.cancelled ? "exit" : "opened";
+		if (result.type === "exit") return { type: "exit" };
+		const opened = await adapter.open(result.summary);
+		return opened.cancelled ? { type: "cancelled" } : { type: "opened" };
 	}
 
 	private async handleResumeSession(

@@ -244,7 +244,36 @@ export function filterUnifiedSessions(
 	records: readonly UnifiedSessionRecord[],
 	matches: (searchableText: string) => boolean,
 ): UnifiedSessionRecord[] {
-	return records.filter((record) => matches(record.searchableText));
+	const recordsByKey = new Map<string, UnifiedSessionRecord>();
+	for (const record of records) {
+		for (const key of record.identityAliases) recordsByKey.set(key, record);
+	}
+
+	const retained = new Set<UnifiedSessionRecord>();
+	for (const record of records) {
+		if (!matches(record.searchableText)) continue;
+		let current: UnifiedSessionRecord | undefined = record;
+		while (current && !retained.has(current)) {
+			retained.add(current);
+			current = findParentRecord(current, recordsByKey);
+		}
+	}
+	// Keep catalog order and the original records so row ranking and sections
+	// remain authoritative while ancestors provide the hierarchy for matches.
+	return records.filter((record) => retained.has(record));
+}
+
+function findParentRecord(
+	record: UnifiedSessionRecord,
+	byKey: ReadonlyMap<string, UnifiedSessionRecord>,
+): UnifiedSessionRecord | undefined {
+	// Only live daemon summaries carry parent links; saved-only rows are roots.
+	if (!record.daemon) return undefined;
+	for (const key of getParentKeys(record.daemon)) {
+		const parent = byKey.get(key);
+		if (parent) return parent;
+	}
+	return undefined;
 }
 
 export function aggregateSessionHeartbeats(
@@ -307,16 +336,19 @@ function findParentSummary(
 	summary: SessionSummary,
 	byKey: ReadonlyMap<string, SessionSummary>,
 ): SessionSummary | undefined {
-	for (const key of [
-		summary.parentActiveSessionId ? `active:${summary.parentActiveSessionId}` : undefined,
-		summary.parentSessionId ? `session:${summary.parentSessionId}` : undefined,
-		summary.parentSessionPath ? fileIdentity(summary.parentSessionPath) : undefined,
-	]) {
-		if (!key) continue;
+	for (const key of getParentKeys(summary)) {
 		const parent = byKey.get(key);
 		if (parent) return parent;
 	}
 	return undefined;
+}
+
+function getParentKeys(summary: SessionSummary): string[] {
+	return [
+		summary.parentActiveSessionId ? `active:${summary.parentActiveSessionId}` : undefined,
+		summary.parentSessionId ? `session:${summary.parentSessionId}` : undefined,
+		summary.parentSessionPath ? fileIdentity(summary.parentSessionPath) : undefined,
+	].filter((key): key is string => key !== undefined);
 }
 
 export function getAgentsViewSummaryIdentity(summary: SessionSummary): string {
@@ -640,16 +672,9 @@ function findParentRow(
 	summary: SessionSummary,
 	rowsByKey: ReadonlyMap<string, MutableAgentsViewRow>,
 ): MutableAgentsViewRow | undefined {
-	const keys = [
-		summary.parentActiveSessionId ? `active:${summary.parentActiveSessionId}` : undefined,
-		summary.parentSessionId ? `session:${summary.parentSessionId}` : undefined,
-		summary.parentSessionPath ? fileIdentity(summary.parentSessionPath) : undefined,
-	].filter((key): key is string => key !== undefined);
-	for (const key of keys) {
+	for (const key of getParentKeys(summary)) {
 		const row = rowsByKey.get(key);
-		if (row) {
-			return row;
-		}
+		if (row) return row;
 	}
 	return undefined;
 }

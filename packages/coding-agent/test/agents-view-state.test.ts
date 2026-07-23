@@ -21,6 +21,7 @@ import {
 	aggregateSessionHeartbeats,
 	buildAgentsViewRows,
 	classifyAgentsViewSession,
+	filterUnifiedSessions,
 	formatHeartbeatBadge,
 	getAgentsViewSelectionKey,
 	reconcileUnifiedSessions,
@@ -835,6 +836,57 @@ describe("agents view state", () => {
 			title: "Live name",
 			record,
 		});
+	});
+
+	test("retains the ancestor chain when search matches only a nested subagent", () => {
+		const summaries = [
+			makeSummary({ id: "root", activeSessionId: "root", sessionId: "root-session", sessionName: "Root" }),
+			makeSummary({
+				id: "child",
+				activeSessionId: "child",
+				sessionId: "child-session",
+				sessionName: "Child",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "root",
+			}),
+			makeSummary({
+				id: "match",
+				activeSessionId: "match",
+				sessionId: "match-session",
+				sessionName: "Needle",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "child",
+			}),
+			makeSummary({
+				id: "newer",
+				activeSessionId: "newer",
+				sessionId: "newer-session",
+				sessionName: "Needle peer",
+				created: "2026-02-01T00:00:00Z",
+			}),
+		];
+		const records = reconcileUnifiedSessions(summaries, []);
+		const filtered = filterUnifiedSessions(records, (text) => text.includes("Needle"));
+
+		expect(filtered.map((record) => record.daemon?.sessionId)).toEqual([
+			"root-session",
+			"child-session",
+			"match-session",
+			"newer-session",
+		]);
+		const rootIdentity = records[0]?.identity ?? "";
+		const childIdentity = records[1]?.identity ?? "";
+		expect(
+			buildAgentsViewRows(filtered, new Set([rootIdentity, childIdentity])).map((row) => [
+				row.summary.sessionId,
+				row.depth,
+			]),
+		).toEqual([
+			["newer-session", 0],
+			["root-session", 0],
+			["child-session", 1],
+			["match-session", 2],
+		]);
 	});
 
 	test("deduplicates and protects sessions across symlink aliases", () => {

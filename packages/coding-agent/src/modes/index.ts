@@ -27,6 +27,7 @@ export {
 	aggregateSessionHeartbeats,
 	buildAgentsViewRows,
 	classifyAgentsViewSession,
+	filterUnifiedSessions,
 	formatHeartbeatBadge,
 	getAgentsViewSelectionKey,
 	reconcileUnifiedSessions,

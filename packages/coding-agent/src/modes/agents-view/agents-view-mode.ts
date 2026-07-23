@@ -310,9 +310,8 @@ function isUnknownActiveSessionError(error: unknown): boolean {
 export async function runLocalSessionView(
 	options: Omit<AgentsViewModeOptions, "socketPath" | "adapter">,
 	adapter: SessionViewAdapter,
-): Promise<SessionSummary | undefined> {
-	const result = await new AgentsViewMode({ ...options, adapter }, {}).run();
-	return result.type === "open" ? result.summary : undefined;
+): Promise<AgentsViewRunResult> {
+	return new AgentsViewMode({ ...options, adapter }, {}).run();
 }
 
 export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise<void> {

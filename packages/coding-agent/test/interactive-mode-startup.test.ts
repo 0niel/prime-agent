@@ -106,9 +106,36 @@ describe("InteractiveMode startup hints", () => {
 		expect(showStatus).toHaveBeenCalledWith("Send, stash, or clear your draft before opening agents");
 	});
 
+	it.each(["cancelled", "opened"] as const)(
+		"continues startup when the local session view returns %s",
+		async (type) => {
+			const shutdown = vi.fn(async () => {});
+			const mode = Object.assign(createMode(), {
+				showLocalSessionView: vi.fn(async () => ({ type })),
+				shutdown,
+			});
+
+			await Reflect.get(InteractiveMode.prototype, "openLocalSessionViewOnStartup").call(mode);
+
+			expect(shutdown).not.toHaveBeenCalled();
+		},
+	);
+
+	it("shuts down only when the local session view itself exits", async () => {
+		const shutdown = vi.fn(async () => {});
+		const mode = Object.assign(createMode(), {
+			showLocalSessionView: vi.fn(async () => ({ type: "exit" as const })),
+			shutdown,
+		});
+
+		await Reflect.get(InteractiveMode.prototype, "openLocalSessionViewOnStartup").call(mode);
+
+		expect(shutdown).toHaveBeenCalledOnce();
+	});
+
 	it("uses the shared session view for non-daemon chats", async () => {
 		const returnToAgentsView = vi.fn(async () => {});
-		const showLocalSessionView = vi.fn(async () => "exit");
+		const showLocalSessionView = vi.fn(async () => ({ type: "exit" as const }));
 		const mode = Object.assign(
 			createMode(false, false, () => "draft prompt"),
 			{
