@@ -4,7 +4,7 @@ See the repository [AGENTS.md](../../../AGENTS.md) for the current contribution 
 
 ## Setup
 
-Prime Agent requires Node.js 22.8.0 or newer.
+Prime Agent requires Node.js 22.9.0 or newer.
 
 ```bash
 git clone https://github.com/PrimeIntellect-ai/prime-agent

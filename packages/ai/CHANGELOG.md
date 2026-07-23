@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Fixed Vertex Gemini 2.5 Flash-Lite minimal reasoning requests to use the supported 512-token thinking budget.
+- Changed the Node.js minimum to 20.18.1 and pinned the install-script-bearing Google Gen AI dependency.
 
 ## [0.3.2] - 2026-07-20
 

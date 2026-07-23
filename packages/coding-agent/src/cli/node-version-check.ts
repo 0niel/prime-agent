@@ -1,6 +1,6 @@
 // Dependency-free and Node-20-safe so it can never crash on the versions it rejects.
 
-const MIN_NODE_VERSION_PARTS = [22, 8, 0] as const;
+const MIN_NODE_VERSION_PARTS = [22, 9, 0] as const;
 export const MIN_NODE_VERSION = MIN_NODE_VERSION_PARTS.join(".");
 
 export interface NodeVersionGuardIO {
