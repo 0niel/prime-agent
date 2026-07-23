@@ -2442,4 +2442,44 @@ describe("AgentSession queue characterization", () => {
 			"Cannot refine without aborting while the agent is running.",
 		);
 	});
+	it("waits for an earlier direct handoff before executing a session command", async () => {
+		let releaseBeforeAgentStart: (() => void) | undefined;
+		const beforeAgentStartGate = new Promise<void>((resolve) => {
+			releaseBeforeAgentStart = resolve;
+		});
+		let directHandoffStarted: (() => void) | undefined;
+		const waitForDirectHandoff = new Promise<void>((resolve) => {
+			directHandoffStarted = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event) => {
+						if (event.prompt === "earlier direct prompt") await beforeAgentStartGate;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			async () => {
+				directHandoffStarted?.();
+				return fauxAssistantMessage("direct done");
+			},
+		]);
+
+		const direct = harness.session.prompt("earlier direct prompt");
+		await vi.waitFor(() => expect(releaseBeforeAgentStart).toBeDefined());
+		const command = harness.session.prompt("/autonomous on");
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(harness.session.getAutonomousStatus().enabled).toBe(false);
+
+		releaseBeforeAgentStart?.();
+		await waitForDirectHandoff;
+		await direct;
+		await command;
+
+		expect(harness.session.getAutonomousStatus().enabled).toBe(true);
+		expect(getUserTexts(harness)).toEqual(["earlier direct prompt"]);
+	});
 });

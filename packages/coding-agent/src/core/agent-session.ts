@@ -4158,6 +4158,7 @@ export class AgentSession {
 					schedule,
 				);
 				reportPreflight(queued, wasBusy);
+				releaseAdmission();
 				if (!wasBusy) await this._sessionInputPump;
 				return;
 			}
