@@ -56,6 +56,14 @@ describe("buildSessionList", () => {
 		]);
 	});
 
+	it("uses the stable session header time for active rows without a saved catalog entry", () => {
+		const state = makeState({ activeSessionId: "active", sessionFile: "/tmp/active.jsonl" });
+		const first = summaryForActiveSession(state);
+		const second = summaryForActiveSession(state);
+		expect(first.created).toBe("2026-05-01T00:00:00.000Z");
+		expect(second.created).toBe(first.created);
+	});
+
 	it("keeps a session working while background subagents run", () => {
 		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
 		const entries = buildSessionList(
@@ -582,6 +590,7 @@ function makeState(options: StateOptions): ActiveSessionState {
 				sessionName: `session ${options.activeSessionId}`,
 				sessionManager: {
 					getCwd: () => "/tmp/project",
+					getHeader: () => ({ timestamp: "2026-05-01T00:00:00.000Z" }),
 					getSessionDir: () => "/tmp/sessions",
 					hasUserContent: () => options.hasUserContent ?? false,
 				},

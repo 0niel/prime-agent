@@ -188,7 +188,7 @@ export function summaryForActiveSession(
 		messageCount: session.messages.length,
 		pendingMessageCount,
 		streamingMessage: session.state.streamingMessage,
-		created: savedSession?.created.toISOString(),
+		created: savedSession?.created.toISOString() ?? session.sessionManager.getHeader()?.timestamp,
 		modified,
 		// Subagent sessions live in artifact dirs that the saved-session scan
 		// never sees; their spawn prompt is the most identifying title we have.

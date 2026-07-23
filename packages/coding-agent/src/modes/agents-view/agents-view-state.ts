@@ -208,14 +208,14 @@ export function reconcileUnifiedSessions(
 export function summaryForUnifiedRecord(record: UnifiedSessionRecord): SessionSummary {
 	if (record.daemon) {
 		const saved = record.saved;
-		if (!saved || (record.daemon.sessionName && record.daemon.firstMessage && record.daemon.sessionFile)) {
-			return record.daemon;
-		}
+		if (!saved) return record.daemon;
 		return {
 			...record.daemon,
 			sessionName: record.daemon.sessionName ?? saved.name,
 			firstMessage: record.daemon.firstMessage ?? saved.firstMessage,
 			sessionFile: record.daemon.sessionFile ?? canonicalSessionPath(saved.path),
+			created: record.daemon.created ?? saved.created.toISOString(),
+			modified: record.daemon.modified ?? saved.modified.toISOString(),
 		};
 	}
 	const saved = record.saved;
