@@ -232,7 +232,7 @@ import {
 import type { SessionStats } from "./session-stats.js";
 import type { SettingsManager } from "./settings-manager.js";
 import { getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
-import type { SlashCommandInfo } from "./slash-commands.js";
+import { parseSessionSlashCommand, type SlashCommandInfo } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
@@ -1481,11 +1481,10 @@ export class AgentSession {
 	}
 
 	private _parseGoalSlashCommand(text: string): GoalSlashCommand | undefined {
-		if (text !== "/goal" && !text.startsWith("/goal ")) {
-			return undefined;
-		}
+		const command = parseSessionSlashCommand(text);
+		if (command?.name !== "goal") return undefined;
 
-		const rest = text.slice("/goal".length).trim();
+		const rest = command.args;
 		const normalized = rest.toLowerCase();
 		if (!rest || normalized === "status") {
 			return { kind: "status" };
@@ -1530,10 +1529,9 @@ export class AgentSession {
 	}
 
 	private _parseAutonomousSlashCommand(text: string): AutonomousSlashCommand | undefined {
-		if (text !== "/autonomous" && !text.startsWith("/autonomous ")) {
-			return undefined;
-		}
-		const rest = text.slice("/autonomous".length).trim().toLowerCase();
+		const command = parseSessionSlashCommand(text);
+		if (command?.name !== "autonomous") return undefined;
+		const rest = command.args.toLowerCase();
 		if (!rest || rest === "status") {
 			return { kind: "status" };
 		}
@@ -3984,27 +3982,23 @@ export class AgentSession {
 					this.hasAcceptedPromptInFlight);
 
 			const shouldHandleBuiltInSlashCommands = !isInternalPrompt && !options?.skipPrePromptWork;
+			const sessionSlashCommand = shouldHandleBuiltInSlashCommands
+				? parseSessionSlashCommand(currentText)
+				: undefined;
 			const isBuiltInSlashCommand =
-				shouldHandleBuiltInSlashCommands &&
-				(currentText === "/autonomous" ||
-					currentText.startsWith("/autonomous ") ||
-					currentText === "/goal" ||
-					currentText.startsWith("/goal "));
+				sessionSlashCommand?.name === "autonomous" || sessionSlashCommand?.name === "goal";
 			if (!this.isStreaming && isBuiltInSlashCommand && hasQueueIfBusyBackpressure()) {
 				reportPreflight(false);
 				throw new Error("Agent has queued work. Retry the slash command after pending work finishes.");
 			}
-			if (
-				shouldHandleBuiltInSlashCommands &&
-				(currentText === "/autonomous" || currentText.startsWith("/autonomous "))
-			) {
+			if (sessionSlashCommand?.name === "autonomous") {
 				const handledAutonomousCommand = await this._handleAutonomousSlashCommand(currentText);
 				if (handledAutonomousCommand) {
 					reportPreflight(true);
 					return;
 				}
 			}
-			if (shouldHandleBuiltInSlashCommands && (currentText === "/goal" || currentText.startsWith("/goal "))) {
+			if (sessionSlashCommand?.name === "goal") {
 				const handledGoalCommand = await this._handleGoalSlashCommand(currentText, currentImages);
 				if (handledGoalCommand) {
 					reportPreflight(true);

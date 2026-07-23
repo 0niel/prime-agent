@@ -1168,22 +1168,22 @@ stale post-hook extension instructions`,
 		).toBeUndefined();
 	});
 
-	it("handles autonomous slash commands when template expansion is disabled", async () => {
+	it("handles tab-separated autonomous slash commands when template expansion is disabled", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 
-		await harness.session.prompt("/autonomous on", { expandPromptTemplates: false });
+		await harness.session.prompt("/autonomous	on", { expandPromptTemplates: false });
 
 		expect(harness.session.getAutonomousStatus().enabled).toBe(true);
 		expect(harness.getPendingResponseCount()).toBe(0);
 		expect(harness.session.messages.some((message) => message.role === "custom")).toBe(true);
 	});
 
-	it("handles goal slash commands when template expansion is disabled", async () => {
+	it("handles Unicode-space-separated goal slash commands when template expansion is disabled", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 
-		await harness.session.prompt("/goal status", { expandPromptTemplates: false });
+		await harness.session.prompt("/goal status", { expandPromptTemplates: false });
 
 		expect(harness.eventsOfType("goal_update")).toHaveLength(1);
 		expect(harness.getPendingResponseCount()).toBe(0);
