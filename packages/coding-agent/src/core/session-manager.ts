@@ -258,13 +258,6 @@ export interface SessionContext {
 	model: { provider: string; modelId: string } | null;
 }
 
-function normalizeLegacyCodexAssistant(message: AssistantMessage): AssistantMessage {
-	if (message.api === "openai-codex-responses" && message.provider === "openai") {
-		return { ...message, provider: "openai-codex" };
-	}
-	return message;
-}
-
 export interface SessionInfo {
 	path: string;
 	id: string;
@@ -506,8 +499,7 @@ export function buildSessionContext(
 		} else if (entry.type === "model_change") {
 			model = { provider: entry.provider, modelId: entry.modelId };
 		} else if (entry.type === "message" && entry.message.role === "assistant") {
-			const assistantMessage = normalizeLegacyCodexAssistant(entry.message);
-			model = { provider: assistantMessage.provider, modelId: assistantMessage.model };
+			model = { provider: entry.message.provider, modelId: entry.message.model };
 		} else if (entry.type === "compaction") {
 			compaction = entry;
 		}
@@ -522,9 +514,7 @@ export function buildSessionContext(
 
 	const appendMessage = (entry: SessionEntry) => {
 		if (entry.type === "message") {
-			messages.push(
-				entry.message.role === "assistant" ? normalizeLegacyCodexAssistant(entry.message) : entry.message,
-			);
+			messages.push(entry.message);
 		} else if (entry.type === "custom_message") {
 			messages.push(
 				createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
@@ -1699,7 +1689,9 @@ export class SessionManager {
 		// the header), so the entries argument is only a fallback for an undefined
 		// leaf — never hit here since leafId is always set or null. Avoids an O(n)
 		// array copy on every call (attach, get_session_context, agent init, ...).
-		return buildSessionContext(this.fileEntries as SessionEntry[], this.leafId, this.byId);
+		const context = buildSessionContext(this.fileEntries as SessionEntry[], this.leafId, this.byId);
+		const header = this.fileEntries[0];
+		return header?.type === "session" && header.importedFrom ? { ...context, model: null } : context;
 	}
 
 	/**

@@ -509,9 +509,10 @@ describe("ENG-4373 onboarding session import", () => {
 			const entries = loadEntriesFromFile(imported.sessionFile);
 			const header = entries[0] as SessionHeader;
 			const state = [...entries].reverse().find((entry) => entry.type === "session_state");
-			const context = buildSessionContext(entries.slice(1).filter((entry) => entry.type !== "session"));
+			const context = SessionManager.open(imported.sessionFile, getSessionsDir(agentDir)).buildSessionContext();
 			expect(header.importedFrom?.source).toBe(imported.source);
 			expect(state?.type === "session_state" ? state.state.status : undefined).toBe("active");
+			expect(context.model).toBeNull();
 			expect(
 				context.messages.some(
 					(message) =>
@@ -524,7 +525,7 @@ describe("ENG-4373 onboarding session import", () => {
 				.slice(1)
 				.filter((entry) => entry.type !== "session"),
 		);
-		expect(codexContext.messages.find((message) => message.role === "assistant")?.provider).toBe("openai-codex");
+		expect(codexContext.messages.find((message) => message.role === "assistant")?.provider).toBe("openai");
 		expect(
 			codexContext.messages
 				.filter((message) => message.role === "assistant")
@@ -540,7 +541,7 @@ describe("ENG-4373 onboarding session import", () => {
 		});
 	});
 
-	it("restores legacy Codex imports through the Codex subscription provider", () => {
+	it("keeps normal model restoration for native Prime Agent sessions", () => {
 		const manager = SessionManager.inMemory("/workspace/codex");
 		manager.appendMessage({
 			role: "assistant",
@@ -555,8 +556,8 @@ describe("ENG-4373 onboarding session import", () => {
 
 		const context = manager.buildSessionContext();
 
-		expect(context.model).toEqual({ provider: "openai-codex", modelId: "gpt-5.6-sol" });
-		expect(context.messages.find((message) => message.role === "assistant")?.provider).toBe("openai-codex");
+		expect(context.model).toEqual({ provider: "openai", modelId: "gpt-5.6-sol" });
+		expect(context.messages.find((message) => message.role === "assistant")?.provider).toBe("openai");
 	});
 
 	it("continues importing other sources when one source disappears", async () => {
