@@ -7,6 +7,7 @@ import { setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getSessionsDir } from "../../../src/config.js";
 import { KeybindingsManager } from "../../../src/core/keybindings.js";
+import { convertToLlm } from "../../../src/core/messages.js";
 import {
 	detectSessionImportFileKind,
 	discoverSessionImports,
@@ -375,6 +376,21 @@ describe("ENG-4373 onboarding session import", () => {
 			expect(header.importedFrom?.contentHash).toMatch(/^[a-f0-9]{64}$/);
 			const context = buildSessionContext(entries.slice(1).filter((entry) => entry.type !== "session"));
 			expect(context.messages.some((message) => message.role === "user")).toBe(true);
+			expect(context.messages.at(-1)).toMatchObject({
+				role: "custom",
+				customType: "session_import_boundary",
+				display: false,
+				details: { source: header.importedFrom?.source },
+			});
+			expect(convertToLlm(context.messages).at(-1)).toMatchObject({
+				role: "user",
+				content: [
+					{
+						type: "text",
+						text: expect.stringContaining("use only the tools exposed in this session"),
+					},
+				],
+			});
 			expect(
 				context.messages.some(
 					(message) =>
@@ -513,6 +529,12 @@ describe("ENG-4373 onboarding session import", () => {
 			expect(header.importedFrom?.source).toBe(imported.source);
 			expect(state?.type === "session_state" ? state.state.status : undefined).toBe("active");
 			expect(context.model).toBeNull();
+			expect(context.messages.at(-1)).toMatchObject({
+				role: "custom",
+				customType: "session_import_boundary",
+				display: false,
+				details: { source: imported.source },
+			});
 			expect(
 				context.messages.some(
 					(message) =>
