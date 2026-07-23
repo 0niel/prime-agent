@@ -366,6 +366,10 @@ describe("parseCommandArgs + substituteArgs integration", () => {
 		expect(result).toBe("Create component Button with features: Button onClick handler disabled support");
 	});
 
+	test("should split Unicode spaces for positional template arguments", () => {
+		expect(substituteArgs("$1|$2", parseCommandArgs("first\u2002second"))).toBe("first|second");
+	});
+
 	test("should handle the example from README", () => {
 		const input = 'Button "onClick handler" "disabled support"';
 		const args = parseCommandArgs(input);
