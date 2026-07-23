@@ -12,7 +12,7 @@ import type { ActiveSessionState, DaemonSocketClient } from "../../../src/modes/
 import { AgentDaemon } from "../../../src/modes/daemon/daemon-mode.js";
 import type { DaemonUpdateRestartManifest } from "../../../src/modes/daemon/daemon-protocol.js";
 import { prepareDaemonUpdateRestart } from "../../../src/package-manager-cli.js";
-import { createHarness, getUserTexts, type Harness } from "../harness.js";
+import { createHarness, getMessageText, getUserTexts, type Harness } from "../harness.js";
 
 type AgentDaemonUpdateInternals = {
 	sessions: Map<string, ActiveSessionState>;
@@ -51,16 +51,6 @@ type QueueInternals = {
 		message: UserMessage | CustomMessage;
 	}>;
 	_pendingNextTurnMessages: CustomMessage[];
-	_activeSessionInput?: {
-		kind: "prompt";
-		lane: "steer" | "followUp";
-		items: QueueInternals["_followUpMessages"];
-		phase: "preparing" | "handedOff";
-		checkpointInputMessages: Set<UserMessage | CustomMessage>;
-		persistedInputMessages: Set<UserMessage | CustomMessage>;
-	};
-	waitForSessionInputCheckpoint(signal?: AbortSignal): Promise<void>;
-	_notifySessionInputCheckpointChange(): void;
 	_acceptedAgentMessagePrompt?: {
 		text: string;
 		agentMessageId: string;
@@ -137,45 +127,100 @@ describe("issue #4257 update restart resume", () => {
 		}
 	});
 
-	it("keeps a prestart input in the manifest exactly once until message_end persistence", async () => {
-		const harness = await createHarness({ persistSession: true });
-		harnesses.push(harness);
-		const internals = harness.session as unknown as QueueInternals;
-		const message: UserMessage = {
-			role: "user",
-			content: [{ type: "text", text: "blocked prestart update" }],
-			timestamp: Date.now(),
-		};
-		const input = {
-			text: "blocked prestart update",
-			prefixMessages: [],
-			message,
-		};
-		internals._activeSessionInput = {
-			kind: "prompt",
-			lane: "followUp",
-			items: [input],
-			phase: "preparing",
-			checkpointInputMessages: new Set([message]),
-			persistedInputMessages: new Set(),
-		};
-
-		let checkpointSettled = false;
-		const checkpoint = internals.waitForSessionInputCheckpoint().then(() => {
-			checkpointSettled = true;
+	it("waits for the full admitted prompt checkpoint before preparing restart", async () => {
+		let releaseAssistantMessageEnd: (() => void) | undefined;
+		const assistantMessageEndBlocked = new Promise<void>((resolve) => {
+			releaseAssistantMessageEnd = resolve;
 		});
-		await Promise.resolve();
-		expect(checkpointSettled).toBe(false);
-		expect(internals._activeSessionInput.items).toEqual([input]);
-		expect(internals._followUpMessages).toEqual([]);
+		const harness = await createHarness({
+			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_end", async (event) => {
+						if (event.message.role === "assistant") {
+							await assistantMessageEndBlocked;
+						}
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("restart response")]);
+		let promptAdmitted = false;
+		const originalPrompt = harness.session.agent.prompt.bind(harness.session.agent);
+		vi.spyOn(harness.session.agent, "prompt").mockImplementation((...args) => {
+			promptAdmitted = true;
+			return originalPrompt(...args);
+		});
+		await harness.session.restoreFollowUpMessage("admitted restart input");
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await vi.waitFor(() => expect(promptAdmitted).toBe(true));
 
-		harness.sessionManager.appendMessage(message);
-		internals._activeSessionInput.persistedInputMessages.add(message);
-		internals._activeSessionInput.phase = "handedOff";
-		internals._notifySessionInputCheckpointChange();
-		await checkpoint;
-		expect(checkpointSettled).toBe(true);
-		expect(readFileSync(harness.session.sessionFile!, "utf8")).toContain("blocked prestart update");
+		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
+			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		internals.sessions.set(
+			"active-1",
+			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
+		);
+		let checkpointWaitEntered = false;
+		const originalCheckpointWait = harness.session.waitForSessionInputCheckpoint.bind(harness.session);
+		vi.spyOn(harness.session, "waitForSessionInputCheckpoint").mockImplementation((signal) => {
+			checkpointWaitEntered = true;
+			return originalCheckpointWait(signal);
+		});
+		let prepareSettled = false;
+		const prepare = internals.prepareUpdateRestart().then((manifest) => {
+			prepareSettled = true;
+			return manifest;
+		});
+		await vi.waitFor(() => expect(checkpointWaitEntered).toBe(true));
+		await harness.session.restoreFollowUpMessage("paused restart input");
+		await vi.waitFor(() =>
+			expect(
+				harness.sessionManager
+					.getEntries()
+					.some(
+						(entry) =>
+							entry.type === "message" &&
+							entry.message.role === "user" &&
+							getMessageText(entry.message) === "admitted restart input",
+					),
+			).toBe(true),
+		);
+		expect(prepareSettled).toBe(false);
+
+		releaseAssistantMessageEnd?.();
+		const manifest = await prepare;
+
+		expect(manifest.sessions).toHaveLength(1);
+		expect(manifest.sessions[0]).toMatchObject({
+			queue: { steering: [], nextTurn: [] },
+			shouldResume: true,
+			wasStreaming: false,
+			wasRetrying: false,
+			hadAcceptedPromptInFlight: false,
+		});
+		expect(manifest.sessions[0]?.queue.followUp).toEqual([
+			{
+				message: "paused restart input",
+				content: [{ type: "text", text: "paused restart input" }],
+			},
+		]);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.some(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						getMessageText(entry.message) === "restart response",
+				),
+		).toBe(true);
 	});
 
 	it("worker cancel releases a prepare blocked on an executing mutation", async () => {

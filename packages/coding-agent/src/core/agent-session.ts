@@ -996,8 +996,6 @@ export class AgentSession {
 				lane: SessionInputSchedule;
 				items: PreparedPromptInput[];
 				phase: "preparing" | "handedOff";
-				checkpointInputMessages: Set<AgentMessage>;
-				persistedInputMessages: Set<AgentMessage>;
 				cancelled?: boolean;
 		  }
 		| { kind: "command"; lane: SessionInputSchedule; item: PreparedCommandInput; phase: "executing" }
@@ -3188,20 +3186,6 @@ export class AgentSession {
 				this.sessionManager.appendMessage(event.message);
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
-			if (this._activeSessionInput?.kind === "prompt") {
-				const activeInput = this._activeSessionInput;
-				if (activeInput.checkpointInputMessages.has(event.message)) {
-					activeInput.persistedInputMessages.add(event.message);
-					if (
-						[...activeInput.checkpointInputMessages].every((message) =>
-							activeInput.persistedInputMessages.has(message),
-						)
-					) {
-						activeInput.phase = "handedOff";
-						this._notifySessionInputCheckpointChange();
-					}
-				}
-			}
 
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
@@ -4971,8 +4955,6 @@ export class AgentSession {
 						lane,
 						items: prompts,
 						phase: "preparing",
-						checkpointInputMessages: new Set(prompts.map((prompt) => prompt.message)),
-						persistedInputMessages: new Set(),
 					};
 					this._syncSteeringStopPending();
 					this._notifySessionInputCheckpointChange();
@@ -4981,10 +4963,6 @@ export class AgentSession {
 						await this._startPreparedPromptItems(prompts, epoch, admission.release);
 						for (const prompt of prompts) {
 							this._settleAgentMessage(prompt.agentMessageId, "completion");
-						}
-						if (this._activeSessionInput?.kind === "prompt") {
-							this._activeSessionInput.phase = "handedOff";
-							this._notifySessionInputCheckpointChange();
 						}
 					} catch (error) {
 						const delivered = new Set(this.agent.state.messages);
@@ -5159,6 +5137,7 @@ export class AgentSession {
 			releaseAdmission();
 			await promptPromise;
 			await this.waitForRetry();
+			await this._agentEventQueue;
 			this._forgetConsumedPostCompactionContinuations(prompts.map((prompt) => prompt.message));
 		} catch (error) {
 			const delivered = new Set(this.agent.state.messages);
@@ -5490,10 +5469,7 @@ export class AgentSession {
 	}
 
 	async waitForSessionInputCheckpoint(signal?: AbortSignal): Promise<void> {
-		while (
-			this._activeSessionInput?.kind === "command" ||
-			(this._activeSessionInput?.kind === "prompt" && this._activeSessionInput.phase === "preparing")
-		) {
+		while (this._activeSessionInput !== undefined) {
 			if (signal?.aborted) throw new Error("Update restart preparation cancelled");
 			await new Promise<void>((resolve, reject) => {
 				const onChange = () => {
