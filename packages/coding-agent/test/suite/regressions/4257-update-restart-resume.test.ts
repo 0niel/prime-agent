@@ -21,10 +21,14 @@ type AgentDaemonUpdateInternals = {
 	prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest>;
 	handleLine(client: DaemonSocketClient, line: string): Promise<void>;
 	handleWorkerCommand(client: DaemonSocketClient, command: { id: string; type: string }): Promise<void>;
-	activeWorkerMutations: number;
+	activeMutations: number;
 	updateRestartPreparing: boolean;
-	updateRestartPrepareAbort?: AbortController;
+	updateRestartTransaction?: { id: symbol; abort: AbortController };
+	updateRestartPublishing?: symbol;
 	preparedUpdateRestart?: { id: symbol; manifest: DaemonUpdateRestartManifest };
+	endMutation(): void;
+	cancelPreparedUpdateRestart(transactionId?: symbol): void;
+	commitPreparedUpdateRestart(transactionId: symbol): Promise<DaemonUpdateRestartManifest>;
 	handleCommand(
 		client: DaemonSocketClient,
 		command: { id: string; type: "abort"; activeSessionId: string },
@@ -185,7 +189,7 @@ describe("issue #4257 update restart resume", () => {
 			},
 		});
 		const internals = daemon as unknown as AgentDaemonUpdateInternals;
-		internals.activeWorkerMutations = 1;
+		internals.activeMutations = 1;
 		const writes: string[] = [];
 		const client = {
 			id: "supervisor",
@@ -206,6 +210,31 @@ describe("issue #4257 update restart resume", () => {
 		expect(internals.updateRestartPreparing).toBe(false);
 		expect(writes.join(" ")).toContain("Update restart preparation cancelled");
 		expect(writes.join(" ")).toContain('"command":"worker_cancel_update","success":true');
+	});
+
+	it("standalone prepare waits for an executing daemon mutation", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
+			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		internals.activeMutations = 1;
+
+		let settled = false;
+		const prepare = internals.prepareUpdateRestart().then((manifest) => {
+			settled = true;
+			return manifest;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		internals.endMutation();
+		await prepare;
+		expect(settled).toBe(true);
 	});
 
 	it.each(["worker_commit_update", "worker_cancel_update"])(
@@ -241,6 +270,70 @@ describe("issue #4257 update restart resume", () => {
 			await internals.handleWorkerCommand(owner, { id: "cleanup", type: "worker_cancel_update" });
 		},
 	);
+
+	it("rejects a duplicate worker commit while publishing", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
+			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
+			worker: { authenticationToken: "token" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const writes: string[] = [];
+		const client = {
+			id: "owner",
+			socket: {
+				destroyed: false,
+				write: (chunk: string) => {
+					writes.push(chunk);
+					return true;
+				},
+			},
+		} as unknown as DaemonSocketClient;
+		await internals.handleWorkerCommand(client, { id: "prepare", type: "worker_prepare_update" });
+		const prepared = internals.preparedUpdateRestart;
+		expect(prepared).toBeDefined();
+		internals.updateRestartPublishing = prepared?.id;
+
+		await internals.handleWorkerCommand(client, { id: "duplicate", type: "worker_commit_update" });
+
+		expect(writes.at(-1)).toContain("already committing");
+		internals.updateRestartPublishing = undefined;
+		internals.cancelPreparedUpdateRestart(prepared?.id);
+	});
+
+	it("finishes cancelled transaction cleanup after a failed publish", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
+			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
+			worker: { authenticationToken: "token" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const client = {
+			id: "owner",
+			socket: { destroyed: false, write: vi.fn(() => true) },
+		} as unknown as DaemonSocketClient;
+		await internals.handleWorkerCommand(client, { id: "prepare", type: "worker_prepare_update" });
+		const transaction = internals.updateRestartTransaction;
+		expect(transaction).toBeDefined();
+		vi.spyOn(internals, "commitPreparedUpdateRestart").mockImplementationOnce(async () => {
+			internals.cancelPreparedUpdateRestart(transaction?.id);
+			throw new Error("publish failed");
+		});
+
+		await internals.handleWorkerCommand(client, { id: "commit", type: "worker_commit_update" });
+
+		expect(internals.updateRestartPreparing).toBe(false);
+		expect(internals.updateRestartTransaction).toBeUndefined();
+		expect(internals.updateRestartPublishing).toBeUndefined();
+	});
 
 	it("rejects drain mutations after this worker publishes its prepare snapshot", async () => {
 		const harness = await createHarness({ persistSession: true });

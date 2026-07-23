@@ -408,8 +408,8 @@ export class AgentDaemon {
 	private shuttingDown = false;
 	private updateRestartPreparing = false;
 	private readonly updateRestartQueuePauses = new Map<string, { release(): void }>();
-	private activeWorkerMutations = 0;
-	private readonly workerMutationDrainWaiters = new Set<() => void>();
+	private activeMutations = 0;
+	private readonly mutationDrainWaiters = new Set<() => void>();
 	private updateRestartTransaction?: {
 		id: symbol;
 		owner?: DaemonSocketClient;
@@ -2621,11 +2621,11 @@ export class AgentDaemon {
 					);
 					return;
 				}
-				if (!updateLifecycle) this.beginWorkerMutation();
+				if (!updateLifecycle) this.beginMutation();
 				try {
 					await this.handleWorkerCommand(client, workerCommand);
 				} finally {
-					if (!updateLifecycle) this.endWorkerMutation();
+					if (!updateLifecycle) this.endMutation();
 				}
 				return;
 			}
@@ -2642,9 +2642,9 @@ export class AgentDaemon {
 			return;
 		}
 
-		const workerMutation = this.options.worker !== undefined && isDaemonMutatingCommand(command);
+		const mutation = command.type !== "prepare_update_restart" && isDaemonMutatingCommand(command);
 		if (
-			workerMutation &&
+			mutation &&
 			this.updateRestartPreparing &&
 			(command.type !== "shutdown" || !this.preparedUpdateRestart) &&
 			!(
@@ -2656,7 +2656,7 @@ export class AgentDaemon {
 			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
 			return;
 		}
-		if (workerMutation) this.beginWorkerMutation();
+		if (mutation) this.beginMutation();
 		try {
 			const response = await this.handleCommand(client, command, () => {
 				promptHandlerOwnsAdmission = true;
@@ -2674,24 +2674,22 @@ export class AgentDaemon {
 			this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
 		} finally {
 			if (!promptHandlerOwnsAdmission) clearParsedAdmission();
-			if (workerMutation) this.endWorkerMutation();
+			if (mutation) this.endMutation();
 		}
 	}
 
-	private beginWorkerMutation(): void {
-		this.activeWorkerMutations++;
+	private beginMutation(): void {
+		this.activeMutations++;
 	}
 
-	private endWorkerMutation(): void {
-		this.activeWorkerMutations--;
-		if (this.activeWorkerMutations === 0) {
-			for (const resolve of this.workerMutationDrainWaiters) resolve();
-			this.workerMutationDrainWaiters.clear();
-		}
+	private endMutation(): void {
+		this.activeMutations--;
+		for (const resolve of this.mutationDrainWaiters) resolve();
+		this.mutationDrainWaiters.clear();
 	}
 
-	private async waitForWorkerMutations(signal: AbortSignal): Promise<void> {
-		while (this.activeWorkerMutations > 0) {
+	private async waitForMutationDrain(remaining: number, signal: AbortSignal): Promise<void> {
+		while (this.activeMutations > remaining) {
 			if (signal.aborted) throw new Error("Update restart preparation cancelled");
 			await new Promise<void>((resolve, reject) => {
 				const onDrained = () => {
@@ -2703,10 +2701,10 @@ export class AgentDaemon {
 					reject(new Error("Update restart preparation cancelled"));
 				};
 				const cleanup = () => {
-					this.workerMutationDrainWaiters.delete(onDrained);
+					this.mutationDrainWaiters.delete(onDrained);
 					signal.removeEventListener("abort", onAbort);
 				};
-				this.workerMutationDrainWaiters.add(onDrained);
+				this.mutationDrainWaiters.add(onDrained);
 				signal.addEventListener("abort", onAbort, { once: true });
 			});
 		}
@@ -2795,7 +2793,7 @@ export class AgentDaemon {
 					}, UPDATE_RESTART_PREPARE_TIMEOUT_MS);
 					transaction.deadline.unref();
 					try {
-						await this.waitForWorkerMutations(transaction.abort.signal);
+						await this.waitForMutationDrain(0, transaction.abort.signal);
 						const manifest = await this.prepareUpdateRestartCheckpoint(transaction.abort.signal, transaction.id);
 						if (!this.isUpdateRestartTransaction(transaction.id) || transaction.abort.signal.aborted) {
 							throw new Error("Update restart preparation cancelled");
@@ -2820,6 +2818,9 @@ export class AgentDaemon {
 					if (!prepared || !transaction || transaction.id !== prepared.id) {
 						throw new Error("Daemon has no prepared update checkpoint");
 					}
+					if (this.updateRestartPublishing !== undefined) {
+						throw new Error("Daemon update checkpoint is already committing");
+					}
 					if (transaction.owner !== client)
 						throw new Error("Daemon update checkpoint belongs to another supervisor");
 					if (transaction.deadline) clearTimeout(transaction.deadline);
@@ -2830,6 +2831,7 @@ export class AgentDaemon {
 						manifest = await this.commitPreparedUpdateRestart(prepared.id);
 					} catch (error) {
 						if (this.updateRestartPublishing === prepared.id) this.updateRestartPublishing = undefined;
+						if (transaction.abort.signal.aborted) this.cancelPreparedUpdateRestart(transaction.id);
 						throw error;
 					}
 					this.write(client, {
@@ -4788,6 +4790,7 @@ export class AgentDaemon {
 		}, UPDATE_RESTART_PREPARE_TIMEOUT_MS);
 		transaction.deadline.unref();
 		try {
+			await this.waitForMutationDrain(0, transaction.abort.signal);
 			const manifest = await this.prepareUpdateRestartCheckpoint(transaction.abort.signal, transaction.id);
 			if (transaction.abort.signal.aborted || !this.isUpdateRestartTransaction(transaction.id)) {
 				throw new Error("Update restart preparation cancelled");
