@@ -1,8 +1,16 @@
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentAutonomousStatus } from "../src/core/autonomous.js";
+import { createSessionSlashCommandResultMessage } from "../src/core/messages.js";
 import type { SessionShutdownEvent } from "../src/index.js";
 import { runPrintMode } from "../src/modes/print-mode.js";
+
+const output = vi.hoisted(() => ({ write: vi.fn(), flush: vi.fn(async () => {}) }));
+vi.mock("../src/core/output-guard.js", () => ({
+	writeRawStdout: output.write,
+	flushRawStdout: output.flush,
+}));
 
 type EmitEvent = SessionShutdownEvent;
 
@@ -14,11 +22,13 @@ type FakeExtensionRunner = {
 type FakeSession = {
 	sessionManager: { getHeader: () => object | undefined };
 	agent: { waitForIdle: ReturnType<typeof vi.fn<() => Promise<void>>> };
-	state: { messages: AssistantMessage[] };
+	state: { messages: AgentMessage[] };
+	messages: AgentMessage[];
 	extensionRunner: FakeExtensionRunner;
 	bindExtensions: ReturnType<typeof vi.fn>;
 	subscribe: ReturnType<typeof vi.fn>;
 	prompt: ReturnType<typeof vi.fn>;
+	promptAndWait: ReturnType<typeof vi.fn>;
 	reload: ReturnType<typeof vi.fn>;
 	getAutonomousStatus: ReturnType<typeof vi.fn>;
 	recordHostAutonomousContinuation: ReturnType<typeof vi.fn>;
@@ -60,7 +70,7 @@ function createAssistantMessage(options?: {
 }
 
 function createRuntimeHost(
-	assistantMessage: AssistantMessage,
+	assistantMessage: AgentMessage,
 	autonomousStatus: AgentAutonomousStatus = {
 		enabled: false,
 		continuationsUsed: 0,
@@ -82,10 +92,12 @@ function createRuntimeHost(
 		sessionManager: { getHeader: () => undefined },
 		agent: { waitForIdle: vi.fn(async () => {}) },
 		state,
+		messages: state.messages,
 		extensionRunner,
 		bindExtensions: vi.fn(async () => {}),
 		subscribe: vi.fn(() => () => {}),
 		prompt: vi.fn(async () => {}),
+		promptAndWait: vi.fn(async () => {}),
 		reload: vi.fn(async () => {}),
 		getAutonomousStatus: vi.fn(() => autonomousStatus),
 		recordHostAutonomousContinuation: vi.fn(),
@@ -121,9 +133,26 @@ describe("runPrintMode", () => {
 		});
 
 		expect(exitCode).toBe(0);
-		expect(session.prompt).toHaveBeenCalledWith("Say done", { images });
+		expect(session.promptAndWait).toHaveBeenCalledWith("Say done", { images });
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+	});
+
+	it("prints successful session command results in text mode", async () => {
+		const result = createSessionSlashCommandResultMessage("No active goal.", {
+			command: { name: "goal", args: "status", text: "/goal status" },
+			success: true,
+			severity: "info",
+		});
+		const runtimeHost = createRuntimeHost(result);
+		output.write.mockClear();
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(0);
+		expect(output.write).toHaveBeenCalledWith("No active goal.\n");
 	});
 
 	it("emits session_shutdown in json mode", async () => {
@@ -136,7 +165,7 @@ describe("runPrintMode", () => {
 		});
 
 		expect(exitCode).toBe(0);
-		expect(session.prompt).toHaveBeenCalledWith("hello");
+		expect(session.promptAndWait).toHaveBeenCalledWith("hello", {});
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});

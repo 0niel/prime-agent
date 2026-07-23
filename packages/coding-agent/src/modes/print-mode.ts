@@ -9,6 +9,7 @@
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.js";
 import { type AgentAutonomousStatus, type AutonomousLimitReason, autonomousLimitReason } from "../core/autonomous.js";
+import { isSessionSlashCommandResultMessage } from "../core/messages.js";
 import { flushRawStdout, writeRawStdout } from "../core/output-guard.js";
 import { killTrackedDetachedChildren } from "../utils/shell.js";
 import { InProcessAgentConnection } from "./agent-connection/in-process-agent-connection.js";
@@ -128,6 +129,8 @@ async function runPrintModeWithConnectionInternal(
 						}
 					}
 				}
+			} else if (lastMessage?.role === "custom" && isSessionSlashCommandResultMessage(lastMessage)) {
+				writeRawStdout(`${lastMessage.content}\n`);
 			}
 		}
 

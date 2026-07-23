@@ -4953,6 +4953,12 @@ export class AgentSession {
 						this._emitQueueUpdate();
 						try {
 							await this._executeQueuedSessionCommand(first);
+							this._resolveAgentMessageCompletion(first.agentMessageId);
+						} catch (error) {
+							this._rejectAgentMessageCompletion(
+								first.agentMessageId,
+								error instanceof Error ? error : new Error(String(error)),
+							);
 						} finally {
 							this._activeSessionInput = undefined;
 							this._syncSteeringStopPending();
@@ -5177,8 +5183,9 @@ export class AgentSession {
 			}
 			if (resultText) this._appendDurableSessionCommandMessage(resultText, input.command, true, false);
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			this._appendDurableSessionCommandMessage(`Command failed: ${message}`, input.command, true, true);
+			const commandError = error instanceof Error ? error : new Error(String(error));
+			this._appendDurableSessionCommandMessage(`Command failed: ${commandError.message}`, input.command, true, true);
+			throw commandError;
 		}
 	}
 

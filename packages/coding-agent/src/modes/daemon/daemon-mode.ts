@@ -3126,7 +3126,7 @@ export class AgentDaemon {
 
 			case "wait_for_idle": {
 				const state = this.getSessionState(command.activeSessionId);
-				await state.runtime.session.agent.waitForIdle();
+				await state.runtime.session.waitForIdle();
 				return success(command.id, "wait_for_idle");
 			}
 

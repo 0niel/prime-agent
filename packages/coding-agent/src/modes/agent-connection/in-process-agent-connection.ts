@@ -328,16 +328,12 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async promptAndWait(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
-		if (!options) {
-			await this.session.prompt(message);
-			return;
-		}
-		await this.session.prompt(message, {
-			...(options.images ? { images: options.images } : {}),
-			...(options.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
-			...(options.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
-			...(options.source ? { source: options.source } : {}),
-			...(options.signal ? { signal: options.signal } : {}),
+		await this.session.promptAndWait(message, {
+			...(options?.images ? { images: options.images } : {}),
+			...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
+			...(options?.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
+			...(options?.source ? { source: options.source } : {}),
+			...(options?.signal ? { signal: options.signal } : {}),
 		});
 	}
 

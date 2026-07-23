@@ -398,13 +398,17 @@ describe("ENG-4685 daemon-backed client modes", () => {
 			],
 			{
 				agentDir: join(root, "agent"),
-				stdin: '{"id":"prompt","type":"prompt","message":"finish before EOF"}\n',
+				stdin:
+					'{"id":"prompt","type":"prompt","message":"finish before EOF"}\n' +
+					'{"id":"follow-up","type":"follow_up","message":"also finish before EOF"}\n',
 			},
 		);
 
 		expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
 		expect(result.stdout).toContain('{"id":"prompt","type":"response","command":"prompt","success":true}');
+		expect(result.stdout).toContain('{"id":"follow-up","type":"response","command":"follow_up","success":true}');
 		expect(result.stdout).toContain("rpc eof response");
+		expect(result.stdout).toContain("queued rpc eof response");
 		expect(result.stdout).toContain('"type":"agent_end"');
 	}, 30_000);
 

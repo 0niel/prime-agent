@@ -2279,6 +2279,7 @@ prepared:${event.prompt}`,
 
 	it("restores command envelopes as commands and other slash-prefixed messages literally", async () => {
 
+
 		const harness = await createHarness();
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("literal handled")]);
