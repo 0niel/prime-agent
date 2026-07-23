@@ -1417,7 +1417,7 @@ export class DaemonSupervisor {
 		if (command.sessionPath) {
 			const activeMatches = this.matchWorkers(command.sessionPath);
 			if (activeMatches.length === 1) {
-				return activeMatches[0]!.worker;
+				return this.reserveWorkerForCreate(activeMatches[0]!.worker);
 			}
 			if (activeMatches.length > 1) {
 				throw new Error(`Ambiguous active session "${command.sessionPath}"`);
@@ -1429,7 +1429,7 @@ export class DaemonSupervisor {
 			createCommand = { ...command, sessionPath };
 			const existing = this.findWorkerBySessionFile(sessionPath);
 			if (existing) {
-				return existing.worker;
+				return this.reserveWorkerForCreate(existing.worker);
 			}
 		}
 		const workerCommand = withoutSupervisorCreateFields(createCommand);
@@ -1438,12 +1438,12 @@ export class DaemonSupervisor {
 			: `new:${command.id ? createCommandIdempotencyKey(clientId, command.id) : createActiveSessionId()}`;
 		const pending = this.openingWorkers.get(key);
 		if (pending) {
-			return pending;
+			return this.reserveWorkerForCreate(await pending);
 		}
 		const opening = this.launchWorker(createCommand);
 		this.openingWorkers.set(key, opening);
 		try {
-			return await opening;
+			return this.reserveWorkerForCreate(await opening);
 		} finally {
 			if (this.openingWorkers.get(key) === opening) {
 				this.openingWorkers.delete(key);
@@ -2845,6 +2845,15 @@ export class DaemonSupervisor {
 		}
 		clearTimeout(worker.cleanupTimer);
 		worker.cleanupTimer = undefined;
+	}
+
+	private reserveWorkerForCreate(worker: ResidentWorker): ResidentWorker {
+		if (worker.intentionalStop || worker.descriptor.stopRequestedAt) {
+			throw new Error(`Session worker ${worker.descriptor.workerId} is stopping`);
+		}
+		this.cancelEphemeralWorkerCleanup(worker);
+		this.scheduleEphemeralWorkerCleanup(worker);
+		return worker;
 	}
 
 	private scheduleEphemeralWorkerCleanup(worker: ResidentWorker): void {

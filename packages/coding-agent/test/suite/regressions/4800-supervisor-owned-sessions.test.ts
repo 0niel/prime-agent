@@ -147,6 +147,50 @@ describe("ENG-4800 supervisor-owned sessions", () => {
 		).rejects.toThrow("worker-1 is stopping");
 	});
 
+	it("refreshes ephemeral cleanup when create reuses a worker", async () => {
+		vi.useFakeTimers();
+		try {
+			const summary = createSummary();
+			const worker = {
+				descriptor: {
+					workerId: "worker-1",
+					rootActiveSessionId: activeSessionId,
+				},
+				intentionalStop: false,
+				ephemeral: true,
+				pendingAttachments: 0,
+				summaries: new Map([[activeSessionId, summary]]),
+				cleanupTimer: undefined as NodeJS.Timeout | undefined,
+			};
+			const stopWorker = vi.fn(async () => undefined);
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				clients: new Set(),
+				workers: new Map([["worker-1", worker]]),
+				matchWorkers: vi.fn(() => [{ worker, summary }]),
+				stopWorker,
+				log: vi.fn(),
+			}) as {
+				createOrReuseWorker(clientId: string, command: DaemonCreateCommand): Promise<typeof worker>;
+				scheduleEphemeralWorkerCleanup(worker: unknown): void;
+			};
+
+			supervisor.scheduleEphemeralWorkerCleanup(worker);
+			await vi.advanceTimersByTimeAsync(DAEMON_EPHEMERAL_WORKER_DISCONNECT_GRACE_MS - 1);
+			await supervisor.createOrReuseWorker("client-1", {
+				type: "create",
+				sessionPath: summary.sessionFile,
+			});
+			await vi.advanceTimersByTimeAsync(1);
+
+			expect(stopWorker).not.toHaveBeenCalled();
+
+			await vi.advanceTimersByTimeAsync(DAEMON_EPHEMERAL_WORKER_DISCONNECT_GRACE_MS - 1);
+			expect(stopWorker).toHaveBeenCalledWith(worker, true);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("reschedules ephemeral cleanup after reconnecting a live worker", async () => {
 		vi.useFakeTimers();
 		try {
