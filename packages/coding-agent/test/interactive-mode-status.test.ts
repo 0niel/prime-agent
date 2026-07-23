@@ -14,6 +14,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test, vi } from "vitest";
+import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { formatNoModelsAvailableMessage } from "../src/core/auth-guidance.js";
 import { type AuthStatus, AuthStorage } from "../src/core/auth-storage.js";
 import type { AgentCronJob } from "../src/core/cron-jobs.js";
@@ -23,6 +24,7 @@ import { KeybindingsManager } from "../src/core/keybindings.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import { emptyUsage } from "../src/core/usage.js";
+import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type {
 	AgentConnectionExtensionUiRequest,
 	AgentConnectionExtensionUiResponse,
@@ -1387,7 +1389,7 @@ describe("InteractiveMode connection events", () => {
 		expect(refreshCommandsOrder).toBeLessThan(renderMessagesOrder);
 		expect(fakeThis.applyConnectionStateSnapshot).toHaveBeenCalledWith(state);
 		expect(fakeThis.resetCurrentSessionRenderState).toHaveBeenCalledWith();
-		expect(fakeThis.rebindCurrentSession).toHaveBeenCalledWith();
+		expect(fakeThis.rebindCurrentSession).toHaveBeenCalledWith({ refreshCommands: false });
 		expect(fakeThis.renderInitialMessages).toHaveBeenCalledWith();
 		expect(fakeThis.ui.requestRender).toHaveBeenCalledWith();
 	});
@@ -1553,9 +1555,12 @@ describe("InteractiveMode connection events", () => {
 		expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
 	});
 
-	test("renderCurrentSessionState refreshes the replacement session queue", async () => {
+	test("renderCurrentSessionState waits for replacement handling before rendering", async () => {
 		const calls: string[] = [];
 		const fakeThis = {
+			sessionEventQueue: Promise.resolve().then(() => {
+				calls.push("replacement");
+			}),
 			resetCurrentSessionRenderState: () => calls.push("reset"),
 			renderInitialMessages: async () => calls.push("messages"),
 			refreshConnectionQueue: async () => calls.push("queue"),
@@ -1568,7 +1573,7 @@ describe("InteractiveMode connection events", () => {
 			}
 		).renderCurrentSessionState.call(fakeThis);
 
-		expect(calls).toEqual(["reset", "messages", "queue", "loader"]);
+		expect(calls).toEqual(["replacement", "reset", "messages", "queue", "loader"]);
 	});
 
 	test("drops a queued source event after the session is replaced", async () => {
@@ -2808,71 +2813,129 @@ describe("InteractiveMode model selection persistence", () => {
 	});
 });
 
-describe("InteractiveMode session switch command catalog", () => {
-	test("refreshes recognized commands before replaying the switched session", async () => {
-		const renderCurrentSessionState = vi.fn(async function (this: {
-			refreshCommandCatalogForCurrentSession(): Promise<void>;
-			isRecognizedSlashCommand(name: string): boolean;
-		}) {
-			await this.refreshCommandCatalogForCurrentSession();
-			expect(this.isRecognizedSlashCommand("target-command")).toBe(true);
-			expect(this.isRecognizedSlashCommand("source-command")).toBe(false);
-		});
-		const setupAutocompleteProvider = vi.fn();
-		const fakeThis = Object.create(InteractiveMode.prototype) as {
-			agentConnection: {
-				switchSession(path: string): Promise<{ cancelled: boolean }>;
-				getCommands(): Promise<Array<{ name: string; source: "prompt"; sourceInfo: AgentConnectionSourceInfo }>>;
-			};
-			connectionCommands: Array<{ name: string; source: "prompt"; sourceInfo: AgentConnectionSourceInfo }>;
-			stopWorkingLoader(): void;
-			setupAutocompleteProvider(): void;
-			renderCurrentSessionState(): Promise<void>;
-			showStatus(message: string): void;
-			isRecognizedSlashCommand(name: string): boolean;
-			handleResumeSession(path: string): Promise<{ cancelled: boolean }>;
-		};
-		fakeThis.agentConnection = {
-			switchSession: vi.fn(async () => ({ cancelled: false })),
-			getCommands: vi.fn<
-				() => Promise<Array<{ name: string; source: "prompt"; sourceInfo: AgentConnectionSourceInfo }>>
-			>(async () => [
-				{
-					name: "target-command",
-					source: "prompt",
-					sourceInfo: {
-						path: "/target/prompt.md",
-						source: "/target/prompt.md",
-						scope: "project",
-						origin: "top-level",
-					},
-				},
-			]),
-		};
-		fakeThis.connectionCommands = [
+function createFakeConnectionSession(commandName: string): AgentSessionRuntime["session"] {
+	return {
+		extensionRunner: { getRegisteredCommands: () => [] },
+		promptTemplates: [
 			{
-				name: "source-command",
-				source: "prompt",
+				name: commandName,
 				sourceInfo: {
-					path: "/source/prompt.md",
-					source: "/source/prompt.md",
+					path: `/${commandName}.md`,
+					source: `/${commandName}.md`,
 					scope: "project",
 					origin: "top-level",
 				},
 			},
-		];
-		fakeThis.stopWorkingLoader = vi.fn();
-		fakeThis.setupAutocompleteProvider = setupAutocompleteProvider;
-		fakeThis.renderCurrentSessionState = renderCurrentSessionState;
-		fakeThis.showStatus = vi.fn();
+		],
+		resourceLoader: { getSkills: () => ({ skills: [] }) },
+		sessionManager: {
+			getCwd: () => "/tmp/project",
+			getSessionDir: () => "/tmp/sessions",
+			getLeafId: () => null,
+			getEntries: () => [],
+		},
+		getAvailableThinkingLevels: () => ["medium"],
+		getActiveToolNames: () => [],
+		getContextUsage: () => undefined,
+		thinkingLevel: "medium",
+		serviceTier: "default",
+		isStreaming: false,
+		isCompacting: false,
+		isBashRunning: false,
+		retryAttempt: 0,
+		steeringMode: "all",
+		followUpMode: "all",
+		sessionId: commandName,
+		autoCompactionEnabled: true,
+		pendingMessageCount: 0,
+		goalState: emptyGoalState(),
+		scopedModels: [],
+		subscribe: () => () => {},
+		messages: [],
+	} as unknown as AgentSessionRuntime["session"];
+}
 
-		const result = await fakeThis.handleResumeSession("/target/session.jsonl");
+class EventEmittingReplacementRuntime {
+	private rebindSession: Parameters<AgentSessionRuntime["setRebindSession"]>[0];
 
-		expect(result).toEqual({ cancelled: false });
-		expect(fakeThis.agentConnection.getCommands).toHaveBeenCalledTimes(1);
-		expect(setupAutocompleteProvider).toHaveBeenCalledTimes(1);
-		expect(renderCurrentSessionState).toHaveBeenCalledTimes(1);
-	});
+	constructor(
+		public session: AgentSessionRuntime["session"],
+		private readonly replacement: AgentSessionRuntime["session"],
+	) {}
+
+	setRebindSession(callback?: Parameters<AgentSessionRuntime["setRebindSession"]>[0]): void {
+		this.rebindSession = callback;
+	}
+
+	setBeforeSessionInvalidate(): void {}
+
+	newSession(): Promise<{ cancelled: boolean }> {
+		return this.replaceSession();
+	}
+
+	switchSession(): Promise<{ cancelled: boolean }> {
+		return this.replaceSession();
+	}
+
+	async fork(): Promise<{ cancelled: boolean; selectedText?: string }> {
+		return this.replaceSession();
+	}
+
+	private async replaceSession(): Promise<{ cancelled: boolean }> {
+		this.session = this.replacement;
+		await this.rebindSession?.(this.replacement);
+		return { cancelled: false };
+	}
+}
+
+describe("InteractiveMode session switch command catalog", () => {
+	test.each(["switchSession", "newSession", "fork"] as const)(
+		"refreshes an event-emitting in-process %s replacement exactly once before replay",
+		async (operation) => {
+			const sourceSession = createFakeConnectionSession("source-command");
+			const targetSession = createFakeConnectionSession("target-command");
+			const runtime = new EventEmittingReplacementRuntime(sourceSession, targetSession);
+			const connection = new InProcessAgentConnection(runtime as unknown as AgentSessionRuntime);
+			const getCommands = vi.spyOn(connection, "getCommands");
+			const calls: string[] = [];
+			const fakeThis = {
+				agentConnection: connection,
+				sessionEventQueue: Promise.resolve(),
+				sessionEventGeneration: 0,
+				connectionCommands: await connection.getCommands(),
+				resetSideQuestion: vi.fn(),
+				resetExtensionUI: vi.fn(),
+				applyConnectionStateSnapshot: vi.fn(),
+				resetCurrentSessionRenderState: vi.fn(() => calls.push("reset")),
+				rebindCurrentSession: vi.fn(async () => {}),
+				setupAutocompleteProvider: vi.fn(() => calls.push("catalog")),
+				renderInitialMessages: vi.fn(async () => {
+					calls.push("render");
+					expect(fakeThis.connectionCommands.map((command) => command.name)).toEqual(["target-command"]);
+				}),
+				refreshConnectionQueue: vi.fn(async () => {}),
+				syncWorkingLoader: vi.fn(),
+				ui: { requestRender: vi.fn() },
+				handleEvent: vi.fn(),
+				handleConnectionExtensionUiRequest: vi.fn(),
+				showError: vi.fn(),
+			};
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+			const interactiveHarness = fakeThis as typeof fakeThis & {
+				subscribeToAgent(): void;
+				renderCurrentSessionState(): Promise<void>;
+			};
+			interactiveHarness.subscribeToAgent();
+
+			if (operation === "switchSession") await connection.switchSession("/target/session.jsonl");
+			else if (operation === "newSession") await connection.newSession();
+			else await connection.fork("entry-1");
+			await interactiveHarness.renderCurrentSessionState();
+
+			expect(calls).toEqual(["reset", "catalog", "render", "reset", "render"]);
+			expect(getCommands).toHaveBeenCalledTimes(2); // initial catalog + one replacement refresh
+		},
+	);
 
 	test("keeps catalog refresh failures nonfatal and drops stale dynamic commands", async () => {
 		const setupAutocompleteProvider = vi.fn();

@@ -2580,16 +2580,18 @@ export class InteractiveMode {
 		this.updatePendingMessagesDisplay();
 	}
 
-	private async refreshConnectionCatalog(): Promise<void> {
+	private async refreshConnectionCatalog(options?: { refreshCommands?: boolean }): Promise<void> {
 		this.invalidateConnectionModelRefresh();
 		const [state, commands, modelCatalog, resources] = await Promise.all([
 			this.agentConnection.getState(),
-			this.agentConnection.getCommands().catch(() => []),
+			options?.refreshCommands === false
+				? Promise.resolve(undefined)
+				: this.agentConnection.getCommands().catch(() => []),
 			this.agentConnection.getModelCatalog(),
 			this.agentConnection.getResourceSnapshot(),
 		]);
 		this.applyConnectionStateSnapshot(state);
-		this.connectionCommands = commands;
+		if (commands) this.connectionCommands = commands;
 		this.applyConnectionModelCatalog(modelCatalog);
 		this.connectionModelsFetchedAt = Date.now();
 		this.connectionResourceSnapshot = resources;
@@ -2838,7 +2840,7 @@ export class InteractiveMode {
 		return this.connectionState?.scopedModels ?? [];
 	}
 
-	private async rebindCurrentSession(): Promise<void> {
+	private async rebindCurrentSession(options?: { refreshCommands?: boolean }): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		if (this.localSessionHost) {
@@ -2850,7 +2852,7 @@ export class InteractiveMode {
 			await this.bindCurrentSessionExtensions();
 		} else {
 			setRegisteredThemes(this.uiServices.getThemes());
-			await this.refreshConnectionCatalog();
+			await this.refreshConnectionCatalog(options);
 			this.setupAutocompleteProvider();
 			this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		}
@@ -2925,8 +2927,11 @@ export class InteractiveMode {
 	}
 
 	private async renderCurrentSessionState(): Promise<void> {
+		// Replacement events own the session-scoped command catalog. The daemon
+		// sends that event before its command response, but its handler may still
+		// be refreshing commands when the response resolves.
+		await this.sessionEventQueue;
 		this.resetCurrentSessionRenderState();
-		await this.refreshCommandCatalogForCurrentSession?.();
 		await this.renderInitialMessages();
 		// The session transition and transcript are already authoritative here;
 		// a transient queue read must not turn a successful switch into a fatal error.
@@ -5068,7 +5073,7 @@ export class InteractiveMode {
 						this.resetExtensionUI();
 						this.applyConnectionStateSnapshot(event.state);
 						this.resetCurrentSessionRenderState();
-						await this.rebindCurrentSession();
+						await this.rebindCurrentSession({ refreshCommands: false });
 						await this.refreshCommandCatalogForCurrentSession?.();
 						await this.renderInitialMessages();
 						this.ui.requestRender();
