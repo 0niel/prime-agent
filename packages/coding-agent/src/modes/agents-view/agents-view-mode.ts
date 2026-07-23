@@ -150,7 +150,6 @@ type PendingDeleteAgent = {
 	sessionFile?: string;
 	summary: SessionSummary;
 	stopped: boolean;
-	diskOnly?: boolean;
 };
 type PendingKillSubagent = {
 	identity: string;
@@ -443,6 +442,7 @@ export class AgentsViewMode implements Component, Focusable {
 	private savedCatalogGeneration = 0;
 	private liveCatalogGeneration = 0;
 	private heartbeatCatalogGeneration = 0;
+	private liveCatalogPollPromise: Promise<void> | undefined;
 	private liveCatalogRefreshPending = false;
 	private savedCatalogRefreshPending = false;
 	private expandedSubagentParents = new Set<string>();
@@ -579,7 +579,7 @@ export class AgentsViewMode implements Component, Focusable {
 		void this.refreshHeartbeats();
 		this.loadStartupNotices();
 		if (!this.options.adapter) {
-			this.pollTimer = setInterval(() => void this.refreshSessions(), POLL_INTERVAL_MS);
+			this.pollTimer = setInterval(() => this.pollSessions(), POLL_INTERVAL_MS);
 			this.pollTimer.unref?.();
 			this.heartbeatPollTimer = setInterval(() => void this.refreshHeartbeats(), HEARTBEAT_POLL_INTERVAL_MS);
 			this.heartbeatPollTimer.unref?.();
@@ -1425,7 +1425,6 @@ export class AgentsViewMode implements Component, Focusable {
 				sessionFile: row.summary.sessionFile,
 				summary: row.summary,
 				stopped: false,
-				diskOnly: true,
 			};
 			this.showDeleteConfirmation();
 			return;
@@ -1588,6 +1587,15 @@ export class AgentsViewMode implements Component, Focusable {
 		requireDaemonData(response);
 	}
 
+	private pollSessions(): void {
+		if (this.liveCatalogPollPromise) return;
+		const poll = this.refreshSessions().then(() => undefined);
+		this.liveCatalogPollPromise = poll;
+		void poll.finally(() => {
+			if (this.liveCatalogPollPromise === poll) this.liveCatalogPollPromise = undefined;
+		});
+	}
+
 	private async refreshSessions(options: { preserveStatusOnError?: boolean } = {}): Promise<boolean> {
 		if (this.reconnectPromise || this.daemonShutdownReceived) return false;
 		const generation = ++this.liveCatalogGeneration;
@@ -1715,7 +1723,10 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private withPendingDeleteSession(sessions: readonly SessionSummary[]): SessionSummary[] {
 		const pending = this.pendingDeleteAgent;
-		if (!pending) {
+		// Saved-only rows already come from the durable catalog. Injecting their
+		// synthetic archived summary as a daemon record would move confirmation
+		// from Inactive to Idle.
+		if (!pending || pending.summary.lifecycle !== "live") {
 			return [...sessions];
 		}
 		if (!this.isDeleteConfirmationVisible()) {

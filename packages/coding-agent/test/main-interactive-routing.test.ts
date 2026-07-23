@@ -18,6 +18,7 @@ import {
 	shouldOpenAgentsViewForDaemonInteractive,
 	shouldOpenProcessLocalSessionViewOnStartup,
 	shouldRejectNonInteractiveAttach,
+	shouldRejectNonInteractiveBareResume,
 	shouldUseDaemonClient,
 	shouldUseDaemonClientRuntime,
 	shouldUseDaemonInteractive,
@@ -147,10 +148,14 @@ describe("interactive startup routing", () => {
 		).toBe(false);
 	});
 
-	test("rejects attach before non-interactive startup", () => {
+	test("rejects interactive-only selectors before non-interactive startup", () => {
 		expect(shouldRejectNonInteractiveAttach("worker", "print")).toBe(true);
 		expect(shouldRejectNonInteractiveAttach("worker", "interactive")).toBe(false);
 		expect(shouldRejectNonInteractiveAttach(undefined, "print")).toBe(false);
+		expect(shouldRejectNonInteractiveBareResume(true, "print")).toBe(true);
+		expect(shouldRejectNonInteractiveBareResume(true, "rpc")).toBe(true);
+		expect(shouldRejectNonInteractiveBareResume("session-id", "print")).toBe(false);
+		expect(shouldRejectNonInteractiveBareResume(true, "interactive")).toBe(false);
 	});
 
 	test("does not start the daemon for attach", () => {

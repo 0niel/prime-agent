@@ -146,4 +146,33 @@ describe("#502 unified session view regressions", () => {
 		privateMethod<(this: typeof harness) => void>("resolveMissingSelectionAnchor").call(harness);
 		expect(syncSelectedRowState).toHaveBeenCalledOnce();
 	});
+	test("saved-only delete confirmation remains in the inactive catalog", () => {
+		const savedOnly = { ...summary("saved"), lifecycle: "archived" as const, activeSessionId: undefined };
+		const harness = {
+			pendingDeleteAgent: { identity: "saved", summary: savedOnly, stopped: false },
+			isDeleteConfirmationVisible: () => true,
+		};
+
+		expect(
+			privateMethod<(this: typeof harness, sessions: SessionSummary[]) => SessionSummary[]>(
+				"withPendingDeleteSession",
+			).call(harness, []),
+		).toEqual([]);
+	});
+
+	test("slow live polls are coalesced instead of repeatedly superseded", async () => {
+		const slow = deferred<boolean>();
+		const refreshSessions = vi.fn(() => slow.promise);
+		const harness = { liveCatalogPollPromise: undefined, refreshSessions };
+		const poll = privateMethod<(this: typeof harness) => void>("pollSessions");
+
+		poll.call(harness);
+		poll.call(harness);
+		expect(refreshSessions).toHaveBeenCalledOnce();
+		slow.resolve(true);
+		await slow.promise;
+		await Promise.resolve();
+		poll.call(harness);
+		expect(refreshSessions).toHaveBeenCalledTimes(2);
+	});
 });

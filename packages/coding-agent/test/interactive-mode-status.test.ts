@@ -1206,6 +1206,26 @@ describe("InteractiveMode pending bash components", () => {
 });
 
 describe("InteractiveMode connection events", () => {
+	test("rendering a switched session tolerates a transient queue refresh failure", async () => {
+		const harness = {
+			resetCurrentSessionRenderState: vi.fn(),
+			renderInitialMessages: vi.fn(async () => {}),
+			refreshConnectionQueue: vi.fn(async () => {
+				throw new Error("queue unavailable");
+			}),
+			syncWorkingLoader: vi.fn(),
+		};
+
+		await expect(
+			(
+				InteractiveMode.prototype as unknown as {
+					renderCurrentSessionState(this: typeof harness): Promise<void>;
+				}
+			).renderCurrentSessionState.call(harness),
+		).resolves.toBeUndefined();
+		expect(harness.syncWorkingLoader).toHaveBeenCalledOnce();
+	});
+
 	test("degrades heartbeat refresh failures without hiding queue refresh failures during rebind", async () => {
 		const rebindCurrentSession = (
 			InteractiveMode.prototype as unknown as { rebindCurrentSession(this: InteractiveMode): Promise<void> }

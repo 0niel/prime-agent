@@ -161,6 +161,10 @@ export function shouldRejectNonInteractiveAttach(attachAgent: string | undefined
 	return attachAgent !== undefined && appMode !== "interactive";
 }
 
+export function shouldRejectNonInteractiveBareResume(resume: true | string | undefined, appMode: AppMode): boolean {
+	return resume === true && appMode !== "interactive";
+}
+
 function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
 	if (parsed.mode === "daemon") {
 		return "daemon";
@@ -1081,6 +1085,10 @@ export async function main(args: string[], options?: MainOptions) {
 
 	if (shouldRejectNonInteractiveAttach(publicCommand.attachAgent, appMode)) {
 		console.error(chalk.red("Error: attach requires an interactive terminal"));
+		process.exit(1);
+	}
+	if (shouldRejectNonInteractiveBareResume(parsed.resume, appMode)) {
+		console.error(chalk.red("Error: --resume without a session selector requires an interactive terminal"));
 		process.exit(1);
 	}
 	setLogContext({ mode: appMode });

@@ -2909,7 +2909,9 @@ export class InteractiveMode {
 	private async renderCurrentSessionState(): Promise<void> {
 		this.resetCurrentSessionRenderState();
 		await this.renderInitialMessages();
-		await this.refreshConnectionQueue();
+		// The session transition and transcript are already authoritative here;
+		// a transient queue read must not turn a successful switch into a fatal error.
+		await this.refreshConnectionQueue().catch(() => undefined);
 		this.syncWorkingLoader();
 	}
 
