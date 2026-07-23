@@ -5290,6 +5290,25 @@ export class AgentSession {
 		await this._sessionInputPump;
 	}
 
+	async waitForIdle(): Promise<void> {
+		while (true) {
+			const pump = this._sessionInputPump;
+			const acceptedPrompts = [...this._acceptedPromptCompletions];
+			await Promise.all([pump, ...acceptedPrompts]);
+			await this.agent.waitForIdle();
+			if (
+				pump === this._sessionInputPump &&
+				acceptedPrompts.length === this._acceptedPromptCompletions.size &&
+				acceptedPrompts.every((completion) => this._acceptedPromptCompletions.has(completion)) &&
+				!this._sessionInputPumpRequested &&
+				!this._pumpingSessionInput &&
+				this._acceptedAgentMessagePrompt === undefined
+			) {
+				return;
+			}
+		}
+	}
+
 	getPendingNextTurnMessageSnapshots(): readonly CustomMessage[] {
 		const messages = this._pendingNextTurnMessages.map((message) => cloneCustomMessage(message));
 		const accepted = this._acceptedAgentMessagePrompt;

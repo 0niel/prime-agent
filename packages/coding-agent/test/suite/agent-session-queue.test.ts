@@ -2213,6 +2213,21 @@ describe("AgentSession queue characterization", () => {
 		await vi.waitFor(() => expect(getUserTexts(harness)).toEqual(["after pause"]));
 	});
 
+	it("waits for all admitted session inputs to finish", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("first response"), fauxAssistantMessage("second response")]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("first", undefined, { resumeIfIdle: true });
+		await harness.session.followUp("second", undefined, { resumeIfIdle: true });
+		pause.release();
+
+		await harness.session.waitForIdle();
+
+		expect(getUserTexts(harness)).toEqual(["first", "second"]);
+		expect(getAssistantTexts(harness)).toEqual(["first response", "second response"]);
+	});
+
 	it("preserves queued command images in restart snapshots", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

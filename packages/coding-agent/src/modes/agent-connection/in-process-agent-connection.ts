@@ -376,7 +376,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async waitForIdle(): Promise<void> {
-		await this.session.agent.waitForIdle();
+		await this.session.waitForIdle();
 	}
 
 	async waitForHeadlessCompletion(): Promise<AgentAutonomousStatus> {
