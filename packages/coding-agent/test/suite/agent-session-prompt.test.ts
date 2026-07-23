@@ -11,6 +11,27 @@ import { createSyntheticSourceInfo } from "../../src/core/source-info.js";
 import { createTestResourceLoader } from "../utilities.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
 
+// acceptAgentMessagePrompt admission is asynchronous. Pause after agent.prompt has
+// synchronously claimed the run, but before its prompt messages become delivered.
+function gateNextAgentStart(harness: Harness): { reached: Promise<void>; release(): void } {
+	let markReached = () => {};
+	const reached = new Promise<void>((resolve) => {
+		markReached = resolve;
+	});
+	let release = () => {};
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let unsubscribe = () => {};
+	unsubscribe = harness.session.agent.subscribe(async (event) => {
+		if (event.type !== "agent_start") return;
+		unsubscribe();
+		markReached();
+		await gate;
+	});
+	return { reached, release };
+}
+
 describe("AgentSession prompt characterization", () => {
 	const harnesses: Harness[] = [];
 	const tempDirs: string[] = [];
@@ -852,7 +873,7 @@ stale post-hook extension instructions`,
 			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_handoff_reject\n\nagent text",
 			{ expandPromptTemplates: false, queueIfBusy: true },
 		);
-		await Promise.resolve();
+		await vi.waitFor(() => expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual([]));
 		sessionInternals._userBashRunning = true;
 		sessionInternals._refineInFlight = undefined;
 		releaseRefine?.();
@@ -1035,11 +1056,14 @@ stale post-hook extension instructions`,
 
 		harness.setResponses([fauxAssistantMessage("never delivered"), fauxAssistantMessage("after clear response")]);
 		gateAgentStart = true;
+		const admission = gateNextAgentStart(harness);
 		const accepted = harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false });
+		await admission.reached;
 		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
 			steering: [],
 			followUp: [agentPrompt],
 		});
+		admission.release();
 		await expect(accepted).rejects.toThrow("cleared before delivery");
 		await harness.session.agent.waitForIdle();
 
@@ -1066,11 +1090,14 @@ stale post-hook extension instructions`,
 		);
 		harness.setResponses([fauxAssistantMessage("never delivered")]);
 
+		const admission = gateNextAgentStart(harness);
 		const accepted = harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false });
+		await admission.reached;
 		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
 			steering: [],
 			followUp: [agentPrompt],
 		});
+		admission.release();
 		await expect(accepted).rejects.toThrow("cleared before delivery");
 		await harness.session.agent.waitForIdle();
 		await (harness.session as unknown as { _agentEventQueue: Promise<void> })._agentEventQueue;
@@ -1141,11 +1168,14 @@ stale post-hook extension instructions`,
 		harness.setResponses([fauxAssistantMessage("never delivered")]);
 
 		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_late_events");
+		const admission = gateNextAgentStart(harness);
 		const accepted = harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false });
+		await admission.reached;
 		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
 			steering: [],
 			followUp: [agentPrompt],
 		});
+		admission.release();
 		await expect(accepted).rejects.toThrow("cleared before delivery");
 		await expect(delivery).rejects.toThrow("cleared before delivery");
 		await harness.session.agent.waitForIdle();

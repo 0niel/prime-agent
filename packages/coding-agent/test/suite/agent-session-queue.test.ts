@@ -2442,6 +2442,114 @@ describe("AgentSession queue characterization", () => {
 			"Cannot refine without aborting while the agent is running.",
 		);
 	});
+	it("serializes queued prompt preparation with a direct prompt handoff", async () => {
+		let releaseDirectPreparation = () => {};
+		const directPreparation = new Promise<void>((resolve) => {
+			releaseDirectPreparation = resolve;
+		});
+		let directPreparing = false;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event) => {
+						if (event.prompt === "direct") {
+							directPreparing = true;
+							await directPreparation;
+						}
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("direct done"), fauxAssistantMessage("queued done")]);
+
+		const direct = harness.session.prompt("direct");
+		await vi.waitFor(() => expect(directPreparing).toBe(true));
+		await harness.session.followUp("queued", undefined, { resumeIfIdle: true });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(getUserTexts(harness)).toEqual([]);
+
+		releaseDirectPreparation();
+		await direct;
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual(["direct", "queued"]);
+	});
+
+	it("allows an admitted extension command to navigate the session tree", async () => {
+		let targetId: string | undefined;
+		let navigated = false;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("back", {
+						description: "Navigate back",
+						handler: async (_args, ctx) => {
+							if (targetId) await ctx.navigateTree(targetId, { summarize: false });
+							navigated = true;
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one")]);
+		await harness.session.prompt("one");
+		targetId = harness.sessionManager.getEntries().find((entry) => entry.type === "message")?.id;
+		expect(targetId).toBeDefined();
+
+		await harness.session.prompt("/back");
+
+		expect(navigated).toBe(true);
+	});
+
+	it("waitForIdle observes a run that starts at its final idle boundary", async () => {
+		let releaseResponse = () => {};
+		const responseGate = new Promise<void>((resolve) => {
+			releaseResponse = resolve;
+		});
+		let responseStarted = () => {};
+		const waitForResponseStart = new Promise<void>((resolve) => {
+			responseStarted = resolve;
+		});
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			async () => {
+				responseStarted();
+				await responseGate;
+				return fauxAssistantMessage("late done");
+			},
+		]);
+		const agentWaitForIdle = harness.session.agent.waitForIdle.bind(harness.session.agent);
+		let waitCalls = 0;
+		vi.spyOn(harness.session.agent, "waitForIdle").mockImplementation(async () => {
+			await agentWaitForIdle();
+			if (waitCalls++ === 0) void harness.session.agent.prompt("late run");
+		});
+
+		let idle = false;
+		const waiting = harness.session.waitForIdle().then(() => {
+			idle = true;
+		});
+		await waitForResponseStart;
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(idle).toBe(false);
+
+		releaseResponse();
+		await waiting;
+		expect(idle).toBe(true);
+	});
+
+	it("rejects skip-abort compaction while a turn is active", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		setAgentStreaming(harness, true);
+
+		await expect(harness.session.compact(undefined, { skipAbort: true })).rejects.toThrow(
+			"Cannot compact without aborting while the agent is running.",
+		);
+	});
+
 	it("waits for an earlier direct handoff before executing a session command", async () => {
 		let releaseBeforeAgentStart: (() => void) | undefined;
 		const beforeAgentStartGate = new Promise<void>((resolve) => {

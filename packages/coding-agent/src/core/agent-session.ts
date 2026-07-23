@@ -907,6 +907,8 @@ export class AgentSession {
 	private readonly _queuedWorkPauses = new Set<symbol>();
 	private readonly _queuedWorkAdmissionWaiters = new Set<() => void>();
 	private _turnAdmissionTail: Promise<void> = Promise.resolve();
+	private _turnAdmissionOwner: symbol | undefined;
+	private readonly _turnAdmissionContext = new AsyncLocalStorage<symbol>();
 	private _legacyQueuedWorkPause: { release(): void } | undefined;
 	private _pumpingSessionInput = false;
 	private _activeSessionInput:
@@ -3898,11 +3900,11 @@ export class AgentSession {
 		options?: InternalPromptOptions,
 	): Promise<void> {
 		if (!this.isStreaming && options?.resumeIfIdle) this._sessionInputPumpSuspended = false;
-		const releaseAdmission = await this._acquireDirectTurnAdmission({ allowStreaming: true });
+		const admission = await this._acquireDirectTurnAdmission({ allowStreaming: true });
 		try {
-			await this._promptInjectedMessageUnserialized(text, message, options, releaseAdmission);
+			await this._promptInjectedMessageUnserialized(text, message, options, admission.release);
 		} finally {
-			releaseAdmission();
+			admission.release();
 		}
 	}
 
@@ -4087,7 +4089,8 @@ export class AgentSession {
 
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
 		if (!this.isStreaming) this._sessionInputPumpSuspended = false;
-		const releaseAdmission = !this.isStreaming ? await this._acquireDirectTurnAdmission() : () => {};
+		const admission = !this.isStreaming ? await this._acquireDirectTurnAdmission() : undefined;
+		const releaseAdmission = admission?.release ?? (() => {});
 		try {
 			await this._promptUnserialized(text, options, releaseAdmission);
 		} finally {
@@ -4529,7 +4532,12 @@ export class AgentSession {
 		const ctx = this._extensionRunner.createCommandContext();
 
 		try {
-			await command.handler(args, ctx);
+			const owner = this._turnAdmissionOwner;
+			if (owner) {
+				await this._turnAdmissionContext.run(owner, () => command.handler(args, ctx));
+			} else {
+				await command.handler(args, ctx);
+			}
 			return true;
 		} catch (err) {
 			// Emit error via extension runner
@@ -4899,67 +4907,72 @@ export class AgentSession {
 		let blocked = false;
 		try {
 			while (!this._disposed && !this._disposing && this.pendingMessageCount > 0) {
-				await this.agent.waitForIdle();
-				if (epoch !== this._sessionInputPumpEpoch) return;
-				await this._agentEventQueue;
-				await this._waitForRefineIdle();
-				if (this._isSessionInputHandoffDeferred(epoch)) {
-					blocked = true;
-					return;
-				}
-
-				const queue = this._steeringMessages.length > 0 ? this._steeringMessages : this._followUpMessages;
-				const mode = queue === this._steeringMessages ? this.steeringMode : this.followUpMode;
-				const first = queue[0];
-				if (!first) continue;
-				const lane: SessionInputSchedule = queue === this._steeringMessages ? "steer" : "followUp";
-				if (first.kind === "command") {
-					queue.shift();
-					this._activeSessionInput = { kind: "command", lane, item: first, phase: "executing" };
-					this._emitQueueUpdate();
-					try {
-						await this._executeQueuedSessionCommand(first);
-					} finally {
-						this._activeSessionInput = undefined;
-					}
-					continue;
-				}
-
-				const prompts: PreparedPromptInput[] = [];
-				while (queue[0]?.kind === "prompt" && (mode === "all" || prompts.length === 0)) {
-					prompts.push(queue.shift() as PreparedPromptInput);
-				}
-				this._steeringStopPending = this._steeringMessages.length > 0;
-				if (epoch !== this._sessionInputPumpEpoch) {
-					queue.unshift(...prompts);
-					return;
-				}
-				this._activeSessionInput = { kind: "prompt", lane, items: prompts, phase: "preparing" };
-				this._emitQueueUpdate();
+				const admission = await this._acquireTurnAdmission();
 				try {
-					await this._startPreparedPromptItems(prompts, epoch);
-					if (this._activeSessionInput?.kind === "prompt") this._activeSessionInput.phase = "handedOff";
-				} catch (error) {
-					const delivered = new Set(this.agent.state.messages);
-					const undelivered: PreparedPromptInput[] = [];
-					for (const prompt of prompts) {
-						prompt.prefixMessages = prompt.prefixMessages.filter((message) => !delivered.has(message));
-						if (!delivered.has(prompt.message)) undelivered.push(prompt);
-					}
-					if (this._isDeferredSessionInputError(error, epoch)) {
-						if (undelivered.length > 0) {
-							queue.unshift(...undelivered);
-							this._emitQueueUpdate();
-						}
+					await this.agent.waitForIdle();
+					if (epoch !== this._sessionInputPumpEpoch) return;
+					await this._agentEventQueue;
+					await this._waitForRefineIdle();
+					if (this._isSessionInputHandoffDeferred(epoch)) {
 						blocked = true;
 						return;
 					}
-					for (const prompt of undelivered) {
-						this._rejectAgentMessageDelivery(prompt.agentMessageId, this._asError(error));
+
+					const queue = this._steeringMessages.length > 0 ? this._steeringMessages : this._followUpMessages;
+					const mode = queue === this._steeringMessages ? this.steeringMode : this.followUpMode;
+					const first = queue[0];
+					if (!first) continue;
+					const lane: SessionInputSchedule = queue === this._steeringMessages ? "steer" : "followUp";
+					if (first.kind === "command") {
+						queue.shift();
+						this._activeSessionInput = { kind: "command", lane, item: first, phase: "executing" };
+						this._emitQueueUpdate();
+						try {
+							await this._executeQueuedSessionCommand(first);
+						} finally {
+							this._activeSessionInput = undefined;
+						}
+						continue;
 					}
-					this._surfaceSessionInputError(error);
+
+					const prompts: PreparedPromptInput[] = [];
+					while (queue[0]?.kind === "prompt" && (mode === "all" || prompts.length === 0)) {
+						prompts.push(queue.shift() as PreparedPromptInput);
+					}
+					this._steeringStopPending = this._steeringMessages.length > 0;
+					if (epoch !== this._sessionInputPumpEpoch) {
+						queue.unshift(...prompts);
+						return;
+					}
+					this._activeSessionInput = { kind: "prompt", lane, items: prompts, phase: "preparing" };
+					this._emitQueueUpdate();
+					try {
+						await this._startPreparedPromptItems(prompts, epoch, admission.release);
+						if (this._activeSessionInput?.kind === "prompt") this._activeSessionInput.phase = "handedOff";
+					} catch (error) {
+						const delivered = new Set(this.agent.state.messages);
+						const undelivered: PreparedPromptInput[] = [];
+						for (const prompt of prompts) {
+							prompt.prefixMessages = prompt.prefixMessages.filter((message) => !delivered.has(message));
+							if (!delivered.has(prompt.message)) undelivered.push(prompt);
+						}
+						if (this._isDeferredSessionInputError(error, epoch)) {
+							if (undelivered.length > 0) {
+								queue.unshift(...undelivered);
+								this._emitQueueUpdate();
+							}
+							blocked = true;
+							return;
+						}
+						for (const prompt of undelivered) {
+							this._rejectAgentMessageDelivery(prompt.agentMessageId, this._asError(error));
+						}
+						this._surfaceSessionInputError(error);
+					} finally {
+						this._activeSessionInput = undefined;
+					}
 				} finally {
-					this._activeSessionInput = undefined;
+					admission.release();
 				}
 			}
 		} finally {
@@ -4973,6 +4986,8 @@ export class AgentSession {
 
 	private _isSessionInputHandoffDeferred(epoch: number): boolean {
 		return (
+			this._disposed ||
+			this._disposing ||
 			epoch !== this._sessionInputPumpEpoch ||
 			this._sessionInputPumpSuspended ||
 			this._queuedWorkPauses.size > 0 ||
@@ -5006,7 +5021,11 @@ export class AgentSession {
 		});
 	}
 
-	private async _startPreparedPromptItems(prompts: PreparedPromptInput[], epoch: number): Promise<void> {
+	private async _startPreparedPromptItems(
+		prompts: PreparedPromptInput[],
+		epoch: number,
+		releaseAdmission: () => void,
+	): Promise<void> {
 		await this._validateCanStartAgentRun();
 		this._flushPendingBashMessages();
 		const lastAssistant = this._findLastAssistantMessage();
@@ -5063,7 +5082,9 @@ export class AgentSession {
 		}
 		this.agent.state.systemPrompt = result?.systemPrompt ?? this._baseSystemPrompt;
 		try {
-			await this.agent.prompt(messages);
+			const promptPromise = this.agent.prompt(messages);
+			releaseAdmission();
+			await promptPromise;
 			await this.waitForRetry();
 			this._forgetConsumedPostCompactionContinuations(prompts.map((prompt) => prompt.message));
 		} catch (error) {
@@ -5198,15 +5219,15 @@ export class AgentSession {
 				await this._queueSteer(normalized.text, normalized.images, { message: appMessage, resumeIfIdle: true });
 			}
 		} else if (options?.triggerTurn) {
-			const releaseAdmission = await this._acquireDirectTurnAdmission();
+			const admission = await this._acquireDirectTurnAdmission();
 			try {
 				if (this.isStreaming) await this.agent.waitForIdle();
 				await this._waitForRefineIdle();
 				const promptPromise = this.agent.prompt(appMessage);
-				releaseAdmission();
+				admission.release();
 				await promptPromise;
 			} finally {
-				releaseAdmission();
+				admission.release();
 			}
 		} else {
 			this.agent.state.messages.push(appMessage);
@@ -5374,26 +5395,38 @@ export class AgentSession {
 		};
 	}
 
-	private async _acquireTurnAdmission(): Promise<() => void> {
+	private async _acquireTurnAdmission(): Promise<{ owner: symbol; release(): void }> {
+		const inheritedOwner = this._turnAdmissionContext.getStore();
+		if (inheritedOwner !== undefined && inheritedOwner === this._turnAdmissionOwner) {
+			return { owner: inheritedOwner, release: () => {} };
+		}
 		const previous = this._turnAdmissionTail;
 		let resolve = () => {};
 		this._turnAdmissionTail = new Promise<void>((release) => {
 			resolve = release;
 		});
 		await previous;
+		const owner = Symbol("turn-admission");
+		this._turnAdmissionOwner = owner;
 		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
-			resolve();
+		return {
+			owner,
+			release: () => {
+				if (released) return;
+				released = true;
+				if (this._turnAdmissionOwner === owner) this._turnAdmissionOwner = undefined;
+				resolve();
+			},
 		};
 	}
 
-	private async _acquireDirectTurnAdmission(options: { allowStreaming?: boolean } = {}): Promise<() => void> {
+	private async _acquireDirectTurnAdmission(
+		options: { allowStreaming?: boolean } = {},
+	): Promise<{ owner: symbol; release(): void }> {
 		while (true) {
 			await this._waitForQueuedWorkAdmission();
 			if (this.pendingMessageCount > 0) this._scheduleSessionInputPump();
-			const release = await this._acquireTurnAdmission();
+			const admission = await this._acquireTurnAdmission();
 			if (
 				(options.allowStreaming === true && this.isStreaming) ||
 				(this.pendingMessageCount === 0 &&
@@ -5401,9 +5434,9 @@ export class AgentSession {
 					!this._pumpingSessionInput &&
 					!this._sessionInputPumpRequested)
 			) {
-				return release;
+				return admission;
 			}
-			release();
+			admission.release();
 			await this.waitForSessionInputIdle();
 		}
 	}
@@ -5454,6 +5487,7 @@ export class AgentSession {
 				acceptedPrompts.every((completion) => this._acceptedPromptCompletions.has(completion)) &&
 				!this._sessionInputPumpRequested &&
 				!this._pumpingSessionInput &&
+				!this.agent.state.isStreaming &&
 				this._acceptedAgentMessagePrompt === undefined
 			) {
 				return;
@@ -5988,6 +6022,9 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string, options: { skipAbort?: boolean } = {}): Promise<CompactionResult> {
+		if (options.skipAbort && this.isStreaming) {
+			throw new Error("Cannot compact without aborting while the agent is running.");
+		}
 		const hadPostCompactionContinue = this._postCompactionContinuationScheduled;
 		this._disconnectFromAgent();
 		if (!options.skipAbort) await this.abort();
@@ -9314,16 +9351,17 @@ export class AgentSession {
 		}
 
 		const queuedWorkPause = this.acquireQueuedWorkPause();
-		let releaseAdmission: (() => void) | undefined;
+		let admission: { owner: symbol; release(): void } | undefined;
 		try {
-			releaseAdmission = await this._acquireTurnAdmission();
-			await this.agent.waitForIdle();
-			await this._agentEventQueue;
-			await this.waitForSessionInputIdle();
-			return await this._navigateTreeUnderPause(targetId, targetEntry, options);
+			admission = await this._acquireTurnAdmission();
+			return await this._turnAdmissionContext.run(admission.owner, async () => {
+				await this.agent.waitForIdle();
+				await this._agentEventQueue;
+				return this._navigateTreeUnderPause(targetId, targetEntry, options);
+			});
 		} finally {
 			queuedWorkPause.release();
-			releaseAdmission?.();
+			admission?.release();
 		}
 	}
 
