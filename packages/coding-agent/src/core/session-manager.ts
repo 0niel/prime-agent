@@ -56,6 +56,10 @@ export interface SessionHeader {
 	cwd: string;
 	parentSession?: string;
 	git?: GitContext;
+	importedFrom?: {
+		source: string;
+		id: string;
+	};
 }
 
 export interface NewSessionOptions {

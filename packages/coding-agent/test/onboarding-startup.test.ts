@@ -71,7 +71,7 @@ describe("startup onboarding decision", () => {
 		expect(shouldRunOnboarding(state)).toBe(false);
 	});
 
-	test("skips the Prime CLI splash for non-Prime providers with ready auth", () => {
+	test("runs first-launch onboarding for non-Prime providers with ready auth", () => {
 		const state = makeState({
 			onboardingShown: false,
 			model: makeModel("anthropic"),
@@ -79,6 +79,6 @@ describe("startup onboarding decision", () => {
 			primeAuthSource: "stored",
 		});
 		expect(shouldRunPrimeCliOnboardingSplash(state)).toBe(false);
-		expect(shouldRunOnboarding(state)).toBe(false);
+		expect(shouldRunOnboarding(state)).toBe(true);
 	});
 });

@@ -108,6 +108,13 @@ import { resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.
 import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
+import {
+	discoverSessionImports,
+	formatSessionImportResult,
+	importSessionsAndSkills,
+	type SessionImportInventory,
+	type SessionImportSource,
+} from "../../core/session-import/index.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
 import { parseSkillBlock } from "../../core/skill-blocks.js";
 import {
@@ -191,6 +198,7 @@ import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
+import { OnboardingImportSelectorComponent } from "./components/onboarding-import-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
 import { SessionPickerScreen } from "./components/session-picker-screen.js";
@@ -214,7 +222,12 @@ import type {
 	InteractiveModeLocalToolRendererDefinition,
 	InteractiveModeUiServices,
 } from "./interactive-mode-services.js";
-import { type OnboardingStartupState, shouldRunOnboarding, shouldRunPrimeCliOnboardingSplash } from "./onboarding.js";
+import {
+	isOnboardingModelReady,
+	type OnboardingStartupState,
+	shouldRunOnboarding,
+	shouldRunPrimeCliOnboardingSplash,
+} from "./onboarding.js";
 import type { ClientPromptStashStore, PromptStash, PromptStashState } from "./prompt-stash-state.js";
 import { formatResumeHint } from "./resume-hint.js";
 import {
@@ -1617,11 +1630,71 @@ export class InteractiveMode {
 			return false;
 		}
 
+		const modelReady = isOnboardingModelReady(this.getOnboardingState());
 		const showPrimeCliSplash = this.shouldRunPrimeCliOnboardingSplash();
 		this.markOnboardingShown();
 		await this.settingsManager.flush();
-		await this.runOnboardingFlow(showPrimeCliSplash);
+		await this.runOnboardingImportFlow();
+		if (showPrimeCliSplash || !modelReady) {
+			await this.runOnboardingFlow(showPrimeCliSplash);
+		}
 		return true;
+	}
+
+	private async runOnboardingImportFlow(): Promise<void> {
+		try {
+			const inventories = discoverSessionImports({ agentDir: getAgentDir() });
+			if (inventories.length === 0) {
+				return;
+			}
+			const selectedSources = await this.showOnboardingImportSelector(inventories);
+			if (!selectedSources || selectedSources.length === 0) {
+				return;
+			}
+			const result = await importSessionsAndSkills(inventories, selectedSources, {
+				agentDir: getAgentDir(),
+				onProgress: (message) => {
+					this.showStatus(message);
+					this.ui.requestRender();
+				},
+			});
+			this.showStatus(formatSessionImportResult(result));
+			if (result.skillsImported > 0) {
+				try {
+					await this.agentConnection.reload();
+				} catch {
+					this.showWarning("Skills were imported, but will become available after the next reload.");
+				}
+			}
+		} catch {
+			this.showWarning("Local session import failed safely; onboarding will continue.");
+		}
+	}
+
+	private showOnboardingImportSelector(
+		inventories: SessionImportInventory[],
+	): Promise<SessionImportSource[] | undefined> {
+		return new Promise((resolve) => {
+			let settled = false;
+			let handle: OverlayHandle | undefined;
+			const settle = (result: SessionImportSource[] | undefined) => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				handle?.hide();
+				this.ui.requestRender();
+				resolve(result);
+			};
+			const selector = new OnboardingImportSelectorComponent(
+				inventories,
+				(sources) => settle(sources),
+				() => settle(undefined),
+			);
+			handle = this.showFullPaneOverlay(selector, 80);
+			handle.focus();
+			this.ui.requestRender();
+		});
 	}
 
 	private async showOnboardingModelSelection(splash: OnboardingSplashHandle): Promise<void> {

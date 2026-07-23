@@ -38,8 +38,5 @@ export function shouldRunOnboarding(state: OnboardingStartupState): boolean {
 		return false;
 	}
 	state.modelRegistry.refresh();
-	if (shouldRunPrimeCliOnboardingSplash(state)) {
-		return true;
-	}
-	return !isOnboardingModelReady(state);
+	return true;
 }
