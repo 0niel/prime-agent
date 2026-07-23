@@ -120,4 +120,70 @@ describe("ENG-4800 supervisor-owned sessions", () => {
 			vi.useRealTimers();
 		}
 	});
+
+	it("rejects an attach after ephemeral cleanup commits the worker stop", async () => {
+		const summary = createSummary();
+		const worker = {
+			descriptor: {
+				workerId: "worker-1",
+				stopRequestedAt: new Date().toISOString(),
+			},
+			intentionalStop: true,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			matchWorkers: vi.fn(() => [{ worker, summary }]),
+		}) as {
+			attachClient(
+				client: DaemonSocketClient,
+				command: Extract<DaemonCommand, { type: "attach" }>,
+			): Promise<unknown>;
+		};
+
+		await expect(
+			supervisor.attachClient({} as DaemonSocketClient, {
+				type: "attach",
+				activeSessionId,
+			}),
+		).rejects.toThrow("worker-1 is stopping");
+	});
+
+	it("reschedules ephemeral cleanup after reconnecting a live worker", async () => {
+		vi.useFakeTimers();
+		try {
+			const worker = {
+				descriptor: {
+					workerId: "worker-1",
+					pid: process.pid,
+					rootActiveSessionId: activeSessionId,
+					lifecycle: "recovering",
+					consecutiveFailures: 1,
+				},
+				intentionalStop: false,
+				ephemeral: true,
+			};
+			const scheduleEphemeralWorkerCleanup = vi.fn();
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				workers: new Map([["worker-1", worker]]),
+				assertRecoveryAllowed: vi.fn(async () => undefined),
+				connectWorker: vi.fn(async () => undefined),
+				subscribeWorker: vi.fn(async () => undefined),
+				refreshWorkerSummaries: vi.fn(async () => undefined),
+				persistWorker: vi.fn(),
+				syncAgentPeers: vi.fn(async () => undefined),
+				broadcastHeartbeatsChanged: vi.fn(),
+				scheduleEphemeralWorkerCleanup,
+			}) as {
+				recoverWorker(worker: unknown): Promise<void>;
+			};
+
+			const recovery = supervisor.recoverWorker(worker);
+			await vi.advanceTimersByTimeAsync(250);
+			await recovery;
+
+			expect(scheduleEphemeralWorkerCleanup).toHaveBeenCalledWith(worker);
+			expect(worker.descriptor.lifecycle).toBe("ready");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });

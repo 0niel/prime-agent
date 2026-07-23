@@ -2106,6 +2106,7 @@ export class DaemonSupervisor {
 								this.log(`Could not synchronize agent peers after worker recovery: ${String(error)}`),
 							);
 							this.broadcastHeartbeatsChanged();
+							this.scheduleEphemeralWorkerCleanup(worker);
 							return;
 						} catch (error) {
 							if (isSupervisorRecoveryCancelled(error)) {
@@ -2421,6 +2422,9 @@ export class DaemonSupervisor {
 		command: Extract<DaemonCommand, { type: "attach" }>,
 	): Promise<WorkerAttachData> {
 		const match = await this.findWorker(command.activeSessionId);
+		if (match.worker.intentionalStop || match.worker.descriptor.stopRequestedAt) {
+			throw new Error(`Session worker ${match.worker.descriptor.workerId} is stopping`);
+		}
 		this.cancelEphemeralWorkerCleanup(match.worker);
 		match.worker.pendingAttachments++;
 		try {
