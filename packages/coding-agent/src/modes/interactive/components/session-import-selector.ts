@@ -20,6 +20,7 @@ export class SessionImportSelectorComponent extends Container {
 	) {
 		super();
 		this.selectedSources = new Set(inventories.map((inventory) => inventory.source));
+		this.selectedIndex = inventories.length;
 		const panel = new MenuPanel({
 			title: "Bring your work with you",
 			subtitle: "Import local sessions and skills. Existing Prime data is never overwritten.",
@@ -30,7 +31,7 @@ export class SessionImportSelectorComponent extends Container {
 			new Text(
 				rawKeyHint("↑↓", "navigate") +
 					"  " +
-					keyHint("tui.select.confirm", "toggle / continue") +
+					keyHint("tui.select.confirm", "toggle / confirm") +
 					"  " +
 					keyHint("tui.select.cancel", "skip"),
 				1,
@@ -94,10 +95,11 @@ export class SessionImportSelectorComponent extends Container {
 			);
 		}
 		const selectedCount = this.selectedSources.size;
+		this.list.addChild(new Spacer(1));
 		this.list.addChild(
 			new MenuRow({
-				primary: selectedCount > 0 ? "Import selected" : "Continue without importing",
-				meta: selectedCount > 0 ? `${selectedCount} selected` : undefined,
+				primary: selectedCount > 0 ? "Import selected sessions and skills" : "Continue without importing",
+				meta: selectedCount > 0 ? `${countLabel(selectedCount, "source")} selected` : undefined,
 				selected: this.selectedIndex === this.inventories.length,
 			}),
 		);

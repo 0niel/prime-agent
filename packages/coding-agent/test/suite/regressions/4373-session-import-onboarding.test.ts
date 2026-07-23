@@ -541,11 +541,24 @@ describe("ENG-4373 onboarding session import", () => {
 		const onSelect = vi.fn();
 		const selector = new SessionImportSelectorComponent(inventories, onSelect, vi.fn());
 
+		selector.handleInput("\x1b[A");
+		selector.handleInput("\x1b[A");
 		selector.handleInput("\r");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\x1b[B");
 		selector.handleInput("\r");
 
 		expect(onSelect).toHaveBeenCalledWith(["codex"]);
+	});
+
+	it("presents the import action as the default CTA", () => {
+		const inventories = discoverSessionImports({ homeDir: home, agentDir, env: {} }).slice(0, 2);
+		const onSelect = vi.fn();
+		const selector = new SessionImportSelectorComponent(inventories, onSelect, vi.fn());
+
+		expect(selector.render(100).join("\n")).toContain("Import selected sessions and skills");
+		selector.handleInput("\r");
+
+		expect(onSelect).toHaveBeenCalledWith(["claude", "codex"]);
 	});
 });
