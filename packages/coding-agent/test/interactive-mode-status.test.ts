@@ -1337,6 +1337,8 @@ describe("InteractiveMode connection events", () => {
 					return vi.fn();
 				}),
 			},
+			sessionEventQueue: Promise.resolve(),
+			sessionEventGeneration: 0,
 			resetSideQuestion: vi.fn(),
 			resetExtensionUI: vi.fn(),
 			applyConnectionStateSnapshot: vi.fn(),
@@ -2718,6 +2720,16 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 	const markOnboardingShown = (InteractiveMode.prototype as unknown as OnboardingHarness).markOnboardingShown;
 	const runStartupOnboarding = (InteractiveMode.prototype as unknown as OnboardingHarness).runStartupOnboarding;
 	const runOnboardingFlow = (InteractiveMode.prototype as unknown as OnboardingHarness).runOnboardingFlow;
+	const startupRunResult = {
+		type: "agents_view",
+		source: {
+			activeSessionId: undefined,
+			sessionFile: undefined,
+			sessionId: "",
+			sessionName: undefined,
+			cwd: "/tmp/project",
+		},
+	};
 	function createStartupRunHarness(
 		options: Record<string, unknown>,
 		overrides: Record<string, unknown> = {},
@@ -2732,6 +2744,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			getUserInput: vi.fn(() => new Promise<void>(() => {})),
 			showWarning: vi.fn(),
 			showError: vi.fn(),
+			getCurrentCwd: () => startupRunResult.source.cwd,
 			sessionHasMessages: false,
 			...overrides,
 		};
@@ -2835,7 +2848,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			await vi.advanceTimersByTimeAsync(1_000);
 			expect(prompt).toHaveBeenCalledTimes(8);
 			inputDone.resolve(undefined);
-			await expect(run).resolves.toBe("agents_view");
+			await expect(run).resolves.toEqual(startupRunResult);
 		} finally {
 			vi.useRealTimers();
 		}
@@ -3020,7 +3033,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 					},
 				]);
 				inputDone.resolve(undefined);
-				await expect(run).resolves.toBe("agents_view");
+				await expect(run).resolves.toEqual(startupRunResult);
 			} finally {
 				vi.useRealTimers();
 			}
@@ -3232,25 +3245,20 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 	});
 
 	test("keeps the TUI alive while direct editor submissions own prompt delivery", async () => {
-		const fakeThis = {
-			init: vi.fn(async () => {}),
-			options: { agentsViewOwnsStartupNotices: true },
-			modelRegistry: { getError: vi.fn(() => undefined) },
-			runStartupOnboarding: vi.fn(async () => true),
-			getModelFallbackWarningAction: vi.fn(() => "suppress"),
-			getCurrentModel: vi.fn(() => primeModel),
-			maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(),
-			getUserInput: vi.fn(async () => undefined),
-			agentConnection: { prompt: vi.fn() },
-			showWarning: vi.fn(),
-			showError: vi.fn(),
-			returnToAgentsViewRequested: false,
-			sessionHasMessages: false,
-		};
+		const prompt = vi.fn();
+		const fakeThis = createStartupRunHarness(
+			{},
+			{
+				getCurrentModel: vi.fn(() => primeModel),
+				getUserInput: vi.fn(async () => undefined),
+				agentConnection: { prompt },
+				returnToAgentsViewRequested: false,
+			},
+		);
 
-		await expect(InteractiveMode.prototype.run.call(fakeThis as never)).resolves.toBe("agents_view");
+		await expect(InteractiveMode.prototype.run.call(fakeThis as never)).resolves.toEqual(startupRunResult);
 		expect(fakeThis.getUserInput).toHaveBeenCalledOnce();
-		expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
+		expect(prompt).not.toHaveBeenCalled();
 	});
 
 	function createPrimeCliHarness(shown: boolean): OnboardingFake {
