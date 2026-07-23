@@ -1336,13 +1336,69 @@ describe("agentLoop with AgentMessage", () => {
 		expect(parallelObserved).toBe(true);
 	});
 
-	it("does not check shouldStopBeforeTurn before the initial turn", async () => {
-		const shouldStopBeforeTurn = vi.fn(() => true);
+	const naturalCompletionCases: Array<{
+		name: string;
+		stopBefore: "always" | "afterTurn" | "never";
+		steerOnce?: boolean;
+		naturalWork?: boolean;
+		expected: { llmCalls: number; stopChecks?: number; steeringPolls?: number; naturalPolls?: number };
+	}> = [
+		{
+			name: "stops only after completing the initial turn",
+			stopBefore: "always",
+			expected: { llmCalls: 1, stopChecks: 1 },
+		},
+		{
+			name: "observes a stop requested after the turn before polling steering",
+			stopBefore: "afterTurn",
+			expected: { llmCalls: 1, steeringPolls: 1 },
+		},
+		{
+			name: "stops before polling natural-completion work",
+			stopBefore: "always",
+			naturalWork: true,
+			expected: { llmCalls: 1, naturalPolls: 0 },
+		},
+		{
+			name: "continues with steering when no stop is requested",
+			stopBefore: "never",
+			steerOnce: true,
+			expected: { llmCalls: 2 },
+		},
+	];
+
+	it.each(naturalCompletionCases)("$name", async ({ stopBefore, steerOnce, naturalWork, expected }) => {
 		let llmCalls = 0;
+		let stopRequested = false;
+		let steeringDelivered = false;
+		const shouldStopBeforeTurn = vi.fn(() => stopBefore === "always" || stopRequested);
+		const getSteeringMessages = vi.fn(async () => {
+			if (steerOnce && llmCalls === 1 && !steeringDelivered) {
+				steeringDelivered = true;
+				return [createUserMessage("steer")];
+			}
+			return [];
+		});
+		const getFollowUpMessages = vi.fn(async () => (naturalWork ? [createUserMessage("follow up")] : []));
+		const getContinuationMessages = vi.fn(async () => (naturalWork ? [createUserMessage("continue")] : []));
 		const stream = agentLoop(
 			[createUserMessage("start")],
 			{ systemPrompt: "", messages: [], tools: [] },
-			{ model: createModel(), convertToLlm: identityConverter, shouldStopBeforeTurn },
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				shouldStopBeforeTurn,
+				getSteeringMessages,
+				getFollowUpMessages,
+				getContinuationMessages,
+				...(stopBefore === "afterTurn" && {
+					shouldStopAfterTurn: async () => {
+						await Promise.resolve();
+						stopRequested = true;
+						return false;
+					},
+				}),
+			},
 			undefined,
 			() => {
 				llmCalls++;
@@ -1361,8 +1417,14 @@ describe("agentLoop with AgentMessage", () => {
 			// Drain the stream.
 		}
 
-		expect(llmCalls).toBe(1);
-		expect(shouldStopBeforeTurn).toHaveBeenCalledOnce();
+		expect(llmCalls).toBe(expected.llmCalls);
+		if (expected.stopChecks !== undefined) expect(shouldStopBeforeTurn).toHaveBeenCalledTimes(expected.stopChecks);
+		if (expected.steeringPolls !== undefined)
+			expect(getSteeringMessages).toHaveBeenCalledTimes(expected.steeringPolls);
+		if (expected.naturalPolls !== undefined) {
+			expect(getFollowUpMessages).toHaveBeenCalledTimes(expected.naturalPolls);
+			expect(getContinuationMessages).toHaveBeenCalledTimes(expected.naturalPolls);
+		}
 	});
 
 	it("checks shouldStopBeforeTurn after a tool batch and before another model call", async () => {
@@ -1408,117 +1470,6 @@ describe("agentLoop with AgentMessage", () => {
 
 		expect(execute).toHaveBeenCalledOnce();
 		expect(llmCalls).toBe(1);
-	});
-
-	it("observes a stop flag changed during shouldStopAfterTurn before polling steering", async () => {
-		let shouldStop = false;
-		const getSteeringMessages = vi.fn(async () => []);
-		const stream = agentLoop(
-			[createUserMessage("start")],
-			{ systemPrompt: "", messages: [], tools: [] },
-			{
-				model: createModel(),
-				convertToLlm: identityConverter,
-				getSteeringMessages,
-				shouldStopAfterTurn: async () => {
-					await Promise.resolve();
-					shouldStop = true;
-					return false;
-				},
-				shouldStopBeforeTurn: () => shouldStop,
-			},
-			undefined,
-			() => {
-				const mockStream = new MockAssistantStream();
-				queueMicrotask(() =>
-					mockStream.push({
-						type: "done",
-						reason: "stop",
-						message: createAssistantMessage([{ type: "text", text: "done" }]),
-					}),
-				);
-				return mockStream;
-			},
-		);
-		for await (const _event of stream) {
-			// Drain the stream.
-		}
-
-		// The only poll is the non-destructive initial-turn poll.
-		expect(getSteeringMessages).toHaveBeenCalledOnce();
-	});
-
-	it("checks shouldStopBeforeTurn before natural-completion polls", async () => {
-		const getFollowUpMessages = vi.fn(async () => [createUserMessage("follow up")]);
-		const getContinuationMessages = vi.fn(async () => [createUserMessage("continue")]);
-		const stream = agentLoop(
-			[createUserMessage("start")],
-			{ systemPrompt: "", messages: [], tools: [] },
-			{
-				model: createModel(),
-				convertToLlm: identityConverter,
-				shouldStopBeforeTurn: () => true,
-				getFollowUpMessages,
-				getContinuationMessages,
-			},
-			undefined,
-			() => {
-				const mockStream = new MockAssistantStream();
-				queueMicrotask(() =>
-					mockStream.push({
-						type: "done",
-						reason: "stop",
-						message: createAssistantMessage([{ type: "text", text: "done" }]),
-					}),
-				);
-				return mockStream;
-			},
-		);
-		for await (const _event of stream) {
-			// Drain the stream.
-		}
-
-		expect(getFollowUpMessages).not.toHaveBeenCalled();
-		expect(getContinuationMessages).not.toHaveBeenCalled();
-	});
-
-	it("preserves steering behavior when shouldStopBeforeTurn returns false", async () => {
-		let delivered = false;
-		let llmCalls = 0;
-		const stream = agentLoop(
-			[createUserMessage("start")],
-			{ systemPrompt: "", messages: [], tools: [] },
-			{
-				model: createModel(),
-				convertToLlm: identityConverter,
-				shouldStopBeforeTurn: () => false,
-				getSteeringMessages: async () => {
-					if (llmCalls === 1 && !delivered) {
-						delivered = true;
-						return [createUserMessage("steer")];
-					}
-					return [];
-				},
-			},
-			undefined,
-			() => {
-				llmCalls++;
-				const mockStream = new MockAssistantStream();
-				queueMicrotask(() =>
-					mockStream.push({
-						type: "done",
-						reason: "stop",
-						message: createAssistantMessage([{ type: "text", text: "done" }]),
-					}),
-				);
-				return mockStream;
-			},
-		);
-		for await (const _event of stream) {
-			// Drain the stream.
-		}
-
-		expect(llmCalls).toBe(2);
 	});
 
 	it("should stop after the current turn when shouldStopAfterTurn returns true", async () => {
