@@ -198,9 +198,9 @@ import { HeartbeatManagerComponent } from "./components/heartbeat-manager.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./components/injected-prompt-message.js";
 import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.js";
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
-import { OnboardingImportSelectorComponent } from "./components/onboarding-import-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
+import { SessionImportSelectorComponent } from "./components/session-import-selector.js";
 import { SessionPickerScreen } from "./components/session-picker-screen.js";
 import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
@@ -1642,13 +1642,23 @@ export class InteractiveMode {
 	}
 
 	private async runOnboardingImportFlow(): Promise<void> {
+		await this.runSessionImportFlow("onboarding");
+	}
+
+	private async runSessionImportFlow(trigger: "onboarding" | "command"): Promise<void> {
 		try {
 			const inventories = discoverSessionImports({ agentDir: getAgentDir() });
 			if (inventories.length === 0) {
+				if (trigger === "command") {
+					this.showStatus("No recent harness sessions or skills found");
+				}
 				return;
 			}
-			const selectedSources = await this.showOnboardingImportSelector(inventories);
+			const selectedSources = await this.showSessionImportSelector(inventories);
 			if (!selectedSources || selectedSources.length === 0) {
+				if (trigger === "command") {
+					this.showStatus("Import cancelled");
+				}
 				return;
 			}
 			const result = await importSessionsAndSkills(inventories, selectedSources, {
@@ -1667,11 +1677,19 @@ export class InteractiveMode {
 				}
 			}
 		} catch {
-			this.showWarning("Local session import failed safely; onboarding will continue.");
+			this.showWarning(
+				trigger === "onboarding"
+					? "Local session import failed safely; onboarding will continue."
+					: "Local session import failed safely.",
+			);
 		}
 	}
 
-	private showOnboardingImportSelector(
+	private async handleHarnessImportCommand(): Promise<void> {
+		await this.runSessionImportFlow("command");
+	}
+
+	private showSessionImportSelector(
 		inventories: SessionImportInventory[],
 	): Promise<SessionImportSource[] | undefined> {
 		return new Promise((resolve) => {
@@ -1686,7 +1704,7 @@ export class InteractiveMode {
 				this.ui.requestRender();
 				resolve(result);
 			};
-			const selector = new OnboardingImportSelectorComponent(
+			const selector = new SessionImportSelectorComponent(
 				inventories,
 				(sources) => settle(sources),
 				() => settle(undefined),
@@ -4342,7 +4360,11 @@ export class InteractiveMode {
 					return;
 				}
 				if (commandName === "import") {
-					await this.handleImportCommand(canonicalCommandText);
+					if (commandArgs) {
+						await this.handleImportCommand(canonicalCommandText);
+					} else {
+						await this.handleHarnessImportCommand();
+					}
 					this.editor.setText("");
 					return;
 				}

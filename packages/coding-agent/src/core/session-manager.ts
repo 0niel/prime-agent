@@ -59,6 +59,7 @@ export interface SessionHeader {
 	importedFrom?: {
 		source: string;
 		id: string;
+		contentHash: string;
 	};
 }
 

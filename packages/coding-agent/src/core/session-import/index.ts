@@ -1,16 +1,17 @@
-import { type Dirent, existsSync, readdirSync } from "node:fs";
+import { type Dirent, existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { getAgentDir, getSessionsDir } from "../../config.js";
 import { parseClaudeSession } from "./adapters/claude.js";
 import { parseCodexSession } from "./adapters/codex.js";
 import {
-	listOpenCodeCliSessionIds,
-	listOpenCodeSessionIds,
+	listOpenCodeCliSessions,
+	listOpenCodeSessions,
 	parseOpenCodeCliSession,
 	parseOpenCodeSession,
 } from "./adapters/opencode.js";
 import { parsePiSession } from "./adapters/pi.js";
+import { importedSessionContentHash } from "./shared.js";
 import { discoverSkillDirectories, importSkillDirectory } from "./skills.js";
 import { collectImportedSessionKeys, persistImportedSession, sessionImportKey } from "./storage.js";
 import {
@@ -39,14 +40,32 @@ const SOURCE_LABELS: Record<SessionImportSource, string> = {
 	opencode: "OpenCode",
 	pi: "Pi",
 };
-const MAX_DISCOVERED_SESSIONS = 50_000;
+const MAX_RECENT_SESSIONS = 50;
+const MAX_SESSION_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
-function listJsonlFiles(root: string, excludeDirectory?: (name: string) => boolean): string[] {
-	const files: string[] = [];
-	const visit = (directory: string) => {
-		if (files.length >= MAX_DISCOVERED_SESSIONS) {
-			return;
-		}
+interface JsonlSearchRoot {
+	path: string;
+	recursive: boolean;
+	excludeDirectory?: (name: string) => boolean;
+}
+
+interface RecentFile {
+	path: string;
+	modifiedAt: number;
+}
+
+function listRecentJsonlFiles(roots: JsonlSearchRoot[], cutoff: number): string[] {
+	const files = new Map<string, RecentFile>();
+	const addFile = (path: string) => {
+		try {
+			const modifiedAt = statSync(path).mtimeMs;
+			if (modifiedAt >= cutoff) {
+				const normalized = resolve(path);
+				files.set(normalized, { path: normalized, modifiedAt });
+			}
+		} catch {}
+	};
+	const visit = (root: JsonlSearchRoot, directory: string) => {
 		let entries: Dirent<string>[];
 		try {
 			entries = readdirSync(directory, { withFileTypes: true, encoding: "utf8" });
@@ -59,33 +78,25 @@ function listJsonlFiles(root: string, excludeDirectory?: (name: string) => boole
 			}
 			const path = join(directory, entry.name);
 			if (entry.isDirectory()) {
-				if (!excludeDirectory?.(entry.name)) {
-					visit(path);
+				if (root.recursive && !root.excludeDirectory?.(entry.name)) {
+					visit(root, path);
 				}
 			} else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-				files.push(path);
-			}
-			if (files.length >= MAX_DISCOVERED_SESSIONS) {
-				return;
+				addFile(path);
 			}
 		}
 	};
-	visit(root);
-	return files;
+	for (const root of roots) {
+		visit(root, root.path);
+	}
+	return [...files.values()]
+		.sort((a, b) => b.modifiedAt - a.modifiedAt || a.path.localeCompare(b.path))
+		.slice(0, MAX_RECENT_SESSIONS)
+		.map((file) => file.path);
 }
 
 function fileReferences(paths: string[]): SessionImportReference[] {
-	return [...new Set(paths.map((path) => resolve(path)))].map((path) => ({ kind: "file", path }));
-}
-
-function listDirectJsonlFiles(root: string): string[] {
-	try {
-		return readdirSync(root, { withFileTypes: true, encoding: "utf8" })
-			.filter((entry) => entry.isFile() && !entry.isSymbolicLink() && entry.name.endsWith(".jsonl"))
-			.map((entry) => join(root, entry.name));
-	} catch {
-		return [];
-	}
+	return paths.map((path) => ({ kind: "file", path }));
 }
 
 function uniqueExistingDirectories(paths: string[]): string[] {
@@ -119,7 +130,12 @@ function makeInventory(
 	};
 }
 
-function discoverOpenCodeReferences(home: string, env: NodeJS.ProcessEnv, cwd: string): SessionImportReference[] {
+function discoverOpenCodeReferences(
+	home: string,
+	env: NodeJS.ProcessEnv,
+	cwd: string,
+	cutoff: number,
+): SessionImportReference[] {
 	const configuredDataDirectories = env.OPENCODE_DATA_HOME
 		? [env.OPENCODE_DATA_HOME]
 		: env.XDG_DATA_HOME
@@ -133,20 +149,26 @@ function discoverOpenCodeReferences(home: string, env: NodeJS.ProcessEnv, cwd: s
 		.map((directory) => join(directory, "opencode.db"))
 		.filter(existsSync);
 
-	const references: SessionImportReference[] = [];
-	const seen = new Set<string>();
+	const candidatesById = new Map<string, { id: string; reference: SessionImportReference; modifiedAt: number }>();
 	for (const databasePath of candidates) {
 		try {
-			for (const sessionId of listOpenCodeSessionIds(databasePath)) {
-				if (!seen.has(sessionId)) {
-					seen.add(sessionId);
-					references.push({ kind: "opencode", databasePath, sessionId });
+			for (const session of listOpenCodeSessions(databasePath, cutoff, MAX_RECENT_SESSIONS)) {
+				const existing = candidatesById.get(session.id);
+				if (!existing || session.modifiedAt > existing.modifiedAt) {
+					candidatesById.set(session.id, {
+						id: session.id,
+						reference: { kind: "opencode", databasePath, sessionId: session.id },
+						modifiedAt: session.modifiedAt,
+					});
 				}
 			}
 		} catch {}
 	}
-	if (references.length > 0) {
-		return references;
+	if (candidatesById.size > 0) {
+		return [...candidatesById.values()]
+			.sort((a, b) => b.modifiedAt - a.modifiedAt || a.id.localeCompare(b.id))
+			.slice(0, MAX_RECENT_SESSIONS)
+			.map((candidate) => candidate.reference);
 	}
 
 	const commands = [
@@ -155,16 +177,13 @@ function discoverOpenCodeReferences(home: string, env: NodeJS.ProcessEnv, cwd: s
 		"opencode",
 	].filter((command): command is string => !!command);
 	for (const command of commands) {
-		const sessionIds = listOpenCodeCliSessionIds(command, cwd);
-		if (sessionIds === undefined) {
+		const sessions = listOpenCodeCliSessions(command, cwd, cutoff, MAX_RECENT_SESSIONS);
+		if (sessions === undefined) {
 			continue;
 		}
-		for (const sessionId of sessionIds) {
-			references.push({ kind: "opencode-cli", command, cwd, sessionId });
-		}
-		break;
+		return sessions.map((session) => ({ kind: "opencode-cli", command, cwd, sessionId: session.id }));
 	}
-	return references;
+	return [];
 }
 
 export function discoverSessionImports(options: SessionImportOptions = {}): SessionImportInventory[] {
@@ -172,6 +191,7 @@ export function discoverSessionImports(options: SessionImportOptions = {}): Sess
 	const env = options.env ?? process.env;
 	const cwd = options.cwd ?? process.cwd();
 	const agentDir = resolve(options.agentDir ?? getAgentDir());
+	const cutoff = Date.now() - MAX_SESSION_AGE_MS;
 	const claudeDir = resolve(env.CLAUDE_CONFIG_DIR ?? join(home, ".claude"));
 	const codexDir = resolve(env.CODEX_HOME ?? join(home, ".codex"));
 	const piDir = resolve(env.PI_CODING_AGENT_DIR ?? env.PI_AGENT_DIR ?? join(home, ".pi", "agent"));
@@ -184,18 +204,34 @@ export function discoverSessionImports(options: SessionImportOptions = {}): Sess
 	const inventories = [
 		makeInventory(
 			"claude",
-			fileReferences(listJsonlFiles(join(claudeDir, "projects"), (name) => name === "subagents")),
+			fileReferences(
+				listRecentJsonlFiles(
+					[
+						{
+							path: join(claudeDir, "projects"),
+							recursive: true,
+							excludeDirectory: (name) => name === "subagents",
+						},
+					],
+					cutoff,
+				),
+			),
 			[join(claudeDir, "skills")],
 		),
 		makeInventory(
 			"codex",
-			fileReferences([
-				...listJsonlFiles(join(codexDir, "sessions")),
-				...listJsonlFiles(join(codexDir, "archived_sessions")),
-			]),
+			fileReferences(
+				listRecentJsonlFiles(
+					[
+						{ path: join(codexDir, "sessions"), recursive: true },
+						{ path: join(codexDir, "archived_sessions"), recursive: true },
+					],
+					cutoff,
+				),
+			),
 			[join(codexDir, "skills")],
 		),
-		makeInventory("opencode", discoverOpenCodeReferences(home, env, cwd), [
+		makeInventory("opencode", discoverOpenCodeReferences(home, env, cwd, cutoff), [
 			...configuredOpenCodeSkillDirectories,
 			join(home, ".config", "opencode", "skills"),
 			join(home, ".opencode", "skills"),
@@ -204,7 +240,15 @@ export function discoverSessionImports(options: SessionImportOptions = {}): Sess
 			? undefined
 			: makeInventory(
 					"pi",
-					fileReferences([...listJsonlFiles(join(piDir, "sessions")), ...listDirectJsonlFiles(piDir)]),
+					fileReferences(
+						listRecentJsonlFiles(
+							[
+								{ path: join(piDir, "sessions"), recursive: true },
+								{ path: piDir, recursive: false },
+							],
+							cutoff,
+						),
+					),
 					[join(piDir, "skills")],
 				),
 	];
@@ -287,12 +331,13 @@ export async function importSessionsAndSkills(
 					result.sessionsSkipped++;
 					continue;
 				}
-				const key = sessionImportKey(session.source, session.sourceId);
+				const contentHash = importedSessionContentHash(session);
+				const key = sessionImportKey(session.source, session.sourceId, contentHash);
 				if (importedKeys.has(key)) {
 					result.sessionsSkipped++;
 					continue;
 				}
-				persistImportedSession(session, sessionDir, home);
+				persistImportedSession(session, contentHash, sessionDir, home);
 				importedKeys.add(key);
 				result.sessionsImported++;
 			} catch {

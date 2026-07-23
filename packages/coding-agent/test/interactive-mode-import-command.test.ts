@@ -6,7 +6,12 @@ type PathCommand = "/export" | "/import";
 
 type InteractiveModePrototype = {
 	getPathCommandArgument(this: unknown, text: string, command: PathCommand): string | undefined;
+	handleHarnessImportCommand(this: HarnessImportCommandContext): Promise<void>;
 	handleImportCommand(this: ImportCommandContext, text: string): Promise<void>;
+};
+
+type HarnessImportCommandContext = {
+	runSessionImportFlow: (trigger: "onboarding" | "command") => Promise<void>;
 };
 
 type ImportCommandContext = {
@@ -26,6 +31,14 @@ type ImportCommandContext = {
 const interactiveModePrototype = InteractiveMode.prototype as unknown as InteractiveModePrototype;
 
 describe("InteractiveMode /import parsing", () => {
+	it("opens harness import when no path is provided", async () => {
+		const runSessionImportFlow = vi.fn(async () => {});
+
+		await interactiveModePrototype.handleHarnessImportCommand.call({ runSessionImportFlow });
+
+		expect(runSessionImportFlow).toHaveBeenCalledWith("command");
+	});
+
 	it("strips quotes from /import path arguments", () => {
 		expect(interactiveModePrototype.getPathCommandArgument('/import "path/to/session.jsonl"', "/import")).toBe(
 			"path/to/session.jsonl",

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
 	Api,
 	AssistantMessage,
@@ -11,6 +12,7 @@ import type {
 	Usage,
 	UserMessage,
 } from "@earendil-works/pi-ai";
+import type { ImportedSession } from "./types.js";
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -260,4 +262,17 @@ export function deriveSessionTitle(messages: Message[], fallback?: string): stri
 		return undefined;
 	}
 	return normalizedFallback.length > 80 ? `${normalizedFallback.slice(0, 77)}...` : normalizedFallback;
+}
+
+export function importedSessionContentHash(session: ImportedSession): string {
+	const messages = session.messages.map(({ timestamp: _timestamp, ...message }) => message);
+	return createHash("sha256")
+		.update(
+			JSON.stringify({
+				cwd: session.cwd,
+				title: session.title,
+				messages,
+			}),
+		)
+		.digest("hex");
 }

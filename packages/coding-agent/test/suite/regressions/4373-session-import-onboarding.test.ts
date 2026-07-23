@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -13,7 +13,7 @@ import {
 	type SessionImportInventory,
 } from "../../../src/core/session-import/index.js";
 import { buildSessionContext, loadEntriesFromFile, type SessionHeader } from "../../../src/core/session-manager.js";
-import { OnboardingImportSelectorComponent } from "../../../src/modes/interactive/components/onboarding-import-selector.js";
+import { SessionImportSelectorComponent } from "../../../src/modes/interactive/components/session-import-selector.js";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
 
 const ZERO_USAGE = {
@@ -133,6 +133,7 @@ function createCodexFixture(home: string): void {
 function createOpenCodeFixture(home: string): void {
 	const directory = join(home, ".local", "share", "opencode");
 	mkdirSync(directory, { recursive: true });
+	const now = Date.now();
 	const database = new DatabaseSync(join(directory, "opencode.db"));
 	try {
 		database.exec(`
@@ -149,14 +150,14 @@ function createOpenCodeFixture(home: string): void {
 		`);
 		database
 			.prepare("INSERT INTO session VALUES (?, NULL, ?, ?, ?, ?)")
-			.run("opencode-session", "/workspace/opencode", "OpenCode title", 1_767_312_000_000, 1_767_312_010_000);
+			.run("opencode-session", "/workspace/opencode", "OpenCode title", now, now + 10_000);
 		database.prepare("INSERT INTO message VALUES (?, ?, ?, ?)").run(
 			"opencode-user",
 			"opencode-session",
-			1_767_312_001_000,
+			now + 1_000,
 			JSON.stringify({
 				role: "user",
-				time: { created: 1_767_312_001_000 },
+				time: { created: now + 1_000 },
 				model: { providerID: "openai", modelID: "gpt-test" },
 			}),
 		);
@@ -166,16 +167,16 @@ function createOpenCodeFixture(home: string): void {
 				"opencode-user-text",
 				"opencode-user",
 				"opencode-session",
-				1_767_312_001_000,
+				now + 1_000,
 				JSON.stringify({ type: "text", text: "OpenCode user prompt" }),
 			);
 		database.prepare("INSERT INTO message VALUES (?, ?, ?, ?)").run(
 			"opencode-assistant",
 			"opencode-session",
-			1_767_312_002_000,
+			now + 2_000,
 			JSON.stringify({
 				role: "assistant",
-				time: { created: 1_767_312_002_000 },
+				time: { created: now + 2_000 },
 				providerID: "openai",
 				modelID: "gpt-test",
 				finish: "tool-calls",
@@ -187,21 +188,21 @@ function createOpenCodeFixture(home: string): void {
 			"opencode-reasoning",
 			"opencode-assistant",
 			"opencode-session",
-			1_767_312_002_000,
-			JSON.stringify({ type: "reasoning", text: "OpenCode thinking", time: { start: 1_767_312_002_000 } }),
+			now + 2_000,
+			JSON.stringify({ type: "reasoning", text: "OpenCode thinking", time: { start: now + 2_000 } }),
 		);
 		insertPart.run(
 			"opencode-text",
 			"opencode-assistant",
 			"opencode-session",
-			1_767_312_003_000,
+			now + 3_000,
 			JSON.stringify({ type: "text", text: "OpenCode assistant" }),
 		);
 		insertPart.run(
 			"opencode-tool",
 			"opencode-assistant",
 			"opencode-session",
-			1_767_312_004_000,
+			now + 4_000,
 			JSON.stringify({
 				type: "tool",
 				callID: "opencode-tool",
@@ -210,7 +211,7 @@ function createOpenCodeFixture(home: string): void {
 					status: "completed",
 					input: { command: "pwd" },
 					output: "OpenCode tool output",
-					time: { start: 1_767_312_004_000, end: 1_767_312_005_000 },
+					time: { start: now + 4_000, end: now + 5_000 },
 				},
 			}),
 		);
@@ -308,6 +309,7 @@ describe("ENG-4373 onboarding session import", () => {
 			const entries = loadEntriesFromFile(sessionFile);
 			const header = entries[0] as SessionHeader;
 			importedSources.add(header.importedFrom?.source ?? "");
+			expect(header.importedFrom?.contentHash).toMatch(/^[a-f0-9]{64}$/);
 			const context = buildSessionContext(entries.slice(1).filter((entry) => entry.type !== "session"));
 			expect(context.messages.some((message) => message.role === "user")).toBe(true);
 			expect(
@@ -341,6 +343,79 @@ describe("ENG-4373 onboarding session import", () => {
 		expect(retry.sessionsSkipped).toBe(5);
 		expect(retry.skillsImported).toBe(0);
 		expect(retry.skillsSkipped).toBe(4);
+
+		const claudeReference = inventories
+			.find((inventory) => inventory.source === "claude")
+			?.sessionReferences.find(
+				(reference) => reference.kind === "file" && reference.path.endsWith("claude-session.jsonl"),
+			);
+		expect(claudeReference?.kind).toBe("file");
+		if (claudeReference?.kind === "file") {
+			writeFileSync(
+				claudeReference.path,
+				`${JSON.stringify({
+					type: "user",
+					sessionId: "claude-session",
+					cwd: "/workspace/claude",
+					timestamp: "2026-01-01T00:00:03.000Z",
+					message: { role: "user", content: "Continued Claude prompt" },
+				})}\n`,
+				{ flag: "a" },
+			);
+		}
+
+		const continued = await importSessionsAndSkills(
+			inventories,
+			inventories.map((inventory) => inventory.source),
+			{ homeDir: home, agentDir, env: {} },
+		);
+		expect(continued.sessionsImported).toBe(1);
+		expect(continued.sessionsSkipped).toBe(4);
+		expect(readdirSync(getSessionsDir(agentDir)).filter((file) => file.endsWith(".jsonl"))).toHaveLength(5);
+	});
+
+	it("considers only the 50 most recently modified sessions from the last 30 days", () => {
+		const project = join(home, ".claude", "projects", "-recent");
+		const now = Date.now();
+		for (let index = 0; index < 55; index++) {
+			const path = join(project, `recent-${index.toString().padStart(2, "0")}.jsonl`);
+			writeJsonl(path, [
+				{
+					type: "user",
+					sessionId: `recent-${index}`,
+					cwd: "/workspace/claude",
+					timestamp: new Date(now - index * 1_000).toISOString(),
+					message: { role: "user", content: `Recent prompt ${index}` },
+				},
+			]);
+			const modifiedAt = new Date(now + 10_000 - index * 1_000);
+			utimesSync(path, modifiedAt, modifiedAt);
+		}
+		const oldPath = join(project, "old.jsonl");
+		writeJsonl(oldPath, [
+			{
+				type: "user",
+				sessionId: "old",
+				cwd: "/workspace/claude",
+				timestamp: "2020-01-01T00:00:00.000Z",
+				message: { role: "user", content: "Old prompt" },
+			},
+		]);
+		const oldTime = new Date(now - 31 * 24 * 60 * 60 * 1_000);
+		utimesSync(oldPath, oldTime, oldTime);
+
+		const claude = discoverSessionImports({ homeDir: home, agentDir, env: {} }).find(
+			(inventory) => inventory.source === "claude",
+		);
+		const paths =
+			claude?.sessionReferences
+				.filter((reference) => reference.kind === "file")
+				.map((reference) => reference.path) ?? [];
+
+		expect(claude?.sessionCount).toBe(50);
+		expect(paths).toContain(join(project, "recent-00.jsonl"));
+		expect(paths).not.toContain(join(project, "recent-54.jsonl"));
+		expect(paths).not.toContain(oldPath);
 	});
 
 	it("continues importing other sources when one source disappears", async () => {
@@ -365,7 +440,7 @@ describe("ENG-4373 onboarding session import", () => {
 	it("selects harnesses rather than individual data types", () => {
 		const inventories = discoverSessionImports({ homeDir: home, agentDir, env: {} }).slice(0, 2);
 		const onSelect = vi.fn();
-		const selector = new OnboardingImportSelectorComponent(inventories, onSelect, vi.fn());
+		const selector = new SessionImportSelectorComponent(inventories, onSelect, vi.fn());
 
 		selector.handleInput("\r");
 		selector.handleInput("\x1b[B");

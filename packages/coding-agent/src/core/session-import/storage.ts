@@ -12,8 +12,8 @@ import {
 } from "../session-manager.js";
 import type { ImportedSession, SessionImportSource } from "./types.js";
 
-export function sessionImportKey(source: SessionImportSource, sourceId: string): string {
-	return `${source}\0${sourceId}`;
+export function sessionImportKey(source: SessionImportSource, sourceId: string, contentHash: string): string {
+	return `${source}\0${sourceId}\0${contentHash}`;
 }
 
 export function collectImportedSessionKeys(sessionDir: string): Set<string> {
@@ -34,8 +34,9 @@ export function collectImportedSessionKeys(sessionDir: string): Set<string> {
 			const header = JSON.parse(firstLine) as Partial<SessionHeader>;
 			const source = header.importedFrom?.source;
 			const id = header.importedFrom?.id;
-			if (source && id) {
-				keys.add(`${source}\0${id}`);
+			const contentHash = header.importedFrom?.contentHash;
+			if (source && id && contentHash) {
+				keys.add(sessionImportKey(source as SessionImportSource, id, contentHash));
 			}
 		} catch {}
 	}
@@ -52,7 +53,7 @@ function sourceTimestamp(message: unknown): string {
 	return new Date(timestamp).toISOString();
 }
 
-function buildImportedEntries(session: ImportedSession, fallbackCwd: string): FileEntry[] {
+function buildImportedEntries(session: ImportedSession, contentHash: string, fallbackCwd: string): FileEntry[] {
 	const manager = SessionManager.inMemory(session.cwd || fallbackCwd);
 	for (const message of session.messages) {
 		manager.appendMessage(message);
@@ -68,11 +69,12 @@ function buildImportedEntries(session: ImportedSession, fallbackCwd: string): Fi
 	}
 	const header: SessionHeader = {
 		...originalHeader,
-		id: uuidv5(`prime-agent-import:${session.source}:${session.sourceId}`, uuidv5.URL),
+		id: uuidv5(`prime-agent-import:${session.source}:${session.sourceId}:${contentHash}`, uuidv5.URL),
 		timestamp: new Date(session.createdAt).toISOString(),
 		importedFrom: {
 			source: session.source,
 			id: session.sourceId,
+			contentHash,
 		},
 	};
 	const lastMessageTimestamp = session.messages.reduce(
@@ -92,9 +94,14 @@ function buildImportedEntries(session: ImportedSession, fallbackCwd: string): Fi
 	return [header, ...entries];
 }
 
-export function persistImportedSession(session: ImportedSession, sessionDir: string, fallbackCwd: string): string {
+export function persistImportedSession(
+	session: ImportedSession,
+	contentHash: string,
+	sessionDir: string,
+	fallbackCwd: string,
+): string {
 	mkdirSync(sessionDir, { recursive: true });
-	const entries = buildImportedEntries(session, fallbackCwd);
+	const entries = buildImportedEntries(session, contentHash, fallbackCwd);
 	const header = entries[0] as SessionHeader;
 	const destination = join(sessionDir, `${header.id}.jsonl`);
 	if (existsSync(destination)) {

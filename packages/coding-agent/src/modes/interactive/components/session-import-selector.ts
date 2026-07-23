@@ -8,7 +8,7 @@ function countLabel(count: number, singular: string): string {
 	return `${count} ${singular}${count === 1 ? "" : "s"}`;
 }
 
-export class OnboardingImportSelectorComponent extends Container {
+export class SessionImportSelectorComponent extends Container {
 	private readonly selectedSources: Set<SessionImportSource>;
 	private readonly list = new MenuList({ compact: true });
 	private selectedIndex = 0;

@@ -37,6 +37,16 @@ interface JsonDataRow {
 	data: string;
 }
 
+interface OpenCodeSessionListRow {
+	id: string;
+	timestamp?: number;
+}
+
+export interface OpenCodeSessionCandidate {
+	id: string;
+	modifiedAt: number;
+}
+
 interface OpenCodeMessageRecord {
 	message: Record<string, unknown>;
 	parts: Record<string, unknown>[];
@@ -236,15 +246,44 @@ function runOpenCode(command: string, args: string[], cwd: string, timeout: numb
 	return result.status === 0 ? result.stdout.trim() : undefined;
 }
 
-export function listOpenCodeCliSessionIds(command: string, cwd: string): string[] | undefined {
+function openCodeListTimestamp(value: Record<string, unknown>): number {
+	const time = asRecord(value.time);
+	return parseTimestamp(
+		time?.updated ??
+			time?.created ??
+			value.time_updated ??
+			value.time_created ??
+			value.updatedAt ??
+			value.updated_at ??
+			value.createdAt ??
+			value.created_at,
+		0,
+	);
+}
+
+export function listOpenCodeCliSessions(
+	command: string,
+	cwd: string,
+	cutoff: number,
+	limit: number,
+): OpenCodeSessionCandidate[] | undefined {
 	const output = runOpenCode(command, ["session", "list", "--format", "json", "--pure"], cwd, 5_000);
 	if (!output) {
 		return undefined;
 	}
 	try {
-		return asArray(JSON.parse(output) as unknown)
-			.map((value) => asString(asRecord(value)?.id))
-			.filter((id): id is string => id !== undefined);
+		const parsed = JSON.parse(output) as unknown;
+		const values = Array.isArray(parsed) ? parsed : asArray(asRecord(parsed)?.sessions);
+		return values
+			.map((value) => {
+				const record = asRecord(value);
+				const id = asString(record?.id);
+				const timestamp = record ? openCodeListTimestamp(record) : 0;
+				return id && timestamp >= cutoff ? { id, modifiedAt: timestamp } : undefined;
+			})
+			.filter((session): session is OpenCodeSessionCandidate => session !== undefined)
+			.sort((a, b) => b.modifiedAt - a.modifiedAt || a.id.localeCompare(b.id))
+			.slice(0, limit);
 	} catch {
 		return undefined;
 	}
@@ -293,7 +332,7 @@ function queryRows<T>(database: NodeDatabaseSync, sql: string, ...params: (strin
 	return database.prepare(sql).all(...params) as T[];
 }
 
-export function listOpenCodeSessionIds(databasePath: string): string[] {
+export function listOpenCodeSessions(databasePath: string, cutoff: number, limit: number): OpenCodeSessionCandidate[] {
 	const database = openDatabase(databasePath);
 	try {
 		const tables = queryRows<{ name: string }>(
@@ -303,16 +342,26 @@ export function listOpenCodeSessionIds(databasePath: string): string[] {
 		if (new Set(tables.map((row) => row.name)).size !== 3) {
 			return [];
 		}
-		try {
-			return queryRows<{ id: string }>(
-				database,
-				"SELECT id FROM session WHERE parent_id IS NULL ORDER BY time_updated, id",
-			).map((row) => row.id);
-		} catch {
-			return queryRows<{ id: string }>(database, "SELECT id FROM session ORDER BY time_updated, id").map(
-				(row) => row.id,
-			);
+		const columns = new Set(
+			queryRows<{ name: string }>(database, "PRAGMA table_info(session)").map((column) => column.name),
+		);
+		const timeColumn = columns.has("time_updated")
+			? "time_updated"
+			: columns.has("time_created")
+				? "time_created"
+				: "";
+		if (!timeColumn) {
+			return [];
 		}
+		const rootFilter = columns.has("parent_id") ? " WHERE parent_id IS NULL" : "";
+		return queryRows<OpenCodeSessionListRow>(
+			database,
+			`SELECT id, ${timeColumn} AS timestamp FROM session${rootFilter}`,
+		)
+			.map((row) => ({ id: row.id, modifiedAt: parseTimestamp(row.timestamp, 0) }))
+			.filter((session) => session.id && session.modifiedAt >= cutoff)
+			.sort((a, b) => b.modifiedAt - a.modifiedAt || a.id.localeCompare(b.id))
+			.slice(0, limit);
 	} finally {
 		database.close();
 	}

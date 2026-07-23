@@ -33,6 +33,12 @@ describe("built-in slash commands", () => {
 		});
 	});
 
+	test("describes both /import modes", () => {
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "import")).toMatchObject({
+			description: "Import harness history, or resume a session from a JSONL file",
+		});
+	});
+
 	test("exposes /btw as an argument command with /side as an alias", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "btw")).toMatchObject({
 			argumentHint: "<question>",
