@@ -723,14 +723,18 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
-		await this.requestOk({
-			type: "prompt",
-			activeSessionId: this.activeSessionId,
-			message,
-			images: options?.images,
-			streamingBehavior: options?.streamingBehavior,
-			source: options?.source,
-		});
+		await this.requestData<unknown>(
+			{
+				type: "prompt",
+				activeSessionId: this.activeSessionId,
+				message,
+				images: options?.images,
+				streamingBehavior: options?.streamingBehavior,
+				queueIfBusy: options?.queueIfBusy,
+				source: options?.source,
+			},
+			DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
+		);
 	}
 
 	async promptAndWait(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
@@ -741,6 +745,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				message,
 				images: options?.images,
 				streamingBehavior: options?.streamingBehavior,
+				queueIfBusy: options?.queueIfBusy,
 				source: options?.source,
 			},
 			DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,

@@ -62,6 +62,9 @@ class FakeDaemonClient {
 		this.requests.push(command);
 		this.requestTimeouts.push(timeoutMs);
 		switch (command.type) {
+			case "prompt":
+			case "prompt_and_wait":
+				return { type: "response", command: command.type, success: true };
 			case "list":
 				return {
 					type: "response",
@@ -673,6 +676,21 @@ function emitSequencedQueueUpdate(client: FakeDaemonClient, activeSessionId: str
 }
 
 describe("DaemonAgentConnection", () => {
+	it("forwards queueIfBusy for prompt admission", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await connection.prompt("queued input", { streamingBehavior: "followUp", queueIfBusy: true });
+
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "prompt",
+			activeSessionId: "active-1",
+			message: "queued input",
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+		});
+	});
+
 	it("uses fleet heartbeat scope for residents and session scope for owned workers", async () => {
 		const residentClient = new FakeDaemonClient();
 		residentClient.serverCapabilities.add("heartbeat_catalog");

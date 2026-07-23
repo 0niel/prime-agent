@@ -1002,8 +1002,10 @@ describe("issue #4257 update restart resume", () => {
 			}),
 		);
 
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		await harness.session.agent.waitForIdle();
+		await vi.waitFor(() =>
+			expect(getUserTexts(harness)).toEqual(["restored steer", "restored follow-up", "continue interrupted work"]),
+		);
+		await harness.session.waitForSessionInputIdle();
 
 		const responses = writes
 			.join("")

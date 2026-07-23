@@ -50,15 +50,11 @@ import type { SessionSummary } from "./daemon-session-list.js";
 export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
 export const DAEMON_PROTOCOL_VERSION = 4;
 export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 2;
-// Revision 5: transient + runId on execute_bash (echoed with a transient
-// marker on the run's bash_start/bash_end session events) + transient_bash
-// capability.
-// Revision 4: side_question_transcript capability. The digest only covers the
-// command/outbound type source, so capability-list and session-event changes
-// must bump this revision by hand — otherwise a retained older daemon passes
-// the staleness probe and clients gate features against it forever.
-export const DAEMON_SCHEMA_REVISION = 5;
-export const DAEMON_SCHEMA_ID = "protocol-4-schema-5-4c17c4fb3f00";
+// Revision 6: session_input_admission plus the upstream side-question transcript and transient-bash contracts.
+// Revision 5: transient + runId on execute_bash and transient_bash capability.
+// Revision 4: side_question_transcript capability.
+export const DAEMON_SCHEMA_REVISION = 6;
+export const DAEMON_SCHEMA_ID = "protocol-4-schema-6-pending";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -89,7 +85,9 @@ export type DaemonServerCapability =
 	// bash: never recorded into the session, and its bash_start/bash_end events
 	// carry the transient marker and echoed runId so clients correlate runs by
 	// identity). Clients must check before sending.
-	| "transient_bash";
+	| "transient_bash"
+	| "session_input_admission";
+
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
 export interface DaemonProtocolInfo {
@@ -123,6 +121,8 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"model_catalog",
 	"side_question_transcript",
 	"transient_bash",
+	"session_input_admission",
+
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -395,6 +395,7 @@ export type DaemonCommand =
 			content?: (TextContent | ImageContent)[];
 			images?: ImageContent[];
 			streamingBehavior?: "steer" | "followUp";
+			queueIfBusy?: boolean;
 			expandPromptTemplates?: boolean;
 			source?: InputSource;
 			agentMessageId?: string;
@@ -408,6 +409,7 @@ export type DaemonCommand =
 			content?: (TextContent | ImageContent)[];
 			images?: ImageContent[];
 			streamingBehavior?: "steer" | "followUp";
+			queueIfBusy?: boolean;
 			expandPromptTemplates?: boolean;
 			source?: InputSource;
 	  }
@@ -595,6 +597,10 @@ export interface DaemonCommandCompatibility {
 
 const LEGACY_DAEMON_COMMAND = { minProtocol: 1 } as const;
 const CURRENT_DAEMON_COMMAND = { minProtocol: DAEMON_PROTOCOL_VERSION } as const;
+const SESSION_INPUT_ADMISSION_COMMAND = {
+	minProtocol: DAEMON_PROTOCOL_VERSION,
+	capability: "session_input_admission",
+} as const;
 const CLIENT_OWNED_DAEMON_COMMAND = {
 	minProtocol: DAEMON_PROTOCOL_VERSION,
 	capability: "client_owned_sessions",
@@ -612,13 +618,13 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	promote_owned_session: CLIENT_OWNED_DAEMON_COMMAND,
 	kill: LEGACY_DAEMON_COMMAND,
 	rename: LEGACY_DAEMON_COMMAND,
-	prompt: LEGACY_DAEMON_COMMAND,
-	prompt_and_wait: CURRENT_DAEMON_COMMAND,
-	steer: LEGACY_DAEMON_COMMAND,
-	follow_up: LEGACY_DAEMON_COMMAND,
+	prompt: SESSION_INPUT_ADMISSION_COMMAND,
+	prompt_and_wait: SESSION_INPUT_ADMISSION_COMMAND,
+	steer: SESSION_INPUT_ADMISSION_COMMAND,
+	follow_up: SESSION_INPUT_ADMISSION_COMMAND,
 	restore_next_turn: LEGACY_DAEMON_COMMAND,
 	append_custom_message: LEGACY_DAEMON_COMMAND,
-	resume_queue: LEGACY_DAEMON_COMMAND,
+	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
 	send_message: LEGACY_DAEMON_COMMAND,
 	agent_messages_status: LEGACY_DAEMON_COMMAND,
 	agent_messages_pause: LEGACY_DAEMON_COMMAND,

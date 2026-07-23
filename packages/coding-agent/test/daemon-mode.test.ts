@@ -5062,24 +5062,147 @@ describe("daemon mode helpers", () => {
 		expect(followUp).not.toHaveBeenCalled();
 	});
 
-	it("forwards queue keys when expanded daemon steer commands are queued", async () => {
+	it.each(["steer", "follow_up"] as const)(
+		"idle daemon %s returns on acceptance before the gated turn completes exactly once",
+		async (type) => {
+			const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			let releaseTurn: (() => void) | undefined;
+			let turnCompleted = false;
+			const turnGate = new Promise<void>((resolve) => {
+				releaseTurn = resolve;
+			}).then(() => {
+				turnCompleted = true;
+			});
+			const promptUntilAccepted = vi.fn(
+				async (_message: string, options?: { preflightResult?: (success: boolean, queued?: boolean) => void }) => {
+					options?.preflightResult?.(true, true);
+					void turnGate;
+				},
+			);
+			const state = makeState("active-1") as ActiveSessionState & {
+				runtime: ActiveSessionState["runtime"] & {
+					session: { isStreaming: boolean; promptUntilAccepted: typeof promptUntilAccepted };
+				};
+			};
+			state.runtime = { ...state.runtime, session: { isStreaming: false, promptUntilAccepted } } as never;
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+
+			let settled = 0;
+			const response = internals
+				.handleCommand(makeClient("client-1", state.activeSessionId), {
+					id: "command-1",
+					type,
+					activeSessionId: state.activeSessionId,
+					message: "idle queued turn",
+				})
+				.then((value) => {
+					settled++;
+					return value;
+				});
+			await expect(response).resolves.toMatchObject({ success: true, command: type });
+			expect(settled).toBe(1);
+			expect(turnCompleted).toBe(false);
+			expect(promptUntilAccepted).toHaveBeenCalledOnce();
+			releaseTurn?.();
+			await turnGate;
+			expect(turnCompleted).toBe(true);
+			expect(settled).toBe(1);
+		},
+	);
+
+	it("uses the queued default lane for old-client prompts on a new daemon", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
 		});
-		const steer = vi.fn(async () => {});
+		const promptUntilAccepted = vi.fn(async () => {});
+		const state = makeState("active-1") as ActiveSessionState & {
+			runtime: ActiveSessionState["runtime"] & { session: { promptUntilAccepted: typeof promptUntilAccepted } };
+		};
+		state.runtime = { ...state.runtime, session: { promptUntilAccepted } } as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+
+		await internals.handleCommand(makeClient("legacy-client", state.activeSessionId), {
+			id: "command-1",
+			type: "prompt",
+			activeSessionId: state.activeSessionId,
+			message: "legacy prompt",
+			streamingBehavior: "followUp",
+		});
+
+		expect(promptUntilAccepted).toHaveBeenCalledWith(
+			"legacy prompt",
+			expect.objectContaining({ streamingBehavior: "followUp", queueIfBusy: true }),
+		);
+	});
+
+	it("routes resume_queue through the session scheduler", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const resumeQueuedWork = vi.fn(() => true);
+		const continueAgent = vi.fn(async () => {});
+		const state = makeState("active-1") as ActiveSessionState & {
+			runtime: ActiveSessionState["runtime"] & {
+				session: { resumeQueuedWork: typeof resumeQueuedWork; agent: { continue: typeof continueAgent } };
+			};
+		};
+		state.runtime = { ...state.runtime, session: { resumeQueuedWork, agent: { continue: continueAgent } } } as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+
+		await expect(
+			internals.handleCommand(makeClient("client-1", state.activeSessionId), {
+				id: "command-1",
+				type: "resume_queue",
+				activeSessionId: state.activeSessionId,
+			}),
+		).resolves.toMatchObject({ success: true, command: "resume_queue" });
+		expect(resumeQueuedWork).toHaveBeenCalledOnce();
+		expect(continueAgent).not.toHaveBeenCalled();
+	});
+
+	it("forwards queue keys through canonical daemon steering admission", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const prompt = vi.fn(async () => {});
+		const acceptAgentMessagePrompt = vi.fn(async (...args: Parameters<typeof prompt>) => prompt(...args));
 		const restoreSteeringMessage = vi.fn(async () => {});
 		const state = makeState("active-1") as ActiveSessionState & {
 			runtime: ActiveSessionState["runtime"] & {
 				session: {
-					steer: typeof steer;
+					prompt: typeof prompt;
+					acceptAgentMessagePrompt: typeof acceptAgentMessagePrompt;
 					restoreSteeringMessage: typeof restoreSteeringMessage;
 				};
 			};
 		};
-		state.runtime.session = { steer, restoreSteeringMessage } as never;
+		state.runtime.session = { prompt, acceptAgentMessagePrompt, restoreSteeringMessage } as never;
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
 			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
@@ -5095,11 +5218,15 @@ describe("daemon mode helpers", () => {
 			agentMessageId: "agentmsg_steer",
 		});
 
-		expect(steer).toHaveBeenCalledWith("queued heartbeat", undefined, {
-			queueKey: "heartbeat:job-1",
-			agentMessageId: "agentmsg_steer",
-			resumeIfIdle: true,
-		});
+		expect(prompt).toHaveBeenCalledWith(
+			"queued heartbeat",
+			expect.objectContaining({
+				streamingBehavior: "steer",
+				queueIfBusy: true,
+				followUpQueueKey: "heartbeat:job-1",
+				agentMessageId: "agentmsg_steer",
+			}),
+		);
 		expect(restoreSteeringMessage).not.toHaveBeenCalled();
 	});
 

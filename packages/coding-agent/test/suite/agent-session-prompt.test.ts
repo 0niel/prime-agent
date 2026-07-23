@@ -1249,6 +1249,49 @@ stale post-hook extension instructions`,
 		).toBeUndefined();
 	});
 
+	it("promptAndWait queued behind an active turn stays pending through its own completion", async () => {
+		let releaseFirst: (() => void) | undefined;
+		let releaseSecond: (() => void) | undefined;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const secondGate = new Promise<void>((resolve) => {
+			releaseSecond = resolve;
+		});
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			async () => {
+				await firstGate;
+				return fauxAssistantMessage("first done");
+			},
+			async () => {
+				await secondGate;
+				return fauxAssistantMessage("second done");
+			},
+		]);
+
+		const first = harness.session.prompt("first");
+		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+		let settled = false;
+		const queued = harness.session
+			.promptAndWait("second", { streamingBehavior: "followUp", queueIfBusy: true, resumeIfIdle: true })
+			.then(() => {
+				settled = true;
+			});
+		await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toEqual(["second"]));
+		expect(settled).toBe(false);
+
+		releaseFirst?.();
+		await vi.waitFor(() => expect(getUserTexts(harness)).toEqual(["first", "second"]));
+		expect(settled).toBe(false);
+
+		releaseSecond?.();
+		await Promise.all([first, queued]);
+		expect(settled).toBe(true);
+		expect(getAssistantTexts(harness)).toEqual(["first done", "second done"]);
+	});
+
 	it("handles tab-separated autonomous slash commands when template expansion is disabled", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

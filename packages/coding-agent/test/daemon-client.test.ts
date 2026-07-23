@@ -86,7 +86,11 @@ vi.mock("node:net", () => ({
 	createConnection: netMock.createConnection,
 }));
 
-function emitHello(socket: (typeof netMock.sockets)[number], version = DAEMON_PROTOCOL_VERSION): void {
+function emitHello(
+	socket: (typeof netMock.sockets)[number],
+	version = DAEMON_PROTOCOL_VERSION,
+	serverCapabilities: string[] = ["session_input_admission"],
+): void {
 	socket.emit(
 		"data",
 		`${JSON.stringify({
@@ -95,7 +99,7 @@ function emitHello(socket: (typeof netMock.sockets)[number], version = DAEMON_PR
 			protocol: { name: "prime-agent.daemon", version },
 			appVersion: "9.9.9",
 			clientId: "client-1",
-			serverCapabilities: [],
+			serverCapabilities,
 		})}\n`,
 	);
 }
@@ -201,6 +205,21 @@ describe("DaemonClient", () => {
 
 		expect(client.supportsServerCapability("heartbeat_catalog")).toBe(false);
 		await expect(client.request({ type: "heartbeats_list" })).rejects.toThrow("does not support heartbeat_catalog");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("rejects session input admission clearly when an old daemon lacks the capability", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, []);
+
+		await expect(
+			client.request({ type: "prompt", activeSessionId: "active-1", message: "hello", queueIfBusy: true }),
+		).rejects.toThrow("does not support session_input_admission");
 		expect(socket.writes).toEqual([]);
 		client.close();
 	});

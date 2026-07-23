@@ -1260,21 +1260,24 @@ export class AgentDaemon {
 		message: string,
 		options?: PromptOptions,
 		canPrompt?: () => boolean,
+		waitForCompletion = true,
 	): Promise<boolean> {
 		return this.withAgentMessagePreparingGuard(
 			state,
 			(session, clearPreparing) => {
 				const prompt =
-					options?.agentMessageId === undefined
-						? session.prompt.bind(session)
-						: session.acceptAgentMessagePrompt.bind(session);
+					options?.agentMessageId !== undefined
+						? session.acceptAgentMessagePrompt.bind(session)
+						: waitForCompletion
+							? (session.promptAndWait ?? session.prompt).bind(session)
+							: (session.promptUntilAccepted ?? session.prompt).bind(session);
 				return prompt(message, {
 					...options,
-					preflightResult: (didSucceed) => {
+					preflightResult: (didSucceed, queued) => {
 						if (didSucceed && session.isStreaming) {
 							clearPreparing();
 						}
-						options?.preflightResult?.(didSucceed);
+						options?.preflightResult?.(didSucceed, queued);
 					},
 				});
 			},
@@ -2464,6 +2467,7 @@ export class AgentDaemon {
 				await this.handleWorkerCommand(client, parsed as DaemonWorkerCommand);
 				return;
 			}
+
 			if (typeof parsed.type !== "string" || !DAEMON_COMMAND_TYPES.has(parsed.type)) {
 				const commandName = typeof parsed.type === "string" ? parsed.type : "unknown";
 				const commandId = typeof parsed.id === "string" ? parsed.id : undefined;
@@ -2837,22 +2841,30 @@ export class AgentDaemon {
 					responseSent = true;
 					this.write(client, success(command.id, "prompt"));
 				};
-				void this.promptWithAgentMessagePreparingGuard(state, command.message, {
-					content: command.content,
-					images: command.images,
-					streamingBehavior: command.streamingBehavior,
-					expandPromptTemplates: command.expandPromptTemplates,
-					agentMessageId: command.agentMessageId,
-					customMessage: command.customMessage,
-					skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
-					source: command.source,
-					preflightResult: (didSucceed) => {
-						if (didSucceed) {
-							this.recordWorkerRecoveryState(state, "prompt_accepted", true);
-							sendSuccessResponse();
-						}
+				void this.promptWithAgentMessagePreparingGuard(
+					state,
+					command.message,
+					{
+						content: command.content,
+						images: command.images,
+						streamingBehavior: command.streamingBehavior,
+						queueIfBusy: command.queueIfBusy ?? command.streamingBehavior !== undefined,
+						resumeIfIdle: command.streamingBehavior !== undefined,
+						expandPromptTemplates: command.expandPromptTemplates,
+						agentMessageId: command.agentMessageId,
+						customMessage: command.customMessage,
+						skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
+						source: command.source,
+						preflightResult: (didSucceed) => {
+							if (didSucceed) {
+								this.recordWorkerRecoveryState(state, "prompt_accepted", true);
+								sendSuccessResponse();
+							}
+						},
 					},
-				})
+					undefined,
+					false,
+				)
 					.then(() => {
 						sendSuccessResponse();
 					})
@@ -2872,6 +2884,8 @@ export class AgentDaemon {
 					content: command.content,
 					images: command.images,
 					streamingBehavior: command.streamingBehavior,
+					queueIfBusy: command.queueIfBusy ?? command.streamingBehavior !== undefined,
+					resumeIfIdle: command.streamingBehavior !== undefined,
 					expandPromptTemplates: command.expandPromptTemplates,
 					skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
 					source: command.source,
@@ -2895,11 +2909,20 @@ export class AgentDaemon {
 						prefixMessages: command.prefixMessages,
 					});
 				} else {
-					await state.runtime.session.steer(command.message, command.images, {
-						queueKey: command.queueKey,
-						agentMessageId: command.agentMessageId,
-						resumeIfIdle: true,
-					});
+					await this.promptWithAgentMessagePreparingGuard(
+						state,
+						command.message,
+						{
+							images: command.images,
+							streamingBehavior: "steer",
+							queueIfBusy: true,
+							resumeIfIdle: true,
+							followUpQueueKey: command.queueKey,
+							agentMessageId: command.agentMessageId,
+						},
+						undefined,
+						false,
+					);
 				}
 				this.recordWorkerRecoveryState(state, "steer_queued", true);
 				return success(command.id, "steer");
@@ -2907,7 +2930,7 @@ export class AgentDaemon {
 
 			case "follow_up": {
 				const state = this.getBoundSessionState(command.activeSessionId);
-				let queued: boolean;
+				let queued = true;
 				if (command.expandPromptTemplates === false) {
 					queued = await state.runtime.session.restoreFollowUpMessage(command.message, command.images, {
 						queueKey: command.queueKey,
@@ -2917,11 +2940,23 @@ export class AgentDaemon {
 						prefixMessages: command.prefixMessages,
 					});
 				} else {
-					queued = await state.runtime.session.followUp(command.message, command.images, {
-						queueKey: command.queueKey,
-						agentMessageId: command.agentMessageId,
-						resumeIfIdle: true,
-					});
+					await this.promptWithAgentMessagePreparingGuard(
+						state,
+						command.message,
+						{
+							images: command.images,
+							streamingBehavior: "followUp",
+							queueIfBusy: true,
+							resumeIfIdle: true,
+							followUpQueueKey: command.queueKey,
+							agentMessageId: command.agentMessageId,
+							preflightResult: (didSucceed, didQueue) => {
+								queued = didSucceed && didQueue === true;
+							},
+						},
+						undefined,
+						false,
+					);
 				}
 				if (queued) {
 					this.recordWorkerRecoveryState(state, "follow_up_queued", true);
@@ -2946,6 +2981,7 @@ export class AgentDaemon {
 				if (!state.runtime.session.resumeQueuedWork()) {
 					const error = new Error("No queued work to resume");
 					return failure(command.id, "resume_queue", error, serializeDaemonError(error));
+
 				}
 				return success(command.id, "resume_queue");
 			}
