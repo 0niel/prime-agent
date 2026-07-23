@@ -367,6 +367,29 @@ describe("AgentSession model and extension characterization", () => {
 		expect(getAssistantTexts(harness)).toContain("accepted");
 	});
 
+	it("keeps streaming injected prompts under turn admission when the turn becomes idle", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("heartbeat")]);
+		const internals = harness.session as unknown as { _acquireTurnAdmission(): Promise<() => void> };
+		const releaseBlocker = await internals._acquireTurnAdmission();
+		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = true;
+		let settled = false;
+
+		const heartbeat = harness.session
+			.promptHeartbeat(createHeartbeat(), { streamingBehavior: "followUp" })
+			.finally(() => {
+				settled = true;
+			});
+		await flushAsyncWork();
+		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = false;
+
+		expect(settled).toBe(false);
+		releaseBlocker();
+		await heartbeat;
+		expect(getAssistantTexts(harness)).toEqual(["heartbeat"]);
+	});
+
 	it("includes nextTurn messages queued by pending model_select handlers in injected prompts", async () => {
 		const handlerStarted = createDeferred();
 		const finishHandler = createDeferred();

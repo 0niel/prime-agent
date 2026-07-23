@@ -611,7 +611,8 @@ describe("AgentSession compaction characterization", () => {
 		await sessionInternals._runAutoCompaction("threshold", false);
 		await vi.advanceTimersByTimeAsync(100);
 
-		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
 	});
 
 	it("keeps autonomous continuation bookkeeping when only steering queue is drained", async () => {
@@ -654,6 +655,43 @@ describe("AgentSession compaction characterization", () => {
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 		expect(sessionInternals._postCompactionContinuationMessages).toEqual([autonomousMessage]);
 		expect(followUpSpy).toHaveBeenCalledWith(autonomousMessage);
+	});
+
+	it("does not continue again after the session pump consumes post-compaction continuations", async () => {
+		vi.useFakeTimers();
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const sessionInternals = harness.session as unknown as {
+			_schedulePostCompactionContinue(): void;
+			_postCompactionContinuationMessages: AgentMessage[];
+			_createPreparedPromptInput(
+				text: string,
+				images: undefined,
+				options: { message: AgentMessage; resumeIfIdle: boolean },
+			): unknown;
+			_enqueueSessionInput(input: unknown, schedule: "followUp"): boolean;
+		};
+		const continuation = {
+			role: "user",
+			content: [{ type: "text", text: "session-owned continuation" }],
+			timestamp: Date.now(),
+		} satisfies AgentMessage;
+		sessionInternals._postCompactionContinuationMessages = [continuation];
+		harness.setResponses([fauxAssistantMessage("continuation handled")]);
+		sessionInternals._enqueueSessionInput(
+			sessionInternals._createPreparedPromptInput("session-owned continuation", undefined, {
+				message: continuation,
+				resumeIfIdle: true,
+			}),
+			"followUp",
+		);
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+
+		sessionInternals._schedulePostCompactionContinue();
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(sessionInternals._postCompactionContinuationMessages).toEqual([]);
 	});
 
 	it("keeps autonomous threshold continuations when post-compaction continue must retry", async () => {

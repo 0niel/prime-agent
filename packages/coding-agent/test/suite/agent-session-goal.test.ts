@@ -459,6 +459,25 @@ describe("AgentSession goals", () => {
 		});
 	});
 
+	it("normalizes queued goal context text and images", async () => {
+		const harness = await createGoalHarness();
+		const image = { type: "image" as const, data: "image-data", mimeType: "image/png" };
+		let preparedText: string | undefined;
+		let preparedImages: unknown;
+		harness.setResponses([fauxAssistantMessage("goal handled")]);
+		vi.spyOn(harness.session.extensionRunner, "emitBeforeAgentStart").mockImplementationOnce(async (text, images) => {
+			preparedText = text;
+			preparedImages = images;
+			return undefined;
+		});
+
+		await harness.session.prompt("/goal inspect the image", { images: [image] });
+
+		expect(preparedText).toContain("<goal_context>");
+		expect(preparedText).not.toContain("[object Object]");
+		expect(preparedImages).toEqual([image]);
+	});
+
 	it("keeps active goals sticky across normal user prompts", async () => {
 		const waiting = createWaitingTool();
 		const harness = await createGoalHarness([waiting.tool]);

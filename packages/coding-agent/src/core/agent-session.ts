@@ -1042,6 +1042,7 @@ export class AgentSession {
 	private _postCompactionContinuationScheduled = false;
 	private _postCompactionContinuationTimer: ReturnType<typeof setTimeout> | undefined;
 	private _postCompactionContinuationMessages: AgentMessage[] = [];
+	private _scheduledPostCompactionContinuationMessages: AgentMessage[] = [];
 	private _queuedAutonomousThresholdContinuations = new WeakMap<AssistantMessage, AgentMessage>();
 	private _queuedAutonomousContinuationSnapshots = new WeakMap<AgentMessage, AutonomousRuntimeSnapshot>();
 	private _pendingThresholdCompactionAutonomousMessages: AgentMessage[] = [];
@@ -1693,10 +1694,11 @@ export class AgentSession {
 		this._ensureGoalRuntimeActive();
 		const message = createGoalContextMessage(this._goalState, kind, images);
 		if (this._pumpingSessionInput) {
+			const normalized = normalizeMessageContent(message.content);
 			if (kind === "budget_limit") {
-				await this._queueSteer(String(message.content), undefined, { message, resumeIfIdle: true });
+				await this._queueSteer(normalized.text, normalized.images, { message, resumeIfIdle: true });
 			} else {
-				const input = this._createPreparedPromptInput(String(message.content), undefined, {
+				const input = this._createPreparedPromptInput(normalized.text, normalized.images, {
 					message,
 					resumeIfIdle: true,
 				});
@@ -3896,7 +3898,7 @@ export class AgentSession {
 		options?: InternalPromptOptions,
 	): Promise<void> {
 		if (!this.isStreaming && options?.resumeIfIdle) this._sessionInputPumpSuspended = false;
-		const releaseAdmission = !this.isStreaming ? await this._acquireDirectTurnAdmission() : () => {};
+		const releaseAdmission = await this._acquireDirectTurnAdmission({ allowStreaming: true });
 		try {
 			await this._promptInjectedMessageUnserialized(text, message, options, releaseAdmission);
 		} finally {
@@ -5387,16 +5389,17 @@ export class AgentSession {
 		};
 	}
 
-	private async _acquireDirectTurnAdmission(): Promise<() => void> {
+	private async _acquireDirectTurnAdmission(options: { allowStreaming?: boolean } = {}): Promise<() => void> {
 		while (true) {
 			await this._waitForQueuedWorkAdmission();
 			if (this.pendingMessageCount > 0) this._scheduleSessionInputPump();
 			const release = await this._acquireTurnAdmission();
 			if (
-				this.pendingMessageCount === 0 &&
-				this._activeSessionInput === undefined &&
-				!this._pumpingSessionInput &&
-				!this._sessionInputPumpRequested
+				(options.allowStreaming === true && this.isStreaming) ||
+				(this.pendingMessageCount === 0 &&
+					this._activeSessionInput === undefined &&
+					!this._pumpingSessionInput &&
+					!this._sessionInputPumpRequested)
 			) {
 				return release;
 			}
@@ -6165,6 +6168,7 @@ export class AgentSession {
 			this._postCompactionContinuationTimer = undefined;
 		}
 		this._postCompactionContinuationScheduled = false;
+		this._scheduledPostCompactionContinuationMessages = [];
 	}
 
 	private _discardPendingAutoRefine(options: { cancelPostCompactionContinue?: boolean } = {}): void {
@@ -6263,6 +6267,7 @@ export class AgentSession {
 			return;
 		}
 		this._postCompactionContinuationScheduled = true;
+		this._scheduledPostCompactionContinuationMessages = [...this._postCompactionContinuationMessages];
 		this._postCompactionContinuationTimer = setTimeout(() => {
 			this._postCompactionContinuationTimer = undefined;
 			void this._runScheduledPostCompactionContinue();
@@ -6280,18 +6285,34 @@ export class AgentSession {
 			return;
 		}
 
+		const continuationMessages = [...this._scheduledPostCompactionContinuationMessages];
+		const sessionOwnedContinuationsRemain = continuationMessages.some((message) =>
+			this._postCompactionContinuationMessages.includes(message),
+		);
+		if (continuationMessages.length > 0 && !sessionOwnedContinuationsRemain) {
+			this._cancelPostCompactionContinue();
+			this._scheduleAutoRefineAfterAgentEnd();
+			return;
+		}
 		if (this.pendingMessageCount > 0) {
 			this._scheduleSessionInputPump();
 			await this._sessionInputPump;
 			if (this._postCompactionContinuationScheduled) {
 				this._postCompactionContinuationScheduled = false;
-				this._schedulePostCompactionContinue();
+				const sessionOwnedContinuationsStillRemain = continuationMessages.some((message) =>
+					this._postCompactionContinuationMessages.includes(message),
+				);
+				if (continuationMessages.length > 0 && !sessionOwnedContinuationsStillRemain) {
+					this._scheduledPostCompactionContinuationMessages = [];
+					this._scheduleAutoRefineAfterAgentEnd();
+				} else {
+					this._schedulePostCompactionContinue();
+				}
 			}
 			return;
 		}
 
 		this._postCompactionContinuationScheduled = false;
-		const continuationMessages = [...this._postCompactionContinuationMessages];
 		try {
 			await this.agent.continue();
 			this._forgetConsumedPostCompactionContinuations(continuationMessages);
