@@ -13,27 +13,6 @@ import { createTestResourceLoader } from "../utilities.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
 import { createDeferred, createWaitingHarness, gatedHook } from "./scheduling.js";
 
-// acceptAgentMessagePrompt admission is asynchronous. Pause after agent.prompt has
-// synchronously claimed the run, but before its prompt messages become delivered.
-function gateNextAgentStart(harness: Harness): { reached: Promise<void>; release(): void } {
-	let markReached = () => {};
-	const reached = new Promise<void>((resolve) => {
-		markReached = resolve;
-	});
-	let release = () => {};
-	const gate = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	let unsubscribe = () => {};
-	unsubscribe = harness.session.agent.subscribe(async (event) => {
-		if (event.type !== "agent_start") return;
-		unsubscribe();
-		markReached();
-		await gate;
-	});
-	return { reached, release };
-}
-
 describe("AgentSession prompt characterization", () => {
 	it("observes already-running work when prompt admission is pre-aborted", async () => {
 		const abort = new AbortController();

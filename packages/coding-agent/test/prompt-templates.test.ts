@@ -318,8 +318,21 @@ describe("parseCommandArgs", () => {
 		expect(parseCommandArgs("a  b   c")).toEqual(["a", "b", "c"]);
 	});
 
-	test("should handle tabs as separators", () => {
-		expect(parseCommandArgs("a\tb\tc")).toEqual(["a", "b", "c"]);
+	test.each([
+		{ name: "tabs", input: "a\tb\tc", expected: ["a", "b", "c"] },
+		{
+			name: "Unicode spaces",
+			input: "first\u2002second",
+			expected: ["first", "second"],
+			positionalResult: "first|second",
+		},
+	])("should handle $name as separators", ({ input, expected, positionalResult }) => {
+		const args = parseCommandArgs(input);
+
+		expect(args).toEqual(expected);
+		if (positionalResult) {
+			expect(substituteArgs("$1|$2", args)).toBe(positionalResult);
+		}
 	});
 
 	test("should handle quoted empty string", () => {
@@ -364,10 +377,6 @@ describe("parseCommandArgs + substituteArgs integration", () => {
 		const template = "Create component $1 with features: $ARGUMENTS";
 		const result = substituteArgs(template, args);
 		expect(result).toBe("Create component Button with features: Button onClick handler disabled support");
-	});
-
-	test("should split Unicode spaces for positional template arguments", () => {
-		expect(substituteArgs("$1|$2", parseCommandArgs("first\u2002second"))).toBe("first|second");
 	});
 
 	test("should handle the example from README", () => {

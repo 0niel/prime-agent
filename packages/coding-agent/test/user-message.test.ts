@@ -61,23 +61,26 @@ describe("UserMessageComponent", () => {
 		expect(embedded).not.toContain(theme.fg("accent", "/compact"));
 	});
 
-	test("wraps wide and multi-code-point command graphemes at terminal width", () => {
+	test.each([
+		{
+			name: "wide and multi-code-point command graphemes",
+			message: "/命é令 arg **bold**",
+			commandName: "命é令",
+			expectedLines: ["", "/命é", "令", "arg", "bold", ""],
+		},
+		{
+			name: "width-three command graphemes atomically",
+			message: "/界ﾞx arg",
+			commandName: "界ﾞx",
+			expectedLines: ["", "/界ﾞ", "x", "arg", ""],
+		},
+	])("wraps $name at terminal width", ({ message, commandName, expectedLines }) => {
 		initTheme("dark");
-		const component = new UserMessageComponent("/命é令 arg **bold**", undefined, (name) => name === "命é令");
-		const lines = component.render(8);
+		const lines = new UserMessageComponent(message, undefined, (name) => name === commandName).render(8);
 		const plainLines = lines.map((line) => line.replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, "").trim());
 
 		expect(lines.every((line) => visibleWidth(line) === 8)).toBe(true);
-		expect(plainLines).toEqual(["", "/命é", "令", "arg", "bold", ""]);
-	});
-
-	test("restores width-three command graphemes atomically", () => {
-		initTheme("dark");
-		const lines = new UserMessageComponent("/界ﾞx arg", undefined, (name) => name === "界ﾞx").render(8);
-		const plainLines = lines.map((line) => line.replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, "").trim());
-
-		expect(lines.every((line) => visibleWidth(line) === 8)).toBe(true);
-		expect(plainLines).toEqual(["", "/界ﾞ", "x", "arg", ""]);
+		expect(plainLines).toEqual(expectedLines);
 	});
 
 	test("preserves mask-like argument text across narrow wraps", () => {
