@@ -996,10 +996,13 @@ export class AgentSession {
 				lane: SessionInputSchedule;
 				items: PreparedPromptInput[];
 				phase: "preparing" | "handedOff";
+				checkpointInputMessages: Set<AgentMessage>;
+				persistedInputMessages: Set<AgentMessage>;
 				cancelled?: boolean;
 		  }
 		| { kind: "command"; lane: SessionInputSchedule; item: PreparedCommandInput; phase: "executing" }
 		| undefined;
+	private readonly _sessionInputCheckpointWaiters = new Set<() => void>();
 	private _steeringStopPending = false;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
@@ -3185,6 +3188,20 @@ export class AgentSession {
 				this.sessionManager.appendMessage(event.message);
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+			if (this._activeSessionInput?.kind === "prompt") {
+				const activeInput = this._activeSessionInput;
+				if (activeInput.checkpointInputMessages.has(event.message)) {
+					activeInput.persistedInputMessages.add(event.message);
+					if (
+						[...activeInput.checkpointInputMessages].every((message) =>
+							activeInput.persistedInputMessages.has(message),
+						)
+					) {
+						activeInput.phase = "handedOff";
+						this._notifySessionInputCheckpointChange();
+					}
+				}
+			}
 
 			// Track assistant message for auto-compaction (checked on agent_end)
 			if (event.message.role === "assistant") {
