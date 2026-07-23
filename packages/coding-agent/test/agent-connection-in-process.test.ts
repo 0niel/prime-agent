@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { getModel } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
-import type { AgentSessionEvent, AgentSessionEventListener } from "../src/core/agent-session.js";
+import { describe, expect, it, vi } from "vitest";
+import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from "../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { emptyGoalState } from "../src/core/goals.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
@@ -142,6 +142,28 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 }
 
 describe("InProcessAgentConnection", () => {
+	it.each([
+		{ accepted: true, expectedError: undefined },
+		{ accepted: false, expectedError: "Prompt was not accepted by the session." },
+	])("settles bare prompts from admission (accepted: $accepted)", async ({ accepted, expectedError }) => {
+		const session = createFakeSession("prompt-admission", []);
+		let finishTurn = () => {};
+		const turn = new Promise<void>((resolve) => {
+			finishTurn = resolve;
+		});
+		const prompt = vi.fn((_message: string, options?: PromptOptions) => {
+			options?.preflightResult?.(accepted);
+			return accepted ? turn : Promise.resolve();
+		});
+		Object.assign(session.session, { prompt });
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+		const result = expect(connection.prompt("hello"));
+
+		if (expectedError) await result.rejects.toThrow(expectedError);
+		else await result.resolves.toBeUndefined();
+		expect(prompt).toHaveBeenCalledWith("hello", expect.objectContaining({ preflightResult: expect.any(Function) }));
+		finishTurn();
+	});
 	it("loads the full model catalog through the connection boundary", async () => {
 		const session = createFakeSession("models", []);
 		const runtime = new FakeRuntime(session.session);

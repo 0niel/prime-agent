@@ -599,7 +599,14 @@ describe("InteractiveMode.renderSessionContext", () => {
 
 type SubmitHandlerHarness = {
 	defaultEditor: { onSubmit?: (text: string) => Promise<void> };
-	editor: { setText: (text: string) => void; addToHistory?: (text: string) => void };
+	editor: { getText: () => string; setText: (text: string) => void; addToHistory?: (text: string) => void };
+	promptStash?: undefined;
+	submittedInputBehavior: "steer" | "followUp";
+	inputSubmissionGeneration: number;
+	flushPendingBashComponents: () => void;
+	collectImagesFor: () => unknown[];
+	updatePendingMessagesDisplay: () => void;
+	ui: { requestRender: () => void };
 	clearSideQuestion: () => void;
 	clearShortcutGuide: () => void;
 	showWarning: (message: string) => void;
@@ -616,13 +623,20 @@ type SubmitHandlerHarness = {
 function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {}): SubmitHandlerHarness {
 	const fakeThis: SubmitHandlerHarness = {
 		defaultEditor: {},
-		editor: { setText: vi.fn(), addToHistory: vi.fn() },
+		editor: { getText: vi.fn(() => ""), setText: vi.fn(), addToHistory: vi.fn() },
 		clearSideQuestion: vi.fn(),
 		clearShortcutGuide: vi.fn(),
 		showWarning: vi.fn(),
 		showError: vi.fn(),
 		isBashRunning: () => false,
 		patchConnectionState: vi.fn(),
+		promptStash: undefined,
+		submittedInputBehavior: "steer",
+		inputSubmissionGeneration: 0,
+		flushPendingBashComponents: vi.fn(),
+		collectImagesFor: vi.fn(() => []),
+		updatePendingMessagesDisplay: vi.fn(),
+		ui: { requestRender: vi.fn() },
 		agentConnection: {
 			prompt: vi.fn(async () => {}),
 			executeBash: vi.fn(async () => {}),
@@ -2371,6 +2385,24 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 	const markOnboardingShown = (InteractiveMode.prototype as unknown as OnboardingHarness).markOnboardingShown;
 	const runStartupOnboarding = (InteractiveMode.prototype as unknown as OnboardingHarness).runStartupOnboarding;
 	const runOnboardingFlow = (InteractiveMode.prototype as unknown as OnboardingHarness).runOnboardingFlow;
+	function createStartupRunHarness(
+		options: Record<string, unknown>,
+		overrides: Record<string, unknown> = {},
+	): Record<string, unknown> & { getUserInput: ReturnType<typeof vi.fn> } {
+		return {
+			init: vi.fn(async () => {}),
+			options: { agentsViewOwnsStartupNotices: true, ...options },
+			modelRegistry: { getError: vi.fn(() => undefined) },
+			runStartupOnboarding: vi.fn(async () => true),
+			getModelFallbackWarningAction: vi.fn(() => "suppress"),
+			maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(),
+			getUserInput: vi.fn(() => new Promise<void>(() => {})),
+			showWarning: vi.fn(),
+			showError: vi.fn(),
+			sessionHasMessages: false,
+			...overrides,
+		};
+	}
 
 	const primeModel: AgentConnectionModel = {
 		id: "openai/gpt-5.5",
@@ -2401,24 +2433,10 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			.mockRejectedValueOnce(new Error("transient admission failure"))
 			.mockRejectedValueOnce(new Error("repeated admission failure"))
 			.mockResolvedValue(undefined);
-		const fakeThis = {
-			init: vi.fn(async () => {}),
-			options: {
-				agentsViewOwnsStartupNotices: true,
-				initialMessage: "first",
-				initialMessages: ["second"],
-			},
-			modelRegistry: { getError: vi.fn(() => undefined) },
-			runStartupOnboarding: vi.fn(async () => true),
-			getModelFallbackWarningAction: vi.fn(() => "suppress"),
-			getCurrentModel: vi.fn(() => primeModel),
-			maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(),
-			getUserInput: vi.fn(() => inputDone),
-			agentConnection: { prompt },
-			showWarning: vi.fn(),
-			showError: vi.fn(),
-			sessionHasMessages: false,
-		};
+		const fakeThis = createStartupRunHarness(
+			{ initialMessage: "first", initialMessages: ["second"] },
+			{ getCurrentModel: () => primeModel, getUserInput: vi.fn(() => inputDone), agentConnection: { prompt } },
+		);
 
 		try {
 			const run = InteractiveMode.prototype.run.call(fakeThis as never);
@@ -2435,6 +2453,59 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		}
 	});
 
+	test("admits one deferred startup prompt before concurrent user submissions", async () => {
+		vi.useFakeTimers();
+		let model: AgentConnectionModel | undefined;
+		const startupAdmission = createDeferred<void>();
+		const inputDone = createDeferred<void>();
+		const prompt = vi.fn((message: string) => (message === "startup" ? startupAdmission.promise : Promise.resolve()));
+		const submitHarness = createSubmitHandlerHarness({
+			agentConnection: {
+				prompt,
+				executeBash: vi.fn(async () => {}),
+				getState: vi.fn(async () => ({ isBashRunning: false })),
+			},
+		});
+		const fakeThis = Object.assign(
+			submitHarness,
+			createStartupRunHarness(
+				{ initialMessage: "startup" },
+				{
+					getCurrentModel: () => model,
+					getUserInput: vi.fn(() => inputDone.promise),
+					agentConnection: submitHarness.agentConnection,
+				},
+			),
+		);
+
+		try {
+			const run = InteractiveMode.prototype.run.call(fakeThis as never);
+			await vi.advanceTimersByTimeAsync(250);
+			model = primeModel;
+			const submissions = ["first user prompt", "second user prompt"].map((text) =>
+				fakeThis.defaultEditor.onSubmit?.(text),
+			);
+			await Promise.resolve();
+
+			expect(prompt.mock.calls.map(([message]) => message)).toEqual(["startup"]);
+			startupAdmission.resolve(undefined);
+			await Promise.all(submissions);
+			expect(prompt.mock.calls.map(([message]) => message)).toEqual([
+				"startup",
+				"first user prompt",
+				"second user prompt",
+			]);
+			expect(prompt.mock.calls[0]).toEqual([
+				"startup",
+				{ images: undefined, streamingBehavior: "steer", queueIfBusy: true },
+			]);
+			inputDone.resolve(undefined);
+			await expect(run).resolves.toBe("agents_view");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	test("defers an initial prompt until a model appears and cleans up its retry timer", async () => {
 		vi.useFakeTimers();
 		let model: AgentConnectionModel | undefined;
@@ -2443,20 +2514,10 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			finishInput = resolve;
 		});
 		const prompt = vi.fn(async () => {});
-		const fakeThis = {
-			init: vi.fn(async () => {}),
-			options: { agentsViewOwnsStartupNotices: true, initialMessage: "deferred" },
-			modelRegistry: { getError: vi.fn(() => undefined) },
-			runStartupOnboarding: vi.fn(async () => true),
-			getModelFallbackWarningAction: vi.fn(() => "suppress"),
-			getCurrentModel: vi.fn(() => model),
-			maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(),
-			getUserInput: vi.fn(() => inputDone),
-			agentConnection: { prompt },
-			showWarning: vi.fn(),
-			showError: vi.fn(),
-			sessionHasMessages: false,
-		};
+		const fakeThis = createStartupRunHarness(
+			{ initialMessage: "deferred" },
+			{ getCurrentModel: () => model, getUserInput: vi.fn(() => inputDone), agentConnection: { prompt } },
+		);
 
 		try {
 			const run = InteractiveMode.prototype.run.call(fakeThis as never);

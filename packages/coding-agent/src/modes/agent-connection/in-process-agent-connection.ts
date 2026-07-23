@@ -292,10 +292,6 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
-		if (!options?.streamingBehavior && options?.queueIfBusy === undefined && !options?.source) {
-			await this.session.prompt(message, options?.images ? { images: options.images } : undefined);
-			return;
-		}
 		await new Promise<void>((resolve, reject) => {
 			let settled = false;
 			const resolveOnce = () => {
@@ -316,7 +312,11 @@ export class InProcessAgentConnection implements AgentConnection {
 				...(options?.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
 				...(options?.source ? { source: options.source } : {}),
 				preflightResult: (success) => {
-					if (success) resolveOnce();
+					if (success) {
+						resolveOnce();
+					} else {
+						rejectOnce(new Error("Prompt was not accepted by the session."));
+					}
 				},
 			});
 			void prompt.then(resolveOnce, rejectOnce);

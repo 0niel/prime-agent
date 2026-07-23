@@ -831,6 +831,7 @@ export class InteractiveMode {
 	private onInputCallback?: (text: string | undefined) => void;
 	private submittedInputBehavior: "steer" | "followUp" = "steer";
 	private inputSubmissionGeneration = 0;
+	private admitPendingStartupPrompts: (() => Promise<void>) | undefined;
 	private returnToAgentsViewRequested = false;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
@@ -1524,6 +1525,11 @@ export class InteractiveMode {
 			});
 			return initialPromptDelivery;
 		};
+		this.admitPendingStartupPrompts = async () => {
+			while (nextInitialPrompt < initialPrompts.length && this.getCurrentModel()) {
+				await sendInitialPrompts();
+			}
+		};
 
 		let deferredStartupNotificationsShown = false;
 		const showDeferredStartupNotifications = () => {
@@ -1592,6 +1598,7 @@ export class InteractiveMode {
 			await this.getUserInput();
 		} finally {
 			clearInitialPromptRetry();
+			this.admitPendingStartupPrompts = undefined;
 		}
 		return "agents_view";
 	}
@@ -4324,6 +4331,7 @@ export class InteractiveMode {
 			this.clearShortcutGuide();
 			const promptStashToRestore = this.promptStash;
 			let restorePromptStashAfterSubmit = true;
+			let submissionGeneration: number | undefined;
 
 			try {
 				const slashCommand = parseSlashCommand(text);
@@ -4658,13 +4666,15 @@ export class InteractiveMode {
 					return;
 				}
 
+				await this.admitPendingStartupPrompts?.();
+
 				this.clearSideQuestion({ abort: true });
 				this.flushPendingBashComponents();
 				const images = this.collectImagesFor(text);
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
 				const promptStashAfterClear = this.promptStash;
-				const submissionGeneration = ++this.inputSubmissionGeneration;
+				submissionGeneration = ++this.inputSubmissionGeneration;
 				try {
 					await this.agentConnection.prompt(text, {
 						streamingBehavior,
@@ -4689,7 +4699,11 @@ export class InteractiveMode {
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 			} finally {
-				if (restorePromptStashAfterSubmit && promptStashToRestore !== undefined) {
+				if (
+					restorePromptStashAfterSubmit &&
+					promptStashToRestore !== undefined &&
+					(submissionGeneration === undefined || submissionGeneration === this.inputSubmissionGeneration)
+				) {
 					this.restorePromptStashIfEditorEmpty(promptStashToRestore);
 				}
 			}
