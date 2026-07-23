@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { readdirSync, readFileSync } from "node:fs";
+import { globSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -73,14 +73,17 @@ function checkLockfile(lockPath) {
 }
 
 function checkWorkspaceMetadata() {
+	const rootManifest = readJson(join(root, "package.json"));
 	const rootLock = readJson(join(root, "package-lock.json"));
-	for (const manifestPath of findFiles(join(root, "packages"), "package.json")) {
-		const packagePath = relative(root, dirname(manifestPath));
+	const workspacePaths = globSync(rootManifest.workspaces, { cwd: root });
+	for (const workspacePath of workspacePaths) {
+		const packagePath = workspacePath.replaceAll("\\", "/");
 		const locked = rootLock.packages?.[packagePath];
 		if (!locked) {
 			errors.push(`package-lock.json:${packagePath} missing workspace package metadata`);
 			continue;
 		}
+		const manifestPath = join(root, workspacePath, "package.json");
 		const manifest = readJson(manifestPath);
 		for (const field of ["name", "version", "dependencies", "devDependencies", "optionalDependencies", "engines"]) {
 			if (!sameJson(locked[field], manifest[field])) {
