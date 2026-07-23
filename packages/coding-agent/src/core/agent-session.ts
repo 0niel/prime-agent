@@ -6302,11 +6302,13 @@ export class AgentSession {
 				const sessionOwnedContinuationsStillRemain = continuationMessages.some((message) =>
 					this._postCompactionContinuationMessages.includes(message),
 				);
-				if (continuationMessages.length > 0 && !sessionOwnedContinuationsStillRemain) {
+				const shouldReschedule =
+					continuationMessages.length === 0 ? this.pendingMessageCount > 0 : sessionOwnedContinuationsStillRemain;
+				if (shouldReschedule) {
+					this._schedulePostCompactionContinue();
+				} else {
 					this._scheduledPostCompactionContinuationMessages = [];
 					this._scheduleAutoRefineAfterAgentEnd();
-				} else {
-					this._schedulePostCompactionContinue();
 				}
 			}
 			return;
