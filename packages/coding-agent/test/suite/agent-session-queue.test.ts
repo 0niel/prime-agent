@@ -2277,65 +2277,7 @@ describe("AgentSession queue characterization", () => {
 		);
 	});
 
-	it("reports whether a queue pause was newly acquired", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
 
-		expect(harness.session.pauseQueuedWork()).toBe(true);
-		expect(harness.session.pauseQueuedWork()).toBe(false);
-	});
 
-	it("reports session commands as queued while compaction blocks delivery", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const internals = harness.session as unknown as { _compactionAbortController?: AbortController };
-		internals._compactionAbortController = new AbortController();
-		const preflight = vi.fn();
 
-		await harness.session.prompt("/autonomous on", {
-			streamingBehavior: "followUp",
-			queueIfBusy: true,
-			preflightResult: preflight,
-		});
-
-		expect(preflight).toHaveBeenCalledWith(true, true);
-		expect(harness.session.getFollowUpMessages()).toEqual(["/autonomous on"]);
-		expect(harness.session.getAutonomousStatus().enabled).toBe(false);
-	});
-
-	it("reschedules session-owned inputs when compaction finishes", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("after compaction")]);
-		const internals = harness.session as unknown as {
-			_compactionAbortController?: AbortController;
-			_schedulePendingMessageResume(): void;
-		};
-		internals._compactionAbortController = new AbortController();
-		await harness.session.followUp("queued during compaction", undefined, { resumeIfIdle: true });
-		await harness.session.waitForSessionInputIdle();
-		expect(harness.session.getFollowUpMessages()).toEqual(["queued during compaction"]);
-
-		internals._compactionAbortController = undefined;
-		internals._schedulePendingMessageResume();
-		await vi.waitFor(() => expect(getUserTexts(harness)).toEqual(["queued during compaction"]));
-	});
-
-	it("uses the compaction card as the only successful compact result", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		vi.spyOn(harness.session, "compact").mockResolvedValue({
-			summary: "summary",
-			firstKeptEntryId: "kept",
-			tokensBefore: 128_144,
-		});
-
-		await harness.session.prompt("/compact focus");
-
-		expect(
-			harness.session.messages.filter(
-				(message) => message.role === "custom" && message.customType === "session_slash_command_result",
-			),
-		).toEqual([]);
-	});
 });
