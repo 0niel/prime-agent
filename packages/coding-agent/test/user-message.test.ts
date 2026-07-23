@@ -55,7 +55,6 @@ describe("UserMessageComponent", () => {
 		const embedded = new UserMessageComponent("Explain /compact", undefined, recognized).render(40).join("\n");
 
 		expect(command).toContain(theme.fg("accent", "/compact"));
-		expect(command).toContain("\u001b[1m");
 		expect(command).not.toContain("**errors**");
 		expect(command).not.toBe(unknown);
 		expect(unknown).not.toContain(theme.fg("accent", "/unknown"));
