@@ -77,7 +77,10 @@ function checkWorkspaceMetadata() {
 	for (const manifestPath of findFiles(join(root, "packages"), "package.json")) {
 		const packagePath = relative(root, dirname(manifestPath));
 		const locked = rootLock.packages?.[packagePath];
-		if (!locked) continue;
+		if (!locked) {
+			errors.push(`package-lock.json:${packagePath} missing workspace package metadata`);
+			continue;
+		}
 		const manifest = readJson(manifestPath);
 		for (const field of ["name", "version", "dependencies", "devDependencies", "optionalDependencies", "engines"]) {
 			if (!sameJson(locked[field], manifest[field])) {
@@ -104,11 +107,11 @@ function checkActionPins() {
 
 function checkNpmPolicy() {
 	const manifest = readJson(join(root, "package.json"));
-	if (!/^npm@11\./.test(manifest.packageManager ?? "")) {
+	if (!/^npm@11\.\d+\.\d+$/.test(manifest.packageManager ?? "")) {
 		errors.push("package.json: packageManager must pin npm 11");
 	}
-	if (!manifest.engines?.npm?.includes(">=11.10.0")) {
-		errors.push("package.json: engines.npm must require npm >=11.10.0");
+	if (manifest.engines?.npm !== ">=11.10.0 <12") {
+		errors.push("package.json: engines.npm must require npm >=11.10.0 <12");
 	}
 	const npmrc = readFileSync(join(root, ".npmrc"), "utf8");
 	if (!/^min-release-age=7$/m.test(npmrc)) {
