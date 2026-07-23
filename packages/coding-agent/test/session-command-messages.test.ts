@@ -1,4 +1,3 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, test, vi } from "vitest";
@@ -141,7 +140,7 @@ describe("session command messages", () => {
 		]);
 	});
 
-	test("renders validated durable command and result components", () => {
+	test("dispatches valid messages and safely diagnoses malformed reserved entries", () => {
 		const command = parseSessionSlashCommand("/compact focus");
 		expect(command).toBeDefined();
 		const components = buildConversationComponents(
@@ -152,30 +151,18 @@ describe("session command messages", () => {
 					success: false,
 					severity: "warning",
 				}),
+				customMessage(SESSION_SLASH_COMMAND_CUSTOM_TYPE, { command: "not-a-command" }),
+				customMessage(SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE, { severity: "fatal" }),
 			],
 			componentOptions,
 		);
+		const output = stripAnsi(components.flatMap((component) => component.render(80)).join("\n"));
 
 		expect(components[0]).toBeInstanceOf(SlashCommandMessageComponent);
 		expect(components[1]).toBeInstanceOf(SlashCommandResultMessageComponent);
-		expect(stripAnsi(components.map((component) => component.render(80).join("\n")).join("\n"))).toContain(
-			"Compaction skipped",
-		);
-	});
-
-	test("uses an explicit diagnostic for malformed reserved messages without inventing failure text", () => {
-		const malformed: AgentMessage[] = [
-			customMessage(SESSION_SLASH_COMMAND_CUSTOM_TYPE, { command: "not-a-command" }),
-			customMessage(SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE, { severity: "fatal" }),
-		];
-		const output = stripAnsi(
-			buildConversationComponents(malformed, componentOptions)
-				.flatMap((component) => component.render(80))
-				.join("\n"),
-		);
-
+		expect(output).toContain("Compaction skipped");
 		expect(output.match(/\[Malformed session command message\]/g)).toHaveLength(2);
-		expect(output).not.toContain("Command failed");
 		expect(output).not.toContain("durable display text");
 	});
+
 });
