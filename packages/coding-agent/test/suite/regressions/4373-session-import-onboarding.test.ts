@@ -223,6 +223,56 @@ function createOpenCodeFixture(home: string): void {
 	createSkill(home, join(".config", "opencode", "skills"), "opencode-skill");
 }
 
+function createOpenCodeExportFixture(home: string): string {
+	const path = join(home, "opencode-session.json");
+	writeFileSync(
+		path,
+		JSON.stringify(
+			{
+				info: {
+					id: "opencode-export",
+					directory: "/workspace/opencode-export",
+					title: "OpenCode export",
+					time: { created: 1_767_571_200_000 },
+				},
+				messages: [
+					{
+						info: { role: "user", time: { created: 1_767_571_201_000 } },
+						parts: [{ type: "text", text: "OpenCode export prompt" }],
+					},
+					{
+						info: {
+							role: "assistant",
+							time: { created: 1_767_571_202_000 },
+							providerID: "openai",
+							modelID: "gpt-test",
+							finish: "tool-calls",
+						},
+						parts: [
+							{ type: "reasoning", text: "OpenCode export thinking" },
+							{ type: "text", text: "OpenCode export response" },
+							{
+								type: "tool",
+								callID: "opencode-export-tool",
+								tool: "bash",
+								state: {
+									status: "completed",
+									input: { command: "pwd" },
+									output: "OpenCode export tool output",
+									time: { start: 1_767_571_203_000, end: 1_767_571_204_000 },
+								},
+							},
+						],
+					},
+				],
+			},
+			null,
+			2,
+		),
+	);
+	return path;
+}
+
 function createPiFixture(home: string): void {
 	const user: Message = {
 		role: "user",
@@ -420,23 +470,31 @@ describe("ENG-4373 onboarding session import", () => {
 		expect(paths).not.toContain(oldPath);
 	});
 
-	it("detects and imports individual Claude Code and Codex JSONL files", async () => {
+	it("detects and imports individual harness session files", async () => {
 		const claudePath = join(home, ".claude", "projects", "-project", "claude-session.jsonl");
 		const codexPath = join(home, ".codex", "sessions", "2026", "01", "01", "codex-session.jsonl");
 		const piPath = join(home, ".pi", "agent", "sessions", "project", "pi-session.jsonl");
+		const openCodePath = createOpenCodeExportFixture(home);
 		const malformedPath = join(home, ".claude", "projects", "-project", "malformed.jsonl");
 
 		await expect(detectSessionImportFileKind(claudePath)).resolves.toBe("claude");
 		await expect(detectSessionImportFileKind(codexPath)).resolves.toBe("codex");
 		await expect(detectSessionImportFileKind(piPath)).resolves.toBe("native");
+		await expect(detectSessionImportFileKind(openCodePath)).resolves.toBe("opencode");
 		await expect(detectSessionImportFileKind(malformedPath)).resolves.toBe("unknown");
 
 		const claude = await importExternalSessionFile(claudePath, "claude", { homeDir: home, agentDir, env: {} });
 		const codex = await importExternalSessionFile(codexPath, "codex", { homeDir: home, agentDir, env: {} });
+		const openCode = await importExternalSessionFile(openCodePath, "opencode", {
+			homeDir: home,
+			agentDir,
+			env: {},
+		});
 		expect(claude.status).toBe("imported");
 		expect(codex.status).toBe("imported");
+		expect(openCode.status).toBe("imported");
 
-		for (const imported of [claude, codex]) {
+		for (const imported of [claude, codex, openCode]) {
 			const entries = loadEntriesFromFile(imported.sessionFile);
 			const header = entries[0] as SessionHeader;
 			const state = [...entries].reverse().find((entry) => entry.type === "session_state");

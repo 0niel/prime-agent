@@ -1,8 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { basename } from "node:path";
 import type { DatabaseSync as NodeDatabaseSync } from "node:sqlite";
 import type { AssistantMessage, Message, TextContent, ThinkingContent, ToolCall, Usage } from "@earendil-works/pi-ai";
 import { shouldUseWindowsShell } from "../../../utils/child-process.js";
+import { readJsonDocument } from "../jsonl.js";
 import {
 	asArray,
 	asNumber,
@@ -246,6 +248,40 @@ function runOpenCode(command: string, args: string[], cwd: string, timeout: numb
 	return result.status === 0 ? result.stdout.trim() : undefined;
 }
 
+function parseOpenCodeExport(value: unknown, fallbackId: string): ImportedSession | undefined {
+	const exported = asRecord(value);
+	const info = asRecord(exported?.info);
+	if (!info) {
+		return undefined;
+	}
+	const id = asString(info.id) ?? fallbackId;
+	const time = asRecord(info.time);
+	const records = asArray(exported?.messages)
+		.map((messageValue): OpenCodeMessageRecord | undefined => {
+			const record = asRecord(messageValue);
+			const message = asRecord(record?.info);
+			if (!message) {
+				return undefined;
+			}
+			return {
+				message,
+				parts: asArray(record?.parts)
+					.map(asRecord)
+					.filter((part): part is Record<string, unknown> => part !== undefined),
+			};
+		})
+		.filter((record): record is OpenCodeMessageRecord => record !== undefined);
+	return convertOpenCodeSession(
+		{
+			id,
+			directory: asString(info.directory),
+			title: asString(info.title),
+			time_created: parseTimestamp(time?.created),
+		},
+		records,
+	);
+}
+
 function openCodeListTimestamp(value: Record<string, unknown>): number {
 	const time = asRecord(value.time);
 	return parseTimestamp(
@@ -298,34 +334,15 @@ export async function parseOpenCodeCliSession(
 	if (!output) {
 		return undefined;
 	}
-	const exported = asRecord(JSON.parse(output) as unknown);
-	const info = asRecord(exported?.info);
-	const id = asString(info?.id) ?? sessionId;
-	const time = asRecord(info?.time);
-	const records = asArray(exported?.messages)
-		.map((value): OpenCodeMessageRecord | undefined => {
-			const record = asRecord(value);
-			const message = asRecord(record?.info);
-			if (!message) {
-				return undefined;
-			}
-			return {
-				message,
-				parts: asArray(record?.parts)
-					.map(asRecord)
-					.filter((part): part is Record<string, unknown> => part !== undefined),
-			};
-		})
-		.filter((record): record is OpenCodeMessageRecord => record !== undefined);
-	return convertOpenCodeSession(
-		{
-			id,
-			directory: asString(info?.directory),
-			title: asString(info?.title),
-			time_created: parseTimestamp(time?.created),
-		},
-		records,
-	);
+	try {
+		return parseOpenCodeExport(JSON.parse(output) as unknown, sessionId);
+	} catch {
+		return undefined;
+	}
+}
+
+export async function parseOpenCodeExportFile(filePath: string): Promise<ImportedSession | undefined> {
+	return parseOpenCodeExport(await readJsonDocument(filePath), basename(filePath, ".json"));
 }
 
 function queryRows<T>(database: NodeDatabaseSync, sql: string, ...params: (string | number)[]): T[] {

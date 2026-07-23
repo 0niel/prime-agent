@@ -5,12 +5,13 @@ import { getAgentDir, getSessionsDir } from "../../config.js";
 import { SessionImportFileNotFoundError } from "../session-import-errors.js";
 import { parseClaudeSession } from "./adapters/claude.js";
 import { parseCodexSession } from "./adapters/codex.js";
-import { readJsonLinePrefix } from "./jsonl.js";
-import { asRecord, asString, importedSessionContentHash } from "./shared.js";
+import { parseOpenCodeExportFile } from "./adapters/opencode.js";
+import { readJsonDocument, readJsonLinePrefix } from "./jsonl.js";
+import { asArray, asRecord, asString, importedSessionContentHash } from "./shared.js";
 import { importedSessionPath, persistImportedSession } from "./storage.js";
 import type { SessionImportOptions } from "./types.js";
 
-export type SessionImportFileKind = "native" | "claude" | "codex" | "unknown";
+export type SessionImportFileKind = "native" | "claude" | "codex" | "opencode" | "unknown";
 export type ExternalSessionImportFileKind = Exclude<SessionImportFileKind, "native" | "unknown">;
 
 export interface ImportedExternalSessionFile {
@@ -41,6 +42,10 @@ export async function detectSessionImportFileKind(filePath: string): Promise<Ses
 			return "claude";
 		}
 	}
+	const document = asRecord(await readJsonDocument(resolvedPath));
+	if (asRecord(document?.info) && asArray(document?.messages).length > 0) {
+		return "opencode";
+	}
 	return "unknown";
 }
 
@@ -50,9 +55,15 @@ export async function importExternalSessionFile(
 	options: SessionImportOptions = {},
 ): Promise<ImportedExternalSessionFile> {
 	const resolvedPath = resolve(filePath);
-	const session = source === "claude" ? await parseClaudeSession(resolvedPath) : await parseCodexSession(resolvedPath);
+	const session =
+		source === "claude"
+			? await parseClaudeSession(resolvedPath)
+			: source === "codex"
+				? await parseCodexSession(resolvedPath)
+				: await parseOpenCodeExportFile(resolvedPath);
 	if (!session) {
-		throw new Error(`No importable ${source === "claude" ? "Claude Code" : "Codex"} messages found`);
+		const label = source === "claude" ? "Claude Code" : source === "codex" ? "Codex" : "OpenCode";
+		throw new Error(`No importable ${label} messages found`);
 	}
 
 	const agentDir = options.agentDir ?? getAgentDir();

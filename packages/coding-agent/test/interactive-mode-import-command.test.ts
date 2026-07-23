@@ -18,7 +18,7 @@ type InteractiveModePrototype = {
 type AutoImportCommandContext = {
 	getPathCommandArgument: (text: string, command: PathCommand) => string | undefined;
 	handleImportCommand: (text: string) => Promise<void>;
-	handleExternalSessionImport: (inputPath: string, source: "claude" | "codex") => Promise<void>;
+	handleExternalSessionImport: (inputPath: string, source: "claude" | "codex" | "opencode") => Promise<void>;
 	showError: (message: string) => void;
 };
 
@@ -52,18 +52,19 @@ describe("InteractiveMode /import parsing", () => {
 		expect(runSessionImportFlow).toHaveBeenCalledWith("command");
 	});
 
-	it("routes supported JSONL files to native or external import", async () => {
+	it("routes supported session files to native or external import", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-agent-import-command-"));
 		try {
-			const nativePath = join(root, "native.jsonl");
+			const piPath = join(root, "pi-mono.jsonl");
 			const claudePath = join(root, "claude.jsonl");
 			const codexPath = join(root, "codex.jsonl");
+			const openCodePath = join(root, "opencode.json");
 			writeFileSync(
-				nativePath,
+				piPath,
 				`${JSON.stringify({
 					type: "session",
 					version: 3,
-					id: "native",
+					id: "pi-mono",
 					timestamp: "2026-01-01T00:00:00.000Z",
 					cwd: root,
 				})}\n`,
@@ -82,6 +83,13 @@ describe("InteractiveMode /import parsing", () => {
 					payload: { id: "codex", cwd: root },
 				})}\n`,
 			);
+			writeFileSync(
+				openCodePath,
+				JSON.stringify({
+					info: { id: "opencode", directory: root },
+					messages: [{ info: { role: "user" }, parts: [{ type: "text", text: "OpenCode prompt" }] }],
+				}),
+			);
 
 			const handleImportCommand = vi.fn(async () => {});
 			const handleExternalSessionImport = vi.fn(async () => {});
@@ -92,14 +100,17 @@ describe("InteractiveMode /import parsing", () => {
 				showError: vi.fn(),
 			};
 
-			await interactiveModePrototype.handleAutoImportCommand.call(context, `/import "${nativePath}"`);
-			expect(handleImportCommand).toHaveBeenLastCalledWith(`/import "${nativePath}"`);
+			await interactiveModePrototype.handleAutoImportCommand.call(context, `/import "${piPath}"`);
+			expect(handleImportCommand).toHaveBeenLastCalledWith(`/import "${piPath}"`);
 
 			await interactiveModePrototype.handleAutoImportCommand.call(context, `/import "${claudePath}"`);
 			expect(handleExternalSessionImport).toHaveBeenLastCalledWith(claudePath, "claude");
 
 			await interactiveModePrototype.handleAutoImportCommand.call(context, `/import "${codexPath}"`);
 			expect(handleExternalSessionImport).toHaveBeenLastCalledWith(codexPath, "codex");
+
+			await interactiveModePrototype.handleAutoImportCommand.call(context, `/import "${openCodePath}"`);
+			expect(handleExternalSessionImport).toHaveBeenLastCalledWith(openCodePath, "opencode");
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

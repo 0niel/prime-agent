@@ -1,4 +1,5 @@
 import { createReadStream, statSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 
 const MAX_IMPORT_FILE_BYTES = 256 * 1024 * 1024;
@@ -32,6 +33,15 @@ export async function readJsonLinePrefix(filePath: string, limit: number): Promi
 		input.destroy();
 	}
 	return values;
+}
+
+export async function readJsonDocument(filePath: string): Promise<unknown | undefined> {
+	validateImportFileSize(filePath);
+	try {
+		return JSON.parse(await readFile(filePath, "utf8")) as unknown;
+	} catch {
+		return undefined;
+	}
 }
 
 export async function readJsonLines(

@@ -8587,11 +8587,13 @@ export class InteractiveMode {
 				await this.handleImportCommand(text);
 				return;
 			}
-			if (kind === "claude" || kind === "codex") {
+			if (kind === "claude" || kind === "codex" || kind === "opencode") {
 				await this.handleExternalSessionImport(inputPath, kind);
 				return;
 			}
-			this.showError("Unsupported session JSONL. Expected a Prime Agent, Pi, Claude Code, or Codex session.");
+			this.showError(
+				"Unsupported session file. Expected a Prime Agent, Pi Mono, Claude Code, Codex, or OpenCode export.",
+			);
 		} catch (error) {
 			if (error instanceof SessionImportFileNotFoundError) {
 				this.showError(`Failed to import session: ${error.message}`);
@@ -8602,7 +8604,7 @@ export class InteractiveMode {
 	}
 
 	private async handleExternalSessionImport(inputPath: string, source: ExternalSessionImportFileKind): Promise<void> {
-		const label = source === "claude" ? "Claude Code" : "Codex";
+		const label = source === "claude" ? "Claude Code" : source === "codex" ? "Codex" : "OpenCode";
 		const confirmed = await this.showExtensionConfirm(
 			"Import session",
 			`Import and resume ${label} session from ${inputPath}?`,
