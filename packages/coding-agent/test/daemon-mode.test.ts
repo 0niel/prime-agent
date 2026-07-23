@@ -5128,6 +5128,52 @@ describe("daemon mode helpers", () => {
 		},
 	);
 
+	it.each([
+		{ error: undefined, expected: "Prompt was not accepted by the session." },
+		{ error: new Error("duplicate follow-up queueKey"), expected: "duplicate follow-up queueKey" },
+	])("fails prompt RPC after preflight rejection with $expected", async ({ error, expected }) => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const promptUntilAccepted = vi.fn(
+			async (_message: string, options?: { preflightResult?: (success: boolean) => void }) => {
+				options?.preflightResult?.(false);
+				if (error) throw error;
+			},
+		);
+		const state = makeState("active-1") as ActiveSessionState & {
+			runtime: ActiveSessionState["runtime"] & { session: { promptUntilAccepted: typeof promptUntilAccepted } };
+		};
+		state.runtime = { ...state.runtime, session: { promptUntilAccepted } } as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		const client = makeClient("client-1", state.activeSessionId);
+		const write = vi.fn((_data: unknown) => true);
+		client.socket = { destroyed: false, write } as unknown as Socket;
+
+		internals.handleCommand(client, {
+			id: "command-1",
+			type: "prompt",
+			activeSessionId: state.activeSessionId,
+			message: "duplicate",
+			streamingBehavior: "followUp",
+		});
+
+		await vi.waitFor(() => expect(write).toHaveBeenCalledOnce());
+		expect(JSON.parse(String(write.mock.calls[0]?.[0]))).toMatchObject({
+			id: "command-1",
+			command: "prompt",
+			success: false,
+			error: expected,
+		});
+	});
+
 	it("uses the queued default lane for old-client prompts on a new daemon", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -5142,11 +5188,14 @@ describe("daemon mode helpers", () => {
 		state.runtime = { ...state.runtime, session: { promptUntilAccepted } } as never;
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
-			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
 		};
 		internals.sessions.set(state.activeSessionId, state);
+		const client = makeClient("legacy-client", state.activeSessionId);
+		const write = vi.fn((_data: unknown) => true);
+		client.socket = { destroyed: false, write } as unknown as Socket;
 
-		await internals.handleCommand(makeClient("legacy-client", state.activeSessionId), {
+		internals.handleCommand(client, {
 			id: "command-1",
 			type: "prompt",
 			activeSessionId: state.activeSessionId,
@@ -5154,6 +5203,8 @@ describe("daemon mode helpers", () => {
 			streamingBehavior: "followUp",
 		});
 
+		await vi.waitFor(() => expect(write).toHaveBeenCalledOnce());
+		expect(JSON.parse(String(write.mock.calls[0]?.[0]))).toMatchObject({ success: true, command: "prompt" });
 		expect(promptUntilAccepted).toHaveBeenCalledWith(
 			"legacy prompt",
 			expect.objectContaining({ streamingBehavior: "followUp", queueIfBusy: true }),

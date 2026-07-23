@@ -2837,6 +2837,7 @@ export class AgentDaemon {
 			case "prompt": {
 				const state = this.getBoundSessionState(command.activeSessionId);
 				let responseSent = false;
+				let preflightRejected = false;
 				const sendSuccessResponse = () => {
 					if (responseSent) {
 						return;
@@ -2862,6 +2863,8 @@ export class AgentDaemon {
 							if (didSucceed) {
 								this.recordWorkerRecoveryState(state, "prompt_accepted", true);
 								sendSuccessResponse();
+							} else {
+								preflightRejected = true;
 							}
 						},
 					},
@@ -2869,7 +2872,12 @@ export class AgentDaemon {
 					false,
 				)
 					.then(() => {
-						sendSuccessResponse();
+						if (preflightRejected) {
+							const error = new Error("Prompt was not accepted by the session.");
+							this.write(client, failure(command.id, "prompt", error, serializeDaemonError(error)));
+						} else {
+							sendSuccessResponse();
+						}
 					})
 					.catch((error) => {
 						if (responseSent) {
@@ -2987,7 +2995,6 @@ export class AgentDaemon {
 				if (!state.runtime.session.resumeQueuedWork()) {
 					const error = new Error("No queued work to resume");
 					return failure(command.id, "resume_queue", error, serializeDaemonError(error));
-
 				}
 				return success(command.id, "resume_queue");
 			}

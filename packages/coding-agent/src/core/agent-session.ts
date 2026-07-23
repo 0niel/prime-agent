@@ -4569,6 +4569,7 @@ export class AgentSession {
 		const context = this._extensionRunner.createCommandContext();
 		return Promise.resolve()
 			.then(() => command.handler(args, context))
+
 			.catch((error: unknown) => {
 				const commandError = error instanceof Error ? error : new Error(String(error));
 				this._extensionRunner.emitError({
@@ -4577,7 +4578,6 @@ export class AgentSession {
 					error: commandError.message,
 				});
 				throw commandError;
-			});
 			});
 	}
 
@@ -5009,8 +5009,6 @@ export class AgentSession {
 						this._activeSessionInput = undefined;
 						this._syncSteeringStopPending();
 					}
-
-
 				} finally {
 					admission.release();
 				}

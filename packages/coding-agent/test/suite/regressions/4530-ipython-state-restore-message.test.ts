@@ -166,5 +166,4 @@ describe("ENG-4530 IPython state restore message", () => {
 		component.setExpanded(true);
 		expect(render(component)).not.toContain("restore details");
 	});
-
 });
