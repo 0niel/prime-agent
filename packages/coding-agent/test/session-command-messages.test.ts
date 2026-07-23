@@ -170,20 +170,6 @@ describe("session command messages", () => {
 		).toEqual([]);
 	});
 
-	test("renders valid and malformed compaction outcomes distinctly on replay", () => {
-		const valid = createCompactionOutcomeMessage("Auto-compaction skipped", {
-			reason: "threshold",
-			outcome: "skipped",
-		});
-		const malformed = customMessage(COMPACTION_OUTCOME_CUSTOM_TYPE, { reason: "manual", outcome: "skipped" });
-		const components = buildConversationComponents([valid, malformed], componentOptions);
-
-		expect(components[0]).toBeInstanceOf(CompactionOutcomeMessageComponent);
-		const output = stripAnsi(components.flatMap((component) => component.render(80)).join("\n"));
-		expect(output).toContain("Auto-compaction skipped");
-		expect(output).toContain("[Malformed compaction outcome message]");
-		expect(output).not.toContain("durable display text");
-	});
 
 	test("continues to include ordinary custom messages", () => {
 		expect(convertToLlm([customMessage("extension_notice")])).toMatchObject([
@@ -202,8 +188,13 @@ describe("session command messages", () => {
 					success: false,
 					severity: "warning",
 				}),
+				createCompactionOutcomeMessage("Auto-compaction skipped", {
+					reason: "threshold",
+					outcome: "skipped",
+				}),
 				customMessage(SESSION_SLASH_COMMAND_CUSTOM_TYPE, { command: "not-a-command" }),
 				customMessage(SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE, { severity: "fatal" }),
+				customMessage(COMPACTION_OUTCOME_CUSTOM_TYPE, { reason: "manual", outcome: "skipped" }),
 			],
 			componentOptions,
 		);
@@ -211,8 +202,11 @@ describe("session command messages", () => {
 
 		expect(components[0]).toBeInstanceOf(SlashCommandMessageComponent);
 		expect(components[1]).toBeInstanceOf(SlashCommandResultMessageComponent);
+		expect(components[2]).toBeInstanceOf(CompactionOutcomeMessageComponent);
 		expect(output).toContain("Compaction skipped");
+		expect(output).toContain("Auto-compaction skipped");
 		expect(output.match(/\[Malformed session command message\]/g)).toHaveLength(2);
+		expect(output).toContain("[Malformed compaction outcome message]");
 		expect(output).not.toContain("durable display text");
 	});
 });

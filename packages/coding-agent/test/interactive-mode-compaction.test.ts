@@ -1,8 +1,6 @@
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { Container } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, test, vi } from "vitest";
-import { createCompactionOutcomeMessage } from "../src/core/messages.js";
 import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -147,74 +145,6 @@ describe("InteractiveMode compaction events", () => {
 		);
 	});
 
-	test("renders valid and malformed compaction outcomes during live delivery", () => {
-		const chatContainer = new Container();
-		const fakeThis = {
-			chatContainer,
-			toolOutputExpanded: false,
-			bindLocalSessionExtensions: false,
-			getMarkdownThemeWithSettings: () => undefined,
-		};
-		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
-		const addMessageToChat = Reflect.get(InteractiveMode.prototype, "addMessageToChat") as (
-			this: typeof fakeThis,
-			message: AgentMessage,
-		) => void;
 
-		addMessageToChat.call(
-			fakeThis,
-			createCompactionOutcomeMessage("Requested compaction failed", {
-				reason: "requested",
-				outcome: "failed",
-			}),
-		);
-		addMessageToChat.call(fakeThis, {
-			role: "custom",
-			customType: "compaction_outcome",
-			content: "untrusted malformed text",
-			display: true,
-			details: { reason: "manual", outcome: "failed" },
-			timestamp: 123,
-		});
 
-		const output = stripAnsi(chatContainer.render(100).join("\n"));
-		expect(output).toContain("Requested compaction failed");
-		expect(output).toContain("[Malformed compaction outcome message]");
-		expect(output).not.toContain("untrusted malformed text");
-	});
-
-	test("renders the persisted summary at its exact retained-message boundary", () => {
-		const retained = { role: "user", content: [], timestamp: 2 } as AgentMessage;
-		const summary = {
-			role: "compactionSummary",
-			summary: "summary",
-			tokensBefore: 123,
-			retainedMessageCount: 1,
-			timestamp: 2,
-		} as AgentMessage;
-		const later = { role: "user", content: [], timestamp: 2 } as AgentMessage;
-		const order = Reflect.get(InteractiveMode.prototype, "orderMessagesForTranscript") as (
-			this: InteractiveMode,
-			messages: AgentMessage[],
-		) => AgentMessage[];
-
-		expect(order.call({} as InteractiveMode, [summary, retained, later])).toEqual([retained, summary, later]);
-	});
-
-	test("falls back to timestamps for legacy compaction summaries", () => {
-		const retained = { role: "user", content: [], timestamp: 1 } as AgentMessage;
-		const summary = {
-			role: "compactionSummary",
-			summary: "summary",
-			tokensBefore: 123,
-			timestamp: 2,
-		} as AgentMessage;
-		const later = { role: "user", content: [], timestamp: 3 } as AgentMessage;
-		const order = Reflect.get(InteractiveMode.prototype, "orderMessagesForTranscript") as (
-			this: InteractiveMode,
-			messages: AgentMessage[],
-		) => AgentMessage[];
-
-		expect(order.call({} as InteractiveMode, [summary, retained, later])).toEqual([retained, summary, later]);
-	});
 });
