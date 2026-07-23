@@ -115,6 +115,7 @@ import {
 	BUILTIN_SLASH_COMMANDS,
 	builtinSlashCommandTakesArgument,
 	isBuiltinSlashCommandName,
+	parseRefineCommandOptions,
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
@@ -9744,30 +9745,15 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 	}
 
 	private async handleRefineCommand(args?: string): Promise<void> {
-		let trimmedArgs = args?.trim() ?? "";
-		const globalOption: { global: boolean } = { global: false };
-		if (/^--global(?=\s|$)/.test(trimmedArgs)) {
-			globalOption.global = true;
-			trimmedArgs = trimmedArgs.replace(/^--global(?=\s|$)/, "").trim();
-		}
-		const rollbackPrefix = "rollback ";
 		let options: { instructions?: string; rollbackId?: string; global?: boolean };
-
-		if (trimmedArgs === "rollback") {
-			this.showWarning("Usage: /refine rollback <refinement-id>");
+		try {
+			options = parseRefineCommandOptions(args ?? "");
+		} catch (error) {
+			this.showWarning(error instanceof Error ? error.message : String(error));
 			return;
 		}
 
-		if (trimmedArgs?.startsWith(rollbackPrefix) && trimmedArgs.slice(rollbackPrefix.length).trim()) {
-			// Rollback uses the global refinement history, not the current trajectory,
-			// so it must work even in a fresh session with no messages yet.
-			let rollbackId = trimmedArgs.slice(rollbackPrefix.length).trim();
-			if (/\s--global$/.test(rollbackId)) {
-				globalOption.global = true;
-				rollbackId = rollbackId.replace(/\s--global$/, "").trim();
-			}
-			options = { rollbackId, ...globalOption };
-		} else {
+		if (!options.rollbackId) {
 			let messageCount: number;
 			try {
 				const stats = await this.agentConnection.getSessionStats();
@@ -9781,7 +9767,6 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 				this.showWarning("Nothing to refine (no trajectory yet)");
 				return;
 			}
-			options = { instructions: trimmedArgs || undefined, ...globalOption };
 		}
 
 		this.stopWorkingLoader();

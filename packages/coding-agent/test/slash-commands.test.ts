@@ -4,6 +4,7 @@ import {
 	builtinSlashCommandTakesArgument,
 	isBuiltinSlashCommandName,
 	isSessionSlashCommandName,
+	parseRefineCommandOptions,
 	parseSessionSlashCommand,
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
@@ -180,6 +181,10 @@ describe("session slash commands", () => {
 			expect(parseSessionSlashCommand(`/goal\t${lineTerminator}ship it`)).toBeUndefined();
 			expect(parseSessionSlashCommand(`/autonomous\t${lineTerminator}on`)).toBeUndefined();
 		}
+	});
+
+	test("requires a rollback id after removing --global", () => {
+		expect(() => parseRefineCommandOptions("rollback --global")).toThrow("Usage: /refine rollback <refinement-id>");
 	});
 
 	test("classifies only exact leading session-owned commands", () => {

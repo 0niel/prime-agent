@@ -5,6 +5,7 @@ import { fauxAssistantMessage, fauxToolCall, type ImageContent } from "@earendil
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createSessionSlashCommandMessage } from "../../src/core/messages.js";
 import {
 	applyRefinementProposal,
 	getGlobalHarnessStateDir,
@@ -16,6 +17,7 @@ import {
 	type RefinementResult,
 	saveHarnessState,
 } from "../../src/core/refinement/index.js";
+import { parseSessionSlashCommand } from "../../src/core/slash-commands.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
 
 type AutoRefineReason = "turn_interval" | "compact";
@@ -1666,6 +1668,69 @@ describe("AgentSession queue characterization", () => {
 		expect(getUserTexts(harness)).toEqual(["start", "same heartbeat"]);
 	});
 
+	it("removes preparing inputs and re-prepares when the last batch anchor changes", async () => {
+		let releaseFirstPreparation = () => {};
+		const firstPreparation = new Promise<void>((resolve) => {
+			releaseFirstPreparation = resolve;
+		});
+		const prepared: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event) => {
+						prepared.push(event.prompt);
+						if (prepared.length === 1) await firstPreparation;
+						return {
+							systemPrompt: `${event.systemPrompt}
+prepared:${event.prompt}`,
+						};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.session.setFollowUpMode("all");
+		let releaseResponse = () => {};
+		const responseGate = new Promise<void>((resolve) => {
+			releaseResponse = resolve;
+		});
+		let providerSystemPrompt = "";
+		harness.setResponses([
+			async (context) => {
+				providerSystemPrompt = context.systemPrompt ?? "";
+				await responseGate;
+				return fauxAssistantMessage("remaining response");
+			},
+		]);
+		const removedAgentMessage =
+			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_remove\n\nremove";
+		const keptAgentMessage =
+			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_keep\n\nkeep";
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("ordinary");
+		await harness.session.queueAgentMessagePrompt(removedAgentMessage, "followUp", undefined);
+		await harness.session.queueAgentMessagePrompt(keptAgentMessage, "followUp", undefined);
+		await harness.session.followUp("last anchor", undefined, { queueKey: "heartbeat:one" });
+		pause.release();
+		await vi.waitFor(() => expect(prepared).toEqual(["last anchor"]));
+
+		expect(harness.session.clearQueuedUserMessagesMatching((text) => text === removedAgentMessage)).toEqual({
+			steering: [],
+			followUp: [removedAgentMessage],
+		});
+		expect(harness.session.removeQueuedFollowUp("heartbeat:one")).toBe(true);
+		releaseFirstPreparation();
+		await vi.waitFor(() => expect(providerSystemPrompt).not.toBe(""));
+		expect(harness.session.removeQueuedFollowUp("heartbeat:one")).toBe(false);
+		releaseResponse();
+		await harness.session.waitForIdle();
+
+		expect(prepared).toEqual(["last anchor", keptAgentMessage]);
+		expect(providerSystemPrompt).toContain(`prepared:${keptAgentMessage}`);
+		expect(providerSystemPrompt).not.toContain("prepared:last anchor");
+		expect(getUserTexts(harness)).toEqual(["ordinary", keptAgentMessage]);
+	});
+
 	it("removes coalesced follow-up messages by queue key", async () => {
 		const waiting = await createWaitingHarness();
 		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
@@ -2252,10 +2317,21 @@ describe("AgentSession queue characterization", () => {
 		).toBe(true);
 	});
 
-	it("restores slash-prefixed snapshots as literal prompts by custom marker", async () => {
+	it("restores command envelopes as commands and other slash-prefixed messages literally", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("literal handled")]);
+		const command = parseSessionSlashCommand("/autonomous status");
+		expect(command).toBeDefined();
+
+		await harness.session.restoreFollowUpMessage(command!.text, undefined, {
+			customMessage: createSessionSlashCommandMessage(command!),
+		});
+		const mismatchedCommand = parseSessionSlashCommand("/autonomous on");
+		expect(mismatchedCommand).toBeDefined();
+		await harness.session.restoreFollowUpMessage(command!.text, undefined, {
+			customMessage: createSessionSlashCommandMessage(mismatchedCommand!),
+		});
 		await harness.session.restoreFollowUpMessage("/autonomous off", undefined, {
 			customMessage: {
 				role: "custom",
@@ -2265,19 +2341,38 @@ describe("AgentSession queue characterization", () => {
 				timestamp: Date.now(),
 			},
 		});
-		await harness.session.prompt("trigger");
+		expect(harness.session.getFollowUpQueueSnapshots()).toEqual([
+			expect.objectContaining({
+				text: command!.text,
+				customMessage: expect.objectContaining({ customType: "session_slash_command" }),
+			}),
+			expect.objectContaining({
+				text: command!.text,
+				customMessage: expect.objectContaining({ customType: "session_slash_command" }),
+			}),
+			expect.objectContaining({
+				text: "/autonomous off",
+				customMessage: expect.objectContaining({ customType: "restored-literal" }),
+			}),
+		]);
+		harness.session.resumeQueuedWork();
+		await harness.session.waitForIdle();
 
 		expect(harness.session.getAutonomousStatus().enabled).toBe(false);
+		expect(getUserTexts(harness)).toEqual([]);
 		expect(
 			harness.session.messages.some(
 				(message) => message.role === "custom" && message.customType === "restored-literal",
 			),
 		).toBe(true);
 		expect(
-			harness.session.messages.some(
-				(message) => message.role === "custom" && message.customType === "session_slash_command",
+			harness.session.messages.filter(
+				(message) =>
+					message.role === "custom" &&
+					message.customType === "session_slash_command" &&
+					(message.details as { command?: { text?: string } } | undefined)?.command?.text === command!.text,
 			),
-		).toBe(false);
+		).toHaveLength(1);
 	});
 
 	it("serializes concurrent trigger-turn custom messages", async () => {
@@ -2483,31 +2578,87 @@ describe("AgentSession queue characterization", () => {
 		expect(getUserTexts(harness)).toEqual(["direct", "queued"]);
 	});
 
-	it("allows an admitted extension command to navigate the session tree", async () => {
+	it("defers work queued after direct admission until the direct handoff", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("direct done"), fauxAssistantMessage("queued done")]);
+		const internals = harness.session as unknown as {
+			_acquireDirectTurnAdmission(options?: { allowStreaming?: boolean }): Promise<{
+				owner: symbol;
+				release(): void;
+			}>;
+		};
+		const acquireDirectTurnAdmission = internals._acquireDirectTurnAdmission.bind(internals);
+		let queuedAtBoundary = false;
+		internals._acquireDirectTurnAdmission = async (options = {}) => {
+			const admission = await acquireDirectTurnAdmission(options);
+			if (!queuedAtBoundary) {
+				queuedAtBoundary = true;
+				await harness.session.followUp("queued", undefined, { resumeIfIdle: true });
+			}
+			return admission;
+		};
+
+		await harness.session.prompt("direct");
+		await harness.session.waitForIdle();
+
+		expect(getUserTexts(harness)).toEqual(["direct", "queued"]);
+	});
+
+	it("serializes an extension command behind an unrelated navigation owner", async () => {
 		let targetId: string | undefined;
-		let navigated = false;
+		let releaseNavigation = () => {};
+		const navigationGate = new Promise<void>((resolve) => {
+			releaseNavigation = resolve;
+		});
+		let navigationStarts = 0;
+		let commandNavigated = false;
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
+					pi.on("session_before_tree", async () => {
+						if (navigationStarts++ === 0) await navigationGate;
+					});
 					pi.registerCommand("back", {
 						description: "Navigate back",
 						handler: async (_args, ctx) => {
-							if (targetId) await ctx.navigateTree(targetId, { summarize: false });
-							navigated = true;
+							await ctx.navigateTree(targetId!, { summarize: false });
+							commandNavigated = true;
 						},
 					});
 				},
 			],
 		});
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("one")]);
+		await harness.session.bindExtensions({
+			commandContextActions: {
+				waitForIdle: () => harness.session.waitForIdle(),
+				newSession: async () => ({ cancelled: false }),
+				fork: async () => ({ cancelled: false }),
+				navigateTree: async (target, options) => harness.session.navigateTree(target, options),
+				switchSession: async () => ({ cancelled: false }),
+				reload: async () => {},
+			},
+		});
+		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
 		await harness.session.prompt("one");
 		targetId = harness.sessionManager.getEntries().find((entry) => entry.type === "message")?.id;
 		expect(targetId).toBeDefined();
+		await harness.session.prompt("two");
+		const secondId = harness.sessionManager.getLeafId();
 
-		await harness.session.prompt("/back");
+		const unrelatedNavigation = harness.session.navigateTree(targetId!, { summarize: false });
+		await vi.waitFor(() => expect(navigationStarts).toBe(1));
+		const extensionCommand = harness.session.prompt("/back");
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(commandNavigated).toBe(false);
 
-		expect(navigated).toBe(true);
+		releaseNavigation();
+		await unrelatedNavigation;
+		await extensionCommand;
+		expect(commandNavigated).toBe(true);
+		expect(navigationStarts).toBe(2);
+		expect(harness.sessionManager.getLeafId()).not.toBe(secondId);
 	});
 
 	it("waitForIdle observes a run that starts at its final idle boundary", async () => {

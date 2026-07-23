@@ -26,6 +26,35 @@ export interface SessionSlashCommand {
 	text: string;
 }
 
+export interface RefineCommandOptions {
+	instructions?: string;
+	rollbackId?: string;
+	global?: boolean;
+}
+
+export function parseRefineCommandOptions(args: string): RefineCommandOptions {
+	let rest = args.trim();
+	let global = false;
+	if (/^--global(?=\s|$)/.test(rest)) {
+		global = true;
+		rest = rest.replace(/^--global(?=\s|$)/, "").trim();
+	}
+	if (rest === "rollback") throw new Error("Usage: /refine rollback <refinement-id>");
+	if (rest.startsWith("rollback ")) {
+		let rollbackId = rest.slice("rollback ".length).trim();
+		if (rollbackId === "--global") {
+			throw new Error("Usage: /refine rollback <refinement-id>");
+		}
+		if (/\s--global$/.test(rollbackId)) {
+			global = true;
+			rollbackId = rollbackId.replace(/\s--global$/, "").trim();
+		}
+		if (!rollbackId) throw new Error("Usage: /refine rollback <refinement-id>");
+		return { rollbackId, global };
+	}
+	return { instructions: rest || undefined, global };
+}
+
 export interface BuiltinSlashCommand {
 	name: string;
 	description: string;

@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { getDaemonUpdateRestartManifestPath } from "../../../src/config.js";
 import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.js";
 import type { AgentCronJobStore, AgentCronScheduler } from "../../../src/core/cron-jobs.js";
-import type { CustomMessage } from "../../../src/core/messages.js";
+import { type CustomMessage, createSessionSlashCommandMessage } from "../../../src/core/messages.js";
+import { parseSessionSlashCommand } from "../../../src/core/slash-commands.js";
 import type { BashOperations } from "../../../src/core/tools/bash.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../../../src/modes/daemon/daemon-mode.js";
@@ -323,6 +324,11 @@ describe("issue #4257 update restart resume", () => {
 			agentMessageId: "agentmsg_custom",
 			customMessage: customFollowUp,
 		});
+		const command = parseSessionSlashCommand("/autonomous on");
+		const commandMessage = createSessionSlashCommandMessage(command!);
+		await parentHarness.session.restoreFollowUpMessage("/autonomous on", undefined, {
+			customMessage: commandMessage,
+		});
 		childHarness.session.recordBashResult("echo child", {
 			output: "child",
 			exitCode: 0,
@@ -390,6 +396,13 @@ describe("issue #4257 update restart resume", () => {
 						queueKey: "heartbeat:custom",
 						agentMessageId: "agentmsg_custom",
 						customMessage: customFollowUp,
+					},
+					{
+						message: "/autonomous on",
+						customMessage: expect.objectContaining({
+							customType: "session_slash_command",
+							details: { command },
+						}),
 					},
 				],
 			},

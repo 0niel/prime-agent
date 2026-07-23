@@ -177,6 +177,7 @@ import {
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+	isSessionSlashCommandMessage,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
@@ -234,7 +235,12 @@ import {
 import type { SessionStats } from "./session-stats.js";
 import type { SettingsManager } from "./settings-manager.js";
 import { getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
-import { parseSessionSlashCommand, type SessionSlashCommand, type SlashCommandInfo } from "./slash-commands.js";
+import {
+	parseRefineCommandOptions,
+	parseSessionSlashCommand,
+	type SessionSlashCommand,
+	type SlashCommandInfo,
+} from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
@@ -3902,7 +3908,9 @@ export class AgentSession {
 		if (!this.isStreaming && options?.resumeIfIdle) this._sessionInputPumpSuspended = false;
 		const admission = await this._acquireDirectTurnAdmission({ allowStreaming: true });
 		try {
-			await this._promptInjectedMessageUnserialized(text, message, options, admission.release);
+			await this._turnAdmissionContext.run(admission.owner, () =>
+				this._promptInjectedMessageUnserialized(text, message, options, admission.release),
+			);
 		} finally {
 			admission.release();
 		}
@@ -4092,9 +4100,19 @@ export class AgentSession {
 		const admission = !this.isStreaming ? await this._acquireDirectTurnAdmission() : undefined;
 		const releaseAdmission = admission?.release ?? (() => {});
 		try {
-			await this._promptUnserialized(text, options, releaseAdmission);
+			if (admission) {
+				await this._turnAdmissionContext.run(admission.owner, () =>
+					this._promptUnserialized(text, options, releaseAdmission),
+				);
+			} else {
+				await this._promptUnserialized(text, options, releaseAdmission);
+			}
 		} finally {
 			releaseAdmission();
+		}
+		if (admission) {
+			this._scheduleSessionInputPump();
+			await this._sessionInputPump;
 		}
 	}
 
@@ -4103,19 +4121,6 @@ export class AgentSession {
 		options: InternalPromptOptions | undefined,
 		releaseAdmission: () => void,
 	): Promise<void> {
-		if (!this.isStreaming) {
-			await this._waitForQueuedWorkAdmission();
-			this._sessionInputPumpSuspended = false;
-			if (
-				this.pendingMessageCount > 0 ||
-				this._activeSessionInput !== undefined ||
-				this._pumpingSessionInput ||
-				this._sessionInputPumpRequested
-			) {
-				this._scheduleSessionInputPump();
-				await this.waitForSessionInputIdle();
-			}
-		}
 		const isInternalPrompt = options?.internalPrompt === true;
 		const expandPromptTemplates = isInternalPrompt ? false : (options?.expandPromptTemplates ?? true);
 		const preflightResult = options?.preflightResult;
@@ -4511,9 +4516,6 @@ export class AgentSession {
 			return;
 		}
 		await promptCompletion;
-		releaseAdmission?.();
-		this._scheduleSessionInputPump();
-		await this._sessionInputPump;
 	}
 
 	/**
@@ -4532,12 +4534,7 @@ export class AgentSession {
 		const ctx = this._extensionRunner.createCommandContext();
 
 		try {
-			const owner = this._turnAdmissionOwner;
-			if (owner) {
-				await this._turnAdmissionContext.run(owner, () => command.handler(args, ctx));
-			} else {
-				await command.handler(args, ctx);
-			}
+			await command.handler(args, ctx);
 			return true;
 		} catch (err) {
 			// Emit error via extension runner
@@ -4638,6 +4635,27 @@ export class AgentSession {
 		});
 	}
 
+	private _restoreSessionCommand(
+		text: string,
+		customMessage: CustomMessage | undefined,
+		images: ImageContent[] | undefined,
+		schedule: SessionInputSchedule,
+	): boolean | undefined {
+		if (!isSessionSlashCommandMessage(customMessage) || text !== customMessage.details.command.text) {
+			return undefined;
+		}
+		return this._enqueueSessionInput(
+			{
+				kind: "command",
+				text,
+				command: customMessage.details.command,
+				images,
+			},
+			schedule,
+			{ restore: true },
+		);
+	}
+
 	async restoreSteeringMessage(
 		text: string,
 		images?: ImageContent[],
@@ -4649,6 +4667,7 @@ export class AgentSession {
 			prefixMessages?: CustomMessage[];
 		} = {},
 	): Promise<void> {
+		if (this._restoreSessionCommand(text, options.customMessage, images, "steer") !== undefined) return;
 		await this._queueSteer(text, images, {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
@@ -4669,6 +4688,8 @@ export class AgentSession {
 			prefixMessages?: CustomMessage[];
 		} = {},
 	): Promise<boolean> {
+		const restoredCommand = this._restoreSessionCommand(text, options.customMessage, images, "followUp");
+		if (restoredCommand !== undefined) return restoredCommand;
 		return this._queueFollowUp(text, images, {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
@@ -4815,7 +4836,11 @@ export class AgentSession {
 		};
 	}
 
-	private _enqueueSessionInput(input: QueuedSessionInput, schedule: SessionInputSchedule): boolean {
+	private _enqueueSessionInput(
+		input: QueuedSessionInput,
+		schedule: SessionInputSchedule,
+		options: { restore?: boolean } = {},
+	): boolean {
 		const queue = schedule === "steer" ? this._steeringMessages : this._followUpMessages;
 		if (
 			schedule === "followUp" &&
@@ -4833,7 +4858,10 @@ export class AgentSession {
 			this._steeringStopPending = true;
 		}
 		this._emitQueueUpdate();
-		if ((schedule === "steer" && this.isStreaming) || input.kind === "command" || input.autoPump) {
+		if (
+			!options.restore &&
+			((schedule === "steer" && this.isStreaming) || input.kind === "command" || input.autoPump)
+		) {
 			if (input.kind === "prompt" && input.autoPump) this._sessionInputPumpSuspended = false;
 			this._scheduleSessionInputPump();
 		}
@@ -4948,7 +4976,6 @@ export class AgentSession {
 					this._emitQueueUpdate();
 					try {
 						await this._startPreparedPromptItems(prompts, epoch, admission.release);
-						if (this._activeSessionInput?.kind === "prompt") this._activeSessionInput.phase = "handedOff";
 					} catch (error) {
 						const delivered = new Set(this.agent.state.messages);
 						const undelivered: PreparedPromptInput[] = [];
@@ -5033,23 +5060,26 @@ export class AgentSession {
 		const pendingModelSelectEmit = this._pendingModelSelectEmit();
 		if (pendingModelSelectEmit) await pendingModelSelectEmit;
 
-		const preparationPrompt = prompts.at(-1);
-		if (!prompts.every((prompt) => prompt.preparation !== undefined)) {
+		while (!prompts.every((prompt) => prompt.preparation !== undefined)) {
 			if (this._isSessionInputHandoffDeferred(epoch)) {
 				throw new DeferredSessionInputError("Session input paused before preparation");
 			}
+			const preparationPrompt = prompts.at(-1);
+			if (!preparationPrompt) return;
 			const result = await this._extensionRunner.emitBeforeAgentStart(
-				preparationPrompt?.text ?? "",
-				preparationPrompt?.images,
+				preparationPrompt.text,
+				preparationPrompt.images,
 				this._baseSystemPrompt,
 				this._baseSystemPromptOptions,
 			);
+			if (prompts.at(-1) !== preparationPrompt) continue;
 			const preparation = { result };
 			for (const prompt of prompts) prompt.preparation = preparation;
 		}
 		if (this._isSessionInputHandoffDeferred(epoch)) {
 			throw new DeferredSessionInputError("Session input paused before handoff");
 		}
+		if (prompts.length === 0) return;
 
 		const messages: AgentMessage[] = [];
 		const nextTurnMessages = this._pendingNextTurnMessages;
@@ -5082,6 +5112,7 @@ export class AgentSession {
 		}
 		this.agent.state.systemPrompt = result?.systemPrompt ?? this._baseSystemPrompt;
 		try {
+			if (this._activeSessionInput?.kind === "prompt") this._activeSessionInput.phase = "handedOff";
 			const promptPromise = this.agent.prompt(messages);
 			releaseAdmission();
 			await promptPromise;
@@ -5103,7 +5134,7 @@ export class AgentSession {
 					await this.compact(input.command.args || undefined, { skipAbort: true });
 					break;
 				case "refine": {
-					const options = this._parseRefineCommandOptions(input.command.args);
+					const options = parseRefineCommandOptions(input.command.args);
 					const result = await this.refine(options, { skipAbort: true });
 					const applied = result.appliedEdits.filter((edit) => edit.applied).length;
 					resultText = `Refined continual harness state: ${applied} edit${applied === 1 ? "" : "s"} applied.`;
@@ -5149,25 +5180,6 @@ export class AgentSession {
 		);
 		this._emit({ type: "message_start", message });
 		this._emit({ type: "message_end", message });
-	}
-
-	private _parseRefineCommandOptions(args: string): { instructions?: string; rollbackId?: string; global?: boolean } {
-		let rest = args.trim();
-		let global = false;
-		if (/^--global(?=\s|$)/.test(rest)) {
-			global = true;
-			rest = rest.replace(/^--global(?=\s|$)/, "").trim();
-		}
-		if (rest === "rollback") throw new Error("Usage: /refine rollback <refinement-id>");
-		if (rest.startsWith("rollback ")) {
-			let rollbackId = rest.slice("rollback ".length).trim();
-			if (/\s--global$/.test(rollbackId)) {
-				global = true;
-				rollbackId = rollbackId.replace(/\s--global$/, "").trim();
-			}
-			return { rollbackId, global };
-		}
-		return { instructions: rest || undefined, global };
 	}
 
 	/**
@@ -5299,6 +5311,23 @@ export class AgentSession {
 		return { steering, followUp };
 	}
 
+	private _removeActivePreparingPrompts(predicate: (message: PreparedPromptInput) => boolean): {
+		steering: PreparedPromptInput[];
+		followUp: PreparedPromptInput[];
+	} {
+		const active = this._activeSessionInput;
+		if (active?.kind !== "prompt" || active.phase !== "preparing") return { steering: [], followUp: [] };
+		const removed = active.items.filter(predicate);
+		if (removed.length === 0) return { steering: [], followUp: [] };
+		const previousAnchor = active.items.at(-1);
+		const removedSet = new Set(removed);
+		active.items.splice(0, active.items.length, ...active.items.filter((message) => !removedSet.has(message)));
+		if (active.items.at(-1) !== previousAnchor) {
+			for (const message of active.items) message.preparation = undefined;
+		}
+		return active.lane === "steer" ? { steering: removed, followUp: [] } : { steering: [], followUp: removed };
+	}
+
 	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): { steering: string[]; followUp: string[] } {
 		const steering = this._steeringMessages.filter(
 			(message): message is PreparedPromptInput =>
@@ -5308,6 +5337,11 @@ export class AgentSession {
 			(message): message is PreparedPromptInput =>
 				message.kind === "prompt" && message.agentMessageId !== undefined && predicate(message.text),
 		);
+		const active = this._removeActivePreparingPrompts(
+			(message) => message.agentMessageId !== undefined && predicate(message.text),
+		);
+		steering.push(...active.steering);
+		followUp.push(...active.followUp);
 		const accepted = this._acceptedAgentMessagePrompt;
 		const acceptedMatches =
 			accepted !== undefined && !accepted.turnStarted && !accepted.cleared && predicate(accepted.text);
@@ -5535,6 +5569,9 @@ export class AgentSession {
 		const removedFollowUp = this._followUpMessages.filter(
 			(message): message is PreparedPromptInput => message.kind === "prompt" && message.queueKey === queueKey,
 		);
+		const active = this._removeActivePreparingPrompts((message) => message.queueKey === queueKey);
+		removedSteering.push(...active.steering);
+		removedFollowUp.push(...active.followUp);
 		if (removedSteering.length === 0 && removedFollowUp.length === 0) return false;
 		const removed = new Set<QueuedSessionInput>([...removedSteering, ...removedFollowUp]);
 		this._steeringMessages = this._steeringMessages.filter((message) => !removed.has(message));
