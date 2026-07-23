@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type ImageContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -2346,6 +2346,8 @@ prepared:${event.prompt}`,
 
 
 
+
+
 		const harness = await createHarness();
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("literal handled")]);
@@ -2665,25 +2667,21 @@ prepared:${event.prompt}`,
 	it("rejects completion when handoff fails after the prompt entered agent state", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
+		const prompt = harness.session.agent.prompt.bind(harness.session.agent);
+		vi.spyOn(harness.session.agent, "prompt").mockImplementationOnce(async (messages) => {
+			await prompt(messages);
+			throw new Error("handoff failed after delivery");
+		});
 		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = true;
 		const completion = harness.session.promptAndWait("delivered then failed", {
 			streamingBehavior: "followUp",
 		});
 		await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toEqual(["delivered then failed"]));
-		const internals = harness.session as unknown as {
-			_activeSessionInput?: { kind: "prompt"; items: Array<{ message: AgentMessage }> };
-			_startPreparedAgentPrompt(...args: unknown[]): Promise<void>;
-		};
-		vi.spyOn(internals, "_startPreparedAgentPrompt").mockImplementationOnce(async () => {
-			const active = internals._activeSessionInput;
-			if (active?.kind === "prompt")
-				harness.session.agent.state.messages.push(...active.items.map((item) => item.message));
-			throw new Error("handoff failed after delivery");
-		});
 		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = false;
 
 		expect(harness.session.resumeQueuedWork()).toBe(true);
 		await expect(completion).rejects.toThrow("handoff failed after delivery");
+		expect(getUserTexts(harness)).toEqual(["delivered then failed"]);
 		expect(harness.session.getFollowUpMessages()).toEqual([]);
 	});
 
@@ -2697,7 +2695,6 @@ prepared:${event.prompt}`,
 			run: (harness: Harness) => harness.session.compact(undefined, { skipAbort: true }),
 		},
 	])("rejects skip-abort $action while a turn is active", async ({ action, run }) => {
-
 		const harness = await createHarness();
 		harnesses.push(harness);
 		withStreaming(harness, true);

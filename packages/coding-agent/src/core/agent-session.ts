@@ -4985,6 +4985,9 @@ export class AgentSession {
 					this._emitQueueUpdate();
 					try {
 						await this._startPreparedPromptItems(prompts, epoch, admission.release);
+						for (const prompt of prompts) {
+							this._resolveAgentMessageCompletion(prompt.agentMessageId);
+						}
 					} catch (error) {
 						const delivered = new Set(this.agent.state.messages);
 						const undelivered: PreparedPromptInput[] = [];
@@ -5001,8 +5004,12 @@ export class AgentSession {
 							blocked = true;
 							return;
 						}
+						const terminalError = this._asError(error);
 						for (const prompt of undelivered) {
-							this._rejectAgentMessageDelivery(prompt.agentMessageId, this._asError(error));
+							this._rejectAgentMessageDelivery(prompt.agentMessageId, terminalError, false);
+						}
+						for (const prompt of prompts) {
+							this._rejectAgentMessageCompletion(prompt.agentMessageId, terminalError);
 						}
 						this._surfaceSessionInputError(error);
 					} finally {
