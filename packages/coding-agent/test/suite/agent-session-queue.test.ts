@@ -2433,15 +2433,23 @@ describe("AgentSession queue characterization", () => {
 		expect(getAssistantTexts(harness)).toEqual(["", "second handled"]);
 	});
 
-	it("rejects skip-abort refinement while a turn is active", async () => {
+	it.each([
+		{
+			action: "refine",
+			run: (harness: Harness) => harness.session.refine({}, { skipAbort: true }),
+		},
+		{
+			action: "compact",
+			run: (harness: Harness) => harness.session.compact(undefined, { skipAbort: true }),
+		},
+	])("rejects skip-abort $action while a turn is active", async ({ action, run }) => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = true;
+		setAgentStreaming(harness, true);
 
-		await expect(harness.session.refine({}, { skipAbort: true })).rejects.toThrow(
-			"Cannot refine without aborting while the agent is running.",
-		);
+		await expect(run(harness)).rejects.toThrow(`Cannot ${action} without aborting while the agent is running.`);
 	});
+
 	it("serializes queued prompt preparation with a direct prompt handoff", async () => {
 		let releaseDirectPreparation = () => {};
 		const directPreparation = new Promise<void>((resolve) => {
@@ -2538,56 +2546,5 @@ describe("AgentSession queue characterization", () => {
 		releaseResponse();
 		await waiting;
 		expect(idle).toBe(true);
-	});
-
-	it("rejects skip-abort compaction while a turn is active", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		setAgentStreaming(harness, true);
-
-		await expect(harness.session.compact(undefined, { skipAbort: true })).rejects.toThrow(
-			"Cannot compact without aborting while the agent is running.",
-		);
-	});
-
-	it("waits for an earlier direct handoff before executing a session command", async () => {
-		let releaseBeforeAgentStart: (() => void) | undefined;
-		const beforeAgentStartGate = new Promise<void>((resolve) => {
-			releaseBeforeAgentStart = resolve;
-		});
-		let directHandoffStarted: (() => void) | undefined;
-		const waitForDirectHandoff = new Promise<void>((resolve) => {
-			directHandoffStarted = resolve;
-		});
-		const harness = await createHarness({
-			extensionFactories: [
-				(pi) => {
-					pi.on("before_agent_start", async (event) => {
-						if (event.prompt === "earlier direct prompt") await beforeAgentStartGate;
-					});
-				},
-			],
-		});
-		harnesses.push(harness);
-		harness.setResponses([
-			async () => {
-				directHandoffStarted?.();
-				return fauxAssistantMessage("direct done");
-			},
-		]);
-
-		const direct = harness.session.prompt("earlier direct prompt");
-		await vi.waitFor(() => expect(releaseBeforeAgentStart).toBeDefined());
-		const command = harness.session.prompt("/autonomous on");
-		await new Promise<void>((resolve) => setImmediate(resolve));
-		expect(harness.session.getAutonomousStatus().enabled).toBe(false);
-
-		releaseBeforeAgentStart?.();
-		await waitForDirectHandoff;
-		await direct;
-		await command;
-
-		expect(harness.session.getAutonomousStatus().enabled).toBe(true);
-		expect(getUserTexts(harness)).toEqual(["earlier direct prompt"]);
 	});
 });

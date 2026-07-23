@@ -657,70 +657,60 @@ describe("AgentSession compaction characterization", () => {
 		expect(followUpSpy).toHaveBeenCalledWith(autonomousMessage);
 	});
 
-	it("does not continue after the session pump handles an untracked queued input", async () => {
-		vi.useFakeTimers();
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const sessionInternals = harness.session as unknown as {
-			_schedulePostCompactionContinue(): void;
-			_postCompactionContinuationScheduled: boolean;
-			_createPreparedPromptInput(text: string, images: undefined, options: { resumeIfIdle: boolean }): unknown;
-			_enqueueSessionInput(input: unknown, schedule: "followUp"): boolean;
-		};
-		harness.setResponses([fauxAssistantMessage("queued input handled")]);
-		sessionInternals._enqueueSessionInput(
-			sessionInternals._createPreparedPromptInput("queued input", undefined, { resumeIfIdle: false }),
-			"followUp",
-		);
-		const continueSpy = vi.spyOn(harness.session.agent, "continue");
-
-		sessionInternals._schedulePostCompactionContinue();
-		await vi.advanceTimersByTimeAsync(200);
-		vi.useRealTimers();
-
-		expect(continueSpy).not.toHaveBeenCalled();
-		expect(sessionInternals._postCompactionContinuationScheduled).toBe(false);
-		expect(harness.session.messages.at(-1)).toMatchObject({
-			role: "assistant",
-			content: [{ type: "text", text: "queued input handled" }],
-		});
-	});
-
-	it("does not continue again after the session pump consumes post-compaction continuations", async () => {
+	it.each([
+		{
+			name: "untracked queued input",
+			text: "queued input",
+			response: "queued input handled",
+			tracked: false,
+		},
+		{
+			name: "post-compaction continuation",
+			text: "session-owned continuation",
+			response: "continuation handled",
+			tracked: true,
+		},
+	])("does not continue again after the session pump handles $name", async ({ text, response, tracked }) => {
 		vi.useFakeTimers();
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const sessionInternals = harness.session as unknown as {
 			_schedulePostCompactionContinue(): void;
 			_postCompactionContinuationMessages: AgentMessage[];
+			_postCompactionContinuationScheduled: boolean;
 			_createPreparedPromptInput(
 				text: string,
 				images: undefined,
-				options: { message: AgentMessage; resumeIfIdle: boolean },
+				options: { message?: AgentMessage; resumeIfIdle: boolean },
 			): unknown;
 			_enqueueSessionInput(input: unknown, schedule: "followUp"): boolean;
 		};
 		const continuation = {
 			role: "user",
-			content: [{ type: "text", text: "session-owned continuation" }],
+			content: [{ type: "text", text }],
 			timestamp: Date.now(),
 		} satisfies AgentMessage;
-		sessionInternals._postCompactionContinuationMessages = [continuation];
-		harness.setResponses([fauxAssistantMessage("continuation handled")]);
+		if (tracked) sessionInternals._postCompactionContinuationMessages = [continuation];
+		harness.setResponses([fauxAssistantMessage(response)]);
 		sessionInternals._enqueueSessionInput(
-			sessionInternals._createPreparedPromptInput("session-owned continuation", undefined, {
-				message: continuation,
-				resumeIfIdle: true,
+			sessionInternals._createPreparedPromptInput(text, undefined, {
+				...(tracked && { message: continuation }),
+				resumeIfIdle: tracked,
 			}),
 			"followUp",
 		);
 		const continueSpy = vi.spyOn(harness.session.agent, "continue");
 
 		sessionInternals._schedulePostCompactionContinue();
-		await vi.advanceTimersByTimeAsync(100);
+		await vi.advanceTimersByTimeAsync(200);
 
 		expect(continueSpy).not.toHaveBeenCalled();
+		expect(sessionInternals._postCompactionContinuationScheduled).toBe(false);
 		expect(sessionInternals._postCompactionContinuationMessages).toEqual([]);
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: response }],
+		});
 	});
 
 	it("keeps autonomous threshold continuations when post-compaction continue must retry", async () => {
