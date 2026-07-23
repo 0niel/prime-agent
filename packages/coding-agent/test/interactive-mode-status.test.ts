@@ -20,6 +20,8 @@ import type { AgentCronJob } from "../src/core/cron-jobs.js";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.js";
 import { emptyGoalState, type GoalState } from "../src/core/goals.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
+import { SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE } from "../src/core/messages.js";
+
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import { emptyUsage } from "../src/core/usage.js";
@@ -52,7 +54,7 @@ import {
 	truncatePathMiddle,
 } from "../src/modes/interactive/interactive-mode.js";
 import { ClientPromptStashStore, type PromptStashState } from "../src/modes/interactive/prompt-stash-state.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 function renderLastLine(container: Container, width = 120): string {
 	const last = container.children[container.children.length - 1];
@@ -1080,8 +1082,15 @@ describe("InteractiveMode pending bash components", () => {
 			pendingBashComponents: [],
 			getAllQueuedMessages: () => ({
 				steering: ["Heartbeat prompt: check steering", "Goal context: steer goal", "plain steering"],
-				followUp: ["Heartbeat prompt: check status", "Goal context: continue goal", "plain follow-up"],
+				followUp: [
+					"Heartbeat prompt: check status",
+					"Goal context: continue goal",
+					"plain follow-up",
+					"/compact focus",
+					"/unknown",
+				],
 			}),
+			isRecognizedSlashCommand: (name: string) => name === "compact",
 			getAppKeyDisplay: () => "Ctrl+Q",
 			featureHintSuppressedByQueue: false,
 			clearFeatureHintPresentation: vi.fn(),
@@ -1091,7 +1100,10 @@ describe("InteractiveMode pending bash components", () => {
 			InteractiveMode.prototype as unknown as { updatePendingMessagesDisplay(this: unknown): void }
 		).updatePendingMessagesDisplay.call(fakeThis);
 
+		const raw = queuedMessagesContainer.render(100).join("\n");
 		const rendered = normalizeRenderedOutput(queuedMessagesContainer);
+		expect(raw).toContain(theme.fg("accent", "/compact"));
+		expect(raw).not.toContain(theme.fg("accent", "/unknown"));
 		expect(rendered).toContain("Heartbeat prompt: check steering");
 		expect(rendered).not.toContain("Steering: Heartbeat prompt");
 		expect(rendered).toContain("Goal context: steer goal");
