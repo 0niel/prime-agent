@@ -2440,7 +2440,11 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 
 		try {
 			const run = InteractiveMode.prototype.run.call(fakeThis as never);
-			await vi.advanceTimersByTimeAsync(250);
+			await vi.advanceTimersByTimeAsync(0);
+			expect(prompt).toHaveBeenCalledOnce();
+			await vi.advanceTimersByTimeAsync(249);
+			expect(prompt).toHaveBeenCalledOnce();
+			await vi.advanceTimersByTimeAsync(1);
 			expect(prompt.mock.calls).toEqual([
 				["first", { images: undefined, streamingBehavior: "steer", queueIfBusy: true }],
 				["first", { images: undefined, streamingBehavior: "steer", queueIfBusy: true }],
@@ -2453,12 +2457,19 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		}
 	});
 
-	test("admits one deferred startup prompt before concurrent user submissions", async () => {
+	test("spaces a failed startup retry while concurrent user submissions wait", async () => {
 		vi.useFakeTimers();
 		let model: AgentConnectionModel | undefined;
+		let startupAttempts = 0;
 		const startupAdmission = createDeferred<void>();
 		const inputDone = createDeferred<void>();
-		const prompt = vi.fn((message: string) => (message === "startup" ? startupAdmission.promise : Promise.resolve()));
+		const prompt = vi.fn((message: string) => {
+			if (message !== "startup") return Promise.resolve();
+			startupAttempts++;
+			return startupAttempts === 1
+				? Promise.reject(new Error("transient admission failure"))
+				: startupAdmission.promise;
+		});
 		const submitHarness = createSubmitHandlerHarness({
 			agentConnection: {
 				prompt,
@@ -2485,12 +2496,16 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			const submissions = ["first user prompt", "second user prompt"].map((text) =>
 				fakeThis.defaultEditor.onSubmit?.(text),
 			);
-			await Promise.resolve();
-
+			await vi.advanceTimersByTimeAsync(250);
 			expect(prompt.mock.calls.map(([message]) => message)).toEqual(["startup"]);
+			await vi.advanceTimersByTimeAsync(249);
+			expect(prompt).toHaveBeenCalledOnce();
+			await vi.advanceTimersByTimeAsync(1);
+			expect(prompt.mock.calls.map(([message]) => message)).toEqual(["startup", "startup"]);
 			startupAdmission.resolve(undefined);
 			await Promise.all(submissions);
 			expect(prompt.mock.calls.map(([message]) => message)).toEqual([
+				"startup",
 				"startup",
 				"first user prompt",
 				"second user prompt",

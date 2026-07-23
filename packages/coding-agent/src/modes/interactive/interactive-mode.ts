@@ -1486,6 +1486,12 @@ export class InteractiveMode {
 		let initialPromptFailures = 0;
 		let initialPromptDelivery: Promise<void> | undefined;
 		let initialPromptRetry: ReturnType<typeof setInterval> | undefined;
+		let acceptingInitialPrompts = true;
+		const initialPromptRetryWaiters = new Set<() => void>();
+		const releaseInitialPromptRetryWaiters = () => {
+			for (const resolve of initialPromptRetryWaiters) resolve();
+			initialPromptRetryWaiters.clear();
+		};
 		const clearInitialPromptRetry = () => {
 			if (initialPromptRetry) clearInterval(initialPromptRetry);
 			initialPromptRetry = undefined;
@@ -1526,8 +1532,12 @@ export class InteractiveMode {
 			return initialPromptDelivery;
 		};
 		this.admitPendingStartupPrompts = async () => {
-			while (nextInitialPrompt < initialPrompts.length && this.getCurrentModel()) {
-				await sendInitialPrompts();
+			while (acceptingInitialPrompts && nextInitialPrompt < initialPrompts.length && this.getCurrentModel()) {
+				if (initialPromptDelivery) {
+					await initialPromptDelivery;
+				} else {
+					await new Promise<void>((resolve) => initialPromptRetryWaiters.add(resolve));
+				}
 			}
 		};
 
@@ -1588,7 +1598,9 @@ export class InteractiveMode {
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 		await sendInitialPrompts();
 		if (nextInitialPrompt < initialPrompts.length) {
-			initialPromptRetry = setInterval(() => void sendInitialPrompts(), 250);
+			initialPromptRetry = setInterval(() => {
+				void sendInitialPrompts().finally(releaseInitialPromptRetryWaiters);
+			}, 250);
 			initialPromptRetry.unref?.();
 		}
 
@@ -1597,7 +1609,9 @@ export class InteractiveMode {
 		try {
 			await this.getUserInput();
 		} finally {
+			acceptingInitialPrompts = false;
 			clearInitialPromptRetry();
+			releaseInitialPromptRetryWaiters();
 			this.admitPendingStartupPrompts = undefined;
 		}
 		return "agents_view";

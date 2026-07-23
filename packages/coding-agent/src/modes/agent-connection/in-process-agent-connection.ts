@@ -294,6 +294,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	async prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
 		await new Promise<void>((resolve, reject) => {
 			let settled = false;
+			let accepted = false;
 			const resolveOnce = () => {
 				if (!settled) {
 					settled = true;
@@ -313,13 +314,15 @@ export class InProcessAgentConnection implements AgentConnection {
 				...(options?.source ? { source: options.source } : {}),
 				preflightResult: (success) => {
 					if (success) {
+						accepted = true;
 						resolveOnce();
-					} else {
-						rejectOnce(new Error("Prompt was not accepted by the session."));
 					}
 				},
 			});
-			void prompt.then(resolveOnce, rejectOnce);
+			void prompt.then(() => {
+				if (accepted) resolveOnce();
+				else rejectOnce(new Error("Prompt was not accepted by the session."));
+			}, rejectOnce);
 		});
 	}
 
