@@ -6989,6 +6989,10 @@ export class InteractiveMode {
 			await this.showLocalSessionView();
 			return;
 		}
+		if (this.editor.getText().length > 0) {
+			this.showStatus("Send, stash, or clear your draft before opening agents");
+			return;
+		}
 		await this.returnToAgentsView();
 	}
 

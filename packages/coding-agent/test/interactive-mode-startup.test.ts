@@ -92,10 +92,30 @@ describe("InteractiveMode startup hints", () => {
 		expect(returnToAgentsView).toHaveBeenCalledOnce();
 	});
 
+	it("explains why a draft blocks the destructive agents-view handoff", async () => {
+		const returnToAgentsView = vi.fn(async () => {});
+		const showStatus = vi.fn();
+		const mode = Object.assign(
+			createMode(false, true, () => "draft prompt"),
+			{ returnToAgentsView, showStatus },
+		);
+
+		await Reflect.get(InteractiveMode.prototype, "requestAgentsView").call(mode);
+
+		expect(returnToAgentsView).not.toHaveBeenCalled();
+		expect(showStatus).toHaveBeenCalledWith("Send, stash, or clear your draft before opening agents");
+	});
+
 	it("uses the shared session view for non-daemon chats", async () => {
 		const returnToAgentsView = vi.fn(async () => {});
 		const showLocalSessionView = vi.fn(async () => "exit");
-		const mode = Object.assign(createMode(), { returnToAgentsView, showLocalSessionView });
+		const mode = Object.assign(
+			createMode(false, false, () => "draft prompt"),
+			{
+				returnToAgentsView,
+				showLocalSessionView,
+			},
+		);
 
 		await Reflect.get(InteractiveMode.prototype, "requestAgentsView").call(mode);
 

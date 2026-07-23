@@ -147,6 +147,32 @@ describe("#502 unified session view regressions", () => {
 		privateMethod<(this: typeof harness) => void>("resolveMissingSelectionAnchor").call(harness);
 		expect(syncSelectedRowState).toHaveBeenCalledOnce();
 	});
+	test("adapter rename uses the captured row after refresh removes it", async () => {
+		const captured = summary("captured");
+		const rename = vi.fn(async () => {});
+		const requireClient = vi.fn(() => {
+			throw new Error("daemon client must not be used");
+		});
+		const harness = {
+			renameTarget: { activeSessionId: captured.activeSessionId, summary: captured },
+			rows: [],
+			options: { adapter: { rename } },
+			exitRenameMode: vi.fn(),
+			setStatusMessage: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+			refreshSavedSessions: vi.fn(async () => true),
+			requireClient,
+		};
+
+		await privateMethod<(this: typeof harness, value: string) => Promise<void>>("confirmRename").call(
+			harness,
+			"Renamed",
+		);
+
+		expect(rename).toHaveBeenCalledWith(captured, "Renamed");
+		expect(requireClient).not.toHaveBeenCalled();
+	});
+
 	test("saved-only delete confirmation remains in the inactive catalog", () => {
 		const savedOnly = { ...summary("saved"), lifecycle: "archived" as const, activeSessionId: undefined };
 		const harness = {

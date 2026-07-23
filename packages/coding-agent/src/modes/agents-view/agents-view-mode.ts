@@ -460,7 +460,7 @@ export class AgentsViewMode implements Component, Focusable {
 	private replyHeaderTime = "";
 	private pendingDeleteAgent: PendingDeleteAgent | undefined;
 	private pendingKillSubagent: PendingKillSubagent | undefined;
-	private renameTarget: { activeSessionId?: string; sessionFile?: string; identity: string } | undefined;
+	private renameTarget: { activeSessionId?: string; sessionFile?: string; summary: SessionSummary } | undefined;
 	private actionModeSearchQuery: string | undefined;
 	private readonly inactiveAgentIdentities = new Set<string>();
 	private statusMessage: string | undefined;
@@ -1239,7 +1239,7 @@ export class AgentsViewMode implements Component, Focusable {
 		this.actionModeSearchQuery = this.editor.getText();
 		this.pendingDeleteAgent = undefined;
 		this.pendingKillSubagent = undefined;
-		this.renameTarget = { activeSessionId, sessionFile, identity: getSummaryIdentity(row.summary) };
+		this.renameTarget = { activeSessionId, sessionFile, summary: row.summary };
 		this.editor.setPlaceholder("Name this agent session");
 		this.editor.setText(row.summary.sessionName ?? "");
 		this.ui.requestRender();
@@ -1267,11 +1267,8 @@ export class AgentsViewMode implements Component, Focusable {
 		this.exitRenameMode();
 		this.setStatusMessage("Renaming agent...");
 		try {
-			const summary = this.rows.find(
-				(row) => row.kind === "agent" && getSummaryIdentity(row.summary) === target.identity,
-			)?.summary;
-			if (this.options.adapter && summary) {
-				await this.options.adapter.rename(summary, name);
+			if (this.options.adapter) {
+				await this.options.adapter.rename(target.summary, name);
 			} else if (target.activeSessionId) {
 				requireDaemonData(
 					await this.requireClient().request({ type: "rename", activeSessionId: target.activeSessionId, name }),

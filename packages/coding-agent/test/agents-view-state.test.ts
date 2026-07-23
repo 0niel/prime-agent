@@ -890,16 +890,33 @@ describe("agents view state", () => {
 		expect(formatHeartbeatBadge(record?.heartbeat)).toBe("♥ 1");
 	});
 
-	test("keeps saved-only sessions inactive and preserves identity when a runtime appears", () => {
+	test("preserves live identity and row state when saved metadata adds a file alias", () => {
 		const saved = makeSessionInfo({ path: "/tmp/saved.jsonl", id: "saved", allMessagesText: "transcript" });
+		const parent = makeSummary({
+			id: "parent",
+			activeSessionId: "parent",
+			sessionId: "saved",
+			sessionFile: undefined,
+		});
+		const child = makeSummary({
+			id: "child",
+			activeSessionId: "child",
+			sessionId: "child-session",
+			runtimeKind: "subagent",
+			parentActiveSessionId: "parent",
+			spawnCode: "run_subagent()",
+		});
 		const [inactive] = reconcileUnifiedSessions([], [saved]);
-		const [resident] = reconcileUnifiedSessions(
-			[makeSummary({ sessionId: "saved", sessionFile: "/tmp/saved.jsonl" })],
-			[saved],
-		);
-		expect(inactive?.section).toBe("inactive");
-		expect(resident?.section).toBe("idle");
-		expect(resident?.identity).toBe(inactive?.identity);
+		const [live] = reconcileUnifiedSessions([parent, child], []);
+		const enrichedRecords = reconcileUnifiedSessions([parent, child], [saved]);
+		const enriched = enrichedRecords.find((record) => record.daemon?.sessionId === parent.sessionId);
+		const expanded = buildAgentsViewRows(enrichedRecords, new Set([live!.identity]), new Set([live!.identity]));
+
+		expect(inactive).toMatchObject({ identity: "file:/tmp/saved.jsonl", section: "inactive" });
+		expect(enriched).toMatchObject({ identity: live?.identity, section: "idle", saved });
+		expect(enriched?.identityAliases).toContain("file:/tmp/saved.jsonl");
+		expect(expanded.map((row) => row.kind)).toContain("subagent-code");
+		expect(expanded.some((row) => row.kind === "subagent" && row.summary.sessionId === "child-session")).toBe(true);
 	});
 
 	test("aggregates active descendant heartbeats once and formats the soonest run", () => {

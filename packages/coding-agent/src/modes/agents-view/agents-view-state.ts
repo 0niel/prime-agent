@@ -186,8 +186,6 @@ export function reconcileUnifiedSessions(
 		if (record) {
 			record.saved = saved;
 			record.identityAliases = [...new Set([...record.identityAliases, ...aliases])];
-			// Canonical durable path is the preferred identity once known.
-			record.identity = aliases[0]!;
 			record.searchableText = createUnifiedSearchableText(record.daemon, saved);
 			for (const alias of aliases) recordByAlias.set(alias, record);
 			continue;
