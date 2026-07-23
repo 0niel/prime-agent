@@ -583,6 +583,7 @@ export class DaemonSupervisor {
 	private shuttingDown = false;
 	private updateRestartPreparing = false;
 	private updateRestartPrepareInFlight = false;
+	private updateRestartDrainAdmissionOpen = false;
 	private activeMutations = 0;
 	private readonly mutationDrainWaiters = new Set<() => void>();
 	private readonly clients = new Set<DaemonSocketClient>();
@@ -1116,7 +1117,7 @@ export class DaemonSupervisor {
 			this.updateRestartPreparing &&
 			isDaemonMutatingCommand(command) &&
 			(command.type !== "shutdown" || this.updateRestartPrepareInFlight) &&
-			!(this.updateRestartPrepareInFlight && UPDATE_RESTART_DRAIN_COMMANDS.has(command.type))
+			!(this.updateRestartDrainAdmissionOpen && UPDATE_RESTART_DRAIN_COMMANDS.has(command.type))
 		) {
 			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
 			return;
@@ -1188,7 +1189,7 @@ export class DaemonSupervisor {
 			command.type !== "ack_result" &&
 			isDaemonMutatingCommand(command) &&
 			(command.type !== "shutdown" || this.updateRestartPrepareInFlight) &&
-			!(this.updateRestartPrepareInFlight && UPDATE_RESTART_DRAIN_COMMANDS.has(command.type))
+			!(this.updateRestartDrainAdmissionOpen && UPDATE_RESTART_DRAIN_COMMANDS.has(command.type))
 		) {
 			throw new Error("Daemon is preparing an update restart");
 		}
@@ -3788,13 +3789,16 @@ export class DaemonSupervisor {
 		if (this.updateRestartPreparing) throw new Error("Daemon is already preparing an update restart");
 		this.updateRestartPreparing = true;
 		this.updateRestartPrepareInFlight = true;
+		this.updateRestartDrainAdmissionOpen = true;
 		try {
 			const abort = AbortSignal.timeout(UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS);
 			await this.waitForMutationDrain(1, abort);
+			this.updateRestartDrainAdmissionOpen = false;
 			const manifest = await this.prepareUpdateRestartFenced();
 			this.updateRestartPrepareInFlight = false;
 			return manifest;
 		} catch (error) {
+			this.updateRestartDrainAdmissionOpen = false;
 			this.updateRestartPrepareInFlight = false;
 			this.updateRestartPreparing = false;
 			throw error;

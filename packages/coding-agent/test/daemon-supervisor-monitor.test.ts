@@ -5,6 +5,8 @@ import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
+import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import type { DaemonAttachResult } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
@@ -1593,6 +1595,33 @@ describe("daemon worker supervisor monitoring", () => {
 		await expect(supervisor.prepareUpdateRestartFenced()).resolves.toMatchObject({
 			discardedActiveSessionIds: ["root"],
 		});
+	});
+
+	it("limits abort admission to mutation drain", async () => {
+		const root = mkdtempSync(`/tmp/prime-update-drain-${process.pid}-`);
+		const socketPath = join(root, "supervisor.sock");
+		const supervisor = new DaemonSupervisor(socketPath, {
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir: join(root, "workers"),
+		});
+		const client = new DaemonClient(socketPath);
+		vi.spyOn(DaemonCatalogClient.prototype, "start").mockResolvedValue();
+		try {
+			await supervisor.start();
+			await client.connect();
+			const prepare = client.request({ type: "prepare_update_restart" });
+			expect(await client.request({ type: "abort", activeSessionId: "missing" })).not.toMatchObject({
+				error: "Daemon is preparing an update restart",
+			});
+			await prepare;
+			await expect(client.request({ type: "abort", activeSessionId: "missing" })).resolves.toMatchObject({
+				error: "Daemon is preparing an update restart",
+			});
+		} finally {
+			client.close();
+			await Reflect.apply(Reflect.get(supervisor, "cleanupSupervisorResources"), supervisor, []);
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("rejects update prepare when a resident worker is recovering or disconnected", async () => {
