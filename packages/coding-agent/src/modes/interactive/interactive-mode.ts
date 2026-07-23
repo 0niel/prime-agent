@@ -839,7 +839,11 @@ export function createLocalSessionViewAdapter(
 		loadSavedSessions: (callbacks) => connection.listSavedSessions("all", callbacks),
 		getCurrentSession: async () => toSummary(await connection.getState()),
 		open: async (summary) => {
-			if (!summary.sessionFile) throw new Error("Cannot resume a session without a saved session file");
+			if (!summary.sessionFile) {
+				const current = await connection.getState();
+				if (summary.sessionId === current.sessionId) return { cancelled: false };
+				throw new Error("Cannot resume a session without a saved session file");
+			}
 			return open(summary.sessionFile);
 		},
 		rename: async (summary, name) => {

@@ -138,6 +138,7 @@ function createUnifiedSearchableText(
 		saved?.name,
 		saved?.firstMessage,
 		saved?.allMessagesText,
+		saved?.agentStatus?.summary,
 		saved?.cwd,
 		saved?.path,
 		saved?.parentSessionPath,
@@ -166,7 +167,7 @@ export function reconcileUnifiedSessions(
 			heartbeatByActiveId.get(daemon.activeSessionId ?? daemon.id) ??
 			(daemon.hasActiveHeartbeat ? { activeCount: 1 } : undefined);
 		const record: UnifiedSessionRecord = {
-			daemon,
+			daemon: heartbeat && !daemon.hasActiveHeartbeat ? { ...daemon, hasActiveHeartbeat: true } : daemon,
 			identity: aliases[0]!,
 			identityAliases: aliases,
 			section: "idle",
@@ -436,11 +437,7 @@ export function buildAgentsViewRows(
 			continue;
 		}
 		parentByChild.set(row, parent);
-		if (
-			row.summary.activity === "working" ||
-			row.summary.hasActiveHeartbeat ||
-			(row.heartbeat?.activeCount ?? 0) > 0
-		) {
+		if (row.section === "running") {
 			parent.runningSubagentCount += 1;
 		}
 		const siblings = childrenByParent.get(parent) ?? [];
@@ -635,9 +632,9 @@ function buildRowKeyMap(rows: readonly MutableAgentsViewRow[]): Map<string, Muta
 
 function getSummaryKeys(summary: SessionSummary): string[] {
 	return [
-		summary.activeSessionId ? `active:${summary.activeSessionId}` : undefined,
+		`active:${summary.activeSessionId ?? summary.id}`,
 		`session:${summary.sessionId}`,
-		summary.sessionFile ? `file:${summary.sessionFile}` : undefined,
+		summary.sessionFile ? fileIdentity(summary.sessionFile) : undefined,
 	].filter((key): key is string => key !== undefined);
 }
 
@@ -648,7 +645,7 @@ function findParentRow(
 	const keys = [
 		summary.parentActiveSessionId ? `active:${summary.parentActiveSessionId}` : undefined,
 		summary.parentSessionId ? `session:${summary.parentSessionId}` : undefined,
-		summary.parentSessionPath ? `file:${summary.parentSessionPath}` : undefined,
+		summary.parentSessionPath ? fileIdentity(summary.parentSessionPath) : undefined,
 	].filter((key): key is string => key !== undefined);
 	for (const key of keys) {
 		const row = rowsByKey.get(key);

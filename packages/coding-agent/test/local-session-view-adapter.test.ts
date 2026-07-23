@@ -63,5 +63,9 @@ describe("local session view adapter", () => {
 		expect(connection.renameSavedSession).toHaveBeenCalledWith(saved.path, "Renamed");
 		await adapter.delete({ ...current!, activeSessionId: undefined, sessionFile: saved.path });
 		expect(connection.deleteSavedSession).toHaveBeenCalledWith(saved.path);
+
+		state.sessionFile = undefined;
+		await expect(adapter.open((await adapter.getCurrentSession())!)).resolves.toEqual({ cancelled: false });
+		expect(open).toHaveBeenCalledTimes(1);
 	});
 });

@@ -33,6 +33,25 @@ import {
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
 import type { Theme } from "../src/modes/interactive/theme/theme.js";
 
+function heartbeat(id: string, nextRunAt?: string, activeSessionId = "child") {
+	return {
+		job: {
+			id,
+			status: "active" as const,
+			activeSessionId,
+			sessionId: `${activeSessionId}-session`,
+			sessionFile: `/tmp/${activeSessionId}.jsonl`,
+			cwd: "/tmp",
+			prompt: "tick",
+			schedule: { kind: "interval" as const, expression: "5m" },
+			createdAt: "2026-01-01T00:00:00Z",
+			updatedAt: "2026-01-01T00:00:00Z",
+			...(nextRunAt ? { nextRunAt } : {}),
+			runCount: 0,
+		},
+	};
+}
+
 describe("agents view state", () => {
 	test("classifies active daemon sessions into coarse fleet sections", () => {
 		expect(classifyAgentsViewSession(makeSummary({ isStreaming: true, activity: "working" }))).toBe("running");
@@ -280,6 +299,13 @@ describe("agents view state", () => {
 		const rows = buildAgentsViewRows([
 			...heartbeatChildren,
 			makeSummary({
+				id: "busy-child",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "parent-active",
+				activity: "idle",
+				isRunningTools: true,
+			}),
+			makeSummary({
 				id: "parent-active",
 				activeSessionId: "parent-active",
 				sessionId: "parent-session",
@@ -289,11 +315,11 @@ describe("agents view state", () => {
 			}),
 		]);
 
-		expect(rows[0]).toMatchObject({ section: "running", runningSubagentCount: 10 });
+		expect(rows[0]).toMatchObject({ section: "running", runningSubagentCount: 11 });
 		expect(rows[1]).toMatchObject({
 			kind: "subagent-summary",
-			title: "10 subagents running · 10 heartbeats active",
-			runningSubagentCount: 10,
+			title: "11 subagents running · 10 heartbeats active",
+			runningSubagentCount: 11,
 		});
 	});
 
@@ -791,6 +817,7 @@ describe("agents view state", () => {
 			id: "merged-session",
 			name: "Durable name",
 			allMessagesText: "a uniquely searchable transcript",
+			agentStatus: { summary: "Investigated the lunar regression", basedOnMessageCount: 1 },
 		});
 		const daemon = makeSummary({
 			id: "runtime",
@@ -803,6 +830,7 @@ describe("agents view state", () => {
 		const [record] = reconcileUnifiedSessions([daemon], [saved]);
 		expect(record).toMatchObject({ daemon, saved, identity: "file:/tmp/sessions/merged.jsonl", section: "idle" });
 		expect(record?.searchableText).toContain("uniquely searchable transcript");
+		expect(record?.searchableText).toContain("lunar regression");
 		expect(buildAgentsViewRows([record!])[0]).toMatchObject({
 			title: "Live name",
 			record,
@@ -820,6 +848,37 @@ describe("agents view state", () => {
 			const saved = makeSessionInfo({ id: "same", path: real });
 			expect(reconcileUnifiedSessions([daemon], [saved])).toHaveLength(1);
 			expect(resolveAgentsViewActiveSummaryForPath(real, [daemon])).toBe(daemon);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("uses canonical path and fallback active-id keys for heartbeat ancestry", () => {
+		const root = mkdtempSync(join(tmpdir(), "session-view-parent-alias-"));
+		try {
+			const path = join(root, "parent.jsonl");
+			const alias = join(root, "alias.jsonl");
+			writeFileSync(path, "");
+			symlinkSync(path, alias);
+			const summaries = [
+				makeSummary({ id: "root", activeSessionId: undefined, sessionFile: path }),
+				makeSummary({
+					id: "parent",
+					activeSessionId: undefined,
+					parentSessionPath: alias,
+					runtimeKind: "subagent",
+				}),
+				makeSummary({
+					id: "child",
+					activeSessionId: undefined,
+					parentActiveSessionId: "parent",
+					runtimeKind: "subagent",
+				}),
+			];
+			const aggregates = aggregateSessionHeartbeats(summaries, [heartbeat("job", undefined, "child")]);
+			expect(["root", "parent", "child"].map((id) => aggregates.get(id))).toEqual(
+				Array.from({ length: 3 }, () => ({ activeCount: 1 })),
+			);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
@@ -852,22 +911,7 @@ describe("agents view state", () => {
 			runtimeKind: "subagent",
 			parentActiveSessionId: "parent",
 		});
-		const heartbeat = (id: string, nextRunAt?: string) => ({
-			job: {
-				id,
-				status: "active" as const,
-				activeSessionId: "child",
-				sessionId: "child-session",
-				sessionFile: "/tmp/child.jsonl",
-				cwd: "/tmp",
-				prompt: "tick",
-				schedule: { kind: "interval" as const, expression: "5m" },
-				createdAt: "2026-01-01T00:00:00Z",
-				updatedAt: "2026-01-01T00:00:00Z",
-				...(nextRunAt ? { nextRunAt } : {}),
-				runCount: 0,
-			},
-		});
+
 		const aggregates = aggregateSessionHeartbeats(
 			[parent, child],
 			[heartbeat("one", "2026-01-01T00:10:00Z"), heartbeat("two", "2026-01-01T00:05:00Z")],

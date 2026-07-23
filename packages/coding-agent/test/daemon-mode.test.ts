@@ -3137,10 +3137,15 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("deduplicates concurrent creates for the same session file", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-race-"));
+	it.each([
+		["explicit session file", (sessionPath: string) => ({ type: "create" as const, sessionPath })],
+		["continue recent", (_sessionPath: string) => ({ type: "create" as const, continueRecent: true })],
+	])("deduplicates concurrent creates after resolving the %s", async (_label, commandFor) => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-open-race-"));
 		try {
-			const sessionPath = join(tempDir, "session.jsonl");
+			const recent = SessionManager.create(tempDir, tempDir);
+			const sessionPath = recent.materializeSessionFile();
+			recent.appendSessionInfo("Recent");
 			let releaseCreate: () => void = () => {};
 			const createBarrier = new Promise<void>((resolve) => {
 				releaseCreate = resolve;
@@ -3159,11 +3164,7 @@ describe("daemon mode helpers", () => {
 				};
 			});
 			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
-				defaultSessionConfig: {
-					agentDir: tempDir,
-					cwd: tempDir,
-					sessionDir: tempDir,
-				},
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: tempDir },
 				createRuntime,
 			});
 			const create = (
@@ -3172,17 +3173,16 @@ describe("daemon mode helpers", () => {
 				}
 			).createRuntime.bind(daemon);
 
-			const first = create({ type: "create", sessionPath });
-			const second = create({ type: "create", sessionPath });
+			const first = create(commandFor(sessionPath));
+			const second = create(commandFor(sessionPath));
 			for (let attempt = 0; attempt < 20 && createRuntime.mock.calls.length === 0; attempt++) {
-				await Promise.resolve();
+				await new Promise<void>((resolve) => setImmediate(resolve));
 			}
-
 			expect(createRuntime).toHaveBeenCalledTimes(1);
 			releaseCreate();
 			const [firstState, secondState] = await Promise.all([first, second]);
-
 			expect(secondState).toBe(firstState);
+			expect(firstState.runtime.session.sessionFile).toBe(sessionPath);
 			expect(createRuntime).toHaveBeenCalledTimes(1);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });

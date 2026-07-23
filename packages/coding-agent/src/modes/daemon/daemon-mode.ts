@@ -1282,6 +1282,11 @@ export class AgentDaemon {
 			return createState();
 		}
 		const openedSessionKey = resolve(sessionFile);
+		if (this.openingSessions.has(openedSessionKey)) {
+			sessionLease?.release();
+			releaseOpenReservation();
+			return this.createRuntime({ ...command, sessionPath: sessionFile }, runtimeOpenGuard);
+		}
 		const opening = Promise.resolve().then(createState);
 		this.openingSessions.set(openedSessionKey, opening);
 		releaseOpenReservation();

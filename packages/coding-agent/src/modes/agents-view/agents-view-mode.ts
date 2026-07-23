@@ -138,6 +138,7 @@ export type AgentsViewPersistentState = {
 	startupNoticesPromise?: Promise<StartupNotices>;
 	query?: string;
 	savedSessions?: AgentConnectionSavedSessionInfo[];
+	lastSuccessfulSavedSessions?: AgentConnectionSavedSessionInfo[];
 	savedCatalogGeneration?: number;
 	heartbeats?: AgentConnectionHeartbeat[];
 };
@@ -377,7 +378,7 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 				const interactiveResult = await interactiveMode.run();
 				const source = interactiveResult.source;
 				persistentState.selectedRowIdentity = source.sessionFile
-					? `file:${resolvePath(source.sessionFile)}`
+					? `file:${resolvePath(canonicalizePath(source.sessionFile))}`
 					: source.activeSessionId
 						? `active:${source.activeSessionId}`
 						: `session:${source.sessionId}`;
@@ -436,10 +437,14 @@ export class AgentsViewMode implements Component, Focusable {
 	private lastListedSummaries: SessionSummary[] = [];
 	private lastVisibleSummaries: SessionSummary[] = [];
 	private savedSessions: AgentConnectionSavedSessionInfo[] = [];
+	private lastSuccessfulSavedSessions: AgentConnectionSavedSessionInfo[] = [];
 	private heartbeats: AgentConnectionHeartbeat[] = [];
 	private unifiedRecords: UnifiedSessionRecord[] = [];
 	private savedCatalogGeneration = 0;
 	private liveCatalogGeneration = 0;
+	private heartbeatCatalogGeneration = 0;
+	private liveCatalogRefreshPending = false;
+	private savedCatalogRefreshPending = false;
 	private expandedSubagentParents = new Set<string>();
 	// Agent row identities whose full spawn program is currently shown.
 	// The program key toggles each agent shown ↔ hidden.
@@ -448,6 +453,7 @@ export class AgentsViewMode implements Component, Focusable {
 	private selectedRowIdentity: string | undefined;
 	private selectedActiveSessionId: string | undefined;
 	private selectedSessionKey: AgentsViewSelectionKey | undefined;
+	private selectionAnchorPending = false;
 	private replyActiveSessionId: string | undefined;
 	private replyLastAssistantText: string | undefined;
 	private replyLastAssistantTextLoading = false;
@@ -471,6 +477,7 @@ export class AgentsViewMode implements Component, Focusable {
 		this.selectedSessionKey = persistentState.selectedSessionKey;
 		this.selectedActiveSessionId = persistentState.selectedSessionKey?.activeSessionId;
 		this.savedSessions = persistentState.savedSessions ?? [];
+		this.lastSuccessfulSavedSessions = persistentState.lastSuccessfulSavedSessions ?? this.savedSessions;
 		this.heartbeats = persistentState.heartbeats ?? [];
 		this.savedCatalogGeneration = persistentState.savedCatalogGeneration ?? 0;
 		this.keybindings = KeybindingsManager.create();
@@ -624,7 +631,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.cycleProgramForSelected();
 			return;
 		}
-		if (this.keybindings.matches(data, "app.agents.open")) {
+		if (!this.replyActiveSessionId && this.keybindings.matches(data, "app.agents.open")) {
 			if (this.editor.getText().length === 0 || this.isSearchCursorAtEnd()) {
 				this.openSelected();
 				return;
@@ -1014,6 +1021,10 @@ export class AgentsViewMode implements Component, Focusable {
 	private openSelected(): void {
 		const row = this.rows[this.selectedIndex];
 		if (!row?.selectable || this.isPendingDeleteRow(row)) {
+			return;
+		}
+		if (this.selectionAnchorPending) {
+			this.setStatusMessage("Waiting for the selected session to load");
 			return;
 		}
 		if (row.kind === "subagent-summary") {
@@ -1578,38 +1589,40 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private async refreshSessions(options: { preserveStatusOnError?: boolean } = {}): Promise<boolean> {
-		if (this.reconnectPromise || this.daemonShutdownReceived) {
-			return false;
-		}
-		if (this.options.adapter) {
-			try {
+		if (this.reconnectPromise || this.daemonShutdownReceived) return false;
+		const generation = ++this.liveCatalogGeneration;
+		this.liveCatalogRefreshPending = true;
+		try {
+			if (this.options.adapter) {
 				const current = await this.options.adapter.getCurrentSession();
+				if (generation !== this.liveCatalogGeneration) return false;
 				this.applySessionList(current ? [current] : []);
 				return true;
+			}
+			const client = this.requireClient();
+			try {
+				const response = await client.request(createAgentsViewListCommand());
+				if (generation !== this.liveCatalogGeneration) return false;
+				this.applySessionList(expectSessionList(requireDaemonData(response)));
+				return true;
 			} catch (error) {
-				if (!options.preserveStatusOnError)
-					this.setStatusMessage(formatError("Failed to refresh current session", error));
+				if (!options.preserveStatusOnError && !this.reconnectPromise) {
+					if (client.isConnected) this.setStatusMessage(formatError("Failed to refresh agents", error));
+					else this.startClientReconnect(client, error);
+				}
 				return false;
 			}
-		}
-		const client = this.requireClient();
-		const generation = ++this.liveCatalogGeneration;
-		try {
-			const response = await client.request(createAgentsViewListCommand());
-			if (generation !== this.liveCatalogGeneration) return false;
-			const data = requireDaemonData(response);
-			this.applySessionList(expectSessionList(data));
-			return true;
 		} catch (error) {
-			if (!options.preserveStatusOnError && !this.reconnectPromise) {
-				if (client.isConnected) {
-					this.setStatusMessage(formatError("Failed to refresh agents", error));
-				} else {
-					this.startClientReconnect(client, error);
-				}
+			if (generation === this.liveCatalogGeneration && !options.preserveStatusOnError) {
+				this.setStatusMessage(formatError("Failed to refresh current session", error));
+			}
+			return false;
+		} finally {
+			if (generation === this.liveCatalogGeneration) {
+				this.liveCatalogRefreshPending = false;
+				this.resolveMissingSelectionAnchor();
 			}
 		}
-		return false;
 	}
 
 	private applySessionList(sessions: SessionSummary[]): void {
@@ -1637,12 +1650,16 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.reconnectPromise || this.daemonShutdownReceived) return false;
 		const generation = ++this.savedCatalogGeneration;
 		this.persistentState.savedCatalogGeneration = generation;
-		const discovered = new Map<string, AgentConnectionSavedSessionInfo>();
+		this.savedCatalogRefreshPending = true;
+		const successfulSessions = this.lastSuccessfulSavedSessions;
+		const progressiveSessions = new Map(
+			successfulSessions.map((session) => [resolvePath(canonicalizePath(session.path)), session]),
+		);
 		try {
 			const onSession = (session: AgentConnectionSavedSessionInfo) => {
 				if (generation !== this.savedCatalogGeneration) return;
-				discovered.set(resolvePath(canonicalizePath(session.path)), session);
-				this.savedSessions = [...discovered.values()];
+				progressiveSessions.set(resolvePath(canonicalizePath(session.path)), session);
+				this.savedSessions = [...progressiveSessions.values()];
 				this.persistentState.savedSessions = this.savedSessions;
 				this.reconcileCatalogs();
 			};
@@ -1653,29 +1670,46 @@ export class AgentsViewMode implements Component, Focusable {
 					});
 			if (generation !== this.savedCatalogGeneration) return false;
 			this.savedSessions = sessions;
+			this.lastSuccessfulSavedSessions = sessions;
+			this.persistentState.lastSuccessfulSavedSessions = sessions;
 			this.persistentState.savedSessions = sessions;
 			this.reconcileCatalogs();
 			return true;
 		} catch (error) {
-			if (generation === this.savedCatalogGeneration && !options.preserveStatusOnError) {
-				this.setStatusMessage(formatError("Failed to load saved sessions", error));
+			if (generation === this.savedCatalogGeneration) {
+				this.savedSessions = successfulSessions;
+				this.persistentState.savedSessions = successfulSessions;
+				this.reconcileCatalogs();
+				if (!options.preserveStatusOnError) {
+					this.setStatusMessage(formatError("Failed to load saved sessions", error));
+				}
 			}
 			return false;
+		} finally {
+			if (generation === this.savedCatalogGeneration) {
+				this.savedCatalogRefreshPending = false;
+				this.resolveMissingSelectionAnchor();
+			}
 		}
 	}
 
 	private async refreshHeartbeats(options: { duringReconnect?: boolean } = {}): Promise<void> {
 		if ((!options.duringReconnect && this.reconnectPromise) || this.daemonShutdownReceived) return;
+		const generation = ++this.heartbeatCatalogGeneration;
 		if (this.options.adapter) {
 			this.heartbeats = [];
 			return;
 		}
 		try {
-			this.heartbeats = await listDaemonHeartbeats(this.requireClient());
-			this.persistentState.heartbeats = this.heartbeats;
+			const heartbeats = await listDaemonHeartbeats(this.requireClient());
+			if (generation !== this.heartbeatCatalogGeneration) return;
+			this.heartbeats = heartbeats;
+			this.persistentState.heartbeats = heartbeats;
 			this.reconcileCatalogs();
 		} catch (error) {
-			if (!this.reconnectPromise) this.setStatusMessage(formatError("Failed to refresh heartbeats", error));
+			if (generation === this.heartbeatCatalogGeneration && !this.reconnectPromise) {
+				this.setStatusMessage(formatError("Failed to refresh heartbeats", error));
+			}
 		}
 	}
 
@@ -1698,6 +1732,13 @@ export class AgentsViewMode implements Component, Focusable {
 		return replaced ? merged : [...merged, pending.summary];
 	}
 
+	private resolveMissingSelectionAnchor(): void {
+		if (!this.selectionAnchorPending || this.liveCatalogRefreshPending || this.savedCatalogRefreshPending) {
+			return;
+		}
+		this.syncSelectedRowState();
+	}
+
 	private restoreSelection(): void {
 		if (this.rows.length === 0) {
 			this.selectedIndex = 0;
@@ -1715,6 +1756,12 @@ export class AgentsViewMode implements Component, Focusable {
 			this.syncSelectedRowState();
 			return;
 		}
+		this.selectionAnchorPending = Boolean(
+			this.selectedRowIdentity ??
+				this.persistentState.selectedRowIdentity ??
+				this.selectedSessionKey ??
+				this.persistentState.selectedSessionKey,
+		);
 		// Catalogs stream independently. Show a temporary fallback row without
 		// replacing the source-session anchor before its daemon row arrives.
 		const fallback = this.rows[this.selectedIndex];
@@ -1728,6 +1775,7 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private syncSelectedRowState(): void {
+		this.selectionAnchorPending = false;
 		const row = this.rows[this.selectedIndex];
 		this.selectedActiveSessionId = row?.selectable ? (row.summary.activeSessionId ?? row.summary.id) : undefined;
 		this.selectedRowIdentity = getSelectedRowIdentity(row);
@@ -1742,6 +1790,8 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 		this.stopped = true;
 		this.savedCatalogGeneration += 1;
+		this.liveCatalogGeneration += 1;
+		this.heartbeatCatalogGeneration += 1;
 		if (this.pollTimer) {
 			clearInterval(this.pollTimer);
 			this.pollTimer = undefined;
