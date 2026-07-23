@@ -4252,7 +4252,7 @@ export class AgentSession {
 					},
 					schedule,
 				);
-				reportPreflight(queued, wasBusy);
+				reportPreflight(queued, queued);
 				releaseAdmission();
 				if (!wasBusy && !options?.returnAfterAccepted) await this._sessionInputPump;
 				return;
@@ -5010,6 +5010,7 @@ export class AgentSession {
 						this._syncSteeringStopPending();
 					}
 
+
 				} finally {
 					admission.release();
 				}
@@ -5348,7 +5349,10 @@ export class AgentSession {
 			active.cancelled = true;
 			this._sessionInputPumpEpoch++;
 			const error = new Error("Queued prompt was cleared before delivery.");
-			for (const input of active.items) this._rejectAgentMessageDelivery(input.agentMessageId, error);
+			for (const input of active.items) {
+				this._rejectAgentMessageDelivery(input.agentMessageId, error, false);
+				this._rejectAgentMessageCompletion(input.agentMessageId, error);
+			}
 		}
 		const activeTexts = active?.items.map((message) => message.text) ?? [];
 		const steering = [

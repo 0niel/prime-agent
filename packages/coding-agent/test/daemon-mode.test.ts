@@ -5110,7 +5110,11 @@ describe("daemon mode helpers", () => {
 					settled++;
 					return value;
 				});
-			await expect(response).resolves.toMatchObject({ success: true, command: type });
+			await expect(response).resolves.toMatchObject({
+				success: true,
+				command: type,
+				...(type === "follow_up" ? { data: { queued: true } } : {}),
+			});
 			expect(settled).toBe(1);
 			expect(turnCompleted).toBe(false);
 			expect(promptUntilAccepted).toHaveBeenCalledOnce();

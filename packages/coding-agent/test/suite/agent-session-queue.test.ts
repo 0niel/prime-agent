@@ -2066,6 +2066,52 @@ prepared:${event.prompt}`,
 		expect(getUserTexts(harness)).toEqual(["normal"]);
 	});
 
+	it("clearQueue rejects completion waiters for every prompt in an active preparing batch", async () => {
+		let preparationStarted: (() => void) | undefined;
+		const waitForPreparation = new Promise<void>((resolve) => {
+			preparationStarted = resolve;
+		});
+		let releasePreparation: (() => void) | undefined;
+		const preparationGate = new Promise<void>((resolve) => {
+			releasePreparation = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async () => {
+						preparationStarted?.();
+						await preparationGate;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.session.setFollowUpMode("all");
+		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = true;
+		const firstCompletion = harness.session.promptAndWait("clear first while preparing", {
+			streamingBehavior: "followUp",
+			resumeIfIdle: true,
+		});
+		const completion = harness.session.promptAndWait("clear second while preparing", {
+			streamingBehavior: "followUp",
+			resumeIfIdle: true,
+		});
+		const firstCompletionRejection = expect(firstCompletion).rejects.toThrow("cleared before delivery");
+		const completionRejection = expect(completion).rejects.toThrow("cleared before delivery");
+		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = false;
+		await waitForPreparation;
+
+		expect(harness.session.clearQueue()).toEqual({
+			steering: [],
+			followUp: ["clear first while preparing", "clear second while preparing"],
+		});
+		releasePreparation?.();
+		await firstCompletionRejection;
+		await completionRejection;
+		await harness.session.waitForSessionInputIdle();
+		expect(getUserTexts(harness)).toEqual([]);
+	});
+
 	it("settles late agent-message delivery waiters", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -2296,6 +2342,7 @@ prepared:${event.prompt}`,
 	});
 
 	it("restores command envelopes as commands and other slash-prefixed messages literally", async () => {
+
 
 
 
@@ -2567,21 +2614,26 @@ prepared:${event.prompt}`,
 		expect(getUserTexts(harness)).toEqual(["queued", "direct"]);
 	});
 
-	it("rejects and surfaces terminal queued-prompt preparation errors", async () => {
+	it("rejects delivery and completion on terminal queued-prompt preparation errors", async () => {
 		const errors: string[] = [];
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 		await harness.session.bindExtensions({ onError: (error) => errors.push(error.error) });
 		withStreaming(harness, true);
-		await harness.session.followUp("cannot start", undefined, {
+		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_terminal");
+		const completion = harness.session.promptAndWait("cannot start", {
 			agentMessageId: "agentmsg_terminal",
+			streamingBehavior: "followUp",
 			resumeIfIdle: true,
 		});
-		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_terminal");
+		const completionRejection = expect(completion).rejects.toThrow("No API key");
+		await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toEqual(["cannot start"]));
 		withStreaming(harness, false);
+
 		await harness.session.waitForSessionInputIdle();
 
 		await expect(delivery).rejects.toThrow("No API key");
+		await completionRejection;
 		expect(harness.session.getFollowUpMessages()).toEqual([]);
 		expect(errors).toEqual([expect.stringContaining("No API key")]);
 	});
