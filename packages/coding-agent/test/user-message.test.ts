@@ -1,4 +1,4 @@
-import { clearDefaultTerminalColors, setDefaultTerminalColors } from "@earendil-works/pi-tui";
+import { clearDefaultTerminalColors, setDefaultTerminalColors, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, test } from "vitest";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
@@ -61,13 +61,36 @@ describe("UserMessageComponent", () => {
 		expect(embedded).not.toContain(theme.fg("accent", "/compact"));
 	});
 
-	test("renders long recognized command tokens across narrow wraps", () => {
+	test("wraps wide and multi-code-point command graphemes at terminal width", () => {
+		initTheme("dark");
+		const component = new UserMessageComponent("/命é令 arg **bold**", undefined, (name) => name === "命é令");
+		const lines = component.render(8);
+		const plainLines = lines.map((line) => line.replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, "").trim());
+
+		expect(lines.every((line) => visibleWidth(line) === 8)).toBe(true);
+		expect(plainLines).toEqual(["", "/命é", "令", "arg", "bold", ""]);
+	});
+
+	test("restores width-three command graphemes atomically", () => {
+		initTheme("dark");
+		const lines = new UserMessageComponent("/界ﾞx arg", undefined, (name) => name === "界ﾞx").render(8);
+		const plainLines = lines.map((line) => line.replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, "").trim());
+
+		expect(lines.every((line) => visibleWidth(line) === 8)).toBe(true);
+		expect(plainLines).toEqual(["", "/界ﾞ", "x", "arg", ""]);
+	});
+
+	test("preserves mask-like argument text across narrow wraps", () => {
 		initTheme("dark");
 		const command = "/averyveryverylongcommand";
-		const component = new UserMessageComponent(`${command} arg ¤`, undefined, (name) => name === command.slice(1));
-		const rendered = component.render(8).join("\n");
-		const plain = rendered.replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, "");
-		expect(plain.replace(/\s+/g, "")).toContain(command);
-		expect(plain.replace(/\s+/g, "")).toContain("arg¤");
+		const lines = new UserMessageComponent(
+			`${command} 界\uE000`,
+			undefined,
+			(name) => name === command.slice(1),
+		).render(8);
+		const plain = lines.join("\n").replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, "");
+
+		expect(plain.replace(/\s+/g, "")).toContain(`${command}界\uE000`);
+		expect(lines.every((line) => visibleWidth(line) === 8)).toBe(true);
 	});
 });

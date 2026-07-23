@@ -1019,8 +1019,8 @@ export class InteractiveMode {
 	private childAgentWatcher: AgentConnectionSessionWatcher | undefined;
 	private childAgentWatcherToken = 0;
 	private childAgentWatcherMessages: AgentMessage[] = [];
-	// Monotonic per-watch counter so a late-resolving getMessages can't clobber a newer one.
 	private childAgentRefreshSeq = 0;
+	private childAgentBodyBuildSeq = 0;
 	// The session key the current watcher attached with, so a later snapshot that
 	// gains the real activeSessionId can retry the attach.
 	private childAgentWatchedKey: string | undefined;
@@ -2949,7 +2949,6 @@ export class InteractiveMode {
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
 		this.replaceChildAgentInspector(snapshot.children);
-		await this.refreshCommandCatalogForCurrentSession?.();
 		await this.renderSessionContext(this.getSessionContextFromConnectionSnapshot(snapshot), {
 			clearChat: true,
 			updateFooter: true,
@@ -6241,6 +6240,7 @@ export class InteractiveMode {
 		if (!watcher || token !== this.childAgentWatcherToken) {
 			return;
 		}
+		const buildSeq = ++this.childAgentBodyBuildSeq;
 		const messages = this.childAgentWatcherMessages;
 		const toolNames = new Set<string>();
 		for (const message of messages) {
@@ -6261,8 +6261,7 @@ export class InteractiveMode {
 		);
 		const childCommands = await childCommandsPromise;
 		const childCommandNames = new Set(childCommands.map((command) => command.name));
-		// A newer refresh (or a close) may have superseded this build while awaiting defs.
-		if (token !== this.childAgentWatcherToken) {
+		if (token !== this.childAgentWatcherToken || buildSeq !== this.childAgentBodyBuildSeq) {
 			return;
 		}
 		this.childAgentDetail.setBodyComponents(
@@ -8493,7 +8492,6 @@ export class InteractiveMode {
 			if (result.cancelled) {
 				return result;
 			}
-			await this.refreshCommandCatalogForCurrentSession?.();
 			await this.renderCurrentSessionState();
 			this.showStatus("Resumed session");
 			return result;
@@ -8513,7 +8511,6 @@ export class InteractiveMode {
 				if (result.cancelled) {
 					return result;
 				}
-				await this.refreshCommandCatalogForCurrentSession?.();
 				await this.renderCurrentSessionState();
 				this.showStatus("Resumed session in current cwd");
 				return result;

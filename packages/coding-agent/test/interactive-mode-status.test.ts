@@ -1452,10 +1452,12 @@ describe("InteractiveMode connection events", () => {
 				startAssistantStreamingMessage(message);
 			}
 		});
+		const refreshCommandCatalogForCurrentSession = vi.fn(async () => {});
 		const fakeThis = {
 			sideQuestionEvent: sideQuestion,
 			activeConnectionExtensionUiRequests: extensionRequests,
 			activeBashComponent,
+			refreshCommandCatalogForCurrentSession,
 			isAgentCompacting: () => true,
 			isBashRunning: () => true,
 			streamingComponent: {},
@@ -1493,6 +1495,7 @@ describe("InteractiveMode connection events", () => {
 			(fakeThis as unknown as { renderSessionContext: ReturnType<typeof vi.fn> }).renderSessionContext,
 		).toHaveBeenCalledWith(expect.anything(), { clearChat: true, updateFooter: true });
 		expect(startAssistantStreamingMessage).toHaveBeenCalledWith(streamingMessage);
+		expect(refreshCommandCatalogForCurrentSession).not.toHaveBeenCalled();
 	});
 
 	test("finishes local bash UI when a resync proves the operation ended", async () => {
@@ -1605,6 +1608,48 @@ describe("InteractiveMode connection events", () => {
 
 		expect(fakeThis.handleEvent).not.toHaveBeenCalled();
 		expect(fakeThis.renderInitialMessages).toHaveBeenCalledOnce();
+	});
+
+	test("drops child body builds superseded by any newer caller", async () => {
+		const oldCommands = createDeferred<[]>();
+		const watcher = {
+			getCommands: vi.fn().mockReturnValueOnce(oldCommands.promise).mockResolvedValueOnce([]),
+			getToolDefinition: vi.fn(async () => undefined),
+		};
+		const setBodyComponents = vi.fn();
+		const fakeThis = {
+			childAgentWatcher: watcher,
+			childAgentWatcherToken: 1,
+			childAgentWatcherMessages: [userMessage("old", 1)],
+			childAgentBodyBuildSeq: 0,
+			childAgentDetail: { setBodyComponents },
+			ui: {},
+			getCurrentCwd: () => process.cwd(),
+			settingsManager: { getShowImages: () => true },
+			getMarkdownThemeWithSettings: () => ({}),
+			hideThinkingBlock: false,
+			hiddenThinkingLabel: "",
+			toolOutputExpanded: false,
+		};
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+		const rebuildChildAgentBody = (
+			InteractiveMode.prototype as unknown as {
+				rebuildChildAgentBody(this: typeof fakeThis, token: number): Promise<void>;
+			}
+		).rebuildChildAgentBody;
+
+		const staleBuild = rebuildChildAgentBody.call(fakeThis, 1);
+		fakeThis.childAgentWatcherMessages = [userMessage("new", 2)];
+		await rebuildChildAgentBody.call(fakeThis, 1);
+		oldCommands.resolve([]);
+		await staleBuild;
+
+		expect(setBodyComponents).toHaveBeenCalledOnce();
+		const rendered = setBodyComponents.mock.calls[0]![0].flatMap((component: Component) => component.render(40)).join(
+			"\n",
+		);
+		expect(rendered).toContain("new");
+		expect(rendered).not.toContain("old");
 	});
 });
 
@@ -2763,8 +2808,10 @@ describe("InteractiveMode model selection persistence", () => {
 describe("InteractiveMode session switch command catalog", () => {
 	test("refreshes recognized commands before replaying the switched session", async () => {
 		const renderCurrentSessionState = vi.fn(async function (this: {
+			refreshCommandCatalogForCurrentSession(): Promise<void>;
 			isRecognizedSlashCommand(name: string): boolean;
 		}) {
+			await this.refreshCommandCatalogForCurrentSession();
 			expect(this.isRecognizedSlashCommand("target-command")).toBe(true);
 			expect(this.isRecognizedSlashCommand("source-command")).toBe(false);
 		});
