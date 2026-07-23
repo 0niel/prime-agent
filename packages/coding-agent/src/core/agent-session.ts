@@ -1539,11 +1539,10 @@ export class AgentSession {
 	}
 
 	private _parseGoalSlashCommand(text: string): GoalSlashCommand | undefined {
-		if (text !== "/goal" && !text.startsWith("/goal ")) {
-			return undefined;
-		}
+		const command = parseSessionSlashCommand(text);
+		if (command?.name !== "goal") return undefined;
 
-		const rest = text.slice("/goal".length).trim();
+		const rest = command.args;
 		const normalized = rest.toLowerCase();
 		if (!rest || normalized === "status") {
 			return { kind: "status" };
@@ -1588,10 +1587,9 @@ export class AgentSession {
 	}
 
 	private _parseAutonomousSlashCommand(text: string): AutonomousSlashCommand | undefined {
-		if (text !== "/autonomous" && !text.startsWith("/autonomous ")) {
-			return undefined;
-		}
-		const rest = text.slice("/autonomous".length).trim().toLowerCase();
+		const command = parseSessionSlashCommand(text);
+		if (command?.name !== "autonomous") return undefined;
+		const rest = command.args.toLowerCase();
 		if (!rest || rest === "status") {
 			return { kind: "status" };
 		}
