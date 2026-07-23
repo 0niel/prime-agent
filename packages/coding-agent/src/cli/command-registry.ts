@@ -18,7 +18,7 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	{
 		path: ["agents"],
 		usage: "agents",
-		summary: "Open the agents view",
+		summary: "Search and open sessions",
 	},
 	{
 		path: ["list"],

@@ -427,6 +427,8 @@ export class AgentDaemon {
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly sessions = new Map<string, ActiveSessionState>();
 	private readonly openingSessions = new Map<string, Promise<ActiveSessionState>>();
+	/** Covers path resolution through publication in openingSessions, before the runtime promise exists. */
+	private readonly reservingSessionOpens = new Map<string, Promise<void>>();
 	private readonly rlmRehydrationClaims = new Map<
 		string,
 		{ parentState: ActiveSessionState; entry: PersistedRlmSubagentRegistryEntry }
@@ -1099,6 +1101,71 @@ export class AgentDaemon {
 		const sessionPath = command.sessionPath
 			? await resolveDaemonSessionPath(command.sessionPath, cwd, config.sessionDir)
 			: undefined;
+		const sessionKey = sessionPath ? resolve(sessionPath) : undefined;
+		const pending = sessionKey ? this.openingSessions.get(sessionKey) : undefined;
+		if (pending && sessionKey) {
+			// Join the in-process open before attempting the filesystem lease. The
+			// creator owns that lease until its runtime is ready.
+			let state: ActiveSessionState;
+			try {
+				state = await pending;
+			} catch (error) {
+				if (!runtimeOpenGuard && error instanceof RuntimeOpenCancelledError) {
+					if (this.openingSessions.get(sessionKey) === pending) {
+						this.openingSessions.delete(sessionKey);
+					}
+					return this.createRuntime(command);
+				}
+				throw error;
+			}
+			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
+				throw new RuntimeOpenCancelledError();
+			}
+			if (command.name) {
+				state.runtime.session.setSessionName(command.name);
+			}
+			this.adoptClientEnv(state, clientEnv);
+			this.rebindCronJobsToState(state);
+			return state;
+		}
+
+		let releaseOpenReservation = () => {};
+		if (sessionKey) {
+			const reservation = this.reservingSessionOpens.get(sessionKey);
+			if (reservation) {
+				await reservation;
+				return this.createRuntime(command, runtimeOpenGuard);
+			}
+			let release!: () => void;
+			const reserved = new Promise<void>((resolveReservation) => {
+				release = resolveReservation;
+			});
+			this.reservingSessionOpens.set(sessionKey, reserved);
+			let released = false;
+			releaseOpenReservation = () => {
+				if (released) return;
+				released = true;
+				if (this.reservingSessionOpens.get(sessionKey) === reserved) {
+					this.reservingSessionOpens.delete(sessionKey);
+				}
+				release();
+			};
+		}
+
+		const existing = sessionPath ? this.findSessionBySessionFile(sessionPath) : undefined;
+		if (existing) {
+			releaseOpenReservation();
+			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
+				throw new RuntimeOpenCancelledError();
+			}
+			if (command.name) {
+				existing.runtime.session.setSessionName(command.name);
+			}
+			this.adoptClientEnv(existing, clientEnv);
+			this.rebindCronJobsToState(existing);
+			return existing;
+		}
+
 		let sessionLease: SessionLease | undefined;
 		let sessionManager: SessionManager;
 		try {
@@ -1112,6 +1179,7 @@ export class AgentDaemon {
 						: SessionManager.create(cwd, config.sessionDir);
 		} catch (error) {
 			sessionLease?.release();
+			releaseOpenReservation();
 			throw error;
 		}
 		const createState = async (): Promise<ActiveSessionState> => {
@@ -1210,43 +1278,19 @@ export class AgentDaemon {
 
 		const sessionFile = sessionManager.getSessionFile();
 		if (!sessionFile) {
+			releaseOpenReservation();
 			return createState();
 		}
-		const sessionKey = resolve(sessionFile);
-		const pending = this.openingSessions.get(sessionKey);
-		if (pending) {
-			sessionLease?.release();
-			// Same as the reuse path above: adopt-if-absent, never overwrite the
-			// identity the racing creator's extensions already captured.
-			let state: ActiveSessionState;
-			try {
-				state = await pending;
-			} catch (error) {
-				if (!runtimeOpenGuard && error instanceof RuntimeOpenCancelledError) {
-					if (this.openingSessions.get(sessionKey) === pending) {
-						this.openingSessions.delete(sessionKey);
-					}
-					return this.createRuntime(command);
-				}
-				throw error;
-			}
-			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
-				throw new RuntimeOpenCancelledError();
-			}
-			if (command.name) {
-				state.runtime.session.setSessionName(command.name);
-			}
-			this.adoptClientEnv(state, clientEnv);
-			this.rebindCronJobsToState(state);
-			return state;
-		}
+		const openedSessionKey = resolve(sessionFile);
 		const opening = Promise.resolve().then(createState);
-		this.openingSessions.set(sessionKey, opening);
+		this.openingSessions.set(openedSessionKey, opening);
+		releaseOpenReservation();
 		try {
 			return await opening;
 		} finally {
-			if (this.openingSessions.get(sessionKey) === opening) {
-				this.openingSessions.delete(sessionKey);
+			releaseOpenReservation();
+			if (this.openingSessions.get(openedSessionKey) === opening) {
+				this.openingSessions.delete(openedSessionKey);
 			}
 		}
 	}
@@ -1885,11 +1929,13 @@ export class AgentDaemon {
 				// closeChildSessions tears it down with the parent. Errored or cancelled children
 				// would re-seed as "done", so close them immediately.
 				if (state && status === "done") {
-					await flushAgentTraceUpload(state.runtime.session.sessionManager).catch(() => undefined);
-					// Retention can decline if deletion or parent teardown won while the trace
-					// flush was in flight. Persist completion only after retention succeeds, so
-					// a late completion cannot overwrite a durable deletion tombstone.
+					// Retention can decline if deletion or parent teardown won. Persist completion
+					// only after retention succeeds, so a late completion cannot overwrite a
+					// durable deletion tombstone.
 					if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
+						// Trace sharing is best-effort telemetry. In particular, 429 retries can
+						// take minutes and must not delay the model-facing rlm.run result.
+						void flushAgentTraceUpload(state.runtime.session.sessionManager).catch(() => undefined);
 						if (runtime.session.sessionFile) {
 							const retainedModel = runtime.session.model ?? options.model;
 							this.recordRlmSubagentRegistryEntry(parentState, {

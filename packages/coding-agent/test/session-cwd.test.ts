@@ -7,7 +7,6 @@ import { SessionSelectorNotFoundError } from "../src/cli/session-resolver.js";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { getMissingSessionCwdIssue, MissingSessionCwdError } from "../src/core/session-cwd.js";
 import { SessionManager } from "../src/core/session-manager.js";
-import { SettingsManager } from "../src/core/settings-manager.js";
 import { createSessionManager } from "../src/main.js";
 
 function createTempDir(name: string): string {
@@ -99,12 +98,7 @@ describe("session cwd handling", () => {
 		writeSessionFile(sessionFile, storedCwd);
 
 		const parsed = parseArgs(["--cwd", explicitCwd, "--resume", sessionFile]);
-		const sessionManager = await createSessionManager(
-			parsed,
-			explicitCwd,
-			sessionDir,
-			SettingsManager.create(explicitCwd, agentDir),
-		);
+		const sessionManager = await createSessionManager(parsed, explicitCwd, sessionDir);
 
 		expect(sessionManager.getCwd()).toBe(explicitCwd);
 	});
@@ -116,9 +110,7 @@ describe("session cwd handling", () => {
 		cleanupPaths.push(cwd, agentDir, sessionDir);
 
 		const parsed = parseArgs(["--resume", "fix", "the", "bug"]);
-		await expect(
-			createSessionManager(parsed, cwd, sessionDir, SettingsManager.create(cwd, agentDir)),
-		).rejects.toMatchObject({
+		await expect(createSessionManager(parsed, cwd, sessionDir)).rejects.toMatchObject({
 			name: SessionSelectorNotFoundError.name,
 			selector: "fix",
 			suggestion: undefined,
@@ -151,5 +143,10 @@ describe("session cwd handling", () => {
 			}),
 		).rejects.toBeInstanceOf(MissingSessionCwdError);
 		expect(createRuntimeCalled).toBe(false);
+	});
+
+	it("preserves an explicit catalog directory for in-memory bootstrap sessions", () => {
+		const manager = SessionManager.inMemory("/tmp/project", "/tmp/sessions");
+		expect(manager.getSessionDir()).toBe("/tmp/sessions");
 	});
 });

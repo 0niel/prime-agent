@@ -16,6 +16,7 @@ import {
 	shouldEnsureDaemonBeforeActiveSessionLookup,
 	shouldEnsureInteractiveDaemonForStartup,
 	shouldOpenAgentsViewForDaemonInteractive,
+	shouldOpenProcessLocalSessionViewOnStartup,
 	shouldRejectNonInteractiveAttach,
 	shouldUseDaemonClient,
 	shouldUseDaemonClientRuntime,
@@ -60,6 +61,30 @@ describe("interactive startup routing", () => {
 				appMode: "rpc",
 				startupBenchmark: false,
 				ownedSessionWorker: true,
+			}),
+		).toBe(false);
+	});
+
+	test("opens the shared session view for process-local bare resume only", () => {
+		expect(
+			shouldOpenProcessLocalSessionViewOnStartup({
+				appMode: "interactive",
+				useDaemonInteractive: false,
+				resume: true,
+			}),
+		).toBe(true);
+		expect(
+			shouldOpenProcessLocalSessionViewOnStartup({
+				appMode: "interactive",
+				useDaemonInteractive: false,
+				resume: "session-id",
+			}),
+		).toBe(false);
+		expect(
+			shouldOpenProcessLocalSessionViewOnStartup({
+				appMode: "interactive",
+				useDaemonInteractive: true,
+				resume: true,
 			}),
 		).toBe(false);
 	});
@@ -165,7 +190,6 @@ describe("daemon-backed interactive session manager routing", () => {
 			"resume selector",
 			{ useDaemonInteractive: true, needsOnboarding: false, explicitAgentsView: true, resume: "active-1" },
 		],
-		["resume picker", { useDaemonInteractive: true, needsOnboarding: false, explicitAgentsView: true, resume: true }],
 		[
 			"continue recent",
 			{ useDaemonInteractive: true, needsOnboarding: false, explicitAgentsView: true, continue: true },
@@ -178,6 +202,16 @@ describe("daemon-backed interactive session manager routing", () => {
 
 	test.each(directAttachCases)("does not open agents view for %s", (_label, decision) => {
 		expect(shouldOpenAgentsViewForDaemonInteractive(decision)).toBe(false);
+	});
+
+	test.each([false, true])("opens the agents view for bare --resume (onboarding=%s)", (needsOnboarding) => {
+		expect(
+			shouldOpenAgentsViewForDaemonInteractive({
+				useDaemonInteractive: true,
+				needsOnboarding,
+				resume: true,
+			}),
+		).toBe(true);
 	});
 
 	test("ensures daemon is available before probing non-path session selectors", () => {
@@ -256,13 +290,16 @@ describe("daemon-backed interactive session manager routing", () => {
 	const persistentSelectionCases: Array<[string, DaemonInteractiveSessionManagerDecision]> = [
 		["active daemon attach", { hasActiveDaemonSession: true }],
 		["explicit saved session", { resume: "saved-session-id" }],
-		["resume picker", { resume: true }],
 		["continue recent", { continue: true }],
 		["fork", { fork: "source-session-id" }],
 	];
 
 	test.each(persistentSelectionCases)("keeps %s on a concrete local session manager", (_label, decision) => {
 		expect(shouldUseEphemeralSessionManagerForDaemonInteractive(decision)).toBe(false);
+	});
+
+	test("uses an ephemeral local session manager for bare --resume", () => {
+		expect(shouldUseEphemeralSessionManagerForDaemonInteractive({ resume: true })).toBe(true);
 	});
 
 	test("finds an active daemon session by resolved session file", () => {

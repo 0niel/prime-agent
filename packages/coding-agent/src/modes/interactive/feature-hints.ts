@@ -47,7 +47,7 @@ export const FEATURE_HINTS: readonly FeatureHintDefinition[] = [
 		getText: ({ getKeybinding, isResidentSession }) => {
 			if (!isResidentSession) return undefined;
 			const key = getKeybinding("app.agents.back");
-			return key ? `Hit ${key} for Agents View, where you can manage all your running agents.` : undefined;
+			return key ? `Hit ${key} for Session View: search running, idle, and inactive sessions.` : undefined;
 		},
 	},
 	{

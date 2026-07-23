@@ -2067,8 +2067,8 @@ export class SessionManager {
 	}
 
 	/** Create an in-memory session (no file persistence) */
-	static inMemory(cwd: string = process.cwd()): SessionManager {
-		return new SessionManager(cwd, "", undefined, false);
+	static inMemory(cwd: string = process.cwd(), sessionDir = ""): SessionManager {
+		return new SessionManager(cwd, sessionDir, undefined, false);
 	}
 
 	/**

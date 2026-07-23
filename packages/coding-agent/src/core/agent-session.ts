@@ -181,6 +181,7 @@ import {
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
+	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
@@ -8246,8 +8247,11 @@ export class AgentSession {
 		// cancelled runs have nothing useful to show, so dispose them now. retainFinished…
 		// disposes the child itself when it declines, so only dispose here otherwise.
 		if (status === "done") {
-			await flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
-			if (!options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
+			if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
+				// Trace sharing is best-effort telemetry. Rate-limit retries can take minutes,
+				// so it must not delay the model-facing rlm.run result.
+				void flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
+			} else {
 				runtime.session.dispose();
 			}
 		} else {

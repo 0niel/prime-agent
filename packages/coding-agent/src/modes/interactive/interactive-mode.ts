@@ -106,6 +106,8 @@ import {
 	isCompactionOutcomeMessage,
 	isSessionSlashCommandMessage,
 	isSessionSlashCommandResultMessage,
+	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
+	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
 import { resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
@@ -155,6 +157,8 @@ import type {
 	AgentConnectionToolDefinition,
 } from "../agent-connection/index.js";
 import { AgentConnectionPromptAdmissionError } from "../agent-connection/index.js";
+import { runLocalSessionView, type SessionViewAdapter } from "../agents-view/agents-view-mode.js";
+import type { SessionSummary } from "../daemon/daemon-session-list.js";
 import { getModelArgumentCompletions } from "../model-autocomplete.js";
 import {
 	checkForPackageUpdates,
@@ -202,8 +206,6 @@ import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybin
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
-import { SessionPickerScreen } from "./components/session-picker-screen.js";
-import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SideQuestionComponent } from "./components/side-question.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
@@ -804,9 +806,58 @@ export interface InteractiveModeOptions {
 	promptStashStore?: ClientPromptStashStore;
 	/** Initial stable session id used to scope prompt stash state. */
 	promptStashSessionId?: string;
+	/** Open the shared saved-session view before accepting prompts (process-local bare --resume). */
+	openSessionViewOnStartup?: boolean;
 }
 
-export type InteractiveModeRunResult = "agents_view";
+export function createLocalSessionViewAdapter(
+	connection: AgentConnection,
+	open: (sessionPath: string) => Promise<{ cancelled: boolean }>,
+): SessionViewAdapter {
+	const toSummary = (state: AgentConnectionState): SessionSummary => ({
+		id: state.activeSessionId ?? state.sessionId,
+		activeSessionId: state.activeSessionId ?? `local:${state.sessionId}`,
+		sessionId: state.sessionId,
+		sessionFile: state.sessionFile,
+		sessionName: state.sessionName,
+		cwd: state.cwd,
+		lifecycle: state.sessionFile ? "live" : "draft",
+		activity:
+			state.isStreaming || state.isCompacting || state.isBashRunning || state.pendingMessageCount > 0
+				? "working"
+				: "idle",
+		isStreaming: state.isStreaming,
+		isCompacting: state.isCompacting,
+		isBashRunning: state.isBashRunning,
+		attachedClients: 1,
+		messageCount: state.messageCount,
+		pendingMessageCount: state.pendingMessageCount,
+		summary: state.recap,
+	});
+	return {
+		kind: "local",
+		loadSavedSessions: (callbacks) => connection.listSavedSessions("all", callbacks),
+		getCurrentSession: async () => toSummary(await connection.getState()),
+		open: async (summary) => {
+			if (!summary.sessionFile) throw new Error("Cannot resume a session without a saved session file");
+			return open(summary.sessionFile);
+		},
+		rename: async (summary, name) => {
+			const current = await connection.getState();
+			if (summary.sessionId === current.sessionId) await connection.setSessionName(name);
+			else if (summary.sessionFile) await connection.renameSavedSession(summary.sessionFile, name);
+		},
+		delete: async (summary) => {
+			if (!summary.sessionFile) return { ok: false, error: "Session has no saved file" };
+			return connection.deleteSavedSession(summary.sessionFile);
+		},
+	};
+}
+
+export interface InteractiveModeRunResult {
+	type: "agents_view";
+	source: Pick<AgentConnectionState, "activeSessionId" | "sessionFile" | "sessionId" | "sessionName" | "cwd">;
+}
 
 export class InteractiveMode {
 	private static readonly EXIT_HINT_DURATION_MS = 2000;
@@ -923,6 +974,7 @@ export class InteractiveMode {
 
 	// Serializes session event handling; see subscribeToAgent
 	private sessionEventQueue: Promise<void> = Promise.resolve();
+	private sessionEventGeneration = 0;
 	private fastModeToggleQueue: Promise<void> = Promise.resolve();
 
 	// Tool execution tracking: toolCallId -> component
@@ -1477,6 +1529,12 @@ export class InteractiveMode {
 	 */
 	async run(): Promise<InteractiveModeRunResult> {
 		await this.init();
+		if (this.options.openSessionViewOnStartup) {
+			const result = await this.showLocalSessionView();
+			if (result === "exit") {
+				await this.shutdown();
+			}
+		}
 
 		// Global, environment-scoped notices (app update, extension updates, tmux setup)
 		// belong on the agents view, not in a conversation. When the agents view already
@@ -1659,8 +1717,9 @@ export class InteractiveMode {
 			() => settleStartupPrompts("admitted"),
 		);
 
-		// Enter/Alt+Enter submit directly through AgentConnection. Keep run alive
-		// until shutdown or a return to the agents view resolves the lifecycle wait.
+		// Enter/Alt+Enter submit directly through AgentConnection. Wait for the
+		// lifecycle signal exactly once; a returned editor value has already been
+		// admitted and must never be submitted again here.
 		try {
 			await this.getUserInput();
 		} finally {
@@ -1668,7 +1727,18 @@ export class InteractiveMode {
 			settleStartupPrompts("lifecycle-cancelled");
 			this.admitPendingStartupPrompts = undefined;
 		}
-		return "agents_view";
+
+		const state = this.connectionState;
+		return {
+			type: "agents_view",
+			source: {
+				activeSessionId: state?.activeSessionId,
+				sessionFile: state?.sessionFile,
+				sessionId: state?.sessionId ?? this.promptStashSessionId ?? "",
+				sessionName: state?.sessionName,
+				cwd: state?.cwd ?? this.getCurrentCwd(),
+			},
+		};
 	}
 
 	private getModelFallbackWarningAction(modelFallbackMessage: string | undefined): ModelFallbackWarningAction {
@@ -2835,6 +2905,7 @@ export class InteractiveMode {
 	private async renderCurrentSessionState(): Promise<void> {
 		this.resetCurrentSessionRenderState();
 		await this.renderInitialMessages();
+		await this.refreshConnectionQueue();
 		this.syncWorkingLoader();
 	}
 
@@ -4089,7 +4160,7 @@ export class InteractiveMode {
 			void this.showUserMessageSelector();
 		});
 		this.defaultEditor.onAction("app.session.resume", () => {
-			void this.showSessionSelector();
+			void this.requestAgentsView();
 		});
 		this.defaultEditor.onAgentsBack = () => {
 			if (!this.options.returnToAgentsView || this.editor.getText().trim()) {
@@ -4744,9 +4815,13 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
-				if (text === "/resume") {
+				if (commandName === "resume") {
 					this.editor.setText("");
-					await this.showSessionSelector();
+					if (commandArgs) {
+						this.showError("Usage: /resume");
+						return;
+					}
+					await this.requestAgentsView();
 					return;
 				}
 				if (text === "/quit") {
@@ -4942,20 +5017,29 @@ export class InteractiveMode {
 		this.unsubscribe = this.agentConnection.subscribe(async (event) => {
 			try {
 				if (event.type === "session_event") {
-					// Connection adapters dispatch without awaiting, so a handler that
-					// suspends would let later events overtake it; queue session events
-					// to keep paired events like bash_start/bash_end in emission order.
-					const run = this.sessionEventQueue.then(() => this.handleEvent(event.event));
+					// Connection adapters dispatch without awaiting, so serialize events.
+					// Replacement advances the generation before entering this queue, which
+					// prevents already-queued source events from mutating the target UI.
+					const generation = this.sessionEventGeneration;
+					const run = this.sessionEventQueue.then(() =>
+						generation === this.sessionEventGeneration ? this.handleEvent(event.event) : undefined,
+					);
 					this.sessionEventQueue = run.catch(() => {});
 					await run;
 				} else if (event.type === "session_replaced") {
-					this.resetSideQuestion();
-					this.resetExtensionUI();
-					this.applyConnectionStateSnapshot(event.state);
-					this.resetCurrentSessionRenderState();
-					await this.rebindCurrentSession();
-					await this.renderInitialMessages();
-					this.ui.requestRender();
+					const generation = ++this.sessionEventGeneration;
+					const run = this.sessionEventQueue.then(async () => {
+						if (generation !== this.sessionEventGeneration) return;
+						this.resetSideQuestion();
+						this.resetExtensionUI();
+						this.applyConnectionStateSnapshot(event.state);
+						this.resetCurrentSessionRenderState();
+						await this.rebindCurrentSession();
+						await this.renderInitialMessages();
+						this.ui.requestRender();
+					});
+					this.sessionEventQueue = run.catch(() => {});
+					await run;
 				} else if (event.type === "session_resynced") {
 					const run = this.sessionEventQueue.then(() => this.renderResyncedSession(event.snapshot));
 					this.sessionEventQueue = run.catch(() => {});
@@ -6378,28 +6462,38 @@ export class InteractiveMode {
 			}
 			case "custom": {
 				if (message.display) {
+					const reservedSessionCommand =
+						message.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||
+						message.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE;
 					const component = isSessionSlashCommandMessage(message)
 						? new SlashCommandMessageComponent(message.content)
 						: isSessionSlashCommandResultMessage(message)
 							? new SlashCommandResultMessageComponent(message)
-							: isCompactionOutcomeMessage(message)
-								? new CompactionOutcomeMessageComponent(message)
-								: message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE
-									? new MalformedCompactionOutcomeMessageComponent()
-									: isAgentSessionMessage(message)
-										? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
-										: isInjectedPromptMessage(message)
-											? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
-											: new CustomMessageComponent(
-													message,
-													this.bindLocalSessionExtensions
-														? this.getLocalSessionHost()
-																.getExtensionRunner()
-																.getMessageRenderer(message.customType)
-														: undefined,
-													this.getMarkdownThemeWithSettings(),
-												);
-					component.setExpanded(this.toolOutputExpanded);
+							: reservedSessionCommand
+								? new UserMessageComponent(
+										"[Malformed session command message]",
+										this.getMarkdownThemeWithSettings(),
+									)
+								: isCompactionOutcomeMessage(message)
+									? new CompactionOutcomeMessageComponent(message)
+									: message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE
+										? new MalformedCompactionOutcomeMessageComponent()
+										: isAgentSessionMessage(message)
+											? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
+											: isInjectedPromptMessage(message)
+												? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
+												: new CustomMessageComponent(
+														message,
+														this.bindLocalSessionExtensions
+															? this.getLocalSessionHost()
+																	.getExtensionRunner()
+																	.getMessageRenderer(message.customType)
+															: undefined,
+														this.getMarkdownThemeWithSettings(),
+													);
+					if (!(component instanceof UserMessageComponent)) {
+						component.setExpanded(this.toolOutputExpanded);
+					}
 					if (isSessionSlashCommandMessage(message) && this.chatContainer.children.length > 0) {
 						this.chatContainer.addChild(new Spacer(1));
 					}
@@ -6882,6 +6976,14 @@ export class InteractiveMode {
 		this.releasePromptStashSession();
 		this.stop({ preserveAltScreen: options.preserveAltScreen });
 		stopThemeWatcher();
+	}
+
+	private async requestAgentsView(): Promise<void> {
+		if (!this.options.returnToAgentsView) {
+			await this.showLocalSessionView();
+			return;
+		}
+		await this.returnToAgentsView();
 	}
 
 	private async returnToAgentsView(): Promise<void> {
@@ -8281,63 +8383,36 @@ export class InteractiveMode {
 		});
 	}
 
-	private async showSessionSelector(): Promise<void> {
-		let state: AgentConnectionState;
+	private async showLocalSessionView(): Promise<"exit" | "opened"> {
+		const adapter = createLocalSessionViewAdapter(this.agentConnection, (sessionPath) =>
+			this.handleResumeSession(sessionPath),
+		);
+		this.ui.stop({ preserveAltScreen: true, flushFullscreen: false });
+		let selected: SessionSummary | undefined;
 		try {
-			state = await this.agentConnection.getState();
-			this.applyConnectionStateSnapshot(state);
-		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
-			return;
-		}
-		await new Promise<void>((done) => {
-			let handle: OverlayHandle | undefined;
-			let settled = false;
-			const close = () => {
-				if (settled) {
-					return;
-				}
-				settled = true;
-				handle?.hide();
-				this.ui.requestRender();
-				done();
-			};
-			const selector = new SessionSelectorComponent(
-				(callbacks) => this.agentConnection.listSavedSessions("current", callbacks),
-				(callbacks) => this.agentConnection.listSavedSessions("all", callbacks),
-				async (sessionPath) => {
-					close();
-					await this.handleResumeSession(sessionPath);
-				},
-				() => {
-					close();
-				},
-				() => {
-					close();
-					void this.shutdown();
-				},
-				() => this.ui.requestRender(),
+			selected = await runLocalSessionView(
 				{
-					renameSession: async (sessionFilePath: string, nextName: string | undefined) => {
-						const next = (nextName ?? "").trim();
-						if (!next) return;
-						await this.agentConnection.renameSavedSession(sessionFilePath, next);
-					},
-					deleteSession: (sessionFilePath: string) => this.agentConnection.deleteSavedSession(sessionFilePath),
-					showRenameHint: true,
-					keybindings: this.keybindings,
-					frameless: true,
+					config: { cwd: this.getCurrentCwd(), sessionDir: this.connectionState?.sessionDir },
+					uiServices: this.uiServices,
+					verbose: this.options.verbose,
 				},
-
-				state.sessionFile,
+				adapter,
 			);
-			const splash = new BrandSplashHeader(
-				this.version,
-				() => this.getCurrentModelId(),
-				() => this.getCurrentCwd(),
-			);
-			handle = this.showFullPaneOverlay(new SessionPickerScreen(this.ui, splash, selector), { fullWidth: true });
-		});
+		} finally {
+			setKeybindings(this.keybindings);
+			initTheme(this.settingsManager.getTheme(), true);
+			onThemeChange(() => {
+				this.ui.invalidate();
+				this.updateEditorBorderColor();
+				this.ui.requestRender();
+			});
+			this.ui.start();
+			if (this.fullscreenEnabled) this.applyFullscreen(true);
+			this.ui.requestRender(true);
+		}
+		if (!selected) return "exit";
+		const opened = await adapter.open(selected);
+		return opened.cancelled ? "exit" : "opened";
 	}
 
 	private async handleResumeSession(

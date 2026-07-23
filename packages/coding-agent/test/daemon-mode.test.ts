@@ -7,9 +7,12 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionMessageController } from "../src/core/agent-messages.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
+import { installAgentTraceUpload } from "../src/core/agent-traces.js";
+import { AuthStorage } from "../src/core/auth-storage.js";
 import type { AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
 import { type CreateRlmSubagentRuntimeOptions, createDefaultRlmSubagentSessionName } from "../src/core/rlm-runtime.js";
 import { SessionManager } from "../src/core/session-manager.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import {
 	AgentDaemon,
@@ -290,6 +293,20 @@ describe("daemon mode helpers", () => {
 			if (!childSessionFile) {
 				throw new Error("Missing child session file");
 			}
+			let traceUploadStarted: () => void = () => {};
+			const traceStarted = new Promise<void>((resolve) => {
+				traceUploadStarted = resolve;
+			});
+			installAgentTraceUpload(childManager, {
+				authStorage: AuthStorage.inMemory({
+					"prime-agent-traces": { type: "api_key", key: "trace-key" },
+				}),
+				settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+				fetchFn: vi.fn(async () => {
+					traceUploadStarted();
+					return await new Promise<Response>(() => {});
+				}),
+			});
 
 			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
 				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir },
@@ -376,9 +393,12 @@ describe("daemon mode helpers", () => {
 			} as unknown as CreateRlmSubagentRuntimeOptions;
 
 			internals.sessions.set(childState.activeSessionId, childState);
-			await internals
+			const release = internals
 				.createSubagentRuntimeHost(parentState)
 				.releaseRlmSubagentRuntime(childState.runtime, releaseOptions, "done");
+			await expect(Promise.race([release.then(() => "released"), traceStarted.then(() => "trace")])).resolves.toBe(
+				"released",
+			);
 
 			expect(internals.cronStore.list().find((job) => job.id === heartbeat.id)).toMatchObject({
 				status: "active",

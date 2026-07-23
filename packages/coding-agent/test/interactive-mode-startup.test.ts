@@ -83,6 +83,26 @@ describe("InteractiveMode startup hints", () => {
 		expect(stripAnsi(label)).toBe("test-model • high  ? for shortcuts");
 	});
 
+	it("routes session-view requests through the existing agents-view return path", async () => {
+		const returnToAgentsView = vi.fn(async () => {});
+		const mode = Object.assign(createMode(false, true), { returnToAgentsView });
+
+		await Reflect.get(InteractiveMode.prototype, "requestAgentsView").call(mode);
+
+		expect(returnToAgentsView).toHaveBeenCalledOnce();
+	});
+
+	it("uses the shared session view for non-daemon chats", async () => {
+		const returnToAgentsView = vi.fn(async () => {});
+		const showLocalSessionView = vi.fn(async () => "exit");
+		const mode = Object.assign(createMode(), { returnToAgentsView, showLocalSessionView });
+
+		await Reflect.get(InteractiveMode.prototype, "requestAgentsView").call(mode);
+
+		expect(returnToAgentsView).not.toHaveBeenCalled();
+		expect(showLocalSessionView).toHaveBeenCalledOnce();
+	});
+
 	it("keeps the lowercase agents hint while typing", () => {
 		let editorText = "";
 		const mode = createMode(false, true, () => editorText);

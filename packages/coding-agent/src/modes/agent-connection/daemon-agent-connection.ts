@@ -39,6 +39,7 @@ import {
 	isUnknownDaemonCommandError,
 } from "../daemon/daemon-protocol.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
+import { listDaemonHeartbeats } from "../daemon/heartbeat-catalog.js";
 import {
 	deleteDaemonSavedSession,
 	listDaemonSavedSessions,
@@ -527,25 +528,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async listHeartbeats(): Promise<AgentConnectionHeartbeat[]> {
-		const hasCapability = this.client.supportsServerCapability("heartbeat_catalog");
-		if (!hasCapability && this.client.hello?.protocol.version !== 3) {
-			return [];
-		}
-		try {
-			const command = {
-				type: "heartbeats_list",
-				...(this.options.ownedSession ? { activeSessionId: this.activeSessionId } : {}),
-			} as const;
-			const data = hasCapability
-				? await this.requestData<{ heartbeats: AgentConnectionHeartbeat[] }>(command)
-				: await this.requestLegacyData<{ heartbeats: AgentConnectionHeartbeat[] }>(command);
-			return data.heartbeats;
-		} catch (error) {
-			if (isUnknownDaemonCommandError(error, "heartbeats_list")) {
-				return [];
-			}
-			throw error;
-		}
+		return listDaemonHeartbeats(this.client, this.options.ownedSession ? this.activeSessionId : undefined);
 	}
 
 	async manageHeartbeat(

@@ -1,10 +1,4 @@
 import { fuzzyMatch } from "@earendil-works/pi-tui";
-import type { AgentConnectionSavedSessionInfo } from "../../agent-connection/index.js";
-
-export type SortMode = "threaded" | "recent" | "relevance";
-
-export type NameFilter = "all" | "named";
-
 export interface ParsedSearchQuery {
 	mode: "tokens" | "regex";
 	tokens: { kind: "fuzzy" | "phrase"; value: string }[];
@@ -23,25 +17,9 @@ function normalizeWhitespaceLower(text: string): string {
 	return text.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
-function getSessionSearchText(session: AgentConnectionSavedSessionInfo): string {
-	return `${session.id} ${session.name ?? ""} ${session.allMessagesText} ${session.cwd}`;
-}
-
-export function hasSessionName(session: AgentConnectionSavedSessionInfo): boolean {
-	return Boolean(session.name?.trim());
-}
-
-function matchesNameFilter(session: AgentConnectionSavedSessionInfo, filter: NameFilter): boolean {
-	if (filter === "all") return true;
-	return hasSessionName(session);
-}
-
-function compareSessionsByModifiedDesc(a: AgentConnectionSavedSessionInfo, b: AgentConnectionSavedSessionInfo): number {
-	const modifiedDiff = b.modified.getTime() - a.modified.getTime();
-	if (modifiedDiff !== 0) return modifiedDiff;
-	const createdDiff = b.created.getTime() - a.created.getTime();
-	if (createdDiff !== 0) return createdDiff;
-	return a.path.localeCompare(b.path);
+/** Join arbitrary session fields into the common search corpus. */
+export function createSessionSearchText(parts: readonly (string | undefined | null)[]): string {
+	return parts.filter((part): part is string => typeof part === "string" && part.length > 0).join(" ");
 }
 
 export function parseSearchQuery(query: string): ParsedSearchQuery {
@@ -121,9 +99,8 @@ export function parseSearchQuery(query: string): ParsedSearchQuery {
 	return { mode: "tokens", tokens, regex: null };
 }
 
-export function matchSession(session: AgentConnectionSavedSessionInfo, parsed: ParsedSearchQuery): MatchResult {
-	const text = getSessionSearchText(session);
-
+/** Match any precomputed search corpus using the resume picker's query language. */
+export function matchSearchText(text: string, parsed: ParsedSearchQuery): MatchResult {
 	if (parsed.mode === "regex") {
 		if (!parsed.regex) {
 			return { matches: false, score: 0 };
@@ -161,44 +138,7 @@ export function matchSession(session: AgentConnectionSavedSessionInfo, parsed: P
 	return { matches: true, score: totalScore };
 }
 
-export function filterAndSortSessions(
-	sessions: AgentConnectionSavedSessionInfo[],
-	query: string,
-	sortMode: SortMode,
-	nameFilter: NameFilter = "all",
-): AgentConnectionSavedSessionInfo[] {
-	const nameFiltered =
-		nameFilter === "all" ? sessions : sessions.filter((session) => matchesNameFilter(session, nameFilter));
-	const trimmed = query.trim();
-	if (!trimmed) {
-		return sortMode === "recent" ? [...nameFiltered].sort(compareSessionsByModifiedDesc) : nameFiltered;
-	}
-
+export function matchesSearchText(text: string, query: string): boolean {
 	const parsed = parseSearchQuery(query);
-	if (parsed.error) return [];
-
-	// Recent mode: filter, then order by the latest user or assistant message.
-	if (sortMode === "recent") {
-		const filtered: AgentConnectionSavedSessionInfo[] = [];
-		for (const s of nameFiltered) {
-			const res = matchSession(s, parsed);
-			if (res.matches) filtered.push(s);
-		}
-		return filtered.sort(compareSessionsByModifiedDesc);
-	}
-
-	// Relevance mode: sort by score, tie-break by modified desc.
-	const scored: { session: AgentConnectionSavedSessionInfo; score: number }[] = [];
-	for (const s of nameFiltered) {
-		const res = matchSession(s, parsed);
-		if (!res.matches) continue;
-		scored.push({ session: s, score: res.score });
-	}
-
-	scored.sort((a, b) => {
-		if (a.score !== b.score) return a.score - b.score;
-		return compareSessionsByModifiedDesc(a.session, b.session);
-	});
-
-	return scored.map((r) => r.session);
+	return !parsed.error && matchSearchText(text, parsed).matches;
 }

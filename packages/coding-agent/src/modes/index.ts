@@ -24,12 +24,18 @@ export {
 	type AgentsViewRow,
 	type AgentsViewSection,
 	type AgentsViewSelectionKey,
+	aggregateSessionHeartbeats,
 	buildAgentsViewRows,
 	classifyAgentsViewSession,
+	formatHeartbeatBadge,
 	getAgentsViewSelectionKey,
+	reconcileUnifiedSessions,
 	resolveAgentsViewSelectionIndex,
+	resolveAgentsViewSelectionState,
 	sectionTitle,
 	shouldShowAgentsViewSession,
+	type UnifiedSessionHeartbeat,
+	type UnifiedSessionRecord,
 } from "./agents-view/agents-view-state.js";
 export {
 	DaemonCapabilityUnavailableError,
