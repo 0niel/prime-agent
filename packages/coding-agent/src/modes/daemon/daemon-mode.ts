@@ -4802,7 +4802,7 @@ export class AgentDaemon {
 			this.writeUpdateRestartManifest(manifest);
 			return await this.commitPreparedUpdateRestart(transaction.id);
 		} catch (error) {
-			this.updateRestartPublishing = undefined;
+			if (this.updateRestartPublishing === transaction.id) this.updateRestartPublishing = undefined;
 			this.cancelPreparedUpdateRestart(transaction.id);
 			throw error;
 		}

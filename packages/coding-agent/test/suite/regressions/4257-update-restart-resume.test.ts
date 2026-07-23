@@ -380,6 +380,29 @@ describe("issue #4257 update restart resume", () => {
 		expect(internals.updateRestartPublishing).toBeUndefined();
 	});
 
+	it("does not let stale standalone cleanup clear a newer publishing owner", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
+			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const newerTransaction = { id: Symbol("newer-update-restart"), abort: new AbortController() };
+		vi.spyOn(internals, "commitPreparedUpdateRestart").mockImplementationOnce(async () => {
+			internals.updateRestartTransaction = newerTransaction;
+			internals.updateRestartPublishing = newerTransaction.id;
+			throw new Error("stale publish failed");
+		});
+
+		await expect(internals.prepareUpdateRestart()).rejects.toThrow("stale publish failed");
+
+		expect(internals.updateRestartTransaction).toBe(newerTransaction);
+		expect(internals.updateRestartPublishing).toBe(newerTransaction.id);
+	});
+
 	it("rejects drain mutations after this worker publishes its prepare snapshot", async () => {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
