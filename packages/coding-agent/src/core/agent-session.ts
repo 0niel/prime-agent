@@ -623,24 +623,6 @@ function cloneCustomMessage(message: CustomMessage): CustomMessage {
 	};
 }
 
-function restoredSessionSlashCommand(message: CustomMessage | undefined): SessionSlashCommand | undefined {
-	if (!isSessionSlashCommandMessage(message)) return undefined;
-	const command = message.details.command;
-	if (!command || typeof command !== "object") return undefined;
-	const candidate = command as Partial<SessionSlashCommand>;
-	if (
-		(candidate.name !== "compact" &&
-			candidate.name !== "refine" &&
-			candidate.name !== "goal" &&
-			candidate.name !== "autonomous") ||
-		typeof candidate.args !== "string" ||
-		typeof candidate.text !== "string"
-	) {
-		return undefined;
-	}
-	return candidate as SessionSlashCommand;
-}
-
 function createQueuedAgentInputSnapshotFromUserMessage(
 	text: string,
 	message: QueuedAgentMessage,
@@ -796,10 +778,32 @@ function undeliveredPendingNextTurnMessages(accepted: AcceptedAgentMessagePrompt
 	return accepted.pendingNextTurnMessages.filter((message) => !accepted.deliveredPendingNextTurnMessages.has(message));
 }
 
-interface AgentMessageDeliveryWaiter {
+interface AgentMessageDeferred {
 	promise: Promise<void>;
 	resolve: () => void;
 	reject: (error: Error) => void;
+}
+
+/**
+ * Per-agent-message settlement record: `delivery` settles when the prompt reaches agent state,
+ * `completion` when its turn (or command) finishes. `delivered`/`deliveryError` keep the
+ * delivery outcome sticky for late waiters; completion deferreds are detached once settled.
+ */
+interface AgentMessageOutcome {
+	delivery?: AgentMessageDeferred;
+	completion?: AgentMessageDeferred;
+	delivered?: boolean;
+	deliveryError?: Error;
+}
+
+function createAgentMessageDeferred(): AgentMessageDeferred {
+	const deferred = {} as AgentMessageDeferred;
+	deferred.promise = new Promise<void>((resolve, reject) => {
+		deferred.resolve = resolve;
+		deferred.reject = reject;
+	});
+	deferred.promise.catch(() => undefined);
+	return deferred;
 }
 
 /** Result from cycleModel() */
@@ -1025,10 +1029,7 @@ export class AgentSession {
 	private _retryAuthFailureSources: AuthSourceToken[] = [];
 	private _acceptedPromptCompletions = new Set<Promise<void>>();
 	private _acceptedAgentMessagePrompt: AcceptedAgentMessagePrompt | undefined = undefined;
-	private _agentMessageDeliveryWaiters = new Map<string, AgentMessageDeliveryWaiter>();
-	private _agentMessageCompletionWaiters = new Map<string, AgentMessageDeliveryWaiter>();
-	private _deliveredAgentMessageIds = new Set<string>();
-	private _failedAgentMessageDeliveries = new Map<string, Error>();
+	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 
 	// Bash execution state
@@ -1795,7 +1796,10 @@ export class AgentSession {
 		if (this._pumpingSessionInput) {
 			const normalized = normalizeMessageContent(message.content);
 			if (kind === "budget_limit") {
-				await this._queueSteer(normalized.text, normalized.images, { message, resumeIfIdle: true });
+				await this._queuePreparedPrompt("steer", normalized.text, normalized.images, {
+					message,
+					resumeIfIdle: true,
+				});
 			} else {
 				const input = this._createPreparedPromptInput(normalized.text, normalized.images, {
 					message,
@@ -2955,85 +2959,63 @@ export class AgentSession {
 	// Track last assistant message for auto-compaction check
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
 
+	private _agentMessageOutcome(agentMessageId: string): AgentMessageOutcome {
+		let outcome = this._agentMessageOutcomes.get(agentMessageId);
+		if (!outcome) {
+			outcome = {};
+			this._agentMessageOutcomes.set(agentMessageId, outcome);
+		}
+		return outcome;
+	}
+
 	waitForAgentMessagePromptDelivery(agentMessageId: string): Promise<void> {
-		if (this._deliveredAgentMessageIds.has(agentMessageId)) {
-			return Promise.resolve();
-		}
-		const failedDelivery = this._failedAgentMessageDeliveries.get(agentMessageId);
-		if (failedDelivery) {
-			return Promise.reject(failedDelivery);
-		}
-		let waiter = this._agentMessageDeliveryWaiters.get(agentMessageId);
-		if (waiter) {
-			return waiter.promise;
-		}
-		let resolveDelivery = () => {};
-		let rejectDelivery = (_error: Error) => {};
-		const promise = new Promise<void>((resolve, reject) => {
-			resolveDelivery = resolve;
-			rejectDelivery = reject;
-		});
-		waiter = { promise, resolve: resolveDelivery, reject: rejectDelivery };
-		this._agentMessageDeliveryWaiters.set(agentMessageId, waiter);
-		void promise
-			.finally(() => {
-				if (this._agentMessageDeliveryWaiters.get(agentMessageId) === waiter) {
-					this._agentMessageDeliveryWaiters.delete(agentMessageId);
-				}
-			})
-			.catch(() => undefined);
-		return promise;
+		const outcome = this._agentMessageOutcome(agentMessageId);
+		if (outcome.delivered) return Promise.resolve();
+		if (outcome.deliveryError) return Promise.reject(outcome.deliveryError);
+		outcome.delivery ??= createAgentMessageDeferred();
+		return outcome.delivery.promise;
 	}
 
-	private waitForAgentMessagePromptCompletion(agentMessageId: string): Promise<void> {
-		let waiter = this._agentMessageCompletionWaiters.get(agentMessageId);
-		if (waiter) return waiter.promise;
-		let resolve = () => {};
-		let reject = (_error: Error) => {};
-		const promise = new Promise<void>((resolvePromise, rejectPromise) => {
-			resolve = resolvePromise;
-			reject = rejectPromise;
-		});
-		waiter = { promise, resolve, reject };
-		this._agentMessageCompletionWaiters.set(agentMessageId, waiter);
-		void promise.finally(() => this._agentMessageCompletionWaiters.delete(agentMessageId)).catch(() => undefined);
-		return promise;
-	}
-
-	private _resolveAgentMessageCompletion(agentMessageId: string | undefined): void {
-		if (agentMessageId) this._agentMessageCompletionWaiters.get(agentMessageId)?.resolve();
-	}
-
-	private _rejectAgentMessageCompletion(agentMessageId: string | undefined, error: Error): void {
-		if (agentMessageId) this._agentMessageCompletionWaiters.get(agentMessageId)?.reject(error);
-	}
-
-	private _resolveAgentMessageDelivery(agentMessageId: string | undefined): void {
-		if (agentMessageId === undefined) {
-			return;
-		}
-		this._failedAgentMessageDeliveries.delete(agentMessageId);
-		this._deliveredAgentMessageIds.add(agentMessageId);
-		this._agentMessageDeliveryWaiters.get(agentMessageId)?.resolve();
-	}
-
-	private _rejectAgentMessageDelivery(
+	/**
+	 * Resolve (no error) or reject one leg of an agent message outcome. The first delivery
+	 * settlement is sticky for late waiters; settled completion deferreds free the id for reuse.
+	 */
+	private _settleAgentMessage(
 		agentMessageId: string | undefined,
-		error: Error,
-		rejectCompletion = true,
+		leg: "delivery" | "completion",
+		error?: Error,
 	): void {
-		if (agentMessageId === undefined || this._deliveredAgentMessageIds.has(agentMessageId)) {
-			return;
+		if (agentMessageId === undefined) return;
+		const outcome =
+			leg === "delivery"
+				? this._agentMessageOutcome(agentMessageId)
+				: this._agentMessageOutcomes.get(agentMessageId);
+		if (!outcome) return;
+		if (leg === "delivery") {
+			if (outcome.delivered) return;
+			outcome.delivered = !error;
+			outcome.deliveryError = error;
 		}
-		this._failedAgentMessageDeliveries.set(agentMessageId, error);
-		this._agentMessageDeliveryWaiters.get(agentMessageId)?.reject(error);
-		if (rejectCompletion) this._rejectAgentMessageCompletion(agentMessageId, error);
+		const deferred = outcome[leg];
+		outcome[leg] = undefined;
+		if (!outcome.delivery && !outcome.completion && !outcome.delivered && !outcome.deliveryError) {
+			this._agentMessageOutcomes.delete(agentMessageId);
+		}
+		if (error) deferred?.reject(error);
+		else deferred?.resolve();
+	}
+
+	/** Reject both delivery and completion with one error unless the message already delivered. */
+	private _rejectAgentMessage(agentMessageId: string | undefined, error: Error): void {
+		if (agentMessageId === undefined || this._agentMessageOutcomes.get(agentMessageId)?.delivered) return;
+		this._settleAgentMessage(agentMessageId, "delivery", error);
+		this._settleAgentMessage(agentMessageId, "completion", error);
 	}
 
 	private _rejectQueuedAgentMessageDeliveries(deliveryError: Error, completionError = deliveryError): void {
 		for (const message of [...this._steeringMessages, ...this._followUpMessages]) {
-			this._rejectAgentMessageDelivery(message.agentMessageId, deliveryError, false);
-			this._rejectAgentMessageCompletion(message.agentMessageId, completionError);
+			this._settleAgentMessage(message.agentMessageId, "delivery", deliveryError);
+			this._settleAgentMessage(message.agentMessageId, "completion", completionError);
 		}
 	}
 
@@ -3049,14 +3031,14 @@ export class AgentSession {
 		if (event.type === "message_start") {
 			if (acceptedPrompt?.message === event.message && !acceptedPrompt.cleared) {
 				acceptedPrompt.turnStarted = true;
-				this._resolveAgentMessageDelivery(acceptedPrompt.agentMessageId);
+				this._settleAgentMessage(acceptedPrompt.agentMessageId, "delivery");
 				acceptedPrompt.resolveAccepted();
 			}
 			const activeInput =
 				this._activeSessionInput?.kind === "prompt"
 					? this._activeSessionInput.items.find((input) => input.message === event.message)
 					: undefined;
-			this._resolveAgentMessageDelivery(activeInput?.agentMessageId);
+			this._settleAgentMessage(activeInput?.agentMessageId, "delivery");
 		}
 		this._agentEventQueue = this._agentEventQueue.then(
 			() => this._processAgentEvent(event),
@@ -3688,10 +3670,10 @@ export class AgentSession {
 			const deliveryError = new Error("Session disposed before prompt delivery.");
 			const completionError = new Error("Session disposed before prompt completion.");
 			this._rejectQueuedAgentMessageDeliveries(deliveryError, completionError);
-			for (const agentMessageId of this._agentMessageDeliveryWaiters.keys()) {
-				this._rejectAgentMessageDelivery(agentMessageId, deliveryError, false);
+			for (const [agentMessageId, outcome] of this._agentMessageOutcomes) {
+				if (outcome.delivery) this._settleAgentMessage(agentMessageId, "delivery", deliveryError);
+				if (outcome.completion) this._settleAgentMessage(agentMessageId, "completion", completionError);
 			}
-			for (const waiter of this._agentMessageCompletionWaiters.values()) waiter.reject(completionError);
 			this._steeringMessages = [];
 			this._followUpMessages = [];
 			this._syncSteeringStopPending();
@@ -4000,15 +3982,17 @@ export class AgentSession {
 
 	async promptAndWait(text: string, options?: PromptOptions): Promise<void> {
 		const agentMessageId = options?.agentMessageId ?? `prompt-wait:${randomUUID()}`;
-		if (this._agentMessageCompletionWaiters.has(agentMessageId)) {
+		if (this._agentMessageOutcomes.get(agentMessageId)?.completion) {
 			throw new Error(`Prompt completion id is already in use: ${agentMessageId}`);
 		}
-		const completion = this.waitForAgentMessagePromptCompletion(agentMessageId);
+		const outcome = this._agentMessageOutcome(agentMessageId);
+		outcome.completion = createAgentMessageDeferred();
+		const completion = outcome.completion.promise;
 		try {
 			await this.promptUntilAccepted(text, { ...options, agentMessageId });
 			await completion;
 		} catch (error) {
-			this._rejectAgentMessageCompletion(agentMessageId, error instanceof Error ? error : new Error(String(error)));
+			this._settleAgentMessage(agentMessageId, "completion", this._asError(error));
 			throw error;
 		}
 	}
@@ -4034,10 +4018,10 @@ export class AgentSession {
 	): Promise<boolean> {
 		const agentMessageId = customMessage?.details.id ?? parseAgentSessionMessagePromptId(text);
 		if (streamingBehavior === "steer") {
-			await this._queueSteer(text, undefined, { agentMessageId, message: customMessage });
+			await this._queuePreparedPrompt("steer", text, undefined, { agentMessageId, message: customMessage });
 			return true;
 		}
-		return this._queueFollowUp(text, undefined, { agentMessageId, message: customMessage });
+		return this._queuePreparedPrompt("followUp", text, undefined, { agentMessageId, message: customMessage });
 	}
 
 	async promptHeartbeat(job: AgentCronJob, options?: PromptOptions): Promise<void> {
@@ -4265,8 +4249,8 @@ export class AgentSession {
 				if (commandCompletion) {
 					reportPreflight(true);
 					void commandCompletion.then(
-						() => this._resolveAgentMessageCompletion(options?.agentMessageId),
-						(error) => this._rejectAgentMessageCompletion(options?.agentMessageId, error),
+						() => this._settleAgentMessage(options?.agentMessageId, "completion"),
+						(error) => this._settleAgentMessage(options?.agentMessageId, "completion", error),
 					);
 					void commandCompletion.catch(() => undefined);
 					if (!options?.returnAfterAccepted) await commandCompletion.catch(() => undefined);
@@ -4285,7 +4269,7 @@ export class AgentSession {
 				);
 				if (inputResult.action === "handled") {
 					reportPreflight(true);
-					this._resolveAgentMessageCompletion(options?.agentMessageId);
+					this._settleAgentMessage(options?.agentMessageId, "completion");
 					return;
 				}
 				if (inputResult.action === "transform") {
@@ -4531,12 +4515,8 @@ export class AgentSession {
 		});
 		if (options?.agentMessageId) {
 			void promptCompletion.then(
-				() => this._resolveAgentMessageCompletion(options.agentMessageId),
-				(error) =>
-					this._rejectAgentMessageCompletion(
-						options.agentMessageId,
-						error instanceof Error ? error : new Error(String(error)),
-					),
+				() => this._settleAgentMessage(options.agentMessageId, "completion"),
+				(error) => this._settleAgentMessage(options.agentMessageId, "completion", this._asError(error)),
 			);
 		}
 		void promptCompletion
@@ -4634,7 +4614,7 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		await this._queueSteer(expandedText, images, {
+		await this._queuePreparedPrompt("steer", expandedText, images, {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
@@ -4662,7 +4642,7 @@ export class AgentSession {
 		let expandedText = this._expandSkillCommand(text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
-		return this._queueFollowUp(expandedText, images, {
+		return this._queuePreparedPrompt("followUp", expandedText, images, {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
@@ -4703,8 +4683,7 @@ export class AgentSession {
 	): Promise<void> {
 		if (this._restoreSessionCommand(text, options.customMessage, images, "steer") !== undefined) return;
 
-
-		await this._queueSteer(text, images, {
+		await this._queuePreparedPrompt("steer", text, images, {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
 			content: options.content,
@@ -4727,8 +4706,7 @@ export class AgentSession {
 		const restoredCommand = this._restoreSessionCommand(text, options.customMessage, images, "followUp");
 		if (restoredCommand !== undefined) return restoredCommand;
 
-
-		return this._queueFollowUp(text, images, {
+		return this._queuePreparedPrompt("followUp", text, images, {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
 			content: options.content,
@@ -4763,43 +4741,33 @@ export class AgentSession {
 	): Promise<void> {
 		const pendingNextTurnMessages = this._pendingNextTurnMessages;
 		this._pendingNextTurnMessages = [];
-		const queueOptions = {
-			queueKey: options.queueKey,
-			agentMessageId: options.agentMessageId,
-			message: options.message,
-			prefixMessages: pendingNextTurnMessages,
-			previewLabel: options.previewLabel,
-			suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-			resumeIfIdle: options.resumeIfIdle,
-		};
 		// Preflight callbacks run outside the try: a throwing callback must not roll
 		// back queue state for an input that was in fact enqueued (its prefixMessages
 		// would be delivered twice).
-		if (streamingBehavior === "followUp") {
-			let queued: boolean;
-			try {
-				queued = await this._queueFollowUp(text, options.images, queueOptions);
-				if (!queued) {
-					this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
-					this._rejectAgentMessageCompletion(
-						options.agentMessageId,
-						new Error("Prompt was not queued because an equivalent follow-up is already pending."),
-					);
-				}
-			} catch (error) {
-				this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
-				throw error;
-			}
-			reportPreflight(queued, queued);
-			return;
-		}
+		let queued: boolean;
 		try {
-			await this._queueSteer(text, options.images, queueOptions);
+			queued = await this._queuePreparedPrompt(streamingBehavior, text, options.images, {
+				queueKey: options.queueKey,
+				agentMessageId: options.agentMessageId,
+				message: options.message,
+				prefixMessages: pendingNextTurnMessages,
+				previewLabel: options.previewLabel,
+				suppressAutonomousContinuation: options.suppressAutonomousContinuation,
+				resumeIfIdle: options.resumeIfIdle,
+			});
+			if (!queued) {
+				this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
+				this._settleAgentMessage(
+					options.agentMessageId,
+					"completion",
+					new Error("Prompt was not queued because an equivalent follow-up is already pending."),
+				);
+			}
 		} catch (error) {
 			this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
 			throw error;
 		}
-		reportPreflight(true, true);
+		reportPreflight(queued, queued);
 	}
 
 	/**
@@ -4873,33 +4841,14 @@ export class AgentSession {
 		return true;
 	}
 
-	private async _queueSteer(
+	/** Queue a prepared prompt on one lane; steering always queues, follow-up may coalesce by queue key. */
+	private async _queuePreparedPrompt(
+		schedule: SessionInputSchedule,
 		text: string,
 		images?: ImageContent[],
 		options: {
 			agentMessageId?: string;
 			queueKey?: string;
-			content?: (TextContent | ImageContent)[];
-			message?: QueuedAgentMessage;
-			prefixMessages?: CustomMessage[];
-			previewLabel?: string;
-			suppressAutonomousContinuation?: boolean;
-			resumeIfIdle?: boolean;
-		} = {},
-	): Promise<void> {
-		const input = this._createPreparedPromptInput(text, images, options);
-		if (options.suppressAutonomousContinuation) {
-			this._markAutonomousContinuationSuppressed(input.message);
-		}
-		this._enqueueSessionInput(input, "steer");
-	}
-
-	private async _queueFollowUp(
-		text: string,
-		images?: ImageContent[],
-		options: {
-			queueKey?: string;
-			agentMessageId?: string;
 			content?: (TextContent | ImageContent)[];
 			message?: QueuedAgentMessage;
 			prefixMessages?: CustomMessage[];
@@ -4912,7 +4861,7 @@ export class AgentSession {
 		if (options.suppressAutonomousContinuation) {
 			this._markAutonomousContinuationSuppressed(input.message);
 		}
-		return this._enqueueSessionInput(input, "followUp");
+		return this._enqueueSessionInput(input, schedule);
 	}
 
 	private _scheduleSessionInputPump(): void {
@@ -4958,12 +4907,9 @@ export class AgentSession {
 						this._emitQueueUpdate();
 						try {
 							await this._executeQueuedSessionCommand(first);
-							this._resolveAgentMessageCompletion(first.agentMessageId);
+							this._settleAgentMessage(first.agentMessageId, "completion");
 						} catch (error) {
-							this._rejectAgentMessageCompletion(
-								first.agentMessageId,
-								error instanceof Error ? error : new Error(String(error)),
-							);
+							this._settleAgentMessage(first.agentMessageId, "completion", this._asError(error));
 						} finally {
 							this._activeSessionInput = undefined;
 							this._syncSteeringStopPending();
@@ -4986,7 +4932,7 @@ export class AgentSession {
 					try {
 						await this._startPreparedPromptItems(prompts, epoch, admission.release);
 						for (const prompt of prompts) {
-							this._resolveAgentMessageCompletion(prompt.agentMessageId);
+							this._settleAgentMessage(prompt.agentMessageId, "completion");
 						}
 					} catch (error) {
 						const delivered = new Set(this.agent.state.messages);
@@ -5006,10 +4952,10 @@ export class AgentSession {
 						}
 						const terminalError = this._asError(error);
 						for (const prompt of undelivered) {
-							this._rejectAgentMessageDelivery(prompt.agentMessageId, terminalError, false);
+							this._settleAgentMessage(prompt.agentMessageId, "delivery", terminalError);
 						}
 						for (const prompt of prompts) {
-							this._rejectAgentMessageCompletion(prompt.agentMessageId, terminalError);
+							this._settleAgentMessage(prompt.agentMessageId, "completion", terminalError);
 						}
 						this._surfaceSessionInputError(error);
 					} finally {
@@ -5270,9 +5216,15 @@ export class AgentSession {
 		} else if (this.isStreaming) {
 			const normalized = normalizeMessageContent(message.content);
 			if (options?.deliverAs === "followUp") {
-				await this._queueFollowUp(normalized.text, normalized.images, { message: appMessage, resumeIfIdle: true });
+				await this._queuePreparedPrompt("followUp", normalized.text, normalized.images, {
+					message: appMessage,
+					resumeIfIdle: true,
+				});
 			} else {
-				await this._queueSteer(normalized.text, normalized.images, { message: appMessage, resumeIfIdle: true });
+				await this._queuePreparedPrompt("steer", normalized.text, normalized.images, {
+					message: appMessage,
+					resumeIfIdle: true,
+				});
 			}
 		} else if (options?.triggerTurn) {
 			const admission = await this._acquireDirectTurnAdmission();
@@ -5355,8 +5307,8 @@ export class AgentSession {
 			this._sessionInputPumpEpoch++;
 			const error = new Error("Queued prompt was cleared before delivery.");
 			for (const input of active.items) {
-				this._rejectAgentMessageDelivery(input.agentMessageId, error, false);
-				this._rejectAgentMessageCompletion(input.agentMessageId, error);
+				this._settleAgentMessage(input.agentMessageId, "delivery", error);
+				this._settleAgentMessage(input.agentMessageId, "completion", error);
 			}
 		}
 		const activeTexts = active?.items.map((message) => message.text) ?? [];
@@ -5422,7 +5374,7 @@ export class AgentSession {
 		);
 		this._syncSteeringStopPending();
 		for (const message of [...steering, ...followUp]) {
-			this._rejectAgentMessageDelivery(
+			this._rejectAgentMessage(
 				message.agentMessageId,
 				new Error("Queued agent message was cleared before delivery."),
 			);
@@ -5436,7 +5388,7 @@ export class AgentSession {
 				...undeliveredPendingNextTurnMessages(accepted).map((message) => ({ ...message })),
 			);
 			const error = new Error("Accepted agent message was cleared before delivery.");
-			this._rejectAgentMessageDelivery(accepted.agentMessageId, error);
+			this._rejectAgentMessage(accepted.agentMessageId, error);
 			accepted.rejectAccepted(error);
 			this.agent.abort();
 			removedFollowUp.push(accepted.text);
@@ -5692,7 +5644,7 @@ export class AgentSession {
 		this._followUpMessages = this._followUpMessages.filter((message) => !removed.has(message));
 		this._syncSteeringStopPending();
 		for (const message of removed) {
-			this._rejectAgentMessageDelivery(
+			this._rejectAgentMessage(
 				message.agentMessageId,
 				new Error("Queued agent message was cleared before delivery."),
 			);

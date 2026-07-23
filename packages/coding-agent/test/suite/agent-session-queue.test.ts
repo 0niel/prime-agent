@@ -2066,7 +2066,8 @@ prepared:${event.prompt}`,
 		expect(getUserTexts(harness)).toEqual(["normal"]);
 	});
 
-	it("clearQueue rejects completion waiters for every prompt in an active preparing batch", async () => {
+	it("clearQueue and terminal preparation errors reject delivery and completion waiters", async () => {
+		// clearQueue while an active batch is preparing rejects every prompt's waiters.
 		let preparationStarted: (() => void) | undefined;
 		const waitForPreparation = new Promise<void>((resolve) => {
 			preparationStarted = resolve;
@@ -2084,8 +2085,9 @@ prepared:${event.prompt}`,
 		});
 		harnesses.push(harness);
 		harness.session.setFollowUpMode("all");
-		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = true;
+		withStreaming(harness, true);
 		const firstCompletion = harness.session.promptAndWait("clear first while preparing", {
+			agentMessageId: "agentmsg_clear_first",
 			streamingBehavior: "followUp",
 			resumeIfIdle: true,
 		});
@@ -2095,7 +2097,7 @@ prepared:${event.prompt}`,
 		});
 		const firstCompletionRejection = expect(firstCompletion).rejects.toThrow("cleared before delivery");
 		const completionRejection = expect(completion).rejects.toThrow("cleared before delivery");
-		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = false;
+		withStreaming(harness, false);
 		await waitForPreparation;
 		expect(pause).toBeDefined();
 
@@ -2106,6 +2108,10 @@ prepared:${event.prompt}`,
 		pause?.release();
 		await firstCompletionRejection;
 		await completionRejection;
+		// Delivery waiters created after the clear observe the sticky failure.
+		await expect(harness.session.waitForAgentMessagePromptDelivery("agentmsg_clear_first")).rejects.toThrow(
+			"cleared before delivery",
+		);
 		await harness.session.waitForSessionInputIdle();
 		expect(harness.session.getSteeringMessages()).toEqual([]);
 		expect(harness.session.getFollowUpMessages()).toEqual([]);
@@ -2113,27 +2119,30 @@ prepared:${event.prompt}`,
 
 		harness.setResponses([fauxAssistantMessage("later response")]);
 		await harness.session.prompt("later prompt");
-
 		expect(getUserTexts(harness)).toEqual(["later prompt"]);
 		expect(getAssistantTexts(harness)).toEqual(["later response"]);
-	});
 
-	it("settles late agent-message delivery waiters", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const deliveryInternals = harness.session as unknown as {
-			waitForAgentMessagePromptDelivery(agentMessageId: string): Promise<void>;
-			_resolveAgentMessageDelivery(agentMessageId: string): void;
-			_rejectAgentMessageDelivery(agentMessageId: string, error: Error): void;
-		};
+		// Terminal queued-prompt preparation errors reject both delivery and completion.
+		const errors: string[] = [];
+		const authHarness = await createHarness({ withConfiguredAuth: false });
+		harnesses.push(authHarness);
+		await authHarness.session.bindExtensions({ onError: (error) => errors.push(error.error) });
+		withStreaming(authHarness, true);
+		const delivery = authHarness.session.waitForAgentMessagePromptDelivery("agentmsg_terminal");
+		const terminalCompletion = authHarness.session.promptAndWait("cannot start", {
+			agentMessageId: "agentmsg_terminal",
+			streamingBehavior: "followUp",
+			resumeIfIdle: true,
+		});
+		const terminalRejection = expect(terminalCompletion).rejects.toThrow("No API key");
+		await vi.waitFor(() => expect(authHarness.session.getFollowUpMessages()).toEqual(["cannot start"]));
+		withStreaming(authHarness, false);
+		await authHarness.session.waitForSessionInputIdle();
 
-		deliveryInternals._resolveAgentMessageDelivery("agentmsg_delivered");
-		await expect(deliveryInternals.waitForAgentMessagePromptDelivery("agentmsg_delivered")).resolves.toBeUndefined();
-
-		deliveryInternals._rejectAgentMessageDelivery("agentmsg_failed", new Error("cleared before delivery"));
-		await expect(deliveryInternals.waitForAgentMessagePromptDelivery("agentmsg_failed")).rejects.toThrow(
-			"cleared before delivery",
-		);
+		await expect(delivery).rejects.toThrow("No API key");
+		await terminalRejection;
+		expect(authHarness.session.getFollowUpMessages()).toEqual([]);
+		expect(errors).toEqual([expect.stringContaining("No API key")]);
 	});
 
 	it("keeps queued agent-message delivery waiters pending on abort until the message is delivered", async () => {
@@ -2223,7 +2232,8 @@ prepared:${event.prompt}`,
 		expect(getAssistantTexts(harness)).toEqual(["first done", "second done"]);
 	});
 
-	it("resolves queued delivery when message_start is received", async () => {
+	it("resolves queued, direct, and late agent-message delivery waiters once prompts start", async () => {
+
 		const blocked = createDeferred();
 		const harness = await createHarness({
 			extensionFactories: [
@@ -2241,24 +2251,21 @@ prepared:${event.prompt}`,
 		});
 		withStreaming(harness, false);
 
+		// Queued delivery resolves on message_start, before the gated turn completes.
 		await expect(harness.session.waitForAgentMessagePromptDelivery("agentmsg_sync")).resolves.toBeUndefined();
 		blocked.resolve();
 		await harness.session.waitForIdle();
-	});
+		// Waiters created after delivery settled resolve immediately.
+		await expect(harness.session.waitForAgentMessagePromptDelivery("agentmsg_sync")).resolves.toBeUndefined();
 
-	it("resolves direct agent-message delivery waiters when the accepted prompt starts", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const agentPrompt = agentPromptText("agentmsg_direct", "direct delivery");
 		harness.setResponses([fauxAssistantMessage("direct reply")]);
-
 		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_direct");
-		await harness.session.acceptAgentMessagePrompt(agentPrompt);
-
+		await harness.session.acceptAgentMessagePrompt(agentPromptText("agentmsg_direct", "direct delivery"));
 		await expect(delivery).resolves.toBeUndefined();
 	});
 
-	it("preserves distinct queued delivery and completion disposal errors", async () => {
+	it("settles disposal and post-delivery handoff failures with distinct errors", async () => {
+		// Dispose rejects pending waiters with distinct delivery and completion errors.
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const agentPrompt = agentPromptText("agentmsg_dispose", "dispose me");
@@ -2273,6 +2280,26 @@ prepared:${event.prompt}`,
 
 		await expect(delivery).rejects.toThrow("disposed before prompt delivery");
 		await expect(completion).rejects.toThrow("disposed before prompt completion");
+
+		// A handoff failure after the prompt entered agent state rejects completion only.
+		const handoffHarness = await createHarness();
+		harnesses.push(handoffHarness);
+		const prompt = handoffHarness.session.agent.prompt.bind(handoffHarness.session.agent);
+		vi.spyOn(handoffHarness.session.agent, "prompt").mockImplementationOnce(async (messages) => {
+			await prompt(messages);
+			throw new Error("handoff failed after delivery");
+		});
+		withStreaming(handoffHarness, true);
+		const handoffCompletion = handoffHarness.session.promptAndWait("delivered then failed", {
+			streamingBehavior: "followUp",
+		});
+		await vi.waitFor(() => expect(handoffHarness.session.getFollowUpMessages()).toEqual(["delivered then failed"]));
+		withStreaming(handoffHarness, false);
+
+		expect(handoffHarness.session.resumeQueuedWork()).toBe(true);
+		await expect(handoffCompletion).rejects.toThrow("handoff failed after delivery");
+		expect(getUserTexts(handoffHarness)).toEqual(["delivered then failed"]);
+		expect(handoffHarness.session.getFollowUpMessages()).toEqual([]);
 	});
 
 	it.each([
@@ -2348,12 +2375,6 @@ prepared:${event.prompt}`,
 	});
 
 	it("restores command envelopes as commands and other slash-prefixed messages literally", async () => {
-
-
-
-
-
-
 		const harness = await createHarness();
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("literal handled")]);
@@ -2622,30 +2643,6 @@ prepared:${event.prompt}`,
 		expect(getUserTexts(harness)).toEqual(["queued", "direct"]);
 	});
 
-	it("rejects delivery and completion on terminal queued-prompt preparation errors", async () => {
-		const errors: string[] = [];
-		const harness = await createHarness({ withConfiguredAuth: false });
-		harnesses.push(harness);
-		await harness.session.bindExtensions({ onError: (error) => errors.push(error.error) });
-		withStreaming(harness, true);
-		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_terminal");
-		const completion = harness.session.promptAndWait("cannot start", {
-			agentMessageId: "agentmsg_terminal",
-			streamingBehavior: "followUp",
-			resumeIfIdle: true,
-		});
-		const completionRejection = expect(completion).rejects.toThrow("No API key");
-		await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toEqual(["cannot start"]));
-		withStreaming(harness, false);
-
-		await harness.session.waitForSessionInputIdle();
-
-		await expect(delivery).rejects.toThrow("No API key");
-		await completionRejection;
-		expect(harness.session.getFollowUpMessages()).toEqual([]);
-		expect(errors).toEqual([expect.stringContaining("No API key")]);
-	});
-
 	it("stops before another turn when more steering remains", async () => {
 		const tool: AgentTool = {
 			name: "instant",
@@ -2668,27 +2665,6 @@ prepared:${event.prompt}`,
 
 		expect(getUserTexts(harness)).toEqual(["first", "second"]);
 		expect(getAssistantTexts(harness)).toEqual(["", "second handled"]);
-	});
-
-	it("rejects completion when handoff fails after the prompt entered agent state", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const prompt = harness.session.agent.prompt.bind(harness.session.agent);
-		vi.spyOn(harness.session.agent, "prompt").mockImplementationOnce(async (messages) => {
-			await prompt(messages);
-			throw new Error("handoff failed after delivery");
-		});
-		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = true;
-		const completion = harness.session.promptAndWait("delivered then failed", {
-			streamingBehavior: "followUp",
-		});
-		await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toEqual(["delivered then failed"]));
-		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = false;
-
-		expect(harness.session.resumeQueuedWork()).toBe(true);
-		await expect(completion).rejects.toThrow("handoff failed after delivery");
-		expect(getUserTexts(harness)).toEqual(["delivered then failed"]);
-		expect(harness.session.getFollowUpMessages()).toEqual([]);
 	});
 
 	it.each([
