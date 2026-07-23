@@ -368,26 +368,36 @@ describe("AgentSession model and extension characterization", () => {
 	});
 
 	it("keeps streaming injected prompts under turn admission when the turn becomes idle", async () => {
-		const harness = await createHarness();
+		const toolStarted = createDeferred();
+		const finishTool = createDeferred();
+		const waitTool: AgentTool = {
+			name: "wait",
+			label: "Wait",
+			description: "Wait for release",
+			parameters: Type.Object({}),
+			execute: async () => {
+				toolStarted.resolve();
+				await finishTool.promise;
+				return { content: [{ type: "text", text: "released" }], details: {} };
+			},
+		};
+		const harness = await createHarness({ tools: [waitTool] });
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("heartbeat")]);
-		const internals = harness.session as unknown as { _acquireTurnAdmission(): Promise<() => void> };
-		const releaseBlocker = await internals._acquireTurnAdmission();
-		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = true;
-		let settled = false;
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("turn complete"),
+			fauxAssistantMessage("heartbeat"),
+		]);
 
-		const heartbeat = harness.session
-			.promptHeartbeat(createHeartbeat(), { streamingBehavior: "followUp" })
-			.finally(() => {
-				settled = true;
-			});
-		await flushAsyncWork();
-		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = false;
+		const turn = harness.session.prompt("start");
+		await toolStarted.promise;
+		await harness.session.promptHeartbeat(createHeartbeat(), { streamingBehavior: "followUp" });
 
-		expect(settled).toBe(false);
-		releaseBlocker();
-		await heartbeat;
-		expect(getAssistantTexts(harness)).toEqual(["heartbeat"]);
+		finishTool.resolve();
+		await turn;
+		await harness.session.waitForIdle();
+
+		expect(getAssistantTexts(harness)).toEqual(["", "turn complete", "heartbeat"]);
 	});
 
 	it("includes nextTurn messages queued by pending model_select handlers in injected prompts", async () => {
