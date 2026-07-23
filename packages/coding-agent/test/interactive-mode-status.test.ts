@@ -2429,42 +2429,59 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		maxTokens: 128000,
 	} as AgentConnectionModel;
 
-	test("retries an initial CLI prompt once and preserves steer/follow-up ordering", async () => {
+	test("retains a startup prompt through repeated failures before later startup and user prompts", async () => {
 		vi.useFakeTimers();
-		let finishInput: () => void = () => {};
-		const inputDone = new Promise<void>((resolve) => {
-			finishInput = resolve;
-		});
+		const inputDone = createDeferred<void>();
 		const prompt = vi
 			.fn<() => Promise<void>>()
 			.mockRejectedValueOnce(new Error("transient admission failure"))
 			.mockRejectedValueOnce(new Error("repeated admission failure"))
 			.mockResolvedValue(undefined);
 		const showError = vi.fn();
-		const fakeThis = createStartupRunHarness(
-			{ initialMessage: "first", initialMessages: ["second"] },
-			{
-				getCurrentModel: () => primeModel,
-				getUserInput: vi.fn(() => inputDone),
-				agentConnection: { prompt },
-				showError,
+		const submitHarness = createSubmitHandlerHarness({
+			agentConnection: {
+				prompt,
+				executeBash: vi.fn(async () => {}),
+				getState: vi.fn(async () => ({ isBashRunning: false })),
 			},
+		});
+		const fakeThis = Object.assign(
+			submitHarness,
+			createStartupRunHarness(
+				{ initialMessage: "first", initialMessages: ["second"] },
+				{
+					getCurrentModel: () => primeModel,
+					getUserInput: vi.fn(() => inputDone.promise),
+					agentConnection: submitHarness.agentConnection,
+					showError,
+				},
+			),
 		);
 
 		try {
 			const run = InteractiveMode.prototype.run.call(fakeThis as never);
 			await vi.advanceTimersByTimeAsync(0);
 			expect(prompt).toHaveBeenCalledOnce();
+			const userSubmission = fakeThis.defaultEditor.onSubmit?.("user");
+
 			await vi.advanceTimersByTimeAsync(249);
 			expect(prompt).toHaveBeenCalledOnce();
 			await vi.advanceTimersByTimeAsync(1);
+			expect(prompt).toHaveBeenCalledTimes(2);
+			await vi.advanceTimersByTimeAsync(249);
+			expect(prompt).toHaveBeenCalledTimes(2);
+			await vi.advanceTimersByTimeAsync(1);
+			await userSubmission;
+
 			expect(prompt.mock.calls).toEqual([
 				["first", { images: undefined, streamingBehavior: "steer", queueIfBusy: true }],
 				["first", { images: undefined, streamingBehavior: "steer", queueIfBusy: true }],
+				["first", { images: undefined, streamingBehavior: "steer", queueIfBusy: true }],
 				["second", { images: undefined, streamingBehavior: "followUp", queueIfBusy: true }],
+				["user", { images: [], streamingBehavior: "steer", queueIfBusy: true }],
 			]);
 			expect(showError.mock.calls).toEqual([["transient admission failure"], ["repeated admission failure"]]);
-			finishInput();
+			inputDone.resolve(undefined);
 			await expect(run).resolves.toBe("agents_view");
 		} finally {
 			vi.useRealTimers();

@@ -1483,7 +1483,6 @@ export class InteractiveMode {
 			...(initialMessages ?? []).map((text) => ({ text, images: undefined })),
 		];
 		let nextInitialPrompt = 0;
-		let initialPromptFailures = 0;
 		let initialPromptDelivery: Promise<void> | undefined;
 		let initialPromptRetry: ReturnType<typeof setInterval> | undefined;
 		let acceptingInitialPrompts = true;
@@ -1512,16 +1511,9 @@ export class InteractiveMode {
 							streamingBehavior: nextInitialPrompt === 0 ? "steer" : "followUp",
 							queueIfBusy: true,
 						});
-						initialPromptFailures = 0;
 						nextInitialPrompt++;
 					} catch (error) {
 						this.showError(error instanceof Error ? error.message : "Unknown error occurred");
-						initialPromptFailures++;
-						if (initialPromptFailures > 1) {
-							initialPromptFailures = 0;
-							nextInitialPrompt++;
-							continue;
-						}
 						return;
 					}
 				}
