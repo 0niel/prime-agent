@@ -99,10 +99,11 @@ import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import {
 	bashOutputToText,
-	createCompactionSummaryMessage,
+	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	createHeartbeatPromptMessage,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
+	isCompactionOutcomeMessage,
 	isSessionSlashCommandMessage,
 	isSessionSlashCommandResultMessage,
 } from "../../core/messages.js";
@@ -175,6 +176,10 @@ import {
 	type ChildAgentInspectorNode,
 	ChildAgentSummaryComponent,
 } from "./components/child-agent-inspector.js";
+import {
+	CompactionOutcomeMessageComponent,
+	MalformedCompactionOutcomeMessageComponent,
+} from "./components/compaction-outcome-message.js";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
@@ -873,6 +878,7 @@ export class InteractiveMode {
 	// activityTracker token count already folded into the context snapshot; only output beyond
 	// this counts as live in-flight (keeps auto-retries from re-adding a failed attempt).
 	private contextUsageTokenBaseline = 0;
+	private contextUsageRefreshGeneration = 0;
 	private readonly defaultHiddenThinkingLabel = "Thinking...";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
 
@@ -2582,13 +2588,19 @@ export class InteractiveMode {
 
 	/** Refresh the tray's context usage from the session after a turn or compaction completes. */
 	private async refreshConnectionContextUsage(): Promise<void> {
+		const generation = ++this.contextUsageRefreshGeneration;
 		const connection = this.agentConnection;
 		const sessionId = this.connectionState?.sessionId;
 		const stats = await connection?.getSessionStats?.().catch(() => undefined);
 		if (!stats) return;
-		// Drop the result if the user switched sessions or the connection was rebound while the
-		// async call was in flight — otherwise stale stats would overwrite the new session.
-		if (this.agentConnection !== connection || this.connectionState?.sessionId !== sessionId) return;
+		// Drop results superseded by a newer refresh as well as results for a replaced session.
+		if (
+			generation !== this.contextUsageRefreshGeneration ||
+			this.agentConnection !== connection ||
+			this.connectionState?.sessionId !== sessionId
+		) {
+			return;
+		}
 		// Anything counted so far is now reflected in the snapshot; only later output is in-flight.
 		this.contextUsageTokenBaseline = this.activityTracker.getStatus().tokens;
 		this.patchConnectionState({ contextUsage: stats.contextUsage });
@@ -5442,7 +5454,9 @@ export class InteractiveMode {
 				this.renderRecap();
 
 				this.applyOptimisticContextUsage();
-				await this.refreshConnectionContextUsage();
+				// Auto-compaction can start server-side while this event is being handled.
+				// Do not hold its start event behind a stats RPC; stale refreshes are discarded.
+				void this.refreshConnectionContextUsage();
 
 				await this.checkShutdownRequested();
 
@@ -5490,33 +5504,20 @@ export class InteractiveMode {
 				// Restore the working loader if streaming/subagents still warrant it.
 				this.syncWorkingLoader();
 				if (event.aborted) {
-					if (event.reason === "manual") {
-						this.showError("Compaction cancelled");
-					} else {
-						this.showStatus("Auto-compaction cancelled");
-					}
+					if (event.reason === "manual") this.showError("Compaction cancelled");
 				} else if (event.result) {
 					this.chatContainer.clear();
-					await this.rebuildChatFromMessages();
-					this.addMessageToChat(
-						createCompactionSummaryMessage(
-							event.result.summary,
-							event.result.tokensBefore,
-							new Date().toISOString(),
-							event.customInstructions,
-						),
-					);
+					try {
+						await this.rebuildChatFromMessages();
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						this.showError(`Compaction succeeded, but the transcript could not be refreshed: ${message}`);
+					}
 					await this.refreshConnectionContextUsage();
 					this.footer.invalidate();
-				} else if (event.errorMessage) {
-					if (event.errorSeverity === "warning") {
-						this.showWarning(event.errorMessage);
-					} else if (event.reason === "manual") {
-						this.showError(event.errorMessage);
-					} else {
-						this.chatContainer.addChild(new Spacer(1));
-						this.chatContainer.addChild(new Text(theme.fg("error", event.errorMessage), 1, 0));
-					}
+				} else if (event.errorMessage && event.reason === "manual") {
+					if (event.errorSeverity === "warning") this.showWarning(event.errorMessage);
+					else this.showError(event.errorMessage);
 				}
 				this.ui.requestRender();
 				break;
@@ -6380,19 +6381,23 @@ export class InteractiveMode {
 						? new SlashCommandMessageComponent(message.content)
 						: isSessionSlashCommandResultMessage(message)
 							? new SlashCommandResultMessageComponent(message)
-							: isAgentSessionMessage(message)
-								? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
-								: isInjectedPromptMessage(message)
-									? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
-									: new CustomMessageComponent(
-											message,
-											this.bindLocalSessionExtensions
-												? this.getLocalSessionHost()
-														.getExtensionRunner()
-														.getMessageRenderer(message.customType)
-												: undefined,
-											this.getMarkdownThemeWithSettings(),
-										);
+							: isCompactionOutcomeMessage(message)
+								? new CompactionOutcomeMessageComponent(message)
+								: message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE
+									? new MalformedCompactionOutcomeMessageComponent()
+									: isAgentSessionMessage(message)
+										? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
+										: isInjectedPromptMessage(message)
+											? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
+											: new CustomMessageComponent(
+													message,
+													this.bindLocalSessionExtensions
+														? this.getLocalSessionHost()
+																.getExtensionRunner()
+																.getMessageRenderer(message.customType)
+														: undefined,
+													this.getMarkdownThemeWithSettings(),
+												);
 					component.setExpanded(this.toolOutputExpanded);
 					if (isSessionSlashCommandMessage(message) && this.chatContainer.children.length > 0) {
 						this.chatContainer.addChild(new Spacer(1));
@@ -6491,6 +6496,26 @@ export class InteractiveMode {
 	 * @param options.clearChat Clear the current transcript immediately before rendering
 	 * @param options.limitTranscript Limit transcript replay to the recent tail
 	 */
+	private orderMessagesForTranscript(messages: AgentMessage[]): AgentMessage[] {
+		const summaryIndex = messages.findIndex((message) => message.role === "compactionSummary");
+		if (summaryIndex === -1) return messages;
+		const summary = messages[summaryIndex];
+		if (summary.role !== "compactionSummary") return messages;
+		const remaining = messages.filter((_, index) => index !== summaryIndex);
+		if (Number.isSafeInteger(summary.retainedMessageCount) && summary.retainedMessageCount! >= 0) {
+			const boundary = Math.min(summary.retainedMessageCount!, remaining.length);
+			return [...remaining.slice(0, boundary), summary, ...remaining.slice(boundary)];
+		}
+
+		// Compatibility for summaries created before retainedMessageCount was added.
+		const retained: AgentMessage[] = [];
+		const later: AgentMessage[] = [];
+		for (const message of remaining) {
+			(message.timestamp <= summary.timestamp ? retained : later).push(message);
+		}
+		return [...retained, summary, ...later];
+	}
+
 	private async renderSessionContext(
 		sessionContext: AgentConnectionSessionContext,
 		options: {
@@ -6501,9 +6526,8 @@ export class InteractiveMode {
 		} = {},
 	): Promise<void> {
 		this.resetPendingToolState();
-		const messagesToRender = options.limitTranscript
-			? initialRenderMessages(sessionContext.messages)
-			: sessionContext.messages;
+		const transcriptMessages = this.orderMessagesForTranscript(sessionContext.messages);
+		const messagesToRender = options.limitTranscript ? initialRenderMessages(transcriptMessages) : transcriptMessages;
 		this.ipythonToolComponents.clear();
 		this.lateIpythonSentAgentMessages.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();

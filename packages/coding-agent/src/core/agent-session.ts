@@ -170,7 +170,10 @@ import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
 	type BashExecutionMessage,
+	type CompactionOutcome,
+	type CompactionOutcomeReason,
 	type CustomMessage,
+	createCompactionOutcomeMessage,
 	createHeartbeatPromptMessage,
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
@@ -1049,6 +1052,7 @@ export class AgentSession {
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _compactionOperation: Promise<void> | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	private _overflowRecoveryFailureReported = false;
 	private _continueAfterThresholdCompaction = false;
 	private _pendingRequestedCompaction: { customInstructions?: string } | undefined;
 	private _pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
@@ -3183,6 +3187,8 @@ export class AgentSession {
 
 		if (event.type === "message_start" && this._isPromptTurnStartMessage(event.message)) {
 			this._overflowRecoveryAttempted = false;
+			this._overflowRecoveryFailureReported = false;
+		}
 		}
 
 		// Emit to extensions first
@@ -3243,6 +3249,7 @@ export class AgentSession {
 				}
 				if (assistantMsg.stopReason !== "error") {
 					this._overflowRecoveryAttempted = false;
+					this._overflowRecoveryFailureReported = false;
 				}
 				if (this._isConcreteProviderAuthFailure(assistantMsg)) {
 					this._captureRetryAuthFailureSource(assistantMsg);
@@ -7271,15 +7278,20 @@ export class AgentSession {
 			isContextOverflow(assistantMessage, contextWindow)
 		) {
 			if (this._overflowRecoveryAttempted) {
-				this._emit({
-					type: "compaction_end",
-					reason: "overflow",
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					errorMessage:
-						"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
-				});
+				if (!this._overflowRecoveryFailureReported) {
+					this._overflowRecoveryFailureReported = true;
+					const message =
+						"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.";
+					this._emit({
+						type: "compaction_end",
+						reason: "overflow",
+						result: undefined,
+						aborted: false,
+						willRetry: false,
+						errorMessage: message,
+					});
+					this._persistCompactionOutcome("overflow", "failed", message);
+				}
 				return false;
 			}
 
@@ -7321,6 +7333,29 @@ export class AgentSession {
 	 * Internal: Run automatic (threshold/overflow) or model-requested compaction
 	 * with events.
 	 */
+	private _persistCompactionOutcome(
+		reason: CompactionOutcomeReason,
+		outcome: CompactionOutcome,
+		message: string,
+	): boolean {
+		const durableMessage = createCompactionOutcomeMessage(message, { reason, outcome });
+		let persisted = true;
+		try {
+			this.sessionManager.appendCustomMessageEntry(
+				durableMessage.customType,
+				durableMessage.content,
+				durableMessage.display,
+				durableMessage.details,
+			);
+		} catch {
+			persisted = false;
+		}
+		this.agent.state.messages.push(durableMessage);
+		this._emit({ type: "message_start", message: durableMessage });
+		this._emit({ type: "message_end", message: durableMessage });
+		return persisted;
+	}
+
 	private async _runAutoCompaction(
 		reason: "overflow" | "threshold" | "requested",
 		willRetry: boolean,
@@ -7350,13 +7385,16 @@ export class AgentSession {
 
 		try {
 			if (!this.model) {
+				const message = "Compaction failed: no model is selected";
 				this._emit({
 					type: "compaction_end",
 					reason,
 					result: undefined,
 					aborted: false,
 					willRetry: false,
+					errorMessage: message,
 				});
+				this._persistCompactionOutcome(reason, "failed", message);
 				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
 					reason === "threshold" && shouldContinueAfterCompaction,
 					queuedAutonomousContinuationsForThisCompaction,
@@ -7367,13 +7405,16 @@ export class AgentSession {
 
 			const authResult = await this._modelRegistry.getApiKeyAndHeaders(this.model);
 			if (!authResult.ok || !authResult.apiKey) {
+				const message = `Compaction failed: ${authResult.ok ? "no API key is available" : authResult.error}`;
 				this._emit({
 					type: "compaction_end",
 					reason,
 					result: undefined,
 					aborted: false,
 					willRetry: false,
+					errorMessage: message,
 				});
+				this._persistCompactionOutcome(reason, "failed", message);
 				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
 					reason === "threshold" && shouldContinueAfterCompaction,
 					queuedAutonomousContinuationsForThisCompaction,
@@ -7430,39 +7471,48 @@ export class AgentSession {
 					willRetry: false,
 					customInstructions,
 				});
+				this._persistCompactionOutcome(
+					reason,
+					"cancelled",
+					`${reason === "requested" ? "Requested c" : "C"}ompaction cancelled`,
+				);
 				return false;
 			}
 			if (error instanceof CompactionSkippedError) {
+				const message =
+					reason === "requested"
+						? `Requested compaction skipped: ${errorMessage}`
+						: `Auto-compaction skipped: ${errorMessage}`;
 				this._emit({
 					type: "compaction_end",
 					reason,
 					result: undefined,
 					aborted: false,
 					willRetry: false,
-					errorMessage:
-						reason === "requested"
-							? `Requested compaction skipped: ${errorMessage}`
-							: `Auto-compaction skipped: ${errorMessage}`,
+					errorMessage: message,
 					errorSeverity: "warning",
 					customInstructions,
 				});
+				this._persistCompactionOutcome(reason, "skipped", message);
 				resumeAfterFailure();
 				return false;
 			}
+			const message =
+				reason === "overflow"
+					? `Context overflow recovery failed: ${errorMessage}`
+					: reason === "requested"
+						? `Requested compaction failed: ${errorMessage}`
+						: `Auto-compaction failed: ${errorMessage}`;
 			this._emit({
 				type: "compaction_end",
 				reason,
 				result: undefined,
 				aborted: false,
 				willRetry: false,
-				errorMessage:
-					reason === "overflow"
-						? `Context overflow recovery failed: ${errorMessage}`
-						: reason === "requested"
-							? `Requested compaction failed: ${errorMessage}`
-							: `Auto-compaction failed: ${errorMessage}`,
+				errorMessage: message,
 				customInstructions,
 			});
+			this._persistCompactionOutcome(reason, "failed", message);
 			resumeAfterFailure();
 			return false;
 		} finally {

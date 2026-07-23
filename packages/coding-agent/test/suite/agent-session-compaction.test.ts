@@ -11,6 +11,11 @@ type SessionWithCompactionInternals = {
 	) => Promise<void>;
 	_runAutoCompaction: (reason: "overflow" | "threshold" | "requested", willRetry: boolean) => Promise<void>;
 	_shouldStopAfterTurn: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
+	_persistCompactionOutcome: (
+		reason: "overflow" | "threshold" | "requested",
+		outcome: "skipped" | "cancelled" | "failed",
+		message: string,
+	) => boolean;
 };
 
 function createUsage(totalTokens: number) {
@@ -386,11 +391,24 @@ describe("AgentSession compaction characterization", () => {
 
 		await sessionInternals._checkCompaction(overflowMessage);
 		await sessionInternals._checkCompaction({ ...overflowMessage, timestamp: Date.now() + 1 });
+		await sessionInternals._checkCompaction({ ...overflowMessage, timestamp: Date.now() + 2 });
 
 		expect(runAutoCompactionSpy).toHaveBeenCalledTimes(1);
-		expect(compactionErrors).toContain(
-			"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
-		);
+		const message =
+			"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.";
+		expect(compactionErrors).toContain(message);
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "custom",
+			customType: "compaction_outcome",
+			content: message,
+			details: { reason: "overflow", outcome: "failed" },
+		});
+		expect(
+			harness.session.messages.filter(
+				(entry) =>
+					entry.role === "custom" && entry.customType === "compaction_outcome" && entry.content === message,
+			),
+		).toHaveLength(1);
 	});
 
 	it("ignores stale pre-compaction assistant usage on pre-prompt checks", async () => {
@@ -1041,5 +1059,42 @@ describe("AgentSession compaction characterization", () => {
 
 		expect(belowThresholdSpy).not.toHaveBeenCalled();
 		expect(disabledSpy).not.toHaveBeenCalled();
+	});
+
+	it("persists unsuccessful automatic compaction outcomes outside model context", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SessionWithCompactionInternals;
+
+		internals._persistCompactionOutcome("requested", "skipped", "Requested compaction skipped: too short");
+
+		const outcome = harness.session.messages.at(-1);
+		expect(outcome).toMatchObject({
+			role: "custom",
+			customType: "compaction_outcome",
+			content: "Requested compaction skipped: too short",
+			display: true,
+			details: { reason: "requested", outcome: "skipped" },
+		});
+		expect(harness.session.agent.convertToLlm([outcome!])).toEqual([]);
+	});
+
+	it("does not let outcome persistence failures replace compaction control flow", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SessionWithCompactionInternals;
+		vi.spyOn(harness.sessionManager, "appendCustomMessageEntry").mockImplementation(() => {
+			throw new Error("disk full");
+		});
+
+		expect(() =>
+			internals._persistCompactionOutcome("requested", "failed", "Requested compaction failed"),
+		).not.toThrow();
+		expect(harness.session.messages).toContainEqual(
+			expect.objectContaining({
+				customType: "compaction_outcome",
+				content: "Requested compaction failed",
+			}),
+		);
 	});
 });

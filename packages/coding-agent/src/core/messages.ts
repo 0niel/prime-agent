@@ -30,6 +30,7 @@ export const HEARTBEAT_PROMPT_PREVIEW_LABEL = "Heartbeat prompt";
 export const IPYTHON_STATE_RESTORED_CUSTOM_TYPE = "ipython_state_restored";
 export const SESSION_SLASH_COMMAND_CUSTOM_TYPE = "session_slash_command";
 export const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE = "session_slash_command_result";
+export const COMPACTION_OUTCOME_CUSTOM_TYPE = "compaction_outcome";
 
 export interface SessionSlashCommandDetails {
 	command: SessionSlashCommand;
@@ -54,6 +55,20 @@ export interface SessionSlashCommandResultMessage extends CustomMessage<SessionS
 	customType: typeof SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE;
 	content: string;
 	details: SessionSlashCommandResultDetails;
+}
+
+export type CompactionOutcomeReason = "threshold" | "overflow" | "requested";
+export type CompactionOutcome = "skipped" | "cancelled" | "failed";
+
+export interface CompactionOutcomeDetails {
+	reason: CompactionOutcomeReason;
+	outcome: CompactionOutcome;
+}
+
+export interface CompactionOutcomeMessage extends CustomMessage<CompactionOutcomeDetails> {
+	customType: typeof COMPACTION_OUTCOME_CUSTOM_TYPE;
+	content: string;
+	details: CompactionOutcomeDetails;
 }
 
 /**
@@ -109,6 +124,8 @@ export interface CompactionSummaryMessage {
 	role: "compactionSummary";
 	summary: string;
 	tokensBefore: number;
+	/** Number of retained messages that precede this summary in transcript presentation. */
+	retainedMessageCount?: number;
 	/** User instructions that guided the summary (from `/compact <instructions>`) */
 	customInstructions?: string;
 	timestamp: number;
@@ -176,11 +193,13 @@ export function createCompactionSummaryMessage(
 	tokensBefore: number,
 	timestamp: string,
 	customInstructions?: string,
+	retainedMessageCount?: number,
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
-		summary: summary,
+		summary,
 		tokensBefore,
+		retainedMessageCount,
 		customInstructions,
 		timestamp: new Date(timestamp).getTime(),
 	};
@@ -232,6 +251,22 @@ export function createSessionSlashCommandResultMessage(
 		content,
 		display,
 		details: { ...details, command: { ...details.command } },
+		timestamp,
+	};
+}
+
+export function createCompactionOutcomeMessage(
+	content: string,
+	details: CompactionOutcomeDetails,
+	display = true,
+	timestamp = Date.now(),
+): CompactionOutcomeMessage {
+	return {
+		role: "custom",
+		customType: COMPACTION_OUTCOME_CUSTOM_TYPE,
+		content,
+		display,
+		details: { ...details },
 		timestamp,
 	};
 }
@@ -296,6 +331,19 @@ export function isSessionSlashCommandResultMessage(message: unknown): message is
 	);
 }
 
+export function isCompactionOutcomeMessage(message: unknown): message is CompactionOutcomeMessage {
+	if (!isRecord(message) || !hasValidCustomMessageEnvelope(message, COMPACTION_OUTCOME_CUSTOM_TYPE)) return false;
+	if (!isRecord(message.details)) return false;
+	return (
+		(message.details.reason === "threshold" ||
+			message.details.reason === "overflow" ||
+			message.details.reason === "requested") &&
+		(message.details.outcome === "skipped" ||
+			message.details.outcome === "cancelled" ||
+			message.details.outcome === "failed")
+	);
+}
+
 export function createHeartbeatPromptMessage(
 	job: AgentCronJob,
 	timestamp = Date.now(),
@@ -342,7 +390,8 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 				case "custom": {
 					if (
 						m.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||
-						m.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE
+						m.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE ||
+						m.customType === COMPACTION_OUTCOME_CUSTOM_TYPE
 					) {
 						return undefined;
 					}

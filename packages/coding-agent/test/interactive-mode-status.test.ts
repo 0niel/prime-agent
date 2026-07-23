@@ -485,6 +485,25 @@ describe("InteractiveMode.renderSessionContext", () => {
 		expect(renderAll(chatContainer)).toContain("Showing latest 400 of 405 messages for faster open.");
 	});
 
+	test("orders the compaction summary at its exact boundary before bounding the initial transcript", async () => {
+		const { harness, addMessageToChat } = createRenderSessionContextHarness();
+		const retained = Array.from({ length: 5 }, (_, index) => userMessage(`retained ${index}`, 5));
+		const summary = {
+			role: "compactionSummary",
+			summary: "summary",
+			tokensBefore: 123,
+			retainedMessageCount: retained.length,
+			timestamp: 5,
+		} as AgentMessage;
+		const later = Array.from({ length: 399 }, (_, index) => userMessage(`later ${index}`, 5));
+
+		await renderMessages(harness, [summary, ...retained, ...later], { limitTranscript: true });
+
+		expect(addMessageToChat).toHaveBeenCalledTimes(400);
+		expect(addMessageToChat.mock.calls[0]?.[0]).toBe(summary);
+		expect(addMessageToChat.mock.calls[1]?.[0]).toMatchObject({ content: "later 0" });
+	});
+
 	test("preserves the full transcript when rebuilding a cleared transcript", async () => {
 		const { harness, chatContainer, addMessageToChat } = createRenderSessionContextHarness();
 		chatContainer.addChild({ render: () => ["old transcript"], invalidate: () => {} });
@@ -3671,6 +3690,7 @@ describe("InteractiveMode live context usage", () => {
 			connectionState: { sessionId?: string; contextUsage?: unknown };
 			activityTracker: { getStatus(): { tokens: number } };
 			contextUsageTokenBaseline: number;
+			contextUsageRefreshGeneration: number;
 			patchConnectionState(patch: Record<string, unknown>): void;
 			refreshConnectionContextUsage(): Promise<void>;
 		};
@@ -3679,6 +3699,7 @@ describe("InteractiveMode live context usage", () => {
 		const patched: Record<string, unknown>[] = [];
 		fakeThis.activityTracker = { getStatus: () => ({ tokens: 0 }) };
 		fakeThis.contextUsageTokenBaseline = 0;
+		fakeThis.contextUsageRefreshGeneration = 0;
 		fakeThis.connectionState = { sessionId: "session-A", contextUsage: undefined };
 		fakeThis.patchConnectionState = (p) => patched.push(p);
 		fakeThis.agentConnection = {
@@ -3693,6 +3714,41 @@ describe("InteractiveMode live context usage", () => {
 
 		// Stats belonged to session-A; must not overwrite session-B.
 		expect(patched).toHaveLength(0);
+	});
+
+	test("refreshConnectionContextUsage drops an older same-session response", async () => {
+		type RefreshHarness = {
+			agentConnection: { getSessionStats(): Promise<{ contextUsage: unknown }> };
+			connectionState: { sessionId?: string; contextUsage?: unknown };
+			activityTracker: { getStatus(): { tokens: number } };
+			contextUsageTokenBaseline: number;
+			contextUsageRefreshGeneration: number;
+			patchConnectionState(patch: Record<string, unknown>): void;
+			refreshConnectionContextUsage(): Promise<void>;
+		};
+		const refresh = (InteractiveMode.prototype as unknown as RefreshHarness).refreshConnectionContextUsage;
+		const first = createDeferred<{ contextUsage: unknown }>();
+		const second = createDeferred<{ contextUsage: unknown }>();
+		const fakeThis = Object.create(InteractiveMode.prototype) as RefreshHarness;
+		const patched: Record<string, unknown>[] = [];
+		let request = 0;
+		fakeThis.activityTracker = { getStatus: () => ({ tokens: 0 }) };
+		fakeThis.contextUsageTokenBaseline = 0;
+		fakeThis.contextUsageRefreshGeneration = 0;
+		fakeThis.connectionState = { sessionId: "session-A", contextUsage: undefined };
+		fakeThis.patchConnectionState = (patch) => patched.push(patch);
+		fakeThis.agentConnection = {
+			getSessionStats: () => (++request === 1 ? first.promise : second.promise),
+		};
+
+		const olderRefresh = refresh.call(fakeThis);
+		const newerRefresh = refresh.call(fakeThis);
+		second.resolve({ contextUsage: { tokens: 10, contextWindow: 100, percent: 10 } });
+		await newerRefresh;
+		first.resolve({ contextUsage: { tokens: 90, contextWindow: 100, percent: 90 } });
+		await olderRefresh;
+
+		expect(patched).toEqual([{ contextUsage: { tokens: 10, contextWindow: 100, percent: 10 } }]);
 	});
 });
 

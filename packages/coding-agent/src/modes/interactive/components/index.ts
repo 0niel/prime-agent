@@ -12,6 +12,10 @@ export {
 	type ChildAgentStatus,
 	ChildAgentSummaryComponent,
 } from "./child-agent-inspector.js";
+export {
+	CompactionOutcomeMessageComponent,
+	MalformedCompactionOutcomeMessageComponent,
+} from "./compaction-outcome-message.js";
 export { CompactionSummaryMessageComponent } from "./compaction-summary-message.js";
 export {
 	ConfigurationMenuComponent,

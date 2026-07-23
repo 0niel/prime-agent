@@ -2,16 +2,20 @@ import type { TUI } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import {
+	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CustomMessage,
 	convertToLlm,
+	createCompactionOutcomeMessage,
 	createSessionSlashCommandMessage,
 	createSessionSlashCommandResultMessage,
+	isCompactionOutcomeMessage,
 	isSessionSlashCommandMessage,
 	isSessionSlashCommandResultMessage,
 	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
 	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "../src/core/messages.js";
 import { parseSessionSlashCommand } from "../src/core/slash-commands.js";
+import { CompactionOutcomeMessageComponent } from "../src/modes/interactive/components/compaction-outcome-message.js";
 import { buildConversationComponents } from "../src/modes/interactive/components/conversation-components.js";
 import { SlashCommandMessageComponent } from "../src/modes/interactive/components/slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "../src/modes/interactive/components/slash-command-result-message.js";
@@ -123,9 +127,34 @@ describe("session command messages", () => {
 		).toBe(false);
 	});
 
-	test("excludes valid and malformed reserved entries from LLM context", () => {
+	test("creates and validates typed compaction outcome messages", () => {
+		const outcome = createCompactionOutcomeMessage(
+			"Requested compaction skipped: too short",
+			{ reason: "requested", outcome: "skipped" },
+			true,
+			123,
+		);
+
+		expect(outcome).toEqual({
+			role: "custom",
+			customType: COMPACTION_OUTCOME_CUSTOM_TYPE,
+			content: "Requested compaction skipped: too short",
+			display: true,
+			details: { reason: "requested", outcome: "skipped" },
+			timestamp: 123,
+		});
+		expect(isCompactionOutcomeMessage(outcome)).toBe(true);
+		expect(isCompactionOutcomeMessage({ ...outcome, details: { reason: "manual", outcome: "skipped" } })).toBe(false);
+		expect(isCompactionOutcomeMessage({ ...outcome, details: { reason: "requested", outcome: "success" } })).toBe(
+			false,
+		);
+		expect(isCompactionOutcomeMessage({ ...outcome, timestamp: Number.NaN })).toBe(false);
+	});
+
+	test("excludes durable command, result, and compaction outcome entries from LLM context", () => {
 		const command = parseSessionSlashCommand("/compact");
 		expect(command).toBeDefined();
+
 		expect(
 			convertToLlm([
 				createSessionSlashCommandMessage(command!),
@@ -136,8 +165,24 @@ describe("session command messages", () => {
 				}),
 				customMessage(SESSION_SLASH_COMMAND_CUSTOM_TYPE),
 				customMessage(SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE),
+				customMessage(COMPACTION_OUTCOME_CUSTOM_TYPE),
 			]),
 		).toEqual([]);
+	});
+
+	test("renders valid and malformed compaction outcomes distinctly on replay", () => {
+		const valid = createCompactionOutcomeMessage("Auto-compaction skipped", {
+			reason: "threshold",
+			outcome: "skipped",
+		});
+		const malformed = customMessage(COMPACTION_OUTCOME_CUSTOM_TYPE, { reason: "manual", outcome: "skipped" });
+		const components = buildConversationComponents([valid, malformed], componentOptions);
+
+		expect(components[0]).toBeInstanceOf(CompactionOutcomeMessageComponent);
+		const output = stripAnsi(components.flatMap((component) => component.render(80)).join("\n"));
+		expect(output).toContain("Auto-compaction skipped");
+		expect(output).toContain("[Malformed compaction outcome message]");
+		expect(output).not.toContain("durable display text");
 	});
 
 	test("continues to include ordinary custom messages", () => {
