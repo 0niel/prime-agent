@@ -119,7 +119,6 @@ import {
 	type SessionImportSource,
 } from "../../core/session-import/index.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
-import type { SessionHeader } from "../../core/session-manager.js";
 import { parseSkillBlock } from "../../core/skill-blocks.js";
 import {
 	BUILTIN_SLASH_COMMANDS,
@@ -639,7 +638,7 @@ function isImportedSessionFile(sessionFile: string | undefined): boolean {
 		if (!firstLine) {
 			return false;
 		}
-		const header = JSON.parse(firstLine) as Partial<SessionHeader>;
+		const header = JSON.parse(firstLine) as { type?: unknown; importedFrom?: unknown };
 		return header.type === "session" && header.importedFrom !== undefined;
 	} catch {
 		return false;
