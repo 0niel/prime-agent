@@ -2429,14 +2429,16 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		maxTokens: 128000,
 	} as AgentConnectionModel;
 
-	test("retains a startup prompt through repeated failures before later startup and user prompts", async () => {
+	test("retains transient startup failures but skips a persistently failing prompt", async () => {
 		vi.useFakeTimers();
 		const inputDone = createDeferred<void>();
-		const prompt = vi
-			.fn<() => Promise<void>>()
-			.mockRejectedValueOnce(new Error("transient admission failure"))
-			.mockRejectedValueOnce(new Error("repeated admission failure"))
-			.mockResolvedValue(undefined);
+		let firstAttempts = 0;
+		const prompt = vi.fn((message: string) => {
+			if (message === "first" && firstAttempts++ < 3) {
+				return Promise.reject(new Error(`admission failure ${firstAttempts}`));
+			}
+			return Promise.resolve();
+		});
 		const showError = vi.fn();
 		const submitHarness = createSubmitHandlerHarness({
 			agentConnection: {
@@ -2461,16 +2463,9 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		try {
 			const run = InteractiveMode.prototype.run.call(fakeThis as never);
 			await vi.advanceTimersByTimeAsync(0);
-			expect(prompt).toHaveBeenCalledOnce();
 			const userSubmission = fakeThis.defaultEditor.onSubmit?.("user");
 
-			await vi.advanceTimersByTimeAsync(249);
-			expect(prompt).toHaveBeenCalledOnce();
-			await vi.advanceTimersByTimeAsync(1);
-			expect(prompt).toHaveBeenCalledTimes(2);
-			await vi.advanceTimersByTimeAsync(249);
-			expect(prompt).toHaveBeenCalledTimes(2);
-			await vi.advanceTimersByTimeAsync(1);
+			await vi.advanceTimersByTimeAsync(500);
 			await userSubmission;
 
 			expect(prompt.mock.calls).toEqual([
@@ -2480,7 +2475,11 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 				["second", { images: undefined, streamingBehavior: "followUp", queueIfBusy: true }],
 				["user", { images: [], streamingBehavior: "steer", queueIfBusy: true }],
 			]);
-			expect(showError.mock.calls).toEqual([["transient admission failure"], ["repeated admission failure"]]);
+			expect(showError.mock.calls).toEqual([
+				["admission failure 1"],
+				["admission failure 2"],
+				["Skipping startup prompt after 3 failed attempts: admission failure 3"],
+			]);
 			inputDone.resolve(undefined);
 			await expect(run).resolves.toBe("agents_view");
 		} finally {
@@ -2533,7 +2532,6 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			try {
 				const run = InteractiveMode.prototype.run.call(fakeThis as never);
 				await vi.advanceTimersByTimeAsync(250);
-				model = primeModel;
 				fakeThis.editor.onSubmit = fakeThis.defaultEditor.onSubmit;
 				const submit = () =>
 					scenario === "typing"
@@ -2548,6 +2546,8 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 				expect(editorText).toBe("");
 				if (scenario === "typing") editorText = "typing during startup wait";
 				const duplicate = scenario === "Alt+Enter" ? submit() : undefined;
+				expect(prompt).not.toHaveBeenCalled();
+				model = primeModel;
 				await vi.advanceTimersByTimeAsync(250);
 				expect(prompt.mock.calls.map(([message]) => message)).toEqual(["startup"]);
 				await vi.advanceTimersByTimeAsync(249);

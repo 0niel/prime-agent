@@ -477,39 +477,29 @@ describe("InteractiveMode prompt stash", () => {
 		expect(mode.editor.getText()).toBe("half-written draft");
 	});
 
-	it("restores a stashed prompt after idle follow-up slash commands clear the editor", async () => {
+	it("owns Alt+Enter /settings locally while preserving the stashed prompt", async () => {
 		let resolveSettings: () => void = () => {};
 		const settingsDone = new Promise<void>((resolve) => {
 			resolveSettings = resolve;
 		});
-		const mode: SubmitHarness & { showSettingsSelector: Mock<() => Promise<void>> } = {
-			...createPromptStashHarness({ text: "/settings", stash: "half-written draft" }),
-			defaultEditor: {},
-			sideQuestionContainer: { clear: vi.fn() },
-			isAgentCompacting: () => false,
-			isAgentStreaming: () => false,
-			flushPendingBashComponents: vi.fn(),
-			onInputCallback: vi.fn(),
-			clearSideQuestion: vi.fn(),
-			collectImagesFor: vi.fn(() => []),
-			agentConnection: { prompt: vi.fn(async () => {}) },
-			updatePendingMessagesDisplay: vi.fn(),
-			ui: { requestRender: vi.fn() },
-			showError: vi.fn(),
-			submittedInputBehavior: "steer",
-			inputSubmissionGeneration: 0,
+		const admitPendingStartupPrompts = vi.fn(() => new Promise<void>(() => {}));
+		const mode = Object.assign(createSubmitHarness({ text: "/settings", stash: "half-written draft" }), {
+			admitPendingStartupPrompts,
 			showSettingsSelector: vi.fn(() => settingsDone),
-		};
-		Object.setPrototypeOf(mode, InteractiveMode.prototype);
-		interactiveModeMethods.setupEditorSubmitHandler.call(mode);
+		});
 		mode.editor.onSubmit = mode.defaultEditor.onSubmit;
 
 		const followUp = interactiveModeMethods.handleFollowUp.call(mode);
-		await Promise.resolve();
+		expect(mode.editor.getText()).toBe("");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(mode.showSettingsSelector).toHaveBeenCalledOnce();
+		await interactiveModeMethods.handleFollowUp.call(mode);
+		expect(mode.showSettingsSelector).toHaveBeenCalledOnce();
+		expect(admitPendingStartupPrompts).not.toHaveBeenCalled();
+
 		resolveSettings();
 		await followUp;
 
-		expect(mode.showSettingsSelector).toHaveBeenCalled();
 		expect(mode.promptStash).toBeUndefined();
 		expect(mode.editor.getText()).toBe("half-written draft");
 	});
@@ -630,6 +620,31 @@ describe("InteractiveMode prompt stash", () => {
 		expect(mode.editor.getText()).toBe("stashed draft");
 		expect(mode.promptStash).toBeUndefined();
 	});
+
+	it.each(["typing", "submission"] as const)(
+		"does not restore an older failed Alt+Enter over newer %s",
+		async (newerInput) => {
+			let rejectFirst: (error: Error) => void = () => {};
+			const firstPrompt = new Promise<void>((_resolve, reject) => {
+				rejectFirst = reject;
+			});
+			const prompt = vi
+				.fn()
+				.mockImplementationOnce(() => firstPrompt)
+				.mockResolvedValueOnce(undefined);
+			const mode = createSubmitHarness({ text: "stale follow-up", prompt });
+			mode.editor.onSubmit = mode.defaultEditor.onSubmit;
+
+			const firstSubmission = interactiveModeMethods.handleFollowUp.call(mode);
+			mode.editor.setText("newer input");
+			if (newerInput === "submission") await mode.defaultEditor.onSubmit?.("newer input");
+			rejectFirst(new Error("late follow-up rejection"));
+			await firstSubmission;
+
+			expect(mode.editor.getText()).toBe(newerInput === "typing" ? "newer input" : "");
+			expect(mode.showError).toHaveBeenCalledWith("late follow-up rejection");
+		},
+	);
 
 	it("does not restore a stale submission after a newer submission is accepted", async () => {
 		let rejectFirst: (error: Error) => void = () => {};

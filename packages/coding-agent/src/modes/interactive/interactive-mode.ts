@@ -1483,6 +1483,7 @@ export class InteractiveMode {
 			...(initialMessages ?? []).map((text) => ({ text, images: undefined })),
 		];
 		let nextInitialPrompt = 0;
+		let initialPromptFailures = 0;
 		let initialPromptDelivery: Promise<void> | undefined;
 		let initialPromptRetry: ReturnType<typeof setInterval> | undefined;
 		let acceptingInitialPrompts = true;
@@ -1511,10 +1512,18 @@ export class InteractiveMode {
 							streamingBehavior: nextInitialPrompt === 0 ? "steer" : "followUp",
 							queueIfBusy: true,
 						});
+						initialPromptFailures = 0;
 						nextInitialPrompt++;
 					} catch (error) {
-						this.showError(error instanceof Error ? error.message : "Unknown error occurred");
-						return;
+						initialPromptFailures++;
+						const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+						if (initialPromptFailures < 3) {
+							this.showError(errorMessage);
+							return;
+						}
+						this.showError(`Skipping startup prompt after 3 failed attempts: ${errorMessage}`);
+						initialPromptFailures = 0;
+						nextInitialPrompt++;
 					}
 				}
 				if (nextInitialPrompt >= initialPrompts.length) clearInitialPromptRetry();
@@ -1524,7 +1533,7 @@ export class InteractiveMode {
 			return initialPromptDelivery;
 		};
 		this.admitPendingStartupPrompts = async () => {
-			while (acceptingInitialPrompts && nextInitialPrompt < initialPrompts.length && this.getCurrentModel()) {
+			while (acceptingInitialPrompts && nextInitialPrompt < initialPrompts.length) {
 				if (initialPromptDelivery) {
 					await initialPromptDelivery;
 				} else {
@@ -4334,10 +4343,10 @@ export class InteractiveMode {
 			this.submittedInputBehavior = "steer";
 			text = text.trim();
 			if (!text) return;
+			const submissionGeneration = ++this.inputSubmissionGeneration;
 			this.clearShortcutGuide();
 			const promptStashToRestore = this.promptStash;
 			let restorePromptStashAfterSubmit = true;
-			let submissionGeneration: number | undefined;
 
 			try {
 				const slashCommand = parseSlashCommand(text);
@@ -4680,7 +4689,6 @@ export class InteractiveMode {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
 				const promptStashAfterClear = this.promptStash;
-				submissionGeneration = ++this.inputSubmissionGeneration;
 				await this.admitPendingStartupPrompts?.();
 				try {
 					await this.agentConnection.prompt(text, {
@@ -4709,7 +4717,7 @@ export class InteractiveMode {
 				if (
 					restorePromptStashAfterSubmit &&
 					promptStashToRestore !== undefined &&
-					(submissionGeneration === undefined || submissionGeneration === this.inputSubmissionGeneration)
+					submissionGeneration === this.inputSubmissionGeneration
 				) {
 					this.restorePromptStashIfEditorEmpty(promptStashToRestore);
 				}
@@ -6776,10 +6784,24 @@ export class InteractiveMode {
 	private async handleFollowUp(): Promise<void> {
 		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
 		if (!text || !this.editor.onSubmit) return;
+
+		// Unlike Enter, Alt+Enter does not go through Editor.submitValue(), so
+		// capture and clear synchronously before an async/local handler can yield.
+		this.editor.setText("");
 		this.submittedInputBehavior = "followUp";
-		const submission = this.editor.onSubmit(text);
-		this.submittedInputBehavior = "steer";
-		await submission;
+		let submissionGeneration: number | undefined;
+		try {
+			const submission = this.editor.onSubmit(text);
+			submissionGeneration = this.inputSubmissionGeneration;
+			await submission;
+		} catch (error) {
+			if (submissionGeneration === this.inputSubmissionGeneration && this.editor.getText().length === 0) {
+				this.editor.setText(text);
+			}
+			throw error;
+		} finally {
+			this.submittedInputBehavior = "steer";
+		}
 	}
 
 	private async handleDequeue(): Promise<void> {
