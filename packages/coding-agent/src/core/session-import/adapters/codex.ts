@@ -112,7 +112,8 @@ export async function parseCodexSession(filePath: string): Promise<ImportedSessi
 		if (asString(entry.type) === "session_meta") {
 			sourceId ??= asString(payload.id);
 			cwd ||= asString(payload.cwd) ?? "";
-			provider = asString(payload.model_provider) ?? provider;
+			const sourceProvider = asString(payload.model_provider);
+			provider = sourceProvider === "openai" ? "openai-codex" : (sourceProvider ?? provider);
 			return;
 		}
 		if (asString(entry.type) === "turn_context") {

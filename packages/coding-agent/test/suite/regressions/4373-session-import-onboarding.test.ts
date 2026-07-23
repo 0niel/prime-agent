@@ -14,7 +14,12 @@ import {
 	importSessionsAndSkills,
 	type SessionImportInventory,
 } from "../../../src/core/session-import/index.js";
-import { buildSessionContext, loadEntriesFromFile, type SessionHeader } from "../../../src/core/session-manager.js";
+import {
+	buildSessionContext,
+	loadEntriesFromFile,
+	type SessionHeader,
+	SessionManager,
+} from "../../../src/core/session-manager.js";
 import { SessionImportSelectorComponent } from "../../../src/modes/interactive/components/session-import-selector.js";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.js";
 
@@ -90,7 +95,7 @@ function createCodexFixture(home: string): void {
 			payload: {
 				id: "codex-session",
 				cwd: "/workspace/codex",
-				model_provider: "openai-codex",
+				model_provider: "openai",
 			},
 		},
 		{
@@ -519,6 +524,7 @@ describe("ENG-4373 onboarding session import", () => {
 				.slice(1)
 				.filter((entry) => entry.type !== "session"),
 		);
+		expect(codexContext.messages.find((message) => message.role === "assistant")?.provider).toBe("openai-codex");
 		expect(
 			codexContext.messages
 				.filter((message) => message.role === "assistant")
@@ -532,6 +538,25 @@ describe("ENG-4373 onboarding session import", () => {
 			sessionFile: claude.sessionFile,
 			status: "existing",
 		});
+	});
+
+	it("restores legacy Codex imports through the Codex subscription provider", () => {
+		const manager = SessionManager.inMemory("/workspace/codex");
+		manager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "Imported Codex response" }],
+			api: "openai-codex-responses",
+			provider: "openai",
+			model: "gpt-5.6-sol",
+			usage: ZERO_USAGE,
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+
+		const context = manager.buildSessionContext();
+
+		expect(context.model).toEqual({ provider: "openai-codex", modelId: "gpt-5.6-sol" });
+		expect(context.messages.find((message) => message.role === "assistant")?.provider).toBe("openai-codex");
 	});
 
 	it("continues importing other sources when one source disappears", async () => {

@@ -258,6 +258,13 @@ export interface SessionContext {
 	model: { provider: string; modelId: string } | null;
 }
 
+function normalizeLegacyCodexAssistant(message: AssistantMessage): AssistantMessage {
+	if (message.api === "openai-codex-responses" && message.provider === "openai") {
+		return { ...message, provider: "openai-codex" };
+	}
+	return message;
+}
+
 export interface SessionInfo {
 	path: string;
 	id: string;
@@ -499,7 +506,8 @@ export function buildSessionContext(
 		} else if (entry.type === "model_change") {
 			model = { provider: entry.provider, modelId: entry.modelId };
 		} else if (entry.type === "message" && entry.message.role === "assistant") {
-			model = { provider: entry.message.provider, modelId: entry.message.model };
+			const assistantMessage = normalizeLegacyCodexAssistant(entry.message);
+			model = { provider: assistantMessage.provider, modelId: assistantMessage.model };
 		} else if (entry.type === "compaction") {
 			compaction = entry;
 		}
@@ -514,7 +522,9 @@ export function buildSessionContext(
 
 	const appendMessage = (entry: SessionEntry) => {
 		if (entry.type === "message") {
-			messages.push(entry.message);
+			messages.push(
+				entry.message.role === "assistant" ? normalizeLegacyCodexAssistant(entry.message) : entry.message,
+			);
 		} else if (entry.type === "custom_message") {
 			messages.push(
 				createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
