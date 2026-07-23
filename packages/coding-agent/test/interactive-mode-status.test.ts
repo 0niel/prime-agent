@@ -2429,13 +2429,18 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		maxTokens: 128000,
 	} as AgentConnectionModel;
 
-	test("retains transient startup failures but skips a persistently failing prompt", async () => {
+	test("defers, retries transient startup failures, and skips a persistently failing prompt", async () => {
 		vi.useFakeTimers();
 		const inputDone = createDeferred<void>();
+		let model: AgentConnectionModel | undefined;
 		let firstAttempts = 0;
+		let secondAttempts = 0;
 		const prompt = vi.fn((message: string) => {
-			if (message === "first" && firstAttempts++ < 3) {
-				return Promise.reject(new Error(`admission failure ${firstAttempts}`));
+			if (message === "first" && firstAttempts++ < 2) {
+				return Promise.reject(new Error(`transient failure ${firstAttempts}`));
+			}
+			if (message === "second") {
+				return Promise.reject(new Error(`admission failure ${++secondAttempts}`));
 			}
 			return Promise.resolve();
 		});
@@ -2450,9 +2455,9 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		const fakeThis = Object.assign(
 			submitHarness,
 			createStartupRunHarness(
-				{ initialMessage: "first", initialMessages: ["second"] },
+				{ initialMessage: "first", initialMessages: ["second", "third"] },
 				{
-					getCurrentModel: () => primeModel,
+					getCurrentModel: () => model,
 					getUserInput: vi.fn(() => inputDone.promise),
 					agentConnection: submitHarness.agentConnection,
 					showError,
@@ -2462,24 +2467,37 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 
 		try {
 			const run = InteractiveMode.prototype.run.call(fakeThis as never);
-			await vi.advanceTimersByTimeAsync(0);
-			const userSubmission = fakeThis.defaultEditor.onSubmit?.("user");
+			await vi.advanceTimersByTimeAsync(250);
+			expect(prompt).not.toHaveBeenCalled();
 
-			await vi.advanceTimersByTimeAsync(500);
+			model = primeModel;
+			const userSubmission = fakeThis.defaultEditor.onSubmit?.("user");
+			await vi.advanceTimersByTimeAsync(1_250);
 			await userSubmission;
 
+			const steer = { images: undefined, streamingBehavior: "steer", queueIfBusy: true };
+			const followUp = { images: undefined, streamingBehavior: "followUp", queueIfBusy: true };
 			expect(prompt.mock.calls).toEqual([
-				["first", { images: undefined, streamingBehavior: "steer", queueIfBusy: true }],
-				["first", { images: undefined, streamingBehavior: "steer", queueIfBusy: true }],
-				["first", { images: undefined, streamingBehavior: "steer", queueIfBusy: true }],
-				["second", { images: undefined, streamingBehavior: "followUp", queueIfBusy: true }],
+				["first", steer],
+				["first", steer],
+				["first", steer],
+				["second", followUp],
+				["second", followUp],
+				["second", followUp],
+				["third", followUp],
 				["user", { images: [], streamingBehavior: "steer", queueIfBusy: true }],
 			]);
 			expect(showError.mock.calls).toEqual([
+				["transient failure 1"],
+				["transient failure 2"],
 				["admission failure 1"],
 				["admission failure 2"],
 				["Skipping startup prompt after 3 failed attempts: admission failure 3"],
 			]);
+
+			// Delivery settled: the retry cadence stops instead of re-prompting.
+			await vi.advanceTimersByTimeAsync(1_000);
+			expect(prompt).toHaveBeenCalledTimes(8);
 			inputDone.resolve(undefined);
 			await expect(run).resolves.toBe("agents_view");
 		} finally {
@@ -2569,35 +2587,6 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			}
 		},
 	);
-
-	test("defers an initial prompt until a model appears and cleans up its retry timer", async () => {
-		vi.useFakeTimers();
-		let model: AgentConnectionModel | undefined;
-		let finishInput: () => void = () => {};
-		const inputDone = new Promise<void>((resolve) => {
-			finishInput = resolve;
-		});
-		const prompt = vi.fn(async () => {});
-		const fakeThis = createStartupRunHarness(
-			{ initialMessage: "deferred" },
-			{ getCurrentModel: () => model, getUserInput: vi.fn(() => inputDone), agentConnection: { prompt } },
-		);
-
-		try {
-			const run = InteractiveMode.prototype.run.call(fakeThis as never);
-			await vi.advanceTimersByTimeAsync(250);
-			expect(prompt).not.toHaveBeenCalled();
-			model = primeModel;
-			await vi.advanceTimersByTimeAsync(250);
-			expect(prompt).toHaveBeenCalledOnce();
-			await vi.advanceTimersByTimeAsync(1_000);
-			expect(prompt).toHaveBeenCalledOnce();
-			finishInput();
-			await expect(run).resolves.toBe("agents_view");
-		} finally {
-			vi.useRealTimers();
-		}
-	});
 
 	test("keeps the TUI alive while direct editor submissions own prompt delivery", async () => {
 		const fakeThis = {

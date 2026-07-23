@@ -1482,65 +1482,56 @@ export class InteractiveMode {
 			...(initialMessage ? [{ text: initialMessage, images: initialImages }] : []),
 			...(initialMessages ?? []).map((text) => ({ text, images: undefined })),
 		];
-		let nextInitialPrompt = 0;
-		let initialPromptFailures = 0;
-		let initialPromptDelivery: Promise<void> | undefined;
-		let initialPromptRetry: ReturnType<typeof setInterval> | undefined;
-		let acceptingInitialPrompts = true;
-		const initialPromptRetryWaiters = new Set<() => void>();
-		const releaseInitialPromptRetryWaiters = () => {
-			for (const resolve of initialPromptRetryWaiters) resolve();
-			initialPromptRetryWaiters.clear();
-		};
-		const clearInitialPromptRetry = () => {
-			if (initialPromptRetry) clearInterval(initialPromptRetry);
-			initialPromptRetry = undefined;
-		};
-		const sendInitialPrompts = async () => {
-			if (nextInitialPrompt >= initialPrompts.length) {
-				clearInitialPromptRetry();
-				return;
-			}
-			if (!this.getCurrentModel()) return;
-			if (initialPromptDelivery) return initialPromptDelivery;
-			initialPromptDelivery = (async () => {
-				while (nextInitialPrompt < initialPrompts.length && this.getCurrentModel()) {
-					const prompt = initialPrompts[nextInitialPrompt]!;
-					try {
-						await this.agentConnection.prompt(prompt.text, {
-							images: prompt.images,
-							streamingBehavior: nextInitialPrompt === 0 ? "steer" : "followUp",
-							queueIfBusy: true,
-						});
-						initialPromptFailures = 0;
-						nextInitialPrompt++;
-					} catch (error) {
-						initialPromptFailures++;
-						const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-						if (initialPromptFailures < 3) {
-							this.showError(errorMessage);
-							return;
-						}
-						this.showError(`Skipping startup prompt after 3 failed attempts: ${errorMessage}`);
-						initialPromptFailures = 0;
-						nextInitialPrompt++;
-					}
-				}
-				if (nextInitialPrompt >= initialPrompts.length) clearInitialPromptRetry();
-			})().finally(() => {
-				initialPromptDelivery = undefined;
+		// One drive loop owns startup-prompt delivery: it retries on a 250ms cadence
+		// while a model is missing or admission fails transiently, shows every
+		// admission error, and skips a prompt after three failed attempts.
+		// `startupPromptsSettled` is the user-submission barrier (startup prompts
+		// stay ahead of user prompts); it resolves when the prompts exhaust or the
+		// run lifecycle ends, whichever comes first.
+		let settleStartupPrompts = () => {};
+		const startupPromptsSettled = new Promise<void>((resolve) => {
+			settleStartupPrompts = resolve;
+		});
+		/** Resolves false when the run lifecycle ended before the 250ms retry delay elapsed. */
+		const startupRetryDelay = () =>
+			new Promise<boolean>((resolve) => {
+				const timer = setTimeout(() => resolve(true), 250);
+				timer.unref?.();
+				void startupPromptsSettled.then(() => {
+					clearTimeout(timer);
+					resolve(false);
+				});
 			});
-			return initialPromptDelivery;
-		};
-		this.admitPendingStartupPrompts = async () => {
-			while (acceptingInitialPrompts && nextInitialPrompt < initialPrompts.length) {
-				if (initialPromptDelivery) {
-					await initialPromptDelivery;
-				} else {
-					await new Promise<void>((resolve) => initialPromptRetryWaiters.add(resolve));
+		const deliverStartupPrompts = async () => {
+			let failures = 0;
+			for (let next = 0; next < initialPrompts.length; ) {
+				if (!this.getCurrentModel()) {
+					if (!(await startupRetryDelay())) return;
+					continue;
+				}
+				const prompt = initialPrompts[next]!;
+				try {
+					await this.agentConnection.prompt(prompt.text, {
+						images: prompt.images,
+						streamingBehavior: next === 0 ? "steer" : "followUp",
+						queueIfBusy: true,
+					});
+					failures = 0;
+					next++;
+				} catch (error) {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					if (++failures < 3) {
+						this.showError(errorMessage);
+						if (!(await startupRetryDelay())) return;
+						continue;
+					}
+					this.showError(`Skipping startup prompt after 3 failed attempts: ${errorMessage}`);
+					failures = 0;
+					next++;
 				}
 			}
 		};
+		this.admitPendingStartupPrompts = initialPrompts.length > 0 ? () => startupPromptsSettled : undefined;
 
 		let deferredStartupNotificationsShown = false;
 		const showDeferredStartupNotifications = () => {
@@ -1597,22 +1588,14 @@ export class InteractiveMode {
 		showDeferredStartupNotifications();
 		showModelFallbackWarning();
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
-		await sendInitialPrompts();
-		if (nextInitialPrompt < initialPrompts.length) {
-			initialPromptRetry = setInterval(() => {
-				void sendInitialPrompts().finally(releaseInitialPromptRetryWaiters);
-			}, 250);
-			initialPromptRetry.unref?.();
-		}
+		void deliverStartupPrompts().finally(settleStartupPrompts);
 
 		// Enter/Alt+Enter submit directly through AgentConnection. Keep run alive
 		// until shutdown or a return to the agents view resolves the lifecycle wait.
 		try {
 			await this.getUserInput();
 		} finally {
-			acceptingInitialPrompts = false;
-			clearInitialPromptRetry();
-			releaseInitialPromptRetryWaiters();
+			settleStartupPrompts();
 			this.admitPendingStartupPrompts = undefined;
 		}
 		return "agents_view";
@@ -4698,15 +4681,11 @@ export class InteractiveMode {
 					});
 				} catch (error) {
 					// Admission failed, so put the exact submitted input back. Accepted
-					// inputs are session-owned and must never be restored by the client.
-					if (submissionGeneration === this.inputSubmissionGeneration && this.editor.getText().length === 0) {
-						this.editor.setText(text);
-					}
-					if (
-						submissionGeneration === this.inputSubmissionGeneration &&
-						this.promptStash === promptStashAfterClear
-					) {
-						this.promptStash = promptStashToRestore;
+					// inputs are session-owned and must never be restored by the client,
+					// and an older failed submit never clobbers newer typing or stashes.
+					if (submissionGeneration === this.inputSubmissionGeneration) {
+						if (this.editor.getText().length === 0) this.editor.setText(text);
+						if (this.promptStash === promptStashAfterClear) this.promptStash = promptStashToRestore;
 					}
 					this.showError(error instanceof Error ? error.message : String(error));
 					return;
@@ -6789,18 +6768,19 @@ export class InteractiveMode {
 		// capture and clear synchronously before an async/local handler can yield.
 		this.editor.setText("");
 		this.submittedInputBehavior = "followUp";
-		let submissionGeneration: number | undefined;
+		// onSubmit consumes the behavior flag and bumps the generation synchronously;
+		// capture the generation so an older failed submit never clobbers newer
+		// typing or submissions.
+		const submission = this.editor.onSubmit(text);
+		this.submittedInputBehavior = "steer";
+		const submissionGeneration = this.inputSubmissionGeneration;
 		try {
-			const submission = this.editor.onSubmit(text);
-			submissionGeneration = this.inputSubmissionGeneration;
 			await submission;
 		} catch (error) {
 			if (submissionGeneration === this.inputSubmissionGeneration && this.editor.getText().length === 0) {
 				this.editor.setText(text);
 			}
 			throw error;
-		} finally {
-			this.submittedInputBehavior = "steer";
 		}
 	}
 
