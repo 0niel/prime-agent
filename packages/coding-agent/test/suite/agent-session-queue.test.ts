@@ -2071,16 +2071,13 @@ prepared:${event.prompt}`,
 		const waitForPreparation = new Promise<void>((resolve) => {
 			preparationStarted = resolve;
 		});
-		let releasePreparation: (() => void) | undefined;
-		const preparationGate = new Promise<void>((resolve) => {
-			releasePreparation = resolve;
-		});
+		let pause: { release(): void } | undefined;
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
 					pi.on("before_agent_start", async () => {
 						preparationStarted?.();
-						await preparationGate;
+						pause = harness.session.acquireQueuedWorkPause();
 					});
 				},
 			],
@@ -2100,16 +2097,25 @@ prepared:${event.prompt}`,
 		const completionRejection = expect(completion).rejects.toThrow("cleared before delivery");
 		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = false;
 		await waitForPreparation;
+		expect(pause).toBeDefined();
 
 		expect(harness.session.clearQueue()).toEqual({
 			steering: [],
 			followUp: ["clear first while preparing", "clear second while preparing"],
 		});
-		releasePreparation?.();
+		pause?.release();
 		await firstCompletionRejection;
 		await completionRejection;
 		await harness.session.waitForSessionInputIdle();
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
 		expect(getUserTexts(harness)).toEqual([]);
+
+		harness.setResponses([fauxAssistantMessage("later response")]);
+		await harness.session.prompt("later prompt");
+
+		expect(getUserTexts(harness)).toEqual(["later prompt"]);
+		expect(getAssistantTexts(harness)).toEqual(["later response"]);
 	});
 
 	it("settles late agent-message delivery waiters", async () => {

@@ -4996,7 +4996,7 @@ export class AgentSession {
 							if (!delivered.has(prompt.message)) undelivered.push(prompt);
 						}
 						if (this._isDeferredSessionInputError(error, epoch)) {
-							if (undelivered.length > 0) {
+							if (!this._activeSessionInput?.cancelled && undelivered.length > 0) {
 								queue.unshift(...undelivered);
 								this._syncSteeringStopPending();
 								this._emitQueueUpdate();
