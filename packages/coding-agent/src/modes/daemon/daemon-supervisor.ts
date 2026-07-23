@@ -2425,26 +2425,22 @@ export class DaemonSupervisor {
 		this.cancelEphemeralWorkerCleanup(match.worker);
 		match.worker.pendingAttachments++;
 		try {
-			await this.ensureWorkerReadyForAttach(match.worker);
+			if (match.worker.intentionalStop || match.worker.descriptor.stopRequestedAt) {
+				throw new Error(`Session worker ${match.worker.descriptor.workerId} is stopping`);
+			}
+			if (match.worker.recovery || match.worker.descriptor.lifecycle === "recovering") {
+				await this.recoverWorker(match.worker);
+			}
+			if (match.worker.intentionalStop || match.worker.descriptor.stopRequestedAt) {
+				throw new Error(`Session worker ${match.worker.descriptor.workerId} is stopping`);
+			}
+			if (match.worker.descriptor.lifecycle !== "ready") {
+				throw new Error(`Session worker is ${match.worker.descriptor.lifecycle}`);
+			}
 			return await this.attachClientToWorker(client, command, match);
 		} finally {
 			match.worker.pendingAttachments--;
 			this.scheduleEphemeralWorkerCleanup(match.worker);
-		}
-	}
-
-	private async ensureWorkerReadyForAttach(worker: ResidentWorker): Promise<void> {
-		if (worker.intentionalStop || worker.descriptor.stopRequestedAt) {
-			throw new Error(`Session worker ${worker.descriptor.workerId} is stopping`);
-		}
-		if (!worker.client || worker.descriptor.lifecycle !== "ready") {
-			await this.recoverWorker(worker);
-		}
-		if (worker.intentionalStop || worker.descriptor.stopRequestedAt) {
-			throw new Error(`Session worker ${worker.descriptor.workerId} is stopping`);
-		}
-		if (!worker.client || worker.descriptor.lifecycle !== "ready") {
-			throw new Error(`Session worker is ${worker.descriptor.lifecycle}`);
 		}
 	}
 
