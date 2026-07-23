@@ -39,7 +39,9 @@ export function collectImportedSessionKeys(sessionDir: string): Set<string> {
 			if (source && id && contentHash) {
 				keys.add(sessionImportKey(source as SessionImportSource, id, contentHash));
 			}
-		} catch {}
+		} catch {
+			// Unreadable sessions cannot contribute a reliable deduplication key.
+		}
 	}
 	return keys;
 }

@@ -643,7 +643,7 @@ describe("ToolExecutionComponent parity", () => {
 			"imported_tool",
 			"tool-imported",
 			{ command: "large historical command" },
-			{},
+			{ compactCompleted: true },
 			undefined,
 			createFakeTui(),
 			process.cwd(),

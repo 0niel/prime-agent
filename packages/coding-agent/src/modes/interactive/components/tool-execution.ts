@@ -16,6 +16,8 @@ export interface ToolExecutionOptions {
 	showImages?: boolean;
 	/** Whether image metadata may parse dimensions from base64 data. */
 	includeImageDimensions?: boolean;
+	/** Whether completed generic tools should show only their header until expanded. */
+	compactCompleted?: boolean;
 }
 
 export interface ToolExecutionRendererDefinition {
@@ -81,6 +83,7 @@ export class ToolExecutionComponent extends Container {
 	private showExpandHint = true;
 	private showImages: boolean;
 	private includeImageDimensions: boolean;
+	private compactCompleted: boolean;
 	private isPartial = true;
 	private toolDefinition?: ToolExecutionDefinition;
 	private builtInToolDefinition?: ToolDefinition<any, any>;
@@ -113,6 +116,7 @@ export class ToolExecutionComponent extends Container {
 		this.builtInToolDefinition = createReplayBuiltInToolDefinition(toolName, cwd, toolDefinition);
 		this.showImages = options.showImages ?? true;
 		this.includeImageDimensions = options.includeImageDimensions ?? true;
+		this.compactCompleted = options.compactCompleted ?? false;
 		this.ui = ui;
 		this.cwd = cwd;
 
@@ -479,7 +483,7 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private formatToolExecution(): string {
-		if (this.result && !this.isPartial && !this.expanded) {
+		if (this.compactCompleted && this.result && !this.isPartial && !this.expanded) {
 			return "";
 		}
 		const parts: string[] = [];

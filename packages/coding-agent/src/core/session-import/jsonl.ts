@@ -26,7 +26,9 @@ export async function readJsonLinePrefix(filePath: string, limit: number): Promi
 				if (values.length >= limit) {
 					break;
 				}
-			} catch {}
+			} catch {
+				// Skip malformed records so later valid JSONL entries remain importable.
+			}
 		}
 	} finally {
 		lines.close();

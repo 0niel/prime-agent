@@ -72,7 +72,9 @@ function listRecentJsonlFiles(roots: JsonlSearchRoot[], cutoff: number): string[
 				const normalized = resolve(path);
 				files.set(normalized, { path: normalized, modifiedAt });
 			}
-		} catch {}
+		} catch {
+			// Files can disappear or become unreadable while discovery is scanning.
+		}
 	};
 	const visit = (root: JsonlSearchRoot, directory: string) => {
 		let entries: Dirent<string>[];
@@ -194,7 +196,9 @@ function discoverOpenCodeReferences(
 					});
 				}
 			}
-		} catch {}
+		} catch {
+			// A bad database should not prevent trying the remaining OpenCode locations.
+		}
 	}
 	if (candidatesById.size > 0) {
 		return [...candidatesById.values()]

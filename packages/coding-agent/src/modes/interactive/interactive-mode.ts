@@ -119,6 +119,7 @@ import {
 	type SessionImportSource,
 } from "../../core/session-import/index.js";
 import { SessionImportFileNotFoundError } from "../../core/session-import-errors.js";
+import type { SessionHeader } from "../../core/session-manager.js";
 import { parseSkillBlock } from "../../core/skill-blocks.js";
 import {
 	BUILTIN_SLASH_COMMANDS,
@@ -132,6 +133,7 @@ import { PRIME_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { readClipboardImage } from "../../utils/clipboard-image.js";
+import { readFirstLineSync } from "../../utils/file-lines.js";
 import { parseGitUrl } from "../../utils/git.js";
 import { resizeImage } from "../../utils/image-resize.js";
 import { getCwdRelativePath } from "../../utils/paths.js";
@@ -628,6 +630,22 @@ function omitOrphanToolResults(messages: AgentMessage[]): AgentMessage[] {
 	return renderableMessages;
 }
 
+function isImportedSessionFile(sessionFile: string | undefined): boolean {
+	if (!sessionFile) {
+		return false;
+	}
+	try {
+		const firstLine = readFirstLineSync(sessionFile);
+		if (!firstLine) {
+			return false;
+		}
+		const header = JSON.parse(firstLine) as Partial<SessionHeader>;
+		return header.type === "session" && header.importedFrom !== undefined;
+	} catch {
+		return false;
+	}
+}
+
 function isDeadTerminalError(error: unknown): boolean {
 	if (!error || typeof error !== "object" || !("code" in error)) {
 		return false;
@@ -925,6 +943,7 @@ export class InteractiveMode {
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
+	private compactImportedToolHistory = false;
 
 	// Thinking block visibility state
 	private hideThinkingBlock = false;
@@ -2834,6 +2853,7 @@ export class InteractiveMode {
 		const compactionFinished = this.isAgentCompacting() && !snapshot.state.isCompacting;
 		const bashFinished = this.isBashRunning() && !snapshot.state.isBashRunning;
 		this.applyConnectionStateSnapshot(snapshot.state);
+		this.compactImportedToolHistory = isImportedSessionFile(snapshot.state.sessionFile);
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
 		this.replaceChildAgentInspector(snapshot.children);
@@ -6209,6 +6229,7 @@ export class InteractiveMode {
 							{
 								showImages: this.settingsManager.getShowImages(),
 								includeImageDimensions: false,
+								compactCompleted: this.compactImportedToolHistory,
 							},
 							this.getCachedToolDefinition(content.name),
 							this.ui,
@@ -6263,6 +6284,7 @@ export class InteractiveMode {
 		const context = this.getSessionContextFromConnectionSnapshot(snapshot);
 		const state = snapshot.state;
 		const streamingMessage = snapshot.streamingMessage;
+		this.compactImportedToolHistory = isImportedSessionFile(state.sessionFile);
 		this.seedChildAgentInspector(snapshot.children);
 		this.setSessionHasMessages(context.messages.length > 0);
 		this.applyConnectionStateSnapshot(state);
