@@ -962,7 +962,7 @@ stale post-hook extension instructions`,
 		sessionInternals._refineInFlight = undefined;
 		releaseRefine?.();
 
-		await expect(accepted).rejects.toThrow("Agent has queued work");
+		await expect(accepted).rejects.toThrow("Agent became busy before prompt delivery");
 		sessionInternals._userBashRunning = false;
 
 		let sawRestoredContext = false;
