@@ -599,8 +599,15 @@ describe("InteractiveMode.renderSessionContext", () => {
 
 type SubmitHandlerHarness = {
 	defaultEditor: { onSubmit?: (text: string) => Promise<void> };
-	editor: { getText: () => string; setText: (text: string) => void; addToHistory?: (text: string) => void };
+	editor: {
+		getText: () => string;
+		getExpandedText?: () => string;
+		setText: (text: string) => void;
+		addToHistory?: (text: string) => void;
+		onSubmit?: (text: string) => Promise<void>;
+	};
 	promptStash?: undefined;
+	admitPendingStartupPrompts?: () => Promise<void>;
 	submittedInputBehavior: "steer" | "followUp";
 	inputSubmissionGeneration: number;
 	flushPendingBashComponents: () => void;
@@ -2433,9 +2440,15 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			.mockRejectedValueOnce(new Error("transient admission failure"))
 			.mockRejectedValueOnce(new Error("repeated admission failure"))
 			.mockResolvedValue(undefined);
+		const showError = vi.fn();
 		const fakeThis = createStartupRunHarness(
 			{ initialMessage: "first", initialMessages: ["second"] },
-			{ getCurrentModel: () => primeModel, getUserInput: vi.fn(() => inputDone), agentConnection: { prompt } },
+			{
+				getCurrentModel: () => primeModel,
+				getUserInput: vi.fn(() => inputDone),
+				agentConnection: { prompt },
+				showError,
+			},
 		);
 
 		try {
@@ -2450,6 +2463,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 				["first", { images: undefined, streamingBehavior: "steer", queueIfBusy: true }],
 				["second", { images: undefined, streamingBehavior: "followUp", queueIfBusy: true }],
 			]);
+			expect(showError.mock.calls).toEqual([["transient admission failure"], ["repeated admission failure"]]);
 			finishInput();
 			await expect(run).resolves.toBe("agents_view");
 		} finally {
@@ -2457,69 +2471,87 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		}
 	});
 
-	test("spaces a failed startup retry while concurrent user submissions wait", async () => {
-		vi.useFakeTimers();
-		let model: AgentConnectionModel | undefined;
-		let startupAttempts = 0;
-		const startupAdmission = createDeferred<void>();
-		const inputDone = createDeferred<void>();
-		const prompt = vi.fn((message: string) => {
-			if (message !== "startup") return Promise.resolve();
-			startupAttempts++;
-			return startupAttempts === 1
-				? Promise.reject(new Error("transient admission failure"))
-				: startupAdmission.promise;
-		});
-		const submitHarness = createSubmitHandlerHarness({
-			agentConnection: {
-				prompt,
-				executeBash: vi.fn(async () => {}),
-				getState: vi.fn(async () => ({ isBashRunning: false })),
-			},
-		});
-		const fakeThis = Object.assign(
-			submitHarness,
-			createStartupRunHarness(
-				{ initialMessage: "startup" },
-				{
-					getCurrentModel: () => model,
-					getUserInput: vi.fn(() => inputDone.promise),
-					agentConnection: submitHarness.agentConnection,
+	test.each(["typing", "Alt+Enter"] as const)(
+		"preserves %s during the startup admission barrier",
+		async (scenario) => {
+			vi.useFakeTimers();
+			let model: AgentConnectionModel | undefined;
+			let editorText = "first user prompt";
+			let startupAttempts = 0;
+			const startupAdmission = createDeferred<void>();
+			const inputDone = createDeferred<void>();
+			const prompt = vi.fn((message: string) => {
+				if (message !== "startup") return Promise.resolve();
+				startupAttempts++;
+				return startupAttempts === 1
+					? Promise.reject(new Error("transient admission failure"))
+					: startupAdmission.promise;
+			});
+			const submitHarness = createSubmitHandlerHarness({
+				editor: {
+					getText: () => editorText,
+					getExpandedText: () => editorText,
+					setText: (text) => {
+						editorText = text;
+					},
 				},
-			),
-		);
-
-		try {
-			const run = InteractiveMode.prototype.run.call(fakeThis as never);
-			await vi.advanceTimersByTimeAsync(250);
-			model = primeModel;
-			const submissions = ["first user prompt", "second user prompt"].map((text) =>
-				fakeThis.defaultEditor.onSubmit?.(text),
+				agentConnection: {
+					prompt,
+					executeBash: vi.fn(async () => {}),
+					getState: vi.fn(async () => ({ isBashRunning: false })),
+				},
+			});
+			const fakeThis = Object.assign(
+				submitHarness,
+				createStartupRunHarness(
+					{ initialMessage: "startup" },
+					{
+						getCurrentModel: () => model,
+						getUserInput: vi.fn(() => inputDone.promise),
+						agentConnection: submitHarness.agentConnection,
+					},
+				),
 			);
-			await vi.advanceTimersByTimeAsync(250);
-			expect(prompt.mock.calls.map(([message]) => message)).toEqual(["startup"]);
-			await vi.advanceTimersByTimeAsync(249);
-			expect(prompt).toHaveBeenCalledOnce();
-			await vi.advanceTimersByTimeAsync(1);
-			expect(prompt.mock.calls.map(([message]) => message)).toEqual(["startup", "startup"]);
-			startupAdmission.resolve(undefined);
-			await Promise.all(submissions);
-			expect(prompt.mock.calls.map(([message]) => message)).toEqual([
-				"startup",
-				"startup",
-				"first user prompt",
-				"second user prompt",
-			]);
-			expect(prompt.mock.calls[0]).toEqual([
-				"startup",
-				{ images: undefined, streamingBehavior: "steer", queueIfBusy: true },
-			]);
-			inputDone.resolve(undefined);
-			await expect(run).resolves.toBe("agents_view");
-		} finally {
-			vi.useRealTimers();
-		}
-	});
+
+			try {
+				const run = InteractiveMode.prototype.run.call(fakeThis as never);
+				await vi.advanceTimersByTimeAsync(250);
+				model = primeModel;
+				fakeThis.editor.onSubmit = fakeThis.defaultEditor.onSubmit;
+				const submit = () =>
+					scenario === "typing"
+						? fakeThis.defaultEditor.onSubmit?.(editorText)
+						: (
+								InteractiveMode.prototype as unknown as {
+									handleFollowUp(this: SubmitHandlerHarness): Promise<void>;
+								}
+							).handleFollowUp.call(fakeThis);
+				const firstSubmission = submit();
+				await Promise.resolve();
+				expect(editorText).toBe("");
+				if (scenario === "typing") editorText = "typing during startup wait";
+				const duplicate = scenario === "Alt+Enter" ? submit() : undefined;
+				await vi.advanceTimersByTimeAsync(250);
+				expect(prompt.mock.calls.map(([message]) => message)).toEqual(["startup"]);
+				await vi.advanceTimersByTimeAsync(249);
+				expect(prompt).toHaveBeenCalledOnce();
+				await vi.advanceTimersByTimeAsync(1);
+				expect(prompt.mock.calls.map(([message]) => message)).toEqual(["startup", "startup"]);
+				startupAdmission.resolve(undefined);
+				await Promise.all([firstSubmission, duplicate]);
+				expect(prompt.mock.calls.map(([message]) => message)).toEqual(["startup", "startup", "first user prompt"]);
+				expect(editorText).toBe(scenario === "typing" ? "typing during startup wait" : "");
+				expect(prompt.mock.calls[0]).toEqual([
+					"startup",
+					{ images: undefined, streamingBehavior: "steer", queueIfBusy: true },
+				]);
+				inputDone.resolve(undefined);
+				await expect(run).resolves.toBe("agents_view");
+			} finally {
+				vi.useRealTimers();
+			}
+		},
+	);
 
 	test("defers an initial prompt until a model appears and cleans up its retry timer", async () => {
 		vi.useFakeTimers();

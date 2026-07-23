@@ -4680,7 +4680,7 @@ export class InteractiveMode {
 					return;
 				}
 
-				await this.admitPendingStartupPrompts?.();
+
 
 				this.clearSideQuestion({ abort: true });
 				this.flushPendingBashComponents();
@@ -4689,6 +4689,7 @@ export class InteractiveMode {
 				this.editor.setText("");
 				const promptStashAfterClear = this.promptStash;
 				submissionGeneration = ++this.inputSubmissionGeneration;
+				await this.admitPendingStartupPrompts?.();
 				try {
 					await this.agentConnection.prompt(text, {
 						streamingBehavior,
