@@ -29,7 +29,10 @@ function createSummary(): SessionSummary {
 
 describe("ENG-4800 supervisor-owned sessions", () => {
 	it("reuses an active worker when a legacy client requests ownership", async () => {
-		const worker = { descriptor: { rootActiveSessionId: activeSessionId } };
+		const worker = {
+			descriptor: { rootActiveSessionId: activeSessionId, lifecycle: "ready" },
+			intentionalStop: false,
+		};
 		const summary = createSummary();
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			matchWorkers: vi.fn(() => [{ worker, summary }]),
@@ -44,6 +47,31 @@ describe("ENG-4800 supervisor-owned sessions", () => {
 				lifecycle: "client_owned",
 			}),
 		).resolves.toBe(worker);
+	});
+
+	it("rejects create reuse when the existing worker is not ready", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "worker-1",
+				rootActiveSessionId: activeSessionId,
+				lifecycle: "failed",
+			},
+			intentionalStop: false,
+		};
+		const summary = createSummary();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			matchWorkers: vi.fn(() => [{ worker, summary }]),
+			scheduleEphemeralWorkerCleanup: vi.fn(),
+		}) as {
+			createOrReuseWorker(clientId: string, command: DaemonCreateCommand): Promise<typeof worker>;
+		};
+
+		await expect(
+			supervisor.createOrReuseWorker("client-1", {
+				type: "create",
+				sessionPath: summary.sessionFile,
+			}),
+		).rejects.toThrow("Session worker is failed");
 	});
 
 	it("treats legacy owned-session completion as detach", async () => {
@@ -200,6 +228,7 @@ describe("ENG-4800 supervisor-owned sessions", () => {
 				descriptor: {
 					workerId: "worker-1",
 					rootActiveSessionId: activeSessionId,
+					lifecycle: "ready",
 				},
 				intentionalStop: false,
 				ephemeral: true,
@@ -271,6 +300,46 @@ describe("ENG-4800 supervisor-owned sessions", () => {
 
 			expect(scheduleEphemeralWorkerCleanup).toHaveBeenCalledWith(worker);
 			expect(worker.descriptor.lifecycle).toBe("ready");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("schedules ephemeral cleanup after recovery is exhausted", async () => {
+		vi.useFakeTimers();
+		try {
+			const worker = {
+				descriptor: {
+					workerId: "worker-1",
+					pid: process.pid,
+					rootActiveSessionId: activeSessionId,
+					lifecycle: "recovering",
+					consecutiveFailures: 0,
+				},
+				intentionalStop: false,
+				ephemeral: true,
+			};
+			const scheduleEphemeralWorkerCleanup = vi.fn();
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				workers: new Map([["worker-1", worker]]),
+				assertRecoveryAllowed: vi.fn(async () => undefined),
+				connectWorker: vi.fn(async () => {
+					throw new Error("worker unavailable");
+				}),
+				persistWorker: vi.fn(),
+				syncAgentPeers: vi.fn(async () => undefined),
+				scheduleEphemeralWorkerCleanup,
+				log: vi.fn(),
+			}) as {
+				recoverWorker(worker: unknown): Promise<void>;
+			};
+
+			const recovery = supervisor.recoverWorker(worker);
+			await vi.runAllTimersAsync();
+			await recovery;
+
+			expect(worker.descriptor.lifecycle).toBe("failed");
+			expect(scheduleEphemeralWorkerCleanup).toHaveBeenCalledWith(worker);
 		} finally {
 			vi.useRealTimers();
 		}

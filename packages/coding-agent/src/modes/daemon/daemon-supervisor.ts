@@ -2162,6 +2162,7 @@ export class DaemonSupervisor {
 			this.persistWorker(worker);
 			await this.syncAgentPeers().catch(() => undefined);
 			this.log(`Worker ${worker.descriptor.workerId} failed after three recovery attempts`);
+			this.scheduleEphemeralWorkerCleanup(worker);
 		})().finally(() => {
 			worker.recovery = undefined;
 		});
@@ -2420,18 +2421,19 @@ export class DaemonSupervisor {
 	private async attachClient(
 		client: DaemonSocketClient,
 		command: Extract<DaemonCommand, { type: "attach" }>,
+		allowStoppingWorker = false,
 	): Promise<WorkerAttachData> {
 		const match = await this.findWorker(command.activeSessionId);
 		this.cancelEphemeralWorkerCleanup(match.worker);
 		match.worker.pendingAttachments++;
 		try {
-			if (match.worker.intentionalStop || match.worker.descriptor.stopRequestedAt) {
+			if (!allowStoppingWorker && (match.worker.intentionalStop || match.worker.descriptor.stopRequestedAt)) {
 				throw new Error(`Session worker ${match.worker.descriptor.workerId} is stopping`);
 			}
 			if (match.worker.recovery || match.worker.descriptor.lifecycle === "recovering") {
 				await this.recoverWorker(match.worker);
 			}
-			if (match.worker.intentionalStop || match.worker.descriptor.stopRequestedAt) {
+			if (!allowStoppingWorker && (match.worker.intentionalStop || match.worker.descriptor.stopRequestedAt)) {
 				throw new Error(`Session worker ${match.worker.descriptor.workerId} is stopping`);
 			}
 			if (match.worker.descriptor.lifecycle !== "ready") {
@@ -2856,9 +2858,20 @@ export class DaemonSupervisor {
 		worker.cleanupTimer = undefined;
 	}
 
-	private reserveWorkerForCreate(worker: ResidentWorker): ResidentWorker {
+	private async reserveWorkerForCreate(worker: ResidentWorker): Promise<ResidentWorker> {
 		if (worker.intentionalStop || worker.descriptor.stopRequestedAt) {
 			throw new Error(`Session worker ${worker.descriptor.workerId} is stopping`);
+		}
+		if (worker.recovery || worker.descriptor.lifecycle === "recovering") {
+			this.cancelEphemeralWorkerCleanup(worker);
+			await this.recoverWorker(worker);
+		}
+		if (worker.intentionalStop || worker.descriptor.stopRequestedAt) {
+			throw new Error(`Session worker ${worker.descriptor.workerId} is stopping`);
+		}
+		if (worker.descriptor.lifecycle !== "ready") {
+			this.scheduleEphemeralWorkerCleanup(worker);
+			throw new Error(`Session worker is ${worker.descriptor.lifecycle}`);
 		}
 		this.cancelEphemeralWorkerCleanup(worker);
 		this.scheduleEphemeralWorkerCleanup(worker);
@@ -3423,12 +3436,16 @@ export class DaemonSupervisor {
 			const { activeSessionId, purpose } = pending[index]!;
 			let releaseTranscript: (() => void) | undefined;
 			try {
-				const attached = await this.attachClient(client, {
-					type: "attach",
-					activeSessionId,
-					capabilities: [...client.capabilities],
-					supportsExtensionUi: client.supportsExtensionUi,
-				});
+				const attached = await this.attachClient(
+					client,
+					{
+						type: "attach",
+						activeSessionId,
+						capabilities: [...client.capabilities],
+						supportsExtensionUi: client.supportsExtensionUi,
+					},
+					true,
+				);
 				releaseTranscript = attached.releaseTranscript;
 				if (client.capabilities.has("chunked_snapshot")) {
 					const transcript = attached.transcript;
