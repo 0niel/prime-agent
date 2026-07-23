@@ -1608,6 +1608,37 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/**
+	 * Append a custom message atomically with respect to in-memory session state.
+	 * Intended for best-effort records whose failed persistence must not leave an
+	 * unsaved leaf that later entries can attach to.
+	 */
+	appendCustomMessageEntryTransactional<T = unknown>(
+		customType: string,
+		content: string | (TextContent | ImageContent)[],
+		display: boolean,
+		details?: T,
+	): string {
+		const previousFileEntries = this.fileEntries;
+		const previousById = this.byId;
+		const previousLeafId = this.leafId;
+
+		// Isolate all append mutations so a failure can restore the exact prior objects.
+		this.fileEntries = [...previousFileEntries];
+		this.byId = new Map(previousById);
+		try {
+			return this.appendCustomMessageEntry(customType, content, display, details);
+		} catch (error) {
+			this.fileEntries = previousFileEntries;
+			this.byId = previousById;
+			this.leafId = previousLeafId;
+			// A failed append may have partially changed the file. Force the next
+			// persisted entry to rewrite the restored state before it is appended.
+			this.flushed = false;
+			throw error;
+		}
+	}
+
 	// =========================================================================
 	// Tree Traversal
 	// =========================================================================

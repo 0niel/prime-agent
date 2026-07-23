@@ -170,7 +170,6 @@ describe("session command messages", () => {
 		).toEqual([]);
 	});
 
-
 	test("continues to include ordinary custom messages", () => {
 		expect(convertToLlm([customMessage("extension_notice")])).toMatchObject([
 			{ role: "user", content: [{ type: "text", text: "durable display text" }] },

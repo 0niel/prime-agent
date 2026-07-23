@@ -1,6 +1,8 @@
+import { appendFileSync } from "node:fs";
 import type { AgentMessage, ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage, type Model, type ToolResultMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { SessionManager } from "../../src/core/session-manager.js";
 import { createHarness, type Harness } from "./harness.js";
 
 type SessionWithCompactionInternals = {
@@ -15,7 +17,7 @@ type SessionWithCompactionInternals = {
 		reason: "overflow" | "threshold" | "requested",
 		outcome: "skipped" | "cancelled" | "failed",
 		message: string,
-	) => boolean;
+	) => void;
 };
 
 function createUsage(totalTokens: number) {
@@ -1079,22 +1081,52 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.session.agent.convertToLlm([outcome!])).toEqual([]);
 	});
 
-	it("does not let outcome persistence failures replace compaction control flow", async () => {
-		const harness = await createHarness();
+	it("rolls back failed outcome persistence without breaking the persisted branch", async () => {
+		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("persisted response")]);
+		await harness.session.prompt("persist this turn");
+
 		const internals = harness.session as unknown as SessionWithCompactionInternals;
-		vi.spyOn(harness.sessionManager, "appendCustomMessageEntry").mockImplementation(() => {
+		const sessionFile = harness.sessionManager.getSessionFile()!;
+		const persistedLeafId = harness.sessionManager.getLeafId();
+		const persistedEntries = harness.sessionManager.getEntries();
+		const persistedEntryObjects = new Map(persistedEntries.map((entry) => [entry.id, entry]));
+		vi.spyOn(harness.sessionManager, "_persist").mockImplementationOnce((entry) => {
+			// _appendEntry mutates all in-memory indexes before persistence is attempted.
+			expect(harness.sessionManager.getLeafId()).toBe(entry.id);
+			expect(harness.sessionManager.getEntry(entry.id)).toBe(entry);
+			appendFileSync(sessionFile, '{"type":"custom_message"');
 			throw new Error("disk full");
 		});
 
 		expect(() =>
 			internals._persistCompactionOutcome("requested", "failed", "Requested compaction failed"),
 		).not.toThrow();
-		expect(harness.session.messages).toContainEqual(
-			expect.objectContaining({
-				customType: "compaction_outcome",
-				content: "Requested compaction failed",
-			}),
+		const outcome = harness.session.messages.at(-1);
+		expect(outcome).toMatchObject({
+			role: "custom",
+			customType: "compaction_outcome",
+			content: expect.stringContaining("could not be saved to session history"),
+			details: { reason: "requested", outcome: "failed" },
+		});
+		expect(harness.sessionManager.getLeafId()).toBe(persistedLeafId);
+		expect(harness.sessionManager.getEntries()).toEqual(persistedEntries);
+		for (const [id, entry] of persistedEntryObjects) {
+			expect(harness.sessionManager.getEntry(id)).toBe(entry);
+		}
+		expect(harness.sessionManager.getEntries()).not.toContainEqual(
+			expect.objectContaining({ type: "custom_message", customType: "compaction_outcome" }),
+		);
+
+		const nextId = harness.sessionManager.appendCustomEntry("after_failed_outcome");
+		const reloaded = SessionManager.open(sessionFile);
+		expect(reloaded.getEntry(nextId)?.parentId).toBe(persistedLeafId);
+		expect(reloaded.getBranch().map((entry) => entry.id)).toEqual(
+			harness.sessionManager.getBranch().map((entry) => entry.id),
+		);
+		expect(reloaded.getEntries()).not.toContainEqual(
+			expect.objectContaining({ type: "custom_message", customType: "compaction_outcome" }),
 		);
 	});
 });

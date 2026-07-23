@@ -7337,23 +7337,25 @@ export class AgentSession {
 		reason: CompactionOutcomeReason,
 		outcome: CompactionOutcome,
 		message: string,
-	): boolean {
-		const durableMessage = createCompactionOutcomeMessage(message, { reason, outcome });
-		let persisted = true;
+	): void {
+		let outcomeMessage = createCompactionOutcomeMessage(message, { reason, outcome });
 		try {
-			this.sessionManager.appendCustomMessageEntry(
-				durableMessage.customType,
-				durableMessage.content,
-				durableMessage.display,
-				durableMessage.details,
+			this.sessionManager.appendCustomMessageEntryTransactional(
+				outcomeMessage.customType,
+				outcomeMessage.content,
+				outcomeMessage.display,
+				outcomeMessage.details,
 			);
-		} catch {
-			persisted = false;
+		} catch (error) {
+			const persistenceError = error instanceof Error ? error.message : String(error);
+			outcomeMessage = createCompactionOutcomeMessage(
+				`${message}\n\nThis compaction outcome could not be saved to session history: ${persistenceError}`,
+				{ reason, outcome },
+			);
 		}
-		this.agent.state.messages.push(durableMessage);
-		this._emit({ type: "message_start", message: durableMessage });
-		this._emit({ type: "message_end", message: durableMessage });
-		return persisted;
+		this.agent.state.messages.push(outcomeMessage);
+		this._emit({ type: "message_start", message: outcomeMessage });
+		this._emit({ type: "message_end", message: outcomeMessage });
 	}
 
 	private async _runAutoCompaction(

@@ -144,7 +144,4 @@ describe("InteractiveMode compaction events", () => {
 			"Compaction succeeded, but the transcript could not be refreshed: context unavailable",
 		);
 	});
-
-
-
 });
