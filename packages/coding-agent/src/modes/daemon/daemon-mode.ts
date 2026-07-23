@@ -2943,23 +2943,9 @@ export class AgentDaemon {
 
 			case "resume_queue": {
 				const state = this.getSessionState(command.activeSessionId);
-				let checkedStart = false;
-				let startError: unknown;
-				void state.runtime.session.agent.continue().then(undefined, (error: unknown) => {
-					if (checkedStart) {
-						this.broadcastToSession(
-							state,
-							failure(undefined, "resume_queue", error, serializeDaemonError(error)),
-						);
-					} else {
-						startError = error;
-					}
-				});
-				// Self-update restore must acknowledge that queued work restarted without waiting for it to finish.
-				await Promise.resolve();
-				checkedStart = true;
-				if (startError !== undefined) {
-					return failure(command.id, "resume_queue", startError, serializeDaemonError(startError));
+				if (!state.runtime.session.resumeQueuedWork()) {
+					const error = new Error("No queued work to resume");
+					return failure(command.id, "resume_queue", error, serializeDaemonError(error));
 				}
 				return success(command.id, "resume_queue");
 			}

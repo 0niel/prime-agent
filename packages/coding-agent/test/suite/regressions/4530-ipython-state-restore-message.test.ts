@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -17,11 +17,6 @@ import { createHarness, getMessageText, getUserTexts, type Harness } from "../ha
 
 type StateRestoreHost = {
 	_onIpythonStateRestored(result: RestoreResult): void;
-};
-
-type QueueDrainHost = {
-	_followUpMessages: Array<{ prefixMessages: CustomMessage[]; message: AgentMessage }>;
-	_drainQueuedMessagesAfterBash(): Promise<void>;
 };
 
 function stripAnsi(text: string): string {
@@ -123,23 +118,7 @@ describe("ENG-4530 IPython state restore message", () => {
 		expect(render(component)).not.toContain("alpha");
 	});
 
-	it("shows an accurate fixed label when restoration starts a fresh kernel", () => {
-		const message: CustomMessage<IpythonStateRestoredDetails> = {
-			role: "custom",
-			customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
-			content: "restore details",
-			display: true,
-			details: { restored: false },
-			timestamp: Date.now(),
-		};
-		const component = new InjectedPromptMessageComponent(message);
-
-		expect(render(component)).toContain("◆ Started fresh IPython kernel");
-		component.setExpanded(true);
-		expect(render(component)).not.toContain("restore details");
-	});
-
-	it("does not requeue prefixes already delivered before a drain failure", async () => {
+	it("retries only undelivered input after partial scheduler delivery", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		await harness.session.sendCustomMessage(
@@ -154,22 +133,37 @@ describe("ENG-4530 IPython state restore message", () => {
 		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = true;
 		await harness.session.prompt("queued prompt", { streamingBehavior: "followUp" });
 		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = false;
-
-		const queueHost = harness.session as unknown as QueueDrainHost;
-		const queued = queueHost._followUpMessages[0];
-		const deliveredPrefix = queued?.prefixMessages[0];
-		if (!queued || !deliveredPrefix) {
-			throw new Error("Expected queued restore context");
-		}
-		vi.spyOn(harness.session.agent, "prompt").mockImplementation(async () => {
-			harness.session.agent.state.messages.push(deliveredPrefix);
+		vi.spyOn(harness.session.agent, "prompt").mockImplementationOnce(async (messages) => {
+			const batch = Array.isArray(messages) ? messages : [messages];
+			harness.session.agent.state.messages.push(batch[0]);
+			harness.session.acquireQueuedWorkPause();
 			throw new Error("partial delivery failed");
 		});
-		const followUp = vi.spyOn(harness.session.agent, "followUp");
 
-		await queueHost._drainQueuedMessagesAfterBash();
+		harness.session.resumeQueuedWork();
+		await harness.session.waitForSessionInputIdle();
 
-		expect(queued.prefixMessages).toEqual([]);
-		expect(followUp).toHaveBeenCalledWith([queued.message]);
+		const [queued] = harness.session.getFollowUpQueueSnapshots();
+		expect(queued).toMatchObject({ text: "queued prompt" });
+		expect(queued?.prefixMessages).toBeUndefined();
+		expect(harness.session.messages).toEqual([
+			expect.objectContaining({ customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE }),
+		]);
+	});
+
+	it("shows an accurate fixed label when restoration starts a fresh kernel", () => {
+		const message: CustomMessage<IpythonStateRestoredDetails> = {
+			role: "custom",
+			customType: IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
+			content: "restore details",
+			display: true,
+			details: { restored: false },
+			timestamp: Date.now(),
+		};
+		const component = new InjectedPromptMessageComponent(message);
+
+		expect(render(component)).toContain("◆ Started fresh IPython kernel");
+		component.setExpanded(true);
+		expect(render(component)).not.toContain("restore details");
 	});
 });

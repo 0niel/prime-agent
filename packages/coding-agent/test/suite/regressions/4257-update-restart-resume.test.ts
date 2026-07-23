@@ -52,12 +52,6 @@ type QueueInternals = {
 	};
 };
 
-type AgentInternals = {
-	_state: {
-		isStreaming: boolean;
-	};
-};
-
 function createState(
 	harness: Harness,
 	activeSessionId: string,
@@ -309,41 +303,26 @@ describe("issue #4257 update restart resume", () => {
 		const image: ImageContent = { type: "image", data: "ZmFrZQ==", mimeType: "image/png" };
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text: "queued work" }, image];
 		const queuedContext = createCustomMessage("queued context");
-		const message: UserMessage = { role: "user", content, timestamp: Date.now() };
 		const followUpContent: TextContent[] = [{ type: "text", text: "heartbeat" }];
 		const followUpContext = createCustomMessage("follow-up context");
-		const followUpMessage: UserMessage = {
-			role: "user",
-			content: followUpContent,
-			timestamp: Date.now(),
-		};
 		const customFollowUp = createCustomMessage("custom heartbeat");
-		const queueInternals = parentHarness.session as unknown as QueueInternals;
-		queueInternals._steeringMessages = [
-			{
-				text: "queued work",
-				queueKey: "heartbeat:steer",
-				agentMessageId: "agentmsg_steer",
-				prefixMessages: [queuedContext],
-				message,
-			},
-		];
-		queueInternals._followUpMessages = [
-			{
-				text: "heartbeat",
-				queueKey: "heartbeat:job-1",
-				agentMessageId: "agentmsg_followup",
-				prefixMessages: [followUpContext],
-				message: followUpMessage,
-			},
-			{
-				text: "custom heartbeat",
-				queueKey: "heartbeat:custom",
-				agentMessageId: "agentmsg_custom",
-				prefixMessages: [],
-				message: customFollowUp,
-			},
-		];
+		await parentHarness.session.restoreSteeringMessage("queued work", [image], {
+			queueKey: "heartbeat:steer",
+			agentMessageId: "agentmsg_steer",
+			content,
+			prefixMessages: [queuedContext],
+		});
+		await parentHarness.session.restoreFollowUpMessage("heartbeat", undefined, {
+			queueKey: "heartbeat:job-1",
+			agentMessageId: "agentmsg_followup",
+			content: followUpContent,
+			prefixMessages: [followUpContext],
+		});
+		await parentHarness.session.restoreFollowUpMessage("custom heartbeat", undefined, {
+			queueKey: "heartbeat:custom",
+			agentMessageId: "agentmsg_custom",
+			customMessage: customFollowUp,
+		});
 		childHarness.session.recordBashResult("echo child", {
 			output: "child",
 			exitCode: 0,
@@ -450,7 +429,7 @@ describe("issue #4257 update restart resume", () => {
 			timestamp: Date.now(),
 		};
 		const queueInternals = harness.session as unknown as QueueInternals;
-		queueInternals._pendingNextTurnMessages = [pendingNextTurn];
+		harness.session.restorePendingNextTurnMessages([pendingNextTurn]);
 		queueInternals._acceptedAgentMessagePrompt = {
 			text: "accepted work",
 			agentMessageId: "agentmsg_accepted",
@@ -502,16 +481,11 @@ describe("issue #4257 update restart resume", () => {
 			{ type: "text", text: "queued context" },
 			{ type: "text", text: "queued follow-up" },
 		];
-		const queueInternals = harness.session as unknown as QueueInternals;
-		queueInternals._followUpMessages = [
-			{
-				text: "queued follow-up",
-				queueKey: "heartbeat:job-1",
-				agentMessageId: "agentmsg_followup",
-				prefixMessages: [],
-				message: { role: "user", content: followUpContent, timestamp: Date.now() },
-			},
-		];
+		await harness.session.restoreFollowUpMessage("queued follow-up", undefined, {
+			queueKey: "heartbeat:job-1",
+			agentMessageId: "agentmsg_followup",
+			content: followUpContent,
+		});
 
 		const sessionDir = `${harness.tempDir}/sessions`;
 		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
@@ -547,7 +521,7 @@ describe("issue #4257 update restart resume", () => {
 	it("materializes busy in-memory drafts before update restart", async () => {
 		const harness = await createHarness({ persistSession: false });
 		harnesses.push(harness);
-		(harness.session.agent as unknown as AgentInternals)._state.isStreaming = true;
+		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = true;
 
 		const sessionDir = `${harness.tempDir}/sessions`;
 		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
@@ -588,7 +562,7 @@ describe("issue #4257 update restart resume", () => {
 			timestamp: Date.now(),
 		};
 		const queueInternals = harness.session as unknown as QueueInternals;
-		queueInternals._pendingNextTurnMessages = [pendingNextTurn];
+		harness.session.restorePendingNextTurnMessages([pendingNextTurn]);
 		queueInternals._acceptedAgentMessagePrompt = {
 			text: "accepted work",
 			agentMessageId: "agentmsg_accepted",
@@ -757,7 +731,6 @@ describe("issue #4257 update restart resume", () => {
 			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
 		);
 
-		const queueInternals = harness.session as unknown as QueueInternals;
 		const restoredSteerContent: TextContent[] = [
 			{ type: "text", text: "restored steer context" },
 			{ type: "text", text: "restored steer" },
@@ -767,15 +740,10 @@ describe("issue #4257 update restart resume", () => {
 			{ type: "text", text: "restored follow-up" },
 		];
 		const restoredPrefix = createCustomMessage("restored custom prefix");
-		queueInternals._followUpMessages = [
-			{
-				text: "existing",
-				queueKey: "heartbeat:job-1",
-				agentMessageId: "agentmsg_existing",
-				prefixMessages: [],
-				message: { role: "user", content: [{ type: "text", text: "existing" }], timestamp: Date.now() },
-			},
-		];
+		await harness.session.restoreFollowUpMessage("existing", undefined, {
+			queueKey: "heartbeat:job-1",
+			agentMessageId: "agentmsg_existing",
+		});
 		const writes: string[] = [];
 		const client: DaemonSocketClient = {
 			id: "client-1",
@@ -1034,7 +1002,7 @@ describe("issue #4257 update restart resume", () => {
 			expect.objectContaining({ id: "follow-up-1", command: "follow_up", success: true }),
 			expect.objectContaining({ id: "prompt-1", command: "prompt", success: true }),
 		]);
-		expect(getUserTexts(harness)).toEqual(["continue interrupted work", "restored steer", "restored follow-up"]);
+		expect(getUserTexts(harness)).toEqual(["restored steer", "restored follow-up", "continue interrupted work"]);
 		expect(harness.session.getSteeringQueueSnapshots()).toEqual([]);
 		expect(harness.session.getFollowUpQueueSnapshots()).toEqual([]);
 	});
@@ -1150,6 +1118,6 @@ describe("issue #4257 update restart resume", () => {
 
 		const response = JSON.parse(writes.join("").trim());
 		expect(response).toMatchObject({ id: "resume-1", command: "resume_queue", success: false });
-		expect(JSON.stringify(response)).toContain("No messages to continue from");
+		expect(JSON.stringify(response)).toContain("No queued work to resume");
 	});
 });
