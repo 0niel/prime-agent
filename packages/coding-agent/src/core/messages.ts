@@ -252,11 +252,17 @@ function hasValidCustomMessageEnvelope(message: Record<string, unknown>, customT
 }
 
 function isSessionSlashCommand(value: unknown): value is SessionSlashCommand {
+	if (
+		!isRecord(value) ||
+		!isSessionSlashCommandName(value.name) ||
+		typeof value.args !== "string" ||
+		typeof value.text !== "string"
+	) {
+		return false;
+	}
+	const parsed = parseSessionSlashCommand(value.text);
 	return (
-		isRecord(value) &&
-		isSessionSlashCommandName(value.name) &&
-		typeof value.args === "string" &&
-		typeof value.text === "string"
+		parsed !== undefined && parsed.name === value.name && parsed.args === value.args && parsed.text === value.text
 	);
 }
 
@@ -273,14 +279,7 @@ export function isSessionSlashCommandMessage(message: unknown): message is Sessi
 		return false;
 	}
 	if (!isRecord(message.details) || !isSessionSlashCommand(message.details.command)) return false;
-	const parsed = parseSessionSlashCommand(message.content);
-	return (
-		parsed !== undefined &&
-		parsed.name === message.details.command.name &&
-		parsed.args === message.details.command.args &&
-		parsed.text === message.details.command.text &&
-		isValidCommandEntryId(message.details.commandEntryId)
-	);
+	return message.content === message.details.command.text && isValidCommandEntryId(message.details.commandEntryId);
 }
 
 export function isSessionSlashCommandResultMessage(message: unknown): message is SessionSlashCommandResultMessage {

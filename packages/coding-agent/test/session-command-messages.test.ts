@@ -78,6 +78,12 @@ describe("session command messages", () => {
 		expect(
 			isSessionSlashCommandResultMessage({
 				...resultMessage,
+				details: { ...resultMessage.details, command: { ...command!, text: "/compact" } },
+			}),
+		).toBe(false);
+		expect(
+			isSessionSlashCommandResultMessage({
+				...resultMessage,
 				details: { ...resultMessage.details, severity: "fatal" },
 			}),
 		).toBe(false);
@@ -164,5 +170,4 @@ describe("session command messages", () => {
 		expect(output.match(/\[Malformed session command message\]/g)).toHaveLength(2);
 		expect(output).not.toContain("durable display text");
 	});
-
 });
