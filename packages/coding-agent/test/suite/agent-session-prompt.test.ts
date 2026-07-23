@@ -342,6 +342,41 @@ stale extension instructions`,
 		expect(providerSystemPrompts[1]).not.toContain("stale extension instructions");
 	});
 
+	it("preserves an extension system prompt across a refine handoff wait", async () => {
+		let sessionInternals: { _refineInFlight?: Promise<void> };
+		const harness = await createHarness({
+			systemPrompt: "base prompt",
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event) => {
+						let releaseRefine: (() => void) | undefined;
+						sessionInternals._refineInFlight = new Promise<void>((resolve) => {
+							releaseRefine = resolve;
+						});
+						setTimeout(() => {
+							sessionInternals._refineInFlight = undefined;
+							releaseRefine?.();
+						}, 0);
+						return { systemPrompt: `${event.systemPrompt}\n\nextension instructions` };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		sessionInternals = harness.session as unknown as { _refineInFlight?: Promise<void> };
+		let providerSystemPrompt = "";
+		harness.setResponses([
+			(context) => {
+				providerSystemPrompt = context.systemPrompt ?? "";
+				return fauxAssistantMessage("done");
+			},
+		]);
+
+		await harness.session.prompt("normal prompt");
+
+		expect(providerSystemPrompt).toContain("extension instructions");
+	});
+
 	it("queues accepted agent messages while compacting", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

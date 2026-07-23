@@ -138,6 +138,35 @@ function seedEntry(state: HarnessState, kind: RefinementKind, id = `${kind}_entr
 }
 
 describe("harness refinement", () => {
+	it("rejects an edit when the target entry changed after planning", () => {
+		const harnessStateDir = makeTempDir();
+		const baselineState = loadHarnessState(harnessStateDir);
+		seedEntry(baselineState, "memory");
+		saveHarnessState(harnessStateDir, baselineState);
+		const currentState = loadHarnessState(harnessStateDir);
+		currentState.entries.memory.memory_entry.content = "concurrent kernel content";
+		currentState.entries.memory.memory_entry.version++;
+
+		const result = applyRefinementProposal(
+			currentState,
+			proposal("Update memory", [
+				{
+					action: "update",
+					kind: "memory",
+					id: "memory_entry",
+					title: "Planned title",
+					content: "stale planned content",
+				},
+			]),
+			{ id: "refine_conflict", baselineState },
+		);
+
+		expect(result.appliedEdits).toMatchObject([
+			{ applied: false, error: "entry changed during refinement planning" },
+		]);
+		expect(currentState.entries.memory.memory_entry.content).toBe("concurrent kernel content");
+	});
+
 	it("applies create, update, and delete for every editable harness kind", () => {
 		const state = loadHarnessState(makeTempDir());
 

@@ -1199,9 +1199,11 @@ describe("AgentSession queue characterization", () => {
 
 			const promptPromise = harness.session.prompt("hello during refine");
 			await new Promise((resolve) => setTimeout(resolve, 10));
-			// The prompt must wait for the refine (its response is still queued);
-			// running now would drop its events while the session is detached.
-			expect(harness.getPendingResponseCount()).toBe(1);
+			// With backgrounded refine planning, the prompt does NOT wait for the
+			// planning LLM pass. It starts immediately and streams its response
+			// while planning is still in flight. The application phase waits for
+			// the agent to be idle before disconnecting and applying.
+			expect(harness.getPendingResponseCount()).toBe(0);
 
 			releasePlan?.();
 			await refinePromise;
@@ -1216,6 +1218,87 @@ describe("AgentSession queue characterization", () => {
 				.getEntries()
 				.filter((entry) => entry.type === "message" && entry.message.role === "assistant");
 			expect(persistedAssistants).toHaveLength(1);
+		} finally {
+			if (previousAgentDir === undefined) {
+				delete process.env.PRIME_AGENT_CODING_AGENT_DIR;
+			} else {
+				process.env.PRIME_AGENT_CODING_AGENT_DIR = previousAgentDir;
+			}
+		}
+	});
+
+	it("preserves a same-entry harness write made during background planning", async () => {
+		const harness = await createAutoRefineHarness();
+		harnesses.push(harness);
+		const previousAgentDir = process.env.PRIME_AGENT_CODING_AGENT_DIR;
+		process.env.PRIME_AGENT_CODING_AGENT_DIR = `${harness.tempDir}/agent`;
+		try {
+			const localDir = getLocalHarnessStateDir(harness.sessionManager.getSessionArtifactDir())!;
+			const initialState = loadHarnessState(localDir, "local");
+			applyRefinementProposal(
+				initialState,
+				{
+					summary: "Seed memory",
+					rationale: "seed",
+					expectedOutcome: "seeded",
+					edits: [
+						{
+							action: "create",
+							kind: "memory",
+							id: "shared",
+							title: "Shared",
+							content: "planning baseline",
+						},
+					],
+				},
+				{ id: "seed_shared", scope: "local" },
+			);
+			saveHarnessState(localDir, initialState);
+
+			let releasePlan: (() => void) | undefined;
+			const planGate = new Promise<void>((resolve) => {
+				releasePlan = resolve;
+			});
+			let planStarted: (() => void) | undefined;
+			const planStartedPromise = new Promise<void>((resolve) => {
+				planStarted = resolve;
+			});
+			harness.setResponses([
+				async () => {
+					planStarted?.();
+					await planGate;
+					return fauxAssistantMessage(
+						JSON.stringify({
+							summary: "Update shared memory",
+							rationale: "planned update",
+							expectedOutcome: "updated",
+							edits: [
+								{
+									action: "update",
+									kind: "memory",
+									id: "shared",
+									title: "Shared",
+									content: "stale planned content",
+								},
+							],
+						}),
+					);
+				},
+			]);
+
+			const refinePromise = harness.session.refine({ instructions: "update shared memory" });
+			await planStartedPromise;
+			const concurrentState = loadHarnessState(localDir, "local");
+			concurrentState.entries.memory.shared.content = "concurrent kernel content";
+			concurrentState.entries.memory.shared.version++;
+			saveHarnessState(localDir, concurrentState);
+			releasePlan?.();
+
+			const result = await refinePromise;
+			expect(result.appliedEdits).toMatchObject([
+				{ applied: false, error: "entry changed during refinement planning" },
+			]);
+			expect(loadHarnessState(localDir, "local").entries.memory.shared.content).toBe("concurrent kernel content");
 		} finally {
 			if (previousAgentDir === undefined) {
 				delete process.env.PRIME_AGENT_CODING_AGENT_DIR;

@@ -610,7 +610,7 @@ function validateEdit(edit: RefinementEdit, computedId?: string): string | undef
 export function applyRefinementProposal(
 	state: HarnessState,
 	proposal: RefinementProposal,
-	options: { id: string; rollbackOf?: string; scope?: HarnessScope },
+	options: { id: string; rollbackOf?: string; scope?: HarnessScope; baselineState?: HarnessState },
 ): RefinementResult {
 	const appliedEdits: AppliedRefinementEdit[] = [];
 	for (const edit of proposal.edits) {
@@ -624,6 +624,17 @@ export function applyRefinementProposal(
 
 		const records = state.entries[edit.kind];
 		const before = cloneEntry(records[id]);
+		const baseline = cloneEntry(options.baselineState?.entries[edit.kind][id]);
+		if (options.baselineState && JSON.stringify(before) !== JSON.stringify(baseline)) {
+			appliedEdits.push({
+				...edit,
+				id,
+				before,
+				applied: false,
+				error: "entry changed during refinement planning",
+			});
+			continue;
+		}
 		if (edit.action === "delete") {
 			if (!before) {
 				appliedEdits.push({ ...edit, id, applied: false, error: "entry not found" });
@@ -733,6 +744,8 @@ export interface RefinementPlan {
 	id: string;
 	rollbackOf?: string;
 	rollbackScope?: HarnessScope;
+	/** Target-scope state captured before planning, used to reject conflicting edits at apply time. */
+	baselineState?: HarnessState;
 }
 
 /**

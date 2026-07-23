@@ -9540,18 +9540,20 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 				: `Refining ${options.global ? "global" : "local"} continual harness state...`,
 		);
 
-		try {
-			const result = await this.agentConnection.refine(options);
-			const applied = result.appliedEdits.filter((edit) => edit.applied).length;
-			const failed = result.appliedEdits.length - applied;
-			const failedSuffix = failed > 0 ? `, ${failed} failed` : "";
-			this.showStatus(
-				`Refined continual harness state: ${applied} edit${applied === 1 ? "" : "s"} applied${failedSuffix}`,
-			);
-			this.showStatus(`Harness state: ${result.harnessStatePath}`);
-		} catch (error) {
-			this.showError(`Refinement failed: ${error instanceof Error ? error.message : String(error)}`);
-		}
+		this.agentConnection
+			.refine(options)
+			.then((result) => {
+				const applied = result.appliedEdits.filter((edit) => edit.applied).length;
+				const failed = result.appliedEdits.length - applied;
+				const failedSuffix = failed > 0 ? `, ${failed} failed` : "";
+				this.showStatus(
+					`Refined continual harness state: ${applied} edit${applied === 1 ? "" : "s"} applied${failedSuffix}`,
+				);
+				this.showStatus(`Harness state: ${result.harnessStatePath}`);
+			})
+			.catch((error) => {
+				this.showError(`Refinement failed: ${error instanceof Error ? error.message : String(error)}`);
+			});
 	}
 
 	stop(options: { preserveAltScreen?: boolean } = {}): void {
