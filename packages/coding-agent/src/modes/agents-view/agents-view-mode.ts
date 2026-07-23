@@ -672,15 +672,22 @@ export class AgentsViewMode implements Component, Focusable {
 		if (height <= 0) {
 			return [];
 		}
-		const lines: string[] = [];
-		lines.push(...this.splash.render(width));
+		const headerLines = this.splash.render(width);
 		const noticeLines = this.renderStartupNotices(width);
 		if (noticeLines.length > 0) {
-			lines.push("", ...noticeLines);
+			headerLines.push("", ...noticeLines);
 		}
-		lines.push("");
-		lines.push(...this.renderPrompt(width));
-		lines.push("");
+		headerLines.push("");
+
+		// The prompt belongs to the scroll pane rather than the fullscreen dock, but
+		// it must remain usable when a short viewport or wrapped notices exhaust the
+		// header. Trim optional header chrome first and reserve one session-list row.
+		const promptLines = this.renderPrompt(width);
+		const listGap = height >= promptLines.length + 2 ? 1 : 0;
+		const headerRows = Math.max(0, height - promptLines.length - listGap - 1);
+		const lines = headerLines.slice(0, headerRows);
+		lines.push(...promptLines);
+		if (listGap > 0) lines.push("");
 		const listRows = Math.max(0, height - lines.length);
 		lines.push(...this.renderSessionRows(width, listRows));
 		return lines;
@@ -971,7 +978,8 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private getFilteredRecords(): UnifiedSessionRecord[] {
-		const query = this.replyActiveSessionId || this.renameTarget ? "" : this.editor.getText();
+		const query =
+			this.replyActiveSessionId || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
 		return filterUnifiedSessions(this.unifiedRecords, (text) => matchesSearchText(text, query));
 	}
 
@@ -1993,7 +2001,9 @@ export class AgentsViewMode implements Component, Focusable {
 		const rawIcon = this.getRowIcon(row.section);
 		const icon = this.formatRowIcon(row.section, rawIcon);
 		const indent = "  ".repeat(row.depth);
-		const timeWidth = 10;
+		const age = formatSessionDuration(row.summary);
+		const details = row.section === "inactive" ? `${row.summary.messageCount} · ${age}` : age;
+		const detailsWidth = row.section === "inactive" ? Math.max(10, visibleWidth(details)) : 10;
 		const heartbeatBadge = !pendingDelete && !pendingKill ? formatHeartbeatBadge(row.heartbeat) : "";
 		const heartbeatCell = heartbeatBadge ? theme.fg("error", heartbeatBadge) : "";
 		const heartbeatWidth = visibleWidth(heartbeatBadge);
@@ -2002,7 +2012,7 @@ export class AgentsViewMode implements Component, Focusable {
 			width -
 				visibleWidth(indent) -
 				visibleWidth(rawIcon) -
-				timeWidth -
+				detailsWidth -
 				2 -
 				(heartbeatWidth > 0 ? heartbeatWidth + 1 : 0),
 		);
@@ -2017,12 +2027,10 @@ export class AgentsViewMode implements Component, Focusable {
 		const summaryText = !pendingDelete && !pendingKill ? row.summary.summary : undefined;
 		const titleContent = summaryText ? `${title} ${theme.fg("dim", `· ${summaryText}`)}` : title;
 		const titleCell = formatTableCell(titleContent, titleWidth);
-		const age = formatSessionDuration(row.summary);
-		const details = row.section === "inactive" ? `${row.summary.messageCount} · ${age}` : age;
 		const cells = [
 			icon,
 			pendingDelete || pendingKill ? theme.fg("error", titleCell) : titleCell,
-			formatRightTableCell(details, timeWidth),
+			formatRightTableCell(details, detailsWidth),
 		];
 		const base = `${indent}${cells[0]} ${heartbeatCell ? `${heartbeatCell} ` : ""}${cells[1]} ${cells[2]}`;
 		const line = padLine(truncateToWidth(base, width, ""), width);

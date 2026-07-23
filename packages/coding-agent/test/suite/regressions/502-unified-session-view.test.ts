@@ -1,3 +1,4 @@
+import stripAnsi from "strip-ansi";
 import { describe, expect, test, vi } from "vitest";
 import { AgentsViewMode } from "../../../src/modes/agents-view/agents-view-mode.js";
 import type { SessionSummary } from "../../../src/modes/daemon/daemon-session-list.js";
@@ -174,5 +175,82 @@ describe("#502 unified session view regressions", () => {
 		await Promise.resolve();
 		poll.call(harness);
 		expect(refreshSessions).toHaveBeenCalledTimes(2);
+	});
+
+	test.each([
+		{ mode: "search", prompt: ["prompt top", "prompt input", "prompt bottom"] },
+		{ mode: "reply", prompt: ["prompt top", "reply header", "reply gap", "prompt input", "prompt bottom"] },
+	])("short content reserves the $mode editor and a session row ahead of startup chrome", ({ prompt }) => {
+		const renderSessionRows = vi.fn(() => ["session row"]);
+		const harness = {
+			splash: { render: () => Array.from({ length: 8 }, () => "splash") },
+			renderStartupNotices: () => Array.from({ length: 8 }, () => "notice"),
+			renderPrompt: () => prompt,
+			renderSessionRows,
+		};
+		const height = prompt.length + 2;
+
+		const lines = privateMethod<(this: typeof harness, width: number, height: number) => string[]>(
+			"renderContent",
+		).call(harness, 80, height);
+
+		expect(lines).toHaveLength(height);
+		expect(lines).toEqual(expect.arrayContaining([...prompt, "session row"]));
+		expect(renderSessionRows).toHaveBeenCalledWith(80, 1);
+	});
+
+	test.each(["reply", "rename"] as const)("%s refresh keeps the captured search filter", (mode) => {
+		const harness = {
+			replyActiveSessionId: mode === "reply" ? "active" : undefined,
+			renameTarget: mode === "rename" ? { identity: "target" } : undefined,
+			actionModeSearchQuery: "needle",
+			editor: { getText: () => "action editor text" },
+			unifiedRecords: [
+				{ identity: "match", identityAliases: [], section: "idle", searchableText: "needle session" },
+				{ identity: "other", identityAliases: [], section: "idle", searchableText: "other session" },
+			],
+		};
+
+		const filtered =
+			privateMethod<(this: typeof harness) => Array<{ identity: string }>>("getFilteredRecords").call(harness);
+		expect(filtered.map((record) => record.identity)).toEqual(["match"]);
+	});
+
+	test("inactive rows give message count and age their full responsive cell", () => {
+		const inactive = {
+			kind: "agent" as const,
+			section: "inactive" as const,
+			summary: {
+				...summary("archived"),
+				activeSessionId: undefined,
+				lifecycle: "archived" as const,
+				messageCount: 123456,
+				modified: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+			},
+			title: "archived",
+			subtitle: "",
+			statusLabel: "inactive",
+			depth: 0,
+			selectable: true,
+			runningSubagentCount: 0,
+			identity: "archived",
+		};
+		const harness = {
+			rows: [inactive],
+			selectedIndex: 0,
+			isPendingDeleteRow: () => false,
+			isPendingKillSubagentRow: () => false,
+			getRowIcon: () => "x",
+			formatRowIcon: (_section: string, icon: string) => icon,
+		};
+
+		const rendered = stripAnsi(
+			privateMethod<(this: typeof harness, row: typeof inactive, width: number) => string>("renderRow").call(
+				harness,
+				inactive,
+				50,
+			),
+		);
+		expect(rendered).toMatch(/123456 · 2h\s*$/);
 	});
 });
