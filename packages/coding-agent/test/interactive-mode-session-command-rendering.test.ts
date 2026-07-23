@@ -1,9 +1,12 @@
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import { createSessionSlashCommandMessage, createSessionSlashCommandResultMessage } from "../src/core/messages.js";
-import { SlashCommandMessageComponent } from "../src/modes/interactive/components/slash-command-message.js";
+import {
+	isLeadingSlashCommand,
+	SlashCommandMessageComponent,
+} from "../src/modes/interactive/components/slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "../src/modes/interactive/components/slash-command-result-message.js";
-import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { InteractiveMode, styleQueuedMessagePreview } from "../src/modes/interactive/interactive-mode.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 const command = { name: "compact" as const, args: "focus", text: "/compact focus" };
 
@@ -35,5 +38,24 @@ describe("InteractiveMode session command rendering", () => {
 
 		expect(children[0]).toBeInstanceOf(SlashCommandMessageComponent);
 		expect(children[1]).toBeInstanceOf(SlashCommandResultMessageComponent);
+	});
+
+	test("recognizes only a complete command token at the start", () => {
+		const recognized = (name: string) => name === "goal";
+		expect(isLeadingSlashCommand("/goal ship it", recognized)).toBe(true);
+		expect(isLeadingSlashCommand("/goal", recognized)).toBe(true);
+		expect(isLeadingSlashCommand("/goalkeeper", recognized)).toBe(false);
+		expect(isLeadingSlashCommand("/goal\nship it", recognized)).toBe(false);
+		expect(isLeadingSlashCommand("/goal	ship it", recognized)).toBe(true);
+		expect(isLeadingSlashCommand("Explain /goal", recognized)).toBe(false);
+	});
+
+	test("keeps only recognized commands accented in queued previews", () => {
+		const recognized = (name: string) => name === "compact";
+		const commandPreview = styleQueuedMessagePreview("/compact focus", "Follow-up", recognized);
+		const unknownPreview = styleQueuedMessagePreview("/unknown focus", "Follow-up", recognized);
+
+		expect(commandPreview).toContain(theme.fg("accent", "/compact"));
+		expect(unknownPreview).not.toContain(theme.fg("accent", "/unknown"));
 	});
 });

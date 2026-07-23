@@ -1,7 +1,7 @@
 import { clearDefaultTerminalColors, setDefaultTerminalColors } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, test } from "vitest";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
@@ -41,5 +41,34 @@ describe("UserMessageComponent", () => {
 
 		expect(lines[0].endsWith(BG_RESET)).toBe(true);
 		expect(lines[2].endsWith(BG_RESET)).toBe(true);
+	});
+
+	test("colors only recognized leading slash commands", () => {
+		clearDefaultTerminalColors();
+		initTheme("dark");
+		const recognized = (name: string) => name === "compact";
+
+		const command = new UserMessageComponent("/compact focus on **errors**", undefined, recognized)
+			.render(40)
+			.join("\n");
+		const unknown = new UserMessageComponent("/unknown focus here", undefined, recognized).render(40).join("\n");
+		const embedded = new UserMessageComponent("Explain /compact", undefined, recognized).render(40).join("\n");
+
+		expect(command).toContain(theme.fg("accent", "/compact"));
+		expect(command).toContain("\u001b[1m");
+		expect(command).not.toContain("**errors**");
+		expect(command).not.toBe(unknown);
+		expect(unknown).not.toContain(theme.fg("accent", "/unknown"));
+		expect(embedded).not.toContain(theme.fg("accent", "/compact"));
+	});
+
+	test("renders long recognized command tokens across narrow wraps", () => {
+		initTheme("dark");
+		const command = "/averyveryverylongcommand";
+		const component = new UserMessageComponent(`${command} arg ¤`, undefined, (name) => name === command.slice(1));
+		const rendered = component.render(8).join("\n");
+		const plain = rendered.replace(/\x1b\[[0-9;]*m|\x1b\]133;[ABC]\x07/g, "");
+		expect(plain.replace(/\s+/g, "")).toContain(command);
+		expect(plain.replace(/\s+/g, "")).toContain("arg¤");
 	});
 });

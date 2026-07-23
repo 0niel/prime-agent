@@ -1248,6 +1248,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		}
 		return {
 			getMessages: () => connection.getMessages(),
+			getCommands: () => connection.getCommands(),
 			subscribe: (listener) => connection.subscribe(listener),
 			getToolDefinition: (name) => connection.getToolDefinition(name),
 			close: () => connection.dispose(),

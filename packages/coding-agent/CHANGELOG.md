@@ -10,6 +10,7 @@
 - Removed the bundled orchestration heartbeat skill from the model system prompt.
 - Fixed feature hints crowding queued messages and side questions by placing them below the recap and hiding them while messages are queued ([ENG-4741](https://linear.app/primeintellect/issue/ENG-4741/recap-queuefollow-upmessage-hint-looks-cluttered)).
 - Fixed `/btw` truncating long answers by rendering side questions in the scrollable transcript.
+- Changed recognized slash commands to retain accent coloring after submission in live, replayed, and queued TUI surfaces while preserving Markdown arguments.
 - Unified prompt, steering, follow-up, and session-command scheduling under session-owned admission with durable queue state and coordinated update/restart checkpoints.
 - Unified Agents View and session resume into one searchable Running/Idle/Inactive session view with live heartbeat badges.
 - Changed selection cursors from `→` to `›` across model selectors, scoped-models, and the theme default for consistency with tree and user-message selectors.

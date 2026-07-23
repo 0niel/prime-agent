@@ -554,6 +554,7 @@ export class InProcessAgentConnection implements AgentConnection {
 		const unsubscribes = new Set<() => void>();
 		return {
 			getMessages: async () => child.messages,
+			getCommands: async () => createAgentConnectionCommands(child),
 			subscribe: (listener) => {
 				const unsubscribe = child.subscribe((event) => void listener({ type: "session_event", event }));
 				unsubscribes.add(unsubscribe);

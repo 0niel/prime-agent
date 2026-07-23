@@ -241,6 +241,7 @@ import { getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 import {
 	parseRefineCommandOptions,
 	parseSessionSlashCommand,
+	parseSlashCommand,
 	type SessionSlashCommand,
 	type SlashCommandInfo,
 } from "./slash-commands.js";
@@ -4648,11 +4649,13 @@ export class AgentSession {
 	}
 
 	private _executeExtensionCommand(text: string): Promise<void> | undefined {
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+		const parsed = parseSlashCommand(text);
+		if (!parsed) return undefined;
+		const commandName = parsed.name;
+		const args = parsed.args;
+
 		const command = this._extensionRunner.getCommand(commandName);
 		if (!command) return undefined;
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
 		const context = this._extensionRunner.createCommandContext();
 		return Promise.resolve()
 			.then(() => command.handler(args, context))
@@ -4676,9 +4679,10 @@ export class AgentSession {
 	private _expandSkillCommand(text: string): string {
 		if (!text.startsWith("/skill:")) return text;
 
-		const spaceIndex = text.indexOf(" ");
-		const skillName = spaceIndex === -1 ? text.slice(7) : text.slice(7, spaceIndex);
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
+		const parsed = parseSlashCommand(text);
+		if (!parsed?.name.startsWith("skill:")) return text;
+		const skillName = parsed.name.slice("skill:".length);
+		const args = parsed.args;
 
 		const skill = this.resourceLoader.getSkills().skills.find((s) => s.name === skillName);
 		if (!skill) return text; // Unknown skill, pass through
@@ -5306,8 +5310,7 @@ export class AgentSession {
 	 * Throw an error if the text is an extension command.
 	 */
 	private _throwIfExtensionCommand(text: string): void {
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+		const commandName = parseSlashCommand(text)?.name ?? "";
 		const command = this._extensionRunner.getCommand(commandName);
 
 		if (command) {

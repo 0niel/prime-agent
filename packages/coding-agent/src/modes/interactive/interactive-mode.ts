@@ -209,7 +209,11 @@ import { ScopedModelsSelectorComponent } from "./components/scoped-models-select
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SideQuestionComponent } from "./components/side-question.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
-import { SlashCommandMessageComponent } from "./components/slash-command-message.js";
+import {
+	isLeadingSlashCommand,
+	SlashCommandMessageComponent,
+	styleSlashCommandText,
+} from "./components/slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
 import {
 	selectLatestToolExpandHint,
@@ -292,6 +296,17 @@ function isLabeledQueuedPreview(message: string): boolean {
 
 export function formatQueuedMessagePreview(message: string, label: "Steering" | "Follow-up"): string {
 	return isLabeledQueuedPreview(message) ? message : `${label}: ${message}`;
+}
+
+export function styleQueuedMessagePreview(
+	message: string,
+	label: "Steering" | "Follow-up",
+	isRecognizedSlashCommand: (name: string) => boolean,
+): string {
+	const preview = formatQueuedMessagePreview(message, label);
+	if (!isLeadingSlashCommand(message, isRecognizedSlashCommand)) return theme.fg("dim", preview);
+	const prefix = preview.slice(0, preview.length - message.length);
+	return `${theme.fg("dim", prefix)}${styleSlashCommandText(message, (rest) => theme.fg("dim", rest))}`;
 }
 
 function isExpandable(obj: unknown): obj is Expandable {
@@ -1290,6 +1305,10 @@ export class InteractiveMode {
 						: `Extension command '/${command.registeredName}' conflicts with built-in interactive command. Available as '/${command.name}'.`,
 				path: command.sourceInfo.path,
 			}));
+	}
+
+	private isRecognizedSlashCommand(name: string): boolean {
+		return isBuiltinSlashCommandName(name) || this.connectionCommands.some((command) => command.name === name);
 	}
 
 	private createBaseAutocompleteProvider(): AutocompleteProvider {
@@ -2565,7 +2584,7 @@ export class InteractiveMode {
 		this.invalidateConnectionModelRefresh();
 		const [state, commands, modelCatalog, resources] = await Promise.all([
 			this.agentConnection.getState(),
-			this.agentConnection.getCommands(),
+			this.agentConnection.getCommands().catch(() => []),
 			this.agentConnection.getModelCatalog(),
 			this.agentConnection.getResourceSnapshot(),
 		]);
@@ -2907,11 +2926,21 @@ export class InteractiveMode {
 
 	private async renderCurrentSessionState(): Promise<void> {
 		this.resetCurrentSessionRenderState();
+		await this.refreshCommandCatalogForCurrentSession?.();
 		await this.renderInitialMessages();
 		// The session transition and transcript are already authoritative here;
 		// a transient queue read must not turn a successful switch into a fatal error.
 		await this.refreshConnectionQueue().catch(() => undefined);
 		this.syncWorkingLoader();
+	}
+
+	private async refreshCommandCatalogForCurrentSession(): Promise<void> {
+		try {
+			this.connectionCommands = await this.agentConnection.getCommands();
+		} catch {
+			this.connectionCommands = [];
+		}
+		this.setupAutocompleteProvider();
 	}
 
 	private async renderResyncedSession(snapshot: AgentConnectionSnapshot): Promise<void> {
@@ -2920,6 +2949,7 @@ export class InteractiveMode {
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
 		this.replaceChildAgentInspector(snapshot.children);
+		await this.refreshCommandCatalogForCurrentSession?.();
 		await this.renderSessionContext(this.getSessionContextFromConnectionSnapshot(snapshot), {
 			clearChat: true,
 			updateFooter: true,
@@ -5040,13 +5070,17 @@ export class InteractiveMode {
 						this.applyConnectionStateSnapshot(event.state);
 						this.resetCurrentSessionRenderState();
 						await this.rebindCurrentSession();
+						await this.refreshCommandCatalogForCurrentSession?.();
 						await this.renderInitialMessages();
 						this.ui.requestRender();
 					});
 					this.sessionEventQueue = run.catch(() => {});
 					await run;
 				} else if (event.type === "session_resynced") {
-					const run = this.sessionEventQueue.then(() => this.renderResyncedSession(event.snapshot));
+					const run = this.sessionEventQueue.then(async () => {
+						await this.refreshCommandCatalogForCurrentSession?.();
+						await this.renderResyncedSession(event.snapshot);
+					});
 					this.sessionEventQueue = run.catch(() => {});
 					await run;
 					this.ui.requestRender();
@@ -6219,11 +6253,14 @@ export class InteractiveMode {
 			}
 		}
 		const definitions = new Map<string, ToolExecutionDefinition | undefined>();
+		const childCommandsPromise = watcher.getCommands().catch(() => []);
 		await Promise.all(
 			[...toolNames].map(async (name) => {
 				definitions.set(name, (await watcher.getToolDefinition(name).catch(() => undefined)) ?? undefined);
 			}),
 		);
+		const childCommands = await childCommandsPromise;
+		const childCommandNames = new Set(childCommands.map((command) => command.name));
 		// A newer refresh (or a close) may have superseded this build while awaiting defs.
 		if (token !== this.childAgentWatcherToken) {
 			return;
@@ -6240,6 +6277,7 @@ export class InteractiveMode {
 				hideThinkingBlock: this.hideThinkingBlock,
 				hiddenThinkingLabel: this.hiddenThinkingLabel,
 				toolsExpanded: this.toolOutputExpanded,
+				isRecognizedSlashCommand: (name) => isBuiltinSlashCommandName(name) || childCommandNames.has(name),
 			}),
 		);
 	}
@@ -6436,7 +6474,11 @@ export class InteractiveMode {
 		if (this.chatContainer.children.length > 0) {
 			this.chatContainer.addChild(new Spacer(1));
 		}
-		this.chatContainer.addChild(new UserMessageComponent(text, this.getMarkdownThemeWithSettings()));
+		this.chatContainer.addChild(
+			new UserMessageComponent(text, this.getMarkdownThemeWithSettings(), (name) =>
+				this.isRecognizedSlashCommand(name),
+			),
+		);
 	}
 
 	private addMessageToEditorHistory(message: AgentMessage): void {
@@ -6554,11 +6596,16 @@ export class InteractiveMode {
 							const userComponent = new UserMessageComponent(
 								skillBlock.userMessage,
 								this.getMarkdownThemeWithSettings(),
+								(name) => this.isRecognizedSlashCommand(name),
 							);
 							this.chatContainer.addChild(userComponent);
 						}
 					} else {
-						const userComponent = new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings());
+						const userComponent = new UserMessageComponent(
+							textContent,
+							this.getMarkdownThemeWithSettings(),
+							(name) => this.isRecognizedSlashCommand(name),
+						);
 						this.chatContainer.addChild(userComponent);
 					}
 					if (options?.populateHistory) {
@@ -7381,11 +7428,11 @@ export class InteractiveMode {
 		if (hasQueuedMessages) {
 			this.queuedMessagesContainer.addChild(new Spacer(1));
 			for (const message of steeringMessages) {
-				const text = theme.fg("dim", formatQueuedMessagePreview(message, "Steering"));
+				const text = styleQueuedMessagePreview(message, "Steering", (name) => this.isRecognizedSlashCommand(name));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			for (const message of followUpMessages) {
-				const text = theme.fg("dim", formatQueuedMessagePreview(message, "Follow-up"));
+				const text = styleQueuedMessagePreview(message, "Follow-up", (name) => this.isRecognizedSlashCommand(name));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			const dequeueHint = this.getAppKeyDisplay("app.message.dequeue");
@@ -8446,6 +8493,7 @@ export class InteractiveMode {
 			if (result.cancelled) {
 				return result;
 			}
+			await this.refreshCommandCatalogForCurrentSession?.();
 			await this.renderCurrentSessionState();
 			this.showStatus("Resumed session");
 			return result;
@@ -8465,6 +8513,7 @@ export class InteractiveMode {
 				if (result.cancelled) {
 					return result;
 				}
+				await this.refreshCommandCatalogForCurrentSession?.();
 				await this.renderCurrentSessionState();
 				this.showStatus("Resumed session in current cwd");
 				return result;
