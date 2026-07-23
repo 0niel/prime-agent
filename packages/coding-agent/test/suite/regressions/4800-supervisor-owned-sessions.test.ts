@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import type { DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import type { DaemonCommand, DaemonOutbound, DaemonResponse } from "../../../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../../../src/modes/daemon/daemon-session-list.js";
-import { DaemonSupervisor } from "../../../src/modes/daemon/daemon-supervisor.js";
+import {
+	DAEMON_EPHEMERAL_WORKER_DISCONNECT_GRACE_MS,
+	DaemonSupervisor,
+} from "../../../src/modes/daemon/daemon-supervisor.js";
 import type { DaemonCreateCommand } from "../../../src/modes/daemon/daemon-worker-protocol.js";
 
 const activeSessionId = "active-target";
@@ -71,5 +74,50 @@ describe("ENG-4800 supervisor-owned sessions", () => {
 		expect(client.attachedActiveSessionIds).toEqual(new Set());
 		expect(stopWorker).not.toHaveBeenCalled();
 		expect(write).toHaveBeenCalledWith(client, { type: "session_detached", activeSessionId });
+	});
+
+	it("retires an ephemeral worker only after its last client detaches", async () => {
+		vi.useFakeTimers();
+		try {
+			const summary = createSummary();
+			const worker = {
+				descriptor: { workerId: "worker-1" },
+				ephemeral: true,
+				pendingAttachments: 0,
+				summaries: new Map([[activeSessionId, summary]]),
+			};
+			const firstClient = {
+				attachedActiveSessionIds: new Set([activeSessionId]),
+				catchupActiveSessionIds: new Set<string>(),
+				catchupPurposes: new Map(),
+			};
+			const secondClient = {
+				attachedActiveSessionIds: new Set([activeSessionId]),
+				catchupActiveSessionIds: new Set<string>(),
+				catchupPurposes: new Map(),
+			};
+			const stopWorker = vi.fn(async () => undefined);
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				clients: new Set([firstClient, secondClient]),
+				workers: new Map([["worker-1", worker]]),
+				matchWorkers: vi.fn(() => [{ worker, summary }]),
+				syncWorkerExtensionUi: vi.fn(async () => undefined),
+				stopWorker,
+				write: vi.fn(() => true),
+				log: vi.fn(),
+			}) as {
+				detachClient(client: typeof firstClient, activeSessionId: string): void;
+			};
+
+			supervisor.detachClient(firstClient, activeSessionId);
+			await vi.advanceTimersByTimeAsync(DAEMON_EPHEMERAL_WORKER_DISCONNECT_GRACE_MS);
+			expect(stopWorker).not.toHaveBeenCalled();
+
+			supervisor.detachClient(secondClient, activeSessionId);
+			await vi.advanceTimersByTimeAsync(DAEMON_EPHEMERAL_WORKER_DISCONNECT_GRACE_MS);
+			expect(stopWorker).toHaveBeenCalledWith(worker, true);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

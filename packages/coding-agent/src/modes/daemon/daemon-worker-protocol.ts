@@ -88,6 +88,8 @@ export interface DaemonWorkerDescriptor {
 	rootActiveSessionId: string;
 	/** Legacy descriptor field. Supervisors clear it when adopting older workers. */
 	ownerClientId?: string;
+	/** Supervisor-managed cleanup policy for workers created by short-lived clients. */
+	retention?: "ephemeral";
 	rootSessionId?: string;
 	sessionFile?: string;
 	createdAt: string;

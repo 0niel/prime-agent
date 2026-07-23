@@ -286,7 +286,7 @@ async function startBlockingBash(client: DaemonClient, activeSessionId: string, 
 }
 
 describe("daemon supervisor resident workers", () => {
-	it("normalizes legacy client-owned creates to shared supervisor workers", async () => {
+	it("treats legacy client-owned creates as shared ephemeral workers", async () => {
 		const root = tempDir();
 		const agentDir = join(root, "agent");
 		const projectDir = join(root, "project");
@@ -364,6 +364,7 @@ describe("daemon supervisor resident workers", () => {
 
 		const descriptor = readWorkerDescriptor(agentDir);
 		expect(descriptor.ownerClientId).toBeUndefined();
+		expect(descriptor.retention).toBe("ephemeral");
 		expect(JSON.stringify(descriptor)).not.toContain(launchEnvSentinel);
 		expect(descriptor.createCommand).not.toHaveProperty("launchEnv");
 		expect(descriptor.createCommand).not.toHaveProperty("lifecycle");

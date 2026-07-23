@@ -87,6 +87,7 @@ import {
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServicesFromServices,
 	DaemonAgentConnection,
+	DaemonCapabilityUnavailableError,
 	DaemonClient,
 	defaultDaemonSocketPath,
 	InProcessAgentConnection,
@@ -939,6 +940,7 @@ async function createDaemonClientConnection(options: {
 	sessionPath?: string;
 	continueRecent?: boolean;
 	activeSessionId?: string;
+	ephemeral?: boolean;
 	noSession?: boolean;
 	supportsExtensionUi?: boolean;
 }): Promise<{ connection: DaemonAgentConnection; summary: SessionSummary }> {
@@ -971,6 +973,12 @@ async function createDaemonClientConnection(options: {
 				return await attach(activeSummary);
 			}
 		}
+		if (options.ephemeral) {
+			await client.waitForHello();
+			if (!client.supportsServerCapability("client_owned_sessions")) {
+				throw new DaemonCapabilityUnavailableError("create", "client_owned_sessions");
+			}
+		}
 		const response = await client.request({
 			type: "create",
 			config: options.config,
@@ -978,6 +986,7 @@ async function createDaemonClientConnection(options: {
 			continueRecent: options.continueRecent,
 			noSession: options.noSession,
 			env: collectDaemonClientEnv(),
+			...(options.ephemeral ? { lifecycle: "client_owned" as const } : {}),
 		});
 		if (!response.success) {
 			throw deserializeDaemonError(response);
@@ -1399,6 +1408,7 @@ export async function main(args: string[], options?: MainOptions) {
 				? getDaemonSummaryActiveSessionId(activeDaemonSessionSummary)
 				: undefined,
 			sessionPath: getInteractiveDaemonSessionPath(parsed, sessionManager),
+			ephemeral: parsed.noSession,
 			noSession: parsed.noSession,
 			supportsExtensionUi: true,
 		});
@@ -1461,6 +1471,7 @@ export async function main(args: string[], options?: MainOptions) {
 				config: defaultSessionConfig,
 				sessionPath: parsed.noSession ? undefined : sessionManager.getSessionFile(),
 				continueRecent: parsed.continue,
+				ephemeral: true,
 				noSession: parsed.noSession,
 				supportsExtensionUi: appMode === "rpc",
 			}));

@@ -105,6 +105,7 @@ const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 const SUPERVISOR_CONFIG_FILE_NAME = "supervisor-config";
 const WORKER_STARTUP_GATE_FD = 3;
+export const DAEMON_EPHEMERAL_WORKER_DISCONNECT_GRACE_MS = 30_000;
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
@@ -216,6 +217,9 @@ interface ResidentWorker {
 	deferredRecovery?: Promise<void>;
 	intentionalStop: boolean;
 	stopRevision: number;
+	ephemeral: boolean;
+	pendingAttachments: number;
+	cleanupTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface SnapshotDuplicateValidation {
@@ -353,6 +357,7 @@ function isDaemonWorkerDescriptor(value: unknown, socketPath: string): value is 
 		(descriptor.pid ?? 0) > 0 &&
 		(descriptor.processStartId === undefined || typeof descriptor.processStartId === "string") &&
 		(descriptor.ownerClientId === undefined || typeof descriptor.ownerClientId === "string") &&
+		(descriptor.retention === undefined || descriptor.retention === "ephemeral") &&
 		typeof descriptor.socketPath === "string" &&
 		typeof descriptor.authenticationToken === "string" &&
 		typeof descriptor.rootActiveSessionId === "string" &&
@@ -715,7 +720,12 @@ export class DaemonSupervisor {
 				if (!isDaemonWorkerDescriptor(descriptor, this.socketPath)) {
 					continue;
 				}
+				const ephemeral =
+					descriptor.retention === "ephemeral" ||
+					descriptor.ownerClientId !== undefined ||
+					descriptor.createCommand.lifecycle === "client_owned";
 				delete descriptor.ownerClientId;
+				descriptor.retention = ephemeral ? "ephemeral" : undefined;
 				descriptor.createCommand = withoutSupervisorCreateFields(descriptor.createCommand);
 				descriptor.lifecycle = "recovering";
 				descriptor.recoveryJournalPath ??= join(this.descriptorDir, `${descriptor.workerId}.recovery.jsonl`);
@@ -730,6 +740,8 @@ export class DaemonSupervisor {
 					snapshotLoads: new Map(),
 					intentionalStop: descriptor.stopRequestedAt !== undefined,
 					stopRevision: 0,
+					ephemeral,
+					pendingAttachments: 0,
 				});
 			} catch (error) {
 				this.log(`Ignoring invalid worker descriptor ${path}: ${String(error)}`);
@@ -841,9 +853,17 @@ export class DaemonSupervisor {
 			cleaned = true;
 			client.detachInput();
 			this.clients.delete(client);
+			const detachedWorkers = new Set<ResidentWorker>();
 			for (const activeSessionId of [...client.attachedActiveSessionIds]) {
+				const match = this.matchWorkers(activeSessionId)[0];
+				if (match) {
+					detachedWorkers.add(match.worker);
+				}
 				client.attachedActiveSessionIds.delete(activeSessionId);
 				void this.syncWorkerExtensionUi(activeSessionId);
+			}
+			for (const worker of detachedWorkers) {
+				this.scheduleEphemeralWorkerCleanup(worker);
 			}
 		};
 		socket.on("close", cleanup);
@@ -1061,6 +1081,7 @@ export class DaemonSupervisor {
 			}
 			case "promote_owned_session": {
 				const match = await this.findWorker(command.activeSessionId);
+				this.promoteEphemeralWorker(match.worker);
 				return success(command.id, command.type, this.publicSummary(match.worker, match.summary));
 			}
 			case "retry_worker": {
@@ -1392,7 +1413,7 @@ export class DaemonSupervisor {
 	}
 
 	private async createOrReuseWorker(clientId: string, command: DaemonCreateCommand): Promise<ResidentWorker> {
-		let createCommand = withoutSupervisorCreateFields(command);
+		let createCommand = command;
 		if (command.sessionPath) {
 			const activeMatches = this.matchWorkers(command.sessionPath);
 			if (activeMatches.length === 1) {
@@ -1406,14 +1427,14 @@ export class DaemonSupervisor {
 				? resolve(command.sessionPath)
 				: await this.catalog.resolve(command.sessionPath, config.cwd ?? process.cwd(), config.sessionDir);
 			createCommand = { ...command, sessionPath };
-			createCommand = withoutSupervisorCreateFields(createCommand);
 			const existing = this.findWorkerBySessionFile(sessionPath);
 			if (existing) {
 				return existing.worker;
 			}
 		}
-		const key = createCommand.sessionPath
-			? canonicalSessionPath(createCommand.sessionPath)
+		const workerCommand = withoutSupervisorCreateFields(createCommand);
+		const key = workerCommand.sessionPath
+			? canonicalSessionPath(workerCommand.sessionPath)
 			: `new:${command.id ? createCommandIdempotencyKey(clientId, command.id) : createActiveSessionId()}`;
 		const pending = this.openingWorkers.get(key);
 		if (pending) {
@@ -1436,6 +1457,7 @@ export class DaemonSupervisor {
 			throw new Error(`Session worker ${existing.descriptor.workerId} recovery was cancelled`);
 		}
 		const recoveryStopRevision = existing?.stopRevision;
+		const ephemeral = existing?.ephemeral ?? command.lifecycle === "client_owned";
 		const createCommand: DaemonCreateCommand = {
 			...withoutSupervisorCreateFields(command),
 			config: mergeAgentSessionRuntimeConfig(this.defaultSessionConfig, command.config),
@@ -1516,6 +1538,7 @@ export class DaemonSupervisor {
 				lifecycle: "starting",
 				createCommand: { ...createCommand, id: undefined },
 				consecutiveFailures: existing?.descriptor.consecutiveFailures ?? 0,
+				...(ephemeral ? { retention: "ephemeral" as const } : {}),
 			};
 			worker = existing ?? {
 				descriptor,
@@ -1527,9 +1550,12 @@ export class DaemonSupervisor {
 				snapshotLoads: new Map(),
 				intentionalStop: false,
 				stopRevision: 0,
+				ephemeral,
+				pendingAttachments: 0,
 			};
 			await this.assertRecoveryAllowed();
 			worker.descriptor = descriptor;
+			worker.ephemeral = ephemeral;
 			descriptorAssigned = true;
 			this.persistWorker(worker);
 			worker.intentionalStop = false;
@@ -1592,6 +1618,7 @@ export class DaemonSupervisor {
 			this.persistWorker(worker);
 			await this.syncAgentPeers();
 			this.broadcastHeartbeatsChanged();
+			this.scheduleEphemeralWorkerCleanup(worker);
 			return worker;
 		} catch (error) {
 			if (isSupervisorGenerationStale(error)) {
@@ -1740,6 +1767,7 @@ export class DaemonSupervisor {
 			worker.descriptor.consecutiveFailures = 0;
 			this.persistWorker(worker);
 			this.broadcastHeartbeatsChanged();
+			this.scheduleEphemeralWorkerCleanup(worker);
 		} catch (error) {
 			if (isSupervisorRecoveryCancelled(error)) {
 				return;
@@ -2393,6 +2421,21 @@ export class DaemonSupervisor {
 		command: Extract<DaemonCommand, { type: "attach" }>,
 	): Promise<WorkerAttachData> {
 		const match = await this.findWorker(command.activeSessionId);
+		this.cancelEphemeralWorkerCleanup(match.worker);
+		match.worker.pendingAttachments++;
+		try {
+			return await this.attachClientToWorker(client, command, match);
+		} finally {
+			match.worker.pendingAttachments--;
+			this.scheduleEphemeralWorkerCleanup(match.worker);
+		}
+	}
+
+	private async attachClientToWorker(
+		client: DaemonSocketClient,
+		command: Extract<DaemonCommand, { type: "attach" }>,
+		match: WorkerMatch,
+	): Promise<WorkerAttachData> {
 		const activeSessionId = match.summary.activeSessionId ?? match.summary.id;
 		const duplicateValidation = this.currentSnapshotGeneration(match.worker, activeSessionId)?.validation;
 		if (duplicateValidation) {
@@ -2774,7 +2817,72 @@ export class DaemonSupervisor {
 			client.catchupPurposes?.delete(resolvedId);
 			this.write(client, { type: "session_detached", activeSessionId: resolvedId });
 			void this.syncWorkerExtensionUi(resolvedId);
+			if (match) {
+				this.scheduleEphemeralWorkerCleanup(match.worker);
+			}
 		}
+	}
+
+	private workerHasAttachments(worker: ResidentWorker): boolean {
+		if (worker.pendingAttachments > 0) {
+			return true;
+		}
+		const activeSessionIds = new Set(
+			[...worker.summaries.values()].map((summary) => summary.activeSessionId ?? summary.id),
+		);
+		return [...this.clients].some((client) =>
+			[...client.attachedActiveSessionIds].some((activeSessionId) => activeSessionIds.has(activeSessionId)),
+		);
+	}
+
+	private cancelEphemeralWorkerCleanup(worker: ResidentWorker): void {
+		if (!worker.cleanupTimer) {
+			return;
+		}
+		clearTimeout(worker.cleanupTimer);
+		worker.cleanupTimer = undefined;
+	}
+
+	private scheduleEphemeralWorkerCleanup(worker: ResidentWorker): void {
+		if (
+			!worker.ephemeral ||
+			worker.cleanupTimer ||
+			this.workerHasAttachments(worker) ||
+			this.workers.get(worker.descriptor.workerId) !== worker
+		) {
+			return;
+		}
+		worker.cleanupTimer = setTimeout(() => {
+			worker.cleanupTimer = undefined;
+			if (
+				!worker.ephemeral ||
+				this.workerHasAttachments(worker) ||
+				this.workers.get(worker.descriptor.workerId) !== worker
+			) {
+				return;
+			}
+			void this.stopWorker(worker, true).catch((error) =>
+				this.log(`Could not clean up ephemeral worker ${worker.descriptor.workerId}: ${String(error)}`),
+			);
+		}, DAEMON_EPHEMERAL_WORKER_DISCONNECT_GRACE_MS);
+		worker.cleanupTimer.unref();
+	}
+
+	private promoteEphemeralWorker(worker: ResidentWorker): void {
+		if (!worker.ephemeral) {
+			return;
+		}
+		const previousRetention = worker.descriptor.retention;
+		worker.ephemeral = false;
+		worker.descriptor.retention = undefined;
+		try {
+			this.persistWorker(worker);
+		} catch (error) {
+			worker.ephemeral = true;
+			worker.descriptor.retention = previousRetention;
+			throw error;
+		}
+		this.cancelEphemeralWorkerCleanup(worker);
 	}
 
 	private async syncWorkerExtensionUi(activeSessionId: string): Promise<void> {
@@ -3467,6 +3575,7 @@ export class DaemonSupervisor {
 		recoveryCleanup = false,
 		directChild?: { child: ChildProcess; closed: Promise<void> },
 	): Promise<void> {
+		this.cancelEphemeralWorkerCleanup(worker);
 		if (!recoveryCleanup) {
 			worker.stopRevision++;
 		}
@@ -3689,6 +3798,7 @@ export class DaemonSupervisor {
 		}
 		this.clients.clear();
 		for (const worker of this.workers.values()) {
+			this.cancelEphemeralWorkerCleanup(worker);
 			await this.runCleanupStep(`worker client ${worker.descriptor.workerId}`, () => worker.client?.close());
 			worker.client = undefined;
 			const transcripts = new Set(worker.transcriptCaches.values());
