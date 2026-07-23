@@ -7,11 +7,7 @@ export class SideQuestionComponent implements Component {
 	private readonly answer: Markdown;
 	private event: AgentConnectionSideQuestionEvent;
 
-	constructor(
-		event: AgentConnectionSideQuestionEvent,
-		private readonly getMaxLines: () => number,
-		paddingX = 2,
-	) {
+	constructor(event: AgentConnectionSideQuestionEvent, paddingX = 2) {
 		this.event = event;
 		this.paddingX = Math.max(2, paddingX);
 		this.answer = new Markdown("", this.paddingX, 0, getMarkdownTheme(), {
@@ -37,12 +33,7 @@ export class SideQuestionComponent implements Component {
 			0,
 		).render(width);
 		const lines = [blank, ...question, blank, ...this.renderAnswer(width), blank];
-		const maxLines = Math.max(6, this.getMaxLines());
-		if (lines.length <= maxLines) {
-			return lines.map((line) => this.applySurface(line, width));
-		}
-		const ellipsis = new Text(theme.fg("dim", "…"), this.paddingX, 0).render(width)[0] ?? blank;
-		return [...lines.slice(0, maxLines - 1), ellipsis].map((line) => this.applySurface(line, width));
+		return lines.map((line) => this.applySurface(line, width));
 	}
 
 	private renderAnswer(width: number): string[] {

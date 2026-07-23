@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Fixed active session resume by making daemon workers supervisor-owned, allowing multiple clients to attach independently, and retiring ephemeral workers after their clients detach ([ENG-4800](https://linear.app/primeintellect/issue/ENG-4800/restore-multi-client-resume-for-active-sessions)).
+- Fixed `/btw` truncating long answers by rendering side questions in the scrollable transcript.
 - Changed selection cursors from `→` to `›` across model selectors, scoped-models, and the theme default for consistency with tree and user-message selectors.
 - Changed the queued follow-up hint connector from `↳` to `╰─` to match the tool-execution continuation connector.
 - Changed `/context` tree connectors from `├ `/`└ ` to `├─ `/`└─ ` to match the tree selector and session picker.

@@ -95,6 +95,56 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
 	});
 
+	it("compacts through the model summarizer, persists metadata, emits events, and remains usable", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			persistSession: true,
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("one response"),
+			fauxAssistantMessage("two response"),
+			fauxAssistantMessage("model-generated summary"),
+			fauxAssistantMessage("model-generated turn summary"),
+			fauxAssistantMessage("still usable"),
+		]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		const result = await harness.session.compact();
+		const entry = harness.sessionManager.getEntries().find((candidate) => candidate.type === "compaction");
+
+		expect(result.summary).toContain("model-generated summary");
+		expect(result.tokensBefore).toBeGreaterThan(0);
+		expect(result.firstKeptEntryId).toBeTruthy();
+		expect(entry).toMatchObject({
+			type: "compaction",
+			summary: expect.stringContaining("model-generated summary"),
+			firstKeptEntryId: result.firstKeptEntryId,
+			tokensBefore: result.tokensBefore,
+			fromHook: false,
+		});
+		expect(harness.session.messages[0]).toMatchObject({
+			role: "compactionSummary",
+			summary: expect.stringContaining("model-generated summary"),
+		});
+		expect(harness.eventsOfType("compaction_start")).toEqual([expect.objectContaining({ reason: "manual" })]);
+		expect(harness.eventsOfType("compaction_end")).toEqual([
+			expect.objectContaining({
+				reason: "manual",
+				result: expect.objectContaining({ tokensBefore: result.tokensBefore }),
+				aborted: false,
+				willRetry: false,
+			}),
+		]);
+
+		await harness.session.prompt("after compaction");
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			content: [{ type: "text", text: "still usable" }],
+		});
+	});
+
 	it("reschedules a pending post-compaction continuation after successful manual compaction", async () => {
 		vi.useFakeTimers();
 		const harness = await createHarness({
