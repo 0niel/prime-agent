@@ -175,8 +175,11 @@ describe("session slash commands", () => {
 			expect(parseSessionSlashCommand(text)).toEqual({ name: "goal", args: "ship it", text });
 		}
 		expect(parseSlashCommand("/goal\t  ship it  ")).toEqual({ name: "goal", args: "ship it" });
-		expect(parseSessionSlashCommand("/goal\nship it")).toBeUndefined();
-		expect(parseSessionSlashCommand("/goal\rship it")).toBeUndefined();
+		for (const lineTerminator of ["\n", "\r", "\r\n", "\u2028", "\u2029"]) {
+			expect(parseSessionSlashCommand(`/goal${lineTerminator}ship it`)).toBeUndefined();
+			expect(parseSessionSlashCommand(`/goal\t${lineTerminator}ship it`)).toBeUndefined();
+			expect(parseSessionSlashCommand(`/autonomous\t${lineTerminator}on`)).toBeUndefined();
+		}
 	});
 
 	test("classifies only exact leading session-owned commands", () => {

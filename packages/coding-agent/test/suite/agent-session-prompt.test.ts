@@ -1190,6 +1190,20 @@ stale post-hook extension instructions`,
 		expect(getAssistantTexts(harness)).toEqual([]);
 	});
 
+	it("sends multiline goal and autonomous variants to the model", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+
+		await harness.session.prompt("/goal\t\nship it", { expandPromptTemplates: false });
+		await harness.session.prompt("/autonomous\t\non", { expandPromptTemplates: false });
+
+		expect(harness.session.goalState.status).toBe("idle");
+		expect(harness.session.getAutonomousStatus().enabled).toBe(false);
+		expect(getUserTexts(harness)).toEqual(["/goal\t\nship it", "/autonomous\t\non"]);
+		expect(getAssistantTexts(harness)).toEqual(["first", "second"]);
+	});
+
 	it("does not run built-in slash commands immediately while queueIfBusy backpressure is active", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

@@ -210,6 +210,7 @@ export function resolveSlashCommand(command: ParsedSlashCommand): ResolvedSlashC
 }
 
 export function parseSessionSlashCommand(text: string): SessionSlashCommand | undefined {
+	if (/[\r\n\u2028\u2029]/u.test(text)) return undefined;
 	const parsed = parseSlashCommand(text);
 	if (!parsed) return undefined;
 	const name = resolveBuiltinSlashCommandName(parsed.name);
