@@ -10,6 +10,7 @@ import type { PromptTemplate } from "../../src/core/prompt-templates.js";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.js";
 import { createTestResourceLoader } from "../utilities.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
+import { createWaitingHarness } from "./scheduling.js";
 
 // acceptAgentMessagePrompt admission is asynchronous. Pause after agent.prompt has
 // synchronously claimed the run, but before its prompt messages become delivered.
@@ -283,47 +284,19 @@ describe("AgentSession prompt characterization", () => {
 	});
 
 	it("throws when prompted during streaming without a streamingBehavior", async () => {
-		let releaseToolExecution: (() => void) | undefined;
-		const toolRelease = new Promise<void>((resolve) => {
-			releaseToolExecution = resolve;
-		});
-		const waitTool: AgentTool = {
-			name: "wait",
-			label: "Wait",
-			description: "Wait for release",
-			parameters: Type.Object({}),
-			execute: async () => {
-				await toolRelease;
-				return {
-					content: [{ type: "text", text: "released" }],
-					details: {},
-				};
-			},
-		};
-		const harness = await createHarness({ tools: [waitTool] });
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = await createWaitingHarness();
 		harnesses.push(harness);
 		harness.setResponses([
 			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
 			fauxAssistantMessage("done"),
 		]);
-
-		const sawToolStart = new Promise<void>((resolve) => {
-			const unsubscribe = harness.session.subscribe((event) => {
-				if (event.type === "tool_execution_start") {
-					unsubscribe();
-					resolve();
-				}
-			});
-		});
-
-		const promptPromise = harness.session.prompt("start");
-		await sawToolStart;
+		await waitForToolStart;
 
 		await expect(harness.session.prompt("second")).rejects.toThrow(
 			"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
 		);
 
-		releaseToolExecution?.();
+		releaseToolExecution();
 		await promptPromise;
 	});
 

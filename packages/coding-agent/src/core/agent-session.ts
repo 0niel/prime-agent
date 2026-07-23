@@ -546,6 +546,19 @@ interface PreparedPromptPreparation {
 
 class DeferredSessionInputError extends Error {}
 
+/** Wrap a preflight callback so only the first report wins. */
+function oncePreflight(
+	preflightResult: ((success: boolean, queued?: boolean) => void) | undefined,
+): (success: boolean, queued?: boolean) => void {
+	let settled = false;
+	return (success, queued = false) => {
+		if (!settled) {
+			settled = true;
+			preflightResult?.(success, queued);
+		}
+	};
+}
+
 interface PreparedCommandInput {
 	kind: "command";
 	text: string;
@@ -1652,6 +1665,24 @@ export class AgentSession {
 		return true;
 	}
 
+	/** Append custom messages returned by before_agent_start extension handlers. */
+	private _appendBeforeAgentStartMessages(
+		messages: AgentMessage[],
+		result: Awaited<ReturnType<ExtensionRunner["emitBeforeAgentStart"]>>,
+	): void {
+		if (!result?.messages) return;
+		for (const message of result.messages) {
+			messages.push({
+				role: "custom",
+				customType: message.customType,
+				content: message.content,
+				display: message.display,
+				details: message.details,
+				timestamp: Date.now(),
+			});
+		}
+	}
+
 	private async _validateCanStartAgentRun(): Promise<void> {
 		if (!this.model) {
 			throw new Error(formatNoModelSelectedMessage());
@@ -2114,7 +2145,7 @@ export class AgentSession {
 			if (this._refineInFlight === applySettled) {
 				this._refineInFlight = undefined;
 			}
-			this._schedulePendingMessageResume();
+			this._scheduleSessionInputPump();
 		}
 	}
 
@@ -2275,7 +2306,7 @@ export class AgentSession {
 			if (this._refineAbortController === refineAbort) {
 				this._refineAbortController = undefined;
 			}
-			this._schedulePendingMessageResume();
+			this._scheduleSessionInputPump();
 			throw error;
 		} finally {
 			if (this._refinePlanInFlight === planSettled) {
@@ -2287,7 +2318,7 @@ export class AgentSession {
 			if (this._refineAbortController === refineAbort) {
 				this._refineAbortController = undefined;
 			}
-			this._schedulePendingMessageResume();
+			this._scheduleSessionInputPump();
 			return;
 		}
 
@@ -2305,7 +2336,7 @@ export class AgentSession {
 			if (this._refineInFlight === applySettled) {
 				this._refineInFlight = undefined;
 			}
-			this._schedulePendingMessageResume();
+			this._scheduleSessionInputPump();
 		}
 	}
 
@@ -3038,19 +3069,7 @@ export class AgentSession {
 			if (this._isPromptTurnStartMessage(event.message)) {
 				this._overflowRecoveryAttempted = false;
 			}
-			const steeringIndex = this._steeringMessages.findIndex((message) => message.message === event.message);
-			if (steeringIndex !== -1) {
-				const [removed] = this._steeringMessages.splice(steeringIndex, 1);
-				this._resolveAgentMessageDelivery(removed?.agentMessageId);
-				this._emitQueueUpdate();
-			} else {
-				const followUpIndex = this._followUpMessages.findIndex((message) => message.message === event.message);
-				if (followUpIndex !== -1) {
-					const [removed] = this._followUpMessages.splice(followUpIndex, 1);
-					this._resolveAgentMessageDelivery(removed?.agentMessageId);
-					this._emitQueueUpdate();
-				}
-			}
+			this._removeDeliveredSessionInput(event.message);
 		}
 
 		// Emit to extensions first
@@ -3197,7 +3216,7 @@ export class AgentSession {
 			this._retryResolve();
 			this._retryResolve = undefined;
 			this._retryPromise = undefined;
-			this._schedulePendingMessageResume();
+			this._scheduleSessionInputPump();
 		}
 	}
 
@@ -3922,14 +3941,7 @@ export class AgentSession {
 		options: InternalPromptOptions | undefined,
 		releaseAdmission: () => void,
 	): Promise<void> {
-		const preflightResult = options?.preflightResult;
-		let preflightSettled = false;
-		const reportPreflight = (success: boolean, queued = false) => {
-			if (!preflightSettled) {
-				preflightSettled = true;
-				preflightResult?.(success, queued);
-			}
-		};
+		const reportPreflight = oncePreflight(options?.preflightResult);
 
 		let messages: AgentMessage[] | undefined;
 		let drainedNextTurnMessages: CustomMessage[] = [];
@@ -3938,13 +3950,7 @@ export class AgentSession {
 		let basePromptSnapshot: string | undefined;
 		try {
 			const shouldQueueForStreaming = this.isStreaming;
-			const shouldQueueForPendingWork =
-				options?.queueIfBusy === true &&
-				(this.pendingMessageCount > 0 ||
-					this.isCompacting ||
-					this.isRetrying ||
-					this.isBashRunning ||
-					this.hasAcceptedPromptInFlight);
+			const shouldQueueForPendingWork = options?.queueIfBusy === true && this._isBusyForSessionInput("preflight");
 			if (shouldQueueForStreaming || shouldQueueForPendingWork) {
 				if (!options?.streamingBehavior) {
 					const stateDescription = shouldQueueForStreaming
@@ -3954,37 +3960,19 @@ export class AgentSession {
 						`${stateDescription}. Specify streamingBehavior ('steer' or 'followUp') to queue the message.`,
 					);
 				}
-				const queued = await this._queueInjectedMessageWithPendingNextTurnMessages(
-					text,
+				await this._queueWithPendingNextTurnMessages(text, options.streamingBehavior, reportPreflight, {
 					message,
-					options.streamingBehavior,
-					{
-						queueKey: options.followUpQueueKey,
-						previewLabel,
-						suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-						resumeIfIdle: options.resumeIfIdle,
-					},
-				);
-				if (!queued) {
-					reportPreflight(false);
-					return;
-				}
-				reportPreflight(true, true);
+					queueKey: options.followUpQueueKey,
+					previewLabel,
+					suppressAutonomousContinuation: options.suppressAutonomousContinuation,
+					resumeIfIdle: options.resumeIfIdle,
+				});
 				return;
 			}
 
 			await this._waitForRefineIdle();
 			this._flushPendingBashMessages();
-			if (!this.model) {
-				throw new Error(formatNoModelSelectedMessage());
-			}
-			if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
-				const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
-				if (isOAuth) {
-					throw new Error(formatAuthenticationFailedMessage(this.model.provider));
-				}
-				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
-			}
+			await this._validateCanStartAgentRun();
 
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
@@ -4007,18 +3995,7 @@ export class AgentSession {
 				basePromptSnapshot,
 				this._baseSystemPromptOptions,
 			);
-			if (extensionResult?.messages) {
-				for (const msg of extensionResult.messages) {
-					messages.push({
-						role: "custom",
-						customType: msg.customType,
-						content: msg.content,
-						display: msg.display,
-						details: msg.details,
-						timestamp: Date.now(),
-					});
-				}
-			}
+			this._appendBeforeAgentStartMessages(messages, extensionResult);
 			this.agent.state.systemPrompt =
 				extensionResult?.systemPrompt !== undefined
 					? this._refreshExtensionSystemPrompt(extensionResult.systemPrompt, basePromptSnapshot)
@@ -4043,40 +4020,22 @@ export class AgentSession {
 				this.agent.state.systemPrompt = this._baseSystemPrompt;
 			}
 		}
-		const shouldQueueAtHandoff =
-			options?.queueIfBusy === true &&
-			(this.isStreaming ||
-				this.pendingMessageCount > 0 ||
-				this.isCompacting ||
-				this.isRetrying ||
-				this.isBashRunning ||
-				this._acceptedPromptCompletions.size > 0 ||
-				this._acceptedAgentMessagePrompt !== undefined);
+		const shouldQueueAtHandoff = options?.queueIfBusy === true && this._isBusyForSessionInput("handoff");
 		if (shouldQueueAtHandoff) {
+			this._pendingNextTurnMessages.unshift(...drainedNextTurnMessages.map((pending) => ({ ...pending })));
 			if (!options?.streamingBehavior) {
-				this._pendingNextTurnMessages.unshift(...drainedNextTurnMessages.map((pending) => ({ ...pending })));
 				reportPreflight(false);
 				throw new Error(
 					"Agent became busy before prompt delivery. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
 				);
 			}
-			this._pendingNextTurnMessages.unshift(...drainedNextTurnMessages.map((pending) => ({ ...pending })));
-			const queued = await this._queueInjectedMessageWithPendingNextTurnMessages(
-				text,
+			await this._queueWithPendingNextTurnMessages(text, options.streamingBehavior, reportPreflight, {
 				message,
-				options.streamingBehavior,
-				{
-					queueKey: options.followUpQueueKey,
-					previewLabel,
-					suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-					resumeIfIdle: options.resumeIfIdle,
-				},
-			);
-			if (!queued) {
-				reportPreflight(false);
-				return;
-			}
-			reportPreflight(true, true);
+				queueKey: options.followUpQueueKey,
+				previewLabel,
+				suppressAutonomousContinuation: options.suppressAutonomousContinuation,
+				resumeIfIdle: options.resumeIfIdle,
+			});
 			return;
 		}
 
@@ -4123,14 +4082,7 @@ export class AgentSession {
 	): Promise<void> {
 		const isInternalPrompt = options?.internalPrompt === true;
 		const expandPromptTemplates = isInternalPrompt ? false : (options?.expandPromptTemplates ?? true);
-		const preflightResult = options?.preflightResult;
-		let preflightSettled = false;
-		const reportPreflight = (success: boolean, queued = false) => {
-			if (!preflightSettled) {
-				preflightSettled = true;
-				preflightResult?.(success, queued);
-			}
-		};
+		const reportPreflight = oncePreflight(options?.preflightResult);
 		let messages: AgentMessage[] | undefined;
 		let acceptedAgentMessagePrompt: AcceptedAgentMessagePrompt | undefined;
 		let drainedNextTurnMessages: CustomMessage[] = [];
@@ -4141,14 +4093,6 @@ export class AgentSession {
 
 		try {
 			let currentText = text;
-			const hasQueueIfBusyBackpressure = () =>
-				options?.queueIfBusy === true &&
-				(this.pendingMessageCount > 0 ||
-					this.isCompacting ||
-					this.isRetrying ||
-					this.isBashRunning ||
-					this.hasAcceptedPromptInFlight);
-
 			const shouldHandleBuiltInSlashCommands = !isInternalPrompt && !options?.skipPrePromptWork;
 			const sessionCommand = shouldHandleBuiltInSlashCommands ? parseSessionSlashCommand(currentText) : undefined;
 			if (sessionCommand) {
@@ -4213,7 +4157,7 @@ export class AgentSession {
 			// If streaming, or a caller explicitly asked to respect existing queued work,
 			// enqueue according to the requested behavior.
 			const shouldQueueForStreaming = this.isStreaming;
-			const shouldQueueForPendingWork = hasQueueIfBusyBackpressure();
+			const shouldQueueForPendingWork = options?.queueIfBusy === true && this._isBusyForSessionInput("preflight");
 			if (shouldQueueForStreaming || shouldQueueForPendingWork) {
 				if (!options?.streamingBehavior) {
 					const stateDescription = shouldQueueForStreaming
@@ -4223,23 +4167,14 @@ export class AgentSession {
 						`${stateDescription}. Specify streamingBehavior ('steer' or 'followUp') to queue the message.`,
 					);
 				}
-				const queued = await this._queuePromptWithPendingNextTurnMessages(
-					expandedText,
-					currentImages,
-					options.streamingBehavior,
-					{
-						queueKey: options.followUpQueueKey,
-						agentMessageId: options.agentMessageId,
-						suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-						customMessage: options.customMessage,
-						resumeIfIdle: options.resumeIfIdle,
-					},
-				);
-				if (!queued) {
-					reportPreflight(false);
-					return;
-				}
-				reportPreflight(true, true);
+				await this._queueWithPendingNextTurnMessages(expandedText, options.streamingBehavior, reportPreflight, {
+					images: currentImages,
+					queueKey: options.followUpQueueKey,
+					agentMessageId: options.agentMessageId,
+					suppressAutonomousContinuation: options.suppressAutonomousContinuation,
+					message: options.customMessage,
+					resumeIfIdle: options.resumeIfIdle,
+				});
 				return;
 			}
 
@@ -4249,24 +4184,21 @@ export class AgentSession {
 
 			// Flush any pending bash messages before the new prompt, including accepted agent messages.
 			this._flushPendingBashMessages();
-
-			// Validate model
-			if (!this.model) {
-				throw new Error(formatNoModelSelectedMessage());
-			}
-
-			if (!this._modelRegistry.hasConfiguredAuth(this.model)) {
-				const isOAuth = this._modelRegistry.isUsingOAuth(this.model);
-				if (isOAuth) {
-					throw new Error(formatAuthenticationFailedMessage(this.model.provider));
-				}
-				throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
-			}
+			await this._validateCanStartAgentRun();
 
 			const pendingModelSelectEmit = this._pendingModelSelectEmit();
 			if (pendingModelSelectEmit) {
 				await pendingModelSelectEmit;
 			}
+			const buildUserContent = (): (TextContent | ImageContent)[] => {
+				const userContent: (TextContent | ImageContent)[] = options?.content
+					? options.content.map((block) => ({ ...block }))
+					: [{ type: "text", text: expandedText }];
+				if (!options?.content && currentImages) {
+					userContent.push(...currentImages);
+				}
+				return userContent;
+			};
 			if (options?.skipPrePromptWork) {
 				this.agent.state.systemPrompt = this._baseSystemPrompt;
 				messages = [];
@@ -4275,17 +4207,11 @@ export class AgentSession {
 					messages.push(msg);
 				}
 				this._pendingNextTurnMessages = [];
-				const userContent: (TextContent | ImageContent)[] = options?.content
-					? options.content.map((block) => ({ ...block }))
-					: [{ type: "text", text: expandedText }];
-				if (!options?.content && currentImages) {
-					userContent.push(...currentImages);
-				}
 				const promptMessage: QueuedAgentMessage = options.customMessage
 					? cloneCustomMessage(options.customMessage)
 					: {
 							role: "user",
-							content: userContent,
+							content: buildUserContent(),
 							timestamp: Date.now(),
 						};
 				messages.push(promptMessage);
@@ -4330,15 +4256,9 @@ export class AgentSession {
 				if (options?.customMessage) {
 					messages.push(cloneCustomMessage(options.customMessage));
 				} else {
-					const userContent: (TextContent | ImageContent)[] = options?.content
-						? options.content.map((block) => ({ ...block }))
-						: [{ type: "text", text: expandedText }];
-					if (!options?.content && currentImages) {
-						userContent.push(...currentImages);
-					}
 					messages.push({
 						role: "user",
-						content: userContent,
+						content: buildUserContent(),
 						timestamp: Date.now(),
 					});
 				}
@@ -4352,18 +4272,8 @@ export class AgentSession {
 					this._baseSystemPromptOptions,
 				);
 				// Add all custom messages from extensions
-				if (extensionResult?.messages) {
-					for (const msg of extensionResult.messages) {
-						messages.push({
-							role: "custom",
-							customType: msg.customType,
-							content: msg.content,
-							display: msg.display,
-							details: msg.details,
-							timestamp: Date.now(),
-						});
-					}
-				}
+				this._appendBeforeAgentStartMessages(messages, extensionResult);
+				// Apply extension-modified system prompt, or reset to base
 				this.agent.state.systemPrompt = extensionResult?.systemPrompt
 					? this._refreshExtensionSystemPrompt(extensionResult.systemPrompt, basePromptSnapshot)
 					: this._baseSystemPrompt;
@@ -4398,47 +4308,26 @@ export class AgentSession {
 			throw new Error("Accepted agent message was cleared before delivery.");
 		}
 		const shouldQueueAtHandoff =
-			options?.queueIfBusy === true &&
-			(this.isStreaming ||
-				this.pendingMessageCount > 0 ||
-				this.isCompacting ||
-				this.isRetrying ||
-				this.isBashRunning ||
-				this._acceptedPromptCompletions.size > 0 ||
-				(this._acceptedAgentMessagePrompt !== undefined &&
-					this._acceptedAgentMessagePrompt !== acceptedAgentMessagePrompt));
+			options?.queueIfBusy === true && this._isBusyForSessionInput("handoff", acceptedAgentMessagePrompt);
 		if (shouldQueueAtHandoff) {
+			if (acceptedAgentMessagePrompt && this._acceptedAgentMessagePrompt === acceptedAgentMessagePrompt) {
+				this._acceptedAgentMessagePrompt = undefined;
+			}
+			this._pendingNextTurnMessages.unshift(...drainedNextTurnMessages.map((message) => ({ ...message })));
 			if (!options?.streamingBehavior) {
-				if (acceptedAgentMessagePrompt && this._acceptedAgentMessagePrompt === acceptedAgentMessagePrompt) {
-					this._acceptedAgentMessagePrompt = undefined;
-				}
-				this._pendingNextTurnMessages.unshift(...drainedNextTurnMessages.map((message) => ({ ...message })));
 				reportPreflight(false);
 				throw new Error(
 					"Agent became busy before prompt delivery. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
 				);
 			}
-			if (acceptedAgentMessagePrompt && this._acceptedAgentMessagePrompt === acceptedAgentMessagePrompt) {
-				this._acceptedAgentMessagePrompt = undefined;
-			}
-			this._pendingNextTurnMessages.unshift(...drainedNextTurnMessages.map((message) => ({ ...message })));
-			const queued = await this._queuePromptWithPendingNextTurnMessages(
-				expandedText,
-				currentImages,
-				options.streamingBehavior,
-				{
-					queueKey: options.followUpQueueKey,
-					agentMessageId: options.agentMessageId,
-					suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-					customMessage: options.customMessage,
-					resumeIfIdle: options.resumeIfIdle,
-				},
-			);
-			if (!queued) {
-				reportPreflight(false);
-				return;
-			}
-			reportPreflight(true, true);
+			await this._queueWithPendingNextTurnMessages(expandedText, options.streamingBehavior, reportPreflight, {
+				images: currentImages,
+				queueKey: options.followUpQueueKey,
+				agentMessageId: options.agentMessageId,
+				suppressAutonomousContinuation: options.suppressAutonomousContinuation,
+				message: options.customMessage,
+				resumeIfIdle: options.resumeIfIdle,
+			});
 			return;
 		}
 		if (options?.suppressAutonomousContinuation) {
@@ -4499,20 +4388,14 @@ export class AgentSession {
 				) {
 					this._acceptedAgentMessagePrompt = undefined;
 				}
-				this._schedulePendingMessageResume();
+				this._scheduleSessionInputPump();
 			})
 			.catch(() => undefined);
 		if (options?.returnAfterAccepted) {
 			this._acceptedPromptCompletions.add(promptCompletion);
-			void promptCompletion.then(
-				() => {
-					this._acceptedPromptCompletions.delete(promptCompletion);
-				},
-				() => {
-					this._acceptedPromptCompletions.delete(promptCompletion);
-				},
-			);
-			void promptCompletion.catch(() => undefined);
+			void promptCompletion
+				.finally(() => this._acceptedPromptCompletions.delete(promptCompletion))
+				.catch(() => undefined);
 			return;
 		}
 		await promptCompletion;
@@ -4708,87 +4591,43 @@ export class AgentSession {
 		return content;
 	}
 
-	private async _queuePromptWithPendingNextTurnMessages(
+	/** Queue via the requested lane, restoring drained next-turn context on failure, and report preflight. */
+	private async _queueWithPendingNextTurnMessages(
 		text: string,
-		images: ImageContent[] | undefined,
 		streamingBehavior: "steer" | "followUp",
+		reportPreflight: (success: boolean, queued?: boolean) => void,
 		options: {
+			images?: ImageContent[];
 			queueKey?: string;
 			agentMessageId?: string;
-			customMessage?: CustomMessage;
-			suppressAutonomousContinuation?: boolean;
-			resumeIfIdle?: boolean;
-		} = {},
-	): Promise<boolean> {
-		const pendingNextTurnMessages = this._pendingNextTurnMessages;
-		this._pendingNextTurnMessages = [];
-		try {
-			if (streamingBehavior === "followUp") {
-				const queued = await this._queueFollowUp(text, images, {
-					queueKey: options.queueKey,
-					agentMessageId: options.agentMessageId,
-					message: options.customMessage,
-					prefixMessages: pendingNextTurnMessages,
-					suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-					resumeIfIdle: options.resumeIfIdle,
-				});
-				if (!queued) {
-					this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
-				}
-				return queued;
-			}
-			await this._queueSteer(text, images, {
-				agentMessageId: options.agentMessageId,
-				queueKey: options.queueKey,
-				message: options.customMessage,
-				prefixMessages: pendingNextTurnMessages,
-				suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-				resumeIfIdle: options.resumeIfIdle,
-			});
-			return true;
-		} catch (error) {
-			this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
-			throw error;
-		}
-	}
-
-	private async _queueInjectedMessageWithPendingNextTurnMessages(
-		text: string,
-		message: CustomMessage,
-		streamingBehavior: "steer" | "followUp",
-		options: {
-			queueKey?: string;
+			message?: QueuedAgentMessage;
 			previewLabel?: string;
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 		} = {},
-	): Promise<boolean> {
+	): Promise<void> {
 		const pendingNextTurnMessages = this._pendingNextTurnMessages;
 		this._pendingNextTurnMessages = [];
+		const queueOptions = {
+			queueKey: options.queueKey,
+			agentMessageId: options.agentMessageId,
+			message: options.message,
+			prefixMessages: pendingNextTurnMessages,
+			previewLabel: options.previewLabel,
+			suppressAutonomousContinuation: options.suppressAutonomousContinuation,
+			resumeIfIdle: options.resumeIfIdle,
+		};
 		try {
 			if (streamingBehavior === "followUp") {
-				const queued = await this._queueFollowUp(text, undefined, {
-					queueKey: options.queueKey,
-					message,
-					prefixMessages: pendingNextTurnMessages,
-					previewLabel: options.previewLabel,
-					suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-					resumeIfIdle: options.resumeIfIdle,
-				});
+				const queued = await this._queueFollowUp(text, options.images, queueOptions);
 				if (!queued) {
 					this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
 				}
-				return queued;
+				reportPreflight(queued, queued);
+				return;
 			}
-			await this._queueSteer(text, undefined, {
-				message,
-				prefixMessages: pendingNextTurnMessages,
-				previewLabel: options.previewLabel,
-				queueKey: options.queueKey,
-				suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-				resumeIfIdle: options.resumeIfIdle,
-			});
-			return true;
+			await this._queueSteer(text, options.images, queueOptions);
+			reportPreflight(true, true);
 		} catch (error) {
 			this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
 			throw error;
@@ -4868,6 +4707,19 @@ export class AgentSession {
 		return true;
 	}
 
+	/** Remove a delivered queued input from whichever lane holds it (steering first, then follow-up). */
+	private _removeDeliveredSessionInput(message: AgentMessage): void {
+		for (const queue of [this._steeringMessages, this._followUpMessages]) {
+			const index = queue.findIndex((item) => item.message === message);
+			if (index !== -1) {
+				const [removed] = queue.splice(index, 1);
+				this._resolveAgentMessageDelivery(removed?.agentMessageId);
+				this._emitQueueUpdate();
+				return;
+			}
+		}
+	}
+
 	private async _queueSteer(
 		text: string,
 		images?: ImageContent[],
@@ -4925,12 +4777,7 @@ export class AgentSession {
 		this._sessionInputPump.catch(() => {});
 	}
 
-	private _schedulePendingMessageResume(_request = false): void {
-		this._scheduleSessionInputPump();
-	}
-
 	private async _pumpSessionInputs(epoch: number): Promise<void> {
-		if (this._pumpingSessionInput) return;
 		this._pumpingSessionInput = true;
 		let blocked = false;
 		try {
@@ -5011,19 +4858,37 @@ export class AgentSession {
 		}
 	}
 
-	private _isSessionInputHandoffDeferred(epoch: number): boolean {
-		return (
-			this._disposed ||
-			this._disposing ||
-			epoch !== this._sessionInputPumpEpoch ||
-			this._sessionInputPumpSuspended ||
-			this._queuedWorkPauses.size > 0 ||
-			this.isBashRunning ||
+	/**
+	 * Single busy truth table for turn-admission decision points:
+	 * "preflight" is queueIfBusy backpressure before pre-prompt work (streaming checked separately),
+	 * "handoff" re-checks adjacent to the agent.prompt() handoff (includes streaming),
+	 * "pump" is session-input pump deferral (adds lifecycle and pause state).
+	 */
+	private _isBusyForSessionInput(
+		point: "preflight" | "handoff" | "pump",
+		ignoreAcceptedPrompt?: AcceptedAgentMessagePrompt,
+	): boolean {
+		const busy =
 			this.isCompacting ||
-			this._branchSummaryOperation !== undefined ||
 			this.isRetrying ||
-			this.hasAcceptedPromptInFlight
-		);
+			this.isBashRunning ||
+			this._acceptedPromptCompletions.size > 0 ||
+			(this._acceptedAgentMessagePrompt !== undefined && this._acceptedAgentMessagePrompt !== ignoreAcceptedPrompt);
+		if (point === "pump") {
+			return (
+				busy ||
+				this._disposed ||
+				this._disposing ||
+				this._sessionInputPumpSuspended ||
+				this._queuedWorkPauses.size > 0 ||
+				this._branchSummaryOperation !== undefined
+			);
+		}
+		return busy || this.pendingMessageCount > 0 || (point === "handoff" && this.isStreaming);
+	}
+
+	private _isSessionInputHandoffDeferred(epoch: number): boolean {
+		return epoch !== this._sessionInputPumpEpoch || this._isBusyForSessionInput("pump");
 	}
 
 	private _asError(error: unknown): Error {
@@ -5031,11 +4896,7 @@ export class AgentSession {
 	}
 
 	private _isDeferredSessionInputError(error: unknown, epoch: number): boolean {
-		return (
-			error instanceof DeferredSessionInputError ||
-			this._isSessionInputHandoffDeferred(epoch) ||
-			(error instanceof Error && error.message.startsWith("Agent is already processing"))
-		);
+		return error instanceof DeferredSessionInputError || this._isSessionInputHandoffDeferred(epoch);
 	}
 
 	private _surfaceSessionInputError(error: unknown): void {
@@ -5090,18 +4951,7 @@ export class AgentSession {
 			if (prompt.suppressAutonomousContinuation) this._markAutonomousContinuationSuppressed(prompt.message);
 		}
 		const result = prompts[0]?.preparation?.result;
-		if (result?.messages) {
-			for (const message of result.messages) {
-				messages.push({
-					role: "custom",
-					customType: message.customType,
-					content: message.content,
-					display: message.display,
-					details: message.details,
-					timestamp: Date.now(),
-				});
-			}
-		}
+		this._appendBeforeAgentStartMessages(messages, result);
 		// Re-check adjacent to the handoff: background refine planning may have
 		// completed and entered _applyRefine during the awaits above,
 		// disconnecting event handling. Wait for it to finish so the new
@@ -5113,6 +4963,10 @@ export class AgentSession {
 		this.agent.state.systemPrompt = result?.systemPrompt ?? this._baseSystemPrompt;
 		try {
 			if (this._activeSessionInput?.kind === "prompt") this._activeSessionInput.phase = "handedOff";
+			if (this.isStreaming) {
+				// agent.prompt() would reject with its already-processing error; defer instead.
+				throw new DeferredSessionInputError("Agent became active before session input handoff");
+			}
 			const promptPromise = this.agent.prompt(messages);
 			releaseAdmission();
 			await promptPromise;
@@ -6123,7 +5977,7 @@ export class AgentSession {
 				this._compactionOperation = undefined;
 			}
 			resolveCompactionOperation();
-			this._schedulePendingMessageResume();
+			this._scheduleSessionInputPump();
 			if (didCompact) {
 				this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
 				if (hadPostCompactionContinue) {
@@ -6348,6 +6202,11 @@ export class AgentSession {
 		}, 100);
 	}
 
+	/** Whether any snapshot of scheduled continuation messages is still session-owned. */
+	private _sessionOwnsScheduledContinuations(continuationMessages: AgentMessage[]): boolean {
+		return continuationMessages.some((message) => this._postCompactionContinuationMessages.includes(message));
+	}
+
 	private async _runScheduledPostCompactionContinue(): Promise<void> {
 		await this._waitForRefineIdle();
 		if (!this._postCompactionContinuationScheduled) {
@@ -6360,10 +6219,7 @@ export class AgentSession {
 		}
 
 		const continuationMessages = [...this._scheduledPostCompactionContinuationMessages];
-		const sessionOwnedContinuationsRemain = continuationMessages.some((message) =>
-			this._postCompactionContinuationMessages.includes(message),
-		);
-		if (continuationMessages.length > 0 && !sessionOwnedContinuationsRemain) {
+		if (continuationMessages.length > 0 && !this._sessionOwnsScheduledContinuations(continuationMessages)) {
 			this._cancelPostCompactionContinue();
 			this._scheduleAutoRefineAfterAgentEnd();
 			return;
@@ -6373,11 +6229,10 @@ export class AgentSession {
 			await this._sessionInputPump;
 			if (this._postCompactionContinuationScheduled) {
 				this._postCompactionContinuationScheduled = false;
-				const sessionOwnedContinuationsStillRemain = continuationMessages.some((message) =>
-					this._postCompactionContinuationMessages.includes(message),
-				);
 				const shouldReschedule =
-					continuationMessages.length === 0 ? this.pendingMessageCount > 0 : sessionOwnedContinuationsStillRemain;
+					continuationMessages.length === 0
+						? this.pendingMessageCount > 0
+						: this._sessionOwnsScheduledContinuations(continuationMessages);
 				if (shouldReschedule) {
 					this._schedulePostCompactionContinue();
 				} else {
@@ -6683,7 +6538,7 @@ export class AgentSession {
 			if (this._refineAbortController === refineAbort) {
 				this._refineAbortController = undefined;
 			}
-			this._schedulePendingMessageResume();
+			this._scheduleSessionInputPump();
 			throw e;
 		} finally {
 			if (this._refinePlanInFlight === planSettled) {
@@ -6729,7 +6584,7 @@ export class AgentSession {
 			if (this._refineInFlight === applySettled) {
 				this._refineInFlight = undefined;
 			}
-			this._schedulePendingMessageResume(true);
+			this._scheduleSessionInputPump();
 		}
 	}
 
@@ -7211,7 +7066,7 @@ export class AgentSession {
 			return false;
 		} finally {
 			this._autoCompactionAbortController = undefined;
-			this._schedulePendingMessageResume();
+			this._scheduleSessionInputPump();
 		}
 	}
 
