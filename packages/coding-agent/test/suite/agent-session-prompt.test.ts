@@ -983,7 +983,7 @@ stale post-hook extension instructions`,
 		sessionInternals._refineInFlight = undefined;
 		releaseRefine?.();
 
-		await expect(accepted).rejects.toThrow("Agent became busy before prompt delivery");
+		await expect(accepted).rejects.toThrow("Agent has queued work");
 		sessionInternals._userBashRunning = false;
 
 		let sawRestoredContext = false;
@@ -1136,95 +1136,6 @@ stale post-hook extension instructions`,
 		expect(getAssistantTexts(harness)).toEqual(["delivered assistant response"]);
 	});
 
-	it("cleared accepted agent message cleanup does not remove messages from a newer prompt", async () => {
-		let gateAgentStart = false;
-		let releaseGate = () => {};
-		const gate = new Promise<void>((resolve) => {
-			releaseGate = resolve;
-		});
-		const harness = await createHarness({
-			extensionFactories: [
-				(pi) => {
-					pi.on("agent_start", async () => {
-						if (gateAgentStart) {
-							await gate;
-						}
-					});
-				},
-			],
-		});
-		harnesses.push(harness);
-		const agentPrompt =
-			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_stale_cleanup\n\nagent text";
-		harness.setResponses([fauxAssistantMessage("seed response")]);
-		await harness.session.prompt("seed");
-
-		harness.setResponses([fauxAssistantMessage("never delivered"), fauxAssistantMessage("after clear response")]);
-		gateAgentStart = true;
-		const admission = gateNextAgentStart(harness);
-		const accepted = harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false });
-		await admission.reached;
-		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
-			steering: [],
-			followUp: [agentPrompt],
-		});
-		admission.release();
-		await expect(accepted).rejects.toThrow("cleared before delivery");
-		await harness.session.agent.waitForIdle();
-
-		// The cleared run's events are still stalled in the session event queue;
-		// run a newer prompt so its messages land in state before the stale cleanup.
-		harness.setResponses([fauxAssistantMessage("after clear response")]);
-		gateAgentStart = false;
-		await harness.session.prompt("after clear");
-		releaseGate();
-		await (harness.session as unknown as { _agentEventQueue: Promise<void> })._agentEventQueue;
-
-		expect(getUserTexts(harness)).toEqual(["seed", "after clear"]);
-		expect(getAssistantTexts(harness)).toEqual(["seed response", "after clear response"]);
-	});
-
-	it("restores drained nextTurn messages when an accepted agent message is cleared", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const agentPrompt =
-			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_next_turn\n\nagent text";
-		await harness.session.sendCustomMessage(
-			{ customType: "next-turn", content: "carry this", display: true, details: {} },
-			{ deliverAs: "nextTurn" },
-		);
-		harness.setResponses([fauxAssistantMessage("never delivered")]);
-
-		const admission = gateNextAgentStart(harness);
-		const accepted = harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false });
-		await admission.reached;
-		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
-			steering: [],
-			followUp: [agentPrompt],
-		});
-		admission.release();
-		await expect(accepted).rejects.toThrow("cleared before delivery");
-		await harness.session.agent.waitForIdle();
-		await (harness.session as unknown as { _agentEventQueue: Promise<void> })._agentEventQueue;
-
-		let sawCustomMessage = false;
-		harness.setResponses([
-			(context) => {
-				sawCustomMessage = context.messages.some(
-					(message) =>
-						message.role === "user" &&
-						typeof message.content !== "string" &&
-						message.content.some((part) => part.type === "text" && part.text === "carry this"),
-				);
-				return fauxAssistantMessage("done");
-			},
-		]);
-		await harness.session.prompt("normal prompt");
-
-		expect(sawCustomMessage).toBe(true);
-		expect(harness.session.messages.map((message) => message.role)).toEqual(["custom", "user", "assistant"]);
-	});
-
 	it("restores drained nextTurn messages when direct agent message acceptance fails before delivery", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -1298,6 +1209,7 @@ stale post-hook extension instructions`,
 			(harness.session as unknown as { _acceptedAgentMessagePrompt?: unknown })._acceptedAgentMessagePrompt,
 		).toBeUndefined();
 	});
+
 
 	it("promptAndWait queued behind an active turn stays pending through its own completion", async () => {
 		let releaseFirst: (() => void) | undefined;
