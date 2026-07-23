@@ -147,6 +147,51 @@ describe("ENG-4800 supervisor-owned sessions", () => {
 		).rejects.toThrow("worker-1 is stopping");
 	});
 
+	it("waits for in-flight worker recovery before attaching", async () => {
+		const summary = createSummary();
+		let finishRecovery!: () => void;
+		const worker = {
+			descriptor: {
+				workerId: "worker-1",
+				lifecycle: "recovering",
+			},
+			intentionalStop: false,
+			pendingAttachments: 0,
+			client: undefined as object | undefined,
+		};
+		const recovery = new Promise<void>((resolve) => {
+			finishRecovery = () => {
+				worker.client = {};
+				worker.descriptor.lifecycle = "ready";
+				resolve();
+			};
+		});
+		const attachClientToWorker = vi.fn(async () => ({ attached: true }));
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			findWorker: vi.fn(async () => ({ worker, summary })),
+			recoverWorker: vi.fn(async () => recovery),
+			attachClientToWorker,
+			cancelEphemeralWorkerCleanup: vi.fn(),
+			scheduleEphemeralWorkerCleanup: vi.fn(),
+		}) as {
+			attachClient(
+				client: DaemonSocketClient,
+				command: Extract<DaemonCommand, { type: "attach" }>,
+			): Promise<unknown>;
+		};
+
+		const attaching = supervisor.attachClient({} as DaemonSocketClient, {
+			type: "attach",
+			activeSessionId,
+		});
+		await Promise.resolve();
+		expect(attachClientToWorker).not.toHaveBeenCalled();
+
+		finishRecovery();
+		await expect(attaching).resolves.toEqual({ attached: true });
+		expect(attachClientToWorker).toHaveBeenCalledOnce();
+	});
+
 	it("refreshes ephemeral cleanup when create reuses a worker", async () => {
 		vi.useFakeTimers();
 		try {

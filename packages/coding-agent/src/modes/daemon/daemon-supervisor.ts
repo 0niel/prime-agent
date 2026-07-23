@@ -2422,16 +2422,29 @@ export class DaemonSupervisor {
 		command: Extract<DaemonCommand, { type: "attach" }>,
 	): Promise<WorkerAttachData> {
 		const match = await this.findWorker(command.activeSessionId);
-		if (match.worker.intentionalStop || match.worker.descriptor.stopRequestedAt) {
-			throw new Error(`Session worker ${match.worker.descriptor.workerId} is stopping`);
-		}
 		this.cancelEphemeralWorkerCleanup(match.worker);
 		match.worker.pendingAttachments++;
 		try {
+			await this.ensureWorkerReadyForAttach(match.worker);
 			return await this.attachClientToWorker(client, command, match);
 		} finally {
 			match.worker.pendingAttachments--;
 			this.scheduleEphemeralWorkerCleanup(match.worker);
+		}
+	}
+
+	private async ensureWorkerReadyForAttach(worker: ResidentWorker): Promise<void> {
+		if (worker.intentionalStop || worker.descriptor.stopRequestedAt) {
+			throw new Error(`Session worker ${worker.descriptor.workerId} is stopping`);
+		}
+		if (!worker.client || worker.descriptor.lifecycle !== "ready") {
+			await this.recoverWorker(worker);
+		}
+		if (worker.intentionalStop || worker.descriptor.stopRequestedAt) {
+			throw new Error(`Session worker ${worker.descriptor.workerId} is stopping`);
+		}
+		if (!worker.client || worker.descriptor.lifecycle !== "ready") {
+			throw new Error(`Session worker is ${worker.descriptor.lifecycle}`);
 		}
 	}
 
@@ -2859,6 +2872,8 @@ export class DaemonSupervisor {
 	private scheduleEphemeralWorkerCleanup(worker: ResidentWorker): void {
 		if (
 			!worker.ephemeral ||
+			worker.intentionalStop ||
+			worker.descriptor.stopRequestedAt ||
 			worker.cleanupTimer ||
 			this.workerHasAttachments(worker) ||
 			this.workers.get(worker.descriptor.workerId) !== worker
@@ -2869,6 +2884,8 @@ export class DaemonSupervisor {
 			worker.cleanupTimer = undefined;
 			if (
 				!worker.ephemeral ||
+				worker.intentionalStop ||
+				worker.descriptor.stopRequestedAt ||
 				this.workerHasAttachments(worker) ||
 				this.workers.get(worker.descriptor.workerId) !== worker
 			) {
