@@ -146,6 +146,7 @@ import {
 	failure,
 	isDaemonCommandEnvelope,
 	isDaemonDialogExtensionUiRequest,
+	isDaemonMutatingCommand,
 	success,
 } from "./daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
@@ -200,6 +201,14 @@ export { defaultDaemonSocketPath } from "./daemon-socket.js";
 
 const structuredLog = getLogger("coding-agent.daemon");
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
+const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
+const UPDATE_RESTART_DRAIN_ALLOWED_COMMANDS = new Set<DaemonCommand["type"]>([
+	"extension_ui_response",
+	"abort",
+	"abort_bash",
+	"abort_compaction",
+	"abort_retry",
+]);
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
@@ -404,6 +413,12 @@ export class AgentDaemon {
 	private server?: Server;
 	private shuttingDown = false;
 	private updateRestartPreparing = false;
+	private readonly updateRestartQueuePauses = new Map<string, { release(): void }>();
+	private activeWorkerMutations = 0;
+	private readonly workerMutationDrainWaiters = new Set<() => void>();
+	private updateRestartPrepareAbort?: AbortController;
+	private updateRestartPrepareInFlight = false;
+	private updateRestartCommitInFlight = false;
 	private preparedUpdateRestartManifest?: DaemonUpdateRestartManifest;
 	private ownsSocketPath = false;
 	private socketIdentity?: DaemonSocketIdentity;
@@ -2407,6 +2422,15 @@ export class AgentDaemon {
 			client.detachInput();
 			this.clients.delete(client);
 			this.supervisorClaims.delete(client);
+			if (
+				this.options.worker &&
+				this.updateRestartPreparing &&
+				!this.updateRestartCommitInFlight &&
+				this.supervisorClaims.size === 0
+			) {
+				this.updateRestartPrepareAbort?.abort();
+				this.cancelPreparedUpdateRestart();
+			}
 			const supervisorSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 			if (this.options.worker && client.authenticated === true && supervisorSocketPath) {
 				this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 100);
@@ -2593,7 +2617,24 @@ export class AgentDaemon {
 				}
 			}
 			if (this.options.worker && typeof parsed.type === "string" && parsed.type.startsWith("worker_")) {
-				await this.handleWorkerCommand(client, parsed as DaemonWorkerCommand);
+				const workerCommand = parsed as DaemonWorkerCommand;
+				const updateLifecycle =
+					workerCommand.type === "worker_prepare_update" ||
+					workerCommand.type === "worker_commit_update" ||
+					workerCommand.type === "worker_cancel_update";
+				if (this.updateRestartPreparing && !updateLifecycle) {
+					this.write(
+						client,
+						failure(workerCommand.id, workerCommand.type, "Daemon is preparing an update restart"),
+					);
+					return;
+				}
+				if (!updateLifecycle) this.beginWorkerMutation();
+				try {
+					await this.handleWorkerCommand(client, workerCommand);
+				} finally {
+					if (!updateLifecycle) this.endWorkerMutation();
+				}
 				return;
 			}
 
@@ -2609,6 +2650,17 @@ export class AgentDaemon {
 			return;
 		}
 
+		const workerMutation = this.options.worker !== undefined && isDaemonMutatingCommand(command);
+		if (
+			workerMutation &&
+			this.updateRestartPreparing &&
+			(command.type !== "shutdown" || this.updateRestartPrepareInFlight) &&
+			!(this.updateRestartPrepareInFlight && UPDATE_RESTART_DRAIN_ALLOWED_COMMANDS.has(command.type))
+		) {
+			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
+			return;
+		}
+		if (workerMutation) this.beginWorkerMutation();
 		try {
 			const response = await this.handleCommand(client, command, () => {
 				promptHandlerOwnsAdmission = true;
@@ -2626,6 +2678,41 @@ export class AgentDaemon {
 			this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
 		} finally {
 			if (!promptHandlerOwnsAdmission) clearParsedAdmission();
+			if (workerMutation) this.endWorkerMutation();
+		}
+	}
+
+	private beginWorkerMutation(): void {
+		this.activeWorkerMutations++;
+	}
+
+	private endWorkerMutation(): void {
+		this.activeWorkerMutations--;
+		if (this.activeWorkerMutations === 0) {
+			for (const resolve of this.workerMutationDrainWaiters) resolve();
+			this.workerMutationDrainWaiters.clear();
+		}
+	}
+
+	private async waitForWorkerMutations(signal: AbortSignal): Promise<void> {
+		while (this.activeWorkerMutations > 0) {
+			if (signal.aborted) throw new Error("Update restart preparation cancelled");
+			await new Promise<void>((resolve, reject) => {
+				const onDrained = () => {
+					cleanup();
+					resolve();
+				};
+				const onAbort = () => {
+					cleanup();
+					reject(new Error("Update restart preparation cancelled"));
+				};
+				const cleanup = () => {
+					this.workerMutationDrainWaiters.delete(onDrained);
+					signal.removeEventListener("abort", onAbort);
+				};
+				this.workerMutationDrainWaiters.add(onDrained);
+				signal.addEventListener("abort", onAbort, { once: true });
+			});
 		}
 	}
 
@@ -2697,7 +2784,26 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_prepare_update": {
-					const manifest = this.prepareUpdateRestartCheckpoint();
+					if (this.updateRestartPreparing) throw new Error("Daemon is already preparing an update restart");
+					const abort = new AbortController();
+					this.updateRestartPrepareAbort = abort;
+					this.updateRestartPrepareInFlight = true;
+					this.updateRestartPreparing = true;
+					this.cronScheduler.stop();
+					const deadline = setTimeout(() => abort.abort(), UPDATE_RESTART_PREPARE_TIMEOUT_MS);
+					deadline.unref();
+					let manifest: DaemonUpdateRestartManifest;
+					try {
+						await this.waitForWorkerMutations(abort.signal);
+						manifest = await this.prepareUpdateRestartCheckpoint(abort.signal, true);
+					} catch (error) {
+						if (this.updateRestartPrepareAbort === abort) this.cancelPreparedUpdateRestart();
+						throw error;
+					} finally {
+						this.updateRestartPrepareInFlight = false;
+						clearTimeout(deadline);
+					}
+
 					this.write(client, {
 						id: command.id,
 						type: "response",
@@ -2708,7 +2814,15 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_commit_update": {
-					const manifest = await this.commitPreparedUpdateRestart();
+					if (!this.preparedUpdateRestartManifest) throw new Error("Daemon has no prepared update checkpoint");
+					this.updateRestartCommitInFlight = true;
+					let manifest: DaemonUpdateRestartManifest;
+					try {
+						manifest = await this.commitPreparedUpdateRestart();
+					} catch (error) {
+						this.updateRestartCommitInFlight = false;
+						throw error;
+					}
 					this.write(client, {
 						id: command.id,
 						type: "response",
@@ -2719,6 +2833,10 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_cancel_update":
+					if (this.updateRestartCommitInFlight) {
+						throw new Error("Daemon update checkpoint is already committing");
+					}
+					this.updateRestartPrepareAbort?.abort();
 					this.cancelPreparedUpdateRestart();
 					this.write(client, {
 						id: command.id,
@@ -2738,7 +2856,12 @@ export class AgentDaemon {
 		command: DaemonCommand,
 		onPromptHandlerOwnsAdmission: () => void = () => {},
 	): Promise<DaemonResponse | undefined> {
-		if (this.updateRestartPreparing && command.type !== "shutdown" && command.type !== "ack_result") {
+		if (
+			this.updateRestartPreparing &&
+			command.type !== "ack_result" &&
+			(command.type !== "shutdown" || this.updateRestartPrepareInFlight) &&
+			!(this.updateRestartPrepareInFlight && UPDATE_RESTART_DRAIN_ALLOWED_COMMANDS.has(command.type))
+		) {
 			throw new Error("Daemon is preparing an update restart");
 		}
 		if ("agentMessageId" in command && command.agentMessageId === "") {
@@ -4538,8 +4661,11 @@ export class AgentDaemon {
 		return depth;
 	}
 
-	private prepareUpdateRestartCheckpoint(): DaemonUpdateRestartManifest {
-		if (this.updateRestartPreparing) {
+	private async prepareUpdateRestartCheckpoint(
+		signal?: AbortSignal,
+		alreadyFenced = false,
+	): Promise<DaemonUpdateRestartManifest> {
+		if (this.updateRestartPreparing && !alreadyFenced) {
 			throw new Error("Daemon is already preparing an update restart");
 		}
 		this.updateRestartPreparing = true;
@@ -4548,6 +4674,15 @@ export class AgentDaemon {
 		this.cronScheduler.stop();
 		try {
 			const states = [...this.sessions.values()];
+			this.updateRestartQueuePauses.clear();
+			for (const state of states) {
+				this.updateRestartQueuePauses.set(state.activeSessionId, state.runtime.session.acquireQueuedWorkPause());
+			}
+			await Promise.all(states.map((state) => state.runtime.session.waitForSessionInputCheckpoint(signal)));
+			const snapshottedIds = new Set(states.map((state) => state.activeSessionId));
+			const addedSession = [...this.sessions.keys()].find((activeSessionId) => !snapshottedIds.has(activeSessionId));
+			if (addedSession) throw new Error(`Session ${addedSession} became resident during update preparation`);
+
 			const restartSessions = states
 				.map((state) => this.createUpdateRestartSession(state))
 				.filter((session): session is DaemonUpdateRestartSession => session !== undefined)
@@ -4595,15 +4730,20 @@ export class AgentDaemon {
 	}
 
 	private cancelPreparedUpdateRestart(): void {
+		this.updateRestartPrepareAbort = undefined;
+		this.updateRestartPrepareInFlight = false;
 		this.preparedUpdateRestartManifest = undefined;
 		this.updateRestartPreparing = false;
+		for (const pause of this.updateRestartQueuePauses.values()) pause.release();
+		this.updateRestartQueuePauses.clear();
+
 		if (!this.shuttingDown) {
 			this.cronScheduler.start();
 		}
 	}
 
 	private async prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest> {
-		const manifest = this.prepareUpdateRestartCheckpoint();
+		const manifest = await this.prepareUpdateRestartCheckpoint();
 		try {
 			this.writeUpdateRestartManifest(manifest);
 			return await this.commitPreparedUpdateRestart();

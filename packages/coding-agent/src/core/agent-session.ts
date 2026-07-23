@@ -4922,6 +4922,7 @@ export class AgentSession {
 						queue.shift();
 						this._activeSessionInput = { kind: "command", lane, item: first, phase: "executing" };
 						this._syncSteeringStopPending();
+						this._notifySessionInputCheckpointChange();
 						this._emitQueueUpdate();
 						try {
 							await this._executeQueuedSessionCommand(first);
@@ -4930,7 +4931,11 @@ export class AgentSession {
 							this._rejectAgentMessage(first.agentMessageId, this._asError(error));
 						} finally {
 							this._activeSessionInput = undefined;
+<<<<<<< HEAD
 							this._syncSteeringStopPending();
+=======
+							this._notifySessionInputCheckpointChange();
+>>>>>>> ca6ec2cc9 (feat(daemon): checkpoint session inputs for restart)
 						}
 						continue;
 					}
@@ -4944,13 +4949,25 @@ export class AgentSession {
 						this._syncSteeringStopPending();
 						return;
 					}
-					this._activeSessionInput = { kind: "prompt", lane, items: prompts, phase: "preparing" };
+					this._activeSessionInput = {
+						kind: "prompt",
+						lane,
+						items: prompts,
+						phase: "preparing",
+						checkpointInputMessages: new Set(prompts.map((prompt) => prompt.message)),
+						persistedInputMessages: new Set(),
+					};
 					this._syncSteeringStopPending();
+					this._notifySessionInputCheckpointChange();
 					this._emitQueueUpdate();
 					try {
 						await this._startPreparedPromptItems(prompts, epoch, admission.release);
 						for (const prompt of prompts) {
 							this._settleAgentMessage(prompt.agentMessageId, "completion");
+						}
+						if (this._activeSessionInput?.kind === "prompt") {
+							this._activeSessionInput.phase = "handedOff";
+							this._notifySessionInputCheckpointChange();
 						}
 					} catch (error) {
 						const delivered = new Set(this.agent.state.messages);
@@ -4979,6 +4996,7 @@ export class AgentSession {
 					} finally {
 						this._activeSessionInput = undefined;
 						this._syncSteeringStopPending();
+						this._notifySessionInputCheckpointChange();
 					}
 				} finally {
 					admission.release();

@@ -20,6 +20,10 @@ type AgentDaemonUpdateInternals = {
 	cronScheduler: AgentCronScheduler;
 	prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest>;
 	handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+	handleWorkerCommand(client: DaemonSocketClient, command: { id: string; type: string }): Promise<void>;
+	activeWorkerMutations: number;
+	updateRestartPreparing: boolean;
+	updateRestartPrepareAbort?: AbortController;
 };
 
 type QueueInternals = {
@@ -38,6 +42,16 @@ type QueueInternals = {
 		message: UserMessage | CustomMessage;
 	}>;
 	_pendingNextTurnMessages: CustomMessage[];
+	_activeSessionInput?: {
+		kind: "prompt";
+		lane: "steer" | "followUp";
+		items: QueueInternals["_followUpMessages"];
+		phase: "preparing" | "handedOff";
+		checkpointInputMessages: Set<UserMessage | CustomMessage>;
+		persistedInputMessages: Set<UserMessage | CustomMessage>;
+	};
+	waitForSessionInputCheckpoint(signal?: AbortSignal): Promise<void>;
+	_notifySessionInputCheckpointChange(): void;
 	_acceptedAgentMessagePrompt?: {
 		text: string;
 		agentMessageId: string;
@@ -112,6 +126,79 @@ describe("issue #4257 update restart resume", () => {
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
+	});
+
+	it("keeps a prestart input in the manifest exactly once until message_end persistence", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = harness.session as unknown as QueueInternals;
+		const message: UserMessage = {
+			role: "user",
+			content: [{ type: "text", text: "blocked prestart update" }],
+			timestamp: Date.now(),
+		};
+		const input = {
+			text: "blocked prestart update",
+			prefixMessages: [],
+			message,
+		};
+		internals._activeSessionInput = {
+			kind: "prompt",
+			lane: "followUp",
+			items: [input],
+			phase: "preparing",
+			checkpointInputMessages: new Set([message]),
+			persistedInputMessages: new Set(),
+		};
+
+		let checkpointSettled = false;
+		const checkpoint = internals.waitForSessionInputCheckpoint().then(() => {
+			checkpointSettled = true;
+		});
+		await Promise.resolve();
+		expect(checkpointSettled).toBe(false);
+		expect(internals._activeSessionInput.items).toEqual([input]);
+		expect(internals._followUpMessages).toEqual([]);
+
+		internals._activeSessionInput.persistedInputMessages.add(message);
+		internals._activeSessionInput.phase = "handedOff";
+		internals._notifySessionInputCheckpointChange();
+		await checkpoint;
+		expect(checkpointSettled).toBe(true);
+	});
+
+	it("worker cancel releases a prepare blocked on an executing mutation", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
+			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
+			worker: { authenticationToken: "token" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		internals.activeWorkerMutations = 1;
+		const writes: string[] = [];
+		const client = {
+			id: "supervisor",
+			socket: {
+				destroyed: false,
+				write: (chunk: string) => {
+					writes.push(chunk);
+					return true;
+				},
+			},
+		} as unknown as DaemonSocketClient;
+
+		const prepare = internals.handleWorkerCommand(client, { id: "prepare", type: "worker_prepare_update" });
+		await vi.waitFor(() => expect(internals.updateRestartPreparing).toBe(true));
+		await internals.handleWorkerCommand(client, { id: "cancel", type: "worker_cancel_update" });
+		await prepare;
+
+		expect(internals.updateRestartPreparing).toBe(false);
+		expect(writes.join(" ")).toContain("Update restart preparation cancelled");
+		expect(writes.join(" ")).toContain('"command":"worker_cancel_update","success":true');
 	});
 
 	it("captures a restart manifest and aborts running bash without archiving the session", async () => {

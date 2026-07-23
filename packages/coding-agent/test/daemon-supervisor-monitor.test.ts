@@ -1552,4 +1552,19 @@ describe("daemon worker supervisor monitoring", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
+	it("rejects update prepare when a resident worker is recovering or disconnected", async () => {
+		const requestWorker = vi.fn();
+		const worker = {
+			descriptor: { workerId: "resident-1", lifecycle: "recovering" },
+			client: undefined,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([["resident-1", worker]]),
+		}) as {
+			prepareUpdateRestartFenced(): Promise<unknown>;
+		};
+
+		await expect(supervisor.prepareUpdateRestartFenced()).rejects.toThrow(/resident-1.*recovering.*disconnected/);
+		expect(requestWorker).not.toHaveBeenCalled();
+	});
 });

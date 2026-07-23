@@ -102,6 +102,15 @@ type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 const structuredLog = getLogger("coding-agent.daemon-supervisor");
 const WORKER_CONNECT_TIMEOUT_MS = 30_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
+const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
+const UPDATE_RESTART_DRAIN_ALLOWED_COMMANDS = new Set<DaemonCommand["type"]>([
+	"extension_ui_response",
+	"abort",
+	"abort_bash",
+	"abort_compaction",
+	"abort_retry",
+]);
 const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 const OWNED_WORKER_DISCONNECT_GRACE_MS = 30_000;
@@ -577,6 +586,10 @@ export class DaemonSupervisor {
 	private ownership?: Awaited<ReturnType<typeof acquireDaemonSupervisorOwnership>>;
 	private cleanupPromise?: Promise<void>;
 	private shuttingDown = false;
+	private updateRestartPreparing = false;
+	private updateRestartPrepareInFlight = false;
+	private activeMutations = 0;
+	private readonly mutationDrainWaiters = new Set<() => void>();
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly protocolClientIds = new WeakMap<DaemonSocketClient, string>();
 	private readonly workers = new Map<string, ResidentWorker>();
@@ -1104,6 +1117,16 @@ export class DaemonSupervisor {
 			return;
 		}
 
+		if (
+			this.updateRestartPreparing &&
+			isDaemonMutatingCommand(command) &&
+			(command.type !== "shutdown" || this.updateRestartPrepareInFlight) &&
+			!(this.updateRestartPrepareInFlight && UPDATE_RESTART_DRAIN_ALLOWED_COMMANDS.has(command.type))
+		) {
+			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
+			return;
+		}
+
 		const journalIdentity =
 			envelopeClientId && command.id && isDaemonMutatingCommand(command)
 				? { clientId: envelopeClientId, commandId: command.id }
@@ -1128,6 +1151,8 @@ export class DaemonSupervisor {
 			}
 		}
 
+		const mutation = isDaemonMutatingCommand(command);
+		if (mutation) this.activeMutations++;
 		try {
 			const response = await this.handleCommand(client, command, cancellationAdmission);
 			if (response) {
@@ -1149,6 +1174,12 @@ export class DaemonSupervisor {
 				}
 			}
 			this.write(client, response);
+		} finally {
+			if (mutation) {
+				this.activeMutations--;
+				for (const resolve of this.mutationDrainWaiters ?? []) resolve();
+				this.mutationDrainWaiters?.clear();
+			}
 		}
 	}
 
@@ -1157,6 +1188,15 @@ export class DaemonSupervisor {
 		command: DaemonCommand,
 		cancellationAdmission?: SupervisorPromptAdmission,
 	): Promise<DaemonResponse | undefined> {
+		if (
+			this.updateRestartPreparing &&
+			command.type !== "ack_result" &&
+			isDaemonMutatingCommand(command) &&
+			(command.type !== "shutdown" || this.updateRestartPrepareInFlight) &&
+			!(this.updateRestartPrepareInFlight && UPDATE_RESTART_DRAIN_ALLOWED_COMMANDS.has(command.type))
+		) {
+			throw new Error("Daemon is preparing an update restart");
+		}
 		switch (command.type) {
 			case "cancel_prompt_admission": {
 				const admission =
@@ -3750,20 +3790,74 @@ export class DaemonSupervisor {
 	}
 
 	private async prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest> {
-		const workers = [...this.workers.values()].filter(
-			(worker): worker is ResidentWorker & { client: DaemonWorkerClient } => worker.client !== undefined,
+		if (this.updateRestartPreparing) throw new Error("Daemon is already preparing an update restart");
+		this.updateRestartPreparing = true;
+		this.updateRestartPrepareInFlight = true;
+		try {
+			const abort = AbortSignal.timeout(UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS);
+			await this.waitForMutationDrain(1, abort);
+			const manifest = await this.prepareUpdateRestartFenced();
+			this.updateRestartPrepareInFlight = false;
+			return manifest;
+		} catch (error) {
+			this.updateRestartPrepareInFlight = false;
+			this.updateRestartPreparing = false;
+			throw error;
+		}
+	}
+
+	private async waitForMutationDrain(remaining: number, signal: AbortSignal): Promise<void> {
+		while (this.activeMutations > remaining) {
+			if (signal.aborted) throw new Error("Timed out draining daemon mutations for update restart");
+			await new Promise<void>((resolve, reject) => {
+				const onDrained = () => {
+					cleanup();
+					resolve();
+				};
+				const onAbort = () => {
+					cleanup();
+					reject(new Error("Timed out draining daemon mutations for update restart"));
+				};
+				const cleanup = () => {
+					this.mutationDrainWaiters.delete(onDrained);
+					signal.removeEventListener("abort", onAbort);
+				};
+				this.mutationDrainWaiters.add(onDrained);
+				signal.addEventListener("abort", onAbort, { once: true });
+			});
+		}
+	}
+
+	private async prepareUpdateRestartFenced(): Promise<DaemonUpdateRestartManifest> {
+		const residents = [...this.workers.values()];
+		const unavailable = residents.find(
+			(worker) => worker.descriptor.lifecycle !== "ready" || worker.client === undefined,
 		);
+		if (unavailable) {
+			throw new Error(
+				`Cannot prepare update restart while resident worker ${unavailable.descriptor.workerId} is ${unavailable.descriptor.lifecycle}${unavailable.client ? "" : " and disconnected"}`,
+			);
+		}
+		const workers = residents as Array<ResidentWorker & { client: DaemonWorkerClient }>;
 		const prepared: Array<ResidentWorker & { client: DaemonWorkerClient }> = [];
 		const preparationResults = await Promise.allSettled(
 			workers.map(async (worker) => {
 				const response = await worker.client.requestWorker(
 					{ type: "worker_prepare_update" },
-					WORKER_REQUEST_TIMEOUT_MS,
+					UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS,
 				);
 				if (!response.success || !response.data || typeof response.data !== "object") {
 					throw new Error(response.success ? "Worker returned an invalid update manifest" : response.error);
 				}
-				return { worker, manifest: response.data as DaemonUpdateRestartManifest };
+				const manifest = response.data as DaemonUpdateRestartManifest;
+				if (
+					!manifest.sessions.some((session) => session.activeSessionId === worker.descriptor.rootActiveSessionId)
+				) {
+					throw new Error(
+						`Worker ${worker.descriptor.workerId} omitted its root session from the update manifest`,
+					);
+				}
+				return { worker, manifest };
 			}),
 		);
 		for (const result of preparationResults) {
@@ -3799,18 +3893,32 @@ export class DaemonSupervisor {
 			);
 			throw error;
 		}
-		await Promise.all(
+		const commitResults = await Promise.allSettled(
 			prepared.map(async (worker) => {
 				const response = await worker.client.requestWorker(
 					{ type: "worker_commit_update" },
-					WORKER_REQUEST_TIMEOUT_MS,
+					UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS,
 				);
-				if (!response.success) {
-					throw new Error(response.error);
-				}
+				if (!response.success) throw new Error(response.error);
 			}),
 		);
-		await Promise.all(prepared.map((worker) => this.stopWorker(worker, false)));
+		const commitFailure = commitResults.find(
+			(result): result is PromiseRejectedResult => result.status === "rejected",
+		);
+		if (commitFailure) {
+			// A successful commit may already have destroyed a worker's live state. The
+			// aggregate manifest is durable, so remain fenced and finish stopping every
+			// resident. Returning the full manifest forces restart completion instead of
+			// exposing this partially committed generation again.
+			this.log(`Update restart commit response failed; forcing restart completion: ${String(commitFailure.reason)}`);
+			await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
+			return manifest;
+		}
+		const stopResults = await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false)));
+		if (stopResults.some((result) => result.status === "rejected")) {
+			this.log("A committed update worker did not stop gracefully; forcing restart completion");
+			await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
+		}
 		return manifest;
 	}
 
@@ -3824,7 +3932,7 @@ export class DaemonSupervisor {
 			if (activeSessionIds.has(session.activeSessionId)) {
 				throw new Error(`Update manifest contains duplicate active session ${session.activeSessionId}`);
 			}
-			const sessionFile = resolve(session.sessionFile);
+			const sessionFile = canonicalSessionPath(session.sessionFile);
 			if (sessionFiles.has(sessionFile)) {
 				throw new Error(`Update manifest contains duplicate session file ${sessionFile}`);
 			}
