@@ -3684,62 +3684,54 @@ describe("InteractiveMode live context usage", () => {
 		expect(prototype.getConnectionContextUsage.call(fakeThis)).toBeUndefined();
 	});
 
-	test("refreshConnectionContextUsage drops stale stats after a session switch", async () => {
-		type RefreshHarness = {
-			agentConnection: { getSessionStats(): Promise<{ contextUsage: unknown }> };
-			connectionState: { sessionId?: string; contextUsage?: unknown };
-			activityTracker: { getStatus(): { tokens: number } };
-			contextUsageTokenBaseline: number;
-			contextUsageRefreshGeneration: number;
-			patchConnectionState(patch: Record<string, unknown>): void;
-			refreshConnectionContextUsage(): Promise<void>;
+	type RefreshHarness = {
+		agentConnection: { getSessionStats(): Promise<{ contextUsage: unknown } | undefined> };
+		connectionState: { sessionId?: string; contextUsage?: unknown };
+		activityTracker: { getStatus(): { tokens: number } };
+		contextUsageTokenBaseline: number;
+		contextUsageRefreshRequestGeneration: number;
+		contextUsageRefreshResultGeneration: number;
+		patchConnectionState(patch: Record<string, unknown>): void;
+		refreshConnectionContextUsage(): Promise<void>;
+	};
+	const refresh = (InteractiveMode.prototype as unknown as RefreshHarness).refreshConnectionContextUsage;
+
+	function createRefreshHarness(
+		getSessionStats: RefreshHarness["agentConnection"]["getSessionStats"],
+	): RefreshHarness & { patched: Record<string, unknown>[] } {
+		const fakeThis = Object.create(InteractiveMode.prototype) as RefreshHarness & {
+			patched: Record<string, unknown>[];
 		};
-		const refresh = (InteractiveMode.prototype as unknown as RefreshHarness).refreshConnectionContextUsage;
-		const fakeThis = Object.create(InteractiveMode.prototype) as RefreshHarness;
-		const patched: Record<string, unknown>[] = [];
+		fakeThis.patched = [];
 		fakeThis.activityTracker = { getStatus: () => ({ tokens: 0 }) };
 		fakeThis.contextUsageTokenBaseline = 0;
-		fakeThis.contextUsageRefreshGeneration = 0;
+		fakeThis.contextUsageRefreshRequestGeneration = 0;
+		fakeThis.contextUsageRefreshResultGeneration = 0;
 		fakeThis.connectionState = { sessionId: "session-A", contextUsage: undefined };
-		fakeThis.patchConnectionState = (p) => patched.push(p);
-		fakeThis.agentConnection = {
-			getSessionStats: async () => {
-				// User switches sessions while the stats call is in flight.
-				fakeThis.connectionState = { sessionId: "session-B", contextUsage: undefined };
-				return { contextUsage: { contextWindow: 100_000, tokens: 50_000, percent: 50 } };
-			},
-		};
+		fakeThis.patchConnectionState = (patch) => fakeThis.patched.push(patch);
+		fakeThis.agentConnection = { getSessionStats };
+		return fakeThis;
+	}
+
+	test("refreshConnectionContextUsage drops stale stats after a session switch", async () => {
+		let fakeThis: ReturnType<typeof createRefreshHarness>;
+		fakeThis = createRefreshHarness(async () => {
+			// User switches sessions while the stats call is in flight.
+			fakeThis.connectionState = { sessionId: "session-B", contextUsage: undefined };
+			return { contextUsage: { contextWindow: 100_000, tokens: 50_000, percent: 50 } };
+		});
 
 		await refresh.call(fakeThis);
 
 		// Stats belonged to session-A; must not overwrite session-B.
-		expect(patched).toHaveLength(0);
+		expect(fakeThis.patched).toHaveLength(0);
 	});
 
-	test("refreshConnectionContextUsage drops an older same-session response", async () => {
-		type RefreshHarness = {
-			agentConnection: { getSessionStats(): Promise<{ contextUsage: unknown }> };
-			connectionState: { sessionId?: string; contextUsage?: unknown };
-			activityTracker: { getStatus(): { tokens: number } };
-			contextUsageTokenBaseline: number;
-			contextUsageRefreshGeneration: number;
-			patchConnectionState(patch: Record<string, unknown>): void;
-			refreshConnectionContextUsage(): Promise<void>;
-		};
-		const refresh = (InteractiveMode.prototype as unknown as RefreshHarness).refreshConnectionContextUsage;
+	test("refreshConnectionContextUsage keeps a newer successful same-session response", async () => {
 		const first = createDeferred<{ contextUsage: unknown }>();
 		const second = createDeferred<{ contextUsage: unknown }>();
-		const fakeThis = Object.create(InteractiveMode.prototype) as RefreshHarness;
-		const patched: Record<string, unknown>[] = [];
 		let request = 0;
-		fakeThis.activityTracker = { getStatus: () => ({ tokens: 0 }) };
-		fakeThis.contextUsageTokenBaseline = 0;
-		fakeThis.contextUsageRefreshGeneration = 0;
-		fakeThis.connectionState = { sessionId: "session-A", contextUsage: undefined };
-		fakeThis.patchConnectionState = (patch) => patched.push(patch);
-		fakeThis.agentConnection = {
-			getSessionStats: () => (++request === 1 ? first.promise : second.promise),
-		};
+		const fakeThis = createRefreshHarness(() => (++request === 1 ? first.promise : second.promise));
 
 		const olderRefresh = refresh.call(fakeThis);
 		const newerRefresh = refresh.call(fakeThis);
@@ -3748,8 +3740,29 @@ describe("InteractiveMode live context usage", () => {
 		first.resolve({ contextUsage: { tokens: 90, contextWindow: 100, percent: 90 } });
 		await olderRefresh;
 
-		expect(patched).toEqual([{ contextUsage: { tokens: 10, contextWindow: 100, percent: 10 } }]);
+		expect(fakeThis.patched).toEqual([{ contextUsage: { tokens: 10, contextWindow: 100, percent: 10 } }]);
 	});
+
+	test.each(["failure", "no stats"] as const)(
+		"refreshConnectionContextUsage lets an older successful response survive a newer %s",
+		async (newerResult) => {
+			const first = createDeferred<{ contextUsage: unknown }>();
+			let request = 0;
+			const fakeThis = createRefreshHarness(() => {
+				if (++request === 1) return first.promise;
+				return newerResult === "failure"
+					? Promise.reject(new Error("stats unavailable"))
+					: Promise.resolve(undefined);
+			});
+
+			const olderRefresh = refresh.call(fakeThis);
+			await refresh.call(fakeThis);
+			first.resolve({ contextUsage: { tokens: 90, contextWindow: 100, percent: 90 } });
+			await olderRefresh;
+
+			expect(fakeThis.patched).toEqual([{ contextUsage: { tokens: 90, contextWindow: 100, percent: 90 } }]);
+		},
+	);
 });
 
 describe("truncatePathMiddle", () => {
