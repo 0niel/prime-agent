@@ -331,6 +331,7 @@ export interface DaemonUpdateRestartSession {
 export interface DaemonUpdateRestartManifest {
 	createdAt: string;
 	sessions: DaemonUpdateRestartSession[];
+	discardedActiveSessionIds?: string[];
 }
 
 export type DaemonSavedSessionListCommand =
@@ -995,6 +996,15 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 export function isDaemonMutatingCommand(command: Pick<DaemonCommand, "type">): boolean {
 	return !READ_ONLY_DAEMON_COMMANDS.has(command.type);
 }
+
+export const UPDATE_RESTART_DRAIN_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
+	"extension_ui_response",
+	"abort",
+	"abort_bash",
+	"abort_branch_summary",
+	"abort_compaction",
+	"abort_retry",
+]);
 
 export function createDaemonEventEnvelope<TEvent extends DaemonOutbound>(
 	event: TEvent,

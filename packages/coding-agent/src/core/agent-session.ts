@@ -5467,6 +5467,38 @@ export class AgentSession {
 		return this._followUpMessages.map((message) => createQueuedAgentInputSnapshot(message));
 	}
 
+	private _notifySessionInputCheckpointChange(): void {
+		for (const resolve of this._sessionInputCheckpointWaiters) resolve();
+		this._sessionInputCheckpointWaiters.clear();
+	}
+
+	async waitForSessionInputCheckpoint(signal?: AbortSignal): Promise<void> {
+		while (
+			this._activeSessionInput?.kind === "command" ||
+			(this._activeSessionInput?.kind === "prompt" && this._activeSessionInput.phase === "preparing")
+		) {
+			if (signal?.aborted) throw new Error("Update restart preparation cancelled");
+			await new Promise<void>((resolve, reject) => {
+				const onChange = () => {
+					cleanup();
+					resolve();
+				};
+				const onAbort = () => {
+					cleanup();
+					reject(new Error("Update restart preparation cancelled"));
+				};
+				const cleanup = () => {
+					this._sessionInputCheckpointWaiters.delete(onChange);
+					signal?.removeEventListener("abort", onAbort);
+				};
+				this._sessionInputCheckpointWaiters.add(onChange);
+				signal?.addEventListener("abort", onAbort, { once: true });
+			});
+		}
+		if (signal?.aborted) throw new Error("Update restart preparation cancelled");
+		this.sessionManager.flushNow();
+	}
+
 	acquireQueuedWorkPause(): { release(): void } {
 		const token = Symbol("queued-work-pause");
 		this._queuedWorkPauses.add(token);

@@ -1552,6 +1552,49 @@ describe("daemon worker supervisor monitoring", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
+	it.each([
+		{ name: "malformed data", data: undefined, error: /invalid update manifest/ },
+		{ name: "missing root disposition", data: { createdAt: "now", sessions: [] }, error: /root disposition/ },
+	])("cancels a prepare acknowledgement with $name", async ({ data, error }) => {
+		const client = {
+			requestWorker: vi.fn(async ({ type }: { type: string }) =>
+				type === "worker_prepare_update" ? { success: true, data } : { success: true },
+			),
+			close: vi.fn(),
+		};
+		const worker = {
+			descriptor: { workerId: "worker", lifecycle: "ready", rootActiveSessionId: "root" },
+			client,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([["worker", worker]]),
+		}) as { prepareUpdateRestartFenced(): Promise<unknown> };
+		await expect(supervisor.prepareUpdateRestartFenced()).rejects.toThrow(error);
+		expect(client.requestWorker).toHaveBeenCalledWith({ type: "worker_cancel_update" }, 5000);
+	});
+
+	it("accepts an explicitly discarded empty root", async () => {
+		const client = {
+			requestWorker: vi.fn(async ({ type }: { type: string }) =>
+				type === "worker_prepare_update"
+					? { success: true, data: { createdAt: "now", sessions: [], discardedActiveSessionIds: ["root"] } }
+					: { success: true },
+			),
+		};
+		const worker = {
+			descriptor: { workerId: "worker", lifecycle: "ready", rootActiveSessionId: "root" },
+			client,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([["worker", worker]]),
+			validateAndPersistUpdateManifest: vi.fn(),
+			stopWorker: vi.fn(async () => undefined),
+		}) as { prepareUpdateRestartFenced(): Promise<{ discardedActiveSessionIds?: string[] }> };
+		await expect(supervisor.prepareUpdateRestartFenced()).resolves.toMatchObject({
+			discardedActiveSessionIds: ["root"],
+		});
+	});
+
 	it("rejects update prepare when a resident worker is recovering or disconnected", async () => {
 		const requestWorker = vi.fn();
 		const worker = {

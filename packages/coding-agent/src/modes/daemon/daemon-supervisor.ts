@@ -58,6 +58,7 @@ import {
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
 	success,
+	UPDATE_RESTART_DRAIN_COMMANDS,
 } from "./daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
 import { matchesSessionIdSuffix } from "./daemon-session-id.js";
@@ -104,13 +105,6 @@ const WORKER_CONNECT_TIMEOUT_MS = 30_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
-const UPDATE_RESTART_DRAIN_ALLOWED_COMMANDS = new Set<DaemonCommand["type"]>([
-	"extension_ui_response",
-	"abort",
-	"abort_bash",
-	"abort_compaction",
-	"abort_retry",
-]);
 const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 const OWNED_WORKER_DISCONNECT_GRACE_MS = 30_000;
@@ -231,6 +225,7 @@ interface ResidentWorker {
 	launchEnv?: Record<string, string>;
 	ownerCleanupTimer?: ReturnType<typeof setTimeout>;
 	promotedOwnerClientId?: string;
+	updateRestartPrepareClient?: DaemonWorkerClient;
 }
 
 interface SnapshotDuplicateValidation {
@@ -1121,7 +1116,7 @@ export class DaemonSupervisor {
 			this.updateRestartPreparing &&
 			isDaemonMutatingCommand(command) &&
 			(command.type !== "shutdown" || this.updateRestartPrepareInFlight) &&
-			!(this.updateRestartPrepareInFlight && UPDATE_RESTART_DRAIN_ALLOWED_COMMANDS.has(command.type))
+			!(this.updateRestartPrepareInFlight && UPDATE_RESTART_DRAIN_COMMANDS.has(command.type))
 		) {
 			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
 			return;
@@ -1193,7 +1188,7 @@ export class DaemonSupervisor {
 			command.type !== "ack_result" &&
 			isDaemonMutatingCommand(command) &&
 			(command.type !== "shutdown" || this.updateRestartPrepareInFlight) &&
-			!(this.updateRestartPrepareInFlight && UPDATE_RESTART_DRAIN_ALLOWED_COMMANDS.has(command.type))
+			!(this.updateRestartPrepareInFlight && UPDATE_RESTART_DRAIN_COMMANDS.has(command.type))
 		) {
 			throw new Error("Daemon is preparing an update restart");
 		}
@@ -3839,63 +3834,87 @@ export class DaemonSupervisor {
 			);
 		}
 		const workers = residents as Array<ResidentWorker & { client: DaemonWorkerClient }>;
-		const prepared: Array<ResidentWorker & { client: DaemonWorkerClient }> = [];
+		const acknowledged: ResidentWorker[] = [];
 		const preparationResults = await Promise.allSettled(
 			workers.map(async (worker) => {
-				const response = await worker.client.requestWorker(
+				const client = worker.client;
+				const response = await client.requestWorker(
 					{ type: "worker_prepare_update" },
 					UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS,
 				);
-				if (!response.success || !response.data || typeof response.data !== "object") {
-					throw new Error(response.success ? "Worker returned an invalid update manifest" : response.error);
+				if (!response.success) throw new Error(response.error);
+				worker.updateRestartPrepareClient = client;
+				acknowledged.push(worker);
+				if (!response.data || typeof response.data !== "object") {
+					throw new Error("Worker returned an invalid update manifest");
+				}
+				if (worker.client !== client || worker.descriptor.lifecycle !== "ready") {
+					throw new Error(`Worker ${worker.descriptor.workerId} disconnected during update preparation`);
 				}
 				const manifest = response.data as DaemonUpdateRestartManifest;
 				if (
-					!manifest.sessions.some((session) => session.activeSessionId === worker.descriptor.rootActiveSessionId)
+					!manifest.sessions.some(
+						(session) => session.activeSessionId === worker.descriptor.rootActiveSessionId,
+					) &&
+					!manifest.discardedActiveSessionIds?.includes(worker.descriptor.rootActiveSessionId)
 				) {
 					throw new Error(
-						`Worker ${worker.descriptor.workerId} omitted its root session from the update manifest`,
+						`Worker ${worker.descriptor.workerId} omitted its root disposition from the update manifest`,
 					);
 				}
 				return { worker, manifest };
 			}),
 		);
-		for (const result of preparationResults) {
-			if (result.status === "fulfilled") {
-				prepared.push(result.value.worker);
-			}
-		}
+		const cancelAcknowledged = async () => {
+			await Promise.all(
+				acknowledged.map(async (worker) => {
+					const prepareClient = worker.updateRestartPrepareClient;
+					worker.updateRestartPrepareClient = undefined;
+					if (!prepareClient) return;
+					try {
+						const response = await prepareClient.requestWorker({ type: "worker_cancel_update" }, 5000);
+						if (!response.success) throw new Error(response.error);
+					} catch (error) {
+						this.log(
+							`Could not cancel prepared worker ${worker.descriptor.workerId}; reconnecting it: ${String(error)}`,
+						);
+						prepareClient.close();
+						if (worker.client && worker.client !== prepareClient) worker.client.close();
+					}
+				}),
+			);
+		};
 		const preparationFailure = preparationResults.find(
 			(result): result is PromiseRejectedResult => result.status === "rejected",
 		);
 		if (preparationFailure) {
-			await Promise.all(
-				prepared.map((worker) =>
-					worker.client.requestWorker({ type: "worker_cancel_update" }, 5000).catch(() => undefined),
-				),
-			);
+			await cancelAcknowledged();
 			throw preparationFailure.reason;
 		}
+		const prepared = preparationResults.flatMap((result) =>
+			result.status === "fulfilled" ? [result.value.worker] : [],
+		);
 		const responses = preparationResults.flatMap((result) =>
 			result.status === "fulfilled" ? [result.value.manifest] : [],
 		);
+		const discardedActiveSessionIds = responses.flatMap((manifest) => manifest.discardedActiveSessionIds ?? []);
 		const manifest = {
 			createdAt: new Date().toISOString(),
 			sessions: responses.flatMap((manifest) => manifest.sessions),
+			...(discardedActiveSessionIds.length > 0 ? { discardedActiveSessionIds } : {}),
 		};
 		try {
 			this.validateAndPersistUpdateManifest(manifest);
 		} catch (error) {
-			await Promise.all(
-				prepared.map((worker) =>
-					worker.client.requestWorker({ type: "worker_cancel_update" }, 5000).catch(() => undefined),
-				),
-			);
+			await cancelAcknowledged();
 			throw error;
 		}
+		for (const worker of prepared) worker.updateRestartPrepareClient = undefined;
 		const commitResults = await Promise.allSettled(
 			prepared.map(async (worker) => {
-				const response = await worker.client.requestWorker(
+				const client = worker.client;
+				if (!client) throw new Error(`Worker ${worker.descriptor.workerId} disconnected before update commit`);
+				const response = await client.requestWorker(
 					{ type: "worker_commit_update" },
 					UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS,
 				);
@@ -3906,10 +3925,6 @@ export class DaemonSupervisor {
 			(result): result is PromiseRejectedResult => result.status === "rejected",
 		);
 		if (commitFailure) {
-			// A successful commit may already have destroyed a worker's live state. The
-			// aggregate manifest is durable, so remain fenced and finish stopping every
-			// resident. Returning the full manifest forces restart completion instead of
-			// exposing this partially committed generation again.
 			this.log(`Update restart commit response failed; forcing restart completion: ${String(commitFailure.reason)}`);
 			await Promise.allSettled(prepared.map((worker) => this.stopWorker(worker, false, true)));
 			return manifest;
@@ -3925,6 +3940,12 @@ export class DaemonSupervisor {
 	private validateAndPersistUpdateManifest(manifest: DaemonUpdateRestartManifest): void {
 		const activeSessionIds = new Set<string>();
 		const sessionFiles = new Set<string>();
+		for (const discardedActiveSessionId of manifest.discardedActiveSessionIds ?? []) {
+			if (!discardedActiveSessionId || activeSessionIds.has(discardedActiveSessionId)) {
+				throw new Error("Update manifest contains an invalid discarded session disposition");
+			}
+			activeSessionIds.add(discardedActiveSessionId);
+		}
 		for (const session of manifest.sessions) {
 			if (!session.activeSessionId || !session.sessionFile) {
 				throw new Error("Update manifest contains an incomplete session checkpoint");
