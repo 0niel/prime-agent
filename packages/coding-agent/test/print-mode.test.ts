@@ -155,6 +155,24 @@ describe("runPrintMode", () => {
 		expect(output.write).toHaveBeenCalledWith("No active goal.\n");
 	});
 
+	it("returns non-zero for failed session command results in text mode", async () => {
+		const result = createSessionSlashCommandResultMessage("Command failed: bad arguments", {
+			command: { name: "refine", args: "rollback", text: "/refine rollback" },
+			success: false,
+			severity: "error",
+			error: "bad arguments",
+		});
+		const runtimeHost = createRuntimeHost(result);
+		output.write.mockClear();
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(1);
+		expect(output.write).toHaveBeenCalledWith("Command failed: bad arguments\n");
+	});
+
 	it("emits session_shutdown in json mode", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
 		const { session } = runtimeHost;

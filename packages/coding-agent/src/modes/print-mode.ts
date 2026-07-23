@@ -131,6 +131,7 @@ async function runPrintModeWithConnectionInternal(
 				}
 			} else if (lastMessage?.role === "custom" && isSessionSlashCommandResultMessage(lastMessage)) {
 				writeRawStdout(`${lastMessage.content}\n`);
+				if (!lastMessage.details.success || lastMessage.details.severity === "error") exitCode = 1;
 			}
 		}
 

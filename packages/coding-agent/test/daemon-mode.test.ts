@@ -5092,9 +5092,11 @@ describe("daemon mode helpers", () => {
 			state.runtime = { ...state.runtime, session: { isStreaming: false, promptUntilAccepted } } as never;
 			const internals = daemon as unknown as {
 				sessions: Map<string, ActiveSessionState>;
+				recordWorkerRecoveryState: ReturnType<typeof vi.fn>;
 				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
 			};
 			internals.sessions.set(state.activeSessionId, state);
+			internals.recordWorkerRecoveryState = vi.fn();
 
 			let settled = 0;
 			const response = internals
@@ -5112,6 +5114,9 @@ describe("daemon mode helpers", () => {
 			expect(settled).toBe(1);
 			expect(turnCompleted).toBe(false);
 			expect(promptUntilAccepted).toHaveBeenCalledOnce();
+			if (type === "follow_up") {
+				expect(internals.recordWorkerRecoveryState).toHaveBeenCalledWith(state, "follow_up_queued", true);
+			}
 			releaseTurn?.();
 			await turnGate;
 			expect(turnCompleted).toBe(true);
@@ -5183,7 +5188,7 @@ describe("daemon mode helpers", () => {
 		expect(continueAgent).not.toHaveBeenCalled();
 	});
 
-	it("forwards queue keys through canonical daemon steering admission", async () => {
+	it("preserves template expansion and queue keys for correlated daemon steering", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -5227,7 +5232,16 @@ describe("daemon mode helpers", () => {
 				agentMessageId: "agentmsg_steer",
 			}),
 		);
+		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
 		expect(restoreSteeringMessage).not.toHaveBeenCalled();
+		await expect(
+			internals.handleCommand(makeClient("client-1", state.activeSessionId), {
+				type: "steer",
+				activeSessionId: state.activeSessionId,
+				message: "invalid",
+				agentMessageId: "",
+			}),
+		).rejects.toThrow("agentMessageId must not be empty");
 	});
 
 	it("rejects invalid heartbeat delivery modes before persisting", async () => {

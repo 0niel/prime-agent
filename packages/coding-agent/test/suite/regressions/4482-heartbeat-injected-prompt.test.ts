@@ -303,7 +303,21 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		await harness.session.promptHeartbeat(createHeartbeat(), { streamingBehavior: "followUp" });
 
 		expect(harness.session.getFollowUpMessagePreviews()).toEqual([heartbeatPreview]);
-		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: [heartbeatText] });
+		const internals = harness.session as unknown as {
+			_activeSessionInput: {
+				kind: "prompt";
+				lane: "followUp";
+				phase: "preparing";
+				items: Array<{ text: string }>;
+			};
+		};
+		internals._activeSessionInput = {
+			kind: "prompt",
+			lane: "followUp",
+			phase: "preparing",
+			items: [{ text: "preparing" }],
+		};
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: ["preparing", heartbeatText] });
 
 		releaseToolExecution?.();
 		await promptPromise;

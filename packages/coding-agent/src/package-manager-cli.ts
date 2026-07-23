@@ -634,8 +634,9 @@ function parseDaemonUpdateRestartQueuedMessage(value: unknown): DaemonUpdateRest
 	) {
 		throw new Error("Daemon update restart response contains an invalid custom queued message");
 	}
-	const agentMessageId =
-		readOptionalString(value.agentMessageId, "queue.agentMessageId") ?? parseAgentSessionMessagePromptId(message);
+	const restoredAgentMessageId = readOptionalString(value.agentMessageId, "queue.agentMessageId");
+	if (restoredAgentMessageId === "") throw new Error("queue.agentMessageId must not be empty");
+	const agentMessageId = restoredAgentMessageId ?? parseAgentSessionMessagePromptId(message);
 	return {
 		message,
 		...(content ? { content } : {}),

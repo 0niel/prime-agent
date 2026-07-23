@@ -662,6 +662,7 @@ function createQueuedAgentInputSnapshot(message: QueuedSessionInput): QueuedAgen
 		return {
 			text: message.text,
 			...(message.images ? { images: message.images.map((image) => ({ ...image })) } : {}),
+			...(message.agentMessageId ? { agentMessageId: message.agentMessageId } : {}),
 			customMessage: createSessionSlashCommandMessage(message.command),
 		};
 	}
@@ -3016,21 +3017,23 @@ export class AgentSession {
 		this._agentMessageDeliveryWaiters.get(agentMessageId)?.resolve();
 	}
 
-	private _rejectAgentMessageDelivery(agentMessageId: string | undefined, error: Error): void {
+	private _rejectAgentMessageDelivery(
+		agentMessageId: string | undefined,
+		error: Error,
+		rejectCompletion = true,
+	): void {
 		if (agentMessageId === undefined || this._deliveredAgentMessageIds.has(agentMessageId)) {
 			return;
 		}
 		this._failedAgentMessageDeliveries.set(agentMessageId, error);
 		this._agentMessageDeliveryWaiters.get(agentMessageId)?.reject(error);
-		this._rejectAgentMessageCompletion(agentMessageId, error);
+		if (rejectCompletion) this._rejectAgentMessageCompletion(agentMessageId, error);
 	}
 
-	private _rejectQueuedAgentMessageDeliveries(error: Error): void {
-		for (const message of this._steeringMessages) {
-			this._rejectAgentMessageDelivery(message.agentMessageId, error);
-		}
-		for (const message of this._followUpMessages) {
-			this._rejectAgentMessageDelivery(message.agentMessageId, error);
+	private _rejectQueuedAgentMessageDeliveries(deliveryError: Error, completionError = deliveryError): void {
+		for (const message of [...this._steeringMessages, ...this._followUpMessages]) {
+			this._rejectAgentMessageDelivery(message.agentMessageId, deliveryError, false);
+			this._rejectAgentMessageCompletion(message.agentMessageId, completionError);
 		}
 	}
 
@@ -3682,9 +3685,13 @@ export class AgentSession {
 			this._deletedRlmChildIds.clear();
 			this._retryableRlmSubagentDeletions.clear();
 			this._pendingNextTurnMessages = [];
-			const disposeError = new Error("Session disposed before prompt completion.");
-			this._rejectQueuedAgentMessageDeliveries(disposeError);
-			for (const waiter of this._agentMessageCompletionWaiters.values()) waiter.reject(disposeError);
+			const deliveryError = new Error("Session disposed before prompt delivery.");
+			const completionError = new Error("Session disposed before prompt completion.");
+			this._rejectQueuedAgentMessageDeliveries(deliveryError, completionError);
+			for (const agentMessageId of this._agentMessageDeliveryWaiters.keys()) {
+				this._rejectAgentMessageDelivery(agentMessageId, deliveryError, false);
+			}
+			for (const waiter of this._agentMessageCompletionWaiters.values()) waiter.reject(completionError);
 			this._steeringMessages = [];
 			this._followUpMessages = [];
 			this._syncSteeringStopPending();
@@ -4247,18 +4254,22 @@ export class AgentSession {
 				);
 				reportPreflight(queued, wasBusy);
 				releaseAdmission();
-				if (!wasBusy) await this._sessionInputPump;
+				if (!wasBusy && !options?.returnAfterAccepted) await this._sessionInputPump;
 				return;
 			}
 
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && currentText.startsWith("/")) {
-				const handled = await this._tryExecuteExtensionCommand(currentText);
-				if (handled) {
-					// Extension command executed, no prompt to send
+				const commandCompletion = this._executeExtensionCommand(currentText);
+				if (commandCompletion) {
 					reportPreflight(true);
-					this._resolveAgentMessageCompletion(options?.agentMessageId);
+					void commandCompletion.then(
+						() => this._resolveAgentMessageCompletion(options?.agentMessageId),
+						(error) => this._rejectAgentMessageCompletion(options?.agentMessageId, error),
+					);
+					void commandCompletion.catch(() => undefined);
+					if (!options?.returnAfterAccepted) await commandCompletion.catch(() => undefined);
 					return;
 				}
 			}
@@ -4549,33 +4560,25 @@ export class AgentSession {
 		await promptCompletion;
 	}
 
-	/**
-	 * Try to execute an extension command. Returns true if command was found and executed.
-	 */
-	private async _tryExecuteExtensionCommand(text: string): Promise<boolean> {
-		// Parse command name and args
+	private _executeExtensionCommand(text: string): Promise<void> | undefined {
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
-
 		const command = this._extensionRunner.getCommand(commandName);
-		if (!command) return false;
-
-		// Get command context from extension runner (includes session control methods)
-		const ctx = this._extensionRunner.createCommandContext();
-
-		try {
-			await command.handler(args, ctx);
-			return true;
-		} catch (err) {
-			// Emit error via extension runner
-			this._extensionRunner.emitError({
-				extensionPath: `command:${commandName}`,
-				event: "command",
-				error: err instanceof Error ? err.message : String(err),
+		if (!command) return undefined;
+		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
+		const context = this._extensionRunner.createCommandContext();
+		return Promise.resolve()
+			.then(() => command.handler(args, context))
+			.catch((error: unknown) => {
+				const commandError = error instanceof Error ? error : new Error(String(error));
+				this._extensionRunner.emitError({
+					extensionPath: `command:${commandName}`,
+					event: "command",
+					error: commandError.message,
+				});
+				throw commandError;
 			});
-			return true;
-		}
+			});
 	}
 
 	/**
@@ -4700,6 +4703,7 @@ export class AgentSession {
 	): Promise<void> {
 		if (this._restoreSessionCommand(text, options.customMessage, images, "steer") !== undefined) return;
 
+
 		await this._queueSteer(text, images, {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
@@ -4722,6 +4726,7 @@ export class AgentSession {
 	): Promise<boolean> {
 		const restoredCommand = this._restoreSessionCommand(text, options.customMessage, images, "followUp");
 		if (restoredCommand !== undefined) return restoredCommand;
+
 
 		return this._queueFollowUp(text, images, {
 			queueKey: options.queueKey,
@@ -5004,6 +5009,7 @@ export class AgentSession {
 						this._activeSessionInput = undefined;
 						this._syncSteeringStopPending();
 					}
+
 				} finally {
 					admission.release();
 				}
@@ -5334,15 +5340,25 @@ export class AgentSession {
 	 * @returns Object with steering and followUp arrays
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
-		if (this._activeSessionInput?.kind === "prompt" && this._activeSessionInput.phase === "preparing") {
-			this._activeSessionInput.cancelled = true;
+		const active =
+			this._activeSessionInput?.kind === "prompt" && this._activeSessionInput.phase === "preparing"
+				? this._activeSessionInput
+				: undefined;
+		if (active) {
+			active.cancelled = true;
 			this._sessionInputPumpEpoch++;
 			const error = new Error("Queued prompt was cleared before delivery.");
-			for (const input of this._activeSessionInput.items)
-				this._rejectAgentMessageDelivery(input.agentMessageId, error);
+			for (const input of active.items) this._rejectAgentMessageDelivery(input.agentMessageId, error);
 		}
-		const steering = this._steeringMessages.map((message) => message.text);
-		const followUp = this._followUpMessages.map((message) => message.text);
+		const activeTexts = active?.items.map((message) => message.text) ?? [];
+		const steering = [
+			...(active?.lane === "steer" ? activeTexts : []),
+			...this._steeringMessages.map((message) => message.text),
+		];
+		const followUp = [
+			...(active?.lane === "followUp" ? activeTexts : []),
+			...this._followUpMessages.map((message) => message.text),
+		];
 		this._rejectQueuedAgentMessageDeliveries(new Error("Queued agent message was cleared before delivery."));
 		this._steeringMessages = [];
 		this._followUpMessages = [];

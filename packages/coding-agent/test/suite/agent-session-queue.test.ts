@@ -1,6 +1,6 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type ImageContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -1294,26 +1294,39 @@ describe("AgentSession queue characterization", () => {
 		}
 	});
 
-	it("dispatches extension commands immediately when prompted while idle", async () => {
-		const commandRuns: string[] = [];
+	it("admits extension commands immediately while completion tracks the handler", async () => {
+		let release: (() => void) | undefined;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
-					pi.registerCommand("testcmd", {
-						description: "Test command",
-						handler: async (args) => {
-							commandRuns.push(args);
+					pi.registerCommand("testcmd", { description: "Test", handler: async () => gate });
+					pi.registerCommand("fail", {
+						description: "Fail",
+						handler: async () => {
+							throw new Error("extension exploded");
 						},
 					});
 				},
 			],
 		});
 		harnesses.push(harness);
+		const extensionErrors: string[] = [];
+		harness.session.bindExtensions({ onError: (error) => extensionErrors.push(error.error) });
 
-		await harness.session.prompt("/testcmd hello world");
-
-		expect(commandRuns).toEqual(["hello world"]);
-		expect(harness.getPendingResponseCount()).toBe(0);
+		await expect(harness.session.promptUntilAccepted("/testcmd")).resolves.toBeUndefined();
+		let completed = false;
+		const completion = harness.session.promptAndWait("/testcmd").then(() => {
+			completed = true;
+		});
+		await Promise.resolve();
+		expect(completed).toBe(false);
+		release?.();
+		await completion;
+		await expect(harness.session.promptAndWait("/fail")).rejects.toThrow("extension exploded");
+		expect(extensionErrors).toEqual(["extension exploded"]);
 		expect(harness.session.messages).toEqual([]);
 	});
 
@@ -2193,16 +2206,21 @@ prepared:${event.prompt}`,
 		await expect(delivery).resolves.toBeUndefined();
 	});
 
-	it("rejects queued agent-message delivery waiters on dispose", async () => {
+	it("preserves distinct queued delivery and completion disposal errors", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const agentPrompt = agentPromptText("agentmsg_dispose", "dispose me");
+		withStreaming(harness, true);
 		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_dispose");
-
-		await harness.session.queueAgentMessagePrompt(agentPrompt, "followUp");
+		const completion = harness.session.promptAndWait(agentPrompt, {
+			agentMessageId: "agentmsg_dispose",
+			streamingBehavior: "followUp",
+		});
+		await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toEqual([agentPrompt]));
 		harness.session.dispose();
 
-		await expect(delivery).rejects.toThrow("cleared before delivery");
+		await expect(delivery).rejects.toThrow("disposed before prompt delivery");
+		await expect(completion).rejects.toThrow("disposed before prompt completion");
 	});
 
 	it.each([
@@ -2278,6 +2296,7 @@ prepared:${event.prompt}`,
 	});
 
 	it("restores command envelopes as commands and other slash-prefixed messages literally", async () => {
+
 
 
 		const harness = await createHarness();
@@ -2591,6 +2610,31 @@ prepared:${event.prompt}`,
 		expect(getAssistantTexts(harness)).toEqual(["", "second handled"]);
 	});
 
+	it("rejects completion when handoff fails after the prompt entered agent state", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = true;
+		const completion = harness.session.promptAndWait("delivered then failed", {
+			streamingBehavior: "followUp",
+		});
+		await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toEqual(["delivered then failed"]));
+		const internals = harness.session as unknown as {
+			_activeSessionInput?: { kind: "prompt"; items: Array<{ message: AgentMessage }> };
+			_startPreparedAgentPrompt(...args: unknown[]): Promise<void>;
+		};
+		vi.spyOn(internals, "_startPreparedAgentPrompt").mockImplementationOnce(async () => {
+			const active = internals._activeSessionInput;
+			if (active?.kind === "prompt")
+				harness.session.agent.state.messages.push(...active.items.map((item) => item.message));
+			throw new Error("handoff failed after delivery");
+		});
+		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = false;
+
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await expect(completion).rejects.toThrow("handoff failed after delivery");
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+	});
+
 	it.each([
 		{
 			action: "refine",
@@ -2601,6 +2645,7 @@ prepared:${event.prompt}`,
 			run: (harness: Harness) => harness.session.compact(undefined, { skipAbort: true }),
 		},
 	])("rejects skip-abort $action while a turn is active", async ({ action, run }) => {
+
 		const harness = await createHarness();
 		harnesses.push(harness);
 		withStreaming(harness, true);
@@ -2774,5 +2819,4 @@ prepared:${event.prompt}`,
 			),
 		).toBe(true);
 	});
-
 });

@@ -1266,7 +1266,7 @@ export class AgentDaemon {
 			state,
 			(session, clearPreparing) => {
 				const prompt =
-					options?.agentMessageId !== undefined
+					options?.agentMessageId !== undefined && options.expandPromptTemplates === false
 						? session.acceptAgentMessagePrompt.bind(session)
 						: waitForCompletion
 							? (session.promptAndWait ?? session.prompt).bind(session)
@@ -2607,6 +2607,9 @@ export class AgentDaemon {
 		if (this.updateRestartPreparing && command.type !== "shutdown" && command.type !== "ack_result") {
 			throw new Error("Daemon is preparing an update restart");
 		}
+		if ("agentMessageId" in command && command.agentMessageId === "") {
+			throw new Error("agentMessageId must not be empty");
+		}
 		switch (command.type) {
 			case "ack_result":
 				return undefined;
@@ -2931,6 +2934,7 @@ export class AgentDaemon {
 			case "follow_up": {
 				const state = this.getBoundSessionState(command.activeSessionId);
 				let queued = true;
+				let admitted = true;
 				if (command.expandPromptTemplates === false) {
 					queued = await state.runtime.session.restoreFollowUpMessage(command.message, command.images, {
 						queueKey: command.queueKey,
@@ -2939,6 +2943,7 @@ export class AgentDaemon {
 						customMessage: command.customMessage,
 						prefixMessages: command.prefixMessages,
 					});
+					admitted = queued;
 				} else {
 					await this.promptWithAgentMessagePreparingGuard(
 						state,
@@ -2951,6 +2956,7 @@ export class AgentDaemon {
 							followUpQueueKey: command.queueKey,
 							agentMessageId: command.agentMessageId,
 							preflightResult: (didSucceed, didQueue) => {
+								admitted = didSucceed;
 								queued = didSucceed && didQueue === true;
 							},
 						},
@@ -2958,7 +2964,7 @@ export class AgentDaemon {
 						false,
 					);
 				}
-				if (queued) {
+				if (admitted) {
 					this.recordWorkerRecoveryState(state, "follow_up_queued", true);
 				}
 				return success(command.id, "follow_up", { queued });
