@@ -2,6 +2,7 @@ import { type Dirent, existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { getAgentDir, getSessionsDir } from "../../config.js";
+import { readFirstLineSync } from "../../utils/file-lines.js";
 import { parseClaudeSession } from "./adapters/claude.js";
 import { parseCodexSession } from "./adapters/codex.js";
 import {
@@ -54,6 +55,7 @@ interface JsonlSearchRoot {
 	path: string;
 	recursive: boolean;
 	excludeDirectory?: (name: string) => boolean;
+	includeFile?: (path: string) => boolean;
 }
 
 interface RecentFile {
@@ -88,7 +90,7 @@ function listRecentJsonlFiles(roots: JsonlSearchRoot[], cutoff: number): string[
 				if (root.recursive && !root.excludeDirectory?.(entry.name)) {
 					visit(root, path);
 				}
-			} else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+			} else if (entry.isFile() && entry.name.endsWith(".jsonl") && (root.includeFile?.(path) ?? true)) {
 				addFile(path);
 			}
 		}
@@ -104,6 +106,29 @@ function listRecentJsonlFiles(roots: JsonlSearchRoot[], cutoff: number): string[
 
 function fileReferences(paths: string[]): SessionImportReference[] {
 	return paths.map((path) => ({ kind: "file", path }));
+}
+
+function isTopLevelCodexSession(path: string): boolean {
+	try {
+		const firstLine = readFirstLineSync(path, 1024 * 1024);
+		if (!firstLine) {
+			return true;
+		}
+		const entry = JSON.parse(firstLine) as {
+			type?: unknown;
+			payload?: { thread_source?: unknown; source?: unknown };
+		};
+		if (entry.type !== "session_meta" || !entry.payload) {
+			return true;
+		}
+		if (entry.payload.thread_source === "subagent") {
+			return false;
+		}
+		const source = entry.payload.source;
+		return !(typeof source === "object" && source !== null && "subagent" in source);
+	} catch {
+		return true;
+	}
 }
 
 function uniqueExistingDirectories(paths: string[]): string[] {
@@ -230,8 +255,8 @@ export function discoverSessionImports(options: SessionImportOptions = {}): Sess
 			fileReferences(
 				listRecentJsonlFiles(
 					[
-						{ path: join(codexDir, "sessions"), recursive: true },
-						{ path: join(codexDir, "archived_sessions"), recursive: true },
+						{ path: join(codexDir, "sessions"), recursive: true, includeFile: isTopLevelCodexSession },
+						{ path: join(codexDir, "archived_sessions"), recursive: true, includeFile: isTopLevelCodexSession },
 					],
 					cutoff,
 				),

@@ -7,7 +7,6 @@ import { setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getSessionsDir } from "../../../src/config.js";
 import { KeybindingsManager } from "../../../src/core/keybindings.js";
-import { convertToLlm } from "../../../src/core/messages.js";
 import {
 	detectSessionImportFileKind,
 	discoverSessionImports,
@@ -139,6 +138,27 @@ function createCodexFixture(home: string): void {
 			type: "response_item",
 			timestamp: "2026-01-02T00:00:05.000Z",
 			payload: { type: "function_call_output", call_id: "codex-tool", output: "Codex tool output" },
+		},
+	]);
+	writeJsonl(join(home, ".codex", "sessions", "2026", "01", "01", "codex-subagent.jsonl"), [
+		{
+			type: "session_meta",
+			timestamp: "2026-01-02T00:00:00.000Z",
+			payload: {
+				id: "codex-subagent",
+				cwd: "/workspace/codex",
+				thread_source: "subagent",
+				source: { subagent: { other: "guardian" } },
+				model_provider: "openai",
+			},
+		},
+		{
+			type: "event_msg",
+			timestamp: "2026-01-02T00:00:01.000Z",
+			payload: {
+				type: "user_message",
+				message: "The following is the Codex agent history whose request action you are assessing.",
+			},
 		},
 	]);
 	createSkill(home, join(".codex", "skills"), "codex-skill");
@@ -352,6 +372,13 @@ describe("ENG-4373 onboarding session import", () => {
 	it("imports all supported harnesses with thoughts, tool calls, results, and skills", async () => {
 		const inventories = discoverSessionImports({ homeDir: home, agentDir, env: {} });
 		expect(inventories.map((inventory) => inventory.source)).toEqual(["claude", "codex", "opencode", "pi"]);
+		const codexInventory = inventories.find((inventory) => inventory.source === "codex");
+		expect(codexInventory?.sessionCount).toBe(1);
+		expect(
+			codexInventory?.sessionReferences.some(
+				(reference) => reference.kind === "file" && reference.path.endsWith("codex-subagent.jsonl"),
+			),
+		).toBe(false);
 
 		const result = await importSessionsAndSkills(
 			inventories,
@@ -376,21 +403,6 @@ describe("ENG-4373 onboarding session import", () => {
 			expect(header.importedFrom?.contentHash).toMatch(/^[a-f0-9]{64}$/);
 			const context = buildSessionContext(entries.slice(1).filter((entry) => entry.type !== "session"));
 			expect(context.messages.some((message) => message.role === "user")).toBe(true);
-			expect(context.messages.at(-1)).toMatchObject({
-				role: "custom",
-				customType: "session_import_boundary",
-				display: false,
-				details: { source: header.importedFrom?.source },
-			});
-			expect(convertToLlm(context.messages).at(-1)).toMatchObject({
-				role: "user",
-				content: [
-					{
-						type: "text",
-						text: expect.stringContaining("use only the tools exposed in this session"),
-					},
-				],
-			});
 			expect(
 				context.messages.some(
 					(message) =>
@@ -529,12 +541,6 @@ describe("ENG-4373 onboarding session import", () => {
 			expect(header.importedFrom?.source).toBe(imported.source);
 			expect(state?.type === "session_state" ? state.state.status : undefined).toBe("active");
 			expect(context.model).toBeNull();
-			expect(context.messages.at(-1)).toMatchObject({
-				role: "custom",
-				customType: "session_import_boundary",
-				display: false,
-				details: { source: imported.source },
-			});
 			expect(
 				context.messages.some(
 					(message) =>

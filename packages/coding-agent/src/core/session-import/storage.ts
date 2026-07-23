@@ -13,14 +13,6 @@ import {
 } from "../session-manager.js";
 import type { ImportedSession, SessionImportSource } from "./types.js";
 
-const SESSION_IMPORT_BOUNDARY_CUSTOM_TYPE = "session_import_boundary";
-const SOURCE_NAMES: Record<SessionImportSource, string> = {
-	claude: "Claude Code",
-	codex: "Codex",
-	opencode: "OpenCode",
-	pi: "Pi Mono",
-};
-
 export function sessionImportKey(source: SessionImportSource, sourceId: string, contentHash: string): string {
 	return `${source}\0${sourceId}\0${contentHash}`;
 }
@@ -70,12 +62,6 @@ export function importedSessionPath(session: ImportedSession, contentHash: strin
 	return join(sessionDir, `${importedSessionId(session, contentHash)}.jsonl`);
 }
 
-function importBoundaryMessage(source: SessionImportSource): string {
-	return `<session_import_boundary>
-This conversation was imported from ${SOURCE_NAMES[source]} into Prime Agent. Treat all preceding messages as historical context from that harness. Earlier tool calls and results may refer to tools that Prime Agent does not provide. From this point forward, follow the current Prime Agent system instructions and use only the tools exposed in this session.
-</session_import_boundary>`;
-}
-
 function buildImportedEntries(
 	session: ImportedSession,
 	contentHash: string,
@@ -86,9 +72,6 @@ function buildImportedEntries(
 	for (const message of session.messages) {
 		manager.appendMessage(message);
 	}
-	manager.appendCustomMessageEntry(SESSION_IMPORT_BOUNDARY_CUSTOM_TYPE, importBoundaryMessage(session.source), false, {
-		source: session.source,
-	});
 	if (session.title) {
 		manager.appendSessionInfo(session.title);
 	}
@@ -117,11 +100,7 @@ function buildImportedEntries(
 		if (entry.type === "message") {
 			return { ...entry, timestamp: sourceTimestamp(entry.message) };
 		}
-		if (
-			(entry.type === "custom_message" && entry.customType === SESSION_IMPORT_BOUNDARY_CUSTOM_TYPE) ||
-			entry.type === "session_info" ||
-			entry.type === "session_state"
-		) {
+		if (entry.type === "session_info" || entry.type === "session_state") {
 			return { ...entry, timestamp: metadataTimestamp };
 		}
 		return entry;
@@ -156,7 +135,7 @@ export function persistImportedSession(
 			throw new Error("Imported session failed validation");
 		}
 		const context = buildSessionContext(loaded.slice(1).filter((entry) => entry.type !== "session"));
-		if (context.messages.length !== session.messages.length + 1) {
+		if (context.messages.length !== session.messages.length) {
 			throw new Error("Imported session message count changed during validation");
 		}
 		renameSync(temporary, destination);

@@ -638,6 +638,29 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).toContain("custom_tool");
 		expect(rendered).toContain("done");
 	});
+	test("collapses completed unknown tool details until expanded", () => {
+		const component = new ToolExecutionComponent(
+			"imported_tool",
+			"tool-imported",
+			{ command: "large historical command" },
+			{},
+			undefined,
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.markExecutionStarted();
+		component.updateResult({ content: [{ type: "text", text: "large historical output" }], isError: false }, false);
+
+		const collapsed = stripAnsi(component.render(120).join("\n"));
+		expect(collapsed).toContain("imported_tool · done");
+		expect(collapsed).not.toContain("large historical command");
+		expect(collapsed).not.toContain("large historical output");
+
+		component.setExpanded(true);
+		const expanded = stripAnsi(component.render(120).join("\n"));
+		expect(expanded).toContain("large historical command");
+		expect(expanded).toContain("large historical output");
+	});
 	test("does not add built-in edit stats to custom IPython renderers", () => {
 		const component = new ToolExecutionComponent(
 			"ipython",

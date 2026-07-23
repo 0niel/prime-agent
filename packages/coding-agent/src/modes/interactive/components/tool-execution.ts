@@ -479,6 +479,9 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private formatToolExecution(): string {
+		if (this.result && !this.isPartial && !this.expanded) {
+			return "";
+		}
 		const parts: string[] = [];
 		const content = JSON.stringify(this.args, null, 2);
 		if (content) {
