@@ -11,7 +11,6 @@ export default function registerRpcEofFauxProvider(pi: ExtensionAPI): void {
 			await new Promise((resolve) => setTimeout(resolve, 250));
 			return fauxAssistantMessage("rpc eof response");
 		},
-		async () => fauxAssistantMessage("queued rpc eof response"),
 	]);
 	const apiProvider = getApiProvider(faux.api);
 	if (!apiProvider) {
