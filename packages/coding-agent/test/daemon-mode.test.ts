@@ -955,7 +955,7 @@ describe("daemon mode helpers", () => {
 					prompt: vi.fn(async () => {}),
 					followUp: vi.fn(async () => true),
 					clearQueue: vi.fn(() => ({ cleared: 0 })),
-					clearQueuedUserMessagesMatching: vi.fn(() => ({ steering: [], followUp: [] })),
+					clearQueuedAgentMessagesMatching: vi.fn(() => ({ steering: [], followUp: [] })),
 				},
 			} as never;
 		}
@@ -1024,7 +1024,7 @@ describe("daemon mode helpers", () => {
 		const targetState = makeState("target");
 		const agentMessageText =
 			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_test\n\nhello";
-		const clearQueuedUserMessagesMatching = vi.fn((predicate: (text: string) => boolean) => ({
+		const clearQueuedAgentMessagesMatching = vi.fn((predicate: (text: string) => boolean) => ({
 			steering: [agentMessageText].filter(predicate),
 			followUp: [],
 		}));
@@ -1037,7 +1037,7 @@ describe("daemon mode helpers", () => {
 				sessionName: "Target",
 				isStreaming: false,
 				pendingMessageCount: 2,
-				clearQueuedUserMessagesMatching,
+				clearQueuedAgentMessagesMatching,
 				clearQueue,
 			},
 		} as never;
@@ -1053,8 +1053,8 @@ describe("daemon mode helpers", () => {
 			activeSessionId: targetState.activeSessionId,
 		});
 
-		expect(clearQueuedUserMessagesMatching).toHaveBeenCalledOnce();
-		const predicate = clearQueuedUserMessagesMatching.mock.calls[0]?.[0];
+		expect(clearQueuedAgentMessagesMatching).toHaveBeenCalledOnce();
+		const predicate = clearQueuedAgentMessagesMatching.mock.calls[0]?.[0];
 		expect(predicate?.(agentMessageText)).toBe(true);
 		expect(predicate?.("ordinary queued follow-up")).toBe(false);
 		expect(clearQueue).not.toHaveBeenCalled();
@@ -1071,7 +1071,7 @@ describe("daemon mode helpers", () => {
 		const secondState = makeState("target-2");
 		const firstClear = vi.fn(() => ({ steering: [], followUp: ["agent message"] }));
 		const secondClear = vi.fn(() => ({ steering: ["agent message"], followUp: [] }));
-		for (const [state, clearQueuedUserMessagesMatching] of [
+		for (const [state, clearQueuedAgentMessagesMatching] of [
 			[firstState, firstClear],
 			[secondState, secondClear],
 		] as const) {
@@ -1083,7 +1083,7 @@ describe("daemon mode helpers", () => {
 					sessionName: state.activeSessionId,
 					isStreaming: false,
 					pendingMessageCount: 1,
-					clearQueuedUserMessagesMatching,
+					clearQueuedAgentMessagesMatching,
 				},
 			} as never;
 		}
@@ -1123,7 +1123,7 @@ describe("daemon mode helpers", () => {
 				}),
 		);
 		const readyClear = vi.fn(() => ({ steering: [], followUp: ["agent message"] }));
-		for (const [state, clearQueuedUserMessagesMatching] of [
+		for (const [state, clearQueuedAgentMessagesMatching] of [
 			[blockedState, blockedClear],
 			[readyState, readyClear],
 		] as const) {
@@ -1135,7 +1135,7 @@ describe("daemon mode helpers", () => {
 					sessionName: state.activeSessionId,
 					isStreaming: false,
 					pendingMessageCount: 1,
-					clearQueuedUserMessagesMatching,
+					clearQueuedAgentMessagesMatching,
 				},
 			} as never;
 		}
@@ -1246,7 +1246,7 @@ describe("daemon mode helpers", () => {
 				isStreaming: true,
 				pendingMessageCount: 19,
 				clearQueue: vi.fn(() => ({ cleared: 0 })),
-				clearQueuedUserMessagesMatching: vi.fn(() => ({ steering: [], followUp: [] })),
+				clearQueuedAgentMessagesMatching: vi.fn(() => ({ steering: [], followUp: [] })),
 				queueAgentMessagePrompt,
 				prompt: vi.fn(async () => {}),
 			},
@@ -2535,7 +2535,7 @@ describe("daemon mode helpers", () => {
 				});
 			},
 		);
-		const clearQueuedUserMessagesMatching = vi.fn(() => ({ steering: [], followUp: [] }));
+		const clearQueuedAgentMessagesMatching = vi.fn(() => ({ steering: [], followUp: [] }));
 		targetState.runtime = {
 			...targetState.runtime,
 			cwd: "/tmp",
@@ -2545,7 +2545,7 @@ describe("daemon mode helpers", () => {
 				isStreaming: false,
 				pendingMessageCount: 0,
 				acceptAgentMessagePrompt,
-				clearQueuedUserMessagesMatching,
+				clearQueuedAgentMessagesMatching,
 			},
 		} as never;
 		const internals = daemon as unknown as {
@@ -2573,12 +2573,12 @@ describe("daemon mode helpers", () => {
 			activeSessionId: targetState.activeSessionId,
 		});
 		await Promise.resolve();
-		expect(clearQueuedUserMessagesMatching).not.toHaveBeenCalled();
+		expect(clearQueuedAgentMessagesMatching).not.toHaveBeenCalled();
 
 		resolvePrompt();
 		await send;
 		await clear;
-		expect(clearQueuedUserMessagesMatching).toHaveBeenCalledOnce();
+		expect(clearQueuedAgentMessagesMatching).toHaveBeenCalledOnce();
 	});
 
 	it("rejects agent messages when pause wins the target lock", async () => {
@@ -2590,7 +2590,7 @@ describe("daemon mode helpers", () => {
 		});
 		const targetState = makeState("target");
 		let resolveBlockedClear: () => void = () => {};
-		const clearQueuedUserMessagesMatching = vi.fn(
+		const clearQueuedAgentMessagesMatching = vi.fn(
 			() =>
 				new Promise<{ steering: string[]; followUp: string[] }>((resolve) => {
 					resolveBlockedClear = () => resolve({ steering: [], followUp: [] });
@@ -2606,7 +2606,7 @@ describe("daemon mode helpers", () => {
 				isStreaming: false,
 				pendingMessageCount: 0,
 				acceptAgentMessagePrompt,
-				clearQueuedUserMessagesMatching,
+				clearQueuedAgentMessagesMatching,
 			},
 		} as never;
 		const internals = daemon as unknown as {
@@ -2650,7 +2650,7 @@ describe("daemon mode helpers", () => {
 		});
 		const targetState = makeState("target");
 		let resolveBlockedClear: () => void = () => {};
-		const clearQueuedUserMessagesMatching = vi.fn(
+		const clearQueuedAgentMessagesMatching = vi.fn(
 			() =>
 				new Promise<{ steering: string[]; followUp: string[] }>((resolve) => {
 					resolveBlockedClear = () => resolve({ steering: [], followUp: [] });
@@ -2666,7 +2666,7 @@ describe("daemon mode helpers", () => {
 				isStreaming: false,
 				pendingMessageCount: 0,
 				acceptAgentMessagePrompt,
-				clearQueuedUserMessagesMatching,
+				clearQueuedAgentMessagesMatching,
 			},
 		} as never;
 		const internals = daemon as unknown as {
@@ -2712,7 +2712,7 @@ describe("daemon mode helpers", () => {
 		const targetState = makeState("target");
 		targetState.extensionUiRequests = new Map();
 		let resolveBlockedClear: () => void = () => {};
-		const clearQueuedUserMessagesMatching = vi.fn(
+		const clearQueuedAgentMessagesMatching = vi.fn(
 			() =>
 				new Promise<{ steering: string[]; followUp: string[] }>((resolve) => {
 					resolveBlockedClear = () => resolve({ steering: [], followUp: [] });
@@ -2732,7 +2732,7 @@ describe("daemon mode helpers", () => {
 				pendingMessageCount: 0,
 				messages: [],
 				acceptAgentMessagePrompt,
-				clearQueuedUserMessagesMatching,
+				clearQueuedAgentMessagesMatching,
 				abort: vi.fn(async () => {}),
 				dispose: vi.fn(),
 				sessionManager: { appendSessionState: vi.fn(), hasUserContent: () => true },

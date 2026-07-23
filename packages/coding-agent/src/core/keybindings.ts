@@ -119,7 +119,7 @@ export const KEYBINDINGS = {
 	},
 	"app.message.dequeue": {
 		defaultKeys: "alt+up",
-		description: "Restore queued messages",
+		description: "Restore queued user messages",
 	},
 	"app.clipboard.pasteImage": {
 		defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v",

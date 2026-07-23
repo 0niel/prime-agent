@@ -132,7 +132,7 @@ Use `tab` to cycle through Providers, Models, and MCP Connections, and `escape` 
 |--------|---------|-------------|
 | `app.tools.expand` | `ctrl+o` | Collapse or expand tool output |
 | `app.message.followUp` | `alt+enter` | Queue follow-up message |
-| `app.message.dequeue` | `alt+up` | Restore queued messages to editor |
+| `app.message.dequeue` | `alt+up` | Restore queued user messages to editor |
 
 ### Tree Navigation
 

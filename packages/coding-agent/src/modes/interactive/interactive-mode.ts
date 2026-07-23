@@ -955,7 +955,10 @@ export class InteractiveMode {
 
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
-	private connectionQueue: AgentConnectionQueueState = { steering: [], followUp: [] };
+	private connectionQueue: AgentConnectionQueueState = {
+		user: { steering: [], followUp: [] },
+		agent: { steering: [], followUp: [] },
+	};
 
 	// Shutdown state
 	private shutdownRequested = false;
@@ -1316,7 +1319,7 @@ export class InteractiveMode {
 						hint("app.prompt.stash", "to stash prompt"),
 						rawKeyHint("/", "for commands"),
 						hint("app.message.followUp", "to queue follow-up"),
-						hint("app.message.dequeue", "to edit all queued messages"),
+						hint("app.message.dequeue", "to edit queued user messages"),
 						hint("app.clipboard.pasteImage", "to paste image"),
 						rawKeyHint("drop files", "to attach"),
 					].join("\n")
@@ -2686,7 +2689,10 @@ export class InteractiveMode {
 		this.pendingMessagesContainer.clear();
 		this.queuedMessagesContainer.clear();
 		this.compactionQueuedMessages = [];
-		this.connectionQueue = { steering: [], followUp: [] };
+		this.connectionQueue = {
+			user: { steering: [], followUp: [] },
+			agent: { steering: [], followUp: [] },
+		};
 		if (options?.clearPromptStash) {
 			this.promptStash = undefined;
 		}
@@ -4096,7 +4102,7 @@ export class InteractiveMode {
 		for (const msg of this.compactionQueuedMessages) {
 			add(msg.text);
 		}
-		for (const msg of [...this.connectionQueue.steering, ...this.connectionQueue.followUp]) {
+		for (const msg of [...this.connectionQueue.user.steering, ...this.connectionQueue.user.followUp]) {
 			add(msg);
 		}
 		return ids;
@@ -4797,9 +4803,9 @@ export class InteractiveMode {
 				break;
 
 			case "queue_update":
-				this.connectionQueue = {
-					steering: [...event.steering],
-					followUp: [...event.followUp],
+				this.connectionQueue = event.queue ?? {
+					user: { steering: [...event.steering], followUp: [...event.followUp] },
+					agent: { steering: [], followUp: [] },
 				};
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
@@ -6582,9 +6588,9 @@ export class InteractiveMode {
 	private async handleDequeue(): Promise<void> {
 		const restored = await this.restoreQueuedMessagesToEditor();
 		if (restored === 0) {
-			this.showStatus("No queued messages to restore");
+			this.showStatus("No queued user messages to restore");
 		} else {
-			this.showStatus(`Restored ${restored} queued message${restored > 1 ? "s" : ""} to editor`);
+			this.showStatus(`Restored ${restored} queued user message${restored > 1 ? "s" : ""} to editor`);
 		}
 	}
 
@@ -6781,30 +6787,33 @@ export class InteractiveMode {
 	 * Get all queued messages (read-only).
 	 * Combines session queue and compaction queue.
 	 */
-	private getAllQueuedMessages(): { steering: string[]; followUp: string[] } {
+	private getAllQueuedUserMessages(): { steering: string[]; followUp: string[] } {
 		return {
 			steering: [
-				...this.connectionQueue.steering,
+				...this.connectionQueue.user.steering,
 				...this.compactionQueuedMessages.filter((msg) => msg.mode === "steer").map((msg) => msg.text),
 			],
 			followUp: [
-				...this.connectionQueue.followUp,
+				...this.connectionQueue.user.followUp,
 				...this.compactionQueuedMessages.filter((msg) => msg.mode === "followUp").map((msg) => msg.text),
 			],
 		};
 	}
 
 	/**
-	 * Clear all queued messages and return their contents.
-	 * Clears both session queue and compaction queue.
+	 * Clear queued user messages and return their contents.
+	 * Agent messages remain queued for delivery.
 	 */
-	private async clearAllQueues(
+	private async clearUserQueues(
 		options: { abort?: boolean } = {},
 	): Promise<{ steering: string[]; followUp: string[] }> {
 		const { steering, followUp } = options.abort
-			? await this.agentConnection.abortAndClearQueue()
-			: await this.agentConnection.clearQueue();
-		this.connectionQueue = { steering: [], followUp: [] };
+			? await this.agentConnection.abortAndClearUserQueue()
+			: await this.agentConnection.clearUserQueue();
+		this.connectionQueue = {
+			...this.connectionQueue,
+			user: { steering: [], followUp: [] },
+		};
 		const compactionSteering = this.compactionQueuedMessages
 			.filter((msg) => msg.mode === "steer")
 			.map((msg) => msg.text);
@@ -6829,20 +6838,26 @@ export class InteractiveMode {
 		// Queued steering/follow-up previews are future turns, so they render in
 		// their own container below the execution indicator and recap.
 		this.queuedMessagesContainer.clear();
-		const { steering: steeringMessages, followUp: followUpMessages } = this.getAllQueuedMessages();
-		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
+		const { steering: userSteering, followUp: userFollowUp } = this.getAllQueuedUserMessages();
+		const { steering: agentSteering, followUp: agentFollowUp } = this.connectionQueue.agent;
+		if (userSteering.length > 0 || userFollowUp.length > 0 || agentSteering.length > 0 || agentFollowUp.length > 0) {
 			this.queuedMessagesContainer.addChild(new Spacer(1));
-			for (const message of steeringMessages) {
+			for (const message of userSteering) {
 				const text = theme.fg("dim", formatQueuedMessagePreview(message, "Steering"));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
-			for (const message of followUpMessages) {
+			for (const message of userFollowUp) {
 				const text = theme.fg("dim", formatQueuedMessagePreview(message, "Follow-up"));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
-			const dequeueHint = this.getAppKeyDisplay("app.message.dequeue");
-			const hintText = theme.fg("dim", `╰─ ${dequeueHint} to edit all queued messages`);
-			this.queuedMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
+			for (const message of [...agentSteering, ...agentFollowUp]) {
+				this.queuedMessagesContainer.addChild(new TruncatedText(theme.fg("dim", message), 1, 0));
+			}
+			if (userSteering.length > 0 || userFollowUp.length > 0) {
+				const dequeueHint = this.getAppKeyDisplay("app.message.dequeue");
+				const hintText = theme.fg("dim", `╰─ ${dequeueHint} to edit queued user messages`);
+				this.queuedMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
+			}
 		}
 	}
 
@@ -6856,7 +6871,7 @@ export class InteractiveMode {
 	}
 
 	private async restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): Promise<number> {
-		const { steering, followUp } = await this.clearAllQueues({ abort: options?.abort });
+		const { steering, followUp } = await this.clearUserQueues({ abort: options?.abort });
 		const allQueued = [...steering, ...followUp];
 		if (allQueued.length === 0) {
 			this.updatePendingMessagesDisplay();
@@ -6903,8 +6918,11 @@ export class InteractiveMode {
 		this.updatePendingMessagesDisplay();
 
 		const restoreQueue = async (error: unknown) => {
-			await this.agentConnection.clearQueue().catch(() => undefined);
-			this.connectionQueue = { steering: [], followUp: [] };
+			await this.agentConnection.clearUserQueue().catch(() => undefined);
+			this.connectionQueue = {
+				...this.connectionQueue,
+				user: { steering: [], followUp: [] },
+			};
 			this.compactionQueuedMessages = queuedMessages;
 			this.updatePendingMessagesDisplay();
 			this.showError(
@@ -9334,7 +9352,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 | \`${externalEditor}\` | Edit message in external editor |
 | \`${promptStash}\` | Stash or restore draft prompt |
 | \`${followUp}\` | Queue follow-up message |
-| \`${dequeue}\` | Restore queued messages |
+| \`${dequeue}\` | Restore queued user messages |
 | \`${pasteImage}\` | Paste image from clipboard |
 | \`/\` | Slash commands |
 

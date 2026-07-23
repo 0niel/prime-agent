@@ -31,6 +31,7 @@ import {
 	type DaemonCommand,
 	type DaemonEventCursor,
 	type DaemonOutbound,
+	type DaemonQueueState,
 	type DaemonReplayInfo,
 	type DaemonSessionClosedReason,
 	type DaemonSessionSnapshot,
@@ -58,6 +59,7 @@ import type {
 	AgentConnectionNavigateTreeResult,
 	AgentConnectionNewSessionOptions,
 	AgentConnectionPromptOptions,
+	AgentConnectionQueueBucket,
 	AgentConnectionQueueMode,
 	AgentConnectionQueueState,
 	AgentConnectionResourceSnapshot,
@@ -81,6 +83,19 @@ import type {
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 type DaemonSnapshotBegin = Extract<DaemonOutbound, { type: "session_snapshot_begin" }>;
+
+function normalizeDaemonQueueState(queue: DaemonQueueState): AgentConnectionQueueState {
+	if (queue.queue) {
+		return {
+			user: { steering: [...queue.queue.user.steering], followUp: [...queue.queue.user.followUp] },
+			agent: { steering: [...queue.queue.agent.steering], followUp: [...queue.queue.agent.followUp] },
+		};
+	}
+	return {
+		user: { steering: [...queue.steering], followUp: [...queue.followUp] },
+		agent: { steering: [], followUp: [] },
+	};
+}
 
 interface DaemonSnapshotAssembly {
 	begin?: DaemonSnapshotBegin;
@@ -485,22 +500,23 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async getQueue(): Promise<AgentConnectionQueueState> {
-		return this.requestData<AgentConnectionQueueState>({
+		const queue = await this.requestData<DaemonQueueState>({
 			type: "get_queue",
 			activeSessionId: this.activeSessionId,
 		});
+		return normalizeDaemonQueueState(queue);
 	}
 
-	async clearQueue(): Promise<AgentConnectionQueueState> {
-		return this.requestData<AgentConnectionQueueState>({
+	async clearQueue(): Promise<AgentConnectionQueueBucket> {
+		return this.requestData<AgentConnectionQueueBucket>({
 			type: "clear_queue",
 			activeSessionId: this.activeSessionId,
 		});
 	}
 
-	async abortAndClearQueue(): Promise<AgentConnectionQueueState> {
+	async abortAndClearQueue(): Promise<AgentConnectionQueueBucket> {
 		try {
-			return await this.requestData<AgentConnectionQueueState>({
+			return await this.requestData<AgentConnectionQueueBucket>({
 				type: "abort_and_clear_queue",
 				activeSessionId: this.activeSessionId,
 			});
@@ -510,6 +526,24 @@ export class DaemonAgentConnection implements AgentConnection {
 			}
 			throw error;
 		}
+	}
+
+	async clearUserQueue(): Promise<AgentConnectionQueueBucket> {
+		const type = this.client.supportsServerCapability("separate_message_queues") ? "clear_user_queue" : "clear_queue";
+		return this.requestData<AgentConnectionQueueBucket>({
+			type,
+			activeSessionId: this.activeSessionId,
+		});
+	}
+
+	async abortAndClearUserQueue(): Promise<AgentConnectionQueueBucket> {
+		const type = this.client.supportsServerCapability("separate_message_queues")
+			? "abort_and_clear_user_queue"
+			: "abort_and_clear_queue";
+		return this.requestData<AgentConnectionQueueBucket>({
+			type,
+			activeSessionId: this.activeSessionId,
+		});
 	}
 
 	async listCronJobs(options: { includeInactive?: boolean } = {}): Promise<AgentCronJob[]> {
@@ -1338,7 +1372,11 @@ export class DaemonAgentConnection implements AgentConnection {
 		if (message.type === "session_event") {
 			this.observeStreamingMessage(message.event);
 			this.latestSnapshotIsFresh = false;
-			await this.emit({ type: "session_event", event: message.event });
+			const event =
+				message.event.type === "queue_update" && !message.event.queue
+					? { ...message.event, queue: normalizeDaemonQueueState(message.event) }
+					: message.event;
+			await this.emit({ type: "session_event", event });
 			return;
 		}
 		if (message.type === "side_question_event") {

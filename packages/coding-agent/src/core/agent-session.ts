@@ -276,6 +276,16 @@ export interface RlmChildAgentSnapshot {
 
 export type CompactionReason = "manual" | "threshold" | "overflow" | "requested";
 
+export interface AgentSessionQueueBucket {
+	steering: string[];
+	followUp: string[];
+}
+
+export interface AgentSessionQueueState {
+	user: AgentSessionQueueBucket;
+	agent: AgentSessionQueueBucket;
+}
+
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
 	| AgentEvent
@@ -284,6 +294,7 @@ export type AgentSessionEvent =
 			type: "queue_update";
 			steering: readonly string[];
 			followUp: readonly string[];
+			queue?: AgentSessionQueueState;
 	  }
 	| { type: "compaction_start"; reason: CompactionReason; customInstructions?: string }
 	| { type: "session_info_changed"; name: string | undefined }
@@ -544,6 +555,10 @@ function queuedAgentMessagePreview(message: QueuedSteeringMessage | QueuedFollow
 		return `${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: ${message.message.details.message}`;
 	}
 	return queuedMessagePreview(message);
+}
+
+function isQueuedAgentMessage(message: QueuedSteeringMessage | QueuedFollowUpMessage): boolean {
+	return message.agentMessageId !== undefined;
 }
 
 const IPYTHON_SENT_AGENT_MESSAGE_CUSTOM_ENTRY = "ipython_sent_agent_message";
@@ -1115,6 +1130,7 @@ export class AgentSession {
 			type: "queue_update",
 			steering: this._steeringMessages.map(queuedAgentMessagePreview),
 			followUp: this._followUpMessages.map(queuedAgentMessagePreview),
+			queue: this.getQueueState(),
 		});
 	}
 
@@ -4049,7 +4065,38 @@ export class AgentSession {
 		return { steering, followUp };
 	}
 
-	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): { steering: string[]; followUp: string[] } {
+	clearUserQueue(): { steering: string[]; followUp: string[] } {
+		const steering = this._steeringMessages.filter((message) => !isQueuedAgentMessage(message));
+		const followUp = this._followUpMessages.filter((message) => !isQueuedAgentMessage(message));
+		if (steering.length === 0 && followUp.length === 0) {
+			return { steering: [], followUp: [] };
+		}
+		const steeringMessages = new Set<AgentMessage>(steering.map((message) => message.message));
+		const followUpMessages = new Set<AgentMessage>(followUp.map((message) => message.message));
+		const removedMessages = new Set(
+			this.agent.removeQueuedMessages((message) => steeringMessages.has(message) || followUpMessages.has(message)),
+		);
+		const removedSteering = steering.filter((message) => removedMessages.has(message.message));
+		const removedFollowUp = followUp.filter((message) => removedMessages.has(message.message));
+		const removedSteeringMessages = new Set(removedSteering.map((message) => message.message));
+		const removedFollowUpMessages = new Set(removedFollowUp.map((message) => message.message));
+		this._steeringMessages = this._steeringMessages.filter(
+			(message) => !removedSteeringMessages.has(message.message),
+		);
+		this._followUpMessages = this._followUpMessages.filter(
+			(message) => !removedFollowUpMessages.has(message.message),
+		);
+		this._emitQueueUpdate();
+		return {
+			steering: removedSteering.map((message) => message.text),
+			followUp: removedFollowUp.map((message) => message.text),
+		};
+	}
+
+	clearQueuedAgentMessagesMatching(predicate: (text: string) => boolean): {
+		steering: string[];
+		followUp: string[];
+	} {
 		const steering = this._steeringMessages.filter(
 			(message) => message.agentMessageId !== undefined && predicate(message.text),
 		);
@@ -4129,6 +4176,23 @@ export class AgentSession {
 
 	getFollowUpMessagePreviews(): readonly string[] {
 		return this._followUpMessages.map(queuedAgentMessagePreview);
+	}
+
+	getQueueState(): AgentSessionQueueState {
+		return {
+			user: {
+				steering: this._steeringMessages
+					.filter((message) => !isQueuedAgentMessage(message))
+					.map(queuedAgentMessagePreview),
+				followUp: this._followUpMessages
+					.filter((message) => !isQueuedAgentMessage(message))
+					.map(queuedAgentMessagePreview),
+			},
+			agent: {
+				steering: this._steeringMessages.filter(isQueuedAgentMessage).map(queuedAgentMessagePreview),
+				followUp: this._followUpMessages.filter(isQueuedAgentMessage).map(queuedAgentMessagePreview),
+			},
+		};
 	}
 
 	getSteeringQueueSnapshots(): readonly QueuedAgentInputSnapshot[] {

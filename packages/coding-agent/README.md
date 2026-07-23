@@ -192,9 +192,9 @@ Submit messages while the agent is working:
 
 - **Enter** queues a *steering* message, delivered after the current assistant turn finishes executing its tool calls
 - **Alt+Enter** queues a *follow-up* message, delivered only after the agent finishes all work
-- **Ctrl+C** interrupts active work and restores queued messages to the editor
+- **Ctrl+C** interrupts active work and restores queued user messages to the editor
 - **Escape** clears the input without interrupting active work
-- **Alt+Up** retrieves queued messages back to editor
+- **Alt+Up** retrieves queued user messages back to editor
 
 On Windows Terminal, `Alt+Enter` is fullscreen by default. Remap it in [docs/terminal-setup.md](docs/terminal-setup.md) so Prime Agent can receive the follow-up shortcut.
 

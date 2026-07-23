@@ -11,6 +11,7 @@ export type {
 	AgentConnectionExtensionUiResponse,
 	AgentConnectionModel,
 	AgentConnectionModelCycleResult,
+	AgentConnectionQueueBucket,
 	AgentConnectionQueueState,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionRlmChildAgentSnapshot,

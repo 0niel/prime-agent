@@ -45,7 +45,6 @@ class FakeDaemonClient {
 	connectionStateGate: Promise<void> | undefined;
 	connectionStateFactory: ((activeSessionId: string) => AgentConnectionState) | undefined;
 	abortBashUnknownCommand = false;
-	abortAndClearQueueUnknownCommand = false;
 	cronAddGate: Promise<void> | undefined;
 	legacyHeartbeatCommandsSupported = false;
 	serverCapabilities = new Set<string>();
@@ -99,7 +98,21 @@ class FakeDaemonClient {
 					type: "response",
 					command: command.type,
 					success: true,
-					data: { steering: ["steer"], followUp: ["follow"] },
+					data: {
+						steering: ["steer", "Agent message received: inspect"],
+						followUp: ["follow"],
+						...(this.serverCapabilities.has("separate_message_queues")
+							? {
+									queue: {
+										user: { steering: ["steer"], followUp: ["follow"] },
+										agent: {
+											steering: ["Agent message received: inspect"],
+											followUp: [],
+										},
+									},
+								}
+							: {}),
+					},
 				};
 			case "get_connection_state":
 				await this.connectionStateGate;
@@ -226,19 +239,25 @@ class FakeDaemonClient {
 					data: { steering: ["cleared"], followUp: [] },
 				};
 			case "abort_and_clear_queue":
-				if (this.abortAndClearQueueUnknownCommand) {
-					return {
-						type: "response",
-						command: command.type,
-						success: false,
-						error: "Unknown daemon command: abort_and_clear_queue",
-					};
-				}
 				return {
 					type: "response",
 					command: command.type,
 					success: true,
 					data: { steering: ["aborted"], followUp: ["cleared"] },
+				};
+			case "clear_user_queue":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: { steering: ["user-cleared"], followUp: [] },
+				};
+			case "abort_and_clear_user_queue":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: { steering: ["user-aborted"], followUp: ["user-cleared"] },
 				};
 			case "heartbeats_list":
 				return this.legacyHeartbeatCommandsSupported || this.serverCapabilities.has("heartbeat_catalog")
@@ -2018,9 +2037,15 @@ describe("DaemonAgentConnection", () => {
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
 		await connection.attach();
 
-		await expect(connection.getQueue()).resolves.toEqual({ steering: ["steer"], followUp: ["follow"] });
-		await expect(connection.clearQueue()).resolves.toEqual({ steering: ["cleared"], followUp: [] });
-		await expect(connection.abortAndClearQueue()).resolves.toEqual({ steering: ["aborted"], followUp: ["cleared"] });
+		await expect(connection.getQueue()).resolves.toEqual({
+			user: { steering: ["steer", "Agent message received: inspect"], followUp: ["follow"] },
+			agent: { steering: [], followUp: [] },
+		});
+		await expect(connection.clearUserQueue()).resolves.toEqual({ steering: ["cleared"], followUp: [] });
+		await expect(connection.abortAndClearUserQueue()).resolves.toEqual({
+			steering: ["aborted"],
+			followUp: ["cleared"],
+		});
 		await connection.waitForIdle();
 		const model = getModel("anthropic", "claude-sonnet-4-5");
 		if (!model) {
@@ -2045,11 +2070,29 @@ describe("DaemonAgentConnection", () => {
 			activeSessionId: "active-1",
 			scopedModels: [{ model, thinkingLevel: "high" }],
 		});
+	});
 
-		fakeClient.abortAndClearQueueUnknownCommand = true;
-		await expect(connection.abortAndClearQueue()).rejects.toThrow(
-			"the daemon is running an older build; restart the daemon and try again",
-		);
+	it("uses separated queue commands when the daemon advertises support", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("separate_message_queues");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await expect(connection.getQueue()).resolves.toEqual({
+			user: { steering: ["steer"], followUp: ["follow"] },
+			agent: { steering: ["Agent message received: inspect"], followUp: [] },
+		});
+		await expect(connection.clearUserQueue()).resolves.toEqual({ steering: ["user-cleared"], followUp: [] });
+		await expect(connection.abortAndClearUserQueue()).resolves.toEqual({
+			steering: ["user-aborted"],
+			followUp: ["user-cleared"],
+		});
+		expect(fakeClient.requests.map((request) => request.type)).toEqual([
+			"attach",
+			"get_queue",
+			"clear_user_queue",
+			"abort_and_clear_user_queue",
+		]);
 	});
 
 	it("cancels rlm child runs through the daemon protocol", async () => {
@@ -2288,6 +2331,10 @@ describe("DaemonAgentConnection", () => {
 					type: "queue_update",
 					steering: ["interrupt"],
 					followUp: ["later"],
+					queue: {
+						user: { steering: ["interrupt"], followUp: ["later"] },
+						agent: { steering: [], followUp: [] },
+					},
 				},
 			},
 		]);

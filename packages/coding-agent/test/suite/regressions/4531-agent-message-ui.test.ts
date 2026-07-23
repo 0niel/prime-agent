@@ -143,7 +143,7 @@ describe("ENG-4531 agent message UI", () => {
 			customType: "agent_message",
 			details: { id: "agentmsg_4531", message: "Use shard seven." },
 		});
-		expect(harness.session.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt)).toEqual({
+		expect(harness.session.clearQueuedAgentMessagesMatching(isAgentSessionMessagePrompt)).toEqual({
 			steering: [],
 			followUp: [prompt],
 		});

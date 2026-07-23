@@ -66,6 +66,18 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("model_catalog");
 	});
 
+	it("capability-gates separated message queue mutation", () => {
+		expect(DAEMON_COMMAND_COMPATIBILITY.clear_user_queue).toEqual({
+			minProtocol: DAEMON_PROTOCOL_VERSION,
+			capability: "separate_message_queues",
+		});
+		expect(DAEMON_COMMAND_COMPATIBILITY.abort_and_clear_user_queue).toEqual({
+			minProtocol: DAEMON_PROTOCOL_VERSION,
+			capability: "separate_message_queues",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("separate_message_queues");
+	});
+
 	it("creates versioned command and event envelopes", () => {
 		const command = { id: "cmd-1", type: "attach", activeSessionId: "active-1" } as const;
 		const commandEnvelope = createDaemonCommandEnvelope(command, "cmd-1", "client-1");

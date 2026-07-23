@@ -11,7 +11,7 @@
 - Fixed cancelled extension commands remaining alive when spawned processes ignored SIGTERM ([#458](https://github.com/PrimeIntellect-ai/prime-agent/pull/458) by [@snimu](https://github.com/snimu)).
 - Fixed OAuth browser launch URLs being interpreted by the system shell.
 - Changed long live session opens to render a bounded recent transcript tail while preserving full prompt history ([#343](https://github.com/PrimeIntellect-ai/prime-agent/pull/343) by [@sethkarten](https://github.com/sethkarten)).
-
+- Fixed queued agent messages being restored into the user editor or cancelled when editing queued user input ([ENG-4775](https://linear.app/primeintellect/issue/ENG-4775/separate-agent-and-user-message-queues)).
 
 ## [0.3.2] - 2026-07-20
 

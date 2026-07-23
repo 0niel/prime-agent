@@ -473,9 +473,14 @@ export interface AgentConnectionUserMessage {
 	text: string;
 }
 
-export interface AgentConnectionQueueState {
+export interface AgentConnectionQueueBucket {
 	steering: string[];
 	followUp: string[];
+}
+
+export interface AgentConnectionQueueState {
+	user: AgentConnectionQueueBucket;
+	agent: AgentConnectionQueueBucket;
 }
 
 export interface AgentConnectionHeartbeat {
@@ -531,6 +536,7 @@ export type AgentConnectionSessionEvent =
 			type: "queue_update";
 			steering: readonly string[];
 			followUp: readonly string[];
+			queue?: AgentConnectionQueueState;
 	  }
 	| {
 			type: "compaction_start";
@@ -605,8 +611,10 @@ export interface AgentConnection {
 		callbacks?: AgentConnectionSessionListCallbacks,
 	): Promise<AgentConnectionSavedSessionInfo[]>;
 	getQueue(): Promise<AgentConnectionQueueState>;
-	clearQueue(): Promise<AgentConnectionQueueState>;
-	abortAndClearQueue(): Promise<AgentConnectionQueueState>;
+	clearQueue(): Promise<AgentConnectionQueueBucket>;
+	abortAndClearQueue(): Promise<AgentConnectionQueueBucket>;
+	clearUserQueue(): Promise<AgentConnectionQueueBucket>;
+	abortAndClearUserQueue(): Promise<AgentConnectionQueueBucket>;
 	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;
 	listHeartbeats(): Promise<AgentConnectionHeartbeat[]>;
 	manageHeartbeat(

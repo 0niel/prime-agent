@@ -501,7 +501,7 @@ stale extension instructions`,
 		await harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false });
 		expect(getUserTexts(harness)).toEqual([agentPrompt]);
 		expect(getAssistantTexts(harness)).toEqual([]);
-		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
+		expect(harness.session.clearQueuedAgentMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
 			steering: [],
 			followUp: [],
 		});
@@ -607,7 +607,7 @@ stale extension instructions`,
 
 		await harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false });
 		await Promise.resolve();
-		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
+		expect(harness.session.clearQueuedAgentMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
 			steering: [],
 			followUp: [],
 		});
@@ -643,7 +643,7 @@ stale extension instructions`,
 		harness.setResponses([fauxAssistantMessage("never delivered"), fauxAssistantMessage("after clear response")]);
 		gateAgentStart = true;
 		const accepted = harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false });
-		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
+		expect(harness.session.clearQueuedAgentMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
 			steering: [],
 			followUp: [agentPrompt],
 		});
@@ -674,7 +674,7 @@ stale extension instructions`,
 		harness.setResponses([fauxAssistantMessage("never delivered")]);
 
 		const accepted = harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false });
-		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
+		expect(harness.session.clearQueuedAgentMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
 			steering: [],
 			followUp: [agentPrompt],
 		});
@@ -749,7 +749,7 @@ stale extension instructions`,
 
 		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_late_events");
 		const accepted = harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false });
-		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
+		expect(harness.session.clearQueuedAgentMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
 			steering: [],
 			followUp: [agentPrompt],
 		});

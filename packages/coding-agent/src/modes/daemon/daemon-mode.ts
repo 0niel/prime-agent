@@ -243,6 +243,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_queue",
 	"clear_queue",
 	"abort_and_clear_queue",
+	"clear_user_queue",
+	"abort_and_clear_user_queue",
 	"cron_list",
 	"heartbeats_list",
 	"heartbeat_manage",
@@ -2983,7 +2985,7 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				const cleared = await this.withAgentMessageTargetLock(state.activeSessionId, async () => {
 					this.agentMessageRateLimiter.clearMatching((key) => key.endsWith(`->${state.activeSessionId}`));
-					return state.runtime.session.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt);
+					return state.runtime.session.clearQueuedAgentMessagesMatching(isAgentSessionMessagePrompt);
 				});
 				return success(command.id, "agent_messages_clear", cleared);
 			}
@@ -3165,6 +3167,7 @@ export class AgentDaemon {
 				return success(command.id, "get_queue", {
 					steering: [...state.runtime.session.getSteeringMessagePreviews()],
 					followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
+					queue: state.runtime.session.getQueueState(),
 				});
 			}
 
@@ -3178,6 +3181,18 @@ export class AgentDaemon {
 				const queue = state.runtime.session.clearQueue();
 				state.runtime.session.requestAbort();
 				return success(command.id, "abort_and_clear_queue", queue);
+			}
+
+			case "clear_user_queue": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "clear_user_queue", state.runtime.session.clearUserQueue());
+			}
+
+			case "abort_and_clear_user_queue": {
+				const state = this.getSessionState(command.activeSessionId);
+				const queue = state.runtime.session.clearUserQueue();
+				state.runtime.session.requestAbort();
+				return success(command.id, "abort_and_clear_user_queue", queue);
 			}
 
 			case "cron_list": {
@@ -3883,7 +3898,7 @@ export class AgentDaemon {
 
 	private async clearQueuedAgentSessionMessagesForState(state: ActiveSessionState) {
 		return this.withAgentMessageTargetLock(state.activeSessionId, async () =>
-			state.runtime.session.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt),
+			state.runtime.session.clearQueuedAgentMessagesMatching(isAgentSessionMessagePrompt),
 		);
 	}
 

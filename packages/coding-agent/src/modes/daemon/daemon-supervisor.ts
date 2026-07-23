@@ -153,6 +153,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_queue",
 	"clear_queue",
 	"abort_and_clear_queue",
+	"clear_user_queue",
+	"abort_and_clear_user_queue",
 	"cron_list",
 	"heartbeats_list",
 	"heartbeat_manage",

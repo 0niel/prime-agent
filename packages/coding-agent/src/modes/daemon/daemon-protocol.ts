@@ -23,6 +23,7 @@ import type {
 	AgentConnectionAgentStatus,
 	AgentConnectionHeartbeat,
 	AgentConnectionQueueMode,
+	AgentConnectionQueueState,
 	AgentConnectionResourceSnapshot,
 	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionSavedSessionScope,
@@ -49,8 +50,8 @@ import type { SessionSummary } from "./daemon-session-list.js";
 export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
 export const DAEMON_PROTOCOL_VERSION = 4;
 export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 2;
-export const DAEMON_SCHEMA_REVISION = 2;
-export const DAEMON_SCHEMA_ID = "protocol-4-schema-2-cbdbe20e7ce4";
+export const DAEMON_SCHEMA_REVISION = 3;
+export const DAEMON_SCHEMA_ID = "protocol-4-schema-3-2a9d89cdc4e1";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -73,7 +74,8 @@ export type DaemonServerCapability =
 	| DaemonClientCapability
 	| "heartbeat_catalog"
 	| "heartbeat_management"
-	| "model_catalog";
+	| "model_catalog"
+	| "separate_message_queues";
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
 export interface DaemonProtocolInfo {
@@ -105,7 +107,14 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"heartbeat_catalog",
 	"heartbeat_management",
 	"model_catalog",
+	"separate_message_queues",
 ];
+
+export interface DaemonQueueState {
+	steering: readonly string[];
+	followUp: readonly string[];
+	queue?: AgentConnectionQueueState;
+}
 
 export interface DaemonRuntimeIdentity {
 	buildId: string;
@@ -472,6 +481,8 @@ export type DaemonCommand =
 	| { id?: string; type: "get_queue"; activeSessionId: string }
 	| { id?: string; type: "clear_queue"; activeSessionId: string }
 	| { id?: string; type: "abort_and_clear_queue"; activeSessionId: string }
+	| { id?: string; type: "clear_user_queue"; activeSessionId: string }
+	| { id?: string; type: "abort_and_clear_user_queue"; activeSessionId: string }
 	| { id?: string; type: "cron_list"; activeSessionId?: string; includeInactive?: boolean }
 	| { id?: string; type: "heartbeats_list"; activeSessionId?: string }
 	| {
@@ -578,6 +589,10 @@ const CLIENT_OWNED_DAEMON_COMMAND = {
 	minProtocol: DAEMON_PROTOCOL_VERSION,
 	capability: "client_owned_sessions",
 } as const;
+const SEPARATE_MESSAGE_QUEUES_DAEMON_COMMAND = {
+	minProtocol: DAEMON_PROTOCOL_VERSION,
+	capability: "separate_message_queues",
+} as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
@@ -624,6 +639,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_queue: LEGACY_DAEMON_COMMAND,
 	clear_queue: LEGACY_DAEMON_COMMAND,
 	abort_and_clear_queue: LEGACY_DAEMON_COMMAND,
+	clear_user_queue: SEPARATE_MESSAGE_QUEUES_DAEMON_COMMAND,
+	abort_and_clear_user_queue: SEPARATE_MESSAGE_QUEUES_DAEMON_COMMAND,
 	cron_list: LEGACY_DAEMON_COMMAND,
 	heartbeats_list: { minProtocol: 3, capability: "heartbeat_catalog" },
 	heartbeat_manage: { minProtocol: 3, capability: "heartbeat_management" },

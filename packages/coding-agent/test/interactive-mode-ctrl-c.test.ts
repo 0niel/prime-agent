@@ -25,12 +25,15 @@ type FakeInteractiveMode = {
 		isBashRunning: boolean;
 		retryAttempt: number;
 	};
-	connectionQueue: { steering: string[]; followUp: string[] };
+	connectionQueue: {
+		user: { steering: string[]; followUp: string[] };
+		agent: { steering: string[]; followUp: string[] };
+	};
 	compactionQueuedMessages: Array<{ text: string; mode: "steer" | "followUp" }>;
 	agentConnection: {
 		abort: Mock;
-		clearQueue: Mock;
-		abortAndClearQueue: Mock;
+		clearUserQueue: Mock;
+		abortAndClearUserQueue: Mock;
 		abortRetry: Mock;
 		abortCompaction: Mock;
 		abortBranchSummary: Mock;
@@ -95,12 +98,15 @@ function createInteractiveFake(options: {
 			isBashRunning: options.bashRunning ?? false,
 			retryAttempt: options.retryAttempt ?? 0,
 		},
-		connectionQueue: { steering: [], followUp: [] },
+		connectionQueue: {
+			user: { steering: [], followUp: [] },
+			agent: { steering: [], followUp: [] },
+		},
 		compactionQueuedMessages: [],
 		agentConnection: {
 			abort: vi.fn().mockResolvedValue(undefined),
-			clearQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),
-			abortAndClearQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),
+			clearUserQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),
+			abortAndClearUserQueue: vi.fn().mockResolvedValue({ steering: [], followUp: [] }),
 			abortRetry: vi.fn(),
 			abortCompaction: vi.fn(),
 			abortBranchSummary: vi.fn(),
@@ -169,7 +175,8 @@ describe("InteractiveMode interrupt shortcuts", () => {
 
 	it("restores queued messages through the atomic abort-and-clear path", async () => {
 		const mode = createInteractiveFake({ editorText: "draft" });
-		mode.agentConnection.abortAndClearQueue.mockResolvedValue({
+		mode.connectionQueue.agent.followUp = ["Agent message received: keep working"];
+		mode.agentConnection.abortAndClearUserQueue.mockResolvedValue({
 			steering: ["steer"],
 			followUp: ["follow"],
 		});
@@ -178,10 +185,11 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		const restored = await restoreQueuedMessagesToEditor.call(mode, { abort: true });
 
 		expect(restored).toBe(2);
-		expect(mode.agentConnection.abortAndClearQueue).toHaveBeenCalledTimes(1);
-		expect(mode.agentConnection.clearQueue).not.toHaveBeenCalled();
+		expect(mode.agentConnection.abortAndClearUserQueue).toHaveBeenCalledTimes(1);
+		expect(mode.agentConnection.clearUserQueue).not.toHaveBeenCalled();
 		expect(mode.agentConnection.abort).not.toHaveBeenCalled();
 		expect(mode.editor.getText()).toBe("steer\n\nfollow\n\ndraft");
+		expect(mode.connectionQueue.agent.followUp).toEqual(["Agent message received: keep working"]);
 	});
 
 	it("exits on the second Ctrl+C while the hint is visible", () => {
@@ -267,7 +275,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		};
 		mode.escapeRepeatAction = "tree";
 		mode.escapeRepeatExpiresAt = Date.now() + 500;
-		mode.agentConnection.abortAndClearQueue.mockResolvedValue({ steering: ["queued"], followUp: [] });
+		mode.agentConnection.abortAndClearUserQueue.mockResolvedValue({ steering: ["queued"], followUp: [] });
 
 		const restoreQueuedMessagesToEditor = Reflect.get(InteractiveMode.prototype, "restoreQueuedMessagesToEditor");
 		await restoreQueuedMessagesToEditor.call(mode, { abort: true });

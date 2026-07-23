@@ -186,18 +186,29 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getQueue(): Promise<AgentConnectionQueueState> {
+		const queue = this.session.getQueueState();
 		return {
-			steering: [...this.session.getSteeringMessagePreviews()],
-			followUp: [...this.session.getFollowUpMessagePreviews()],
+			user: { steering: [...queue.user.steering], followUp: [...queue.user.followUp] },
+			agent: { steering: [...queue.agent.steering], followUp: [...queue.agent.followUp] },
 		};
 	}
 
-	async clearQueue(): Promise<AgentConnectionQueueState> {
+	async clearQueue(): Promise<AgentConnectionQueueState["user"]> {
 		return this.session.clearQueue();
 	}
 
-	async abortAndClearQueue(): Promise<AgentConnectionQueueState> {
+	async abortAndClearQueue(): Promise<AgentConnectionQueueState["user"]> {
 		const queue = this.session.clearQueue();
+		this.session.requestAbort();
+		return queue;
+	}
+
+	async clearUserQueue(): Promise<AgentConnectionQueueState["user"]> {
+		return this.session.clearUserQueue();
+	}
+
+	async abortAndClearUserQueue(): Promise<AgentConnectionQueueState["user"]> {
+		const queue = this.session.clearUserQueue();
 		this.session.requestAbort();
 		return queue;
 	}

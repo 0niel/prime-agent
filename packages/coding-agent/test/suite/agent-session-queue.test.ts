@@ -1802,7 +1802,7 @@ describe("AgentSession queue characterization", () => {
 		await harness.session.followUp(spoofed);
 		await harness.session.queueAgentMessagePrompt(real, "followUp");
 
-		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
+		expect(harness.session.clearQueuedAgentMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
 			steering: [],
 			followUp: [real],
 		});
@@ -1818,7 +1818,7 @@ describe("AgentSession queue characterization", () => {
 		await harness.session.steer(sharedText);
 		await harness.session.queueAgentMessagePrompt(sharedText, "steer");
 
-		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
+		expect(harness.session.clearQueuedAgentMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
 			steering: [sharedText],
 			followUp: [],
 		});
