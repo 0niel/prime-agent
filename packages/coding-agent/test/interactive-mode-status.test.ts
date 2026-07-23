@@ -20,8 +20,6 @@ import type { AgentCronJob } from "../src/core/cron-jobs.js";
 import type { AutocompleteProviderFactory } from "../src/core/extensions/types.js";
 import { emptyGoalState, type GoalState } from "../src/core/goals.js";
 import { KeybindingsManager } from "../src/core/keybindings.js";
-import { SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE } from "../src/core/messages.js";
-
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import { emptyUsage } from "../src/core/usage.js";
@@ -676,6 +674,7 @@ type SubmitHandlerHarness = {
 	showError: (message: string) => void;
 	isBashRunning: () => boolean;
 	patchConnectionState: (patch: Record<string, unknown>) => void;
+	requestAgentsView: () => Promise<void>;
 	agentConnection: {
 		prompt: (message: string) => Promise<void>;
 		executeBash: (command: string, options?: { excludeFromContext?: boolean }) => Promise<void>;
@@ -693,7 +692,11 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 		showError: vi.fn(),
 		isBashRunning: () => false,
 		patchConnectionState: vi.fn(),
+<<<<<<< HEAD
 		promptStashState: {},
+=======
+		requestAgentsView: vi.fn(async () => {}),
+>>>>>>> 807913357 (test(coding-agent): align stacked fixtures)
 		promptStash: undefined,
 		pastedImages: new Map(),
 		getPromptStashImages: vi.fn(() => []),
