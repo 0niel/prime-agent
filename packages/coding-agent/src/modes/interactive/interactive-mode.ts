@@ -109,8 +109,11 @@ import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-infe
 import { parseCommandArgs } from "../../core/prompt-templates.js";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.js";
 import {
+	detectSessionImportFileKind,
 	discoverSessionImports,
+	type ExternalSessionImportFileKind,
 	formatSessionImportResult,
+	importExternalSessionFile,
 	importSessionsAndSkills,
 	type SessionImportInventory,
 	type SessionImportSource,
@@ -4361,7 +4364,7 @@ export class InteractiveMode {
 				}
 				if (commandName === "import") {
 					if (commandArgs) {
-						await this.handleImportCommand(canonicalCommandText);
+						await this.handleAutoImportCommand(canonicalCommandText);
 					} else {
 						await this.handleHarnessImportCommand();
 					}
@@ -8568,6 +8571,59 @@ export class InteractiveMode {
 			return;
 		}
 
+		await this.importAndResumeSession(inputPath, `Session imported from: ${inputPath}`);
+	}
+
+	private async handleAutoImportCommand(text: string): Promise<void> {
+		const inputPath = this.getPathCommandArgument(text, "/import");
+		if (!inputPath) {
+			this.showError("Usage: /import <path.jsonl>");
+			return;
+		}
+
+		try {
+			const kind = await detectSessionImportFileKind(inputPath);
+			if (kind === "native") {
+				await this.handleImportCommand(text);
+				return;
+			}
+			if (kind === "claude" || kind === "codex") {
+				await this.handleExternalSessionImport(inputPath, kind);
+				return;
+			}
+			this.showError("Unsupported session JSONL. Expected a Prime Agent, Pi, Claude Code, or Codex session.");
+		} catch (error) {
+			if (error instanceof SessionImportFileNotFoundError) {
+				this.showError(`Failed to import session: ${error.message}`);
+				return;
+			}
+			this.showError(`Failed to inspect session: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	private async handleExternalSessionImport(inputPath: string, source: ExternalSessionImportFileKind): Promise<void> {
+		const label = source === "claude" ? "Claude Code" : "Codex";
+		const confirmed = await this.showExtensionConfirm(
+			"Import session",
+			`Import and resume ${label} session from ${inputPath}?`,
+		);
+		if (!confirmed) {
+			this.showStatus("Import cancelled");
+			return;
+		}
+
+		let imported: Awaited<ReturnType<typeof importExternalSessionFile>>;
+		try {
+			imported = await importExternalSessionFile(inputPath, source, { agentDir: getAgentDir() });
+		} catch (error) {
+			this.showError(`Failed to import ${label} session: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
+		const action = imported.status === "imported" ? "imported and resumed" : "already imported; resumed";
+		await this.importAndResumeSession(imported.sessionFile, `${label} session ${action} from: ${inputPath}`);
+	}
+
+	private async importAndResumeSession(inputPath: string, successMessage: string): Promise<void> {
 		try {
 			this.stopWorkingLoader();
 			const result = await this.agentConnection.importFromJsonl(inputPath);
@@ -8576,7 +8632,7 @@ export class InteractiveMode {
 				return;
 			}
 			await this.renderCurrentSessionState();
-			this.showStatus(`Session imported from: ${inputPath}`);
+			this.showStatus(successMessage);
 		} catch (error: unknown) {
 			if (error instanceof MissingSessionCwdError) {
 				const selectedCwd = await this.promptForMissingSessionCwd(error);
@@ -8590,7 +8646,7 @@ export class InteractiveMode {
 					return;
 				}
 				await this.renderCurrentSessionState();
-				this.showStatus(`Session imported from: ${inputPath}`);
+				this.showStatus(successMessage);
 				return;
 			}
 			if (error instanceof SessionImportFileNotFoundError) {

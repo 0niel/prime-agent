@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { SessionImportFileNotFoundError } from "../src/core/session-import-errors.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
@@ -6,8 +9,17 @@ type PathCommand = "/export" | "/import";
 
 type InteractiveModePrototype = {
 	getPathCommandArgument(this: unknown, text: string, command: PathCommand): string | undefined;
+	handleAutoImportCommand(this: AutoImportCommandContext, text: string): Promise<void>;
 	handleHarnessImportCommand(this: HarnessImportCommandContext): Promise<void>;
 	handleImportCommand(this: ImportCommandContext, text: string): Promise<void>;
+	importAndResumeSession(this: ImportCommandContext, inputPath: string, successMessage: string): Promise<void>;
+};
+
+type AutoImportCommandContext = {
+	getPathCommandArgument: (text: string, command: PathCommand) => string | undefined;
+	handleImportCommand: (text: string) => Promise<void>;
+	handleExternalSessionImport: (inputPath: string, source: "claude" | "codex") => Promise<void>;
+	showError: (message: string) => void;
 };
 
 type HarnessImportCommandContext = {
@@ -26,6 +38,7 @@ type ImportCommandContext = {
 	handleFatalRuntimeError: (prefix: string, error: unknown) => Promise<never>;
 	promptForMissingSessionCwd: (error: unknown) => Promise<string | undefined>;
 	getPathCommandArgument: (text: string, command: PathCommand) => string | undefined;
+	importAndResumeSession: (inputPath: string, successMessage: string) => Promise<void>;
 };
 
 const interactiveModePrototype = InteractiveMode.prototype as unknown as InteractiveModePrototype;
@@ -37,6 +50,59 @@ describe("InteractiveMode /import parsing", () => {
 		await interactiveModePrototype.handleHarnessImportCommand.call({ runSessionImportFlow });
 
 		expect(runSessionImportFlow).toHaveBeenCalledWith("command");
+	});
+
+	it("routes supported JSONL files to native or external import", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-import-command-"));
+		try {
+			const nativePath = join(root, "native.jsonl");
+			const claudePath = join(root, "claude.jsonl");
+			const codexPath = join(root, "codex.jsonl");
+			writeFileSync(
+				nativePath,
+				`${JSON.stringify({
+					type: "session",
+					version: 3,
+					id: "native",
+					timestamp: "2026-01-01T00:00:00.000Z",
+					cwd: root,
+				})}\n`,
+			);
+			writeFileSync(
+				claudePath,
+				`${JSON.stringify({
+					type: "user",
+					message: { role: "user", content: "Claude prompt" },
+				})}\n`,
+			);
+			writeFileSync(
+				codexPath,
+				`${JSON.stringify({
+					type: "session_meta",
+					payload: { id: "codex", cwd: root },
+				})}\n`,
+			);
+
+			const handleImportCommand = vi.fn(async () => {});
+			const handleExternalSessionImport = vi.fn(async () => {});
+			const context: AutoImportCommandContext = {
+				getPathCommandArgument: interactiveModePrototype.getPathCommandArgument,
+				handleImportCommand,
+				handleExternalSessionImport,
+				showError: vi.fn(),
+			};
+
+			await interactiveModePrototype.handleAutoImportCommand.call(context, `/import "${nativePath}"`);
+			expect(handleImportCommand).toHaveBeenLastCalledWith(`/import "${nativePath}"`);
+
+			await interactiveModePrototype.handleAutoImportCommand.call(context, `/import "${claudePath}"`);
+			expect(handleExternalSessionImport).toHaveBeenLastCalledWith(claudePath, "claude");
+
+			await interactiveModePrototype.handleAutoImportCommand.call(context, `/import "${codexPath}"`);
+			expect(handleExternalSessionImport).toHaveBeenLastCalledWith(codexPath, "codex");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("strips quotes from /import path arguments", () => {
@@ -83,6 +149,7 @@ describe("InteractiveMode /import parsing", () => {
 			}),
 			promptForMissingSessionCwd: vi.fn(async () => undefined),
 			getPathCommandArgument: interactiveModePrototype.getPathCommandArgument,
+			importAndResumeSession: interactiveModePrototype.importAndResumeSession,
 		};
 
 		await interactiveModePrototype.handleImportCommand.call(context, '/import "path/to/session.jsonl"');
@@ -115,6 +182,7 @@ describe("InteractiveMode /import parsing", () => {
 			}),
 			promptForMissingSessionCwd: vi.fn(async () => undefined),
 			getPathCommandArgument: interactiveModePrototype.getPathCommandArgument,
+			importAndResumeSession: interactiveModePrototype.importAndResumeSession,
 		};
 
 		await interactiveModePrototype.handleImportCommand.call(context, "/import john's/session.jsonl");
@@ -146,6 +214,7 @@ describe("InteractiveMode /import parsing", () => {
 			handleFatalRuntimeError,
 			promptForMissingSessionCwd: vi.fn(async () => undefined),
 			getPathCommandArgument: interactiveModePrototype.getPathCommandArgument,
+			importAndResumeSession: interactiveModePrototype.importAndResumeSession,
 		};
 
 		await interactiveModePrototype.handleImportCommand.call(context, "/import /tmp/missing-session.jsonl");

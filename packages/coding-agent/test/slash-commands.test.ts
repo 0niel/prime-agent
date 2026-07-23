@@ -35,7 +35,7 @@ describe("built-in slash commands", () => {
 
 	test("describes both /import modes", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "import")).toMatchObject({
-			description: "Import harness history, or resume a session from a JSONL file",
+			description: "Import harness history, or import and resume a supported JSONL file",
 		});
 	});
 

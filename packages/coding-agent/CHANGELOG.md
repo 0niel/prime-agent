@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Added safe first-run and repeatable `/import` migration for recent Claude Code, Codex, OpenCode, and Pi sessions and skills ([ENG-4373](https://linear.app/primeintellect/issue/ENG-4373/import-claudecodexopencodepi-sessions-in-onboarding)).
+- Added safe first-run and repeatable `/import` migration for recent Claude Code, Codex, OpenCode, and Pi sessions and skills, with direct Claude Code and Codex JSONL imports ([ENG-4373](https://linear.app/primeintellect/issue/ENG-4373/import-claudecodexopencodepi-sessions-in-onboarding)).
 - Fixed `/btw` truncating long answers by rendering side questions in the scrollable transcript.
 - Changed selection cursors from `→` to `›` across model selectors, scoped-models, and the theme default for consistency with tree and user-message selectors.
 - Changed the queued follow-up hint connector from `↳` to `╰─` to match the tool-execution continuation connector.

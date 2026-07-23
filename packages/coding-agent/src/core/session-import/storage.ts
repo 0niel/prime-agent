@@ -9,6 +9,7 @@ import {
 	loadEntriesFromFile,
 	type SessionHeader,
 	SessionManager,
+	type SessionStateStatus,
 } from "../session-manager.js";
 import type { ImportedSession, SessionImportSource } from "./types.js";
 
@@ -53,7 +54,20 @@ function sourceTimestamp(message: unknown): string {
 	return new Date(timestamp).toISOString();
 }
 
-function buildImportedEntries(session: ImportedSession, contentHash: string, fallbackCwd: string): FileEntry[] {
+function importedSessionId(session: ImportedSession, contentHash: string): string {
+	return uuidv5(`prime-agent-import:${session.source}:${session.sourceId}:${contentHash}`, uuidv5.URL);
+}
+
+export function importedSessionPath(session: ImportedSession, contentHash: string, sessionDir: string): string {
+	return join(sessionDir, `${importedSessionId(session, contentHash)}.jsonl`);
+}
+
+function buildImportedEntries(
+	session: ImportedSession,
+	contentHash: string,
+	fallbackCwd: string,
+	status: SessionStateStatus,
+): FileEntry[] {
 	const manager = SessionManager.inMemory(session.cwd || fallbackCwd);
 	for (const message of session.messages) {
 		manager.appendMessage(message);
@@ -61,7 +75,7 @@ function buildImportedEntries(session: ImportedSession, contentHash: string, fal
 	if (session.title) {
 		manager.appendSessionInfo(session.title);
 	}
-	manager.appendSessionState({ status: "archived" });
+	manager.appendSessionState({ status });
 
 	const originalHeader = manager.getHeader();
 	if (!originalHeader) {
@@ -69,7 +83,7 @@ function buildImportedEntries(session: ImportedSession, contentHash: string, fal
 	}
 	const header: SessionHeader = {
 		...originalHeader,
-		id: uuidv5(`prime-agent-import:${session.source}:${session.sourceId}:${contentHash}`, uuidv5.URL),
+		id: importedSessionId(session, contentHash),
 		timestamp: new Date(session.createdAt).toISOString(),
 		importedFrom: {
 			source: session.source,
@@ -99,16 +113,17 @@ export function persistImportedSession(
 	contentHash: string,
 	sessionDir: string,
 	fallbackCwd: string,
+	status: SessionStateStatus = "archived",
 ): string {
 	mkdirSync(sessionDir, { recursive: true });
-	const entries = buildImportedEntries(session, contentHash, fallbackCwd);
-	const header = entries[0] as SessionHeader;
-	const destination = join(sessionDir, `${header.id}.jsonl`);
+	const entries = buildImportedEntries(session, contentHash, fallbackCwd, status);
+	const sessionId = importedSessionId(session, contentHash);
+	const destination = importedSessionPath(session, contentHash, sessionDir);
 	if (existsSync(destination)) {
 		throw new Error(`Session destination already exists: ${destination}`);
 	}
 
-	const temporary = join(sessionDir, `.${header.id}.import-${randomUUID()}.tmp`);
+	const temporary = join(sessionDir, `.${sessionId}.import-${randomUUID()}.tmp`);
 	try {
 		writeFileSync(temporary, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`, {
 			encoding: "utf8",

@@ -25,6 +25,13 @@ import {
 	type SessionImportSourceResult,
 } from "./types.js";
 
+export {
+	detectSessionImportFileKind,
+	type ExternalSessionImportFileKind,
+	type ImportedExternalSessionFile,
+	importExternalSessionFile,
+	type SessionImportFileKind,
+} from "./file.js";
 export type {
 	SessionImportInventory,
 	SessionImportOptions,

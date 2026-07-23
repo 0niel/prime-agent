@@ -8,7 +8,9 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { getSessionsDir } from "../../../src/config.js";
 import { KeybindingsManager } from "../../../src/core/keybindings.js";
 import {
+	detectSessionImportFileKind,
 	discoverSessionImports,
+	importExternalSessionFile,
 	importSessionsAndSkills,
 	type SessionImportInventory,
 } from "../../../src/core/session-import/index.js";
@@ -416,6 +418,45 @@ describe("ENG-4373 onboarding session import", () => {
 		expect(paths).toContain(join(project, "recent-00.jsonl"));
 		expect(paths).not.toContain(join(project, "recent-54.jsonl"));
 		expect(paths).not.toContain(oldPath);
+	});
+
+	it("detects and imports individual Claude Code and Codex JSONL files", async () => {
+		const claudePath = join(home, ".claude", "projects", "-project", "claude-session.jsonl");
+		const codexPath = join(home, ".codex", "sessions", "2026", "01", "01", "codex-session.jsonl");
+		const piPath = join(home, ".pi", "agent", "sessions", "project", "pi-session.jsonl");
+		const malformedPath = join(home, ".claude", "projects", "-project", "malformed.jsonl");
+
+		await expect(detectSessionImportFileKind(claudePath)).resolves.toBe("claude");
+		await expect(detectSessionImportFileKind(codexPath)).resolves.toBe("codex");
+		await expect(detectSessionImportFileKind(piPath)).resolves.toBe("native");
+		await expect(detectSessionImportFileKind(malformedPath)).resolves.toBe("unknown");
+
+		const claude = await importExternalSessionFile(claudePath, "claude", { homeDir: home, agentDir, env: {} });
+		const codex = await importExternalSessionFile(codexPath, "codex", { homeDir: home, agentDir, env: {} });
+		expect(claude.status).toBe("imported");
+		expect(codex.status).toBe("imported");
+
+		for (const imported of [claude, codex]) {
+			const entries = loadEntriesFromFile(imported.sessionFile);
+			const header = entries[0] as SessionHeader;
+			const state = [...entries].reverse().find((entry) => entry.type === "session_state");
+			const context = buildSessionContext(entries.slice(1).filter((entry) => entry.type !== "session"));
+			expect(header.importedFrom?.source).toBe(imported.source);
+			expect(state?.type === "session_state" ? state.state.status : undefined).toBe("active");
+			expect(
+				context.messages.some(
+					(message) =>
+						message.role === "assistant" && message.content.some((content) => content.type === "thinking"),
+				),
+			).toBe(true);
+		}
+
+		await expect(
+			importExternalSessionFile(claudePath, "claude", { homeDir: home, agentDir, env: {} }),
+		).resolves.toMatchObject({
+			sessionFile: claude.sessionFile,
+			status: "existing",
+		});
 	});
 
 	it("continues importing other sources when one source disappears", async () => {
