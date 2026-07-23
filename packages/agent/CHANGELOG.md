@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Fixed recovery event listener failures replacing the original agent lifecycle failure.
+- Changed internal package dependencies to exact lockstep versions and raised the Node.js minimum to 20.18.1.
 
 ## [0.3.2] - 2026-07-20
 

@@ -23,13 +23,13 @@ describe("assertNodeVersion", () => {
 	});
 
 	test("passes on a newer minor", () => {
-		const { ok, exitCode } = run("22.9.0");
+		const { ok, exitCode } = run("22.10.0");
 		expect(ok).toBe(true);
 		expect(exitCode).toBeNull();
 	});
 
 	test("passes on a newer patch", () => {
-		const { ok, exitCode } = run("22.8.1");
+		const { ok, exitCode } = run("22.9.1");
 		expect(ok).toBe(true);
 		expect(exitCode).toBeNull();
 	});
@@ -41,7 +41,7 @@ describe("assertNodeVersion", () => {
 	});
 
 	test("rejects a Node 22 release below the minimum", () => {
-		const { ok, logs, exitCode } = run("22.7.0");
+		const { ok, logs, exitCode } = run("22.8.0");
 		expect(ok).toBe(false);
 		expect(exitCode).toBe(1);
 		expect(logs.join("\n")).toContain(`Node ${MIN_NODE_VERSION}`);
