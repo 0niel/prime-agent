@@ -1,16 +1,17 @@
 import { createHash } from "node:crypto";
-import type {
-	Api,
-	AssistantMessage,
-	ImageContent,
-	Message,
-	StopReason,
-	TextContent,
-	ThinkingContent,
-	ToolCall,
-	ToolResultMessage,
-	Usage,
-	UserMessage,
+import {
+	type Api,
+	type AssistantMessage,
+	type ImageContent,
+	type Message,
+	normalizeToolName,
+	type StopReason,
+	type TextContent,
+	type ThinkingContent,
+	type ToolCall,
+	type ToolResultMessage,
+	type Usage,
+	type UserMessage,
 } from "@earendil-works/pi-ai";
 import type { ImportedSession } from "./types.js";
 
@@ -158,7 +159,7 @@ export function thinkingContent(thinking: string): ThinkingContent {
 }
 
 export function toolCallContent(id: string, name: string, args: unknown): ToolCall {
-	return { type: "toolCall", id, name, arguments: parseToolArguments(args) };
+	return { type: "toolCall", id, name: normalizeToolName(name), arguments: parseToolArguments(args) };
 }
 
 export function contentToText(content: Message["content"]): string {

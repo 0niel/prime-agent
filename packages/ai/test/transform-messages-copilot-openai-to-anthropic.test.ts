@@ -133,6 +133,43 @@ describe("OpenAI to Anthropic session migration for Copilot Claude", () => {
 		expect(toolCall.thoughtSignature).toBeUndefined();
 	});
 
+	it("normalizes historical tool names and their results", () => {
+		const model = makeCopilotClaudeModel();
+		const messages: Message[] = [
+			{ role: "user", content: "rename the task", timestamp: Date.now() },
+			makeAssistantMessage([
+				{
+					type: "toolCall",
+					id: "call_123",
+					name: "codex_app.set_thread_title",
+					arguments: { title: "Imported session" },
+					thoughtSignature: "opaque",
+				},
+			]),
+			{
+				role: "toolResult",
+				toolCallId: "call_123",
+				toolName: "codex_app.set_thread_title",
+				content: [{ type: "text", text: "done" }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+		];
+
+		const result = transformMessages(messages, model, anthropicNormalizeToolCallId);
+		const assistant = result.find((message) => message.role === "assistant") as AssistantMessage;
+		const toolCall = assistant.content.find((block) => block.type === "toolCall") as ToolCall;
+		const toolResult = result.find((message) => message.role === "toolResult");
+
+		expect(toolCall.name).toBe("codex_app_set_thread_title");
+		expect(toolCall.thoughtSignature).toBeUndefined();
+		expect(toolResult).toMatchObject({
+			role: "toolResult",
+			toolCallId: "call_123",
+			toolName: "codex_app_set_thread_title",
+		});
+	});
+
 	it("adds synthetic tool results for trailing orphaned tool calls", () => {
 		const model = makeCopilotClaudeModel();
 		const messages: Message[] = [

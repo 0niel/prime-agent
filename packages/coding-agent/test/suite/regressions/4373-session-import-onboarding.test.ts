@@ -121,7 +121,13 @@ function createCodexFixture(home: string): void {
 		{
 			type: "response_item",
 			timestamp: "2026-01-02T00:00:04.000Z",
-			payload: { type: "function_call", call_id: "codex-tool", name: "exec", arguments: '{"cmd":"pwd"}' },
+			payload: {
+				type: "function_call",
+				call_id: "codex-tool",
+				namespace: "codex_app",
+				name: "set_thread_title",
+				arguments: '{"title":"Imported session"}',
+			},
 		},
 		{
 			type: "response_item",
@@ -508,6 +514,17 @@ describe("ENG-4373 onboarding session import", () => {
 				),
 			).toBe(true);
 		}
+		const codexContext = buildSessionContext(
+			loadEntriesFromFile(codex.sessionFile)
+				.slice(1)
+				.filter((entry) => entry.type !== "session"),
+		);
+		expect(
+			codexContext.messages
+				.filter((message) => message.role === "assistant")
+				.flatMap((message) => message.content)
+				.find((content) => content.type === "toolCall")?.name,
+		).toBe("codex_app_set_thread_title");
 
 		await expect(
 			importExternalSessionFile(claudePath, "claude", { homeDir: home, agentDir, env: {} }),

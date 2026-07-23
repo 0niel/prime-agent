@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed invalid historical tool names causing provider request failures when resuming imported sessions ([ENG-4373](https://linear.app/primeintellect/issue/ENG-4373)).
 - Fixed Vertex Gemini 2.5 Flash-Lite minimal reasoning requests to use the supported 512-token thinking budget.
 
 ## [0.3.2] - 2026-07-20

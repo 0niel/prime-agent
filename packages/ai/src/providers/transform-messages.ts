@@ -8,6 +8,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.js";
+import { normalizeToolName } from "../utils/tool-names.js";
 
 const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
@@ -68,6 +69,7 @@ export function transformMessages<TApi extends Api>(
 ): Message[] {
 	// Build a map of original tool call IDs to normalized IDs
 	const toolCallIdMap = new Map<string, string>();
+	const toolCallNameMap = new Map<string, string>();
 	const imageAwareMessages = downgradeUnsupportedImages(messages, model);
 
 	// First pass: transform messages (unsupported image downgrade, thinking blocks, tool call ID normalization)
@@ -80,8 +82,13 @@ export function transformMessages<TApi extends Api>(
 		// Handle toolResult messages - normalize toolCallId if we have a mapping
 		if (msg.role === "toolResult") {
 			const normalizedId = toolCallIdMap.get(msg.toolCallId);
-			if (normalizedId && normalizedId !== msg.toolCallId) {
-				return { ...msg, toolCallId: normalizedId };
+			const normalizedName = toolCallNameMap.get(msg.toolCallId) ?? normalizeToolName(msg.toolName);
+			if ((normalizedId && normalizedId !== msg.toolCallId) || (normalizedName && normalizedName !== msg.toolName)) {
+				return {
+					...msg,
+					toolCallId: normalizedId ?? msg.toolCallId,
+					toolName: normalizedName,
+				};
 			}
 			return msg;
 		}
@@ -124,9 +131,15 @@ export function transformMessages<TApi extends Api>(
 				if (block.type === "toolCall") {
 					const toolCall = block as ToolCall;
 					let normalizedToolCall: ToolCall = toolCall;
+					const normalizedName = normalizeToolName(toolCall.name);
+					toolCallNameMap.set(toolCall.id, normalizedName);
+
+					if (normalizedName !== toolCall.name) {
+						normalizedToolCall = { ...normalizedToolCall, name: normalizedName };
+					}
 
 					if (!isSameModel && toolCall.thoughtSignature) {
-						normalizedToolCall = { ...toolCall };
+						normalizedToolCall = { ...normalizedToolCall };
 						delete (normalizedToolCall as { thoughtSignature?: string }).thoughtSignature;
 					}
 
