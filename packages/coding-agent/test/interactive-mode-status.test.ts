@@ -3237,7 +3237,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		fakeThis.returnToAgentsViewRequested = true;
 		fakeThis.isShuttingDown = true;
 		inputDone.resolve(undefined);
-		await expect(run).resolves.toBe("agents_view");
+		await expect(run).resolves.toMatchObject({ type: "agents_view" });
 		await Promise.all([first, second]);
 
 		expect(promptStashState.stash).toEqual({ text: "first rich draft", expandedText: "first expanded" });
