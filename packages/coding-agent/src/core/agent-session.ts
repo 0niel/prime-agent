@@ -3188,7 +3188,6 @@ export class AgentSession {
 		if (event.type === "message_start" && this._isPromptTurnStartMessage(event.message)) {
 			this._overflowRecovery = "idle";
 		}
-		}
 
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
