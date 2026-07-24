@@ -11,7 +11,7 @@ import type { PromptTemplate } from "../../src/core/prompt-templates.js";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.js";
 import { createTestResourceLoader } from "../utilities.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
-import { createWaitingHarness, gatedHook } from "./scheduling.js";
+import { createDeferred, createWaitingHarness, gatedHook } from "./scheduling.js";
 
 // acceptAgentMessagePrompt admission is asynchronous. Pause after agent.prompt has
 // synchronously claimed the run, but before its prompt messages become delivered.
@@ -1480,6 +1480,56 @@ stale post-hook extension instructions`,
 		expect(harness.session.getFollowUpMessages()).toEqual(["/review keep literal", "/testcmd keep literal"]);
 		expect(commandRuns).toEqual([]);
 		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("keeps an injected direct prompt fenced until the injected message starts", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		await harness.session.sendCustomMessage(
+			{ customType: "earlier-next-turn", content: "earlier", display: true, details: {} },
+			{ deliverAs: "nextTurn" },
+		);
+		const injectedMessage = {
+			role: "custom" as const,
+			customType: "injected-test",
+			content: "injected prompt",
+			display: true,
+			details: {},
+			timestamp: Date.now(),
+		};
+		const earlierStarted = createDeferred();
+		const earlierStartGate = createDeferred();
+		const injectedStarted = createDeferred();
+		const unsubscribe = harness.session.agent.subscribe(async (event) => {
+			if (event.type !== "message_start") return;
+			if (event.message === injectedMessage) {
+				injectedStarted.resolve();
+				return;
+			}
+			if (event.message.role === "custom" && event.message.customType === "earlier-next-turn") {
+				earlierStarted.resolve();
+				await earlierStartGate.promise;
+			}
+		});
+		const internals = harness.session as unknown as {
+			_promptInjectedMessage(text: string, message: typeof injectedMessage): Promise<void>;
+		};
+
+		const prompt = internals._promptInjectedMessage("injected prompt", injectedMessage);
+		await earlierStarted.promise;
+		let checkpointReleased = false;
+		const checkpoint = harness.session.waitForSessionInputCheckpoint().then(() => {
+			checkpointReleased = true;
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(checkpointReleased).toBe(false);
+
+		earlierStartGate.resolve();
+		await injectedStarted.promise;
+		await checkpoint;
+		await prompt;
+		unsubscribe();
 	});
 
 	it("releases the direct prompt section when an injected dispatch fails", async () => {

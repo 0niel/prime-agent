@@ -1004,7 +1004,7 @@ export class AgentSession {
 	/** Direct prompts between admission and agent handoff; restart checkpoints wait for zero. */
 	private _directPromptSectionCount = 0;
 	/** One-shot waiters resolved when a dispatched message reaches message_start. */
-	private _directDispatchObservers = new Set<{ messages: ReadonlySet<AgentMessage>; resolve: () => void }>();
+	private _directDispatchObservers = new Set<{ message: AgentMessage; resolve: () => void }>();
 	private _steeringStopPending = false;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
@@ -3042,7 +3042,7 @@ export class AgentSession {
 					: undefined;
 			this._settleAgentMessage(activeInput?.agentMessageId, "delivery");
 			for (const observer of this._directDispatchObservers) {
-				if (observer.messages.has(event.message)) {
+				if (observer.message === event.message) {
 					this._directDispatchObservers.delete(observer);
 					observer.resolve();
 				}
@@ -4184,10 +4184,9 @@ export class AgentSession {
 		if (options?.suppressAutonomousContinuation) this._markAutonomousContinuationSuppressed(message);
 		// Register the observer before dispatch so a synchronously-emitted
 		// message_start cannot be missed.
-		const dispatchedMessages: ReadonlySet<AgentMessage> = new Set(messages);
-		let observer: { messages: ReadonlySet<AgentMessage>; resolve: () => void } | undefined;
+		let observer: { message: AgentMessage; resolve: () => void } | undefined;
 		const observed = new Promise<true>((resolve) => {
-			observer = { messages: dispatchedMessages, resolve: () => resolve(true) };
+			observer = { message, resolve: () => resolve(true) };
 		});
 		if (observer) this._directDispatchObservers.add(observer);
 		const promptPromise = options?.suppressAutonomousContinuation
