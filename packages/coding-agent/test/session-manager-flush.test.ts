@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -160,5 +160,52 @@ describe("SessionManager.flushNow", () => {
 			customType: "thread_goal_state",
 			data: { active: true, status: "active" },
 		});
+	});
+});
+
+describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
+	it("restores the session file after a torn append", () => {
+		const dir = createTempDir();
+		const sessionDir = join(dir, "sessions");
+		const mgr = SessionManager.create(dir, sessionDir);
+		mgr.appendMessage({ role: "user", content: "hi", timestamp: Date.now() });
+		mgr.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "hello" }],
+			api: "openai-completions",
+			provider: "openai",
+			model: "test",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		const file = mgr.getSessionFile()!;
+		const before = readFileSync(file, "utf8");
+
+		// Simulate a partial append: the fs write tears the file, then throws.
+		const internals = mgr as unknown as { _persist(entry: unknown): void };
+		const originalPersist = internals._persist.bind(mgr);
+		internals._persist = () => {
+			appendFileSync(file, '{"type":"custom_message","truncat');
+			throw new Error("disk full");
+		};
+		expect(() => mgr.appendCustomMessageEntryWithRollback("test.outcome", "details", false)).toThrow("disk full");
+		internals._persist = originalPersist;
+
+		// The rollback rewrites the file from the restored in-memory entries, so the
+		// durable session has no torn tail even if the process exits right after.
+		const after = readFileSync(file, "utf8");
+		expect(after).toBe(before);
+		for (const line of after.trim().split("\n")) {
+			expect(() => JSON.parse(line)).not.toThrow();
+		}
+		expect(mgr.getLeafEntry()?.type).toBe("message");
 	});
 });

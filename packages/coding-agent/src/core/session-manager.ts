@@ -1627,9 +1627,15 @@ export class SessionManager {
 				this.byId.delete(this.leafId);
 				this.fileEntries.pop();
 				this.leafId = previousLeafId;
-				// The failed append may have partially changed the file. Force the next
-				// persisted entry to rewrite the restored state before it is appended.
+				// The failed append may have left a torn line on disk. Restore the file
+				// from the rolled-back entries now; if that also fails (e.g. the disk is
+				// still full), fall back to forcing the next persist to rewrite.
 				this.flushed = false;
+				try {
+					this.flushNow();
+				} catch {
+					this.flushed = false;
+				}
 			}
 			throw error;
 		}
