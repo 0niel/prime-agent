@@ -542,6 +542,8 @@ interface PreparedPromptInput {
 
 interface PreparedPromptPreparation {
 	result: Awaited<ReturnType<ExtensionRunner["emitBeforeAgentStart"]>>;
+	/** Base system prompt captured at emitBeforeAgentStart, for stale-base refresh at handoff. */
+	basePromptSnapshot: string;
 }
 
 class DeferredSessionInputError extends Error {}
@@ -4617,21 +4619,30 @@ export class AgentSession {
 			suppressAutonomousContinuation: options.suppressAutonomousContinuation,
 			resumeIfIdle: options.resumeIfIdle,
 		};
-		try {
-			if (streamingBehavior === "followUp") {
-				const queued = await this._queueFollowUp(text, options.images, queueOptions);
+		// Preflight callbacks run outside the try: a throwing callback must not roll
+		// back queue state for an input that was in fact enqueued (its prefixMessages
+		// would be delivered twice).
+		if (streamingBehavior === "followUp") {
+			let queued: boolean;
+			try {
+				queued = await this._queueFollowUp(text, options.images, queueOptions);
 				if (!queued) {
 					this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
 				}
-				reportPreflight(queued, queued);
-				return;
+			} catch (error) {
+				this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
+				throw error;
 			}
+			reportPreflight(queued, queued);
+			return;
+		}
+		try {
 			await this._queueSteer(text, options.images, queueOptions);
-			reportPreflight(true, true);
 		} catch (error) {
 			this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
 			throw error;
 		}
+		reportPreflight(true, true);
 	}
 
 	/**
@@ -4915,6 +4926,9 @@ export class AgentSession {
 		releaseAdmission: () => void,
 	): Promise<void> {
 		await this._validateCanStartAgentRun();
+		if (this._isSessionInputHandoffDeferred(epoch)) {
+			throw new DeferredSessionInputError("Session input paused before preflight");
+		}
 		this._flushPendingBashMessages();
 		const lastAssistant = this._findLastAssistantMessage();
 		if (lastAssistant) await this._checkCompaction(lastAssistant, false, false);
@@ -4927,14 +4941,15 @@ export class AgentSession {
 			}
 			const preparationPrompt = prompts.at(-1);
 			if (!preparationPrompt) return;
+			const basePromptSnapshot = this._baseSystemPrompt;
 			const result = await this._extensionRunner.emitBeforeAgentStart(
 				preparationPrompt.text,
 				preparationPrompt.images,
-				this._baseSystemPrompt,
+				basePromptSnapshot,
 				this._baseSystemPromptOptions,
 			);
 			if (prompts.at(-1) !== preparationPrompt) continue;
-			const preparation = { result };
+			const preparation = { result, basePromptSnapshot };
 			for (const prompt of prompts) prompt.preparation = preparation;
 		}
 		if (this._isSessionInputHandoffDeferred(epoch)) {
@@ -4950,7 +4965,8 @@ export class AgentSession {
 			messages.push(...prompt.prefixMessages, prompt.message);
 			if (prompt.suppressAutonomousContinuation) this._markAutonomousContinuationSuppressed(prompt.message);
 		}
-		const result = prompts[0]?.preparation?.result;
+		const preparation = prompts[0]?.preparation;
+		const result = preparation?.result;
 		this._appendBeforeAgentStartMessages(messages, result);
 		// Re-check adjacent to the handoff: background refine planning may have
 		// completed and entered _applyRefine during the awaits above,
@@ -4960,7 +4976,12 @@ export class AgentSession {
 		if (this._isSessionInputHandoffDeferred(epoch)) {
 			throw new DeferredSessionInputError("Session input paused before handoff");
 		}
-		this.agent.state.systemPrompt = result?.systemPrompt ?? this._baseSystemPrompt;
+		// The base prompt may have changed (e.g. refine) since preparation; splice the
+		// current base into an extension-modified prompt exactly like the direct path.
+		this.agent.state.systemPrompt =
+			result?.systemPrompt !== undefined && preparation !== undefined
+				? this._refreshExtensionSystemPrompt(result.systemPrompt, preparation.basePromptSnapshot)
+				: this._baseSystemPrompt;
 		try {
 			if (this._activeSessionInput?.kind === "prompt") this._activeSessionInput.phase = "handedOff";
 			if (this.isStreaming) {

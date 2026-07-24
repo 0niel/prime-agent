@@ -40,8 +40,11 @@ export function parseRefineCommandOptions(args: string): RefineCommandOptions {
 		rest = rest.replace(/^--global(?=\s|$)/, "").trim();
 	}
 	if (rest === "rollback") throw new Error("Usage: /refine rollback <refinement-id>");
-	if (rest.startsWith("rollback ")) {
-		let rollbackId = rest.slice("rollback ".length).trim();
+	// Slash-command args keep their original separators (tabs, Unicode spaces);
+	// match the subcommand with the same class parseSlashCommand splits on.
+	const rollbackMatch = /^rollback[\t\p{Zs}]/u.exec(rest);
+	if (rollbackMatch) {
+		let rollbackId = rest.slice(rollbackMatch[0].length).trim();
 		if (rollbackId === "--global") {
 			throw new Error("Usage: /refine rollback <refinement-id>");
 		}
