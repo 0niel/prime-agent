@@ -414,7 +414,7 @@ function cleanupProcessState(identity: CleanupProcessIdentity): "exited" | "matc
 	return observedStartId === identity.processStartId ? "matching" : "exited";
 }
 
-function removeDeadFixtureOwnerRecords(registryDir: string): void {
+async function removeDeadFixtureOwnerRecords(registryDir: string): Promise<void> {
 	for (const owner of listOwnerRecords(registryDir)) {
 		if (!owner.processStartId) {
 			throw new Error(`Cannot clean owner ${owner.generation} without an exact process-start identity`);
@@ -424,11 +424,11 @@ function removeDeadFixtureOwnerRecords(registryDir: string): void {
 			processStartId: owner.processStartId,
 			label: `supervisor ${owner.generation}`,
 		};
-		const state = cleanupProcessState(identity);
-		if (state !== "exited") {
-			throw new Error(
-				`Refusing to clean ${identity.label} owner for ${identity.pid} (${identity.processStartId}): ${state}`,
-			);
+		// A supervisor that just acknowledged shutdown can stay observable for a
+		// moment; wait for the exact identity to exit instead of refusing outright.
+		if (cleanupProcessState(identity) !== "exited") {
+			await forceShutdownReachableSupervisor(owner.socketPath);
+			await waitForCleanupProcessExit(identity);
 		}
 
 		const current = readOwnerRecord(registryDir, owner.generation);
@@ -722,7 +722,7 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 			await waitForCleanupProcessExit(successorCleanupIdentity);
 			registerOwnerRecordsForCleanup(paths.registryDir);
 			await cleanupRegisteredProcesses(client);
-			removeDeadFixtureOwnerRecords(paths.registryDir);
+			await removeDeadFixtureOwnerRecords(paths.registryDir);
 			expect(listOwnerRecords(paths.registryDir)).toEqual([]);
 		} finally {
 			await connection?.dispose().catch(() => undefined);
