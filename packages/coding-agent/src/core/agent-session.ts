@@ -1447,7 +1447,7 @@ export class AgentSession {
 			input.kind === "prompt" && input.customMessage?.customType === GOAL_CONTEXT_CUSTOM_TYPE;
 		this._steeringMessages = this._steeringMessages.filter((input) => !isGoalContext(input));
 		this._followUpMessages = this._followUpMessages.filter((input) => !isGoalContext(input));
-		this._steeringStopPending = this._steeringMessages.length > 0 && this.isStreaming;
+		this._syncSteeringStopPending();
 		this._emitQueueUpdate();
 	}
 
@@ -1838,6 +1838,15 @@ export class AgentSession {
 			lastError: undefined,
 		});
 		return true;
+	}
+
+	private _syncSteeringStopPending(): void {
+		const activeSteeringHandoff =
+			this._activeSessionInput?.kind === "prompt" &&
+			this._activeSessionInput.lane === "steer" &&
+			this._activeSessionInput.phase === "preparing" &&
+			this._activeSessionInput.items.length > 0;
+		this._steeringStopPending = this._steeringMessages.length > 0 || activeSteeringHandoff;
 	}
 
 	private _shouldStopBeforeTurn(): boolean {
@@ -2441,6 +2450,7 @@ export class AgentSession {
 			input.kind === "prompt" && queuedMessageSet.has(input.message);
 		this._steeringMessages = this._steeringMessages.filter((input) => !isQueuedContinuation(input));
 		this._followUpMessages = this._followUpMessages.filter((input) => !isQueuedContinuation(input));
+		this._syncSteeringStopPending();
 		this._emitQueueUpdate();
 		if (options.restoreAutonomousState) {
 			for (const queuedMessage of queuedMessages) {
@@ -3585,6 +3595,7 @@ export class AgentSession {
 			this._rejectQueuedAgentMessageDeliveries(new Error("Queued agent message was cleared before delivery."));
 			this._steeringMessages = [];
 			this._followUpMessages = [];
+			this._syncSteeringStopPending();
 			this.agent.clearAllQueues();
 			this._extensionRunner.invalidate(
 				"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
@@ -4702,9 +4713,7 @@ export class AgentSession {
 		}
 		queue.push(input);
 		this._sessionInputArrivalEpoch++;
-		if (schedule === "steer" && this.isStreaming) {
-			this._steeringStopPending = true;
-		}
+		this._syncSteeringStopPending();
 		this._emitQueueUpdate();
 		if (
 			!options.restore &&
@@ -4797,11 +4806,13 @@ export class AgentSession {
 					if (first.kind === "command") {
 						queue.shift();
 						this._activeSessionInput = { kind: "command", lane, item: first, phase: "executing" };
+						this._syncSteeringStopPending();
 						this._emitQueueUpdate();
 						try {
 							await this._executeQueuedSessionCommand(first);
 						} finally {
 							this._activeSessionInput = undefined;
+							this._syncSteeringStopPending();
 						}
 						continue;
 					}
@@ -4810,12 +4821,13 @@ export class AgentSession {
 					while (queue[0]?.kind === "prompt" && (mode === "all" || prompts.length === 0)) {
 						prompts.push(queue.shift() as PreparedPromptInput);
 					}
-					this._steeringStopPending = this._steeringMessages.length > 0;
 					if (epoch !== this._sessionInputPumpEpoch) {
 						queue.unshift(...prompts);
+						this._syncSteeringStopPending();
 						return;
 					}
 					this._activeSessionInput = { kind: "prompt", lane, items: prompts, phase: "preparing" };
+					this._syncSteeringStopPending();
 					this._emitQueueUpdate();
 					try {
 						await this._startPreparedPromptItems(prompts, epoch, admission.release);
@@ -4829,6 +4841,7 @@ export class AgentSession {
 						if (this._isDeferredSessionInputError(error, epoch)) {
 							if (undelivered.length > 0) {
 								queue.unshift(...undelivered);
+								this._syncSteeringStopPending();
 								this._emitQueueUpdate();
 							}
 							blocked = true;
@@ -4840,6 +4853,7 @@ export class AgentSession {
 						this._surfaceSessionInputError(error);
 					} finally {
 						this._activeSessionInput = undefined;
+						this._syncSteeringStopPending();
 					}
 				} finally {
 					admission.release();
@@ -4847,7 +4861,7 @@ export class AgentSession {
 			}
 		} finally {
 			this._pumpingSessionInput = false;
-			this._steeringStopPending = false;
+			this._syncSteeringStopPending();
 			if (!blocked && epoch === this._sessionInputPumpEpoch && this.pendingMessageCount > 0) {
 				this._scheduleSessionInputPump();
 			}
@@ -4972,10 +4986,13 @@ export class AgentSession {
 				? this._refreshExtensionSystemPrompt(result.systemPrompt, preparation.basePromptSnapshot)
 				: this._baseSystemPrompt;
 		try {
-			if (this._activeSessionInput?.kind === "prompt") this._activeSessionInput.phase = "handedOff";
 			if (this.isStreaming) {
 				// agent.prompt() would reject with its already-processing error; defer instead.
 				throw new DeferredSessionInputError("Agent became active before session input handoff");
+			}
+			if (this._activeSessionInput?.kind === "prompt") {
+				this._activeSessionInput.phase = "handedOff";
+				this._syncSteeringStopPending();
 			}
 			const promptPromise = this.agent.prompt(messages);
 			releaseAdmission();
@@ -5170,6 +5187,7 @@ export class AgentSession {
 		this._rejectQueuedAgentMessageDeliveries(new Error("Queued agent message was cleared before delivery."));
 		this._steeringMessages = [];
 		this._followUpMessages = [];
+		this._syncSteeringStopPending();
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		return { steering, followUp };
@@ -5218,6 +5236,7 @@ export class AgentSession {
 		this._followUpMessages = this._followUpMessages.filter(
 			(message) => !followUpSet.has(message as PreparedPromptInput),
 		);
+		this._syncSteeringStopPending();
 		for (const message of [...steering, ...followUp]) {
 			this._rejectAgentMessageDelivery(
 				message.agentMessageId,
@@ -5462,6 +5481,7 @@ export class AgentSession {
 		const removed = new Set<QueuedSessionInput>([...removedSteering, ...removedFollowUp]);
 		this._steeringMessages = this._steeringMessages.filter((message) => !removed.has(message));
 		this._followUpMessages = this._followUpMessages.filter((message) => !removed.has(message));
+		this._syncSteeringStopPending();
 		for (const message of removed) {
 			this._rejectAgentMessageDelivery(
 				message.agentMessageId,

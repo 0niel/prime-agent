@@ -47,6 +47,21 @@ type AutoRefineInternals = {
 	_autoRefineBranchVersion: number;
 };
 
+type SteeringStopInternals = {
+	_steeringStopPending: boolean;
+	_clearQueuedGoalContexts(): void;
+};
+
+function testAgentMessage(id: string, message: string) {
+	return createAgentSessionMessage({
+		id,
+		source: AGENT_MESSAGE_SOURCE,
+		message,
+		target: { activeSessionId: "target-active", sessionId: "target-session" },
+		deliveryMode: "steer",
+	});
+}
+
 function emptyRefinementResult(): RefinementResult {
 	return {
 		id: "refine_test",
@@ -1425,6 +1440,131 @@ describe("AgentSession queue characterization", () => {
 			releaseToolExecution();
 			await promptPromise;
 			if (expectedFinalUsers !== undefined) expect(getUserTexts(harness)).toEqual(expectedFinalUsers);
+		},
+	);
+
+	it.each([
+		{
+			name: "clearQueue",
+			queue: async (harness: Harness, text: string, _id: string) => {
+				await harness.session.steer(text);
+			},
+			remove: (harness: Harness, _text: string) => harness.session.clearQueue(),
+		},
+		{
+			name: "clearQueuedUserMessagesMatching",
+			queue: async (harness: Harness, text: string, id: string) => {
+				await harness.session.queueAgentMessagePrompt(text, "steer", testAgentMessage(id, text));
+			},
+			remove: (harness: Harness, text: string) =>
+				harness.session.clearQueuedUserMessagesMatching((candidate) => candidate === text),
+		},
+		{
+			name: "removeQueuedFollowUp",
+			queue: async (harness: Harness, text: string, id: string) => {
+				await harness.session.steer(text, undefined, { queueKey: id });
+			},
+			remove: (harness: Harness, _text: string, id: string) => harness.session.removeQueuedFollowUp(id),
+		},
+		{
+			name: "goal-context cleanup",
+			queue: async (harness: Harness, text: string, _id: string) => {
+				await harness.session.sendCustomMessage(
+					{ customType: "goal_context", content: text, display: true },
+					{ triggerTurn: true, deliverAs: "steer" },
+				);
+			},
+			remove: (harness: Harness, _text: string) =>
+				(harness.session as unknown as SteeringStopInternals)._clearQueuedGoalContexts(),
+		},
+	])("reconciles steering stop state after $name removes queued steering", async ({ queue, remove }) => {
+		const waiting = await createWaitingHarness();
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SteeringStopInternals;
+		let providerCalls = 0;
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			() => {
+				providerCalls++;
+				return fauxAssistantMessage("continued without a stale stop");
+			},
+		]);
+		await waitForToolStart;
+		await queue(harness, "remove me", "remove-key");
+		expect(internals._steeringStopPending).toBe(true);
+
+		remove(harness, "remove me", "remove-key");
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(internals._steeringStopPending).toBe(false);
+
+		releaseToolExecution();
+		await promptPromise;
+		expect(providerCalls).toBe(1);
+	});
+
+	it("keeps steering stop pending while a steering handoff is still preparing", async () => {
+		const hook = gatedHook({ prompt: "active steering" });
+		const harness = await createHarness({ extensionFactories: [hook.factory] });
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SteeringStopInternals;
+		harness.setResponses([fauxAssistantMessage("delivered")]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.steer("active steering", undefined, { resumeIfIdle: true });
+		pause.release();
+		await hook.reached;
+
+		expect(harness.session.getSteeringMessages()).toEqual([]);
+		expect(internals._steeringStopPending).toBe(true);
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: [] });
+		expect(internals._steeringStopPending).toBe(true);
+
+		hook.release();
+		await harness.session.waitForIdle();
+		expect(internals._steeringStopPending).toBe(false);
+		expect(getUserTexts(harness)).toEqual(["active steering"]);
+	});
+
+	it.each([
+		{
+			name: "clearQueuedUserMessagesMatching",
+			queueRemoved: (harness: Harness) =>
+				harness.session.queueAgentMessagePrompt(
+					"remove me",
+					"steer",
+					testAgentMessage("remove-message", "remove me"),
+				),
+			remove: (harness: Harness) =>
+				harness.session.clearQueuedUserMessagesMatching((candidate) => candidate === "remove me"),
+		},
+		{
+			name: "removeQueuedFollowUp",
+			queueRemoved: (harness: Harness) => harness.session.steer("remove me", undefined, { queueKey: "remove-key" }),
+			remove: (harness: Harness) => harness.session.removeQueuedFollowUp("remove-key"),
+		},
+		{
+			name: "goal-context cleanup",
+			queueRemoved: (harness: Harness) =>
+				harness.session.sendCustomMessage(
+					{ customType: "goal_context", content: "remove me", display: true },
+					{ triggerTurn: true, deliverAs: "steer" },
+				),
+			remove: (harness: Harness) => (harness.session as unknown as SteeringStopInternals)._clearQueuedGoalContexts(),
+		},
+	])(
+		"preserves steering stop state after $name when another steering input remains",
+		async ({ queueRemoved, remove }) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const internals = harness.session as unknown as SteeringStopInternals;
+			withStreaming(harness, true);
+			await queueRemoved(harness);
+			await harness.session.steer("keep me");
+
+			remove(harness);
+
+			expect(harness.session.getSteeringMessages()).toEqual(["keep me"]);
+			expect(internals._steeringStopPending).toBe(true);
 		},
 	);
 
