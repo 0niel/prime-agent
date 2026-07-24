@@ -97,12 +97,20 @@ declare module "@earendil-works/pi-agent-core" {
 }
 
 /**
- * Convert a BashExecutionMessage to user message text for LLM context.
+ * Format bash output for LLM context. The fence must be longer than any
+ * backtick run in the output so command output cannot terminate it early.
  */
-export function bashExecutionToText(msg: BashExecutionMessage): string {
-	let text = `Ran \`${msg.command}\`\n`;
+export function bashOutputToText(
+	msg: Pick<BashExecutionMessage, "output" | "exitCode" | "cancelled" | "truncated" | "fullOutputPath">,
+): string {
+	let text = "";
 	if (msg.output) {
-		text += `\`\`\`\n${msg.output}\n\`\`\``;
+		let longestBacktickRun = 0;
+		for (const match of msg.output.matchAll(/`+/g)) {
+			longestBacktickRun = Math.max(longestBacktickRun, match[0].length);
+		}
+		const fence = "`".repeat(Math.max(3, longestBacktickRun + 1));
+		text += `${fence}\n${msg.output}\n${fence}`;
 	} else {
 		text += "(no output)";
 	}
@@ -111,10 +119,19 @@ export function bashExecutionToText(msg: BashExecutionMessage): string {
 	} else if (msg.exitCode !== null && msg.exitCode !== undefined && msg.exitCode !== 0) {
 		text += `\n\nCommand exited with code ${msg.exitCode}`;
 	}
-	if (msg.truncated && msg.fullOutputPath) {
-		text += `\n\n[Output truncated. Full output: ${msg.fullOutputPath}]`;
+	if (msg.truncated) {
+		text += msg.fullOutputPath
+			? `\n\n[Output truncated. Full output: ${msg.fullOutputPath}]`
+			: "\n\n[Output truncated.]";
 	}
 	return text;
+}
+
+/**
+ * Convert a BashExecutionMessage to user message text for LLM context.
+ */
+export function bashExecutionToText(msg: BashExecutionMessage): string {
+	return `Ran \`${msg.command}\`\n${bashOutputToText(msg)}`;
 }
 
 export function createBranchSummaryMessage(summary: string, fromId: string, timestamp: string): BranchSummaryMessage {

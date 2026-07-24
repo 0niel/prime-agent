@@ -161,7 +161,7 @@ Type `/` in the editor to trigger commands. [Extensions](#extensions) can regist
 | `/clone` | Duplicate the current active branch into a new session |
 | `/compact [prompt]` | Manually compact context, optional custom instructions |
 | `/copy` | Copy last assistant message to clipboard |
-| `/btw <question>`, `/side <question>` | Ask one inline side question without adding it to the session |
+| `/btw <question>`, `/side <question>` | Ask an inline side question without adding it to the session; replies continue the side conversation, esc returns |
 | `/export [file]` | Export session to HTML file |
 | `/share` | Upload as private GitHub gist with shareable HTML link |
 | `/reload` | Reload keybindings, extensions, skills, prompts, and context files (themes hot-reload automatically) |

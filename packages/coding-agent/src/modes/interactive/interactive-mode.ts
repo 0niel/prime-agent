@@ -98,6 +98,7 @@ import { emptyGoalState, formatGoalUsage, GOAL_CONTEXT_PREVIEW_LABEL, type GoalS
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import {
+	bashOutputToText,
 	createCompactionSummaryMessage,
 	createHeartbeatPromptMessage,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
@@ -117,7 +118,7 @@ import {
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
-import type { TruncationResult } from "../../core/tools/truncate.js";
+import { type TruncationResult, truncateTail } from "../../core/tools/truncate.js";
 import { PRIME_BUTTERFLY_LOGO } from "../../themes/prime-logo.js";
 import { getChangelogPath, parseChangelog } from "../../utils/changelog.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
@@ -871,7 +872,20 @@ export class InteractiveMode {
 	private streamingMessage: AssistantMessage | undefined = undefined;
 	private sideQuestionComponent: SideQuestionComponent | undefined;
 	private sideQuestionEvent: AgentConnectionSideQuestionEvent | undefined;
+	private sideQuestionTurns: AgentConnectionSideQuestionEvent[] = [];
 	private activeSideQuestionId: string | undefined;
+	// Set while a ! bash command runs inside the side conversation: its
+	// BashExecutionComponent renders inside the pane instead of the main chat.
+	// bash_* events broadcast to every attached client, so runs correlate by
+	// runId — the runId we generate here is echoed on our run's events.
+	private sideQuestionBash: { runId: string; input: string; seedTranscript: boolean } | undefined;
+	// The pane-mounted component of our own side run; bash_end seeds the side
+	// transcript only when it ends this exact component.
+	private sideQuestionBashComponent: BashExecutionComponent | undefined;
+	// Holds the runId of a side bash abandoned at pane close: that run's
+	// remaining bash_* events are swallowed (until its bash_end) instead of
+	// leaking into the main transcript.
+	private sideQuestionBashDiscarded: string | undefined;
 
 	// User bash execution tracking (! / !! prefix), driven by bash_* session events
 	private activeBashComponent: BashExecutionComponent | undefined = undefined;
@@ -2752,12 +2766,23 @@ export class InteractiveMode {
 		if (compactionFinished) {
 			await this.flushCompactionQueue({ willRetry: false });
 		}
-		if (bashFinished && this.activeBashComponent) {
-			this.activeBashComponent.setComplete(undefined, false);
-			this.activeBashComponent = undefined;
-			if (!snapshot.state.isStreaming) {
-				this.flushPendingBashComponents();
+		if (bashFinished) {
+			if (this.activeBashComponent) {
+				this.activeBashComponent.setComplete(undefined, false);
+				this.activeBashComponent = undefined;
+				if (!snapshot.state.isStreaming) {
+					this.flushPendingBashComponents();
+				}
 			}
+			// A transient side bash is not persisted in the session snapshot, so a
+			// reconnect cannot replay its missed bash_end event. Release the pane's
+			// local running state when the authoritative snapshot says bash ended.
+			if (this.sideQuestionBash) {
+				this.sideQuestionComponent?.finishBash();
+				this.sideQuestionBash = undefined;
+				this.sideQuestionBashComponent = undefined;
+			}
+			this.sideQuestionBashDiscarded = undefined;
 		}
 		this.updateTerminalTitle();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
@@ -4132,6 +4157,10 @@ export class InteractiveMode {
 		return images.length > 0 ? images : undefined;
 	}
 
+	private hasPastedImagesFor(text: string): boolean {
+		return imageMarkerIds(text).some((id) => this.pastedImages.has(id));
+	}
+
 	private async handleSideQuestion(question: string): Promise<void> {
 		if (!question) {
 			this.showWarning("Usage: /btw <question>");
@@ -4142,7 +4171,10 @@ export class InteractiveMode {
 			return;
 		}
 
-		this.clearSideQuestion();
+		// Turns already answered in the open pane seed the follow-up's context.
+		const previousTurns = this.sideQuestionTurns
+			.filter((turn) => turn.answer)
+			.map((turn) => ({ question: turn.question, answer: turn.answer }));
 		const event: AgentConnectionSideQuestionEvent = {
 			id: randomUUID(),
 			question,
@@ -4151,13 +4183,22 @@ export class InteractiveMode {
 		};
 		this.activeSideQuestionId = event.id;
 		this.sideQuestionEvent = event;
-		this.sideQuestionComponent = new SideQuestionComponent(event, this.settingsManager.getEditorPaddingX());
-		this.sideQuestionContainer.addChild(new Spacer(1));
-		this.sideQuestionContainer.addChild(this.sideQuestionComponent);
+		this.sideQuestionTurns.push(event);
+		if (this.sideQuestionComponent) {
+			this.sideQuestionComponent.addTurn(event);
+		} else {
+			this.sideQuestionComponent = new SideQuestionComponent(event, this.settingsManager.getEditorPaddingX());
+			this.sideQuestionContainer.addChild(new Spacer(1));
+			this.sideQuestionContainer.addChild(this.sideQuestionComponent);
+		}
 		this.ui.requestRender();
 
 		try {
-			await this.agentConnection.startSideQuestion(event.id, question);
+			await this.agentConnection.startSideQuestion(
+				event.id,
+				question,
+				previousTurns.length > 0 ? previousTurns : undefined,
+			);
 		} catch (error) {
 			this.handleSideQuestionEvent({
 				...event,
@@ -4175,8 +4216,44 @@ export class InteractiveMode {
 			return;
 		}
 		this.sideQuestionEvent = event;
+		const turnIndex = this.sideQuestionTurns.findIndex((turn) => turn.id === event.id);
+		if (turnIndex !== -1) {
+			this.sideQuestionTurns[turnIndex] = event;
+		}
 		this.sideQuestionComponent.update(event);
 		this.ui.requestRender();
+	}
+
+	private finishSideQuestionBash(
+		event: Extract<AgentConnectionSessionEvent, { type: "bash_end" }>,
+		rawOutput: string,
+	): void {
+		// Release the pane's running state before any early return so the cancel
+		// hint cannot stay stuck if the pending state was already cleared.
+		this.sideQuestionComponent?.finishBash();
+		const bash = this.sideQuestionBash;
+		if (!bash) {
+			return;
+		}
+		this.sideQuestionBash = undefined;
+		// The pane already rendered the run; this only seeds follow-up turns.
+		if (!bash.seedTranscript || event.cancelled || event.errorMessage) {
+			return;
+		}
+		const truncation = truncateTail(rawOutput);
+		const output = truncation.content.replace(/\n+$/, "");
+		this.sideQuestionTurns.push({
+			id: `side-bash-${randomUUID()}`,
+			question: bash.input,
+			answer: bashOutputToText({
+				output,
+				exitCode: event.exitCode,
+				cancelled: false,
+				truncated: event.truncated || truncation.truncated,
+				fullOutputPath: event.fullOutputPath,
+			}),
+			status: "complete",
+		});
 	}
 
 	private clearSideQuestion(options: { abort?: boolean } = {}): void {
@@ -4184,7 +4261,21 @@ export class InteractiveMode {
 		if (options.abort && event?.status === "running") {
 			this.abortSideQuestion(event.id);
 		}
+		if (this.sideQuestionBash) {
+			// A side-conversation bash run dies with its pane. Its bash_* events may
+			// still be in flight (even bash_start), so swallow them until bash_end.
+			const ownsRunningBash = this.sideQuestionBashComponent !== undefined;
+			this.sideQuestionBashDiscarded = this.sideQuestionBash.runId;
+			this.sideQuestionBash = undefined;
+			this.sideQuestionBashComponent = undefined;
+			// abort_bash is session-scoped. Before our matching bash_start arrives,
+			// another client may own the slot, so only abort a run we have observed.
+			if (ownsRunningBash) {
+				void this.agentConnection.abortBash().catch(() => undefined);
+			}
+		}
 		this.sideQuestionEvent = undefined;
+		this.sideQuestionTurns = [];
 		this.sideQuestionComponent = undefined;
 		this.sideQuestionContainer.clear();
 		if (this.isInitialized) {
@@ -4236,6 +4327,29 @@ export class InteractiveMode {
 				const commandName = slashCommand ? resolveBuiltinSlashCommandName(slashCommand.name) : undefined;
 				const commandArgs = slashCommand?.args ?? "";
 				const canonicalCommandText = commandName ? `/${commandName}${commandArgs ? ` ${commandArgs}` : ""}` : text;
+
+				// Slash commands are disabled while a side conversation is open: they
+				// act on the main session, which is confusing mid-side-chat. The notice
+				// renders as a pane response and never reaches the model. A reply that
+				// merely starts with "/" (e.g. an absolute path) is not a command and
+				// falls through to the side-conversation capture below.
+				if (
+					this.sideQuestionComponent &&
+					slashCommand !== undefined &&
+					(isBuiltinSlashCommandName(slashCommand.name) ||
+						this.connectionCommands.some((command) => command.name === slashCommand.name))
+				) {
+					this.editor.addToHistory?.(text);
+					this.sideQuestionComponent.addTurn({
+						id: `side-notice-${randomUUID()}`,
+						question: text,
+						answer:
+							"Slash commands are not available in side conversations. Press esc to return to the main thread.",
+						status: "complete",
+					});
+					this.ui.requestRender();
+					return;
+				}
 
 				// Handle commands
 				if (commandName === "btw") {
@@ -4472,14 +4586,35 @@ export class InteractiveMode {
 						);
 						return;
 					}
-					this.clearSideQuestion({ abort: true });
+					// A streaming side turn blocks bash just like it blocks follow-up
+					// replies: overlapping pane turns would seed out of order.
+					if (this.sideQuestionComponent && this.activeSideQuestionId) {
+						this.editor.setText(text);
+						this.showWarning("Wait for the current side question to finish or cancel it first.");
+						return;
+					}
+					// Inside a side conversation the command runs inside the pane (its
+					// bash_start event mounts the usual BashExecutionComponent there),
+					// stays out of the main-session context, and (for !, not !!) seeds
+					// follow-up side questions.
+					const sideBash = this.sideQuestionComponent
+						? { runId: randomUUID(), input: text, seedTranscript: !isExcluded }
+						: undefined;
+					if (sideBash) {
+						this.sideQuestionBash = sideBash;
+					} else {
+						this.clearSideQuestion({ abort: true });
+					}
 					this.editor.addToHistory?.(text);
 					this.editor.setText("");
 					// Optimistic: bash_start only fires after extension dispatch, and the
 					// clear key must already route to abortBash in that window.
 					this.patchConnectionState({ isBashRunning: true });
 					try {
-						await this.agentConnection.executeBash(command, { excludeFromContext: isExcluded });
+						await this.agentConnection.executeBash(command, {
+							excludeFromContext: isExcluded || sideBash !== undefined,
+							...(sideBash ? { transient: true, runId: sideBash.runId } : {}),
+						});
 					} catch (error) {
 						// Re-sync rather than assume idle: the rejection may mean another
 						// client's bash run already holds the slot.
@@ -4489,8 +4624,52 @@ export class InteractiveMode {
 						} catch {
 							this.patchConnectionState({ isBashRunning: false });
 						}
+						if (this.sideQuestionBash === sideBash) {
+							this.sideQuestionBash = undefined;
+						}
+						if (sideBash && this.sideQuestionBashDiscarded === sideBash.runId) {
+							// The pane discarded this run, but it never started, so no
+							// bash_end will arrive to consume the marker.
+							this.sideQuestionBashDiscarded = undefined;
+						}
 						this.showError(error instanceof Error ? error.message : String(error));
 					}
+					return;
+				}
+
+				// An open side-question pane captures replies as follow-up side
+				// questions; ! bash routed above and slash commands were rejected
+				// earlier with a notice. Esc returns to the main thread.
+				if (this.sideQuestionComponent) {
+					// A follow-up submitted mid-bash would seed the transcript ahead of
+					// the output it reacts to; make it wait like a running side turn.
+					// The editor cleared its buffer before onSubmit fired, so blocked
+					// paths put the draft back rather than merely skip clearing it.
+					if (this.sideQuestionBash) {
+						this.editor.setText(text);
+						this.showWarning("Wait for the running command to finish or cancel it first.");
+						return;
+					}
+					if (this.activeSideQuestionId) {
+						this.editor.setText(text);
+						await this.handleSideQuestion(text);
+						return;
+					}
+					// Side questions are text-only end to end; a reply with pasted
+					// images gets an in-pane notice instead of silently dropping them.
+					if (this.hasPastedImagesFor(text)) {
+						this.editor.setText(text);
+						this.sideQuestionComponent.addTurn({
+							id: `side-notice-${randomUUID()}`,
+							question: text,
+							answer: "Images are not supported in side conversations. Press esc to return to the main thread.",
+							status: "complete",
+						});
+						this.ui.requestRender();
+						return;
+					}
+					this.editor.addToHistory?.(text);
+					await this.handleSideQuestion(text);
 					return;
 				}
 
@@ -4833,8 +5012,30 @@ export class InteractiveMode {
 				break;
 
 			case "bash_start": {
+				if (this.sideQuestionBashDiscarded !== undefined) {
+					if (event.runId === this.sideQuestionBashDiscarded) {
+						// The discarded side run now owns the bash slot. Abort only
+						// after matching its identity so a foreign run is never killed.
+						void this.agentConnection.abortBash().catch(() => undefined);
+						break;
+					}
+					// A different run claimed the slot, so the discarded run lost the
+					// race and can never start (its execute_bash will reject); render
+					// this run normally instead of swallowing it.
+					this.sideQuestionBashDiscarded = undefined;
+				}
+				const ownSideBash = this.sideQuestionBash !== undefined && event.runId === this.sideQuestionBash.runId;
+				if (event.transient && !ownSideBash) {
+					// Another client's side-conversation run: it renders only in that
+					// client's pane, never in this window's chat.
+					break;
+				}
 				const component = new BashExecutionComponent(event.command, this.ui, event.excludeFromContext);
-				if (this.isAgentStreaming()) {
+				if (ownSideBash && this.sideQuestionComponent) {
+					// Same component as the main thread, mounted inside the pane.
+					this.sideQuestionComponent.addBash(component);
+					this.sideQuestionBashComponent = component;
+				} else if (this.isAgentStreaming()) {
 					this.pendingMessagesContainer.addChild(component);
 					this.pendingBashComponents.push(component);
 				} else {
@@ -4846,18 +5047,30 @@ export class InteractiveMode {
 			}
 
 			case "bash_output":
+				if (this.sideQuestionBashDiscarded !== undefined) {
+					break;
+				}
 				if (this.activeBashComponent) {
 					this.activeBashComponent.appendOutput(event.chunk);
 					this.ui.requestRender();
 				}
 				break;
 
-			case "bash_end":
-				if (this.activeBashComponent) {
+			case "bash_end": {
+				if (this.sideQuestionBashDiscarded !== undefined) {
+					// Only the discarded run's own end consumes the marker; bash_start
+					// already cleared it for any other run that claimed the slot.
+					this.sideQuestionBashDiscarded = undefined;
+					this.activeBashComponent = undefined;
+					this.ui.requestRender();
+					break;
+				}
+				const component = this.activeBashComponent;
+				if (component) {
 					if (event.errorMessage) {
-						this.activeBashComponent.setFailed(event.errorMessage);
+						component.setFailed(event.errorMessage);
 					} else {
-						this.activeBashComponent.setComplete(
+						component.setComplete(
 							event.exitCode,
 							event.cancelled,
 							event.truncated ? ({ truncated: true } as TruncationResult) : undefined,
@@ -4865,11 +5078,18 @@ export class InteractiveMode {
 						);
 					}
 					this.activeBashComponent = undefined;
-				} else if (event.errorMessage) {
+				} else if (event.errorMessage && !event.transient) {
+					// Transient failures surface in the owning client's pane, not here.
 					this.showError(`Bash command failed: ${event.errorMessage}`);
+				}
+				// Seed the side transcript only when our own pane-mounted run ended.
+				if (component !== undefined && component === this.sideQuestionBashComponent) {
+					this.sideQuestionBashComponent = undefined;
+					this.finishSideQuestionBash(event, component.getOutput());
 				}
 				this.ui.requestRender();
 				break;
+			}
 
 			case "message_start":
 				if (event.message.role === "custom") {

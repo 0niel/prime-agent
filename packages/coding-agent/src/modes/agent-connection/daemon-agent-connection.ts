@@ -70,6 +70,7 @@ import type {
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSessionWatcher,
 	AgentConnectionSideQuestionEvent,
+	AgentConnectionSideQuestionTurn,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
 	AgentConnectionState,
@@ -746,7 +747,18 @@ export class DaemonAgentConnection implements AgentConnection {
 		);
 	}
 
-	async startSideQuestion(id: string, question: string): Promise<void> {
+	async startSideQuestion(
+		id: string,
+		question: string,
+		previousTurns?: AgentConnectionSideQuestionTurn[],
+	): Promise<void> {
+		if (previousTurns?.length && !this.client.supportsServerCapability("side_question_transcript")) {
+			// An older daemon would silently ignore previousTurns and answer the
+			// follow-up without the side-conversation context; fail loudly instead.
+			throw new Error(
+				"the daemon is running an older build without side-conversation follow-ups; restart the daemon and try again",
+			);
+		}
 		this.activeSideQuestionIds.add(id);
 		try {
 			await this.requestOk({
@@ -754,6 +766,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				activeSessionId: this.activeSessionId,
 				sideQuestionId: id,
 				question,
+				previousTurns,
 			});
 		} catch (error) {
 			this.activeSideQuestionIds.delete(id);
@@ -820,12 +833,21 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async executeBash(command: string, options?: AgentConnectionExecuteBashOptions): Promise<void> {
+		if (options?.transient && !this.client.supportsServerCapability("transient_bash")) {
+			// An older daemon would record the run into the session, leaking the
+			// side conversation into the main transcript; fail loudly instead.
+			throw new Error(
+				"the daemon is running an older build without side-conversation bash; restart the daemon and try again",
+			);
+		}
 		try {
 			await this.requestOk({
 				type: "execute_bash",
 				activeSessionId: this.activeSessionId,
 				command,
 				excludeFromContext: options?.excludeFromContext,
+				transient: options?.transient,
+				runId: options?.runId,
 			});
 		} catch (error) {
 			if (isUnknownDaemonCommandError(error, "execute_bash")) {

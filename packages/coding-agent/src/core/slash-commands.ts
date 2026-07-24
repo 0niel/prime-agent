@@ -47,7 +47,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 	{ name: "copy", description: "Copy last agent message to clipboard" },
 	{
 		name: "btw",
-		description: "Ask one side question without adding it to the session",
+		description: "Ask a side question without adding it to the session; replies follow up, esc returns",
 		argumentHint: "<question>",
 		takesArgument: true,
 	},

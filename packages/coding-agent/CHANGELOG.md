@@ -20,6 +20,7 @@
 - Changed long live session opens to render a bounded recent transcript tail while preserving full prompt history ([#343](https://github.com/PrimeIntellect-ai/prime-agent/pull/343) by [@sethkarten](https://github.com/sethkarten)).
 - Changed `/refine` to run planning in the background so the conversation is not blocked during the LLM pass ([#497](https://github.com/PrimeIntellect-ai/prime-agent/pull/497) by [@sethkarten](https://github.com/sethkarten)).
 - Added serialized headless refinement and `--goal` / `--goal-token-budget` for seeding durable session goals ([#514](https://github.com/PrimeIntellect-ai/prime-agent/pull/514) by [@sethkarten](https://github.com/sethkarten)).
+- Added multi-turn `/btw` side conversations with transient in-pane bash commands ([#512](https://github.com/PrimeIntellect-ai/prime-agent/pull/512) by [@ilijalichkovski](https://github.com/ilijalichkovski)).
 
 
 ## [0.3.2] - 2026-07-20

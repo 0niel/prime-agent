@@ -58,6 +58,7 @@ import type {
 	AgentConnectionSessionListCallbacks,
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSessionWatcher,
+	AgentConnectionSideQuestionTurn,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
 	AgentConnectionState,
@@ -327,12 +328,20 @@ export class InProcessAgentConnection implements AgentConnection {
 		});
 	}
 
-	async startSideQuestion(id: string, question: string): Promise<void> {
+	async startSideQuestion(
+		id: string,
+		question: string,
+		previousTurns?: AgentConnectionSideQuestionTurn[],
+	): Promise<void> {
 		if (this.sideQuestionRuns.has(id)) {
 			throw new Error(`Side question already exists: ${id}`);
 		}
-		const run = startSideQuestion(this.session.agent, id, question, (event) =>
-			this.emit({ type: "side_question_event", event }),
+		const run = startSideQuestion(
+			this.session.agent,
+			id,
+			question,
+			(event) => this.emit({ type: "side_question_event", event }),
+			previousTurns,
 		);
 		this.sideQuestionRuns.set(id, run);
 		const removeRun = () => {

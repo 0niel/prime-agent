@@ -61,6 +61,7 @@ export type {
 	AgentConnectionSessionTreeNode,
 	AgentConnectionSessionWatcher,
 	AgentConnectionSideQuestionEvent,
+	AgentConnectionSideQuestionTurn,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
 	AgentConnectionSourceInfo,

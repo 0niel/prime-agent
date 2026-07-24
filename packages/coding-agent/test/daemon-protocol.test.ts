@@ -14,6 +14,7 @@ import {
 	DAEMON_PROTOCOL_VERSION,
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
+	type DaemonCommand,
 	type DaemonOutbound,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
@@ -73,9 +74,48 @@ describe("daemon protocol helpers", () => {
 			event: { type: "refine_failed", error: "disk full" },
 		};
 
-		expect(DAEMON_SCHEMA_REVISION).toBe(3);
+		// Revision 3 introduced the refine events; later features moved it further.
+		expect(DAEMON_SCHEMA_REVISION).toBeGreaterThanOrEqual(3);
 		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_event).toEqual({ minProtocol: 1 });
 		expect(event).toMatchObject({ event: { type: "refine_failed", error: "disk full" } });
+	});
+
+	it("accepts legacy side-question and bash shapes in new daemons and clients", () => {
+		const oldClientSideQuestion: DaemonCommand = {
+			type: "start_side_question",
+			activeSessionId: "active-1",
+			sideQuestionId: "side-1",
+			question: "What changed?",
+		};
+		const oldClientBash: DaemonCommand = {
+			type: "execute_bash",
+			activeSessionId: "active-1",
+			command: "ls",
+		};
+		const oldDaemonBashStart: DaemonOutbound = {
+			type: "session_event",
+			activeSessionId: "active-1",
+			event: { type: "bash_start", command: "ls", excludeFromContext: false },
+		};
+		const oldDaemonBashEnd: DaemonOutbound = {
+			type: "session_event",
+			activeSessionId: "active-1",
+			event: { type: "bash_end", exitCode: 0, cancelled: false, truncated: false },
+		};
+
+		expect(DAEMON_COMMAND_COMPATIBILITY.start_side_question).toEqual({ minProtocol: 1 });
+		expect(DAEMON_COMMAND_COMPATIBILITY.execute_bash).toEqual({ minProtocol: 1 });
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_event).toEqual({ minProtocol: 1 });
+		expect(oldClientSideQuestion).not.toHaveProperty("previousTurns");
+		expect(oldClientBash).not.toHaveProperty("transient");
+		expect(oldClientBash).not.toHaveProperty("runId");
+		expect(oldDaemonBashStart.event).not.toHaveProperty("transient");
+		expect(oldDaemonBashStart.event).not.toHaveProperty("runId");
+		expect(oldDaemonBashEnd.event).not.toHaveProperty("transient");
+		expect(oldDaemonBashEnd.event).not.toHaveProperty("runId");
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toEqual(
+			expect.arrayContaining(["side_question_transcript", "transient_bash"]),
+		);
 	});
 
 	it("creates versioned command and event envelopes", () => {

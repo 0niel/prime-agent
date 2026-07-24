@@ -54,7 +54,7 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/compact [prompt]` | Manually compact context, optionally with custom instructions |
 | `/refine [instructions]` | Refine or roll back session-backed harness state |
 | `/copy` | Copy last assistant message to clipboard |
-| `/btw <question>`, `/side <question>` | Ask one inline side question without adding it to the session |
+| `/btw <question>`, `/side <question>` | Ask an inline side question without adding it to the session; replies continue the side conversation, esc returns |
 | `/export [file]` | Export session to HTML |
 | `/share` | Upload as private GitHub gist with shareable HTML link |
 | `/reload` | Reload keybindings, extensions, skills, prompts, and context files |
