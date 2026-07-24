@@ -69,13 +69,18 @@ describe("agents view reply on inactive sessions", () => {
 	it("resumes a saved session before delivering the reply", async () => {
 		const request = vi.fn(async (command: { type: string }) => {
 			if (command.type === "create") {
-				return { success: true, data: { ...savedSummary, lifecycle: "live", activeSessionId: "active-9" } };
+				return {
+					success: true,
+					data: { ...savedSummary, lifecycle: "live", activeSessionId: "active-9", isStreaming: true },
+				};
 			}
 			return { success: true, data: {} };
 		});
 		const self: Record<string, unknown> = {
 			options: { config: { cwd: process.cwd() } },
 			requireClient: () => ({ request }),
+			// Stale pre-resume rows do not know the resumed session; scheduling must
+			// come from the resume response instead.
 			findSummaryByActiveSessionId: () => undefined,
 			setStatusMessage: vi.fn(),
 			setReplyTarget: vi.fn(),
@@ -89,9 +94,37 @@ describe("agents view reply on inactive sessions", () => {
 		expect(request).toHaveBeenCalledWith(
 			expect.objectContaining({ type: "create", sessionPath: savedSummary.sessionFile }),
 		);
-		expect(self.sendPrompt).toHaveBeenCalledWith("active-9", "wake up", undefined);
+		expect(self.sendPrompt).toHaveBeenCalledWith("active-9", "wake up", "followUp");
 		expect(self.selectSummary).toHaveBeenCalledWith(expect.objectContaining({ activeSessionId: "active-9" }));
 		expect(self.setReplyTarget).toHaveBeenCalledWith(undefined);
+	});
+
+	it("keeps the cwd-fallback notice visible after the reply is sent", async () => {
+		const missingCwd = "/definitely/not/a/real/dir/for/this/test";
+		const savedWithMissingCwd = { ...savedSummary, cwd: missingCwd };
+		const request = vi.fn(async () => ({
+			success: true,
+			data: { ...savedWithMissingCwd, lifecycle: "live", activeSessionId: "active-9" },
+		}));
+		const statuses: Array<[string, { sticky?: boolean } | undefined]> = [];
+		const self: Record<string, unknown> = {
+			options: { config: { cwd: process.cwd() } },
+			requireClient: () => ({ request }),
+			findSummaryByActiveSessionId: () => undefined,
+			setStatusMessage: vi.fn((message: string, options?: { sticky?: boolean }) => {
+				statuses.push([message, options]);
+			}),
+			setReplyTarget: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+			selectSummary: vi.fn(),
+			sendPrompt: vi.fn(async () => {}),
+		};
+
+		await invoke("sendReply", self, { key: "saved-1", summary: savedWithMissingCwd }, "wake up");
+
+		const last = statuses.at(-1);
+		expect(last?.[0]).toContain("Original directory is missing");
+		expect(last?.[1]).toEqual({ sticky: true });
 	});
 
 	it("replies to live sessions without resuming", async () => {

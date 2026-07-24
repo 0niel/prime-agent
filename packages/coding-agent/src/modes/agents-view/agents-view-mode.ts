@@ -1374,6 +1374,8 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private async sendReply(target: { key: string; summary: SessionSummary }, text: string): Promise<void> {
 		let activeSessionId = target.summary.activeSessionId;
+		let liveSummary = this.findSummaryByActiveSessionId(activeSessionId ?? target.key);
+		let cwdFallbackNotice: string | undefined;
 		try {
 			if (!activeSessionId) {
 				// Saved session: resume it into the daemon first, then deliver the
@@ -1385,13 +1387,18 @@ export class AgentsViewMode implements Component, Focusable {
 					target.summary,
 				);
 				activeSessionId = resumed.activeSessionId;
-				if (resumed.cwdFallbackNotice) this.setStatusMessage(resumed.cwdFallbackNotice, { sticky: true });
+				// The rows are still pre-resume; the fresh summary is the authoritative
+				// streaming state for scheduling the prompt.
+				liveSummary = resumed.summary;
+				cwdFallbackNotice = resumed.cwdFallbackNotice;
 				this.selectSummary(resumed.summary);
 			}
-			const behavior = this.findSummaryByActiveSessionId(activeSessionId)?.isStreaming ? "followUp" : undefined;
+			const behavior = liveSummary?.isStreaming ? "followUp" : undefined;
 			this.setStatusMessage("Sending reply...");
 			await this.sendPrompt(activeSessionId, text, behavior);
-			this.setStatusMessage("Reply sent");
+			// The fallback-directory notice must outlive the transient send statuses.
+			if (cwdFallbackNotice) this.setStatusMessage(cwdFallbackNotice, { sticky: true });
+			else this.setStatusMessage("Reply sent");
 			this.setReplyTarget(undefined);
 			await this.refreshSessions();
 		} catch (error) {
