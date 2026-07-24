@@ -93,6 +93,9 @@ jobs:
                 echo "Retrying production v${production_version} for ${GITHUB_SHA_VALUE}."
               fi
               publish_production=true
+            elif ! git show-ref --verify --quiet "refs/tags/v${production_version}"; then
+              echo "Production v${production_version} has no tag; retrying the failed release."
+              publish_production=true
             else
               echo "Package version is unchanged at ${production_version}; only beta will advance."
             fi
