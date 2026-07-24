@@ -20,6 +20,7 @@ import {
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
 import type { PrivateFrame } from "../src/modes/session-worker/private-framing.js";
+import { createDeferred } from "./suite/scheduling.js";
 
 const workerLaunchTestState = vi.hoisted(() => ({
 	capture: false,
@@ -338,6 +339,99 @@ describe("daemon worker supervisor monitoring", () => {
 			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
 		}
+	});
+
+	it("does not revoke a newer same-client claim when an older periodic fence fails", async () => {
+		const assertionReached = createDeferred<void>();
+		const assertionGate = createDeferred<void>();
+		const client = {
+			authenticated: true,
+			socket: { destroyed: false, end: vi.fn() },
+		} as unknown as DaemonSocketClient;
+		const oldClaim = { claim: {}, ownerFingerprint: "old" };
+		const newerClaim = { claim: {}, ownerFingerprint: "new" };
+		const transaction = {
+			id: Symbol("update-restart"),
+			owner: client,
+			abort: new AbortController(),
+			phase: "prepared",
+		};
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			options: { worker: { authenticationToken: "token" } },
+			supervisorClaims: new Map([[client, oldClaim]]),
+			updateRestart: transaction,
+			shuttingDown: false,
+			scheduleSupervisorFenceCheck: vi.fn(),
+			assertSupervisorClaimCurrent: vi.fn(async () => {
+				assertionReached.resolve();
+				await assertionGate.promise;
+				throw new Error("stale fence");
+			}),
+		}) as unknown as {
+			supervisorClaims: Map<DaemonSocketClient, object>;
+			updateRestart: object;
+			checkSupervisorFences(): Promise<void>;
+		};
+
+		const check = daemon.checkSupervisorFences();
+		await assertionReached.promise;
+		daemon.supervisorClaims.set(client, newerClaim);
+		assertionGate.resolve();
+		await check;
+
+		expect(daemon.supervisorClaims.get(client)).toBe(newerClaim);
+		expect(daemon.updateRestart).toBe(transaction);
+		expect(client.socket.end).not.toHaveBeenCalled();
+	});
+
+	it("does not revoke a newer same-client claim when an older command fence fails", async () => {
+		const assertionReached = createDeferred<void>();
+		const assertionGate = createDeferred<void>();
+		const client = {
+			id: "supervisor",
+			authenticated: true,
+			socket: { destroyed: false, write: vi.fn(() => true), end: vi.fn() },
+			attachedActiveSessionIds: new Set(),
+			detachInput: vi.fn(),
+			supportsExtensionUi: false,
+			capabilities: new Set(),
+		} as unknown as DaemonSocketClient;
+		const oldClaim = { claim: {}, ownerFingerprint: "old" };
+		const newerClaim = { claim: {}, ownerFingerprint: "new" };
+		const transaction = {
+			id: Symbol("update-restart"),
+			owner: client,
+			abort: new AbortController(),
+			phase: "prepared",
+		};
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			options: { worker: { authenticationToken: "token" } },
+			supervisorClaims: new Map([[client, oldClaim]]),
+			updateRestart: transaction,
+			handleWorkerCommand: vi.fn(async () => undefined),
+			assertSupervisorClaimCurrent: vi.fn(async () => {
+				assertionReached.resolve();
+				await assertionGate.promise;
+				throw new Error("stale fence");
+			}),
+		}) as unknown as {
+			supervisorClaims: Map<DaemonSocketClient, object>;
+			updateRestart: object;
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		const command = daemon.handleLine(
+			client,
+			JSON.stringify({ type: "worker_subscribe", activeSessionId: "active-1" }),
+		);
+		await assertionReached.promise;
+		daemon.supervisorClaims.set(client, newerClaim);
+		assertionGate.resolve();
+		await command;
+
+		expect(daemon.supervisorClaims.get(client)).toBe(newerClaim);
+		expect(daemon.updateRestart).toBe(transaction);
+		expect(client.socket.end).not.toHaveBeenCalled();
 	});
 
 	it("revokes an old supervisor before ending its socket when a replacement authenticates", async () => {

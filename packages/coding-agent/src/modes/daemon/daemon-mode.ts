@@ -629,11 +629,13 @@ export class AgentDaemon {
 		return this.supervisorClaims.size > 0;
 	}
 
-	private revokeSupervisorClaim(client: DaemonSocketClient): void {
-		this.supervisorClaims.delete(client);
+	private revokeSupervisorClaim(client: DaemonSocketClient, expected?: BoundSupervisorGenerationClaim): boolean {
+		if (expected && this.supervisorClaims.get(client) !== expected) return false;
+		if (!this.supervisorClaims.delete(client)) return false;
 		if (this.options.worker && this.updateRestart?.owner === client) {
 			this.cancelPreparedUpdateRestart(this.updateRestart.id);
 		}
+		return true;
 	}
 
 	private clearSupervisorAvailabilityCheck(): void {
@@ -665,8 +667,7 @@ export class AgentDaemon {
 					boundClaim.ownerFingerprint,
 				);
 			} catch {
-				this.revokeSupervisorClaim(client);
-				client.socket.end();
+				if (this.revokeSupervisorClaim(client, boundClaim)) client.socket.end();
 			}
 		}
 		this.scheduleSupervisorFenceCheck();
@@ -2603,8 +2604,7 @@ export class AgentDaemon {
 					);
 					// Cancelling this prompt only abandons its admission wait. A genuine
 					// stale supervisor claim fences only the binding that it checked.
-					if (!admissionCancelled && this.supervisorClaims.get(client) === boundClaim) {
-						this.revokeSupervisorClaim(client);
+					if (!admissionCancelled && this.revokeSupervisorClaim(client, boundClaim)) {
 						client.socket.end();
 					}
 					return;

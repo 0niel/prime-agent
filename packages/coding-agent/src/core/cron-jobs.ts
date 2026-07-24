@@ -763,6 +763,16 @@ export class AgentCronJobStore {
 		return recovered;
 	}
 
+	recoverInterruptedDispatchesById(dispatchIds: readonly string[], now = new Date()): AgentCronJob[] {
+		const recovered: AgentCronJob[] = [];
+		const interruptedDispatchIds = new Set(dispatchIds);
+		this.mutateStates((state) => {
+			recoverInterruptedInState(state, now, recovered, interruptedDispatchIds);
+			return [];
+		});
+		return recovered;
+	}
+
 	getDueJob(id: string, now = new Date()): AgentCronJob | undefined {
 		return this.readJobs().find((job) => job.id === id && isDueJob(job, now));
 	}
@@ -962,12 +972,20 @@ export class AgentCronScheduler {
 		}
 		this.running = true;
 		const dispatches: Array<{ dispatch: AgentCronDispatch; endDispatch?: () => void }> = [];
+		let claimedDispatches: AgentCronDispatch[] | undefined;
 		try {
-			for (const dispatch of this.store.claimDue(now, this.now())) {
+			claimedDispatches = this.store.claimDue(now, this.now());
+			for (const dispatch of claimedDispatches) {
 				dispatches.push({ dispatch, endDispatch: this.hooks.beginDispatch?.(dispatch) });
 			}
 		} catch (error) {
 			for (const claimed of dispatches) claimed.endDispatch?.();
+			if (claimedDispatches) {
+				this.store.recoverInterruptedDispatchesById(
+					claimedDispatches.map((dispatch) => dispatch.id),
+					this.now(),
+				);
+			}
 			throw error;
 		} finally {
 			this.running = false;
@@ -1581,12 +1599,20 @@ function claimDueInState(state: CronJobsState, dueAt: Date, claimedAt: Date): Ag
 	return dispatches;
 }
 
-function recoverInterruptedInState(state: CronJobsState, now: Date, recovered: AgentCronJob[]): void {
-	if (state.dispatches.length === 0) {
+function recoverInterruptedInState(
+	state: CronJobsState,
+	now: Date,
+	recovered: AgentCronJob[],
+	dispatchIds?: ReadonlySet<string>,
+): void {
+	const interrupted = dispatchIds
+		? state.dispatches.filter((dispatch) => dispatchIds.has(dispatch.id))
+		: state.dispatches;
+	if (interrupted.length === 0) {
 		return;
 	}
-	const interruptedIds = new Set(state.dispatches.map((dispatch) => dispatch.jobId));
-	state.dispatches = [];
+	const interruptedIds = new Set(interrupted.map((dispatch) => dispatch.jobId));
+	state.dispatches = dispatchIds ? state.dispatches.filter((dispatch) => !dispatchIds.has(dispatch.id)) : [];
 	state.jobs = state.jobs.map((job) => {
 		if (!interruptedIds.has(job.id) || job.status !== "active") {
 			return job;

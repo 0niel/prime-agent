@@ -1571,6 +1571,65 @@ stale post-hook extension instructions`,
 		unsubscribe();
 	});
 
+	it("aborts while an extension event is pending without flushing or cancelling its queue", async () => {
+		const extensionReached = createDeferred();
+		const extensionGate = createDeferred();
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_start", async (event) => {
+						if (event.message.role !== "user") return;
+						extensionReached.resolve();
+						await extensionGate.promise;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		const prompt = harness.session.prompt("pending extension event");
+		await extensionReached.promise;
+		const checkpointInternals = harness.session as unknown as {
+			_activeSessionInput?: unknown;
+			_directPromptSectionCount: number;
+		};
+		expect(checkpointInternals._activeSessionInput).toBeUndefined();
+		expect(checkpointInternals._directPromptSectionCount).toBe(0);
+		const eventQueue = (harness.session as unknown as { _agentEventQueue: Promise<void> })._agentEventQueue;
+		let queueDrained = false;
+		void eventQueue.then(() => {
+			queueDrained = true;
+		});
+		const flushNow = vi.spyOn(harness.sessionManager, "flushNow");
+		const controller = new AbortController();
+		const removeEventListener = vi.spyOn(controller.signal, "removeEventListener");
+
+		const checkpoint = harness.session.waitForSessionInputCheckpoint(controller.signal);
+		controller.abort();
+
+		await expect(checkpoint).rejects.toThrow("Update restart preparation cancelled");
+		expect(queueDrained).toBe(false);
+		expect(flushNow).not.toHaveBeenCalled();
+		expect(removeEventListener).toHaveBeenCalledWith("abort", expect.any(Function));
+		extensionGate.resolve();
+		await prompt;
+		await eventQueue;
+		expect(queueDrained).toBe(true);
+		expect(flushNow).not.toHaveBeenCalled();
+	});
+
+	it("propagates a snapshotted event queue rejection without flushing", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		(harness.session as unknown as { _agentEventQueue: Promise<void> })._agentEventQueue = Promise.reject(
+			new Error("event queue failed"),
+		);
+		const flushNow = vi.spyOn(harness.sessionManager, "flushNow");
+
+		await expect(harness.session.waitForSessionInputCheckpoint()).rejects.toThrow("event queue failed");
+		expect(flushNow).not.toHaveBeenCalled();
+	});
+
 	it("releases the direct prompt section when an injected dispatch fails", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

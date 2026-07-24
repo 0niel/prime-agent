@@ -947,6 +947,33 @@ function readAssistantText(message: AssistantMessage): string {
 		.join("");
 }
 
+function waitForPromiseOrAbort<T>(
+	promise: Promise<T>,
+	signal: AbortSignal | undefined,
+	abortMessage: string,
+): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) return Promise.reject(new Error(abortMessage));
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => {
+			cleanup();
+			reject(new Error(abortMessage));
+		};
+		const cleanup = () => signal.removeEventListener("abort", onAbort);
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			(value) => {
+				cleanup();
+				resolve(value);
+			},
+			(error: unknown) => {
+				cleanup();
+				reject(error);
+			},
+		);
+	});
+}
+
 function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 	const parentContextTokens =
 		parentUsage.totalTokens ||
@@ -5575,9 +5602,10 @@ export class AgentSession {
 			});
 		}
 		if (signal?.aborted) throw new Error("Update restart preparation cancelled");
-		// Handed-off inputs reach the transcript through the event queue; drain it so
-		// the flush below persists them before the snapshot is taken.
-		await this._agentEventQueue;
+		// Handed-off inputs reach the transcript through the event queue; drain the
+		// current snapshot so the flush below persists them before the snapshot is taken.
+		await waitForPromiseOrAbort(this._agentEventQueue, signal, "Update restart preparation cancelled");
+		if (signal?.aborted) throw new Error("Update restart preparation cancelled");
 		this.sessionManager.flushNow();
 	}
 

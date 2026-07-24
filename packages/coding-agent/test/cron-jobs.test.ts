@@ -972,9 +972,20 @@ describe("AgentCronScheduler", () => {
 		expect(store.list()[0]).toMatchObject({ id: job.id, status: "active", runCount: 0 });
 	});
 
-	it("releases acquired dispatch leases when later setup fails", async () => {
+	it("releases leases and recovers the whole claimed batch when setup fails", async () => {
 		const store = new AgentCronJobStore(makeStorePath(tempDirs));
-		for (const activeSessionId of ["active-1", "active-2"]) {
+		const unrelated = store.create({
+			activeSessionId: "unrelated",
+			sessionId: "unrelated",
+			sessionFile: "/tmp/unrelated.jsonl",
+			cwd: "/tmp/project",
+			scheduleText: "every 10s",
+			prompt: "unrelated",
+			now: start,
+		});
+		const [unrelatedDispatch] = store.claimDue(new Date("2026-01-01T12:34:10.000Z"));
+		if (!unrelatedDispatch) throw new Error("Expected unrelated dispatch");
+		const batch = ["active-1", "active-2", "active-3"].map((activeSessionId) =>
 			store.create({
 				activeSessionId,
 				sessionId: activeSessionId,
@@ -983,19 +994,33 @@ describe("AgentCronScheduler", () => {
 				scheduleText: "in 1m",
 				prompt: activeSessionId,
 				now: start,
-			});
-		}
+			}),
+		);
 		const endDispatch = vi.fn();
+		const beginDispatch = vi.fn((dispatch) => {
+			if (dispatch.job.activeSessionId === "active-2") throw new Error("lease setup failed");
+			return endDispatch;
+		});
 		const scheduler = new AgentCronScheduler(store, {
+			now: () => new Date("2026-01-01T12:35:00.000Z"),
 			runJob: vi.fn(async () => undefined),
-			beginDispatch: (dispatch) => {
-				if (dispatch.job.activeSessionId === "active-2") throw new Error("lease setup failed");
-				return endDispatch;
-			},
+			beginDispatch,
 		});
 
 		await expect(scheduler.runDue(new Date("2026-01-01T12:35:00.000Z"))).rejects.toThrow("lease setup failed");
+		expect(beginDispatch).toHaveBeenCalledTimes(2);
 		expect(endDispatch).toHaveBeenCalledOnce();
+		for (const job of batch) {
+			expect(store.getClaimedJob(job.id)).toBeUndefined();
+			expect(store.list().find((candidate) => candidate.id === job.id)).toMatchObject({
+				status: "completed",
+				lastError: "Interrupted before scheduled operation completion",
+			});
+		}
+		expect(store.getClaimedJob(unrelated.id)).toMatchObject({ id: unrelated.id });
+		expect(store.recordDispatchResult(unrelatedDispatch.id, { outcome: "ran" })).toMatchObject({
+			id: unrelated.id,
+		});
 	});
 
 	it("reschedules recurring jobs after each run", async () => {
