@@ -878,8 +878,8 @@ export class InteractiveMode {
 	// activityTracker token count already folded into the context snapshot; only output beyond
 	// this counts as live in-flight (keeps auto-retries from re-adding a failed attempt).
 	private contextUsageTokenBaseline = 0;
-	private contextUsageRefreshRequestGeneration = 0;
-	private contextUsageRefreshResultGeneration = 0;
+	// Refresh ordering: a stale failure must never clobber a newer success.
+	private contextUsageRefresh = { generation: 0, lastSuccessGeneration: 0 };
 	private readonly defaultHiddenThinkingLabel = "Thinking...";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
 
@@ -2589,20 +2589,20 @@ export class InteractiveMode {
 
 	/** Refresh the tray's context usage from the session after a turn or compaction completes. */
 	private async refreshConnectionContextUsage(): Promise<void> {
-		const requestGeneration = ++this.contextUsageRefreshRequestGeneration;
+		const generation = ++this.contextUsageRefresh.generation;
 		const connection = this.agentConnection;
 		const sessionId = this.connectionState?.sessionId;
 		const stats = await connection?.getSessionStats?.().catch(() => undefined);
 		if (!stats) return;
 		// Drop results superseded by a newer successful refresh as well as results for a replaced session.
 		if (
-			requestGeneration < this.contextUsageRefreshResultGeneration ||
+			generation < this.contextUsageRefresh.lastSuccessGeneration ||
 			this.agentConnection !== connection ||
 			this.connectionState?.sessionId !== sessionId
 		) {
 			return;
 		}
-		this.contextUsageRefreshResultGeneration = requestGeneration;
+		this.contextUsageRefresh.lastSuccessGeneration = generation;
 		// Anything counted so far is now reflected in the snapshot; only later output is in-flight.
 		this.contextUsageTokenBaseline = this.activityTracker.getStatus().tokens;
 		this.patchConnectionState({ contextUsage: stats.contextUsage });

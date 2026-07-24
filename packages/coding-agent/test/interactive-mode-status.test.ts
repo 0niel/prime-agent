@@ -3689,8 +3689,7 @@ describe("InteractiveMode live context usage", () => {
 		connectionState: { sessionId?: string; contextUsage?: unknown };
 		activityTracker: { getStatus(): { tokens: number } };
 		contextUsageTokenBaseline: number;
-		contextUsageRefreshRequestGeneration: number;
-		contextUsageRefreshResultGeneration: number;
+		contextUsageRefresh: { generation: number; lastSuccessGeneration: number };
 		patchConnectionState(patch: Record<string, unknown>): void;
 		refreshConnectionContextUsage(): Promise<void>;
 	};
@@ -3705,8 +3704,7 @@ describe("InteractiveMode live context usage", () => {
 		fakeThis.patched = [];
 		fakeThis.activityTracker = { getStatus: () => ({ tokens: 0 }) };
 		fakeThis.contextUsageTokenBaseline = 0;
-		fakeThis.contextUsageRefreshRequestGeneration = 0;
-		fakeThis.contextUsageRefreshResultGeneration = 0;
+		fakeThis.contextUsageRefresh = { generation: 0, lastSuccessGeneration: 0 };
 		fakeThis.connectionState = { sessionId: "session-A", contextUsage: undefined };
 		fakeThis.patchConnectionState = (patch) => fakeThis.patched.push(patch);
 		fakeThis.agentConnection = { getSessionStats };

@@ -1609,32 +1609,28 @@ export class SessionManager {
 	}
 
 	/**
-	 * Append a custom message atomically with respect to in-memory session state.
-	 * Intended for best-effort records whose failed persistence must not leave an
-	 * unsaved leaf that later entries can attach to.
+	 * Append a custom message, undoing the append if persistence fails so a
+	 * best-effort record never leaves an unsaved leaf for later entries.
 	 */
-	appendCustomMessageEntryTransactional<T = unknown>(
+	appendCustomMessageEntryWithRollback<T = unknown>(
 		customType: string,
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
 	): string {
-		const previousFileEntries = this.fileEntries;
-		const previousById = this.byId;
 		const previousLeafId = this.leafId;
-
-		// Isolate all append mutations so a failure can restore the exact prior objects.
-		this.fileEntries = [...previousFileEntries];
-		this.byId = new Map(previousById);
 		try {
 			return this.appendCustomMessageEntry(customType, content, display, details);
 		} catch (error) {
-			this.fileEntries = previousFileEntries;
-			this.byId = previousById;
-			this.leafId = previousLeafId;
-			// A failed append may have partially changed the file. Force the next
-			// persisted entry to rewrite the restored state before it is appended.
-			this.flushed = false;
+			// The append indexes the entry before persisting it; undo exactly that.
+			if (this.leafId !== null && this.leafId !== previousLeafId) {
+				this.byId.delete(this.leafId);
+				this.fileEntries.pop();
+				this.leafId = previousLeafId;
+				// The failed append may have partially changed the file. Force the next
+				// persisted entry to rewrite the restored state before it is appended.
+				this.flushed = false;
+			}
 			throw error;
 		}
 	}

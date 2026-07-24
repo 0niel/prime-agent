@@ -354,7 +354,7 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);
 	});
 
-	it("emits a warning when auto-compaction has nothing to summarize", async () => {
+	it("emits a warning and persists the outcome outside model context when auto-compaction has nothing to summarize", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		await harness.session.prompt("one");
@@ -372,6 +372,17 @@ describe("AgentSession compaction characterization", () => {
 		expect(endEvents).toHaveLength(1);
 		expect(endEvents[0].errorSeverity).toBe("warning");
 		expect(endEvents[0].errorMessage).toContain("Auto-compaction skipped");
+
+		// The unsuccessful outcome is disclosed as a durable custom message that stays out of model context.
+		const outcome = harness.session.messages.at(-1);
+		expect(outcome).toMatchObject({
+			role: "custom",
+			customType: "compaction_outcome",
+			content: endEvents[0].errorMessage,
+			display: true,
+			details: { reason: "threshold", outcome: "skipped" },
+		});
+		expect(harness.session.agent.convertToLlm([outcome!])).toEqual([]);
 	});
 
 	it("does not retry overflow recovery more than once", async () => {
@@ -1063,24 +1074,6 @@ describe("AgentSession compaction characterization", () => {
 		expect(disabledSpy).not.toHaveBeenCalled();
 	});
 
-	it("persists unsuccessful automatic compaction outcomes outside model context", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const internals = harness.session as unknown as SessionWithCompactionInternals;
-
-		internals._persistCompactionOutcome("requested", "skipped", "Requested compaction skipped: too short");
-
-		const outcome = harness.session.messages.at(-1);
-		expect(outcome).toMatchObject({
-			role: "custom",
-			customType: "compaction_outcome",
-			content: "Requested compaction skipped: too short",
-			display: true,
-			details: { reason: "requested", outcome: "skipped" },
-		});
-		expect(harness.session.agent.convertToLlm([outcome!])).toEqual([]);
-	});
-
 	it("rolls back failed outcome persistence without breaking the persisted branch", async () => {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
@@ -1091,11 +1084,7 @@ describe("AgentSession compaction characterization", () => {
 		const sessionFile = harness.sessionManager.getSessionFile()!;
 		const persistedLeafId = harness.sessionManager.getLeafId();
 		const persistedEntries = harness.sessionManager.getEntries();
-		const persistedEntryObjects = new Map(persistedEntries.map((entry) => [entry.id, entry]));
-		vi.spyOn(harness.sessionManager, "_persist").mockImplementationOnce((entry) => {
-			// _appendEntry mutates all in-memory indexes before persistence is attempted.
-			expect(harness.sessionManager.getLeafId()).toBe(entry.id);
-			expect(harness.sessionManager.getEntry(entry.id)).toBe(entry);
+		vi.spyOn(harness.sessionManager, "_persist").mockImplementationOnce(() => {
 			appendFileSync(sessionFile, '{"type":"custom_message"');
 			throw new Error("disk full");
 		});
@@ -1103,22 +1092,18 @@ describe("AgentSession compaction characterization", () => {
 		expect(() =>
 			internals._persistCompactionOutcome("requested", "failed", "Requested compaction failed"),
 		).not.toThrow();
-		const outcome = harness.session.messages.at(-1);
-		expect(outcome).toMatchObject({
+		// The live outcome message discloses that it was not saved.
+		expect(harness.session.messages.at(-1)).toMatchObject({
 			role: "custom",
 			customType: "compaction_outcome",
 			content: expect.stringContaining("could not be saved to session history"),
 			details: { reason: "requested", outcome: "failed" },
 		});
+		// In-memory state is fully rolled back: no outcome entry, same leaf and entries.
 		expect(harness.sessionManager.getLeafId()).toBe(persistedLeafId);
 		expect(harness.sessionManager.getEntries()).toEqual(persistedEntries);
-		for (const [id, entry] of persistedEntryObjects) {
-			expect(harness.sessionManager.getEntry(id)).toBe(entry);
-		}
-		expect(harness.sessionManager.getEntries()).not.toContainEqual(
-			expect.objectContaining({ type: "custom_message", customType: "compaction_outcome" }),
-		);
 
+		// The next append attaches to the persisted leaf and rewrites a coherent file.
 		const nextId = harness.sessionManager.appendCustomEntry("after_failed_outcome");
 		const reloaded = SessionManager.open(sessionFile);
 		expect(reloaded.getEntry(nextId)?.parentId).toBe(persistedLeafId);

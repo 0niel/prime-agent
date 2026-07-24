@@ -5,37 +5,44 @@ import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
+const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
+	this: unknown,
+	event: Record<string, unknown>,
+) => Promise<void>;
+
+function createFakeThis(overrides: Record<string, unknown> = {}) {
+	return {
+		isInitialized: true,
+		footer: { invalidate: vi.fn() },
+		updateConnectionStateFromEvent: vi.fn(),
+		activityTracker: new AgentActivityTracker(),
+		updateWorkingLoaderMessage: vi.fn(),
+		autoCompactionLoader: undefined,
+		retryLoader: undefined,
+		workingVisible: true,
+		stopWorkingLoader: vi.fn(),
+		syncWorkingLoader: vi.fn(),
+		defaultEditor: {},
+		statusContainer: { clear: vi.fn() },
+		chatContainer: { clear: vi.fn() },
+		rebuildChatFromMessages: vi.fn().mockResolvedValue(undefined),
+		addMessageToChat: vi.fn(),
+		refreshConnectionContextUsage: vi.fn().mockResolvedValue(undefined),
+		showError: vi.fn(),
+		showWarning: vi.fn(),
+		showStatus: vi.fn(),
+		settingsManager: { getShowTerminalProgress: () => false },
+		ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
+		...overrides,
+	};
+}
+
 describe("InteractiveMode compaction events", () => {
 	beforeAll(() => initTheme("dark"));
+
 	test("shows an automatic compaction loader for the full operation", async () => {
 		const statusContainer = new Container();
-		const fakeThis = {
-			isInitialized: true,
-			footer: { invalidate: vi.fn() },
-			updateConnectionStateFromEvent: vi.fn(),
-			activityTracker: new AgentActivityTracker(),
-			updateWorkingLoaderMessage: vi.fn(),
-			autoCompactionLoader: undefined,
-			retryLoader: undefined,
-			workingVisible: true,
-			stopWorkingLoader: vi.fn(),
-			syncWorkingLoader: vi.fn(),
-			statusContainer,
-			settingsManager: { getShowTerminalProgress: () => false },
-			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
-		};
-		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
-			this: typeof fakeThis,
-			event:
-				| { type: "compaction_start"; reason: "threshold"; customInstructions?: string }
-				| {
-						type: "compaction_end";
-						reason: "threshold";
-						result: undefined;
-						aborted: true;
-						willRetry: false;
-				  },
-		) => Promise<void>;
+		const fakeThis = createFakeThis({ statusContainer });
 
 		await handleEvent.call(fakeThis, { type: "compaction_start", reason: "threshold" });
 
@@ -52,96 +59,33 @@ describe("InteractiveMode compaction events", () => {
 		expect(statusContainer.children).toHaveLength(0);
 	});
 
-	test("rebuilds successful compaction from its single persisted summary", async () => {
-		const fakeThis = {
-			isInitialized: true,
-			footer: { invalidate: vi.fn() },
-			updateConnectionStateFromEvent: vi.fn(),
-			activityTracker: new AgentActivityTracker(),
-			updateWorkingLoaderMessage: vi.fn(),
-			autoCompactionLoader: undefined,
-			retryLoader: undefined,
-			syncWorkingLoader: vi.fn(),
-			defaultEditor: {},
-			statusContainer: { clear: vi.fn() },
-			chatContainer: { clear: vi.fn() },
-			rebuildChatFromMessages: vi.fn().mockResolvedValue(undefined),
-			addMessageToChat: vi.fn(),
-			refreshConnectionContextUsage: vi.fn().mockResolvedValue(undefined),
-			showError: vi.fn(),
-			showWarning: vi.fn(),
-			showStatus: vi.fn(),
-			settingsManager: { getShowTerminalProgress: () => false },
-			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
-		};
-		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
-			this: typeof fakeThis,
-			event: {
-				type: "compaction_end";
-				reason: "manual" | "requested" | "threshold" | "overflow";
-				result: { tokensBefore: number; summary: string } | undefined;
-				aborted: boolean;
-				willRetry: boolean;
-				errorMessage?: string;
-				errorSeverity?: "warning" | "error";
-			},
-		) => Promise<void>;
-
-		await handleEvent.call(fakeThis, {
-			type: "compaction_end",
-			reason: "requested",
-			result: { tokensBefore: 123, summary: "summary" },
-			aborted: false,
-			willRetry: false,
-		});
-
-		expect(fakeThis.rebuildChatFromMessages).toHaveBeenCalledOnce();
-		expect(fakeThis.chatContainer.clear).toHaveBeenCalledOnce();
-		expect(fakeThis.addMessageToChat).not.toHaveBeenCalled();
-	});
-
-	test("clears stale chat and reports a failed post-compaction refresh", async () => {
-		const fakeThis = {
-			isInitialized: true,
-			footer: { invalidate: vi.fn() },
-			updateConnectionStateFromEvent: vi.fn(),
-			activityTracker: new AgentActivityTracker(),
-			updateWorkingLoaderMessage: vi.fn(),
-			autoCompactionLoader: undefined,
-			retryLoader: undefined,
-			syncWorkingLoader: vi.fn(),
-			defaultEditor: {},
-			statusContainer: { clear: vi.fn() },
-			chatContainer: { clear: vi.fn() },
-			rebuildChatFromMessages: vi.fn().mockRejectedValue(new Error("context unavailable")),
-			refreshConnectionContextUsage: vi.fn().mockResolvedValue(undefined),
-			showError: vi.fn(),
-			showWarning: vi.fn(),
-			settingsManager: { getShowTerminalProgress: () => false },
-			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
-		};
-		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
-			this: typeof fakeThis,
-			event: {
-				type: "compaction_end";
-				reason: "requested";
-				result: { tokensBefore: number; summary: string };
-				aborted: false;
-				willRetry: false;
-			},
-		) => Promise<void>;
-
-		await handleEvent.call(fakeThis, {
-			type: "compaction_end",
-			reason: "requested",
-			result: { tokensBefore: 123, summary: "summary" },
-			aborted: false,
-			willRetry: false,
-		});
-
-		expect(fakeThis.chatContainer.clear).toHaveBeenCalledOnce();
-		expect(fakeThis.showError).toHaveBeenCalledWith(
-			"Compaction succeeded, but the transcript could not be refreshed: context unavailable",
+	test.each([
+		{ name: "rebuilds successful compaction from its single persisted summary", refresh: "succeeds" },
+		{ name: "clears stale chat and reports a failed post-compaction refresh", refresh: "fails" },
+	] as const)("$name", async ({ refresh }) => {
+		const fakeThis = createFakeThis(
+			refresh === "fails"
+				? { rebuildChatFromMessages: vi.fn().mockRejectedValue(new Error("context unavailable")) }
+				: {},
 		);
+
+		await handleEvent.call(fakeThis, {
+			type: "compaction_end",
+			reason: "requested",
+			result: { tokensBefore: 123, summary: "summary" },
+			aborted: false,
+			willRetry: false,
+		});
+
+		expect(fakeThis.chatContainer.clear).toHaveBeenCalledOnce();
+		expect(fakeThis.rebuildChatFromMessages).toHaveBeenCalledOnce();
+		expect(fakeThis.addMessageToChat).not.toHaveBeenCalled();
+		if (refresh === "fails") {
+			expect(fakeThis.showError).toHaveBeenCalledWith(
+				"Compaction succeeded, but the transcript could not be refreshed: context unavailable",
+			);
+		} else {
+			expect(fakeThis.showError).not.toHaveBeenCalled();
+		}
 	});
 });

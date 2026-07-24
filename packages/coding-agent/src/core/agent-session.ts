@@ -1051,8 +1051,8 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _compactionOperation: Promise<void> | undefined = undefined;
-	private _overflowRecoveryAttempted = false;
-	private _overflowRecoveryFailureReported = false;
+	/** One recovery attempt per overflow; "reported" dedups the failure notice. */
+	private _overflowRecovery: "idle" | "attempted" | "reported" = "idle";
 	private _continueAfterThresholdCompaction = false;
 	private _pendingRequestedCompaction: { customInstructions?: string } | undefined;
 	private _pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
@@ -3186,8 +3186,7 @@ export class AgentSession {
 		}
 
 		if (event.type === "message_start" && this._isPromptTurnStartMessage(event.message)) {
-			this._overflowRecoveryAttempted = false;
-			this._overflowRecoveryFailureReported = false;
+			this._overflowRecovery = "idle";
 		}
 		}
 
@@ -3248,8 +3247,7 @@ export class AgentSession {
 					this._maybeStartSerializedBackgroundPlan();
 				}
 				if (assistantMsg.stopReason !== "error") {
-					this._overflowRecoveryAttempted = false;
-					this._overflowRecoveryFailureReported = false;
+					this._overflowRecovery = "idle";
 				}
 				if (this._isConcreteProviderAuthFailure(assistantMsg)) {
 					this._captureRetryAuthFailureSource(assistantMsg);
@@ -7277,25 +7275,19 @@ export class AgentSession {
 			sameModel &&
 			isContextOverflow(assistantMessage, contextWindow)
 		) {
-			if (this._overflowRecoveryAttempted) {
-				if (!this._overflowRecoveryFailureReported) {
-					this._overflowRecoveryFailureReported = true;
-					const message =
-						"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.";
-					this._emit({
-						type: "compaction_end",
-						reason: "overflow",
-						result: undefined,
-						aborted: false,
-						willRetry: false,
-						errorMessage: message,
-					});
-					this._persistCompactionOutcome("overflow", "failed", message);
+			if (this._overflowRecovery !== "idle") {
+				if (this._overflowRecovery === "attempted") {
+					this._overflowRecovery = "reported";
+					this._endCompactionUnsuccessfully(
+						"overflow",
+						"failed",
+						"Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.",
+					);
 				}
 				return false;
 			}
 
-			this._overflowRecoveryAttempted = true;
+			this._overflowRecovery = "attempted";
 			// Remove the error message from agent state (it IS saved to session for history,
 			// but we don't want it in context for the retry)
 			const messages = this.agent.state.messages;
@@ -7333,6 +7325,27 @@ export class AgentSession {
 	 * Internal: Run automatic (threshold/overflow) or model-requested compaction
 	 * with events.
 	 */
+	/** Emit an unsuccessful compaction_end and durably record the outcome. */
+	private _endCompactionUnsuccessfully(
+		reason: CompactionOutcomeReason,
+		outcome: CompactionOutcome,
+		message: string,
+		options: { aborted?: boolean; errorSeverity?: "warning" | "error"; customInstructions?: string } = {},
+	): void {
+		this._emit({
+			type: "compaction_end",
+			reason,
+			result: undefined,
+			aborted: options.aborted ?? false,
+			willRetry: false,
+			// Aborts are user-initiated; they carry no error message on the event.
+			errorMessage: options.aborted ? undefined : message,
+			errorSeverity: options.errorSeverity,
+			customInstructions: options.customInstructions,
+		});
+		this._persistCompactionOutcome(reason, outcome, message);
+	}
+
 	private _persistCompactionOutcome(
 		reason: CompactionOutcomeReason,
 		outcome: CompactionOutcome,
@@ -7340,7 +7353,7 @@ export class AgentSession {
 	): void {
 		let outcomeMessage = createCompactionOutcomeMessage(message, { reason, outcome });
 		try {
-			this.sessionManager.appendCustomMessageEntryTransactional(
+			this.sessionManager.appendCustomMessageEntryWithRollback(
 				outcomeMessage.customType,
 				outcomeMessage.content,
 				outcomeMessage.display,
@@ -7386,37 +7399,15 @@ export class AgentSession {
 		this._autoCompactionAbortController = new AbortController();
 
 		try {
-			if (!this.model) {
-				const message = "Compaction failed: no model is selected";
-				this._emit({
-					type: "compaction_end",
-					reason,
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					errorMessage: message,
-				});
-				this._persistCompactionOutcome(reason, "failed", message);
-				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
-					reason === "threshold" && shouldContinueAfterCompaction,
-					queuedAutonomousContinuationsForThisCompaction,
-				);
-				resumeAfterFailure();
-				return false;
-			}
-
-			const authResult = await this._modelRegistry.getApiKeyAndHeaders(this.model);
-			if (!authResult.ok || !authResult.apiKey) {
-				const message = `Compaction failed: ${authResult.ok ? "no API key is available" : authResult.error}`;
-				this._emit({
-					type: "compaction_end",
-					reason,
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					errorMessage: message,
-				});
-				this._persistCompactionOutcome(reason, "failed", message);
+			const authResult = this.model ? await this._modelRegistry.getApiKeyAndHeaders(this.model) : undefined;
+			if (!this.model || !authResult || !authResult.ok || !authResult.apiKey) {
+				const detail =
+					!this.model || !authResult
+						? "no model is selected"
+						: authResult.ok
+							? "no API key is available"
+							: authResult.error;
+				this._endCompactionUnsuccessfully(reason, "failed", `Compaction failed: ${detail}`);
 				this._clearQueuedAutonomousContinuationsAfterSkippedThresholdCompaction(
 					reason === "threshold" && shouldContinueAfterCompaction,
 					queuedAutonomousContinuationsForThisCompaction,
@@ -7465,56 +7456,36 @@ export class AgentSession {
 			const aborted =
 				errorMessage === "Compaction cancelled" || (error instanceof Error && error.name === "AbortError");
 			if (aborted) {
-				this._emit({
-					type: "compaction_end",
-					reason,
-					result: undefined,
-					aborted: true,
-					willRetry: false,
-					customInstructions,
-				});
-				this._persistCompactionOutcome(
+				this._endCompactionUnsuccessfully(
 					reason,
 					"cancelled",
 					`${reason === "requested" ? "Requested c" : "C"}ompaction cancelled`,
+					{ aborted: true, customInstructions },
 				);
 				return false;
 			}
 			if (error instanceof CompactionSkippedError) {
-				const message =
+				this._endCompactionUnsuccessfully(
+					reason,
+					"skipped",
 					reason === "requested"
 						? `Requested compaction skipped: ${errorMessage}`
-						: `Auto-compaction skipped: ${errorMessage}`;
-				this._emit({
-					type: "compaction_end",
-					reason,
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					errorMessage: message,
-					errorSeverity: "warning",
-					customInstructions,
-				});
-				this._persistCompactionOutcome(reason, "skipped", message);
+						: `Auto-compaction skipped: ${errorMessage}`,
+					{ errorSeverity: "warning", customInstructions },
+				);
 				resumeAfterFailure();
 				return false;
 			}
-			const message =
+			this._endCompactionUnsuccessfully(
+				reason,
+				"failed",
 				reason === "overflow"
 					? `Context overflow recovery failed: ${errorMessage}`
 					: reason === "requested"
 						? `Requested compaction failed: ${errorMessage}`
-						: `Auto-compaction failed: ${errorMessage}`;
-			this._emit({
-				type: "compaction_end",
-				reason,
-				result: undefined,
-				aborted: false,
-				willRetry: false,
-				errorMessage: message,
-				customInstructions,
-			});
-			this._persistCompactionOutcome(reason, "failed", message);
+						: `Auto-compaction failed: ${errorMessage}`,
+				{ customInstructions },
+			);
 			resumeAfterFailure();
 			return false;
 		} finally {
