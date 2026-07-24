@@ -740,6 +740,17 @@ function getSessionStatusLabel(summary: SessionSummary, hasActiveHeartbeat = sum
 	if (summary.isStreaming) {
 		return summary.isRunningTools ? "running tools" : "thinking";
 	}
+	// These classify the session as Running (isAgentsViewSessionBusy); the label
+	// must agree with the section instead of claiming the session needs input.
+	if (summary.isRunningTools === true) {
+		return "running tools";
+	}
+	if (summary.isBashRunning === true) {
+		return "running bash";
+	}
+	if (summary.hasRunningRlmChildren === true) {
+		return "subagents running";
+	}
 	if (summary.pendingMessageCount > 0) {
 		return `${summary.pendingMessageCount} queued`;
 	}

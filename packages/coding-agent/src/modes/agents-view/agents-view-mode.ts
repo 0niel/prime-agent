@@ -375,15 +375,19 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 			try {
 				const interactiveResult = await interactiveMode.run();
 				const source = interactiveResult.source;
-				persistentState.selectedRowIdentity = source.sessionFile
-					? `file:${resolvePath(canonicalizePath(source.sessionFile))}`
-					: source.activeSessionId
-						? `active:${source.activeSessionId}`
-						: `session:${source.sessionId}`;
-				persistentState.selectedSessionKey = {
-					sessionId: source.sessionId,
-					activeSessionId: source.activeSessionId,
-				};
+				// A subagent selection was recorded before the chat opened; keep it so
+				// the view reselects the subagent instead of its root session.
+				if (!result.subagent) {
+					persistentState.selectedRowIdentity = source.sessionFile
+						? `file:${resolvePath(canonicalizePath(source.sessionFile))}`
+						: source.activeSessionId
+							? `active:${source.activeSessionId}`
+							: `session:${source.sessionId}`;
+					persistentState.selectedSessionKey = {
+						sessionId: source.sessionId,
+						activeSessionId: source.activeSessionId,
+					};
+				}
 				persistentState.backSession = {
 					...opened.summary,
 					...source,
@@ -1284,9 +1288,7 @@ export class AgentsViewMode implements Component, Focusable {
 				this.refreshSessions({ preserveStatusOnError: true }),
 				this.refreshSavedSessions({ preserveStatusOnError: true }),
 			]);
-			this.setStatusMessage(refreshed.every(Boolean) ? `Renamed to ${name}` : `Renamed to ${name}; refresh failed`, {
-				render: false,
-			});
+			this.setStatusMessage(refreshed.every(Boolean) ? `Renamed to ${name}` : `Renamed to ${name}; refresh failed`);
 		} catch (error) {
 			this.setStatusMessage(
 				isUnknownDaemonCommandError(error, "rename")
@@ -1390,7 +1392,7 @@ export class AgentsViewMode implements Component, Focusable {
 						this.pendingDeleteAgent = undefined;
 						const refreshed = await this.refreshSavedSessions({ preserveStatusOnError: true });
 						const success = result.method === "trash" ? "Session moved to trash" : "Session deleted";
-						this.setStatusMessage(refreshed ? success : `${success}; refresh failed`, { render: false });
+						this.setStatusMessage(refreshed ? success : `${success}; refresh failed`);
 						return;
 					}
 					const latest = expectSessionList(
@@ -1418,7 +1420,7 @@ export class AgentsViewMode implements Component, Focusable {
 					this.pendingDeleteAgent = undefined;
 					const refreshed = await this.refreshSavedSessions({ preserveStatusOnError: true });
 					const success = result.method === "trash" ? "Session moved to trash" : "Session deleted";
-					this.setStatusMessage(refreshed ? success : `${success}; refresh failed`, { render: false });
+					this.setStatusMessage(refreshed ? success : `${success}; refresh failed`);
 				} catch (error) {
 					this.setStatusMessage(formatError("Failed to delete session", error));
 				}

@@ -863,7 +863,7 @@ export interface InteractiveModeRunResult {
 	source: Pick<AgentConnectionState, "activeSessionId" | "sessionFile" | "sessionId" | "sessionName" | "cwd">;
 }
 
-type LocalSessionViewResult = { type: "exit" } | { type: "cancelled" } | { type: "opened" };
+type LocalSessionViewResult = { type: "exit" } | { type: "opened" };
 
 export class InteractiveMode {
 	private static readonly EXIT_HINT_DURATION_MS = 2000;
@@ -6985,7 +6985,8 @@ export class InteractiveMode {
 
 	private async requestAgentsView(): Promise<void> {
 		if (!this.options.returnToAgentsView) {
-			await this.showLocalSessionView();
+			const result = await this.showLocalSessionView();
+			if (result.type === "exit") await this.shutdown();
 			return;
 		}
 		if (this.editor.getText().length > 0) {
@@ -8426,7 +8427,9 @@ export class InteractiveMode {
 		}
 		if (result.type === "exit") return { type: "exit" };
 		const opened = await adapter.open(result.summary);
-		return opened.cancelled ? { type: "cancelled" } : { type: "opened" };
+		// A cancelled open (e.g. dismissing the missing-cwd prompt) returns to the
+		// view instead of falling through into whatever chat happens to be current.
+		return opened.cancelled ? this.showLocalSessionView() : { type: "opened" };
 	}
 
 	private async handleResumeSession(
