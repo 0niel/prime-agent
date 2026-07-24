@@ -4625,6 +4625,8 @@ export class AgentDaemon {
 			await this.mutationDrain.waitForDrain(0, transaction.abort.signal, "Update restart preparation cancelled");
 			this.assertUpdateRestartNotCancelled(transaction);
 			transaction.phase = "fencing";
+			await this.mutationDrain.waitForDrain(0, transaction.abort.signal, "Update restart preparation cancelled");
+			this.assertUpdateRestartNotCancelled(transaction);
 			const manifest = await this.prepareUpdateRestartCheckpoint(transaction);
 			this.assertUpdateRestartNotCancelled(transaction);
 			transaction.manifest = manifest;

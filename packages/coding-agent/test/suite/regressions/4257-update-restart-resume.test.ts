@@ -11,8 +11,10 @@ import type { BashOperations } from "../../../src/core/tools/bash.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../../../src/modes/daemon/daemon-mode.js";
 import type { DaemonUpdateRestartManifest } from "../../../src/modes/daemon/daemon-protocol.js";
+import { MutationDrainLatch } from "../../../src/modes/daemon/mutation-drain-latch.js";
 import { prepareDaemonUpdateRestart } from "../../../src/package-manager-cli.js";
 import { createHarness, getMessageText, getUserTexts, type Harness } from "../harness.js";
+import { createDeferred } from "../scheduling.js";
 
 type AgentDaemonUpdateInternals = {
 	sessions: Map<string, ActiveSessionState>;
@@ -20,13 +22,19 @@ type AgentDaemonUpdateInternals = {
 	cronScheduler: AgentCronScheduler;
 	runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
 	prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest>;
+	runUpdateRestartPreparation(
+		transaction: NonNullable<AgentDaemonUpdateInternals["updateRestart"]>,
+	): Promise<DaemonUpdateRestartManifest>;
+	prepareUpdateRestartCheckpoint(
+		transaction: NonNullable<AgentDaemonUpdateInternals["updateRestart"]>,
+	): Promise<DaemonUpdateRestartManifest>;
 	handleLine(client: DaemonSocketClient, line: string): Promise<void>;
 	handleWorkerCommand(client: DaemonSocketClient, command: { id: string; type: string }): Promise<void>;
 	mutationDrain: { begin(): void; end(): void };
 	updateRestart?: {
 		id: symbol;
 		abort: AbortController;
-		phase: "preparing" | "prepared" | "publishing";
+		phase: "preparing" | "fencing" | "prepared" | "publishing";
 		manifest?: DaemonUpdateRestartManifest;
 	};
 	cancelPreparedUpdateRestart(transactionId?: symbol): void;
@@ -293,6 +301,42 @@ describe("issue #4257 update restart resume", () => {
 		internals.mutationDrain.end();
 		await prepare;
 		expect(settled).toBe(true);
+	});
+
+	it("fences and drains a mutation admitted at the first drain boundary before checkpointing", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = createDaemonInternals(harness);
+		const mutationDrain = new MutationDrainLatch();
+		const transaction = {
+			id: Symbol("update-restart"),
+			abort: new AbortController(),
+			phase: "preparing" as const,
+		};
+		internals.updateRestart = transaction;
+		const firstDrain = createDeferred();
+		const originalWaitForDrain = mutationDrain.waitForDrain.bind(mutationDrain);
+		vi.spyOn(mutationDrain, "waitForDrain").mockImplementationOnce(async (...args) => {
+			await originalWaitForDrain(...args);
+			mutationDrain.begin();
+			firstDrain.resolve();
+		});
+		Reflect.set(internals, "mutationDrain", mutationDrain);
+		const checkpoint = vi.spyOn(internals, "prepareUpdateRestartCheckpoint").mockResolvedValue({
+			createdAt: "now",
+			sessions: [],
+		});
+
+		const prepare = internals.runUpdateRestartPreparation(transaction);
+		await firstDrain.promise;
+		await Promise.resolve();
+
+		expect(internals.updateRestart?.phase).toBe("fencing");
+		expect(checkpoint).not.toHaveBeenCalled();
+
+		mutationDrain.end();
+		await prepare;
+		expect(checkpoint).toHaveBeenCalledOnce();
 	});
 
 	it("waits for an already-claimed one-shot dispatch and runs it exactly once", async () => {

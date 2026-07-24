@@ -18,6 +18,7 @@ import {
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	type DaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
+import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
 import type { PrivateFrame } from "../src/modes/session-worker/private-framing.js";
 import { createDeferred } from "./suite/scheduling.js";
@@ -1807,6 +1808,39 @@ describe("daemon worker supervisor monitoring", () => {
 		await expect(supervisor.prepareUpdateRestartFenced()).resolves.toMatchObject({
 			discardedActiveSessionIds: ["root"],
 		});
+	});
+
+	it("fences and drains a mutation admitted at the first drain boundary before worker prepare", async () => {
+		const mutationDrain = new MutationDrainLatch();
+		const firstDrain = createDeferred();
+		const originalWaitForDrain = mutationDrain.waitForDrain.bind(mutationDrain);
+		vi.spyOn(mutationDrain, "waitForDrain").mockImplementationOnce(async (...args) => {
+			await originalWaitForDrain(...args);
+			mutationDrain.begin();
+			firstDrain.resolve();
+		});
+		mutationDrain.begin(); // The prepare command itself remains in flight at the supervisor boundary.
+		const prepareFenced = vi.fn(async () => ({ createdAt: "now", sessions: [] }));
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			mutationDrain,
+			workers: new Map(),
+			prepareUpdateRestartFenced: prepareFenced,
+		}) as {
+			updateRestartPhase?: "draining" | "fencing" | "prepared";
+			prepareUpdateRestart(): Promise<unknown>;
+		};
+
+		const prepare = supervisor.prepareUpdateRestart();
+		await firstDrain.promise;
+		await Promise.resolve();
+
+		expect(supervisor.updateRestartPhase).toBe("fencing");
+		expect(prepareFenced).not.toHaveBeenCalled();
+
+		mutationDrain.end();
+		await prepare;
+		expect(prepareFenced).toHaveBeenCalledOnce();
+		mutationDrain.end();
 	});
 
 	it("limits abort admission to mutation drain", async () => {

@@ -3782,6 +3782,7 @@ export class DaemonSupervisor {
 			const abort = AbortSignal.timeout(Math.min(UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS, deadline - Date.now()));
 			await this.mutationDrain.waitForDrain(1, abort, "Timed out draining daemon mutations for update restart");
 			this.updateRestartPhase = "fencing";
+			await this.mutationDrain.waitForDrain(1, abort, "Timed out draining daemon mutations for update restart");
 			const manifest = await this.prepareUpdateRestartFenced(deadline);
 			this.updateRestartPhase = "prepared";
 			return manifest;
