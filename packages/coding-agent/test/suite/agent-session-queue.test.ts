@@ -2238,7 +2238,6 @@ prepared:${event.prompt}`,
 	});
 
 	it("resolves queued, direct, and late agent-message delivery waiters once prompts start", async () => {
-
 		const blocked = createDeferred();
 		const harness = await createHarness({
 			extensionFactories: [
