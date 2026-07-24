@@ -1292,6 +1292,35 @@ stale post-hook extension instructions`,
 		expect(getAssistantTexts(harness)).toEqual(["first done", "second done"]);
 	});
 
+	it("drops generated prompt-wait outcome entries after completion", async () => {
+		let releaseFirst: (() => void) | undefined;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			async () => {
+				await firstGate;
+				return fauxAssistantMessage("first done");
+			},
+			fauxAssistantMessage("second done"),
+		]);
+		const internals = harness.session as unknown as { _agentMessageOutcomes: Map<string, unknown> };
+
+		const first = harness.session.prompt("first");
+		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+		// Queued delivery settles the sticky delivered flag; a generated id must
+		// still be dropped after completion or long-lived daemons grow one outcome
+		// entry per prompt.
+		const queued = harness.session.promptAndWait("second", { streamingBehavior: "followUp", queueIfBusy: true });
+		releaseFirst?.();
+		await Promise.all([first, queued]);
+
+		const keys = [...internals._agentMessageOutcomes.keys()];
+		expect(keys.filter((key) => key.startsWith("prompt-wait:"))).toEqual([]);
+	});
+
 	it("handles tab-separated autonomous slash commands when template expansion is disabled", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

@@ -3987,6 +3987,7 @@ export class AgentSession {
 	}
 
 	async promptAndWait(text: string, options?: PromptOptions): Promise<void> {
+		const internalId = options?.agentMessageId === undefined;
 		const agentMessageId = options?.agentMessageId ?? `prompt-wait:${randomUUID()}`;
 		if (this._agentMessageOutcomes.get(agentMessageId)?.completion) {
 			throw new Error(`Prompt completion id is already in use: ${agentMessageId}`);
@@ -4000,6 +4001,10 @@ export class AgentSession {
 		} catch (error) {
 			this._settleAgentMessage(agentMessageId, "completion", this._asError(error));
 			throw error;
+		} finally {
+			// A generated id has no late waiters; drop its sticky delivery record so
+			// long-lived sessions do not grow one outcome entry per prompt.
+			if (internalId) this._agentMessageOutcomes.delete(agentMessageId);
 		}
 	}
 
