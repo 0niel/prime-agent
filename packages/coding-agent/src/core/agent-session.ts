@@ -4957,6 +4957,18 @@ export class AgentSession {
 		}
 		if (prompts.length === 0) return;
 
+		// Re-check adjacent to the handoff: background refine planning may have
+		// completed and entered _applyRefine during the awaits above,
+		// disconnecting event handling. Wait for it to finish so the new
+		// turn's events are not lost.
+		await this._waitForRefineIdle();
+		if (this._isSessionInputHandoffDeferred(epoch)) {
+			throw new DeferredSessionInputError("Session input paused before handoff");
+		}
+		// Assemble the handoff snapshot only after the last await: a clear that runs
+		// during the waits above must still be able to remove prompts from
+		// active.items before they are captured for agent.prompt().
+		if (prompts.length === 0) return;
 		const messages: AgentMessage[] = [];
 		const nextTurnMessages = this._pendingNextTurnMessages;
 		this._pendingNextTurnMessages = [];
@@ -4968,14 +4980,6 @@ export class AgentSession {
 		const preparation = prompts[0]?.preparation;
 		const result = preparation?.result;
 		this._appendBeforeAgentStartMessages(messages, result);
-		// Re-check adjacent to the handoff: background refine planning may have
-		// completed and entered _applyRefine during the awaits above,
-		// disconnecting event handling. Wait for it to finish so the new
-		// turn's events are not lost.
-		await this._waitForRefineIdle();
-		if (this._isSessionInputHandoffDeferred(epoch)) {
-			throw new DeferredSessionInputError("Session input paused before handoff");
-		}
 		// The base prompt may have changed (e.g. refine) since preparation; splice the
 		// current base into an extension-modified prompt exactly like the direct path.
 		this.agent.state.systemPrompt =

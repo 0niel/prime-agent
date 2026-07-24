@@ -1447,6 +1447,50 @@ prepared:${event.prompt}`,
 		expect(getUserTexts(harness)).toEqual(["ordinary", keptAgentMessage]);
 	});
 
+	it("keeps cleared prompts out of the handoff snapshot during the refine wait", async () => {
+		let sessionInternals: { _refineInFlight?: Promise<void> };
+		let clearDuringRefineWait: (() => void) | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async () => {
+						// Stall the pre-handoff refine wait and clear the queued agent
+						// message inside that window; the handoff snapshot must not
+						// deliver it.
+						let releaseRefine: (() => void) | undefined;
+						sessionInternals._refineInFlight = new Promise<void>((resolve) => {
+							releaseRefine = resolve;
+						});
+						setTimeout(() => {
+							clearDuringRefineWait?.();
+							sessionInternals._refineInFlight = undefined;
+							releaseRefine?.();
+						}, 0);
+						return {};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		sessionInternals = harness.session as unknown as { _refineInFlight?: Promise<void> };
+		harness.setResponses([fauxAssistantMessage("kept response")]);
+
+		const clearedAgentMessage = agentPromptText("agentmsg_cleared", "cleared");
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("kept");
+		await harness.session.queueAgentMessagePrompt(clearedAgentMessage, "followUp", undefined);
+		harness.session.setFollowUpMode("all");
+		let cleared: { steering: string[]; followUp: string[] } | undefined;
+		clearDuringRefineWait = () => {
+			cleared = harness.session.clearQueuedUserMessagesMatching((text) => text === clearedAgentMessage);
+		};
+		pause.release();
+		await harness.session.waitForIdle();
+
+		expect(cleared).toEqual({ steering: [], followUp: [clearedAgentMessage] });
+		expect(getUserTexts(harness)).toEqual(["kept"]);
+	});
+
 	it("delivers follow-up messages only after the current run finishes", async () => {
 		const waiting = await createWaitingHarness();
 		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;
