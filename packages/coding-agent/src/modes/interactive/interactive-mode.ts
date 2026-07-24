@@ -842,6 +842,7 @@ export class InteractiveMode {
 	private featureHintAnimationTimer: NodeJS.Timeout | undefined;
 	private featureHintComponent: FeatureHintComponent | undefined;
 	private featureHintRunPending = false;
+	private featureHintSuppressedByQueue = false;
 	private pulseTimer: NodeJS.Timeout | undefined = undefined;
 	private pulseFrame = 0;
 	private readonly activityTracker = new AgentActivityTracker();
@@ -1344,19 +1345,17 @@ export class InteractiveMode {
 		this.renderWidgets(); // Initialize with default spacer
 		this.mainContainer.addChild(this.widgetContainerAbove);
 		this.renderRecap();
-		this.mainContainer.addChild(this.recapContainer);
-		this.mainContainer.addChild(this.queuedMessagesContainer);
-		this.mainContainer.addChild(this.sideQuestionContainer);
-		this.mainContainer.addChild(this.featureHintContainer);
+		for (const container of this.getPromptContextContainers()) {
+			this.mainContainer.addChild(container);
+		}
 		this.mainContainer.addChild(this.editorContainer);
 		this.mainContainer.addChild(this.childAgentSummary);
 		this.mainContainer.addChild(this.widgetContainerBelow);
 		this.footerSlot.addChild(this.footer);
 		this.mainContainer.addChild(this.footerSlot);
-		this.promptDock.addChild(this.featureHintContainer);
-		this.promptDock.addChild(this.editorContainer);
-		this.promptDock.addChild(this.childAgentSummary);
-		this.promptDock.addChild(this.footerSlot);
+		for (const component of this.getPromptDockComponents()) {
+			this.promptDock.addChild(component);
+		}
 		this.ui.addChild(this.mainContainer);
 		this.ui.setFocus(this.editor);
 
@@ -2687,6 +2686,7 @@ export class InteractiveMode {
 		this.queuedMessagesContainer.clear();
 		this.compactionQueuedMessages = [];
 		this.connectionQueue = { steering: [], followUp: [] };
+		this.featureHintSuppressedByQueue = false;
 		if (options?.clearPromptStash) {
 			this.promptStash = undefined;
 		}
@@ -3042,7 +3042,7 @@ export class InteractiveMode {
 
 	private startFeatureHintPresentation(): void {
 		this.clearFeatureHintPresentation();
-		if (this.childAgentPanelMode) {
+		if (this.shouldSuppressFeatureHint()) {
 			return;
 		}
 		if (this.featureHintEligibleAt === 0) {
@@ -3062,6 +3062,7 @@ export class InteractiveMode {
 
 	private showFeatureHint(): void {
 		if (
+			this.shouldSuppressFeatureHint() ||
 			!this.loadingAnimation ||
 			!this.shouldShowWorkingLoader() ||
 			!this.statusContainer.children.includes(this.loadingAnimation)
@@ -3108,12 +3109,21 @@ export class InteractiveMode {
 
 	private resumeFeatureHintPresentation(): void {
 		if (
+			!this.shouldSuppressFeatureHint() &&
 			this.loadingAnimation &&
 			this.shouldShowWorkingLoader() &&
 			this.statusContainer.children.includes(this.loadingAnimation)
 		) {
 			this.startFeatureHintPresentation();
 		}
+	}
+
+	private shouldSuppressFeatureHint(): boolean {
+		if (this.childAgentPanelMode) {
+			return true;
+		}
+		const { steering, followUp } = this.getAllQueuedMessages();
+		return steering.length > 0 || followUp.length > 0;
 	}
 
 	private endFeatureHintRun(): void {
@@ -6602,6 +6612,14 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private getPromptContextContainers(): Container[] {
+		return [this.recapContainer, this.featureHintContainer, this.queuedMessagesContainer, this.sideQuestionContainer];
+	}
+
+	private getPromptDockComponents(): Component[] {
+		return [this.editorContainer, this.childAgentSummary, this.footerSlot];
+	}
+
 	/** Enter or leave fullscreen rendering without touching the persisted setting. */
 	private applyFullscreen(enabled: boolean): void {
 		if (enabled) {
@@ -6611,9 +6629,7 @@ export class InteractiveMode {
 					this.headerContainer,
 					this.mainViewContainer,
 					this.widgetContainerAbove,
-					this.recapContainer,
-					this.queuedMessagesContainer,
-					this.sideQuestionContainer,
+					...this.getPromptContextContainers(),
 					this.widgetContainerBelow,
 				],
 				dock: this.promptDock,
@@ -6837,7 +6853,8 @@ export class InteractiveMode {
 		// their own container below the execution indicator and recap.
 		this.queuedMessagesContainer.clear();
 		const { steering: steeringMessages, followUp: followUpMessages } = this.getAllQueuedMessages();
-		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
+		const hasQueuedMessages = steeringMessages.length > 0 || followUpMessages.length > 0;
+		if (hasQueuedMessages) {
 			this.queuedMessagesContainer.addChild(new Spacer(1));
 			for (const message of steeringMessages) {
 				const text = theme.fg("dim", formatQueuedMessagePreview(message, "Steering"));
@@ -6850,6 +6867,13 @@ export class InteractiveMode {
 			const dequeueHint = this.getAppKeyDisplay("app.message.dequeue");
 			const hintText = theme.fg("dim", `╰─ ${dequeueHint} to edit all queued messages`);
 			this.queuedMessagesContainer.addChild(new TruncatedText(hintText, 1, 0));
+		}
+		if (hasQueuedMessages && !this.featureHintSuppressedByQueue) {
+			this.featureHintSuppressedByQueue = true;
+			this.clearFeatureHintPresentation();
+		} else if (!hasQueuedMessages && this.featureHintSuppressedByQueue) {
+			this.featureHintSuppressedByQueue = false;
+			this.resumeFeatureHintPresentation();
 		}
 	}
 

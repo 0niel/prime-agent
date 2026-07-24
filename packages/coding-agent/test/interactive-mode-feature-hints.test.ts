@@ -44,6 +44,8 @@ function createMode() {
 		featureHintComponent: undefined,
 		featureHintRunPending: false,
 		childAgentPanelMode: undefined,
+		connectionQueue: { steering: [], followUp: [] },
+		compactionQueuedMessages: [],
 		options: { returnToAgentsView: true },
 		ui: { requestRender },
 	};

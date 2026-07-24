@@ -764,6 +764,7 @@ describe("InteractiveMode pending bash components", () => {
 			queuedMessagesContainer: new Container(),
 			pendingBashComponents: [component],
 			getAllQueuedMessages: () => ({ steering: [], followUp: [] }),
+			featureHintSuppressedByQueue: false,
 		} as unknown as InteractiveMode;
 
 		(
@@ -784,6 +785,8 @@ describe("InteractiveMode pending bash components", () => {
 				followUp: ["Heartbeat prompt: check status", "Goal context: continue goal", "plain follow-up"],
 			}),
 			getAppKeyDisplay: () => "Ctrl+Q",
+			featureHintSuppressedByQueue: false,
+			clearFeatureHintPresentation: vi.fn(),
 		} as unknown as InteractiveMode;
 
 		(
