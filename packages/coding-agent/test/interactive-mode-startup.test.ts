@@ -135,12 +135,14 @@ describe("InteractiveMode startup hints", () => {
 
 	it("uses the shared session view for non-daemon chats", async () => {
 		const returnToAgentsView = vi.fn(async () => {});
-		const showLocalSessionView = vi.fn(async () => ({ type: "exit" as const }));
+		const showLocalSessionView = vi.fn(async () => ({ type: "opened" as const }));
+		const shutdown = vi.fn(async () => {});
 		const mode = Object.assign(
 			createMode(false, false, () => "draft prompt"),
 			{
 				returnToAgentsView,
 				showLocalSessionView,
+				shutdown,
 			},
 		);
 
@@ -148,6 +150,21 @@ describe("InteractiveMode startup hints", () => {
 
 		expect(returnToAgentsView).not.toHaveBeenCalled();
 		expect(showLocalSessionView).toHaveBeenCalledOnce();
+		expect(shutdown).not.toHaveBeenCalled();
+	});
+
+	it("shuts down when the shared session view exits for non-daemon chats", async () => {
+		const showLocalSessionView = vi.fn(async () => ({ type: "exit" as const }));
+		const shutdown = vi.fn(async () => {});
+		const mode = Object.assign(createMode(false, false), {
+			returnToAgentsView: vi.fn(async () => {}),
+			showLocalSessionView,
+			shutdown,
+		});
+
+		await Reflect.get(InteractiveMode.prototype, "requestAgentsView").call(mode);
+
+		expect(shutdown).toHaveBeenCalledOnce();
 	});
 
 	it("keeps the lowercase agents hint while typing", () => {
