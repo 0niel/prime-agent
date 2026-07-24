@@ -14,10 +14,13 @@ export class MutationDrainLatch {
 	}
 
 	async waitForDrain(remaining: number, signal: AbortSignal, abortMessage: string): Promise<void> {
+		if (signal.aborted) throw new Error(abortMessage);
 		while (this.active > remaining) {
-			if (signal.aborted) throw new Error(abortMessage);
 			await new Promise<void>((resolve, reject) => {
+				let settled = false;
 				const settle = (error?: Error) => {
+					if (settled) return;
+					settled = true;
 					this.waiters.delete(onDrained);
 					signal.removeEventListener("abort", onAbort);
 					if (error) reject(error);
@@ -28,6 +31,7 @@ export class MutationDrainLatch {
 				this.waiters.add(onDrained);
 				signal.addEventListener("abort", onAbort, { once: true });
 			});
+			if (signal.aborted) throw new Error(abortMessage);
 		}
 	}
 }
