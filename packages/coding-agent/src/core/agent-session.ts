@@ -3066,12 +3066,8 @@ export class AgentSession {
 			this._resolveRetry();
 		}
 
-		// Remove queued messages before emitting so the UI sees the updated queue.
-		if (event.type === "message_start") {
-			if (this._isPromptTurnStartMessage(event.message)) {
-				this._overflowRecoveryAttempted = false;
-			}
-			this._removeDeliveredSessionInput(event.message);
+		if (event.type === "message_start" && this._isPromptTurnStartMessage(event.message)) {
+			this._overflowRecoveryAttempted = false;
 		}
 
 		// Emit to extensions first
@@ -3391,6 +3387,7 @@ export class AgentSession {
 				return;
 			}
 			this._disposing = true;
+			this._wakeQueuedWorkAdmissionWaiters();
 			await this._disposeAsyncOnce();
 		})();
 		return this._disposeAsyncPromise;
@@ -3558,6 +3555,7 @@ export class AgentSession {
 			return;
 		}
 		this._disposed = true;
+		this._wakeQueuedWorkAdmissionWaiters();
 		try {
 			// Invalidate scheduled timers and abort any in-flight review so a late
 			// resolution cannot write harness state or re-subscribe handlers.
@@ -4718,19 +4716,6 @@ export class AgentSession {
 		return true;
 	}
 
-	/** Remove a delivered queued input from whichever lane holds it (steering first, then follow-up). */
-	private _removeDeliveredSessionInput(message: AgentMessage): void {
-		for (const queue of [this._steeringMessages, this._followUpMessages]) {
-			const index = queue.findIndex((item) => item.message === message);
-			if (index !== -1) {
-				const [removed] = queue.splice(index, 1);
-				this._resolveAgentMessageDelivery(removed?.agentMessageId);
-				this._emitQueueUpdate();
-				return;
-			}
-		}
-	}
-
 	private async _queueSteer(
 		text: string,
 		images?: ImageContent[],
@@ -5299,13 +5284,24 @@ export class AgentSession {
 				if (released) return;
 				released = true;
 				this._queuedWorkPauses.delete(token);
-				if (this._queuedWorkPauses.size === 0) {
-					for (const resolve of this._queuedWorkAdmissionWaiters) resolve();
-					this._queuedWorkAdmissionWaiters.clear();
-				}
+				if (this._queuedWorkPauses.size === 0) this._wakeQueuedWorkAdmissionWaiters();
 				this._scheduleSessionInputPump();
 			},
 		};
+	}
+
+	private _wakeQueuedWorkAdmissionWaiters(): void {
+		for (const resolve of this._queuedWorkAdmissionWaiters) resolve();
+		this._queuedWorkAdmissionWaiters.clear();
+	}
+
+	private _assertDirectTurnAdmissionAvailable(): void {
+		if (this._disposed || this._disposing) {
+			throw new Error("Cannot start a direct turn because the session is disposing or disposed.");
+		}
+		if (this.pendingMessageCount > 0 && this._sessionInputPumpSuspended) {
+			throw new Error("Cannot start a direct turn while queued session input is suspended.");
+		}
 	}
 
 	private async _acquireTurnAdmission(): Promise<{ owner: symbol; release(): void }> {
@@ -5337,26 +5333,37 @@ export class AgentSession {
 		options: { allowStreaming?: boolean } = {},
 	): Promise<{ owner: symbol; release(): void }> {
 		while (true) {
+			this._assertDirectTurnAdmissionAvailable();
 			await this._waitForQueuedWorkAdmission();
+			this._assertDirectTurnAdmissionAvailable();
 			if (this.pendingMessageCount > 0) this._scheduleSessionInputPump();
 			const admission = await this._acquireTurnAdmission();
-			if (
-				(options.allowStreaming === true && this.isStreaming) ||
-				(this.pendingMessageCount === 0 &&
-					this._activeSessionInput === undefined &&
-					!this._pumpingSessionInput &&
-					!this._sessionInputPumpRequested)
-			) {
-				return admission;
+			try {
+				this._assertDirectTurnAdmissionAvailable();
+				if (
+					(options.allowStreaming === true && this.isStreaming) ||
+					(this.pendingMessageCount === 0 &&
+						this._activeSessionInput === undefined &&
+						!this._pumpingSessionInput &&
+						!this._sessionInputPumpRequested)
+				) {
+					return admission;
+				}
+			} catch (error) {
+				admission.release();
+				throw error;
 			}
 			admission.release();
 			await this.waitForSessionInputIdle();
+			this._assertDirectTurnAdmissionAvailable();
 		}
 	}
 
 	private async _waitForQueuedWorkAdmission(): Promise<void> {
 		while (this._queuedWorkPauses.size > 0) {
+			this._assertDirectTurnAdmissionAvailable();
 			await new Promise<void>((resolve) => this._queuedWorkAdmissionWaiters.add(resolve));
+			this._assertDirectTurnAdmissionAvailable();
 		}
 	}
 

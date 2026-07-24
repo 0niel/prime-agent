@@ -5,6 +5,12 @@ import { fauxAssistantMessage, fauxToolCall, type ImageContent } from "@earendil
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+	AGENT_MESSAGE_SOURCE,
+	type AgentSessionMessagePayload,
+	createAgentSessionMessage,
+	createAgentSessionMessagePrompt,
+} from "../../src/core/agent-messages.js";
 import { createSessionSlashCommandMessage } from "../../src/core/messages.js";
 import {
 	applyRefinementProposal,
@@ -1947,6 +1953,46 @@ prepared:${event.prompt}`,
 		expect(getUserTexts(harness)).toContain(agentPrompt);
 	});
 
+	it("keeps a second one-at-a-time input queued when both use the same message object", async () => {
+		const firstResponse = createDeferred();
+		const firstProviderStarted = createDeferred();
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.session.setFollowUpMode("one-at-a-time");
+		harness.setResponses([
+			async () => {
+				firstProviderStarted.resolve();
+				await firstResponse.promise;
+				return fauxAssistantMessage("first done");
+			},
+			fauxAssistantMessage("second done"),
+		]);
+		const payload: AgentSessionMessagePayload = {
+			id: "agentmsg_same_object",
+			source: AGENT_MESSAGE_SOURCE,
+			message: "same object",
+			deliveryMode: "follow_up" as const,
+			target: { activeSessionId: "worker-active", sessionId: "worker-session" },
+		};
+		const message = createAgentSessionMessage(payload);
+		const prompt = createAgentSessionMessagePrompt(payload);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.queueAgentMessagePrompt(prompt, "followUp", message);
+		await harness.session.queueAgentMessagePrompt(prompt, "followUp", message);
+		pause.release();
+
+		await firstProviderStarted.promise;
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(harness.session.pendingMessageCount).toBe(1);
+		expect(harness.session.getFollowUpMessages()).toEqual([prompt]);
+		firstResponse.resolve();
+		await harness.session.waitForIdle();
+
+		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(harness.session.messages.filter((item) => item === message)).toHaveLength(2);
+		expect(getAssistantTexts(harness)).toEqual(["first done", "second done"]);
+	});
+
 	it("resolves queued delivery when message_start is received", async () => {
 		const blocked = createDeferred();
 		const harness = await createHarness({
@@ -2143,6 +2189,58 @@ prepared:${event.prompt}`,
 		expect(
 			harness.session.messages.filter((message) => message.role === "custom").map((message) => message.content),
 		).toEqual(["first", "second"]);
+	});
+
+	it("rejects triggerTurn promptly when pending input is suspended", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await harness.session.restoreFollowUpMessage("suspended");
+		harness.session.abortForUpdateRestart();
+		const prompt = vi.spyOn(harness.session.agent, "prompt");
+
+		await expect(
+			harness.session.sendCustomMessage(
+				{ customType: "trigger", content: "trigger", display: false },
+				{ triggerTurn: true },
+			),
+		).rejects.toThrow("queued session input is suspended");
+
+		expect(prompt).not.toHaveBeenCalled();
+		expect(harness.session.getFollowUpMessages()).toEqual(["suspended"]);
+	});
+
+	it("rejects disposal while direct admission waits behind a pause", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const pause = harness.session.acquireQueuedWorkPause();
+		const release = vi.spyOn(pause, "release");
+		const prompt = vi.spyOn(harness.session.agent, "prompt");
+		const trigger = harness.session.sendCustomMessage(
+			{ customType: "trigger", content: "trigger", display: false },
+			{ triggerTurn: true },
+		);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		harness.session.dispose();
+		await expect(trigger).rejects.toThrow("session is disposing or disposed");
+
+		expect(prompt).not.toHaveBeenCalled();
+		expect(release).not.toHaveBeenCalled();
+	});
+
+	it("rejects a post-disposal direct call without prompting the agent", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const prompt = vi.spyOn(harness.session.agent, "prompt");
+		harness.session.dispose();
+
+		await expect(
+			harness.session.sendCustomMessage(
+				{ customType: "trigger", content: "trigger", display: false },
+				{ triggerTurn: true },
+			),
+		).rejects.toThrow("session is disposing or disposed");
+		expect(prompt).not.toHaveBeenCalled();
 	});
 
 	it("resumes explicitly admitted and restored work after abort", async () => {
