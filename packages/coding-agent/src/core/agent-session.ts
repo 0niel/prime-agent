@@ -1003,6 +1003,8 @@ export class AgentSession {
 	private readonly _sessionInputCheckpointWaiters = new Set<() => void>();
 	/** Direct prompts between admission and agent handoff; restart checkpoints wait for zero. */
 	private _directPromptSectionCount = 0;
+	/** One-shot waiters resolved when a dispatched message reaches message_start. */
+	private _directDispatchObservers = new Set<{ messages: ReadonlySet<AgentMessage>; resolve: () => void }>();
 	private _steeringStopPending = false;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
@@ -3039,6 +3041,12 @@ export class AgentSession {
 					? this._activeSessionInput.items.find((input) => input.message === event.message)
 					: undefined;
 			this._settleAgentMessage(activeInput?.agentMessageId, "delivery");
+			for (const observer of this._directDispatchObservers) {
+				if (observer.messages.has(event.message)) {
+					this._directDispatchObservers.delete(observer);
+					observer.resolve();
+				}
+			}
 		}
 		this._agentEventQueue = this._agentEventQueue.then(
 			() => this._processAgentEvent(event),
@@ -4155,34 +4163,49 @@ export class AgentSession {
 					"Agent became busy before prompt delivery. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
 				);
 			}
-			await this._queueWithPendingNextTurnMessages(text, options.streamingBehavior, reportPreflight, {
-				message,
-				queueKey: options.followUpQueueKey,
-				previewLabel,
-				suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-				resumeIfIdle: options.resumeIfIdle,
-			});
+			try {
+				await this._queueWithPendingNextTurnMessages(text, options.streamingBehavior, reportPreflight, {
+					message,
+					queueKey: options.followUpQueueKey,
+					previewLabel,
+					suppressAutonomousContinuation: options.suppressAutonomousContinuation,
+					resumeIfIdle: options.resumeIfIdle,
+				});
+			} catch (error) {
+				// A failed enqueue must still settle the preflight outcome, or the
+				// direct-prompt section would fence checkpoints forever.
+				reportPreflight(false);
+				throw error;
+			}
 
 			return;
 		}
 
 		if (options?.suppressAutonomousContinuation) this._markAutonomousContinuationSuppressed(message);
+		// Register the observer before dispatch so a synchronously-emitted
+		// message_start cannot be missed.
+		const dispatchedMessages: ReadonlySet<AgentMessage> = new Set(messages);
+		let observer: { messages: ReadonlySet<AgentMessage>; resolve: () => void } | undefined;
+		const observed = new Promise<true>((resolve) => {
+			observer = { messages: dispatchedMessages, resolve: () => resolve(true) };
+		});
+		if (observer) this._directDispatchObservers.add(observer);
 		const promptPromise = options?.suppressAutonomousContinuation
 			? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(messages))
 			: this.agent.prompt(messages);
 		releaseAdmission();
-		// Settle the preflight outcome at the handoff, exactly like the direct path:
-		// the direct-prompt section must not fence checkpoints for the whole turn,
-		// and a rejected dispatch must still release it.
+		// Settle the preflight outcome at the handoff, not after the whole turn: the
+		// direct-prompt section must keep fencing update-restart checkpoints until
+		// message_start proves the input reached the run's event stream, and a
+		// rejected dispatch must still release the section.
 		const dispatched = await Promise.race([
 			promptPromise.then(
 				() => true,
 				() => false,
 			),
-			new Promise<true>((resolve) => {
-				setTimeout(() => resolve(true), 0);
-			}),
+			observed,
 		]);
+		if (observer) this._directDispatchObservers.delete(observer);
 		reportPreflight(dispatched);
 		try {
 			await promptPromise;
@@ -4485,14 +4508,21 @@ export class AgentSession {
 					"Agent became busy before prompt delivery. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
 				);
 			}
-			await this._queueWithPendingNextTurnMessages(expandedText, options.streamingBehavior, reportPreflight, {
-				images: currentImages,
-				queueKey: options.followUpQueueKey,
-				agentMessageId: options.agentMessageId,
-				suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-				message: options.customMessage,
-				resumeIfIdle: options.resumeIfIdle,
-			});
+			try {
+				await this._queueWithPendingNextTurnMessages(expandedText, options.streamingBehavior, reportPreflight, {
+					images: currentImages,
+					queueKey: options.followUpQueueKey,
+					agentMessageId: options.agentMessageId,
+					suppressAutonomousContinuation: options.suppressAutonomousContinuation,
+					message: options.customMessage,
+					resumeIfIdle: options.resumeIfIdle,
+				});
+			} catch (error) {
+				// A failed enqueue must still settle the preflight outcome, or the
+				// direct-prompt section would fence checkpoints forever.
+				reportPreflight(false);
+				throw error;
+			}
 
 			return;
 		}

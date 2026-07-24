@@ -2897,7 +2897,11 @@ export class AgentDaemon {
 				const streamsSnapshot =
 					client.transport === "private-framed" &&
 					daemonClientCapabilitiesForSession(client, state.activeSessionId).has("chunked_snapshot");
-				this.adoptClientEnv(state, filterClientEnv(command.env));
+				// Attach is admitted during update-restart preparation as a read, but env
+				// adoption is a session mutation: adopting after the manifest snapshot
+				// would strand the identity on a checkpoint that no longer includes it.
+				// The client re-attaches after restart and adopts env then.
+				if (!this.updateRestart) this.adoptClientEnv(state, filterClientEnv(command.env));
 				const snapshotSignal = streamsSnapshot
 					? markClientSnapshotStreaming(client, state.activeSessionId)
 					: undefined;
