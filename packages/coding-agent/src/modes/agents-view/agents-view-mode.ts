@@ -314,7 +314,7 @@ export async function runLocalSessionView(
 	return new AgentsViewMode({ ...options, adapter }, {}).run();
 }
 
-export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise<void> {
+export async function runAgentsViewMode(options: Omit<AgentsViewModeOptions, "adapter">): Promise<void> {
 	const initialSession = options.initialSession;
 	const persistentState: AgentsViewPersistentState = initialSession
 		? {

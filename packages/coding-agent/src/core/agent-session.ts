@@ -8246,11 +8246,11 @@ export class AgentSession {
 		// cancelled runs have nothing useful to show, so dispose them now. retainFinished…
 		// disposes the child itself when it declines, so only dispose here otherwise.
 		if (status === "done") {
-			if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
-				// Trace sharing is best-effort telemetry. Rate-limit retries can take minutes,
-				// so it must not delay the model-facing rlm.run result.
-				void flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
-			} else {
+			// Trace sharing is best-effort telemetry for every completed run, retained
+			// or not. Rate-limit retries can take minutes, so it must not delay the
+			// model-facing rlm.run result.
+			void flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
+			if (!options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
 				runtime.session.dispose();
 			}
 		} else {
