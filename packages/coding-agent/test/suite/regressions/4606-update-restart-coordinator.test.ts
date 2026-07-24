@@ -129,7 +129,9 @@ async function waitForTerminalStatus(agentDir: string, timeoutMs = 120_000) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (existsSync(directory)) {
-			for (const name of readdirSync(directory)) {
+			// The writer stages "<name>.json.<pid>.<uuid>.tmp" files in this directory
+			// before its atomic rename; parsing one mid-write reads torn JSON.
+			for (const name of readdirSync(directory).filter((entry) => entry.endsWith(".json"))) {
 				const path = join(directory, name);
 				const status = readDaemonUpdateRestartStatus(path);
 				if (status && (status.phase === "complete" || status.phase === "failed" || status.phase === "skipped")) {
