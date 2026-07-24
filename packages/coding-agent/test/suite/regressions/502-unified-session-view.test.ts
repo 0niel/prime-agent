@@ -200,6 +200,72 @@ describe("#502 unified session view regressions", () => {
 		expect(harness.setStatusMessage).not.toHaveBeenCalled();
 	});
 
+	test("reconnect stays active until the heartbeat catalog refresh succeeds", async () => {
+		vi.useFakeTimers();
+		try {
+			const firstHeartbeatAttempt = deferred<void>();
+			let heartbeatAttempts = 0;
+			const client = {
+				hello: { protocol: { version: 3 } },
+				supportsServerCapability: () => true,
+				reconnect: vi.fn(async () => {}),
+				request: vi.fn(async (command: { type: string }) => {
+					if (command.type === "list") return { success: true, data: { sessions: [summary("live")] } };
+					heartbeatAttempts += 1;
+					if (heartbeatAttempts === 1) {
+						firstHeartbeatAttempt.resolve();
+						throw new Error("heartbeat connection lost");
+					}
+					return { success: true, data: { heartbeats: [{ job: { id: "healthy" } }] } };
+				}),
+			};
+			const harness = {
+				...refreshHarness(),
+				stopped: false,
+				reconnectTimedOut: false,
+				client,
+				options: { reconnectTimeoutMs: 10_000 },
+				requireClient: () => client,
+				refreshSavedSessions: vi.fn(async () => true),
+				refreshHeartbeats: vi.fn(async (_options?: { duringReconnect?: boolean }) => false),
+				reconnectClient: vi.fn(async (_reconnectingClient: typeof client, _error: unknown) => {}),
+			};
+			const refreshHeartbeats =
+				privateMethod<(this: typeof harness, options?: { duringReconnect?: boolean }) => Promise<boolean>>(
+					"refreshHeartbeats",
+				);
+			const reconnectClient =
+				privateMethod<(this: typeof harness, reconnectingClient: typeof client, error: unknown) => Promise<void>>(
+					"reconnectClient",
+				);
+			harness.refreshHeartbeats.mockImplementation((options) => refreshHeartbeats.call(harness, options));
+			harness.reconnectClient.mockImplementation((reconnectingClient, error) =>
+				reconnectClient.call(harness, reconnectingClient, error),
+			);
+
+			privateMethod<(this: typeof harness, reconnectingClient: typeof client, error: unknown) => void>(
+				"startClientReconnect",
+			).call(harness, client, new Error("disconnected"));
+			await firstHeartbeatAttempt.promise;
+			await Promise.resolve();
+
+			expect(harness.reconnectPromise).toBeDefined();
+			expect(harness.applySessionList).not.toHaveBeenCalled();
+			expect(harness.setStatusMessage).not.toHaveBeenCalledWith("Daemon reconnected", { render: false });
+			expect(client.reconnect).toHaveBeenCalledOnce();
+
+			await vi.advanceTimersByTimeAsync(1_000);
+			await harness.reconnectPromise;
+
+			expect(client.reconnect).toHaveBeenCalledTimes(2);
+			expect(harness.applySessionList).toHaveBeenCalledWith([summary("live")]);
+			expect(harness.heartbeats).toEqual([{ job: { id: "healthy" } }]);
+			expect(harness.reconnectPromise).toBeUndefined();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	test("a pending saved scan cannot overwrite daemon shutdown status", async () => {
 		const scan = deferred<void>();
 		const harness = {

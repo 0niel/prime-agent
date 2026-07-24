@@ -1709,23 +1709,25 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 	}
 
-	private async refreshHeartbeats(options: { duringReconnect?: boolean } = {}): Promise<void> {
-		if ((!options.duringReconnect && this.reconnectPromise) || this.daemonShutdownReceived) return;
+	private async refreshHeartbeats(options: { duringReconnect?: boolean } = {}): Promise<boolean> {
+		if ((!options.duringReconnect && this.reconnectPromise) || this.daemonShutdownReceived) return false;
 		const generation = ++this.heartbeatCatalogGeneration;
 		if (this.options.adapter) {
 			this.heartbeats = [];
-			return;
+			return true;
 		}
 		try {
 			const heartbeats = await listDaemonHeartbeats(this.requireClient());
-			if (generation !== this.heartbeatCatalogGeneration) return;
+			if (generation !== this.heartbeatCatalogGeneration) return false;
 			this.heartbeats = heartbeats;
 			this.persistentState.heartbeats = heartbeats;
 			this.reconcileCatalogs();
+			return true;
 		} catch (error) {
 			if (generation === this.heartbeatCatalogGeneration && !this.reconnectPromise) {
 				this.setStatusMessage(formatError("Failed to refresh heartbeats", error));
 			}
+			return false;
 		}
 	}
 
@@ -1890,12 +1892,13 @@ export class AgentsViewMode implements Component, Focusable {
 				const response = await client.request(createAgentsViewListCommand());
 				const data = requireDaemonData(response);
 				const sessions = expectSessionList(data);
+				const heartbeatsRefreshed = await this.refreshHeartbeats({ duringReconnect: true });
+				if (!heartbeatsRefreshed) throw new Error("Heartbeat catalog did not refresh during reconnect");
 				this.daemonShutdownReceived = false;
 				this.reconnectTimedOut = false;
 				this.setStatusMessage("Daemon reconnected", { render: false });
 				this.applySessionList(sessions);
 				void this.refreshSavedSessions({ duringReconnect: true, preserveStatusOnError: true });
-				await this.refreshHeartbeats({ duringReconnect: true });
 				return;
 			} catch (error) {
 				lastError = error;
