@@ -3,16 +3,19 @@ import type { AssistantMessage, ImageContent, Message, ServiceTier, TextContent,
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
+	chmodSync,
 	createReadStream,
 	existsSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
+	rmSync,
 	statSync,
 	writeFileSync,
 } from "fs";
 import { readdir, readFile, stat } from "fs/promises";
-import { dirname, join, resolve } from "path";
+import { basename, dirname, join, resolve } from "path";
 import { createInterface } from "readline";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
@@ -47,6 +50,15 @@ const CONTENT_ENTRY_TYPES = new Set([
 	"compaction",
 	"branch_summary",
 ]);
+
+function statModeIfPresent(path: string): number | undefined {
+	try {
+		return statSync(path).mode & 0o777;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
 
 export interface SessionHeader {
 	type: "session";
@@ -1197,8 +1209,19 @@ export class SessionManager {
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
-		mkdirSync(dirname(this.sessionFile), { recursive: true });
-		writeFileSync(this.sessionFile, content);
+		const directory = dirname(this.sessionFile);
+		mkdirSync(directory, { recursive: true });
+		const tempPath = join(directory, `.${basename(this.sessionFile)}.${process.pid}.${randomUUID()}.tmp`);
+		try {
+			const mode = statModeIfPresent(this.sessionFile);
+			writeFileSync(tempPath, content, mode === undefined ? undefined : { mode });
+			if (mode !== undefined) {
+				chmodSync(tempPath, mode);
+			}
+			renameSync(tempPath, this.sessionFile);
+		} finally {
+			rmSync(tempPath, { force: true });
+		}
 		this._notifyPersistListeners();
 	}
 

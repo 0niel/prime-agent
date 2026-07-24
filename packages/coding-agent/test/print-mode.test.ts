@@ -2,8 +2,13 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentAutonomousStatus } from "../src/core/autonomous.js";
-import { createSessionSlashCommandResultMessage } from "../src/core/messages.js";
+import {
+	createCompactionOutcomeMessage,
+	createCustomMessage,
+	createSessionSlashCommandResultMessage,
+} from "../src/core/messages.js";
 import type { SessionShutdownEvent } from "../src/index.js";
+import { selectHeadlessTerminalResult } from "../src/modes/headless-completion.js";
 import { runPrintMode } from "../src/modes/print-mode.js";
 
 const output = vi.hoisted(() => ({ write: vi.fn(), flush: vi.fn(async () => {}) }));
@@ -70,7 +75,7 @@ function createAssistantMessage(options?: {
 }
 
 function createRuntimeHost(
-	assistantMessage: AgentMessage,
+	assistantMessage: AgentMessage | AgentMessage[],
 	autonomousStatus: AgentAutonomousStatus = {
 		enabled: false,
 		continuationsUsed: 0,
@@ -86,7 +91,7 @@ function createRuntimeHost(
 		emit: vi.fn(async () => {}),
 	};
 
-	const state = { messages: [assistantMessage] };
+	const state = { messages: Array.isArray(assistantMessage) ? assistantMessage : [assistantMessage] };
 
 	const session: FakeSession = {
 		sessionManager: { getHeader: () => undefined },
@@ -155,6 +160,47 @@ describe("runPrintMode", () => {
 		expect(output.write).toHaveBeenCalledWith("No active goal.\n");
 	});
 
+	it("prints a session command result before a trailing compaction outcome", async () => {
+		const result = createSessionSlashCommandResultMessage("No active goal.", {
+			command: { name: "goal", args: "status", text: "/goal status" },
+			success: true,
+			severity: "info",
+		});
+		const outcome = createCompactionOutcomeMessage("Requested compaction skipped", {
+			reason: "requested",
+			outcome: "skipped",
+		});
+		const runtimeHost = createRuntimeHost([result, outcome]);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		output.write.mockClear();
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(0);
+		expect(output.write).toHaveBeenCalledWith("No active goal.\n");
+		expect(errorSpy).toHaveBeenCalledWith("Requested compaction skipped");
+	});
+
+	it("does not select a result across a message barrier", () => {
+		const outcome = createCompactionOutcomeMessage("Requested compaction skipped", {
+			reason: "requested",
+			outcome: "skipped",
+		});
+		const barriers: AgentMessage[] = [
+			{ role: "user", content: "next request", timestamp: Date.now() },
+			createCustomMessage("extension.notice", "unrelated", true, undefined, new Date().toISOString()),
+		];
+
+		for (const barrier of barriers) {
+			expect(selectHeadlessTerminalResult([createAssistantMessage({ text: "stale" }), barrier, outcome])).toEqual({
+				primary: undefined,
+				compactionOutcomes: [outcome],
+			});
+		}
+	});
+
 	it("returns non-zero for failed session command results in text mode", async () => {
 		const result = createSessionSlashCommandResultMessage("Command failed: bad arguments", {
 			command: { name: "refine", args: "rollback", text: "/refine rollback" },
@@ -203,6 +249,42 @@ describe("runPrintMode", () => {
 		expect(errorSpy).toHaveBeenCalledWith("provider failure");
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+	});
+
+	it("prints assistant output and reports a trailing compaction outcome", async () => {
+		const outcome = createCompactionOutcomeMessage("Auto-compaction skipped: nothing to compact", {
+			reason: "threshold",
+			outcome: "skipped",
+		});
+		const runtimeHost = createRuntimeHost([createAssistantMessage({ text: "done" }), outcome]);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		output.write.mockClear();
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(0);
+		expect(output.write).toHaveBeenCalledWith("done\n");
+		expect(errorSpy).toHaveBeenCalledWith("Auto-compaction skipped: nothing to compact");
+	});
+
+	it("reports an outcome-only failure and exits non-zero", async () => {
+		const outcome = createCompactionOutcomeMessage("Context overflow recovery failed", {
+			reason: "overflow",
+			outcome: "failed",
+		});
+		const runtimeHost = createRuntimeHost(outcome);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		output.write.mockClear();
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(1);
+		expect(output.write).not.toHaveBeenCalled();
+		expect(errorSpy).toHaveBeenCalledWith("Context overflow recovery failed");
 	});
 
 	it("stops host-driven gate retries once gate maxRetries is exhausted", async () => {
@@ -348,7 +430,10 @@ describe("runPrintMode", () => {
 			() => statuses[Math.min(statusIndex++, statuses.length - 1)] as AgentAutonomousStatus,
 		);
 		session.prompt.mockImplementationOnce(async () => {
-			session.state.messages = [createAssistantMessage({ stopReason: "error", errorMessage: "provider down" })];
+			session.state.messages = [
+				createAssistantMessage({ stopReason: "error", errorMessage: "provider down" }),
+				createCompactionOutcomeMessage("Auto-compaction failed", { reason: "threshold", outcome: "failed" }),
+			];
 		});
 		session.prompt.mockImplementationOnce(async () => {
 			session.state.messages = [createAssistantMessage({ text: "still failing" })];

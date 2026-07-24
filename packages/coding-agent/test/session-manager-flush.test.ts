@@ -1,7 +1,31 @@
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+	appendFileSync,
+	chmodSync,
+	existsSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	statSync,
+	type writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+type WriteFileSync = typeof writeFileSync;
+
+const fsMocks = vi.hoisted(() => ({
+	actualWriteFileSync: undefined as WriteFileSync | undefined,
+	writeFileSync: vi.fn<WriteFileSync>(),
+}));
+vi.mock("node:fs", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs")>();
+	fsMocks.actualWriteFileSync = actual.writeFileSync;
+	fsMocks.writeFileSync.mockImplementation(actual.writeFileSync);
+	return { ...actual, writeFileSync: fsMocks.writeFileSync };
+});
+
 import { SessionManager } from "../src/core/session-manager.js";
 
 const tempDirs: string[] = [];
@@ -47,6 +71,42 @@ describe("SessionManager.flushNow", () => {
 		expect(custom.type).toBe("custom");
 		expect(custom.customType).toBe("thread_goal_state");
 		expect(custom.data).toEqual({ active: true, status: "active" });
+	});
+
+	it("preserves live bytes and cleans up the temp file when a rewrite fails", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		mgr.appendCustomEntry("before_failure");
+		mgr.flushNow();
+		const file = mgr.getSessionFile()!;
+		const before = readFileSync(file);
+		const tempPrefix = `.${basename(file)}.`;
+
+		mgr.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
+		fsMocks.writeFileSync.mockImplementationOnce((path, data, options) => {
+			fsMocks.actualWriteFileSync!(path, Buffer.from(String(data)).subarray(0, 12), options);
+			throw new Error("disk full");
+		});
+
+		expect(() => mgr.flushNow()).toThrow("disk full");
+		expect(readFileSync(file)).toEqual(before);
+		expect(readdirSync(dirname(file)).filter((name) => name.startsWith(tempPrefix) && name.endsWith(".tmp"))).toEqual(
+			[],
+		);
+	});
+
+	it("preserves live-file permissions across rewrites", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		mgr.appendCustomEntry("before_permission_check");
+		mgr.flushNow();
+		const file = mgr.getSessionFile()!;
+		chmodSync(file, 0o660);
+
+		mgr.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
+		mgr.flushNow();
+
+		expect(statSync(file).mode & 0o777).toBe(0o660);
 	});
 
 	it("is a no-op for in-memory (non-persisted) sessions", () => {
@@ -163,8 +223,46 @@ describe("SessionManager.flushNow", () => {
 	});
 });
 
+function createPersistedSessionForRollbackTest(): { mgr: SessionManager; file: string; before: Buffer } {
+	const dir = createTempDir();
+	const mgr = SessionManager.create(dir, join(dir, "sessions"));
+	mgr.appendMessage({ role: "user", content: "hi", timestamp: Date.now() });
+	mgr.appendMessage({
+		role: "assistant",
+		content: [{ type: "text", text: "hello" }],
+		api: "openai-completions",
+		provider: "openai",
+		model: "test",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	});
+	const file = mgr.getSessionFile()!;
+	return { mgr, file, before: readFileSync(file) };
+}
+
+function failNextOutcomeAppend(mgr: SessionManager, file: string): void {
+	const internals = mgr as unknown as { _persist(entry: unknown): void };
+	internals._persist = () => {
+		appendFileSync(file, '{"type":"custom_message","truncat');
+		throw new Error("append failed");
+	};
+}
+
+const failAfterPartialTempWrite: WriteFileSync = (path, data, options) => {
+	fsMocks.actualWriteFileSync!(path, Buffer.from(String(data)).subarray(0, 12), options);
+	throw new Error("repair failed");
+};
+
 describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
-	it("restores the session file after a torn append", () => {
+	it("repairs the session file immediately after a torn append", () => {
 		const dir = createTempDir();
 		const sessionDir = join(dir, "sessions");
 		const mgr = SessionManager.create(dir, sessionDir);
@@ -201,11 +299,25 @@ describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
 
 		// The rollback rewrites the file from the restored in-memory entries, so the
 		// durable session has no torn tail even if the process exits right after.
-		const after = readFileSync(file, "utf8");
-		expect(after).toBe(before);
-		for (const line of after.trim().split("\n")) {
-			expect(() => JSON.parse(line)).not.toThrow();
-		}
-		expect(mgr.getLeafEntry()?.type).toBe("message");
+		expect(readFileSync(file, "utf8")).toBe(before);
+	});
+
+	it("preserves old history when rollback repair fails", () => {
+		const { mgr, file, before } = createPersistedSessionForRollbackTest();
+		failNextOutcomeAppend(mgr, file);
+		fsMocks.writeFileSync.mockImplementationOnce(failAfterPartialTempWrite);
+
+		expect(() => mgr.appendCustomMessageEntryWithRollback("test.outcome", "details", false)).toThrow("append failed");
+		expect(readFileSync(file).subarray(0, before.length)).toEqual(before);
+	});
+
+	it("repairs a torn tail on the next successful retry", () => {
+		const { mgr, file, before } = createPersistedSessionForRollbackTest();
+		failNextOutcomeAppend(mgr, file);
+		fsMocks.writeFileSync.mockImplementationOnce(failAfterPartialTempWrite);
+		expect(() => mgr.appendCustomMessageEntryWithRollback("test.outcome", "details", false)).toThrow();
+
+		mgr.flushNow();
+		expect(readFileSync(file)).toEqual(before);
 	});
 });
