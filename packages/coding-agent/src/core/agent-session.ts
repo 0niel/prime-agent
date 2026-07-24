@@ -1857,9 +1857,6 @@ export class AgentSession {
 		if (this._stopGoalContinuationForTerminalMessage(context.message)) {
 			return true;
 		}
-		if (this._steeringStopPending) {
-			return true;
-		}
 		try {
 			if (this._accountGoalUsageForAssistantMessage(context.message)) {
 				this.agent.steer(createGoalContextMessage(this._goalState, "budget_limit"));
@@ -1882,7 +1879,9 @@ export class AgentSession {
 		if (await this._shouldStopForThresholdCompaction(context)) {
 			return true;
 		}
-		return false;
+		// Steering stops continuation only after mandatory serialized checkpoints.
+		// Returning true here still prevents the agent loop from starting another turn.
+		return this._steeringStopPending;
 	}
 
 	private async _shouldStopForThresholdCompaction(context: ShouldStopAfterTurnContext): Promise<boolean> {
