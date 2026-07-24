@@ -106,6 +106,10 @@ const WORKER_CONNECT_TIMEOUT_MS = 30_000;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
 const UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS = 90_000;
+// The whole pre-commit prepare (drain + worker fencing) must finish inside the
+// caller's 120s prepare_update_restart request timeout, or roll back; otherwise
+// an abandoned prepare leaves the daemon permanently fenced with workers stopped.
+const UPDATE_RESTART_PREPARE_DEADLINE_MS = 100_000;
 const WORKER_RETRY_DELAYS_MS = [250, 1000, 5000] as const;
 const DEFERRED_RECOVERY_RECHECK_MS = 5000;
 const OWNED_WORKER_DISCONNECT_GRACE_MS = 30_000;
@@ -3774,10 +3778,11 @@ export class DaemonSupervisor {
 		if (this.updateRestartPhase !== undefined) throw new Error("Daemon is already preparing an update restart");
 		this.updateRestartPhase = "draining";
 		try {
-			const abort = AbortSignal.timeout(UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS);
+			const deadline = Date.now() + UPDATE_RESTART_PREPARE_DEADLINE_MS;
+			const abort = AbortSignal.timeout(Math.min(UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS, deadline - Date.now()));
 			await this.mutationDrain.waitForDrain(1, abort, "Timed out draining daemon mutations for update restart");
 			this.updateRestartPhase = "fencing";
-			const manifest = await this.prepareUpdateRestartFenced();
+			const manifest = await this.prepareUpdateRestartFenced(deadline);
 			this.updateRestartPhase = "prepared";
 			return manifest;
 		} catch (error) {
@@ -3786,7 +3791,7 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async prepareUpdateRestartFenced(): Promise<DaemonUpdateRestartManifest> {
+	private async prepareUpdateRestartFenced(deadline: number): Promise<DaemonUpdateRestartManifest> {
 		const residents = [...this.workers.values()];
 		const unavailable = residents.find(
 			(worker) => worker.descriptor.lifecycle !== "ready" || worker.client === undefined,
@@ -3803,7 +3808,7 @@ export class DaemonSupervisor {
 				const client = worker.client;
 				const response = await client.requestWorker(
 					{ type: "worker_prepare_update" },
-					UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS,
+					Math.max(1, Math.min(UPDATE_RESTART_WORKER_REQUEST_TIMEOUT_MS, deadline - Date.now())),
 				);
 				if (!response.success) throw new Error(response.error);
 				worker.updateRestartPrepareClient = client;

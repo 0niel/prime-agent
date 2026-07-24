@@ -1001,6 +1001,8 @@ export class AgentSession {
 		| { kind: "command"; lane: SessionInputSchedule; item: PreparedCommandInput; phase: "executing" }
 		| undefined;
 	private readonly _sessionInputCheckpointWaiters = new Set<() => void>();
+	/** Direct prompts between admission and agent handoff; restart checkpoints wait for zero. */
+	private _directPromptSectionCount = 0;
 	private _steeringStopPending = false;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
@@ -4058,7 +4060,12 @@ export class AgentSession {
 		options: InternalPromptOptions | undefined,
 		releaseAdmission: () => void,
 	): Promise<void> {
-		const reportPreflight = oncePreflight(options?.preflightResult);
+		const endDirectPromptSection = this._enterDirectPromptSection();
+		const reportInput = oncePreflight(options?.preflightResult);
+		const reportPreflight: typeof reportInput = (success, queued) => {
+			endDirectPromptSection();
+			reportInput(success, queued);
+		};
 
 		let messages: AgentMessage[] | undefined;
 		let drainedNextTurnMessages: CustomMessage[] = [];
@@ -4124,6 +4131,7 @@ export class AgentSession {
 		}
 
 		if (!messages) {
+			endDirectPromptSection();
 			return;
 		}
 
@@ -4208,7 +4216,12 @@ export class AgentSession {
 	): Promise<void> {
 		const isInternalPrompt = options?.internalPrompt === true;
 		const expandPromptTemplates = isInternalPrompt ? false : (options?.expandPromptTemplates ?? true);
-		const reportPreflight = oncePreflight(options?.preflightResult);
+		const endDirectPromptSection = this._enterDirectPromptSection();
+		const reportInput = oncePreflight(options?.preflightResult);
+		const reportPreflight: typeof reportInput = (success, queued) => {
+			endDirectPromptSection();
+			reportInput(success, queued);
+		};
 		let messages: AgentMessage[] | undefined;
 		let acceptedAgentMessagePrompt: AcceptedAgentMessagePrompt | undefined;
 		let drainedNextTurnMessages: CustomMessage[] = [];
@@ -4423,6 +4436,7 @@ export class AgentSession {
 		}
 
 		if (!messages) {
+			endDirectPromptSection();
 			return;
 		}
 
@@ -5468,8 +5482,25 @@ export class AgentSession {
 		this._sessionInputCheckpointWaiters.clear();
 	}
 
+	/**
+	 * Marks a direct prompt as being between admission and its preflight outcome
+	 * (queued, handed off to the agent, or failed). Restart checkpoints wait for
+	 * these sections so an accepted input cannot fall between the queue snapshot
+	 * and the transcript flush.
+	 */
+	private _enterDirectPromptSection(): () => void {
+		this._directPromptSectionCount++;
+		let ended = false;
+		return () => {
+			if (ended) return;
+			ended = true;
+			this._directPromptSectionCount--;
+			this._notifySessionInputCheckpointChange();
+		};
+	}
+
 	async waitForSessionInputCheckpoint(signal?: AbortSignal): Promise<void> {
-		while (this._activeSessionInput !== undefined) {
+		while (this._activeSessionInput !== undefined || this._directPromptSectionCount > 0) {
 			if (signal?.aborted) throw new Error("Update restart preparation cancelled");
 			await new Promise<void>((resolve, reject) => {
 				const onChange = () => {
@@ -5489,6 +5520,9 @@ export class AgentSession {
 			});
 		}
 		if (signal?.aborted) throw new Error("Update restart preparation cancelled");
+		// Handed-off inputs reach the transcript through the event queue; drain it so
+		// the flush below persists them before the snapshot is taken.
+		await this._agentEventQueue;
 		this.sessionManager.flushNow();
 	}
 
