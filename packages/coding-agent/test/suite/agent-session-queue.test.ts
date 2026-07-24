@@ -1491,6 +1491,40 @@ prepared:${event.prompt}`,
 		expect(getUserTexts(harness)).toEqual(["kept"]);
 	});
 
+	it("does not start a queued turn after abortForUpdateRestart", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let providerCalls = 0;
+		let releaseFirst: (() => void) | undefined;
+		const firstGate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		harness.setResponses([
+			async () => {
+				await firstGate;
+				return fauxAssistantMessage("first done");
+			},
+			() => {
+				providerCalls++;
+				return fauxAssistantMessage("must not run");
+			},
+		]);
+
+		const first = harness.session.prompt("first");
+		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+		await harness.session.followUp("queued for restart");
+		harness.session.abortForUpdateRestart();
+		releaseFirst?.();
+		await first.catch(() => undefined);
+		await harness.session.agent.waitForIdle();
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		// The queued input must survive into the restart manifest instead of
+		// starting a fresh turn during teardown.
+		expect(providerCalls).toBe(0);
+		expect(harness.session.getFollowUpMessages()).toEqual(["queued for restart"]);
+	});
+
 	it("delivers follow-up messages only after the current run finishes", async () => {
 		const waiting = await createWaitingHarness();
 		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = waiting;

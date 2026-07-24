@@ -5506,6 +5506,11 @@ export class AgentSession {
 	}
 
 	abortForUpdateRestart(): void {
+		// Cancel scheduled pumps and suspend new ones: queued inputs must survive
+		// into the restart manifest instead of starting a turn during teardown.
+		this._sessionInputPumpRequested = false;
+		this._sessionInputPumpEpoch++;
+		this._sessionInputPumpSuspended = true;
 		this.abortRetry();
 		this._cancelActiveRlmChildRuns("Parent session aborted for update restart");
 		this._goalAbortInProgress = this._goalState.status === "active";
