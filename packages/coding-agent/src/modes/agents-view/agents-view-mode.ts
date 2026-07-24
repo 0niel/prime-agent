@@ -1029,10 +1029,17 @@ export class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		if (this.replyTarget) {
+			const target = this.replyTarget;
 			const text = value.trim();
 			if (text) {
 				this.editor.setText("");
-				await this.sendReply(this.replyTarget, text);
+				const sent = await this.sendReply(target, text);
+				if (sent) {
+					if (this.replyTarget === target) this.setReplyTarget(undefined);
+					await this.refreshSessions();
+				} else if (this.replyTarget === target && this.editor.getText().length === 0) {
+					this.editor.setText(value);
+				}
 			}
 			return;
 		}
@@ -1372,7 +1379,7 @@ export class AgentsViewMode implements Component, Focusable {
 		return data.text;
 	}
 
-	private async sendReply(target: { key: string; summary: SessionSummary }, text: string): Promise<void> {
+	private async sendReply(target: { key: string; summary: SessionSummary }, text: string): Promise<boolean> {
 		let activeSessionId = target.summary.activeSessionId;
 		let liveSummary = this.findSummaryByActiveSessionId(activeSessionId ?? target.key);
 		let cwdFallbackNotice: string | undefined;
@@ -1391,6 +1398,7 @@ export class AgentsViewMode implements Component, Focusable {
 				// streaming state for scheduling the prompt.
 				liveSummary = resumed.summary;
 				cwdFallbackNotice = resumed.cwdFallbackNotice;
+				this.inactiveAgentIdentities.delete(getSummaryIdentity(target.summary));
 				this.selectSummary(resumed.summary);
 			}
 			const behavior = liveSummary?.isStreaming ? "followUp" : undefined;
@@ -1399,10 +1407,10 @@ export class AgentsViewMode implements Component, Focusable {
 			// The fallback-directory notice must outlive the transient send statuses.
 			if (cwdFallbackNotice) this.setStatusMessage(cwdFallbackNotice, { sticky: true });
 			else this.setStatusMessage("Reply sent");
-			this.setReplyTarget(undefined);
-			await this.refreshSessions();
+			return true;
 		} catch (error) {
 			this.setStatusMessage(formatError("Failed to send reply", error));
+			return false;
 		}
 	}
 

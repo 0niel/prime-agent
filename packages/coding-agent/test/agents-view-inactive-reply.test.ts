@@ -22,6 +22,16 @@ function invoke(method: string, self: object, ...args: unknown[]): unknown {
 	return Reflect.get(AgentsViewMode.prototype, method).call(self, ...args);
 }
 
+function editorWithText(initial: string) {
+	let text = initial;
+	return {
+		getText: () => text,
+		setText: vi.fn((next: string) => {
+			text = next;
+		}),
+	};
+}
+
 describe("agents view reply on inactive sessions", () => {
 	const savedSummary = summary({
 		sessionFile: "/tmp/sessions/saved-1.jsonl",
@@ -82,6 +92,7 @@ describe("agents view reply on inactive sessions", () => {
 			// Stale pre-resume rows do not know the resumed session; scheduling must
 			// come from the resume response instead.
 			findSummaryByActiveSessionId: () => undefined,
+			inactiveAgentIdentities: new Set(["file:/tmp/sessions/saved-1.jsonl"]),
 			setStatusMessage: vi.fn(),
 			setReplyTarget: vi.fn(),
 			refreshSessions: vi.fn(async () => true),
@@ -96,7 +107,80 @@ describe("agents view reply on inactive sessions", () => {
 		);
 		expect(self.sendPrompt).toHaveBeenCalledWith("active-9", "wake up", "followUp");
 		expect(self.selectSummary).toHaveBeenCalledWith(expect.objectContaining({ activeSessionId: "active-9" }));
-		expect(self.setReplyTarget).toHaveBeenCalledWith(undefined);
+		expect(self.inactiveAgentIdentities).not.toContain("file:/tmp/sessions/saved-1.jsonl");
+		expect(self.setReplyTarget).not.toHaveBeenCalled();
+	});
+
+	it("preserves a replacement composer when an older reply succeeds", async () => {
+		const editor = editorWithText("old reply");
+		const oldTarget = { key: "saved-1", summary: savedSummary };
+		const newTarget = {
+			key: "active-2",
+			summary: summary({ id: "active-2", activeSessionId: "active-2", lifecycle: "live" }),
+		};
+		const self: Record<string, unknown> = {
+			replyTarget: oldTarget,
+			editor,
+			setReplyTarget: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+			sendReply: vi.fn(async () => {
+				self.replyTarget = newTarget;
+				editor.setText("new reply");
+				return true;
+			}),
+		};
+
+		await invoke("submit", self, "old reply");
+
+		expect(self.replyTarget).toBe(newTarget);
+		expect(editor.getText()).toBe("new reply");
+		expect(self.setReplyTarget).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		{ name: "resume failure", failure: "resume", remainsInactive: true },
+		{ name: "send failure", failure: "send", remainsInactive: false },
+		{
+			name: "replacement text entered during send failure",
+			failure: "send",
+			replacement: "replacement",
+			remainsInactive: false,
+		},
+	] as const)("handles $name", async ({ failure, replacement, remainsInactive }) => {
+		const editor = editorWithText("wake up");
+		const target = { key: "saved-1", summary: savedSummary };
+		const inactiveAgentIdentities = new Set(["file:/tmp/sessions/saved-1.jsonl"]);
+		const request = vi.fn(async () => {
+			if (failure === "resume") throw new Error("resume failed");
+			return {
+				success: true,
+				data: { ...savedSummary, lifecycle: "live", activeSessionId: "active-9" },
+			};
+		});
+		const sendPrompt = vi.fn(async () => {
+			if (replacement) editor.setText(replacement);
+			throw new Error("send failed");
+		});
+		const self: Record<string, unknown> = {
+			options: { config: { cwd: process.cwd() } },
+			requireClient: () => ({ request }),
+			findSummaryByActiveSessionId: () => undefined,
+			inactiveAgentIdentities,
+			replyTarget: target,
+			editor,
+			setStatusMessage: vi.fn(),
+			setReplyTarget: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+			selectSummary: vi.fn(),
+			sendPrompt,
+			sendReply: (replyTarget: unknown, text: string) => invoke("sendReply", self, replyTarget, text),
+		};
+
+		await invoke("submit", self, "wake up");
+
+		expect(editor.setText).toHaveBeenNthCalledWith(1, "");
+		expect(editor.getText()).toBe(replacement ?? "wake up");
+		expect(inactiveAgentIdentities.has("file:/tmp/sessions/saved-1.jsonl")).toBe(remainsInactive);
 	});
 
 	it("keeps the cwd-fallback notice visible after the reply is sent", async () => {
@@ -111,6 +195,7 @@ describe("agents view reply on inactive sessions", () => {
 			options: { config: { cwd: process.cwd() } },
 			requireClient: () => ({ request }),
 			findSummaryByActiveSessionId: () => undefined,
+			inactiveAgentIdentities: new Set(["file:/tmp/sessions/saved-1.jsonl"]),
 			setStatusMessage: vi.fn((message: string, options?: { sticky?: boolean }) => {
 				statuses.push([message, options]);
 			}),
