@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed daemon startup failing when an interrupted supervisor left an empty ownership directory.
+
 ## [0.3.3] - 2026-07-23
 
 - Removed the bundled orchestration heartbeat skill from the model system prompt.

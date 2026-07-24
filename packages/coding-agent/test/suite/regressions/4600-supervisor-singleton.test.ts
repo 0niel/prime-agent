@@ -891,6 +891,25 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 		}
 	});
 
+	it("reclaims empty owner directories left by interrupted startup", async () => {
+		const paths = await createPaths();
+		const abandonedDirectory = join(paths.registryDir, "abandoned-owner.owner");
+		mkdirSync(abandonedDirectory, { recursive: true });
+
+		const owner = await acquireDaemonSupervisorOwnership({
+			agentDir: paths.agentDir,
+			appVersion: "test",
+			descriptorDir: paths.descriptorDir,
+			generation: "healthy-owner",
+			registryDir: paths.registryDir,
+			socketPath: paths.socketPath,
+		});
+
+		expect(existsSync(abandonedDirectory)).toBe(false);
+		expect(owner.record.generation).toBe("healthy-owner");
+		await owner.release();
+	});
+
 	it("persists a fence when immutable scope proves a corrupt owner is unrelated", async () => {
 		const paths = await createPaths();
 		const targetOwner = await acquireDaemonSupervisorOwnership({
