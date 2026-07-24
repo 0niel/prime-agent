@@ -2580,18 +2580,16 @@ export class InteractiveMode {
 		this.updatePendingMessagesDisplay();
 	}
 
-	private async refreshConnectionCatalog(options?: { refreshCommands?: boolean }): Promise<void> {
+	private async refreshConnectionCatalog(): Promise<void> {
 		this.invalidateConnectionModelRefresh();
 		const [state, commands, modelCatalog, resources] = await Promise.all([
 			this.agentConnection.getState(),
-			options?.refreshCommands === false
-				? Promise.resolve(undefined)
-				: this.agentConnection.getCommands().catch(() => []),
+			this.agentConnection.getCommands().catch(() => []),
 			this.agentConnection.getModelCatalog(),
 			this.agentConnection.getResourceSnapshot(),
 		]);
 		this.applyConnectionStateSnapshot(state);
-		if (commands) this.connectionCommands = commands;
+		this.connectionCommands = commands;
 		this.applyConnectionModelCatalog(modelCatalog);
 		this.connectionModelsFetchedAt = Date.now();
 		this.connectionResourceSnapshot = resources;
@@ -2840,7 +2838,7 @@ export class InteractiveMode {
 		return this.connectionState?.scopedModels ?? [];
 	}
 
-	private async rebindCurrentSession(options?: { refreshCommands?: boolean }): Promise<void> {
+	private async rebindCurrentSession(): Promise<void> {
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		if (this.localSessionHost) {
@@ -2852,7 +2850,7 @@ export class InteractiveMode {
 			await this.bindCurrentSessionExtensions();
 		} else {
 			setRegisteredThemes(this.uiServices.getThemes());
-			await this.refreshConnectionCatalog(options);
+			await this.refreshConnectionCatalog();
 			this.setupAutocompleteProvider();
 			this.showLoadedResources({ force: false, showDiagnosticsWhenQuiet: true });
 		}
@@ -5073,8 +5071,7 @@ export class InteractiveMode {
 						this.resetExtensionUI();
 						this.applyConnectionStateSnapshot(event.state);
 						this.resetCurrentSessionRenderState();
-						await this.rebindCurrentSession({ refreshCommands: false });
-						await this.refreshCommandCatalogForCurrentSession?.();
+						await this.rebindCurrentSession();
 						await this.renderInitialMessages();
 						this.ui.requestRender();
 					});

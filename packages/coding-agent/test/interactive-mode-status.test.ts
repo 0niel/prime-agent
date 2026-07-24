@@ -1361,7 +1361,6 @@ describe("InteractiveMode connection events", () => {
 			applyConnectionStateSnapshot: vi.fn(),
 			resetCurrentSessionRenderState: vi.fn(),
 			rebindCurrentSession: vi.fn(async () => {}),
-			refreshCommandCatalogForCurrentSession: vi.fn(async () => {}),
 			renderInitialMessages: vi.fn(async () => {}),
 			ui: { requestRender: vi.fn() },
 			handleEvent: vi.fn(),
@@ -1380,16 +1379,13 @@ describe("InteractiveMode connection events", () => {
 		const applySnapshotOrder = fakeThis.applyConnectionStateSnapshot.mock.invocationCallOrder[0];
 		const resetRenderOrder = fakeThis.resetCurrentSessionRenderState.mock.invocationCallOrder[0];
 		const rebindOrder = fakeThis.rebindCurrentSession.mock.invocationCallOrder[0];
-		const refreshCommandsOrder = fakeThis.refreshCommandCatalogForCurrentSession.mock.invocationCallOrder[0];
 		const renderMessagesOrder = fakeThis.renderInitialMessages.mock.invocationCallOrder[0];
 		expect(resetOrder).toBeLessThan(applySnapshotOrder);
 		expect(applySnapshotOrder).toBeLessThan(resetRenderOrder);
 		expect(resetRenderOrder).toBeLessThan(rebindOrder);
-		expect(rebindOrder).toBeLessThan(refreshCommandsOrder);
-		expect(refreshCommandsOrder).toBeLessThan(renderMessagesOrder);
+		expect(rebindOrder).toBeLessThan(renderMessagesOrder);
 		expect(fakeThis.applyConnectionStateSnapshot).toHaveBeenCalledWith(state);
 		expect(fakeThis.resetCurrentSessionRenderState).toHaveBeenCalledWith();
-		expect(fakeThis.rebindCurrentSession).toHaveBeenCalledWith({ refreshCommands: false });
 		expect(fakeThis.renderInitialMessages).toHaveBeenCalledWith();
 		expect(fakeThis.ui.requestRender).toHaveBeenCalledWith();
 	});
@@ -1600,7 +1596,6 @@ describe("InteractiveMode connection events", () => {
 			applyConnectionStateSnapshot: vi.fn(),
 			resetCurrentSessionRenderState: vi.fn(),
 			rebindCurrentSession: vi.fn(async () => {}),
-			refreshCommandCatalogForCurrentSession: vi.fn(async () => {}),
 			renderInitialMessages: vi.fn(async () => {}),
 			ui: { requestRender: vi.fn() },
 			showError: vi.fn(),
@@ -2827,7 +2822,14 @@ function createFakeConnectionSession(commandName: string): AgentSessionRuntime["
 				},
 			},
 		],
-		resourceLoader: { getSkills: () => ({ skills: [] }) },
+		resourceLoader: {
+			getSkills: () => ({ skills: [] }),
+			getPrompts: () => ({ prompts: [] }),
+			getThemes: () => ({ themes: [] }),
+			getExtensions: () => ({ extensions: [], errors: [] }),
+			getAgentsFiles: () => ({ agentsFiles: [] }),
+		},
+		modelRegistry: { refreshModelCatalog: async () => ({ models: [], configuredProviders: [] }) },
 		sessionManager: {
 			getCwd: () => "/tmp/project",
 			getSessionDir: () => "/tmp/sessions",
@@ -2903,11 +2905,24 @@ describe("InteractiveMode session switch command catalog", () => {
 				sessionEventQueue: Promise.resolve(),
 				sessionEventGeneration: 0,
 				connectionCommands: await connection.getCommands(),
+				connectionModelsRefreshVersion: 0,
+				bindLocalSessionExtensions: false,
+				uiServices: { getThemes: () => [] },
+				toolDefinitionCache: { clear: vi.fn() },
+				applyRuntimeSettings: vi.fn(),
+				applyConnectionModelCatalog: vi.fn(),
+				showLoadedResources: vi.fn(),
+				refreshHeartbeatCatalog: vi.fn(async () => {}),
+				updateAvailableProviderCount: vi.fn(async () => {}),
+				updateEditorBorderColor: vi.fn(),
+				updateTerminalTitle: vi.fn(),
+				setGoalAnnouncementBaseline: vi.fn(),
+				syncGoalTray: vi.fn(),
+				getGoalState: () => emptyGoalState(),
 				resetSideQuestion: vi.fn(),
 				resetExtensionUI: vi.fn(),
 				applyConnectionStateSnapshot: vi.fn(),
 				resetCurrentSessionRenderState: vi.fn(() => calls.push("reset")),
-				rebindCurrentSession: vi.fn(async () => {}),
 				setupAutocompleteProvider: vi.fn(() => calls.push("catalog")),
 				renderInitialMessages: vi.fn(async () => {
 					calls.push("render");
