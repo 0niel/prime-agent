@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-07-23
+
 - Removed the bundled orchestration heartbeat skill from the model system prompt.
 - Fixed feature hints crowding queued messages and side questions by placing them below the recap and hiding them while messages are queued ([ENG-4741](https://linear.app/primeintellect/issue/ENG-4741/recap-queuefollow-upmessage-hint-looks-cluttered)).
 - Fixed `/btw` truncating long answers by rendering side questions in the scrollable transcript.

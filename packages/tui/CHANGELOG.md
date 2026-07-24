@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-07-23
+
 - Changed `SelectList` selection cursor from `→` to `›` for consistency with tree and user-message selectors.
 - Changed slash-command autocomplete to show argument hints and source tags inline, selected descriptions separately, and directional hidden-result counts.
 
