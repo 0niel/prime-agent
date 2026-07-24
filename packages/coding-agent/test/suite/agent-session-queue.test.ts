@@ -2610,6 +2610,97 @@ prepared:${event.prompt}`,
 		expect(harness.session.getSteeringMessages()).toEqual(["first", "second"]);
 	});
 
+	it("rejects both agent-message outcome legs when keyed follow-ups coalesce", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		withStreaming(harness, true);
+		await harness.session.followUp("existing", undefined, { queueKey: "same" });
+
+		const expandedId = "agentmsg_coalesced_expanded";
+		const earlyExpandedDelivery = expect(
+			harness.session.waitForAgentMessagePromptDelivery(expandedId),
+		).rejects.toThrow("equivalent follow-up is already pending");
+		const completion = expect(
+			harness.session.promptAndWait("duplicate", {
+				streamingBehavior: "followUp",
+				followUpQueueKey: "same",
+				agentMessageId: expandedId,
+			}),
+		).rejects.toThrow("equivalent follow-up is already pending");
+		await Promise.all([earlyExpandedDelivery, completion]);
+		await expect(harness.session.waitForAgentMessagePromptDelivery(expandedId)).rejects.toThrow(
+			"equivalent follow-up is already pending",
+		);
+
+		const restoredId = "agentmsg_coalesced_restored";
+		const earlyRestoredDelivery = expect(
+			harness.session.waitForAgentMessagePromptDelivery(restoredId),
+		).rejects.toThrow("equivalent follow-up is already pending");
+		await expect(
+			harness.session.restoreFollowUpMessage("restored duplicate", undefined, {
+				queueKey: "same",
+				agentMessageId: restoredId,
+			}),
+		).resolves.toBe(false);
+		await earlyRestoredDelivery;
+		await expect(harness.session.waitForAgentMessagePromptDelivery(restoredId)).rejects.toThrow(
+			"equivalent follow-up is already pending",
+		);
+		expect(harness.session.getFollowUpMessages()).toEqual(["existing"]);
+	});
+
+	it.each(["queued", "preparing"] as const)(
+		"keeps a coalesced duplicate with its $phase agent-message owner",
+		async (phase) => {
+			const prepared = createDeferred<void>();
+			const releasePreparation = createDeferred<void>();
+			const harness = await createHarness({
+				extensionFactories:
+					phase === "preparing"
+						? [
+								(pi) => {
+									pi.on("before_agent_start", async () => {
+										prepared.resolve();
+										await releasePreparation.promise;
+									});
+								},
+							]
+						: [],
+			});
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("accepted done")]);
+			const pause = phase === "queued" ? harness.session.acquireQueuedWorkPause() : undefined;
+			const id = `agentmsg_${phase}_coalesced_owner`;
+			withStreaming(harness, true);
+
+			const completion = harness.session.promptAndWait("accepted", {
+				streamingBehavior: "followUp",
+				followUpQueueKey: "same",
+				agentMessageId: id,
+				resumeIfIdle: true,
+			});
+			if (phase === "queued") {
+				await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toEqual(["accepted"]));
+			} else {
+				withStreaming(harness, false);
+				await prepared.promise;
+				await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toEqual([]));
+			}
+			const earlyDelivery = harness.session.waitForAgentMessagePromptDelivery(id);
+			await expect(
+				harness.session.restoreFollowUpMessage("duplicate", undefined, { queueKey: "same", agentMessageId: id }),
+			).resolves.toBe(false);
+
+			withStreaming(harness, false);
+			pause?.release();
+			releasePreparation.resolve();
+			await expect(earlyDelivery).resolves.toBeUndefined();
+			await expect(completion).resolves.toBeUndefined();
+			await expect(harness.session.waitForAgentMessagePromptDelivery(id)).resolves.toBeUndefined();
+			expect(getUserTexts(harness)).toEqual(["accepted"]);
+		},
+	);
+
 	it("retains active preparation while blocking duplicate and direct admission", async () => {
 		let hookRuns = 0;
 		let pause: { release(): void } | undefined;

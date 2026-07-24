@@ -4860,7 +4860,7 @@ describe("daemon mode helpers", () => {
 		expect(continueAgent).not.toHaveBeenCalled();
 	});
 
-	it("preserves template expansion and queue keys for correlated daemon steering", async () => {
+	it.each(["steer", "follow_up"] as const)("routes correlated daemon %s commands", async (type) => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -4868,51 +4868,90 @@ describe("daemon mode helpers", () => {
 			},
 		});
 		const prompt = vi.fn(async () => {});
-		const acceptAgentMessagePrompt = vi.fn(async (...args: Parameters<typeof prompt>) => prompt(...args));
 		const restoreSteeringMessage = vi.fn(async () => {});
+		const restoreFollowUpMessage = vi.fn(async () => true);
 		const state = makeState("active-1") as ActiveSessionState & {
 			runtime: ActiveSessionState["runtime"] & {
 				session: {
 					prompt: typeof prompt;
-					acceptAgentMessagePrompt: typeof acceptAgentMessagePrompt;
 					restoreSteeringMessage: typeof restoreSteeringMessage;
+					restoreFollowUpMessage: typeof restoreFollowUpMessage;
 				};
 			};
 		};
-		state.runtime.session = { prompt, acceptAgentMessagePrompt, restoreSteeringMessage } as never;
+		state.runtime.session = { prompt, restoreSteeringMessage, restoreFollowUpMessage } as never;
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
 			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
 		};
 		internals.sessions.set(state.activeSessionId, state);
+		const client = makeClient("client-1", state.activeSessionId);
+		const base = { type, activeSessionId: state.activeSessionId } as const;
 
-		await internals.handleCommand(makeClient("client-1", state.activeSessionId), {
-			id: "command-1",
-			type: "steer",
-			activeSessionId: state.activeSessionId,
-			message: "queued heartbeat",
-			queueKey: "heartbeat:job-1",
-			agentMessageId: "agentmsg_steer",
+		await internals.handleCommand(client, {
+			...base,
+			message: "expanded prompt",
+			queueKey: "heartbeat:expanded",
+			agentMessageId: `agentmsg_expanded_${type}`,
 		});
-
 		expect(prompt).toHaveBeenCalledWith(
-			"queued heartbeat",
+			"expanded prompt",
 			expect.objectContaining({
-				streamingBehavior: "steer",
+				streamingBehavior: type === "steer" ? "steer" : "followUp",
 				queueIfBusy: true,
-				followUpQueueKey: "heartbeat:job-1",
-				agentMessageId: "agentmsg_steer",
+				followUpQueueKey: "heartbeat:expanded",
+				agentMessageId: `agentmsg_expanded_${type}`,
 			}),
 		);
-		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
-		expect(restoreSteeringMessage).not.toHaveBeenCalled();
+
+		const replayFields = {
+			content: [{ type: "text" as const, text: "restored content" }],
+			customMessage: {
+				role: "custom" as const,
+				customType: "restored",
+				content: "restored custom message",
+				display: false,
+				timestamp: 1,
+			},
+			prefixMessages: [
+				{
+					role: "custom" as const,
+					customType: "restored-prefix",
+					content: "restored prefix",
+					display: false,
+					timestamp: 1,
+				},
+			],
+		};
+		for (const expandPromptTemplates of [undefined, true]) {
+			await expect(
+				internals.handleCommand(client, {
+					...base,
+					message: "invalid replay",
+					expandPromptTemplates,
+					...replayFields,
+				}),
+			).rejects.toThrow("require expandPromptTemplates=false");
+		}
+
+		await internals.handleCommand(client, {
+			...base,
+			message: "restored prompt",
+			queueKey: "heartbeat:job-1",
+			agentMessageId: `agentmsg_${type}`,
+			expandPromptTemplates: false,
+			...replayFields,
+		});
+		const restore = type === "steer" ? restoreSteeringMessage : restoreFollowUpMessage;
+		expect(restore).toHaveBeenCalledWith("restored prompt", undefined, {
+			queueKey: "heartbeat:job-1",
+			agentMessageId: `agentmsg_${type}`,
+			...replayFields,
+		});
+		expect(prompt).toHaveBeenCalledOnce();
+
 		await expect(
-			internals.handleCommand(makeClient("client-1", state.activeSessionId), {
-				type: "steer",
-				activeSessionId: state.activeSessionId,
-				message: "invalid",
-				agentMessageId: "",
-			}),
+			internals.handleCommand(client, { ...base, message: "invalid", agentMessageId: "" }),
 		).rejects.toThrow("agentMessageId must not be empty");
 	});
 

@@ -4768,11 +4768,6 @@ export class AgentSession {
 			});
 			if (!queued) {
 				this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
-				this._settleAgentMessage(
-					options.agentMessageId,
-					"completion",
-					new Error("Prompt was not queued because an equivalent follow-up is already pending."),
-				);
 			}
 		} catch (error) {
 			this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
@@ -4828,14 +4823,20 @@ export class AgentSession {
 		options: { restore?: boolean } = {},
 	): boolean {
 		const queue = schedule === "steer" ? this._steeringMessages : this._followUpMessages;
-		if (
-			schedule === "followUp" &&
-			input.kind === "prompt" &&
-			input.queueKey &&
-			(queue.some((item) => item.queueKey === input.queueKey) ||
-				(this._activeSessionInput?.kind === "prompt" &&
-					this._activeSessionInput.items.some((item) => item.queueKey === input.queueKey)))
-		) {
+		const coalescedOwner =
+			schedule === "followUp" && input.kind === "prompt" && input.queueKey
+				? (queue.find((item) => item.queueKey === input.queueKey) ??
+					(this._activeSessionInput?.kind === "prompt"
+						? this._activeSessionInput.items.find((item) => item.queueKey === input.queueKey)
+						: undefined))
+				: undefined;
+		if (coalescedOwner) {
+			if (input.agentMessageId !== coalescedOwner.agentMessageId) {
+				this._rejectAgentMessage(
+					input.agentMessageId,
+					new Error("Prompt was not queued because an equivalent follow-up is already pending."),
+				);
+			}
 			return false;
 		}
 		queue.push(input);

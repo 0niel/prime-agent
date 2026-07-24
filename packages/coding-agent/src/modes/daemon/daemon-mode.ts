@@ -2610,6 +2610,16 @@ export class AgentDaemon {
 		if ("agentMessageId" in command && command.agentMessageId === "") {
 			throw new Error("agentMessageId must not be empty");
 		}
+		if ((command.type === "steer" || command.type === "follow_up") && command.expandPromptTemplates !== false) {
+			const replayFields = (["content", "customMessage", "prefixMessages"] as const).filter(
+				(field) => command[field] !== undefined,
+			);
+			if (replayFields.length > 0) {
+				throw new Error(
+					`${command.type} replay fields (${replayFields.join(", ")}) require expandPromptTemplates=false`,
+				);
+			}
+		}
 		switch (command.type) {
 			case "ack_result":
 				return undefined;
