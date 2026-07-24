@@ -133,22 +133,34 @@ describe("InteractiveMode startup hints", () => {
 		expect(shutdown).toHaveBeenCalledOnce();
 	});
 
-	it("uses the shared session view for non-daemon chats", async () => {
-		const returnToAgentsView = vi.fn(async () => {});
+	it("does not open the local session view while the editor has a draft", async () => {
 		const showLocalSessionView = vi.fn(async () => ({ type: "opened" as const }));
-		const shutdown = vi.fn(async () => {});
+		const showStatus = vi.fn();
 		const mode = Object.assign(
 			createMode(false, false, () => "draft prompt"),
 			{
-				returnToAgentsView,
 				showLocalSessionView,
-				shutdown,
+				showStatus,
 			},
 		);
 
 		await Reflect.get(InteractiveMode.prototype, "requestAgentsView").call(mode);
 
-		expect(returnToAgentsView).not.toHaveBeenCalled();
+		expect(showLocalSessionView).not.toHaveBeenCalled();
+		expect(showStatus).toHaveBeenCalledWith("Send, stash, or clear your draft before opening agents");
+	});
+
+	it("routes an empty local editor to the shared session view", async () => {
+		const showLocalSessionView = vi.fn(async () => ({ type: "opened" as const }));
+		const shutdown = vi.fn(async () => {});
+		const mode = Object.assign(createMode(false, false), {
+			returnToAgentsView: vi.fn(async () => {}),
+			showLocalSessionView,
+			shutdown,
+		});
+
+		await Reflect.get(InteractiveMode.prototype, "requestAgentsView").call(mode);
+
 		expect(showLocalSessionView).toHaveBeenCalledOnce();
 		expect(shutdown).not.toHaveBeenCalled();
 	});

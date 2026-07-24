@@ -10,7 +10,11 @@ import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session
 import { installAgentTraceUpload } from "../src/core/agent-traces.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import type { AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
-import { type CreateRlmSubagentRuntimeOptions, createDefaultRlmSubagentSessionName } from "../src/core/rlm-runtime.js";
+import {
+	type CreateRlmSubagentRuntimeOptions,
+	createDefaultRlmSubagentSessionName,
+	type SubagentRuntimeHost,
+} from "../src/core/rlm-runtime.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
@@ -273,6 +277,66 @@ describe("daemon mode helpers", () => {
 		expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
 		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toContain(`To: ${defaultSubagentName}, active child`);
 		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toContain("report current progress");
+	});
+
+	it("starts trace flush and skips the registry when teardown wins the retention race", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-trace-race-"));
+		try {
+			const manager = SessionManager.create(tempDir, tempDir);
+			manager.newSession();
+			let markTraceStarted: () => void = () => {};
+			const traceStarted = new Promise<void>((resolve) => {
+				markTraceStarted = resolve;
+			});
+			const fetchFn = vi.fn(async () => {
+				markTraceStarted();
+				return await new Promise<Response>(() => {});
+			});
+			installAgentTraceUpload(manager, {
+				authStorage: AuthStorage.inMemory({
+					"prime-agent-traces": { type: "api_key", key: "trace-key" },
+				}),
+				settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+				fetchFn,
+			});
+			manager.appendSessionInfo("trace-race");
+
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const parentState = makeState("parent");
+			const parentSession = makeRuntimeSession(manager);
+			parentSession.retainFinishedRlmChildSession = vi.fn(() => false);
+			const childState = makeState("child", parentState.activeSessionId);
+			const childSession = makeRuntimeSession(manager);
+			childState.runtime = { ...childState.runtime, session: childSession } as ActiveSessionState["runtime"];
+			// Competing teardown already closed the state, so this release-time close is a no-op.
+			const closeSession = vi.fn(async () => {});
+			const recordRlmSubagentRegistryEntry = vi.fn();
+			Object.assign(daemon, {
+				findRuntimeState: vi.fn(() => childState),
+				closeSession,
+				recordRlmSubagentRegistryEntry,
+			});
+			const host = Reflect.get(daemon, "createSubagentRuntimeHost").call(daemon, parentState) as SubagentRuntimeHost;
+
+			await host.releaseRlmSubagentRuntime?.(
+				childState.runtime,
+				{ parentSession, id: "child-1" } as CreateRlmSubagentRuntimeOptions,
+				"done",
+			);
+			await traceStarted;
+
+			expect(fetchFn).toHaveBeenCalledOnce();
+			expect(parentSession.retainFinishedRlmChildSession).toHaveBeenCalledWith("child-1", childSession);
+			expect(closeSession).toHaveBeenCalledWith(childState, "completed");
+			expect(recordRlmSubagentRegistryEntry).not.toHaveBeenCalled();
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 
 	it("keeps RLM heartbeats active when a successful subagent is retained", async () => {

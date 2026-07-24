@@ -6984,13 +6984,13 @@ export class InteractiveMode {
 	}
 
 	private async requestAgentsView(): Promise<void> {
+		if (this.editor.getText().length > 0) {
+			this.showStatus("Send, stash, or clear your draft before opening agents");
+			return;
+		}
 		if (!this.options.returnToAgentsView) {
 			const result = await this.showLocalSessionView();
 			if (result.type === "exit") await this.shutdown();
-			return;
-		}
-		if (this.editor.getText().length > 0) {
-			this.showStatus("Send, stash, or clear your draft before opening agents");
 			return;
 		}
 		await this.returnToAgentsView();

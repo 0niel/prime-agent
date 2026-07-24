@@ -1930,6 +1930,11 @@ export class AgentDaemon {
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status) => {
 				const state = this.findRuntimeState(runtime);
+				// Trace sharing is best-effort telemetry. In particular, 429 retries can
+				// take minutes and must not delay the model-facing rlm.run result or retention.
+				if (state && status === "done") {
+					void flushAgentTraceUpload(state.runtime.session.sessionManager).catch(() => undefined);
+				}
 				// A successful subagent stays resident so it's still viewable and messageable;
 				// closeChildSessions tears it down with the parent. Errored or cancelled children
 				// would re-seed as "done", so close them immediately.
@@ -1938,9 +1943,6 @@ export class AgentDaemon {
 					// only after retention succeeds, so a late completion cannot overwrite a
 					// durable deletion tombstone.
 					if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
-						// Trace sharing is best-effort telemetry. In particular, 429 retries can
-						// take minutes and must not delay the model-facing rlm.run result.
-						void flushAgentTraceUpload(state.runtime.session.sessionManager).catch(() => undefined);
 						if (runtime.session.sessionFile) {
 							const retainedModel = runtime.session.model ?? options.model;
 							this.recordRlmSubagentRegistryEntry(parentState, {
