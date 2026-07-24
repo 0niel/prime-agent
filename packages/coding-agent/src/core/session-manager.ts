@@ -4,6 +4,7 @@ import { randomUUID } from "crypto";
 import {
 	appendFileSync,
 	chmodSync,
+	chownSync,
 	createReadStream,
 	existsSync,
 	mkdirSync,
@@ -61,9 +62,10 @@ function realpathIfPresent(path: string): string {
 	}
 }
 
-function statModeIfPresent(path: string): number | undefined {
+function statMetadataIfPresent(path: string): { mode: number; uid: number; gid: number } | undefined {
 	try {
-		return statSync(path).mode & 0o777;
+		const { mode, uid, gid } = statSync(path);
+		return { mode: mode & 0o777, uid, gid };
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
@@ -1224,10 +1226,11 @@ export class SessionManager {
 		mkdirSync(directory, { recursive: true });
 		const tempPath = join(directory, `.${basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
 		try {
-			const mode = statModeIfPresent(targetPath);
-			writeFileSync(tempPath, content, mode === undefined ? undefined : { mode });
-			if (mode !== undefined) {
-				chmodSync(tempPath, mode);
+			const metadata = statMetadataIfPresent(targetPath);
+			writeFileSync(tempPath, content, metadata === undefined ? undefined : { mode: metadata.mode });
+			if (metadata !== undefined) {
+				chownSync(tempPath, metadata.uid, metadata.gid);
+				chmodSync(tempPath, metadata.mode);
 			}
 			renameSync(tempPath, targetPath);
 		} finally {

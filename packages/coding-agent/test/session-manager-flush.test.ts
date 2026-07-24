@@ -1,12 +1,14 @@
 import {
 	appendFileSync,
 	chmodSync,
+	type chownSync,
 	existsSync,
 	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	type renameSync,
 	rmSync,
 	statSync,
 	symlinkSync,
@@ -16,17 +18,32 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+type ChmodSync = typeof chmodSync;
+type ChownSync = typeof chownSync;
+type RenameSync = typeof renameSync;
 type WriteFileSync = typeof writeFileSync;
 
 const fsMocks = vi.hoisted(() => ({
 	actualWriteFileSync: undefined as WriteFileSync | undefined,
+	chmodSync: vi.fn<ChmodSync>(),
+	chownSync: vi.fn<ChownSync>(),
+	renameSync: vi.fn<RenameSync>(),
 	writeFileSync: vi.fn<WriteFileSync>(),
 }));
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	fsMocks.actualWriteFileSync = actual.writeFileSync;
+	fsMocks.chmodSync.mockImplementation(actual.chmodSync);
+	fsMocks.chownSync.mockImplementation(actual.chownSync);
+	fsMocks.renameSync.mockImplementation(actual.renameSync);
 	fsMocks.writeFileSync.mockImplementation(actual.writeFileSync);
-	return { ...actual, writeFileSync: fsMocks.writeFileSync };
+	return {
+		...actual,
+		chmodSync: fsMocks.chmodSync,
+		chownSync: fsMocks.chownSync,
+		renameSync: fsMocks.renameSync,
+		writeFileSync: fsMocks.writeFileSync,
+	};
 });
 
 import { SessionManager } from "../src/core/session-manager.js";
@@ -98,18 +115,63 @@ describe("SessionManager.flushNow", () => {
 		);
 	});
 
-	it("preserves live-file permissions across rewrites", () => {
+	it("preserves live-file metadata before atomically replacing it", () => {
 		const dir = createTempDir();
 		const mgr = SessionManager.create(dir, join(dir, "sessions"));
-		mgr.appendCustomEntry("before_permission_check");
+		mgr.appendCustomEntry("before_metadata_check");
 		mgr.flushNow();
 		const file = mgr.getSessionFile()!;
 		chmodSync(file, 0o660);
+		const before = statSync(file);
+		fsMocks.chownSync.mockClear();
+		fsMocks.chownSync.mockImplementationOnce(() => undefined);
+		fsMocks.chmodSync.mockClear();
+		fsMocks.renameSync.mockClear();
 
 		mgr.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
 		mgr.flushNow();
 
-		expect(statSync(file).mode & 0o777).toBe(0o660);
+		const tempPath = fsMocks.chownSync.mock.calls[0]?.[0];
+		expect(tempPath).toEqual(expect.any(String));
+		expect(fsMocks.chownSync).toHaveBeenCalledWith(tempPath, before.uid, before.gid);
+		expect(fsMocks.chmodSync).toHaveBeenCalledWith(tempPath, before.mode & 0o777);
+		expect(fsMocks.renameSync).toHaveBeenCalledWith(tempPath, join(dirname(tempPath as string), basename(file)));
+		expect(fsMocks.chownSync.mock.invocationCallOrder[0]!).toBeLessThan(
+			fsMocks.chmodSync.mock.invocationCallOrder[0]!,
+		);
+		expect(fsMocks.chmodSync.mock.invocationCallOrder[0]!).toBeLessThan(
+			fsMocks.renameSync.mock.invocationCallOrder[0]!,
+		);
+		const after = statSync(file);
+		expect({ mode: after.mode & 0o777, uid: after.uid, gid: after.gid }).toEqual({
+			mode: before.mode & 0o777,
+			uid: before.uid,
+			gid: before.gid,
+		});
+	});
+
+	it("preserves live bytes and cleans the temp file when restoring ownership fails", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+		mgr.appendCustomEntry("before_ownership_failure");
+		mgr.flushNow();
+		const file = mgr.getSessionFile()!;
+		const before = readFileSync(file);
+		const tempPrefix = `.${basename(file)}.`;
+		const permissionError = Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+		fsMocks.chownSync.mockImplementationOnce(() => {
+			throw permissionError;
+		});
+		fsMocks.renameSync.mockClear();
+
+		mgr.appendMessage({ role: "user", content: "pending", timestamp: Date.now() });
+
+		expect(() => mgr.flushNow()).toThrow(permissionError);
+		expect(fsMocks.renameSync).not.toHaveBeenCalled();
+		expect(readFileSync(file)).toEqual(before);
+		expect(readdirSync(dirname(file)).filter((name) => name.startsWith(tempPrefix) && name.endsWith(".tmp"))).toEqual(
+			[],
+		);
 	});
 
 	it("rewrites a cross-directory symlink target without replacing the alias", () => {
