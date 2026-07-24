@@ -30,7 +30,12 @@ function deferred<T>() {
 function refreshHarness() {
 	const applySessionList = vi.fn();
 	const reconcileCatalogs = vi.fn();
-	const persistentState: { savedSessions?: unknown[]; heartbeats?: unknown[] } = {};
+	const persistentState: {
+		savedSessions?: unknown[];
+		lastSuccessfulSavedSessions?: unknown[];
+		heartbeats?: unknown[];
+		savedCatalogGeneration?: number;
+	} = {};
 	return {
 		reconnectPromise: undefined,
 		daemonShutdownReceived: false,
@@ -122,6 +127,100 @@ describe("#502 unified session view regressions", () => {
 
 		expect([harness.savedSessions, harness.persistentState.savedSessions]).toEqual([previous, previous]);
 		expect(harness.savedCatalogRefreshPending).toBe(false);
+	});
+
+	test("reconnect retries the saved catalog and fences a stale startup scan", async () => {
+		const previous = [{ path: "/tmp/previous.jsonl", id: "previous" }];
+		const startup = deferred<typeof previous>();
+		const retried = deferred<typeof previous>();
+		const replacement = [{ path: "/tmp/retried.jsonl", id: "retried" }];
+		const harness = {
+			...refreshHarness(),
+			reconnectPromise: undefined as Promise<void> | undefined,
+			savedSessions: previous,
+			lastSuccessfulSavedSessions: previous,
+		};
+		harness.persistentState.savedSessions = previous;
+		harness.options = {
+			adapter: {
+				loadSavedSessions: vi.fn().mockReturnValueOnce(startup.promise).mockReturnValueOnce(retried.promise),
+			},
+		};
+		const refresh =
+			privateMethod<
+				(
+					this: typeof harness,
+					options?: { duringReconnect?: boolean; preserveStatusOnError?: boolean },
+				) => Promise<boolean>
+			>("refreshSavedSessions");
+
+		harness.reconnectPromise = undefined;
+		const startupScan = refresh.call(harness);
+		harness.reconnectPromise = Promise.resolve();
+		const retry = refresh.call(harness, { duringReconnect: true, preserveStatusOnError: true });
+		expect(harness.savedCatalogGeneration).toBe(2);
+		expect(harness.persistentState.savedCatalogGeneration).toBe(2);
+
+		retried.resolve(replacement);
+		expect(await retry).toBe(true);
+		startup.resolve([{ path: "/tmp/stale.jsonl", id: "stale" }]);
+		expect(await startupScan).toBe(false);
+		expect(harness.savedSessions).toEqual(replacement);
+	});
+
+	test("failed saved retry during reconnect preserves status and complete catalog", async () => {
+		const previous = [{ path: "/tmp/previous.jsonl", id: "previous" }];
+		const streamed = { path: "/tmp/partial.jsonl", id: "partial" };
+		const harness = {
+			...refreshHarness(),
+			reconnectPromise: Promise.resolve(),
+			savedSessions: previous,
+			lastSuccessfulSavedSessions: previous,
+		};
+		harness.persistentState.savedSessions = previous;
+		harness.options = {
+			adapter: {
+				loadSavedSessions: async ({ onSession }: { onSession: (session: typeof streamed) => void }) => {
+					onSession(streamed);
+					throw new Error("retry failed");
+				},
+			},
+		};
+
+		const refreshed = await privateMethod<
+			(
+				this: typeof harness,
+				options: { duringReconnect: boolean; preserveStatusOnError: boolean },
+			) => Promise<boolean>
+		>("refreshSavedSessions").call(harness, { duringReconnect: true, preserveStatusOnError: false });
+
+		expect(refreshed).toBe(false);
+		expect(harness.savedSessions).toEqual(previous);
+		expect(harness.persistentState.savedSessions).toEqual(previous);
+		expect(harness.setStatusMessage).not.toHaveBeenCalled();
+	});
+
+	test("a pending saved scan cannot overwrite daemon shutdown status", async () => {
+		const scan = deferred<void>();
+		const harness = {
+			...refreshHarness(),
+			savedSessions: [],
+			lastSuccessfulSavedSessions: [],
+			options: {
+				adapter: {
+					loadSavedSessions: async () => {
+						await scan.promise;
+						throw new Error("scan failed");
+					},
+				},
+			},
+		};
+
+		const pending = privateMethod<(this: typeof harness) => Promise<boolean>>("refreshSavedSessions").call(harness);
+		harness.daemonShutdownReceived = true;
+		scan.resolve();
+		expect(await pending).toBe(false);
+		expect(harness.setStatusMessage).not.toHaveBeenCalled();
 	});
 
 	test("a missing selection anchor blocks open only until both catalogs settle", () => {

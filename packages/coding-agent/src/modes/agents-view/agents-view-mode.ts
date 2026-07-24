@@ -1660,8 +1660,10 @@ export class AgentsViewMode implements Component, Focusable {
 		this.ui.requestRender();
 	}
 
-	private async refreshSavedSessions(options: { preserveStatusOnError?: boolean } = {}): Promise<boolean> {
-		if (this.reconnectPromise || this.daemonShutdownReceived) return false;
+	private async refreshSavedSessions(
+		options: { duringReconnect?: boolean; preserveStatusOnError?: boolean } = {},
+	): Promise<boolean> {
+		if ((!options.duringReconnect && this.reconnectPromise) || this.daemonShutdownReceived) return false;
 		const generation = ++this.savedCatalogGeneration;
 		this.persistentState.savedCatalogGeneration = generation;
 		this.savedCatalogRefreshPending = true;
@@ -1694,7 +1696,7 @@ export class AgentsViewMode implements Component, Focusable {
 				this.savedSessions = successfulSessions;
 				this.persistentState.savedSessions = successfulSessions;
 				this.reconcileCatalogs();
-				if (!options.preserveStatusOnError) {
+				if (!options.preserveStatusOnError && !this.reconnectPromise && !this.daemonShutdownReceived) {
 					this.setStatusMessage(formatError("Failed to load saved sessions", error));
 				}
 			}
@@ -1892,6 +1894,7 @@ export class AgentsViewMode implements Component, Focusable {
 				this.reconnectTimedOut = false;
 				this.setStatusMessage("Daemon reconnected", { render: false });
 				this.applySessionList(sessions);
+				void this.refreshSavedSessions({ duringReconnect: true, preserveStatusOnError: true });
 				await this.refreshHeartbeats({ duringReconnect: true });
 				return;
 			} catch (error) {
