@@ -325,7 +325,9 @@ export function formatHeartbeatBadge(heartbeat: UnifiedSessionHeartbeat | undefi
 }
 
 function formatHeartbeatCountdown(durationMs: number): string {
-	const minutes = Math.max(1, Math.round(Math.max(0, durationMs) / 60_000));
+	const seconds = Math.max(1, Math.round(Math.max(0, durationMs) / 1000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.round(seconds / 60);
 	if (minutes < 60) return `${minutes}m`;
 	const hours = Math.round(minutes / 60);
 	if (hours < 24) return `${hours}h`;

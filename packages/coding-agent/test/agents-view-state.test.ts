@@ -998,6 +998,25 @@ describe("agents view state", () => {
 			),
 		).toBe("♥ 1·10m");
 		expect(formatHeartbeatBadge({ activeCount: 1 })).toBe("♥ 1");
+		// Sub-minute countdowns show seconds instead of rounding up to 1m.
+		expect(
+			formatHeartbeatBadge(
+				{ activeCount: 1, nextRunAt: "2026-01-01T00:00:42Z" },
+				Date.parse("2026-01-01T00:00:00Z"),
+			),
+		).toBe("♥ 1·42s");
+		expect(
+			formatHeartbeatBadge(
+				{ activeCount: 1, nextRunAt: "2026-01-01T00:00:59.700Z" },
+				Date.parse("2026-01-01T00:00:00Z"),
+			),
+		).toBe("♥ 1·1m");
+		expect(
+			formatHeartbeatBadge(
+				{ activeCount: 1, nextRunAt: "2026-01-01T00:00:00Z" },
+				Date.parse("2026-01-01T00:00:00Z"),
+			),
+		).toBe("♥ 1·1s");
 	});
 
 	describe("restores selection to the previously open session", () => {
