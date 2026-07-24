@@ -5473,6 +5473,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
+		this._cancelPostCompactionContinue();
 		this.abortRetry();
 		this.abortCompaction();
 		this.abortBranchSummary();
@@ -5511,6 +5512,7 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
+		this._cancelPostCompactionContinue();
 		this.abortRetry();
 		this._cancelActiveRlmChildRuns("Parent session aborted for update restart");
 		this._goalAbortInProgress = this._goalState.status === "active";

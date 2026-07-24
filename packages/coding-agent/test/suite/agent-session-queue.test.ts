@@ -337,7 +337,35 @@ describe("AgentSession queue characterization", () => {
 		}
 	});
 
-	it("keeps scheduled post-compaction continuation when manual compaction is skipped", async () => {
+	it.each([
+		{ name: "requestAbort", abort: (harness: Harness) => harness.session.requestAbort() },
+		{
+			name: "abortForUpdateRestart",
+			abort: (harness: Harness) => harness.session.abortForUpdateRestart(),
+		},
+	])("cancels scheduled post-compaction continuation at $name without dropping queued input", async ({ abort }) => {
+		vi.useFakeTimers();
+		const harness = await createAutoRefineHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as AutoRefineInternals;
+		const continueAgent = vi.spyOn(harness.session.agent, "continue").mockResolvedValue();
+
+		try {
+			internals._schedulePostCompactionContinue();
+			await harness.session.followUp("queued across abort");
+
+			abort(harness);
+			await vi.advanceTimersByTimeAsync(100);
+
+			expect(continueAgent).not.toHaveBeenCalled();
+			expect(internals._postCompactionContinuationScheduled).toBe(false);
+			expect(harness.session.getFollowUpMessages()).toEqual(["queued across abort"]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps scheduled post-compaction continuation when session-input pump compaction skips without aborting", async () => {
 		vi.useFakeTimers();
 		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
@@ -347,7 +375,9 @@ describe("AgentSession queue characterization", () => {
 		try {
 			internals._schedulePostCompactionContinue();
 
-			await expect(harness.session.compact()).rejects.toThrow("Session is too short to compact");
+			await expect(harness.session.compact(undefined, { skipAbort: true })).rejects.toThrow(
+				"Session is too short to compact",
+			);
 
 			expect(internals._postCompactionContinuationScheduled).toBe(true);
 		} finally {
