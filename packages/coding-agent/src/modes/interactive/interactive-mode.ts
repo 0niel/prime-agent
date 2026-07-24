@@ -117,7 +117,6 @@ import {
 	BUILTIN_SLASH_COMMANDS,
 	builtinSlashCommandTakesArgument,
 	isBuiltinSlashCommandName,
-	parseRefineCommandOptions,
 	parseSlashCommand,
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
@@ -1488,9 +1487,13 @@ export class InteractiveMode {
 		// `startupPromptsSettled` is the user-submission barrier (startup prompts
 		// stay ahead of user prompts); it resolves when the prompts exhaust or the
 		// run lifecycle ends, whichever comes first.
+		let startupPromptsDone = false;
 		let settleStartupPrompts = () => {};
 		const startupPromptsSettled = new Promise<void>((resolve) => {
-			settleStartupPrompts = resolve;
+			settleStartupPrompts = () => {
+				startupPromptsDone = true;
+				resolve();
+			};
 		});
 		/** Resolves false when the run lifecycle ended before the 250ms retry delay elapsed. */
 		const startupRetryDelay = () =>
@@ -1505,6 +1508,9 @@ export class InteractiveMode {
 		const deliverStartupPrompts = async () => {
 			let failures = 0;
 			for (let next = 0; next < initialPrompts.length; ) {
+				// The run lifecycle can settle the barrier while a prompt is being
+				// admitted; stop instead of prompting a session we already left.
+				if (startupPromptsDone) return;
 				if (!this.getCurrentModel()) {
 					if (!(await startupRetryDelay())) return;
 					continue;
@@ -9532,78 +9538,6 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		if (model.provider === "opencode" && model.id.toLowerCase().includes("kimi-k2.5")) {
 			this.handleDaxnuts();
 		}
-	}
-
-	private async handleCompactCommand(customInstructions?: string): Promise<void> {
-		let messageCount: number;
-		try {
-			const stats = await this.agentConnection.getSessionStats();
-			messageCount = stats.totalMessages;
-		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
-			return;
-		}
-
-		if (messageCount < 2) {
-			this.showWarning("Nothing to compact (no messages yet)");
-			return;
-		}
-
-		this.stopWorkingLoader();
-
-		try {
-			await this.agentConnection.compact(customInstructions);
-		} catch {
-			// Ignore, will be emitted as an event
-		}
-	}
-
-	private async handleRefineCommand(args?: string): Promise<void> {
-		let options: { instructions?: string; rollbackId?: string; global?: boolean };
-		try {
-			options = parseRefineCommandOptions(args ?? "");
-		} catch (error) {
-			this.showWarning(error instanceof Error ? error.message : String(error));
-			return;
-		}
-
-		if (!options.rollbackId) {
-			let messageCount: number;
-			try {
-				const stats = await this.agentConnection.getSessionStats();
-				messageCount = stats.totalMessages;
-			} catch (error) {
-				this.showError(error instanceof Error ? error.message : String(error));
-				return;
-			}
-
-			if (messageCount < 2) {
-				this.showWarning("Nothing to refine (no trajectory yet)");
-				return;
-			}
-		}
-
-		this.stopWorkingLoader();
-		this.showStatus(
-			options.rollbackId
-				? `Rolling back refinement ${options.rollbackId}...`
-				: `Refining ${options.global ? "global" : "local"} continual harness state...`,
-		);
-
-		this.agentConnection
-			.refine(options)
-			.then((result) => {
-				const applied = result.appliedEdits.filter((edit) => edit.applied).length;
-				const failed = result.appliedEdits.length - applied;
-				const failedSuffix = failed > 0 ? `, ${failed} failed` : "";
-				this.showStatus(
-					`Refined continual harness state: ${applied} edit${applied === 1 ? "" : "s"} applied${failedSuffix}`,
-				);
-				this.showStatus(`Harness state: ${result.harnessStatePath}`);
-			})
-			.catch((error) => {
-				this.showError(`Refinement failed: ${error instanceof Error ? error.message : String(error)}`);
-			});
 	}
 
 	stop(options: { preserveAltScreen?: boolean } = {}): void {
