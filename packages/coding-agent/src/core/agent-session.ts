@@ -4166,18 +4166,30 @@ export class AgentSession {
 			return;
 		}
 
+		if (options?.suppressAutonomousContinuation) this._markAutonomousContinuationSuppressed(message);
+		const promptPromise = options?.suppressAutonomousContinuation
+			? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(messages))
+			: this.agent.prompt(messages);
+		releaseAdmission();
+		// Settle the preflight outcome at the handoff, exactly like the direct path:
+		// the direct-prompt section must not fence checkpoints for the whole turn,
+		// and a rejected dispatch must still release it.
+		const dispatched = await Promise.race([
+			promptPromise.then(
+				() => true,
+				() => false,
+			),
+			new Promise<true>((resolve) => {
+				setTimeout(() => resolve(true), 0);
+			}),
+		]);
+		reportPreflight(dispatched);
 		try {
-			if (options?.suppressAutonomousContinuation) this._markAutonomousContinuationSuppressed(message);
-			const promptPromise = options?.suppressAutonomousContinuation
-				? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(messages))
-				: this.agent.prompt(messages);
-			releaseAdmission();
 			await promptPromise;
 		} catch (error) {
 			this._pendingNextTurnMessages.unshift(...drainedNextTurnMessages.map((pending) => ({ ...pending })));
 			throw error;
 		}
-		reportPreflight(true);
 		await this.waitForRetry();
 	}
 

@@ -3871,16 +3871,31 @@ export class DaemonSupervisor {
 			sessions: responses.flatMap((manifest) => manifest.sessions),
 			...(discardedActiveSessionIds.length > 0 ? { discardedActiveSessionIds } : {}),
 		};
+		// A worker that disconnected after preparing cancelled its checkpoint with
+		// the old client; a recovered replacement may have admitted inputs past the
+		// captured manifest. Abort before the manifest is persisted so the caller's
+		// fallback cannot restore from the stale checkpoint.
+		const staleWorker = prepared.find((worker) => worker.client !== worker.updateRestartPrepareClient);
+		if (staleWorker) {
+			await cancelAcknowledged();
+			throw new Error(
+				`Worker ${staleWorker.descriptor.workerId} reconnected during update preparation; its checkpoint is stale`,
+			);
+		}
 		try {
 			this.validateAndPersistUpdateManifest(manifest);
 		} catch (error) {
 			await cancelAcknowledged();
 			throw error;
 		}
+		// Commit through the connection that owns the prepared transaction; a client
+		// swapped in after the check above must fail the commit rather than reach a
+		// worker that no longer holds the checkpoint.
+		const commitClients = new Map(prepared.map((worker) => [worker, worker.updateRestartPrepareClient]));
 		for (const worker of prepared) worker.updateRestartPrepareClient = undefined;
 		const commitResults = await Promise.allSettled(
 			prepared.map(async (worker) => {
-				const client = worker.client;
+				const client = commitClients.get(worker);
 				if (!client) throw new Error(`Worker ${worker.descriptor.workerId} disconnected before update commit`);
 				const response = await client.requestWorker(
 					{ type: "worker_commit_update" },

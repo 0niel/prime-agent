@@ -1482,6 +1482,39 @@ stale post-hook extension instructions`,
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
+	it("releases the direct prompt section when an injected dispatch fails", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as {
+			_promptInjectedMessage(
+				text: string,
+				message: {
+					role: "custom";
+					customType: string;
+					content: string;
+					display: boolean;
+					details: Record<string, never>;
+					timestamp: number;
+				},
+			): Promise<void>;
+		};
+		vi.spyOn(harness.session.agent, "prompt").mockRejectedValue(new Error("dispatch failed"));
+
+		await expect(
+			internals._promptInjectedMessage("injected prompt", {
+				role: "custom",
+				customType: "injected-test",
+				content: "injected prompt",
+				display: true,
+				details: {},
+				timestamp: Date.now(),
+			}),
+		).rejects.toThrow("dispatch failed");
+
+		// A leaked section would keep update-restart checkpoints waiting forever.
+		await expect(harness.session.waitForSessionInputCheckpoint(AbortSignal.timeout(1000))).resolves.toBeUndefined();
+	});
+
 	it("throws when prompting without a model", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

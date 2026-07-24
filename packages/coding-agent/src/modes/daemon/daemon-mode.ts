@@ -414,7 +414,7 @@ export class AgentDaemon {
 		owner?: DaemonSocketClient;
 		abort: AbortController;
 		deadline?: ReturnType<typeof setTimeout>;
-		phase: "preparing" | "prepared" | "publishing";
+		phase: "preparing" | "fencing" | "prepared" | "publishing";
 		manifest?: DaemonUpdateRestartManifest;
 	};
 	private ownsSocketPath = false;
@@ -2643,6 +2643,9 @@ export class AgentDaemon {
 
 		const mutation = command.type !== "prepare_update_restart" && isDaemonMutatingCommand(command);
 		const restartPhase = this.updateRestart?.phase;
+		// Mirror the supervisor's drain/fence split: abort-style commands stay
+		// admitted only while mutations drain; once the checkpoint is being
+		// captured they could race the snapshot and are rejected too.
 		const restartRejected =
 			restartPhase === "preparing"
 				? !UPDATE_RESTART_DRAIN_COMMANDS.has(command.type)
@@ -2742,7 +2745,7 @@ export class AgentDaemon {
 				}
 				case "worker_commit_update": {
 					const transaction = this.updateRestart;
-					if (!transaction || transaction.phase === "preparing") {
+					if (!transaction || transaction.phase === "preparing" || transaction.phase === "fencing") {
 						throw new Error("Daemon has no prepared update checkpoint");
 					}
 					if (transaction.phase === "publishing") {
@@ -4613,6 +4616,8 @@ export class AgentDaemon {
 	): Promise<DaemonUpdateRestartManifest> {
 		try {
 			await this.mutationDrain.waitForDrain(0, transaction.abort.signal, "Update restart preparation cancelled");
+			this.assertUpdateRestartNotCancelled(transaction);
+			transaction.phase = "fencing";
 			const manifest = await this.prepareUpdateRestartCheckpoint(transaction);
 			this.assertUpdateRestartNotCancelled(transaction);
 			transaction.manifest = manifest;
