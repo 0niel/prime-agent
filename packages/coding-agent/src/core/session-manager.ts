@@ -9,6 +9,7 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	renameSync,
 	rmSync,
 	statSync,
@@ -50,6 +51,15 @@ const CONTENT_ENTRY_TYPES = new Set([
 	"compaction",
 	"branch_summary",
 ]);
+
+function realpathIfPresent(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return path;
+		throw error;
+	}
+}
 
 function statModeIfPresent(path: string): number | undefined {
 	try {
@@ -1209,16 +1219,17 @@ export class SessionManager {
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
-		const directory = dirname(this.sessionFile);
+		const targetPath = realpathIfPresent(this.sessionFile);
+		const directory = dirname(targetPath);
 		mkdirSync(directory, { recursive: true });
-		const tempPath = join(directory, `.${basename(this.sessionFile)}.${process.pid}.${randomUUID()}.tmp`);
+		const tempPath = join(directory, `.${basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
 		try {
-			const mode = statModeIfPresent(this.sessionFile);
+			const mode = statModeIfPresent(targetPath);
 			writeFileSync(tempPath, content, mode === undefined ? undefined : { mode });
 			if (mode !== undefined) {
 				chmodSync(tempPath, mode);
 			}
-			renameSync(tempPath, this.sessionFile);
+			renameSync(tempPath, targetPath);
 		} finally {
 			rmSync(tempPath, { force: true });
 		}
