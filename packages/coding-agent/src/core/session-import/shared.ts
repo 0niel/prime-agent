@@ -154,8 +154,11 @@ export function textContent(text: string): TextContent {
 	return { type: "text", text };
 }
 
-export function thinkingContent(thinking: string): ThinkingContent {
-	return { type: "thinking", thinking };
+export function thinkingContent(
+	thinking: string,
+	options?: Pick<ThinkingContent, "thinkingSignature" | "redacted">,
+): ThinkingContent {
+	return { type: "thinking", thinking, ...options };
 }
 
 export function toolCallContent(id: string, name: string, args: unknown): ToolCall {
@@ -198,6 +201,7 @@ export function sanitizeImportedMessages(messages: Message[]): Message[] {
 
 	const sanitized: Message[] = [];
 	const emittedCalls = new Set<string>();
+	const emittedResults = new Set<string>();
 	for (const message of messages) {
 		if (message.role === "assistant") {
 			const content: AssistantMessage["content"] = [];
@@ -205,7 +209,7 @@ export function sanitizeImportedMessages(messages: Message[]): Message[] {
 				if (block.type !== "toolCall") {
 					if (
 						(block.type === "text" && block.text.trim()) ||
-						(block.type === "thinking" && block.thinking.trim())
+						(block.type === "thinking" && (block.thinking.trim() || block.thinkingSignature || block.redacted))
 					) {
 						content.push(block);
 					}
@@ -229,7 +233,7 @@ export function sanitizeImportedMessages(messages: Message[]): Message[] {
 		}
 
 		if (message.role === "toolResult") {
-			if (!emittedCalls.has(message.toolCallId)) {
+			if (!emittedCalls.has(message.toolCallId) || emittedResults.has(message.toolCallId)) {
 				continue;
 			}
 			const content = message.content.filter(
@@ -241,6 +245,7 @@ export function sanitizeImportedMessages(messages: Message[]): Message[] {
 				content: content.length > 0 ? content : [textContent("(No tool output)")],
 			};
 			sanitized.push(next);
+			emittedResults.add(message.toolCallId);
 			continue;
 		}
 

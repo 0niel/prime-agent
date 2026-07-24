@@ -19,7 +19,7 @@ export function discoverSkillDirectories(root: string): string[] {
 		.filter((directory) => existsSync(join(directory, "SKILL.md")));
 }
 
-function copySkillTree(source: string, destination: string, budget: { files: number; bytes: number }): void {
+function copySkillTree(source: string, destination: string, budget: { entries: number; bytes: number }): void {
 	mkdirSync(destination, { recursive: true });
 	for (const entry of readdirSync(source, { withFileTypes: true, encoding: "utf8" })) {
 		if (entry.isSymbolicLink()) {
@@ -29,6 +29,10 @@ function copySkillTree(source: string, destination: string, budget: { files: num
 		const destinationPath = join(destination, entry.name);
 		if (entry.isDirectory()) {
 			if (!EXCLUDED_DIRECTORIES.has(entry.name)) {
+				budget.entries++;
+				if (budget.entries > MAX_SKILL_FILES) {
+					throw new Error("Skill exceeds safe import size limits");
+				}
 				copySkillTree(sourcePath, destinationPath, budget);
 			}
 			continue;
@@ -37,9 +41,9 @@ function copySkillTree(source: string, destination: string, budget: { files: num
 			continue;
 		}
 		const size = lstatSync(sourcePath).size;
-		budget.files++;
+		budget.entries++;
 		budget.bytes += size;
-		if (budget.files > MAX_SKILL_FILES || budget.bytes > MAX_SKILL_BYTES) {
+		if (budget.entries > MAX_SKILL_FILES || budget.bytes > MAX_SKILL_BYTES) {
 			throw new Error("Skill exceeds safe import size limits");
 		}
 		copyFileSync(sourcePath, destinationPath);
@@ -59,7 +63,7 @@ export function importSkillDirectory(source: string, destinationRoot: string): "
 
 	const temporary = join(destinationRoot, `.${name}.import-${randomUUID()}`);
 	try {
-		copySkillTree(source, temporary, { files: 0, bytes: 0 });
+		copySkillTree(source, temporary, { entries: 0, bytes: 0 });
 		if (!existsSync(join(temporary, "SKILL.md"))) {
 			throw new Error("Imported skill has no SKILL.md");
 		}

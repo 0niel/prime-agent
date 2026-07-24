@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { v5 as uuidv5 } from "uuid";
 import { readFirstLineSync } from "../../utils/file-lines.js";
@@ -140,7 +140,8 @@ export function persistImportedSession(
 		if (context.messages.length !== session.messages.length) {
 			throw new Error("Imported session message count changed during validation");
 		}
-		renameSync(temporary, destination);
+		linkSync(temporary, destination);
+		unlinkSync(temporary);
 		return destination;
 	} catch (error) {
 		rmSync(temporary, { force: true });

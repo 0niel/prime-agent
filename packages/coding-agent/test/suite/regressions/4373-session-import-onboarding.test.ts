@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -7,6 +7,7 @@ import { setKeybindings } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getSessionsDir } from "../../../src/config.js";
 import { KeybindingsManager } from "../../../src/core/keybindings.js";
+import { listOpenCodeSessions } from "../../../src/core/session-import/adapters/opencode.js";
 import {
 	detectSessionImportFileKind,
 	discoverSessionImports,
@@ -14,6 +15,7 @@ import {
 	importSessionsAndSkills,
 	type SessionImportInventory,
 } from "../../../src/core/session-import/index.js";
+import { importSkillDirectory } from "../../../src/core/session-import/skills.js";
 import {
 	buildSessionContext,
 	loadEntriesFromFile,
@@ -64,7 +66,8 @@ function createClaudeFixture(home: string): void {
 				stop_reason: "tool_use",
 				usage: { input_tokens: 2, output_tokens: 3 },
 				content: [
-					{ type: "thinking", thinking: "Claude thinking" },
+					{ type: "thinking", thinking: "Claude thinking", signature: "claude-thinking-signature" },
+					{ type: "redacted_thinking", data: "claude-redacted-payload" },
 					{ type: "text", text: "Claude assistant" },
 					{ type: "tool_use", id: "claude-tool", name: "read", input: { path: "README.md" } },
 				],
@@ -138,6 +141,11 @@ function createCodexFixture(home: string): void {
 			type: "response_item",
 			timestamp: "2026-01-02T00:00:05.000Z",
 			payload: { type: "function_call_output", call_id: "codex-tool", output: "Codex tool output" },
+		},
+		{
+			type: "response_item",
+			timestamp: "2026-01-02T00:00:05.500Z",
+			payload: { type: "function_call_output", call_id: "codex-tool", output: "Duplicate Codex tool output" },
 		},
 	]);
 	writeJsonl(join(home, ".codex", "sessions", "2026", "01", "01", "codex-subagent.jsonl"), [
@@ -248,6 +256,13 @@ function createOpenCodeFixture(home: string): void {
 					time: { start: now + 4_000, end: now + 5_000 },
 				},
 			}),
+		);
+		insertPart.run(
+			"opencode-after-tool",
+			"opencode-assistant",
+			"opencode-session",
+			now + 6_000,
+			JSON.stringify({ type: "text", text: "OpenCode after tool" }),
 		);
 	} finally {
 		database.close();
@@ -418,6 +433,30 @@ describe("ENG-4373 onboarding session import", () => {
 				).toBe(true);
 				expect(context.messages.some((message) => message.role === "toolResult")).toBe(true);
 			}
+			if (header.importedFrom?.source === "claude") {
+				const thinking = context.messages
+					.filter((message) => message.role === "assistant")
+					.flatMap((message) => message.content)
+					.filter((content) => content.type === "thinking");
+				expect(thinking).toContainEqual(
+					expect.objectContaining({ thinkingSignature: "claude-thinking-signature" }),
+				);
+				expect(thinking).toContainEqual(
+					expect.objectContaining({
+						thinkingSignature: "claude-redacted-payload",
+						redacted: true,
+					}),
+				);
+			}
+			if (header.importedFrom?.source === "codex") {
+				expect(context.messages.filter((message) => message.role === "toolResult")).toHaveLength(1);
+			}
+			if (header.importedFrom?.source === "opencode") {
+				const totalUsage = context.messages
+					.filter((message) => message.role === "assistant")
+					.reduce((sum, message) => sum + message.usage.totalTokens, 0);
+				expect(totalUsage).toBe(6);
+			}
 		}
 		expect(importedSources).toEqual(new Set(["claude", "codex", "opencode", "pi"]));
 
@@ -567,6 +606,235 @@ describe("ENG-4373 onboarding session import", () => {
 			sessionFile: claude.sessionFile,
 			status: "existing",
 		});
+	});
+
+	it("preserves response-only Codex turns while removing event duplicates and injected context", async () => {
+		const path = join(home, "codex-mixed-users.jsonl");
+		writeJsonl(path, [
+			{
+				type: "session_meta",
+				timestamp: "2026-01-02T00:00:00.000Z",
+				payload: { id: "codex-mixed-users", cwd: "/workspace/codex", model_provider: "openai" },
+			},
+			{
+				type: "response_item",
+				timestamp: "2026-01-02T00:00:01.000Z",
+				payload: {
+					type: "message",
+					role: "user",
+					content: [{ type: "input_text", text: "First Codex turn" }],
+				},
+			},
+			{
+				type: "event_msg",
+				timestamp: "2026-01-02T00:00:01.000Z",
+				payload: { type: "user_message", message: "First Codex turn" },
+			},
+			{
+				type: "response_item",
+				timestamp: "2026-01-02T00:00:02.000Z",
+				payload: {
+					type: "message",
+					role: "assistant",
+					content: [{ type: "output_text", text: "First Codex answer" }],
+				},
+			},
+			{
+				type: "response_item",
+				timestamp: "2026-01-02T00:00:03.000Z",
+				payload: {
+					type: "message",
+					role: "user",
+					content: [
+						{ type: "input_text", text: "<permissions instructions>ignored</permissions instructions>" },
+						{ type: "input_text", text: "Second Codex turn" },
+					],
+				},
+			},
+			{
+				type: "response_item",
+				timestamp: "2026-01-02T00:00:04.000Z",
+				payload: {
+					type: "message",
+					role: "assistant",
+					content: [{ type: "text", text: "Second Codex answer" }],
+				},
+			},
+		]);
+
+		const imported = await importExternalSessionFile(path, "codex", {
+			agentDir,
+			cwd: "/fallback/codex",
+		});
+		const context = SessionManager.open(imported.sessionFile, getSessionsDir(agentDir)).buildSessionContext();
+		const users = context.messages
+			.filter((message) => message.role === "user")
+			.map((message) =>
+				typeof message.content === "string"
+					? message.content
+					: message.content.map((content) => (content.type === "text" ? content.text : "")).join("\n"),
+			);
+		const assistantText = context.messages
+			.filter((message) => message.role === "assistant")
+			.flatMap((message) => message.content)
+			.filter((content) => content.type === "text")
+			.map((content) => content.text);
+
+		expect(users).toEqual(["First Codex turn", "Second Codex turn"]);
+		expect(assistantText).toEqual(["First Codex answer", "Second Codex answer"]);
+	});
+
+	it("uses the requested cwd when imported source metadata has no cwd", async () => {
+		const path = join(home, "claude-no-cwd.jsonl");
+		writeJsonl(path, [
+			{
+				type: "user",
+				sessionId: "claude-no-cwd",
+				timestamp: "2026-01-01T00:00:00.000Z",
+				message: { role: "user", content: "No cwd prompt" },
+			},
+		]);
+
+		const directAgentDir = join(root, "direct-agent");
+		const direct = await importExternalSessionFile(path, "claude", {
+			agentDir: directAgentDir,
+			cwd: "/fallback/direct",
+		});
+		expect((loadEntriesFromFile(direct.sessionFile)[0] as SessionHeader).cwd).toBe("/fallback/direct");
+
+		const bulkAgentDir = join(root, "bulk-agent");
+		const result = await importSessionsAndSkills(
+			[
+				{
+					source: "claude",
+					label: "Claude Code",
+					sessionCount: 1,
+					skillCount: 0,
+					sessionReferences: [{ kind: "file", path }],
+					skillDirectories: [],
+				},
+			],
+			["claude"],
+			{ agentDir: bulkAgentDir, cwd: "/fallback/bulk" },
+		);
+		expect(result.sessionsImported).toBe(1);
+		const bulkFile = readdirSync(getSessionsDir(bulkAgentDir)).find((file) => file.endsWith(".jsonl"));
+		expect(bulkFile).toBeDefined();
+		expect((loadEntriesFromFile(join(getSessionsDir(bulkAgentDir), bulkFile!))[0] as SessionHeader).cwd).toBe(
+			"/fallback/bulk",
+		);
+	});
+
+	it("rejects non-regular import sources and oversized empty skill trees", async () => {
+		await expect(detectSessionImportFileKind(home)).rejects.toThrow("regular file");
+
+		const skill = join(root, "too-many-directories");
+		mkdirSync(skill, { recursive: true });
+		writeFileSync(join(skill, "SKILL.md"), "---\nname: too-many\ndescription: too-many\n---\n");
+		for (let index = 0; index < 2_000; index++) {
+			mkdirSync(join(skill, `empty-${index}`));
+		}
+		expect(() => importSkillDirectory(skill, join(root, "skills"))).toThrow("safe import size limits");
+	});
+
+	it("filters Codex files without trustworthy top-level metadata", () => {
+		const path = join(home, ".codex", "sessions", "2026", "01", "01", "codex-malformed-prefix.jsonl");
+		mkdirSync(join(path, ".."), { recursive: true });
+		writeFileSync(
+			path,
+			`not json\n${JSON.stringify({
+				type: "session_meta",
+				timestamp: "2026-01-02T00:00:00.000Z",
+				payload: {
+					id: "codex-malformed-prefix",
+					cwd: "/workspace/codex",
+					model_provider: "openai",
+				},
+			})}\n`,
+		);
+
+		const codex = discoverSessionImports({ homeDir: home, agentDir, env: {} }).find(
+			(inventory) => inventory.source === "codex",
+		);
+		expect(
+			codex?.sessionReferences.some(
+				(reference) => reference.kind === "file" && reference.path.endsWith("codex-malformed-prefix.jsonl"),
+			),
+		).toBe(false);
+	});
+
+	it("derives OpenCode database recency from messages and parts", () => {
+		const databasePath = join(home, ".local", "share", "opencode", "opencode.db");
+		const database = new DatabaseSync(databasePath);
+		const now = Date.now();
+		const old = now - 60 * 24 * 60 * 60 * 1_000;
+		try {
+			database
+				.prepare("INSERT INTO session VALUES (?, NULL, ?, ?, ?, ?)")
+				.run("opencode-stale-refresh", "/workspace/stale", "Stale", old, now);
+			database
+				.prepare("INSERT INTO message VALUES (?, ?, ?, ?)")
+				.run(
+					"opencode-stale-message",
+					"opencode-stale-refresh",
+					old,
+					JSON.stringify({ role: "user", time: { created: old } }),
+				);
+			database
+				.prepare("INSERT INTO session VALUES (?, NULL, ?, ?, ?, ?)")
+				.run("opencode-recent-part", "/workspace/recent", "Recent", old, old);
+			database
+				.prepare("INSERT INTO message VALUES (?, ?, ?, ?)")
+				.run(
+					"opencode-recent-message",
+					"opencode-recent-part",
+					old,
+					JSON.stringify({ role: "user", time: { created: old } }),
+				);
+			database
+				.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?)")
+				.run(
+					"opencode-recent-text",
+					"opencode-recent-message",
+					"opencode-recent-part",
+					now,
+					JSON.stringify({ type: "text", text: "Recent part" }),
+				);
+		} finally {
+			database.close();
+		}
+
+		const sessions = listOpenCodeSessions(databasePath, now - 30 * 24 * 60 * 60 * 1_000, 50);
+		expect(sessions.map((session) => session.id)).toContain("opencode-recent-part");
+		expect(sessions.map((session) => session.id)).not.toContain("opencode-stale-refresh");
+	});
+
+	it("tries later OpenCode binaries when an earlier CLI returns no sessions", () => {
+		if (process.platform === "win32") {
+			return;
+		}
+		const cliHome = join(root, "cli-home");
+		const emptyCommand = join(cliHome, "empty-opencode");
+		const workingCommand = join(cliHome, ".opencode", "bin", "opencode");
+		mkdirSync(join(workingCommand, ".."), { recursive: true });
+		writeFileSync(emptyCommand, '#!/bin/sh\nprintf "[]\\n"\n');
+		writeFileSync(
+			workingCommand,
+			`#!/bin/sh\nprintf '[{"id":"cli-session","updated":${Date.now()},"created":${Date.now()}}]\\n'\n`,
+		);
+		chmodSync(emptyCommand, 0o755);
+		chmodSync(workingCommand, 0o755);
+
+		const opencode = discoverSessionImports({
+			homeDir: cliHome,
+			agentDir,
+			cwd: root,
+			env: { OPENCODE_BIN: emptyCommand },
+		}).find((inventory) => inventory.source === "opencode");
+
+		expect(opencode?.sessionReferences).toContainEqual(
+			expect.objectContaining({ kind: "opencode-cli", command: workingCommand, sessionId: "cli-session" }),
+		);
 	});
 
 	it("keeps normal model restoration for native Prime Agent sessions", () => {

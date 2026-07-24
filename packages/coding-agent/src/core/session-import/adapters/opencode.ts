@@ -154,11 +154,13 @@ function convertOpenCodeSession(
 
 		let pending: (TextContent | ThinkingContent | ToolCall)[] = [];
 		const usage = messageUsage(message);
+		let usageEmitted = false;
 		const provider = asString(message.providerID) ?? "opencode";
 		const model = asString(message.modelID) ?? "opencode";
 		const errorMessage = openCodeErrorMessage(message.error);
+		let errorEmitted = false;
 		const flushAssistant = (partTime = timestamp) => {
-			if (pending.length === 0 && !errorMessage) {
+			if (pending.length === 0 && (!errorMessage || errorEmitted)) {
 				return;
 			}
 			messages.push(
@@ -167,11 +169,13 @@ function convertOpenCodeSession(
 					provider,
 					model,
 					timestamp: partTime,
-					usage,
+					usage: usageEmitted ? createZeroUsage() : usage,
 					stopReason: errorMessage ? "error" : finishReason(message.finish),
 					errorMessage,
 				}),
 			);
+			usageEmitted = true;
+			errorEmitted = !!errorMessage;
 			pending = [];
 		};
 
@@ -289,6 +293,8 @@ function openCodeListTimestamp(value: Record<string, unknown>): number {
 			time?.created ??
 			value.time_updated ??
 			value.time_created ??
+			value.updated ??
+			value.created ??
 			value.updatedAt ??
 			value.updated_at ??
 			value.createdAt ??
@@ -362,18 +368,32 @@ export function listOpenCodeSessions(databasePath: string, cutoff: number, limit
 		const columns = new Set(
 			queryRows<{ name: string }>(database, "PRAGMA table_info(session)").map((column) => column.name),
 		);
-		const timeColumn = columns.has("time_updated")
-			? "time_updated"
-			: columns.has("time_created")
-				? "time_created"
+		const messageColumns = new Set(
+			queryRows<{ name: string }>(database, "PRAGMA table_info(message)").map((column) => column.name),
+		);
+		const partColumns = new Set(
+			queryRows<{ name: string }>(database, "PRAGMA table_info(part)").map((column) => column.name),
+		);
+		const timeColumn = columns.has("time_created")
+			? "time_created"
+			: columns.has("time_updated")
+				? "time_updated"
 				: "";
 		if (!timeColumn) {
 			return [];
 		}
+		const timestamps = [`COALESCE(s.${timeColumn}, 0)`];
+		if (messageColumns.has("session_id") && messageColumns.has("time_created")) {
+			timestamps.push("COALESCE((SELECT MAX(m.time_created) FROM message m WHERE m.session_id = s.id), 0)");
+		}
+		if (partColumns.has("session_id") && partColumns.has("time_created")) {
+			timestamps.push("COALESCE((SELECT MAX(p.time_created) FROM part p WHERE p.session_id = s.id), 0)");
+		}
+		const timestampExpression = timestamps.length === 1 ? timestamps[0] : `MAX(${timestamps.join(", ")})`;
 		const rootFilter = columns.has("parent_id") ? " WHERE parent_id IS NULL" : "";
 		return queryRows<OpenCodeSessionListRow>(
 			database,
-			`SELECT id, ${timeColumn} AS timestamp FROM session${rootFilter}`,
+			`SELECT s.id, ${timestampExpression} AS timestamp FROM session s${rootFilter}`,
 		)
 			.map((row) => ({ id: row.id, modifiedAt: parseTimestamp(row.timestamp, 0) }))
 			.filter((session) => session.id && session.modifiedAt >= cutoff)

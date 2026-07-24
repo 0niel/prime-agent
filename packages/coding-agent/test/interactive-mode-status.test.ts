@@ -2486,7 +2486,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		expect(fakeThis.uiServices.settingsManager.setOnboardingShown).toHaveBeenCalledWith(true);
 	});
 
-	test("persists onboarding before opening the one-shot flow", async () => {
+	test("persists onboarding after import completes and before opening the one-shot flow", async () => {
 		let shown = false;
 		let flushed = false;
 		const fakeThis = createPrimeCliHarness(false);
@@ -2496,6 +2496,10 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		});
 		fakeThis.uiServices.settingsManager.flush = vi.fn(async () => {
 			flushed = true;
+		});
+		fakeThis.runOnboardingImportFlow = vi.fn(async () => {
+			expect(shown).toBe(false);
+			expect(flushed).toBe(false);
 		});
 		fakeThis.runOnboardingFlow = vi.fn(async (showPrimeCliSplash?: boolean) => {
 			expect(showPrimeCliSplash).toBe(true);
@@ -2509,6 +2513,18 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		expect(fakeThis.uiServices.settingsManager.flush).toHaveBeenCalledTimes(1);
 		expect(fakeThis.runOnboardingImportFlow).toHaveBeenCalledTimes(1);
 		expect(fakeThis.runOnboardingFlow).toHaveBeenCalledWith(true);
+	});
+
+	test("does not suppress onboarding when import is interrupted", async () => {
+		const fakeThis = createPrimeCliHarness(false);
+		fakeThis.runOnboardingImportFlow = vi.fn(async () => {
+			throw new Error("interrupted");
+		});
+
+		await expect(runStartupOnboarding.call(fakeThis)).rejects.toThrow("interrupted");
+
+		expect(fakeThis.uiServices.settingsManager.setOnboardingShown).not.toHaveBeenCalled();
+		expect(fakeThis.uiServices.settingsManager.flush).not.toHaveBeenCalled();
 	});
 
 	test("imports first-launch data without reopening model setup for a ready model", async () => {

@@ -1653,9 +1653,9 @@ export class InteractiveMode {
 
 		const modelReady = isOnboardingModelReady(this.getOnboardingState());
 		const showPrimeCliSplash = this.shouldRunPrimeCliOnboardingSplash();
+		await this.runOnboardingImportFlow();
 		this.markOnboardingShown();
 		await this.settingsManager.flush();
-		await this.runOnboardingImportFlow();
 		if (showPrimeCliSplash || !modelReady) {
 			await this.runOnboardingFlow(showPrimeCliSplash);
 		}

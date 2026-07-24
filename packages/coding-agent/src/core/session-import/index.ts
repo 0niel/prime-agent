@@ -114,14 +114,14 @@ function isTopLevelCodexSession(path: string): boolean {
 	try {
 		const firstLine = readFirstLineSync(path, 1024 * 1024);
 		if (!firstLine) {
-			return true;
+			return false;
 		}
 		const entry = JSON.parse(firstLine) as {
 			type?: unknown;
 			payload?: { thread_source?: unknown; source?: unknown };
 		};
 		if (entry.type !== "session_meta" || !entry.payload) {
-			return true;
+			return false;
 		}
 		if (entry.payload.thread_source === "subagent") {
 			return false;
@@ -129,7 +129,7 @@ function isTopLevelCodexSession(path: string): boolean {
 		const source = entry.payload.source;
 		return !(typeof source === "object" && source !== null && "subagent" in source);
 	} catch {
-		return true;
+		return false;
 	}
 }
 
@@ -214,7 +214,7 @@ function discoverOpenCodeReferences(
 	].filter((command): command is string => !!command);
 	for (const command of commands) {
 		const sessions = listOpenCodeCliSessions(command, cwd, cutoff, MAX_RECENT_SESSIONS);
-		if (sessions === undefined) {
+		if (!sessions || sessions.length === 0) {
 			continue;
 		}
 		return sessions.map((session) => ({ kind: "opencode-cli", command, cwd, sessionId: session.id }));
@@ -345,7 +345,7 @@ export async function importSessionsAndSkills(
 	options: SessionImportOptions = {},
 ): Promise<SessionImportResult> {
 	const agentDir = options.agentDir ?? getAgentDir();
-	const home = options.homeDir ?? homedir();
+	const fallbackCwd = options.cwd ?? process.cwd();
 	const sessionDir = getSessionsDir(agentDir);
 	const skillDir = join(agentDir, "skills");
 	const selected = new Set(selectedSources);
@@ -373,7 +373,7 @@ export async function importSessionsAndSkills(
 					result.sessionsSkipped++;
 					continue;
 				}
-				persistImportedSession(session, contentHash, sessionDir, home);
+				persistImportedSession(session, contentHash, sessionDir, fallbackCwd);
 				importedKeys.add(key);
 				result.sessionsImported++;
 			} catch {

@@ -114,8 +114,21 @@ function parseClaudeAssistant(
 			}
 			case "thinking": {
 				const thinking = asString(block?.thinking);
-				if (thinking) {
-					content.push(thinkingContent(thinking));
+				const signature = asString(block?.signature);
+				if (thinking || signature) {
+					content.push(thinkingContent(thinking ?? "", { thinkingSignature: signature }));
+				}
+				break;
+			}
+			case "redacted_thinking": {
+				const data = asString(block?.data);
+				if (data) {
+					content.push(
+						thinkingContent("[Reasoning redacted]", {
+							thinkingSignature: data,
+							redacted: true,
+						}),
+					);
 				}
 				break;
 			}

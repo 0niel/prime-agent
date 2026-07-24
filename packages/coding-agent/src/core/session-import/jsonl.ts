@@ -5,8 +5,11 @@ import { createInterface } from "node:readline";
 const MAX_IMPORT_FILE_BYTES = 256 * 1024 * 1024;
 
 function validateImportFileSize(filePath: string): void {
-	const size = statSync(filePath).size;
-	if (size > MAX_IMPORT_FILE_BYTES) {
+	const stats = statSync(filePath);
+	if (!stats.isFile()) {
+		throw new Error("Session import source must be a regular file");
+	}
+	if (stats.size > MAX_IMPORT_FILE_BYTES) {
 		throw new Error(`Session file exceeds the ${MAX_IMPORT_FILE_BYTES / 1024 / 1024} MB import limit`);
 	}
 }

@@ -39,13 +39,29 @@ function contentText(value: unknown): string {
 	return parts.length > 0 ? parts.join("\n") : stringifyUnknown(value);
 }
 
-function responseMessageText(payload: Record<string, unknown>): string {
+function isInjectedCodexContext(text: string): boolean {
+	const normalized = text.trimStart();
+	return (
+		normalized.startsWith("<permissions instructions>") ||
+		normalized.startsWith("<app-context>") ||
+		normalized.startsWith("<apps_instructions>") ||
+		normalized.startsWith("<collaboration_mode>") ||
+		normalized.startsWith("<in-app-browser-context") ||
+		normalized.startsWith("<plugins_instructions>") ||
+		normalized.startsWith("<recommended_plugins>") ||
+		normalized.startsWith("<skills_instructions>") ||
+		normalized.startsWith("<environment_context>") ||
+		normalized.startsWith("# AGENTS.md instructions")
+	);
+}
+
+function responseMessageText(payload: Record<string, unknown>, excludeInjectedContext = false): string {
 	return asArray(payload.content)
 		.map((item) => {
 			const block = asRecord(item);
-			return asString(block?.text) ?? "";
+			return asString(block?.text) ?? asString(block?.output_text) ?? asString(block?.input_text) ?? "";
 		})
-		.filter(Boolean)
+		.filter((text) => text && (!excludeInjectedContext || !isInjectedCodexContext(text)))
 		.join("\n");
 }
 
@@ -57,26 +73,15 @@ function reasoningText(payload: Record<string, unknown>): string {
 		.join("\n");
 }
 
-function isInjectedCodexContext(text: string): boolean {
-	const normalized = text.trimStart();
-	return (
-		normalized.startsWith("<permissions instructions>") ||
-		normalized.startsWith("<app-context>") ||
-		normalized.startsWith("<skills_instructions>") ||
-		normalized.startsWith("<environment_context>") ||
-		normalized.startsWith("# AGENTS.md instructions")
-	);
-}
-
 export async function parseCodexSession(filePath: string): Promise<ImportedSession | undefined> {
 	const messages: Message[] = [];
 	const fallbackUserMessages = new Set<Message>();
+	const eventUserMessages: { text: string; timestamp: number }[] = [];
 	let sourceId: string | undefined;
 	let cwd = "";
 	let provider = "openai-codex";
 	let model = "codex";
 	let createdAt = Number.POSITIVE_INFINITY;
-	let sawEventUser = false;
 	let pending: PendingAssistant | undefined;
 
 	const flushAssistant = () => {
@@ -124,7 +129,7 @@ export async function parseCodexSession(filePath: string): Promise<ImportedSessi
 			const text = asString(payload.message);
 			if (text) {
 				flushAssistant();
-				sawEventUser = true;
+				eventUserMessages.push({ text, timestamp });
 				messages.push(createUserMessage(text, timestamp));
 			}
 			return;
@@ -135,7 +140,7 @@ export async function parseCodexSession(filePath: string): Promise<ImportedSessi
 
 		const itemType = asString(payload.type);
 		if (itemType === "message" && asString(payload.role) === "user") {
-			const text = responseMessageText(payload);
+			const text = responseMessageText(payload, true);
 			if (text) {
 				flushAssistant();
 				const userMessage = createUserMessage(text, timestamp);
@@ -202,7 +207,17 @@ export async function parseCodexSession(filePath: string): Promise<ImportedSessi
 		if (!fallbackUserMessages.has(message)) {
 			return true;
 		}
-		return !sawEventUser && message.role === "user" && !isInjectedCodexContext(contentToText(message.content));
+		if (message.role !== "user") {
+			return false;
+		}
+		const text = contentToText(message.content);
+		if (isInjectedCodexContext(text)) {
+			return false;
+		}
+		return !eventUserMessages.some(
+			(eventMessage) =>
+				eventMessage.text === text && Math.abs(eventMessage.timestamp - (message.timestamp ?? 0)) <= 1_000,
+		);
 	});
 	const sanitized = sanitizeImportedMessages(selectedMessages);
 	if (sanitized.length === 0) {

@@ -1,5 +1,4 @@
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { getAgentDir, getSessionsDir } from "../../config.js";
 import { SessionImportFileNotFoundError } from "../session-import-errors.js";
@@ -74,6 +73,6 @@ export async function importExternalSessionFile(
 		return { source, sessionFile, status: "existing" };
 	}
 
-	persistImportedSession(session, contentHash, sessionDir, options.homeDir ?? homedir(), "active");
+	persistImportedSession(session, contentHash, sessionDir, options.cwd ?? process.cwd(), "active");
 	return { source, sessionFile, status: "imported" };
 }
