@@ -24,6 +24,7 @@ describe("Prime Inference models", () => {
 			expect.arrayContaining([
 				"anthropic/claude-opus-4.7",
 				"anthropic/claude-opus-4.8",
+				"anthropic/claude-opus-5",
 				"anthropic/claude-sonnet-5",
 				"deepseek/deepseek-v4-pro",
 				"google/gemini-2.5-pro",
@@ -139,6 +140,22 @@ describe("Prime Inference models", () => {
 	});
 
 	it("marks known reasoning-capable Prime Inference model families", () => {
+		const opus5 = getModel("prime-inference", "anthropic/claude-opus-5");
+		expect(opus5.reasoning).toBe(true);
+		expect(opus5.thinkingLevelMap).toEqual({ xhigh: "xhigh", max: "max" });
+		expect(opus5.input).toEqual(["text", "image"]);
+		expect(opus5.contextWindow).toBe(1000000);
+		expect(opus5.maxTokens).toBe(128000);
+		expect(opus5.cost).toEqual({
+			input: 5,
+			output: 25,
+			cacheRead: 0.5,
+			cacheWrite: 6.25,
+		});
+		expect(opus5.featured).toBe(true);
+		expect(getSupportedThinkingLevels(opus5)).toContain("xhigh");
+		expect(getSupportedThinkingLevels(opus5)).toContain("max");
+
 		const opus48 = getModel("prime-inference", "anthropic/claude-opus-4.8");
 		expect(opus48.reasoning).toBe(true);
 		expect(opus48.thinkingLevelMap).toEqual({ xhigh: "xhigh", max: "max" });
@@ -197,6 +214,7 @@ describe("Prime Inference models", () => {
 		expect(getModel("prime-inference", "anthropic/claude-opus-4.6").contextWindow).toBe(1000000);
 		expect(getModel("prime-inference", "anthropic/claude-opus-4.7").contextWindow).toBe(1000000);
 		expect(getModel("prime-inference", "anthropic/claude-opus-4.8").contextWindow).toBe(1000000);
+		expect(getModel("prime-inference", "anthropic/claude-opus-5").contextWindow).toBe(1000000);
 		expect(getModel("prime-inference", "anthropic/claude-sonnet-4.6").contextWindow).toBe(1000000);
 		expect(getModel("prime-inference", "anthropic/claude-sonnet-5").contextWindow).toBe(1000000);
 		expect(getModel("prime-inference", "anthropic/claude-haiku-4.5").contextWindow).toBe(200000);

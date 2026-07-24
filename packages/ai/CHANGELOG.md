@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added Claude Opus 5 to the Anthropic, Prime Inference, and OpenRouter model catalogs.
+
 ## [0.3.3] - 2026-07-23
 
 - Fixed Vertex Gemini 2.5 Flash-Lite minimal reasoning requests to use the supported 512-token thinking budget.

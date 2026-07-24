@@ -26,6 +26,36 @@ describe("getSupportedThinkingLevels", () => {
 		expect(levels).toContain("max");
 	});
 
+	it("registers Anthropic Opus 5 with full effort support", () => {
+		const model = getModel("anthropic", "claude-opus-5");
+		expect(model).toBeDefined();
+		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+		expect(model!.input).toEqual(["text", "image"]);
+		expect(model!.contextWindow).toBe(1000000);
+		expect(model!.maxTokens).toBe(128000);
+		expect(model!.cost).toEqual({
+			input: 5,
+			output: 25,
+			cacheRead: 0.5,
+			cacheWrite: 6.25,
+		});
+	});
+
+	it("registers OpenRouter Opus 5 with full effort support", () => {
+		const model = getModel("openrouter", "anthropic/claude-opus-5");
+		expect(model).toBeDefined();
+		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+		expect(model!.input).toEqual(["text", "image"]);
+		expect(model!.contextWindow).toBe(1000000);
+		expect(model!.maxTokens).toBe(128000);
+		expect(model!.cost).toEqual({
+			input: 5,
+			output: 25,
+			cacheRead: 0.5,
+			cacheWrite: 6.25,
+		});
+	});
+
 	it("includes max but not xhigh for Anthropic Sonnet 4.6 (adaptive thinking)", () => {
 		const model = getModel("anthropic", "claude-sonnet-4-6");
 		expect(model).toBeDefined();

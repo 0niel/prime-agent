@@ -81,6 +81,12 @@ const EAGER_TOOL_INPUT_STREAMING_UNSUPPORTED_ANTHROPIC_MODELS = new Set([
 	"github-copilot:claude-sonnet-4.5",
 ]);
 
+// Opus 5 launch support is scoped to Anthropic, OpenRouter, and Prime Inference
+// while other provider paths are validated separately.
+function isDeferredOpus5ProviderModel(modelId: string): boolean {
+	return modelId.includes("claude-opus-5");
+}
+
 const DEEPSEEK_V4_THINKING_LEVEL_MAP = {
 	minimal: null,
 	low: null,
@@ -143,6 +149,7 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	// Verified 2026-07-08: these routes reject prompts above 200k tokens even
 	// though OpenRouter reports 1M. Every other Claude route accepted a >200k
 	// prompt (opus-4.7/4.8, sonnet-4.6/5, fable-5 verified individually).
+	"anthropic/claude-opus-5": { contextWindow: 1000000, maxTokens: 128000, vision: true },
 	"anthropic/claude-sonnet-4": { contextWindow: 200000 },
 	"anthropic/claude-sonnet-4.5": { contextWindow: 200000 },
 	// Enforced windows measured against the live gateway 2026-07-08 where they
@@ -170,6 +177,12 @@ const PRIME_INFERENCE_MODEL_METADATA: Record<string, PrimeInferenceModelMetadata
 	"z-ai/glm-5": { maxTokens: 131072 },
 };
 
+// Newly launched routes can serve traffic before the Prime /models catalog
+// propagates. Live catalog entries take priority as soon as they appear.
+const PRIME_INFERENCE_LAUNCH_MODELS: PrimeInferenceCatalogEntry[] = [
+	{ id: "anthropic/claude-opus-5", input: 5, output: 25, reasoning: true },
+];
+
 // Flagship models pinned above the long tail in the model picker, so the full
 // catalog doesn't flood /model. Everything else stays selectable via search.
 const PRIME_INFERENCE_FEATURED_MODELS = new Set([
@@ -178,6 +191,7 @@ const PRIME_INFERENCE_FEATURED_MODELS = new Set([
 	"anthropic/claude-opus-4.6",
 	"anthropic/claude-opus-4.7",
 	"anthropic/claude-opus-4.8",
+	"anthropic/claude-opus-5",
 	"anthropic/claude-sonnet-4.5",
 	"anthropic/claude-sonnet-4.6",
 	"anthropic/claude-sonnet-5",
@@ -310,6 +324,7 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 		model.id.includes("opus-4.7") ||
 		model.id.includes("opus-4-8") ||
 		model.id.includes("opus-4.8") ||
+		model.id.includes("opus-5") ||
 		model.id.includes("sonnet-5")
 	) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh", max: "max" });
@@ -535,7 +550,7 @@ function isPrimeInferenceReasoningModel(modelId: string, catalogReasoning?: bool
 		id.startsWith("x-ai/grok-4") ||
 		id.startsWith("z-ai/glm-") ||
 		(id.startsWith("openai/gpt-5") && !id.includes("-chat")) ||
-		/^anthropic\/claude-(?:fable-5|opus-4|sonnet-(?:4|5))/.test(id)
+		/^anthropic\/claude-(?:fable-5|opus-(?:4|5)|sonnet-(?:4|5))/.test(id)
 	);
 }
 
@@ -626,6 +641,18 @@ function getPrimeInferenceOpenRouterMetadata(
 	return index.get(PRIME_INFERENCE_OPENROUTER_ALIASES[id] ?? id);
 }
 
+function createPrimeInferenceLaunchModels(
+	openRouterIndex: Map<string, PrimeInferenceOpenRouterMetadata>,
+): Model<"openai-completions">[] {
+	return PRIME_INFERENCE_LAUNCH_MODELS.map((entry) =>
+		createPrimeInferenceModel(
+			entry,
+			PRIME_INFERENCE_MODEL_METADATA[entry.id.toLowerCase()],
+			getPrimeInferenceOpenRouterMetadata(openRouterIndex, entry.id),
+		),
+	);
+}
+
 async function fetchPrimeInferenceModels(): Promise<Model<"openai-completions">[]> {
 	const primeConfig = readPrimeCliConfig();
 	const apiKey = getPrimeInferenceConfigValue("PRIME_API_KEY", primeConfig, ["api_key", "apiKey"]);
@@ -650,9 +677,12 @@ async function fetchPrimeInferenceModels(): Promise<Model<"openai-completions">[
 	}
 	if (openRouterIndex.size === 0) {
 		// Without OpenRouter metadata every model would regress to the defaults;
-		// keep the previous snapshot instead.
+		// keep the previous snapshot plus complete launch fallbacks instead.
 		console.error("OpenRouter catalog unavailable; keeping snapshot Prime Inference models");
-		return getExistingPrimeInferenceModels();
+		return mergePrimeInferenceModels(
+			getExistingPrimeInferenceModels(),
+			createPrimeInferenceLaunchModels(openRouterIndex),
+		);
 	}
 
 	const catalogModels = catalog
@@ -670,7 +700,10 @@ async function fetchPrimeInferenceModels(): Promise<Model<"openai-completions">[
 		snapshotModels = snapshotModels.filter((model) => liveIds.has(model.id.toLowerCase()));
 	}
 	snapshotModels = refreshPrimeInferenceAliasLimits(snapshotModels, catalogModels);
-	const models = mergePrimeInferenceModels(snapshotModels, catalogModels);
+	const models = mergePrimeInferenceModels(snapshotModels, [
+		...createPrimeInferenceLaunchModels(openRouterIndex),
+		...catalogModels,
+	]);
 	console.log(`Loaded ${models.length} Prime Inference models (${catalogModels.length} from the live catalog)`);
 	return models;
 }
@@ -796,6 +829,7 @@ async function fetchAiGatewayModels(): Promise<Model<any>[]> {
 
 		const items = Array.isArray(data.data) ? (data.data as AiGatewayModel[]) : [];
 		for (const model of items) {
+			if (isDeferredOpus5ProviderModel(model.id)) continue;
 			const tags = Array.isArray(model.tags) ? model.tags : [];
 			// Only include models that support tools
 			if (!tags.includes("tool-use")) continue;
@@ -850,6 +884,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 			for (const [modelId, model] of Object.entries(data["amazon-bedrock"].models)) {
 				const m = model as ModelsDevModel;
 				if (m.tool_call !== true) continue;
+				if (isDeferredOpus5ProviderModel(modelId)) continue;
 
 				let id = modelId;
 
@@ -1253,6 +1288,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 				const m = model as ModelsDevModel & { status?: string };
 				if (m.tool_call !== true) continue;
 				if (m.status === "deprecated") continue;
+				if (isDeferredOpus5ProviderModel(modelId)) continue;
 
 				const npm = m.provider?.npm;
 				let api: Api;
@@ -1656,6 +1692,27 @@ async function generateModels() {
 		allModels.push({
 			id: "claude-opus-4-7",
 			name: "Claude Opus 4.7",
+			api: "anthropic-messages",
+			baseUrl: "https://api.anthropic.com",
+			provider: "anthropic",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: {
+				input: 5,
+				output: 25,
+				cacheRead: 0.5,
+				cacheWrite: 6.25,
+			},
+			contextWindow: 1000000,
+			maxTokens: 128000,
+		});
+	}
+
+	// Add missing Claude Opus 5
+	if (!allModels.some(m => m.provider === "anthropic" && m.id === "claude-opus-5")) {
+		allModels.push({
+			id: "claude-opus-5",
+			name: "Claude Opus 5",
 			api: "anthropic-messages",
 			baseUrl: "https://api.anthropic.com",
 			provider: "anthropic",

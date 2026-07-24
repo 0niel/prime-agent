@@ -747,7 +747,7 @@ function isAlwaysOnAdaptiveThinkingModel(modelId: string): boolean {
 }
 
 /**
- * Check if a model supports adaptive thinking (Opus 4.6+, Sonnet 4.6)
+ * Check if a model supports adaptive thinking (Opus 4.6+, Sonnet 4.6+)
  */
 function supportsAdaptiveThinking(modelId: string): boolean {
 	// Adaptive-thinking model IDs (with or without date suffix).
@@ -758,6 +758,7 @@ function supportsAdaptiveThinking(modelId: string): boolean {
 		modelId.includes("opus-4.7") ||
 		modelId.includes("opus-4-8") ||
 		modelId.includes("opus-4.8") ||
+		modelId.includes("opus-5") ||
 		modelId.includes("sonnet-4-6") ||
 		modelId.includes("sonnet-4.6") ||
 		modelId.includes("sonnet-5") ||
@@ -815,7 +816,7 @@ export const streamSimpleAnthropic: StreamFunction<"anthropic-messages", SimpleS
 		return streamAnthropic(model, context, { ...base, thinkingEnabled: false } satisfies AnthropicOptions);
 	}
 
-	// For Opus 4.6 and Sonnet 4.6: use adaptive thinking with effort level
+	// For Opus 4.6+ and Sonnet 4.6+: use adaptive thinking with effort level
 	// For older models: use budget-based thinking
 	if (supportsAdaptiveThinking(model.id)) {
 		const effort = mapThinkingLevelToEffort(model, options.reasoning);
@@ -853,8 +854,8 @@ function createClient(
 	optionsHeaders?: Record<string, string>,
 	dynamicHeaders?: Record<string, string>,
 ): { client: Anthropic; isOAuthToken: boolean } {
-	// Adaptive thinking models (Opus 4.6, Sonnet 4.6) have interleaved thinking built-in.
-	// The beta header is deprecated on Opus 4.6 and redundant on Sonnet 4.6, so skip it.
+	// Adaptive thinking models have interleaved thinking built-in, so skip the
+	// legacy beta header for them.
 	const needsInterleavedBeta = interleavedThinking && !supportsAdaptiveThinking(model.id);
 	const betaFeatures: string[] = [];
 	if (useFineGrainedToolStreamingBeta) {
@@ -1007,7 +1008,7 @@ function buildParams(
 		);
 	}
 
-	// Configure thinking mode: adaptive (Opus 4.6+ and Sonnet 4.6),
+	// Configure thinking mode: adaptive (Opus 4.6+ and Sonnet 4.6+),
 	// budget-based (older models), or explicitly disabled.
 	if (model.reasoning) {
 		if (options?.thinkingEnabled) {
