@@ -719,7 +719,10 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 			client.close();
 			await waitForExit(legacyCleanup);
 			await waitForCleanupProcessExit(workerCleanupIdentity);
-			await waitForCleanupProcessExit(successorCleanupIdentity);
+			// Under a fully loaded CI shard, the replacement supervisor can remain
+			// observable after shutdown longer than the helper's general cleanup bound.
+			// Extend only this exact generation/pid/process-start identity's polled wait.
+			await waitForCleanupProcessExit(successorCleanupIdentity, 60_000);
 			registerOwnerRecordsForCleanup(paths.registryDir);
 			await cleanupRegisteredProcesses(client);
 			await removeDeadFixtureOwnerRecords(paths.registryDir);
