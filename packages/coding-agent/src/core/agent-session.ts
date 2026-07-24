@@ -3005,10 +3005,16 @@ export class AgentSession {
 		else deferred?.resolve();
 	}
 
-	/** Reject both delivery and completion with one error unless the message already delivered. */
+	/**
+	 * Reject both legs of an agent message outcome. Delivery stays sticky once it
+	 * succeeded, but a re-armed completion (a reused id queued again after its first
+	 * turn finished) must still reject or its waiter hangs forever.
+	 */
 	private _rejectAgentMessage(agentMessageId: string | undefined, error: Error): void {
-		if (agentMessageId === undefined || this._agentMessageOutcomes.get(agentMessageId)?.delivered) return;
-		this._settleAgentMessage(agentMessageId, "delivery", error);
+		if (agentMessageId === undefined) return;
+		if (!this._agentMessageOutcomes.get(agentMessageId)?.delivered) {
+			this._settleAgentMessage(agentMessageId, "delivery", error);
+		}
 		this._settleAgentMessage(agentMessageId, "completion", error);
 	}
 
