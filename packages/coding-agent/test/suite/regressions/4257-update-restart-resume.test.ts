@@ -4,7 +4,7 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getDaemonUpdateRestartManifestPath } from "../../../src/config.js";
 import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.js";
-import type { AgentCronJobStore, AgentCronScheduler } from "../../../src/core/cron-jobs.js";
+import type { AgentCronJob, AgentCronJobStore, AgentCronScheduler } from "../../../src/core/cron-jobs.js";
 import { type CustomMessage, createSessionSlashCommandMessage } from "../../../src/core/messages.js";
 import { parseSessionSlashCommand } from "../../../src/core/slash-commands.js";
 import type { BashOperations } from "../../../src/core/tools/bash.js";
@@ -18,6 +18,7 @@ type AgentDaemonUpdateInternals = {
 	sessions: Map<string, ActiveSessionState>;
 	cronStore: AgentCronJobStore;
 	cronScheduler: AgentCronScheduler;
+	runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
 	prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest>;
 	handleLine(client: DaemonSocketClient, line: string): Promise<void>;
 	handleWorkerCommand(client: DaemonSocketClient, command: { id: string; type: string }): Promise<void>;
@@ -72,6 +73,7 @@ function createState(
 	const runtime = {
 		session: harness.session,
 		metadata,
+		cwd: harness.tempDir,
 		runtimeConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
 		diagnostics: [],
 		dispose: async () => {
@@ -291,6 +293,66 @@ describe("issue #4257 update restart resume", () => {
 		internals.mutationDrain.end();
 		await prepare;
 		expect(settled).toBe(true);
+	});
+
+	it("waits for an already-claimed one-shot dispatch and runs it exactly once", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("scheduled response")]);
+		const promptSpy = vi.spyOn(harness.session, "promptAndWait");
+		const state = createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() });
+		const internals = createDaemonInternals(harness);
+		internals.sessions.set(state.activeSessionId, state);
+		const now = new Date("2026-01-01T12:00:00.000Z");
+		const job = internals.cronStore.create({
+			activeSessionId: state.activeSessionId,
+			sessionId: harness.session.sessionId,
+			sessionFile: harness.session.sessionFile ?? "",
+			cwd: harness.tempDir,
+			scheduleText: "in 1m",
+			prompt: "claimed before restart",
+			now,
+		});
+		let markDispatchReached = () => {};
+		const dispatchReached = new Promise<void>((resolve) => {
+			markDispatchReached = resolve;
+		});
+		let releaseDispatch = () => {};
+		const dispatchGate = new Promise<void>((resolve) => {
+			releaseDispatch = resolve;
+		});
+		const originalRunCronJob = internals.runCronJob.bind(internals);
+		let runResult: "skipped" | undefined;
+		vi.spyOn(internals, "runCronJob").mockImplementation(async (claimedJob) => {
+			markDispatchReached();
+			await dispatchGate;
+			runResult = await originalRunCronJob(claimedJob);
+			return runResult;
+		});
+
+		const dispatch = internals.cronScheduler.runDue(new Date("2026-01-01T12:01:00.000Z"));
+		await dispatchReached;
+		let prepareSettled = false;
+		const prepare = internals.prepareUpdateRestart().then((manifest) => {
+			prepareSettled = true;
+			return manifest;
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(prepareSettled).toBe(false);
+
+		releaseDispatch();
+		await dispatch;
+		await prepare;
+		expect(runResult).toBeUndefined();
+		expect(promptSpy).toHaveBeenCalledOnce();
+		expect(promptSpy).toHaveBeenCalledWith(
+			"claimed before restart",
+			expect.objectContaining({ streamingBehavior: "followUp", source: "rpc" }),
+		);
+		expect(internals.cronStore.list().find((candidate) => candidate.id === job.id)).toMatchObject({
+			status: "completed",
+			runCount: 1,
+		});
 	});
 
 	type OwnershipContext = {

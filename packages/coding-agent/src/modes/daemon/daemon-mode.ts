@@ -497,6 +497,10 @@ export class AgentDaemon {
 		}
 		this.cronScheduler = new AgentCronScheduler(this.cronStore, {
 			runJob: (job) => this.runCronJob(job),
+			beginDispatch: () => {
+				this.mutationDrain.begin();
+				return () => this.mutationDrain.end();
+			},
 			onError: (job, error) => {
 				this.log(`Cron job ${job.id} failed: ${error instanceof Error ? error.message : String(error)}`);
 			},
@@ -625,6 +629,13 @@ export class AgentDaemon {
 		return this.supervisorClaims.size > 0;
 	}
 
+	private revokeSupervisorClaim(client: DaemonSocketClient): void {
+		this.supervisorClaims.delete(client);
+		if (this.options.worker && this.updateRestart?.owner === client) {
+			this.cancelPreparedUpdateRestart(this.updateRestart.id);
+		}
+	}
+
 	private clearSupervisorAvailabilityCheck(): void {
 		if (this.supervisorMonitorTimer) {
 			clearTimeout(this.supervisorMonitorTimer);
@@ -654,6 +665,7 @@ export class AgentDaemon {
 					boundClaim.ownerFingerprint,
 				);
 			} catch {
+				this.revokeSupervisorClaim(client);
 				client.socket.end();
 			}
 		}
@@ -1234,9 +1246,6 @@ export class AgentDaemon {
 	}
 
 	private async runCronJob(job: AgentCronJob): Promise<"skipped" | undefined> {
-		if (this.updateRestart) {
-			return "skipped";
-		}
 		const requirePersistedJob = this.cronStore.list().some((candidate) => candidate.id === job.id);
 		const dueJob = requirePersistedJob ? this.getRunnableCronJob(job.id) : job;
 		if (!dueJob) {
@@ -1244,12 +1253,7 @@ export class AgentDaemon {
 		}
 		const state = await this.getOrCreateCronJobSession(dueJob, requirePersistedJob);
 		const runnableJob = requirePersistedJob ? this.getRunnableCronJob(job.id) : dueJob;
-		if (
-			!state ||
-			!runnableJob ||
-			this.updateRestart !== undefined ||
-			!this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)
-		) {
+		if (!state || !runnableJob || !this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)) {
 			return "skipped";
 		}
 		const session = state.runtime.session;
@@ -1661,9 +1665,6 @@ export class AgentDaemon {
 		job: AgentCronJob,
 		requirePersistedJob: boolean,
 	): Promise<ActiveSessionState | undefined> {
-		if (this.updateRestart) {
-			return undefined;
-		}
 		const dueJob = requirePersistedJob ? this.getRunnableCronJob(job.id) : job;
 		if (!dueJob) {
 			return undefined;
@@ -2418,12 +2419,10 @@ export class AgentDaemon {
 			this.detachClient(client);
 			client.detachInput();
 			this.clients.delete(client);
-			this.supervisorClaims.delete(client);
-			if (this.options.worker && this.updateRestart?.owner === client) {
-				this.cancelPreparedUpdateRestart(this.updateRestart.id);
-			}
+			const wasAuthenticated = client.authenticated === true;
+			this.revokeSupervisorClaim(client);
 			const supervisorSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
-			if (this.options.worker && client.authenticated === true && supervisorSocketPath) {
+			if (this.options.worker && wasAuthenticated && supervisorSocketPath) {
 				this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 100);
 			}
 		};
@@ -2546,6 +2545,7 @@ export class AgentDaemon {
 				}
 				for (const previous of this.supervisorClaims.keys()) {
 					if (previous !== client) {
+						this.revokeSupervisorClaim(previous);
 						previous.socket.end();
 					}
 				}
@@ -2603,7 +2603,10 @@ export class AgentDaemon {
 					);
 					// Cancelling this prompt only abandons its admission wait. A genuine
 					// stale supervisor claim fences only the binding that it checked.
-					if (!admissionCancelled && this.supervisorClaims.get(client) === boundClaim) client.socket.end();
+					if (!admissionCancelled && this.supervisorClaims.get(client) === boundClaim) {
+						this.revokeSupervisorClaim(client);
+						client.socket.end();
+					}
 					return;
 				}
 			}

@@ -1,5 +1,7 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -13,6 +15,7 @@ import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js"
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
+	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	type DaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
@@ -285,6 +288,121 @@ describe("daemon worker supervisor monitoring", () => {
 		} else {
 			process.env[supervisorRegistryDirEnv] = previousSupervisorRegistryDir;
 		}
+	});
+
+	it("schedules recovery when the sole supervisor fails a fence check", async () => {
+		const previousSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = "/tmp/supervisor.sock";
+		try {
+			const daemon = new AgentDaemon("/tmp/worker.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+				worker: { authenticationToken: "token" },
+			});
+			const socket = Object.assign(new EventEmitter(), {
+				destroyed: false,
+				write: vi.fn(() => true),
+				end: vi.fn(function (this: EventEmitter) {
+					this.emit("close");
+				}),
+			}) as unknown as Socket;
+			const internals = daemon as unknown as {
+				clients: Set<DaemonSocketClient>;
+				supervisorClaims: Map<DaemonSocketClient, object>;
+				handleConnection(socket: Socket): void;
+				checkSupervisorFences(): Promise<void>;
+				assertSupervisorClaimCurrent: ReturnType<typeof vi.fn>;
+				scheduleSupervisorAvailabilityCheck: ReturnType<typeof vi.fn>;
+			};
+			internals.handleConnection(socket);
+			const client = [...internals.clients][0]!;
+			client.authenticated = true;
+			internals.supervisorClaims.set(client, {
+				claim: {},
+				ownerFingerprint: "old",
+			});
+			internals.assertSupervisorClaimCurrent = vi.fn(async () => {
+				throw new Error("stale fence");
+			});
+			internals.scheduleSupervisorAvailabilityCheck = vi.fn();
+
+			await internals.checkSupervisorFences();
+
+			expect(internals.supervisorClaims.has(client)).toBe(false);
+			expect(client.authenticated).toBe(true);
+			expect(internals.scheduleSupervisorAvailabilityCheck).toHaveBeenCalledOnce();
+			expect(internals.scheduleSupervisorAvailabilityCheck).toHaveBeenCalledWith("/tmp/supervisor.sock", 100);
+		} finally {
+			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
+		}
+	});
+
+	it("revokes an old supervisor before ending its socket when a replacement authenticates", async () => {
+		let markOldAssertionReached = () => {};
+		const oldAssertionReached = new Promise<void>((resolve) => {
+			markOldAssertionReached = resolve;
+		});
+		let releaseOldAssertion = () => {};
+		const oldAssertionGate = new Promise<void>((resolve) => {
+			releaseOldAssertion = resolve;
+		});
+		let assertionCount = 0;
+		const handleWorkerCommand = vi.fn(async () => undefined);
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			options: { worker: { authenticationToken: "token" } },
+			supervisorClaims: new Map(),
+			shuttingDown: false,
+			clearSupervisorAvailabilityCheck: vi.fn(),
+			scheduleSupervisorFenceCheck: vi.fn(),
+			handleWorkerCommand,
+			assertSupervisorClaimCurrent: vi.fn(async () => {
+				assertionCount++;
+				if (assertionCount === 2) {
+					markOldAssertionReached();
+					await oldAssertionGate;
+				}
+				return `fingerprint-${assertionCount}`;
+			}),
+		}) as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+		const makeClient = () =>
+			({
+				id: "supervisor",
+				authenticated: false,
+				socket: { destroyed: false, write: vi.fn(() => true), end: vi.fn() },
+				attachedActiveSessionIds: new Set(),
+				detachInput: vi.fn(),
+				supportsExtensionUi: false,
+				capabilities: new Set(),
+			}) as unknown as DaemonSocketClient;
+		const auth = (generation: string) =>
+			JSON.stringify({
+				type: "worker_auth",
+				token: "token",
+				supervisorGeneration: generation,
+				supervisorPid: 123,
+				supervisorSocketPath: "/tmp/supervisor.sock",
+			});
+		const oldClient = makeClient();
+		const replacementClient = makeClient();
+
+		await daemon.handleLine(oldClient, auth("old"));
+		const staleCommand = daemon.handleLine(
+			oldClient,
+			JSON.stringify({ type: "worker_subscribe", activeSessionId: "active-1" }),
+		);
+		await oldAssertionReached;
+		await daemon.handleLine(replacementClient, auth("replacement"));
+
+		expect(oldClient.authenticated).toBe(true);
+		expect(oldClient.socket.end).toHaveBeenCalledOnce();
+		releaseOldAssertion();
+		await staleCommand;
+		expect(handleWorkerCommand).not.toHaveBeenCalled();
 	});
 
 	it.each([

@@ -4041,6 +4041,18 @@ export class AgentSession {
 		});
 	}
 
+	private _observeDirectDispatch(message: AgentMessage): { observed: Promise<true>; stop(): void } {
+		let observer!: { message: AgentMessage; resolve: () => void };
+		const observed = new Promise<true>((resolve) => {
+			observer = { message, resolve: () => resolve(true) };
+		});
+		this._directDispatchObservers.add(observer);
+		return {
+			observed,
+			stop: () => this._directDispatchObservers.delete(observer),
+		};
+	}
+
 	private async _promptInjectedMessage(
 		text: string,
 		message: CustomMessage,
@@ -4184,11 +4196,7 @@ export class AgentSession {
 		if (options?.suppressAutonomousContinuation) this._markAutonomousContinuationSuppressed(message);
 		// Register the observer before dispatch so a synchronously-emitted
 		// message_start cannot be missed.
-		let observer: { message: AgentMessage; resolve: () => void } | undefined;
-		const observed = new Promise<true>((resolve) => {
-			observer = { message, resolve: () => resolve(true) };
-		});
-		if (observer) this._directDispatchObservers.add(observer);
+		const dispatchObserver = this._observeDirectDispatch(message);
 		const promptPromise = options?.suppressAutonomousContinuation
 			? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(messages))
 			: this.agent.prompt(messages);
@@ -4202,9 +4210,9 @@ export class AgentSession {
 				() => true,
 				() => false,
 			),
-			observed,
+			dispatchObserver.observed,
 		]);
-		if (observer) this._directDispatchObservers.delete(observer);
+		dispatchObserver.stop();
 		reportPreflight(dispatched);
 		try {
 			await promptPromise;
@@ -4257,6 +4265,7 @@ export class AgentSession {
 			reportInput(success, queued);
 		};
 		let messages: AgentMessage[] | undefined;
+		let primaryPromptMessage: QueuedAgentMessage | undefined;
 		let acceptedAgentMessagePrompt: AcceptedAgentMessagePrompt | undefined;
 		let drainedNextTurnMessages: CustomMessage[] = [];
 		let expandedText = text;
@@ -4393,14 +4402,14 @@ export class AgentSession {
 					messages.push(msg);
 				}
 				this._pendingNextTurnMessages = [];
-				const promptMessage: QueuedAgentMessage = options.customMessage
+				primaryPromptMessage = options.customMessage
 					? cloneCustomMessage(options.customMessage)
 					: {
 							role: "user",
 							content: buildUserContent(),
 							timestamp: Date.now(),
 						};
-				messages.push(promptMessage);
+				messages.push(primaryPromptMessage);
 				if (options.agentMessageId !== undefined && options.returnAfterAccepted) {
 					let resolveAccepted = () => {};
 					let rejectAccepted = (_error: Error) => {};
@@ -4411,8 +4420,8 @@ export class AgentSession {
 					acceptedAgentMessagePrompt = {
 						text: expandedText,
 						agentMessageId: options.agentMessageId,
-						message: promptMessage,
-						messages: new Set<AgentMessage>([...drainedNextTurnMessages, promptMessage]),
+						message: primaryPromptMessage,
+						messages: new Set<AgentMessage>([...drainedNextTurnMessages, primaryPromptMessage]),
 						pendingNextTurnMessages: drainedNextTurnMessages,
 						deliveredPendingNextTurnMessages: new Set(),
 						accepted,
@@ -4439,15 +4448,14 @@ export class AgentSession {
 				}
 				this._pendingNextTurnMessages = [];
 
-				if (options?.customMessage) {
-					messages.push(cloneCustomMessage(options.customMessage));
-				} else {
-					messages.push({
-						role: "user",
-						content: buildUserContent(),
-						timestamp: Date.now(),
-					});
-				}
+				primaryPromptMessage = options?.customMessage
+					? cloneCustomMessage(options.customMessage)
+					: {
+							role: "user",
+							content: buildUserContent(),
+							timestamp: Date.now(),
+						};
+				messages.push(primaryPromptMessage);
 
 				// Emit before_agent_start extension event
 				basePromptSnapshot = this._baseSystemPrompt;
@@ -4530,6 +4538,13 @@ export class AgentSession {
 				this._markAutonomousContinuationSuppressed(message);
 			}
 		}
+		if (!primaryPromptMessage) {
+			reportPreflight(false);
+			throw new Error("Direct prompt is missing its primary message");
+		}
+		const dispatchObserver = acceptedAgentMessagePrompt
+			? undefined
+			: this._observeDirectDispatch(primaryPromptMessage);
 		const promptPromise = options?.suppressAutonomousContinuation
 			? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(messages))
 			: this.agent.prompt(messages);
@@ -4540,9 +4555,7 @@ export class AgentSession {
 					() => promptAccepted,
 					(error: unknown) => error,
 				)
-			: new Promise<typeof promptAccepted>((resolve) => {
-					setTimeout(() => resolve(promptAccepted), 0);
-				});
+			: dispatchObserver!.observed.then(() => promptAccepted);
 		const firstOutcome = await Promise.race([
 			promptPromise.then(
 				() => undefined,
@@ -4550,6 +4563,7 @@ export class AgentSession {
 			),
 			acceptance,
 		]);
+		dispatchObserver?.stop();
 		if (firstOutcome !== undefined && firstOutcome !== promptAccepted) {
 			// A cleared prompt stays set until the aborted run's agent_end cleanup nulls it;
 			// nulling here would let the run's late events re-persist cleared messages.

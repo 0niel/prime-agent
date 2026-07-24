@@ -1482,6 +1482,45 @@ stale post-hook extension instructions`,
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
+	it("keeps an ordinary direct prompt fenced until its primary message starts", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		await harness.session.sendCustomMessage(
+			{ customType: "earlier-next-turn", content: "earlier", display: true, details: {} },
+			{ deliverAs: "nextTurn" },
+		);
+		const earlierStarted = createDeferred();
+		const earlierStartGate = createDeferred();
+		const primaryStarted = createDeferred();
+		const unsubscribe = harness.session.agent.subscribe(async (event) => {
+			if (event.type !== "message_start") return;
+			if (event.message.role === "user" && getMessageText(event.message) === "ordinary prompt") {
+				primaryStarted.resolve();
+				return;
+			}
+			if (event.message.role === "custom" && event.message.customType === "earlier-next-turn") {
+				earlierStarted.resolve();
+				await earlierStartGate.promise;
+			}
+		});
+
+		const prompt = harness.session.prompt("ordinary prompt");
+		await earlierStarted.promise;
+		let checkpointReleased = false;
+		const checkpoint = harness.session.waitForSessionInputCheckpoint().then(() => {
+			checkpointReleased = true;
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(checkpointReleased).toBe(false);
+
+		earlierStartGate.resolve();
+		await primaryStarted.promise;
+		await checkpoint;
+		await prompt;
+		unsubscribe();
+	});
+
 	it("keeps an injected direct prompt fenced until the injected message starts", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -1562,6 +1601,15 @@ stale post-hook extension instructions`,
 		).rejects.toThrow("dispatch failed");
 
 		// A leaked section would keep update-restart checkpoints waiting forever.
+		await expect(harness.session.waitForSessionInputCheckpoint(AbortSignal.timeout(1000))).resolves.toBeUndefined();
+	});
+
+	it("releases the direct prompt section when an ordinary dispatch fails", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		vi.spyOn(harness.session.agent, "prompt").mockRejectedValue(new Error("dispatch failed"));
+
+		await expect(harness.session.prompt("ordinary prompt")).rejects.toThrow("dispatch failed");
 		await expect(harness.session.waitForSessionInputCheckpoint(AbortSignal.timeout(1000))).resolves.toBeUndefined();
 	});
 

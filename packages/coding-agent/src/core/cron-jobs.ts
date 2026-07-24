@@ -77,6 +77,7 @@ export interface AgentCronDispatch {
 
 export interface AgentCronSchedulerHooks {
 	runJob: (job: AgentCronJob) => Promise<AgentCronJobRunResult | undefined>;
+	beginDispatch?: (dispatch: AgentCronDispatch) => (() => void) | undefined;
 	now?: () => Date;
 	onError?: (job: AgentCronJob, error: unknown) => void;
 }
@@ -956,48 +957,62 @@ export class AgentCronScheduler {
 	}
 
 	async runDue(now = this.now()): Promise<number> {
-		if (this.running) {
+		if (this.running || (this.stopped && this.hasStarted)) {
 			return 0;
 		}
 		this.running = true;
-		let dispatches: AgentCronDispatch[] = [];
+		const dispatches: Array<{ dispatch: AgentCronDispatch; endDispatch?: () => void }> = [];
 		try {
-			dispatches = this.store.claimDue(now, this.now());
+			for (const dispatch of this.store.claimDue(now, this.now())) {
+				dispatches.push({ dispatch, endDispatch: this.hooks.beginDispatch?.(dispatch) });
+			}
+		} catch (error) {
+			for (const claimed of dispatches) claimed.endDispatch?.();
+			throw error;
 		} finally {
 			this.running = false;
 			if (!this.stopped) {
 				this.scheduleNext();
 			}
 		}
-		const results = await Promise.all(dispatches.map((dispatch) => this.queueDispatch(dispatch)));
+		const results = await Promise.all(
+			dispatches.map(({ dispatch, endDispatch }) => this.queueDispatch(dispatch, endDispatch)),
+		);
 		return results.filter((result) => result !== "skipped").length;
 	}
 
-	private queueDispatch(dispatch: AgentCronDispatch): Promise<AgentCronJobRunResult | undefined> {
+	private queueDispatch(
+		dispatch: AgentCronDispatch,
+		endDispatch?: () => void,
+	): Promise<AgentCronJobRunResult | undefined> {
 		const laneKey = dispatch.job.activeSessionId;
 		const previous = this.dispatchLanes.get(laneKey) ?? Promise.resolve();
 		const task = previous
 			.catch(() => undefined)
 			.then(async (): Promise<AgentCronJobRunResult | undefined> => {
-				const job = this.store.getClaimedJob(dispatch.job.id);
-				if (!job) {
-					this.store.recordDispatchResult(dispatch.id, { now: this.now(), outcome: "skipped" });
-					return "skipped";
-				}
-				let runResult: AgentCronJobRunResult | undefined;
-				let error: unknown;
 				try {
-					runResult = await this.hooks.runJob(job);
-				} catch (runError) {
-					error = runError;
-					this.hooks.onError?.(job, runError);
+					const job = this.store.getClaimedJob(dispatch.job.id);
+					if (!job) {
+						this.store.recordDispatchResult(dispatch.id, { now: this.now(), outcome: "skipped" });
+						return "skipped";
+					}
+					let runResult: AgentCronJobRunResult | undefined;
+					let error: unknown;
+					try {
+						runResult = await this.hooks.runJob(job);
+					} catch (runError) {
+						error = runError;
+						this.hooks.onError?.(job, runError);
+					}
+					this.store.recordDispatchResult(dispatch.id, {
+						now: this.now(),
+						outcome: runResult === "skipped" && error === undefined ? "skipped" : "ran",
+						error,
+					});
+					return runResult;
+				} finally {
+					endDispatch?.();
 				}
-				this.store.recordDispatchResult(dispatch.id, {
-					now: this.now(),
-					outcome: runResult === "skipped" && error === undefined ? "skipped" : "ran",
-					error,
-				});
-				return runResult;
 			});
 		const lane = task.then(
 			() => undefined,
