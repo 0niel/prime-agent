@@ -392,7 +392,7 @@ describe("#502 unified session view regressions", () => {
 
 	test.each(["reply", "rename"] as const)("%s refresh keeps the captured search filter", (mode) => {
 		const harness = {
-			replyActiveSessionId: mode === "reply" ? "active" : undefined,
+			replyTarget: mode === "reply" ? { key: "active", summary: {} } : undefined,
 			renameTarget: mode === "rename" ? { identity: "target" } : undefined,
 			actionModeSearchQuery: "needle",
 			editor: { getText: () => "action editor text" },

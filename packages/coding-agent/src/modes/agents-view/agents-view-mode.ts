@@ -80,6 +80,7 @@ const DELETE_CONFIRM_DURATION_MS = 2000;
 const STATUS_MESSAGE_DURATION_MS = 4500;
 const SEARCH_PROMPT_PLACEHOLDER = "Search sessions";
 const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "Write a reply to this agent";
+const RESUME_PROMPT_PLACEHOLDER = "Write a prompt to resume this session";
 const COMPLETED_ROW_ICON = "✓";
 const NEEDS_INPUT_ROW_ICON = "●";
 const SELECTED_ROW_MARKER = "\0agents-view-selected-row\0";
@@ -264,25 +265,45 @@ async function openAgentsViewSession(
 		throw new Error("Cannot open agent without an active runtime or saved session file");
 	}
 
-	const { overrideCwd, notice } = resolveAgentsViewOpenCwd(summary, options.config.cwd);
 	try {
-		const response = await client.request({
-			type: "create",
-			config: createAgentsViewResumeConfig(options.config, overrideCwd),
-			sessionPath: summary.sessionFile,
-		});
-		const createdSummary = expectSessionSummary(requireDaemonData(response));
-		const activeSessionId = getRequiredActiveSessionId(createdSummary);
-		const connection = await DaemonAgentConnection.attach(client, activeSessionId, {
+		const resumed = await resumeSavedAgentsViewSession(client, options.config, summary);
+		const connection = await DaemonAgentConnection.attach(client, resumed.activeSessionId, {
 			closeClientOnDispose: true,
 			recoverDaemon: options.recoverDaemon,
 			reconnectTimeoutMs: options.reconnectTimeoutMs,
 		});
-		return { connection, summary: createdSummary, cwdFallbackNotice: notice };
+		return { connection, summary: resumed.summary, cwdFallbackNotice: resumed.cwdFallbackNotice };
 	} catch (error) {
 		client.close();
 		throw error;
 	}
+}
+
+/**
+ * Resume a saved session file into the daemon and return the live summary.
+ * The daemon's create-with-sessionPath is idempotent for this client: an
+ * already-resident session is reused instead of resumed twice.
+ */
+async function resumeSavedAgentsViewSession(
+	client: DaemonClient,
+	config: AgentSessionRuntimeConfig,
+	summary: SessionSummary,
+): Promise<{ summary: SessionSummary; activeSessionId: string; cwdFallbackNotice?: string }> {
+	if (!summary.sessionFile) {
+		throw new Error("Cannot resume a session without a saved session file");
+	}
+	const { overrideCwd, notice } = resolveAgentsViewOpenCwd(summary, config.cwd);
+	const response = await client.request({
+		type: "create",
+		config: createAgentsViewResumeConfig(config, overrideCwd),
+		sessionPath: summary.sessionFile,
+	});
+	const createdSummary = expectSessionSummary(requireDaemonData(response));
+	return {
+		summary: createdSummary,
+		activeSessionId: getRequiredActiveSessionId(createdSummary),
+		cwdFallbackNotice: notice,
+	};
 }
 
 async function connectAgentsViewDaemonClient(socketPath: string): Promise<DaemonClient> {
@@ -457,7 +478,8 @@ export class AgentsViewMode implements Component, Focusable {
 	private selectedActiveSessionId: string | undefined;
 	private selectedSessionKey: AgentsViewSelectionKey | undefined;
 	private selectionAnchorPending = false;
-	private replyActiveSessionId: string | undefined;
+	/** Armed reply composer target: a live agent or a saved session to resume on send. */
+	private replyTarget: { key: string; summary: SessionSummary } | undefined;
 	private replyLastAssistantText: string | undefined;
 	private replyLastAssistantTextLoading = false;
 	private replyHeaderTime = "";
@@ -507,7 +529,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.finish({ type: "exit" });
 		};
 		this.editor.onAgentsBack = () => {
-			if (this.replyActiveSessionId) {
+			if (this.replyTarget) {
 				this.setReplyTarget(undefined);
 				return true;
 			}
@@ -517,7 +539,7 @@ export class AgentsViewMode implements Component, Focusable {
 			return true;
 		};
 		this.editor.onEscape = () => {
-			if (this.replyActiveSessionId) {
+			if (this.replyTarget) {
 				this.setReplyTarget(undefined);
 			} else if (this.editor.getText().length > 0) {
 				this.setSearchQuery("");
@@ -634,18 +656,18 @@ export class AgentsViewMode implements Component, Focusable {
 			this.cycleProgramForSelected();
 			return;
 		}
-		if (!this.replyActiveSessionId && this.keybindings.matches(data, "app.agents.open")) {
+		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.open")) {
 			if (this.editor.getText().length === 0 || this.isSearchCursorAtEnd()) {
 				this.openSelected();
 				return;
 			}
 		}
-		if (!this.replyActiveSessionId && this.handleListNavigation(data)) {
+		if (!this.replyTarget && this.handleListNavigation(data)) {
 			return;
 		}
 		const previous = this.editor.getText();
 		this.editor.handleInput(data);
-		if (!this.replyActiveSessionId && this.editor.getText() !== previous) {
+		if (!this.replyTarget && this.editor.getText() !== previous) {
 			this.queryChanged();
 		}
 	}
@@ -898,8 +920,8 @@ export class AgentsViewMode implements Component, Focusable {
 		// targets; nested rows share the parent's session id but are read-only.
 		const selectedRow = this.rows[this.selectedIndex];
 		if (
-			this.replyActiveSessionId &&
-			(selectedRow?.kind !== "agent" || this.replyActiveSessionId !== this.selectedActiveSessionId)
+			this.replyTarget &&
+			(selectedRow?.kind !== "agent" || this.replyTarget.key !== this.selectedActiveSessionId)
 		) {
 			this.setReplyTarget(undefined);
 		}
@@ -980,8 +1002,7 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private getFilteredRecords(): UnifiedSessionRecord[] {
-		const query =
-			this.replyActiveSessionId || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
+		const query = this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
 		return filterUnifiedSessions(this.unifiedRecords, (text) => matchesSearchText(text, query));
 	}
 
@@ -1007,11 +1028,11 @@ export class AgentsViewMode implements Component, Focusable {
 			await this.confirmRename(value);
 			return;
 		}
-		if (this.replyActiveSessionId) {
+		if (this.replyTarget) {
 			const text = value.trim();
 			if (text) {
 				this.editor.setText("");
-				await this.sendReply(this.replyActiveSessionId, text);
+				await this.sendReply(this.replyTarget, text);
 			}
 			return;
 		}
@@ -1180,48 +1201,67 @@ export class AgentsViewMode implements Component, Focusable {
 		if (selectedRow?.kind !== "agent") {
 			return;
 		}
-		const activeSessionId = selectedRow.summary.activeSessionId;
-		if (!activeSessionId) {
+		const summary = selectedRow.summary;
+		// Live agents reply directly; saved sessions are resumed when the reply is
+		// sent. Rows with neither runtime nor file have nothing to receive a prompt.
+		if (!summary.activeSessionId && !summary.sessionFile) {
 			return;
 		}
 		if (this.pendingDeleteAgent?.identity === getSelectedRowIdentity(selectedRow)) {
 			return;
 		}
-		if (this.replyActiveSessionId === activeSessionId) {
+		const key = summary.activeSessionId ?? summary.id;
+		if (this.replyTarget?.key === key) {
 			this.setReplyTarget(undefined);
 			return;
 		}
-		this.setReplyTarget(activeSessionId);
+		this.setReplyTarget({ key, summary });
+		if (!summary.activeSessionId) {
+			// Inactive sessions have no live transcript endpoint; the persisted recap
+			// (or opener) is the best preview and needs no daemon round-trip.
+			this.replyLastAssistantText = summary.summary ?? summary.firstMessage;
+			this.ui.requestRender();
+			return;
+		}
+		const activeSessionId = summary.activeSessionId;
 		this.replyLastAssistantTextLoading = true;
 		try {
 			const latestAssistantText = await this.getLastAssistantText(activeSessionId);
-			if (this.replyActiveSessionId === activeSessionId) {
+			if (this.replyTarget?.key === key) {
 				this.replyLastAssistantText = latestAssistantText;
 				this.replyLastAssistantTextLoading = false;
 				this.ui.requestRender();
 			}
 		} catch (error) {
-			if (this.replyActiveSessionId === activeSessionId) {
+			if (this.replyTarget?.key === key) {
 				this.replyLastAssistantTextLoading = false;
 				this.setStatusMessage(formatError("Failed to load latest response", error));
 			}
 		}
 	}
 
-	private setReplyTarget(activeSessionId: string | undefined): void {
-		if (activeSessionId && !this.replyActiveSessionId) {
+	private setReplyTarget(target: { key: string; summary: SessionSummary } | undefined): void {
+		if (target && !this.replyTarget) {
 			this.actionModeSearchQuery = this.editor.getText();
 			this.editor.setText("");
-		} else if (!activeSessionId && this.replyActiveSessionId) {
+		} else if (!target && this.replyTarget) {
 			this.editor.setText(this.actionModeSearchQuery ?? this.persistentState.query ?? "");
 			this.actionModeSearchQuery = undefined;
 		}
-		this.replyActiveSessionId = activeSessionId;
+		this.replyTarget = target;
 		this.replyLastAssistantText = undefined;
 		this.replyLastAssistantTextLoading = false;
-		this.replyHeaderTime = activeSessionId ? this.getReplyHeaderTime(activeSessionId) : "";
-		this.editor.setPlaceholder(activeSessionId ? REPLY_PROMPT_FALLBACK_PLACEHOLDER : SEARCH_PROMPT_PLACEHOLDER);
-		if (!activeSessionId) this.rebuildRows();
+		this.replyHeaderTime = target
+			? formatAgentsViewRelativeTime(target.summary.modified ?? target.summary.created)
+			: "";
+		this.editor.setPlaceholder(
+			target
+				? target.summary.activeSessionId
+					? REPLY_PROMPT_FALLBACK_PLACEHOLDER
+					: RESUME_PROMPT_PLACEHOLDER
+				: SEARCH_PROMPT_PLACEHOLDER,
+		);
+		if (!target) this.rebuildRows();
 		this.ui.requestRender();
 	}
 
@@ -1297,11 +1337,6 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 	}
 
-	private getReplyHeaderTime(activeSessionId: string): string {
-		const summary = this.findSummaryByActiveSessionId(activeSessionId);
-		return formatAgentsViewRelativeTime(summary?.modified ?? summary?.created);
-	}
-
 	private findSummaryByActiveSessionId(activeSessionId: string): SessionSummary | undefined {
 		return this.rows.find((row) => (row.summary.activeSessionId ?? row.summary.id) === activeSessionId)?.summary;
 	}
@@ -1310,7 +1345,7 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.renameTarget) {
 			return theme.fg("warning", "Rename agent session");
 		}
-		if (!this.replyActiveSessionId) {
+		if (!this.replyTarget) {
 			return undefined;
 		}
 		const headline =
@@ -1337,10 +1372,24 @@ export class AgentsViewMode implements Component, Focusable {
 		return data.text;
 	}
 
-	private async sendReply(activeSessionId: string, text: string): Promise<void> {
-		const behavior = this.findSummaryByActiveSessionId(activeSessionId)?.isStreaming ? "followUp" : undefined;
-		this.setStatusMessage("Sending reply...");
+	private async sendReply(target: { key: string; summary: SessionSummary }, text: string): Promise<void> {
+		let activeSessionId = target.summary.activeSessionId;
 		try {
+			if (!activeSessionId) {
+				// Saved session: resume it into the daemon first, then deliver the
+				// prompt through the same path as a live reply.
+				this.setStatusMessage("Resuming session...");
+				const resumed = await resumeSavedAgentsViewSession(
+					this.requireClient(),
+					this.options.config,
+					target.summary,
+				);
+				activeSessionId = resumed.activeSessionId;
+				if (resumed.cwdFallbackNotice) this.setStatusMessage(resumed.cwdFallbackNotice, { sticky: true });
+				this.selectSummary(resumed.summary);
+			}
+			const behavior = this.findSummaryByActiveSessionId(activeSessionId)?.isStreaming ? "followUp" : undefined;
+			this.setStatusMessage("Sending reply...");
 			await this.sendPrompt(activeSessionId, text, behavior);
 			this.setStatusMessage("Reply sent");
 			this.setReplyTarget(undefined);
@@ -1348,6 +1397,15 @@ export class AgentsViewMode implements Component, Focusable {
 		} catch (error) {
 			this.setStatusMessage(formatError("Failed to send reply", error));
 		}
+	}
+
+	/** Point selection (and its persisted key) at a freshly resumed session row. */
+	private selectSummary(summary: SessionSummary): void {
+		this.selectedRowIdentity = getSummaryIdentity(summary);
+		this.selectedActiveSessionId = summary.activeSessionId ?? summary.id;
+		this.selectedSessionKey = getAgentsViewSelectionKey(summary);
+		this.persistentState.selectedRowIdentity = this.selectedRowIdentity;
+		this.persistentState.selectedSessionKey = this.selectedSessionKey;
 	}
 
 	private async handleDeleteSelected(): Promise<void> {
@@ -2118,14 +2176,16 @@ export class AgentsViewMode implements Component, Focusable {
 			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
 			`${keyText("tui.select.confirm")} open`,
 			`${keyText("app.agents.open")} open`,
-			selectedAgent && !this.options.adapter ? `${keyText("app.agents.reply")} reply` : undefined,
+			selectedAgent && !this.options.adapter
+				? `${keyText("app.agents.reply")} ${selectedRow?.section === "inactive" ? "resume" : "reply"}`
+				: undefined,
 			selectedAgent ? `${keyText("app.agents.rename")} rename` : undefined,
 			selectedAgent && (!this.options.adapter || selectedRow?.section === "inactive")
 				? `${keyText("app.agents.delete")} ${selectedRow?.section === "inactive" ? "delete" : "stop/deactivate"}`
 				: undefined,
 			selectedSubagent ? `${keyText("app.agents.delete")} stop` : undefined,
 			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,
-			this.replyActiveSessionId ? `${keyText("app.agents.back")} back` : undefined,
+			this.replyTarget ? `${keyText("app.agents.back")} back` : undefined,
 		]
 			.filter((hint): hint is string => hint !== undefined)
 			.join("   ");
