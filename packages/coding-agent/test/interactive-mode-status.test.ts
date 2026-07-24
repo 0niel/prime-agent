@@ -50,6 +50,7 @@ import {
 	mergeChildAgentSnapshots,
 	truncatePathMiddle,
 } from "../src/modes/interactive/interactive-mode.js";
+import { ClientPromptStashStore, type PromptStashState } from "../src/modes/interactive/prompt-stash-state.js";
 import { initTheme } from "../src/modes/interactive/theme/theme.js";
 
 function renderLastLine(container: Container, width = 120): string {
@@ -606,8 +607,11 @@ type SubmitHandlerHarness = {
 		addToHistory?: (text: string) => void;
 		onSubmit?: (text: string) => Promise<void>;
 	};
-	promptStash?: undefined;
-	admitPendingStartupPrompts?: () => Promise<void>;
+	promptStash?: { text: string };
+	promptStashState?: PromptStashState;
+	admitPendingStartupPrompts?: () => Promise<"admitted" | "lifecycle-cancelled">;
+	isShuttingDown?: boolean;
+	returnToAgentsViewRequested?: boolean;
 	submittedInputBehavior: "steer" | "followUp";
 	inputSubmissionGeneration: number;
 	flushPendingBashComponents: () => void;
@@ -2587,6 +2591,52 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			}
 		},
 	);
+
+	test("lifecycle cancellation at the startup barrier preserves the durable stash", async () => {
+		const inputDone = createDeferred<void>();
+		const store = new ClientPromptStashStore();
+		const promptStashState = store.forSession("session-a");
+		promptStashState.stash = { text: "durable draft" };
+		let editorText = "user prompt";
+		const submitHarness = createSubmitHandlerHarness({
+			editor: {
+				getText: () => editorText,
+				getExpandedText: () => editorText,
+				setText: (text) => {
+					editorText = text;
+				},
+			},
+			promptStashState,
+		});
+		delete submitHarness.promptStash;
+		const fakeThis = Object.assign(
+			submitHarness,
+			createStartupRunHarness(
+				{ initialMessage: "startup" },
+				{
+					getCurrentModel: () => undefined,
+					getUserInput: vi.fn(() => inputDone.promise),
+					agentConnection: submitHarness.agentConnection,
+				},
+			),
+		);
+
+		const run = InteractiveMode.prototype.run.call(fakeThis as never);
+		while (!fakeThis.admitPendingStartupPrompts) await Promise.resolve();
+		const submission = fakeThis.defaultEditor.onSubmit?.("user prompt");
+		await Promise.resolve();
+		expect(editorText).toBe("");
+		fakeThis.returnToAgentsViewRequested = true;
+		fakeThis.isShuttingDown = true;
+		inputDone.resolve(undefined);
+
+		await expect(run).resolves.toBe("agents_view");
+		await submission;
+
+		expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
+		expect(editorText).toBe("");
+		expect(promptStashState.stash?.text).toBe("durable draft");
+	});
 
 	test("keeps the TUI alive while direct editor submissions own prompt delivery", async () => {
 		const fakeThis = {

@@ -472,6 +472,8 @@ export class BrandSplashHeader implements Component {
 	}
 }
 
+type StartupPromptBarrierOutcome = "admitted" | "lifecycle-cancelled";
+
 type GoalAnnouncementSnapshot = {
 	goalId?: string;
 	status: GoalState["status"];
@@ -830,7 +832,7 @@ export class InteractiveMode {
 	private onInputCallback?: (text: string | undefined) => void;
 	private submittedInputBehavior: "steer" | "followUp" = "steer";
 	private inputSubmissionGeneration = 0;
-	private admitPendingStartupPrompts: (() => Promise<void>) | undefined;
+	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
 	private returnToAgentsViewRequested = false;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
@@ -1485,14 +1487,15 @@ export class InteractiveMode {
 		// while a model is missing or admission fails transiently, shows every
 		// admission error, and skips a prompt after three failed attempts.
 		// `startupPromptsSettled` is the user-submission barrier (startup prompts
-		// stay ahead of user prompts); it resolves when the prompts exhaust or the
-		// run lifecycle ends, whichever comes first.
+		// stay ahead of user prompts). Its outcome distinguishes completed admission
+		// from lifecycle cancellation so a resumed submit does not mutate torn-down
+		// editor state or consume the client-owned durable stash.
 		let startupPromptsDone = false;
-		let settleStartupPrompts = () => {};
-		const startupPromptsSettled = new Promise<void>((resolve) => {
-			settleStartupPrompts = () => {
+		let settleStartupPrompts = (_outcome: StartupPromptBarrierOutcome) => {};
+		const startupPromptsSettled = new Promise<StartupPromptBarrierOutcome>((resolve) => {
+			settleStartupPrompts = (outcome) => {
 				startupPromptsDone = true;
-				resolve();
+				resolve(outcome);
 			};
 		});
 		/** Resolves false when the run lifecycle ended before the 250ms retry delay elapsed. */
@@ -1594,14 +1597,17 @@ export class InteractiveMode {
 		showDeferredStartupNotifications();
 		showModelFallbackWarning();
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
-		void deliverStartupPrompts().finally(settleStartupPrompts);
+		void deliverStartupPrompts().then(
+			() => settleStartupPrompts("admitted"),
+			() => settleStartupPrompts("admitted"),
+		);
 
 		// Enter/Alt+Enter submit directly through AgentConnection. Keep run alive
 		// until shutdown or a return to the agents view resolves the lifecycle wait.
 		try {
 			await this.getUserInput();
 		} finally {
-			settleStartupPrompts();
+			settleStartupPrompts("lifecycle-cancelled");
 			this.admitPendingStartupPrompts = undefined;
 		}
 		return "agents_view";
@@ -4336,6 +4342,7 @@ export class InteractiveMode {
 			this.clearShortcutGuide();
 			const promptStashToRestore = this.promptStash;
 			let restorePromptStashAfterSubmit = true;
+			let submissionOutcome: StartupPromptBarrierOutcome = "admitted";
 
 			try {
 				const slashCommand = parseSlashCommand(text);
@@ -4678,10 +4685,17 @@ export class InteractiveMode {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
 				const promptStashAfterClear = this.promptStash;
-				await this.admitPendingStartupPrompts?.();
+				submissionOutcome = (await this.admitPendingStartupPrompts?.()) ?? "admitted";
 				// The barrier also settles when the run lifecycle ends; a submit resumed
-				// by teardown must not prompt the session the user already left.
-				if (this.isShuttingDown || this.returnToAgentsViewRequested) return;
+				// by teardown must neither prompt nor mutate the editor/durable stash.
+				if (
+					submissionOutcome === "lifecycle-cancelled" ||
+					this.isShuttingDown ||
+					this.returnToAgentsViewRequested
+				) {
+					submissionOutcome = "lifecycle-cancelled";
+					return;
+				}
 				try {
 					await this.agentConnection.prompt(text, {
 						streamingBehavior,
@@ -4692,7 +4706,11 @@ export class InteractiveMode {
 					// Admission failed, so put the exact submitted input back. Accepted
 					// inputs are session-owned and must never be restored by the client,
 					// and an older failed submit never clobbers newer typing or stashes.
-					if (submissionGeneration === this.inputSubmissionGeneration) {
+					if (
+						!this.isShuttingDown &&
+						!this.returnToAgentsViewRequested &&
+						submissionGeneration === this.inputSubmissionGeneration
+					) {
 						if (this.editor.getText().length === 0) this.editor.setText(text);
 						if (this.promptStash === promptStashAfterClear) this.promptStash = promptStashToRestore;
 					}
@@ -4702,7 +4720,11 @@ export class InteractiveMode {
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 			} finally {
+				if (this.isShuttingDown || this.returnToAgentsViewRequested) {
+					submissionOutcome = "lifecycle-cancelled";
+				}
 				if (
+					submissionOutcome === "admitted" &&
 					restorePromptStashAfterSubmit &&
 					promptStashToRestore !== undefined &&
 					submissionGeneration === this.inputSubmissionGeneration
