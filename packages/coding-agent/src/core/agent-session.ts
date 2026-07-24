@@ -2992,7 +2992,7 @@ export class AgentSession {
 				: this._agentMessageOutcomes.get(agentMessageId);
 		if (!outcome) return;
 		if (leg === "delivery") {
-			if (outcome.delivered) return;
+			if (outcome.delivered || outcome.deliveryError) return;
 			outcome.delivered = !error;
 			outcome.deliveryError = error;
 		}
@@ -4665,6 +4665,7 @@ export class AgentSession {
 		customMessage: CustomMessage | undefined,
 		images: ImageContent[] | undefined,
 		schedule: SessionInputSchedule,
+		agentMessageId: string | undefined,
 	): boolean | undefined {
 		if (!isSessionSlashCommandMessage(customMessage) || text !== customMessage.details.command.text) {
 			return undefined;
@@ -4675,6 +4676,7 @@ export class AgentSession {
 				text,
 				command: customMessage.details.command,
 				images,
+				agentMessageId,
 			},
 			schedule,
 			{ restore: true },
@@ -4692,7 +4694,10 @@ export class AgentSession {
 			prefixMessages?: CustomMessage[];
 		} = {},
 	): Promise<void> {
-		if (this._restoreSessionCommand(text, options.customMessage, images, "steer") !== undefined) return;
+		if (
+			this._restoreSessionCommand(text, options.customMessage, images, "steer", options.agentMessageId) !== undefined
+		)
+			return;
 
 		await this._queuePreparedPrompt("steer", text, images, {
 			queueKey: options.queueKey,
@@ -4714,7 +4719,13 @@ export class AgentSession {
 			prefixMessages?: CustomMessage[];
 		} = {},
 	): Promise<boolean> {
-		const restoredCommand = this._restoreSessionCommand(text, options.customMessage, images, "followUp");
+		const restoredCommand = this._restoreSessionCommand(
+			text,
+			options.customMessage,
+			images,
+			"followUp",
+			options.agentMessageId,
+		);
 		if (restoredCommand !== undefined) return restoredCommand;
 
 		return this._queuePreparedPrompt("followUp", text, images, {
@@ -4921,7 +4932,7 @@ export class AgentSession {
 							await this._executeQueuedSessionCommand(first);
 							this._settleAgentMessage(first.agentMessageId, "completion");
 						} catch (error) {
-							this._settleAgentMessage(first.agentMessageId, "completion", this._asError(error));
+							this._rejectAgentMessage(first.agentMessageId, this._asError(error));
 						} finally {
 							this._activeSessionInput = undefined;
 							this._syncSteeringStopPending();
@@ -5128,6 +5139,7 @@ export class AgentSession {
 
 	private async _executeQueuedSessionCommand(input: PreparedCommandInput): Promise<void> {
 		this._appendDurableSessionCommandMessage(input.text, input.command, false);
+		this._settleAgentMessage(input.agentMessageId, "delivery");
 		try {
 			let resultText: string | undefined;
 			switch (input.command.name) {

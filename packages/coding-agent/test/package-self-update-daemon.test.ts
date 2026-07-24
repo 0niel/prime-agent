@@ -1256,6 +1256,7 @@ describe("self-update daemon restart", () => {
 							},
 							{
 								message: "/autonomous on",
+								agentMessageId: "agentmsg_command",
 								customMessage: commandMessage,
 							},
 						],
@@ -1293,6 +1294,7 @@ describe("self-update daemon restart", () => {
 					type: "follow_up",
 					activeSessionId: "restored-active",
 					message: "/autonomous on",
+					agentMessageId: "agentmsg_command",
 					customMessage: commandMessage,
 				}),
 			);

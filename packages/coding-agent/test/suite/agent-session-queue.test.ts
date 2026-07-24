@@ -2118,7 +2118,12 @@ prepared:${event.prompt}`,
 		expect(getUserTexts(harness)).toEqual([]);
 
 		harness.setResponses([fauxAssistantMessage("later response")]);
-		await harness.session.prompt("later prompt");
+		await expect(
+			harness.session.promptAndWait("later prompt", { agentMessageId: "agentmsg_clear_first" }),
+		).resolves.toBeUndefined();
+		await expect(harness.session.waitForAgentMessagePromptDelivery("agentmsg_clear_first")).rejects.toThrow(
+			"cleared before delivery",
+		);
 		expect(getUserTexts(harness)).toEqual(["later prompt"]);
 		expect(getAssistantTexts(harness)).toEqual(["later response"]);
 
@@ -2374,6 +2379,63 @@ prepared:${event.prompt}`,
 		).toBe(true);
 	});
 
+	it("settles queued command delivery after durable invocation and before gated completion", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const started = createDeferred<void>();
+		const release = createDeferred<void>();
+		vi.spyOn(harness.session, "refine").mockImplementation(async () => {
+			started.resolve();
+			await release.promise;
+			return emptyRefinementResult();
+		});
+		const pause = harness.session.acquireQueuedWorkPause();
+		const id = "agentmsg_gated_command";
+		const delivery = harness.session.waitForAgentMessagePromptDelivery(id);
+		let completionSettled = false;
+		const completion = harness.session.promptAndWait("/refine --local", { agentMessageId: id }).finally(() => {
+			completionSettled = true;
+		});
+
+		pause.release();
+		await started.promise;
+		await expect(delivery).resolves.toBeUndefined();
+		expect(completionSettled).toBe(false);
+		release.resolve();
+		await expect(completion).resolves.toBeUndefined();
+	});
+
+	it("keeps queued command delivery successful when execution fails", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		vi.spyOn(harness.session, "refine").mockRejectedValue(new Error("refine execution failed"));
+		const pause = harness.session.acquireQueuedWorkPause();
+		const id = "agentmsg_failed_command";
+		const delivery = harness.session.waitForAgentMessagePromptDelivery(id);
+		const completion = harness.session.promptAndWait("/refine --local", { agentMessageId: id });
+
+		pause.release();
+		await expect(delivery).resolves.toBeUndefined();
+		await expect(completion).rejects.toThrow("refine execution failed");
+		await expect(harness.session.waitForAgentMessagePromptDelivery(id)).resolves.toBeUndefined();
+	});
+
+	it("rejects queued command delivery and completion when the invocation append fails", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		vi.spyOn(harness.sessionManager, "appendCustomMessageEntry").mockImplementationOnce(() => {
+			throw new Error("durable invocation append failed");
+		});
+		const pause = harness.session.acquireQueuedWorkPause();
+		const id = "agentmsg_command_append_failed";
+		const delivery = harness.session.waitForAgentMessagePromptDelivery(id);
+		const completion = harness.session.promptAndWait("/autonomous status", { agentMessageId: id });
+
+		pause.release();
+		await expect(delivery).rejects.toThrow("durable invocation append failed");
+		await expect(completion).rejects.toThrow("durable invocation append failed");
+	});
+
 	it("restores command envelopes as commands and other slash-prefixed messages literally", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -2382,6 +2444,7 @@ prepared:${event.prompt}`,
 		expect(command).toBeDefined();
 
 		await harness.session.restoreFollowUpMessage(command!.text, undefined, {
+			agentMessageId: "agentmsg_restored_command",
 			customMessage: createSessionSlashCommandMessage(command!),
 		});
 		const mismatchedCommand = parseSessionSlashCommand("/autonomous on");
@@ -2401,6 +2464,7 @@ prepared:${event.prompt}`,
 		expect(harness.session.getFollowUpQueueSnapshots()).toEqual([
 			expect.objectContaining({
 				text: command!.text,
+				agentMessageId: "agentmsg_restored_command",
 				customMessage: expect.objectContaining({ customType: "session_slash_command" }),
 			}),
 			expect.objectContaining({
