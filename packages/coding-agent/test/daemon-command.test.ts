@@ -15,7 +15,10 @@ const daemonClientMock = vi.hoisted(() => {
 		prompt?: string;
 		includeInactive?: boolean;
 		sessionPath?: string;
-		config?: { extensionFlagValues?: Record<string, boolean | string> };
+		config?: {
+			extensionFlagValues?: Record<string, boolean | string>;
+			initialGoal?: { objective: string; tokenBudget?: number };
+		};
 	};
 	type Response =
 		| { type: "response"; command: string; success: true; data?: unknown }
@@ -25,6 +28,7 @@ const daemonClientMock = vi.hoisted(() => {
 	const behavior = {
 		promptSucceeds: false,
 		emitStaleAgentEndOnAttach: false,
+		connectFails: false,
 		sessions: [] as Array<Record<string, unknown>>,
 	};
 
@@ -39,7 +43,9 @@ const daemonClientMock = vi.hoisted(() => {
 			instances.push(this);
 		}
 
-		async connect(): Promise<void> {}
+		async connect(): Promise<void> {
+			if (behavior.connectFails) throw new Error("mock connect failed");
+		}
 
 		async request(command: Command): Promise<Response> {
 			this.requests.push(command);
@@ -94,6 +100,31 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 	DaemonClient: daemonClientMock.MockDaemonClient,
 }));
 
+const spawnMock = vi.hoisted(() => {
+	const calls: string[][] = [];
+	return {
+		calls,
+		mockSpawn: (...args: unknown[]) => {
+			calls.push(args[1] as string[]);
+			return {
+				unref: () => {},
+				kill: () => {},
+				pid: 99999,
+				stdout: null,
+				stderr: null,
+				stdin: null,
+				on: () => {},
+				once: () => {},
+			};
+		},
+	};
+});
+
+vi.mock("node:child_process", async (importOriginal) => {
+	const original = (await importOriginal()) as Record<string, unknown>;
+	return { ...original, spawn: spawnMock.mockSpawn as never };
+});
+
 import { handleDaemonCommand } from "../src/cli/daemon-command.js";
 
 describe("daemon command", () => {
@@ -104,6 +135,7 @@ describe("daemon command", () => {
 		daemonClientMock.instances.length = 0;
 		daemonClientMock.behavior.promptSucceeds = false;
 		daemonClientMock.behavior.emitStaleAgentEndOnAttach = false;
+		daemonClientMock.behavior.connectFails = false;
 		daemonClientMock.behavior.sessions = [];
 		consoleErrorMessages = [];
 		vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null | undefined) => {
@@ -418,6 +450,114 @@ describe("daemon command", () => {
 			{ type: "list" },
 			{ type: "cron_list", activeSessionId: "active-1", includeInactive: false },
 		]);
+	});
+
+	it("passes --goal and --goal-token-budget to the create config", async () => {
+		await expect(
+			handleDaemonCommand([
+				"daemon",
+				"--socket",
+				"/tmp/prime-agent.sock",
+				"create",
+				"--goal",
+				"Write tests",
+				"--goal-token-budget",
+				"50000",
+				"my-session",
+			]),
+		).resolves.toBe(true);
+
+		expect(daemonClientMock.instances[0]?.requests[0]).toMatchObject({
+			type: "create",
+			name: "my-session",
+			config: {
+				initialGoal: { objective: "Write tests", tokenBudget: 50000 },
+			},
+		});
+	});
+
+	it("rejects empty --goal in daemon create", async () => {
+		await handleDaemonCommand([
+			"daemon",
+			"--socket",
+			"/tmp/prime-agent.sock",
+			"create",
+			"--goal",
+			"  ",
+			"my-session",
+		]);
+		expect(process.exitCode).toBe(1);
+		expect(
+			consoleErrorMessages.some((m) => typeof m === "string" && m.includes("--goal requires a non-empty objective")),
+		).toBe(true);
+	});
+
+	it("rejects --goal-token-budget without --goal in daemon create", async () => {
+		await handleDaemonCommand([
+			"daemon",
+			"--socket",
+			"/tmp/prime-agent.sock",
+			"create",
+			"--goal-token-budget",
+			"50000",
+			"my-session",
+		]);
+		expect(process.exitCode).toBe(1);
+		expect(
+			consoleErrorMessages.some((m) => typeof m === "string" && m.includes("--goal-token-budget requires --goal")),
+		).toBe(true);
+		// DaemonClient is constructed before runCreate parses session args
+		expect(daemonClientMock.instances.length).toBe(1);
+		expect(daemonClientMock.instances[0]?.requests.length).toBe(0);
+	});
+
+	it("does not leak --goal/--goal-token-budget into daemon startup args", async () => {
+		// Force canConnectToDaemon to fail so runStart is exercised.
+		daemonClientMock.behavior.connectFails = true;
+		spawnMock.calls.length = 0;
+
+		await handleDaemonCommand([
+			"daemon",
+			"--socket",
+			"/tmp/prime-agent-goal-leak-test.sock",
+			"start",
+			"--goal",
+			"Leak test goal",
+			"--goal-token-budget",
+			"100",
+		]);
+
+		expect(spawnMock.calls.length).toBe(1);
+		const spawnArgs = spawnMock.calls[0]!;
+		// The goal flags must NOT appear in the daemon startup args.
+		expect(spawnArgs).not.toContain("--goal");
+		expect(spawnArgs).not.toContain("Leak test goal");
+		expect(spawnArgs).not.toContain("--goal-token-budget");
+		expect(spawnArgs).not.toContain("100");
+	});
+
+	it("does not leak goal into default config for a subsequent no-goal create", async () => {
+		// First create with goal — config has initialGoal.
+		await handleDaemonCommand([
+			"daemon",
+			"--socket",
+			"/tmp/prime-agent.sock",
+			"create",
+			"--goal",
+			"Write tests",
+			"--goal-token-budget",
+			"50000",
+			"first",
+		]);
+		expect(daemonClientMock.instances.at(-1)?.requests[0]).toMatchObject({
+			type: "create",
+			config: { initialGoal: { objective: "Write tests", tokenBudget: 50000 } },
+		});
+
+		// Second create without goal — config must NOT have initialGoal.
+		await handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "create", "second"]);
+		const secondConfig = daemonClientMock.instances.at(-1)?.requests[0]?.config;
+		expect(secondConfig?.initialGoal).toBeUndefined();
 	});
 });
 

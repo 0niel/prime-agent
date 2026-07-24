@@ -2,10 +2,12 @@ import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
+import { mergeAgentSessionRuntimeConfig } from "../src/core/agent-session-config.js";
 import type { CreateAgentSessionOptions } from "../src/core/sdk.js";
 import {
 	type AppMode,
 	type DaemonInteractiveSessionManagerDecision,
+	daemonServerDefaultSessionConfig,
 	findActiveDaemonSessionSummaryForInteractiveStartup,
 	findActiveDaemonSessionSummaryForSessionFile,
 	type InteractiveDaemonStartupDecision,
@@ -331,6 +333,30 @@ describe("agents view command parsing", () => {
 });
 
 describe("runtime session option resolution", () => {
+	test("keeps verifier goals per session instead of in the daemon fallback", () => {
+		const headlessCreateConfig = {
+			cwd: "/repo",
+			serializedRefine: true,
+			initialGoal: { objective: "solve the verifier task", tokenBudget: 100_000 },
+		};
+
+		expect(headlessCreateConfig.initialGoal).toEqual({
+			objective: "solve the verifier task",
+			tokenBudget: 100_000,
+		});
+		const daemonFallback = daemonServerDefaultSessionConfig(headlessCreateConfig);
+		expect(daemonFallback).toEqual({
+			cwd: "/repo",
+			serializedRefine: true,
+			initialGoal: undefined,
+		});
+		expect(
+			mergeAgentSessionRuntimeConfig(daemonFallback, {
+				initialGoal: headlessCreateConfig.initialGoal,
+			}),
+		).toMatchObject({ initialGoal: headlessCreateConfig.initialGoal });
+	});
+
 	test("preserves daemon-provided RLM heartbeat controller when creating sessions", () => {
 		const preparedModel = { id: "prepared-model" } as unknown as CreateAgentSessionOptions["model"];
 		const runtimeModel = { id: "runtime-model" } as unknown as CreateAgentSessionOptions["model"];

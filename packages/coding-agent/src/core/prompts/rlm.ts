@@ -29,8 +29,6 @@ const IPYTHON_CONTROL_PROMPT = [
 	"Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, IPython kernel, and native call interface exposed to the model.",
 	"",
 	"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are reusable delegation specs; invoke them by turning the spec into a concise task prompt and starting `asyncio.create_task(rlm('sub-task'))` by default, then await the task only when its result is needed, or collect independent subagents with `await asyncio.gather(...)`. Use direct `await rlm('sub-task')` only when the result is immediately required. Do not invent non-native wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
-	"",
-	"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `/refine` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
 ].join("\n");
 
 export function buildRlmPrompt(options: RlmPromptOptions): string {
@@ -97,6 +95,12 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 
 	if (hasIpython) {
 		parts.push("", IPYTHON_CONTROL_PROMPT);
+		if (installedSkills.includes("refine")) {
+			parts.push(
+				"",
+				"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. It returns immediately and runs when the current turn ends, so continue working normally after calling it. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
+			);
+		}
 	}
 
 	return parts.join("\n");
@@ -110,8 +114,8 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
  * uses. The subagent-spec menu itself renders just after this, inside the
  * harness-state block.
  */
-export function buildSubagentGuidance(): string {
-	return [
+export function buildSubagentGuidance(options: { includeRefineExamples?: boolean } = {}): string {
+	const lines = [
 		"# Delegating to sub-agents",
 		"",
 		"You already have `rlm` in scope. This is about *when* to spawn one — which matters as much as how.",
@@ -153,6 +157,11 @@ export function buildSubagentGuidance(): string {
 		"```",
 		"",
 		"These are illustrations, not a fixed menu: delegate any self-contained sub-task that fits the cases above.",
-		"When you notice a delegation role, procedure, fact, preference, or behavior policy that should be reused, use `/refine` to create or update the smallest relevant subagent spec, skill, memory, or prompt addendum.",
-	].join("\n");
+	];
+	if (options.includeRefineExamples ?? true) {
+		lines.push(
+			"When you notice a delegation role, procedure, fact, preference, or behavior policy that should be reused, use `await refine.run()` to create or update the smallest relevant subagent spec, skill, memory, or prompt addendum.",
+		);
+	}
+	return lines.join("\n");
 }

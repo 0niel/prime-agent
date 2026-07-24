@@ -22,7 +22,7 @@ import {
 } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, join, resolve } from "node:path";
-import { getLogger } from "@earendil-works/pi-ai";
+import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
 import {
 	appendRotatingLog,
@@ -345,6 +345,7 @@ interface PersistedRlmSubagentRegistryEntry {
 	rlmParentNodeId?: string;
 	prompt?: string;
 	spawnCode?: string;
+	model?: { provider: string; modelId: string };
 	status: "running" | "completed" | "deleted";
 	createdAt: number;
 	updatedAt: string;
@@ -806,6 +807,7 @@ export class AgentDaemon {
 			rlmParentNodeId?: string;
 			prompt?: string;
 			spawnCode?: string;
+			model?: { provider: string; modelId: string };
 			status: PersistedRlmSubagentRegistryEntry["status"];
 			createdAt?: number;
 		},
@@ -824,6 +826,7 @@ export class AgentDaemon {
 			...(input.rlmParentNodeId ? { rlmParentNodeId: input.rlmParentNodeId } : {}),
 			...(input.prompt ? { prompt: input.prompt } : {}),
 			...(input.spawnCode ? { spawnCode: input.spawnCode } : {}),
+			...(input.model ? { model: input.model } : {}),
 			status: input.status,
 			createdAt: input.createdAt ?? Date.now(),
 			updatedAt: new Date().toISOString(),
@@ -1809,6 +1812,7 @@ export class AgentDaemon {
 					// a late completion cannot overwrite a durable deletion tombstone.
 					if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
 						if (runtime.session.sessionFile) {
+							const retainedModel = runtime.session.model ?? options.model;
 							this.recordRlmSubagentRegistryEntry(parentState, {
 								childId: options.id,
 								sessionName: runtime.session.sessionName ?? options.sessionName,
@@ -1819,6 +1823,9 @@ export class AgentDaemon {
 								rlmParentNodeId: options.rlmParentNodeId,
 								prompt: options.prompt.length <= 4096 ? options.prompt : undefined,
 								spawnCode: options.spawnCode,
+								...(retainedModel
+									? { model: { provider: retainedModel.provider, modelId: retainedModel.id } }
+									: {}),
 								status: "completed",
 								createdAt: state.runtime.metadata.createdAt,
 							});
@@ -1936,6 +1943,7 @@ export class AgentDaemon {
 						rlmParentNodeId: options.rlmParentNodeId,
 						prompt: options.prompt.length <= 4096 ? options.prompt : undefined,
 						spawnCode: options.spawnCode,
+						model: { provider: options.model.provider, modelId: options.model.id },
 						status: "running",
 						createdAt: runtime.metadata.createdAt,
 					});
@@ -1984,6 +1992,14 @@ export class AgentDaemon {
 		let runtime: AgentSessionRuntime | undefined;
 		try {
 			const sessionManager = await SessionManager.openAsync(entry.sessionFile, entry.sessionDir);
+			const modelRegistry = parentState.runtime.services.modelRegistry;
+			let rehydratedModel: Model<Api> | undefined;
+			if (entry.model) {
+				const resolved = modelRegistry.find(entry.model.provider, entry.model.modelId);
+				if (resolved && (await modelRegistry.canUseModel(resolved))) {
+					rehydratedModel = resolved;
+				}
+			}
 			runtime = await withClientEnv(parentState.clientEnv, () =>
 				createAgentSessionRuntime(this.options.createRuntime, {
 					cwd: sessionManager.getCwd(),
@@ -1992,6 +2008,7 @@ export class AgentDaemon {
 					sessionStartEvent: { type: "session_start", reason: "startup" },
 					sessionConfig: parentState.runtime.runtimeConfig,
 					sessionOptions: {
+						...(rehydratedModel ? { model: rehydratedModel } : {}),
 						agentMessageController: this.createAgentMessageController(() => stateRef),
 						agentObserveController: this.createAgentObserveController(() => stateRef),
 						rlmHeartbeatController: {

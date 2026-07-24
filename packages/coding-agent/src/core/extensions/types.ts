@@ -645,6 +645,19 @@ export interface AgentEndEvent {
 	messages: AgentMessage[];
 }
 
+/** Fired when a continual-harness refinement completes (auto-refine or explicit /refine). */
+export interface RefineCompleteEvent {
+	type: "refine_complete";
+	/** Unique refinement id. */
+	id: string;
+	/** Human-readable summary of the refinement. */
+	summary: string;
+	/** Number of edits applied. */
+	appliedEdits: number;
+	/** Whether the refinement was applied to the global or local harness. */
+	scope: "global" | "local";
+}
+
 /** Fired at the start of each turn */
 export interface TurnStartEvent {
 	type: "turn_start";
@@ -902,7 +915,8 @@ export type ExtensionEvent =
 	| UserBashEvent
 	| InputEvent
 	| ToolCallEvent
-	| ToolResultEvent;
+	| ToolResultEvent
+	| RefineCompleteEvent;
 
 // ============================================================================
 // Event Results
@@ -1057,6 +1071,7 @@ export interface ExtensionAPI {
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): void;
+	on(event: "refine_complete", handler: ExtensionHandler<RefineCompleteEvent>): void;
 
 	// =========================================================================
 	// Tool Registration

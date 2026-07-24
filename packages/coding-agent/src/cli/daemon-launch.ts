@@ -9,12 +9,20 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { appendRotatingLog, expandTildePath, getClientErrorLogPath, VERSION } from "../config.js";
-import { getProcessStartId } from "../core/session-lease.js";
+import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
+import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../modes/daemon/daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
 import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath } from "../modes/daemon/daemon-socket.js";
+import {
+	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
+	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
+	DAEMON_WORKER_ROLE_ENV,
+	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
+	DAEMON_WORKER_TOKEN_ENV,
+} from "../modes/daemon/daemon-worker-protocol.js";
 import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
 import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
 
@@ -374,13 +382,28 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 		throw new Error("Cannot determine current CLI entrypoint for daemon launch");
 	}
 
+	// Strip inherited daemon worker/supervisor role env vars so the spawned
+	// daemon supervisor does not inherit worker-mode behavior. Without this,
+	// a CLI running inside a daemon worker (e.g. a test spawned by the Prime
+	// Agent daemon) would launch the supervisor in worker mode, which listens
+	// on the socket but never sends the daemon_hello handshake.
+	const env = createCliSubprocessEnv();
+	delete env[DAEMON_WORKER_ROLE_ENV];
+	delete env[DAEMON_WORKER_TOKEN_ENV];
+	delete env[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV];
+	delete env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
+	delete env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+	delete env[ORPHAN_PROCESS_JOURNAL_ENV];
+	delete env[SESSION_LEASES_ENABLED_ENV];
+	delete env[SESSION_LEASE_OWNER_ID_ENV];
+
 	const child = spawn(
 		process.execPath,
 		[...process.execArgv, entrypoint, "--mode", "daemon", "--daemon-socket", socketPath],
 		{
 			cwd: spawnCwd ?? process.cwd(),
 			detached: true,
-			env: createCliSubprocessEnv(),
+			env,
 			// The daemon writes its own rotating log (see daemon-mode); nothing here
 			// needs its stdout/stderr, so leave them detached.
 			stdio: "ignore",
@@ -451,6 +474,8 @@ const EARLY_LAUNCH_VALUE_FLAGS = new Set([
 	"--autonomous-max-turns",
 	"--autonomous-max-tokens",
 	"--autonomous-timeout-ms",
+	"--goal",
+	"--goal-token-budget",
 ]);
 
 function findFirstEarlyLaunchPositional(args: readonly string[]): { index: number; value: string } | undefined {

@@ -49,8 +49,8 @@ import type { SessionSummary } from "./daemon-session-list.js";
 export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
 export const DAEMON_PROTOCOL_VERSION = 4;
 export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 2;
-export const DAEMON_SCHEMA_REVISION = 2;
-export const DAEMON_SCHEMA_ID = "protocol-4-schema-2-cbdbe20e7ce4";
+export const DAEMON_SCHEMA_REVISION = 3;
+export const DAEMON_SCHEMA_ID = "protocol-4-schema-3-cbdbe20e7ce4";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;

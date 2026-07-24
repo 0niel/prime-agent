@@ -1273,6 +1273,20 @@ export class SessionManager {
 		return this.persist ? getSessionArtifactPath(this.sessionDir, this.sessionId) : undefined;
 	}
 
+	/**
+	 * Force-write all in-memory entries to the session file immediately.
+	 * This bypasses the no-assistant guard in {@link _persist} so that
+	 * pre-model entries (session header, goal state, settings changes)
+	 * are durable on disk before the first assistant response.
+	 * No-op for in-memory (non-persisted) sessions.
+	 */
+	flushNow(): void {
+		if (!this.persist || !this.sessionFile) return;
+		if (this.flushed && existsSync(this.sessionFile)) return;
+		this._rewriteFile();
+		this.flushed = true;
+	}
+
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 

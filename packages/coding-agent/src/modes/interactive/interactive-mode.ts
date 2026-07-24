@@ -5146,6 +5146,13 @@ export class InteractiveMode {
 			case "goal_update":
 				this.handleGoalUpdate(event.goal);
 				break;
+
+			case "refine_failed":
+				this.showError(`Refinement failed: ${event.error}`);
+				break;
+
+			case "refine_complete":
+				break;
 		}
 	}
 

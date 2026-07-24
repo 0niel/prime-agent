@@ -41,7 +41,7 @@ describe("buildRlmPrompt", () => {
 		const prompt = buildRlmPrompt({
 			cwd: "/repo",
 			messagesPath: "/repo/.pi/sessions/session.jsonl",
-			installedSkills: ["websearch"],
+			installedSkills: ["websearch", "refine"],
 			activeTools: ["ipython"],
 			allowRecursion: false,
 		});
@@ -57,7 +57,7 @@ describe("buildRlmPrompt", () => {
 				`Pre-installed Python packages: ${DEFAULT_RLM_EXTRA_IMPORT_LABELS.join(", ")}.`,
 				"Install additional packages with `uv pip install <pkg>` (this is a uv-managed venv with no pip module).",
 				"",
-				"Installed Python skill modules (pre-imported): `websearch`.",
+				"Installed Python skill modules (pre-imported): `websearch`, `refine`.",
 				"Read each skill's SKILL.md for its API. Inspect a module with `help(<skill>)` or `dir(<skill>)`, then inspect a documented callable with `inspect.signature(<skill>.<function>)`.",
 				"Each skill is also available as a shell command by the same name: `<skill> ...`. Discover its CLI usage with `<skill> --help`.",
 				"",
@@ -81,7 +81,7 @@ describe("buildRlmPrompt", () => {
 				"",
 				"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are reusable delegation specs; invoke them by turning the spec into a concise task prompt and starting `asyncio.create_task(rlm('sub-task'))` by default, then await the task only when its result is needed, or collect independent subagents with `await asyncio.gather(...)`. Use direct `await rlm('sub-task')` only when the result is immediately required. Do not invent non-native wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
 				"",
-				"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `/refine` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
+				"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. It returns immediately and runs when the current turn ends, so continue working normally after calling it. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
 			].join("\n"),
 		);
 	});
@@ -302,7 +302,7 @@ describe("buildSystemPrompt", () => {
 		const prompt = buildSystemPrompt({
 			selectedTools: ["ipython"],
 			contextFiles: [],
-			skills: [],
+			skills: [pythonSkill("refine")],
 			cwd: "/repo",
 			messagesPath: "/repo/.pi/sessions/session.jsonl",
 			harnessState,
@@ -312,7 +312,7 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("Local continual harness entries belong to this Prime Agent session");
 		expect(prompt).toContain("The continual harness entries below are compact summaries, not full descriptions");
 		expect(prompt).toContain("Use global continual harness refinement only for stable cross-session lessons");
-		expect(prompt).toContain("When to call `/refine`");
+		expect(prompt).toContain("When to call `await refine.run()`");
 		expect(prompt).toContain("Call contract: read each installed Python skill's SKILL.md");
 		expect(prompt).toContain("Continual harness skill entries are Python REPL skills");
 		expect(prompt).toContain("Continual harness subagent entries are invoked by composing a concise task prompt");
@@ -383,7 +383,7 @@ describe("buildSystemPrompt", () => {
 		const prompt = buildSystemPrompt({
 			selectedTools: ["ipython"],
 			contextFiles: [],
-			skills: [],
+			skills: [pythonSkill("refine")],
 			cwd: "/repo",
 			messagesPath: "/repo/.pi/sessions/session.jsonl",
 		});
@@ -453,7 +453,9 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("await <skill_import>.<function>(...)");
 		expect(prompt).toContain("Python `reference` and `arguments` contract");
 		expect(prompt).toContain("await asyncio.gather(rlm('task1'), rlm('task2'))");
-		expect(prompt).toContain("Use `/refine` to turn repeated delegation patterns into reusable subagent specs");
+		expect(prompt).toContain(
+			"Use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs",
+		);
 		expect(prompt).toContain("repeated procedures into skills");
 		expect(prompt).toContain("durable facts/preferences into memories");
 		expect(prompt).toContain("narrow behavioral policies into prompt addendums");
@@ -516,6 +518,7 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).not.toContain("agent_observe.list_agents");
 		expect(prompt).not.toContain("asyncio.create_task");
 		expect(prompt).not.toContain("await <skill_import>");
+		expect(prompt).not.toContain("await refine.run()");
 	});
 
 	test("omits shell guidance from harness state when shell is inactive", () => {
@@ -559,6 +562,7 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).not.toContain("<skill_import> ...");
 		expect(prompt).not.toContain("asyncio.create_task");
 		expect(prompt).not.toContain("await <skill_import>");
+		expect(prompt).not.toContain("await refine.run()");
 	});
 
 	test("custom prompt override bypasses the rlm harness body", () => {

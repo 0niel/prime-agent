@@ -381,6 +381,10 @@ function parseSessionArgs(args: string[]): ParsedSessionArgs {
 	}
 
 	const name = nameParts.join(" ").trim();
+	// Validate: --goal-token-budget without --goal is an error.
+	if (config.initialGoal?.tokenBudget !== undefined && !config.initialGoal.objective) {
+		throw new Error("--goal-token-budget requires --goal");
+	}
 	return {
 		daemonArgs,
 		name: name || undefined,
@@ -528,6 +532,30 @@ function parseSessionOption(
 		case "-nc":
 			config.noContextFiles = true;
 			return boolean(arg);
+		case "--goal": {
+			const value = readValue(arg);
+			if (!value.trim()) {
+				throw new Error("--goal requires a non-empty objective");
+			}
+			config.initialGoal = { objective: value, tokenBudget: config.initialGoal?.tokenBudget };
+			// Session-specific flag: do NOT propagate to daemon startup args.
+			// The goal is sent per-create via the config in the daemon request,
+			// so a later no-goal create is not contaminated.
+			return { consumed: 1 };
+		}
+		case "--goal-token-budget": {
+			const value = readValue(arg);
+			const budget = Number(value);
+			if (!Number.isInteger(budget) || budget <= 0) {
+				throw new Error("--goal-token-budget must be a positive integer");
+			}
+			config.initialGoal = {
+				objective: config.initialGoal?.objective ?? "",
+				tokenBudget: budget,
+			};
+			// Session-specific flag: do NOT propagate to daemon startup args.
+			return { consumed: 1 };
+		}
 		case "--foreground":
 		case "--no-detach":
 		case "--background":
@@ -1355,7 +1383,9 @@ class DaemonAttachTerminal {
 				this.rl?.prompt();
 				return;
 			case "session_event":
-				this.handleSessionEvent(message.event);
+				if (message.event.type !== "refine_complete") {
+					this.handleSessionEvent(message.event);
+				}
 				return;
 			case "session_replaced":
 				this.isStreaming = message.state.isStreaming;
@@ -1451,6 +1481,11 @@ class DaemonAttachTerminal {
 				return;
 			case "goal_update":
 				this.writeLine(chalk.dim(`Goal: ${event.goal.status}`));
+				return;
+			case "refine_failed":
+				this.writeLine(chalk.red(`Refinement failed: ${event.error}`));
+				return;
+			case "refine_complete":
 				return;
 			case "turn_start":
 			case "turn_end":

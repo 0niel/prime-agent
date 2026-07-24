@@ -1,4 +1,14 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+	appendFileSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
@@ -9,6 +19,8 @@ import { convertToLlm } from "../messages.js";
 import type { CustomEntry } from "../session-manager.js";
 
 export const REFINEMENT_CUSTOM_TYPE = "prime-agent.refinement";
+
+export const REFINE_SKILL_NAME = "refine";
 const HARNESS_STATE_DIR_NAME = "harness";
 const REFINEMENT_HISTORY_FILE_NAME = "refinements.jsonl";
 const DEFAULT_OVERVIEW_ENTRY_LIMIT = 6;
@@ -214,7 +226,7 @@ function normalizeHarnessScope(value: unknown, fallback: HarnessScope): HarnessS
 	return value === "global" || value === "local" ? value : fallback;
 }
 
-function inferRefinementResultScope(result: RefinementResult): HarnessScope | undefined {
+export function inferRefinementResultScope(result: RefinementResult): HarnessScope | undefined {
 	if (result.scope) {
 		return result.scope;
 	}
@@ -312,8 +324,17 @@ export function mergeHarnessStates(globalState: HarnessState, localState?: Harne
 
 export function saveHarnessState(harnessStateDir: string, state: HarnessState): string {
 	const statePath = getHarnessStatePath(harnessStateDir);
+	const tempPath = `${statePath}.${process.pid}.${randomUUID()}.tmp`;
 	mkdirSync(harnessStateDir, { recursive: true });
-	writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+	try {
+		const mode = existsSync(statePath) ? statSync(statePath).mode & 0o777 : 0o600;
+		writeFileSync(tempPath, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode });
+		renameSync(tempPath, statePath);
+	} finally {
+		if (existsSync(tempPath)) {
+			unlinkSync(tempPath);
+		}
+	}
 	return statePath;
 }
 
@@ -393,12 +414,14 @@ export function formatHarnessStateForPrompt(
 		maxContentLength?: number;
 		includeIpythonExamples?: boolean;
 		includeShellExamples?: boolean;
+		includeRefineExamples?: boolean;
 	} = {},
 ): string {
 	const maxEntriesPerKind = options.maxEntriesPerKind ?? DEFAULT_OVERVIEW_ENTRY_LIMIT;
 	const maxRefinements = options.maxRefinements ?? DEFAULT_OVERVIEW_REFINEMENT_LIMIT;
 	const maxContentLength = options.maxContentLength ?? DEFAULT_OVERVIEW_CONTENT_LIMIT;
 	const includeIpythonExamples = options.includeIpythonExamples ?? true;
+	const includeRefineExamples = options.includeRefineExamples ?? includeIpythonExamples;
 	const lines = [
 		"# Continual Harness State",
 		"",
@@ -407,7 +430,9 @@ export function formatHarnessStateForPrompt(
 		"Default to local continual harness refinement for current task progress, temporary blockers, and session coordination. Use global continual harness refinement only for stable cross-session lessons, durable user preferences, reusable skills/subagents, or explicitly project-qualified facts.",
 		"Use these continual harness prompt notes, memories, skills, and subagent specs when they are relevant. The base system prompt is immutable; prompt entries below are supplemental notes only.",
 		"",
-		"When to call `/refine`: after a repeated failure, a reusable tactic emerges, a repeated delegation role should become a subagent spec, a repeated procedure should become a skill, a durable fact/preference should become a memory, a narrow behavioral policy should become a prompt addendum, a user corrects behavior that should persist locally or globally, validation shows a continual harness entry is wrong, or a skill/subagent/memory/prompt note should be created, updated, deleted, or rolled back. Keep `/refine` continual harness edits small and evidence-backed.",
+		includeRefineExamples
+			? "When to call `await refine.run()`: after a repeated failure, a reusable tactic emerges, a repeated delegation role should become a subagent spec, a repeated procedure should become a skill, a durable fact/preference should become a memory, a narrow behavioral policy should become a prompt addendum, a user corrects behavior that should persist locally or globally, validation shows a continual harness entry is wrong, or a skill/subagent/memory/prompt note should be created, updated, deleted, or rolled back. Keep `await refine.run()` continual harness edits small and evidence-backed."
+			: "When to refine the continual harness: after a repeated failure, a reusable tactic emerges, a repeated delegation role should become a subagent spec, a repeated procedure should become a skill, a durable fact/preference should become a memory, a narrow behavioral policy should become a prompt addendum, a user corrects behavior that should persist locally or globally, validation shows a continual harness entry is wrong, or a skill/subagent/memory/prompt note should be created, updated, deleted, or rolled back. Keep continual harness edits small and evidence-backed.",
 		"",
 		includeIpythonExamples
 			? "Call contract: read each installed Python skill's SKILL.md and call its documented module function in IPython; do not assume a `.run` entrypoint. Use `<skill_import> ...` in shell when a CLI exists. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are invoked by composing a concise task prompt and starting `asyncio.create_task(rlm('sub-task'))` by default, then awaiting only when the result is needed; use `await asyncio.gather(rlm('task1'), rlm('task2'))` for independent parallel subagents. Use direct `await rlm('sub-task')` only when the result is immediately required. Do not invent wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries."
@@ -613,6 +638,7 @@ export function applyRefinementProposal(
 	options: { id: string; rollbackOf?: string; scope?: HarnessScope; baselineState?: HarnessState },
 ): RefinementResult {
 	const appliedEdits: AppliedRefinementEdit[] = [];
+	const proposalModifiedKeys = new Set<string>();
 	for (const edit of proposal.edits) {
 		const computedId = edit.id ?? (edit.action === "create" ? slug(edit.title ?? edit.kind, edit.kind) : undefined);
 		const id = computedId ?? "";
@@ -624,8 +650,13 @@ export function applyRefinementProposal(
 
 		const records = state.entries[edit.kind];
 		const before = cloneEntry(records[id]);
+		const entryKey = `${edit.kind}:${id}`;
 		const baseline = cloneEntry(options.baselineState?.entries[edit.kind][id]);
-		if (options.baselineState && JSON.stringify(before) !== JSON.stringify(baseline)) {
+		if (
+			options.baselineState &&
+			!proposalModifiedKeys.has(entryKey) &&
+			JSON.stringify(before) !== JSON.stringify(baseline)
+		) {
 			appliedEdits.push({
 				...edit,
 				id,
@@ -641,6 +672,7 @@ export function applyRefinementProposal(
 				continue;
 			}
 			delete records[id];
+			proposalModifiedKeys.add(entryKey);
 			appliedEdits.push({ ...edit, id, before, applied: true });
 			continue;
 		}
@@ -671,6 +703,7 @@ export function applyRefinementProposal(
 			version,
 		};
 		records[id] = after;
+		proposalModifiedKeys.add(entryKey);
 		appliedEdits.push({ ...edit, id, before, after: cloneEntry(after), applied: true });
 	}
 

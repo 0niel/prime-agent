@@ -26,6 +26,19 @@ export interface AgentSessionRuntimeConfig {
 	noContextFiles?: boolean;
 	autonomous?: AgentAutonomousConfig;
 	extensionFlagValues?: Record<string, boolean | string>;
+	/**
+	 * When true, auto-refine runs synchronously between turns at the
+	 * shouldStopAfterTurn boundary instead of in the background after
+	 * agent_end. Passed from the JSON/print client to the daemon worker
+	 * so it survives the appMode="daemon" context switch.
+	 */
+	serializedRefine?: boolean;
+	/**
+	 * Initial goal to seed when creating a new top-level session (rlmDepth 0).
+	 * Ignored for subagent sessions and when the branch already has a persisted
+	 * thread_goal_state entry (idempotent restart/rehydration).
+	 */
+	initialGoal?: { objective: string; tokenBudget?: number };
 }
 
 export function mergeAgentSessionRuntimeConfig(
@@ -63,6 +76,8 @@ export function mergeAgentSessionRuntimeConfig(
 			base.extensionFlagValues || override.extensionFlagValues
 				? { ...(base.extensionFlagValues ?? {}), ...(override.extensionFlagValues ?? {}) }
 				: undefined,
+		serializedRefine: override.serializedRefine ?? base.serializedRefine,
+		initialGoal: override.initialGoal ?? base.initialGoal,
 	};
 }
 
@@ -78,6 +93,8 @@ function cloneAgentSessionRuntimeConfig(config: AgentSessionRuntimeConfig): Agen
 		themes: cloneArray(config.themes),
 		autonomous: mergeAutonomousConfig(undefined, config.autonomous),
 		extensionFlagValues: config.extensionFlagValues ? { ...config.extensionFlagValues } : undefined,
+		serializedRefine: config.serializedRefine,
+		initialGoal: config.initialGoal ? { ...config.initialGoal } : undefined,
 	};
 }
 

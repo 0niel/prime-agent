@@ -66,6 +66,18 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("model_catalog");
 	});
 
+	it("keeps refine failure events backward-compatible on the existing session event channel", () => {
+		const event: DaemonOutbound = {
+			type: "session_event",
+			activeSessionId: "active-1",
+			event: { type: "refine_failed", error: "disk full" },
+		};
+
+		expect(DAEMON_SCHEMA_REVISION).toBe(3);
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.session_event).toEqual({ minProtocol: 1 });
+		expect(event).toMatchObject({ event: { type: "refine_failed", error: "disk full" } });
+	});
+
 	it("creates versioned command and event envelopes", () => {
 		const command = { id: "cmd-1", type: "attach", activeSessionId: "active-1" } as const;
 		const commandEnvelope = createDaemonCommandEnvelope(command, "cmd-1", "client-1");

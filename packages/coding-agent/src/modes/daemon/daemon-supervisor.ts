@@ -3044,10 +3044,18 @@ export class DaemonSupervisor {
 					);
 					return;
 				}
+				// Snapshot summaries/state include live fields (for example activity and attached client
+				// counts) that can change without advancing the transcript sequence. Treat the stable
+				// transfer envelope as identity; duplicate chunks and end metadata are still byte-checked.
 				const duplicate =
 					generation?.transcript.complete === true &&
 					generation.end !== undefined &&
-					generation.begin?.equals(frame.payload) === true;
+					generation.result.snapshotStream?.messageCount === begin.messageCount &&
+					generation.result.snapshotStream?.targetChunkBytes === begin.targetChunkBytes &&
+					generation.result.lastEventSequence === result.lastEventSequence &&
+					generation.result.snapshot.lastEventSequence === result.snapshot.lastEventSequence &&
+					generation.result.snapshot.lastEventCursor?.generation === result.snapshot.lastEventCursor?.generation &&
+					generation.result.snapshot.lastEventCursor?.sequence === result.snapshot.lastEventCursor?.sequence;
 				if (generation?.transcript.complete && !duplicate) {
 					this.failWorkerSnapshotCache(
 						worker,

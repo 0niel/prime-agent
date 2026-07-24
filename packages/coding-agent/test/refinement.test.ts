@@ -1,4 +1,4 @@
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
@@ -15,6 +15,7 @@ import {
 	getRefinementHistory,
 	getRefinementHistoryPath,
 	type HarnessState,
+	inferRefinementResultScope,
 	loadGlobalRefinementHistory,
 	loadHarnessState,
 	mergeHarnessStates,
@@ -165,6 +166,61 @@ describe("harness refinement", () => {
 			{ applied: false, error: "entry changed during refinement planning" },
 		]);
 		expect(currentState.entries.memory.memory_entry.content).toBe("concurrent kernel content");
+	});
+
+	it("allows sequential edits to the same entry after the baseline matches once", () => {
+		const state = loadHarnessState(makeTempDir(), "local");
+		seedEntry(state, "memory");
+		const baselineState = structuredClone(state);
+
+		const result = applyRefinementProposal(
+			state,
+			proposal("Update memory twice", [
+				{ action: "update", kind: "memory", id: "memory_entry", title: "First", content: "first" },
+				{ action: "update", kind: "memory", id: "memory_entry", title: "Second", content: "second" },
+			]),
+			{ id: "refine_same_entry", baselineState, scope: "local" },
+		);
+
+		expect(result.appliedEdits.map((edit) => edit.applied)).toEqual([true, true]);
+		expect(state.entries.memory.memory_entry.content).toBe("second");
+		expect(state.entries.memory.memory_entry.version).toBe(3);
+	});
+
+	it("infers legacy refinement scope from applied edit snapshots", () => {
+		const state = loadHarnessState(makeTempDir(), "global");
+		seedEntry(state, "memory", "global_memory");
+		const after = { ...state.entries.memory.global_memory, scope: "global" as const };
+		const result: RefinementResult = {
+			...proposal("Legacy global edit", []),
+			id: "legacy",
+			appliedEdits: [
+				{
+					action: "create",
+					kind: "memory",
+					id: "global_memory",
+					applied: true,
+					after,
+				},
+			],
+			harnessStatePath: "",
+		};
+
+		expect(inferRefinementResultScope(result)).toBe("global");
+	});
+
+	it("atomically replaces harness state without leaving temporary files", () => {
+		const harnessStateDir = makeTempDir();
+		const state = loadHarnessState(harnessStateDir);
+		seedEntry(state, "memory");
+
+		const statePath = saveHarnessState(harnessStateDir, state);
+
+		expect(loadHarnessState(harnessStateDir).entries.memory.memory_entry).toBeDefined();
+		expect(readdirSync(harnessStateDir)).toEqual([statePath.split("/").at(-1)]);
+		chmodSync(statePath, 0o600);
+		saveHarnessState(harnessStateDir, state);
+		expect(statSync(statePath).mode & 0o777).toBe(0o600);
 	});
 
 	it("applies create, update, and delete for every editable harness kind", () => {

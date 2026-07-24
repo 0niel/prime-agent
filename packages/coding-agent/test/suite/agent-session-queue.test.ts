@@ -1178,6 +1178,15 @@ describe("AgentSession queue characterization", () => {
 			const planStartedPromise = new Promise<void>((resolve) => {
 				planStarted = resolve;
 			});
+			let releasePrompt: (() => void) | undefined;
+			const promptGate = new Promise<void>((resolve) => {
+				releasePrompt = resolve;
+			});
+			let promptStarted: (() => void) | undefined;
+			const promptStartedPromise = new Promise<void>((resolve) => {
+				promptStarted = resolve;
+			});
+			let promptSignal: AbortSignal | undefined;
 			harness.setResponses([
 				async () => {
 					planStarted?.();
@@ -1191,14 +1200,19 @@ describe("AgentSession queue characterization", () => {
 						}),
 					);
 				},
-				fauxAssistantMessage("prompt reply"),
+				async (_context, options) => {
+					promptSignal = options?.signal;
+					promptStarted?.();
+					await promptGate;
+					return fauxAssistantMessage("prompt reply");
+				},
 			]);
 
 			const refinePromise = harness.session.refine({ instructions: "background refine" });
 			await planStartedPromise;
 
 			const promptPromise = harness.session.prompt("hello during refine");
-			await new Promise((resolve) => setTimeout(resolve, 10));
+			await promptStartedPromise;
 			// With backgrounded refine planning, the prompt does NOT wait for the
 			// planning LLM pass. It starts immediately and streams its response
 			// while planning is still in flight. The application phase waits for
@@ -1206,6 +1220,17 @@ describe("AgentSession queue characterization", () => {
 			expect(harness.getPendingResponseCount()).toBe(0);
 
 			releasePlan?.();
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			expect(promptSignal?.aborted).toBe(false);
+
+			let refineSettled = false;
+			void refinePromise.finally(() => {
+				refineSettled = true;
+			});
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			expect(refineSettled).toBe(false);
+
+			releasePrompt?.();
 			await refinePromise;
 			await promptPromise;
 

@@ -1,10 +1,17 @@
+import { existsSync } from "node:fs";
 import type { AgentContext, AgentTool } from "@earendil-works/pi-agent-core";
+import { Agent } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage, fauxToolCall, type Usage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentSession } from "../../src/core/agent-session.js";
+import { AgentSession } from "../../src/core/agent-session.js";
+import { AuthStorage } from "../../src/core/auth-storage.js";
 import type { ExtensionFactory } from "../../src/core/extensions/types.js";
 import type { GoalHostResponse } from "../../src/core/goals.js";
+import { ModelRegistry } from "../../src/core/model-registry.js";
+import { SessionManager } from "../../src/core/session-manager.js";
+import { SettingsManager } from "../../src/core/settings-manager.js";
+import { createTestResourceLoader } from "../utilities.js";
 import { createHarness, getAssistantTexts, getMessageText, type Harness } from "./harness.js";
 
 function assistantWithUsage(message: string | AssistantMessage, usage: Partial<Usage>): AssistantMessage {
@@ -830,5 +837,177 @@ describe("AgentSession goals", () => {
 		expect(harness.session.messages).toEqual([]);
 		expect(harness.eventsOfType("goal_update").at(-1)?.goal.status).toBe("idle");
 		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+});
+
+describe("initial goal seeding from config", () => {
+	const harnesses: Harness[] = [];
+
+	afterEach(() => {
+		while (harnesses.length > 0) {
+			harnesses.pop()?.cleanup();
+		}
+	});
+
+	it("seeds an active goal from initialGoal config on a fresh top-level session", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			initialGoal: { objective: "Write tests", tokenBudget: 50000 },
+		});
+		harnesses.push(harness);
+
+		expect(harness.session.goalState).toMatchObject({
+			active: true,
+			status: "active",
+			objective: "Write tests",
+			tokenBudget: 50000,
+		});
+
+		// Goal is persisted before first prompt
+		const { GOAL_STATE_CUSTOM_TYPE } = await import("../../src/core/goals.js");
+		const branch = harness.sessionManager.getBranch();
+		const goalEntry = branch.find((e) => e.type === "custom" && e.customType === GOAL_STATE_CUSTOM_TYPE);
+		expect(goalEntry).toBeDefined();
+	});
+
+	it("does not seed initialGoal for subagent sessions (rlmDepth > 0)", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			rlmDepth: 1,
+			initialGoal: { objective: "Subagent goal" },
+		});
+		harnesses.push(harness);
+
+		expect(harness.session.goalState.status).toBe("idle");
+		expect(harness.session.goalState.active).toBe(false);
+	});
+
+	function createRestartSession(harness: Harness): AgentSession {
+		const sessionFile = harness.sessionManager.getSessionFile()!;
+		expect(existsSync(sessionFile)).toBe(true);
+		const newSessionManager = SessionManager.open(sessionFile);
+
+		// Assert the reopened branch contains a thread_goal_state custom entry
+		// before constructing the new AgentSession. This proves the goal was
+		// persisted to disk.
+		const reopenedBranch = newSessionManager.getBranch();
+		const goalEntries = reopenedBranch.filter(
+			(e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "thread_goal_state",
+		);
+		expect(goalEntries.length).toBeGreaterThan(0);
+
+		const model = harness.getModel();
+		const newAuth = AuthStorage.inMemory();
+		newAuth.setRuntimeApiKey(model.provider, "faux-key");
+		const newRegistry = ModelRegistry.inMemory(newAuth);
+		const newSettings = SettingsManager.inMemory();
+
+		const newAgent = new Agent({
+			getApiKey: () => "faux-key",
+			initialState: {
+				model,
+				systemPrompt: "You are a test assistant.",
+				tools: [],
+			},
+		});
+
+		return new AgentSession({
+			agent: newAgent,
+			sessionManager: newSessionManager,
+			settingsManager: newSettings,
+			cwd: harness.tempDir,
+			modelRegistry: newRegistry,
+			resourceLoader: createTestResourceLoader(),
+			rlmDepth: 0,
+			initialGoal: { objective: "Should not reseed" },
+		});
+	}
+
+	it("does not reseed after goal is cleared (idempotent restart)", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			initialGoal: { objective: "Initial goal" },
+		});
+		harnesses.push(harness);
+
+		expect(harness.session.goalState.status).toBe("active");
+
+		// Clear the goal via /goal clear (slash command)
+		harness.setResponses([fauxAssistantMessage("unused")]);
+		await harness.session.prompt("/goal clear");
+		expect(harness.session.goalState.status).toBe("idle");
+
+		// Simulate restart: reopen the same session file
+		const newSession = createRestartSession(harness);
+
+		// Goal should remain idle (cleared), not reseeded
+		expect(newSession.goalState.status).toBe("idle");
+		expect(newSession.goalState.objective).toBeUndefined();
+		newSession.dispose();
+	});
+
+	it("does not reseed after goal is completed (idempotent restart)", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			initialGoal: { objective: "Complete me" },
+		});
+		harnesses.push(harness);
+
+		expect(harness.session.goalState.status).toBe("active");
+
+		// Complete the goal via host request
+		harness.session.handleGoalHostRequest("goal.complete");
+		expect(harness.session.goalState.status).toBe("complete");
+
+		// Simulate restart on the same session file
+		const newSession = createRestartSession(harness);
+
+		// Goal should remain complete, not reseeded
+		expect(newSession.goalState.status).toBe("complete");
+		expect(newSession.goalState.objective).toBe("Complete me");
+		newSession.dispose();
+	});
+
+	it("does not reseed when branch has messages (idempotent restart after use)", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			initialGoal: { objective: "Initial goal" },
+		});
+		harnesses.push(harness);
+
+		expect(harness.session.goalState.status).toBe("active");
+
+		// Append user and assistant messages directly via sessionManager
+		// to avoid triggering autonomous goal continuation loop.
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "do something" }],
+			timestamp: Date.now(),
+		});
+		harness.sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "done" }],
+			api: "openai-completions",
+			provider: "openai",
+			model: "test",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+
+		// Simulate restart on the same session file
+		const newSession = createRestartSession(harness);
+
+		// Goal should be the persisted active goal, not the new initialGoal
+		expect(newSession.goalState.status).toBe("active");
+		expect(newSession.goalState.objective).toBe("Initial goal");
+		newSession.dispose();
 	});
 });

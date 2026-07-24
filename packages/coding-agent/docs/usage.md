@@ -259,6 +259,8 @@ prime-agent --no-extensions -e ./my-extension.ts
 | `--autonomous-max-turns <n>` | Maximum assistant turns; default is 12 |
 | `--autonomous-max-tokens <n>` | Maximum tokens; default is 80000 |
 | `--autonomous-timeout-ms <n>` | Maximum wall-clock duration; default is 1800000 milliseconds |
+| `--goal <objective>` | Start the session with an active persistent goal; only seeds new top-level sessions (rlmDepth 0) with no existing goal state |
+| `--goal-token-budget <n>` | Positive integer token budget for the initial goal; requires `--goal` |
 
 ### Other Options
 

@@ -643,6 +643,7 @@ function runtimeConfigFromArgs(
 	cwd: string,
 	agentDir: string,
 	sessionDir: string | undefined,
+	appMode: AppMode,
 ): AgentSessionRuntimeConfig {
 	return {
 		cwd,
@@ -669,6 +670,12 @@ function runtimeConfigFromArgs(
 		noContextFiles: parsed.noContextFiles,
 		autonomous: runtimeAutonomousConfigFromArgs(parsed),
 		extensionFlagValues: parsed.unknownFlags.size > 0 ? Object.fromEntries(parsed.unknownFlags.entries()) : undefined,
+		// Serialized refine for print/json/rpc: the client's appMode is NOT
+		// "daemon" here — it's "print", "json", or "rpc". The daemon worker
+		// receives this flag via AgentSessionRuntimeConfig and uses it
+		// instead of its own appMode="daemon".
+		serializedRefine: appMode !== "interactive" && appMode !== "daemon",
+		initialGoal: parsed.goal ? { objective: parsed.goal, tokenBudget: parsed.goalTokenBudget } : undefined,
 	};
 }
 
@@ -678,6 +685,10 @@ interface PreparedRuntimeServices {
 	sessionOptions: CreateAgentSessionOptions;
 	cliThinkingFromModel: boolean;
 	diagnostics: AgentSessionRuntimeDiagnostic[];
+}
+
+export function daemonServerDefaultSessionConfig(config: AgentSessionRuntimeConfig): AgentSessionRuntimeConfig {
+	return { ...config, initialGoal: undefined };
 }
 
 export function resolveRuntimeSessionOptions(
@@ -1065,6 +1076,7 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("parseArgs");
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY);
+
 	if (shouldRejectNonInteractiveAttach(publicCommand.attachAgent, appMode)) {
 		console.error(chalk.red("Error: attach requires an interactive terminal"));
 		process.exit(1);
@@ -1228,7 +1240,11 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 	time("createSessionManager");
 
-	const defaultSessionConfig = runtimeConfigFromArgs(parsed, sessionManager.getCwd(), agentDir, sessionDir);
+	const defaultSessionConfig = runtimeConfigFromArgs(parsed, sessionManager.getCwd(), agentDir, sessionDir, appMode);
+	// Verifier/headless clients pass initialGoal in each create request. The long-lived
+	// daemon fallback must not seed that goal into unrelated future sessions.
+	const daemonDefaultSessionConfig = daemonServerDefaultSessionConfig(defaultSessionConfig);
+	const runtimeDefaultSessionConfig = appMode === "daemon" ? daemonDefaultSessionConfig : defaultSessionConfig;
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
@@ -1237,7 +1253,7 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionConfig,
 		sessionOptions: runtimeSessionOptions,
 	}) => {
-		const config = mergeAgentSessionRuntimeConfig(defaultSessionConfig, sessionConfig);
+		const config = mergeAgentSessionRuntimeConfig(runtimeDefaultSessionConfig, sessionConfig);
 		const prepared = await prepareRuntimeServices({
 			config,
 			cwd,
@@ -1257,6 +1273,12 @@ export async function main(args: string[], options?: MainOptions) {
 			// Main agents boot their kernel in the background at session creation;
 			// subagent sessions (rlmDepth > 0) keep the lazy first-call start.
 			prewarmIpythonKernel: true,
+			// Read serializedRefine from the merged runtime config (passed
+			// from the JSON/print client through AgentSessionRuntimeConfig)
+			// so it survives the daemon worker's appMode="daemon" context.
+			serializedRefine: config.serializedRefine ?? false,
+			// Only seed initial goal for top-level sessions (rlmDepth 0).
+			initialGoal: (runtimeSessionOptions?.rlmDepth ?? 0) === 0 ? config.initialGoal : undefined,
 		});
 		const cliThinkingOverride = config.thinking !== undefined || prepared.cliThinkingFromModel;
 		if (created.session.model && cliThinkingOverride) {
@@ -1279,7 +1301,7 @@ export async function main(args: string[], options?: MainOptions) {
 		if (isDaemonWorkerProcess()) {
 			await runDaemonMode({
 				socketPath: parsed.daemonSocket,
-				defaultSessionConfig,
+				defaultSessionConfig: daemonDefaultSessionConfig,
 				createRuntime,
 				worker: {
 					authenticationToken: requireDaemonWorkerAuthenticationToken(),
@@ -1289,7 +1311,7 @@ export async function main(args: string[], options?: MainOptions) {
 		} else {
 			await runDaemonSupervisorMode({
 				socketPath: parsed.daemonSocket,
-				defaultSessionConfig,
+				defaultSessionConfig: daemonDefaultSessionConfig,
 			});
 		}
 		return;

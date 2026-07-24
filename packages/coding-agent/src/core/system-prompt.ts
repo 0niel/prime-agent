@@ -3,7 +3,7 @@
  */
 
 import { buildRlmPrompt, buildSubagentGuidance } from "./prompts/index.js";
-import { formatHarnessStateForPrompt, type HarnessState } from "./refinement/index.js";
+import { formatHarnessStateForPrompt, type HarnessState, REFINE_SKILL_NAME } from "./refinement/index.js";
 import { formatSkillsForPrompt, getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 
 export interface BuildSystemPromptOptions {
@@ -62,6 +62,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const hasIpython = tools.includes("ipython");
 	const hasBash = tools.includes("bash");
 	const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
+	const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);
 
 	if (customPrompt) {
 		let prompt = customPrompt;
@@ -87,7 +88,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		prompt += `\nCurrent working directory: ${promptCwd}`;
 
 		if (harnessState) {
-			prompt += `\n\n${formatHarnessStateForPrompt(harnessState, { includeIpythonExamples: hasIpython, includeShellExamples: hasBash })}`;
+			prompt += `\n\n${formatHarnessStateForPrompt(harnessState, { includeIpythonExamples: hasIpython, includeShellExamples: hasBash, includeRefineExamples: hasIpython && hasRefineSkill })}`;
 		}
 
 		if (appendSection) {
@@ -109,11 +110,11 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	// menu, so the model reads when/why to delegate and then sees the concrete subagent
 	// specs it can match against — the same ordering as Claude Code's Agent tool.
 	if ((allowRecursion ?? true) && hasIpython) {
-		prompt += `\n\n${buildSubagentGuidance()}`;
+		prompt += `\n\n${buildSubagentGuidance({ includeRefineExamples: hasRefineSkill })}`;
 	}
 
 	if (harnessState) {
-		prompt += `\n\n${formatHarnessStateForPrompt(harnessState, { includeIpythonExamples: hasIpython, includeShellExamples: hasBash })}`;
+		prompt += `\n\n${formatHarnessStateForPrompt(harnessState, { includeIpythonExamples: hasIpython, includeShellExamples: hasBash, includeRefineExamples: hasIpython && hasRefineSkill })}`;
 	}
 
 	const guidelines = formatPromptGuidelines(promptGuidelines);

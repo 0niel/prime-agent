@@ -72,6 +72,8 @@ export interface HarnessOptions {
 	rlmDepth?: number;
 	autonomous?: AgentAutonomousConfig;
 	autoRefineReviewer?: AutoRefineReviewer;
+	serializedRefine?: boolean;
+	initialGoal?: { objective: string; tokenBudget?: number };
 }
 
 export interface Harness {
@@ -191,6 +193,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		rlmDepth: options.rlmDepth,
 		autonomous: options.autonomous,
 		autoRefineReviewer: options.autoRefineReviewer,
+		serializedRefine: options.serializedRefine,
+		initialGoal: options.initialGoal,
 	});
 
 	const events: AgentSessionEvent[] = [];

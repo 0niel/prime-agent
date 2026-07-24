@@ -93,6 +93,7 @@ export type {
 	MessageRenderOptions,
 	ProviderConfig,
 	ProviderModelConfig,
+	RefineCompleteEvent,
 	RegisteredCommand,
 	RegisteredTool,
 	ResolvedCommand,

@@ -77,6 +77,10 @@ export interface AgentSessionCreationOptions {
 	rlmHeartbeatController?: AgentRlmHeartbeatController;
 	prewarmIpythonKernel?: boolean;
 	autonomous?: AgentAutonomousConfig;
+	/** Serialized refine mode for print/headless autonomous runs. */
+	serializedRefine?: boolean;
+	/** Initial goal to seed at session creation (rlmDepth 0 only, idempotent). */
+	initialGoal?: { objective: string; tokenBudget?: number };
 }
 
 /**
@@ -274,5 +278,7 @@ export async function createAgentSessionFromServices(
 		sessionStartEvent: options.sessionStartEvent,
 		prewarmIpythonKernel: options.prewarmIpythonKernel,
 		autonomous: options.autonomous,
+		serializedRefine: options.serializedRefine,
+		initialGoal: options.initialGoal,
 	});
 }

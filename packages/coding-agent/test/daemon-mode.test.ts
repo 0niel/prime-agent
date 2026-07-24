@@ -291,6 +291,7 @@ describe("daemon mode helpers", () => {
 				hasAcceptedPromptInFlight: false,
 				pendingMessageCount: 0,
 				promptHeartbeat,
+				model: { provider: "current-provider", id: "current-model" },
 			});
 			childState.runtime = {
 				...childState.runtime,
@@ -342,6 +343,7 @@ describe("daemon mode helpers", () => {
 				rlmDepth: 1,
 				rlmMaxDepth: 4,
 				rlmParentNodeId: "child-1",
+				model: { provider: "spawn-provider", id: "spawn-model" },
 			} as unknown as CreateRlmSubagentRuntimeOptions;
 
 			internals.sessions.set(childState.activeSessionId, childState);
@@ -354,6 +356,11 @@ describe("daemon mode helpers", () => {
 				runCount: 0,
 			});
 			expect(parentSession.retainFinishedRlmChildSession).toHaveBeenCalledWith("child-1", childSession);
+			const registryLines = readFileSync(join(parentArtifactDir, "rlm-subagents.jsonl"), "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { model?: { provider: string; modelId: string } });
+			expect(registryLines.at(-1)?.model).toEqual({ provider: "current-provider", modelId: "current-model" });
 			const dueRuns = await internals.cronScheduler.runDue(new Date("2026-07-16T00:00:00.000Z"));
 			expect(dueRuns).toBe(1);
 			expect(promptHeartbeat).toHaveBeenCalledOnce();
