@@ -4679,6 +4679,9 @@ export class InteractiveMode {
 				this.editor.setText("");
 				const promptStashAfterClear = this.promptStash;
 				await this.admitPendingStartupPrompts?.();
+				// The barrier also settles when the run lifecycle ends; a submit resumed
+				// by teardown must not prompt the session the user already left.
+				if (this.isShuttingDown || this.returnToAgentsViewRequested) return;
 				try {
 					await this.agentConnection.prompt(text, {
 						streamingBehavior,
