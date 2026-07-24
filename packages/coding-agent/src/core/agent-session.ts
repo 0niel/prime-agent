@@ -5028,11 +5028,8 @@ export class AgentSession {
 							this._rejectAgentMessage(first.agentMessageId, this._asError(error));
 						} finally {
 							this._activeSessionInput = undefined;
-<<<<<<< HEAD
 							this._syncSteeringStopPending();
-=======
 							this._notifySessionInputCheckpointChange();
->>>>>>> ca6ec2cc9 (feat(daemon): checkpoint session inputs for restart)
 						}
 						continue;
 					}
