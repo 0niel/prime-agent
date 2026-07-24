@@ -94,6 +94,7 @@ import {
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
+import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import { SNAPSHOT_TARGET_CHUNK_BYTES, SnapshotTranscriptCache } from "./snapshot-transcript-cache.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
@@ -581,11 +582,8 @@ export class DaemonSupervisor {
 	private ownership?: Awaited<ReturnType<typeof acquireDaemonSupervisorOwnership>>;
 	private cleanupPromise?: Promise<void>;
 	private shuttingDown = false;
-	private updateRestartPreparing = false;
-	private updateRestartPrepareInFlight = false;
-	private updateRestartDrainAdmissionOpen = false;
-	private activeMutations = 0;
-	private readonly mutationDrainWaiters = new Set<() => void>();
+	private updateRestartPhase?: "draining" | "fencing" | "prepared";
+	private readonly mutationDrain = new MutationDrainLatch();
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly protocolClientIds = new WeakMap<DaemonSocketClient, string>();
 	private readonly workers = new Map<string, ResidentWorker>();
@@ -1113,12 +1111,12 @@ export class DaemonSupervisor {
 			return;
 		}
 
-		if (
-			this.updateRestartPreparing &&
-			isDaemonMutatingCommand(command) &&
-			(command.type !== "shutdown" || this.updateRestartPrepareInFlight) &&
-			!(this.updateRestartDrainAdmissionOpen && UPDATE_RESTART_DRAIN_COMMANDS.has(command.type))
-		) {
+		const phase = this.updateRestartPhase;
+		const restartRejected =
+			phase === "draining"
+				? !UPDATE_RESTART_DRAIN_COMMANDS.has(command.type)
+				: phase !== undefined && !(phase === "prepared" && command.type === "shutdown");
+		if (restartRejected && isDaemonMutatingCommand(command)) {
 			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
 			return;
 		}
@@ -1148,7 +1146,7 @@ export class DaemonSupervisor {
 		}
 
 		const mutation = isDaemonMutatingCommand(command);
-		if (mutation) this.activeMutations++;
+		if (mutation) this.mutationDrain.begin();
 		try {
 			const response = await this.handleCommand(client, command, cancellationAdmission);
 			if (response) {
@@ -1171,11 +1169,7 @@ export class DaemonSupervisor {
 			}
 			this.write(client, response);
 		} finally {
-			if (mutation) {
-				this.activeMutations--;
-				for (const resolve of this.mutationDrainWaiters ?? []) resolve();
-				this.mutationDrainWaiters?.clear();
-			}
+			if (mutation) this.mutationDrain.end();
 		}
 	}
 
@@ -1184,15 +1178,6 @@ export class DaemonSupervisor {
 		command: DaemonCommand,
 		cancellationAdmission?: SupervisorPromptAdmission,
 	): Promise<DaemonResponse | undefined> {
-		if (
-			this.updateRestartPreparing &&
-			command.type !== "ack_result" &&
-			isDaemonMutatingCommand(command) &&
-			(command.type !== "shutdown" || this.updateRestartPrepareInFlight) &&
-			!(this.updateRestartDrainAdmissionOpen && UPDATE_RESTART_DRAIN_COMMANDS.has(command.type))
-		) {
-			throw new Error("Daemon is preparing an update restart");
-		}
 		switch (command.type) {
 			case "cancel_prompt_admission": {
 				const admission =
@@ -3786,44 +3771,18 @@ export class DaemonSupervisor {
 	}
 
 	private async prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest> {
-		if (this.updateRestartPreparing) throw new Error("Daemon is already preparing an update restart");
-		this.updateRestartPreparing = true;
-		this.updateRestartPrepareInFlight = true;
-		this.updateRestartDrainAdmissionOpen = true;
+		if (this.updateRestartPhase !== undefined) throw new Error("Daemon is already preparing an update restart");
+		this.updateRestartPhase = "draining";
 		try {
 			const abort = AbortSignal.timeout(UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS);
-			await this.waitForMutationDrain(1, abort);
-			this.updateRestartDrainAdmissionOpen = false;
+			await this.mutationDrain.waitForDrain(1, abort, "Timed out draining daemon mutations for update restart");
+			this.updateRestartPhase = "fencing";
 			const manifest = await this.prepareUpdateRestartFenced();
-			this.updateRestartPrepareInFlight = false;
+			this.updateRestartPhase = "prepared";
 			return manifest;
 		} catch (error) {
-			this.updateRestartDrainAdmissionOpen = false;
-			this.updateRestartPrepareInFlight = false;
-			this.updateRestartPreparing = false;
+			this.updateRestartPhase = undefined;
 			throw error;
-		}
-	}
-
-	private async waitForMutationDrain(remaining: number, signal: AbortSignal): Promise<void> {
-		while (this.activeMutations > remaining) {
-			if (signal.aborted) throw new Error("Timed out draining daemon mutations for update restart");
-			await new Promise<void>((resolve, reject) => {
-				const onDrained = () => {
-					cleanup();
-					resolve();
-				};
-				const onAbort = () => {
-					cleanup();
-					reject(new Error("Timed out draining daemon mutations for update restart"));
-				};
-				const cleanup = () => {
-					this.mutationDrainWaiters.delete(onDrained);
-					signal.removeEventListener("abort", onAbort);
-				};
-				this.mutationDrainWaiters.add(onDrained);
-				signal.addEventListener("abort", onAbort, { once: true });
-			});
 		}
 	}
 
