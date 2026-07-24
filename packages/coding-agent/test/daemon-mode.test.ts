@@ -3175,10 +3175,11 @@ describe("daemon mode helpers", () => {
 
 			const first = create(commandFor(sessionPath));
 			const second = create(commandFor(sessionPath));
-			for (let attempt = 0; attempt < 20 && createRuntime.mock.calls.length === 0; attempt++) {
-				await new Promise<void>((resolve) => setImmediate(resolve));
-			}
-			expect(createRuntime).toHaveBeenCalledTimes(1);
+			// The pre-create session resolution is async (continueRecent scans the
+			// session dir); wait on a deadline, not a fixed number of ticks.
+			await vi.waitFor(() => {
+				expect(createRuntime).toHaveBeenCalledTimes(1);
+			});
 			releaseCreate();
 			const [firstState, secondState] = await Promise.all([first, second]);
 			expect(secondState).toBe(firstState);
