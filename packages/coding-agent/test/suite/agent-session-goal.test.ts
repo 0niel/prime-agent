@@ -739,11 +739,13 @@ describe("AgentSession goals", () => {
 
 		const promptPromise = harness.session.prompt("/goal --budget 10 do work");
 		try {
-			await waitForCondition(() => harness.getPendingResponseCount() === 1);
+			await waitForCondition(() => harness.session.goalState.status === "budget_limited");
 		} finally {
 			releaseMessageEnd?.();
 		}
 		await promptPromise;
+		await harness.session.waitForIdle();
+		await vi.waitFor(() => expect(visibleAssistantTexts(harness)).toHaveLength(2));
 
 		expect(visibleAssistantTexts(harness)).toEqual(["Spent the budget.", "Wrapping up."]);
 		expect(harness.getPendingResponseCount()).toBe(1);

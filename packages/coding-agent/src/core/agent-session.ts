@@ -1445,6 +1445,7 @@ export class AgentSession {
 		);
 		const isGoalContext = (input: QueuedSessionInput) =>
 			input.kind === "prompt" && input.customMessage?.customType === GOAL_CONTEXT_CUSTOM_TYPE;
+		this._removeActivePreparingPrompts(isGoalContext);
 		this._steeringMessages = this._steeringMessages.filter((input) => !isGoalContext(input));
 		this._followUpMessages = this._followUpMessages.filter((input) => !isGoalContext(input));
 		this._syncSteeringStopPending();
@@ -1859,7 +1860,12 @@ export class AgentSession {
 		}
 		try {
 			if (this._accountGoalUsageForAssistantMessage(context.message)) {
-				this.agent.steer(createGoalContextMessage(this._goalState, "budget_limit"));
+				const message = createGoalContextMessage(this._goalState, "budget_limit");
+				const normalized = normalizeMessageContent(message.content);
+				await this._queueSteer(normalized.text, normalized.images, {
+					message,
+					resumeIfIdle: true,
+				});
 			}
 		} catch {
 			// Goal accounting must not interrupt the core agent loop.
@@ -3154,7 +3160,12 @@ export class AgentSession {
 					this._retryAuthFailureSources = [];
 				}
 				if (this._accountGoalUsageForAssistantMessage(assistantMsg)) {
-					this.agent.steer(createGoalContextMessage(this._goalState, "budget_limit"));
+					const message = createGoalContextMessage(this._goalState, "budget_limit");
+					const normalized = normalizeMessageContent(message.content);
+					await this._queueSteer(normalized.text, normalized.images, {
+						message,
+						resumeIfIdle: true,
+					});
 				}
 			}
 		}
@@ -5121,6 +5132,7 @@ export class AgentSession {
 				await promptPromise;
 			} finally {
 				admission.release();
+				this._scheduleSessionInputPump();
 			}
 		} else {
 			this.agent.state.messages.push(appMessage);

@@ -1503,6 +1503,31 @@ describe("AgentSession queue characterization", () => {
 		expect(providerCalls).toBe(1);
 	});
 
+	it("removes goal context while its steering handoff is still preparing", async () => {
+		const hook = gatedHook({ prompt: "stale goal context" });
+		const harness = await createHarness({ extensionFactories: [hook.factory] });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("must not run")]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		withStreaming(harness, true);
+		await harness.session.sendCustomMessage(
+			{ customType: "goal_context", content: "stale goal context", display: true },
+			{ triggerTurn: true, deliverAs: "steer" },
+		);
+		withStreaming(harness, false);
+		pause.release();
+		await hook.reached;
+
+		(harness.session as unknown as SteeringStopInternals)._clearQueuedGoalContexts();
+		hook.release();
+		await harness.session.waitForIdle();
+
+		expect(
+			harness.session.messages.some((message) => message.role === "custom" && message.customType === "goal_context"),
+		).toBe(false);
+		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
 	it("keeps steering stop pending while a steering handoff is still preparing", async () => {
 		const hook = gatedHook({ prompt: "active steering" });
 		const harness = await createHarness({ extensionFactories: [hook.factory] });
@@ -2329,6 +2354,29 @@ prepared:${event.prompt}`,
 		expect(
 			harness.session.messages.filter((message) => message.role === "custom").map((message) => message.content),
 		).toEqual(["first", "second"]);
+	});
+
+	it("pumps follow-up work admitted during a trigger-turn custom message", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let queued = false;
+		harness.setResponses([
+			async () => {
+				queued = await harness.session.restoreFollowUpMessage("queued during custom turn");
+				return fauxAssistantMessage("custom done");
+			},
+			fauxAssistantMessage("follow-up done"),
+		]);
+
+		await harness.session.sendCustomMessage(
+			{ customType: "trigger", content: "trigger", display: false },
+			{ triggerTurn: true },
+		);
+		await harness.session.waitForIdle();
+
+		expect(queued).toBe(true);
+		expect(getUserTexts(harness)).toEqual(["queued during custom turn"]);
+		expect(getAssistantTexts(harness)).toEqual(["custom done", "follow-up done"]);
 	});
 
 	it("rejects triggerTurn promptly when pending input is suspended", async () => {
