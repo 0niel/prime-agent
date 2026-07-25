@@ -1470,6 +1470,63 @@ describe("agentLoop with AgentMessage", () => {
 		expect(llmCalls).toBe(1);
 	});
 
+	it("injects steering drained by the poll even when a stop flips during it", async () => {
+		const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "done" }], details: {} }));
+		let stopRequested = false;
+		const injected: string[] = [];
+		let llmCalls = 0;
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{
+				systemPrompt: "",
+				messages: [],
+				tools: [{ name: "work", label: "Work", description: "Work", parameters: Type.Object({}), execute }],
+			},
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				shouldStopBeforeTurn: () => stopRequested,
+				getSteeringMessages: async () => {
+					// Only the post-tool-batch poll returns steering; the stop flips
+					// during that same poll.
+					if (llmCalls !== 1 || stopRequested) return [];
+					stopRequested = true;
+					return [createUserMessage("late steer")];
+				},
+			},
+			undefined,
+			() => {
+				llmCalls++;
+				const mockStream = new MockAssistantStream();
+				const calls = llmCalls;
+				queueMicrotask(() =>
+					mockStream.push({
+						type: "done",
+						reason: calls === 1 ? "toolUse" : "stop",
+						message:
+							calls === 1
+								? createAssistantMessage(
+										[{ type: "toolCall", id: "tool-1", name: "work", arguments: {} }],
+										"toolUse",
+									)
+								: createAssistantMessage([{ type: "text", text: "steered reply" }], "stop"),
+					}),
+				);
+				return mockStream;
+			},
+		);
+		for await (const event of stream) {
+			if (event.type === "message_end" && event.message.role === "user") {
+				const text = event.message.content;
+				if (typeof text !== "string") continue;
+				injected.push(text);
+			}
+		}
+		// The drained steering message must reach the conversation, not vanish.
+		expect(injected).toContain("late steer");
+		expect(llmCalls).toBe(2);
+	});
+
 	it("checks shouldStopBeforeTurn after a tool batch and before another model call", async () => {
 		const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "done" }], details: {} }));
 		const context: AgentContext = {
