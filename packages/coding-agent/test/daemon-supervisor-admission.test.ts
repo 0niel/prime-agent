@@ -7,7 +7,7 @@ import {
 	type DaemonCommand,
 	type DaemonResponse,
 } from "../src/modes/daemon/daemon-protocol.js";
-import { DaemonSupervisor, waitForSupervisorPromptAdmission } from "../src/modes/daemon/daemon-supervisor.js";
+import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
 
 interface AdmissionRecord {
@@ -101,17 +101,6 @@ function createHarness(
 }
 
 describe("daemon supervisor prompt admission ownership", () => {
-	it("observes an already-running promise when admission is pre-aborted", async () => {
-		const abort = new AbortController();
-		abort.abort();
-		const work = Promise.reject(new Error("late failure"));
-
-		await expect(waitForSupervisorPromptAdmission(work, abort.signal)).rejects.toThrow(
-			"Prompt admission was cancelled",
-		);
-		await Promise.resolve();
-	});
-
 	it("registers a prompt synchronously before readiness and ownership awaits", async () => {
 		const ready = deferred<void>();
 		const ownership = deferred<void>();

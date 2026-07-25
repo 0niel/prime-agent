@@ -90,6 +90,7 @@ import {
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
+import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type {
 	CreateRlmSubagentRuntimeOptions,
 	RlmSubagentRuntime,
@@ -326,43 +327,6 @@ const RECOVERY_CHECKPOINT_EVENTS: ReadonlySet<string> = new Set([
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
-}
-
-class DaemonPromptAdmissionCancelledError extends Error {
-	constructor() {
-		super("Prompt admission was cancelled.");
-		this.name = "DaemonPromptAdmissionCancelledError";
-	}
-}
-
-export function waitForDaemonPromptAdmission<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
-	if (!signal) return promise;
-	if (signal.aborted) {
-		// The caller supplied already-running work. Observe its eventual rejection
-		// even though admission cancellation wins immediately.
-		void promise.catch(() => {});
-		return Promise.reject(new DaemonPromptAdmissionCancelledError());
-	}
-	return new Promise<T>((resolve, reject) => {
-		const cleanup = () => signal.removeEventListener("abort", onAbort);
-		const onAbort = () => {
-			cleanup();
-			reject(new DaemonPromptAdmissionCancelledError());
-		};
-		signal.addEventListener("abort", onAbort, { once: true });
-		// Close the registration-to-check race before observing the awaited work.
-		if (signal.aborted) return onAbort();
-		promise.then(
-			(value) => {
-				cleanup();
-				resolve(value);
-			},
-			(error: unknown) => {
-				cleanup();
-				reject(error);
-			},
-		);
-	});
 }
 
 type RuntimeOpenGuard = () => boolean | Promise<boolean>;
@@ -1467,7 +1431,7 @@ export class AgentDaemon {
 		try {
 			const targetLock = this.agentMessageTargetLocks.get(activeSessionId);
 			if (targetLock)
-				await waitForDaemonPromptAdmission(
+				await waitForPromptAdmission(
 					targetLock.catch(() => undefined),
 					signal,
 				);
@@ -2635,17 +2599,14 @@ export class AgentDaemon {
 				// wins the command wait below.
 				void claimCheck.catch(() => {});
 				try {
-					const ownerFingerprint = await waitForDaemonPromptAdmission(
-						claimCheck,
-						parsedAdmission?.controller?.signal,
-					);
+					const ownerFingerprint = await waitForPromptAdmission(claimCheck, parsedAdmission?.controller?.signal);
 					if (this.supervisorClaims.get(client) !== boundClaim || client.socket.destroyed) {
 						clearParsedAdmission();
 						return;
 					}
 					boundClaim.ownerFingerprint = ownerFingerprint;
 				} catch (error) {
-					const admissionCancelled = error instanceof DaemonPromptAdmissionCancelledError;
+					const admissionCancelled = error instanceof PromptAdmissionCancelledError;
 					if (admissionCancelled) {
 						// The fence check remains authoritative after cancellation. Its rejection
 						// revokes only the exact binding that initiated it; replacements survive.
@@ -3143,7 +3104,7 @@ export class AgentDaemon {
 				};
 				let state: ActiveSessionState;
 				try {
-					if (admission?.status === "cancelled") throw new Error("Prompt admission was cancelled.");
+					if (admission?.status === "cancelled") throw new PromptAdmissionCancelledError();
 					state = this.getBoundSessionState(command.activeSessionId);
 				} catch (error) {
 					clearAdmission();

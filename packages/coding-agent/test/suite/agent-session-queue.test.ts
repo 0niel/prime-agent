@@ -2717,7 +2717,7 @@ prepared:${event.prompt}`,
 	it("does not coalesce steering inputs that share a follow-up queue key", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.session.pauseQueuedWork();
+		harness.session.acquireQueuedWorkPause();
 		withStreaming(harness, true);
 
 		await harness.session.steer("first", undefined, { queueKey: "same" });

@@ -25,7 +25,7 @@ type SerializedInternals = {
 		abort: AbortController,
 	): Promise<unknown>;
 	_serializedRefine: boolean;
-	_steeringStopPending: boolean;
+	_steeringMessages: unknown[];
 	_pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
 	_assistantTurnsSinceAutoRefine: number;
 	_lastAutoRefineReviewAt: number;
@@ -310,7 +310,12 @@ describe("Serialized agent-callable refine", () => {
 		const internals = harness.session as unknown as SerializedInternals;
 		const { applyRefine } = mockSerializedRefine(harness);
 		internals._pendingRequestedRefine = { instructions: "capture a lesson" };
-		internals._steeringStopPending = true;
+		internals._steeringMessages.push({
+			kind: "prompt",
+			text: "steer",
+			prefixMessages: [],
+			message: { role: "user", content: "steer" },
+		});
 		const compactionSpy = vi
 			.spyOn(
 				internals as unknown as { _shouldStopForThresholdCompaction: (ctx: unknown) => Promise<boolean> },
@@ -1705,7 +1710,12 @@ describe("P0 concurrency regressions", () => {
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as SerializedInternals;
-		internals._steeringStopPending = true;
+		internals._steeringMessages.push({
+			kind: "prompt",
+			text: "steer",
+			prefixMessages: [],
+			message: { role: "user", content: "steer" },
+		});
 
 		let planResolved = false;
 		let applyFinished = false;

@@ -27,7 +27,6 @@ import {
 	markClientSnapshotStreaming,
 	setDaemonClientSessionCapabilities,
 	shouldSendDaemonOutboundToClient,
-	waitForDaemonPromptAdmission,
 } from "../src/modes/daemon/daemon-mode.js";
 import {
 	createDaemonCommandEnvelope,
@@ -46,18 +45,6 @@ describe("daemon mode helpers", () => {
 
 		parse(client, JSON.stringify(createDaemonCommandEnvelope({ type: "list" }, "request-1", "public-client")));
 		expect(client.id).toBe("public-client");
-	});
-
-	it("observes supplied work when prompt admission is already aborted", async () => {
-		const controller = new AbortController();
-		controller.abort();
-		const work = Promise.reject(new Error("late claim failure"));
-
-		await expect(waitForDaemonPromptAdmission(work, controller.signal)).rejects.toThrow(
-			"Prompt admission was cancelled.",
-		);
-		// Let the observed work settle; an unhandled rejection would fail Vitest.
-		await Promise.resolve();
 	});
 
 	it("finds only direct child active sessions", () => {
