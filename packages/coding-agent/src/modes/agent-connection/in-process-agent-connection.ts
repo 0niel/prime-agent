@@ -312,6 +312,7 @@ export class InProcessAgentConnection implements AgentConnection {
 				...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
 				...(options?.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
 				...(options?.source ? { source: options.source } : {}),
+				...(options?.signal ? { signal: options.signal } : {}),
 				preflightResult: (success) => {
 					if (success) {
 						accepted = true;
@@ -336,6 +337,7 @@ export class InProcessAgentConnection implements AgentConnection {
 			...(options.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
 			...(options.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
 			...(options.source ? { source: options.source } : {}),
+			...(options.signal ? { signal: options.signal } : {}),
 		});
 	}
 

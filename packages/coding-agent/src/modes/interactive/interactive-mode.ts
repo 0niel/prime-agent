@@ -831,6 +831,8 @@ export class InteractiveMode {
 	private isInitialized = false;
 	private onInputCallback?: (text: string | undefined) => void;
 	private submittedInputBehavior: "steer" | "followUp" = "steer";
+	private latestEditorPromptStash: PromptStash | undefined;
+	private pendingSubmittedPromptStash: PromptStash | undefined;
 	private inputSubmissionGeneration = 0;
 	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
 	private returnToAgentsViewRequested = false;
@@ -1124,15 +1126,14 @@ export class InteractiveMode {
 	}
 
 	private hydratePromptStash(): void {
-		const stash = this.promptStash;
-		if (!stash) {
-			return;
-		}
-		for (const [markerId, image] of stash.images ?? []) {
-			this.pastedImages.set(markerId, image);
-		}
-		for (const markerId of imageMarkerIds(stash.text)) {
-			this.nextImageMarkerId = Math.max(this.nextImageMarkerId, markerId + 1);
+		for (const stash of [this.promptStash, ...(this.promptStashState?.queuedStashes ?? [])]) {
+			if (!stash) continue;
+			for (const [markerId, image] of stash.images ?? []) {
+				this.pastedImages.set(markerId, image);
+			}
+			for (const markerId of imageMarkerIds(stash.text)) {
+				this.nextImageMarkerId = Math.max(this.nextImageMarkerId, markerId + 1);
+			}
 		}
 	}
 
@@ -1491,6 +1492,7 @@ export class InteractiveMode {
 		// from lifecycle cancellation so a resumed submit does not mutate torn-down
 		// editor state or consume the client-owned durable stash.
 		let startupPromptsDone = false;
+		const startupAdmissionAbort = new AbortController();
 		let settleStartupPrompts = (_outcome: StartupPromptBarrierOutcome) => {};
 		const startupPromptsSettled = new Promise<StartupPromptBarrierOutcome>((resolve) => {
 			settleStartupPrompts = (outcome) => {
@@ -1524,10 +1526,12 @@ export class InteractiveMode {
 						images: prompt.images,
 						streamingBehavior: next === 0 ? "steer" : "followUp",
 						queueIfBusy: true,
+						signal: startupAdmissionAbort.signal,
 					});
 					failures = 0;
 					next++;
 				} catch (error) {
+					if (startupPromptsDone || startupAdmissionAbort.signal.aborted) return;
 					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 					if (++failures < 3) {
 						this.showError(errorMessage);
@@ -1607,6 +1611,7 @@ export class InteractiveMode {
 		try {
 			await this.getUserInput();
 		} finally {
+			startupAdmissionAbort.abort();
 			settleStartupPrompts("lifecycle-cancelled");
 			this.admitPendingStartupPrompts = undefined;
 		}
@@ -2725,6 +2730,7 @@ export class InteractiveMode {
 		this.featureHintSuppressedByQueue = false;
 		if (options?.clearPromptStash) {
 			this.promptStash = undefined;
+			if (this.promptStashState) this.promptStashState.queuedStashes = undefined;
 		}
 		// Clear every editor's prompt history, draft text, and queues, then prune
 		// any pasted images no longer referenced by the remaining stashed draft.
@@ -3777,8 +3783,10 @@ export class InteractiveMode {
 		}
 		this.childAgentSummary.setHidden(false);
 
-		// Save text from current editor before switching
-		const currentText = this.editor.getText();
+		// Snapshot the current editor before replacing it. Paste markers are only
+		// meaningful while their originating editor still owns the paste snapshot.
+		const currentEditor = this.editor;
+		const currentPromptStash = this.snapshotPromptStashFrom(currentEditor, currentEditor.getText());
 
 		this.editorContainer.clear();
 
@@ -3786,12 +3794,24 @@ export class InteractiveMode {
 			// Create the custom editor with tui, theme, and keybindings
 			const newEditor = factory(this.ui, getEditorTheme(), this.keybindings);
 
-			// Wire up callbacks from the default editor
+			// Restore before wiring the shared onChange callback: setText may emit a
+			// change, and an empty custom editor cannot reconstruct the old snapshot.
+			const canRestorePasteSnapshot =
+				currentPromptStash.pasteSnapshot === undefined || newEditor.restorePasteSnapshot !== undefined;
+			newEditor.setText(
+				canRestorePasteSnapshot
+					? currentPromptStash.text
+					: (currentPromptStash.expandedText ?? currentPromptStash.text),
+			);
+			if (currentPromptStash.pasteSnapshot && newEditor.restorePasteSnapshot) {
+				newEditor.restorePasteSnapshot(currentPromptStash.pasteSnapshot);
+			}
+
+			// Wire up callbacks from the default editor. onChange snapshots the
+			// active editor while it still owns paste markers and attachments, so
+			// submit remains exact even when an editor clears before calling onSubmit.
 			newEditor.onSubmit = this.defaultEditor.onSubmit;
 			newEditor.onChange = this.defaultEditor.onChange;
-
-			// Copy text from previous editor
-			newEditor.setText(currentText);
 
 			// Copy appearance settings if supported
 			if (newEditor.borderColor !== undefined) {
@@ -3836,10 +3856,21 @@ export class InteractiveMode {
 
 			this.editor = newEditor;
 		} else {
-			// Restore default editor with text from custom editor
-			this.defaultEditor.setText(currentText);
+			// Restore the default editor with the same rich snapshot (or expanded
+			// fallback text if this editor implementation cannot restore it).
+			const canRestorePasteSnapshot =
+				currentPromptStash.pasteSnapshot === undefined || this.defaultEditor.restorePasteSnapshot !== undefined;
+			this.defaultEditor.setText(
+				canRestorePasteSnapshot
+					? currentPromptStash.text
+					: (currentPromptStash.expandedText ?? currentPromptStash.text),
+			);
+			if (currentPromptStash.pasteSnapshot && this.defaultEditor.restorePasteSnapshot) {
+				this.defaultEditor.restorePasteSnapshot(currentPromptStash.pasteSnapshot);
+			}
 			this.editor = this.defaultEditor;
 		}
+		this.latestEditorPromptStash = currentPromptStash;
 
 		this.editorContainer.addChild(this.editor as Component);
 		this.ui.setFocus(this.editor as Component);
@@ -4014,6 +4045,9 @@ export class InteractiveMode {
 		this.defaultEditor.onMoveBelowPrompt = () => this.focusChildAgentSummary();
 
 		this.defaultEditor.onChange = (text: string) => {
+			if (text.length > 0) {
+				this.latestEditorPromptStash = this.snapshotPromptStashFrom(this.editor, text);
+			}
 			if (this.escapeRepeatAction && !this.isRestoringQueuedEditorText) {
 				this.clearEscapeRepeat();
 			}
@@ -4028,6 +4062,21 @@ export class InteractiveMode {
 		};
 	}
 
+	private snapshotPromptStashFrom(editor: EditorComponent, text: string): PromptStash {
+		const pasteSnapshot = editor.getPasteSnapshot?.();
+		const images = this.getPromptStashImages(text);
+		return {
+			text,
+			expandedText: pasteSnapshot ? (editor.getExpandedText?.() ?? text) : undefined,
+			pasteSnapshot,
+			...(images.length > 0 ? { images } : {}),
+		};
+	}
+
+	private snapshotPromptStash(text: string): PromptStash {
+		return this.snapshotPromptStashFrom(this.editor, text);
+	}
+
 	private handlePromptStash(): void {
 		const text = this.editor.getText();
 		if (!text.trim()) {
@@ -4040,14 +4089,7 @@ export class InteractiveMode {
 			this.showStatus("Prompt stash already has a draft");
 			return;
 		}
-		const pasteSnapshot = this.editor.getPasteSnapshot?.();
-		const images = this.getPromptStashImages(text);
-		this.promptStash = {
-			text,
-			expandedText: pasteSnapshot ? (this.editor.getExpandedText?.() ?? text) : undefined,
-			pasteSnapshot,
-			...(images.length > 0 ? { images } : {}),
-		};
+		this.promptStash = this.snapshotPromptStash(text);
 		this.editor.setText("");
 		this.showStatus("Stashed prompt");
 	}
@@ -4059,15 +4101,26 @@ export class InteractiveMode {
 		if (this.promptStash !== stash) {
 			return false;
 		}
-		this.promptStash = undefined;
+		this.promptStash = this.promptStashState?.queuedStashes?.shift();
+		if (this.promptStashState?.queuedStashes?.length === 0) this.promptStashState.queuedStashes = undefined;
 		const canRestorePasteSnapshot =
 			stash.pasteSnapshot === undefined || this.editor.restorePasteSnapshot !== undefined;
 		this.editor.setText(canRestorePasteSnapshot ? stash.text : (stash.expandedText ?? stash.text));
 		if (stash.pasteSnapshot && this.editor.restorePasteSnapshot) {
 			this.editor.restorePasteSnapshot(stash.pasteSnapshot);
 		}
+		this.latestEditorPromptStash = this.snapshotPromptStash(this.editor.getText());
 		this.showStatus("Restored stashed prompt");
 		return true;
+	}
+
+	private retainSubmittedDraft(stash: PromptStash): void {
+		if (this.promptStash === undefined) {
+			this.promptStash = stash;
+		} else {
+			this.promptStashState.queuedStashes ??= [];
+			this.promptStashState.queuedStashes.push(stash);
+		}
 	}
 
 	private getPromptStashImages(text: string): readonly (readonly [number, ImageContent])[] {
@@ -4144,8 +4197,8 @@ export class InteractiveMode {
 			}
 		};
 		add(this.editor.getText());
-		if (this.promptStash !== undefined) {
-			add(this.promptStash.text);
+		for (const stash of [this.promptStash, ...(this.promptStashState?.queuedStashes ?? [])]) {
+			if (stash) add(stash.text);
 		}
 		for (const entry of this.editor.getHistory?.() ?? []) {
 			add(entry);
@@ -4341,6 +4394,11 @@ export class InteractiveMode {
 			const submissionGeneration = ++this.inputSubmissionGeneration;
 			this.clearShortcutGuide();
 			const promptStashToRestore = this.promptStash;
+			const liveEditorText = this.editor.getText();
+			const submittedDraft =
+				this.pendingSubmittedPromptStash ??
+				(liveEditorText.trim() ? this.snapshotPromptStash(liveEditorText) : this.latestEditorPromptStash);
+			this.pendingSubmittedPromptStash = undefined;
 			let restorePromptStashAfterSubmit = true;
 			let submissionOutcome: StartupPromptBarrierOutcome = "admitted";
 
@@ -4693,6 +4751,10 @@ export class InteractiveMode {
 					this.isShuttingDown ||
 					this.returnToAgentsViewRequested
 				) {
+					// The editor is already torn down, but its shared session stash outlives
+					// this view. Preserve the submitted draft there without overwriting an
+					// explicit older stash or touching editor state.
+					this.retainSubmittedDraft(submittedDraft ?? { text });
 					submissionOutcome = "lifecycle-cancelled";
 					return;
 				}
@@ -6792,11 +6854,13 @@ export class InteractiveMode {
 	}
 
 	private async handleFollowUp(): Promise<void> {
-		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
+		const editorText = this.editor.getText();
+		const text = (this.editor.getExpandedText?.() ?? editorText).trim();
 		if (!text || !this.editor.onSubmit) return;
 
 		// Unlike Enter, Alt+Enter does not go through Editor.submitValue(), so
 		// capture and clear synchronously before an async/local handler can yield.
+		this.pendingSubmittedPromptStash = this.snapshotPromptStash(editorText);
 		this.editor.setText("");
 		this.submittedInputBehavior = "followUp";
 		// onSubmit consumes the behavior flag and bumps the generation synchronously;

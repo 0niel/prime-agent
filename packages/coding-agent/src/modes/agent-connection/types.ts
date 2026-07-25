@@ -430,6 +430,8 @@ export interface AgentConnectionPromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	queueIfBusy?: boolean;
 	source?: InputSource;
+	/** Cancel admission while it is still waiting; accepted prompts remain session-owned. */
+	signal?: AbortSignal;
 }
 
 export interface AgentConnectionSideQuestionEvent {

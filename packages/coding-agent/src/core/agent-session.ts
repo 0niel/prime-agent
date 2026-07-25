@@ -510,6 +510,8 @@ export interface PromptOptions {
 	skipInputHandlers?: boolean;
 	/** Start queued work when this input is admitted to an otherwise idle session. */
 	resumeIfIdle?: boolean;
+	/** Cancel this prompt while it is waiting for direct-turn admission. */
+	signal?: AbortSignal;
 	agentMessageId?: string;
 	content?: (TextContent | ImageContent)[];
 	customMessage?: CustomMessage;
@@ -559,6 +561,33 @@ function oncePreflight(
 			preflightResult?.(success, queued);
 		}
 	};
+}
+
+function throwIfPromptAdmissionCancelled(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new Error("Prompt admission was cancelled.");
+}
+
+function waitForPromptAdmission<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+	if (!signal) return promise;
+	throwIfPromptAdmissionCancelled(signal);
+	return new Promise<T>((resolve, reject) => {
+		const onAbort = () => {
+			cleanup();
+			reject(new Error("Prompt admission was cancelled."));
+		};
+		const cleanup = () => signal.removeEventListener("abort", onAbort);
+		signal.addEventListener("abort", onAbort, { once: true });
+		promise.then(
+			(value) => {
+				cleanup();
+				resolve(value);
+			},
+			(error: unknown) => {
+				cleanup();
+				reject(error);
+			},
+		);
+	});
 }
 
 interface PreparedCommandInput {
@@ -3946,7 +3975,7 @@ export class AgentSession {
 		options?: InternalPromptOptions,
 	): Promise<void> {
 		if (!this.isStreaming && options?.resumeIfIdle) this._sessionInputPumpSuspended = false;
-		const admission = await this._acquireDirectTurnAdmission({ allowStreaming: true });
+		const admission = await this._acquireDirectTurnAdmission({ allowStreaming: true, signal: options?.signal });
 		try {
 			await this._turnAdmissionContext.run(admission.owner, () =>
 				this._promptInjectedMessageUnserialized(text, message, options, admission.release),
@@ -4078,7 +4107,9 @@ export class AgentSession {
 
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
 		if (!this.isStreaming) this._sessionInputPumpSuspended = false;
-		const admission = !this.isStreaming ? await this._acquireDirectTurnAdmission() : undefined;
+		const admission = !this.isStreaming
+			? await this._acquireDirectTurnAdmission({ signal: options?.signal })
+			: undefined;
 		const releaseAdmission = admission?.release ?? (() => {});
 		try {
 			if (admission) {
@@ -5335,7 +5366,7 @@ export class AgentSession {
 		}
 	}
 
-	private async _acquireTurnAdmission(): Promise<{ owner: symbol; release(): void }> {
+	private async _acquireTurnAdmission(signal?: AbortSignal): Promise<{ owner: symbol; release(): void }> {
 		const inheritedOwner = this._turnAdmissionContext.getStore();
 		if (inheritedOwner !== undefined && inheritedOwner === this._turnAdmissionOwner) {
 			return { owner: inheritedOwner, release: () => {} };
@@ -5345,7 +5376,15 @@ export class AgentSession {
 		this._turnAdmissionTail = new Promise<void>((release) => {
 			resolve = release;
 		});
-		await previous;
+		try {
+			await waitForPromptAdmission(previous, signal);
+		} catch (error) {
+			// Keep this cancelled waiter in the FIFO chain until its predecessor
+			// releases; resolving immediately would let a later caller bypass the
+			// current admission owner.
+			void previous.then(resolve, resolve);
+			throw error;
+		}
 		const owner = Symbol("turn-admission");
 		this._turnAdmissionOwner = owner;
 		let released = false;
@@ -5361,14 +5400,14 @@ export class AgentSession {
 	}
 
 	private async _acquireDirectTurnAdmission(
-		options: { allowStreaming?: boolean } = {},
+		options: { allowStreaming?: boolean; signal?: AbortSignal } = {},
 	): Promise<{ owner: symbol; release(): void }> {
 		while (true) {
 			this._assertDirectTurnAdmissionAvailable();
-			await this._waitForQueuedWorkAdmission();
+			await this._waitForQueuedWorkAdmission(options.signal);
 			this._assertDirectTurnAdmissionAvailable();
 			if (this.pendingMessageCount > 0) this._scheduleSessionInputPump();
-			const admission = await this._acquireTurnAdmission();
+			const admission = await this._acquireTurnAdmission(options.signal);
 			try {
 				this._assertDirectTurnAdmissionAvailable();
 				if (this._queuedWorkPauses.size > 0) {
@@ -5383,6 +5422,9 @@ export class AgentSession {
 						!this._pumpingSessionInput &&
 						!this._sessionInputPumpRequested)
 				) {
+					// This is the ownership commit point: no prompt/session state has
+					// been consumed yet, and from here the session owns delivery.
+					throwIfPromptAdmissionCancelled(options.signal);
 					return admission;
 				}
 			} catch (error) {
@@ -5390,15 +5432,24 @@ export class AgentSession {
 				throw error;
 			}
 			admission.release();
-			await this.waitForSessionInputIdle();
+			await waitForPromptAdmission(this.waitForSessionInputIdle(), options.signal);
 			this._assertDirectTurnAdmissionAvailable();
 		}
 	}
 
-	private async _waitForQueuedWorkAdmission(): Promise<void> {
+	private async _waitForQueuedWorkAdmission(signal?: AbortSignal): Promise<void> {
 		while (this._queuedWorkPauses.size > 0) {
 			this._assertDirectTurnAdmissionAvailable();
-			await new Promise<void>((resolve) => this._queuedWorkAdmissionWaiters.add(resolve));
+			let wake = () => {};
+			const wait = new Promise<void>((resolve) => {
+				wake = resolve;
+				this._queuedWorkAdmissionWaiters.add(resolve);
+			});
+			try {
+				await waitForPromptAdmission(wait, signal);
+			} finally {
+				this._queuedWorkAdmissionWaiters.delete(wake);
+			}
 			this._assertDirectTurnAdmissionAvailable();
 		}
 	}

@@ -173,6 +173,30 @@ describe("InProcessAgentConnection", () => {
 			finishTurn();
 		},
 	);
+	it("forwards prompt admission cancellation to the session", async () => {
+		const session = createFakeSession("prompt-cancellation", []);
+		const prompt = vi.fn(
+			(_message: string, options?: PromptOptions) =>
+				new Promise<void>((_resolve, reject) => {
+					options?.signal?.addEventListener("abort", () => reject(new Error("Prompt admission was cancelled.")), {
+						once: true,
+					});
+				}),
+		);
+		Object.assign(session.session, { prompt });
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+		const controller = new AbortController();
+
+		const admission = connection.prompt("hello", { signal: controller.signal });
+		controller.abort();
+
+		await expect(admission).rejects.toThrow("Prompt admission was cancelled.");
+		expect(prompt).toHaveBeenCalledWith(
+			"hello",
+			expect.objectContaining({ signal: controller.signal, preflightResult: expect.any(Function) }),
+		);
+	});
+
 	it("loads the full model catalog through the connection boundary", async () => {
 		const session = createFakeSession("models", []);
 		const runtime = new FakeRuntime(session.session);

@@ -49,6 +49,45 @@ describe("AgentSession prompt characterization", () => {
 		}
 	});
 
+	it("cancels a prompt while direct-turn admission is paused", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const pause = harness.session.acquireQueuedWorkPause();
+		const controller = new AbortController();
+
+		const prompt = harness.session.prompt("cancel me", { signal: controller.signal });
+		controller.abort();
+
+		await expect(prompt).rejects.toThrow("Prompt admission was cancelled.");
+		expect(getUserTexts(harness)).toEqual([]);
+		pause.release();
+	});
+
+	it("keeps a prompt session-owned when cancellation arrives after admission", async () => {
+		const harness = await createHarness({ models: [{ id: "slow-faux" }] });
+		harnesses.push(harness);
+		let releaseResponse = () => {};
+		const responseGate = new Promise<void>((resolve) => {
+			releaseResponse = resolve;
+		});
+		harness.setResponses([
+			async () => {
+				await responseGate;
+				return fauxAssistantMessage("owned");
+			},
+		]);
+		const controller = new AbortController();
+
+		const prompt = harness.session.prompt("keep me", { signal: controller.signal });
+		await vi.waitFor(() => expect(getUserTexts(harness)).toEqual(["keep me"]));
+		controller.abort();
+		releaseResponse();
+		await prompt;
+
+		expect(getUserTexts(harness)).toEqual(["keep me"]);
+		expect(getAssistantTexts(harness)).toEqual(["owned"]);
+	});
+
 	it("prompts while idle and records a single text response", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

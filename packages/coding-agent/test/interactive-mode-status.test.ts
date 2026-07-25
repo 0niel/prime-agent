@@ -599,20 +599,29 @@ describe("InteractiveMode.renderSessionContext", () => {
 });
 
 type SubmitHandlerHarness = {
-	defaultEditor: { onSubmit?: (text: string) => Promise<void> };
+	defaultEditor: {
+		onSubmit?: (text: string) => Promise<void>;
+	};
 	editor: {
 		getText: () => string;
 		getExpandedText?: () => string;
+		getPasteSnapshot?: () => unknown;
 		setText: (text: string) => void;
 		addToHistory?: (text: string) => void;
 		onSubmit?: (text: string) => Promise<void>;
 	};
 	promptStash?: { text: string };
-	promptStashState?: PromptStashState;
+	promptStashState: PromptStashState;
+	pastedImages: Map<number, unknown>;
+	getPromptStashImages: (text: string) => readonly (readonly [number, unknown])[];
 	admitPendingStartupPrompts?: () => Promise<"admitted" | "lifecycle-cancelled">;
 	isShuttingDown?: boolean;
 	returnToAgentsViewRequested?: boolean;
 	submittedInputBehavior: "steer" | "followUp";
+	latestEditorPromptStash?: unknown;
+	pendingSubmittedPromptStash?: unknown;
+	snapshotPromptStash: (text: string) => unknown;
+	retainSubmittedDraft: (stash: unknown) => void;
 	inputSubmissionGeneration: number;
 	flushPendingBashComponents: () => void;
 	collectImagesFor: () => unknown[];
@@ -641,7 +650,18 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 		showError: vi.fn(),
 		isBashRunning: () => false,
 		patchConnectionState: vi.fn(),
+		promptStashState: {},
 		promptStash: undefined,
+		pastedImages: new Map(),
+		getPromptStashImages: vi.fn(() => []),
+		snapshotPromptStash: vi.fn((text) => ({ text })),
+		retainSubmittedDraft(stash) {
+			if (!this.promptStashState.stash) this.promptStashState.stash = stash as { text: string };
+			else {
+				this.promptStashState.queuedStashes ??= [];
+				this.promptStashState.queuedStashes.push(stash as { text: string });
+			}
+		},
 		submittedInputBehavior: "steer",
 		inputSubmissionGeneration: 0,
 		flushPendingBashComponents: vi.fn(),
@@ -664,6 +684,213 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 }
 
 describe("InteractiveMode submit handling", () => {
+	test.each(["normal Enter", "installed custom editor"])("captures exact rich state for %s", async () => {
+		const image = { type: "image", data: "base64", mimeType: "image/png" };
+		const pasteSnapshot = { pastes: [[1, "expanded paste"]] as const, pasteCounter: 2 };
+		const rawText = "draft [paste #1] [image #7]";
+		let editorText = rawText;
+		const editor = {
+			getText: () => editorText,
+			getExpandedText: () => "draft expanded paste [image #7]",
+			getPasteSnapshot: () => pasteSnapshot,
+			setText: (text: string) => {
+				editorText = text;
+			},
+			onSubmit: undefined as ((text: string) => Promise<void>) | undefined,
+		};
+		const fakeThis = createSubmitHandlerHarness({
+			editor,
+			pastedImages: new Map([[7, image]]),
+			getPromptStashImages: () => [[7, image]],
+			admitPendingStartupPrompts: vi.fn(async (): Promise<"lifecycle-cancelled"> => "lifecycle-cancelled"),
+		});
+		delete fakeThis.promptStash;
+		fakeThis.snapshotPromptStash = (
+			InteractiveMode.prototype as unknown as { snapshotPromptStash(text: string): unknown }
+		).snapshotPromptStash.bind({
+			editor,
+			snapshotPromptStashFrom: (
+				InteractiveMode.prototype as unknown as {
+					snapshotPromptStashFrom(editor: unknown, text: string): unknown;
+				}
+			).snapshotPromptStashFrom,
+			getPromptStashImages: fakeThis.getPromptStashImages,
+		} as never);
+		fakeThis.latestEditorPromptStash = fakeThis.snapshotPromptStash(rawText);
+		editor.onSubmit = fakeThis.defaultEditor.onSubmit;
+
+		// Both pi-tui's normal editor and an installed extension editor call their
+		// wired onSubmit only after clearing their own state.
+		editorText = "";
+		await editor.onSubmit?.("draft expanded paste [image #7]");
+
+		expect(fakeThis.promptStashState.stash).toEqual({
+			text: rawText,
+			expandedText: "draft expanded paste [image #7]",
+			pasteSnapshot,
+			images: [[7, image]],
+		});
+	});
+
+	test.each([true, false])(
+		"custom editor replacement preserves the submitted rich draft through lifecycle cancellation (snapshot restore: %s)",
+		async (supportsSnapshotRestore) => {
+			initTheme("dark");
+			const image = { type: "image", data: "base64", mimeType: "image/png" };
+			const pasteSnapshot = { pastes: [[5, "expanded paste"]] as const, pasteCounter: 6 };
+			const rawText = "draft [paste #5] [image #7]";
+			const expandedText = "draft expanded paste [image #7]";
+			let oldText = rawText;
+			const oldEditor = {
+				onSubmit: undefined as ((text: string) => Promise<void>) | undefined,
+				onChange: undefined as ((text: string) => void) | undefined,
+				getText: () => oldText,
+				getExpandedText: () => expandedText,
+				getPasteSnapshot: () => pasteSnapshot,
+				setText: (text: string) => {
+					oldText = text;
+				},
+				handleInput: vi.fn(),
+				render: () => [],
+			};
+			let customText = "";
+			let restoredSnapshot: unknown;
+			const customEditor = {
+				getText: () => customText,
+				getExpandedText: () => (restoredSnapshot ? expandedText : customText),
+				getPasteSnapshot: () => restoredSnapshot,
+				restorePasteSnapshot: supportsSnapshotRestore
+					? (snapshot: unknown) => {
+							restoredSnapshot = snapshot;
+						}
+					: undefined,
+				setText: (text: string) => {
+					customText = text;
+					customEditor.onChange?.(text);
+				},
+				handleInput: vi.fn(),
+				render: () => [],
+				onSubmit: undefined as ((text: string) => Promise<void>) | undefined,
+				onChange: undefined as ((text: string) => void) | undefined,
+			};
+			const lifecycleBarrier = createDeferred<"admitted" | "lifecycle-cancelled">();
+			const promptStashState: PromptStashState = {};
+			const fakeThis = createSubmitHandlerHarness({
+				defaultEditor: oldEditor,
+				editor: oldEditor,
+				promptStashState,
+				pastedImages: new Map([[7, image]]),
+				getPromptStashImages: (text) => (text.includes("[image #7]") ? [[7, image]] : []),
+				admitPendingStartupPrompts: () => lifecycleBarrier.promise,
+			});
+			Object.assign(fakeThis, {
+				editorContainer: new Container(),
+				childAgentPanelMode: undefined,
+				childAgentSummary: { setHidden: vi.fn() },
+				ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+				keybindings: {},
+				autocompleteProvider: undefined,
+				showStatus: vi.fn(),
+			});
+			Object.defineProperty(fakeThis, "promptStash", {
+				configurable: true,
+				get: () => promptStashState.stash,
+				set: (stash) => {
+					promptStashState.stash = stash;
+				},
+			});
+			fakeThis.snapshotPromptStash = (
+				InteractiveMode.prototype as unknown as { snapshotPromptStash(text: string): unknown }
+			).snapshotPromptStash.bind(fakeThis as never);
+			(
+				fakeThis as unknown as { snapshotPromptStashFrom(editor: unknown, text: string): unknown }
+			).snapshotPromptStashFrom = (
+				InteractiveMode.prototype as unknown as {
+					snapshotPromptStashFrom(editor: unknown, text: string): unknown;
+				}
+			).snapshotPromptStashFrom;
+			(
+				InteractiveMode.prototype as unknown as { setupEditorSubmitHandler(this: SubmitHandlerHarness): void }
+			).setupEditorSubmitHandler.call(fakeThis);
+			oldEditor.onChange = (text: string) => {
+				if (text.length > 0) fakeThis.latestEditorPromptStash = fakeThis.snapshotPromptStash(text);
+			};
+
+			(
+				InteractiveMode.prototype as unknown as {
+					setCustomEditorComponent(this: unknown, factory: () => unknown): void;
+				}
+			).setCustomEditorComponent.call(fakeThis, () => customEditor);
+
+			expect(customText).toBe(supportsSnapshotRestore ? rawText : expandedText);
+			expect(restoredSnapshot).toBe(supportsSnapshotRestore ? pasteSnapshot : undefined);
+			customEditor.setText("");
+			const submission = customEditor.onSubmit?.(expandedText);
+			await Promise.resolve();
+			expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
+			lifecycleBarrier.resolve("lifecycle-cancelled");
+			await submission;
+
+			expect(promptStashState.stash).toEqual({
+				text: rawText,
+				expandedText,
+				pasteSnapshot,
+				images: [[7, image]],
+			});
+			restoredSnapshot = undefined;
+			(
+				InteractiveMode.prototype as unknown as { restorePromptStashIfEditorEmpty(this: unknown): boolean }
+			).restorePromptStashIfEditorEmpty.call(fakeThis);
+			expect(customText).toBe(supportsSnapshotRestore ? rawText : expandedText);
+			expect(restoredSnapshot).toBe(supportsSnapshotRestore ? pasteSnapshot : undefined);
+			expect(promptStashState.stash).toBeUndefined();
+		},
+	);
+
+	test("captures exact rich state for Alt+Enter before clearing", async () => {
+		const image = { type: "image", data: "base64", mimeType: "image/png" };
+		const pasteSnapshot = { pastes: [[3, "expanded paste"]] as const, pasteCounter: 4 };
+		let editorText = "alt [paste #3] [image #9]";
+		const fakeThis = createSubmitHandlerHarness({
+			editor: {
+				getText: () => editorText,
+				getExpandedText: () => "alt expanded paste [image #9]",
+				getPasteSnapshot: () => pasteSnapshot,
+				setText: (text: string) => {
+					editorText = text;
+				},
+			},
+			pastedImages: new Map([[9, image]]),
+			getPromptStashImages: () => [[9, image]],
+			admitPendingStartupPrompts: vi.fn(async (): Promise<"lifecycle-cancelled"> => "lifecycle-cancelled"),
+		});
+		delete fakeThis.promptStash;
+		fakeThis.editor.onSubmit = fakeThis.defaultEditor.onSubmit;
+		fakeThis.snapshotPromptStash = (
+			InteractiveMode.prototype as unknown as { snapshotPromptStash(text: string): unknown }
+		).snapshotPromptStash.bind({
+			editor: fakeThis.editor,
+			snapshotPromptStashFrom: (
+				InteractiveMode.prototype as unknown as {
+					snapshotPromptStashFrom(editor: unknown, text: string): unknown;
+				}
+			).snapshotPromptStashFrom,
+			getPromptStashImages: fakeThis.getPromptStashImages,
+		} as never);
+
+		await (
+			InteractiveMode.prototype as unknown as { handleFollowUp(this: SubmitHandlerHarness): Promise<void> }
+		).handleFollowUp.call(fakeThis);
+
+		expect(editorText).toBe("");
+		expect(fakeThis.promptStashState.stash).toEqual({
+			text: "alt [paste #3] [image #9]",
+			expandedText: "alt expanded paste [image #9]",
+			pasteSnapshot,
+			images: [[9, image]],
+		});
+	});
+
 	test("routes ! shortcuts to executeBash on the agent connection", async () => {
 		const fakeThis = createSubmitHandlerHarness();
 
@@ -2479,8 +2706,18 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			await vi.advanceTimersByTimeAsync(1_250);
 			await userSubmission;
 
-			const steer = { images: undefined, streamingBehavior: "steer", queueIfBusy: true };
-			const followUp = { images: undefined, streamingBehavior: "followUp", queueIfBusy: true };
+			const steer = {
+				images: undefined,
+				streamingBehavior: "steer",
+				queueIfBusy: true,
+				signal: expect.any(AbortSignal),
+			};
+			const followUp = {
+				images: undefined,
+				streamingBehavior: "followUp",
+				queueIfBusy: true,
+				signal: expect.any(AbortSignal),
+			};
 			expect(prompt.mock.calls).toEqual([
 				["first", steer],
 				["first", steer],
@@ -2582,7 +2819,12 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 				expect(editorText).toBe(scenario === "typing" ? "typing during startup wait" : "");
 				expect(prompt.mock.calls[0]).toEqual([
 					"startup",
-					{ images: undefined, streamingBehavior: "steer", queueIfBusy: true },
+					{
+						images: undefined,
+						streamingBehavior: "steer",
+						queueIfBusy: true,
+						signal: expect.any(AbortSignal),
+					},
 				]);
 				inputDone.resolve(undefined);
 				await expect(run).resolves.toBe("agents_view");
@@ -2592,16 +2834,119 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		},
 	);
 
-	test("lifecycle cancellation at the startup barrier preserves the durable stash", async () => {
+	test("aborts an actually blocked startup admission when the run lifecycle ends", async () => {
 		const inputDone = createDeferred<void>();
-		const store = new ClientPromptStashStore();
-		const promptStashState = store.forSession("session-a");
-		promptStashState.stash = { text: "durable draft" };
-		let editorText = "user prompt";
+		let blockedSignal: AbortSignal | undefined;
+		const prompt = vi.fn((_message: string, options?: { signal?: AbortSignal }) => {
+			blockedSignal = options?.signal;
+			return new Promise<void>((_resolve, reject) => {
+				options?.signal?.addEventListener("abort", () => reject(new Error("admission aborted")), { once: true });
+			});
+		});
+		const fakeThis = Object.assign(
+			createSubmitHandlerHarness({
+				agentConnection: {
+					prompt,
+					executeBash: vi.fn(async () => {}),
+					getState: vi.fn(async () => ({ isBashRunning: false })),
+				},
+			}),
+			createStartupRunHarness(
+				{ initialMessage: "startup" },
+				{
+					getCurrentModel: () => primeModel,
+					getUserInput: vi.fn(() => inputDone.promise),
+				},
+			),
+		);
+
+		const run = InteractiveMode.prototype.run.call(fakeThis as never);
+		await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+		expect(blockedSignal?.aborted).toBe(false);
+		inputDone.resolve(undefined);
+
+		await expect(run).resolves.toBe("agents_view");
+		expect(blockedSignal?.aborted).toBe(true);
+		expect(fakeThis.showError).not.toHaveBeenCalled();
+	});
+
+	test.each([false, true])(
+		"lifecycle cancellation retains the submitted draft with exact fidelity (existing stash: %s)",
+		async (hasExistingStash) => {
+			const inputDone = createDeferred<void>();
+			const store = new ClientPromptStashStore();
+			const promptStashState = store.forSession("session-a");
+			if (hasExistingStash) promptStashState.stash = { text: "older durable draft" };
+			const image = { type: "image", data: "base64", mimeType: "image/png" } as const;
+			const pasteSnapshot = { pastes: [[1, "expanded paste"]], pasteCounter: 2 } as const;
+			const submittedText = "submitted [paste #1] [image #7]";
+			let editorText = submittedText;
+			const submitHarness = createSubmitHandlerHarness({
+				editor: {
+					getText: () => editorText,
+					getExpandedText: () => "submitted expanded paste [image #7]",
+					getPasteSnapshot: () => pasteSnapshot,
+					setText: (text) => {
+						editorText = text;
+					},
+				},
+				promptStashState,
+				pastedImages: new Map([[7, image]]),
+				getPromptStashImages: () => [[7, image]],
+			});
+			delete submitHarness.promptStash;
+			const fakeThis = Object.assign(
+				submitHarness,
+				createStartupRunHarness(
+					{ initialMessage: "startup" },
+					{
+						getCurrentModel: () => undefined,
+						getUserInput: vi.fn(() => inputDone.promise),
+						agentConnection: submitHarness.agentConnection,
+					},
+				),
+			);
+
+			const run = InteractiveMode.prototype.run.call(fakeThis as never);
+			while (!fakeThis.admitPendingStartupPrompts) await Promise.resolve();
+			fakeThis.latestEditorPromptStash = {
+				text: submittedText,
+				expandedText: "submitted expanded paste [image #7]",
+				pasteSnapshot,
+				images: [[7, image]],
+			};
+			// pi-tui clears and emits onChange before invoking onSubmit.
+			editorText = "";
+			const submission = fakeThis.defaultEditor.onSubmit?.("submitted expanded paste [image #7]");
+			await Promise.resolve();
+			expect(editorText).toBe("");
+			fakeThis.returnToAgentsViewRequested = true;
+			fakeThis.isShuttingDown = true;
+			inputDone.resolve(undefined);
+
+			await expect(run).resolves.toBe("agents_view");
+			await submission;
+
+			expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
+			expect(editorText).toBe("");
+			const retained = hasExistingStash ? promptStashState.queuedStashes?.[0] : promptStashState.stash;
+			expect(promptStashState.stash?.text).toBe(hasExistingStash ? "older durable draft" : submittedText);
+			expect(retained).toEqual({
+				text: submittedText,
+				expandedText: "submitted expanded paste [image #7]",
+				pasteSnapshot,
+				images: [[7, image]],
+			});
+		},
+	);
+
+	test("retains every blocked submission in submission order on lifecycle cancellation", async () => {
+		const inputDone = createDeferred<void>();
+		const promptStashState: PromptStashState = {};
+		let editorText = "first rich draft";
 		const submitHarness = createSubmitHandlerHarness({
 			editor: {
 				getText: () => editorText,
-				getExpandedText: () => editorText,
 				setText: (text) => {
 					editorText = text;
 				},
@@ -2623,19 +2968,21 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 
 		const run = InteractiveMode.prototype.run.call(fakeThis as never);
 		while (!fakeThis.admitPendingStartupPrompts) await Promise.resolve();
-		const submission = fakeThis.defaultEditor.onSubmit?.("user prompt");
+		fakeThis.latestEditorPromptStash = { text: "first rich draft", expandedText: "first expanded" };
+		editorText = "";
+		const first = fakeThis.defaultEditor.onSubmit?.("first rich draft");
+		fakeThis.latestEditorPromptStash = { text: "second rich draft", expandedText: "second expanded" };
+		const second = fakeThis.defaultEditor.onSubmit?.("second rich draft");
 		await Promise.resolve();
-		expect(editorText).toBe("");
+
 		fakeThis.returnToAgentsViewRequested = true;
 		fakeThis.isShuttingDown = true;
 		inputDone.resolve(undefined);
-
 		await expect(run).resolves.toBe("agents_view");
-		await submission;
+		await Promise.all([first, second]);
 
-		expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
-		expect(editorText).toBe("");
-		expect(promptStashState.stash?.text).toBe("durable draft");
+		expect(promptStashState.stash).toEqual({ text: "first rich draft", expandedText: "first expanded" });
+		expect(promptStashState.queuedStashes).toEqual([{ text: "second rich draft", expandedText: "second expanded" }]);
 	});
 
 	test("keeps the TUI alive while direct editor submissions own prompt delivery", async () => {

@@ -358,6 +358,36 @@ describe("InteractiveMode prompt stash", () => {
 		expect(mode.showStatus).not.toHaveBeenCalledWith("Restored stashed prompt");
 	});
 
+	it("restores both rich lifecycle-retained drafts in submission order", () => {
+		const store = new ClientPromptStashStore();
+		const mode = createSharedPromptStashHarness(store, "session-a");
+		const firstPaste: FakePasteSnapshot = { pastes: [[1, "first expanded"]], pasteCounter: 1 };
+		const secondPaste: FakePasteSnapshot = { pastes: [[2, "second expanded"]], pasteCounter: 2 };
+		mode.promptStashState.stash = {
+			text: "first [paste #1] [image #7]",
+			expandedText: "first expanded [image #7]",
+			pasteSnapshot: firstPaste,
+		};
+		mode.promptStashState.queuedStashes = [
+			{
+				text: "second [paste #2] [image #8]",
+				expandedText: "second expanded [image #8]",
+				pasteSnapshot: secondPaste,
+			},
+		];
+
+		expect(interactiveModeMethods.restorePromptStashIfEditorEmpty.call(mode)).toBe(true);
+		expect(mode.editor.getText()).toBe("first [paste #1] [image #7]");
+		expect(mode.editor.restoredPasteSnapshot).toBe(firstPaste);
+
+		mode.editor.setText("");
+		expect(interactiveModeMethods.restorePromptStashIfEditorEmpty.call(mode)).toBe(true);
+		expect(mode.editor.getText()).toBe("second [paste #2] [image #8]");
+		expect(mode.editor.restoredPasteSnapshot).toBe(secondPaste);
+		expect(mode.promptStashState.stash).toBeUndefined();
+		expect(mode.promptStashState.queuedStashes).toBeUndefined();
+	});
+
 	it("does not overwrite an existing stash", () => {
 		const mode = createPromptStashHarness({ text: "second draft", stash: "first draft" });
 
