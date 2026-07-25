@@ -6512,7 +6512,7 @@ export class InteractiveMode {
 		const retained: AgentMessage[] = [];
 		const later: AgentMessage[] = [];
 		for (const message of remaining) {
-			(message.timestamp <= summary.timestamp ? retained : later).push(message);
+			(message.timestamp < summary.timestamp ? retained : later).push(message);
 		}
 		return [...retained, summary, ...later];
 	}

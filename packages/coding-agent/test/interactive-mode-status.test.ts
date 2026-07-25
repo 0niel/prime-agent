@@ -485,6 +485,21 @@ describe("InteractiveMode.renderSessionContext", () => {
 		expect(renderAll(chatContainer)).toContain("Showing latest 400 of 405 messages for faster open.");
 	});
 
+	test("keeps equal-timestamp legacy messages after the compaction summary", async () => {
+		const { harness, addMessageToChat } = createRenderSessionContextHarness();
+		const earlier = userMessage("earlier", 4);
+		const summary = {
+			role: "compactionSummary",
+			summary: "legacy summary",
+			tokensBefore: 123,
+			timestamp: 5,
+		} as AgentMessage;
+		const equalLater = userMessage("equal later", 5);
+
+		await renderMessages(harness, [summary, earlier, equalLater]);
+		expect(addMessageToChat.mock.calls.map((call) => call[0])).toEqual([earlier, summary, equalLater]);
+	});
+
 	test("orders the compaction summary at its exact boundary before bounding the initial transcript", async () => {
 		const { harness, addMessageToChat } = createRenderSessionContextHarness();
 		const retained = Array.from({ length: 5 }, (_, index) => userMessage(`retained ${index}`, 5));
@@ -3109,9 +3124,8 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			promptStashState: state,
 			retainedSubmissionGenerations: new WeakMap(),
 		};
-		const release = (
-			InteractiveMode.prototype as unknown as { releasePromptStashSession(this: unknown): void }
-		).releasePromptStashSession;
+		const release = (InteractiveMode.prototype as unknown as { releasePromptStashSession(this: unknown): void })
+			.releasePromptStashSession;
 		const retain = (
 			InteractiveMode.prototype as unknown as {
 				retainSubmittedDraft(this: unknown, stash: { text: string }, generation: number): void;
