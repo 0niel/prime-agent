@@ -412,6 +412,10 @@ async function runLoop(
 				return;
 			}
 			pendingMessages = steeringMessagesResult.value;
+			if (shouldStopBeforeTurn()) {
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
 		}
 
 		// Agent would stop here. Check for follow-up messages.

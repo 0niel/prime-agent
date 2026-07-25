@@ -1427,6 +1427,49 @@ describe("agentLoop with AgentMessage", () => {
 		}
 	});
 
+	it("rechecks a tool-cycle stop after polling steering", async () => {
+		const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "done" }], details: {} }));
+		let stopRequested = false;
+		let llmCalls = 0;
+		const stream = agentLoop(
+			[createUserMessage("start")],
+			{
+				systemPrompt: "",
+				messages: [],
+				tools: [{ name: "work", label: "Work", description: "Work", parameters: Type.Object({}), execute }],
+			},
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				shouldStopBeforeTurn: () => stopRequested,
+				getSteeringMessages: async () => {
+					stopRequested = true;
+					return [];
+				},
+			},
+			undefined,
+			() => {
+				llmCalls++;
+				const mockStream = new MockAssistantStream();
+				queueMicrotask(() =>
+					mockStream.push({
+						type: "done",
+						reason: "toolUse",
+						message: createAssistantMessage(
+							[{ type: "toolCall", id: "tool-1", name: "work", arguments: {} }],
+							"toolUse",
+						),
+					}),
+				);
+				return mockStream;
+			},
+		);
+		for await (const _event of stream) {
+			// Drain the stream.
+		}
+		expect(llmCalls).toBe(1);
+	});
+
 	it("checks shouldStopBeforeTurn after a tool batch and before another model call", async () => {
 		const execute = vi.fn(async () => ({ content: [{ type: "text" as const, text: "done" }], details: {} }));
 		const context: AgentContext = {
