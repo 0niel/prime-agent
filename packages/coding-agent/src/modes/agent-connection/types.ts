@@ -425,6 +425,21 @@ export interface AgentConnectionToolDefinition {
 	replayBuiltInToolName?: ReplayBuiltInToolName;
 }
 
+/** Prompt admission failure; only a confirmed cancellation is retry-safe. */
+export class AgentConnectionPromptAdmissionError extends Error {
+	readonly cancelled: boolean;
+
+	constructor(
+		message: string,
+		readonly status: "cancelled" | "owned" | "unknown" | "unsupported",
+		options?: ErrorOptions,
+	) {
+		super(message, options);
+		this.cancelled = status === "cancelled";
+		this.name = "AgentConnectionPromptAdmissionError";
+	}
+}
+
 export interface AgentConnectionPromptOptions {
 	images?: ImageContent[];
 	streamingBehavior?: "steer" | "followUp";

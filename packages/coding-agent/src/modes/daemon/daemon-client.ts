@@ -7,6 +7,7 @@ import {
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
 	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_REVISION,
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonCommandEnvelope,
@@ -33,6 +34,8 @@ export type DaemonClientProgressListener = (message: DaemonRequestProgress) => v
 
 export interface DaemonClientRequestOptions {
 	onProgress?: DaemonClientProgressListener;
+	/** Fields that require an exact protocol/schema/capability handshake. */
+	requiredSchema?: { protocol: number; revision: number; capability: DaemonServerCapability };
 }
 
 interface PendingDaemonRequest {
@@ -298,13 +301,25 @@ export class DaemonClient {
 		}
 		const hello = this.helloMessage ?? (await this.waitForHello());
 		const compatibility = DAEMON_COMMAND_COMPATIBILITY[command.type];
+		const requiredSchema =
+			(command.type === "prompt" || command.type === "prompt_and_wait") && command.admissionId !== undefined
+				? {
+						protocol: DAEMON_PROTOCOL_VERSION,
+						revision: DAEMON_SCHEMA_REVISION,
+						capability: "prompt_admission_cancellation" as const,
+					}
+				: options.requiredSchema;
 		if (
 			hello.protocol.version < compatibility.minProtocol ||
-			("capability" in compatibility && !this.supportsServerCapability(compatibility.capability))
+			("capability" in compatibility && !this.supportsServerCapability(compatibility.capability)) ||
+			(requiredSchema !== undefined &&
+				(hello.protocol.version < requiredSchema.protocol ||
+					hello.schemaRevision !== requiredSchema.revision ||
+					!this.supportsServerCapability(requiredSchema.capability)))
 		) {
 			throw new DaemonCapabilityUnavailableError(
 				command.type,
-				"capability" in compatibility ? compatibility.capability : undefined,
+				requiredSchema?.capability ?? ("capability" in compatibility ? compatibility.capability : undefined),
 			);
 		}
 		const envelopeProtocolVersion = Math.min(hello.protocol.version, DAEMON_PROTOCOL_VERSION);

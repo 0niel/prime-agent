@@ -48,13 +48,11 @@ import type { SessionSummary } from "./daemon-session-list.js";
  */
 
 export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
-export const DAEMON_PROTOCOL_VERSION = 4;
+export const DAEMON_PROTOCOL_VERSION = 5;
 export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 2;
-// Revision 6: session_input_admission plus the upstream side-question transcript and transient-bash contracts.
-// Revision 5: transient + runId on execute_bash and transient_bash capability.
-// Revision 4: side_question_transcript capability.
+// Revision 6 combines prompt-admission cancellation with side-question transcripts and transient bash.
 export const DAEMON_SCHEMA_REVISION = 6;
-export const DAEMON_SCHEMA_ID = "protocol-4-schema-6-pending";
+export const DAEMON_SCHEMA_ID = "protocol-5-schema-6-48a562b9bffe";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -73,6 +71,10 @@ export type DaemonClientCapability =
 	| "slim_attach"
 	| "chunked_snapshot"
 	| "client_owned_sessions";
+export type DaemonPromptAdmissionCancellationStatus = "cancelled" | "owned" | "unknown";
+export interface DaemonPromptAdmissionCancellationResult {
+	status: DaemonPromptAdmissionCancellationStatus;
+}
 export type DaemonServerCapability =
 	| DaemonClientCapability
 	| "heartbeat_catalog"
@@ -86,7 +88,8 @@ export type DaemonServerCapability =
 	// carry the transient marker and echoed runId so clients correlate runs by
 	// identity). Clients must check before sending.
 	| "transient_bash"
-	| "session_input_admission";
+	| "session_input_admission"
+	| "prompt_admission_cancellation";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -122,6 +125,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"side_question_transcript",
 	"transient_bash",
 	"session_input_admission",
+	"prompt_admission_cancellation",
 
 ];
 
@@ -400,6 +404,14 @@ export type DaemonCommand =
 			source?: InputSource;
 			agentMessageId?: string;
 			customMessage?: CustomMessage;
+			/** Unique only when the caller needs cancellable pre-ownership admission. */
+			admissionId?: string;
+	  }
+	| {
+			id?: string;
+			type: "cancel_prompt_admission";
+			activeSessionId: string;
+			admissionId: string;
 	  }
 	| {
 			id?: string;
@@ -412,6 +424,8 @@ export type DaemonCommand =
 			queueIfBusy?: boolean;
 			expandPromptTemplates?: boolean;
 			source?: InputSource;
+			/** Unique only when the caller needs cancellable pre-ownership admission. */
+			admissionId?: string;
 	  }
 	| {
 			id?: string;
@@ -596,13 +610,17 @@ export interface DaemonCommandCompatibility {
 }
 
 const LEGACY_DAEMON_COMMAND = { minProtocol: 1 } as const;
-const CURRENT_DAEMON_COMMAND = { minProtocol: DAEMON_PROTOCOL_VERSION } as const;
+const CURRENT_DAEMON_COMMAND = { minProtocol: 4 } as const;
 const SESSION_INPUT_ADMISSION_COMMAND = {
-	minProtocol: DAEMON_PROTOCOL_VERSION,
+	minProtocol: 4,
 	capability: "session_input_admission",
 } as const;
-const CLIENT_OWNED_DAEMON_COMMAND = {
+const PROMPT_ADMISSION_CANCELLATION_COMMAND = {
 	minProtocol: DAEMON_PROTOCOL_VERSION,
+	capability: "prompt_admission_cancellation",
+} as const;
+const CLIENT_OWNED_DAEMON_COMMAND = {
+	minProtocol: 4,
 	capability: "client_owned_sessions",
 } as const;
 
@@ -619,6 +637,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	kill: LEGACY_DAEMON_COMMAND,
 	rename: LEGACY_DAEMON_COMMAND,
 	prompt: SESSION_INPUT_ADMISSION_COMMAND,
+	cancel_prompt_admission: PROMPT_ADMISSION_CANCELLATION_COMMAND,
 	prompt_and_wait: SESSION_INPUT_ADMISSION_COMMAND,
 	steer: SESSION_INPUT_ADMISSION_COMMAND,
 	follow_up: SESSION_INPUT_ADMISSION_COMMAND,
@@ -787,6 +806,8 @@ export type DaemonOutbound =
 			socketPath: string;
 			protocol: DaemonProtocolInfo;
 			schemaId?: string;
+			/** Monotonic wire-schema revision for field-sensitive compatibility checks. */
+			schemaRevision?: number;
 			/** App version of the daemon process, used to detect stale daemons after self-update. */
 			appVersion?: string;
 			runtime?: DaemonRuntimeIdentity;

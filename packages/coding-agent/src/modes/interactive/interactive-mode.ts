@@ -153,6 +153,7 @@ import type {
 	AgentConnectionState,
 	AgentConnectionToolDefinition,
 } from "../agent-connection/index.js";
+import { AgentConnectionPromptAdmissionError } from "../agent-connection/index.js";
 import { getModelArgumentCompletions } from "../model-autocomplete.js";
 import {
 	checkForPackageUpdates,
@@ -1540,6 +1541,16 @@ export class InteractiveMode {
 					next++;
 				} catch (error) {
 					if (startupPromptsDone || startupAdmissionAbort.signal.aborted) return;
+					// An uncertain daemon admission may already be session-owned. Retrying
+					// would duplicate it; only an acknowledged pre-ownership cancellation is safe.
+					if (error instanceof AgentConnectionPromptAdmissionError && !error.cancelled) {
+						this.retainSubmittedDraft({
+							text: prompt.text,
+							images: prompt.images?.map((image, index) => [index, image] as const),
+						});
+						this.showError(error.message);
+						return;
+					}
 					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 					if (++failures < 3) {
 						this.showError(errorMessage);

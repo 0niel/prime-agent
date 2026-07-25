@@ -90,6 +90,7 @@ function emitHello(
 	socket: (typeof netMock.sockets)[number],
 	version = DAEMON_PROTOCOL_VERSION,
 	serverCapabilities: string[] = ["session_input_admission"],
+	schemaRevision?: number,
 ): void {
 	socket.emit(
 		"data",
@@ -97,6 +98,7 @@ function emitHello(
 			type: "daemon_hello",
 			socketPath: "/tmp/prime-agent.sock",
 			protocol: { name: "prime-agent.daemon", version },
+			schemaRevision,
 			appVersion: "9.9.9",
 			clientId: "client-1",
 			serverCapabilities,
@@ -220,6 +222,21 @@ describe("DaemonClient", () => {
 		await expect(
 			client.request({ type: "prompt", activeSessionId: "active-1", message: "hello", queueIfBusy: true }),
 		).rejects.toThrow("does not support session_input_admission");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("field-gates prompt admissionId before writing raw commands", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["session_input_admission", "prompt_admission_cancellation"], 3);
+
+		await expect(
+			client.request({ type: "prompt", activeSessionId: "active-1", message: "hello", admissionId: "a-1" }),
+		).rejects.toThrow("does not support prompt_admission_cancellation");
 		expect(socket.writes).toEqual([]);
 		client.close();
 	});

@@ -23,6 +23,7 @@ import {
 } from "../src/modes/daemon/daemon-client.js";
 import {
 	DAEMON_PROTOCOL_INFO,
+	DAEMON_SCHEMA_REVISION,
 	type DaemonAttachResult,
 	type DaemonCommand,
 	type DaemonOutbound,
@@ -47,10 +48,20 @@ class FakeDaemonClient {
 	abortBashUnknownCommand = false;
 	abortAndClearQueueUnknownCommand = false;
 	cronAddGate: Promise<void> | undefined;
+	promptGate: Promise<void> | undefined;
+	promptError: Error | undefined;
+	cancelPromptAdmissionStatus: "cancelled" | "owned" | "unknown" = "owned";
 	legacyHeartbeatCommandsSupported = false;
 	serverCapabilities = new Set<string>();
 	updateRestartSessions: Array<Record<string, unknown>> = [];
-	hello: DaemonHello | undefined;
+	hello: DaemonHello | undefined = {
+		type: "daemon_hello",
+		socketPath: "/tmp/fake.sock",
+		protocol: DAEMON_PROTOCOL_INFO,
+		schemaRevision: DAEMON_SCHEMA_REVISION,
+		clientId: "fake-client",
+		serverCapabilities: ["prompt_admission_cancellation", "session_input_admission"],
+	};
 	private readonly messageListeners = new Set<DaemonClientMessageListener>();
 	private readonly closeListeners = new Set<DaemonClientCloseListener>();
 
@@ -63,8 +74,20 @@ class FakeDaemonClient {
 		this.requestTimeouts.push(timeoutMs);
 		switch (command.type) {
 			case "prompt":
-			case "prompt_and_wait":
+				if (this.promptGate) await this.promptGate;
+				if (this.promptError) throw this.promptError;
 				return { type: "response", command: command.type, success: true };
+			case "prompt_and_wait":
+				if (this.promptGate) await this.promptGate;
+				if (this.promptError) throw this.promptError;
+				return { type: "response", command: command.type, success: true };
+			case "cancel_prompt_admission":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: { status: this.cancelPromptAdmissionStatus },
+				};
 			case "list":
 				return {
 					type: "response",
@@ -491,7 +514,9 @@ class FakeDaemonClient {
 		this.connected = true;
 	}
 
-	async waitForHello(): Promise<void> {}
+	async waitForHello(): Promise<DaemonHello> {
+		return this.hello!;
+	}
 
 	resetTransportForReconnect(): void {
 		this.resetTransportCount++;
@@ -689,6 +714,96 @@ describe("DaemonAgentConnection", () => {
 			streamingBehavior: "followUp",
 			queueIfBusy: true,
 		});
+	});
+
+	it("forwards signal-backed prompts with a unique cancellable admission id", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("prompt_admission_cancellation");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const abort = new AbortController();
+
+		await connection.prompt("startup", { signal: abort.signal, queueIfBusy: true });
+
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "prompt",
+			activeSessionId: "active-1",
+			message: "startup",
+			queueIfBusy: true,
+			admissionId: expect.stringMatching(/^prompt-admission:/),
+		});
+	});
+
+	it("cancels rejected signal-backed admission and removes its abort listener", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("prompt_admission_cancellation");
+		fakeClient.promptError = new Error("transport failed");
+		fakeClient.cancelPromptAdmissionStatus = "cancelled";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const abort = new AbortController();
+		const add = vi.spyOn(abort.signal, "addEventListener");
+		const remove = vi.spyOn(abort.signal, "removeEventListener");
+
+		await expect(connection.prompt("startup", { signal: abort.signal })).rejects.toMatchObject({
+			message: "transport failed",
+			cancelled: true,
+		});
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["prompt", "cancel_prompt_admission"]);
+		expect(add).toHaveBeenCalledOnce();
+		expect(remove).toHaveBeenCalledOnce();
+		expect(remove.mock.calls[0]?.[1]).toBe(add.mock.calls[0]?.[1]);
+	});
+
+	it("sends zero requests for a pre-aborted prompt", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const abort = new AbortController();
+		abort.abort();
+
+		await expect(connection.prompt("startup", { signal: abort.signal })).rejects.toMatchObject({
+			status: "cancelled",
+		});
+		expect(fakeClient.requests).toEqual([]);
+	});
+
+	it("treats a lost prompt response plus unknown cancellation as uncertain", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("prompt_admission_cancellation");
+		fakeClient.promptError = new Error("lost response");
+		fakeClient.cancelPromptAdmissionStatus = "unknown";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await expect(connection.prompt("startup", { signal: new AbortController().signal })).rejects.toMatchObject({
+			message: "lost response",
+			status: "unknown",
+			cancelled: false,
+		});
+	});
+
+	it("uses cancellable admission for promptAndWait", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("prompt_admission_cancellation");
+		fakeClient.promptError = new Error("lost response");
+		fakeClient.cancelPromptAdmissionStatus = "cancelled";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await expect(connection.promptAndWait("wait", { signal: new AbortController().signal })).rejects.toMatchObject({
+			status: "cancelled",
+		});
+		expect(fakeClient.requests.map((request) => request.type)).toEqual([
+			"prompt_and_wait",
+			"cancel_prompt_admission",
+		]);
+	});
+
+	it("rejects an old daemon before sending a signal-backed prompt", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.hello = { ...fakeClient.hello!, protocol: { ...DAEMON_PROTOCOL_INFO, version: 4 } };
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await expect(connection.prompt("startup", { signal: new AbortController().signal })).rejects.toMatchObject({
+			status: "unsupported",
+		});
+		expect(fakeClient.requests).toEqual([]);
 	});
 
 	it("uses fleet heartbeat scope for residents and session scope for owned workers", async () => {

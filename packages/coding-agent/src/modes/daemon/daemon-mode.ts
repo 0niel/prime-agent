@@ -130,6 +130,7 @@ import {
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_SCHEMA_ID,
+	DAEMON_SCHEMA_REVISION,
 	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	type DaemonAttachResult,
 	type DaemonClientCapability,
@@ -210,6 +211,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"kill",
 	"rename",
 	"prompt",
+	"cancel_prompt_admission",
 	"prompt_and_wait",
 	"steer",
 	"follow_up",
@@ -322,6 +324,31 @@ function delay(ms: number): Promise<void> {
 	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
+function waitForDaemonPromptAdmission<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) return Promise.reject(new Error("Prompt admission was cancelled."));
+	return new Promise<T>((resolve, reject) => {
+		const cleanup = () => signal.removeEventListener("abort", onAbort);
+		const onAbort = () => {
+			cleanup();
+			reject(new Error("Prompt admission was cancelled."));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		// Close the registration-to-check race before observing the awaited work.
+		if (signal.aborted) return onAbort();
+		promise.then(
+			(value) => {
+				cleanup();
+				resolve(value);
+			},
+			(error: unknown) => {
+				cleanup();
+				reject(error);
+			},
+		);
+	});
+}
+
 type RuntimeOpenGuard = () => boolean | Promise<boolean>;
 type SupervisorGenerationClaim = Omit<Extract<DaemonWorkerCommand, { type: "worker_auth" }>, "id" | "type" | "token">;
 
@@ -379,6 +406,16 @@ export class AgentDaemon {
 	private readonly sideQuestionRuns = new Map<
 		string,
 		{ run: SideQuestionRun; client: DaemonSocketClient; activeSessionId: string }
+	>();
+	/** Live prompt admissions, keyed by session and caller-generated admission id. */
+	private readonly promptAdmissions = new Map<
+		string,
+		{
+			activeSessionId: string;
+			admissionId: string;
+			controller?: AbortController;
+			status: "waiting" | "owned" | "cancelled";
+		}
 	>();
 	private readonly signalCleanupHandlers: Array<() => void> = [];
 	private readonly cronStore: AgentCronJobStore;
@@ -1282,6 +1319,7 @@ export class AgentDaemon {
 				});
 			},
 			canPrompt,
+			options?.signal,
 		);
 	}
 
@@ -1322,6 +1360,7 @@ export class AgentDaemon {
 		state: ActiveSessionState,
 		run: (session: AgentSession, clearPreparing: () => void) => Promise<void>,
 		canRun?: () => boolean,
+		signal?: AbortSignal,
 	): Promise<boolean> {
 		const activeSessionId = state.activeSessionId;
 		this.agentMessagePreparingTargets.set(
@@ -1342,7 +1381,12 @@ export class AgentDaemon {
 			}
 		};
 		try {
-			await this.agentMessageTargetLocks.get(activeSessionId)?.catch(() => undefined);
+			const targetLock = this.agentMessageTargetLocks.get(activeSessionId);
+			if (targetLock)
+				await waitForDaemonPromptAdmission(
+					targetLock.catch(() => undefined),
+					signal,
+				);
 			if (this.sessions.get(activeSessionId) !== state || this.closingSessions.has(activeSessionId)) {
 				throw new Error("Target session is closing before prompt delivery");
 			}
@@ -2299,6 +2343,7 @@ export class AgentDaemon {
 			socketPath: this.socketPath,
 			protocol: DAEMON_PROTOCOL_INFO,
 			schemaId: DAEMON_SCHEMA_ID,
+			schemaRevision: DAEMON_SCHEMA_REVISION,
 			appVersion: VERSION,
 			runtime: getDaemonRuntimeIdentity(),
 			clientId: client.id,
@@ -2366,13 +2411,46 @@ export class AgentDaemon {
 		});
 	}
 
+	private promptAdmissionKey(activeSessionId: string, admissionId: string): string {
+		return `${activeSessionId}\0${admissionId}`;
+	}
+
+	/**
+	 * Parse and synchronously register prompt admission before returning a promise.
+	 * This method is intentionally non-async: handleLine invokes it before its first await.
+	 */
+	private parseCommandAndRegisterPromptAdmission(line: string): unknown {
+		const wireValue = JSON.parse(line) as unknown;
+		const parsed = (isDaemonCommandEnvelope(wireValue) ? { ...wireValue.command, id: wireValue.id } : wireValue) as {
+			type?: unknown;
+			activeSessionId?: unknown;
+			admissionId?: unknown;
+		};
+		if (parsed.type === "prompt" || parsed.type === "prompt_and_wait") {
+			if (parsed.admissionId !== undefined) {
+				if (typeof parsed.activeSessionId !== "string" || typeof parsed.admissionId !== "string") {
+					throw new Error("Prompt admission requires string activeSessionId and admissionId");
+				}
+				if (parsed.admissionId === "") throw new Error("admissionId must not be empty");
+				const key = this.promptAdmissionKey(parsed.activeSessionId, parsed.admissionId);
+				if (this.promptAdmissions.has(key)) {
+					throw new Error(`Prompt admission id is already in use: ${parsed.admissionId}`);
+				}
+				this.promptAdmissions.set(key, {
+					activeSessionId: parsed.activeSessionId,
+					admissionId: parsed.admissionId,
+					controller: new AbortController(),
+					status: "waiting",
+				});
+			}
+		}
+		return parsed;
+	}
+
 	private async handleLine(client: DaemonSocketClient, line: string): Promise<void> {
 		let command: DaemonCommand;
 		try {
-			const wireValue = JSON.parse(line) as unknown;
-			const parsed = (
-				isDaemonCommandEnvelope(wireValue) ? { ...wireValue.command, id: wireValue.id } : wireValue
-			) as {
+			const parsed = this.parseCommandAndRegisterPromptAdmission(line) as {
 				id?: unknown;
 				type?: unknown;
 				token?: unknown;
@@ -2381,13 +2459,28 @@ export class AgentDaemon {
 				supervisorProcessStartId?: unknown;
 				supervisorSocketPath?: unknown;
 				activeSessionId?: unknown;
+				admissionId?: unknown;
 				capabilities?: unknown;
 				supportsExtensionUi?: unknown;
 				job?: unknown;
 			};
-			if (isDaemonCommandEnvelope(wireValue) && wireValue.clientId) {
-				client.id = wireValue.clientId;
-			}
+			const parsedAdmission =
+				(parsed.type === "prompt" || parsed.type === "prompt_and_wait") &&
+				typeof parsed.activeSessionId === "string" &&
+				typeof (parsed as { admissionId?: unknown }).admissionId === "string"
+					? this.promptAdmissions.get(
+							this.promptAdmissionKey(parsed.activeSessionId, (parsed as { admissionId: string }).admissionId),
+						)
+					: undefined;
+			const clearParsedAdmission = () => {
+				if (parsedAdmission) {
+					this.promptAdmissions.delete(
+						this.promptAdmissionKey(parsedAdmission.activeSessionId, parsedAdmission.admissionId),
+					);
+				}
+			};
+			// Envelope client identity is irrelevant to worker-local prompt admission.
+			// Public supervisor authentication has already bound this socket's identity.
 			if (this.options.worker && client.authenticated !== true) {
 				const commandId = typeof parsed.id === "string" ? parsed.id : undefined;
 				if (
@@ -2446,17 +2539,18 @@ export class AgentDaemon {
 					return;
 				}
 				try {
-					boundClaim.ownerFingerprint = await this.assertSupervisorClaimCurrent(
-						boundClaim.claim,
-						boundClaim.ownerFingerprint,
+					boundClaim.ownerFingerprint = await waitForDaemonPromptAdmission(
+						this.assertSupervisorClaimCurrent(boundClaim.claim, boundClaim.ownerFingerprint),
+						parsedAdmission?.controller?.signal,
 					);
-				} catch {
+				} catch (error) {
+					clearParsedAdmission();
 					this.write(
 						client,
 						failure(
 							typeof parsed.id === "string" ? parsed.id : undefined,
 							typeof parsed.type === "string" ? parsed.type : "worker_auth",
-							"supervisor_generation_stale",
+							error,
 						),
 					);
 					client.socket.end();
@@ -2609,6 +2703,9 @@ export class AgentDaemon {
 		}
 		if ("agentMessageId" in command && command.agentMessageId === "") {
 			throw new Error("agentMessageId must not be empty");
+		}
+		if ("admissionId" in command && command.admissionId === "") {
+			throw new Error("admissionId must not be empty");
 		}
 		if ((command.type === "steer" || command.type === "follow_up") && command.expandPromptTemplates !== false) {
 			const replayFields = (["content", "customMessage", "prefixMessages"] as const).filter(
@@ -2844,14 +2941,79 @@ export class AgentDaemon {
 				return success(command.id, "delete_saved_session", result);
 			}
 
-			case "prompt": {
-				const state = this.getBoundSessionState(command.activeSessionId);
+			case "cancel_prompt_admission": {
+				const admission = this.promptAdmissions.get(
+					this.promptAdmissionKey(command.activeSessionId, command.admissionId),
+				);
+				if (!admission) {
+					return success(command.id, command.type, { status: "unknown" as const });
+				}
+				if (admission.status === "owned") {
+					return success(command.id, command.type, { status: "owned" as const });
+				}
+				if (admission.status === "waiting") {
+					admission.status = "cancelled";
+					admission.controller?.abort();
+				}
+				return success(command.id, command.type, { status: "cancelled" as const });
+			}
+
+			case "prompt":
+			case "prompt_and_wait": {
+				const admissionKey = command.admissionId
+					? this.promptAdmissionKey(command.activeSessionId, command.admissionId)
+					: undefined;
+				const admission = admissionKey ? this.promptAdmissions.get(admissionKey) : undefined;
+				if (command.admissionId && !admission) {
+					throw new Error("Prompt admission was not registered during command parsing");
+				}
+				const clearAdmission = () => {
+					if (admissionKey && this.promptAdmissions.get(admissionKey) === admission) {
+						this.promptAdmissions.delete(admissionKey);
+					}
+				};
+				const commitAdmission = () => {
+					if (admission?.status === "waiting") admission.status = "owned";
+				};
+				let state: ActiveSessionState;
+				try {
+					if (admission?.status === "cancelled") throw new Error("Prompt admission was cancelled.");
+					state = this.getBoundSessionState(command.activeSessionId);
+				} catch (error) {
+					clearAdmission();
+					throw error;
+				}
+				const options: PromptOptions = {
+					content: command.content,
+					images: command.images,
+					streamingBehavior: command.streamingBehavior,
+					queueIfBusy: command.queueIfBusy ?? command.streamingBehavior !== undefined,
+					resumeIfIdle: command.streamingBehavior !== undefined,
+					expandPromptTemplates: command.expandPromptTemplates,
+					skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
+					source: command.source,
+					...(admission?.controller
+						? { signal: admission.controller.signal, admissionCommitted: commitAdmission }
+						: {}),
+				};
+				if (command.type === "prompt_and_wait") {
+					try {
+						await this.promptWithAgentMessagePreparingGuard(state, command.message, {
+							...options,
+							preflightResult: (didSucceed) => {
+								if (didSucceed) this.recordWorkerRecoveryState(state, "prompt_accepted", true);
+							},
+						});
+						return success(command.id, command.type);
+					} finally {
+						clearAdmission();
+					}
+				}
+
 				let responseSent = false;
 				let preflightRejected = false;
 				const sendSuccessResponse = () => {
-					if (responseSent) {
-						return;
-					}
+					if (responseSent) return;
 					responseSent = true;
 					this.write(client, success(command.id, "prompt"));
 				};
@@ -2859,16 +3021,9 @@ export class AgentDaemon {
 					state,
 					command.message,
 					{
-						content: command.content,
-						images: command.images,
-						streamingBehavior: command.streamingBehavior,
-						queueIfBusy: command.queueIfBusy ?? command.streamingBehavior !== undefined,
-						resumeIfIdle: command.streamingBehavior !== undefined,
-						expandPromptTemplates: command.expandPromptTemplates,
+						...options,
 						agentMessageId: command.agentMessageId,
 						customMessage: command.customMessage,
-						skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
-						source: command.source,
 						preflightResult: (didSucceed) => {
 							if (didSucceed) {
 								this.recordWorkerRecoveryState(state, "prompt_accepted", true);
@@ -2895,28 +3050,9 @@ export class AgentDaemon {
 						} else {
 							this.write(client, failure(command.id, "prompt", error, serializeDaemonError(error)));
 						}
-					});
+					})
+					.finally(clearAdmission);
 				return undefined;
-			}
-
-			case "prompt_and_wait": {
-				const state = this.getBoundSessionState(command.activeSessionId);
-				await this.promptWithAgentMessagePreparingGuard(state, command.message, {
-					content: command.content,
-					images: command.images,
-					streamingBehavior: command.streamingBehavior,
-					queueIfBusy: command.queueIfBusy ?? command.streamingBehavior !== undefined,
-					resumeIfIdle: command.streamingBehavior !== undefined,
-					expandPromptTemplates: command.expandPromptTemplates,
-					skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
-					source: command.source,
-					preflightResult: (didSucceed) => {
-						if (didSucceed) {
-							this.recordWorkerRecoveryState(state, "prompt_accepted", true);
-						}
-					},
-				});
-				return success(command.id, command.type);
 			}
 
 			case "steer": {
@@ -4487,11 +4623,21 @@ export class AgentDaemon {
 		return undefined;
 	}
 
+	private abortWaitingPromptAdmissionsForSession(activeSessionId: string): void {
+		for (const admission of this.promptAdmissions.values()) {
+			if (admission.activeSessionId === activeSessionId && admission.status === "waiting") {
+				admission.status = "cancelled";
+				admission.controller?.abort();
+			}
+		}
+	}
+
 	private async closeSession(
 		state: ActiveSessionState,
 		reason: DaemonSessionClosedReason,
 		waitForAbort = true,
 	): Promise<void> {
+		this.abortWaitingPromptAdmissionsForSession(state.activeSessionId);
 		for (const client of state.clients) {
 			this.abortSideQuestionsFor(client, state.activeSessionId);
 		}

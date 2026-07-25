@@ -512,6 +512,8 @@ export interface PromptOptions {
 	skipInputHandlers?: boolean;
 	/** Cancel this prompt while it is waiting for direct-turn admission. */
 	signal?: AbortSignal;
+	/** Internal host hook fired at the direct-turn ownership commit point. */
+	admissionCommitted?: () => void;
 	agentMessageId?: string;
 	content?: (TextContent | ImageContent)[];
 	customMessage?: CustomMessage;
@@ -577,6 +579,8 @@ function waitForPromptAdmission<T>(promise: Promise<T>, signal: AbortSignal | un
 		};
 		const cleanup = () => signal.removeEventListener("abort", onAbort);
 		signal.addEventListener("abort", onAbort, { once: true });
+		// Close the listener-registration race before observing the awaited work.
+		if (signal.aborted) return onAbort();
 		promise.then(
 			(value) => {
 				cleanup();
@@ -4029,6 +4033,8 @@ export class AgentSession {
 	): Promise<void> {
 		if (!this.isStreaming && options?.resumeIfIdle) this._sessionInputPumpSuspended = false;
 		const admission = await this._acquireDirectTurnAdmission({ allowStreaming: true, signal: options?.signal });
+		throwIfPromptAdmissionCancelled(options?.signal);
+		options?.admissionCommitted?.();
 		try {
 			await this._turnAdmissionContext.run(admission.owner, () =>
 				this._promptInjectedMessageUnserialized(text, message, options, admission.release),
@@ -4166,6 +4172,10 @@ export class AgentSession {
 			? await this._acquireDirectTurnAdmission({ signal: options?.signal })
 			: undefined;
 		const releaseAdmission = admission?.release ?? (() => {});
+		// Streaming prompts skip direct-turn admission but still transfer ownership
+		// before any queue/interception work begins.
+		throwIfPromptAdmissionCancelled(options?.signal);
+		options?.admissionCommitted?.();
 		try {
 			if (admission) {
 				await this._turnAdmissionContext.run(admission.owner, () =>

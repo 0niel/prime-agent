@@ -45,6 +45,7 @@ import {
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_SCHEMA_ID,
+	DAEMON_SCHEMA_REVISION,
 	type DaemonAttachResult,
 	type DaemonClientCapability,
 	type DaemonClosingReason,
@@ -120,6 +121,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"kill",
 	"rename",
 	"prompt",
+	"cancel_prompt_admission",
 	"prompt_and_wait",
 	"steer",
 	"follow_up",
@@ -264,6 +266,17 @@ interface WorkerAttachData {
 	releaseTranscript?: () => void;
 }
 
+interface SupervisorPromptAdmission {
+	client: DaemonSocketClient;
+	activeSessionId: string;
+	publicAdmissionId: string;
+	workerAdmissionId: string;
+	status: "waiting" | "owned" | "cancelled";
+	controller: AbortController;
+	worker?: ResidentWorker;
+	workerActiveSessionId?: string;
+}
+
 class SupervisorRecoveryCancelledError extends Error {
 	readonly code = "supervisor_recovery_cancelled" as const;
 }
@@ -293,6 +306,30 @@ function isSupervisorShutdownAdmissionCancelled(error: unknown): boolean {
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+function waitForSupervisorPromptAdmission<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) return Promise.reject(new Error("Prompt admission was cancelled."));
+	return new Promise<T>((resolve, reject) => {
+		const cleanup = () => signal.removeEventListener("abort", onAbort);
+		const onAbort = () => {
+			cleanup();
+			reject(new Error("Prompt admission was cancelled."));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) return onAbort();
+		promise.then(
+			(value) => {
+				cleanup();
+				resolve(value);
+			},
+			(error: unknown) => {
+				cleanup();
+				reject(error);
+			},
+		);
+	});
 }
 
 function unrefDelay(ms: number): Promise<void> {
@@ -541,6 +578,8 @@ export class DaemonSupervisor {
 	private readonly protocolClientIds = new WeakMap<DaemonSocketClient, string>();
 	private readonly workers = new Map<string, ResidentWorker>();
 	private readonly openingWorkers = new Map<string, Promise<ResidentWorker>>();
+	/** Public admission ids are scoped to the socket that registered them. */
+	private readonly promptAdmissions = new Map<DaemonSocketClient, Map<string, SupervisorPromptAdmission>>();
 	private readonly signalCleanupHandlers: Array<() => void> = [];
 	private readonly descriptorDir: string;
 	private readonly generation = randomUUID();
@@ -822,6 +861,7 @@ export class DaemonSupervisor {
 						socketPath: this.socketPath,
 						protocol: DAEMON_PROTOCOL_INFO,
 						schemaId: DAEMON_SCHEMA_ID,
+						schemaRevision: DAEMON_SCHEMA_REVISION,
 						appVersion: VERSION,
 						runtime: getDaemonRuntimeIdentity(),
 						supervisorGeneration: this.generation,
@@ -846,6 +886,7 @@ export class DaemonSupervisor {
 			cleaned = true;
 			client.detachInput();
 			this.clients.delete(client);
+			this.cancelWaitingPromptAdmissionsForClient(client);
 			for (const activeSessionId of [...client.attachedActiveSessionIds]) {
 				client.attachedActiveSessionIds.delete(activeSessionId);
 				void this.syncWorkerExtensionUi(activeSessionId);
@@ -914,46 +955,147 @@ export class DaemonSupervisor {
 		worker.ownerCleanupTimer.unref();
 	}
 
-	private async handleLine(client: DaemonSocketClient, line: string): Promise<void> {
-		try {
-			await this.ready;
-		} catch {
-			return;
+	private promptAdmissionKey(activeSessionId: string, publicAdmissionId: string): string {
+		return `${activeSessionId}\0${publicAdmissionId}`;
+	}
+
+	private promptAdmissionsFor(client: DaemonSocketClient): Map<string, SupervisorPromptAdmission> {
+		let admissions = this.promptAdmissions.get(client);
+		if (!admissions) {
+			admissions = new Map();
+			this.promptAdmissions.set(client, admissions);
 		}
-		let command: DaemonCommand;
-		let envelopeClientId: string | undefined;
+		return admissions;
+	}
+
+	private getPromptAdmission(
+		client: DaemonSocketClient,
+		activeSessionId: string,
+		publicAdmissionId: string,
+	): SupervisorPromptAdmission | undefined {
+		return this.promptAdmissions.get(client)?.get(this.promptAdmissionKey(activeSessionId, publicAdmissionId));
+	}
+
+	private deletePromptAdmission(admission: SupervisorPromptAdmission): void {
+		const admissions = this.promptAdmissions.get(admission.client);
+		const key = this.promptAdmissionKey(admission.activeSessionId, admission.publicAdmissionId);
+		if (admissions?.get(key) !== admission) return;
+		admissions.delete(key);
+		if (admissions.size === 0) this.promptAdmissions.delete(admission.client);
+	}
+
+	private cancelWaitingPromptAdmissionsForClient(client: DaemonSocketClient): void {
+		for (const admission of this.promptAdmissions.get(client)?.values() ?? []) {
+			if (admission.status !== "waiting") continue;
+			if (!admission.worker || !admission.workerActiveSessionId) {
+				admission.status = "cancelled";
+				admission.controller.abort();
+				continue;
+			}
+			const worker = admission.worker;
+			const workerActiveSessionId = admission.workerActiveSessionId;
+			void this.forwardToWorker(worker, {
+				type: "cancel_prompt_admission",
+				activeSessionId: workerActiveSessionId,
+				admissionId: admission.workerAdmissionId,
+			})
+				.then((response) => {
+					if (admission.status !== "waiting") return;
+					const status =
+						response.success && response.data && typeof response.data === "object" && "status" in response.data
+							? (response.data as { status?: unknown }).status
+							: undefined;
+					if (status === "owned") admission.status = "owned";
+					else if (status === "cancelled") admission.status = "cancelled";
+				})
+				.catch((error: unknown) => {
+					this.log(
+						`Could not cancel prompt admission ${admission.workerAdmissionId} on disconnected client: ${String(error)}`,
+					);
+				});
+		}
+	}
+
+	/** Non-async by design: prompt registration completes before handleLine's first await. */
+	private parseCommandAndRegisterPromptAdmission(
+		client: DaemonSocketClient,
+		line: string,
+	): {
+		command: DaemonCommand;
+		envelopeClientId?: string;
+		admission?: SupervisorPromptAdmission;
+	} {
+		const parsed = JSON.parse(line) as unknown;
+		const command = (
+			isDaemonCommandEnvelope(parsed) ? { ...parsed.command, id: parsed.id } : parsed
+		) as DaemonCommand;
+		let admission: SupervisorPromptAdmission | undefined;
+		if ((command.type === "prompt" || command.type === "prompt_and_wait") && command.admissionId !== undefined) {
+			if (typeof command.activeSessionId !== "string" || typeof command.admissionId !== "string") {
+				throw new Error("Prompt admission requires string activeSessionId and admissionId");
+			}
+			if (command.admissionId === "") throw new Error("admissionId must not be empty");
+			const admissions = this.promptAdmissionsFor(client);
+			const key = this.promptAdmissionKey(command.activeSessionId, command.admissionId);
+			if (admissions.has(key)) {
+				throw new Error(`Prompt admission id is already in use: ${command.admissionId}`);
+			}
+			admission = {
+				client,
+				activeSessionId: command.activeSessionId,
+				publicAdmissionId: command.admissionId,
+				workerAdmissionId: `supervisor-admission:${randomUUID()}`,
+				status: "waiting",
+				controller: new AbortController(),
+			};
+			admissions.set(key, admission);
+		}
+		return {
+			command,
+			envelopeClientId: isDaemonCommandEnvelope(parsed) ? (parsed.clientId ?? client.id) : undefined,
+			admission,
+		};
+	}
+
+	private async handleLine(client: DaemonSocketClient, line: string): Promise<void> {
+		let preParsed: ReturnType<DaemonSupervisor["parseCommandAndRegisterPromptAdmission"]>;
 		try {
-			const parsed = JSON.parse(line) as unknown;
-			const candidate = isDaemonCommandEnvelope(parsed)
-				? { ...parsed.command, id: parsed.id }
-				: (parsed as { id?: unknown; type?: unknown });
-			if (isDaemonCommandEnvelope(parsed)) {
-				envelopeClientId = parsed.clientId ?? client.id;
-				this.protocolClientIds.set(client, envelopeClientId);
-				client.id = envelopeClientId;
-			}
-			this.cancelOwnedWorkerCleanup(client.id);
-			if (typeof candidate.type !== "string" || !DAEMON_COMMAND_TYPES.has(candidate.type)) {
-				const commandName = typeof candidate.type === "string" ? candidate.type : "unknown";
-				this.write(
-					client,
-					failure(
-						typeof candidate.id === "string" ? candidate.id : undefined,
-						commandName,
-						`Unknown daemon command: ${commandName}`,
-					),
-				);
-				return;
-			}
-			command = candidate as DaemonCommand;
+			preParsed = this.parseCommandAndRegisterPromptAdmission(client, line);
 		} catch (error) {
 			this.write(client, failure(undefined, "parse", error));
 			return;
 		}
+		const command = preParsed.command;
+		const parsedAdmission = preParsed.admission;
+		if (command.type === "cancel_prompt_admission") {
+			const admission = this.getPromptAdmission(client, command.activeSessionId, command.admissionId);
+			if (admission?.status === "waiting" && !admission.worker) {
+				admission.status = "cancelled";
+				admission.controller.abort();
+			}
+		}
+		try {
+			await waitForSupervisorPromptAdmission(this.ready, parsedAdmission?.controller.signal);
+		} catch (error) {
+			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+			this.write(client, failure(command.id, command.type, error));
+			return;
+		}
+		const envelopeClientId = preParsed.envelopeClientId;
+		if (envelopeClientId) {
+			this.protocolClientIds.set(client, envelopeClientId);
+			client.id = envelopeClientId;
+		}
+		this.cancelOwnedWorkerCleanup(client.id);
+		if (!DAEMON_COMMAND_TYPES.has(command.type)) {
+			this.write(client, failure(command.id, command.type, `Unknown daemon command: ${command.type}`));
+			return;
+		}
 
 		try {
-			await this.assertCurrentOwnership();
+			await waitForSupervisorPromptAdmission(this.assertCurrentOwnership(), parsedAdmission?.controller.signal);
 		} catch (error) {
+			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 			this.write(client, failure(command.id, command.type, error));
 			return;
 		}
@@ -965,10 +1107,12 @@ export class DaemonSupervisor {
 		if (journalIdentity) {
 			const existing = this.commandJournal.begin(journalIdentity.clientId, journalIdentity.commandId, command.type);
 			if (existing.status === "complete") {
+				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 				this.write(client, existing.response);
 				return;
 			}
 			if (existing.status === "pending") {
+				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 				this.write(
 					client,
 					failure(command.id, command.type, "The previous command result is uncertain and was not replayed", {
@@ -1009,6 +1153,27 @@ export class DaemonSupervisor {
 		command: DaemonCommand,
 	): Promise<DaemonResponse | undefined> {
 		switch (command.type) {
+			case "cancel_prompt_admission": {
+				const admission = this.getPromptAdmission(client, command.activeSessionId, command.admissionId);
+				if (!admission) return success(command.id, command.type, { status: "unknown" as const });
+				if (admission.status === "owned") return success(command.id, command.type, { status: "owned" as const });
+				if (!admission.worker || !admission.workerActiveSessionId) {
+					admission.status = "cancelled";
+					admission.controller.abort();
+					return success(command.id, command.type, { status: "cancelled" as const });
+				}
+				const response = await this.forwardToWorker(admission.worker, {
+					...command,
+					activeSessionId: admission.workerActiveSessionId,
+					admissionId: admission.workerAdmissionId,
+				});
+				const status =
+					response.success && response.data && typeof response.data === "object" && "status" in response.data
+						? (response.data as { status: "cancelled" | "owned" | "unknown" }).status
+						: "unknown";
+				admission.status = status === "owned" ? "owned" : status === "cancelled" ? "cancelled" : "waiting";
+				return { ...response, id: command.id };
+			}
 			case "ack_result":
 				this.commandJournal.acknowledge(client.id, command.commandId);
 				return undefined;
@@ -1386,25 +1551,45 @@ export class DaemonSupervisor {
 		if (!("activeSessionId" in command) || typeof command.activeSessionId !== "string") {
 			throw new Error(`Supervisor cannot route daemon command: ${command.type}`);
 		}
-		const match = await this.findWorkerForClient(client, command.activeSessionId);
-		const resolvedCommand = {
-			...command,
-			activeSessionId: match.summary.activeSessionId ?? match.summary.id,
-		} as DaemonCommand;
-		const isRootKill =
-			command.type === "kill" &&
-			(match.summary.activeSessionId ?? match.summary.id) === match.worker.descriptor.rootActiveSessionId;
-		if (!isRootKill) {
-			return this.forwardToWorker(match.worker, resolvedCommand);
-		}
-		this.persistWorkerStopTombstone(match.worker, true);
-		let response: DaemonResponse;
+		const admission =
+			(command.type === "prompt" || command.type === "prompt_and_wait") && command.admissionId
+				? this.getPromptAdmission(client, command.activeSessionId, command.admissionId)
+				: undefined;
 		try {
-			response = await this.forwardToWorker(match.worker, resolvedCommand);
+			if (admission?.status === "cancelled") throw new Error("Prompt admission was cancelled.");
+			const match = await waitForSupervisorPromptAdmission(
+				this.findWorkerForClient(client, command.activeSessionId),
+				admission?.controller.signal,
+			);
+			if ((admission as { status: string } | undefined)?.status === "cancelled") {
+				throw new Error("Prompt admission was cancelled.");
+			}
+			const resolvedCommand = {
+				...command,
+				activeSessionId: match.summary.activeSessionId ?? match.summary.id,
+				...(admission ? { admissionId: admission.workerAdmissionId } : {}),
+			} as DaemonCommand;
+			if (admission) {
+				admission.worker = match.worker;
+				admission.workerActiveSessionId = match.summary.activeSessionId ?? match.summary.id;
+			}
+			const isRootKill =
+				command.type === "kill" &&
+				(match.summary.activeSessionId ?? match.summary.id) === match.worker.descriptor.rootActiveSessionId;
+			if (!isRootKill) {
+				return await this.forwardToWorker(match.worker, resolvedCommand);
+			}
+			this.persistWorkerStopTombstone(match.worker, true);
+			let response: DaemonResponse;
+			try {
+				response = await this.forwardToWorker(match.worker, resolvedCommand);
+			} finally {
+				await this.stopWorker(match.worker, true, false, true);
+			}
+			return response;
 		} finally {
-			await this.stopWorker(match.worker, true, false, true);
+			if (admission) this.deletePromptAdmission(admission);
 		}
-		return response;
 	}
 
 	private async handleList(

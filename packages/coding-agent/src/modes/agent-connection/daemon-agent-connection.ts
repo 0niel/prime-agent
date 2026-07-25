@@ -27,6 +27,8 @@ import { deserializeDaemonError } from "../daemon/daemon-errors.js";
 import {
 	collectDaemonClientEnv,
 	collectDaemonLaunchEnv,
+	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_REVISION,
 	type DaemonAttachResult,
 	type DaemonCommand,
 	type DaemonEventCursor,
@@ -78,6 +80,7 @@ import type {
 	AgentConnectionToolDefinition,
 	AgentConnectionUserMessage,
 } from "./types.js";
+import { AgentConnectionPromptAdmissionError } from "./types.js";
 
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
@@ -723,33 +726,108 @@ export class DaemonAgentConnection implements AgentConnection {
 	}
 
 	async prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
-		await this.requestData<unknown>(
-			{
-				type: "prompt",
-				activeSessionId: this.activeSessionId,
-				message,
-				images: options?.images,
-				streamingBehavior: options?.streamingBehavior,
-				queueIfBusy: options?.queueIfBusy,
-				source: options?.source,
-			},
-			DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
-		);
+		await this.promptWithAdmissionCancellation("prompt", message, options);
 	}
 
 	async promptAndWait(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
-		await this.requestData<unknown>(
-			{
-				type: "prompt_and_wait",
-				activeSessionId: this.activeSessionId,
-				message,
-				images: options?.images,
-				streamingBehavior: options?.streamingBehavior,
-				queueIfBusy: options?.queueIfBusy,
-				source: options?.source,
+		await this.promptWithAdmissionCancellation("prompt_and_wait", message, options);
+	}
+
+	private async promptWithAdmissionCancellation(
+		type: "prompt" | "prompt_and_wait",
+		message: string,
+		options?: AgentConnectionPromptOptions,
+	): Promise<void> {
+		const signal = options?.signal;
+		if (signal?.aborted) {
+			throw new AgentConnectionPromptAdmissionError("Prompt admission was cancelled.", "cancelled");
+		}
+		if (!signal) {
+			await this.requestData<unknown>(
+				{
+					type,
+					activeSessionId: this.activeSessionId,
+					message,
+					images: options?.images,
+					streamingBehavior: options?.streamingBehavior,
+					queueIfBusy: options?.queueIfBusy,
+					source: options?.source,
+				},
+				DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
+			);
+			return;
+		}
+		const hello = this.client.hello ?? (await this.client.waitForHello());
+		if (
+			hello.protocol.version < DAEMON_PROTOCOL_VERSION ||
+			hello.schemaRevision !== DAEMON_SCHEMA_REVISION ||
+			!this.client.supportsServerCapability("prompt_admission_cancellation")
+		) {
+			throw new AgentConnectionPromptAdmissionError(
+				"Startup prompt cancellation requires daemon protocol 5, schema 4, and prompt_admission_cancellation.",
+				"unsupported",
+			);
+		}
+
+		const admissionId = `prompt-admission:${randomUUID()}`;
+		let resolveAbort = () => {};
+		const aborted = new Promise<"abort">((resolve) => {
+			resolveAbort = () => resolve("abort");
+		});
+		const onAbort = () => resolveAbort();
+		signal.addEventListener("abort", onAbort, { once: true });
+		// Close the listener-registration race before issuing the first request.
+		if (signal.aborted) {
+			signal.removeEventListener("abort", onAbort);
+			throw new AgentConnectionPromptAdmissionError("Prompt admission was cancelled.", "cancelled");
+		}
+		const command = {
+			type,
+			activeSessionId: this.activeSessionId,
+			message,
+			images: options.images,
+			streamingBehavior: options.streamingBehavior,
+			queueIfBusy: options.queueIfBusy,
+			source: options.source,
+			admissionId,
+		} as Extract<DaemonCommandBody, { type: typeof type }>;
+		let promptError: unknown;
+		const promptRequest = this.requestData<unknown>(command, DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS, {
+			requiredSchema: {
+				protocol: DAEMON_PROTOCOL_VERSION,
+				revision: DAEMON_SCHEMA_REVISION,
+				capability: "prompt_admission_cancellation",
 			},
-			DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS,
-		);
+		}).catch((error: unknown) => {
+			promptError = error;
+			return "failed" as const;
+		});
+		try {
+			const first = await Promise.race([promptRequest.then(() => "settled" as const), aborted]);
+			if (first === "settled" && promptError === undefined) return;
+			let status: "cancelled" | "owned" | "unknown" = "unknown";
+			try {
+				const result = await this.requestData<{ status: "cancelled" | "owned" | "unknown" }>({
+					type: "cancel_prompt_admission",
+					activeSessionId: this.activeSessionId,
+					admissionId,
+				});
+				status = result.status;
+			} catch {
+				// Timeout/transport is indistinguishable from accepted ownership.
+			}
+			if (status === "owned") {
+				await promptRequest;
+				if (promptError === undefined) return;
+			}
+			throw new AgentConnectionPromptAdmissionError(
+				promptError instanceof Error ? promptError.message : "Prompt admission did not complete.",
+				status,
+				promptError === undefined ? undefined : { cause: promptError },
+			);
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
 	}
 
 	async startSideQuestion(
@@ -1297,8 +1375,12 @@ export class DaemonAgentConnection implements AgentConnection {
 		return response.data as T;
 	}
 
-	private async requestData<T>(command: DaemonCommandBody, timeoutMs?: number): Promise<T> {
-		const response = await this.client.request(command, timeoutMs);
+	private async requestData<T>(
+		command: DaemonCommandBody,
+		timeoutMs?: number,
+		options?: Parameters<DaemonClient["request"]>[2],
+	): Promise<T> {
+		const response = await this.client.request(command, timeoutMs, options);
 		if (!response.success) {
 			throw deserializeDaemonError(response);
 		}

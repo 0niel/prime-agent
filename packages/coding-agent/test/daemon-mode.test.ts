@@ -4791,6 +4791,165 @@ describe("daemon mode helpers", () => {
 		});
 	});
 
+	it("cancels only pre-ownership prompt admission and cleans up its controller", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		let promptOptions: { signal?: AbortSignal; admissionCommitted?: () => void } | undefined;
+		let rejectPrompt: ((error: Error) => void) | undefined;
+		const promptUntilAccepted = vi.fn(
+			async (_message: string, options?: { signal?: AbortSignal; admissionCommitted?: () => void }) => {
+				promptOptions = options;
+				await new Promise<void>((_resolve, reject) => {
+					rejectPrompt = reject;
+					options?.signal?.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+				});
+			},
+		);
+		const state = makeState("active-1") as ActiveSessionState & {
+			runtime: ActiveSessionState["runtime"] & { session: { promptUntilAccepted: typeof promptUntilAccepted } };
+		};
+		state.runtime = { ...state.runtime, session: { promptUntilAccepted } } as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			promptAdmissions: Map<string, unknown>;
+			parseCommandAndRegisterPromptAdmission(line: string): unknown;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		const client = makeClient("client-1", state.activeSessionId);
+		client.socket = { destroyed: false, write: vi.fn(() => true) } as unknown as Socket;
+
+		internals.parseCommandAndRegisterPromptAdmission(
+			JSON.stringify({
+				type: "prompt",
+				activeSessionId: state.activeSessionId,
+				message: "blocked",
+				admissionId: "admission-1",
+			}),
+		);
+		internals.handleCommand(client, {
+			id: "prompt-1",
+			type: "prompt",
+			activeSessionId: state.activeSessionId,
+			message: "blocked",
+			admissionId: "admission-1",
+		});
+		await vi.waitFor(() => expect(promptUntilAccepted).toHaveBeenCalledOnce());
+		await expect(
+			internals.handleCommand(client, {
+				id: "cancel-1",
+				type: "cancel_prompt_admission",
+				activeSessionId: state.activeSessionId,
+				admissionId: "admission-1",
+			}),
+		).resolves.toMatchObject({ success: true, data: { status: "cancelled" } });
+		await vi.waitFor(() => expect(internals.promptAdmissions.size).toBe(0));
+
+		// Once ownership commits the same cancellation is a no-op.
+		internals.parseCommandAndRegisterPromptAdmission(
+			JSON.stringify({
+				type: "prompt",
+				activeSessionId: state.activeSessionId,
+				message: "owned",
+				admissionId: "admission-2",
+			}),
+		);
+		internals.handleCommand(client, {
+			id: "prompt-2",
+			type: "prompt",
+			activeSessionId: state.activeSessionId,
+			message: "owned",
+			admissionId: "admission-2",
+		});
+		await vi.waitFor(() => expect(promptUntilAccepted).toHaveBeenCalledTimes(2));
+		promptOptions?.admissionCommitted?.();
+		await expect(
+			internals.handleCommand(client, {
+				id: "cancel-2",
+				type: "cancel_prompt_admission",
+				activeSessionId: state.activeSessionId,
+				admissionId: "admission-2",
+			}),
+		).resolves.toMatchObject({ success: true, data: { status: "owned" } });
+		rejectPrompt?.(new Error("test cleanup"));
+	});
+
+	it("settles cancellation while prompt routing waits on the target lock", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const promptUntilAccepted = vi.fn(async () => {});
+		const state = makeState("active-lock") as ActiveSessionState;
+		state.runtime = { ...state.runtime, session: { promptUntilAccepted } } as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			agentMessageTargetLocks: Map<string, Promise<void>>;
+			promptAdmissions: Map<string, unknown>;
+			parseCommandAndRegisterPromptAdmission(line: string): unknown;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		internals.agentMessageTargetLocks.set(state.activeSessionId, new Promise(() => {}));
+		internals.parseCommandAndRegisterPromptAdmission(
+			JSON.stringify({
+				type: "prompt",
+				activeSessionId: state.activeSessionId,
+				message: "blocked",
+				admissionId: "lock-admission",
+			}),
+		);
+		const client = makeClient("client-lock", state.activeSessionId);
+		client.socket = { destroyed: false, write: vi.fn(() => true) } as unknown as Socket;
+		internals.handleCommand(client, {
+			type: "prompt",
+			activeSessionId: state.activeSessionId,
+			message: "blocked",
+			admissionId: "lock-admission",
+		});
+		await expect(
+			internals.handleCommand(client, {
+				type: "cancel_prompt_admission",
+				activeSessionId: state.activeSessionId,
+				admissionId: "lock-admission",
+			}),
+		).resolves.toMatchObject({ data: { status: "cancelled" } });
+		await vi.waitFor(() => expect(internals.promptAdmissions.size).toBe(0));
+		expect(promptUntilAccepted).not.toHaveBeenCalled();
+	});
+
+	it("aborts waiting prompt admissions when their session closes", () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const internals = daemon as unknown as {
+			promptAdmissions: Map<string, { status: string; controller?: AbortController }>;
+			parseCommandAndRegisterPromptAdmission(line: string): unknown;
+			abortWaitingPromptAdmissionsForSession(activeSessionId: string): void;
+		};
+		internals.parseCommandAndRegisterPromptAdmission(
+			JSON.stringify({
+				type: "prompt",
+				activeSessionId: "closing-session",
+				message: "blocked",
+				admissionId: "closing-admission",
+			}),
+		);
+		const admission = [...internals.promptAdmissions.values()][0]!;
+		internals.abortWaitingPromptAdmissionsForSession("closing-session");
+		expect(admission.status).toBe("cancelled");
+		expect(admission.controller?.signal.aborted).toBe(true);
+	});
+
 	it("uses the queued default lane for old-client prompts on a new daemon", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },

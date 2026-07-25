@@ -73,3 +73,4 @@ export type {
 	AgentConnectionToolDefinition,
 	AgentConnectionUserMessage,
 } from "./types.js";
+export { AgentConnectionPromptAdmissionError } from "./types.js";

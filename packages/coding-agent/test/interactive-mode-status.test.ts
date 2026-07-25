@@ -38,6 +38,7 @@ import type {
 	AgentConnectionSourceInfo,
 	AgentConnectionState,
 } from "../src/modes/agent-connection/types.js";
+import { AgentConnectionPromptAdmissionError } from "../src/modes/agent-connection/types.js";
 import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import type { AuthenticationResult } from "../src/modes/interactive/auth-flows.js";
 import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.js";
@@ -2747,6 +2748,35 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		} finally {
 			vi.useRealTimers();
 		}
+	});
+
+	test("reports old-daemon admission once and preserves the startup prompt", async () => {
+		const inputDone = createDeferred<void>();
+		const prompt = vi.fn(async () => {
+			throw new AgentConnectionPromptAdmissionError("daemon upgrade required", "unsupported");
+		});
+		const fakeThis = Object.assign(
+			createSubmitHandlerHarness({
+				agentConnection: {
+					prompt,
+					executeBash: vi.fn(async () => {}),
+					getState: vi.fn(async () => ({ isBashRunning: false })),
+				},
+			}),
+			createStartupRunHarness(
+				{ initialMessage: "startup" },
+				{ getCurrentModel: () => primeModel, getUserInput: vi.fn(() => inputDone.promise) },
+			),
+		);
+
+		const run = InteractiveMode.prototype.run.call(fakeThis as never);
+		await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		expect(prompt).toHaveBeenCalledOnce();
+		expect(fakeThis.showError).toHaveBeenCalledWith("daemon upgrade required");
+		expect(fakeThis.promptStashState.stash).toEqual({ text: "startup", images: undefined });
+		inputDone.resolve(undefined);
+		await expect(run).resolves.toBe("agents_view");
 	});
 
 	test.each(["typing", "Alt+Enter"] as const)(
