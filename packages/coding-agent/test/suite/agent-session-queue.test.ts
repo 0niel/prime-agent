@@ -2809,5 +2809,4 @@ prepared:${event.prompt}`,
 			),
 		).toBe(true);
 	});
-
 });
