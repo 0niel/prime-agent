@@ -8,6 +8,7 @@ import {
 	type DaemonResponse,
 } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor, waitForSupervisorPromptAdmission } from "../src/modes/daemon/daemon-supervisor.js";
+import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
 
 interface AdmissionRecord {
 	client: DaemonSocketClient;
@@ -30,14 +31,17 @@ interface SupervisorHarness {
 interface Deferred<T> {
 	promise: Promise<T>;
 	resolve(value: T): void;
+	reject(error: unknown): void;
 }
 
 function deferred<T>(): Deferred<T> {
 	let resolve!: (value: T) => void;
-	const promise = new Promise<T>((resolvePromise) => {
+	let reject!: (error: unknown) => void;
+	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
 		resolve = resolvePromise;
+		reject = rejectPromise;
 	});
-	return { promise, resolve };
+	return { promise, resolve, reject };
 }
 
 function client(id: string): DaemonSocketClient {
@@ -74,7 +78,9 @@ function createHarness(
 		clients: new Set(),
 		protocolClientIds: new WeakMap(),
 		promptAdmissions: new Map(),
+		mutationDrain: new MutationDrainLatch(),
 		commandJournal: {
+			lookup: vi.fn(() => undefined),
 			begin: vi.fn(() => ({ status: "new" })),
 			recordResult: vi.fn(),
 			acknowledge: vi.fn(),
@@ -131,7 +137,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 		ownership.resolve();
 		await Promise.resolve();
 		expect(admissionFor(supervisor, owner)).toBe(admission);
-		workerLookup.resolve(Promise.reject(new Error("worker lookup stopped")));
+		workerLookup.reject(new Error("worker lookup stopped"));
 		await pendingPrompt;
 		expect(admissionFor(supervisor, owner)).toBeUndefined();
 	});
