@@ -90,6 +90,16 @@ afterEach(async () => {
 			await waitForExit(handle).catch(() => undefined);
 		}
 	}
+	// A worker or fixture can publish a replacement owner while the first cleanup
+	// sweep is stopping processes. Discover and stop that exact identity only after
+	// every tracked fixture handle has exited, before removing harness directories.
+	for (const registryDir of cleanupRegistryDirs) {
+		registerOwnerRecordsForCleanup(registryDir);
+	}
+	await cleanupRegisteredProcesses();
+	for (const registryDir of cleanupRegistryDirs) {
+		await removeDeadFixtureOwnerRecords(registryDir);
+	}
 	handles.clear();
 	cleanupProcesses.clear();
 	cleanupRegistryDirs.clear();
