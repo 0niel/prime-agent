@@ -437,8 +437,9 @@ async function removeDeadFixtureOwnerRecords(registryDir: string): Promise<void>
 		// A supervisor that just acknowledged shutdown can stay observable for a
 		// moment; wait for the exact identity to exit instead of refusing outright.
 		if (cleanupProcessState(identity) !== "exited") {
-			await forceShutdownReachableSupervisor(owner.socketPath);
-			await waitForCleanupProcessExit(identity);
+			registerCleanupProcess(identity);
+			cleanupSupervisorSockets.add(owner.socketPath);
+			await cleanupRegisteredProcesses();
 		}
 
 		const current = readOwnerRecord(registryDir, owner.generation);
