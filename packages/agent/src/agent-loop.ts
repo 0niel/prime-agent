@@ -412,9 +412,7 @@ async function runLoop(
 				return;
 			}
 			pendingMessages = steeringMessagesResult.value;
-			// Steering returned by the poll owns the turn boundary; a stop may only
-			// end the loop when the poll came back empty, or the drained messages
-			// would be dropped without ever being injected.
+			// Steering drained by this poll owns the turn boundary; stop only when it was empty.
 			if (pendingMessages.length === 0 && shouldStopBeforeTurn()) {
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
