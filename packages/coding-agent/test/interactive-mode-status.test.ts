@@ -2949,7 +2949,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		expect(prompt.mock.calls.map(([message]) => message)).toEqual(["owned startup", "next startup"]);
 		expect(fakeThis.promptStashState.stash).toBeUndefined();
 		inputDone.resolve(undefined);
-		await expect(run).resolves.toBe("agents_view");
+		await expect(run).resolves.toMatchObject({ type: "agents_view" });
 	});
 
 	test.each(["typing", "Alt+Enter"] as const)(
