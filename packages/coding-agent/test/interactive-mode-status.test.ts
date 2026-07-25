@@ -2915,7 +2915,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			expect(fakeThis.pastedImages.get(6)).toBe(firstImage);
 			expect(fakeThis.pastedImages.get(7)).toBe(secondImage);
 			inputDone.resolve(undefined);
-			await expect(run).resolves.toBe("agents_view");
+			await expect(run).resolves.toMatchObject({ type: "agents_view" });
 		},
 	);
 
@@ -3071,7 +3071,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		expect(blockedSignal?.aborted).toBe(false);
 		inputDone.resolve(undefined);
 
-		await expect(run).resolves.toBe("agents_view");
+		await expect(run).resolves.toMatchObject({ type: "agents_view" });
 		expect(blockedSignal?.aborted).toBe(true);
 		expect(fakeThis.showError).not.toHaveBeenCalled();
 	});
@@ -3130,7 +3130,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			fakeThis.isShuttingDown = true;
 			inputDone.resolve(undefined);
 
-			await expect(run).resolves.toBe("agents_view");
+			await expect(run).resolves.toMatchObject({ type: "agents_view" });
 			await submission;
 
 			expect(fakeThis.agentConnection.prompt).not.toHaveBeenCalled();
