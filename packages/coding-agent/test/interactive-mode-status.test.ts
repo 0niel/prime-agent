@@ -2823,6 +2823,39 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		},
 	);
 
+	test("does not retain a startup prompt already owned by the session", async () => {
+		const inputDone = createDeferred<void>();
+		const prompt = vi
+			.fn()
+			.mockRejectedValueOnce(new AgentConnectionPromptAdmissionError("session owns prompt", "owned"))
+			.mockResolvedValueOnce(undefined);
+		const submitHarness = createSubmitHandlerHarness({
+			agentConnection: {
+				prompt,
+				executeBash: vi.fn(async () => {}),
+				getState: vi.fn(async () => ({ isBashRunning: false })),
+			},
+		});
+		const fakeThis = Object.assign(
+			submitHarness,
+			createStartupRunHarness(
+				{ initialMessages: ["owned startup", "next startup"] },
+				{
+					getCurrentModel: () => primeModel,
+					getUserInput: vi.fn(() => inputDone.promise),
+					agentConnection: submitHarness.agentConnection,
+				},
+			),
+		);
+
+		const run = InteractiveMode.prototype.run.call(fakeThis as never);
+		await vi.waitFor(() => expect(prompt).toHaveBeenCalledTimes(2));
+		expect(prompt.mock.calls.map(([message]) => message)).toEqual(["owned startup", "next startup"]);
+		expect(fakeThis.promptStashState.stash).toBeUndefined();
+		inputDone.resolve(undefined);
+		await expect(run).resolves.toBe("agents_view");
+	});
+
 	test.each(["typing", "Alt+Enter"] as const)(
 		"preserves %s during the startup admission barrier",
 		async (scenario) => {

@@ -159,6 +159,52 @@ describe("daemon supervisor prompt admission ownership", () => {
 		expect(admissionFor(supervisor, owner)).toBeUndefined();
 	});
 
+	it("returns the captured outcome when cancellation handling follows prompt cleanup", async () => {
+		const cancelOwnership = deferred<void>();
+		let ownershipChecks = 0;
+		const workerPrompt = deferred<DaemonResponse>();
+		const worker = { descriptor: { lifecycle: "ready", rootActiveSessionId: "worker-session" } };
+		const supervisor = createHarness({
+			assertCurrent: () => (++ownershipChecks === 1 ? Promise.resolve() : cancelOwnership.promise),
+			findWorker: vi.fn(async () => ({
+				worker,
+				summary: { id: "worker-session", activeSessionId: "worker-session" },
+			})),
+			forwardToWorker: vi.fn(async () => workerPrompt.promise),
+		});
+		const owner = client("connection-owner");
+		const pendingPrompt = supervisor.handleLine(
+			owner,
+			JSON.stringify({
+				id: "prompt-1",
+				type: "prompt",
+				activeSessionId: "session-1",
+				admissionId: "public-admission",
+				message: "hello",
+			} satisfies DaemonCommand),
+		);
+		await waitFor(() => admissionFor(supervisor, owner)?.worker !== undefined);
+		const pendingCancel = supervisor.handleLine(
+			owner,
+			JSON.stringify({
+				id: "cancel-1",
+				type: "cancel_prompt_admission",
+				activeSessionId: "session-1",
+				admissionId: "public-admission",
+			} satisfies DaemonCommand),
+		);
+		workerPrompt.resolve({ type: "response", command: "prompt", success: true });
+		await pendingPrompt;
+		expect(admissionFor(supervisor, owner)).toBeUndefined();
+		cancelOwnership.resolve();
+		await pendingCancel;
+
+		expect((supervisor as unknown as { write: ReturnType<typeof vi.fn> }).write).toHaveBeenLastCalledWith(
+			owner,
+			expect.objectContaining({ success: true, data: { status: "owned" } }),
+		);
+	});
+
 	it("isolates public ids by connection and forwards only opaque worker ids", async () => {
 		const ownerA = client("connection-a");
 		const ownerB = client("connection-b");

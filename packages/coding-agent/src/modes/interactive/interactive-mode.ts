@@ -1559,6 +1559,11 @@ export class InteractiveMode {
 					if (startupPromptsDone || startupAdmissionAbort.signal.aborted) return;
 					// An uncertain daemon admission may already be session-owned. Retrying
 					// would duplicate it; only an acknowledged pre-ownership cancellation is safe.
+					if (error instanceof AgentConnectionPromptAdmissionError && error.status === "owned") {
+						failures = 0;
+						next++;
+						continue;
+					}
 					if (error instanceof AgentConnectionPromptAdmissionError && !error.cancelled) {
 						// This attempt may already be session-owned, so never retry it. Preserve
 						// it and every not-yet-attempted startup prompt in original order.

@@ -1554,13 +1554,13 @@ describe("AgentSession queue characterization", () => {
 
 		expect(harness.session.getSteeringMessages()).toEqual([]);
 		expect(internals._steeringStopPending).toBe(true);
-		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: [] });
-		expect(internals._steeringStopPending).toBe(true);
+		expect(harness.session.clearQueue()).toEqual({ steering: ["active steering"], followUp: [] });
+		expect(internals._steeringStopPending).toBe(false);
 
 		hook.release();
 		await harness.session.waitForIdle();
 		expect(internals._steeringStopPending).toBe(false);
-		expect(getUserTexts(harness)).toEqual(["active steering"]);
+		expect(getUserTexts(harness)).toEqual([]);
 	});
 
 	it.each([

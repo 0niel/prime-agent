@@ -200,6 +200,7 @@ export class DaemonAgentConnection implements AgentConnection {
 	private readonly snapshotRecoveryPromises = new Map<string, Promise<void>>();
 	private readonly ignoredSnapshotIds = new Set<string>();
 	private reconnectPromise?: Promise<void>;
+	private readonly definitiveRequestErrors = new WeakSet<Error>();
 	private disposing = false;
 	private disposed = false;
 
@@ -805,6 +806,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		try {
 			const first = await Promise.race([promptRequest.then(() => "settled" as const), aborted]);
 			if (first === "settled" && promptError === undefined) return;
+			if (
+				first === "settled" &&
+				!signal.aborted &&
+				promptError instanceof Error &&
+				this.definitiveRequestErrors.has(promptError)
+			) {
+				throw promptError;
+			}
 			let status: "cancelled" | "owned" | "unknown" = "unknown";
 			try {
 				const result = await this.requestData<{ status: "cancelled" | "owned" | "unknown" }>({
@@ -818,7 +827,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			}
 			if (status === "owned") {
 				await promptRequest;
-				if (promptError === undefined) return;
+				if (promptError === undefined || type === "prompt") return;
 			}
 			throw new AgentConnectionPromptAdmissionError(
 				promptError instanceof Error ? promptError.message : "Prompt admission did not complete.",
@@ -1382,7 +1391,9 @@ export class DaemonAgentConnection implements AgentConnection {
 	): Promise<T> {
 		const response = await this.client.request(command, timeoutMs, options);
 		if (!response.success) {
-			throw deserializeDaemonError(response);
+			const error = deserializeDaemonError(response);
+			this.definitiveRequestErrors.add(error);
+			throw error;
 		}
 		if (invalidatesCachedSnapshot(command.type)) {
 			this.latestSnapshotIsFresh = false;

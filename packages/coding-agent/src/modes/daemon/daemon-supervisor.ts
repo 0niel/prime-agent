@@ -1067,12 +1067,13 @@ export class DaemonSupervisor {
 		}
 		const command = preParsed.command;
 		const parsedAdmission = preParsed.admission;
-		if (command.type === "cancel_prompt_admission") {
-			const admission = this.getPromptAdmission(client, command.activeSessionId, command.admissionId);
-			if (admission?.status === "waiting" && !admission.worker) {
-				admission.status = "cancelled";
-				admission.controller.abort();
-			}
+		const cancellationAdmission =
+			command.type === "cancel_prompt_admission"
+				? this.getPromptAdmission(client, command.activeSessionId, command.admissionId)
+				: undefined;
+		if (cancellationAdmission?.status === "waiting" && !cancellationAdmission.worker) {
+			cancellationAdmission.status = "cancelled";
+			cancellationAdmission.controller.abort();
 		}
 		try {
 			await waitForSupervisorPromptAdmission(this.ready, parsedAdmission?.controller.signal);
@@ -1125,7 +1126,7 @@ export class DaemonSupervisor {
 		}
 
 		try {
-			const response = await this.handleCommand(client, command);
+			const response = await this.handleCommand(client, command, cancellationAdmission);
 			if (response) {
 				if (journalIdentity) {
 					await this.assertCurrentOwnership();
@@ -1151,10 +1152,12 @@ export class DaemonSupervisor {
 	private async handleCommand(
 		client: DaemonSocketClient,
 		command: DaemonCommand,
+		cancellationAdmission?: SupervisorPromptAdmission,
 	): Promise<DaemonResponse | undefined> {
 		switch (command.type) {
 			case "cancel_prompt_admission": {
-				const admission = this.getPromptAdmission(client, command.activeSessionId, command.admissionId);
+				const admission =
+					cancellationAdmission ?? this.getPromptAdmission(client, command.activeSessionId, command.admissionId);
 				if (!admission) return success(command.id, command.type, { status: "unknown" as const });
 				if (admission.status === "owned") return success(command.id, command.type, { status: "owned" as const });
 				if (!admission.worker || !admission.workerActiveSessionId) {
@@ -1577,7 +1580,9 @@ export class DaemonSupervisor {
 				command.type === "kill" &&
 				(match.summary.activeSessionId ?? match.summary.id) === match.worker.descriptor.rootActiveSessionId;
 			if (!isRootKill) {
-				return await this.forwardToWorker(match.worker, resolvedCommand);
+				const response = await this.forwardToWorker(match.worker, resolvedCommand);
+				if (admission && response.success) admission.status = "owned";
+				return response;
 			}
 			this.persistWorkerStopTombstone(match.worker, true);
 			let response: DaemonResponse;

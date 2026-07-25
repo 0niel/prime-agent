@@ -50,6 +50,7 @@ class FakeDaemonClient {
 	cronAddGate: Promise<void> | undefined;
 	promptGate: Promise<void> | undefined;
 	promptError: Error | undefined;
+	promptResponseError: string | undefined;
 	cancelPromptAdmissionStatus: "cancelled" | "owned" | "unknown" = "owned";
 	legacyHeartbeatCommandsSupported = false;
 	serverCapabilities = new Set<string>();
@@ -76,6 +77,9 @@ class FakeDaemonClient {
 			case "prompt":
 				if (this.promptGate) await this.promptGate;
 				if (this.promptError) throw this.promptError;
+				if (this.promptResponseError) {
+					return { type: "response", command: command.type, success: false, error: this.promptResponseError };
+				}
 				return { type: "response", command: command.type, success: true };
 			case "prompt_and_wait":
 				if (this.promptGate) await this.promptGate;
@@ -751,6 +755,18 @@ describe("DaemonAgentConnection", () => {
 		expect(add).toHaveBeenCalledOnce();
 		expect(remove).toHaveBeenCalledOnce();
 		expect(remove.mock.calls[0]?.[1]).toBe(add.mock.calls[0]?.[1]);
+	});
+
+	it("preserves a definitive prompt rejection when the signal remains live", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("prompt_admission_cancellation");
+		fakeClient.promptResponseError = "session rejected prompt";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await expect(connection.prompt("startup", { signal: new AbortController().signal })).rejects.toEqual(
+			new Error("session rejected prompt"),
+		);
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["prompt"]);
 	});
 
 	it("sends zero requests for a pre-aborted prompt", async () => {

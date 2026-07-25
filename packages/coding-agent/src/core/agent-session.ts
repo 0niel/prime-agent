@@ -1908,6 +1908,7 @@ export class AgentSession {
 			this._activeSessionInput?.kind === "prompt" &&
 			this._activeSessionInput.lane === "steer" &&
 			this._activeSessionInput.phase === "preparing" &&
+			!this._activeSessionInput.cancelled &&
 			this._activeSessionInput.items.length > 0;
 		this._steeringStopPending = this._steeringMessages.length > 0 || activeSteeringHandoff;
 	}
@@ -1924,7 +1925,7 @@ export class AgentSession {
 			if (this._accountGoalUsageForAssistantMessage(context.message)) {
 				const message = createGoalContextMessage(this._goalState, "budget_limit");
 				const normalized = normalizeMessageContent(message.content);
-				await this._queueSteer(normalized.text, normalized.images, {
+				await this._queuePreparedPrompt("steer", normalized.text, normalized.images, {
 					message,
 					resumeIfIdle: true,
 				});
@@ -3220,7 +3221,7 @@ export class AgentSession {
 				if (this._accountGoalUsageForAssistantMessage(assistantMsg)) {
 					const message = createGoalContextMessage(this._goalState, "budget_limit");
 					const normalized = normalizeMessageContent(message.content);
-					await this._queueSteer(normalized.text, normalized.images, {
+					await this._queuePreparedPrompt("steer", normalized.text, normalized.images, {
 						message,
 						resumeIfIdle: true,
 					});

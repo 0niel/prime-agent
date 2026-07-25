@@ -2461,6 +2461,8 @@ export class AgentDaemon {
 
 	private async handleLine(client: DaemonSocketClient, line: string): Promise<void> {
 		let command: DaemonCommand;
+		let clearParsedAdmission = () => {};
+		let promptHandlerOwnsAdmission = false;
 		try {
 			const parsed = this.parseCommandAndRegisterPromptAdmission(line) as {
 				id?: unknown;
@@ -2484,7 +2486,7 @@ export class AgentDaemon {
 							this.promptAdmissionKey(parsed.activeSessionId, (parsed as { admissionId: string }).admissionId),
 						)
 					: undefined;
-			const clearParsedAdmission = () => {
+			clearParsedAdmission = () => {
 				if (!parsedAdmission) return;
 				const key = this.promptAdmissionKey(parsedAdmission.activeSessionId, parsedAdmission.admissionId);
 				if (this.promptAdmissions.get(key) === parsedAdmission) {
@@ -2540,6 +2542,7 @@ export class AgentDaemon {
 			if (this.options.worker) {
 				const boundClaim = this.supervisorClaims.get(client);
 				if (!boundClaim) {
+					clearParsedAdmission();
 					this.write(
 						client,
 						failure(
@@ -2578,7 +2581,7 @@ export class AgentDaemon {
 						failure(
 							typeof parsed.id === "string" ? parsed.id : undefined,
 							typeof parsed.type === "string" ? parsed.type : "worker_auth",
-							error,
+							admissionCancelled ? error : "supervisor_generation_stale",
 						),
 					);
 					// Cancelling this prompt only abandons its admission wait. A genuine
@@ -2605,7 +2608,9 @@ export class AgentDaemon {
 		}
 
 		try {
-			const response = await this.handleCommand(client, command);
+			const response = await this.handleCommand(client, command, () => {
+				promptHandlerOwnsAdmission = true;
+			});
 			if (response) {
 				this.write(client, response);
 			}
@@ -2617,6 +2622,8 @@ export class AgentDaemon {
 				`daemon command "${command.type}" failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
 			);
 			this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
+		} finally {
+			if (!promptHandlerOwnsAdmission) clearParsedAdmission();
 		}
 	}
 
@@ -2727,6 +2734,7 @@ export class AgentDaemon {
 	private async handleCommand(
 		client: DaemonSocketClient,
 		command: DaemonCommand,
+		onPromptHandlerOwnsAdmission: () => void = () => {},
 	): Promise<DaemonResponse | undefined> {
 		if (this.updateRestartPreparing && command.type !== "shutdown" && command.type !== "ack_result") {
 			throw new Error("Daemon is preparing an update restart");
@@ -2990,6 +2998,7 @@ export class AgentDaemon {
 
 			case "prompt":
 			case "prompt_and_wait": {
+				onPromptHandlerOwnsAdmission();
 				const admissionKey = command.admissionId
 					? this.promptAdmissionKey(command.activeSessionId, command.admissionId)
 					: undefined;
