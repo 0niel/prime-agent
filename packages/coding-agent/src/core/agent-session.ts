@@ -5315,7 +5315,9 @@ export class AgentSession {
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
 		const active =
-			this._activeSessionInput?.kind === "prompt" && this._activeSessionInput.phase === "preparing"
+			this._activeSessionInput?.kind === "prompt" &&
+			this._activeSessionInput.phase === "preparing" &&
+			!this._activeSessionInput.cancelled
 				? this._activeSessionInput
 				: undefined;
 		if (active) {

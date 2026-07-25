@@ -1292,6 +1292,7 @@ export class AgentDaemon {
 				source: "rpc",
 			},
 			canPrompt,
+			false,
 		);
 		return didPrompt ? undefined : "skipped";
 	}

@@ -2288,7 +2288,7 @@ describe("daemon mode helpers", () => {
 		expect(prompt).toHaveBeenCalledOnce();
 	});
 
-	it("queues agent messages while a cron prompt prepares to stream", async () => {
+	it("releases cron preparing state after prompt admission", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -2303,6 +2303,7 @@ describe("daemon mode helpers", () => {
 					resolvePrompt = resolve;
 				}),
 		);
+		const promptUntilAccepted = vi.fn(async () => {});
 		const acceptAgentMessagePrompt = vi.fn(async () => {});
 		const queueAgentMessagePrompt = vi.fn(async (_message: string, _streamingBehavior: "steer" | "followUp") => true);
 		targetState.runtime = {
@@ -2315,6 +2316,7 @@ describe("daemon mode helpers", () => {
 				isBashRunning: false,
 				pendingMessageCount: 0,
 				prompt,
+				promptUntilAccepted,
 				acceptAgentMessagePrompt,
 				queueAgentMessagePrompt,
 			},
@@ -2335,7 +2337,8 @@ describe("daemon mode helpers", () => {
 		);
 		await Promise.resolve();
 		await Promise.resolve();
-		expect(prompt).toHaveBeenCalledOnce();
+		expect(promptUntilAccepted).toHaveBeenCalledOnce();
+		expect(prompt).not.toHaveBeenCalled();
 
 		await internals.sendAgentSessionMessage({
 			targetSelector: targetState.activeSessionId,
@@ -2343,9 +2346,8 @@ describe("daemon mode helpers", () => {
 			origin: "agent",
 		});
 
-		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
-		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
+		expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
+		expect(queueAgentMessagePrompt).not.toHaveBeenCalled();
 		resolvePrompt();
 		await cronRun;
 	});
