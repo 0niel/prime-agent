@@ -4068,14 +4068,26 @@ export class AgentSession {
 		});
 	}
 
-	private _observeDirectDispatch(message: AgentMessage): { observed: Promise<true>; stop(): void } {
+	private _observeDirectDispatch(message: AgentMessage): {
+		observed: Promise<true>;
+		wasObserved(): boolean;
+		stop(): void;
+	} {
+		let fired = false;
 		let observer!: { message: AgentMessage; resolve: () => void };
 		const observed = new Promise<true>((resolve) => {
-			observer = { message, resolve: () => resolve(true) };
+			observer = {
+				message,
+				resolve: () => {
+					fired = true;
+					resolve(true);
+				},
+			};
 		});
 		this._directDispatchObservers.add(observer);
 		return {
 			observed,
+			wasObserved: () => fired,
 			stop: () => this._directDispatchObservers.delete(observer),
 		};
 	}
@@ -4231,10 +4243,13 @@ export class AgentSession {
 		// Settle the preflight outcome at the handoff, not after the whole turn: the
 		// direct-prompt section must keep fencing update-restart checkpoints until
 		// message_start proves the input reached the run's event stream, and a
-		// rejected dispatch must still release the section.
+		// rejected dispatch must still release the section. A resolved prompt is
+		// not proof by itself: Agent.prompt() converts lifecycle failures into a
+		// synthetic error turn, so on resolution confirm the message reached
+		// agent state before releasing the checkpoint fence.
 		const dispatched = await Promise.race([
 			promptPromise.then(
-				() => true,
+				() => dispatchObserver.wasObserved() || this.agent.state.messages.includes(message),
 				() => false,
 			),
 			dispatchObserver.observed,
