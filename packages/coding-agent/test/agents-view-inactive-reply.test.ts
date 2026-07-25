@@ -179,6 +179,27 @@ describe("agents view reply on inactive sessions", () => {
 		expect(self.setReplyTarget).not.toHaveBeenCalled();
 	});
 
+	it("preserves new text entered while the same reply succeeds", async () => {
+		const editor = editorWithText("first reply");
+		const target = { key: "saved-1", summary: savedSummary };
+		const self: Record<string, unknown> = {
+			replyTarget: target,
+			editor,
+			setReplyTarget: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+			sendReply: vi.fn(async () => {
+				editor.setText("next reply");
+				return true;
+			}),
+		};
+
+		await invoke("submit", self, "first reply");
+
+		expect(self.replyTarget).toBe(target);
+		expect(editor.getText()).toBe("next reply");
+		expect(self.setReplyTarget).not.toHaveBeenCalled();
+	});
+
 	it.each([
 		{ name: "resume failure", failure: "resume", remainsInactive: true },
 		{ name: "send failure", failure: "send", remainsInactive: false },

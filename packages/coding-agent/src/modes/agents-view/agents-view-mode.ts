@@ -1035,7 +1035,9 @@ export class AgentsViewMode implements Component, Focusable {
 				this.editor.setText("");
 				const sent = await this.sendReply(target, text);
 				if (sent) {
-					if (this.replyTarget === target) this.setReplyTarget(undefined);
+					if (this.replyTarget === target && this.editor.getText().length === 0) {
+						this.setReplyTarget(undefined);
+					}
 					await this.refreshSessions();
 				} else if (this.replyTarget === target && this.editor.getText().length === 0) {
 					this.editor.setText(value);
