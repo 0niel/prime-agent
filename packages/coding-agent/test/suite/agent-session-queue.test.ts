@@ -773,7 +773,6 @@ describe("AgentSession queue characterization", () => {
 		const target = harness.sessionManager.getEntries().find((entry) => entry.type === "message");
 		expect(target).toBeDefined();
 
-		// Preparation completes, then the pause defers the handoff and requeues.
 		withStreaming(harness, true);
 		await harness.session.followUp("queued", undefined, { resumeIfIdle: true });
 		withStreaming(harness, false);
@@ -783,8 +782,6 @@ describe("AgentSession queue characterization", () => {
 			._followUpMessages;
 		await vi.waitFor(() => expect(queued[0]?.preparation).toBeDefined());
 
-		// The branch switch must clear the cached preparation so
-		// before_agent_start re-runs against the new context on the next pump.
 		const navigation = harness.session.navigateTree(target!.id, { summarize: false });
 		pause?.release();
 		pause = undefined;
