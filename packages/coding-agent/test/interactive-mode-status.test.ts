@@ -3146,6 +3146,35 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		},
 	);
 
+	test("a barrier-paused submit retains its draft in the original session's stash after a rebind", async () => {
+		const barrier = createDeferred<"admitted" | "lifecycle-cancelled">();
+		const oldState: PromptStashState = {};
+		const newState: PromptStashState = {};
+		const prompt = vi.fn(async () => {});
+		const fakeThis = createSubmitHandlerHarness({
+			promptStashState: oldState,
+			admitPendingStartupPrompts: () => barrier.promise,
+			agentConnection: {
+				prompt,
+				executeBash: vi.fn(async () => {}),
+				getState: vi.fn(async () => ({ isBashRunning: false })),
+			},
+		});
+		(fakeThis as unknown as { promptStashSessionId?: string }).promptStashSessionId = "session-old";
+
+		const submission = fakeThis.defaultEditor.onSubmit?.("typed for the old session");
+		await Promise.resolve();
+		// /new rebinds the live fields while the submit is paused on the barrier.
+		(fakeThis as unknown as { promptStashSessionId?: string }).promptStashSessionId = "session-new";
+		fakeThis.promptStashState = newState;
+		barrier.resolve("admitted");
+		await submission;
+
+		expect(prompt).not.toHaveBeenCalled();
+		expect(oldState.stash).toEqual({ text: "typed for the old session" });
+		expect(newState.stash).toBeUndefined();
+	});
+
 	test("defers stash-store release until lifecycle-retained submissions settle", () => {
 		const store = new ClientPromptStashStore();
 		const state = store.forSession("session-a");
