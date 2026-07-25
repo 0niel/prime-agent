@@ -2581,7 +2581,10 @@ export class AgentDaemon {
 						claimCheck,
 						parsedAdmission?.controller?.signal,
 					);
-					if (this.supervisorClaims.get(client) !== boundClaim || client.socket.destroyed) return;
+					if (this.supervisorClaims.get(client) !== boundClaim || client.socket.destroyed) {
+						clearParsedAdmission();
+						return;
+					}
 					boundClaim.ownerFingerprint = ownerFingerprint;
 				} catch (error) {
 					const admissionCancelled = error instanceof DaemonPromptAdmissionCancelledError;
