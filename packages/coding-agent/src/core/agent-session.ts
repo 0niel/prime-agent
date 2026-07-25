@@ -786,14 +786,11 @@ interface AgentMessageDeferred {
 
 /**
  * Per-agent-message settlement record: `delivery` settles when the prompt reaches agent state,
- * `completion` when its turn (or command) finishes. `delivered`/`deliveryError` keep the
- * delivery outcome sticky for late waiters; completion deferreds are detached once settled.
+ * `completion` when its turn (or command) finishes. Settled deferreds are removed immediately.
  */
 interface AgentMessageOutcome {
 	delivery?: AgentMessageDeferred;
 	completion?: AgentMessageDeferred;
-	delivered?: boolean;
-	deliveryError?: Error;
 }
 
 function createAgentMessageDeferred(): AgentMessageDeferred {
@@ -2968,53 +2965,39 @@ export class AgentSession {
 		return outcome;
 	}
 
+	/**
+	 * Register a delivery waiter before submitting the prompt. Delivery outcomes are not retained
+	 * for late lookup, so callers that register after admission may wait for a future use of the id.
+	 */
 	waitForAgentMessagePromptDelivery(agentMessageId: string): Promise<void> {
 		const outcome = this._agentMessageOutcome(agentMessageId);
-		if (outcome.delivered) return Promise.resolve();
-		if (outcome.deliveryError) return Promise.reject(outcome.deliveryError);
 		outcome.delivery ??= createAgentMessageDeferred();
 		return outcome.delivery.promise;
 	}
 
-	/**
-	 * Resolve (no error) or reject one leg of an agent message outcome. The first delivery
-	 * settlement is sticky for late waiters; settled completion deferreds free the id for reuse.
-	 */
+	/** Resolve (no error) or reject an existing leg of an agent message outcome. */
 	private _settleAgentMessage(
 		agentMessageId: string | undefined,
 		leg: "delivery" | "completion",
 		error?: Error,
 	): void {
 		if (agentMessageId === undefined) return;
-		const outcome =
-			leg === "delivery"
-				? this._agentMessageOutcome(agentMessageId)
-				: this._agentMessageOutcomes.get(agentMessageId);
+		const outcome = this._agentMessageOutcomes.get(agentMessageId);
 		if (!outcome) return;
-		if (leg === "delivery") {
-			if (outcome.delivered || outcome.deliveryError) return;
-			outcome.delivered = !error;
-			outcome.deliveryError = error;
-		}
 		const deferred = outcome[leg];
+		if (!deferred) return;
 		outcome[leg] = undefined;
-		if (!outcome.delivery && !outcome.completion && !outcome.delivered && !outcome.deliveryError) {
+		if (!outcome.delivery && !outcome.completion) {
 			this._agentMessageOutcomes.delete(agentMessageId);
 		}
-		if (error) deferred?.reject(error);
-		else deferred?.resolve();
+		if (error) deferred.reject(error);
+		else deferred.resolve();
 	}
 
-	/**
-	 * Reject both legs of an agent message outcome. Delivery stays sticky once it
-	 * succeeded, but a re-armed completion (a reused id queued again after its first
-	 * turn finished) must still reject or its waiter hangs forever.
-	 */
+	/** Reject both currently registered legs of an agent message outcome. */
 	private _rejectAgentMessage(agentMessageId: string | undefined, error: Error): void {
 		if (agentMessageId === undefined) return;
-		if (!this._agentMessageOutcomes.get(agentMessageId)?.delivered) {
-			this._settleAgentMessage(agentMessageId, "delivery", error);
-		}
+		this._settleAgentMessage(agentMessageId, "delivery", error);
 		this._settleAgentMessage(agentMessageId, "completion", error);
 	}
 
@@ -3987,7 +3970,6 @@ export class AgentSession {
 	}
 
 	async promptAndWait(text: string, options?: PromptOptions): Promise<void> {
-		const internalId = options?.agentMessageId === undefined;
 		const agentMessageId = options?.agentMessageId ?? `prompt-wait:${randomUUID()}`;
 		if (this._agentMessageOutcomes.get(agentMessageId)?.completion) {
 			throw new Error(`Prompt completion id is already in use: ${agentMessageId}`);
@@ -4001,10 +3983,6 @@ export class AgentSession {
 		} catch (error) {
 			this._settleAgentMessage(agentMessageId, "completion", this._asError(error));
 			throw error;
-		} finally {
-			// A generated id has no late waiters; drop its sticky delivery record so
-			// long-lived sessions do not grow one outcome entry per prompt.
-			if (internalId) this._agentMessageOutcomes.delete(agentMessageId);
 		}
 	}
 

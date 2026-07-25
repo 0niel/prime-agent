@@ -2086,6 +2086,7 @@ prepared:${event.prompt}`,
 		harnesses.push(harness);
 		harness.session.setFollowUpMode("all");
 		withStreaming(harness, true);
+		const firstDelivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_clear_first");
 		const firstCompletion = harness.session.promptAndWait("clear first while preparing", {
 			agentMessageId: "agentmsg_clear_first",
 			streamingBehavior: "followUp",
@@ -2108,10 +2109,7 @@ prepared:${event.prompt}`,
 		pause?.release();
 		await firstCompletionRejection;
 		await completionRejection;
-		// Delivery waiters created after the clear observe the sticky failure.
-		await expect(harness.session.waitForAgentMessagePromptDelivery("agentmsg_clear_first")).rejects.toThrow(
-			"cleared before delivery",
-		);
+		await expect(firstDelivery).rejects.toThrow("cleared before delivery");
 		await harness.session.waitForSessionInputIdle();
 		expect(harness.session.getSteeringMessages()).toEqual([]);
 		expect(harness.session.getFollowUpMessages()).toEqual([]);
@@ -2121,9 +2119,6 @@ prepared:${event.prompt}`,
 		await expect(
 			harness.session.promptAndWait("later prompt", { agentMessageId: "agentmsg_clear_first" }),
 		).resolves.toBeUndefined();
-		await expect(harness.session.waitForAgentMessagePromptDelivery("agentmsg_clear_first")).rejects.toThrow(
-			"cleared before delivery",
-		);
 		expect(getUserTexts(harness)).toEqual(["later prompt"]);
 		expect(getAssistantTexts(harness)).toEqual(["later response"]);
 
@@ -2167,8 +2162,8 @@ prepared:${event.prompt}`,
 		const promptPromise = harness.session.prompt("hi");
 		await sawMessageUpdate;
 
-		await harness.session.queueAgentMessagePrompt(agentPrompt, "followUp");
 		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_abort");
+		await harness.session.queueAgentMessagePrompt(agentPrompt, "followUp");
 		let deliverySettled = false;
 		void delivery.then(
 			() => {
@@ -2237,7 +2232,35 @@ prepared:${event.prompt}`,
 		expect(getAssistantTexts(harness)).toEqual(["first done", "second done"]);
 	});
 
-	it("resolves queued, direct, and late agent-message delivery waiters once prompts start", async () => {
+	it("releases hundreds of external promptAndWait outcomes for pre-registered id reuse", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+
+		for (let index = 0; index < 300; index++) {
+			const id = `agentmsg_completed_${index}`;
+			harness.setResponses([fauxAssistantMessage(`done ${index}`)]);
+			await expect(
+				harness.session.promptAndWait(`prompt ${index}`, { agentMessageId: id }),
+			).resolves.toBeUndefined();
+		}
+
+		const reusedId = "agentmsg_completed_0";
+		let delivered = false;
+		const delivery = harness.session.waitForAgentMessagePromptDelivery(reusedId).then(() => {
+			delivered = true;
+		});
+		await Promise.resolve();
+		expect(delivered).toBe(false);
+
+		harness.setResponses([fauxAssistantMessage("reused done")]);
+		await harness.session.acceptAgentMessagePrompt(agentPromptText(reusedId, "reused prompt"));
+		await expect(delivery).resolves.toBeUndefined();
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toHaveLength(301);
+		expect(getAssistantTexts(harness)).toHaveLength(301);
+	});
+
+	it("resolves pre-registered queued and direct agent-message delivery waiters once prompts start", async () => {
 		const blocked = createDeferred();
 		const harness = await createHarness({
 			extensionFactories: [
@@ -2249,6 +2272,7 @@ prepared:${event.prompt}`,
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("done")]);
 		withStreaming(harness, true);
+		const queuedDelivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_sync");
 		await harness.session.followUp("agent message", undefined, {
 			agentMessageId: "agentmsg_sync",
 			resumeIfIdle: true,
@@ -2256,11 +2280,9 @@ prepared:${event.prompt}`,
 		withStreaming(harness, false);
 
 		// Queued delivery resolves on message_start, before the gated turn completes.
-		await expect(harness.session.waitForAgentMessagePromptDelivery("agentmsg_sync")).resolves.toBeUndefined();
+		await expect(queuedDelivery).resolves.toBeUndefined();
 		blocked.resolve();
 		await harness.session.waitForIdle();
-		// Waiters created after delivery settled resolve immediately.
-		await expect(harness.session.waitForAgentMessagePromptDelivery("agentmsg_sync")).resolves.toBeUndefined();
 
 		harness.setResponses([fauxAssistantMessage("direct reply")]);
 		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_direct");
@@ -2416,7 +2438,6 @@ prepared:${event.prompt}`,
 		pause.release();
 		await expect(delivery).resolves.toBeUndefined();
 		await expect(completion).rejects.toThrow("refine execution failed");
-		await expect(harness.session.waitForAgentMessagePromptDelivery(id)).resolves.toBeUndefined();
 	});
 
 	it("rejects queued command delivery and completion when the invocation append fails", async () => {
@@ -2691,9 +2712,6 @@ prepared:${event.prompt}`,
 			}),
 		).rejects.toThrow("equivalent follow-up is already pending");
 		await Promise.all([earlyExpandedDelivery, completion]);
-		await expect(harness.session.waitForAgentMessagePromptDelivery(expandedId)).rejects.toThrow(
-			"equivalent follow-up is already pending",
-		);
 
 		const restoredId = "agentmsg_coalesced_restored";
 		const earlyRestoredDelivery = expect(
@@ -2706,9 +2724,6 @@ prepared:${event.prompt}`,
 			}),
 		).resolves.toBe(false);
 		await earlyRestoredDelivery;
-		await expect(harness.session.waitForAgentMessagePromptDelivery(restoredId)).rejects.toThrow(
-			"equivalent follow-up is already pending",
-		);
 		expect(harness.session.getFollowUpMessages()).toEqual(["existing"]);
 	});
 
@@ -2735,6 +2750,7 @@ prepared:${event.prompt}`,
 			const pause = phase === "queued" ? harness.session.acquireQueuedWorkPause() : undefined;
 			const id = `agentmsg_${phase}_coalesced_owner`;
 			withStreaming(harness, true);
+			const earlyDelivery = harness.session.waitForAgentMessagePromptDelivery(id);
 
 			const completion = harness.session.promptAndWait("accepted", {
 				streamingBehavior: "followUp",
@@ -2749,7 +2765,6 @@ prepared:${event.prompt}`,
 				await prepared.promise;
 				await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toEqual([]));
 			}
-			const earlyDelivery = harness.session.waitForAgentMessagePromptDelivery(id);
 			await expect(
 				harness.session.restoreFollowUpMessage("duplicate", undefined, { queueKey: "same", agentMessageId: id }),
 			).resolves.toBe(false);
@@ -2759,7 +2774,6 @@ prepared:${event.prompt}`,
 			releasePreparation.resolve();
 			await expect(earlyDelivery).resolves.toBeUndefined();
 			await expect(completion).resolves.toBeUndefined();
-			await expect(harness.session.waitForAgentMessagePromptDelivery(id)).resolves.toBeUndefined();
 			expect(getUserTexts(harness)).toEqual(["accepted"]);
 		},
 	);

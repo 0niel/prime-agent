@@ -1231,10 +1231,6 @@ stale post-hook extension instructions`,
 		await expect(delivery).rejects.toThrow("cleared before delivery");
 		await harness.session.agent.waitForIdle();
 		await (harness.session as unknown as { _agentEventQueue: Promise<void> })._agentEventQueue;
-
-		await expect(harness.session.waitForAgentMessagePromptDelivery("agentmsg_late_events")).rejects.toThrow(
-			"cleared before delivery",
-		);
 		// The aborted run's late message events must not re-persist the cleared message.
 		const persistedRoles = harness.sessionManager
 			.getEntries()
