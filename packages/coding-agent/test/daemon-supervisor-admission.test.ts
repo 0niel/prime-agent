@@ -66,6 +66,13 @@ function createHarness(
 		assertCurrent?: () => Promise<void>;
 		findWorker?: (client: DaemonSocketClient, selector: string) => Promise<unknown>;
 		forwardToWorker?: (worker: unknown, command: DaemonCommand) => Promise<DaemonResponse>;
+		commandJournal?: {
+			lookup: ReturnType<typeof vi.fn>;
+			begin: ReturnType<typeof vi.fn>;
+			recordResult: ReturnType<typeof vi.fn>;
+			acknowledge: ReturnType<typeof vi.fn>;
+		};
+		updateRestartPhase?: "draining" | "fencing" | "prepared";
 	} = {},
 ): SupervisorHarness {
 	return Object.assign(Object.create(DaemonSupervisor.prototype), {
@@ -79,12 +86,13 @@ function createHarness(
 		protocolClientIds: new WeakMap(),
 		promptAdmissions: new Map(),
 		mutationDrain: new MutationDrainLatch(),
-		commandJournal: {
+		commandJournal: options.commandJournal ?? {
 			lookup: vi.fn(() => undefined),
 			begin: vi.fn(() => ({ status: "new" })),
 			recordResult: vi.fn(),
 			acknowledge: vi.fn(),
 		},
+		updateRestartPhase: options.updateRestartPhase,
 		findWorkerForClient: options.findWorker,
 		forwardToWorker: options.forwardToWorker,
 		write: vi.fn(),
@@ -159,6 +167,71 @@ describe("daemon supervisor prompt admission ownership", () => {
 
 		await supervisor.handleLine(owner, JSON.stringify({ ...prompt, id: "prompt-2" }));
 		expect(supervisor.promptAdmissions.size).toBe(0);
+	});
+
+	it("rejects restart-fenced cancellation before mutating its admission", async () => {
+		const supervisor = createHarness({ updateRestartPhase: "fencing" });
+		const owner = client("connection-owner");
+		const admission: AdmissionRecord = {
+			client: owner,
+			activeSessionId: "session-1",
+			publicAdmissionId: "public-admission",
+			workerAdmissionId: "worker-admission",
+			status: "waiting",
+			controller: new AbortController(),
+		};
+		supervisor.promptAdmissions.set(owner, new Map([["session-1\0public-admission", admission]]));
+
+		await supervisor.handleLine(
+			owner,
+			JSON.stringify({
+				id: "cancel-1",
+				type: "cancel_prompt_admission",
+				activeSessionId: "session-1",
+				admissionId: "public-admission",
+			} satisfies DaemonCommand),
+		);
+
+		expect(admission.status).toBe("waiting");
+		expect(admission.controller.signal.aborted).toBe(false);
+	});
+
+	it("admits only one concurrent mutation with the same journal identity", async () => {
+		let begun = false;
+		const commandJournal = {
+			lookup: vi.fn(() => undefined),
+			begin: vi.fn(() => {
+				if (begun) return { status: "pending" as const };
+				begun = true;
+				return { status: "new" as const };
+			}),
+			recordResult: vi.fn(),
+			acknowledge: vi.fn(),
+		};
+		const forward = deferred<DaemonResponse>();
+		const supervisor = createHarness({
+			commandJournal,
+			findWorker: vi.fn(async () => ({
+				worker: { descriptor: { lifecycle: "ready", rootActiveSessionId: "session-1" } },
+				summary: { id: "session-1", activeSessionId: "session-1" },
+			})),
+			forwardToWorker: vi.fn(() => forward.promise),
+		});
+		const owner = client("connection-owner");
+		const command = createDaemonCommandEnvelope(
+			{ id: "prompt-1", type: "prompt", activeSessionId: "session-1", message: "hello" },
+			"prompt-1",
+			"logical-client",
+		);
+
+		const first = supervisor.handleLine(owner, JSON.stringify(command));
+		const second = supervisor.handleLine(owner, JSON.stringify(command));
+		await waitFor(() => commandJournal.begin.mock.calls.length === 2);
+		expect(
+			(supervisor as unknown as { forwardToWorker: ReturnType<typeof vi.fn> }).forwardToWorker,
+		).toHaveBeenCalledOnce();
+		forward.resolve({ type: "response", command: "prompt", success: true });
+		await Promise.all([first, second]);
 	});
 
 	it("lets the originating connection cancel before worker lookup starts", async () => {

@@ -1081,6 +1081,10 @@ export class DaemonSupervisor {
 		}
 		const command = preParsed.command;
 		const parsedAdmission = preParsed.admission;
+		if (command.type === "cancel_prompt_admission" && this.updateRestartPhase !== undefined) {
+			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
+			return;
+		}
 		const cancellationAdmission =
 			command.type === "cancel_prompt_admission"
 				? this.getPromptAdmission(client, command.activeSessionId, command.admissionId)
@@ -1149,7 +1153,23 @@ export class DaemonSupervisor {
 			return;
 		}
 		if (journalIdentity) {
-			this.commandJournal.begin(journalIdentity.clientId, journalIdentity.commandId, command.type);
+			const admitted = this.commandJournal.begin(journalIdentity.clientId, journalIdentity.commandId, command.type);
+			if (admitted.status === "complete") {
+				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+				this.write(client, admitted.response);
+				return;
+			}
+			if (admitted.status === "pending") {
+				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+				this.write(
+					client,
+					failure(command.id, command.type, "The previous command result is uncertain and was not replayed", {
+						code: "command_result_uncertain",
+						...journalIdentity,
+					}),
+				);
+				return;
+			}
 		}
 
 		if (mutation) this.mutationDrain.begin();
