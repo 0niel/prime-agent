@@ -221,7 +221,6 @@ describe("daemon supervisor prompt admission ownership", () => {
 		const worker = { descriptor: { lifecycle: "ready", rootActiveSessionId: "worker-session" } };
 		const forwardToWorker = vi.fn(async (_worker: unknown, command: DaemonCommand) => {
 			if (command.type === "cancel_prompt_admission") {
-				// The worker lost the record: a bare unknown must not un-cancel.
 				return success(command.id, command.type, { status: "unknown" as const });
 			}
 			return new Promise<DaemonResponse>(() => {});
@@ -260,7 +259,6 @@ describe("daemon supervisor prompt admission ownership", () => {
 			} satisfies DaemonCommand),
 		);
 
-		// The cancel short-circuits: no worker round-trip, status stays cancelled.
 		expect(forwardToWorker).not.toHaveBeenCalledWith(
 			worker,
 			expect.objectContaining({ type: "cancel_prompt_admission" }),
