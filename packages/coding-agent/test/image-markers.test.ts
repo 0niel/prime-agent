@@ -5,6 +5,7 @@ import {
 	evictImagesToBudget,
 	formatImageMarker,
 	imageMarkerIds,
+	remapImageMarkers,
 } from "../src/modes/interactive/image-markers.js";
 
 describe("image markers", () => {
@@ -16,6 +17,12 @@ describe("image markers", () => {
 	test("imageMarkerIds returns ids in order of appearance", () => {
 		expect(imageMarkerIds("a [image #2] b [image #1] c")).toEqual([2, 1]);
 		expect(imageMarkerIds("no markers here")).toEqual([]);
+	});
+
+	test("remapImageMarkers replaces every spelling of the numeric id", () => {
+		expect(remapImageMarkers("[image #1] [image #01] [image #2]", new Map([[1, 7]]))).toBe(
+			"[image #7] [image #7] [image #2]",
+		);
 	});
 
 	test("collectMarkedImages returns images in paste order, not text order", () => {

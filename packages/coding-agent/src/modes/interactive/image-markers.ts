@@ -19,6 +19,14 @@ export function imageMarkerIds(text: string): number[] {
 	return [...text.matchAll(IMAGE_MARKER_REGEX)].map((match) => Number(match[1]));
 }
 
+/** Replace every image-marker spelling whose numeric id appears in `remaps`. */
+export function remapImageMarkers(text: string, remaps: ReadonlyMap<number, number>): string {
+	return text.replace(IMAGE_MARKER_REGEX, (marker, id: string) => {
+		const replacement = remaps.get(Number(id));
+		return replacement === undefined ? marker : formatImageMarker(replacement);
+	});
+}
+
 /**
  * Images from `pending` whose marker still appears in `text`, in paste order
  * (the map's insertion order). Each image is returned at most once even if its

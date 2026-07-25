@@ -765,7 +765,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			!this.client.supportsServerCapability("prompt_admission_cancellation")
 		) {
 			throw new AgentConnectionPromptAdmissionError(
-				"Startup prompt cancellation requires daemon protocol 5, schema 4, and prompt_admission_cancellation.",
+				`Startup prompt cancellation requires daemon protocol ${DAEMON_PROTOCOL_VERSION}, schema ${DAEMON_SCHEMA_REVISION}, and prompt_admission_cancellation.`,
 				"unsupported",
 			);
 		}
@@ -825,10 +825,8 @@ export class DaemonAgentConnection implements AgentConnection {
 			} catch {
 				// Timeout/transport is indistinguishable from accepted ownership.
 			}
-			if (status === "owned") {
-				await promptRequest;
-				if (promptError === undefined || type === "prompt") return;
-			}
+			await promptRequest;
+			if (promptError === undefined || (status === "owned" && type === "prompt")) return;
 			throw new AgentConnectionPromptAdmissionError(
 				promptError instanceof Error ? promptError.message : "Prompt admission did not complete.",
 				status,

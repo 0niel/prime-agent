@@ -214,7 +214,13 @@ import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
 import { FeatureHintDeck } from "./feature-hints.js";
 import { scopeHeartbeatsToSession } from "./heartbeat-scope.js";
-import { collectMarkedImages, evictImagesToBudget, formatImageMarker, imageMarkerIds } from "./image-markers.js";
+import {
+	collectMarkedImages,
+	evictImagesToBudget,
+	formatImageMarker,
+	imageMarkerIds,
+	remapImageMarkers,
+} from "./image-markers.js";
 import type {
 	InteractiveModeLocalSessionHost,
 	InteractiveModeLocalToolRendererDefinition,
@@ -4198,9 +4204,7 @@ export class InteractiveMode {
 					literalRemaps.set(markerId, allocateMarker());
 				}
 			}
-			for (const [from, to] of literalRemaps) {
-				text = text.replaceAll(formatImageMarker(from), formatImageMarker(to));
-			}
+			text = remapImageMarkers(text, literalRemaps);
 
 			const images: Array<readonly [number, ImageContent]> = [];
 			for (const image of prompt.images ?? []) {
