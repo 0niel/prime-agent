@@ -6359,7 +6359,14 @@ export class AgentSession {
 			this._scheduleAutoRefineAfterAgentEnd();
 			return;
 		}
-		if (this.pendingMessageCount > 0) {
+		// The pump owns items it moved into _activeSessionInput before handoff, so
+		// an empty queue alone does not mean idle.
+		if (
+			this.pendingMessageCount > 0 ||
+			this._activeSessionInput !== undefined ||
+			this._pumpingSessionInput ||
+			this._sessionInputPumpRequested
+		) {
 			this._scheduleSessionInputPump();
 			await this._sessionInputPump;
 			if (this._postCompactionContinuationScheduled) {
