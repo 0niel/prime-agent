@@ -5335,6 +5335,10 @@ export class AgentDaemon {
 		this.signalCleanupHandlers.push(() => process.off("exit", exitHandler));
 	}
 
+	private getShutdownClosingReason(): DaemonClosingReason {
+		return this.updateRestart?.phase === "publishing" ? "update" : "shutdown";
+	}
+
 	private async shutdown(exitCode: number): Promise<never> {
 		if (this.shuttingDown) {
 			process.exit(exitCode);
@@ -5349,7 +5353,7 @@ export class AgentDaemon {
 			this.supervisorFenceTimer = undefined;
 		}
 		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
-		const closingReason: DaemonClosingReason = this.updateRestart ? "update" : "shutdown";
+		const closingReason = this.getShutdownClosingReason();
 		for (const client of this.clients) {
 			abortClientSnapshotStreaming(client);
 			this.write(client, { type: "daemon_closing", reason: closingReason });

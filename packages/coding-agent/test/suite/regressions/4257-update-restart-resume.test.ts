@@ -47,6 +47,7 @@ type AgentDaemonUpdateInternals = {
 	supervisorClaims: Map<DaemonSocketClient, unknown>;
 	revokeSupervisorClaim(client: DaemonSocketClient): boolean;
 	shutdown(exitCode: number): Promise<never>;
+	getShutdownClosingReason(): "update" | "shutdown";
 	cancelPreparedUpdateRestart(transactionId?: symbol): void;
 	commitPreparedUpdateRestart(transactionId: symbol): Promise<DaemonUpdateRestartManifest>;
 };
@@ -177,6 +178,28 @@ describe("issue #4257 update restart resume", () => {
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
+	});
+
+	it.each([
+		[undefined, "shutdown"],
+		["preparing", "shutdown"],
+		["fencing", "shutdown"],
+		["prepared", "shutdown"],
+		["publishing", "update"],
+	] as const)("uses %s restart phase as %s shutdown", async (phase, expected) => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = createDaemonInternals(harness);
+		if (phase) {
+			internals.updateRestart = {
+				id: Symbol("update-restart"),
+				abort: new AbortController(),
+				phase,
+				deferredClientEnv: [],
+			};
+		}
+
+		expect(internals.getShutdownClosingReason()).toBe(expected);
 	});
 
 	it("waits for the admitted prompt event checkpoint before preparing restart", async () => {
