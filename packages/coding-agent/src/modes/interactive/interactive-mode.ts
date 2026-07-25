@@ -1535,9 +1535,6 @@ export class InteractiveMode {
 	 */
 	async run(): Promise<InteractiveModeRunResult> {
 		await this.init();
-		if (this.options.openSessionViewOnStartup) {
-			await this.openLocalSessionViewOnStartup();
-		}
 
 		// Global, environment-scoped notices (app update, extension updates, tmux setup)
 		// belong on the agents view, not in a conversation. When the agents view already
@@ -1712,6 +1709,9 @@ export class InteractiveMode {
 		};
 
 		await this.runStartupOnboarding();
+		if (this.options.openSessionViewOnStartup) {
+			await this.openLocalSessionViewOnStartup();
+		}
 		showDeferredStartupNotifications();
 		showModelFallbackWarning();
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
