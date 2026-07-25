@@ -308,9 +308,12 @@ function delay(ms: number): Promise<void> {
 	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
-function waitForSupervisorPromptAdmission<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+export function waitForSupervisorPromptAdmission<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 	if (!signal) return promise;
-	if (signal.aborted) return Promise.reject(new Error("Prompt admission was cancelled."));
+	if (signal.aborted) {
+		void promise.catch(() => {});
+		return Promise.reject(new Error("Prompt admission was cancelled."));
+	}
 	return new Promise<T>((resolve, reject) => {
 		const cleanup = () => signal.removeEventListener("abort", onAbort);
 		const onAbort = () => {
