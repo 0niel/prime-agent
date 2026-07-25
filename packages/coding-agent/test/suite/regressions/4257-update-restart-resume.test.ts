@@ -169,7 +169,7 @@ describe("issue #4257 update restart resume", () => {
 		}
 	});
 
-	it("waits for the full admitted prompt checkpoint before preparing restart", async () => {
+	it("waits for the admitted prompt event checkpoint before preparing restart", async () => {
 		let releaseAssistantMessageEnd: (() => void) | undefined;
 		const assistantMessageEndBlocked = new Promise<void>((resolve) => {
 			releaseAssistantMessageEnd = resolve;

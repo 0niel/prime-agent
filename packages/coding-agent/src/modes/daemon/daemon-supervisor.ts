@@ -1115,41 +1115,42 @@ export class DaemonSupervisor {
 			return;
 		}
 
+		const mutation = isDaemonMutatingCommand(command);
+		const journalIdentity =
+			envelopeClientId && command.id && mutation ? { clientId: envelopeClientId, commandId: command.id } : undefined;
+		const existing = journalIdentity
+			? this.commandJournal.lookup(journalIdentity.clientId, journalIdentity.commandId)
+			: undefined;
+		if (existing?.status === "complete") {
+			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+			this.write(client, existing.response);
+			return;
+		}
+		if (existing?.status === "pending" && journalIdentity) {
+			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
+			this.write(
+				client,
+				failure(command.id, command.type, "The previous command result is uncertain and was not replayed", {
+					code: "command_result_uncertain",
+					...journalIdentity,
+				}),
+			);
+			return;
+		}
+
 		const phase = this.updateRestartPhase;
 		const restartRejected =
 			phase === "draining"
 				? !UPDATE_RESTART_DRAIN_COMMANDS.has(command.type)
 				: phase !== undefined && !(phase === "prepared" && command.type === "shutdown");
-		if (restartRejected && isDaemonMutatingCommand(command)) {
+		if (restartRejected && mutation) {
 			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
 			return;
 		}
-
-		const journalIdentity =
-			envelopeClientId && command.id && isDaemonMutatingCommand(command)
-				? { clientId: envelopeClientId, commandId: command.id }
-				: undefined;
 		if (journalIdentity) {
-			const existing = this.commandJournal.begin(journalIdentity.clientId, journalIdentity.commandId, command.type);
-			if (existing.status === "complete") {
-				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
-				this.write(client, existing.response);
-				return;
-			}
-			if (existing.status === "pending") {
-				if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
-				this.write(
-					client,
-					failure(command.id, command.type, "The previous command result is uncertain and was not replayed", {
-						code: "command_result_uncertain",
-						...journalIdentity,
-					}),
-				);
-				return;
-			}
+			this.commandJournal.begin(journalIdentity.clientId, journalIdentity.commandId, command.type);
 		}
 
-		const mutation = isDaemonMutatingCommand(command);
 		if (mutation) this.mutationDrain.begin();
 		try {
 			const response = await this.handleCommand(client, command, cancellationAdmission);

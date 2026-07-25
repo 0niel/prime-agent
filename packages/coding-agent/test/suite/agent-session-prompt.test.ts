@@ -1571,6 +1571,56 @@ stale post-hook extension instructions`,
 		unsubscribe();
 	});
 
+	it("releases a queued prompt checkpoint after handoff while its turn remains active", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const responseGate = createDeferred<ReturnType<typeof fauxAssistantMessage>>();
+		harness.setResponses([() => responseGate.promise]);
+		const promptStarted = createDeferred();
+		const unsubscribe = harness.session.agent.subscribe((event) => {
+			if (event.type === "message_start" && event.message.role === "user") promptStarted.resolve();
+		});
+
+		await harness.session.restoreFollowUpMessage("queued prompt");
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await promptStarted.promise;
+
+		await expect(harness.session.waitForSessionInputCheckpoint(AbortSignal.timeout(1000))).resolves.toBeUndefined();
+		expect(harness.session.isStreaming).toBe(true);
+		responseGate.resolve(fauxAssistantMessage("done"));
+		await harness.session.waitForIdle();
+		unsubscribe();
+	});
+
+	it("aborts while a queued prompt is still preparing without consuming its snapshot", async () => {
+		const preparationReached = createDeferred();
+		const preparationGate = createDeferred();
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async () => {
+						preparationReached.resolve();
+						await preparationGate.promise;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		await harness.session.restoreFollowUpMessage("queued prompt");
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await preparationReached.promise;
+		const controller = new AbortController();
+
+		const checkpoint = harness.session.waitForSessionInputCheckpoint(controller.signal);
+		controller.abort();
+
+		await expect(checkpoint).rejects.toThrow("Update restart preparation cancelled");
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: ["queued prompt"] });
+		preparationGate.resolve();
+		await harness.session.waitForIdle();
+	});
+
 	it("aborts while an extension event is pending without flushing or cancelling its queue", async () => {
 		const extensionReached = createDeferred();
 		const extensionGate = createDeferred();

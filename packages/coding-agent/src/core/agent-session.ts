@@ -5579,7 +5579,10 @@ export class AgentSession {
 	}
 
 	async waitForSessionInputCheckpoint(signal?: AbortSignal): Promise<void> {
-		while (this._activeSessionInput !== undefined || this._directPromptSectionCount > 0) {
+		while (
+			(this._activeSessionInput?.kind === "prompt" && this._activeSessionInput.phase === "preparing") ||
+			this._directPromptSectionCount > 0
+		) {
 			if (signal?.aborted) throw new Error("Update restart preparation cancelled");
 			await new Promise<void>((resolve, reject) => {
 				const onChange = () => {

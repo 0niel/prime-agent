@@ -7,10 +7,11 @@ import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { CommandRecoveryJournal } from "../src/modes/daemon/command-recovery-journal.js";
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
-import type { DaemonAttachResult } from "../src/modes/daemon/daemon-protocol.js";
+import { createDaemonCommandEnvelope, type DaemonAttachResult, success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
@@ -1808,6 +1809,99 @@ describe("daemon worker supervisor monitoring", () => {
 		await expect(supervisor.prepareUpdateRestartFenced()).resolves.toMatchObject({
 			discardedActiveSessionIds: ["root"],
 		});
+	});
+
+	it("replays completed journaled mutations during restart preparation without taking a mutation lease", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-command-replay-"));
+		const commandJournal = new CommandRecoveryJournal(join(root, "commands.jsonl"));
+		const response = success("command-1", "kill");
+		commandJournal.begin("client-1", "command-1", "kill");
+		commandJournal.recordResult("client-1", "command-1", response);
+		const writes: string[] = [];
+		const client = {
+			id: "socket-client",
+			socket: {
+				destroyed: false,
+				write: vi.fn((chunk: string) => {
+					writes.push(chunk);
+					return true;
+				}),
+			},
+		} as unknown as DaemonSocketClient;
+		const mutationDrain = { begin: vi.fn(), end: vi.fn() };
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			ready: Promise.resolve(),
+			workers: new Map(),
+			protocolClientIds: new WeakMap(),
+			commandJournal,
+			mutationDrain,
+			updateRestartPhase: "fencing",
+			assertCurrentOwnership: vi.fn(async () => undefined),
+			cancelOwnedWorkerCleanup: vi.fn(),
+			handleCommand: vi.fn(async () => {
+				throw new Error("completed command was dispatched again");
+			}),
+		}) as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		try {
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(
+					createDaemonCommandEnvelope({ type: "kill", activeSessionId: "session-1" }, "command-1", "client-1"),
+				),
+			);
+			expect(writes).toEqual([`${JSON.stringify(response)}\n`]);
+			expect(mutationDrain.begin).not.toHaveBeenCalled();
+			expect(mutationDrain.end).not.toHaveBeenCalled();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects genuinely new mutations during restart preparation without journaling or leasing them", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-command-reject-"));
+		const commandJournal = new CommandRecoveryJournal(join(root, "commands.jsonl"));
+		const writes: string[] = [];
+		const client = {
+			id: "socket-client",
+			socket: {
+				destroyed: false,
+				write: vi.fn((chunk: string) => {
+					writes.push(chunk);
+					return true;
+				}),
+			},
+		} as unknown as DaemonSocketClient;
+		const mutationDrain = { begin: vi.fn(), end: vi.fn() };
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			ready: Promise.resolve(),
+			workers: new Map(),
+			protocolClientIds: new WeakMap(),
+			commandJournal,
+			mutationDrain,
+			updateRestartPhase: "fencing",
+			assertCurrentOwnership: vi.fn(async () => undefined),
+			cancelOwnedWorkerCleanup: vi.fn(),
+		}) as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		try {
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(
+					createDaemonCommandEnvelope({ type: "kill", activeSessionId: "session-1" }, "command-2", "client-1"),
+				),
+			);
+			expect(writes.join(" ")).toContain("Daemon is preparing an update restart");
+			expect(commandJournal.lookup("client-1", "command-2")).toBeUndefined();
+			expect(mutationDrain.begin).not.toHaveBeenCalled();
+			expect(mutationDrain.end).not.toHaveBeenCalled();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("fences and drains a mutation admitted at the first drain boundary before worker prepare", async () => {
