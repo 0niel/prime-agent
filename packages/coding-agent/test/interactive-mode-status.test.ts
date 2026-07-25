@@ -3543,7 +3543,6 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			completeDeferredPromptStashRelease(this: unknown): void;
 		};
 
-		// /new defers the release, then rebinds the live fields to the new session.
 		methods.releasePromptStashSession.call(fakeThis);
 		const newState = store.forSession("session-new");
 		newState.stash = { text: "new session draft" };
@@ -3553,7 +3552,6 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		fakeThis.inputSubmissionsPending = 0;
 		methods.completeDeferredPromptStashRelease.call(fakeThis);
 
-		// The old (empty) entry is released; the new session's draft survives.
 		expect(store.forSession("session-old")).not.toBe(oldState);
 		expect(store.forSession("session-new")).toBe(newState);
 		expect(newState.stash).toEqual({ text: "new session draft" });
