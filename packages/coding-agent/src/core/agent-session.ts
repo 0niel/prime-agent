@@ -5136,8 +5136,7 @@ export class AgentSession {
 				stack: normalized.stack,
 			});
 		} catch {
-			// Surfacing is best-effort; a throwing error listener must never break
-			// the pump's requeue/settle path.
+			// Best-effort: a throwing error listener must not break the pump's requeue path.
 		}
 	}
 
