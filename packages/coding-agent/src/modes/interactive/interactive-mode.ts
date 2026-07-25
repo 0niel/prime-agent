@@ -4167,10 +4167,13 @@ export class InteractiveMode {
 		return true;
 	}
 
-	private retainSubmittedDraft(stash: PromptStash, submissionGeneration: number): void {
-		this.promptStashState ??= {};
+	private retainSubmittedDraft(
+		stash: PromptStash,
+		submissionGeneration: number,
+		state: PromptStashState = this.promptStashState,
+	): void {
 		this.retainedSubmissionGenerations.set(stash, submissionGeneration);
-		const ordered = [this.promptStashState.stash, ...(this.promptStashState.queuedStashes ?? [])].filter(
+		const ordered = [state.stash, ...(state.queuedStashes ?? [])].filter(
 			(candidate): candidate is PromptStash => candidate !== undefined,
 		);
 		const insertAt = ordered.findIndex((candidate) => {
@@ -4178,8 +4181,8 @@ export class InteractiveMode {
 			return generation !== undefined && generation > submissionGeneration;
 		});
 		ordered.splice(insertAt === -1 ? ordered.length : insertAt, 0, stash);
-		this.promptStashState.stash = ordered.shift();
-		this.promptStashState.queuedStashes = ordered.length > 0 ? ordered : undefined;
+		state.stash = ordered.shift();
+		state.queuedStashes = ordered.length > 0 ? ordered : undefined;
 	}
 
 	private retainStartupPromptDrafts(prompts: readonly InteractiveInitialPrompt[]): void {
@@ -4511,6 +4514,10 @@ export class InteractiveMode {
 			const submissionGeneration = ++this.inputSubmissionGeneration;
 			this.inputSubmissionsPending++;
 			this.clearShortcutGuide();
+			// Bind the submission to the session it was typed for: a barrier wait can
+			// resume after /new or a session rebind repointed the live fields.
+			const submissionStashState = this.promptStashState;
+			const submissionSessionId = this.promptStashSessionId;
 			const promptStashToRestore = this.promptStash;
 			const liveEditorText = this.editor.getText();
 			const submittedDraft =
@@ -4872,12 +4879,14 @@ export class InteractiveMode {
 				if (
 					submissionOutcome === "lifecycle-cancelled" ||
 					this.isShuttingDown ||
-					this.returnToAgentsViewRequested
+					this.returnToAgentsViewRequested ||
+					this.promptStashSessionId !== submissionSessionId
 				) {
 					// The editor is already torn down, but its shared session stash outlives
 					// this view. Preserve the submitted draft there without overwriting an
-					// explicit older stash or touching editor state.
-					this.retainSubmittedDraft(submittedDraft ?? { text }, submissionGeneration);
+					// explicit older stash or touching editor state. Retention targets the
+					// state of the session the input was typed for, not a rebound one.
+					this.retainSubmittedDraft(submittedDraft ?? { text }, submissionGeneration, submissionStashState);
 					submissionOutcome = "lifecycle-cancelled";
 					return;
 				}
@@ -4908,7 +4917,7 @@ export class InteractiveMode {
 						this.latestEditorPromptStash = this.snapshotPromptStash(this.editor.getText());
 						if (this.promptStash === promptStashAfterClear) this.promptStash = promptStashToRestore;
 					} else {
-						this.retainSubmittedDraft(rejectedDraft, submissionGeneration);
+						this.retainSubmittedDraft(rejectedDraft, submissionGeneration, submissionStashState);
 					}
 					this.showError(error instanceof Error ? error.message : String(error));
 					return;
