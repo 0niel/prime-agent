@@ -5371,6 +5371,11 @@ export class AgentSession {
 			const admission = await this._acquireTurnAdmission();
 			try {
 				this._assertDirectTurnAdmissionAvailable();
+				if (this._queuedWorkPauses.size > 0) {
+					admission.release();
+					await this._waitForQueuedWorkAdmission();
+					continue;
+				}
 				if (
 					(options.allowStreaming === true && this.isStreaming) ||
 					(this.pendingMessageCount === 0 &&

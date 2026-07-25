@@ -2397,6 +2397,32 @@ prepared:${event.prompt}`,
 		expect(harness.session.getFollowUpMessages()).toEqual(["suspended"]);
 	});
 
+	it("rechecks queued-work pauses acquired at the direct-admission boundary", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("direct done")]);
+		const internals = harness.session as unknown as {
+			_acquireTurnAdmission(): Promise<{ owner: symbol; release(): void }>;
+		};
+		const acquireTurnAdmission = internals._acquireTurnAdmission.bind(internals);
+		let pause: { release(): void } | undefined;
+		let first = true;
+		internals._acquireTurnAdmission = async () => {
+			const admission = await acquireTurnAdmission();
+			if (first) {
+				first = false;
+				pause = harness.session.acquireQueuedWorkPause();
+			}
+			return admission;
+		};
+		const prompt = harness.session.prompt("direct");
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(getUserTexts(harness)).toEqual([]);
+		pause?.release();
+		await prompt;
+		expect(getUserTexts(harness)).toEqual(["direct"]);
+	});
+
 	it("rejects disposal while direct admission waits behind a pause", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
