@@ -356,6 +356,17 @@ const failAfterPartialTempWrite: WriteFileSync = (path, data, options) => {
 };
 
 describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
+	it("flushes rollback-aware custom messages before the first assistant response", () => {
+		const dir = createTempDir();
+		const sessionDir = join(dir, "sessions");
+		const mgr = SessionManager.create(dir, sessionDir);
+
+		mgr.appendCustomMessageEntryWithRollback("compaction_outcome", "failed early", true);
+
+		const persisted = readFileSync(mgr.getSessionFile()!, "utf8");
+		expect(persisted).toContain('"customType":"compaction_outcome"');
+	});
+
 	it("repairs the session file immediately after a torn append", () => {
 		const dir = createTempDir();
 		const sessionDir = join(dir, "sessions");

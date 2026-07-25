@@ -7331,6 +7331,7 @@ export class AgentSession {
 		message: string,
 		options: { aborted?: boolean; errorSeverity?: "warning" | "error"; customInstructions?: string } = {},
 	): void {
+		this._persistCompactionOutcome(reason, outcome, message);
 		this._emit({
 			type: "compaction_end",
 			reason,
@@ -7342,7 +7343,6 @@ export class AgentSession {
 			errorSeverity: options.errorSeverity,
 			customInstructions: options.customInstructions,
 		});
-		this._persistCompactionOutcome(reason, outcome, message);
 	}
 
 	private _persistCompactionOutcome(

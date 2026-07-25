@@ -362,6 +362,7 @@ describe("AgentSession compaction characterization", () => {
 		const endEvents: Array<{ errorMessage?: string; errorSeverity?: string }> = [];
 		harness.session.subscribe((event) => {
 			if (event.type === "compaction_end") {
+				expect(harness.session.messages.at(-1)).toMatchObject({ customType: "compaction_outcome" });
 				endEvents.push({ errorMessage: event.errorMessage, errorSeverity: event.errorSeverity });
 			}
 		});

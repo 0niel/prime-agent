@@ -1657,7 +1657,9 @@ export class SessionManager {
 	): string {
 		const previousLeafId = this.leafId;
 		try {
-			return this.appendCustomMessageEntry(customType, content, display, details);
+			const entryId = this.appendCustomMessageEntry(customType, content, display, details);
+			this.flushNow();
+			return entryId;
 		} catch (error) {
 			// The append indexes the entry before persisting it; undo exactly that.
 			if (this.leafId !== null && this.leafId !== previousLeafId) {
