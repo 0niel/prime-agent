@@ -1385,6 +1385,7 @@ export class AgentsViewMode implements Component, Focusable {
 		let activeSessionId = target.summary.activeSessionId;
 		let liveSummary = this.findSummaryByActiveSessionId(activeSessionId ?? target.key);
 		let cwdFallbackNotice: string | undefined;
+		let didResume = false;
 		try {
 			if (!activeSessionId) {
 				// Saved session: resume it into the daemon first, then deliver the
@@ -1396,6 +1397,7 @@ export class AgentsViewMode implements Component, Focusable {
 					target.summary,
 				);
 				activeSessionId = resumed.activeSessionId;
+				didResume = true;
 				// The rows are still pre-resume; the fresh summary is the authoritative
 				// streaming state for scheduling the prompt.
 				liveSummary = resumed.summary;
@@ -1414,6 +1416,7 @@ export class AgentsViewMode implements Component, Focusable {
 			return true;
 		} catch (error) {
 			this.setStatusMessage(formatError("Failed to send reply", error));
+			if (didResume) await this.refreshSessions();
 			return false;
 		}
 	}

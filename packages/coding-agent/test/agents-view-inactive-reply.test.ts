@@ -244,6 +244,7 @@ describe("agents view reply on inactive sessions", () => {
 		expect(editor.setText).toHaveBeenNthCalledWith(1, "");
 		expect(editor.getText()).toBe(replacement ?? "wake up");
 		expect(inactiveAgentIdentities.has("file:/tmp/sessions/saved-1.jsonl")).toBe(remainsInactive);
+		expect(self.refreshSessions).toHaveBeenCalledTimes(remainsInactive ? 0 : 1);
 	});
 
 	it("keeps the cwd-fallback notice visible after the reply is sent", async () => {
