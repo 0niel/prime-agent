@@ -32,7 +32,6 @@ function gateNextAgentStart(harness: Harness): { reached: Promise<void>; release
 	return { reached, release };
 }
 
-
 describe("AgentSession prompt characterization", () => {
 	it("observes already-running work when prompt admission is pre-aborted", async () => {
 		const abort = new AbortController();
@@ -1177,7 +1176,6 @@ stale post-hook extension instructions`,
 		releaseEventQueue();
 		await harness.session.waitForIdle();
 
-
 		expect(sawRestoredNextTurn).toBe(true);
 		expect(getUserTexts(harness)).toEqual(["newer prompt"]);
 		expect(getAssistantTexts(harness)).toEqual(["newer response"]);
@@ -1299,7 +1297,6 @@ stale post-hook extension instructions`,
 			(harness.session as unknown as { _acceptedAgentMessagePrompt?: unknown })._acceptedAgentMessagePrompt,
 		).toBeUndefined();
 	});
-
 
 	it("promptAndWait queued behind an active turn stays pending through its own completion", async () => {
 		let releaseFirst: (() => void) | undefined;
