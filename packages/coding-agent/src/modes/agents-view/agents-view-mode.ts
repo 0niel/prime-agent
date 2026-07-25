@@ -975,7 +975,6 @@ export class AgentsViewMode implements Component, Focusable {
 	private queryChanged(): void {
 		this.persistentState.query = this.editor.getText();
 		this.rebuildRows();
-		this.selectedIndex = this.getSelectableRowIndexes()[0] ?? 0;
 		this.syncSelectedRowState();
 		this.ui.requestRender();
 	}
