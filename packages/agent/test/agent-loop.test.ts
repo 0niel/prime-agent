@@ -1487,8 +1487,7 @@ describe("agentLoop with AgentMessage", () => {
 				convertToLlm: identityConverter,
 				shouldStopBeforeTurn: () => stopRequested,
 				getSteeringMessages: async () => {
-					// Only the post-tool-batch poll returns steering; the stop flips
-					// during that same poll.
+					// Only the post-tool-batch poll returns steering; the stop flips during it.
 					if (llmCalls !== 1 || stopRequested) return [];
 					stopRequested = true;
 					return [createUserMessage("late steer")];
@@ -1522,7 +1521,6 @@ describe("agentLoop with AgentMessage", () => {
 				injected.push(text);
 			}
 		}
-		// The drained steering message must reach the conversation, not vanish.
 		expect(injected).toContain("late steer");
 		expect(llmCalls).toBe(2);
 	});

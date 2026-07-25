@@ -162,8 +162,7 @@ function createPromptStashHarness(
 	options: { text?: string; expandedText?: string; stash?: string; pasteSnapshot?: FakePasteSnapshot } = {},
 ) {
 	const harness: PromptStashHarness = {
-		// Backing state only: promptStash reads/writes go through the prototype
-		// accessor so retainSubmittedDraft and the tests see the same storage.
+		// promptStash reads/writes go through the prototype accessor onto this state.
 		promptStashState: {
 			stash: options.stash ? { text: options.stash, pasteSnapshot: options.pasteSnapshot } : undefined,
 		},
