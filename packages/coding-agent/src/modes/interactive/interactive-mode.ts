@@ -1167,8 +1167,7 @@ export class InteractiveMode {
 
 	private releasePromptStashSession(): void {
 		if (this.inputSubmissionsPending > 0) {
-			// Capture the pair now: bindPromptStashSession may rebind the fields
-			// to a new session before the deferred release fires.
+			// Capture the pair: a rebind may repoint the fields before the deferred release fires.
 			if (this.promptStashSessionId) {
 				this.pendingPromptStashRelease = { sessionId: this.promptStashSessionId, state: this.promptStashState };
 			}
@@ -1185,9 +1184,6 @@ export class InteractiveMode {
 		if (!pending) return;
 		this.pendingPromptStashRelease = undefined;
 		if (!this.promptStashStore) return;
-		// Released against the captured pair; if the same session was rebound in
-		// the meantime, the live state object is identical and stays retained by
-		// the store's own emptiness check.
 		this.promptStashStore.release(pending.sessionId, pending.state);
 	}
 
