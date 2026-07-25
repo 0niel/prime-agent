@@ -36,7 +36,11 @@ type AgentDaemonUpdateInternals = {
 		abort: AbortController;
 		phase: "preparing" | "fencing" | "prepared" | "publishing";
 		manifest?: DaemonUpdateRestartManifest;
+		owner?: DaemonSocketClient;
 	};
+	supervisorClaims: Map<DaemonSocketClient, unknown>;
+	revokeSupervisorClaim(client: DaemonSocketClient): boolean;
+	shutdown(exitCode: number): Promise<never>;
 	cancelPreparedUpdateRestart(transactionId?: symbol): void;
 	commitPreparedUpdateRestart(transactionId: symbol): Promise<DaemonUpdateRestartManifest>;
 };
@@ -448,6 +452,29 @@ describe("issue #4257 update restart resume", () => {
 				await internals.handleWorkerCommand(owner, { id: "commit", type: "worker_commit_update" });
 
 				expect(internals.updateRestart).toBeUndefined();
+			},
+		},
+		{
+			name: "finishes publishing then exits when its owning supervisor is replaced",
+			run: async ({ internals, makeClient }) => {
+				const owner = makeClient("owner");
+				internals.supervisorClaims.set(owner, {});
+				await internals.handleWorkerCommand(owner, { id: "prepare", type: "worker_prepare_update" });
+				const transaction = internals.updateRestart;
+				expect(transaction).toBeDefined();
+				const publish = createDeferred<DaemonUpdateRestartManifest>();
+				vi.spyOn(internals, "commitPreparedUpdateRestart").mockImplementationOnce(() => publish.promise);
+				const shutdown = vi.spyOn(internals, "shutdown").mockImplementation(() => new Promise<never>(() => {}));
+
+				const commit = internals.handleWorkerCommand(owner, { id: "commit", type: "worker_commit_update" });
+				await vi.waitFor(() => expect(transaction?.phase).toBe("publishing"));
+				internals.revokeSupervisorClaim(owner);
+				expect(transaction?.phase).toBe("publishing");
+				publish.resolve(transaction!.manifest!);
+				await commit;
+				await new Promise<void>((resolve) => setImmediate(resolve));
+
+				expect(shutdown).toHaveBeenCalledWith(0);
 			},
 		},
 		{

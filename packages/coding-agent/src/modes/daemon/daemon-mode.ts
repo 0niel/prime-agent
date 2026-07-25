@@ -2772,6 +2772,9 @@ export class AgentDaemon {
 						throw error;
 					}
 					this.writeWorkerSuccess(client, command, manifest);
+					if (!this.supervisorClaims.has(client)) {
+						setImmediate(() => void this.shutdown(0));
+					}
 					return;
 				}
 				case "worker_cancel_update": {
