@@ -4243,10 +4243,9 @@ export class AgentSession {
 		// Settle the preflight outcome at the handoff, not after the whole turn: the
 		// direct-prompt section must keep fencing update-restart checkpoints until
 		// message_start proves the input reached the run's event stream, and a
-		// rejected dispatch must still release the section. A resolved prompt is
-		// not proof by itself: Agent.prompt() converts lifecycle failures into a
-		// synthetic error turn, so on resolution confirm the message reached
-		// agent state before releasing the checkpoint fence.
+		// rejected dispatch must still release the section. A resolved prompt alone
+		// is not proof: Agent.prompt() converts lifecycle failures into a synthetic
+		// error turn without the message ever reaching agent state.
 		const dispatched = await Promise.race([
 			promptPromise.then(
 				() => dispatchObserver.wasObserved() || this.agent.state.messages.includes(message),
