@@ -1401,6 +1401,7 @@ describe("InteractiveMode connection events", () => {
 				}),
 			},
 			sessionEventQueue: Promise.resolve(),
+			sessionEventGeneration: 0,
 			renderResyncedSession: vi.fn(async () => {}),
 			refreshCommandCatalogForCurrentSession: vi.fn(async () => {}),
 			resetSideQuestion: vi.fn(),
@@ -1429,6 +1430,54 @@ describe("InteractiveMode connection events", () => {
 		expect(fakeThis.resetExtensionUI).not.toHaveBeenCalled();
 		expect(fakeThis.resetCurrentSessionRenderState).not.toHaveBeenCalled();
 		expect(fakeThis.rebindCurrentSession).not.toHaveBeenCalled();
+	});
+
+	test("drops a resync superseded while its command catalog refreshes", async () => {
+		type ConnectionEvent =
+			| { type: "session_resynced"; snapshot: { state: AgentConnectionState; messages: [] } }
+			| { type: "session_replaced"; state: AgentConnectionState; messages: [] };
+		let listener: ((event: ConnectionEvent) => Promise<void> | void) | undefined;
+		let releaseCatalog = () => {};
+		const catalog = new Promise<void>((resolve) => {
+			releaseCatalog = resolve;
+		});
+		const fakeThis = {
+			agentConnection: {
+				subscribe: vi.fn((callback) => {
+					listener = callback;
+					return vi.fn();
+				}),
+			},
+			sessionEventQueue: Promise.resolve(),
+			sessionEventGeneration: 0,
+			refreshCommandCatalogForCurrentSession: vi.fn(() => catalog),
+			renderResyncedSession: vi.fn(async () => {}),
+			resetSideQuestion: vi.fn(),
+			resetExtensionUI: vi.fn(),
+			applyConnectionStateSnapshot: vi.fn(),
+			resetCurrentSessionRenderState: vi.fn(),
+			rebindCurrentSession: vi.fn(async () => {}),
+			renderInitialMessages: vi.fn(async () => {}),
+			ui: { requestRender: vi.fn() },
+			handleEvent: vi.fn(),
+			handleConnectionExtensionUiRequest: vi.fn(),
+			showError: vi.fn(),
+		};
+		(InteractiveMode.prototype as unknown as { subscribeToAgent(this: typeof fakeThis): void }).subscribeToAgent.call(
+			fakeThis,
+		);
+
+		const resync = listener?.({
+			type: "session_resynced",
+			snapshot: { state: createConnectionState(), messages: [] },
+		});
+		await vi.waitFor(() => expect(fakeThis.refreshCommandCatalogForCurrentSession).toHaveBeenCalledOnce());
+		const replacement = listener?.({ type: "session_replaced", state: createConnectionState(), messages: [] });
+		releaseCatalog();
+		await Promise.all([resync, replacement]);
+
+		expect(fakeThis.renderResyncedSession).not.toHaveBeenCalled();
+		expect(fakeThis.renderInitialMessages).toHaveBeenCalledOnce();
 	});
 
 	test("preserves client-local work while rendering a resynchronized snapshot", async () => {

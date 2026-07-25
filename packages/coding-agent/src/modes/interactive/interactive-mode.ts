@@ -5078,13 +5078,16 @@ export class InteractiveMode {
 					this.sessionEventQueue = run.catch(() => {});
 					await run;
 				} else if (event.type === "session_resynced") {
+					const generation = this.sessionEventGeneration;
 					const run = this.sessionEventQueue.then(async () => {
+						if (generation !== this.sessionEventGeneration) return false;
 						await this.refreshCommandCatalogForCurrentSession?.();
+						if (generation !== this.sessionEventGeneration) return false;
 						await this.renderResyncedSession(event.snapshot);
+						return true;
 					});
-					this.sessionEventQueue = run.catch(() => {});
-					await run;
-					this.ui.requestRender();
+					this.sessionEventQueue = run.then(() => undefined).catch(() => {});
+					if (await run) this.ui.requestRender();
 				} else if (event.type === "session_status") {
 					this.sessionRecap = event.recap;
 					this.patchConnectionState({ recap: event.recap });
