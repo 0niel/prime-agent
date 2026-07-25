@@ -126,7 +126,6 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"transient_bash",
 	"session_input_admission",
 	"prompt_admission_cancellation",
-
 ];
 
 export interface DaemonRuntimeIdentity {
