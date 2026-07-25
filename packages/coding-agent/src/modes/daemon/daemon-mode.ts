@@ -2657,6 +2657,7 @@ export class AgentDaemon {
 				? !UPDATE_RESTART_DRAIN_COMMANDS.has(command.type)
 				: restartPhase !== undefined && command.type !== "shutdown";
 		if (mutation && restartRejected) {
+			clearParsedAdmission();
 			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
 			return;
 		}

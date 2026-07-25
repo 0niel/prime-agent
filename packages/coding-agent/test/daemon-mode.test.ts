@@ -4790,6 +4790,36 @@ describe("daemon mode helpers", () => {
 		expect(internals.promptAdmissions.size).toBe(0);
 	});
 
+	it("clears prompt admission when restart fencing rejects before dispatch", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const client = makeClient("client", "active-1");
+		client.socket = { destroyed: false, write: vi.fn(() => true), end: vi.fn() } as unknown as Socket;
+		const internals = daemon as unknown as {
+			promptAdmissions: Map<string, unknown>;
+			updateRestart: { phase: "fencing" };
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+		internals.updateRestart = { phase: "fencing" };
+
+		await internals.handleLine(
+			client,
+			JSON.stringify({
+				id: "prompt-1",
+				type: "prompt",
+				activeSessionId: "active-1",
+				message: "blocked",
+				admissionId: "retryable-admission",
+			}),
+		);
+
+		expect(internals.promptAdmissions.size).toBe(0);
+	});
+
 	it.each(["success", "late-failure", "replacement"] as const)(
 		"handles cancellation followed by supervisor-claim %s without affecting the wrong socket binding",
 		async (outcome) => {
