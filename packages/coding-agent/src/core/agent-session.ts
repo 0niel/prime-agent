@@ -5205,6 +5205,14 @@ export class AgentSession {
 		return { steering, followUp };
 	}
 
+	private _invalidateQueuedPromptPreparation(): void {
+		for (const queue of [this._steeringMessages, this._followUpMessages]) {
+			for (const input of queue) {
+				if (input.kind === "prompt") input.preparation = undefined;
+			}
+		}
+	}
+
 	private _removeActivePreparingPrompts(predicate: (message: PreparedPromptInput) => boolean): {
 		steering: PreparedPromptInput[];
 		followUp: PreparedPromptInput[];
@@ -9503,6 +9511,9 @@ export class AgentSession {
 			this.agent.state.messages = sessionContext.messages;
 			this._restoreLateIpythonSentAgentMessages();
 			this._reloadGoalStateFromBranch();
+			// Queued prompts prepared against the old branch must re-run
+			// before_agent_start against the new context.
+			this._invalidateQueuedPromptPreparation();
 
 			// Emit session_tree event
 			await this._extensionRunner.emit({

@@ -756,6 +756,43 @@ describe("AgentSession queue characterization", () => {
 		await vi.waitFor(() => expect(getUserTexts(harness)).toContain("after navigation"));
 	});
 
+	it("invalidates queued prompt preparation on branch navigation", async () => {
+		let pause: { release(): void } | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event) => {
+						if (event.prompt === "queued" && !pause) pause = harness.session.acquireQueuedWorkPause();
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one")]);
+		await harness.session.prompt("first");
+		const target = harness.sessionManager.getEntries().find((entry) => entry.type === "message");
+		expect(target).toBeDefined();
+
+		// Preparation completes, then the pause defers the handoff and requeues.
+		withStreaming(harness, true);
+		await harness.session.followUp("queued", undefined, { resumeIfIdle: true });
+		withStreaming(harness, false);
+		await vi.waitFor(() => expect(pause).toBeDefined());
+		await harness.session.waitForSessionInputIdle();
+		const queued = (harness.session as unknown as { _followUpMessages: { preparation?: unknown }[] })
+			._followUpMessages;
+		await vi.waitFor(() => expect(queued[0]?.preparation).toBeDefined());
+
+		// The branch switch must clear the cached preparation so
+		// before_agent_start re-runs against the new context on the next pump.
+		const navigation = harness.session.navigateTree(target!.id, { summarize: false });
+		pause?.release();
+		pause = undefined;
+		await navigation;
+
+		expect(queued[0]?.preparation).toBeUndefined();
+	});
+
 	it("does not apply stale auto-refine cooldown when a review completes after branch navigation", async () => {
 		const reviewStarted = createDeferred();
 		const reviewer = vi.fn(async () => {
