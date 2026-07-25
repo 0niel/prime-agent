@@ -7,6 +7,7 @@ import {
 	buildAutonomousGateFailureContinuation,
 } from "../core/autonomous.js";
 import {
+	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	type CompactionOutcomeMessage,
 	isCompactionOutcomeMessage,
 	isSessionSlashCommandResultMessage,
@@ -29,9 +30,18 @@ export function selectHeadlessTerminalResult(messages: readonly AgentMessage[]):
 	const compactionOutcomes: CompactionOutcomeMessage[] = [];
 	while (index >= 0) {
 		const message = messages[index];
-		if (!isCompactionOutcomeMessage(message)) break;
-		compactionOutcomes.unshift(message);
-		index--;
+		if (isCompactionOutcomeMessage(message)) {
+			compactionOutcomes.unshift(message);
+			index--;
+			continue;
+		}
+		// A corrupt outcome is still part of the terminal outcome suffix. Skip it
+		// without letting it hide earlier valid outcomes or their failure status.
+		if (message.role === "custom" && message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE) {
+			index--;
+			continue;
+		}
+		break;
 	}
 	const precedingMessage = messages[index];
 	const primary =

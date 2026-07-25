@@ -183,6 +183,20 @@ describe("runPrintMode", () => {
 		expect(errorSpy).toHaveBeenCalledWith("Requested compaction skipped");
 	});
 
+	it("skips malformed terminal outcomes without hiding earlier valid failures", () => {
+		const failed = createCompactionOutcomeMessage("Compaction failed", {
+			reason: "requested",
+			outcome: "failed",
+		});
+		const malformed = { ...failed, details: { reason: "unknown", outcome: "failed" } } as AgentMessage;
+		const assistant = createAssistantMessage({ text: "done" });
+
+		expect(selectHeadlessTerminalResult([assistant, failed, malformed])).toEqual({
+			primary: assistant,
+			compactionOutcomes: [failed],
+		});
+	});
+
 	it("does not select a result across a message barrier", () => {
 		const outcome = createCompactionOutcomeMessage("Requested compaction skipped", {
 			reason: "requested",
