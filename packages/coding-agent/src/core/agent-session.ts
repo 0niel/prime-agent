@@ -5412,7 +5412,7 @@ export class AgentSession {
 				this._assertDirectTurnAdmissionAvailable();
 				if (this._queuedWorkPauses.size > 0) {
 					admission.release();
-					await this._waitForQueuedWorkAdmission();
+					await this._waitForQueuedWorkAdmission(options.signal);
 					continue;
 				}
 				if (
