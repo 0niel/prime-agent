@@ -834,6 +834,9 @@ export class InteractiveMode {
 	private latestEditorPromptStash: PromptStash | undefined;
 	private pendingSubmittedPromptStash: PromptStash | undefined;
 	private inputSubmissionGeneration = 0;
+	private inputSubmissionsPending = 0;
+	private promptStashReleasePending = false;
+	private readonly retainedSubmissionGenerations = new WeakMap<PromptStash, number>();
 	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
 	private returnToAgentsViewRequested = false;
 	private loadingAnimation: Loader | undefined = undefined;
@@ -1148,6 +1151,11 @@ export class InteractiveMode {
 	}
 
 	private releasePromptStashSession(): void {
+		if (this.inputSubmissionsPending > 0) {
+			this.promptStashReleasePending = true;
+			return;
+		}
+		this.promptStashReleasePending = false;
 		if (this.promptStashStore && this.promptStashSessionId) {
 			this.promptStashStore.release(this.promptStashSessionId, this.promptStashState);
 		}
@@ -4110,14 +4118,19 @@ export class InteractiveMode {
 		return true;
 	}
 
-	private retainSubmittedDraft(stash: PromptStash): void {
+	private retainSubmittedDraft(stash: PromptStash, submissionGeneration: number): void {
 		this.promptStashState ??= {};
-		if (this.promptStash === undefined) {
-			this.promptStash = stash;
-		} else {
-			this.promptStashState.queuedStashes ??= [];
-			this.promptStashState.queuedStashes.push(stash);
-		}
+		this.retainedSubmissionGenerations.set(stash, submissionGeneration);
+		const ordered = [this.promptStashState.stash, ...(this.promptStashState.queuedStashes ?? [])].filter(
+			(candidate): candidate is PromptStash => candidate !== undefined,
+		);
+		const insertAt = ordered.findIndex((candidate) => {
+			const generation = this.retainedSubmissionGenerations.get(candidate);
+			return generation !== undefined && generation > submissionGeneration;
+		});
+		ordered.splice(insertAt === -1 ? ordered.length : insertAt, 0, stash);
+		this.promptStashState.stash = ordered.shift();
+		this.promptStashState.queuedStashes = ordered.length > 0 ? ordered : undefined;
 	}
 
 	private getPromptStashImages(text: string): readonly (readonly [number, ImageContent])[] {
@@ -4389,6 +4402,7 @@ export class InteractiveMode {
 			text = text.trim();
 			if (!text) return;
 			const submissionGeneration = ++this.inputSubmissionGeneration;
+			this.inputSubmissionsPending++;
 			this.clearShortcutGuide();
 			const promptStashToRestore = this.promptStash;
 			const liveEditorText = this.editor.getText();
@@ -4749,7 +4763,7 @@ export class InteractiveMode {
 					// The editor is already torn down, but its shared session stash outlives
 					// this view. Preserve the submitted draft there without overwriting an
 					// explicit older stash or touching editor state.
-					this.retainSubmittedDraft(submittedDraft ?? { text });
+					this.retainSubmittedDraft(submittedDraft ?? { text }, submissionGeneration);
 					submissionOutcome = "lifecycle-cancelled";
 					return;
 				}
@@ -4780,7 +4794,7 @@ export class InteractiveMode {
 						this.latestEditorPromptStash = this.snapshotPromptStash(this.editor.getText());
 						if (this.promptStash === promptStashAfterClear) this.promptStash = promptStashToRestore;
 					} else {
-						this.retainSubmittedDraft(rejectedDraft);
+						this.retainSubmittedDraft(rejectedDraft, submissionGeneration);
 					}
 					this.showError(error instanceof Error ? error.message : String(error));
 					return;
@@ -4798,6 +4812,10 @@ export class InteractiveMode {
 					submissionGeneration === this.inputSubmissionGeneration
 				) {
 					this.restorePromptStashIfEditorEmpty(promptStashToRestore);
+				}
+				this.inputSubmissionsPending--;
+				if (this.inputSubmissionsPending === 0 && this.promptStashReleasePending) {
+					this.releasePromptStashSession();
 				}
 			}
 		};

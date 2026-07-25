@@ -621,8 +621,12 @@ type SubmitHandlerHarness = {
 	latestEditorPromptStash?: unknown;
 	pendingSubmittedPromptStash?: unknown;
 	snapshotPromptStash: (text: string) => unknown;
-	retainSubmittedDraft: (stash: unknown) => void;
+	retainSubmittedDraft: (stash: unknown, submissionGeneration: number) => void;
 	inputSubmissionGeneration: number;
+	inputSubmissionsPending: number;
+	promptStashReleasePending: boolean;
+	retainedSubmissionGenerations: WeakMap<object, number>;
+	releasePromptStashSession?: () => void;
 	flushPendingBashComponents: () => void;
 	collectImagesFor: () => unknown[];
 	updatePendingMessagesDisplay: () => void;
@@ -655,15 +659,14 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 		pastedImages: new Map(),
 		getPromptStashImages: vi.fn(() => []),
 		snapshotPromptStash: vi.fn((text) => ({ text })),
-		retainSubmittedDraft(stash) {
-			if (!this.promptStashState.stash) this.promptStashState.stash = stash as { text: string };
-			else {
-				this.promptStashState.queuedStashes ??= [];
-				this.promptStashState.queuedStashes.push(stash as { text: string });
-			}
-		},
+		retainSubmittedDraft: (
+			InteractiveMode.prototype as unknown as { retainSubmittedDraft(stash: unknown, generation: number): void }
+		).retainSubmittedDraft,
 		submittedInputBehavior: "steer",
 		inputSubmissionGeneration: 0,
+		inputSubmissionsPending: 0,
+		promptStashReleasePending: false,
+		retainedSubmissionGenerations: new WeakMap(),
 		flushPendingBashComponents: vi.fn(),
 		collectImagesFor: vi.fn(() => []),
 		updatePendingMessagesDisplay: vi.fn(),
@@ -2939,6 +2942,60 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			});
 		},
 	);
+
+	test("defers stash-store release until lifecycle-retained submissions settle", () => {
+		const store = new ClientPromptStashStore();
+		const state = store.forSession("session-a");
+		const fakeThis = {
+			inputSubmissionsPending: 1,
+			promptStashReleasePending: false,
+			promptStashStore: store,
+			promptStashSessionId: "session-a",
+			promptStashState: state,
+			retainedSubmissionGenerations: new WeakMap(),
+		};
+		const release = (
+			InteractiveMode.prototype as unknown as { releasePromptStashSession(this: unknown): void }
+		).releasePromptStashSession;
+		const retain = (
+			InteractiveMode.prototype as unknown as {
+				retainSubmittedDraft(this: unknown, stash: { text: string }, generation: number): void;
+			}
+		).retainSubmittedDraft;
+
+		release.call(fakeThis);
+		expect(fakeThis.promptStashReleasePending).toBe(true);
+		expect(store.forSession("session-a")).toBe(state);
+		retain.call(fakeThis, { text: "retained" }, 1);
+		fakeThis.inputSubmissionsPending = 0;
+		release.call(fakeThis);
+		expect(store.forSession("session-a")).toBe(state);
+		expect(state.stash).toEqual({ text: "retained" });
+	});
+
+	test("orders retained drafts by submission rather than rejection", () => {
+		const state: PromptStashState = {};
+		const fakeThis = {
+			promptStashState: state,
+			retainedSubmissionGenerations: new WeakMap(),
+		};
+		Object.defineProperty(fakeThis, "promptStash", {
+			get: () => state.stash,
+			set: (stash) => {
+				state.stash = stash;
+			},
+		});
+		const retain = (
+			InteractiveMode.prototype as unknown as {
+				retainSubmittedDraft(this: unknown, stash: { text: string }, generation: number): void;
+			}
+		).retainSubmittedDraft;
+
+		retain.call(fakeThis, { text: "second" }, 2);
+		retain.call(fakeThis, { text: "first" }, 1);
+		expect(state.stash).toEqual({ text: "first" });
+		expect(state.queuedStashes).toEqual([{ text: "second" }]);
+	});
 
 	test("retains every blocked submission in submission order on lifecycle cancellation", async () => {
 		const inputDone = createDeferred<void>();
