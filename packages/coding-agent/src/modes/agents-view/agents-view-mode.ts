@@ -1399,7 +1399,9 @@ export class AgentsViewMode implements Component, Focusable {
 				liveSummary = resumed.summary;
 				cwdFallbackNotice = resumed.cwdFallbackNotice;
 				this.inactiveAgentIdentities.delete(getSummaryIdentity(target.summary));
-				this.selectSummary(resumed.summary);
+				// The resume and delivery still belong to this submission, but selection
+				// belongs to the current composer. Do not steal it after cancellation.
+				if (this.replyTarget === target) this.selectSummary(resumed.summary);
 			}
 			const behavior = liveSummary?.isStreaming ? "followUp" : undefined;
 			this.setStatusMessage("Sending reply...");

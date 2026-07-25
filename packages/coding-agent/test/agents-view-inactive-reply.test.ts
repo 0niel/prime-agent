@@ -86,9 +86,11 @@ describe("agents view reply on inactive sessions", () => {
 			}
 			return { success: true, data: {} };
 		});
+		const target = { key: "saved-1", summary: savedSummary };
 		const self: Record<string, unknown> = {
 			options: { config: { cwd: process.cwd() } },
 			requireClient: () => ({ request }),
+			replyTarget: target,
 			// Stale pre-resume rows do not know the resumed session; scheduling must
 			// come from the resume response instead.
 			findSummaryByActiveSessionId: () => undefined,
@@ -100,7 +102,7 @@ describe("agents view reply on inactive sessions", () => {
 			sendPrompt: vi.fn(async () => {}),
 		};
 
-		await invoke("sendReply", self, { key: "saved-1", summary: savedSummary }, "wake up");
+		await invoke("sendReply", self, target, "wake up");
 
 		expect(request).toHaveBeenCalledWith(
 			expect.objectContaining({ type: "create", sessionPath: savedSummary.sessionFile }),
@@ -109,6 +111,46 @@ describe("agents view reply on inactive sessions", () => {
 		expect(self.selectSummary).toHaveBeenCalledWith(expect.objectContaining({ activeSessionId: "active-9" }));
 		expect(self.inactiveAgentIdentities).not.toContain("file:/tmp/sessions/saved-1.jsonl");
 		expect(self.setReplyTarget).not.toHaveBeenCalled();
+	});
+
+	it("does not select a resumed session after its reply target is cancelled", async () => {
+		let finishResume: ((result: { success: true; data: SessionSummary }) => void) | undefined;
+		const request = vi.fn(
+			() =>
+				new Promise<{ success: true; data: SessionSummary }>((resolve) => {
+					finishResume = resolve;
+				}),
+		);
+		const target = { key: "saved-1", summary: savedSummary };
+		const selection = { activeSessionId: "active-2" };
+		const selectSummary = vi.fn((next: SessionSummary) => {
+			selection.activeSessionId = next.activeSessionId ?? next.id;
+		});
+		const sendPrompt = vi.fn(async () => {});
+		const self: Record<string, unknown> = {
+			options: { config: { cwd: process.cwd() } },
+			requireClient: () => ({ request }),
+			findSummaryByActiveSessionId: () => undefined,
+			inactiveAgentIdentities: new Set(["file:/tmp/sessions/saved-1.jsonl"]),
+			replyTarget: target,
+			setStatusMessage: vi.fn(),
+			selectSummary,
+			sendPrompt,
+		};
+
+		const reply = invoke("sendReply", self, target, "wake up") as Promise<boolean>;
+		await vi.waitFor(() => expect(request).toHaveBeenCalledOnce());
+		self.replyTarget = undefined;
+		finishResume?.({
+			success: true,
+			data: { ...savedSummary, lifecycle: "live", activeSessionId: "active-9" },
+		});
+
+		await expect(reply).resolves.toBe(true);
+		expect(selectSummary).not.toHaveBeenCalled();
+		expect(selection.activeSessionId).toBe("active-2");
+		expect(sendPrompt).toHaveBeenCalledWith("active-9", "wake up", undefined);
+		expect(self.inactiveAgentIdentities).not.toContain("file:/tmp/sessions/saved-1.jsonl");
 	});
 
 	it("preserves a replacement composer when an older reply succeeds", async () => {
