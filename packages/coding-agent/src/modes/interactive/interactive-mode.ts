@@ -4853,7 +4853,7 @@ export class InteractiveMode {
 				// before the barrier settled, so append this blocked submission behind them
 				// and never let it prompt or overtake them.
 				if (submissionOutcome === "retained") {
-					this.retainSubmittedDraft(submittedDraft ?? { text });
+					this.retainSubmittedDraft(submittedDraft ?? { text }, submissionGeneration);
 					return;
 				}
 				// The barrier also settles when the run lifecycle ends; a submit resumed

@@ -19,6 +19,10 @@ describe("image markers", () => {
 		expect(imageMarkerIds("no markers here")).toEqual([]);
 	});
 
+	test("imageMarkerIds ignores ids outside the safe integer range", () => {
+		expect(imageMarkerIds("[image #7] [image #9007199254740992]")).toEqual([7]);
+	});
+
 	test("remapImageMarkers replaces every spelling of the numeric id", () => {
 		expect(remapImageMarkers("[image #1] [image #01] [image #2]", new Map([[1, 7]]))).toBe(
 			"[image #7] [image #7] [image #2]",

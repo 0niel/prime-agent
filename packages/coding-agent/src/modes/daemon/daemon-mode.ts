@@ -2432,8 +2432,9 @@ export class AgentDaemon {
 	 * Parse and synchronously register prompt admission before returning a promise.
 	 * This method is intentionally non-async: handleLine invokes it before its first await.
 	 */
-	private parseCommandAndRegisterPromptAdmission(line: string): unknown {
+	private parseCommandAndRegisterPromptAdmission(client: DaemonSocketClient, line: string): unknown {
 		const wireValue = JSON.parse(line) as unknown;
+		if (isDaemonCommandEnvelope(wireValue) && wireValue.clientId) client.id = wireValue.clientId;
 		const parsed = (isDaemonCommandEnvelope(wireValue) ? { ...wireValue.command, id: wireValue.id } : wireValue) as {
 			type?: unknown;
 			activeSessionId?: unknown;
@@ -2465,7 +2466,7 @@ export class AgentDaemon {
 		let clearParsedAdmission = () => {};
 		let promptHandlerOwnsAdmission = false;
 		try {
-			const parsed = this.parseCommandAndRegisterPromptAdmission(line) as {
+			const parsed = this.parseCommandAndRegisterPromptAdmission(client, line) as {
 				id?: unknown;
 				type?: unknown;
 				token?: unknown;

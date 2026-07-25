@@ -22,9 +22,25 @@ import {
 	shouldSendDaemonOutboundToClient,
 	waitForDaemonPromptAdmission,
 } from "../src/modes/daemon/daemon-mode.js";
-import type { DaemonAttachResult, DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
+import {
+	createDaemonCommandEnvelope,
+	type DaemonAttachResult,
+	type DaemonCommand,
+} from "../src/modes/daemon/daemon-protocol.js";
 
 describe("daemon mode helpers", () => {
+	it("preserves envelope client identity while registering prompt admission", () => {
+		const daemon = new AgentDaemon("/tmp/unused-daemon.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const client = makeClient("worker-socket", "active");
+		const parse = Reflect.get(daemon, "parseCommandAndRegisterPromptAdmission").bind(daemon);
+
+		parse(client, JSON.stringify(createDaemonCommandEnvelope({ type: "list" }, "request-1", "public-client")));
+		expect(client.id).toBe("public-client");
+	});
+
 	it("observes supplied work when prompt admission is already aborted", async () => {
 		const controller = new AbortController();
 		controller.abort();
@@ -4868,7 +4884,7 @@ describe("daemon mode helpers", () => {
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
 			promptAdmissions: Map<string, unknown>;
-			parseCommandAndRegisterPromptAdmission(line: string): unknown;
+			parseCommandAndRegisterPromptAdmission(client: DaemonSocketClient, line: string): unknown;
 			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
 		};
 		internals.sessions.set(state.activeSessionId, state);
@@ -4876,6 +4892,7 @@ describe("daemon mode helpers", () => {
 		client.socket = { destroyed: false, write: vi.fn(() => true) } as unknown as Socket;
 
 		internals.parseCommandAndRegisterPromptAdmission(
+			client,
 			JSON.stringify({
 				type: "prompt",
 				activeSessionId: state.activeSessionId,
@@ -4903,6 +4920,7 @@ describe("daemon mode helpers", () => {
 
 		// Once ownership commits the same cancellation is a no-op.
 		internals.parseCommandAndRegisterPromptAdmission(
+			client,
 			JSON.stringify({
 				type: "prompt",
 				activeSessionId: state.activeSessionId,
@@ -4944,12 +4962,15 @@ describe("daemon mode helpers", () => {
 			sessions: Map<string, ActiveSessionState>;
 			agentMessageTargetLocks: Map<string, Promise<void>>;
 			promptAdmissions: Map<string, unknown>;
-			parseCommandAndRegisterPromptAdmission(line: string): unknown;
+			parseCommandAndRegisterPromptAdmission(client: DaemonSocketClient, line: string): unknown;
 			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
 		};
 		internals.sessions.set(state.activeSessionId, state);
 		internals.agentMessageTargetLocks.set(state.activeSessionId, new Promise(() => {}));
+		const client = makeClient("client-lock", state.activeSessionId);
+		client.socket = { destroyed: false, write: vi.fn(() => true) } as unknown as Socket;
 		internals.parseCommandAndRegisterPromptAdmission(
+			client,
 			JSON.stringify({
 				type: "prompt",
 				activeSessionId: state.activeSessionId,
@@ -4957,8 +4978,6 @@ describe("daemon mode helpers", () => {
 				admissionId: "lock-admission",
 			}),
 		);
-		const client = makeClient("client-lock", state.activeSessionId);
-		client.socket = { destroyed: false, write: vi.fn(() => true) } as unknown as Socket;
 		internals.handleCommand(client, {
 			type: "prompt",
 			activeSessionId: state.activeSessionId,
@@ -4985,10 +5004,12 @@ describe("daemon mode helpers", () => {
 		});
 		const internals = daemon as unknown as {
 			promptAdmissions: Map<string, { status: string; controller?: AbortController }>;
-			parseCommandAndRegisterPromptAdmission(line: string): unknown;
+			parseCommandAndRegisterPromptAdmission(client: DaemonSocketClient, line: string): unknown;
 			abortWaitingPromptAdmissionsForSession(activeSessionId: string): void;
 		};
+		const client = makeClient("client-closing", "closing-session");
 		internals.parseCommandAndRegisterPromptAdmission(
+			client,
 			JSON.stringify({
 				type: "prompt",
 				activeSessionId: "closing-session",
