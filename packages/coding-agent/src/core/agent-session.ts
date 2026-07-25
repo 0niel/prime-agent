@@ -5113,12 +5113,17 @@ export class AgentSession {
 
 	private _surfaceSessionInputError(error: unknown): void {
 		const normalized = this._asError(error);
-		this._extensionRunner.emitError({
-			extensionPath: "<session-input>",
-			event: "session_input",
-			error: normalized.message,
-			stack: normalized.stack,
-		});
+		try {
+			this._extensionRunner.emitError({
+				extensionPath: "<session-input>",
+				event: "session_input",
+				error: normalized.message,
+				stack: normalized.stack,
+			});
+		} catch {
+			// Surfacing is best-effort; a throwing error listener must never break
+			// the pump's requeue/settle path.
+		}
 	}
 
 	private async _startPreparedPromptItems(
