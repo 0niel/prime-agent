@@ -10,7 +10,7 @@ import type { PromptTemplate } from "../../src/core/prompt-templates.js";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.js";
 import { createTestResourceLoader } from "../utilities.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
-import { createWaitingHarness } from "./scheduling.js";
+import { createWaitingHarness, gatedHook } from "./scheduling.js";
 
 // acceptAgentMessagePrompt admission is asynchronous. Pause after agent.prompt has
 // synchronously claimed the run, but before its prompt messages become delivered.
@@ -560,6 +560,45 @@ stale injected extension instructions`,
 		expect(providerSystemPrompt).toContain("refined injected base");
 		expect(providerSystemPrompt).toContain("stale injected extension instructions");
 		expect(providerMessages).toContain("injected extension message preserved");
+	});
+
+	it("pumps a follow-up queued while an injected prompt owns the active turn", async () => {
+		const hook = gatedHook({ prompt: "injected prompt" });
+		const harness = await createHarness({ extensionFactories: [hook.factory] });
+		harnesses.push(harness);
+		const internals = harness.session as unknown as {
+			_promptInjectedMessage(
+				text: string,
+				message: {
+					role: "custom";
+					customType: string;
+					content: string;
+					display: boolean;
+					details: Record<string, never>;
+					timestamp: number;
+				},
+			): Promise<void>;
+		};
+		harness.setResponses([fauxAssistantMessage("injected done"), fauxAssistantMessage("follow-up done")]);
+
+		const injectedPrompt = internals._promptInjectedMessage("injected prompt", {
+			role: "custom",
+			customType: "injected-test",
+			content: "injected prompt",
+			display: true,
+			details: {},
+			timestamp: Date.now(),
+		});
+		await hook.reached;
+		await harness.session.followUp("queued follow-up");
+		hook.release();
+
+		await injectedPrompt;
+		await harness.session.waitForIdle();
+
+		expect(getUserTexts(harness)).toEqual(["queued follow-up"]);
+		expect(getAssistantTexts(harness)).toEqual(["injected done", "follow-up done"]);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
 	});
 
 	it("preserves an empty extension system prompt across an injected refine handoff wait", async () => {

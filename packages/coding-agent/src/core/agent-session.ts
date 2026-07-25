@@ -3942,6 +3942,7 @@ export class AgentSession {
 			);
 		} finally {
 			admission.release();
+			this._scheduleSessionInputPump();
 		}
 	}
 
