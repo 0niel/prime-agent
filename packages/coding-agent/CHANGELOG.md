@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed `prime-agent agents` opening a new chat when running with a process-local session.
 - Fixed daemon startup failing when an interrupted supervisor left an empty ownership directory.
 
 ## [0.3.3] - 2026-07-23

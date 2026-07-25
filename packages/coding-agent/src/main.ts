@@ -271,6 +271,7 @@ export interface DaemonInteractiveSessionManagerDecision {
 export function shouldOpenProcessLocalSessionViewOnStartup(options: {
 	appMode: AppMode;
 	useDaemonInteractive: boolean;
+	explicitAgentsView?: boolean;
 	resume?: true | string;
 	noSession?: boolean;
 	startupBenchmark?: boolean;
@@ -280,7 +281,7 @@ export function shouldOpenProcessLocalSessionViewOnStartup(options: {
 		!options.useDaemonInteractive &&
 		!options.noSession &&
 		!options.startupBenchmark &&
-		options.resume === true
+		(options.explicitAgentsView || options.resume === true)
 	);
 }
 
@@ -1207,15 +1208,16 @@ export async function main(args: string[], options?: MainOptions) {
 		console.error(chalk.red(`Error: No active agent found matching '${publicCommand.attachAgent}'`));
 		process.exit(1);
 	}
-	const processLocalBareResume = shouldOpenProcessLocalSessionViewOnStartup({
+	const openProcessLocalSessionView = shouldOpenProcessLocalSessionViewOnStartup({
 		appMode,
 		useDaemonInteractive,
+		explicitAgentsView,
 		resume: parsed.resume,
 		noSession: parsed.noSession,
 		startupBenchmark,
 	});
 	let sessionManager: SessionManager;
-	if (processLocalBareResume) {
+	if (openProcessLocalSessionView) {
 		sessionManager = SessionManager.inMemory(cwd, sessionDir);
 	} else if (activeDaemonSessionSummary) {
 		sessionManager = createSessionManagerForActiveDaemonSummary(activeDaemonSessionSummary, cwd);
@@ -1643,7 +1645,7 @@ export async function main(args: string[], options?: MainOptions) {
 			promptStashStore: new ClientPromptStashStore(),
 			promptStashSessionId: session.sessionId,
 			bindLocalSessionExtensions: true,
-			openSessionViewOnStartup: processLocalBareResume,
+			openSessionViewOnStartup: openProcessLocalSessionView,
 			migratedProviders,
 			modelFallbackMessage,
 			initialMessage,

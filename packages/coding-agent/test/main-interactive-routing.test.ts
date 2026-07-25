@@ -66,7 +66,14 @@ describe("interactive startup routing", () => {
 		).toBe(false);
 	});
 
-	test("opens the shared session view for process-local bare resume only", () => {
+	test("opens the shared session view for process-local agents and bare resume", () => {
+		expect(
+			shouldOpenProcessLocalSessionViewOnStartup({
+				appMode: "interactive",
+				useDaemonInteractive: false,
+				explicitAgentsView: true,
+			}),
+		).toBe(true);
 		expect(
 			shouldOpenProcessLocalSessionViewOnStartup({
 				appMode: "interactive",
@@ -85,7 +92,7 @@ describe("interactive startup routing", () => {
 			shouldOpenProcessLocalSessionViewOnStartup({
 				appMode: "interactive",
 				useDaemonInteractive: true,
-				resume: true,
+				explicitAgentsView: true,
 			}),
 		).toBe(false);
 	});
