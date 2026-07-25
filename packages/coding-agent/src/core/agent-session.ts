@@ -1909,10 +1909,6 @@ export class AgentSession {
 		return true;
 	}
 
-	/**
-	 * Derived, never cached: the agent loop's synchronous stop hooks must see
-	 * queued steering (or an in-flight steer handoff) the instant it exists.
-	 */
 	private get _steeringStopPending(): boolean {
 		const activeSteeringHandoff =
 			this._activeSessionInput?.kind === "prompt" &&
@@ -5108,9 +5104,7 @@ export class AgentSession {
 		if (error instanceof DeferredSessionInputError) return true;
 		if (epoch !== this._sessionInputPumpEpoch) return true;
 		if (this._isBusyForSessionInput("pump")) {
-			// The input is still requeued, but the failure was not a deliberate
-			// deferral: surface it so a genuine handoff error is never silently
-			// swallowed by a coincidentally-busy session.
+			// Requeue, but surface the error: this was not a deliberate deferral.
 			this._surfaceSessionInputError(error);
 			return true;
 		}
@@ -5701,12 +5695,7 @@ export class AgentSession {
 		}
 	}
 
-	/**
-	 * Resume the session-input scheduler after an abort or update-restart
-	 * suspended it (requestAbort/abortForUpdateRestart). Returns whether any
-	 * queued work remains to run. Owned pause leases are unaffected: they are
-	 * released only by their holders via acquireQueuedWorkPause().release().
-	 */
+	/** Resume the scheduler after requestAbort/abortForUpdateRestart suspended it; owned pause leases are unaffected. */
 	resumeQueuedWork(): boolean {
 		this._sessionInputPumpSuspended = false;
 		this._scheduleSessionInputPump();

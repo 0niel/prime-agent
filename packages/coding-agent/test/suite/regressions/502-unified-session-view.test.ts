@@ -48,11 +48,6 @@ function refreshHarness() {
 	};
 }
 
-/**
- * These regressions exercise AgentsViewMode internals directly because the
- * mode class has no injectable seams yet. The guard turns a renamed/removed
- * private into an explicit failure instead of a cryptic undefined-call error.
- */
 function privateMethod<T>(name: string): T {
 	const member = Reflect.get(AgentsViewMode.prototype, name) as T;
 	if (typeof member !== "function") {

@@ -1592,8 +1592,6 @@ export class DaemonSupervisor {
 				this.findWorkerForClient(client, command.activeSessionId),
 				admission?.controller.signal,
 			);
-			// Re-check after the await: a cancel command may have settled the
-			// admission while worker routing was in flight.
 			throwIfAdmissionCancelled(admission);
 			const resolvedCommand = {
 				...command,

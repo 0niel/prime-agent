@@ -45,14 +45,8 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 	throw new Error("Condition was not reached");
 }
 
-/**
- * Constructor-bypass harness: DaemonSupervisor's constructor spawns file
- * watchers and requires a live socket dir, so admission ordering is tested
- * against a prototype instance with exactly the private fields handleLine
- * touches. This list is coupled to the class by hand — when a supervisor
- * refactor renames one of these fields, update it here; handleLine failing
- * with "undefined is not a function/Map" in this file means exactly that.
- */
+// Constructor-bypass harness: the real constructor spawns watchers and needs a
+// socket dir. The field list is hand-coupled to what handleLine touches.
 function createHarness(
 	options: {
 		ready?: Promise<void>;

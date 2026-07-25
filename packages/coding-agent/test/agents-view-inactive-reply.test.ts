@@ -18,7 +18,6 @@ function summary(overrides: Partial<SessionSummary>): SessionSummary {
 	};
 }
 
-/** Guarded private invocation: fails with a clear message if the member is renamed. */
 function invoke(method: string, self: object, ...args: unknown[]): unknown {
 	const member = Reflect.get(AgentsViewMode.prototype, method) as ((...a: unknown[]) => unknown) | undefined;
 	if (typeof member !== "function") {

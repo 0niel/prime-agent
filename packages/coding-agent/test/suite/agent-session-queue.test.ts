@@ -1763,8 +1763,6 @@ prepared:${event.prompt}`,
 		releaseFirst?.();
 		await first.catch(() => undefined);
 		await harness.session.agent.waitForIdle();
-		// Deterministic settle point: the pump chain is quiescent, so an
-		// erroneously scheduled turn would already have called the provider.
 		await harness.session.waitForSessionInputIdle();
 
 		// The queued input must survive into the restart manifest instead of

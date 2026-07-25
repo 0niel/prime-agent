@@ -1,10 +1,3 @@
-/**
- * Shared prompt-admission cancellation primitives used by the session core,
- * the daemon, and the supervisor. Admission cancellation is uncertain and
- * non-retryable by design: cancelling only wins while the original request is
- * still waiting, so every layer must reject with the same typed error and
- * observe the underlying work to avoid unhandled rejections.
- */
 export class PromptAdmissionCancelledError extends Error {
 	constructor() {
 		super("Prompt admission was cancelled.");
@@ -17,9 +10,8 @@ export function throwIfPromptAdmissionCancelled(signal: AbortSignal | undefined)
 }
 
 /**
- * Await `promise` unless `signal` aborts first. A pre-aborted signal rejects
- * immediately but still observes the supplied work's eventual rejection so a
- * cancelled admission never produces an unhandled rejection.
+ * Await `promise` unless `signal` aborts first. Always observes the supplied
+ * work's rejection so a cancelled admission never leaks an unhandled rejection.
  */
 export function waitForPromptAdmission<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
 	if (!signal) return promise;
