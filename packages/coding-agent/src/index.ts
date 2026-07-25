@@ -316,6 +316,7 @@ export {
 	type DaemonResumeCursor,
 	type DaemonSessionSnapshot,
 	defaultDaemonSocketPath,
+	type InteractiveInitialPrompt,
 	InteractiveMode,
 	type InteractiveModeLocalSessionHost,
 	type InteractiveModeOptions,

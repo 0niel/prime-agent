@@ -63,6 +63,50 @@ describe("AgentSession prompt characterization", () => {
 		pause.release();
 	});
 
+	it("releases direct-turn admission when cancellation lands immediately after acquisition", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const controller = new AbortController();
+		const internals = harness.session as unknown as {
+			_acquireDirectTurnAdmission(options?: { signal?: AbortSignal }): Promise<{ owner: object; release(): void }>;
+		};
+		const acquire = internals._acquireDirectTurnAdmission.bind(internals);
+		internals._acquireDirectTurnAdmission = async (options) => {
+			const admission = await acquire(options);
+			controller.abort();
+			return admission;
+		};
+
+		await expect(harness.session.prompt("cancel after acquire", { signal: controller.signal })).rejects.toThrow(
+			"Prompt admission was cancelled.",
+		);
+		expect(getUserTexts(harness)).toEqual([]);
+
+		internals._acquireDirectTurnAdmission = acquire;
+		harness.setResponses([fauxAssistantMessage("recovered")]);
+		await harness.session.prompt("second");
+		expect(getUserTexts(harness)).toEqual(["second"]);
+	});
+
+	it("releases direct-turn admission when ownership commit throws", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const commitError = new Error("commit failed");
+
+		await expect(
+			harness.session.prompt("first", {
+				admissionCommitted: () => {
+					throw commitError;
+				},
+			}),
+		).rejects.toBe(commitError);
+		expect(getUserTexts(harness)).toEqual([]);
+
+		harness.setResponses([fauxAssistantMessage("recovered")]);
+		await harness.session.prompt("second");
+		expect(getUserTexts(harness)).toEqual(["second"]);
+	});
+
 	it("keeps a prompt session-owned when cancellation arrives after admission", async () => {
 		const harness = await createHarness({ models: [{ id: "slow-faux" }] });
 		harnesses.push(harness);

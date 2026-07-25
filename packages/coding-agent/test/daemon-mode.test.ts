@@ -20,10 +20,23 @@ import {
 	markClientSnapshotStreaming,
 	setDaemonClientSessionCapabilities,
 	shouldSendDaemonOutboundToClient,
+	waitForDaemonPromptAdmission,
 } from "../src/modes/daemon/daemon-mode.js";
 import type { DaemonAttachResult, DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
 
 describe("daemon mode helpers", () => {
+	it("observes supplied work when prompt admission is already aborted", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		const work = Promise.reject(new Error("late claim failure"));
+
+		await expect(waitForDaemonPromptAdmission(work, controller.signal)).rejects.toThrow(
+			"Prompt admission was cancelled.",
+		);
+		// Let the observed work settle; an unhandled rejection would fail Vitest.
+		await Promise.resolve();
+	});
+
 	it("finds only direct child active sessions", () => {
 		const parent = makeState("parent");
 		const child = makeState("child", "parent");
@@ -4790,6 +4803,105 @@ describe("daemon mode helpers", () => {
 			error: expected,
 		});
 	});
+
+	it("clears prompt admission registered before unauthenticated worker rejection", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+			worker: { authenticationToken: "worker-token" },
+		});
+		const client = makeClient("unauthenticated", "active-1");
+		const end = vi.fn();
+		client.socket = { destroyed: false, write: vi.fn(() => true), end } as unknown as Socket;
+		const internals = daemon as unknown as {
+			promptAdmissions: Map<string, unknown>;
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		await internals.handleLine(
+			client,
+			JSON.stringify({
+				type: "prompt",
+				activeSessionId: "active-1",
+				message: "unauthorized",
+				admissionId: "leaked-admission",
+			}),
+		);
+
+		expect(end).toHaveBeenCalledOnce();
+		expect(internals.promptAdmissions.size).toBe(0);
+	});
+
+	it.each(["success", "late-failure", "replacement"] as const)(
+		"handles cancellation followed by supervisor-claim %s without affecting the wrong socket binding",
+		async (outcome) => {
+			const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+				worker: { authenticationToken: "worker-token" },
+			});
+			const client = makeClient("authenticated", "active-1");
+			client.authenticated = true;
+			const end = vi.fn();
+			client.socket = { destroyed: false, write: vi.fn(() => true), end } as unknown as Socket;
+			const claim = {
+				supervisorGeneration: "generation",
+				supervisorPid: process.pid,
+				supervisorSocketPath: "/tmp/supervisor.sock",
+			};
+			let resolveClaim!: (fingerprint: string) => void;
+			let rejectClaim!: (error: Error) => void;
+			const claimCheck = new Promise<string>((resolve, reject) => {
+				resolveClaim = resolve;
+				rejectClaim = reject;
+			});
+			const internals = daemon as unknown as {
+				promptAdmissions: Map<string, { controller?: AbortController }>;
+				supervisorClaims: Map<DaemonSocketClient, { claim: typeof claim; ownerFingerprint: string }>;
+				assertSupervisorClaimCurrent: ReturnType<typeof vi.fn>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+				handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+			};
+			const originalBinding = { claim, ownerFingerprint: "owner" };
+			internals.supervisorClaims.set(client, originalBinding);
+			internals.assertSupervisorClaimCurrent = vi.fn(() => claimCheck);
+
+			const handling = internals.handleLine(
+				client,
+				JSON.stringify({
+					type: "prompt",
+					activeSessionId: "active-1",
+					message: "cancel during claim check",
+					admissionId: "claim-admission",
+				}),
+			);
+			await vi.waitFor(() => expect(internals.promptAdmissions.size).toBe(1));
+			await internals.handleCommand(client, {
+				type: "cancel_prompt_admission",
+				activeSessionId: "active-1",
+				admissionId: "claim-admission",
+			});
+			await handling;
+
+			expect(internals.promptAdmissions.size).toBe(0);
+			expect(end).not.toHaveBeenCalled();
+			if (outcome === "replacement") {
+				internals.supervisorClaims.set(client, { claim: { ...claim }, ownerFingerprint: "replacement" });
+			}
+			if (outcome === "success") resolveClaim("refreshed");
+			else rejectClaim(new Error("late stale claim"));
+			await Promise.resolve();
+			await Promise.resolve();
+
+			if (outcome === "late-failure") expect(end).toHaveBeenCalledOnce();
+			else expect(end).not.toHaveBeenCalled();
+			if (outcome === "success") expect(originalBinding.ownerFingerprint).toBe("owner");
+		},
+	);
 
 	it("cancels only pre-ownership prompt admission and cleans up its controller", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {

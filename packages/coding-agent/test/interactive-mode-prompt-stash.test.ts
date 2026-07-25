@@ -272,6 +272,40 @@ describe("InteractiveMode prompt stash", () => {
 		expect(reopenedMode.promptStashState.stash).toBeUndefined();
 	});
 
+	it("restores retained startup image drafts in order and resubmits each image exactly once", async () => {
+		const store = new ClientPromptStashStore();
+		const state = store.forSession("session-a");
+		const firstImage: ImageContent = { type: "image", data: "first", mimeType: "image/png" };
+		const secondImage: ImageContent = { type: "image", data: "second", mimeType: "image/jpeg" };
+		state.stash = { text: "first [image #2]", images: [[2, firstImage]] };
+		state.queuedStashes = [{ text: "second [image #3]", images: [[3, secondImage]] }];
+		const mode = createSharedPromptStashHarness(store, "session-a", {
+			pastedImages: [[1, { type: "image", data: "existing", mimeType: "image/png" }]],
+		});
+		interactiveModeMethods.hydratePromptStash.call(mode);
+		const submitted: Array<{ text: string; images: ImageContent[] }> = [];
+
+		for (let index = 0; index < 2; index++) {
+			expect(interactiveModeMethods.restorePromptStashIfEditorEmpty.call(mode)).toBe(true);
+			const text = mode.editor.getText();
+			const ids = [...text.matchAll(/\[image #(\d+)\]/g)].map((match) => Number(match[1]));
+			submitted.push({
+				text,
+				images: ids.flatMap((id) => (mode.pastedImages.get(id) ? [mode.pastedImages.get(id)!] : [])),
+			});
+			mode.editor.setText("");
+		}
+
+		expect(submitted).toEqual([
+			{ text: "first [image #2]", images: [firstImage] },
+			{ text: "second [image #3]", images: [secondImage] },
+		]);
+		expect(mode.pastedImages.get(1)?.data).toBe("existing");
+		expect(mode.nextImageMarkerId).toBe(4);
+		expect(state.stash).toBeUndefined();
+		expect(state.queuedStashes).toBeUndefined();
+	});
+
 	it("rebinds prompt stash state when the connected session changes", () => {
 		const store = new ClientPromptStashStore();
 		const firstState = store.forSession("session-a");

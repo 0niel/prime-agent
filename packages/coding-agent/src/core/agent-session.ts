@@ -4033,9 +4033,11 @@ export class AgentSession {
 	): Promise<void> {
 		if (!this.isStreaming && options?.resumeIfIdle) this._sessionInputPumpSuspended = false;
 		const admission = await this._acquireDirectTurnAdmission({ allowStreaming: true, signal: options?.signal });
-		throwIfPromptAdmissionCancelled(options?.signal);
-		options?.admissionCommitted?.();
 		try {
+			// Ownership commits before destructive preflight, but cancellation and the
+			// commit callback are covered by release if either throws.
+			throwIfPromptAdmissionCancelled(options?.signal);
+			options?.admissionCommitted?.();
 			await this._turnAdmissionContext.run(admission.owner, () =>
 				this._promptInjectedMessageUnserialized(text, message, options, admission.release),
 			);
@@ -4172,11 +4174,12 @@ export class AgentSession {
 			? await this._acquireDirectTurnAdmission({ signal: options?.signal })
 			: undefined;
 		const releaseAdmission = admission?.release ?? (() => {});
-		// Streaming prompts skip direct-turn admission but still transfer ownership
-		// before any queue/interception work begins.
-		throwIfPromptAdmissionCancelled(options?.signal);
-		options?.admissionCommitted?.();
 		try {
+			// Streaming prompts skip direct-turn admission but still transfer ownership
+			// before any queue/interception work begins. Keep this before destructive
+			// preflight while ensuring a directly acquired admission is always released.
+			throwIfPromptAdmissionCancelled(options?.signal);
+			options?.admissionCommitted?.();
 			if (admission) {
 				await this._turnAdmissionContext.run(admission.owner, () =>
 					this._promptUnserialized(text, options, releaseAdmission),

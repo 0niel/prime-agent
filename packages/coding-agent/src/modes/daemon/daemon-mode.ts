@@ -324,14 +324,26 @@ function delay(ms: number): Promise<void> {
 	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
-function waitForDaemonPromptAdmission<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+class DaemonPromptAdmissionCancelledError extends Error {
+	constructor() {
+		super("Prompt admission was cancelled.");
+		this.name = "DaemonPromptAdmissionCancelledError";
+	}
+}
+
+export function waitForDaemonPromptAdmission<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 	if (!signal) return promise;
-	if (signal.aborted) return Promise.reject(new Error("Prompt admission was cancelled."));
+	if (signal.aborted) {
+		// The caller supplied already-running work. Observe its eventual rejection
+		// even though admission cancellation wins immediately.
+		void promise.catch(() => {});
+		return Promise.reject(new DaemonPromptAdmissionCancelledError());
+	}
 	return new Promise<T>((resolve, reject) => {
 		const cleanup = () => signal.removeEventListener("abort", onAbort);
 		const onAbort = () => {
 			cleanup();
-			reject(new Error("Prompt admission was cancelled."));
+			reject(new DaemonPromptAdmissionCancelledError());
 		};
 		signal.addEventListener("abort", onAbort, { once: true });
 		// Close the registration-to-check race before observing the awaited work.
@@ -2473,10 +2485,10 @@ export class AgentDaemon {
 						)
 					: undefined;
 			const clearParsedAdmission = () => {
-				if (parsedAdmission) {
-					this.promptAdmissions.delete(
-						this.promptAdmissionKey(parsedAdmission.activeSessionId, parsedAdmission.admissionId),
-					);
+				if (!parsedAdmission) return;
+				const key = this.promptAdmissionKey(parsedAdmission.activeSessionId, parsedAdmission.admissionId);
+				if (this.promptAdmissions.get(key) === parsedAdmission) {
+					this.promptAdmissions.delete(key);
 				}
 			};
 			// Envelope client identity is irrelevant to worker-local prompt admission.
@@ -2492,6 +2504,7 @@ export class AgentDaemon {
 					(parsed.supervisorProcessStartId !== undefined && typeof parsed.supervisorProcessStartId !== "string") ||
 					typeof parsed.supervisorSocketPath !== "string"
 				) {
+					clearParsedAdmission();
 					this.write(client, failure(commandId, "worker_auth", "Worker authentication failed"));
 					client.socket.end();
 					return;
@@ -2538,12 +2551,27 @@ export class AgentDaemon {
 					client.socket.end();
 					return;
 				}
+				const claimCheck = this.assertSupervisorClaimCurrent(boundClaim.claim, boundClaim.ownerFingerprint);
+				// Observe the already-running fence check even if admission cancellation
+				// wins the command wait below.
+				void claimCheck.catch(() => {});
 				try {
-					boundClaim.ownerFingerprint = await waitForDaemonPromptAdmission(
-						this.assertSupervisorClaimCurrent(boundClaim.claim, boundClaim.ownerFingerprint),
+					const ownerFingerprint = await waitForDaemonPromptAdmission(
+						claimCheck,
 						parsedAdmission?.controller?.signal,
 					);
+					if (this.supervisorClaims.get(client) === boundClaim) {
+						boundClaim.ownerFingerprint = ownerFingerprint;
+					}
 				} catch (error) {
+					const admissionCancelled = error instanceof DaemonPromptAdmissionCancelledError;
+					if (admissionCancelled) {
+						// The fence check remains authoritative after cancellation. Its rejection
+						// revokes only the exact binding that initiated it; replacements survive.
+						void claimCheck.catch(() => {
+							if (this.supervisorClaims.get(client) === boundClaim) client.socket.end();
+						});
+					}
 					clearParsedAdmission();
 					this.write(
 						client,
@@ -2553,7 +2581,9 @@ export class AgentDaemon {
 							error,
 						),
 					);
-					client.socket.end();
+					// Cancelling this prompt only abandons its admission wait. A genuine
+					// stale supervisor claim fences only the binding that it checked.
+					if (!admissionCancelled && this.supervisorClaims.get(client) === boundClaim) client.socket.end();
 					return;
 				}
 			}

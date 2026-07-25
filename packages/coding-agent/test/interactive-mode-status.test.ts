@@ -615,7 +615,9 @@ type SubmitHandlerHarness = {
 	promptStashState: PromptStashState;
 	pastedImages: Map<number, unknown>;
 	getPromptStashImages: (text: string) => readonly (readonly [number, unknown])[];
-	admitPendingStartupPrompts?: () => Promise<"admitted" | "lifecycle-cancelled">;
+	retainStartupPromptDrafts?: (prompts: readonly { text: string; images?: readonly unknown[] }[]) => void;
+	nextImageMarkerId?: number;
+	admitPendingStartupPrompts?: () => Promise<"admitted" | "retained" | "lifecycle-cancelled">;
 	isShuttingDown?: boolean;
 	returnToAgentsViewRequested?: boolean;
 	submittedInputBehavior: "steer" | "followUp";
@@ -663,6 +665,12 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 		retainSubmittedDraft: (
 			InteractiveMode.prototype as unknown as { retainSubmittedDraft(stash: unknown, generation: number): void }
 		).retainSubmittedDraft,
+		retainStartupPromptDrafts: (
+			InteractiveMode.prototype as unknown as {
+				retainStartupPromptDrafts(prompts: readonly { text: string; images?: readonly unknown[] }[]): void;
+			}
+		).retainStartupPromptDrafts,
+		nextImageMarkerId: 1,
 		submittedInputBehavior: "steer",
 		inputSubmissionGeneration: 0,
 		inputSubmissionsPending: 0,
@@ -2750,34 +2758,70 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		}
 	});
 
-	test("reports old-daemon admission once and preserves the startup prompt", async () => {
-		const inputDone = createDeferred<void>();
-		const prompt = vi.fn(async () => {
-			throw new AgentConnectionPromptAdmissionError("daemon upgrade required", "unsupported");
-		});
-		const fakeThis = Object.assign(
-			createSubmitHandlerHarness({
+	test.each(["unsupported", "unknown"] as const)(
+		"reports %s startup admission once and retains every remaining prompt with collision-safe images",
+		async (status) => {
+			const inputDone = createDeferred<void>();
+			const firstImage = { type: "image", data: "first", mimeType: "image/png" } as const;
+			const secondImage = { type: "image", data: "second", mimeType: "image/jpeg" } as const;
+			let rejectStartup!: (error: Error) => void;
+			const startupAdmission = new Promise<void>((_resolve, reject) => {
+				rejectStartup = reject;
+			});
+			const prompt = vi.fn(() => startupAdmission);
+			const promptStashState: PromptStashState = { stash: { text: "existing draft [image #3]" } };
+			const submitHarness = createSubmitHandlerHarness({
+				promptStashState,
 				agentConnection: {
 					prompt,
 					executeBash: vi.fn(async () => {}),
 					getState: vi.fn(async () => ({ isBashRunning: false })),
 				},
-			}),
-			createStartupRunHarness(
-				{ initialMessage: "startup" },
-				{ getCurrentModel: () => primeModel, getUserInput: vi.fn(() => inputDone.promise) },
-			),
-		);
+				pastedImages: new Map([[1, { type: "image", data: "existing", mimeType: "image/png" }]]),
+				nextImageMarkerId: 1,
+			});
+			const fakeThis = Object.assign(
+				submitHarness,
+				createStartupRunHarness(
+					{
+						initialMessage: "startup [image #1]",
+						initialImages: [firstImage],
+						initialPrompts: [{ text: "later [image #2]", images: [secondImage] }, { text: "last [image #4]" }],
+					},
+					{
+						getCurrentModel: () => primeModel,
+						getUserInput: vi.fn(() => inputDone.promise),
+						agentConnection: submitHarness.agentConnection,
+					},
+				),
+			);
 
-		const run = InteractiveMode.prototype.run.call(fakeThis as never);
-		await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
-		await new Promise((resolve) => setTimeout(resolve, 300));
-		expect(prompt).toHaveBeenCalledOnce();
-		expect(fakeThis.showError).toHaveBeenCalledWith("daemon upgrade required");
-		expect(fakeThis.promptStashState.stash).toEqual({ text: "startup", images: undefined });
-		inputDone.resolve(undefined);
-		await expect(run).resolves.toBe("agents_view");
-	});
+			const run = InteractiveMode.prototype.run.call(fakeThis as never);
+			await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+			const blockedSubmission = fakeThis.defaultEditor.onSubmit?.("blocked user");
+			rejectStartup(new AgentConnectionPromptAdmissionError("daemon admission uncertain", status));
+			await blockedSubmission;
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(prompt).toHaveBeenCalledOnce();
+			expect(fakeThis.showError).toHaveBeenCalledWith("daemon admission uncertain");
+			expect(fakeThis.promptStashState.stash).toEqual({
+				text: "startup [image #5] [image #6]",
+				images: [[6, firstImage]],
+			});
+			expect(fakeThis.promptStashState.queuedStashes).toEqual([
+				{ text: "later [image #2] [image #7]", images: [[7, secondImage]] },
+				{ text: "last [image #4]" },
+				{ text: "existing draft [image #3]" },
+				{ text: "blocked user" },
+			]);
+			expect(fakeThis.pastedImages.get(1)).toEqual({ type: "image", data: "existing", mimeType: "image/png" });
+			expect(fakeThis.pastedImages.get(5)).toBeUndefined();
+			expect(fakeThis.pastedImages.get(6)).toBe(firstImage);
+			expect(fakeThis.pastedImages.get(7)).toBe(secondImage);
+			inputDone.resolve(undefined);
+			await expect(run).resolves.toBe("agents_view");
+		},
+	);
 
 	test.each(["typing", "Alt+Enter"] as const)(
 		"preserves %s during the startup admission barrier",

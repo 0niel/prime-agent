@@ -473,7 +473,7 @@ export class BrandSplashHeader implements Component {
 	}
 }
 
-type StartupPromptBarrierOutcome = "admitted" | "lifecycle-cancelled";
+type StartupPromptBarrierOutcome = "admitted" | "retained" | "lifecycle-cancelled";
 
 type GoalAnnouncementSnapshot = {
 	goalId?: string;
@@ -740,6 +740,11 @@ export function resolveInteractiveUpdateDaemonSocketPath(
 /**
  * Options for InteractiveMode initialization.
  */
+export interface InteractiveInitialPrompt {
+	text: string;
+	images?: ImageContent[];
+}
+
 export interface InteractiveModeOptions {
 	/** Providers that were migrated to auth.json (shows warning) */
 	migratedProviders?: string[];
@@ -751,8 +756,10 @@ export interface InteractiveModeOptions {
 	initialMessage?: string;
 	/** Images to attach to the initial message */
 	initialImages?: ImageContent[];
-	/** Additional messages to send after the initial message */
+	/** Additional text-only messages to send after the initial message. */
 	initialMessages?: string[];
+	/** Additional image-bearing prompts to send after the initial messages. */
+	initialPrompts?: InteractiveInitialPrompt[];
 	/** Force verbose startup (overrides quietStartup setting) */
 	verbose?: boolean;
 	/** Agent execution boundary. InteractiveMode never talks directly to AgentSession for core execution. */
@@ -1134,6 +1141,7 @@ export class InteractiveMode {
 			if (!stash) continue;
 			for (const [markerId, image] of stash.images ?? []) {
 				this.pastedImages.set(markerId, image);
+				this.nextImageMarkerId = Math.max(this.nextImageMarkerId, markerId + 1);
 			}
 			for (const markerId of imageMarkerIds(stash.text)) {
 				this.nextImageMarkerId = Math.max(this.nextImageMarkerId, markerId + 1);
@@ -1474,7 +1482,14 @@ export class InteractiveMode {
 		const tmuxKeyboardWarningPromise = ownsGlobalStartupNotices ? checkTmuxKeyboardSetup() : undefined;
 
 		// Show startup warnings
-		const { migratedProviders, modelFallbackMessage, initialMessage, initialImages, initialMessages } = this.options;
+		const {
+			migratedProviders,
+			modelFallbackMessage,
+			initialMessage,
+			initialImages,
+			initialMessages,
+			initialPrompts,
+		} = this.options;
 
 		if (migratedProviders && migratedProviders.length > 0) {
 			this.showWarning(`Migrated credentials to auth.json: ${migratedProviders.join(", ")}`);
@@ -1489,9 +1504,10 @@ export class InteractiveMode {
 			this.showError(`models.json error: ${modelsJsonError}`);
 		}
 
-		const initialPrompts = [
+		const startupPrompts: InteractiveInitialPrompt[] = [
 			...(initialMessage ? [{ text: initialMessage, images: initialImages }] : []),
-			...(initialMessages ?? []).map((text) => ({ text, images: undefined })),
+			...(initialMessages ?? []).map((text) => ({ text })),
+			...(initialPrompts ?? []),
 		];
 		// One drive loop owns startup-prompt delivery: it retries on a 250ms cadence
 		// while a model is missing or admission fails transiently, shows every
@@ -1521,7 +1537,7 @@ export class InteractiveMode {
 			});
 		const deliverStartupPrompts = async () => {
 			let failures = 0;
-			for (let next = 0; next < initialPrompts.length; ) {
+			for (let next = 0; next < startupPrompts.length; ) {
 				// The run lifecycle can settle the barrier while a prompt is being
 				// admitted; stop instead of prompting a session we already left.
 				if (startupPromptsDone) return;
@@ -1529,7 +1545,7 @@ export class InteractiveMode {
 					if (!(await startupRetryDelay())) return;
 					continue;
 				}
-				const prompt = initialPrompts[next]!;
+				const prompt = startupPrompts[next]!;
 				try {
 					await this.agentConnection.prompt(prompt.text, {
 						images: prompt.images,
@@ -1544,11 +1560,11 @@ export class InteractiveMode {
 					// An uncertain daemon admission may already be session-owned. Retrying
 					// would duplicate it; only an acknowledged pre-ownership cancellation is safe.
 					if (error instanceof AgentConnectionPromptAdmissionError && !error.cancelled) {
-						this.retainSubmittedDraft({
-							text: prompt.text,
-							images: prompt.images?.map((image, index) => [index, image] as const),
-						});
+						// This attempt may already be session-owned, so never retry it. Preserve
+						// it and every not-yet-attempted startup prompt in original order.
+						this.retainStartupPromptDrafts(startupPrompts.slice(next));
 						this.showError(error.message);
+						settleStartupPrompts("retained");
 						return;
 					}
 					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
@@ -1563,7 +1579,7 @@ export class InteractiveMode {
 				}
 			}
 		};
-		this.admitPendingStartupPrompts = initialPrompts.length > 0 ? () => startupPromptsSettled : undefined;
+		this.admitPendingStartupPrompts = startupPrompts.length > 0 ? () => startupPromptsSettled : undefined;
 
 		let deferredStartupNotificationsShown = false;
 		const showDeferredStartupNotifications = () => {
@@ -4144,6 +4160,66 @@ export class InteractiveMode {
 		this.promptStashState.queuedStashes = ordered.length > 0 ? ordered : undefined;
 	}
 
+	private retainStartupPromptDrafts(prompts: readonly InteractiveInitialPrompt[]): void {
+		// Reserve every marker visible anywhere in the retained batch before assigning
+		// any image. This prevents an early prompt's attachment from making a literal
+		// marker in a later prompt resolve to the wrong image.
+		const reserved = new Set(this.pastedImages.keys());
+		for (const stash of [this.promptStash, ...(this.promptStashState.queuedStashes ?? [])]) {
+			if (stash) for (const markerId of imageMarkerIds(stash.text)) reserved.add(markerId);
+		}
+		for (const prompt of prompts) {
+			for (const markerId of imageMarkerIds(prompt.text)) reserved.add(markerId);
+		}
+		for (const markerId of reserved) {
+			this.nextImageMarkerId = Math.max(this.nextImageMarkerId, markerId + 1);
+		}
+		const allocateMarker = () => {
+			while (reserved.has(this.nextImageMarkerId)) this.nextImageMarkerId++;
+			const markerId = this.nextImageMarkerId++;
+			reserved.add(markerId);
+			return markerId;
+		};
+
+		const retained: PromptStash[] = [];
+		for (const prompt of prompts) {
+			let text = prompt.text;
+			// A startup prompt owns only the images passed with it. Remap literal
+			// markers that already name registry data so restoring this draft cannot
+			// accidentally attach an old or another prompt's image.
+			const literalRemaps = new Map<number, number>();
+			for (const markerId of imageMarkerIds(text)) {
+				if (this.pastedImages.has(markerId) && !literalRemaps.has(markerId)) {
+					literalRemaps.set(markerId, allocateMarker());
+				}
+			}
+			for (const [from, to] of literalRemaps) {
+				text = text.replaceAll(formatImageMarker(from), formatImageMarker(to));
+			}
+
+			const images: Array<readonly [number, ImageContent]> = [];
+			for (const image of prompt.images ?? []) {
+				const markerId = allocateMarker();
+				images.push([markerId, image]);
+				text += `${text.length > 0 && !/\s$/.test(text) ? " " : ""}${formatImageMarker(markerId)}`;
+			}
+			retained.push({
+				text,
+				...(images.length > 0 ? { images } : {}),
+			});
+			for (const [markerId, image] of images) this.pastedImages.set(markerId, image);
+		}
+
+		// Startup drafts form the head of the durable queue. Preserve any older
+		// client draft after them, and let submissions released by the barrier append.
+		const existing = [this.promptStashState.stash, ...(this.promptStashState.queuedStashes ?? [])].filter(
+			(stash): stash is PromptStash => stash !== undefined,
+		);
+		const ordered = [...retained, ...existing];
+		this.promptStashState.stash = ordered.shift();
+		this.promptStashState.queuedStashes = ordered.length > 0 ? ordered : undefined;
+	}
+
 	private getPromptStashImages(text: string): readonly (readonly [number, ImageContent])[] {
 		const images: Array<readonly [number, ImageContent]> = [];
 		for (const markerId of imageMarkerIds(text)) {
@@ -4764,6 +4840,13 @@ export class InteractiveMode {
 				this.editor.setText("");
 				const promptStashAfterClear = this.promptStash;
 				submissionOutcome = (await this.admitPendingStartupPrompts?.()) ?? "admitted";
+				// Retention is not admission. Startup drafts were inserted synchronously
+				// before the barrier settled, so append this blocked submission behind them
+				// and never let it prompt or overtake them.
+				if (submissionOutcome === "retained") {
+					this.retainSubmittedDraft(submittedDraft ?? { text });
+					return;
+				}
 				// The barrier also settles when the run lifecycle ends; a submit resumed
 				// by teardown must neither prompt nor mutate the editor/durable stash.
 				if (
