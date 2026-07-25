@@ -1144,6 +1144,7 @@ export class DaemonSupervisor {
 				? !UPDATE_RESTART_DRAIN_COMMANDS.has(command.type)
 				: phase !== undefined && !(phase === "prepared" && command.type === "shutdown");
 		if (restartRejected && mutation) {
+			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
 			return;
 		}

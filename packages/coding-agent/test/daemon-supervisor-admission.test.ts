@@ -142,6 +142,25 @@ describe("daemon supervisor prompt admission ownership", () => {
 		expect(admissionFor(supervisor, owner)).toBeUndefined();
 	});
 
+	it("cleans up restart-fenced prompt admissions so the same id can retry", async () => {
+		const supervisor = createHarness();
+		(supervisor as unknown as { updateRestartPhase: "fencing" }).updateRestartPhase = "fencing";
+		const owner = client("connection-owner");
+		const prompt = {
+			id: "prompt-1",
+			type: "prompt",
+			activeSessionId: "session-1",
+			admissionId: "retryable-admission",
+			message: "hello",
+		} satisfies DaemonCommand;
+
+		await supervisor.handleLine(owner, JSON.stringify(prompt));
+		expect(supervisor.promptAdmissions.size).toBe(0);
+
+		await supervisor.handleLine(owner, JSON.stringify({ ...prompt, id: "prompt-2" }));
+		expect(supervisor.promptAdmissions.size).toBe(0);
+	});
+
 	it("lets the originating connection cancel before worker lookup starts", async () => {
 		const ready = deferred<void>();
 		const findWorker = vi.fn(async () => {
