@@ -4111,6 +4111,7 @@ export class InteractiveMode {
 	}
 
 	private retainSubmittedDraft(stash: PromptStash): void {
+		this.promptStashState ??= {};
 		if (this.promptStash === undefined) {
 			this.promptStash = stash;
 		} else {
@@ -4731,8 +4732,6 @@ export class InteractiveMode {
 					return;
 				}
 
-
-
 				this.clearSideQuestion({ abort: true });
 				this.flushPendingBashComponents();
 				const images = this.collectImagesFor(text);
@@ -4761,16 +4760,27 @@ export class InteractiveMode {
 						images,
 					});
 				} catch (error) {
-					// Admission failed, so put the exact submitted input back. Accepted
-					// inputs are session-owned and must never be restored by the client,
-					// and an older failed submit never clobbers newer typing or stashes.
-					if (
+					// Generation guards editor ownership, not draft durability: a stale
+					// rejection must be retained rather than overwrite newer input or vanish.
+					const rejectedDraft = submittedDraft ?? { text };
+					const canRestore =
 						!this.isShuttingDown &&
 						!this.returnToAgentsViewRequested &&
-						submissionGeneration === this.inputSubmissionGeneration
-					) {
-						if (this.editor.getText().length === 0) this.editor.setText(text);
+						submissionGeneration === this.inputSubmissionGeneration &&
+						this.editor.getText().length === 0;
+					if (canRestore) {
+						const canRestorePasteSnapshot =
+							rejectedDraft.pasteSnapshot === undefined || this.editor.restorePasteSnapshot !== undefined;
+						this.editor.setText(
+							canRestorePasteSnapshot ? rejectedDraft.text : (rejectedDraft.expandedText ?? rejectedDraft.text),
+						);
+						if (rejectedDraft.pasteSnapshot && this.editor.restorePasteSnapshot) {
+							this.editor.restorePasteSnapshot(rejectedDraft.pasteSnapshot);
+						}
+						this.latestEditorPromptStash = this.snapshotPromptStash(this.editor.getText());
 						if (this.promptStash === promptStashAfterClear) this.promptStash = promptStashToRestore;
+					} else {
+						this.retainSubmittedDraft(rejectedDraft);
 					}
 					this.showError(error instanceof Error ? error.message : String(error));
 					return;

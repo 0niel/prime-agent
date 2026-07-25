@@ -557,6 +557,29 @@ describe("InteractiveMode prompt stash", () => {
 		expect(mode.pastedImages.has(1)).toBe(false);
 	});
 
+	it("restores the exact rich draft after admission rejects", async () => {
+		const pasteSnapshot: FakePasteSnapshot = { pastes: [[1, "expanded paste"]], pasteCounter: 1 };
+		const mode = createSubmitHarness({
+			text: "draft [paste #1]",
+			expandedText: "draft expanded paste",
+			pasteSnapshot,
+			prompt: vi.fn(async () => {
+				throw new Error("admission failed");
+			}),
+		});
+		(mode as SubmitHarness & { latestEditorPromptStash: PromptStash }).latestEditorPromptStash = {
+			text: "draft [paste #1]",
+			expandedText: "draft expanded paste",
+			pasteSnapshot,
+		};
+		mode.editor.setText("");
+
+		await mode.defaultEditor.onSubmit?.("draft expanded paste");
+
+		expect(mode.editor.getText()).toBe("draft [paste #1]");
+		expect(mode.editor.restoredPasteSnapshot).toBe(pasteSnapshot);
+	});
+
 	it.each([
 		{ newer: "draft and stash", stash: "older stash", firstError: "late rejection" },
 		{ newer: "pending submission", stash: "stashed draft", firstError: undefined },
@@ -600,7 +623,7 @@ describe("InteractiveMode prompt stash", () => {
 			expect(mode.editor.getText()).toBe("stashed draft");
 			expect(mode.promptStash).toBeUndefined();
 		} else {
-			expect(mode.promptStash).toBeUndefined();
+			expect(mode.promptStash).toEqual({ text: "first prompt" });
 		}
 	});
 
