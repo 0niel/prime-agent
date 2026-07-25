@@ -9,6 +9,7 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
+import { type Deferred, createDeferred as deferred } from "./suite/scheduling.js";
 
 interface AdmissionRecord {
 	client: DaemonSocketClient;
@@ -28,22 +29,6 @@ interface SupervisorHarness {
 	promptAdmissions: Map<DaemonSocketClient, Map<string, AdmissionRecord>>;
 }
 
-interface Deferred<T> {
-	promise: Promise<T>;
-	resolve(value: T): void;
-	reject(error: unknown): void;
-}
-
-function deferred<T>(): Deferred<T> {
-	let resolve!: (value: T) => void;
-	let reject!: (error: unknown) => void;
-	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-		resolve = resolvePromise;
-		reject = rejectPromise;
-	});
-	return { promise, resolve, reject };
-}
-
 function client(id: string): DaemonSocketClient {
 	return { id, attachedActiveSessionIds: new Set(), capabilities: new Set() } as DaemonSocketClient;
 }
@@ -60,6 +45,14 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 	throw new Error("Condition was not reached");
 }
 
+/**
+ * Constructor-bypass harness: DaemonSupervisor's constructor spawns file
+ * watchers and requires a live socket dir, so admission ordering is tested
+ * against a prototype instance with exactly the private fields handleLine
+ * touches. This list is coupled to the class by hand — when a supervisor
+ * refactor renames one of these fields, update it here; handleLine failing
+ * with "undefined is not a function/Map" in this file means exactly that.
+ */
 function createHarness(
 	options: {
 		ready?: Promise<void>;

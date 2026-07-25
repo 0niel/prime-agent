@@ -3249,7 +3249,9 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 			const blockedSubmission = fakeThis.defaultEditor.onSubmit?.("blocked user");
 			rejectStartup(new AgentConnectionPromptAdmissionError("daemon admission uncertain", status));
 			await blockedSubmission;
-			await new Promise((resolve) => setTimeout(resolve, 300));
+			// Drain scheduled continuations deterministically: an erroneous retry
+			// would have been queued by the settled submission above, not by time.
+			for (let i = 0; i < 25; i++) await new Promise((resolve) => setImmediate(resolve));
 			expect(prompt).toHaveBeenCalledOnce();
 			expect(fakeThis.showError).toHaveBeenCalledWith("daemon admission uncertain");
 			expect(fakeThis.promptStashState.stash).toEqual({

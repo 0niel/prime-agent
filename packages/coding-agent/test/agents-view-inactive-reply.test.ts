@@ -18,8 +18,13 @@ function summary(overrides: Partial<SessionSummary>): SessionSummary {
 	};
 }
 
+/** Guarded private invocation: fails with a clear message if the member is renamed. */
 function invoke(method: string, self: object, ...args: unknown[]): unknown {
-	return Reflect.get(AgentsViewMode.prototype, method).call(self, ...args);
+	const member = Reflect.get(AgentsViewMode.prototype, method) as ((...a: unknown[]) => unknown) | undefined;
+	if (typeof member !== "function") {
+		throw new Error(`AgentsViewMode.${method} no longer exists; update this test harness`);
+	}
+	return member.call(self, ...args);
 }
 
 function editorWithText(initial: string) {

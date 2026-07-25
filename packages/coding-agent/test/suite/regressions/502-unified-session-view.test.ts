@@ -2,6 +2,7 @@ import stripAnsi from "strip-ansi";
 import { describe, expect, test, vi } from "vitest";
 import { AgentsViewMode } from "../../../src/modes/agents-view/agents-view-mode.js";
 import type { SessionSummary } from "../../../src/modes/daemon/daemon-session-list.js";
+import { createDeferred as deferred } from "../scheduling.js";
 
 function summary(id: string): SessionSummary {
 	return {
@@ -17,14 +18,6 @@ function summary(id: string): SessionSummary {
 		messageCount: 1,
 		pendingMessageCount: 0,
 	};
-}
-
-function deferred<T>() {
-	let resolve!: (value: T) => void;
-	const promise = new Promise<T>((done) => {
-		resolve = done;
-	});
-	return { promise, resolve };
 }
 
 function refreshHarness() {
@@ -55,8 +48,17 @@ function refreshHarness() {
 	};
 }
 
+/**
+ * These regressions exercise AgentsViewMode internals directly because the
+ * mode class has no injectable seams yet. The guard turns a renamed/removed
+ * private into an explicit failure instead of a cryptic undefined-call error.
+ */
 function privateMethod<T>(name: string): T {
-	return Reflect.get(AgentsViewMode.prototype, name) as T;
+	const member = Reflect.get(AgentsViewMode.prototype, name) as T;
+	if (typeof member !== "function") {
+		throw new Error(`AgentsViewMode.${name} no longer exists; update this regression harness`);
+	}
+	return member;
 }
 
 describe("#502 unified session view regressions", () => {
