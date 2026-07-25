@@ -48,7 +48,7 @@ describe("ENG-4620 fast mode child agents", () => {
 
 		await supervisor.handleLine(client, JSON.stringify(command));
 
-		expect(handleCommand).toHaveBeenCalledWith(client, command);
+		expect(handleCommand.mock.calls[0]?.slice(0, 2)).toEqual([client, command]);
 		expect(write).toHaveBeenCalledWith(
 			client,
 			expect.objectContaining({ command: "set_service_tier", success: true }),
