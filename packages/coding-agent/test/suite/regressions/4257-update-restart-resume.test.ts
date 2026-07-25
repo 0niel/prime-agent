@@ -343,7 +343,7 @@ describe("issue #4257 update restart resume", () => {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("scheduled response")]);
-		const promptSpy = vi.spyOn(harness.session, "promptAndWait");
+		const promptSpy = vi.spyOn(harness.session, "promptUntilAccepted");
 		const state = createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() });
 		const internals = createDaemonInternals(harness);
 		internals.sessions.set(state.activeSessionId, state);
