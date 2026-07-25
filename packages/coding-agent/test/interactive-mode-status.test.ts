@@ -694,11 +694,8 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 		showError: vi.fn(),
 		isBashRunning: () => false,
 		patchConnectionState: vi.fn(),
-<<<<<<< HEAD
 		promptStashState: {},
-=======
 		requestAgentsView: vi.fn(async () => {}),
->>>>>>> 807913357 (test(coding-agent): align stacked fixtures)
 		promptStash: undefined,
 		pastedImages: new Map(),
 		getPromptStashImages: vi.fn(() => []),
