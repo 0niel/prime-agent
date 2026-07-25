@@ -67,6 +67,7 @@ import {
 	resolveAgentsViewSelectionState,
 	sectionTitle,
 	shouldShowAgentsViewSession,
+	summaryForUnifiedRecord,
 	type UnifiedSessionRecord,
 } from "./agents-view-state.js";
 import { matchesSearchText } from "./session-view-search.js";
@@ -431,6 +432,24 @@ export async function runAgentsViewMode(options: Omit<AgentsViewModeOptions, "ad
 			persistentState.statusMessage = formatError("Failed to open agent", error);
 		}
 	}
+}
+
+export function resolveCurrentReplyTargetSummary(
+	records: readonly UnifiedSessionRecord[],
+	target: { key: string; summary: SessionSummary },
+	findLive: (activeSessionId: string) => SessionSummary | undefined,
+): SessionSummary {
+	const identity = getSummaryIdentity(target.summary);
+	const current = records.find((record) => record.identity === identity || record.identityAliases.includes(identity));
+	if (current) return summaryForUnifiedRecord(current);
+	const live = target.summary.activeSessionId ? findLive(target.summary.activeSessionId) : undefined;
+	if (live) return live;
+	// A persisted target missing from the current live catalog can still be
+	// resumed from its captured file, but its captured runtime id is stale.
+	if (target.summary.sessionFile && target.summary.activeSessionId) {
+		return { ...target.summary, activeSessionId: undefined, lifecycle: "archived", activity: "idle" };
+	}
+	return target.summary;
 }
 
 export class AgentsViewMode implements Component, Focusable {
@@ -1382,8 +1401,11 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private async sendReply(target: { key: string; summary: SessionSummary }, text: string): Promise<boolean> {
-		let activeSessionId = target.summary.activeSessionId;
-		let liveSummary = this.findSummaryByActiveSessionId(activeSessionId ?? target.key);
+		const currentSummary = resolveCurrentReplyTargetSummary(this.unifiedRecords ?? [], target, (activeSessionId) =>
+			this.findSummaryByActiveSessionId(activeSessionId),
+		);
+		let activeSessionId = currentSummary.activeSessionId;
+		let liveSummary = activeSessionId ? currentSummary : undefined;
 		let cwdFallbackNotice: string | undefined;
 		let didResume = false;
 		try {
@@ -1394,7 +1416,7 @@ export class AgentsViewMode implements Component, Focusable {
 				const resumed = await resumeSavedAgentsViewSession(
 					this.requireClient(),
 					this.options.config,
-					target.summary,
+					currentSummary,
 				);
 				activeSessionId = resumed.activeSessionId;
 				didResume = true;

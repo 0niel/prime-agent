@@ -276,6 +276,46 @@ describe("agents view reply on inactive sessions", () => {
 		expect(last?.[1]).toEqual({ sticky: true });
 	});
 
+	it("resumes the current saved row when an armed live target becomes inactive", async () => {
+		const capturedLive = summary({
+			activeSessionId: "active-dead",
+			lifecycle: "live",
+			sessionFile: savedSummary.sessionFile,
+		});
+		const currentSaved = { ...savedSummary, activeSessionId: undefined };
+		const request = vi.fn(async () => ({
+			success: true,
+			data: { ...currentSaved, lifecycle: "live", activeSessionId: "active-new" },
+		}));
+		const self: Record<string, unknown> = {
+			options: { config: { cwd: process.cwd() } },
+			requireClient: () => ({ request }),
+			unifiedRecords: [
+				{
+					daemon: currentSaved,
+					identity: "file:/tmp/sessions/saved-1.jsonl",
+					identityAliases: ["file:/tmp/sessions/saved-1.jsonl"],
+					section: "inactive",
+					searchableText: "",
+				},
+			],
+			findSummaryByActiveSessionId: () => undefined,
+			inactiveAgentIdentities: new Set<string>(),
+			replyTarget: undefined,
+			setStatusMessage: vi.fn(),
+			selectSummary: vi.fn(),
+			sendPrompt: vi.fn(async () => {}),
+		};
+
+		await invoke("sendReply", self, { key: "active-dead", summary: capturedLive }, "wake up");
+
+		expect(request).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "create", sessionPath: savedSummary.sessionFile }),
+		);
+		expect(self.sendPrompt).toHaveBeenCalledWith("active-new", "wake up", undefined);
+		expect(self.sendPrompt).not.toHaveBeenCalledWith("active-dead", expect.anything(), expect.anything());
+	});
+
 	it("replies to live sessions without resuming", async () => {
 		const liveSummary = summary({ activeSessionId: "active-1", lifecycle: "live" });
 		const request = vi.fn();
