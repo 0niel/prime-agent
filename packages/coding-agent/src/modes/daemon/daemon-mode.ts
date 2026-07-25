@@ -416,6 +416,11 @@ export class AgentDaemon {
 		deadline?: ReturnType<typeof setTimeout>;
 		phase: "preparing" | "fencing" | "prepared" | "publishing";
 		manifest?: DaemonUpdateRestartManifest;
+		deferredClientEnv: Array<{
+			client: DaemonSocketClient;
+			state: ActiveSessionState;
+			env: Record<string, string>;
+		}>;
 	};
 	private ownsSocketPath = false;
 	private socketIdentity?: DaemonSocketIdentity;
@@ -2907,11 +2912,12 @@ export class AgentDaemon {
 				const streamsSnapshot =
 					client.transport === "private-framed" &&
 					daemonClientCapabilitiesForSession(client, state.activeSessionId).has("chunked_snapshot");
-				// Attach is admitted during update-restart preparation as a read, but env
-				// adoption is a session mutation: adopting after the manifest snapshot
-				// would strand the identity on a checkpoint that no longer includes it.
-				// The client re-attaches after restart and adopts env then.
-				if (!this.updateRestart) this.adoptClientEnv(state, filterClientEnv(command.env));
+				// Attach is admitted during update-restart preparation as a read. Env
+				// adoption remains safe while mutations are only draining; after fencing,
+				// defer it until rollback so the checkpoint never omits a live identity.
+				const clientEnv = filterClientEnv(command.env);
+				const deferClientEnv = this.updateRestart && this.updateRestart.phase !== "preparing";
+				if (!deferClientEnv) this.adoptClientEnv(state, clientEnv);
 				const snapshotSignal = streamsSnapshot
 					? markClientSnapshotStreaming(client, state.activeSessionId)
 					: undefined;
@@ -2928,6 +2934,9 @@ export class AgentDaemon {
 						finishClientSnapshotStreaming(client, state.activeSessionId);
 					}
 					throw error;
+				}
+				if (deferClientEnv && clientEnv) {
+					this.updateRestart?.deferredClientEnv.push({ client, state, env: clientEnv });
 				}
 				if (streamsSnapshot) {
 					const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
@@ -4614,6 +4623,7 @@ export class AgentDaemon {
 			...(owner ? { owner } : {}),
 			abort: new AbortController(),
 			phase: "preparing",
+			deferredClientEnv: [],
 		};
 		this.updateRestart = transaction;
 		this.cronScheduler.stop();
@@ -4724,6 +4734,16 @@ export class AgentDaemon {
 		transaction.abort.abort();
 		if (transaction.phase === "publishing") return;
 		this.updateRestart = undefined;
+		for (const deferred of transaction.deferredClientEnv) {
+			if (
+				this.sessions.get(deferred.state.activeSessionId) === deferred.state &&
+				deferred.state.clients.has(deferred.client) &&
+				deferred.client.attachedActiveSessionIds.has(deferred.state.activeSessionId)
+			) {
+				this.adoptClientEnv(deferred.state, deferred.env);
+			}
+		}
+		transaction.deferredClientEnv.length = 0;
 		for (const pause of this.updateRestartQueuePauses.values()) pause.release();
 		this.updateRestartQueuePauses.clear();
 		if (!this.shuttingDown) this.cronScheduler.start();

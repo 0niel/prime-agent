@@ -22,6 +22,7 @@ type AgentDaemonUpdateInternals = {
 	cronScheduler: AgentCronScheduler;
 	runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
 	prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest>;
+	beginUpdateRestartTransaction(owner?: DaemonSocketClient): NonNullable<AgentDaemonUpdateInternals["updateRestart"]>;
 	runUpdateRestartPreparation(
 		transaction: NonNullable<AgentDaemonUpdateInternals["updateRestart"]>,
 	): Promise<DaemonUpdateRestartManifest>;
@@ -37,6 +38,11 @@ type AgentDaemonUpdateInternals = {
 		phase: "preparing" | "fencing" | "prepared" | "publishing";
 		manifest?: DaemonUpdateRestartManifest;
 		owner?: DaemonSocketClient;
+		deferredClientEnv: Array<{
+			client: DaemonSocketClient;
+			state: ActiveSessionState;
+			env: Record<string, string>;
+		}>;
 	};
 	supervisorClaims: Map<DaemonSocketClient, unknown>;
 	revokeSupervisorClaim(client: DaemonSocketClient): boolean;
@@ -316,6 +322,7 @@ describe("issue #4257 update restart resume", () => {
 			id: Symbol("update-restart"),
 			abort: new AbortController(),
 			phase: "preparing" as const,
+			deferredClientEnv: [],
 		};
 		internals.updateRestart = transaction;
 		const firstDrain = createDeferred();
@@ -484,6 +491,7 @@ describe("issue #4257 update restart resume", () => {
 					id: Symbol("newer-update-restart"),
 					abort: new AbortController(),
 					phase: "publishing" as const,
+					deferredClientEnv: [],
 				};
 				vi.spyOn(internals, "commitPreparedUpdateRestart").mockImplementationOnce(async () => {
 					internals.updateRestart = newerTransaction;
@@ -1340,6 +1348,35 @@ describe("issue #4257 update restart resume", () => {
 		]);
 		expect(getUserTexts(harness)).toEqual(["restored follow-up"]);
 		expect(harness.session.getFollowUpQueueSnapshots()).toEqual([]);
+	});
+
+	it("adopts attach env after a fenced update preparation rolls back", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = createDaemonInternals(harness);
+		const state = createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() });
+		internals.sessions.set(state.activeSessionId, state);
+		const transaction = internals.beginUpdateRestartTransaction();
+		transaction.phase = "fencing";
+		const writes: string[] = [];
+		const client = createWriteClient(writes);
+
+		await internals.handleLine(
+			client,
+			JSON.stringify({
+				id: "attach-1",
+				type: "attach",
+				activeSessionId: state.activeSessionId,
+				env: { HERDR_PANE_ID: "w1:p1", PATH: "/ignored" },
+			}),
+		);
+
+		expect(state.clientEnv).toBeUndefined();
+		expect(state.clients.has(client)).toBe(true);
+		expect(transaction.deferredClientEnv).toHaveLength(1);
+		internals.cancelPreparedUpdateRestart(transaction.id);
+		expect(state.clientEnv).toEqual({ HERDR_PANE_ID: "w1:p1" });
+		expect(transaction.deferredClientEnv).toEqual([]);
 	});
 
 	it("reports resume_queue failure when no work can resume", async () => {
