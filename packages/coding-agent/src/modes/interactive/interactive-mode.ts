@@ -5508,7 +5508,6 @@ export class InteractiveMode {
 				if (event.aborted) {
 					if (event.reason === "manual") this.showError("Compaction cancelled");
 				} else if (event.result) {
-					this.chatContainer.clear();
 					try {
 						await this.rebuildChatFromMessages();
 					} catch (error) {
@@ -7126,7 +7125,6 @@ export class InteractiveMode {
 
 		void (async () => {
 			// Rebuild chat from session messages
-			this.chatContainer.clear();
 			await this.rebuildChatFromMessages();
 
 			// If streaming, re-add the streaming component with updated visibility and re-render

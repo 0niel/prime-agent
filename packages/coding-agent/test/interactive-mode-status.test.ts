@@ -1670,16 +1670,22 @@ describe("InteractiveMode tool event rendering", () => {
 });
 
 describe("InteractiveMode transcript rebuild", () => {
-	test("keeps existing chat visible when session context reload fails", async () => {
-		type RebuildHarness = {
-			chatContainer: Container;
-			agentConnection: { getSessionContext(): Promise<never> };
-			renderSessionContext(): Promise<void>;
-			rebuildChatFromMessages(): Promise<void>;
-		};
+	type RebuildHarness = {
+		chatContainer: Container;
+		agentConnection: { getSessionContext(): Promise<AgentConnectionSessionContext> };
+		renderSessionContext(context: AgentConnectionSessionContext, options: RenderSessionContextOptions): Promise<void>;
+		rebuildChatFromMessages(): Promise<void>;
+	};
+
+	function createRebuildHarness(): RebuildHarness {
 		const fakeThis = Object.create(InteractiveMode.prototype) as RebuildHarness;
 		fakeThis.chatContainer = new Container();
 		fakeThis.chatContainer.addChild(new Container());
+		return fakeThis;
+	}
+
+	test("keeps existing chat visible when session context reload fails", async () => {
+		const fakeThis = createRebuildHarness();
 		fakeThis.agentConnection = {
 			getSessionContext: vi.fn(async () => {
 				throw new Error("context unavailable");
@@ -1691,6 +1697,29 @@ describe("InteractiveMode transcript rebuild", () => {
 
 		expect(fakeThis.chatContainer.children).toHaveLength(1);
 		expect(fakeThis.renderSessionContext).not.toHaveBeenCalled();
+	});
+
+	test("replaces existing chat after session context reload succeeds", async () => {
+		const fakeThis = createRebuildHarness();
+		const staleChild = fakeThis.chatContainer.children[0];
+		const rebuiltChild = new Container();
+		const context: AgentConnectionSessionContext = {
+			messages: [],
+			thinkingLevel: "medium",
+			serviceTier: "default",
+			model: null,
+		};
+		fakeThis.agentConnection = { getSessionContext: vi.fn(async () => context) };
+		fakeThis.renderSessionContext = vi.fn(async (_context, options) => {
+			if (options.clearChat) fakeThis.chatContainer.clear();
+			fakeThis.chatContainer.addChild(rebuiltChild);
+		});
+
+		await fakeThis.rebuildChatFromMessages();
+
+		expect(fakeThis.renderSessionContext).toHaveBeenCalledWith(context, { clearChat: true });
+		expect(fakeThis.chatContainer.children).toEqual([rebuiltChild]);
+		expect(fakeThis.chatContainer.children).not.toContain(staleChild);
 	});
 });
 

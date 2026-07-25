@@ -25,7 +25,10 @@ function createFakeThis(overrides: Record<string, unknown> = {}) {
 		defaultEditor: {},
 		statusContainer: { clear: vi.fn() },
 		chatContainer: { clear: vi.fn() },
-		rebuildChatFromMessages: vi.fn().mockResolvedValue(undefined),
+		rebuildChatFromMessages: vi.fn(function (this: { chatContainer: { clear(): void } }) {
+			this.chatContainer.clear();
+			return Promise.resolve();
+		}),
 		addMessageToChat: vi.fn(),
 		refreshConnectionContextUsage: vi.fn().mockResolvedValue(undefined),
 		showError: vi.fn(),
@@ -61,7 +64,7 @@ describe("InteractiveMode compaction events", () => {
 
 	test.each([
 		{ name: "rebuilds successful compaction from its single persisted summary", refresh: "succeeds" },
-		{ name: "clears stale chat and reports a failed post-compaction refresh", refresh: "fails" },
+		{ name: "keeps stale chat and reports a failed post-compaction refresh", refresh: "fails" },
 	] as const)("$name", async ({ refresh }) => {
 		const fakeThis = createFakeThis(
 			refresh === "fails"
@@ -77,7 +80,7 @@ describe("InteractiveMode compaction events", () => {
 			willRetry: false,
 		});
 
-		expect(fakeThis.chatContainer.clear).toHaveBeenCalledOnce();
+		expect(fakeThis.chatContainer.clear).toHaveBeenCalledTimes(refresh === "succeeds" ? 1 : 0);
 		expect(fakeThis.rebuildChatFromMessages).toHaveBeenCalledOnce();
 		expect(fakeThis.addMessageToChat).not.toHaveBeenCalled();
 		if (refresh === "fails") {
