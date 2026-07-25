@@ -9850,8 +9850,6 @@ export class AgentSession {
 			this.agent.state.messages = sessionContext.messages;
 			this._restoreLateIpythonSentAgentMessages();
 			this._reloadGoalStateFromBranch();
-			// Queued prompts prepared against the old branch must re-run
-			// before_agent_start against the new context.
 			this._invalidateQueuedPromptPreparation();
 
 			// Emit session_tree event
