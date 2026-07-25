@@ -35,6 +35,7 @@ type FakeEditor = {
 
 type PromptStashHarness = {
 	promptStash?: PromptStash;
+	promptStashState: PromptStashState;
 	editor: FakeEditor;
 	showStatus: Mock;
 	clearShortcutGuide: Mock;
@@ -92,6 +93,8 @@ type SubmitHarness = PromptStashHarness & {
 	showError: Mock;
 	submittedInputBehavior: "steer" | "followUp";
 	inputSubmissionGeneration: number;
+	inputSubmissionsPending: number;
+	retainedSubmissionGenerations: WeakMap<object, number>;
 };
 
 type PromptStashMethods = {
@@ -159,7 +162,11 @@ function createPromptStashHarness(
 	options: { text?: string; expandedText?: string; stash?: string; pasteSnapshot?: FakePasteSnapshot } = {},
 ) {
 	const harness: PromptStashHarness = {
-		promptStash: options.stash ? { text: options.stash, pasteSnapshot: options.pasteSnapshot } : undefined,
+		// Backing state only: promptStash reads/writes go through the prototype
+		// accessor so retainSubmittedDraft and the tests see the same storage.
+		promptStashState: {
+			stash: options.stash ? { text: options.stash, pasteSnapshot: options.pasteSnapshot } : undefined,
+		},
 		editor: createEditor({
 			text: options.text,
 			expandedText: options.expandedText,
@@ -191,6 +198,8 @@ function createSubmitHarness(
 		showError: vi.fn(),
 		submittedInputBehavior: "steer",
 		inputSubmissionGeneration: 0,
+		inputSubmissionsPending: 0,
+		retainedSubmissionGenerations: new WeakMap(),
 	};
 	Object.setPrototypeOf(mode, InteractiveMode.prototype);
 	interactiveModeMethods.setupEditorSubmitHandler.call(mode);

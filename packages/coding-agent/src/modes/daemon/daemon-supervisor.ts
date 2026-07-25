@@ -1188,6 +1188,11 @@ export class DaemonSupervisor {
 					cancellationAdmission ?? this.getPromptAdmission(client, command.activeSessionId, command.admissionId);
 				if (!admission) return success(command.id, command.type, { status: "unknown" as const });
 				if (admission.status === "owned") return success(command.id, command.type, { status: "owned" as const });
+				// A definitive cancellation never downgrades: repeated cancels must not
+				// report "unknown" (or revert to waiting) for an already-cancelled admission.
+				if (admission.status === "cancelled") {
+					return success(command.id, command.type, { status: "cancelled" as const });
+				}
 				if (!admission.worker || !admission.workerActiveSessionId) {
 					admission.status = "cancelled";
 					admission.controller.abort();
@@ -1202,7 +1207,13 @@ export class DaemonSupervisor {
 					response.success && response.data && typeof response.data === "object" && "status" in response.data
 						? (response.data as { status: "cancelled" | "owned" | "unknown" }).status
 						: "unknown";
-				admission.status = status === "owned" ? "owned" : status === "cancelled" ? "cancelled" : "waiting";
+				// Re-read after the await: a concurrent socket close may have cancelled
+				// the admission during the worker round-trip. TS narrowed the pre-await
+				// status, so widen explicitly before comparing.
+				const current = (admission as SupervisorPromptAdmission).status;
+				if (status === "owned") admission.status = "owned";
+				else if (status === "cancelled") admission.status = "cancelled";
+				else if (current !== "cancelled") admission.status = "waiting";
 				return { ...response, id: command.id };
 			}
 			case "ack_result":
