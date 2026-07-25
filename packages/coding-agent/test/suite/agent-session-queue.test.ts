@@ -1541,6 +1541,37 @@ describe("AgentSession queue characterization", () => {
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
 
+	it("releases restart checkpoint waiters when preparation hands off", async () => {
+		const hook = gatedHook({ prompt: "checkpoint handoff" });
+		const harness = await createHarness({ extensionFactories: [hook.factory] });
+		harnesses.push(harness);
+		let releaseResponse = () => {};
+		harness.setResponses([
+			async () => {
+				await new Promise<void>((resolve) => {
+					releaseResponse = resolve;
+				});
+				return fauxAssistantMessage("done");
+			},
+		]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.steer("checkpoint handoff", undefined, { resumeIfIdle: true });
+		pause.release();
+		await hook.reached;
+
+		let checkpointSettled = false;
+		const checkpoint = harness.session.waitForSessionInputCheckpoint().then(() => {
+			checkpointSettled = true;
+		});
+		await Promise.resolve();
+		expect(checkpointSettled).toBe(false);
+		hook.release();
+		await vi.waitFor(() => expect(checkpointSettled).toBe(true));
+		releaseResponse();
+		await checkpoint;
+		await harness.session.waitForIdle();
+	});
+
 	it("keeps steering stop pending while a steering handoff is still preparing", async () => {
 		const hook = gatedHook({ prompt: "active steering" });
 		const harness = await createHarness({ extensionFactories: [hook.factory] });

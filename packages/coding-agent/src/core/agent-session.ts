@@ -5216,7 +5216,6 @@ export class AgentSession {
 			result?.systemPrompt !== undefined && preparation !== undefined
 				? this._refreshExtensionSystemPrompt(result.systemPrompt, preparation.basePromptSnapshot)
 				: this._baseSystemPrompt;
-		if (this._activeSessionInput?.kind === "prompt") this._activeSessionInput.phase = "handedOff";
 		try {
 			if (this.isStreaming) {
 				// agent.prompt() would reject with its already-processing error; defer instead.
@@ -5225,6 +5224,7 @@ export class AgentSession {
 			if (this._activeSessionInput?.kind === "prompt") {
 				this._activeSessionInput.phase = "handedOff";
 				this._syncSteeringStopPending();
+				this._notifySessionInputCheckpointChange();
 			}
 			const promptPromise = this.agent.prompt(messages);
 			releaseAdmission();
