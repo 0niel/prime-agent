@@ -6,6 +6,7 @@ import {
 	createDaemonCommandEnvelope,
 	type DaemonCommand,
 	type DaemonResponse,
+	success,
 } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor, waitForSupervisorPromptAdmission } from "../src/modes/daemon/daemon-supervisor.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
@@ -311,6 +312,61 @@ describe("daemon supervisor prompt admission ownership", () => {
 		expect((supervisor as unknown as { write: ReturnType<typeof vi.fn> }).write).toHaveBeenLastCalledWith(
 			owner,
 			expect.objectContaining({ success: true, data: { status: "owned" } }),
+		);
+	});
+
+	it("never downgrades a cancelled admission on repeated cancels", async () => {
+		const worker = { descriptor: { lifecycle: "ready", rootActiveSessionId: "worker-session" } };
+		const forwardToWorker = vi.fn(async (_worker: unknown, command: DaemonCommand) => {
+			if (command.type === "cancel_prompt_admission") {
+				// The worker lost the record: a bare unknown must not un-cancel.
+				return success(command.id, command.type, { status: "unknown" as const });
+			}
+			return new Promise<DaemonResponse>(() => {});
+		});
+		const supervisor = createHarness({
+			findWorker: vi.fn(async () => ({
+				worker,
+				summary: { id: "worker-session", activeSessionId: "worker-session" },
+			})),
+			forwardToWorker,
+		});
+		const owner = client("connection-owner");
+		void supervisor.handleLine(
+			owner,
+			JSON.stringify({
+				id: "prompt-1",
+				type: "prompt",
+				activeSessionId: "session-1",
+				admissionId: "public-admission",
+				message: "hello",
+			} satisfies DaemonCommand),
+		);
+		await waitFor(() => admissionFor(supervisor, owner)?.worker !== undefined);
+		const admission = admissionFor(supervisor, owner);
+		expect(admission).toBeDefined();
+		if (!admission) throw new Error("admission not registered");
+		admission.status = "cancelled";
+
+		await supervisor.handleLine(
+			owner,
+			JSON.stringify({
+				id: "cancel-1",
+				type: "cancel_prompt_admission",
+				activeSessionId: "session-1",
+				admissionId: "public-admission",
+			} satisfies DaemonCommand),
+		);
+
+		// The cancel short-circuits: no worker round-trip, status stays cancelled.
+		expect(forwardToWorker).not.toHaveBeenCalledWith(
+			worker,
+			expect.objectContaining({ type: "cancel_prompt_admission" }),
+		);
+		expect(admission.status).toBe("cancelled");
+		expect((supervisor as unknown as { write: ReturnType<typeof vi.fn> }).write).toHaveBeenLastCalledWith(
+			owner,
+			expect.objectContaining({ success: true, data: { status: "cancelled" } }),
 		);
 	});
 
