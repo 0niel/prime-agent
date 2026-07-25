@@ -4695,7 +4695,7 @@ describe("daemon mode helpers", () => {
 	});
 
 	it.each(["steer", "follow_up"] as const)(
-		"idle daemon %s returns on acceptance before the gated turn completes exactly once",
+		"idle daemon %s inserts into its scheduler lane exactly once",
 		async (type) => {
 			const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -4703,25 +4703,14 @@ describe("daemon mode helpers", () => {
 					throw new Error("unexpected runtime creation");
 				},
 			});
-			let releaseTurn: (() => void) | undefined;
-			let turnCompleted = false;
-			const turnGate = new Promise<void>((resolve) => {
-				releaseTurn = resolve;
-			}).then(() => {
-				turnCompleted = true;
-			});
-			const promptUntilAccepted = vi.fn(
-				async (_message: string, options?: { preflightResult?: (success: boolean, queued?: boolean) => void }) => {
-					options?.preflightResult?.(true, true);
-					void turnGate;
-				},
-			);
+			const steer = vi.fn(async () => {});
+			const followUp = vi.fn(async () => true);
 			const state = makeState("active-1") as ActiveSessionState & {
 				runtime: ActiveSessionState["runtime"] & {
-					session: { isStreaming: boolean; promptUntilAccepted: typeof promptUntilAccepted };
+					session: { isStreaming: boolean; steer: typeof steer; followUp: typeof followUp };
 				};
 			};
-			state.runtime = { ...state.runtime, session: { isStreaming: false, promptUntilAccepted } } as never;
+			state.runtime = { ...state.runtime, session: { isStreaming: false, steer, followUp } } as never;
 			const internals = daemon as unknown as {
 				sessions: Map<string, ActiveSessionState>;
 				recordWorkerRecoveryState: ReturnType<typeof vi.fn>;
@@ -4730,81 +4719,30 @@ describe("daemon mode helpers", () => {
 			internals.sessions.set(state.activeSessionId, state);
 			internals.recordWorkerRecoveryState = vi.fn();
 
-			let settled = 0;
-			const response = internals
-				.handleCommand(makeClient("client-1", state.activeSessionId), {
+			await expect(
+				internals.handleCommand(makeClient("client-1", state.activeSessionId), {
 					id: "command-1",
 					type,
 					activeSessionId: state.activeSessionId,
 					message: "idle queued turn",
-				})
-				.then((value) => {
-					settled++;
-					return value;
-				});
-			await expect(response).resolves.toMatchObject({
+				}),
+			).resolves.toMatchObject({
 				success: true,
 				command: type,
 				...(type === "follow_up" ? { data: { queued: true } } : {}),
 			});
-			expect(settled).toBe(1);
-			expect(turnCompleted).toBe(false);
-			expect(promptUntilAccepted).toHaveBeenCalledOnce();
+			const queue = type === "steer" ? steer : followUp;
+			expect(queue).toHaveBeenCalledOnce();
+			expect(queue).toHaveBeenCalledWith("idle queued turn", undefined, {
+				queueKey: undefined,
+				agentMessageId: undefined,
+				resumeIfIdle: true,
+			});
 			if (type === "follow_up") {
 				expect(internals.recordWorkerRecoveryState).toHaveBeenCalledWith(state, "follow_up_queued", true);
 			}
-			releaseTurn?.();
-			await turnGate;
-			expect(turnCompleted).toBe(true);
-			expect(settled).toBe(1);
 		},
 	);
-
-	it.each([
-		{ error: undefined, expected: "Prompt was not accepted by the session." },
-		{ error: new Error("duplicate follow-up queueKey"), expected: "duplicate follow-up queueKey" },
-	])("fails prompt RPC after preflight rejection with $expected", async ({ error, expected }) => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const promptUntilAccepted = vi.fn(
-			async (_message: string, options?: { preflightResult?: (success: boolean) => void }) => {
-				options?.preflightResult?.(false);
-				if (error) throw error;
-			},
-		);
-		const state = makeState("active-1") as ActiveSessionState & {
-			runtime: ActiveSessionState["runtime"] & { session: { promptUntilAccepted: typeof promptUntilAccepted } };
-		};
-		state.runtime = { ...state.runtime, session: { promptUntilAccepted } } as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
-		};
-		internals.sessions.set(state.activeSessionId, state);
-		const client = makeClient("client-1", state.activeSessionId);
-		const write = vi.fn((_data: unknown) => true);
-		client.socket = { destroyed: false, write } as unknown as Socket;
-
-		internals.handleCommand(client, {
-			id: "command-1",
-			type: "prompt",
-			activeSessionId: state.activeSessionId,
-			message: "duplicate",
-			streamingBehavior: "followUp",
-		});
-
-		await vi.waitFor(() => expect(write).toHaveBeenCalledOnce());
-		expect(JSON.parse(String(write.mock.calls[0]?.[0]))).toMatchObject({
-			id: "command-1",
-			command: "prompt",
-			success: false,
-			error: expected,
-		});
-	});
 
 	it("clears prompt admission registered before unauthenticated worker rejection", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
