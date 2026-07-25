@@ -826,7 +826,8 @@ export class DaemonAgentConnection implements AgentConnection {
 				// Timeout/transport is indistinguishable from accepted ownership.
 			}
 			await promptRequest;
-			if (promptError === undefined || (status === "owned" && type === "prompt")) return;
+			const definitiveFailure = promptError instanceof Error && this.definitiveRequestErrors.has(promptError);
+			if (promptError === undefined || (status === "owned" && type === "prompt" && !definitiveFailure)) return;
 			throw new AgentConnectionPromptAdmissionError(
 				promptError instanceof Error ? promptError.message : "Prompt admission did not complete.",
 				status,

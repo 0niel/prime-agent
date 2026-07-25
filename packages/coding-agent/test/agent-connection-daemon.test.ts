@@ -802,6 +802,28 @@ describe("DaemonAgentConnection", () => {
 		await expect(prompt).resolves.toBeUndefined();
 	});
 
+	it("preserves a definitive prompt rejection when cancellation reports owned", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("prompt_admission_cancellation");
+		let releasePrompt = () => {};
+		fakeClient.promptGate = new Promise<void>((resolve) => {
+			releasePrompt = resolve;
+		});
+		fakeClient.promptResponseError = "post-ownership validation failed";
+		fakeClient.cancelPromptAdmissionStatus = "owned";
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		const abort = new AbortController();
+
+		const prompt = connection.prompt("startup", { signal: abort.signal });
+		abort.abort();
+		await vi.waitFor(() =>
+			expect(fakeClient.requests.map((request) => request.type)).toContain("cancel_prompt_admission"),
+		);
+		releasePrompt();
+
+		await expect(prompt).rejects.toThrow("post-ownership validation failed");
+	});
+
 	it("treats a lost prompt response plus unknown cancellation as uncertain", async () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.serverCapabilities.add("prompt_admission_cancellation");
