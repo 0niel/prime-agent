@@ -569,9 +569,12 @@ function throwIfPromptAdmissionCancelled(signal: AbortSignal | undefined): void 
 	if (signal?.aborted) throw new Error("Prompt admission was cancelled.");
 }
 
-function waitForPromptAdmission<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+export function waitForPromptAdmission<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
 	if (!signal) return promise;
-	throwIfPromptAdmissionCancelled(signal);
+	if (signal.aborted) {
+		void promise.catch(() => {});
+		throwIfPromptAdmissionCancelled(signal);
+	}
 	return new Promise<T>((resolve, reject) => {
 		const onAbort = () => {
 			cleanup();

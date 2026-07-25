@@ -5,6 +5,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { waitForPromptAdmission } from "../../src/core/agent-session.js";
 import type { BashResult } from "../../src/core/bash-executor.js";
 import type { PromptTemplate } from "../../src/core/prompt-templates.js";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.js";
@@ -34,6 +35,15 @@ function gateNextAgentStart(harness: Harness): { reached: Promise<void>; release
 }
 
 describe("AgentSession prompt characterization", () => {
+	it("observes already-running work when prompt admission is pre-aborted", async () => {
+		const abort = new AbortController();
+		abort.abort();
+		const work = Promise.reject(new Error("late idle failure"));
+
+		expect(() => waitForPromptAdmission(work, abort.signal)).toThrow("Prompt admission was cancelled");
+		await Promise.resolve();
+	});
+
 	const harnesses: Harness[] = [];
 	const tempDirs: string[] = [];
 
