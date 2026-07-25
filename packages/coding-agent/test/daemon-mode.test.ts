@@ -5140,19 +5140,21 @@ describe("daemon mode helpers", () => {
 				throw new Error("unexpected runtime creation");
 			},
 		});
-		const prompt = vi.fn(async () => {});
+		const steer = vi.fn(async () => {});
+		const followUp = vi.fn(async () => true);
 		const restoreSteeringMessage = vi.fn(async () => {});
 		const restoreFollowUpMessage = vi.fn(async () => true);
 		const state = makeState("active-1") as ActiveSessionState & {
 			runtime: ActiveSessionState["runtime"] & {
 				session: {
-					prompt: typeof prompt;
+					steer: typeof steer;
+					followUp: typeof followUp;
 					restoreSteeringMessage: typeof restoreSteeringMessage;
 					restoreFollowUpMessage: typeof restoreFollowUpMessage;
 				};
 			};
 		};
-		state.runtime.session = { prompt, restoreSteeringMessage, restoreFollowUpMessage } as never;
+		state.runtime.session = { steer, followUp, restoreSteeringMessage, restoreFollowUpMessage } as never;
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
 			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
@@ -5167,15 +5169,12 @@ describe("daemon mode helpers", () => {
 			queueKey: "heartbeat:expanded",
 			agentMessageId: `agentmsg_expanded_${type}`,
 		});
-		expect(prompt).toHaveBeenCalledWith(
-			"expanded prompt",
-			expect.objectContaining({
-				streamingBehavior: type === "steer" ? "steer" : "followUp",
-				queueIfBusy: true,
-				followUpQueueKey: "heartbeat:expanded",
-				agentMessageId: `agentmsg_expanded_${type}`,
-			}),
-		);
+		const queue = type === "steer" ? steer : followUp;
+		expect(queue).toHaveBeenCalledWith("expanded prompt", undefined, {
+			queueKey: "heartbeat:expanded",
+			agentMessageId: `agentmsg_expanded_${type}`,
+			resumeIfIdle: true,
+		});
 
 		const replayFields = {
 			content: [{ type: "text" as const, text: "restored content" }],
@@ -5221,7 +5220,7 @@ describe("daemon mode helpers", () => {
 			agentMessageId: `agentmsg_${type}`,
 			...replayFields,
 		});
-		expect(prompt).toHaveBeenCalledOnce();
+		expect(queue).toHaveBeenCalledOnce();
 
 		await expect(
 			internals.handleCommand(client, { ...base, message: "invalid", agentMessageId: "" }),

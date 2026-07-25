@@ -3106,20 +3106,11 @@ export class AgentDaemon {
 						prefixMessages: command.prefixMessages,
 					});
 				} else {
-					await this.promptWithAgentMessagePreparingGuard(
-						state,
-						command.message,
-						{
-							images: command.images,
-							streamingBehavior: "steer",
-							queueIfBusy: true,
-							resumeIfIdle: true,
-							followUpQueueKey: command.queueKey,
-							agentMessageId: command.agentMessageId,
-						},
-						undefined,
-						false,
-					);
+					await state.runtime.session.steer(command.message, command.images, {
+						queueKey: command.queueKey,
+						agentMessageId: command.agentMessageId,
+						resumeIfIdle: true,
+					});
 				}
 				this.recordWorkerRecoveryState(state, "steer_queued", true);
 				return success(command.id, "steer");
@@ -3139,24 +3130,12 @@ export class AgentDaemon {
 					});
 					admitted = queued;
 				} else {
-					await this.promptWithAgentMessagePreparingGuard(
-						state,
-						command.message,
-						{
-							images: command.images,
-							streamingBehavior: "followUp",
-							queueIfBusy: true,
-							resumeIfIdle: true,
-							followUpQueueKey: command.queueKey,
-							agentMessageId: command.agentMessageId,
-							preflightResult: (didSucceed, didQueue) => {
-								admitted = didSucceed;
-								queued = didSucceed && didQueue === true;
-							},
-						},
-						undefined,
-						false,
-					);
+					queued = await state.runtime.session.followUp(command.message, command.images, {
+						queueKey: command.queueKey,
+						agentMessageId: command.agentMessageId,
+						resumeIfIdle: true,
+					});
+					admitted = queued;
 				}
 				if (admitted) {
 					this.recordWorkerRecoveryState(state, "follow_up_queued", true);
