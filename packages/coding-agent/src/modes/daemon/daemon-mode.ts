@@ -2592,7 +2592,7 @@ export class AgentDaemon {
 						// The fence check remains authoritative after cancellation. Its rejection
 						// revokes only the exact binding that initiated it; replacements survive.
 						void claimCheck.catch(() => {
-							if (this.supervisorClaims.get(client) === boundClaim) client.socket.end();
+							if (this.revokeSupervisorClaim(client, boundClaim)) client.socket.end();
 						});
 					}
 					clearParsedAdmission();

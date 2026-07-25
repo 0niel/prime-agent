@@ -4853,9 +4853,15 @@ describe("daemon mode helpers", () => {
 			await Promise.resolve();
 			await Promise.resolve();
 
-			if (outcome === "late-failure") expect(end).toHaveBeenCalledOnce();
-			else expect(end).not.toHaveBeenCalled();
+			if (outcome === "late-failure") {
+				expect(end).toHaveBeenCalledOnce();
+				expect(internals.supervisorClaims.has(client)).toBe(false);
+			} else {
+				expect(end).not.toHaveBeenCalled();
+			}
 			if (outcome === "success") expect(originalBinding.ownerFingerprint).toBe("owner");
+			if (outcome === "replacement")
+				expect(internals.supervisorClaims.get(client)?.ownerFingerprint).toBe("replacement");
 		},
 	);
 
