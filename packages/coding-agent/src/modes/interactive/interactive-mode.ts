@@ -2779,7 +2779,6 @@ export class InteractiveMode {
 	}
 
 	private async renderResyncedSession(snapshot: AgentConnectionSnapshot): Promise<void> {
-		const compactionFinished = this.isAgentCompacting() && !snapshot.state.isCompacting;
 		const bashFinished = this.isBashRunning() && !snapshot.state.isBashRunning;
 		this.applyConnectionStateSnapshot(snapshot.state);
 		this.streamingComponent = undefined;
@@ -2791,9 +2790,6 @@ export class InteractiveMode {
 		});
 		await this.restoreStreamingMessageFromSnapshot(snapshot.streamingMessage);
 		await this.refreshConnectionQueue();
-		if (compactionFinished) {
-			await this.flushCompactionQueue({ willRetry: false });
-		}
 		if (bashFinished) {
 			if (this.activeBashComponent) {
 				this.activeBashComponent.setComplete(undefined, false);
