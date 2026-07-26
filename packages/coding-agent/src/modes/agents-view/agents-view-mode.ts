@@ -1,6 +1,8 @@
 import { existsSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import {
+	type AutocompleteProvider,
+	CombinedAutocompleteProvider,
 	type Component,
 	clippedFullscreenDockHeight,
 	type Focusable,
@@ -15,6 +17,13 @@ import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSI
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
 import { SessionManager } from "../../core/session-manager.js";
+import {
+	BUILTIN_SLASH_COMMANDS,
+	isBuiltinSlashCommandName,
+	isSessionSlashCommandName,
+	parseSlashCommand,
+	resolveBuiltinSlashCommandName,
+} from "../../core/slash-commands.js";
 import { canonicalizePath } from "../../utils/paths.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
@@ -435,6 +444,34 @@ export async function runAgentsViewMode(options: Omit<AgentsViewModeOptions, "ad
 	}
 }
 
+/**
+ * The reply composer delivers text through the daemon prompt path, which only
+ * executes session-owned slash commands. Reject other recognized built-ins
+ * instead of sending them to the model as plain text.
+ */
+export function getReplyComposerCommandRejection(text: string): string | undefined {
+	const parsed = parseSlashCommand(text);
+	if (!parsed) return undefined;
+	const name = resolveBuiltinSlashCommandName(parsed.name);
+	if (isSessionSlashCommandName(name)) return undefined;
+	if (!isBuiltinSlashCommandName(parsed.name)) return undefined;
+	return `/${parsed.name} is not available here; open the session to run it`;
+}
+
+/** Autocomplete for the reply composer: session-owned slash commands only. */
+export function createReplyComposerAutocompleteProvider(cwd: string): AutocompleteProvider {
+	const sessionCommands = BUILTIN_SLASH_COMMANDS.filter((command) => isSessionSlashCommandName(command.name)).map(
+		(command) => ({
+			name: command.name,
+			aliases: command.aliases,
+			description: command.description,
+			argumentHint: command.argumentHint,
+			takesArgument: command.takesArgument,
+		}),
+	);
+	return new CombinedAutocompleteProvider(sessionCommands, cwd);
+}
+
 export function resolveCurrentReplyTargetSummary(
 	records: readonly UnifiedSessionRecord[],
 	target: { key: string; summary: SessionSummary },
@@ -539,6 +576,15 @@ export class AgentsViewMode implements Component, Focusable {
 			autocompleteMaxVisible: options.uiServices.settingsManager.getAutocompleteMaxVisible(),
 			placeholder: SEARCH_PROMPT_PLACEHOLDER,
 			placeholderColor: (text) => theme.fg("dim", text),
+		});
+		const replyAutocomplete = createReplyComposerAutocompleteProvider(options.uiServices.getInitialCwd());
+		// Search mode must not autocomplete; the provider only answers while a
+		// reply target is armed.
+		this.editor.setAutocompleteProvider({
+			getSuggestions: async (lines, cursorLine, cursorCol, suggestOptions) =>
+				this.replyTarget ? replyAutocomplete.getSuggestions(lines, cursorLine, cursorCol, suggestOptions) : null,
+			applyCompletion: (lines, cursorLine, cursorCol, item, prefix) =>
+				replyAutocomplete.applyCompletion(lines, cursorLine, cursorCol, item, prefix),
 		});
 		this.editor.focused = true;
 		this.editor.getHeaderLine = () => this.renderReplyHeaderLine();
@@ -1062,6 +1108,11 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.replyTarget) {
 			const target = this.replyTarget;
 			const text = value.trim();
+			const rejection = getReplyComposerCommandRejection(text);
+			if (rejection) {
+				this.setStatusMessage(rejection, { tone: "warning" });
+				return;
+			}
 			if (text) {
 				this.editor.setText("");
 				const sent = await this.sendReply(target, text, delivery);

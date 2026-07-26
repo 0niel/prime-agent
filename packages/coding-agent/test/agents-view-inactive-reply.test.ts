@@ -2,7 +2,11 @@ import { setKeybindings } from "@earendil-works/pi-tui";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../src/core/keybindings.js";
-import { AgentsViewMode } from "../src/modes/agents-view/agents-view-mode.js";
+import {
+	AgentsViewMode,
+	createReplyComposerAutocompleteProvider,
+	getReplyComposerCommandRejection,
+} from "../src/modes/agents-view/agents-view-mode.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 
 function summary(overrides: Partial<SessionSummary>): SessionSummary {
@@ -473,5 +477,53 @@ describe("agents view reply on inactive sessions", () => {
 		self.findSummaryByActiveSessionId = () => undefined;
 		const savedHints = stripAnsi(invoke("renderReplyComposerHints", self) as string);
 		expect(savedHints).toContain("resume & send");
+	});
+});
+
+describe("reply composer slash commands", () => {
+	it("lets session-owned commands pass through to the prompt path", () => {
+		expect(getReplyComposerCommandRejection("/compact focus on the API work")).toBeUndefined();
+		expect(getReplyComposerCommandRejection("/refine")).toBeUndefined();
+		expect(getReplyComposerCommandRejection("/goal ship it")).toBeUndefined();
+		expect(getReplyComposerCommandRejection("/autonomous")).toBeUndefined();
+	});
+
+	it("rejects recognized non-session built-ins with guidance", () => {
+		expect(getReplyComposerCommandRejection("/model gpt-5")).toContain("/model is not available here");
+		expect(getReplyComposerCommandRejection("/settings")).toContain("not available here");
+	});
+
+	it("treats unrecognized slash-prefixed text as a plain reply", () => {
+		expect(getReplyComposerCommandRejection("/usr/local/bin looks wrong")).toBeUndefined();
+		expect(getReplyComposerCommandRejection("plain reply")).toBeUndefined();
+	});
+
+	it("blocks a rejected command in submit without clearing the editor", async () => {
+		const editor = editorWithText("/model gpt-5");
+		const setStatusMessage = vi.fn();
+		const sendReply = vi.fn();
+		const self: Record<string, unknown> = {
+			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
+			editor,
+			setStatusMessage,
+			sendReply,
+		};
+
+		await invoke("submit", self, "/model gpt-5");
+
+		expect(sendReply).not.toHaveBeenCalled();
+		expect(setStatusMessage).toHaveBeenCalledWith(expect.stringContaining("not available here"), {
+			tone: "warning",
+		});
+		expect(editor.getText()).toBe("/model gpt-5");
+	});
+
+	it("suggests only session-owned commands", async () => {
+		const provider = createReplyComposerAutocompleteProvider(process.cwd());
+		const suggestions = await provider.getSuggestions(["/"], 0, 1, { signal: new AbortController().signal });
+		const names = suggestions?.items.map((item) => item.value) ?? [];
+		expect(names).toEqual(expect.arrayContaining(["compact", "refine", "goal", "autonomous"]));
+		expect(names).not.toContain("model");
+		expect(names).not.toContain("settings");
 	});
 });
