@@ -5169,6 +5169,8 @@ export class AgentSession {
 			}
 			if (resultText) this._appendDurableSessionCommandMessage(resultText, input.command, true, false);
 		} catch (error) {
+			// A skipped compaction is benign and already surfaced by compaction_end.
+			if (error instanceof CompactionSkippedError) return;
 			const commandError = error instanceof Error ? error : new Error(String(error));
 			this._appendDurableSessionCommandMessage(`Command failed: ${commandError.message}`, input.command, true, true);
 			throw commandError;

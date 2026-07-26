@@ -2513,6 +2513,25 @@ prepared:${event.prompt}`,
 		await expect(completion).rejects.toThrow("durable invocation append failed");
 	});
 
+	it("does not record a benign compaction skip as a command failure", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		let compactionEndErrorSeverity: string | undefined;
+		harness.session.subscribe((event) => {
+			if (event.type === "compaction_end") compactionEndErrorSeverity = event.errorSeverity;
+		});
+
+		// Too-short session: compact() throws CompactionSkippedError.
+		await harness.session.prompt("/compact");
+
+		const commandMessages = harness.session.messages.filter(
+			(message): message is Extract<(typeof harness.session.messages)[number], { role: "custom" }> =>
+				message.role === "custom" && message.customType.startsWith("session_slash_command"),
+		);
+		expect(commandMessages.map((message) => message.customType)).toEqual(["session_slash_command"]);
+		expect(compactionEndErrorSeverity).toBe("warning");
+	});
+
 	it("restores command envelopes as commands and other slash-prefixed messages literally", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
