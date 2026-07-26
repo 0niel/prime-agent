@@ -1530,8 +1530,8 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	/** Create a fresh daemon session and open it in the chat view. */
-	private async createNewSession(): Promise<void> {
-		if (this.creatingNewSession || this.stopped) return;
+	private async createNewSession(): Promise<boolean> {
+		if (this.creatingNewSession || this.stopped) return false;
 		this.creatingNewSession = true;
 		const client = this.requireClient();
 		try {
@@ -1548,12 +1548,14 @@ export class AgentsViewMode implements Component, Focusable {
 				if (created.activeSessionId && client.isConnected) {
 					await client.request({ type: "kill", activeSessionId: created.activeSessionId }).catch(() => undefined);
 				}
-				return;
+				return false;
 			}
 			this.selectSummary(created);
 			this.finish({ type: "open", summary: created });
+			return true;
 		} catch (error) {
 			if (!this.stopped) this.setStatusMessage(formatError("Failed to create session", error));
+			return false;
 		} finally {
 			this.creatingNewSession = false;
 		}
