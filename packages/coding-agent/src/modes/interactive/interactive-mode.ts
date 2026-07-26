@@ -4418,8 +4418,7 @@ export class InteractiveMode {
 			const submissionGeneration = ++this.inputSubmissionGeneration;
 			this.inputSubmissionsPending++;
 			this.clearShortcutGuide();
-			// Bind the submission to the session it was typed for: a barrier wait can
-			// resume after /new or a session rebind repointed the live fields.
+			// A barrier wait can resume after /new repointed the live session fields.
 			const submissionStashState = this.promptStashState;
 			const submissionSessionId = this.promptStashSessionId;
 			const promptStashToRestore = this.promptStash;
@@ -4780,9 +4779,8 @@ export class InteractiveMode {
 					this.promptStashSessionId !== submissionSessionId
 				) {
 					// The editor is already torn down, but its shared session stash outlives
-					// this view. Preserve the submitted draft there without overwriting an
-					// explicit older stash or touching editor state. Retention targets the
-					// state of the session the input was typed for, not a rebound one.
+					// this view. Preserve the submitted draft in the stash of the session it
+					// was typed for, without overwriting an explicit older stash.
 					this.retainSubmittedDraft(submittedDraft ?? { text }, submissionGeneration, submissionStashState);
 					submissionOutcome = "lifecycle-cancelled";
 					return;
