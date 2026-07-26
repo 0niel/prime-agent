@@ -1255,7 +1255,11 @@ export class AgentsViewMode implements Component, Focusable {
 		// The search editor never treats text as a prompt; a recognized view
 		// command acts on the selected row, anything else opens the selection.
 		const viewCommand = parseAgentsViewCommand(value.trim());
-		if (viewCommand && !this.options.adapter) {
+		if (viewCommand) {
+			if (this.options.adapter) {
+				this.setStatusMessage(`/${viewCommand.name} is not available here`, { tone: "warning" });
+				return;
+			}
 			// submitValue cleared the editor without queryChanged; drop the command
 			// from the persisted query so a remount cannot restore and re-run it.
 			this.persistentState.query = "";

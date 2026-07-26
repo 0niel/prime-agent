@@ -706,6 +706,26 @@ describe("agents view slash commands", () => {
 		expect(persistentState.query).toBe("/kill");
 	});
 
+	it("rejects view commands in the adapter search editor", async () => {
+		const openSelected = vi.fn();
+		const self: Record<string, unknown> = {
+			replyTarget: undefined,
+			renameTarget: undefined,
+			options: { adapter: { kind: "local" } },
+			rows: [],
+			selectedIndex: 0,
+			setStatusMessage: vi.fn(),
+			runAgentsViewCommand: vi.fn(),
+			openSelected,
+		};
+
+		await invoke("submit", self, "/new");
+
+		expect(self.runAgentsViewCommand).not.toHaveBeenCalled();
+		expect(openSelected).not.toHaveBeenCalled();
+		expect(self.setStatusMessage).toHaveBeenCalledWith("/new is not available here", { tone: "warning" });
+	});
+
 	it("keeps plain search text opening the selection", async () => {
 		const openSelected = vi.fn();
 		const self: Record<string, unknown> = {
