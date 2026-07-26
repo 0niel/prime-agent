@@ -288,26 +288,31 @@ describe("#502 unified session view regressions", () => {
 
 	test("a missing selection anchor blocks open only until both catalogs settle", () => {
 		const finish = vi.fn();
-		const syncSelectedRowState = vi.fn();
+		const fallback = summary("fallback");
 		const harness = {
 			selectionAnchorPending: true,
 			liveCatalogRefreshPending: false,
 			savedCatalogRefreshPending: true,
 			selectedIndex: 0,
-			rows: [{ selectable: true, kind: "agent", summary: summary("fallback") }],
+			selectedActiveSessionId: undefined as string | undefined,
+			selectedRowIdentity: "identity-intended",
+			rows: [{ selectable: true, kind: "agent", summary: fallback }],
 			isPendingDeleteRow: () => false,
 			setStatusMessage: vi.fn(),
 			finish,
-			syncSelectedRowState,
 		};
 
 		privateMethod<(this: typeof harness) => void>("openSelected").call(harness);
 		expect(finish).not.toHaveBeenCalled();
 		privateMethod<(this: typeof harness) => void>("resolveMissingSelectionAnchor").call(harness);
-		expect(syncSelectedRowState).not.toHaveBeenCalled();
+		expect(harness.selectionAnchorPending).toBe(true);
 		harness.savedCatalogRefreshPending = false;
 		privateMethod<(this: typeof harness) => void>("resolveMissingSelectionAnchor").call(harness);
-		expect(syncSelectedRowState).toHaveBeenCalledOnce();
+		// Open unblocks on the visible fallback row...
+		expect(harness.selectionAnchorPending).toBe(false);
+		expect(harness.selectedActiveSessionId).toBe(fallback.activeSessionId ?? fallback.id);
+		// ...but the restored anchor identity survives so a late poll can still re-anchor.
+		expect(harness.selectedRowIdentity).toBe("identity-intended");
 	});
 	test("adapter rename uses the captured row after refresh removes it", async () => {
 		const captured = summary("captured");
