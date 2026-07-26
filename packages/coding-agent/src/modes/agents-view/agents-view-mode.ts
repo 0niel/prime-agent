@@ -1553,8 +1553,7 @@ export class AgentsViewMode implements Component, Focusable {
 					env: collectDaemonClientEnv(),
 				});
 				const created = expectSessionSummary(requireDaemonData(response));
-				// The view can finish while create is in flight; kill the fresh empty
-				// session instead of leaving an orphan resident in the agents list.
+				// The view can finish mid-create; kill the fresh session instead of orphaning it.
 				if (this.stopped) {
 					if (created.activeSessionId) {
 						await client
@@ -1578,9 +1577,8 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	/**
-	 * A connection that outlives finish(), which closes the shared client and
-	 * would reject an in-flight create while the daemon still materializes the
-	 * session, leaving that orphan unkillable.
+	 * Outlives finish(), which closes the shared client and would reject an
+	 * in-flight create while the daemon still materializes the session.
 	 */
 	private async connectDedicatedClient(): Promise<DaemonClient> {
 		return connectAgentsViewDaemonClient(this.requireSocketPath());
