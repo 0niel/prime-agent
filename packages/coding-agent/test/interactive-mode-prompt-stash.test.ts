@@ -49,6 +49,7 @@ type SharedPromptStashHarness = PromptStashHarness & {
 	promptStashStore: ClientPromptStashStore;
 	promptStashSessionId: string;
 	promptStashState: PromptStashState;
+	pendingPromptStashReleases: { sessionId: string; state: unknown }[];
 	pastedImages: Map<number, ImageContent>;
 	nextImageMarkerId: number;
 };
@@ -94,6 +95,7 @@ type SubmitHarness = PromptStashHarness & {
 	submittedInputBehavior: "steer" | "followUp";
 	inputSubmissionGeneration: number;
 	inputSubmissionsPending: number;
+	pendingPromptStashReleases: { sessionId: string; state: unknown }[];
 	retainedSubmissionGenerations: WeakMap<object, number>;
 };
 
@@ -198,6 +200,7 @@ function createSubmitHarness(
 		submittedInputBehavior: "steer",
 		inputSubmissionGeneration: 0,
 		inputSubmissionsPending: 0,
+		pendingPromptStashReleases: [],
 		retainedSubmissionGenerations: new WeakMap(),
 	};
 	Object.setPrototypeOf(mode, InteractiveMode.prototype);
@@ -219,6 +222,7 @@ function createSharedPromptStashHarness(
 		promptStashStore: store,
 		promptStashSessionId: sessionId,
 		promptStashState: store.forSession(sessionId),
+		pendingPromptStashReleases: [],
 		editor: createEditor(options),
 		showStatus: vi.fn(),
 		clearShortcutGuide: vi.fn(),
