@@ -651,9 +651,7 @@ export class AgentsViewMode implements Component, Focusable {
 		});
 		const searchAutocomplete = createSearchViewAutocompleteProvider(options.uiServices.getInitialCwd());
 		// Search text stays a query; only slash-prefixed input offers view commands.
-		// The armed provider is rebuilt on arming so @-paths resolve in the target
-		// session's cwd, not the view's startup directory. The local adapter view
-		// runs no view commands, so it offers none either.
+		// The armed provider is rebuilt on arming so @-paths resolve in the target's cwd.
 		void ensureTool("fd").then((fdPath) => {
 			this.fdPath = fdPath;
 			// Rebind an already-armed provider so @-completion picks up fd.
@@ -1678,8 +1676,7 @@ export class AgentsViewMode implements Component, Focusable {
 					env: collectDaemonClientEnv(),
 				});
 				const created = expectSessionSummary(requireDaemonData(response));
-				// The view can finish while create is in flight; kill the fresh empty
-				// session instead of leaving an orphan resident in the agents list.
+				// The view can finish mid-create; kill the fresh session instead of orphaning it.
 				if (this.stopped) {
 					if (created.activeSessionId) {
 						await client
@@ -1703,10 +1700,9 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	/**
-	 * Run a whitelisted view command against a target row (or none for /new).
-	 * Returns whether the command completed, so callers can restore the draft.
-	 * The editor buffer is already empty here (submitValue cleared it), and any
-	 * composer disarm is guarded against re-arming during the awaited RPCs.
+	 * Run a view command against a target row (none for /new). Returns whether
+	 * it completed so callers can restore the draft; disarms are guarded
+	 * against a composer re-armed during the awaited RPCs.
 	 */
 	private async runAgentsViewCommand(
 		command: AgentsViewCommand,
@@ -1777,9 +1773,8 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	/**
-	 * A connection that outlives finish(), which closes the shared client and
-	 * would reject an in-flight create while the daemon still materializes the
-	 * session, leaving that orphan unkillable.
+	 * Outlives finish(), which closes the shared client and would reject an
+	 * in-flight create while the daemon still materializes the session.
 	 */
 	private async connectDedicatedClient(): Promise<DaemonClient> {
 		return connectAgentsViewDaemonClient(this.requireSocketPath());
