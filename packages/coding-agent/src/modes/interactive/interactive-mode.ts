@@ -4210,13 +4210,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.session.resume", () => {
 			void this.requestAgentsView();
 		});
-		this.defaultEditor.onAgentsBack = () => {
-			if (!this.options.returnToAgentsView || this.editor.getText().trim()) {
-				return false;
-			}
-			void this.returnToAgentsView();
-			return true;
-		};
+		this.defaultEditor.onAgentsBack = () => this.handleAgentsBack();
 		this.defaultEditor.onMoveBelowPrompt = () => this.focusChildAgentSummary();
 
 		this.defaultEditor.onChange = (text: string) => {
@@ -7050,6 +7044,19 @@ export class InteractiveMode {
 		this.releasePromptStashSession();
 		this.stop({ preserveAltScreen: options.preserveAltScreen });
 		stopThemeWatcher();
+	}
+
+	private handleAgentsBack(): boolean {
+		if (this.editor.getText().trim()) {
+			return false;
+		}
+		if (!this.options.returnToAgentsView) {
+			// Process-local sessions open the same unified view in place.
+			void this.requestAgentsView();
+			return true;
+		}
+		void this.returnToAgentsView();
+		return true;
 	}
 
 	private async requestAgentsView(): Promise<void> {
