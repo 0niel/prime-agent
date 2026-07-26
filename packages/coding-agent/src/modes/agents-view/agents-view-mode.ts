@@ -1657,8 +1657,7 @@ export class AgentsViewMode implements Component, Focusable {
 			if (armedAtStart && this.replyTarget === armedAtStart) this.setReplyTarget(undefined);
 		};
 		if (command.name === "new") {
-			await this.createNewSession();
-			return true;
+			return await this.createNewSession();
 		}
 		if (!target) {
 			this.setStatusMessage(`Select an agent row to use /${command.name}`, { tone: "warning" });
@@ -1730,35 +1729,43 @@ export class AgentsViewMode implements Component, Focusable {
 	 */
 	private async forkTargetSession(target: SessionSummary): Promise<boolean> {
 		let activeSessionId = target.activeSessionId;
-		if (!activeSessionId) {
-			this.setStatusMessage("Resuming session...");
-			const resumed = await resumeSavedAgentsViewSession(this.requireClient(), this.options.config, target);
-			activeSessionId = resumed.activeSessionId;
-			this.inactiveAgentIdentities.delete(getSummaryIdentity(target));
+		let didResume = false;
+		try {
+			if (!activeSessionId) {
+				this.setStatusMessage("Resuming session...");
+				const resumed = await resumeSavedAgentsViewSession(this.requireClient(), this.options.config, target);
+				activeSessionId = resumed.activeSessionId;
+				didResume = true;
+				this.inactiveAgentIdentities.delete(getSummaryIdentity(target));
+			}
+			const treeData = requireDaemonData(
+				await this.requireClient().request({ type: "get_session_tree", activeSessionId }),
+			) as { leafId: string | null };
+			if (!treeData.leafId) {
+				this.setStatusMessage("Nothing to fork yet", { tone: "warning" });
+				return false;
+			}
+			this.setStatusMessage("Forking session...");
+			const result = requireDaemonData(
+				await this.requireClient().request({
+					type: "fork",
+					activeSessionId,
+					entryId: treeData.leafId,
+					position: "at",
+				}),
+			) as { cancelled: boolean };
+			if (result.cancelled) {
+				this.setStatusMessage("Fork cancelled");
+				return false;
+			}
+			this.setStatusMessage("Forked to a new session; previous history stays available as inactive");
+			didResume = false;
+			await this.refreshSessions({ preserveStatusOnError: true });
+			return true;
+		} finally {
+			// A session resumed for a fork that then failed must still appear live.
+			if (didResume) await this.refreshSessions({ preserveStatusOnError: true });
 		}
-		const treeData = requireDaemonData(
-			await this.requireClient().request({ type: "get_session_tree", activeSessionId }),
-		) as { leafId: string | null };
-		if (!treeData.leafId) {
-			this.setStatusMessage("Nothing to fork yet", { tone: "warning" });
-			return false;
-		}
-		this.setStatusMessage("Forking session...");
-		const result = requireDaemonData(
-			await this.requireClient().request({
-				type: "fork",
-				activeSessionId,
-				entryId: treeData.leafId,
-				position: "at",
-			}),
-		) as { cancelled: boolean };
-		if (result.cancelled) {
-			this.setStatusMessage("Fork cancelled");
-			return false;
-		}
-		this.setStatusMessage("Forked to a new session; previous history stays available as inactive");
-		await this.refreshSessions({ preserveStatusOnError: true });
-		return true;
 	}
 
 	/** Point selection (and its persisted key) at a freshly resumed session row. */

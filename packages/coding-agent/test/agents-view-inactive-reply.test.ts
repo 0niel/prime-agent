@@ -694,14 +694,13 @@ describe("agents view slash commands", () => {
 		expect(self.runAgentsViewCommand).not.toHaveBeenCalled();
 	});
 
-	it("runs /new without a target row", async () => {
-		const createNewSession = vi.fn(async () => {});
-		const self: Record<string, unknown> = { createNewSession, replyTarget: undefined };
+	it("runs /new without a target row and propagates the outcome", async () => {
+		const self: Record<string, unknown> = { createNewSession: vi.fn(async () => true), replyTarget: undefined };
+		await expect(invoke("runAgentsViewCommand", self, { name: "new", args: "" }, undefined)).resolves.toBe(true);
+		expect(self.createNewSession).toHaveBeenCalledOnce();
 
-		const succeeded = await invoke("runAgentsViewCommand", self, { name: "new", args: "" }, undefined);
-
-		expect(createNewSession).toHaveBeenCalledOnce();
-		expect(succeeded).toBe(true);
+		const failing: Record<string, unknown> = { createNewSession: vi.fn(async () => false), replyTarget: undefined };
+		await expect(invoke("runAgentsViewCommand", failing, { name: "new", args: "" }, undefined)).resolves.toBe(false);
 	});
 
 	it("requires a selected row for row-targeted commands", async () => {
@@ -810,6 +809,29 @@ describe("agents view slash commands", () => {
 		expect(forked).toBe(false);
 		expect(setStatusMessage).toHaveBeenCalledWith("Fork cancelled");
 		expect(self.refreshSessions).not.toHaveBeenCalled();
+	});
+
+	it("refreshes the catalog when a resumed fork fails afterwards", async () => {
+		const saved = summary({ sessionFile: "/tmp/sessions/saved-1.jsonl", cwd: process.cwd() });
+		const request = vi.fn(async (command: { type: string }) => {
+			if (command.type === "create") {
+				return { success: true, data: { ...saved, lifecycle: "live", activeSessionId: "active-9" } };
+			}
+			// Empty tree: fork aborts after the resume already made the row live.
+			return { success: true, data: { tree: [], leafId: null } };
+		});
+		const self: Record<string, unknown> = {
+			options: { config: { cwd: process.cwd() } },
+			requireClient: () => ({ request }),
+			setStatusMessage: vi.fn(),
+			inactiveAgentIdentities: new Set(["file:/tmp/sessions/saved-1.jsonl"]),
+			refreshSessions: vi.fn(async () => true),
+		};
+
+		const forked = await invoke("forkTargetSession", self, saved);
+
+		expect(forked).toBe(false);
+		expect(self.refreshSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
 	});
 
 	it("refuses /kill on an inactive row", async () => {
