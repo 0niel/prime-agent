@@ -4117,8 +4117,7 @@ export class AgentSession {
 					signal: options?.signal,
 				})
 			: undefined;
-		// The streaming path skips admission, so its commit point is here; an
-		// already-aborted prompt must not enqueue into a session the caller left.
+		// The streaming path skips admission, so this is its cancellation commit point.
 		if (!admission) throwIfPromptAdmissionCancelled(options?.signal);
 		const releaseAdmission = admission?.release ?? (() => {});
 		try {
