@@ -1154,7 +1154,12 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private getFilteredRecords(): UnifiedSessionRecord[] {
-		const query = this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
+		let query = this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
+		// Slash-prefixed input is (partially typed) command input, not a query:
+		// filtering on it would reshuffle the list under the selected target row.
+		if (!this.replyTarget && !this.renameTarget && !this.options.adapter && query.trimStart().startsWith("/")) {
+			query = "";
+		}
 		return filterUnifiedSessions(this.unifiedRecords, (text) => matchesSearchText(text, query));
 	}
 
@@ -1184,11 +1189,24 @@ export class AgentsViewMode implements Component, Focusable {
 			const target = this.replyTarget;
 			const text = value.trim();
 			const viewCommand = parseAgentsViewCommand(text);
+			if (viewCommand && this.options.adapter) {
+				// Adapter sessions have no daemon RPCs behind view commands; treat
+				// them like any other unavailable built-in instead of prompt text.
+				this.setStatusMessage(`/${viewCommand.name} is not available here`, { tone: "warning" });
+				if (this.editor.getText().length === 0) this.editor.setText(value);
+				return;
+			}
 			if (viewCommand) {
+				// Stale summaries mis-route the RPCs after a runtime replacement.
+				const currentSummary = resolveCurrentReplyTargetSummary(
+					this.unifiedRecords ?? [],
+					target,
+					(activeSessionId) => this.findSummaryByActiveSessionId(activeSessionId),
+				);
 				// The buffer is already clear (submitValue), so re-submitting during the
 				// RPC cannot double-run; a failure restores the draft only if the same
 				// composer is still armed and the user has not typed anew.
-				const succeeded = await this.runAgentsViewCommand(viewCommand, target.summary);
+				const succeeded = await this.runAgentsViewCommand(viewCommand, currentSummary);
 				if (!succeeded && this.replyTarget === target && this.editor.getText().length === 0) {
 					this.editor.setText(value);
 				}
@@ -1751,14 +1769,13 @@ export class AgentsViewMode implements Component, Focusable {
 	 */
 	private async forkTargetSession(target: SessionSummary): Promise<boolean> {
 		let activeSessionId = target.activeSessionId;
-		let didResume = false;
+		let resumedForFork: string | undefined;
 		try {
 			if (!activeSessionId) {
 				this.setStatusMessage("Resuming session...");
 				const resumed = await resumeSavedAgentsViewSession(this.requireClient(), this.options.config, target);
 				activeSessionId = resumed.activeSessionId;
-				didResume = true;
-				this.inactiveAgentIdentities.delete(getSummaryIdentity(target));
+				resumedForFork = resumed.activeSessionId;
 			}
 			const treeData = requireDaemonData(
 				await this.requireClient().request({ type: "get_session_tree", activeSessionId }),
@@ -1780,13 +1797,22 @@ export class AgentsViewMode implements Component, Focusable {
 				this.setStatusMessage("Fork cancelled");
 				return false;
 			}
+			this.inactiveAgentIdentities.delete(getSummaryIdentity(target));
+			resumedForFork = undefined;
 			this.setStatusMessage("Forked to a new session; previous history stays available as inactive");
-			didResume = false;
 			await this.refreshSessions({ preserveStatusOnError: true });
 			return true;
 		} finally {
-			// A session resumed for a fork that then failed must still appear live.
-			if (didResume) await this.refreshSessions({ preserveStatusOnError: true });
+			// The resume existed only to serve the fork: on any failure path, stop
+			// the runtime again instead of leaving a silently activated agent.
+			if (resumedForFork) {
+				try {
+					await this.requireClient().request({ type: "kill", activeSessionId: resumedForFork });
+				} catch {
+					// Best effort; the refresh below surfaces the live row if it failed.
+				}
+				await this.refreshSessions({ preserveStatusOnError: true });
+			}
 		}
 	}
 

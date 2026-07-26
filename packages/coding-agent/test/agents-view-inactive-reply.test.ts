@@ -179,6 +179,7 @@ describe("agents view reply on inactive sessions", () => {
 		};
 		const self: Record<string, unknown> = {
 			replyTarget: oldTarget,
+			options: {},
 			editor,
 			setReplyTarget: vi.fn(),
 			refreshSessions: vi.fn(async () => true),
@@ -202,6 +203,7 @@ describe("agents view reply on inactive sessions", () => {
 		const target = { key: "saved-1", summary: savedSummary };
 		const self: Record<string, unknown> = {
 			replyTarget: target,
+			options: {},
 			editor,
 			setReplyTarget: vi.fn(),
 			refreshSessions: vi.fn(async () => true),
@@ -564,6 +566,7 @@ describe("reply composer slash commands", () => {
 		const sendReply = vi.fn();
 		const self: Record<string, unknown> = {
 			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
+			options: {},
 			editor,
 			setStatusMessage,
 			sendReply,
@@ -582,6 +585,7 @@ describe("reply composer slash commands", () => {
 		const editor = editorWithText("newer draft");
 		const self: Record<string, unknown> = {
 			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
+			options: {},
 			editor,
 			setStatusMessage: vi.fn(),
 			sendReply: vi.fn(),
@@ -797,6 +801,9 @@ describe("agents view slash commands", () => {
 		const editor = editorWithText("");
 		const self: Record<string, unknown> = {
 			replyTarget: target,
+			options: {},
+			unifiedRecords: [],
+			findSummaryByActiveSessionId: () => live,
 			editor,
 			setStatusMessage: vi.fn(),
 			runAgentsViewCommand: vi.fn(async () => false),
@@ -827,27 +834,113 @@ describe("agents view slash commands", () => {
 		expect(self.refreshSessions).not.toHaveBeenCalled();
 	});
 
-	it("refreshes the catalog when a resumed fork fails afterwards", async () => {
+	it("stops a session resumed for a fork that then fails", async () => {
 		const saved = summary({ sessionFile: "/tmp/sessions/saved-1.jsonl", cwd: process.cwd() });
+		const requests: { type: string }[] = [];
 		const request = vi.fn(async (command: { type: string }) => {
+			requests.push(command);
 			if (command.type === "create") {
 				return { success: true, data: { ...saved, lifecycle: "live", activeSessionId: "active-9" } };
 			}
 			// Empty tree: fork aborts after the resume already made the row live.
 			return { success: true, data: { tree: [], leafId: null } };
 		});
+		const inactiveAgentIdentities = new Set(["file:/tmp/sessions/saved-1.jsonl"]);
 		const self: Record<string, unknown> = {
 			options: { config: { cwd: process.cwd() } },
 			requireClient: () => ({ request }),
 			setStatusMessage: vi.fn(),
-			inactiveAgentIdentities: new Set(["file:/tmp/sessions/saved-1.jsonl"]),
+			inactiveAgentIdentities,
 			refreshSessions: vi.fn(async () => true),
 		};
 
 		const forked = await invoke("forkTargetSession", self, saved);
 
 		expect(forked).toBe(false);
+		// The resume served only the fork: the runtime is stopped again and the
+		// row stays inactive.
+		expect(requests.map((r) => r.type)).toEqual(["create", "get_session_tree", "kill"]);
+		expect(inactiveAgentIdentities.has("file:/tmp/sessions/saved-1.jsonl")).toBe(true);
 		expect(self.refreshSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
+	});
+
+	it("freezes the session filter while a view command is typed", () => {
+		const matching = {
+			daemon: summary({ activeSessionId: "active-1", sessionName: "kilroy" }),
+			identity: "active:active-1",
+			identityAliases: ["active:active-1"],
+			section: "idle",
+			searchableText: "kilroy",
+		};
+		const self: Record<string, unknown> = {
+			replyTarget: undefined,
+			renameTarget: undefined,
+			options: {},
+			unifiedRecords: [matching],
+			editor: editorWithText("/kill"),
+		};
+
+		const records = invoke("getFilteredRecords", self) as unknown[];
+
+		// "/kill" must not be applied as a fuzzy query (it would drop the row).
+		expect(records).toHaveLength(1);
+	});
+
+	it("re-resolves the armed target before dispatching a view command", async () => {
+		const stale = summary({ sessionFile: "/tmp/sessions/saved-1.jsonl" });
+		const liveNow = summary({
+			sessionFile: "/tmp/sessions/saved-1.jsonl",
+			activeSessionId: "active-9",
+			lifecycle: "live",
+		});
+		const runAgentsViewCommand = vi.fn(async () => true);
+		const self: Record<string, unknown> = {
+			replyTarget: { key: "saved-1", summary: stale },
+			options: {},
+			unifiedRecords: [
+				{
+					daemon: liveNow,
+					identity: "file:/tmp/sessions/saved-1.jsonl",
+					identityAliases: ["file:/tmp/sessions/saved-1.jsonl"],
+					section: "idle",
+					searchableText: "",
+				},
+			],
+			findSummaryByActiveSessionId: () => undefined,
+			editor: editorWithText(""),
+			runAgentsViewCommand,
+		};
+
+		await invoke("submit", self, "/kill");
+
+		expect(runAgentsViewCommand).toHaveBeenCalledWith(
+			{ name: "kill", args: "" },
+			expect.objectContaining({ activeSessionId: "active-9" }),
+		);
+	});
+
+	it("ignores view commands in the armed composer under the local adapter", async () => {
+		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
+		const target = { key: "active-1", summary: live };
+		const runAgentsViewCommand = vi.fn();
+		const sendReply = vi.fn(async () => true);
+		const self: Record<string, unknown> = {
+			replyTarget: target,
+			options: { adapter: { kind: "local" } },
+			editor: editorWithText(""),
+			setStatusMessage: vi.fn(),
+			setReplyTarget: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+			runAgentsViewCommand,
+			sendReply,
+		};
+
+		await invoke("submit", self, "/kill");
+
+		// Adapter sessions cannot run view commands; reject instead of prompting.
+		expect(runAgentsViewCommand).not.toHaveBeenCalled();
+		expect(sendReply).not.toHaveBeenCalled();
+		expect(self.setStatusMessage).toHaveBeenCalledWith("/kill is not available here", { tone: "warning" });
 	});
 
 	it("refuses /kill on an inactive row", async () => {
@@ -879,6 +972,7 @@ describe("agents view slash commands", () => {
 			editor: editorWithText("/fork"),
 			setStatusMessage: vi.fn(),
 			replyTarget: undefined,
+			inactiveAgentIdentities: new Set<string>(),
 			refreshSessions: vi.fn(async () => true),
 		};
 
