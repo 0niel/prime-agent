@@ -445,7 +445,7 @@ export async function runAgentsViewMode(options: Omit<AgentsViewModeOptions, "ad
 	}
 }
 
-const AGENTS_VIEW_COMMAND_NAMES = ["new", "fork", "name", "kill"] as const;
+const AGENTS_VIEW_COMMAND_NAMES = ["new", "name", "kill"] as const;
 export type AgentsViewCommandName = (typeof AGENTS_VIEW_COMMAND_NAMES)[number];
 const AGENTS_VIEW_COMMAND_NAME_SET: ReadonlySet<string> = new Set(AGENTS_VIEW_COMMAND_NAMES);
 
@@ -498,7 +498,6 @@ export function getReplyComposerCommandRejection(text: string): string | undefin
 const AGENTS_VIEW_COMMAND_DESCRIPTIONS: Record<AgentsViewCommandName, { description: string; argumentHint?: string }> =
 	{
 		new: { description: "Start a new session" },
-		fork: { description: "Fork this session from a previous user message" },
 		name: { description: "Set session display name", argumentHint: "<name>" },
 		kill: { description: "Stop this agent's runtime (session stays resumable)" },
 	};
@@ -1768,72 +1767,12 @@ export class AgentsViewMode implements Component, Focusable {
 					await this.refreshSessions({ preserveStatusOnError: true });
 					return true;
 				}
-				case "fork": {
-					const forked = await this.forkTargetSession(target);
-					if (forked) disarmIfUnchanged();
-					return forked;
-				}
 			}
 		} catch (error) {
 			this.setStatusMessage(formatError(`Failed to run /${command.name}`, error));
 			return false;
 		}
 		return false;
-	}
-
-	/**
-	 * Fork the target session at its current leaf. The daemon fork RPC rebinds
-	 * the running agent onto the forked file (in-session semantics); the
-	 * pre-fork history stays on disk as an inactive session. Saved rows are
-	 * resumed first so the same RPC applies.
-	 */
-	private async forkTargetSession(target: SessionSummary): Promise<boolean> {
-		let activeSessionId = target.activeSessionId;
-		let resumedForFork: string | undefined;
-		try {
-			if (!activeSessionId) {
-				this.setStatusMessage("Resuming session...");
-				const resumed = await resumeSavedAgentsViewSession(this.requireClient(), this.options.config, target);
-				activeSessionId = resumed.activeSessionId;
-				resumedForFork = resumed.activeSessionId;
-			}
-			const treeData = requireDaemonData(
-				await this.requireClient().request({ type: "get_session_tree", activeSessionId }),
-			) as { leafId: string | null };
-			if (!treeData.leafId) {
-				this.setStatusMessage("Nothing to fork yet", { tone: "warning" });
-				return false;
-			}
-			this.setStatusMessage("Forking session...");
-			const result = requireDaemonData(
-				await this.requireClient().request({
-					type: "fork",
-					activeSessionId,
-					entryId: treeData.leafId,
-					position: "at",
-				}),
-			) as { cancelled: boolean };
-			if (result.cancelled) {
-				this.setStatusMessage("Fork cancelled");
-				return false;
-			}
-			this.inactiveAgentIdentities.delete(getSummaryIdentity(target));
-			resumedForFork = undefined;
-			this.setStatusMessage("Forked to a new session; previous history stays available as inactive");
-			await this.refreshSessions({ preserveStatusOnError: true });
-			return true;
-		} finally {
-			// The resume existed only to serve the fork: on any failure path, stop
-			// the runtime again instead of leaving a silently activated agent.
-			if (resumedForFork) {
-				try {
-					await this.requireClient().request({ type: "kill", activeSessionId: resumedForFork });
-				} catch {
-					// Best effort; the refresh below surfaces the live row if it failed.
-				}
-				await this.refreshSessions({ preserveStatusOnError: true });
-			}
-		}
 	}
 
 	/**

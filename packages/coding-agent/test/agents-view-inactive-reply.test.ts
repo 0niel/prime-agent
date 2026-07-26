@@ -594,8 +594,9 @@ describe("agents view slash commands", () => {
 		expect(parseAgentsViewCommand("/kill")).toEqual({ name: "kill", args: "" });
 		expect(parseAgentsViewCommand("/compact")).toBeUndefined();
 		expect(parseAgentsViewCommand("plain search text")).toBeUndefined();
-		expect(getReplyComposerCommandRejection("/fork")).toBeUndefined();
 		expect(getReplyComposerCommandRejection("/kill")).toBeUndefined();
+		// /fork is a builtin but not a view command; it is rejected with guidance.
+		expect(getReplyComposerCommandRejection("/fork")).toContain("not available here");
 	});
 
 	it("suggests view commands in both composers and session commands only when armed", async () => {
@@ -605,9 +606,10 @@ describe("agents view slash commands", () => {
 		const composerNames = (await composer.getSuggestions(["/"], 0, 1, { signal }))?.items.map((i) => i.value) ?? [];
 		const searchNames = (await search.getSuggestions(["/"], 0, 1, { signal }))?.items.map((i) => i.value) ?? [];
 		expect(composerNames).toEqual(
-			expect.arrayContaining(["compact", "refine", "goal", "autonomous", "new", "fork", "name", "kill"]),
+			expect.arrayContaining(["compact", "refine", "goal", "autonomous", "new", "name", "kill"]),
 		);
-		expect(searchNames).toEqual(expect.arrayContaining(["new", "fork", "name", "kill"]));
+		expect(searchNames).toEqual(expect.arrayContaining(["new", "name", "kill"]));
+		expect(searchNames).not.toContain("fork");
 		expect(searchNames).not.toContain("compact");
 		expect(searchNames).not.toContain("settings");
 	});
@@ -815,56 +817,6 @@ describe("agents view slash commands", () => {
 		expect(editor.getText()).toBe("/name");
 	});
 
-	it("reports a cancelled fork instead of claiming success", async () => {
-		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
-		const request = vi.fn(async (command: { type: string }) => {
-			if (command.type === "get_session_tree") return { success: true, data: { tree: [], leafId: "leaf-1" } };
-			return { success: true, data: { cancelled: true } };
-		});
-		const setStatusMessage = vi.fn();
-		const self: Record<string, unknown> = {
-			requireClient: () => ({ request }),
-			setStatusMessage,
-			refreshSessions: vi.fn(async () => true),
-		};
-
-		const forked = await invoke("forkTargetSession", self, live);
-
-		expect(forked).toBe(false);
-		expect(setStatusMessage).toHaveBeenCalledWith("Fork cancelled");
-		expect(self.refreshSessions).not.toHaveBeenCalled();
-	});
-
-	it("stops a session resumed for a fork that then fails", async () => {
-		const saved = summary({ sessionFile: "/tmp/sessions/saved-1.jsonl", cwd: process.cwd() });
-		const requests: { type: string }[] = [];
-		const request = vi.fn(async (command: { type: string }) => {
-			requests.push(command);
-			if (command.type === "create") {
-				return { success: true, data: { ...saved, lifecycle: "live", activeSessionId: "active-9" } };
-			}
-			// Empty tree: fork aborts after the resume already made the row live.
-			return { success: true, data: { tree: [], leafId: null } };
-		});
-		const inactiveAgentIdentities = new Set(["file:/tmp/sessions/saved-1.jsonl"]);
-		const self: Record<string, unknown> = {
-			options: { config: { cwd: process.cwd() } },
-			requireClient: () => ({ request }),
-			setStatusMessage: vi.fn(),
-			inactiveAgentIdentities,
-			refreshSessions: vi.fn(async () => true),
-		};
-
-		const forked = await invoke("forkTargetSession", self, saved);
-
-		expect(forked).toBe(false);
-		// The resume served only the fork: the runtime is stopped again and the
-		// row stays inactive.
-		expect(requests.map((r) => r.type)).toEqual(["create", "get_session_tree", "kill"]);
-		expect(inactiveAgentIdentities.has("file:/tmp/sessions/saved-1.jsonl")).toBe(true);
-		expect(self.refreshSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
-	});
-
 	it("freezes the filter for command input but not for unknown slash terms", () => {
 		const editor = editorWithText("/kill");
 		const self: Record<string, unknown> = {
@@ -940,63 +892,5 @@ describe("agents view slash commands", () => {
 
 		expect(request).not.toHaveBeenCalled();
 		expect(setStatusMessage).toHaveBeenCalledWith(expect.stringContaining("inactive"), { tone: "warning" });
-	});
-
-	it("forks a live target at its current leaf", async () => {
-		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
-		const requests: { type: string }[] = [];
-		const request = vi.fn(async (command: { type: string }) => {
-			requests.push(command);
-			if (command.type === "get_session_tree") return { success: true, data: { tree: [], leafId: "leaf-9" } };
-			return { success: true, data: { cancelled: false } };
-		});
-		const self: Record<string, unknown> = {
-			requireClient: () => ({ request }),
-			editor: editorWithText("/fork"),
-			setStatusMessage: vi.fn(),
-			replyTarget: undefined,
-			inactiveAgentIdentities: new Set<string>(),
-			refreshSessions: vi.fn(async () => true),
-		};
-
-		await invoke("forkTargetSession", self, live);
-
-		expect(requests.map((r) => r.type)).toEqual(["get_session_tree", "fork"]);
-		expect(request).toHaveBeenCalledWith({
-			type: "fork",
-			activeSessionId: "active-1",
-			entryId: "leaf-9",
-			position: "at",
-		});
-	});
-
-	it("resumes a saved row before forking it", async () => {
-		const saved = summary({ sessionFile: "/tmp/sessions/saved-1.jsonl", cwd: process.cwd() });
-		const requests: { type: string }[] = [];
-		const request = vi.fn(async (command: { type: string }) => {
-			requests.push(command);
-			if (command.type === "create") {
-				return { success: true, data: { ...saved, lifecycle: "live", activeSessionId: "active-9" } };
-			}
-			if (command.type === "get_session_tree") return { success: true, data: { tree: [], leafId: "leaf-1" } };
-			return { success: true, data: { cancelled: false } };
-		});
-		const self: Record<string, unknown> = {
-			options: { config: { cwd: process.cwd() } },
-			requireClient: () => ({ request }),
-			editor: editorWithText("/fork"),
-			setStatusMessage: vi.fn(),
-			replyTarget: undefined,
-			inactiveAgentIdentities: new Set(["file:/tmp/sessions/saved-1.jsonl"]),
-			refreshSessions: vi.fn(async () => true),
-		};
-
-		await invoke("forkTargetSession", self, saved);
-
-		expect(requests.map((r) => r.type)).toEqual(["create", "get_session_tree", "fork"]);
-		expect(request).toHaveBeenCalledWith(
-			expect.objectContaining({ type: "fork", activeSessionId: "active-9", entryId: "leaf-1" }),
-		);
-		expect(self.inactiveAgentIdentities).not.toContain("file:/tmp/sessions/saved-1.jsonl");
 	});
 });
