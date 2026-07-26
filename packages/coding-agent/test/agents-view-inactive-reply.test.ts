@@ -641,7 +641,7 @@ describe("agents view slash commands", () => {
 
 	it("routes a search-editor command to the selected row", async () => {
 		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
-		const runAgentsViewCommand = vi.fn(async () => {});
+		const runAgentsViewCommand = vi.fn(async () => true);
 		const self: Record<string, unknown> = {
 			replyTarget: undefined,
 			renameTarget: undefined,
@@ -656,6 +656,24 @@ describe("agents view slash commands", () => {
 
 		expect(runAgentsViewCommand).toHaveBeenCalledWith({ name: "kill", args: "" }, live);
 		expect(self.openSelected).not.toHaveBeenCalled();
+	});
+
+	it("restores the search-editor command when it fails", async () => {
+		const editor = editorWithText("");
+		const self: Record<string, unknown> = {
+			replyTarget: undefined,
+			renameTarget: undefined,
+			options: {},
+			rows: [],
+			selectedIndex: 0,
+			editor,
+			runAgentsViewCommand: vi.fn(async () => false),
+			openSelected: vi.fn(),
+		};
+
+		await invoke("submit", self, "/kill");
+
+		expect(editor.getText()).toBe("/kill");
 	});
 
 	it("keeps plain search text opening the selection", async () => {
@@ -678,13 +696,12 @@ describe("agents view slash commands", () => {
 
 	it("runs /new without a target row", async () => {
 		const createNewSession = vi.fn(async () => {});
-		const editor = editorWithText("/new");
-		const self: Record<string, unknown> = { createNewSession, editor };
+		const self: Record<string, unknown> = { createNewSession, replyTarget: undefined };
 
-		await invoke("runAgentsViewCommand", self, { name: "new", args: "" }, undefined);
+		const succeeded = await invoke("runAgentsViewCommand", self, { name: "new", args: "" }, undefined);
 
 		expect(createNewSession).toHaveBeenCalledOnce();
-		expect(editor.getText()).toBe("");
+		expect(succeeded).toBe(true);
 	});
 
 	it("requires a selected row for row-targeted commands", async () => {
@@ -732,6 +749,67 @@ describe("agents view slash commands", () => {
 
 		expect(request).toHaveBeenCalledWith({ type: "kill", activeSessionId: "active-1" });
 		expect(setReplyTarget).toHaveBeenCalledWith(undefined);
+	});
+
+	it("does not disarm a composer that was re-armed during the command", async () => {
+		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
+		const originalTarget = { key: "active-1", summary: live };
+		const newTarget = { key: "active-2", summary: summary({ activeSessionId: "active-2" }) };
+		const setReplyTarget = vi.fn();
+		const self: Record<string, unknown> = {
+			requireClient: () => ({
+				request: vi.fn(async () => {
+					// The user re-arms against a different agent mid-RPC.
+					self.replyTarget = newTarget;
+					return { success: true, data: {} };
+				}),
+			}),
+			editor: editorWithText(""),
+			setStatusMessage: vi.fn(),
+			setReplyTarget,
+			replyTarget: originalTarget,
+			refreshSessions: vi.fn(async () => true),
+		};
+
+		await invoke("runAgentsViewCommand", self, { name: "kill", args: "" }, live);
+
+		expect(setReplyTarget).not.toHaveBeenCalled();
+	});
+
+	it("restores the command draft when the armed command fails", async () => {
+		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
+		const target = { key: "active-1", summary: live };
+		const editor = editorWithText("");
+		const self: Record<string, unknown> = {
+			replyTarget: target,
+			editor,
+			setStatusMessage: vi.fn(),
+			runAgentsViewCommand: vi.fn(async () => false),
+		};
+
+		await invoke("submit", self, "/name");
+
+		expect(editor.getText()).toBe("/name");
+	});
+
+	it("reports a cancelled fork instead of claiming success", async () => {
+		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
+		const request = vi.fn(async (command: { type: string }) => {
+			if (command.type === "get_session_tree") return { success: true, data: { tree: [], leafId: "leaf-1" } };
+			return { success: true, data: { cancelled: true } };
+		});
+		const setStatusMessage = vi.fn();
+		const self: Record<string, unknown> = {
+			requireClient: () => ({ request }),
+			setStatusMessage,
+			refreshSessions: vi.fn(async () => true),
+		};
+
+		const forked = await invoke("forkTargetSession", self, live);
+
+		expect(forked).toBe(false);
+		expect(setStatusMessage).toHaveBeenCalledWith("Fork cancelled");
+		expect(self.refreshSessions).not.toHaveBeenCalled();
 	});
 
 	it("refuses /kill on an inactive row", async () => {
