@@ -744,7 +744,7 @@ export class DaemonAgentConnection implements AgentConnection {
 		const hello = this.client.hello ?? (await this.client.waitForHello());
 		if (
 			hello.protocol.version < DAEMON_PROTOCOL_VERSION ||
-			hello.schemaRevision !== DAEMON_SCHEMA_REVISION ||
+			(hello.schemaRevision ?? 0) < DAEMON_SCHEMA_REVISION ||
 			!this.client.supportsServerCapability("prompt_admission_cancellation")
 		) {
 			throw new AgentConnectionPromptAdmissionError(
