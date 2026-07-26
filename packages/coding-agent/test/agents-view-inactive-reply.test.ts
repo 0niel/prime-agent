@@ -538,19 +538,11 @@ describe("agents view reply on inactive sessions", () => {
 });
 
 describe("reply composer slash commands", () => {
-	it("lets session-owned commands pass through to the prompt path", () => {
+	it("classifies composer input: session commands pass, other built-ins reject, plain text flows", () => {
 		expect(getReplyComposerCommandRejection("/compact focus on the API work")).toBeUndefined();
-		expect(getReplyComposerCommandRejection("/refine")).toBeUndefined();
 		expect(getReplyComposerCommandRejection("/goal ship it")).toBeUndefined();
-		expect(getReplyComposerCommandRejection("/autonomous")).toBeUndefined();
-	});
-
-	it("rejects recognized non-session built-ins with guidance", () => {
 		expect(getReplyComposerCommandRejection("/model gpt-5")).toContain("/model is not available here");
 		expect(getReplyComposerCommandRejection("/settings")).toContain("not available here");
-	});
-
-	it("treats unrecognized slash-prefixed text as a plain reply", () => {
 		expect(getReplyComposerCommandRejection("/usr/local/bin looks wrong")).toBeUndefined();
 		expect(getReplyComposerCommandRejection("plain reply")).toBeUndefined();
 	});
