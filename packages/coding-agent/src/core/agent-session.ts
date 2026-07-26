@@ -3819,16 +3819,23 @@ export class AgentSession {
 		for (const message of context.messages) {
 			this._applyLateIpythonSentAgentMessages(message);
 		}
-		// Merge by timestamp: turns persisted after the failed append must stay
-		// below the disclosure, matching where it appeared live.
+		this._mergeUnpersistedCompactionOutcomes(context.messages);
+		return context;
+	}
+
+	/**
+	 * Merge disclosures whose session-file append failed into a rebuilt message
+	 * list by timestamp, so turns persisted after the failure stay below the
+	 * notice exactly where it appeared live.
+	 */
+	private _mergeUnpersistedCompactionOutcomes(messages: AgentMessage[]): void {
 		for (const outcome of this._unpersistedCompactionOutcomes) {
-			let insertAt = context.messages.length;
-			while (insertAt > 0 && context.messages[insertAt - 1]!.timestamp > outcome.timestamp) {
+			let insertAt = messages.length;
+			while (insertAt > 0 && messages[insertAt - 1]!.timestamp > outcome.timestamp) {
 				insertAt -= 1;
 			}
-			context.messages.splice(insertAt, 0, outcome);
+			messages.splice(insertAt, 0, outcome);
 		}
-		return context;
 	}
 
 	/** Current steering mode */
@@ -6456,6 +6463,7 @@ export class AgentSession {
 		);
 		const newEntries = this.sessionManager.getEntries();
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
+		this._mergeUnpersistedCompactionOutcomes(this.agent.state.messages);
 		this._restoreLateIpythonSentAgentMessages();
 
 		// Get the saved compaction entry for the extension event
@@ -9857,6 +9865,7 @@ export class AgentSession {
 			// Update agent state
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
+			this._mergeUnpersistedCompactionOutcomes(this.agent.state.messages);
 			this._restoreLateIpythonSentAgentMessages();
 			this._reloadGoalStateFromBranch();
 			this._invalidateQueuedPromptPreparation();
