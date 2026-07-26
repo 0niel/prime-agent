@@ -581,9 +581,8 @@ export class AgentsViewMode implements Component, Focusable {
 			placeholder: SEARCH_PROMPT_PLACEHOLDER,
 			placeholderColor: (text) => theme.fg("dim", text),
 		});
-		// Search mode must not autocomplete; the provider only answers while a
-		// reply target is armed. Rebuilt on arming so @-paths resolve in the
-		// target session's cwd, not the view's startup directory.
+		// The provider only answers while a target is armed; rebuilt on arming so
+		// @-paths resolve in the target's cwd, not the view's startup directory.
 		void ensureTool("fd").then((fdPath) => {
 			this.fdPath = fdPath;
 			// Rebind an already-armed provider so @-completion picks up fd.
