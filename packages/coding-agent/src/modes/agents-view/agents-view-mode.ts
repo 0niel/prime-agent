@@ -25,6 +25,7 @@ import {
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
 import { canonicalizePath } from "../../utils/paths.js";
+import { ensureTool } from "../../utils/tools-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
@@ -459,7 +460,7 @@ export function getReplyComposerCommandRejection(text: string): string | undefin
 }
 
 /** Autocomplete for the reply composer: session-owned slash commands only. */
-export function createReplyComposerAutocompleteProvider(cwd: string): AutocompleteProvider {
+export function createReplyComposerAutocompleteProvider(cwd: string, fdPath?: string): AutocompleteProvider {
 	const sessionCommands = BUILTIN_SLASH_COMMANDS.filter((command) => isSessionSlashCommandName(command.name)).map(
 		(command) => ({
 			name: command.name,
@@ -469,7 +470,7 @@ export function createReplyComposerAutocompleteProvider(cwd: string): Autocomple
 			takesArgument: command.takesArgument,
 		}),
 	);
-	return new CombinedAutocompleteProvider(sessionCommands, cwd);
+	return new CombinedAutocompleteProvider(sessionCommands, cwd, fdPath ?? null);
 }
 
 export function resolveCurrentReplyTargetSummary(
@@ -539,6 +540,7 @@ export class AgentsViewMode implements Component, Focusable {
 	private replyTarget: { key: string; summary: SessionSummary } | undefined;
 	/** Provider bound to the armed target's cwd for file-path completions. */
 	private replyAutocomplete: AutocompleteProvider | undefined;
+	private fdPath: string | undefined;
 	private creatingNewSession = false;
 	private replyLastAssistantText: string | undefined;
 	private replyLastAssistantTextLoading = false;
@@ -582,6 +584,13 @@ export class AgentsViewMode implements Component, Focusable {
 		// Search mode must not autocomplete; the provider only answers while a
 		// reply target is armed. Rebuilt on arming so @-paths resolve in the
 		// target session's cwd, not the view's startup directory.
+		void ensureTool("fd").then((fdPath) => {
+			this.fdPath = fdPath;
+			// Rebind an already-armed provider so @-completion picks up fd.
+			if (this.replyTarget) {
+				this.replyAutocomplete = createReplyComposerAutocompleteProvider(this.replyTarget.summary.cwd, fdPath);
+			}
+		});
 		this.editor.setAutocompleteProvider({
 			getSuggestions: async (lines, cursorLine, cursorCol, suggestOptions) =>
 				this.replyTarget && this.replyAutocomplete
@@ -1358,7 +1367,9 @@ export class AgentsViewMode implements Component, Focusable {
 			this.actionModeSearchQuery = undefined;
 		}
 		this.replyTarget = target;
-		this.replyAutocomplete = target ? createReplyComposerAutocompleteProvider(target.summary.cwd) : undefined;
+		this.replyAutocomplete = target
+			? createReplyComposerAutocompleteProvider(target.summary.cwd, this.fdPath)
+			: undefined;
 		this.replyLastAssistantText = undefined;
 		this.replyLastAssistantTextLoading = false;
 		this.replyHeaderTime = target
