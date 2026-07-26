@@ -854,7 +854,7 @@ export class InteractiveMode {
 	private pendingSubmittedPromptStash: PromptStash | undefined;
 	private inputSubmissionGeneration = 0;
 	private inputSubmissionsPending = 0;
-	private pendingPromptStashRelease: { sessionId: string; state: PromptStashState } | undefined;
+	private pendingPromptStashReleases: { sessionId: string; state: PromptStashState }[] = [];
 	private readonly retainedSubmissionGenerations = new WeakMap<PromptStash, number>();
 	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
 	private returnToAgentsViewRequested = false;
@@ -1174,24 +1174,38 @@ export class InteractiveMode {
 
 	private releasePromptStashSession(): void {
 		if (this.inputSubmissionsPending > 0) {
-			// Capture the pair: a rebind may repoint the fields before the deferred release fires.
-			if (this.promptStashSessionId) {
-				this.pendingPromptStashRelease = { sessionId: this.promptStashSessionId, state: this.promptStashState };
+			// Capture the pair: a rebind may repoint the fields before the deferred
+			// release fires, and repeated rebinds/teardowns each defer their own pair.
+			if (
+				this.promptStashSessionId &&
+				!this.pendingPromptStashReleases.some((pending) => pending.sessionId === this.promptStashSessionId)
+			) {
+				this.pendingPromptStashReleases.push({
+					sessionId: this.promptStashSessionId,
+					state: this.promptStashState,
+				});
 			}
 			return;
 		}
-		this.pendingPromptStashRelease = undefined;
-		if (this.promptStashStore && this.promptStashSessionId) {
+		const pending = this.pendingPromptStashReleases;
+		this.pendingPromptStashReleases = [];
+		if (!this.promptStashStore) return;
+		for (const release of pending) {
+			this.promptStashStore.release(release.sessionId, release.state);
+		}
+		if (this.promptStashSessionId) {
 			this.promptStashStore.release(this.promptStashSessionId, this.promptStashState);
 		}
 	}
 
 	private completeDeferredPromptStashRelease(): void {
-		const pending = this.pendingPromptStashRelease;
-		if (!pending) return;
-		this.pendingPromptStashRelease = undefined;
+		const pending = this.pendingPromptStashReleases;
+		if (pending.length === 0) return;
+		this.pendingPromptStashReleases = [];
 		if (!this.promptStashStore) return;
-		this.promptStashStore.release(pending.sessionId, pending.state);
+		for (const release of pending) {
+			this.promptStashStore.release(release.sessionId, release.state);
+		}
 	}
 
 	private getAutocompleteSourceTag(sourceInfo?: AgentConnectionSourceInfo): string | undefined {
@@ -4949,7 +4963,7 @@ export class InteractiveMode {
 					this.restorePromptStashIfEditorEmpty(promptStashToRestore);
 				}
 				this.inputSubmissionsPending--;
-				if (this.inputSubmissionsPending === 0 && this.pendingPromptStashRelease) {
+				if (this.inputSubmissionsPending === 0 && this.pendingPromptStashReleases.length > 0) {
 					this.completeDeferredPromptStashRelease();
 				}
 			}
