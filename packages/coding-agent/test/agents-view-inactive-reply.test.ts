@@ -723,19 +723,22 @@ describe("agents view slash commands", () => {
 		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
 		const request = vi.fn(async () => ({ success: true, data: {} }));
 		const editor = editorWithText("/name Fresh Name");
+		const refreshSelf = {
+			refreshSessions: vi.fn(async () => true),
+			refreshSavedSessions: vi.fn(async () => true),
+		};
 		const self: Record<string, unknown> = {
 			requireClient: () => ({ request }),
 			editor,
 			setStatusMessage: vi.fn(),
-			refreshSessions: vi.fn(async () => true),
-			refreshSavedSessions: vi.fn(async () => true),
+			refreshBothCatalogs: () => invoke("refreshBothCatalogs", refreshSelf),
 		};
 
 		await invoke("runAgentsViewCommand", self, { name: "name", args: "Fresh Name" }, live);
 
 		expect(request).toHaveBeenCalledWith({ type: "rename", activeSessionId: "active-1", name: "Fresh Name" });
-		expect(self.refreshSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
-		expect(self.refreshSavedSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
+		expect(refreshSelf.refreshSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
+		expect(refreshSelf.refreshSavedSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
 	});
 
 	it("kills a live target and disarms the composer", async () => {
@@ -748,13 +751,14 @@ describe("agents view slash commands", () => {
 			setStatusMessage: vi.fn(),
 			setReplyTarget,
 			replyTarget: { key: "active-1", summary: live },
-			refreshSessions: vi.fn(async () => true),
+			refreshBothCatalogs: vi.fn(async () => true),
 		};
 
 		await invoke("runAgentsViewCommand", self, { name: "kill", args: "" }, live);
 
 		expect(request).toHaveBeenCalledWith({ type: "kill", activeSessionId: "active-1" });
 		expect(setReplyTarget).toHaveBeenCalledWith(undefined);
+		expect(self.refreshBothCatalogs).toHaveBeenCalled();
 	});
 
 	it("does not disarm a composer that was re-armed during the command", async () => {
@@ -774,7 +778,7 @@ describe("agents view slash commands", () => {
 			setStatusMessage: vi.fn(),
 			setReplyTarget,
 			replyTarget: originalTarget,
-			refreshSessions: vi.fn(async () => true),
+			refreshBothCatalogs: vi.fn(async () => true),
 		};
 
 		await invoke("runAgentsViewCommand", self, { name: "kill", args: "" }, live);
@@ -820,11 +824,14 @@ describe("agents view slash commands", () => {
 		};
 		const filtered = () => (invoke("getFilteredRecords", self) as unknown[]).length;
 
-		// "/kill" and mid-typing "/ki" must not filter; unknown "/foo" still does.
+		// "/kill" and mid-typing "/ki" must not filter; unknown "/foo" and path
+		// queries like "/tmp/x" still do.
 		expect(filtered()).toBe(1);
 		editor.setText("/ki");
 		expect(filtered()).toBe(1);
 		editor.setText("/foo");
+		expect(filtered()).toBe(0);
+		editor.setText("/tmp/x");
 		expect(filtered()).toBe(0);
 	});
 

@@ -660,7 +660,10 @@ export class AgentsViewMode implements Component, Focusable {
 				if (this.replyTarget) {
 					return this.replyAutocomplete?.getSuggestions(lines, cursorLine, cursorCol, suggestOptions) ?? null;
 				}
-				if (this.options.adapter || this.renameTarget || !this.editor.getText().startsWith("/")) return null;
+				// Same predicate as the filter freeze: "/tmp/" is a path query, not a command.
+				if (this.options.adapter || this.renameTarget || !isAgentsViewCommandInput(this.editor.getText())) {
+					return null;
+				}
 				return searchAutocomplete.getSuggestions(lines, cursorLine, cursorCol, suggestOptions);
 			},
 			applyCompletion: (lines, cursorLine, cursorCol, item, prefix) =>
@@ -1561,11 +1564,8 @@ export class AgentsViewMode implements Component, Focusable {
 					name,
 				);
 			}
-			const refreshed = await Promise.all([
-				this.refreshSessions({ preserveStatusOnError: true }),
-				this.refreshSavedSessions({ preserveStatusOnError: true }),
-			]);
-			this.setStatusMessage(refreshed.every(Boolean) ? `Renamed to ${name}` : `Renamed to ${name}; refresh failed`);
+			const refreshed = await this.refreshBothCatalogs();
+			this.setStatusMessage(refreshed ? `Renamed to ${name}` : `Renamed to ${name}; refresh failed`);
 		} catch (error) {
 			this.setStatusMessage(
 				isUnknownDaemonCommandError(error, "rename")
@@ -1742,12 +1742,7 @@ export class AgentsViewMode implements Component, Focusable {
 						return false;
 					}
 					this.setStatusMessage(`Session renamed to ${name}`);
-					// Both catalogs, like confirmRename: the saved entry keeps the old
-					// name otherwise and resurfaces it once the agent is killed.
-					await Promise.all([
-						this.refreshSessions({ preserveStatusOnError: true }),
-						this.refreshSavedSessions({ preserveStatusOnError: true }),
-					]);
+					await this.refreshBothCatalogs();
 					return true;
 				}
 				case "kill": {
@@ -1760,7 +1755,7 @@ export class AgentsViewMode implements Component, Focusable {
 					);
 					disarmIfUnchanged();
 					this.setStatusMessage("Agent stopped");
-					await this.refreshSessions({ preserveStatusOnError: true });
+					await this.refreshBothCatalogs();
 					return true;
 				}
 			}
@@ -2095,6 +2090,15 @@ export class AgentsViewMode implements Component, Focusable {
 		this.applyPendingAncestorExpansion();
 		this.restoreSelection();
 		this.ui.requestRender();
+	}
+
+	/** A session appears in both catalogs; mutations must refresh both. */
+	private async refreshBothCatalogs(): Promise<boolean> {
+		const results = await Promise.all([
+			this.refreshSessions({ preserveStatusOnError: true }),
+			this.refreshSavedSessions({ preserveStatusOnError: true }),
+		]);
+		return results.every(Boolean);
 	}
 
 	private async refreshSavedSessions(
