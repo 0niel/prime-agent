@@ -1059,7 +1059,9 @@ export class AgentsViewMode implements Component, Focusable {
 					if (this.replyTarget === target && this.editor.getText().length === 0) {
 						this.setReplyTarget(undefined);
 					}
-					await this.refreshSessions();
+					// A refresh failure must not clobber the send outcome (or a sticky
+					// cwd-fallback notice) that sendReply just surfaced.
+					await this.refreshSessions({ preserveStatusOnError: true });
 				} else if (this.replyTarget === target && this.editor.getText().length === 0) {
 					this.editor.setText(value);
 				}
@@ -1440,7 +1442,7 @@ export class AgentsViewMode implements Component, Focusable {
 			return true;
 		} catch (error) {
 			this.setStatusMessage(formatError("Failed to send reply", error));
-			if (didResume) await this.refreshSessions();
+			if (didResume) await this.refreshSessions({ preserveStatusOnError: true });
 			return false;
 		}
 	}

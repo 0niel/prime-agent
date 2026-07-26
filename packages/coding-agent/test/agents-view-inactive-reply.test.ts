@@ -181,6 +181,9 @@ describe("agents view reply on inactive sessions", () => {
 		expect(self.replyTarget).toBe(newTarget);
 		expect(editor.getText()).toBe("new reply");
 		expect(self.setReplyTarget).not.toHaveBeenCalled();
+		// The post-send refresh must not clobber sendReply's status (e.g. the
+		// sticky cwd-fallback notice) when the catalog refresh fails.
+		expect(self.refreshSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
 	});
 
 	it("preserves new text entered while the same reply succeeds", async () => {
@@ -249,6 +252,10 @@ describe("agents view reply on inactive sessions", () => {
 		expect(editor.getText()).toBe(replacement ?? "wake up");
 		expect(inactiveAgentIdentities.has("file:/tmp/sessions/saved-1.jsonl")).toBe(remainsInactive);
 		expect(self.refreshSessions).toHaveBeenCalledTimes(remainsInactive ? 0 : 1);
+		if (!remainsInactive) {
+			// The failure status set by sendReply must survive a failing refresh.
+			expect(self.refreshSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
+		}
 	});
 
 	it("keeps the cwd-fallback notice visible after the reply is sent", async () => {
