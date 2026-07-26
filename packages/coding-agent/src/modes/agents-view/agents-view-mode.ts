@@ -1059,8 +1059,7 @@ export class AgentsViewMode implements Component, Focusable {
 					if (this.replyTarget === target && this.editor.getText().length === 0) {
 						this.setReplyTarget(undefined);
 					}
-					// A refresh failure must not clobber the send outcome (or a sticky
-					// cwd-fallback notice) that sendReply just surfaced.
+					// Keep the send outcome (or sticky cwd notice) that sendReply just surfaced.
 					await this.refreshSessions({ preserveStatusOnError: true });
 				} else if (this.replyTarget === target && this.editor.getText().length === 0) {
 					this.editor.setText(value);
