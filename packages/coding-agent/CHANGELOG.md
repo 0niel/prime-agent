@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added starting a new session directly from the agents view with `ctrl+n`.
+- Added queueing a reply as a follow-up with `alt+enter` in the agents-view reply composer; plain Enter now steers a streaming agent.
 - Fixed `prime-agent agents` opening a new chat when running with a process-local session.
 - Fixed daemon startup failing when an interrupted supervisor left an empty ownership directory.
 

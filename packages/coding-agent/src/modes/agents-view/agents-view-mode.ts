@@ -20,6 +20,7 @@ import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connecti
 import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
 import {
+	collectDaemonClientEnv,
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonResponse,
@@ -499,6 +500,7 @@ export class AgentsViewMode implements Component, Focusable {
 	private selectionAnchorPending = false;
 	/** Armed reply composer target: a live agent or a saved session to resume on send. */
 	private replyTarget: { key: string; summary: SessionSummary } | undefined;
+	private creatingNewSession = false;
 	private replyLastAssistantText: string | undefined;
 	private replyLastAssistantTextLoading = false;
 	private replyHeaderTime = "";
@@ -669,6 +671,14 @@ export class AgentsViewMode implements Component, Focusable {
 			this.editor.getText().length === 0
 		) {
 			void this.toggleReplyTarget();
+			return;
+		}
+		if (!this.options.adapter && this.keybindings.matches(data, "app.agents.new")) {
+			void this.createNewSession();
+			return;
+		}
+		if (this.replyTarget && this.keybindings.matches(data, "app.message.followUp")) {
+			this.handleReplyFollowUp();
 			return;
 		}
 		if (this.editor.getText().length === 0 && this.keybindings.matches(data, "app.agents.program")) {
@@ -1044,7 +1054,7 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 	}
 
-	private async submit(value: string): Promise<void> {
+	private async submit(value: string, delivery: "steer" | "followUp" = "steer"): Promise<void> {
 		if (this.renameTarget) {
 			await this.confirmRename(value);
 			return;
@@ -1054,7 +1064,7 @@ export class AgentsViewMode implements Component, Focusable {
 			const text = value.trim();
 			if (text) {
 				this.editor.setText("");
-				const sent = await this.sendReply(target, text);
+				const sent = await this.sendReply(target, text, delivery);
 				if (sent) {
 					if (this.replyTarget === target && this.editor.getText().length === 0) {
 						this.setReplyTarget(undefined);
@@ -1070,6 +1080,14 @@ export class AgentsViewMode implements Component, Focusable {
 		// The normal editor is search-only: Enter opens the selection and never
 		// interprets text as a command or a prompt for a new agent.
 		this.openSelected();
+	}
+
+	/** Alt+Enter in the reply composer queues the reply as a follow-up. */
+	private handleReplyFollowUp(): void {
+		if (!this.replyTarget) return;
+		const text = this.editor.getText();
+		if (!text.trim()) return;
+		void this.submit(text, "followUp");
 	}
 
 	private getSavedSessionCwd(): string {
@@ -1403,7 +1421,11 @@ export class AgentsViewMode implements Component, Focusable {
 		return data.text;
 	}
 
-	private async sendReply(target: { key: string; summary: SessionSummary }, text: string): Promise<boolean> {
+	private async sendReply(
+		target: { key: string; summary: SessionSummary },
+		text: string,
+		delivery: "steer" | "followUp" = "steer",
+	): Promise<boolean> {
 		const currentSummary = resolveCurrentReplyTargetSummary(this.unifiedRecords ?? [], target, (activeSessionId) =>
 			this.findSummaryByActiveSessionId(activeSessionId),
 		);
@@ -1432,7 +1454,7 @@ export class AgentsViewMode implements Component, Focusable {
 				// belongs to the current composer. Do not steal it after cancellation.
 				if (this.replyTarget === target) this.selectSummary(resumed.summary);
 			}
-			const behavior = liveSummary?.isStreaming ? "followUp" : undefined;
+			const behavior = delivery === "followUp" ? "followUp" : liveSummary?.isStreaming ? "steer" : undefined;
 			this.setStatusMessage("Sending reply...");
 			await this.sendPrompt(activeSessionId, text, behavior);
 			// The fallback-directory notice must outlive the transient send statuses.
@@ -1443,6 +1465,27 @@ export class AgentsViewMode implements Component, Focusable {
 			this.setStatusMessage(formatError("Failed to send reply", error));
 			if (didResume) await this.refreshSessions({ preserveStatusOnError: true });
 			return false;
+		}
+	}
+
+	/** Create a fresh daemon session and open it in the chat view. */
+	private async createNewSession(): Promise<void> {
+		if (this.creatingNewSession) return;
+		this.creatingNewSession = true;
+		try {
+			this.setStatusMessage("Creating session...");
+			const response = await this.requireClient().request({
+				type: "create",
+				config: this.options.config,
+				env: collectDaemonClientEnv(),
+			});
+			const created = expectSessionSummary(requireDaemonData(response));
+			this.selectSummary(created);
+			this.finish({ type: "open", summary: created });
+		} catch (error) {
+			this.setStatusMessage(formatError("Failed to create session", error));
+		} finally {
+			this.creatingNewSession = false;
 		}
 	}
 
@@ -2219,6 +2262,9 @@ export class AgentsViewMode implements Component, Focusable {
 			const hint = `${keyText("tui.select.confirm")} save   ${keyText("tui.select.cancel")} cancel`;
 			return truncateToWidth(theme.fg("muted", hint), width);
 		}
+		if (this.replyTarget) {
+			return truncateToWidth(theme.fg("muted", this.renderReplyComposerHints()), width);
+		}
 		// Replying is reserved for top-level agents; subagents can be stopped.
 		const selectedRow = this.rows[this.selectedIndex];
 		const selectedAgent = selectedRow?.kind === "agent";
@@ -2230,17 +2276,33 @@ export class AgentsViewMode implements Component, Focusable {
 			selectedAgent && !this.options.adapter
 				? `${keyText("app.agents.reply")} ${selectedRow?.section === "inactive" ? "resume" : "reply"}`
 				: undefined,
+			!this.options.adapter ? `${keyText("app.agents.new")} new` : undefined,
 			selectedAgent ? `${keyText("app.agents.rename")} rename` : undefined,
 			selectedAgent && (!this.options.adapter || selectedRow?.section === "inactive")
 				? `${keyText("app.agents.delete")} ${selectedRow?.section === "inactive" ? "delete" : "stop/deactivate"}`
 				: undefined,
 			selectedSubagent ? `${keyText("app.agents.delete")} stop` : undefined,
 			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,
-			this.replyTarget ? `${keyText("app.agents.back")} back` : undefined,
 		]
 			.filter((hint): hint is string => hint !== undefined)
 			.join("   ");
 		return truncateToWidth(theme.fg("muted", hints), width);
+	}
+
+	private renderReplyComposerHints(): string {
+		const target = this.replyTarget!;
+		const current = resolveCurrentReplyTargetSummary(this.unifiedRecords ?? [], target, (activeSessionId) =>
+			this.findSummaryByActiveSessionId(activeSessionId),
+		);
+		const streaming = current.activeSessionId !== undefined && current.isStreaming;
+		const hasText = this.editor.getText().trim().length > 0;
+		return [
+			`${keyText("tui.select.confirm")} ${streaming ? "steer" : current.activeSessionId ? "send" : "resume & send"}`,
+			hasText ? `${keyText("app.message.followUp")} queue` : undefined,
+			`${keyText("tui.select.cancel")} cancel`,
+		]
+			.filter((hint): hint is string => hint !== undefined)
+			.join("   ");
 	}
 
 	private visibleListRows(): number {

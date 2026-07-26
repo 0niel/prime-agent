@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { setKeybindings } from "@earendil-works/pi-tui";
+import stripAnsi from "strip-ansi";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import { KeybindingsManager } from "../src/core/keybindings.js";
 import { AgentsViewMode } from "../src/modes/agents-view/agents-view-mode.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 
@@ -37,6 +40,10 @@ function editorWithText(initial: string) {
 }
 
 describe("agents view reply on inactive sessions", () => {
+	beforeAll(() => {
+		setKeybindings(new KeybindingsManager());
+	});
+
 	const savedSummary = summary({
 		sessionFile: "/tmp/sessions/saved-1.jsonl",
 		cwd: process.cwd(),
@@ -111,7 +118,7 @@ describe("agents view reply on inactive sessions", () => {
 		expect(request).toHaveBeenCalledWith(
 			expect.objectContaining({ type: "create", sessionPath: savedSummary.sessionFile }),
 		);
-		expect(self.sendPrompt).toHaveBeenCalledWith("active-9", "wake up", "followUp");
+		expect(self.sendPrompt).toHaveBeenCalledWith("active-9", "wake up", "steer");
 		expect(self.selectSummary).toHaveBeenCalledWith(expect.objectContaining({ activeSessionId: "active-9" }));
 		expect(self.inactiveAgentIdentities).not.toContain("file:/tmp/sessions/saved-1.jsonl");
 		expect(self.setReplyTarget).not.toHaveBeenCalled();
@@ -324,6 +331,62 @@ describe("agents view reply on inactive sessions", () => {
 		expect(self.sendPrompt).not.toHaveBeenCalledWith("active-dead", expect.anything(), expect.anything());
 	});
 
+	it("queues a follow-up when Alt+Enter delivery is requested", async () => {
+		const liveSummary = summary({ activeSessionId: "active-1", lifecycle: "live", isStreaming: true });
+		const self: Record<string, unknown> = {
+			options: { config: {} },
+			requireClient: () => ({ request: vi.fn() }),
+			findSummaryByActiveSessionId: () => liveSummary,
+			setStatusMessage: vi.fn(),
+			selectSummary: vi.fn(),
+			sendPrompt: vi.fn(async () => {}),
+		};
+
+		await invoke("sendReply", self, { key: "active-1", summary: liveSummary }, "later please", "followUp");
+
+		expect(self.sendPrompt).toHaveBeenCalledWith("active-1", "later please", "followUp");
+	});
+
+	it("steers a streaming session on plain submit", async () => {
+		const liveSummary = summary({ activeSessionId: "active-1", lifecycle: "live", isStreaming: true });
+		const self: Record<string, unknown> = {
+			options: { config: {} },
+			requireClient: () => ({ request: vi.fn() }),
+			findSummaryByActiveSessionId: () => liveSummary,
+			setStatusMessage: vi.fn(),
+			selectSummary: vi.fn(),
+			sendPrompt: vi.fn(async () => {}),
+		};
+
+		await invoke("sendReply", self, { key: "active-1", summary: liveSummary }, "change course");
+
+		expect(self.sendPrompt).toHaveBeenCalledWith("active-1", "change course", "steer");
+	});
+
+	it("routes the follow-up keybinding through submit with followUp delivery", () => {
+		const submit = vi.fn(async () => {});
+		const self = {
+			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
+			editor: { getText: () => "queued reply" },
+			submit,
+		};
+
+		invoke("handleReplyFollowUp", self);
+
+		expect(submit).toHaveBeenCalledWith("queued reply", "followUp");
+	});
+
+	it("ignores the follow-up keybinding without an armed target or text", () => {
+		const submit = vi.fn(async () => {});
+		invoke("handleReplyFollowUp", { replyTarget: undefined, editor: { getText: () => "text" }, submit });
+		invoke("handleReplyFollowUp", {
+			replyTarget: { key: "a", summary: summary({}) },
+			editor: { getText: () => "   " },
+			submit,
+		});
+		expect(submit).not.toHaveBeenCalled();
+	});
+
 	it("replies to live sessions without resuming", async () => {
 		const liveSummary = summary({ activeSessionId: "active-1", lifecycle: "live" });
 		const request = vi.fn();
@@ -343,5 +406,72 @@ describe("agents view reply on inactive sessions", () => {
 		expect(request).not.toHaveBeenCalled();
 		expect(self.sendPrompt).toHaveBeenCalledWith("active-1", "hello", undefined);
 		expect(self.selectSummary).not.toHaveBeenCalled();
+	});
+
+	it("creates a new daemon session and opens it", async () => {
+		const created = summary({ id: "active-new", activeSessionId: "active-new", lifecycle: "live" });
+		const request = vi.fn(async () => ({ success: true, data: created }));
+		const finish = vi.fn();
+		const self: Record<string, unknown> = {
+			creatingNewSession: false,
+			options: { config: { cwd: process.cwd() } },
+			requireClient: () => ({ request }),
+			setStatusMessage: vi.fn(),
+			selectSummary: vi.fn(),
+			finish,
+		};
+
+		await invoke("createNewSession", self);
+
+		expect(request).toHaveBeenCalledWith(expect.objectContaining({ type: "create" }));
+		expect(self.selectSummary).toHaveBeenCalledWith(created);
+		expect(finish).toHaveBeenCalledWith({ type: "open", summary: created });
+	});
+
+	it("reports a create failure without leaving the view", async () => {
+		const request = vi.fn(async () => {
+			throw new Error("daemon busy");
+		});
+		const finish = vi.fn();
+		const setStatusMessage = vi.fn();
+		const self: Record<string, unknown> = {
+			creatingNewSession: false,
+			options: { config: {} },
+			requireClient: () => ({ request }),
+			setStatusMessage,
+			selectSummary: vi.fn(),
+			finish,
+		};
+
+		await invoke("createNewSession", self);
+
+		expect(finish).not.toHaveBeenCalled();
+		expect(setStatusMessage).toHaveBeenCalledWith(expect.stringContaining("Failed to create session"));
+		expect(self.creatingNewSession).toBe(false);
+	});
+
+	it("shows composer-mode hints that track target state and typed text", () => {
+		const live = summary({ activeSessionId: "active-1", lifecycle: "live", isStreaming: true });
+		const self: Record<string, unknown> = {
+			replyTarget: { key: "active-1", summary: live },
+			unifiedRecords: [],
+			findSummaryByActiveSessionId: () => live,
+			editor: editorWithText(""),
+		};
+
+		const idleHints = stripAnsi(invoke("renderReplyComposerHints", self) as string);
+		expect(idleHints).toContain("steer");
+		expect(idleHints).toContain("cancel");
+		expect(idleHints).not.toContain("queue");
+
+		self.editor = editorWithText("some reply");
+		const typedHints = stripAnsi(invoke("renderReplyComposerHints", self) as string);
+		expect(typedHints).toContain("queue");
+
+		const saved = summary({ sessionFile: "/tmp/sessions/saved-1.jsonl" });
+		self.replyTarget = { key: "saved-1", summary: saved };
+		self.findSummaryByActiveSessionId = () => undefined;
+		const savedHints = stripAnsi(invoke("renderReplyComposerHints", self) as string);
+		expect(savedHints).toContain("resume & send");
 	});
 });
