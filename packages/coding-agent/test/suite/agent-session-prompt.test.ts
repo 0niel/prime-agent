@@ -322,6 +322,30 @@ describe("AgentSession prompt characterization", () => {
 		expect(getMessageText(harness.session.messages[0]!)).toBe("from extension");
 	});
 
+	it("rejects an aborted prompt while streaming instead of enqueueing it", async () => {
+		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = await createWaitingHarness();
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		await waitForToolStart;
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(
+			harness.session.prompt("stale startup prompt", {
+				streamingBehavior: "followUp",
+				signal: controller.signal,
+			}),
+		).rejects.toThrow("Prompt admission was cancelled.");
+		expect(harness.session.pendingMessageCount).toBe(0);
+
+		releaseToolExecution();
+		await promptPromise;
+		expect(getUserTexts(harness)).toEqual(["start"]);
+	});
+
 	it("throws when prompted during streaming without a streamingBehavior", async () => {
 		const { harness, waitForToolStart, promptPromise, releaseToolExecution } = await createWaitingHarness();
 		harnesses.push(harness);
