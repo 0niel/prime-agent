@@ -1540,12 +1540,7 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 	}
 
-	/**
-	 * Create a fresh daemon session and open it in the chat view. Runs over a
-	 * dedicated connection: finish() closes the shared client, which would
-	 * reject an in-flight create while the daemon still materializes the
-	 * session, making the orphan unkillable.
-	 */
+	/** Create a fresh daemon session and open it in the chat view. */
 	private async createNewSession(): Promise<boolean> {
 		if (this.creatingNewSession || this.stopped) return false;
 		this.creatingNewSession = true;
@@ -1583,7 +1578,11 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 	}
 
-	/** A connection that outlives finish(), which closes the shared client. */
+	/**
+	 * A connection that outlives finish(), which closes the shared client and
+	 * would reject an in-flight create while the daemon still materializes the
+	 * session, leaving that orphan unkillable.
+	 */
 	private async connectDedicatedClient(): Promise<DaemonClient> {
 		return connectAgentsViewDaemonClient(this.requireSocketPath());
 	}
