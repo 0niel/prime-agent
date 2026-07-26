@@ -150,6 +150,43 @@ describe("InteractiveMode startup hints", () => {
 		expect(showStatus).toHaveBeenCalledWith("Send, stash, or clear your draft before opening agents");
 	});
 
+	it("opens the shared session view on back navigation for process-local chats", async () => {
+		const requestAgentsView = vi.fn(async () => {});
+		const returnToAgentsView = vi.fn(async () => {});
+		const mode = Object.assign(createMode(false, false), { requestAgentsView, returnToAgentsView });
+
+		const handled = Reflect.get(InteractiveMode.prototype, "handleAgentsBack").call(mode) as boolean;
+
+		expect(handled).toBe(true);
+		expect(requestAgentsView).toHaveBeenCalledOnce();
+		expect(returnToAgentsView).not.toHaveBeenCalled();
+	});
+
+	it("returns to the daemon agents view on back navigation for daemon chats", async () => {
+		const requestAgentsView = vi.fn(async () => {});
+		const returnToAgentsView = vi.fn(async () => {});
+		const mode = Object.assign(createMode(false, true), { requestAgentsView, returnToAgentsView });
+
+		const handled = Reflect.get(InteractiveMode.prototype, "handleAgentsBack").call(mode) as boolean;
+
+		expect(handled).toBe(true);
+		expect(returnToAgentsView).toHaveBeenCalledOnce();
+		expect(requestAgentsView).not.toHaveBeenCalled();
+	});
+
+	it("leaves back navigation to the editor while a draft exists", async () => {
+		const requestAgentsView = vi.fn(async () => {});
+		const mode = Object.assign(
+			createMode(false, false, () => "draft prompt"),
+			{ requestAgentsView },
+		);
+
+		const handled = Reflect.get(InteractiveMode.prototype, "handleAgentsBack").call(mode) as boolean;
+
+		expect(handled).toBe(false);
+		expect(requestAgentsView).not.toHaveBeenCalled();
+	});
+
 	it("routes an empty local editor to the shared session view", async () => {
 		const showLocalSessionView = vi.fn(async () => ({ type: "opened" as const }));
 		const shutdown = vi.fn(async () => {});
