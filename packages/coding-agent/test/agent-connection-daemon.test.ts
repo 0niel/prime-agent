@@ -865,6 +865,16 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests).toEqual([]);
 	});
 
+	it("accepts a newer daemon schema revision for a signal-backed prompt", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("prompt_admission_cancellation");
+		fakeClient.hello = { ...fakeClient.hello!, schemaRevision: DAEMON_SCHEMA_REVISION + 1 };
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+
+		await connection.prompt("startup", { signal: new AbortController().signal });
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["prompt"]);
+	});
+
 	it("uses fleet heartbeat scope for residents and session scope for owned workers", async () => {
 		const residentClient = new FakeDaemonClient();
 		residentClient.serverCapabilities.add("heartbeat_catalog");
