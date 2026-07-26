@@ -1072,6 +1072,8 @@ export class AgentSession {
 	private _acceptedAgentMessagePrompt: AcceptedAgentMessagePrompt | undefined = undefined;
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
+	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
+	private readonly _unpersistedCompactionOutcomes: CustomMessage[] = [];
 
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
@@ -3853,6 +3855,9 @@ export class AgentSession {
 		for (const message of context.messages) {
 			this._applyLateIpythonSentAgentMessages(message);
 		}
+		if (this._unpersistedCompactionOutcomes.length > 0) {
+			context.messages.push(...this._unpersistedCompactionOutcomes);
+		}
 		return context;
 	}
 
@@ -4103,7 +4108,11 @@ export class AgentSession {
 		options?: InternalPromptOptions,
 	): Promise<void> {
 		if (!this.isStreaming && options?.resumeIfIdle) this._sessionInputPumpSuspended = false;
-		const admission = await this._acquireDirectTurnAdmission({ allowStreaming: true, signal: options?.signal });
+		const admission = await this._acquireDirectTurnAdmission({
+			allowStreaming: true,
+			allowPendingQueue: options?.queueIfBusy === true,
+			signal: options?.signal,
+		});
 		try {
 			// Ownership commits before destructive preflight, but cancellation and the
 			// commit callback are covered by release if either throws.
@@ -4272,7 +4281,10 @@ export class AgentSession {
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
 		if (!this.isStreaming) this._sessionInputPumpSuspended = false;
 		const admission = !this.isStreaming
-			? await this._acquireDirectTurnAdmission({ signal: options?.signal })
+			? await this._acquireDirectTurnAdmission({
+					allowPendingQueue: options?.queueIfBusy === true,
+					signal: options?.signal,
+				})
 			: undefined;
 		const releaseAdmission = admission?.release ?? (() => {});
 		try {
@@ -5703,7 +5715,7 @@ export class AgentSession {
 	}
 
 	private async _acquireDirectTurnAdmission(
-		options: { allowStreaming?: boolean; signal?: AbortSignal } = {},
+		options: { allowStreaming?: boolean; allowPendingQueue?: boolean; signal?: AbortSignal } = {},
 	): Promise<{ owner: symbol; release(): void }> {
 		while (true) {
 			this._assertDirectTurnAdmissionAvailable();
@@ -5718,8 +5730,10 @@ export class AgentSession {
 					await this._waitForQueuedWorkAdmission(options.signal);
 					continue;
 				}
+				// queueIfBusy callers enqueue behind pending work at preflight; they need ownership, not a drained queue.
 				if (
 					(options.allowStreaming === true && this.isStreaming) ||
+					options.allowPendingQueue === true ||
 					(this.pendingMessageCount === 0 &&
 						this._activeSessionInput === undefined &&
 						!this._pumpingSessionInput &&
@@ -6654,8 +6668,7 @@ export class AgentSession {
 			this._scheduleAutoRefineAfterAgentEnd();
 			return;
 		}
-		// The pump owns items it moved into _activeSessionInput before handoff, so
-		// an empty queue alone does not mean idle.
+		// An empty queue is not idle: the pump owns items moved into _activeSessionInput before handoff.
 		if (
 			this.pendingMessageCount > 0 ||
 			this._activeSessionInput !== undefined ||
@@ -7396,6 +7409,8 @@ export class AgentSession {
 				`${message}\n\nThis compaction outcome could not be saved to session history: ${persistenceError}`,
 				{ reason, outcome },
 			);
+			// Not in the session file, so context rebuilds would drop the disclosure.
+			this._unpersistedCompactionOutcomes.push(outcomeMessage);
 		}
 		this.agent.state.messages.push(outcomeMessage);
 		this._emit({ type: "message_start", message: outcomeMessage });
