@@ -895,6 +895,28 @@ describe("agents view slash commands", () => {
 		expect(persistentState.query).toBe("");
 	});
 
+	it("keeps filtering on unknown slash-prefixed search terms", () => {
+		const matching = {
+			daemon: summary({ activeSessionId: "active-1", sessionName: "kilroy" }),
+			identity: "active:active-1",
+			identityAliases: ["active:active-1"],
+			section: "idle",
+			searchableText: "kilroy",
+		};
+		const self: Record<string, unknown> = {
+			replyTarget: undefined,
+			renameTarget: undefined,
+			options: {},
+			unifiedRecords: [matching],
+			editor: editorWithText("/foo"),
+		};
+
+		const records = invoke("getFilteredRecords", self) as unknown[];
+
+		// "/foo" is not a view command; it stays an ordinary (non-matching) query.
+		expect(records).toHaveLength(0);
+	});
+
 	it("freezes the session filter while a view command is typed", () => {
 		const matching = {
 			daemon: summary({ activeSessionId: "active-1", sessionName: "kilroy" }),
@@ -913,8 +935,11 @@ describe("agents view slash commands", () => {
 
 		const records = invoke("getFilteredRecords", self) as unknown[];
 
-		// "/kill" must not be applied as a fuzzy query (it would drop the row).
+		// "/kill" must not be applied as a fuzzy query (it would drop the row),
+		// and neither must a mid-typing prefix like "/ki".
 		expect(records).toHaveLength(1);
+		(self.editor as { setText(t: string): void }).setText("/ki");
+		expect(invoke("getFilteredRecords", self) as unknown[]).toHaveLength(1);
 	});
 
 	it("re-resolves the armed target before dispatching a view command", async () => {

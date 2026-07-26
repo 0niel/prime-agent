@@ -463,6 +463,24 @@ export function parseAgentsViewCommand(text: string): AgentsViewCommand | undefi
 	return { name: name as AgentsViewCommandName, args: parsed.args };
 }
 
+const AGENTS_VIEW_COMMAND_TYPING_TARGETS: readonly string[] = AGENTS_VIEW_COMMAND_NAMES.flatMap((name) => {
+	const builtin = BUILTIN_SLASH_COMMANDS.find((command) => command.name === name);
+	return [name, ...(builtin?.aliases ?? [])];
+});
+
+/**
+ * True while search input is a view command or may still extend into one.
+ * Prefix matching keeps mid-typing (like "/ki") from filtering the list,
+ * while unknown terms such as "/foo" stay ordinary search text.
+ */
+export function isAgentsViewCommandInput(text: string): boolean {
+	const trimmed = text.trim();
+	if (!trimmed.startsWith("/")) return false;
+	if (parseAgentsViewCommand(trimmed)) return true;
+	const token = trimmed.slice(1).toLowerCase();
+	return !/\s/.test(token) && AGENTS_VIEW_COMMAND_TYPING_TARGETS.some((name) => name.startsWith(token));
+}
+
 /**
  * Reject recognized built-ins that are neither session-owned nor view
  * commands, so they are never sent to the model as plain prompt text.
@@ -1155,9 +1173,9 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private getFilteredRecords(): UnifiedSessionRecord[] {
 		let query = this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
-		// Slash-prefixed input is (partially typed) command input, not a query:
-		// filtering on it would reshuffle the list under the selected target row.
-		if (!this.replyTarget && !this.renameTarget && !this.options.adapter && query.trimStart().startsWith("/")) {
+		// Command input is not a query: filtering on it (even mid-typing) would
+		// reshuffle the list out from under the selected target row.
+		if (!this.replyTarget && !this.renameTarget && !this.options.adapter && isAgentsViewCommandInput(query)) {
 			query = "";
 		}
 		return filterUnifiedSessions(this.unifiedRecords, (text) => matchesSearchText(text, query));
