@@ -4250,6 +4250,9 @@ export class AgentSession {
 					signal: options?.signal,
 				})
 			: undefined;
+		// The streaming path skips admission, so its commit point is here; an
+		// already-aborted prompt must not enqueue into a session the caller left.
+		if (!admission) throwIfPromptAdmissionCancelled(options?.signal);
 		const releaseAdmission = admission?.release ?? (() => {});
 		try {
 			// Streaming prompts skip direct-turn admission but still transfer ownership
