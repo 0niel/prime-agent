@@ -756,6 +756,28 @@ describe("AgentSession queue characterization", () => {
 		await vi.waitFor(() => expect(getUserTexts(harness)).toContain("after navigation"));
 	});
 
+	it("queueIfBusy enqueues behind pending work instead of draining it first", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("first done"), fauxAssistantMessage("second done")]);
+		withStreaming(harness, true);
+		await harness.session.followUp("already queued", undefined, { queueKey: "existing" });
+		withStreaming(harness, false);
+
+		let queuedAtPreflight: boolean | undefined;
+		await harness.session.prompt("respects the queue", {
+			queueIfBusy: true,
+			streamingBehavior: "followUp",
+			preflightResult: (_success, queued) => {
+				queuedAtPreflight ??= queued;
+			},
+		});
+		await harness.session.waitForIdle();
+
+		expect(queuedAtPreflight).toBe(true);
+		expect(getUserTexts(harness)).toEqual(["already queued", "respects the queue"]);
+	});
+
 	it("invalidates queued prompt preparation on branch navigation", async () => {
 		let pause: { release(): void } | undefined;
 		const harness = await createHarness({
