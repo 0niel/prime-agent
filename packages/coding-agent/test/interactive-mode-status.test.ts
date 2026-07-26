@@ -661,7 +661,7 @@ type SubmitHandlerHarness = {
 	retainSubmittedDraft: (stash: unknown, submissionGeneration: number) => void;
 	inputSubmissionGeneration: number;
 	inputSubmissionsPending: number;
-	pendingPromptStashRelease: { sessionId: string; state: unknown } | undefined;
+	pendingPromptStashReleases: { sessionId: string; state: unknown }[];
 	retainedSubmissionGenerations: WeakMap<object, number>;
 	releasePromptStashSession?: () => void;
 	flushPendingBashComponents: () => void;
@@ -708,7 +708,7 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 		submittedInputBehavior: "steer",
 		inputSubmissionGeneration: 0,
 		inputSubmissionsPending: 0,
-		pendingPromptStashRelease: undefined,
+		pendingPromptStashReleases: [],
 		retainedSubmissionGenerations: new WeakMap(),
 		flushPendingBashComponents: vi.fn(),
 		collectImagesFor: vi.fn(() => []),
@@ -3180,7 +3180,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		const state = store.forSession("session-a");
 		const fakeThis = {
 			inputSubmissionsPending: 1,
-			pendingPromptStashRelease: undefined as { sessionId: string; state: unknown } | undefined,
+			pendingPromptStashReleases: [] as { sessionId: string; state: unknown }[],
 			promptStashStore: store,
 			promptStashSessionId: "session-a",
 			promptStashState: state,
@@ -3195,7 +3195,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		).retainSubmittedDraft;
 
 		release.call(fakeThis);
-		expect(fakeThis.pendingPromptStashRelease).toEqual({ sessionId: "session-a", state });
+		expect(fakeThis.pendingPromptStashReleases).toEqual([{ sessionId: "session-a", state }]);
 		expect(store.forSession("session-a")).toBe(state);
 		retain.call(fakeThis, { text: "retained" }, 1);
 		fakeThis.inputSubmissionsPending = 0;
@@ -3209,7 +3209,7 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		const oldState = store.forSession("session-old");
 		const fakeThis = {
 			inputSubmissionsPending: 1,
-			pendingPromptStashRelease: undefined as { sessionId: string; state: unknown } | undefined,
+			pendingPromptStashReleases: [] as { sessionId: string; state: unknown }[],
 			promptStashStore: store,
 			promptStashSessionId: "session-old",
 			promptStashState: oldState,
@@ -3231,6 +3231,41 @@ describe("InteractiveMode Prime CLI onboarding", () => {
 		expect(store.forSession("session-old")).not.toBe(oldState);
 		expect(store.forSession("session-new")).toBe(newState);
 		expect(newState.stash).toEqual({ text: "new session draft" });
+	});
+
+	test("a teardown release after a rebind keeps both deferred session releases", () => {
+		const store = new ClientPromptStashStore();
+		const oldState = store.forSession("session-old");
+		const fakeThis = {
+			inputSubmissionsPending: 1,
+			pendingPromptStashReleases: [] as { sessionId: string; state: unknown }[],
+			promptStashStore: store,
+			promptStashSessionId: "session-old",
+			promptStashState: oldState,
+		};
+		const methods = InteractiveMode.prototype as unknown as {
+			releasePromptStashSession(this: unknown): void;
+			completeDeferredPromptStashRelease(this: unknown): void;
+		};
+
+		// /new rebind defers the old session's release...
+		methods.releasePromptStashSession.call(fakeThis);
+		const newState = store.forSession("session-new");
+		fakeThis.promptStashSessionId = "session-new";
+		fakeThis.promptStashState = newState;
+		// ...then teardown defers the rebound session's release while the same
+		// submission is still pending. The first pair must not be overwritten.
+		methods.releasePromptStashSession.call(fakeThis);
+		expect(fakeThis.pendingPromptStashReleases.map((pending) => pending.sessionId)).toEqual([
+			"session-old",
+			"session-new",
+		]);
+
+		fakeThis.inputSubmissionsPending = 0;
+		methods.completeDeferredPromptStashRelease.call(fakeThis);
+
+		expect(store.forSession("session-old")).not.toBe(oldState);
+		expect(store.forSession("session-new")).not.toBe(newState);
 	});
 
 	test("orders retained drafts by submission rather than rejection", () => {
