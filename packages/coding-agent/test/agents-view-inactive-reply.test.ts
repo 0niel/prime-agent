@@ -515,7 +515,7 @@ describe("reply composer slash commands", () => {
 		expect(getReplyComposerCommandRejection("plain reply")).toBeUndefined();
 	});
 
-	it("restores the draft when a command is rejected after submit cleared the buffer", async () => {
+	it("restores rejected-command drafts without overwriting newer typing", async () => {
 		// submitValue empties the editor before onSubmit runs.
 		const editor = editorWithText("");
 		const setStatusMessage = vi.fn();
@@ -528,25 +528,14 @@ describe("reply composer slash commands", () => {
 		};
 
 		await invoke("submit", self, "/model gpt-5");
-
 		expect(sendReply).not.toHaveBeenCalled();
 		expect(setStatusMessage).toHaveBeenCalledWith(expect.stringContaining("not available here"), {
 			tone: "warning",
 		});
 		expect(editor.getText()).toBe("/model gpt-5");
-	});
 
-	it("does not overwrite newer typing when a rejection lands late", async () => {
-		const editor = editorWithText("newer draft");
-		const self: Record<string, unknown> = {
-			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
-			editor,
-			setStatusMessage: vi.fn(),
-			sendReply: vi.fn(),
-		};
-
+		editor.setText("newer draft");
 		await invoke("submit", self, "/settings");
-
 		expect(editor.getText()).toBe("newer draft");
 	});
 
