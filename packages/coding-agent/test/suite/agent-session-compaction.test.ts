@@ -1123,7 +1123,9 @@ describe("AgentSession compaction characterization", () => {
 		});
 
 		// A turn persisted after the failure sorts below the disclosure on rebuild,
-		// matching where the notice appeared live.
+		// matching where the notice appeared live. Cross a millisecond boundary so
+		// the later turn's timestamp is strictly newer.
+		await new Promise((resolve) => setTimeout(resolve, 5));
 		harness.setResponses([fauxAssistantMessage("later response")]);
 		await harness.session.prompt("later turn");
 		const reordered = harness.session.buildSessionContext().messages;
@@ -1135,5 +1137,46 @@ describe("AgentSession compaction characterization", () => {
 		);
 		expect(outcomeIndex).toBeGreaterThanOrEqual(0);
 		expect(laterTurnIndex).toBeGreaterThan(outcomeIndex);
+	});
+
+	it("keeps an unpersisted outcome in agent state after a successful compaction", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "post-failure summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: { source: "extension" },
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one response"), fauxAssistantMessage("two response")]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+
+		const internals = harness.session as unknown as SessionWithCompactionInternals;
+		vi.spyOn(harness.sessionManager, "_persist").mockImplementationOnce(() => {
+			throw new Error("disk full");
+		});
+		internals._persistCompactionOutcome("requested", "failed", "Requested compaction failed");
+
+		// A later successful compaction reloads agent.state.messages from the
+		// session file; the disclosure only exists in memory and must survive.
+		await harness.session.compact();
+
+		expect(harness.session.messages).toContainEqual(
+			expect.objectContaining({
+				role: "custom",
+				customType: "compaction_outcome",
+				content: expect.stringContaining("could not be saved to session history"),
+			}),
+		);
 	});
 });
