@@ -3946,7 +3946,10 @@ export class AgentSession {
 		options?: InternalPromptOptions,
 	): Promise<void> {
 		if (!this.isStreaming && options?.resumeIfIdle) this._sessionInputPumpSuspended = false;
-		const admission = await this._acquireDirectTurnAdmission({ allowStreaming: true });
+		const admission = await this._acquireDirectTurnAdmission({
+			allowStreaming: true,
+			allowPendingQueue: options?.queueIfBusy === true,
+		});
 		try {
 			await this._turnAdmissionContext.run(admission.owner, () =>
 				this._promptInjectedMessageUnserialized(text, message, options, admission.release),
@@ -4078,7 +4081,9 @@ export class AgentSession {
 
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
 		if (!this.isStreaming) this._sessionInputPumpSuspended = false;
-		const admission = !this.isStreaming ? await this._acquireDirectTurnAdmission() : undefined;
+		const admission = !this.isStreaming
+			? await this._acquireDirectTurnAdmission({ allowPendingQueue: options?.queueIfBusy === true })
+			: undefined;
 		const releaseAdmission = admission?.release ?? (() => {});
 		try {
 			if (admission) {
@@ -5369,7 +5374,7 @@ export class AgentSession {
 	}
 
 	private async _acquireDirectTurnAdmission(
-		options: { allowStreaming?: boolean } = {},
+		options: { allowStreaming?: boolean; allowPendingQueue?: boolean } = {},
 	): Promise<{ owner: symbol; release(): void }> {
 		while (true) {
 			this._assertDirectTurnAdmissionAvailable();
@@ -5384,8 +5389,11 @@ export class AgentSession {
 					await this._waitForQueuedWorkAdmission();
 					continue;
 				}
+				// allowPendingQueue: queueIfBusy callers only need admission ownership,
+				// not a drained queue - they enqueue behind pending work at preflight.
 				if (
 					(options.allowStreaming === true && this.isStreaming) ||
+					options.allowPendingQueue === true ||
 					(this.pendingMessageCount === 0 &&
 						this._activeSessionInput === undefined &&
 						!this._pumpingSessionInput &&
