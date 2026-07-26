@@ -1071,6 +1071,8 @@ export class AgentSession {
 	private _acceptedAgentMessagePrompt: AcceptedAgentMessagePrompt | undefined = undefined;
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
+	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
+	private readonly _unpersistedCompactionOutcomes: CustomMessage[] = [];
 
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
@@ -3851,6 +3853,9 @@ export class AgentSession {
 		const context = this.sessionManager.buildSessionContext();
 		for (const message of context.messages) {
 			this._applyLateIpythonSentAgentMessages(message);
+		}
+		if (this._unpersistedCompactionOutcomes.length > 0) {
+			context.messages.push(...this._unpersistedCompactionOutcomes);
 		}
 		return context;
 	}
@@ -7393,6 +7398,8 @@ export class AgentSession {
 				`${message}\n\nThis compaction outcome could not be saved to session history: ${persistenceError}`,
 				{ reason, outcome },
 			);
+			// Not in the session file, so context rebuilds would drop the disclosure.
+			this._unpersistedCompactionOutcomes.push(outcomeMessage);
 		}
 		this.agent.state.messages.push(outcomeMessage);
 		this._emit({ type: "message_start", message: outcomeMessage });
