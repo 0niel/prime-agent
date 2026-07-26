@@ -3975,7 +3975,11 @@ export class AgentSession {
 		options?: InternalPromptOptions,
 	): Promise<void> {
 		if (!this.isStreaming && options?.resumeIfIdle) this._sessionInputPumpSuspended = false;
-		const admission = await this._acquireDirectTurnAdmission({ allowStreaming: true, signal: options?.signal });
+		const admission = await this._acquireDirectTurnAdmission({
+			allowStreaming: true,
+			allowPendingQueue: options?.queueIfBusy === true,
+			signal: options?.signal,
+		});
 		try {
 			await this._turnAdmissionContext.run(admission.owner, () =>
 				this._promptInjectedMessageUnserialized(text, message, options, admission.release),
@@ -4108,7 +4112,10 @@ export class AgentSession {
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
 		if (!this.isStreaming) this._sessionInputPumpSuspended = false;
 		const admission = !this.isStreaming
-			? await this._acquireDirectTurnAdmission({ signal: options?.signal })
+			? await this._acquireDirectTurnAdmission({
+					allowPendingQueue: options?.queueIfBusy === true,
+					signal: options?.signal,
+				})
 			: undefined;
 		const releaseAdmission = admission?.release ?? (() => {});
 		try {
@@ -5408,7 +5415,7 @@ export class AgentSession {
 	}
 
 	private async _acquireDirectTurnAdmission(
-		options: { allowStreaming?: boolean; signal?: AbortSignal } = {},
+		options: { allowStreaming?: boolean; allowPendingQueue?: boolean; signal?: AbortSignal } = {},
 	): Promise<{ owner: symbol; release(): void }> {
 		while (true) {
 			this._assertDirectTurnAdmissionAvailable();
@@ -5423,8 +5430,11 @@ export class AgentSession {
 					await this._waitForQueuedWorkAdmission(options.signal);
 					continue;
 				}
+				// allowPendingQueue: queueIfBusy callers only need admission ownership,
+				// not a drained queue - they enqueue behind pending work at preflight.
 				if (
 					(options.allowStreaming === true && this.isStreaming) ||
+					options.allowPendingQueue === true ||
 					(this.pendingMessageCount === 0 &&
 						this._activeSessionInput === undefined &&
 						!this._pumpingSessionInput &&
