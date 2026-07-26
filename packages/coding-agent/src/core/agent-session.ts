@@ -3855,8 +3855,14 @@ export class AgentSession {
 		for (const message of context.messages) {
 			this._applyLateIpythonSentAgentMessages(message);
 		}
-		if (this._unpersistedCompactionOutcomes.length > 0) {
-			context.messages.push(...this._unpersistedCompactionOutcomes);
+		// Merge by timestamp: turns persisted after the failed append must stay
+		// below the disclosure, matching where it appeared live.
+		for (const outcome of this._unpersistedCompactionOutcomes) {
+			let insertAt = context.messages.length;
+			while (insertAt > 0 && context.messages[insertAt - 1]!.timestamp > outcome.timestamp) {
+				insertAt -= 1;
+			}
+			context.messages.splice(insertAt, 0, outcome);
 		}
 		return context;
 	}

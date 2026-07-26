@@ -3,7 +3,7 @@ import type { AgentMessage, ShouldStopAfterTurnContext } from "@earendil-works/p
 import { type AssistantMessage, fauxAssistantMessage, type Model, type ToolResultMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.js";
-import { createHarness, type Harness } from "./harness.js";
+import { createHarness, getMessageText, type Harness } from "./harness.js";
 
 type SessionWithCompactionInternals = {
 	_checkCompaction: (
@@ -1121,5 +1121,19 @@ describe("AgentSession compaction characterization", () => {
 			customType: "compaction_outcome",
 			content: expect.stringContaining("could not be saved to session history"),
 		});
+
+		// A turn persisted after the failure sorts below the disclosure on rebuild,
+		// matching where the notice appeared live.
+		harness.setResponses([fauxAssistantMessage("later response")]);
+		await harness.session.prompt("later turn");
+		const reordered = harness.session.buildSessionContext().messages;
+		const outcomeIndex = reordered.findIndex(
+			(message) => message.role === "custom" && message.customType === "compaction_outcome",
+		);
+		const laterTurnIndex = reordered.findIndex(
+			(message) => message.role === "user" && getMessageText(message).includes("later turn"),
+		);
+		expect(outcomeIndex).toBeGreaterThanOrEqual(0);
+		expect(laterTurnIndex).toBeGreaterThan(outcomeIndex);
 	});
 });
