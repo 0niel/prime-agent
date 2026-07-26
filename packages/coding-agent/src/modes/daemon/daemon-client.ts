@@ -314,7 +314,6 @@ export class DaemonClient {
 			("capability" in compatibility && !this.supportsServerCapability(compatibility.capability)) ||
 			(requiredSchema !== undefined &&
 				(hello.protocol.version < requiredSchema.protocol ||
-					// schemaRevision is monotonic; a newer daemon must stay compatible.
 					(hello.schemaRevision ?? 0) < requiredSchema.revision ||
 					!this.supportsServerCapability(requiredSchema.capability)))
 		) {
