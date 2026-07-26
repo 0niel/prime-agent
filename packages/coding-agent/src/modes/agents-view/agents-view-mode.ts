@@ -25,6 +25,7 @@ import {
 	resolveBuiltinSlashCommandName,
 } from "../../core/slash-commands.js";
 import { canonicalizePath } from "../../utils/paths.js";
+import { ensureTool } from "../../utils/tools-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
@@ -505,7 +506,7 @@ function agentsViewSlashCommands(): {
 }
 
 /** Autocomplete for the reply composer: session-owned plus view commands. */
-export function createReplyComposerAutocompleteProvider(cwd: string): AutocompleteProvider {
+export function createReplyComposerAutocompleteProvider(cwd: string, fdPath?: string): AutocompleteProvider {
 	const sessionCommands = BUILTIN_SLASH_COMMANDS.filter((command) => isSessionSlashCommandName(command.name)).map(
 		(command) => ({
 			name: command.name,
@@ -515,7 +516,7 @@ export function createReplyComposerAutocompleteProvider(cwd: string): Autocomple
 			takesArgument: command.takesArgument,
 		}),
 	);
-	return new CombinedAutocompleteProvider([...sessionCommands, ...agentsViewSlashCommands()], cwd);
+	return new CombinedAutocompleteProvider([...sessionCommands, ...agentsViewSlashCommands()], cwd, fdPath ?? null);
 }
 
 /** Autocomplete for the search editor: view commands only, once "/" is typed. */
@@ -590,6 +591,7 @@ export class AgentsViewMode implements Component, Focusable {
 	private replyTarget: { key: string; summary: SessionSummary } | undefined;
 	/** Provider bound to the armed target's cwd for file-path completions. */
 	private replyAutocomplete: AutocompleteProvider | undefined;
+	private fdPath: string | undefined;
 	private creatingNewSession = false;
 	private replyLastAssistantText: string | undefined;
 	private replyLastAssistantTextLoading = false;
@@ -635,6 +637,13 @@ export class AgentsViewMode implements Component, Focusable {
 		// The armed provider is rebuilt on arming so @-paths resolve in the target
 		// session's cwd, not the view's startup directory. The local adapter view
 		// runs no view commands, so it offers none either.
+		void ensureTool("fd").then((fdPath) => {
+			this.fdPath = fdPath;
+			// Rebind an already-armed provider so @-completion picks up fd.
+			if (this.replyTarget) {
+				this.replyAutocomplete = createReplyComposerAutocompleteProvider(this.replyTarget.summary.cwd, fdPath);
+			}
+		});
 		this.editor.setAutocompleteProvider({
 			getSuggestions: async (lines, cursorLine, cursorCol, suggestOptions) => {
 				if (this.replyTarget) {
@@ -1439,7 +1448,9 @@ export class AgentsViewMode implements Component, Focusable {
 			this.actionModeSearchQuery = undefined;
 		}
 		this.replyTarget = target;
-		this.replyAutocomplete = target ? createReplyComposerAutocompleteProvider(target.summary.cwd) : undefined;
+		this.replyAutocomplete = target
+			? createReplyComposerAutocompleteProvider(target.summary.cwd, this.fdPath)
+			: undefined;
 		this.replyLastAssistantText = undefined;
 		this.replyLastAssistantTextLoading = false;
 		this.replyHeaderTime = target
@@ -1610,30 +1621,41 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 	}
 
-	/** Create a fresh daemon session and open it in the chat view. */
+	/**
+	 * Create a fresh daemon session and open it in the chat view. Runs over a
+	 * dedicated connection: finish() closes the shared client, which would
+	 * reject an in-flight create while the daemon still materializes the
+	 * session, making the orphan unkillable.
+	 */
 	private async createNewSession(): Promise<boolean> {
 		if (this.creatingNewSession || this.stopped) return false;
 		this.creatingNewSession = true;
-		const client = this.requireClient();
 		try {
-			this.setStatusMessage("Creating session...");
-			const response = await client.request({
-				type: "create",
-				config: this.options.config,
-				env: collectDaemonClientEnv(),
-			});
-			const created = expectSessionSummary(requireDaemonData(response));
-			// The view can finish while create is in flight; kill the fresh empty
-			// session instead of leaving an orphan resident in the agents list.
-			if (this.stopped) {
-				if (created.activeSessionId && client.isConnected) {
-					await client.request({ type: "kill", activeSessionId: created.activeSessionId }).catch(() => undefined);
+			const client = await this.connectDedicatedClient();
+			try {
+				this.setStatusMessage("Creating session...");
+				const response = await client.request({
+					type: "create",
+					config: this.options.config,
+					env: collectDaemonClientEnv(),
+				});
+				const created = expectSessionSummary(requireDaemonData(response));
+				// The view can finish while create is in flight; kill the fresh empty
+				// session instead of leaving an orphan resident in the agents list.
+				if (this.stopped) {
+					if (created.activeSessionId) {
+						await client
+							.request({ type: "kill", activeSessionId: created.activeSessionId })
+							.catch(() => undefined);
+					}
+					return false;
 				}
-				return false;
+				this.selectSummary(created);
+				this.finish({ type: "open", summary: created });
+				return true;
+			} finally {
+				client.close();
 			}
-			this.selectSummary(created);
-			this.finish({ type: "open", summary: created });
-			return true;
 		} catch (error) {
 			if (!this.stopped) this.setStatusMessage(formatError("Failed to create session", error));
 			return false;
@@ -1766,6 +1788,11 @@ export class AgentsViewMode implements Component, Focusable {
 			// A session resumed for a fork that then failed must still appear live.
 			if (didResume) await this.refreshSessions({ preserveStatusOnError: true });
 		}
+	}
+
+	/** A connection that outlives finish(), which closes the shared client. */
+	private async connectDedicatedClient(): Promise<DaemonClient> {
+		return connectAgentsViewDaemonClient(this.requireSocketPath());
 	}
 
 	/** Point selection (and its persisted key) at a freshly resumed session row. */
