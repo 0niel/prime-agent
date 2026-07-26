@@ -1257,6 +1257,7 @@ export class AgentsViewMode implements Component, Focusable {
 		if (viewCommand) {
 			if (this.options.adapter) {
 				this.setStatusMessage(`/${viewCommand.name} is not available here`, { tone: "warning" });
+				if (this.editor.getText().length === 0) this.setSearchQuery(value);
 				return;
 			}
 			// submitValue cleared the editor without queryChanged; drop the command

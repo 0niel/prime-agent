@@ -666,14 +666,20 @@ describe("agents view slash commands", () => {
 	});
 
 	it("rejects view commands under the local adapter in both editors", async () => {
-		// Search editor: must warn instead of opening the selected row.
+		// Search editor: must warn instead of opening the selected row, and keep
+		// the cleared draft.
 		const openSelected = vi.fn();
+		const searchEditor = editorWithText("");
 		const searchSelf: Record<string, unknown> = {
 			replyTarget: undefined,
 			renameTarget: undefined,
 			options: { adapter: { kind: "local" } },
 			rows: [],
 			selectedIndex: 0,
+			editor: searchEditor,
+			setSearchQuery(query: string) {
+				searchEditor.setText(query);
+			},
 			setStatusMessage: vi.fn(),
 			runAgentsViewCommand: vi.fn(),
 			openSelected,
@@ -682,6 +688,7 @@ describe("agents view slash commands", () => {
 		expect(searchSelf.runAgentsViewCommand).not.toHaveBeenCalled();
 		expect(openSelected).not.toHaveBeenCalled();
 		expect(searchSelf.setStatusMessage).toHaveBeenCalledWith("/new is not available here", { tone: "warning" });
+		expect(searchEditor.getText()).toBe("/new");
 
 		// Armed composer: must warn instead of sending the command as a prompt.
 		const sendReply = vi.fn(async () => true);
