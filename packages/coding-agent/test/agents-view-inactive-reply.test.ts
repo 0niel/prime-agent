@@ -373,7 +373,7 @@ describe("agents view reply on inactive sessions", () => {
 		const submit = vi.fn(async () => {});
 		const self = {
 			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
-			editor: { getText: () => "queued reply" },
+			editor: { getExpandedText: () => "queued reply" },
 			submit,
 		};
 
@@ -384,10 +384,10 @@ describe("agents view reply on inactive sessions", () => {
 
 	it("ignores the follow-up keybinding without an armed target or text", () => {
 		const submit = vi.fn(async () => {});
-		invoke("handleReplyFollowUp", { replyTarget: undefined, editor: { getText: () => "text" }, submit });
+		invoke("handleReplyFollowUp", { replyTarget: undefined, editor: { getExpandedText: () => "text" }, submit });
 		invoke("handleReplyFollowUp", {
 			replyTarget: { key: "a", summary: summary({}) },
-			editor: { getText: () => "   " },
+			editor: { getExpandedText: () => "   " },
 			submit,
 		});
 		expect(submit).not.toHaveBeenCalled();
@@ -432,6 +432,47 @@ describe("agents view reply on inactive sessions", () => {
 		expect(request).toHaveBeenCalledWith(expect.objectContaining({ type: "create" }));
 		expect(self.selectSummary).toHaveBeenCalledWith(created);
 		expect(finish).toHaveBeenCalledWith({ type: "open", summary: created });
+	});
+
+	it("kills a session created after the view already finished", async () => {
+		const created = summary({ id: "active-new", activeSessionId: "active-new", lifecycle: "live" });
+		const requests: { type: string }[] = [];
+		const self: Record<string, unknown> = {
+			creatingNewSession: false,
+			stopped: false,
+			options: { config: {} },
+			requireClient: () => ({
+				isConnected: true,
+				request: vi.fn(async (command: { type: string }) => {
+					requests.push(command);
+					// The view finishes while create is in flight.
+					self.stopped = true;
+					return { success: true, data: created };
+				}),
+			}),
+			setStatusMessage: vi.fn(),
+			selectSummary: vi.fn(),
+			finish: vi.fn(),
+		};
+
+		await invoke("createNewSession", self);
+
+		expect(requests.map((r) => r.type)).toEqual(["create", "kill"]);
+		expect(self.finish).not.toHaveBeenCalled();
+		expect(self.selectSummary).not.toHaveBeenCalled();
+	});
+
+	it("expands paste markers for the alt+enter follow-up path", () => {
+		const submit = vi.fn(async () => {});
+		const self = {
+			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
+			editor: { getExpandedText: () => "expanded paste body" },
+			submit,
+		};
+
+		invoke("handleReplyFollowUp", self);
+
+		expect(submit).toHaveBeenCalledWith("expanded paste body", "followUp");
 	});
 
 	it("reports a create failure without leaving the view", async () => {
@@ -500,8 +541,9 @@ describe("reply composer slash commands", () => {
 		expect(getReplyComposerCommandRejection("plain reply")).toBeUndefined();
 	});
 
-	it("blocks a rejected command in submit without clearing the editor", async () => {
-		const editor = editorWithText("/model gpt-5");
+	it("restores the draft when a command is rejected after submit cleared the buffer", async () => {
+		// submitValue empties the editor before onSubmit runs.
+		const editor = editorWithText("");
 		const setStatusMessage = vi.fn();
 		const sendReply = vi.fn();
 		const self: Record<string, unknown> = {
@@ -518,6 +560,40 @@ describe("reply composer slash commands", () => {
 			tone: "warning",
 		});
 		expect(editor.getText()).toBe("/model gpt-5");
+	});
+
+	it("does not overwrite newer typing when a rejection lands late", async () => {
+		const editor = editorWithText("newer draft");
+		const self: Record<string, unknown> = {
+			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
+			editor,
+			setStatusMessage: vi.fn(),
+			sendReply: vi.fn(),
+		};
+
+		await invoke("submit", self, "/settings");
+
+		expect(editor.getText()).toBe("newer draft");
+	});
+
+	it("binds reply autocomplete to the armed target's cwd", () => {
+		const self: Record<string, unknown> = {
+			replyTarget: undefined,
+			replyAutocomplete: undefined,
+			actionModeSearchQuery: undefined,
+			persistentState: {},
+			editor: Object.assign(editorWithText(""), { setPlaceholder: vi.fn() }),
+			replyLastAssistantText: undefined,
+			replyLastAssistantTextLoading: false,
+			replyHeaderTime: "",
+			rebuildRows: vi.fn(),
+			ui: { requestRender: vi.fn() },
+		};
+		const target = { key: "active-1", summary: summary({ activeSessionId: "active-1", cwd: "/tmp/elsewhere" }) };
+		invoke("setReplyTarget", self, target);
+		expect(self.replyAutocomplete).toBeDefined();
+		invoke("setReplyTarget", self, undefined);
+		expect(self.replyAutocomplete).toBeUndefined();
 	});
 
 	it("suggests only session-owned commands", async () => {

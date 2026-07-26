@@ -588,6 +588,8 @@ export class AgentsViewMode implements Component, Focusable {
 	private selectionAnchorPending = false;
 	/** Armed reply composer target: a live agent or a saved session to resume on send. */
 	private replyTarget: { key: string; summary: SessionSummary } | undefined;
+	/** Provider bound to the armed target's cwd for file-path completions. */
+	private replyAutocomplete: AutocompleteProvider | undefined;
 	private creatingNewSession = false;
 	private replyLastAssistantText: string | undefined;
 	private replyLastAssistantTextLoading = false;
@@ -628,17 +630,20 @@ export class AgentsViewMode implements Component, Focusable {
 			placeholder: SEARCH_PROMPT_PLACEHOLDER,
 			placeholderColor: (text) => theme.fg("dim", text),
 		});
-		const replyAutocomplete = createReplyComposerAutocompleteProvider(options.uiServices.getInitialCwd());
 		const searchAutocomplete = createSearchViewAutocompleteProvider(options.uiServices.getInitialCwd());
 		// Search text stays a query; only slash-prefixed input offers view commands.
+		// The armed provider is rebuilt on arming so @-paths resolve in the target
+		// session's cwd, not the view's startup directory.
 		this.editor.setAutocompleteProvider({
 			getSuggestions: async (lines, cursorLine, cursorCol, suggestOptions) => {
-				if (this.replyTarget) return replyAutocomplete.getSuggestions(lines, cursorLine, cursorCol, suggestOptions);
+				if (this.replyTarget) {
+					return this.replyAutocomplete?.getSuggestions(lines, cursorLine, cursorCol, suggestOptions) ?? null;
+				}
 				if (this.renameTarget || !this.editor.getText().startsWith("/")) return null;
 				return searchAutocomplete.getSuggestions(lines, cursorLine, cursorCol, suggestOptions);
 			},
 			applyCompletion: (lines, cursorLine, cursorCol, item, prefix) =>
-				(this.replyTarget ? replyAutocomplete : searchAutocomplete).applyCompletion(
+				(this.replyTarget && this.replyAutocomplete ? this.replyAutocomplete : searchAutocomplete).applyCompletion(
 					lines,
 					cursorLine,
 					cursorCol,
@@ -779,7 +784,7 @@ export class AgentsViewMode implements Component, Focusable {
 			void this.toggleReplyTarget();
 			return;
 		}
-		if (!this.options.adapter && this.keybindings.matches(data, "app.agents.new")) {
+		if (!this.options.adapter && !this.replyTarget && this.keybindings.matches(data, "app.agents.new")) {
 			void this.createNewSession();
 			return;
 		}
@@ -1175,6 +1180,8 @@ export class AgentsViewMode implements Component, Focusable {
 			}
 			const rejection = getReplyComposerCommandRejection(text);
 			if (rejection) {
+				// submitValue cleared the buffer before onSubmit; keep the draft.
+				if (this.editor.getText().length === 0) this.editor.setText(value);
 				this.setStatusMessage(rejection, { tone: "warning" });
 				return;
 			}
@@ -1208,7 +1215,8 @@ export class AgentsViewMode implements Component, Focusable {
 	/** Alt+Enter in the reply composer queues the reply as a follow-up. */
 	private handleReplyFollowUp(): void {
 		if (!this.replyTarget) return;
-		const text = this.editor.getText();
+		// Unlike Enter, this path skips submitValue, so expand paste markers here.
+		const text = this.editor.getExpandedText();
 		if (!text.trim()) return;
 		void this.submit(text, "followUp");
 	}
@@ -1421,6 +1429,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.actionModeSearchQuery = undefined;
 		}
 		this.replyTarget = target;
+		this.replyAutocomplete = target ? createReplyComposerAutocompleteProvider(target.summary.cwd) : undefined;
 		this.replyLastAssistantText = undefined;
 		this.replyLastAssistantTextLoading = false;
 		this.replyHeaderTime = target
@@ -1593,20 +1602,29 @@ export class AgentsViewMode implements Component, Focusable {
 
 	/** Create a fresh daemon session and open it in the chat view. */
 	private async createNewSession(): Promise<void> {
-		if (this.creatingNewSession) return;
+		if (this.creatingNewSession || this.stopped) return;
 		this.creatingNewSession = true;
+		const client = this.requireClient();
 		try {
 			this.setStatusMessage("Creating session...");
-			const response = await this.requireClient().request({
+			const response = await client.request({
 				type: "create",
 				config: this.options.config,
 				env: collectDaemonClientEnv(),
 			});
 			const created = expectSessionSummary(requireDaemonData(response));
+			// The view can finish while create is in flight; kill the fresh empty
+			// session instead of leaving an orphan resident in the agents list.
+			if (this.stopped) {
+				if (created.activeSessionId && client.isConnected) {
+					await client.request({ type: "kill", activeSessionId: created.activeSessionId }).catch(() => undefined);
+				}
+				return;
+			}
 			this.selectSummary(created);
 			this.finish({ type: "open", summary: created });
 		} catch (error) {
-			this.setStatusMessage(formatError("Failed to create session", error));
+			if (!this.stopped) this.setStatusMessage(formatError("Failed to create session", error));
 		} finally {
 			this.creatingNewSession = false;
 		}
