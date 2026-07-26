@@ -1114,5 +1114,12 @@ describe("AgentSession compaction characterization", () => {
 		expect(reloaded.getEntries()).not.toContainEqual(
 			expect.objectContaining({ type: "custom_message", customType: "compaction_outcome" }),
 		);
+		// The unpersisted disclosure survives context rebuilds (e.g. thinking toggle).
+		const rebuilt = harness.session.buildSessionContext();
+		expect(rebuilt.messages.at(-1)).toMatchObject({
+			role: "custom",
+			customType: "compaction_outcome",
+			content: expect.stringContaining("could not be saved to session history"),
+		});
 	});
 });
