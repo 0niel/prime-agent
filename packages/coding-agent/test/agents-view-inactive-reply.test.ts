@@ -331,23 +331,7 @@ describe("agents view reply on inactive sessions", () => {
 		expect(self.sendPrompt).not.toHaveBeenCalledWith("active-dead", expect.anything(), expect.anything());
 	});
 
-	it("queues a follow-up when Alt+Enter delivery is requested", async () => {
-		const liveSummary = summary({ activeSessionId: "active-1", lifecycle: "live", isStreaming: true });
-		const self: Record<string, unknown> = {
-			options: { config: {} },
-			requireClient: () => ({ request: vi.fn() }),
-			findSummaryByActiveSessionId: () => liveSummary,
-			setStatusMessage: vi.fn(),
-			selectSummary: vi.fn(),
-			sendPrompt: vi.fn(async () => {}),
-		};
-
-		await invoke("sendReply", self, { key: "active-1", summary: liveSummary }, "later please", "followUp");
-
-		expect(self.sendPrompt).toHaveBeenCalledWith("active-1", "later please", "followUp");
-	});
-
-	it("steers a streaming session on plain submit", async () => {
+	it("steers on plain submit and queues a follow-up on Alt+Enter delivery", async () => {
 		const liveSummary = summary({ activeSessionId: "active-1", lifecycle: "live", isStreaming: true });
 		const self: Record<string, unknown> = {
 			options: { config: {} },
@@ -359,21 +343,10 @@ describe("agents view reply on inactive sessions", () => {
 		};
 
 		await invoke("sendReply", self, { key: "active-1", summary: liveSummary }, "change course");
-
 		expect(self.sendPrompt).toHaveBeenCalledWith("active-1", "change course", "steer");
-	});
 
-	it("routes the follow-up keybinding through submit with followUp delivery", () => {
-		const submit = vi.fn(async () => {});
-		const self = {
-			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
-			editor: { getExpandedText: () => "queued reply" },
-			submit,
-		};
-
-		invoke("handleReplyFollowUp", self);
-
-		expect(submit).toHaveBeenCalledWith("queued reply", "followUp");
+		await invoke("sendReply", self, { key: "active-1", summary: liveSummary }, "later please", "followUp");
+		expect(self.sendPrompt).toHaveBeenCalledWith("active-1", "later please", "followUp");
 	});
 
 	it("ignores the follow-up keybinding without an armed target or text", () => {
@@ -458,7 +431,7 @@ describe("agents view reply on inactive sessions", () => {
 		expect(self.selectSummary).not.toHaveBeenCalled();
 	});
 
-	it("expands paste markers for the alt+enter follow-up path", () => {
+	it("submits the expanded editor text with followUp delivery on alt+enter", () => {
 		const submit = vi.fn(async () => {});
 		const self = {
 			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
@@ -471,38 +444,33 @@ describe("agents view reply on inactive sessions", () => {
 		expect(submit).toHaveBeenCalledWith("expanded paste body", "followUp");
 	});
 
-	it("reports a create failure without leaving the view", async () => {
-		const request = vi.fn(async () => {
-			throw new Error("daemon busy");
-		});
+	it("reports create failures and resets the guard", async () => {
+		// Failure after connecting.
 		const finish = vi.fn();
 		const setStatusMessage = vi.fn();
 		const self: Record<string, unknown> = {
 			creatingNewSession: false,
 			options: { config: {} },
-			connectDedicatedClient: vi.fn(async () => ({ request, close: vi.fn() })),
+			connectDedicatedClient: vi.fn(async () => ({
+				request: vi.fn(async () => {
+					throw new Error("daemon busy");
+				}),
+				close: vi.fn(),
+			})),
 			setStatusMessage,
 			selectSummary: vi.fn(),
 			finish,
 		};
-
 		await expect(invoke("createNewSession", self)).resolves.toBe(false);
-
 		expect(finish).not.toHaveBeenCalled();
 		expect(setStatusMessage).toHaveBeenCalledWith(expect.stringContaining("Failed to create session"));
 		expect(self.creatingNewSession).toBe(false);
-	});
 
-	it("resets the guard when no daemon connection is available", async () => {
-		const self: Record<string, unknown> = {
-			creatingNewSession: false,
-			options: { config: {} },
-			connectDedicatedClient: vi.fn(async () => {
-				throw new Error("Agents view daemon socket is not configured");
-			}),
-			setStatusMessage: vi.fn(),
-		};
-
+		// Failure to connect at all must also reset the guard.
+		self.creatingNewSession = false;
+		self.connectDedicatedClient = vi.fn(async () => {
+			throw new Error("Agents view daemon socket is not configured");
+		});
 		await expect(invoke("createNewSession", self)).resolves.toBe(false);
 		expect(self.creatingNewSession).toBe(false);
 	});
