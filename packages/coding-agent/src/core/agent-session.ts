@@ -5389,8 +5389,7 @@ export class AgentSession {
 					await this._waitForQueuedWorkAdmission();
 					continue;
 				}
-				// allowPendingQueue: queueIfBusy callers only need admission ownership,
-				// not a drained queue - they enqueue behind pending work at preflight.
+				// queueIfBusy callers enqueue behind pending work at preflight; they need ownership, not a drained queue.
 				if (
 					(options.allowStreaming === true && this.isStreaming) ||
 					options.allowPendingQueue === true ||
@@ -6316,8 +6315,7 @@ export class AgentSession {
 			this._scheduleAutoRefineAfterAgentEnd();
 			return;
 		}
-		// The pump owns items it moved into _activeSessionInput before handoff, so
-		// an empty queue alone does not mean idle.
+		// An empty queue is not idle: the pump owns items moved into _activeSessionInput before handoff.
 		if (
 			this.pendingMessageCount > 0 ||
 			this._activeSessionInput !== undefined ||

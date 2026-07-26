@@ -774,8 +774,6 @@ describe("AgentSession queue characterization", () => {
 		});
 		await harness.session.waitForIdle();
 
-		// The prompt joined the queue rather than waiting for it to drain and
-		// starting a direct turn; delivery order proves queue membership.
 		expect(queuedAtPreflight).toBe(true);
 		expect(getUserTexts(harness)).toEqual(["already queued", "respects the queue"]);
 	});
