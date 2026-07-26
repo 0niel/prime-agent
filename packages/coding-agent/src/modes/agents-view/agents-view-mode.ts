@@ -468,11 +468,7 @@ const AGENTS_VIEW_COMMAND_TYPING_TARGETS: readonly string[] = AGENTS_VIEW_COMMAN
 	return [name, ...(builtin?.aliases ?? [])];
 });
 
-/**
- * True while search input is a view command or may still extend into one.
- * Prefix matching keeps mid-typing (like "/ki") from filtering the list,
- * while unknown terms such as "/foo" stay ordinary search text.
- */
+/** True while input is a view command or a prefix that may extend into one ("/ki"); "/foo" is not. */
 export function isAgentsViewCommandInput(text: string): boolean {
 	const trimmed = text.trim();
 	if (!trimmed.startsWith("/")) return false;
@@ -1170,8 +1166,7 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private getFilteredRecords(): UnifiedSessionRecord[] {
 		let query = this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
-		// Command input is not a query: filtering on it (even mid-typing) would
-		// reshuffle the list out from under the selected target row.
+		// Filtering on command input would reshuffle the list under the selected row.
 		if (!this.replyTarget && !this.renameTarget && !this.options.adapter && isAgentsViewCommandInput(query)) {
 			query = "";
 		}
@@ -1205,8 +1200,7 @@ export class AgentsViewMode implements Component, Focusable {
 			const text = value.trim();
 			const viewCommand = parseAgentsViewCommand(text);
 			if (viewCommand && this.options.adapter) {
-				// Adapter sessions have no daemon RPCs behind view commands; treat
-				// them like any other unavailable built-in instead of prompt text.
+				// No daemon RPCs behind adapter rows; reject like other unavailable built-ins.
 				this.setStatusMessage(`/${viewCommand.name} is not available here`, { tone: "warning" });
 				if (this.editor.getText().length === 0) this.editor.setText(value);
 				return;
@@ -1218,9 +1212,7 @@ export class AgentsViewMode implements Component, Focusable {
 					target,
 					(activeSessionId) => this.findSummaryByActiveSessionId(activeSessionId),
 				);
-				// The buffer is already clear (submitValue), so re-submitting during the
-				// RPC cannot double-run; a failure restores the draft only if the same
-				// composer is still armed and the user has not typed anew.
+				// Restore the draft only if the same composer is armed and nothing new was typed.
 				const succeeded = await this.runAgentsViewCommand(viewCommand, currentSummary);
 				if (!succeeded && this.replyTarget === target && this.editor.getText().length === 0) {
 					this.editor.setText(value);
@@ -1249,8 +1241,7 @@ export class AgentsViewMode implements Component, Focusable {
 			}
 			return;
 		}
-		// The search editor never treats text as a prompt; a recognized view
-		// command acts on the selected row, anything else opens the selection.
+		// Search text is never a prompt: commands act on the selected row, anything else opens it.
 		const viewCommand = parseAgentsViewCommand(value.trim());
 		if (viewCommand) {
 			if (this.options.adapter) {
@@ -1258,8 +1249,7 @@ export class AgentsViewMode implements Component, Focusable {
 				if (this.editor.getText().length === 0) this.setSearchQuery(value);
 				return;
 			}
-			// submitValue cleared the editor without queryChanged; drop the command
-			// from the persisted query so a remount cannot restore and re-run it.
+			// submitValue bypassed queryChanged; a remount must not restore and re-run the command.
 			this.persistentState.query = "";
 			const row = this.rows[this.selectedIndex];
 			const target = row?.kind === "agent" && row.selectable ? row.summary : undefined;

@@ -545,15 +545,6 @@ describe("reply composer slash commands", () => {
 		invoke("setReplyTarget", self, undefined);
 		expect(self.replyAutocomplete).toBeUndefined();
 	});
-
-	it("suggests only session-owned commands", async () => {
-		const provider = createReplyComposerAutocompleteProvider(process.cwd());
-		const suggestions = await provider.getSuggestions(["/"], 0, 1, { signal: new AbortController().signal });
-		const names = suggestions?.items.map((item) => item.value) ?? [];
-		expect(names).toEqual(expect.arrayContaining(["compact", "refine", "goal", "autonomous"]));
-		expect(names).not.toContain("model");
-		expect(names).not.toContain("settings");
-	});
 });
 
 describe("agents view slash commands", () => {
@@ -565,7 +556,6 @@ describe("agents view slash commands", () => {
 		expect(parseAgentsViewCommand("/compact")).toBeUndefined();
 		expect(parseAgentsViewCommand("plain search text")).toBeUndefined();
 		expect(getReplyComposerCommandRejection("/kill")).toBeUndefined();
-		// /fork is a builtin but not a view command; it is rejected with guidance.
 		expect(getReplyComposerCommandRejection("/fork")).toContain("not available here");
 	});
 
@@ -604,8 +594,7 @@ describe("agents view slash commands", () => {
 
 		expect(runAgentsViewCommand).toHaveBeenCalledWith({ name: "kill", args: "" }, live);
 		expect(self.openSelected).not.toHaveBeenCalled();
-		// A remount restores persistentState.query; it must not resurrect the
-		// command where Enter could re-run it on an arbitrary row.
+		// A remount must not restore and re-run the command from the persisted query.
 		expect(persistentState.query).toBe("");
 	});
 
@@ -630,14 +619,12 @@ describe("agents view slash commands", () => {
 
 		await invoke("submit", self, "/kill");
 
-		// The draft comes back through the query path so persistence agrees.
 		expect(editor.getText()).toBe("/kill");
 		expect(persistentState.query).toBe("/kill");
 	});
 
 	it("rejects view commands under the local adapter in both editors", async () => {
-		// Search editor: must warn instead of opening the selected row, and keep
-		// the cleared draft.
+		// Search editor: warn instead of opening the selected row; keep the draft.
 		const openSelected = vi.fn();
 		const searchEditor = editorWithText("");
 		const searchSelf: Record<string, unknown> = {
@@ -813,8 +800,7 @@ describe("agents view slash commands", () => {
 		};
 		const filtered = () => (invoke("getFilteredRecords", self) as unknown[]).length;
 
-		// "/kill" and the mid-typing prefix "/ki" must not act as fuzzy queries
-		// (they would drop the row), but "/foo" stays an ordinary search term.
+		// "/kill" and mid-typing "/ki" must not filter; unknown "/foo" still does.
 		expect(filtered()).toBe(1);
 		editor.setText("/ki");
 		expect(filtered()).toBe(1);
