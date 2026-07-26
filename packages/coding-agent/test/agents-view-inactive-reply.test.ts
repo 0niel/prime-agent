@@ -408,14 +408,15 @@ describe("agents view reply on inactive sessions", () => {
 		expect(self.selectSummary).not.toHaveBeenCalled();
 	});
 
-	it("creates a new daemon session and opens it", async () => {
+	it("creates a new daemon session over a dedicated connection and opens it", async () => {
 		const created = summary({ id: "active-new", activeSessionId: "active-new", lifecycle: "live" });
 		const request = vi.fn(async () => ({ success: true, data: created }));
+		const close = vi.fn();
 		const finish = vi.fn();
 		const self: Record<string, unknown> = {
 			creatingNewSession: false,
 			options: { config: { cwd: process.cwd() } },
-			requireClient: () => ({ request }),
+			connectDedicatedClient: vi.fn(async () => ({ request, close })),
 			setStatusMessage: vi.fn(),
 			selectSummary: vi.fn(),
 			finish,
@@ -426,6 +427,7 @@ describe("agents view reply on inactive sessions", () => {
 		expect(request).toHaveBeenCalledWith(expect.objectContaining({ type: "create" }));
 		expect(self.selectSummary).toHaveBeenCalledWith(created);
 		expect(finish).toHaveBeenCalledWith({ type: "open", summary: created });
+		expect(close).toHaveBeenCalled();
 	});
 
 	it("kills a session created after the view already finished", async () => {
@@ -435,15 +437,15 @@ describe("agents view reply on inactive sessions", () => {
 			creatingNewSession: false,
 			stopped: false,
 			options: { config: {} },
-			requireClient: () => ({
-				isConnected: true,
+			connectDedicatedClient: vi.fn(async () => ({
+				close: vi.fn(),
 				request: vi.fn(async (command: { type: string }) => {
 					requests.push(command);
 					// The view finishes while create is in flight.
 					self.stopped = true;
 					return { success: true, data: created };
 				}),
-			}),
+			})),
 			setStatusMessage: vi.fn(),
 			selectSummary: vi.fn(),
 			finish: vi.fn(),
@@ -478,16 +480,30 @@ describe("agents view reply on inactive sessions", () => {
 		const self: Record<string, unknown> = {
 			creatingNewSession: false,
 			options: { config: {} },
-			requireClient: () => ({ request }),
+			connectDedicatedClient: vi.fn(async () => ({ request, close: vi.fn() })),
 			setStatusMessage,
 			selectSummary: vi.fn(),
 			finish,
 		};
 
-		await invoke("createNewSession", self);
+		await expect(invoke("createNewSession", self)).resolves.toBe(false);
 
 		expect(finish).not.toHaveBeenCalled();
 		expect(setStatusMessage).toHaveBeenCalledWith(expect.stringContaining("Failed to create session"));
+		expect(self.creatingNewSession).toBe(false);
+	});
+
+	it("resets the guard when no daemon connection is available", async () => {
+		const self: Record<string, unknown> = {
+			creatingNewSession: false,
+			options: { config: {} },
+			connectDedicatedClient: vi.fn(async () => {
+				throw new Error("Agents view daemon socket is not configured");
+			}),
+			setStatusMessage: vi.fn(),
+		};
+
+		await expect(invoke("createNewSession", self)).resolves.toBe(false);
 		expect(self.creatingNewSession).toBe(false);
 	});
 

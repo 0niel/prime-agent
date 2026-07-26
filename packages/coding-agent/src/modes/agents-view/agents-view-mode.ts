@@ -1469,36 +1469,52 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 	}
 
-	/** Create a fresh daemon session and open it in the chat view. */
+	/**
+	 * Create a fresh daemon session and open it in the chat view. Runs over a
+	 * dedicated connection: finish() closes the shared client, which would
+	 * reject an in-flight create while the daemon still materializes the
+	 * session, making the orphan unkillable.
+	 */
 	private async createNewSession(): Promise<boolean> {
 		if (this.creatingNewSession || this.stopped) return false;
 		this.creatingNewSession = true;
-		const client = this.requireClient();
 		try {
-			this.setStatusMessage("Creating session...");
-			const response = await client.request({
-				type: "create",
-				config: this.options.config,
-				env: collectDaemonClientEnv(),
-			});
-			const created = expectSessionSummary(requireDaemonData(response));
-			// The view can finish while create is in flight; kill the fresh empty
-			// session instead of leaving an orphan resident in the agents list.
-			if (this.stopped) {
-				if (created.activeSessionId && client.isConnected) {
-					await client.request({ type: "kill", activeSessionId: created.activeSessionId }).catch(() => undefined);
+			const client = await this.connectDedicatedClient();
+			try {
+				this.setStatusMessage("Creating session...");
+				const response = await client.request({
+					type: "create",
+					config: this.options.config,
+					env: collectDaemonClientEnv(),
+				});
+				const created = expectSessionSummary(requireDaemonData(response));
+				// The view can finish while create is in flight; kill the fresh empty
+				// session instead of leaving an orphan resident in the agents list.
+				if (this.stopped) {
+					if (created.activeSessionId) {
+						await client
+							.request({ type: "kill", activeSessionId: created.activeSessionId })
+							.catch(() => undefined);
+					}
+					return false;
 				}
-				return false;
+				this.selectSummary(created);
+				this.finish({ type: "open", summary: created });
+				return true;
+			} finally {
+				client.close();
 			}
-			this.selectSummary(created);
-			this.finish({ type: "open", summary: created });
-			return true;
 		} catch (error) {
 			if (!this.stopped) this.setStatusMessage(formatError("Failed to create session", error));
 			return false;
 		} finally {
 			this.creatingNewSession = false;
 		}
+	}
+
+	/** A connection that outlives finish(), which closes the shared client. */
+	private async connectDedicatedClient(): Promise<DaemonClient> {
+		return connectAgentsViewDaemonClient(this.requireSocketPath());
 	}
 
 	/** Point selection (and its persisted key) at a freshly resumed session row. */
