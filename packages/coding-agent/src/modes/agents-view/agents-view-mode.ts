@@ -783,6 +783,11 @@ export class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		if (this.keybindings.matches(data, "app.clear")) {
+			// The composer hints advertise ctrl+c as cancel; it must not start the exit flow.
+			if (this.replyTarget) {
+				this.setReplyTarget(undefined);
+				return;
+			}
 			this.handleCtrlC();
 			return;
 		}

@@ -384,6 +384,24 @@ describe("agents view reply on inactive sessions", () => {
 		expect(submit).toHaveBeenCalledWith("expanded paste body", "followUp");
 	});
 
+	it("ctrl+c disarms the composer instead of starting the exit flow", () => {
+		const setReplyTarget = vi.fn();
+		const handleCtrlC = vi.fn();
+		const self: Record<string, unknown> = {
+			clearStickyStatusMessage: vi.fn(),
+			renameTarget: undefined,
+			keybindings: { matches: (_d: string, action: string) => action === "app.clear" },
+			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
+			setReplyTarget,
+			handleCtrlC,
+		};
+
+		invoke("handleInput", self, "\x03");
+
+		expect(setReplyTarget).toHaveBeenCalledWith(undefined);
+		expect(handleCtrlC).not.toHaveBeenCalled();
+	});
+
 	it("creates a new daemon session over a dedicated connection and opens it", async () => {
 		const created = summary({ id: "active-new", activeSessionId: "active-new", lifecycle: "live" });
 		const request = vi.fn(async () => ({ success: true, data: created }));
