@@ -1739,9 +1739,15 @@ export class AgentsViewMode implements Component, Focusable {
 						this.setStatusMessage("/kill needs a running agent; this session is inactive", { tone: "warning" });
 						return false;
 					}
-					requireDaemonData(
-						await this.requireClient().request({ type: "kill", activeSessionId: target.activeSessionId }),
-					);
+					try {
+						requireDaemonData(
+							await this.requireClient().request({ type: "kill", activeSessionId: target.activeSessionId }),
+						);
+					} catch (error) {
+						// Same tolerance as deactivatePendingAgent: the agent can finish
+						// between listing and the command; that still counts as stopped.
+						if (!isUnknownActiveSessionError(error)) throw error;
+					}
 					disarmIfUnchanged();
 					this.setStatusMessage("Agent stopped");
 					await this.refreshBothCatalogs();

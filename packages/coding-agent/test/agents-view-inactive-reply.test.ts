@@ -765,6 +765,13 @@ describe("agents view slash commands", () => {
 		expect(request).toHaveBeenCalledWith({ type: "kill", activeSessionId: "active-1" });
 		expect(setReplyTarget).toHaveBeenCalledWith(undefined);
 		expect(self.refreshBothCatalogs).toHaveBeenCalled();
+
+		// An agent that finished before the RPC still counts as stopped.
+		self.request = undefined;
+		self.requireClient = () => ({
+			request: vi.fn(async () => ({ success: false, error: "Unknown active session: active-1" })),
+		});
+		await expect(invoke("runAgentsViewCommand", self, { name: "kill", args: "" }, live)).resolves.toBe(true);
 	});
 
 	it("does not disarm a composer that was re-armed during the command", async () => {
