@@ -646,8 +646,6 @@ export class AgentsViewMode implements Component, Focusable {
 			placeholderColor: (text) => theme.fg("dim", text),
 		});
 		const searchAutocomplete = createSearchViewAutocompleteProvider(options.uiServices.getInitialCwd());
-		// Search text stays a query; only slash-prefixed input offers view commands.
-		// The armed provider is rebuilt on arming so @-paths resolve in the target's cwd.
 		void ensureTool("fd").then((fdPath) => {
 			this.fdPath = fdPath;
 			// Rebind an already-armed provider so @-completion picks up fd.
@@ -660,7 +658,6 @@ export class AgentsViewMode implements Component, Focusable {
 				if (this.replyTarget) {
 					return this.replyAutocomplete?.getSuggestions(lines, cursorLine, cursorCol, suggestOptions) ?? null;
 				}
-				// Same predicate as the filter freeze: "/tmp/" is a path query, not a command.
 				if (this.options.adapter || this.renameTarget || !isAgentsViewCommandInput(this.editor.getText())) {
 					return null;
 				}
@@ -1208,7 +1205,6 @@ export class AgentsViewMode implements Component, Focusable {
 			const text = value.trim();
 			const viewCommand = parseAgentsViewCommand(text);
 			if (viewCommand && this.options.adapter) {
-				// No daemon RPCs behind adapter rows; reject like other unavailable built-ins.
 				this.setStatusMessage(`/${viewCommand.name} is not available here`, { tone: "warning" });
 				if (this.editor.getText().length === 0) this.editor.setText(value);
 				return;
@@ -1220,7 +1216,6 @@ export class AgentsViewMode implements Component, Focusable {
 					target,
 					(activeSessionId) => this.findSummaryByActiveSessionId(activeSessionId),
 				);
-				// Restore the draft only if the same composer is armed and nothing new was typed.
 				const succeeded = await this.runAgentsViewCommand(viewCommand, currentSummary);
 				if (!succeeded && this.replyTarget === target && this.editor.getText().length === 0) {
 					this.editor.setText(value);
@@ -1744,8 +1739,7 @@ export class AgentsViewMode implements Component, Focusable {
 							await this.requireClient().request({ type: "kill", activeSessionId: target.activeSessionId }),
 						);
 					} catch (error) {
-						// Same tolerance as deactivatePendingAgent: the agent can finish
-						// between listing and the command; that still counts as stopped.
+						// As in deactivatePendingAgent: an agent that already finished counts as stopped.
 						if (!isUnknownActiveSessionError(error)) throw error;
 					}
 					disarmIfUnchanged();
