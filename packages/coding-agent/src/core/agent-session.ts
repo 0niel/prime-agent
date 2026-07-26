@@ -3861,8 +3861,7 @@ export class AgentSession {
 
 	/**
 	 * Merge disclosures whose session-file append failed into a rebuilt message
-	 * list by timestamp, so turns persisted after the failure stay below the
-	 * notice exactly where it appeared live.
+	 * list at their timestamp position, where they appeared live.
 	 */
 	private _mergeUnpersistedCompactionOutcomes(messages: AgentMessage[]): void {
 		for (const outcome of this._unpersistedCompactionOutcomes) {
@@ -4299,8 +4298,7 @@ export class AgentSession {
 					signal: options?.signal,
 				})
 			: undefined;
-		// The streaming path skips admission, so its commit point is here; an
-		// already-aborted prompt must not enqueue into a session the caller left.
+		// The streaming path skips admission, so this is its cancellation commit point.
 		if (!admission) throwIfPromptAdmissionCancelled(options?.signal);
 		const releaseAdmission = admission?.release ?? (() => {});
 		try {

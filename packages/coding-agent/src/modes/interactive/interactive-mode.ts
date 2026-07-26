@@ -7051,7 +7051,6 @@ export class InteractiveMode {
 			return false;
 		}
 		if (!this.options.returnToAgentsView) {
-			// Process-local sessions open the same unified view in place.
 			void this.requestAgentsView();
 			return true;
 		}
