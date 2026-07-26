@@ -539,8 +539,9 @@ describe("reply composer slash commands", () => {
 		expect(getReplyComposerCommandRejection("plain reply")).toBeUndefined();
 	});
 
-	it("blocks a rejected command in submit without clearing the editor", async () => {
-		const editor = editorWithText("/model gpt-5");
+	it("restores the draft when a command is rejected after submit cleared the buffer", async () => {
+		// submitValue empties the editor before onSubmit runs.
+		const editor = editorWithText("");
 		const setStatusMessage = vi.fn();
 		const sendReply = vi.fn();
 		const self: Record<string, unknown> = {
@@ -557,6 +558,40 @@ describe("reply composer slash commands", () => {
 			tone: "warning",
 		});
 		expect(editor.getText()).toBe("/model gpt-5");
+	});
+
+	it("does not overwrite newer typing when a rejection lands late", async () => {
+		const editor = editorWithText("newer draft");
+		const self: Record<string, unknown> = {
+			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
+			editor,
+			setStatusMessage: vi.fn(),
+			sendReply: vi.fn(),
+		};
+
+		await invoke("submit", self, "/settings");
+
+		expect(editor.getText()).toBe("newer draft");
+	});
+
+	it("binds reply autocomplete to the armed target's cwd", () => {
+		const self: Record<string, unknown> = {
+			replyTarget: undefined,
+			replyAutocomplete: undefined,
+			actionModeSearchQuery: undefined,
+			persistentState: {},
+			editor: Object.assign(editorWithText(""), { setPlaceholder: vi.fn() }),
+			replyLastAssistantText: undefined,
+			replyLastAssistantTextLoading: false,
+			replyHeaderTime: "",
+			rebuildRows: vi.fn(),
+			ui: { requestRender: vi.fn() },
+		};
+		const target = { key: "active-1", summary: summary({ activeSessionId: "active-1", cwd: "/tmp/elsewhere" }) };
+		invoke("setReplyTarget", self, target);
+		expect(self.replyAutocomplete).toBeDefined();
+		invoke("setReplyTarget", self, undefined);
+		expect(self.replyAutocomplete).toBeUndefined();
 	});
 
 	it("suggests only session-owned commands", async () => {

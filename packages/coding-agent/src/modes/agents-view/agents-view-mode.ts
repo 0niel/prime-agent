@@ -537,6 +537,8 @@ export class AgentsViewMode implements Component, Focusable {
 	private selectionAnchorPending = false;
 	/** Armed reply composer target: a live agent or a saved session to resume on send. */
 	private replyTarget: { key: string; summary: SessionSummary } | undefined;
+	/** Provider bound to the armed target's cwd for file-path completions. */
+	private replyAutocomplete: AutocompleteProvider | undefined;
 	private creatingNewSession = false;
 	private replyLastAssistantText: string | undefined;
 	private replyLastAssistantTextLoading = false;
@@ -577,14 +579,18 @@ export class AgentsViewMode implements Component, Focusable {
 			placeholder: SEARCH_PROMPT_PLACEHOLDER,
 			placeholderColor: (text) => theme.fg("dim", text),
 		});
-		const replyAutocomplete = createReplyComposerAutocompleteProvider(options.uiServices.getInitialCwd());
 		// Search mode must not autocomplete; the provider only answers while a
-		// reply target is armed.
+		// reply target is armed. Rebuilt on arming so @-paths resolve in the
+		// target session's cwd, not the view's startup directory.
 		this.editor.setAutocompleteProvider({
 			getSuggestions: async (lines, cursorLine, cursorCol, suggestOptions) =>
-				this.replyTarget ? replyAutocomplete.getSuggestions(lines, cursorLine, cursorCol, suggestOptions) : null,
+				this.replyTarget && this.replyAutocomplete
+					? this.replyAutocomplete.getSuggestions(lines, cursorLine, cursorCol, suggestOptions)
+					: null,
 			applyCompletion: (lines, cursorLine, cursorCol, item, prefix) =>
-				replyAutocomplete.applyCompletion(lines, cursorLine, cursorCol, item, prefix),
+				(
+					this.replyAutocomplete ?? createReplyComposerAutocompleteProvider(this.getSavedSessionCwd())
+				).applyCompletion(lines, cursorLine, cursorCol, item, prefix),
 		});
 		this.editor.focused = true;
 		this.editor.getHeaderLine = () => this.renderReplyHeaderLine();
@@ -1110,6 +1116,8 @@ export class AgentsViewMode implements Component, Focusable {
 			const text = value.trim();
 			const rejection = getReplyComposerCommandRejection(text);
 			if (rejection) {
+				// submitValue cleared the buffer before onSubmit; keep the draft.
+				if (this.editor.getText().length === 0) this.editor.setText(value);
 				this.setStatusMessage(rejection, { tone: "warning" });
 				return;
 			}
@@ -1350,6 +1358,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.actionModeSearchQuery = undefined;
 		}
 		this.replyTarget = target;
+		this.replyAutocomplete = target ? createReplyComposerAutocompleteProvider(target.summary.cwd) : undefined;
 		this.replyLastAssistantText = undefined;
 		this.replyLastAssistantTextLoading = false;
 		this.replyHeaderTime = target
