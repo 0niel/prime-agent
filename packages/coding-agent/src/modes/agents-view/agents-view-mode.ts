@@ -1732,13 +1732,17 @@ export class AgentsViewMode implements Component, Focusable {
 							target.sessionFile,
 							name,
 						);
-						await this.refreshSavedSessions({ preserveStatusOnError: true });
 					} else {
 						this.setStatusMessage("This session cannot be renamed", { tone: "warning" });
 						return false;
 					}
 					this.setStatusMessage(`Session renamed to ${name}`);
-					await this.refreshSessions({ preserveStatusOnError: true });
+					// Both catalogs, like confirmRename: the saved entry keeps the old
+					// name otherwise and resurfaces it once the agent is killed.
+					await Promise.all([
+						this.refreshSessions({ preserveStatusOnError: true }),
+						this.refreshSavedSessions({ preserveStatusOnError: true }),
+					]);
 					return true;
 				}
 				case "kill": {

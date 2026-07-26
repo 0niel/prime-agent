@@ -701,7 +701,7 @@ describe("agents view slash commands", () => {
 		});
 	});
 
-	it("renames a live target via the rename RPC", async () => {
+	it("renames a live target via the rename RPC and refreshes both catalogs", async () => {
 		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
 		const request = vi.fn(async () => ({ success: true, data: {} }));
 		const editor = editorWithText("/name Fresh Name");
@@ -710,12 +710,14 @@ describe("agents view slash commands", () => {
 			editor,
 			setStatusMessage: vi.fn(),
 			refreshSessions: vi.fn(async () => true),
+			refreshSavedSessions: vi.fn(async () => true),
 		};
 
 		await invoke("runAgentsViewCommand", self, { name: "name", args: "Fresh Name" }, live);
 
 		expect(request).toHaveBeenCalledWith({ type: "rename", activeSessionId: "active-1", name: "Fresh Name" });
 		expect(self.refreshSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
+		expect(self.refreshSavedSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
 	});
 
 	it("kills a live target and disarms the composer", async () => {
