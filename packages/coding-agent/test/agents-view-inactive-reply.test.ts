@@ -5,7 +5,9 @@ import { KeybindingsManager } from "../src/core/keybindings.js";
 import {
 	AgentsViewMode,
 	createReplyComposerAutocompleteProvider,
+	createSearchViewAutocompleteProvider,
 	getReplyComposerCommandRejection,
+	parseAgentsViewCommand,
 } from "../src/modes/agents-view/agents-view-mode.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 
@@ -525,5 +527,207 @@ describe("reply composer slash commands", () => {
 		expect(names).toEqual(expect.arrayContaining(["compact", "refine", "goal", "autonomous"]));
 		expect(names).not.toContain("model");
 		expect(names).not.toContain("settings");
+	});
+});
+
+describe("agents view slash commands", () => {
+	it("parses whitelisted view commands and aliases", () => {
+		expect(parseAgentsViewCommand("/new")).toEqual({ name: "new", args: "" });
+		expect(parseAgentsViewCommand("/fork")).toEqual({ name: "fork", args: "" });
+		expect(parseAgentsViewCommand("/name My Agent")).toEqual({ name: "name", args: "My Agent" });
+		expect(parseAgentsViewCommand("/rename My Agent")).toEqual({ name: "name", args: "My Agent" });
+		expect(parseAgentsViewCommand("/kill")).toEqual({ name: "kill", args: "" });
+		expect(parseAgentsViewCommand("/compact")).toBeUndefined();
+		expect(parseAgentsViewCommand("/settings")).toBeUndefined();
+		expect(parseAgentsViewCommand("plain search text")).toBeUndefined();
+	});
+
+	it("keeps view commands out of the composer rejection list", () => {
+		expect(getReplyComposerCommandRejection("/fork")).toBeUndefined();
+		expect(getReplyComposerCommandRejection("/name x")).toBeUndefined();
+		expect(getReplyComposerCommandRejection("/kill")).toBeUndefined();
+		expect(getReplyComposerCommandRejection("/new")).toBeUndefined();
+	});
+
+	it("suggests view commands in both composers and session commands only when armed", async () => {
+		const composer = createReplyComposerAutocompleteProvider(process.cwd());
+		const search = createSearchViewAutocompleteProvider(process.cwd());
+		const signal = new AbortController().signal;
+		const composerNames = (await composer.getSuggestions(["/"], 0, 1, { signal }))?.items.map((i) => i.value) ?? [];
+		const searchNames = (await search.getSuggestions(["/"], 0, 1, { signal }))?.items.map((i) => i.value) ?? [];
+		expect(composerNames).toEqual(
+			expect.arrayContaining(["compact", "refine", "goal", "autonomous", "new", "fork", "name", "kill"]),
+		);
+		expect(searchNames).toEqual(expect.arrayContaining(["new", "fork", "name", "kill"]));
+		expect(searchNames).not.toContain("compact");
+		expect(searchNames).not.toContain("settings");
+	});
+
+	it("routes a search-editor command to the selected row", async () => {
+		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
+		const runAgentsViewCommand = vi.fn(async () => {});
+		const self: Record<string, unknown> = {
+			replyTarget: undefined,
+			renameTarget: undefined,
+			options: {},
+			rows: [{ kind: "agent", selectable: true, summary: live }],
+			selectedIndex: 0,
+			runAgentsViewCommand,
+			openSelected: vi.fn(),
+		};
+
+		await invoke("submit", self, "/kill");
+
+		expect(runAgentsViewCommand).toHaveBeenCalledWith({ name: "kill", args: "" }, live);
+		expect(self.openSelected).not.toHaveBeenCalled();
+	});
+
+	it("keeps plain search text opening the selection", async () => {
+		const openSelected = vi.fn();
+		const self: Record<string, unknown> = {
+			replyTarget: undefined,
+			renameTarget: undefined,
+			options: {},
+			rows: [],
+			selectedIndex: 0,
+			runAgentsViewCommand: vi.fn(),
+			openSelected,
+		};
+
+		await invoke("submit", self, "release planner");
+
+		expect(openSelected).toHaveBeenCalledOnce();
+		expect(self.runAgentsViewCommand).not.toHaveBeenCalled();
+	});
+
+	it("runs /new without a target row", async () => {
+		const createNewSession = vi.fn(async () => {});
+		const editor = editorWithText("/new");
+		const self: Record<string, unknown> = { createNewSession, editor };
+
+		await invoke("runAgentsViewCommand", self, { name: "new", args: "" }, undefined);
+
+		expect(createNewSession).toHaveBeenCalledOnce();
+		expect(editor.getText()).toBe("");
+	});
+
+	it("requires a selected row for row-targeted commands", async () => {
+		const setStatusMessage = vi.fn();
+		const self: Record<string, unknown> = { setStatusMessage, createNewSession: vi.fn() };
+
+		await invoke("runAgentsViewCommand", self, { name: "kill", args: "" }, undefined);
+
+		expect(setStatusMessage).toHaveBeenCalledWith(expect.stringContaining("Select an agent row"), {
+			tone: "warning",
+		});
+	});
+
+	it("renames a live target via the rename RPC", async () => {
+		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
+		const request = vi.fn(async () => ({ success: true, data: {} }));
+		const editor = editorWithText("/name Fresh Name");
+		const self: Record<string, unknown> = {
+			requireClient: () => ({ request }),
+			editor,
+			setStatusMessage: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+		};
+
+		await invoke("runAgentsViewCommand", self, { name: "name", args: "Fresh Name" }, live);
+
+		expect(request).toHaveBeenCalledWith({ type: "rename", activeSessionId: "active-1", name: "Fresh Name" });
+		expect(self.refreshSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
+	});
+
+	it("kills a live target and disarms the composer", async () => {
+		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
+		const request = vi.fn(async () => ({ success: true, data: {} }));
+		const setReplyTarget = vi.fn();
+		const self: Record<string, unknown> = {
+			requireClient: () => ({ request }),
+			editor: editorWithText("/kill"),
+			setStatusMessage: vi.fn(),
+			setReplyTarget,
+			replyTarget: { key: "active-1", summary: live },
+			refreshSessions: vi.fn(async () => true),
+		};
+
+		await invoke("runAgentsViewCommand", self, { name: "kill", args: "" }, live);
+
+		expect(request).toHaveBeenCalledWith({ type: "kill", activeSessionId: "active-1" });
+		expect(setReplyTarget).toHaveBeenCalledWith(undefined);
+	});
+
+	it("refuses /kill on an inactive row", async () => {
+		const saved = summary({ sessionFile: "/tmp/sessions/saved-1.jsonl" });
+		const request = vi.fn();
+		const setStatusMessage = vi.fn();
+		const self: Record<string, unknown> = {
+			requireClient: () => ({ request }),
+			editor: editorWithText("/kill"),
+			setStatusMessage,
+		};
+
+		await invoke("runAgentsViewCommand", self, { name: "kill", args: "" }, saved);
+
+		expect(request).not.toHaveBeenCalled();
+		expect(setStatusMessage).toHaveBeenCalledWith(expect.stringContaining("inactive"), { tone: "warning" });
+	});
+
+	it("forks a live target at its current leaf", async () => {
+		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
+		const requests: { type: string }[] = [];
+		const request = vi.fn(async (command: { type: string }) => {
+			requests.push(command);
+			if (command.type === "get_session_tree") return { success: true, data: { tree: [], leafId: "leaf-9" } };
+			return { success: true, data: { cancelled: false } };
+		});
+		const self: Record<string, unknown> = {
+			requireClient: () => ({ request }),
+			editor: editorWithText("/fork"),
+			setStatusMessage: vi.fn(),
+			replyTarget: undefined,
+			refreshSessions: vi.fn(async () => true),
+		};
+
+		await invoke("forkTargetSession", self, live);
+
+		expect(requests.map((r) => r.type)).toEqual(["get_session_tree", "fork"]);
+		expect(request).toHaveBeenCalledWith({
+			type: "fork",
+			activeSessionId: "active-1",
+			entryId: "leaf-9",
+			position: "at",
+		});
+	});
+
+	it("resumes a saved row before forking it", async () => {
+		const saved = summary({ sessionFile: "/tmp/sessions/saved-1.jsonl", cwd: process.cwd() });
+		const requests: { type: string }[] = [];
+		const request = vi.fn(async (command: { type: string }) => {
+			requests.push(command);
+			if (command.type === "create") {
+				return { success: true, data: { ...saved, lifecycle: "live", activeSessionId: "active-9" } };
+			}
+			if (command.type === "get_session_tree") return { success: true, data: { tree: [], leafId: "leaf-1" } };
+			return { success: true, data: { cancelled: false } };
+		});
+		const self: Record<string, unknown> = {
+			options: { config: { cwd: process.cwd() } },
+			requireClient: () => ({ request }),
+			editor: editorWithText("/fork"),
+			setStatusMessage: vi.fn(),
+			replyTarget: undefined,
+			inactiveAgentIdentities: new Set(["file:/tmp/sessions/saved-1.jsonl"]),
+			refreshSessions: vi.fn(async () => true),
+		};
+
+		await invoke("forkTargetSession", self, saved);
+
+		expect(requests.map((r) => r.type)).toEqual(["create", "get_session_tree", "fork"]);
+		expect(request).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "fork", activeSessionId: "active-9", entryId: "leaf-1" }),
+		);
+		expect(self.inactiveAgentIdentities).not.toContain("file:/tmp/sessions/saved-1.jsonl");
 	});
 });

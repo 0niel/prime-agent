@@ -444,21 +444,67 @@ export async function runAgentsViewMode(options: Omit<AgentsViewModeOptions, "ad
 	}
 }
 
+const AGENTS_VIEW_COMMAND_NAMES = ["new", "fork", "name", "kill"] as const;
+export type AgentsViewCommandName = (typeof AGENTS_VIEW_COMMAND_NAMES)[number];
+const AGENTS_VIEW_COMMAND_NAME_SET: ReadonlySet<string> = new Set(AGENTS_VIEW_COMMAND_NAMES);
+
+export interface AgentsViewCommand {
+	name: AgentsViewCommandName;
+	args: string;
+}
+
+/** Row-targeted commands the view maps onto existing RPCs; /new needs no row. */
+export function parseAgentsViewCommand(text: string): AgentsViewCommand | undefined {
+	const parsed = parseSlashCommand(text);
+	if (!parsed) return undefined;
+	const name = resolveBuiltinSlashCommandName(parsed.name);
+	if (!AGENTS_VIEW_COMMAND_NAME_SET.has(name)) return undefined;
+	return { name: name as AgentsViewCommandName, args: parsed.args };
+}
+
 /**
- * The reply composer delivers text through the daemon prompt path, which only
- * executes session-owned slash commands. Reject other recognized built-ins
- * instead of sending them to the model as plain text.
+ * Reject recognized built-ins that are neither session-owned nor view
+ * commands, so they are never sent to the model as plain prompt text.
  */
 export function getReplyComposerCommandRejection(text: string): string | undefined {
 	const parsed = parseSlashCommand(text);
 	if (!parsed) return undefined;
 	const name = resolveBuiltinSlashCommandName(parsed.name);
 	if (isSessionSlashCommandName(name)) return undefined;
+	if (AGENTS_VIEW_COMMAND_NAME_SET.has(name)) return undefined;
 	if (!isBuiltinSlashCommandName(parsed.name)) return undefined;
 	return `/${parsed.name} is not available here; open the session to run it`;
 }
 
-/** Autocomplete for the reply composer: session-owned slash commands only. */
+const AGENTS_VIEW_COMMAND_DESCRIPTIONS: Record<AgentsViewCommandName, { description: string; argumentHint?: string }> =
+	{
+		new: { description: "Start a new session" },
+		fork: { description: "Fork this session from a previous user message" },
+		name: { description: "Set session display name", argumentHint: "<name>" },
+		kill: { description: "Stop this agent's runtime (session stays resumable)" },
+	};
+
+function agentsViewSlashCommands(): {
+	name: string;
+	aliases?: readonly string[];
+	description: string;
+	argumentHint?: string;
+	takesArgument?: boolean;
+}[] {
+	return AGENTS_VIEW_COMMAND_NAMES.map((name) => {
+		const builtin = BUILTIN_SLASH_COMMANDS.find((command) => command.name === name);
+		const display = AGENTS_VIEW_COMMAND_DESCRIPTIONS[name];
+		return {
+			name,
+			aliases: builtin?.aliases,
+			description: display.description,
+			argumentHint: display.argumentHint ?? builtin?.argumentHint,
+			takesArgument: name === "name" ? true : builtin?.takesArgument,
+		};
+	});
+}
+
+/** Autocomplete for the reply composer: session-owned plus view commands. */
 export function createReplyComposerAutocompleteProvider(cwd: string): AutocompleteProvider {
 	const sessionCommands = BUILTIN_SLASH_COMMANDS.filter((command) => isSessionSlashCommandName(command.name)).map(
 		(command) => ({
@@ -469,7 +515,12 @@ export function createReplyComposerAutocompleteProvider(cwd: string): Autocomple
 			takesArgument: command.takesArgument,
 		}),
 	);
-	return new CombinedAutocompleteProvider(sessionCommands, cwd);
+	return new CombinedAutocompleteProvider([...sessionCommands, ...agentsViewSlashCommands()], cwd);
+}
+
+/** Autocomplete for the search editor: view commands only, once "/" is typed. */
+export function createSearchViewAutocompleteProvider(cwd: string): AutocompleteProvider {
+	return new CombinedAutocompleteProvider(agentsViewSlashCommands(), cwd);
 }
 
 export function resolveCurrentReplyTargetSummary(
@@ -578,13 +629,22 @@ export class AgentsViewMode implements Component, Focusable {
 			placeholderColor: (text) => theme.fg("dim", text),
 		});
 		const replyAutocomplete = createReplyComposerAutocompleteProvider(options.uiServices.getInitialCwd());
-		// Search mode must not autocomplete; the provider only answers while a
-		// reply target is armed.
+		const searchAutocomplete = createSearchViewAutocompleteProvider(options.uiServices.getInitialCwd());
+		// Search text stays a query; only slash-prefixed input offers view commands.
 		this.editor.setAutocompleteProvider({
-			getSuggestions: async (lines, cursorLine, cursorCol, suggestOptions) =>
-				this.replyTarget ? replyAutocomplete.getSuggestions(lines, cursorLine, cursorCol, suggestOptions) : null,
+			getSuggestions: async (lines, cursorLine, cursorCol, suggestOptions) => {
+				if (this.replyTarget) return replyAutocomplete.getSuggestions(lines, cursorLine, cursorCol, suggestOptions);
+				if (this.renameTarget || !this.editor.getText().startsWith("/")) return null;
+				return searchAutocomplete.getSuggestions(lines, cursorLine, cursorCol, suggestOptions);
+			},
 			applyCompletion: (lines, cursorLine, cursorCol, item, prefix) =>
-				replyAutocomplete.applyCompletion(lines, cursorLine, cursorCol, item, prefix),
+				(this.replyTarget ? replyAutocomplete : searchAutocomplete).applyCompletion(
+					lines,
+					cursorLine,
+					cursorCol,
+					item,
+					prefix,
+				),
 		});
 		this.editor.focused = true;
 		this.editor.getHeaderLine = () => this.renderReplyHeaderLine();
@@ -1108,6 +1168,11 @@ export class AgentsViewMode implements Component, Focusable {
 		if (this.replyTarget) {
 			const target = this.replyTarget;
 			const text = value.trim();
+			const viewCommand = parseAgentsViewCommand(text);
+			if (viewCommand) {
+				await this.runAgentsViewCommand(viewCommand, target.summary);
+				return;
+			}
 			const rejection = getReplyComposerCommandRejection(text);
 			if (rejection) {
 				this.setStatusMessage(rejection, { tone: "warning" });
@@ -1128,8 +1193,15 @@ export class AgentsViewMode implements Component, Focusable {
 			}
 			return;
 		}
-		// The normal editor is search-only: Enter opens the selection and never
-		// interprets text as a command or a prompt for a new agent.
+		// The search editor never treats text as a prompt; a recognized view
+		// command acts on the selected row, anything else opens the selection.
+		const viewCommand = parseAgentsViewCommand(value.trim());
+		if (viewCommand && !this.options.adapter) {
+			const row = this.rows[this.selectedIndex];
+			const target = row?.kind === "agent" && row.selectable ? row.summary : undefined;
+			await this.runAgentsViewCommand(viewCommand, target);
+			return;
+		}
 		this.openSelected();
 	}
 
@@ -1538,6 +1610,110 @@ export class AgentsViewMode implements Component, Focusable {
 		} finally {
 			this.creatingNewSession = false;
 		}
+	}
+
+	/** Run a whitelisted view command against a target row (or none for /new). */
+	private async runAgentsViewCommand(command: AgentsViewCommand, target: SessionSummary | undefined): Promise<void> {
+		if (command.name === "new") {
+			this.editor.setText("");
+			await this.createNewSession();
+			return;
+		}
+		if (!target) {
+			this.setStatusMessage(`Select an agent row to use /${command.name}`, { tone: "warning" });
+			return;
+		}
+		try {
+			switch (command.name) {
+				case "name": {
+					const name = command.args.trim();
+					if (!name) {
+						this.setStatusMessage("Usage: /name <session name>", { tone: "warning" });
+						return;
+					}
+					if (target.activeSessionId) {
+						requireDaemonData(
+							await this.requireClient().request({
+								type: "rename",
+								activeSessionId: target.activeSessionId,
+								name,
+							}),
+						);
+					} else if (target.sessionFile) {
+						await renameDaemonSavedSession(
+							this.requireClient(),
+							this.getSavedSessionCatalogContext(),
+							target.sessionFile,
+							name,
+						);
+						await this.refreshSavedSessions({ preserveStatusOnError: true });
+					} else {
+						this.setStatusMessage("This session cannot be renamed", { tone: "warning" });
+						return;
+					}
+					this.editor.setText("");
+					this.setStatusMessage(`Session renamed to ${name}`);
+					await this.refreshSessions({ preserveStatusOnError: true });
+					return;
+				}
+				case "kill": {
+					if (!target.activeSessionId) {
+						this.setStatusMessage("/kill needs a running agent; this session is inactive", { tone: "warning" });
+						return;
+					}
+					requireDaemonData(
+						await this.requireClient().request({ type: "kill", activeSessionId: target.activeSessionId }),
+					);
+					this.editor.setText("");
+					if (this.replyTarget) this.setReplyTarget(undefined);
+					this.setStatusMessage("Agent stopped");
+					await this.refreshSessions({ preserveStatusOnError: true });
+					return;
+				}
+				case "fork": {
+					await this.forkTargetSession(target);
+					return;
+				}
+			}
+		} catch (error) {
+			this.setStatusMessage(formatError(`Failed to run /${command.name}`, error));
+		}
+	}
+
+	/**
+	 * Fork the target session at its current leaf. The daemon fork RPC rebinds
+	 * the running agent onto the forked file (in-session semantics); the
+	 * pre-fork history stays on disk as an inactive session. Saved rows are
+	 * resumed first so the same RPC applies.
+	 */
+	private async forkTargetSession(target: SessionSummary): Promise<void> {
+		let activeSessionId = target.activeSessionId;
+		if (!activeSessionId) {
+			this.setStatusMessage("Resuming session...");
+			const resumed = await resumeSavedAgentsViewSession(this.requireClient(), this.options.config, target);
+			activeSessionId = resumed.activeSessionId;
+			this.inactiveAgentIdentities.delete(getSummaryIdentity(target));
+		}
+		const treeData = requireDaemonData(
+			await this.requireClient().request({ type: "get_session_tree", activeSessionId }),
+		) as { leafId: string | null };
+		if (!treeData.leafId) {
+			this.setStatusMessage("Nothing to fork yet", { tone: "warning" });
+			return;
+		}
+		this.setStatusMessage("Forking session...");
+		requireDaemonData(
+			await this.requireClient().request({
+				type: "fork",
+				activeSessionId,
+				entryId: treeData.leafId,
+				position: "at",
+			}),
+		);
+		this.editor.setText("");
+		if (this.replyTarget) this.setReplyTarget(undefined);
+		this.setStatusMessage("Forked to a new session; previous history stays available as inactive");
+		await this.refreshSessions({ preserveStatusOnError: true });
 	}
 
 	/** Point selection (and its persisted key) at a freshly resumed session row. */
@@ -2324,6 +2500,7 @@ export class AgentsViewMode implements Component, Focusable {
 			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
 			`${keyText("tui.select.confirm")} open`,
 			`${keyText("app.agents.open")} open`,
+			!this.options.adapter ? "/ commands" : undefined,
 			selectedAgent && !this.options.adapter
 				? `${keyText("app.agents.reply")} ${selectedRow?.section === "inactive" ? "resume" : "reply"}`
 				: undefined,

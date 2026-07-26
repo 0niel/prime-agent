@@ -5,6 +5,7 @@
 - Added starting a new session directly from the agents view with `ctrl+n`.
 - Added queueing a reply as a follow-up with `alt+enter` in the agents-view reply composer; plain Enter now steers a streaming agent.
 - Added session-owned slash commands (`/compact`, `/refine`, `/goal`, `/autonomous`) with autocomplete to the agents-view reply composer; other built-in commands are rejected with guidance instead of being sent as prompt text.
+- Added `/new`, `/fork`, `/name`, and `/kill` view commands to the agents view, usable from the search editor on the selected row and from the armed reply composer on its target.
 - Fixed `prime-agent agents` opening a new chat when running with a process-local session.
 - Fixed daemon startup failing when an interrupted supervisor left an empty ownership directory.
 
