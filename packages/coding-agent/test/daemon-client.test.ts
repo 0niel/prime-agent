@@ -254,9 +254,15 @@ describe("DaemonClient", () => {
 			DAEMON_SCHEMA_REVISION + 1,
 		);
 
-		void client.request({ type: "prompt", activeSessionId: "active-1", message: "hello", admissionId: "a-1" });
+		const request = client.request({
+			type: "prompt",
+			activeSessionId: "active-1",
+			message: "hello",
+			admissionId: "a-1",
+		});
 		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
 		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
 	});
 
 	it("isolates a message consumer failure from the rest of the client", async () => {
@@ -809,6 +815,43 @@ describe("DaemonClient", () => {
 		);
 
 		await expect(response).resolves.toMatchObject({ id: firstEnvelope.id, success: true });
+		client.close();
+	});
+
+	it("rejects a pending admission-gated prompt when the reconnected daemon is downgraded", async () => {
+		vi.useFakeTimers();
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		client.enableRequestRecovery();
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(
+			firstSocket,
+			DAEMON_PROTOCOL_VERSION,
+			["session_input_admission", "prompt_admission_cancellation"],
+			DAEMON_SCHEMA_REVISION,
+		);
+
+		const response = client.request({
+			type: "prompt",
+			activeSessionId: "active-1",
+			message: "hello",
+			admissionId: "a-1",
+		});
+		expect(firstSocket.writes).toHaveLength(1);
+		firstSocket.emit("close");
+
+		const secondConnect = client.connect();
+		const secondSocket = netMock.sockets[1]!;
+		secondSocket.emit("connect");
+		await secondConnect;
+		// The replacement daemon no longer supports admission cancellation, so
+		// replaying would silently drop admissionId and take ownership.
+		emitHello(secondSocket, DAEMON_PROTOCOL_VERSION, ["session_input_admission"], DAEMON_SCHEMA_REVISION);
+
+		await expect(response).rejects.toThrow("does not support prompt_admission_cancellation");
+		expect(secondSocket.writes).toEqual([]);
 		client.close();
 	});
 
