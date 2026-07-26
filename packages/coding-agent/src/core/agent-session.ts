@@ -3860,8 +3860,7 @@ export class AgentSession {
 
 	/**
 	 * Merge disclosures whose session-file append failed into a rebuilt message
-	 * list by timestamp, so turns persisted after the failure stay below the
-	 * notice exactly where it appeared live.
+	 * list at their timestamp position, where they appeared live.
 	 */
 	private _mergeUnpersistedCompactionOutcomes(messages: AgentMessage[]): void {
 		for (const outcome of this._unpersistedCompactionOutcomes) {

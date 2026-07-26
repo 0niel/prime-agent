@@ -1122,9 +1122,7 @@ describe("AgentSession compaction characterization", () => {
 			content: expect.stringContaining("could not be saved to session history"),
 		});
 
-		// A turn persisted after the failure sorts below the disclosure on rebuild,
-		// matching where the notice appeared live. Cross a millisecond boundary so
-		// the later turn's timestamp is strictly newer.
+		// Cross a millisecond boundary so the later turn's timestamp is strictly newer.
 		await new Promise((resolve) => setTimeout(resolve, 5));
 		harness.setResponses([fauxAssistantMessage("later response")]);
 		await harness.session.prompt("later turn");
@@ -1167,8 +1165,8 @@ describe("AgentSession compaction characterization", () => {
 		});
 		internals._persistCompactionOutcome("requested", "failed", "Requested compaction failed");
 
-		// A later successful compaction reloads agent.state.messages from the
-		// session file; the disclosure only exists in memory and must survive.
+		// Compaction reloads agent.state.messages from the session file; the
+		// memory-only disclosure must survive.
 		await harness.session.compact();
 
 		expect(harness.session.messages).toContainEqual(
