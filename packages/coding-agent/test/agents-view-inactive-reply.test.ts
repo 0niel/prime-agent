@@ -335,25 +335,34 @@ describe("agents view reply on inactive sessions", () => {
 		expect(self.sendPrompt).not.toHaveBeenCalledWith("active-dead", expect.anything(), expect.anything());
 	});
 
-	it("steers on plain submit and queues a follow-up on Alt+Enter delivery", async () => {
-		const liveSummary = summary({ activeSessionId: "active-1", lifecycle: "live", isStreaming: true });
+	it("replies to live sessions without resuming, steering or queueing per delivery", async () => {
+		let liveSummary = summary({ activeSessionId: "active-1", lifecycle: "live" });
+		const request = vi.fn();
 		const self: Record<string, unknown> = {
 			options: { config: {} },
-			requireClient: () => ({ request: vi.fn() }),
+			requireClient: () => ({ request }),
 			findSummaryByActiveSessionId: () => liveSummary,
 			setStatusMessage: vi.fn(),
 			selectSummary: vi.fn(),
 			sendPrompt: vi.fn(async () => {}),
 		};
+		const target = () => ({ key: "active-1", summary: liveSummary });
 
-		await invoke("sendReply", self, { key: "active-1", summary: liveSummary }, "change course");
+		await invoke("sendReply", self, target(), "hello");
+		expect(self.sendPrompt).toHaveBeenCalledWith("active-1", "hello", undefined);
+
+		liveSummary = summary({ activeSessionId: "active-1", lifecycle: "live", isStreaming: true });
+		await invoke("sendReply", self, target(), "change course");
 		expect(self.sendPrompt).toHaveBeenCalledWith("active-1", "change course", "steer");
 
-		await invoke("sendReply", self, { key: "active-1", summary: liveSummary }, "later please", "followUp");
+		await invoke("sendReply", self, target(), "later please", "followUp");
 		expect(self.sendPrompt).toHaveBeenCalledWith("active-1", "later please", "followUp");
+
+		expect(request).not.toHaveBeenCalled();
+		expect(self.selectSummary).not.toHaveBeenCalled();
 	});
 
-	it("ignores the follow-up keybinding without an armed target or text", () => {
+	it("alt+enter submits expanded text as followUp, only with an armed target and text", () => {
 		const submit = vi.fn(async () => {});
 		invoke("handleReplyFollowUp", { replyTarget: undefined, editor: { getExpandedText: () => "text" }, submit });
 		invoke("handleReplyFollowUp", {
@@ -362,27 +371,13 @@ describe("agents view reply on inactive sessions", () => {
 			submit,
 		});
 		expect(submit).not.toHaveBeenCalled();
-	});
 
-	it("replies to live sessions without resuming", async () => {
-		const liveSummary = summary({ activeSessionId: "active-1", lifecycle: "live" });
-		const request = vi.fn();
-		const self: Record<string, unknown> = {
-			options: { config: {} },
-			requireClient: () => ({ request }),
-			findSummaryByActiveSessionId: () => liveSummary,
-			setStatusMessage: vi.fn(),
-			setReplyTarget: vi.fn(),
-			refreshSessions: vi.fn(async () => true),
-			selectSummary: vi.fn(),
-			sendPrompt: vi.fn(async () => {}),
-		};
-
-		await invoke("sendReply", self, { key: "active-1", summary: liveSummary }, "hello");
-
-		expect(request).not.toHaveBeenCalled();
-		expect(self.sendPrompt).toHaveBeenCalledWith("active-1", "hello", undefined);
-		expect(self.selectSummary).not.toHaveBeenCalled();
+		invoke("handleReplyFollowUp", {
+			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
+			editor: { getExpandedText: () => "expanded paste body" },
+			submit,
+		});
+		expect(submit).toHaveBeenCalledWith("expanded paste body", "followUp");
 	});
 
 	it("creates a new daemon session over a dedicated connection and opens it", async () => {
@@ -433,19 +428,6 @@ describe("agents view reply on inactive sessions", () => {
 		expect(requests.map((r) => r.type)).toEqual(["create", "kill"]);
 		expect(self.finish).not.toHaveBeenCalled();
 		expect(self.selectSummary).not.toHaveBeenCalled();
-	});
-
-	it("submits the expanded editor text with followUp delivery on alt+enter", () => {
-		const submit = vi.fn(async () => {});
-		const self = {
-			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
-			editor: { getExpandedText: () => "expanded paste body" },
-			submit,
-		};
-
-		invoke("handleReplyFollowUp", self);
-
-		expect(submit).toHaveBeenCalledWith("expanded paste body", "followUp");
 	});
 
 	it("reports create failures and resets the guard", async () => {
