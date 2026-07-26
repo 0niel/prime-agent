@@ -723,22 +723,28 @@ describe("agents view slash commands", () => {
 		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
 		const request = vi.fn(async () => ({ success: true, data: {} }));
 		const editor = editorWithText("/name Fresh Name");
-		const refreshSelf = {
-			refreshSessions: vi.fn(async () => true),
-			refreshSavedSessions: vi.fn(async () => true),
-		};
 		const self: Record<string, unknown> = {
+			options: {},
 			requireClient: () => ({ request }),
 			editor,
 			setStatusMessage: vi.fn(),
-			refreshBothCatalogs: () => invoke("refreshBothCatalogs", refreshSelf),
+			refreshSessions: vi.fn(async () => true),
+			refreshSavedSessions: vi.fn(async () => true),
+			renameSession(s: unknown, n: string) {
+				return invoke("renameSession", self, s, n);
+			},
+			refreshBothCatalogs() {
+				return invoke("refreshBothCatalogs", self);
+			},
 		};
 
-		await invoke("runAgentsViewCommand", self, { name: "name", args: "Fresh Name" }, live);
+		await expect(invoke("runAgentsViewCommand", self, { name: "name", args: "Fresh Name" }, live)).resolves.toBe(
+			true,
+		);
 
 		expect(request).toHaveBeenCalledWith({ type: "rename", activeSessionId: "active-1", name: "Fresh Name" });
-		expect(refreshSelf.refreshSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
-		expect(refreshSelf.refreshSavedSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
+		expect(self.refreshSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
+		expect(self.refreshSavedSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
 	});
 
 	it("kills a live target and disarms the composer", async () => {

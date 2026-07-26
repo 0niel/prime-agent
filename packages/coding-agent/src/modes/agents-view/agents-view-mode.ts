@@ -1548,30 +1548,40 @@ export class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		this.exitRenameMode();
+		await this.renameSession(target.summary, name);
+	}
+
+	/** Shared by rename mode and /name: rename, refresh both catalogs, report. */
+	private async renameSession(summary: SessionSummary, name: string): Promise<boolean> {
 		this.setStatusMessage("Renaming agent...");
 		try {
 			if (this.options.adapter) {
-				await this.options.adapter.rename(target.summary, name);
-			} else if (target.activeSessionId) {
+				await this.options.adapter.rename(summary, name);
+			} else if (summary.activeSessionId) {
 				requireDaemonData(
-					await this.requireClient().request({ type: "rename", activeSessionId: target.activeSessionId, name }),
+					await this.requireClient().request({ type: "rename", activeSessionId: summary.activeSessionId, name }),
 				);
-			} else if (target.sessionFile) {
+			} else if (summary.sessionFile) {
 				await renameDaemonSavedSession(
 					this.requireClient(),
 					this.getSavedSessionCatalogContext(),
-					target.sessionFile,
+					summary.sessionFile,
 					name,
 				);
+			} else {
+				this.setStatusMessage("This session cannot be renamed", { tone: "warning" });
+				return false;
 			}
 			const refreshed = await this.refreshBothCatalogs();
 			this.setStatusMessage(refreshed ? `Renamed to ${name}` : `Renamed to ${name}; refresh failed`);
+			return true;
 		} catch (error) {
 			this.setStatusMessage(
 				isUnknownDaemonCommandError(error, "rename")
 					? "Failed to rename: the daemon is running an older build; restart the daemon and try again"
 					: formatError("Failed to rename agent", error),
 			);
+			return false;
 		}
 	}
 
@@ -1722,28 +1732,7 @@ export class AgentsViewMode implements Component, Focusable {
 						this.setStatusMessage("Usage: /name <session name>", { tone: "warning" });
 						return false;
 					}
-					if (target.activeSessionId) {
-						requireDaemonData(
-							await this.requireClient().request({
-								type: "rename",
-								activeSessionId: target.activeSessionId,
-								name,
-							}),
-						);
-					} else if (target.sessionFile) {
-						await renameDaemonSavedSession(
-							this.requireClient(),
-							this.getSavedSessionCatalogContext(),
-							target.sessionFile,
-							name,
-						);
-					} else {
-						this.setStatusMessage("This session cannot be renamed", { tone: "warning" });
-						return false;
-					}
-					this.setStatusMessage(`Session renamed to ${name}`);
-					await this.refreshBothCatalogs();
-					return true;
+					return await this.renameSession(target, name);
 				}
 				case "kill": {
 					if (!target.activeSessionId) {
