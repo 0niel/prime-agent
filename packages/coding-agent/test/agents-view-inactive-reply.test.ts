@@ -666,8 +666,10 @@ describe("agents view slash commands", () => {
 			replyTarget: undefined,
 			renameTarget: undefined,
 			options: {},
+			persistentState: { query: "/kill" },
 			rows: [{ kind: "agent", selectable: true, summary: live }],
 			selectedIndex: 0,
+			editor: editorWithText(""),
 			runAgentsViewCommand,
 			openSelected: vi.fn(),
 		};
@@ -680,20 +682,28 @@ describe("agents view slash commands", () => {
 
 	it("restores the search-editor command when it fails", async () => {
 		const editor = editorWithText("");
+		const persistentState: Record<string, unknown> = { query: "/kill" };
 		const self: Record<string, unknown> = {
 			replyTarget: undefined,
 			renameTarget: undefined,
 			options: {},
+			persistentState,
 			rows: [],
 			selectedIndex: 0,
 			editor,
+			setSearchQuery(query: string) {
+				editor.setText(query);
+				persistentState.query = query;
+			},
 			runAgentsViewCommand: vi.fn(async () => false),
 			openSelected: vi.fn(),
 		};
 
 		await invoke("submit", self, "/kill");
 
+		// The draft comes back through the query path so persistence agrees.
 		expect(editor.getText()).toBe("/kill");
+		expect(persistentState.query).toBe("/kill");
 	});
 
 	it("keeps plain search text opening the selection", async () => {
@@ -862,6 +872,27 @@ describe("agents view slash commands", () => {
 		expect(requests.map((r) => r.type)).toEqual(["create", "get_session_tree", "kill"]);
 		expect(inactiveAgentIdentities.has("file:/tmp/sessions/saved-1.jsonl")).toBe(true);
 		expect(self.refreshSessions).toHaveBeenCalledWith({ preserveStatusOnError: true });
+	});
+
+	it("drops a submitted view command from the persisted query", async () => {
+		const live = summary({ activeSessionId: "active-1", lifecycle: "live" });
+		const persistentState: Record<string, unknown> = { query: "/kill" };
+		const self: Record<string, unknown> = {
+			replyTarget: undefined,
+			renameTarget: undefined,
+			options: {},
+			persistentState,
+			rows: [{ kind: "agent", selectable: true, summary: live }],
+			selectedIndex: 0,
+			editor: editorWithText(""),
+			runAgentsViewCommand: vi.fn(async () => true),
+		};
+
+		await invoke("submit", self, "/kill");
+
+		// A remount restores persistentState.query; it must not resurrect the
+		// command where Enter could re-run it on an arbitrary row.
+		expect(persistentState.query).toBe("");
 	});
 
 	it("freezes the session filter while a view command is typed", () => {

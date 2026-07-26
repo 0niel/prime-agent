@@ -1238,11 +1238,14 @@ export class AgentsViewMode implements Component, Focusable {
 		// command acts on the selected row, anything else opens the selection.
 		const viewCommand = parseAgentsViewCommand(value.trim());
 		if (viewCommand && !this.options.adapter) {
+			// submitValue cleared the editor without queryChanged; drop the command
+			// from the persisted query so a remount cannot restore and re-run it.
+			this.persistentState.query = "";
 			const row = this.rows[this.selectedIndex];
 			const target = row?.kind === "agent" && row.selectable ? row.summary : undefined;
 			const succeeded = await this.runAgentsViewCommand(viewCommand, target);
 			if (!succeeded && !this.replyTarget && this.editor.getText().length === 0) {
-				this.editor.setText(value);
+				this.setSearchQuery(value);
 			}
 			return;
 		}
