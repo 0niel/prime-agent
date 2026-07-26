@@ -1443,8 +1443,7 @@ describe("agentLoop with AgentMessage", () => {
 				convertToLlm: identityConverter,
 				shouldStopBeforeTurn: () => stopRequested,
 				getSteeringMessages: async () => {
-					// Only the post-tool-batch poll flips the stop; flipping on the
-					// pre-loop poll would stop before the recheck under test runs.
+					// Flip only on the post-tool-batch poll; the pre-loop poll would stop before the recheck runs.
 					if (llmCalls > 0) stopRequested = true;
 					return [];
 				},
