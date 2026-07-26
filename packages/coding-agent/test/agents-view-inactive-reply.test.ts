@@ -367,7 +367,7 @@ describe("agents view reply on inactive sessions", () => {
 		const submit = vi.fn(async () => {});
 		const self = {
 			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
-			editor: { getText: () => "queued reply" },
+			editor: { getExpandedText: () => "queued reply" },
 			submit,
 		};
 
@@ -378,10 +378,10 @@ describe("agents view reply on inactive sessions", () => {
 
 	it("ignores the follow-up keybinding without an armed target or text", () => {
 		const submit = vi.fn(async () => {});
-		invoke("handleReplyFollowUp", { replyTarget: undefined, editor: { getText: () => "text" }, submit });
+		invoke("handleReplyFollowUp", { replyTarget: undefined, editor: { getExpandedText: () => "text" }, submit });
 		invoke("handleReplyFollowUp", {
 			replyTarget: { key: "a", summary: summary({}) },
-			editor: { getText: () => "   " },
+			editor: { getExpandedText: () => "   " },
 			submit,
 		});
 		expect(submit).not.toHaveBeenCalled();
@@ -426,6 +426,47 @@ describe("agents view reply on inactive sessions", () => {
 		expect(request).toHaveBeenCalledWith(expect.objectContaining({ type: "create" }));
 		expect(self.selectSummary).toHaveBeenCalledWith(created);
 		expect(finish).toHaveBeenCalledWith({ type: "open", summary: created });
+	});
+
+	it("kills a session created after the view already finished", async () => {
+		const created = summary({ id: "active-new", activeSessionId: "active-new", lifecycle: "live" });
+		const requests: { type: string }[] = [];
+		const self: Record<string, unknown> = {
+			creatingNewSession: false,
+			stopped: false,
+			options: { config: {} },
+			requireClient: () => ({
+				isConnected: true,
+				request: vi.fn(async (command: { type: string }) => {
+					requests.push(command);
+					// The view finishes while create is in flight.
+					self.stopped = true;
+					return { success: true, data: created };
+				}),
+			}),
+			setStatusMessage: vi.fn(),
+			selectSummary: vi.fn(),
+			finish: vi.fn(),
+		};
+
+		await invoke("createNewSession", self);
+
+		expect(requests.map((r) => r.type)).toEqual(["create", "kill"]);
+		expect(self.finish).not.toHaveBeenCalled();
+		expect(self.selectSummary).not.toHaveBeenCalled();
+	});
+
+	it("expands paste markers for the alt+enter follow-up path", () => {
+		const submit = vi.fn(async () => {});
+		const self = {
+			replyTarget: { key: "active-1", summary: summary({ activeSessionId: "active-1" }) },
+			editor: { getExpandedText: () => "expanded paste body" },
+			submit,
+		};
+
+		invoke("handleReplyFollowUp", self);
+
+		expect(submit).toHaveBeenCalledWith("expanded paste body", "followUp");
 	});
 
 	it("reports a create failure without leaving the view", async () => {

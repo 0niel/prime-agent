@@ -673,7 +673,7 @@ export class AgentsViewMode implements Component, Focusable {
 			void this.toggleReplyTarget();
 			return;
 		}
-		if (!this.options.adapter && this.keybindings.matches(data, "app.agents.new")) {
+		if (!this.options.adapter && !this.replyTarget && this.keybindings.matches(data, "app.agents.new")) {
 			void this.createNewSession();
 			return;
 		}
@@ -1085,7 +1085,8 @@ export class AgentsViewMode implements Component, Focusable {
 	/** Alt+Enter in the reply composer queues the reply as a follow-up. */
 	private handleReplyFollowUp(): void {
 		if (!this.replyTarget) return;
-		const text = this.editor.getText();
+		// Unlike Enter, this path skips submitValue, so expand paste markers here.
+		const text = this.editor.getExpandedText();
 		if (!text.trim()) return;
 		void this.submit(text, "followUp");
 	}
@@ -1470,20 +1471,29 @@ export class AgentsViewMode implements Component, Focusable {
 
 	/** Create a fresh daemon session and open it in the chat view. */
 	private async createNewSession(): Promise<void> {
-		if (this.creatingNewSession) return;
+		if (this.creatingNewSession || this.stopped) return;
 		this.creatingNewSession = true;
+		const client = this.requireClient();
 		try {
 			this.setStatusMessage("Creating session...");
-			const response = await this.requireClient().request({
+			const response = await client.request({
 				type: "create",
 				config: this.options.config,
 				env: collectDaemonClientEnv(),
 			});
 			const created = expectSessionSummary(requireDaemonData(response));
+			// The view can finish while create is in flight; kill the fresh empty
+			// session instead of leaving an orphan resident in the agents list.
+			if (this.stopped) {
+				if (created.activeSessionId && client.isConnected) {
+					await client.request({ type: "kill", activeSessionId: created.activeSessionId }).catch(() => undefined);
+				}
+				return;
+			}
 			this.selectSummary(created);
 			this.finish({ type: "open", summary: created });
 		} catch (error) {
-			this.setStatusMessage(formatError("Failed to create session", error));
+			if (!this.stopped) this.setStatusMessage(formatError("Failed to create session", error));
 		} finally {
 			this.creatingNewSession = false;
 		}
