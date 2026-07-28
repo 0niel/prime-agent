@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { parseNewSessionCommand } from "../src/core/new-session-command.js";
 import {
 	BUILTIN_SLASH_COMMANDS,
 	builtinSlashCommandTakesArgument,
@@ -70,7 +71,7 @@ describe("built-in slash commands", () => {
 		expect(builtinSlashCommandTakesArgument("thinking")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("heartbeat")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("mcp")).toBe(true);
-		expect(builtinSlashCommandTakesArgument("new")).toBe(false);
+		expect(builtinSlashCommandTakesArgument("new")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("clear")).toBe(false);
 	});
 });
@@ -81,7 +82,8 @@ describe("slash command aliases", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "usage")).toBeUndefined();
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "rename")).toBeUndefined();
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "new")).toMatchObject({
-			description: "Start a new session",
+			description: "Start a new session, optionally named and/or with an initial prompt",
+			argumentHint: '[--name "session name" --] [prompt]',
 			aliases: ["clear"],
 		});
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "context")).toMatchObject({
@@ -111,6 +113,7 @@ describe("slash command aliases", () => {
 		const parsed = parseSlashCommand("/clear");
 
 		expect(parsed).toEqual({ name: "clear", args: "" });
+		expect(parseSlashCommand("/new\n  multiline prompt")).toEqual({ name: "new", args: "multiline prompt" });
 		expect(isBuiltinSlashCommandName("clear")).toBe(true);
 		expect(resolveBuiltinSlashCommandName("clear")).toBe("new");
 		expect(resolveSlashCommand(parsed!)).toEqual({
@@ -119,6 +122,18 @@ describe("slash command aliases", () => {
 			originalName: "clear",
 			isAlias: true,
 		});
+		expect(parseNewSessionCommand(" write a\n  multiline prompt  ")).toEqual({
+			prompt: "write a\n  multiline prompt  ",
+		});
+		expect(parseNewSessionCommand(" --name stable")).toEqual({ name: "stable" });
+		expect(parseNewSessionCommand(' --name "stable name" --  \n  --keep\nformat  ')).toEqual({
+			name: "stable name",
+			prompt: "  --keep\nformat  ",
+		});
+		expect(() => parseNewSessionCommand(" --name")).toThrow("Missing value");
+		expect(() => parseNewSessionCommand(' --name "one" --name "two"')).toThrow("Duplicate");
+		expect(() => parseNewSessionCommand(" --other value")).toThrow("Unknown /new option");
+		expect(() => parseNewSessionCommand(' --name "broken')).toThrow("Unterminated quote");
 	});
 
 	test("resolves /thinking to /effort through the alias path", () => {

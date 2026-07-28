@@ -105,6 +105,7 @@ import {
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
 } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
+import { parseNewSessionCommand } from "../../core/new-session-command.js";
 import { resolvePrimeAgentTracesBaseUrl } from "../../core/prime-inference-auth.js";
 import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { parseCommandArgs } from "../../core/prompt-templates.js";
@@ -4500,9 +4501,27 @@ export class InteractiveMode {
 					await this.handleMcpCommand(commandArgs);
 					return;
 				}
-				if (commandName === "new" && !commandArgs) {
+				if (slashCommand?.name === "clear") {
+					if (commandArgs) {
+						this.editor.setText(text);
+						this.showError("Usage: /clear");
+					} else {
+						this.editor.setText("");
+						await this.handleClearCommand();
+					}
+					return;
+				}
+				if (slashCommand?.name === "new") {
+					let options: ReturnType<typeof parseNewSessionCommand>;
+					try {
+						options = parseNewSessionCommand(text.slice(4));
+					} catch (error) {
+						this.editor.setText(text);
+						this.showError(error instanceof Error ? error.message : String(error));
+						return;
+					}
 					this.editor.setText("");
-					await this.handleClearCommand();
+					await this.handleClearCommand(options);
 					return;
 				}
 				if (commandName === "compact") {
@@ -9648,19 +9667,40 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		this.ui.requestRender();
 	}
 
-	private async handleClearCommand(): Promise<void> {
+	private async handleClearCommand(options: { name?: string; prompt?: string } = {}): Promise<void> {
 		this.stopWorkingLoader();
+		const retainedImages = options.prompt ? this.getPromptStashImages(options.prompt) : [];
+		const restorePrompt = () => {
+			if (!options.prompt) return;
+			for (const [id, image] of retainedImages) this.pastedImages.set(id, image);
+			this.editor.setText(options.prompt);
+		};
+		let created = false;
 		try {
 			const result = await this.agentConnection.newSession();
 			if (result.cancelled) {
+				restorePrompt();
 				return;
 			}
+			created = true;
 			await this.renderCurrentSessionState();
+			for (const [id, image] of retainedImages) this.pastedImages.set(id, image);
 			this.chatContainer.addChild(new Spacer(1));
 			this.chatContainer.addChild(new Text(`${theme.fg("accent", "✓ New session started")}`, 1, 1));
 			this.ui.requestRender();
+			const images = options.prompt ? this.collectImagesFor(options.prompt) : undefined;
+			if (options.name) await this.agentConnection.setSessionName(options.name);
+			if (options.prompt) {
+				this.editor.addToHistory?.(options.prompt);
+				await this.agentConnection.prompt(options.prompt, { images });
+			}
 		} catch (error: unknown) {
-			await this.handleFatalRuntimeError("Failed to create session", error);
+			if (!created) {
+				await this.handleFatalRuntimeError("Failed to create session", error);
+				return;
+			}
+			restorePrompt();
+			this.showError(error instanceof Error ? error.message : String(error));
 		}
 	}
 

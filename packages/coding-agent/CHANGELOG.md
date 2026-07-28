@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added `/new` support for an optional stable session name and initial prompt.
 - Changed collapsed edit and IPython tool calls to show compact per-file line-change summaries while keeping full diffs available when expanded.
 - Changed session search to rank exact name and first-message matches before prefix, substring, and stricter transcript fuzzy matches.
 - Fixed daemon startup failing when an interrupted supervisor left an empty ownership directory.
