@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed compaction retaining runtime resources after an explicitly deleted subagent had a transient cleanup failure.
+
 ## [0.4.0] - 2026-08-01
 
 ### Breaking Changes

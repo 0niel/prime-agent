@@ -6555,8 +6555,14 @@ export class AgentSession {
 			});
 		}
 		await this._notifyKernelStateAfterCompaction();
+		await this._reapDeletedRlmSubagentRuntimesAfterCompaction();
 
 		return { summary, firstKeptEntryId, tokensBefore, details };
+	}
+
+	private async _reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void> {
+		const childIds = [...this._retryableRlmSubagentDeletions.keys()];
+		await Promise.allSettled(childIds.map((childId) => this.deleteRlmSubagent(childId)));
 	}
 
 	/**
