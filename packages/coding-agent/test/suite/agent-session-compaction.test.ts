@@ -242,6 +242,50 @@ describe("AgentSession compaction characterization", () => {
 		expect(branchSnapshots[1]).not.toContain("[Compacted history stored on disk]");
 	});
 
+	it("asks the agent to collect stale REPL state after compaction", async () => {
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "summary from extension",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		const listNamespaceNames = vi.fn().mockResolvedValue(["ongoing_helper", "stale_results"]);
+		const dispose = vi.fn().mockResolvedValue(undefined);
+		(
+			harness.session as unknown as {
+				_ipythonKernelProvisioner: {
+					hasRunningKernel: boolean;
+					listNamespaceNames: typeof listNamespaceNames;
+					dispose: typeof dispose;
+				};
+			}
+		)._ipythonKernelProvisioner = { hasRunningKernel: true, listNamespaceNames, dispose };
+
+		await harness.session.compact();
+
+		const notice = harness.session.messages.find(
+			(message) => message.role === "custom" && message.customType === "ipython_state",
+		);
+		if (notice?.role !== "custom") throw new Error("missing IPython state notice");
+		expect(notice.content).toContain("ongoing_helper, stale_results");
+		expect(notice.content).toContain("preserve state needed for ongoing work");
+		expect(notice.content).toContain("delete stale variables and large intermediates with `del`");
+		expect(notice.content).toContain("import gc; gc.collect()");
+		expect(notice.content).not.toContain("rlm.list_subagents");
+	});
+
 	it("retries cleanup for explicitly deleted subagents after compaction", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { keepRecentTokens: 1 } },

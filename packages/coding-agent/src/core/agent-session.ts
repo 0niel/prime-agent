@@ -6308,6 +6308,7 @@ export class AgentSession {
 		const content = [
 			"<ipython_state>",
 			`Your IPython kernel persisted through compaction; all variables, imports, and helpers you defined remain available.${detail}`,
+			"Treat compaction as a REPL garbage-collection checkpoint. Review the persisted namespace now, preserve state needed for ongoing work, delete stale variables and large intermediates with `del`, then run `import gc; gc.collect()`. Do not clear useful state indiscriminately.",
 			"</ipython_state>",
 		].join("\n");
 		const message = {

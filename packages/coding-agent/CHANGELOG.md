@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Changed compaction to prompt the agent to remove stale IPython state and collect Python garbage while preserving useful REPL state.
 - Changed compaction to keep old message payloads on disk instead of retaining them indefinitely in session memory.
 - Changed large daemon session loads to stream JSONL history and avoid retaining a second full-file copy in memory.
 - Changed subagent guidance to retain reusable children and delete completed direct children once they are no longer needed.
