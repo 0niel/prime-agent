@@ -16,6 +16,7 @@ const LOGIN_RECOVERY_SUFFIX = `\n\n${LOGIN_RECOVERY_MESSAGE}`;
 
 export interface AssistantMessageComponentOptions {
 	expanded?: boolean;
+	precededByToolActivity?: boolean;
 }
 
 function getThinkingMarkdownTheme(baseTheme: MarkdownTheme): MarkdownTheme {
@@ -68,6 +69,7 @@ export class AssistantMessageComponent extends Container {
 	private lastSignature?: string;
 	private blockMarkdowns = new Map<number, Markdown>();
 	private lastBlockTexts = new Map<number, string>();
+	private precededByToolActivity: boolean;
 
 	constructor(
 		message?: AssistantMessage,
@@ -82,6 +84,7 @@ export class AssistantMessageComponent extends Container {
 		this.markdownTheme = markdownTheme;
 		this.hiddenThinkingLabel = hiddenThinkingLabel;
 		this.expanded = options.expanded ?? false;
+		this.precededByToolActivity = options.precededByToolActivity ?? false;
 
 		// Container for text/thinking content
 		this.contentContainer = new Container();
@@ -265,7 +268,7 @@ export class AssistantMessageComponent extends Container {
 			this.contentContainer.addChild(this.createErrorComponent(errorMsg, "Error"));
 		}
 
-		if (hasToolCalls) {
+		if (hasToolCalls && (hasVisibleContent || message.stopReason === "aborted" || !this.precededByToolActivity)) {
 			this.contentContainer.addChild(new Spacer(1));
 		}
 	}

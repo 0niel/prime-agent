@@ -5392,7 +5392,10 @@ export class InteractiveMode {
 			this.hideThinkingBlock,
 			this.getMarkdownThemeWithSettings(),
 			this.hiddenThinkingLabel,
-			{ expanded: this.toolOutputExpanded },
+			{
+				expanded: this.toolOutputExpanded,
+				precededByToolActivity: this.chatContainer.children.at(-1) instanceof ToolExecutionComponent,
+			},
 		);
 		this.streamingMessage = message;
 		this.chatContainer.addChild(this.streamingComponent);
@@ -6251,7 +6254,10 @@ export class InteractiveMode {
 					this.hideThinkingBlock,
 					this.getMarkdownThemeWithSettings(),
 					this.hiddenThinkingLabel,
-					{ expanded: this.toolOutputExpanded },
+					{
+						expanded: this.toolOutputExpanded,
+						precededByToolActivity: this.chatContainer.children.at(-1) instanceof ToolExecutionComponent,
+					},
 				);
 				this.chatContainer.addChild(assistantComponent);
 				break;

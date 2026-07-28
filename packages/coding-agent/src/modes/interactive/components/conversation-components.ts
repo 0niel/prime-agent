@@ -52,7 +52,10 @@ export function buildConversationComponents(
 					options.hideThinkingBlock ?? false,
 					options.markdownTheme,
 					options.hiddenThinkingLabel ?? "Thinking...",
-					{ expanded },
+					{
+						expanded,
+						precededByToolActivity: components.at(-1) instanceof ToolExecutionComponent,
+					},
 				),
 			);
 			for (const content of message.content) {
