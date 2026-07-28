@@ -224,9 +224,9 @@ describe("IPythonCellComponent diff rendering", () => {
 			expanded: false,
 		});
 		expect(collapsed).toContain("to expand");
-		expect(collapsed).toContain("big.py");
-		expect(collapsed).toContain("old");
-		expect(collapsed).toContain("NEW");
+		expect(collapsed).not.toContain("big.py");
+		expect(collapsed).not.toContain("old");
+		expect(collapsed).not.toContain("NEW");
 	});
 
 	it("hides edit source when collapsed and shows it when globally expanded", () => {

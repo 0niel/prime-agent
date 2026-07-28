@@ -690,9 +690,9 @@ describe("ToolExecutionComponent parity", () => {
 
 		const collapsed = stripAnsi(component.render(120).join("\n"));
 		expect(collapsed).not.toContain("hidden_side_effect");
-		expect(collapsed).toMatch(/✓ README\.md\s+\+1 -1/);
-		expect(collapsed).toMatch(/1 - before/);
-		expect(collapsed).toMatch(/1 \+ after/);
+		expect(collapsed).toContain("╰─ README.md +1 -1");
+		expect(collapsed).not.toMatch(/1 - before/);
+		expect(collapsed).not.toMatch(/1 \+ after/);
 
 		component.setExpanded(true);
 		const expanded = stripAnsi(component.render(120).join("\n"));

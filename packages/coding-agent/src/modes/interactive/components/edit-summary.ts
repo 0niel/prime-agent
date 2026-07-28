@@ -1,10 +1,12 @@
+import { isAbsolute } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
+import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { EditToolDetails } from "../../../core/tools/edit.js";
 import { generateDiffString } from "../../../core/tools/edit-diff.js";
 import type { IpythonToolDetails } from "../../../core/tools/ipython.js";
 import { resolveToCwd } from "../../../core/tools/path-utils.js";
-import { canonicalizePath } from "../../../utils/paths.js";
+import { canonicalizePath, formatPathRelativeToCwdOrAbsolute } from "../../../utils/paths.js";
 import { theme } from "../theme/theme.js";
 
 export interface FileChangeSummary {
@@ -79,6 +81,33 @@ export function mergeTurnFileChanges(
 
 function counts(change: Pick<FileChangeSummary, "added" | "removed">): string {
 	return `${theme.fg("toolDiffAdded", `+${change.added}`)} ${theme.fg("toolDiffRemoved", `-${change.removed}`)}`;
+}
+
+function formatFileChangePath(path: string, cwd: string): string {
+	const resolvedPath = resolveToCwd(path, cwd);
+	const lexicalPath = formatPathRelativeToCwdOrAbsolute(resolvedPath, cwd);
+	if (!isAbsolute(lexicalPath)) return lexicalPath;
+	return formatPathRelativeToCwdOrAbsolute(canonicalizePath(resolvedPath), canonicalizePath(cwd));
+}
+
+export class FileChangeSummaryComponent implements Component {
+	constructor(
+		private readonly changes: readonly FileChangeSummary[],
+		private readonly cwd: string,
+	) {}
+
+	render(width: number): string[] {
+		const safeWidth = Math.max(1, width);
+		const prefix = theme.fg("dim", "    ╰─ ");
+		return this.changes.map((change) => {
+			const suffix = `${theme.fg("dim", " ")}${counts(change)}`;
+			const available = Math.max(1, safeWidth - visibleWidth(prefix) - visibleWidth(suffix));
+			const path = truncateToWidth(formatFileChangePath(change.path, this.cwd), available, "…");
+			return truncateToWidth(`${prefix}${theme.fg("muted", path)}${suffix}`, safeWidth, "");
+		});
+	}
+
+	invalidate(): void {}
 }
 
 export function formatTotalChangeSummary(changes: readonly FileChangeSummary[]): string {

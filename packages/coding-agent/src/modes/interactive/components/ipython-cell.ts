@@ -359,7 +359,7 @@ export class IPythonCellComponent implements Component {
 		const lines = [truncateToWidth(` ${this.collapsedLine(details)}`, safeWidth, "")];
 
 		const hasCode = this.state.expanded ? this.renderCode(lines, safeWidth) : false;
-		if ((details.diffs?.length ?? 0) > 0) {
+		if ((details.diffs?.length ?? 0) > 0 && this.state.expanded) {
 			this.renderDiffs(lines, safeWidth, details.diffs ?? [], this.marker(details));
 		}
 		if ((details.sentAgentMessages?.length ?? 0) > 0) {

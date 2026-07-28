@@ -4,6 +4,7 @@ import { constants } from "fs";
 import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { renderDiff } from "../../modes/interactive/components/diff.js";
+import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
 import type { ToolDefinition } from "../extensions/types.js";
 import {
 	applyEditsToNormalizedContent,
@@ -251,14 +252,25 @@ function buildEditCallComponent(
 	component: EditCallRenderComponent,
 	args: RenderableEditArgs | undefined,
 	theme: typeof import("../../modes/interactive/theme/theme.js").theme,
+	expanded: boolean,
+	showExpandHint: boolean,
 ): EditCallRenderComponent {
 	component.setBgFn(getEditHeaderBg(component.preview, component.settledError, theme));
 	component.clear();
-	component.addChild(new Text(formatEditCall(args, theme), 0, 0));
+	const canExpand = component.preview !== undefined && !("error" in component.preview);
+	const expandHint =
+		canExpand && showExpandHint
+			? `${theme.fg("dim", " · ")}${keyHint("app.tools.expand", expanded ? "to collapse" : "to expand")}`
+			: "";
+	component.addChild(new Text(`${formatEditCall(args, theme)}${expandHint}`, 0, 0));
 
 	const body =
 		component.preview &&
-		("error" in component.preview ? theme.fg("error", component.preview.error) : renderDiff(component.preview.diff));
+		("error" in component.preview
+			? theme.fg("error", component.preview.error)
+			: expanded
+				? renderDiff(component.preview.diff)
+				: undefined);
 	if (body) {
 		component.addChild(new Spacer(1));
 		component.addChild(new Text(body, 0, 0));
@@ -437,7 +449,7 @@ export function createEditToolDefinition(
 				});
 			}
 
-			return buildEditCallComponent(component, args, theme);
+			return buildEditCallComponent(component, args, theme, context.expanded, context.showExpandHint !== false);
 		},
 		renderResult(result, _options, theme, context) {
 			const callComponent = context.state.callComponent;
@@ -462,7 +474,13 @@ export function createEditToolDefinition(
 					changed = true;
 				}
 				if (changed) {
-					buildEditCallComponent(callComponent, context.args as RenderableEditArgs | undefined, theme);
+					buildEditCallComponent(
+						callComponent,
+						context.args as RenderableEditArgs | undefined,
+						theme,
+						context.expanded,
+						context.showExpandHint !== false,
+					);
 				}
 			}
 

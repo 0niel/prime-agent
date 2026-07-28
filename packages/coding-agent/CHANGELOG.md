@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Changed collapsed edit and IPython tool calls to show compact per-file line-change summaries while keeping full diffs available when expanded.
 - Fixed daemon startup failing when an interrupted supervisor left an empty ownership directory.
 
 ## [0.3.3] - 2026-07-23
