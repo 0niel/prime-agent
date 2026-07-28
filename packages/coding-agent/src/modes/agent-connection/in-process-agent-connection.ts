@@ -267,7 +267,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getUserMessagesForForking(): Promise<AgentConnectionUserMessage[]> {
-		return this.session.getUserMessagesForForking();
+		return await this.session.getUserMessagesForForking();
 	}
 
 	async getLastAssistantText(): Promise<string | undefined> {
@@ -518,7 +518,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async exportToJsonl(outputPath?: string): Promise<string> {
-		return this.session.exportToJsonl(outputPath);
+		return await this.session.exportToJsonl(outputPath);
 	}
 
 	async setSessionName(name: string): Promise<void> {

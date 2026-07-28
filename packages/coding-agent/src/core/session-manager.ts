@@ -36,6 +36,147 @@ const SESSION_LIST_PARSE_MAX_LINE_CHARS = 1024 * 1024;
 const SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS = 256;
 const SESSION_STREAMING_LOAD_THRESHOLD_BYTES = 128 * 1024 * 1024;
 const SESSION_ASYNC_PARSE_YIELD_BYTES = 4 * 1024 * 1024;
+const COMPACTED_HISTORY_PREVIEW_PREFIX = "[Compacted history stored on disk]";
+const COMPACTED_HISTORY_PREVIEW_MAX_CHARS = 256;
+
+function previewContent(content: unknown): string {
+	if (typeof content === "string") {
+		return content.slice(0, COMPACTED_HISTORY_PREVIEW_MAX_CHARS);
+	}
+	if (!Array.isArray(content)) {
+		return "";
+	}
+	let preview = "";
+	for (const block of content) {
+		if (preview.length >= COMPACTED_HISTORY_PREVIEW_MAX_CHARS) break;
+		if (!block || typeof block !== "object") continue;
+		const record = block as Record<string, unknown>;
+		let part = "";
+		if (record.type === "text" && typeof record.text === "string") {
+			part = record.text;
+		} else if (record.type === "thinking" && typeof record.thinking === "string") {
+			part = record.thinking;
+		} else if (record.type === "image") {
+			part = `[image${typeof record.mimeType === "string" ? ` ${record.mimeType}` : ""}]`;
+		} else if (record.type === "toolCall") {
+			part = `[tool ${typeof record.name === "string" ? record.name : "call"}]`;
+		}
+		if (part) {
+			preview += `${preview ? " " : ""}${part}`.slice(0, COMPACTED_HISTORY_PREVIEW_MAX_CHARS - preview.length);
+		}
+	}
+	return preview;
+}
+
+function compactedHistoryPreview(content: unknown): string {
+	const preview = previewContent(content).replace(/\s+/g, " ").trim();
+	return preview ? `${COMPACTED_HISTORY_PREVIEW_PREFIX} ${preview}` : COMPACTED_HISTORY_PREVIEW_PREFIX;
+}
+
+function compactedHistoryMetadata<T extends string>(value: T): T;
+function compactedHistoryMetadata<T extends string>(value: T | undefined): T | undefined;
+function compactedHistoryMetadata<T extends string>(value: T | undefined): T | undefined {
+	return value === undefined ? undefined : (value.slice(0, COMPACTED_HISTORY_PREVIEW_MAX_CHARS) as T);
+}
+
+function compactUnknownAgentMessagePayload(message: AgentMessage): AgentMessage {
+	const source = message as unknown as Record<string, unknown>;
+	const compacted: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+	compacted.role = compactedHistoryMetadata(String(source.role ?? "unknown"));
+	let retainedFieldCount = 0;
+	for (const key in source) {
+		if (!Object.hasOwn(source, key) || key === "role" || key.length > COMPACTED_HISTORY_PREVIEW_MAX_CHARS) continue;
+		const value = source[key];
+		if (value === undefined) continue;
+		if (retainedFieldCount >= 32) break;
+		retainedFieldCount++;
+		if (typeof value === "string") {
+			compacted[key] = key === "content" ? compactedHistoryPreview(value) : compactedHistoryMetadata(value);
+		} else if (value === null || typeof value === "number" || typeof value === "boolean") {
+			compacted[key] = value;
+		} else {
+			compacted[key] = compactedHistoryPreview(value);
+		}
+	}
+	return compacted as unknown as AgentMessage;
+}
+
+function compactAgentMessagePayload(message: AgentMessage): AgentMessage {
+	switch (message.role) {
+		case "user":
+			return {
+				role: "user",
+				content: compactedHistoryPreview(message.content),
+				timestamp: message.timestamp,
+			};
+		case "assistant":
+			return {
+				role: "assistant",
+				content: [{ type: "text", text: compactedHistoryPreview(message.content) }],
+				api: compactedHistoryMetadata(message.api),
+				provider: compactedHistoryMetadata(message.provider),
+				model: compactedHistoryMetadata(message.model),
+				responseModel: compactedHistoryMetadata(message.responseModel),
+				responseId: compactedHistoryMetadata(message.responseId),
+				usage: cloneUsage(message.usage),
+				stopReason: message.stopReason,
+				stopReasonRaw: compactedHistoryMetadata(message.stopReasonRaw),
+				errorMessage:
+					message.errorMessage === undefined ? undefined : compactedHistoryPreview(message.errorMessage),
+				timestamp: message.timestamp,
+			};
+		case "toolResult":
+			return {
+				role: "toolResult",
+				toolCallId: compactedHistoryMetadata(message.toolCallId),
+				toolName: compactedHistoryMetadata(message.toolName),
+				content: [{ type: "text", text: compactedHistoryPreview(message.content) }],
+				isError: message.isError,
+				timestamp: message.timestamp,
+			};
+		case "bashExecution":
+			return {
+				role: "bashExecution",
+				command: compactedHistoryPreview(message.command),
+				output: compactedHistoryPreview(message.output),
+				exitCode: message.exitCode,
+				cancelled: message.cancelled,
+				truncated: message.truncated,
+				fullOutputPath: compactedHistoryMetadata(message.fullOutputPath),
+				timestamp: message.timestamp,
+				excludeFromContext: message.excludeFromContext,
+			};
+		case "custom":
+			return {
+				role: "custom",
+				customType: compactedHistoryMetadata(message.customType),
+				content: compactedHistoryPreview(message.content),
+				display: message.display,
+				timestamp: message.timestamp,
+			};
+		case "branchSummary":
+			return {
+				role: "branchSummary",
+				summary: compactedHistoryPreview(message.summary),
+				fromId: compactedHistoryMetadata(message.fromId),
+				timestamp: message.timestamp,
+			};
+		case "compactionSummary":
+			return {
+				role: "compactionSummary",
+				summary: compactedHistoryPreview(message.summary),
+				tokensBefore: message.tokensBefore,
+				retainedMessageCount: message.retainedMessageCount,
+				customInstructions:
+					message.customInstructions === undefined
+						? undefined
+						: compactedHistoryPreview(message.customInstructions),
+				timestamp: message.timestamp,
+			};
+		default:
+			return compactUnknownAgentMessagePayload(message);
+	}
+}
 
 // Entry types that can represent user intent (vs. daemon bookkeeping like
 // session_state/agent_status/git_state/child_usage_attributed). Used by
@@ -85,6 +226,11 @@ export interface SessionHeader {
 export interface NewSessionOptions {
 	id?: string;
 	parentSession?: string;
+}
+
+export interface SessionOpenOptions {
+	/** Evict compacted payloads from resident state for memory efficiency. Defaults to true. */
+	evictCompactedHistory?: boolean;
 }
 
 export type SessionPersistListener = (sessionFile: string) => void;
@@ -311,8 +457,10 @@ export type ReadonlySessionManager = Pick<
 	| "getEntry"
 	| "getLabel"
 	| "getBranch"
+	| "getResidentBranch"
 	| "getHeader"
 	| "getEntries"
+	| "getEntriesById"
 	| "getTree"
 	| "getSessionName"
 >;
@@ -500,8 +648,10 @@ export function buildSessionContext(
 
 	// push+reverse, not unshift-per-entry: unshift is O(n), making this O(n^2) on long sessions.
 	const path: SessionEntry[] = [];
+	const visited = new Set<string>();
 	let current: SessionEntry | undefined = leaf;
-	while (current) {
+	while (current && !visited.has(current.id)) {
+		visited.add(current.id);
 		path.push(current);
 		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
@@ -682,6 +832,83 @@ export async function loadEntriesFromFileAsync(
 		}
 	}
 	return finalizeLoadedEntries(entries);
+}
+
+const JSON_ID_KEY = Buffer.from('"id"');
+const JSON_TARGET_ID_KEY = Buffer.from('"targetId"');
+
+function bufferContainsJsonStringProperty(buffer: Buffer, propertyKey: Buffer, values: ReadonlySet<string>): boolean {
+	if (values.size === 0) return false;
+	let keyIndex = buffer.indexOf(propertyKey);
+	while (keyIndex >= 0) {
+		let cursor = keyIndex + propertyKey.length;
+		while (cursor < buffer.length && (buffer[cursor] === 0x20 || buffer[cursor] === 0x09)) cursor++;
+		if (buffer[cursor] !== 0x3a) {
+			keyIndex = buffer.indexOf(propertyKey, cursor);
+			continue;
+		}
+		cursor++;
+		while (cursor < buffer.length && (buffer[cursor] === 0x20 || buffer[cursor] === 0x09)) cursor++;
+		if (buffer[cursor] !== 0x22) {
+			keyIndex = buffer.indexOf(propertyKey, cursor);
+			continue;
+		}
+		const valueStart = cursor++;
+		let escaped = false;
+		while (cursor < buffer.length) {
+			const byte = buffer[cursor++];
+			if (escaped) {
+				escaped = false;
+				continue;
+			}
+			if (byte === 0x5c) {
+				escaped = true;
+				continue;
+			}
+			if (byte !== 0x22) continue;
+			try {
+				const value = JSON.parse(buffer.toString("utf8", valueStart, cursor)) as unknown;
+				if (typeof value === "string" && values.has(value)) return true;
+			} catch {
+				// The full line parser below also ignores malformed JSON.
+			}
+			break;
+		}
+		keyIndex = buffer.indexOf(propertyKey, cursor);
+	}
+	return false;
+}
+
+async function loadEntriesByIdFromFile(
+	filePath: string,
+	entryIds: ReadonlySet<string>,
+): Promise<Map<string, SessionEntry>> {
+	const remainingIds = new Set(entryIds);
+	const entries = new Map<string, SessionEntry>();
+	const usageAttributions: ChildUsageAttributionEntry[] = [];
+	if (remainingIds.size === 0 || !existsSync(filePath)) return entries;
+
+	for await (const line of readLinesAsBuffers(filePath)) {
+		if (line.length === 0) continue;
+		const hasRequestedEntryId = bufferContainsJsonStringProperty(line, JSON_ID_KEY, remainingIds);
+		const hasRequestedUsageTarget = bufferContainsJsonStringProperty(line, JSON_TARGET_ID_KEY, entryIds);
+		if (!hasRequestedEntryId && !hasRequestedUsageTarget) continue;
+		let entry: FileEntry;
+		try {
+			entry = JSON.parse(line.toString("utf8")) as FileEntry;
+		} catch {
+			continue;
+		}
+		if (entry.type === "child_usage_attributed" && entryIds.has(entry.targetId)) {
+			usageAttributions.push(entry);
+			continue;
+		}
+		if (entry.type === "session" || !remainingIds.has(entry.id)) continue;
+		entries.set(entry.id, entry);
+		remainingIds.delete(entry.id);
+	}
+	applyChildUsageAttributions([...entries.values(), ...usageAttributions]);
+	return entries;
 }
 
 function readSessionHeader(filePath: string): Partial<SessionHeader> | undefined {
@@ -1114,6 +1341,7 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	private evictedPayloadEntryIds = new Set<string>();
 	private persistListeners = new Set<SessionPersistListener>();
 
 	private constructor(
@@ -1122,6 +1350,7 @@ export class SessionManager {
 		sessionFile: string | undefined,
 		persist: boolean,
 		preloadedEntries?: FileEntry[],
+		openOptions: SessionOpenOptions = {},
 	) {
 		this.cwd = cwd;
 		this.sessionDir = sessionDir;
@@ -1131,7 +1360,7 @@ export class SessionManager {
 		}
 
 		if (sessionFile) {
-			this.setSessionFile(sessionFile, preloadedEntries);
+			this.setSessionFile(sessionFile, preloadedEntries, openOptions);
 		} else {
 			this.newSession();
 		}
@@ -1142,7 +1371,8 @@ export class SessionManager {
 	 * preloadedEntries must be loadEntriesFromFile(sessionFile) for the same path; it
 	 * lets the async daemon path skip the synchronous re-read.
 	 */
-	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[]): void {
+	setSessionFile(sessionFile: string, preloadedEntries?: FileEntry[], options: SessionOpenOptions = {}): void {
+		this.evictedPayloadEntryIds.clear();
 		this.sessionFile = resolve(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			this.fileEntries = preloadedEntries ?? loadEntriesFromFile(this.sessionFile);
@@ -1167,6 +1397,9 @@ export class SessionManager {
 
 			this._buildIndex();
 			this.flushed = true;
+			if (options.evictCompactedHistory !== false) {
+				this.evictCompactedHistoryPayloads();
+			}
 		} else {
 			const explicitPath = this.sessionFile;
 			this.newSession();
@@ -1203,6 +1436,7 @@ export class SessionManager {
 			git,
 		};
 		this.fileEntries = [header];
+		this.evictedPayloadEntryIds.clear();
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -1236,9 +1470,135 @@ export class SessionManager {
 		}
 	}
 
+	private _branchFromIndex(fromId: string | null, byId: ReadonlyMap<string, SessionEntry>): SessionEntry[] {
+		const path: SessionEntry[] = [];
+		const visited = new Set<string>();
+		let current = fromId ? byId.get(fromId) : undefined;
+		while (current && !visited.has(current.id)) {
+			visited.add(current.id);
+			path.push(current);
+			current = current.parentId ? byId.get(current.parentId) : undefined;
+		}
+		path.reverse();
+		return path;
+	}
+
+	private _residentBranch(fromId = this.leafId): SessionEntry[] {
+		return this._branchFromIndex(fromId, this.byId);
+	}
+
+	/** Read full payloads for selected IDs without hydrating or otherwise changing resident state. */
+	async getEntriesById(entryIds: ReadonlySet<string>): Promise<Map<string, SessionEntry>> {
+		const entries = new Map<string, SessionEntry>();
+		const persistedIds = new Set<string>();
+		for (const entryId of entryIds) {
+			if (this.evictedPayloadEntryIds.has(entryId)) {
+				persistedIds.add(entryId);
+				continue;
+			}
+			const entry = this.byId.get(entryId);
+			if (entry) entries.set(entryId, entry);
+		}
+		if (persistedIds.size === 0) return entries;
+		if (!this.sessionFile || !existsSync(this.sessionFile)) {
+			throw new Error("Compacted session history is unavailable on disk");
+		}
+		for (const [entryId, entry] of await loadEntriesByIdFromFile(this.sessionFile, persistedIds)) {
+			entries.set(entryId, entry);
+		}
+		return entries;
+	}
+
+	private async _hydratePayloadEntries(entryIds: ReadonlySet<string>): Promise<void> {
+		if (entryIds.size === 0) return;
+		const persistedById = await this.getEntriesById(entryIds);
+		for (const entryId of entryIds) {
+			if (!persistedById.has(entryId)) {
+				throw new Error(`Compacted session entry ${entryId} is unavailable on disk`);
+			}
+		}
+		for (let index = 0; index < this.fileEntries.length; index++) {
+			const entry = this.fileEntries[index];
+			if (entry.type === "session" || !entryIds.has(entry.id)) continue;
+			const persisted = persistedById.get(entry.id);
+			if (!persisted) continue;
+			this.fileEntries[index] = persisted;
+			this.byId.set(entry.id, persisted);
+			this.evictedPayloadEntryIds.delete(entry.id);
+		}
+	}
+
+	/** Asynchronously hydrate evicted payloads on one branch for a scoped operation. */
+	async hydrateBranchPayloads(fromId: string): Promise<void> {
+		const payloadIds = new Set(
+			this._residentBranch(fromId)
+				.map((entry) => entry.id)
+				.filter((entryId) => this.evictedPayloadEntryIds.has(entryId)),
+		);
+		await this._hydratePayloadEntries(payloadIds);
+	}
+
+	/** Drop old compacted message payloads while preserving lightweight tree metadata and disk history. */
+	evictCompactedHistoryPayloads(): number {
+		if (!this.persist || !this.sessionFile || !existsSync(this.sessionFile)) return 0;
+		if (this.getCompactionCount() === 0) return 0;
+		const branch = this._residentBranch();
+		const compaction = getLatestCompactionEntry(branch);
+		let retainedEntries = branch;
+		if (compaction) {
+			const firstKeptIndex = branch.findIndex((entry) => entry.id === compaction.firstKeptEntryId);
+			const compactionIndex = branch.findIndex((entry) => entry.id === compaction.id);
+			if (firstKeptIndex >= 0 && compactionIndex >= firstKeptIndex) {
+				retainedEntries = branch.slice(firstKeptIndex);
+			}
+		}
+		const retainedIds = new Set(retainedEntries.map((entry) => entry.id));
+		let evicted = 0;
+		for (let index = 0; index < this.fileEntries.length; index++) {
+			const entry = this.fileEntries[index];
+			if (entry.type === "session" || retainedIds.has(entry.id) || this.evictedPayloadEntryIds.has(entry.id)) {
+				continue;
+			}
+			let compacted: SessionEntry | undefined;
+			if (entry.type === "message") {
+				compacted = { ...entry, message: compactAgentMessagePayload(entry.message) };
+			} else if (entry.type === "custom_message") {
+				compacted = {
+					...entry,
+					content: compactedHistoryPreview(entry.content),
+					details: undefined,
+				};
+			}
+			if (!compacted) continue;
+			this.fileEntries[index] = compacted;
+			this.byId.set(compacted.id, compacted);
+			this.evictedPayloadEntryIds.add(compacted.id);
+			evicted++;
+		}
+		return evicted;
+	}
+
+	getEvictedHistoryPayloadCount(): number {
+		return this.evictedPayloadEntryIds.size;
+	}
+
+	/** Resident entries may contain bounded previews for compacted payloads. */
+	getResidentEntries(): SessionEntry[] {
+		return this.fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session");
+	}
+
+	getCompactionCount(): number {
+		return this.fileEntries.reduce((count, entry) => count + (entry.type === "compaction" ? 1 : 0), 0);
+	}
+
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
+		if (this.evictedPayloadEntryIds.size > 0 && !existsSync(this.sessionFile)) {
+			throw new Error("Cannot rewrite compacted session because full history is unavailable on disk");
+		}
+		const header = this.getHeader();
+		const entries = this.getEntries();
+		const content = `${(header ? [header, ...entries] : entries).map((entry) => JSON.stringify(entry)).join("\n")}\n`;
 		const targetPath = realpathIfPresent(this.sessionFile);
 		const directory = dirname(targetPath);
 		mkdirSync(directory, { recursive: true });
@@ -1366,6 +1726,9 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		if (this.persist && this.sessionFile && this.evictedPayloadEntryIds.size > 0 && !existsSync(this.sessionFile)) {
+			throw new Error("Cannot append to compacted session because full history is unavailable on disk");
+		}
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
@@ -1520,7 +1883,7 @@ export class SessionManager {
 	getSessionName(): string | undefined {
 		// Walk entries in reverse to find the latest session_info entry.
 		// Empty names explicitly clear the session title.
-		const entries = this.getEntries();
+		const entries = this.getResidentEntries();
 		for (let i = entries.length - 1; i >= 0; i--) {
 			const entry = entries[i];
 			if (entry.type === "session_info") {
@@ -1532,7 +1895,7 @@ export class SessionManager {
 
 	/** Get the current session lifecycle state from the latest session_state entry, if any. */
 	getSessionState(): SessionState | undefined {
-		const entries = this.getEntries();
+		const entries = this.getResidentEntries();
 		for (let i = entries.length - 1; i >= 0; i--) {
 			const entry = entries[i];
 			if (entry.type === "session_state") {
@@ -1557,7 +1920,7 @@ export class SessionManager {
 	 * prefix is skipped; anything beyond it is user content.
 	 */
 	hasUserContent(): boolean {
-		const contentEntries = this.getEntries().filter((entry) => CONTENT_ENTRY_TYPES.has(entry.type));
+		const contentEntries = this.getResidentEntries().filter((entry) => CONTENT_ENTRY_TYPES.has(entry.type));
 		let start = 0;
 		if (contentEntries[start]?.type === "model_change") {
 			start++;
@@ -1612,8 +1975,10 @@ export class SessionManager {
 
 	/** Active-branch git: nearest git_state from leaf to root, else the header snapshot. */
 	private getActiveGitContext(): GitContext | undefined {
+		const visited = new Set<string>();
 		let current = this.leafId ? this.byId.get(this.leafId) : undefined;
-		while (current) {
+		while (current && !visited.has(current.id)) {
+			visited.add(current.id);
 			if (current.type === "git_state") return current.git;
 			current = current.parentId ? this.byId.get(current.parentId) : undefined;
 		}
@@ -1625,8 +1990,10 @@ export class SessionManager {
 	getLatestAgentStatus(): AgentStatus | undefined {
 		// Walk the current leaf to root so we only read status on the active branch,
 		// not a sibling branch's status that happens to sit later in the file.
+		const visited = new Set<string>();
 		let current = this.leafId ? this.byId.get(this.leafId) : undefined;
-		while (current) {
+		while (current && !visited.has(current.id)) {
+			visited.add(current.id);
 			if (current.type === "agent_status") {
 				return { ...current.status };
 			}
@@ -1762,22 +2129,23 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Walk from an entry to the root without loading evicted payloads. */
+	getResidentBranch(fromId?: string): SessionEntry[] {
+		return this._residentBranch(fromId ?? this.leafId);
+	}
+
 	/**
-	 * Walk from entry to root, returning all entries in path order.
-	 * Includes all entry types (messages, compaction, model changes, etc.).
-	 * Use buildSessionContext() to get the resolved messages for the LLM.
+	 * Walk from entry to root, returning full payloads in path order.
+	 * When compacted payloads are evicted, this explicit full-history API reads them from disk
+	 * without repopulating resident state. Hot paths should use getResidentBranch().
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
-		// push+reverse, not unshift-per-entry: unshift is O(n), which makes this O(n^2) on long sessions.
-		const path: SessionEntry[] = [];
-		const startId = fromId ?? this.leafId;
-		let current = startId ? this.byId.get(startId) : undefined;
-		while (current) {
-			path.push(current);
-			current = current.parentId ? this.byId.get(current.parentId) : undefined;
+		const leafId = fromId ?? this.leafId;
+		if (this.evictedPayloadEntryIds.size === 0) {
+			return this._residentBranch(leafId);
 		}
-		path.reverse();
-		return path;
+		const entries = this.getEntries();
+		return this._branchFromIndex(leafId, new Map(entries.map((entry) => [entry.id, entry])));
 	}
 
 	/**
@@ -1802,21 +2170,30 @@ export class SessionManager {
 	}
 
 	/**
-	 * Get all session entries (excludes header). Returns a shallow copy.
+	 * Get all session entries (excludes header). Returns a shallow copy with full payloads.
+	 * Compacted payloads are synchronously read from disk on this explicit full-history path without repopulating resident state.
 	 * The session is append-only: use appendXXX() to add entries, branch() to
 	 * change the leaf pointer. Entries cannot be modified or deleted.
 	 */
 	getEntries(): SessionEntry[] {
-		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+		if (this.evictedPayloadEntryIds.size > 0) {
+			if (!this.sessionFile || !existsSync(this.sessionFile)) {
+				throw new Error("Compacted session history is unavailable on disk");
+			}
+			return loadEntriesFromFile(this.sessionFile).filter(
+				(entry): entry is SessionEntry => entry.type !== "session",
+			);
+		}
+		return this.getResidentEntries();
 	}
 
 	/**
-	 * Get the session as a tree structure. Returns a shallow defensive copy of all entries.
+	 * Get the session as a tree structure. Compacted messages use bounded previews while their full payloads stay on disk.
 	 * A well-formed session has exactly one root (first entry with parentId === null).
 	 * Orphaned entries (broken parent chain) are also returned as roots.
 	 */
 	getFlatTree(): SessionTreeFlatNode[] {
-		return this.getEntries().map((entry) => ({
+		return this.getResidentEntries().map((entry) => ({
 			entry,
 			label: this.labelsById.get(entry.id),
 			labelTimestamp: this.labelTimestampsById.get(entry.id),
@@ -1973,6 +2350,7 @@ export class SessionManager {
 			}
 
 			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+			this.evictedPayloadEntryIds.clear();
 			this.sessionId = newSessionId;
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
@@ -2009,6 +2387,7 @@ export class SessionManager {
 			parentId = labelEntry.id;
 		}
 		this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+		this.evictedPayloadEntryIds.clear();
 		this.sessionId = newSessionId;
 		this._buildIndex();
 		return undefined;
@@ -2030,7 +2409,12 @@ export class SessionManager {
 	 * @param sessionDir Optional session directory for /new or /branch. If omitted, derives from file's parent.
 	 * @param cwdOverride Optional cwd override instead of the session header cwd.
 	 */
-	static open(path: string, sessionDir?: string, cwdOverride?: string): SessionManager {
+	static open(
+		path: string,
+		sessionDir?: string,
+		cwdOverride?: string,
+		options: SessionOpenOptions = {},
+	): SessionManager {
 		// Only the header's cwd is needed to construct the manager; the constructor
 		// (setSessionFile) performs the full parse. Read just the first line here
 		// instead of parsing the entire file a second time — that double parse is a
@@ -2055,7 +2439,7 @@ export class SessionManager {
 		}
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ?? resolve(path, "..");
-		return new SessionManager(cwd ?? process.cwd(), dir, path, true);
+		return new SessionManager(cwd ?? process.cwd(), dir, path, true, undefined, options);
 	}
 
 	/**
@@ -2063,18 +2447,23 @@ export class SessionManager {
 	 * doesn't freeze other sessions. Falls back to open() for any non-happy path so
 	 * behavior is identical to it.
 	 */
-	static async openAsync(path: string, sessionDir?: string, cwdOverride?: string): Promise<SessionManager> {
+	static async openAsync(
+		path: string,
+		sessionDir?: string,
+		cwdOverride?: string,
+		options: SessionOpenOptions = {},
+	): Promise<SessionManager> {
 		if (!existsSync(path)) {
-			return SessionManager.open(path, sessionDir, cwdOverride);
+			return SessionManager.open(path, sessionDir, cwdOverride, options);
 		}
 		const entries = await loadEntriesFromFileAsync(path);
 		// empty/corrupt: defer to open() (finalizeLoadedEntries guarantees entries[0] is a valid header otherwise)
 		if (entries.length === 0) {
-			return SessionManager.open(path, sessionDir, cwdOverride);
+			return SessionManager.open(path, sessionDir, cwdOverride, options);
 		}
 		const cwd = cwdOverride ?? (entries[0] as SessionHeader).cwd;
 		const dir = sessionDir ?? resolve(path, "..");
-		return new SessionManager(cwd ?? process.cwd(), dir, path, true, entries);
+		return new SessionManager(cwd ?? process.cwd(), dir, path, true, entries, options);
 	}
 
 	/**

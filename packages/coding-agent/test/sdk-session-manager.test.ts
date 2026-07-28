@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getModel } from "@earendil-works/pi-ai";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAgentSession } from "../src/core/sdk.js";
 import { SessionManager } from "../src/core/session-manager.js";
 
@@ -60,6 +60,20 @@ describe("createAgentSession session manager defaults", () => {
 		expect(session.sessionManager).toBe(sessionManager);
 		expect(session.sessionManager.isPersisted()).toBe(false);
 
+		session.dispose();
+	});
+
+	it("uses resident structural history when restoring session settings", async () => {
+		const model = getModel("anthropic", "claude-sonnet-4-5");
+		expect(model).toBeTruthy();
+		const sessionManager = SessionManager.inMemory(cwd);
+		const getBranch = vi.spyOn(sessionManager, "getBranch");
+		const getResidentBranch = vi.spyOn(sessionManager, "getResidentBranch");
+
+		const { session } = await createAgentSession({ cwd, agentDir, model: model!, sessionManager });
+
+		expect(getBranch).not.toHaveBeenCalled();
+		expect(getResidentBranch).toHaveBeenCalled();
 		session.dispose();
 	});
 

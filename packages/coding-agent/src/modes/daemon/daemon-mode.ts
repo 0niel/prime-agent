@@ -3722,7 +3722,7 @@ export class AgentDaemon {
 
 			case "export_jsonl": {
 				const state = this.getSessionState(command.activeSessionId);
-				const path = state.runtime.session.exportToJsonl(command.outputPath);
+				const path = await state.runtime.session.exportToJsonl(command.outputPath);
 				return success(command.id, "export_jsonl", { path });
 			}
 
@@ -3754,7 +3754,7 @@ export class AgentDaemon {
 			case "get_user_messages_for_forking": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "get_user_messages_for_forking", {
-					messages: state.runtime.session.getUserMessagesForForking(),
+					messages: await state.runtime.session.getUserMessagesForForking(),
 				});
 			}
 

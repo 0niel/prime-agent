@@ -1361,7 +1361,7 @@ export class AgentSession {
 
 	private _restoreLateIpythonSentAgentMessages(): void {
 		this._lateIpythonSentAgentMessages.clear();
-		for (const entry of this.sessionManager.getBranch()) {
+		for (const entry of this.sessionManager.getResidentBranch()) {
 			if (entry.type !== "custom" || entry.customType !== IPYTHON_SENT_AGENT_MESSAGE_CUSTOM_ENTRY) {
 				continue;
 			}
@@ -1413,7 +1413,7 @@ export class AgentSession {
 	}
 
 	private _loadPersistedGoalState(): GoalState {
-		const branch = this.sessionManager.getBranch();
+		const branch = this.sessionManager.getResidentBranch();
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const entry = branch[i];
 			if (
@@ -1436,7 +1436,7 @@ export class AgentSession {
 	 * and should not be reseeded.
 	 */
 	private _isBranchSeedable(): boolean {
-		const branch = this.sessionManager.getBranch();
+		const branch = this.sessionManager.getResidentBranch();
 		for (const entry of branch) {
 			switch (entry.type) {
 				case "model_change":
@@ -2434,7 +2434,7 @@ export class AgentSession {
 		if (!settings.enabled) return false;
 
 		const contextWindow = this.model?.contextWindow ?? 0;
-		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getResidentBranch());
 		const compactionTimestamp = compactionEntry ? new Date(compactionEntry.timestamp).getTime() : undefined;
 		if (compactionTimestamp !== undefined && context.message.timestamp <= compactionTimestamp) {
 			return false;
@@ -2621,11 +2621,11 @@ export class AgentSession {
 					};
 				}
 				const preparation = prepareCompaction(
-					this.sessionManager.getBranch(),
+					this.sessionManager.getResidentBranch(),
 					this.settingsManager.getCompactionSettings(),
 				);
 				if (!preparation) {
-					const lastEntry = this.sessionManager.getBranch().at(-1);
+					const lastEntry = this.sessionManager.getResidentBranch().at(-1);
 					return {
 						scheduled: false,
 						reason: lastEntry?.type === "compaction" ? "already compacted" : "session is too short to compact",
@@ -6488,7 +6488,7 @@ export class AgentSession {
 		signal: AbortSignal;
 	}): Promise<CompactionResult> {
 		const { model, apiKey, headers, customInstructions, signal } = options;
-		const pathEntries = this.sessionManager.getBranch();
+		const pathEntries = this.sessionManager.getResidentBranch();
 		const settings = this.settingsManager.getCompactionSettings();
 
 		const preparation = prepareCompaction(pathEntries, settings);
@@ -6507,7 +6507,7 @@ export class AgentSession {
 			const result = (await this._extensionRunner.emit({
 				type: "session_before_compact",
 				preparation,
-				branchEntries: pathEntries,
+				branchEntries: this.sessionManager.getBranch(),
 				customInstructions,
 				signal,
 			})) as SessionBeforeCompactResult | undefined;
@@ -6538,7 +6538,7 @@ export class AgentSession {
 			fromExtension,
 			customInstructions,
 		);
-		const newEntries = this.sessionManager.getEntries();
+		const newEntries = this.sessionManager.getResidentEntries();
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
 		this._mergeUnpersistedCompactionOutcomes(this.agent.state.messages);
 		this._restoreLateIpythonSentAgentMessages();
@@ -6555,6 +6555,7 @@ export class AgentSession {
 			});
 		}
 		await this._notifyKernelStateAfterCompaction();
+		this.sessionManager.evictCompactedHistoryPayloads();
 		await this._reapDeletedRlmSubagentRuntimesAfterCompaction();
 
 		return { summary, firstKeptEntryId, tokensBefore, details };
@@ -6970,7 +6971,7 @@ export class AgentSession {
 	private _loadRefinementHistory(): RefinementResult[] {
 		return mergeRefinementHistory(
 			loadGlobalRefinementHistory(getGlobalHarnessStateDir()),
-			getRefinementHistory(this.sessionManager.getEntries().filter((entry) => entry.type === "custom")),
+			getRefinementHistory(this.sessionManager.getResidentEntries().filter((entry) => entry.type === "custom")),
 		);
 	}
 
@@ -7356,7 +7357,7 @@ export class AgentSession {
 		// Skip overflow/threshold checks if this assistant message is older than the
 		// latest compaction boundary. This prevents a stale pre-compaction usage/error
 		// from retriggering compaction on the first prompt after compaction.
-		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getResidentBranch());
 		const compactionTimestamp = compactionEntry ? new Date(compactionEntry.timestamp).getTime() : undefined;
 		const assistantIsFromBeforeCompaction =
 			compactionTimestamp !== undefined && assistantMessage.timestamp <= compactionTimestamp;
@@ -8272,7 +8273,7 @@ export class AgentSession {
 
 	private _findAssistantEntryForMessage(message: AssistantMessage): SessionMessageEntry | undefined {
 		return this.sessionManager
-			.getEntries()
+			.getResidentEntries()
 			.find((entry): entry is SessionMessageEntry => entry.type === "message" && entry.message === message);
 	}
 
@@ -9776,7 +9777,7 @@ export class AgentSession {
 			return await this._turnAdmissionContext.run(admission.owner, async () => {
 				await this.agent.waitForIdle();
 				await this._agentEventQueue;
-				return this._navigateTreeUnderPause(targetId, targetEntry, options);
+				return this._navigateTreeUnderPause(targetId, options);
 			});
 		} finally {
 			queuedWorkPause.release();
@@ -9785,6 +9786,25 @@ export class AgentSession {
 	}
 
 	private async _navigateTreeUnderPause(
+		targetId: string,
+		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
+	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		if (targetId === this.sessionManager.getLeafId()) {
+			return { cancelled: false };
+		}
+		await this.sessionManager.hydrateBranchPayloads(targetId);
+		try {
+			const targetEntry = this.sessionManager.getEntry(targetId);
+			if (!targetEntry) {
+				throw new Error(`Entry ${targetId} not found`);
+			}
+			return await this._navigateTreeUnderPauseHydrated(targetId, targetEntry, options);
+		} finally {
+			this.sessionManager.evictCompactedHistoryPayloads();
+		}
+	}
+
+	private async _navigateTreeUnderPauseHydrated(
 		targetId: string,
 		targetEntry: NonNullable<ReturnType<SessionManager["getEntry"]>>,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string },
@@ -9800,11 +9820,13 @@ export class AgentSession {
 		// about to persist harness/session entries for the current branch.
 		await this._invalidatePendingAutoRefineForBranchChange();
 
-		// Collect entries to summarize (from old leaf to common ancestor)
-		const { entries: entriesToSummarize, commonAncestorId } = collectEntriesForBranchSummary(
+		// Full abandoned-branch payloads are only needed by summarization or extension hooks.
+		const hasBeforeTreeHandlers = this._extensionRunner.hasHandlers("session_before_tree");
+		const { entries: entriesToSummarize, commonAncestorId } = await collectEntriesForBranchSummary(
 			this.sessionManager,
 			oldLeafId,
 			targetId,
+			{ includePayloads: options.summarize || hasBeforeTreeHandlers },
 		);
 
 		// Prepare event data - mutable so extensions can override
@@ -9836,7 +9858,7 @@ export class AgentSession {
 			let fromExtension = false;
 
 			// Emit session_before_tree event
-			if (this._extensionRunner.hasHandlers("session_before_tree")) {
+			if (hasBeforeTreeHandlers) {
 				const result = (await this._extensionRunner.emit({
 					type: "session_before_tree",
 					preparation,
@@ -9981,14 +10003,18 @@ export class AgentSession {
 	/**
 	 * Get all user messages from session for fork selector.
 	 */
-	getUserMessagesForForking(): Array<{ entryId: string; text: string }> {
-		const entries = this.sessionManager.getEntries();
+	async getUserMessagesForForking(): Promise<Array<{ entryId: string; text: string }>> {
+		const residentUserEntries = this.sessionManager
+			.getResidentEntries()
+			.filter((entry) => entry.type === "message" && entry.message.role === "user");
+		const entriesById = await this.sessionManager.getEntriesById(
+			new Set(residentUserEntries.map((entry) => entry.id)),
+		);
 		const result: Array<{ entryId: string; text: string }> = [];
 
-		for (const entry of entries) {
-			if (entry.type !== "message") continue;
-			if (entry.message.role !== "user") continue;
-
+		for (const residentEntry of residentUserEntries) {
+			const entry = entriesById.get(residentEntry.id);
+			if (!entry || entry.type !== "message" || entry.message.role !== "user") continue;
 			const text = this._extractUserMessageText(entry.message.content);
 			if (text) {
 				result.push({ entryId: entry.id, text });
@@ -10067,7 +10093,7 @@ export class AgentSession {
 		// After compaction, the last assistant usage reflects pre-compaction context size.
 		// We can only trust usage from an assistant that responded after the latest compaction.
 		// If no such assistant exists, context token count is unknown until the next LLM response.
-		const branchEntries = this.sessionManager.getBranch();
+		const branchEntries = this.sessionManager.getResidentBranch();
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
 
 		if (latestCompaction) {
@@ -10121,8 +10147,8 @@ export class AgentSession {
 	getContextTree(): ContextTreeNode {
 		const resolveContextWindow = this._contextWindowResolver();
 		const { ownUsage, totalUsage } = computeOwnAndTotalUsage(
-			this.sessionManager.getBranch(),
-			this.sessionManager.getEntries(),
+			this.sessionManager.getResidentBranch(),
+			this.sessionManager.getResidentEntries(),
 		);
 
 		const children: ContextTreeNode[] = [];
@@ -10185,7 +10211,7 @@ export class AgentSession {
 	 * @param outputPath Target file path. If omitted, generates a timestamped file in cwd.
 	 * @returns The resolved output file path.
 	 */
-	exportToJsonl(outputPath?: string): string {
+	async exportToJsonl(outputPath?: string): Promise<string> {
 		const filePath = resolve(outputPath ?? `session-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`);
 		const dir = dirname(filePath);
 		if (!existsSync(dir)) {
@@ -10200,7 +10226,15 @@ export class AgentSession {
 			cwd: this.sessionManager.getCwd(),
 		};
 
-		const branchEntries = this.sessionManager.getBranch();
+		const residentBranch = this.sessionManager.getResidentBranch();
+		const fullEntriesById = await this.sessionManager.getEntriesById(
+			new Set(residentBranch.map((entry) => entry.id)),
+		);
+		const branchEntries = residentBranch.map((entry) => {
+			const fullEntry = fullEntriesById.get(entry.id);
+			if (!fullEntry) throw new Error(`Session entry ${entry.id} is unavailable for export`);
+			return fullEntry;
+		});
 		const lines = [JSON.stringify(header)];
 
 		// Re-chain parentIds to form a linear sequence

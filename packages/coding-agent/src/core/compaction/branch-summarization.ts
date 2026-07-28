@@ -95,44 +95,42 @@ export interface GenerateBranchSummaryOptions {
  * @param targetId - Target position (where we're navigating to)
  * @returns Entries to summarize and the common ancestor
  */
-export function collectEntriesForBranchSummary(
+export async function collectEntriesForBranchSummary(
 	session: ReadonlySessionManager,
 	oldLeafId: string | null,
 	targetId: string,
-): CollectEntriesResult {
-	// If no old position, nothing to summarize
+	options: { includePayloads?: boolean } = {},
+): Promise<CollectEntriesResult> {
 	if (!oldLeafId) {
 		return { entries: [], commonAncestorId: null };
 	}
 
-	// Find common ancestor (deepest node that's on both paths)
-	const oldPath = new Set(session.getBranch(oldLeafId).map((e) => e.id));
-	const targetPath = session.getBranch(targetId);
-
-	// targetPath is root-first, so iterate backwards to find deepest common ancestor
+	const oldPath = session.getResidentBranch(oldLeafId);
+	const oldIds = new Set(oldPath.map((entry) => entry.id));
+	const targetPath = session.getResidentBranch(targetId);
 	let commonAncestorId: string | null = null;
 	for (let i = targetPath.length - 1; i >= 0; i--) {
-		if (oldPath.has(targetPath[i].id)) {
+		if (oldIds.has(targetPath[i].id)) {
 			commonAncestorId = targetPath[i].id;
 			break;
 		}
 	}
 
-	// Collect entries from old leaf back to common ancestor
-	const entries: SessionEntry[] = [];
-	let current: string | null = oldLeafId;
-
-	while (current && current !== commonAncestorId) {
-		const entry = session.getEntry(current);
-		if (!entry) break;
-		entries.push(entry);
-		current = entry.parentId;
+	const firstEntryIndex = commonAncestorId ? oldPath.findIndex((entry) => entry.id === commonAncestorId) + 1 : 0;
+	const entries = oldPath.slice(firstEntryIndex);
+	if (options.includePayloads === false) {
+		return { entries, commonAncestorId };
 	}
 
-	// Reverse to get chronological order
-	entries.reverse();
-
-	return { entries, commonAncestorId };
+	const fullEntriesById = await session.getEntriesById(new Set(entries.map((entry) => entry.id)));
+	return {
+		entries: entries.map((entry) => {
+			const fullEntry = fullEntriesById.get(entry.id);
+			if (!fullEntry) throw new Error(`Session entry ${entry.id} is unavailable for branch summary`);
+			return fullEntry;
+		}),
+		commonAncestorId,
+	};
 }
 
 // ============================================================================

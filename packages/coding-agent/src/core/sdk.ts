@@ -186,8 +186,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Check if session has existing data to restore
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
-	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
-	const hasServiceTierEntry = sessionManager.getBranch().some((entry) => entry.type === "service_tier_change");
+	const residentBranch = sessionManager.getResidentBranch();
+	const hasThinkingEntry = residentBranch.some((entry) => entry.type === "thinking_level_change");
+	const hasServiceTierEntry = residentBranch.some((entry) => entry.type === "service_tier_change");
 
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;

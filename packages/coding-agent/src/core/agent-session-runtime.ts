@@ -547,7 +547,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		let targetLeafId: string | null;
 		let selectedText: string | undefined;
 
-		const selectedEntry = this.session.sessionManager.getEntry(entryId);
+		const selectedEntry = (await this.session.sessionManager.getEntriesById(new Set([entryId]))).get(entryId);
 		if (!selectedEntry) {
 			throw new Error("Invalid entry ID for forking");
 		}
@@ -591,7 +591,9 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				return { cancelled: false, selectedText };
 			}
 
-			const sourceManager = SessionManager.open(currentSessionFile, sessionDir);
+			const sourceManager = await SessionManager.openAsync(currentSessionFile, sessionDir, undefined, {
+				evictCompactedHistory: false,
+			});
 			const forkedSessionPath = sourceManager.createBranchedSession(targetLeafId);
 			if (!forkedSessionPath) {
 				throw new Error("Failed to create forked session");

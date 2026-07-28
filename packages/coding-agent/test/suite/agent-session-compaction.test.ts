@@ -1,4 +1,5 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { AgentMessage, ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, fauxAssistantMessage, type Model, type ToolResultMessage } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -100,6 +101,145 @@ describe("AgentSession compaction characterization", () => {
 		expect(result.summary).toBe("summary from extension");
 		expect(compactionEntries).toHaveLength(1);
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
+	});
+
+	it("evicts compacted history payloads after successful compaction", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "summary from extension",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const oldMessage = `old-${"x".repeat(64 * 1024)}`;
+		await harness.session.prompt(oldMessage);
+		const oldUserEntry = harness.sessionManager
+			.getResidentEntries()
+			.find((entry) => entry.type === "message" && entry.message.role === "user");
+		expect(oldUserEntry).toBeDefined();
+		await harness.session.prompt("recent");
+
+		await harness.session.compact();
+
+		expect(harness.sessionManager.getEvictedHistoryPayloadCount()).toBeGreaterThan(0);
+		expect(JSON.stringify(harness.sessionManager.getTree())).toContain("[Compacted history stored on disk]");
+		expect(JSON.stringify(harness.session.messages)).not.toContain(oldMessage);
+		const fullSessionRead = vi.spyOn(harness.sessionManager, "getEntries");
+		const targetedRead = vi.spyOn(harness.sessionManager, "getEntriesById");
+		const exportPath = await harness.session.exportToJsonl(join(harness.tempDir, "export.jsonl"));
+		expect(fullSessionRead).not.toHaveBeenCalled();
+		expect(targetedRead).toHaveBeenCalledOnce();
+		const exported = readFileSync(exportPath, "utf8");
+		expect(exported).toContain(oldMessage);
+		expect(exported).not.toContain("[Compacted history stored on disk]");
+
+		const evictedBeforeNavigation = harness.sessionManager.getEvictedHistoryPayloadCount();
+		const fullHistoryRead = vi.spyOn(harness.sessionManager, "getEntries");
+		const navigationResult = await harness.session.navigateTree(oldUserEntry!.id, { summarize: false });
+		expect(navigationResult).toMatchObject({ cancelled: false, editorText: oldMessage });
+		expect(fullHistoryRead).not.toHaveBeenCalled();
+		expect(harness.sessionManager.getEvictedHistoryPayloadCount()).toBeGreaterThanOrEqual(evictedBeforeNavigation);
+		expect(JSON.stringify(harness.sessionManager.getEntry(oldUserEntry!.id))).toContain(
+			"[Compacted history stored on disk]",
+		);
+	});
+
+	it("re-evicts targeted history when tree navigation is cancelled or throws", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "summary from extension",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+					pi.on("session_before_tree", () => ({ cancel: true }));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const oldMessage = `cancelled-old-${"x".repeat(64 * 1024)}`;
+		await harness.session.prompt(oldMessage);
+		const oldUserEntry = harness.sessionManager
+			.getResidentEntries()
+			.find((entry) => entry.type === "message" && entry.message.role === "user");
+		await harness.session.prompt("recent");
+		await harness.session.compact();
+		const leafBeforeNavigation = harness.sessionManager.getLeafId();
+		const evictedBeforeNavigation = harness.sessionManager.getEvictedHistoryPayloadCount();
+
+		await expect(harness.session.navigateTree(oldUserEntry!.id, { summarize: false })).resolves.toEqual({
+			cancelled: true,
+		});
+		expect(harness.sessionManager.getLeafId()).toBe(leafBeforeNavigation);
+		expect(harness.sessionManager.getEvictedHistoryPayloadCount()).toBeGreaterThanOrEqual(evictedBeforeNavigation);
+		expect(JSON.stringify(harness.sessionManager.getEntry(oldUserEntry!.id))).toContain(
+			"[Compacted history stored on disk]",
+		);
+
+		const realGetEntry = harness.sessionManager.getEntry.bind(harness.sessionManager);
+		let getEntryCalls = 0;
+		vi.spyOn(harness.sessionManager, "getEntry").mockImplementation((entryId) => {
+			getEntryCalls++;
+			if (getEntryCalls === 2) throw new Error("navigation failed after hydration");
+			return realGetEntry(entryId);
+		});
+		await expect(harness.session.navigateTree(oldUserEntry!.id, { summarize: false })).rejects.toThrow(
+			"navigation failed after hydration",
+		);
+		expect(harness.sessionManager.getEvictedHistoryPayloadCount()).toBeGreaterThanOrEqual(evictedBeforeNavigation);
+		expect(JSON.stringify(realGetEntry(oldUserEntry!.id))).toContain("[Compacted history stored on disk]");
+	});
+
+	it("passes full historic payloads to session_before_compact after prior eviction", async () => {
+		const branchSnapshots: string[] = [];
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => {
+						branchSnapshots.push(JSON.stringify(event.branchEntries));
+						return {
+							compaction: {
+								summary: `summary ${branchSnapshots.length}`,
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+								details: {},
+							},
+						};
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const historicMessage = `historic-extension-${"x".repeat(64 * 1024)}`;
+		await harness.session.prompt(historicMessage);
+		await harness.session.prompt("recent");
+		await harness.session.compact();
+		expect(harness.sessionManager.getEvictedHistoryPayloadCount()).toBeGreaterThan(0);
+
+		await harness.session.prompt("after first compaction");
+		await harness.session.compact();
+
+		expect(branchSnapshots).toHaveLength(2);
+		expect(branchSnapshots[1]).toContain(historicMessage);
+		expect(branchSnapshots[1]).not.toContain("[Compacted history stored on disk]");
 	});
 
 	it("retries cleanup for explicitly deleted subagents after compaction", async () => {

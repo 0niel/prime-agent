@@ -2880,6 +2880,7 @@ function createFakeConnectionSession(commandName: string): AgentSessionRuntime["
 			getSessionDir: () => "/tmp/sessions",
 			getLeafId: () => null,
 			getEntries: () => [],
+			getCompactionCount: () => 0,
 		},
 		getAvailableThinkingLevels: () => ["medium"],
 		getActiveToolNames: () => [],

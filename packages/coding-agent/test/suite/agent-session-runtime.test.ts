@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai";
@@ -479,7 +479,7 @@ describe("AgentSessionRuntime characterization", () => {
 
 		events.length = 0;
 		await runtime.session.prompt("hello");
-		const userMessage = runtime.session.getUserMessagesForForking()[0]!;
+		const userMessage = (await runtime.session.getUserMessagesForForking())[0]!;
 		const previousSessionFile = runtime.session.sessionFile;
 
 		const successResult = await runtime.fork(userMessage.entryId);
@@ -505,12 +505,65 @@ describe("AgentSessionRuntime characterization", () => {
 		expect(events).toEqual([{ type: "session_before_fork", entryId: "missing-entry", position: "at" }]);
 	});
 
+	it("forks before an evicted historic prompt with one full session load", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		const oldText = `historic-fork-${"x".repeat(64 * 1024)}`;
+		await runtime.session.prompt("prefix");
+		await runtime.session.prompt(oldText);
+		await runtime.session.prompt("recent");
+		const userEntries = runtime.session.sessionManager
+			.getResidentEntries()
+			.filter((entry) => entry.type === "message" && entry.message.role === "user");
+		const oldUserEntry = userEntries[1];
+		const recentUserEntry = userEntries.at(-1);
+		if (!oldUserEntry || !recentUserEntry) throw new Error("missing test prompt entries");
+		runtime.session.sessionManager.appendCompaction("summary", recentUserEntry.id, 1000);
+		expect(runtime.session.sessionManager.evictCompactedHistoryPayloads()).toBeGreaterThan(0);
+		expect(JSON.stringify(runtime.session.sessionManager.getEntry(oldUserEntry.id))).not.toContain(oldText);
+		const forkChoices = await runtime.session.getUserMessagesForForking();
+		expect(forkChoices.find((message) => message.entryId === oldUserEntry.id)?.text).toBe(oldText);
+		expect(runtime.session.sessionManager.getEvictedHistoryPayloadCount()).toBeGreaterThan(0);
+		const openSource = vi.spyOn(SessionManager, "openAsync");
+
+		const result = await runtime.fork(oldUserEntry.id);
+
+		expect(result).toEqual({ cancelled: false, selectedText: oldText });
+		expect(openSource).toHaveBeenCalledWith(expect.any(String), expect.any(String), undefined, {
+			evictCompactedHistory: false,
+		});
+	});
+
+	it("omits a compacted fork choice whose persisted payload is missing", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		await runtime.session.prompt("historic missing prompt");
+		await runtime.session.prompt("recent prompt");
+		const userEntries = runtime.session.sessionManager
+			.getResidentEntries()
+			.filter((entry) => entry.type === "message" && entry.message.role === "user");
+		const historicEntry = userEntries[0];
+		const recentEntry = userEntries[1];
+		if (!historicEntry || !recentEntry) throw new Error("missing test prompt entries");
+		runtime.session.sessionManager.appendCompaction("summary", recentEntry.id, 1000);
+		expect(runtime.session.sessionManager.evictCompactedHistoryPayloads()).toBeGreaterThan(0);
+		const sessionFile = runtime.session.sessionFile;
+		if (!sessionFile) throw new Error("missing session file");
+		const retainedLines = readFileSync(sessionFile, "utf8")
+			.trimEnd()
+			.split("\n")
+			.filter((line) => (JSON.parse(line) as { id?: string }).id !== historicEntry.id);
+		writeFileSync(sessionFile, `${retainedLines.join("\n")}\n`);
+
+		const choices = await runtime.session.getUserMessagesForForking();
+		expect(choices.some((choice) => choice.entryId === historicEntry.id)).toBe(false);
+		expect(JSON.stringify(choices)).not.toContain("[Compacted history stored on disk]");
+	});
+
 	it("forks before a selected middle prompt and preserves its selection metadata", async () => {
 		const { runtime } = await createRuntimeForTest(() => {});
 		await runtime.session.prompt("Say one");
 		await runtime.session.prompt("Say two");
 		await runtime.session.prompt("Say three");
-		const userMessages = runtime.session.getUserMessagesForForking();
+		const userMessages = await runtime.session.getUserMessagesForForking();
 		expect(userMessages.map((message) => message.text)).toEqual(["Say one", "Say two", "Say three"]);
 
 		const result = await runtime.fork(userMessages[1]!.entryId);
@@ -534,7 +587,7 @@ describe("AgentSessionRuntime characterization", () => {
 	it("forks before the first prompt in-memory and preserves its selection metadata", async () => {
 		const { runtime } = await createRuntimeForTest(() => {}, { inMemory: true });
 		await runtime.session.prompt("Say one");
-		const userMessages = runtime.session.getUserMessagesForForking();
+		const userMessages = await runtime.session.getUserMessagesForForking();
 
 		const result = await runtime.fork(userMessages[0]!.entryId);
 

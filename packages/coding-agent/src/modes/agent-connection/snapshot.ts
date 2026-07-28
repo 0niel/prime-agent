@@ -46,7 +46,7 @@ export function createAgentConnectionState(
 		autoCompactionEnabled: session.autoCompactionEnabled,
 		messageCount: session.messages.length,
 		pendingMessageCount: session.pendingMessageCount,
-		compactionCount: sessionManager.getEntries().filter((entry) => entry.type === "compaction").length,
+		compactionCount: sessionManager.getCompactionCount(),
 		goal: session.goalState,
 		scopedModels: session.scopedModels.map((scoped) => ({
 			model: toConnectionModel(scoped.model),

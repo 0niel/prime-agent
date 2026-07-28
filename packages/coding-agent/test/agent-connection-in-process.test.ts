@@ -82,6 +82,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 			getSessionDir: () => "/tmp/prime-agent-sessions",
 			getLeafId: () => `${id}-leaf`,
 			getEntries: () => [],
+			getCompactionCount: () => 0,
 			getTree: () => [],
 			buildSessionContext,
 		},
