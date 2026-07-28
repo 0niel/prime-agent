@@ -1,8 +1,14 @@
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { findMostRecentSession, loadEntriesFromFile, SessionManager } from "../../src/core/session-manager.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	findMostRecentSession,
+	loadEntriesFromFile,
+	loadEntriesFromFileAsync,
+	readSessionInfo,
+	SessionManager,
+} from "../../src/core/session-manager.js";
 
 describe("loadEntriesFromFile", () => {
 	let tempDir: string;
@@ -62,6 +68,91 @@ describe("loadEntriesFromFile", () => {
 		);
 		const entries = loadEntriesFromFile(file);
 		expect(entries).toHaveLength(2);
+	});
+
+	it("yields while parsing a multi-megabyte session below the streaming threshold", async () => {
+		const file = join(tempDir, "buffered.jsonl");
+		writeFileSync(
+			file,
+			[
+				'{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}',
+				JSON.stringify({
+					type: "message",
+					id: "1",
+					parentId: null,
+					timestamp: "2025-01-01T00:00:01Z",
+					message: { role: "user", content: "x".repeat(5 * 1024 * 1024), timestamp: 1 },
+				}),
+			].join("\n"),
+		);
+		const setImmediateSpy = vi.spyOn(globalThis, "setImmediate");
+		try {
+			const entries = await loadEntriesFromFileAsync(file, { streamThresholdBytes: Number.MAX_SAFE_INTEGER });
+			expect(entries).toHaveLength(2);
+			expect(setImmediateSpy).toHaveBeenCalled();
+		} finally {
+			setImmediateSpy.mockRestore();
+		}
+	});
+
+	it("streams large sessions with the same parsing semantics as the Buffer loader", async () => {
+		const file = join(tempDir, "streamed.jsonl");
+		writeFileSync(
+			file,
+			'{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\r\n' +
+				"\r\n" +
+				"not valid json\n" +
+				'{"type":"message","id":"1","parentId":null,"timestamp":"2025-01-01T00:00:01Z","message":{"role":"user","content":"héllo 世界","timestamp":1}}',
+		);
+
+		const streamed = await loadEntriesFromFileAsync(file, { streamThresholdBytes: 0 });
+		expect(streamed).toEqual(loadEntriesFromFile(file));
+	});
+
+	it("only treats LF bytes as JSONL record boundaries", async () => {
+		const file = join(tempDir, "unicode-separators.jsonl");
+		const content = "before\u2028middle\u2029after";
+		writeFileSync(
+			file,
+			[
+				'{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}',
+				JSON.stringify({
+					type: "message",
+					id: "1",
+					parentId: null,
+					timestamp: "2025-01-01T00:00:01Z",
+					message: { role: "user", content, timestamp: 1 },
+				}),
+			].join("\n"),
+		);
+
+		const streamed = await loadEntriesFromFileAsync(file, { streamThresholdBytes: 0 });
+		expect(streamed).toEqual(loadEntriesFromFile(file));
+		expect(streamed[1]).toMatchObject({ type: "message", message: { content } });
+		expect((await readSessionInfo(file))?.firstMessage).toBe(content);
+	});
+
+	it("streams a multi-megabyte JSONL record without losing following entries", async () => {
+		const file = join(tempDir, "large-record.jsonl");
+		const largeContent = "x".repeat(2 * 1024 * 1024);
+		writeFileSync(
+			file,
+			[
+				'{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}',
+				JSON.stringify({
+					type: "message",
+					id: "1",
+					parentId: null,
+					timestamp: "2025-01-01T00:00:01Z",
+					message: { role: "user", content: largeContent, timestamp: 1 },
+				}),
+				'{"type":"message","id":"2","parentId":"1","timestamp":"2025-01-01T00:00:02Z","message":{"role":"user","content":"after","timestamp":2}}',
+			].join("\n"),
+		);
+
+		const entries = await loadEntriesFromFileAsync(file, { streamThresholdBytes: 0 });
+		expect(entries).toHaveLength(3);
+		expect(entries[2]).toMatchObject({ type: "message", id: "2" });
 	});
 });
 

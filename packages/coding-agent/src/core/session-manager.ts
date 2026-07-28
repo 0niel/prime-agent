@@ -5,7 +5,6 @@ import {
 	appendFileSync,
 	chmodSync,
 	chownSync,
-	createReadStream,
 	existsSync,
 	mkdirSync,
 	readdirSync,
@@ -18,10 +17,9 @@ import {
 } from "fs";
 import { readdir, readFile, stat } from "fs/promises";
 import { basename, dirname, join, resolve } from "path";
-import { createInterface } from "readline";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
-import { readFirstLineSync } from "../utils/file-lines.js";
+import { readFirstLineSync, readLinesAsBuffers } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
 import {
 	type BashExecutionMessage,
@@ -36,6 +34,8 @@ export const CURRENT_SESSION_VERSION = 3;
 const SESSION_LIST_SEARCH_TEXT_MAX_CHARS = 64 * 1024;
 const SESSION_LIST_PARSE_MAX_LINE_CHARS = 1024 * 1024;
 const SESSION_LIST_LARGE_MESSAGE_PREVIEW_MAX_CHARS = 256;
+const SESSION_STREAMING_LOAD_THRESHOLD_BYTES = 128 * 1024 * 1024;
+const SESSION_ASYNC_PARSE_YIELD_BYTES = 4 * 1024 * 1024;
 
 // Entry types that can represent user intent (vs. daemon bookkeeping like
 // session_state/agent_status/git_state/child_usage_attributed). Used by
@@ -603,21 +603,41 @@ export function getDefaultSessionDir(_cwd: string, agentDir: string = getDefault
 
 // Decode per line off a Buffer: toString("utf8") on a whole large file is far slower
 // (one giant UTF-16 string). Splitting on 0x0a is UTF-8-safe.
+function appendEntryFromBuffer(entries: FileEntry[], buffer: Buffer, start = 0, end = buffer.length): void {
+	if (end <= start) return;
+	try {
+		entries.push(JSON.parse(buffer.toString("utf8", start, end)) as FileEntry);
+	} catch {
+		// Skip malformed or blank lines.
+	}
+}
+
 function parseEntriesFromBuffer(buffer: Buffer): FileEntry[] {
 	const entries: FileEntry[] = [];
-	const len = buffer.length;
 	let start = 0;
-	while (start < len) {
+	while (start < buffer.length) {
 		let end = buffer.indexOf(0x0a, start);
-		if (end === -1) end = len;
-		if (end > start) {
-			try {
-				entries.push(JSON.parse(buffer.toString("utf8", start, end)) as FileEntry);
-			} catch {
-				// skip malformed/blank lines
-			}
-		}
+		if (end === -1) end = buffer.length;
+		appendEntryFromBuffer(entries, buffer, start, end);
 		start = end + 1;
+	}
+	return entries;
+}
+
+async function parseEntriesFromBufferAsync(buffer: Buffer): Promise<FileEntry[]> {
+	const entries: FileEntry[] = [];
+	let start = 0;
+	let bytesSinceYield = 0;
+	while (start < buffer.length) {
+		let end = buffer.indexOf(0x0a, start);
+		if (end === -1) end = buffer.length;
+		appendEntryFromBuffer(entries, buffer, start, end);
+		bytesSinceYield += end - start + 1;
+		start = end + 1;
+		if (bytesSinceYield >= SESSION_ASYNC_PARSE_YIELD_BYTES) {
+			bytesSinceYield = 0;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
 	}
 	return entries;
 }
@@ -639,29 +659,25 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 }
 
 // Async loader for the daemon: reads off the event loop and yields while parsing so a
-// large load doesn't freeze other sessions. Identical output to loadEntriesFromFile.
-export async function loadEntriesFromFileAsync(filePath: string): Promise<FileEntry[]> {
+// large load doesn't freeze other sessions. Large files stream to avoid retaining both
+// the full input Buffer and the parsed entry graph at the same time.
+export async function loadEntriesFromFileAsync(
+	filePath: string,
+	options: { streamThresholdBytes?: number } = {},
+): Promise<FileEntry[]> {
 	if (!existsSync(filePath)) return [];
-	const buffer = await readFile(filePath);
+	const streamThresholdBytes = options.streamThresholdBytes ?? SESSION_STREAMING_LOAD_THRESHOLD_BYTES;
+	if ((await stat(filePath)).size < streamThresholdBytes) {
+		return finalizeLoadedEntries(await parseEntriesFromBufferAsync(await readFile(filePath)));
+	}
+
 	const entries: FileEntry[] = [];
-	const len = buffer.length;
-	// yield by bytes, not entry count: parse cost scales with bytes (handles a few huge entries too)
-	const YIELD_BYTES = 4 * 1024 * 1024;
-	let start = 0;
-	let lastYield = 0;
-	while (start < len) {
-		let end = buffer.indexOf(0x0a, start);
-		if (end === -1) end = len;
-		if (end > start) {
-			try {
-				entries.push(JSON.parse(buffer.toString("utf8", start, end)) as FileEntry);
-			} catch {
-				// Skip malformed/blank lines (JSON.parse rejects whitespace-only slices)
-			}
-		}
-		start = end + 1;
-		if (start - lastYield >= YIELD_BYTES) {
-			lastYield = start;
+	let bytesSinceYield = 0;
+	for await (const line of readLinesAsBuffers(filePath)) {
+		appendEntryFromBuffer(entries, line);
+		bytesSinceYield += line.length + 1;
+		if (bytesSinceYield >= SESSION_ASYNC_PARSE_YIELD_BYTES) {
+			bytesSinceYield = 0;
 			await new Promise<void>((resolve) => setImmediate(resolve));
 		}
 	}
@@ -920,8 +936,6 @@ export async function readSessionInfo(filePath: string): Promise<SessionInfo | n
 
 async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeof stat>>): Promise<SessionInfo | null> {
 	try {
-		const stream = createReadStream(filePath, { encoding: "utf8" });
-		const lines = createInterface({ input: stream, crlfDelay: Infinity });
 		let header: SessionHeader | undefined;
 		let messageCount = 0;
 		let firstMessage = "";
@@ -931,7 +945,8 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 		let agentStatus: AgentStatus | undefined;
 		let lastActivityTime: number | undefined;
 
-		for await (const line of lines) {
+		for await (const lineBuffer of readLinesAsBuffers(filePath)) {
+			const line = lineBuffer.toString("utf8");
 			if (!line.trim()) continue;
 
 			// Large tool-result entries can be many MB. They do not carry the
