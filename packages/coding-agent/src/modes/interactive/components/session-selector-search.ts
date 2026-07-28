@@ -23,6 +23,11 @@ function normalizeWhitespaceLower(text: string): string {
 	return text.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
+function normalizeSessionTitle(value: string | undefined): string {
+	if (value === "(no messages)" || value === "(large message)") return "";
+	return normalizeWhitespaceLower(value ?? "");
+}
+
 function getSessionSearchText(session: AgentConnectionSavedSessionInfo): string {
 	return `${session.id} ${session.name ?? ""} ${session.allMessagesText} ${session.cwd}`;
 }
@@ -121,44 +126,60 @@ export function parseSearchQuery(query: string): ParsedSearchQuery {
 	return { mode: "tokens", tokens, regex: null };
 }
 
+const STRICT_FUZZY_MAX_TOKEN_SCORE = 25;
+const SCORE_TIER_SIZE = 1000;
+
 export function matchSession(session: AgentConnectionSavedSessionInfo, parsed: ParsedSearchQuery): MatchResult {
 	const text = getSessionSearchText(session);
 
 	if (parsed.mode === "regex") {
-		if (!parsed.regex) {
-			return { matches: false, score: 0 };
-		}
+		if (!parsed.regex) return { matches: false, score: 0 };
 		const idx = text.search(parsed.regex);
-		if (idx < 0) return { matches: false, score: 0 };
-		return { matches: true, score: idx * 0.1 };
+		return idx < 0 ? { matches: false, score: 0 } : { matches: true, score: idx * 0.1 };
+	}
+	if (parsed.tokens.length === 0) return { matches: true, score: 0 };
+
+	const titles = [session.name, session.firstMessage].map(normalizeSessionTitle);
+	if (parsed.tokens.length > 1 && parsed.tokens.every((token) => token.kind === "fuzzy")) {
+		const query = parsed.tokens.map((token) => normalizeWhitespaceLower(token.value)).join(" ");
+		const exact = titles.indexOf(query);
+		const prefix = titles.findIndex((title) => title.startsWith(query));
+		const substring = titles.findIndex((title) => title.includes(query));
+		if (exact >= 0) return { matches: true, score: exact };
+		if (prefix >= 0) return { matches: true, score: SCORE_TIER_SIZE + prefix };
+		if (substring >= 0) return { matches: true, score: SCORE_TIER_SIZE * 2 + substring };
 	}
 
-	if (parsed.tokens.length === 0) {
-		return { matches: true, score: 0 };
-	}
-
-	let totalScore = 0;
-	let normalizedText: string | null = null;
-
+	const normalizedText = normalizeWhitespaceLower(text);
+	let worstTier = 0;
+	let tieScore = 0;
+	let matchedTokens = 0;
 	for (const token of parsed.tokens) {
-		if (token.kind === "phrase") {
-			if (normalizedText === null) {
-				normalizedText = normalizeWhitespaceLower(text);
+		const needle = normalizeWhitespaceLower(token.value);
+		if (!needle) continue;
+		const exact = titles.indexOf(needle);
+		const prefix = titles.findIndex((title) => title.startsWith(needle));
+		const substring = titles.findIndex((title) => title.includes(needle));
+		let tier: number;
+		let tie: number;
+		if (exact >= 0) [tier, tie] = [3, exact];
+		else if (prefix >= 0) [tier, tie] = [4, prefix];
+		else if (substring >= 0) [tier, tie] = [5, substring];
+		else {
+			const position = normalizedText.indexOf(needle);
+			if (position >= 0) [tier, tie] = [6, position];
+			else {
+				if (token.kind === "phrase") return { matches: false, score: 0 };
+				const match = fuzzyMatch(token.value, text);
+				if (!match.matches || match.score > STRICT_FUZZY_MAX_TOKEN_SCORE) return { matches: false, score: 0 };
+				[tier, tie] = [7, match.score];
 			}
-			const phrase = normalizeWhitespaceLower(token.value);
-			if (!phrase) continue;
-			const idx = normalizedText.indexOf(phrase);
-			if (idx < 0) return { matches: false, score: 0 };
-			totalScore += idx * 0.1;
-			continue;
 		}
-
-		const m = fuzzyMatch(token.value, text);
-		if (!m.matches) return { matches: false, score: 0 };
-		totalScore += m.score;
+		worstTier = Math.max(worstTier, tier);
+		tieScore += 0.5 + Math.atan(tie) / Math.PI;
+		matchedTokens++;
 	}
-
-	return { matches: true, score: totalScore };
+	return { matches: true, score: worstTier * SCORE_TIER_SIZE + tieScore / Math.max(1, matchedTokens) };
 }
 
 export function filterAndSortSessions(
