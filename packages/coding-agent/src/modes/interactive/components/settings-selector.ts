@@ -21,12 +21,12 @@ const SETTINGS_SUBMENU_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 
 const THINKING_DESCRIPTIONS: Record<ThinkingLevel, string> = {
 	off: "No reasoning",
-	minimal: "Very brief reasoning (~1k tokens)",
-	low: "Light reasoning (~2k tokens)",
-	medium: "Moderate reasoning (~8k tokens)",
-	high: "Deep reasoning (~16k tokens)",
-	xhigh: "Very deep reasoning (~32k tokens)",
-	max: "Maximum reasoning (unconstrained)",
+	minimal: "Very brief reasoning",
+	low: "Light reasoning",
+	medium: "Moderate reasoning",
+	high: "Deep reasoning",
+	xhigh: "Very deep reasoning",
+	max: "Maximum reasoning",
 };
 
 export interface SettingsConfig {
