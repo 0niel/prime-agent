@@ -152,7 +152,7 @@ function effectivePendingMessageCount(session: ActiveSessionState["runtime"]["se
 	return (
 		session.pendingMessageCount +
 		(session.hasAcceptedPromptInFlight ? 1 : 0) +
-		(session.hasActiveSessionInput ? 1 : 0)
+		(session.hasExecutingSessionCommand ? 1 : 0)
 	);
 }
 

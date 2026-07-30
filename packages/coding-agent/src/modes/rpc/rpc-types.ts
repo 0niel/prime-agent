@@ -152,6 +152,7 @@ export interface RpcSessionState {
 	autoCompactionEnabled: boolean;
 	messageCount: number;
 	pendingMessageCount: number;
+	hasActiveSessionInput?: boolean;
 	goal: GoalState;
 }
 

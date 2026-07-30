@@ -135,6 +135,7 @@ describe("buildSessionList", () => {
 				messages: oneMessage,
 				summaryState: { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"],
 				hasActiveSessionInput: true,
+				hasExecutingSessionCommand: true,
 			}),
 		);
 
@@ -142,6 +143,20 @@ describe("buildSessionList", () => {
 		expect(summary.hasActiveSessionInput).toBe(true);
 		expect(summary.activity).toBe("working");
 		expect(isSessionSummaryBusy(summary)).toBe(true);
+	});
+
+	it("does not double-count an active prompt that is still pending preparation", () => {
+		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
+		const state = makeState({
+			activeSessionId: "preparing-prompt",
+			messages: oneMessage,
+			hasActiveSessionInput: true,
+		});
+		(state.runtime.session as { pendingMessageCount: number }).pendingMessageCount = 1;
+
+		const summary = summaryForActiveSession(state);
+		expect(summary.pendingMessageCount).toBe(1);
+		expect(summary.hasActiveSessionInput).toBe(true);
 	});
 
 	it("marks a finished subagent idle instead of holding it at working", () => {
@@ -570,6 +585,7 @@ interface StateOptions {
 	hasRunningRlmChildren?: boolean;
 	hasAcceptedPromptInFlight?: boolean;
 	hasActiveSessionInput?: boolean;
+	hasExecutingSessionCommand?: boolean;
 	contextTokens?: number;
 	streamingMessage?: AgentMessage;
 	metadata?: {
@@ -618,6 +634,7 @@ function makeState(options: StateOptions): ActiveSessionState {
 				hasRunningRlmChildren: () => options.hasRunningRlmChildren ?? false,
 				hasAcceptedPromptInFlight: options.hasAcceptedPromptInFlight ?? false,
 				hasActiveSessionInput: options.hasActiveSessionInput ?? false,
+				hasExecutingSessionCommand: options.hasExecutingSessionCommand ?? false,
 				get hasSessionInputWork() {
 					return this.pendingMessageCount > 0 || this.hasActiveSessionInput;
 				},

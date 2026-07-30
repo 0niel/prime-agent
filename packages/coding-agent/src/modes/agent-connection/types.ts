@@ -336,6 +336,7 @@ export interface AgentConnectionState {
 	autoCompactionEnabled: boolean;
 	messageCount: number;
 	pendingMessageCount: number;
+	hasActiveSessionInput?: boolean;
 	compactionCount: number;
 	goal: GoalState;
 	heartbeat?: AgentCronJob | null;

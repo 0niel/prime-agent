@@ -5609,6 +5609,10 @@ export class AgentSession {
 		return this._activeSessionInput !== undefined;
 	}
 
+	get hasExecutingSessionCommand(): boolean {
+		return this._activeSessionInput?.kind === "command";
+	}
+
 	get hasSessionInputWork(): boolean {
 		return this.pendingMessageCount > 0 || this.hasActiveSessionInput;
 	}
