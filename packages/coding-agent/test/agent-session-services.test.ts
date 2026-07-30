@@ -82,6 +82,7 @@ describe("createAgentSessionFromServices", () => {
 						cwd: tempDir,
 						isStreaming: false,
 						pendingMessageCount: 0,
+						hasActiveSessionInput: false,
 					},
 				],
 			}),

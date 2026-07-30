@@ -1623,6 +1623,64 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(catchUpClient).not.toHaveBeenCalled();
 	});
 
+	it("refreshes remote agent peers when session input activity changes", async () => {
+		const activeSessionId = "active-queue-update";
+		const firstRefresh = createDeferred();
+		const secondRefresh = createDeferred();
+		let refreshes = 0;
+		const refreshWorkerSummaries = vi.fn(async () => {
+			refreshes++;
+			if (refreshes === 1) await firstRefresh.promise;
+			if (refreshes === 2) await secondRefresh.promise;
+		});
+		const syncAgentPeers = vi.fn(async () => undefined);
+		const worker = {
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			incomingTranscriptActiveSessionIds: new Set(),
+			duplicateIncomingTranscriptChunkIndexes: new Map(),
+			snapshotTransferFrames: new Map(),
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			clients: new Set(),
+			streamReconstructor: { observe: vi.fn() },
+			invalidateWorkerSnapshot: vi.fn(),
+			refreshWorkerSummaries,
+			syncAgentPeers,
+			pendingAgentPeerRefreshes: new Set(),
+			activeAgentPeerRefreshes: new Set(),
+			agentPeerSyncQueue: Promise.resolve(),
+		}) as {
+			handleWorkerFrame(residentWorker: typeof worker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+		const frame: PrivateFrame<DaemonWorkerFrameHeader> = {
+			header: {
+				kind: "outbound",
+				outboundType: "session_event",
+				activeSessionId,
+				sessionEventType: "queue_update",
+			},
+			payload: Buffer.from(
+				`${JSON.stringify({
+					type: "session_event",
+					activeSessionId,
+					event: { type: "queue_update", steering: [], followUp: [] },
+				})}\n`,
+			),
+		};
+
+		supervisor.handleWorkerFrame(worker, frame);
+		await vi.waitFor(() => expect(refreshWorkerSummaries).toHaveBeenCalledTimes(1));
+		supervisor.handleWorkerFrame(worker, frame);
+		expect(refreshWorkerSummaries).toHaveBeenCalledTimes(1);
+		firstRefresh.resolve();
+		await vi.waitFor(() => expect(refreshWorkerSummaries).toHaveBeenCalledTimes(2));
+		expect(syncAgentPeers).toHaveBeenCalledTimes(1);
+		secondRefresh.resolve();
+		await vi.waitFor(() => expect(syncAgentPeers).toHaveBeenCalledTimes(2));
+		expect(refreshWorkerSummaries).toHaveBeenCalledWith(worker);
+	});
+
 	it("subscribes to worker updates with chunked snapshots", async () => {
 		type SubscriptionWorker = {
 			client: { requestWorker: (command: unknown) => Promise<{ success: boolean }> };

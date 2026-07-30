@@ -4136,6 +4136,7 @@ export class AgentDaemon {
 			isStreaming: state.runtime.session.isStreaming,
 			pendingMessageCount:
 				state.runtime.session.pendingMessageCount + (state.runtime.session.hasAcceptedPromptInFlight ? 1 : 0),
+			hasActiveSessionInput: state.runtime.session.hasActiveSessionInput,
 			...(metadata.parentActiveSessionId ? { parentActiveSessionId: metadata.parentActiveSessionId } : {}),
 			...(metadata.rlmChildId ? { rlmChildId: metadata.rlmChildId } : {}),
 		};

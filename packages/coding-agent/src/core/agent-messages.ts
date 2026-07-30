@@ -32,6 +32,7 @@ export interface AgentSessionMessageAgentSummary extends AgentSessionMessageEndp
 	cwd: string;
 	isStreaming: boolean;
 	pendingMessageCount: number;
+	hasActiveSessionInput: boolean;
 	parentActiveSessionId?: string;
 	rlmChildId?: string;
 }

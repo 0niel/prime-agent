@@ -149,11 +149,7 @@ export function buildSessionList(
 }
 
 function effectivePendingMessageCount(session: ActiveSessionState["runtime"]["session"]): number {
-	return (
-		session.pendingMessageCount +
-		(session.hasAcceptedPromptInFlight ? 1 : 0) +
-		(session.hasExecutingSessionCommand ? 1 : 0)
-	);
+	return session.pendingMessageCount + (session.hasAcceptedPromptInFlight ? 1 : 0);
 }
 
 export function summaryForActiveSession(

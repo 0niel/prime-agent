@@ -1661,6 +1661,40 @@ describe("daemon mode helpers", () => {
 		expect(internals.createAgentMessageListResult(targetState).agents[0]?.pendingMessageCount).toBe(3);
 	});
 
+	it("reports active session input separately from agent-message queue depth", () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const targetState = makeState("target");
+		targetState.runtime = {
+			...targetState.runtime,
+			cwd: "/tmp",
+			session: {
+				sessionId: "session-target",
+				sessionName: "Target",
+				isStreaming: false,
+				pendingMessageCount: 0,
+				hasAcceptedPromptInFlight: false,
+				hasActiveSessionInput: true,
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createAgentMessageListResult(current: ActiveSessionState): {
+				agents: Array<{ pendingMessageCount: number; hasActiveSessionInput: boolean }>;
+			};
+		};
+		internals.sessions.set(targetState.activeSessionId, targetState);
+
+		expect(internals.createAgentMessageListResult(targetState).agents[0]).toMatchObject({
+			pendingMessageCount: 0,
+			hasActiveSessionInput: true,
+		});
+	});
+
 	it("reports non-streaming busy sessions as active in agent-observe summaries", () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },

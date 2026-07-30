@@ -5094,6 +5094,7 @@ export class AgentSession {
 					} finally {
 						this._activeSessionInput = undefined;
 						this._notifySessionInputCheckpointChange();
+						this._emitQueueUpdate();
 					}
 				} finally {
 					admission.release();
@@ -5607,10 +5608,6 @@ export class AgentSession {
 
 	get hasActiveSessionInput(): boolean {
 		return this._activeSessionInput !== undefined;
-	}
-
-	get hasExecutingSessionCommand(): boolean {
-		return this._activeSessionInput?.kind === "command";
 	}
 
 	get hasSessionInputWork(): boolean {

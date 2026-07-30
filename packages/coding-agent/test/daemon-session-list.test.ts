@@ -127,7 +127,7 @@ describe("buildSessionList", () => {
 		expect(summary.activity).toBe("working");
 	});
 
-	it("marks active session input explicitly while preserving the legacy busy count", () => {
+	it("marks active session input without reporting it as queued", () => {
 		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
 		const summary = summaryForActiveSession(
 			makeState({
@@ -135,11 +135,10 @@ describe("buildSessionList", () => {
 				messages: oneMessage,
 				summaryState: { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"],
 				hasActiveSessionInput: true,
-				hasExecutingSessionCommand: true,
 			}),
 		);
 
-		expect(summary.pendingMessageCount).toBe(1);
+		expect(summary.pendingMessageCount).toBe(0);
 		expect(summary.hasActiveSessionInput).toBe(true);
 		expect(summary.activity).toBe("working");
 		expect(isSessionSummaryBusy(summary)).toBe(true);
@@ -585,7 +584,6 @@ interface StateOptions {
 	hasRunningRlmChildren?: boolean;
 	hasAcceptedPromptInFlight?: boolean;
 	hasActiveSessionInput?: boolean;
-	hasExecutingSessionCommand?: boolean;
 	contextTokens?: number;
 	streamingMessage?: AgentMessage;
 	metadata?: {
@@ -634,7 +632,6 @@ function makeState(options: StateOptions): ActiveSessionState {
 				hasRunningRlmChildren: () => options.hasRunningRlmChildren ?? false,
 				hasAcceptedPromptInFlight: options.hasAcceptedPromptInFlight ?? false,
 				hasActiveSessionInput: options.hasActiveSessionInput ?? false,
-				hasExecutingSessionCommand: options.hasExecutingSessionCommand ?? false,
 				get hasSessionInputWork() {
 					return this.pendingMessageCount > 0 || this.hasActiveSessionInput;
 				},

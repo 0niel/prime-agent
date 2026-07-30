@@ -582,6 +582,8 @@ export class DaemonSupervisor {
 	private commandJournal!: CommandRecoveryJournal;
 	private readonly streamReconstructor = new CompactAssistantStreamReconstructor();
 	private readonly compactCatchupInProgress = new Set<string>();
+	private readonly pendingAgentPeerRefreshes = new Set<ResidentWorker>();
+	private readonly activeAgentPeerRefreshes = new Set<ResidentWorker>();
 	private agentPeerSyncQueue: Promise<void> = Promise.resolve();
 	private readonly catalog: DaemonCatalogClient;
 
@@ -2608,6 +2610,25 @@ export class DaemonSupervisor {
 		);
 	}
 
+	private scheduleAgentPeerRefresh(worker: ResidentWorker): void {
+		this.pendingAgentPeerRefreshes.add(worker);
+		if (this.activeAgentPeerRefreshes.has(worker)) return;
+		this.activeAgentPeerRefreshes.add(worker);
+		void (async () => {
+			try {
+				while (this.pendingAgentPeerRefreshes.delete(worker)) {
+					await this.refreshWorkerSummaries(worker);
+					await this.syncAgentPeers();
+				}
+			} catch {
+				// Best-effort peer status refresh; the next session event retries it.
+			} finally {
+				this.activeAgentPeerRefreshes.delete(worker);
+				if (this.pendingAgentPeerRefreshes.has(worker)) this.scheduleAgentPeerRefresh(worker);
+			}
+		})();
+	}
+
 	private async refreshWorkerSummaries(worker: ResidentWorker, recovery = false): Promise<void> {
 		if (!worker.client) {
 			throw new Error("Session worker is not connected");
@@ -2684,6 +2705,7 @@ export class DaemonSupervisor {
 			cwd: summary.cwd,
 			isStreaming: summary.isStreaming,
 			pendingMessageCount: summary.pendingMessageCount,
+			hasActiveSessionInput: summary.hasActiveSessionInput ?? false,
 			...(summary.parentActiveSessionId ? { parentActiveSessionId: summary.parentActiveSessionId } : {}),
 			...(summary.rlmChildId ? { rlmChildId: summary.rlmChildId } : {}),
 		};
@@ -3621,11 +3643,10 @@ export class DaemonSupervisor {
 		} else if (
 			sessionEventType === "turn_start" ||
 			sessionEventType === "turn_end" ||
+			sessionEventType === "queue_update" ||
 			sessionEventType === "rlm_child_update"
 		) {
-			void this.refreshWorkerSummaries(worker)
-				.then(() => this.syncAgentPeers())
-				.catch(() => undefined);
+			this.scheduleAgentPeerRefresh(worker);
 		}
 		if (
 			decodedOutbound?.type === "session_closed" &&
