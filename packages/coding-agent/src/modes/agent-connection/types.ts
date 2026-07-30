@@ -248,11 +248,14 @@ export type AgentConnectionSessionEntry =
 	| AgentConnectionAgentStatusEntry
 	| AgentConnectionGitStateEntry;
 
-export interface AgentConnectionSessionTreeNode {
+export interface AgentConnectionSessionTreeFlatNode {
 	entry: AgentConnectionSessionEntry;
-	children: AgentConnectionSessionTreeNode[];
 	label?: string;
 	labelTimestamp?: string;
+}
+
+export interface AgentConnectionSessionTreeNode extends AgentConnectionSessionTreeFlatNode {
+	children: AgentConnectionSessionTreeNode[];
 }
 
 export interface AgentConnectionSessionContext {

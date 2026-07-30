@@ -215,6 +215,21 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("rejects flat session-tree requests to an old daemon", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, 5);
+
+		await expect(client.request({ type: "get_session_tree", activeSessionId: "active-1" })).rejects.toThrow(
+			"does not support get_session_tree",
+		);
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
 	it("rejects session input admission clearly when an old daemon lacks the capability", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();

@@ -42,6 +42,7 @@ import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js
 import {
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
+	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_PROTOCOL_INFO,
@@ -1015,12 +1016,12 @@ export class DaemonSupervisor {
 	): {
 		command: DaemonCommand;
 		envelopeClientId?: string;
+		protocolVersion: number;
 		admission?: SupervisorPromptAdmission;
 	} {
 		const parsed = JSON.parse(line) as unknown;
-		const command = (
-			isDaemonCommandEnvelope(parsed) ? { ...parsed.command, id: parsed.id } : parsed
-		) as DaemonCommand;
+		const envelope = isDaemonCommandEnvelope(parsed) ? parsed : undefined;
+		const command = (envelope ? { ...envelope.command, id: envelope.id } : parsed) as DaemonCommand;
 		let admission: SupervisorPromptAdmission | undefined;
 		if ((command.type === "prompt" || command.type === "prompt_and_wait") && command.admissionId !== undefined) {
 			if (typeof command.activeSessionId !== "string" || typeof command.admissionId !== "string") {
@@ -1044,7 +1045,8 @@ export class DaemonSupervisor {
 		}
 		return {
 			command,
-			envelopeClientId: isDaemonCommandEnvelope(parsed) ? (parsed.clientId ?? client.id) : undefined,
+			envelopeClientId: envelope ? (envelope.clientId ?? client.id) : undefined,
+			protocolVersion: envelope?.protocol.version ?? 1,
 			admission,
 		};
 	}
@@ -1086,6 +1088,20 @@ export class DaemonSupervisor {
 		this.cancelOwnedWorkerCleanup(client.id);
 		if (!DAEMON_COMMAND_TYPES.has(command.type)) {
 			this.write(client, failure(command.id, command.type, `Unknown daemon command: ${command.type}`));
+			return;
+		}
+		if (
+			command.type === "get_session_tree" &&
+			preParsed.protocolVersion < DAEMON_COMMAND_COMPATIBILITY.get_session_tree.minProtocol
+		) {
+			this.write(
+				client,
+				failure(
+					command.id,
+					command.type,
+					`get_session_tree requires client protocol ${DAEMON_COMMAND_COMPATIBILITY.get_session_tree.minProtocol} or newer`,
+				),
+			);
 			return;
 		}
 

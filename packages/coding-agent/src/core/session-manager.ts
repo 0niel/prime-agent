@@ -261,13 +261,16 @@ export type SessionEntry =
 export type FileEntry = SessionHeader | SessionEntry;
 
 /** Tree node for getTree() - defensive copy of session structure */
-export interface SessionTreeNode {
+export interface SessionTreeFlatNode {
 	entry: SessionEntry;
-	children: SessionTreeNode[];
 	/** Resolved label for this entry, if any */
 	label?: string;
 	/** Timestamp of the latest label change for this entry, if any */
 	labelTimestamp?: string;
+}
+
+export interface SessionTreeNode extends SessionTreeFlatNode {
+	children: SessionTreeNode[];
 }
 
 export interface SessionContext {
@@ -1797,20 +1800,27 @@ export class SessionManager {
 	 * A well-formed session has exactly one root (first entry with parentId === null).
 	 * Orphaned entries (broken parent chain) are also returned as roots.
 	 */
+	getFlatTree(): SessionTreeFlatNode[] {
+		return this.getEntries().map((entry) => ({
+			entry,
+			label: this.labelsById.get(entry.id),
+			labelTimestamp: this.labelTimestampsById.get(entry.id),
+		}));
+	}
+
 	getTree(): SessionTreeNode[] {
-		const entries = this.getEntries();
+		const entries = this.getFlatTree();
 		const nodeMap = new Map<string, SessionTreeNode>();
 		const roots: SessionTreeNode[] = [];
 
 		// Create nodes with resolved labels
-		for (const entry of entries) {
-			const label = this.labelsById.get(entry.id);
-			const labelTimestamp = this.labelTimestampsById.get(entry.id);
-			nodeMap.set(entry.id, { entry, children: [], label, labelTimestamp });
+		for (const flatNode of entries) {
+			nodeMap.set(flatNode.entry.id, { ...flatNode, children: [] });
 		}
 
 		// Build tree
-		for (const entry of entries) {
+		for (const flatNode of entries) {
+			const entry = flatNode.entry;
 			const node = nodeMap.get(entry.id)!;
 			if (entry.parentId === null || entry.parentId === entry.id) {
 				roots.push(node);

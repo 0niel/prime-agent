@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed `/tree` overflowing the daemon serializer on very deep sessions by transferring a flat session tree.
+
 - Added starting a new session directly from the agents view with `ctrl+n`.
 - Added queueing a reply as a follow-up with `alt+enter` in the agents-view reply composer; plain Enter now steers a streaming agent.
 - Added session-owned slash commands (`/compact`, `/refine`, `/goal`, `/autonomous`) with autocomplete to the agents-view reply composer; other built-in commands are rejected with guidance instead of being sent as prompt text.

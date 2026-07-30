@@ -3746,7 +3746,7 @@ export class AgentDaemon {
 			case "get_session_tree": {
 				const state = this.getSessionState(command.activeSessionId);
 				return success(command.id, "get_session_tree", {
-					tree: state.runtime.session.sessionManager.getTree(),
+					flatNodes: state.runtime.session.sessionManager.getFlatTree(),
 					leafId: state.runtime.session.sessionManager.getLeafId(),
 				});
 			}
