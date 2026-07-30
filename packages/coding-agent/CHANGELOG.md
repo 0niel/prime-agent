@@ -6,6 +6,7 @@
 - Changed collapsed edit and IPython tool calls to show compact per-file line-change summaries while keeping full diffs available when expanded.
 - Changed session search to rank exact name and first-message matches before prefix, substring, and stricter transcript fuzzy matches.
 - Fixed daemon startup failing when an interrupted supervisor left an empty ownership directory.
+- Fixed `/effort xhigh` and `/effort max` being rejected as unknown levels when no model was active yet.
 
 ## [0.3.3] - 2026-07-23
 
