@@ -2,7 +2,13 @@
 
 ## [Unreleased]
 
+- Added starting a new session directly from the agents view with `ctrl+n`.
+- Added queueing a reply as a follow-up with `alt+enter` in the agents-view reply composer; plain Enter now steers a streaming agent.
+- Added session-owned slash commands (`/compact`, `/refine`, `/goal`, `/autonomous`) with autocomplete to the agents-view reply composer; other built-in commands are rejected with guidance instead of being sent as prompt text.
+- Added `/name` and `/kill` view commands to the agents view reply composer, acting on its armed target; the search bar stays pure search.
 - Added `/new` support for an optional stable session name and initial prompt.
+- Removed the `/resume` command and bare `--resume`; browse sessions with left-arrow from a chat (daemon view), and use `--resume <session-id|path>` for direct resumes.
+- Fixed `prime-agent agents` opening a new chat when running with a process-local session.
 - Changed collapsed edit and IPython tool calls to show compact per-file line-change summaries while keeping full diffs available when expanded.
 - Changed bare `/effort` to open a selector for the current model's supported reasoning levels.
 - Changed session search to rank exact name and first-message matches before prefix, substring, and stricter transcript fuzzy matches.
@@ -15,7 +21,9 @@
 - Removed the bundled orchestration heartbeat skill from the model system prompt.
 - Fixed feature hints crowding queued messages and side questions by placing them below the recap and hiding them while messages are queued ([ENG-4741](https://linear.app/primeintellect/issue/ENG-4741/recap-queuefollow-upmessage-hint-looks-cluttered)).
 - Fixed `/btw` truncating long answers by rendering side questions in the scrollable transcript.
+- Changed recognized slash commands to retain accent coloring after submission in live, replayed, and queued TUI surfaces while preserving Markdown arguments.
 - Unified prompt, steering, follow-up, and session-command scheduling under session-owned admission with durable queue state and coordinated update/restart checkpoints.
+- Unified Agents View and session resume into one searchable Running/Idle/Inactive session view with live heartbeat badges.
 - Changed selection cursors from `→` to `›` across model selectors, scoped-models, and the theme default for consistency with tree and user-message selectors.
 - Changed the queued follow-up hint connector from `↳` to `╰─` to match the tool-execution continuation connector.
 - Changed `/context` tree connectors from `├ `/`└ ` to `├─ `/`└─ ` to match the tree selector and session picker.

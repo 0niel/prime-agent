@@ -27,6 +27,7 @@ import {
 	ORPHAN_PROCESS_JOURNAL_ENV,
 	readActiveOrphanProcesses,
 } from "../../core/orphan-process-journal.js";
+import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import { canonicalSessionPath, getProcessStartId, SessionAlreadyActiveError } from "../../core/session-lease.js";
 import type { SessionInfo } from "../../core/session-manager.js";
 import { signalProcessGroupOrProcess } from "../../utils/child-process.js";
@@ -286,6 +287,10 @@ interface SupervisorPromptAdmission {
 	workerActiveSessionId?: string;
 }
 
+function throwIfAdmissionCancelled(admission: SupervisorPromptAdmission | undefined): void {
+	if (admission?.status === "cancelled") throw new PromptAdmissionCancelledError();
+}
+
 class SupervisorRecoveryCancelledError extends Error {
 	readonly code = "supervisor_recovery_cancelled" as const;
 }
@@ -315,33 +320,6 @@ function isSupervisorShutdownAdmissionCancelled(error: unknown): boolean {
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
-}
-
-export function waitForSupervisorPromptAdmission<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
-	if (!signal) return promise;
-	if (signal.aborted) {
-		void promise.catch(() => {});
-		return Promise.reject(new Error("Prompt admission was cancelled."));
-	}
-	return new Promise<T>((resolve, reject) => {
-		const cleanup = () => signal.removeEventListener("abort", onAbort);
-		const onAbort = () => {
-			cleanup();
-			reject(new Error("Prompt admission was cancelled."));
-		};
-		signal.addEventListener("abort", onAbort, { once: true });
-		if (signal.aborted) return onAbort();
-		promise.then(
-			(value) => {
-				cleanup();
-				resolve(value);
-			},
-			(error: unknown) => {
-				cleanup();
-				reject(error);
-			},
-		);
-	});
 }
 
 function unrefDelay(ms: number): Promise<void> {
@@ -1094,7 +1072,7 @@ export class DaemonSupervisor {
 			cancellationAdmission.controller.abort();
 		}
 		try {
-			await waitForSupervisorPromptAdmission(this.ready, parsedAdmission?.controller.signal);
+			await waitForPromptAdmission(this.ready, parsedAdmission?.controller.signal);
 		} catch (error) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 			this.write(client, failure(command.id, command.type, error));
@@ -1112,7 +1090,7 @@ export class DaemonSupervisor {
 		}
 
 		try {
-			await waitForSupervisorPromptAdmission(this.assertCurrentOwnership(), parsedAdmission?.controller.signal);
+			await waitForPromptAdmission(this.assertCurrentOwnership(), parsedAdmission?.controller.signal);
 		} catch (error) {
 			if (parsedAdmission) this.deletePromptAdmission(parsedAdmission);
 			this.write(client, failure(command.id, command.type, error));
@@ -1617,14 +1595,12 @@ export class DaemonSupervisor {
 				? this.getPromptAdmission(client, command.activeSessionId, command.admissionId)
 				: undefined;
 		try {
-			if (admission?.status === "cancelled") throw new Error("Prompt admission was cancelled.");
-			const match = await waitForSupervisorPromptAdmission(
+			throwIfAdmissionCancelled(admission);
+			const match = await waitForPromptAdmission(
 				this.findWorkerForClient(client, command.activeSessionId),
 				admission?.controller.signal,
 			);
-			if ((admission as { status: string } | undefined)?.status === "cancelled") {
-				throw new Error("Prompt admission was cancelled.");
-			}
+			throwIfAdmissionCancelled(admission);
 			const resolvedCommand = {
 				...command,
 				activeSessionId: match.summary.activeSessionId ?? match.summary.id,

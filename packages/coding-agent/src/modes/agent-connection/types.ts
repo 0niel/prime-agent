@@ -739,6 +739,7 @@ export interface AgentConnection {
 
 export interface AgentConnectionSessionWatcher {
 	getMessages(): Promise<AgentMessage[]>;
+	getCommands(): Promise<AgentConnectionSlashCommand[]>;
 	subscribe(listener: AgentConnectionEventListener): () => void;
 	getToolDefinition(name: string): Promise<AgentConnectionToolDefinition | undefined>;
 	close(): Promise<void>;

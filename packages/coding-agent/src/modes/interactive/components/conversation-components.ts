@@ -35,6 +35,7 @@ export interface ConversationComponentsOptions {
 	hideThinkingBlock?: boolean;
 	hiddenThinkingLabel?: string;
 	toolsExpanded?: boolean;
+	isRecognizedSlashCommand?: (name: string) => boolean;
 }
 
 function readUserText(content: string | Array<{ type: string; text?: string }>): string {
@@ -137,7 +138,7 @@ export function buildConversationComponents(
 			// An image-only prompt has no text; show a placeholder rather than dropping it.
 			const display = text || (hasContent ? "[image]" : "");
 			if (display) {
-				components.push(new UserMessageComponent(display, options.markdownTheme));
+				components.push(new UserMessageComponent(display, options.markdownTheme, options.isRecognizedSlashCommand));
 			}
 		}
 		// Non-conversational messages (bash/branch-summary/compaction/other custom) aren't shown.

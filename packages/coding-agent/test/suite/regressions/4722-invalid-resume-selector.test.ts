@@ -8,7 +8,6 @@ import {
 	SessionSelectorNotFoundError,
 } from "../../../src/cli/session-resolver.js";
 import { SessionManager } from "../../../src/core/session-manager.js";
-import { SettingsManager } from "../../../src/core/settings-manager.js";
 import { createSessionManager } from "../../../src/main.js";
 import { createHarness, type Harness } from "../harness.js";
 
@@ -31,9 +30,7 @@ describe("ENG-4722 invalid resume selectors", () => {
 		const parsed = parseArgs(["--resume", mistypedId, "do not submit this"]);
 		const sessionDir = join(harness.tempDir, "sessions");
 
-		await expect(
-			createSessionManager(parsed, harness.tempDir, sessionDir, SettingsManager.inMemory()),
-		).rejects.toMatchObject({
+		await expect(createSessionManager(parsed, harness.tempDir, sessionDir)).rejects.toMatchObject({
 			name: SessionSelectorNotFoundError.name,
 			selector: mistypedId,
 			suggestion: sessionId,
@@ -55,9 +52,7 @@ describe("ENG-4722 invalid resume selectors", () => {
 		createSavedSession(harness.tempDir, sessionDir, "11111111-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
 		const parsed = parseArgs(["--resume", "11111111", "do not submit this"]);
 
-		await expect(
-			createSessionManager(parsed, harness.tempDir, sessionDir, SettingsManager.inMemory()),
-		).rejects.toMatchObject({
+		await expect(createSessionManager(parsed, harness.tempDir, sessionDir)).rejects.toMatchObject({
 			name: SessionSelectorAmbiguousError.name,
 			selector: "11111111",
 		});
@@ -71,12 +66,7 @@ describe("ENG-4722 invalid resume selectors", () => {
 		createSavedSession(harness.tempDir, sessionDir, sessionId);
 		const parsed = parseArgs(["--resume", "aaaaaaaaaaaa"]);
 
-		const sessionManager = await createSessionManager(
-			parsed,
-			harness.tempDir,
-			sessionDir,
-			SettingsManager.inMemory(),
-		);
+		const sessionManager = await createSessionManager(parsed, harness.tempDir, sessionDir);
 
 		expect(sessionManager.getSessionId()).toBe(sessionId);
 	});
@@ -89,12 +79,7 @@ describe("ENG-4722 invalid resume selectors", () => {
 		createSavedSession(harness.tempDir, sessionDir, "1abcd");
 		const parsed = parseArgs(["--resume", "AB-CD"]);
 
-		const sessionManager = await createSessionManager(
-			parsed,
-			harness.tempDir,
-			sessionDir,
-			SettingsManager.inMemory(),
-		);
+		const sessionManager = await createSessionManager(parsed, harness.tempDir, sessionDir);
 
 		expect(sessionManager.getSessionId()).toBe("abcd");
 	});

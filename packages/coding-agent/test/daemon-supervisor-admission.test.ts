@@ -8,8 +8,9 @@ import {
 	type DaemonResponse,
 	success,
 } from "../src/modes/daemon/daemon-protocol.js";
-import { DaemonSupervisor, waitForSupervisorPromptAdmission } from "../src/modes/daemon/daemon-supervisor.js";
+import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
+import { type Deferred, createDeferred as deferred } from "./suite/scheduling.js";
 
 interface AdmissionRecord {
 	client: DaemonSocketClient;
@@ -29,22 +30,6 @@ interface SupervisorHarness {
 	promptAdmissions: Map<DaemonSocketClient, Map<string, AdmissionRecord>>;
 }
 
-interface Deferred<T> {
-	promise: Promise<T>;
-	resolve(value: T): void;
-	reject(error: unknown): void;
-}
-
-function deferred<T>(): Deferred<T> {
-	let resolve!: (value: T) => void;
-	let reject!: (error: unknown) => void;
-	const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-		resolve = resolvePromise;
-		reject = rejectPromise;
-	});
-	return { promise, resolve, reject };
-}
-
 function client(id: string): DaemonSocketClient {
 	return { id, attachedActiveSessionIds: new Set(), capabilities: new Set() } as DaemonSocketClient;
 }
@@ -61,6 +46,8 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 	throw new Error("Condition was not reached");
 }
 
+// Constructor-bypass harness: the real constructor spawns watchers and needs a
+// socket dir. The field list is hand-coupled to what handleLine touches.
 function createHarness(
 	options: {
 		ready?: Promise<void>;
@@ -102,17 +89,6 @@ function createHarness(
 }
 
 describe("daemon supervisor prompt admission ownership", () => {
-	it("observes an already-running promise when admission is pre-aborted", async () => {
-		const abort = new AbortController();
-		abort.abort();
-		const work = Promise.reject(new Error("late failure"));
-
-		await expect(waitForSupervisorPromptAdmission(work, abort.signal)).rejects.toThrow(
-			"Prompt admission was cancelled",
-		);
-		await Promise.resolve();
-	});
-
 	it("registers a prompt synchronously before readiness and ownership awaits", async () => {
 		const ready = deferred<void>();
 		const ownership = deferred<void>();

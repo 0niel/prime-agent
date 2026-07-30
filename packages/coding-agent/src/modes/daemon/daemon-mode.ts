@@ -90,6 +90,7 @@ import {
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
+import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type {
 	CreateRlmSubagentRuntimeOptions,
 	RlmSubagentRuntime,
@@ -328,43 +329,6 @@ function delay(ms: number): Promise<void> {
 	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
-class DaemonPromptAdmissionCancelledError extends Error {
-	constructor() {
-		super("Prompt admission was cancelled.");
-		this.name = "DaemonPromptAdmissionCancelledError";
-	}
-}
-
-export function waitForDaemonPromptAdmission<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
-	if (!signal) return promise;
-	if (signal.aborted) {
-		// The caller supplied already-running work. Observe its eventual rejection
-		// even though admission cancellation wins immediately.
-		void promise.catch(() => {});
-		return Promise.reject(new DaemonPromptAdmissionCancelledError());
-	}
-	return new Promise<T>((resolve, reject) => {
-		const cleanup = () => signal.removeEventListener("abort", onAbort);
-		const onAbort = () => {
-			cleanup();
-			reject(new DaemonPromptAdmissionCancelledError());
-		};
-		signal.addEventListener("abort", onAbort, { once: true });
-		// Close the registration-to-check race before observing the awaited work.
-		if (signal.aborted) return onAbort();
-		promise.then(
-			(value) => {
-				cleanup();
-				resolve(value);
-			},
-			(error: unknown) => {
-				cleanup();
-				reject(error);
-			},
-		);
-	});
-}
-
 type RuntimeOpenGuard = () => boolean | Promise<boolean>;
 type SupervisorGenerationClaim = Omit<Extract<DaemonWorkerCommand, { type: "worker_auth" }>, "id" | "type" | "token">;
 
@@ -427,6 +391,8 @@ export class AgentDaemon {
 	private readonly clients = new Set<DaemonSocketClient>();
 	private readonly sessions = new Map<string, ActiveSessionState>();
 	private readonly openingSessions = new Map<string, Promise<ActiveSessionState>>();
+	/** Covers path resolution through publication in openingSessions, before the runtime promise exists. */
+	private readonly reservingSessionOpens = new Map<string, Promise<void>>();
 	private readonly rlmRehydrationClaims = new Map<
 		string,
 		{ parentState: ActiveSessionState; entry: PersistedRlmSubagentRegistryEntry }
@@ -581,7 +547,7 @@ export class AgentDaemon {
 		this.registerSignalHandlers();
 		this.summarizer.start();
 		this.log(`Prime Agent daemon listening on ${this.socketPath}`);
-		// No startup restore: on-disk sessions return only via /resume or --resume.
+		// No startup restore: on-disk sessions return only via --resume or the agents view.
 		if (!this.shuttingDown) {
 			this.cronScheduler.start();
 		}
@@ -1099,6 +1065,71 @@ export class AgentDaemon {
 		const sessionPath = command.sessionPath
 			? await resolveDaemonSessionPath(command.sessionPath, cwd, config.sessionDir)
 			: undefined;
+		const sessionKey = sessionPath ? resolve(sessionPath) : undefined;
+		const pending = sessionKey ? this.openingSessions.get(sessionKey) : undefined;
+		if (pending && sessionKey) {
+			// Join the in-process open before attempting the filesystem lease. The
+			// creator owns that lease until its runtime is ready.
+			let state: ActiveSessionState;
+			try {
+				state = await pending;
+			} catch (error) {
+				if (!runtimeOpenGuard && error instanceof RuntimeOpenCancelledError) {
+					if (this.openingSessions.get(sessionKey) === pending) {
+						this.openingSessions.delete(sessionKey);
+					}
+					return this.createRuntime(command);
+				}
+				throw error;
+			}
+			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
+				throw new RuntimeOpenCancelledError();
+			}
+			if (command.name) {
+				state.runtime.session.setSessionName(command.name);
+			}
+			this.adoptClientEnv(state, clientEnv);
+			this.rebindCronJobsToState(state);
+			return state;
+		}
+
+		let releaseOpenReservation = () => {};
+		if (sessionKey) {
+			const reservation = this.reservingSessionOpens.get(sessionKey);
+			if (reservation) {
+				await reservation;
+				return this.createRuntime(command, runtimeOpenGuard);
+			}
+			let release!: () => void;
+			const reserved = new Promise<void>((resolveReservation) => {
+				release = resolveReservation;
+			});
+			this.reservingSessionOpens.set(sessionKey, reserved);
+			let released = false;
+			releaseOpenReservation = () => {
+				if (released) return;
+				released = true;
+				if (this.reservingSessionOpens.get(sessionKey) === reserved) {
+					this.reservingSessionOpens.delete(sessionKey);
+				}
+				release();
+			};
+		}
+
+		const existing = sessionPath ? this.findSessionBySessionFile(sessionPath) : undefined;
+		if (existing) {
+			releaseOpenReservation();
+			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
+				throw new RuntimeOpenCancelledError();
+			}
+			if (command.name) {
+				existing.runtime.session.setSessionName(command.name);
+			}
+			this.adoptClientEnv(existing, clientEnv);
+			this.rebindCronJobsToState(existing);
+			return existing;
+		}
+
 		let sessionLease: SessionLease | undefined;
 		let sessionManager: SessionManager;
 		try {
@@ -1112,6 +1143,7 @@ export class AgentDaemon {
 						: SessionManager.create(cwd, config.sessionDir);
 		} catch (error) {
 			sessionLease?.release();
+			releaseOpenReservation();
 			throw error;
 		}
 		const createState = async (): Promise<ActiveSessionState> => {
@@ -1210,43 +1242,24 @@ export class AgentDaemon {
 
 		const sessionFile = sessionManager.getSessionFile();
 		if (!sessionFile) {
+			releaseOpenReservation();
 			return createState();
 		}
-		const sessionKey = resolve(sessionFile);
-		const pending = this.openingSessions.get(sessionKey);
-		if (pending) {
+		const openedSessionKey = resolve(sessionFile);
+		if (this.openingSessions.has(openedSessionKey)) {
 			sessionLease?.release();
-			// Same as the reuse path above: adopt-if-absent, never overwrite the
-			// identity the racing creator's extensions already captured.
-			let state: ActiveSessionState;
-			try {
-				state = await pending;
-			} catch (error) {
-				if (!runtimeOpenGuard && error instanceof RuntimeOpenCancelledError) {
-					if (this.openingSessions.get(sessionKey) === pending) {
-						this.openingSessions.delete(sessionKey);
-					}
-					return this.createRuntime(command);
-				}
-				throw error;
-			}
-			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
-				throw new RuntimeOpenCancelledError();
-			}
-			if (command.name) {
-				state.runtime.session.setSessionName(command.name);
-			}
-			this.adoptClientEnv(state, clientEnv);
-			this.rebindCronJobsToState(state);
-			return state;
+			releaseOpenReservation();
+			return this.createRuntime({ ...command, sessionPath: sessionFile }, runtimeOpenGuard);
 		}
 		const opening = Promise.resolve().then(createState);
-		this.openingSessions.set(sessionKey, opening);
+		this.openingSessions.set(openedSessionKey, opening);
+		releaseOpenReservation();
 		try {
 			return await opening;
 		} finally {
-			if (this.openingSessions.get(sessionKey) === opening) {
-				this.openingSessions.delete(sessionKey);
+			releaseOpenReservation();
+			if (this.openingSessions.get(openedSessionKey) === opening) {
+				this.openingSessions.delete(openedSessionKey);
 			}
 		}
 	}
@@ -1418,7 +1431,7 @@ export class AgentDaemon {
 		try {
 			const targetLock = this.agentMessageTargetLocks.get(activeSessionId);
 			if (targetLock)
-				await waitForDaemonPromptAdmission(
+				await waitForPromptAdmission(
 					targetLock.catch(() => undefined),
 					signal,
 				);
@@ -1881,14 +1894,18 @@ export class AgentDaemon {
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status) => {
 				const state = this.findRuntimeState(runtime);
+				// Trace sharing is best-effort telemetry. In particular, 429 retries can
+				// take minutes and must not delay the model-facing rlm.run result or retention.
+				if (state && status === "done") {
+					void flushAgentTraceUpload(state.runtime.session.sessionManager).catch(() => undefined);
+				}
 				// A successful subagent stays resident so it's still viewable and messageable;
 				// closeChildSessions tears it down with the parent. Errored or cancelled children
 				// would re-seed as "done", so close them immediately.
 				if (state && status === "done") {
-					await flushAgentTraceUpload(state.runtime.session.sessionManager).catch(() => undefined);
-					// Retention can decline if deletion or parent teardown won while the trace
-					// flush was in flight. Persist completion only after retention succeeds, so
-					// a late completion cannot overwrite a durable deletion tombstone.
+					// Retention can decline if deletion or parent teardown won. Persist completion
+					// only after retention succeeds, so a late completion cannot overwrite a
+					// durable deletion tombstone.
 					if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
 						if (runtime.session.sessionFile) {
 							const retainedModel = runtime.session.model ?? options.model;
@@ -2582,17 +2599,14 @@ export class AgentDaemon {
 				// wins the command wait below.
 				void claimCheck.catch(() => {});
 				try {
-					const ownerFingerprint = await waitForDaemonPromptAdmission(
-						claimCheck,
-						parsedAdmission?.controller?.signal,
-					);
+					const ownerFingerprint = await waitForPromptAdmission(claimCheck, parsedAdmission?.controller?.signal);
 					if (this.supervisorClaims.get(client) !== boundClaim || client.socket.destroyed) {
 						clearParsedAdmission();
 						return;
 					}
 					boundClaim.ownerFingerprint = ownerFingerprint;
 				} catch (error) {
-					const admissionCancelled = error instanceof DaemonPromptAdmissionCancelledError;
+					const admissionCancelled = error instanceof PromptAdmissionCancelledError;
 					if (admissionCancelled) {
 						// The fence check remains authoritative after cancellation. Its rejection
 						// revokes only the exact binding that initiated it; replacements survive.
@@ -3090,7 +3104,7 @@ export class AgentDaemon {
 				};
 				let state: ActiveSessionState;
 				try {
-					if (admission?.status === "cancelled") throw new Error("Prompt admission was cancelled.");
+					if (admission?.status === "cancelled") throw new PromptAdmissionCancelledError();
 					state = this.getBoundSessionState(command.activeSessionId);
 				} catch (error) {
 					clearAdmission();

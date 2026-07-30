@@ -2553,6 +2553,7 @@ describe("AgentSession scheduler scenarios", () => {
 		firstGate.resolve();
 		await first.catch(() => undefined);
 		await harness.session.agent.waitForIdle();
+		await harness.session.waitForSessionInputIdle();
 		expect(providerCalls).toBe(0);
 		expect(harness.session.getFollowUpMessages()).toEqual(["queued for restart", "/goal inspect image", agentPrompt]);
 		expect(harness.session.getFollowUpQueueSnapshots()).toEqual([

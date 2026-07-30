@@ -101,6 +101,23 @@ describe("InteractiveMode compaction events", () => {
 		}
 	});
 
+	test("shows manual warning-severity outcomes as warnings, not errors", async () => {
+		const fakeThis = createFakeThis();
+
+		await handleEvent.call(fakeThis, {
+			type: "compaction_end",
+			reason: "manual",
+			result: undefined,
+			aborted: false,
+			willRetry: false,
+			errorMessage: "Session is too short to compact",
+			errorSeverity: "warning",
+		});
+
+		expect(fakeThis.showWarning).toHaveBeenCalledWith("Session is too short to compact");
+		expect(fakeThis.showError).not.toHaveBeenCalled();
+	});
+
 	test("restores the compaction loader from state when no start event was seen", () => {
 		const statusContainer = new Container();
 		const fakeThis = createFakeThis({

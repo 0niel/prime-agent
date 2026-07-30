@@ -318,8 +318,21 @@ describe("parseCommandArgs", () => {
 		expect(parseCommandArgs("a  b   c")).toEqual(["a", "b", "c"]);
 	});
 
-	test("should handle tabs as separators", () => {
-		expect(parseCommandArgs("a\tb\tc")).toEqual(["a", "b", "c"]);
+	test.each([
+		{ name: "tabs", input: "a\tb\tc", expected: ["a", "b", "c"] },
+		{
+			name: "Unicode spaces",
+			input: "first\u2002second",
+			expected: ["first", "second"],
+			positionalResult: "first|second",
+		},
+	])("should handle $name as separators", ({ input, expected, positionalResult }) => {
+		const args = parseCommandArgs(input);
+
+		expect(args).toEqual(expected);
+		if (positionalResult) {
+			expect(substituteArgs("$1|$2", args)).toBe(positionalResult);
+		}
 	});
 
 	test("should handle quoted empty string", () => {

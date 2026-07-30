@@ -1,8 +1,7 @@
 import { existsSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
-import type { Api, ImageContent, Model } from "@earendil-works/pi-ai";
-import type { AutocompleteItem, OverlayHandle, SlashCommand } from "@earendil-works/pi-tui";
 import {
+	type AutocompleteProvider,
 	CombinedAutocompleteProvider,
 	type Component,
 	clippedFullscreenDockHeight,
@@ -17,43 +16,36 @@ import {
 import { APP_TITLE, appendRotatingLog, getAgentDir, getClientErrorLogPath, VERSION } from "../../config.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import { KeybindingsManager } from "../../core/keybindings.js";
-import type { ModelCatalogSnapshot, ModelRegistry } from "../../core/model-registry.js";
-import { findExactModelReferenceMatch } from "../../core/model-resolver.js";
-import { resolvePrimeInferencePostLoginModelAction } from "../../core/prime-inference-model-selection.js";
 import { SessionManager } from "../../core/session-manager.js";
+import {
+	BUILTIN_SLASH_COMMANDS,
+	isBuiltinSlashCommandName,
+	isSessionSlashCommandName,
+	parseSlashCommand,
+	resolveBuiltinSlashCommandName,
+} from "../../core/slash-commands.js";
+import { canonicalizePath } from "../../utils/paths.js";
 import { ensureTool } from "../../utils/tools-manager.js";
 import { DaemonAgentConnection } from "../agent-connection/daemon-agent-connection.js";
-import type { AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
+import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/types.js";
 import { DaemonClient, getDaemonSocketCloseReason } from "../daemon/daemon-client.js";
 import {
+	collectDaemonClientEnv,
 	type DaemonClosingReason,
 	type DaemonCommand,
 	type DaemonResponse,
 	isUnknownDaemonCommandError,
 } from "../daemon/daemon-protocol.js";
-import {
-	resolveAttachModelFallbackMessage,
-	type SessionSummary,
-	summaryForInactiveSession,
-} from "../daemon/daemon-session-list.js";
+import { resolveAttachModelFallbackMessage, type SessionSummary } from "../daemon/daemon-session-list.js";
+import { listDaemonHeartbeats } from "../daemon/heartbeat-catalog.js";
 import {
 	type DaemonSavedSessionCatalogContext,
 	deleteDaemonSavedSession,
 	listDaemonSavedSessions,
 	renameDaemonSavedSession,
 } from "../daemon/saved-session-catalog.js";
-import {
-	type AuthenticationResult,
-	getAnthropicSubscriptionAuthWarning,
-	ProviderAuthFlows,
-} from "../interactive/auth-flows.js";
-import { showFullPaneOverlay } from "../interactive/components/centered-overlay.js";
-import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "../interactive/components/configuration-menu.js";
 import { CustomEditor } from "../interactive/components/custom-editor.js";
 import { keyText } from "../interactive/components/keybinding-hints.js";
-import type { AuthSelectorProvider } from "../interactive/components/oauth-selector.js";
-import { SessionPickerScreen } from "../interactive/components/session-picker-screen.js";
-import { type SessionListCallbacks, SessionSelectorComponent } from "../interactive/components/session-selector.js";
 import { BrandSplashHeader, InteractiveMode } from "../interactive/interactive-mode.js";
 import type { InteractiveModeUiServices } from "../interactive/interactive-mode-services.js";
 import { ClientPromptStashStore } from "../interactive/prompt-stash-state.js";
@@ -66,7 +58,6 @@ import {
 	theme,
 } from "../interactive/theme/theme.js";
 import { WORKING_ICON_INTERVAL_MS, workingIconFrame } from "../interactive/theme/working-icon.js";
-import { getModelArgumentCompletions } from "../model-autocomplete.js";
 import {
 	formatPackageUpdateNotice,
 	formatTmuxWarningNotice,
@@ -75,60 +66,56 @@ import {
 	type StartupNotices,
 } from "../shared/startup-notices.js";
 import {
-	AGENTS_VIEW_SLASH_COMMANDS,
-	type AgentsViewCommandName,
-	classifyAgentsViewCommand,
-	type ParsedSlashCommand,
-	parseSlashCommand,
-	resolveAgentsViewCommand,
-} from "./agents-view-commands.js";
-import {
 	type AgentsViewRow,
 	type AgentsViewSection,
 	type AgentsViewSelectionKey,
 	buildAgentsViewRows,
+	filterUnifiedSessions,
+	formatHeartbeatBadge,
 	getAgentsViewSelectionKey,
 	getAgentsViewSummaryIdentity as getSummaryIdentity,
-	resolveAgentsViewSelectionIndex,
+	reconcileUnifiedSessions,
+	resolveAgentsViewSelectionState,
 	sectionTitle,
 	shouldShowAgentsViewSession,
+	summaryForUnifiedRecord,
+	type UnifiedSessionRecord,
 } from "./agents-view-state.js";
+import { matchesSearchText } from "./session-view-search.js";
 
 const POLL_INTERVAL_MS = 1000;
+const HEARTBEAT_POLL_INTERVAL_MS = 15000;
 const RECONNECT_TIMEOUT_MS = 120000;
 const RECONNECT_RETRY_MS = 1000;
 const EXIT_HINT_DURATION_MS = 2000;
 const DELETE_CONFIRM_DURATION_MS = 2000;
 const STATUS_MESSAGE_DURATION_MS = 4500;
-const SESSION_NAME_MAX_LENGTH = 80;
-const DEFAULT_PROMPT_PLACEHOLDER = "Describe a task for a new session";
+const SEARCH_PROMPT_PLACEHOLDER = "Search sessions";
 const REPLY_PROMPT_FALLBACK_PLACEHOLDER = "Write a reply to this agent";
+const RESUME_PROMPT_PLACEHOLDER = "Write a prompt to resume this session";
 const COMPLETED_ROW_ICON = "✓";
 const NEEDS_INPUT_ROW_ICON = "●";
-const HEARTBEAT_ROW_ICON = "♥";
 const SELECTED_ROW_MARKER = "\0agents-view-selected-row\0";
 // Tags a spawn-code line so finalize can wrap the whole row in a panel
 // background, visually segmenting the program from the agent rows.
 const CODE_ROW_MARKER = "\0agents-view-code-row\0";
 
 export interface AgentsViewModeOptions {
-	socketPath: string;
+	socketPath?: string;
 	config: AgentSessionRuntimeConfig;
 	uiServices: InteractiveModeUiServices;
 	createUiServicesForSession?: (summary: SessionSummary) => Promise<InteractiveModeUiServices>;
 	migratedProviders?: string[];
 	modelFallbackMessage?: string;
 	startupModelId?: string;
-	initialMessage?: string;
-	initialImages?: ImageContent[];
-	initialMessages?: string[];
 	verbose?: boolean;
 	recoverDaemon?: () => Promise<void>;
 	reconnectTimeoutMs?: number;
 	promptStashStore?: ClientPromptStashStore;
+	initialSession?: SessionSummary;
 }
 
-type AgentsViewRunResult =
+export type AgentsViewRunResult =
 	| { type: "exit" }
 	| {
 			type: "open";
@@ -138,18 +125,23 @@ type AgentsViewRunResult =
 			// opened subagent, from the root agent down to its immediate parent.
 			subagentAncestorSessionIds?: string[];
 	  };
-type AgentsViewPersistentState = {
+export type AgentsViewPersistentState = {
 	selectedRowIdentity?: string;
+	backSession?: SessionSummary;
 	selectedSessionKey?: AgentsViewSelectionKey;
 	// Ancestor chain to re-expand on return to a subagent. Kept by sessionId, not
 	// row identity, so it survives a parent's active→persisted identity flip.
 	pendingExpandedAncestorSessionIds?: string[];
 	statusMessage?: string;
-	initialPromptsSent?: boolean;
 	// Gathered once and reused across agents-view instances so the notices survive
 	// re-entry and render the moment they resolve, even if the first view was left early.
 	startupNotices?: StartupNotices;
 	startupNoticesPromise?: Promise<StartupNotices>;
+	query?: string;
+	savedSessions?: AgentConnectionSavedSessionInfo[];
+	lastSuccessfulSavedSessions?: AgentConnectionSavedSessionInfo[];
+	savedCatalogGeneration?: number;
+	heartbeats?: AgentConnectionHeartbeat[];
 };
 
 type PromptCommand = Extract<DaemonCommand, { type: "prompt" }>;
@@ -190,34 +182,20 @@ export function createAgentsViewResumeConfig(
 
 export function createAgentsViewListCommand(): Extract<DaemonCommand, { type: "list" }> {
 	// Omitting `all` returns daemon-resident sessions only; on-disk ones come back
-	// via /resume.
+	// through the view's saved-session catalog.
 	return { type: "list" };
-}
-
-export function resolveAgentsViewResumeSummary(
-	sessionPath: string,
-	savedSessions: readonly AgentConnectionSavedSessionInfo[],
-	visibleSummaries: readonly SessionSummary[],
-): SessionSummary | undefined {
-	const activeSummary = resolveAgentsViewActiveSummaryForPath(sessionPath, visibleSummaries);
-	if (activeSummary) {
-		return activeSummary;
-	}
-	const selectedPath = resolvePath(sessionPath);
-	const savedSession = savedSessions.find((session) => resolvePath(session.path) === selectedPath);
-	return savedSession ? summaryForInactiveSession(savedSession) : undefined;
 }
 
 export function resolveAgentsViewActiveSummaryForPath(
 	sessionPath: string,
 	summaries: readonly SessionSummary[],
 ): SessionSummary | undefined {
-	const selectedPath = resolvePath(sessionPath);
+	const selectedPath = resolvePath(canonicalizePath(sessionPath));
 	return summaries.find(
 		(summary) =>
 			summary.activeSessionId !== undefined &&
 			summary.sessionFile !== undefined &&
-			resolvePath(summary.sessionFile) === selectedPath,
+			resolvePath(canonicalizePath(summary.sessionFile)) === selectedPath,
 	);
 }
 
@@ -226,23 +204,6 @@ export function resolveAgentsViewActiveSummaryForPath(
 // the input, so flatten all whitespace runs to single spaces.
 export function formatAgentsViewStatusLine(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
-}
-
-export async function getAgentsViewModelArgumentCompletions(
-	prefix: string,
-	modelRegistry: Pick<ModelRegistry, "refreshModelCatalog">,
-): Promise<AutocompleteItem[] | null> {
-	const catalog = await modelRegistry.refreshModelCatalog();
-	return getModelArgumentCompletions(prefix, catalog.models);
-}
-
-export function syncAgentsViewModelMenuAfterAuth(
-	menu: Pick<ConfigurationMenuComponent, "refreshAuthentication" | "updateModels">,
-	currentModel: Model<Api> | undefined,
-	catalog: ModelCatalogSnapshot,
-): void {
-	menu.refreshAuthentication();
-	menu.updateModels(currentModel, catalog.models, new Set(catalog.configuredProviders));
 }
 
 export function shouldReconnectAgentsViewDaemon(reason: DaemonClosingReason | undefined): boolean {
@@ -279,7 +240,9 @@ async function openAgentsViewSession(
 	options: AgentsViewModeOptions,
 	summary: SessionSummary,
 ): Promise<OpenedAgentsViewSession> {
-	let client = await connectAgentsViewDaemonClient(options.socketPath);
+	const socketPath = options.socketPath;
+	if (!socketPath) throw new Error("Agents view daemon socket is not configured");
+	let client = await connectAgentsViewDaemonClient(socketPath);
 	if (summary.activeSessionId) {
 		try {
 			const connection = await DaemonAgentConnection.attach(client, summary.activeSessionId, {
@@ -293,7 +256,7 @@ async function openAgentsViewSession(
 			if (!summary.sessionFile || !isUnknownActiveSessionError(error)) {
 				throw error;
 			}
-			client = await connectAgentsViewDaemonClient(options.socketPath);
+			client = await connectAgentsViewDaemonClient(socketPath);
 		}
 	}
 
@@ -302,25 +265,45 @@ async function openAgentsViewSession(
 		throw new Error("Cannot open agent without an active runtime or saved session file");
 	}
 
-	const { overrideCwd, notice } = resolveAgentsViewOpenCwd(summary, options.config.cwd);
 	try {
-		const response = await client.request({
-			type: "create",
-			config: createAgentsViewResumeConfig(options.config, overrideCwd),
-			sessionPath: summary.sessionFile,
-		});
-		const createdSummary = expectSessionSummary(requireDaemonData(response));
-		const activeSessionId = getRequiredActiveSessionId(createdSummary);
-		const connection = await DaemonAgentConnection.attach(client, activeSessionId, {
+		const resumed = await resumeSavedAgentsViewSession(client, options.config, summary);
+		const connection = await DaemonAgentConnection.attach(client, resumed.activeSessionId, {
 			closeClientOnDispose: true,
 			recoverDaemon: options.recoverDaemon,
 			reconnectTimeoutMs: options.reconnectTimeoutMs,
 		});
-		return { connection, summary: createdSummary, cwdFallbackNotice: notice };
+		return { connection, summary: resumed.summary, cwdFallbackNotice: resumed.cwdFallbackNotice };
 	} catch (error) {
 		client.close();
 		throw error;
 	}
+}
+
+/**
+ * Resume a saved session file into the daemon and return the live summary.
+ * The daemon's create-with-sessionPath is idempotent for this client: an
+ * already-resident session is reused instead of resumed twice.
+ */
+async function resumeSavedAgentsViewSession(
+	client: DaemonClient,
+	config: AgentSessionRuntimeConfig,
+	summary: SessionSummary,
+): Promise<{ summary: SessionSummary; activeSessionId: string; cwdFallbackNotice?: string }> {
+	if (!summary.sessionFile) {
+		throw new Error("Cannot resume a session without a saved session file");
+	}
+	const { overrideCwd, notice } = resolveAgentsViewOpenCwd(summary, config.cwd);
+	const response = await client.request({
+		type: "create",
+		config: createAgentsViewResumeConfig(config, overrideCwd),
+		sessionPath: summary.sessionFile,
+	});
+	const createdSummary = expectSessionSummary(requireDaemonData(response));
+	return {
+		summary: createdSummary,
+		activeSessionId: getRequiredActiveSessionId(createdSummary),
+		cwdFallbackNotice: notice,
+	};
 }
 
 async function connectAgentsViewDaemonClient(socketPath: string): Promise<DaemonClient> {
@@ -346,7 +329,14 @@ function isUnknownActiveSessionError(error: unknown): boolean {
 }
 
 export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise<void> {
-	const persistentState: AgentsViewPersistentState = {};
+	const initialSession = options.initialSession;
+	const persistentState: AgentsViewPersistentState = initialSession
+		? {
+				selectedRowIdentity: getSummaryIdentity(initialSession),
+				selectedSessionKey: getAgentsViewSelectionKey(initialSession),
+				backSession: initialSession,
+			}
+		: {};
 	const promptStashStore = options.promptStashStore ?? new ClientPromptStashStore();
 
 	while (true) {
@@ -370,6 +360,7 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 		let opened: OpenedAgentsViewSession | undefined;
 		try {
 			opened = await openAgentsViewSession(options, result.summary);
+			persistentState.backSession = opened.summary;
 			if (opened.cwdFallbackNotice) {
 				persistentState.statusMessage = opened.cwdFallbackNotice;
 			}
@@ -396,7 +387,26 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 					: undefined,
 			});
 			try {
-				await interactiveMode.run();
+				const interactiveResult = await interactiveMode.run();
+				const source = interactiveResult.source;
+				// A subagent selection was recorded before the chat opened; keep it so
+				// the view reselects the subagent instead of its root session.
+				if (!result.subagent) {
+					persistentState.selectedRowIdentity = source.sessionFile
+						? `file:${resolvePath(canonicalizePath(source.sessionFile))}`
+						: source.activeSessionId
+							? `active:${source.activeSessionId}`
+							: `session:${source.sessionId}`;
+					persistentState.selectedSessionKey = {
+						sessionId: source.sessionId,
+						activeSessionId: source.activeSessionId,
+					};
+				}
+				persistentState.backSession = {
+					...opened.summary,
+					...source,
+					id: source.activeSessionId ?? opened.summary.id,
+				};
 			} catch (error) {
 				// The session opened fine and then threw while running; label it as a
 				// runtime crash so it isn't mixed in with true open failures.
@@ -416,7 +426,97 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 	}
 }
 
-class AgentsViewMode implements Component, Focusable {
+const AGENTS_VIEW_COMMAND_NAMES = ["name", "kill"] as const;
+export type AgentsViewCommandName = (typeof AGENTS_VIEW_COMMAND_NAMES)[number];
+const AGENTS_VIEW_COMMAND_NAME_SET: ReadonlySet<string> = new Set(AGENTS_VIEW_COMMAND_NAMES);
+
+export interface AgentsViewCommand {
+	name: AgentsViewCommandName;
+	args: string;
+}
+
+/** Row-targeted commands the armed composer maps onto existing RPCs. */
+export function parseAgentsViewCommand(text: string): AgentsViewCommand | undefined {
+	const parsed = parseSlashCommand(text);
+	if (!parsed) return undefined;
+	const name = resolveBuiltinSlashCommandName(parsed.name);
+	if (!AGENTS_VIEW_COMMAND_NAME_SET.has(name)) return undefined;
+	return { name: name as AgentsViewCommandName, args: parsed.args };
+}
+
+/**
+ * Reject recognized built-ins that are neither session-owned nor view
+ * commands, so they are never sent to the model as plain prompt text.
+ */
+export function getReplyComposerCommandRejection(text: string): string | undefined {
+	const parsed = parseSlashCommand(text);
+	if (!parsed) return undefined;
+	const name = resolveBuiltinSlashCommandName(parsed.name);
+	if (isSessionSlashCommandName(name)) return undefined;
+	if (AGENTS_VIEW_COMMAND_NAME_SET.has(name)) return undefined;
+	if (!isBuiltinSlashCommandName(parsed.name)) return undefined;
+	return `/${parsed.name} is not available here; open the session to run it`;
+}
+
+const AGENTS_VIEW_COMMAND_DESCRIPTIONS: Record<AgentsViewCommandName, { description: string; argumentHint?: string }> =
+	{
+		name: { description: "Set session display name", argumentHint: "<name>" },
+		kill: { description: "Stop this agent's runtime (session stays resumable)" },
+	};
+
+function agentsViewSlashCommands(): {
+	name: string;
+	aliases?: readonly string[];
+	description: string;
+	argumentHint?: string;
+	takesArgument?: boolean;
+}[] {
+	return AGENTS_VIEW_COMMAND_NAMES.map((name) => {
+		const builtin = BUILTIN_SLASH_COMMANDS.find((command) => command.name === name);
+		const display = AGENTS_VIEW_COMMAND_DESCRIPTIONS[name];
+		return {
+			name,
+			aliases: builtin?.aliases,
+			description: display.description,
+			argumentHint: display.argumentHint ?? builtin?.argumentHint,
+			takesArgument: name === "name" ? true : builtin?.takesArgument,
+		};
+	});
+}
+
+/** Autocomplete for the reply composer: session-owned plus view commands. */
+export function createReplyComposerAutocompleteProvider(cwd: string, fdPath?: string): AutocompleteProvider {
+	const sessionCommands = BUILTIN_SLASH_COMMANDS.filter((command) => isSessionSlashCommandName(command.name)).map(
+		(command) => ({
+			name: command.name,
+			aliases: command.aliases,
+			description: command.description,
+			argumentHint: command.argumentHint,
+			takesArgument: command.takesArgument,
+		}),
+	);
+	return new CombinedAutocompleteProvider([...sessionCommands, ...agentsViewSlashCommands()], cwd, fdPath ?? null);
+}
+
+export function resolveCurrentReplyTargetSummary(
+	records: readonly UnifiedSessionRecord[],
+	target: { key: string; summary: SessionSummary },
+	findLive: (activeSessionId: string) => SessionSummary | undefined,
+): SessionSummary {
+	const identity = getSummaryIdentity(target.summary);
+	const current = records.find((record) => record.identity === identity || record.identityAliases.includes(identity));
+	if (current) return summaryForUnifiedRecord(current);
+	const live = target.summary.activeSessionId ? findLive(target.summary.activeSessionId) : undefined;
+	if (live) return live;
+	// A persisted target missing from the current live catalog can still be
+	// resumed from its captured file, but its captured runtime id is stale.
+	if (target.summary.sessionFile && target.summary.activeSessionId) {
+		return { ...target.summary, activeSessionId: undefined, lifecycle: "archived", activity: "idle" };
+	}
+	return target.summary;
+}
+
+export class AgentsViewMode implements Component, Focusable {
 	focused = false;
 
 	private readonly ui: TUI;
@@ -426,11 +526,13 @@ class AgentsViewMode implements Component, Focusable {
 	private readonly keybindings: KeybindingsManager;
 	private client: DaemonClient | undefined;
 	private unsubscribeClientClose: (() => void) | undefined;
+	private unsubscribeClientMessage: (() => void) | undefined;
 	private reconnectPromise: Promise<void> | undefined;
 	private reconnectTimedOut = false;
 	private daemonShutdownReceived = false;
 	private resolveRun: ((result: AgentsViewRunResult) => void) | undefined;
 	private pollTimer: NodeJS.Timeout | undefined;
+	private heartbeatPollTimer: NodeJS.Timeout | undefined;
 	private animationTimer: NodeJS.Timeout | undefined;
 	private ctrlCExitHintExpiresAt = 0;
 	private ctrlCExitHintTimer: ReturnType<typeof setTimeout> | undefined;
@@ -440,6 +542,16 @@ class AgentsViewMode implements Component, Focusable {
 	private rows: AgentsViewRow[] = [];
 	private lastListedSummaries: SessionSummary[] = [];
 	private lastVisibleSummaries: SessionSummary[] = [];
+	private savedSessions: AgentConnectionSavedSessionInfo[] = [];
+	private lastSuccessfulSavedSessions: AgentConnectionSavedSessionInfo[] = [];
+	private heartbeats: AgentConnectionHeartbeat[] = [];
+	private unifiedRecords: UnifiedSessionRecord[] = [];
+	private savedCatalogGeneration = 0;
+	private liveCatalogGeneration = 0;
+	private heartbeatCatalogGeneration = 0;
+	private liveCatalogPollPromise: Promise<void> | undefined;
+	private liveCatalogRefreshPending = false;
+	private savedCatalogRefreshPending = false;
 	private expandedSubagentParents = new Set<string>();
 	// Agent row identities whose full spawn program is currently shown.
 	// The program key toggles each agent shown ↔ hidden.
@@ -448,21 +560,26 @@ class AgentsViewMode implements Component, Focusable {
 	private selectedRowIdentity: string | undefined;
 	private selectedActiveSessionId: string | undefined;
 	private selectedSessionKey: AgentsViewSelectionKey | undefined;
-	private replyActiveSessionId: string | undefined;
+	private selectionAnchorPending = false;
+	/** Armed reply composer target: a live agent or a saved session to resume on send. */
+	private replyTarget: { key: string; summary: SessionSummary } | undefined;
+	/** Provider bound to the armed target's cwd for file-path completions. */
+	private replyAutocomplete: AutocompleteProvider | undefined;
+	private fdPath: string | undefined;
+	private creatingNewSession = false;
 	private replyLastAssistantText: string | undefined;
 	private replyLastAssistantTextLoading = false;
 	private replyHeaderTime = "";
 	private pendingDeleteAgent: PendingDeleteAgent | undefined;
 	private pendingKillSubagent: PendingKillSubagent | undefined;
-	private renameTarget: { activeSessionId: string; identity: string } | undefined;
+	private renameTarget: { activeSessionId?: string; sessionFile?: string; summary: SessionSummary } | undefined;
+	private actionModeSearchQuery: string | undefined;
 	private readonly inactiveAgentIdentities = new Set<string>();
-	private fdPath: string | undefined;
 	private statusMessage: string | undefined;
 	private statusMessageTone: "muted" | "error" | "warning" = "muted";
 	private statusMessageSticky = false;
 	private statusMessageTimer: ReturnType<typeof setTimeout> | undefined;
 	private stopped = false;
-	private anthropicSubscriptionWarningShown = false;
 
 	constructor(
 		private readonly options: AgentsViewModeOptions,
@@ -471,6 +588,10 @@ class AgentsViewMode implements Component, Focusable {
 		this.selectedRowIdentity = persistentState.selectedRowIdentity;
 		this.selectedSessionKey = persistentState.selectedSessionKey;
 		this.selectedActiveSessionId = persistentState.selectedSessionKey?.activeSessionId;
+		this.savedSessions = persistentState.savedSessions ?? [];
+		this.lastSuccessfulSavedSessions = persistentState.lastSuccessfulSavedSessions ?? this.savedSessions;
+		this.heartbeats = persistentState.heartbeats ?? [];
+		this.savedCatalogGeneration = persistentState.savedCatalogGeneration ?? 0;
 		this.keybindings = KeybindingsManager.create();
 		setKeybindings(this.keybindings);
 		setRegisteredThemes(options.uiServices.getThemes());
@@ -482,27 +603,57 @@ class AgentsViewMode implements Component, Focusable {
 		this.editor = new CustomEditor(this.ui, getEditorTheme(), this.keybindings, {
 			paddingX: options.uiServices.settingsManager.getEditorPaddingX(),
 			autocompleteMaxVisible: options.uiServices.settingsManager.getAutocompleteMaxVisible(),
-			placeholder: DEFAULT_PROMPT_PLACEHOLDER,
+			placeholder: SEARCH_PROMPT_PLACEHOLDER,
 			placeholderColor: (text) => theme.fg("dim", text),
 		});
+		void ensureTool("fd").then((fdPath) => {
+			this.fdPath = fdPath;
+			// Rebind an already-armed provider so @-completion picks up fd.
+			if (this.replyTarget) {
+				this.replyAutocomplete = createReplyComposerAutocompleteProvider(this.replyTarget.summary.cwd, fdPath);
+			}
+		});
+		// Search input never autocompletes; only the armed composer's provider answers.
+		this.editor.setAutocompleteProvider({
+			getSuggestions: async (lines, cursorLine, cursorCol, suggestOptions) => {
+				if (!this.replyTarget) return null;
+				return this.replyAutocomplete?.getSuggestions(lines, cursorLine, cursorCol, suggestOptions) ?? null;
+			},
+			applyCompletion: (lines, cursorLine, cursorCol, item, prefix) =>
+				this.replyAutocomplete?.applyCompletion(lines, cursorLine, cursorCol, item, prefix) ?? {
+					lines,
+					cursorLine,
+					cursorCol,
+				},
+		});
 		this.editor.focused = true;
-		this.editor.setAutocompleteProvider(this.createAutocompleteProvider());
 		this.editor.getHeaderLine = () => this.renderReplyHeaderLine();
 		this.editor.onSubmit = (value) => {
 			void this.submit(value);
 		};
+		this.editor.setText(persistentState.query ?? "");
 		this.editor.onCtrlD = () => {
 			this.finish({ type: "exit" });
 		};
 		this.editor.onAgentsBack = () => {
-			if (this.editor.getText().trim()) {
-				return false;
+			if (this.replyTarget) {
+				this.setReplyTarget(undefined);
+				return true;
 			}
-			if (!this.replyActiveSessionId) {
-				return false;
-			}
-			this.setReplyTarget(undefined);
+			if (this.editor.getText().length > 0) return false;
+			const backSession = this.persistentState.backSession;
+			this.finish(backSession ? { type: "open", summary: backSession } : { type: "exit" });
 			return true;
+		};
+		this.editor.onEscape = () => {
+			if (this.replyTarget) {
+				this.setReplyTarget(undefined);
+			} else if (this.editor.getText().length > 0) {
+				this.setSearchQuery("");
+			} else {
+				const backSession = this.persistentState.backSession;
+				this.finish(backSession ? { type: "open", summary: backSession } : { type: "exit" });
+			}
 		};
 		this.fullscreenDock = {
 			render: (width) => this.renderDock(width),
@@ -523,11 +674,12 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	async run(): Promise<AgentsViewRunResult> {
-		this.client = new DaemonClient(this.options.socketPath);
+		this.client = new DaemonClient(this.requireSocketPath());
 		await this.client.connect();
 		this.subscribeToClientClose(this.client);
-		this.fdPath = await ensureTool("fd");
-		this.editor.setAutocompleteProvider(this.createAutocompleteProvider());
+		this.unsubscribeClientMessage = this.client.onMessage((message) => {
+			if (message.type === "heartbeats_changed") void this.refreshHeartbeats();
+		});
 
 		this.ui.addChild(this);
 		this.ui.setFocus(this);
@@ -549,30 +701,29 @@ class AgentsViewMode implements Component, Focusable {
 			this.ui.requestRender();
 		});
 
-		await this.refreshSessions();
+		const runPromise = new Promise<AgentsViewRunResult>((resolve) => {
+			this.resolveRun = resolve;
+		});
+		void this.refreshSessions();
+		void this.refreshSavedSessions();
+		void this.refreshHeartbeats();
 		this.loadStartupNotices();
-		this.pollTimer = setInterval(() => {
-			void this.refreshSessions();
-		}, POLL_INTERVAL_MS);
+		this.pollTimer = setInterval(() => this.pollSessions(), POLL_INTERVAL_MS);
 		this.pollTimer.unref?.();
+		this.heartbeatPollTimer = setInterval(() => void this.refreshHeartbeats(), HEARTBEAT_POLL_INTERVAL_MS);
+		this.heartbeatPollTimer.unref?.();
 		this.animationTimer = setInterval(() => {
-			if (!this.rows.some((row) => row.section === "working")) {
-				return;
-			}
+			if (!this.rows.some((row) => row.section === "running")) return;
 			this.workingIconFrame += 1;
 			this.ui.requestRender();
 		}, WORKING_ICON_INTERVAL_MS);
 		this.animationTimer.unref?.();
 
-		return new Promise((resolve) => {
-			this.resolveRun = resolve;
-		});
+		return runPromise;
 	}
 
 	handleInput(data: string): void {
 		this.clearStickyStatusMessage();
-		// While renaming, the editor holds the proposed name: Escape cancels, Enter
-		// (via onSubmit) confirms, everything else edits the text.
 		if (this.renameTarget) {
 			if (this.keybindings.matches(data, "tui.select.cancel")) {
 				this.exitRenameMode();
@@ -582,14 +733,19 @@ class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		if (this.keybindings.matches(data, "app.clear")) {
+			// The composer hints advertise ctrl+c as cancel; it must not start the exit flow.
+			if (this.replyTarget) {
+				this.setReplyTarget(undefined);
+				return;
+			}
 			this.handleCtrlC();
 			return;
 		}
-		if (this.keybindings.matches(data, "app.agents.rename") && this.editor.getText().length === 0) {
+		if (this.editor.getText().length === 0 && this.keybindings.matches(data, "app.agents.rename")) {
 			this.enterRenameMode();
 			return;
 		}
-		if (this.keybindings.matches(data, "app.agents.delete") && this.editor.getText().length === 0) {
+		if (this.editor.getText().length === 0 && this.keybindings.matches(data, "app.agents.delete")) {
 			this.clearCtrlCExitHint({ render: false });
 			void this.handleDeleteSelected();
 			return;
@@ -600,25 +756,38 @@ class AgentsViewMode implements Component, Focusable {
 			void this.toggleReplyTarget();
 			return;
 		}
-		if (this.keybindings.matches(data, "app.agents.program") && this.editor.getText().length === 0) {
+		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.new")) {
+			void this.createNewSession();
+			return;
+		}
+		if (this.replyTarget && this.keybindings.matches(data, "app.message.followUp")) {
+			this.handleReplyFollowUp();
+			return;
+		}
+		if (this.editor.getText().length === 0 && this.keybindings.matches(data, "app.agents.program")) {
 			this.cycleProgramForSelected();
 			return;
 		}
-		// Mirror the confirm shortcut: open the selected agent only when the prompt
-		// is empty and we are not composing a reply (empty confirm is a no-op then).
-		// Match the confirm path's trim() so a whitespace-only prompt still opens.
-		if (
-			this.keybindings.matches(data, "app.agents.open") &&
-			this.editor.getText().trim().length === 0 &&
-			!this.replyActiveSessionId
-		) {
-			this.openSelected();
+		if (!this.replyTarget && this.keybindings.matches(data, "app.agents.open")) {
+			if (this.editor.getText().length === 0 || this.isSearchCursorAtEnd()) {
+				this.openSelected();
+				return;
+			}
+		}
+		if (!this.replyTarget && this.handleListNavigation(data)) {
 			return;
 		}
-		if (this.editor.getText().length === 0 && this.handleListNavigation(data)) {
-			return;
-		}
+		const previous = this.editor.getText();
 		this.editor.handleInput(data);
+		if (!this.replyTarget && this.editor.getText() !== previous) {
+			this.queryChanged();
+		}
+	}
+
+	private isSearchCursorAtEnd(): boolean {
+		const lines = this.editor.getLines();
+		const cursor = this.editor.getCursor();
+		return cursor.line === lines.length - 1 && cursor.col === (lines[cursor.line]?.length ?? 0);
 	}
 
 	render(width: number): string[] {
@@ -640,13 +809,22 @@ class AgentsViewMode implements Component, Focusable {
 		if (height <= 0) {
 			return [];
 		}
-		const lines: string[] = [];
-		lines.push(...this.splash.render(width));
+		const headerLines = this.splash.render(width);
 		const noticeLines = this.renderStartupNotices(width);
 		if (noticeLines.length > 0) {
-			lines.push("", ...noticeLines);
+			headerLines.push("", ...noticeLines);
 		}
-		lines.push("");
+		headerLines.push("");
+
+		// The prompt belongs to the scroll pane rather than the fullscreen dock, but
+		// it must remain usable when a short viewport or wrapped notices exhaust the
+		// header. Trim optional header chrome first and reserve one session-list row.
+		const promptLines = this.renderPrompt(width);
+		const listGap = height >= promptLines.length + 2 ? 1 : 0;
+		const headerRows = Math.max(0, height - promptLines.length - listGap - 1);
+		const lines = headerLines.slice(0, headerRows);
+		lines.push(...promptLines);
+		if (listGap > 0) lines.push("");
 		const listRows = Math.max(0, height - lines.length);
 		lines.push(...this.renderSessionRows(width, listRows));
 		return lines;
@@ -854,8 +1032,8 @@ class AgentsViewMode implements Component, Focusable {
 		// targets; nested rows share the parent's session id but are read-only.
 		const selectedRow = this.rows[this.selectedIndex];
 		if (
-			this.replyActiveSessionId &&
-			(selectedRow?.kind !== "agent" || this.replyActiveSessionId !== this.selectedActiveSessionId)
+			this.replyTarget &&
+			(selectedRow?.kind !== "agent" || this.replyTarget.key !== this.selectedActiveSessionId)
 		) {
 			this.setReplyTarget(undefined);
 		}
@@ -923,11 +1101,30 @@ class AgentsViewMode implements Component, Focusable {
 		this.rebuildRows();
 	}
 
+	private setSearchQuery(query: string): void {
+		this.editor.setText(query);
+		this.queryChanged();
+	}
+
+	private queryChanged(): void {
+		this.persistentState.query = this.editor.getText();
+		this.rebuildRows();
+		// Typing must not claim the visible fallback row while the restored
+		// anchor is still waiting for its catalog row.
+		if (!this.selectionAnchorPending) this.syncSelectedRowState();
+		this.ui.requestRender();
+	}
+
+	private getFilteredRecords(): UnifiedSessionRecord[] {
+		const query = this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
+		return filterUnifiedSessions(this.unifiedRecords, (text) => matchesSearchText(text, query));
+	}
+
 	/** Rebuild rows from the last fetched summaries, keeping selection on the same row. */
 	private rebuildRows(): void {
 		const selectedIdentity = this.rows[this.selectedIndex]?.identity;
 		this.rows = buildAgentsViewRows(
-			this.lastVisibleSummaries,
+			this.getFilteredRecords(),
 			this.expandedSubagentParents,
 			this.programShownParents,
 		);
@@ -940,357 +1137,61 @@ class AgentsViewMode implements Component, Focusable {
 		}
 	}
 
-	private async submit(value: string): Promise<void> {
+	private async submit(value: string, delivery: "steer" | "followUp" = "steer"): Promise<void> {
 		if (this.renameTarget) {
 			await this.confirmRename(value);
 			return;
 		}
-		const text = value.trim();
-		if (!text) {
-			if (this.replyActiveSessionId) {
-				return;
-			}
-			this.openSelected();
-			return;
-		}
-
-		// Only built-in interactive commands are intercepted here; unknown "/..."
-		// text still reaches the daemon session, which expands prompt templates,
-		// skills, and extension commands.
-		const command = parseSlashCommand(text);
-		if (command) {
-			const kind = classifyAgentsViewCommand(command.name);
-			if (kind === "agents-view") {
-				this.editor.setText("");
-				await this.runSlashCommand(resolveAgentsViewCommand(command));
-				return;
-			}
-			if (kind === "session-only") {
-				this.editor.setText("");
-				const resolvedCommand = resolveAgentsViewCommand(command);
-				const commandLabel =
-					resolvedCommand.name === command.name
-						? `/${command.name}`
-						: `/${command.name} maps to /${resolvedCommand.name}, which`;
-				this.setStatusMessage(
-					`${commandLabel} is only available inside an agent session — press ${keyText("tui.select.confirm")} on an agent to open it`,
+		if (this.replyTarget) {
+			const target = this.replyTarget;
+			const text = value.trim();
+			const viewCommand = parseAgentsViewCommand(text);
+			if (viewCommand) {
+				// Stale summaries mis-route the RPCs after a runtime replacement.
+				const currentSummary = resolveCurrentReplyTargetSummary(
+					this.unifiedRecords ?? [],
+					target,
+					(activeSessionId) => this.findSummaryByActiveSessionId(activeSessionId),
 				);
+				const succeeded = await this.runAgentsViewCommand(viewCommand, currentSummary);
+				if (!succeeded && this.replyTarget === target && this.editor.getText().length === 0) {
+					this.editor.setText(value);
+				}
 				return;
 			}
-		}
-
-		this.editor.setText("");
-		if (this.replyActiveSessionId) {
-			await this.sendReply(this.replyActiveSessionId, text);
-			return;
-		}
-		const created = await this.createAgentForPrompt(text);
-		if (created) {
-			this.finish({ type: "open", summary: created.summary });
-		}
-	}
-
-	private async runSlashCommand(command: ParsedSlashCommand): Promise<void> {
-		switch (command.name as AgentsViewCommandName) {
-			case "login":
-				await this.showConfigurationMenu("providers");
+			const rejection = getReplyComposerCommandRejection(text);
+			if (rejection) {
+				// submitValue cleared the buffer before onSubmit; keep the draft.
+				if (this.editor.getText().length === 0) this.editor.setText(value);
+				this.setStatusMessage(rejection, { tone: "warning" });
 				return;
-			case "logout":
-				await this.createAuthFlows().runLogout();
-				return;
-			case "mcp":
-				if (command.args) {
-					this.setStatusMessage("MCP subcommands are only available inside an agent session.");
-					return;
-				}
-				await this.showConfigurationMenu("mcp-connections");
-				return;
-			case "model": {
-				const searchTerm = command.args || undefined;
-				if (searchTerm) {
-					const authFlows = this.createAuthFlows();
-					const providerOptions = authFlows.getLoginProviderOptions();
-					const catalog = await this.options.uiServices.modelRegistry.refreshModelCatalog();
-					const match = findExactModelReferenceMatch(searchTerm, catalog.models);
-					if (match) {
-						const { ready } = await this.ensureDefaultModelProviderConfigured(match, authFlows, providerOptions);
-						if (ready) {
-							this.applyDefaultModel(match);
-						}
-						return;
+			}
+			if (text) {
+				this.editor.setText("");
+				const sent = await this.sendReply(target, text, delivery);
+				if (sent) {
+					if (this.replyTarget === target && this.editor.getText().length === 0) {
+						this.setReplyTarget(undefined);
 					}
+					// Keep the send outcome (or sticky cwd notice) that sendReply just surfaced.
+					await this.refreshSessions({ preserveStatusOnError: true });
+				} else if (this.replyTarget === target && this.editor.getText().length === 0) {
+					this.editor.setText(value);
 				}
-				await this.showConfigurationMenu("models", searchTerm);
-				return;
 			}
-			case "resume":
-				await this.showSessionSelector();
-				return;
-			case "quit":
-				this.finish({ type: "exit" });
-				return;
-			default: {
-				const _exhaustive: never = command.name as never;
-				return _exhaustive;
-			}
-		}
-	}
-
-	private createAuthFlows(): ProviderAuthFlows {
-		const modelRegistry = this.options.uiServices.modelRegistry;
-		return new ProviderAuthFlows({
-			ui: this.ui,
-			modelRegistry,
-			showStatus: (message) => this.setStatusMessage(message),
-			showError: (message) => this.setStatusMessage(message, { tone: "error" }),
-			getAvailableModels: () => modelRegistry.refreshAvailableModels(),
-			onLoginCompleted: () => {
-				void this.maybeWarnAboutAnthropicSubscriptionAuth(this.getDefaultModelForNewAgents());
-			},
-		});
-	}
-
-	private async applyPrimeInferenceFallbackAfterLogin(authResult: AuthenticationResult): Promise<void> {
-		const currentModel = this.getDefaultModelForNewAgents();
-		const action = resolvePrimeInferencePostLoginModelAction(
-			authResult,
-			currentModel,
-			this.options.uiServices.modelRegistry,
-		);
-		if (!action.openModelPicker) {
 			return;
 		}
-
-		if (action.fallbackModel) {
-			this.applyDefaultModel(action.fallbackModel);
-			await this.options.uiServices.settingsManager.flush();
-		} else if (!currentModel) {
-			this.setStatusMessage("Prime Inference login succeeded, but the default GLM 5.2 model is unavailable.", {
-				tone: "error",
-			});
-		}
+		// Search text is never a prompt or a command; Enter opens the selection.
+		this.openSelected();
 	}
 
-	private async maybeWarnAboutAnthropicSubscriptionAuth(model: Model<Api> | undefined): Promise<void> {
-		if (this.options.uiServices.settingsManager.getWarnings().anthropicExtraUsage === false) {
-			return;
-		}
-		if (this.anthropicSubscriptionWarningShown) {
-			return;
-		}
-		const warning = await getAnthropicSubscriptionAuthWarning(this.options.uiServices.modelRegistry, model);
-		if (!warning) {
-			return;
-		}
-		this.anthropicSubscriptionWarningShown = true;
-		this.setStatusMessage(warning, { tone: "warning", sticky: true });
-	}
-
-	private async ensureDefaultModelProviderConfigured(
-		model: Model<Api>,
-		authFlows: ProviderAuthFlows,
-		providerOptions: ReadonlyArray<AuthSelectorProvider>,
-	): Promise<{ ready: boolean; refreshedCatalog?: ModelCatalogSnapshot }> {
-		const modelRegistry = this.options.uiServices.modelRegistry;
-		if (modelRegistry.hasConfiguredAuth(model)) return { ready: true };
-
-		const provider = providerOptions.find(
-			(option) => option.id === model.provider && (option.category ?? "provider") === "provider",
-		);
-		if (!provider) {
-			this.setStatusMessage(`Authentication for ${model.provider} must be configured externally.`, {
-				tone: "error",
-			});
-			return { ready: false };
-		}
-
-		const result = await authFlows.loginProvider(provider);
-		if (result.status !== "success") return { ready: false };
-
-		const refreshedCatalog = await modelRegistry.refreshModelCatalog();
-		if (modelRegistry.hasConfiguredAuth(model)) return { ready: true, refreshedCatalog };
-
-		this.setStatusMessage(`Authentication completed, but ${model.provider} is still unavailable.`, {
-			tone: "error",
-		});
-		return { ready: false, refreshedCatalog };
-	}
-
-	private async showConfigurationMenu(initialTab: ConfigurationMenuTab, initialModelSearch?: string): Promise<void> {
-		const modelRegistry = this.options.uiServices.modelRegistry;
-		const authFlows = this.createAuthFlows();
-		const providerOptions = authFlows.getLoginProviderOptions();
-		const initialCatalog = await modelRegistry.refreshModelCatalog();
-		return new Promise((resolve) => {
-			let handle: OverlayHandle | undefined;
-			let settled = false;
-			let hidden = false;
-			let menu: ConfigurationMenuComponent;
-			const hide = () => {
-				if (hidden) return;
-				hidden = true;
-				handle?.hide();
-				this.ui.requestRender();
-			};
-			const finish = () => {
-				if (settled) return;
-				settled = true;
-				hide();
-				resolve();
-			};
-			const authenticate = (provider: AuthSelectorProvider, tab: "providers" | "mcp-connections") => {
-				if (settled) return;
-				void authFlows
-					.loginProvider(provider)
-					.then(async (authResult) => {
-						if (settled) return;
-						handle?.focus();
-						if (authResult.status !== "success" || tab === "mcp-connections") {
-							menu.refreshAuthentication();
-							return;
-						}
-
-						await this.applyPrimeInferenceFallbackAfterLogin(authResult);
-						const catalog = await modelRegistry.refreshModelCatalog();
-						syncAgentsViewModelMenuAfterAuth(menu, this.getDefaultModelForNewAgents(), catalog);
-						menu.setActiveTab("models");
-					})
-					.catch((error) => {
-						handle?.focus();
-						this.setStatusMessage(error instanceof Error ? error.message : String(error), { tone: "error" });
-					});
-			};
-
-			menu = new ConfigurationMenuComponent({
-				initialTab,
-				tui: this.ui,
-				authStorage: modelRegistry.authStorage,
-				providerOptions,
-				modelRegistry,
-				currentModel: this.getDefaultModelForNewAgents(),
-				scopedModels: [],
-				availableModels: initialCatalog.models,
-				configuredProviders: new Set(initialCatalog.configuredProviders),
-				recentModels: this.options.uiServices.settingsManager.getRecentModels(),
-				initialModelSearch,
-				getRows: () => this.ui.terminal.rows,
-				requestRender: () => this.ui.requestRender(),
-				onSelectProvider: (provider) => authenticate(provider, "providers"),
-				onSelectMcpConnection: (provider) => authenticate(provider, "mcp-connections"),
-				onSelectModel: (model) => {
-					void (async () => {
-						try {
-							const result = await this.ensureDefaultModelProviderConfigured(model, authFlows, providerOptions);
-							handle?.focus();
-							if (result.refreshedCatalog) {
-								syncAgentsViewModelMenuAfterAuth(
-									menu,
-									this.getDefaultModelForNewAgents(),
-									result.refreshedCatalog,
-								);
-							} else {
-								menu.refreshAuthentication();
-							}
-							if (!result.ready || settled) return;
-							this.applyDefaultModel(model);
-							finish();
-						} catch (error) {
-							this.setStatusMessage(error instanceof Error ? error.message : String(error), { tone: "error" });
-						}
-					})();
-				},
-				onCancel: finish,
-			});
-			handle = showFullPaneOverlay(this.ui, menu, 96);
-		});
-	}
-
-	private showSessionSelector(): Promise<void> {
-		return new Promise((done) => {
-			let handle: OverlayHandle | undefined;
-			let settled = false;
-			const savedSessionsByPath = new Map<string, AgentConnectionSavedSessionInfo>();
-
-			const rememberSessions = <T extends AgentConnectionSavedSessionInfo[]>(sessions: T): T => {
-				for (const session of sessions) {
-					savedSessionsByPath.set(resolvePath(session.path), session);
-				}
-				return sessions;
-			};
-			const listSavedSessions = async (
-				scope: "current" | "all",
-				callbacks?: SessionListCallbacks,
-			): Promise<AgentConnectionSavedSessionInfo[]> => {
-				const sessions = await listDaemonSavedSessions(
-					this.requireClient(),
-					this.getSavedSessionCatalogContext(),
-					scope,
-					{
-						onProgress: callbacks?.onProgress,
-						onSession: (session) => {
-							rememberSessions([session]);
-							callbacks?.onSession?.(session);
-						},
-					},
-				);
-				return rememberSessions(sessions);
-			};
-
-			const close = () => {
-				if (settled) {
-					return;
-				}
-				settled = true;
-				handle?.hide();
-				this.ui.requestRender();
-				done();
-			};
-
-			const selector = new SessionSelectorComponent(
-				(callbacks) => listSavedSessions("current", callbacks),
-				(callbacks) => listSavedSessions("all", callbacks),
-				(sessionPath) => {
-					const summary = resolveAgentsViewResumeSummary(
-						sessionPath,
-						[...savedSessionsByPath.values()],
-						this.lastListedSummaries,
-					);
-					close();
-					if (!summary) {
-						this.setStatusMessage("Failed to resume session: selected session was not found");
-						return;
-					}
-					this.finish({ type: "open", summary });
-				},
-				close,
-				() => {
-					close();
-					this.finish({ type: "exit" });
-				},
-				() => this.ui.requestRender(),
-				{
-					renameSession: async (sessionPath, nextName) => {
-						const name = (nextName ?? "").trim();
-						if (!name) {
-							return;
-						}
-						await this.renameSavedSessionFromSelector(sessionPath, name);
-					},
-					deleteSession: (sessionPath) => this.deleteSavedSessionFromSelector(sessionPath),
-					showRenameHint: true,
-					keybindings: this.keybindings,
-					frameless: true,
-				},
-			);
-			const splash = new BrandSplashHeader(
-				VERSION,
-				() => this.getSplashModelId(),
-				() => this.getSavedSessionCwd(),
-			);
-			handle = showFullPaneOverlay(this.ui, new SessionPickerScreen(this.ui, splash, selector), {
-				fullWidth: true,
-			});
-		});
+	/** Alt+Enter in the reply composer queues the reply as a follow-up. */
+	private handleReplyFollowUp(): void {
+		if (!this.replyTarget) return;
+		// Unlike Enter, this path skips submitValue, so expand paste markers here.
+		const text = this.editor.getExpandedText();
+		if (!text.trim()) return;
+		void this.submit(text, "followUp");
 	}
 
 	private getSavedSessionCwd(): string {
@@ -1301,46 +1202,13 @@ class AgentsViewMode implements Component, Focusable {
 		return { cwd: this.getSavedSessionCwd(), sessionDir: this.options.config.sessionDir };
 	}
 
-	private async renameSavedSessionFromSelector(sessionPath: string, name: string): Promise<void> {
-		await renameDaemonSavedSession(this.requireClient(), this.getSavedSessionCatalogContext(), sessionPath, name);
-		await this.refreshSessions();
-	}
-
-	private async deleteSavedSessionFromSelector(sessionPath: string) {
-		return deleteDaemonSavedSession(this.requireClient(), this.getSavedSessionCatalogContext(), sessionPath);
-	}
-
-	private getDefaultModelForNewAgents(): Model<Api> | undefined {
-		const settings = this.options.uiServices.settingsManager;
-		const provider = settings.getDefaultProvider();
-		const modelId = settings.getDefaultModel();
-		return provider && modelId ? this.options.uiServices.modelRegistry.find(provider, modelId) : undefined;
-	}
-
-	private applyDefaultModel(model: Model<Api>): void {
-		this.options.uiServices.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
-		// New agents are created from this shared config; pin the model explicitly
-		// so the daemon does not fall back to its own settings snapshot.
-		this.options.config.provider = model.provider;
-		this.options.config.model = model.id;
-		this.options.startupModelId = model.id;
-		this.setStatusMessage(`Model for new agents: ${model.id}`);
-		void this.maybeWarnAboutAnthropicSubscriptionAuth(model);
-	}
-
-	private createAutocompleteProvider(): CombinedAutocompleteProvider {
-		const cwd = resolveAgentsViewAutocompleteCwd(
-			this.options.uiServices.getInitialCwd(),
-			this.replyActiveSessionId ? this.findSummaryByActiveSessionId(this.replyActiveSessionId) : undefined,
-		);
-		return createAgentsViewAutocompleteProvider(cwd, this.fdPath, (prefix) =>
-			getAgentsViewModelArgumentCompletions(prefix, this.options.uiServices.modelRegistry),
-		);
-	}
-
 	private openSelected(): void {
 		const row = this.rows[this.selectedIndex];
 		if (!row?.selectable || this.isPendingDeleteRow(row)) {
+			return;
+		}
+		if (this.selectionAnchorPending) {
+			this.setStatusMessage("Waiting for the selected session to load");
 			return;
 		}
 		if (row.kind === "subagent-summary") {
@@ -1486,42 +1354,70 @@ class AgentsViewMode implements Component, Focusable {
 		if (selectedRow?.kind !== "agent") {
 			return;
 		}
-		const activeSessionId = selectedRow.summary.activeSessionId;
-		if (!activeSessionId) {
+		const summary = selectedRow.summary;
+		// Live agents reply directly; saved sessions are resumed when the reply is
+		// sent. Rows with neither runtime nor file have nothing to receive a prompt.
+		if (!summary.activeSessionId && !summary.sessionFile) {
 			return;
 		}
 		if (this.pendingDeleteAgent?.identity === getSelectedRowIdentity(selectedRow)) {
 			return;
 		}
-		if (this.replyActiveSessionId === activeSessionId) {
+		const key = summary.activeSessionId ?? summary.id;
+		if (this.replyTarget?.key === key) {
 			this.setReplyTarget(undefined);
 			return;
 		}
-		this.setReplyTarget(activeSessionId);
+		this.setReplyTarget({ key, summary });
+		if (!summary.activeSessionId) {
+			// Inactive sessions have no live transcript endpoint; the persisted recap
+			// (or opener) is the best preview and needs no daemon round-trip.
+			this.replyLastAssistantText = summary.summary ?? summary.firstMessage;
+			this.ui.requestRender();
+			return;
+		}
+		const activeSessionId = summary.activeSessionId;
 		this.replyLastAssistantTextLoading = true;
 		try {
 			const latestAssistantText = await this.getLastAssistantText(activeSessionId);
-			if (this.replyActiveSessionId === activeSessionId) {
+			if (this.replyTarget?.key === key) {
 				this.replyLastAssistantText = latestAssistantText;
 				this.replyLastAssistantTextLoading = false;
 				this.ui.requestRender();
 			}
 		} catch (error) {
-			if (this.replyActiveSessionId === activeSessionId) {
+			if (this.replyTarget?.key === key) {
 				this.replyLastAssistantTextLoading = false;
 				this.setStatusMessage(formatError("Failed to load latest response", error));
 			}
 		}
 	}
 
-	private setReplyTarget(activeSessionId: string | undefined): void {
-		this.replyActiveSessionId = activeSessionId;
+	private setReplyTarget(target: { key: string; summary: SessionSummary } | undefined): void {
+		if (target && !this.replyTarget) {
+			this.actionModeSearchQuery = this.editor.getText();
+			this.editor.setText("");
+		} else if (!target && this.replyTarget) {
+			this.editor.setText(this.actionModeSearchQuery ?? this.persistentState.query ?? "");
+			this.actionModeSearchQuery = undefined;
+		}
+		this.replyTarget = target;
+		this.replyAutocomplete = target
+			? createReplyComposerAutocompleteProvider(target.summary.cwd, this.fdPath)
+			: undefined;
 		this.replyLastAssistantText = undefined;
 		this.replyLastAssistantTextLoading = false;
-		// Captured once on entry so the header does not count up while reply mode stays open.
-		this.replyHeaderTime = activeSessionId ? this.getReplyHeaderTime(activeSessionId) : "";
-		this.editor.setPlaceholder(activeSessionId ? REPLY_PROMPT_FALLBACK_PLACEHOLDER : DEFAULT_PROMPT_PLACEHOLDER);
-		this.editor.setAutocompleteProvider(this.createAutocompleteProvider());
+		this.replyHeaderTime = target
+			? formatAgentsViewRelativeTime(target.summary.modified ?? target.summary.created)
+			: "";
+		this.editor.setPlaceholder(
+			target
+				? target.summary.activeSessionId
+					? REPLY_PROMPT_FALLBACK_PLACEHOLDER
+					: RESUME_PROMPT_PLACEHOLDER
+				: SEARCH_PROMPT_PLACEHOLDER,
+		);
+		if (!target) this.rebuildRows();
 		this.ui.requestRender();
 	}
 
@@ -1532,14 +1428,16 @@ class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		const activeSessionId = row.summary.activeSessionId;
-		if (!activeSessionId) {
-			this.setStatusMessage("This agent has no active session to rename");
+		const sessionFile = row.summary.sessionFile;
+		if (!activeSessionId && !sessionFile) {
+			this.setStatusMessage("This session cannot be renamed");
 			return;
 		}
 		this.setReplyTarget(undefined);
+		this.actionModeSearchQuery = this.editor.getText();
 		this.pendingDeleteAgent = undefined;
 		this.pendingKillSubagent = undefined;
-		this.renameTarget = { activeSessionId, identity: getSummaryIdentity(row.summary) };
+		this.renameTarget = { activeSessionId, sessionFile, summary: row.summary };
 		this.editor.setPlaceholder("Name this agent session");
 		this.editor.setText(row.summary.sessionName ?? "");
 		this.ui.requestRender();
@@ -1547,8 +1445,10 @@ class AgentsViewMode implements Component, Focusable {
 
 	private exitRenameMode(): void {
 		this.renameTarget = undefined;
-		this.editor.setText("");
-		this.editor.setPlaceholder(DEFAULT_PROMPT_PLACEHOLDER);
+		this.editor.setText(this.actionModeSearchQuery ?? this.persistentState.query ?? "");
+		this.actionModeSearchQuery = undefined;
+		this.editor.setPlaceholder(SEARCH_PROMPT_PLACEHOLDER);
+		this.rebuildRows();
 		this.ui.requestRender();
 	}
 
@@ -1563,27 +1463,39 @@ class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		this.exitRenameMode();
+		await this.renameSession(target.summary, name);
+	}
+
+	/** Shared by rename mode and /name: rename, refresh both catalogs, report. */
+	private async renameSession(summary: SessionSummary, name: string): Promise<boolean> {
 		this.setStatusMessage("Renaming agent...");
 		try {
-			await this.requireClient().request({
-				type: "rename",
-				activeSessionId: target.activeSessionId,
-				name,
-			});
-			this.setStatusMessage(`Renamed to ${name}`, { render: false });
-			await this.refreshSessions();
+			if (summary.activeSessionId) {
+				requireDaemonData(
+					await this.requireClient().request({ type: "rename", activeSessionId: summary.activeSessionId, name }),
+				);
+			} else if (summary.sessionFile) {
+				await renameDaemonSavedSession(
+					this.requireClient(),
+					this.getSavedSessionCatalogContext(),
+					summary.sessionFile,
+					name,
+				);
+			} else {
+				this.setStatusMessage("This session cannot be renamed", { tone: "warning" });
+				return false;
+			}
+			const refreshed = await this.refreshBothCatalogs();
+			this.setStatusMessage(refreshed ? `Renamed to ${name}` : `Renamed to ${name}; refresh failed`);
+			return true;
 		} catch (error) {
 			this.setStatusMessage(
 				isUnknownDaemonCommandError(error, "rename")
 					? "Failed to rename: the daemon is running an older build; restart the daemon and try again"
 					: formatError("Failed to rename agent", error),
 			);
+			return false;
 		}
-	}
-
-	private getReplyHeaderTime(activeSessionId: string): string {
-		const summary = this.findSummaryByActiveSessionId(activeSessionId);
-		return formatAgentsViewRelativeTime(summary?.modified ?? summary?.created);
 	}
 
 	private findSummaryByActiveSessionId(activeSessionId: string): SessionSummary | undefined {
@@ -1594,7 +1506,7 @@ class AgentsViewMode implements Component, Focusable {
 		if (this.renameTarget) {
 			return theme.fg("warning", "Rename agent session");
 		}
-		if (!this.replyActiveSessionId) {
+		if (!this.replyTarget) {
 			return undefined;
 		}
 		const headline =
@@ -1621,17 +1533,151 @@ class AgentsViewMode implements Component, Focusable {
 		return data.text;
 	}
 
-	private async sendReply(activeSessionId: string, text: string): Promise<void> {
-		const behavior = this.findSummaryByActiveSessionId(activeSessionId)?.isStreaming ? "followUp" : undefined;
-		this.setStatusMessage("Sending reply...");
+	private async sendReply(
+		target: { key: string; summary: SessionSummary },
+		text: string,
+		delivery: "steer" | "followUp" = "steer",
+	): Promise<boolean> {
+		const currentSummary = resolveCurrentReplyTargetSummary(this.unifiedRecords ?? [], target, (activeSessionId) =>
+			this.findSummaryByActiveSessionId(activeSessionId),
+		);
+		let activeSessionId = currentSummary.activeSessionId;
+		let liveSummary = activeSessionId ? currentSummary : undefined;
+		let cwdFallbackNotice: string | undefined;
+		let didResume = false;
 		try {
-			await this.sendPrompt(activeSessionId, text, undefined, behavior);
-			this.setStatusMessage("Reply sent");
-			this.setReplyTarget(undefined);
-			await this.refreshSessions();
+			if (!activeSessionId) {
+				// Saved session: resume it into the daemon first, then deliver the
+				// prompt through the same path as a live reply.
+				this.setStatusMessage("Resuming session...");
+				const resumed = await resumeSavedAgentsViewSession(
+					this.requireClient(),
+					this.options.config,
+					currentSummary,
+				);
+				activeSessionId = resumed.activeSessionId;
+				didResume = true;
+				// The rows are still pre-resume; the fresh summary is the authoritative
+				// streaming state for scheduling the prompt.
+				liveSummary = resumed.summary;
+				cwdFallbackNotice = resumed.cwdFallbackNotice;
+				this.inactiveAgentIdentities.delete(getSummaryIdentity(target.summary));
+				// The resume and delivery still belong to this submission, but selection
+				// belongs to the current composer. Do not steal it after cancellation.
+				if (this.replyTarget === target) this.selectSummary(resumed.summary);
+			}
+			const behavior = delivery === "followUp" ? "followUp" : liveSummary?.isStreaming ? "steer" : undefined;
+			this.setStatusMessage("Sending reply...");
+			await this.sendPrompt(activeSessionId, text, behavior);
+			// The fallback-directory notice must outlive the transient send statuses.
+			if (cwdFallbackNotice) this.setStatusMessage(cwdFallbackNotice, { sticky: true });
+			else this.setStatusMessage("Reply sent");
+			return true;
 		} catch (error) {
 			this.setStatusMessage(formatError("Failed to send reply", error));
+			if (didResume) await this.refreshSessions({ preserveStatusOnError: true });
+			return false;
 		}
+	}
+
+	/** Create a fresh daemon session and open it in the chat view. */
+	private async createNewSession(): Promise<boolean> {
+		if (this.creatingNewSession || this.stopped) return false;
+		this.creatingNewSession = true;
+		try {
+			const client = await this.connectDedicatedClient();
+			try {
+				this.setStatusMessage("Creating session...");
+				const response = await client.request({
+					type: "create",
+					config: this.options.config,
+					env: collectDaemonClientEnv(),
+				});
+				const created = expectSessionSummary(requireDaemonData(response));
+				// The view can finish mid-create; kill the fresh session instead of orphaning it.
+				if (this.stopped) {
+					if (created.activeSessionId) {
+						await client
+							.request({ type: "kill", activeSessionId: created.activeSessionId })
+							.catch(() => undefined);
+					}
+					return false;
+				}
+				this.selectSummary(created);
+				this.finish({ type: "open", summary: created });
+				return true;
+			} finally {
+				client.close();
+			}
+		} catch (error) {
+			if (!this.stopped) this.setStatusMessage(formatError("Failed to create session", error));
+			return false;
+		} finally {
+			this.creatingNewSession = false;
+		}
+	}
+
+	/**
+	 * Run a view command against the armed composer's target. Returns whether
+	 * it completed so callers can restore the draft; disarms are guarded
+	 * against a composer re-armed during the awaited RPCs.
+	 */
+	private async runAgentsViewCommand(command: AgentsViewCommand, target: SessionSummary): Promise<boolean> {
+		const armedAtStart = this.replyTarget;
+		const disarmIfUnchanged = () => {
+			if (armedAtStart && this.replyTarget === armedAtStart) this.setReplyTarget(undefined);
+		};
+		try {
+			switch (command.name) {
+				case "name": {
+					const name = command.args.trim();
+					if (!name) {
+						this.setStatusMessage("Usage: /name <session name>", { tone: "warning" });
+						return false;
+					}
+					return await this.renameSession(target, name);
+				}
+				case "kill": {
+					if (!target.activeSessionId) {
+						this.setStatusMessage("/kill needs a running agent; this session is inactive", { tone: "warning" });
+						return false;
+					}
+					try {
+						requireDaemonData(
+							await this.requireClient().request({ type: "kill", activeSessionId: target.activeSessionId }),
+						);
+					} catch (error) {
+						// As in deactivatePendingAgent: an agent that already finished counts as stopped.
+						if (!isUnknownActiveSessionError(error)) throw error;
+					}
+					disarmIfUnchanged();
+					this.setStatusMessage("Agent stopped");
+					await this.refreshBothCatalogs();
+					return true;
+				}
+			}
+		} catch (error) {
+			this.setStatusMessage(formatError(`Failed to run /${command.name}`, error));
+			return false;
+		}
+		return false;
+	}
+
+	/**
+	 * Outlives finish(), which closes the shared client and would reject an
+	 * in-flight create while the daemon still materializes the session.
+	 */
+	private async connectDedicatedClient(): Promise<DaemonClient> {
+		return connectAgentsViewDaemonClient(this.requireSocketPath());
+	}
+
+	/** Point selection (and its persisted key) at a freshly resumed session row. */
+	private selectSummary(summary: SessionSummary): void {
+		this.selectedRowIdentity = getSummaryIdentity(summary);
+		this.selectedActiveSessionId = summary.activeSessionId ?? summary.id;
+		this.selectedSessionKey = getAgentsViewSelectionKey(summary);
+		this.persistentState.selectedRowIdentity = this.selectedRowIdentity;
+		this.persistentState.selectedSessionKey = this.selectedSessionKey;
 	}
 
 	private async handleDeleteSelected(): Promise<void> {
@@ -1649,6 +1695,50 @@ class AgentsViewMode implements Component, Focusable {
 		}
 		this.pendingKillSubagent = undefined;
 		const identity = getSummaryIdentity(row.summary);
+		if (!row.summary.activeSessionId && row.summary.sessionFile) {
+			if (this.pendingDeleteAgent?.identity === identity && this.isDeleteConfirmationVisible()) {
+				this.clearDeleteConfirmation({ render: false });
+				try {
+					const latest = expectSessionList(
+						requireDaemonData(await this.requireClient().request(createAgentsViewListCommand())),
+					);
+					this.lastListedSummaries = latest;
+					const active = resolveAgentsViewActiveSummaryForPath(row.summary.sessionFile, latest);
+					if (active) {
+						this.pendingDeleteAgent = undefined;
+						this.setStatusMessage("Session became active; stop it before deleting", { tone: "warning" });
+						await this.refreshSessions();
+						return;
+					}
+					const result = await deleteDaemonSavedSession(
+						this.requireClient(),
+						this.getSavedSessionCatalogContext(),
+						row.summary.sessionFile,
+					);
+					if (!result.ok) {
+						this.setStatusMessage(`Failed to delete session: ${result.error ?? "Unknown error"}`, {
+							tone: "error",
+						});
+						return;
+					}
+					this.pendingDeleteAgent = undefined;
+					const refreshed = await this.refreshSavedSessions({ preserveStatusOnError: true });
+					const success = result.method === "trash" ? "Session moved to trash" : "Session deleted";
+					this.setStatusMessage(refreshed ? success : `${success}; refresh failed`);
+				} catch (error) {
+					this.setStatusMessage(formatError("Failed to delete session", error));
+				}
+				return;
+			}
+			this.pendingDeleteAgent = {
+				identity,
+				sessionFile: row.summary.sessionFile,
+				summary: row.summary,
+				stopped: false,
+			};
+			this.showDeleteConfirmation();
+			return;
+		}
 		if (this.pendingDeleteAgent?.identity === identity) {
 			if (this.isDeleteConfirmationVisible()) {
 				await this.deactivatePendingAgent();
@@ -1796,113 +1886,70 @@ class AgentsViewMode implements Component, Focusable {
 		}
 	}
 
-	private async createAgentForPrompt(
-		text: string,
-		images?: ImageContent[],
-	): Promise<{ summary: SessionSummary; activeSessionId: string } | undefined> {
-		const client = this.requireClient();
-		this.setStatusMessage("Creating agent...");
-		try {
-			const response = await client.request({
-				type: "create",
-				config: this.options.config,
-				name: createAgentsViewSessionName(text),
-			});
-			const summary = expectSessionSummary(requireDaemonData(response));
-			const activeSessionId = summary.activeSessionId ?? summary.id;
-			await this.sendPrompt(activeSessionId, text, images);
-			this.setStatusMessage("Agent started");
-			await this.refreshSessions();
-			this.selectedRowIdentity = getSummaryIdentity(summary);
-			this.selectedActiveSessionId = activeSessionId;
-			this.selectedSessionKey = getAgentsViewSelectionKey(summary);
-			this.persistentState.selectedRowIdentity = this.selectedRowIdentity;
-			this.persistentState.selectedSessionKey = this.selectedSessionKey;
-			this.restoreSelection();
-			return { summary, activeSessionId };
-		} catch (error) {
-			this.setStatusMessage(formatError("Failed to create agent", error));
-			return undefined;
-		}
-	}
-
 	private async sendPrompt(
 		activeSessionId: string,
 		message: string,
-		images?: ImageContent[],
 		streamingBehavior?: "steer" | "followUp",
 	): Promise<void> {
-		const command: PromptCommand = {
-			type: "prompt",
-			activeSessionId,
-			message,
-		};
-		if (images && images.length > 0) {
-			command.images = images;
-		}
-		if (streamingBehavior) {
-			command.streamingBehavior = streamingBehavior;
-		}
+		const command: PromptCommand = { type: "prompt", activeSessionId, message };
+		if (streamingBehavior) command.streamingBehavior = streamingBehavior;
 		const response = await this.requireClient().request(command);
 		requireDaemonData(response);
 	}
 
-	private async sendInitialPrompts(): Promise<void> {
-		if (this.persistentState.initialPromptsSent) {
-			return;
-		}
-		this.persistentState.initialPromptsSent = true;
-		const initialMessages = this.options.initialMessages ?? [];
-		const firstMessage = this.options.initialMessage ?? initialMessages[0];
-		if (!firstMessage) {
-			return;
-		}
-		const remainingMessages = this.options.initialMessage ? initialMessages : initialMessages.slice(1);
-		const created = await this.createAgentForPrompt(firstMessage, this.options.initialImages);
-		if (!created) {
-			return;
-		}
-		const { activeSessionId } = created;
-		for (const message of remainingMessages) {
-			try {
-				await this.sendPrompt(activeSessionId, message, undefined, "followUp");
-			} catch (error) {
-				this.setStatusMessage(formatError("Failed to send startup prompt", error));
-				break;
-			}
-		}
-		await this.refreshSessions();
+	private pollSessions(): void {
+		if (this.liveCatalogPollPromise) return;
+		const poll = this.refreshSessions().then(() => undefined);
+		this.liveCatalogPollPromise = poll;
+		void poll.finally(() => {
+			if (this.liveCatalogPollPromise === poll) this.liveCatalogPollPromise = undefined;
+		});
 	}
 
-	private async refreshSessions(): Promise<void> {
-		if (this.reconnectPromise || this.daemonShutdownReceived) {
-			return;
-		}
-		const client = this.requireClient();
+	private async refreshSessions(options: { preserveStatusOnError?: boolean } = {}): Promise<boolean> {
+		if (this.reconnectPromise || this.daemonShutdownReceived) return false;
+		const generation = ++this.liveCatalogGeneration;
+		this.liveCatalogRefreshPending = true;
 		try {
-			const response = await client.request(createAgentsViewListCommand());
-			const data = requireDaemonData(response);
-			this.applySessionList(expectSessionList(data));
-			await this.sendInitialPrompts();
-		} catch (error) {
-			if (!this.reconnectPromise) {
-				if (client.isConnected) {
-					this.setStatusMessage(formatError("Failed to refresh agents", error));
-				} else {
-					this.startClientReconnect(client, error);
+			const client = this.requireClient();
+			try {
+				const response = await client.request(createAgentsViewListCommand());
+				if (generation !== this.liveCatalogGeneration) return false;
+				this.applySessionList(expectSessionList(requireDaemonData(response)));
+				return true;
+			} catch (error) {
+				if (!options.preserveStatusOnError && !this.reconnectPromise) {
+					if (client.isConnected) this.setStatusMessage(formatError("Failed to refresh agents", error));
+					else this.startClientReconnect(client, error);
 				}
+				return false;
+			}
+		} catch (error) {
+			if (generation === this.liveCatalogGeneration && !options.preserveStatusOnError) {
+				this.setStatusMessage(formatError("Failed to refresh current session", error));
+			}
+			return false;
+		} finally {
+			if (generation === this.liveCatalogGeneration) {
+				this.liveCatalogRefreshPending = false;
+				this.resolveMissingSelectionAnchor();
 			}
 		}
 	}
 
 	private applySessionList(sessions: SessionSummary[]): void {
 		this.lastListedSummaries = sessions;
-		const visibleSessions = sessions.filter((summary) =>
+		this.reconcileCatalogs();
+	}
+
+	private reconcileCatalogs(): void {
+		const visibleSessions = this.lastListedSummaries.filter((summary) =>
 			shouldShowAgentsViewSession(summary, this.inactiveAgentIdentities.has(getSummaryIdentity(summary))),
 		);
 		this.lastVisibleSummaries = this.withPendingDeleteSession(visibleSessions);
+		this.unifiedRecords = reconcileUnifiedSessions(this.lastVisibleSummaries, this.savedSessions, this.heartbeats);
 		this.rows = buildAgentsViewRows(
-			this.lastVisibleSummaries,
+			this.getFilteredRecords(),
 			this.expandedSubagentParents,
 			this.programShownParents,
 		);
@@ -1911,9 +1958,91 @@ class AgentsViewMode implements Component, Focusable {
 		this.ui.requestRender();
 	}
 
+	/** A session appears in both catalogs; mutations must refresh both. */
+	private async refreshBothCatalogs(): Promise<boolean> {
+		const results = await Promise.all([
+			this.refreshSessions({ preserveStatusOnError: true }),
+			this.refreshSavedSessions({ preserveStatusOnError: true }),
+		]);
+		return results.every(Boolean);
+	}
+
+	private async refreshSavedSessions(
+		options: { duringReconnect?: boolean; preserveStatusOnError?: boolean } = {},
+	): Promise<boolean> {
+		if ((!options.duringReconnect && this.reconnectPromise) || this.daemonShutdownReceived) return false;
+		const generation = ++this.savedCatalogGeneration;
+		this.persistentState.savedCatalogGeneration = generation;
+		this.savedCatalogRefreshPending = true;
+		const successfulSessions = this.lastSuccessfulSavedSessions;
+		const progressiveSessions = new Map(
+			successfulSessions.map((session) => [resolvePath(canonicalizePath(session.path)), session]),
+		);
+		try {
+			const onSession = (session: AgentConnectionSavedSessionInfo) => {
+				if (generation !== this.savedCatalogGeneration) return;
+				progressiveSessions.set(resolvePath(canonicalizePath(session.path)), session);
+				this.savedSessions = [...progressiveSessions.values()];
+				this.persistentState.savedSessions = this.savedSessions;
+				this.reconcileCatalogs();
+			};
+			const sessions = await listDaemonSavedSessions(
+				this.requireClient(),
+				this.getSavedSessionCatalogContext(),
+				"all",
+				{
+					onSession,
+				},
+			);
+			if (generation !== this.savedCatalogGeneration) return false;
+			this.savedSessions = sessions;
+			this.lastSuccessfulSavedSessions = sessions;
+			this.persistentState.lastSuccessfulSavedSessions = sessions;
+			this.persistentState.savedSessions = sessions;
+			this.reconcileCatalogs();
+			return true;
+		} catch (error) {
+			if (generation === this.savedCatalogGeneration) {
+				this.savedSessions = successfulSessions;
+				this.persistentState.savedSessions = successfulSessions;
+				this.reconcileCatalogs();
+				if (!options.preserveStatusOnError && !this.reconnectPromise && !this.daemonShutdownReceived) {
+					this.setStatusMessage(formatError("Failed to load saved sessions", error));
+				}
+			}
+			return false;
+		} finally {
+			if (generation === this.savedCatalogGeneration) {
+				this.savedCatalogRefreshPending = false;
+				this.resolveMissingSelectionAnchor();
+			}
+		}
+	}
+
+	private async refreshHeartbeats(options: { duringReconnect?: boolean } = {}): Promise<boolean> {
+		if ((!options.duringReconnect && this.reconnectPromise) || this.daemonShutdownReceived) return false;
+		const generation = ++this.heartbeatCatalogGeneration;
+		try {
+			const heartbeats = await listDaemonHeartbeats(this.requireClient());
+			if (generation !== this.heartbeatCatalogGeneration) return false;
+			this.heartbeats = heartbeats;
+			this.persistentState.heartbeats = heartbeats;
+			this.reconcileCatalogs();
+			return true;
+		} catch (error) {
+			if (generation === this.heartbeatCatalogGeneration && !this.reconnectPromise) {
+				this.setStatusMessage(formatError("Failed to refresh heartbeats", error));
+			}
+			return false;
+		}
+	}
+
 	private withPendingDeleteSession(sessions: readonly SessionSummary[]): SessionSummary[] {
 		const pending = this.pendingDeleteAgent;
-		if (!pending) {
+		// Saved-only rows already come from the durable catalog. Injecting their
+		// synthetic archived summary as a daemon record would move confirmation
+		// from Inactive to Idle.
+		if (!pending || pending.summary.lifecycle !== "live") {
 			return [...sessions];
 		}
 		if (!this.isDeleteConfirmationVisible()) {
@@ -1930,27 +2059,46 @@ class AgentsViewMode implements Component, Focusable {
 		return replaced ? merged : [...merged, pending.summary];
 	}
 
+	private resolveMissingSelectionAnchor(): void {
+		if (!this.selectionAnchorPending || this.liveCatalogRefreshPending || this.savedCatalogRefreshPending) {
+			return;
+		}
+		// Unblock the fallback row, but keep the anchor identities: a later poll
+		// can still deliver the intended session and re-anchor selection to it.
+		this.selectionAnchorPending = false;
+		const row = this.rows[this.selectedIndex];
+		this.selectedActiveSessionId = row?.selectable ? (row.summary.activeSessionId ?? row.summary.id) : undefined;
+	}
+
 	private restoreSelection(): void {
 		if (this.rows.length === 0) {
 			this.selectedIndex = 0;
 			this.selectedActiveSessionId = undefined;
 			return;
 		}
-		const index = this.findSelectedRowIndex();
-		if (index >= 0) {
-			this.selectedIndex = index;
-		} else if (!this.rows[this.selectedIndex]?.selectable) {
-			this.selectedIndex = this.getSelectableRowIndexes()[0] ?? 0;
-		} else {
-			this.selectedIndex = Math.min(this.selectedIndex, this.rows.length - 1);
+		const resolution = resolveAgentsViewSelectionState(
+			this.rows,
+			this.selectedIndex,
+			this.selectedRowIdentity ?? this.persistentState.selectedRowIdentity,
+			this.selectedSessionKey ?? this.persistentState.selectedSessionKey,
+		);
+		this.selectedIndex = resolution.index;
+		if (resolution.resolved) {
+			this.syncSelectedRowState();
+			return;
 		}
-		this.syncSelectedRowState();
-	}
-
-	private findSelectedRowIndex(): number {
-		const identity = this.selectedRowIdentity ?? this.persistentState.selectedRowIdentity;
-		const key = this.selectedSessionKey ?? this.persistentState.selectedSessionKey;
-		return resolveAgentsViewSelectionIndex(this.rows, identity, key);
+		this.selectionAnchorPending = Boolean(
+			this.selectedRowIdentity ??
+				this.persistentState.selectedRowIdentity ??
+				this.selectedSessionKey ??
+				this.persistentState.selectedSessionKey,
+		);
+		// Catalogs stream independently. Show a temporary fallback row without
+		// replacing the source-session anchor before its daemon row arrives.
+		const fallback = this.rows[this.selectedIndex];
+		this.selectedActiveSessionId = fallback?.selectable
+			? (fallback.summary.activeSessionId ?? fallback.summary.id)
+			: undefined;
 	}
 
 	private getSelectableRowIndexes(): number[] {
@@ -1958,6 +2106,7 @@ class AgentsViewMode implements Component, Focusable {
 	}
 
 	private syncSelectedRowState(): void {
+		this.selectionAnchorPending = false;
 		const row = this.rows[this.selectedIndex];
 		this.selectedActiveSessionId = row?.selectable ? (row.summary.activeSessionId ?? row.summary.id) : undefined;
 		this.selectedRowIdentity = getSelectedRowIdentity(row);
@@ -1971,9 +2120,16 @@ class AgentsViewMode implements Component, Focusable {
 			return;
 		}
 		this.stopped = true;
+		this.savedCatalogGeneration += 1;
+		this.liveCatalogGeneration += 1;
+		this.heartbeatCatalogGeneration += 1;
 		if (this.pollTimer) {
 			clearInterval(this.pollTimer);
 			this.pollTimer = undefined;
+		}
+		if (this.heartbeatPollTimer) {
+			clearInterval(this.heartbeatPollTimer);
+			this.heartbeatPollTimer = undefined;
 		}
 		if (this.animationTimer) {
 			clearInterval(this.animationTimer);
@@ -1989,6 +2145,8 @@ class AgentsViewMode implements Component, Focusable {
 		stopThemeWatcher();
 		this.unsubscribeClientClose?.();
 		this.unsubscribeClientClose = undefined;
+		this.unsubscribeClientMessage?.();
+		this.unsubscribeClientMessage = undefined;
 		this.client?.close();
 		this.client = undefined;
 		this.resolveRun?.(result);
@@ -2044,11 +2202,13 @@ class AgentsViewMode implements Component, Focusable {
 				const response = await client.request(createAgentsViewListCommand());
 				const data = requireDaemonData(response);
 				const sessions = expectSessionList(data);
+				const heartbeatsRefreshed = await this.refreshHeartbeats({ duringReconnect: true });
+				if (!heartbeatsRefreshed) throw new Error("Heartbeat catalog did not refresh during reconnect");
 				this.daemonShutdownReceived = false;
 				this.reconnectTimedOut = false;
 				this.setStatusMessage("Daemon reconnected", { render: false });
 				this.applySessionList(sessions);
-				await this.sendInitialPrompts();
+				void this.refreshSavedSessions({ duringReconnect: true, preserveStatusOnError: true });
 				return;
 			} catch (error) {
 				lastError = error;
@@ -2069,6 +2229,11 @@ class AgentsViewMode implements Component, Focusable {
 		}
 	}
 
+	private requireSocketPath(): string {
+		if (!this.options.socketPath) throw new Error("Session view daemon socket is not configured");
+		return this.options.socketPath;
+	}
+
 	private requireClient(): DaemonClient {
 		if (!this.client) {
 			throw new Error("Agents view daemon client is not connected");
@@ -2078,16 +2243,7 @@ class AgentsViewMode implements Component, Focusable {
 
 	private getAgentCountsText(): string {
 		const counts = countRowsBySection(this.rows);
-		const parts: string[] = [];
-		if (counts["needs-input"] > 0) {
-			parts.push(`${counts["needs-input"]} needs input`);
-		}
-		parts.push(`${counts.working} working`);
-		if (counts.heartbeats > 0) {
-			parts.push(`${counts.heartbeats} heartbeats`);
-		}
-		parts.push(`${counts.completed} completed`);
-		return parts.join(", ");
+		return `${counts.running} running, ${counts.idle} idle, ${counts.inactive} inactive`;
 	}
 
 	private renderSessionRows(width: number, maxRows: number): string[] {
@@ -2095,10 +2251,10 @@ class AgentsViewMode implements Component, Focusable {
 			return [];
 		}
 		if (this.rows.length === 0) {
-			return [
-				theme.bold(sectionTitle("working")),
-				theme.fg("dim", "  No agents yet. Describe a task below to start one."),
-			].slice(0, maxRows);
+			return [theme.bold(sectionTitle("running")), theme.fg("dim", "  No sessions match your search.")].slice(
+				0,
+				maxRows,
+			);
 		}
 
 		const displayItems = buildDisplayItems(this.rows);
@@ -2159,8 +2315,21 @@ class AgentsViewMode implements Component, Focusable {
 		const rawIcon = this.getRowIcon(row.section);
 		const icon = this.formatRowIcon(row.section, rawIcon);
 		const indent = "  ".repeat(row.depth);
-		const timeWidth = 10;
-		const titleWidth = Math.max(0, width - visibleWidth(indent) - visibleWidth(rawIcon) - timeWidth - 2);
+		const age = formatSessionDuration(row.summary);
+		const details = row.section === "inactive" ? `${row.summary.messageCount} · ${age}` : age;
+		const detailsWidth = row.section === "inactive" ? Math.max(10, visibleWidth(details)) : 10;
+		const heartbeatBadge = !pendingDelete && !pendingKill ? formatHeartbeatBadge(row.heartbeat) : "";
+		const heartbeatCell = heartbeatBadge ? theme.fg("error", heartbeatBadge) : "";
+		const heartbeatWidth = visibleWidth(heartbeatBadge);
+		const titleWidth = Math.max(
+			0,
+			width -
+				visibleWidth(indent) -
+				visibleWidth(rawIcon) -
+				detailsWidth -
+				2 -
+				(heartbeatWidth > 0 ? heartbeatWidth + 1 : 0),
+		);
 		const title = pendingDelete
 			? this.getPendingDeleteTitle()
 			: pendingKill
@@ -2175,9 +2344,9 @@ class AgentsViewMode implements Component, Focusable {
 		const cells = [
 			icon,
 			pendingDelete || pendingKill ? theme.fg("error", titleCell) : titleCell,
-			formatRightTableCell(formatSessionDuration(row.summary), timeWidth),
+			formatRightTableCell(details, detailsWidth),
 		];
-		const base = `${indent}${cells[0]} ${cells[1]} ${cells[2]}`;
+		const base = `${indent}${cells[0]} ${heartbeatCell ? `${heartbeatCell} ` : ""}${cells[1]} ${cells[2]}`;
 		const line = padLine(truncateToWidth(base, width, ""), width);
 		return selected ? `${SELECTED_ROW_MARKER}${line}` : line;
 	}
@@ -2236,9 +2405,7 @@ class AgentsViewMode implements Component, Focusable {
 
 	private renderDock(width: number): string[] {
 		const safeWidth = Math.max(1, width);
-		return [...this.renderPrompt(safeWidth), this.renderHints(safeWidth)].map((line) =>
-			this.finalizeRenderedLine(line, safeWidth),
-		);
+		return [this.renderHints(safeWidth)].map((line) => this.finalizeRenderedLine(line, safeWidth));
 	}
 
 	private renderHints(width: number): string {
@@ -2254,25 +2421,47 @@ class AgentsViewMode implements Component, Focusable {
 			const hint = `${keyText("tui.select.confirm")} save   ${keyText("tui.select.cancel")} cancel`;
 			return truncateToWidth(theme.fg("muted", hint), width);
 		}
+		if (this.replyTarget) {
+			return truncateToWidth(theme.fg("muted", this.renderReplyComposerHints()), width);
+		}
 		// Replying is reserved for top-level agents; subagents can be stopped.
 		const selectedRow = this.rows[this.selectedIndex];
 		const selectedAgent = selectedRow?.kind === "agent";
 		const selectedSubagent = selectedRow?.kind === "subagent";
 		const hints = [
 			`${keyText("tui.select.up")}/${keyText("tui.select.down")} move`,
-			`${keyText("tui.select.confirm")} open/send`,
+			`${keyText("tui.select.confirm")} open`,
 			`${keyText("app.agents.open")} open`,
-			"/ commands",
-			selectedAgent ? `${keyText("app.agents.reply")} reply` : undefined,
+			selectedAgent
+				? `${keyText("app.agents.reply")} ${selectedRow?.section === "inactive" ? "resume" : "reply"}`
+				: undefined,
+			`${keyText("app.agents.new")} new`,
 			selectedAgent ? `${keyText("app.agents.rename")} rename` : undefined,
-			selectedAgent ? `${keyText("app.agents.delete")} stop/deactivate` : undefined,
+			selectedAgent
+				? `${keyText("app.agents.delete")} ${selectedRow?.section === "inactive" ? "delete" : "stop/deactivate"}`
+				: undefined,
 			selectedSubagent ? `${keyText("app.agents.delete")} stop` : undefined,
 			this.selectedRowCanShowProgram() ? `${keyText("app.agents.program")} program` : undefined,
-			this.replyActiveSessionId ? `${keyText("app.agents.back")} back` : undefined,
 		]
 			.filter((hint): hint is string => hint !== undefined)
 			.join("   ");
 		return truncateToWidth(theme.fg("muted", hints), width);
+	}
+
+	private renderReplyComposerHints(): string {
+		const target = this.replyTarget!;
+		const current = resolveCurrentReplyTargetSummary(this.unifiedRecords ?? [], target, (activeSessionId) =>
+			this.findSummaryByActiveSessionId(activeSessionId),
+		);
+		const streaming = current.activeSessionId !== undefined && current.isStreaming;
+		const hasText = this.editor.getText().trim().length > 0;
+		return [
+			`${keyText("tui.select.confirm")} ${streaming ? "steer" : current.activeSessionId ? "send" : "resume & send"}`,
+			hasText ? `${keyText("app.message.followUp")} queue` : undefined,
+			`${keyText("tui.select.cancel")} cancel`,
+		]
+			.filter((hint): hint is string => hint !== undefined)
+			.join("   ");
 	}
 
 	private visibleListRows(): number {
@@ -2295,13 +2484,11 @@ class AgentsViewMode implements Component, Focusable {
 
 	private getRowIcon(section: AgentsViewSection): string {
 		switch (section) {
-			case "working":
+			case "running":
 				return workingIconFrame(this.workingIconFrame);
-			case "needs-input":
+			case "idle":
 				return NEEDS_INPUT_ROW_ICON;
-			case "heartbeats":
-				return HEARTBEAT_ROW_ICON;
-			case "completed":
+			case "inactive":
 				return COMPLETED_ROW_ICON;
 			default: {
 				const _exhaustive: never = section;
@@ -2312,14 +2499,12 @@ class AgentsViewMode implements Component, Focusable {
 
 	private formatRowIcon(section: AgentsViewSection, icon: string): string {
 		switch (section) {
-			case "working":
+			case "running":
 				return theme.bold(icon);
-			case "needs-input":
+			case "idle":
 				return theme.fg("warning", icon);
-			case "heartbeats":
-				return theme.fg("error", icon);
-			case "completed":
-				return theme.fg("success", icon);
+			case "inactive":
+				return theme.fg("dim", icon);
 			default: {
 				const _exhaustive: never = section;
 				return _exhaustive;
@@ -2336,7 +2521,7 @@ type DisplayItem =
 
 function buildDisplayItems(rows: readonly AgentsViewRow[]): DisplayItem[] {
 	const items: DisplayItem[] = [];
-	const sections: AgentsViewSection[] = ["needs-input", "working", "heartbeats", "completed"];
+	const sections: AgentsViewSection[] = ["running", "idle", "inactive"];
 	for (const [index, section] of sections.entries()) {
 		if (index > 0) {
 			items.push({ type: "spacer" });
@@ -2373,10 +2558,9 @@ function getDisplayRowsForSection(rows: readonly AgentsViewRow[], section: Agent
 function countRowsBySection(rows: readonly AgentsViewRow[]): Record<AgentsViewSection, number> {
 	const agents = rows.filter((row) => row.kind === "agent");
 	return {
-		working: agents.filter((row) => row.section === "working").length,
-		"needs-input": agents.filter((row) => row.section === "needs-input").length,
-		heartbeats: agents.filter((row) => row.section === "heartbeats").length,
-		completed: agents.filter((row) => row.section === "completed").length,
+		running: agents.filter((row) => row.section === "running").length,
+		idle: agents.filter((row) => row.section === "idle").length,
+		inactive: agents.filter((row) => row.section === "inactive").length,
 	};
 }
 
@@ -2393,35 +2577,6 @@ function isRunningSessionSummary(summary: SessionSummary): boolean {
 	return summary.activity === "working";
 }
 
-export function resolveAgentsViewAutocompleteCwd(initialCwd: string, replyTarget?: SessionSummary): string {
-	const replyCwd = replyTarget?.cwd;
-	return replyCwd && existsSync(replyCwd) ? replyCwd : initialCwd;
-}
-
-export function createAgentsViewAutocompleteProvider(
-	cwd: string,
-	fdPath: string | undefined,
-	getModelArgumentCompletions: NonNullable<SlashCommand["getArgumentCompletions"]>,
-): CombinedAutocompleteProvider {
-	const commands: SlashCommand[] = AGENTS_VIEW_SLASH_COMMANDS.map((command) => ({
-		name: command.name,
-		description: command.description,
-		...(command.argumentHint ? { argumentHint: command.argumentHint } : {}),
-	}));
-	const modelCommand = commands.find((command) => command.name === "model");
-	if (modelCommand) {
-		modelCommand.getArgumentCompletions = getModelArgumentCompletions;
-	}
-	return new CombinedAutocompleteProvider(commands, cwd, fdPath ?? null);
-}
-
-export function createAgentsViewSessionName(text: string): string {
-	const normalized = text.replace(/\s+/g, " ").trim();
-	return normalized.length > SESSION_NAME_MAX_LENGTH
-		? `${normalized.slice(0, SESSION_NAME_MAX_LENGTH - 3)}...`
-		: normalized;
-}
-
 function formatTableCell(value: string, width: number): string {
 	const truncated = truncateToWidth(value, width, "");
 	return truncated + " ".repeat(Math.max(0, width - visibleWidth(truncated)));
@@ -2433,7 +2588,9 @@ function formatRightTableCell(value: string, width: number): string {
 }
 
 function formatSessionDuration(summary: SessionSummary): string {
-	return formatAgentsViewRelativeTime(summary.created ?? summary.modified);
+	return formatAgentsViewRelativeTime(
+		summary.activeSessionId ? (summary.created ?? summary.modified) : (summary.modified ?? summary.created),
+	);
 }
 
 export function formatAgentsViewRelativeTime(value: string | undefined, now: number = Date.now()): string {

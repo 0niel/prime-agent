@@ -106,6 +106,8 @@ import {
 	isCompactionOutcomeMessage,
 	isSessionSlashCommandMessage,
 	isSessionSlashCommandResultMessage,
+	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
+	SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
 } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
 import { parseNewSessionCommand } from "../../core/new-session-command.js";
@@ -203,12 +205,14 @@ import { formatKeyText, keyHint, keyText, rawKeyHint } from "./components/keybin
 import type { AuthSelectorProvider } from "./components/oauth-selector.js";
 import { PrimeOnboardingSplashComponent } from "./components/prime-onboarding-splash.js";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.js";
-import { SessionPickerScreen } from "./components/session-picker-screen.js";
-import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SideQuestionComponent } from "./components/side-question.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
-import { SlashCommandMessageComponent } from "./components/slash-command-message.js";
+import {
+	isLeadingSlashCommand,
+	SlashCommandMessageComponent,
+	styleSlashCommandText,
+} from "./components/slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
 import {
@@ -292,6 +296,17 @@ function isLabeledQueuedPreview(message: string): boolean {
 
 export function formatQueuedMessagePreview(message: string, label: "Steering" | "Follow-up"): string {
 	return isLabeledQueuedPreview(message) ? message : `${label}: ${message}`;
+}
+
+export function styleQueuedMessagePreview(
+	message: string,
+	label: "Steering" | "Follow-up",
+	isRecognizedSlashCommand: (name: string) => boolean,
+): string {
+	const preview = formatQueuedMessagePreview(message, label);
+	if (!isLeadingSlashCommand(message, isRecognizedSlashCommand)) return theme.fg("dim", preview);
+	const prefix = preview.slice(0, preview.length - message.length);
+	return `${theme.fg("dim", prefix)}${styleSlashCommandText(message, (rest) => theme.fg("dim", rest))}`;
 }
 
 function isExpandable(obj: unknown): obj is Expandable {
@@ -808,7 +823,10 @@ export interface InteractiveModeOptions {
 	promptStashSessionId?: string;
 }
 
-export type InteractiveModeRunResult = "agents_view";
+export interface InteractiveModeRunResult {
+	type: "agents_view";
+	source: Pick<AgentConnectionState, "activeSessionId" | "sessionFile" | "sessionId" | "sessionName" | "cwd">;
+}
 
 export class InteractiveMode {
 	private static readonly EXIT_HINT_DURATION_MS = 2000;
@@ -925,6 +943,7 @@ export class InteractiveMode {
 
 	// Serializes session event handling; see subscribeToAgent
 	private sessionEventQueue: Promise<void> = Promise.resolve();
+	private sessionEventGeneration = 0;
 	private fastModeToggleQueue: Promise<void> = Promise.resolve();
 
 	// Tool execution tracking: toolCallId -> component
@@ -948,8 +967,8 @@ export class InteractiveMode {
 	private childAgentWatcher: AgentConnectionSessionWatcher | undefined;
 	private childAgentWatcherToken = 0;
 	private childAgentWatcherMessages: AgentMessage[] = [];
-	// Monotonic per-watch counter so a late-resolving getMessages can't clobber a newer one.
 	private childAgentRefreshSeq = 0;
+	private childAgentBodyBuildSeq = 0;
 	// The session key the current watcher attached with, so a later snapshot that
 	// gains the real activeSessionId can retry the attach.
 	private childAgentWatchedKey: string | undefined;
@@ -1259,6 +1278,10 @@ export class InteractiveMode {
 						: `Extension command '/${command.registeredName}' conflicts with built-in interactive command. Available as '/${command.name}'.`,
 				path: command.sourceInfo.path,
 			}));
+	}
+
+	private isRecognizedSlashCommand(name: string): boolean {
+		return isBuiltinSlashCommandName(name) || this.connectionCommands.some((command) => command.name === name);
 	}
 
 	private createBaseAutocompleteProvider(): AutocompleteProvider {
@@ -1686,8 +1709,9 @@ export class InteractiveMode {
 			() => settleStartupPrompts("admitted"),
 		);
 
-		// Enter/Alt+Enter submit directly through AgentConnection. Keep run alive
-		// until shutdown or a return to the agents view resolves the lifecycle wait.
+		// Enter/Alt+Enter submit directly through AgentConnection. Wait for the
+		// lifecycle signal exactly once; a returned editor value has already been
+		// admitted and must never be submitted again here.
 		try {
 			await this.getUserInput();
 		} finally {
@@ -1695,7 +1719,18 @@ export class InteractiveMode {
 			settleStartupPrompts("lifecycle-cancelled");
 			this.admitPendingStartupPrompts = undefined;
 		}
-		return "agents_view";
+
+		const state = this.connectionState;
+		return {
+			type: "agents_view",
+			source: {
+				activeSessionId: state?.activeSessionId,
+				sessionFile: state?.sessionFile,
+				sessionId: state?.sessionId ?? this.promptStashSessionId ?? "",
+				sessionName: state?.sessionName,
+				cwd: state?.cwd ?? this.getCurrentCwd(),
+			},
+		};
 	}
 
 	private getModelFallbackWarningAction(modelFallbackMessage: string | undefined): ModelFallbackWarningAction {
@@ -2519,7 +2554,7 @@ export class InteractiveMode {
 		this.invalidateConnectionModelRefresh();
 		const [state, commands, modelCatalog, resources] = await Promise.all([
 			this.agentConnection.getState(),
-			this.agentConnection.getCommands(),
+			this.agentConnection.getCommands().catch(() => []),
 			this.agentConnection.getModelCatalog(),
 			this.agentConnection.getResourceSnapshot(),
 		]);
@@ -2860,9 +2895,25 @@ export class InteractiveMode {
 	}
 
 	private async renderCurrentSessionState(): Promise<void> {
+		// Replacement events own the session-scoped command catalog. The daemon
+		// sends that event before its command response, but its handler may still
+		// be refreshing commands when the response resolves.
+		await this.sessionEventQueue;
 		this.resetCurrentSessionRenderState();
 		await this.renderInitialMessages();
+		// The session transition and transcript are already authoritative here;
+		// a transient queue read must not turn a successful switch into a fatal error.
+		await this.refreshConnectionQueue().catch(() => undefined);
 		this.syncWorkingLoader();
+	}
+
+	private async refreshCommandCatalogForCurrentSession(): Promise<void> {
+		try {
+			this.connectionCommands = await this.agentConnection.getCommands();
+		} catch {
+			this.connectionCommands = [];
+		}
+		this.setupAutocompleteProvider();
 	}
 
 	private async renderResyncedSession(snapshot: AgentConnectionSnapshot): Promise<void> {
@@ -4151,15 +4202,9 @@ export class InteractiveMode {
 			void this.showUserMessageSelector();
 		});
 		this.defaultEditor.onAction("app.session.resume", () => {
-			void this.showSessionSelector();
+			void this.requestAgentsView();
 		});
-		this.defaultEditor.onAgentsBack = () => {
-			if (!this.options.returnToAgentsView || this.editor.getText().trim()) {
-				return false;
-			}
-			void this.returnToAgentsView();
-			return true;
-		};
+		this.defaultEditor.onAgentsBack = () => this.handleAgentsBack();
 		this.defaultEditor.onMoveBelowPrompt = () => this.focusChildAgentSummary();
 
 		this.defaultEditor.onChange = (text: string) => {
@@ -4830,11 +4875,6 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
-				if (text === "/resume") {
-					this.editor.setText("");
-					await this.showSessionSelector();
-					return;
-				}
 				if (text === "/quit") {
 					this.editor.setText("");
 					await this.shutdown();
@@ -5029,25 +5069,40 @@ export class InteractiveMode {
 		this.unsubscribe = this.agentConnection.subscribe(async (event) => {
 			try {
 				if (event.type === "session_event") {
-					// Connection adapters dispatch without awaiting, so a handler that
-					// suspends would let later events overtake it; queue session events
-					// to keep paired events like bash_start/bash_end in emission order.
-					const run = this.sessionEventQueue.then(() => this.handleEvent(event.event));
+					// Connection adapters dispatch without awaiting, so serialize events.
+					// Replacement advances the generation before entering this queue, which
+					// prevents already-queued source events from mutating the target UI.
+					const generation = this.sessionEventGeneration;
+					const run = this.sessionEventQueue.then(() =>
+						generation === this.sessionEventGeneration ? this.handleEvent(event.event) : undefined,
+					);
 					this.sessionEventQueue = run.catch(() => {});
 					await run;
 				} else if (event.type === "session_replaced") {
-					this.resetSideQuestion();
-					this.resetExtensionUI();
-					this.applyConnectionStateSnapshot(event.state);
-					this.resetCurrentSessionRenderState();
-					await this.rebindCurrentSession();
-					await this.renderInitialMessages();
-					this.ui.requestRender();
-				} else if (event.type === "session_resynced") {
-					const run = this.sessionEventQueue.then(() => this.renderResyncedSession(event.snapshot));
+					const generation = ++this.sessionEventGeneration;
+					const run = this.sessionEventQueue.then(async () => {
+						if (generation !== this.sessionEventGeneration) return;
+						this.resetSideQuestion();
+						this.resetExtensionUI();
+						this.applyConnectionStateSnapshot(event.state);
+						this.resetCurrentSessionRenderState();
+						await this.rebindCurrentSession();
+						await this.renderInitialMessages();
+						this.ui.requestRender();
+					});
 					this.sessionEventQueue = run.catch(() => {});
 					await run;
-					this.ui.requestRender();
+				} else if (event.type === "session_resynced") {
+					const generation = this.sessionEventGeneration;
+					const run = this.sessionEventQueue.then(async () => {
+						if (generation !== this.sessionEventGeneration) return false;
+						await this.refreshCommandCatalogForCurrentSession?.();
+						if (generation !== this.sessionEventGeneration) return false;
+						await this.renderResyncedSession(event.snapshot);
+						return true;
+					});
+					this.sessionEventQueue = run.then(() => undefined).catch(() => {});
+					if (await run) this.ui.requestRender();
 				} else if (event.type === "session_status") {
 					this.sessionRecap = event.recap;
 					this.patchConnectionState({ recap: event.recap });
@@ -6019,7 +6074,7 @@ export class InteractiveMode {
 		if (!this.options.returnToAgentsView) {
 			return undefined;
 		}
-		return keyHint("app.agents.back", "agents");
+		return keyHint("app.agents.back", "agents/resume");
 	}
 
 	private getTrayContextLabel(): string | undefined {
@@ -6184,6 +6239,7 @@ export class InteractiveMode {
 		if (!watcher || token !== this.childAgentWatcherToken) {
 			return;
 		}
+		const buildSeq = ++this.childAgentBodyBuildSeq;
 		const messages = this.childAgentWatcherMessages;
 		const toolNames = new Set<string>();
 		for (const message of messages) {
@@ -6196,13 +6252,15 @@ export class InteractiveMode {
 			}
 		}
 		const definitions = new Map<string, ToolExecutionDefinition | undefined>();
+		const childCommandsPromise = watcher.getCommands().catch(() => []);
 		await Promise.all(
 			[...toolNames].map(async (name) => {
 				definitions.set(name, (await watcher.getToolDefinition(name).catch(() => undefined)) ?? undefined);
 			}),
 		);
-		// A newer refresh (or a close) may have superseded this build while awaiting defs.
-		if (token !== this.childAgentWatcherToken) {
+		const childCommands = await childCommandsPromise;
+		const childCommandNames = new Set(childCommands.map((command) => command.name));
+		if (token !== this.childAgentWatcherToken || buildSeq !== this.childAgentBodyBuildSeq) {
 			return;
 		}
 		this.childAgentDetail.setBodyComponents(
@@ -6217,6 +6275,7 @@ export class InteractiveMode {
 				hideThinkingBlock: this.hideThinkingBlock,
 				hiddenThinkingLabel: this.hiddenThinkingLabel,
 				toolsExpanded: this.toolOutputExpanded,
+				isRecognizedSlashCommand: (name) => isBuiltinSlashCommandName(name) || childCommandNames.has(name),
 			}),
 		);
 	}
@@ -6413,7 +6472,11 @@ export class InteractiveMode {
 		if (this.chatContainer.children.length > 0) {
 			this.chatContainer.addChild(new Spacer(1));
 		}
-		this.chatContainer.addChild(new UserMessageComponent(text, this.getMarkdownThemeWithSettings()));
+		this.chatContainer.addChild(
+			new UserMessageComponent(text, this.getMarkdownThemeWithSettings(), (name) =>
+				this.isRecognizedSlashCommand(name),
+			),
+		);
 	}
 
 	private addMessageToEditorHistory(message: AgentMessage): void {
@@ -6444,28 +6507,38 @@ export class InteractiveMode {
 			}
 			case "custom": {
 				if (message.display) {
+					const reservedSessionCommand =
+						message.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE ||
+						message.customType === SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE;
 					const component = isSessionSlashCommandMessage(message)
 						? new SlashCommandMessageComponent(message.content)
 						: isSessionSlashCommandResultMessage(message)
 							? new SlashCommandResultMessageComponent(message)
-							: isCompactionOutcomeMessage(message)
-								? new CompactionOutcomeMessageComponent(message)
-								: message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE
-									? new MalformedCompactionOutcomeMessageComponent()
-									: isAgentSessionMessage(message)
-										? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
-										: isInjectedPromptMessage(message)
-											? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
-											: new CustomMessageComponent(
-													message,
-													this.bindLocalSessionExtensions
-														? this.getLocalSessionHost()
-																.getExtensionRunner()
-																.getMessageRenderer(message.customType)
-														: undefined,
-													this.getMarkdownThemeWithSettings(),
-												);
-					component.setExpanded(this.toolOutputExpanded);
+							: reservedSessionCommand
+								? new UserMessageComponent(
+										"[Malformed session command message]",
+										this.getMarkdownThemeWithSettings(),
+									)
+								: isCompactionOutcomeMessage(message)
+									? new CompactionOutcomeMessageComponent(message)
+									: message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE
+										? new MalformedCompactionOutcomeMessageComponent()
+										: isAgentSessionMessage(message)
+											? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
+											: isInjectedPromptMessage(message)
+												? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
+												: new CustomMessageComponent(
+														message,
+														this.bindLocalSessionExtensions
+															? this.getLocalSessionHost()
+																	.getExtensionRunner()
+																	.getMessageRenderer(message.customType)
+															: undefined,
+														this.getMarkdownThemeWithSettings(),
+													);
+					if (!(component instanceof UserMessageComponent)) {
+						component.setExpanded(this.toolOutputExpanded);
+					}
 					if (isSessionSlashCommandMessage(message) && this.chatContainer.children.length > 0) {
 						this.chatContainer.addChild(new Spacer(1));
 					}
@@ -6521,11 +6594,16 @@ export class InteractiveMode {
 							const userComponent = new UserMessageComponent(
 								skillBlock.userMessage,
 								this.getMarkdownThemeWithSettings(),
+								(name) => this.isRecognizedSlashCommand(name),
 							);
 							this.chatContainer.addChild(userComponent);
 						}
 					} else {
-						const userComponent = new UserMessageComponent(textContent, this.getMarkdownThemeWithSettings());
+						const userComponent = new UserMessageComponent(
+							textContent,
+							this.getMarkdownThemeWithSettings(),
+							(name) => this.isRecognizedSlashCommand(name),
+						);
 						this.chatContainer.addChild(userComponent);
 					}
 					if (options?.populateHistory) {
@@ -6953,6 +7031,30 @@ export class InteractiveMode {
 		stopThemeWatcher();
 	}
 
+	private handleAgentsBack(): boolean {
+		if (this.editor.getText().trim()) {
+			return false;
+		}
+		if (!this.options.returnToAgentsView) {
+			void this.requestAgentsView();
+			return true;
+		}
+		void this.returnToAgentsView();
+		return true;
+	}
+
+	private async requestAgentsView(): Promise<void> {
+		if (this.editor.getText().length > 0) {
+			this.showStatus("Send, stash, or clear your draft before opening agents");
+			return;
+		}
+		if (!this.options.returnToAgentsView) {
+			this.showStatus("The agents view needs the daemon; start without --no-daemon to browse sessions");
+			return;
+		}
+		await this.returnToAgentsView();
+	}
+
 	private async returnToAgentsView(): Promise<void> {
 		if (this.isShuttingDown || this.returnToAgentsViewRequested) return;
 		this.returnToAgentsViewRequested = true;
@@ -7338,11 +7440,11 @@ export class InteractiveMode {
 		if (hasQueuedMessages) {
 			this.queuedMessagesContainer.addChild(new Spacer(1));
 			for (const message of steeringMessages) {
-				const text = theme.fg("dim", formatQueuedMessagePreview(message, "Steering"));
+				const text = styleQueuedMessagePreview(message, "Steering", (name) => this.isRecognizedSlashCommand(name));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			for (const message of followUpMessages) {
-				const text = theme.fg("dim", formatQueuedMessagePreview(message, "Follow-up"));
+				const text = styleQueuedMessagePreview(message, "Follow-up", (name) => this.isRecognizedSlashCommand(name));
 				this.queuedMessagesContainer.addChild(new TruncatedText(text, 1, 0));
 			}
 			const dequeueHint = this.getAppKeyDisplay("app.message.dequeue");
@@ -8370,65 +8472,6 @@ export class InteractiveMode {
 				initialFilterMode,
 			);
 			return { component: selector, focus: selector };
-		});
-	}
-
-	private async showSessionSelector(): Promise<void> {
-		let state: AgentConnectionState;
-		try {
-			state = await this.agentConnection.getState();
-			this.applyConnectionStateSnapshot(state);
-		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
-			return;
-		}
-		await new Promise<void>((done) => {
-			let handle: OverlayHandle | undefined;
-			let settled = false;
-			const close = () => {
-				if (settled) {
-					return;
-				}
-				settled = true;
-				handle?.hide();
-				this.ui.requestRender();
-				done();
-			};
-			const selector = new SessionSelectorComponent(
-				(callbacks) => this.agentConnection.listSavedSessions("current", callbacks),
-				(callbacks) => this.agentConnection.listSavedSessions("all", callbacks),
-				async (sessionPath) => {
-					close();
-					await this.handleResumeSession(sessionPath);
-				},
-				() => {
-					close();
-				},
-				() => {
-					close();
-					void this.shutdown();
-				},
-				() => this.ui.requestRender(),
-				{
-					renameSession: async (sessionFilePath: string, nextName: string | undefined) => {
-						const next = (nextName ?? "").trim();
-						if (!next) return;
-						await this.agentConnection.renameSavedSession(sessionFilePath, next);
-					},
-					deleteSession: (sessionFilePath: string) => this.agentConnection.deleteSavedSession(sessionFilePath),
-					showRenameHint: true,
-					keybindings: this.keybindings,
-					frameless: true,
-				},
-
-				state.sessionFile,
-			);
-			const splash = new BrandSplashHeader(
-				this.version,
-				() => this.getCurrentModelId(),
-				() => this.getCurrentCwd(),
-			);
-			handle = this.showFullPaneOverlay(new SessionPickerScreen(this.ui, splash, selector), { fullWidth: true });
 		});
 	}
 

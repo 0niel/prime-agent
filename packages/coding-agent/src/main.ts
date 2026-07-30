@@ -27,7 +27,6 @@ import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
 import { installOwnedSessionRecoveryTracking, isOwnedSessionWorkerProcess } from "./cli/owned-session-worker.js";
 import { handlePublicCommand } from "./cli/public-command.js";
-import { selectSession } from "./cli/session-picker.js";
 import {
 	looksLikeSessionPath,
 	resolveSessionPath,
@@ -162,6 +161,10 @@ export function shouldRejectNonInteractiveAttach(attachAgent: string | undefined
 	return attachAgent !== undefined && appMode !== "interactive";
 }
 
+export function shouldRejectBareResume(resume: true | string | undefined): boolean {
+	return resume === true;
+}
+
 function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
 	if (parsed.mode === "daemon") {
 		return "daemon";
@@ -244,14 +247,12 @@ export interface AgentsViewStartupDecision {
 export function shouldOpenAgentsViewForDaemonInteractive(options: AgentsViewStartupDecision): boolean {
 	return (
 		options.useDaemonInteractive &&
-		// `prime-agent` opens a new chat by default; the agents view is reached via
+		// `prime-agent` opens a new chat by default; the unified agents view is reached via
 		// left-arrow from a session or requested explicitly (`agents`).
 		!!options.explicitAgentsView &&
-		// Onboarding lives in InteractiveMode, so a first run must take the
-		// direct session path; the agents view would otherwise require creating
-		// an agent before the onboarding splash ever renders.
 		!options.needsOnboarding &&
-		!options.resume &&
+		// A resume selector resolves and opens its target directly.
+		typeof options.resume !== "string" &&
 		!options.continue &&
 		!options.fork
 	);
@@ -267,7 +268,7 @@ export interface DaemonInteractiveSessionManagerDecision {
 export function shouldUseEphemeralSessionManagerForDaemonInteractive(
 	options: DaemonInteractiveSessionManagerDecision,
 ): boolean {
-	return !options.hasActiveDaemonSession && !options.resume && !options.continue && !options.fork;
+	return !options.hasActiveDaemonSession && options.resume === undefined && !options.continue && !options.fork;
 }
 
 export interface DaemonActiveSessionLookupDecision {
@@ -439,7 +440,6 @@ export async function createSessionManager(
 	parsed: Args,
 	cwd: string,
 	sessionDir: string | undefined,
-	settingsManager: SettingsManager,
 ): Promise<SessionManager> {
 	const explicitCwdOverride = parsed.cwd ? cwd : undefined;
 
@@ -476,24 +476,6 @@ export async function createSessionManager(
 				}
 				return forkSessionOrExit(resolved.path, cwd, sessionDir);
 			}
-		}
-	}
-
-	if (parsed.resume) {
-		initTheme(settingsManager.getTheme(), true);
-		try {
-			const selectedPath = await selectSession(
-				(callbacks) => SessionManager.list(cwd, sessionDir, callbacks),
-				SessionManager.listAll,
-				{ cwd, sessionDir },
-			);
-			if (!selectedPath) {
-				console.log(chalk.dim("No session selected"));
-				process.exit(0);
-			}
-			return SessionManager.open(selectedPath, sessionDir, explicitCwdOverride);
-		} finally {
-			stopThemeWatcher();
 		}
 	}
 
@@ -1081,6 +1063,12 @@ export async function main(args: string[], options?: MainOptions) {
 		console.error(chalk.red("Error: attach requires an interactive terminal"));
 		process.exit(1);
 	}
+	if (shouldRejectBareResume(parsed.resume)) {
+		console.error(
+			chalk.red("Error: --resume requires a session id or path; browse sessions with left-arrow from a chat"),
+		);
+		process.exit(1);
+	}
 	setLogContext({ mode: appMode });
 	const shouldTakeOverStdout = appMode !== "interactive";
 	if (shouldTakeOverStdout) {
@@ -1211,7 +1199,7 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionManager = SessionManager.inMemory(cwd);
 	} else {
 		try {
-			sessionManager = await createSessionManager(parsed, cwd, sessionDir, startupSettingsManager);
+			sessionManager = await createSessionManager(parsed, cwd, sessionDir);
 		} catch (error) {
 			if (!(error instanceof SessionSelectorError)) {
 				throw error;
@@ -1221,7 +1209,7 @@ export async function main(args: string[], options?: MainOptions) {
 					? ` Did you mean '${error.suggestion}'?`
 					: "";
 			console.error(chalk.red(`Error: ${error.message}.${suggestion}`));
-			console.error(chalk.dim(`Run "${APP_NAME} --resume" to browse sessions.`));
+			console.error(chalk.dim(`Open ${APP_NAME} and press left-arrow to browse sessions.`));
 			process.exit(1);
 		}
 	}
@@ -1367,7 +1355,7 @@ export async function main(args: string[], options?: MainOptions) {
 			services,
 			sessionManager,
 		});
-		const launchAgentsView = async (includeInitialPrompts: boolean) => {
+		const launchAgentsView = async (initialSession?: SessionSummary) => {
 			await runAgentsViewMode({
 				socketPath: daemonSocketPath,
 				config: defaultSessionConfig,
@@ -1396,7 +1384,7 @@ export async function main(args: string[], options?: MainOptions) {
 				modelFallbackMessage: startupModel.modelFallbackMessage,
 				promptStashStore,
 				startupModelId: startupModel.model?.id,
-				...(includeInitialPrompts ? { initialMessage, initialImages, initialMessages: parsed.messages } : {}),
+				initialSession,
 				verbose: parsed.verbose,
 			});
 		};
@@ -1417,7 +1405,7 @@ export async function main(args: string[], options?: MainOptions) {
 			daemonReady = (await awaitDaemonReady(daemonReady)).ready;
 			await preloadCodeHighlighter();
 			printTimings();
-			await launchAgentsView(true);
+			await launchAgentsView();
 			return;
 		}
 
@@ -1465,11 +1453,15 @@ export async function main(args: string[], options?: MainOptions) {
 
 		await preloadCodeHighlighter();
 		printTimings();
-		await interactiveMode.run();
+		const interactiveResult = await interactiveMode.run();
 		if (parsed.noSession) {
 			return;
 		}
-		await launchAgentsView(false);
+		await launchAgentsView({
+			...summary,
+			...interactiveResult.source,
+			id: interactiveResult.source.activeSessionId ?? summary.id,
+		});
 		return;
 	}
 	if (useDaemonClient) {
@@ -1604,6 +1596,9 @@ export async function main(args: string[], options?: MainOptions) {
 		printTimings();
 		await runRpcMode(runtime);
 	} else if (appMode === "interactive") {
+		if (explicitAgentsView) {
+			console.error(chalk.yellow("Warning: the agents view needs the daemon; opening a normal chat instead"));
+		}
 		if (scopedModels.length > 0 && (parsed.verbose || !settingsManager.getQuietStartup())) {
 			const modelList = scopedModels
 				.map((sm) => {

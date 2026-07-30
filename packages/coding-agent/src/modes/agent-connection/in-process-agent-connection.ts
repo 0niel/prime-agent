@@ -176,14 +176,13 @@ export class InProcessAgentConnection implements AgentConnection {
 		scope: AgentConnectionSavedSessionScope,
 		callbacks?: AgentConnectionSessionListCallbacks,
 	): Promise<AgentConnectionSavedSessionInfo[]> {
+		// In-memory managers hold "" for "no explicit session dir"; pass undefined so
+		// list()/listAll() fall back to the default directories instead of scanning "".
+		const sessionDir = this.session.sessionManager.getSessionDir() || undefined;
 		if (scope === "current") {
-			return SessionManager.list(
-				this.session.sessionManager.getCwd(),
-				this.session.sessionManager.getSessionDir(),
-				callbacks,
-			);
+			return SessionManager.list(this.session.sessionManager.getCwd(), sessionDir, callbacks);
 		}
-		return SessionManager.listAll(callbacks, this.session.sessionManager.getSessionDir());
+		return SessionManager.listAll(callbacks, sessionDir);
 	}
 
 	async getQueue(): Promise<AgentConnectionQueueState> {
@@ -555,6 +554,7 @@ export class InProcessAgentConnection implements AgentConnection {
 		const unsubscribes = new Set<() => void>();
 		return {
 			getMessages: async () => child.messages,
+			getCommands: async () => createAgentConnectionCommands(child),
 			subscribe: (listener) => {
 				const unsubscribe = child.subscribe((event) => void listener({ type: "session_event", event }));
 				unsubscribes.add(unsubscribe);

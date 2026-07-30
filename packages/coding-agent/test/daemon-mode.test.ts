@@ -7,9 +7,16 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionMessageController } from "../src/core/agent-messages.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
+import { installAgentTraceUpload } from "../src/core/agent-traces.js";
+import { AuthStorage } from "../src/core/auth-storage.js";
 import type { AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
-import { type CreateRlmSubagentRuntimeOptions, createDefaultRlmSubagentSessionName } from "../src/core/rlm-runtime.js";
+import {
+	type CreateRlmSubagentRuntimeOptions,
+	createDefaultRlmSubagentSessionName,
+	type SubagentRuntimeHost,
+} from "../src/core/rlm-runtime.js";
 import { SessionManager } from "../src/core/session-manager.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import {
 	AgentDaemon,
@@ -20,7 +27,6 @@ import {
 	markClientSnapshotStreaming,
 	setDaemonClientSessionCapabilities,
 	shouldSendDaemonOutboundToClient,
-	waitForDaemonPromptAdmission,
 } from "../src/modes/daemon/daemon-mode.js";
 import {
 	createDaemonCommandEnvelope,
@@ -39,18 +45,6 @@ describe("daemon mode helpers", () => {
 
 		parse(client, JSON.stringify(createDaemonCommandEnvelope({ type: "list" }, "request-1", "public-client")));
 		expect(client.id).toBe("public-client");
-	});
-
-	it("observes supplied work when prompt admission is already aborted", async () => {
-		const controller = new AbortController();
-		controller.abort();
-		const work = Promise.reject(new Error("late claim failure"));
-
-		await expect(waitForDaemonPromptAdmission(work, controller.signal)).rejects.toThrow(
-			"Prompt admission was cancelled.",
-		);
-		// Let the observed work settle; an unhandled rejection would fail Vitest.
-		await Promise.resolve();
 	});
 
 	it("finds only direct child active sessions", () => {
@@ -272,6 +266,66 @@ describe("daemon mode helpers", () => {
 		expect(acceptAgentMessagePrompt.mock.calls[0]?.[0]).toContain("report current progress");
 	});
 
+	it("starts trace flush and skips the registry when teardown wins the retention race", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-trace-race-"));
+		try {
+			const manager = SessionManager.create(tempDir, tempDir);
+			manager.newSession();
+			let markTraceStarted: () => void = () => {};
+			const traceStarted = new Promise<void>((resolve) => {
+				markTraceStarted = resolve;
+			});
+			const fetchFn = vi.fn(async () => {
+				markTraceStarted();
+				return await new Promise<Response>(() => {});
+			});
+			installAgentTraceUpload(manager, {
+				authStorage: AuthStorage.inMemory({
+					"prime-agent-traces": { type: "api_key", key: "trace-key" },
+				}),
+				settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+				fetchFn,
+			});
+			manager.appendSessionInfo("trace-race");
+
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const parentState = makeState("parent");
+			const parentSession = makeRuntimeSession(manager);
+			parentSession.retainFinishedRlmChildSession = vi.fn(() => false);
+			const childState = makeState("child", parentState.activeSessionId);
+			const childSession = makeRuntimeSession(manager);
+			childState.runtime = { ...childState.runtime, session: childSession } as ActiveSessionState["runtime"];
+			// Competing teardown already closed the state, so this release-time close is a no-op.
+			const closeSession = vi.fn(async () => {});
+			const recordRlmSubagentRegistryEntry = vi.fn();
+			Object.assign(daemon, {
+				findRuntimeState: vi.fn(() => childState),
+				closeSession,
+				recordRlmSubagentRegistryEntry,
+			});
+			const host = Reflect.get(daemon, "createSubagentRuntimeHost").call(daemon, parentState) as SubagentRuntimeHost;
+
+			await host.releaseRlmSubagentRuntime?.(
+				childState.runtime,
+				{ parentSession, id: "child-1" } as CreateRlmSubagentRuntimeOptions,
+				"done",
+			);
+			await traceStarted;
+
+			expect(fetchFn).toHaveBeenCalledOnce();
+			expect(parentSession.retainFinishedRlmChildSession).toHaveBeenCalledWith("child-1", childSession);
+			expect(closeSession).toHaveBeenCalledWith(childState, "completed");
+			expect(recordRlmSubagentRegistryEntry).not.toHaveBeenCalled();
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("keeps RLM heartbeats active when a successful subagent is retained", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-retained-heartbeat-"));
 		try {
@@ -290,6 +344,20 @@ describe("daemon mode helpers", () => {
 			if (!childSessionFile) {
 				throw new Error("Missing child session file");
 			}
+			let traceUploadStarted: () => void = () => {};
+			const traceStarted = new Promise<void>((resolve) => {
+				traceUploadStarted = resolve;
+			});
+			installAgentTraceUpload(childManager, {
+				authStorage: AuthStorage.inMemory({
+					"prime-agent-traces": { type: "api_key", key: "trace-key" },
+				}),
+				settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+				fetchFn: vi.fn(async () => {
+					traceUploadStarted();
+					return await new Promise<Response>(() => {});
+				}),
+			});
 
 			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
 				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir },
@@ -376,9 +444,12 @@ describe("daemon mode helpers", () => {
 			} as unknown as CreateRlmSubagentRuntimeOptions;
 
 			internals.sessions.set(childState.activeSessionId, childState);
-			await internals
+			const release = internals
 				.createSubagentRuntimeHost(parentState)
 				.releaseRlmSubagentRuntime(childState.runtime, releaseOptions, "done");
+			await expect(Promise.race([release.then(() => "released"), traceStarted.then(() => "trace")])).resolves.toBe(
+				"released",
+			);
 
 			expect(internals.cronStore.list().find((job) => job.id === heartbeat.id)).toMatchObject({
 				status: "active",
@@ -3117,10 +3188,15 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("deduplicates concurrent creates for the same session file", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-race-"));
+	it.each([
+		["explicit session file", (sessionPath: string) => ({ type: "create" as const, sessionPath })],
+		["continue recent", (_sessionPath: string) => ({ type: "create" as const, continueRecent: true })],
+	])("deduplicates concurrent creates after resolving the %s", async (_label, commandFor) => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-open-race-"));
 		try {
-			const sessionPath = join(tempDir, "session.jsonl");
+			const recent = SessionManager.create(tempDir, tempDir);
+			const sessionPath = recent.materializeSessionFile();
+			recent.appendSessionInfo("Recent");
 			let releaseCreate: () => void = () => {};
 			const createBarrier = new Promise<void>((resolve) => {
 				releaseCreate = resolve;
@@ -3139,11 +3215,7 @@ describe("daemon mode helpers", () => {
 				};
 			});
 			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
-				defaultSessionConfig: {
-					agentDir: tempDir,
-					cwd: tempDir,
-					sessionDir: tempDir,
-				},
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: tempDir },
 				createRuntime,
 			});
 			const create = (
@@ -3152,17 +3224,17 @@ describe("daemon mode helpers", () => {
 				}
 			).createRuntime.bind(daemon);
 
-			const first = create({ type: "create", sessionPath });
-			const second = create({ type: "create", sessionPath });
-			for (let attempt = 0; attempt < 20 && createRuntime.mock.calls.length === 0; attempt++) {
-				await Promise.resolve();
-			}
-
-			expect(createRuntime).toHaveBeenCalledTimes(1);
+			const first = create(commandFor(sessionPath));
+			const second = create(commandFor(sessionPath));
+			// The pre-create session resolution is async (continueRecent scans the
+			// session dir); wait on a deadline, not a fixed number of ticks.
+			await vi.waitFor(() => {
+				expect(createRuntime).toHaveBeenCalledTimes(1);
+			});
 			releaseCreate();
 			const [firstState, secondState] = await Promise.all([first, second]);
-
 			expect(secondState).toBe(firstState);
+			expect(firstState.runtime.session.sessionFile).toBe(sessionPath);
 			expect(createRuntime).toHaveBeenCalledTimes(1);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });

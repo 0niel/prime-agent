@@ -5,7 +5,6 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { waitForPromptAdmission } from "../../src/core/agent-session.js";
 import type { BashResult } from "../../src/core/bash-executor.js";
 import type { PromptTemplate } from "../../src/core/prompt-templates.js";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.js";
@@ -13,8 +12,6 @@ import { createTestResourceLoader } from "../utilities.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
 import { createDeferred, createWaitingHarness, gatedHook } from "./scheduling.js";
 
-// acceptAgentMessagePrompt admission is asynchronous. Pause after agent.prompt has
-// synchronously claimed the run, but before its prompt messages become delivered.
 function gateNextAgentStart(harness: Harness): { reached: Promise<void>; release(): void } {
 	let markReached = () => {};
 	const reached = new Promise<void>((resolve) => {
@@ -35,15 +32,6 @@ function gateNextAgentStart(harness: Harness): { reached: Promise<void>; release
 }
 
 describe("AgentSession prompt characterization", () => {
-	it("observes already-running work when prompt admission is pre-aborted", async () => {
-		const abort = new AbortController();
-		abort.abort();
-		const work = Promise.reject(new Error("late idle failure"));
-
-		expect(() => waitForPromptAdmission(work, abort.signal)).toThrow("Prompt admission was cancelled");
-		await Promise.resolve();
-	});
-
 	const harnesses: Harness[] = [];
 	const tempDirs: string[] = [];
 
@@ -1083,93 +1071,94 @@ stale post-hook extension instructions`,
 		expect(harness.session.hasPendingBashMessages).toBe(false);
 	});
 
-	it("cleared accepted agent message cleanup does not remove messages from a newer prompt", async () => {
-		let gateAgentStart = false;
-		let releaseGate = () => {};
-		const gate = new Promise<void>((resolve) => {
-			releaseGate = resolve;
+	it("clears an accepted agent message before delivery without disturbing later work", async () => {
+		let holdAgentStart = true;
+		let releaseEventQueue = () => {};
+		const eventQueueGate = new Promise<void>((resolve) => {
+			releaseEventQueue = resolve;
 		});
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
 					pi.on("agent_start", async () => {
-						if (gateAgentStart) {
-							await gate;
-						}
+						if (holdAgentStart) await eventQueueGate;
 					});
 				},
 			],
 		});
 		harnesses.push(harness);
-		const agentPrompt =
-			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_stale_cleanup\n\nagent text";
-		harness.setResponses([fauxAssistantMessage("seed response")]);
-		await harness.session.prompt("seed");
-
-		harness.setResponses([fauxAssistantMessage("never delivered"), fauxAssistantMessage("after clear response")]);
-		gateAgentStart = true;
-		const admission = gateNextAgentStart(harness);
-		const accepted = harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false });
-		await admission.reached;
-		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
-			steering: [],
-			followUp: [agentPrompt],
-		});
-		admission.release();
-		await expect(accepted).rejects.toThrow("cleared before delivery");
-		await harness.session.agent.waitForIdle();
-
-		// The cleared run's events are still stalled in the session event queue;
-		// run a newer prompt so its messages land in state before the stale cleanup.
-		harness.setResponses([fauxAssistantMessage("after clear response")]);
-		gateAgentStart = false;
-		await harness.session.prompt("after clear");
-		releaseGate();
-		await (harness.session as unknown as { _agentEventQueue: Promise<void> })._agentEventQueue;
-
-		expect(getUserTexts(harness)).toEqual(["seed", "after clear"]);
-		expect(getAssistantTexts(harness)).toEqual(["seed response", "after clear response"]);
-	});
-
-	it("restores drained nextTurn messages when an accepted agent message is cleared", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const agentPrompt =
-			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_next_turn\n\nagent text";
+		const agentMessageId = "agentmsg_clear_lifecycle";
+		const agentPrompt = `Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: ${agentMessageId}\n\nagent text`;
 		await harness.session.sendCustomMessage(
 			{ customType: "next-turn", content: "carry this", display: true, details: {} },
 			{ deliverAs: "nextTurn" },
 		);
+		harness.events.splice(0);
 		harness.setResponses([fauxAssistantMessage("never delivered")]);
 
-		const admission = gateNextAgentStart(harness);
+		let markAdmitted = () => {};
+		const admitted = new Promise<void>((resolve) => {
+			markAdmitted = resolve;
+		});
+		let releaseAdmission = () => {};
+		const admissionGate = new Promise<void>((resolve) => {
+			releaseAdmission = resolve;
+		});
+		let unsubscribe = () => {};
+		unsubscribe = harness.session.agent.subscribe(async (event) => {
+			if (event.type !== "agent_start") return;
+			unsubscribe();
+			markAdmitted();
+			await admissionGate;
+		});
+
+		const delivery = harness.session.waitForAgentMessagePromptDelivery(agentMessageId);
 		const accepted = harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false });
-		await admission.reached;
-		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes("agentmsg_"))).toEqual({
+		const acceptedRejection = expect(accepted).rejects.toThrow("cleared before delivery");
+		const deliveryRejection = expect(delivery).rejects.toThrow("cleared before delivery");
+		await admitted;
+
+		expect(harness.session.clearQueuedUserMessagesMatching((text) => text.includes(agentMessageId))).toEqual({
 			steering: [],
 			followUp: [agentPrompt],
 		});
-		admission.release();
-		await expect(accepted).rejects.toThrow("cleared before delivery");
+		releaseAdmission();
+		await Promise.all([acceptedRejection, deliveryRejection]);
 		await harness.session.agent.waitForIdle();
-		await (harness.session as unknown as { _agentEventQueue: Promise<void> })._agentEventQueue;
 
-		let sawCustomMessage = false;
+		let sawRestoredNextTurn = false;
 		harness.setResponses([
 			(context) => {
-				sawCustomMessage = context.messages.some(
-					(message) =>
-						message.role === "user" &&
-						typeof message.content !== "string" &&
-						message.content.some((part) => part.type === "text" && part.text === "carry this"),
+				sawRestoredNextTurn = context.messages.some(
+					(message) => message.role === "user" && getMessageText(message) === "carry this",
 				);
-				return fauxAssistantMessage("done");
+				return fauxAssistantMessage("newer response");
 			},
 		]);
-		await harness.session.prompt("normal prompt");
+		holdAgentStart = false;
+		await harness.session.prompt("newer prompt");
+		releaseEventQueue();
+		await harness.session.waitForIdle();
 
-		expect(sawCustomMessage).toBe(true);
-		expect(harness.session.messages.map((message) => message.role)).toEqual(["custom", "user", "assistant"]);
+		expect(sawRestoredNextTurn).toBe(true);
+		expect(getUserTexts(harness)).toEqual(["newer prompt"]);
+		expect(getAssistantTexts(harness)).toEqual(["newer response"]);
+		const deliveredEventTexts = harness.events
+			.filter((event) => event.type === "message_start" || event.type === "message_end")
+			.map((event) => getMessageText(event.message));
+		expect(deliveredEventTexts).not.toContain(agentPrompt);
+		expect(deliveredEventTexts).not.toContain("never delivered");
+		await vi.waitFor(() =>
+			expect(
+				harness.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "message")
+					.map((entry) => getMessageText(entry.message)),
+			).toEqual(["newer prompt", "newer response"]),
+		);
+		expect(harness.session.agent.state.errorMessage).toBeUndefined();
+		expect(harness.session.getAcceptedPromptSnapshot()).toBeUndefined();
+		expect(harness.session.hasAcceptedPromptInFlight).toBe(false);
 	});
 
 	it("restores drained nextTurn messages when direct agent message acceptance fails before delivery", async () => {

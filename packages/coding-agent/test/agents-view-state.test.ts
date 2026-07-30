@@ -1,32 +1,32 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntimeConfig } from "../src/core/agent-session-config.js";
 import type { ModelRegistry } from "../src/core/model-registry.js";
 import type { SessionInfo } from "../src/core/session-manager.js";
 import type { SettingsManager } from "../src/core/settings-manager.js";
 import {
-	createAgentsViewAutocompleteProvider,
 	createAgentsViewListCommand,
 	createAgentsViewReplyHeadline,
 	createAgentsViewResumeConfig,
-	createAgentsViewSessionName,
 	formatAgentsViewRelativeTime,
 	formatAgentsViewStatusLine,
 	resolveAgentsViewActiveSummaryForPath,
-	resolveAgentsViewAutocompleteCwd,
 	resolveAgentsViewOpenCwd,
-	resolveAgentsViewResumeSummary,
 	resolveAgentsViewSessionUiServices,
 	shouldReconnectAgentsViewDaemon,
 } from "../src/modes/agents-view/agents-view-mode.js";
 import {
+	aggregateSessionHeartbeats,
 	buildAgentsViewRows,
 	classifyAgentsViewSession,
+	filterUnifiedSessions,
+	formatHeartbeatBadge,
 	getAgentsViewSelectionKey,
+	reconcileUnifiedSessions,
 	resolveAgentsViewSelectionIndex,
+	resolveAgentsViewSelectionState,
 	type SessionSummary,
 	sectionTitle,
 	shouldShowAgentsViewSession,
@@ -34,50 +34,65 @@ import {
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
 import type { Theme } from "../src/modes/interactive/theme/theme.js";
 
+function heartbeat(id: string, nextRunAt?: string, activeSessionId = "child") {
+	return {
+		job: {
+			id,
+			status: "active" as const,
+			activeSessionId,
+			sessionId: `${activeSessionId}-session`,
+			sessionFile: `/tmp/${activeSessionId}.jsonl`,
+			cwd: "/tmp",
+			prompt: "tick",
+			schedule: { kind: "interval" as const, expression: "5m" },
+			createdAt: "2026-01-01T00:00:00Z",
+			updatedAt: "2026-01-01T00:00:00Z",
+			...(nextRunAt ? { nextRunAt } : {}),
+			runCount: 0,
+		},
+	};
+}
+
 describe("agents view state", () => {
 	test("classifies active daemon sessions into coarse fleet sections", () => {
-		expect(classifyAgentsViewSession(makeSummary({ isStreaming: true, activity: "working" }))).toBe("working");
-		expect(classifyAgentsViewSession(makeSummary({ pendingMessageCount: 1, activity: "working" }))).toBe("working");
-		expect(classifyAgentsViewSession(makeSummary({ activity: "working" }))).toBe("working");
-		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 2 }))).toBe("needs-input");
-		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 0 }))).toBe("needs-input");
-		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 4 }))).toBe("needs-input");
+		expect(classifyAgentsViewSession(makeSummary({ isStreaming: true, activity: "working" }))).toBe("running");
+		expect(classifyAgentsViewSession(makeSummary({ pendingMessageCount: 1, activity: "working" }))).toBe("running");
+		expect(classifyAgentsViewSession(makeSummary({ activity: "working" }))).toBe("running");
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 2 }))).toBe("idle");
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 0 }))).toBe("idle");
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 4 }))).toBe("idle");
 	});
 
-	test("idle sessions split by the summarizer's completion verdict", () => {
+	test("places all non-busy resident sessions in Idle", () => {
 		// Working is heuristic and ignores taskState.
 		expect(
 			classifyAgentsViewSession(makeSummary({ isStreaming: true, activity: "working", taskState: "completed" })),
-		).toBe("working");
-		// Idle sessions follow the verdict; absent one they default to needs-input.
-		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: "needs_input" }))).toBe(
-			"needs-input",
-		);
-		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: "completed" }))).toBe("completed");
-		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: undefined }))).toBe("needs-input");
+		).toBe("running");
+		// Secondary completion verdicts do not create extra sections.
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: "needs_input" }))).toBe("idle");
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: "completed" }))).toBe("idle");
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: undefined }))).toBe("idle");
 	});
 
-	test("active heartbeats use their own section regardless of current activity", () => {
-		expect(classifyAgentsViewSession(makeSummary({ activity: "working", hasActiveHeartbeat: true }))).toBe(
-			"heartbeats",
-		);
+	test("active heartbeats make sessions Running regardless of current activity", () => {
+		expect(classifyAgentsViewSession(makeSummary({ activity: "working", hasActiveHeartbeat: true }))).toBe("running");
 		expect(
 			classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: "completed", hasActiveHeartbeat: true })),
-		).toBe("heartbeats");
+		).toBe("running");
 
 		const [row] = buildAgentsViewRows([makeSummary({ activity: "idle", hasActiveHeartbeat: true })]);
-		expect(row).toMatchObject({ section: "heartbeats", statusLabel: "heartbeat active" });
+		expect(row).toMatchObject({ section: "running", statusLabel: "heartbeat active" });
 		const [busyRow] = buildAgentsViewRows([
 			makeSummary({ activity: "working", hasActiveHeartbeat: true, isStreaming: true, isRunningTools: true }),
 		]);
-		expect(busyRow).toMatchObject({ section: "heartbeats", statusLabel: "running tools" });
-		expect(sectionTitle("heartbeats")).toBe("Heartbeats");
+		expect(busyRow).toMatchObject({ section: "running", statusLabel: "running tools" });
+		expect(sectionTitle("running")).toBe("Running");
 	});
 
 	test("defaults an idle session with no verdict to needs-input", () => {
 		// A slow, failed, or absent classification never lingers in Working; only
 		// an explicit completed verdict moves an idle session out of needs-input.
-		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: undefined }))).toBe("needs-input");
+		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", taskState: undefined }))).toBe("idle");
 	});
 
 	test("sorts rows by section and creation time", () => {
@@ -116,7 +131,7 @@ describe("agents view state", () => {
 		]);
 
 		expect(rows.map((row) => row.title)).toEqual(["newer working", "older working", "heartbeat", "completed"]);
-		expect(rows.map((row) => row.section)).toEqual(["working", "working", "heartbeats", "completed"]);
+		expect(rows.map((row) => row.section)).toEqual(["running", "running", "running", "idle"]);
 	});
 
 	test("keeps row order stable when modification times and daemon input order change", () => {
@@ -251,19 +266,19 @@ describe("agents view state", () => {
 		const collapsed = buildAgentsViewRows(summaries);
 		expect(collapsed[0]).toMatchObject({
 			kind: "agent",
-			section: "heartbeats",
+			section: "running",
 			statusLabel: "heartbeat active",
 		});
 		expect(collapsed[1]).toMatchObject({
 			kind: "subagent-summary",
-			section: "heartbeats",
+			section: "running",
 			title: "1 subagent running · 1 heartbeat active",
 			runningSubagentCount: 1,
 		});
 		const expanded = buildAgentsViewRows(summaries, new Set([collapsed[0]?.identity ?? ""]));
 		expect(expanded[1]).toMatchObject({
 			kind: "subagent",
-			section: "heartbeats",
+			section: "running",
 			statusLabel: "heartbeat active",
 		});
 	});
@@ -285,6 +300,13 @@ describe("agents view state", () => {
 		const rows = buildAgentsViewRows([
 			...heartbeatChildren,
 			makeSummary({
+				id: "busy-child",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "parent-active",
+				activity: "idle",
+				isRunningTools: true,
+			}),
+			makeSummary({
 				id: "parent-active",
 				activeSessionId: "parent-active",
 				sessionId: "parent-session",
@@ -294,11 +316,11 @@ describe("agents view state", () => {
 			}),
 		]);
 
-		expect(rows[0]).toMatchObject({ section: "heartbeats", runningSubagentCount: 10 });
+		expect(rows[0]).toMatchObject({ section: "running", runningSubagentCount: 11 });
 		expect(rows[1]).toMatchObject({
 			kind: "subagent-summary",
-			title: "10 subagents running · 10 heartbeats active",
-			runningSubagentCount: 10,
+			title: "11 subagents running · 10 heartbeats active",
+			runningSubagentCount: 11,
 		});
 	});
 
@@ -338,8 +360,8 @@ describe("agents view state", () => {
 		const rootIdentity = buildAgentsViewRows(summaries)[0]?.identity ?? "";
 		const oneLevel = buildAgentsViewRows(summaries, new Set([rootIdentity]));
 		const child = oneLevel.find((row) => row.title === "Child");
-		expect(oneLevel[0]).toMatchObject({ section: "heartbeats", statusLabel: "heartbeat active" });
-		expect(child).toMatchObject({ section: "heartbeats", statusLabel: "heartbeat active" });
+		expect(oneLevel[0]).toMatchObject({ section: "running", statusLabel: "heartbeat active" });
+		expect(child).toMatchObject({ section: "running", statusLabel: "heartbeat active" });
 
 		const childIdentity = child?.identity ?? "";
 		const expanded = buildAgentsViewRows(summaries, new Set([rootIdentity, childIdentity]));
@@ -348,9 +370,9 @@ describe("agents view state", () => {
 				.filter((row) => row.kind === "agent" || row.kind === "subagent")
 				.map((row) => [row.title, row.section, row.statusLabel]),
 		).toEqual([
-			["Root", "heartbeats", "heartbeat active"],
-			["Child", "heartbeats", "heartbeat active"],
-			["Heartbeat grandchild", "heartbeats", "heartbeat active"],
+			["Root", "running", "heartbeat active"],
+			["Child", "running", "heartbeat active"],
+			["Heartbeat grandchild", "running", "heartbeat active"],
 		]);
 	});
 
@@ -717,105 +739,6 @@ describe("agents view state", () => {
 		expect(createAgentsViewListCommand()).toEqual({ type: "list" });
 	});
 
-	test("uses the active-chat file autocomplete for new-agent prompts", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "agents-view-autocomplete-"));
-		const fdPath = join(dir, "fd");
-		writeFileSync(
-			fdPath,
-			`#!/bin/sh
-printf 'src/referenced.ts\n'
-`,
-		);
-		chmodSync(fdPath, 0o755);
-
-		try {
-			const provider = createAgentsViewAutocompleteProvider(dir, fdPath, () => []);
-			const suggestions = await provider.getSuggestions(["review @refer"], 0, 13, {
-				signal: new AbortController().signal,
-			});
-
-			expect(suggestions).toEqual({
-				prefix: "@refer",
-				items: [{ value: "@src/referenced.ts", label: "referenced.ts", description: "src/referenced.ts" }],
-				kind: "file",
-			});
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-		}
-	});
-
-	test("uses the reply target cwd for file autocomplete", () => {
-		const missing = mkdtempSync(join(tmpdir(), "agents-view-autocomplete-missing-"));
-		rmSync(missing, { recursive: true, force: true });
-
-		expect(resolveAgentsViewAutocompleteCwd("/launch", makeSummary({ cwd: tmpdir() }))).toBe(tmpdir());
-		expect(resolveAgentsViewAutocompleteCwd("/launch")).toBe("/launch");
-		expect(resolveAgentsViewAutocompleteCwd("/launch", makeSummary({ cwd: missing }))).toBe("/launch");
-		expect(resolveAgentsViewAutocompleteCwd("/launch", makeSummary({ cwd: "" }))).toBe("/launch");
-	});
-
-	test("reads current models for each autocomplete request", async () => {
-		let completions: AutocompleteItem[] | null = null;
-		const provider = createAgentsViewAutocompleteProvider("/tmp", undefined, () => completions);
-
-		expect(
-			await provider.getSuggestions(["/model fresh"], 0, 12, { signal: new AbortController().signal }),
-		).toBeNull();
-
-		completions = [{ value: "test-provider/fresh-model", label: "fresh-model", description: "test-provider" }];
-		expect(await provider.getSuggestions(["/model fresh"], 0, 12, { signal: new AbortController().signal })).toEqual({
-			prefix: "fresh",
-			items: [{ value: "test-provider/fresh-model", label: "fresh-model", description: "test-provider" }],
-		});
-	});
-
-	test("creates an inactive summary for a saved session selected from resume", () => {
-		const savedSession = makeSessionInfo({
-			path: "/tmp/sessions/saved.jsonl",
-			id: "saved",
-			name: "Saved session",
-			cwd: "/tmp/project",
-			messageCount: 2,
-			agentStatus: {
-				summary: "Finished the task",
-				taskState: "completed",
-				basedOnMessageCount: 2,
-			},
-		});
-
-		const summary = resolveAgentsViewResumeSummary(savedSession.path, [savedSession], []);
-
-		expect(summary).toMatchObject({
-			id: "saved",
-			activity: "idle",
-			sessionId: "saved",
-			sessionFile: savedSession.path,
-			sessionName: "Saved session",
-			cwd: "/tmp/project",
-			summary: "Finished the task",
-			taskState: "completed",
-		});
-		expect(summary?.activeSessionId).toBeUndefined();
-		expect(summary?.lifecycle).toBe("live");
-	});
-
-	test("reuses the live daemon summary when resuming an already-active saved session", () => {
-		const savedSession = makeSessionInfo({
-			path: "/tmp/sessions/active.jsonl",
-			id: "saved-active",
-			cwd: "/tmp/project",
-		});
-		const activeSummary = makeSummary({
-			id: "active-runtime",
-			activeSessionId: "active-runtime",
-			sessionId: "saved-active",
-			sessionFile: savedSession.path,
-			sessionName: "Running",
-		});
-
-		expect(resolveAgentsViewResumeSummary(savedSession.path, [savedSession], [activeSummary])).toBe(activeSummary);
-	});
-
 	test("resolves active summaries by session file path", () => {
 		const activeSummary = makeSummary({
 			id: "active-runtime",
@@ -871,11 +794,6 @@ printf 'src/referenced.ts\n'
 		expect(shouldReconnectAgentsViewDaemon("shutdown")).toBe(false);
 	});
 
-	test("caps generated session names at the configured limit", () => {
-		expect(createAgentsViewSessionName("x".repeat(120))).toHaveLength(80);
-		expect(createAgentsViewSessionName("short")).toBe("short");
-	});
-
 	test("uses session-specific UI services when opening an agent", async () => {
 		const dashboardServices = makeUiServices("/tmp/dashboard");
 		const sessionServices = makeUiServices("/tmp/project");
@@ -892,6 +810,213 @@ printf 'src/referenced.ts\n'
 			),
 		).resolves.toBe(sessionServices);
 		expect(createUiServicesForSession).toHaveBeenCalledWith(summary);
+	});
+
+	test("reconciles canonical paths and session ids while retaining saved search text", () => {
+		const saved = makeSessionInfo({
+			path: "/tmp/sessions/../sessions/merged.jsonl",
+			id: "merged-session",
+			name: "Durable name",
+			allMessagesText: "a uniquely searchable transcript",
+			agentStatus: { summary: "Investigated the lunar regression", basedOnMessageCount: 1 },
+		});
+		const daemon = makeSummary({
+			id: "runtime",
+			activeSessionId: "runtime",
+			sessionId: "merged-session",
+			sessionFile: "/tmp/sessions/merged.jsonl",
+			sessionName: "Live name",
+		});
+
+		const [record] = reconcileUnifiedSessions([daemon], [saved]);
+		expect(record).toMatchObject({ daemon, saved, identity: "file:/tmp/sessions/merged.jsonl", section: "idle" });
+		expect(record?.searchableText).toContain("uniquely searchable transcript");
+		expect(record?.searchableText).toContain("lunar regression");
+		expect(buildAgentsViewRows([record!])[0]).toMatchObject({
+			title: "Live name",
+			record,
+		});
+	});
+
+	test("retains the ancestor chain when search matches only a nested subagent", () => {
+		const summaries = [
+			makeSummary({ id: "root", activeSessionId: "root", sessionId: "root-session", sessionName: "Root" }),
+			makeSummary({
+				id: "child",
+				activeSessionId: "child",
+				sessionId: "child-session",
+				sessionName: "Child",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "root",
+			}),
+			makeSummary({
+				id: "match",
+				activeSessionId: "match",
+				sessionId: "match-session",
+				sessionName: "Needle",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "child",
+			}),
+			makeSummary({
+				id: "newer",
+				activeSessionId: "newer",
+				sessionId: "newer-session",
+				sessionName: "Needle peer",
+				created: "2026-02-01T00:00:00Z",
+			}),
+		];
+		const records = reconcileUnifiedSessions(summaries, []);
+		const filtered = filterUnifiedSessions(records, (text) => text.includes("Needle"));
+
+		expect(filtered.map((record) => record.daemon?.sessionId)).toEqual([
+			"root-session",
+			"child-session",
+			"match-session",
+			"newer-session",
+		]);
+		const rootIdentity = records[0]?.identity ?? "";
+		const childIdentity = records[1]?.identity ?? "";
+		expect(
+			buildAgentsViewRows(filtered, new Set([rootIdentity, childIdentity])).map((row) => [
+				row.summary.sessionId,
+				row.depth,
+			]),
+		).toEqual([
+			["newer-session", 0],
+			["root-session", 0],
+			["child-session", 1],
+			["match-session", 2],
+		]);
+	});
+
+	test("deduplicates and protects sessions across symlink aliases", () => {
+		const root = mkdtempSync(join(tmpdir(), "session-view-alias-"));
+		try {
+			const real = join(root, "session.jsonl");
+			const alias = join(root, "alias.jsonl");
+			writeFileSync(real, "");
+			symlinkSync(real, alias);
+			const daemon = makeSummary({ activeSessionId: "active", sessionFile: alias, sessionId: "same" });
+			const saved = makeSessionInfo({ id: "same", path: real });
+			expect(reconcileUnifiedSessions([daemon], [saved])).toHaveLength(1);
+			expect(resolveAgentsViewActiveSummaryForPath(real, [daemon])).toBe(daemon);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("uses canonical path and fallback active-id keys for heartbeat ancestry", () => {
+		const root = mkdtempSync(join(tmpdir(), "session-view-parent-alias-"));
+		try {
+			const path = join(root, "parent.jsonl");
+			const alias = join(root, "alias.jsonl");
+			writeFileSync(path, "");
+			symlinkSync(path, alias);
+			const summaries = [
+				makeSummary({ id: "root", activeSessionId: undefined, sessionFile: path }),
+				makeSummary({
+					id: "parent",
+					activeSessionId: undefined,
+					parentSessionPath: alias,
+					runtimeKind: "subagent",
+				}),
+				makeSummary({
+					id: "child",
+					activeSessionId: undefined,
+					parentActiveSessionId: "parent",
+					runtimeKind: "subagent",
+				}),
+			];
+			const aggregates = aggregateSessionHeartbeats(summaries, [heartbeat("job", undefined, "child")]);
+			expect(["root", "parent", "child"].map((id) => aggregates.get(id))).toEqual(
+				Array.from({ length: 3 }, () => ({ activeCount: 1 })),
+			);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("shows a fallback heartbeat count while catalog details are unavailable", () => {
+		const [record] = reconcileUnifiedSessions([makeSummary({ hasActiveHeartbeat: true })], []);
+		expect(record).toMatchObject({ section: "running", heartbeat: { activeCount: 1 } });
+		expect(formatHeartbeatBadge(record?.heartbeat)).toBe("♥ 1");
+	});
+
+	test("preserves live identity and row state when saved metadata adds a file alias", () => {
+		const saved = makeSessionInfo({ path: "/tmp/saved.jsonl", id: "saved", allMessagesText: "transcript" });
+		const parent = makeSummary({
+			id: "parent",
+			activeSessionId: "parent",
+			sessionId: "saved",
+			sessionFile: undefined,
+		});
+		const child = makeSummary({
+			id: "child",
+			activeSessionId: "child",
+			sessionId: "child-session",
+			runtimeKind: "subagent",
+			parentActiveSessionId: "parent",
+			spawnCode: "run_subagent()",
+		});
+		const [inactive] = reconcileUnifiedSessions([], [saved]);
+		const [live] = reconcileUnifiedSessions([parent, child], []);
+		const enrichedRecords = reconcileUnifiedSessions([parent, child], [saved]);
+		const enriched = enrichedRecords.find((record) => record.daemon?.sessionId === parent.sessionId);
+		const expanded = buildAgentsViewRows(enrichedRecords, new Set([live!.identity]), new Set([live!.identity]));
+
+		expect(inactive).toMatchObject({ identity: "file:/tmp/saved.jsonl", section: "inactive" });
+		expect(enriched).toMatchObject({ identity: live?.identity, section: "idle", saved });
+		expect(enriched?.identityAliases).toContain("file:/tmp/saved.jsonl");
+		expect(expanded.map((row) => row.kind)).toContain("subagent-code");
+		expect(expanded.some((row) => row.kind === "subagent" && row.summary.sessionId === "child-session")).toBe(true);
+	});
+
+	test("aggregates active descendant heartbeats once and formats the soonest run", () => {
+		const parent = makeSummary({ id: "parent", activeSessionId: "parent", sessionId: "parent-session" });
+		const child = makeSummary({
+			id: "child",
+			activeSessionId: "child",
+			sessionId: "child-session",
+			runtimeKind: "subagent",
+			parentActiveSessionId: "parent",
+		});
+
+		const aggregates = aggregateSessionHeartbeats(
+			[parent, child],
+			[heartbeat("one", "2026-01-01T00:10:00Z"), heartbeat("two", "2026-01-01T00:05:00Z")],
+		);
+		expect(aggregates.get("child")).toEqual({ activeCount: 2, nextRunAt: "2026-01-01T00:05:00Z" });
+		expect(aggregates.get("parent")).toEqual({ activeCount: 2, nextRunAt: "2026-01-01T00:05:00Z" });
+		const rows = buildAgentsViewRows(reconcileUnifiedSessions([parent, child], [], [heartbeat("one")]));
+		expect(rows[0]).toMatchObject({ section: "running", heartbeat: { activeCount: 1 } });
+		expect(rows[1]).toMatchObject({ title: "1 subagent running · 1 heartbeat active" });
+		expect(formatHeartbeatBadge(aggregates.get("parent"), Date.parse("2026-01-01T00:00:00Z"))).toBe("♥ 2·5m");
+		expect(
+			formatHeartbeatBadge(
+				{ activeCount: 1, nextRunAt: "2026-01-01T00:10:00Z" },
+				Date.parse("2026-01-01T00:00:00Z"),
+			),
+		).toBe("♥ 1·10m");
+		expect(formatHeartbeatBadge({ activeCount: 1 })).toBe("♥ 1");
+		// Sub-minute countdowns show seconds instead of rounding up to 1m.
+		expect(
+			formatHeartbeatBadge(
+				{ activeCount: 1, nextRunAt: "2026-01-01T00:00:42Z" },
+				Date.parse("2026-01-01T00:00:00Z"),
+			),
+		).toBe("♥ 1·42s");
+		expect(
+			formatHeartbeatBadge(
+				{ activeCount: 1, nextRunAt: "2026-01-01T00:00:59.700Z" },
+				Date.parse("2026-01-01T00:00:00Z"),
+			),
+		).toBe("♥ 1·1m");
+		expect(
+			formatHeartbeatBadge(
+				{ activeCount: 1, nextRunAt: "2026-01-01T00:00:00Z" },
+				Date.parse("2026-01-01T00:00:00Z"),
+			),
+		).toBe("♥ 1·1s");
 	});
 
 	describe("restores selection to the previously open session", () => {
@@ -914,8 +1039,9 @@ printf 'src/referenced.ts\n'
 
 		test("re-finds the session after a section change reorders the list", () => {
 			const rows = buildAgentsViewRows([{ ...opened, activity: "working" }, other]);
-			expect(rows[1]?.summary.sessionId).toBe("session-open");
-			expect(resolveAgentsViewSelectionIndex(rows, identity, key)).toBe(1);
+			const openIndex = rows.findIndex((row) => row.summary.sessionId === "session-open");
+			expect(openIndex).toBe(0);
+			expect(resolveAgentsViewSelectionIndex(rows, identity, key)).toBe(openIndex);
 		});
 
 		test("falls back to activeSessionId when the row identity changed", () => {
@@ -927,6 +1053,25 @@ printf 'src/referenced.ts\n'
 			);
 		});
 
+		test("prefers the current runtime over a stale saved-file identity", () => {
+			const switched = {
+				...opened,
+				sessionId: "session-switched",
+				sessionFile: "/tmp/project/switched.jsonl",
+			};
+			const staleSaved = makeSummary({
+				id: "session-open",
+				activeSessionId: undefined,
+				sessionId: "session-open",
+				sessionFile: opened.sessionFile,
+				lifecycle: "archived",
+			});
+			const rows = buildAgentsViewRows([staleSaved, switched]);
+			expect(resolveAgentsViewSelectionIndex(rows, identity, key)).toBe(
+				rows.findIndex((row) => row.summary.sessionId === "session-switched"),
+			);
+		});
+
 		test("falls back to sessionId after a daemon re-attach regenerates the active id", () => {
 			// Re-attach gives a fresh activeSessionId, so only the sessionId still matches.
 			const reattached = { ...opened, id: "active-open-2", activeSessionId: "active-open-2" };
@@ -934,6 +1079,42 @@ printf 'src/referenced.ts\n'
 			expect(resolveAgentsViewSelectionIndex(rows, identity, key)).toBe(
 				rows.findIndex((row) => row.summary.sessionId === "session-open"),
 			);
+		});
+
+		test("keeps an unresolved source anchor while streamed rows provide a visual fallback", () => {
+			const partialRows = buildAgentsViewRows([other]);
+			expect(resolveAgentsViewSelectionState(partialRows, 0, identity, key)).toEqual({
+				index: 0,
+				resolved: false,
+			});
+			const completeRows = buildAgentsViewRows([other, opened]);
+			expect(resolveAgentsViewSelectionState(completeRows, 0, identity, key)).toEqual({
+				index: completeRows.findIndex((row) => row.summary.sessionId === "session-open"),
+				resolved: true,
+			});
+		});
+
+		test("keeps a collapsed subagent summary selected across refreshes", () => {
+			const child = makeSummary({
+				id: "child-active",
+				activeSessionId: "child-active",
+				sessionId: "child-session",
+				sessionFile: "/tmp/project/child.jsonl",
+				runtimeKind: "subagent",
+				parentActiveSessionId: opened.activeSessionId,
+				parentSessionId: opened.sessionId,
+			});
+			const initialRows = buildAgentsViewRows([opened, child]);
+			const selected = initialRows.find((row) => row.kind === "subagent-summary")!;
+			const refreshedRows = buildAgentsViewRows([{ ...opened }, { ...child }]);
+			const refreshedSummaryIndex = refreshedRows.findIndex((row) => row.kind === "subagent-summary");
+			expect(
+				resolveAgentsViewSelectionIndex(
+					refreshedRows,
+					selected.identity,
+					getAgentsViewSelectionKey(selected.summary),
+				),
+			).toBe(refreshedSummaryIndex);
 		});
 
 		test("returns -1 when the session is gone so callers pick a default", () => {

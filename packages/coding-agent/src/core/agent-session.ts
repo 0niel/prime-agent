@@ -183,6 +183,7 @@ import {
 	isSessionSlashCommandMessage,
 } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
+import { throwIfPromptAdmissionCancelled, waitForPromptAdmission } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import {
 	type AutoRefineReason,
@@ -241,6 +242,7 @@ import { getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 import {
 	parseRefineCommandOptions,
 	parseSessionSlashCommand,
+	parseSlashCommand,
 	type SessionSlashCommand,
 	type SlashCommandInfo,
 } from "./slash-commands.js";
@@ -566,38 +568,6 @@ function oncePreflight(
 			preflightResult?.(success, queued);
 		}
 	};
-}
-
-function throwIfPromptAdmissionCancelled(signal: AbortSignal | undefined): void {
-	if (signal?.aborted) throw new Error("Prompt admission was cancelled.");
-}
-
-export function waitForPromptAdmission<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-	if (!signal) return promise;
-	if (signal.aborted) {
-		void promise.catch(() => {});
-		throwIfPromptAdmissionCancelled(signal);
-	}
-	return new Promise<T>((resolve, reject) => {
-		const onAbort = () => {
-			cleanup();
-			reject(new Error("Prompt admission was cancelled."));
-		};
-		const cleanup = () => signal.removeEventListener("abort", onAbort);
-		signal.addEventListener("abort", onAbort, { once: true });
-		// Close the listener-registration race before observing the awaited work.
-		if (signal.aborted) return onAbort();
-		promise.then(
-			(value) => {
-				cleanup();
-				resolve(value);
-			},
-			(error: unknown) => {
-				cleanup();
-				reject(error);
-			},
-		);
-	});
 }
 
 interface PreparedCommandInput {
@@ -1020,7 +990,6 @@ export class AgentSession {
 	private _turnAdmissionTail: Promise<void> = Promise.resolve();
 	private _turnAdmissionOwner: symbol | undefined;
 	private readonly _turnAdmissionContext = new AsyncLocalStorage<symbol>();
-	private _legacyQueuedWorkPause: { release(): void } | undefined;
 	private _pumpingSessionInput = false;
 	private _activeSessionInput:
 		| {
@@ -1037,7 +1006,6 @@ export class AgentSession {
 	private _directPromptSectionCount = 0;
 	/** One-shot waiters resolved when a dispatched message reaches message_start. */
 	private _directDispatchObservers = new Set<{ message: AgentMessage; resolve: () => void }>();
-	private _steeringStopPending = false;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
@@ -1550,7 +1518,6 @@ export class AgentSession {
 		this._removeActivePreparingPrompts(isGoalContext);
 		this._steeringMessages = this._steeringMessages.filter((input) => !isGoalContext(input));
 		this._followUpMessages = this._followUpMessages.filter((input) => !isGoalContext(input));
-		this._syncSteeringStopPending();
 		this._emitQueueUpdate();
 	}
 
@@ -1946,14 +1913,14 @@ export class AgentSession {
 		return true;
 	}
 
-	private _syncSteeringStopPending(): void {
+	private get _steeringStopPending(): boolean {
 		const activeSteeringHandoff =
 			this._activeSessionInput?.kind === "prompt" &&
 			this._activeSessionInput.lane === "steer" &&
 			this._activeSessionInput.phase === "preparing" &&
 			!this._activeSessionInput.cancelled &&
 			this._activeSessionInput.items.length > 0;
-		this._steeringStopPending = this._steeringMessages.length > 0 || activeSteeringHandoff;
+		return this._steeringMessages.length > 0 || activeSteeringHandoff;
 	}
 
 	private _shouldStopBeforeTurn(): boolean {
@@ -2561,7 +2528,6 @@ export class AgentSession {
 			input.kind === "prompt" && queuedMessageSet.has(input.message);
 		this._steeringMessages = this._steeringMessages.filter((input) => !isQueuedContinuation(input));
 		this._followUpMessages = this._followUpMessages.filter((input) => !isQueuedContinuation(input));
-		this._syncSteeringStopPending();
 		this._emitQueueUpdate();
 		if (options.restoreAutonomousState) {
 			for (const queuedMessage of queuedMessages) {
@@ -3719,7 +3685,6 @@ export class AgentSession {
 			}
 			this._steeringMessages = [];
 			this._followUpMessages = [];
-			this._syncSteeringStopPending();
 			this.agent.clearAllQueues();
 			this._extensionRunner.invalidate(
 				"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
@@ -4691,11 +4656,13 @@ export class AgentSession {
 	}
 
 	private _executeExtensionCommand(text: string): Promise<void> | undefined {
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+		const parsed = parseSlashCommand(text);
+		if (!parsed) return undefined;
+		const commandName = parsed.name;
+		const args = parsed.args;
+
 		const command = this._extensionRunner.getCommand(commandName);
 		if (!command) return undefined;
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1);
 		const context = this._extensionRunner.createCommandContext();
 		return Promise.resolve()
 			.then(() => command.handler(args, context))
@@ -4719,9 +4686,10 @@ export class AgentSession {
 	private _expandSkillCommand(text: string): string {
 		if (!text.startsWith("/skill:")) return text;
 
-		const spaceIndex = text.indexOf(" ");
-		const skillName = spaceIndex === -1 ? text.slice(7) : text.slice(7, spaceIndex);
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
+		const parsed = parseSlashCommand(text);
+		if (!parsed?.name.startsWith("skill:")) return text;
+		const skillName = parsed.name.slice("skill:".length);
+		const args = parsed.args;
 
 		const skill = this.resourceLoader.getSkills().skills.find((s) => s.name === skillName);
 		if (!skill) return text; // Unknown skill, pass through
@@ -4989,7 +4957,6 @@ export class AgentSession {
 		}
 		queue.push(input);
 		this._sessionInputArrivalEpoch++;
-		this._syncSteeringStopPending();
 		this._emitQueueUpdate();
 		if (
 			!options.restore &&
@@ -5063,7 +5030,6 @@ export class AgentSession {
 					if (first.kind === "command") {
 						queue.shift();
 						this._activeSessionInput = { kind: "command", lane, item: first, phase: "executing" };
-						this._syncSteeringStopPending();
 						this._notifySessionInputCheckpointChange();
 						this._emitQueueUpdate();
 						try {
@@ -5073,7 +5039,6 @@ export class AgentSession {
 							this._rejectAgentMessage(first.agentMessageId, this._asError(error));
 						} finally {
 							this._activeSessionInput = undefined;
-							this._syncSteeringStopPending();
 							this._notifySessionInputCheckpointChange();
 							this._emitQueueUpdate();
 						}
@@ -5086,7 +5051,6 @@ export class AgentSession {
 					}
 					if (epoch !== this._sessionInputPumpEpoch) {
 						queue.unshift(...prompts);
-						this._syncSteeringStopPending();
 						return;
 					}
 					this._activeSessionInput = {
@@ -5095,7 +5059,6 @@ export class AgentSession {
 						items: prompts,
 						phase: "preparing",
 					};
-					this._syncSteeringStopPending();
 					this._notifySessionInputCheckpointChange();
 					this._emitQueueUpdate();
 					try {
@@ -5116,7 +5079,6 @@ export class AgentSession {
 								// Clear ownership before emitting so the requeued items are not
 								// double-counted as both owned and queued.
 								this._activeSessionInput = undefined;
-								this._syncSteeringStopPending();
 								this._emitQueueUpdate();
 							}
 							blocked = true;
@@ -5132,7 +5094,6 @@ export class AgentSession {
 						this._surfaceSessionInputError(error);
 					} finally {
 						this._activeSessionInput = undefined;
-						this._syncSteeringStopPending();
 						this._notifySessionInputCheckpointChange();
 					}
 				} finally {
@@ -5141,7 +5102,6 @@ export class AgentSession {
 			}
 		} finally {
 			this._pumpingSessionInput = false;
-			this._syncSteeringStopPending();
 			if (!blocked && epoch === this._sessionInputPumpEpoch && this.pendingMessageCount > 0) {
 				this._scheduleSessionInputPump();
 			}
@@ -5186,17 +5146,28 @@ export class AgentSession {
 	}
 
 	private _isDeferredSessionInputError(error: unknown, epoch: number): boolean {
-		return error instanceof DeferredSessionInputError || this._isSessionInputHandoffDeferred(epoch);
+		if (error instanceof DeferredSessionInputError) return true;
+		if (epoch !== this._sessionInputPumpEpoch) return true;
+		if (this._isBusyForSessionInput("pump")) {
+			// Requeue, but surface the error: this was not a deliberate deferral.
+			this._surfaceSessionInputError(error);
+			return true;
+		}
+		return false;
 	}
 
 	private _surfaceSessionInputError(error: unknown): void {
 		const normalized = this._asError(error);
-		this._extensionRunner.emitError({
-			extensionPath: "<session-input>",
-			event: "session_input",
-			error: normalized.message,
-			stack: normalized.stack,
-		});
+		try {
+			this._extensionRunner.emitError({
+				extensionPath: "<session-input>",
+				event: "session_input",
+				error: normalized.message,
+				stack: normalized.stack,
+			});
+		} catch {
+			// Best-effort: a throwing error listener must not break the pump's requeue path.
+		}
 	}
 
 	private async _startPreparedPromptItems(
@@ -5272,7 +5243,6 @@ export class AgentSession {
 			}
 			if (this._activeSessionInput?.kind === "prompt") {
 				this._activeSessionInput.phase = "handedOff";
-				this._syncSteeringStopPending();
 				this._notifySessionInputCheckpointChange();
 				this._emitQueueUpdate();
 			}
@@ -5377,8 +5347,7 @@ export class AgentSession {
 	 * Throw an error if the text is an extension command.
 	 */
 	private _throwIfExtensionCommand(text: string): void {
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+		const commandName = parseSlashCommand(text)?.name ?? "";
 		const command = this._extensionRunner.getCommand(commandName);
 
 		if (command) {
@@ -5539,7 +5508,6 @@ export class AgentSession {
 		this._rejectQueuedAgentMessageDeliveries(new Error("Queued agent message was cleared before delivery."));
 		this._steeringMessages = [];
 		this._followUpMessages = [];
-		this._syncSteeringStopPending();
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		return { steering, followUp };
@@ -5596,7 +5564,6 @@ export class AgentSession {
 		this._followUpMessages = this._followUpMessages.filter(
 			(message) => !followUpSet.has(message as PreparedPromptInput),
 		);
-		this._syncSteeringStopPending();
 		for (const message of [...steering, ...followUp]) {
 			this._rejectAgentMessage(
 				message.agentMessageId,
@@ -5847,23 +5814,10 @@ export class AgentSession {
 		}
 	}
 
-	/** Compatibility wrapper for callers migrating to owned pause leases. */
-	pauseQueuedWork(): boolean {
-		if (this._legacyQueuedWorkPause) return false;
-		this._legacyQueuedWorkPause = this.acquireQueuedWorkPause();
-		return true;
-	}
-
-	/** Compatibility wrapper that releases only the pause acquired by pauseQueuedWork(). */
+	/** Resume the scheduler after requestAbort/abortForUpdateRestart suspended it; owned pause leases are unaffected. */
 	resumeQueuedWork(): boolean {
 		this._sessionInputPumpSuspended = false;
-		const pause = this._legacyQueuedWorkPause;
-		if (pause) {
-			this._legacyQueuedWorkPause = undefined;
-			pause.release();
-		} else {
-			this._scheduleSessionInputPump();
-		}
+		this._scheduleSessionInputPump();
 		return this.pendingMessageCount > 0;
 	}
 
@@ -5952,7 +5906,6 @@ export class AgentSession {
 		const removed = new Set<QueuedSessionInput>([...removedSteering, ...removedFollowUp]);
 		this._steeringMessages = this._steeringMessages.filter((message) => !removed.has(message));
 		this._followUpMessages = this._followUpMessages.filter((message) => !removed.has(message));
-		this._syncSteeringStopPending();
 		for (const message of removed) {
 			this._rejectAgentMessage(
 				message.agentMessageId,
@@ -8388,7 +8341,10 @@ export class AgentSession {
 		// cancelled runs have nothing useful to show, so dispose them now. retainFinished…
 		// disposes the child itself when it declines, so only dispose here otherwise.
 		if (status === "done") {
-			await flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
+			// Trace sharing is best-effort telemetry for every completed run, retained
+			// or not. Rate-limit retries can take minutes, so it must not delay the
+			// model-facing rlm.run result.
+			void flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
 			if (!options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
 				runtime.session.dispose();
 			}
