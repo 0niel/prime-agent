@@ -8,6 +8,7 @@
 - Changed session search to rank exact name and first-message matches before prefix, substring, and stricter transcript fuzzy matches.
 - Fixed daemon startup failing when an interrupted supervisor left an empty ownership directory.
 - Fixed `/effort xhigh` and `/effort max` being rejected as unknown levels when no model was active yet.
+- Fixed startup blocking on a private Prime Inference model authorization request; the authorization is now cached next to `models.json` and stale entries refresh in the background.
 
 ## [0.3.3] - 2026-07-23
 
