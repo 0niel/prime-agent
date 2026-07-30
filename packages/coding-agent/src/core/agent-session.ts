@@ -4325,8 +4325,7 @@ export class AgentSession {
 					this.hasAcceptedPromptInFlight ||
 					this._sessionInputPumpSuspended ||
 					this._queuedWorkPauses.size > 0 ||
-					this._activeSessionInput !== undefined ||
-					this.pendingMessageCount > 0;
+					this.hasSessionInputWork;
 				const schedule = options?.streamingBehavior ?? (this.isStreaming ? "steer" : "followUp");
 				const queued = this._enqueueSessionInput(
 					{
@@ -5134,7 +5133,7 @@ export class AgentSession {
 				this._branchSummaryOperation !== undefined
 			);
 		}
-		return busy || this.pendingMessageCount > 0 || (point === "handoff" && this.isStreaming);
+		return busy || this.hasSessionInputWork || (point === "handoff" && this.isStreaming);
 	}
 
 	private _isSessionInputHandoffDeferred(epoch: number): boolean {
@@ -5588,15 +5587,10 @@ export class AgentSession {
 		return { steering: removedSteering, followUp: removedFollowUp };
 	}
 
-	/**
-	 * Items the pump moved out of the typed queues but has not yet delivered:
-	 * prompts still preparing and commands still executing. Once a prompt hands
-	 * off it reaches the transcript, so it stops counting as pending.
-	 */
+	/** Preparing prompts remain pending until handoff; executing commands are active work. */
 	private _undeliveredActiveSessionInputs(lane: SessionInputSchedule): readonly QueuedSessionInput[] {
 		const active = this._activeSessionInput;
-		if (!active || active.lane !== lane) return [];
-		if (active.kind === "command") return [active.item];
+		if (!active || active.lane !== lane || active.kind === "command") return [];
 		return active.phase === "preparing" && !active.cancelled ? active.items : [];
 	}
 
@@ -5609,6 +5603,14 @@ export class AgentSession {
 	/** Number of pending messages (includes both steering and follow-up) */
 	get pendingMessageCount(): number {
 		return this._pendingSessionInputs("steer").length + this._pendingSessionInputs("followUp").length;
+	}
+
+	get hasActiveSessionInput(): boolean {
+		return this._activeSessionInput !== undefined;
+	}
+
+	get hasSessionInputWork(): boolean {
+		return this.pendingMessageCount > 0 || this.hasActiveSessionInput;
 	}
 
 	/** Get pending steering messages (read-only) */
@@ -5777,10 +5779,7 @@ export class AgentSession {
 				if (
 					(options.allowStreaming === true && this.isStreaming) ||
 					options.allowPendingQueue === true ||
-					(this.pendingMessageCount === 0 &&
-						this._activeSessionInput === undefined &&
-						!this._pumpingSessionInput &&
-						!this._sessionInputPumpRequested)
+					(!this.hasSessionInputWork && !this._pumpingSessionInput && !this._sessionInputPumpRequested)
 				) {
 					// This is the ownership commit point: no prompt/session state has
 					// been consumed yet, and from here the session owns delivery.
@@ -6713,12 +6712,7 @@ export class AgentSession {
 			return;
 		}
 		// An empty queue is not idle: the pump owns items moved into _activeSessionInput before handoff.
-		if (
-			this.pendingMessageCount > 0 ||
-			this._activeSessionInput !== undefined ||
-			this._pumpingSessionInput ||
-			this._sessionInputPumpRequested
-		) {
+		if (this.hasSessionInputWork || this._pumpingSessionInput || this._sessionInputPumpRequested) {
 			this._scheduleSessionInputPump();
 			await this._sessionInputPump;
 			if (this._postCompactionContinuationScheduled) {

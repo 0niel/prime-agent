@@ -1292,7 +1292,7 @@ export class AgentDaemon {
 			session.isRetrying ||
 			session.isBashRunning ||
 			session.hasAcceptedPromptInFlight ||
-			session.pendingMessageCount > 0;
+			session.hasSessionInputWork;
 		if (!isHeartbeatCronJob(runnableJob) && shouldQueueCronPrompt) {
 			if (!this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)) {
 				return "skipped";
@@ -2345,7 +2345,7 @@ export class AgentDaemon {
 				: session.isRetrying ||
 						session.isBashRunning ||
 						session.hasAcceptedPromptInFlight ||
-						session.pendingMessageCount > 0 ||
+						session.hasSessionInputWork ||
 						session.hasRunningRlmChildren()
 					? "busy"
 					: state.clients.size > 0
@@ -4393,7 +4393,7 @@ export class AgentDaemon {
 			session.isRetrying ||
 			session.isBashRunning ||
 			session.hasAcceptedPromptInFlight ||
-			session.pendingMessageCount > 0;
+			session.hasSessionInputWork;
 		const streamingBehavior =
 			resolveAgentSessionMessageStreamingBehavior(shouldQueue, payload.deliveryMode) ??
 			(payload.deliveryMode === "follow_up" ? "followUp" : "steer");

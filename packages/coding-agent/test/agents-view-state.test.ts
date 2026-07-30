@@ -57,6 +57,9 @@ describe("agents view state", () => {
 	test("classifies active daemon sessions into coarse fleet sections", () => {
 		expect(classifyAgentsViewSession(makeSummary({ isStreaming: true, activity: "working" }))).toBe("running");
 		expect(classifyAgentsViewSession(makeSummary({ pendingMessageCount: 1, activity: "working" }))).toBe("running");
+		expect(classifyAgentsViewSession(makeSummary({ hasActiveSessionInput: true, activity: "working" }))).toBe(
+			"running",
+		);
 		expect(classifyAgentsViewSession(makeSummary({ activity: "working" }))).toBe("running");
 		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 2 }))).toBe("idle");
 		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 0 }))).toBe("idle");

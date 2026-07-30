@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed executing slash commands appearing as queued steering or follow-up messages.
 - Fixed `/tree` overflowing the daemon serializer on very deep sessions by transferring a flat session tree.
 
 - Added starting a new session directly from the agents view with `ctrl+n`.

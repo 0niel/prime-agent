@@ -199,7 +199,9 @@ export function agentStatusChanged(previous: AgentStatus | undefined, next: Agen
 
 function isSessionWorking(state: ActiveSessionState): boolean {
 	const session = state.runtime.session;
-	return session.isStreaming || session.isCompacting || session.pendingMessageCount > 0;
+	return (
+		session.isStreaming || session.isCompacting || session.hasSessionInputWork || session.hasAcceptedPromptInFlight
+	);
 }
 
 /**

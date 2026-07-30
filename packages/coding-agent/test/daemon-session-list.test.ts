@@ -7,6 +7,7 @@ import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon
 import {
 	buildRlmChildSnapshots,
 	buildSessionList,
+	isSessionSummaryBusy,
 	resolveAttachModelFallbackMessage,
 	type SessionSummary,
 	summaryForActiveSession,
@@ -124,6 +125,23 @@ describe("buildSessionList", () => {
 
 		expect(summary.pendingMessageCount).toBe(1);
 		expect(summary.activity).toBe("working");
+	});
+
+	it("marks active session input explicitly while preserving the legacy busy count", () => {
+		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
+		const summary = summaryForActiveSession(
+			makeState({
+				activeSessionId: "active-input",
+				messages: oneMessage,
+				summaryState: { basedOnMessageCount: 1 } as ActiveSessionState["summaryState"],
+				hasActiveSessionInput: true,
+			}),
+		);
+
+		expect(summary.pendingMessageCount).toBe(1);
+		expect(summary.hasActiveSessionInput).toBe(true);
+		expect(summary.activity).toBe("working");
+		expect(isSessionSummaryBusy(summary)).toBe(true);
 	});
 
 	it("marks a finished subagent idle instead of holding it at working", () => {
@@ -551,6 +569,7 @@ interface StateOptions {
 	childRunStatuses?: Record<string, "queued" | "running" | "done" | "error" | "cancelled">;
 	hasRunningRlmChildren?: boolean;
 	hasAcceptedPromptInFlight?: boolean;
+	hasActiveSessionInput?: boolean;
 	contextTokens?: number;
 	streamingMessage?: AgentMessage;
 	metadata?: {
@@ -598,6 +617,10 @@ function makeState(options: StateOptions): ActiveSessionState {
 				getRlmChildRunStatus: (childId: string) => options.childRunStatuses?.[childId],
 				hasRunningRlmChildren: () => options.hasRunningRlmChildren ?? false,
 				hasAcceptedPromptInFlight: options.hasAcceptedPromptInFlight ?? false,
+				hasActiveSessionInput: options.hasActiveSessionInput ?? false,
+				get hasSessionInputWork() {
+					return this.pendingMessageCount > 0 || this.hasActiveSessionInput;
+				},
 				getCurrentRecap: () => undefined,
 				_contextTokensForCurrentMessages: () => options.contextTokens,
 				pendingMessageCount: 0,

@@ -60,6 +60,7 @@ export function classifyAgentsViewSession(summary: SessionSummary): AgentsViewSe
 function isAgentsViewSessionBusy(summary: SessionSummary): boolean {
 	return (
 		summary.isStreaming ||
+		summary.hasActiveSessionInput === true ||
 		summary.isCompacting ||
 		summary.isBashRunning === true ||
 		summary.isRunningTools === true ||
@@ -752,6 +753,9 @@ function getSessionStatusLabel(summary: SessionSummary, hasActiveHeartbeat = sum
 	}
 	if (summary.hasRunningRlmChildren === true) {
 		return "subagents running";
+	}
+	if (summary.hasActiveSessionInput) {
+		return "working";
 	}
 	if (summary.pendingMessageCount > 0) {
 		return `${summary.pendingMessageCount} queued`;

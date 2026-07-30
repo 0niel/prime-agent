@@ -46,6 +46,8 @@ export interface SessionSummary {
 	attachedClients: number;
 	messageCount: number;
 	pendingMessageCount: number;
+	/** True while session input is executing or preparing after leaving the queue. */
+	hasActiveSessionInput?: boolean;
 	streamingMessage?: AgentMessage;
 	created?: string;
 	modified?: string;
@@ -90,6 +92,7 @@ export function resolveAttachModelFallbackMessage(
 export function isSessionSummaryBusy(summary: SessionSummary): boolean {
 	return (
 		summary.isStreaming ||
+		summary.hasActiveSessionInput === true ||
 		summary.isCompacting ||
 		summary.isBashRunning === true ||
 		summary.hasRunningRlmChildren === true ||
@@ -146,7 +149,11 @@ export function buildSessionList(
 }
 
 function effectivePendingMessageCount(session: ActiveSessionState["runtime"]["session"]): number {
-	return session.pendingMessageCount + (session.hasAcceptedPromptInFlight ? 1 : 0);
+	return (
+		session.pendingMessageCount +
+		(session.hasAcceptedPromptInFlight ? 1 : 0) +
+		(session.hasActiveSessionInput ? 1 : 0)
+	);
 }
 
 export function summaryForActiveSession(
@@ -187,6 +194,7 @@ export function summaryForActiveSession(
 		attachedClients: activeSession.clients.size,
 		messageCount: session.messages.length,
 		pendingMessageCount,
+		hasActiveSessionInput: session.hasActiveSessionInput || undefined,
 		streamingMessage: session.state.streamingMessage,
 		created: savedSession?.created.toISOString() ?? session.sessionManager.getHeader?.()?.timestamp,
 		modified,
@@ -314,7 +322,9 @@ function rlmChildSnapshotForActiveSession(
 	const runStatus = metadata.rlmChildId
 		? parent?.runtime.session.getRlmChildRunStatus(metadata.rlmChildId)
 		: undefined;
-	const status = runStatus ?? (session.isStreaming || effectivePendingMessageCount(session) > 0 ? "running" : "done");
+	const status =
+		runStatus ??
+		(session.isStreaming || session.hasSessionInputWork || session.hasAcceptedPromptInFlight ? "running" : "done");
 	return {
 		id: metadata.rlmChildId ?? activeSession.activeSessionId,
 		parentId: parentNodeId,
@@ -372,7 +382,8 @@ export function isActiveSessionBusy(activeSession: ActiveSessionState): boolean 
 		session.isStreaming ||
 		session.isCompacting ||
 		session.isBashRunning ||
-		effectivePendingMessageCount(session) > 0 ||
+		session.hasSessionInputWork ||
+		session.hasAcceptedPromptInFlight ||
 		session.hasRunningRlmChildren()
 	);
 }

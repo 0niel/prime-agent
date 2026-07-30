@@ -158,6 +158,12 @@ describe("AgentSession compaction characterization", () => {
 			persistSession: true,
 		});
 		harnesses.push(harness);
+		const internals = harness.session as unknown as {
+			_scheduleAutoRefineAfterCompaction(willContinueAfterCompaction: boolean): void;
+		};
+		const scheduleAutoRefineSpy = vi
+			.spyOn(internals, "_scheduleAutoRefineAfterCompaction")
+			.mockImplementation(() => {});
 		let releaseTurn: () => void = () => {};
 		const turnGate = new Promise<void>((resolve) => {
 			releaseTurn = resolve;
@@ -182,6 +188,7 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.eventsOfType("compaction_end")).toEqual([
 			expect.objectContaining({ reason: "manual", aborted: false }),
 		]);
+		expect(scheduleAutoRefineSpy).toHaveBeenCalledWith(false);
 	});
 
 	it("reschedules a pending post-compaction continuation after successful manual compaction", async () => {

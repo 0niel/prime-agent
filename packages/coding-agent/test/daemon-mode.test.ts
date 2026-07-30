@@ -1687,6 +1687,7 @@ describe("daemon mode helpers", () => {
 				isRetrying: false,
 				hasAcceptedPromptInFlight: false,
 				pendingMessageCount: 1,
+				hasSessionInputWork: true,
 				messages: [],
 				state: { pendingToolCalls: new Set(), streamingMessage: undefined },
 				hasRunningRlmChildren: () => false,
@@ -1860,6 +1861,7 @@ describe("daemon mode helpers", () => {
 				sessionName: "Target",
 				isStreaming: false,
 				pendingMessageCount: 1,
+				hasSessionInputWork: true,
 				prompt,
 				followUp,
 				queueAgentMessagePrompt,
@@ -1889,6 +1891,57 @@ describe("daemon mode helpers", () => {
 		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
 		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
 		expect(followUp).not.toHaveBeenCalled();
+		expect(prompt).not.toHaveBeenCalled();
+	});
+
+	it("queues agent messages behind active session input that is no longer pending", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const fromState = makeState("source");
+		const targetState = makeState("target");
+		fromState.runtime = {
+			...fromState.runtime,
+			session: { sessionId: "session-source", sessionName: "Source" },
+		} as never;
+		const prompt = vi.fn(async () => {});
+		const queueAgentMessagePrompt = vi.fn(async () => true);
+		targetState.runtime = {
+			...targetState.runtime,
+			cwd: "/tmp",
+			session: {
+				sessionId: "session-target",
+				sessionName: "Target",
+				isStreaming: false,
+				pendingMessageCount: 0,
+				hasSessionInputWork: true,
+				prompt,
+				queueAgentMessagePrompt,
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				fromState?: ActiveSessionState;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(fromState.activeSessionId, fromState);
+		internals.sessions.set(targetState.activeSessionId, targetState);
+
+		await internals.sendAgentSessionMessage({
+			targetSelector: targetState.activeSessionId,
+			message: "queued behind executing command",
+			fromState,
+			origin: "agent",
+		});
+
+		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
 		expect(prompt).not.toHaveBeenCalled();
 	});
 
@@ -4662,6 +4715,11 @@ describe("daemon mode helpers", () => {
 			activity: { pendingMessageCount: 1 },
 			acceptingAgentMessage: false,
 		},
+		{
+			name: "queues generic cron jobs behind active session input",
+			activity: { hasSessionInputWork: true },
+			acceptingAgentMessage: false,
+		},
 	] as const)("$name", async ({ activity, acceptingAgentMessage }) => {
 		const fixture = makeCronAdmissionFixture(activity, { acceptingAgentMessage });
 
@@ -4733,6 +4791,9 @@ describe("daemon mode helpers", () => {
 			isStreaming: false,
 			isBashRunning: false,
 			pendingMessageCount: 0,
+			get hasSessionInputWork() {
+				return this.pendingMessageCount > 0;
+			},
 		};
 		const prompt = vi.fn(async (_message: string, options?: { preflightResult?: (didSucceed: boolean) => void }) => {
 			sessionState.isStreaming = true;
@@ -5795,6 +5856,7 @@ type CronAdmissionActivity = Partial<{
 	isBashRunning: boolean;
 	hasAcceptedPromptInFlight: boolean;
 	pendingMessageCount: number;
+	hasSessionInputWork: boolean;
 }>;
 
 function makeCronAdmissionFixture(
@@ -5834,6 +5896,7 @@ function makeCronAdmissionFixture(
 			isBashRunning: false,
 			hasAcceptedPromptInFlight: false,
 			pendingMessageCount: 0,
+			hasSessionInputWork: (activity.pendingMessageCount ?? 0) > 0,
 			...activity,
 			prompt,
 			promptHeartbeat,
