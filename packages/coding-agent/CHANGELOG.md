@@ -4,6 +4,7 @@
 
 - Added `/new` support for an optional stable session name and initial prompt.
 - Changed collapsed edit and IPython tool calls to show compact per-file line-change summaries while keeping full diffs available when expanded.
+- Changed bare `/effort` to open a selector for the current model's supported reasoning levels.
 - Changed session search to rank exact name and first-message matches before prefix, substring, and stricter transcript fuzzy matches.
 - Fixed daemon startup failing when an interrupted supervisor left an empty ownership directory.
 - Fixed `/effort xhigh` and `/effort max` being rejected as unknown levels when no model was active yet.

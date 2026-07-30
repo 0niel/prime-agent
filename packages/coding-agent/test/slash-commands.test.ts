@@ -28,7 +28,7 @@ describe("built-in slash commands", () => {
 
 	test("exposes /effort for selecting the thinking level", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "effort")).toMatchObject({
-			description: "Set reasoning/thinking level",
+			description: "Select reasoning/thinking level (opens selector UI)",
 			argumentHint: "[level]",
 			aliases: ["thinking"],
 		});
@@ -63,12 +63,9 @@ describe("built-in slash commands", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "goal")).toMatchObject({
 			takesArgument: true,
 		});
-		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "effort")).toMatchObject({
-			takesArgument: true,
-		});
 		expect(builtinSlashCommandTakesArgument("goal")).toBe(true);
-		expect(builtinSlashCommandTakesArgument("effort")).toBe(true);
-		expect(builtinSlashCommandTakesArgument("thinking")).toBe(true);
+		expect(builtinSlashCommandTakesArgument("effort")).toBe(false);
+		expect(builtinSlashCommandTakesArgument("thinking")).toBe(false);
 		expect(builtinSlashCommandTakesArgument("heartbeat")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("mcp")).toBe(true);
 		expect(builtinSlashCommandTakesArgument("new")).toBe(true);

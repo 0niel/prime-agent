@@ -200,6 +200,7 @@ import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SideQuestionComponent } from "./components/side-question.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
+import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
 import {
 	selectLatestToolExpandHint,
 	ToolExecutionComponent,
@@ -7774,7 +7775,7 @@ export class InteractiveMode {
 		}
 		const requested = arg.trim().toLowerCase();
 		if (!requested) {
-			this.showStatus(`Thinking level: ${this.connectionState?.thinkingLevel} (type a level: ${levels.join(", ")})`);
+			this.showThinkingSelector(levels);
 			return;
 		}
 		if (!levels.includes(requested as ThinkingLevel)) {
@@ -7782,6 +7783,29 @@ export class InteractiveMode {
 			return;
 		}
 		this.applyThinkingLevel(requested as ThinkingLevel);
+	}
+
+	private showThinkingSelector(levels: ThinkingLevel[] = this.getAvailableThinkingLevels()): void {
+		const currentLevel = this.connectionState?.thinkingLevel ?? levels[0];
+		if (!currentLevel) {
+			this.showStatus("Current model does not support thinking");
+			return;
+		}
+		this.showSelector((done) => {
+			const selector = new ThinkingSelectorComponent(
+				currentLevel,
+				levels,
+				(level) => {
+					done();
+					this.applyThinkingLevel(level);
+				},
+				() => {
+					done();
+					this.ui.requestRender();
+				},
+			);
+			return { component: selector, focus: selector.getSelectList() };
+		});
 	}
 
 	private applyThinkingLevel(level: ThinkingLevel): void {
