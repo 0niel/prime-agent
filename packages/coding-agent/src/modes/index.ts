@@ -69,6 +69,7 @@ export { resolveAttachModelFallbackMessage } from "./daemon/daemon-session-list.
 export { defaultDaemonSocketPath } from "./daemon/daemon-socket.js";
 export { runDaemonSupervisorMode } from "./daemon/daemon-supervisor.js";
 export {
+	type InteractiveInitialPrompt,
 	InteractiveMode,
 	type InteractiveModeOptions,
 	type InteractiveModeRunResult,

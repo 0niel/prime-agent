@@ -20,10 +20,39 @@ import {
 	markClientSnapshotStreaming,
 	setDaemonClientSessionCapabilities,
 	shouldSendDaemonOutboundToClient,
+	waitForDaemonPromptAdmission,
 } from "../src/modes/daemon/daemon-mode.js";
-import type { DaemonAttachResult, DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
+import {
+	createDaemonCommandEnvelope,
+	type DaemonAttachResult,
+	type DaemonCommand,
+} from "../src/modes/daemon/daemon-protocol.js";
 
 describe("daemon mode helpers", () => {
+	it("preserves envelope client identity while registering prompt admission", () => {
+		const daemon = new AgentDaemon("/tmp/unused-daemon.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const client = makeClient("worker-socket", "active");
+		const parse = Reflect.get(daemon, "parseCommandAndRegisterPromptAdmission").bind(daemon);
+
+		parse(client, JSON.stringify(createDaemonCommandEnvelope({ type: "list" }, "request-1", "public-client")));
+		expect(client.id).toBe("public-client");
+	});
+
+	it("observes supplied work when prompt admission is already aborted", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		const work = Promise.reject(new Error("late claim failure"));
+
+		await expect(waitForDaemonPromptAdmission(work, controller.signal)).rejects.toThrow(
+			"Prompt admission was cancelled.",
+		);
+		// Let the observed work settle; an unhandled rejection would fail Vitest.
+		await Promise.resolve();
+	});
+
 	it("finds only direct child active sessions", () => {
 		const parent = makeState("parent");
 		const child = makeState("child", "parent");
@@ -2275,7 +2304,7 @@ describe("daemon mode helpers", () => {
 		expect(prompt).toHaveBeenCalledOnce();
 	});
 
-	it("queues agent messages while a cron prompt prepares to stream", async () => {
+	it("releases cron preparing state after prompt admission", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -2290,6 +2319,7 @@ describe("daemon mode helpers", () => {
 					resolvePrompt = resolve;
 				}),
 		);
+		const promptUntilAccepted = vi.fn(async () => {});
 		const acceptAgentMessagePrompt = vi.fn(async () => {});
 		const queueAgentMessagePrompt = vi.fn(async (_message: string, _streamingBehavior: "steer" | "followUp") => true);
 		targetState.runtime = {
@@ -2302,6 +2332,7 @@ describe("daemon mode helpers", () => {
 				isBashRunning: false,
 				pendingMessageCount: 0,
 				prompt,
+				promptUntilAccepted,
 				acceptAgentMessagePrompt,
 				queueAgentMessagePrompt,
 			},
@@ -2322,7 +2353,8 @@ describe("daemon mode helpers", () => {
 		);
 		await Promise.resolve();
 		await Promise.resolve();
-		expect(prompt).toHaveBeenCalledOnce();
+		expect(promptUntilAccepted).toHaveBeenCalledOnce();
+		expect(prompt).not.toHaveBeenCalled();
 
 		await internals.sendAgentSessionMessage({
 			targetSelector: targetState.activeSessionId,
@@ -2330,9 +2362,8 @@ describe("daemon mode helpers", () => {
 			origin: "agent",
 		});
 
-		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
-		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
+		expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
+		expect(queueAgentMessagePrompt).not.toHaveBeenCalled();
 		resolvePrompt();
 		await cronRun;
 	});
@@ -4487,407 +4518,128 @@ describe("daemon mode helpers", () => {
 		});
 	});
 
-	it("defers busy heartbeat cron jobs instead of queueing a follow-up", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: {
-				agentDir: "/tmp/prime-agent-test-agent",
-				cwd: "/tmp",
-			},
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const prompt = vi.fn(async () => {});
-		const followUp = vi.fn(async () => true);
-		const state = makeState("active-1") as ActiveSessionState & {
-			runtime: ActiveSessionState["runtime"] & {
-				session: {
-					isStreaming: boolean;
-					isBashRunning: boolean;
-					pendingMessageCount: number;
-					prompt: typeof prompt;
-					followUp: typeof followUp;
-				};
-			};
-		};
-		state.runtime.session = {
-			isStreaming: true,
-			isBashRunning: false,
-			pendingMessageCount: 0,
-			prompt,
-			followUp,
-		} as never;
-		(
-			daemon as unknown as {
-				sessions: Map<string, ActiveSessionState>;
-			}
-		).sessions.set(state.activeSessionId, state);
-		const runCronJob = (
-			daemon as unknown as {
-				runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
-			}
-		).runCronJob.bind(daemon);
+	it.each([
+		{
+			name: "defers busy heartbeat cron jobs instead of queueing a follow-up",
+			activity: { isStreaming: true },
+			jobs: [{ id: "heartbeat-1", source: "heartbeat", deliveryMode: "follow_up" }],
+			acceptingAgentMessage: false,
+			assertQueuedHeartbeatUntouched: false,
+		},
+		{
+			name: "defers separate RLM heartbeat cron jobs while the session is busy",
+			activity: { isStreaming: true },
+			jobs: [
+				{ id: "rlm-1", source: "rlm_heartbeat", deliveryMode: "follow_up" },
+				{ id: "rlm-2", source: "rlm_heartbeat", deliveryMode: "follow_up" },
+			],
+			acceptingAgentMessage: false,
+			assertQueuedHeartbeatUntouched: false,
+		},
+		{
+			name: "does not enqueue another heartbeat when one is already pending",
+			activity: { isStreaming: true, pendingMessageCount: 1 },
+			jobs: [{ id: "heartbeat-1", source: "heartbeat" }],
+			acceptingAgentMessage: false,
+			assertQueuedHeartbeatUntouched: true,
+		},
+		{
+			name: "defers heartbeat cron jobs while the target is accepting an agent message",
+			activity: {},
+			jobs: [{ id: "heartbeat-1", source: "heartbeat" }],
+			acceptingAgentMessage: true,
+			assertQueuedHeartbeatUntouched: false,
+		},
+		{
+			name: "defers heartbeat cron jobs while an accepted agent message prompt is in flight",
+			activity: { hasAcceptedPromptInFlight: true },
+			jobs: [{ id: "heartbeat-1", source: "heartbeat" }],
+			acceptingAgentMessage: false,
+			assertQueuedHeartbeatUntouched: false,
+		},
+	] as const)("$name", async ({ activity, jobs, acceptingAgentMessage, assertQueuedHeartbeatUntouched }) => {
+		const fixture = makeCronAdmissionFixture(activity, { acceptingAgentMessage });
 
-		const result = await runCronJob(
-			makeCronJob({
-				id: "heartbeat-1",
-				source: "heartbeat",
-				activeSessionId: state.activeSessionId,
-				deliveryMode: "follow_up",
-			}),
-		);
+		const results = [];
+		for (const job of jobs) {
+			results.push(await fixture.runCronJob(makeCronJob({ ...job, activeSessionId: fixture.activeSessionId })));
+		}
 
-		expect(result).toBe("skipped");
-		expect(followUp).not.toHaveBeenCalled();
-		expect(prompt).not.toHaveBeenCalled();
+		expect(results).toEqual(jobs.map(() => "skipped"));
+		expect(fixture.prompt).not.toHaveBeenCalled();
+		expect(fixture.promptHeartbeat).not.toHaveBeenCalled();
+		expect(fixture.followUp).not.toHaveBeenCalled();
+		if (assertQueuedHeartbeatUntouched) {
+			expect(fixture.removeQueuedFollowUp).not.toHaveBeenCalled();
+		}
 	});
 
-	it("defers separate RLM heartbeat cron jobs while the session is busy", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: {
-				agentDir: "/tmp/prime-agent-test-agent",
-				cwd: "/tmp",
-			},
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const prompt = vi.fn(async () => {});
-		const followUp = vi.fn(async () => true);
-		const state = makeState("active-1") as ActiveSessionState & {
-			runtime: ActiveSessionState["runtime"] & {
-				session: {
-					isStreaming: boolean;
-					isBashRunning: boolean;
-					pendingMessageCount: number;
-					prompt: typeof prompt;
-					followUp: typeof followUp;
-				};
-			};
-		};
-		state.runtime.session = {
-			isStreaming: true,
-			isBashRunning: false,
-			pendingMessageCount: 0,
-			prompt,
-			followUp,
-		} as never;
-		(
-			daemon as unknown as {
-				sessions: Map<string, ActiveSessionState>;
-			}
-		).sessions.set(state.activeSessionId, state);
-		const runCronJob = (
-			daemon as unknown as {
-				runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
-			}
-		).runCronJob.bind(daemon);
+	it.each([
+		{
+			name: "queues generic cron jobs while the target is accepting an agent message",
+			activity: {},
+			acceptingAgentMessage: true,
+		},
+		{
+			name: "queues generic cron jobs behind accepted agent message prompts",
+			activity: { hasAcceptedPromptInFlight: true },
+			acceptingAgentMessage: false,
+		},
+		{
+			name: "queues generic cron jobs behind pending messages",
+			activity: { pendingMessageCount: 1 },
+			acceptingAgentMessage: false,
+		},
+	] as const)("$name", async ({ activity, acceptingAgentMessage }) => {
+		const fixture = makeCronAdmissionFixture(activity, { acceptingAgentMessage });
 
-		const first = await runCronJob(
-			makeCronJob({
-				id: "rlm-1",
-				source: "rlm_heartbeat",
-				activeSessionId: state.activeSessionId,
-				deliveryMode: "follow_up",
-			}),
-		);
-		const second = await runCronJob(
-			makeCronJob({
-				id: "rlm-2",
-				source: "rlm_heartbeat",
-				activeSessionId: state.activeSessionId,
-				deliveryMode: "follow_up",
-			}),
-		);
+		await fixture.runCronJob(makeCronJob({ id: "cron-1", source: "cron", activeSessionId: fixture.activeSessionId }));
 
-		expect(first).toBe("skipped");
-		expect(second).toBe("skipped");
-		expect(followUp).not.toHaveBeenCalled();
-		expect(prompt).not.toHaveBeenCalled();
+		expect(fixture.followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, { resumeIfIdle: true });
+		expect(fixture.prompt).not.toHaveBeenCalled();
+		expect(fixture.promptHeartbeat).not.toHaveBeenCalled();
 	});
 
-	it("does not enqueue another heartbeat when one is already pending", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const state = makeState("active-1") as ActiveSessionState & {
-			runtime: ActiveSessionState["runtime"] & {
-				session: {
-					isStreaming: boolean;
-					isBashRunning: boolean;
-					pendingMessageCount: number;
-					prompt: ReturnType<typeof vi.fn>;
-					followUp: ReturnType<typeof vi.fn>;
-				};
-			};
-		};
-		const followUp = vi.fn(async () => false);
-		const removeQueuedFollowUp = vi.fn(() => true);
-		state.runtime.session = {
-			isStreaming: true,
-			isBashRunning: false,
-			pendingMessageCount: 1,
-			prompt: vi.fn(),
-			followUp,
-			removeQueuedFollowUp,
-		} as never;
-		(daemon as unknown as { sessions: Map<string, ActiveSessionState> }).sessions.set(state.activeSessionId, state);
-		const result = await (
-			daemon as unknown as { runCronJob(job: AgentCronJob): Promise<"skipped" | undefined> }
-		).runCronJob(makeCronJob({ id: "heartbeat-1", source: "heartbeat", activeSessionId: state.activeSessionId }));
+	it.each([
+		{
+			name: "delivers heartbeats with a steering behavior by default",
+			job: { id: "heartbeat-1", source: "heartbeat" },
+			streamingBehavior: "steer",
+			method: "promptHeartbeat",
+		},
+		{
+			name: "delivers follow-up heartbeats with a followUp behavior and coalescing key",
+			job: { id: "heartbeat-1", source: "heartbeat", deliveryMode: "follow_up" },
+			streamingBehavior: "followUp",
+			method: "promptHeartbeat",
+		},
+		{
+			name: "prompts idle generic cron jobs without a heartbeat coalescing key",
+			job: { id: "cron-1", source: "cron" },
+			streamingBehavior: "followUp",
+			method: "prompt",
+		},
+	] as const)("$name", async ({ job, streamingBehavior, method }) => {
+		const fixture = makeCronAdmissionFixture();
 
-		expect(result).toBe("skipped");
-		expect(followUp).not.toHaveBeenCalled();
-		expect(removeQueuedFollowUp).not.toHaveBeenCalled();
-	});
+		await fixture.runCronJob(makeCronJob({ ...job, activeSessionId: fixture.activeSessionId }));
 
-	it("defers heartbeat cron jobs while the target is accepting an agent message", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const prompt = vi.fn(async () => {});
-		const followUp = vi.fn(async () => true);
-		const state = makeState("active-1") as ActiveSessionState & {
-			runtime: ActiveSessionState["runtime"] & {
-				session: {
-					isStreaming: boolean;
-					isBashRunning: boolean;
-					pendingMessageCount: number;
-					prompt: typeof prompt;
-					followUp: typeof followUp;
-				};
-			};
-		};
-		state.runtime.session = {
-			isStreaming: false,
-			isBashRunning: false,
-			pendingMessageCount: 0,
-			prompt,
-			followUp,
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			agentMessageAcceptingTargets: Set<string>;
-			runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
-		};
-		internals.sessions.set(state.activeSessionId, state);
-		internals.agentMessageAcceptingTargets.add(state.activeSessionId);
-
-		const result = await internals.runCronJob(
-			makeCronJob({ id: "heartbeat-1", source: "heartbeat", activeSessionId: state.activeSessionId }),
-		);
-
-		expect(result).toBe("skipped");
-		expect(prompt).not.toHaveBeenCalled();
-		expect(followUp).not.toHaveBeenCalled();
-	});
-
-	it("queues generic cron jobs while the target is accepting an agent message", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const prompt = vi.fn(async () => {});
-		const followUp = vi.fn(async () => true);
-		const state = makeState("active-1") as ActiveSessionState & {
-			runtime: ActiveSessionState["runtime"] & {
-				session: {
-					isStreaming: boolean;
-					isBashRunning: boolean;
-					pendingMessageCount: number;
-					prompt: typeof prompt;
-					followUp: typeof followUp;
-				};
-			};
-		};
-		state.runtime.session = {
-			isStreaming: false,
-			isBashRunning: false,
-			pendingMessageCount: 0,
-			prompt,
-			followUp,
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			agentMessageAcceptingTargets: Set<string>;
-			runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
-		};
-		internals.sessions.set(state.activeSessionId, state);
-		internals.agentMessageAcceptingTargets.add(state.activeSessionId);
-
-		await internals.runCronJob(makeCronJob({ id: "cron-1", source: "cron", activeSessionId: state.activeSessionId }));
-
-		expect(followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, { resumeIfIdle: true });
-		expect(prompt).not.toHaveBeenCalled();
-	});
-
-	it("defers heartbeat cron jobs while an accepted agent message prompt is in flight", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const prompt = vi.fn(async () => {});
-		const followUp = vi.fn(async () => true);
-		const state = makeState("active-1") as ActiveSessionState & {
-			runtime: ActiveSessionState["runtime"] & {
-				session: {
-					isStreaming: boolean;
-					isBashRunning: boolean;
-					hasAcceptedPromptInFlight: boolean;
-					pendingMessageCount: number;
-					prompt: typeof prompt;
-					followUp: typeof followUp;
-				};
-			};
-		};
-		state.runtime.session = {
-			isStreaming: false,
-			isBashRunning: false,
-			hasAcceptedPromptInFlight: true,
-			pendingMessageCount: 0,
-			prompt,
-			followUp,
-		} as never;
-		(daemon as unknown as { sessions: Map<string, ActiveSessionState> }).sessions.set(state.activeSessionId, state);
-
-		const result = await (
-			daemon as unknown as { runCronJob(job: AgentCronJob): Promise<"skipped" | undefined> }
-		).runCronJob(makeCronJob({ id: "heartbeat-1", source: "heartbeat", activeSessionId: state.activeSessionId }));
-
-		expect(result).toBe("skipped");
-		expect(prompt).not.toHaveBeenCalled();
-		expect(followUp).not.toHaveBeenCalled();
-	});
-
-	it("queues generic cron jobs behind accepted agent message prompts", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const prompt = vi.fn(async () => {});
-		const followUp = vi.fn(async () => true);
-		const state = makeState("active-1") as ActiveSessionState & {
-			runtime: ActiveSessionState["runtime"] & {
-				session: {
-					isStreaming: boolean;
-					hasAcceptedPromptInFlight: boolean;
-					pendingMessageCount: number;
-					prompt: typeof prompt;
-					followUp: typeof followUp;
-				};
-			};
-		};
-		state.runtime.session = {
-			isStreaming: false,
-			hasAcceptedPromptInFlight: true,
-			pendingMessageCount: 0,
-			prompt,
-			followUp,
-		} as never;
-		(daemon as unknown as { sessions: Map<string, ActiveSessionState> }).sessions.set(state.activeSessionId, state);
-
-		await (daemon as unknown as { runCronJob(job: AgentCronJob): Promise<"skipped" | undefined> }).runCronJob(
-			makeCronJob({ id: "cron-1", source: "cron", activeSessionId: state.activeSessionId }),
-		);
-
-		expect(followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, { resumeIfIdle: true });
-		expect(prompt).not.toHaveBeenCalled();
-	});
-
-	it("queues generic cron jobs behind pending messages", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const prompt = vi.fn(async () => {});
-		const followUp = vi.fn(async () => true);
-		const state = makeState("active-1") as ActiveSessionState & {
-			runtime: ActiveSessionState["runtime"] & {
-				session: {
-					isStreaming: boolean;
-					pendingMessageCount: number;
-					prompt: typeof prompt;
-					followUp: typeof followUp;
-				};
-			};
-		};
-		state.runtime.session = { isStreaming: false, pendingMessageCount: 1, prompt, followUp } as never;
-		(daemon as unknown as { sessions: Map<string, ActiveSessionState> }).sessions.set(state.activeSessionId, state);
-
-		await (daemon as unknown as { runCronJob(job: AgentCronJob): Promise<"skipped" | undefined> }).runCronJob(
-			makeCronJob({ id: "cron-1", source: "cron", activeSessionId: state.activeSessionId }),
-		);
-
-		expect(followUp).toHaveBeenCalledWith("heartbeat prompt", undefined, { resumeIfIdle: true });
-		expect(prompt).not.toHaveBeenCalled();
-	});
-
-	it("delivers heartbeats with a steering behavior by default", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const prompt = vi.fn(async () => {});
-		const promptHeartbeat = vi.fn(
-			async (
-				_job: AgentCronJob,
-				_options?: { streamingBehavior?: "steer" | "followUp"; followUpQueueKey?: string },
-			) => {},
-		);
-		const followUp = vi.fn(async () => true);
-		const state = makeState("active-1") as ActiveSessionState & {
-			runtime: ActiveSessionState["runtime"] & {
-				session: {
-					isStreaming: boolean;
-					isBashRunning: boolean;
-					pendingMessageCount: number;
-					prompt: typeof prompt;
-					promptHeartbeat: typeof promptHeartbeat;
-					followUp: typeof followUp;
-				};
-			};
-		};
-		state.runtime.session = {
-			isStreaming: false,
-			isBashRunning: false,
-			pendingMessageCount: 0,
-			prompt,
-			promptHeartbeat,
-			followUp,
-		} as never;
-		(daemon as unknown as { sessions: Map<string, ActiveSessionState> }).sessions.set(state.activeSessionId, state);
-
-		await (daemon as unknown as { runCronJob(job: AgentCronJob): Promise<"skipped" | undefined> }).runCronJob(
-			makeCronJob({ id: "heartbeat-1", source: "heartbeat", activeSessionId: state.activeSessionId }),
-		);
-
-		// The preparing guard adds an internal preflightResult hook.
-		expect(promptHeartbeat).toHaveBeenCalledWith(
-			expect.objectContaining({ id: "heartbeat-1", prompt: "heartbeat prompt" }),
-			expect.objectContaining({
-				streamingBehavior: "steer",
-				source: "rpc",
-			}),
-		);
-		expect(promptHeartbeat.mock.calls[0]?.[1]).toMatchObject({ followUpQueueKey: "heartbeat:heartbeat-1" });
-		expect(prompt).not.toHaveBeenCalled();
-		expect(followUp).not.toHaveBeenCalled();
+		const expectedOptions = expect.objectContaining({ streamingBehavior, source: "rpc" });
+		if (method === "promptHeartbeat") {
+			expect(fixture.promptHeartbeat).toHaveBeenCalledWith(
+				expect.objectContaining({ id: job.id, prompt: "heartbeat prompt" }),
+				expectedOptions,
+			);
+			expect(fixture.promptHeartbeat.mock.calls[0]?.[1]).toMatchObject({
+				followUpQueueKey: `heartbeat:${job.id}`,
+			});
+			expect(fixture.prompt).not.toHaveBeenCalled();
+		} else {
+			expect(fixture.prompt).toHaveBeenCalledWith("heartbeat prompt", expectedOptions);
+			expect(fixture.prompt.mock.calls[0]?.[1]).not.toHaveProperty("followUpQueueKey");
+			expect(fixture.promptHeartbeat).not.toHaveBeenCalled();
+		}
+		expect(fixture.followUp).not.toHaveBeenCalled();
 	});
 
 	it("delivers steer heartbeats after an RPC prompt finishes preflight while its turn is still streaming", async () => {
@@ -4958,111 +4710,425 @@ describe("daemon mode helpers", () => {
 		);
 	});
 
-	it("delivers follow-up heartbeats with a followUp behavior and coalescing key", async () => {
+	it.each(["steer", "follow_up"] as const)(
+		"idle daemon %s inserts into its scheduler lane exactly once",
+		async (type) => {
+			const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const steer = vi.fn(async () => {});
+			const followUp = vi.fn(async () => true);
+			const state = makeState("active-1") as ActiveSessionState & {
+				runtime: ActiveSessionState["runtime"] & {
+					session: { isStreaming: boolean; steer: typeof steer; followUp: typeof followUp };
+				};
+			};
+			state.runtime = { ...state.runtime, session: { isStreaming: false, steer, followUp } } as never;
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				recordWorkerRecoveryState: ReturnType<typeof vi.fn>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+			internals.recordWorkerRecoveryState = vi.fn();
+
+			await expect(
+				internals.handleCommand(makeClient("client-1", state.activeSessionId), {
+					id: "command-1",
+					type,
+					activeSessionId: state.activeSessionId,
+					message: "idle queued turn",
+				}),
+			).resolves.toMatchObject({
+				success: true,
+				command: type,
+				...(type === "follow_up" ? { data: { queued: true } } : {}),
+			});
+			const queue = type === "steer" ? steer : followUp;
+			expect(queue).toHaveBeenCalledOnce();
+			expect(queue).toHaveBeenCalledWith("idle queued turn", undefined, {
+				queueKey: undefined,
+				agentMessageId: undefined,
+				resumeIfIdle: true,
+			});
+			if (type === "follow_up") {
+				expect(internals.recordWorkerRecoveryState).toHaveBeenCalledWith(state, "follow_up_queued", true);
+			}
+		},
+	);
+
+	it("clears prompt admission registered before unauthenticated worker rejection", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+			worker: { authenticationToken: "worker-token" },
+		});
+		const client = makeClient("unauthenticated", "active-1");
+		const end = vi.fn();
+		client.socket = { destroyed: false, write: vi.fn(() => true), end } as unknown as Socket;
+		const internals = daemon as unknown as {
+			promptAdmissions: Map<string, unknown>;
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		await internals.handleLine(
+			client,
+			JSON.stringify({
+				type: "prompt",
+				activeSessionId: "active-1",
+				message: "unauthorized",
+				admissionId: "leaked-admission",
+			}),
+		);
+
+		expect(end).toHaveBeenCalledOnce();
+		expect(internals.promptAdmissions.size).toBe(0);
+	});
+
+	it("clears prompt admission when restart fencing rejects before dispatch", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const client = makeClient("client", "active-1");
+		client.socket = { destroyed: false, write: vi.fn(() => true), end: vi.fn() } as unknown as Socket;
+		const internals = daemon as unknown as {
+			promptAdmissions: Map<string, unknown>;
+			updateRestart: { phase: "fencing" };
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+		internals.updateRestart = { phase: "fencing" };
+
+		await internals.handleLine(
+			client,
+			JSON.stringify({
+				id: "prompt-1",
+				type: "prompt",
+				activeSessionId: "active-1",
+				message: "blocked",
+				admissionId: "retryable-admission",
+			}),
+		);
+
+		expect(internals.promptAdmissions.size).toBe(0);
+	});
+
+	it.each(["success", "late-failure", "replacement"] as const)(
+		"handles cancellation followed by supervisor-claim %s without affecting the wrong socket binding",
+		async (outcome) => {
+			const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+				worker: { authenticationToken: "worker-token" },
+			});
+			const client = makeClient("authenticated", "active-1");
+			client.authenticated = true;
+			const end = vi.fn();
+			client.socket = { destroyed: false, write: vi.fn(() => true), end } as unknown as Socket;
+			const claim = {
+				supervisorGeneration: "generation",
+				supervisorPid: process.pid,
+				supervisorSocketPath: "/tmp/supervisor.sock",
+			};
+			let resolveClaim!: (fingerprint: string) => void;
+			let rejectClaim!: (error: Error) => void;
+			const claimCheck = new Promise<string>((resolve, reject) => {
+				resolveClaim = resolve;
+				rejectClaim = reject;
+			});
+			const internals = daemon as unknown as {
+				promptAdmissions: Map<string, { controller?: AbortController }>;
+				supervisorClaims: Map<DaemonSocketClient, { claim: typeof claim; ownerFingerprint: string }>;
+				assertSupervisorClaimCurrent: ReturnType<typeof vi.fn>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+				handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+			};
+			const originalBinding = { claim, ownerFingerprint: "owner" };
+			internals.supervisorClaims.set(client, originalBinding);
+			internals.assertSupervisorClaimCurrent = vi.fn(() => claimCheck);
+
+			const handling = internals.handleLine(
+				client,
+				JSON.stringify({
+					type: "prompt",
+					activeSessionId: "active-1",
+					message: "cancel during claim check",
+					admissionId: "claim-admission",
+				}),
+			);
+			await vi.waitFor(() => expect(internals.promptAdmissions.size).toBe(1));
+			await internals.handleCommand(client, {
+				type: "cancel_prompt_admission",
+				activeSessionId: "active-1",
+				admissionId: "claim-admission",
+			});
+			await handling;
+
+			expect(internals.promptAdmissions.size).toBe(0);
+			expect(end).not.toHaveBeenCalled();
+			if (outcome === "replacement") {
+				internals.supervisorClaims.set(client, { claim: { ...claim }, ownerFingerprint: "replacement" });
+			}
+			if (outcome === "success") resolveClaim("refreshed");
+			else rejectClaim(new Error("late stale claim"));
+			await Promise.resolve();
+			await Promise.resolve();
+
+			if (outcome === "late-failure") {
+				expect(end).toHaveBeenCalledOnce();
+				expect(internals.supervisorClaims.has(client)).toBe(false);
+			} else {
+				expect(end).not.toHaveBeenCalled();
+			}
+			if (outcome === "success") expect(originalBinding.ownerFingerprint).toBe("owner");
+			if (outcome === "replacement")
+				expect(internals.supervisorClaims.get(client)?.ownerFingerprint).toBe("replacement");
+		},
+	);
+
+	it("cancels only pre-ownership prompt admission and cleans up its controller", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
 		});
-		const prompt = vi.fn(async () => {});
-		const promptHeartbeat = vi.fn(async () => {});
-		const followUp = vi.fn(async () => true);
+		let promptOptions: { signal?: AbortSignal; admissionCommitted?: () => void } | undefined;
+		let rejectPrompt: ((error: Error) => void) | undefined;
+		const promptUntilAccepted = vi.fn(
+			async (_message: string, options?: { signal?: AbortSignal; admissionCommitted?: () => void }) => {
+				promptOptions = options;
+				await new Promise<void>((_resolve, reject) => {
+					rejectPrompt = reject;
+					options?.signal?.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+				});
+			},
+		);
 		const state = makeState("active-1") as ActiveSessionState & {
-			runtime: ActiveSessionState["runtime"] & {
-				session: {
-					isStreaming: boolean;
-					isBashRunning: boolean;
-					pendingMessageCount: number;
-					prompt: typeof prompt;
-					promptHeartbeat: typeof promptHeartbeat;
-					followUp: typeof followUp;
-				};
-			};
+			runtime: ActiveSessionState["runtime"] & { session: { promptUntilAccepted: typeof promptUntilAccepted } };
 		};
-		state.runtime.session = {
-			isStreaming: false,
-			isBashRunning: false,
-			pendingMessageCount: 0,
-			prompt,
-			promptHeartbeat,
-			followUp,
-		} as never;
-		(daemon as unknown as { sessions: Map<string, ActiveSessionState> }).sessions.set(state.activeSessionId, state);
+		state.runtime = { ...state.runtime, session: { promptUntilAccepted } } as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			promptAdmissions: Map<string, unknown>;
+			parseCommandAndRegisterPromptAdmission(client: DaemonSocketClient, line: string): unknown;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		const client = makeClient("client-1", state.activeSessionId);
+		client.socket = { destroyed: false, write: vi.fn(() => true) } as unknown as Socket;
 
-		await (daemon as unknown as { runCronJob(job: AgentCronJob): Promise<"skipped" | undefined> }).runCronJob(
-			makeCronJob({
-				id: "heartbeat-1",
-				source: "heartbeat",
+		internals.parseCommandAndRegisterPromptAdmission(
+			client,
+			JSON.stringify({
+				type: "prompt",
 				activeSessionId: state.activeSessionId,
-				deliveryMode: "follow_up",
+				message: "blocked",
+				admissionId: "admission-1",
 			}),
 		);
+		internals.handleCommand(client, {
+			id: "prompt-1",
+			type: "prompt",
+			activeSessionId: state.activeSessionId,
+			message: "blocked",
+			admissionId: "admission-1",
+		});
+		await vi.waitFor(() => expect(promptUntilAccepted).toHaveBeenCalledOnce());
+		await expect(
+			internals.handleCommand(client, {
+				id: "cancel-1",
+				type: "cancel_prompt_admission",
+				activeSessionId: state.activeSessionId,
+				admissionId: "admission-1",
+			}),
+		).resolves.toMatchObject({ success: true, data: { status: "cancelled" } });
+		await vi.waitFor(() => expect(internals.promptAdmissions.size).toBe(0));
 
-		// The preparing guard adds an internal preflightResult hook.
-		expect(promptHeartbeat).toHaveBeenCalledWith(
-			expect.objectContaining({ id: "heartbeat-1", prompt: "heartbeat prompt" }),
-			expect.objectContaining({
-				streamingBehavior: "followUp",
-				followUpQueueKey: "heartbeat:heartbeat-1",
-				source: "rpc",
+		// Once ownership commits the same cancellation is a no-op.
+		internals.parseCommandAndRegisterPromptAdmission(
+			client,
+			JSON.stringify({
+				type: "prompt",
+				activeSessionId: state.activeSessionId,
+				message: "owned",
+				admissionId: "admission-2",
 			}),
 		);
-		expect(prompt).not.toHaveBeenCalled();
-		expect(followUp).not.toHaveBeenCalled();
+		internals.handleCommand(client, {
+			id: "prompt-2",
+			type: "prompt",
+			activeSessionId: state.activeSessionId,
+			message: "owned",
+			admissionId: "admission-2",
+		});
+		await vi.waitFor(() => expect(promptUntilAccepted).toHaveBeenCalledTimes(2));
+		promptOptions?.admissionCommitted?.();
+		await expect(
+			internals.handleCommand(client, {
+				id: "cancel-2",
+				type: "cancel_prompt_admission",
+				activeSessionId: state.activeSessionId,
+				admissionId: "admission-2",
+			}),
+		).resolves.toMatchObject({ success: true, data: { status: "owned" } });
+		rejectPrompt?.(new Error("test cleanup"));
 	});
 
-	it("prompts idle generic cron jobs without a heartbeat coalescing key", async () => {
+	it("settles cancellation while prompt routing waits on the target lock", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
 				throw new Error("unexpected runtime creation");
 			},
 		});
-		const prompt = vi.fn(
-			async (
-				_message: string,
-				_options?: { streamingBehavior?: "steer" | "followUp"; followUpQueueKey?: string; source?: string },
-			) => {},
-		);
-		const followUp = vi.fn(async () => true);
-		const state = makeState("active-1") as ActiveSessionState & {
-			runtime: ActiveSessionState["runtime"] & {
-				session: {
-					isStreaming: boolean;
-					isBashRunning: boolean;
-					pendingMessageCount: number;
-					prompt: typeof prompt;
-					followUp: typeof followUp;
-				};
-			};
+		const promptUntilAccepted = vi.fn(async () => {});
+		const state = makeState("active-lock") as ActiveSessionState;
+		state.runtime = { ...state.runtime, session: { promptUntilAccepted } } as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			agentMessageTargetLocks: Map<string, Promise<void>>;
+			promptAdmissions: Map<string, unknown>;
+			parseCommandAndRegisterPromptAdmission(client: DaemonSocketClient, line: string): unknown;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
 		};
-		state.runtime.session = {
-			isStreaming: false,
-			isBashRunning: false,
-			pendingMessageCount: 0,
-			prompt,
-			followUp,
-		} as never;
-		(daemon as unknown as { sessions: Map<string, ActiveSessionState> }).sessions.set(state.activeSessionId, state);
-
-		await (daemon as unknown as { runCronJob(job: AgentCronJob): Promise<"skipped" | undefined> }).runCronJob(
-			makeCronJob({ id: "cron-1", source: "cron", activeSessionId: state.activeSessionId }),
-		);
-
-		// The preparing guard adds an internal preflightResult hook.
-		expect(prompt).toHaveBeenCalledWith(
-			"heartbeat prompt",
-			expect.objectContaining({
-				streamingBehavior: "followUp",
-				source: "rpc",
+		internals.sessions.set(state.activeSessionId, state);
+		internals.agentMessageTargetLocks.set(state.activeSessionId, new Promise(() => {}));
+		const client = makeClient("client-lock", state.activeSessionId);
+		client.socket = { destroyed: false, write: vi.fn(() => true) } as unknown as Socket;
+		internals.parseCommandAndRegisterPromptAdmission(
+			client,
+			JSON.stringify({
+				type: "prompt",
+				activeSessionId: state.activeSessionId,
+				message: "blocked",
+				admissionId: "lock-admission",
 			}),
 		);
-		expect(prompt.mock.calls[0]?.[1]).not.toHaveProperty("followUpQueueKey");
-		expect(followUp).not.toHaveBeenCalled();
+		internals.handleCommand(client, {
+			type: "prompt",
+			activeSessionId: state.activeSessionId,
+			message: "blocked",
+			admissionId: "lock-admission",
+		});
+		await expect(
+			internals.handleCommand(client, {
+				type: "cancel_prompt_admission",
+				activeSessionId: state.activeSessionId,
+				admissionId: "lock-admission",
+			}),
+		).resolves.toMatchObject({ data: { status: "cancelled" } });
+		await vi.waitFor(() => expect(internals.promptAdmissions.size).toBe(0));
+		expect(promptUntilAccepted).not.toHaveBeenCalled();
 	});
 
-	it("forwards queue keys when expanded daemon steer commands are queued", async () => {
+	it("aborts waiting prompt admissions when their session closes", () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const internals = daemon as unknown as {
+			promptAdmissions: Map<string, { status: string; controller?: AbortController }>;
+			parseCommandAndRegisterPromptAdmission(client: DaemonSocketClient, line: string): unknown;
+			abortWaitingPromptAdmissionsForSession(activeSessionId: string): void;
+		};
+		const client = makeClient("client-closing", "closing-session");
+		internals.parseCommandAndRegisterPromptAdmission(
+			client,
+			JSON.stringify({
+				type: "prompt",
+				activeSessionId: "closing-session",
+				message: "blocked",
+				admissionId: "closing-admission",
+			}),
+		);
+		const admission = [...internals.promptAdmissions.values()][0]!;
+		internals.abortWaitingPromptAdmissionsForSession("closing-session");
+		expect(admission.status).toBe("cancelled");
+		expect(admission.controller?.signal.aborted).toBe(true);
+	});
+
+	it("uses the queued default lane for old-client prompts on a new daemon", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const promptUntilAccepted = vi.fn(async () => {});
+		const state = makeState("active-1") as ActiveSessionState & {
+			runtime: ActiveSessionState["runtime"] & { session: { promptUntilAccepted: typeof promptUntilAccepted } };
+		};
+		state.runtime = { ...state.runtime, session: { promptUntilAccepted } } as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		const client = makeClient("legacy-client", state.activeSessionId);
+		const write = vi.fn((_data: unknown) => true);
+		client.socket = { destroyed: false, write } as unknown as Socket;
+
+		internals.handleCommand(client, {
+			id: "command-1",
+			type: "prompt",
+			activeSessionId: state.activeSessionId,
+			message: "legacy prompt",
+			streamingBehavior: "followUp",
+		});
+
+		await vi.waitFor(() => expect(write).toHaveBeenCalledOnce());
+		expect(JSON.parse(String(write.mock.calls[0]?.[0]))).toMatchObject({ success: true, command: "prompt" });
+		expect(promptUntilAccepted).toHaveBeenCalledWith(
+			"legacy prompt",
+			expect.objectContaining({ streamingBehavior: "followUp", queueIfBusy: true }),
+		);
+	});
+
+	it("routes resume_queue through the session scheduler", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const resumeQueuedWork = vi.fn(() => true);
+		const continueAgent = vi.fn(async () => {});
+		const state = makeState("active-1") as ActiveSessionState & {
+			runtime: ActiveSessionState["runtime"] & {
+				session: { resumeQueuedWork: typeof resumeQueuedWork; agent: { continue: typeof continueAgent } };
+			};
+		};
+		state.runtime = { ...state.runtime, session: { resumeQueuedWork, agent: { continue: continueAgent } } } as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+
+		await expect(
+			internals.handleCommand(makeClient("client-1", state.activeSessionId), {
+				id: "command-1",
+				type: "resume_queue",
+				activeSessionId: state.activeSessionId,
+			}),
+		).resolves.toMatchObject({ success: true, command: "resume_queue" });
+		expect(resumeQueuedWork).toHaveBeenCalledOnce();
+		expect(continueAgent).not.toHaveBeenCalled();
+	});
+
+	it.each(["steer", "follow_up"] as const)("routes correlated daemon %s commands", async (type) => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -5070,37 +5136,90 @@ describe("daemon mode helpers", () => {
 			},
 		});
 		const steer = vi.fn(async () => {});
+		const followUp = vi.fn(async () => true);
 		const restoreSteeringMessage = vi.fn(async () => {});
+		const restoreFollowUpMessage = vi.fn(async () => true);
 		const state = makeState("active-1") as ActiveSessionState & {
 			runtime: ActiveSessionState["runtime"] & {
 				session: {
 					steer: typeof steer;
+					followUp: typeof followUp;
 					restoreSteeringMessage: typeof restoreSteeringMessage;
+					restoreFollowUpMessage: typeof restoreFollowUpMessage;
 				};
 			};
 		};
-		state.runtime.session = { steer, restoreSteeringMessage } as never;
+		state.runtime.session = { steer, followUp, restoreSteeringMessage, restoreFollowUpMessage } as never;
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
 			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
 		};
 		internals.sessions.set(state.activeSessionId, state);
+		const client = makeClient("client-1", state.activeSessionId);
+		const base = { type, activeSessionId: state.activeSessionId } as const;
 
-		await internals.handleCommand(makeClient("client-1", state.activeSessionId), {
-			id: "command-1",
-			type: "steer",
-			activeSessionId: state.activeSessionId,
-			message: "queued heartbeat",
-			queueKey: "heartbeat:job-1",
-			agentMessageId: "agentmsg_steer",
+		await internals.handleCommand(client, {
+			...base,
+			message: "expanded prompt",
+			queueKey: "heartbeat:expanded",
+			agentMessageId: `agentmsg_expanded_${type}`,
 		});
-
-		expect(steer).toHaveBeenCalledWith("queued heartbeat", undefined, {
-			queueKey: "heartbeat:job-1",
-			agentMessageId: "agentmsg_steer",
+		const queue = type === "steer" ? steer : followUp;
+		expect(queue).toHaveBeenCalledWith("expanded prompt", undefined, {
+			queueKey: "heartbeat:expanded",
+			agentMessageId: `agentmsg_expanded_${type}`,
 			resumeIfIdle: true,
 		});
-		expect(restoreSteeringMessage).not.toHaveBeenCalled();
+
+		const replayFields = {
+			content: [{ type: "text" as const, text: "restored content" }],
+			customMessage: {
+				role: "custom" as const,
+				customType: "restored",
+				content: "restored custom message",
+				display: false,
+				timestamp: 1,
+			},
+			prefixMessages: [
+				{
+					role: "custom" as const,
+					customType: "restored-prefix",
+					content: "restored prefix",
+					display: false,
+					timestamp: 1,
+				},
+			],
+		};
+		for (const expandPromptTemplates of [undefined, true]) {
+			await expect(
+				internals.handleCommand(client, {
+					...base,
+					message: "invalid replay",
+					expandPromptTemplates,
+					...replayFields,
+				}),
+			).rejects.toThrow("require expandPromptTemplates=false");
+		}
+
+		await internals.handleCommand(client, {
+			...base,
+			message: "restored prompt",
+			queueKey: "heartbeat:job-1",
+			agentMessageId: `agentmsg_${type}`,
+			expandPromptTemplates: false,
+			...replayFields,
+		});
+		const restore = type === "steer" ? restoreSteeringMessage : restoreFollowUpMessage;
+		expect(restore).toHaveBeenCalledWith("restored prompt", undefined, {
+			queueKey: "heartbeat:job-1",
+			agentMessageId: `agentmsg_${type}`,
+			...replayFields,
+		});
+		expect(queue).toHaveBeenCalledOnce();
+
+		await expect(
+			internals.handleCommand(client, { ...base, message: "invalid", agentMessageId: "" }),
+		).rejects.toThrow("agentMessageId must not be empty");
 	});
 
 	it("rejects invalid heartbeat delivery modes before persisting", async () => {
@@ -5596,6 +5715,79 @@ describe("daemon mode helpers", () => {
 		).rejects.toThrow("Unknown active session: missing");
 	});
 });
+
+type CronAdmissionActivity = Partial<{
+	isStreaming: boolean;
+	isCompacting: boolean;
+	isRetrying: boolean;
+	isBashRunning: boolean;
+	hasAcceptedPromptInFlight: boolean;
+	pendingMessageCount: number;
+}>;
+
+function makeCronAdmissionFixture(
+	activity: CronAdmissionActivity = {},
+	options: { acceptingAgentMessage?: boolean } = {},
+) {
+	const activeSessionId = "active-1";
+	const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+		defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+		createRuntime: async () => {
+			throw new Error("unexpected runtime creation");
+		},
+	});
+	const prompt = vi.fn(
+		async (
+			_message: string,
+			_options?: { streamingBehavior?: "steer" | "followUp"; followUpQueueKey?: string; source?: string },
+		) => {},
+	);
+	const promptHeartbeat = vi.fn(
+		async (
+			_job: AgentCronJob,
+			_options?: { streamingBehavior?: "steer" | "followUp"; followUpQueueKey?: string; source?: string },
+		) => {},
+	);
+	const followUp = vi.fn(async () => true);
+	const removeQueuedFollowUp = vi.fn(() => true);
+	const state = makeState(activeSessionId) as ActiveSessionState & {
+		runtime: ActiveSessionState["runtime"] & { session: Record<string, unknown> };
+	};
+	state.runtime = {
+		...state.runtime,
+		session: {
+			isStreaming: false,
+			isCompacting: false,
+			isRetrying: false,
+			isBashRunning: false,
+			hasAcceptedPromptInFlight: false,
+			pendingMessageCount: 0,
+			...activity,
+			prompt,
+			promptHeartbeat,
+			followUp,
+			removeQueuedFollowUp,
+		},
+	} as never;
+	const internals = daemon as unknown as {
+		sessions: Map<string, ActiveSessionState>;
+		agentMessageAcceptingTargets: Set<string>;
+		runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
+	};
+	internals.sessions.set(activeSessionId, state);
+	if (options.acceptingAgentMessage) {
+		internals.agentMessageAcceptingTargets.add(activeSessionId);
+	}
+
+	return {
+		activeSessionId,
+		prompt,
+		promptHeartbeat,
+		followUp,
+		removeQueuedFollowUp,
+		runCronJob: internals.runCronJob.bind(daemon),
+	};
+}
 
 function makeCronJob(input: {
 	id: string;

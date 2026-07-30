@@ -317,6 +317,8 @@ async function runLoop(
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = await pollMessagesUnlessAborted(config.getSteeringMessages, signal);
 
+	const shouldStopBeforeTurn = (): boolean => !firstTurn && (config.shouldStopBeforeTurn?.() ?? false);
+
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
 		throwIfAborted(signal);
@@ -396,7 +398,7 @@ async function runLoop(
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
-			if (shouldStopResult.value) {
+			if (shouldStopResult.value || shouldStopBeforeTurn()) {
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
@@ -410,9 +412,15 @@ async function runLoop(
 				return;
 			}
 			pendingMessages = steeringMessagesResult.value;
+			// Steering drained by this poll owns the turn boundary; stop only when it was empty.
+			if (pendingMessages.length === 0 && shouldStopBeforeTurn()) {
+				await emit({ type: "agent_end", messages: newMessages });
+				return;
+			}
 		}
 
 		// Agent would stop here. Check for follow-up messages.
+		if (shouldStopBeforeTurn()) break;
 		const followUpMessagesResult = await settlePostTurn(
 			pollMessagesUnlessAborted(config.getFollowUpMessages, signal),
 			signal,
@@ -428,6 +436,7 @@ async function runLoop(
 			continue;
 		}
 
+		if (shouldStopBeforeTurn()) break;
 		const continuationMessagesResult = lastTurn
 			? await settlePostTurn(
 					maybePromiseWithAbort(config.getContinuationMessages?.(lastTurn, signal) ?? [], signal),

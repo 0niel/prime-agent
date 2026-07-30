@@ -43,7 +43,11 @@ import {
 } from "./config.js";
 import { parseAgentSessionMessagePromptId } from "./core/agent-messages.js";
 import type { AgentSessionRuntimeMetadata } from "./core/agent-session-runtime.js";
-import type { CustomMessage } from "./core/messages.js";
+import {
+	type CustomMessage,
+	isSessionSlashCommandMessage,
+	SESSION_SLASH_COMMAND_CUSTOM_TYPE,
+} from "./core/messages.js";
 import { DefaultPackageManager } from "./core/package-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { DaemonClient, type DaemonHello } from "./modes/daemon/daemon-client.js";
@@ -622,11 +626,17 @@ function parseDaemonUpdateRestartQueuedMessage(value: unknown): DaemonUpdateRest
 			: isCustomMessage(value.customMessage)
 				? value.customMessage
 				: undefined;
-	if (value.customMessage !== undefined && !customMessage) {
+	if (
+		value.customMessage !== undefined &&
+		(!customMessage ||
+			(customMessage.customType === SESSION_SLASH_COMMAND_CUSTOM_TYPE &&
+				(!isSessionSlashCommandMessage(customMessage) || message !== customMessage.details.command.text)))
+	) {
 		throw new Error("Daemon update restart response contains an invalid custom queued message");
 	}
-	const agentMessageId =
-		readOptionalString(value.agentMessageId, "queue.agentMessageId") ?? parseAgentSessionMessagePromptId(message);
+	const restoredAgentMessageId = readOptionalString(value.agentMessageId, "queue.agentMessageId");
+	if (restoredAgentMessageId === "") throw new Error("queue.agentMessageId must not be empty");
+	const agentMessageId = restoredAgentMessageId ?? parseAgentSessionMessagePromptId(message);
 	return {
 		message,
 		...(content ? { content } : {}),

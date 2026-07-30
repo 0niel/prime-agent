@@ -1,20 +1,28 @@
 import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
+import { CommandRecoveryJournal } from "../src/modes/daemon/command-recovery-journal.js";
+import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
+import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
-import type { DaemonAttachResult } from "../src/modes/daemon/daemon-protocol.js";
+import { createDaemonCommandEnvelope, type DaemonAttachResult, success } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
+	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
 	type DaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
+import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
 import type { PrivateFrame } from "../src/modes/session-worker/private-framing.js";
+import { createDeferred } from "./suite/scheduling.js";
 
 const workerLaunchTestState = vi.hoisted(() => ({
 	capture: false,
@@ -283,6 +291,214 @@ describe("daemon worker supervisor monitoring", () => {
 		} else {
 			process.env[supervisorRegistryDirEnv] = previousSupervisorRegistryDir;
 		}
+	});
+
+	it("schedules recovery when the sole supervisor fails a fence check", async () => {
+		const previousSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = "/tmp/supervisor.sock";
+		try {
+			const daemon = new AgentDaemon("/tmp/worker.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+				worker: { authenticationToken: "token" },
+			});
+			const socket = Object.assign(new EventEmitter(), {
+				destroyed: false,
+				write: vi.fn(() => true),
+				end: vi.fn(function (this: EventEmitter) {
+					this.emit("close");
+				}),
+			}) as unknown as Socket;
+			const internals = daemon as unknown as {
+				clients: Set<DaemonSocketClient>;
+				supervisorClaims: Map<DaemonSocketClient, object>;
+				handleConnection(socket: Socket): void;
+				checkSupervisorFences(): Promise<void>;
+				assertSupervisorClaimCurrent: ReturnType<typeof vi.fn>;
+				scheduleSupervisorAvailabilityCheck: ReturnType<typeof vi.fn>;
+			};
+			internals.handleConnection(socket);
+			const client = [...internals.clients][0]!;
+			client.authenticated = true;
+			internals.supervisorClaims.set(client, {
+				claim: {},
+				ownerFingerprint: "old",
+			});
+			internals.assertSupervisorClaimCurrent = vi.fn(async () => {
+				throw new Error("stale fence");
+			});
+			internals.scheduleSupervisorAvailabilityCheck = vi.fn();
+
+			await internals.checkSupervisorFences();
+
+			expect(internals.supervisorClaims.has(client)).toBe(false);
+			expect(client.authenticated).toBe(true);
+			expect(internals.scheduleSupervisorAvailabilityCheck).toHaveBeenCalledOnce();
+			expect(internals.scheduleSupervisorAvailabilityCheck).toHaveBeenCalledWith("/tmp/supervisor.sock", 100);
+		} finally {
+			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
+		}
+	});
+
+	it("does not revoke a newer same-client claim when an older periodic fence fails", async () => {
+		const assertionReached = createDeferred<void>();
+		const assertionGate = createDeferred<void>();
+		const client = {
+			authenticated: true,
+			socket: { destroyed: false, end: vi.fn() },
+		} as unknown as DaemonSocketClient;
+		const oldClaim = { claim: {}, ownerFingerprint: "old" };
+		const newerClaim = { claim: {}, ownerFingerprint: "new" };
+		const transaction = {
+			id: Symbol("update-restart"),
+			owner: client,
+			abort: new AbortController(),
+			phase: "prepared",
+		};
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			options: { worker: { authenticationToken: "token" } },
+			supervisorClaims: new Map([[client, oldClaim]]),
+			updateRestart: transaction,
+			shuttingDown: false,
+			scheduleSupervisorFenceCheck: vi.fn(),
+			assertSupervisorClaimCurrent: vi.fn(async () => {
+				assertionReached.resolve();
+				await assertionGate.promise;
+				throw new Error("stale fence");
+			}),
+		}) as unknown as {
+			supervisorClaims: Map<DaemonSocketClient, object>;
+			updateRestart: object;
+			checkSupervisorFences(): Promise<void>;
+		};
+
+		const check = daemon.checkSupervisorFences();
+		await assertionReached.promise;
+		daemon.supervisorClaims.set(client, newerClaim);
+		assertionGate.resolve();
+		await check;
+
+		expect(daemon.supervisorClaims.get(client)).toBe(newerClaim);
+		expect(daemon.updateRestart).toBe(transaction);
+		expect(client.socket.end).not.toHaveBeenCalled();
+	});
+
+	it("does not revoke a newer same-client claim when an older command fence fails", async () => {
+		const assertionReached = createDeferred<void>();
+		const assertionGate = createDeferred<void>();
+		const client = {
+			id: "supervisor",
+			authenticated: true,
+			socket: { destroyed: false, write: vi.fn(() => true), end: vi.fn() },
+			attachedActiveSessionIds: new Set(),
+			detachInput: vi.fn(),
+			supportsExtensionUi: false,
+			capabilities: new Set(),
+		} as unknown as DaemonSocketClient;
+		const oldClaim = { claim: {}, ownerFingerprint: "old" };
+		const newerClaim = { claim: {}, ownerFingerprint: "new" };
+		const transaction = {
+			id: Symbol("update-restart"),
+			owner: client,
+			abort: new AbortController(),
+			phase: "prepared",
+		};
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			options: { worker: { authenticationToken: "token" } },
+			supervisorClaims: new Map([[client, oldClaim]]),
+			updateRestart: transaction,
+			handleWorkerCommand: vi.fn(async () => undefined),
+			assertSupervisorClaimCurrent: vi.fn(async () => {
+				assertionReached.resolve();
+				await assertionGate.promise;
+				throw new Error("stale fence");
+			}),
+		}) as unknown as {
+			supervisorClaims: Map<DaemonSocketClient, object>;
+			updateRestart: object;
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		const command = daemon.handleLine(
+			client,
+			JSON.stringify({ type: "worker_subscribe", activeSessionId: "active-1" }),
+		);
+		await assertionReached.promise;
+		daemon.supervisorClaims.set(client, newerClaim);
+		assertionGate.resolve();
+		await command;
+
+		expect(daemon.supervisorClaims.get(client)).toBe(newerClaim);
+		expect(daemon.updateRestart).toBe(transaction);
+		expect(client.socket.end).not.toHaveBeenCalled();
+	});
+
+	it("revokes an old supervisor before ending its socket when a replacement authenticates", async () => {
+		let markOldAssertionReached = () => {};
+		const oldAssertionReached = new Promise<void>((resolve) => {
+			markOldAssertionReached = resolve;
+		});
+		let releaseOldAssertion = () => {};
+		const oldAssertionGate = new Promise<void>((resolve) => {
+			releaseOldAssertion = resolve;
+		});
+		let assertionCount = 0;
+		const handleWorkerCommand = vi.fn(async () => undefined);
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			options: { worker: { authenticationToken: "token" } },
+			supervisorClaims: new Map(),
+			shuttingDown: false,
+			clearSupervisorAvailabilityCheck: vi.fn(),
+			scheduleSupervisorFenceCheck: vi.fn(),
+			handleWorkerCommand,
+			assertSupervisorClaimCurrent: vi.fn(async () => {
+				assertionCount++;
+				if (assertionCount === 2) {
+					markOldAssertionReached();
+					await oldAssertionGate;
+				}
+				return `fingerprint-${assertionCount}`;
+			}),
+		}) as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+		const makeClient = () =>
+			({
+				id: "supervisor",
+				authenticated: false,
+				socket: { destroyed: false, write: vi.fn(() => true), end: vi.fn() },
+				attachedActiveSessionIds: new Set(),
+				detachInput: vi.fn(),
+				supportsExtensionUi: false,
+				capabilities: new Set(),
+			}) as unknown as DaemonSocketClient;
+		const auth = (generation: string) =>
+			JSON.stringify({
+				type: "worker_auth",
+				token: "token",
+				supervisorGeneration: generation,
+				supervisorPid: 123,
+				supervisorSocketPath: "/tmp/supervisor.sock",
+			});
+		const oldClient = makeClient();
+		const replacementClient = makeClient();
+
+		await daemon.handleLine(oldClient, auth("old"));
+		const staleCommand = daemon.handleLine(
+			oldClient,
+			JSON.stringify({ type: "worker_subscribe", activeSessionId: "active-1" }),
+		);
+		await oldAssertionReached;
+		await daemon.handleLine(replacementClient, auth("replacement"));
+
+		expect(oldClient.authenticated).toBe(true);
+		expect(oldClient.socket.end).toHaveBeenCalledOnce();
+		releaseOldAssertion();
+		await staleCommand;
+		expect(handleWorkerCommand).not.toHaveBeenCalled();
 	});
 
 	it.each([
@@ -1551,5 +1767,216 @@ describe("daemon worker supervisor monitoring", () => {
 			kill.mockRestore();
 			rmSync(root, { recursive: true, force: true });
 		}
+	});
+	it.each([
+		{ name: "malformed data", data: undefined, error: /invalid update manifest/ },
+		{ name: "missing root disposition", data: { createdAt: "now", sessions: [] }, error: /root disposition/ },
+	])("cancels a prepare acknowledgement with $name", async ({ data, error }) => {
+		const client = {
+			requestWorker: vi.fn(async ({ type }: { type: string }) =>
+				type === "worker_prepare_update" ? { success: true, data } : { success: true },
+			),
+			close: vi.fn(),
+		};
+		const worker = {
+			descriptor: { workerId: "worker", lifecycle: "ready", rootActiveSessionId: "root" },
+			client,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([["worker", worker]]),
+		}) as { prepareUpdateRestartFenced(): Promise<unknown> };
+		await expect(supervisor.prepareUpdateRestartFenced()).rejects.toThrow(error);
+		expect(client.requestWorker).toHaveBeenCalledWith({ type: "worker_cancel_update" }, 5000);
+	});
+
+	it("accepts an explicitly discarded empty root", async () => {
+		const client = {
+			requestWorker: vi.fn(async ({ type }: { type: string }) =>
+				type === "worker_prepare_update"
+					? { success: true, data: { createdAt: "now", sessions: [], discardedActiveSessionIds: ["root"] } }
+					: { success: true },
+			),
+		};
+		const worker = {
+			descriptor: { workerId: "worker", lifecycle: "ready", rootActiveSessionId: "root" },
+			client,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([["worker", worker]]),
+			validateAndPersistUpdateManifest: vi.fn(),
+			stopWorker: vi.fn(async () => undefined),
+		}) as { prepareUpdateRestartFenced(): Promise<{ discardedActiveSessionIds?: string[] }> };
+		await expect(supervisor.prepareUpdateRestartFenced()).resolves.toMatchObject({
+			discardedActiveSessionIds: ["root"],
+		});
+	});
+
+	it("replays completed journaled mutations during restart preparation without taking a mutation lease", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-command-replay-"));
+		const commandJournal = new CommandRecoveryJournal(join(root, "commands.jsonl"));
+		const response = success("command-1", "kill");
+		commandJournal.begin("client-1", "command-1", "kill");
+		commandJournal.recordResult("client-1", "command-1", response);
+		const writes: string[] = [];
+		const client = {
+			id: "socket-client",
+			socket: {
+				destroyed: false,
+				write: vi.fn((chunk: string) => {
+					writes.push(chunk);
+					return true;
+				}),
+			},
+		} as unknown as DaemonSocketClient;
+		const mutationDrain = { begin: vi.fn(), end: vi.fn() };
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			ready: Promise.resolve(),
+			workers: new Map(),
+			protocolClientIds: new WeakMap(),
+			commandJournal,
+			mutationDrain,
+			updateRestartPhase: "fencing",
+			assertCurrentOwnership: vi.fn(async () => undefined),
+			cancelOwnedWorkerCleanup: vi.fn(),
+			handleCommand: vi.fn(async () => {
+				throw new Error("completed command was dispatched again");
+			}),
+		}) as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		try {
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(
+					createDaemonCommandEnvelope({ type: "kill", activeSessionId: "session-1" }, "command-1", "client-1"),
+				),
+			);
+			expect(writes).toEqual([`${JSON.stringify(response)}\n`]);
+			expect(mutationDrain.begin).not.toHaveBeenCalled();
+			expect(mutationDrain.end).not.toHaveBeenCalled();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects genuinely new mutations during restart preparation without journaling or leasing them", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-command-reject-"));
+		const commandJournal = new CommandRecoveryJournal(join(root, "commands.jsonl"));
+		const writes: string[] = [];
+		const client = {
+			id: "socket-client",
+			socket: {
+				destroyed: false,
+				write: vi.fn((chunk: string) => {
+					writes.push(chunk);
+					return true;
+				}),
+			},
+		} as unknown as DaemonSocketClient;
+		const mutationDrain = { begin: vi.fn(), end: vi.fn() };
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			ready: Promise.resolve(),
+			workers: new Map(),
+			protocolClientIds: new WeakMap(),
+			commandJournal,
+			mutationDrain,
+			updateRestartPhase: "fencing",
+			assertCurrentOwnership: vi.fn(async () => undefined),
+			cancelOwnedWorkerCleanup: vi.fn(),
+		}) as unknown as {
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		try {
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(
+					createDaemonCommandEnvelope({ type: "kill", activeSessionId: "session-1" }, "command-2", "client-1"),
+				),
+			);
+			expect(writes.join(" ")).toContain("Daemon is preparing an update restart");
+			expect(commandJournal.lookup("client-1", "command-2")).toBeUndefined();
+			expect(mutationDrain.begin).not.toHaveBeenCalled();
+			expect(mutationDrain.end).not.toHaveBeenCalled();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fences and drains a mutation admitted at the first drain boundary before worker prepare", async () => {
+		const mutationDrain = new MutationDrainLatch();
+		const firstDrain = createDeferred();
+		const originalWaitForDrain = mutationDrain.waitForDrain.bind(mutationDrain);
+		vi.spyOn(mutationDrain, "waitForDrain").mockImplementationOnce(async (...args) => {
+			await originalWaitForDrain(...args);
+			mutationDrain.begin();
+			firstDrain.resolve();
+		});
+		mutationDrain.begin(); // The prepare command itself remains in flight at the supervisor boundary.
+		const prepareFenced = vi.fn(async () => ({ createdAt: "now", sessions: [] }));
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			mutationDrain,
+			workers: new Map(),
+			prepareUpdateRestartFenced: prepareFenced,
+		}) as {
+			updateRestartPhase?: "draining" | "fencing" | "prepared";
+			prepareUpdateRestart(): Promise<unknown>;
+		};
+
+		const prepare = supervisor.prepareUpdateRestart();
+		await firstDrain.promise;
+		await Promise.resolve();
+
+		expect(supervisor.updateRestartPhase).toBe("fencing");
+		expect(prepareFenced).not.toHaveBeenCalled();
+
+		mutationDrain.end();
+		await prepare;
+		expect(prepareFenced).toHaveBeenCalledOnce();
+		mutationDrain.end();
+	});
+
+	it("limits abort admission to mutation drain", async () => {
+		const root = mkdtempSync(`/tmp/prime-update-drain-${process.pid}-`);
+		const socketPath = join(root, "supervisor.sock");
+		const supervisor = new DaemonSupervisor(socketPath, {
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir: join(root, "workers"),
+		});
+		const client = new DaemonClient(socketPath);
+		vi.spyOn(DaemonCatalogClient.prototype, "start").mockResolvedValue();
+		try {
+			await supervisor.start();
+			await client.connect();
+			const prepare = client.request({ type: "prepare_update_restart" });
+			expect(await client.request({ type: "abort", activeSessionId: "missing" })).not.toMatchObject({
+				error: "Daemon is preparing an update restart",
+			});
+			await prepare;
+			await expect(client.request({ type: "abort", activeSessionId: "missing" })).resolves.toMatchObject({
+				error: "Daemon is preparing an update restart",
+			});
+		} finally {
+			client.close();
+			await Reflect.apply(Reflect.get(supervisor, "cleanupSupervisorResources"), supervisor, []);
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects update prepare when a resident worker is recovering or disconnected", async () => {
+		const requestWorker = vi.fn();
+		const worker = {
+			descriptor: { workerId: "resident-1", lifecycle: "recovering" },
+			client: undefined,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([["resident-1", worker]]),
+		}) as {
+			prepareUpdateRestartFenced(): Promise<unknown>;
+		};
+
+		await expect(supervisor.prepareUpdateRestartFenced()).rejects.toThrow(/resident-1.*recovering.*disconnected/);
+		expect(requestWorker).not.toHaveBeenCalled();
 	});
 });

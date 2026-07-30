@@ -459,6 +459,25 @@ describe("AgentSession goals", () => {
 		});
 	});
 
+	it("normalizes queued goal context text and images", async () => {
+		const harness = await createGoalHarness();
+		const image = { type: "image" as const, data: "image-data", mimeType: "image/png" };
+		let preparedText: string | undefined;
+		let preparedImages: unknown;
+		harness.setResponses([fauxAssistantMessage("goal handled")]);
+		vi.spyOn(harness.session.extensionRunner, "emitBeforeAgentStart").mockImplementationOnce(async (text, images) => {
+			preparedText = text;
+			preparedImages = images;
+			return undefined;
+		});
+
+		await harness.session.prompt("/goal inspect the image", { images: [image] });
+
+		expect(preparedText).toContain("<goal_context>");
+		expect(preparedText).not.toContain("[object Object]");
+		expect(preparedImages).toEqual([image]);
+	});
+
 	it("keeps active goals sticky across normal user prompts", async () => {
 		const waiting = createWaitingTool();
 		const harness = await createGoalHarness([waiting.tool]);
@@ -625,7 +644,9 @@ describe("AgentSession goals", () => {
 
 		await harness.session.prompt("/goal clear");
 
-		expect(harness.session.messages).toEqual([]);
+		expect(
+			harness.session.messages.map((message) => (message.role === "custom" ? message.customType : message.role)),
+		).toEqual(["session_slash_command", "session_slash_command_result"]);
 		expect(harness.eventsOfType("goal_update").at(-1)?.goal.status).toBe("idle");
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
@@ -634,13 +655,17 @@ describe("AgentSession goals", () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 
-		await expect(harness.session.prompt("/goal do task")).rejects.toThrow();
+		await harness.session.prompt("/goal do task");
 
 		expect(harness.session.goalState).toMatchObject({
 			active: false,
 			status: "idle",
 		});
-		expect(harness.session.messages).toEqual([]);
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "custom",
+			customType: "session_slash_command_result",
+			details: { success: false },
+		});
 	});
 
 	it("completes a goal whose completing turn crosses the budget without a stale budget-limit steer", async () => {
@@ -714,11 +739,13 @@ describe("AgentSession goals", () => {
 
 		const promptPromise = harness.session.prompt("/goal --budget 10 do work");
 		try {
-			await waitForCondition(() => harness.getPendingResponseCount() === 1);
+			await waitForCondition(() => harness.session.goalState.status === "budget_limited");
 		} finally {
 			releaseMessageEnd?.();
 		}
 		await promptPromise;
+		await harness.session.waitForIdle();
+		await vi.waitFor(() => expect(visibleAssistantTexts(harness)).toHaveLength(2));
 
 		expect(visibleAssistantTexts(harness)).toEqual(["Spent the budget.", "Wrapping up."]);
 		expect(harness.getPendingResponseCount()).toBe(1);
@@ -737,7 +764,12 @@ describe("AgentSession goals", () => {
 			harnesses.push(harness);
 			harness.setResponses([fauxAssistantMessage("unused")]);
 
-			await expect(harness.session.prompt(command)).rejects.toThrow("Goal token budget must be a positive integer.");
+			await harness.session.prompt(command);
+			expect(harness.session.messages.at(-1)).toMatchObject({
+				role: "custom",
+				customType: "session_slash_command_result",
+				details: { success: false, error: "Goal token budget must be a positive integer." },
+			});
 
 			expect(harness.session.goalState).toMatchObject({
 				active: false,
@@ -834,7 +866,9 @@ describe("AgentSession goals", () => {
 
 		await harness.session.prompt("/goal status");
 
-		expect(harness.session.messages).toEqual([]);
+		expect(
+			harness.session.messages.map((message) => (message.role === "custom" ? message.customType : message.role)),
+		).toEqual(["session_slash_command", "session_slash_command_result"]);
 		expect(harness.eventsOfType("goal_update").at(-1)?.goal.status).toBe("idle");
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});

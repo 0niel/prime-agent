@@ -130,6 +130,7 @@ import {
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_SCHEMA_ID,
+	DAEMON_SCHEMA_REVISION,
 	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
 	type DaemonAttachResult,
 	type DaemonClientCapability,
@@ -145,7 +146,9 @@ import {
 	failure,
 	isDaemonCommandEnvelope,
 	isDaemonDialogExtensionUiRequest,
+	isDaemonMutatingCommand,
 	success,
+	UPDATE_RESTART_DRAIN_COMMANDS,
 } from "./daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
 import {
@@ -176,6 +179,7 @@ import {
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
+import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import {
 	createSnapshotTranscriptChunks,
 	SNAPSHOT_TARGET_CHUNK_BYTES,
@@ -199,6 +203,7 @@ export { defaultDaemonSocketPath } from "./daemon-socket.js";
 
 const structuredLog = getLogger("coding-agent.daemon");
 const WORKER_SNAPSHOT_TERMINAL_DRAIN_TIMEOUT_MS = 1_000;
+const UPDATE_RESTART_PREPARE_TIMEOUT_MS = 90_000;
 
 const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"ack_result",
@@ -210,6 +215,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"kill",
 	"rename",
 	"prompt",
+	"cancel_prompt_admission",
 	"prompt_and_wait",
 	"steer",
 	"follow_up",
@@ -322,6 +328,43 @@ function delay(ms: number): Promise<void> {
 	return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
 
+class DaemonPromptAdmissionCancelledError extends Error {
+	constructor() {
+		super("Prompt admission was cancelled.");
+		this.name = "DaemonPromptAdmissionCancelledError";
+	}
+}
+
+export function waitForDaemonPromptAdmission<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return promise;
+	if (signal.aborted) {
+		// The caller supplied already-running work. Observe its eventual rejection
+		// even though admission cancellation wins immediately.
+		void promise.catch(() => {});
+		return Promise.reject(new DaemonPromptAdmissionCancelledError());
+	}
+	return new Promise<T>((resolve, reject) => {
+		const cleanup = () => signal.removeEventListener("abort", onAbort);
+		const onAbort = () => {
+			cleanup();
+			reject(new DaemonPromptAdmissionCancelledError());
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		// Close the registration-to-check race before observing the awaited work.
+		if (signal.aborted) return onAbort();
+		promise.then(
+			(value) => {
+				cleanup();
+				resolve(value);
+			},
+			(error: unknown) => {
+				cleanup();
+				reject(error);
+			},
+		);
+	});
+}
+
 type RuntimeOpenGuard = () => boolean | Promise<boolean>;
 type SupervisorGenerationClaim = Omit<Extract<DaemonWorkerCommand, { type: "worker_auth" }>, "id" | "type" | "token">;
 
@@ -364,8 +407,21 @@ export async function runDaemonMode(options: DaemonModeOptions): Promise<never> 
 export class AgentDaemon {
 	private server?: Server;
 	private shuttingDown = false;
-	private updateRestartPreparing = false;
-	private preparedUpdateRestartManifest?: DaemonUpdateRestartManifest;
+	private readonly updateRestartQueuePauses = new Map<string, { release(): void }>();
+	private readonly mutationDrain = new MutationDrainLatch();
+	private updateRestart?: {
+		id: symbol;
+		owner?: DaemonSocketClient;
+		abort: AbortController;
+		deadline?: ReturnType<typeof setTimeout>;
+		phase: "preparing" | "fencing" | "prepared" | "publishing";
+		manifest?: DaemonUpdateRestartManifest;
+		deferredClientEnv: Array<{
+			client: DaemonSocketClient;
+			state: ActiveSessionState;
+			env: Record<string, string>;
+		}>;
+	};
 	private ownsSocketPath = false;
 	private socketIdentity?: DaemonSocketIdentity;
 	private readonly clients = new Set<DaemonSocketClient>();
@@ -379,6 +435,16 @@ export class AgentDaemon {
 	private readonly sideQuestionRuns = new Map<
 		string,
 		{ run: SideQuestionRun; client: DaemonSocketClient; activeSessionId: string }
+	>();
+	/** Live prompt admissions, keyed by session and caller-generated admission id. */
+	private readonly promptAdmissions = new Map<
+		string,
+		{
+			activeSessionId: string;
+			admissionId: string;
+			controller?: AbortController;
+			status: "waiting" | "owned" | "cancelled";
+		}
 	>();
 	private readonly signalCleanupHandlers: Array<() => void> = [];
 	private readonly cronStore: AgentCronJobStore;
@@ -436,6 +502,10 @@ export class AgentDaemon {
 		}
 		this.cronScheduler = new AgentCronScheduler(this.cronStore, {
 			runJob: (job) => this.runCronJob(job),
+			beginDispatch: () => {
+				this.mutationDrain.begin();
+				return () => this.mutationDrain.end();
+			},
 			onError: (job, error) => {
 				this.log(`Cron job ${job.id} failed: ${error instanceof Error ? error.message : String(error)}`);
 			},
@@ -564,6 +634,15 @@ export class AgentDaemon {
 		return this.supervisorClaims.size > 0;
 	}
 
+	private revokeSupervisorClaim(client: DaemonSocketClient, expected?: BoundSupervisorGenerationClaim): boolean {
+		if (expected && this.supervisorClaims.get(client) !== expected) return false;
+		if (!this.supervisorClaims.delete(client)) return false;
+		if (this.options.worker && this.updateRestart?.owner === client) {
+			this.cancelPreparedUpdateRestart(this.updateRestart.id);
+		}
+		return true;
+	}
+
 	private clearSupervisorAvailabilityCheck(): void {
 		if (this.supervisorMonitorTimer) {
 			clearTimeout(this.supervisorMonitorTimer);
@@ -593,7 +672,7 @@ export class AgentDaemon {
 					boundClaim.ownerFingerprint,
 				);
 			} catch {
-				client.socket.end();
+				if (this.revokeSupervisorClaim(client, boundClaim)) client.socket.end();
 			}
 		}
 		this.scheduleSupervisorFenceCheck();
@@ -1173,9 +1252,6 @@ export class AgentDaemon {
 	}
 
 	private async runCronJob(job: AgentCronJob): Promise<"skipped" | undefined> {
-		if (this.updateRestartPreparing) {
-			return "skipped";
-		}
 		const requirePersistedJob = this.cronStore.list().some((candidate) => candidate.id === job.id);
 		const dueJob = requirePersistedJob ? this.getRunnableCronJob(job.id) : job;
 		if (!dueJob) {
@@ -1183,12 +1259,7 @@ export class AgentDaemon {
 		}
 		const state = await this.getOrCreateCronJobSession(dueJob, requirePersistedJob);
 		const runnableJob = requirePersistedJob ? this.getRunnableCronJob(job.id) : dueJob;
-		if (
-			!state ||
-			!runnableJob ||
-			this.updateRestartPreparing ||
-			!this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)
-		) {
+		if (!state || !runnableJob || !this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)) {
 			return "skipped";
 		}
 		const session = state.runtime.session;
@@ -1243,6 +1314,7 @@ export class AgentDaemon {
 				source: "rpc",
 			},
 			canPrompt,
+			false,
 		);
 		return didPrompt ? undefined : "skipped";
 	}
@@ -1260,25 +1332,29 @@ export class AgentDaemon {
 		message: string,
 		options?: PromptOptions,
 		canPrompt?: () => boolean,
+		waitForCompletion = true,
 	): Promise<boolean> {
 		return this.withAgentMessagePreparingGuard(
 			state,
 			(session, clearPreparing) => {
 				const prompt =
-					options?.agentMessageId === undefined
-						? session.prompt.bind(session)
-						: session.acceptAgentMessagePrompt.bind(session);
+					options?.agentMessageId !== undefined && options.expandPromptTemplates === false
+						? session.acceptAgentMessagePrompt.bind(session)
+						: waitForCompletion
+							? (session.promptAndWait ?? session.prompt).bind(session)
+							: (session.promptUntilAccepted ?? session.prompt).bind(session);
 				return prompt(message, {
 					...options,
-					preflightResult: (didSucceed) => {
+					preflightResult: (didSucceed, queued) => {
 						if (didSucceed && session.isStreaming) {
 							clearPreparing();
 						}
-						options?.preflightResult?.(didSucceed);
+						options?.preflightResult?.(didSucceed, queued);
 					},
 				});
 			},
 			canPrompt,
+			options?.signal,
 		);
 	}
 
@@ -1319,6 +1395,7 @@ export class AgentDaemon {
 		state: ActiveSessionState,
 		run: (session: AgentSession, clearPreparing: () => void) => Promise<void>,
 		canRun?: () => boolean,
+		signal?: AbortSignal,
 	): Promise<boolean> {
 		const activeSessionId = state.activeSessionId;
 		this.agentMessagePreparingTargets.set(
@@ -1339,7 +1416,12 @@ export class AgentDaemon {
 			}
 		};
 		try {
-			await this.agentMessageTargetLocks.get(activeSessionId)?.catch(() => undefined);
+			const targetLock = this.agentMessageTargetLocks.get(activeSessionId);
+			if (targetLock)
+				await waitForDaemonPromptAdmission(
+					targetLock.catch(() => undefined),
+					signal,
+				);
 			if (this.sessions.get(activeSessionId) !== state || this.closingSessions.has(activeSessionId)) {
 				throw new Error("Target session is closing before prompt delivery");
 			}
@@ -1589,9 +1671,6 @@ export class AgentDaemon {
 		job: AgentCronJob,
 		requirePersistedJob: boolean,
 	): Promise<ActiveSessionState | undefined> {
-		if (this.updateRestartPreparing) {
-			return undefined;
-		}
 		const dueJob = requirePersistedJob ? this.getRunnableCronJob(job.id) : job;
 		if (!dueJob) {
 			return undefined;
@@ -2296,6 +2375,7 @@ export class AgentDaemon {
 			socketPath: this.socketPath,
 			protocol: DAEMON_PROTOCOL_INFO,
 			schemaId: DAEMON_SCHEMA_ID,
+			schemaRevision: DAEMON_SCHEMA_REVISION,
 			appVersion: VERSION,
 			runtime: getDaemonRuntimeIdentity(),
 			clientId: client.id,
@@ -2345,9 +2425,10 @@ export class AgentDaemon {
 			this.detachClient(client);
 			client.detachInput();
 			this.clients.delete(client);
-			this.supervisorClaims.delete(client);
+			const wasAuthenticated = client.authenticated === true;
+			this.revokeSupervisorClaim(client);
 			const supervisorSocketPath = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
-			if (this.options.worker && client.authenticated === true && supervisorSocketPath) {
+			if (this.options.worker && wasAuthenticated && supervisorSocketPath) {
 				this.scheduleSupervisorAvailabilityCheck(supervisorSocketPath, 100);
 			}
 		};
@@ -2363,13 +2444,49 @@ export class AgentDaemon {
 		});
 	}
 
+	private promptAdmissionKey(activeSessionId: string, admissionId: string): string {
+		return `${activeSessionId}\0${admissionId}`;
+	}
+
+	/**
+	 * Parse and synchronously register prompt admission before returning a promise.
+	 * This method is intentionally non-async: handleLine invokes it before its first await.
+	 */
+	private parseCommandAndRegisterPromptAdmission(client: DaemonSocketClient, line: string): unknown {
+		const wireValue = JSON.parse(line) as unknown;
+		if (isDaemonCommandEnvelope(wireValue) && wireValue.clientId) client.id = wireValue.clientId;
+		const parsed = (isDaemonCommandEnvelope(wireValue) ? { ...wireValue.command, id: wireValue.id } : wireValue) as {
+			type?: unknown;
+			activeSessionId?: unknown;
+			admissionId?: unknown;
+		};
+		if (parsed.type === "prompt" || parsed.type === "prompt_and_wait") {
+			if (parsed.admissionId !== undefined) {
+				if (typeof parsed.activeSessionId !== "string" || typeof parsed.admissionId !== "string") {
+					throw new Error("Prompt admission requires string activeSessionId and admissionId");
+				}
+				if (parsed.admissionId === "") throw new Error("admissionId must not be empty");
+				const key = this.promptAdmissionKey(parsed.activeSessionId, parsed.admissionId);
+				if (this.promptAdmissions.has(key)) {
+					throw new Error(`Prompt admission id is already in use: ${parsed.admissionId}`);
+				}
+				this.promptAdmissions.set(key, {
+					activeSessionId: parsed.activeSessionId,
+					admissionId: parsed.admissionId,
+					controller: new AbortController(),
+					status: "waiting",
+				});
+			}
+		}
+		return parsed;
+	}
+
 	private async handleLine(client: DaemonSocketClient, line: string): Promise<void> {
 		let command: DaemonCommand;
+		let clearParsedAdmission = () => {};
+		let promptHandlerOwnsAdmission = false;
 		try {
-			const wireValue = JSON.parse(line) as unknown;
-			const parsed = (
-				isDaemonCommandEnvelope(wireValue) ? { ...wireValue.command, id: wireValue.id } : wireValue
-			) as {
+			const parsed = this.parseCommandAndRegisterPromptAdmission(client, line) as {
 				id?: unknown;
 				type?: unknown;
 				token?: unknown;
@@ -2378,13 +2495,28 @@ export class AgentDaemon {
 				supervisorProcessStartId?: unknown;
 				supervisorSocketPath?: unknown;
 				activeSessionId?: unknown;
+				admissionId?: unknown;
 				capabilities?: unknown;
 				supportsExtensionUi?: unknown;
 				job?: unknown;
 			};
-			if (isDaemonCommandEnvelope(wireValue) && wireValue.clientId) {
-				client.id = wireValue.clientId;
-			}
+			const parsedAdmission =
+				(parsed.type === "prompt" || parsed.type === "prompt_and_wait") &&
+				typeof parsed.activeSessionId === "string" &&
+				typeof (parsed as { admissionId?: unknown }).admissionId === "string"
+					? this.promptAdmissions.get(
+							this.promptAdmissionKey(parsed.activeSessionId, (parsed as { admissionId: string }).admissionId),
+						)
+					: undefined;
+			clearParsedAdmission = () => {
+				if (!parsedAdmission) return;
+				const key = this.promptAdmissionKey(parsedAdmission.activeSessionId, parsedAdmission.admissionId);
+				if (this.promptAdmissions.get(key) === parsedAdmission) {
+					this.promptAdmissions.delete(key);
+				}
+			};
+			// Envelope client identity is irrelevant to worker-local prompt admission.
+			// Public supervisor authentication has already bound this socket's identity.
 			if (this.options.worker && client.authenticated !== true) {
 				const commandId = typeof parsed.id === "string" ? parsed.id : undefined;
 				if (
@@ -2396,6 +2528,7 @@ export class AgentDaemon {
 					(parsed.supervisorProcessStartId !== undefined && typeof parsed.supervisorProcessStartId !== "string") ||
 					typeof parsed.supervisorSocketPath !== "string"
 				) {
+					clearParsedAdmission();
 					this.write(client, failure(commandId, "worker_auth", "Worker authentication failed"));
 					client.socket.end();
 					return;
@@ -2418,6 +2551,7 @@ export class AgentDaemon {
 				}
 				for (const previous of this.supervisorClaims.keys()) {
 					if (previous !== client) {
+						this.revokeSupervisorClaim(previous);
 						previous.socket.end();
 					}
 				}
@@ -2431,6 +2565,7 @@ export class AgentDaemon {
 			if (this.options.worker) {
 				const boundClaim = this.supervisorClaims.get(client);
 				if (!boundClaim) {
+					clearParsedAdmission();
 					this.write(
 						client,
 						failure(
@@ -2442,28 +2577,69 @@ export class AgentDaemon {
 					client.socket.end();
 					return;
 				}
+				const claimCheck = this.assertSupervisorClaimCurrent(boundClaim.claim, boundClaim.ownerFingerprint);
+				// Observe the already-running fence check even if admission cancellation
+				// wins the command wait below.
+				void claimCheck.catch(() => {});
 				try {
-					boundClaim.ownerFingerprint = await this.assertSupervisorClaimCurrent(
-						boundClaim.claim,
-						boundClaim.ownerFingerprint,
+					const ownerFingerprint = await waitForDaemonPromptAdmission(
+						claimCheck,
+						parsedAdmission?.controller?.signal,
 					);
-				} catch {
+					if (this.supervisorClaims.get(client) !== boundClaim || client.socket.destroyed) {
+						clearParsedAdmission();
+						return;
+					}
+					boundClaim.ownerFingerprint = ownerFingerprint;
+				} catch (error) {
+					const admissionCancelled = error instanceof DaemonPromptAdmissionCancelledError;
+					if (admissionCancelled) {
+						// The fence check remains authoritative after cancellation. Its rejection
+						// revokes only the exact binding that initiated it; replacements survive.
+						void claimCheck.catch(() => {
+							if (this.revokeSupervisorClaim(client, boundClaim)) client.socket.end();
+						});
+					}
+					clearParsedAdmission();
+					if (this.supervisorClaims.get(client) !== boundClaim || client.socket.destroyed) return;
 					this.write(
 						client,
 						failure(
 							typeof parsed.id === "string" ? parsed.id : undefined,
 							typeof parsed.type === "string" ? parsed.type : "worker_auth",
-							"supervisor_generation_stale",
+							admissionCancelled ? error : "supervisor_generation_stale",
 						),
 					);
-					client.socket.end();
+					// Cancelling this prompt only abandons its admission wait. A genuine
+					// stale supervisor claim fences only the binding that it checked.
+					if (!admissionCancelled && this.revokeSupervisorClaim(client, boundClaim)) {
+						client.socket.end();
+					}
 					return;
 				}
 			}
 			if (this.options.worker && typeof parsed.type === "string" && parsed.type.startsWith("worker_")) {
-				await this.handleWorkerCommand(client, parsed as DaemonWorkerCommand);
+				const workerCommand = parsed as DaemonWorkerCommand;
+				const updateLifecycle =
+					workerCommand.type === "worker_prepare_update" ||
+					workerCommand.type === "worker_commit_update" ||
+					workerCommand.type === "worker_cancel_update";
+				if (this.updateRestart && !updateLifecycle) {
+					this.write(
+						client,
+						failure(workerCommand.id, workerCommand.type, "Daemon is preparing an update restart"),
+					);
+					return;
+				}
+				if (!updateLifecycle) this.mutationDrain.begin();
+				try {
+					await this.handleWorkerCommand(client, workerCommand);
+				} finally {
+					if (!updateLifecycle) this.mutationDrain.end();
+				}
 				return;
 			}
+
 			if (typeof parsed.type !== "string" || !DAEMON_COMMAND_TYPES.has(parsed.type)) {
 				const commandName = typeof parsed.type === "string" ? parsed.type : "unknown";
 				const commandId = typeof parsed.id === "string" ? parsed.id : undefined;
@@ -2476,8 +2652,25 @@ export class AgentDaemon {
 			return;
 		}
 
+		const mutation = command.type !== "prepare_update_restart" && isDaemonMutatingCommand(command);
+		const restartPhase = this.updateRestart?.phase;
+		// Mirror the supervisor's drain/fence split: abort-style commands stay
+		// admitted only while mutations drain; once the checkpoint is being
+		// captured they could race the snapshot and are rejected too.
+		const restartRejected =
+			restartPhase === "preparing"
+				? !UPDATE_RESTART_DRAIN_COMMANDS.has(command.type)
+				: restartPhase !== undefined && command.type !== "shutdown";
+		if (mutation && restartRejected) {
+			clearParsedAdmission();
+			this.write(client, failure(command.id, command.type, "Daemon is preparing an update restart"));
+			return;
+		}
+		if (mutation) this.mutationDrain.begin();
 		try {
-			const response = await this.handleCommand(client, command);
+			const response = await this.handleCommand(client, command, () => {
+				promptHandlerOwnsAdmission = true;
+			});
 			if (response) {
 				this.write(client, response);
 			}
@@ -2489,7 +2682,20 @@ export class AgentDaemon {
 				`daemon command "${command.type}" failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
 			);
 			this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
+		} finally {
+			if (!promptHandlerOwnsAdmission) clearParsedAdmission();
+			if (mutation) this.mutationDrain.end();
 		}
+	}
+
+	private writeWorkerSuccess(client: DaemonSocketClient, command: DaemonWorkerCommand, data?: unknown): void {
+		this.write(client, {
+			id: command.id,
+			type: "response",
+			command: command.type,
+			success: true,
+			...(data !== undefined ? { data } : {}),
+		});
 	}
 
 	private async handleWorkerCommand(client: DaemonSocketClient, command: DaemonWorkerCommand): Promise<void> {
@@ -2521,23 +2727,13 @@ export class AgentDaemon {
 					for (const peer of command.peers) {
 						this.remoteAgentPeers.set(peer.activeSessionId, peer);
 					}
-					this.write(client, {
-						id: command.id,
-						type: "response",
-						command: command.type,
-						success: true,
-					});
+					this.writeWorkerSuccess(client, command);
 					return;
 				case "worker_archive_and_shutdown": {
 					for (const state of [...this.sessions.values()]) {
 						await this.closeSession(state, "killed");
 					}
-					this.write(client, {
-						id: command.id,
-						type: "response",
-						command: command.type,
-						success: true,
-					});
+					this.writeWorkerSuccess(client, command);
 					setImmediate(() => void this.shutdown(0));
 					return;
 				}
@@ -2550,46 +2746,54 @@ export class AgentDaemon {
 						deliveryMode: command.deliveryMode,
 						origin: "agent",
 					});
-					this.write(client, {
-						id: command.id,
-						type: "response",
-						command: command.type,
-						success: true,
-						data: receipt,
-					});
+					this.writeWorkerSuccess(client, command, receipt);
 					return;
 				}
 				case "worker_prepare_update": {
-					const manifest = this.prepareUpdateRestartCheckpoint();
-					this.write(client, {
-						id: command.id,
-						type: "response",
-						command: command.type,
-						success: true,
-						data: manifest,
-					});
+					const transaction = this.beginUpdateRestartTransaction(client);
+					const manifest = await this.runUpdateRestartPreparation(transaction);
+					this.writeWorkerSuccess(client, command, manifest);
 					return;
 				}
 				case "worker_commit_update": {
-					const manifest = await this.commitPreparedUpdateRestart();
-					this.write(client, {
-						id: command.id,
-						type: "response",
-						command: command.type,
-						success: true,
-						data: manifest,
-					});
+					const transaction = this.updateRestart;
+					if (!transaction || transaction.phase === "preparing" || transaction.phase === "fencing") {
+						throw new Error("Daemon has no prepared update checkpoint");
+					}
+					if (transaction.phase === "publishing") {
+						throw new Error("Daemon update checkpoint is already committing");
+					}
+					if (transaction.owner !== client)
+						throw new Error("Daemon update checkpoint belongs to another supervisor");
+					if (transaction.deadline) clearTimeout(transaction.deadline);
+					transaction.deadline = undefined;
+					transaction.phase = "publishing";
+					let manifest: DaemonUpdateRestartManifest;
+					try {
+						manifest = await this.commitPreparedUpdateRestart(transaction.id);
+					} catch (error) {
+						if (this.updateRestart === transaction) transaction.phase = "prepared";
+						if (transaction.abort.signal.aborted) this.cancelPreparedUpdateRestart(transaction.id);
+						throw error;
+					}
+					this.writeWorkerSuccess(client, command, manifest);
+					if (!this.supervisorClaims.has(client)) {
+						setImmediate(() => void this.shutdown(0));
+					}
 					return;
 				}
-				case "worker_cancel_update":
-					this.cancelPreparedUpdateRestart();
-					this.write(client, {
-						id: command.id,
-						type: "response",
-						command: command.type,
-						success: true,
-					});
+				case "worker_cancel_update": {
+					const transaction = this.updateRestart;
+					if (transaction && transaction.owner !== client) {
+						throw new Error("Daemon update checkpoint belongs to another supervisor");
+					}
+					if (transaction?.phase === "publishing") {
+						throw new Error("Daemon update checkpoint is already committing");
+					}
+					if (transaction) this.cancelPreparedUpdateRestart(transaction.id);
+					this.writeWorkerSuccess(client, command);
 					return;
+				}
 			}
 		} catch (error) {
 			this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
@@ -2599,9 +2803,23 @@ export class AgentDaemon {
 	private async handleCommand(
 		client: DaemonSocketClient,
 		command: DaemonCommand,
+		onPromptHandlerOwnsAdmission: () => void = () => {},
 	): Promise<DaemonResponse | undefined> {
-		if (this.updateRestartPreparing && command.type !== "shutdown" && command.type !== "ack_result") {
-			throw new Error("Daemon is preparing an update restart");
+		if ("agentMessageId" in command && command.agentMessageId === "") {
+			throw new Error("agentMessageId must not be empty");
+		}
+		if ("admissionId" in command && command.admissionId === "") {
+			throw new Error("admissionId must not be empty");
+		}
+		if ((command.type === "steer" || command.type === "follow_up") && command.expandPromptTemplates !== false) {
+			const replayFields = (["content", "customMessage", "prefixMessages"] as const).filter(
+				(field) => command[field] !== undefined,
+			);
+			if (replayFields.length > 0) {
+				throw new Error(
+					`${command.type} replay fields (${replayFields.join(", ")}) require expandPromptTemplates=false`,
+				);
+			}
 		}
 		switch (command.type) {
 			case "ack_result":
@@ -2694,7 +2912,12 @@ export class AgentDaemon {
 				const streamsSnapshot =
 					client.transport === "private-framed" &&
 					daemonClientCapabilitiesForSession(client, state.activeSessionId).has("chunked_snapshot");
-				this.adoptClientEnv(state, filterClientEnv(command.env));
+				// Attach is admitted during update-restart preparation as a read. Env
+				// adoption remains safe while mutations are only draining; after fencing,
+				// defer it until rollback so the checkpoint never omits a live identity.
+				const clientEnv = filterClientEnv(command.env);
+				const deferClientEnv = this.updateRestart && this.updateRestart.phase !== "preparing";
+				if (!deferClientEnv) this.adoptClientEnv(state, clientEnv);
 				const snapshotSignal = streamsSnapshot
 					? markClientSnapshotStreaming(client, state.activeSessionId)
 					: undefined;
@@ -2711,6 +2934,9 @@ export class AgentDaemon {
 						finishClientSnapshotStreaming(client, state.activeSessionId);
 					}
 					throw error;
+				}
+				if (deferClientEnv && clientEnv) {
+					this.updateRestart?.deferredClientEnv.push({ client, state, env: clientEnv });
 				}
 				if (streamsSnapshot) {
 					const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
@@ -2827,34 +3053,109 @@ export class AgentDaemon {
 				return success(command.id, "delete_saved_session", result);
 			}
 
-			case "prompt": {
-				const state = this.getBoundSessionState(command.activeSessionId);
-				let responseSent = false;
-				const sendSuccessResponse = () => {
-					if (responseSent) {
-						return;
+			case "cancel_prompt_admission": {
+				const admission = this.promptAdmissions.get(
+					this.promptAdmissionKey(command.activeSessionId, command.admissionId),
+				);
+				if (!admission) {
+					return success(command.id, command.type, { status: "unknown" as const });
+				}
+				if (admission.status === "owned") {
+					return success(command.id, command.type, { status: "owned" as const });
+				}
+				if (admission.status === "waiting") {
+					admission.status = "cancelled";
+					admission.controller?.abort();
+				}
+				return success(command.id, command.type, { status: "cancelled" as const });
+			}
+
+			case "prompt":
+			case "prompt_and_wait": {
+				onPromptHandlerOwnsAdmission();
+				const admissionKey = command.admissionId
+					? this.promptAdmissionKey(command.activeSessionId, command.admissionId)
+					: undefined;
+				const admission = admissionKey ? this.promptAdmissions.get(admissionKey) : undefined;
+				if (command.admissionId && !admission) {
+					throw new Error("Prompt admission was not registered during command parsing");
+				}
+				const clearAdmission = () => {
+					if (admissionKey && this.promptAdmissions.get(admissionKey) === admission) {
+						this.promptAdmissions.delete(admissionKey);
 					}
-					responseSent = true;
-					this.write(client, success(command.id, "prompt"));
 				};
-				void this.promptWithAgentMessagePreparingGuard(state, command.message, {
+				const commitAdmission = () => {
+					if (admission?.status === "waiting") admission.status = "owned";
+				};
+				let state: ActiveSessionState;
+				try {
+					if (admission?.status === "cancelled") throw new Error("Prompt admission was cancelled.");
+					state = this.getBoundSessionState(command.activeSessionId);
+				} catch (error) {
+					clearAdmission();
+					throw error;
+				}
+				const options: PromptOptions = {
 					content: command.content,
 					images: command.images,
 					streamingBehavior: command.streamingBehavior,
+					queueIfBusy: command.queueIfBusy ?? command.streamingBehavior !== undefined,
+					resumeIfIdle: command.streamingBehavior !== undefined,
 					expandPromptTemplates: command.expandPromptTemplates,
-					agentMessageId: command.agentMessageId,
-					customMessage: command.customMessage,
 					skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
 					source: command.source,
-					preflightResult: (didSucceed) => {
-						if (didSucceed) {
-							this.recordWorkerRecoveryState(state, "prompt_accepted", true);
+					...(admission?.controller
+						? { signal: admission.controller.signal, admissionCommitted: commitAdmission }
+						: {}),
+				};
+				if (command.type === "prompt_and_wait") {
+					try {
+						await this.promptWithAgentMessagePreparingGuard(state, command.message, {
+							...options,
+							preflightResult: (didSucceed) => {
+								if (didSucceed) this.recordWorkerRecoveryState(state, "prompt_accepted", true);
+							},
+						});
+						return success(command.id, command.type);
+					} finally {
+						clearAdmission();
+					}
+				}
+
+				let responseSent = false;
+				let preflightRejected = false;
+				const sendSuccessResponse = () => {
+					if (responseSent) return;
+					responseSent = true;
+					this.write(client, success(command.id, "prompt"));
+				};
+				void this.promptWithAgentMessagePreparingGuard(
+					state,
+					command.message,
+					{
+						...options,
+						agentMessageId: command.agentMessageId,
+						customMessage: command.customMessage,
+						preflightResult: (didSucceed) => {
+							if (didSucceed) {
+								this.recordWorkerRecoveryState(state, "prompt_accepted", true);
+								sendSuccessResponse();
+							} else {
+								preflightRejected = true;
+							}
+						},
+					},
+					undefined,
+					false,
+				)
+					.then(() => {
+						if (preflightRejected) {
+							const error = new Error("Prompt was not accepted by the session.");
+							this.write(client, failure(command.id, "prompt", error, serializeDaemonError(error)));
+						} else {
 							sendSuccessResponse();
 						}
-					},
-				})
-					.then(() => {
-						sendSuccessResponse();
 					})
 					.catch((error) => {
 						if (responseSent) {
@@ -2862,26 +3163,9 @@ export class AgentDaemon {
 						} else {
 							this.write(client, failure(command.id, "prompt", error, serializeDaemonError(error)));
 						}
-					});
+					})
+					.finally(clearAdmission);
 				return undefined;
-			}
-
-			case "prompt_and_wait": {
-				const state = this.getBoundSessionState(command.activeSessionId);
-				await this.promptWithAgentMessagePreparingGuard(state, command.message, {
-					content: command.content,
-					images: command.images,
-					streamingBehavior: command.streamingBehavior,
-					expandPromptTemplates: command.expandPromptTemplates,
-					skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
-					source: command.source,
-					preflightResult: (didSucceed) => {
-						if (didSucceed) {
-							this.recordWorkerRecoveryState(state, "prompt_accepted", true);
-						}
-					},
-				});
-				return success(command.id, command.type);
 			}
 
 			case "steer": {
@@ -2907,7 +3191,8 @@ export class AgentDaemon {
 
 			case "follow_up": {
 				const state = this.getBoundSessionState(command.activeSessionId);
-				let queued: boolean;
+				let queued = true;
+				let admitted = true;
 				if (command.expandPromptTemplates === false) {
 					queued = await state.runtime.session.restoreFollowUpMessage(command.message, command.images, {
 						queueKey: command.queueKey,
@@ -2916,14 +3201,16 @@ export class AgentDaemon {
 						customMessage: command.customMessage,
 						prefixMessages: command.prefixMessages,
 					});
+					admitted = queued;
 				} else {
 					queued = await state.runtime.session.followUp(command.message, command.images, {
 						queueKey: command.queueKey,
 						agentMessageId: command.agentMessageId,
 						resumeIfIdle: true,
 					});
+					admitted = queued;
 				}
-				if (queued) {
+				if (admitted) {
 					this.recordWorkerRecoveryState(state, "follow_up_queued", true);
 				}
 				return success(command.id, "follow_up", { queued });
@@ -2943,23 +3230,9 @@ export class AgentDaemon {
 
 			case "resume_queue": {
 				const state = this.getSessionState(command.activeSessionId);
-				let checkedStart = false;
-				let startError: unknown;
-				void state.runtime.session.agent.continue().then(undefined, (error: unknown) => {
-					if (checkedStart) {
-						this.broadcastToSession(
-							state,
-							failure(undefined, "resume_queue", error, serializeDaemonError(error)),
-						);
-					} else {
-						startError = error;
-					}
-				});
-				// Self-update restore must acknowledge that queued work restarted without waiting for it to finish.
-				await Promise.resolve();
-				checkedStart = true;
-				if (startError !== undefined) {
-					return failure(command.id, "resume_queue", startError, serializeDaemonError(startError));
+				if (!state.runtime.session.resumeQueuedWork()) {
+					const error = new Error("No queued work to resume");
+					return failure(command.id, "resume_queue", error, serializeDaemonError(error));
 				}
 				return success(command.id, "resume_queue");
 			}
@@ -3104,7 +3377,7 @@ export class AgentDaemon {
 
 			case "wait_for_idle": {
 				const state = this.getSessionState(command.activeSessionId);
-				await state.runtime.session.agent.waitForIdle();
+				await state.runtime.session.waitForIdle();
 				return success(command.id, "wait_for_idle");
 			}
 
@@ -4337,47 +4610,109 @@ export class AgentDaemon {
 		return depth;
 	}
 
-	private prepareUpdateRestartCheckpoint(): DaemonUpdateRestartManifest {
-		if (this.updateRestartPreparing) {
-			throw new Error("Daemon is already preparing an update restart");
+	private assertUpdateRestartNotCancelled(transaction: { id: symbol; abort: AbortController }): void {
+		if (transaction.abort.signal.aborted || this.updateRestart?.id !== transaction.id) {
+			throw new Error("Update restart preparation cancelled");
 		}
-		this.updateRestartPreparing = true;
-		// Keep persisted jobs for the replacement daemon, but stop this process
-		// from accepting another scheduled mutation while its checkpoint is held.
+	}
+
+	private beginUpdateRestartTransaction(owner?: DaemonSocketClient): NonNullable<AgentDaemon["updateRestart"]> {
+		if (this.updateRestart) throw new Error("Daemon is already preparing an update restart");
+		const transaction: NonNullable<AgentDaemon["updateRestart"]> = {
+			id: Symbol("update-restart"),
+			...(owner ? { owner } : {}),
+			abort: new AbortController(),
+			phase: "preparing",
+			deferredClientEnv: [],
+		};
+		this.updateRestart = transaction;
 		this.cronScheduler.stop();
+		transaction.deadline = setTimeout(() => {
+			transaction.abort.abort();
+			this.cancelPreparedUpdateRestart(transaction.id);
+		}, UPDATE_RESTART_PREPARE_TIMEOUT_MS);
+		transaction.deadline.unref();
+		return transaction;
+	}
+
+	private async runUpdateRestartPreparation(
+		transaction: NonNullable<AgentDaemon["updateRestart"]>,
+	): Promise<DaemonUpdateRestartManifest> {
 		try {
-			const states = [...this.sessions.values()];
-			const restartSessions = states
-				.map((state) => this.createUpdateRestartSession(state))
-				.filter((session): session is DaemonUpdateRestartSession => session !== undefined)
-				.sort(
-					(left, right) =>
-						this.getUpdateRestartSessionDepth(this.getSessionState(left.activeSessionId)) -
-						this.getUpdateRestartSessionDepth(this.getSessionState(right.activeSessionId)),
-				);
-			const manifest = {
-				createdAt: new Date().toISOString(),
-				sessions: restartSessions,
-			};
-			this.preparedUpdateRestartManifest = manifest;
+			await this.mutationDrain.waitForDrain(0, transaction.abort.signal, "Update restart preparation cancelled");
+			this.assertUpdateRestartNotCancelled(transaction);
+			transaction.phase = "fencing";
+			await this.mutationDrain.waitForDrain(0, transaction.abort.signal, "Update restart preparation cancelled");
+			this.assertUpdateRestartNotCancelled(transaction);
+			const manifest = await this.prepareUpdateRestartCheckpoint(transaction);
+			this.assertUpdateRestartNotCancelled(transaction);
+			transaction.manifest = manifest;
+			transaction.phase = "prepared";
 			return manifest;
 		} catch (error) {
-			this.cancelPreparedUpdateRestart();
+			this.cancelPreparedUpdateRestart(transaction.id);
 			throw error;
 		}
 	}
 
-	private async commitPreparedUpdateRestart(): Promise<DaemonUpdateRestartManifest> {
-		const manifest = this.preparedUpdateRestartManifest;
-		if (!this.updateRestartPreparing || !manifest) {
+	private async prepareUpdateRestartCheckpoint(
+		transaction: NonNullable<AgentDaemon["updateRestart"]>,
+	): Promise<DaemonUpdateRestartManifest> {
+		const signal = transaction.abort.signal;
+		try {
+			const states = [...this.sessions.values()];
+			this.updateRestartQueuePauses.clear();
+			for (const state of states) {
+				this.updateRestartQueuePauses.set(state.activeSessionId, state.runtime.session.acquireQueuedWorkPause());
+			}
+			await Promise.all(states.map((state) => state.runtime.session.waitForSessionInputCheckpoint(signal)));
+			this.assertUpdateRestartNotCancelled(transaction);
+			const snapshottedIds = new Set(states.map((state) => state.activeSessionId));
+			const addedSession = [...this.sessions.keys()].find((activeSessionId) => !snapshottedIds.has(activeSessionId));
+			if (addedSession) throw new Error(`Session ${addedSession} became resident during update preparation`);
+
+			const restartSessions = states
+				.filter((state) => this.sessions.get(state.activeSessionId) === state)
+				.map((state) => this.createUpdateRestartSession(state))
+				.filter((session): session is DaemonUpdateRestartSession => session !== undefined)
+				.sort((left, right) => {
+					const leftState = this.sessions.get(left.activeSessionId);
+					const rightState = this.sessions.get(right.activeSessionId);
+					return (
+						(leftState ? this.getUpdateRestartSessionDepth(leftState) : 0) -
+						(rightState ? this.getUpdateRestartSessionDepth(rightState) : 0)
+					);
+				});
+			this.assertUpdateRestartNotCancelled(transaction);
+			const includedActiveSessionIds = new Set(restartSessions.map((session) => session.activeSessionId));
+			const discardedActiveSessionIds = states
+				.filter(
+					(state) =>
+						this.sessions.get(state.activeSessionId) === state &&
+						!includedActiveSessionIds.has(state.activeSessionId),
+				)
+				.map((state) => state.activeSessionId);
+			return {
+				createdAt: new Date().toISOString(),
+				sessions: restartSessions,
+				...(discardedActiveSessionIds.length > 0 ? { discardedActiveSessionIds } : {}),
+			};
+		} catch (error) {
+			this.cancelPreparedUpdateRestart(transaction.id);
+			throw error;
+		}
+	}
+
+	private async commitPreparedUpdateRestart(transactionId: symbol): Promise<DaemonUpdateRestartManifest> {
+		const transaction = this.updateRestart;
+		if (transaction?.id !== transactionId || !transaction.manifest) {
 			throw new Error("Daemon has no prepared update checkpoint");
 		}
+		const manifest = transaction.manifest;
 		const restartByActiveSessionId = new Map(manifest.sessions.map((session) => [session.activeSessionId, session]));
 		for (const state of this.sessions.values()) {
 			const restartSession = restartByActiveSessionId.get(state.activeSessionId);
-			if (restartSession) {
-				this.appendUpdateRestartMarker(state, restartSession);
-			}
+			if (restartSession) this.appendUpdateRestartMarker(state, restartSession);
 		}
 		const closeStates = [...this.sessions.values()].sort(
 			(left, right) => this.getUpdateRestartSessionDepth(right) - this.getUpdateRestartSessionDepth(left),
@@ -4387,27 +4722,47 @@ export class AgentDaemon {
 				await this.closeSession(state, restartByActiveSessionId.has(state.activeSessionId) ? "update" : "killed");
 			}
 		}
-		for (const state of [...this.sessions.values()]) {
-			await this.closeSession(state, "killed");
-		}
+		for (const state of [...this.sessions.values()]) await this.closeSession(state, "killed");
 		return manifest;
 	}
 
-	private cancelPreparedUpdateRestart(): void {
-		this.preparedUpdateRestartManifest = undefined;
-		this.updateRestartPreparing = false;
-		if (!this.shuttingDown) {
-			this.cronScheduler.start();
+	private cancelPreparedUpdateRestart(transactionId?: symbol): void {
+		const transaction = this.updateRestart;
+		if (!transaction || (transactionId && transaction.id !== transactionId)) return;
+		if (transaction.deadline) clearTimeout(transaction.deadline);
+		transaction.deadline = undefined;
+		transaction.abort.abort();
+		if (transaction.phase === "publishing") return;
+		this.updateRestart = undefined;
+		for (const deferred of transaction.deferredClientEnv) {
+			if (
+				this.sessions.get(deferred.state.activeSessionId) === deferred.state &&
+				deferred.state.clients.has(deferred.client) &&
+				deferred.client.attachedActiveSessionIds.has(deferred.state.activeSessionId)
+			) {
+				this.adoptClientEnv(deferred.state, deferred.env);
+			}
 		}
+		transaction.deferredClientEnv.length = 0;
+		for (const pause of this.updateRestartQueuePauses.values()) pause.release();
+		this.updateRestartQueuePauses.clear();
+		if (!this.shuttingDown) this.cronScheduler.start();
 	}
 
 	private async prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest> {
-		const manifest = this.prepareUpdateRestartCheckpoint();
+		const transaction = this.beginUpdateRestartTransaction();
 		try {
+			const manifest = await this.runUpdateRestartPreparation(transaction);
+			if (transaction.deadline) clearTimeout(transaction.deadline);
+			transaction.deadline = undefined;
+			transaction.phase = "publishing";
 			this.writeUpdateRestartManifest(manifest);
-			return await this.commitPreparedUpdateRestart();
+			return await this.commitPreparedUpdateRestart(transaction.id);
 		} catch (error) {
-			this.cancelPreparedUpdateRestart();
+			if (this.updateRestart === transaction && transaction.phase === "publishing") {
+				transaction.phase = "prepared";
+			}
+			this.cancelPreparedUpdateRestart(transaction.id);
 			throw error;
 		}
 	}
@@ -4442,11 +4797,21 @@ export class AgentDaemon {
 		return undefined;
 	}
 
+	private abortWaitingPromptAdmissionsForSession(activeSessionId: string): void {
+		for (const admission of this.promptAdmissions.values()) {
+			if (admission.activeSessionId === activeSessionId && admission.status === "waiting") {
+				admission.status = "cancelled";
+				admission.controller?.abort();
+			}
+		}
+	}
+
 	private async closeSession(
 		state: ActiveSessionState,
 		reason: DaemonSessionClosedReason,
 		waitForAbort = true,
 	): Promise<void> {
+		this.abortWaitingPromptAdmissionsForSession(state.activeSessionId);
 		for (const client of state.clients) {
 			this.abortSideQuestionsFor(client, state.activeSessionId);
 		}
@@ -4970,6 +5335,10 @@ export class AgentDaemon {
 		this.signalCleanupHandlers.push(() => process.off("exit", exitHandler));
 	}
 
+	private getShutdownClosingReason(): DaemonClosingReason {
+		return this.updateRestart?.phase === "publishing" ? "update" : "shutdown";
+	}
+
 	private async shutdown(exitCode: number): Promise<never> {
 		if (this.shuttingDown) {
 			process.exit(exitCode);
@@ -4984,7 +5353,7 @@ export class AgentDaemon {
 			this.supervisorFenceTimer = undefined;
 		}
 		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
-		const closingReason: DaemonClosingReason = this.updateRestartPreparing ? "update" : "shutdown";
+		const closingReason = this.getShutdownClosingReason();
 		for (const client of this.clients) {
 			abortClientSnapshotStreaming(client);
 			this.write(client, { type: "daemon_closing", reason: closingReason });

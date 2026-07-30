@@ -294,37 +294,46 @@ export class InProcessAgentConnection implements AgentConnection {
 	async prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
 		await new Promise<void>((resolve, reject) => {
 			let settled = false;
+			let accepted = false;
 			const resolveOnce = () => {
-				if (settled) return;
-				settled = true;
-				resolve();
+				if (!settled) {
+					settled = true;
+					resolve();
+				}
 			};
 			const rejectOnce = (error: unknown) => {
-				if (settled) return;
-				settled = true;
-				reject(error);
+				if (!settled) {
+					settled = true;
+					reject(error);
+				}
 			};
 			const prompt = this.session.prompt(message, {
-				images: options?.images,
-				streamingBehavior: options?.streamingBehavior,
-				source: options?.source,
+				...(options?.images ? { images: options.images } : {}),
+				...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
+				...(options?.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
+				...(options?.source ? { source: options.source } : {}),
+				...(options?.signal ? { signal: options.signal } : {}),
 				preflightResult: (success) => {
-					if (success) resolveOnce();
+					if (success) {
+						accepted = true;
+						resolveOnce();
+					}
 				},
 			});
-			void prompt.then(resolveOnce, rejectOnce);
+			void prompt.then(() => {
+				if (accepted) resolveOnce();
+				else rejectOnce(new Error("Prompt was not accepted by the session."));
+			}, rejectOnce);
 		});
 	}
 
 	async promptAndWait(message: string, options?: AgentConnectionPromptOptions): Promise<void> {
-		if (!options) {
-			await this.session.prompt(message);
-			return;
-		}
-		await this.session.prompt(message, {
-			images: options.images,
-			streamingBehavior: options.streamingBehavior,
-			source: options.source,
+		await this.session.promptAndWait(message, {
+			...(options?.images ? { images: options.images } : {}),
+			...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior, resumeIfIdle: true } : {}),
+			...(options?.queueIfBusy !== undefined ? { queueIfBusy: options.queueIfBusy } : {}),
+			...(options?.source ? { source: options.source } : {}),
+			...(options?.signal ? { signal: options.signal } : {}),
 		});
 	}
 
@@ -376,7 +385,7 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async waitForIdle(): Promise<void> {
-		await this.session.agent.waitForIdle();
+		await this.session.waitForIdle();
 	}
 
 	async waitForHeadlessCompletion(): Promise<AgentAutonomousStatus> {

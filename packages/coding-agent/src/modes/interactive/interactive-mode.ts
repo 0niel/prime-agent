@@ -99,10 +99,13 @@ import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.js";
 import {
 	bashOutputToText,
-	createCompactionSummaryMessage,
+	COMPACTION_OUTCOME_CUSTOM_TYPE,
 	createHeartbeatPromptMessage,
 	HEARTBEAT_PROMPT_CUSTOM_TYPE,
 	HEARTBEAT_PROMPT_PREVIEW_LABEL,
+	isCompactionOutcomeMessage,
+	isSessionSlashCommandMessage,
+	isSessionSlashCommandResultMessage,
 } from "../../core/messages.js";
 import { findExactModelReferenceMatch, resolveModelScopeFromModels } from "../../core/model-resolver.js";
 import { parseNewSessionCommand } from "../../core/new-session-command.js";
@@ -152,6 +155,7 @@ import type {
 	AgentConnectionState,
 	AgentConnectionToolDefinition,
 } from "../agent-connection/index.js";
+import { AgentConnectionPromptAdmissionError } from "../agent-connection/index.js";
 import { getModelArgumentCompletions } from "../model-autocomplete.js";
 import {
 	checkForPackageUpdates,
@@ -173,6 +177,10 @@ import {
 	type ChildAgentInspectorNode,
 	ChildAgentSummaryComponent,
 } from "./components/child-agent-inspector.js";
+import {
+	CompactionOutcomeMessageComponent,
+	MalformedCompactionOutcomeMessageComponent,
+} from "./components/compaction-outcome-message.js";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
@@ -200,6 +208,8 @@ import { SessionSelectorComponent } from "./components/session-selector.js";
 import { SettingsSelectorComponent } from "./components/settings-selector.js";
 import { SideQuestionComponent } from "./components/side-question.js";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.js";
+import { SlashCommandMessageComponent } from "./components/slash-command-message.js";
+import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
 import {
 	selectLatestToolExpandHint,
@@ -211,7 +221,13 @@ import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
 import { FeatureHintDeck } from "./feature-hints.js";
 import { scopeHeartbeatsToSession } from "./heartbeat-scope.js";
-import { collectMarkedImages, evictImagesToBudget, formatImageMarker, imageMarkerIds } from "./image-markers.js";
+import {
+	collectMarkedImages,
+	evictImagesToBudget,
+	formatImageMarker,
+	imageMarkerIds,
+	remapImageMarkers,
+} from "./image-markers.js";
 import type {
 	InteractiveModeLocalSessionHost,
 	InteractiveModeLocalToolRendererDefinition,
@@ -470,10 +486,7 @@ export class BrandSplashHeader implements Component {
 	}
 }
 
-type CompactionQueuedMessage = {
-	text: string;
-	mode: "steer" | "followUp";
-};
+type StartupPromptBarrierOutcome = "admitted" | "retained" | "lifecycle-cancelled";
 
 type GoalAnnouncementSnapshot = {
 	goalId?: string;
@@ -740,6 +753,11 @@ export function resolveInteractiveUpdateDaemonSocketPath(
 /**
  * Options for InteractiveMode initialization.
  */
+export interface InteractiveInitialPrompt {
+	text: string;
+	images?: ImageContent[];
+}
+
 export interface InteractiveModeOptions {
 	/** Providers that were migrated to auth.json (shows warning) */
 	migratedProviders?: string[];
@@ -751,8 +769,10 @@ export interface InteractiveModeOptions {
 	initialMessage?: string;
 	/** Images to attach to the initial message */
 	initialImages?: ImageContent[];
-	/** Additional messages to send after the initial message */
+	/** Additional text-only messages to send after the initial message. */
 	initialMessages?: string[];
+	/** Additional image-bearing prompts to send after the initial messages. */
+	initialPrompts?: InteractiveInitialPrompt[];
 	/** Force verbose startup (overrides quietStartup setting) */
 	verbose?: boolean;
 	/** Agent execution boundary. InteractiveMode never talks directly to AgentSession for core execution. */
@@ -831,6 +851,14 @@ export class InteractiveMode {
 	private readonly startHint = getRandomStartHint();
 	private isInitialized = false;
 	private onInputCallback?: (text: string | undefined) => void;
+	private submittedInputBehavior: "steer" | "followUp" = "steer";
+	private latestEditorPromptStash: PromptStash | undefined;
+	private pendingSubmittedPromptStash: PromptStash | undefined;
+	private inputSubmissionGeneration = 0;
+	private inputSubmissionsPending = 0;
+	private pendingPromptStashReleases: { sessionId: string; state: PromptStashState }[] = [];
+	private readonly retainedSubmissionGenerations = new WeakMap<PromptStash, number>();
+	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
 	private returnToAgentsViewRequested = false;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
@@ -852,6 +880,8 @@ export class InteractiveMode {
 	// activityTracker token count already folded into the context snapshot; only output beyond
 	// this counts as live in-flight (keeps auto-retries from re-adding a failed attempt).
 	private contextUsageTokenBaseline = 0;
+	// Refresh ordering: a stale failure must never clobber a newer success.
+	private contextUsageRefresh = { generation: 0, lastSuccessGeneration: 0 };
 	private readonly defaultHiddenThinkingLabel = "Thinking...";
 	private hiddenThinkingLabel = this.defaultHiddenThinkingLabel;
 
@@ -970,8 +1000,7 @@ export class InteractiveMode {
 	private retryCountdown: CountdownTimer | undefined = undefined;
 	private traceUploadAllAbortController: AbortController | undefined = undefined;
 
-	// Messages queued while compaction is running
-	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
+	// Session-owned queued messages mirrored from connection events.
 	private connectionQueue: AgentConnectionQueueState = { steering: [], followUp: [] };
 
 	// Shutdown state
@@ -1123,15 +1152,15 @@ export class InteractiveMode {
 	}
 
 	private hydratePromptStash(): void {
-		const stash = this.promptStash;
-		if (!stash) {
-			return;
-		}
-		for (const [markerId, image] of stash.images ?? []) {
-			this.pastedImages.set(markerId, image);
-		}
-		for (const markerId of imageMarkerIds(stash.text)) {
-			this.nextImageMarkerId = Math.max(this.nextImageMarkerId, markerId + 1);
+		for (const stash of [this.promptStash, ...(this.promptStashState?.queuedStashes ?? [])]) {
+			if (!stash) continue;
+			for (const [markerId, image] of stash.images ?? []) {
+				this.pastedImages.set(markerId, image);
+				this.nextImageMarkerId = Math.max(this.nextImageMarkerId, markerId + 1);
+			}
+			for (const markerId of imageMarkerIds(stash.text)) {
+				this.nextImageMarkerId = Math.max(this.nextImageMarkerId, markerId + 1);
+			}
 		}
 	}
 
@@ -1146,8 +1175,38 @@ export class InteractiveMode {
 	}
 
 	private releasePromptStashSession(): void {
-		if (this.promptStashStore && this.promptStashSessionId) {
+		if (this.inputSubmissionsPending > 0) {
+			// Capture the pair: a rebind may repoint the fields before the deferred
+			// release fires, and repeated rebinds/teardowns each defer their own pair.
+			if (
+				this.promptStashSessionId &&
+				!this.pendingPromptStashReleases.some((pending) => pending.sessionId === this.promptStashSessionId)
+			) {
+				this.pendingPromptStashReleases.push({
+					sessionId: this.promptStashSessionId,
+					state: this.promptStashState,
+				});
+			}
+			return;
+		}
+		const pending = this.pendingPromptStashReleases;
+		this.pendingPromptStashReleases = [];
+		if (!this.promptStashStore) return;
+		for (const release of pending) {
+			this.promptStashStore.release(release.sessionId, release.state);
+		}
+		if (this.promptStashSessionId) {
 			this.promptStashStore.release(this.promptStashSessionId, this.promptStashState);
+		}
+	}
+
+	private completeDeferredPromptStashRelease(): void {
+		const pending = this.pendingPromptStashReleases;
+		if (pending.length === 0) return;
+		this.pendingPromptStashReleases = [];
+		if (!this.promptStashStore) return;
+		for (const release of pending) {
+			this.promptStashStore.release(release.sessionId, release.state);
 		}
 	}
 
@@ -1463,7 +1522,14 @@ export class InteractiveMode {
 		const tmuxKeyboardWarningPromise = ownsGlobalStartupNotices ? checkTmuxKeyboardSetup() : undefined;
 
 		// Show startup warnings
-		const { migratedProviders, modelFallbackMessage, initialMessage, initialImages, initialMessages } = this.options;
+		const {
+			migratedProviders,
+			modelFallbackMessage,
+			initialMessage,
+			initialImages,
+			initialMessages,
+			initialPrompts,
+		} = this.options;
 
 		if (migratedProviders && migratedProviders.length > 0) {
 			this.showWarning(`Migrated credentials to auth.json: ${migratedProviders.join(", ")}`);
@@ -1478,40 +1544,87 @@ export class InteractiveMode {
 			this.showError(`models.json error: ${modelsJsonError}`);
 		}
 
-		let initialPromptsSent = false;
-		const sendInitialPrompts = async () => {
-			if (initialPromptsSent) {
-				return;
-			}
-			if (!initialMessage && !initialMessages?.length) {
-				initialPromptsSent = true;
-				return;
-			}
-			if (!this.getCurrentModel()) {
-				return;
-			}
-			initialPromptsSent = true;
-
-			if (initialMessage) {
-				try {
-					await this.agentConnection.prompt(initialMessage, { images: initialImages });
-				} catch (error: unknown) {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-					this.showError(errorMessage);
+		const startupPrompts: InteractiveInitialPrompt[] = [
+			...(initialMessage ? [{ text: initialMessage, images: initialImages }] : []),
+			...(initialMessages ?? []).map((text) => ({ text })),
+			...(initialPrompts ?? []),
+		];
+		// One drive loop owns startup-prompt delivery: it retries on a 250ms cadence
+		// while a model is missing or admission fails transiently, shows every
+		// admission error, and skips a prompt after three failed attempts.
+		// `startupPromptsSettled` is the user-submission barrier (startup prompts
+		// stay ahead of user prompts). Its outcome distinguishes completed admission
+		// from lifecycle cancellation so a resumed submit does not mutate torn-down
+		// editor state or consume the client-owned durable stash.
+		let startupPromptsDone = false;
+		const startupAdmissionAbort = new AbortController();
+		let settleStartupPrompts = (_outcome: StartupPromptBarrierOutcome) => {};
+		const startupPromptsSettled = new Promise<StartupPromptBarrierOutcome>((resolve) => {
+			settleStartupPrompts = (outcome) => {
+				startupPromptsDone = true;
+				resolve(outcome);
+			};
+		});
+		/** Resolves false when the run lifecycle ended before the 250ms retry delay elapsed. */
+		const startupRetryDelay = () =>
+			new Promise<boolean>((resolve) => {
+				const timer = setTimeout(() => resolve(true), 250);
+				timer.unref?.();
+				void startupPromptsSettled.then(() => {
+					clearTimeout(timer);
+					resolve(false);
+				});
+			});
+		const deliverStartupPrompts = async () => {
+			let failures = 0;
+			for (let next = 0; next < startupPrompts.length; ) {
+				// The run lifecycle can settle the barrier while a prompt is being
+				// admitted; stop instead of prompting a session we already left.
+				if (startupPromptsDone) return;
+				if (!this.getCurrentModel()) {
+					if (!(await startupRetryDelay())) return;
+					continue;
 				}
-			}
-
-			if (initialMessages) {
-				for (const message of initialMessages) {
-					try {
-						await this.agentConnection.prompt(message);
-					} catch (error: unknown) {
-						const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-						this.showError(errorMessage);
+				const prompt = startupPrompts[next]!;
+				try {
+					await this.agentConnection.prompt(prompt.text, {
+						images: prompt.images,
+						streamingBehavior: next === 0 ? "steer" : "followUp",
+						queueIfBusy: true,
+						signal: startupAdmissionAbort.signal,
+					});
+					failures = 0;
+					next++;
+				} catch (error) {
+					if (startupPromptsDone || startupAdmissionAbort.signal.aborted) return;
+					// An uncertain daemon admission may already be session-owned. Retrying
+					// would duplicate it; only an acknowledged pre-ownership cancellation is safe.
+					if (error instanceof AgentConnectionPromptAdmissionError && error.status === "owned") {
+						failures = 0;
+						next++;
+						continue;
 					}
+					if (error instanceof AgentConnectionPromptAdmissionError && !error.cancelled) {
+						// This attempt may already be session-owned, so never retry it. Preserve
+						// it and every not-yet-attempted startup prompt in original order.
+						this.retainStartupPromptDrafts(startupPrompts.slice(next));
+						this.showError(error.message);
+						settleStartupPrompts("retained");
+						return;
+					}
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					if (++failures < 3) {
+						this.showError(errorMessage);
+						if (!(await startupRetryDelay())) return;
+						continue;
+					}
+					this.showError(`Skipping startup prompt after 3 failed attempts: ${errorMessage}`);
+					failures = 0;
+					next++;
 				}
 			}
 		};
+		this.admitPendingStartupPrompts = startupPrompts.length > 0 ? () => startupPromptsSettled : undefined;
 
 		let deferredStartupNotificationsShown = false;
 		const showDeferredStartupNotifications = () => {
@@ -1568,28 +1681,21 @@ export class InteractiveMode {
 		showDeferredStartupNotifications();
 		showModelFallbackWarning();
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
-		await sendInitialPrompts();
+		void deliverStartupPrompts().then(
+			() => settleStartupPrompts("admitted"),
+			() => settleStartupPrompts("admitted"),
+		);
 
-		// Main interactive loop
-		while (true) {
-			const userInput = await this.getUserInput();
-			if (userInput === undefined || this.returnToAgentsViewRequested) {
-				return "agents_view";
-			}
-			showDeferredStartupNotifications();
-			showModelFallbackWarning();
-			await sendInitialPrompts();
-			// Collect images from the markers in the submitted text. The registry
-			// still holds them (it is not cleared on submit), so this works even after
-			// the text was restored to the editor by onboarding, history, or a retry.
-			const images = this.collectImagesFor(userInput);
-			try {
-				await this.agentConnection.prompt(userInput, { streamingBehavior: "steer", images });
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				this.showError(errorMessage);
-			}
+		// Enter/Alt+Enter submit directly through AgentConnection. Keep run alive
+		// until shutdown or a return to the agents view resolves the lifecycle wait.
+		try {
+			await this.getUserInput();
+		} finally {
+			startupAdmissionAbort.abort();
+			settleStartupPrompts("lifecycle-cancelled");
+			this.admitPendingStartupPrompts = undefined;
 		}
+		return "agents_view";
 	}
 
 	private getModelFallbackWarningAction(modelFallbackMessage: string | undefined): ModelFallbackWarningAction {
@@ -2510,13 +2616,20 @@ export class InteractiveMode {
 
 	/** Refresh the tray's context usage from the session after a turn or compaction completes. */
 	private async refreshConnectionContextUsage(): Promise<void> {
+		const generation = ++this.contextUsageRefresh.generation;
 		const connection = this.agentConnection;
 		const sessionId = this.connectionState?.sessionId;
 		const stats = await connection?.getSessionStats?.().catch(() => undefined);
 		if (!stats) return;
-		// Drop the result if the user switched sessions or the connection was rebound while the
-		// async call was in flight — otherwise stale stats would overwrite the new session.
-		if (this.agentConnection !== connection || this.connectionState?.sessionId !== sessionId) return;
+		// Drop results superseded by a newer successful refresh as well as results for a replaced session.
+		if (
+			generation < this.contextUsageRefresh.lastSuccessGeneration ||
+			this.agentConnection !== connection ||
+			this.connectionState?.sessionId !== sessionId
+		) {
+			return;
+		}
+		this.contextUsageRefresh.lastSuccessGeneration = generation;
 		// Anything counted so far is now reflected in the snapshot; only later output is in-flight.
 		this.contextUsageTokenBaseline = this.activityTracker.getStatus().tokens;
 		this.patchConnectionState({ contextUsage: stats.contextUsage });
@@ -2700,11 +2813,11 @@ export class InteractiveMode {
 		this.shortcutGuideContainer.clear();
 		this.pendingMessagesContainer.clear();
 		this.queuedMessagesContainer.clear();
-		this.compactionQueuedMessages = [];
 		this.connectionQueue = { steering: [], followUp: [] };
 		this.featureHintSuppressedByQueue = false;
 		if (options?.clearPromptStash) {
 			this.promptStash = undefined;
+			if (this.promptStashState) this.promptStashState.queuedStashes = undefined;
 		}
 		// Clear every editor's prompt history, draft text, and queues, then prune
 		// any pasted images no longer referenced by the remaining stashed draft.
@@ -2753,7 +2866,6 @@ export class InteractiveMode {
 	}
 
 	private async renderResyncedSession(snapshot: AgentConnectionSnapshot): Promise<void> {
-		const compactionFinished = this.isAgentCompacting() && !snapshot.state.isCompacting;
 		const bashFinished = this.isBashRunning() && !snapshot.state.isBashRunning;
 		this.applyConnectionStateSnapshot(snapshot.state);
 		this.streamingComponent = undefined;
@@ -2765,9 +2877,6 @@ export class InteractiveMode {
 		});
 		await this.restoreStreamingMessageFromSnapshot(snapshot.streamingMessage);
 		await this.refreshConnectionQueue();
-		if (compactionFinished) {
-			await this.flushCompactionQueue({ willRetry: false });
-		}
 		if (bashFinished) {
 			if (this.activeBashComponent) {
 				this.activeBashComponent.setComplete(undefined, false);
@@ -3222,7 +3331,42 @@ export class InteractiveMode {
 
 	// Reconcile the loader with current state for transitions that fire no live
 	// agent_start edge (returning from agents view, resuming mid-stream).
+	private startCompactionLoader(
+		reason: "manual" | "requested" | "overflow" | "threshold",
+		customInstructions?: string,
+	): void {
+		if (this.settingsManager.getShowTerminalProgress()) {
+			this.ui.terminal.setProgress(true);
+		}
+		// Keep editor active; submissions are queued during compaction.
+		// Fully stop the working loader (not just detach) so it isn't orphaned.
+		this.stopWorkingLoader();
+		this.statusContainer.clear();
+		const cancelHint = `(${keyText("app.clear")} to cancel)`;
+		const focus = customInstructions ? ` (focus: ${truncateToWidth(customInstructions, 60, "…")})` : "";
+		const label =
+			reason === "manual"
+				? `Compacting context${focus}... ${cancelHint}`
+				: reason === "requested"
+					? `Agent requested compaction, compacting context${focus}... ${cancelHint}`
+					: `${reason === "overflow" ? "Context overflow detected, " : ""}Auto-compacting... ${cancelHint}`;
+		this.autoCompactionLoader = new Loader(
+			this.ui,
+			(spinner) => theme.fg("muted", spinner),
+			(text) => theme.fg("muted", text),
+			label,
+		);
+		this.statusContainer.addChild(this.autoCompactionLoader);
+		this.ui.requestRender();
+	}
+
 	private syncWorkingLoader(): void {
+		// A compaction that started before this client attached (or while another
+		// view was open) has no start-event edge; restore its loader from state.
+		if (!this.autoCompactionLoader && this.isAgentCompacting()) {
+			this.startCompactionLoader("manual");
+			return;
+		}
 		// Compaction/retry own the status container while active; don't fight them.
 		if (this.autoCompactionLoader || this.retryLoader) {
 			return;
@@ -3757,8 +3901,10 @@ export class InteractiveMode {
 		}
 		this.childAgentSummary.setHidden(false);
 
-		// Save text from current editor before switching
-		const currentText = this.editor.getText();
+		// Snapshot the current editor before replacing it. Paste markers are only
+		// meaningful while their originating editor still owns the paste snapshot.
+		const currentEditor = this.editor;
+		const currentPromptStash = this.snapshotPromptStashFrom(currentEditor, currentEditor.getText());
 
 		this.editorContainer.clear();
 
@@ -3766,12 +3912,24 @@ export class InteractiveMode {
 			// Create the custom editor with tui, theme, and keybindings
 			const newEditor = factory(this.ui, getEditorTheme(), this.keybindings);
 
-			// Wire up callbacks from the default editor
+			// Restore before wiring the shared onChange callback: setText may emit a
+			// change, and an empty custom editor cannot reconstruct the old snapshot.
+			const canRestorePasteSnapshot =
+				currentPromptStash.pasteSnapshot === undefined || newEditor.restorePasteSnapshot !== undefined;
+			newEditor.setText(
+				canRestorePasteSnapshot
+					? currentPromptStash.text
+					: (currentPromptStash.expandedText ?? currentPromptStash.text),
+			);
+			if (currentPromptStash.pasteSnapshot && newEditor.restorePasteSnapshot) {
+				newEditor.restorePasteSnapshot(currentPromptStash.pasteSnapshot);
+			}
+
+			// Wire up callbacks from the default editor. onChange snapshots the
+			// active editor while it still owns paste markers and attachments, so
+			// submit remains exact even when an editor clears before calling onSubmit.
 			newEditor.onSubmit = this.defaultEditor.onSubmit;
 			newEditor.onChange = this.defaultEditor.onChange;
-
-			// Copy text from previous editor
-			newEditor.setText(currentText);
 
 			// Copy appearance settings if supported
 			if (newEditor.borderColor !== undefined) {
@@ -3816,10 +3974,21 @@ export class InteractiveMode {
 
 			this.editor = newEditor;
 		} else {
-			// Restore default editor with text from custom editor
-			this.defaultEditor.setText(currentText);
+			// Restore the default editor with the same rich snapshot (or expanded
+			// fallback text if this editor implementation cannot restore it).
+			const canRestorePasteSnapshot =
+				currentPromptStash.pasteSnapshot === undefined || this.defaultEditor.restorePasteSnapshot !== undefined;
+			this.defaultEditor.setText(
+				canRestorePasteSnapshot
+					? currentPromptStash.text
+					: (currentPromptStash.expandedText ?? currentPromptStash.text),
+			);
+			if (currentPromptStash.pasteSnapshot && this.defaultEditor.restorePasteSnapshot) {
+				this.defaultEditor.restorePasteSnapshot(currentPromptStash.pasteSnapshot);
+			}
 			this.editor = this.defaultEditor;
 		}
+		this.latestEditorPromptStash = currentPromptStash;
 
 		this.editorContainer.addChild(this.editor as Component);
 		this.ui.setFocus(this.editor as Component);
@@ -3994,6 +4163,9 @@ export class InteractiveMode {
 		this.defaultEditor.onMoveBelowPrompt = () => this.focusChildAgentSummary();
 
 		this.defaultEditor.onChange = (text: string) => {
+			if (text.length > 0) {
+				this.latestEditorPromptStash = this.snapshotPromptStashFrom(this.editor, text);
+			}
 			if (this.escapeRepeatAction && !this.isRestoringQueuedEditorText) {
 				this.clearEscapeRepeat();
 			}
@@ -4008,6 +4180,21 @@ export class InteractiveMode {
 		};
 	}
 
+	private snapshotPromptStashFrom(editor: EditorComponent, text: string): PromptStash {
+		const pasteSnapshot = editor.getPasteSnapshot?.();
+		const images = this.getPromptStashImages(text);
+		return {
+			text,
+			expandedText: pasteSnapshot ? (editor.getExpandedText?.() ?? text) : undefined,
+			pasteSnapshot,
+			...(images.length > 0 ? { images } : {}),
+		};
+	}
+
+	private snapshotPromptStash(text: string): PromptStash {
+		return this.snapshotPromptStashFrom(this.editor, text);
+	}
+
 	private handlePromptStash(): void {
 		const text = this.editor.getText();
 		if (!text.trim()) {
@@ -4020,14 +4207,7 @@ export class InteractiveMode {
 			this.showStatus("Prompt stash already has a draft");
 			return;
 		}
-		const pasteSnapshot = this.editor.getPasteSnapshot?.();
-		const images = this.getPromptStashImages(text);
-		this.promptStash = {
-			text,
-			expandedText: pasteSnapshot ? (this.editor.getExpandedText?.() ?? text) : undefined,
-			pasteSnapshot,
-			...(images.length > 0 ? { images } : {}),
-		};
+		this.promptStash = this.snapshotPromptStash(text);
 		this.editor.setText("");
 		this.showStatus("Stashed prompt");
 	}
@@ -4039,15 +4219,93 @@ export class InteractiveMode {
 		if (this.promptStash !== stash) {
 			return false;
 		}
-		this.promptStash = undefined;
+		this.promptStash = this.promptStashState?.queuedStashes?.shift();
+		if (this.promptStashState?.queuedStashes?.length === 0) this.promptStashState.queuedStashes = undefined;
 		const canRestorePasteSnapshot =
 			stash.pasteSnapshot === undefined || this.editor.restorePasteSnapshot !== undefined;
 		this.editor.setText(canRestorePasteSnapshot ? stash.text : (stash.expandedText ?? stash.text));
 		if (stash.pasteSnapshot && this.editor.restorePasteSnapshot) {
 			this.editor.restorePasteSnapshot(stash.pasteSnapshot);
 		}
+		this.latestEditorPromptStash = this.snapshotPromptStash(this.editor.getText());
 		this.showStatus("Restored stashed prompt");
 		return true;
+	}
+
+	private retainSubmittedDraft(
+		stash: PromptStash,
+		submissionGeneration: number,
+		state: PromptStashState = this.promptStashState,
+	): void {
+		this.retainedSubmissionGenerations.set(stash, submissionGeneration);
+		const ordered = [state.stash, ...(state.queuedStashes ?? [])].filter(
+			(candidate): candidate is PromptStash => candidate !== undefined,
+		);
+		const insertAt = ordered.findIndex((candidate) => {
+			const generation = this.retainedSubmissionGenerations.get(candidate);
+			return generation !== undefined && generation > submissionGeneration;
+		});
+		ordered.splice(insertAt === -1 ? ordered.length : insertAt, 0, stash);
+		state.stash = ordered.shift();
+		state.queuedStashes = ordered.length > 0 ? ordered : undefined;
+	}
+
+	private retainStartupPromptDrafts(prompts: readonly InteractiveInitialPrompt[]): void {
+		// Reserve every marker visible anywhere in the retained batch before assigning
+		// any image. This prevents an early prompt's attachment from making a literal
+		// marker in a later prompt resolve to the wrong image.
+		const reserved = new Set(this.pastedImages.keys());
+		for (const stash of [this.promptStash, ...(this.promptStashState.queuedStashes ?? [])]) {
+			if (stash) for (const markerId of imageMarkerIds(stash.text)) reserved.add(markerId);
+		}
+		for (const prompt of prompts) {
+			for (const markerId of imageMarkerIds(prompt.text)) reserved.add(markerId);
+		}
+		for (const markerId of reserved) {
+			this.nextImageMarkerId = Math.max(this.nextImageMarkerId, markerId + 1);
+		}
+		const allocateMarker = () => {
+			while (reserved.has(this.nextImageMarkerId)) this.nextImageMarkerId++;
+			const markerId = this.nextImageMarkerId++;
+			reserved.add(markerId);
+			return markerId;
+		};
+
+		const retained: PromptStash[] = [];
+		for (const prompt of prompts) {
+			let text = prompt.text;
+			// A startup prompt owns only the images passed with it. Remap literal
+			// markers that already name registry data so restoring this draft cannot
+			// accidentally attach an old or another prompt's image.
+			const literalRemaps = new Map<number, number>();
+			for (const markerId of imageMarkerIds(text)) {
+				if (this.pastedImages.has(markerId) && !literalRemaps.has(markerId)) {
+					literalRemaps.set(markerId, allocateMarker());
+				}
+			}
+			text = remapImageMarkers(text, literalRemaps);
+
+			const images: Array<readonly [number, ImageContent]> = [];
+			for (const image of prompt.images ?? []) {
+				const markerId = allocateMarker();
+				images.push([markerId, image]);
+				text += `${text.length > 0 && !/\s$/.test(text) ? " " : ""}${formatImageMarker(markerId)}`;
+			}
+			retained.push({
+				text,
+				...(images.length > 0 ? { images } : {}),
+			});
+			for (const [markerId, image] of images) this.pastedImages.set(markerId, image);
+		}
+
+		// Startup drafts form the head of the durable queue. Preserve any older
+		// client draft after them, and let submissions released by the barrier append.
+		const existing = [this.promptStashState.stash, ...(this.promptStashState.queuedStashes ?? [])].filter(
+			(stash): stash is PromptStash => stash !== undefined,
+		);
+		const ordered = [...retained, ...existing];
+		this.promptStashState.stash = ordered.shift();
+		this.promptStashState.queuedStashes = ordered.length > 0 ? ordered : undefined;
 	}
 
 	private getPromptStashImages(text: string): readonly (readonly [number, ImageContent])[] {
@@ -4124,14 +4382,11 @@ export class InteractiveMode {
 			}
 		};
 		add(this.editor.getText());
-		if (this.promptStash !== undefined) {
-			add(this.promptStash.text);
+		for (const stash of [this.promptStash, ...(this.promptStashState?.queuedStashes ?? [])]) {
+			if (stash) add(stash.text);
 		}
 		for (const entry of this.editor.getHistory?.() ?? []) {
 			add(entry);
-		}
-		for (const msg of this.compactionQueuedMessages) {
-			add(msg.text);
 		}
 		for (const msg of [...this.connectionQueue.steering, ...this.connectionQueue.followUp]) {
 			add(msg);
@@ -4313,16 +4568,28 @@ export class InteractiveMode {
 			this.editor.setText(result.editorText);
 		}
 		this.showStatus("Navigated to selected point");
-		void this.flushCompactionQueue({ willRetry: false });
 	}
 
 	private setupEditorSubmitHandler(): void {
 		this.defaultEditor.onSubmit = async (text: string) => {
+			const streamingBehavior = this.submittedInputBehavior;
+			this.submittedInputBehavior = "steer";
 			text = text.trim();
 			if (!text) return;
+			const submissionGeneration = ++this.inputSubmissionGeneration;
+			this.inputSubmissionsPending++;
 			this.clearShortcutGuide();
+			// A barrier wait can resume after /new repointed the live session fields.
+			const submissionStashState = this.promptStashState;
+			const submissionSessionId = this.promptStashSessionId;
 			const promptStashToRestore = this.promptStash;
+			const liveEditorText = this.editor.getText();
+			const submittedDraft =
+				this.pendingSubmittedPromptStash ??
+				(liveEditorText.trim() ? this.snapshotPromptStash(liveEditorText) : this.latestEditorPromptStash);
+			this.pendingSubmittedPromptStash = undefined;
 			let restorePromptStashAfterSubmit = true;
+			let submissionOutcome: StartupPromptBarrierOutcome = "admitted";
 
 			try {
 				const slashCommand = parseSlashCommand(text);
@@ -4443,12 +4710,6 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
-				if (commandName === "goal" && (!commandArgs || commandArgs === "status")) {
-					this.echoLocalCommand(text);
-					this.handleGoalStatusCommand();
-					this.editor.setText("");
-					return;
-				}
 				if (commandName === "heartbeat") {
 					await this.handleHeartbeatCommand(canonicalCommandText);
 					this.editor.setText("");
@@ -4523,18 +4784,6 @@ export class InteractiveMode {
 					}
 					this.editor.setText("");
 					await this.handleClearCommand(options);
-					return;
-				}
-				if (commandName === "compact") {
-					const customInstructions = commandArgs || undefined;
-					this.editor.setText("");
-					await this.handleCompactCommand(customInstructions);
-					return;
-				}
-				if (commandName === "refine") {
-					const refineArgs = commandArgs || undefined;
-					this.editor.setText("");
-					await this.handleRefineCommand(refineArgs);
 					return;
 				}
 				if (commandName === "reload" && !commandArgs) {
@@ -4694,42 +4943,83 @@ export class InteractiveMode {
 				}
 
 				this.clearSideQuestion({ abort: true });
-
-				// Queue input during compaction (extension commands execute immediately)
-				if (this.isAgentCompacting()) {
-					if (this.isExtensionCommand(text)) {
-						this.editor.addToHistory?.(text);
-						this.editor.setText("");
-						await this.agentConnection.prompt(text, { images: this.collectImagesFor(text) });
-					} else {
-						this.queueCompactionMessage(text, "steer");
-					}
-					return;
-				}
-
-				// If streaming, use prompt() with steer behavior
-				// This handles extension commands (execute immediately), prompt template expansion, and queueing
-				if (this.isAgentStreaming()) {
-					const images = this.collectImagesFor(text);
-					this.editor.addToHistory?.(text);
-					this.editor.setText("");
-					await this.agentConnection.prompt(text, { streamingBehavior: "steer", images });
-					this.updatePendingMessagesDisplay();
-					this.ui.requestRender();
-					return;
-				}
-
-				// Normal message submission
-				// First, move any pending bash components to chat
 				this.flushPendingBashComponents();
-
-				if (this.onInputCallback) {
-					this.onInputCallback(text);
-				}
+				const images = this.collectImagesFor(text);
 				this.editor.addToHistory?.(text);
+				this.editor.setText("");
+				const promptStashAfterClear = this.promptStash;
+				submissionOutcome = (await this.admitPendingStartupPrompts?.()) ?? "admitted";
+				// Retention is not admission. Startup drafts were inserted synchronously
+				// before the barrier settled, so append this blocked submission behind them
+				// and never let it prompt or overtake them.
+				if (submissionOutcome === "retained") {
+					this.retainSubmittedDraft(submittedDraft ?? { text }, submissionGeneration);
+					return;
+				}
+				// The barrier also settles when the run lifecycle ends; a submit resumed
+				// by teardown must neither prompt nor mutate the editor/durable stash.
+				if (
+					submissionOutcome === "lifecycle-cancelled" ||
+					this.isShuttingDown ||
+					this.returnToAgentsViewRequested ||
+					this.promptStashSessionId !== submissionSessionId
+				) {
+					// The editor is already torn down, but its shared session stash outlives
+					// this view. Preserve the submitted draft in the stash of the session it
+					// was typed for, without overwriting an explicit older stash.
+					this.retainSubmittedDraft(submittedDraft ?? { text }, submissionGeneration, submissionStashState);
+					submissionOutcome = "lifecycle-cancelled";
+					return;
+				}
+				try {
+					await this.agentConnection.prompt(text, {
+						streamingBehavior,
+						queueIfBusy: true,
+						images,
+					});
+				} catch (error) {
+					// Generation guards editor ownership, not draft durability: a stale
+					// rejection must be retained rather than overwrite newer input or vanish.
+					const rejectedDraft = submittedDraft ?? { text };
+					const canRestore =
+						!this.isShuttingDown &&
+						!this.returnToAgentsViewRequested &&
+						submissionGeneration === this.inputSubmissionGeneration &&
+						this.editor.getText().length === 0;
+					if (canRestore) {
+						const canRestorePasteSnapshot =
+							rejectedDraft.pasteSnapshot === undefined || this.editor.restorePasteSnapshot !== undefined;
+						this.editor.setText(
+							canRestorePasteSnapshot ? rejectedDraft.text : (rejectedDraft.expandedText ?? rejectedDraft.text),
+						);
+						if (rejectedDraft.pasteSnapshot && this.editor.restorePasteSnapshot) {
+							this.editor.restorePasteSnapshot(rejectedDraft.pasteSnapshot);
+						}
+						this.latestEditorPromptStash = this.snapshotPromptStash(this.editor.getText());
+						if (this.promptStash === promptStashAfterClear) this.promptStash = promptStashToRestore;
+					} else {
+						this.retainSubmittedDraft(rejectedDraft, submissionGeneration, submissionStashState);
+					}
+					this.showError(error instanceof Error ? error.message : String(error));
+					return;
+				}
+				this.updatePendingMessagesDisplay();
+				this.ui.requestRender();
 			} finally {
-				if (restorePromptStashAfterSubmit && promptStashToRestore !== undefined) {
+				if (this.isShuttingDown || this.returnToAgentsViewRequested) {
+					submissionOutcome = "lifecycle-cancelled";
+				}
+				if (
+					submissionOutcome === "admitted" &&
+					restorePromptStashAfterSubmit &&
+					promptStashToRestore !== undefined &&
+					submissionGeneration === this.inputSubmissionGeneration
+				) {
 					this.restorePromptStashIfEditorEmpty(promptStashToRestore);
+				}
+				this.inputSubmissionsPending--;
+				if (this.inputSubmissionsPending === 0 && this.pendingPromptStashReleases.length > 0) {
+					this.completeDeferredPromptStashRelease();
 				}
 			}
 		};
@@ -5253,7 +5543,9 @@ export class InteractiveMode {
 				this.renderRecap();
 
 				this.applyOptimisticContextUsage();
-				await this.refreshConnectionContextUsage();
+				// Auto-compaction can start server-side while this event is being handled.
+				// Do not hold its start event behind a stats RPC; stale refreshes are discarded.
+				void this.refreshConnectionContextUsage();
 
 				await this.checkShutdownRequested();
 
@@ -5261,31 +5553,7 @@ export class InteractiveMode {
 				break;
 
 			case "compaction_start": {
-				if (this.settingsManager.getShowTerminalProgress()) {
-					this.ui.terminal.setProgress(true);
-				}
-				// Keep editor active; submissions are queued during compaction.
-				// Fully stop the working loader (not just detach) so it isn't orphaned.
-				this.stopWorkingLoader();
-				this.statusContainer.clear();
-				const cancelHint = `(${keyText("app.clear")} to cancel)`;
-				const focus = event.customInstructions
-					? ` (focus: ${truncateToWidth(event.customInstructions, 60, "…")})`
-					: "";
-				const label =
-					event.reason === "manual"
-						? `Compacting context${focus}... ${cancelHint}`
-						: event.reason === "requested"
-							? `Agent requested compaction, compacting context${focus}... ${cancelHint}`
-							: `${event.reason === "overflow" ? "Context overflow detected, " : ""}Auto-compacting... ${cancelHint}`;
-				this.autoCompactionLoader = new Loader(
-					this.ui,
-					(spinner) => theme.fg("muted", spinner),
-					(text) => theme.fg("muted", text),
-					label,
-				);
-				this.statusContainer.addChild(this.autoCompactionLoader);
-				this.ui.requestRender();
+				this.startCompactionLoader(event.reason, event.customInstructions);
 				break;
 			}
 
@@ -5301,35 +5569,20 @@ export class InteractiveMode {
 				// Restore the working loader if streaming/subagents still warrant it.
 				this.syncWorkingLoader();
 				if (event.aborted) {
-					if (event.reason === "manual") {
-						this.showError("Compaction cancelled");
-					} else {
-						this.showStatus("Auto-compaction cancelled");
-					}
+					if (event.reason === "manual") this.showError("Compaction cancelled");
 				} else if (event.result) {
-					this.chatContainer.clear();
-					await this.rebuildChatFromMessages();
-					this.addMessageToChat(
-						createCompactionSummaryMessage(
-							event.result.summary,
-							event.result.tokensBefore,
-							new Date().toISOString(),
-							event.customInstructions,
-						),
-					);
+					try {
+						await this.rebuildChatFromMessages();
+					} catch (error) {
+						const message = error instanceof Error ? error.message : String(error);
+						this.showError(`Compaction succeeded, but the transcript could not be refreshed: ${message}`);
+					}
 					await this.refreshConnectionContextUsage();
 					this.footer.invalidate();
-				} else if (event.errorMessage) {
-					if (event.errorSeverity === "warning") {
-						this.showWarning(event.errorMessage);
-					} else if (event.reason === "manual") {
-						this.showError(event.errorMessage);
-					} else {
-						this.chatContainer.addChild(new Spacer(1));
-						this.chatContainer.addChild(new Text(theme.fg("error", event.errorMessage), 1, 0));
-					}
+				} else if (event.errorMessage && event.reason === "manual") {
+					if (event.errorSeverity === "warning") this.showWarning(event.errorMessage);
+					else this.showError(event.errorMessage);
 				}
-				void this.flushCompactionQueue({ willRetry: event.willRetry });
 				this.ui.requestRender();
 				break;
 			}
@@ -6191,18 +6444,31 @@ export class InteractiveMode {
 			}
 			case "custom": {
 				if (message.display) {
-					const component = isAgentSessionMessage(message)
-						? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
-						: isInjectedPromptMessage(message)
-							? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
-							: new CustomMessageComponent(
-									message,
-									this.bindLocalSessionExtensions
-										? this.getLocalSessionHost().getExtensionRunner().getMessageRenderer(message.customType)
-										: undefined,
-									this.getMarkdownThemeWithSettings(),
-								);
+					const component = isSessionSlashCommandMessage(message)
+						? new SlashCommandMessageComponent(message.content)
+						: isSessionSlashCommandResultMessage(message)
+							? new SlashCommandResultMessageComponent(message)
+							: isCompactionOutcomeMessage(message)
+								? new CompactionOutcomeMessageComponent(message)
+								: message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE
+									? new MalformedCompactionOutcomeMessageComponent()
+									: isAgentSessionMessage(message)
+										? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
+										: isInjectedPromptMessage(message)
+											? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
+											: new CustomMessageComponent(
+													message,
+													this.bindLocalSessionExtensions
+														? this.getLocalSessionHost()
+																.getExtensionRunner()
+																.getMessageRenderer(message.customType)
+														: undefined,
+													this.getMarkdownThemeWithSettings(),
+												);
 					component.setExpanded(this.toolOutputExpanded);
+					if (isSessionSlashCommandMessage(message) && this.chatContainer.children.length > 0) {
+						this.chatContainer.addChild(new Spacer(1));
+					}
 					this.chatContainer.addChild(component);
 				}
 				break;
@@ -6300,6 +6566,26 @@ export class InteractiveMode {
 	 * @param options.clearChat Clear the current transcript immediately before rendering
 	 * @param options.limitTranscript Limit transcript replay to the recent tail
 	 */
+	private orderMessagesForTranscript(messages: AgentMessage[]): AgentMessage[] {
+		const summaryIndex = messages.findIndex((message) => message.role === "compactionSummary");
+		if (summaryIndex === -1) return messages;
+		const summary = messages[summaryIndex];
+		if (summary.role !== "compactionSummary") return messages;
+		const remaining = messages.filter((_, index) => index !== summaryIndex);
+		if (Number.isSafeInteger(summary.retainedMessageCount) && summary.retainedMessageCount! >= 0) {
+			const boundary = Math.min(summary.retainedMessageCount!, remaining.length);
+			return [...remaining.slice(0, boundary), summary, ...remaining.slice(boundary)];
+		}
+
+		// Compatibility for summaries created before retainedMessageCount was added.
+		const retained: AgentMessage[] = [];
+		const later: AgentMessage[] = [];
+		for (const message of remaining) {
+			(message.timestamp < summary.timestamp ? retained : later).push(message);
+		}
+		return [...retained, summary, ...later];
+	}
+
 	private async renderSessionContext(
 		sessionContext: AgentConnectionSessionContext,
 		options: {
@@ -6310,9 +6596,8 @@ export class InteractiveMode {
 		} = {},
 	): Promise<void> {
 		this.resetPendingToolState();
-		const messagesToRender = options.limitTranscript
-			? initialRenderMessages(sessionContext.messages)
-			: sessionContext.messages;
+		const transcriptMessages = this.orderMessagesForTranscript(sessionContext.messages);
+		const messagesToRender = options.limitTranscript ? initialRenderMessages(transcriptMessages) : transcriptMessages;
 		this.ipythonToolComponents.clear();
 		this.lateIpythonSentAgentMessages.clear();
 		const renderedPendingTools = new Map<string, ToolExecutionComponent>();
@@ -6790,55 +7075,28 @@ export class InteractiveMode {
 	}
 
 	private async handleFollowUp(): Promise<void> {
-		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
-		if (!text) return;
-		const promptStashToRestore = this.promptStash;
-		let clearedSubmittedText: string | undefined;
+		const editorText = this.editor.getText();
+		const text = (this.editor.getExpandedText?.() ?? editorText).trim();
+		if (!text || !this.editor.onSubmit) return;
 
+		// Unlike Enter, Alt+Enter does not go through Editor.submitValue(), so
+		// capture and clear synchronously before an async/local handler can yield.
+		this.pendingSubmittedPromptStash = this.snapshotPromptStash(editorText);
+		this.editor.setText("");
+		this.submittedInputBehavior = "followUp";
+		// onSubmit consumes the behavior flag and bumps the generation synchronously;
+		// capture the generation so an older failed submit never clobbers newer
+		// typing or submissions.
+		const submission = this.editor.onSubmit(text);
+		this.submittedInputBehavior = "steer";
+		const submissionGeneration = this.inputSubmissionGeneration;
 		try {
-			// Queue input during compaction (extension commands execute immediately)
-			if (this.isAgentCompacting()) {
-				if (this.isExtensionCommand(text)) {
-					this.editor.addToHistory?.(text);
-					clearedSubmittedText = text;
-					this.editor.setText("");
-					await this.agentConnection.prompt(text, { images: this.collectImagesFor(text) });
-					clearedSubmittedText = undefined;
-				} else {
-					this.queueCompactionMessage(text, "followUp");
-				}
-				return;
-			}
-
-			// Alt+Enter queues a follow-up message (waits until agent finishes)
-			// This handles extension commands (execute immediately), prompt template expansion, and queueing
-			if (this.isAgentStreaming()) {
-				const images = this.collectImagesFor(text);
-				this.editor.addToHistory?.(text);
-				clearedSubmittedText = text;
-				this.editor.setText("");
-				await this.agentConnection.prompt(text, { streamingBehavior: "followUp", images });
-				clearedSubmittedText = undefined;
-				this.updatePendingMessagesDisplay();
-				this.ui.requestRender();
-			}
-			// If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
-			else if (this.editor.onSubmit) {
-				clearedSubmittedText = text;
-				this.editor.setText("");
-				await this.editor.onSubmit(text);
-				clearedSubmittedText = undefined;
-			}
+			await submission;
 		} catch (error) {
-			if (clearedSubmittedText !== undefined) {
-				this.editor.setText(clearedSubmittedText);
-				this.promptStash = promptStashToRestore;
+			if (submissionGeneration === this.inputSubmissionGeneration && this.editor.getText().length === 0) {
+				this.editor.setText(text);
 			}
 			throw error;
-		} finally {
-			if (promptStashToRestore !== undefined && clearedSubmittedText === undefined) {
-				this.restorePromptStashIfEditorEmpty(promptStashToRestore);
-			}
 		}
 	}
 
@@ -6936,7 +7194,6 @@ export class InteractiveMode {
 
 		void (async () => {
 			// Rebuild chat from session messages
-			this.chatContainer.clear();
 			await this.rebuildChatFromMessages();
 
 			// If streaming, re-add the streaming component with updated visibility and re-render
@@ -7046,27 +7303,15 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	/**
-	 * Get all queued messages (read-only).
-	 * Combines session queue and compaction queue.
-	 */
+	/** Get all queued messages from the session-owned connection queue. */
 	private getAllQueuedMessages(): { steering: string[]; followUp: string[] } {
 		return {
-			steering: [
-				...this.connectionQueue.steering,
-				...this.compactionQueuedMessages.filter((msg) => msg.mode === "steer").map((msg) => msg.text),
-			],
-			followUp: [
-				...this.connectionQueue.followUp,
-				...this.compactionQueuedMessages.filter((msg) => msg.mode === "followUp").map((msg) => msg.text),
-			],
+			steering: [...this.connectionQueue.steering],
+			followUp: [...this.connectionQueue.followUp],
 		};
 	}
 
-	/**
-	 * Clear all queued messages and return their contents.
-	 * Clears both session queue and compaction queue.
-	 */
+	/** Clear all session-owned queued messages and return their contents. */
 	private async clearAllQueues(
 		options: { abort?: boolean } = {},
 	): Promise<{ steering: string[]; followUp: string[] }> {
@@ -7074,17 +7319,7 @@ export class InteractiveMode {
 			? await this.agentConnection.abortAndClearQueue()
 			: await this.agentConnection.clearQueue();
 		this.connectionQueue = { steering: [], followUp: [] };
-		const compactionSteering = this.compactionQueuedMessages
-			.filter((msg) => msg.mode === "steer")
-			.map((msg) => msg.text);
-		const compactionFollowUp = this.compactionQueuedMessages
-			.filter((msg) => msg.mode === "followUp")
-			.map((msg) => msg.text);
-		this.compactionQueuedMessages = [];
-		return {
-			steering: [...steering, ...compactionSteering],
-			followUp: [...followUp, ...compactionFollowUp],
-		};
+		return { steering, followUp };
 	}
 
 	private updatePendingMessagesDisplay(): void {
@@ -7152,102 +7387,6 @@ export class InteractiveMode {
 		}
 		this.updatePendingMessagesDisplay();
 		return allQueued.length;
-	}
-
-	private queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.compactionQueuedMessages.push({ text, mode });
-		this.editor.addToHistory?.(text);
-		this.editor.setText("");
-		this.updatePendingMessagesDisplay();
-		this.showStatus("Queued message for after compaction");
-	}
-
-	private isExtensionCommand(text: string): boolean {
-		if (!text.startsWith("/")) return false;
-
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-		return this.connectionCommands.some((command) => command.source === "extension" && command.name === commandName);
-	}
-
-	private async flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
-		if (this.compactionQueuedMessages.length === 0) {
-			return;
-		}
-
-		const queuedMessages = [...this.compactionQueuedMessages];
-		this.compactionQueuedMessages = [];
-		this.updatePendingMessagesDisplay();
-
-		const restoreQueue = async (error: unknown) => {
-			await this.agentConnection.clearQueue().catch(() => undefined);
-			this.connectionQueue = { steering: [], followUp: [] };
-			this.compactionQueuedMessages = queuedMessages;
-			this.updatePendingMessagesDisplay();
-			this.showError(
-				`Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}: ${
-					error instanceof Error ? error.message : String(error)
-				}`,
-			);
-		};
-
-		try {
-			if (options?.willRetry) {
-				// When retry is pending, queue messages for the retry turn
-				for (const message of queuedMessages) {
-					if (this.isExtensionCommand(message.text)) {
-						await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
-					} else if (message.mode === "followUp") {
-						await this.agentConnection.followUp(message.text, this.collectImagesFor(message.text));
-					} else {
-						await this.agentConnection.steer(message.text, this.collectImagesFor(message.text));
-					}
-				}
-				this.updatePendingMessagesDisplay();
-				return;
-			}
-
-			// Find first non-extension-command message to use as prompt
-			const firstPromptIndex = queuedMessages.findIndex((message) => !this.isExtensionCommand(message.text));
-			if (firstPromptIndex === -1) {
-				// All extension commands - execute them all
-				for (const message of queuedMessages) {
-					await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
-				}
-				return;
-			}
-
-			// Execute any extension commands before the first prompt
-			const preCommands = queuedMessages.slice(0, firstPromptIndex);
-			const firstPrompt = queuedMessages[firstPromptIndex];
-			const rest = queuedMessages.slice(firstPromptIndex + 1);
-
-			for (const message of preCommands) {
-				await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
-			}
-
-			// Send first prompt (starts streaming)
-			const promptPromise = this.agentConnection
-				.prompt(firstPrompt.text, { images: this.collectImagesFor(firstPrompt.text) })
-				.catch((error) => {
-					void restoreQueue(error);
-				});
-
-			// Queue remaining messages
-			for (const message of rest) {
-				if (this.isExtensionCommand(message.text)) {
-					await this.agentConnection.prompt(message.text, { images: this.collectImagesFor(message.text) });
-				} else if (message.mode === "followUp") {
-					await this.agentConnection.followUp(message.text, this.collectImagesFor(message.text));
-				} else {
-					await this.agentConnection.steer(message.text, this.collectImagesFor(message.text));
-				}
-			}
-			this.updatePendingMessagesDisplay();
-			void promptPromise;
-		} catch (error) {
-			await restoreQueue(error);
-		}
 	}
 
 	// =========================================================================
@@ -9264,41 +9403,6 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private handleGoalStatusCommand(): void {
-		const goal = this.getGoalState();
-		if (goal.status === "idle" || !goal.objective) {
-			this.showStatus("No active goal");
-			return;
-		}
-
-		const lines = [
-			theme.bold("Goal"),
-			"",
-			`${theme.fg("dim", "Status:")} ${goal.status}`,
-			`${theme.fg("dim", "Objective:")} ${goal.objective}`,
-			`${theme.fg("dim", "Time:")} ${this.formatGoalElapsed(goal.timeUsedSeconds)}`,
-			`${theme.fg("dim", "Continuations:")} ${goal.continuationsUsed}`,
-			`${theme.fg("dim", "Tokens:")} ${goal.tokensUsed.toLocaleString()}${
-				goal.tokenBudget === undefined ? "" : ` / ${goal.tokenBudget.toLocaleString()}`
-			}`,
-		];
-		if (goal.tokenBudget !== undefined) {
-			lines.push(
-				`${theme.fg("dim", "Remaining:")} ${Math.max(0, goal.tokenBudget - goal.tokensUsed).toLocaleString()}`,
-			);
-		}
-		if (goal.lastReason) {
-			lines.push(`${theme.fg("dim", "Reason:")} ${goal.lastReason}`);
-		}
-		if (goal.lastError) {
-			lines.push(`${theme.fg("dim", "Error:")} ${goal.lastError}`);
-		}
-
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(lines.join("\n"), 1, 0));
-		this.ui.requestRender();
-	}
-
 	private async handleHeartbeatCommand(text: string): Promise<void> {
 		try {
 			const command = parseHeartbeatCommand(text);
@@ -9787,94 +9891,6 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 		if (model.provider === "opencode" && model.id.toLowerCase().includes("kimi-k2.5")) {
 			this.handleDaxnuts();
 		}
-	}
-
-	private async handleCompactCommand(customInstructions?: string): Promise<void> {
-		let messageCount: number;
-		try {
-			const stats = await this.agentConnection.getSessionStats();
-			messageCount = stats.totalMessages;
-		} catch (error) {
-			this.showError(error instanceof Error ? error.message : String(error));
-			return;
-		}
-
-		if (messageCount < 2) {
-			this.showWarning("Nothing to compact (no messages yet)");
-			return;
-		}
-
-		this.stopWorkingLoader();
-
-		try {
-			await this.agentConnection.compact(customInstructions);
-		} catch {
-			// Ignore, will be emitted as an event
-		}
-	}
-
-	private async handleRefineCommand(args?: string): Promise<void> {
-		let trimmedArgs = args?.trim() ?? "";
-		const globalOption: { global: boolean } = { global: false };
-		if (/^--global(?=\s|$)/.test(trimmedArgs)) {
-			globalOption.global = true;
-			trimmedArgs = trimmedArgs.replace(/^--global(?=\s|$)/, "").trim();
-		}
-		const rollbackPrefix = "rollback ";
-		let options: { instructions?: string; rollbackId?: string; global?: boolean };
-
-		if (trimmedArgs === "rollback") {
-			this.showWarning("Usage: /refine rollback <refinement-id>");
-			return;
-		}
-
-		if (trimmedArgs?.startsWith(rollbackPrefix) && trimmedArgs.slice(rollbackPrefix.length).trim()) {
-			// Rollback uses the global refinement history, not the current trajectory,
-			// so it must work even in a fresh session with no messages yet.
-			let rollbackId = trimmedArgs.slice(rollbackPrefix.length).trim();
-			if (/\s--global$/.test(rollbackId)) {
-				globalOption.global = true;
-				rollbackId = rollbackId.replace(/\s--global$/, "").trim();
-			}
-			options = { rollbackId, ...globalOption };
-		} else {
-			let messageCount: number;
-			try {
-				const stats = await this.agentConnection.getSessionStats();
-				messageCount = stats.totalMessages;
-			} catch (error) {
-				this.showError(error instanceof Error ? error.message : String(error));
-				return;
-			}
-
-			if (messageCount < 2) {
-				this.showWarning("Nothing to refine (no trajectory yet)");
-				return;
-			}
-			options = { instructions: trimmedArgs || undefined, ...globalOption };
-		}
-
-		this.stopWorkingLoader();
-		this.showStatus(
-			options.rollbackId
-				? `Rolling back refinement ${options.rollbackId}...`
-				: `Refining ${options.global ? "global" : "local"} continual harness state...`,
-		);
-
-		this.agentConnection
-			.refine(options)
-			.then((result) => {
-				const applied = result.appliedEdits.filter((edit) => edit.applied).length;
-				const failed = result.appliedEdits.length - applied;
-				const failedSuffix = failed > 0 ? `, ${failed} failed` : "";
-				this.showStatus(
-					`Refined continual harness state: ${applied} edit${applied === 1 ? "" : "s"} applied${failedSuffix}`,
-				);
-				this.showStatus(`Harness state: ${result.harnessStatePath}`);
-			})
-			.catch((error) => {
-				this.showError(`Refinement failed: ${error instanceof Error ? error.message : String(error)}`);
-			});
 	}
 
 	stop(options: { preserveAltScreen?: boolean } = {}): void {

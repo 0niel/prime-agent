@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import type { DaemonCommand, DaemonResponse } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
 
 interface SupervisorHarness {
 	handleLine(client: DaemonSocketClient, line: string): Promise<void>;
@@ -24,6 +25,7 @@ describe("daemon supervisor side-question routing", () => {
 			workers: new Map(),
 			clients: new Set(),
 			protocolClientIds: new WeakMap(),
+			mutationDrain: new MutationDrainLatch(),
 			handleCommand,
 			write,
 			log: vi.fn(),

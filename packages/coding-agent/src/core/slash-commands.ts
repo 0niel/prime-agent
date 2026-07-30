@@ -10,9 +10,58 @@ export interface SlashCommandInfo {
 	sourceInfo: SourceInfo;
 }
 
+export const SESSION_SLASH_COMMAND_NAMES = ["compact", "refine", "goal", "autonomous"] as const;
+
+export type SessionSlashCommandName = (typeof SESSION_SLASH_COMMAND_NAMES)[number];
+
+const SESSION_SLASH_COMMAND_NAME_SET: ReadonlySet<string> = new Set(SESSION_SLASH_COMMAND_NAMES);
+
+export function isSessionSlashCommandName(value: unknown): value is SessionSlashCommandName {
+	return typeof value === "string" && SESSION_SLASH_COMMAND_NAME_SET.has(value);
+}
+
+export interface SessionSlashCommand {
+	name: SessionSlashCommandName;
+	args: string;
+	text: string;
+}
+
+export interface RefineCommandOptions {
+	instructions?: string;
+	rollbackId?: string;
+	global?: boolean;
+}
+
+export function parseRefineCommandOptions(args: string): RefineCommandOptions {
+	let rest = args.trim();
+	let global = false;
+	if (/^--global(?=\s|$)/.test(rest)) {
+		global = true;
+		rest = rest.replace(/^--global(?=\s|$)/, "").trim();
+	}
+	if (rest === "rollback") throw new Error("Usage: /refine rollback <refinement-id>");
+	// Slash-command args keep their original separators (tabs, Unicode spaces);
+	// match the subcommand with the same class parseSlashCommand splits on.
+	const rollbackMatch = /^rollback[\t\p{Zs}]/u.exec(rest);
+	if (rollbackMatch) {
+		let rollbackId = rest.slice(rollbackMatch[0].length).trim();
+		if (rollbackId === "--global") {
+			throw new Error("Usage: /refine rollback <refinement-id>");
+		}
+		if (/\s--global$/.test(rollbackId)) {
+			global = true;
+			rollbackId = rollbackId.replace(/\s--global$/, "").trim();
+		}
+		if (!rollbackId) throw new Error("Usage: /refine rollback <refinement-id>");
+		return { rollbackId, global };
+	}
+	return { instructions: rest || undefined, global };
+}
+
 export interface BuiltinSlashCommand {
 	name: string;
 	description: string;
+	execution?: "client" | "session";
 	/** Shown in autocomplete before the description, e.g. "[instructions]" */
 	argumentHint?: string;
 	/** Hidden names that resolve to this command without being shown as commands. */
@@ -91,11 +140,20 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		description: "Compact the session context; optional instructions focus the summary",
 		argumentHint: "[instructions]",
 	},
-	{ name: "refine", description: "Refine continual harness prompt notes, skills, subagents, and memory" },
+	{
+		name: "refine",
+		description: "Refine continual harness prompt notes, skills, subagents, and memory",
+	},
 	{
 		name: "goal",
 		description: "Set or view a persistent goal; supports pause, resume, and clear",
 		argumentHint: "[objective]",
+		takesArgument: true,
+	},
+	{
+		name: "autonomous",
+		description: "Set or view autonomous mode",
+		argumentHint: "[status|on|off]",
 		takesArgument: true,
 	},
 	{
@@ -142,6 +200,7 @@ function buildBuiltinSlashCommands(): ReadonlyArray<BuiltinSlashCommand> {
 	}
 	return CANONICAL_BUILTIN_SLASH_COMMANDS.map((command) => ({
 		...command,
+		...(isSessionSlashCommandName(command.name) ? { execution: "session" as const } : {}),
 		...(aliasesByTarget.has(command.name) ? { aliases: aliasesByTarget.get(command.name) } : {}),
 	}));
 }
@@ -182,4 +241,14 @@ export function resolveSlashCommand(command: ParsedSlashCommand): ResolvedSlashC
 		originalName: command.name,
 		isAlias: name !== command.name,
 	};
+}
+
+export function parseSessionSlashCommand(text: string): SessionSlashCommand | undefined {
+	if (/[\r\n\u2028\u2029]/u.test(text)) return undefined;
+	const parsed = parseSlashCommand(text);
+	if (!parsed) return undefined;
+	const name = resolveBuiltinSlashCommandName(parsed.name);
+	const command = BUILTIN_SLASH_COMMAND_BY_NAME.get(name);
+	if (command?.execution !== "session" || !isSessionSlashCommandName(name)) return undefined;
+	return { name, args: parsed.args, text };
 }

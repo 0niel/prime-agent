@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { getModel } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
-import type { AgentSessionEvent, AgentSessionEventListener } from "../src/core/agent-session.js";
+import { describe, expect, it, vi } from "vitest";
+import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from "../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { emptyGoalState } from "../src/core/goals.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
@@ -142,6 +142,61 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 }
 
 describe("InProcessAgentConnection", () => {
+	it.each([
+		{ accepted: true, promptResult: "pending", expectedError: undefined },
+		{ accepted: false, promptResult: "resolve", expectedError: "Prompt was not accepted by the session." },
+		{ accepted: false, promptResult: "reject", expectedError: "real session error" },
+	] as const)(
+		"settles bare prompts from admission (accepted: $accepted, result: $promptResult)",
+		async ({ accepted, promptResult, expectedError }) => {
+			const session = createFakeSession("prompt-admission", []);
+			let finishTurn = () => {};
+			const turn = new Promise<void>((resolve) => {
+				finishTurn = resolve;
+			});
+			const prompt = vi.fn((_message: string, options?: PromptOptions) => {
+				options?.preflightResult?.(accepted);
+				if (promptResult === "pending") return turn;
+				if (promptResult === "reject") return Promise.reject(new Error("real session error"));
+				return Promise.resolve();
+			});
+			Object.assign(session.session, { prompt });
+			const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+			const result = expect(connection.prompt("hello"));
+
+			if (expectedError) await result.rejects.toThrow(expectedError);
+			else await result.resolves.toBeUndefined();
+			expect(prompt).toHaveBeenCalledWith(
+				"hello",
+				expect.objectContaining({ preflightResult: expect.any(Function) }),
+			);
+			finishTurn();
+		},
+	);
+	it("forwards prompt admission cancellation to the session", async () => {
+		const session = createFakeSession("prompt-cancellation", []);
+		const prompt = vi.fn(
+			(_message: string, options?: PromptOptions) =>
+				new Promise<void>((_resolve, reject) => {
+					options?.signal?.addEventListener("abort", () => reject(new Error("Prompt admission was cancelled.")), {
+						once: true,
+					});
+				}),
+		);
+		Object.assign(session.session, { prompt });
+		const connection = new InProcessAgentConnection(asRuntime(new FakeRuntime(session.session)));
+		const controller = new AbortController();
+
+		const admission = connection.prompt("hello", { signal: controller.signal });
+		controller.abort();
+
+		await expect(admission).rejects.toThrow("Prompt admission was cancelled.");
+		expect(prompt).toHaveBeenCalledWith(
+			"hello",
+			expect.objectContaining({ signal: controller.signal, preflightResult: expect.any(Function) }),
+		);
+	});
+
 	it("loads the full model catalog through the connection boundary", async () => {
 		const session = createFakeSession("models", []);
 		const runtime = new FakeRuntime(session.session);

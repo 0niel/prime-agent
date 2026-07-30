@@ -379,7 +379,7 @@ describe("ENG-4509 side questions", () => {
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
 			defaultEditor,
-			editor: { setText, addToHistory },
+			editor: { getText: () => "", setText, addToHistory },
 			promptStashState: { stash: undefined },
 			clearShortcutGuide: vi.fn(),
 			sideQuestionComponent: {},
@@ -406,7 +406,7 @@ describe("ENG-4509 side questions", () => {
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
 			defaultEditor,
-			editor: { setText: vi.fn(), addToHistory },
+			editor: { getText: () => "", setText: vi.fn(), addToHistory },
 			promptStashState: { stash: undefined },
 			clearShortcutGuide: vi.fn(),
 			sideQuestionComponent: {},
@@ -441,7 +441,7 @@ describe("ENG-4509 side questions", () => {
 			const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 			const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
 				defaultEditor,
-				editor: { setText: vi.fn(), addToHistory: vi.fn() },
+				editor: { getText: () => "", setText: vi.fn(), addToHistory: vi.fn() },
 				promptStashState: { stash: undefined },
 				clearShortcutGuide: vi.fn(),
 				sideQuestionComponent: { addTurn },
@@ -482,7 +482,7 @@ describe("ENG-4509 side questions", () => {
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
 			defaultEditor,
-			editor: { setText: vi.fn(), addToHistory: vi.fn() },
+			editor: { getText: () => "", setText: vi.fn(), addToHistory: vi.fn() },
 			promptStashState: { stash: undefined },
 			clearShortcutGuide: vi.fn(),
 			sideQuestionComponent: { finishBash },
@@ -628,7 +628,7 @@ describe("ENG-4509 side questions", () => {
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
 			defaultEditor,
-			editor: { setText, addToHistory: vi.fn() },
+			editor: { getText: () => "", setText, addToHistory: vi.fn() },
 			promptStashState: { stash: undefined },
 			clearShortcutGuide: vi.fn(),
 			sideQuestionComponent: { addTurn },
@@ -659,7 +659,7 @@ describe("ENG-4509 side questions", () => {
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
 			defaultEditor,
-			editor: { setText, addToHistory: vi.fn() },
+			editor: { getText: () => "", setText, addToHistory: vi.fn() },
 			promptStashState: { stash: undefined },
 			clearShortcutGuide: vi.fn(),
 			sideQuestionComponent: {},
@@ -688,7 +688,7 @@ describe("ENG-4509 side questions", () => {
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
 			defaultEditor,
-			editor: { setText, addToHistory: vi.fn() },
+			editor: { getText: () => "", setText, addToHistory: vi.fn() },
 			promptStashState: { stash: undefined },
 			clearShortcutGuide: vi.fn(),
 			sideQuestionComponent: { addTurn },
@@ -786,7 +786,7 @@ describe("ENG-4509 side questions", () => {
 			const chatContainer = new Container();
 			const fakeThis = Object.assign(Object.create(InteractiveMode.prototype), {
 				defaultEditor,
-				editor: { setText: vi.fn(), addToHistory: vi.fn() },
+				editor: { getText: () => "", setText: vi.fn(), addToHistory: vi.fn() },
 				promptStashState: { stash: undefined },
 				clearShortcutGuide: vi.fn(),
 				sideQuestionComponent: { addBash, finishBash },

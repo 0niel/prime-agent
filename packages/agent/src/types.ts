@@ -192,6 +192,15 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	shouldStopAfterTurn?: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
 
 	/**
+	 * Called synchronously after a completed turn and before polling work for another turn.
+	 * Return true to emit `agent_end` without starting another provider call. Work returned by
+	 * an asynchronous poll owns that boundary; queue owners must suppress stale continuation
+	 * results if their higher-level stop condition changes while generating them.
+	 * The hook is never checked before the initial assistant turn.
+	 */
+	shouldStopBeforeTurn?: () => boolean;
+
+	/**
 	 * Returns steering messages to inject into the conversation mid-run.
 	 *
 	 * Called after the current assistant turn finishes executing its tool calls, unless `shouldStopAfterTurn` exits first.

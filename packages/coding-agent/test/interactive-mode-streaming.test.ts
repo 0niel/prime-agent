@@ -50,6 +50,8 @@ type HandleEventThis = {
 	stopWorkingLoader(): void;
 	resetPendingToolState(): void;
 	checkShutdownRequested(): Promise<void>;
+	applyOptimisticContextUsage(): void;
+	refreshConnectionContextUsage(): Promise<void>;
 	setSessionHasMessages(hasMessages: boolean): void;
 	clearShortcutGuide(): void;
 	addMessageToChat(): void;
@@ -100,6 +102,8 @@ function createFakeInteractiveModeThis(): HandleEventThis {
 		stopWorkingLoader: vi.fn(),
 		resetPendingToolState: vi.fn(),
 		checkShutdownRequested: vi.fn(async () => {}),
+		applyOptimisticContextUsage: vi.fn(),
+		refreshConnectionContextUsage: vi.fn(async () => {}),
 		setSessionHasMessages: vi.fn(),
 		clearShortcutGuide: vi.fn(),
 		addMessageToChat: vi.fn(),
@@ -169,6 +173,22 @@ describe("InteractiveMode streaming events", () => {
 		expect(renderChat(fakeThis.chatContainer)).toContain("final response");
 		expect(fakeThis.streamingComponent).toBeUndefined();
 		expect(fakeThis.streamingMessage).toBeUndefined();
+	});
+
+	test("does not block later compaction events on the agent-end stats refresh", async () => {
+		const fakeThis = createFakeInteractiveModeThis();
+		let resolveRefresh!: () => void;
+		fakeThis.refreshConnectionContextUsage = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					resolveRefresh = resolve;
+				}),
+		);
+		const handleEvent = (InteractiveMode.prototype as unknown as { handleEvent: HandleEvent }).handleEvent;
+
+		await expect(handleEvent.call(fakeThis, { type: "agent_end", messages: [] })).resolves.toBeUndefined();
+		expect(fakeThis.refreshConnectionContextUsage).toHaveBeenCalledOnce();
+		resolveRefresh();
 	});
 
 	test("keeps attached partial assistant text when agent_end arrives without message_end", async () => {

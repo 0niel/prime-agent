@@ -45,6 +45,7 @@ interface MockCustomMessage {
 	content: string;
 	display: boolean;
 	timestamp: number;
+	details?: unknown;
 }
 
 interface MockQueuedMessage {
@@ -1217,6 +1218,16 @@ describe("self-update daemon restart", () => {
 			display: true,
 			timestamp: Date.now(),
 		};
+		const commandMessage: MockCustomMessage = {
+			role: "custom",
+			customType: "session_slash_command",
+			content: "/autonomous on",
+			display: true,
+			timestamp: Date.now(),
+			details: {
+				command: { name: "autonomous", args: "on", text: "/autonomous on" },
+			},
+		};
 		const prefixMessage: MockCustomMessage = {
 			role: "custom",
 			customType: "ipython_state_restored",
@@ -1242,6 +1253,11 @@ describe("self-update daemon restart", () => {
 								agentMessageId: "agentmsg_followup",
 								customMessage,
 								prefixMessages: [prefixMessage],
+							},
+							{
+								message: "/autonomous on",
+								agentMessageId: "agentmsg_command",
+								customMessage: commandMessage,
 							},
 						],
 						nextTurn: [],
@@ -1272,6 +1288,31 @@ describe("self-update daemon restart", () => {
 					customMessage,
 					prefixMessages: [prefixMessage],
 				}),
+			);
+			expect(mockState.requestPayloads).toContainEqual(
+				expect.objectContaining({
+					type: "follow_up",
+					activeSessionId: "restored-active",
+					message: "/autonomous on",
+					agentMessageId: "agentmsg_command",
+					customMessage: commandMessage,
+				}),
+			);
+			mockState.prepareResponse = {
+				success: true,
+				data: {
+					...mockState.prepareManifest,
+					sessions: mockState.prepareManifest.sessions.map((session) => ({
+						...session,
+						queue: {
+							...session.queue,
+							followUp: [{ message: "/autonomous off", customMessage: commandMessage }],
+						},
+					})),
+				},
+			};
+			await expect(prepareDaemonUpdateRestart(mockState.socketPath, agentDir)).rejects.toThrow(
+				"invalid custom queued message",
 			);
 		} finally {
 			errorSpy.mockRestore();

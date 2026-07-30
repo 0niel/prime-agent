@@ -222,7 +222,9 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			session.dispose();
 			fauxProvider.unregister();
 			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true });
+				// Spawned fixture processes may still be flushing their final registry
+				// writes; retry briefly instead of failing the suite on ENOTEMPTY.
+				rmSync(tempDir, { recursive: true, force: true, maxRetries: 40, retryDelay: 50 });
 			}
 		},
 	};

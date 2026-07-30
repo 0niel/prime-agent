@@ -4,21 +4,52 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getDaemonUpdateRestartManifestPath } from "../../../src/config.js";
 import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.js";
-import type { AgentCronJobStore, AgentCronScheduler } from "../../../src/core/cron-jobs.js";
-import type { CustomMessage } from "../../../src/core/messages.js";
+import type { AgentCronJob, AgentCronJobStore, AgentCronScheduler } from "../../../src/core/cron-jobs.js";
+import { type CustomMessage, createSessionSlashCommandMessage } from "../../../src/core/messages.js";
+import { parseSessionSlashCommand } from "../../../src/core/slash-commands.js";
 import type { BashOperations } from "../../../src/core/tools/bash.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../../../src/modes/daemon/daemon-mode.js";
 import type { DaemonUpdateRestartManifest } from "../../../src/modes/daemon/daemon-protocol.js";
+import { MutationDrainLatch } from "../../../src/modes/daemon/mutation-drain-latch.js";
 import { prepareDaemonUpdateRestart } from "../../../src/package-manager-cli.js";
-import { createHarness, getUserTexts, type Harness } from "../harness.js";
+import { createHarness, getMessageText, getUserTexts, type Harness } from "../harness.js";
+import { createDeferred } from "../scheduling.js";
 
 type AgentDaemonUpdateInternals = {
 	sessions: Map<string, ActiveSessionState>;
 	cronStore: AgentCronJobStore;
 	cronScheduler: AgentCronScheduler;
+	runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
 	prepareUpdateRestart(): Promise<DaemonUpdateRestartManifest>;
+	beginUpdateRestartTransaction(owner?: DaemonSocketClient): NonNullable<AgentDaemonUpdateInternals["updateRestart"]>;
+	runUpdateRestartPreparation(
+		transaction: NonNullable<AgentDaemonUpdateInternals["updateRestart"]>,
+	): Promise<DaemonUpdateRestartManifest>;
+	prepareUpdateRestartCheckpoint(
+		transaction: NonNullable<AgentDaemonUpdateInternals["updateRestart"]>,
+	): Promise<DaemonUpdateRestartManifest>;
 	handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+	handleWorkerCommand(client: DaemonSocketClient, command: { id: string; type: string }): Promise<void>;
+	mutationDrain: { begin(): void; end(): void };
+	updateRestart?: {
+		id: symbol;
+		abort: AbortController;
+		phase: "preparing" | "fencing" | "prepared" | "publishing";
+		manifest?: DaemonUpdateRestartManifest;
+		owner?: DaemonSocketClient;
+		deferredClientEnv: Array<{
+			client: DaemonSocketClient;
+			state: ActiveSessionState;
+			env: Record<string, string>;
+		}>;
+	};
+	supervisorClaims: Map<DaemonSocketClient, unknown>;
+	revokeSupervisorClaim(client: DaemonSocketClient): boolean;
+	shutdown(exitCode: number): Promise<never>;
+	getShutdownClosingReason(): "update" | "shutdown";
+	cancelPreparedUpdateRestart(transactionId?: symbol): void;
+	commitPreparedUpdateRestart(transactionId: symbol): Promise<DaemonUpdateRestartManifest>;
 };
 
 type QueueInternals = {
@@ -52,12 +83,6 @@ type QueueInternals = {
 	};
 };
 
-type AgentInternals = {
-	_state: {
-		isStreaming: boolean;
-	};
-};
-
 function createState(
 	harness: Harness,
 	activeSessionId: string,
@@ -67,6 +92,7 @@ function createState(
 	const runtime = {
 		session: harness.session,
 		metadata,
+		cwd: harness.tempDir,
 		runtimeConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
 		diagnostics: [],
 		dispose: async () => {
@@ -82,6 +108,41 @@ function createState(
 		lastEventSequence: 0,
 		...(options.clientEnv ? { clientEnv: options.clientEnv } : {}),
 	};
+}
+
+function createDaemonInternals(
+	harness: Harness,
+	options: { sessionDir?: string; worker?: boolean } = {},
+): AgentDaemonUpdateInternals {
+	const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
+		defaultSessionConfig: {
+			cwd: harness.tempDir,
+			agentDir: harness.tempDir,
+			...(options.sessionDir ? { sessionDir: options.sessionDir } : {}),
+		},
+		...(options.worker ? { worker: { authenticationToken: "token" } } : {}),
+		createRuntime: async () => {
+			throw new Error("unexpected runtime creation");
+		},
+	});
+	return daemon as unknown as AgentDaemonUpdateInternals;
+}
+
+function createWriteClient(writes: string[], options: { id?: string; attached?: string[] } = {}): DaemonSocketClient {
+	return {
+		id: options.id ?? "client-1",
+		socket: {
+			destroyed: false,
+			write: vi.fn((chunk: string) => {
+				writes.push(chunk);
+				return true;
+			}),
+		} as unknown as DaemonSocketClient["socket"],
+		attachedActiveSessionIds: new Set(options.attached ?? []),
+		detachInput: vi.fn(),
+		supportsExtensionUi: false,
+		capabilities: new Set(),
+	} as DaemonSocketClient;
 }
 
 function hasArchivedState(harness: Harness): boolean {
@@ -117,6 +178,386 @@ describe("issue #4257 update restart resume", () => {
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
+	});
+
+	it.each([
+		[undefined, "shutdown"],
+		["preparing", "shutdown"],
+		["fencing", "shutdown"],
+		["prepared", "shutdown"],
+		["publishing", "update"],
+	] as const)("uses %s restart phase as %s shutdown", async (phase, expected) => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = createDaemonInternals(harness);
+		if (phase) {
+			internals.updateRestart = {
+				id: Symbol("update-restart"),
+				abort: new AbortController(),
+				phase,
+				deferredClientEnv: [],
+			};
+		}
+
+		expect(internals.getShutdownClosingReason()).toBe(expected);
+	});
+
+	it("waits for the admitted prompt event checkpoint before preparing restart", async () => {
+		let releaseAssistantMessageEnd: (() => void) | undefined;
+		const assistantMessageEndBlocked = new Promise<void>((resolve) => {
+			releaseAssistantMessageEnd = resolve;
+		});
+		const harness = await createHarness({
+			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_end", async (event) => {
+						if (event.message.role === "assistant") {
+							await assistantMessageEndBlocked;
+						}
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("restart response")]);
+		let promptAdmitted = false;
+		const originalPrompt = harness.session.agent.prompt.bind(harness.session.agent);
+		vi.spyOn(harness.session.agent, "prompt").mockImplementation((...args) => {
+			promptAdmitted = true;
+			return originalPrompt(...args);
+		});
+		await harness.session.restoreFollowUpMessage("admitted restart input");
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		await vi.waitFor(() => expect(promptAdmitted).toBe(true));
+
+		const internals = createDaemonInternals(harness);
+		internals.sessions.set(
+			"active-1",
+			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
+		);
+		let checkpointWaitEntered = false;
+		const originalCheckpointWait = harness.session.waitForSessionInputCheckpoint.bind(harness.session);
+		vi.spyOn(harness.session, "waitForSessionInputCheckpoint").mockImplementation((signal) => {
+			checkpointWaitEntered = true;
+			return originalCheckpointWait(signal);
+		});
+		let prepareSettled = false;
+		const prepare = internals.prepareUpdateRestart().then((manifest) => {
+			prepareSettled = true;
+			return manifest;
+		});
+		await vi.waitFor(() => expect(checkpointWaitEntered).toBe(true));
+		await harness.session.restoreFollowUpMessage("paused restart input");
+		await vi.waitFor(() =>
+			expect(
+				harness.sessionManager
+					.getEntries()
+					.some(
+						(entry) =>
+							entry.type === "message" &&
+							entry.message.role === "user" &&
+							getMessageText(entry.message) === "admitted restart input",
+					),
+			).toBe(true),
+		);
+		expect(prepareSettled).toBe(false);
+
+		releaseAssistantMessageEnd?.();
+		const manifest = await prepare;
+
+		expect(manifest.sessions).toHaveLength(1);
+		expect(manifest.sessions[0]).toMatchObject({
+			queue: { steering: [], nextTurn: [] },
+			shouldResume: true,
+			wasStreaming: false,
+			wasRetrying: false,
+			hadAcceptedPromptInFlight: false,
+		});
+		expect(manifest.sessions[0]?.queue.followUp).toEqual([
+			{
+				message: "paused restart input",
+				content: [{ type: "text", text: "paused restart input" }],
+			},
+		]);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.some(
+					(entry) =>
+						entry.type === "message" &&
+						entry.message.role === "assistant" &&
+						getMessageText(entry.message) === "restart response",
+				),
+		).toBe(true);
+	});
+
+	it.each([
+		{ name: "worker cancel releases a prepare blocked on an executing mutation", release: "cancel" },
+		{ name: "standalone prepare waits for an executing daemon mutation", release: "drain" },
+	] as const)("$name", async ({ release }) => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = createDaemonInternals(harness, { worker: true });
+		internals.mutationDrain.begin();
+		const writes: string[] = [];
+		const client = {
+			id: "supervisor",
+			socket: {
+				destroyed: false,
+				write: (chunk: string) => {
+					writes.push(chunk);
+					return true;
+				},
+			},
+		} as unknown as DaemonSocketClient;
+
+		if (release === "cancel") {
+			const prepare = internals.handleWorkerCommand(client, { id: "prepare", type: "worker_prepare_update" });
+			await vi.waitFor(() => expect(internals.updateRestart).toBeDefined());
+			await internals.handleWorkerCommand(client, { id: "cancel", type: "worker_cancel_update" });
+			await prepare;
+
+			expect(internals.updateRestart).toBeUndefined();
+			expect(writes.join(" ")).toContain("Update restart preparation cancelled");
+			expect(writes.join(" ")).toContain('"command":"worker_cancel_update","success":true');
+			return;
+		}
+		let settled = false;
+		const prepare = internals.prepareUpdateRestart().then((manifest) => {
+			settled = true;
+			return manifest;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		internals.mutationDrain.end();
+		await prepare;
+		expect(settled).toBe(true);
+	});
+
+	it("fences and drains a mutation admitted at the first drain boundary before checkpointing", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = createDaemonInternals(harness);
+		const mutationDrain = new MutationDrainLatch();
+		const transaction = {
+			id: Symbol("update-restart"),
+			abort: new AbortController(),
+			phase: "preparing" as const,
+			deferredClientEnv: [],
+		};
+		internals.updateRestart = transaction;
+		const firstDrain = createDeferred();
+		const originalWaitForDrain = mutationDrain.waitForDrain.bind(mutationDrain);
+		vi.spyOn(mutationDrain, "waitForDrain").mockImplementationOnce(async (...args) => {
+			await originalWaitForDrain(...args);
+			mutationDrain.begin();
+			firstDrain.resolve();
+		});
+		Reflect.set(internals, "mutationDrain", mutationDrain);
+		const checkpoint = vi.spyOn(internals, "prepareUpdateRestartCheckpoint").mockResolvedValue({
+			createdAt: "now",
+			sessions: [],
+		});
+
+		const prepare = internals.runUpdateRestartPreparation(transaction);
+		await firstDrain.promise;
+		await Promise.resolve();
+
+		expect(internals.updateRestart?.phase).toBe("fencing");
+		expect(checkpoint).not.toHaveBeenCalled();
+
+		mutationDrain.end();
+		await prepare;
+		expect(checkpoint).toHaveBeenCalledOnce();
+	});
+
+	it("waits for an already-claimed one-shot dispatch and runs it exactly once", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("scheduled response")]);
+		const promptSpy = vi.spyOn(harness.session, "promptUntilAccepted");
+		const state = createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() });
+		const internals = createDaemonInternals(harness);
+		internals.sessions.set(state.activeSessionId, state);
+		const now = new Date("2026-01-01T12:00:00.000Z");
+		const job = internals.cronStore.create({
+			activeSessionId: state.activeSessionId,
+			sessionId: harness.session.sessionId,
+			sessionFile: harness.session.sessionFile ?? "",
+			cwd: harness.tempDir,
+			scheduleText: "in 1m",
+			prompt: "claimed before restart",
+			now,
+		});
+		let markDispatchReached = () => {};
+		const dispatchReached = new Promise<void>((resolve) => {
+			markDispatchReached = resolve;
+		});
+		let releaseDispatch = () => {};
+		const dispatchGate = new Promise<void>((resolve) => {
+			releaseDispatch = resolve;
+		});
+		const originalRunCronJob = internals.runCronJob.bind(internals);
+		let runResult: "skipped" | undefined;
+		vi.spyOn(internals, "runCronJob").mockImplementation(async (claimedJob) => {
+			markDispatchReached();
+			await dispatchGate;
+			runResult = await originalRunCronJob(claimedJob);
+			return runResult;
+		});
+
+		const dispatch = internals.cronScheduler.runDue(new Date("2026-01-01T12:01:00.000Z"));
+		await dispatchReached;
+		let prepareSettled = false;
+		const prepare = internals.prepareUpdateRestart().then((manifest) => {
+			prepareSettled = true;
+			return manifest;
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(prepareSettled).toBe(false);
+
+		releaseDispatch();
+		await dispatch;
+		await prepare;
+		expect(runResult).toBeUndefined();
+		expect(promptSpy).toHaveBeenCalledOnce();
+		expect(promptSpy).toHaveBeenCalledWith(
+			"claimed before restart",
+			expect.objectContaining({ streamingBehavior: "followUp", source: "rpc" }),
+		);
+		expect(internals.cronStore.list().find((candidate) => candidate.id === job.id)).toMatchObject({
+			status: "completed",
+			runCount: 1,
+		});
+	});
+
+	type OwnershipContext = {
+		internals: AgentDaemonUpdateInternals;
+		makeClient: (id: string) => DaemonSocketClient;
+		writes: string[];
+	};
+
+	it.each<{ name: string; run: (context: OwnershipContext) => Promise<void> }>([
+		...(["worker_commit_update", "worker_cancel_update"] as const).map((type) => ({
+			name: `rejects ${type} from a different prepare owner`,
+			run: async ({ internals, makeClient, writes }: OwnershipContext) => {
+				const owner = makeClient("owner");
+				await internals.handleWorkerCommand(owner, { id: "prepare", type: "worker_prepare_update" });
+				await internals.handleWorkerCommand(makeClient("other"), { id: "foreign", type });
+				expect(writes.at(-1)).toContain("belongs to another supervisor");
+				expect(internals.updateRestart?.phase).toBe("prepared");
+				await internals.handleWorkerCommand(owner, { id: "cleanup", type: "worker_cancel_update" });
+			},
+		})),
+		{
+			name: "rejects a duplicate worker commit while publishing",
+			run: async ({ internals, makeClient, writes }) => {
+				const owner = makeClient("owner");
+				await internals.handleWorkerCommand(owner, { id: "prepare", type: "worker_prepare_update" });
+				const transaction = internals.updateRestart;
+				expect(transaction).toBeDefined();
+				transaction!.phase = "publishing";
+
+				await internals.handleWorkerCommand(owner, { id: "duplicate", type: "worker_commit_update" });
+
+				expect(writes.at(-1)).toContain("already committing");
+				transaction!.phase = "prepared";
+				internals.cancelPreparedUpdateRestart(transaction?.id);
+			},
+		},
+		{
+			name: "finishes cancelled transaction cleanup after a failed publish",
+			run: async ({ internals, makeClient }) => {
+				const owner = makeClient("owner");
+				await internals.handleWorkerCommand(owner, { id: "prepare", type: "worker_prepare_update" });
+				const transaction = internals.updateRestart;
+				expect(transaction).toBeDefined();
+				vi.spyOn(internals, "commitPreparedUpdateRestart").mockImplementationOnce(async () => {
+					internals.cancelPreparedUpdateRestart(transaction?.id);
+					throw new Error("publish failed");
+				});
+
+				await internals.handleWorkerCommand(owner, { id: "commit", type: "worker_commit_update" });
+
+				expect(internals.updateRestart).toBeUndefined();
+			},
+		},
+		{
+			name: "finishes publishing then exits when its owning supervisor is replaced",
+			run: async ({ internals, makeClient }) => {
+				const owner = makeClient("owner");
+				internals.supervisorClaims.set(owner, {});
+				await internals.handleWorkerCommand(owner, { id: "prepare", type: "worker_prepare_update" });
+				const transaction = internals.updateRestart;
+				expect(transaction).toBeDefined();
+				const publish = createDeferred<DaemonUpdateRestartManifest>();
+				vi.spyOn(internals, "commitPreparedUpdateRestart").mockImplementationOnce(() => publish.promise);
+				const shutdown = vi.spyOn(internals, "shutdown").mockImplementation(() => new Promise<never>(() => {}));
+
+				const commit = internals.handleWorkerCommand(owner, { id: "commit", type: "worker_commit_update" });
+				await vi.waitFor(() => expect(transaction?.phase).toBe("publishing"));
+				internals.revokeSupervisorClaim(owner);
+				expect(transaction?.phase).toBe("publishing");
+				publish.resolve(transaction!.manifest!);
+				await commit;
+				await new Promise<void>((resolve) => setImmediate(resolve));
+
+				expect(shutdown).toHaveBeenCalledWith(0);
+			},
+		},
+		{
+			name: "does not let stale standalone cleanup clear a newer publishing owner",
+			run: async ({ internals }) => {
+				const newerTransaction = {
+					id: Symbol("newer-update-restart"),
+					abort: new AbortController(),
+					phase: "publishing" as const,
+					deferredClientEnv: [],
+				};
+				vi.spyOn(internals, "commitPreparedUpdateRestart").mockImplementationOnce(async () => {
+					internals.updateRestart = newerTransaction;
+					throw new Error("stale publish failed");
+				});
+
+				await expect(internals.prepareUpdateRestart()).rejects.toThrow("stale publish failed");
+
+				expect(internals.updateRestart).toBe(newerTransaction);
+			},
+		},
+		{
+			name: "rejects drain mutations but admits reads after this worker publishes its prepare snapshot",
+			run: async ({ internals, makeClient, writes }) => {
+				const owner = makeClient("owner");
+				await internals.handleWorkerCommand(owner, { id: "prepare", type: "worker_prepare_update" });
+				await internals.handleLine(
+					owner,
+					JSON.stringify({ id: "abort", type: "abort", activeSessionId: "missing" }),
+				);
+				expect(writes.at(-1)).toContain("Daemon is preparing an update restart");
+				await internals.handleLine(owner, JSON.stringify({ id: "late-list", type: "list" }));
+				expect(JSON.parse(writes.at(-1) ?? "{}")).toMatchObject({ id: "late-list", success: true });
+				await internals.handleWorkerCommand(owner, { id: "cancel", type: "worker_cancel_update" });
+			},
+		},
+	])("$name", async ({ run }) => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = createDaemonInternals(harness);
+		const writes: string[] = [];
+		const makeClient = (id: string) =>
+			({
+				id,
+				socket: {
+					destroyed: false,
+					write: (chunk: string) => {
+						writes.push(chunk);
+						return true;
+					},
+				},
+			}) as unknown as DaemonSocketClient;
+		await run({ internals, makeClient, writes });
 	});
 
 	it("captures a restart manifest and aborts running bash without archiving the session", async () => {
@@ -160,13 +601,7 @@ describe("issue #4257 update restart resume", () => {
 				},
 			},
 		);
-		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
-			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const internals = createDaemonInternals(harness);
 		internals.sessions.set(state.activeSessionId, state);
 		const schedulerStopSpy = vi.spyOn(internals.cronScheduler, "stop");
 		const now = new Date("2026-01-01T12:00:00.000Z");
@@ -275,20 +710,7 @@ describe("issue #4257 update restart resume", () => {
 
 		await internals.prepareUpdateRestart();
 		const writes: string[] = [];
-		const client: DaemonSocketClient = {
-			id: "client-1",
-			socket: {
-				destroyed: false,
-				write: vi.fn((chunk: string) => {
-					writes.push(chunk);
-					return true;
-				}),
-			} as unknown as DaemonSocketClient["socket"],
-			attachedActiveSessionIds: new Set(),
-			detachInput: vi.fn(),
-			supportsExtensionUi: false,
-			capabilities: new Set(),
-		};
+		const client = createWriteClient(writes);
 
 		await internals.handleLine(client, JSON.stringify({ id: "late-create", type: "create" }));
 
@@ -309,41 +731,31 @@ describe("issue #4257 update restart resume", () => {
 		const image: ImageContent = { type: "image", data: "ZmFrZQ==", mimeType: "image/png" };
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text: "queued work" }, image];
 		const queuedContext = createCustomMessage("queued context");
-		const message: UserMessage = { role: "user", content, timestamp: Date.now() };
 		const followUpContent: TextContent[] = [{ type: "text", text: "heartbeat" }];
 		const followUpContext = createCustomMessage("follow-up context");
-		const followUpMessage: UserMessage = {
-			role: "user",
-			content: followUpContent,
-			timestamp: Date.now(),
-		};
 		const customFollowUp = createCustomMessage("custom heartbeat");
-		const queueInternals = parentHarness.session as unknown as QueueInternals;
-		queueInternals._steeringMessages = [
-			{
-				text: "queued work",
-				queueKey: "heartbeat:steer",
-				agentMessageId: "agentmsg_steer",
-				prefixMessages: [queuedContext],
-				message,
-			},
-		];
-		queueInternals._followUpMessages = [
-			{
-				text: "heartbeat",
-				queueKey: "heartbeat:job-1",
-				agentMessageId: "agentmsg_followup",
-				prefixMessages: [followUpContext],
-				message: followUpMessage,
-			},
-			{
-				text: "custom heartbeat",
-				queueKey: "heartbeat:custom",
-				agentMessageId: "agentmsg_custom",
-				prefixMessages: [],
-				message: customFollowUp,
-			},
-		];
+		await parentHarness.session.restoreSteeringMessage("queued work", [image], {
+			queueKey: "heartbeat:steer",
+			agentMessageId: "agentmsg_steer",
+			content,
+			prefixMessages: [queuedContext],
+		});
+		await parentHarness.session.restoreFollowUpMessage("heartbeat", undefined, {
+			queueKey: "heartbeat:job-1",
+			agentMessageId: "agentmsg_followup",
+			content: followUpContent,
+			prefixMessages: [followUpContext],
+		});
+		await parentHarness.session.restoreFollowUpMessage("custom heartbeat", undefined, {
+			queueKey: "heartbeat:custom",
+			agentMessageId: "agentmsg_custom",
+			customMessage: customFollowUp,
+		});
+		const command = parseSessionSlashCommand("/autonomous on");
+		const commandMessage = createSessionSlashCommandMessage(command!);
+		await parentHarness.session.restoreFollowUpMessage("/autonomous on", undefined, {
+			customMessage: commandMessage,
+		});
 		childHarness.session.recordBashResult("echo child", {
 			output: "child",
 			exitCode: 0,
@@ -351,13 +763,7 @@ describe("issue #4257 update restart resume", () => {
 			truncated: false,
 		});
 
-		const daemon = new AgentDaemon(`${parentHarness.tempDir}/daemon.sock`, {
-			defaultSessionConfig: { cwd: parentHarness.tempDir, agentDir: parentHarness.tempDir },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const internals = createDaemonInternals(parentHarness);
 		internals.sessions.set(
 			"parent-active",
 			createState(
@@ -412,6 +818,13 @@ describe("issue #4257 update restart resume", () => {
 						agentMessageId: "agentmsg_custom",
 						customMessage: customFollowUp,
 					},
+					{
+						message: "/autonomous on",
+						customMessage: expect.objectContaining({
+							customType: "session_slash_command",
+							details: { command },
+						}),
+					},
 				],
 			},
 			shouldResume: true,
@@ -450,7 +863,7 @@ describe("issue #4257 update restart resume", () => {
 			timestamp: Date.now(),
 		};
 		const queueInternals = harness.session as unknown as QueueInternals;
-		queueInternals._pendingNextTurnMessages = [pendingNextTurn];
+		harness.session.restorePendingNextTurnMessages([pendingNextTurn]);
 		queueInternals._acceptedAgentMessagePrompt = {
 			text: "accepted work",
 			agentMessageId: "agentmsg_accepted",
@@ -465,13 +878,7 @@ describe("issue #4257 update restart resume", () => {
 			cleared: false,
 		};
 
-		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
-			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const internals = createDaemonInternals(harness);
 		internals.sessions.set(
 			"active-1",
 			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
@@ -502,25 +909,14 @@ describe("issue #4257 update restart resume", () => {
 			{ type: "text", text: "queued context" },
 			{ type: "text", text: "queued follow-up" },
 		];
-		const queueInternals = harness.session as unknown as QueueInternals;
-		queueInternals._followUpMessages = [
-			{
-				text: "queued follow-up",
-				queueKey: "heartbeat:job-1",
-				agentMessageId: "agentmsg_followup",
-				prefixMessages: [],
-				message: { role: "user", content: followUpContent, timestamp: Date.now() },
-			},
-		];
+		await harness.session.restoreFollowUpMessage("queued follow-up", undefined, {
+			queueKey: "heartbeat:job-1",
+			agentMessageId: "agentmsg_followup",
+			content: followUpContent,
+		});
 
 		const sessionDir = `${harness.tempDir}/sessions`;
-		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
-			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir, sessionDir },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const internals = createDaemonInternals(harness, { sessionDir });
 		internals.sessions.set(
 			"active-1",
 			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
@@ -547,16 +943,10 @@ describe("issue #4257 update restart resume", () => {
 	it("materializes busy in-memory drafts before update restart", async () => {
 		const harness = await createHarness({ persistSession: false });
 		harnesses.push(harness);
-		(harness.session.agent as unknown as AgentInternals)._state.isStreaming = true;
+		(harness.session.agent.state as { isStreaming: boolean }).isStreaming = true;
 
 		const sessionDir = `${harness.tempDir}/sessions`;
-		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
-			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir, sessionDir },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const internals = createDaemonInternals(harness, { sessionDir });
 		internals.sessions.set(
 			"active-1",
 			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
@@ -588,7 +978,7 @@ describe("issue #4257 update restart resume", () => {
 			timestamp: Date.now(),
 		};
 		const queueInternals = harness.session as unknown as QueueInternals;
-		queueInternals._pendingNextTurnMessages = [pendingNextTurn];
+		harness.session.restorePendingNextTurnMessages([pendingNextTurn]);
 		queueInternals._acceptedAgentMessagePrompt = {
 			text: "accepted work",
 			agentMessageId: "agentmsg_accepted",
@@ -603,13 +993,7 @@ describe("issue #4257 update restart resume", () => {
 			cleared: false,
 		};
 
-		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
-			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const internals = createDaemonInternals(harness);
 		internals.sessions.set(
 			"active-1",
 			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
@@ -631,33 +1015,14 @@ describe("issue #4257 update restart resume", () => {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
 
-		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
-			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const internals = createDaemonInternals(harness);
 		internals.sessions.set(
 			"active-1",
 			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
 		);
 
 		const writes: string[] = [];
-		const client: DaemonSocketClient = {
-			id: "client-1",
-			socket: {
-				destroyed: false,
-				write: vi.fn((chunk: string) => {
-					writes.push(chunk);
-					return true;
-				}),
-			} as unknown as DaemonSocketClient["socket"],
-			attachedActiveSessionIds: new Set(["active-1"]),
-			detachInput: vi.fn(),
-			supportsExtensionUi: false,
-			capabilities: new Set(),
-		};
+		const client = createWriteClient(writes, { attached: ["active-1"] });
 		const restoredMessage = createCustomMessage("restored next turn");
 
 		await internals.handleLine(
@@ -684,13 +1049,7 @@ describe("issue #4257 update restart resume", () => {
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("accepted restored prompt")]);
 
-		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
-			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const internals = createDaemonInternals(harness);
 		internals.sessions.set(
 			"active-1",
 			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
@@ -701,20 +1060,7 @@ describe("issue #4257 update restart resume", () => {
 			{ type: "text", text: "accepted work" },
 		];
 		const writes: string[] = [];
-		const client: DaemonSocketClient = {
-			id: "client-1",
-			socket: {
-				destroyed: false,
-				write: vi.fn((chunk: string) => {
-					writes.push(chunk);
-					return true;
-				}),
-			} as unknown as DaemonSocketClient["socket"],
-			attachedActiveSessionIds: new Set(["active-1"]),
-			detachInput: vi.fn(),
-			supportsExtensionUi: false,
-			capabilities: new Set(),
-		};
+		const client = createWriteClient(writes, { attached: ["active-1"] });
 
 		await internals.handleLine(
 			client,
@@ -745,19 +1091,12 @@ describe("issue #4257 update restart resume", () => {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
 
-		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
-			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const internals = createDaemonInternals(harness);
 		internals.sessions.set(
 			"active-1",
 			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
 		);
 
-		const queueInternals = harness.session as unknown as QueueInternals;
 		const restoredSteerContent: TextContent[] = [
 			{ type: "text", text: "restored steer context" },
 			{ type: "text", text: "restored steer" },
@@ -767,30 +1106,12 @@ describe("issue #4257 update restart resume", () => {
 			{ type: "text", text: "restored follow-up" },
 		];
 		const restoredPrefix = createCustomMessage("restored custom prefix");
-		queueInternals._followUpMessages = [
-			{
-				text: "existing",
-				queueKey: "heartbeat:job-1",
-				agentMessageId: "agentmsg_existing",
-				prefixMessages: [],
-				message: { role: "user", content: [{ type: "text", text: "existing" }], timestamp: Date.now() },
-			},
-		];
+		await harness.session.restoreFollowUpMessage("existing", undefined, {
+			queueKey: "heartbeat:job-1",
+			agentMessageId: "agentmsg_existing",
+		});
 		const writes: string[] = [];
-		const client: DaemonSocketClient = {
-			id: "client-1",
-			socket: {
-				destroyed: false,
-				write: vi.fn((chunk: string) => {
-					writes.push(chunk);
-					return true;
-				}),
-			} as unknown as DaemonSocketClient["socket"],
-			attachedActiveSessionIds: new Set(["active-1"]),
-			detachInput: vi.fn(),
-			supportsExtensionUi: false,
-			capabilities: new Set(),
-		};
+		const client = createWriteClient(writes, { attached: ["active-1"] });
 
 		await internals.handleLine(
 			client,
@@ -872,32 +1193,13 @@ describe("issue #4257 update restart resume", () => {
 		]);
 		await harness.session.prompt("start");
 
-		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
-			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const internals = createDaemonInternals(harness);
 		internals.sessions.set(
 			"active-1",
 			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
 		);
 		const writes: string[] = [];
-		const client: DaemonSocketClient = {
-			id: "client-1",
-			socket: {
-				destroyed: false,
-				write: vi.fn((chunk: string) => {
-					writes.push(chunk);
-					return true;
-				}),
-			} as unknown as DaemonSocketClient["socket"],
-			attachedActiveSessionIds: new Set(["active-1"]),
-			detachInput: vi.fn(),
-			supportsExtensionUi: false,
-			capabilities: new Set(),
-		};
+		const client = createWriteClient(writes, { attached: ["active-1"] });
 
 		await internals.handleLine(
 			client,
@@ -963,32 +1265,13 @@ describe("issue #4257 update restart resume", () => {
 		harness.setResponses([fauxAssistantMessage("handled continuation"), fauxAssistantMessage("handled follow-up")]);
 		harness.session.agent.state.messages.push(createCustomMessage("update interrupted"));
 
-		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
-			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const internals = createDaemonInternals(harness);
 		internals.sessions.set(
 			"active-1",
 			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
 		);
 		const writes: string[] = [];
-		const client: DaemonSocketClient = {
-			id: "client-1",
-			socket: {
-				destroyed: false,
-				write: vi.fn((chunk: string) => {
-					writes.push(chunk);
-					return true;
-				}),
-			} as unknown as DaemonSocketClient["socket"],
-			attachedActiveSessionIds: new Set(["active-1"]),
-			detachInput: vi.fn(),
-			supportsExtensionUi: false,
-			capabilities: new Set(),
-		};
+		const client = createWriteClient(writes, { attached: ["active-1"] });
 
 		await internals.handleLine(
 			client,
@@ -1021,8 +1304,10 @@ describe("issue #4257 update restart resume", () => {
 			}),
 		);
 
-		await new Promise((resolve) => setTimeout(resolve, 0));
-		await harness.session.agent.waitForIdle();
+		await vi.waitFor(() =>
+			expect(getUserTexts(harness)).toEqual(["restored steer", "restored follow-up", "continue interrupted work"]),
+		);
+		await harness.session.waitForSessionInputIdle();
 
 		const responses = writes
 			.join("")
@@ -1034,7 +1319,7 @@ describe("issue #4257 update restart resume", () => {
 			expect.objectContaining({ id: "follow-up-1", command: "follow_up", success: true }),
 			expect.objectContaining({ id: "prompt-1", command: "prompt", success: true }),
 		]);
-		expect(getUserTexts(harness)).toEqual(["continue interrupted work", "restored steer", "restored follow-up"]);
+		expect(getUserTexts(harness)).toEqual(["restored steer", "restored follow-up", "continue interrupted work"]);
 		expect(harness.session.getSteeringQueueSnapshots()).toEqual([]);
 		expect(harness.session.getFollowUpQueueSnapshots()).toEqual([]);
 	});
@@ -1045,32 +1330,13 @@ describe("issue #4257 update restart resume", () => {
 		harness.setResponses([fauxAssistantMessage("handled restored follow-up")]);
 		harness.session.agent.state.messages.push(createCustomMessage("update interrupted"));
 
-		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
-			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const internals = createDaemonInternals(harness);
 		internals.sessions.set(
 			"active-1",
 			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
 		);
 		const writes: string[] = [];
-		const client: DaemonSocketClient = {
-			id: "client-1",
-			socket: {
-				destroyed: false,
-				write: vi.fn((chunk: string) => {
-					writes.push(chunk);
-					return true;
-				}),
-			} as unknown as DaemonSocketClient["socket"],
-			attachedActiveSessionIds: new Set(["active-1"]),
-			detachInput: vi.fn(),
-			supportsExtensionUi: false,
-			capabilities: new Set(),
-		};
+		const client = createWriteClient(writes, { attached: ["active-1"] });
 
 		await internals.handleLine(
 			client,
@@ -1107,36 +1373,46 @@ describe("issue #4257 update restart resume", () => {
 		expect(harness.session.getFollowUpQueueSnapshots()).toEqual([]);
 	});
 
+	it("adopts attach env after a fenced update preparation rolls back", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = createDaemonInternals(harness);
+		const state = createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() });
+		internals.sessions.set(state.activeSessionId, state);
+		const transaction = internals.beginUpdateRestartTransaction();
+		transaction.phase = "fencing";
+		const writes: string[] = [];
+		const client = createWriteClient(writes);
+
+		await internals.handleLine(
+			client,
+			JSON.stringify({
+				id: "attach-1",
+				type: "attach",
+				activeSessionId: state.activeSessionId,
+				env: { HERDR_PANE_ID: "w1:p1", PATH: "/ignored" },
+			}),
+		);
+
+		expect(state.clientEnv).toBeUndefined();
+		expect(state.clients.has(client)).toBe(true);
+		expect(transaction.deferredClientEnv).toHaveLength(1);
+		internals.cancelPreparedUpdateRestart(transaction.id);
+		expect(state.clientEnv).toEqual({ HERDR_PANE_ID: "w1:p1" });
+		expect(transaction.deferredClientEnv).toEqual([]);
+	});
+
 	it("reports resume_queue failure when no work can resume", async () => {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
 
-		const daemon = new AgentDaemon(`${harness.tempDir}/daemon.sock`, {
-			defaultSessionConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const internals = daemon as unknown as AgentDaemonUpdateInternals;
+		const internals = createDaemonInternals(harness);
 		internals.sessions.set(
 			"active-1",
 			createState(harness, "active-1", { kind: "top-level", createdAt: Date.now() }),
 		);
 		const writes: string[] = [];
-		const client: DaemonSocketClient = {
-			id: "client-1",
-			socket: {
-				destroyed: false,
-				write: vi.fn((chunk: string) => {
-					writes.push(chunk);
-					return true;
-				}),
-			} as unknown as DaemonSocketClient["socket"],
-			attachedActiveSessionIds: new Set(["active-1"]),
-			detachInput: vi.fn(),
-			supportsExtensionUi: false,
-			capabilities: new Set(),
-		};
+		const client = createWriteClient(writes, { attached: ["active-1"] });
 
 		await internals.handleLine(
 			client,
@@ -1150,6 +1426,6 @@ describe("issue #4257 update restart resume", () => {
 
 		const response = JSON.parse(writes.join("").trim());
 		expect(response).toMatchObject({ id: "resume-1", command: "resume_queue", success: false });
-		expect(JSON.stringify(response)).toContain("No messages to continue from");
+		expect(JSON.stringify(response)).toContain("No queued work to resume");
 	});
 });

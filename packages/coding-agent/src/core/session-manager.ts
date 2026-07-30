@@ -3,16 +3,21 @@ import type { AssistantMessage, ImageContent, Message, ServiceTier, TextContent,
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
+	chmodSync,
+	chownSync,
 	createReadStream,
 	existsSync,
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
+	renameSync,
+	rmSync,
 	statSync,
 	writeFileSync,
 } from "fs";
 import { readdir, readFile, stat } from "fs/promises";
-import { dirname, join, resolve } from "path";
+import { basename, dirname, join, resolve } from "path";
 import { createInterface } from "readline";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
@@ -47,6 +52,25 @@ const CONTENT_ENTRY_TYPES = new Set([
 	"compaction",
 	"branch_summary",
 ]);
+
+function realpathIfPresent(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return path;
+		throw error;
+	}
+}
+
+function statMetadataIfPresent(path: string): { mode: number; uid: number; gid: number } | undefined {
+	try {
+		const { mode, uid, gid } = statSync(path);
+		return { mode: mode & 0o777, uid, gid };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
+	}
+}
 
 export interface SessionHeader {
 	type: "session";
@@ -501,39 +525,30 @@ export function buildSessionContext(
 	}
 
 	// Build messages and collect corresponding entries
-	// When there's a compaction, we need to:
-	// 1. Emit summary first (entry = compaction)
-	// 2. Emit kept messages (from firstKeptEntryId up to compaction)
-	// 3. Emit messages after compaction
+	// When there's a compaction, model context remains summary-first while the
+	// summary records where clients should present it among retained messages.
 	const messages: AgentMessage[] = [];
 
-	const appendMessage = (entry: SessionEntry) => {
+	const appendMessage = (entry: SessionEntry, target = messages) => {
 		if (entry.type === "message") {
-			messages.push(entry.message);
+			target.push(entry.message);
 		} else if (entry.type === "custom_message") {
-			messages.push(
+			target.push(
 				createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
 			);
 		} else if (entry.type === "branch_summary" && entry.summary) {
-			messages.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
+			target.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
 		}
 	};
 
 	if (compaction) {
-		// Emit summary first
-		messages.push(
-			createCompactionSummaryMessage(
-				compaction.summary,
-				compaction.tokensBefore,
-				compaction.timestamp,
-				compaction.customInstructions,
-			),
-		);
-
 		// Find compaction index in path
 		const compactionIdx = path.findIndex((e) => e.type === "compaction" && e.id === compaction.id);
 
-		// Emit kept messages (before compaction, starting from firstKeptEntryId)
+		// Collect kept messages (before compaction, starting from firstKeptEntryId).
+		// The context remains summary-first for the model; retainedMessageCount records
+		// the exact chronological presentation boundary for clients.
+		const retainedMessages: AgentMessage[] = [];
 		let foundFirstKept = false;
 		for (let i = 0; i < compactionIdx; i++) {
 			const entry = path[i];
@@ -541,9 +556,20 @@ export function buildSessionContext(
 				foundFirstKept = true;
 			}
 			if (foundFirstKept) {
-				appendMessage(entry);
+				appendMessage(entry, retainedMessages);
 			}
 		}
+
+		messages.push(
+			createCompactionSummaryMessage(
+				compaction.summary,
+				compaction.tokensBefore,
+				compaction.timestamp,
+				compaction.customInstructions,
+				retainedMessages.length,
+			),
+			...retainedMessages,
+		);
 
 		// Emit messages after compaction
 		for (let i = compactionIdx + 1; i < path.length; i++) {
@@ -1195,8 +1221,21 @@ export class SessionManager {
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
 		const content = `${this.fileEntries.map((e) => JSON.stringify(e)).join("\n")}\n`;
-		mkdirSync(dirname(this.sessionFile), { recursive: true });
-		writeFileSync(this.sessionFile, content);
+		const targetPath = realpathIfPresent(this.sessionFile);
+		const directory = dirname(targetPath);
+		mkdirSync(directory, { recursive: true });
+		const tempPath = join(directory, `.${basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
+		try {
+			const metadata = statMetadataIfPresent(targetPath);
+			writeFileSync(tempPath, content, metadata === undefined ? undefined : { mode: metadata.mode });
+			if (metadata !== undefined) {
+				chownSync(tempPath, metadata.uid, metadata.gid);
+				chmodSync(tempPath, metadata.mode);
+			}
+			renameSync(tempPath, targetPath);
+		} finally {
+			rmSync(tempPath, { force: true });
+		}
 		this._notifyPersistListeners();
 	}
 
@@ -1604,6 +1643,41 @@ export class SessionManager {
 		};
 		this._appendEntry(entry);
 		return entry.id;
+	}
+
+	/**
+	 * Append a custom message, undoing the append if persistence fails so a
+	 * best-effort record never leaves an unsaved leaf for later entries.
+	 */
+	appendCustomMessageEntryWithRollback<T = unknown>(
+		customType: string,
+		content: string | (TextContent | ImageContent)[],
+		display: boolean,
+		details?: T,
+	): string {
+		const previousLeafId = this.leafId;
+		try {
+			const entryId = this.appendCustomMessageEntry(customType, content, display, details);
+			this.flushNow();
+			return entryId;
+		} catch (error) {
+			// The append indexes the entry before persisting it; undo exactly that.
+			if (this.leafId !== null && this.leafId !== previousLeafId) {
+				this.byId.delete(this.leafId);
+				this.fileEntries.pop();
+				this.leafId = previousLeafId;
+				// The failed append may have left a torn line on disk. Restore the file
+				// from the rolled-back entries now; if that also fails (e.g. the disk is
+				// still full), fall back to forcing the next persist to rewrite.
+				this.flushed = false;
+				try {
+					this.flushNow();
+				} catch {
+					this.flushed = false;
+				}
+			}
+			throw error;
+		}
 	}
 
 	// =========================================================================

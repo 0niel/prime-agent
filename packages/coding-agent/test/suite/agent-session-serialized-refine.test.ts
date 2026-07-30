@@ -25,6 +25,7 @@ type SerializedInternals = {
 		abort: AbortController,
 	): Promise<unknown>;
 	_serializedRefine: boolean;
+	_steeringStopPending: boolean;
 	_pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
 	_assistantTurnsSinceAutoRefine: number;
 	_lastAutoRefineReviewAt: number;
@@ -297,6 +298,31 @@ describe("Serialized agent-callable refine", () => {
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
+	});
+
+	it("services a pending refine.run before stopping for steering", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			serializedRefine: true,
+			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SerializedInternals;
+		const { applyRefine } = mockSerializedRefine(harness);
+		internals._pendingRequestedRefine = { instructions: "capture a lesson" };
+		internals._steeringStopPending = true;
+		const compactionSpy = vi
+			.spyOn(
+				internals as unknown as { _shouldStopForThresholdCompaction: (ctx: unknown) => Promise<boolean> },
+				"_shouldStopForThresholdCompaction",
+			)
+			.mockResolvedValue(false);
+
+		const shouldStop = await internals._shouldStopAfterTurn(makeCtx("turn"));
+
+		expect(applyRefine).toHaveBeenCalledTimes(1);
+		expect(compactionSpy).toHaveBeenCalledTimes(1);
+		expect(shouldStop).toBe(true);
 	});
 
 	it("agent-callable refine.run starts background planning immediately in serialized mode", async () => {
@@ -1662,7 +1688,7 @@ describe("P0 concurrency regressions", () => {
 		}
 	});
 
-	it("serialized threshold compaction: background plan applied before compaction fires", async () => {
+	it("steering waits for interval refine and threshold compaction boundaries", async () => {
 		// Verify that when threshold compaction would fire, the serialized
 		// checkpoint runs FIRST, draining the background plan, so the
 		// compaction model call cannot overlap an in-flight refine.
@@ -1679,6 +1705,7 @@ describe("P0 concurrency regressions", () => {
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as SerializedInternals;
+		internals._steeringStopPending = true;
 
 		let planResolved = false;
 		let applyFinished = false;

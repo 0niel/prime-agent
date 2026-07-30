@@ -5,6 +5,7 @@ import { startSideQuestion } from "../../../src/core/side-question.js";
 import type { DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
 import type { DaemonCommand, DaemonResponse } from "../../../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../../../src/modes/daemon/daemon-supervisor.js";
+import { MutationDrainLatch } from "../../../src/modes/daemon/mutation-drain-latch.js";
 import { createHarness } from "../harness.js";
 
 const fastModel = {
@@ -34,6 +35,7 @@ describe("ENG-4620 fast mode child agents", () => {
 			workers: new Map(),
 			clients: new Set(),
 			protocolClientIds: new WeakMap(),
+			mutationDrain: new MutationDrainLatch(),
 			handleCommand,
 			write,
 			log: vi.fn(),
@@ -48,7 +50,7 @@ describe("ENG-4620 fast mode child agents", () => {
 
 		await supervisor.handleLine(client, JSON.stringify(command));
 
-		expect(handleCommand).toHaveBeenCalledWith(client, command);
+		expect(handleCommand.mock.calls[0]?.slice(0, 2)).toEqual([client, command]);
 		expect(write).toHaveBeenCalledWith(
 			client,
 			expect.objectContaining({ command: "set_service_tier", success: true }),
