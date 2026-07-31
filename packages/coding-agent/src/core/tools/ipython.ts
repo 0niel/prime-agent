@@ -247,7 +247,7 @@ export type IpythonToolInput = Static<typeof ipythonSchema>;
 
 export interface IpythonToolDetails {
 	durationMs?: number;
-	status?: "ok" | "error" | "aborted" | "starting";
+	status?: "ok" | "error" | "aborted" | "starting" | "backgrounded";
 	errorEname?: string;
 	stdout?: string;
 	stderr?: string;
@@ -563,6 +563,28 @@ async function chooseBusyKernelAction(
 	return "cancel";
 }
 
+function ipythonToolTimeoutMs(): number {
+	const raw = process.env.PRIME_AGENT_IPYTHON_TOOL_TIMEOUT_MS;
+	if (raw === undefined) {
+		return 900_000;
+	}
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 900_000;
+}
+
+function backgroundedNotice(timeoutMs: number, outputSoFar: string): string {
+	const head =
+		`Cell still executing after ${Math.round(timeoutMs / 1000)}s; it continues in the background. ` +
+		"The kernel runs cells serially, so your next ipython call waits for this cell to finish " +
+		"before it runs (and reports again if the cell is still going). Variables the cell assigns " +
+		"stay in the kernel; after it finishes, inspect them with a cheap follow-up cell. If you " +
+		"believe the cell is stuck rather than working, run a short follow-up cell to regain " +
+		"control after interrupt, and prefer restructuring the work into smaller cells.";
+	return outputSoFar ? `${head}\n\nOutput so far:\n${outputSoFar}` : head;
+}
+
+const BACKGROUNDED = Symbol("ipython-backgrounded");
+
 async function executeWithBusyKernelChoice(
 	provisioner: IpythonKernelProvisioner,
 	reportStartupProgress: KernelBootstrapProgressHandler,
@@ -647,13 +669,15 @@ export function createIpythonToolDefinition(
 
 			try {
 				const code = applyShellSettingsToBashMagicCell(params.code, options);
-				const { result: r, kernelRestarted } = await executeWithBusyKernelChoice(
+				let streamedOutput = "";
+				const executePromise = executeWithBusyKernelChoice(
 					provisioner,
 					reportStartupProgress,
 					toolCallId,
 					code,
 					signal,
 					(chunk) => {
+						streamedOutput += chunk;
 						onUpdate?.({
 							content: [{ type: "text", text: chunk }],
 							details: { status: "ok" },
@@ -663,6 +687,36 @@ export function createIpythonToolDefinition(
 					options?.onLateSentAgentMessage,
 					ctx,
 				);
+				const timeoutMs = ipythonToolTimeoutMs();
+				let raced: Awaited<typeof executePromise> | typeof BACKGROUNDED;
+				if (timeoutMs > 0) {
+					let timer: ReturnType<typeof globalThis.setTimeout> | undefined;
+					const timeout = new Promise<typeof BACKGROUNDED>((resolve) => {
+						timer = globalThis.setTimeout(() => resolve(BACKGROUNDED), timeoutMs);
+						if (timer && typeof timer === "object" && "unref" in timer) {
+							timer.unref();
+						}
+					});
+					raced = await Promise.race([executePromise, timeout]);
+					if (timer) {
+						globalThis.clearTimeout(timer);
+					}
+				} else {
+					raced = await executePromise;
+				}
+				if (raced === BACKGROUNDED) {
+					// The cell keeps running; the kernel's serial queue makes the next
+					// ipython call wait behind it, which doubles as the poll mechanism.
+					// Late completion is intentionally not delivered as a message — the
+					// kernel namespace carries the results forward.
+					executePromise.catch(() => undefined);
+					return {
+						content: [{ type: "text", text: backgroundedNotice(timeoutMs, streamedOutput) }],
+						details: { status: "backgrounded", stdout: streamedOutput },
+						isError: false,
+					};
+				}
+				const { result: r, kernelRestarted } = raced;
 
 				let text = r.stdout;
 				if (r.stderr) text += (text ? "\n" : "") + r.stderr;
