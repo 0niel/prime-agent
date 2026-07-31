@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Changed the model catalog snapshot to the current upstream catalogs: added Claude Opus 5 (Anthropic direct, Bedrock, OpenRouter, Vercel AI Gateway, Copilot, Prime Inference), Gemini 3.5/3.6 flash models, Kimi K3 variants, refreshed Prime Inference to the live catalog (103 models), and removed the discontinued `gpt-5-chat`, `gpt-5-codex`, and `laguna-m.1` routes.
+
 ## [0.3.3] - 2026-07-23
 
 - Fixed Vertex Gemini 2.5 Flash-Lite minimal reasoning requests to use the supported 512-token thinking budget.

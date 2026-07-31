@@ -754,6 +754,7 @@ function supportsAdaptiveThinking(modelId: string): boolean {
 	return (
 		modelId.includes("opus-4-6") ||
 		modelId.includes("opus-4.6") ||
+		modelId.includes("opus-5") ||
 		modelId.includes("opus-4-7") ||
 		modelId.includes("opus-4.7") ||
 		modelId.includes("opus-4-8") ||
