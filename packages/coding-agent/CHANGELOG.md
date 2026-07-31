@@ -16,6 +16,7 @@
 - Changed session search to rank exact name and first-message matches before prefix, substring, and stricter transcript fuzzy matches.
 - Fixed daemon startup failing when an interrupted supervisor left an empty ownership directory.
 - Fixed `/effort xhigh` and `/effort max` being rejected as unknown levels when no model was active yet.
+- Fixed selected rows in the agents view, child agent panel, and selectors being nearly invisible on terminals whose background closely matches the `selectedBg` theme color; the selection highlight now adapts to keep a minimum contrast against the detected terminal background.
 - Fixed startup blocking on a private Prime Inference model authorization request; the authorization is now cached next to `models.json` and stale entries refresh in the background.
 
 ## [0.3.3] - 2026-07-23

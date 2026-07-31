@@ -586,7 +586,7 @@ export class ChildAgentSummaryComponent implements Component, Focusable {
 		const truncated = this.truncate(line, contentWidth);
 		const paddedContent = truncated + " ".repeat(Math.max(0, contentWidth - visibleWidth(truncated)));
 		const padded = `${" ".repeat(this.paddingX)}${paddedContent}${" ".repeat(this.paddingX)}`;
-		return selected ? theme.bg("selectedBg", padded) : padded;
+		return selected ? theme.getSelectionBackgroundColor()(padded) : padded;
 	}
 
 	private truncate(line: string, width: number): string {

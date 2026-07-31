@@ -2377,7 +2377,7 @@ export class AgentsViewMode implements Component, Focusable {
 		if (code) {
 			return theme.bg("toolPanelBg", padded);
 		}
-		return selected ? theme.bg("selectedBg", padded) : padded;
+		return selected ? theme.getSelectionBackgroundColor()(padded) : padded;
 	}
 
 	private isPendingDeleteRow(row: AgentsViewRow): boolean {
