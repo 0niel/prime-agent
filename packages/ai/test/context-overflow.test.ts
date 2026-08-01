@@ -22,6 +22,7 @@ import { hasAzureOpenAICredentials } from "./azure-utils.js";
 import { hasBedrockCredentials } from "./bedrock-utils.js";
 import { getKimiCodingTestModel } from "./kimi-test-model.js";
 import { resolveApiKey } from "./oauth.js";
+import { getZaiTestModel } from "./zai-test-model.js";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
 const oauthTokens = await Promise.all([resolveApiKey("github-copilot"), resolveApiKey("openai-codex")]);
@@ -333,8 +334,8 @@ describe("Context overflow error handling", () => {
 	// =============================================================================
 
 	describe.skipIf(!process.env.ZAI_API_KEY)("z.ai", () => {
-		it("glm-4.5-air - should detect overflow via isContextOverflow when z.ai reports it", async () => {
-			const model = getModel("zai", "glm-4.5-air");
+		it("should detect overflow via isContextOverflow when z.ai reports it", async () => {
+			const model = getZaiTestModel({ smallestContextWindow: true });
 			const result = await testContextOverflow(model, process.env.ZAI_API_KEY!);
 			logResult(result);
 

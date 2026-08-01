@@ -9,6 +9,7 @@ import { getModel } from "../src/models.js";
 import { complete, stream } from "../src/stream.js";
 import type { Api, Context, ImageContent, Model, StreamOptions, Tool, ToolResultMessage } from "../src/types.js";
 import { getKimiCodingTestModel } from "./kimi-test-model.js";
+import { getZaiTestModel } from "./zai-test-model.js";
 
 type StreamOptionsWithExtras = StreamOptions & Record<string, unknown>;
 
@@ -891,8 +892,8 @@ describe("Generate E2E Tests", () => {
 		},
 	);
 
-	describe.skipIf(!process.env.ZAI_API_KEY)("zAI Provider (glm-5.1 via OpenAI Completions)", () => {
-		const llm = getModel("zai", "glm-5.1");
+	describe.skipIf(!process.env.ZAI_API_KEY)("zAI Provider (via OpenAI Completions)", () => {
+		const llm = getZaiTestModel({ toolStream: true });
 
 		it("should complete basic text generation", { retry: 3 }, async () => {
 			await basicTextGeneration(llm);
@@ -914,7 +915,7 @@ describe("Generate E2E Tests", () => {
 			await multiTurn(llm, { reasoningEffort: "medium" });
 		});
 
-		it("should handle image input", { retry: 3 }, async () => {
+		it.skipIf(!llm.input.includes("image"))("should handle image input", { retry: 3 }, async () => {
 			await handleImage(llm);
 		});
 	});

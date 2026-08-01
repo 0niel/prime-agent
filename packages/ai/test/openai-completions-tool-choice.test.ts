@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getModel } from "../src/models.js";
 import { streamSimple } from "../src/stream.js";
 import type { Tool } from "../src/types.js";
+import { getZaiTestModel } from "./zai-test-model.js";
 
 const mockState = vi.hoisted(() => ({
 	lastParams: undefined as unknown,
@@ -212,7 +213,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("enables tool_stream for supported z.ai models with tools", async () => {
-		const model = getModel("zai", "glm-5.1")!;
+		const model = getZaiTestModel({ toolStream: true });
 		const tools: Tool[] = [
 			{
 				name: "ping",
@@ -249,15 +250,18 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("stores z.ai tool_stream support in model compat metadata", () => {
-		expect(getModel("zai", "glm-5.1")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-4.7")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-4.7")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-5-turbo")?.compat?.zaiToolStream).toBe(true);
-		expect(getModel("zai", "glm-4.5-air")?.compat?.zaiToolStream).toBeUndefined();
+		expect(getZaiTestModel({ toolStream: true }).compat?.zaiToolStream).toBe(true);
 	});
 
-	it("omits tool_stream for unsupported z.ai models", async () => {
-		const model = getModel("zai", "glm-4.5-air")!;
+	it("omits tool_stream when model compat disables it", async () => {
+		const baseModel = getZaiTestModel();
+		const model = {
+			...baseModel,
+			compat: {
+				...baseModel.compat,
+				zaiToolStream: false,
+			},
+		} as const;
 		const tools: Tool[] = [
 			{
 				name: "ping",
@@ -294,7 +298,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("respects explicit z.ai tool_stream compat override", async () => {
-		const baseModel = getModel("zai", "glm-4.5-air")!;
+		const baseModel = getZaiTestModel();
 		const model = {
 			...baseModel,
 			compat: {
@@ -338,7 +342,7 @@ describe("openai-completions tool_choice", () => {
 	});
 
 	it("omits tool_stream when no tools are provided", async () => {
-		const model = getModel("zai", "glm-5.1")!;
+		const model = getZaiTestModel({ toolStream: true });
 		let payload: unknown;
 
 		await streamSimple(
@@ -380,7 +384,7 @@ describe("openai-completions tool_choice", () => {
 			},
 		];
 
-		const model = getModel("zai", "glm-5.1")!;
+		const model = getZaiTestModel({ toolStream: true });
 		const response = await streamSimple(
 			model,
 			{

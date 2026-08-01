@@ -17,6 +17,7 @@ import { getModel } from "../src/models.js";
 import { complete } from "../src/stream.js";
 import type { Api, Context, Model, StreamOptions, Usage } from "../src/types.js";
 import { getKimiCodingTestModel } from "./kimi-test-model.js";
+import { getZaiTestModel } from "./zai-test-model.js";
 
 type StreamOptionsWithExtras = StreamOptions & Record<string, unknown>;
 
@@ -376,22 +377,18 @@ describe("totalTokens field", () => {
 	// =========================================================================
 
 	describe.skipIf(!process.env.ZAI_API_KEY)("z.ai", () => {
-		it(
-			"glm-4.5-air - should return totalTokens equal to sum of components",
-			{ retry: 3, timeout: 60000 },
-			async () => {
-				const llm = getModel("zai", "glm-4.5-air");
+		it("should return totalTokens equal to sum of components", { retry: 3, timeout: 60000 }, async () => {
+			const llm = getZaiTestModel();
 
-				console.log(`\nz.ai / ${llm.id}:`);
-				const { first, second } = await testTotalTokensWithCache(llm, { apiKey: process.env.ZAI_API_KEY });
+			console.log(`\nz.ai / ${llm.id}:`);
+			const { first, second } = await testTotalTokensWithCache(llm, { apiKey: process.env.ZAI_API_KEY });
 
-				logUsage("First request", first);
-				logUsage("Second request", second);
+			logUsage("First request", first);
+			logUsage("Second request", second);
 
-				assertTotalTokensEqualsComponents(first);
-				assertTotalTokensEqualsComponents(second);
-			},
-		);
+			assertTotalTokensEqualsComponents(first);
+			assertTotalTokensEqualsComponents(second);
+		});
 	});
 
 	// =========================================================================
