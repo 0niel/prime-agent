@@ -496,8 +496,7 @@ Use this EXACT format:
 Keep each section concise. Preserve exact file paths, function names, and error messages.`;
 
 const KERNEL_PERSIST_SUMMARY_NOTE =
-	"Note: the IPython kernel keeps running after this summary — every Python variable, import, and helper you defined stays available. The cells that defined them won't appear above, so record in the summary any names worth remembering so you reuse them instead of redefining them.";
-
+	"Note: the IPython kernel keeps running across compaction. Record any variables, imports, and helpers that are needed to continue the user's work.";
 const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
 
 Update the existing structured summary with new information. RULES:
@@ -622,6 +621,10 @@ export interface CompactionPreparation {
 	messagesToSummarize: AgentMessage[];
 	/** Messages that will be turned into turn prefix summary (if splitting) */
 	turnPrefixMessages: AgentMessage[];
+	/** Prepared ongoing context for parent-kernel maintenance: prior summary, split prefix, and retained suffix. */
+	maintenanceContextMessages: AgentMessage[];
+	/** Synthetic maintenance-only messages not present in the active agent transcript. */
+	maintenanceContextSyntheticMessageCount?: number;
 	/** Whether this is a split turn (cut point in middle of turn) */
 	isSplitTurn: boolean;
 	tokensBefore: number;
@@ -636,6 +639,7 @@ export interface CompactionPreparation {
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
+	customInstructions?: string,
 ): CompactionPreparation | undefined {
 	if (pathEntries.length > 0 && pathEntries[pathEntries.length - 1].type === "compaction") {
 		return undefined;
@@ -688,6 +692,34 @@ export function prepareCompaction(
 		}
 	}
 
+	const maintenanceContextMessages: AgentMessage[] = [];
+	if (prevCompactionIndex >= 0) {
+		const prevCompaction = pathEntries[prevCompactionIndex] as CompactionEntry;
+		maintenanceContextMessages.push(
+			createCompactionSummaryMessage(
+				prevCompaction.summary,
+				prevCompaction.tokensBefore,
+				prevCompaction.timestamp,
+				prevCompaction.customInstructions,
+			),
+		);
+	}
+	maintenanceContextMessages.push(...turnPrefixMessages);
+	for (let i = cutPoint.firstKeptEntryIndex; i < boundaryEnd; i++) {
+		const msg = getMessageFromEntryForCompaction(pathEntries[i]);
+		if (msg) maintenanceContextMessages.push(msg);
+	}
+	const maintenanceCustomInstructions = customInstructions?.trim();
+	const maintenanceContextSyntheticMessageCount = maintenanceCustomInstructions ? 1 : 0;
+	if (maintenanceCustomInstructions) {
+		maintenanceContextMessages.push({
+			role: "user",
+			content: `Current compaction instructions:
+${maintenanceCustomInstructions}`,
+			timestamp: Date.now(),
+		});
+	}
+
 	// Everything fits in the keep-recent window and there is no previous summary
 	// to carry forward — compacting would summarize an empty conversation.
 	if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0 && !previousSummary) {
@@ -708,6 +740,8 @@ export function prepareCompaction(
 		firstKeptEntryId,
 		messagesToSummarize,
 		turnPrefixMessages,
+		maintenanceContextMessages,
+		maintenanceContextSyntheticMessageCount,
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary,

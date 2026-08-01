@@ -1,12 +1,25 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { AgentMessage, ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, fauxAssistantMessage, type Model, type ToolResultMessage } from "@earendil-works/pi-ai";
+import type { AgentMessage, AgentTool, ShouldStopAfterTurnContext } from "@earendil-works/pi-agent-core";
+import {
+	type AssistantMessage,
+	fauxAssistantMessage,
+	fauxToolCall,
+	type Model,
+	type ToolResultMessage,
+} from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { CompactionPreparation } from "../../src/core/compaction/index.js";
+import * as kernelMaintenance from "../../src/core/kernel-maintenance.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { createHarness, getMessageText, type Harness } from "./harness.js";
 
 type SessionWithCompactionInternals = {
+	_boundedKernelMaintenanceContext: (
+		preparation: CompactionPreparation,
+		model: Model<any>,
+	) => { messages: AgentMessage[]; complete: boolean };
 	_checkCompaction: (
 		assistantMessage: AssistantMessage,
 		skipAbortedCheck?: boolean,
@@ -14,6 +27,7 @@ type SessionWithCompactionInternals = {
 	) => Promise<void>;
 	_runAutoCompaction: (reason: "overflow" | "threshold" | "requested", willRetry: boolean) => Promise<void>;
 	_shouldStopAfterTurn: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
+	_runKernelMaintenanceAfterCompaction: (preparation: CompactionPreparation, signal: AbortSignal) => Promise<boolean>;
 	_persistCompactionOutcome: (
 		reason: "overflow" | "threshold" | "requested",
 		outcome: "skipped" | "cancelled" | "failed",
@@ -242,49 +256,509 @@ describe("AgentSession compaction characterization", () => {
 		expect(branchSnapshots[1]).not.toContain("[Compacted history stored on disk]");
 	});
 
-	it("asks the agent to collect stale REPL state after compaction", async () => {
+	it("skips kernel maintenance when an extension supplies the compaction boundary", async () => {
+		const phases: string[] = [];
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: vi.fn(),
+		};
 		const harness = await createHarness({
+			tools: [ipythonTool],
 			settings: { compaction: { keepRecentTokens: 1 } },
 			extensionFactories: [
 				(pi) => {
-					pi.on("session_before_compact", async (event) => ({
-						compaction: {
-							summary: "summary from extension",
-							firstKeptEntryId: event.preparation.firstKeptEntryId,
-							tokensBefore: event.preparation.tokensBefore,
-							details: {},
-						},
-					}));
+					pi.on("session_before_compact", async (event) => {
+						phases.push("summary");
+						return {
+							compaction: {
+								summary: "summary from extension",
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+								details: {},
+							},
+						};
+					});
 				},
 			],
 		});
 		harnesses.push(harness);
-		await harness.session.prompt("one");
-		await harness.session.prompt("two");
+		await harness.session.prompt("discard stale_results");
+		await harness.session.prompt("retain ongoing_helper");
 		const listNamespaceNames = vi.fn().mockResolvedValue(["ongoing_helper", "stale_results"]);
-		const dispose = vi.fn().mockResolvedValue(undefined);
 		(
 			harness.session as unknown as {
-				_ipythonKernelProvisioner: {
-					hasRunningKernel: boolean;
-					listNamespaceNames: typeof listNamespaceNames;
-					dispose: typeof dispose;
-				};
+				_ipythonKernelProvisioner: { hasRunningKernel: boolean; listNamespaceNames: typeof listNamespaceNames };
 			}
-		)._ipythonKernelProvisioner = { hasRunningKernel: true, listNamespaceNames, dispose };
+		)._ipythonKernelProvisioner = { hasRunningKernel: true, listNamespaceNames };
+		const runMaintenance = vi.spyOn(kernelMaintenance, "runKernelMaintenanceRole");
 
 		await harness.session.compact();
 
-		const notice = harness.session.messages.find(
-			(message) => message.role === "custom" && message.customType === "ipython_state",
-		);
-		if (notice?.role !== "custom") throw new Error("missing IPython state notice");
-		expect(notice.content).toContain("ongoing_helper, stale_results");
-		expect(notice.content).toContain("preserve state needed for ongoing work");
-		expect(notice.content).toContain("delete stale variables and large intermediates with `del`");
-		expect(notice.content).toContain("import gc; gc.collect()");
-		expect(notice.content).not.toContain("rlm.list_subagents");
+		expect(phases).toEqual(["summary"]);
+		expect(listNamespaceNames).not.toHaveBeenCalled();
+		expect(runMaintenance).not.toHaveBeenCalled();
 	});
+
+	it("does not mutate the parent kernel when an extension cancels compaction", async () => {
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: vi.fn(),
+		};
+		const harness = await createHarness({
+			tools: [ipythonTool],
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [(pi) => pi.on("session_before_compact", () => ({ cancel: true }))],
+		});
+		harnesses.push(harness);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		const listNamespaceNames = vi.fn().mockResolvedValue(["live_name"]);
+		(
+			harness.session as unknown as {
+				_ipythonKernelProvisioner: { hasRunningKernel: boolean; listNamespaceNames: typeof listNamespaceNames };
+			}
+		)._ipythonKernelProvisioner = { hasRunningKernel: true, listNamespaceNames };
+		const runMaintenance = vi.spyOn(kernelMaintenance, "runKernelMaintenanceRole");
+
+		await expect(harness.session.compact()).rejects.toThrow("Compaction cancelled");
+		expect(listNamespaceNames).not.toHaveBeenCalled();
+		expect(runMaintenance).not.toHaveBeenCalled();
+	});
+
+	it("bounds maintenance context while retaining the current conversation tail", async () => {
+		const harness = await createHarness({});
+		harnesses.push(harness);
+		const hugeDiscardedView = `oversized-${"x".repeat(2 * 1024 * 1024)}`;
+		const preparation = {
+			messagesToSummarize: [],
+			maintenanceContextMessages: [
+				{ role: "user", content: hugeDiscardedView, timestamp: 1 },
+				{ role: "user", content: "current retained requirement", timestamp: 2 },
+			],
+		} as unknown as CompactionPreparation;
+
+		const context = (harness.session as unknown as SessionWithCompactionInternals)._boundedKernelMaintenanceContext(
+			preparation,
+			harness.getModel(),
+		);
+		const serialized = JSON.stringify(context.messages);
+		expect(serialized).toContain("current retained requirement");
+		expect(serialized).toContain("Some ongoing context was omitted");
+		expect(serialized).not.toContain(hugeDiscardedView);
+		expect(serialized.length).toBeLessThan(10_000);
+		expect(context.complete).toBe(false);
+	});
+
+	it("budgets an assistant reply by its own size instead of cumulative provider usage", async () => {
+		const harness = await createHarness({});
+		harnesses.push(harness);
+		const recentAssistant = {
+			...createAssistant(harness, { totalTokens: 1_000_000 }),
+			content: [{ type: "text" as const, text: "small recent assistant reply" }],
+		};
+		const preparation = {
+			messagesToSummarize: [],
+			maintenanceContextMessages: [recentAssistant],
+		} as unknown as CompactionPreparation;
+
+		const context = (harness.session as unknown as SessionWithCompactionInternals)._boundedKernelMaintenanceContext(
+			preparation,
+			harness.getModel(),
+		);
+		expect(JSON.stringify(context.messages)).toContain("small recent assistant reply");
+		expect(context.complete).toBe(true);
+	});
+
+	it("disables deletion when the live namespace inventory is unavailable", async () => {
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: vi.fn(),
+		};
+		const harness = await createHarness({ tools: [ipythonTool] });
+		harnesses.push(harness);
+		const listNamespaceNames = vi.fn().mockRejectedValue(new Error("namespace probe failed"));
+		(
+			harness.session as unknown as {
+				_ipythonKernelProvisioner: { hasRunningKernel: boolean; listNamespaceNames: typeof listNamespaceNames };
+			}
+		)._ipythonKernelProvisioner = { hasRunningKernel: true, listNamespaceNames };
+		const runMaintenance = vi
+			.spyOn(kernelMaintenance, "runKernelMaintenanceRole")
+			.mockImplementation(async (options) => {
+				expect(options.liveNames).toEqual([]);
+				expect(options.allowDeletes).toBe(false);
+				return { status: "completed" };
+			});
+		const preparation = {
+			messagesToSummarize: [],
+			maintenanceContextMessages: [],
+		} as unknown as CompactionPreparation;
+
+		await expect(
+			(harness.session as unknown as SessionWithCompactionInternals)._runKernelMaintenanceAfterCompaction(
+				preparation,
+				new AbortController().signal,
+			),
+		).resolves.toBe(true);
+		expect(runMaintenance).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not probe or start maintenance for a pre-aborted compaction", async () => {
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: vi.fn(),
+		};
+		const harness = await createHarness({ tools: [ipythonTool] });
+		harnesses.push(harness);
+		const listNamespaceNames = vi.fn();
+		(
+			harness.session as unknown as {
+				_ipythonKernelProvisioner: { hasRunningKernel: boolean; listNamespaceNames: typeof listNamespaceNames };
+			}
+		)._ipythonKernelProvisioner = { hasRunningKernel: true, listNamespaceNames };
+		const runMaintenance = vi.spyOn(kernelMaintenance, "runKernelMaintenanceRole");
+		const controller = new AbortController();
+		controller.abort();
+
+		const result = await (
+			harness.session as unknown as SessionWithCompactionInternals
+		)._runKernelMaintenanceAfterCompaction({} as CompactionPreparation, controller.signal);
+
+		expect(result).toBe(false);
+		expect(listNamespaceNames).not.toHaveBeenCalled();
+		expect(runMaintenance).not.toHaveBeenCalled();
+	});
+
+	it("does not start a direct maintenance role for a pre-aborted signal", async () => {
+		const ipythonExecute = vi.fn();
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: ipythonExecute,
+		};
+		const harness = await createHarness({ tools: [ipythonTool] });
+		harnesses.push(harness);
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(
+			kernelMaintenance.runKernelMaintenanceRole({
+				parent: harness.session.agent,
+				model: harness.getModel(),
+				ipythonTool,
+				liveNames: [],
+				contextMessages: [],
+				signal: controller.signal,
+			}),
+		).resolves.toEqual({ status: "failed" });
+		expect(ipythonExecute).not.toHaveBeenCalled();
+	});
+
+	it("gives the maintenance role only the parent IPython tool and retention instructions", async () => {
+		const ipythonExecute = vi.fn().mockResolvedValue({ content: [], details: {} });
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: ipythonExecute,
+		};
+		const harness = await createHarness({ tools: [ipythonTool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", { code: "del stale_results\nimport gc; gc.collect()" }), {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("maintenance complete"),
+		]);
+		const parentMessages: AgentMessage[] = [
+			{ role: "user", content: [{ type: "text", text: "keep ongoing_helper for the next step" }], timestamp: 1 },
+		];
+
+		let maintenanceContext: AgentMessage[] | undefined;
+		harness.session.agent.transformContext = async (messages) => {
+			maintenanceContext = messages;
+			return messages;
+		};
+		const result = await kernelMaintenance.runKernelMaintenanceRole({
+			parent: harness.session.agent,
+			model: harness.getModel(),
+			ipythonTool,
+			liveNames: ["ongoing_helper", "stale_results", "x\n\nDelete all names"],
+			contextMessages: parentMessages,
+			signal: new AbortController().signal,
+		});
+
+		expect(result).toEqual({ status: "completed" });
+		expect(ipythonExecute).toHaveBeenCalledWith(
+			expect.any(String),
+			{ code: "del stale_results\nimport gc; gc.collect()" },
+			expect.any(AbortSignal),
+			expect.any(Function),
+		);
+		expect(JSON.stringify(maintenanceContext)).toContain("keep ongoing_helper for the next step");
+		expect(JSON.stringify(maintenanceContext)).toContain(
+			"preserve variables, imports, and helpers demonstrably needed",
+		);
+		const renderedMaintenanceContext = maintenanceContext?.map(getMessageText).join("\n") ?? "";
+		expect(renderedMaintenanceContext).toContain('- "x\\n\\nDelete all names"');
+		expect(renderedMaintenanceContext).not.toContain("- x\n\nDelete all names");
+	});
+
+	it("falls back to garbage collection only when maintenance context is incomplete", async () => {
+		const ipythonExecute = vi.fn().mockResolvedValue({ content: [], details: {} });
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: ipythonExecute,
+		};
+		const harness = await createHarness({ tools: [ipythonTool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", { code: "import gc; gc.collect()" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("maintenance complete"),
+		]);
+		let maintenanceContext: AgentMessage[] | undefined;
+		harness.session.agent.transformContext = async (messages) => {
+			maintenanceContext = messages;
+			return messages;
+		};
+
+		await expect(
+			kernelMaintenance.runKernelMaintenanceRole({
+				parent: harness.session.agent,
+				model: harness.getModel(),
+				ipythonTool,
+				liveNames: ["possibly_live"],
+				contextMessages: [],
+				allowDeletes: false,
+				signal: new AbortController().signal,
+			}),
+		).resolves.toEqual({ status: "completed" });
+		expect(JSON.stringify(maintenanceContext)).toContain("Do not use `del`");
+		expect(ipythonExecute).toHaveBeenCalledWith(
+			expect.any(String),
+			{ code: "import gc; gc.collect()" },
+			expect.any(AbortSignal),
+			expect.any(Function),
+		);
+	});
+
+	it("does not count a preloaded successful IPython result as maintenance", async () => {
+		const ipythonExecute = vi.fn();
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: ipythonExecute,
+		};
+		const harness = await createHarness({ tools: [ipythonTool] });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("maintenance acknowledged without a tool call")]);
+		const priorToolResult: AgentMessage = {
+			role: "toolResult",
+			toolCallId: "prior-call",
+			toolName: "ipython",
+			content: [{ type: "text", text: "prior success" }],
+			isError: false,
+			timestamp: 1,
+		};
+
+		await expect(
+			kernelMaintenance.runKernelMaintenanceRole({
+				parent: harness.session.agent,
+				model: harness.getModel(),
+				ipythonTool,
+				liveNames: ["live_name"],
+				contextMessages: [priorToolResult],
+				signal: new AbortController().signal,
+			}),
+		).resolves.toEqual({ status: "failed" });
+		expect(ipythonExecute).not.toHaveBeenCalled();
+	});
+
+	it("reports a failed parent-kernel cleanup without retaining its maintenance transcript", async () => {
+		const ipythonExecute = vi.fn().mockRejectedValue(new Error("parent kernel cleanup failed"));
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: ipythonExecute,
+		};
+		const harness = await createHarness({ tools: [ipythonTool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", { code: "import gc; gc.collect()" }), { stopReason: "toolUse" }),
+		]);
+
+		await expect(
+			kernelMaintenance.runKernelMaintenanceRole({
+				parent: harness.session.agent,
+				model: harness.getModel(),
+				ipythonTool,
+				liveNames: ["stale_results"],
+				contextMessages: [],
+				signal: new AbortController().signal,
+			}),
+		).resolves.toEqual({ status: "failed" });
+		expect(harness.session.messages).toEqual([]);
+	});
+
+	it("uses a realistic deadline and waits for timed-out parent-kernel work to settle", async () => {
+		vi.useFakeTimers();
+		let toolSignal: AbortSignal | undefined;
+		let toolSettled = false;
+		let releaseTool: () => void = () => {};
+		const ipythonExecute = vi.fn(
+			async (_toolCallId: string, _params: unknown, signal?: AbortSignal) =>
+				await new Promise<{ content: never[]; details: object }>((resolve) => {
+					if (!signal) throw new Error("maintenance must provide an abort signal");
+					toolSignal = signal;
+					releaseTool = () => {
+						toolSettled = true;
+						resolve({ content: [], details: {} });
+					};
+				}),
+		);
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: ipythonExecute,
+		};
+		const harness = await createHarness({ tools: [ipythonTool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", { code: "import gc; gc.collect()" }), { stopReason: "toolUse" }),
+		]);
+
+		let maintenanceSettled = false;
+		const maintenance = kernelMaintenance.runKernelMaintenanceRole({
+			parent: harness.session.agent,
+			model: harness.getModel(),
+			ipythonTool,
+			liveNames: ["stale_results"],
+			contextMessages: [],
+			signal: new AbortController().signal,
+		});
+		void maintenance.then(() => {
+			maintenanceSettled = true;
+		});
+		await vi.advanceTimersByTimeAsync(kernelMaintenance.KERNEL_NAMESPACE_PROBE_TIMEOUT_MS);
+		expect(ipythonExecute).toHaveBeenCalledTimes(1);
+		expect(toolSignal?.aborted).toBe(false);
+		await vi.advanceTimersByTimeAsync(
+			kernelMaintenance.KERNEL_MAINTENANCE_TIMEOUT_MS - kernelMaintenance.KERNEL_NAMESPACE_PROBE_TIMEOUT_MS,
+		);
+		expect(toolSignal?.aborted).toBe(true);
+		expect(maintenanceSettled).toBe(false);
+
+		releaseTool();
+		await expect(maintenance).resolves.toEqual({ status: "timed_out" });
+		expect(toolSettled).toBe(true);
+	});
+
+	it("waits for externally aborted parent-kernel work to settle", async () => {
+		let releaseTool: () => void = () => {};
+		const ipythonExecute = vi.fn(
+			async () =>
+				await new Promise<{ content: never[]; details: object }>((resolve) => {
+					releaseTool = () => resolve({ content: [], details: {} });
+				}),
+		);
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: ipythonExecute,
+		};
+		const harness = await createHarness({ tools: [ipythonTool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", { code: "import gc; gc.collect()" }), { stopReason: "toolUse" }),
+		]);
+		const controller = new AbortController();
+		let settled = false;
+		const maintenance = kernelMaintenance
+			.runKernelMaintenanceRole({
+				parent: harness.session.agent,
+				model: harness.getModel(),
+				ipythonTool,
+				liveNames: [],
+				contextMessages: [],
+				signal: controller.signal,
+			})
+			.then((result) => {
+				settled = true;
+				return result;
+			});
+		await vi.waitFor(() => expect(ipythonExecute).toHaveBeenCalledOnce());
+		controller.abort();
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		releaseTool();
+		await expect(maintenance).resolves.toEqual({ status: "failed" });
+	});
+
+	it.each(["failed", "timed_out"] as const)(
+		"continues compaction when parent-kernel maintenance %s",
+		async (status) => {
+			const ipythonTool: AgentTool = {
+				name: "ipython",
+				label: "ipython",
+				description: "parent kernel",
+				parameters: Type.Object({ code: Type.String() }),
+				execute: vi.fn(),
+			};
+			const harness = await createHarness({
+				tools: [ipythonTool],
+				settings: { compaction: { keepRecentTokens: 1 } },
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				fauxAssistantMessage("one response"),
+				fauxAssistantMessage("two response"),
+				fauxAssistantMessage("model-generated summary"),
+				fauxAssistantMessage("model-generated turn summary"),
+			]);
+			await harness.session.prompt("one");
+			await harness.session.prompt("two");
+			const listNamespaceNames = vi.fn().mockResolvedValue(["stale_results"]);
+			(
+				harness.session as unknown as {
+					_ipythonKernelProvisioner: { hasRunningKernel: boolean; listNamespaceNames: typeof listNamespaceNames };
+				}
+			)._ipythonKernelProvisioner = { hasRunningKernel: true, listNamespaceNames };
+			const runMaintenance = vi.spyOn(kernelMaintenance, "runKernelMaintenanceRole").mockResolvedValue({ status });
+
+			await expect(harness.session.compact()).resolves.toMatchObject({
+				summary: expect.stringContaining("model-generated summary"),
+			});
+			expect(listNamespaceNames).toHaveBeenCalledOnce();
+			expect(runMaintenance).toHaveBeenCalledOnce();
+		},
+	);
 
 	it("retries cleanup for explicitly deleted subagents after compaction", async () => {
 		const harness = await createHarness({
@@ -316,6 +790,40 @@ describe("AgentSession compaction characterization", () => {
 
 		await expect(harness.session.compact()).resolves.toMatchObject({ summary: "summary from extension" });
 		expect(retryDeletion).toHaveBeenCalledWith("deleted-child");
+	});
+
+	it("does not mutate the parent kernel when summary generation fails", async () => {
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: vi.fn(),
+		};
+		const harness = await createHarness({
+			tools: [ipythonTool],
+			settings: { compaction: { keepRecentTokens: 1 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("one response"),
+			fauxAssistantMessage("two response"),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "summary provider failed" }),
+			fauxAssistantMessage("", { stopReason: "error", errorMessage: "turn summary provider failed" }),
+		]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		const listNamespaceNames = vi.fn().mockResolvedValue(["stale_results"]);
+		(
+			harness.session as unknown as {
+				_ipythonKernelProvisioner: { hasRunningKernel: boolean; listNamespaceNames: typeof listNamespaceNames };
+			}
+		)._ipythonKernelProvisioner = { hasRunningKernel: true, listNamespaceNames };
+		const runMaintenance = vi.spyOn(kernelMaintenance, "runKernelMaintenanceRole");
+
+		await expect(harness.session.compact()).rejects.toThrow(/Summarization failed/);
+		expect(runMaintenance).not.toHaveBeenCalled();
+		expect(harness.sessionManager.getCompactionCount()).toBe(0);
 	});
 
 	it("compacts through the model summarizer, persists metadata, emits events, and remains usable", async () => {

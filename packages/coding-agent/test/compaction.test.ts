@@ -176,12 +176,13 @@ function extractText(messages: AgentMessage[]): string {
 // ============================================================================
 
 describe("buildSummarizationPrompt", () => {
-	it("omits user instructions block when no instructions given", () => {
+	it("omits user instructions and successful-maintenance claims by default", () => {
 		const prompt = buildSummarizationPrompt();
 		expect(prompt).not.toContain("<user-instructions>");
 		expect(prompt).toContain("## Goal");
-		// The kernel keeps running across compaction — the note must not claim a wipe.
+		// The kernel keeps running across compaction — the note must not claim a wipe or cleanup success.
 		expect(prompt).toContain("IPython kernel keeps running");
+		expect(prompt).not.toContain("successfully completed");
 		expect(prompt).not.toMatch(/wiped|restarted/);
 	});
 
@@ -466,12 +467,22 @@ describe("prepareCompaction with previous compaction", () => {
 
 		const pathEntries = [u1, a1, u2, a2, u3, a3, compaction1, u4, a4];
 		const contextBefore = buildSessionContext(pathEntries);
-		const preparation = prepareCompaction(pathEntries, DEFAULT_COMPACTION_SETTINGS);
+		const preparation = prepareCompaction(
+			pathEntries,
+			DEFAULT_COMPACTION_SETTINGS,
+			"Preserve the live dataframe in df",
+		);
 
 		expect(preparation).toBeDefined();
 		expect(preparation!.firstKeptEntryId).toBe(u2.id);
 		expect(preparation!.previousSummary).toBe("First summary");
 		expect(extractText(preparation!.messagesToSummarize)).not.toContain("First summary");
+		const maintenanceText = extractText(preparation!.maintenanceContextMessages);
+		expect(maintenanceText).toContain("First summary");
+		expect(maintenanceText).toContain("user msg 2 - kept by compaction1");
+		expect(maintenanceText).toContain("user msg 4 (new after compaction1)");
+		expect(maintenanceText).toContain("Current compaction instructions");
+		expect(maintenanceText).toContain("Preserve the live dataframe in df");
 		expect(preparation!.tokensBefore).toBe(estimateContextTokens(contextBefore.messages).tokens);
 
 		const compaction2: CompactionEntry = {

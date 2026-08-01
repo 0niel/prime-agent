@@ -101,11 +101,13 @@ import {
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import {
 	COMPACT_SKILL_NAME,
+	type CompactionPreparation,
 	type CompactionResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
+	estimateTokens,
 	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
@@ -167,6 +169,7 @@ import {
 } from "./goals.js";
 import type { HostRequestHandlers, KernelSentAgentMessage } from "./kernel/index.js";
 import { type RestoreResult, snapshotPathIn } from "./kernel/state-snapshot.js";
+import * as kernelMaintenance from "./kernel-maintenance.js";
 import type { McpManager } from "./mcp/mcp-manager.js";
 import {
 	type BashExecutionMessage,
@@ -849,9 +852,6 @@ interface RlmSubagentModelSelection {
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
-/** Cap on the post-compaction kernel namespace probe so a wedged kernel can't stall recovery. */
-const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 
 function noopRlmChildAbort(): void {}
 
@@ -6279,57 +6279,90 @@ export class AgentSession {
 		return this.model ? (clampThinkingLevel(this.model, level) as ThinkingLevel) : "off";
 	}
 
-	// Added to history (not a nextTurn message) so it also reaches the continue()-driven
-	// auto-compaction resume, which never injects nextTurn messages.
-	private async _notifyKernelStateAfterCompaction(): Promise<void> {
+	/**
+	 * Execute the dedicated host-side maintenance role against the parent kernel
+	 * after the summary and compaction entry are durably committed. This is deliberately
+	 * not an RLM child: an RLM child owns a distinct kernel and cannot reclaim
+	 * parent-session state.
+	 *
+	 * Cleanup is best-effort. A wedged or failed kernel must not turn an otherwise
+	 * valid transcript compaction into a failure; the role awaits its own IPython
+	 * execution before post-compaction finalization continues.
+	 */
+	private _boundedKernelMaintenanceContext(
+		preparation: CompactionPreparation,
+		model: Model<any>,
+	): { messages: AgentMessage[]; complete: boolean } {
+		const contextWindow = model.contextWindow || 16_000;
+		const tokenBudget = Math.max(1024, Math.min(32_000, Math.floor(contextWindow / 2)));
+		const selected: AgentMessage[] = [];
+		let remainingTokens = tokenBudget;
+		let omitted = false;
+		for (let i = preparation.maintenanceContextMessages.length - 1; i >= 0; i--) {
+			const message = preparation.maintenanceContextMessages[i];
+			const messageTokens = estimateTokens(message);
+			if (messageTokens > remainingTokens) {
+				omitted = true;
+				continue;
+			}
+			selected.unshift(message);
+			remainingTokens -= messageTokens;
+		}
+		if (omitted) {
+			selected.unshift({
+				role: "user",
+				content:
+					"Some ongoing context was omitted from this bounded maintenance view. Preserve every live kernel name unless the visible context explicitly proves it stale.",
+				timestamp: Date.now(),
+			});
+		}
+		const preparedMessageCount =
+			preparation.messagesToSummarize.length +
+			preparation.maintenanceContextMessages.length -
+			(preparation.maintenanceContextSyntheticMessageCount ?? 0);
+		return {
+			messages: selected,
+			complete: !omitted && this.agent.state.messages.length <= preparedMessageCount,
+		};
+	}
+
+	private async _runKernelMaintenanceAfterCompaction(
+		preparation: CompactionPreparation,
+		signal: AbortSignal,
+	): Promise<boolean> {
+		if (signal.aborted) return false;
 		const provisioner = this._ipythonKernelProvisioner;
-		// No kernel means no state to remind about; only stay silent in that case.
-		if (!provisioner?.hasRunningKernel) return;
-		// Bound the probe so a wedged kernel can't stall recovery, and abort it on timeout so
-		// the kernel's serialized execution queue isn't left occupied by a never-resolving cell.
-		const abort = new AbortController();
-		const timer = setTimeout(() => abort.abort(), KERNEL_STATE_LISTING_TIMEOUT_MS);
+		const ipythonTool = this._toolRegistry.get("ipython");
+		const model = this.model;
+		if (!provisioner?.hasRunningKernel || !ipythonTool || !model) return false;
+
+		const listingAbort = new AbortController();
+		const abortListing = () => listingAbort.abort();
+		signal.addEventListener("abort", abortListing, { once: true });
+		const timer = setTimeout(() => listingAbort.abort(), kernelMaintenance.KERNEL_NAMESPACE_PROBE_TIMEOUT_MS);
 		if (typeof timer === "object" && "unref" in timer) timer.unref();
 		let names: string[] | null;
 		try {
-			names = await provisioner.listNamespaceNames(abort.signal).catch(() => null);
+			names = await provisioner.listNamespaceNames(listingAbort.signal).catch(() => null);
 		} finally {
 			clearTimeout(timer);
+			signal.removeEventListener("abort", abortListing);
 		}
-		// null is a listing failure/timeout; only claim state survived if the kernel is still up
-		// (it may have died in the window since the check above).
-		if (names === null && !provisioner.hasRunningKernel) return;
-		const detail =
-			names === null
-				? ""
-				: names.length > 0
-					? ` These names are still defined: ${names.join(", ")}.`
-					: " You have not defined any names yet.";
-		const content = [
-			"<ipython_state>",
-			`Your IPython kernel persisted through compaction; all variables, imports, and helpers you defined remain available.${detail}`,
-			"Treat compaction as a REPL garbage-collection checkpoint. Review the persisted namespace now, preserve state needed for ongoing work, delete stale variables and large intermediates with `del`, then run `import gc; gc.collect()`. Do not clear useful state indiscriminately.",
-			"</ipython_state>",
-		].join("\n");
-		const message = {
-			role: "custom" as const,
-			customType: "ipython_state",
-			content,
-			display: false,
-			timestamp: Date.now(),
-		} satisfies CustomMessage;
-		// Insert before a trailing assistant error so overflow-retry cleanup can still strip it.
-		const messages = this.agent.state.messages;
-		const last = messages[messages.length - 1];
-		const insertBeforeError = last?.role === "assistant" && (last as AssistantMessage).stopReason === "error";
-		if (insertBeforeError) {
-			messages.splice(messages.length - 1, 0, message);
-		} else {
-			messages.push(message);
-		}
-		this.sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display, undefined);
-		this._emit({ type: "message_start", message });
-		this._emit({ type: "message_end", message });
+		if (signal.aborted) return false;
+
+		const maintenanceContext = this._boundedKernelMaintenanceContext(preparation, model);
+		const result = await kernelMaintenance
+			.runKernelMaintenanceRole({
+				parent: this.agent,
+				model,
+				ipythonTool,
+				liveNames: names ?? [],
+				contextMessages: maintenanceContext.messages,
+				allowDeletes: names !== null && maintenanceContext.complete,
+				signal,
+			})
+			.catch(() => ({ status: "failed" }) as const);
+		return result.status === "completed";
 	}
 
 	/**
@@ -6492,7 +6525,7 @@ export class AgentSession {
 		const pathEntries = this.sessionManager.getResidentBranch();
 		const settings = this.settingsManager.getCompactionSettings();
 
-		const preparation = prepareCompaction(pathEntries, settings);
+		const preparation = prepareCompaction(pathEntries, settings, customInstructions);
 		if (!preparation) {
 			const lastEntry = pathEntries[pathEntries.length - 1];
 			if (lastEntry?.type === "compaction") {
@@ -6539,6 +6572,11 @@ export class AgentSession {
 			fromExtension,
 			customInstructions,
 		);
+		// Destructive maintenance is intentionally post-commit: a summary/provider
+		// failure must never mutate the parent kernel without a saved compaction.
+		if (!fromExtension) {
+			await this._runKernelMaintenanceAfterCompaction(preparation, signal);
+		}
 		const newEntries = this.sessionManager.getResidentEntries();
 		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
 		this._mergeUnpersistedCompactionOutcomes(this.agent.state.messages);
@@ -6555,7 +6593,6 @@ export class AgentSession {
 				fromExtension,
 			});
 		}
-		await this._notifyKernelStateAfterCompaction();
 		this.sessionManager.evictCompactedHistoryPayloads();
 		await this._reapDeletedRlmSubagentRuntimesAfterCompaction();
 
