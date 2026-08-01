@@ -12,13 +12,24 @@ type SerializedInternals = {
 		newMessages: unknown[];
 	}): Promise<boolean>;
 	_runSerializedRefineCheckpoint(): Promise<void>;
-	_runSerializedRefine(options: { instructions?: string; global?: boolean }): Promise<void>;
+	_runSerializedRefine(
+		options: { instructions?: string; global?: boolean },
+		trajectoryMessages?: readonly unknown[],
+	): Promise<void>;
 	_consumeSerializedBackgroundPlan(consume: (result: unknown) => Promise<boolean>): Promise<string>;
-	_runSerializedAutoRefineReview(reason: "turn_interval" | "compact", branchVersion: number): Promise<void>;
+	_runSerializedAutoRefineReview(
+		reason: "turn_interval" | "compact",
+		branchVersion: number,
+		concurrentCompaction?: unknown,
+	): Promise<void>;
 	_consumePendingRequestedRefine(): boolean;
 	_maybeAutoRefine(reason: string): Promise<void>;
 	_reviewAutoRefine(context: { reason: string; turnsSinceLastReview: number }, signal?: AbortSignal): Promise<unknown>;
-	_planRefine(options: { instructions?: string; global?: boolean }, signal: AbortSignal): Promise<unknown>;
+	_planRefine(
+		options: { instructions?: string; global?: boolean },
+		signal: AbortSignal,
+		trajectoryMessages?: readonly unknown[],
+	): Promise<unknown>;
 	_applyRefine(
 		plan: unknown,
 		options: { instructions?: string; global?: boolean },
@@ -54,6 +65,11 @@ type SerializedInternals = {
 	_schedulePendingMessageResume(request?: boolean): void;
 	_maybeStartSerializedBackgroundPlan: () => void;
 	_compactAutoRefinePending: boolean;
+	_pendingConcurrentCompactionRefine?: {
+		trajectoryMessages: readonly unknown[];
+		applyGate: Promise<boolean>;
+		commitState: { value?: boolean };
+	};
 	_scheduleAutoRefine(reason: "turn_interval" | "compact"): void;
 	_getRequiredRequestAuth(model: unknown): Promise<{ apiKey: string; headers?: Record<string, string> }>;
 	_performCompaction(options: unknown): Promise<{
@@ -1425,6 +1441,88 @@ describe("Serialized refine review-fix regressions", () => {
 		await compacting;
 		await vi.waitFor(() => expect(applyRefine).toHaveBeenCalledOnce());
 		expect(internals._compactAutoRefinePending).toBe(false);
+	});
+
+	it("consumes a deferred compact snapshot on the serialized boundary without an interactive timer", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "deferred serialized lesson" }));
+		const harness = await createHarness({
+			persistSession: true,
+			serializedRefine: true,
+			settings: { autoRefine: { enabled: true, compact: true, turnInterval: 999, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SerializedInternals;
+		const { applyRefine } = mockSerializedRefine(harness);
+		const planRefine = vi.mocked(internals._planRefine);
+		const publicRefine = vi.spyOn(harness.session, "refine");
+		const scheduleAutoRefine = vi.spyOn(internals, "_scheduleAutoRefine");
+		internals._pendingConcurrentCompactionRefine = {
+			trajectoryMessages: [{ role: "user", content: "serialized pre-compaction snapshot", timestamp: Date.now() }],
+			applyGate: Promise.resolve(true),
+			commitState: { value: true },
+		};
+		internals._compactAutoRefinePending = true;
+
+		await internals._runSerializedRefineCheckpoint();
+
+		expect(reviewer).toHaveBeenCalledWith(expect.objectContaining({ reason: "compact" }), expect.any(AbortSignal));
+		expect(JSON.stringify(planRefine.mock.calls[0]?.[2])).toContain("serialized pre-compaction snapshot");
+		expect(applyRefine).toHaveBeenCalledOnce();
+		expect(publicRefine).not.toHaveBeenCalled();
+		expect(scheduleAutoRefine).not.toHaveBeenCalled();
+		expect(internals._pendingConcurrentCompactionRefine).toBeUndefined();
+	});
+
+	it("drains a deferred compact snapshot during disposal without waiting for agent idle", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "disposal lesson" }));
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { autoRefine: { enabled: true, compact: true, turnInterval: 999, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SerializedInternals;
+		const { applyRefine } = mockSerializedRefine(harness);
+		const planRefine = vi.mocked(internals._planRefine);
+		const waitForIdle = vi.spyOn(harness.session.agent, "waitForIdle");
+		internals._pendingConcurrentCompactionRefine = {
+			trajectoryMessages: [{ role: "user", content: "disposal pre-compaction snapshot", timestamp: Date.now() }],
+			applyGate: Promise.resolve(true),
+			commitState: { value: true },
+		};
+		internals._compactAutoRefinePending = true;
+
+		await expect(internals._drainPendingRefinementForDisposal()).resolves.toBeUndefined();
+
+		expect(JSON.stringify(planRefine.mock.calls[0]?.[2])).toContain("disposal pre-compaction snapshot");
+		expect(applyRefine).toHaveBeenCalledOnce();
+		expect(waitForIdle).not.toHaveBeenCalled();
+	});
+
+	it("does not drain an uncommitted compact snapshot during disposal", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "must not run" }));
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { autoRefine: { enabled: true, compact: true, turnInterval: 999, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SerializedInternals;
+		const { applyRefine } = mockSerializedRefine(harness);
+		const planRefine = vi.mocked(internals._planRefine);
+		internals._pendingConcurrentCompactionRefine = {
+			trajectoryMessages: [{ role: "user", content: "uncommitted compaction", timestamp: Date.now() }],
+			applyGate: new Promise<boolean>(() => {}),
+			commitState: {},
+		};
+		internals._compactAutoRefinePending = true;
+
+		await expect(internals._drainPendingRefinementForDisposal()).resolves.toBeUndefined();
+
+		expect(reviewer).not.toHaveBeenCalled();
+		expect(planRefine).not.toHaveBeenCalled();
+		expect(applyRefine).not.toHaveBeenCalled();
 	});
 
 	it("does not let a compact review failure block disposal", async () => {

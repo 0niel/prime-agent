@@ -2114,9 +2114,19 @@ export class AgentSession {
 		}
 		if (this._compactAutoRefinePending) {
 			if (this._pendingConcurrentCompactionRefine) {
-				if (!this._pendingConcurrentCompactionRefineTimer) {
-					this._schedulePendingConcurrentCompactionRefine(this._pendingConcurrentCompactionRefine, 0);
+				const pendingCompaction = this._pendingConcurrentCompactionRefine;
+				if (!settings.compact || pendingCompaction.commitState.value === false) {
+					this._pendingConcurrentCompactionRefine = undefined;
+					this._compactAutoRefinePending = false;
+					return;
 				}
+				const nowMs = Date.now();
+				const underCooldown =
+					this._lastAutoRefineReviewAt > 0 && nowMs - this._lastAutoRefineReviewAt < settings.cooldownMs;
+				if (underCooldown) return;
+				this._pendingConcurrentCompactionRefine = undefined;
+				this._compactAutoRefinePending = false;
+				await this._runSerializedAutoRefineReview("compact", branchVersion, pendingCompaction);
 				return;
 			}
 			if (!settings.compact) {
@@ -2153,7 +2163,9 @@ export class AgentSession {
 	private async _runSerializedAutoRefineReview(
 		reason: "compact" | "turn_interval",
 		branchVersion: number,
+		concurrentCompaction?: ConcurrentCompactionRefine,
 	): Promise<void> {
+		if (concurrentCompaction && concurrentCompaction.commitState.value !== true) return;
 		const reviewAbort = new AbortController();
 		this._autoRefineReviewAbort = reviewAbort;
 		this._autoRefineInProgress = true;
@@ -2161,6 +2173,7 @@ export class AgentSession {
 			const review = await this._reviewAutoRefine(
 				{ reason, turnsSinceLastReview: this._assistantTurnsSinceAutoRefine },
 				reviewAbort.signal,
+				concurrentCompaction?.trajectoryMessages,
 			);
 			if (this._disposed || this._disposing || branchVersion !== this._autoRefineBranchVersion) {
 				return;
@@ -2170,9 +2183,10 @@ export class AgentSession {
 				this._assistantTurnsSinceAutoRefine = 0;
 				return;
 			}
-			await this._runSerializedRefine({
-				instructions: autoRefineInstructions(reason, review),
-			});
+			await this._runSerializedRefine(
+				{ instructions: autoRefineInstructions(reason, review) },
+				concurrentCompaction?.trajectoryMessages,
+			);
 			if (this._disposed || this._disposing || branchVersion !== this._autoRefineBranchVersion) {
 				return;
 			}
@@ -2368,11 +2382,10 @@ export class AgentSession {
 	 * so the agent is between turns and _applyRefine's disconnect/reconnect
 	 * is safe.
 	 */
-	private async _runSerializedRefine(options: {
-		instructions?: string;
-		rollbackId?: string;
-		global?: boolean;
-	}): Promise<void> {
+	private async _runSerializedRefine(
+		options: { instructions?: string; rollbackId?: string; global?: boolean },
+		trajectoryMessages?: readonly AgentMessage[],
+	): Promise<void> {
 		if (this._disposed || this._disposing) {
 			return;
 		}
@@ -2396,7 +2409,7 @@ export class AgentSession {
 		const refineAbort = new AbortController();
 		this._refineAbortController = refineAbort;
 
-		const planRun = this._planRefine(options, refineAbort.signal);
+		const planRun = this._planRefine(options, refineAbort.signal, trajectoryMessages);
 		const planSettled = planRun.then(
 			() => undefined,
 			() => undefined,
@@ -3598,7 +3611,7 @@ export class AgentSession {
 			this._pendingConcurrentCompactionRefine = undefined;
 			this._compactAutoRefinePending = false;
 			if (compactSettings.enabled && compactSettings.compact && !underCooldown) {
-				await this._maybeAutoRefine("compact", pending);
+				await this._runSerializedAutoRefineReview("compact", this._autoRefineBranchVersion, pending);
 				return;
 			}
 		}
@@ -6869,7 +6882,10 @@ export class AgentSession {
 	private _schedulePendingConcurrentCompactionRefine(pending: ConcurrentCompactionRefine, delayMs?: number): void {
 		this._pendingConcurrentCompactionRefine = pending;
 		this._compactAutoRefinePending = true;
-		if (delayMs === undefined) return;
+		// Serialized sessions consume deferred compaction work synchronously at
+		// their next turn/disposal boundary; an interactive timer could overlap
+		// the next primary model turn.
+		if (this._serializedRefine || delayMs === undefined) return;
 		if (this._pendingConcurrentCompactionRefineTimer) {
 			clearTimeout(this._pendingConcurrentCompactionRefineTimer);
 			this._scheduledAutoRefineTimers.delete(this._pendingConcurrentCompactionRefineTimer);
