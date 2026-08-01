@@ -2,22 +2,34 @@
 
 ## [Unreleased]
 
-- Fixed `/tree` overflowing the daemon serializer on very deep sessions by transferring a flat session tree.
+## [0.4.0] - 2026-08-01
 
-- Added starting a new session directly from the agents view with `ctrl+n`.
-- Added queueing a reply as a follow-up with `alt+enter` in the agents-view reply composer; plain Enter now steers a streaming agent.
-- Added session-owned slash commands (`/compact`, `/refine`, `/goal`, `/autonomous`) with autocomplete to the agents-view reply composer; other built-in commands are rejected with guidance instead of being sent as prompt text.
-- Added `/name` and `/kill` view commands to the agents view reply composer, acting on its armed target; the search bar stays pure search.
-- Added `/new` support for an optional stable session name and initial prompt.
-- Removed the `/resume` command and bare `--resume`; browse sessions with left-arrow from a chat (daemon view), and use `--resume <session-id|path>` for direct resumes.
-- Fixed `prime-agent agents` opening a new chat when running with a process-local session.
-- Changed collapsed edit and IPython tool calls to show compact per-file line-change summaries while keeping full diffs available when expanded.
-- Changed bare `/effort` to open a selector for the current model's supported reasoning levels.
-- Changed session search to rank exact name and first-message matches before prefix, substring, and stricter transcript fuzzy matches.
-- Fixed daemon startup failing when an interrupted supervisor left an empty ownership directory.
-- Fixed `/effort xhigh` and `/effort max` being rejected as unknown levels when no model was active yet.
-- Fixed selected rows in the agents view, child agent panel, and selectors being nearly invisible on terminals whose background closely matches the `selectedBg` theme color; the selection highlight now adapts to keep a minimum contrast against the detected terminal background.
-- Fixed startup blocking on a private Prime Inference model authorization request; the authorization is now cached next to `models.json` and stale entries refresh in the background.
+### Breaking Changes
+
+- Replaced the recursive daemon `get_session_tree` response with flat nodes linked by `parentId` (protocol 6); clients must support the new response shape.
+- Removed `/resume` and bare `--resume`; browse sessions with left-arrow from a daemon chat, or use `--resume <session-id|path>` for a direct resume.
+
+### Added
+
+- Added `ctrl+n` to start a session from Agents View, and `alt+enter` to queue a reply as a follow-up while Enter steers a streaming session.
+- Added session-owned `/compact`, `/refine`, `/goal`, and `/autonomous` commands with autocomplete to the Agents View reply composer, plus target-scoped `/name` and `/kill` commands.
+- Added optional stable session names and initial prompts to `/new`.
+
+### Changed
+
+- Changed collapsed edit and IPython calls to show compact per-file line-change summaries while retaining full expanded diffs.
+- Changed bare `/effort` to open a selector of the current model's supported reasoning levels, and removed token estimates from reasoning-effort displays.
+- Improved session search ranking to prefer exact session-name and first-message matches before prefix, substring, and transcript fuzzy matches.
+
+### Fixed
+
+- Fixed deeply nested `/tree` sessions overflowing the daemon serializer by transferring and rebuilding the session tree iteratively.
+- Fixed `prime-agent agents` opening a new chat for a process-local session.
+- Fixed daemon startup after an interrupted supervisor leaves an empty ownership directory.
+- Fixed `/effort xhigh` and `/effort max` being rejected before a model is active.
+- Fixed IPython tracebacks emitting ANSI color codes.
+- Fixed selected rows and selectors becoming nearly invisible on terminals whose background matches the selected theme color.
+- Fixed startup waiting on private Prime Inference model authorization by caching authorization locally and refreshing stale entries in the background.
 
 ## [0.3.3] - 2026-07-23
 

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-01
+
 ## [0.3.3] - 2026-07-23
 
 - Changed `SelectList` selection cursor from `→` to `›` for consistency with tree and user-message selectors.
