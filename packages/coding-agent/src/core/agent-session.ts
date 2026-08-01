@@ -6510,6 +6510,9 @@ export class AgentSession {
 				if (hadPostCompactionContinue) {
 					this._schedulePostCompactionContinue();
 				}
+				const willContinue =
+					hadPostCompactionContinue || this.agent.hasQueuedMessages() || this.pendingMessageCount > 0;
+				if (!willContinue) this._scheduleDeferredAutoRefineIfIdle();
 			}
 		}
 	}
@@ -6899,7 +6902,9 @@ export class AgentSession {
 			return;
 		}
 		if (this._pendingConcurrentCompactionRefine) {
-			this._schedulePendingConcurrentCompactionRefine(this._pendingConcurrentCompactionRefine, 0);
+			if (!this._pendingConcurrentCompactionRefineTimer) {
+				this._schedulePendingConcurrentCompactionRefine(this._pendingConcurrentCompactionRefine, 0);
+			}
 			return;
 		}
 		if (this._turnIntervalAutoRefinePending) {
@@ -6973,14 +6978,17 @@ export class AgentSession {
 
 		const pendingReview = this._pendingAutoRefineReview;
 		if (pendingReview) {
-			if (underCooldown) {
-				if (concurrentCompaction) {
-					const remaining = Math.max(0, settings.cooldownMs - (nowMs - this._lastAutoRefineReviewAt));
-					this._schedulePendingConcurrentCompactionRefine(concurrentCompaction, remaining);
-				}
-				return;
+			if (concurrentCompaction) {
+				const remaining = underCooldown
+					? Math.max(0, settings.cooldownMs - (nowMs - this._lastAutoRefineReviewAt))
+					: undefined;
+				this._schedulePendingConcurrentCompactionRefine(concurrentCompaction, remaining);
 			}
-			await this._runApprovedRefine(pendingReview.reason, pendingReview.review, concurrentCompaction);
+			if (underCooldown) return;
+			// This approved review predates the compaction. Apply it independently so
+			// compaction failure cannot discard unrelated harness work, while the
+			// compact-specific snapshot remains queued for its own fresh review.
+			await this._runApprovedRefine(pendingReview.reason, pendingReview.review);
 			return;
 		}
 
@@ -7095,13 +7103,13 @@ export class AgentSession {
 	): Promise<void> {
 		this._autoRefineInProgress = true;
 		try {
-			const result = await this.refine(
-				{ instructions: autoRefineInstructions(reason, review) },
-				{
-					trajectoryMessages: concurrentCompaction?.trajectoryMessages,
-					applyGate: concurrentCompaction?.applyGate,
-				},
-			);
+			const options = { instructions: autoRefineInstructions(reason, review) };
+			const result = concurrentCompaction
+				? await this.refine(options, {
+						trajectoryMessages: concurrentCompaction.trajectoryMessages,
+						applyGate: concurrentCompaction.applyGate,
+					})
+				: await this.refine(options);
 			this._appendRefinementCompletionMessage(result);
 			this._pendingAutoRefineReview = undefined;
 			this._turnIntervalAutoRefinePending = false;

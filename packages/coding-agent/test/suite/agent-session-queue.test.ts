@@ -32,7 +32,6 @@ type AutoRefineReason = "turn_interval" | "compact";
 type AutoRefineInternals = {
 	_maybeAutoRefine(reason: AutoRefineReason): Promise<void>;
 	_scheduleAutoRefine(reason: AutoRefineReason): void;
-	_scheduleAutoRefineAfterCompaction(willContinueAfterCompaction: boolean): void;
 	_scheduleAutoRefineAfterAgentEnd(): void;
 	_schedulePostCompactionContinue(): void;
 	_invalidatePendingAutoRefineForBranchChange(): Promise<void>;
@@ -222,49 +221,22 @@ describe("AgentSession queue characterization", () => {
 		},
 	);
 
-	it.each([
-		{
-			name: "waits for planned post-compaction continuation",
-			act: (internals: AutoRefineInternals, expectSchedule: (called: boolean) => void) => {
-				internals._scheduleAutoRefineAfterCompaction(true);
-				expect(internals._compactAutoRefinePending).toBe(true);
-				expectSchedule(false);
-				internals._scheduleAutoRefineAfterAgentEnd();
-				expect(internals._compactAutoRefinePending).toBe(true);
-			},
-		},
-		{
-			name: "waits until the scheduled post-compaction continuation starts",
-			act: (internals: AutoRefineInternals, expectSchedule: (called: boolean) => void) => {
-				internals._compactAutoRefinePending = true;
-				internals._postCompactionContinuationScheduled = true;
-				internals._scheduleAutoRefineAfterAgentEnd();
-				expectSchedule(false);
-				internals._postCompactionContinuationScheduled = false;
-				internals._scheduleAutoRefineAfterAgentEnd();
-			},
-		},
-		{
-			name: "runs immediately when no post-compaction continuation is planned",
-			act: (internals: AutoRefineInternals) => {
-				internals._scheduleAutoRefineAfterCompaction(false);
-				expect(internals._compactAutoRefinePending).toBe(false);
-			},
-		},
-	])("auto-refine compact hook $name", async ({ act }) => {
+	it("waits until the scheduled post-compaction continuation starts before compact auto-refine", async () => {
 		const harness = await createAutoRefineHarness({
 			settings: { autoRefine: { enabled: true, turnInterval: 25, cooldownMs: 0 } },
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as AutoRefineInternals;
 		const scheduleAutoRefine = vi.spyOn(internals, "_scheduleAutoRefine").mockImplementation(() => {});
+		internals._compactAutoRefinePending = true;
+		internals._postCompactionContinuationScheduled = true;
 
-		act(internals, (called) =>
-			called ? expect(scheduleAutoRefine).toHaveBeenCalled() : expect(scheduleAutoRefine).not.toHaveBeenCalled(),
-		);
-
+		internals._scheduleAutoRefineAfterAgentEnd();
+		expect(scheduleAutoRefine).not.toHaveBeenCalled();
+		internals._postCompactionContinuationScheduled = false;
+		internals._scheduleAutoRefineAfterAgentEnd();
+		expect(scheduleAutoRefine).toHaveBeenCalledOnce();
 		expect(scheduleAutoRefine).toHaveBeenCalledWith("compact");
-		expect(scheduleAutoRefine).toHaveBeenCalledTimes(1);
 	});
 
 	it("runs a turn-interval review after a concurrent compact review declines", async () => {
@@ -738,7 +710,6 @@ describe("AgentSession queue characterization", () => {
 		const scheduleAutoRefine = vi.spyOn(internals, "_scheduleAutoRefine").mockImplementation(() => {});
 
 		await internals._maybeAutoRefine("turn_interval");
-		internals._scheduleAutoRefineAfterCompaction(false);
 		internals._scheduleAutoRefineAfterAgentEnd();
 
 		expect(skipReviewer).not.toHaveBeenCalled();

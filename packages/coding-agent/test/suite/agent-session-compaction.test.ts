@@ -1110,19 +1110,45 @@ describe("AgentSession compaction characterization", () => {
 		expect(planRefine).toHaveBeenCalledOnce();
 	});
 
-	it("defers a compact-triggered refinement without losing its pre-compaction snapshot", async () => {
+	it("retries an overlap-deferred compact refinement after compaction becomes idle", async () => {
+		let releaseCompaction!: () => void;
+		const compactionBarrier = new Promise<void>((resolve) => {
+			releaseCompaction = resolve;
+		});
+		let compactionStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			compactionStarted = resolve;
+		});
 		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "deferred compact lesson" }));
 		const harness = await createHarness({
 			persistSession: true,
-			settings: { autoRefine: { enabled: true, compact: true, turnInterval: 25, cooldownMs: 0 } },
+			settings: {
+				compaction: { keepRecentTokens: 1 },
+				autoRefine: { enabled: true, compact: true, turnInterval: 25, cooldownMs: 0 },
+			},
 			autoRefineReviewer: reviewer,
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => {
+						compactionStarted();
+						await compactionBarrier;
+						return {
+							compaction: {
+								summary: "deferred compaction",
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+							},
+						};
+					});
+				},
+			],
 		});
 		harnesses.push(harness);
 		await harness.session.prompt("snapshot before deferred compaction");
+		await harness.session.prompt("another message before deferred compaction");
 		const internals = harness.session as unknown as {
 			_autoRefineInProgress: boolean;
 			_pendingConcurrentCompactionRefine?: unknown;
-			_startAutoRefineAlongsideCompaction: () => { settle: (committed: boolean) => void };
 			_scheduleDeferredAutoRefineIfIdle: () => void;
 			_planRefine: (...args: unknown[]) => Promise<unknown>;
 			_applyRefine: (...args: unknown[]) => Promise<unknown>;
@@ -1141,15 +1167,71 @@ describe("AgentSession compaction characterization", () => {
 		});
 
 		internals._autoRefineInProgress = true;
-		const pending = internals._startAutoRefineAlongsideCompaction();
-		pending.settle(true);
+		const compacting = harness.session.compact();
+		await started;
 		await vi.waitFor(() => expect(internals._pendingConcurrentCompactionRefine).toBeDefined());
-		expect(reviewer).not.toHaveBeenCalled();
 		internals._autoRefineInProgress = false;
 		internals._scheduleDeferredAutoRefineIfIdle();
+		expect(reviewer).not.toHaveBeenCalled();
+		releaseCompaction();
+		await compacting;
 		await vi.waitFor(() => expect(applyRefine).toHaveBeenCalledOnce());
 		expect(reviewer).toHaveBeenCalledWith(expect.objectContaining({ reason: "compact" }), expect.any(AbortSignal));
 		expect(planRefine).toHaveBeenCalledOnce();
+	});
+
+	it("keeps a prior approved review independent from a failing compaction gate", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "fresh compact review" }));
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { autoRefine: { enabled: true, compact: true, turnInterval: 25, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as {
+			_pendingAutoRefineReview?: unknown;
+			_maybeAutoRefine: (
+				reason: "compact",
+				concurrent: {
+					trajectoryMessages: readonly AgentMessage[];
+					applyGate: Promise<boolean>;
+					commitState: { value?: boolean };
+				},
+			) => Promise<void>;
+		};
+		internals._pendingAutoRefineReview = {
+			reason: "turn_interval",
+			review: { shouldRefine: true, rationale: "prior approved lesson" },
+		};
+		const refine = vi.spyOn(harness.session, "refine").mockResolvedValue({
+			id: "refine_prior",
+			summary: "prior lesson",
+			rationale: "independent apply",
+			expectedOutcome: "not lost with compaction",
+			appliedEdits: [],
+			harnessStatePath: "/tmp/harness.json",
+		});
+		let settleGate!: (committed: boolean) => void;
+		const applyGate = new Promise<boolean>((resolve) => {
+			settleGate = resolve;
+		});
+		const commitState: { value?: boolean } = {};
+
+		const running = internals._maybeAutoRefine("compact", {
+			trajectoryMessages: [...harness.session.messages],
+			applyGate,
+			commitState,
+		});
+		await vi.waitFor(() => expect(refine).toHaveBeenCalledOnce());
+		expect(refine).toHaveBeenCalledWith(
+			expect.objectContaining({ instructions: expect.stringContaining("prior approved lesson") }),
+		);
+		commitState.value = false;
+		settleGate(false);
+		await running;
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		expect(refine).toHaveBeenCalledOnce();
+		expect(reviewer).not.toHaveBeenCalled();
 	});
 
 	it("retries a cooldown-deferred compact refinement with its original snapshot", async () => {
