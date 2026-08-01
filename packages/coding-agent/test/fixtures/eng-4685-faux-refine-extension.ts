@@ -4,15 +4,21 @@ import type { ExtensionAPI } from "../../src/index.js";
 /**
  * ENG-4685 faux provider extension for process-backed serialized-refine proof.
  *
- * Queues exactly three responses so the real daemon worker, model, and
- * auto-refine machinery all exercise the real code paths:
+ * Queues responses so the real daemon worker, model, and auto-refine
+ * machinery all exercise the real code paths:
  *
  *  1. Parent assistant response for the user prompt.
  *  2. Valid auto-refine review JSON (shouldRefine: true).
  *  3. Valid empty refinement-proposal JSON (edits: []).
+ *  4. Reply for the goal budget-limit continuation turn (--goal-token-budget 1
+ *     limits the goal immediately, which injects one more turn).
+ *  5. Auto-refine review declining a second refinement, so the
+ *     turnInterval: 1 cadence does not chain another proposal.
  *
  * The auto-refine review and plan both call completeSimple on the same
- * faux provider, so they consume responses 2 and 3 from the same queue.
+ * faux provider, so they consume responses from this same queue. Running the
+ * queue dry ends the run on an errored assistant turn, which JSON mode now
+ * reports as a non-zero exit.
  */
 export default function registerEng4685FauxRefineProvider(pi: ExtensionAPI): void {
 	const faux = registerFauxProvider({
@@ -34,6 +40,10 @@ export default function registerEng4685FauxRefineProvider(pi: ExtensionAPI): voi
 				expectedOutcome: "No changes",
 			}),
 		),
+		// 4 — reply for the goal budget-limit continuation turn
+		fauxAssistantMessage("Goal budget reached; stopping."),
+		// 5 — auto-refine review declining a second refinement
+		fauxAssistantMessage(JSON.stringify({ shouldRefine: false, rationale: "process-proof second review" })),
 	]);
 
 	const apiProvider = getApiProvider(faux.api);
