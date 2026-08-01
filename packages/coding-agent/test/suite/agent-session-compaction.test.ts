@@ -1234,6 +1234,57 @@ describe("AgentSession compaction characterization", () => {
 		expect(reviewer).not.toHaveBeenCalled();
 	});
 
+	it("keeps a prior approved review from applying during pre-prompt auto-compaction", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: false, rationale: "no separate compact lesson" }));
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { autoRefine: { enabled: true, compact: true, turnInterval: 25, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as {
+			_pendingAutoRefineReview?: unknown;
+			_runAutoCompaction: (reason: "threshold", willRetry: boolean) => Promise<boolean>;
+			_performCompaction: (...args: unknown[]) => Promise<unknown>;
+			_planRefine: (...args: unknown[]) => Promise<unknown>;
+			_applyRefine: (...args: unknown[]) => Promise<unknown>;
+		};
+		internals._pendingAutoRefineReview = {
+			reason: "turn_interval",
+			review: { shouldRefine: true, rationale: "prior approved lesson" },
+		};
+		let releaseCompaction!: () => void;
+		const compactionBarrier = new Promise<void>((resolve) => {
+			releaseCompaction = resolve;
+		});
+		let compactionStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			compactionStarted = resolve;
+		});
+		vi.spyOn(internals, "_performCompaction").mockImplementation(async () => {
+			compactionStarted();
+			await compactionBarrier;
+			return { summary: "auto summary", firstKeptEntryId: "entry-1", tokensBefore: 100 };
+		});
+		vi.spyOn(internals, "_planRefine").mockResolvedValue({});
+		const applyRefine = vi.spyOn(internals, "_applyRefine").mockResolvedValue({
+			id: "refine_prior_auto_compact",
+			summary: "prior lesson",
+			rationale: "apply after compaction",
+			expectedOutcome: "no session rewrite race",
+			appliedEdits: [],
+			harnessStatePath: "/tmp/harness.json",
+		});
+
+		const compacting = internals._runAutoCompaction("threshold", false);
+		await started;
+		await Promise.resolve();
+		expect(applyRefine).not.toHaveBeenCalled();
+		releaseCompaction();
+		await compacting;
+		await vi.waitFor(() => expect(applyRefine).toHaveBeenCalledOnce());
+	});
+
 	it("retries a cooldown-deferred compact refinement with its original snapshot", async () => {
 		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "cooldown elapsed" }));
 		const harness = await createHarness({

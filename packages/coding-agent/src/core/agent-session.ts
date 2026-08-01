@@ -7717,6 +7717,16 @@ export class AgentSession {
 			}
 		};
 
+		// Publish auto-compaction as the same quiescence operation used by manual
+		// compaction. Pre-prompt auto-compaction runs while the agent is already
+		// idle, so agent.waitForIdle() alone cannot keep refinement application
+		// from racing the session-message rewrite.
+		while (this._compactionOperation) await this._compactionOperation;
+		let resolveCompactionOperation: () => void = () => {};
+		const compactionOperation = new Promise<void>((resolve) => {
+			resolveCompactionOperation = resolve;
+		});
+		this._compactionOperation = compactionOperation;
 		this._emit({ type: "compaction_start", reason, customInstructions });
 		this._autoCompactionAbortController = new AbortController();
 		let compactionRefine: { settle: (committed: boolean) => void } | undefined;
@@ -7811,6 +7821,10 @@ export class AgentSession {
 		} finally {
 			compactionRefine?.settle(false);
 			this._autoCompactionAbortController = undefined;
+			if (this._compactionOperation === compactionOperation) {
+				this._compactionOperation = undefined;
+			}
+			resolveCompactionOperation();
 			this._scheduleSessionInputPump();
 		}
 	}
