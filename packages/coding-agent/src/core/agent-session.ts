@@ -5338,6 +5338,11 @@ export class AgentSession {
 				dispatchObserver.stop();
 				endHandoffSection();
 			};
+			// Handoff commits the decision: flush before the turn so continuation and
+			// gate frames precede the turn they caused, not the one after it.
+			for (const prompt of prompts) {
+				this._flushQueuedAutonomousContinuationEvents(prompt.message);
+			}
 			const promptPromise = this.agent.prompt(messages);
 			releaseAdmission();
 			void Promise.race([promptPromise.catch(() => undefined), dispatchObserver.observed]).then(
@@ -6823,6 +6828,9 @@ export class AgentSession {
 
 		this._postCompactionContinuationScheduled = false;
 		try {
+			for (const message of continuationMessages) {
+				this._flushQueuedAutonomousContinuationEvents(message);
+			}
 			await this.agent.continue();
 			this._forgetConsumedPostCompactionContinuations(continuationMessages);
 		} catch (error) {
@@ -6845,8 +6853,6 @@ export class AgentSession {
 		for (const message of continuationMessages) {
 			if (!stillQueued.has(message)) {
 				this._queuedAutonomousContinuationSnapshots.delete(message);
-				// No snapshot left to restore from: the decision now stands.
-				this._flushQueuedAutonomousContinuationEvents(message);
 			}
 		}
 		this._postCompactionContinuationMessages = this._postCompactionContinuationMessages.filter(
