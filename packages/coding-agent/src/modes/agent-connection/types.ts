@@ -6,7 +6,7 @@ import type {
 	AgentSessionMessageSafetyStatus,
 } from "../../core/agent-messages.js";
 import type { AuthSourceToken } from "../../core/auth-storage.js";
-import type { AgentAutonomousStatus } from "../../core/autonomous.js";
+import type { AgentAutonomousStatus, AutonomousEvent } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { ContextTreeNode } from "../../core/context-tree.js";
@@ -606,6 +606,7 @@ export type AgentConnectionSessionEvent =
 			/** Echo of the caller-supplied run id, so clients correlate runs by identity. */
 			runId?: string;
 	  }
+	| AutonomousEvent
 	| { type: "refine_complete"; result: RefinementResult }
 	| { type: "refine_failed"; error: string };
 

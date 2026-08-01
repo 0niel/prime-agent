@@ -101,6 +101,17 @@ async function runPrintModeWithConnectionInternal(
 				writeRawStdout(`${JSON.stringify(event.event)}\n`);
 			}
 			if (event.type === "extension_error") {
+				// Also framed on stdout in json mode so consumers do not have to parse stderr prose.
+				if (mode === "json") {
+					writeRawStdout(
+						`${JSON.stringify({
+							type: "extension_error",
+							extensionPath: event.extensionPath,
+							event: event.event,
+							error: event.error,
+						})}\n`,
+					);
+				}
 				console.error(`Extension error (${event.extensionPath}): ${event.error}`);
 			}
 		});
@@ -114,27 +125,30 @@ async function runPrintModeWithConnectionInternal(
 		}
 
 		const autonomousStatus = await connection.waitForHeadlessCompletion();
-		if (mode === "text") {
-			const { primary, compactionOutcomes } = selectHeadlessTerminalResult(await connection.getMessages());
-			if (primary?.role === "assistant") {
-				if (primary.stopReason === "error" || primary.stopReason === "aborted") {
-					console.error(primary.errorMessage || `Request ${primary.stopReason}`);
-					exitCode = 1;
-				} else {
-					for (const content of primary.content) {
-						if (content.type === "text") {
-							writeRawStdout(`${content.text}\n`);
-						}
+		// Failure detection and stderr diagnostics run in both modes so a failed run
+		// is never reported as success; only the stdout result is text-mode-only,
+		// since bare text would corrupt the JSON stream.
+		const { primary, compactionOutcomes } = selectHeadlessTerminalResult(await connection.getMessages());
+		if (primary?.role === "assistant") {
+			if (primary.stopReason === "error" || primary.stopReason === "aborted") {
+				console.error(primary.errorMessage || `Request ${primary.stopReason}`);
+				exitCode = 1;
+			} else if (mode === "text") {
+				for (const content of primary.content) {
+					if (content.type === "text") {
+						writeRawStdout(`${content.text}\n`);
 					}
 				}
-			} else if (primary) {
+			}
+		} else if (primary) {
+			if (mode === "text") {
 				writeRawStdout(`${primary.content}\n`);
-				if (!primary.details.success || primary.details.severity === "error") exitCode = 1;
 			}
-			for (const outcome of compactionOutcomes) {
-				console.error(outcome.content);
-				if (outcome.details.outcome === "failed") exitCode = 1;
-			}
+			if (!primary.details.success || primary.details.severity === "error") exitCode = 1;
+		}
+		for (const outcome of compactionOutcomes) {
+			console.error(outcome.content);
+			if (outcome.details.outcome === "failed") exitCode = 1;
 		}
 
 		const autonomousLimit = autonomousLimitReason(autonomousStatus);

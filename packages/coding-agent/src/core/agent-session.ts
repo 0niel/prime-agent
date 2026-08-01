@@ -89,6 +89,7 @@ import type { AuthSourceToken } from "./auth-storage.js";
 import {
 	type AgentAutonomousConfig,
 	type AgentAutonomousStatus,
+	type AutonomousEvent,
 	type AutonomousRuntimeState,
 	addAutonomousContinuation,
 	addAutonomousUsage,
@@ -337,6 +338,7 @@ export type AgentSessionEvent =
 			/** Echo of the caller-supplied run id, so clients correlate runs by identity. */
 			runId?: string;
 	  }
+	| AutonomousEvent
 	| { type: "refine_complete"; result: RefinementResult }
 	| { type: "refine_failed"; error: string };
 
@@ -2485,6 +2487,7 @@ export class AgentSession {
 		const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, message, {
 			cwd: this._cwd,
 			signal: this.agent.signal,
+			onEvent: (event) => this._emit(event),
 		});
 		if (!autonomousMessage) {
 			return undefined;
@@ -2959,6 +2962,7 @@ export class AgentSession {
 		const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, context.message, {
 			cwd: this._cwd,
 			signal,
+			onEvent: (event) => this._emit(event),
 		});
 		if (autonomousMessage && this._sessionInputArrivalEpoch !== arrivalEpoch) {
 			this._restoreAutonomousRuntimeSnapshot(autonomousSnapshot);
@@ -3877,7 +3881,10 @@ export class AgentSession {
 	}
 
 	async refreshAutonomousGates(): Promise<void> {
-		await refreshAutonomousQualityGates(this._autonomousState, { cwd: this._cwd });
+		await refreshAutonomousQualityGates(this._autonomousState, {
+			cwd: this._cwd,
+			onEvent: (event) => this._emit(event),
+		});
 	}
 
 	private async _runWithAutonomousContinuationSuppressed<T>(fn: () => Promise<T>): Promise<T> {

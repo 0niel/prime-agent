@@ -7,7 +7,7 @@ import {
 	createCustomMessage,
 	createSessionSlashCommandResultMessage,
 } from "../src/core/messages.js";
-import type { SessionShutdownEvent } from "../src/index.js";
+import type { ExtensionError, SessionShutdownEvent } from "../src/index.js";
 import { selectHeadlessTerminalResult } from "../src/modes/headless-completion.js";
 import { runPrintMode } from "../src/modes/print-mode.js";
 
@@ -263,6 +263,113 @@ describe("runPrintMode", () => {
 		expect(errorSpy).toHaveBeenCalledWith("provider failure");
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+	});
+
+	it("returns non-zero on assistant error in json mode without printing the result", async () => {
+		const runtimeHost = createRuntimeHost(
+			createAssistantMessage({ text: "partial", stopReason: "error", errorMessage: "provider failure" }),
+		);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		output.write.mockClear();
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "json",
+		});
+
+		expect(exitCode).toBe(1);
+		expect(errorSpy).toHaveBeenCalledWith("provider failure");
+		// Bare result text on stdout would corrupt the JSON stream.
+		expect(output.write).not.toHaveBeenCalledWith("partial\n");
+	});
+
+	it("keeps the assistant result off stdout on success in json mode", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		output.write.mockClear();
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "json",
+		});
+
+		expect(exitCode).toBe(0);
+		expect(output.write).not.toHaveBeenCalledWith("done\n");
+	});
+
+	it("returns non-zero for failed session command results in json mode", async () => {
+		const result = createSessionSlashCommandResultMessage("Command failed: bad arguments", {
+			command: { name: "refine", args: "rollback", text: "/refine rollback" },
+			success: false,
+			severity: "error",
+			error: "bad arguments",
+		});
+		const runtimeHost = createRuntimeHost(result);
+		output.write.mockClear();
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "json",
+		});
+
+		expect(exitCode).toBe(1);
+		expect(output.write).not.toHaveBeenCalledWith("Command failed: bad arguments\n");
+	});
+
+	it("frames extension errors on stdout in json mode", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		const { session } = runtimeHost;
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		session.bindExtensions.mockImplementation(async (options: { onError?: (error: ExtensionError) => void }) => {
+			options.onError?.({ extensionPath: "/ext/foo.ts", event: "session_start", error: "boom" });
+		});
+		output.write.mockClear();
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "json",
+		});
+
+		expect(exitCode).toBe(0);
+		expect(output.write).toHaveBeenCalledWith(
+			`${JSON.stringify({
+				type: "extension_error",
+				extensionPath: "/ext/foo.ts",
+				event: "session_start",
+				error: "boom",
+			})}\n`,
+		);
+		expect(errorSpy).toHaveBeenCalledWith("Extension error (/ext/foo.ts): boom");
+	});
+
+	it("keeps extension errors off stdout in text mode", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		const { session } = runtimeHost;
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		session.bindExtensions.mockImplementation(async (options: { onError?: (error: ExtensionError) => void }) => {
+			options.onError?.({ extensionPath: "/ext/foo.ts", event: "session_start", error: "boom" });
+		});
+		output.write.mockClear();
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+		});
+
+		expect(exitCode).toBe(0);
+		expect(output.write).toHaveBeenCalledWith("done\n");
+		expect(output.write).not.toHaveBeenCalledWith(expect.stringContaining('"type":"extension_error"'));
+		expect(errorSpy).toHaveBeenCalledWith("Extension error (/ext/foo.ts): boom");
+	});
+
+	it("reports a failed compaction outcome in json mode", async () => {
+		const outcome = createCompactionOutcomeMessage("Context overflow recovery failed", {
+			reason: "overflow",
+			outcome: "failed",
+		});
+		const runtimeHost = createRuntimeHost(outcome);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "json",
+		});
+
+		expect(exitCode).toBe(1);
+		expect(errorSpy).toHaveBeenCalledWith("Context overflow recovery failed");
 	});
 
 	it("prints assistant output and reports a trailing compaction outcome", async () => {
