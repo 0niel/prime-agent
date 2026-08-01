@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Changed built-in compaction to run a dedicated host-integrated maintenance role against the parent IPython kernel after the summary is generated and durably committed, preserving live state needed for continued work while reclaiming stale REPL objects without mutating the kernel on failed or extension-owned compactions.
+- Changed built-in compaction to start a dedicated host-integrated maintenance role in parallel with summary generation using the full active pre-compaction trajectory, while commit-gating its parent-IPython tool until the summary is durably appended so failed or extension-owned compactions cannot mutate the kernel.
 - Changed compaction to keep old message payloads on disk instead of retaining them indefinitely in session memory.
 - Changed large daemon session loads to stream JSONL history and avoid retaining a second full-file copy in memory.
 - Changed subagent guidance to retain reusable children and delete completed direct children once they are no longer needed.
@@ -167,6 +167,7 @@
 - Changed `/model` to sort featured flagship models above a provider's long tail (with a numeric-aware alphabetical tiebreak), so the full Prime Inference catalog doesn't flood the picker.
 - Fixed selector prompts and choices filling their background through the terminal's right edge.
 - Changed automatic harness refinement to be enabled by default while keeping `autoRefine.enabled: false` as the opt-out.
+- Changed compact-triggered automatic refinement to review and plan from the full active pre-compaction trajectory in parallel with compaction, apply only after a successful commit, and append a durable user-visible completion update listing applied continual-harness changes.
 - Fixed non-numeric `autoRefine.turnInterval` and `autoRefine.cooldownMs` settings falling back to defaults instead of silently enabling a noisy auto-refine loop.
 - Fixed all session-resume entry points to share a searchable full-screen picker, stream results while loading, and support renaming ([ENG-4513](https://linear.app/primeintellect/issue/ENG-4513/resume-in-agents-view-is-broken)).
 

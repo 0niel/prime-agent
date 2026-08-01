@@ -101,13 +101,11 @@ import {
 import { type BashResult, executeBashWithOperations } from "./bash-executor.js";
 import {
 	COMPACT_SKILL_NAME,
-	type CompactionPreparation,
 	type CompactionResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
-	estimateTokens,
 	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
@@ -357,6 +355,7 @@ type UserBashEndDetails = {
 
 /** Thrown when compaction is skipped for a benign reason (surfaced as a warning, not an error) */
 export class CompactionSkippedError extends Error {}
+class CompactionRefinementDiscardedError extends Error {}
 
 // ============================================================================
 // Types
@@ -1042,7 +1041,7 @@ export class AgentSession {
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
-	private readonly _unpersistedCompactionOutcomes: CustomMessage[] = [];
+	private readonly _unpersistedStatusMessages: CustomMessage[] = [];
 
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
@@ -2228,7 +2227,8 @@ export class AgentSession {
 		});
 		this._refineInFlight = applySettled;
 		try {
-			await this._applyRefine(bgResult.plan, bgResult.options, bgResult.abort);
+			const result = await this._applyRefine(bgResult.plan, bgResult.options, bgResult.abort);
+			this._appendRefinementCompletionMessage(result);
 		} finally {
 			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {
@@ -2419,7 +2419,8 @@ export class AgentSession {
 		});
 		this._refineInFlight = applySettled;
 		try {
-			await this._applyRefine(plan, options, refineAbort);
+			const result = await this._applyRefine(plan, options, refineAbort);
+			this._appendRefinementCompletionMessage(result);
 		} finally {
 			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {
@@ -3821,7 +3822,7 @@ export class AgentSession {
 		for (const message of context.messages) {
 			this._applyLateIpythonSentAgentMessages(message);
 		}
-		this._mergeUnpersistedCompactionOutcomes(context.messages);
+		this._mergeUnpersistedStatusMessages(context.messages);
 		return context;
 	}
 
@@ -3829,8 +3830,8 @@ export class AgentSession {
 	 * Merge disclosures whose session-file append failed into a rebuilt message
 	 * list at their timestamp position, where they appeared live.
 	 */
-	private _mergeUnpersistedCompactionOutcomes(messages: AgentMessage[]): void {
-		for (const outcome of this._unpersistedCompactionOutcomes) {
+	private _mergeUnpersistedStatusMessages(messages: AgentMessage[]): void {
+		for (const outcome of this._unpersistedStatusMessages) {
 			let insertAt = messages.length;
 			while (insertAt > 0 && messages[insertAt - 1]!.timestamp > outcome.timestamp) {
 				insertAt -= 1;
@@ -5283,8 +5284,7 @@ export class AgentSession {
 				case "refine": {
 					const options = parseRefineCommandOptions(input.command.args);
 					const result = await this.refine(options, { skipAbort: true });
-					const applied = result.appliedEdits.filter((edit) => edit.applied).length;
-					resultText = `Refined continual harness state: ${applied} edit${applied === 1 ? "" : "s"} applied.`;
+					resultText = this._formatRefinementCompletion(result);
 					break;
 				}
 				case "goal":
@@ -6289,45 +6289,15 @@ export class AgentSession {
 	 * valid transcript compaction into a failure; the role awaits its own IPython
 	 * execution before post-compaction finalization continues.
 	 */
-	private _boundedKernelMaintenanceContext(
-		preparation: CompactionPreparation,
-		model: Model<any>,
-	): { messages: AgentMessage[]; complete: boolean } {
-		const contextWindow = model.contextWindow || 16_000;
-		const tokenBudget = Math.max(1024, Math.min(32_000, Math.floor(contextWindow / 2)));
-		const selected: AgentMessage[] = [];
-		let remainingTokens = tokenBudget;
-		let omitted = false;
-		for (let i = preparation.maintenanceContextMessages.length - 1; i >= 0; i--) {
-			const message = preparation.maintenanceContextMessages[i];
-			const messageTokens = estimateTokens(message);
-			if (messageTokens > remainingTokens) {
-				omitted = true;
-				continue;
-			}
-			selected.unshift(message);
-			remainingTokens -= messageTokens;
-		}
-		if (omitted) {
-			selected.unshift({
-				role: "user",
-				content:
-					"Some ongoing context was omitted from this bounded maintenance view. Preserve every live kernel name unless the visible context explicitly proves it stale.",
-				timestamp: Date.now(),
-			});
-		}
-		const preparedMessageCount =
-			preparation.messagesToSummarize.length +
-			preparation.maintenanceContextMessages.length -
-			(preparation.maintenanceContextSyntheticMessageCount ?? 0);
-		return {
-			messages: selected,
-			complete: !omitted && this.agent.state.messages.length <= preparedMessageCount,
-		};
-	}
-
-	private async _runKernelMaintenanceAfterCompaction(
-		preparation: CompactionPreparation,
+	/**
+	 * Start the isolated parent-kernel maintenance role from the full active
+	 * pre-compaction trajectory. Model planning and namespace inventory overlap
+	 * summary generation, while the wrapped IPython tool remains blocked on the
+	 * commit gate so failed or cancelled compactions cannot mutate the kernel.
+	 */
+	private async _runKernelMaintenanceAlongsideCompaction(
+		contextMessages: readonly AgentMessage[],
+		executionGate: Promise<boolean>,
 		signal: AbortSignal,
 	): Promise<boolean> {
 		if (signal.aborted) return false;
@@ -6350,15 +6320,15 @@ export class AgentSession {
 		}
 		if (signal.aborted) return false;
 
-		const maintenanceContext = this._boundedKernelMaintenanceContext(preparation, model);
 		const result = await kernelMaintenance
 			.runKernelMaintenanceRole({
 				parent: this.agent,
 				model,
 				ipythonTool,
 				liveNames: names ?? [],
-				contextMessages: maintenanceContext.messages,
-				allowDeletes: names !== null && maintenanceContext.complete,
+				contextMessages: [...contextMessages],
+				allowDeletes: names !== null,
+				executionGate,
 				signal,
 			})
 			.catch(() => ({ status: "failed" }) as const);
@@ -6444,6 +6414,7 @@ export class AgentSession {
 		});
 		this._compactionOperation = compactionOperation;
 		this._emit({ type: "compaction_start", reason: "manual", customInstructions });
+		const compactionRefine = this._startAutoRefineAlongsideCompaction();
 
 		try {
 			if (!this.model) {
@@ -6467,6 +6438,7 @@ export class AgentSession {
 				willRetry: false,
 				customInstructions,
 			});
+			compactionRefine.settle(true);
 			didCompact = true;
 			// A manual compaction satisfies any pending model request; on failure the
 			// request stays scheduled for the next turn boundary.
@@ -6488,6 +6460,7 @@ export class AgentSession {
 			});
 			throw error;
 		} finally {
+			if (!didCompact) compactionRefine.settle(false);
 			this._compactionAbortController = undefined;
 			this._reconnectToAgent();
 			if (this._compactionOperation === compactionOperation) {
@@ -6500,11 +6473,6 @@ export class AgentSession {
 				if (hadPostCompactionContinue) {
 					this._schedulePostCompactionContinue();
 				}
-				// Queued agent or session-owned inputs resume the loop; defer refine
-				// behind them instead of interleaving it before their turns.
-				this._scheduleAutoRefineAfterCompaction(
-					hadPostCompactionContinue || this.agent.hasQueuedMessages() || this.pendingMessageCount > 0,
-				);
 			}
 		}
 	}
@@ -6524,6 +6492,7 @@ export class AgentSession {
 		const { model, apiKey, headers, customInstructions, signal } = options;
 		const pathEntries = this.sessionManager.getResidentBranch();
 		const settings = this.settingsManager.getCompactionSettings();
+		const preCompactionMessages = [...this.agent.state.messages];
 
 		const preparation = prepareCompaction(pathEntries, settings, customInstructions);
 		if (!preparation) {
@@ -6556,47 +6525,80 @@ export class AgentSession {
 			}
 		}
 
-		const { summary, firstKeptEntryId, tokensBefore, details } =
-			extensionCompaction ??
-			(await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel));
+		let resolveMaintenanceGate: (allowed: boolean) => void = () => {};
+		const maintenanceGate = new Promise<boolean>((resolve) => {
+			resolveMaintenanceGate = resolve;
+		});
+		let maintenanceGateSettled = false;
+		const settleMaintenanceGate = (allowed: boolean) => {
+			if (maintenanceGateSettled) return;
+			maintenanceGateSettled = true;
+			resolveMaintenanceGate(allowed);
+		};
+		const maintenanceAbort = new AbortController();
+		const abortMaintenance = () => maintenanceAbort.abort();
+		signal.addEventListener("abort", abortMaintenance, { once: true });
+		const maintenanceOperation = fromExtension
+			? undefined
+			: this._runKernelMaintenanceAlongsideCompaction(
+					preCompactionMessages,
+					maintenanceGate,
+					maintenanceAbort.signal,
+				).catch(() => false);
+		let committed = false;
 
-		if (signal.aborted) {
-			throw new Error("Compaction cancelled");
-		}
+		try {
+			const { summary, firstKeptEntryId, tokensBefore, details } =
+				extensionCompaction ??
+				(await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel));
 
-		this.sessionManager.appendCompaction(
-			summary,
-			firstKeptEntryId,
-			tokensBefore,
-			details,
-			fromExtension,
-			customInstructions,
-		);
-		// Destructive maintenance is intentionally post-commit: a summary/provider
-		// failure must never mutate the parent kernel without a saved compaction.
-		if (!fromExtension) {
-			await this._runKernelMaintenanceAfterCompaction(preparation, signal);
-		}
-		const newEntries = this.sessionManager.getResidentEntries();
-		this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
-		this._mergeUnpersistedCompactionOutcomes(this.agent.state.messages);
-		this._restoreLateIpythonSentAgentMessages();
+			if (signal.aborted) {
+				throw new Error("Compaction cancelled");
+			}
 
-		// Get the saved compaction entry for the extension event
-		const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
-			| CompactionEntry
-			| undefined;
-		if (savedCompactionEntry) {
-			await this._extensionRunner.emit({
-				type: "session_compact",
-				compactionEntry: savedCompactionEntry,
+			this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
 				fromExtension,
-			});
-		}
-		this.sessionManager.evictCompactedHistoryPayloads();
-		await this._reapDeletedRlmSubagentRuntimesAfterCompaction();
+				customInstructions,
+			);
+			committed = true;
+			// The maintenance role has already reviewed the full uncompacted
+			// trajectory in parallel. Release its parent-kernel tool only now that
+			// the summary and compaction entry are durable.
+			settleMaintenanceGate(true);
+			await maintenanceOperation;
 
-		return { summary, firstKeptEntryId, tokensBefore, details };
+			const newEntries = this.sessionManager.getResidentEntries();
+			this.agent.state.messages = this.sessionManager.buildSessionContext().messages;
+			this._mergeUnpersistedStatusMessages(this.agent.state.messages);
+			this._restoreLateIpythonSentAgentMessages();
+
+			// Get the saved compaction entry for the extension event
+			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
+				| CompactionEntry
+				| undefined;
+			if (savedCompactionEntry) {
+				await this._extensionRunner.emit({
+					type: "session_compact",
+					compactionEntry: savedCompactionEntry,
+					fromExtension,
+				});
+			}
+			this.sessionManager.evictCompactedHistoryPayloads();
+			await this._reapDeletedRlmSubagentRuntimesAfterCompaction();
+
+			return { summary, firstKeptEntryId, tokensBefore, details };
+		} finally {
+			if (!committed) {
+				settleMaintenanceGate(false);
+				maintenanceAbort.abort();
+			}
+			signal.removeEventListener("abort", abortMaintenance);
+			await maintenanceOperation;
+		}
 	}
 
 	private async _reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void> {
@@ -6682,7 +6684,9 @@ export class AgentSession {
 		const pending = this._pendingRequestedRefine;
 		if (!pending) return false;
 		this._pendingRequestedRefine = undefined;
-		void this.refine(pending).catch((error) => this._emitRefineFailed(error));
+		void this.refine(pending)
+			.then((result) => this._appendRefinementCompletionMessage(result))
+			.catch((error) => this._emitRefineFailed(error));
 		return true;
 	}
 
@@ -6703,24 +6707,6 @@ export class AgentSession {
 		}
 
 		this._scheduleAutoRefine("turn_interval");
-	}
-
-	private _scheduleAutoRefineAfterCompaction(willContinueAfterCompaction: boolean): void {
-		if (!this._autoRefineAllowedForSession()) {
-			return;
-		}
-		if (this._serializedRefine) {
-			// Serialized sessions must service compaction-triggered refinement at
-			// shouldStopAfterTurn (or disposal), never through the interactive path.
-			this._compactAutoRefinePending = true;
-			return;
-		}
-		if (willContinueAfterCompaction) {
-			this._compactAutoRefinePending = true;
-			return;
-		}
-
-		this._scheduleAutoRefine("compact");
 	}
 
 	private _schedulePostCompactionContinue(): void {
@@ -6840,7 +6826,32 @@ export class AgentSession {
 		this._scheduledAutoRefineTimers.add(timer);
 	}
 
-	private async _maybeAutoRefine(reason: AutoRefineReason): Promise<void> {
+	private _startAutoRefineAlongsideCompaction(): { settle: (committed: boolean) => void } {
+		let resolveApplyGate: (committed: boolean) => void = () => {};
+		const applyGate = new Promise<boolean>((resolve) => {
+			resolveApplyGate = resolve;
+		});
+		let settled = false;
+		const trajectoryMessages = [...this.agent.state.messages];
+		const operation = this._maybeAutoRefine("compact", { trajectoryMessages, applyGate });
+		this._autoRefineOperations.add(operation);
+		void operation.finally(() => this._autoRefineOperations.delete(operation)).catch(() => undefined);
+		return {
+			settle: (committed) => {
+				if (settled) return;
+				settled = true;
+				resolveApplyGate(committed);
+			},
+		};
+	}
+
+	private async _maybeAutoRefine(
+		reason: AutoRefineReason,
+		concurrentCompaction?: {
+			trajectoryMessages: readonly AgentMessage[];
+			applyGate: Promise<boolean>;
+		},
+	): Promise<void> {
 		if (this._disposed || this._disposing) {
 			this._discardPendingAutoRefine();
 			return;
@@ -6855,11 +6866,13 @@ export class AgentSession {
 			this._discardPendingAutoRefine();
 			return;
 		}
-		if (this._autoRefineInProgress || this._shouldSkipAutoRefineForActiveAgent()) {
-			if (reason === "compact") {
-				this._compactAutoRefinePending = true;
-			} else {
-				this._turnIntervalAutoRefinePending = true;
+		if (this._autoRefineInProgress || (!concurrentCompaction && this._shouldSkipAutoRefineForActiveAgent())) {
+			if (!concurrentCompaction) {
+				if (reason === "compact") {
+					this._compactAutoRefinePending = true;
+				} else {
+					this._turnIntervalAutoRefinePending = true;
+				}
 			}
 			return;
 		}
@@ -6870,36 +6883,27 @@ export class AgentSession {
 
 		const pendingReview = this._pendingAutoRefineReview;
 		if (pendingReview) {
-			// A failed refine stamps the cooldown; keep the pending review for later.
-			if (underCooldown) {
-				return;
-			}
-			await this._runApprovedRefine(pendingReview.reason, pendingReview.review);
+			if (underCooldown) return;
+			await this._runApprovedRefine(pendingReview.reason, pendingReview.review, concurrentCompaction);
 			return;
 		}
 
 		if (reason === "compact" && !settings.compact) {
 			this._compactAutoRefinePending = false;
+			if (concurrentCompaction) return;
 			reason = "turn_interval";
 		}
-		if (reason === "turn_interval" && this._assistantTurnsSinceAutoRefine < settings.turnInterval) {
-			return;
-		}
+		if (reason === "turn_interval" && this._assistantTurnsSinceAutoRefine < settings.turnInterval) return;
 		if (underCooldown) {
-			if (reason === "compact") {
-				this._compactAutoRefinePending = true;
-			} else {
-				this._turnIntervalAutoRefinePending = true;
+			if (!concurrentCompaction) {
+				if (reason === "compact") this._compactAutoRefinePending = true;
+				else this._turnIntervalAutoRefinePending = true;
 			}
 			return;
 		}
-		if (reason === "turn_interval") {
-			this._turnIntervalAutoRefinePending = false;
-		}
+		if (reason === "turn_interval") this._turnIntervalAutoRefinePending = false;
 		if (!this.model) {
-			if (reason === "compact") {
-				this._compactAutoRefinePending = true;
-			}
+			if (reason === "compact" && !concurrentCompaction) this._compactAutoRefinePending = true;
 			return;
 		}
 		this._autoRefineInProgress = true;
@@ -6909,73 +6913,116 @@ export class AgentSession {
 		this._autoRefineReviewAbort = reviewAbort;
 		let approvedReview: AutoRefineReview | undefined;
 		try {
-			const review = await this._reviewAutoRefine({ reason, turnsSinceLastReview }, reviewAbort.signal);
-			if (this._disposed || this._disposing || branchVersion !== this._autoRefineBranchVersion) {
-				return;
-			}
+			const review = await this._reviewAutoRefine(
+				{ reason, turnsSinceLastReview },
+				reviewAbort.signal,
+				concurrentCompaction?.trajectoryMessages,
+			);
+			if (this._disposed || this._disposing || branchVersion !== this._autoRefineBranchVersion) return;
 			if (!review.shouldRefine) {
+				if (concurrentCompaction && !(await concurrentCompaction.applyGate)) return;
 				const preserveTurnIntervalReview =
-					reason === "compact" && this._assistantTurnsSinceAutoRefine >= settings.turnInterval;
-				if (preserveTurnIntervalReview) {
-					this._turnIntervalAutoRefinePending = true;
-				} else {
+					!concurrentCompaction &&
+					reason === "compact" &&
+					this._assistantTurnsSinceAutoRefine >= settings.turnInterval;
+				if (preserveTurnIntervalReview) this._turnIntervalAutoRefinePending = true;
+				else {
 					this._lastAutoRefineReviewAt = nowMs;
 					this._assistantTurnsSinceAutoRefine = 0;
 				}
-				if (reason === "compact") {
-					this._compactAutoRefinePending = false;
-				}
+				if (reason === "compact") this._compactAutoRefinePending = false;
 				return;
 			}
-			if (this._shouldSkipAutoRefineForActiveAgent()) {
+			if (!concurrentCompaction && this._shouldSkipAutoRefineForActiveAgent()) {
 				this._pendingAutoRefineReview = { reason, review };
 				return;
 			}
 			approvedReview = review;
 		} catch {
-			// Failed review: stamp the cooldown so a persistent failure (bad auth,
-			// unparseable output) doesn't retry a full review on every agent end.
-			if (branchVersion === this._autoRefineBranchVersion) {
+			const shouldRecordFailure = !concurrentCompaction || (await concurrentCompaction.applyGate);
+			if (shouldRecordFailure && branchVersion === this._autoRefineBranchVersion) {
 				this._lastAutoRefineReviewAt = Date.now();
 			}
 		} finally {
-			if (this._autoRefineReviewAbort === reviewAbort) {
-				this._autoRefineReviewAbort = undefined;
-			}
+			if (this._autoRefineReviewAbort === reviewAbort) this._autoRefineReviewAbort = undefined;
 			this._autoRefineInProgress = false;
-			// When a refine follows, _runApprovedRefine schedules the deferred pass.
-			if (!approvedReview) {
-				this._scheduleDeferredAutoRefineIfIdle();
-			}
+			if (!approvedReview) this._scheduleDeferredAutoRefineIfIdle();
 		}
-		if (approvedReview) {
-			await this._runApprovedRefine(reason, approvedReview);
+		if (approvedReview) await this._runApprovedRefine(reason, approvedReview, concurrentCompaction);
+	}
+
+	private _formatRefinementCompletion(result: RefinementResult): string {
+		const applied = result.appliedEdits.filter((edit) => edit.applied);
+		const scope = result.scope ?? "local";
+		const changes = applied.map((edit) => {
+			const title = edit.after?.title ?? edit.before?.title;
+			return `- ${edit.action} ${edit.kind}:${edit.id}${title ? ` (${title})` : ""}`;
+		});
+		return [
+			`Continual harness refinement complete (${scope}): ${result.summary}`,
+			changes.length > 0 ? `Harness changes:\n${changes.join("\n")}` : "Harness changes: none.",
+		].join("\n\n");
+	}
+
+	private _appendRefinementCompletionMessage(result: RefinementResult): void {
+		const command = { name: "refine", args: "", text: "/refine" } as const;
+		const content = this._formatRefinementCompletion(result);
+		try {
+			this._appendDurableSessionCommandMessage(content, command, true, false);
+		} catch (error) {
+			const persistenceError = error instanceof Error ? error.message : String(error);
+			const fallback = createSessionSlashCommandResultMessage(
+				`${content}\n\nThis refinement update could not be saved to session history: ${persistenceError}`,
+				{ command, success: true, severity: "warning" },
+			);
+			// Preserve and render the disclosure even when its session-file append
+			// failed; later context rebuilds merge it back at its timestamp.
+			this._unpersistedStatusMessages.push(fallback);
+			this.agent.state.messages.push(fallback);
+			this._emit({ type: "message_start", message: fallback });
+			this._emit({ type: "message_end", message: fallback });
 		}
 	}
 
-	private async _runApprovedRefine(reason: AutoRefineReason, review: AutoRefineReview): Promise<void> {
+	private async _runApprovedRefine(
+		reason: AutoRefineReason,
+		review: AutoRefineReview,
+		concurrentCompaction?: {
+			trajectoryMessages: readonly AgentMessage[];
+			applyGate: Promise<boolean>;
+		},
+	): Promise<void> {
 		this._autoRefineInProgress = true;
 		try {
-			await this.refine({ instructions: autoRefineInstructions(reason, review) });
+			const result = await this.refine(
+				{ instructions: autoRefineInstructions(reason, review) },
+				{
+					trajectoryMessages: concurrentCompaction?.trajectoryMessages,
+					applyGate: concurrentCompaction?.applyGate,
+				},
+			);
+			this._appendRefinementCompletionMessage(result);
 			this._pendingAutoRefineReview = undefined;
 			this._turnIntervalAutoRefinePending = false;
 			this._lastAutoRefineReviewAt = Date.now();
 			this._assistantTurnsSinceAutoRefine = 0;
-			if (reason === "compact") {
-				this._compactAutoRefinePending = false;
+			if (reason === "compact") this._compactAutoRefinePending = false;
+		} catch (error) {
+			if (!(error instanceof CompactionRefinementDiscardedError)) {
+				const shouldRecordFailure = !concurrentCompaction || (await concurrentCompaction.applyGate);
+				if (shouldRecordFailure) this._lastAutoRefineReviewAt = Date.now();
 			}
-		} catch {
-			// Auto-refine is opportunistic; manual /refine remains available.
-			// Stamp the cooldown so a persistently failing refine doesn't retry
-			// (via a retained pending review) on every agent end.
-			this._lastAutoRefineReviewAt = Date.now();
 		} finally {
 			this._autoRefineInProgress = false;
 			this._scheduleDeferredAutoRefineIfIdle();
 		}
 	}
 
-	private async _reviewAutoRefine(context: AutoRefineReviewRequest, signal?: AbortSignal): Promise<AutoRefineReview> {
+	private async _reviewAutoRefine(
+		context: AutoRefineReviewRequest,
+		signal?: AbortSignal,
+		trajectoryMessages: readonly AgentMessage[] = this.agent.state.messages,
+	): Promise<AutoRefineReview> {
 		if (this._autoRefineReviewer) {
 			return this._autoRefineReviewer(context, signal);
 		}
@@ -6985,7 +7032,7 @@ export class AgentSession {
 		}
 		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
 		return reviewAutoRefine(
-			this.agent.state.messages,
+			[...trajectoryMessages],
 			this._loadMergedHarnessState(),
 			this._loadRefinementHistory(),
 			model,
@@ -7023,7 +7070,11 @@ export class AgentSession {
 	 */
 	async refine(
 		options: { instructions?: string; rollbackId?: string; global?: boolean } = {},
-		internal: { skipAbort?: boolean } = {},
+		internal: {
+			skipAbort?: boolean;
+			trajectoryMessages?: readonly AgentMessage[];
+			applyGate?: Promise<boolean>;
+		} = {},
 	): Promise<RefinementResult> {
 		// Queued /refine executes from the session-input pump between turns;
 		// refine never aborts the agent (planning is backgrounded and the apply
@@ -7064,7 +7115,7 @@ export class AgentSession {
 		this._refineAbortController = refineAbort;
 
 		// Background planning phase — does NOT block turn entry points
-		const planRun = this._planRefine(options, refineAbort.signal);
+		const planRun = this._planRefine(options, refineAbort.signal, internal.trajectoryMessages);
 		const planSettled = planRun.then(
 			() => undefined,
 			() => undefined,
@@ -7083,6 +7134,14 @@ export class AgentSession {
 			if (this._refinePlanInFlight === planSettled) {
 				this._refinePlanInFlight = undefined;
 			}
+		}
+
+		if (internal.applyGate && !(await internal.applyGate)) {
+			if (this._refineAbortController === refineAbort) {
+				this._refineAbortController = undefined;
+			}
+			this._scheduleSessionInputPump();
+			throw new CompactionRefinementDiscardedError("Compaction did not commit; refinement plan discarded");
 		}
 
 		// Block new turns before waiting for the current turn to finish. One shared
@@ -7150,6 +7209,7 @@ export class AgentSession {
 	private async _planRefine(
 		options: { instructions?: string; rollbackId?: string; global?: boolean },
 		signal: AbortSignal,
+		trajectoryMessages: readonly AgentMessage[] = this.agent.state.messages,
 	): Promise<RefinementPlan> {
 		if (this._disposed) {
 			throw new Error("Cannot refine a disposed session.");
@@ -7192,7 +7252,7 @@ export class AgentSession {
 				? globalPlanningState
 				: localPlanningState!;
 		const plan = await planRefinement(
-			this.agent.state.messages,
+			[...trajectoryMessages],
 			planningState,
 			history,
 			model,
@@ -7495,11 +7555,11 @@ export class AgentSession {
 		} catch (error) {
 			const persistenceError = error instanceof Error ? error.message : String(error);
 			outcomeMessage = createCompactionOutcomeMessage(
-				`${message}\n\nThis compaction outcome could not be saved to session history: ${persistenceError}`,
+				`${message}\n\nThis status message could not be saved to session history: ${persistenceError}`,
 				{ reason, outcome },
 			);
 			// Not in the session file, so context rebuilds would drop the disclosure.
-			this._unpersistedCompactionOutcomes.push(outcomeMessage);
+			this._unpersistedStatusMessages.push(outcomeMessage);
 		}
 		this.agent.state.messages.push(outcomeMessage);
 		this._emit({ type: "message_start", message: outcomeMessage });
@@ -7535,6 +7595,7 @@ export class AgentSession {
 
 		this._emit({ type: "compaction_start", reason, customInstructions });
 		this._autoCompactionAbortController = new AbortController();
+		let compactionRefine: { settle: (committed: boolean) => void } | undefined;
 
 		try {
 			const authResult = this.model ? await this._modelRegistry.getApiKeyAndHeaders(this.model) : undefined;
@@ -7554,6 +7615,7 @@ export class AgentSession {
 				return false;
 			}
 
+			compactionRefine = this._startAutoRefineAlongsideCompaction();
 			const result = await this._performCompaction({
 				model: this.model,
 				apiKey: authResult.apiKey,
@@ -7563,10 +7625,9 @@ export class AgentSession {
 			});
 
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry, customInstructions });
+			compactionRefine.settle(true);
 			// Queued work lives in both the agent queues and the session-owned queues.
 			const hasQueuedMessages = this.agent.hasQueuedMessages() || this.pendingMessageCount > 0;
-			const willContinueAfterCompaction = willRetry || shouldContinueAfterCompaction || hasQueuedMessages;
-
 			if (willRetry) {
 				const messages = this.agent.state.messages;
 				const lastMsg = messages[messages.length - 1];
@@ -7575,15 +7636,11 @@ export class AgentSession {
 				}
 
 				this._schedulePostCompactionContinue();
-				this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
 				return true;
 			} else if (shouldContinueAfterCompaction || hasQueuedMessages) {
 				// Compaction can intentionally stop a tool loop between turns.
 				// Queued follow-up/steering/custom messages can also be waiting.
 				this._schedulePostCompactionContinue();
-				this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
-			} else {
-				this._scheduleAutoRefineAfterCompaction(willContinueAfterCompaction);
 			}
 			return false;
 		} catch (error) {
@@ -7628,6 +7685,7 @@ export class AgentSession {
 			resumeAfterFailure();
 			return false;
 		} finally {
+			compactionRefine?.settle(false);
 			this._autoCompactionAbortController = undefined;
 			this._scheduleSessionInputPump();
 		}
@@ -10012,7 +10070,7 @@ export class AgentSession {
 			// Update agent state
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
-			this._mergeUnpersistedCompactionOutcomes(this.agent.state.messages);
+			this._mergeUnpersistedStatusMessages(this.agent.state.messages);
 			this._restoreLateIpythonSentAgentMessages();
 			this._reloadGoalStateFromBranch();
 			this._invalidateQueuedPromptPreparation();

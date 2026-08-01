@@ -3,10 +3,10 @@ import type { Model } from "@earendil-works/pi-ai";
 
 /** Bound the lightweight namespace probe independently from the maintenance model turn. */
 export const KERNEL_NAMESPACE_PROBE_TIMEOUT_MS = 5000;
-/** Request cancellation after this post-commit maintenance budget, then wait for kernel quiescence. */
+/** Request cancellation after this compaction-time maintenance budget, then wait for kernel quiescence. */
 export const KERNEL_MAINTENANCE_TIMEOUT_MS = 120_000;
 
-const KERNEL_MAINTENANCE_SYSTEM_PROMPT = `You are the dedicated post-compaction IPython maintenance role. Your only job is to safely reduce stale state in the parent agent's already-running IPython kernel after its conversation summary and compaction entry have been recorded. You are not a normal task agent and must not work on the user's task, explain the task, delegate through rlm, create a child agent, or modify files. Use only the provided ipython tool, which is directly bound to the parent kernel.`;
+const KERNEL_MAINTENANCE_SYSTEM_PROMPT = `You are the dedicated compaction-time IPython maintenance role. Review the full pre-compaction conversation in the background and safely reduce stale state in the parent agent's already-running IPython kernel. Your tool execution is commit-gated and will run only after the conversation summary and compaction entry have been recorded. You are not a normal task agent and must not work on the user's task, explain the task, delegate through rlm, create a child agent, or modify files. Use only the provided ipython tool, which is directly bound to the parent kernel.`;
 
 export type KernelMaintenanceResult = { status: "completed" } | { status: "failed" } | { status: "timed_out" };
 
@@ -18,6 +18,8 @@ export interface KernelMaintenanceRoleOptions {
 	contextMessages: readonly AgentMessage[];
 	/** False when current context was truncated or could not be represented safely. */
 	allowDeletes?: boolean;
+	/** Resolves true only after compaction is durably committed; false forbids kernel mutation. */
+	executionGate?: Promise<boolean>;
 	signal: AbortSignal;
 }
 
@@ -54,8 +56,15 @@ export async function runKernelMaintenanceRole(
 	const maintenanceIpythonTool = {
 		...options.ipythonTool,
 		execute: (...args: Parameters<typeof originalExecute>) => {
-			const execution = originalExecute(...args);
-			activeToolExecution = Promise.resolve(execution).then(
+			const execution = (async () => {
+				const toolSignal = args[2] as AbortSignal | undefined;
+				const executionAllowed = options.executionGate ? await options.executionGate : true;
+				if (!executionAllowed || options.signal.aborted || toolSignal?.aborted) {
+					throw new Error("Kernel maintenance cancelled before compaction commit");
+				}
+				return await originalExecute(...args);
+			})();
+			activeToolExecution = execution.then(
 				() => undefined,
 				() => undefined,
 			);

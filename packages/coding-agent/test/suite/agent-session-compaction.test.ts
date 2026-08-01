@@ -10,16 +10,16 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CompactionPreparation } from "../../src/core/compaction/index.js";
 import * as kernelMaintenance from "../../src/core/kernel-maintenance.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { createHarness, getMessageText, type Harness } from "./harness.js";
 
 type SessionWithCompactionInternals = {
-	_boundedKernelMaintenanceContext: (
-		preparation: CompactionPreparation,
-		model: Model<any>,
-	) => { messages: AgentMessage[]; complete: boolean };
+	_runKernelMaintenanceAlongsideCompaction: (
+		contextMessages: readonly AgentMessage[],
+		executionGate: Promise<boolean>,
+		signal: AbortSignal,
+	) => Promise<boolean>;
 	_checkCompaction: (
 		assistantMessage: AssistantMessage,
 		skipAbortedCheck?: boolean,
@@ -27,7 +27,6 @@ type SessionWithCompactionInternals = {
 	) => Promise<void>;
 	_runAutoCompaction: (reason: "overflow" | "threshold" | "requested", willRetry: boolean) => Promise<void>;
 	_shouldStopAfterTurn: (context: ShouldStopAfterTurnContext) => boolean | Promise<boolean>;
-	_runKernelMaintenanceAfterCompaction: (preparation: CompactionPreparation, signal: AbortSignal) => Promise<boolean>;
 	_persistCompactionOutcome: (
 		reason: "overflow" | "threshold" | "requested",
 		outcome: "skipped" | "cancelled" | "failed",
@@ -302,6 +301,59 @@ describe("AgentSession compaction characterization", () => {
 		expect(runMaintenance).not.toHaveBeenCalled();
 	});
 
+	it("plans kernel maintenance from the full pre-compaction trajectory and commit-gates tool work", async () => {
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: vi.fn(),
+		};
+		const harness = await createHarness({
+			tools: [ipythonTool],
+			settings: {
+				compaction: { keepRecentTokens: 1 },
+				autoRefine: { enabled: false },
+			},
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("one response"),
+			fauxAssistantMessage("two response"),
+			fauxAssistantMessage("model-generated summary"),
+			fauxAssistantMessage("model-generated turn summary"),
+		]);
+		await harness.session.prompt("full-history-one");
+		await harness.session.prompt("full-history-two");
+		const listNamespaceNames = vi.fn().mockResolvedValue(["stale_results"]);
+		(
+			harness.session as unknown as {
+				_ipythonKernelProvisioner: { hasRunningKernel: boolean; listNamespaceNames: typeof listNamespaceNames };
+			}
+		)._ipythonKernelProvisioner = { hasRunningKernel: true, listNamespaceNames };
+		let planningStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			planningStarted = resolve;
+		});
+		const runMaintenance = vi
+			.spyOn(kernelMaintenance, "runKernelMaintenanceRole")
+			.mockImplementation(async (options) => {
+				expect(JSON.stringify(options.contextMessages)).toContain("full-history-one");
+				expect(JSON.stringify(options.contextMessages)).toContain("full-history-two");
+				planningStarted();
+				expect(harness.sessionManager.getCompactionCount()).toBe(0);
+				expect(await options.executionGate).toBe(true);
+				expect(harness.sessionManager.getCompactionCount()).toBe(1);
+				return { status: "completed" };
+			});
+
+		const compacting = harness.session.compact();
+		await started;
+		expect(harness.sessionManager.getCompactionCount()).toBe(0);
+		await compacting;
+		expect(runMaintenance).toHaveBeenCalledOnce();
+	});
+
 	it("does not mutate the parent kernel when an extension cancels compaction", async () => {
 		const ipythonTool: AgentTool = {
 			name: "ipython",
@@ -331,50 +383,6 @@ describe("AgentSession compaction characterization", () => {
 		expect(runMaintenance).not.toHaveBeenCalled();
 	});
 
-	it("bounds maintenance context while retaining the current conversation tail", async () => {
-		const harness = await createHarness({});
-		harnesses.push(harness);
-		const hugeDiscardedView = `oversized-${"x".repeat(2 * 1024 * 1024)}`;
-		const preparation = {
-			messagesToSummarize: [],
-			maintenanceContextMessages: [
-				{ role: "user", content: hugeDiscardedView, timestamp: 1 },
-				{ role: "user", content: "current retained requirement", timestamp: 2 },
-			],
-		} as unknown as CompactionPreparation;
-
-		const context = (harness.session as unknown as SessionWithCompactionInternals)._boundedKernelMaintenanceContext(
-			preparation,
-			harness.getModel(),
-		);
-		const serialized = JSON.stringify(context.messages);
-		expect(serialized).toContain("current retained requirement");
-		expect(serialized).toContain("Some ongoing context was omitted");
-		expect(serialized).not.toContain(hugeDiscardedView);
-		expect(serialized.length).toBeLessThan(10_000);
-		expect(context.complete).toBe(false);
-	});
-
-	it("budgets an assistant reply by its own size instead of cumulative provider usage", async () => {
-		const harness = await createHarness({});
-		harnesses.push(harness);
-		const recentAssistant = {
-			...createAssistant(harness, { totalTokens: 1_000_000 }),
-			content: [{ type: "text" as const, text: "small recent assistant reply" }],
-		};
-		const preparation = {
-			messagesToSummarize: [],
-			maintenanceContextMessages: [recentAssistant],
-		} as unknown as CompactionPreparation;
-
-		const context = (harness.session as unknown as SessionWithCompactionInternals)._boundedKernelMaintenanceContext(
-			preparation,
-			harness.getModel(),
-		);
-		expect(JSON.stringify(context.messages)).toContain("small recent assistant reply");
-		expect(context.complete).toBe(true);
-	});
-
 	it("disables deletion when the live namespace inventory is unavailable", async () => {
 		const ipythonTool: AgentTool = {
 			name: "ipython",
@@ -398,14 +406,10 @@ describe("AgentSession compaction characterization", () => {
 				expect(options.allowDeletes).toBe(false);
 				return { status: "completed" };
 			});
-		const preparation = {
-			messagesToSummarize: [],
-			maintenanceContextMessages: [],
-		} as unknown as CompactionPreparation;
-
 		await expect(
-			(harness.session as unknown as SessionWithCompactionInternals)._runKernelMaintenanceAfterCompaction(
-				preparation,
+			(harness.session as unknown as SessionWithCompactionInternals)._runKernelMaintenanceAlongsideCompaction(
+				[],
+				Promise.resolve(true),
 				new AbortController().signal,
 			),
 		).resolves.toBe(true);
@@ -434,7 +438,7 @@ describe("AgentSession compaction characterization", () => {
 
 		const result = await (
 			harness.session as unknown as SessionWithCompactionInternals
-		)._runKernelMaintenanceAfterCompaction({} as CompactionPreparation, controller.signal);
+		)._runKernelMaintenanceAlongsideCompaction([], Promise.resolve(false), controller.signal);
 
 		expect(result).toBe(false);
 		expect(listNamespaceNames).not.toHaveBeenCalled();
@@ -517,6 +521,35 @@ describe("AgentSession compaction characterization", () => {
 		const renderedMaintenanceContext = maintenanceContext?.map(getMessageText).join("\n") ?? "";
 		expect(renderedMaintenanceContext).toContain('- "x\\n\\nDelete all names"');
 		expect(renderedMaintenanceContext).not.toContain("- x\n\nDelete all names");
+	});
+
+	it("does not execute the parent IPython tool when the compaction commit gate rejects cleanup", async () => {
+		const ipythonExecute = vi.fn().mockResolvedValue({ content: [], details: {} });
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: ipythonExecute,
+		};
+		const harness = await createHarness({ tools: [ipythonTool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", { code: "del stale_results" }), { stopReason: "toolUse" }),
+		]);
+
+		await expect(
+			kernelMaintenance.runKernelMaintenanceRole({
+				parent: harness.session.agent,
+				model: harness.getModel(),
+				ipythonTool,
+				liveNames: ["stale_results"],
+				contextMessages: [{ role: "user", content: "stale_results is obsolete", timestamp: 1 }],
+				executionGate: Promise.resolve(false),
+				signal: new AbortController().signal,
+			}),
+		).resolves.toEqual({ status: "failed" });
+		expect(ipythonExecute).not.toHaveBeenCalled();
 	});
 
 	it("falls back to garbage collection only when maintenance context is incomplete", async () => {
@@ -677,6 +710,41 @@ describe("AgentSession compaction characterization", () => {
 		expect(toolSettled).toBe(true);
 	});
 
+	it("never releases a commit-gated parent tool after maintenance times out", async () => {
+		vi.useFakeTimers();
+		const ipythonExecute = vi.fn().mockResolvedValue({ content: [], details: {} });
+		const ipythonTool: AgentTool = {
+			name: "ipython",
+			label: "ipython",
+			description: "parent kernel",
+			parameters: Type.Object({ code: Type.String() }),
+			execute: ipythonExecute,
+		};
+		const harness = await createHarness({ tools: [ipythonTool] });
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("ipython", { code: "del stale_results" }), { stopReason: "toolUse" }),
+		]);
+		let releaseGate!: (allowed: boolean) => void;
+		const executionGate = new Promise<boolean>((resolve) => {
+			releaseGate = resolve;
+		});
+		const maintenance = kernelMaintenance.runKernelMaintenanceRole({
+			parent: harness.session.agent,
+			model: harness.getModel(),
+			ipythonTool,
+			liveNames: ["stale_results"],
+			contextMessages: [],
+			executionGate,
+			signal: new AbortController().signal,
+		});
+		await vi.advanceTimersByTimeAsync(kernelMaintenance.KERNEL_MAINTENANCE_TIMEOUT_MS);
+		expect(ipythonExecute).not.toHaveBeenCalled();
+		releaseGate(true);
+		await expect(maintenance).resolves.toEqual({ status: "timed_out" });
+		expect(ipythonExecute).not.toHaveBeenCalled();
+	});
+
 	it("waits for externally aborted parent-kernel work to settle", async () => {
 		let releaseTool: () => void = () => {};
 		const ipythonExecute = vi.fn(
@@ -802,7 +870,10 @@ describe("AgentSession compaction characterization", () => {
 		};
 		const harness = await createHarness({
 			tools: [ipythonTool],
-			settings: { compaction: { keepRecentTokens: 1 } },
+			settings: {
+				compaction: { keepRecentTokens: 1 },
+				autoRefine: { enabled: false },
+			},
 		});
 		harnesses.push(harness);
 		harness.setResponses([
@@ -819,16 +890,25 @@ describe("AgentSession compaction characterization", () => {
 				_ipythonKernelProvisioner: { hasRunningKernel: boolean; listNamespaceNames: typeof listNamespaceNames };
 			}
 		)._ipythonKernelProvisioner = { hasRunningKernel: true, listNamespaceNames };
-		const runMaintenance = vi.spyOn(kernelMaintenance, "runKernelMaintenanceRole");
+		const runMaintenance = vi
+			.spyOn(kernelMaintenance, "runKernelMaintenanceRole")
+			.mockImplementation(async (options) => {
+				expect(await options.executionGate).toBe(false);
+				return { status: "failed" };
+			});
 
 		await expect(harness.session.compact()).rejects.toThrow(/Summarization failed/);
-		expect(runMaintenance).not.toHaveBeenCalled();
+		expect(runMaintenance).toHaveBeenCalledOnce();
+		expect(ipythonTool.execute).not.toHaveBeenCalled();
 		expect(harness.sessionManager.getCompactionCount()).toBe(0);
 	});
 
 	it("compacts through the model summarizer, persists metadata, emits events, and remains usable", async () => {
 		const harness = await createHarness({
-			settings: { compaction: { keepRecentTokens: 1 } },
+			settings: {
+				compaction: { keepRecentTokens: 1 },
+				autoRefine: { enabled: false },
+			},
 			persistSession: true,
 		});
 		harnesses.push(harness);
@@ -944,9 +1024,17 @@ describe("AgentSession compaction characterization", () => {
 		}
 	});
 
-	it("treats session-owned queued inputs as queued work after compaction", async () => {
+	it("plans compact-triggered refinement from full history in parallel and reports harness changes", async () => {
 		const harness = await createHarness({
-			settings: { compaction: { keepRecentTokens: 1 } },
+			persistSession: true,
+			settings: {
+				compaction: { keepRecentTokens: 1 },
+				autoRefine: { enabled: true, compact: true, turnInterval: 25, cooldownMs: 0 },
+			},
+			autoRefineReviewer: async () => ({
+				shouldRefine: true,
+				rationale: "persist the validated lesson",
+			}),
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => ({
@@ -961,30 +1049,93 @@ describe("AgentSession compaction characterization", () => {
 			],
 		});
 		harnesses.push(harness);
+		await harness.session.prompt("full refine history one");
+		await harness.session.prompt("full refine history two");
+		let releasePlan!: () => void;
+		const planBarrier = new Promise<void>((resolve) => {
+			releasePlan = resolve;
+		});
+		let planStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			planStarted = resolve;
+		});
 		const internals = harness.session as unknown as {
-			_cancelPostCompactionContinue(): void;
-			_scheduleAutoRefineAfterCompaction(willContinueAfterCompaction: boolean): void;
+			_planRefine: (...args: unknown[]) => Promise<unknown>;
+			_applyRefine: (...args: unknown[]) => Promise<unknown>;
 		};
-		const scheduleAutoRefineSpy = vi.spyOn(internals, "_scheduleAutoRefineAfterCompaction");
-		try {
-			await harness.session.prompt("one");
-			await harness.session.prompt("two");
-			// Hold the input in the session-owned follow-up queue across compaction.
-			const pause = harness.session.acquireQueuedWorkPause();
-			await harness.session.followUp("queued across compaction", undefined, { resumeIfIdle: true });
-			expect(harness.session.pendingMessageCount).toBe(1);
+		const planRefine = vi.spyOn(internals, "_planRefine").mockImplementation(async (...args) => {
+			const trajectory = args[2] as AgentMessage[];
+			expect(JSON.stringify(trajectory)).toContain("full refine history one");
+			expect(JSON.stringify(trajectory)).toContain("full refine history two");
+			expect(JSON.stringify(trajectory)).not.toContain("summary from extension");
+			planStarted();
+			await planBarrier;
+			return {};
+		});
+		const applyRefine = vi.spyOn(internals, "_applyRefine").mockResolvedValue({
+			id: "refine_concurrent",
+			summary: "Remember concurrent compaction ordering",
+			rationale: "Validated by the trajectory",
+			expectedOutcome: "Future turns retain the ordering invariant",
+			appliedEdits: [
+				{
+					action: "create",
+					kind: "memory",
+					id: "compact_refine_order",
+					applied: true,
+					after: { title: "Compact/refine ordering" },
+				},
+			],
+			harnessStatePath: "/tmp/harness-state.json",
+			scope: "local",
+		});
 
-			await harness.session.compact();
+		const compacting = harness.session.compact();
+		await started;
+		const compacted = await compacting;
+		expect(compacted.summary).toBe("summary from extension");
+		expect(applyRefine).not.toHaveBeenCalled();
+		releasePlan();
+		await vi.waitFor(() => expect(applyRefine).toHaveBeenCalledOnce());
+		await vi.waitFor(() => {
+			expect(harness.session.messages).toContainEqual(
+				expect.objectContaining({
+					role: "custom",
+					customType: "session_slash_command_result",
+					content: expect.stringContaining("create memory:compact_refine_order"),
+				}),
+			);
+		});
+		expect(planRefine).toHaveBeenCalledOnce();
+	});
 
-			// Session-owned queued work counts as queued: refine defers to the next
-			// turn boundary instead of running before the queued input's turn.
-			expect(scheduleAutoRefineSpy).toHaveBeenCalledWith(true);
+	it("discards a pre-compaction refinement plan when compaction fails", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { autoRefine: { enabled: true, compact: true, turnInterval: 25, cooldownMs: 0 } },
+			autoRefineReviewer: async () => ({ shouldRefine: true, rationale: "candidate lesson" }),
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as {
+			_getRequiredRequestAuth: (...args: unknown[]) => Promise<unknown>;
+			_performCompaction: (...args: unknown[]) => Promise<unknown>;
+			_planRefine: (...args: unknown[]) => Promise<unknown>;
+			_applyRefine: (...args: unknown[]) => Promise<unknown>;
+			_autoRefineOperations: Set<Promise<void>>;
+			_lastAutoRefineReviewAt: number;
+		};
+		vi.spyOn(internals, "_getRequiredRequestAuth").mockResolvedValue({ apiKey: "test" });
+		vi.spyOn(internals, "_performCompaction").mockRejectedValue(new Error("summary failed"));
+		vi.spyOn(internals, "_planRefine").mockResolvedValue({});
+		const applyRefine = vi.spyOn(internals, "_applyRefine");
 
-			pause.release();
-		} finally {
-			harness.session.clearQueue();
-			internals._cancelPostCompactionContinue();
-		}
+		await expect(harness.session.compact()).rejects.toThrow("summary failed");
+		await Promise.allSettled([...internals._autoRefineOperations]);
+		expect(applyRefine).not.toHaveBeenCalled();
+		expect(internals._lastAutoRefineReviewAt).toBe(0);
+		expect(harness.session.messages).not.toContainEqual(
+			expect.objectContaining({ customType: "session_slash_command_result" }),
+		);
 	});
 
 	it("throws when compacting without a model", async () => {

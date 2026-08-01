@@ -4,6 +4,8 @@ import { createHarness, type Harness } from "./harness.js";
 type SessionInternals = {
 	_consumePendingRequestedRefine: () => boolean;
 	_emitRefineFailed: (error: unknown) => void;
+	_appendRefinementCompletionMessage: (result: unknown) => void;
+	_unpersistedStatusMessages: unknown[];
 	_pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
 	_serializedPlanInFlight?: Promise<unknown>;
 	_serializedExplicitRefineOptions?: { instructions?: string; global?: boolean };
@@ -179,10 +181,53 @@ describe("AgentSession refine skill host requests", () => {
 		setStreaming(harness, false);
 
 		const internals = harness.session as unknown as SessionInternals;
-		const refineSpy = vi.spyOn(internals, "refine").mockResolvedValue({});
+		const refineSpy = vi.spyOn(internals, "refine").mockResolvedValue({
+			id: "refine_skill",
+			summary: "Remember the requested behavior",
+			rationale: "Validated",
+			expectedOutcome: "Future turns improve",
+			appliedEdits: [{ action: "create", kind: "memory", id: "requested_behavior", applied: true }],
+			harnessStatePath: "/tmp/harness.json",
+			scope: "local",
+		});
 		internals._consumePendingRequestedRefine();
 		expect(refineSpy).toHaveBeenCalledWith({ instructions: "test", global: undefined });
 		expect(internals._pendingRequestedRefine).toBeUndefined();
+		await vi.waitFor(() => {
+			expect(harness.session.messages).toContainEqual(
+				expect.objectContaining({
+					customType: "session_slash_command_result",
+					content: expect.stringContaining("create memory:requested_behavior"),
+				}),
+			);
+		});
+	});
+
+	it("keeps a visible refinement update when status persistence fails", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SessionInternals;
+		vi.spyOn(harness.session.sessionManager, "appendCustomMessageEntryWithRollback").mockImplementation(() => {
+			throw new Error("disk full");
+		});
+
+		internals._appendRefinementCompletionMessage({
+			id: "refine_fallback",
+			summary: "Keep the update visible",
+			rationale: "Status durability",
+			expectedOutcome: "User sees changes",
+			appliedEdits: [{ action: "update", kind: "prompt", id: "status_policy", applied: true }],
+			harnessStatePath: "/tmp/harness.json",
+			scope: "local",
+		});
+
+		expect(internals._unpersistedStatusMessages).toHaveLength(1);
+		expect(harness.session.messages).toContainEqual(
+			expect.objectContaining({
+				customType: "session_slash_command_result",
+				content: expect.stringContaining("could not be saved to session history: disk full"),
+			}),
+		);
 	});
 
 	it("does nothing when no pending refine at turn boundary", async () => {
