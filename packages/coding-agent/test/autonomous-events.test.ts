@@ -160,6 +160,32 @@ describe("autonomous events", () => {
 		void cwd;
 	});
 
+	it("reports one stop once when both paths observe the same limit", async () => {
+		// Mirrors AgentSession._emitAutonomousEvent: the in-session decision and the
+		// host loop both see the stop, but clients get a single frame.
+		const emitted: AutonomousEvent[] = [];
+		let reported: string | undefined;
+		const funnel = (event: AutonomousEvent) => {
+			if (event.type === "autonomous_limit_reached") {
+				if (reported === event.reason) return;
+				reported = event.reason;
+			}
+			emitted.push(event);
+		};
+
+		const state = createState([]);
+		state.limits = { ...state.limits, maxContinuations: 1 };
+		state.continuationsUsed = 1;
+
+		// In-session evaluation reports the limit...
+		await nextAutonomousContinuation(state, assistantMessage(), { cwd: createCwd(), onEvent: funnel });
+		// ...then the host loop observes the same stop on exit.
+		const reason = autonomousLimitReason(state);
+		if (reason) funnel({ type: "autonomous_limit_reached", reason, ...autonomousLimitUsage(state, reason) });
+
+		expect(emitted).toEqual([{ type: "autonomous_limit_reached", reason: "maxContinuations", used: 1, limit: 1 }]);
+	});
+
 	it("does not let a throwing listener break the control loop", async () => {
 		const cwd = createCwd();
 		const state = createState(["exit 0"]);

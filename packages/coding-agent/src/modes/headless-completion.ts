@@ -75,7 +75,8 @@ export async function waitForHeadlessCompletion(session: AgentSession): Promise<
 	let lastPromptedProgressKey: string | undefined;
 	let repeatedProgressPrompts = 0;
 	let limitReported = false;
-	// The host loop evaluates limits itself, so nothing else reports them to clients.
+	// The host loop evaluates limits itself; in-session evaluation may have already
+	// reported the same stop, so AgentSession drops the duplicate.
 	const reportLimit = (current: AgentAutonomousStatus): void => {
 		if (limitReported || !current.enabled) return;
 		const reason = autonomousLimitReason(current);
