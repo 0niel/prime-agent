@@ -6,6 +6,9 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	type AutonomousEvent,
+	addAutonomousContinuation,
+	autonomousLimitReason,
+	autonomousLimitUsage,
 	createAutonomousRuntimeState,
 	nextAutonomousContinuation,
 	refreshAutonomousQualityGates,
@@ -126,6 +129,35 @@ describe("autonomous events", () => {
 		});
 
 		expect(events).toEqual([{ type: "autonomous_limit_reached", reason: "maxContinuations", used: 1, limit: 1 }]);
+	});
+
+	it("reports host-driven continuations and limits, which bypass in-session evaluation", async () => {
+		const cwd = createCwd();
+		const state = createState([]);
+		state.limits = { ...state.limits, maxContinuations: 2 };
+		const events: AutonomousEvent[] = [];
+
+		// Mirrors AgentSession.recordHostAutonomousContinuation + reportAutonomousLimitReached,
+		// the path waitForHeadlessCompletion drives with suppressAutonomousContinuation.
+		addAutonomousContinuation(state);
+		events.push({
+			type: "autonomous_continuation",
+			reason: "gate_failed",
+			continuationsUsed: state.continuationsUsed,
+			maxContinuations: state.limits.maxContinuations,
+		});
+		addAutonomousContinuation(state);
+		const reason = autonomousLimitReason(state);
+		expect(reason).toBe("maxContinuations");
+		if (reason) {
+			events.push({ type: "autonomous_limit_reached", reason, ...autonomousLimitUsage(state, reason) });
+		}
+
+		expect(events).toEqual([
+			{ type: "autonomous_continuation", reason: "gate_failed", continuationsUsed: 1, maxContinuations: 2 },
+			{ type: "autonomous_limit_reached", reason: "maxContinuations", used: 2, limit: 2 },
+		]);
+		void cwd;
 	});
 
 	it("does not let a throwing listener break the control loop", async () => {

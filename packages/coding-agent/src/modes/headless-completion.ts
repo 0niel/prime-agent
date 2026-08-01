@@ -74,10 +74,20 @@ function autonomousProgressKey(status: AgentAutonomousStatus): string {
 export async function waitForHeadlessCompletion(session: AgentSession): Promise<AgentAutonomousStatus> {
 	let lastPromptedProgressKey: string | undefined;
 	let repeatedProgressPrompts = 0;
+	let limitReported = false;
+	// The host loop evaluates limits itself, so nothing else reports them to clients.
+	const reportLimit = (current: AgentAutonomousStatus): void => {
+		if (limitReported || !current.enabled) return;
+		const reason = autonomousLimitReason(current);
+		if (!reason) return;
+		limitReported = true;
+		session.reportAutonomousLimitReached(reason);
+	};
 	while (true) {
 		await session.agent.waitForIdle();
 		const status = session.getAutonomousStatus();
 		if (!shouldContinueAutonomousGates(status) || !status.lastGateFailure) {
+			reportLimit(status);
 			return status;
 		}
 		const progressKey = autonomousProgressKey(status);
@@ -111,6 +121,7 @@ export async function waitForHeadlessCompletion(session: AgentSession): Promise<
 				if (shouldContinueAutonomousGates(postErrorStatus) && postErrorStatus.lastGateFailure) {
 					continue;
 				}
+				reportLimit(postErrorStatus);
 				return postErrorStatus;
 			}
 		}

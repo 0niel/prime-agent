@@ -37,6 +37,7 @@ type FakeSession = {
 	reload: ReturnType<typeof vi.fn>;
 	getAutonomousStatus: ReturnType<typeof vi.fn>;
 	recordHostAutonomousContinuation: ReturnType<typeof vi.fn>;
+	reportAutonomousLimitReached: ReturnType<typeof vi.fn>;
 	refreshAutonomousGates: ReturnType<typeof vi.fn>;
 };
 
@@ -106,6 +107,7 @@ function createRuntimeHost(
 		reload: vi.fn(async () => {}),
 		getAutonomousStatus: vi.fn(() => autonomousStatus),
 		recordHostAutonomousContinuation: vi.fn(),
+		reportAutonomousLimitReached: vi.fn(),
 		refreshAutonomousGates: vi.fn(),
 	};
 

@@ -90,9 +90,11 @@ import {
 	type AgentAutonomousConfig,
 	type AgentAutonomousStatus,
 	type AutonomousEvent,
+	type AutonomousLimitReason,
 	type AutonomousRuntimeState,
 	addAutonomousContinuation,
 	addAutonomousUsage,
+	autonomousLimitUsage,
 	autonomousStatus,
 	createAutonomousRuntimeState,
 	nextAutonomousContinuation,
@@ -2484,18 +2486,22 @@ export class AgentSession {
 		}
 		const snapshot = this._snapshotAutonomousRuntimeState();
 		const arrivalEpoch = this._sessionInputArrivalEpoch;
+		const autonomousEvents = this._bufferAutonomousEvents();
 		const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, message, {
 			cwd: this._cwd,
 			signal: this.agent.signal,
-			onEvent: (event) => this._emit(event),
+			onEvent: autonomousEvents.onEvent,
 		});
 		if (!autonomousMessage) {
+			// No continuation, but no rollback either: the decision stands.
+			autonomousEvents.flush();
 			return undefined;
 		}
 		if (this._sessionInputArrivalEpoch !== arrivalEpoch) {
 			this._restoreAutonomousRuntimeSnapshot(snapshot);
 			return undefined;
 		}
+		autonomousEvents.flush();
 		this._queuedAutonomousThresholdContinuations.set(message, autonomousMessage);
 		this._queuedAutonomousContinuationSnapshots.set(autonomousMessage, snapshot);
 		this._postCompactionContinuationMessages.push(autonomousMessage);
@@ -2959,15 +2965,17 @@ export class AgentSession {
 			return [];
 		}
 		const autonomousSnapshot = this._snapshotAutonomousRuntimeState();
+		const autonomousEvents = this._bufferAutonomousEvents();
 		const autonomousMessage = await nextAutonomousContinuation(this._autonomousState, context.message, {
 			cwd: this._cwd,
 			signal,
-			onEvent: (event) => this._emit(event),
+			onEvent: autonomousEvents.onEvent,
 		});
 		if (autonomousMessage && this._sessionInputArrivalEpoch !== arrivalEpoch) {
 			this._restoreAutonomousRuntimeSnapshot(autonomousSnapshot);
 			return [];
 		}
+		autonomousEvents.flush();
 		return autonomousMessage ? [autonomousMessage] : [];
 	}
 
@@ -3878,6 +3886,20 @@ export class AgentSession {
 
 	recordHostAutonomousContinuation(): void {
 		addAutonomousContinuation(this._autonomousState);
+		// Host-driven continuations suppress in-session evaluation, so emit here or
+		// headless consumers never see them.
+		this._emit({
+			type: "autonomous_continuation",
+			reason: "gate_failed",
+			continuationsUsed: this._autonomousState.continuationsUsed,
+			maxContinuations: this._autonomousState.limits.maxContinuations,
+		});
+	}
+
+	/** Host-driven loops evaluate limits themselves; this reports that stop to clients. */
+	reportAutonomousLimitReached(reason: AutonomousLimitReason): void {
+		const { used, limit } = autonomousLimitUsage(this._autonomousState, reason);
+		this._emit({ type: "autonomous_limit_reached", reason, used, limit });
 	}
 
 	async refreshAutonomousGates(): Promise<void> {
@@ -3894,6 +3916,23 @@ export class AgentSession {
 		} finally {
 			this._autonomousContinuationSuppressionDepth--;
 		}
+	}
+
+	/**
+	 * Buffers autonomous events so a continuation that is rolled back (late user
+	 * input wins the arrival-epoch race) is never reported to clients. Flushing is
+	 * the caller's job, on the paths where the decision actually stands.
+	 */
+	private _bufferAutonomousEvents(): { onEvent: (event: AutonomousEvent) => void; flush: () => void } {
+		const buffered: AutonomousEvent[] = [];
+		return {
+			onEvent: (event) => buffered.push(event),
+			flush: () => {
+				for (const event of buffered.splice(0)) {
+					this._emit(event);
+				}
+			},
+		};
 	}
 
 	private _markAutonomousContinuationSuppressed(message: AgentMessage): void {

@@ -80,7 +80,7 @@ export interface AutonomousRuntimeState {
 export type AutonomousLimitReason = "maxContinuations" | "maxTurns" | "maxTokens" | "timeoutMs";
 export type AutonomousGateResult = "passed" | "failed" | "retry_exhausted";
 
-type AutonomousLimitState = Pick<
+export type AutonomousLimitState = Pick<
 	AgentAutonomousStatus,
 	"continuationsUsed" | "turnsUsed" | "tokensUsed" | "startedAt" | "limits"
 >;
@@ -301,6 +301,16 @@ export async function shouldAutonomouslyContinue(
 		return { shouldContinue: false, reason: "limit_reached" };
 	}
 	return { shouldContinue: true, reason: "missing_terminal_evidence" };
+}
+
+/** Used/limit pair for a binding limit, so host-driven loops can report it themselves. */
+export function autonomousLimitUsage(
+	state: AutonomousLimitState,
+	reason: AutonomousLimitReason,
+	now = Date.now(),
+): { used: number; limit: number } {
+	const [used, limit] = limitUsage(state, reason, now);
+	return { used, limit };
 }
 
 function emitLimitReached(
