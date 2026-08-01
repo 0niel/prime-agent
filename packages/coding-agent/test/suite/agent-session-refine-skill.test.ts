@@ -11,7 +11,13 @@ type SessionInternals = {
 	_serializedExplicitRefineOptions?: { instructions?: string; global?: boolean };
 	_refineAbortController?: AbortController;
 	_createKernelHostHandlers: () => Record<string, unknown>;
-	refine: (options: { instructions?: string; global?: boolean }) => Promise<unknown>;
+	refine: (
+		options: { instructions?: string; global?: boolean },
+		internal?: { trajectoryMessages?: readonly unknown[]; applyGate?: Promise<boolean> },
+	) => Promise<unknown>;
+	_planRefine: (...args: unknown[]) => Promise<unknown>;
+	_applyRefine: (...args: unknown[]) => Promise<unknown>;
+	_refineInFlight?: Promise<void>;
 };
 
 function setStreaming(harness: Harness, streaming: boolean) {
@@ -265,6 +271,38 @@ describe("AgentSession refine skill host requests", () => {
 		expect(internals._consumePendingRequestedRefine()).toBe(true);
 		expect(await failed).toBe("refine failed");
 		expect(internals._pendingRequestedRefine).toBeUndefined();
+	});
+
+	it("serializes another refine while a compaction plan waits on its apply gate", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SessionInternals;
+		const result = {
+			id: "refine_serialized",
+			summary: "serialized",
+			rationale: "no lost edits",
+			expectedOutcome: "sequential apply",
+			appliedEdits: [],
+			harnessStatePath: "/tmp/harness.json",
+		};
+		const planRefine = vi.spyOn(internals, "_planRefine").mockResolvedValue({});
+		const applyRefine = vi.spyOn(internals, "_applyRefine").mockResolvedValue(result);
+		let releaseGate!: (committed: boolean) => void;
+		const applyGate = new Promise<boolean>((resolve) => {
+			releaseGate = resolve;
+		});
+
+		const first = internals.refine({}, { trajectoryMessages: [], applyGate });
+		await vi.waitFor(() => expect(internals._refineInFlight).toBeDefined());
+		const second = internals.refine({ instructions: "second" });
+		await Promise.resolve();
+		expect(planRefine).toHaveBeenCalledTimes(1);
+		expect(applyRefine).not.toHaveBeenCalled();
+		releaseGate(true);
+		await expect(first).resolves.toEqual(result);
+		await expect(second).resolves.toEqual(result);
+		expect(planRefine).toHaveBeenCalledTimes(2);
+		expect(applyRefine).toHaveBeenCalledTimes(2);
 	});
 
 	it("continues notifying refine listeners after one throws", async () => {

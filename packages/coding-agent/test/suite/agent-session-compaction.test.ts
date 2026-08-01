@@ -340,6 +340,7 @@ describe("AgentSession compaction characterization", () => {
 			.mockImplementation(async (options) => {
 				expect(JSON.stringify(options.contextMessages)).toContain("full-history-one");
 				expect(JSON.stringify(options.contextMessages)).toContain("full-history-two");
+				expect(JSON.stringify(options.contextMessages)).toContain("preserve critical_name");
 				planningStarted();
 				expect(harness.sessionManager.getCompactionCount()).toBe(0);
 				expect(await options.executionGate).toBe(true);
@@ -347,7 +348,7 @@ describe("AgentSession compaction characterization", () => {
 				return { status: "completed" };
 			});
 
-		const compacting = harness.session.compact();
+		const compacting = harness.session.compact("preserve critical_name");
 		await started;
 		expect(harness.sessionManager.getCompactionCount()).toBe(0);
 		await compacting;
@@ -1106,6 +1107,87 @@ describe("AgentSession compaction characterization", () => {
 				}),
 			);
 		});
+		expect(planRefine).toHaveBeenCalledOnce();
+	});
+
+	it("defers a compact-triggered refinement without losing its pre-compaction snapshot", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "deferred compact lesson" }));
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { autoRefine: { enabled: true, compact: true, turnInterval: 25, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		await harness.session.prompt("snapshot before deferred compaction");
+		const internals = harness.session as unknown as {
+			_autoRefineInProgress: boolean;
+			_pendingConcurrentCompactionRefine?: unknown;
+			_startAutoRefineAlongsideCompaction: () => { settle: (committed: boolean) => void };
+			_scheduleDeferredAutoRefineIfIdle: () => void;
+			_planRefine: (...args: unknown[]) => Promise<unknown>;
+			_applyRefine: (...args: unknown[]) => Promise<unknown>;
+		};
+		const planRefine = vi.spyOn(internals, "_planRefine").mockImplementation(async (...args) => {
+			expect(JSON.stringify(args[2])).toContain("snapshot before deferred compaction");
+			return {};
+		});
+		const applyRefine = vi.spyOn(internals, "_applyRefine").mockResolvedValue({
+			id: "refine_deferred",
+			summary: "deferred compact lesson",
+			rationale: "preserve snapshot",
+			expectedOutcome: "refine after existing work",
+			appliedEdits: [],
+			harnessStatePath: "/tmp/harness.json",
+		});
+
+		internals._autoRefineInProgress = true;
+		const pending = internals._startAutoRefineAlongsideCompaction();
+		pending.settle(true);
+		await vi.waitFor(() => expect(internals._pendingConcurrentCompactionRefine).toBeDefined());
+		expect(reviewer).not.toHaveBeenCalled();
+		internals._autoRefineInProgress = false;
+		internals._scheduleDeferredAutoRefineIfIdle();
+		await vi.waitFor(() => expect(applyRefine).toHaveBeenCalledOnce());
+		expect(reviewer).toHaveBeenCalledWith(expect.objectContaining({ reason: "compact" }), expect.any(AbortSignal));
+		expect(planRefine).toHaveBeenCalledOnce();
+	});
+
+	it("retries a cooldown-deferred compact refinement with its original snapshot", async () => {
+		const reviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "cooldown elapsed" }));
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { autoRefine: { enabled: true, compact: true, turnInterval: 25, cooldownMs: 40 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		await harness.session.prompt("snapshot before cooldown");
+		const internals = harness.session as unknown as {
+			_lastAutoRefineReviewAt: number;
+			_pendingConcurrentCompactionRefine?: unknown;
+			_startAutoRefineAlongsideCompaction: () => { settle: (committed: boolean) => void };
+			_planRefine: (...args: unknown[]) => Promise<unknown>;
+			_applyRefine: (...args: unknown[]) => Promise<unknown>;
+		};
+		const planRefine = vi.spyOn(internals, "_planRefine").mockImplementation(async (...args) => {
+			expect(JSON.stringify(args[2])).toContain("snapshot before cooldown");
+			return {};
+		});
+		const applyRefine = vi.spyOn(internals, "_applyRefine").mockResolvedValue({
+			id: "refine_cooldown",
+			summary: "cooldown compact lesson",
+			rationale: "preserve snapshot",
+			expectedOutcome: "retry after cooldown",
+			appliedEdits: [],
+			harnessStatePath: "/tmp/harness.json",
+		});
+
+		internals._lastAutoRefineReviewAt = Date.now();
+		const pending = internals._startAutoRefineAlongsideCompaction();
+		pending.settle(true);
+		await vi.waitFor(() => expect(internals._pendingConcurrentCompactionRefine).toBeDefined());
+		expect(reviewer).not.toHaveBeenCalled();
+		await vi.waitFor(() => expect(applyRefine).toHaveBeenCalledOnce());
+		expect(reviewer).toHaveBeenCalledOnce();
 		expect(planRefine).toHaveBeenCalledOnce();
 	});
 

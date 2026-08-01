@@ -464,6 +464,12 @@ export interface AutoRefineReviewRequest {
 	turnsSinceLastReview: number;
 }
 
+interface ConcurrentCompactionRefine {
+	trajectoryMessages: readonly AgentMessage[];
+	applyGate: Promise<boolean>;
+	commitState: { value?: boolean };
+}
+
 /**
  * Discriminated result from a serialized-mode background planning pass.
  * - "plan": review approved and planning succeeded; carry the exact plan,
@@ -1130,6 +1136,8 @@ export class AgentSession {
 	private readonly _autoRefineOperations = new Set<Promise<void>>();
 	private readonly _scheduledAutoRefineTimers = new Set<ReturnType<typeof setTimeout>>();
 	private _compactAutoRefinePending = false;
+	private _pendingConcurrentCompactionRefine?: ConcurrentCompactionRefine;
+	private _pendingConcurrentCompactionRefineTimer?: ReturnType<typeof setTimeout>;
 	private _turnIntervalAutoRefinePending = false;
 	private _postCompactionContinuationScheduled = false;
 	private _postCompactionContinuationTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2105,6 +2113,12 @@ export class AgentSession {
 			return;
 		}
 		if (this._compactAutoRefinePending) {
+			if (this._pendingConcurrentCompactionRefine) {
+				if (!this._pendingConcurrentCompactionRefineTimer) {
+					this._schedulePendingConcurrentCompactionRefine(this._pendingConcurrentCompactionRefine, 0);
+				}
+				return;
+			}
 			if (!settings.compact) {
 				this._compactAutoRefinePending = false;
 			} else {
@@ -3499,11 +3513,13 @@ export class AgentSession {
 			clearTimeout(timer);
 		}
 		this._scheduledAutoRefineTimers.clear();
+		this._pendingConcurrentCompactionRefineTimer = undefined;
 		await Promise.allSettled([...this._autoRefineOperations]);
 		for (const timer of this._scheduledAutoRefineTimers) {
 			clearTimeout(timer);
 		}
 		this._scheduledAutoRefineTimers.clear();
+		this._pendingConcurrentCompactionRefineTimer = undefined;
 		// Wait for in-flight refinement (including serialized background plan) to settle.
 		while (this._refineInFlight || this._refinePlanInFlight || this._serializedPlanInFlight) {
 			if (this._refineInFlight) {
@@ -3570,6 +3586,23 @@ export class AgentSession {
 			this._lastAutoRefineReviewAt = Date.now();
 			this._assistantTurnsSinceAutoRefine = 0;
 		}
+		// A cooldown- or overlap-deferred compaction review retains the original
+		// pre-compaction trajectory. Drain that exact snapshot when it is due rather
+		// than falling back to the resident post-compaction history.
+		if (this._pendingConcurrentCompactionRefine && this._autoRefineAllowedForSession()) {
+			const pending = this._pendingConcurrentCompactionRefine;
+			const compactSettings = this.settingsManager.getAutoRefineSettings();
+			const nowMs = Date.now();
+			const underCooldown =
+				this._lastAutoRefineReviewAt > 0 && nowMs - this._lastAutoRefineReviewAt < compactSettings.cooldownMs;
+			this._pendingConcurrentCompactionRefine = undefined;
+			this._compactAutoRefinePending = false;
+			if (compactSettings.enabled && compactSettings.compact && !underCooldown) {
+				await this._maybeAutoRefine("compact", pending);
+				return;
+			}
+		}
+
 		// A serialized compaction can finish without another model turn. Drain its
 		// pending review here so disposal does not silently lose the trigger.
 		if (this._serializedRefine && this._compactAutoRefinePending && this._autoRefineAllowedForSession()) {
@@ -6469,7 +6502,11 @@ export class AgentSession {
 			resolveCompactionOperation();
 			this._scheduleSessionInputPump();
 			if (didCompact) {
-				this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
+				if (this._pendingConcurrentCompactionRefine) {
+					this._cancelPostCompactionContinue();
+				} else {
+					this._discardPendingAutoRefine({ cancelPostCompactionContinue: true });
+				}
 				if (hadPostCompactionContinue) {
 					this._schedulePostCompactionContinue();
 				}
@@ -6493,6 +6530,14 @@ export class AgentSession {
 		const pathEntries = this.sessionManager.getResidentBranch();
 		const settings = this.settingsManager.getCompactionSettings();
 		const preCompactionMessages = [...this.agent.state.messages];
+		const maintenanceCustomInstructions = customInstructions?.trim();
+		if (maintenanceCustomInstructions) {
+			preCompactionMessages.push({
+				role: "user",
+				content: `Current compaction instructions:\n${maintenanceCustomInstructions}`,
+				timestamp: Date.now(),
+			});
+		}
 
 		const preparation = prepareCompaction(pathEntries, settings, customInstructions);
 		if (!preparation) {
@@ -6636,6 +6681,12 @@ export class AgentSession {
 
 	private _discardPendingAutoRefine(options: { cancelPostCompactionContinue?: boolean } = {}): void {
 		this._compactAutoRefinePending = false;
+		this._pendingConcurrentCompactionRefine = undefined;
+		if (this._pendingConcurrentCompactionRefineTimer) {
+			clearTimeout(this._pendingConcurrentCompactionRefineTimer);
+			this._scheduledAutoRefineTimers.delete(this._pendingConcurrentCompactionRefineTimer);
+			this._pendingConcurrentCompactionRefineTimer = undefined;
+		}
 		this._turnIntervalAutoRefinePending = false;
 		this._pendingAutoRefineReview = undefined;
 		if (options.cancelPostCompactionContinue) {
@@ -6699,7 +6750,11 @@ export class AgentSession {
 			return;
 		}
 		if (this._compactAutoRefinePending) {
-			if (this._postCompactionContinuationScheduled) {
+			if (this._postCompactionContinuationScheduled) return;
+			if (this._pendingConcurrentCompactionRefine) {
+				if (!this._pendingConcurrentCompactionRefineTimer) {
+					this._schedulePendingConcurrentCompactionRefine(this._pendingConcurrentCompactionRefine, 0);
+				}
 				return;
 			}
 			this._scheduleAutoRefine("compact");
@@ -6803,8 +6858,48 @@ export class AgentSession {
 		return this.isStreaming || this.isCompacting;
 	}
 
+	private _trackAutoRefineOperation(operation: Promise<void>): void {
+		this._autoRefineOperations.add(operation);
+		void operation.finally(() => this._autoRefineOperations.delete(operation)).catch(() => undefined);
+	}
+
+	private _schedulePendingConcurrentCompactionRefine(pending: ConcurrentCompactionRefine, delayMs?: number): void {
+		this._pendingConcurrentCompactionRefine = pending;
+		this._compactAutoRefinePending = true;
+		if (delayMs === undefined) return;
+		if (this._pendingConcurrentCompactionRefineTimer) {
+			clearTimeout(this._pendingConcurrentCompactionRefineTimer);
+			this._scheduledAutoRefineTimers.delete(this._pendingConcurrentCompactionRefineTimer);
+		}
+		const branchVersion = this._autoRefineBranchVersion;
+		const timer = setTimeout(
+			() => {
+				this._scheduledAutoRefineTimers.delete(timer);
+				if (this._pendingConcurrentCompactionRefineTimer === timer) {
+					this._pendingConcurrentCompactionRefineTimer = undefined;
+				}
+				if (
+					branchVersion !== this._autoRefineBranchVersion ||
+					this._pendingConcurrentCompactionRefine !== pending
+				) {
+					return;
+				}
+				this._pendingConcurrentCompactionRefine = undefined;
+				this._compactAutoRefinePending = false;
+				this._trackAutoRefineOperation(this._maybeAutoRefine("compact", pending));
+			},
+			Math.max(0, delayMs),
+		);
+		this._pendingConcurrentCompactionRefineTimer = timer;
+		this._scheduledAutoRefineTimers.add(timer);
+	}
+
 	private _scheduleDeferredAutoRefineIfIdle(): void {
 		if (this._autoRefineInProgress || this._shouldSkipAutoRefineForActiveAgent() || this._pendingAutoRefineReview) {
+			return;
+		}
+		if (this._pendingConcurrentCompactionRefine) {
+			this._schedulePendingConcurrentCompactionRefine(this._pendingConcurrentCompactionRefine, 0);
 			return;
 		}
 		if (this._turnIntervalAutoRefinePending) {
@@ -6816,12 +6911,8 @@ export class AgentSession {
 	private _scheduleAutoRefine(reason: AutoRefineReason, branchVersion = this._autoRefineBranchVersion): void {
 		const timer = setTimeout(() => {
 			this._scheduledAutoRefineTimers.delete(timer);
-			if (branchVersion !== this._autoRefineBranchVersion) {
-				return;
-			}
-			const operation = this._maybeAutoRefine(reason);
-			this._autoRefineOperations.add(operation);
-			void operation.finally(() => this._autoRefineOperations.delete(operation)).catch(() => undefined);
+			if (branchVersion !== this._autoRefineBranchVersion) return;
+			this._trackAutoRefineOperation(this._maybeAutoRefine(reason));
 		}, 0);
 		this._scheduledAutoRefineTimers.add(timer);
 	}
@@ -6833,13 +6924,14 @@ export class AgentSession {
 		});
 		let settled = false;
 		const trajectoryMessages = [...this.agent.state.messages];
-		const operation = this._maybeAutoRefine("compact", { trajectoryMessages, applyGate });
-		this._autoRefineOperations.add(operation);
-		void operation.finally(() => this._autoRefineOperations.delete(operation)).catch(() => undefined);
+		const commitState: { value?: boolean } = {};
+		const operation = this._maybeAutoRefine("compact", { trajectoryMessages, applyGate, commitState });
+		this._trackAutoRefineOperation(operation);
 		return {
 			settle: (committed) => {
 				if (settled) return;
 				settled = true;
+				commitState.value = committed;
 				resolveApplyGate(committed);
 			},
 		};
@@ -6847,11 +6939,9 @@ export class AgentSession {
 
 	private async _maybeAutoRefine(
 		reason: AutoRefineReason,
-		concurrentCompaction?: {
-			trajectoryMessages: readonly AgentMessage[];
-			applyGate: Promise<boolean>;
-		},
+		concurrentCompaction?: ConcurrentCompactionRefine,
 	): Promise<void> {
+		if (concurrentCompaction?.commitState.value === false) return;
 		if (this._disposed || this._disposing) {
 			this._discardPendingAutoRefine();
 			return;
@@ -6867,12 +6957,12 @@ export class AgentSession {
 			return;
 		}
 		if (this._autoRefineInProgress || (!concurrentCompaction && this._shouldSkipAutoRefineForActiveAgent())) {
-			if (!concurrentCompaction) {
-				if (reason === "compact") {
-					this._compactAutoRefinePending = true;
-				} else {
-					this._turnIntervalAutoRefinePending = true;
-				}
+			if (concurrentCompaction) {
+				this._schedulePendingConcurrentCompactionRefine(concurrentCompaction);
+			} else if (reason === "compact") {
+				this._compactAutoRefinePending = true;
+			} else {
+				this._turnIntervalAutoRefinePending = true;
 			}
 			return;
 		}
@@ -6883,7 +6973,13 @@ export class AgentSession {
 
 		const pendingReview = this._pendingAutoRefineReview;
 		if (pendingReview) {
-			if (underCooldown) return;
+			if (underCooldown) {
+				if (concurrentCompaction) {
+					const remaining = Math.max(0, settings.cooldownMs - (nowMs - this._lastAutoRefineReviewAt));
+					this._schedulePendingConcurrentCompactionRefine(concurrentCompaction, remaining);
+				}
+				return;
+			}
 			await this._runApprovedRefine(pendingReview.reason, pendingReview.review, concurrentCompaction);
 			return;
 		}
@@ -6895,13 +6991,21 @@ export class AgentSession {
 		}
 		if (reason === "turn_interval" && this._assistantTurnsSinceAutoRefine < settings.turnInterval) return;
 		if (underCooldown) {
-			if (!concurrentCompaction) {
-				if (reason === "compact") this._compactAutoRefinePending = true;
-				else this._turnIntervalAutoRefinePending = true;
+			if (concurrentCompaction) {
+				const remaining = Math.max(0, settings.cooldownMs - (nowMs - this._lastAutoRefineReviewAt));
+				this._schedulePendingConcurrentCompactionRefine(concurrentCompaction, remaining);
+			} else if (reason === "compact") {
+				this._compactAutoRefinePending = true;
+			} else {
+				this._turnIntervalAutoRefinePending = true;
 			}
 			return;
 		}
 		if (reason === "turn_interval") this._turnIntervalAutoRefinePending = false;
+		if (concurrentCompaction && this._pendingConcurrentCompactionRefine === concurrentCompaction) {
+			this._pendingConcurrentCompactionRefine = undefined;
+			this._compactAutoRefinePending = false;
+		}
 		if (!this.model) {
 			if (reason === "compact" && !concurrentCompaction) this._compactAutoRefinePending = true;
 			return;
@@ -6987,10 +7091,7 @@ export class AgentSession {
 	private async _runApprovedRefine(
 		reason: AutoRefineReason,
 		review: AutoRefineReview,
-		concurrentCompaction?: {
-			trajectoryMessages: readonly AgentMessage[];
-			applyGate: Promise<boolean>;
-		},
+		concurrentCompaction?: ConcurrentCompactionRefine,
 	): Promise<void> {
 		this._autoRefineInProgress = true;
 		try {
@@ -7136,22 +7237,18 @@ export class AgentSession {
 			}
 		}
 
-		if (internal.applyGate && !(await internal.applyGate)) {
-			if (this._refineAbortController === refineAbort) {
-				this._refineAbortController = undefined;
-			}
-			this._scheduleSessionInputPump();
-			throw new CompactionRefinementDiscardedError("Compaction did not commit; refinement plan discarded");
-		}
-
-		// Block new turns before waiting for the current turn to finish. One shared
-		// settled promise covers the full transition and apply critical section.
+		// Claim the apply-serialization marker before waiting on a compaction gate.
+		// Otherwise another public refine can plan and enter apply while this plan
+		// is parked between planning and its commit decision.
 		let resolveApplySettled: () => void = () => {};
 		const applySettled = new Promise<void>((resolve) => {
 			resolveApplySettled = resolve;
 		});
 		this._refineInFlight = applySettled;
 		try {
+			if (internal.applyGate && !(await internal.applyGate)) {
+				throw new CompactionRefinementDiscardedError("Compaction did not commit; refinement plan discarded");
+			}
 			// Wait for the session to become quiescent before applying. Planning is
 			// allowed to overlap active user work, but application must not disconnect
 			// event handling until that work and its queued events have completed.
@@ -7181,6 +7278,9 @@ export class AgentSession {
 			resolveApplySettled();
 			if (this._refineInFlight === applySettled) {
 				this._refineInFlight = undefined;
+			}
+			if (this._refineAbortController === refineAbort) {
+				this._refineAbortController = undefined;
 			}
 			this._scheduleSessionInputPump();
 		}
