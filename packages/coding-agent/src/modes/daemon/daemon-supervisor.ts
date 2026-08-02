@@ -296,6 +296,8 @@ class SupervisorRecoveryCancelledError extends Error {
 	readonly code = "supervisor_recovery_cancelled" as const;
 }
 
+class SnapshotLoadInvalidatedError extends Error {}
+
 function isSupervisorGenerationStale(error: unknown): boolean {
 	return (
 		typeof error === "object" &&
@@ -2841,32 +2843,73 @@ export class DaemonSupervisor {
 		}
 		if (!result) {
 			const snapshotLoadKey = `${activeSessionId}:${client.capabilities.has("chunked_snapshot") ? "chunked" : "full"}`;
-			let loading = match.worker.snapshotLoads.get(snapshotLoadKey);
-			if (!loading) {
-				const observedSnapshotId =
-					match.worker.transcriptCaches.get(activeSessionId)?.snapshotId ??
-					match.worker.snapshotCache.get(activeSessionId)?.snapshotStream?.id;
-				loading = (async () => {
-					if (!match.worker.client) {
-						throw new Error("Session worker is not connected");
+			let retryInvalidatedLoad = true;
+			while (!result) {
+				let loading = match.worker.snapshotLoads.get(snapshotLoadKey);
+				if (!loading) {
+					const observedSnapshotId =
+						match.worker.transcriptCaches.get(activeSessionId)?.snapshotId ??
+						match.worker.snapshotCache.get(activeSessionId)?.snapshotStream?.id;
+					loading = (async () => {
+						if (!match.worker.client) {
+							throw new Error("Session worker is not connected");
+						}
+						const response = await match.worker.client.request({
+							type: "attach",
+							activeSessionId,
+							capabilities: client.capabilities.has("chunked_snapshot")
+								? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
+								: ["attach_snapshot", "event_sequence", "slim_attach"],
+							supportsExtensionUi: false,
+							env: command.env ?? collectDaemonClientEnv(),
+						});
+						const loaded = attachResultFromResponse(response);
+						if (match.worker.snapshotLoads.get(snapshotLoadKey) !== loading) {
+							throw new SnapshotLoadInvalidatedError("Session snapshot changed during attach");
+						}
+						return this.cacheLoadedSnapshot(match.worker, activeSessionId, loaded, observedSnapshotId);
+					})();
+					match.worker.snapshotLoads.set(snapshotLoadKey, loading);
+					void loading.then(
+						async (loaded) => {
+							try {
+								const snapshotId = loaded.snapshotStream?.id;
+								const transcript = snapshotId
+									? this.snapshotGeneration(match.worker, loaded.activeSessionId, snapshotId)?.transcript
+									: undefined;
+								if (transcript && !transcript.complete) {
+									let chunkIndex = 0;
+									while (await transcript.waitForChunk(chunkIndex)) {
+										chunkIndex++;
+									}
+								}
+							} catch {
+								// Failed transfers must allow a fresh snapshot request.
+							} finally {
+								if (match.worker.snapshotLoads.get(snapshotLoadKey) === loading) {
+									match.worker.snapshotLoads.delete(snapshotLoadKey);
+								}
+							}
+						},
+						() => {
+							if (match.worker.snapshotLoads.get(snapshotLoadKey) === loading) {
+								match.worker.snapshotLoads.delete(snapshotLoadKey);
+							}
+						},
+					);
+				}
+				try {
+					result = await loading;
+				} catch (error) {
+					if (!(error instanceof SnapshotLoadInvalidatedError)) {
+						throw error;
 					}
-					const response = await match.worker.client.request({
-						type: "attach",
-						activeSessionId,
-						capabilities: client.capabilities.has("chunked_snapshot")
-							? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
-							: ["attach_snapshot", "event_sequence", "slim_attach"],
-						supportsExtensionUi: false,
-						env: command.env ?? collectDaemonClientEnv(),
-					});
-					const loaded = attachResultFromResponse(response);
-					return this.cacheLoadedSnapshot(match.worker, activeSessionId, loaded, observedSnapshotId);
-				})().finally(() => {
-					match.worker.snapshotLoads.delete(snapshotLoadKey);
-				});
-				match.worker.snapshotLoads.set(snapshotLoadKey, loading);
+					if (!retryInvalidatedLoad) {
+						throw error;
+					}
+					retryInvalidatedLoad = false;
+				}
 			}
-			result = await loading;
 		}
 		const wasAttached = client.attachedActiveSessionIds.has(activeSessionId);
 		let transcript: SnapshotTranscriptCache | undefined;
@@ -3645,6 +3688,8 @@ export class DaemonSupervisor {
 		if (!transcriptChanged) {
 			return;
 		}
+		worker.snapshotLoads.delete(`${activeSessionId}:chunked`);
+		worker.snapshotLoads.delete(`${activeSessionId}:full`);
 		const transcript = worker.transcriptCaches.get(activeSessionId);
 		if (transcript) {
 			this.retireWorkerSnapshotCache(worker, activeSessionId, transcript);

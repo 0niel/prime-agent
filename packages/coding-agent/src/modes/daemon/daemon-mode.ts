@@ -3913,6 +3913,16 @@ export class AgentDaemon {
 			transcript.dispose?.();
 			return;
 		}
+		client.snapshotTransferTails ??= new Map();
+		const previousTransfer = client.snapshotTransferTails.get(result.activeSessionId);
+		let finishTransfer!: () => void;
+		const transfer = new Promise<void>((resolve) => {
+			finishTransfer = resolve;
+		});
+		client.snapshotTransferTails.set(result.activeSessionId, transfer);
+		if (previousTransfer) {
+			await previousTransfer;
+		}
 		const { messages: _messages, ...snapshot } = result.snapshot;
 		const snapshotBegin: DaemonOutbound = {
 			type: "session_snapshot_begin",
@@ -4021,6 +4031,10 @@ export class AgentDaemon {
 			await deliverSnapshotFailure(streamError);
 			throw streamError;
 		} finally {
+			finishTransfer();
+			if (client.snapshotTransferTails.get(result.activeSessionId) === transfer) {
+				client.snapshotTransferTails.delete(result.activeSessionId);
+			}
 			finishClientSnapshotStreaming(client, result.activeSessionId);
 			transcript.dispose?.();
 			if (!client.snapshotStreaming && client.catchupActiveSessionIds?.size) {

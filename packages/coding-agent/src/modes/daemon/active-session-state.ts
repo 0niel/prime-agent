@@ -22,6 +22,7 @@ export interface DaemonSocketClient {
 	snapshotActiveSessionIds?: Set<string>;
 	snapshotActiveSessionCounts?: Map<string, number>;
 	snapshotTransferAbortControllers?: Map<string, AbortController>;
+	snapshotTransferTails?: Map<string, Promise<void>>;
 	detachInput: () => void;
 	supportsExtensionUi: boolean;
 	capabilities: Set<DaemonClientCapability>;
