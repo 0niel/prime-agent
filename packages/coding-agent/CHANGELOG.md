@@ -4,6 +4,7 @@
 
 - Changed subagent guidance to retain reusable children and delete completed direct children once they are no longer needed.
 - Fixed compaction retaining runtime resources after an explicitly deleted subagent had a transient cleanup failure.
+- Fixed long-running thinking timers to display hours and days instead of unbounded minutes.
 
 ## [0.4.0] - 2026-08-01
 
