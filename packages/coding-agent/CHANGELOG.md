@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Changed top-level CLI help and documentation to expose autonomous mode, quality gates, and their limits.
 - Fixed long-running thinking timers to display hours and days instead of unbounded minutes.
 
 ## [0.4.0] - 2026-08-01
