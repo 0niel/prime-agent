@@ -2334,7 +2334,7 @@ export class AgentsViewMode implements Component, Focusable {
 			? this.getPendingDeleteTitle()
 			: pendingKill
 				? `${keyText("app.agents.delete")} again to stop`
-				: row.title;
+				: styleRowTitle(row);
 		// Append the background summary as a dim suffix on the same line, e.g.
 		// "fix auth · Refactoring token validation". Hidden during delete/stop
 		// confirmations so the warning text stands alone.
@@ -2377,7 +2377,13 @@ export class AgentsViewMode implements Component, Focusable {
 		if (code) {
 			return theme.bg("toolPanelBg", padded);
 		}
-		return selected ? theme.getSelectionBackgroundColor()(padded) : padded;
+		if (!selected) {
+			return padded;
+		}
+		// Truncating styled cells embeds full \x1b[0m resets; re-open the
+		// selection background after each so the highlight spans the whole row.
+		const applySelectionBg = theme.getSelectionBackgroundColor();
+		return padded.split("\x1b[0m").map(applySelectionBg).join("\x1b[0m");
 	}
 
 	private isPendingDeleteRow(row: AgentsViewRow): boolean {
@@ -2575,6 +2581,18 @@ function rowHasSpawnCode(row: AgentsViewRow): boolean {
 
 function isRunningSessionSummary(summary: SessionSummary): boolean {
 	return summary.activity === "working";
+}
+
+// Explicit session names read bold so they stand out from fallback titles
+// (first prompt, cwd, ids); the "(no messages)" placeholder reads italic.
+function styleRowTitle(row: AgentsViewRow): string {
+	if (row.summary.sessionName?.replace(/\s+/g, " ").trim()) {
+		return theme.bold(row.title);
+	}
+	if (row.title === "(no messages)") {
+		return theme.italic(row.title);
+	}
+	return row.title;
 }
 
 function formatTableCell(value: string, width: number): string {
