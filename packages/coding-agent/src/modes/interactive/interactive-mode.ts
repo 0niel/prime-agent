@@ -3281,6 +3281,7 @@ export class InteractiveMode {
 		}
 		this.featureHintComponent = new FeatureHintComponent(this.currentFeatureHint);
 		this.featureHintContainer.addChild(this.featureHintComponent);
+		this.renderRecap();
 		this.featureHintAnimationTimer = setInterval(() => {
 			this.featureHintComponent?.advance();
 			this.ui.requestRender();
@@ -3301,6 +3302,7 @@ export class InteractiveMode {
 		if (this.featureHintComponent) {
 			this.featureHintContainer.removeChild(this.featureHintComponent);
 			this.featureHintComponent = undefined;
+			this.renderRecap();
 		}
 	}
 
@@ -3594,7 +3596,7 @@ export class InteractiveMode {
 		if (recap) {
 			this.recapContainer.addChild(new TruncatedText(theme.fg("dim", `Recap: ${recap}`), 1, 0));
 		}
-		if (recap || showChanges) {
+		if ((recap || showChanges) && !this.featureHintComponent) {
 			this.recapContainer.addChild(new Spacer(1));
 		}
 		this.ui.requestRender();
