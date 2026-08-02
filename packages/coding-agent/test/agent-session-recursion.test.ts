@@ -114,6 +114,7 @@ interface InspectableRlmSession {
 	_retainedRlmChildSessions: Map<string, AgentSession>;
 	_retainedRlmChildUnsubscribes: Map<string, () => void>;
 	_createKernelHostHandlers(): HostRequestHandlers;
+	_reapDeletedRlmSubagentRuntimesAfterCompaction(): Promise<void>;
 }
 
 interface KernelPumpTestApi {
@@ -1206,7 +1207,7 @@ describe("AgentSession rlm recursion", () => {
 		expect(deleteRuntime).toHaveBeenCalledTimes(1);
 		expect(disposeHostedChild).not.toHaveBeenCalled();
 
-		await expect(root.deleteRlmSubagent("starting-worker")).resolves.toEqual({ subagent: starting });
+		await internals._reapDeletedRlmSubagentRuntimesAfterCompaction();
 		expect(deleteRuntime).toHaveBeenCalledTimes(2);
 		expect(disposeHostedChild).toHaveBeenCalledOnce();
 		expect(internals._retryableRlmSubagentDeletions.size).toBe(0);
