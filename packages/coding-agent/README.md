@@ -596,6 +596,23 @@ Available built-in tools: `ipython`
 
 Combine `--no-*` with explicit flags to load exactly what you need, ignoring settings.json (e.g., `--no-extensions -e ./my-ext.ts`).
 
+### Autonomous Options
+
+Autonomous mode is disabled by default. `--autonomous` or any of its sub-options enables host-managed continuations for unattended work.
+
+| Option | Description |
+|--------|-------------|
+| `--autonomous` | Continue until gates pass or a limit prevents another continuation |
+| `--autonomous-gate <command>` | Add a repeatable shell command that must pass before completion |
+| `--autonomous-gate-retries <n>` | Positive per-gate retry limit; default `3` |
+| `--autonomous-gate-timeout-ms <n>` | Positive per-gate timeout in milliseconds; default `300000` |
+| `--autonomous-max-continuations <n>` | Positive host follow-up limit; default `3` |
+| `--autonomous-max-turns <n>` | Positive assistant-turn limit; default `12` |
+| `--autonomous-max-tokens <n>` | Positive token limit; default `80000` |
+| `--autonomous-timeout-ms <n>` | Positive wall-clock limit in milliseconds; default `1800000` |
+
+Gates run before the continuation, turn, token, and wall-clock limits are evaluated; every configured gate must pass for autonomous completion. See the [usage guide](docs/usage.md#autonomous-options) for validation rules, retry behavior, and detailed limit interactions.
+
 ### Other Options
 
 | Option | Description |
