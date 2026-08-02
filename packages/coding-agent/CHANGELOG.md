@@ -5,7 +5,9 @@
 - Changed compaction to keep old message payloads on disk instead of retaining them indefinitely in session memory.
 - Changed large daemon session loads to stream JSONL history and avoid retaining a second full-file copy in memory.
 - Changed subagent guidance to retain reusable children and delete completed direct children once they are no longer needed.
+- Changed top-level CLI help and documentation to expose autonomous mode, quality gates, and their limits.
 - Fixed compaction retaining runtime resources after an explicitly deleted subagent had a transient cleanup failure.
+- Fixed long-running thinking timers to display hours and days instead of unbounded minutes.
 
 ## [0.4.0] - 2026-08-01
 
