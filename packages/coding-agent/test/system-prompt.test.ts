@@ -413,6 +413,9 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("Successful subagent sessions remain in that registry");
 		expect(prompt).toContain("current parent session remains open");
 		expect(prompt).toContain("retained children close when their parent session closes");
+		expect(prompt).toContain(
+			"Retain a completed direct child when it may be reused; once it is definitively no longer needed, delete it with `await rlm.delete_subagent(child)`.",
+		);
 		expect(prompt).toContain("agent_message.send");
 		expect(prompt).toContain("agent_message.send(child.session_name");
 		expect(prompt).toContain("readable, unique default `session_name`");
