@@ -2,7 +2,7 @@
  * Local test harness for the new coding-agent test suite.
  */
 
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
@@ -98,6 +98,49 @@ function createTempDir(): string {
 	const tempDir = join(tmpdir(), `pi-suite-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	mkdirSync(tempDir, { recursive: true });
 	return tempDir;
+}
+
+const REMOVABLE_RACE_CODES = new Set(["EBUSY", "EEXIST", "ENOTEMPTY", "EPERM"]);
+
+function sleepSync(milliseconds: number): void {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+
+function describeRemainingEntries(path: string): string {
+	try {
+		const entries = readdirSync(path, { recursive: true }) as string[];
+		const listed = entries.slice(0, 20).join(", ");
+		return entries.length > 20 ? `${listed}, … (${entries.length} entries)` : listed;
+	} catch {
+		return "unreadable";
+	}
+}
+
+/**
+ * Remove a temp directory that spawned fixture processes may still be writing into.
+ *
+ * `rmSync` enumerates a directory's children once and then only retries the final
+ * `rmdir`, so a registry write that lands after that enumeration fails the removal
+ * no matter how large `maxRetries` is. Re-run the whole removal instead, so every
+ * attempt re-enumerates, until the directory is gone or the deadline passes.
+ */
+function removeTempDir(path: string, timeoutMs = 30_000): void {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		try {
+			rmSync(path, { recursive: true, force: true, maxRetries: 2, retryDelay: 25 });
+			return;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (!code || !REMOVABLE_RACE_CODES.has(code) || Date.now() >= deadline) {
+				throw new Error(
+					`Failed to remove ${path} (${code ?? "unknown"}); remaining: ${describeRemainingEntries(path)}`,
+					{ cause: error },
+				);
+			}
+			sleepSync(25);
+		}
+	}
 }
 
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
@@ -223,8 +266,9 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			fauxProvider.unregister();
 			if (existsSync(tempDir)) {
 				// Spawned fixture processes may still be flushing their final registry
-				// writes; retry briefly instead of failing the suite on ENOTEMPTY.
-				rmSync(tempDir, { recursive: true, force: true, maxRetries: 40, retryDelay: 50 });
+				// writes, so re-enumerate on every attempt instead of failing the suite
+				// on the ENOTEMPTY that a single late write would otherwise cause.
+				removeTempDir(tempDir);
 			}
 		},
 	};
