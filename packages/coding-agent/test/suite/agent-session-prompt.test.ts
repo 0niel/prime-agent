@@ -61,15 +61,17 @@ describe("AgentSession prompt characterization", () => {
 		pause.release();
 	});
 
-	it("releases direct-turn admission when cancellation lands immediately after acquisition", async () => {
+	it("releases action admission when cancellation lands immediately after acquisition", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const controller = new AbortController();
 		const internals = harness.session as unknown as {
-			_acquireDirectTurnAdmission(options?: { signal?: AbortSignal }): Promise<{ owner: object; release(): void }>;
+			_acquireSessionActionAdmission(options?: {
+				signal?: AbortSignal;
+			}): Promise<{ owner: object; release(): void }>;
 		};
-		const acquire = internals._acquireDirectTurnAdmission.bind(internals);
-		internals._acquireDirectTurnAdmission = async (options) => {
+		const acquire = internals._acquireSessionActionAdmission.bind(internals);
+		internals._acquireSessionActionAdmission = async (options) => {
 			const admission = await acquire(options);
 			controller.abort();
 			return admission;
@@ -80,13 +82,13 @@ describe("AgentSession prompt characterization", () => {
 		);
 		expect(getUserTexts(harness)).toEqual([]);
 
-		internals._acquireDirectTurnAdmission = acquire;
+		internals._acquireSessionActionAdmission = acquire;
 		harness.setResponses([fauxAssistantMessage("recovered")]);
 		await harness.session.prompt("second");
 		expect(getUserTexts(harness)).toEqual(["second"]);
 	});
 
-	it("releases direct-turn admission when ownership commit throws", async () => {
+	it("releases action admission when ownership commit throws", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const commitError = new Error("commit failed");
@@ -141,6 +143,66 @@ describe("AgentSession prompt characterization", () => {
 		expect(harness.session.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
 		expect(getMessageText(harness.session.messages[0]!)).toBe("hi");
 		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(harness.eventsOfType("queue_update")).toEqual([]);
+	});
+
+	it("admits concurrent idle prompts in FIFO order without exposing queue rows", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const firstResponse = createDeferred();
+		const secondResponse = createDeferred();
+		harness.setResponses([
+			async () => {
+				await firstResponse.promise;
+				return fauxAssistantMessage("first done");
+			},
+			async () => {
+				await secondResponse.promise;
+				return fauxAssistantMessage("second done");
+			},
+		]);
+
+		const first = harness.session.prompt("first");
+		let secondSettled = false;
+		const second = harness.session.prompt("second").then(() => {
+			secondSettled = true;
+		});
+
+		await vi.waitFor(() => expect(harness.session.isStreaming).toBe(true));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(secondSettled).toBe(false);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.session.pendingMessageCount).toBe(0);
+
+		firstResponse.resolve();
+		await vi.waitFor(() => expect(getUserTexts(harness)).toEqual(["first", "second"]));
+		expect(secondSettled).toBe(false);
+		secondResponse.resolve();
+		await Promise.all([first, second]);
+	});
+
+	it("admits reentrant hook prompts without deadlocking the active action", async () => {
+		let submitted = false;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async () => {
+						if (submitted) return;
+						submitted = true;
+						await harness.session.promptUntilAccepted("from hook", {
+							expandPromptTemplates: false,
+						});
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("outer done"), fauxAssistantMessage("hook done")]);
+
+		await harness.session.prompt("outer");
+		await harness.session.waitForIdle();
+
+		expect(getUserTexts(harness)).toEqual(["outer", "from hook"]);
 	});
 
 	it("handles a tool call turn and waits for the follow-up LLM response", async () => {
@@ -995,47 +1057,6 @@ stale post-hook extension instructions`,
 		expect(sawRestoredContext).toBe(true);
 	});
 
-	it("allows normal prompts while an accepted agent message is idle between retry attempts", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const acceptedMessage = {
-			role: "user" as const,
-			content: [{ type: "text" as const, text: "accepted agent message" }],
-			timestamp: Date.now(),
-		};
-		const sessionInternals = harness.session as unknown as {
-			_acceptedAgentMessagePrompt?: {
-				text: string;
-				agentMessageId: string;
-				message: typeof acceptedMessage;
-				messages: Set<typeof acceptedMessage>;
-				pendingNextTurnMessages: unknown[];
-				accepted: Promise<void>;
-				resolveAccepted: () => void;
-				rejectAccepted: (error: Error) => void;
-				turnStarted: boolean;
-				cleared: boolean;
-			};
-		};
-		harness.setResponses([fauxAssistantMessage("ordinary response")]);
-
-		sessionInternals._acceptedAgentMessagePrompt = {
-			text: "accepted agent message",
-			agentMessageId: "agentmsg_in_flight",
-			message: acceptedMessage,
-			messages: new Set([acceptedMessage]),
-			pendingNextTurnMessages: [],
-			accepted: Promise.resolve(),
-			resolveAccepted: () => {},
-			rejectAccepted: () => {},
-			turnStarted: true,
-			cleared: false,
-		};
-		await expect(harness.session.prompt("ordinary prompt")).resolves.toBeUndefined();
-		sessionInternals._acceptedAgentMessagePrompt = undefined;
-		expect(getUserTexts(harness)).toContain("ordinary prompt");
-	});
-
 	it("flushes pending bash messages before accepted agent messages", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -1197,6 +1218,49 @@ stale post-hook extension instructions`,
 		await harness.session.prompt("normal prompt");
 
 		expect(sawCustomMessage).toBe(true);
+	});
+
+	it("does not restore durable nextTurn context after partial agent-message delivery", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await harness.session.sendCustomMessage(
+			{ customType: "partial-next-turn", content: "deliver once", display: true, details: {} },
+			{ deliverAs: "nextTurn" },
+		);
+		const agentPrompt =
+			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_partial_delivery\n\nagent text";
+		const unsubscribe = harness.session.agent.subscribe((event) => {
+			if (
+				event.type === "message_start" &&
+				event.message.role === "user" &&
+				getMessageText(event.message) === agentPrompt
+			) {
+				throw new Error("fail after nextTurn delivery");
+			}
+		});
+
+		await expect(
+			harness.session.acceptAgentMessagePrompt(agentPrompt, { expandPromptTemplates: false }),
+		).resolves.toBeUndefined();
+		unsubscribe();
+		await harness.session.waitForIdle();
+
+		expect(harness.session.getPendingNextTurnMessageSnapshots()).toEqual([]);
+		expect(
+			harness.session.messages.filter(
+				(message) => message.role === "custom" && message.customType === "partial-next-turn",
+			),
+		).toHaveLength(1);
+
+		let contextCopies = 0;
+		harness.setResponses([
+			(context) => {
+				contextCopies = context.messages.filter((message) => getMessageText(message) === "deliver once").length;
+				return fauxAssistantMessage("done");
+			},
+		]);
+		await harness.session.prompt("normal prompt");
+		expect(contextCopies).toBe(1);
 	});
 
 	it("promptAndWait queued behind an active turn stays pending through its own completion", async () => {
@@ -1396,6 +1460,30 @@ stale post-hook extension instructions`,
 		await prompt;
 		unsubscribe();
 	});
+	it("promptUntilAccepted waits for delivery but not turn completion", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const responseGate = createDeferred();
+		harness.setResponses([
+			async () => {
+				await responseGate.promise;
+				return fauxAssistantMessage("done");
+			},
+		]);
+		let delivered = false;
+		const unsubscribe = harness.session.agent.subscribe((event) => {
+			if (event.type === "message_start" && event.message.role === "user") delivered = true;
+		});
+
+		await harness.session.promptUntilAccepted("accepted prompt");
+
+		expect(delivered).toBe(true);
+		expect(harness.session.isStreaming).toBe(true);
+		responseGate.resolve();
+		await harness.session.waitForIdle();
+		unsubscribe();
+	});
+
 	it("promptUntilAccepted returns at ownership commit without draining queued work", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -1614,6 +1702,34 @@ stale post-hook extension instructions`,
 		unsubscribe();
 	});
 
+	it("cancels an invisible idle prompt aborted during preparation", async () => {
+		const preparationReached = createDeferred();
+		const preparationGate = createDeferred();
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async () => {
+						preparationReached.resolve();
+						await preparationGate.promise;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		const prompt = harness.session.prompt("aborted prompt");
+		await preparationReached.promise;
+
+		const abort = harness.session.abort();
+		preparationGate.resolve();
+		await abort;
+
+		await expect(prompt).rejects.toThrow("Prompt aborted before delivery.");
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: [] });
+		await harness.session.prompt("next prompt");
+		expect(getUserTexts(harness)).toEqual(["next prompt"]);
+	});
+
 	it("aborts while a queued prompt is still preparing without consuming its snapshot", async () => {
 		const preparationReached = createDeferred();
 		const preparationGate = createDeferred();
@@ -1661,12 +1777,6 @@ stale post-hook extension instructions`,
 		harness.setResponses([fauxAssistantMessage("done")]);
 		const prompt = harness.session.prompt("pending extension event");
 		await extensionReached.promise;
-		const checkpointInternals = harness.session as unknown as {
-			_activeSessionInput?: unknown;
-			_directPromptSectionCount: number;
-		};
-		expect(checkpointInternals._activeSessionInput).toBeUndefined();
-		expect(checkpointInternals._directPromptSectionCount).toBe(0);
 		const eventQueue = (harness.session as unknown as { _agentEventQueue: Promise<void> })._agentEventQueue;
 		let queueDrained = false;
 		void eventQueue.then(() => {
@@ -1702,7 +1812,7 @@ stale post-hook extension instructions`,
 		expect(flushNow).not.toHaveBeenCalled();
 	});
 
-	it("releases the direct prompt section when an injected dispatch fails", async () => {
+	it("releases the injected action checkpoint when dispatch fails", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const internals = harness.session as unknown as {
@@ -1735,7 +1845,7 @@ stale post-hook extension instructions`,
 		await expect(harness.session.waitForSessionInputCheckpoint(AbortSignal.timeout(1000))).resolves.toBeUndefined();
 	});
 
-	it("releases the direct prompt section when an ordinary dispatch fails", async () => {
+	it("releases the prompt action checkpoint when dispatch fails", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		vi.spyOn(harness.session.agent, "prompt").mockRejectedValue(new Error("dispatch failed"));
@@ -1755,8 +1865,20 @@ stale post-hook extension instructions`,
 	it("throws when prompting without configured auth", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
+		const surfacedErrors: string[] = [];
+		harness.session.bindExtensions({ onError: (error) => surfacedErrors.push(error.error) });
 
 		await expect(harness.session.prompt("hi")).rejects.toThrow(
+			`No API key found for ${harness.getModel().provider}.`,
+		);
+		expect(surfacedErrors).toEqual([]);
+	});
+
+	it("rejects promptUntilAccepted when validation fails", async () => {
+		const harness = await createHarness({ withConfiguredAuth: false });
+		harnesses.push(harness);
+
+		await expect(harness.session.promptUntilAccepted("hi")).rejects.toThrow(
 			`No API key found for ${harness.getModel().provider}.`,
 		);
 	});
@@ -1841,10 +1963,6 @@ stale post-hook extension instructions`,
 		expect(persistedAfter).toBe(persistedBefore);
 		expect(getUserTexts(harness)).not.toContain(clearedAgentPrompt);
 		expect(harness.session.agent.state.errorMessage).toBeUndefined();
-		expect(
-			(harness.session as unknown as { _acceptedAgentMessagePrompt?: unknown })._acceptedAgentMessagePrompt,
-		).toBeUndefined();
-
 		harness.setResponses([fauxAssistantMessage("clean after")]);
 		await harness.session.prompt("normal prompt");
 		expect(getAssistantTexts(harness)).toContain("clean after");

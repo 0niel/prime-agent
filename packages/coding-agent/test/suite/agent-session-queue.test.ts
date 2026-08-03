@@ -1415,6 +1415,73 @@ describe("AgentSession queue characterization", () => {
 		expect(getUserTexts(harness)).toEqual(["first heartbeat", "second heartbeat"]);
 	});
 
+	it("does not reclaim a handed-off action before its delivery event", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("delivered")]);
+		const dispatchGate = createDeferred();
+		const promptCalled = createDeferred();
+		const originalPrompt = harness.session.agent.prompt.bind(harness.session.agent);
+		const promptSpy = vi
+			.spyOn(harness.session.agent, "prompt")
+			.mockImplementation(async (messages: Parameters<typeof originalPrompt>[0]) => {
+				promptSpy.mockRestore();
+				promptCalled.resolve();
+				await dispatchGate.promise;
+				return originalPrompt(messages);
+			});
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("handed off", undefined, { resumeIfIdle: true });
+		pause.release();
+		await promptCalled.promise;
+
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: [] });
+		dispatchGate.resolve();
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual(["handed off"]);
+		expect(getAssistantTexts(harness)).toEqual(["delivered"]);
+	});
+
+	it("does not cancel one action from a handed-off batch", async () => {
+		const firstPrompt = agentPromptText("agentmsg_batch_first", "first");
+		const secondPrompt = agentPromptText("agentmsg_batch_second", "second");
+		let cancelSecond: (() => void) | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_start", (event) => {
+						if (event.message.role === "user" && getMessageText(event.message) === firstPrompt) {
+							cancelSecond?.();
+						}
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.session.setFollowUpMode("all");
+		harness.setResponses([fauxAssistantMessage("shared response")]);
+		let cleared: { steering: string[]; followUp: string[] } | undefined;
+		cancelSecond = () => {
+			cleared = harness.session.clearQueuedUserMessagesMatching((text) => text === secondPrompt);
+		};
+
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.queueAgentMessagePrompt(firstPrompt, "followUp");
+		await harness.session.queueAgentMessagePrompt(secondPrompt, "followUp");
+		pause.release();
+		await harness.session.waitForIdle();
+
+		expect(cleared).toEqual({ steering: [], followUp: [] });
+		expect(getUserTexts(harness)).toEqual([firstPrompt, secondPrompt]);
+		expect(getAssistantTexts(harness)).toEqual(["shared response"]);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "message")
+				.map((entry) => getMessageText(entry.message)),
+		).toContain("shared response");
+	});
+
 	it("keeps cleared prompts out of the handoff snapshot during the refine wait", async () => {
 		let sessionInternals: { _refineInFlight?: Promise<void> };
 		let clearDuringRefineWait: (() => void) | undefined;
@@ -1457,6 +1524,49 @@ describe("AgentSession queue characterization", () => {
 
 		expect(cleared).toEqual({ steering: [], followUp: [clearedAgentMessage] });
 		expect(getUserTexts(harness)).toEqual(["kept"]);
+	});
+
+	it("delivers next-turn context when the first preparing turn is cancelled", async () => {
+		const firstPrompt = agentPromptText("agentmsg_cancel_first", "cancelled");
+		let cancelFirst: (() => void) | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", () => {
+						cancelFirst?.();
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.session.setFollowUpMode("all");
+		let cleared: { steering: string[]; followUp: string[] } | undefined;
+		cancelFirst = () => {
+			cleared = harness.session.clearQueuedUserMessagesMatching((text) => text === firstPrompt);
+		};
+		let sawNextTurnContext = false;
+		harness.setResponses([
+			(context) => {
+				sawNextTurnContext = context.messages.some(
+					(message) => message.role === "user" && getMessageText(message) === "carry this",
+				);
+				return fauxAssistantMessage("done");
+			},
+		]);
+
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.sendCustomMessage(
+			{ customType: "next-turn", content: "carry this", display: true, details: {} },
+			{ deliverAs: "nextTurn" },
+		);
+		await harness.session.queueAgentMessagePrompt(firstPrompt, "followUp");
+		await harness.session.followUp("surviving");
+		pause.release();
+		await harness.session.waitForIdle();
+
+		expect(cleared).toEqual({ steering: [], followUp: [firstPrompt] });
+		expect(sawNextTurnContext).toBe(true);
+		expect(getUserTexts(harness)).toEqual(["surviving"]);
 	});
 
 	it("injects nextTurn custom messages into the next prompt", async () => {
@@ -1541,10 +1651,12 @@ describe("AgentSession queue characterization", () => {
 			preparationStarted = resolve;
 		});
 		let pause: { release(): void } | undefined;
+		let gatePreparation = true;
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
 					pi.on("before_agent_start", async () => {
+						if (!gatePreparation) return;
 						preparationStarted?.();
 						pause = harness.session.acquireQueuedWorkPause();
 					});
@@ -1568,6 +1680,7 @@ describe("AgentSession queue characterization", () => {
 		const completionRejection = expect(completion).rejects.toThrow("cleared before delivery");
 		withStreaming(harness, false);
 		await waitForPreparation;
+		gatePreparation = false;
 		expect(pause).toBeDefined();
 
 		expect(harness.session.clearQueue()).toEqual({
@@ -1818,6 +1931,49 @@ describe("AgentSession queue characterization", () => {
 		expect(compactionEndErrorSeverity).toBe("warning");
 	});
 
+	it("splits all-mode batches when execution policies differ", async () => {
+		const beforeAgentStartPrompts: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event) => {
+						beforeAgentStartPrompts.push(event.prompt);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.session.setFollowUpMode("all");
+		harness.setResponses([fauxAssistantMessage("custom done"), fauxAssistantMessage("follow-up done")]);
+		const prompt = vi.spyOn(harness.session.agent, "prompt");
+		const admitted = createDeferred<void>();
+		let pause: { release(): void } | undefined;
+		const internals = harness.session as unknown as {
+			_canStartSessionActionImmediately(): boolean;
+			_scheduleSessionInputPump(): void;
+		};
+		const immediateEligibilitySpy = vi.spyOn(internals, "_canStartSessionActionImmediately").mockReturnValue(false);
+		const scheduleSpy = vi.spyOn(internals, "_scheduleSessionInputPump").mockImplementation(() => {
+			pause = harness.session.acquireQueuedWorkPause();
+			admitted.resolve();
+		});
+
+		const customTurn = harness.session.sendCustomMessage(
+			{ customType: "trigger", content: "trigger", display: false },
+			{ triggerTurn: true },
+		);
+		await admitted.promise;
+		immediateEligibilitySpy.mockRestore();
+		scheduleSpy.mockRestore();
+		await harness.session.followUp("ordinary follow-up");
+		pause?.release();
+		await customTurn;
+		await harness.session.waitForIdle();
+
+		expect(prompt).toHaveBeenCalledTimes(2);
+		expect(beforeAgentStartPrompts).toEqual(["ordinary follow-up"]);
+	});
+
 	it("serializes concurrent trigger-turn custom messages", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -1862,7 +2018,7 @@ describe("AgentSession queue characterization", () => {
 		expect(getAssistantTexts(harness)).toEqual(["custom done", "follow-up done"]);
 	});
 
-	it("rechecks queued-work pauses acquired at the direct-admission boundary", async () => {
+	it("rechecks queued-work pauses acquired at the action-admission boundary", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("direct done")]);
@@ -1888,7 +2044,7 @@ describe("AgentSession queue characterization", () => {
 		expect(getUserTexts(harness)).toEqual(["direct"]);
 	});
 
-	it("rejects disposal while direct admission waits behind a pause", async () => {
+	it("rejects disposal while action admission waits behind a pause", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const pause = harness.session.acquireQueuedWorkPause();
@@ -1907,7 +2063,7 @@ describe("AgentSession queue characterization", () => {
 		expect(release).not.toHaveBeenCalled();
 	});
 
-	it("rejects a post-disposal direct call without prompting the agent", async () => {
+	it("rejects a post-disposal action call without prompting the agent", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const prompt = vi.spyOn(harness.session.agent, "prompt");
@@ -2046,33 +2202,6 @@ describe("AgentSession queue characterization", () => {
 		withStreaming(harness, true);
 
 		await expect(run(harness)).rejects.toThrow(`Cannot ${action} without aborting while the agent is running.`);
-	});
-
-	it("defers work queued after direct admission until the direct handoff", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("direct done"), fauxAssistantMessage("queued done")]);
-		const internals = harness.session as unknown as {
-			_acquireDirectTurnAdmission(options?: { allowStreaming?: boolean }): Promise<{
-				owner: symbol;
-				release(): void;
-			}>;
-		};
-		const acquireDirectTurnAdmission = internals._acquireDirectTurnAdmission.bind(internals);
-		let queuedAtBoundary = false;
-		internals._acquireDirectTurnAdmission = async (options = {}) => {
-			const admission = await acquireDirectTurnAdmission(options);
-			if (!queuedAtBoundary) {
-				queuedAtBoundary = true;
-				await harness.session.followUp("queued", undefined, { resumeIfIdle: true });
-			}
-			return admission;
-		};
-
-		await harness.session.prompt("direct");
-		await harness.session.waitForIdle();
-
-		expect(getUserTexts(harness)).toEqual(["direct", "queued"]);
 	});
 
 	it("serializes an extension command behind an unrelated navigation owner", async () => {

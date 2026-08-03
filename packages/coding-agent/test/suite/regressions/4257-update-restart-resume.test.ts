@@ -53,19 +53,22 @@ type AgentDaemonUpdateInternals = {
 };
 
 type QueueInternals = {
-	_pendingNextTurnMessages: CustomMessage[];
-	_acceptedAgentMessagePrompt?: {
-		text: string;
-		agentMessageId: string;
-		message: UserMessage;
-		messages: Set<unknown>;
-		pendingNextTurnMessages: CustomMessage[];
-		deliveredPendingNextTurnMessages: Set<CustomMessage>;
-		accepted: Promise<void>;
-		resolveAccepted: () => void;
-		rejectAccepted: (error: Error) => void;
-		turnStarted: boolean;
-		cleared: boolean;
+	_compactionAbortController?: AbortController;
+	_actionStore: {
+		ownedActions(): Array<{
+			agentMessageId?: string;
+			lifecycle: { state: string; execution?: "agent_turn" | "session_command" };
+			payload: {
+				kind: string;
+				queueVisible: boolean;
+				records: Array<{
+					role: "primary" | "prefix" | "next_turn";
+					message: UserMessage | CustomMessage;
+					started: boolean;
+					durable: boolean;
+				}>;
+			};
+		}>;
 	};
 };
 
@@ -678,6 +681,39 @@ describe("issue #4257 update restart resume", () => {
 		agentAbortSpy.mockRestore();
 	});
 
+	it("rolls back a preselected prompt when update restart pauses the pump", async () => {
+		const harness = await createHarness({ persistSession: true });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		const idleReached = createDeferred();
+		const idleGate = createDeferred();
+		const originalWaitForIdle = harness.session.agent.waitForIdle.bind(harness.session.agent);
+		let gateIdle = true;
+		const waitForIdleSpy = vi.spyOn(harness.session.agent, "waitForIdle").mockImplementation(async () => {
+			if (gateIdle) {
+				gateIdle = false;
+				idleReached.resolve();
+				await idleGate.promise;
+			}
+			await originalWaitForIdle();
+		});
+		const prompt = harness.session.prompt("paused before selection");
+		await idleReached.promise;
+
+		const pause = harness.session.acquireQueuedWorkPause();
+		const checkpoint = harness.session.waitForSessionInputCheckpoint(AbortSignal.timeout(1000));
+		idleGate.resolve();
+
+		await expect(checkpoint).resolves.toBeUndefined();
+		expect(harness.session.getFollowUpQueueSnapshots().map((snapshot) => snapshot.text)).toEqual([
+			"paused before selection",
+		]);
+		pause.release();
+		await prompt;
+		expect(getUserTexts(harness)).toEqual(["paused before selection"]);
+		waitForIdleSpy.mockRestore();
+	});
+
 	it("rejects new daemon sessions after update restart preparation starts", async () => {
 		const harness = await createHarness({ persistSession: true });
 		harnesses.push(harness);
@@ -838,31 +874,27 @@ describe("issue #4257 update restart resume", () => {
 
 		const pendingNextTurn = createCustomMessage("pending next turn");
 		const acceptedNextTurn = createCustomMessage("accepted prompt context");
-		const deliveredAcceptedNextTurn = createCustomMessage("already delivered context");
 		const acceptedContent: TextContent[] = [
 			{ type: "text", text: "accepted prefix" },
 			{ type: "text", text: "accepted work" },
 		];
-		const acceptedMessage: UserMessage = {
-			role: "user",
-			content: acceptedContent,
-			timestamp: Date.now(),
-		};
 		const queueInternals = harness.session as unknown as QueueInternals;
-		harness.session.restorePendingNextTurnMessages([pendingNextTurn]);
-		queueInternals._acceptedAgentMessagePrompt = {
-			text: "accepted work",
+		harness.session.restorePendingNextTurnMessages([acceptedNextTurn]);
+		queueInternals._compactionAbortController = new AbortController();
+		await harness.session.acceptAgentMessagePrompt("accepted work", {
+			content: acceptedContent,
 			agentMessageId: "agentmsg_accepted",
-			message: acceptedMessage,
-			messages: new Set([acceptedNextTurn, deliveredAcceptedNextTurn, acceptedMessage]),
-			pendingNextTurnMessages: [acceptedNextTurn, deliveredAcceptedNextTurn],
-			deliveredPendingNextTurnMessages: new Set([deliveredAcceptedNextTurn]),
-			accepted: Promise.resolve(),
-			resolveAccepted: () => undefined,
-			rejectAccepted: () => undefined,
-			turnStarted: false,
-			cleared: false,
-		};
+			expandPromptTemplates: false,
+			queueIfBusy: true,
+			streamingBehavior: "followUp",
+		});
+		queueInternals._compactionAbortController = undefined;
+		const acceptedAction = queueInternals._actionStore
+			.ownedActions()
+			.find((action) => action.agentMessageId === "agentmsg_accepted");
+		if (!acceptedAction) throw new Error("Accepted action was not admitted");
+		acceptedAction.payload.queueVisible = false;
+		harness.session.restorePendingNextTurnMessages([pendingNextTurn]);
 
 		const internals = createDaemonInternals(harness);
 		internals.sessions.set(
@@ -958,26 +990,33 @@ describe("issue #4257 update restart resume", () => {
 		const pendingNextTurn = createCustomMessage("pending next turn");
 		const acceptedNextTurn = createCustomMessage("accepted prompt context");
 		const deliveredAcceptedNextTurn = createCustomMessage("already delivered context");
-		const acceptedMessage: UserMessage = {
-			role: "user",
-			content: [{ type: "text", text: "accepted work" }],
-			timestamp: Date.now(),
-		};
 		const queueInternals = harness.session as unknown as QueueInternals;
-		harness.session.restorePendingNextTurnMessages([pendingNextTurn]);
-		queueInternals._acceptedAgentMessagePrompt = {
-			text: "accepted work",
+		harness.session.restorePendingNextTurnMessages([acceptedNextTurn, deliveredAcceptedNextTurn]);
+		queueInternals._compactionAbortController = new AbortController();
+		await harness.session.acceptAgentMessagePrompt("accepted work", {
 			agentMessageId: "agentmsg_accepted",
-			message: acceptedMessage,
-			messages: new Set([acceptedMessage, deliveredAcceptedNextTurn]),
-			pendingNextTurnMessages: [acceptedNextTurn, deliveredAcceptedNextTurn],
-			deliveredPendingNextTurnMessages: new Set([deliveredAcceptedNextTurn]),
-			accepted: Promise.resolve(),
-			resolveAccepted: () => undefined,
-			rejectAccepted: () => undefined,
-			turnStarted: true,
-			cleared: false,
-		};
+			expandPromptTemplates: false,
+			queueIfBusy: true,
+			streamingBehavior: "followUp",
+		});
+		queueInternals._compactionAbortController = undefined;
+		const acceptedAction = queueInternals._actionStore
+			.ownedActions()
+			.find((action) => action.agentMessageId === "agentmsg_accepted");
+		expect(acceptedAction?.payload.kind).toBe("turn");
+		const primary = acceptedAction?.payload.records.find((record) => record.role === "primary");
+		if (!acceptedAction || !primary) throw new Error("Accepted action was not admitted");
+		primary.started = true;
+		primary.durable = true;
+		const deliveredContext = acceptedAction.payload.records.find(
+			(record) => record.message.role === "custom" && record.message.content === "already delivered context",
+		);
+		if (!deliveredContext) throw new Error("Accepted context was not attached");
+		deliveredContext.started = true;
+		deliveredContext.durable = true;
+		acceptedAction.payload.queueVisible = false;
+		acceptedAction.lifecycle = { state: "running", execution: "agent_turn" };
+		harness.session.restorePendingNextTurnMessages([pendingNextTurn]);
 
 		const internals = createDaemonInternals(harness);
 		internals.sessions.set(

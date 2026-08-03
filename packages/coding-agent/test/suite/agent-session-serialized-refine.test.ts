@@ -31,7 +31,7 @@ type SerializedInternals = {
 		images: undefined,
 		options: Record<string, never>,
 	): unknown;
-	_enqueueSessionInput(action: unknown): boolean;
+	_admitSessionInput(action: unknown, options?: { wake?: boolean }): { accepted: boolean };
 	_pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
 	_assistantTurnsSinceAutoRefine: number;
 	_lastAutoRefineReviewAt: number;
@@ -316,7 +316,7 @@ describe("Serialized agent-callable refine", () => {
 		const internals = harness.session as unknown as SerializedInternals;
 		const { applyRefine } = mockSerializedRefine(harness);
 		internals._pendingRequestedRefine = { instructions: "capture a lesson" };
-		internals._enqueueSessionInput(internals._createPreparedTurnAction("steer", "steer", undefined, {}));
+		internals._admitSessionInput(internals._createPreparedTurnAction("steer", "steer", undefined, {}));
 		const compactionSpy = vi
 			.spyOn(
 				internals as unknown as { _shouldStopForThresholdCompaction: (ctx: unknown) => Promise<boolean> },
@@ -1711,7 +1711,7 @@ describe("P0 concurrency regressions", () => {
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as SerializedInternals;
-		internals._enqueueSessionInput(internals._createPreparedTurnAction("steer", "steer", undefined, {}));
+		internals._admitSessionInput(internals._createPreparedTurnAction("steer", "steer", undefined, {}));
 
 		let planResolved = false;
 		let applyFinished = false;

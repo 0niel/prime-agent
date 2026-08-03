@@ -823,7 +823,7 @@ describe("AgentSession compaction characterization", () => {
 				images: undefined,
 				options: { message?: AgentMessage; resumeIfIdle: boolean },
 			): unknown;
-			_enqueueSessionInput(action: unknown): boolean;
+			_admitSessionInput(action: unknown, options?: { wake?: boolean }): { accepted: boolean };
 		};
 		const continuation = {
 			role: "user",
@@ -832,7 +832,7 @@ describe("AgentSession compaction characterization", () => {
 		} satisfies AgentMessage;
 		if (tracked) sessionInternals._postCompactionContinuationMessages = [continuation];
 		harness.setResponses([fauxAssistantMessage(response)]);
-		sessionInternals._enqueueSessionInput(
+		sessionInternals._admitSessionInput(
 			sessionInternals._createPreparedTurnAction("followUp", text, undefined, {
 				...(tracked && { message: continuation }),
 				resumeIfIdle: tracked,

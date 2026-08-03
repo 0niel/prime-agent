@@ -231,6 +231,7 @@ import {
 } from "./rlm-runtime.js";
 import {
 	ActionStore,
+	type ActionTicket,
 	canSelectSessionAction,
 	type DeliveryPolicy,
 	type DeliveryRecord,
@@ -564,6 +565,8 @@ type RefineBarrierPolicy = "always" | "ifInFlight" | "skip";
 interface CommitPreparationPolicy {
 	initialRefineBarrier: RefineBarrierPolicy;
 	flushPendingBashBeforeValidation: boolean;
+	validateModelAndAuth: boolean;
+	awaitPendingModelSelection: boolean;
 	preTurnCompaction: PreTurnCompactionTiming;
 	finalRefineBarrier: RefineBarrierPolicy;
 }
@@ -576,22 +579,43 @@ interface CommitPreparationSteps<TPrepared, TCommitted> {
 	commit: (prepared: TPrepared, passedFinalRefineBarrier: boolean) => TCommitted;
 }
 
-interface PromptDispatchFence {
-	promptPromise: Promise<void>;
-	deliveryObserved?: Promise<true>;
-	wasDeliveryObserved(): boolean;
-	stopDeliveryObservation(): void;
-	restorePendingNextTurnMessages(isDelivered?: (message: CustomMessage) => boolean): void;
-}
-
 type QueuedAgentMessage = UserMessage | CustomMessage;
 type SessionInputSchedule = "steer" | "followUp";
+
+interface TurnExecutionPolicy {
+	preparation: CommitPreparationPolicy;
+	runBeforeAgentStart: boolean;
+	nextTurnContextTiming: "preparation" | "commit" | "skip";
+	preserveEmptyExtensionPrompt: boolean;
+	completionIncludesRetryChain: boolean;
+}
+
+function turnExecutionPoliciesEqual(left: TurnExecutionPolicy, right: TurnExecutionPolicy): boolean {
+	return (
+		left.preparation.initialRefineBarrier === right.preparation.initialRefineBarrier &&
+		left.preparation.flushPendingBashBeforeValidation === right.preparation.flushPendingBashBeforeValidation &&
+		left.preparation.validateModelAndAuth === right.preparation.validateModelAndAuth &&
+		left.preparation.awaitPendingModelSelection === right.preparation.awaitPendingModelSelection &&
+		left.preparation.preTurnCompaction === right.preparation.preTurnCompaction &&
+		left.preparation.finalRefineBarrier === right.preparation.finalRefineBarrier &&
+		left.runBeforeAgentStart === right.runBeforeAgentStart &&
+		left.nextTurnContextTiming === right.nextTurnContextTiming &&
+		left.preserveEmptyExtensionPrompt === right.preserveEmptyExtensionPrompt &&
+		left.completionIncludesRetryChain === right.completionIncludesRetryChain
+	);
+}
 
 interface PreparedTurnPayload extends SessionTurnPayload {
 	images?: ImageContent[];
 	content?: (TextContent | ImageContent)[];
 	customMessage?: CustomMessage;
 	prepared?: PreparedPromptPreparation;
+	executionPolicy: TurnExecutionPolicy;
+	queueVisible: boolean;
+	acceptedAgentMessage: boolean;
+	acceptedBeforeCompletion: boolean;
+	captureRunMessages?: Set<AgentMessage>;
+	cancelledDispatchEnded?: boolean;
 }
 
 interface PreparedCommandPayload extends SessionCommandPayload {
@@ -793,25 +817,6 @@ function injectedMessagePreviewLabel(message: CustomMessage): string | undefined
 		default:
 			return undefined;
 	}
-}
-
-interface AcceptedAgentMessagePrompt {
-	text: string;
-	agentMessageId: string;
-	message: QueuedAgentMessage;
-	messages: Set<AgentMessage>;
-	/** Pending nextTurn messages drained into this prompt; restored to the queue if the prompt is cleared. */
-	pendingNextTurnMessages: CustomMessage[];
-	deliveredPendingNextTurnMessages: Set<CustomMessage>;
-	accepted: Promise<void>;
-	resolveAccepted: () => void;
-	rejectAccepted: (error: Error) => void;
-	turnStarted: boolean;
-	cleared: boolean;
-}
-
-function undeliveredPendingNextTurnMessages(accepted: AcceptedAgentMessagePrompt): CustomMessage[] {
-	return accepted.pendingNextTurnMessages.filter((message) => !accepted.deliveredPendingNextTurnMessages.has(message));
 }
 
 interface AgentMessageDeferred {
@@ -1031,6 +1036,7 @@ export class AgentSession {
 	// Event subscription state
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
+	private _lastQueueUpdate = { steering: [] as string[], followUp: [] as string[] };
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
@@ -1047,10 +1053,6 @@ export class AgentSession {
 	private readonly _turnAdmissionContext = new AsyncLocalStorage<symbol>();
 	private _pumpingSessionInput = false;
 	private readonly _sessionInputCheckpointWaiters = new Set<() => void>();
-	/** Direct prompts between admission and agent handoff; restart checkpoints wait for zero. */
-	private _directPromptSectionCount = 0;
-	/** One-shot waiters resolved when a dispatched message reaches message_start. */
-	private _directDispatchObservers = new Set<{ message: AgentMessage; resolve: () => void }>();
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 
@@ -1082,8 +1084,6 @@ export class AgentSession {
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
 	private _retryAuthFailureSources: AuthSourceToken[] = [];
-	private _acceptedPromptCompletions = new Set<Promise<void>>();
-	private _acceptedAgentMessagePrompt: AcceptedAgentMessagePrompt | undefined = undefined;
 	private _agentMessageOutcomes = new Map<string, AgentMessageOutcome>();
 	private _lateIpythonSentAgentMessages = new Map<string, KernelSentAgentMessage[]>();
 	/** Outcome disclosures whose session-file append failed; retained for context rebuilds. */
@@ -1397,11 +1397,18 @@ export class AgentSession {
 	}
 
 	private _emitQueueUpdate(): void {
-		this._emit({
-			type: "queue_update",
-			steering: this.legacyPendingProjection("next_turn_boundary").map(queuedAgentMessagePreview),
-			followUp: this.legacyPendingProjection("when_run_idle").map(queuedAgentMessagePreview),
-		});
+		const steering = this.legacyPendingProjection("next_turn_boundary").map(queuedAgentMessagePreview);
+		const followUp = this.legacyPendingProjection("when_run_idle").map(queuedAgentMessagePreview);
+		if (
+			steering.length === this._lastQueueUpdate.steering.length &&
+			followUp.length === this._lastQueueUpdate.followUp.length &&
+			steering.every((value, index) => value === this._lastQueueUpdate.steering[index]) &&
+			followUp.every((value, index) => value === this._lastQueueUpdate.followUp[index])
+		) {
+			return;
+		}
+		this._lastQueueUpdate = { steering, followUp };
+		this._emit({ type: "queue_update", steering, followUp });
 	}
 
 	private _restoreLateIpythonSentAgentMessages(): void {
@@ -1557,7 +1564,10 @@ export class AgentSession {
 	private _cancelSessionActions(
 		predicate: (action: QueuedSessionAction) => boolean,
 		error: Error,
+		candidates = this._actionStore.clearableActions(),
 	): QueuedSessionAction[] {
+		const matching = candidates.filter(predicate);
+		const previousStates = new Map(matching.map((action) => [action.id, action.lifecycle.state]));
 		const preparing = this._actionStore
 			.activeActions()
 			.filter(
@@ -1565,7 +1575,7 @@ export class AgentSession {
 					action.payload.kind === "turn" && action.lifecycle.state === "preparing",
 			);
 		const previousAnchor = preparing.at(-1);
-		const actions = this._actionStore.remove(predicate);
+		const actions = this._actionStore.remove(predicate, candidates);
 		const removed = new Set(actions);
 		if (previousAnchor && removed.has(previousAnchor)) {
 			for (const action of preparing) {
@@ -1574,9 +1584,34 @@ export class AgentSession {
 		}
 		for (const action of actions) {
 			const ticket = this._actionStore.ticketFor(action);
-			ticket.settleDelivered({ status: "not_applicable" });
+			if (action.payload.kind === "turn" && (action.payload.acceptedAgentMessage || !action.payload.queueVisible)) {
+				ticket.rejectDelivered(error);
+			} else {
+				ticket.settleDelivered({ status: "not_applicable" });
+			}
 			ticket.settleCompleted(error);
-			this._actionStore.releaseTerminal(action);
+			const dispatched = previousStates.get(action.id) === "committing" && action.payload.kind === "turn";
+			if (action.payload.kind === "turn") {
+				const payload = action.payload;
+				const restorable = payload.records
+					.filter(
+						(record): record is DeliveryRecord & { message: CustomMessage } =>
+							(record.role === "next_turn" || (payload.acceptedAgentMessage && record.role === "prefix")) &&
+							record.message.role === "custom" &&
+							!record.durable,
+					)
+					.map((record) => cloneCustomMessage(record.message));
+				this._pendingNextTurnMessages.unshift(...restorable);
+				if (dispatched) {
+					payload.captureRunMessages = new Set(payload.records.map((record) => record.message));
+					this.agent.state.messages = this.agent.state.messages.filter(
+						(message) => !payload.captureRunMessages?.has(message),
+					);
+				}
+			}
+			if (!dispatched) {
+				this._actionStore.releaseTerminal(action);
+			}
 		}
 		return actions;
 	}
@@ -1888,7 +1923,7 @@ export class AgentSession {
 					message,
 					resumeIfIdle: true,
 				});
-				this._enqueueSessionInput(action, { front: true, wake: false });
+				this._admitSessionInput(action, { front: true, wake: false });
 			}
 			return;
 		}
@@ -1898,12 +1933,11 @@ export class AgentSession {
 			return;
 		}
 
-		await this._validateCanStartAgentRun();
-		// Wait immediately before the handoff so a refine starting during the
-		// awaits above cannot disconnect event handling under this turn.
-		await this._waitForRefineIdle();
-		await this.agent.prompt([message]);
-		await this.waitForRetry();
+		const normalized = normalizeMessageContent(message.content);
+		await this._promptInjectedMessage(normalized.text, message, {
+			resumeIfIdle: true,
+			executionPolicy: this._turnExecutionPolicy("goalContext"),
+		});
 	}
 
 	private async _handleGoalSlashCommand(text: string, images: ImageContent[] | undefined): Promise<boolean> {
@@ -2573,7 +2607,7 @@ export class AgentSession {
 			typeof autonomousMessage.content === "string"
 				? autonomousMessage.content
 				: autonomousMessage.content.map((block) => (block.type === "text" ? block.text : "")).join("\n");
-		this._enqueueSessionInput(
+		this._admitSessionInput(
 			this._createPreparedTurnAction("followUp", text, undefined, { message: autonomousMessage }),
 		);
 		return autonomousMessage;
@@ -3093,42 +3127,71 @@ export class AgentSession {
 		}
 	}
 
+	private _capturingCancelledAction(message: AgentMessage): QueuedSessionAction | undefined {
+		return this._actionStore
+			.ownedActions()
+			.find(
+				(action) =>
+					action.lifecycle.state === "cancelled" &&
+					action.payload.kind === "turn" &&
+					action.payload.captureRunMessages?.has(message) === true,
+			);
+	}
+
+	private _hasCancelledDispatchCapture(): boolean {
+		return this._actionStore
+			.ownedActions()
+			.some(
+				(action) =>
+					action.lifecycle.state === "cancelled" &&
+					action.payload.kind === "turn" &&
+					action.payload.captureRunMessages !== undefined,
+			);
+	}
+
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = (event: AgentEvent): void => {
-		// Create retry promise synchronously before queueing async processing.
-		// Agent.emit() calls this handler synchronously, and prompt() calls waitForRetry()
-		// as soon as agent.prompt() resolves. If _retryPromise is created only inside
-		// _processAgentEvent, slow earlier queued events can delay agent_end processing
-		// and waitForRetry() can miss the in-flight retry.
 		this._createRetryPromiseForAgentEnd(event);
-		const acceptedPrompt = this._acceptedAgentMessagePrompt;
-		if (event.type === "message_start") {
-			if (acceptedPrompt?.message === event.message && !acceptedPrompt.cleared) {
-				acceptedPrompt.turnStarted = true;
-				this._settleAgentMessage(acceptedPrompt.agentMessageId, "delivery");
-				acceptedPrompt.resolveAccepted();
-			}
-			if (event.message.role === "user" || event.message.role === "custom") {
-				for (const action of this._actionStore.activeActionsForMessage(event.message)) {
-					const record =
-						action.payload.kind === "turn"
-							? action.payload.records.find((candidate) => candidate.message === event.message)
-							: undefined;
-					if (record) record.started = true;
-					if (record?.role === "primary") {
-						this._actionStore.ticketFor(action).settleDelivered({ status: "delivered" });
-						this._settleAgentMessage(action.agentMessageId, "delivery");
-					}
+		if (event.type === "message_start" || event.type === "message_end") {
+			for (const action of this._actionStore.ownedActions()) {
+				if (
+					action.payload.kind !== "turn" ||
+					!action.payload.captureRunMessages ||
+					action.payload.cancelledDispatchEnded
+				) {
+					continue;
+				}
+				const primary = primaryDeliveryRecord(action);
+				if (event.message === primary.message || primary.started) {
+					action.payload.captureRunMessages.add(event.message);
 				}
 			}
-			for (const observer of this._directDispatchObservers) {
-				if (observer.message === event.message) {
-					this._directDispatchObservers.delete(observer);
-					observer.resolve();
+		} else if (event.type === "agent_end") {
+			const captured = new Set<AgentMessage>();
+			for (const action of this._actionStore.ownedActions()) {
+				if (action.payload.kind === "turn" && action.payload.captureRunMessages) {
+					for (const message of action.payload.captureRunMessages) captured.add(message);
+					action.payload.cancelledDispatchEnded = true;
+				}
+			}
+			if (captured.size > 0) {
+				this.agent.state.messages = this.agent.state.messages.filter((message) => !captured.has(message));
+			}
+		}
+		if (event.type === "message_start" && (event.message.role === "user" || event.message.role === "custom")) {
+			for (const action of this._actionStore.actionsForMessage(event.message)) {
+				const record =
+					action.payload.kind === "turn"
+						? action.payload.records.find((candidate) => candidate.message === event.message)
+						: undefined;
+				if (record) record.started = true;
+				if (record?.role === "primary") {
+					this._actionStore.ticketFor(action).settleDelivered({ status: "delivered" });
+					this._settleAgentMessage(action.agentMessageId, "delivery");
 				}
 			}
 		} else if (event.type === "message_end" && (event.message.role === "user" || event.message.role === "custom")) {
-			for (const action of this._actionStore.activeActionsForMessage(event.message)) {
+			for (const action of this._actionStore.actionsForMessage(event.message)) {
 				const record =
 					action.payload.kind === "turn"
 						? action.payload.records.find((candidate) => candidate.message === event.message)
@@ -3144,8 +3207,6 @@ export class AgentSession {
 			() => this._processAgentEvent(event),
 			() => this._processAgentEvent(event),
 		);
-
-		// Keep queue alive if an event handler fails
 		this._agentEventQueue.catch(() => {});
 	};
 
@@ -3200,50 +3261,41 @@ export class AgentSession {
 	}
 
 	private async _processAgentEvent(event: AgentEvent): Promise<void> {
+		let clearedDispatchEnded = false;
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "toolResult") {
 			this._applyLateIpythonSentAgentMessages(event.message);
 		}
-		const acceptedPrompt = this._acceptedAgentMessagePrompt;
-		if (acceptedPrompt && (event.type === "message_start" || event.type === "message_end")) {
-			if (event.message === acceptedPrompt.message) {
-				if (event.type === "message_start") {
-					acceptedPrompt.turnStarted = true;
-				}
-				acceptedPrompt.messages.add(event.message);
-			} else if (acceptedPrompt.turnStarted) {
-				acceptedPrompt.messages.add(event.message);
-			}
-			if (
-				event.type === "message_end" &&
-				event.message.role === "custom" &&
-				acceptedPrompt.pendingNextTurnMessages.includes(event.message)
-			) {
-				acceptedPrompt.deliveredPendingNextTurnMessages.add(event.message);
-			}
-			if (acceptedPrompt.cleared && acceptedPrompt.messages.has(event.message)) {
-				// Membership filter, not a positional slice: newer prompts or compaction may
-				// have rewritten state.messages since the clear.
-				this.agent.state.messages = this.agent.state.messages.filter(
-					(message) => !acceptedPrompt.messages.has(message),
-				);
+		if (event.type === "message_start" || event.type === "message_end") {
+			const cleared = this._capturingCancelledAction(event.message);
+			if (cleared?.payload.kind === "turn" && cleared.payload.captureRunMessages) {
+				const captured = cleared.payload.captureRunMessages;
+				this.agent.state.messages = this.agent.state.messages.filter((message) => !captured.has(message));
 				return;
 			}
 		}
-		const clearedPromptEnded = event.type === "agent_end" ? this._acceptedAgentMessagePrompt : undefined;
-		const clearedAcceptedPromptEnded = clearedPromptEnded?.cleared === true;
-		if (clearedAcceptedPromptEnded) {
-			// Membership filter, not a positional slice: this runs asynchronously after the
-			// clear, and a newer prompt or compaction may have rewritten state.messages.
-			this.agent.state.messages = this.agent.state.messages.filter(
-				(message) => !clearedPromptEnded.messages.has(message),
-			);
-			(this.agent.state as { errorMessage?: string }).errorMessage = undefined;
-			if (!clearedPromptEnded.turnStarted) {
-				clearedPromptEnded.rejectAccepted(new Error("Accepted agent message was cleared before delivery."));
+		if (event.type === "agent_end") {
+			const cleared = this._actionStore
+				.ownedActions()
+				.filter(
+					(action) =>
+						action.lifecycle.state === "cancelled" &&
+						action.payload.kind === "turn" &&
+						action.payload.captureRunMessages !== undefined,
+				);
+			if (cleared.length > 0) {
+				clearedDispatchEnded = true;
+				const removed = new Set(
+					cleared.flatMap((action) =>
+						action.payload.kind === "turn" ? [...(action.payload.captureRunMessages ?? [])] : [],
+					),
+				);
+				this.agent.state.messages = this.agent.state.messages.filter((message) => !removed.has(message));
+				(this.agent.state as { errorMessage?: string }).errorMessage = undefined;
+				this._lastAssistantMessage = undefined;
+				for (const action of cleared) this._actionStore.releaseTerminal(action);
+				this._notifySessionInputCheckpointChange();
+				this._resolveRetry();
 			}
-			this._lastAssistantMessage = undefined;
-			this._acceptedAgentMessagePrompt = undefined;
-			this._resolveRetry();
 		}
 
 		if (event.type === "message_start" && this._isPromptTurnStartMessage(event.message)) {
@@ -3252,15 +3304,13 @@ export class AgentSession {
 
 		// Emit to extensions first
 		await this._emitExtensionEvent(event);
-		if (
-			(event.type === "message_start" || event.type === "message_end") &&
-			this._acceptedAgentMessagePrompt?.cleared &&
-			this._acceptedAgentMessagePrompt.messages.has(event.message)
-		) {
-			this.agent.state.messages = this.agent.state.messages.filter(
-				(message) => !this._acceptedAgentMessagePrompt?.messages.has(message),
-			);
-			return;
+		if (event.type === "message_start" || event.type === "message_end") {
+			const cleared = this._capturingCancelledAction(event.message);
+			if (cleared?.payload.kind === "turn" && cleared.payload.captureRunMessages) {
+				const captured = cleared.payload.captureRunMessages;
+				this.agent.state.messages = this.agent.state.messages.filter((message) => !captured.has(message));
+				return;
+			}
 		}
 
 		this._addLoginGuidanceToAuthError(event);
@@ -3335,7 +3385,7 @@ export class AgentSession {
 			}
 		}
 
-		if (clearedAcceptedPromptEnded) {
+		if (clearedDispatchEnded) {
 			return;
 		}
 
@@ -4136,13 +4186,15 @@ export class AgentSession {
 			await this._waitForRefineIdle();
 		}
 		if (policy.flushPendingBashBeforeValidation) this._flushPendingBashMessages();
-		await this._validateCanStartAgentRun();
+		if (policy.validateModelAndAuth) await this._validateCanStartAgentRun();
 		steps.afterValidation?.();
 		if (!policy.flushPendingBashBeforeValidation) this._flushPendingBashMessages();
 
 		if (policy.preTurnCompaction === "beforeModelSelection") await this._runPreTurnCompaction();
-		const pendingModelSelectEmit = this._pendingModelSelectEmit();
-		if (pendingModelSelectEmit) await pendingModelSelectEmit;
+		if (policy.awaitPendingModelSelection) {
+			const pendingModelSelectEmit = this._pendingModelSelectEmit();
+			if (pendingModelSelectEmit) await pendingModelSelectEmit;
+		}
 		if (policy.preTurnCompaction === "afterModelSelection") await this._runPreTurnCompaction();
 
 		const prepared = await steps.prepare();
@@ -4173,49 +4225,21 @@ export class AgentSession {
 				: this._baseSystemPrompt;
 	}
 
-	private _dispatchPromptWithFence(
-		messages: AgentMessage[],
-		observedMessage: AgentMessage | undefined,
-		pendingNextTurnMessages: CustomMessage[],
-		options: {
-			releaseAdmission: () => void;
-			suppressAutonomousContinuation?: boolean;
-			checkpointUntilDelivery?: boolean;
-			cloneRestoredNextTurnMessages?: boolean;
-		},
-	): PromptDispatchFence {
-		const dispatchObserver = observedMessage ? this._observeDirectDispatch(observedMessage) : undefined;
-		const endCheckpointSection = options.checkpointUntilDelivery ? this._enterDirectPromptSection() : undefined;
-		const promptPromise = options.suppressAutonomousContinuation
-			? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(messages))
-			: this.agent.prompt(messages);
-		options.releaseAdmission();
-
-		if (endCheckpointSection && dispatchObserver) {
-			const settleCheckpointSection = () => {
-				dispatchObserver.stop();
-				endCheckpointSection();
-			};
-			void Promise.race([promptPromise.catch(() => undefined), dispatchObserver.observed]).then(
-				settleCheckpointSection,
-				settleCheckpointSection,
-			);
-		}
-
-		return {
-			promptPromise,
-			deliveryObserved: dispatchObserver?.observed,
-			wasDeliveryObserved: () => dispatchObserver?.wasObserved() ?? false,
-			stopDeliveryObservation: () => dispatchObserver?.stop(),
-			restorePendingNextTurnMessages: (isDelivered = (message) => this.agent.state.messages.includes(message)) => {
-				const undelivered = pendingNextTurnMessages.filter((message) => !isDelivered(message));
-				this._pendingNextTurnMessages.unshift(
-					...(options.cloneRestoredNextTurnMessages === false
-						? undelivered
-						: undelivered.map((message) => ({ ...message }))),
-				);
-			},
-		};
+	private _canStartSessionActionImmediately(): boolean {
+		const hasBlockingOwnedWork = this._actionStore
+			.unfinishedActions()
+			.some((action) => action.lifecycle.state !== "queued" || action.wake !== "external_resume");
+		return (
+			!this.isStreaming &&
+			!this.isCompacting &&
+			!this.isRetrying &&
+			!this.isBashRunning &&
+			!this._sessionInputPumpSuspended &&
+			this._queuedWorkPauses.size === 0 &&
+			!hasBlockingOwnedWork &&
+			!this._disposed &&
+			!this._disposing
+		);
 	}
 
 	/**
@@ -4289,528 +4313,248 @@ export class AgentSession {
 		});
 	}
 
-	private _observeDirectDispatch(message: AgentMessage): {
-		observed: Promise<true>;
-		wasObserved(): boolean;
-		stop(): void;
-	} {
-		let fired = false;
-		let observer!: { message: AgentMessage; resolve: () => void };
-		const observed = new Promise<true>((resolve) => {
-			observer = {
-				message,
-				resolve: () => {
-					fired = true;
-					resolve(true);
-				},
-			};
-		});
-		this._directDispatchObservers.add(observer);
-		return {
-			observed,
-			wasObserved: () => fired,
-			stop: () => this._directDispatchObservers.delete(observer),
-		};
-	}
-
 	private async _promptInjectedMessage(
 		text: string,
 		message: CustomMessage,
-		options?: InternalPromptOptions,
+		options?: InternalPromptOptions & { executionPolicy?: TurnExecutionPolicy },
 	): Promise<void> {
 		if (!this.isStreaming && options?.resumeIfIdle) this._sessionInputPumpSuspended = false;
-		const admission = await this._acquireDirectTurnAdmission({
-			allowStreaming: true,
-			allowPendingQueue: options?.queueIfBusy === true,
-			signal: options?.signal,
-		});
+		const admission = this.isStreaming
+			? undefined
+			: await this._acquireSessionActionAdmission({ signal: options?.signal });
+		const reportPreflight = oncePreflight(options?.preflightResult);
 		try {
-			// Ownership commits before destructive preflight, but cancellation and the
-			// commit callback are covered by release if either throws.
 			throwIfPromptAdmissionCancelled(options?.signal);
 			options?.admissionCommitted?.();
-			await this._turnAdmissionContext.run(admission.owner, () =>
-				this._promptInjectedMessageUnserialized(text, message, options, admission.release),
-			);
-		} finally {
-			admission.release();
-			this._scheduleSessionInputPump();
-		}
-	}
-
-	private async _promptInjectedMessageUnserialized(
-		text: string,
-		message: CustomMessage,
-		options: InternalPromptOptions | undefined,
-		releaseAdmission: () => void,
-	): Promise<void> {
-		const endDirectPromptSection = this._enterDirectPromptSection();
-		const reportInput = oncePreflight(options?.preflightResult);
-		const reportPreflight: typeof reportInput = (success, queued) => {
-			endDirectPromptSection();
-			reportInput(success, queued);
-		};
-
-		let messages: AgentMessage[] | undefined;
-		let drainedNextTurnMessages: CustomMessage[] = [];
-		let preparation: PreparedPromptPreparation | undefined;
-		const previewLabel = injectedMessagePreviewLabel(message);
-		try {
-			const shouldQueueForStreaming = this.isStreaming;
-			const shouldQueueForPendingWork = options?.queueIfBusy === true && this._isBusyForSessionInput("preflight");
-			if (shouldQueueForStreaming || shouldQueueForPendingWork) {
-				if (!options?.streamingBehavior) {
-					const stateDescription = shouldQueueForStreaming
-						? "Agent is already processing"
-						: "Agent has queued work";
-					throw new Error(
-						`${stateDescription}. Specify streamingBehavior ('steer' or 'followUp') to queue the message.`,
-					);
-				}
-				await this._queueWithPendingNextTurnMessages(text, options.streamingBehavior, reportPreflight, {
-					message,
-					queueKey: options.followUpQueueKey,
-					previewLabel,
-					suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-					resumeIfIdle: options.resumeIfIdle,
-					source: options.source ?? "internal",
-				});
-
+			const queueForStreaming = this.isStreaming;
+			const queueForBusy = options?.queueIfBusy === true && this._isBusyForSessionInput("preflight");
+			const visibleQueued = queueForStreaming || queueForBusy;
+			if (visibleQueued && !options?.streamingBehavior) {
+				const stateDescription = queueForStreaming ? "Agent is already processing" : "Agent has queued work";
+				throw new Error(
+					`${stateDescription}. Specify streamingBehavior ('steer' or 'followUp') to queue the message.`,
+				);
+			}
+			const schedule = options?.streamingBehavior ?? "followUp";
+			const prefixMessages = visibleQueued ? this._takePendingNextTurnMessages() : undefined;
+			const action = this._createPreparedTurnAction(schedule, text, undefined, {
+				message,
+				prefixMessages,
+				queueKey: options?.followUpQueueKey,
+				previewLabel: injectedMessagePreviewLabel(message),
+				suppressAutonomousContinuation: options?.suppressAutonomousContinuation,
+				resumeIfIdle:
+					!visibleQueued ||
+					options?.resumeIfIdle ||
+					(options?.queueIfBusy === true && canSelectSessionAction(this._runtimeActivity())),
+				source: options?.source ?? "internal",
+				executionPolicy:
+					options?.executionPolicy ??
+					(visibleQueued ? this._turnExecutionPolicy("queued") : this._turnExecutionPolicy("injected")),
+				queueVisible: visibleQueued,
+			});
+			const result = this._admitSessionInput(action, { immediatelyEligible: !visibleQueued });
+			if (!result.accepted || !result.ticket) {
+				if (prefixMessages) this._pendingNextTurnMessages.unshift(...prefixMessages);
+				reportPreflight(false, false);
 				return;
 			}
-
-			messages = await this._prepareForCommit(
-				{
-					initialRefineBarrier: "always",
-					flushPendingBashBeforeValidation: true,
-					preTurnCompaction: "beforeModelSelection",
-					finalRefineBarrier: "ifInFlight",
-				},
-				{
-					prepare: async () => {
-						drainedNextTurnMessages = this._pendingNextTurnMessages;
-						this._pendingNextTurnMessages = [];
-						const preparedMessages: AgentMessage[] = [...drainedNextTurnMessages, message];
-						const basePromptSnapshot = this._baseSystemPrompt;
-						const result = await this._extensionRunner.emitBeforeAgentStart(
-							text,
-							undefined,
-							basePromptSnapshot,
-							this._baseSystemPromptOptions,
-						);
-						preparation = { result, basePromptSnapshot };
-						this._appendBeforeAgentStartMessages(preparedMessages, result);
-						this._applyPreparedSystemPrompt(preparation, true);
-						return { messages: preparedMessages, preparation };
-					},
-					commit: (prepared, passedFinalRefineBarrier) => {
-						if (passedFinalRefineBarrier) this._applyPreparedSystemPrompt(prepared.preparation, true);
-						return prepared.messages;
-					},
-				},
-			);
+			if (result.disposition === "queued") {
+				reportPreflight(true, true);
+			} else {
+				void result.ticket.delivered.then(
+					() => reportPreflight(true),
+					() => reportPreflight(false),
+				);
+			}
+			admission?.release();
+			if (options?.returnAfterAccepted) {
+				if (result.disposition === "starts_when_admitted") await result.ticket.delivered;
+				return;
+			}
+			if (visibleQueued) return;
+			await result.ticket.completed;
 		} catch (error) {
 			reportPreflight(false);
 			throw error;
+		} finally {
+			admission?.release();
 		}
-
-		if (!messages) {
-			endDirectPromptSection();
-			return;
-		}
-		if (this._refineInFlight) {
-			await this._waitForRefineIdle();
-		}
-		this._applyPreparedSystemPrompt(preparation, true);
-
-		const shouldQueueAtHandoff = options?.queueIfBusy === true && this._isBusyForSessionInput("handoff");
-		if (shouldQueueAtHandoff) {
-			this._pendingNextTurnMessages.unshift(...drainedNextTurnMessages.map((pending) => ({ ...pending })));
-			if (!options?.streamingBehavior) {
-				reportPreflight(false);
-				throw new Error(
-					"Agent became busy before prompt delivery. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
-				);
-			}
-			try {
-				await this._queueWithPendingNextTurnMessages(text, options.streamingBehavior, reportPreflight, {
-					message,
-					queueKey: options.followUpQueueKey,
-					previewLabel,
-					suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-					resumeIfIdle: options.resumeIfIdle,
-					source: options.source ?? "internal",
-				});
-			} catch (error) {
-				// A failed enqueue must still settle the preflight outcome, or the
-				// direct-prompt section would fence checkpoints forever.
-				reportPreflight(false);
-				throw error;
-			}
-
-			return;
-		}
-
-		if (options?.suppressAutonomousContinuation) this._markAutonomousContinuationSuppressed(message);
-		const dispatch = this._dispatchPromptWithFence(messages, message, drainedNextTurnMessages, {
-			releaseAdmission,
-			suppressAutonomousContinuation: options?.suppressAutonomousContinuation,
-		});
-		// Settle the preflight outcome at the handoff, not after the whole turn: the
-		// direct-prompt section must keep fencing update-restart checkpoints until
-		// message_start proves the input reached the run's event stream, and a
-		// rejected dispatch must still release the section. A resolved prompt alone
-		// is not proof: Agent.prompt() converts lifecycle failures into a synthetic
-		// error turn without the message ever reaching agent state.
-		const dispatched = await Promise.race([
-			dispatch.promptPromise.then(
-				() => dispatch.wasDeliveryObserved() || this.agent.state.messages.includes(message),
-				() => false,
-			),
-			dispatch.deliveryObserved!,
-		]);
-		dispatch.stopDeliveryObservation();
-		reportPreflight(dispatched);
-		try {
-			await dispatch.promptPromise;
-		} catch (error) {
-			dispatch.restorePendingNextTurnMessages(() => false);
-			throw error;
-		}
-		await this.waitForRetry();
 	}
 
 	private async _prompt(text: string, options?: InternalPromptOptions): Promise<void> {
 		if (!this.isStreaming) this._sessionInputPumpSuspended = false;
-		const admission = !this.isStreaming
-			? await this._acquireDirectTurnAdmission({
-					allowPendingQueue: options?.queueIfBusy === true,
-					signal: options?.signal,
-				})
-			: undefined;
-		// The streaming path skips admission, so this is its cancellation commit point.
-		if (!admission) throwIfPromptAdmissionCancelled(options?.signal);
-		const releaseAdmission = admission?.release ?? (() => {});
-		try {
-			// Streaming prompts skip direct-turn admission but still transfer ownership
-			// before any queue/interception work begins. Keep this before destructive
-			// preflight while ensuring a directly acquired admission is always released.
-			throwIfPromptAdmissionCancelled(options?.signal);
-			options?.admissionCommitted?.();
-			if (admission) {
-				await this._turnAdmissionContext.run(admission.owner, () =>
-					this._promptUnserialized(text, options, releaseAdmission),
-				);
-			} else {
-				await this._promptUnserialized(text, options, releaseAdmission);
-			}
-		} finally {
-			releaseAdmission();
-		}
-		if (admission) {
-			this._scheduleSessionInputPump();
-			// promptUntilAccepted resolves at ownership commit, before queued work runs.
-			if (!options?.returnAfterAccepted) await this._sessionInputPump;
-		}
-	}
+		const admission = this.isStreaming
+			? undefined
+			: await this._acquireSessionActionAdmission({ signal: options?.signal });
+		const reportPreflight = oncePreflight(options?.preflightResult);
+		const run = async () => {
+			try {
+				throwIfPromptAdmissionCancelled(options?.signal);
+				options?.admissionCommitted?.();
+				const isInternalPrompt = options?.internalPrompt === true;
+				const expandPromptTemplates = isInternalPrompt ? false : (options?.expandPromptTemplates ?? true);
+				const normalizationResult = this._normalizeSubmission(text, options?.images, {
+					parseSessionCommands: !isInternalPrompt && !options?.skipPrePromptWork,
+					extensionCommands: expandPromptTemplates ? "execute" : "ignore",
+					inputSource:
+						!isInternalPrompt && !options?.skipInputHandlers ? (options?.source ?? "interactive") : undefined,
+					expandSkills: expandPromptTemplates,
+					expandPromptTemplates,
+				});
+				const normalized = normalizationResult instanceof Promise ? await normalizationResult : normalizationResult;
+				if (normalized.kind === "extensionCommand") {
+					reportPreflight(true);
+					void normalized.completion.then(
+						() => this._settleAgentMessage(options?.agentMessageId, "completion"),
+						(error) => this._settleAgentMessage(options?.agentMessageId, "completion", error),
+					);
+					void normalized.completion.catch(() => undefined);
+					if (!options?.returnAfterAccepted) await normalized.completion.catch(() => undefined);
+					return;
+				}
+				if (normalized.kind === "handled") {
+					reportPreflight(true);
+					this._settleAgentMessage(options?.agentMessageId, "completion");
+					return;
+				}
 
-	private async _promptUnserialized(
-		text: string,
-		options: InternalPromptOptions | undefined,
-		releaseAdmission: () => void,
-	): Promise<void> {
-		const isInternalPrompt = options?.internalPrompt === true;
-		const expandPromptTemplates = isInternalPrompt ? false : (options?.expandPromptTemplates ?? true);
-		const endDirectPromptSection = this._enterDirectPromptSection();
-		const reportInput = oncePreflight(options?.preflightResult);
-		const reportPreflight: typeof reportInput = (success, queued) => {
-			endDirectPromptSection();
-			reportInput(success, queued);
-		};
-		let messages: AgentMessage[] | undefined;
-		let primaryPromptMessage: QueuedAgentMessage | undefined;
-		let acceptedAgentMessagePrompt: AcceptedAgentMessagePrompt | undefined;
-		let drainedNextTurnMessages: CustomMessage[] = [];
-		let preparation: PreparedPromptPreparation | undefined;
-		let expandedText = text;
-		let currentImages = options?.images;
+				const pendingOwnedWork = this._actionStore.unfinishedActions().length > 0;
+				const wasRuntimeBusy = this.isStreaming || this.isCompacting || this.isRetrying || this.isBashRunning;
+				const wasBusy = wasRuntimeBusy || pendingOwnedWork;
+				if (normalized.kind === "sessionCommand") {
+					const schedule = options?.streamingBehavior ?? (this.isStreaming ? "steer" : "followUp");
+					const action = this._createSessionCommandAction(
+						normalized.text,
+						normalized.command,
+						normalized.images,
+						schedule,
+						{
+							agentMessageId: options?.agentMessageId,
+							source: isInternalPrompt ? "internal" : (options?.source ?? "interactive"),
+						},
+					);
+					const result = this._admitSessionInput(action, {
+						immediatelyEligible: !wasBusy && this._canStartSessionActionImmediately(),
+					});
+					reportPreflight(result.accepted, result.disposition === "queued");
+					if (!result.accepted || !result.ticket) return;
+					admission?.release();
+					if (options?.returnAfterAccepted) {
+						if (result.disposition === "starts_when_admitted") await result.ticket.delivered;
+						return;
+					}
+					if (wasRuntimeBusy) return;
+					await this.waitForSessionInputIdle();
+					return;
+				}
 
-		try {
-			const normalizationResult = this._normalizeSubmission(text, currentImages, {
-				parseSessionCommands: !isInternalPrompt && !options?.skipPrePromptWork,
-				extensionCommands: expandPromptTemplates ? "execute" : "ignore",
-				inputSource:
-					!isInternalPrompt && !options?.skipInputHandlers ? (options?.source ?? "interactive") : undefined,
-				expandSkills: expandPromptTemplates,
-				expandPromptTemplates,
-			});
-			const normalized = normalizationResult instanceof Promise ? await normalizationResult : normalizationResult;
-			if (normalized.kind === "sessionCommand") {
-				const wasBusy =
-					this.isStreaming ||
-					this.isCompacting ||
-					this.isRetrying ||
-					this.isBashRunning ||
-					this.hasAcceptedPromptInFlight ||
-					this._sessionInputPumpSuspended ||
-					this._queuedWorkPauses.size > 0 ||
-					this._actionStore.activeActions().length > 0 ||
-					this.pendingMessageCount > 0;
-				const schedule = options?.streamingBehavior ?? (this.isStreaming ? "steer" : "followUp");
-				const queued = this._enqueueSessionInput(
-					this._createSessionCommandAction(normalized.text, normalized.command, normalized.images, schedule, {
-						agentMessageId: options?.agentMessageId,
-						source: isInternalPrompt ? "internal" : (options?.source ?? "interactive"),
-					}),
-				);
-				reportPreflight(queued, queued);
-				releaseAdmission();
-				if (!wasBusy && !options?.returnAfterAccepted) await this._sessionInputPump;
-				return;
-			}
-			if (normalized.kind === "extensionCommand") {
-				reportPreflight(true);
-				void normalized.completion.then(
-					() => this._settleAgentMessage(options?.agentMessageId, "completion"),
-					(error) => this._settleAgentMessage(options?.agentMessageId, "completion", error),
-				);
-				void normalized.completion.catch(() => undefined);
-				if (!options?.returnAfterAccepted) await normalized.completion.catch(() => undefined);
-				return;
-			}
-			if (normalized.kind === "handled") {
-				reportPreflight(true);
-				this._settleAgentMessage(options?.agentMessageId, "completion");
-				return;
-			}
-			expandedText = normalized.text;
-			currentImages = normalized.images;
-
-			// If streaming, or a caller explicitly asked to respect existing queued work,
-			// enqueue according to the requested behavior.
-			const shouldQueueForStreaming = this.isStreaming;
-			const shouldQueueForPendingWork = options?.queueIfBusy === true && this._isBusyForSessionInput("preflight");
-			if (shouldQueueForStreaming || shouldQueueForPendingWork) {
-				if (!options?.streamingBehavior) {
-					const stateDescription = shouldQueueForStreaming
-						? "Agent is already processing"
-						: "Agent has queued work";
+				const queueForStreaming = this.isStreaming;
+				const queueForBusy = options?.queueIfBusy === true && this._isBusyForSessionInput("preflight");
+				const visibleQueued = queueForStreaming || queueForBusy;
+				if (visibleQueued && !options?.streamingBehavior) {
+					const stateDescription = queueForStreaming ? "Agent is already processing" : "Agent has queued work";
 					throw new Error(
 						`${stateDescription}. Specify streamingBehavior ('steer' or 'followUp') to queue the message.`,
 					);
 				}
-				await this._queueWithPendingNextTurnMessages(expandedText, options.streamingBehavior, reportPreflight, {
-					images: currentImages,
-					queueKey: options.followUpQueueKey,
-					agentMessageId: options.agentMessageId,
-					suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-					message: options.customMessage,
-					resumeIfIdle: options.resumeIfIdle,
-					source: isInternalPrompt ? "internal" : (options.source ?? "interactive"),
+				const schedule = options?.streamingBehavior ?? "followUp";
+				const prefixMessages = visibleQueued ? this._takePendingNextTurnMessages() : undefined;
+				const content = options?.content
+					? options.content.map((block) => ({ ...block }))
+					: this._buildPromptContent(normalized.text, normalized.images);
+				const suppliedMessage = options?.customMessage;
+				const primaryMessage = suppliedMessage
+					? visibleQueued
+						? suppliedMessage
+						: cloneCustomMessage(suppliedMessage)
+					: ({
+							role: "user",
+							content: content.map((block) => ({ ...block })),
+							timestamp: Date.now(),
+						} satisfies UserMessage);
+				const acceptedAgentMessage = options?.skipPrePromptWork === true && options.returnAfterAccepted === true;
+				const action = this._createPreparedTurnAction(schedule, normalized.text, normalized.images, {
+					agentMessageId: options?.agentMessageId,
+					queueKey: options?.followUpQueueKey,
+					content,
+					message: primaryMessage,
+					prefixMessages,
+					suppressAutonomousContinuation: options?.suppressAutonomousContinuation,
+					resumeIfIdle:
+						!visibleQueued ||
+						options?.resumeIfIdle ||
+						(options?.queueIfBusy === true && canSelectSessionAction(this._runtimeActivity())),
+					source: isInternalPrompt ? "internal" : (options?.source ?? "interactive"),
+					executionPolicy: visibleQueued
+						? this._turnExecutionPolicy("queued")
+						: this._turnExecutionPolicy("directPrompt", {
+								returnAfterAccepted: options?.returnAfterAccepted,
+								skipPrePromptWork: options?.skipPrePromptWork,
+							}),
+					queueVisible: visibleQueued,
+					acceptedAgentMessage,
+					acceptedBeforeCompletion: options?.returnAfterAccepted === true,
 				});
-
-				return;
-			}
-
-			messages = await this._prepareForCommit(
-				{
-					initialRefineBarrier: options?.returnAfterAccepted ? "skip" : "always",
-					flushPendingBashBeforeValidation: true,
-					preTurnCompaction: options?.skipPrePromptWork ? "skip" : "afterModelSelection",
-					finalRefineBarrier: "ifInFlight",
-				},
-				{
-					prepare: async () => {
-						const buildUserContent = (): (TextContent | ImageContent)[] => {
-							const userContent: (TextContent | ImageContent)[] = options?.content
-								? options.content.map((block) => ({ ...block }))
-								: [{ type: "text", text: expandedText }];
-							if (!options?.content && currentImages) userContent.push(...currentImages);
-							return userContent;
-						};
-						drainedNextTurnMessages = this._pendingNextTurnMessages;
-						this._pendingNextTurnMessages = [];
-						const preparedMessages: AgentMessage[] = [...drainedNextTurnMessages];
-						primaryPromptMessage = options?.customMessage
-							? cloneCustomMessage(options.customMessage)
-							: { role: "user", content: buildUserContent(), timestamp: Date.now() };
-						preparedMessages.push(primaryPromptMessage);
-
-						if (options?.skipPrePromptWork) {
-							this.agent.state.systemPrompt = this._baseSystemPrompt;
-							if (options.agentMessageId !== undefined && options.returnAfterAccepted) {
-								let resolveAccepted = () => {};
-								let rejectAccepted = (_error: Error) => {};
-								const accepted = new Promise<void>((resolve, reject) => {
-									resolveAccepted = resolve;
-									rejectAccepted = reject;
-								});
-								acceptedAgentMessagePrompt = {
-									text: expandedText,
-									agentMessageId: options.agentMessageId,
-									message: primaryPromptMessage,
-									messages: new Set<AgentMessage>([...drainedNextTurnMessages, primaryPromptMessage]),
-									pendingNextTurnMessages: drainedNextTurnMessages,
-									deliveredPendingNextTurnMessages: new Set(),
-									accepted,
-									resolveAccepted,
-									rejectAccepted,
-									turnStarted: false,
-									cleared: false,
-								};
-							}
-							return { messages: preparedMessages, preparation: undefined };
+				if (action.suppressAutonomousContinuation) {
+					this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
+				}
+				const result = this._admitSessionInput(action, { immediatelyEligible: !visibleQueued });
+				if (!result.accepted || !result.ticket) {
+					if (prefixMessages) this._pendingNextTurnMessages.unshift(...prefixMessages);
+					reportPreflight(false, false);
+					return;
+				}
+				if (result.disposition === "queued") {
+					reportPreflight(true, true);
+				} else {
+					void result.ticket.delivered.then(
+						() => reportPreflight(true),
+						() => reportPreflight(false),
+					);
+				}
+				const rollbackObserver =
+					acceptedAgentMessage && options?.queueIfBusy === true && result.disposition === "starts_when_admitted"
+						? this._observeSessionActionRollback(action)
+						: undefined;
+				admission?.release();
+				if (acceptedAgentMessage && !queueForStreaming && !queueForBusy) {
+					try {
+						const outcome = rollbackObserver
+							? await Promise.race([
+									result.ticket.delivered.then(() => "delivered" as const),
+									rollbackObserver.rolledBack.then(() => "rolled_back" as const),
+								])
+							: await result.ticket.delivered.then(() => "delivered" as const);
+						if (outcome === "rolled_back" && !options?.streamingBehavior) {
+							const error = new Error(
+								"Agent became busy before prompt delivery. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+							);
+							this._rejectAgentMessage(action.agentMessageId, error);
+							this._cancelSessionActions((candidate) => candidate === action, error);
+							this._emitQueueUpdate();
+							throw error;
 						}
-
-						const basePromptSnapshot = this._baseSystemPrompt;
-						const result = await this._extensionRunner.emitBeforeAgentStart(
-							expandedText,
-							currentImages,
-							basePromptSnapshot,
-							this._baseSystemPromptOptions,
-						);
-						preparation = { result, basePromptSnapshot };
-						this._appendBeforeAgentStartMessages(preparedMessages, result);
-						this._applyPreparedSystemPrompt(preparation, false);
-						return { messages: preparedMessages, preparation };
-					},
-					beforeFinalRefineBarrier: () => {
-						if (acceptedAgentMessagePrompt) this._acceptedAgentMessagePrompt = acceptedAgentMessagePrompt;
-					},
-					commit: (prepared, passedFinalRefineBarrier) => {
-						if (passedFinalRefineBarrier) this._applyPreparedSystemPrompt(prepared.preparation, false);
-						return prepared.messages;
-					},
-				},
-			);
-		} catch (error) {
-			reportPreflight(false);
-			throw error;
-		}
-
-		if (!messages) {
-			endDirectPromptSection();
-			return;
-		}
-		if (this._refineInFlight) {
-			await this._waitForRefineIdle();
-		}
-		this._applyPreparedSystemPrompt(preparation, false);
-
-		if (acceptedAgentMessagePrompt?.cleared) {
-			reportPreflight(false);
-			throw new Error("Accepted agent message was cleared before delivery.");
-		}
-		const shouldQueueAtHandoff =
-			options?.queueIfBusy === true && this._isBusyForSessionInput("handoff", acceptedAgentMessagePrompt);
-		if (shouldQueueAtHandoff) {
-			if (acceptedAgentMessagePrompt && this._acceptedAgentMessagePrompt === acceptedAgentMessagePrompt) {
-				this._acceptedAgentMessagePrompt = undefined;
-			}
-			this._pendingNextTurnMessages.unshift(...drainedNextTurnMessages.map((message) => ({ ...message })));
-			if (!options?.streamingBehavior) {
-				reportPreflight(false);
-				throw new Error(
-					"Agent became busy before prompt delivery. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
-				);
-			}
-			try {
-				await this._queueWithPendingNextTurnMessages(expandedText, options.streamingBehavior, reportPreflight, {
-					images: currentImages,
-					queueKey: options.followUpQueueKey,
-					agentMessageId: options.agentMessageId,
-					suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-					message: options.customMessage,
-					resumeIfIdle: options.resumeIfIdle,
-					source: isInternalPrompt ? "internal" : (options.source ?? "interactive"),
-				});
+						return;
+					} finally {
+						rollbackObserver?.stop();
+					}
+				}
+				if (options?.returnAfterAccepted) {
+					if (result.disposition === "starts_when_admitted") await result.ticket.delivered;
+					return;
+				}
+				if (visibleQueued) return;
+				await result.ticket.completed;
+				await this.waitForSessionInputIdle();
 			} catch (error) {
-				// A failed enqueue must still settle the preflight outcome, or the
-				// direct-prompt section would fence checkpoints forever.
 				reportPreflight(false);
 				throw error;
+			} finally {
+				admission?.release();
 			}
-
-			return;
-		}
-		if (options?.suppressAutonomousContinuation) {
-			for (const message of messages) {
-				this._markAutonomousContinuationSuppressed(message);
-			}
-		}
-		if (!primaryPromptMessage) {
-			reportPreflight(false);
-			throw new Error("Direct prompt is missing its primary message");
-		}
-		const dispatch = this._dispatchPromptWithFence(
-			messages,
-			acceptedAgentMessagePrompt ? undefined : primaryPromptMessage,
-			drainedNextTurnMessages,
-			{
-				releaseAdmission,
-				suppressAutonomousContinuation: options?.suppressAutonomousContinuation,
-			},
-		);
-		const promptAccepted = Symbol("promptAccepted");
-		const acceptance = acceptedAgentMessagePrompt
-			? acceptedAgentMessagePrompt.accepted.then(
-					() => promptAccepted,
-					(error: unknown) => error,
-				)
-			: dispatch.deliveryObserved!.then(() => promptAccepted);
-		const firstOutcome = await Promise.race([
-			dispatch.promptPromise.then(
-				() => undefined,
-				(error: unknown) => error,
-			),
-			acceptance,
-		]);
-		dispatch.stopDeliveryObservation();
-		if (firstOutcome !== undefined && firstOutcome !== promptAccepted) {
-			// A cleared prompt stays set until the aborted run's agent_end cleanup nulls it;
-			// nulling here would let the run's late events re-persist cleared messages.
-			if (
-				this._acceptedAgentMessagePrompt === acceptedAgentMessagePrompt &&
-				!this._acceptedAgentMessagePrompt?.cleared
-			) {
-				this._acceptedAgentMessagePrompt = undefined;
-			}
-			if (acceptedAgentMessagePrompt && !acceptedAgentMessagePrompt.cleared) {
-				const deliveredPendingNextTurnMessages = acceptedAgentMessagePrompt.deliveredPendingNextTurnMessages;
-				dispatch.restorePendingNextTurnMessages((message) => deliveredPendingNextTurnMessages.has(message));
-			}
-			reportPreflight(false);
-			throw firstOutcome;
-		}
-		reportPreflight(true);
-		const promptCompletion = dispatch.promptPromise.then(async () => {
-			await this.waitForRetry();
-		});
-		if (options?.agentMessageId) {
-			void promptCompletion.then(
-				() => this._settleAgentMessage(options.agentMessageId, "completion"),
-				(error) => this._settleAgentMessage(options.agentMessageId, "completion", this._asError(error)),
-			);
-		}
-		void promptCompletion
-			.finally(() => {
-				if (
-					this._acceptedAgentMessagePrompt === acceptedAgentMessagePrompt &&
-					!this._acceptedAgentMessagePrompt?.cleared
-				) {
-					this._acceptedAgentMessagePrompt = undefined;
-				}
-				this._scheduleSessionInputPump();
-			})
-			.catch(() => undefined);
-		if (options?.returnAfterAccepted) {
-			this._acceptedPromptCompletions.add(promptCompletion);
-			void promptCompletion
-				.finally(() => this._acceptedPromptCompletions.delete(promptCompletion))
-				.catch(() => undefined);
-			return;
-		}
-		await promptCompletion;
+		};
+		return admission ? this._turnAdmissionContext.run(admission.owner, run) : run();
 	}
 
 	private _executeExtensionCommand(text: string): Promise<void> | undefined {
@@ -4937,13 +4681,13 @@ export class AgentSession {
 		if (!isSessionSlashCommandMessage(customMessage) || text !== customMessage.details.command.text) {
 			return undefined;
 		}
-		return this._enqueueSessionInput(
+		return this._admitSessionInput(
 			this._createSessionCommandAction(text, customMessage.details.command, images, schedule, {
 				agentMessageId,
 				source: "internal",
 			}),
 			{ restore: true },
-		);
+		).accepted;
 	}
 
 	private _restoreLegacyRecoveryPrompt(
@@ -5025,42 +4769,10 @@ export class AgentSession {
 		return content;
 	}
 
-	/** Queue via the requested lane, restoring drained next-turn context on failure, and report preflight. */
-	private async _queueWithPendingNextTurnMessages(
-		text: string,
-		streamingBehavior: "steer" | "followUp",
-		reportPreflight: (success: boolean, queued?: boolean) => void,
-		options: {
-			images?: ImageContent[];
-			queueKey?: string;
-			agentMessageId?: string;
-			message?: QueuedAgentMessage;
-			previewLabel?: string;
-			suppressAutonomousContinuation?: boolean;
-			resumeIfIdle?: boolean;
-			source?: InputSource | "internal";
-		} = {},
-	): Promise<void> {
-		const pendingNextTurnMessages = this._pendingNextTurnMessages;
+	private _takePendingNextTurnMessages(): CustomMessage[] {
+		const messages = this._pendingNextTurnMessages;
 		this._pendingNextTurnMessages = [];
-		let queued: boolean;
-		try {
-			queued = await this._queuePreparedPrompt(streamingBehavior, text, options.images, {
-				queueKey: options.queueKey,
-				agentMessageId: options.agentMessageId,
-				message: options.message,
-				prefixMessages: pendingNextTurnMessages,
-				previewLabel: options.previewLabel,
-				suppressAutonomousContinuation: options.suppressAutonomousContinuation,
-				resumeIfIdle: options.resumeIfIdle,
-				source: options.source,
-			});
-			if (!queued) this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
-		} catch (error) {
-			this._pendingNextTurnMessages.unshift(...pendingNextTurnMessages);
-			throw error;
-		}
-		reportPreflight(queued, queued);
+		return messages;
 	}
 
 	private _deliveryPolicy(schedule: SessionInputSchedule): DeliveryPolicy {
@@ -5082,6 +4794,74 @@ export class AgentSession {
 		};
 	}
 
+	private _turnExecutionPolicy(
+		kind: "queued" | "directPrompt" | "injected" | "customTrigger" | "goalContext",
+		options: { returnAfterAccepted?: boolean; skipPrePromptWork?: boolean } = {},
+	): TurnExecutionPolicy {
+		if (kind === "queued") {
+			return {
+				preparation: {
+					initialRefineBarrier: "skip",
+					flushPendingBashBeforeValidation: false,
+					validateModelAndAuth: true,
+					awaitPendingModelSelection: true,
+					preTurnCompaction: "beforeModelSelection",
+					finalRefineBarrier: "always",
+				},
+				runBeforeAgentStart: true,
+				nextTurnContextTiming: "commit",
+				preserveEmptyExtensionPrompt: true,
+				completionIncludesRetryChain: true,
+			};
+		}
+		if (kind === "directPrompt") {
+			return {
+				preparation: {
+					initialRefineBarrier: options.returnAfterAccepted ? "skip" : "always",
+					flushPendingBashBeforeValidation: true,
+					validateModelAndAuth: true,
+					awaitPendingModelSelection: true,
+					preTurnCompaction: options.skipPrePromptWork ? "skip" : "afterModelSelection",
+					finalRefineBarrier: "ifInFlight",
+				},
+				runBeforeAgentStart: !options.skipPrePromptWork,
+				nextTurnContextTiming: "preparation",
+				preserveEmptyExtensionPrompt: false,
+				completionIncludesRetryChain: true,
+			};
+		}
+		if (kind === "injected") {
+			return {
+				preparation: {
+					initialRefineBarrier: "always",
+					flushPendingBashBeforeValidation: true,
+					validateModelAndAuth: true,
+					awaitPendingModelSelection: true,
+					preTurnCompaction: "beforeModelSelection",
+					finalRefineBarrier: "ifInFlight",
+				},
+				runBeforeAgentStart: true,
+				nextTurnContextTiming: "preparation",
+				preserveEmptyExtensionPrompt: true,
+				completionIncludesRetryChain: true,
+			};
+		}
+		return {
+			preparation: {
+				initialRefineBarrier: kind === "goalContext" ? "skip" : "always",
+				flushPendingBashBeforeValidation: false,
+				validateModelAndAuth: kind === "goalContext",
+				awaitPendingModelSelection: false,
+				preTurnCompaction: "skip",
+				finalRefineBarrier: kind === "goalContext" ? "always" : "skip",
+			},
+			runBeforeAgentStart: false,
+			nextTurnContextTiming: "skip",
+			preserveEmptyExtensionPrompt: false,
+			completionIncludesRetryChain: kind === "goalContext",
+		};
+	}
+
 	private _createPreparedTurnAction(
 		schedule: SessionInputSchedule,
 		text: string,
@@ -5096,6 +4876,10 @@ export class AgentSession {
 			suppressAutonomousContinuation?: boolean;
 			resumeIfIdle?: boolean;
 			source?: InputSource | "internal";
+			executionPolicy?: TurnExecutionPolicy;
+			queueVisible?: boolean;
+			acceptedAgentMessage?: boolean;
+			acceptedBeforeCompletion?: boolean;
 		},
 	): QueuedSessionAction {
 		const id = randomUUID();
@@ -5120,6 +4904,10 @@ export class AgentSession {
 			images: images?.map((image) => ({ ...image })),
 			content: content.map((block) => ({ ...block })),
 			customMessage: options.message?.role === "custom" ? cloneCustomMessage(options.message) : undefined,
+			executionPolicy: options.executionPolicy ?? this._turnExecutionPolicy("queued"),
+			queueVisible: options.queueVisible ?? true,
+			acceptedAgentMessage: options.acceptedAgentMessage ?? false,
+			acceptedBeforeCompletion: options.acceptedBeforeCompletion ?? false,
 		};
 		return {
 			id,
@@ -5170,10 +4958,10 @@ export class AgentSession {
 			);
 	}
 
-	private _enqueueSessionInput(
+	private _admitSessionInput(
 		action: QueuedSessionAction,
-		options: { restore?: boolean; front?: boolean; wake?: boolean } = {},
-	): boolean {
+		options: { restore?: boolean; front?: boolean; wake?: boolean; immediatelyEligible?: boolean } = {},
+	): { accepted: boolean; disposition: "starts_when_admitted" | "queued"; ticket?: ActionTicket } {
 		const coalescedOwner = this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
@@ -5182,28 +4970,31 @@ export class AgentSession {
 					new Error("Prompt was not queued because an equivalent follow-up is already pending."),
 				);
 			}
-			return false;
+			return { accepted: false, disposition: "queued" };
 		}
+		const canStartImmediately =
+			options.immediatelyEligible === true &&
+			(this._actionStore.unfinishedActions().length === 0 || options.front === true);
 		if (options.front) this._actionStore.enqueueFront(action);
 		else this._actionStore.enqueue(action);
-		this._actionStore.ticketFor(action).settleAccepted({
-			status: "accepted",
-			actionId: action.id,
-			disposition: "queued",
-		});
+		let disposition: "starts_when_admitted" | "queued" = "queued";
+		if (canStartImmediately && this._actionStore.selectFirst() === action) disposition = "starts_when_admitted";
+		const controller = this._actionStore.ticketFor(action);
+		controller.settleAccepted({ status: "accepted", actionId: action.id, disposition });
 		this._sessionInputArrivalEpoch++;
 		this._emitQueueUpdate();
 		if (
 			!options.restore &&
 			options.wake !== false &&
-			((action.delivery === "next_turn_boundary" && this.isStreaming) ||
+			(disposition === "starts_when_admitted" ||
+				(action.delivery === "next_turn_boundary" && this.isStreaming) ||
 				action.payload.kind === "session_command" ||
 				action.wake === "immediate")
 		) {
 			if (action.payload.kind === "turn" && action.wake === "immediate") this._sessionInputPumpSuspended = false;
 			this._scheduleSessionInputPump();
 		}
-		return true;
+		return { accepted: true, disposition, ticket: controller.ticket };
 	}
 
 	private async _queuePreparedPrompt(
@@ -5226,7 +5017,7 @@ export class AgentSession {
 		if (action.suppressAutonomousContinuation) {
 			this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 		}
-		return this._enqueueSessionInput(action);
+		return this._admitSessionInput(action).accepted;
 	}
 
 	private _runtimeActivity(mandatoryCheckpointsComplete = true): RuntimeActivity {
@@ -5236,21 +5027,23 @@ export class AgentSession {
 			retry: this.isRetrying,
 			bash: this.isBashRunning,
 			refinementApply: this._refineInFlight !== undefined,
-			branchMutation: this._branchSummaryOperation !== undefined || this._acceptedPromptCompletions.size > 0,
+			branchMutation: this._branchSummaryOperation !== undefined,
 			schedulerPauseCount: this._queuedWorkPauses.size + (this._sessionInputPumpSuspended ? 1 : 0),
 			disposing: this._disposed || this._disposing,
 			mandatoryCheckpointsComplete,
 		};
 	}
 
+	private _hasSelectableSessionInput(): boolean {
+		return (
+			this._actionStore.queuedActions().length > 0 ||
+			this._actionStore.activeActions().some((action) => action.lifecycle.state === "selected")
+		);
+	}
+
 	private _scheduleSessionInputPump(): void {
 		if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) return;
-		if (
-			this._disposed ||
-			this._disposing ||
-			this._sessionInputPumpRequested ||
-			this._actionStore.queuedActions().length === 0
-		) {
+		if (this._disposed || this._disposing || this._sessionInputPumpRequested || !this._hasSelectableSessionInput()) {
 			return;
 		}
 		this._sessionInputPumpRequested = true;
@@ -5267,115 +5060,149 @@ export class AgentSession {
 		this._pumpingSessionInput = true;
 		let blocked = false;
 		try {
-			while (!this._disposed && !this._disposing && this._actionStore.queuedActions().length > 0) {
+			while (!this._disposed && !this._disposing && this._hasSelectableSessionInput()) {
+				await this.agent.waitForIdle();
 				const admission = await this._acquireTurnAdmission();
 				try {
-					await this.agent.waitForIdle();
-					if (epoch !== this._sessionInputPumpEpoch) return;
-					await this._agentEventQueue;
-					await this._waitForRefineIdle();
-					if (this._isSessionInputHandoffDeferred(epoch) || !canSelectSessionAction(this._runtimeActivity())) {
-						blocked = true;
-						return;
-					}
-
-					const first = this._actionStore.selectFirst();
-					if (!first) continue;
-					if (first.payload.kind === "session_command") {
-						await this._executeSelectedSessionCommand(first);
-						continue;
-					}
-
-					const mode = first.delivery === "next_turn_boundary" ? this.steeringMode : this.followUpMode;
-					const actions: QueuedSessionAction[] = [first];
-					while (mode === "all") {
-						const next = this._actionStore.queuedActions(first.delivery)[0];
-						if (!next || next.payload.kind !== "turn") break;
-						this._actionStore.selectFirst();
-						actions.push(next);
-					}
-					if (epoch !== this._sessionInputPumpEpoch) {
-						for (const action of actions) this._actionStore.rollback(action);
-						return;
-					}
-					for (const action of actions) transitionSessionAction(action, { state: "preparing" });
-					this._notifySessionInputCheckpointChange();
-					this._emitQueueUpdate();
-					try {
-						await this._startPreparedTurnActions(actions, epoch, admission.release);
-						for (const action of actions) {
-							if (action.lifecycle.state === "committing") {
-								const primary = primaryDeliveryRecord(action);
-								if (this.agent.state.messages.includes(primary.message)) {
-									primary.durable = true;
-									transitionSessionAction(action, { state: "running", execution: "agent_turn" });
-								}
+					await this._turnAdmissionContext.run(admission.owner, async () => {
+						const preselected = this._actionStore
+							.activeActions()
+							.find((action) => action.lifecycle.state === "selected");
+						if (epoch !== this._sessionInputPumpEpoch) {
+							if (preselected) {
+								this._actionStore.rollback(preselected);
+								this._notifySessionInputCheckpointChange();
+								this._emitQueueUpdate();
 							}
-							if (action.lifecycle.state === "running") {
-								transitionSessionAction(action, { state: "completed" });
-								this._actionStore.ticketFor(action).settleCompleted();
-								this._settleAgentMessage(action.agentMessageId, "completion");
-							}
+							return;
 						}
-					} catch (error) {
-						const transcript = this.agent.state.messages;
-						const delivered = new Set(transcript);
-						const undelivered: QueuedSessionAction[] = [];
-						for (const action of actions) {
-							if (action.payload.kind !== "turn" || action.lifecycle.state === "cancelled") continue;
-							for (const record of action.payload.records) record.durable = delivered.has(record.message);
-							action.payload.records = action.payload.records.filter((record) => {
-								if (record.role === "prefix") return !record.durable;
-								if (record.role === "next_turn") return record.durable;
-								return true;
-							});
-							if (!primaryDeliveryRecord(action).durable) undelivered.push(action);
-						}
-						if (this._isDeferredSessionInputError(error, epoch)) {
-							for (const action of undelivered) {
-								if (action.lifecycle.state === "committing") {
-									this._actionStore.rollback(action, { dispatchSettled: true, transcript });
-								} else if (action.lifecycle.state === "preparing" || action.lifecycle.state === "selected") {
-									this._actionStore.rollback(action);
-								}
-							}
-							if (undelivered.length > 0) this._emitQueueUpdate();
+						if (!this._hasCancelledDispatchCapture()) await this._agentEventQueue;
+						if (!preselected || preselected.payload.kind === "session_command") await this._waitForRefineIdle();
+						const activity = this._runtimeActivity();
+						const canSelectPreselectedTurn =
+							preselected?.payload.kind === "turn" &&
+							canSelectSessionAction({ ...activity, refinementApply: false });
+						if (
+							this._isSessionInputHandoffDeferred(epoch) ||
+							(!canSelectPreselectedTurn && !canSelectSessionAction(activity))
+						) {
 							blocked = true;
 							return;
 						}
-						const terminalError = this._asError(error);
-						for (const action of actions) {
-							if (action.lifecycle.state === "cancelled") continue;
-							if (action.lifecycle.state !== "completed" && action.lifecycle.state !== "failed") {
-								transitionSessionAction(action, { state: "failed", error: terminalError });
-							}
-							if (undelivered.includes(action)) {
-								this._settleAgentMessage(action.agentMessageId, "delivery", terminalError);
-							}
-							this._settleAgentMessage(action.agentMessageId, "completion", terminalError);
-							this._actionStore.ticketFor(action).settleCompleted(terminalError);
+						const first = preselected ?? this._actionStore.selectFirst();
+						if (!first) return;
+						if (first.payload.kind === "session_command") {
+							await this._executeSelectedSessionCommand(first);
+							return;
 						}
-						this._surfaceSessionInputError(error);
-					} finally {
-						for (const action of actions) {
+
+						const mode = first.delivery === "next_turn_boundary" ? this.steeringMode : this.followUpMode;
+						const actions: QueuedSessionAction[] = [first];
+						while (!preselected && mode === "all") {
+							const next = this._actionStore.queuedActions(first.delivery)[0];
 							if (
-								action.lifecycle.state === "completed" ||
-								action.lifecycle.state === "failed" ||
-								action.lifecycle.state === "cancelled"
+								!next ||
+								next.payload.kind !== "turn" ||
+								!turnExecutionPoliciesEqual(first.payload.executionPolicy, next.payload.executionPolicy)
 							) {
-								this._actionStore.releaseTerminal(action);
+								break;
 							}
+							this._actionStore.selectFirst();
+							actions.push(next);
 						}
+						if (epoch !== this._sessionInputPumpEpoch) {
+							for (const action of actions) this._actionStore.rollback(action);
+							return;
+						}
+						for (const action of actions) transitionSessionAction(action, { state: "preparing" });
 						this._notifySessionInputCheckpointChange();
 						this._emitQueueUpdate();
-					}
+						try {
+							await this._startPreparedTurnActions(actions, epoch, admission.release);
+							for (const action of actions) {
+								if (action.lifecycle.state === "committing") {
+									const primary = primaryDeliveryRecord(action);
+									if (this.agent.state.messages.includes(primary.message)) {
+										primary.durable = true;
+										transitionSessionAction(action, { state: "running", execution: "agent_turn" });
+									}
+								}
+								if (action.lifecycle.state === "running") {
+									transitionSessionAction(action, { state: "completed" });
+									this._actionStore.ticketFor(action).settleCompleted();
+									this._settleAgentMessage(action.agentMessageId, "completion");
+								}
+							}
+						} catch (error) {
+							const transcript = this.agent.state.messages;
+							const delivered = new Set(transcript);
+							const undelivered: QueuedSessionAction[] = [];
+							for (const action of actions) {
+								if (action.payload.kind !== "turn" || action.lifecycle.state === "cancelled") continue;
+								for (const record of action.payload.records) record.durable ||= delivered.has(record.message);
+								action.payload.records = action.payload.records.filter((record) => {
+									if (record.role === "prefix") return !record.durable;
+									if (record.role === "next_turn") return record.durable;
+									return true;
+								});
+								if (!primaryDeliveryRecord(action).durable) undelivered.push(action);
+							}
+							if (this._isDeferredSessionInputError(error, epoch)) {
+								for (const action of undelivered) {
+									if (action.lifecycle.state === "committing") {
+										this._actionStore.rollback(action, { dispatchSettled: true, transcript });
+									} else if (action.lifecycle.state === "preparing" || action.lifecycle.state === "selected") {
+										this._actionStore.rollback(action);
+									}
+								}
+								if (undelivered.length > 0) this._emitQueueUpdate();
+								blocked = true;
+								return;
+							}
+							const terminalError = this._asError(error);
+							for (const action of actions) {
+								if (action.lifecycle.state === "cancelled") continue;
+								if (action.lifecycle.state !== "completed" && action.lifecycle.state !== "failed") {
+									transitionSessionAction(action, { state: "failed", error: terminalError });
+								}
+								const ticket = this._actionStore.ticketFor(action);
+								if (undelivered.includes(action)) {
+									ticket.rejectDelivered(terminalError);
+									this._settleAgentMessage(action.agentMessageId, "delivery", terminalError);
+								}
+								this._settleAgentMessage(action.agentMessageId, "completion", terminalError);
+								ticket.settleCompleted(terminalError);
+							}
+							if (actions.some((action) => action.payload.kind !== "turn" || action.payload.queueVisible)) {
+								this._surfaceSessionInputError(error);
+							}
+						} finally {
+							for (const action of actions) {
+								const retainedCancelledDispatch =
+									action.lifecycle.state === "cancelled" &&
+									action.payload.kind === "turn" &&
+									action.payload.captureRunMessages !== undefined;
+								if (
+									!retainedCancelledDispatch &&
+									(action.lifecycle.state === "completed" ||
+										action.lifecycle.state === "failed" ||
+										action.lifecycle.state === "cancelled")
+								) {
+									this._actionStore.releaseTerminal(action);
+								}
+							}
+							this._notifySessionInputCheckpointChange();
+							this._emitQueueUpdate();
+						}
+					});
 				} finally {
 					admission.release();
 				}
+				if (epoch !== this._sessionInputPumpEpoch || blocked) return;
 			}
 		} finally {
 			this._pumpingSessionInput = false;
-			if (!blocked && epoch === this._sessionInputPumpEpoch && this._actionStore.queuedActions().length > 0) {
+			if (!blocked && epoch === this._sessionInputPumpEpoch && this._hasSelectableSessionInput()) {
 				this._scheduleSessionInputPump();
 			}
 		}
@@ -5395,7 +5222,9 @@ export class AgentSession {
 		} catch (error) {
 			const commandError = this._asError(error);
 			transitionSessionAction(action, { state: "failed", error: commandError });
-			this._actionStore.ticketFor(action).settleCompleted(commandError);
+			const ticket = this._actionStore.ticketFor(action);
+			ticket.rejectDelivered(commandError);
+			ticket.settleCompleted(commandError);
 			this._rejectAgentMessage(action.agentMessageId, commandError);
 		} finally {
 			this._actionStore.releaseTerminal(action);
@@ -5404,19 +5233,11 @@ export class AgentSession {
 		}
 	}
 
-	private _isBusyForSessionInput(
-		point: "preflight" | "handoff" | "pump",
-		ignoreAcceptedPrompt?: AcceptedAgentMessagePrompt,
-	): boolean {
-		const busy =
-			this.isCompacting ||
-			this.isRetrying ||
-			this.isBashRunning ||
-			this._acceptedPromptCompletions.size > 0 ||
-			(this._acceptedAgentMessagePrompt !== undefined && this._acceptedAgentMessagePrompt !== ignoreAcceptedPrompt);
+	private _isBusyForSessionInput(point: "preflight" | "handoff" | "pump"): boolean {
+		const externalBusy = this.isCompacting || this.isRetrying || this.isBashRunning;
 		if (point === "pump") {
 			return (
-				busy ||
+				externalBusy ||
 				this._disposed ||
 				this._disposing ||
 				this._sessionInputPumpSuspended ||
@@ -5424,7 +5245,9 @@ export class AgentSession {
 				this._branchSummaryOperation !== undefined
 			);
 		}
-		return busy || this.pendingMessageCount > 0 || (point === "handoff" && this.isStreaming);
+		return (
+			externalBusy || this._actionStore.unfinishedActions().length > 0 || (point === "handoff" && this.isStreaming)
+		);
 	}
 
 	private _isSessionInputHandoffDeferred(epoch: number): boolean {
@@ -5470,20 +5293,25 @@ export class AgentSession {
 				(action): action is SessionAction<PreparedTurnPayload> =>
 					action.payload.kind === "turn" && action.lifecycle.state === "preparing",
 			);
-		const preparation = await this._prepareForCommit(
-			{
-				initialRefineBarrier: "skip",
-				flushPendingBashBeforeValidation: false,
-				preTurnCompaction: "beforeModelSelection",
-				finalRefineBarrier: "always",
-			},
-			{
+		const firstTurn = activeTurns()[0];
+		if (!firstTurn) return;
+		const executionPolicy = firstTurn.payload.executionPolicy;
+		const restoreNextTurnContext = () => {
+			this._pendingNextTurnMessages.unshift(...nextTurnMessages);
+			nextTurnMessages = [];
+		};
+		try {
+			const preparedTurn = await this._prepareForCommit(executionPolicy.preparation, {
 				afterValidation: () => {
 					if (this._isSessionInputHandoffDeferred(epoch)) {
 						throw new DeferredSessionInputError("Session input paused before preflight");
 					}
 				},
 				prepare: async () => {
+					if (executionPolicy.nextTurnContextTiming === "preparation") {
+						nextTurnMessages = this._takePendingNextTurnMessages();
+					}
+					if (!executionPolicy.runBeforeAgentStart) return undefined;
 					while (activeTurns().some((action) => action.payload.prepared === undefined)) {
 						if (this._isSessionInputHandoffDeferred(epoch)) {
 							throw new DeferredSessionInputError("Session input paused before preparation");
@@ -5513,60 +5341,66 @@ export class AgentSession {
 					}
 					const turns = activeTurns();
 					if (turns.length === 0) return undefined;
-					this._applyPreparedSystemPrompt(prepared, true);
-					return prepared;
+					return { prepared, turns };
 				},
-			},
-		);
-		if (!preparation) return;
-		let dispatch: PromptDispatchFence | undefined;
-		try {
-			if (this._refineInFlight) await this._waitForRefineIdle();
+			});
+			if (!preparedTurn) {
+				restoreNextTurnContext();
+				return;
+			}
 			if (this._isSessionInputHandoffDeferred(epoch)) {
 				throw new DeferredSessionInputError("Session input paused before handoff");
 			}
-			const turns = activeTurns();
-			if (turns.length === 0) return;
 			if (this.isStreaming) throw new DeferredSessionInputError("Agent became active before session input handoff");
-			this._applyPreparedSystemPrompt(preparation, true);
-			const preparedMessages: AgentMessage[] = [];
-			nextTurnMessages = this._pendingNextTurnMessages;
-			this._pendingNextTurnMessages = [];
-			preparedMessages.push(...nextTurnMessages);
-			const first = turns[0];
-			if (first) {
-				first.payload.records.unshift(
-					...nextTurnMessages.map((message) => this._createDeliveryRecord(first.id, "next_turn", message)),
-				);
+			const { prepared, turns } = preparedTurn;
+			if (executionPolicy.nextTurnContextTiming === "commit") {
+				nextTurnMessages = this._takePendingNextTurnMessages();
 			}
+			const contextRecords = nextTurnMessages.map((message) =>
+				this._createDeliveryRecord(turns[0].id, "next_turn", message),
+			);
+			turns[0].payload.records.unshift(...contextRecords);
+			const preparedMessages: AgentMessage[] = [...nextTurnMessages];
 			for (const action of turns) {
 				preparedMessages.push(...actionPrefixMessages(action), primaryDeliveryRecord(action).message);
 				if (action.suppressAutonomousContinuation) {
 					this._markAutonomousContinuationSuppressed(primaryDeliveryRecord(action).message);
 				}
 			}
-			this._appendBeforeAgentStartMessages(preparedMessages, preparation.result);
+			if (executionPolicy.runBeforeAgentStart) {
+				this._appendBeforeAgentStartMessages(preparedMessages, prepared?.result);
+				this._applyPreparedSystemPrompt(prepared, executionPolicy.preserveEmptyExtensionPrompt);
+			} else if (executionPolicy.nextTurnContextTiming !== "skip") {
+				this.agent.state.systemPrompt = this._baseSystemPrompt;
+			}
 			for (const action of turns) transitionSessionAction(action, { state: "committing" });
 			this._notifySessionInputCheckpointChange();
 			this._emitQueueUpdate();
-			const observedMessage = primaryDeliveryRecord(turns[turns.length - 1]!).message;
-			dispatch = this._dispatchPromptWithFence(preparedMessages, observedMessage, nextTurnMessages, {
-				releaseAdmission,
-				checkpointUntilDelivery: true,
-				cloneRestoredNextTurnMessages: false,
-			});
-			await dispatch.promptPromise;
-			await this.waitForRetry();
-			await this._agentEventQueue;
-			if (turns.some((action) => !this.agent.state.messages.includes(primaryDeliveryRecord(action).message))) {
+			const promptPromise = turns.some((action) => action.suppressAutonomousContinuation)
+				? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(preparedMessages))
+				: this.agent.prompt(preparedMessages);
+			releaseAdmission();
+			await promptPromise;
+			if (executionPolicy.completionIncludesRetryChain) await this.waitForRetry();
+			if (!this._hasCancelledDispatchCapture()) await this._agentEventQueue;
+			if (
+				turns.some(
+					(action) =>
+						action.lifecycle.state !== "cancelled" &&
+						!primaryDeliveryRecord(action).durable &&
+						!this.agent.state.messages.includes(primaryDeliveryRecord(action).message),
+				)
+			) {
 				throw new Error("Session input dispatch settled without durable delivery");
 			}
 			this._forgetConsumedPostCompactionContinuations(turns.map((action) => primaryDeliveryRecord(action).message));
 		} catch (error) {
-			if (dispatch) dispatch.restorePendingNextTurnMessages();
-			else {
-				const delivered = new Set(this.agent.state.messages);
-				this._pendingNextTurnMessages.unshift(...nextTurnMessages.filter((message) => !delivered.has(message)));
+			const delivered = new Set(this.agent.state.messages);
+			this._pendingNextTurnMessages.unshift(...nextTurnMessages.filter((message) => !delivered.has(message)));
+			for (const action of actions) {
+				if (action.payload.kind === "turn") {
+					action.payload.records = action.payload.records.filter((record) => record.role !== "next_turn");
+				}
 			}
 			throw error;
 		}
@@ -5700,27 +5534,21 @@ export class AgentSession {
 				});
 			}
 		} else if (options?.triggerTurn) {
-			const admission = await this._acquireDirectTurnAdmission();
-			// Hold a checkpoint section from admission until the turn dispatches so
-			// an update-restart snapshot cannot miss the admitted custom turn.
-			const endDirectPromptSection = this._enterDirectPromptSection();
-			const dispatchObserver = this._observeDirectDispatch(appMessage);
-			const settleSection = () => {
-				dispatchObserver.stop();
-				endDirectPromptSection();
-			};
+			const admission = await this._acquireSessionActionAdmission();
 			try {
-				if (this.isStreaming) await this.agent.waitForIdle();
-				await this._waitForRefineIdle();
-				const promptPromise = this.agent.prompt(appMessage);
+				const normalized = normalizeMessageContent(message.content);
+				const immediatelyEligible = this._canStartSessionActionImmediately();
+				const action = this._createPreparedTurnAction("followUp", normalized.text, normalized.images, {
+					message: appMessage,
+					resumeIfIdle: true,
+					executionPolicy: this._turnExecutionPolicy("customTrigger"),
+					queueVisible: false,
+				});
+				const result = this._admitSessionInput(action, { immediatelyEligible });
+				if (!result.ticket) return;
 				admission.release();
-				void Promise.race([promptPromise.catch(() => undefined), dispatchObserver.observed]).then(
-					settleSection,
-					settleSection,
-				);
-				await promptPromise;
+				await result.ticket.completed;
 			} finally {
-				settleSection();
 				admission.release();
 				this._scheduleSessionInputPump();
 			}
@@ -5784,7 +5612,9 @@ export class AgentSession {
 	 * @returns Object with steering and followUp arrays
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
-		const clearable = [...this._actionStore.clearableActions()];
+		const clearable = this._actionStore
+			.clearableActions()
+			.filter((action) => action.payload.kind === "session_command" || action.payload.queueVisible);
 		if (clearable.some((action) => action.payload.kind === "turn" && action.lifecycle.state === "preparing")) {
 			this._sessionInputPumpEpoch++;
 		}
@@ -5802,7 +5632,8 @@ export class AgentSession {
 			this._settleAgentMessage(action.agentMessageId, "delivery", error);
 			this._settleAgentMessage(action.agentMessageId, "completion", error);
 		}
-		this._cancelSessionActions(() => true, agentMessageError);
+		const clearableIds = new Set(clearable.map((action) => action.id));
+		this._cancelSessionActions((action) => clearableIds.has(action.id), agentMessageError);
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		return { steering, followUp };
@@ -5815,16 +5646,25 @@ export class AgentSession {
 	}
 
 	clearQueuedUserMessagesMatching(predicate: (text: string) => boolean): { steering: string[]; followUp: string[] } {
-		const matching = this._actionStore
-			.clearableActions()
-			.filter(
-				(action) =>
-					action.payload.kind === "turn" && action.agentMessageId !== undefined && predicate(action.payload.text),
-			);
-		const accepted = this._acceptedAgentMessagePrompt;
-		const acceptedMatches =
-			accepted !== undefined && !accepted.turnStarted && !accepted.cleared && predicate(accepted.text);
-		if (matching.length === 0 && !acceptedMatches) return { steering: [], followUp: [] };
+		const ownedActions = this._actionStore.ownedActions();
+		const dispatchedTurnCount = ownedActions.filter(
+			(action) =>
+				action.payload.kind === "turn" &&
+				(action.lifecycle.state === "committing" || action.lifecycle.state === "running"),
+		).length;
+		const matching = ownedActions.filter(
+			(action) =>
+				action.payload.kind === "turn" &&
+				action.agentMessageId !== undefined &&
+				predicate(action.payload.text) &&
+				(action.lifecycle.state === "queued" ||
+					action.lifecycle.state === "selected" ||
+					action.lifecycle.state === "preparing" ||
+					(action.lifecycle.state === "committing" &&
+						dispatchedTurnCount === 1 &&
+						!primaryDeliveryRecord(action).started)),
+		);
+		if (matching.length === 0) return { steering: [], followUp: [] };
 		const removedTexts = (delivery: DeliveryPolicy) =>
 			[
 				...matching.filter((action) => action.delivery === delivery && action.lifecycle.state === "queued"),
@@ -5832,21 +5672,33 @@ export class AgentSession {
 			].map((action) => action.payload.text);
 		const removedSteering = removedTexts("next_turn_boundary");
 		const removedFollowUp = removedTexts("when_run_idle");
-		const error = new Error("Queued agent message was cleared before delivery.");
-		for (const action of matching) this._rejectAgentMessage(action.agentMessageId, error);
-		const matchingIds = new Set(matching.map((action) => action.id));
-		this._cancelSessionActions((action) => matchingIds.has(action.id), error);
-		if (acceptedMatches) {
-			accepted.cleared = true;
-			this.agent.state.messages = this.agent.state.messages.filter((message) => !accepted.messages.has(message));
-			this._pendingNextTurnMessages.unshift(
-				...undeliveredPendingNextTurnMessages(accepted).map((message) => ({ ...message })),
+		const acceptedError = new Error("Accepted agent message was cleared before delivery.");
+		const queuedError = new Error("Queued agent message was cleared before delivery.");
+		for (const action of matching) {
+			const error =
+				action.payload.kind === "turn" && action.payload.acceptedAgentMessage ? acceptedError : queuedError;
+			this._rejectAgentMessage(action.agentMessageId, error);
+		}
+		for (const [accepted, error] of [
+			[true, acceptedError],
+			[false, queuedError],
+		] as const) {
+			const ids = new Set(
+				matching
+					.filter((action) => action.payload.kind === "turn" && action.payload.acceptedAgentMessage === accepted)
+					.map((action) => action.id),
 			);
-			const acceptedError = new Error("Accepted agent message was cleared before delivery.");
-			this._rejectAgentMessage(accepted.agentMessageId, acceptedError);
-			accepted.rejectAccepted(acceptedError);
+			if (ids.size > 0) this._cancelSessionActions((action) => ids.has(action.id), error, matching);
+		}
+		if (
+			matching.some(
+				(action) =>
+					action.lifecycle.state === "cancelled" &&
+					action.payload.kind === "turn" &&
+					action.payload.captureRunMessages,
+			)
+		) {
 			this.agent.abort();
-			removedFollowUp.push(accepted.text);
 		}
 		this._emitQueueUpdate();
 		return { steering: removedSteering, followUp: removedFollowUp };
@@ -5855,6 +5707,7 @@ export class AgentSession {
 	/** Preserves the active-as-pending wire behavior until the PR 4 protocol break. */
 	private legacyPendingProjection(delivery: DeliveryPolicy): readonly QueuedSessionAction[] {
 		return this._actionStore.unfinishedActions(delivery).filter((action) => {
+			if (action.payload.kind === "turn" && !action.payload.queueVisible) return false;
 			if (action.lifecycle.state === "queued") return true;
 			if (action.payload.kind === "session_command") {
 				return action.lifecycle.state === "selected" || action.lifecycle.state === "running";
@@ -5892,9 +5745,18 @@ export class AgentSession {
 
 	/** Private old-manifest adapter; deleted when PR 4 versions the recovery format. */
 	private _legacyRecoverySnapshots(delivery: DeliveryPolicy): readonly QueuedAgentInputSnapshot[] {
-		const recovery = this._sessionActionRecoverySnapshot().actions.filter((action) => action.delivery === delivery);
-		const legacy = this.legacyPendingProjection(delivery);
-		return (legacy.length === recovery.length ? recovery : legacy).map(createQueuedAgentInputSnapshot);
+		const recovery = new Set(
+			this._sessionActionRecoverySnapshot().actions.filter((action) => action.delivery === delivery),
+		);
+		const legacy = new Set(this.legacyPendingProjection(delivery));
+		return this._actionStore
+			.unfinishedActions(delivery)
+			.filter(
+				(action) =>
+					(recovery.has(action) || legacy.has(action)) &&
+					!(action.payload.kind === "turn" && action.payload.acceptedAgentMessage && !action.payload.queueVisible),
+			)
+			.map(createQueuedAgentInputSnapshot);
 	}
 
 	getSteeringQueueSnapshots(): readonly QueuedAgentInputSnapshot[] {
@@ -5906,24 +5768,24 @@ export class AgentSession {
 	}
 
 	private _notifySessionInputCheckpointChange(): void {
-		for (const resolve of this._sessionInputCheckpointWaiters) resolve();
+		const waiters = [...this._sessionInputCheckpointWaiters];
 		this._sessionInputCheckpointWaiters.clear();
+		for (const resolve of waiters) resolve();
 	}
 
-	/**
-	 * Marks a direct prompt as being between admission and its preflight outcome
-	 * (queued, handed off to the agent, or failed). Restart checkpoints wait for
-	 * these sections so an accepted input cannot fall between the queue snapshot
-	 * and the transcript flush.
-	 */
-	private _enterDirectPromptSection(): () => void {
-		this._directPromptSectionCount++;
-		let ended = false;
-		return () => {
-			if (ended) return;
-			ended = true;
-			this._directPromptSectionCount--;
-			this._notifySessionInputCheckpointChange();
+	private _observeSessionActionRollback(action: QueuedSessionAction): { rolledBack: Promise<void>; stop(): void } {
+		let resolveRollback = () => {};
+		const rolledBack = new Promise<void>((resolve) => {
+			resolveRollback = resolve;
+		});
+		const check = () => {
+			if (action.lifecycle.state === "queued") resolveRollback();
+			else this._sessionInputCheckpointWaiters.add(check);
+		};
+		this._sessionInputCheckpointWaiters.add(check);
+		return {
+			rolledBack,
+			stop: () => this._sessionInputCheckpointWaiters.delete(check),
 		};
 	}
 
@@ -5931,15 +5793,16 @@ export class AgentSession {
 		// An executing command was already shifted off the queue; the snapshot
 		// must wait for it or it vanishes from durable queued input.
 		while (
-			this._actionStore
-				.activeActions()
-				.some(
-					(action) =>
-						(action.payload.kind === "turn" &&
-							(action.lifecycle.state === "selected" || action.lifecycle.state === "preparing")) ||
-						(action.payload.kind === "session_command" && action.lifecycle.state === "running"),
-				) ||
-			this._directPromptSectionCount > 0
+			this._actionStore.activeActions().some((action) => {
+				if (action.payload.kind === "session_command") {
+					return action.lifecycle.state === "selected" || action.lifecycle.state === "running";
+				}
+				return (
+					action.lifecycle.state === "selected" ||
+					action.lifecycle.state === "preparing" ||
+					(action.lifecycle.state === "committing" && !primaryDeliveryRecord(action).durable)
+				);
+			})
 		) {
 			if (signal?.aborted) throw new Error("Update restart preparation cancelled");
 			await new Promise<void>((resolve, reject) => {
@@ -5989,15 +5852,16 @@ export class AgentSession {
 		this._queuedWorkAdmissionWaiters.clear();
 	}
 
-	private _assertDirectTurnAdmissionAvailable(): void {
+	private _assertSessionActionAdmissionAvailable(): void {
 		if (this._disposed || this._disposing) {
-			throw new Error("Cannot start a direct turn because the session is disposing or disposed.");
+			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
 		if (this.pendingMessageCount > 0 && this._sessionInputPumpSuspended) {
-			throw new Error("Cannot start a direct turn while queued session input is suspended.");
+			throw new Error("Cannot admit a session action while queued session input is suspended.");
 		}
 	}
 
+	/** PR 5 deletion target: preparation still shares this lease with branch mutation. */
 	private async _acquireTurnAdmission(signal?: AbortSignal): Promise<{ owner: symbol; release(): void }> {
 		const inheritedOwner = this._turnAdmissionContext.getStore();
 		if (inheritedOwner !== undefined && inheritedOwner === this._turnAdmissionOwner) {
@@ -6031,49 +5895,31 @@ export class AgentSession {
 		};
 	}
 
-	private async _acquireDirectTurnAdmission(
-		options: { allowStreaming?: boolean; allowPendingQueue?: boolean; signal?: AbortSignal } = {},
+	private async _acquireSessionActionAdmission(
+		options: { signal?: AbortSignal } = {},
 	): Promise<{ owner: symbol; release(): void }> {
 		while (true) {
-			this._assertDirectTurnAdmissionAvailable();
+			this._assertSessionActionAdmissionAvailable();
 			await this._waitForQueuedWorkAdmission(options.signal);
-			this._assertDirectTurnAdmissionAvailable();
-			if (this.pendingMessageCount > 0) this._scheduleSessionInputPump();
 			const admission = await this._acquireTurnAdmission(options.signal);
 			try {
-				this._assertDirectTurnAdmissionAvailable();
+				this._assertSessionActionAdmissionAvailable();
 				if (this._queuedWorkPauses.size > 0) {
 					admission.release();
-					await this._waitForQueuedWorkAdmission(options.signal);
 					continue;
 				}
-				// queueIfBusy callers enqueue behind pending work at preflight; they need ownership, not a drained queue.
-				if (
-					(options.allowStreaming === true && this.isStreaming) ||
-					options.allowPendingQueue === true ||
-					(this.pendingMessageCount === 0 &&
-						this._actionStore.activeActions().length === 0 &&
-						!this._pumpingSessionInput &&
-						!this._sessionInputPumpRequested)
-				) {
-					// This is the ownership commit point: no prompt/session state has
-					// been consumed yet, and from here the session owns delivery.
-					throwIfPromptAdmissionCancelled(options.signal);
-					return admission;
-				}
+				throwIfPromptAdmissionCancelled(options.signal);
+				return admission;
 			} catch (error) {
 				admission.release();
 				throw error;
 			}
-			admission.release();
-			await waitForPromptAdmission(this.waitForSessionInputIdle(), options.signal);
-			this._assertDirectTurnAdmissionAvailable();
 		}
 	}
 
 	private async _waitForQueuedWorkAdmission(signal?: AbortSignal): Promise<void> {
 		while (this._queuedWorkPauses.size > 0) {
-			this._assertDirectTurnAdmissionAvailable();
+			this._assertSessionActionAdmissionAvailable();
 			let wake = () => {};
 			const wait = new Promise<void>((resolve) => {
 				wake = resolve;
@@ -6084,7 +5930,7 @@ export class AgentSession {
 			} finally {
 				this._queuedWorkAdmissionWaiters.delete(wake);
 			}
-			this._assertDirectTurnAdmissionAvailable();
+			this._assertSessionActionAdmissionAvailable();
 		}
 	}
 
@@ -6106,17 +5952,14 @@ export class AgentSession {
 	async waitForIdle(): Promise<void> {
 		while (true) {
 			const pump = this._sessionInputPump;
-			const acceptedPrompts = [...this._acceptedPromptCompletions];
-			await Promise.all([pump, ...acceptedPrompts]);
+			await pump;
 			await this.agent.waitForIdle();
 			if (
 				pump === this._sessionInputPump &&
-				acceptedPrompts.length === this._acceptedPromptCompletions.size &&
-				acceptedPrompts.every((completion) => this._acceptedPromptCompletions.has(completion)) &&
 				!this._sessionInputPumpRequested &&
 				!this._pumpingSessionInput &&
 				!this.agent.state.isStreaming &&
-				this._acceptedAgentMessagePrompt === undefined
+				this._actionStore.activeActions().length === 0
 			) {
 				return;
 			}
@@ -6125,22 +5968,51 @@ export class AgentSession {
 
 	getPendingNextTurnMessageSnapshots(): readonly CustomMessage[] {
 		const messages = this._pendingNextTurnMessages.map((message) => cloneCustomMessage(message));
-		const accepted = this._acceptedAgentMessagePrompt;
-		if (accepted && !accepted.cleared && accepted.turnStarted) {
-			messages.push(...undeliveredPendingNextTurnMessages(accepted).map((message) => cloneCustomMessage(message)));
+		for (const action of this._actionStore.unfinishedActions()) {
+			if (
+				action.payload.kind !== "turn" ||
+				!action.payload.acceptedAgentMessage ||
+				!primaryDeliveryRecord(action).started
+			) {
+				continue;
+			}
+			messages.push(
+				...action.payload.records
+					.filter(
+						(record): record is DeliveryRecord & { message: CustomMessage } =>
+							(record.role === "next_turn" || record.role === "prefix") &&
+							record.message.role === "custom" &&
+							!record.durable,
+					)
+					.map((record) => cloneCustomMessage(record.message)),
+			);
 		}
 		return messages;
 	}
 
 	getAcceptedPromptSnapshot(): AcceptedAgentInputSnapshot | undefined {
-		const accepted = this._acceptedAgentMessagePrompt;
-		if (!accepted || accepted.cleared || accepted.turnStarted) {
-			return undefined;
-		}
+		const action = this._actionStore
+			.unfinishedActions()
+			.find(
+				(candidate) =>
+					candidate.payload.kind === "turn" &&
+					candidate.payload.acceptedAgentMessage &&
+					!candidate.payload.queueVisible &&
+					!primaryDeliveryRecord(candidate).started,
+			);
+		if (!action || action.payload.kind !== "turn") return undefined;
+		const nextTurn = action.payload.records
+			.filter(
+				(record): record is DeliveryRecord & { message: CustomMessage } =>
+					(record.role === "next_turn" || record.role === "prefix") &&
+					record.message.role === "custom" &&
+					!record.durable,
+			)
+			.map((record) => cloneCustomMessage(record.message));
 		return {
-			...createQueuedAgentInputSnapshotFromUserMessage(accepted.text, accepted.message),
-			agentMessageId: accepted.agentMessageId,
-			nextTurn: undeliveredPendingNextTurnMessages(accepted).map((message) => cloneCustomMessage(message)),
+			...createQueuedAgentInputSnapshotFromUserMessage(action.payload.text, primaryDeliveryRecord(action).message),
+			agentMessageId: action.agentMessageId,
+			nextTurn,
 		};
 	}
 
@@ -6181,6 +6053,10 @@ export class AgentSession {
 		this._sessionInputPumpRequested = false;
 		this._sessionInputPumpEpoch++;
 		this._sessionInputPumpSuspended = true;
+		this._cancelSessionActions(
+			(action) => action.payload.kind === "turn" && !action.payload.queueVisible,
+			new Error("Prompt aborted before delivery."),
+		);
 		this._cancelPostCompactionContinue();
 		this.abortRetry();
 		this.abortCompaction();
@@ -9722,7 +9598,14 @@ export class AgentSession {
 
 	/** Whether an accepted prompt is still running or waiting for retry completion. */
 	get hasAcceptedPromptInFlight(): boolean {
-		return this._acceptedPromptCompletions.size > 0 || this._acceptedAgentMessagePrompt !== undefined;
+		return this._actionStore
+			.unfinishedActions()
+			.some(
+				(action) =>
+					action.payload.kind === "turn" &&
+					!action.payload.queueVisible &&
+					action.payload.acceptedBeforeCompletion,
+			);
 	}
 
 	/** Whether auto-retry is enabled */
