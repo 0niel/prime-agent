@@ -157,6 +157,31 @@ describe("Agent", () => {
 		expect(agent.state.isStreaming).toBe(false);
 	});
 
+	it("can commit only a prefix of a prompt batch when a listener fails", async () => {
+		const agent = new Agent();
+		const first: AgentMessage = {
+			role: "user",
+			content: [{ type: "text", text: "first" }],
+			timestamp: Date.now(),
+		};
+		const second: AgentMessage = {
+			role: "user",
+			content: [{ type: "text", text: "second" }],
+			timestamp: Date.now(),
+		};
+		agent.subscribe((event) => {
+			if (event.type === "message_end" && event.message === first) {
+				throw new Error("listener failed between batched messages");
+			}
+		});
+
+		await agent.prompt([first, second]);
+
+		expect(agent.state.messages).toContain(first);
+		expect(agent.state.messages).not.toContain(second);
+		expect(agent.state.errorMessage).toBe("listener failed between batched messages");
+	});
+
 	it("waitForIdle should wait for async subscribers", async () => {
 		const barrier = createDeferred();
 		const agent = new Agent({

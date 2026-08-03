@@ -530,6 +530,48 @@ interface InternalPromptOptions extends PromptOptions {
 	agentMessageId?: string;
 }
 
+type SubmissionExtensionCommandPolicy = "execute" | "reject" | "ignore";
+
+interface SubmissionNormalizationPolicy {
+	parseSessionCommands: boolean;
+	extensionCommands: SubmissionExtensionCommandPolicy;
+	inputSource?: InputSource;
+	expandSkills: boolean;
+	expandPromptTemplates: boolean;
+}
+
+type NormalizedSubmission =
+	| { kind: "prompt"; text: string; images?: ImageContent[] }
+	| { kind: "sessionCommand"; text: string; images?: ImageContent[]; command: SessionSlashCommand }
+	| { kind: "extensionCommand"; completion: Promise<void> }
+	| { kind: "handled" };
+
+type PreTurnCompactionTiming = "beforeModelSelection" | "afterModelSelection" | "skip";
+type RefineBarrierPolicy = "always" | "ifInFlight" | "skip";
+
+interface CommitPreparationPolicy {
+	initialRefineBarrier: RefineBarrierPolicy;
+	flushPendingBashBeforeValidation: boolean;
+	preTurnCompaction: PreTurnCompactionTiming;
+	finalRefineBarrier: RefineBarrierPolicy;
+}
+
+interface CommitPreparationSteps<TPrepared, TCommitted> {
+	afterValidation?: () => void;
+	prepare: () => Promise<TPrepared>;
+	shouldCommit?: (prepared: TPrepared) => boolean;
+	beforeFinalRefineBarrier?: (prepared: TPrepared) => void;
+	commit: (prepared: TPrepared, passedFinalRefineBarrier: boolean) => TCommitted;
+}
+
+interface PromptDispatchFence {
+	promptPromise: Promise<void>;
+	deliveryObserved?: Promise<true>;
+	wasDeliveryObserved(): boolean;
+	stopDeliveryObservation(): void;
+	restorePendingNextTurnMessages(isDelivered?: (message: CustomMessage) => boolean): void;
+}
+
 type QueuedAgentMessage = UserMessage | CustomMessage;
 type SessionInputSchedule = "steer" | "followUp";
 
@@ -3985,6 +4027,149 @@ export class AgentSession {
 		return extensionPrompt.replace(baseSnapshot, () => this._baseSystemPrompt);
 	}
 
+	private _finishSubmissionNormalization(
+		text: string,
+		images: ImageContent[] | undefined,
+		policy: SubmissionNormalizationPolicy,
+	): NormalizedSubmission {
+		let expandedText = text;
+		if (policy.expandSkills) expandedText = this._expandSkillCommand(expandedText);
+		if (policy.expandPromptTemplates) {
+			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+		}
+		return { kind: "prompt", text: expandedText, images };
+	}
+
+	private _normalizeSubmission(
+		text: string,
+		images: ImageContent[] | undefined,
+		policy: SubmissionNormalizationPolicy,
+	): NormalizedSubmission | Promise<NormalizedSubmission> {
+		if (policy.parseSessionCommands) {
+			const command = parseSessionSlashCommand(text);
+			if (command) return { kind: "sessionCommand", text, images, command };
+		}
+
+		if (text.startsWith("/")) {
+			if (policy.extensionCommands === "execute") {
+				const completion = this._executeExtensionCommand(text);
+				if (completion) return { kind: "extensionCommand", completion };
+			} else if (policy.extensionCommands === "reject") {
+				this._throwIfExtensionCommand(text);
+			}
+		}
+
+		if (policy.inputSource !== undefined && this._extensionRunner.hasHandlers("input")) {
+			return this._extensionRunner.emitInput(text, images, policy.inputSource).then((result) => {
+				if (result.action === "handled") return { kind: "handled" };
+				if (result.action === "transform") {
+					return this._finishSubmissionNormalization(result.text, result.images ?? images, policy);
+				}
+				return this._finishSubmissionNormalization(text, images, policy);
+			});
+		}
+
+		return this._finishSubmissionNormalization(text, images, policy);
+	}
+
+	private async _runPreTurnCompaction(): Promise<void> {
+		const lastAssistant = this._findLastAssistantMessage();
+		if (lastAssistant) await this._checkCompaction(lastAssistant, false, false);
+	}
+
+	private async _prepareForCommit<TPrepared, TCommitted>(
+		policy: CommitPreparationPolicy,
+		steps: CommitPreparationSteps<TPrepared, TCommitted>,
+	): Promise<TCommitted | undefined> {
+		if (
+			policy.initialRefineBarrier === "always" ||
+			(policy.initialRefineBarrier === "ifInFlight" && this._refineInFlight)
+		) {
+			await this._waitForRefineIdle();
+		}
+		if (policy.flushPendingBashBeforeValidation) this._flushPendingBashMessages();
+		await this._validateCanStartAgentRun();
+		steps.afterValidation?.();
+		if (!policy.flushPendingBashBeforeValidation) this._flushPendingBashMessages();
+
+		if (policy.preTurnCompaction === "beforeModelSelection") await this._runPreTurnCompaction();
+		const pendingModelSelectEmit = this._pendingModelSelectEmit();
+		if (pendingModelSelectEmit) await pendingModelSelectEmit;
+		if (policy.preTurnCompaction === "afterModelSelection") await this._runPreTurnCompaction();
+
+		const prepared = await steps.prepare();
+		if (steps.shouldCommit && !steps.shouldCommit(prepared)) return undefined;
+		steps.beforeFinalRefineBarrier?.(prepared);
+		let passedFinalRefineBarrier = false;
+		if (
+			policy.finalRefineBarrier === "always" ||
+			(policy.finalRefineBarrier === "ifInFlight" && this._refineInFlight)
+		) {
+			await this._waitForRefineIdle();
+			passedFinalRefineBarrier = true;
+		}
+		return steps.commit(prepared, passedFinalRefineBarrier);
+	}
+
+	private _applyPreparedSystemPrompt(
+		preparation: PreparedPromptPreparation | undefined,
+		preserveEmptyExtensionPrompt: boolean,
+	): void {
+		const extensionPrompt = preparation?.result?.systemPrompt;
+		const hasExtensionPrompt = preserveEmptyExtensionPrompt
+			? extensionPrompt !== undefined
+			: Boolean(extensionPrompt);
+		this.agent.state.systemPrompt =
+			hasExtensionPrompt && extensionPrompt !== undefined && preparation !== undefined
+				? this._refreshExtensionSystemPrompt(extensionPrompt, preparation.basePromptSnapshot)
+				: this._baseSystemPrompt;
+	}
+
+	private _dispatchPromptWithFence(
+		messages: AgentMessage[],
+		observedMessage: AgentMessage | undefined,
+		pendingNextTurnMessages: CustomMessage[],
+		options: {
+			releaseAdmission: () => void;
+			suppressAutonomousContinuation?: boolean;
+			checkpointUntilDelivery?: boolean;
+			cloneRestoredNextTurnMessages?: boolean;
+		},
+	): PromptDispatchFence {
+		const dispatchObserver = observedMessage ? this._observeDirectDispatch(observedMessage) : undefined;
+		const endCheckpointSection = options.checkpointUntilDelivery ? this._enterDirectPromptSection() : undefined;
+		const promptPromise = options.suppressAutonomousContinuation
+			? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(messages))
+			: this.agent.prompt(messages);
+		options.releaseAdmission();
+
+		if (endCheckpointSection && dispatchObserver) {
+			const settleCheckpointSection = () => {
+				dispatchObserver.stop();
+				endCheckpointSection();
+			};
+			void Promise.race([promptPromise.catch(() => undefined), dispatchObserver.observed]).then(
+				settleCheckpointSection,
+				settleCheckpointSection,
+			);
+		}
+
+		return {
+			promptPromise,
+			deliveryObserved: dispatchObserver?.observed,
+			wasDeliveryObserved: () => dispatchObserver?.wasObserved() ?? false,
+			stopDeliveryObservation: () => dispatchObserver?.stop(),
+			restorePendingNextTurnMessages: (isDelivered = (message) => this.agent.state.messages.includes(message)) => {
+				const undelivered = pendingNextTurnMessages.filter((message) => !isDelivered(message));
+				this._pendingNextTurnMessages.unshift(
+					...(options.cloneRestoredNextTurnMessages === false
+						? undelivered
+						: undelivered.map((message) => ({ ...message }))),
+				);
+			},
+		};
+	}
+
 	/**
 	 * Send a prompt to the agent.
 	 * - Handles extension commands (registered via pi.registerCommand) immediately, even during streaming
@@ -4120,9 +4305,8 @@ export class AgentSession {
 
 		let messages: AgentMessage[] | undefined;
 		let drainedNextTurnMessages: CustomMessage[] = [];
+		let preparation: PreparedPromptPreparation | undefined;
 		const previewLabel = injectedMessagePreviewLabel(message);
-		let extensionResult: Awaited<ReturnType<typeof this._extensionRunner.emitBeforeAgentStart>> | undefined;
-		let basePromptSnapshot: string | undefined;
 		try {
 			const shouldQueueForStreaming = this.isStreaming;
 			const shouldQueueForPendingWork = options?.queueIfBusy === true && this._isBusyForSessionInput("preflight");
@@ -4146,36 +4330,36 @@ export class AgentSession {
 				return;
 			}
 
-			await this._waitForRefineIdle();
-			this._flushPendingBashMessages();
-			await this._validateCanStartAgentRun();
-
-			const lastAssistant = this._findLastAssistantMessage();
-			if (lastAssistant) {
-				await this._checkCompaction(lastAssistant, false, false);
-			}
-
-			const pendingModelSelectEmit = this._pendingModelSelectEmit();
-			if (pendingModelSelectEmit) {
-				await pendingModelSelectEmit;
-			}
-
-			drainedNextTurnMessages = this._pendingNextTurnMessages;
-			this._pendingNextTurnMessages = [];
-			messages = [...drainedNextTurnMessages, message];
-
-			basePromptSnapshot = this._baseSystemPrompt;
-			extensionResult = await this._extensionRunner.emitBeforeAgentStart(
-				text,
-				undefined,
-				basePromptSnapshot,
-				this._baseSystemPromptOptions,
+			messages = await this._prepareForCommit(
+				{
+					initialRefineBarrier: "always",
+					flushPendingBashBeforeValidation: true,
+					preTurnCompaction: "beforeModelSelection",
+					finalRefineBarrier: "ifInFlight",
+				},
+				{
+					prepare: async () => {
+						drainedNextTurnMessages = this._pendingNextTurnMessages;
+						this._pendingNextTurnMessages = [];
+						const preparedMessages: AgentMessage[] = [...drainedNextTurnMessages, message];
+						const basePromptSnapshot = this._baseSystemPrompt;
+						const result = await this._extensionRunner.emitBeforeAgentStart(
+							text,
+							undefined,
+							basePromptSnapshot,
+							this._baseSystemPromptOptions,
+						);
+						preparation = { result, basePromptSnapshot };
+						this._appendBeforeAgentStartMessages(preparedMessages, result);
+						this._applyPreparedSystemPrompt(preparation, true);
+						return { messages: preparedMessages, preparation };
+					},
+					commit: (prepared, passedFinalRefineBarrier) => {
+						if (passedFinalRefineBarrier) this._applyPreparedSystemPrompt(prepared.preparation, true);
+						return prepared.messages;
+					},
+				},
 			);
-			this._appendBeforeAgentStartMessages(messages, extensionResult);
-			this.agent.state.systemPrompt =
-				extensionResult?.systemPrompt !== undefined
-					? this._refreshExtensionSystemPrompt(extensionResult.systemPrompt, basePromptSnapshot)
-					: this._baseSystemPrompt;
 		} catch (error) {
 			reportPreflight(false);
 			throw error;
@@ -4185,18 +4369,11 @@ export class AgentSession {
 			endDirectPromptSection();
 			return;
 		}
-
 		if (this._refineInFlight) {
 			await this._waitForRefineIdle();
-			if (extensionResult?.systemPrompt !== undefined && basePromptSnapshot !== undefined) {
-				this.agent.state.systemPrompt = this._refreshExtensionSystemPrompt(
-					extensionResult.systemPrompt,
-					basePromptSnapshot,
-				);
-			} else {
-				this.agent.state.systemPrompt = this._baseSystemPrompt;
-			}
 		}
+		this._applyPreparedSystemPrompt(preparation, true);
+
 		const shouldQueueAtHandoff = options?.queueIfBusy === true && this._isBusyForSessionInput("handoff");
 		if (shouldQueueAtHandoff) {
 			this._pendingNextTurnMessages.unshift(...drainedNextTurnMessages.map((pending) => ({ ...pending })));
@@ -4225,13 +4402,10 @@ export class AgentSession {
 		}
 
 		if (options?.suppressAutonomousContinuation) this._markAutonomousContinuationSuppressed(message);
-		// Register the observer before dispatch so a synchronously-emitted
-		// message_start cannot be missed.
-		const dispatchObserver = this._observeDirectDispatch(message);
-		const promptPromise = options?.suppressAutonomousContinuation
-			? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(messages))
-			: this.agent.prompt(messages);
-		releaseAdmission();
+		const dispatch = this._dispatchPromptWithFence(messages, message, drainedNextTurnMessages, {
+			releaseAdmission,
+			suppressAutonomousContinuation: options?.suppressAutonomousContinuation,
+		});
 		// Settle the preflight outcome at the handoff, not after the whole turn: the
 		// direct-prompt section must keep fencing update-restart checkpoints until
 		// message_start proves the input reached the run's event stream, and a
@@ -4239,18 +4413,18 @@ export class AgentSession {
 		// is not proof: Agent.prompt() converts lifecycle failures into a synthetic
 		// error turn without the message ever reaching agent state.
 		const dispatched = await Promise.race([
-			promptPromise.then(
-				() => dispatchObserver.wasObserved() || this.agent.state.messages.includes(message),
+			dispatch.promptPromise.then(
+				() => dispatch.wasDeliveryObserved() || this.agent.state.messages.includes(message),
 				() => false,
 			),
-			dispatchObserver.observed,
+			dispatch.deliveryObserved!,
 		]);
-		dispatchObserver.stop();
+		dispatch.stopDeliveryObservation();
 		reportPreflight(dispatched);
 		try {
-			await promptPromise;
+			await dispatch.promptPromise;
 		} catch (error) {
-			this._pendingNextTurnMessages.unshift(...drainedNextTurnMessages.map((pending) => ({ ...pending })));
+			dispatch.restorePendingNextTurnMessages(() => false);
 			throw error;
 		}
 		await this.waitForRetry();
@@ -4307,16 +4481,21 @@ export class AgentSession {
 		let primaryPromptMessage: QueuedAgentMessage | undefined;
 		let acceptedAgentMessagePrompt: AcceptedAgentMessagePrompt | undefined;
 		let drainedNextTurnMessages: CustomMessage[] = [];
+		let preparation: PreparedPromptPreparation | undefined;
 		let expandedText = text;
 		let currentImages = options?.images;
-		let extensionResult: Awaited<ReturnType<typeof this._extensionRunner.emitBeforeAgentStart>> | undefined;
-		let basePromptSnapshot: string | undefined;
 
 		try {
-			let currentText = text;
-			const shouldHandleBuiltInSlashCommands = !isInternalPrompt && !options?.skipPrePromptWork;
-			const sessionCommand = shouldHandleBuiltInSlashCommands ? parseSessionSlashCommand(currentText) : undefined;
-			if (sessionCommand) {
+			const normalizationResult = this._normalizeSubmission(text, currentImages, {
+				parseSessionCommands: !isInternalPrompt && !options?.skipPrePromptWork,
+				extensionCommands: expandPromptTemplates ? "execute" : "ignore",
+				inputSource:
+					!isInternalPrompt && !options?.skipInputHandlers ? (options?.source ?? "interactive") : undefined,
+				expandSkills: expandPromptTemplates,
+				expandPromptTemplates,
+			});
+			const normalized = normalizationResult instanceof Promise ? await normalizationResult : normalizationResult;
+			if (normalized.kind === "sessionCommand") {
 				const wasBusy =
 					this.isStreaming ||
 					this.isCompacting ||
@@ -4331,9 +4510,9 @@ export class AgentSession {
 				const queued = this._enqueueSessionInput(
 					{
 						kind: "command",
-						text: currentText,
-						command: sessionCommand,
-						images: currentImages,
+						text: normalized.text,
+						command: normalized.command,
+						images: normalized.images,
 						agentMessageId: options?.agentMessageId,
 					},
 					schedule,
@@ -4343,49 +4522,23 @@ export class AgentSession {
 				if (!wasBusy && !options?.returnAfterAccepted) await this._sessionInputPump;
 				return;
 			}
-
-			// Handle extension commands first (execute immediately, even during streaming)
-			// Extension commands manage their own LLM interaction via pi.sendMessage()
-			if (expandPromptTemplates && currentText.startsWith("/")) {
-				const commandCompletion = this._executeExtensionCommand(currentText);
-				if (commandCompletion) {
-					reportPreflight(true);
-					void commandCompletion.then(
-						() => this._settleAgentMessage(options?.agentMessageId, "completion"),
-						(error) => this._settleAgentMessage(options?.agentMessageId, "completion", error),
-					);
-					void commandCompletion.catch(() => undefined);
-					if (!options?.returnAfterAccepted) await commandCompletion.catch(() => undefined);
-					return;
-				}
-			}
-
-			// Emit input event for extension interception (before skill/template expansion).
-			// Agent-to-agent and internal host prompts bypass input handlers so
-			// extensions cannot rewrite or swallow direct delivery.
-			if (!isInternalPrompt && !options?.skipInputHandlers && this._extensionRunner.hasHandlers("input")) {
-				const inputResult = await this._extensionRunner.emitInput(
-					currentText,
-					currentImages,
-					options?.source ?? "interactive",
+			if (normalized.kind === "extensionCommand") {
+				reportPreflight(true);
+				void normalized.completion.then(
+					() => this._settleAgentMessage(options?.agentMessageId, "completion"),
+					(error) => this._settleAgentMessage(options?.agentMessageId, "completion", error),
 				);
-				if (inputResult.action === "handled") {
-					reportPreflight(true);
-					this._settleAgentMessage(options?.agentMessageId, "completion");
-					return;
-				}
-				if (inputResult.action === "transform") {
-					currentText = inputResult.text;
-					currentImages = inputResult.images ?? currentImages;
-				}
+				void normalized.completion.catch(() => undefined);
+				if (!options?.returnAfterAccepted) await normalized.completion.catch(() => undefined);
+				return;
 			}
-
-			// Expand skill commands (/skill:name args) and prompt templates (/template args)
-			expandedText = currentText;
-			if (expandPromptTemplates) {
-				expandedText = this._expandSkillCommand(expandedText);
-				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+			if (normalized.kind === "handled") {
+				reportPreflight(true);
+				this._settleAgentMessage(options?.agentMessageId, "completion");
+				return;
 			}
+			expandedText = normalized.text;
+			currentImages = normalized.images;
 
 			// If streaming, or a caller explicitly asked to respect existing queued work,
 			// enqueue according to the requested behavior.
@@ -4412,105 +4565,77 @@ export class AgentSession {
 				return;
 			}
 
-			if (!options?.returnAfterAccepted) {
-				await this._waitForRefineIdle();
-			}
-
-			// Flush any pending bash messages before the new prompt, including accepted agent messages.
-			this._flushPendingBashMessages();
-			await this._validateCanStartAgentRun();
-
-			const pendingModelSelectEmit = this._pendingModelSelectEmit();
-			if (pendingModelSelectEmit) {
-				await pendingModelSelectEmit;
-			}
-			const buildUserContent = (): (TextContent | ImageContent)[] => {
-				const userContent: (TextContent | ImageContent)[] = options?.content
-					? options.content.map((block) => ({ ...block }))
-					: [{ type: "text", text: expandedText }];
-				if (!options?.content && currentImages) {
-					userContent.push(...currentImages);
-				}
-				return userContent;
-			};
-			if (options?.skipPrePromptWork) {
-				this.agent.state.systemPrompt = this._baseSystemPrompt;
-				messages = [];
-				drainedNextTurnMessages = this._pendingNextTurnMessages;
-				for (const msg of drainedNextTurnMessages) {
-					messages.push(msg);
-				}
-				this._pendingNextTurnMessages = [];
-				primaryPromptMessage = options.customMessage
-					? cloneCustomMessage(options.customMessage)
-					: {
-							role: "user",
-							content: buildUserContent(),
-							timestamp: Date.now(),
+			messages = await this._prepareForCommit(
+				{
+					initialRefineBarrier: options?.returnAfterAccepted ? "skip" : "always",
+					flushPendingBashBeforeValidation: true,
+					preTurnCompaction: options?.skipPrePromptWork ? "skip" : "afterModelSelection",
+					finalRefineBarrier: "ifInFlight",
+				},
+				{
+					prepare: async () => {
+						const buildUserContent = (): (TextContent | ImageContent)[] => {
+							const userContent: (TextContent | ImageContent)[] = options?.content
+								? options.content.map((block) => ({ ...block }))
+								: [{ type: "text", text: expandedText }];
+							if (!options?.content && currentImages) userContent.push(...currentImages);
+							return userContent;
 						};
-				messages.push(primaryPromptMessage);
-				if (options.agentMessageId !== undefined && options.returnAfterAccepted) {
-					let resolveAccepted = () => {};
-					let rejectAccepted = (_error: Error) => {};
-					const accepted = new Promise<void>((resolve, reject) => {
-						resolveAccepted = resolve;
-						rejectAccepted = reject;
-					});
-					acceptedAgentMessagePrompt = {
-						text: expandedText,
-						agentMessageId: options.agentMessageId,
-						message: primaryPromptMessage,
-						messages: new Set<AgentMessage>([...drainedNextTurnMessages, primaryPromptMessage]),
-						pendingNextTurnMessages: drainedNextTurnMessages,
-						deliveredPendingNextTurnMessages: new Set(),
-						accepted,
-						resolveAccepted,
-						rejectAccepted,
-						turnStarted: false,
-						cleared: false,
-					};
-				}
-			} else {
-				// Check if we need to compact before sending (catches aborted responses)
-				const lastAssistant = this._findLastAssistantMessage();
-				if (lastAssistant) {
-					await this._checkCompaction(lastAssistant, false, false);
-				}
+						drainedNextTurnMessages = this._pendingNextTurnMessages;
+						this._pendingNextTurnMessages = [];
+						const preparedMessages: AgentMessage[] = [...drainedNextTurnMessages];
+						primaryPromptMessage = options?.customMessage
+							? cloneCustomMessage(options.customMessage)
+							: { role: "user", content: buildUserContent(), timestamp: Date.now() };
+						preparedMessages.push(primaryPromptMessage);
 
-				// Build messages array (custom message if any, then user message)
-				messages = [];
+						if (options?.skipPrePromptWork) {
+							this.agent.state.systemPrompt = this._baseSystemPrompt;
+							if (options.agentMessageId !== undefined && options.returnAfterAccepted) {
+								let resolveAccepted = () => {};
+								let rejectAccepted = (_error: Error) => {};
+								const accepted = new Promise<void>((resolve, reject) => {
+									resolveAccepted = resolve;
+									rejectAccepted = reject;
+								});
+								acceptedAgentMessagePrompt = {
+									text: expandedText,
+									agentMessageId: options.agentMessageId,
+									message: primaryPromptMessage,
+									messages: new Set<AgentMessage>([...drainedNextTurnMessages, primaryPromptMessage]),
+									pendingNextTurnMessages: drainedNextTurnMessages,
+									deliveredPendingNextTurnMessages: new Set(),
+									accepted,
+									resolveAccepted,
+									rejectAccepted,
+									turnStarted: false,
+									cleared: false,
+								};
+							}
+							return { messages: preparedMessages, preparation: undefined };
+						}
 
-				// Inject any pending "nextTurn" messages as context before the user message.
-				drainedNextTurnMessages = this._pendingNextTurnMessages;
-				for (const msg of drainedNextTurnMessages) {
-					messages.push(msg);
-				}
-				this._pendingNextTurnMessages = [];
-
-				primaryPromptMessage = options?.customMessage
-					? cloneCustomMessage(options.customMessage)
-					: {
-							role: "user",
-							content: buildUserContent(),
-							timestamp: Date.now(),
-						};
-				messages.push(primaryPromptMessage);
-
-				// Emit before_agent_start extension event
-				basePromptSnapshot = this._baseSystemPrompt;
-				extensionResult = await this._extensionRunner.emitBeforeAgentStart(
-					expandedText,
-					currentImages,
-					basePromptSnapshot,
-					this._baseSystemPromptOptions,
-				);
-				// Add all custom messages from extensions
-				this._appendBeforeAgentStartMessages(messages, extensionResult);
-				// Apply extension-modified system prompt, or reset to base
-				this.agent.state.systemPrompt = extensionResult?.systemPrompt
-					? this._refreshExtensionSystemPrompt(extensionResult.systemPrompt, basePromptSnapshot)
-					: this._baseSystemPrompt;
-			}
+						const basePromptSnapshot = this._baseSystemPrompt;
+						const result = await this._extensionRunner.emitBeforeAgentStart(
+							expandedText,
+							currentImages,
+							basePromptSnapshot,
+							this._baseSystemPromptOptions,
+						);
+						preparation = { result, basePromptSnapshot };
+						this._appendBeforeAgentStartMessages(preparedMessages, result);
+						this._applyPreparedSystemPrompt(preparation, false);
+						return { messages: preparedMessages, preparation };
+					},
+					beforeFinalRefineBarrier: () => {
+						if (acceptedAgentMessagePrompt) this._acceptedAgentMessagePrompt = acceptedAgentMessagePrompt;
+					},
+					commit: (prepared, passedFinalRefineBarrier) => {
+						if (passedFinalRefineBarrier) this._applyPreparedSystemPrompt(prepared.preparation, false);
+						return prepared.messages;
+					},
+				},
+			);
 		} catch (error) {
 			reportPreflight(false);
 			throw error;
@@ -4520,23 +4645,11 @@ export class AgentSession {
 			endDirectPromptSection();
 			return;
 		}
-
-		if (acceptedAgentMessagePrompt) {
-			this._acceptedAgentMessagePrompt = acceptedAgentMessagePrompt;
-		}
-		// Re-check adjacent to the handoff: extension before_agent_start handlers
-		// above may have suspended this turn long enough for a refine to start.
 		if (this._refineInFlight) {
 			await this._waitForRefineIdle();
-			if (extensionResult?.systemPrompt && basePromptSnapshot !== undefined) {
-				this.agent.state.systemPrompt = this._refreshExtensionSystemPrompt(
-					extensionResult.systemPrompt,
-					basePromptSnapshot,
-				);
-			} else {
-				this.agent.state.systemPrompt = this._baseSystemPrompt;
-			}
 		}
+		this._applyPreparedSystemPrompt(preparation, false);
+
 		if (acceptedAgentMessagePrompt?.cleared) {
 			reportPreflight(false);
 			throw new Error("Accepted agent message was cleared before delivery.");
@@ -4581,28 +4694,30 @@ export class AgentSession {
 			reportPreflight(false);
 			throw new Error("Direct prompt is missing its primary message");
 		}
-		const dispatchObserver = acceptedAgentMessagePrompt
-			? undefined
-			: this._observeDirectDispatch(primaryPromptMessage);
-		const promptPromise = options?.suppressAutonomousContinuation
-			? this._runWithAutonomousContinuationSuppressed(() => this.agent.prompt(messages))
-			: this.agent.prompt(messages);
-		releaseAdmission();
+		const dispatch = this._dispatchPromptWithFence(
+			messages,
+			acceptedAgentMessagePrompt ? undefined : primaryPromptMessage,
+			drainedNextTurnMessages,
+			{
+				releaseAdmission,
+				suppressAutonomousContinuation: options?.suppressAutonomousContinuation,
+			},
+		);
 		const promptAccepted = Symbol("promptAccepted");
 		const acceptance = acceptedAgentMessagePrompt
 			? acceptedAgentMessagePrompt.accepted.then(
 					() => promptAccepted,
 					(error: unknown) => error,
 				)
-			: dispatchObserver!.observed.then(() => promptAccepted);
+			: dispatch.deliveryObserved!.then(() => promptAccepted);
 		const firstOutcome = await Promise.race([
-			promptPromise.then(
+			dispatch.promptPromise.then(
 				() => undefined,
 				(error: unknown) => error,
 			),
 			acceptance,
 		]);
-		dispatchObserver?.stop();
+		dispatch.stopDeliveryObservation();
 		if (firstOutcome !== undefined && firstOutcome !== promptAccepted) {
 			// A cleared prompt stays set until the aborted run's agent_end cleanup nulls it;
 			// nulling here would let the run's late events re-persist cleared messages.
@@ -4613,19 +4728,14 @@ export class AgentSession {
 				this._acceptedAgentMessagePrompt = undefined;
 			}
 			if (acceptedAgentMessagePrompt && !acceptedAgentMessagePrompt.cleared) {
-				// The prompt was never accepted, so next-turn context drained for it
-				// was not consumed by the model and must remain available to retry.
-				this._pendingNextTurnMessages.unshift(
-					...undeliveredPendingNextTurnMessages(acceptedAgentMessagePrompt).map((message) => ({
-						...message,
-					})),
-				);
+				const deliveredPendingNextTurnMessages = acceptedAgentMessagePrompt.deliveredPendingNextTurnMessages;
+				dispatch.restorePendingNextTurnMessages((message) => deliveredPendingNextTurnMessages.has(message));
 			}
 			reportPreflight(false);
 			throw firstOutcome;
 		}
 		reportPreflight(true);
-		const promptCompletion = promptPromise.then(async () => {
+		const promptCompletion = dispatch.promptPromise.then(async () => {
 			await this.waitForRetry();
 		});
 		if (options?.agentMessageId) {
@@ -4723,16 +4833,17 @@ export class AgentSession {
 		images?: ImageContent[],
 		options: { queueKey?: string; agentMessageId?: string; resumeIfIdle?: boolean } = {},
 	): Promise<void> {
-		// Check for extension commands (cannot be queued)
-		if (text.startsWith("/")) {
-			this._throwIfExtensionCommand(text);
+		const normalized = this._normalizeSubmission(text, images, {
+			parseSessionCommands: false,
+			extensionCommands: "reject",
+			expandSkills: true,
+			expandPromptTemplates: true,
+		});
+		if (normalized instanceof Promise || normalized.kind !== "prompt") {
+			throw new Error("Queued prompt normalization did not produce a prompt");
 		}
 
-		// Expand skill commands and prompt templates
-		let expandedText = this._expandSkillCommand(text);
-		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-
-		await this._queuePreparedPrompt("steer", expandedText, images, {
+		await this._queuePreparedPrompt("steer", normalized.text, normalized.images, {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
@@ -4751,16 +4862,17 @@ export class AgentSession {
 		images?: ImageContent[],
 		options: { queueKey?: string; agentMessageId?: string; resumeIfIdle?: boolean } = {},
 	): Promise<boolean> {
-		// Check for extension commands (cannot be queued)
-		if (text.startsWith("/")) {
-			this._throwIfExtensionCommand(text);
+		const normalized = this._normalizeSubmission(text, images, {
+			parseSessionCommands: false,
+			extensionCommands: "reject",
+			expandSkills: true,
+			expandPromptTemplates: true,
+		});
+		if (normalized instanceof Promise || normalized.kind !== "prompt") {
+			throw new Error("Queued prompt normalization did not produce a prompt");
 		}
 
-		// Expand skill commands and prompt templates
-		let expandedText = this._expandSkillCommand(text);
-		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-
-		return this._queuePreparedPrompt("followUp", expandedText, images, {
+		return this._queuePreparedPrompt("followUp", normalized.text, normalized.images, {
 			queueKey: options.queueKey,
 			agentMessageId: options.agentMessageId,
 			resumeIfIdle: options.resumeIfIdle,
@@ -5175,98 +5287,99 @@ export class AgentSession {
 		epoch: number,
 		releaseAdmission: () => void,
 	): Promise<void> {
-		await this._validateCanStartAgentRun();
-		if (this._isSessionInputHandoffDeferred(epoch)) {
-			throw new DeferredSessionInputError("Session input paused before preflight");
-		}
-		this._flushPendingBashMessages();
-		const lastAssistant = this._findLastAssistantMessage();
-		if (lastAssistant) await this._checkCompaction(lastAssistant, false, false);
-		const pendingModelSelectEmit = this._pendingModelSelectEmit();
-		if (pendingModelSelectEmit) await pendingModelSelectEmit;
-
-		while (!prompts.every((prompt) => prompt.preparation !== undefined)) {
-			if (this._isSessionInputHandoffDeferred(epoch)) {
-				throw new DeferredSessionInputError("Session input paused before preparation");
-			}
-			const preparationPrompt = prompts.at(-1);
-			if (!preparationPrompt) return;
-			const basePromptSnapshot = this._baseSystemPrompt;
-			const result = await this._extensionRunner.emitBeforeAgentStart(
-				preparationPrompt.text,
-				preparationPrompt.images,
-				basePromptSnapshot,
-				this._baseSystemPromptOptions,
-			);
-			if (prompts.at(-1) !== preparationPrompt) continue;
-			const preparation = { result, basePromptSnapshot };
-			for (const prompt of prompts) prompt.preparation = preparation;
-		}
-		if (this._isSessionInputHandoffDeferred(epoch)) {
-			throw new DeferredSessionInputError("Session input paused before handoff");
-		}
-		if (prompts.length === 0) return;
-
-		// Re-check adjacent to the handoff: background refine planning may have
-		// completed and entered _applyRefine during the awaits above,
-		// disconnecting event handling. Wait for it to finish so the new
-		// turn's events are not lost.
-		await this._waitForRefineIdle();
-		if (this._isSessionInputHandoffDeferred(epoch)) {
-			throw new DeferredSessionInputError("Session input paused before handoff");
-		}
-		// Assemble the handoff snapshot only after the last await: a clear that runs
-		// during the waits above must still be able to remove prompts from
-		// active.items before they are captured for agent.prompt().
-		if (prompts.length === 0) return;
-		const messages: AgentMessage[] = [];
-		const nextTurnMessages = this._pendingNextTurnMessages;
-		this._pendingNextTurnMessages = [];
-		messages.push(...nextTurnMessages);
-		for (const prompt of prompts) {
-			messages.push(...prompt.prefixMessages, prompt.message);
-			if (prompt.suppressAutonomousContinuation) this._markAutonomousContinuationSuppressed(prompt.message);
-		}
-		const preparation = prompts[0]?.preparation;
-		const result = preparation?.result;
-		this._appendBeforeAgentStartMessages(messages, result);
-		// The base prompt may have changed (e.g. refine) since preparation; splice the
-		// current base into an extension-modified prompt exactly like the direct path.
-		this.agent.state.systemPrompt =
-			result?.systemPrompt !== undefined && preparation !== undefined
-				? this._refreshExtensionSystemPrompt(result.systemPrompt, preparation.basePromptSnapshot)
-				: this._baseSystemPrompt;
+		let nextTurnMessages: CustomMessage[] = [];
+		const preparation = await this._prepareForCommit(
+			{
+				initialRefineBarrier: "skip",
+				flushPendingBashBeforeValidation: false,
+				preTurnCompaction: "beforeModelSelection",
+				finalRefineBarrier: "always",
+			},
+			{
+				afterValidation: () => {
+					if (this._isSessionInputHandoffDeferred(epoch)) {
+						throw new DeferredSessionInputError("Session input paused before preflight");
+					}
+				},
+				prepare: async () => {
+					while (!prompts.every((prompt) => prompt.preparation !== undefined)) {
+						if (this._isSessionInputHandoffDeferred(epoch)) {
+							throw new DeferredSessionInputError("Session input paused before preparation");
+						}
+						const preparationPrompt = prompts.at(-1);
+						if (!preparationPrompt) return undefined;
+						const basePromptSnapshot = this._baseSystemPrompt;
+						const result = await this._extensionRunner.emitBeforeAgentStart(
+							preparationPrompt.text,
+							preparationPrompt.images,
+							basePromptSnapshot,
+							this._baseSystemPromptOptions,
+						);
+						if (prompts.at(-1) !== preparationPrompt) continue;
+						const preparation = { result, basePromptSnapshot };
+						for (const prompt of prompts) prompt.preparation = preparation;
+					}
+					if (this._isSessionInputHandoffDeferred(epoch)) {
+						throw new DeferredSessionInputError("Session input paused before handoff");
+					}
+					return prompts[0]?.preparation;
+				},
+				shouldCommit: () => prompts.length > 0,
+				commit: (preparation) => {
+					if (this._isSessionInputHandoffDeferred(epoch)) {
+						throw new DeferredSessionInputError("Session input paused before handoff");
+					}
+					if (prompts.length === 0) return undefined;
+					this._applyPreparedSystemPrompt(preparation, true);
+					return preparation;
+				},
+			},
+		);
+		if (!preparation) return;
+		let dispatch: PromptDispatchFence | undefined;
 		try {
+			if (this._refineInFlight) await this._waitForRefineIdle();
+			if (this._isSessionInputHandoffDeferred(epoch)) {
+				throw new DeferredSessionInputError("Session input paused before handoff");
+			}
+			if (prompts.length === 0) return;
 			if (this.isStreaming) {
 				// agent.prompt() would reject with its already-processing error; defer instead.
 				throw new DeferredSessionInputError("Agent became active before session input handoff");
 			}
+			this._applyPreparedSystemPrompt(preparation, true);
+			const messages: AgentMessage[] = [];
+			nextTurnMessages = this._pendingNextTurnMessages;
+			this._pendingNextTurnMessages = [];
+			messages.push(...nextTurnMessages);
+			for (const prompt of prompts) {
+				messages.push(...prompt.prefixMessages, prompt.message);
+				if (prompt.suppressAutonomousContinuation) {
+					this._markAutonomousContinuationSuppressed(prompt.message);
+				}
+			}
+			this._appendBeforeAgentStartMessages(messages, preparation.result);
 			if (this._activeSessionInput?.kind === "prompt") {
 				this._activeSessionInput.phase = "handedOff";
 				this._notifySessionInputCheckpointChange();
 				this._emitQueueUpdate();
 			}
-			// The phase flipped to handedOff before dispatch; hold a checkpoint section
-			// until dispatch so a restart snapshot cannot miss the accepted messages.
-			const endHandoffSection = this._enterDirectPromptSection();
-			const dispatchObserver = this._observeDirectDispatch(prompts[prompts.length - 1]!.message);
-			const settleHandoffSection = () => {
-				dispatchObserver.stop();
-				endHandoffSection();
-			};
-			const promptPromise = this.agent.prompt(messages);
-			releaseAdmission();
-			void Promise.race([promptPromise.catch(() => undefined), dispatchObserver.observed]).then(
-				settleHandoffSection,
-				settleHandoffSection,
-			);
-			await promptPromise;
+			dispatch = this._dispatchPromptWithFence(messages, prompts[prompts.length - 1]!.message, nextTurnMessages, {
+				releaseAdmission,
+				checkpointUntilDelivery: true,
+				cloneRestoredNextTurnMessages: false,
+			});
+			await dispatch.promptPromise;
 			await this.waitForRetry();
 			await this._agentEventQueue;
 			this._forgetConsumedPostCompactionContinuations(prompts.map((prompt) => prompt.message));
 		} catch (error) {
-			const delivered = new Set(this.agent.state.messages);
-			this._pendingNextTurnMessages.unshift(...nextTurnMessages.filter((message) => !delivered.has(message)));
+			if (dispatch) {
+				dispatch.restorePendingNextTurnMessages();
+			} else {
+				const delivered = new Set(this.agent.state.messages);
+				this._pendingNextTurnMessages.unshift(...nextTurnMessages.filter((message) => !delivered.has(message)));
+			}
 			throw error;
 		}
 	}
