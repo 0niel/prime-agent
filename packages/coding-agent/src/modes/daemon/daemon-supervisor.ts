@@ -61,6 +61,7 @@ import {
 	failure,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
+	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
 } from "./daemon-protocol.js";
@@ -1064,7 +1065,7 @@ export class DaemonSupervisor {
 		try {
 			preParsed = this.parseCommandAndRegisterPromptAdmission(client, line);
 		} catch (error) {
-			this.write(client, failure(undefined, "parse", error));
+			this.write(client, failure(salvageDaemonCommandId(line), "parse", error));
 			return;
 		}
 		const command = preParsed.command;

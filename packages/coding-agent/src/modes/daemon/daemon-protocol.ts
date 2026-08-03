@@ -964,6 +964,25 @@ export function isDaemonCommandEnvelope(value: unknown): value is DaemonCommandE
 	);
 }
 
+/**
+ * Best-effort id salvage for rejected command lines, so parse failures reach
+ * the sender as correlatable responses instead of client-side timeouts.
+ * Deliberately ignores everything but the id itself: whatever made the line
+ * unparseable (rejected protocol version, missing or invalid type), the
+ * sender still correlates the failure by id.
+ */
+export function salvageDaemonCommandId(line: string): string | undefined {
+	try {
+		const candidate = JSON.parse(line) as { id?: unknown };
+		if (!candidate || typeof candidate !== "object") {
+			return undefined;
+		}
+		return typeof candidate.id === "string" ? candidate.id : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"ack_result",
 	"list",

@@ -149,6 +149,7 @@ import {
 	isDaemonCommandEnvelope,
 	isDaemonDialogExtensionUiRequest,
 	isDaemonMutatingCommand,
+	salvageDaemonCommandId,
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
 } from "./daemon-protocol.js";
@@ -2660,7 +2661,7 @@ export class AgentDaemon {
 			}
 			command = parsed as DaemonCommand;
 		} catch (error) {
-			this.write(client, failure(undefined, "parse", error, serializeDaemonError(error)));
+			this.write(client, failure(salvageDaemonCommandId(line), "parse", error, serializeDaemonError(error)));
 			return;
 		}
 

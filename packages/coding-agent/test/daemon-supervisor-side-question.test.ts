@@ -115,6 +115,7 @@ describe("daemon supervisor side-question routing", () => {
 		expect(write).toHaveBeenCalledWith(
 			client,
 			expect.objectContaining({
+				id: "state-1",
 				command: "parse",
 				success: false,
 				error: expect.stringContaining("require protocol 7"),
@@ -166,6 +167,7 @@ describe("daemon supervisor side-question routing", () => {
 			await expect(messages).resolves.toEqual([
 				expect.objectContaining({ type: "daemon_hello" }),
 				expect.objectContaining({
+					id: "state-1",
 					type: "response",
 					command: "parse",
 					success: false,
