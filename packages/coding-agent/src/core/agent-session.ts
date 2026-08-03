@@ -1248,6 +1248,9 @@ export class AgentSession {
 		// or restart/rehydration of a session that already has messages or a goal.
 		if (this._rlmDepth === 0 && config.initialGoal && this._isBranchSeedable()) {
 			this._goalState = this._startGoal(config.initialGoal.objective, config.initialGoal.tokenBudget);
+			// Goal context is the model's only source of goal visibility; action
+			// admission is unavailable mid-construction, so ride the next turn.
+			this._pendingNextTurnMessages.push(createGoalContextMessage(this._goalState, "continuation"));
 		}
 		this._restoreLateIpythonSentAgentMessages();
 		if (this._goalState.status === "active") {
@@ -1622,6 +1625,9 @@ export class AgentSession {
 	}
 
 	private _clearQueuedGoalContexts(): void {
+		this._pendingNextTurnMessages = this._pendingNextTurnMessages.filter(
+			(message) => message.customType !== GOAL_CONTEXT_CUSTOM_TYPE,
+		);
 		this.agent.removeQueuedMessages(
 			(message) => message.role === "custom" && message.customType === GOAL_CONTEXT_CUSTOM_TYPE,
 		);
