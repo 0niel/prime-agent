@@ -11,6 +11,7 @@
 - Fixed long-running thinking timers to display hours and days instead of unbounded minutes.
 - Fixed overlapping daemon snapshot catch-ups closing healthy workers and preventing new sessions from starting.
 - Changed daemon and RPC session state to report literal queued actions separately from active scheduler work.
+- Changed session input scheduling to use one action lifecycle and store, fixing active work appearing queued, headless completion exiting early, `/compact` consuming itself as a successor, and incompatible clients not failing cleanly at protocol 7/schema 8.
 
 ## [0.4.0] - 2026-08-01
 

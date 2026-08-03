@@ -316,6 +316,57 @@ describe("AgentSession compaction characterization", () => {
 		}
 	});
 
+	it("defers post-compaction refine behind a preparing session action", async () => {
+		const preparationReached = vi.fn();
+		let releasePreparation = () => {};
+		const preparationGate = new Promise<void>((resolve) => {
+			releasePreparation = resolve;
+		});
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event) => {
+						if (event.prompt !== "preparing across compaction") return;
+						preparationReached();
+						await preparationGate;
+					});
+					pi.on("session_before_compact", async (event) => ({
+						compaction: {
+							summary: "summary from extension",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: { source: "extension" },
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("one response"),
+			fauxAssistantMessage("two response"),
+			fauxAssistantMessage("prepared response"),
+		]);
+		await harness.session.prompt("one");
+		await harness.session.prompt("two");
+		await harness.session.followUp("preparing across compaction", undefined, { resumeIfIdle: true });
+		await vi.waitFor(() => expect(preparationReached).toHaveBeenCalledOnce());
+		const internals = harness.session as unknown as SessionWithCompactionInternals & {
+			_cancelPostCompactionContinue(): void;
+			_scheduleAutoRefineAfterCompaction(willContinueAfterCompaction: boolean): void;
+		};
+		const scheduleAutoRefineSpy = vi.spyOn(internals, "_scheduleAutoRefineAfterCompaction");
+		try {
+			await internals._runAutoCompaction("requested", false);
+			expect(scheduleAutoRefineSpy).toHaveBeenCalledWith(true);
+		} finally {
+			releasePreparation();
+			internals._cancelPostCompactionContinue();
+		}
+		await harness.session.waitForIdle();
+	});
+
 	it("throws when compacting without a model", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

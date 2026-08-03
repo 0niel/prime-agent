@@ -307,7 +307,6 @@ export interface RuntimeActivity {
 	branchMutation: boolean;
 	schedulerPauseCount: number;
 	disposing: boolean;
-	mandatoryCheckpointsComplete: boolean;
 }
 
 export function canSelectSessionAction(activity: RuntimeActivity): boolean {
@@ -321,8 +320,4 @@ export function canSelectSessionAction(activity: RuntimeActivity): boolean {
 		activity.schedulerPauseCount === 0 &&
 		!activity.disposing
 	);
-}
-
-export function shouldYieldLowerRun(store: ActionStore, activity: RuntimeActivity): boolean {
-	return activity.mandatoryCheckpointsComplete && store.queuedActions("next_turn_boundary").length > 0;
 }

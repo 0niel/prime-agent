@@ -67,7 +67,6 @@ function activity(overrides: Partial<RuntimeActivity> = {}): RuntimeActivity {
 		branchMutation: false,
 		schedulerPauseCount: 0,
 		disposing: false,
-		mandatoryCheckpointsComplete: true,
 		...overrides,
 	};
 }

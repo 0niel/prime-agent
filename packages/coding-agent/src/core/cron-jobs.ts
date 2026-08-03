@@ -87,6 +87,7 @@ export interface HeartbeatCronSessionActivity {
 	isCompacting?: boolean;
 	isRetrying?: boolean;
 	isBashRunning: boolean;
+	hasPendingSessionWork: boolean;
 	unfinishedActionCount: number;
 }
 
@@ -1357,7 +1358,8 @@ export function shouldDeferHeartbeatCronJob(job: AgentCronJob, activity: Heartbe
 		activity.isCompacting === true ||
 		activity.isRetrying === true ||
 		activity.isBashRunning ||
-		activity.unfinishedActionCount > 0;
+		activity.hasPendingSessionWork ||
+		(!activity.isStreaming && activity.unfinishedActionCount > 0);
 	if (busyBesidesStreaming) {
 		return true;
 	}

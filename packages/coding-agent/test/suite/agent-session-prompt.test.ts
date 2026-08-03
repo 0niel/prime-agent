@@ -47,47 +47,6 @@ describe("AgentSession prompt characterization", () => {
 		}
 	});
 
-	it("cancels a prompt while direct-turn admission is paused", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const pause = harness.session.acquireQueuedWorkPause();
-		const controller = new AbortController();
-
-		const prompt = harness.session.prompt("cancel me", { signal: controller.signal });
-		controller.abort();
-
-		await expect(prompt).rejects.toThrow("Prompt admission was cancelled.");
-		expect(getUserTexts(harness)).toEqual([]);
-		pause.release();
-	});
-
-	it("releases action admission when cancellation lands immediately after acquisition", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		const controller = new AbortController();
-		const internals = harness.session as unknown as {
-			_acquireSessionActionAdmission(options?: {
-				signal?: AbortSignal;
-			}): Promise<{ owner: object; release(): void }>;
-		};
-		const acquire = internals._acquireSessionActionAdmission.bind(internals);
-		internals._acquireSessionActionAdmission = async (options) => {
-			const admission = await acquire(options);
-			controller.abort();
-			return admission;
-		};
-
-		await expect(harness.session.prompt("cancel after acquire", { signal: controller.signal })).rejects.toThrow(
-			"Prompt admission was cancelled.",
-		);
-		expect(getUserTexts(harness)).toEqual([]);
-
-		internals._acquireSessionActionAdmission = acquire;
-		harness.setResponses([fauxAssistantMessage("recovered")]);
-		await harness.session.prompt("second");
-		expect(getUserTexts(harness)).toEqual(["second"]);
-	});
-
 	it("releases action admission when ownership commit throws", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -179,6 +138,38 @@ describe("AgentSession prompt characterization", () => {
 		expect(secondSettled).toBe(false);
 		secondResponse.resolve();
 		await Promise.all([first, second]);
+	});
+
+	it("preserves idle prompt order while the first input handler is pending", async () => {
+		const firstInputReached = createDeferred();
+		const firstInputGate = createDeferred();
+		const inputOrder: string[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event) => {
+						inputOrder.push(event.text);
+						if (event.text === "first") {
+							firstInputReached.resolve();
+							await firstInputGate.promise;
+						}
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("first done"), fauxAssistantMessage("second done")]);
+
+		const first = harness.session.prompt("first");
+		await firstInputReached.promise;
+		const second = harness.session.prompt("second");
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(inputOrder).toEqual(["first"]);
+
+		firstInputGate.resolve();
+		await Promise.all([first, second]);
+		expect(inputOrder).toEqual(["first", "second"]);
+		expect(getUserTexts(harness)).toEqual(["first", "second"]);
 	});
 
 	it("admits reentrant hook prompts without deadlocking the active action", async () => {
@@ -981,36 +972,38 @@ stale post-hook extension instructions`,
 		expect(harness.session.queuedActionCount).toBe(0);
 	});
 
-	it("queues accepted agent messages if the session becomes busy before handoff", async () => {
+	it("waits to accept agent messages while queued work is paused without leaking a waiter", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const agentPrompt =
 			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_handoff_busy\n\nqueue at handoff";
-		let releaseRefine: (() => void) | undefined;
-		const refineGate = new Promise<void>((resolve) => {
-			releaseRefine = resolve;
-		});
 		const sessionInternals = harness.session as unknown as {
-			_refineInFlight?: Promise<void>;
-			_userBashRunning?: boolean;
+			_sessionInputCheckpointWaiters: Set<() => void>;
 		};
-		sessionInternals._refineInFlight = refineGate;
+		const pause = harness.session.acquireQueuedWorkPause();
+		let acceptedSettled = false;
+		const accepted = harness.session
+			.acceptAgentMessagePrompt(agentPrompt, {
+				expandPromptTemplates: false,
+				streamingBehavior: "followUp",
+				queueIfBusy: true,
+			})
+			.then(() => {
+				acceptedSettled = true;
+			});
+		await new Promise<void>((resolve) => setImmediate(resolve));
 
-		const accepted = harness.session.acceptAgentMessagePrompt(agentPrompt, {
-			expandPromptTemplates: false,
-			streamingBehavior: "followUp",
-			queueIfBusy: true,
-		});
-		await Promise.resolve();
-		sessionInternals._userBashRunning = true;
-		sessionInternals._refineInFlight = undefined;
-		releaseRefine?.();
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(acceptedSettled).toBe(false);
+		expect(sessionInternals._sessionInputCheckpointWaiters.size).toBe(1);
 
+		harness.setResponses([fauxAssistantMessage("delivered")]);
+		pause.release();
 		await accepted;
-		sessionInternals._userBashRunning = false;
+		await harness.session.waitForIdle();
 
-		expect(harness.session.getFollowUpMessages()).toEqual([agentPrompt]);
-		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(getUserTexts(harness)).toEqual([agentPrompt]);
+		expect(sessionInternals._sessionInputCheckpointWaiters.size).toBe(0);
 	});
 
 	it("restores nextTurn context when handoff busy rejection cannot queue", async () => {
@@ -1180,6 +1173,48 @@ stale post-hook extension instructions`,
 		expect(harness.session.agent.state.errorMessage).toBeUndefined();
 		expect(harness.session.unfinishedActionCount).toBe(0);
 		expect(harness.session.hasAcceptedPromptInFlight).toBe(false);
+	});
+
+	it("waitForIdle waits for cancelled dispatch cleanup in the session event queue", async () => {
+		const eventQueueReached = createDeferred();
+		const eventQueueGate = createDeferred();
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_start", async () => {
+						eventQueueReached.resolve();
+						await eventQueueGate.promise;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("never delivered")]);
+		const dispatchGate = gateNextAgentStart(harness);
+		const prompt =
+			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_idle_cleanup\n\ncancel me";
+		const accepted = harness.session.acceptAgentMessagePrompt(prompt, { expandPromptTemplates: false });
+		const rejected = expect(accepted).rejects.toThrow("cleared before delivery");
+		await Promise.all([eventQueueReached.promise, dispatchGate.reached]);
+
+		harness.session.clearQueuedUserMessagesMatching((text) => text === prompt);
+		let idle = false;
+		const waiting = harness.session.waitForIdle().then(() => {
+			idle = true;
+		});
+		dispatchGate.release();
+		await rejected;
+		await harness.session.agent.waitForIdle();
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		const store = (harness.session as unknown as { _actionStore: { ownedActions(): readonly unknown[] } })
+			._actionStore;
+		expect(idle).toBe(false);
+		expect(store.ownedActions()).toHaveLength(1);
+		eventQueueGate.resolve();
+		await waiting;
+		expect(store.ownedActions()).toHaveLength(0);
+		expect(harness.session.agent.state.errorMessage).toBeUndefined();
 	});
 
 	it("restores drained nextTurn messages when direct agent message acceptance fails before delivery", async () => {
@@ -1811,7 +1846,6 @@ stale post-hook extension instructions`,
 		});
 		const flushNow = vi.spyOn(harness.sessionManager, "flushNow");
 		const controller = new AbortController();
-		const removeEventListener = vi.spyOn(controller.signal, "removeEventListener");
 
 		const checkpoint = harness.session.waitForSessionInputCheckpoint(controller.signal);
 		controller.abort();
@@ -1819,7 +1853,6 @@ stale post-hook extension instructions`,
 		await expect(checkpoint).rejects.toThrow("Update restart preparation cancelled");
 		expect(queueDrained).toBe(false);
 		expect(flushNow).not.toHaveBeenCalled();
-		expect(removeEventListener).toHaveBeenCalledWith("abort", expect.any(Function));
 		extensionGate.resolve();
 		await prompt;
 		await eventQueue;

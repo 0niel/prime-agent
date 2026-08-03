@@ -1352,6 +1352,7 @@ describe("shouldDeferHeartbeatCronJob", () => {
 				shouldDeferHeartbeatCronJob(job, {
 					isStreaming: true,
 					isBashRunning: false,
+					hasPendingSessionWork: false,
 					unfinishedActionCount: 0,
 				}),
 			).toBe(true);
@@ -1359,6 +1360,7 @@ describe("shouldDeferHeartbeatCronJob", () => {
 				shouldDeferHeartbeatCronJob(job, {
 					isStreaming: false,
 					isBashRunning: true,
+					hasPendingSessionWork: false,
 					unfinishedActionCount: 0,
 				}),
 			).toBe(true);
@@ -1366,6 +1368,7 @@ describe("shouldDeferHeartbeatCronJob", () => {
 				shouldDeferHeartbeatCronJob(job, {
 					isStreaming: false,
 					isBashRunning: false,
+					hasPendingSessionWork: false,
 					unfinishedActionCount: 1,
 				}),
 			).toBe(true);
@@ -1383,7 +1386,8 @@ describe("shouldDeferHeartbeatCronJob", () => {
 					shouldDeferHeartbeatCronJob(job, {
 						isStreaming: true,
 						isBashRunning: false,
-						unfinishedActionCount: 0,
+						hasPendingSessionWork: false,
+						unfinishedActionCount: 1,
 					}),
 				).toBe(false);
 			}
@@ -1398,6 +1402,7 @@ describe("shouldDeferHeartbeatCronJob", () => {
 				isStreaming: true,
 				isCompacting: true,
 				isBashRunning: false,
+				hasPendingSessionWork: false,
 				unfinishedActionCount: 0,
 			}),
 		).toBe(true);
@@ -1405,6 +1410,7 @@ describe("shouldDeferHeartbeatCronJob", () => {
 			shouldDeferHeartbeatCronJob(job, {
 				isStreaming: false,
 				isBashRunning: true,
+				hasPendingSessionWork: false,
 				unfinishedActionCount: 0,
 			}),
 		).toBe(true);
@@ -1412,6 +1418,7 @@ describe("shouldDeferHeartbeatCronJob", () => {
 			shouldDeferHeartbeatCronJob(job, {
 				isStreaming: false,
 				isBashRunning: false,
+				hasPendingSessionWork: false,
 				unfinishedActionCount: 1,
 			}),
 		).toBe(true);
@@ -1420,14 +1427,16 @@ describe("shouldDeferHeartbeatCronJob", () => {
 				isStreaming: false,
 				isRetrying: true,
 				isBashRunning: false,
+				hasPendingSessionWork: false,
 				unfinishedActionCount: 0,
 			}),
 		).toBe(true);
 		expect(
 			shouldDeferHeartbeatCronJob(job, {
-				isStreaming: false,
+				isStreaming: true,
 				isBashRunning: false,
-				unfinishedActionCount: 1,
+				hasPendingSessionWork: true,
+				unfinishedActionCount: 2,
 			}),
 		).toBe(true);
 	});
@@ -1436,7 +1445,7 @@ describe("shouldDeferHeartbeatCronJob", () => {
 		expect(
 			shouldDeferHeartbeatCronJob(
 				{ ...baseJob, source: "heartbeat" },
-				{ isStreaming: false, isBashRunning: false, unfinishedActionCount: 0 },
+				{ isStreaming: false, isBashRunning: false, hasPendingSessionWork: false, unfinishedActionCount: 0 },
 			),
 		).toBe(false);
 	});
@@ -1445,7 +1454,7 @@ describe("shouldDeferHeartbeatCronJob", () => {
 		expect(
 			shouldDeferHeartbeatCronJob(
 				{ ...baseJob, source: "cron" },
-				{ isStreaming: true, isBashRunning: true, unfinishedActionCount: 2 },
+				{ isStreaming: true, isBashRunning: true, hasPendingSessionWork: true, unfinishedActionCount: 2 },
 			),
 		).toBe(false);
 	});

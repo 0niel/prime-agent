@@ -568,20 +568,16 @@ export class DaemonAgentConnection implements AgentConnection {
 		jobId: string,
 		action: AgentHeartbeatManagementAction,
 	): Promise<AgentCronJob> {
-		const hasCapability = this.client.supportsServerCapability("heartbeat_management");
-		if (!hasCapability && this.client.hello?.protocol.version !== 3) {
+		if (!this.client.supportsServerCapability("heartbeat_management")) {
 			throw new Error("Heartbeat management requires a newer Prime Agent daemon.");
 		}
 		try {
-			const command = {
+			const data = await this.requestData<{ heartbeat: AgentCronJob }>({
 				type: "heartbeat_manage",
 				activeSessionId,
 				jobId,
 				action,
-			} as const;
-			const data = hasCapability
-				? await this.requestData<{ heartbeat: AgentCronJob }>(command)
-				: await this.requestLegacyData<{ heartbeat: AgentCronJob }>(command);
+			});
 			return data.heartbeat;
 		} catch (error) {
 			if (isUnknownDaemonCommandError(error, "heartbeat_manage")) {
@@ -1378,14 +1374,6 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	private async requestOk(command: DaemonCommandBody): Promise<void> {
 		await this.requestData<unknown>(command);
-	}
-
-	private async requestLegacyData<T>(command: DaemonCommandBody, timeoutMs?: number): Promise<T> {
-		const response = await this.client.requestLegacy(command, timeoutMs);
-		if (!response.success) {
-			throw deserializeDaemonError(response);
-		}
-		return response.data as T;
 	}
 
 	private async requestData<T>(

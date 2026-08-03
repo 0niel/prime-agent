@@ -384,25 +384,6 @@ describe("DaemonClient", () => {
 		});
 	});
 
-	it("keeps a raw one-release request path for v1 daemon handoff", async () => {
-		const client = new DaemonClient("/tmp/prime-agent.sock");
-		const connect = client.connect();
-		const socket = netMock.sockets[0]!;
-		socket.emit("connect");
-		await connect;
-
-		const response = client.requestLegacy({ type: "prepare_update_restart" });
-		const command = JSON.parse(socket.writes[0]!.trim()) as { id: string; type: string };
-		expect(command.type).toBe("prepare_update_restart");
-		expect(command).not.toHaveProperty("protocol");
-		socket.emit(
-			"data",
-			`${JSON.stringify({ id: command.id, type: "response", command: command.type, success: true })}\n`,
-		);
-		await expect(response).resolves.toMatchObject({ success: true });
-		client.close();
-	});
-
 	it("keeps durable command envelopes on the session-action protocol", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();

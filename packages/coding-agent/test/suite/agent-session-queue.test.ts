@@ -11,6 +11,7 @@ import {
 	createAgentSessionMessage,
 	createAgentSessionMessagePrompt,
 } from "../../src/core/agent-messages.js";
+import { type AgentCronJob, shouldDeferHeartbeatCronJob } from "../../src/core/cron-jobs.js";
 import { createSessionSlashCommandMessage } from "../../src/core/messages.js";
 import {
 	applyRefinementProposal,
@@ -78,6 +79,24 @@ function createAutoRefineHarness(options: Parameters<typeof createHarness>[0] = 
 
 function agentPromptText(id: string, body: string): string {
 	return `Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: ${id}\n\n${body}`;
+}
+
+function heartbeatJob(): AgentCronJob {
+	return {
+		id: "heartbeat-test",
+		status: "active",
+		source: "heartbeat",
+		activeSessionId: "active-test",
+		sessionId: "session-test",
+		sessionFile: "/tmp/session.jsonl",
+		cwd: "/tmp",
+		prompt: "check progress",
+		schedule: { kind: "interval", expression: "every 5m", intervalMs: 300_000 },
+		createdAt: "2026-01-01T00:00:00.000Z",
+		updatedAt: "2026-01-01T00:00:00.000Z",
+		nextRunAt: "2026-01-01T00:05:00.000Z",
+		runCount: 0,
+	};
 }
 
 const skipReviewer = vi.fn(async () => ({ shouldRefine: true, rationale: "durable lesson" }));
@@ -625,6 +644,39 @@ describe("AgentSession queue characterization", () => {
 		await promptPromise;
 		await navigation;
 		expect(navigated).toBe(true);
+	});
+
+	it("cancels a restart checkpoint while tree navigation owns the commit fence", async () => {
+		const treeEventReached = createDeferred();
+		const treeEventGate = createDeferred();
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_tree", async () => {
+						treeEventReached.resolve();
+						await treeEventGate.promise;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		await harness.session.prompt("one");
+		const target = harness.sessionManager.getEntries().find((entry) => entry.type === "message");
+		expect(target).toBeDefined();
+		await harness.session.prompt("two");
+
+		const navigation = harness.session.navigateTree(target!.id, { summarize: false });
+		await treeEventReached.promise;
+		const controller = new AbortController();
+		const checkpoint = harness.session.waitForSessionInputCheckpoint(controller.signal);
+		controller.abort();
+
+		await expect(checkpoint).rejects.toThrow("Update restart preparation cancelled");
+		const nextCheckpoint = harness.session.waitForSessionInputCheckpoint();
+		treeEventGate.resolve();
+		await navigation;
+		await expect(nextCheckpoint).resolves.toBeUndefined();
 	});
 
 	it("keeps queued work paused until tree navigation events settle", async () => {
@@ -1254,6 +1306,24 @@ describe("AgentSession queue characterization", () => {
 		expect(harness.session.messages).toEqual([]);
 	});
 
+	it("settles a visibly queued session command while an earlier action is preparing", async () => {
+		const hook = gatedHook({ prompt: "preparing turn" });
+		const harness = await createHarness({ extensionFactories: [hook.factory] });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("preparing turn", undefined, { resumeIfIdle: true });
+		pause.release();
+		await hook.reached;
+
+		const command = harness.session.prompt("/goal status");
+		await vi.waitFor(() => expect(harness.session.getFollowUpMessages()).toContain("/goal status"));
+		await expect(command).resolves.toBeUndefined();
+
+		hook.release();
+		await harness.session.waitForIdle();
+	});
+
 	it("removes goal context while its steering handoff is still preparing", async () => {
 		const hook = gatedHook({ prompt: "stale goal context" });
 		const harness = await createHarness({ extensionFactories: [hook.factory] });
@@ -1441,6 +1511,51 @@ describe("AgentSession queue characterization", () => {
 		await harness.session.waitForSessionInputIdle();
 	});
 
+	it("revalidates turn batches after acquiring the commit fence", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.session.setFollowUpMode("all");
+		harness.setResponses([fauxAssistantMessage("survivor delivered")]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		withStreaming(harness, true);
+		const removed = harness.session.promptAndWait("remove after preparation", {
+			streamingBehavior: "followUp",
+			followUpQueueKey: "remove",
+		});
+		const removedOutcome = removed.then(
+			() => ({ error: undefined }),
+			(error: unknown) => ({ error }),
+		);
+		const survivor = harness.session.promptAndWait("survive re-selection", {
+			streamingBehavior: "followUp",
+			followUpQueueKey: "survivor",
+		});
+		const survivorOutcome = survivor.then(
+			() => ({ error: undefined }),
+			(error: unknown) => ({ error }),
+		);
+		withStreaming(harness, false);
+		const internals = harness.session as unknown as {
+			_acquireSessionActionCommitFence(): Promise<{ release(): void }>;
+		};
+		const fence = await internals._acquireSessionActionCommitFence();
+
+		pause.release();
+		try {
+			await vi.waitFor(() => expect(harness.session.getSessionActionSnapshot().active?.phase).toBe("preparing"));
+			expect(harness.session.removeQueuedFollowUp("remove")).toBe(true);
+		} finally {
+			fence.release();
+		}
+		await harness.session.waitForSessionInputIdle();
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect((await removedOutcome).error).toEqual(
+			expect.objectContaining({ message: "Queued agent message was cleared before delivery." }),
+		);
+		expect((await survivorOutcome).error).toBeUndefined();
+		expect(getUserTexts(harness)).toEqual(["survive re-selection"]);
+	});
+
 	it("stops counting cleared preparing inputs as pending", async () => {
 		const hook = gatedHook({ prompt: "cleared prompt" });
 		const harness = await createHarness({ extensionFactories: [hook.factory] });
@@ -1459,6 +1574,24 @@ describe("AgentSession queue characterization", () => {
 		hook.release();
 		await harness.session.waitForSessionInputIdle();
 		expect(getUserTexts(harness)).toEqual([]);
+	});
+
+	it("coalesces a same-key follow-up while a steering owner is preparing", async () => {
+		const hook = gatedHook({ prompt: "steering heartbeat" });
+		const harness = await createHarness({ extensionFactories: [hook.factory] });
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.steer("steering heartbeat", undefined, { queueKey: "heartbeat", resumeIfIdle: true });
+		pause.release();
+		await hook.reached;
+
+		expect(await harness.session.followUp("duplicate heartbeat", undefined, { queueKey: "heartbeat" })).toBe(false);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+
+		hook.release();
+		await harness.session.waitForIdle();
+		expect(getUserTexts(harness)).toEqual(["steering heartbeat"]);
 	});
 
 	it("queues a same-key follow-up once the prior owner has handed off", async () => {
@@ -1601,6 +1734,31 @@ describe("AgentSession queue characterization", () => {
 
 		expect(cleared).toEqual({ steering: [], followUp: [clearedAgentMessage] });
 		expect(getUserTexts(harness)).toEqual(["kept"]);
+	});
+
+	it("restores next-turn context from cancelled actions in action order", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const firstPrompt = agentPromptText("agentmsg_restore_first", "first");
+		const secondPrompt = agentPromptText("agentmsg_restore_second", "second");
+		withStreaming(harness, true);
+		await harness.session.sendCustomMessage(
+			{ customType: "next-turn", content: "context A", display: true, details: {} },
+			{ deliverAs: "nextTurn" },
+		);
+		await harness.session.queueAgentMessagePrompt(firstPrompt, "followUp");
+		await harness.session.sendCustomMessage(
+			{ customType: "next-turn", content: "context B", display: true, details: {} },
+			{ deliverAs: "nextTurn" },
+		);
+		await harness.session.queueAgentMessagePrompt(secondPrompt, "followUp");
+
+		expect(harness.session.clearQueue().followUp).toEqual([firstPrompt, secondPrompt]);
+		expect(harness.session.getPendingNextTurnMessageSnapshots().map(getMessageText)).toEqual([
+			"context A",
+			"context B",
+		]);
+		withStreaming(harness, false);
 	});
 
 	it("delivers next-turn context when the first preparing turn is cancelled", async () => {
@@ -2095,33 +2253,7 @@ describe("AgentSession queue characterization", () => {
 		expect(getAssistantTexts(harness)).toEqual(["custom done", "follow-up done"]);
 	});
 
-	it("rechecks queued-work pauses acquired at the action-admission boundary", async () => {
-		const harness = await createHarness();
-		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("direct done")]);
-		const internals = harness.session as unknown as {
-			_acquireTurnAdmission(): Promise<{ owner: symbol; release(): void }>;
-		};
-		const acquireTurnAdmission = internals._acquireTurnAdmission.bind(internals);
-		let pause: { release(): void } | undefined;
-		let first = true;
-		internals._acquireTurnAdmission = async () => {
-			const admission = await acquireTurnAdmission();
-			if (first) {
-				first = false;
-				pause = harness.session.acquireQueuedWorkPause();
-			}
-			return admission;
-		};
-		const prompt = harness.session.prompt("direct");
-		await new Promise<void>((resolve) => setImmediate(resolve));
-		expect(getUserTexts(harness)).toEqual([]);
-		pause?.release();
-		await prompt;
-		expect(getUserTexts(harness)).toEqual(["direct"]);
-	});
-
-	it("rejects disposal while action admission waits behind a pause", async () => {
+	it("settles an action disposed while its queued-work pause is held", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
 		const pause = harness.session.acquireQueuedWorkPause();
@@ -2333,6 +2465,117 @@ describe("AgentSession queue characterization", () => {
 		expect(harness.sessionManager.getLeafId()).not.toBe(secondId);
 	});
 
+	it("defers steer heartbeats while a non-streaming session command is running", async () => {
+		const commandStarted = createDeferred();
+		const commandGate = createDeferred();
+		const harness = await createHarness();
+		harnesses.push(harness);
+		vi.spyOn(harness.session, "refine").mockImplementation(async () => {
+			commandStarted.resolve();
+			await commandGate.promise;
+			return emptyRefinementResult();
+		});
+
+		const command = harness.session.prompt("/refine --local");
+		await commandStarted.promise;
+		expect(harness.session.isStreaming).toBe(false);
+		expect(harness.session.unfinishedActionCount).toBe(1);
+		expect(harness.session.hasPendingSessionWork).toBe(false);
+		expect(shouldDeferHeartbeatCronJob(heartbeatJob(), harness.session)).toBe(true);
+
+		commandGate.resolve();
+		await command;
+	});
+
+	it("keeps a slow session command on one branch while concurrent navigation waits", async () => {
+		const commandStarted = createDeferred();
+		const commandGate = createDeferred();
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		await harness.session.prompt("one");
+		const target = harness.sessionManager.getEntries().find((entry) => entry.type === "message");
+		expect(target).toBeDefined();
+		await harness.session.prompt("two");
+		vi.spyOn(harness.session, "refine").mockImplementation(async () => {
+			commandStarted.resolve();
+			await commandGate.promise;
+			return emptyRefinementResult();
+		});
+
+		const command = harness.session.prompt("/refine --local");
+		await commandStarted.promise;
+		let navigationSettled = false;
+		const navigation = harness.session.navigateTree(target!.id, { summarize: false }).then(() => {
+			navigationSettled = true;
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(navigationSettled).toBe(false);
+
+		commandGate.resolve();
+		await command;
+		await navigation;
+		const entries = harness.sessionManager.getEntries();
+		const inputEntry = entries.find(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === "session_slash_command" &&
+				entry.content === "/refine --local",
+		);
+		const resultEntry = entries.find(
+			(entry) => entry.type === "custom_message" && entry.customType === "session_slash_command_result",
+		);
+		expect(inputEntry).toBeDefined();
+		expect(resultEntry).toBeDefined();
+		expect(harness.sessionManager.getBranch(resultEntry!.id).map((entry) => entry.id)).toContain(inputEntry!.id);
+	});
+
+	it("allows a /compact extension hook to navigate without deadlocking on the commit fence", async () => {
+		let targetId: string | undefined;
+		let navigateFromContext: ((target: string) => Promise<{ cancelled: boolean }>) | undefined;
+		let navigated = false;
+		const harness = await createHarness({
+			settings: { compaction: { keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("capture-navigation", {
+						description: "Capture command context",
+						handler: async (_args, ctx) => {
+							navigateFromContext = (target) => ctx.navigateTree(target, { summarize: false });
+						},
+					});
+					pi.on("session_before_compact", async () => {
+						if (!navigateFromContext) throw new Error("Expected captured extension command context");
+						const result = await navigateFromContext(targetId!);
+						navigated = !result.cancelled;
+						return { cancel: true };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({
+			commandContextActions: {
+				waitForIdle: () => harness.session.waitForIdle(),
+				newSession: async () => ({ cancelled: false }),
+				fork: async () => ({ cancelled: false }),
+				navigateTree: async (target, options) => harness.session.navigateTree(target, options),
+				switchSession: async () => ({ cancelled: false }),
+				reload: async () => {},
+			},
+		});
+		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		await harness.session.prompt("one");
+		targetId = harness.sessionManager.getEntries().find((entry) => entry.type === "message")?.id;
+		expect(targetId).toBeDefined();
+		await harness.session.prompt("two");
+		await harness.session.prompt("/capture-navigation");
+
+		await harness.session.prompt("/compact");
+
+		expect(navigated).toBe(true);
+	});
+
 	it("waitForIdle yields to timers while queued work is paused", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -2389,6 +2632,19 @@ describe("AgentSession queue characterization", () => {
 		expect(getUserTexts(harness)).toEqual(["queued across abort"]);
 	});
 
+	it("admits a resumeIfIdle follow-up after abort suspends queued work", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("queued done"), fauxAssistantMessage("wake done")]);
+		await harness.session.followUp("queued before abort");
+		await harness.session.abort();
+
+		await expect(harness.session.followUp("wake after abort", undefined, { resumeIfIdle: true })).resolves.toBe(true);
+		await harness.session.waitForIdle();
+
+		expect(getUserTexts(harness)).toEqual(["queued before abort", "wake after abort"]);
+	});
+
 	it("waitForIdle resolves when the queue is cleared while the pump is suspended", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -2425,6 +2681,35 @@ describe("AgentSession queue characterization", () => {
 		expect(harness.session.hasAcceptedPromptInFlight).toBe(false);
 		harness.session.clearQueue();
 		withStreaming(harness, false);
+	});
+
+	it("waitForIdle observes event-queue work chained while settling", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const initialEvent = createDeferred();
+		const chainedOperation = createDeferred();
+		const internals = harness.session as unknown as { _agentEventQueue: Promise<void> };
+		let eventQueue: Promise<void>;
+		eventQueue = initialEvent.promise.then(() => {
+			internals._agentEventQueue = eventQueue.then(() => chainedOperation.promise);
+		});
+		internals._agentEventQueue = eventQueue;
+		let idle = false;
+		const waiting = harness.session.waitForIdle().then(() => {
+			idle = true;
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+
+		initialEvent.resolve();
+		await eventQueue;
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		try {
+			expect(idle).toBe(false);
+		} finally {
+			chainedOperation.resolve();
+		}
+		await waiting;
+		expect(idle).toBe(true);
 	});
 
 	it("waitForIdle observes a run that starts at its final idle boundary", async () => {

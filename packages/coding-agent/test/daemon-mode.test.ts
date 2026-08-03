@@ -4620,7 +4620,7 @@ describe("daemon mode helpers", () => {
 		},
 		{
 			name: "does not enqueue another heartbeat when one is already pending",
-			activity: { isStreaming: true, unfinishedActionCount: 1 },
+			activity: { isStreaming: true, hasPendingSessionWork: true, unfinishedActionCount: 1 },
 			jobs: [{ id: "heartbeat-1", source: "heartbeat" }],
 			acceptingAgentMessage: false,
 			assertQueuedHeartbeatUntouched: true,
@@ -4742,6 +4742,8 @@ describe("daemon mode helpers", () => {
 		const sessionState = {
 			isStreaming: false,
 			isBashRunning: false,
+			hasPendingSessionWork: false,
+			unfinishedActionCount: 1,
 			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		};
 		const prompt = vi.fn(async (_message: string, options?: { preflightResult?: (didSucceed: boolean) => void }) => {
@@ -5803,6 +5805,7 @@ type CronAdmissionActivity = Partial<{
 	isCompacting: boolean;
 	isRetrying: boolean;
 	isBashRunning: boolean;
+	hasPendingSessionWork: boolean;
 	unfinishedActionCount: number;
 }>;
 
@@ -5841,6 +5844,7 @@ function makeCronAdmissionFixture(
 			isCompacting: false,
 			isRetrying: false,
 			isBashRunning: false,
+			hasPendingSessionWork: false,
 			unfinishedActionCount: 0,
 			...activity,
 			prompt,
