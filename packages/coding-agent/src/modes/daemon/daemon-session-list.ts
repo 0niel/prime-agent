@@ -6,6 +6,7 @@ import { compactRlmText, rlmChildLabel } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.js";
 import { type AgentCronJob, isHeartbeatCronJob } from "../../core/cron-jobs.js";
+import type { SessionActionSnapshot } from "../../core/session-action-store.js";
 import type { AgentTaskState, SessionInfo } from "../../core/session-manager.js";
 import type { AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
 import type { ActiveSessionState } from "./active-session-state.js";
@@ -28,6 +29,7 @@ export interface SessionSummary {
 	id: string;
 	lifecycle: SessionLifecycle;
 	activity: SessionActivity;
+	isSessionActive: boolean;
 	hasActiveHeartbeat?: boolean;
 	runtimeKind?: "top-level" | "subagent";
 	activeSessionId?: string;
@@ -45,7 +47,8 @@ export interface SessionSummary {
 	isRunningTools?: boolean;
 	attachedClients: number;
 	messageCount: number;
-	pendingMessageCount: number;
+	unfinishedActionCount?: number;
+	sessionActions: SessionActionSnapshot;
 	streamingMessage?: AgentMessage;
 	created?: string;
 	modified?: string;
@@ -88,13 +91,7 @@ export function resolveAttachModelFallbackMessage(
 }
 
 export function isSessionSummaryBusy(summary: SessionSummary): boolean {
-	return (
-		summary.isStreaming ||
-		summary.isCompacting ||
-		summary.isBashRunning === true ||
-		summary.hasRunningRlmChildren === true ||
-		summary.pendingMessageCount > 0
-	);
+	return summary.isSessionActive || summary.hasRunningRlmChildren === true;
 }
 
 export function buildSessionList(
@@ -145,17 +142,12 @@ export function buildSessionList(
 	return entries;
 }
 
-function effectivePendingMessageCount(session: ActiveSessionState["runtime"]["session"]): number {
-	return session.pendingMessageCount + (session.hasAcceptedPromptInFlight ? 1 : 0);
-}
-
 export function summaryForActiveSession(
 	activeSession: ActiveSessionState,
 	savedSession?: SessionInfo,
 	hasActiveHeartbeat = false,
 ): SessionSummary {
 	const session = activeSession.runtime.session;
-	const pendingMessageCount = effectivePendingMessageCount(session);
 	const metadata = activeSession.runtime.metadata ?? { kind: "top-level" as const };
 	let modified = savedSession?.modified.toISOString();
 	if (!modified && session.sessionFile) {
@@ -170,6 +162,7 @@ export function summaryForActiveSession(
 		id: activeSession.activeSessionId,
 		lifecycle: activeLifecycleForSession(activeSession),
 		activity: activeActivityForSession(activeSession),
+		isSessionActive: session.isSessionActive,
 		hasActiveHeartbeat: hasActiveHeartbeat || undefined,
 		runtimeKind: metadata.kind,
 		activeSessionId: activeSession.activeSessionId,
@@ -186,7 +179,8 @@ export function summaryForActiveSession(
 		isRunningTools: session.isStreaming && session.state.pendingToolCalls.size > 0,
 		attachedClients: activeSession.clients.size,
 		messageCount: session.messages.length,
-		pendingMessageCount,
+		unfinishedActionCount: session.unfinishedActionCount,
+		sessionActions: session.getSessionActionSnapshot(),
 		streamingMessage: session.state.streamingMessage,
 		created: savedSession?.created.toISOString() ?? session.sessionManager.getHeader?.()?.timestamp,
 		modified,
@@ -227,6 +221,7 @@ export function summaryForInactiveSession(session: SessionInfo): SessionSummary 
 		id: session.id,
 		lifecycle: inactiveLifecycleForSession(session),
 		activity: "idle",
+		isSessionActive: false,
 		sessionId: session.id,
 		sessionFile: session.path,
 		sessionName: session.name,
@@ -235,7 +230,8 @@ export function summaryForInactiveSession(session: SessionInfo): SessionSummary 
 		isCompacting: false,
 		attachedClients: 0,
 		messageCount: session.messageCount,
-		pendingMessageCount: 0,
+		unfinishedActionCount: 0,
+		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		created: session.created.toISOString(),
 		modified: session.modified.toISOString(),
 		firstMessage: session.firstMessage,
@@ -314,7 +310,7 @@ function rlmChildSnapshotForActiveSession(
 	const runStatus = metadata.rlmChildId
 		? parent?.runtime.session.getRlmChildRunStatus(metadata.rlmChildId)
 		: undefined;
-	const status = runStatus ?? (session.isStreaming || effectivePendingMessageCount(session) > 0 ? "running" : "done");
+	const status = runStatus ?? (session.isSessionActive ? "running" : "done");
 	return {
 		id: metadata.rlmChildId ?? activeSession.activeSessionId,
 		parentId: parentNodeId,
@@ -368,13 +364,7 @@ function readMessageText(content: unknown): string {
 export function isActiveSessionBusy(activeSession: ActiveSessionState): boolean {
 	const session = activeSession.runtime.session;
 	// Background subagents keep the parent "working" even after its own turn ends.
-	return (
-		session.isStreaming ||
-		session.isCompacting ||
-		session.isBashRunning ||
-		effectivePendingMessageCount(session) > 0 ||
-		session.hasRunningRlmChildren()
-	);
+	return session.isSessionActive || session.hasRunningRlmChildren();
 }
 
 export function activeActivityForSession(activeSession: ActiveSessionState): SessionActivity {

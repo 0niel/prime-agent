@@ -52,13 +52,14 @@ function summary(): SessionSummary {
 		activeSessionId,
 		lifecycle: "live",
 		activity: "idle",
+		isSessionActive: false,
 		sessionId: "session-4602",
 		cwd: "/tmp",
 		isStreaming: false,
 		isCompacting: false,
 		attachedClients: 0,
 		messageCount: 1,
-		pendingMessageCount: 0,
+		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 	};
 }
 
@@ -382,6 +383,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 				summary: {
 					...frames.begin.snapshot.summary,
 					activity: "working" as const,
+					isSessionActive: true,
 					attachedClients: 2,
 				},
 			},
@@ -392,6 +394,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		expect(worker.snapshotCache.get(activeSessionId)?.snapshot.summary).toMatchObject({
 			activity: "working",
+			isSessionActive: true,
 		});
 		expect(streamSnapshot).toHaveBeenCalledOnce();
 		expect(close).not.toHaveBeenCalled();

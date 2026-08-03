@@ -237,10 +237,12 @@ import {
 	type DeliveryRecord,
 	type RuntimeActivity,
 	type SessionAction,
+	type SessionActionSnapshot,
 	type SessionCommandPayload,
 	type SessionTurnPayload,
 	shouldYieldLowerRun,
 	transitionSessionAction,
+	type WakePolicy,
 } from "./session-action-store.js";
 import type { BranchSummaryEntry, CompactionEntry, SessionContext, SessionMessageEntry } from "./session-manager.js";
 import {
@@ -309,11 +311,7 @@ export type CompactionReason = "manual" | "threshold" | "overflow" | "requested"
 export type AgentSessionEvent =
 	| AgentEvent
 	| { type: "ipython_sent_agent_message"; toolCallId: string; message: KernelSentAgentMessage }
-	| {
-			type: "queue_update";
-			steering: readonly string[];
-			followUp: readonly string[];
-	  }
+	| { type: "session_action_update"; actions: SessionActionSnapshot }
 	| { type: "compaction_start"; reason: CompactionReason; customInstructions?: string }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
@@ -582,7 +580,7 @@ interface CommitPreparationSteps<TPrepared, TCommitted> {
 type QueuedAgentMessage = UserMessage | CustomMessage;
 type SessionInputSchedule = "steer" | "followUp";
 
-interface TurnExecutionPolicy {
+export interface TurnExecutionPolicy {
 	preparation: CommitPreparationPolicy;
 	runBeforeAgentStart: boolean;
 	nextTurnContextTiming: "preparation" | "commit" | "skip";
@@ -645,7 +643,7 @@ function oncePreflight(
 	};
 }
 
-export interface QueuedAgentInputSnapshot {
+interface RestoredPromptInput {
 	text: string;
 	content?: (TextContent | ImageContent)[];
 	images?: ImageContent[];
@@ -655,12 +653,50 @@ export interface QueuedAgentInputSnapshot {
 	prefixMessages?: CustomMessage[];
 }
 
-export interface AcceptedAgentInputSnapshot extends QueuedAgentInputSnapshot {
-	nextTurn: CustomMessage[];
+export const SESSION_ACTION_RECOVERY_FORMAT_VERSION = 1;
+
+export interface SessionActionRecoveryRecord {
+	id: string;
+	role: DeliveryRecord["role"];
+	message: QueuedAgentMessage;
+	ownerActionId: string;
 }
 
-interface SessionActionRecoverySnapshot {
-	actions: readonly QueuedSessionAction[];
+export type SessionActionRecoveryPayload =
+	| {
+			kind: "turn";
+			text: string;
+			preview?: string;
+			records: SessionActionRecoveryRecord[];
+			images?: ImageContent[];
+			content?: (TextContent | ImageContent)[];
+			customMessage?: CustomMessage;
+			executionPolicy: TurnExecutionPolicy;
+			queueVisible: boolean;
+			acceptedAgentMessage: boolean;
+			acceptedBeforeCompletion: boolean;
+	  }
+	| {
+			kind: "session_command";
+			text: string;
+			command: SessionSlashCommand;
+			images?: ImageContent[];
+	  };
+
+export interface SessionActionRecoveryAction {
+	id: string;
+	source: InputSource | "internal";
+	delivery: DeliveryPolicy;
+	wake: WakePolicy;
+	payload: SessionActionRecoveryPayload;
+	queueKey?: string;
+	agentMessageId?: string;
+	suppressAutonomousContinuation?: boolean;
+}
+
+export interface SessionActionRecoverySnapshot {
+	formatVersion: typeof SESSION_ACTION_RECOVERY_FORMAT_VERSION;
+	actions: SessionActionRecoveryAction[];
 }
 
 function cloneCustomMessage(message: CustomMessage): CustomMessage {
@@ -670,20 +706,12 @@ function cloneCustomMessage(message: CustomMessage): CustomMessage {
 	};
 }
 
-function createQueuedAgentInputSnapshotFromUserMessage(
-	text: string,
-	message: QueuedAgentMessage,
-): QueuedAgentInputSnapshot {
-	if (message.role === "custom") {
-		return { text, customMessage: cloneCustomMessage(message) };
-	}
-	const messageContent = message.content;
-	if (!Array.isArray(messageContent)) {
-		return { text };
-	}
-	const content = messageContent.map((block) => ({ ...block }));
-	const images = content.filter((block): block is ImageContent => block.type === "image");
-	return { text, content, ...(images.length > 0 ? { images } : {}) };
+function cloneQueuedAgentMessage(message: QueuedAgentMessage): QueuedAgentMessage {
+	if (message.role === "custom") return cloneCustomMessage(message);
+	return {
+		...message,
+		content: Array.isArray(message.content) ? message.content.map((block) => ({ ...block })) : message.content,
+	};
 }
 
 function primaryDeliveryRecord(action: QueuedSessionAction): DeliveryRecord {
@@ -699,33 +727,6 @@ function actionPrefixMessages(action: QueuedSessionAction): CustomMessage[] {
 				.filter((record): record is DeliveryRecord & { message: CustomMessage } => record.role === "prefix")
 				.map((record) => record.message)
 		: [];
-}
-
-function createQueuedAgentInputSnapshot(action: QueuedSessionAction): QueuedAgentInputSnapshot {
-	const payload = action.payload;
-	if (payload.kind === "session_command") {
-		return {
-			text: payload.text,
-			...(payload.images ? { images: payload.images.map((image) => ({ ...image })) } : {}),
-			...(action.agentMessageId ? { agentMessageId: action.agentMessageId } : {}),
-			customMessage: createSessionSlashCommandMessage(payload.command),
-		};
-	}
-	const message = primaryDeliveryRecord(action).message;
-	const legacySnapshot = createQueuedAgentInputSnapshotFromUserMessage(payload.text, message);
-	const prefixMessages = actionPrefixMessages(action);
-	return {
-		...legacySnapshot,
-		text: payload.text,
-		...(payload.content ? { content: payload.content.map((block) => ({ ...block })) } : {}),
-		...(payload.images ? { images: payload.images.map((image) => ({ ...image })) } : {}),
-		...(payload.customMessage ? { customMessage: cloneCustomMessage(payload.customMessage) } : {}),
-		...(prefixMessages.length > 0
-			? { prefixMessages: prefixMessages.map((prefix) => cloneCustomMessage(prefix)) }
-			: {}),
-		...(action.agentMessageId ? { agentMessageId: action.agentMessageId } : {}),
-		...(action.queueKey ? { queueKey: action.queueKey } : {}),
-	};
 }
 
 function normalizeMessageContent(content: string | (TextContent | ImageContent)[]): {
@@ -748,6 +749,15 @@ function queuedAgentMessagePreview(action: QueuedSessionAction): string {
 		return `${AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL}: ${payload.customMessage.details.message}`;
 	}
 	return payload.preview ?? payload.text;
+}
+
+function visibleSessionActionProjection(actions: readonly QueuedSessionAction[]): readonly QueuedSessionAction[] {
+	return actions.filter(
+		(action) =>
+			action.payload.kind === "session_command" ||
+			action.payload.queueVisible ||
+			action.payload.acceptedAgentMessage,
+	);
 }
 
 const IPYTHON_SENT_AGENT_MESSAGE_CUSTOM_ENTRY = "ipython_sent_agent_message";
@@ -1036,7 +1046,7 @@ export class AgentSession {
 	// Event subscription state
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
-	private _lastQueueUpdate = { steering: [] as string[], followUp: [] as string[] };
+	private _lastSessionActionSnapshot: SessionActionSnapshot = { queuedCount: 0, steering: [], followUps: [] };
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
 	/** Session-owned actions. Items are never fed into Agent.steer/followUp. */
@@ -1397,18 +1407,10 @@ export class AgentSession {
 	}
 
 	private _emitQueueUpdate(): void {
-		const steering = this.legacyPendingProjection("next_turn_boundary").map(queuedAgentMessagePreview);
-		const followUp = this.legacyPendingProjection("when_run_idle").map(queuedAgentMessagePreview);
-		if (
-			steering.length === this._lastQueueUpdate.steering.length &&
-			followUp.length === this._lastQueueUpdate.followUp.length &&
-			steering.every((value, index) => value === this._lastQueueUpdate.steering[index]) &&
-			followUp.every((value, index) => value === this._lastQueueUpdate.followUp[index])
-		) {
-			return;
-		}
-		this._lastQueueUpdate = { steering, followUp };
-		this._emit({ type: "queue_update", steering, followUp });
+		const actions = this.getSessionActionSnapshot();
+		if (JSON.stringify(actions) === JSON.stringify(this._lastSessionActionSnapshot)) return;
+		this._lastSessionActionSnapshot = actions;
+		this._emit({ type: "session_action_update", actions });
 	}
 
 	private _restoreLateIpythonSentAgentMessages(): void {
@@ -1584,7 +1586,12 @@ export class AgentSession {
 		}
 		for (const action of actions) {
 			const ticket = this._actionStore.ticketFor(action);
-			if (action.payload.kind === "turn" && (action.payload.acceptedAgentMessage || !action.payload.queueVisible)) {
+			if (
+				action.payload.kind === "turn" &&
+				(action.payload.acceptedAgentMessage ||
+					!action.payload.queueVisible ||
+					previousStates.get(action.id) !== "queued")
+			) {
 				ticket.rejectDelivered(error);
 			} else {
 				ticket.settleDelivered({ status: "not_applicable" });
@@ -1613,6 +1620,7 @@ export class AgentSession {
 				this._actionStore.releaseTerminal(action);
 			}
 		}
+		if (actions.length > 0) this._notifySessionInputCheckpointChange();
 		return actions;
 	}
 
@@ -2652,7 +2660,7 @@ export class AgentSession {
 		if (options.messages === undefined) {
 			this._continueAfterThresholdCompaction = false;
 		}
-		if (!this.agent.hasQueuedMessages() && this.pendingMessageCount === 0) {
+		if (!this.agent.hasQueuedMessages() && this.unfinishedActionCount === 0) {
 			this._cancelPostCompactionContinue();
 		}
 	}
@@ -3039,7 +3047,7 @@ export class AgentSession {
 		context: GetContinuationMessagesContext,
 		signal?: AbortSignal,
 	): Promise<AgentMessage[]> {
-		if (this.pendingMessageCount > 0) {
+		if (this.queuedActionCount > 0) {
 			return [];
 		}
 		const arrivalEpoch = this._sessionInputArrivalEpoch;
@@ -3200,6 +3208,7 @@ export class AgentSession {
 				if (record?.role === "primary" && action.lifecycle.state === "committing") {
 					transitionSessionAction(action, { state: "running", execution: "agent_turn" });
 					this._notifySessionInputCheckpointChange();
+					this._emitQueueUpdate();
 				}
 			}
 		}
@@ -3825,6 +3834,7 @@ export class AgentSession {
 				if (outcome.completion) this._settleAgentMessage(agentMessageId, "completion", completionError);
 			}
 			this._cancelSessionActions(() => true, deliveryError);
+			this._notifySessionInputCheckpointChange();
 			this.agent.clearAllQueues();
 			this._extensionRunner.invalidate(
 				"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
@@ -4671,6 +4681,75 @@ export class AgentSession {
 		});
 	}
 
+	async restoreSessionActions(snapshot: SessionActionRecoverySnapshot): Promise<number> {
+		if (snapshot.formatVersion !== SESSION_ACTION_RECOVERY_FORMAT_VERSION) {
+			throw new Error(`Unsupported session action recovery format version: ${snapshot.formatVersion}`);
+		}
+		const actionIds = new Set(this._actionStore.ownedActions().map((action) => action.id));
+		const actions = snapshot.actions.map((recovered): QueuedSessionAction => {
+			if (actionIds.has(recovered.id)) throw new Error(`Duplicate session action id: ${recovered.id}`);
+			actionIds.add(recovered.id);
+			if (
+				recovered.payload.kind === "turn" &&
+				recovered.payload.records.some((record) => record.ownerActionId !== recovered.id)
+			) {
+				throw new Error(`Session action ${recovered.id} has invalid delivery correlation`);
+			}
+			const payload: PreparedTurnPayload | PreparedCommandPayload =
+				recovered.payload.kind === "turn"
+					? {
+							kind: "turn",
+							text: recovered.payload.text,
+							...(recovered.payload.preview ? { preview: recovered.payload.preview } : {}),
+							records: recovered.payload.records.map((record) => ({
+								id: record.id,
+								role: record.role,
+								message: cloneQueuedAgentMessage(record.message),
+								started: false,
+								durable: false,
+								ownerActionId: record.ownerActionId,
+							})),
+							...(recovered.payload.images
+								? { images: recovered.payload.images.map((image) => ({ ...image })) }
+								: {}),
+							...(recovered.payload.content
+								? { content: recovered.payload.content.map((block) => ({ ...block })) }
+								: {}),
+							...(recovered.payload.customMessage
+								? { customMessage: cloneCustomMessage(recovered.payload.customMessage) }
+								: {}),
+							executionPolicy: {
+								...recovered.payload.executionPolicy,
+								preparation: { ...recovered.payload.executionPolicy.preparation },
+							},
+							queueVisible: recovered.payload.queueVisible,
+							acceptedAgentMessage: recovered.payload.acceptedAgentMessage,
+							acceptedBeforeCompletion: recovered.payload.acceptedBeforeCompletion,
+						}
+					: {
+							kind: "session_command",
+							text: recovered.payload.text,
+							command: { ...recovered.payload.command },
+							...(recovered.payload.images
+								? { images: recovered.payload.images.map((image) => ({ ...image })) }
+								: {}),
+						};
+			return {
+				id: recovered.id,
+				source: recovered.source,
+				delivery: recovered.delivery,
+				wake: recovered.wake,
+				payload,
+				lifecycle: { state: "queued" },
+				...(recovered.queueKey ? { queueKey: recovered.queueKey } : {}),
+				...(recovered.agentMessageId ? { agentMessageId: recovered.agentMessageId } : {}),
+				...(recovered.suppressAutonomousContinuation ? { suppressAutonomousContinuation: true } : {}),
+			};
+		});
+		for (const action of actions) this._admitSessionInput(action, { restore: true });
+		return actions.length;
+	}
+
 	private _restoreSessionCommand(
 		text: string,
 		customMessage: CustomMessage | undefined,
@@ -4690,10 +4769,7 @@ export class AgentSession {
 		).accepted;
 	}
 
-	private _restoreLegacyRecoveryPrompt(
-		schedule: SessionInputSchedule,
-		snapshot: QueuedAgentInputSnapshot,
-	): Promise<boolean> {
+	private _restorePromptInput(schedule: SessionInputSchedule, snapshot: RestoredPromptInput): Promise<boolean> {
 		return this._queuePreparedPrompt(schedule, snapshot.text, snapshot.images, {
 			queueKey: snapshot.queueKey,
 			agentMessageId: snapshot.agentMessageId,
@@ -4720,7 +4796,7 @@ export class AgentSession {
 		)
 			return;
 
-		await this._restoreLegacyRecoveryPrompt("steer", {
+		await this._restorePromptInput("steer", {
 			text,
 			images,
 			queueKey: options.queueKey,
@@ -4751,7 +4827,7 @@ export class AgentSession {
 		);
 		if (restoredCommand !== undefined) return restoredCommand;
 
-		return this._restoreLegacyRecoveryPrompt("followUp", {
+		return this._restorePromptInput("followUp", {
 			text,
 			images,
 			queueKey: options.queueKey,
@@ -4962,7 +5038,7 @@ export class AgentSession {
 		action: QueuedSessionAction,
 		options: { restore?: boolean; front?: boolean; wake?: boolean; immediatelyEligible?: boolean } = {},
 	): { accepted: boolean; disposition: "starts_when_admitted" | "queued"; ticket?: ActionTicket } {
-		const coalescedOwner = this._coalescedFollowUpOwner(action);
+		const coalescedOwner = options.restore ? undefined : this._coalescedFollowUpOwner(action);
 		if (coalescedOwner) {
 			if (action.agentMessageId !== coalescedOwner.agentMessageId) {
 				this._rejectAgentMessage(
@@ -5704,67 +5780,125 @@ export class AgentSession {
 		return { steering: removedSteering, followUp: removedFollowUp };
 	}
 
-	/** Preserves the active-as-pending wire behavior until the PR 4 protocol break. */
-	private legacyPendingProjection(delivery: DeliveryPolicy): readonly QueuedSessionAction[] {
-		return this._actionStore.unfinishedActions(delivery).filter((action) => {
-			if (action.payload.kind === "turn" && !action.payload.queueVisible) return false;
-			if (action.lifecycle.state === "queued") return true;
-			if (action.payload.kind === "session_command") {
-				return action.lifecycle.state === "selected" || action.lifecycle.state === "running";
-			}
-			return action.lifecycle.state === "selected" || action.lifecycle.state === "preparing";
-		});
+	get queuedActionCount(): number {
+		return visibleSessionActionProjection(this._actionStore.queuedActions()).length;
 	}
 
-	get pendingMessageCount(): number {
+	get unfinishedActionCount(): number {
+		return this._actionStore.unfinishedActions().length;
+	}
+
+	get isSessionActive(): boolean {
 		return (
-			this.legacyPendingProjection("next_turn_boundary").length +
-			this.legacyPendingProjection("when_run_idle").length
+			this.isStreaming ||
+			this.isCompacting ||
+			this.isRetrying ||
+			this.isBashRunning ||
+			this._refineInFlight !== undefined ||
+			this._branchSummaryOperation !== undefined ||
+			this.unfinishedActionCount > 0
 		);
+	}
+
+	getSessionActionSnapshot(): SessionActionSnapshot {
+		const steering = visibleSessionActionProjection(this._actionStore.queuedActions("next_turn_boundary")).map(
+			queuedAgentMessagePreview,
+		);
+		const followUps = visibleSessionActionProjection(this._actionStore.queuedActions("when_run_idle")).map(
+			queuedAgentMessagePreview,
+		);
+		const active = visibleSessionActionProjection(this._actionStore.activeActions())[0];
+		const activeState = active?.lifecycle.state;
+		const phase =
+			activeState === "selected"
+				? "preparing"
+				: activeState === "preparing" || activeState === "committing" || activeState === "running"
+					? activeState
+					: undefined;
+		return {
+			queuedCount: steering.length + followUps.length,
+			steering,
+			followUps,
+			...(active && phase
+				? { active: { kind: active.payload.kind, phase, label: compactRlmText(active.payload.text) } }
+				: {}),
+		};
 	}
 
 	getSteeringMessages(): readonly string[] {
-		return this.legacyPendingProjection("next_turn_boundary").map((action) => action.payload.text);
+		return visibleSessionActionProjection(this._actionStore.queuedActions("next_turn_boundary")).map(
+			(action) => action.payload.text,
+		);
 	}
 
 	getSteeringMessagePreviews(): readonly string[] {
-		return this.legacyPendingProjection("next_turn_boundary").map(queuedAgentMessagePreview);
+		return visibleSessionActionProjection(this._actionStore.queuedActions("next_turn_boundary")).map(
+			queuedAgentMessagePreview,
+		);
 	}
 
 	getFollowUpMessages(): readonly string[] {
-		return this.legacyPendingProjection("when_run_idle").map((action) => action.payload.text);
+		return visibleSessionActionProjection(this._actionStore.queuedActions("when_run_idle")).map(
+			(action) => action.payload.text,
+		);
 	}
 
 	getFollowUpMessagePreviews(): readonly string[] {
-		return this.legacyPendingProjection("when_run_idle").map(queuedAgentMessagePreview);
-	}
-
-	private _sessionActionRecoverySnapshot(): SessionActionRecoverySnapshot {
-		return { actions: this._actionStore.snapshotActions() };
-	}
-
-	/** Private old-manifest adapter; deleted when PR 4 versions the recovery format. */
-	private _legacyRecoverySnapshots(delivery: DeliveryPolicy): readonly QueuedAgentInputSnapshot[] {
-		const recovery = new Set(
-			this._sessionActionRecoverySnapshot().actions.filter((action) => action.delivery === delivery),
+		return visibleSessionActionProjection(this._actionStore.queuedActions("when_run_idle")).map(
+			queuedAgentMessagePreview,
 		);
-		const legacy = new Set(this.legacyPendingProjection(delivery));
-		return this._actionStore
-			.unfinishedActions(delivery)
-			.filter(
-				(action) =>
-					(recovery.has(action) || legacy.has(action)) &&
-					!(action.payload.kind === "turn" && action.payload.acceptedAgentMessage && !action.payload.queueVisible),
-			)
-			.map(createQueuedAgentInputSnapshot);
 	}
 
-	getSteeringQueueSnapshots(): readonly QueuedAgentInputSnapshot[] {
-		return this._legacyRecoverySnapshots("next_turn_boundary");
-	}
-
-	getFollowUpQueueSnapshots(): readonly QueuedAgentInputSnapshot[] {
-		return this._legacyRecoverySnapshots("when_run_idle");
+	getSessionActionRecoverySnapshot(): SessionActionRecoverySnapshot {
+		return {
+			formatVersion: SESSION_ACTION_RECOVERY_FORMAT_VERSION,
+			actions: this._actionStore.snapshotActions().map((action) => ({
+				id: action.id,
+				source: action.source,
+				delivery: action.delivery,
+				wake: action.wake,
+				...(action.queueKey ? { queueKey: action.queueKey } : {}),
+				...(action.agentMessageId ? { agentMessageId: action.agentMessageId } : {}),
+				...(action.suppressAutonomousContinuation ? { suppressAutonomousContinuation: true } : {}),
+				payload:
+					action.payload.kind === "turn"
+						? {
+								kind: "turn",
+								text: action.payload.text,
+								...(action.payload.preview ? { preview: action.payload.preview } : {}),
+								records: action.payload.records.map((record) => ({
+									id: record.id,
+									role: record.role,
+									message: cloneQueuedAgentMessage(record.message),
+									ownerActionId: record.ownerActionId,
+								})),
+								...(action.payload.images
+									? { images: action.payload.images.map((image) => ({ ...image })) }
+									: {}),
+								...(action.payload.content
+									? { content: action.payload.content.map((block) => ({ ...block })) }
+									: {}),
+								...(action.payload.customMessage
+									? { customMessage: cloneCustomMessage(action.payload.customMessage) }
+									: {}),
+								executionPolicy: {
+									...action.payload.executionPolicy,
+									preparation: { ...action.payload.executionPolicy.preparation },
+								},
+								queueVisible: action.payload.queueVisible,
+								acceptedAgentMessage: action.payload.acceptedAgentMessage,
+								acceptedBeforeCompletion: action.payload.acceptedBeforeCompletion,
+							}
+						: {
+								kind: "session_command",
+								text: action.payload.text,
+								command: { ...action.payload.command },
+								...(action.payload.images
+									? { images: action.payload.images.map((image) => ({ ...image })) }
+									: {}),
+							},
+			})),
+		};
 	}
 
 	private _notifySessionInputCheckpointChange(): void {
@@ -5842,6 +5976,7 @@ export class AgentSession {
 				released = true;
 				this._queuedWorkPauses.delete(token);
 				if (this._queuedWorkPauses.size === 0) this._wakeQueuedWorkAdmissionWaiters();
+				this._notifySessionInputCheckpointChange();
 				this._scheduleSessionInputPump();
 			},
 		};
@@ -5856,7 +5991,7 @@ export class AgentSession {
 		if (this._disposed || this._disposing) {
 			throw new Error("Cannot admit a session action because the session is disposing or disposed.");
 		}
-		if (this.pendingMessageCount > 0 && this._sessionInputPumpSuspended) {
+		if (this.unfinishedActionCount > 0 && this._sessionInputPumpSuspended) {
 			throw new Error("Cannot admit a session action while queued session input is suspended.");
 		}
 	}
@@ -5937,8 +6072,9 @@ export class AgentSession {
 	/** Resume the scheduler after requestAbort/abortForUpdateRestart suspended it; owned pause leases are unaffected. */
 	resumeQueuedWork(): boolean {
 		this._sessionInputPumpSuspended = false;
+		this._notifySessionInputCheckpointChange();
 		this._scheduleSessionInputPump();
-		return this.pendingMessageCount > 0;
+		return this._hasSelectableSessionInput();
 	}
 
 	async waitForSessionInputIdle(): Promise<void> {
@@ -5951,6 +6087,13 @@ export class AgentSession {
 
 	async waitForIdle(): Promise<void> {
 		while (true) {
+			if (this._actionStore.queuedActions().length > 0) {
+				if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) {
+					await new Promise<void>((resolve) => this._sessionInputCheckpointWaiters.add(resolve));
+					continue;
+				}
+				this._scheduleSessionInputPump();
+			}
 			const pump = this._sessionInputPump;
 			await pump;
 			await this.agent.waitForIdle();
@@ -5959,7 +6102,7 @@ export class AgentSession {
 				!this._sessionInputPumpRequested &&
 				!this._pumpingSessionInput &&
 				!this.agent.state.isStreaming &&
-				this._actionStore.activeActions().length === 0
+				this.unfinishedActionCount === 0
 			) {
 				return;
 			}
@@ -5988,32 +6131,6 @@ export class AgentSession {
 			);
 		}
 		return messages;
-	}
-
-	getAcceptedPromptSnapshot(): AcceptedAgentInputSnapshot | undefined {
-		const action = this._actionStore
-			.unfinishedActions()
-			.find(
-				(candidate) =>
-					candidate.payload.kind === "turn" &&
-					candidate.payload.acceptedAgentMessage &&
-					!candidate.payload.queueVisible &&
-					!primaryDeliveryRecord(candidate).started,
-			);
-		if (!action || action.payload.kind !== "turn") return undefined;
-		const nextTurn = action.payload.records
-			.filter(
-				(record): record is DeliveryRecord & { message: CustomMessage } =>
-					(record.role === "next_turn" || record.role === "prefix") &&
-					record.message.role === "custom" &&
-					!record.durable,
-			)
-			.map((record) => cloneCustomMessage(record.message));
-		return {
-			...createQueuedAgentInputSnapshotFromUserMessage(action.payload.text, primaryDeliveryRecord(action).message),
-			agentMessageId: action.agentMessageId,
-			nextTurn,
-		};
 	}
 
 	restorePendingNextTurnMessages(messages: readonly CustomMessage[]): void {
@@ -6602,7 +6719,7 @@ export class AgentSession {
 				// Queued agent or session-owned inputs resume the loop; defer refine
 				// behind them instead of interleaving it before their turns.
 				this._scheduleAutoRefineAfterCompaction(
-					hadPostCompactionContinue || this.agent.hasQueuedMessages() || this.pendingMessageCount > 0,
+					hadPostCompactionContinue || this.agent.hasQueuedMessages() || this.unfinishedActionCount > 0,
 				);
 			}
 		}
@@ -6852,19 +6969,14 @@ export class AgentSession {
 			return;
 		}
 		// An empty queue is not idle while the scheduler still owns active work.
-		if (
-			this.pendingMessageCount > 0 ||
-			this._actionStore.activeActions().length > 0 ||
-			this._pumpingSessionInput ||
-			this._sessionInputPumpRequested
-		) {
+		if (this.unfinishedActionCount > 0 || this._pumpingSessionInput || this._sessionInputPumpRequested) {
 			this._scheduleSessionInputPump();
 			await this._sessionInputPump;
 			if (this._postCompactionContinuationScheduled) {
 				this._postCompactionContinuationScheduled = false;
 				const shouldReschedule =
 					continuationMessages.length === 0
-						? this.pendingMessageCount > 0
+						? this.unfinishedActionCount > 0
 						: this._sessionOwnsScheduledContinuations(continuationMessages);
 				if (shouldReschedule) {
 					this._schedulePostCompactionContinue();
@@ -7924,7 +8036,7 @@ export class AgentSession {
 				isIdle: () => !this.isStreaming,
 				getSignal: () => this.agent.signal,
 				abort: () => this.abort(),
-				hasPendingMessages: () => this.pendingMessageCount > 0,
+				hasPendingMessages: () => this.queuedActionCount > 0,
 				shutdown: () => {
 					this._extensionShutdownHandler?.();
 				},

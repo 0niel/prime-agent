@@ -115,7 +115,7 @@ describe("daemon mode helpers", () => {
 					sessionId: string;
 					sessionName: string;
 					isStreaming: boolean;
-					pendingMessageCount: number;
+					unfinishedActionCount: number;
 					acceptAgentMessagePrompt: ReturnType<typeof vi.fn>;
 				};
 			};
@@ -136,7 +136,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 				acceptAgentMessagePrompt,
 			},
 		} as never;
@@ -192,7 +192,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-parent",
 				sessionName: "Parent",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 			},
 		} as never;
 		const defaultSubagentName = createDefaultRlmSubagentSessionName("retained worker", "child-1");
@@ -202,7 +202,7 @@ describe("daemon mode helpers", () => {
 					sessionId: string;
 					sessionName: string;
 					isStreaming: boolean;
-					pendingMessageCount: number;
+					unfinishedActionCount: number;
 					acceptAgentMessagePrompt: ReturnType<typeof vi.fn>;
 				};
 			};
@@ -224,7 +224,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-child",
 				sessionName: defaultSubagentName,
 				isStreaming: false,
-				pendingMessageCount: 0,
+				sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 				acceptAgentMessagePrompt,
 			},
 		} as never;
@@ -386,7 +386,7 @@ describe("daemon mode helpers", () => {
 				isRetrying: false,
 				isBashRunning: false,
 				hasAcceptedPromptInFlight: false,
-				pendingMessageCount: 0,
+				sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 				promptHeartbeat,
 				model: { provider: "current-provider", id: "current-model" },
 			});
@@ -510,7 +510,7 @@ describe("daemon mode helpers", () => {
 					isRetrying: false,
 					isBashRunning: false,
 					hasAcceptedPromptInFlight: false,
-					pendingMessageCount: 0,
+					sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 					promptHeartbeat,
 				});
 				if (options.sessionOptions?.rlmSessionDir === childSessionDir) {
@@ -748,7 +748,7 @@ describe("daemon mode helpers", () => {
 					sessionName: sessionId,
 					prompt: sessionPrompt,
 					isStreaming: false,
-					pendingMessageCount: 0,
+					sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 				},
 			} as unknown as ActiveSessionState["runtime"];
 		}
@@ -863,7 +863,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-source",
 				sessionName: "Source",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 			},
 		} as never;
 		const remoteSelector = "remote is closing";
@@ -897,7 +897,7 @@ describe("daemon mode helpers", () => {
 			runtimeKind: "top-level",
 			cwd: "/tmp/remote",
 			isStreaming: false,
-			pendingMessageCount: 0,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		});
 		internals.sendRemoteAgentSessionMessage = sendRemoteAgentSessionMessage;
 
@@ -936,7 +936,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-source",
 				sessionName: "Source",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 			},
 		} as never;
 		const sendRemoteAgentSessionMessage = vi.fn();
@@ -986,7 +986,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 				acceptAgentMessagePrompt,
 			},
 		} as never;
@@ -1058,7 +1058,7 @@ describe("daemon mode helpers", () => {
 					sessionId: `session-${targetState.activeSessionId}`,
 					sessionName: targetState.activeSessionId,
 					isStreaming: false,
-					pendingMessageCount: 0,
+					sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 					prompt: vi.fn(async () => {}),
 					followUp: vi.fn(async () => true),
 					clearQueue: vi.fn(() => ({ cleared: 0 })),
@@ -1143,7 +1143,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 2,
+				unfinishedActionCount: 2,
 				clearQueuedUserMessagesMatching,
 				clearQueue,
 			},
@@ -1189,7 +1189,7 @@ describe("daemon mode helpers", () => {
 					sessionId: `session-${state.activeSessionId}`,
 					sessionName: state.activeSessionId,
 					isStreaming: false,
-					pendingMessageCount: 1,
+					unfinishedActionCount: 1,
 					clearQueuedUserMessagesMatching,
 				},
 			} as never;
@@ -1241,7 +1241,7 @@ describe("daemon mode helpers", () => {
 					sessionId: `session-${state.activeSessionId}`,
 					sessionName: state.activeSessionId,
 					isStreaming: false,
-					pendingMessageCount: 1,
+					unfinishedActionCount: 1,
 					clearQueuedUserMessagesMatching,
 				},
 			} as never;
@@ -1286,7 +1286,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				prompt: vi.fn(async () => {
 					throw new Error("missing model");
 				}),
@@ -1351,7 +1351,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: true,
-				pendingMessageCount: 19,
+				unfinishedActionCount: 19,
 				clearQueue: vi.fn(() => ({ cleared: 0 })),
 				clearQueuedUserMessagesMatching: vi.fn(() => ({ steering: [], followUp: [] })),
 				queueAgentMessagePrompt,
@@ -1420,7 +1420,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: true,
-				get pendingMessageCount() {
+				get unfinishedActionCount() {
 					return pending;
 				},
 				queueAgentMessagePrompt,
@@ -1494,7 +1494,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: true,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				queueAgentMessagePrompt,
 				waitForAgentMessagePromptDelivery,
 			},
@@ -1542,7 +1542,7 @@ describe("daemon mode helpers", () => {
 					sessionId: `session-${name}`,
 					sessionName: name,
 					isStreaming: true,
-					pendingMessageCount: 0,
+					unfinishedActionCount: 0,
 					queueAgentMessagePrompt: vi.fn(async () => true),
 					// Neither turn ends while both sessions block inside their own send.
 					waitForAgentMessagePromptDelivery: vi.fn(() => new Promise<void>(() => {})),
@@ -1604,7 +1604,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 19,
+				unfinishedActionCount: 20,
 				hasAcceptedPromptInFlight: true,
 				acceptAgentMessagePrompt,
 				queueAgentMessagePrompt: vi.fn(async () => true),
@@ -1648,17 +1648,19 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 2,
+				unfinishedActionCount: 3,
 				hasAcceptedPromptInFlight: true,
 			},
 		} as never;
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
-			createAgentMessageListResult(current: ActiveSessionState): { agents: Array<{ pendingMessageCount: number }> };
+			createAgentMessageListResult(current: ActiveSessionState): {
+				agents: Array<{ unfinishedActionCount: number }>;
+			};
 		};
 		internals.sessions.set(targetState.activeSessionId, targetState);
 
-		expect(internals.createAgentMessageListResult(targetState).agents[0]?.pendingMessageCount).toBe(3);
+		expect(internals.createAgentMessageListResult(targetState).agents[0]?.unfinishedActionCount).toBe(3);
 	});
 
 	it("reports non-streaming busy sessions as active in agent-observe summaries", () => {
@@ -1686,7 +1688,9 @@ describe("daemon mode helpers", () => {
 				isBashRunning: false,
 				isRetrying: false,
 				hasAcceptedPromptInFlight: false,
-				pendingMessageCount: 1,
+				unfinishedActionCount: 1,
+				isSessionActive: true,
+				getSessionActionSnapshot: () => ({ queuedCount: 1, steering: [], followUps: [] }),
 				messages: [],
 				state: { pendingToolCalls: new Set(), streamingMessage: undefined },
 				hasRunningRlmChildren: () => false,
@@ -1700,8 +1704,9 @@ describe("daemon mode helpers", () => {
 
 		expect(internals.createAgentObserveListResult(targetState).current.status).toBe("busy");
 
-		(targetState.runtime.session as { isCompacting: boolean; pendingMessageCount: number }).isCompacting = true;
-		(targetState.runtime.session as { isCompacting: boolean; pendingMessageCount: number }).pendingMessageCount = 0;
+		(targetState.runtime.session as { isCompacting: boolean; unfinishedActionCount: number }).isCompacting = true;
+		(targetState.runtime.session as { isCompacting: boolean; unfinishedActionCount: number }).unfinishedActionCount =
+			0;
 
 		expect(internals.createAgentObserveListResult(targetState).current.status).toBe("compacting");
 	});
@@ -1734,7 +1739,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				prompt,
 				followUp,
 			},
@@ -1803,7 +1808,7 @@ describe("daemon mode helpers", () => {
 				sessionName: "Target",
 				isStreaming: false,
 				isRetrying: true,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				prompt,
 				followUp,
 				queueAgentMessagePrompt,
@@ -1859,7 +1864,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 1,
+				unfinishedActionCount: 1,
 				prompt,
 				followUp,
 				queueAgentMessagePrompt,
@@ -1915,7 +1920,7 @@ describe("daemon mode helpers", () => {
 				sessionName: "Target",
 				isStreaming: false,
 				isCompacting: true,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				prompt,
 				queueAgentMessagePrompt,
 			},
@@ -1969,7 +1974,7 @@ describe("daemon mode helpers", () => {
 				sessionName: "Target",
 				isStreaming: false,
 				isBashRunning: true,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				acceptAgentMessagePrompt,
 				queueAgentMessagePrompt,
 			},
@@ -2028,7 +2033,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: true,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				queueAgentMessagePrompt,
 				waitForAgentMessagePromptDelivery,
 			},
@@ -2088,7 +2093,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				prompt,
 				followUp,
 				queueAgentMessagePrompt,
@@ -2156,7 +2161,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: true,
-				pendingMessageCount: 1,
+				unfinishedActionCount: 1,
 				queueAgentMessagePrompt,
 			},
 		} as never;
@@ -2209,7 +2214,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				acceptAgentMessagePrompt,
 			},
 		} as never;
@@ -2260,7 +2265,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				prompt,
 				acceptAgentMessagePrompt,
 				queueAgentMessagePrompt,
@@ -2329,7 +2334,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				prompt,
 				acceptAgentMessagePrompt,
 			},
@@ -2401,7 +2406,7 @@ describe("daemon mode helpers", () => {
 				sessionName: "Target",
 				isStreaming: false,
 				isBashRunning: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				prompt,
 				promptUntilAccepted,
 				acceptAgentMessagePrompt,
@@ -2463,7 +2468,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				prompt,
 				acceptAgentMessagePrompt,
 				queueAgentMessagePrompt,
@@ -2543,7 +2548,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				acceptAgentMessagePrompt,
 				followUp,
 			},
@@ -2574,7 +2579,7 @@ describe("daemon mode helpers", () => {
 		});
 		await Promise.resolve();
 		await Promise.resolve();
-		(targetState.runtime.session as { pendingMessageCount: number }).pendingMessageCount = 20;
+		(targetState.runtime.session as { unfinishedActionCount: number }).unfinishedActionCount = 20;
 
 		resolveFirstPrompt();
 		await expect(first).resolves.toMatchObject({ message: "first" });
@@ -2597,7 +2602,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				prompt: vi.fn(async () => {}),
 			},
 		} as never;
@@ -2652,7 +2657,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				acceptAgentMessagePrompt,
 				clearQueuedUserMessagesMatching,
 			},
@@ -2713,7 +2718,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				acceptAgentMessagePrompt,
 				clearQueuedUserMessagesMatching,
 			},
@@ -2773,7 +2778,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				acceptAgentMessagePrompt,
 				clearQueuedUserMessagesMatching,
 			},
@@ -2838,7 +2843,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-target",
 				sessionName: "Target",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				messages: [],
 				acceptAgentMessagePrompt,
 				clearQueuedUserMessagesMatching,
@@ -2902,7 +2907,7 @@ describe("daemon mode helpers", () => {
 				sessionId: "session-self",
 				sessionName: "Self",
 				isStreaming: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 				prompt: vi.fn(async () => {}),
 			},
 		} as never;
@@ -4016,7 +4021,7 @@ describe("daemon mode helpers", () => {
 					sessionId: "session-grandchild",
 					sessionName: "Grandchild",
 					isStreaming: false,
-					pendingMessageCount: 0,
+					sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 				},
 			} as never;
 			internals.sessions.set(grandchildState.activeSessionId, grandchildState);
@@ -4170,7 +4175,12 @@ describe("daemon mode helpers", () => {
 			fromState.runtime = {
 				...fromState.runtime,
 				cwd: tempDir,
-				session: { sessionId: "session-source", sessionName: "Source", isStreaming: false, pendingMessageCount: 0 },
+				session: {
+					sessionId: "session-source",
+					sessionName: "Source",
+					isStreaming: false,
+					unfinishedActionCount: 0,
+				},
 			} as never;
 			internals.sessions.set(fromState.activeSessionId, fromState);
 
@@ -4610,7 +4620,7 @@ describe("daemon mode helpers", () => {
 		},
 		{
 			name: "does not enqueue another heartbeat when one is already pending",
-			activity: { isStreaming: true, pendingMessageCount: 1 },
+			activity: { isStreaming: true, unfinishedActionCount: 1 },
 			jobs: [{ id: "heartbeat-1", source: "heartbeat" }],
 			acceptingAgentMessage: false,
 			assertQueuedHeartbeatUntouched: true,
@@ -4624,7 +4634,7 @@ describe("daemon mode helpers", () => {
 		},
 		{
 			name: "defers heartbeat cron jobs while an accepted agent message prompt is in flight",
-			activity: { hasAcceptedPromptInFlight: true },
+			activity: { unfinishedActionCount: 1 },
 			jobs: [{ id: "heartbeat-1", source: "heartbeat" }],
 			acceptingAgentMessage: false,
 			assertQueuedHeartbeatUntouched: false,
@@ -4654,12 +4664,12 @@ describe("daemon mode helpers", () => {
 		},
 		{
 			name: "queues generic cron jobs behind accepted agent message prompts",
-			activity: { hasAcceptedPromptInFlight: true },
+			activity: { unfinishedActionCount: 1 },
 			acceptingAgentMessage: false,
 		},
 		{
 			name: "queues generic cron jobs behind pending messages",
-			activity: { pendingMessageCount: 1 },
+			activity: { unfinishedActionCount: 1 },
 			acceptingAgentMessage: false,
 		},
 	] as const)("$name", async ({ activity, acceptingAgentMessage }) => {
@@ -4732,7 +4742,7 @@ describe("daemon mode helpers", () => {
 		const sessionState = {
 			isStreaming: false,
 			isBashRunning: false,
-			pendingMessageCount: 0,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		};
 		const prompt = vi.fn(async (_message: string, options?: { preflightResult?: (didSucceed: boolean) => void }) => {
 			sessionState.isStreaming = true;
@@ -5793,8 +5803,7 @@ type CronAdmissionActivity = Partial<{
 	isCompacting: boolean;
 	isRetrying: boolean;
 	isBashRunning: boolean;
-	hasAcceptedPromptInFlight: boolean;
-	pendingMessageCount: number;
+	unfinishedActionCount: number;
 }>;
 
 function makeCronAdmissionFixture(
@@ -5832,8 +5841,7 @@ function makeCronAdmissionFixture(
 			isCompacting: false,
 			isRetrying: false,
 			isBashRunning: false,
-			hasAcceptedPromptInFlight: false,
-			pendingMessageCount: 0,
+			unfinishedActionCount: 0,
 			...activity,
 			prompt,
 			promptHeartbeat,

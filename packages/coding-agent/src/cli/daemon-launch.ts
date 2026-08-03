@@ -62,7 +62,7 @@ async function canConnectToDaemon(socketPath: string, timeoutMs: number): Promis
 type DaemonVersionProbe =
 	| { status: "absent" }
 	| { status: "current"; hello: DaemonHello }
-	| { status: "stale"; hello?: DaemonHello; compatible: boolean };
+	| { status: "stale"; hello?: DaemonHello };
 
 /** Connect to a running daemon and check whether it matches this client's protocol and app version. */
 export async function probeDaemonVersion(socketPath: string): Promise<DaemonVersionProbe> {
@@ -96,15 +96,11 @@ export async function probeDaemonVersion(socketPath: string): Promise<DaemonVers
 		if (current) {
 			return { status: "current", hello };
 		}
-		return {
-			status: "stale",
-			hello,
-			compatible: hello.protocol.version === 3,
-		};
+		return { status: "stale", hello };
 	} catch {
 		// Connected but no recognizable greeting: assume a stale daemon.
 		logDaemonLaunch(`running daemon on ${socketPath} sent no recognizable hello; treating as stale`);
-		return { status: "stale", compatible: false };
+		return { status: "stale" };
 	} finally {
 		client.close();
 	}
@@ -121,11 +117,7 @@ async function queryActiveDaemonSessions(
 	client: DaemonClient,
 	options: { includeClientOwned?: boolean } = {},
 ): Promise<{ sessions: SessionSummary[]; busyClientOwnedSessionCount: number }> {
-	const hello = await client.waitForHello(2000).catch(() => undefined);
-	const response =
-		hello && hello.protocol.version < DAEMON_PROTOCOL_VERSION
-			? await client.requestLegacy({ type: "list", includeClientOwned: options.includeClientOwned })
-			: await client.request({ type: "list", includeClientOwned: options.includeClientOwned });
+	const response = await client.request({ type: "list", includeClientOwned: options.includeClientOwned });
 	if (!response.success) {
 		throw new Error(response.error);
 	}
@@ -249,11 +241,7 @@ export async function shutdownConnectedDaemonAndWait(
 	let shutdownAccepted = false;
 	const expectedIdentity = processIdentityFromDaemonHello(hello);
 	try {
-		const request =
-			hello && hello.protocol.version < DAEMON_PROTOCOL_VERSION
-				? client.requestLegacy.bind(client)
-				: client.request.bind(client);
-		const response = await request({ type: "shutdown" }).catch(() => undefined);
+		const response = await client.request({ type: "shutdown" }).catch(() => undefined);
 		shutdownAccepted = response?.success === true;
 	} catch {
 		// A connect failure isn't treated as "gone"; waitForDaemonGone is the source of truth.
@@ -309,20 +297,6 @@ export async function probeRunningDaemonSessions(socketPath: string): Promise<Ru
 	}
 }
 
-export async function shouldUseLegacyOwnedSessionWorkerFrontend(socketPath: string): Promise<boolean> {
-	const version = await probeDaemonVersion(socketPath);
-	if (version.status !== "stale") {
-		return false;
-	}
-	const running = await probeRunningDaemonSessions(socketPath);
-	return (
-		running.reachable &&
-		(running.activeSessions === undefined ||
-			(running.busyClientOwnedSessionCount ?? 0) > 0 ||
-			running.activeSessions.some((summary) => isSessionBusy(summary)))
-	);
-}
-
 // Idle-but-loaded sessions reload from disk on the fresh daemon, so only a busy
 // session blocks replacing a stale daemon.
 async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<boolean> {
@@ -368,13 +342,7 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 	}
 	if (probe.status === "stale") {
 		const stopped = await shutdownStaleDaemonIfNotBusy(socketPath);
-		if (!stopped) {
-			if (probe.compatible) {
-				logDaemonLaunch(`using compatible legacy daemon on ${socketPath} while busy work completes`);
-				return;
-			}
-			throw new StaleDaemonError(socketPath, probe.hello);
-		}
+		if (!stopped) throw new StaleDaemonError(socketPath, probe.hello);
 	}
 
 	const entrypoint = process.argv[1];

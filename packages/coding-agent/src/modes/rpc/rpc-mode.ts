@@ -256,7 +256,7 @@ async function runRpcModeWithConnectionInternal(
 					sessionName: state.sessionName,
 					autoCompactionEnabled: state.autoCompactionEnabled,
 					messageCount: state.messageCount,
-					pendingMessageCount: state.pendingMessageCount,
+					sessionActions: state.sessionActions,
 					goal: state.goal,
 				};
 				return success(id, command.type, rpcState);

@@ -250,13 +250,14 @@ describe("daemon-backed interactive session manager routing", () => {
 					activeSessionId: "active-1",
 					lifecycle: "draft",
 					activity: "idle",
+					isSessionActive: false,
 					sessionId: "session-1",
 					cwd: "/tmp/project",
 					isStreaming: false,
 					isCompacting: false,
 					attachedClients: 0,
 					messageCount: 0,
-					pendingMessageCount: 0,
+					sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 				}),
 			}),
 		).resolves.toMatchObject({ activeSessionId: "active-1" });
@@ -472,7 +473,8 @@ function makeSessionSummary(overrides: Partial<SessionSummary>): SessionSummary 
 		isCompacting: false,
 		attachedClients: 0,
 		messageCount: 0,
-		pendingMessageCount: 0,
+		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		...overrides,
+		isSessionActive: overrides.isSessionActive ?? false,
 	};
 }

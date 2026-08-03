@@ -158,7 +158,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		// steer should work while streaming
 		expect(() => session.steer("Steering message")).not.toThrow();
-		expect(session.pendingMessageCount).toBe(1);
+		expect(session.queuedActionCount).toBe(1);
 
 		// Cleanup
 		await session.abort();
@@ -174,7 +174,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		// followUp should work while streaming
 		expect(() => session.followUp("Follow-up message")).not.toThrow();
-		expect(session.pendingMessageCount).toBe(1);
+		expect(session.queuedActionCount).toBe(1);
 
 		// Cleanup
 		await session.abort();
@@ -259,8 +259,8 @@ describe("AgentSession concurrent prompt guard", () => {
 			resourceLoader: createTestResourceLoader({ extensionsResult }),
 		});
 		session.subscribe((event) => {
-			if (event.type === "queue_update") {
-				queueEvents.push({ steering: event.steering, followUp: event.followUp });
+			if (event.type === "session_action_update") {
+				queueEvents.push({ steering: event.actions.steering, followUp: event.actions.followUps });
 			}
 		});
 
@@ -280,7 +280,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		pi!.sendUserMessage("Steer from extension", { deliverAs: "steer" });
 		await new Promise((resolve) => setTimeout(resolve, 25));
 
-		expect(session.pendingMessageCount).toBe(1);
+		expect(session.queuedActionCount).toBe(1);
 		expect(session.getSteeringMessages()).toContain("Steer from extension");
 		expect(lastInputSource).toBe("extension");
 		expect(queueEvents.some((event) => event.steering.includes("Steer from extension"))).toBe(true);
@@ -290,12 +290,12 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		expect(sawSteeringMessage).toBe(false);
 		expect(session.getSteeringMessages()).toContain("Steer from extension");
-		expect(session.pendingMessageCount).toBe(1);
+		expect(session.queuedActionCount).toBe(1);
 
 		await session.prompt("After abort");
 
 		expect(sawSteeringMessage).toBe(true);
-		expect(session.pendingMessageCount).toBe(0);
+		expect(session.queuedActionCount).toBe(0);
 	});
 
 	it("delivers accepted agent messages without extension input interception", async () => {

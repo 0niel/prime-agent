@@ -212,8 +212,8 @@ describe("ENG-4482 heartbeat injected prompt UI", () => {
 		let queuedPendingContextText = "";
 		const queueEvents: Array<{ steering: readonly string[]; followUp: readonly string[] }> = [];
 		harness.session.subscribe((event) => {
-			if (event.type === "queue_update") {
-				queueEvents.push({ steering: event.steering, followUp: event.followUp });
+			if (event.type === "session_action_update") {
+				queueEvents.push({ steering: event.actions.steering, followUp: event.actions.followUps });
 			}
 		});
 		harness.setResponses([

@@ -1451,10 +1451,12 @@ class DaemonAttachTerminal {
 			case "tool_execution_end":
 				this.writeLine(chalk.dim(`Tool ${event.isError ? "failed" : "finished"}: ${event.toolName}`));
 				return;
-			case "queue_update":
-				if (event.steering.length > 0 || event.followUp.length > 0) {
+			case "session_action_update":
+				if (event.actions.queuedCount > 0) {
 					this.writeLine(
-						chalk.dim(`Queued: ${event.steering.length} steering, ${event.followUp.length} follow-up`),
+						chalk.dim(
+							`Queued: ${event.actions.steering.length} steering, ${event.actions.followUps.length} follow-up`,
+						),
 					);
 				}
 				return;
@@ -1648,11 +1650,17 @@ function isSessionSummary(value: unknown): value is SessionSummary {
 		typeof candidate.cwd === "string" &&
 		typeof candidate.lifecycle === "string" &&
 		typeof candidate.activity === "string" &&
+		typeof candidate.isSessionActive === "boolean" &&
 		typeof candidate.isStreaming === "boolean" &&
 		typeof candidate.isCompacting === "boolean" &&
 		typeof candidate.attachedClients === "number" &&
 		typeof candidate.messageCount === "number" &&
-		typeof candidate.pendingMessageCount === "number"
+		(candidate.unfinishedActionCount === undefined || typeof candidate.unfinishedActionCount === "number") &&
+		typeof candidate.sessionActions === "object" &&
+		candidate.sessionActions !== null &&
+		typeof candidate.sessionActions.queuedCount === "number" &&
+		Array.isArray(candidate.sessionActions.steering) &&
+		Array.isArray(candidate.sessionActions.followUps)
 	);
 }
 

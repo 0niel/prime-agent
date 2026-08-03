@@ -3,7 +3,11 @@ import { describe, expect, it, vi } from "vitest";
 import { SessionManager } from "../../../src/core/session-manager.js";
 import { startSideQuestion } from "../../../src/core/side-question.js";
 import type { DaemonSocketClient } from "../../../src/modes/daemon/active-session-state.js";
-import type { DaemonCommand, DaemonResponse } from "../../../src/modes/daemon/daemon-protocol.js";
+import {
+	createDaemonCommandEnvelope,
+	type DaemonCommand,
+	type DaemonResponse,
+} from "../../../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../../../src/modes/daemon/daemon-supervisor.js";
 import { MutationDrainLatch } from "../../../src/modes/daemon/mutation-drain-latch.js";
 import { createHarness } from "../harness.js";
@@ -36,6 +40,12 @@ describe("ENG-4620 fast mode child agents", () => {
 			clients: new Set(),
 			protocolClientIds: new WeakMap(),
 			mutationDrain: new MutationDrainLatch(),
+			commandJournal: {
+				lookup: vi.fn(() => undefined),
+				begin: vi.fn(() => ({ status: "new" })),
+				recordResult: vi.fn(),
+				acknowledge: vi.fn(),
+			},
 			handleCommand,
 			write,
 			log: vi.fn(),
@@ -48,7 +58,7 @@ describe("ENG-4620 fast mode child agents", () => {
 			serviceTier: "priority",
 		} satisfies DaemonCommand;
 
-		await supervisor.handleLine(client, JSON.stringify(command));
+		await supervisor.handleLine(client, JSON.stringify(createDaemonCommandEnvelope(command, command.id)));
 
 		expect(handleCommand.mock.calls[0]?.slice(0, 2)).toEqual([client, command]);
 		expect(write).toHaveBeenCalledWith(

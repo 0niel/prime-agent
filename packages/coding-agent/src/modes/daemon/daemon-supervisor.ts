@@ -43,11 +43,13 @@ import {
 	collectDaemonClientEnv,
 	createDaemonEventMeta,
 	DAEMON_COMMAND_COMPATIBILITY,
+	DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION,
 	DAEMON_DEFAULT_CLIENT_CAPABILITIES,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_PROTOCOL_INFO,
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
+	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 	type DaemonAttachResult,
 	type DaemonClientCapability,
 	type DaemonClosingReason,
@@ -136,6 +138,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"steer",
 	"follow_up",
 	"restore_next_turn",
+	"restore_actions",
 	"append_custom_message",
 	"resume_queue",
 	"send_message",
@@ -1023,7 +1026,10 @@ export class DaemonSupervisor {
 	} {
 		const parsed = JSON.parse(line) as unknown;
 		const envelope = isDaemonCommandEnvelope(parsed) ? parsed : undefined;
-		const command = (envelope ? { ...envelope.command, id: envelope.id } : parsed) as DaemonCommand;
+		if (!envelope) {
+			throw new Error(`Daemon commands require protocol ${DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION} or newer`);
+		}
+		const command = { ...envelope.command, id: envelope.id } as DaemonCommand;
 		let admission: SupervisorPromptAdmission | undefined;
 		if ((command.type === "prompt" || command.type === "prompt_and_wait") && command.admissionId !== undefined) {
 			if (typeof command.activeSessionId !== "string" || typeof command.admissionId !== "string") {
@@ -1047,8 +1053,8 @@ export class DaemonSupervisor {
 		}
 		return {
 			command,
-			envelopeClientId: envelope ? (envelope.clientId ?? client.id) : undefined,
-			protocolVersion: envelope?.protocol.version ?? 1,
+			envelopeClientId: envelope.clientId ?? client.id,
+			protocolVersion: envelope.protocol.version,
 			admission,
 		};
 	}
@@ -2685,7 +2691,11 @@ export class DaemonSupervisor {
 			runtimeKind: summary.runtimeKind ?? "top-level",
 			cwd: summary.cwd,
 			isStreaming: summary.isStreaming,
-			pendingMessageCount: summary.pendingMessageCount,
+			unfinishedActionCount:
+				summary.unfinishedActionCount ??
+				(summary.sessionActions.active
+					? 1 + summary.sessionActions.queuedCount
+					: summary.sessionActions.queuedCount),
 			...(summary.parentActiveSessionId ? { parentActiveSessionId: summary.parentActiveSessionId } : {}),
 			...(summary.rlmChildId ? { rlmChildId: summary.rlmChildId } : {}),
 		};
@@ -3888,6 +3898,9 @@ export class DaemonSupervisor {
 					throw new Error(`Worker ${worker.descriptor.workerId} disconnected during update preparation`);
 				}
 				const manifest = response.data as DaemonUpdateRestartManifest;
+				if (manifest.formatVersion !== DAEMON_UPDATE_RESTART_FORMAT_VERSION) {
+					throw new Error(`Worker returned unsupported update manifest version ${manifest.formatVersion}`);
+				}
 				if (
 					!manifest.sessions.some(
 						(session) => session.activeSessionId === worker.descriptor.rootActiveSessionId,
@@ -3934,7 +3947,8 @@ export class DaemonSupervisor {
 			result.status === "fulfilled" ? [result.value.manifest] : [],
 		);
 		const discardedActiveSessionIds = responses.flatMap((manifest) => manifest.discardedActiveSessionIds ?? []);
-		const manifest = {
+		const manifest: DaemonUpdateRestartManifest = {
+			formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 			createdAt: new Date().toISOString(),
 			sessions: responses.flatMap((manifest) => manifest.sessions),
 			...(discardedActiveSessionIds.length > 0 ? { discardedActiveSessionIds } : {}),
@@ -3989,6 +4003,9 @@ export class DaemonSupervisor {
 	}
 
 	private validateAndPersistUpdateManifest(manifest: DaemonUpdateRestartManifest): void {
+		if (manifest.formatVersion !== DAEMON_UPDATE_RESTART_FORMAT_VERSION) {
+			throw new Error(`Unsupported update manifest version ${manifest.formatVersion}`);
+		}
 		const activeSessionIds = new Set<string>();
 		const sessionFiles = new Set<string>();
 		for (const discardedActiveSessionId of manifest.discardedActiveSessionIds ?? []) {

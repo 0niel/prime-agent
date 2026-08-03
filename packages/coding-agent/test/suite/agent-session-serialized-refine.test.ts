@@ -2375,7 +2375,7 @@ describe("P0 concurrency regressions", () => {
 		// Queue a follow-up via the public API (no resumeIfIdle flag).
 		// This populates both the session and Agent queues.
 		await harness.session.queueAgentMessagePrompt("queued follow-up", "followUp");
-		expect(harness.session.pendingMessageCount).toBe(1);
+		expect(harness.session.queuedActionCount).toBe(1);
 
 		vi.spyOn(internals, "_planRefine").mockResolvedValue({ id: "plan", proposal: { edits: [] } });
 		vi.spyOn(internals, "_applyRefine").mockResolvedValue(emptyRefinementResult());
@@ -2384,7 +2384,7 @@ describe("P0 concurrency regressions", () => {
 
 		// The forced resume should consume the follow-up and run the provider.
 		await vi.waitFor(() => {
-			expect(harness.session.pendingMessageCount).toBe(0);
+			expect(harness.session.queuedActionCount).toBe(0);
 			expect(harness.getPendingResponseCount()).toBe(0);
 		});
 	});

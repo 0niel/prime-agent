@@ -368,16 +368,16 @@ describe("AgentSession bash and persistence characterization", () => {
 		await bashStartedPromise;
 		expect(harness.session.isBashRunning).toBe(true);
 		await harness.session.queueAgentMessagePrompt(agentPrompt, "followUp");
-		expect(harness.session.pendingMessageCount).toBe(1);
+		expect(harness.session.queuedActionCount).toBe(1);
 
 		releaseBash?.();
 		await bashRun;
-		for (let i = 0; i < 10 && harness.session.pendingMessageCount > 0; i++) {
+		for (let i = 0; i < 10 && harness.session.queuedActionCount > 0; i++) {
 			await Promise.resolve();
 		}
 		await delivery;
 
-		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(harness.session.queuedActionCount).toBe(0);
 	});
 
 	it("drains steering before follow-up prompts after user bash finishes", async () => {
@@ -427,7 +427,7 @@ describe("AgentSession bash and persistence characterization", () => {
 		expect(userTexts.findIndex((text) => text.includes("steer after bash"))).toBeLessThan(
 			userTexts.findIndex((text) => text.includes("follow-up after bash")),
 		);
-		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(harness.session.queuedActionCount).toBe(0);
 	});
 
 	it("flushes pending bash output before draining queued prompts", async () => {

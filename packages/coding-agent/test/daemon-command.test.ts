@@ -570,11 +570,12 @@ function makeSessionSummary(activeSessionId: string, sessionId: string, sessionN
 		cwd: "/tmp/project",
 		lifecycle: "ready",
 		activity: "idle",
+		isSessionActive: false,
 		isStreaming: false,
 		isCompacting: false,
 		attachedClients: 0,
 		messageCount: 0,
-		pendingMessageCount: 0,
+		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 	};
 }
 

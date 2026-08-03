@@ -87,8 +87,7 @@ export interface HeartbeatCronSessionActivity {
 	isCompacting?: boolean;
 	isRetrying?: boolean;
 	isBashRunning: boolean;
-	hasAcceptedPromptInFlight?: boolean;
-	pendingMessageCount: number;
+	unfinishedActionCount: number;
 }
 
 interface CronJobsFile {
@@ -1358,8 +1357,7 @@ export function shouldDeferHeartbeatCronJob(job: AgentCronJob, activity: Heartbe
 		activity.isCompacting === true ||
 		activity.isRetrying === true ||
 		activity.isBashRunning ||
-		activity.hasAcceptedPromptInFlight === true ||
-		activity.pendingMessageCount > 0;
+		activity.unfinishedActionCount > 0;
 	if (busyBesidesStreaming) {
 		return true;
 	}

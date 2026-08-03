@@ -586,7 +586,7 @@ function createConnectionState(activeSessionId: string, sessionId: string): Agen
 		leafId: `${sessionId}-leaf`,
 		autoCompactionEnabled: true,
 		messageCount: 1,
-		pendingMessageCount: 0,
+		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		compactionCount: 0,
 		goal: {
 			active: false,
@@ -627,13 +627,14 @@ function createAttachResult(
 		activeSessionId,
 		lifecycle: "live" as const,
 		activity: "idle" as const,
+		isSessionActive: state.isStreaming,
 		sessionId: state.sessionId,
 		cwd: "/tmp/project",
 		isStreaming: state.isStreaming,
 		isCompacting: false,
 		attachedClients: 1,
 		messageCount: messages.length,
-		pendingMessageCount: 0,
+		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		...(options.streamingMessage ? { streamingMessage: options.streamingMessage } : {}),
 	};
 	// Slim shape: the daemon omits top-level state/messages for clients with the
@@ -689,9 +690,8 @@ function emitSequencedQueueUpdate(client: FakeDaemonClient, activeSessionId: str
 		type: "session_event",
 		activeSessionId,
 		event: {
-			type: "queue_update",
-			steering: [],
-			followUp: [],
+			type: "session_action_update",
+			actions: { queuedCount: 0, steering: [], followUps: [] },
 		},
 		meta: {
 			id: `${activeSessionId}:${sequence}`,
@@ -965,7 +965,7 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests).toEqual([]);
 	});
 
-	it("uses heartbeat commands supported by a retained protocol-3 daemon", async () => {
+	it("does not query the heartbeat catalog on a retained protocol-3 daemon", async () => {
 		const fakeClient = new FakeDaemonClient();
 		fakeClient.hello = {
 			type: "daemon_hello",
@@ -981,7 +981,7 @@ describe("DaemonAgentConnection", () => {
 		await expect(connection.manageHeartbeat("active-original", "job-1", "pause")).resolves.toMatchObject({
 			id: "job-1",
 		});
-		expect(fakeClient.requests.map((request) => request.type)).toEqual(["heartbeats_list", "heartbeat_manage"]);
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["heartbeat_manage"]);
 	});
 
 	it("degrades heartbeat commands missing from an older protocol-3 daemon", async () => {
@@ -999,7 +999,7 @@ describe("DaemonAgentConnection", () => {
 		await expect(connection.manageHeartbeat("active-original", "job-1", "pause")).rejects.toThrow(
 			"Heartbeat management requires a newer Prime Agent daemon.",
 		);
-		expect(fakeClient.requests.map((request) => request.type)).toEqual(["heartbeats_list", "heartbeat_manage"]);
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["heartbeat_manage"]);
 	});
 
 	it("reattaches an open window to its restored session after an update restart", async () => {
@@ -1735,7 +1735,7 @@ describe("DaemonAgentConnection", () => {
 		emitSequencedQueueUpdate(fakeClient, "active-2", 13);
 		await vi.waitFor(() => expect(siblingEvents).toHaveLength(1));
 
-		expect(siblingEvents[0]).toMatchObject({ type: "session_event", event: { type: "queue_update" } });
+		expect(siblingEvents[0]).toMatchObject({ type: "session_event", event: { type: "session_action_update" } });
 		expect(fakeClient.closeCount).toBe(0);
 		await failed.dispose();
 		await sibling.dispose();
@@ -1959,7 +1959,7 @@ describe("DaemonAgentConnection", () => {
 			]);
 			emitSequencedQueueUpdate(fakeClient, "active-2", 13);
 			await vi.waitFor(() => expect(siblingEvents).toHaveLength(1));
-			expect(siblingEvents[0]).toMatchObject({ type: "session_event", event: { type: "queue_update" } });
+			expect(siblingEvents[0]).toMatchObject({ type: "session_event", event: { type: "session_action_update" } });
 			expect(fakeClient.closeCount).toBe(0);
 			expect((connection as unknown as { snapshotAssemblies: Map<string, unknown> }).snapshotAssemblies.size).toBe(
 				0,
@@ -2396,9 +2396,8 @@ describe("DaemonAgentConnection", () => {
 			type: "session_event",
 			activeSessionId: "active-1",
 			event: {
-				type: "queue_update",
-				steering: [],
-				followUp: [],
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: [], followUps: [] },
 			},
 			meta: {
 				id: "active-1:13",
@@ -2429,9 +2428,8 @@ describe("DaemonAgentConnection", () => {
 			type: "session_event",
 			activeSessionId: "active-1",
 			event: {
-				type: "queue_update",
-				steering: [],
-				followUp: [],
+				type: "session_action_update",
+				actions: { queuedCount: 0, steering: [], followUps: [] },
 			},
 			meta: {
 				id: "active-1:13",
@@ -2499,9 +2497,8 @@ describe("DaemonAgentConnection", () => {
 			type: "session_event",
 			activeSessionId: "active-1",
 			event: {
-				type: "queue_update",
-				steering: ["interrupt"],
-				followUp: ["later"],
+				type: "session_action_update",
+				actions: { queuedCount: 2, steering: ["interrupt"], followUps: ["later"] },
 			},
 			meta: {
 				id: "active-1:14",
@@ -2515,9 +2512,8 @@ describe("DaemonAgentConnection", () => {
 			type: "session_event",
 			activeSessionId: "other",
 			event: {
-				type: "queue_update",
-				steering: ["ignored"],
-				followUp: [],
+				type: "session_action_update",
+				actions: { queuedCount: 1, steering: ["ignored"], followUps: [] },
 			},
 		});
 
@@ -2525,9 +2521,8 @@ describe("DaemonAgentConnection", () => {
 			{
 				type: "session_event",
 				event: {
-					type: "queue_update",
-					steering: ["interrupt"],
-					followUp: ["later"],
+					type: "session_action_update",
+					actions: { queuedCount: 2, steering: ["interrupt"], followUps: ["later"] },
 				},
 			},
 		]);
@@ -2563,8 +2558,8 @@ describe("DaemonAgentConnection", () => {
 		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
 		const steeringUpdates: Array<readonly string[]> = [];
 		connection.subscribe((event) => {
-			if (event.type === "session_event" && event.event.type === "queue_update") {
-				steeringUpdates.push(event.event.steering);
+			if (event.type === "session_event" && event.event.type === "session_action_update") {
+				steeringUpdates.push(event.event.actions.steering);
 			}
 		});
 		await connection.attach();
@@ -2572,7 +2567,7 @@ describe("DaemonAgentConnection", () => {
 			fakeClient.emitMessage({
 				type: "session_event",
 				activeSessionId: "active-1",
-				event: { type: "queue_update", steering: [steering], followUp: [] },
+				event: { type: "session_action_update", actions: { queuedCount: 1, steering: [steering], followUps: [] } },
 				meta: {
 					id: `${generation}:${sequence}`,
 					protocol: DAEMON_PROTOCOL_INFO,

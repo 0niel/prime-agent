@@ -9,7 +9,6 @@ import {
 	probeDaemonVersion,
 	probeRunningDaemonSessions,
 	shouldStartDaemonEarly,
-	shouldUseLegacyOwnedSessionWorkerFrontend,
 	shutdownDaemonAndWait,
 } from "../src/cli/daemon-launch.js";
 import { VERSION } from "../src/config.js";
@@ -47,9 +46,9 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 		send(socket, {
 			type: "daemon_hello",
 			socketPath,
-			protocol: { name: "prime-agent-daemon", version: options.protocolVersion ?? 1 },
+			protocol: { name: "prime-agent.daemon", version: options.protocolVersion ?? DAEMON_PROTOCOL_VERSION },
 			appVersion: options.appVersion,
-			schemaId: options.schemaId,
+			schemaId: options.schemaId ?? DAEMON_SCHEMA_ID,
 			clientId: "fake-client",
 			serverCapabilities: options.serverCapabilities ?? [],
 		});
@@ -75,7 +74,7 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 					send(socket, {
 						type: "response",
 						command: "list",
-						id: command.id,
+						id: wire.id,
 						...(options.failList
 							? { success: false, error: "list failed" }
 							: {
@@ -90,7 +89,7 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 					if (options.respondToShutdown === false) {
 						continue;
 					}
-					send(socket, { type: "response", command: "shutdown", id: command.id, success: true });
+					send(socket, { type: "response", command: "shutdown", id: wire.id, success: true });
 					server.close();
 					socket.end();
 				}
@@ -119,15 +118,21 @@ async function startCrashingDaemon(): Promise<FakeDaemon> {
 const socketPath = process.argv[1];
 const send = (socket, message) => socket.write(JSON.stringify(message) + "\\n");
 const server = createServer((socket) => {
-	send(socket, { type: "daemon_hello", socketPath, protocol: { name: "prime-agent-daemon", version: 1 } });
+	send(socket, {
+		type: "daemon_hello",
+		socketPath,
+		protocol: { name: "prime-agent.daemon", version: ${DAEMON_PROTOCOL_VERSION} },
+		schemaId: ${JSON.stringify(DAEMON_SCHEMA_ID)},
+	});
 	let buffer = "";
 	socket.on("data", (chunk) => {
 		buffer += chunk.toString();
 		const newline = buffer.indexOf("\\n");
 		if (newline === -1) return;
-		const command = JSON.parse(buffer.slice(0, newline));
+		const wire = JSON.parse(buffer.slice(0, newline));
+		const command = wire.command ?? wire;
 		if (command.type !== "shutdown") return;
-		send(socket, { type: "response", command: "shutdown", id: command.id, success: true });
+		send(socket, { type: "response", command: "shutdown", id: wire.id ?? command.id, success: true });
 		socket.end(() => process.kill(process.pid, "SIGKILL"));
 	});
 });
@@ -223,7 +228,7 @@ describe("ensureInteractiveDaemonRunning", () => {
 		await Promise.all(cleanups.splice(0).map((fn) => fn()));
 	});
 
-	it("keeps a compatible protocol-3 daemon serving busy work instead of bricking startup", async () => {
+	it("rejects a busy pre-session-action daemon before attach", async () => {
 		const commands: string[] = [];
 		const daemon = await startFakeDaemon({
 			protocolVersion: 3,
@@ -233,8 +238,8 @@ describe("ensureInteractiveDaemonRunning", () => {
 		});
 		cleanups.push(daemon.close);
 
-		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).resolves.toBeUndefined();
-		expect(commands).toContain("list");
+		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).rejects.toThrow("incompatible");
+		expect(commands).not.toContain("list");
 		expect(commands).not.toContain("shutdown");
 	});
 
@@ -249,21 +254,9 @@ describe("ensureInteractiveDaemonRunning", () => {
 		});
 		cleanups.push(daemon.close);
 
-		await expect(shouldUseLegacyOwnedSessionWorkerFrontend(daemon.socketPath)).resolves.toBe(true);
 		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).rejects.toThrow("stale");
 		expect(commands).toContain("list");
 		expect(commands).not.toContain("shutdown");
-	});
-
-	it("routes owned clients through the legacy frontend while a compatible legacy daemon is busy", async () => {
-		const daemon = await startFakeDaemon({
-			protocolVersion: 3,
-			appVersion: VERSION,
-			sessions: [{ id: "active-1", activeSessionId: "active-1", isStreaming: true }],
-		});
-		cleanups.push(daemon.close);
-
-		await expect(shouldUseLegacyOwnedSessionWorkerFrontend(daemon.socketPath)).resolves.toBe(true);
 	});
 
 	it("does not treat a live daemon as absent when cold startup delays the first connection", async () => {

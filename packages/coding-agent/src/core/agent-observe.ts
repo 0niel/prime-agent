@@ -16,7 +16,8 @@ export interface AgentObserveAgentSummary {
 	isCompacting: boolean;
 	attachedClients: number;
 	messageCount: number;
-	pendingMessageCount: number;
+	queuedCount: number;
+	isSessionActive: boolean;
 	parentActiveSessionId?: string;
 	parentSessionId?: string;
 	rlmChildId?: string;

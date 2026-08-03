@@ -2681,10 +2681,8 @@ export class InteractiveMode {
 			case "agent_end":
 				this.patchConnectionState({ isStreaming: false, activeToolNames: [] });
 				break;
-			case "queue_update":
-				this.patchConnectionState({
-					pendingMessageCount: event.steering.length + event.followUp.length,
-				});
+			case "session_action_update":
+				this.patchConnectionState({ sessionActions: event.actions });
 				break;
 			case "compaction_start":
 				this.patchConnectionState({ isCompacting: true });
@@ -2765,6 +2763,7 @@ export class InteractiveMode {
 			this.isAgentCompacting() ||
 			this.isBashRunning() ||
 			this.getRetryAttempt() > 0 ||
+			this.connectionState?.sessionActions.active !== undefined ||
 			this.traceUploadAllAbortController !== undefined ||
 			this.sideQuestionEvent?.status === "running"
 		);
@@ -2774,8 +2773,8 @@ export class InteractiveMode {
 		return this.connectionState?.retryAttempt ?? 0;
 	}
 
-	private getPendingMessageCount(): number {
-		return this.connectionState?.pendingMessageCount ?? 0;
+	private getQueuedActionCount(): number {
+		return this.connectionState?.sessionActions.queuedCount ?? 0;
 	}
 
 	private getGoalState(): GoalState {
@@ -3104,7 +3103,7 @@ export class InteractiveMode {
 			isIdle: () => !this.isAgentStreaming(),
 			signal: localSessionHost.getAbortSignal(),
 			abort: () => this.agentConnection.abort(),
-			hasPendingMessages: () => this.getPendingMessageCount() > 0,
+			hasPendingMessages: () => this.getQueuedActionCount() > 0,
 			shutdown: () => {
 				this.shutdownRequested = true;
 			},
@@ -5362,10 +5361,10 @@ export class InteractiveMode {
 				this.ui.requestRender();
 				break;
 
-			case "queue_update":
+			case "session_action_update":
 				this.connectionQueue = {
-					steering: [...event.steering],
-					followUp: [...event.followUp],
+					steering: [...event.actions.steering],
+					followUp: [...event.actions.followUps],
 				};
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();

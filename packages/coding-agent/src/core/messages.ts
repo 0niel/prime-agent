@@ -286,7 +286,7 @@ function hasValidCustomMessageEnvelope(message: Record<string, unknown>, customT
 	);
 }
 
-function isSessionSlashCommand(value: unknown): value is SessionSlashCommand {
+export function isSessionSlashCommand(value: unknown): value is SessionSlashCommand {
 	if (
 		!isRecord(value) ||
 		!isSessionSlashCommandName(value.name) ||

@@ -139,7 +139,8 @@ describe("ENG-4531 agent message UI", () => {
 		await harness.session.queueAgentMessagePrompt(prompt, "followUp", message);
 
 		expect(harness.session.getFollowUpMessagePreviews()).toEqual(["Agent message received: Use shard seven."]);
-		expect(harness.session.getFollowUpQueueSnapshots()[0]?.customMessage).toMatchObject({
+		const queued = harness.session.getSessionActionRecoverySnapshot().actions[0];
+		expect(queued?.payload.kind === "turn" ? queued.payload.customMessage : undefined).toMatchObject({
 			customType: "agent_message",
 			details: { id: "agentmsg_4531", message: "Use shard seven." },
 		});
@@ -271,7 +272,8 @@ describe("ENG-4531 agent message UI", () => {
 			queueIfBusy: true,
 		});
 
-		expect(harness.session.getFollowUpQueueSnapshots()[0]?.customMessage).toMatchObject({
+		const queued = harness.session.getSessionActionRecoverySnapshot().actions[0];
+		expect(queued?.payload.kind === "turn" ? queued.payload.customMessage : undefined).toMatchObject({
 			customType: "agent_message",
 			details: { message: "Queue behind the active turn." },
 		});

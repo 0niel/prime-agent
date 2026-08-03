@@ -7,6 +7,17 @@ import type { SessionSlashCommand } from "./slash-commands.js";
 export type DeliveryPolicy = "next_turn_boundary" | "when_run_idle";
 export type WakePolicy = "immediate" | "on_lower_boundary" | "external_resume";
 
+export interface SessionActionSnapshot {
+	queuedCount: number;
+	steering: readonly string[];
+	followUps: readonly string[];
+	active?: {
+		kind: "turn" | "session_command";
+		phase: "preparing" | "committing" | "running";
+		label?: string;
+	};
+}
+
 export interface DeliveryRecord {
 	id: string;
 	role: "primary" | "prefix" | "next_turn";

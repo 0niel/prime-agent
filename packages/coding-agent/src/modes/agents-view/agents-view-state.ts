@@ -58,14 +58,7 @@ export function classifyAgentsViewSession(summary: SessionSummary): AgentsViewSe
 }
 
 function isAgentsViewSessionBusy(summary: SessionSummary): boolean {
-	return (
-		summary.isStreaming ||
-		summary.isCompacting ||
-		summary.isBashRunning === true ||
-		summary.isRunningTools === true ||
-		summary.hasRunningRlmChildren === true ||
-		summary.pendingMessageCount > 0
-	);
+	return summary.isSessionActive || summary.hasRunningRlmChildren === true;
 }
 
 export function classifyUnifiedSession(record: Pick<UnifiedSessionRecord, "daemon" | "heartbeat">): AgentsViewSection {
@@ -223,6 +216,7 @@ export function summaryForUnifiedRecord(record: UnifiedSessionRecord): SessionSu
 		id: saved.id,
 		lifecycle: "archived",
 		activity: "idle",
+		isSessionActive: false,
 		sessionId: saved.id,
 		sessionFile: canonicalSessionPath(saved.path),
 		sessionName: saved.name,
@@ -231,7 +225,7 @@ export function summaryForUnifiedRecord(record: UnifiedSessionRecord): SessionSu
 		isCompacting: false,
 		attachedClients: 0,
 		messageCount: saved.messageCount,
-		pendingMessageCount: 0,
+		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		created: saved.created.toISOString(),
 		modified: saved.modified.toISOString(),
 		firstMessage: saved.firstMessage,
@@ -753,8 +747,11 @@ function getSessionStatusLabel(summary: SessionSummary, hasActiveHeartbeat = sum
 	if (summary.hasRunningRlmChildren === true) {
 		return "subagents running";
 	}
-	if (summary.pendingMessageCount > 0) {
-		return `${summary.pendingMessageCount} queued`;
+	if (summary.sessionActions.active) {
+		return summary.sessionActions.active.label ?? summary.sessionActions.active.kind.replace("_", " ");
+	}
+	if (summary.sessionActions.queuedCount > 0) {
+		return `${summary.sessionActions.queuedCount} queued`;
 	}
 	if (summary.lifecycle === "archived") {
 		return "archived";

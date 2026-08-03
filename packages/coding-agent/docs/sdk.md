@@ -316,8 +316,8 @@ session.subscribe((event) => {
       break;
     
     // Session events (queue, compaction, retry)
-    case "queue_update":
-      console.log(event.steering, event.followUp);
+    case "session_action_update":
+      console.log(event.actions.steering, event.actions.followUps);
       break;
     case "compaction_start":
     case "compaction_end":

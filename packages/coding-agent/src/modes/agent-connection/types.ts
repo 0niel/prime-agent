@@ -21,6 +21,7 @@ import type { InputSource } from "../../core/extensions/types.js";
 import type { GoalState } from "../../core/goals.js";
 import type { KernelSentAgentMessage } from "../../core/kernel/index.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
+import type { SessionActionSnapshot } from "../../core/session-action-store.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import type { SessionStats } from "../../core/session-stats.js";
 
@@ -335,7 +336,7 @@ export interface AgentConnectionState {
 	leafId: string | null;
 	autoCompactionEnabled: boolean;
 	messageCount: number;
-	pendingMessageCount: number;
+	sessionActions: SessionActionSnapshot;
 	compactionCount: number;
 	goal: GoalState;
 	heartbeat?: AgentCronJob | null;
@@ -561,11 +562,7 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 export type AgentConnectionSessionEvent =
 	| AgentEvent
 	| { type: "ipython_sent_agent_message"; toolCallId: string; message: KernelSentAgentMessage }
-	| {
-			type: "queue_update";
-			steering: readonly string[];
-			followUp: readonly string[];
-	  }
+	| { type: "session_action_update"; actions: SessionActionSnapshot }
 	| {
 			type: "compaction_start";
 			reason: "manual" | "threshold" | "overflow" | "requested";

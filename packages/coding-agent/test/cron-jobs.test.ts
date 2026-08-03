@@ -1352,21 +1352,21 @@ describe("shouldDeferHeartbeatCronJob", () => {
 				shouldDeferHeartbeatCronJob(job, {
 					isStreaming: true,
 					isBashRunning: false,
-					pendingMessageCount: 0,
+					unfinishedActionCount: 0,
 				}),
 			).toBe(true);
 			expect(
 				shouldDeferHeartbeatCronJob(job, {
 					isStreaming: false,
 					isBashRunning: true,
-					pendingMessageCount: 0,
+					unfinishedActionCount: 0,
 				}),
 			).toBe(true);
 			expect(
 				shouldDeferHeartbeatCronJob(job, {
 					isStreaming: false,
 					isBashRunning: false,
-					pendingMessageCount: 1,
+					unfinishedActionCount: 1,
 				}),
 			).toBe(true);
 		}
@@ -1383,7 +1383,7 @@ describe("shouldDeferHeartbeatCronJob", () => {
 					shouldDeferHeartbeatCronJob(job, {
 						isStreaming: true,
 						isBashRunning: false,
-						pendingMessageCount: 0,
+						unfinishedActionCount: 0,
 					}),
 				).toBe(false);
 			}
@@ -1398,21 +1398,21 @@ describe("shouldDeferHeartbeatCronJob", () => {
 				isStreaming: true,
 				isCompacting: true,
 				isBashRunning: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 			}),
 		).toBe(true);
 		expect(
 			shouldDeferHeartbeatCronJob(job, {
 				isStreaming: false,
 				isBashRunning: true,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 			}),
 		).toBe(true);
 		expect(
 			shouldDeferHeartbeatCronJob(job, {
 				isStreaming: false,
 				isBashRunning: false,
-				pendingMessageCount: 1,
+				unfinishedActionCount: 1,
 			}),
 		).toBe(true);
 		expect(
@@ -1420,15 +1420,14 @@ describe("shouldDeferHeartbeatCronJob", () => {
 				isStreaming: false,
 				isRetrying: true,
 				isBashRunning: false,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 0,
 			}),
 		).toBe(true);
 		expect(
 			shouldDeferHeartbeatCronJob(job, {
 				isStreaming: false,
 				isBashRunning: false,
-				hasAcceptedPromptInFlight: true,
-				pendingMessageCount: 0,
+				unfinishedActionCount: 1,
 			}),
 		).toBe(true);
 	});
@@ -1437,7 +1436,7 @@ describe("shouldDeferHeartbeatCronJob", () => {
 		expect(
 			shouldDeferHeartbeatCronJob(
 				{ ...baseJob, source: "heartbeat" },
-				{ isStreaming: false, isBashRunning: false, pendingMessageCount: 0 },
+				{ isStreaming: false, isBashRunning: false, unfinishedActionCount: 0 },
 			),
 		).toBe(false);
 	});
@@ -1446,7 +1445,7 @@ describe("shouldDeferHeartbeatCronJob", () => {
 		expect(
 			shouldDeferHeartbeatCronJob(
 				{ ...baseJob, source: "cron" },
-				{ isStreaming: true, isBashRunning: true, pendingMessageCount: 2 },
+				{ isStreaming: true, isBashRunning: true, unfinishedActionCount: 2 },
 			),
 		).toBe(false);
 	});

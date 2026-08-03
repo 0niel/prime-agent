@@ -56,7 +56,11 @@ function heartbeat(id: string, nextRunAt?: string, activeSessionId = "child") {
 describe("agents view state", () => {
 	test("classifies active daemon sessions into coarse fleet sections", () => {
 		expect(classifyAgentsViewSession(makeSummary({ isStreaming: true, activity: "working" }))).toBe("running");
-		expect(classifyAgentsViewSession(makeSummary({ pendingMessageCount: 1, activity: "working" }))).toBe("running");
+		expect(
+			classifyAgentsViewSession(
+				makeSummary({ sessionActions: { queuedCount: 1, steering: [], followUps: [] }, activity: "working" }),
+			),
+		).toBe("running");
 		expect(classifyAgentsViewSession(makeSummary({ activity: "working" }))).toBe("running");
 		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 2 }))).toBe("idle");
 		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 0 }))).toBe("idle");
@@ -304,6 +308,7 @@ describe("agents view state", () => {
 				runtimeKind: "subagent",
 				parentActiveSessionId: "parent-active",
 				activity: "idle",
+				isSessionActive: true,
 				isRunningTools: true,
 			}),
 			makeSummary({
@@ -1135,13 +1140,14 @@ function makeSummary(overrides: Partial<SessionSummary>): SessionSummary {
 		activeSessionId: "active-1",
 		lifecycle: "live",
 		activity: "idle",
+		isSessionActive: false,
 		sessionId: "session-1",
 		cwd: "/tmp/project",
 		isStreaming: false,
 		isCompacting: false,
 		attachedClients: 0,
 		messageCount: 1,
-		pendingMessageCount: 0,
+		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		...overrides,
 	};
 }

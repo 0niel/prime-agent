@@ -75,7 +75,7 @@ export async function waitForHeadlessCompletion(session: AgentSession): Promise<
 	let lastPromptedProgressKey: string | undefined;
 	let repeatedProgressPrompts = 0;
 	while (true) {
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 		const status = session.getAutonomousStatus();
 		if (!shouldContinueAutonomousGates(status) || !status.lastGateFailure) {
 			return status;
@@ -102,7 +102,7 @@ export async function waitForHeadlessCompletion(session: AgentSession): Promise<
 				suppressAutonomousContinuation: true,
 			},
 		);
-		await session.agent.waitForIdle();
+		await session.waitForIdle();
 		await session.refreshAutonomousGates();
 		const { primary } = selectHeadlessTerminalResult(session.state.messages);
 		if (primary?.role === "assistant") {

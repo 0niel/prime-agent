@@ -27,6 +27,7 @@ type FakeExtensionRunner = {
 type FakeSession = {
 	sessionManager: { getHeader: () => object | undefined };
 	agent: { waitForIdle: ReturnType<typeof vi.fn<() => Promise<void>>> };
+	waitForIdle: ReturnType<typeof vi.fn<() => Promise<void>>>;
 	state: { messages: AgentMessage[] };
 	messages: AgentMessage[];
 	extensionRunner: FakeExtensionRunner;
@@ -96,6 +97,7 @@ function createRuntimeHost(
 	const session: FakeSession = {
 		sessionManager: { getHeader: () => undefined },
 		agent: { waitForIdle: vi.fn(async () => {}) },
+		waitForIdle: vi.fn(async () => {}),
 		state,
 		messages: state.messages,
 		extensionRunner,
@@ -505,7 +507,7 @@ describe("runPrintMode", () => {
 			() => statuses[Math.min(statusIndex++, statuses.length - 1)] as AgentAutonomousStatus,
 		);
 		let waitCount = 0;
-		session.agent.waitForIdle.mockImplementation(async () => {
+		session.waitForIdle.mockImplementation(async () => {
 			waitCount++;
 			if (waitCount === 2) {
 				session.state.messages = [createAssistantMessage({ text: "queued retry completed" })];
@@ -520,7 +522,7 @@ describe("runPrintMode", () => {
 		expect(exitCode).toBe(0);
 		expect(session.prompt).toHaveBeenCalledTimes(1);
 		expect(session.recordHostAutonomousContinuation).toHaveBeenCalledTimes(1);
-		expect(session.agent.waitForIdle).toHaveBeenCalledTimes(3);
+		expect(session.waitForIdle).toHaveBeenCalledTimes(3);
 		expect(errorSpy).not.toHaveBeenCalledWith("provider down");
 	});
 
@@ -694,7 +696,7 @@ describe("runPrintMode", () => {
 		});
 
 		expect(exitCode).toBe(0);
-		expect(session.agent.waitForIdle).toHaveBeenCalledBefore(session.prompt);
+		expect(session.waitForIdle).toHaveBeenCalledBefore(session.prompt);
 		expect(session.prompt).toHaveBeenCalledTimes(2);
 		expect(session.prompt.mock.calls[0][0]).toContain("Autonomous quality gate failed (attempt 1/3)");
 		expect(session.prompt.mock.calls[0][0]).toContain("0/9");
@@ -801,7 +803,7 @@ describe("runPrintMode", () => {
 		});
 
 		expect(exitCode).toBe(1);
-		expect(session.agent.waitForIdle).toHaveBeenCalledTimes(7);
+		expect(session.waitForIdle).toHaveBeenCalledTimes(7);
 		expect(session.prompt).toHaveBeenCalledTimes(3);
 		expect(session.recordHostAutonomousContinuation).toHaveBeenCalledTimes(3);
 		expect(session.prompt.mock.calls[1][0]).toContain("workspace unchanged");

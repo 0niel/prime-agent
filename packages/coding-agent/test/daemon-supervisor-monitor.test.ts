@@ -11,7 +11,12 @@ import { CommandRecoveryJournal } from "../src/modes/daemon/command-recovery-jou
 import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
-import { createDaemonCommandEnvelope, type DaemonAttachResult, success } from "../src/modes/daemon/daemon-protocol.js";
+import {
+	createDaemonCommandEnvelope,
+	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
+	type DaemonAttachResult,
+	success,
+} from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
@@ -1521,13 +1526,14 @@ describe("daemon worker supervisor monitoring", () => {
 			activeSessionId,
 			lifecycle: "live",
 			activity: "working",
+			isSessionActive: true,
 			sessionId: "session-1",
 			cwd: "/tmp/project",
 			isStreaming: true,
 			isCompacting: false,
 			attachedClients: 0,
 			messageCount: 1,
-			pendingMessageCount: 0,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 			streamingMessage,
 		};
 		const result = {
@@ -1658,13 +1664,14 @@ describe("daemon worker supervisor monitoring", () => {
 			activeSessionId,
 			lifecycle: "live",
 			activity: "idle",
+			isSessionActive: false,
 			sessionId: "session-failed-attach",
 			cwd: "/tmp/project",
 			isStreaming: false,
 			isCompacting: false,
 			attachedClients: 0,
 			messageCount: 0,
-			pendingMessageCount: 0,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		} satisfies SessionSummary;
 		const worker = {
 			descriptor: { workerId: "worker-1", lifecycle: "ready", pid: 1234 },
@@ -1770,7 +1777,11 @@ describe("daemon worker supervisor monitoring", () => {
 	});
 	it.each([
 		{ name: "malformed data", data: undefined, error: /invalid update manifest/ },
-		{ name: "missing root disposition", data: { createdAt: "now", sessions: [] }, error: /root disposition/ },
+		{
+			name: "missing root disposition",
+			data: { formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION, createdAt: "now", sessions: [] },
+			error: /root disposition/,
+		},
 	])("cancels a prepare acknowledgement with $name", async ({ data, error }) => {
 		const client = {
 			requestWorker: vi.fn(async ({ type }: { type: string }) =>
@@ -1793,7 +1804,15 @@ describe("daemon worker supervisor monitoring", () => {
 		const client = {
 			requestWorker: vi.fn(async ({ type }: { type: string }) =>
 				type === "worker_prepare_update"
-					? { success: true, data: { createdAt: "now", sessions: [], discardedActiveSessionIds: ["root"] } }
+					? {
+							success: true,
+							data: {
+								formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
+								createdAt: "now",
+								sessions: [],
+								discardedActiveSessionIds: ["root"],
+							},
+						}
 					: { success: true },
 			),
 		};
@@ -1914,7 +1933,11 @@ describe("daemon worker supervisor monitoring", () => {
 			firstDrain.resolve();
 		});
 		mutationDrain.begin(); // The prepare command itself remains in flight at the supervisor boundary.
-		const prepareFenced = vi.fn(async () => ({ createdAt: "now", sessions: [] }));
+		const prepareFenced = vi.fn(async () => ({
+			formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
+			createdAt: "now",
+			sessions: [],
+		}));
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			mutationDrain,
 			workers: new Map(),

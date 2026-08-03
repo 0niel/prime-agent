@@ -11,12 +11,13 @@ function summary(id: string): SessionSummary {
 		sessionId: `session-${id}`,
 		lifecycle: "live",
 		activity: "idle",
+		isSessionActive: false,
 		cwd: "/tmp/project",
 		isStreaming: false,
 		isCompacting: false,
 		attachedClients: 0,
 		messageCount: 1,
-		pendingMessageCount: 0,
+		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 	};
 }
 

@@ -63,13 +63,14 @@ function summary(messageCount: number): SessionSummary {
 		activeSessionId,
 		lifecycle: "live",
 		activity: "idle",
+		isSessionActive: false,
 		sessionId: "session-4677",
 		cwd: "/tmp",
 		isStreaming: false,
 		isCompacting: false,
 		attachedClients: 0,
 		messageCount,
-		pendingMessageCount: 0,
+		sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 	};
 }
 

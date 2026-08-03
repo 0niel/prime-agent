@@ -55,7 +55,7 @@ describe("agent-message skill over the kernel host bridge", () => {
 								sessionId: "session-alpha",
 								cwd: tempDir,
 								isStreaming: false,
-								pendingMessageCount: 0,
+								unfinishedActionCount: 0,
 							},
 							{
 								activeSessionId: "beta",
@@ -63,7 +63,7 @@ describe("agent-message skill over the kernel host bridge", () => {
 								sessionName: "Beta",
 								cwd: tempDir,
 								isStreaming: true,
-								pendingMessageCount: 1,
+								unfinishedActionCount: 1,
 							},
 						],
 					};

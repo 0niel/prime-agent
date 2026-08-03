@@ -133,6 +133,7 @@ import {
 	DAEMON_SCHEMA_ID,
 	DAEMON_SCHEMA_REVISION,
 	DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
+	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 	type DaemonAttachResult,
 	type DaemonClientCapability,
 	type DaemonClosingReason,
@@ -221,6 +222,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"steer",
 	"follow_up",
 	"restore_next_turn",
+	"restore_actions",
 	"append_custom_message",
 	"resume_queue",
 	"send_message",
@@ -321,7 +323,7 @@ const RECOVERY_CHECKPOINT_EVENTS: ReadonlySet<string> = new Set([
 	"auto_retry_end",
 	"bash_start",
 	"bash_end",
-	"queue_update",
+	"session_action_update",
 	"rlm_child_update",
 ]);
 
@@ -1291,8 +1293,7 @@ export class AgentDaemon {
 			session.isCompacting ||
 			session.isRetrying ||
 			session.isBashRunning ||
-			session.hasAcceptedPromptInFlight ||
-			session.pendingMessageCount > 0;
+			session.unfinishedActionCount > 0;
 		if (!isHeartbeatCronJob(runnableJob) && shouldQueueCronPrompt) {
 			if (!this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)) {
 				return "skipped";
@@ -2342,11 +2343,7 @@ export class AgentDaemon {
 				: "model"
 			: session.isCompacting
 				? "compacting"
-				: session.isRetrying ||
-						session.isBashRunning ||
-						session.hasAcceptedPromptInFlight ||
-						session.pendingMessageCount > 0 ||
-						session.hasRunningRlmChildren()
+				: session.isSessionActive || session.hasRunningRlmChildren()
 					? "busy"
 					: state.clients.size > 0
 						? "user"
@@ -2363,7 +2360,8 @@ export class AgentDaemon {
 			isCompacting: summary.isCompacting,
 			attachedClients: summary.attachedClients,
 			messageCount: summary.messageCount,
-			pendingMessageCount: summary.pendingMessageCount,
+			queuedCount: summary.sessionActions.queuedCount,
+			isSessionActive: summary.isSessionActive,
 			...(summary.parentActiveSessionId ? { parentActiveSessionId: summary.parentActiveSessionId } : {}),
 			...(summary.parentSessionId ? { parentSessionId: summary.parentSessionId } : {}),
 			...(summary.rlmChildId ? { rlmChildId: summary.rlmChildId } : {}),
@@ -3234,6 +3232,13 @@ export class AgentDaemon {
 				const state = this.getSessionState(command.activeSessionId);
 				state.runtime.session.restorePendingNextTurnMessages(command.messages);
 				return success(command.id, "restore_next_turn");
+			}
+
+			case "restore_actions": {
+				const state = this.getSessionState(command.activeSessionId);
+				const restored = await state.runtime.session.restoreSessionActions(command.snapshot);
+				if (restored > 0) this.recordWorkerRecoveryState(state, "actions_restored", true);
+				return success(command.id, "restore_actions", { restored });
 			}
 
 			case "append_custom_message": {
@@ -4148,8 +4153,7 @@ export class AgentDaemon {
 			...this.createAgentSessionMessageEndpoint(state),
 			cwd: state.runtime.cwd,
 			isStreaming: state.runtime.session.isStreaming,
-			pendingMessageCount:
-				state.runtime.session.pendingMessageCount + (state.runtime.session.hasAcceptedPromptInFlight ? 1 : 0),
+			unfinishedActionCount: state.runtime.session.unfinishedActionCount,
 			...(metadata.parentActiveSessionId ? { parentActiveSessionId: metadata.parentActiveSessionId } : {}),
 			...(metadata.rlmChildId ? { rlmChildId: metadata.rlmChildId } : {}),
 		};
@@ -4220,9 +4224,7 @@ export class AgentDaemon {
 		const activeSessionId = targetState.activeSessionId;
 		const reserved = this.agentMessagePendingReservations.get(activeSessionId) ?? 0;
 		assertAgentMessageQueueCapacity(
-			targetState.runtime.session.pendingMessageCount +
-				(targetState.runtime.session.hasAcceptedPromptInFlight ? 1 : 0) +
-				reserved,
+			targetState.runtime.session.unfinishedActionCount + reserved,
 			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 		);
 		this.agentMessagePendingReservations.set(activeSessionId, reserved + 1);
@@ -4396,7 +4398,7 @@ export class AgentDaemon {
 		const reserved = this.agentMessagePendingReservations.get(targetState.activeSessionId) ?? 0;
 		const otherReservations = Math.max(0, reserved - 1);
 		assertAgentMessageQueueCapacity(
-			session.pendingMessageCount + (session.hasAcceptedPromptInFlight ? 1 : 0) + otherReservations,
+			session.unfinishedActionCount + otherReservations,
 			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 		);
 		const shouldQueue =
@@ -4406,8 +4408,7 @@ export class AgentDaemon {
 			session.isCompacting ||
 			session.isRetrying ||
 			session.isBashRunning ||
-			session.hasAcceptedPromptInFlight ||
-			session.pendingMessageCount > 0;
+			session.unfinishedActionCount > 0;
 		const streamingBehavior =
 			resolveAgentSessionMessageStreamingBehavior(shouldQueue, payload.deliveryMode) ??
 			(payload.deliveryMode === "follow_up" ? "followUp" : "steer");
@@ -4419,7 +4420,7 @@ export class AgentDaemon {
 			if (!didQueue) {
 				throw new Error("Agent message was not queued");
 			}
-			// The queued message now counts in pendingMessageCount.
+			// The queued message now counts in unfinishedActionCount.
 			releaseReservation();
 			// Do not await delivery: a queued message delivers only when the target's
 			// turn progresses, and the sender is blocked inside its own turn — awaiting
@@ -4507,47 +4508,10 @@ export class AgentDaemon {
 	private createUpdateRestartSession(state: ActiveSessionState): DaemonUpdateRestartSession | undefined {
 		const session = state.runtime.session;
 		const queue = {
-			steering: [...session.getSteeringQueueSnapshots()].map((message) => ({
-				message: message.text,
-				...(message.content ? { content: message.content } : {}),
-				...(message.images ? { images: message.images } : {}),
-				...(message.queueKey ? { queueKey: message.queueKey } : {}),
-				...(message.agentMessageId ? { agentMessageId: message.agentMessageId } : {}),
-				...(message.customMessage ? { customMessage: message.customMessage } : {}),
-				...(message.prefixMessages ? { prefixMessages: message.prefixMessages } : {}),
-			})),
-			followUp: [...session.getFollowUpQueueSnapshots()].map((message) => ({
-				message: message.text,
-				...(message.content ? { content: message.content } : {}),
-				...(message.images ? { images: message.images } : {}),
-				...(message.queueKey ? { queueKey: message.queueKey } : {}),
-				...(message.agentMessageId ? { agentMessageId: message.agentMessageId } : {}),
-				...(message.customMessage ? { customMessage: message.customMessage } : {}),
-				...(message.prefixMessages ? { prefixMessages: message.prefixMessages } : {}),
-			})),
+			actions: session.getSessionActionRecoverySnapshot(),
 			nextTurn: [...session.getPendingNextTurnMessageSnapshots()],
 		};
-		const acceptedPrompt = session.getAcceptedPromptSnapshot();
-		const restartQueue = {
-			...queue,
-			...(acceptedPrompt
-				? {
-						acceptedPrompt: {
-							message: acceptedPrompt.text,
-							...(acceptedPrompt.content ? { content: acceptedPrompt.content } : {}),
-							...(acceptedPrompt.images ? { images: acceptedPrompt.images } : {}),
-							...(acceptedPrompt.customMessage ? { customMessage: acceptedPrompt.customMessage } : {}),
-							agentMessageId: acceptedPrompt.agentMessageId,
-							nextTurn: acceptedPrompt.nextTurn,
-						},
-					}
-				: {}),
-		};
-		const hasQueuedMessages =
-			restartQueue.steering.length > 0 ||
-			restartQueue.followUp.length > 0 ||
-			restartQueue.nextTurn.length > 0 ||
-			restartQueue.acceptedPrompt !== undefined;
+		const hasQueuedMessages = queue.actions.actions.length > 0 || queue.nextTurn.length > 0;
 		const wasStreaming = session.isStreaming;
 		const wasCompacting = session.isCompacting;
 		const wasBashRunning = session.isBashRunning;
@@ -4561,9 +4525,7 @@ export class AgentDaemon {
 			hadRunningRlmChildren ||
 			wasRetrying ||
 			hadAcceptedPromptInFlight ||
-			restartQueue.steering.length > 0 ||
-			restartQueue.followUp.length > 0 ||
-			restartQueue.acceptedPrompt !== undefined;
+			queue.actions.actions.length > 0;
 		const sessionFile =
 			session.sessionFile ??
 			(hasQueuedMessages || shouldResume
@@ -4585,7 +4547,7 @@ export class AgentDaemon {
 			},
 			runtimeMetadata: state.runtime.metadata,
 			...(state.clientEnv ? { clientEnv: { ...state.clientEnv } } : {}),
-			queue: restartQueue,
+			queue,
 			shouldResume,
 			wasStreaming,
 			wasCompacting,
@@ -4721,6 +4683,7 @@ export class AgentDaemon {
 				)
 				.map((state) => state.activeSessionId);
 			return {
+				formatVersion: DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 				createdAt: new Date().toISOString(),
 				sessions: restartSessions,
 				...(discardedActiveSessionIds.length > 0 ? { discardedActiveSessionIds } : {}),

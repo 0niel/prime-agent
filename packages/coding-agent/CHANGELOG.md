@@ -10,6 +10,7 @@
 - Fixed compaction retaining runtime resources after an explicitly deleted subagent had a transient cleanup failure.
 - Fixed long-running thinking timers to display hours and days instead of unbounded minutes.
 - Fixed overlapping daemon snapshot catch-ups closing healthy workers and preventing new sessions from starting.
+- Changed daemon and RPC session state to report literal queued actions separately from active scheduler work.
 
 ## [0.4.0] - 2026-08-01
 

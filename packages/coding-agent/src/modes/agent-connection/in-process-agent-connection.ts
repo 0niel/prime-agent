@@ -600,7 +600,7 @@ export class InProcessAgentConnection implements AgentConnection {
 		await session.bindExtensions({
 			uiContext: this.headlessExtensionOptions?.uiContext,
 			commandContextActions: {
-				waitForIdle: () => session.agent.waitForIdle(),
+				waitForIdle: () => session.waitForIdle(),
 				newSession: (options) => this.runtimeHost.newSession(options),
 				fork: async (entryId, options) => {
 					const result = await this.runtimeHost.fork(entryId, options);

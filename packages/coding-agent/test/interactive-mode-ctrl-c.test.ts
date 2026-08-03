@@ -24,6 +24,7 @@ type FakeInteractiveMode = {
 		isCompacting: boolean;
 		isBashRunning: boolean;
 		retryAttempt: number;
+		sessionActions: { queuedCount: number; steering: readonly string[]; followUps: readonly string[] };
 	};
 	connectionQueue: { steering: string[]; followUp: string[] };
 	agentConnection: {
@@ -93,6 +94,7 @@ function createInteractiveFake(options: {
 			isCompacting: options.compacting ?? false,
 			isBashRunning: options.bashRunning ?? false,
 			retryAttempt: options.retryAttempt ?? 0,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 		},
 		connectionQueue: { steering: [], followUp: [] },
 		agentConnection: {

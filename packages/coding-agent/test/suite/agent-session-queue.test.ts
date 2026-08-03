@@ -1321,8 +1321,8 @@ describe("AgentSession queue characterization", () => {
 		pause.release();
 		await hook.reached;
 
-		// The pump owns the prompt during preparation, but it stays visible as pending.
-		expect(harness.session.getSteeringMessages()).toEqual(["active steering"]);
+		// The pump owns the prompt during preparation, so it is active rather than queued.
+		expect(harness.session.getSteeringMessages()).toEqual([]);
 		expect(internals._steeringStopPending).toBe(true);
 		expect(harness.session.clearQueue()).toEqual({ steering: ["active steering"], followUp: [] });
 		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: [] });
@@ -1334,15 +1334,15 @@ describe("AgentSession queue characterization", () => {
 		expect(getUserTexts(harness)).toEqual([]);
 	});
 
-	it("keeps owned inputs visible in counts, previews, and queue updates until delivery", async () => {
+	it("removes preparing inputs from literal queue projections", async () => {
 		const hook = gatedHook({ prompt: "owned prompt" });
 		const harness = await createHarness({ extensionFactories: [hook.factory] });
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("delivered")]);
 		const queueUpdates: { steering: readonly string[]; followUp: readonly string[] }[] = [];
 		harness.session.subscribe((event) => {
-			if (event.type === "queue_update") {
-				queueUpdates.push({ steering: [...event.steering], followUp: [...event.followUp] });
+			if (event.type === "session_action_update") {
+				queueUpdates.push({ steering: [...event.actions.steering], followUp: [...event.actions.followUps] });
 			}
 		});
 		const pause = harness.session.acquireQueuedWorkPause();
@@ -1350,18 +1350,95 @@ describe("AgentSession queue characterization", () => {
 		pause.release();
 		await hook.reached;
 
-		// The pump moved the prompt into _activeSessionInput (preparing); it must
-		// still count as pending and appear in previews and snapshots.
-		expect(harness.session.pendingMessageCount).toBe(1);
-		expect(harness.session.getFollowUpMessagePreviews()).toEqual(["owned prompt"]);
-		expect(harness.session.getFollowUpQueueSnapshots().map((snapshot) => snapshot.text)).toEqual(["owned prompt"]);
-		expect(queueUpdates.at(-1)).toEqual({ steering: [], followUp: ["owned prompt"] });
+		expect(harness.session.queuedActionCount).toBe(0);
+		expect(harness.session.getFollowUpMessagePreviews()).toEqual([]);
+		expect(harness.session.getSessionActionRecoverySnapshot().actions).toEqual([]);
+		expect(queueUpdates.at(-1)).toEqual({ steering: [], followUp: [] });
 
 		hook.release();
 		await harness.session.waitForIdle();
-		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(harness.session.queuedActionCount).toBe(0);
 		expect(queueUpdates.at(-1)).toEqual({ steering: [], followUp: [] });
 		expect(getUserTexts(harness)).toEqual(["owned prompt"]);
+	});
+
+	it("hides queued trigger-turn actions from user-visible queue projections", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as { _scheduleSessionInputPump(): void };
+		const schedule = vi.spyOn(internals, "_scheduleSessionInputPump").mockImplementation(() => {});
+		await harness.session.followUp("visible queued prompt");
+		const hidden = harness.session.sendCustomMessage(
+			{ customType: "hidden-trigger", content: "hidden queued prompt", display: false },
+			{ triggerTurn: true },
+		);
+		const hiddenRejection = expect(hidden).rejects.toThrow("Prompt aborted before delivery.");
+
+		await vi.waitFor(() => expect(harness.session.getSessionActionRecoverySnapshot().actions).toHaveLength(2));
+		expect(harness.session.getFollowUpMessages()).toEqual(["visible queued prompt"]);
+		expect(harness.session.getFollowUpMessagePreviews()).toEqual(["visible queued prompt"]);
+		expect(harness.session.getSessionActionSnapshot()).toMatchObject({
+			queuedCount: 1,
+			steering: [],
+			followUps: ["visible queued prompt"],
+		});
+		expect(harness.session.queuedActionCount).toBe(1);
+		expect(harness.session.getSessionActionRecoverySnapshot().actions.map((action) => action.payload.text)).toEqual([
+			"visible queued prompt",
+			"hidden queued prompt",
+		]);
+
+		harness.session.requestAbort();
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: ["visible queued prompt"] });
+		schedule.mockRestore();
+		await hiddenRejection;
+	});
+
+	it("emits the running phase when a queued turn starts", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		const phases: string[] = [];
+		harness.session.subscribe((event) => {
+			if (event.type === "session_action_update" && event.actions.active) {
+				phases.push(event.actions.active.phase);
+			}
+		});
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("phase probe", undefined, { resumeIfIdle: true });
+
+		pause.release();
+		await harness.session.waitForIdle();
+
+		expect(phases).toContain("running");
+	});
+
+	it("reports selected work when resuming after an abort", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const command = parseSessionSlashCommand("/autonomous status");
+		expect(command).toBeDefined();
+		const selected = createDeferred<void>();
+		const releaseSelection = createDeferred<void>();
+		const internals = harness.session as unknown as {
+			_executeSelectedSessionCommand(action: unknown, epoch?: number): Promise<void>;
+		};
+		internals._executeSelectedSessionCommand = async () => {
+			selected.resolve();
+			await releaseSelection.promise;
+		};
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.restoreFollowUpMessage(command!.text, undefined, {
+			customMessage: createSessionSlashCommandMessage(command!),
+		});
+
+		pause.release();
+		await selected.promise;
+		harness.session.requestAbort();
+		expect(harness.session.resumeQueuedWork()).toBe(true);
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: [command!.text] });
+		releaseSelection.resolve();
+		await harness.session.waitForSessionInputIdle();
 	});
 
 	it("stops counting cleared preparing inputs as pending", async () => {
@@ -1373,10 +1450,10 @@ describe("AgentSession queue characterization", () => {
 		await harness.session.followUp("cleared prompt", undefined, { resumeIfIdle: true });
 		pause.release();
 		await hook.reached;
-		expect(harness.session.pendingMessageCount).toBe(1);
+		expect(harness.session.queuedActionCount).toBe(0);
 
 		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: ["cleared prompt"] });
-		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(harness.session.queuedActionCount).toBe(0);
 		expect(harness.session.getFollowUpMessagePreviews()).toEqual([]);
 
 		hook.release();
@@ -1618,7 +1695,7 @@ describe("AgentSession queue characterization", () => {
 		const delivery = harness.session.waitForAgentMessagePromptDelivery("agentmsg_queue_update_clear");
 		let cleared = false;
 		const unsubscribe = harness.session.subscribe((event) => {
-			if (event.type === "queue_update" && !cleared) {
+			if (event.type === "session_action_update" && !cleared) {
 				cleared = true;
 				harness.session.clearQueue();
 			}
@@ -1756,12 +1833,12 @@ describe("AgentSession queue characterization", () => {
 
 		await firstProviderStarted.promise;
 		await new Promise<void>((resolve) => setImmediate(resolve));
-		expect(harness.session.pendingMessageCount).toBe(1);
+		expect(harness.session.queuedActionCount).toBe(1);
 		expect(harness.session.getFollowUpMessages()).toEqual([prompt]);
 		firstResponse.resolve();
 		await harness.session.waitForIdle();
 
-		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(harness.session.queuedActionCount).toBe(0);
 		expect(harness.session.messages.filter((item) => item === message)).toHaveLength(2);
 		expect(getAssistantTexts(harness)).toEqual(["first done", "second done"]);
 	});
@@ -2114,8 +2191,7 @@ describe("AgentSession queue characterization", () => {
 			} else {
 				withStreaming(harness, false);
 				await prepared.promise;
-				// Owned by the pump during preparation, still reported as pending.
-				expect(harness.session.getFollowUpMessages()).toEqual(["accepted"]);
+				expect(harness.session.getFollowUpMessages()).toEqual([]);
 			}
 			await expect(
 				harness.session.restoreFollowUpMessage("duplicate", undefined, { queueKey: "same", agentMessageId: id }),
@@ -2257,6 +2333,100 @@ describe("AgentSession queue characterization", () => {
 		expect(harness.sessionManager.getLeafId()).not.toBe(secondId);
 	});
 
+	it("waitForIdle yields to timers while queued work is paused", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		const pause = harness.session.acquireQueuedWorkPause();
+		await harness.session.followUp("paused follow-up", undefined, { resumeIfIdle: true });
+		const originalWaitForIdle = harness.session.agent.waitForIdle.bind(harness.session.agent);
+		let waitCalls = 0;
+		vi.spyOn(harness.session.agent, "waitForIdle").mockImplementation(async () => {
+			if (++waitCalls > 100) throw new Error("waitForIdle spun without yielding");
+			await originalWaitForIdle();
+		});
+		const waiting = harness.session.waitForIdle().then(
+			() => ({ ok: true as const }),
+			(error: unknown) => ({ ok: false as const, error }),
+		);
+
+		try {
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			expect(waitCalls).toBeLessThan(100);
+			expect(harness.session.getFollowUpMessages()).toEqual(["paused follow-up"]);
+		} finally {
+			pause.release();
+		}
+		expect(await waiting).toEqual({ ok: true });
+		expect(getUserTexts(harness)).toEqual(["paused follow-up"]);
+	});
+
+	it("waitForIdle yields to timers while queued work is suspended after abort", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		await harness.session.followUp("queued across abort");
+		harness.session.requestAbort();
+		expect(harness.session.getFollowUpMessages()).toEqual(["queued across abort"]);
+		const originalWaitForIdle = harness.session.agent.waitForIdle.bind(harness.session.agent);
+		let waitCalls = 0;
+		vi.spyOn(harness.session.agent, "waitForIdle").mockImplementation(async () => {
+			if (++waitCalls > 100) throw new Error("waitForIdle spun without yielding");
+			await originalWaitForIdle();
+		});
+		const waiting = harness.session.waitForIdle().then(
+			() => ({ ok: true as const }),
+			(error: unknown) => ({ ok: false as const, error }),
+		);
+
+		try {
+			await new Promise<void>((resolve) => setTimeout(resolve, 0));
+			expect(waitCalls).toBeLessThan(100);
+		} finally {
+			harness.session.resumeQueuedWork();
+		}
+		expect(await waiting).toEqual({ ok: true });
+		expect(getUserTexts(harness)).toEqual(["queued across abort"]);
+	});
+
+	it("waitForIdle resolves when the queue is cleared while the pump is suspended", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		await harness.session.followUp("cleared while suspended");
+		harness.session.requestAbort();
+		expect(harness.session.getFollowUpMessages()).toEqual(["cleared while suspended"]);
+		const waiting = harness.session.waitForIdle().then(
+			() => ({ ok: true as const }),
+			(error: unknown) => ({ ok: false as const, error }),
+		);
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		const cleared = harness.session.clearQueue();
+		expect(cleared.followUp).toEqual(["cleared while suspended"]);
+		const outcome = await Promise.race([
+			waiting,
+			new Promise<{ ok: false; error: Error }>((resolve) =>
+				setTimeout(() => resolve({ ok: false, error: new Error("waitForIdle hung after clearQueue") }), 500),
+			),
+		]);
+		expect(outcome).toEqual({ ok: true });
+	});
+
+	it("does not report a visible accepted prompt as accepted in flight", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		withStreaming(harness, true);
+
+		await harness.session.promptUntilAccepted("visible queued prompt", {
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+		});
+
+		expect(harness.session.getFollowUpMessages()).toEqual(["visible queued prompt"]);
+		expect(harness.session.hasAcceptedPromptInFlight).toBe(false);
+		harness.session.clearQueue();
+		withStreaming(harness, false);
+	});
+
 	it("waitForIdle observes a run that starts at its final idle boundary", async () => {
 		const responseGate = createDeferred();
 		const waitForResponseStart = createDeferred();
@@ -2354,7 +2524,7 @@ describe("AgentSession scheduler scenarios", () => {
 			if (event.type === "message_start" && event.message.role === "user") {
 				countsAtUserMessageStart.push({
 					text: getMessageText(event.message),
-					pending: harness.session.pendingMessageCount,
+					pending: harness.session.queuedActionCount,
 				});
 			}
 		});
@@ -2421,7 +2591,7 @@ describe("AgentSession scheduler scenarios", () => {
 
 		// Phase 2: queued work stays in session queues, not Agent queues.
 		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
-		const pendingAfterQueueing = harness.session.pendingMessageCount;
+		const pendingAfterQueueing = harness.session.queuedActionCount;
 		expect(pendingAfterQueueing).toBeGreaterThan(0);
 		expect(harness.session.getFollowUpMessages()).toContain("f1");
 		expect(harness.session.getFollowUpMessages()).toContain("f2");
@@ -2461,7 +2631,7 @@ describe("AgentSession scheduler scenarios", () => {
 		expect(rows).toContain("custom:queue-test-follow-up");
 
 		// Phase 5: every queued input left the pending count before its message_start.
-		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(harness.session.queuedActionCount).toBe(0);
 		const queuedStarts = countsAtUserMessageStart.filter((entry) => entry.text !== "start");
 		expect(queuedStarts.length).toBeGreaterThan(0);
 		for (const entry of queuedStarts) {
@@ -2569,7 +2739,7 @@ describe("AgentSession scheduler scenarios", () => {
 		expect(continuationSawRemoved).toBe(false);
 		expect(getUserTexts(harness)).toEqual(["start", "keep me", spoofedPlain]);
 		expect(getAssistantTexts(harness)).toEqual(["", "continued clean", "keep me done", "spoof done"]);
-		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(harness.session.queuedActionCount).toBe(0);
 	});
 
 	it("S3: pause-lease preparation journey with anchor re-preparation and direct handoff", async () => {
@@ -2688,10 +2858,15 @@ describe("AgentSession scheduler scenarios", () => {
 		await harness.session.waitForSessionInputIdle();
 		expect(providerCalls).toBe(0);
 		expect(harness.session.getFollowUpMessages()).toEqual(["queued for restart", "/goal inspect image", agentPrompt]);
-		expect(harness.session.getFollowUpQueueSnapshots()).toEqual([
-			expect.objectContaining({ text: "queued for restart" }),
-			expect.objectContaining({ text: "/goal inspect image", images: [image] }),
-			expect.objectContaining({ text: agentPrompt, agentMessageId: "agentmsg_abort" }),
+		expect(harness.session.getSessionActionRecoverySnapshot().actions).toEqual([
+			expect.objectContaining({ payload: expect.objectContaining({ text: "queued for restart" }) }),
+			expect.objectContaining({
+				payload: expect.objectContaining({ text: "/goal inspect image", images: [image] }),
+			}),
+			expect.objectContaining({
+				agentMessageId: "agentmsg_abort",
+				payload: expect.objectContaining({ text: agentPrompt }),
+			}),
 		]);
 		expect(deliverySettled).toBe(false);
 
@@ -2752,7 +2927,7 @@ describe("AgentSession scheduler scenarios", () => {
 		await expect(delivery).resolves.toBeUndefined();
 		expect(getUserTexts(harness)).toContain("queued for restart");
 		expect(getUserTexts(harness)).toContain(agentPrompt);
-		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(harness.session.queuedActionCount).toBe(0);
 	});
 
 	it("S5: settles queued command delivery before gated completion and rejects completion on failure", async () => {

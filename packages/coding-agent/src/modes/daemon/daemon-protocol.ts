@@ -5,6 +5,7 @@ import type {
 	AgentSessionMessageReceipt,
 	AgentSessionMessageSafetyStatus,
 } from "../../core/agent-messages.js";
+import type { SessionActionRecoverySnapshot } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import type { AgentSessionRuntimeMetadata } from "../../core/agent-session-runtime.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
@@ -48,12 +49,11 @@ import type { SessionSummary } from "./daemon-session-list.js";
  */
 
 export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
-export const DAEMON_PROTOCOL_VERSION = 6;
-export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 2;
-// Revision 6 combines prompt-admission cancellation with side-question transcripts and transient bash.
-// Revision 7 makes get_session_tree return flatNodes instead of a recursively nested tree.
-export const DAEMON_SCHEMA_REVISION = 7;
-export const DAEMON_SCHEMA_ID = "protocol-6-schema-7-48a562b9bffe";
+export const DAEMON_PROTOCOL_VERSION = 7;
+export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
+// Revision 8 publishes literal session-action queues and activity separately.
+export const DAEMON_SCHEMA_REVISION = 8;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-8-b56e29842cfa";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -290,25 +290,11 @@ export interface DaemonAttachResult {
 	};
 }
 
-export interface DaemonUpdateRestartQueuedMessage {
-	message: string;
-	content?: (TextContent | ImageContent)[];
-	images?: ImageContent[];
-	queueKey?: string;
-	agentMessageId?: string;
-	customMessage?: CustomMessage;
-	prefixMessages?: CustomMessage[];
-}
-
-export interface DaemonUpdateRestartAcceptedPrompt extends DaemonUpdateRestartQueuedMessage {
-	nextTurn: CustomMessage[];
-}
+export const DAEMON_UPDATE_RESTART_FORMAT_VERSION = 1;
 
 export interface DaemonUpdateRestartQueue {
-	steering: DaemonUpdateRestartQueuedMessage[];
-	followUp: DaemonUpdateRestartQueuedMessage[];
+	actions: SessionActionRecoverySnapshot;
 	nextTurn: CustomMessage[];
-	acceptedPrompt?: DaemonUpdateRestartAcceptedPrompt;
 }
 
 export interface DaemonUpdateRestartSession {
@@ -330,6 +316,7 @@ export interface DaemonUpdateRestartSession {
 }
 
 export interface DaemonUpdateRestartManifest {
+	formatVersion: typeof DAEMON_UPDATE_RESTART_FORMAT_VERSION;
 	createdAt: string;
 	sessions: DaemonUpdateRestartSession[];
 	discardedActiveSessionIds?: string[];
@@ -455,6 +442,7 @@ export type DaemonCommand =
 			prefixMessages?: CustomMessage[];
 	  }
 	| { id?: string; type: "restore_next_turn"; activeSessionId: string; messages: CustomMessage[] }
+	| { id?: string; type: "restore_actions"; activeSessionId: string; snapshot: SessionActionRecoverySnapshot }
 	| {
 			id?: string;
 			type: "append_custom_message";
@@ -611,22 +599,22 @@ export interface DaemonCommandCompatibility {
 	capability?: DaemonServerCapability;
 }
 
-const LEGACY_DAEMON_COMMAND = { minProtocol: 1 } as const;
-const CURRENT_DAEMON_COMMAND = { minProtocol: 4 } as const;
+const LEGACY_DAEMON_COMMAND = { minProtocol: 7 } as const;
+const CURRENT_DAEMON_COMMAND = { minProtocol: 7 } as const;
 const SESSION_INPUT_ADMISSION_COMMAND = {
-	minProtocol: 4,
+	minProtocol: 7,
 	capability: "session_input_admission",
 } as const;
 const PROMPT_ADMISSION_CANCELLATION_COMMAND = {
-	minProtocol: 5,
-	minSchemaRevision: 6,
+	minProtocol: 7,
+	minSchemaRevision: 8,
 	capability: "prompt_admission_cancellation",
 } as const;
 const CLIENT_OWNED_DAEMON_COMMAND = {
-	minProtocol: 4,
+	minProtocol: 7,
 	capability: "client_owned_sessions",
 } as const;
-const FLAT_SESSION_TREE_COMMAND = { minProtocol: 6 } as const;
+const FLAT_SESSION_TREE_COMMAND = { minProtocol: 7 } as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
@@ -646,6 +634,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	steer: SESSION_INPUT_ADMISSION_COMMAND,
 	follow_up: SESSION_INPUT_ADMISSION_COMMAND,
 	restore_next_turn: LEGACY_DAEMON_COMMAND,
+	restore_actions: LEGACY_DAEMON_COMMAND,
 	append_custom_message: LEGACY_DAEMON_COMMAND,
 	resume_queue: SESSION_INPUT_ADMISSION_COMMAND,
 	send_message: LEGACY_DAEMON_COMMAND,
@@ -669,14 +658,14 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_context_tree: LEGACY_DAEMON_COMMAND,
 	get_commands: LEGACY_DAEMON_COMMAND,
 	get_resource_snapshot: LEGACY_DAEMON_COMMAND,
-	get_model_catalog: { minProtocol: 4, capability: "model_catalog" },
+	get_model_catalog: { minProtocol: 7, capability: "model_catalog" },
 	get_available_models: LEGACY_DAEMON_COMMAND,
 	get_queue: LEGACY_DAEMON_COMMAND,
 	clear_queue: LEGACY_DAEMON_COMMAND,
 	abort_and_clear_queue: LEGACY_DAEMON_COMMAND,
 	cron_list: LEGACY_DAEMON_COMMAND,
-	heartbeats_list: { minProtocol: 3, capability: "heartbeat_catalog" },
-	heartbeat_manage: { minProtocol: 3, capability: "heartbeat_management" },
+	heartbeats_list: { minProtocol: 7, capability: "heartbeat_catalog" },
+	heartbeat_manage: { minProtocol: 7, capability: "heartbeat_management" },
 	cron_add: LEGACY_DAEMON_COMMAND,
 	cron_cancel: LEGACY_DAEMON_COMMAND,
 	heartbeat_get: LEGACY_DAEMON_COMMAND,
@@ -919,7 +908,7 @@ export const DAEMON_OUTBOUND_COMPATIBILITY = {
 	session_list_item: LEGACY_DAEMON_COMMAND,
 	daemon_hello: LEGACY_DAEMON_COMMAND,
 	daemon_closing: LEGACY_DAEMON_COMMAND,
-	heartbeats_changed: { minProtocol: 3, capability: "heartbeat_catalog" },
+	heartbeats_changed: { minProtocol: 7, capability: "heartbeat_catalog" },
 	session_event: LEGACY_DAEMON_COMMAND,
 	side_question_event: LEGACY_DAEMON_COMMAND,
 	session_status: LEGACY_DAEMON_COMMAND,

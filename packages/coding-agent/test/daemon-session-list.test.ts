@@ -111,7 +111,7 @@ describe("buildSessionList", () => {
 		});
 	});
 
-	it("counts accepted in-flight agent prompts as pending work", () => {
+	it("reports accepted in-flight prompts as active with no queued work", () => {
 		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
 		const summary = summaryForActiveSession(
 			makeState({
@@ -122,8 +122,21 @@ describe("buildSessionList", () => {
 			}),
 		);
 
-		expect(summary.pendingMessageCount).toBe(1);
+		expect(summary.sessionActions).toMatchObject({ queuedCount: 0, active: { kind: "turn", phase: "running" } });
 		expect(summary.activity).toBe("working");
+	});
+
+	it("reports the exact unfinished action count independently of the visible action snapshot", () => {
+		const summary = summaryForActiveSession(
+			makeState({
+				activeSessionId: "batched",
+				unfinishedActionCount: 3,
+				hasAcceptedPromptInFlight: true,
+			}),
+		);
+
+		expect(summary.sessionActions).toMatchObject({ queuedCount: 0, active: { kind: "turn" } });
+		expect(summary.unfinishedActionCount).toBe(3);
 	});
 
 	it("marks a finished subagent idle instead of holding it at working", () => {
@@ -515,8 +528,9 @@ describe("resolveAttachModelFallbackMessage", () => {
 			isCompacting: false,
 			attachedClients: 0,
 			messageCount: 0,
-			pendingMessageCount: 0,
+			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
 			...overrides,
+			isSessionActive: overrides.isSessionActive ?? false,
 		};
 	}
 
@@ -551,6 +565,7 @@ interface StateOptions {
 	childRunStatuses?: Record<string, "queued" | "running" | "done" | "error" | "cancelled">;
 	hasRunningRlmChildren?: boolean;
 	hasAcceptedPromptInFlight?: boolean;
+	unfinishedActionCount?: number;
 	contextTokens?: number;
 	streamingMessage?: AgentMessage;
 	metadata?: {
@@ -598,9 +613,18 @@ function makeState(options: StateOptions): ActiveSessionState {
 				getRlmChildRunStatus: (childId: string) => options.childRunStatuses?.[childId],
 				hasRunningRlmChildren: () => options.hasRunningRlmChildren ?? false,
 				hasAcceptedPromptInFlight: options.hasAcceptedPromptInFlight ?? false,
+				unfinishedActionCount: options.unfinishedActionCount ?? (options.hasAcceptedPromptInFlight ? 1 : 0),
+				isSessionActive: options.isStreaming === true || options.hasAcceptedPromptInFlight === true,
 				getCurrentRecap: () => undefined,
 				_contextTokensForCurrentMessages: () => options.contextTokens,
-				pendingMessageCount: 0,
+				getSessionActionSnapshot: () => ({
+					queuedCount: 0,
+					steering: [],
+					followUps: [],
+					...(options.hasAcceptedPromptInFlight
+						? { active: { kind: "turn" as const, phase: "running" as const } }
+						: {}),
+				}),
 				state: {
 					streamingMessage: options.streamingMessage,
 					pendingToolCalls: new Set(options.pendingToolCalls ?? []),

@@ -31,7 +31,7 @@ export interface AgentSessionMessageSender extends Partial<AgentSessionMessageEn
 export interface AgentSessionMessageAgentSummary extends AgentSessionMessageEndpoint {
 	cwd: string;
 	isStreaming: boolean;
-	pendingMessageCount: number;
+	unfinishedActionCount: number;
 	parentActiveSessionId?: string;
 	rlmChildId?: string;
 }
@@ -134,12 +134,12 @@ export function assertDirectAgentMessageTarget(target: string): string {
 }
 
 export function assertAgentMessageQueueCapacity(
-	pendingMessageCount: number,
+	unfinishedActionCount: number,
 	maxPending = DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 ): void {
-	if (pendingMessageCount >= maxPending) {
+	if (unfinishedActionCount >= maxPending) {
 		throw new Error(
-			`Target session has too many pending messages: ${pendingMessageCount} pending, limit is ${maxPending}`,
+			`Target session has too many pending messages: ${unfinishedActionCount} unfinished, limit is ${maxPending}`,
 		);
 	}
 }

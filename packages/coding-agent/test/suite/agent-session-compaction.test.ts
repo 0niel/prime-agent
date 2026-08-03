@@ -184,10 +184,21 @@ describe("AgentSession compaction characterization", () => {
 		});
 	});
 
-	it("emits compaction lifecycle events when /compact was queued behind a running turn", async () => {
+	it("renders an executing /compact as activity instead of queued work", async () => {
+		let releaseCompaction: () => void = () => {};
+		const compactionGate = new Promise<void>((resolve) => {
+			releaseCompaction = resolve;
+		});
 		const harness = await createHarness({
 			settings: { compaction: { keepRecentTokens: 1 } },
 			persistSession: true,
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async () => {
+						await compactionGate;
+					});
+				},
+			],
 		});
 		harnesses.push(harness);
 		let releaseTurn: () => void = () => {};
@@ -206,6 +217,16 @@ describe("AgentSession compaction characterization", () => {
 		// Queue the command while the turn streams, then let the turn finish.
 		const queued = harness.session.prompt("/compact", { streamingBehavior: "steer" });
 		releaseTurn();
+		await vi.waitFor(() =>
+			expect(harness.session.getSessionActionSnapshot()).toMatchObject({
+				queuedCount: 0,
+				steering: [],
+				followUps: [],
+				active: { kind: "session_command", phase: "running", label: "/compact" },
+			}),
+		);
+		expect(harness.session.isSessionActive).toBe(true);
+		releaseCompaction();
 		await Promise.all([running, queued]);
 
 		const order = harness.events.map((event) => event.type);
@@ -280,7 +301,7 @@ describe("AgentSession compaction characterization", () => {
 			// Hold the input in the session-owned follow-up queue across compaction.
 			const pause = harness.session.acquireQueuedWorkPause();
 			await harness.session.followUp("queued across compaction", undefined, { resumeIfIdle: true });
-			expect(harness.session.pendingMessageCount).toBe(1);
+			expect(harness.session.queuedActionCount).toBe(1);
 
 			await harness.session.compact();
 
@@ -963,6 +984,7 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.session.getFollowUpMessages()).toHaveLength(1);
 
 		await harness.session.prompt("/autonomous off");
+		await harness.session.waitForIdle();
 		expect(harness.session.getAutonomousStatus().enabled).toBe(false);
 		expect(harness.session.getFollowUpMessages()).toEqual([]);
 

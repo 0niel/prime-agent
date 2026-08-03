@@ -184,7 +184,12 @@ Response:
     "sessionName": "my-feature-work",
     "autoCompactionEnabled": true,
     "messageCount": 5,
-    "pendingMessageCount": 0
+    "unfinishedActionCount": 0,
+    "sessionActions": {
+      "queuedCount": 0,
+      "steering": [],
+      "followUps": []
+    }
   }
 }
 ```
@@ -795,7 +800,7 @@ Events are streamed to stdout as JSON lines during agent operation. Events do NO
 | `tool_execution_start` | Tool begins execution |
 | `tool_execution_update` | Tool execution progress (streaming output) |
 | `tool_execution_end` | Tool completes |
-| `queue_update` | Pending steering/follow-up queue changed |
+| `session_action_update` | Pending steering/follow-up queue changed |
 | `compaction_start` | Compaction begins |
 | `compaction_end` | Compaction completes |
 | `auto_retry_start` | Auto-retry begins (after transient error) |
@@ -933,15 +938,19 @@ When complete:
 
 Use `toolCallId` to correlate events. The `partialResult` in `tool_execution_update` contains the accumulated output so far (not just the delta), allowing clients to simply replace their display on each update.
 
-### queue_update
+### session_action_update
 
-Emitted whenever the pending steering or follow-up queue changes.
+Emitted whenever literal queued actions or the active scheduler action changes.
 
 ```json
 {
-  "type": "queue_update",
-  "steering": ["Focus on error handling"],
-  "followUp": ["After that, summarize the result"]
+  "type": "session_action_update",
+  "actions": {
+    "queuedCount": 2,
+    "steering": ["Focus on error handling"],
+    "followUps": ["After that, summarize the result"],
+    "active": { "kind": "session_command", "phase": "running", "label": "/compact" }
+  }
 }
 ```
 

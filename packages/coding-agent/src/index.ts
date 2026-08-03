@@ -179,6 +179,7 @@ export {
 	type RlmSubagentRuntime,
 	type SubagentRuntimeHost,
 } from "./core/sdk.js";
+export type { SessionActionSnapshot } from "./core/session-action-store.js";
 export { SessionImportFileNotFoundError } from "./core/session-import-errors.js";
 export {
 	type BranchSummaryEntry,

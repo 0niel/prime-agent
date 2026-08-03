@@ -49,7 +49,7 @@ describe("AgentSession action contracts", () => {
 		await harness.session.prompt("handled", { streamingBehavior: "followUp" });
 
 		expect(harness.session.getFollowUpMessages()).toEqual(["transformed:queued"]);
-		expect(harness.session.pendingMessageCount).toBe(1);
+		expect(harness.session.queuedActionCount).toBe(1);
 		withStreaming(harness, false);
 		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: ["transformed:queued"] });
 	});
@@ -65,7 +65,7 @@ describe("AgentSession action contracts", () => {
 		);
 
 		expect(harness.session.messages).toEqual([]);
-		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(harness.session.queuedActionCount).toBe(0);
 		expect(harness.getPendingResponseCount()).toBe(1);
 
 		await harness.session.prompt("consume context");

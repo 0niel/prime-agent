@@ -34,6 +34,10 @@ function client(id: string): DaemonSocketClient {
 	return { id, attachedActiveSessionIds: new Set(), capabilities: new Set() } as DaemonSocketClient;
 }
 
+function commandLine(command: DaemonCommand & { id: string }, clientId?: string): string {
+	return JSON.stringify(createDaemonCommandEnvelope(command, command.id, clientId));
+}
+
 function admissionFor(supervisor: SupervisorHarness, owner: DaemonSocketClient): AdmissionRecord | undefined {
 	return [...(supervisor.promptAdmissions.get(owner)?.values() ?? [])][0];
 }
@@ -107,7 +111,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 			message: "hello",
 		} satisfies DaemonCommand;
 
-		const pendingPrompt = supervisor.handleLine(owner, JSON.stringify(prompt));
+		const pendingPrompt = supervisor.handleLine(owner, commandLine(prompt));
 		const admission = admissionFor(supervisor, owner);
 		expect(admission).toMatchObject({
 			client: owner,
@@ -139,10 +143,10 @@ describe("daemon supervisor prompt admission ownership", () => {
 			message: "hello",
 		} satisfies DaemonCommand;
 
-		await supervisor.handleLine(owner, JSON.stringify(prompt));
+		await supervisor.handleLine(owner, commandLine(prompt));
 		expect(supervisor.promptAdmissions.size).toBe(0);
 
-		await supervisor.handleLine(owner, JSON.stringify({ ...prompt, id: "prompt-2" }));
+		await supervisor.handleLine(owner, commandLine({ ...prompt, id: "prompt-2" }));
 		expect(supervisor.promptAdmissions.size).toBe(0);
 	});
 
@@ -161,7 +165,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 
 		await supervisor.handleLine(
 			owner,
-			JSON.stringify({
+			commandLine({
 				id: "cancel-1",
 				type: "cancel_prompt_admission",
 				activeSessionId: "session-1",
@@ -220,7 +224,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 		const owner = client("connection-owner");
 		const pendingPrompt = supervisor.handleLine(
 			owner,
-			JSON.stringify({
+			commandLine({
 				id: "prompt-1",
 				type: "prompt",
 				activeSessionId: "session-1",
@@ -230,7 +234,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 		);
 		const pendingCancel = supervisor.handleLine(
 			owner,
-			JSON.stringify({
+			commandLine({
 				id: "cancel-1",
 				type: "cancel_prompt_admission",
 				activeSessionId: "session-1",
@@ -251,7 +255,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 		const workerPrompt = deferred<DaemonResponse>();
 		const worker = { descriptor: { lifecycle: "ready", rootActiveSessionId: "worker-session" } };
 		const supervisor = createHarness({
-			assertCurrent: () => (++ownershipChecks === 1 ? Promise.resolve() : cancelOwnership.promise),
+			assertCurrent: () => (++ownershipChecks === 2 ? cancelOwnership.promise : Promise.resolve()),
 			findWorker: vi.fn(async () => ({
 				worker,
 				summary: { id: "worker-session", activeSessionId: "worker-session" },
@@ -261,7 +265,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 		const owner = client("connection-owner");
 		const pendingPrompt = supervisor.handleLine(
 			owner,
-			JSON.stringify({
+			commandLine({
 				id: "prompt-1",
 				type: "prompt",
 				activeSessionId: "session-1",
@@ -272,7 +276,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 		await waitFor(() => admissionFor(supervisor, owner)?.worker !== undefined);
 		const pendingCancel = supervisor.handleLine(
 			owner,
-			JSON.stringify({
+			commandLine({
 				id: "cancel-1",
 				type: "cancel_prompt_admission",
 				activeSessionId: "session-1",
@@ -309,7 +313,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 		const owner = client("connection-owner");
 		void supervisor.handleLine(
 			owner,
-			JSON.stringify({
+			commandLine({
 				id: "prompt-1",
 				type: "prompt",
 				activeSessionId: "session-1",
@@ -325,7 +329,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 
 		await supervisor.handleLine(
 			owner,
-			JSON.stringify({
+			commandLine({
 				id: "cancel-1",
 				type: "cancel_prompt_admission",
 				activeSessionId: "session-1",
@@ -378,8 +382,8 @@ describe("daemon supervisor prompt admission ownership", () => {
 				message: id,
 			}) as const satisfies DaemonCommand;
 
-		const pendingA = supervisor.handleLine(ownerA, JSON.stringify(makePrompt("prompt-a")));
-		const pendingB = supervisor.handleLine(ownerB, JSON.stringify(makePrompt("prompt-b")));
+		const pendingA = supervisor.handleLine(ownerA, commandLine(makePrompt("prompt-a")));
+		const pendingB = supervisor.handleLine(ownerB, commandLine(makePrompt("prompt-b")));
 		await waitFor(() => promptResponses.size === 2);
 		const admissionA = admissionFor(supervisor, ownerA)!;
 		const admissionB = admissionFor(supervisor, ownerB)!;
@@ -406,7 +410,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 		expect(admissionFor(supervisor, ownerA)).toBe(admissionA);
 		expect(admissionFor(supervisor, ownerB)).toBe(admissionB);
 
-		const pendingCancelA = supervisor.handleLine(ownerA, JSON.stringify({ ...spoofedCancel, id: "cancel-a" }));
+		const pendingCancelA = supervisor.handleLine(ownerA, commandLine({ ...spoofedCancel, id: "cancel-a" }));
 		await waitFor(() => cancelResponses.has(admissionA.workerAdmissionId));
 		expect(cancelResponses.has(admissionB.workerAdmissionId)).toBe(false);
 		expect(admissionFor(supervisor, ownerA)).toBe(admissionA);
@@ -481,7 +485,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 		const owner = [...supervisor.clients][0]!;
 		const pendingPrompt = supervisor.handleLine(
 			owner,
-			JSON.stringify({
+			commandLine({
 				id: "prompt-1",
 				type: "prompt",
 				activeSessionId: "public-session",
@@ -549,7 +553,7 @@ describe("daemon supervisor prompt admission ownership", () => {
 		const owner = [...supervisor.clients][0]!;
 		const pendingPrompt = supervisor.handleLine(
 			owner,
-			JSON.stringify({
+			commandLine({
 				id: "prompt-1",
 				type: "prompt",
 				activeSessionId: "public-session",

@@ -22,6 +22,7 @@ import type {
 } from "../../core/cron-jobs.js";
 import type { GoalState } from "../../core/goals.js";
 import type { RefinementResult } from "../../core/refinement/index.js";
+import type { SessionActionSnapshot } from "../../core/session-action-store.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSourceInfo } from "../agent-connection/types.js";
 
@@ -151,7 +152,7 @@ export interface RpcSessionState {
 	sessionName?: string;
 	autoCompactionEnabled: boolean;
 	messageCount: number;
-	pendingMessageCount: number;
+	sessionActions: SessionActionSnapshot;
 	goal: GoalState;
 }
 
