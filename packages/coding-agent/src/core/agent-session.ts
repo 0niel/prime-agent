@@ -3610,7 +3610,12 @@ export class AgentSession {
 				this._lastAutoRefineReviewAt > 0 && nowMs - this._lastAutoRefineReviewAt < compactSettings.cooldownMs;
 			this._pendingConcurrentCompactionRefine = undefined;
 			this._compactAutoRefinePending = false;
-			if (compactSettings.enabled && compactSettings.compact && !underCooldown) {
+			if (
+				compactSettings.enabled &&
+				compactSettings.compact &&
+				!underCooldown &&
+				pending.commitState.value === true
+			) {
 				await this._runSerializedAutoRefineReview("compact", this._autoRefineBranchVersion, pending);
 				return;
 			}

@@ -1525,6 +1525,39 @@ describe("Serialized refine review-fix regressions", () => {
 		expect(applyRefine).not.toHaveBeenCalled();
 	});
 
+	it("continues to a due interval refine after discarding an uncommitted compact snapshot", async () => {
+		const reviewer = vi.fn(async ({ reason }: { reason: string }) => ({
+			shouldRefine: reason === "turn_interval",
+			rationale: "due interval lesson",
+		}));
+		const harness = await createHarness({
+			persistSession: true,
+			serializedRefine: true,
+			settings: { autoRefine: { enabled: true, compact: true, turnInterval: 1, cooldownMs: 0 } },
+			autoRefineReviewer: reviewer,
+		});
+		harnesses.push(harness);
+		const internals = harness.session as unknown as SerializedInternals;
+		const { applyRefine } = mockSerializedRefine(harness);
+		internals._assistantTurnsSinceAutoRefine = 1;
+		internals._pendingConcurrentCompactionRefine = {
+			trajectoryMessages: [{ role: "user", content: "discarded compact snapshot", timestamp: Date.now() }],
+			applyGate: new Promise<boolean>(() => {}),
+			commitState: {},
+		};
+		internals._compactAutoRefinePending = true;
+
+		await expect(internals._drainPendingRefinementForDisposal()).resolves.toBeUndefined();
+
+		expect(reviewer).toHaveBeenCalledOnce();
+		expect(reviewer).toHaveBeenCalledWith(
+			expect.objectContaining({ reason: "turn_interval" }),
+			expect.any(AbortSignal),
+		);
+		expect(applyRefine).toHaveBeenCalledOnce();
+		expect(internals._pendingConcurrentCompactionRefine).toBeUndefined();
+	});
+
 	it("does not let a compact review failure block disposal", async () => {
 		const harness = await createHarness({
 			persistSession: true,
