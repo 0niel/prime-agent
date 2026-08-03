@@ -696,16 +696,19 @@ describe("AgentSession queue characterization", () => {
 		withStreaming(harness, false);
 		await vi.waitFor(() => expect(pause).toBeDefined());
 		await harness.session.waitForSessionInputIdle();
-		const queued = (harness.session as unknown as { _followUpMessages: { preparation?: unknown }[] })
-			._followUpMessages;
-		await vi.waitFor(() => expect(queued[0]?.preparation).toBeDefined());
+		const store = (
+			harness.session as unknown as {
+				_actionStore: { queuedActions(): readonly { payload: { prepared?: unknown } }[] };
+			}
+		)._actionStore;
+		await vi.waitFor(() => expect(store.queuedActions()[0]?.payload.prepared).toBeDefined());
 
 		const navigation = harness.session.navigateTree(target!.id, { summarize: false });
 		pause?.release();
 		pause = undefined;
 		await navigation;
 
-		expect(queued[0]?.preparation).toBeUndefined();
+		expect(store.queuedActions()[0]?.payload.prepared).toBeUndefined();
 	});
 
 	it.each([

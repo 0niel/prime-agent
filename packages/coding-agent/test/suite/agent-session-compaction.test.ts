@@ -817,12 +817,13 @@ describe("AgentSession compaction characterization", () => {
 			_schedulePostCompactionContinue(): void;
 			_postCompactionContinuationMessages: AgentMessage[];
 			_postCompactionContinuationScheduled: boolean;
-			_createPreparedPromptInput(
+			_createPreparedTurnAction(
+				schedule: "followUp",
 				text: string,
 				images: undefined,
 				options: { message?: AgentMessage; resumeIfIdle: boolean },
 			): unknown;
-			_enqueueSessionInput(input: unknown, schedule: "followUp"): boolean;
+			_enqueueSessionInput(action: unknown): boolean;
 		};
 		const continuation = {
 			role: "user",
@@ -832,11 +833,10 @@ describe("AgentSession compaction characterization", () => {
 		if (tracked) sessionInternals._postCompactionContinuationMessages = [continuation];
 		harness.setResponses([fauxAssistantMessage(response)]);
 		sessionInternals._enqueueSessionInput(
-			sessionInternals._createPreparedPromptInput(text, undefined, {
+			sessionInternals._createPreparedTurnAction("followUp", text, undefined, {
 				...(tracked && { message: continuation }),
 				resumeIfIdle: tracked,
 			}),
-			"followUp",
 		);
 		const continueSpy = vi.spyOn(harness.session.agent, "continue");
 

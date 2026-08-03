@@ -1476,10 +1476,16 @@ stale post-hook extension instructions`,
 		await harness.session.followUp("handed off", undefined, { resumeIfIdle: true });
 		pause.release();
 		await vi.waitFor(() => {
-			const active = (harness.session as unknown as { _activeSessionInput?: { kind: string; phase?: string } })
-				._activeSessionInput;
-			expect(active?.kind).toBe("prompt");
-			expect(active?.phase).toBe("handedOff");
+			const store = (
+				harness.session as unknown as {
+					_actionStore: {
+						activeActions(): readonly { lifecycle: { state: string }; payload: { kind: string } }[];
+					};
+				}
+			)._actionStore;
+			const active = store.activeActions()[0];
+			expect(active?.payload.kind).toBe("turn");
+			expect(active?.lifecycle.state).toBe("committing");
 		});
 
 		let checkpointReleased = false;

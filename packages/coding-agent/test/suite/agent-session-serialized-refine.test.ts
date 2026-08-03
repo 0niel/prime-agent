@@ -25,7 +25,13 @@ type SerializedInternals = {
 		abort: AbortController,
 	): Promise<unknown>;
 	_serializedRefine: boolean;
-	_steeringMessages: unknown[];
+	_createPreparedTurnAction(
+		schedule: "steer",
+		text: string,
+		images: undefined,
+		options: Record<string, never>,
+	): unknown;
+	_enqueueSessionInput(action: unknown): boolean;
 	_pendingRequestedRefine: { instructions?: string; global?: boolean } | undefined;
 	_assistantTurnsSinceAutoRefine: number;
 	_lastAutoRefineReviewAt: number;
@@ -310,12 +316,7 @@ describe("Serialized agent-callable refine", () => {
 		const internals = harness.session as unknown as SerializedInternals;
 		const { applyRefine } = mockSerializedRefine(harness);
 		internals._pendingRequestedRefine = { instructions: "capture a lesson" };
-		internals._steeringMessages.push({
-			kind: "prompt",
-			text: "steer",
-			prefixMessages: [],
-			message: { role: "user", content: "steer" },
-		});
+		internals._enqueueSessionInput(internals._createPreparedTurnAction("steer", "steer", undefined, {}));
 		const compactionSpy = vi
 			.spyOn(
 				internals as unknown as { _shouldStopForThresholdCompaction: (ctx: unknown) => Promise<boolean> },
@@ -1710,12 +1711,7 @@ describe("P0 concurrency regressions", () => {
 		});
 		harnesses.push(harness);
 		const internals = harness.session as unknown as SerializedInternals;
-		internals._steeringMessages.push({
-			kind: "prompt",
-			text: "steer",
-			prefixMessages: [],
-			message: { role: "user", content: "steer" },
-		});
+		internals._enqueueSessionInput(internals._createPreparedTurnAction("steer", "steer", undefined, {}));
 
 		let planResolved = false;
 		let applyFinished = false;

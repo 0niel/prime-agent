@@ -53,20 +53,6 @@ type AgentDaemonUpdateInternals = {
 };
 
 type QueueInternals = {
-	_steeringMessages: Array<{
-		text: string;
-		queueKey?: string;
-		agentMessageId?: string;
-		prefixMessages: CustomMessage[];
-		message: UserMessage | CustomMessage;
-	}>;
-	_followUpMessages: Array<{
-		text: string;
-		queueKey?: string;
-		agentMessageId?: string;
-		prefixMessages: CustomMessage[];
-		message: UserMessage | CustomMessage;
-	}>;
 	_pendingNextTurnMessages: CustomMessage[];
 	_acceptedAgentMessagePrompt?: {
 		text: string;
