@@ -2,11 +2,18 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-03
+
+### Changed
+
 - Changed large daemon session loads to stream JSONL history and avoid retaining a second full-file copy in memory.
 - Changed the agents view to render explicit session names in bold and the "(no messages)" placeholder in italics.
-- Fixed the blank line between the recap and the working hint so they render directly above each other.
 - Changed subagent guidance to retain reusable children and delete completed direct children once they are no longer needed.
 - Changed top-level CLI help and documentation to expose autonomous mode, quality gates, and their limits.
+
+### Fixed
+
+- Fixed the blank line between the recap and the working hint so they render directly above each other.
 - Fixed compaction retaining runtime resources after an explicitly deleted subagent had a transient cleanup failure.
 - Fixed long-running thinking timers to display hours and days instead of unbounded minutes.
 - Fixed overlapping daemon snapshot catch-ups closing healthy workers and preventing new sessions from starting.
