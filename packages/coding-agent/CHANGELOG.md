@@ -2,18 +2,31 @@
 
 ## [Unreleased]
 
-- Fixed daemon parse rejections dropping the command id, which left older clients waiting for a timeout instead of seeing the protocol error.
-- Fixed `--goal` sessions never showing the objective to the model, which made seeded goals invisible to first turns and continuations.
+## [0.5.0] - 2026-08-03
+
+### Breaking Changes
+
+- Reworked session input scheduling into a single session action lifecycle and store (daemon protocol 7, schema revision 8); older clients and daemons are rejected cleanly at connect.
+
+### Changed
+
 - Changed large daemon session loads to stream JSONL history and avoid retaining a second full-file copy in memory.
 - Changed the agents view to render explicit session names in bold and the "(no messages)" placeholder in italics.
-- Fixed the blank line between the recap and the working hint so they render directly above each other.
 - Changed subagent guidance to retain reusable children and delete completed direct children once they are no longer needed.
 - Changed top-level CLI help and documentation to expose autonomous mode, quality gates, and their limits.
+- Changed daemon and RPC session state to report literal queued actions separately from active scheduler work.
+
+### Fixed
+
+- Fixed the blank line between the recap and the working hint so they render directly above each other.
 - Fixed compaction retaining runtime resources after an explicitly deleted subagent had a transient cleanup failure.
 - Fixed long-running thinking timers to display hours and days instead of unbounded minutes.
 - Fixed overlapping daemon snapshot catch-ups closing healthy workers and preventing new sessions from starting.
-- Changed daemon and RPC session state to report literal queued actions separately from active scheduler work.
-- Changed session input scheduling to use one action lifecycle and store, fixing active work appearing queued, headless completion exiting early, `/compact` consuming itself as a successor, and incompatible clients not failing cleanly at protocol 7/schema 8.
+- Fixed active scheduler work being reported as queued in session state.
+- Fixed headless runs completing before queued follow-up work had finished.
+- Fixed `/compact` consuming itself as its own successor action.
+- Fixed daemon parse rejections dropping the command id, which left older clients waiting for a timeout instead of seeing the protocol error.
+- Fixed `--goal` sessions never showing the objective to the model, which made seeded goals invisible to first turns and continuations.
 
 ## [0.4.0] - 2026-08-01
 
