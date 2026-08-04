@@ -16,6 +16,9 @@ vi.mock("../src/core/output-guard.js", () => ({
 	writeRawStdout: output.write,
 	flushRawStdout: output.flush,
 }));
+vi.mock("../src/utils/shell.js", () => ({
+	killTrackedDetachedChildren: vi.fn(),
+}));
 
 type EmitEvent = SessionShutdownEvent;
 
@@ -143,6 +146,36 @@ describe("runPrintMode", () => {
 		expect(session.promptAndWait).toHaveBeenCalledWith("Say done", { images });
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+	});
+
+	it("disposes the connection before exiting on SIGINT", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		const { session } = runtimeHost;
+		let resolvePrompt: (() => void) | undefined;
+		session.promptAndWait.mockImplementation(
+			() =>
+				new Promise<void>((resolve) => {
+					resolvePrompt = resolve;
+				}),
+		);
+		const onSpy = vi.spyOn(process, "on");
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => undefined) as typeof process.exit);
+
+		const runPromise = runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+			initialMessage: "Wait",
+		});
+		await vi.waitFor(() => expect(session.promptAndWait).toHaveBeenCalled());
+		const handler = onSpy.mock.calls.find(([event]) => event === "SIGINT")?.[1];
+		if (typeof handler !== "function") throw new Error("SIGINT handler was not registered");
+
+		handler();
+
+		await vi.waitFor(() => expect(exitSpy).toHaveBeenCalledWith(130));
+		expect(runtimeHost.dispose).toHaveBeenCalledTimes(1);
+		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
+		resolvePrompt?.();
+		await expect(runPromise).resolves.toBe(0);
 	});
 
 	it("prints successful session command results in text mode", async () => {
