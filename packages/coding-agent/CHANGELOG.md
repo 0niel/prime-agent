@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed `stop` and `rename` rejecting custom daemon socket options.
+
 ## [0.5.1] - 2026-08-04
 
 ### Fixed

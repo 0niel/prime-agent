@@ -362,11 +362,22 @@ function splitOperandsAndOptions(args: string[]): { operands: string[]; options:
 }
 
 function requireOperandCount(args: string[], minimum: number, maximum: number | undefined, command: string): boolean {
-	if (args.some((arg) => arg.startsWith("-") && arg !== "--json")) {
-		fail(`Usage: ${APP_NAME} ${getCommandSpec([command])?.usage ?? command}`);
-		return false;
+	const operands: string[] = [];
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index]!;
+		if (arg === "--json") {
+			continue;
+		}
+		if (arg === "--socket" || arg === "--daemon-socket") {
+			index++;
+			continue;
+		}
+		if (arg.startsWith("-")) {
+			fail(`Usage: ${APP_NAME} ${getCommandSpec([command])?.usage ?? command}`);
+			return false;
+		}
+		operands.push(arg);
 	}
-	const operands = args.filter((arg) => arg !== "--json");
 	if (operands.length >= minimum && (maximum === undefined || operands.length <= maximum)) {
 		return true;
 	}
