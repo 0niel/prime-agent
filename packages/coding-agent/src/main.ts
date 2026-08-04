@@ -1477,6 +1477,10 @@ export async function main(args: string[], options?: MainOptions) {
 			stdinContent,
 		);
 		time("prepareInitialMessage");
+		if (appMode !== "rpc" && !initialMessage && parsed.messages.length === 0) {
+			console.error("No prompt provided (stdin was empty); nothing to do.");
+			return;
+		}
 		initTheme(settingsManager.getTheme(), false);
 		time("initTheme");
 
@@ -1571,6 +1575,10 @@ export async function main(args: string[], options?: MainOptions) {
 		stdinContent,
 	);
 	time("prepareInitialMessage");
+	if ((appMode === "print" || appMode === "json") && !initialMessage && parsed.messages.length === 0) {
+		console.error("No prompt provided (stdin was empty); nothing to do.");
+		return;
+	}
 	initTheme(settingsManager.getTheme(), appMode === "interactive");
 	time("initTheme");
 
