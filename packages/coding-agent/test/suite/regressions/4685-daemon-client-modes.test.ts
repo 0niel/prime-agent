@@ -287,6 +287,35 @@ describe("ENG-4685 daemon-backed client modes", () => {
 		expect(existsSync(socketPath)).toBe(true);
 	}, 90_000);
 
+	it("warns without writing stdout when print mode receives no prompt", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-empty-print-"));
+		tempRoots.add(root);
+		const agentDir = join(root, "agent");
+		const socketPath = join(root, "daemon.sock");
+		daemonSockets.add(socketPath);
+
+		const result = await runCli(
+			[
+				"--print",
+				"--daemon-socket",
+				socketPath,
+				"--model",
+				"faux/faux",
+				"--extension",
+				fauxExtensionPath,
+				"--no-tools",
+				"--no-skills",
+				"--no-prompt-templates",
+				"--no-themes",
+				"--no-context-files",
+			],
+			{ agentDir, stdin: "" },
+		);
+
+		expect(result).toMatchObject({ code: 0, signal: null, stdout: "" });
+		expect(result.stderr).toContain("No prompt provided (stdin was empty); nothing to do.");
+	}, 30_000);
+
 	it("keeps the rollback frontend fully off the daemon path", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-agent-4685-rollback-"));
 		tempRoots.add(root);

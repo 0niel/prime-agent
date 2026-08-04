@@ -89,6 +89,11 @@ async function runPrintModeWithConnectionInternal(
 	}
 
 	try {
+		if (!initialMessage && messages.length === 0 && (await connection.getMessages()).length === 0) {
+			console.error("No prompt provided (stdin was empty); nothing to do.");
+			return 0;
+		}
+
 		if (mode === "json") {
 			const header = await connection.getSessionHeader();
 			if (header) {

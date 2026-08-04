@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed print mode silently exiting when no prompt was provided through arguments or stdin.
+
 ## [0.5.1] - 2026-08-04
 
 ### Fixed
