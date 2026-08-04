@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed `stop` and `rename` rejecting custom daemon socket options.
+- Fixed SIGINT in print mode leaving the session active until liveness reclaim.
 - Fixed print mode silently exiting when no prompt was provided through arguments or stdin.
 
 ## [0.5.1] - 2026-08-04
