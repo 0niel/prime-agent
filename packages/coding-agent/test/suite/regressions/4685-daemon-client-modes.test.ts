@@ -316,6 +316,35 @@ describe("ENG-4685 daemon-backed client modes", () => {
 		expect(result.stderr).toContain("No prompt provided (stdin was empty); nothing to do.");
 	}, 30_000);
 
+	it("does not replay the previous response when continuing with no prompt", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-agent-empty-continue-"));
+		tempRoots.add(root);
+		const agentDir = join(root, "agent");
+		const socketPath = join(root, "daemon.sock");
+		daemonSockets.add(socketPath);
+		const commonArgs = [
+			"--daemon-socket",
+			socketPath,
+			"--model",
+			"faux/faux",
+			"--extension",
+			fauxExtensionPath,
+			"--no-tools",
+			"--no-skills",
+			"--no-prompt-templates",
+			"--no-themes",
+			"--no-context-files",
+		];
+
+		const first = await runCli(["--print", ...commonArgs, "Say hello"], { agentDir });
+		expect(first.code).toBe(0);
+		expect(first.stdout).not.toBe("");
+
+		const resumed = await runCli(["--print", "--continue", ...commonArgs], { agentDir, stdin: "" });
+		expect(resumed).toMatchObject({ code: 0, signal: null, stdout: "" });
+		expect(resumed.stderr).toContain("No prompt provided (stdin was empty); nothing to do.");
+	}, 60_000);
+
 	it("keeps the rollback frontend fully off the daemon path", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-agent-4685-rollback-"));
 		tempRoots.add(root);
