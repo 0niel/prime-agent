@@ -338,8 +338,9 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (isGoogleThinkingApi(model) && isGemma4Model(model.id)) {
 		mergeThinkingLevelMap(model, { off: null, minimal: "MINIMAL", low: null, medium: null, high: "HIGH" });
 	}
-	if (model.provider === "groq" && model.id === "qwen/qwen3-32b") {
-		mergeThinkingLevelMap(model, { minimal: null, low: null, medium: null, high: "default" });
+	// Groq exposes only `none` and `default` reasoning effort for Qwen 3.6 27B.
+	if (model.provider === "groq" && model.id === "qwen/qwen3.6-27b") {
+		mergeThinkingLevelMap(model, { off: "none", minimal: null, low: null, medium: null, high: "default" });
 	}
 	if (
 		model.provider === "openai-codex" &&

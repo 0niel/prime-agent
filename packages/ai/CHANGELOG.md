@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Refreshed the generated provider catalogs, including current Groq, Prime Inference, OpenRouter, and gateway availability and metadata; replaced Groq's discontinued Qwen 3 32B route with Qwen 3.6 27B and mapped its supported `none`/`default` reasoning effort values.
+
 ## [0.5.1] - 2026-08-04
 
 ## [0.5.0] - 2026-08-03
