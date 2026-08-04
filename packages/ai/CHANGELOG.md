@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Removed the groq `qwen/qwen3-32b` reasoning-effort special case and its test; groq delisted the model, which broke CI catalog regeneration.
+
 ## [0.5.1] - 2026-08-04
 
 ## [0.5.0] - 2026-08-03
