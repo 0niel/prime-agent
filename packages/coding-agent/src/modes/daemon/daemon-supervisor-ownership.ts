@@ -623,7 +623,8 @@ function readOwnerRecordForScope(
 		return owner;
 	}
 	const scope = readOwnerScope(directory);
-	if (!scope && readdirSync(directory).length === 0) {
+	const entries = !scope ? readdirSync(directory) : [];
+	if (!scope && !entries.includes("owner.json") && !entries.includes("scope.json")) {
 		const abandonedDirectory = `${directory}.abandoned-${randomUUID()}`;
 		renameSync(directory, abandonedDirectory);
 		rmSync(abandonedDirectory, { recursive: true, force: true });
