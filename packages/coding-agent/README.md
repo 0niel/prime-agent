@@ -43,13 +43,13 @@ Prime Agent began as a hard fork of [pi-mono](https://github.com/badlogic/pi-mon
 ## Quick Start
 
 ```bash
-curl -fsSL https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/install.sh | sh
+curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
 ```
 
 To install the beta built from the latest commit on `main`:
 
 ```bash
-curl -fsSL https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/install-beta.sh | sh
+curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh -s -- beta
 ```
 
 Authenticate with an API key:
