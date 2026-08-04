@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -240,6 +240,38 @@ describe("AgentSession autonomous mode", () => {
 
 		expect(getUserTexts(harness)).toEqual(["make the change"]);
 		expect(harness.session.getAutonomousStatus().continuationsUsed).toBe(0);
+	});
+
+	it("runs autonomous gates with the environment captured at runtime creation", async () => {
+		const originalPath = process.env.PATH;
+		const originalMarker = process.env.PRIME_AGENT_AUTONOMOUS_GATE_ENV_TEST;
+		try {
+			process.env.PRIME_AGENT_AUTONOMOUS_GATE_ENV_TEST = "captured";
+			const capturedPath = process.env.PATH;
+			const gate = `${process.execPath} -e "console.error(JSON.stringify({path:process.env.PATH,marker:process.env.PRIME_AGENT_AUTONOMOUS_GATE_ENV_TEST})); process.exit(1)"`;
+			const state = createAutonomousRuntimeState({
+				enabled: true,
+				maxContinuations: 1,
+				gates: { commands: [gate], maxRetries: 1 },
+			});
+			process.env.PATH = `/agent-controlled/bin${delimiter}${capturedPath ?? ""}`;
+			process.env.PRIME_AGENT_AUTONOMOUS_GATE_ENV_TEST = "mutated";
+
+			await nextAutonomousContinuation(state, fauxAssistantMessage("Done."), { cwd: process.cwd() });
+
+			expect(state.lastGateFailure?.output).toBe(JSON.stringify({ path: capturedPath, marker: "captured" }));
+		} finally {
+			if (originalPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = originalPath;
+			}
+			if (originalMarker === undefined) {
+				delete process.env.PRIME_AGENT_AUTONOMOUS_GATE_ENV_TEST;
+			} else {
+				process.env.PRIME_AGENT_AUTONOMOUS_GATE_ENV_TEST = originalMarker;
+			}
+		}
 	});
 
 	it("feeds failing autonomous gate output back into the session", async () => {

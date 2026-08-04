@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed autonomous quality gates inheriting environment and PATH changes made after runtime creation.
+
 ## [0.5.1] - 2026-08-04
 
 ### Fixed

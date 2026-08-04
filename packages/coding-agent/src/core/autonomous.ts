@@ -75,6 +75,7 @@ export interface AutonomousRuntimeState {
 	gateAttempts: Record<string, number>;
 	lastGateFailure?: GateFailure;
 	lastGateFailureSnapshot?: GitWorktreeSnapshot;
+	gateEnvironment: NodeJS.ProcessEnv;
 }
 
 export type AutonomousLimitReason = "maxContinuations" | "maxTurns" | "maxTokens" | "timeoutMs";
@@ -129,6 +130,7 @@ export function createAutonomousRuntimeState(
 		gateAttempts: {},
 		lastGateFailure: undefined,
 		lastGateFailureSnapshot: undefined,
+		gateEnvironment: { ...process.env },
 	};
 }
 
@@ -311,6 +313,7 @@ async function runAutonomousQualityGates(
 		}
 		const result = await runChildProcess(command, [], {
 			cwd,
+			env: state.gateEnvironment,
 			shell: true,
 			timeoutMs: state.gates.timeoutMs,
 			maxOutputChars: MAX_GATE_OUTPUT_CHARS,
@@ -483,6 +486,7 @@ function runChildProcess(
 	args: string[],
 	options: {
 		cwd?: string;
+		env?: NodeJS.ProcessEnv;
 		shell?: boolean;
 		timeoutMs?: number;
 		maxOutputChars?: number;
@@ -494,6 +498,7 @@ function runChildProcess(
 		const child = spawn(command, args, {
 			cwd: options.cwd,
 			detached: process.platform !== "win32",
+			env: options.env,
 			shell: options.shell === true,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
