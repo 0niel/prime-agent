@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `/refine` failing with an opaque JSON parse error when the refiner exceeded a fixed 4096-token output cap; output budgets now derive from the selected model, and a truncated reply reports the exhausted budget directly.
+
 ## [0.5.0] - 2026-08-03
 
 ### Breaking Changes
