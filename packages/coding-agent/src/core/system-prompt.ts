@@ -2,7 +2,7 @@
  * System prompt construction and project context loading
  */
 
-import { buildRlmPrompt, buildSubagentGuidance } from "./prompts/index.js";
+import { buildChildAgentDoctrine, buildRlmPrompt, buildSubagentGuidance } from "./prompts/index.js";
 import { formatHarnessStateForPrompt, type HarnessState, REFINE_SKILL_NAME } from "./refinement/index.js";
 import { formatSkillsForPrompt, getPythonSkillRuntimeInfo, type Skill } from "./skills.js";
 
@@ -29,6 +29,8 @@ export interface BuildSystemPromptOptions {
 	allowRecursion?: boolean;
 	/** Fixed recursive-agent depth for this session. */
 	rlmDepth?: number;
+	/** Human-readable parent name or id for child communication doctrine. */
+	rlmParentAgent?: string;
 	/** Global harness state to inject as compact persistent context. */
 	harnessState?: HarnessState;
 }
@@ -64,6 +66,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	const hasIpython = tools.includes("ipython");
 	const hasBash = tools.includes("bash");
 	const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
+	const visiblePythonSkillImportNames = getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName);
 	const hasRefineSkill = visibleSkills.some((skill) => skill.name === REFINE_SKILL_NAME);
 
 	if (customPrompt) {
@@ -89,6 +92,16 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		prompt += `\nCurrent date: ${date}`;
 		prompt += `\nCurrent working directory: ${promptCwd}`;
 
+		const childDoctrine = buildChildAgentDoctrine({
+			depth: options.rlmDepth,
+			parentAgent: options.rlmParentAgent,
+			installedSkills: visiblePythonSkillImportNames,
+			activeTools: tools,
+		});
+		if (childDoctrine) {
+			prompt += `\n\n${childDoctrine}`;
+		}
+
 		if (harnessState) {
 			prompt += `\n\n${formatHarnessStateForPrompt(harnessState, { includeIpythonExamples: hasIpython, includeShellExamples: hasBash, includeRefineExamples: hasIpython && hasRefineSkill })}`;
 		}
@@ -103,10 +116,11 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	let prompt = buildRlmPrompt({
 		cwd: promptCwd,
 		messagesPath: promptMessagesPath,
-		installedSkills: getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName),
+		installedSkills: visiblePythonSkillImportNames,
 		activeTools: tools.filter((name) => name === "ipython" || name === "bash" || name === "edit"),
 		allowRecursion,
 		depth: options.rlmDepth,
+		parentAgent: options.rlmParentAgent,
 	});
 
 	// Appended AFTER the trained buildRlmPrompt prefix, and before the harness-state

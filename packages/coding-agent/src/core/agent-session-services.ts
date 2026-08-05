@@ -73,6 +73,7 @@ export interface AgentSessionCreationOptions {
 	rlmMaxDepth?: number;
 	rlmSessionDir?: string;
 	rlmParentNodeId?: string;
+	rlmParentAgent?: string;
 	subagentRuntimeHost?: SubagentRuntimeHost;
 	rlmHeartbeatController?: AgentRlmHeartbeatController;
 	prewarmIpythonKernel?: boolean;
@@ -273,6 +274,7 @@ export async function createAgentSessionFromServices(
 		rlmMaxDepth: options.rlmMaxDepth,
 		rlmSessionDir: options.rlmSessionDir,
 		rlmParentNodeId: options.rlmParentNodeId,
+		rlmParentAgent: options.rlmParentAgent,
 		subagentRuntimeHost: options.subagentRuntimeHost,
 		rlmHeartbeatController: options.rlmHeartbeatController,
 		sessionStartEvent: options.sessionStartEvent,

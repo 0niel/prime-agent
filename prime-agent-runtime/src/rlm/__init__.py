@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -24,24 +24,12 @@ except Exception:  # pragma: no cover - only available in kernels
 HOST_COMM_TARGET = "host.request"
 
 
-@dataclass
-class TokenUsage:
-    prompt_tokens: int = 0
-    completion_tokens: int = 0
-
-    @property
-    def total(self) -> int:
-        return self.prompt_tokens + self.completion_tokens
-
-
-@dataclass
-class RLMResult:
-    answer: str
-    session_dir: Path | None = None
-    usage: TokenUsage = field(default_factory=TokenUsage)
-    turns: int = 0
-    model: str | None = None
-    warning: str | None = None
+@dataclass(frozen=True)
+class RLMSpawnHandle:
+    rlm_child_id: str
+    name: str
+    session_dir: Path
+    model: str
 
 
 @dataclass(frozen=True)
@@ -76,24 +64,20 @@ def _install_control_comm_handlers() -> None:
     control_handlers.setdefault("comm_close", comm_manager.comm_close)
 
 
-def _result_from_payload(payload: dict[str, Any]) -> RLMResult:
-    usage_payload = payload.get("usage")
-    usage = TokenUsage()
-    if isinstance(usage_payload, dict):
-        usage = TokenUsage(
-            prompt_tokens=int(usage_payload.get("prompt_tokens", 0)),
-            completion_tokens=int(usage_payload.get("completion_tokens", 0)),
-        )
-
-    session_dir_payload = payload.get("session_dir")
-    session_dir = Path(session_dir_payload) if isinstance(session_dir_payload, str) else None
-    return RLMResult(
-        answer=str(payload.get("answer", "")),
-        usage=usage,
-        turns=int(payload.get("turns", 0)),
-        session_dir=session_dir,
-        model=payload.get("model") if isinstance(payload.get("model"), str) else None,
-        warning=payload.get("warning") if isinstance(payload.get("warning"), str) else None,
+def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
+    if not isinstance(payload, dict):
+        raise RuntimeError("rlm.run returned an invalid spawn handle")
+    child_id = payload.get("rlm_child_id")
+    name = payload.get("name")
+    session_dir = payload.get("session_dir")
+    model = payload.get("model")
+    if not all(isinstance(value, str) and value for value in (child_id, name, session_dir, model)):
+        raise RuntimeError("rlm.run returned an invalid spawn handle")
+    return RLMSpawnHandle(
+        rlm_child_id=child_id,
+        name=name,
+        session_dir=Path(session_dir),
+        model=model,
     )
 
 
@@ -156,15 +140,15 @@ async def host_request(request_type: str, payload: dict[str, Any] | None = None)
     return await future
 
 
-async def run(prompt: str, **kwargs: Any) -> RLMResult:
-    """Run a recursive Prime Agent child through the TypeScript host.
+async def run(prompt: str, **kwargs: Any) -> RLMSpawnHandle:
+    """Spawn a recursive Prime Agent child and return once its task is admitted.
 
     ``model`` selects a child with an exact ``provider/model`` selector.
     """
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
     payload = await host_request("rlm.run", {"prompt": prompt, "kwargs": kwargs})
-    return _result_from_payload(payload)
+    return _spawn_handle_from_payload(payload)
 
 
 def _model_from_payload(payload: Any) -> RLMModel:
@@ -301,7 +285,7 @@ class _RLMCallable:
     harness = _harness_state
     get_harness_state = staticmethod(get_harness_state)
 
-    async def run(self, prompt: str, **kwargs: Any) -> RLMResult:
+    async def run(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
         return await run(prompt, **kwargs)
 
     async def find_models(self, query: str = "", limit: int = 8) -> list[RLMModel]:
@@ -313,7 +297,7 @@ class _RLMCallable:
     async def delete_subagent(self, target: str | RLMSubagent) -> RLMSubagent:
         return await delete_subagent(target)
 
-    async def __call__(self, prompt: str, **kwargs: Any) -> RLMResult:
+    async def __call__(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
         return await run(prompt, **kwargs)
 
 
@@ -322,7 +306,7 @@ harness = _harness_state
 
 
 class _CallableModule(types.ModuleType):
-    async def __call__(self, prompt: str, **kwargs: Any) -> RLMResult:
+    async def __call__(self, prompt: str, **kwargs: Any) -> RLMSpawnHandle:
         return await run(prompt, **kwargs)
 
 
@@ -336,10 +320,9 @@ __all__ = [
     "McpToolError",
     "NotEnabled",
     "RLMModel",
-    "RLMResult",
+    "RLMSpawnHandle",
     "RLMSubagent",
     "RefinementEvent",
-    "TokenUsage",
     "delete_subagent",
     "find_models",
     "get_harness_state",

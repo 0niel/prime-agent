@@ -726,8 +726,12 @@ class HarnessState:
             f"Harness state ({self.scope}): {self.file_path}",
             "Call contract: installed Python skills use await <skill_import>(...) or a matching shell CLI; "
             "harness skill entries are Python REPL skills and must include a Python reference plus arguments. "
-            "Subagent specs are invoked by composing a concise task prompt and calling await rlm('sub-task'), "
-            "or asyncio.gather(rlm('task1'), rlm('task2')) for independent parallel subagents.",
+            "Spawn a subagent spec by composing a concise task prompt and calling "
+            "handle = await rlm('sub-task'); admission returns immediately with rlm_child_id, name, session_dir, "
+            "and model, never the child's answer. Results arrive only through explicit agent_message replies or "
+            "files; children reply with await agent_message.send(message, receiver_role='parent'). Use "
+            "await rlm.list_subagents() to recover direct child handles and await agent_message.send(..., "
+            "receiver_role='child', receiver_name=handle.name) for follow-ups.",
         ]
         for kind in _KINDS:
             records = self.list(kind)[:max_entries_per_kind]

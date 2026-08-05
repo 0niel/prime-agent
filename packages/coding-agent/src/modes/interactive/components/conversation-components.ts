@@ -11,11 +11,13 @@ import {
 } from "../../../core/messages.js";
 import { AgentMessageComponent } from "./agent-message.js";
 import { AssistantMessageComponent } from "./assistant-message.js";
+import { BashExecutionComponent } from "./bash-execution.js";
 import {
 	CompactionOutcomeMessageComponent,
 	MalformedCompactionOutcomeMessageComponent,
 } from "./compaction-outcome-message.js";
 import { InjectedPromptMessageComponent, isInjectedPromptMessage } from "./injected-prompt-message.js";
+import { IPythonCellComponent } from "./ipython-cell.js";
 import { SlashCommandMessageComponent } from "./slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./slash-command-result-message.js";
 import {
@@ -36,6 +38,15 @@ export interface ConversationComponentsOptions {
 	hiddenThinkingLabel?: string;
 	toolsExpanded?: boolean;
 	isRecognizedSlashCommand?: (name: string) => boolean;
+}
+
+export function isCompactAgentMessageNeighbor(component: Component | undefined): boolean {
+	return (
+		component instanceof AgentMessageComponent ||
+		component instanceof ToolExecutionComponent ||
+		component instanceof IPythonCellComponent ||
+		component instanceof BashExecutionComponent
+	);
 }
 
 function readUserText(content: string | Array<{ type: string; text?: string }>): string {
@@ -69,7 +80,9 @@ export function buildConversationComponents(
 					options.hiddenThinkingLabel ?? "Thinking...",
 					{
 						expanded,
-						precededByToolActivity: components.at(-1) instanceof ToolExecutionComponent,
+						precededByToolActivity:
+							components.at(-1) instanceof ToolExecutionComponent ||
+							components.at(-1) instanceof AgentMessageComponent,
 					},
 				),
 			);
@@ -124,7 +137,9 @@ export function buildConversationComponents(
 					: new MalformedCompactionOutcomeMessageComponent(),
 			);
 		} else if (isAgentSessionMessage(message) && message.display) {
-			const component = new AgentMessageComponent(message, options.markdownTheme);
+			const component = new AgentMessageComponent(message, options.markdownTheme, {
+				suppressLeadingSpace: isCompactAgentMessageNeighbor(components.at(-1)),
+			});
 			component.setExpanded(expanded);
 			components.push(component);
 		} else if (isInjectedPromptMessage(message) && message.display) {

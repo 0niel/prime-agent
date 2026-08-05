@@ -80,7 +80,7 @@ describe("buildRlmPrompt", () => {
 				"",
 				"Terminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, IPython kernel, and native call interface exposed to the model.",
 				"",
-				"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Continual harness subagent entries are reusable delegation specs; invoke them by turning the spec into a concise task prompt and starting `asyncio.create_task(rlm('sub-task'))` by default, then await the task only when its result is needed, or collect independent subagents with `await asyncio.gather(...)`. Use direct `await rlm('sub-task')` only when the result is immediately required. Do not invent non-native wrappers such as `call_skill(...)`, `run_subagent(...)`, or named subagent registries.",
+				"RLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through explicit `agent_message` replies or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.",
 				"",
 				"Treat continual harness refinement as a small, evidence-backed update after observing a repeated failure or reusable tactic: diagnose the issue, update the smallest relevant continual harness component, validate on the next action, then record the outcome. Use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs, repeated procedures into skills, durable facts/preferences into memories, and narrow behavioral policies into prompt addendums. It returns immediately and runs when the current turn ends, so continue working normally after calling it. Do not rewrite the whole continual harness when a focused memory, skill, prompt note, or subagent spec is enough.",
 			].join("\n"),
@@ -107,12 +107,10 @@ describe("buildRlmPrompt", () => {
 			activeTools: ["ipython"],
 		});
 
-		expect(prompt).toContain("await rlm.find_models('requested model')");
-		expect(prompt).toContain("bounded authenticated catalog");
-		expect(prompt).toContain("exact `provider/model` selector");
-		expect(prompt).toContain("If an `RLMResult.warning` is set");
-		expect(prompt).toContain("tell the user which model actually ran");
-		expect(prompt).toContain("Do not choose a different model on your own");
+		expect(prompt).toContain("await rlm.find_models(...)");
+		expect(prompt).toContain("exact returned selector");
+		expect(prompt).toContain("An unavailable requested model fails spawn");
+		expect(prompt).toContain("decide whether to retry or omit `model`");
 		expect(prompt).not.toContain("model choices for subagents");
 	});
 
@@ -159,7 +157,7 @@ describe("buildRlmPrompt", () => {
 		for (const prompt of [withoutObserve, withObserve]) {
 			expect(prompt).toContain("await rlm.list_subagents()");
 			expect(prompt).toContain("await rlm.delete_subagent(child)");
-			expect(prompt).toContain("automatic child registry");
+			expect(prompt).toContain("recover direct child handles");
 			expect(prompt).not.toContain("Write a small disk registry");
 		}
 	});
@@ -316,10 +314,15 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("When to call `await refine.run()`");
 		expect(prompt).toContain("Call contract: read each installed Python skill's SKILL.md");
 		expect(prompt).toContain("Continual harness skill entries are Python REPL skills");
-		expect(prompt).toContain("Continual harness subagent entries are invoked by composing a concise task prompt");
-		expect(prompt).toContain("asyncio.create_task(rlm('sub-task'))");
-		expect(prompt).toContain("await rlm('sub-task')");
-		expect(prompt).toContain("only when the result is immediately required");
+		expect(prompt).toContain("Spawn a continual harness subagent spec by composing a concise task prompt");
+		expect(prompt).toContain("handle = await rlm('sub-task')");
+		expect(prompt).toContain("admission returns immediately");
+		expect(prompt).toContain("never the child's answer");
+		expect(prompt).toContain("receiver_role='parent'");
+		expect(prompt).toContain("await rlm.list_subagents()");
+		expect(prompt).toContain("receiver_role='child'");
+		expect(prompt).not.toContain("asyncio.create_task(rlm('sub-task'))");
+		expect(prompt).not.toContain("asyncio.gather(rlm('task1'), rlm('task2'))");
 		expect(prompt).toContain("after a repeated failure");
 		expect(prompt).toContain("a reusable tactic emerges");
 		expect(prompt).toContain("a repeated delegation role should become a subagent spec");
@@ -393,89 +396,16 @@ describe("buildSystemPrompt", () => {
 		expect(prompt).toContain("Working directory: /repo");
 		expect(prompt).toContain("Conversation log: /repo/.pi/sessions/session.jsonl");
 		expect(prompt).toContain("await rlm('sub-task')");
-		expect(prompt).toContain("asyncio.gather");
-		expect(prompt).toContain("asyncio.create_task");
-		expect(prompt).toContain("Sub-agents should not block Prime Agent by default");
-		expect(prompt).toContain("Default to non-blocking subagents");
-		expect(prompt).toContain("automatic child registry");
-		expect(prompt).toContain("parent-scoped subagent registry");
-		expect(prompt).toContain("kernel restarts, state restore, and compaction");
+		expect(prompt).toContain("returns at admission, not completion");
+		expect(prompt).toContain("Results arrive only through explicit `agent_message` replies or files");
+		expect(prompt).toContain("recover direct child handles");
+		expect(prompt).toContain("kernel restart or compaction");
 		expect(prompt).toContain("rlm.list_subagents");
 		expect(prompt).toContain("rlm.delete_subagent");
 		expect(prompt).toContain("rlm_child_id");
-		expect(prompt).toContain("active_session_id");
-		expect(prompt).toContain("session_name");
 		expect(prompt).toContain("name='api-reviewer'");
-		expect(prompt).toContain("names must be non-empty and unique");
 		expect(prompt).toContain("session_dir");
-		expect(prompt).toContain("`agent_observe` skill is installed and a registry entry has `active_session_id`");
-		expect(prompt).toContain("agent_observe.get_agent");
-		expect(prompt).toContain("agent_observe.recent_messages");
-		expect(prompt).toContain("Successful subagent sessions remain in that registry");
-		expect(prompt).toContain("current parent session remains open");
-		expect(prompt).toContain("retained children close when their parent session closes");
-		expect(prompt).toContain(
-			"Retain a completed direct child when it may be reused; once it is definitively no longer needed, delete it with `await rlm.delete_subagent(child)`.",
-		);
-		expect(prompt).toContain("agent_message.send");
-		expect(prompt).toContain("agent_message.send(child.session_name");
-		expect(prompt).toContain("readable, unique default `session_name`");
-		expect(prompt).toContain("same child");
-		expect(prompt).not.toContain("disk-backed registry");
-		expect(prompt).toContain("mode='steer'");
-		expect(prompt).toContain("sub-agent work that can run in the background");
-		expect(prompt).toContain("do not block the main execution path");
-		expect(prompt).toContain("keep the task handle");
-		expect(prompt).toContain("normal task callbacks");
-		expect(prompt).toContain("task.done()");
-		expect(prompt).toContain("await task");
-		expect(prompt).toContain("RLMResult.answer");
-		expect(prompt).not.toContain("simple named task dictionary");
-		expect(prompt).not.toContain("rlm_tasks");
-		expect(prompt).not.toContain("globals().setdefault");
-		expect(prompt).not.toContain("rlm.background");
-		expect(prompt).not.toContain("notify='wake'");
-		expect(prompt).not.toContain("notify='silent'");
-		expect(prompt).toContain("IPython is the agent's long-lived notebook");
-		expect(prompt).toContain("yaml (PyYAML)");
-		expect(prompt).toContain("dotenv (python-dotenv)");
-		expect(prompt).toContain("bs4 (Beautiful Soup)");
-		expect(prompt).toContain("Avoid `!cmd` shell escapes for project commands");
-		expect(prompt).toContain("Each `%%bash` cell runs in a throw-away subshell");
-		expect(prompt).toContain("Python state in the kernel, by contrast, persists across cells");
-		expect(prompt).toContain("Continual harness state is available as `rlm.harness`");
-		expect(prompt).toContain("CRUD calls are local to this Prime Agent session by default");
-		expect(prompt).toContain("global_=True");
-		expect(prompt).toContain("rlm.harness.create_memory");
-		expect(prompt).toContain("rlm.harness.update_skill");
-		expect(prompt).toContain("rlm.harness.delete_subagent");
-		expect(prompt).toContain("rlm.harness.create_prompt_note");
-		expect(prompt).not.toContain("rlm.harness.upsert_skill");
-		expect(prompt).toContain("rlm.harness.record_refinement");
-		expect(prompt).toContain("continual harness names the persisted prompt");
-		expect(prompt).toContain("RLM-native call contract: installed Python skills are pre-imported modules");
-		expect(prompt).toContain("await <skill_import>.<function>(...)");
-		expect(prompt).toContain("Python `reference` and `arguments` contract");
-		expect(prompt).toContain("await asyncio.gather(rlm('task1'), rlm('task2'))");
-		expect(prompt).toContain(
-			"Use `await refine.run()` to turn repeated delegation patterns into reusable subagent specs",
-		);
-		expect(prompt).toContain("repeated procedures into skills");
-		expect(prompt).toContain("durable facts/preferences into memories");
-		expect(prompt).toContain("narrow behavioral policies into prompt addendums");
-		expect(prompt).toContain("call_skill(...)");
-		expect(prompt).toContain("run_subagent(...)");
-		expect(prompt).toContain("named subagent registries");
-		expect(prompt).toContain("Do not assume IPython is the native runtime");
-		expect(prompt).toContain("do not install dependencies into the IPython kernel");
-		expect(prompt).toContain("run it through that project's own environment");
-		expect(prompt).not.toContain("!cd build && make");
-		expect(prompt).not.toContain("out = !cmd");
-		expect(prompt).not.toContain("Call at most one built-in tool per turn.");
-		expect(prompt).not.toContain("# IPython Kernel Guidance");
-		expect(prompt).not.toContain("Available tools:");
-		expect(prompt).not.toContain("## Worked example:");
-		expect(prompt).not.toContain("## Anti-patterns");
+		expect(prompt).toContain("agent_observe");
 	});
 
 	test("omits ipython-only subagent guidance when ipython is inactive", () => {
@@ -616,6 +546,38 @@ describe("buildSystemPrompt", () => {
 		);
 		expect(prompt.indexOf("Current working directory: /repo")).toBeLessThan(prompt.indexOf("custom append"));
 		expect(prompt.indexOf("# Continual Harness State")).toBeLessThan(prompt.indexOf("custom append"));
+	});
+
+	test("adds child reply doctrine to custom prompts when messaging is available", () => {
+		const prompt = buildSystemPrompt({
+			customPrompt: "custom body",
+			selectedTools: ["ipython"],
+			contextFiles: [],
+			skills: [pythonSkill("agent-message")],
+			cwd: "/repo",
+			rlmDepth: 1,
+			rlmParentAgent: "orchestrator",
+		});
+
+		expect(prompt).toContain("You are a child agent spawned by orchestrator");
+		expect(prompt).toContain('await agent_message.send(message, receiver_role="parent")');
+		expect(prompt).not.toContain("You are a general purpose agent that uses code to solve tasks.");
+	});
+
+	test("gates custom-prompt child reply doctrine on IPython and agent messaging", () => {
+		const build = (selectedTools: string[], skills: Skill[]) =>
+			buildSystemPrompt({
+				customPrompt: "custom body",
+				selectedTools,
+				contextFiles: [],
+				skills,
+				cwd: "/repo",
+				rlmDepth: 1,
+			});
+
+		expect(build(["ipython"], [])).toContain("You are a child agent spawned by your parent agent");
+		expect(build(["ipython"], [])).not.toContain("agent_message.send");
+		expect(build(["bash"], [pythonSkill("agent-message")])).not.toContain("agent_message.send");
 	});
 
 	test("append system prompt content is included after the rlm harness prompt", () => {

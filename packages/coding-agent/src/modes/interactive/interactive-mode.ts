@@ -180,6 +180,7 @@ import {
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
+import { isCompactAgentMessageNeighbor } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { CustomMessageComponent } from "./components/custom-message.js";
@@ -5318,7 +5319,9 @@ export class InteractiveMode {
 					// client's pane, never in this window's chat.
 					break;
 				}
-				const component = new BashExecutionComponent(event.command, this.ui, event.excludeFromContext);
+				const component = new BashExecutionComponent(event.command, this.ui, event.excludeFromContext, {
+					suppressLeadingSpace: this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
+				});
 				if (ownSideBash && this.sideQuestionComponent) {
 					// Same component as the main thread, mounted inside the pane.
 					this.sideQuestionComponent.addBash(component);
@@ -5645,7 +5648,9 @@ export class InteractiveMode {
 			this.hiddenThinkingLabel,
 			{
 				expanded: this.toolOutputExpanded,
-				precededByToolActivity: this.chatContainer.children.at(-1) instanceof ToolExecutionComponent,
+				precededByToolActivity:
+					this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
+					this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
 			},
 		);
 		this.streamingMessage = message;
@@ -6151,7 +6156,9 @@ export class InteractiveMode {
 	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
 		switch (message.role) {
 			case "bashExecution": {
-				const component = new BashExecutionComponent(message.command, this.ui, message.excludeFromContext);
+				const component = new BashExecutionComponent(message.command, this.ui, message.excludeFromContext, {
+					suppressLeadingSpace: this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
+				});
 				if (message.output) {
 					component.appendOutput(message.output);
 				}
@@ -6183,7 +6190,11 @@ export class InteractiveMode {
 									: message.customType === COMPACTION_OUTCOME_CUSTOM_TYPE
 										? new MalformedCompactionOutcomeMessageComponent()
 										: isAgentSessionMessage(message)
-											? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings())
+											? new AgentMessageComponent(message, this.getMarkdownThemeWithSettings(), {
+													suppressLeadingSpace: isCompactAgentMessageNeighbor(
+														this.chatContainer.children.at(-1),
+													),
+												})
 											: isInjectedPromptMessage(message)
 												? new InjectedPromptMessageComponent(message, this.getMarkdownThemeWithSettings())
 												: new CustomMessageComponent(
@@ -6279,7 +6290,9 @@ export class InteractiveMode {
 					this.hiddenThinkingLabel,
 					{
 						expanded: this.toolOutputExpanded,
-						precededByToolActivity: this.chatContainer.children.at(-1) instanceof ToolExecutionComponent,
+						precededByToolActivity:
+							this.chatContainer.children.at(-1) instanceof ToolExecutionComponent ||
+							this.chatContainer.children.at(-1) instanceof AgentMessageComponent,
 					},
 				);
 				this.chatContainer.addChild(assistantComponent);

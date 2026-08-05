@@ -145,6 +145,7 @@ export interface KernelSentAgentMessage {
 	id: string;
 	message: string;
 	deliveryStatus: "delivered" | "queued";
+	receiverRole?: "parent" | "sibling" | "child";
 	target: {
 		activeSessionId: string;
 		sessionId: string;
@@ -204,7 +205,7 @@ function parseSentAgentMessage(payload: unknown): KernelSentAgentMessage | undef
 	if (!isRecord(payload) || !isRecord(payload.target)) {
 		return undefined;
 	}
-	const { id, message, deliveryStatus, target } = payload;
+	const { id, message, deliveryStatus, receiverRole, target } = payload;
 	const { activeSessionId, sessionId, sessionName } = target;
 	if (
 		typeof id !== "string" ||
@@ -219,6 +220,7 @@ function parseSentAgentMessage(payload: unknown): KernelSentAgentMessage | undef
 		id,
 		message,
 		deliveryStatus,
+		...(receiverRole === "parent" || receiverRole === "sibling" || receiverRole === "child" ? { receiverRole } : {}),
 		target: {
 			activeSessionId,
 			sessionId,

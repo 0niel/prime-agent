@@ -23,11 +23,11 @@ flowchart TD
 When the model delegates work:
 
 ```python
-result = await rlm("inspect the API", name="api-reviewer")
-print(result.answer)
+handle = await rlm("inspect the API", name="api-reviewer")
+print(handle.rlm_child_id, handle.name, handle.session_dir, handle.model)
 ```
 
-the call travels through a Jupyter comm target named `host.request`. `KernelManager` dispatches request type `rlm.run` to the parent `AgentSession`, which starts a child through the same TypeScript agent machinery as the parent. The final answer and usage return over the comm as an `RLMResult`.
+the call travels through a Jupyter comm target named `host.request`. `KernelManager` dispatches request type `rlm.run` to the parent `AgentSession`, which starts a child through the same TypeScript agent machinery as the parent. The call returns over the comm immediately after task admission with a child handle; it never waits for or returns the child's answer. Results arrive only through explicit `agent_message` replies or files.
 
 The same bridge supports other typed host requests. Bundled Python skills such as `goal` call `rlm.host_request("goal.get", ...)`; state and policy remain in the TypeScript host.
 
@@ -45,16 +45,18 @@ sequenceDiagram
     H->>K: execute await rlm("inspect the API")
     K->>H: host.request · rlm.run
     H->>H: check depth and resolve model
+    H->>H: admit child task and update registry
+    H-->>K: RLMSpawnHandle
+    K-->>H: tool output
+    H-->>M: IPython result
     H->>C: create child runtime and prompt
     loop Child agent loop
         C->>P: stream model request
         P-->>C: response or tool call
     end
-    C-->>H: final answer and usage
+    C-->>H: explicit agent_message reply
+    H-->>M: ordinary agent message
     H->>H: update registry and attribute usage
-    H-->>K: RLMResult
-    K-->>H: tool output
-    H-->>M: IPython result
 ```
 
 ## Component Ownership
@@ -64,8 +66,8 @@ sequenceDiagram
 | `src/core/kernel/index.ts` | ZeroMQ sockets, Jupyter framing, execution, comm dispatch, interrupt, and shutdown. |
 | `src/core/tools/ipython.ts` | Agent tool wrapper, lazy kernel provisioning, namespace bootstrap, and output shaping. |
 | `src/core/agent-session.ts` | RLM policy, child creation, registry, usage attribution, cancellation, and goal handlers. |
-| `src/core/rlm-runtime.ts` | Typed request/result validation for `rlm.run`, model discovery, list, and delete. |
-| `prime-agent-runtime/src/rlm/` | Python shim, result types, callable `rlm`, and session-backed harness state. |
+| `src/core/rlm-runtime.ts` | Typed request/spawn-handle validation for `rlm.run`, model discovery, list, and delete. |
+| `prime-agent-runtime/src/rlm/` | Python shim, handle types, callable `rlm`, and session-backed harness state. |
 
 The Python side does not call providers or implement an agent loop.
 
@@ -108,17 +110,17 @@ JSON frames are signed with HMAC-SHA256. Ordinary output is accepted only when `
 
 Calls to `KernelManager.execute()` are serialized. One kernel has one shared namespace and does not run two ordinary IPython cells concurrently. RLM child agents can still run concurrently because each delegation uses a distinct comm and child runtime.
 
-## Why Replies Use the Control Channel
+## Why Host-Request Responses Use the Control Channel
 
-A running cell can await a host request:
+A running cell can await task admission:
 
 ```python
-await rlm("subtask")
+handle = await rlm("subtask")
 ```
 
-IPython processes shell messages serially. Sending the reply on the shell channel would deadlock: the active `execute_request` cannot finish until the reply arrives, while the kernel will not process that shell reply until the request finishes.
+IPython processes shell messages serially. Sending the admission response on the shell channel would deadlock: the active `execute_request` cannot finish until the response arrives, while the kernel will not process that shell response until the request finishes.
 
-The Python shim therefore registers comm handlers on the control channel, and the host sends replies there. Future completion is scheduled with `loop.call_soon_threadsafe()` because the control handler may run on another thread.
+The Python shim therefore registers comm handlers on the control channel, and the host sends admission responses there. Future completion is scheduled with `loop.call_soon_threadsafe()` because the control handler may run on another thread. Child answers do not use this response path; they arrive later through explicit `agent_message` replies or files.
 
 ## Python API
 
@@ -131,7 +133,7 @@ find_models(query: str = "", limit: int = 8)
 list_subagents()
 delete_subagent(selector)
 host_request(request_type: str, payload: dict | None = None)
-RLMResult
+RLMSpawnHandle
 RLMModel
 RLMSubagent
 TokenUsage
@@ -144,14 +146,14 @@ await rlm("subtask")
 await rlm.run("subtask")
 ```
 
-`RLMResult` contains the final answer, token usage, assistant-turn count, child session directory, exact selected model, and an optional fallback warning.
+`RLMSpawnHandle` contains `rlm_child_id`, `name`, `session_dir`, and `model`. It confirms admission only and never contains the child's answer.
 
 Supported `rlm.run` options are:
 
 - `name`: a unique readable child session name; and
 - `model`: an exact `provider/model` selector from `rlm.find_models()`.
 
-Unknown options fail instead of being ignored. Model search is bounded to active, non-expired credentials. If an exact selection is unavailable or fails auth preflight, the child falls back to the parent model and returns the actual model plus a warning that the parent must surface.
+Unknown options fail instead of being ignored. Model search is bounded to active, non-expired credentials. If an exact selection is unavailable or fails auth preflight, spawn fails instead of silently falling back to another model. A child otherwise inherits the parent model.
 
 ## Child Execution
 
@@ -160,32 +162,25 @@ Unknown options fail instead of being ignored. Model search is bounded to active
 1. Check `RLM_DEPTH < RLM_MAX_DEPTH`.
 2. Resolve the requested model or inherit the parent model.
 3. Create a `sub-xxxxxxxx` child directory under the parent artifact directory.
-4. Create a child `SessionManager`, `Agent`, and `AgentSession`.
-5. Reuse provider hooks, resource loader, model registry, tools, transport, retry settings, and thinking configuration.
-6. Start `child.prompt()` and wait for the child to become idle.
-7. Return the final assistant text and usage.
+4. Admit the task into the parent registry and return its `RLMSpawnHandle`.
+5. In detached work, create a child `SessionManager`, `Agent`, and `AgentSession`.
+6. Reuse provider hooks, resource loader, model registry, tools, transport, retry settings, and thinking configuration.
+7. Run the child prompt, retain its session, and update lifecycle state independently of the admission call.
 8. Attribute child usage to the parent assistant turn and persist the attribution.
 
 Children receive incremented `RLM_DEPTH`, the inherited maximum depth, and their own `RLM_SESSION_DIR`. The default maximum depth is 1, so root sessions may create children and those children may not create grandchildren unless the limit is configured higher.
 
-## Parallel and Background Delegation
+## Independent Delegation
 
-Normal Python async patterns provide concurrency:
+Each direct call admits an independent child and returns its handle immediately:
 
 ```python
-import asyncio
-
-task = asyncio.create_task(rlm("slow independent audit"))
-
-results = await asyncio.gather(
-    rlm("review the API"),
-    rlm("review the tests"),
-)
-
-background_result = await task
+api_review = await rlm("review the API", name="api-reviewer")
+test_review = await rlm("review the tests", name="test-reviewer")
+audit = await rlm("slow independent audit", name="audit-reviewer")
 ```
 
-The root kernel still executes one cell. Each `rlm` call opens a separate comm, and the host starts an independent child `AgentSession`. Daemon-backed children can be retained as independently addressable session workers.
+End the turn instead of waiting for completion. Children send requested answers with `await agent_message.send(message, receiver_role="parent")`, and replies arrive as ordinary agent messages over later turns. A child may instead write results to files for the parent to read. The host runs each admitted child as an independent `AgentSession`; daemon-backed children can be retained as independently addressable session workers.
 
 ## Parent-Scoped Sub-Agent Registry
 
@@ -193,13 +188,13 @@ The TypeScript parent maintains the authoritative direct-child registry. `await 
 
 This registry survives kernel restart, compaction, and parent restore. Successfully completed daemon-backed children are rehydrated from the parent artifact registry. Inline children remain inspectable in the current process but have no active-session ID.
 
-The parent can continue a retained daemon child with agent messaging. `rlm.delete_subagent()` accepts an exact child ID, active-session ID, session ID, or unique name. Deletion cancels or closes the runtime, writes a durable tombstone, and removes the child from messaging and observation. It does not erase the transcript or artifacts on disk.
+The parent can continue a retained daemon child with `await agent_message.send(..., receiver_role="child", receiver_name=child.session_name)`. `rlm.delete_subagent()` accepts an exact child ID, active-session ID, session ID, or unique name. Deletion cancels or closes the runtime, writes a durable tombstone, and removes the child from messaging and observation. It does not erase the transcript or artifacts on disk.
 
 Registry scope follows the parent transcript. An unrelated new parent session does not inherit children.
 
 ## Usage and Cost Attribution
 
-`RLMResult.usage` reports the child's own aggregate prompt and completion tokens. Prime Agent also folds the child's assistant usage and cost into the parent assistant turn that launched it.
+The admission handle does not contain usage or completion data. Prime Agent asynchronously folds the child's assistant usage and cost into the parent assistant turn that launched it.
 
 The parent transcript persists a `child_usage_attributed` entry containing:
 
@@ -264,7 +259,7 @@ Provider credentials are resolved by the TypeScript host. The bounded model cata
 | Managed runtime is missing | Kernel bootstrap rebuilds it; a custom Python without `rlm` fails clearly when recursion is called. |
 | Depth limit reached | Python raises before opening a comm; the host checks again. |
 | Unsupported options | Host rejects the request. |
-| Requested model unavailable | Child uses the parent model and returns a warning. |
+| Requested model unavailable | Spawn fails instead of substituting another model. |
 | Shell-channel comm reply | Deadlock risk; current replies use control. |
 | Child cancellation | Host aborts the child and removes failed/cancelled registry entries. |
 | Parent teardown | Active descendants are cancelled and their runtimes are closed. |

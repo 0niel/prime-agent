@@ -11,12 +11,7 @@ import { flushAgentTraceUpload } from "./agent-traces.js";
 import { isNoModelsAvailableMessage } from "./auth-guidance.js";
 import type { ReplacedSessionContext, SessionShutdownEvent, SessionStartEvent } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
-import type {
-	CreateRlmSubagentRuntimeOptions,
-	RlmSubagentReleaseStatus,
-	RlmSubagentRuntime,
-	SubagentRuntimeHost,
-} from "./rlm-runtime.js";
+import type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
 import type { CreateAgentSessionResult } from "./sdk.js";
 import { assertSessionCwdExists } from "./session-cwd.js";
 import { SessionImportFileNotFoundError } from "./session-import-errors.js";
@@ -62,6 +57,8 @@ export interface AgentSessionRuntimeMetadata {
 	parentSessionFile?: string;
 	rlmChildId?: string;
 	rlmParentNodeId?: string;
+	/** Runtime restored from an already-persisted completed registry entry. */
+	rehydratedCompleted?: boolean;
 	prompt?: string;
 	/** Source of the IPython cell that spawned this subagent, for display. */
 	spawnCode?: string;
@@ -102,7 +99,10 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		private _diagnostics: AgentSessionRuntimeDiagnostic[] = [],
 		private _modelFallbackMessage?: string,
 		private readonly sessionConfig?: AgentSessionRuntimeConfig,
-		private readonly _metadata: AgentSessionRuntimeMetadata = { kind: "top-level", createdAt: Date.now() },
+		private readonly _metadata: AgentSessionRuntimeMetadata = {
+			kind: "top-level",
+			createdAt: Date.now(),
+		},
 		private _sessionLease?: SessionLease,
 	) {
 		this.bindRuntimeHost();
@@ -258,15 +258,6 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		this._sessionLease = undefined;
 	}
 
-	private transferSessionLeaseToSession(): void {
-		const lease = this._sessionLease;
-		if (!lease) {
-			return;
-		}
-		this._sessionLease = undefined;
-		this.session.registerDisposeCallback(() => lease.release());
-	}
-
 	private commitReplacementLease(lease: SessionLease | undefined): void {
 		if (lease === this._sessionLease) {
 			return;
@@ -370,6 +361,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 					rlmMaxDepth: options.rlmMaxDepth,
 					rlmSessionDir: options.sessionDir,
 					rlmParentNodeId: options.rlmParentNodeId,
+					rlmParentAgent: options.parentSession.sessionName ?? options.parentSession.sessionId,
 				},
 				runtimeMetadata: {
 					kind: "subagent",
@@ -419,36 +411,6 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		}
 	}
 
-	async releaseRlmSubagentRuntime(
-		runtime: RlmSubagentRuntime,
-		options: CreateRlmSubagentRuntimeOptions,
-		status: RlmSubagentReleaseStatus,
-	): Promise<void> {
-		const tracked = this.subagentRuntimes.get(options.id);
-		if (tracked === runtime) {
-			this.subagentRuntimes.delete(options.id);
-		}
-		// Keep a successful run's session readable via the parent's inspector (disposed
-		// with the parent); errored/cancelled runs have nothing to show, so dispose now.
-		if (status === "done") {
-			// Flush traces now since the runtime's own shutdown path is skipped while retained.
-			await flushAgentTraceUpload(runtime.session.sessionManager).catch(() => undefined);
-			if (runtime instanceof AgentSessionRuntime) {
-				runtime.transferSessionLeaseToSession();
-			}
-			// Retention can decline if the parent is already tearing down; if so, fall
-			// through and dispose the runtime instead of leaving it dangling.
-			if (options.parentSession.retainFinishedRlmChildSession(options.id, runtime.session)) {
-				return;
-			}
-		}
-		if (runtime instanceof AgentSessionRuntime) {
-			await runtime.dispose();
-		} else {
-			runtime.session.dispose();
-		}
-	}
-
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
 		if (this.rebindSession) {
 			await this.rebindSession(this.session);
@@ -463,7 +425,10 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 	async switchSession(
 		sessionPath: string,
-		options?: { cwdOverride?: string; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+		options?: {
+			cwdOverride?: string;
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+		},
 	): Promise<{ cancelled: boolean }> {
 		const beforeResult = await this.emitBeforeSwitch("resume", sessionPath);
 		if (beforeResult.cancelled) {
@@ -488,7 +453,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 						cwd: sessionManager.getCwd(),
 						agentDir: this.services.agentDir,
 						sessionManager,
-						sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+						sessionStartEvent: {
+							type: "session_start",
+							reason: "resume",
+							previousSessionFile,
+						},
 						sessionConfig: this.sessionConfig,
 					}),
 				),
@@ -527,7 +496,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 						cwd: this.cwd,
 						agentDir: this.services.agentDir,
 						sessionManager,
-						sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
+						sessionStartEvent: {
+							type: "session_start",
+							reason: "new",
+							previousSessionFile,
+						},
 						sessionConfig: this.sessionConfig,
 					}),
 				),
@@ -543,7 +516,10 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 	async fork(
 		entryId: string,
-		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+		options?: {
+			position?: "before" | "at";
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+		},
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
 		const position = options?.position ?? "before";
 		const beforeResult = await this.emitBeforeFork(entryId, { position });
@@ -591,7 +567,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 								cwd: this.cwd,
 								agentDir: this.services.agentDir,
 								sessionManager,
-								sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+								sessionStartEvent: {
+									type: "session_start",
+									reason: "fork",
+									previousSessionFile,
+								},
 								sessionConfig: this.sessionConfig,
 							}),
 						),
@@ -616,7 +596,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 							cwd: sessionManager.getCwd(),
 							agentDir: this.services.agentDir,
 							sessionManager,
-							sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+							sessionStartEvent: {
+								type: "session_start",
+								reason: "fork",
+								previousSessionFile,
+							},
 							sessionConfig: this.sessionConfig,
 						}),
 					),
@@ -645,7 +629,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 						cwd: this.cwd,
 						agentDir: this.services.agentDir,
 						sessionManager,
-						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+						sessionStartEvent: {
+							type: "session_start",
+							reason: "fork",
+							previousSessionFile,
+						},
 						sessionConfig: this.sessionConfig,
 					}),
 				),
@@ -701,7 +689,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 						cwd: sessionManager.getCwd(),
 						agentDir: this.services.agentDir,
 						sessionManager,
-						sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+						sessionStartEvent: {
+							type: "session_start",
+							reason: "resume",
+							previousSessionFile,
+						},
 						sessionConfig: this.sessionConfig,
 					}),
 				),

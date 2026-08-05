@@ -44,11 +44,12 @@ describe("ENG-4649 subagent model selection", () => {
 				model: `${provider}/model-319`,
 			});
 
-			const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
-			const child = harness.session.getRlmChildSession(childEntry!.rlm_child_id);
-			expect(child?.model?.id).toBe("model-319");
 			expect(result.model).toBe(`${provider}/model-319`);
-			expect(result.warning).toBeUndefined();
+			await vi.waitFor(async () => {
+				const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
+				expect(childEntry?.status).toBe("completed");
+				expect(harness.session.getRlmChildSession(childEntry!.rlm_child_id)?.model?.id).toBe("model-319");
+			});
 		} finally {
 			harness.cleanup();
 		}
@@ -95,12 +96,14 @@ describe("ENG-4649 subagent model selection", () => {
 				}),
 			);
 
-			harness.setResponses([fauxAssistantMessage("parent fallback answer")]);
-			const result = await harness.session.runRlmChild("reject unsupported account model", {
-				model: `${codexProvider}/unsupported-model`,
-			});
-			expect(result.model).toBe(`${codexProvider}/parent-model`);
-			expect(result.warning).toContain(`not "${codexProvider}/unsupported-model"`);
+			await expect(
+				harness.session.runRlmChild("reject unsupported account model", {
+					model: `${codexProvider}/unsupported-model`,
+				}),
+			).rejects.toThrow(
+				`Requested subagent model "${codexProvider}/unsupported-model" is unavailable, unauthenticated, or expired`,
+			);
+			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
 		} finally {
 			vi.unstubAllGlobals();
 			harness.cleanup();
@@ -177,11 +180,10 @@ describe("ENG-4649 subagent model selection", () => {
 			const result = await harness.session.runRlmChild("keep the parent model", {
 				model: `${codexProvider}/parent-model`,
 			});
-			expect(result).toMatchObject({
-				answer: "same parent answer",
-				model: `${codexProvider}/parent-model`,
+			expect(result.model).toBe(`${codexProvider}/parent-model`);
+			await vi.waitFor(async () => {
+				expect((await harness.session.listRlmSubagents()).subagents[0]?.status).toBe("completed");
 			});
-			expect(result.warning).toBeUndefined();
 		} finally {
 			vi.unstubAllGlobals();
 			harness.cleanup();
@@ -218,7 +220,7 @@ describe("ENG-4649 subagent model selection", () => {
 			harness.session.dispose();
 			releasePreflight();
 
-			await expect(run).rejects.toThrow("parent session has been disposed");
+			await expect(run).rejects.toThrow("Cannot spawn a subagent after its parent was disposed");
 			expect(providerCalls).toBe(0);
 			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
 		} finally {
@@ -239,7 +241,7 @@ describe("ENG-4649 subagent model selection", () => {
 			await expect(harness.session.runRlmChild("second task", { name: "shared-reviewer" })).rejects.toThrow(
 				'Agent name "shared-reviewer" is unavailable: an agent of that name already exists at depth 1 under this parent',
 			);
-			await expect(first).resolves.toMatchObject({ answer: "first child answer" });
+			await expect(first).resolves.toMatchObject({ name: "shared-reviewer" });
 		} finally {
 			harness.cleanup();
 		}
@@ -273,8 +275,10 @@ describe("ENG-4649 subagent model selection", () => {
 				name: "api-reviewer",
 				model: `${provider}/child-model`,
 			});
+			await vi.waitFor(async () => {
+				expect((await harness.session.listRlmSubagents()).subagents[0]?.status).toBe("completed");
+			});
 			const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
-			expect(childEntry?.status).toBe("completed");
 			const child = harness.session.getRlmChildSession(childEntry!.rlm_child_id);
 			expect(child?.model?.id).toBe("child-model");
 			expect(child?.thinkingLevel).toBe("off");
@@ -283,7 +287,6 @@ describe("ENG-4649 subagent model selection", () => {
 			await child!.prompt("check the follow-up", { expandPromptTemplates: false, source: "extension" });
 			await child!.agent.waitForIdle();
 
-			expect(result.answer).toBe("initial child answer");
 			expect(seenModels).toEqual(["child-model", "child-model"]);
 			expect(child?.model?.id).toBe("child-model");
 			expect(result.session_dir).not.toBeNull();
@@ -313,7 +316,7 @@ describe("ENG-4649 subagent model selection", () => {
 			]);
 
 			await harness.session.runRlmChild("inherit the model");
-			expect(seenModel).toBe("parent-model");
+			await vi.waitFor(() => expect(seenModel).toBe("parent-model"));
 		} finally {
 			harness.cleanup();
 		}
@@ -336,13 +339,12 @@ describe("ENG-4649 subagent model selection", () => {
 			authPreflight.mockRestore();
 
 			expect(result.model).toBe(`${provider}/child-model`);
-			expect(result.warning).toBeUndefined();
 		} finally {
 			harness.cleanup();
 		}
 	});
 
-	it("falls back to the parent model and returns a user-facing warning", async () => {
+	it("rejects unavailable requested models at admission without fallback", async () => {
 		const harness = await createHarness({
 			provider,
 			models: [{ id: "parent-model" }, { id: "child-model" }],
@@ -351,51 +353,30 @@ describe("ENG-4649 subagent model selection", () => {
 			await expect(harness.session.runRlmChild("bad type", { model: 42 })).rejects.toThrow(
 				"rlm.run model must be a string",
 			);
-			harness.setResponses([
-				fauxAssistantMessage("unknown fallback"),
-				fauxAssistantMessage("unauthenticated fallback"),
-				fauxAssistantMessage("unavailable fallback"),
-				fauxAssistantMessage("preflight fallback"),
-			]);
-
-			const unknown = await harness.session.runRlmChild("unknown model", {
-				model: `${provider}/missing-model`,
-			});
-			expect(unknown.model).toBe(`${provider}/parent-model`);
-			expect(unknown.warning).toContain(`not "${provider}/missing-model"`);
-			expect(unknown.warning).toContain("Tell the user");
-
-			const unauthenticated = await harness.session.runRlmChild("unauthenticated provider", {
-				model: "not-authed/missing-model",
-			});
-			expect(unauthenticated.model).toBe(`${provider}/parent-model`);
-			expect(unauthenticated.warning).toContain("unauthenticated");
+			await expect(
+				harness.session.runRlmChild("unknown model", { model: `${provider}/missing-model` }),
+			).rejects.toThrow("is unavailable, unauthenticated, or expired");
+			await expect(
+				harness.session.runRlmChild("unauthenticated provider", { model: "not-authed/missing-model" }),
+			).rejects.toThrow("is unavailable, unauthenticated, or expired");
 
 			const availability = vi
 				.spyOn(harness.session.modelRegistry, "getAvailable")
 				.mockReturnValue([harness.getModel("parent-model")!]);
-			const unavailable = await harness.session.runRlmChild("unavailable model", {
-				model: `${provider}/child-model`,
-			});
+			await expect(
+				harness.session.runRlmChild("unavailable model", { model: `${provider}/child-model` }),
+			).rejects.toThrow("is unavailable, unauthenticated, or expired");
 			availability.mockRestore();
-
-			expect(unavailable.model).toBe(`${provider}/parent-model`);
-			expect(unavailable.warning).toContain(`not "${provider}/child-model"`);
 
 			const authPreflight = vi
 				.spyOn(harness.session.modelRegistry, "getApiKeyAndHeaders")
 				.mockResolvedValueOnce({ ok: false, error: "token expired" });
-			const failedPreflight = await harness.session.runRlmChild("failed auth preflight", {
-				model: `${provider}/child-model`,
-			});
+			await expect(
+				harness.session.runRlmChild("failed auth preflight", { model: `${provider}/child-model` }),
+			).rejects.toThrow("failed authentication preflight");
 			authPreflight.mockRestore();
-			expect(failedPreflight.model).toBe(`${provider}/parent-model`);
-			expect(failedPreflight.warning).toContain("failed authentication preflight");
 
-			expect((await harness.session.listRlmSubagents()).subagents).toHaveLength(4);
-			for (const child of (await harness.session.listRlmSubagents()).subagents) {
-				expect(harness.session.getRlmChildSession(child.rlm_child_id)?.model?.id).toBe("parent-model");
-			}
+			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
 		} finally {
 			harness.cleanup();
 		}

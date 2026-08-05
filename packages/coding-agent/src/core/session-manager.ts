@@ -172,6 +172,7 @@ export interface ChildUsageAttributionEntry extends SessionEntryBase {
 	targetId: string;
 	childUsage: Usage;
 	aggregateUsage: Usage;
+	origin?: "spawn_task" | "agent_message" | "direct_user";
 }
 
 /** Label entry for user-defined bookmarks/markers on entries. */
@@ -1583,7 +1584,12 @@ export class SessionManager {
 	}
 
 	/** Append an RLM child usage attribution and update the parent assistant aggregate in memory. */
-	appendChildUsageAttribution(targetId: string, childUsage: Usage, aggregateUsage: Usage): string {
+	appendChildUsageAttribution(
+		targetId: string,
+		childUsage: Usage,
+		aggregateUsage: Usage,
+		origin?: ChildUsageAttributionEntry["origin"],
+	): string {
 		const target = this.byId.get(targetId);
 		if (target?.type !== "message" || target.message.role !== "assistant") {
 			throw new Error(`Assistant message entry ${targetId} not found`);
@@ -1598,6 +1604,7 @@ export class SessionManager {
 			targetId,
 			childUsage: cloneUsage(childUsage),
 			aggregateUsage: cloneUsage(aggregateUsage),
+			...(origin ? { origin } : {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;

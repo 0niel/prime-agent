@@ -701,6 +701,7 @@ export function resolveRuntimeSessionOptions(
 		rlmMaxDepth: runtimeSessionOptions?.rlmMaxDepth,
 		rlmSessionDir: runtimeSessionOptions?.rlmSessionDir,
 		rlmParentNodeId: runtimeSessionOptions?.rlmParentNodeId,
+		rlmParentAgent: runtimeSessionOptions?.rlmParentAgent,
 		subagentRuntimeHost: runtimeSessionOptions?.subagentRuntimeHost,
 	};
 }

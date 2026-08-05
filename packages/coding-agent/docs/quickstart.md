@@ -77,7 +77,7 @@ Prime Agent runs in your current working directory and can modify files there. U
 
 ## Recursive Subagents
 
-Recursive subagents are a built-in Prime Agent capability. The model can delegate independent work from IPython with `await rlm("subtask")`, run several children with `asyncio.gather(...)`, or start background work with `asyncio.create_task(...)`. Child agents use the same TypeScript agent runtime, providers, tools, skills, and session machinery as the parent.
+Recursive subagents are a built-in Prime Agent capability. The model spawns independent work from IPython with `await rlm("subtask")`; each call returns at admission with a child handle and never returns the answer. Children send requested results as explicit `agent_message` replies to the parent or write them to files. Child agents use the same TypeScript agent runtime, providers, tools, skills, and session machinery as the parent.
 
 You can prompt the model to use that capability directly:
 

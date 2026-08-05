@@ -375,6 +375,47 @@ describe("AgentSessionRuntime characterization", () => {
 		expect((runtime as unknown as RuntimeSubagentMapAccess).subagentRuntimes.has("cancelled-child")).toBe(false);
 	});
 
+	it("releases a failed child run from the inline runtime host", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		const deleteRlmSubagentRuntime = vi.spyOn(runtime, "deleteRlmSubagentRuntime");
+		vi.spyOn(runtime, "createRlmSubagentRuntime").mockImplementationOnce(async (options) => {
+			const childRuntime = await AgentSessionRuntime.prototype.createRlmSubagentRuntime.call(runtime, options);
+			vi.spyOn(childRuntime.session, "promptAndWait").mockRejectedValue(new Error("child run failed"));
+			return childRuntime;
+		});
+
+		await runtime.session.runRlmChild("fail after startup");
+
+		await vi.waitFor(() => expect(deleteRlmSubagentRuntime).toHaveBeenCalledOnce());
+		expect(runtime.listSubagentRuntimes()).toEqual([]);
+	});
+
+	it("plumbs the parent agent identity into runtime-created child prompts", async () => {
+		const { runtime } = await createRuntimeForTest(() => {});
+		runtime.session.setSessionName("parent-worker");
+		const childRuntime = await runtime.createRlmSubagentRuntime({
+			parentSession: runtime.session,
+			id: "parent-agent-child",
+			prompt: "inspect parent identity",
+			sessionName: "child-worker",
+			sessionDir: join(runtime.cwd, "parent-agent-child"),
+			model: runtime.session.model!,
+			thinkingLevel: "off",
+			serviceTier: null,
+			scopedModels: [],
+			activeToolNames: [],
+			customTools: [],
+			includeGoals: false,
+			includeCompactSkill: false,
+			rlmDepth: 1,
+			rlmMaxDepth: 2,
+			rlmParentNodeId: "parent-agent-child",
+		});
+
+		expect(childRuntime.session.systemPrompt).toContain("spawned by parent-worker");
+		await runtime.deleteRlmSubagentRuntime("parent-agent-child", childRuntime.session);
+	});
+
 	it("disposes hosted RLM children during session replacement", async () => {
 		const disposeRlmSubagentRuntimes = vi.fn(async () => {});
 		const host: SubagentRuntimeHost = {

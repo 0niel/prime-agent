@@ -196,6 +196,7 @@ export interface AgentConnectionChildUsageAttributionEntry extends AgentConnecti
 	targetId: string;
 	childUsage: Usage;
 	aggregateUsage: Usage;
+	origin?: "spawn_task" | "agent_message" | "direct_user";
 }
 
 export interface AgentConnectionCustomMessageEntry extends AgentConnectionSessionEntryBase {
@@ -550,6 +551,7 @@ export interface AgentConnectionRlmChildAgentSnapshot {
 	status: AgentConnectionRlmChildAgentStatus;
 	durationMs?: number;
 	answerPreview?: string;
+	repliedSinceTask?: boolean;
 	/** Number of tool executions the subagent has started so far. */
 	toolUseCount?: number;
 	/** Context size (tokens) of the subagent's latest turn. */

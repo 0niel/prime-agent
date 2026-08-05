@@ -97,7 +97,12 @@ describe("ENG-4620 fast mode child agents", () => {
 			]);
 
 			const result = await harness.session.runRlmChild("Check fast mode");
-			expect(result.answer).toBe("child answer");
+			expect(result.rlm_child_id).toMatch(/^sub-/);
+			await vi.waitFor(() => {
+				expect(harness.session.getRlmChildSession(result.rlm_child_id)?.getLastAssistantText()).toBe(
+					"child answer",
+				);
+			});
 			expect(result.session_dir).not.toBeNull();
 			const childSessions = await SessionManager.list(harness.tempDir, result.session_dir!);
 			const childSession = SessionManager.open(childSessions[0]!.path, result.session_dir!);

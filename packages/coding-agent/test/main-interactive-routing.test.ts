@@ -410,6 +410,12 @@ describe("runtime session option resolution", () => {
 		});
 	});
 
+	test("preserves the runtime child parent-agent identity", () => {
+		const resolved = resolveRuntimeSessionOptions({}, { rlmDepth: 1, rlmParentAgent: "parent-worker" });
+
+		expect(resolved.rlmParentAgent).toBe("parent-worker");
+	});
+
 	test("deep-merges autonomous runtime session overrides", () => {
 		const resolved = resolveRuntimeSessionOptions(
 			{

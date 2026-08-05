@@ -30,7 +30,7 @@ export class BashExecutionComponent extends Container {
 	private expanded = false;
 	private contentContainer: Container;
 
-	constructor(command: string, ui: TUI, excludeFromContext = false) {
+	constructor(command: string, ui: TUI, excludeFromContext = false, options: { suppressLeadingSpace?: boolean } = {}) {
 		super();
 		this.command = command;
 
@@ -38,8 +38,8 @@ export class BashExecutionComponent extends Container {
 		const colorKey = excludeFromContext ? "dim" : "bashMode";
 		const borderColor = (str: string) => theme.fg(colorKey, str);
 
-		// Add spacer
-		this.addChild(new Spacer(1));
+		// Keep tool activity tight against a preceding agent-message notification.
+		if (!options.suppressLeadingSpace) this.addChild(new Spacer(1));
 
 		// Top border
 		this.addChild(new DynamicBorder(borderColor));

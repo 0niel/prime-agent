@@ -1347,9 +1347,17 @@ describe("global refinement history", () => {
 		// so applying must be the only thing that mutates state.
 		expect(plan.proposal.edits).toHaveLength(1);
 		expect(plan.id).toMatch(/^refine_/);
-		const userPrompt = completeSimpleMock.mock.calls[0][1].messages[0].content[0].text;
+		const request = completeSimpleMock.mock.calls[0][1];
+		const userPrompt = request.messages[0].content[0].text;
 		expect(userPrompt).toContain("Requested refinement scope: local");
 		expect(userPrompt).toContain("Global entries in the overview are read-only context");
+		expect(request.systemPrompt).toContain('handle = await rlm("sub-task")');
+		expect(request.systemPrompt).toContain("never the child's answer");
+		expect(request.systemPrompt).toContain('receiver_role="parent"');
+		expect(request.systemPrompt).toContain("await rlm.list_subagents()");
+		expect(request.systemPrompt).toContain('receiver_role="child"');
+		expect(request.systemPrompt).not.toContain("asyncio.create_task(rlm");
+		expect(request.systemPrompt).not.toContain("asyncio.gather(rlm");
 		expect(state.entries.memory.planned_memory).toBeUndefined();
 		expect(state.refinements).toHaveLength(0);
 

@@ -105,20 +105,26 @@ Normal interactive sessions are persistent agents backed by isolated worker proc
 Within a session, the model can delegate through the `rlm` callable already available in IPython:
 
 ```python
-# Return one child result immediately.
-review = await rlm("Review the authentication flow for security issues.", name="auth-reviewer")
-print(review.answer)
-
-# Run independent children in parallel.
-tests, docs = await asyncio.gather(
-    rlm("Find missing regression tests."),
-    rlm("Find stale public documentation."),
+# Spawn independent children. Each call returns at admission with a child handle,
+# never the child's answer.
+review = await rlm(
+    "Review authentication and reply to the parent with findings.",
+    name="auth-reviewer",
 )
+tests = await rlm("Find missing regression tests and reply to the parent.", name="test-reviewer")
+docs = await rlm("Find stale public documentation and reply to the parent.", name="docs-reviewer")
 
-# Start background work and collect it later.
-task = asyncio.create_task(rlm("Run focused checks and report failures.", name="checks"))
+# Children reply from their own sessions with:
+# await agent_message.send(message, receiver_role="parent")
+# Their replies arrive here as ordinary agent messages.
+
+# Recover handles and follow up with a retained child.
 children = await rlm.list_subagents()
-result = await task
+await agent_message.send(
+    "Also check authorization boundaries.",
+    receiver_role="child",
+    receiver_name=review.name,
+)
 ```
 
 Children inherit the parent model unless the user requests another model. They run as TypeScript `AgentSession` instances under the same root worker and can use the same provider, tools, skills, session storage, and scheduling system. See [RLM Runtime Architecture](rlm-runtime.md).

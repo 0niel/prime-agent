@@ -102,38 +102,6 @@ describe("AgentSession compaction characterization", () => {
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
 	});
 
-	it("retries cleanup for explicitly deleted subagents after compaction", async () => {
-		const harness = await createHarness({
-			settings: { compaction: { keepRecentTokens: 1 } },
-			extensionFactories: [
-				(pi) => {
-					pi.on("session_before_compact", async (event) => ({
-						compaction: {
-							summary: "summary from extension",
-							firstKeptEntryId: event.preparation.firstKeptEntryId,
-							tokensBefore: event.preparation.tokensBefore,
-							details: {},
-						},
-					}));
-				},
-			],
-		});
-		harnesses.push(harness);
-		await harness.session.prompt("one");
-		await harness.session.prompt("two");
-
-		const retryableDeletions = (
-			harness.session as unknown as { _retryableRlmSubagentDeletions: Map<string, unknown> }
-		)._retryableRlmSubagentDeletions;
-		retryableDeletions.set("deleted-child", {});
-		const retryDeletion = vi
-			.spyOn(harness.session, "deleteRlmSubagent")
-			.mockRejectedValue(new Error("cleanup still unavailable"));
-
-		await expect(harness.session.compact()).resolves.toMatchObject({ summary: "summary from extension" });
-		expect(retryDeletion).toHaveBeenCalledWith("deleted-child");
-	});
-
 	it("compacts through the model summarizer, persists metadata, emits events, and remains usable", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { keepRecentTokens: 1 } },

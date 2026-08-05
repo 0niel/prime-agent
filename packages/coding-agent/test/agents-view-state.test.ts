@@ -124,6 +124,30 @@ describe("agents view state", () => {
 		expect(sectionTitle("running")).toBe("Running");
 	});
 
+	test("labels replied subagents with active heartbeats as heartbeat active", () => {
+		const summaries = [
+			makeSummary({
+				id: "replied-child",
+				activeSessionId: "replied-child",
+				sessionId: "replied-child-session",
+				sessionName: "Replied child",
+				runtimeKind: "subagent",
+				parentActiveSessionId: "parent-active",
+				repliedSinceTask: true,
+				hasActiveHeartbeat: true,
+				activity: "idle",
+			}),
+			makeSummary({ id: "parent-active", activeSessionId: "parent-active", sessionId: "parent-session" }),
+		];
+		const collapsed = buildAgentsViewRows(summaries);
+		const expanded = buildAgentsViewRows(summaries, new Set([collapsed[0]?.identity ?? ""]));
+
+		expect(expanded.find((row) => row.title === "Replied child")).toMatchObject({
+			section: "running",
+			statusLabel: "heartbeat active",
+		});
+	});
+
 	test("defaults an idle session with no verdict to needs-input", () => {
 		// A slow, failed, or absent classification never lingers in Working; only
 		// an explicit completed verdict moves an idle session out of needs-input.
