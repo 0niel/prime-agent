@@ -7003,7 +7003,6 @@ export class InteractiveMode {
 								text,
 								images: this.collectImagesFor(text),
 							};
-		const changedState = this.pendingMessageNavigation.checkpoint();
 		let result: AgentConnectionQueueMutationResult;
 		try {
 			result = await this.agentConnection.mutateQueueItem(selected.id, checkpoint.queue?.revision ?? -1, mutation);
@@ -7011,6 +7010,7 @@ export class InteractiveMode {
 			this.pendingMessageNavigation.restore(checkpoint);
 			throw error;
 		}
+		if ((result.queue.revision ?? -1) < (this.connectionQueue.revision ?? -1)) return false;
 		if (result.status !== "applied") {
 			this.connectionQueue = result.queue;
 			if (result.status === "unsupported") {
@@ -7024,8 +7024,7 @@ export class InteractiveMode {
 			}
 			return false;
 		}
-		if ((result.queue.revision ?? -1) < (this.connectionQueue.revision ?? -1)) return false;
-		this.pendingMessageNavigation.restore(changedState);
+		this.pendingMessageNavigation.reconcile(result.queue, change.selected?.id);
 		this.connectionQueue = result.queue;
 		this.setEditorFromPendingNavigation(change.selected ? text : change.draft);
 		this.updatePendingMessagesDisplay();

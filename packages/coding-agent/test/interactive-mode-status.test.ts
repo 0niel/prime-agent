@@ -47,6 +47,7 @@ import type { ConfigurationMenuComponent } from "../src/modes/interactive/compon
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
+import { PendingMessageNavigation } from "../src/modes/interactive/pending-message-navigation.js";
 import { ClientPromptStashStore, type PromptStashState } from "../src/modes/interactive/prompt-stash-state.js";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
@@ -742,8 +743,12 @@ describe("InteractiveMode submit handling", () => {
 				setEditorFromPendingNavigation: (text: string) => {
 					editorText = text;
 				},
+				connectionQueue: { steering: [], followUp: ["old"], revision: 1 },
 				agentConnection: {
-					mutateQueueItem: vi.fn(async () => ({ status, queue: { steering: [], followUp: ["old"] } })),
+					mutateQueueItem: vi.fn(async () => ({
+						status,
+						queue: { steering: [], followUp: ["old"], revision: 1 },
+					})),
 				},
 				collectImagesFor: () => [],
 				showWarning,
@@ -758,6 +763,92 @@ describe("InteractiveMode submit handling", () => {
 			expect(showWarning).toHaveBeenCalledOnce();
 		},
 	);
+
+	test("applies two serialized real reorder mutations at successive revisions without losing edit or draft", async () => {
+		let editorText = "f2 edited";
+		const navigation = new PendingMessageNavigation();
+		const initial = {
+			steering: [],
+			followUp: ["f1", "f2", "f3"],
+			revision: 7,
+			items: [
+				{ id: "f1", lane: "followUp" as const, index: 0, text: "f1" },
+				{ id: "f2", lane: "followUp" as const, index: 1, text: "f2" },
+				{ id: "f3", lane: "followUp" as const, index: 2, text: "f3" },
+			],
+		};
+		navigation.select(initial, "original draft", initial.items[1]!);
+		navigation.capture(editorText);
+		const calls: number[] = [];
+		const fakeThis = {
+			editor: { getText: () => editorText },
+			pendingMessageNavigation: navigation,
+			pendingMessageMutation: Promise.resolve(false),
+			connectionQueue: initial,
+			agentConnection: {
+				mutateQueueItem: vi.fn(async (_id: string, revision: number) => {
+					calls.push(revision);
+					const nextRevision = revision + 1;
+					const items =
+						revision === 7
+							? [{ ...initial.items[1]!, index: 0 }, { ...initial.items[0]!, index: 1 }, initial.items[2]!]
+							: [initial.items[0]!, initial.items[1]!, initial.items[2]!];
+					return { status: "applied" as const, queue: { ...initial, revision: nextRevision, items } };
+				}),
+			},
+			collectImagesFor: () => [],
+			setEditorFromPendingNavigation: (text: string) => {
+				editorText = text;
+			},
+			updatePendingMessagesDisplay: vi.fn(),
+			ui: { requestRender: vi.fn() },
+			applySelectedPendingMessageChange: Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange"),
+		};
+		const mutate = Reflect.get(InteractiveMode.prototype, "changeSelectedPendingMessage");
+		await mutate.call(fakeThis, "earlier", editorText);
+		await mutate.call(fakeThis, "later", editorText);
+		expect(calls).toEqual([7, 8]);
+		expect(navigation.selected?.id).toBe("f2");
+		expect(navigation.draftText).toBe("original draft");
+		expect(editorText).toBe("f2 edited");
+	});
+
+	test("ignores an obsolete stale response after a newer authoritative revision", async () => {
+		const editorText = "newer editor";
+		const navigation = new PendingMessageNavigation();
+		const queue = {
+			steering: [],
+			followUp: ["selected", "external"],
+			revision: 9,
+			items: [{ id: "selected", lane: "followUp" as const, index: 0, text: "selected" }],
+		};
+		navigation.select(queue, "draft", queue.items[0]!);
+		const fakeThis = {
+			editor: { getText: () => editorText },
+			pendingMessageNavigation: navigation,
+			connectionQueue: queue,
+			agentConnection: {
+				mutateQueueItem: vi.fn(async () => ({
+					status: "stale" as const,
+					queue: { steering: [], followUp: ["selected"], revision: 8, items: queue.items },
+				})),
+			},
+			collectImagesFor: () => [],
+			setEditorFromPendingNavigation: vi.fn(),
+			showWarning: vi.fn(),
+		};
+		await expect(
+			Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange").call(
+				fakeThis,
+				"followUp",
+				"edited",
+			),
+		).resolves.toBe(false);
+		expect(fakeThis.connectionQueue).toBe(queue);
+		expect(fakeThis.setEditorFromPendingNavigation).not.toHaveBeenCalled();
+		expect(fakeThis.showWarning).not.toHaveBeenCalled();
+		expect(editorText).toBe("newer editor");
+	});
 
 	test("serializes rapid selected-item mutations", async () => {
 		const first = createDeferred<boolean>();

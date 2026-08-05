@@ -1,7 +1,14 @@
 import { createConnection, type Socket } from "node:net";
 import { serializeJsonLine } from "../rpc/jsonl.js";
 import { type PrivateFrame, PrivateFramedChannel } from "../session-worker/private-framing.js";
-import type { DaemonCommand, DaemonOutbound, DaemonResponse } from "./daemon-protocol.js";
+import {
+	DAEMON_PROTOCOL_VERSION,
+	type DaemonCommand,
+	type DaemonCommandCompatibility,
+	type DaemonOutbound,
+	type DaemonResponse,
+	getDaemonCommandCompatibilities,
+} from "./daemon-protocol.js";
 import {
 	type DaemonWorkerCommand,
 	type DaemonWorkerCommandBody,
@@ -108,8 +115,24 @@ export class DaemonWorkerClient {
 		return () => this.closeListeners.delete(listener);
 	}
 
-	request(command: DaemonCommandBody, timeoutMs = 30_000): Promise<DaemonResponse> {
+	async request(command: DaemonCommandBody, timeoutMs = 30_000): Promise<DaemonResponse> {
+		const hello = this.hello ?? (await this.waitForHello());
+		const missing = getDaemonCommandCompatibilities(command as DaemonCommand).find(
+			(compatibility) => !this.meetsCompatibility(hello, compatibility),
+		);
+		if (missing) throw new Error(`Worker does not support ${missing.capability ?? command.type}`);
 		return this.requestWire(command, timeoutMs);
+	}
+
+	private meetsCompatibility(hello: DaemonHello, compatibility: DaemonCommandCompatibility): boolean {
+		return (
+			hello.protocol.version >= compatibility.minProtocol &&
+			(compatibility.minSchemaRevision === undefined ||
+				(hello.schemaRevision ?? 0) >= compatibility.minSchemaRevision) &&
+			(compatibility.capability === undefined ||
+				hello.serverCapabilities?.includes(compatibility.capability) === true) &&
+			hello.protocol.version <= DAEMON_PROTOCOL_VERSION
+		);
 	}
 
 	requestWorker(command: DaemonWorkerCommandBody, timeoutMs = 30_000): Promise<DaemonResponse> {

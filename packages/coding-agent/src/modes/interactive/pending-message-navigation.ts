@@ -16,6 +16,7 @@ type Item = PendingMessageLocation & { id: string; text: string };
 const clone = (queue: AgentConnectionQueueState): AgentConnectionQueueState => ({
 	steering: [...queue.steering],
 	followUp: [...queue.followUp],
+	...(queue.revision !== undefined ? { revision: queue.revision } : {}),
 	...(queue.items ? { items: queue.items.map((item) => ({ ...item })) } : {}),
 });
 const items = (queue: AgentConnectionQueueState): Item[] =>
@@ -60,6 +61,20 @@ export class PendingMessageNavigation {
 	}
 	get isAtDraft(): boolean {
 		return !!this.queue && this.cursor === items(this.queue).length;
+	}
+
+	reconcile(queue: AgentConnectionQueueState, selectedId?: string): void {
+		if (!selectedId) {
+			this.reset();
+			return;
+		}
+		const cursor = items(queue).findIndex((item) => item.id === selectedId);
+		if (cursor < 0) {
+			this.reset();
+			return;
+		}
+		this.queue = clone(queue);
+		this.cursor = cursor;
 	}
 
 	checkpoint(): { queue?: AgentConnectionQueueState; cursor: number; draft: string; edits: Map<string, string> } {
