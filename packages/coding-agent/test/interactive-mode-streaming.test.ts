@@ -59,7 +59,7 @@ type HandleEventThis = {
 
 type HandleEvent = (this: HandleEventThis, event: AgentConnectionSessionEvent) => Promise<void>;
 type GetUserInput = (this: {
-	returnToAgentsViewRequested: boolean;
+	agentsViewRequest?: "agents_view" | "scoped_agents_view";
 	onInputCallback?: (text: string | undefined) => void;
 }) => Promise<string | undefined>;
 type HandleSubagentSummaryChatAction = (
@@ -286,7 +286,7 @@ describe("InteractiveMode streaming events", () => {
 	test("resolves input immediately after return to agents view was requested", async () => {
 		const getUserInput = (InteractiveMode.prototype as unknown as { getUserInput: GetUserInput }).getUserInput;
 
-		await expect(getUserInput.call({ returnToAgentsViewRequested: true })).resolves.toBeUndefined();
+		await expect(getUserInput.call({ agentsViewRequest: "agents_view" })).resolves.toBeUndefined();
 	});
 
 	test("forwards typed keys from focused subagent summary back to the editor", () => {

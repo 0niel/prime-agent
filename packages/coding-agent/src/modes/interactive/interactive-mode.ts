@@ -815,8 +815,10 @@ export interface InteractiveModeOptions {
 	 * which also covers direct daemon attaches where the agents view was never shown.
 	 */
 	agentsViewOwnsStartupNotices?: boolean;
-	/** Open the read-only detail view for this subagent node right after startup. */
-	initialSubagentNodeId?: string;
+	/** Persisted RLM depth supplied by the daemon SessionSummary. */
+	sessionDepth?: number;
+	/** Whether the unified daemon/catalog projection had any direct children. */
+	sessionHasChildren?: boolean;
 	/** Client-owned stash store shared across chat views in this TUI process. */
 	promptStashStore?: ClientPromptStashStore;
 	/** Initial stable session id used to scope prompt stash state. */
@@ -824,8 +826,13 @@ export interface InteractiveModeOptions {
 }
 
 export interface InteractiveModeRunResult {
-	type: "agents_view";
+	type: "agents_view" | "scoped_agents_view";
 	source: Pick<AgentConnectionState, "activeSessionId" | "sessionFile" | "sessionId" | "sessionName" | "cwd">;
+}
+
+export function formatAgentDepthLabel(depth: number | undefined, hasChildren: boolean): string | undefined {
+	if (depth === undefined || (depth === 0 && !hasChildren)) return undefined;
+	return `depth ${depth}`;
 }
 
 export class InteractiveMode {
@@ -877,7 +884,7 @@ export class InteractiveMode {
 	private pendingPromptStashReleases: { sessionId: string; state: PromptStashState }[] = [];
 	private readonly retainedSubmissionGenerations = new WeakMap<PromptStash, number>();
 	private admitPendingStartupPrompts: (() => Promise<StartupPromptBarrierOutcome>) | undefined;
-	private returnToAgentsViewRequested = false;
+	private agentsViewRequest: InteractiveModeRunResult["type"] | undefined;
 	private loadingAnimation: Loader | undefined = undefined;
 	private workingMessage: string | undefined = undefined;
 	private workingVisible = true;
@@ -963,7 +970,6 @@ export class InteractiveMode {
 	private childAgentNodes: ChildAgentInspectorNode[] = [];
 	private childAgentDetailNodeId: string | undefined;
 	private childAgentPanelMode: "detail" | undefined;
-	private enteredSessionViaSubagentDetail = false;
 	private childAgentWatcher: AgentConnectionSessionWatcher | undefined;
 	private childAgentWatcherToken = 0;
 	private childAgentWatcherMessages: AgentMessage[] = [];
@@ -1108,10 +1114,6 @@ export class InteractiveMode {
 			ui: this.ui,
 		});
 		this.childAgentDetail.onCancel = () => {
-			if (this.options.returnToAgentsView && this.enteredSessionViaSubagentDetail) {
-				void this.returnToAgentsView();
-				return;
-			}
 			this.closeChildAgentPanel({ selectNodeId: this.childAgentDetailNodeId });
 		};
 		this.childAgentDetail.onToggleToolsExpanded = () => this.toggleToolOutputExpansion();
@@ -1143,9 +1145,9 @@ export class InteractiveMode {
 			() => this.getTrayContextLabel(),
 			() => this.getTrayOverrideLabel(),
 		);
-		this.childAgentSummary.onOpenDetail = (nodeId) => this.openChildAgentDetail(nodeId);
-		// Fallback for Enter when the list emptied out while focused (no selection).
-		this.childAgentSummary.onOpen = () => this.focusEditor();
+		this.childAgentSummary.onOpenDetail = () => void this.openScopedAgentsView();
+		// Fallback for Enter when the list emptied out while focused.
+		this.childAgentSummary.onOpen = () => void this.openScopedAgentsView();
 		this.childAgentSummary.onCancel = () => this.focusEditor();
 		this.childAgentSummary.onExit = () => this.handleSubagentSummaryExit();
 		this.childAgentSummary.onChatAction = (data) => this.handleSubagentSummaryChatAction(data);
@@ -1476,22 +1478,6 @@ export class InteractiveMode {
 		// Render initial messages AFTER showing loaded resources
 		await this.renderInitialMessages();
 
-		// Jump straight into a subagent's read-only detail view when the agents
-		// view opened this session targeting one of its subagents.
-		if (this.options.initialSubagentNodeId) {
-			if (this.openChildAgentDetail(this.options.initialSubagentNodeId)) {
-				if (this.options.returnToAgentsView) {
-					this.enteredSessionViaSubagentDetail = true;
-					this.childAgentDetail.setBackHintLabel("back to agents");
-				}
-			} else {
-				// The subagent can finish and get released between the agents view
-				// listing it and this session attaching; say so instead of silently
-				// landing in the parent chat.
-				this.showStatus("Subagent already finished; showing its parent session");
-			}
-		}
-
 		// Set up theme file watcher
 		onThemeChange(() => {
 			this.ui.invalidate();
@@ -1722,7 +1708,7 @@ export class InteractiveMode {
 
 		const state = this.connectionState;
 		return {
-			type: "agents_view",
+			type: this.agentsViewRequest ?? "agents_view",
 			source: {
 				activeSessionId: state?.activeSessionId,
 				sessionFile: state?.sessionFile,
@@ -3955,7 +3941,6 @@ export class InteractiveMode {
 			// Re-render queued previews cleared on panel entry; the queue may still hold messages.
 			this.updatePendingMessagesDisplay();
 			this.childAgentDetailNodeId = undefined;
-			this.enteredSessionViaSubagentDetail = false;
 			this.childAgentDetail.setBackHintLabel("back to chat");
 			this.childAgentDetail.setNode(undefined);
 			this.childAgentPanelMode = undefined;
@@ -5017,7 +5002,7 @@ export class InteractiveMode {
 				if (
 					submissionOutcome === "lifecycle-cancelled" ||
 					this.isShuttingDown ||
-					this.returnToAgentsViewRequested ||
+					this.agentsViewRequest ||
 					this.promptStashSessionId !== submissionSessionId
 				) {
 					// The editor is already torn down, but its shared session stash outlives
@@ -5039,7 +5024,7 @@ export class InteractiveMode {
 					const rejectedDraft = submittedDraft ?? { text };
 					const canRestore =
 						!this.isShuttingDown &&
-						!this.returnToAgentsViewRequested &&
+						!this.agentsViewRequest &&
 						submissionGeneration === this.inputSubmissionGeneration &&
 						this.editor.getText().length === 0;
 					if (canRestore) {
@@ -5062,7 +5047,7 @@ export class InteractiveMode {
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 			} finally {
-				if (this.isShuttingDown || this.returnToAgentsViewRequested) {
+				if (this.isShuttingDown || this.agentsViewRequest) {
 					submissionOutcome = "lifecycle-cancelled";
 				}
 				if (
@@ -6004,6 +5989,20 @@ export class InteractiveMode {
 		return true;
 	}
 
+	private async openScopedAgentsView(): Promise<void> {
+		if (this.editor.getText().trim()) {
+			this.focusEditor();
+			this.showStatus("Send, stash, or clear your draft before opening agents");
+			return;
+		}
+		if (!this.options.returnToAgentsView) {
+			this.focusEditor();
+			this.showStatus("The agents view needs the daemon; start without --no-daemon to browse sessions");
+			return;
+		}
+		await this.returnToAgentsView("scoped_agents_view");
+	}
+
 	// Left from the focused subagent list: exit to manage sessions if available,
 	// otherwise just drop focus back to the editor.
 	private handleSubagentSummaryExit(): void {
@@ -6043,9 +6042,13 @@ export class InteractiveMode {
 
 	private getTrayLocationLabel(): string | undefined {
 		const modelLabel = this.getModelTrayLabel();
+		const hasChildren = this.options.sessionHasChildren === true || (this.childAgentSnapshots?.size ?? 0) > 0;
+		const depthLabel = formatAgentDepthLabel(this.options.sessionDepth, hasChildren);
 		const shortcutsHint = this.getShortcutsTrayHint();
 		const agentsHint = this.getAgentsViewTrayHint();
-		return [agentsHint, modelLabel, shortcutsHint].filter((label): label is string => label !== undefined).join("  ");
+		return [agentsHint, depthLabel, modelLabel, shortcutsHint]
+			.filter((label): label is string => label !== undefined)
+			.join("  ");
 	}
 
 	private getShortcutsTrayHint(): string | undefined {
@@ -6160,32 +6163,6 @@ export class InteractiveMode {
 			this.showError(`Failed to stop subagent: ${error instanceof Error ? error.message : String(error)}`);
 		}
 		this.ui.requestRender();
-	}
-
-	private openChildAgentDetail(nodeId: string): boolean {
-		// Live text deltas are stored without redrawing the summary on every token.
-		// Rebuild once here so the detail opens with the latest preview and recap.
-		this.childAgentNodes = this.buildChildAgentInspectorNodes();
-		this.childAgentSummary.setNodes(this.childAgentNodes);
-		const node = this.findChildAgentInspectorNode(nodeId);
-		if (!node) {
-			return false;
-		}
-		this.childAgentPanelMode = "detail";
-		this.clearFeatureHintPresentation();
-		this.childAgentDetailNodeId = nodeId;
-		this.childAgentDetail.setNode(node);
-		this.childAgentDetail.setBodyComponents([]);
-		this.renderRecap();
-		this.childAgentSummary.setHidden(true);
-		this.editorContainer.clear();
-		this.queuedMessagesContainer.clear();
-		this.mainViewContainer.clear();
-		this.mainViewContainer.addChild(this.childAgentDetail);
-		this.ui.setFocus(this.childAgentDetail);
-		this.ui.requestRender();
-		void this.startChildAgentWatch(node);
-		return true;
 	}
 
 	private async startChildAgentWatch(node: ChildAgentInspectorNode): Promise<void> {
@@ -6309,7 +6286,6 @@ export class InteractiveMode {
 		this.stopChildAgentWatch();
 		this.childAgentPanelMode = undefined;
 		this.childAgentDetailNodeId = undefined;
-		this.enteredSessionViaSubagentDetail = false;
 		this.childAgentDetail.setBackHintLabel("back to chat");
 		this.childAgentDetail.setNode(undefined);
 		this.childAgentDetail.setBodyComponents([]);
@@ -6852,7 +6828,7 @@ export class InteractiveMode {
 	}
 
 	async getUserInput(): Promise<string | undefined> {
-		if (this.returnToAgentsViewRequested) {
+		if (this.agentsViewRequest) {
 			return undefined;
 		}
 		return new Promise((resolve) => {
@@ -7071,9 +7047,9 @@ export class InteractiveMode {
 		await this.returnToAgentsView();
 	}
 
-	private async returnToAgentsView(): Promise<void> {
-		if (this.isShuttingDown || this.returnToAgentsViewRequested) return;
-		this.returnToAgentsViewRequested = true;
+	private async returnToAgentsView(request: InteractiveModeRunResult["type"] = "agents_view"): Promise<void> {
+		if (this.isShuttingDown || this.agentsViewRequest) return;
+		this.agentsViewRequest = request;
 		this.isShuttingDown = true;
 		this.unregisterSignalHandlers();
 

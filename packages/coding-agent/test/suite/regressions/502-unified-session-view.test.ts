@@ -104,7 +104,7 @@ describe("#502 unified session view regressions", () => {
 			});
 			await oldPoll;
 
-			if (kind === "live") expect(harness.applySessionList).toHaveBeenCalledWith([newer]);
+			if (kind === "live") expect(harness.applySessionList).toHaveBeenCalledWith([newer], true);
 			else expect(harness.heartbeats).toEqual([newer]);
 			expect(kind === "live" ? harness.applySessionList : harness.reconcileCatalogs).toHaveBeenCalledOnce();
 		},
@@ -280,7 +280,7 @@ describe("#502 unified session view regressions", () => {
 			await harness.reconnectPromise;
 
 			expect(client.reconnect).toHaveBeenCalledTimes(2);
-			expect(harness.applySessionList).toHaveBeenCalledWith([summary("live")]);
+			expect(harness.applySessionList).toHaveBeenCalledWith([summary("live")], true);
 			expect(harness.heartbeats).toEqual([{ job: { id: "healthy" } }]);
 			expect(harness.reconnectPromise).toBeUndefined();
 		} finally {
@@ -422,7 +422,7 @@ describe("#502 unified session view regressions", () => {
 			renameTarget: mode === "rename" ? { identity: "target" } : undefined,
 			actionModeSearchQuery: "needle",
 			editor: { getText: () => "action editor text" },
-			unifiedRecords: [
+			scopedRecords: [
 				{ identity: "match", identityAliases: [], section: "idle", searchableText: "needle session" },
 				{ identity: "other", identityAliases: [], section: "idle", searchableText: "other session" },
 			],

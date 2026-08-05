@@ -195,7 +195,6 @@ describe("InteractiveMode feature hints", () => {
 		const mode = {
 			childAgentPanelMode: "detail",
 			childAgentDetailNodeId: "subagent-1",
-			enteredSessionViaSubagentDetail: true,
 			childAgentDetail: { setBackHintLabel: vi.fn(), setNode: vi.fn() },
 			childAgentSummary: { setHidden: vi.fn() },
 			editor: { getText: () => "draft" },

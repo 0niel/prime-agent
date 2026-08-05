@@ -67,18 +67,31 @@ import {
 } from "../shared/startup-notices.js";
 import {
 	type AgentsViewRow,
+	type AgentsViewScopeFrame,
+	type AgentsViewScopeKey,
 	type AgentsViewSection,
 	type AgentsViewSelectionKey,
 	buildAgentsViewRows,
+	buildUnifiedSessionIndex,
+	createUnattachableChildOpenResult,
 	filterUnifiedSessions,
 	formatHeartbeatBadge,
 	getAgentsViewSelectionKey,
+	getAgentsViewSessionTitle,
 	getAgentsViewSummaryIdentity as getSummaryIdentity,
+	getUnifiedSessionAncestorSessionIds,
+	hasUnifiedSessionChildren,
 	reconcileUnifiedSessions,
+	resolveAgentsViewLeftResult,
+	resolveAgentsViewScopeFrames,
 	resolveAgentsViewSelectionState,
+	scopeToSessionSubtree,
 	sectionTitle,
+	shouldApplyScopeResolution,
 	shouldShowAgentsViewSession,
 	summaryForUnifiedRecord,
+	transitionAgentsViewScope,
+	type UnifiedSessionIndex,
 	type UnifiedSessionRecord,
 } from "./agents-view-state.js";
 import { matchesSearchText } from "./session-view-search.js";
@@ -113,24 +126,35 @@ export interface AgentsViewModeOptions {
 	reconnectTimeoutMs?: number;
 	promptStashStore?: ClientPromptStashStore;
 	initialSession?: SessionSummary;
+	/** When set, the first view is rooted at this session's direct children. */
+	initialScopeKey?: AgentsViewScopeKey;
 }
 
 export type AgentsViewRunResult =
 	| { type: "exit" }
 	| {
+			type: "scope_back";
+			selection: SessionSummary;
+			expandedAncestorSessionIds: string[];
+			returnChat?: SessionSummary;
+			hasChildren: boolean;
+	  }
+	| {
 			type: "open";
 			summary: SessionSummary;
-			subagent?: SessionSummary;
-			// Session ids of every ancestor that must be expanded to reveal the
-			// opened subagent, from the root agent down to its immediate parent.
-			subagentAncestorSessionIds?: string[];
+			/** Row restored after chat closes; differs from summary only for an unattachable-child fallback. */
+			selection?: SessionSummary;
+			expandedAncestorSessionIds?: string[];
+			hasChildren?: boolean;
+			statusMessage?: string;
 	  };
 export type AgentsViewPersistentState = {
 	selectedRowIdentity?: string;
 	backSession?: SessionSummary;
+	scopeFrames?: AgentsViewScopeFrame[];
 	selectedSessionKey?: AgentsViewSelectionKey;
-	// Ancestor chain to re-expand on return to a subagent. Kept by sessionId, not
-	// row identity, so it survives a parent's active→persisted identity flip.
+	// Ancestor chain to re-expand on return to a nested agent. Kept by sessionId,
+	// not row identity, so it survives an active→persisted identity flip.
 	pendingExpandedAncestorSessionIds?: string[];
 	statusMessage?: string;
 	// Gathered once and reused across agents-view instances so the notices survive
@@ -140,6 +164,7 @@ export type AgentsViewPersistentState = {
 	query?: string;
 	savedSessions?: AgentConnectionSavedSessionInfo[];
 	lastSuccessfulSavedSessions?: AgentConnectionSavedSessionInfo[];
+	lastSuccessfulLiveSummaries?: SessionSummary[];
 	savedCatalogGeneration?: number;
 	heartbeats?: AgentConnectionHeartbeat[];
 };
@@ -206,6 +231,13 @@ export function formatAgentsViewStatusLine(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
 
+export function combineAgentsViewStartupNotices(...notices: readonly (string | undefined)[]): string | undefined {
+	const formatted = notices
+		.map((notice) => (notice ? formatAgentsViewStatusLine(notice) : ""))
+		.filter((notice) => notice.length > 0);
+	return formatted.length > 0 ? formatted.join(" · ") : undefined;
+}
+
 export function shouldReconnectAgentsViewDaemon(reason: DaemonClosingReason | undefined): boolean {
 	return reason !== "shutdown";
 }
@@ -215,6 +247,56 @@ export function createAgentsViewReplyHeadline(text: string | undefined): string 
 		?.split("\n")
 		.map((line) => line.replace(/\s+/g, " ").trim())
 		.find((line) => line.length > 0);
+}
+
+export function getAgentsViewDepth(scopeRoot: SessionSummary | undefined): number {
+	return scopeRoot ? (scopeRoot.rlmDepth ?? 0) + 1 : 0;
+}
+
+export function createInitialAgentsViewScopeFrames(
+	initialScopeKey: AgentsViewScopeKey | undefined,
+	returnChat: SessionSummary | undefined,
+): AgentsViewScopeFrame[] {
+	if (!initialScopeKey) return [];
+	return [
+		{
+			scope: initialScopeKey,
+			...(returnChat?.sessionId === initialScopeKey.sessionId ? { returnChat } : {}),
+		},
+	];
+}
+
+export function createInitialAgentsViewPersistentState(
+	options: Pick<AgentsViewModeOptions, "initialScopeKey" | "initialSession">,
+): AgentsViewPersistentState {
+	const initialSession = options.initialSession;
+	return {
+		...(initialSession
+			? {
+					selectedRowIdentity: getSummaryIdentity(initialSession),
+					selectedSessionKey: getAgentsViewSelectionKey(initialSession),
+					backSession: initialSession,
+				}
+			: {}),
+		...(options.initialScopeKey
+			? {
+					scopeFrames: createInitialAgentsViewScopeFrames(options.initialScopeKey, initialSession),
+					...(initialSession ? { lastSuccessfulLiveSummaries: [initialSession] } : {}),
+				}
+			: {}),
+	};
+}
+
+export function createScopeBackReturnChatOpenResult(
+	result: Extract<AgentsViewRunResult, { type: "scope_back" }>,
+): Extract<AgentsViewRunResult, { type: "open" }> | undefined {
+	if (!result.returnChat) return undefined;
+	return {
+		type: "open",
+		summary: result.returnChat,
+		expandedAncestorSessionIds: result.expandedAncestorSessionIds,
+		hasChildren: result.hasChildren,
+	};
 }
 
 interface OpenedAgentsViewSession {
@@ -329,40 +411,41 @@ function isUnknownActiveSessionError(error: unknown): boolean {
 }
 
 export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise<void> {
-	const initialSession = options.initialSession;
-	const persistentState: AgentsViewPersistentState = initialSession
-		? {
-				selectedRowIdentity: getSummaryIdentity(initialSession),
-				selectedSessionKey: getAgentsViewSelectionKey(initialSession),
-				backSession: initialSession,
-			}
-		: {};
+	const persistentState = createInitialAgentsViewPersistentState(options);
 	const promptStashStore = options.promptStashStore ?? new ClientPromptStashStore();
 
 	while (true) {
 		const view = new AgentsViewMode(options, persistentState);
-		const result = await view.run();
-		if (result.type === "exit") {
-			return;
-		}
-		if (result.subagent) {
-			// Returning from a subagent reopens the agents view with every ancestor
-			// list expanded and that subagent reselected.
-			persistentState.selectedRowIdentity = getSummaryIdentity(result.subagent);
-			persistentState.selectedSessionKey = getAgentsViewSelectionKey(result.subagent);
-			persistentState.pendingExpandedAncestorSessionIds = result.subagentAncestorSessionIds ?? [];
+		const viewResult = await view.run();
+		if (viewResult.type === "exit") return;
+		let result: Extract<AgentsViewRunResult, { type: "open" }>;
+		if (viewResult.type === "scope_back") {
+			persistentState.scopeFrames = transitionAgentsViewScope(persistentState.scopeFrames ?? [], { type: "back" });
+			persistentState.selectedRowIdentity = getSummaryIdentity(viewResult.selection);
+			persistentState.selectedSessionKey = getAgentsViewSelectionKey(viewResult.selection);
+			persistentState.pendingExpandedAncestorSessionIds = viewResult.expandedAncestorSessionIds;
+			persistentState.query = "";
+			const returnChatResult = createScopeBackReturnChatOpenResult(viewResult);
+			if (!returnChatResult) continue;
+			result = returnChatResult;
 		} else {
-			persistentState.selectedRowIdentity = getSummaryIdentity(result.summary);
-			persistentState.selectedSessionKey = getAgentsViewSelectionKey(result.summary);
-			persistentState.pendingExpandedAncestorSessionIds = undefined;
+			result = viewResult;
 		}
+
+		const selection = result.selection ?? result.summary;
+		persistentState.selectedRowIdentity = getSummaryIdentity(selection);
+		persistentState.selectedSessionKey = getAgentsViewSelectionKey(selection);
+		persistentState.pendingExpandedAncestorSessionIds = result.expandedAncestorSessionIds;
+		if (result.statusMessage) persistentState.statusMessage = result.statusMessage;
 
 		let opened: OpenedAgentsViewSession | undefined;
 		try {
 			opened = await openAgentsViewSession(options, result.summary);
-			persistentState.backSession = opened.summary;
 			if (opened.cwdFallbackNotice) {
-				persistentState.statusMessage = opened.cwdFallbackNotice;
+				persistentState.statusMessage = combineAgentsViewStartupNotices(
+					result.statusMessage,
+					opened.cwdFallbackNotice,
+				);
 			}
 			const uiServices = await resolveAgentsViewSessionUiServices(options, opened.summary);
 			const interactiveMode = new InteractiveMode({
@@ -374,39 +457,46 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 				bindLocalSessionExtensions: false,
 				migratedProviders: options.migratedProviders,
 				modelFallbackMessage: resolveAttachModelFallbackMessage(opened.summary, options.modelFallbackMessage),
-				startupNotice: opened.cwdFallbackNotice,
+				startupNotice: combineAgentsViewStartupNotices(result.statusMessage, opened.cwdFallbackNotice),
 				verbose: options.verbose,
 				returnToAgentsView: true,
 				forceFullscreen: true,
 				// The agents view renders the global notices itself, so suppress them in-session.
 				agentsViewOwnsStartupNotices: true,
-				// Matches the node id scheme used by snapshot child seeding
-				// (rlmChildId, falling back to the child's active session id).
-				initialSubagentNodeId: result.subagent
-					? (result.subagent.rlmChildId ?? result.subagent.activeSessionId)
-					: undefined,
+				sessionDepth: opened.summary.rlmDepth,
+				sessionHasChildren: result.hasChildren,
 			});
 			try {
 				const interactiveResult = await interactiveMode.run();
 				const source = interactiveResult.source;
-				// A subagent selection was recorded before the chat opened; keep it so
-				// the view reselects the subagent instead of its root session.
-				if (!result.subagent) {
-					persistentState.selectedRowIdentity = source.sessionFile
-						? `file:${resolvePath(canonicalizePath(source.sessionFile))}`
-						: source.activeSessionId
-							? `active:${source.activeSessionId}`
-							: `session:${source.sessionId}`;
-					persistentState.selectedSessionKey = {
-						sessionId: source.sessionId,
-						activeSessionId: source.activeSessionId,
-					};
-				}
-				persistentState.backSession = {
+				const returnedSession: SessionSummary = {
 					...opened.summary,
 					...source,
 					id: source.activeSessionId ?? opened.summary.id,
 				};
+				// Preserve an unattachable child's selection while its parent chat was open.
+				if (selection.sessionId === result.summary.sessionId) {
+					persistentState.selectedRowIdentity = getSummaryIdentity(returnedSession);
+					persistentState.selectedSessionKey = getAgentsViewSelectionKey(returnedSession);
+				}
+				if (interactiveResult.type === "scoped_agents_view") {
+					const nextScope = { sessionId: source.sessionId, activeSessionId: source.activeSessionId };
+					persistentState.scopeFrames = transitionAgentsViewScope(persistentState.scopeFrames ?? [], {
+						type: "push",
+						scope: nextScope,
+						returnChat: returnedSession,
+					});
+					const cachedLiveSummaries = persistentState.lastSuccessfulLiveSummaries ?? [];
+					const cachedIndex = cachedLiveSummaries.findIndex(
+						(summary) => summary.sessionId === returnedSession.sessionId,
+					);
+					persistentState.lastSuccessfulLiveSummaries =
+						cachedIndex === -1
+							? [...cachedLiveSummaries, returnedSession]
+							: cachedLiveSummaries.map((summary, index) => (index === cachedIndex ? returnedSession : summary));
+					persistentState.query = "";
+				}
+				persistentState.backSession = returnedSession;
 			} catch (error) {
 				// The session opened fine and then threw while running; label it as a
 				// runtime crash so it isn't mixed in with true open failures.
@@ -546,6 +636,12 @@ export class AgentsViewMode implements Component, Focusable {
 	private lastSuccessfulSavedSessions: AgentConnectionSavedSessionInfo[] = [];
 	private heartbeats: AgentConnectionHeartbeat[] = [];
 	private unifiedRecords: UnifiedSessionRecord[] = [];
+	private unifiedIndex: UnifiedSessionIndex = buildUnifiedSessionIndex([]);
+	private scopedRecords: UnifiedSessionRecord[] = [];
+	private scopeKey: AgentsViewScopeKey | undefined;
+	private scopeRootSummary: SessionSummary | undefined;
+	private liveCatalogReady = false;
+	private savedCatalogReady = false;
 	private savedCatalogGeneration = 0;
 	private liveCatalogGeneration = 0;
 	private heartbeatCatalogGeneration = 0;
@@ -585,11 +681,21 @@ export class AgentsViewMode implements Component, Focusable {
 		private readonly options: AgentsViewModeOptions,
 		private readonly persistentState: AgentsViewPersistentState = {},
 	) {
+		const initialFrames =
+			persistentState.scopeFrames ??
+			createInitialAgentsViewScopeFrames(
+				options.initialScopeKey,
+				persistentState.backSession ?? options.initialSession,
+			);
+		persistentState.scopeFrames = initialFrames;
+		this.scopeKey = initialFrames.at(-1)?.scope;
 		this.selectedRowIdentity = persistentState.selectedRowIdentity;
 		this.selectedSessionKey = persistentState.selectedSessionKey;
 		this.selectedActiveSessionId = persistentState.selectedSessionKey?.activeSessionId;
+		this.lastListedSummaries = persistentState.lastSuccessfulLiveSummaries ?? [];
 		this.savedSessions = persistentState.savedSessions ?? [];
 		this.lastSuccessfulSavedSessions = persistentState.lastSuccessfulSavedSessions ?? this.savedSessions;
+		this.savedCatalogReady = persistentState.lastSuccessfulSavedSessions !== undefined;
 		this.heartbeats = persistentState.heartbeats ?? [];
 		this.savedCatalogGeneration = persistentState.savedCatalogGeneration ?? 0;
 		this.keybindings = KeybindingsManager.create();
@@ -641,8 +747,26 @@ export class AgentsViewMode implements Component, Focusable {
 				return true;
 			}
 			if (this.editor.getText().length > 0) return false;
-			const backSession = this.persistentState.backSession;
-			this.finish(backSession ? { type: "open", summary: backSession } : { type: "exit" });
+			const ancestors = this.scopeKey
+				? getUnifiedSessionAncestorSessionIds(this.unifiedRecords, this.scopeKey, this.unifiedIndex)
+				: [];
+			const scopeRoot = this.scopeRootSummary;
+			const result = resolveAgentsViewLeftResult(
+				scopeRoot,
+				ancestors,
+				this.persistentState.scopeFrames?.at(-1)?.returnChat,
+			);
+			if (result && scopeRoot) {
+				this.finish({
+					...result,
+					hasChildren: hasUnifiedSessionChildren(
+						this.unifiedRecords,
+						getAgentsViewSelectionKey(scopeRoot),
+						this.unifiedIndex,
+					),
+				});
+			}
+			// Global view has no hierarchy parent: consume Left without opening chat.
 			return true;
 		};
 		this.editor.onEscape = () => {
@@ -652,7 +776,19 @@ export class AgentsViewMode implements Component, Focusable {
 				this.setSearchQuery("");
 			} else {
 				const backSession = this.persistentState.backSession;
-				this.finish(backSession ? { type: "open", summary: backSession } : { type: "exit" });
+				this.finish(
+					backSession
+						? {
+								type: "open",
+								summary: backSession,
+								hasChildren: hasUnifiedSessionChildren(
+									this.unifiedRecords,
+									getAgentsViewSelectionKey(backSession),
+									this.unifiedIndex,
+								),
+							}
+						: { type: "exit" },
+				);
 			}
 		};
 		this.fullscreenDock = {
@@ -668,7 +804,14 @@ export class AgentsViewMode implements Component, Focusable {
 			undefined,
 			{
 				topPadding: true,
-				getExtraMetadata: () => [{ label: "agents", value: this.getAgentCountsText() }],
+				getExtraMetadata: () => {
+					const root = this.scopeRootSummary;
+					return [
+						{ label: "agents", value: this.getAgentCountsText() },
+						{ label: "scope", value: root ? getAgentsViewSessionTitle(root) : "global" },
+						{ label: "depth", value: String(getAgentsViewDepth(root)) },
+					];
+				},
 			},
 		);
 	}
@@ -1117,7 +1260,7 @@ export class AgentsViewMode implements Component, Focusable {
 
 	private getFilteredRecords(): UnifiedSessionRecord[] {
 		const query = this.replyTarget || this.renameTarget ? (this.actionModeSearchQuery ?? "") : this.editor.getText();
-		return filterUnifiedSessions(this.unifiedRecords, (text) => matchesSearchText(text, query));
+		return filterUnifiedSessions(this.scopedRecords, (text) => matchesSearchText(text, query));
 	}
 
 	/** Rebuild rows from the last fetched summaries, keeping selection on the same row. */
@@ -1127,6 +1270,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.getFilteredRecords(),
 			this.expandedSubagentParents,
 			this.programShownParents,
+			this.scopeKey,
 		);
 		const index =
 			selectedIdentity === undefined ? -1 : this.rows.findIndex((row) => row.identity === selectedIdentity);
@@ -1223,7 +1367,15 @@ export class AgentsViewMode implements Component, Focusable {
 			this.setStatusMessage("Cannot open agent without an active runtime or saved session file");
 			return;
 		}
-		this.finish({ type: "open", summary: row.summary });
+		this.finish({
+			type: "open",
+			summary: row.summary,
+			hasChildren: hasUnifiedSessionChildren(
+				this.unifiedRecords,
+				getAgentsViewSelectionKey(row.summary),
+				this.unifiedIndex,
+			),
+		});
 	}
 
 	private expandSubagentList(row: AgentsViewRow): void {
@@ -1307,17 +1459,33 @@ export class AgentsViewMode implements Component, Focusable {
 	}
 
 	private openSelectedSubagent(row: AgentsViewRow): void {
-		const root = this.findSubagentRootRow(row);
-		if (!root || !(root.summary.activeSessionId || root.summary.sessionFile)) {
-			this.setStatusMessage("Cannot open subagent without its parent agent");
+		const expandedAncestorSessionIds = this.collectSubagentAncestorSessionIds(row);
+		if (row.summary.activeSessionId || row.summary.sessionFile) {
+			this.finish({
+				type: "open",
+				summary: row.summary,
+				expandedAncestorSessionIds,
+				hasChildren: hasUnifiedSessionChildren(
+					this.unifiedRecords,
+					getAgentsViewSelectionKey(row.summary),
+					this.unifiedIndex,
+				),
+			});
 			return;
 		}
-		this.finish({
-			type: "open",
-			summary: root.summary,
-			subagent: row.summary,
-			subagentAncestorSessionIds: this.collectSubagentAncestorSessionIds(row),
-		});
+		const root = this.findSubagentRootRow(row);
+		if (!root || !(root.summary.activeSessionId || root.summary.sessionFile)) {
+			this.setStatusMessage("Cannot open agent without an active runtime or saved session file");
+			return;
+		}
+		this.finish(
+			createUnattachableChildOpenResult(
+				row.summary,
+				root.summary,
+				expandedAncestorSessionIds,
+				hasUnifiedSessionChildren(this.unifiedRecords, getAgentsViewSelectionKey(root.summary), this.unifiedIndex),
+			),
+		);
 	}
 
 	/** Session ids of every ancestor of a subagent row, root-most first. */
@@ -1915,18 +2083,29 @@ export class AgentsViewMode implements Component, Focusable {
 			try {
 				const response = await client.request(createAgentsViewListCommand());
 				if (generation !== this.liveCatalogGeneration) return false;
-				this.applySessionList(expectSessionList(requireDaemonData(response)));
+				this.liveCatalogReady = true;
+				this.applySessionList(expectSessionList(requireDaemonData(response)), true);
 				return true;
 			} catch (error) {
-				if (!options.preserveStatusOnError && !this.reconnectPromise) {
-					if (client.isConnected) this.setStatusMessage(formatError("Failed to refresh agents", error));
-					else this.startClientReconnect(client, error);
+				if (generation === this.liveCatalogGeneration) {
+					// A completed failed attempt is still catalog-settled: otherwise a
+					// vanished scope can permanently trap an empty view.
+					this.liveCatalogReady = true;
+					this.reconcileCatalogs();
+					if (!options.preserveStatusOnError && !this.reconnectPromise) {
+						if (client.isConnected) this.setStatusMessage(formatError("Failed to refresh agents", error));
+						else this.startClientReconnect(client, error);
+					}
 				}
 				return false;
 			}
 		} catch (error) {
-			if (generation === this.liveCatalogGeneration && !options.preserveStatusOnError) {
-				this.setStatusMessage(formatError("Failed to refresh current session", error));
+			if (generation === this.liveCatalogGeneration) {
+				this.liveCatalogReady = true;
+				this.reconcileCatalogs();
+				if (!options.preserveStatusOnError) {
+					this.setStatusMessage(formatError("Failed to refresh current session", error));
+				}
 			}
 			return false;
 		} finally {
@@ -1937,8 +2116,9 @@ export class AgentsViewMode implements Component, Focusable {
 		}
 	}
 
-	private applySessionList(sessions: SessionSummary[]): void {
+	private applySessionList(sessions: SessionSummary[], successful = false): void {
 		this.lastListedSummaries = sessions;
+		if (successful) this.persistentState.lastSuccessfulLiveSummaries = sessions;
 		this.reconcileCatalogs();
 	}
 
@@ -1948,10 +2128,25 @@ export class AgentsViewMode implements Component, Focusable {
 		);
 		this.lastVisibleSummaries = this.withPendingDeleteSession(visibleSessions);
 		this.unifiedRecords = reconcileUnifiedSessions(this.lastVisibleSummaries, this.savedSessions, this.heartbeats);
+		this.unifiedIndex = buildUnifiedSessionIndex(this.unifiedRecords);
+
+		const frames = this.persistentState.scopeFrames ?? [];
+		const resolution = resolveAgentsViewScopeFrames(this.unifiedRecords, frames, this.unifiedIndex);
+		if (shouldApplyScopeResolution(resolution.droppedFrames, this.liveCatalogReady, this.savedCatalogReady)) {
+			this.persistentState.scopeFrames = resolution.frames;
+			this.scopeKey = resolution.frames.at(-1)?.scope;
+			this.scopeRootSummary = resolution.root ? summaryForUnifiedRecord(resolution.root) : undefined;
+			if (resolution.droppedFrames > 0) {
+				const destination = resolution.root ? "the nearest available parent" : "the global view";
+				this.setStatusMessage(`Scope is no longer available; returned to ${destination}`, { render: false });
+			}
+		}
+		this.scopedRecords = scopeToSessionSubtree(this.unifiedRecords, this.scopeKey, this.unifiedIndex);
 		this.rows = buildAgentsViewRows(
 			this.getFilteredRecords(),
 			this.expandedSubagentParents,
 			this.programShownParents,
+			this.scopeKey,
 		);
 		this.applyPendingAncestorExpansion();
 		this.restoreSelection();
@@ -1997,6 +2192,7 @@ export class AgentsViewMode implements Component, Focusable {
 			if (generation !== this.savedCatalogGeneration) return false;
 			this.savedSessions = sessions;
 			this.lastSuccessfulSavedSessions = sessions;
+			this.savedCatalogReady = true;
 			this.persistentState.lastSuccessfulSavedSessions = sessions;
 			this.persistentState.savedSessions = sessions;
 			this.reconcileCatalogs();
@@ -2005,6 +2201,8 @@ export class AgentsViewMode implements Component, Focusable {
 			if (generation === this.savedCatalogGeneration) {
 				this.savedSessions = successfulSessions;
 				this.persistentState.savedSessions = successfulSessions;
+				// Treat a terminal failure as settled so scope fallback cannot soft-lock.
+				this.savedCatalogReady = true;
 				this.reconcileCatalogs();
 				if (!options.preserveStatusOnError && !this.reconnectPromise && !this.daemonShutdownReceived) {
 					this.setStatusMessage(formatError("Failed to load saved sessions", error));
@@ -2139,7 +2337,7 @@ export class AgentsViewMode implements Component, Focusable {
 		this.clearDeleteConfirmation({ render: false });
 		this.setStatusMessage(undefined, { render: false });
 		this.ui.stop({
-			preserveAltScreen: result.type === "open",
+			preserveAltScreen: result.type !== "exit",
 			flushFullscreen: false,
 		});
 		stopThemeWatcher();
@@ -2207,7 +2405,7 @@ export class AgentsViewMode implements Component, Focusable {
 				this.daemonShutdownReceived = false;
 				this.reconnectTimedOut = false;
 				this.setStatusMessage("Daemon reconnected", { render: false });
-				this.applySessionList(sessions);
+				this.applySessionList(sessions, true);
 				void this.refreshSavedSessions({ duringReconnect: true, preserveStatusOnError: true });
 				return;
 			} catch (error) {
@@ -2225,7 +2423,6 @@ export class AgentsViewMode implements Component, Focusable {
 				sticky: true,
 				render: false,
 			});
-			this.applySessionList([]);
 		}
 	}
 

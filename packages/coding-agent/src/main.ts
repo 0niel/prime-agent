@@ -82,6 +82,7 @@ import {
 } from "./modes/daemon/daemon-worker-protocol.js";
 import {
 	type AgentConnection,
+	type AgentsViewScopeKey,
 	ClientPromptStashStore,
 	createInteractiveModeLocalSessionHost,
 	createInteractiveModeUiServicesFromServices,
@@ -1355,7 +1356,7 @@ export async function main(args: string[], options?: MainOptions) {
 			services,
 			sessionManager,
 		});
-		const launchAgentsView = async (initialSession?: SessionSummary) => {
+		const launchAgentsView = async (initialSession?: SessionSummary, initialScopeKey?: AgentsViewScopeKey) => {
 			await runAgentsViewMode({
 				socketPath: daemonSocketPath,
 				config: defaultSessionConfig,
@@ -1385,6 +1386,7 @@ export async function main(args: string[], options?: MainOptions) {
 				promptStashStore,
 				startupModelId: startupModel.model?.id,
 				initialSession,
+				initialScopeKey,
 				verbose: parsed.verbose,
 			});
 		};
@@ -1449,6 +1451,11 @@ export async function main(args: string[], options?: MainOptions) {
 			// view was not rendered here, so we intentionally leave
 			// agentsViewOwnsStartupNotices unset and let the in-session fallback run.
 			returnToAgentsView: !parsed.noSession,
+			sessionDepth: summary.rlmDepth,
+			// Direct launch has only the attached summary; the live+passive+saved
+			// unified catalog index is not built until the agents view opens. Retained
+			// child snapshots augment this running-child fallback inside chat.
+			sessionHasChildren: summary.hasRunningRlmChildren === true,
 		});
 
 		await preloadCodeHighlighter();
@@ -1457,11 +1464,19 @@ export async function main(args: string[], options?: MainOptions) {
 		if (parsed.noSession) {
 			return;
 		}
-		await launchAgentsView({
+		const returnedSummary = {
 			...summary,
 			...interactiveResult.source,
 			id: interactiveResult.source.activeSessionId ?? summary.id,
-		});
+		};
+		const initialScopeKey =
+			interactiveResult.type === "scoped_agents_view"
+				? {
+						sessionId: interactiveResult.source.sessionId,
+						activeSessionId: interactiveResult.source.activeSessionId,
+					}
+				: undefined;
+		await launchAgentsView(returnedSummary, initialScopeKey);
 		return;
 	}
 	if (useDaemonClient) {
