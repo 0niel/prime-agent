@@ -2,11 +2,33 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-04
+
+### Breaking Changes
+
+- Changed `rlm(...)` to return at task admission instead of waiting for the child to finish. It now yields a spawn handle (`rlm_child_id`, `name`, `session_dir`, `model`); `RLMResult` and its final answer, usage, and model-fallback warning are gone. A child reports back with `agent_message.send(..., receiver_role="parent")`, which arrives as an ordinary prompt and starts a parent turn. Code that read `result.answer`, or treated `asyncio.gather(...)` over `rlm(...)` as fan-in, must be updated.
+- Changed `agent_message.send` to role-addressed delivery: pass `receiver_role` (`"parent"`, `"sibling"`, `"child"`) plus `receiver_name` for siblings and children. The old positional `send(target, message)` form no longer works, and the separate `roster()` call is now `agent_message.list_agents()`.
+- Narrowed agent reach to the nuclear family: an agent may message or observe only its parent, siblings, and direct children. Top-level sessions are siblings of one another, so agent-to-agent between them still works; grandchildren and cousins must be reached by relaying through the intermediate child. Users are unaffected and still see every session.
+- Requesting an unavailable subagent model now fails the spawn instead of silently falling back to the parent's model with a warning.
+- Bumped the daemon schema revision to 13 for the parent-edge, depth, naming, and passivation wire changes; older clients and daemons are rejected cleanly at connect.
+
 ### Added
 
-- Added `--mode acp`: prime-agent now runs as an Agent Client Protocol agent over NDJSON on stdio, driving an `AgentConnection` in-process. IPython surfaces as an ACP `execute` tool call carrying its cell source, and capabilities ACP has no native concept for (subagents, autonomous gate state, rich IPython MIME output, compaction) travel in a namespaced `ai.primeintellect.prime-agent` `_meta` envelope that vanilla ACP clients ignore.
+- Added `--mode acp`: Prime Agent now runs as an [Agent Client Protocol](https://agentclientprotocol.com) agent over NDJSON on stdio, driving an `AgentConnection` in-process. IPython surfaces as an ACP `execute` tool call carrying its cell source, and capabilities ACP has no native concept for (subagents, autonomous gate state, rich IPython output, compaction, goals, heartbeats, continual-harness refinement) travel in a namespaced `ai.primeintellect.prime-agent` `_meta` envelope that vanilla ACP clients ignore. Documented in `docs/acp.md`.
+- Added `/rlm-max-depth` to view or set the recursion cap for the current chat, with `--global` to change the default for new sessions.
+- Added recursive navigation to the agents view: drill into any session's children and back out again, with each chat showing its own depth.
+- Added a family roster via `agent_message.list_agents()`, listing parent, siblings, and children with name, id, depth, and status, including family members currently on disk.
+- Added sibling-unique agent names, enforced at spawn and rename against loaded and unloaded sessions alike. The same name may be reused at different depths.
+- Added an `idleEvictionMinutes` setting (default 90, `off` to disable) controlling idle eviction and passivation.
 
-- Added missing argument hints to /name, /model, /export, and /import in autocomplete.
+### Changed
+
+- Changed finished subagents to stay on disk until something touches them, so memory scales with the active frontier rather than every subagent ever spawned. Lists show them without loading them, and attach, message, or transcript read wakes them on demand.
+- Changed sessions to persist their parent edge and derived RLM depth, so tree position no longer has to be inferred from whatever happens to be in memory.
+- Changed the supervisor to stop worker processes whose whole session tree has been idle past the threshold, and to passivate individually idle children inside still-busy workers.
+- Replaced the child-agent inspector with a single subagent summary line under the prompt that opens the agents view scoped to that session's children.
+
+### Fixed
 
 - Fixed `stop` and `rename` rejecting custom daemon socket options.
 - Fixed SIGINT in print mode leaving the session active until liveness reclaim.
@@ -14,6 +36,7 @@
 - Fixed agents-view fallback notices and scoped live sessions surviving transient refresh failures across chat returns.
 - Fixed stopping completed subagents deleting their retained sessions.
 - Fixed silent or cancelled RLM children leaving parents without a terminal status notice.
+- Added missing argument hints to `/name`, `/model`, `/export`, and `/import` in autocomplete.
 
 ## [0.5.1] - 2026-08-04
 
