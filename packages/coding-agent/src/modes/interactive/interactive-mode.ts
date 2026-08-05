@@ -467,6 +467,7 @@ export class BrandSplashHeader implements Component {
 	}
 }
 
+type PendingMessageMutationOutcome = "applied" | "retained" | "obsolete" | "noop";
 type StartupPromptBarrierOutcome = "admitted" | "retained" | "lifecycle-cancelled";
 
 type GoalAnnouncementSnapshot = {
@@ -986,7 +987,7 @@ export class InteractiveMode {
 		followUp: [],
 	};
 	private readonly pendingMessageNavigation = new PendingMessageNavigation();
-	private pendingMessageMutation = Promise.resolve(false);
+	private pendingMessageMutation: Promise<PendingMessageMutationOutcome> = Promise.resolve("noop");
 	private queueEventGeneration = 0;
 	private isPendingMessageNavigationTextChange = false;
 
@@ -4613,10 +4614,12 @@ export class InteractiveMode {
 			try {
 				if (recalledPendingMessage) {
 					try {
-						if (await this.changeSelectedPendingMessage("steer", text)) this.editor.addToHistory?.(text);
-						else this.setEditorFromPendingNavigation(text);
+						const outcome = await this.changeSelectedPendingMessage("steer", text);
+						if (outcome === "applied") this.editor.addToHistory?.(text);
 					} catch (error) {
-						this.setEditorFromPendingNavigation(text);
+						if (submissionGeneration === this.inputSubmissionGeneration && this.editor.getText().length === 0) {
+							this.setEditorFromPendingNavigation(text);
+						}
 						this.showError(error instanceof Error ? error.message : String(error));
 					}
 					this.updatePendingMessagesDisplay();
@@ -6986,7 +6989,7 @@ export class InteractiveMode {
 	private changeSelectedPendingMessage(
 		kind: "delete" | "followUp" | "steer" | "earlier" | "later",
 		text = this.editor.getText(),
-	): Promise<boolean> {
+	): Promise<PendingMessageMutationOutcome> {
 		const run = () => this.applySelectedPendingMessageChange(kind, text);
 		this.pendingMessageMutation = this.pendingMessageMutation.then(run, run);
 		return this.pendingMessageMutation;
@@ -6995,12 +6998,12 @@ export class InteractiveMode {
 	private async applySelectedPendingMessageChange(
 		kind: "delete" | "followUp" | "steer" | "earlier" | "later",
 		text = this.editor.getText(),
-	): Promise<boolean> {
+	): Promise<PendingMessageMutationOutcome> {
 		const selected = this.pendingMessageNavigation.selected;
-		if (!selected) return false;
+		if (!selected) return "noop";
 		const checkpoint = this.pendingMessageNavigation.checkpoint();
 		const change = this.pendingMessageNavigation.change(kind, text);
-		if (!change) return false;
+		if (!change) return "noop";
 		const changedState = this.pendingMessageNavigation.checkpoint();
 		const mutation =
 			kind === "delete"
@@ -7029,7 +7032,7 @@ export class InteractiveMode {
 			} else {
 				this.pendingMessageNavigation.reset();
 			}
-			return false;
+			return "obsolete";
 		}
 		if (result.status !== "applied") {
 			this.connectionQueue = result.queue;
@@ -7042,7 +7045,7 @@ export class InteractiveMode {
 				this.setEditorFromPendingNavigation(checkpoint.draft);
 				this.showWarning("That queued message is no longer pending.");
 			}
-			return false;
+			return "retained";
 		}
 		this.pendingMessageNavigation.restore(changedState);
 		this.pendingMessageNavigation.reconcile(result.queue, change.selected?.id);
@@ -7050,10 +7053,10 @@ export class InteractiveMode {
 		this.setEditorFromPendingNavigation(change.selected ? text : change.draft);
 		this.updatePendingMessagesDisplay();
 		this.ui.requestRender();
-		return true;
+		return "applied";
 	}
 
-	private moveSelectedPendingMessage(delta: -1 | 1): Promise<boolean> {
+	private moveSelectedPendingMessage(delta: -1 | 1): Promise<PendingMessageMutationOutcome> {
 		return this.changeSelectedPendingMessage(delta < 0 ? "earlier" : "later");
 	}
 

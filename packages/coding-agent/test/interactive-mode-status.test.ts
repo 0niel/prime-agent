@@ -634,6 +634,7 @@ type SubmitHandlerHarness = {
 	flushPendingBashComponents: () => void;
 	collectImagesFor: () => unknown[];
 	updatePendingMessagesDisplay: () => void;
+	setEditorFromPendingNavigation: (text: string) => void;
 	pendingMessageNavigation?: {
 		selected?: { lane: "steering" | "followUp"; index: number };
 		draftText?: string;
@@ -689,6 +690,9 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 		flushPendingBashComponents: vi.fn(),
 		collectImagesFor: vi.fn(() => []),
 		updatePendingMessagesDisplay: vi.fn(),
+		setEditorFromPendingNavigation(text: string) {
+			this.editor.setText(text);
+		},
 		ui: { requestRender: vi.fn() },
 		agentConnection: {
 			prompt: vi.fn(async () => {}),
@@ -712,7 +716,7 @@ describe("InteractiveMode submit handling", () => {
 		["followUp", "followUp", "edited"],
 		["followUp", "delete", "   "],
 	] as const)("routes selected-item %s input to the unified %s transition", async (key, expected, text) => {
-		const changeSelectedPendingMessage = vi.fn(async () => true);
+		const changeSelectedPendingMessage = vi.fn(async () => "applied" as const);
 		const selected = { lane: "followUp" as const, index: 0 };
 		const fakeThis = createSubmitHandlerHarness({
 			pendingMessageNavigation: { selected, reset: vi.fn() },
@@ -724,6 +728,63 @@ describe("InteractiveMode submit handling", () => {
 			await Reflect.get(InteractiveMode.prototype, "handleFollowUp").call(fakeThis);
 		}
 		expect(changeSelectedPendingMessage).toHaveBeenCalledWith(expected, ...(expected === "delete" ? [] : ["edited"]));
+	});
+
+	test("recalled Enter leaves newer editor ownership intact after an obsolete response", async () => {
+		let editorText = "";
+		let resolveMutation!: (outcome: "obsolete") => void;
+		const mutation = new Promise<"obsolete">((resolve) => {
+			resolveMutation = resolve;
+		});
+		const fakeThis = createSubmitHandlerHarness({
+			editor: {
+				getText: () => editorText,
+				setText: (value: string) => {
+					editorText = value;
+				},
+				addToHistory: vi.fn(),
+			},
+			pendingMessageNavigation: {
+				selected: { lane: "followUp", index: 0 },
+				reset: vi.fn(),
+			},
+		});
+		Object.assign(fakeThis, { changeSelectedPendingMessage: vi.fn(() => mutation) });
+		const submission = fakeThis.defaultEditor.onSubmit!("edited");
+		editorText = "newer editor";
+		resolveMutation("obsolete");
+		await submission;
+		expect(editorText).toBe("newer editor");
+	});
+
+	test.each([
+		["", "edited"],
+		["newer editor", "newer editor"],
+	] as const)("recalled Enter transport failure preserves editor ownership for %j", async (newerText, expected) => {
+		let editorText = "";
+		let rejectMutation!: (error: Error) => void;
+		const mutation = new Promise<never>((_resolve, reject) => {
+			rejectMutation = reject;
+		});
+		const fakeThis = createSubmitHandlerHarness({
+			editor: {
+				getText: () => editorText,
+				setText: (value: string) => {
+					editorText = value;
+				},
+			},
+			pendingMessageNavigation: {
+				selected: { lane: "followUp", index: 0 },
+				reset: vi.fn(),
+			},
+		});
+		Object.assign(fakeThis, { changeSelectedPendingMessage: vi.fn(() => mutation) });
+		const submission = fakeThis.defaultEditor.onSubmit!("edited");
+		editorText = newerText;
+		rejectMutation(new Error("transport failed"));
+		await submission;
+		expect(editorText).toBe(expected);
+		expect(fakeThis.showError).toHaveBeenCalledWith("transport failed");
 	});
 
 	test.each(["unsupported", "stale"] as const)(
@@ -759,7 +820,7 @@ describe("InteractiveMode submit handling", () => {
 				"followUp",
 				editorText,
 			);
-			expect(applied).toBe(false);
+			expect(applied).toBe("retained");
 			expect(editorText).toBe(status === "unsupported" ? "edited" : "draft");
 			expect(showWarning).toHaveBeenCalledOnce();
 		},
@@ -857,7 +918,7 @@ describe("InteractiveMode submit handling", () => {
 				"followUp",
 				"edited",
 			),
-		).resolves.toBe(false);
+		).resolves.toBe("obsolete");
 		expect(fakeThis.connectionQueue).toBe(queue);
 		expect(fakeThis.setEditorFromPendingNavigation).not.toHaveBeenCalled();
 		expect(fakeThis.showWarning).not.toHaveBeenCalled();
