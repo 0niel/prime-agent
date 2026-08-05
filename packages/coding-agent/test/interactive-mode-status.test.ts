@@ -115,6 +115,26 @@ function createConnectionState(overrides: Partial<AgentConnectionState> = {}): A
 	};
 }
 
+describe("InteractiveMode pending message edit header", () => {
+	test("shows configurable browse, requeue, reorder, and steering hints", () => {
+		const fakeThis = {
+			pendingMessageNavigation: { selected: { lane: "steering", index: 1 } },
+			getAppKeyDisplay: (action: string) =>
+				new Map([
+					["app.message.navigateOlder", "Opt+Up"],
+					["app.message.navigateNewer", "Opt+Down"],
+					["app.message.followUp", "Opt+Enter"],
+					["app.message.moveEarlier", "Ctrl+Opt+Up"],
+					["app.message.moveLater", "Ctrl+Opt+Down"],
+				]).get(action) ?? "",
+		};
+		const header = Reflect.get(InteractiveMode.prototype, "getPendingMessageEditorHeader").call(fakeThis);
+		expect(header).toBe(
+			"steering 2 · Opt+Up/Opt+Down browse · Opt+Enter requeue · Ctrl+Opt+Up/Ctrl+Opt+Down reorder · Enter steer · empty submit deletes",
+		);
+	});
+});
+
 describe("InteractiveMode update notifications", () => {
 	beforeAll(() => {
 		initTheme("dark");
@@ -613,6 +633,13 @@ type SubmitHandlerHarness = {
 	flushPendingBashComponents: () => void;
 	collectImagesFor: () => unknown[];
 	updatePendingMessagesDisplay: () => void;
+	pendingMessageNavigation?: {
+		selected?: { lane: "steering" | "followUp"; index: number };
+		draftText?: string;
+		reset(): void;
+	};
+	connectionQueue?: { steering: string[]; followUp: string[] };
+	rebuildPendingQueue?: (queue: { steering: string[]; followUp: string[] }) => Promise<void>;
 	ui: { requestRender: () => void };
 	clearSideQuestion: () => void;
 	clearShortcutGuide: () => void;
@@ -678,6 +705,26 @@ function createSubmitHandlerHarness(overrides: Partial<SubmitHandlerHarness> = {
 }
 
 describe("InteractiveMode submit handling", () => {
+	test.each([
+		["enter", "steer", "edited"],
+		["enter", "delete", "   "],
+		["followUp", "followUp", "edited"],
+		["followUp", "delete", "   "],
+	] as const)("routes selected-item %s input to the unified %s transition", async (key, expected, text) => {
+		const changeSelectedPendingMessage = vi.fn(async () => true);
+		const selected = { lane: "followUp" as const, index: 0 };
+		const fakeThis = createSubmitHandlerHarness({
+			pendingMessageNavigation: { selected, reset: vi.fn() },
+		});
+		Object.assign(fakeThis, { changeSelectedPendingMessage });
+		if (key === "enter") await fakeThis.defaultEditor.onSubmit?.(text);
+		else {
+			Object.assign(fakeThis.editor, { getText: () => text, getExpandedText: () => text, onSubmit: vi.fn() });
+			await Reflect.get(InteractiveMode.prototype, "handleFollowUp").call(fakeThis);
+		}
+		expect(changeSelectedPendingMessage).toHaveBeenCalledWith(expected, ...(expected === "delete" ? [] : ["edited"]));
+	});
+
 	test.each(["normal Enter", "installed custom editor"])("captures exact rich state for %s", async () => {
 		const image = { type: "image", data: "base64", mimeType: "image/png" };
 		const pasteSnapshot = { pastes: [[1, "expanded paste"]] as const, pasteCounter: 2 };

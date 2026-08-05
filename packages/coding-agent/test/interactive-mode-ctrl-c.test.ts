@@ -167,21 +167,22 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		expect(mode.shutdown).not.toHaveBeenCalled();
 	});
 
-	it("restores queued messages through the atomic abort-and-clear path", async () => {
+	it("atomically aborts, clears, and merges every queued item before the draft without prompting", async () => {
 		const mode = createInteractiveFake({ editorText: "draft" });
 		mode.agentConnection.abortAndClearQueue.mockResolvedValue({
-			steering: ["steer"],
-			followUp: ["follow"],
+			steering: ["steer one", "steer two"],
+			followUp: ["follow one", "follow two"],
 		});
 
-		const restoreQueuedMessagesToEditor = Reflect.get(InteractiveMode.prototype, "restoreQueuedMessagesToEditor");
-		const restored = await restoreQueuedMessagesToEditor.call(mode, { abort: true });
+		const restored = await Reflect.get(InteractiveMode.prototype, "restoreQueuedMessagesToEditor").call(mode, {
+			abort: true,
+		});
 
-		expect(restored).toBe(2);
-		expect(mode.agentConnection.abortAndClearQueue).toHaveBeenCalledTimes(1);
+		expect(restored).toBe(4);
+		expect(mode.agentConnection.abortAndClearQueue).toHaveBeenCalledOnce();
 		expect(mode.agentConnection.clearQueue).not.toHaveBeenCalled();
 		expect(mode.agentConnection.abort).not.toHaveBeenCalled();
-		expect(mode.editor.getText()).toBe("steer\n\nfollow\n\ndraft");
+		expect(mode.editor.getText()).toBe("steer one\n\nsteer two\n\nfollow one\n\nfollow two\n\ndraft");
 	});
 
 	it("exits on the second Ctrl+C while the hint is visible", () => {

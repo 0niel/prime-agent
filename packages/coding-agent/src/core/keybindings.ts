@@ -28,7 +28,10 @@ export interface AppKeybindings {
 	"app.editor.external": true;
 	"app.prompt.stash": true;
 	"app.message.followUp": true;
-	"app.message.dequeue": true;
+	"app.message.navigateOlder": true;
+	"app.message.navigateNewer": true;
+	"app.message.moveEarlier": true;
+	"app.message.moveLater": true;
 	"app.clipboard.pasteImage": true;
 	"app.session.new": true;
 	"app.session.tree": true;
@@ -110,9 +113,21 @@ export const KEYBINDINGS = {
 		defaultKeys: "alt+enter",
 		description: "Queue follow-up message",
 	},
-	"app.message.dequeue": {
+	"app.message.navigateOlder": {
 		defaultKeys: "alt+up",
-		description: "Restore queued messages",
+		description: "Select older pending message",
+	},
+	"app.message.navigateNewer": {
+		defaultKeys: "alt+down",
+		description: "Select newer pending message or draft",
+	},
+	"app.message.moveEarlier": {
+		defaultKeys: "ctrl+alt+up",
+		description: "Move selected pending message earlier",
+	},
+	"app.message.moveLater": {
+		defaultKeys: "ctrl+alt+down",
+		description: "Move selected pending message later",
 	},
 	"app.clipboard.pasteImage": {
 		defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v",
@@ -201,6 +216,7 @@ export const KEYBINDINGS = {
 } as const satisfies KeybindingDefinitions;
 
 const KEYBINDING_NAME_MIGRATIONS = {
+	"app.message.dequeue": "app.message.navigateOlder",
 	cursorUp: "tui.editor.cursorUp",
 	cursorDown: "tui.editor.cursorDown",
 	cursorLeft: "tui.editor.cursorLeft",
@@ -243,7 +259,7 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	focusSubagents: "app.subagents.focus",
 	externalEditor: "app.editor.external",
 	followUp: "app.message.followUp",
-	dequeue: "app.message.dequeue",
+	dequeue: "app.message.navigateOlder",
 	pasteImage: "app.clipboard.pasteImage",
 	newSession: "app.session.new",
 	tree: "app.session.tree",
