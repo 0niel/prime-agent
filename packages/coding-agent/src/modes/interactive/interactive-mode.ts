@@ -4419,6 +4419,13 @@ export class InteractiveMode {
 		return images.length > 0 ? images : undefined;
 	}
 
+	private queueMutationImages(text: string): ImageContent[] | undefined {
+		const markerIds = imageMarkerIds(text);
+		if (markerIds.length === 0) return [];
+		const images = this.collectImagesFor(text);
+		return images?.length === markerIds.length ? images : undefined;
+	}
+
 	private hasPastedImagesFor(text: string): boolean {
 		return imageMarkerIds(text).some((id) => this.pastedImages.has(id));
 	}
@@ -7005,7 +7012,7 @@ export class InteractiveMode {
 						: {
 								type: kind === "steer" ? ("replace_steering" as const) : ("replace_follow_up" as const),
 								text,
-								images: this.collectImagesFor(text),
+								images: this.queueMutationImages(text),
 							};
 		let result: AgentConnectionQueueMutationResult;
 		try {

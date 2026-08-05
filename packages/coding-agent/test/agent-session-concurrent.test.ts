@@ -187,17 +187,41 @@ describe("AgentSession concurrent prompt guard", () => {
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		await session.prompt("duplicate", { streamingBehavior: "steer", queueIfBusy: true, source: "interactive" });
 		await session.sendUserMessage("extension item", { deliverAs: "steer" });
-		await session.prompt("duplicate", { streamingBehavior: "steer", queueIfBusy: true, source: "interactive" });
+		const originalImage: ImageContent = { type: "image", data: "original", mimeType: "image/png" };
+		await session.prompt("duplicate [image #1]", {
+			streamingBehavior: "steer",
+			queueIfBusy: true,
+			source: "interactive",
+			images: [originalImage],
+		});
 		await session.prompt("follow", { streamingBehavior: "followUp", queueIfBusy: true, source: "interactive" });
 		const staleRevision = session.queueRevision - 1;
 		const [first, second, follow] = session.getEditableQueueItems();
-		expect([first?.text, second?.text, follow?.text]).toEqual(["duplicate", "duplicate", "follow"]);
+		expect([first?.text, second?.text, follow?.text]).toEqual(["duplicate", "duplicate [image #1]", "follow"]);
+		expect(second?.hasImages).toBe(true);
 
-		expect(session.getSteeringMessages()).toEqual(["duplicate", "extension item", "duplicate"]);
+		expect(session.getSteeringMessages()).toEqual(["duplicate", "extension item", "duplicate [image #1]"]);
 		expect(session.mutateQueuedUserMessage(second!.id, staleRevision, { type: "delete" })).toBe(false);
 		expect(session.mutateQueuedUserMessage("missing", session.queueRevision, { type: "delete" })).toBe(false);
 		expect(session.mutateQueuedUserMessage(second!.id, session.queueRevision, { type: "move_earlier" })).toBe(true);
 		expect(session.getEditableQueueItems().map((item) => item.id)).toEqual([second!.id, first!.id, follow!.id]);
+		expect(
+			session.mutateQueuedUserMessage(second!.id, session.queueRevision, {
+				type: "replace_steering",
+				text: "reconnected edit [image #1]",
+			}),
+		).toBe(true);
+		let preserved = session.getSessionActionRecoverySnapshot().actions.find((action) => action.id === second!.id);
+		expect(preserved?.payload).toMatchObject({ images: [originalImage] });
+		expect(
+			session.mutateQueuedUserMessage(second!.id, session.queueRevision, {
+				type: "replace_steering",
+				text: "removed marker",
+				images: [],
+			}),
+		).toBe(true);
+		preserved = session.getSessionActionRecoverySnapshot().actions.find((action) => action.id === second!.id);
+		expect(preserved?.payload).not.toHaveProperty("images");
 		const image: ImageContent = { type: "image", data: "encoded", mimeType: "image/png" };
 		expect(
 			session.mutateQueuedUserMessage(second!.id, session.queueRevision, {

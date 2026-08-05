@@ -751,6 +751,7 @@ describe("InteractiveMode submit handling", () => {
 					})),
 				},
 				collectImagesFor: () => [],
+				queueMutationImages: () => [],
 				showWarning,
 			};
 			const applied = await Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange").call(
@@ -841,6 +842,7 @@ describe("InteractiveMode submit handling", () => {
 				})),
 			},
 			collectImagesFor: () => [],
+			queueMutationImages: () => [],
 			setEditorFromPendingNavigation: vi.fn(),
 			showWarning: vi.fn(),
 		};
@@ -855,6 +857,20 @@ describe("InteractiveMode submit handling", () => {
 		expect(fakeThis.setEditorFromPendingNavigation).not.toHaveBeenCalled();
 		expect(fakeThis.showWarning).not.toHaveBeenCalled();
 		expect(editorText).toBe("newer editor");
+	});
+
+	test.each([
+		["plain text", [], "clear"],
+		["keep [image #1]", undefined, "preserve"],
+		["replace [image #1]", [{ type: "image", data: "new", mimeType: "image/png" }], "replace"],
+	] as const)("uses explicit image semantics for %s (%s)", (text, resolved, _label) => {
+		const result = Reflect.get(InteractiveMode.prototype, "queueMutationImages").call(
+			{
+				collectImagesFor: () => resolved,
+			},
+			text,
+		);
+		expect(result).toEqual(resolved);
 	});
 
 	test("serializes rapid selected-item mutations", async () => {

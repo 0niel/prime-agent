@@ -6086,8 +6086,20 @@ export class AgentSession {
 		return { steering: removedSteering, followUp: removedFollowUp };
 	}
 
-	getEditableQueueItems(): Array<{ id: string; lane: "steering" | "followUp"; index: number; text: string }> {
-		const result: Array<{ id: string; lane: "steering" | "followUp"; index: number; text: string }> = [];
+	getEditableQueueItems(): Array<{
+		id: string;
+		lane: "steering" | "followUp";
+		index: number;
+		text: string;
+		hasImages?: boolean;
+	}> {
+		const result: Array<{
+			id: string;
+			lane: "steering" | "followUp";
+			index: number;
+			text: string;
+			hasImages?: boolean;
+		}> = [];
 		for (const [delivery, lane] of [
 			["next_turn_boundary", "steering"],
 			["when_run_idle", "followUp"],
@@ -6099,7 +6111,14 @@ export class AgentSession {
 						action.payload.kind === "turn" && action.payload.queueVisible && action.source === "interactive",
 				);
 			for (const [index, action] of editable.entries()) {
-				if (action.payload.kind === "turn") result.push({ id: action.id, lane, index, text: action.payload.text });
+				if (action.payload.kind === "turn")
+					result.push({
+						id: action.id,
+						lane,
+						index,
+						text: action.payload.text,
+						...(action.payload.images?.length ? { hasImages: true } : {}),
+					});
 			}
 		}
 		return result;
@@ -6147,16 +6166,22 @@ export class AgentSession {
 					? this._actionStore.queuedActions(lane).indexOf(action)
 					: this._actionStore.queuedActions(targetLane).length;
 			action.payload.text = mutation.text;
-			action.payload.images = mutation.images?.map((image) => ({ ...image }));
-			action.payload.content = mutation.images
-				? [{ type: "text", text: mutation.text }, ...mutation.images.map((image) => ({ ...image }))]
-				: undefined;
+			if (mutation.images !== undefined) {
+				action.payload.images = mutation.images.length ? mutation.images.map((image) => ({ ...image })) : undefined;
+				action.payload.content = mutation.images.length
+					? [{ type: "text", text: mutation.text }, ...mutation.images.map((image) => ({ ...image }))]
+					: [{ type: "text", text: mutation.text }];
+			} else if (action.payload.content) {
+				action.payload.content = action.payload.content.map((block) =>
+					block.type === "text" ? { ...block, text: mutation.text } : block,
+				);
+			}
 			action.payload.preview = undefined;
 			action.payload.prepared = undefined;
 			for (const record of action.payload.records) {
 				if (record.role === "primary" && record.message.role === "user") {
-					record.message.content = mutation.images
-						? [{ type: "text", text: mutation.text }, ...mutation.images.map((image) => ({ ...image }))]
+					record.message.content = action.payload.content
+						? action.payload.content.map((block) => ({ ...block }))
 						: mutation.text;
 				}
 			}
