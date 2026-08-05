@@ -21,7 +21,6 @@ describe("InteractiveMode startup hints", () => {
 
 	function createMode(sessionHasMessages = false, returnToAgentsView = false, getEditorText = () => "") {
 		const mode = {
-			childAgentPanelMode: undefined,
 			sessionHasMessages,
 			options: { returnToAgentsView },
 			editor: { getText: getEditorText },

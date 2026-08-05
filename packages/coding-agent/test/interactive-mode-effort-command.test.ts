@@ -42,7 +42,7 @@ type FastCommandContext = {
 		getState: () => Promise<{ sessionId: string; serviceTier: ServiceTier }>;
 	};
 	footer: { invalidate: () => void };
-	childAgentSummary: { invalidate: () => void };
+	subagentSummaryLine: { invalidate: () => void };
 	showStatus: (message: string) => void;
 	showError: (message: string) => void;
 	patchConnectionState: (patch: Record<string, unknown>) => void;
@@ -79,7 +79,7 @@ function makeFastContext(model: Model<Api> = testModel("openai-codex", "gpt-5.5"
 		fastModeToggleQueue: Promise.resolve(),
 		agentConnection: undefined as never,
 		footer: { invalidate: vi.fn() },
-		childAgentSummary: { invalidate: vi.fn() },
+		subagentSummaryLine: { invalidate: vi.fn() },
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 		patchConnectionState: vi.fn((patch: Record<string, unknown>) => {
@@ -244,7 +244,7 @@ describe("InteractiveMode /effort", () => {
 				settingsManager: { setDefaultModelAndProvider: (provider: string, id: string) => void };
 				patchConnectionState: (patch: Record<string, unknown>) => void;
 				footer: { invalidate: () => void };
-				childAgentSummary: { invalidate: () => void };
+				subagentSummaryLine: { invalidate: () => void };
 				updateEditorBorderColor: () => void;
 				setupAutocompleteProvider: () => void;
 			};
@@ -272,7 +272,7 @@ describe("InteractiveMode /effort", () => {
 				settingsManager: { setDefaultModelAndProvider: vi.fn() },
 				patchConnectionState,
 				footer: { invalidate: vi.fn() },
-				childAgentSummary: { invalidate: vi.fn() },
+				subagentSummaryLine: { invalidate: vi.fn() },
 				updateEditorBorderColor: vi.fn(),
 				setupAutocompleteProvider,
 			};
@@ -299,7 +299,7 @@ describe("InteractiveMode /effort", () => {
 			expect(context.agentConnection.setServiceTier).toHaveBeenCalledWith("priority");
 			expect(context.patchConnectionState).toHaveBeenCalledWith({ serviceTier: "priority" });
 			expect(context.footer.invalidate).toHaveBeenCalledWith();
-			expect(context.childAgentSummary.invalidate).toHaveBeenCalledWith();
+			expect(context.subagentSummaryLine.invalidate).toHaveBeenCalledWith();
 		});
 
 		it("disables Fast mode when it is already enabled", async () => {

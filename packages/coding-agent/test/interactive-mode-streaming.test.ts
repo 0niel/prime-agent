@@ -35,7 +35,6 @@ type HandleEventThis = {
 	chatContainer: Container;
 	recapContainer: Container;
 	sessionRecap: string | undefined;
-	childAgentPanelMode: undefined;
 	hideThinkingBlock: boolean;
 	hiddenThinkingLabel: string;
 	streamingComponent: AssistantMessageComponent | undefined;
@@ -85,7 +84,6 @@ function createFakeInteractiveModeThis(): HandleEventThis {
 		chatContainer: new Container(),
 		recapContainer: new Container(),
 		sessionRecap: "Updated files",
-		childAgentPanelMode: undefined,
 		hideThinkingBlock: false,
 		hiddenThinkingLabel: "Thinking...",
 		streamingComponent: undefined,

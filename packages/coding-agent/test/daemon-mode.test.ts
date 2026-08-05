@@ -33,6 +33,7 @@ import {
 	createDaemonCommandEnvelope,
 	type DaemonAttachResult,
 	type DaemonCommand,
+	type DaemonOutbound,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 
@@ -3086,6 +3087,119 @@ describe("daemon mode helpers", () => {
 		expect(client.catchupActiveSessionIds).toEqual(new Set());
 	});
 
+	it("automatically retries every pending catch-up after snapshot creation rejects", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const firstState = makeState("first");
+		const secondState = makeState("second");
+		firstState.eventGeneration = "generation-1";
+		secondState.eventGeneration = "generation-2";
+		const write = vi.fn((_data: unknown) => true);
+		const client = makeClient("client-1", firstState.activeSessionId);
+		client.socket = { destroyed: false, write } as unknown as Socket;
+		firstState.clients.add(client);
+		secondState.clients.add(client);
+		const createAttachResult = vi.fn(async (_client: DaemonSocketClient, state: ActiveSessionState) => {
+			if (createAttachResult.mock.calls.length === 1) {
+				throw new Error("snapshot creation failed");
+			}
+			return {
+				activeSessionId: state.activeSessionId,
+				snapshot: {
+					activeSessionId: state.activeSessionId,
+					state: { activeSessionId: state.activeSessionId },
+					messages: [],
+					lastEventSequence: state.lastEventSequence,
+				},
+				lastEventSequence: state.lastEventSequence,
+			} as unknown as DaemonAttachResult;
+		});
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createAttachResult: typeof createAttachResult;
+			queueClientCatchup(
+				client: DaemonSocketClient,
+				activeSessionId: string,
+				purpose?: "replacement" | "resync",
+			): void;
+			catchUpBackpressuredClient(client: DaemonSocketClient): Promise<void>;
+		};
+		internals.sessions.set(firstState.activeSessionId, firstState);
+		internals.sessions.set(secondState.activeSessionId, secondState);
+		internals.createAttachResult = createAttachResult;
+		internals.queueClientCatchup(client, firstState.activeSessionId, "replacement");
+		internals.queueClientCatchup(client, secondState.activeSessionId, "resync");
+
+		await internals.catchUpBackpressuredClient(client);
+
+		expect(client.catchupActiveSessionIds).toEqual(
+			new Set([firstState.activeSessionId, secondState.activeSessionId]),
+		);
+		expect(client.catchupPurposes).toEqual(
+			new Map([
+				[firstState.activeSessionId, "replacement"],
+				[secondState.activeSessionId, "resync"],
+			]),
+		);
+		expect(createAttachResult).toHaveBeenCalledOnce();
+
+		await vi.waitFor(() => expect(createAttachResult).toHaveBeenCalledTimes(3));
+
+		expect(client.catchupActiveSessionIds).toEqual(new Set());
+		expect(client.catchupPurposes).toEqual(new Map());
+		const messages = write.mock.calls.map(([data]) => JSON.parse(String(data)) as { type: string });
+		expect(messages.map((message) => message.type)).toEqual(["session_replaced", "session_resynced"]);
+	});
+
+	it("clears a scheduled catch-up retry when the client disconnects", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const state = makeState("active");
+		state.extensionUiRequests = new Map();
+		const socketState = { destroyed: false };
+		const socket = Object.assign(new EventEmitter(), {
+			get destroyed() {
+				return socketState.destroyed;
+			},
+			write: vi.fn((_data: unknown) => true),
+		}) as unknown as Socket;
+		const createAttachResult = vi.fn(async () => {
+			throw new Error("snapshot creation failed");
+		});
+		const internals = daemon as unknown as {
+			clients: Set<DaemonSocketClient>;
+			sessions: Map<string, ActiveSessionState>;
+			handleConnection(socket: Socket): void;
+			createAttachResult: typeof createAttachResult;
+			queueClientCatchup(client: DaemonSocketClient, activeSessionId: string): void;
+			catchUpBackpressuredClient(client: DaemonSocketClient): Promise<void>;
+		};
+		internals.handleConnection(socket);
+		const client = [...internals.clients][0]!;
+		client.attachedActiveSessionIds.add(state.activeSessionId);
+		state.clients.add(client);
+		internals.sessions.set(state.activeSessionId, state);
+		internals.createAttachResult = createAttachResult;
+		internals.queueClientCatchup(client, state.activeSessionId);
+
+		await internals.catchUpBackpressuredClient(client);
+
+		expect(client.catchupRetryTimer).toBeDefined();
+		socketState.destroyed = true;
+		socket.emit("close");
+		expect(client.catchupRetryTimer).toBeUndefined();
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		expect(createAttachResult).toHaveBeenCalledOnce();
+	});
+
 	it("marks a chunked attach as snapshotting before deferred streaming", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-snapshot-order-"));
 		try {
@@ -3146,7 +3260,7 @@ describe("daemon mode helpers", () => {
 		expect(client.snapshotActiveSessionIds).not.toContain("active");
 	});
 
-	it("falls back to a full replacement when snapshot cache creation fails", () => {
+	it("falls back to a full replacement when snapshot cache creation fails", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-agent-daemon-replacement-fallback-"));
 		try {
 			const invalidAgentDir = join(root, "not-a-directory");
@@ -3175,10 +3289,12 @@ describe("daemon mode helpers", () => {
 				lastEventSequence: 0,
 			} as unknown as DaemonAttachResult;
 			const internals = daemon as unknown as {
-				createAttachResult: () => DaemonAttachResult;
+				sessions: Map<string, ActiveSessionState>;
+				createAttachResult: () => Promise<DaemonAttachResult>;
 				broadcastToSession(state: ActiveSessionState, message: unknown): void;
 			};
-			internals.createAttachResult = () => result;
+			internals.sessions.set(state.activeSessionId, state);
+			internals.createAttachResult = async () => result;
 
 			internals.broadcastToSession(state, {
 				type: "session_replaced",
@@ -3187,14 +3303,154 @@ describe("daemon mode helpers", () => {
 				messages: [],
 			});
 
-			expect(write).toHaveBeenCalledTimes(2);
-			const replacementFrame = String(write.mock.calls[0]?.[0]);
-			expect(replacementFrame).toContain('"type":"session_replaced"');
-			expect(replacementFrame).toContain('"snapshotFollows":true');
-			expect(String(write.mock.calls[1]?.[0])).toContain('"type":"session_snapshot_begin"');
+			await vi.waitFor(() => expect(write).toHaveBeenCalled());
+			const frames = write.mock.calls.map((call) => String(call[0])).join("\n");
+			expect(frames).toContain('"type":"session_replaced"');
+			expect(frames).toContain('"snapshotFollows":true');
+			expect(frames).toContain('"type":"session_snapshot_begin"');
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it.each(["resolved", "rejected"] as const)(
+		"does not send a replacement snapshot after the session closes while preparation is %s",
+		async (outcome) => {
+			const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const state = makeState("active");
+			state.eventGeneration = "generation-1";
+			state.extensionUiRequests = new Map();
+			state.unsubscribe = vi.fn();
+			state.runtime = {
+				...state.runtime,
+				dispose: vi.fn(async () => {}),
+				session: {
+					sessionId: "session-active",
+					sessionFile: undefined,
+					isBashRunning: false,
+					abort: vi.fn(async () => {}),
+					sessionManager: { appendSessionState: vi.fn() },
+				},
+			} as unknown as ActiveSessionState["runtime"];
+			const write = vi.fn((_data: unknown) => true);
+			const client = makeClient("client-1", state.activeSessionId);
+			client.socket = { destroyed: false, write } as unknown as Socket;
+			client.transport = "private-framed";
+			setDaemonClientSessionCapabilities(client, state.activeSessionId, new Set(["chunked_snapshot"]));
+			state.clients.add(client);
+			let resolveAttach: (result: DaemonAttachResult) => void = () => {};
+			let rejectAttach: (error: Error) => void = () => {};
+			const pendingAttach = new Promise<DaemonAttachResult>((resolve, reject) => {
+				resolveAttach = resolve;
+				rejectAttach = reject;
+			});
+			const streamWorkerSnapshot = vi.fn(async () => {});
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createAttachResult: ReturnType<typeof vi.fn>;
+				streamWorkerSnapshot: typeof streamWorkerSnapshot;
+				closeSession(state: ActiveSessionState, reason: "killed"): Promise<void>;
+				closeChildSessions: ReturnType<typeof vi.fn>;
+				isEmptyDraftContent: ReturnType<typeof vi.fn>;
+				abortBashForClose: ReturnType<typeof vi.fn>;
+				recordWorkerRecoveryState: ReturnType<typeof vi.fn>;
+				cancelScheduledJobsForSession: ReturnType<typeof vi.fn>;
+				broadcastToSession(state: ActiveSessionState, message: unknown): void;
+			};
+			internals.sessions.set(state.activeSessionId, state);
+			internals.createAttachResult = vi.fn(() => pendingAttach);
+			internals.streamWorkerSnapshot = streamWorkerSnapshot;
+			internals.closeChildSessions = vi.fn(async () => undefined);
+			internals.isEmptyDraftContent = vi.fn(() => true);
+			internals.abortBashForClose = vi.fn(async () => {});
+			internals.recordWorkerRecoveryState = vi.fn();
+			internals.cancelScheduledJobsForSession = vi.fn();
+
+			internals.broadcastToSession(state, {
+				type: "session_replaced",
+				activeSessionId: state.activeSessionId,
+				state: {},
+				messages: [],
+			});
+			const snapshotSignal = client.snapshotTransferAbortControllers?.get(state.activeSessionId)?.signal;
+			expect(snapshotSignal?.aborted).toBe(false);
+
+			await internals.closeSession(state, "killed");
+			expect(snapshotSignal?.aborted).toBe(true);
+
+			if (outcome === "resolved") {
+				resolveAttach({
+					activeSessionId: state.activeSessionId,
+					snapshot: { summary: {}, state: {}, messages: [] },
+					lastEventSequence: 0,
+				} as unknown as DaemonAttachResult);
+			} else {
+				rejectAttach(new Error("snapshot preparation failed after close"));
+			}
+			await vi.waitFor(() => expect(client.snapshotStreaming).toBe(false));
+
+			const frames = write.mock.calls.map((call) => String(call[0])).join("\n");
+			expect(frames).toContain('"type":"session_closed"');
+			expect(frames).not.toContain('"type":"session_replaced"');
+			expect(frames).not.toContain('"type":"session_snapshot_begin"');
+			expect(streamWorkerSnapshot).not.toHaveBeenCalled();
+		},
+	);
+
+	it("drains queued catch-up after replacement snapshot preparation outlives its session", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const state = makeState("closing");
+		state.eventGeneration = "generation-1";
+		const otherState = makeState("queued");
+		const client = makeClient("client-1", state.activeSessionId);
+		client.transport = "private-framed";
+		setDaemonClientSessionCapabilities(client, state.activeSessionId, new Set(["chunked_snapshot"]));
+		state.clients.add(client);
+		let resolveAttach: (result: DaemonAttachResult) => void = () => {};
+		const pendingAttach = new Promise<DaemonAttachResult>((resolve) => {
+			resolveAttach = resolve;
+		});
+		const catchUpBackpressuredClient = vi.fn(async (target: DaemonSocketClient) => {
+			target.catchupActiveSessionIds?.clear();
+		});
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			createAttachResult: ReturnType<typeof vi.fn>;
+			catchUpBackpressuredClient: typeof catchUpBackpressuredClient;
+			broadcastToSession(state: ActiveSessionState, message: DaemonOutbound): void;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		internals.sessions.set(otherState.activeSessionId, otherState);
+		internals.createAttachResult = vi.fn(() => pendingAttach);
+		internals.catchUpBackpressuredClient = catchUpBackpressuredClient;
+
+		internals.broadcastToSession(state, {
+			type: "session_replaced",
+			activeSessionId: state.activeSessionId,
+			state: {},
+			messages: [],
+		} as unknown as DaemonOutbound);
+		client.catchupActiveSessionIds = new Set([otherState.activeSessionId]);
+		internals.sessions.delete(state.activeSessionId);
+		resolveAttach({
+			activeSessionId: state.activeSessionId,
+			snapshot: { summary: {}, state: {}, messages: [] },
+			lastEventSequence: 0,
+		} as unknown as DaemonAttachResult);
+
+		await vi.waitFor(() => expect(catchUpBackpressuredClient).toHaveBeenCalledWith(client));
+		expect(client.snapshotStreaming).toBe(false);
+		expect(client.catchupActiveSessionIds).toEqual(new Set());
 	});
 
 	it.each([
@@ -3612,6 +3868,9 @@ describe("daemon mode helpers", () => {
 				createAgentMessageController(
 					getCurrentState: () => ActiveSessionState | undefined,
 				): AgentSessionMessageController;
+				buildRlmChildSnapshotsWithPassiveRlmSubagents(
+					state: ActiveSessionState,
+				): Promise<NonNullable<DaemonAttachResult["snapshot"]["children"]>>;
 				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
 			};
 
@@ -3622,6 +3881,21 @@ describe("daemon mode helpers", () => {
 
 			expect(fixture.createRuntime).toHaveBeenCalledOnce();
 			expect([...internals.sessions.values()]).toEqual([parentState]);
+			const children = await internals.buildRlmChildSnapshotsWithPassiveRlmSubagents(parentState);
+			expect(children).toEqual([
+				expect.objectContaining({
+					id: fixture.childId,
+					status: "done",
+				}),
+				expect.objectContaining({
+					id: fixture.grandchildId,
+					parentId: fixture.childId,
+					status: "done",
+				}),
+			]);
+			expect(children.every((child) => child.activeSessionId === undefined)).toBe(true);
+			// Snapshotting must reuse the passive registry walk without hydrating children.
+			expect(fixture.createRuntime).toHaveBeenCalledOnce();
 			expect((await internals.createAgentMessageController(() => parentState).listAgents()).agents).toContainEqual(
 				expect.objectContaining({
 					activeSessionId: expect.any(String),

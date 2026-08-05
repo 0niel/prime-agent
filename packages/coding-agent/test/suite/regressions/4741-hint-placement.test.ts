@@ -39,7 +39,6 @@ function createFeatureHintMode() {
 		featureHintComponent: undefined,
 		featureHintRunPending: false,
 		featureHintSuppressedByQueue: false,
-		childAgentPanelMode: undefined,
 		options: { returnToAgentsView: true },
 		getAppKeyDisplay: () => "Ctrl+Q",
 		ui: { requestRender: vi.fn() },
@@ -67,7 +66,7 @@ describe("ENG-4741 hint placement", () => {
 		const queuedMessagesContainer = new Container();
 		const sideQuestionContainer = new Container();
 		const editorContainer = new Container();
-		const childAgentSummary = new Container();
+		const subagentSummaryLine = new Container();
 		const footerSlot = new Container();
 		const mode = Object.assign(Object.create(InteractiveMode.prototype), {
 			recapContainer,
@@ -75,7 +74,7 @@ describe("ENG-4741 hint placement", () => {
 			queuedMessagesContainer,
 			sideQuestionContainer,
 			editorContainer,
-			childAgentSummary,
+			subagentSummaryLine,
 			footerSlot,
 		});
 
@@ -85,7 +84,7 @@ describe("ENG-4741 hint placement", () => {
 			queuedMessagesContainer,
 			sideQuestionContainer,
 		]);
-		expect(callPrivate(mode, "getPromptDockComponents")).toEqual([editorContainer, childAgentSummary, footerSlot]);
+		expect(callPrivate(mode, "getPromptDockComponents")).toEqual([editorContainer, subagentSummaryLine, footerSlot]);
 	});
 
 	it("keeps hints in the fullscreen transcript instead of the prompt dock", () => {

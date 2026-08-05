@@ -33,7 +33,6 @@ import type {
 	AgentConnectionModelCatalog,
 	AgentConnectionResourceDiagnostic,
 	AgentConnectionResourceSnapshot,
-	AgentConnectionRlmChildAgentSnapshot,
 	AgentConnectionSessionContext,
 	AgentConnectionSessionEvent,
 	AgentConnectionSnapshot,
@@ -47,12 +46,7 @@ import { BashExecutionComponent } from "../src/modes/interactive/components/bash
 import type { ConfigurationMenuComponent } from "../src/modes/interactive/components/configuration-menu.js";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
-import {
-	formatSplashCwd,
-	InteractiveMode,
-	mergeChildAgentSnapshots,
-	truncatePathMiddle,
-} from "../src/modes/interactive/interactive-mode.js";
+import { formatSplashCwd, InteractiveMode, truncatePathMiddle } from "../src/modes/interactive/interactive-mode.js";
 import { ClientPromptStashStore, type PromptStashState } from "../src/modes/interactive/prompt-stash-state.js";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
@@ -120,56 +114,6 @@ function createConnectionState(overrides: Partial<AgentConnectionState> = {}): A
 		...overrides,
 	};
 }
-
-describe("mergeChildAgentSnapshots", () => {
-	const rich: AgentConnectionRlmChildAgentSnapshot = {
-		id: "child-1",
-		activeSessionId: "active-child-1",
-		model: "openai/gpt-5.4",
-		label: "Inspect the scheduler",
-		status: "running",
-		durationMs: 5_000,
-		answerPreview: "Reading the queue",
-		toolUseCount: 4,
-		tokenCount: 41_000,
-		recap: "Tracing dispatch",
-		sessionDir: "/tmp/child-1",
-		activity: { kind: "executing", toolName: "ipython" },
-	};
-
-	test("preserves rich live fields when a daemon resync is sparse", () => {
-		const merged = mergeChildAgentSnapshots(rich, {
-			id: "child-1",
-			label: "Inspect the scheduler",
-			status: "running",
-			sessionDir: "/tmp/child-1",
-		});
-
-		expect(merged).toMatchObject({
-			activeSessionId: "active-child-1",
-			model: "openai/gpt-5.4",
-			durationMs: 5_000,
-			answerPreview: "Reading the queue",
-			toolUseCount: 4,
-			tokenCount: 41_000,
-			recap: "Tracing dispatch",
-			activity: { kind: "executing", toolName: "ipython" },
-		});
-	});
-
-	test("clears transient activity when the child finishes", () => {
-		const merged = mergeChildAgentSnapshots(rich, {
-			id: "child-1",
-			label: "Inspect the scheduler",
-			status: "done",
-			sessionDir: "/tmp/child-1",
-		});
-
-		expect(merged.activity).toBeUndefined();
-		expect(merged.toolUseCount).toBe(4);
-		expect(merged.tokenCount).toBe(41_000);
-	});
-});
 
 describe("InteractiveMode update notifications", () => {
 	beforeAll(() => {
@@ -835,8 +779,6 @@ describe("InteractiveMode submit handling", () => {
 			});
 			Object.assign(fakeThis, {
 				editorContainer: new Container(),
-				childAgentPanelMode: undefined,
-				childAgentSummary: { setHidden: vi.fn() },
 				ui: { setFocus: vi.fn(), requestRender: vi.fn() },
 				keybindings: {},
 				autocompleteProvider: undefined,
@@ -1203,7 +1145,7 @@ describe("InteractiveMode pending bash components", () => {
 			ipythonToolComponents: new Map(),
 			lateIpythonSentAgentMessages: new Map(),
 			resetPendingToolState: vi.fn(),
-			resetChildAgentInspector: vi.fn(),
+			resetSubagentSummary: vi.fn(),
 			setGoalAnnouncementBaseline: vi.fn(),
 			syncGoalTray: vi.fn(),
 			getGoalState: () => emptyGoalState(),
@@ -1308,7 +1250,7 @@ describe("InteractiveMode connection events", () => {
 				thinkingLevel: "medium",
 				model: null,
 			})),
-			seedChildAgentInspector: vi.fn(),
+			seedSubagentSummary: vi.fn(),
 			setSessionHasMessages: vi.fn(),
 			applyConnectionStateSnapshot: vi.fn(),
 			renderSessionContext: renderSessionContextMock,
@@ -1510,7 +1452,7 @@ describe("InteractiveMode connection events", () => {
 			streamingComponent: {},
 			streamingMessage: {},
 			applyConnectionStateSnapshot: vi.fn(),
-			replaceChildAgentInspector: vi.fn(),
+			replaceSubagentSummary: vi.fn(),
 			getSessionContextFromConnectionSnapshot: vi.fn(() => ({
 				messages: [],
 				thinkingLevel: "medium",
@@ -1559,7 +1501,7 @@ describe("InteractiveMode connection events", () => {
 			isAgentCompacting: () => true,
 			isBashRunning: () => true,
 			applyConnectionStateSnapshot: vi.fn(),
-			replaceChildAgentInspector: vi.fn(),
+			replaceSubagentSummary: vi.fn(),
 			getSessionContextFromConnectionSnapshot: vi.fn(() => ({
 				messages: [],
 				thinkingLevel: "medium",
@@ -1656,48 +1598,6 @@ describe("InteractiveMode connection events", () => {
 
 		expect(fakeThis.handleEvent).not.toHaveBeenCalled();
 		expect(fakeThis.renderInitialMessages).toHaveBeenCalledOnce();
-	});
-
-	test("drops child body builds superseded by any newer caller", async () => {
-		const oldCommands = createDeferred<[]>();
-		const watcher = {
-			getCommands: vi.fn().mockReturnValueOnce(oldCommands.promise).mockResolvedValueOnce([]),
-			getToolDefinition: vi.fn(async () => undefined),
-		};
-		const setBodyComponents = vi.fn();
-		const fakeThis = {
-			childAgentWatcher: watcher,
-			childAgentWatcherToken: 1,
-			childAgentWatcherMessages: [userMessage("old", 1)],
-			childAgentBodyBuildSeq: 0,
-			childAgentDetail: { setBodyComponents },
-			ui: {},
-			getCurrentCwd: () => process.cwd(),
-			settingsManager: { getShowImages: () => true },
-			getMarkdownThemeWithSettings: () => ({}),
-			hideThinkingBlock: false,
-			hiddenThinkingLabel: "",
-			toolOutputExpanded: false,
-		};
-		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
-		const rebuildChildAgentBody = (
-			InteractiveMode.prototype as unknown as {
-				rebuildChildAgentBody(this: typeof fakeThis, token: number): Promise<void>;
-			}
-		).rebuildChildAgentBody;
-
-		const staleBuild = rebuildChildAgentBody.call(fakeThis, 1);
-		fakeThis.childAgentWatcherMessages = [userMessage("new", 2)];
-		await rebuildChildAgentBody.call(fakeThis, 1);
-		oldCommands.resolve([]);
-		await staleBuild;
-
-		expect(setBodyComponents).toHaveBeenCalledOnce();
-		const rendered = setBodyComponents.mock.calls[0]![0].flatMap((component: Component) => component.render(40)).join(
-			"\n",
-		);
-		expect(rendered).toContain("new");
-		expect(rendered).not.toContain("old");
 	});
 });
 
@@ -2085,7 +1985,7 @@ describe("InteractiveMode model selection persistence", () => {
 			settingsManager: { setDefaultModelAndProvider(provider: string, modelId: string): void };
 		};
 		footer: { invalidate(): void };
-		childAgentSummary: { invalidate(): void };
+		subagentSummaryLine: { invalidate(): void };
 		patchConnectionState(patch: Partial<AgentConnectionState>): void;
 		updateEditorBorderColor(): void;
 		showStatus(message: string): void;
@@ -2310,7 +2210,7 @@ describe("InteractiveMode model selection persistence", () => {
 			},
 		};
 		fakeThis.footer = { invalidate: vi.fn() };
-		fakeThis.childAgentSummary = { invalidate: vi.fn() };
+		fakeThis.subagentSummaryLine = { invalidate: vi.fn() };
 		fakeThis.patchConnectionState = vi.fn();
 		fakeThis.updateEditorBorderColor = vi.fn();
 		fakeThis.setupAutocompleteProvider = vi.fn();
@@ -2344,7 +2244,7 @@ describe("InteractiveMode model selection persistence", () => {
 			},
 		};
 		fakeThis.footer = { invalidate: vi.fn() };
-		fakeThis.childAgentSummary = { invalidate: vi.fn() };
+		fakeThis.subagentSummaryLine = { invalidate: vi.fn() };
 		fakeThis.patchConnectionState = vi.fn();
 		fakeThis.updateEditorBorderColor = vi.fn();
 
@@ -2371,7 +2271,7 @@ describe("InteractiveMode model selection persistence", () => {
 			},
 		};
 		fakeThis.footer = { invalidate: vi.fn() };
-		fakeThis.childAgentSummary = { invalidate: vi.fn() };
+		fakeThis.subagentSummaryLine = { invalidate: vi.fn() };
 		fakeThis.patchConnectionState = vi.fn();
 		fakeThis.updateEditorBorderColor = vi.fn();
 		fakeThis.showStatus = vi.fn();
@@ -4291,16 +4191,14 @@ describe("truncatePathMiddle", () => {
 });
 
 describe("InteractiveMode.setToolsExpanded", () => {
-	test("applies expansion state to the active header, chat entries, and child agent detail", () => {
+	test("applies expansion state to the active header and chat entries", () => {
 		const header = { setExpanded: vi.fn() };
 		const chatChild = { setExpanded: vi.fn() };
-		const childAgentDetail = { setToolsExpanded: vi.fn() };
 		const fakeThis: any = {
 			toolOutputExpanded: false,
 			customHeader: undefined,
 			builtInHeader: header,
 			chatContainer: { children: [chatChild] },
-			childAgentDetail,
 			ui: {
 				requestRender: vi.fn(),
 				requestRenderPreservingViewport: vi.fn(),
@@ -4313,7 +4211,6 @@ describe("InteractiveMode.setToolsExpanded", () => {
 		expect(fakeThis.toolOutputExpanded).toBe(true);
 		expect(header.setExpanded).toHaveBeenCalledWith(true);
 		expect(chatChild.setExpanded).toHaveBeenCalledWith(true);
-		expect(childAgentDetail.setToolsExpanded).toHaveBeenCalledWith(true);
 		// Expansion keeps the user anchored, so it uses the viewport-preserving path.
 		expect(fakeThis.ui.requestRenderPreservingViewport).toHaveBeenCalledTimes(1);
 	});

@@ -15,6 +15,8 @@ export interface DaemonSocketClient {
 	catchupPurposes?: Map<string, "replacement" | "resync">;
 	/** The single catch-up drain currently serving this client. */
 	catchupPromise?: Promise<void>;
+	/** Delayed retry after transient catch-up snapshot preparation failure. */
+	catchupRetryTimer?: NodeJS.Timeout;
 	backpressured?: boolean;
 	authenticated?: boolean;
 	transport?: "jsonl" | "private-framed";

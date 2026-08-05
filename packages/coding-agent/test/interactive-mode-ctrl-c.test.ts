@@ -36,7 +36,7 @@ type FakeInteractiveMode = {
 		abortBranchSummary: Mock;
 		abortBash: Mock;
 	};
-	childAgentSummary: { invalidate: Mock };
+	subagentSummaryLine: { invalidate: Mock };
 	ui: { requestRender: Mock; onDebug?: () => void };
 	restoreQueuedMessagesToEditor: Mock;
 	updatePendingMessagesDisplay: Mock;
@@ -106,7 +106,7 @@ function createInteractiveFake(options: {
 			abortBranchSummary: vi.fn(),
 			abortBash: vi.fn(),
 		},
-		childAgentSummary: { invalidate: vi.fn() },
+		subagentSummaryLine: { invalidate: vi.fn() },
 		ui: { requestRender: vi.fn() },
 		restoreQueuedMessagesToEditor: vi.fn().mockResolvedValue(0),
 		updatePendingMessagesDisplay: vi.fn(),
@@ -207,7 +207,7 @@ describe("InteractiveMode interrupt shortcuts", () => {
 		await vi.advanceTimersByTimeAsync(2000);
 
 		expect(Reflect.get(InteractiveMode.prototype, "getTrayOverrideLabel").call(mode)).toBeUndefined();
-		expect(mode.childAgentSummary.invalidate).toHaveBeenCalled();
+		expect(mode.subagentSummaryLine.invalidate).toHaveBeenCalled();
 		expect(mode.ui.requestRender).toHaveBeenCalled();
 	});
 

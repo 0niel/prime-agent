@@ -149,7 +149,6 @@ import type {
 	AgentConnectionSessionContext,
 	AgentConnectionSessionEvent,
 	AgentConnectionSessionTreeNode,
-	AgentConnectionSessionWatcher,
 	AgentConnectionSideQuestionEvent,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
@@ -175,18 +174,12 @@ import { BorderedLoader } from "./components/bordered-loader.js";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.js";
 import { type FullPaneOverlayOptions, showFullPaneOverlay } from "./components/centered-overlay.js";
 import {
-	ChildAgentDetailComponent,
-	type ChildAgentInspectorNode,
-	ChildAgentSummaryComponent,
-} from "./components/child-agent-inspector.js";
-import {
 	CompactionOutcomeMessageComponent,
 	MalformedCompactionOutcomeMessageComponent,
 } from "./components/compaction-outcome-message.js";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
 import { ConfigurationMenuComponent, type ConfigurationMenuTab } from "./components/configuration-menu.js";
 import { formatContextTree } from "./components/context-tree-format.js";
-import { buildConversationComponents } from "./components/conversation-components.js";
 import { CountdownTimer } from "./components/countdown-timer.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { CustomMessageComponent } from "./components/custom-message.js";
@@ -214,6 +207,7 @@ import {
 	styleSlashCommandText,
 } from "./components/slash-command-message.js";
 import { SlashCommandResultMessageComponent } from "./components/slash-command-result-message.js";
+import { countDirectSubagentStatuses, SubagentSummaryLine } from "./components/subagent-summary-line.js";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.js";
 import {
 	selectLatestToolExpandHint,
@@ -342,7 +336,7 @@ export function formatSplashCwd(cwd: string): string {
 	return normalized;
 }
 
-export function mergeChildAgentSnapshots(
+function mergeSubagentSnapshot(
 	previous: AgentConnectionRlmChildAgentSnapshot,
 	incoming: AgentConnectionRlmChildAgentSnapshot,
 ): AgentConnectionRlmChildAgentSnapshot {
@@ -351,42 +345,11 @@ export function mergeChildAgentSnapshots(
 		...previous,
 		...incoming,
 		parentId: incoming.parentId ?? previous.parentId,
-		activeSessionId: incoming.activeSessionId ?? previous.activeSessionId,
-		sessionName: incoming.sessionName ?? previous.sessionName,
-		model: incoming.model ?? previous.model,
-		durationMs: incoming.durationMs ?? previous.durationMs,
-		answerPreview: incoming.answerPreview ?? previous.answerPreview,
-		toolUseCount:
-			incoming.toolUseCount === undefined
-				? previous.toolUseCount
-				: Math.max(previous.toolUseCount ?? 0, incoming.toolUseCount),
-		tokenCount: incoming.tokenCount ?? previous.tokenCount,
-		recap: incoming.recap ?? previous.recap,
+		// Active updates may omit a previously known daemon session id, but a
+		// terminal update without one means the child is no longer resident.
+		activeSessionId: active ? (incoming.activeSessionId ?? previous.activeSessionId) : incoming.activeSessionId,
 		activity: active ? (incoming.activity ?? previous.activity) : undefined,
-		error: incoming.status === "error" ? (incoming.error ?? previous.error) : undefined,
 	};
-}
-
-function childAgentSummaryChanged(
-	previous: AgentConnectionRlmChildAgentSnapshot,
-	next: AgentConnectionRlmChildAgentSnapshot,
-): boolean {
-	const previousTokens = previous.tokenCount === undefined ? undefined : formatTokenCount(previous.tokenCount);
-	const nextTokens = next.tokenCount === undefined ? undefined : formatTokenCount(next.tokenCount);
-	return (
-		previous.parentId !== next.parentId ||
-		previous.activeSessionId !== next.activeSessionId ||
-		previous.sessionName !== next.sessionName ||
-		previous.model !== next.model ||
-		previous.label !== next.label ||
-		previous.status !== next.status ||
-		previous.durationMs !== next.durationMs ||
-		previous.toolUseCount !== next.toolUseCount ||
-		previousTokens !== nextTokens ||
-		previous.recap !== next.recap ||
-		previous.activity?.kind !== next.activity?.kind ||
-		previous.activity?.toolName !== next.activity?.toolName
-	);
 }
 
 export function truncatePathMiddle(value: string, width: number): string {
@@ -963,21 +926,10 @@ export class InteractiveMode {
 	private toolDefinitionCache = new Map<string, ToolExecutionDefinition | undefined>();
 	private agentRunFileChanges = new Map<string, FileChangeSummary>();
 
-	// RLM child-agent tray: inline list below the editor, full-screen detail on open.
-	private childAgentSummary: ChildAgentSummaryComponent;
-	private childAgentDetail: ChildAgentDetailComponent;
-	private childAgentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
-	private childAgentNodes: ChildAgentInspectorNode[] = [];
-	private childAgentDetailNodeId: string | undefined;
-	private childAgentPanelMode: "detail" | undefined;
-	private childAgentWatcher: AgentConnectionSessionWatcher | undefined;
-	private childAgentWatcherToken = 0;
-	private childAgentWatcherMessages: AgentMessage[] = [];
-	private childAgentRefreshSeq = 0;
-	private childAgentBodyBuildSeq = 0;
-	// The session key the current watcher attached with, so a later snapshot that
-	// gains the real activeSessionId can retry the attach.
-	private childAgentWatchedKey: string | undefined;
+	// One summary line below the editor, backed by the existing child-status stream.
+	private subagentSummaryLine: SubagentSummaryLine;
+	private subagentSnapshots = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
+	private rlmNodeId: string | undefined;
 
 	// Tool output expansion state
 	private toolOutputExpanded = false;
@@ -1110,14 +1062,6 @@ export class InteractiveMode {
 		this.queuedMessagesContainer = new Container();
 		this.sideQuestionContainer = new Container();
 		this.featureHintContainer = new Container();
-		this.childAgentDetail = new ChildAgentDetailComponent(() => this.getChildAgentPanelRows(), {
-			ui: this.ui,
-		});
-		this.childAgentDetail.onCancel = () => {
-			this.closeChildAgentPanel({ selectNodeId: this.childAgentDetailNodeId });
-		};
-		this.childAgentDetail.onToggleToolsExpanded = () => this.toggleToolOutputExpansion();
-		this.childAgentDetail.onKill = (nodeId) => void this.killChildAgent(nodeId);
 		this.widgetContainerAbove = new Container();
 		this.widgetContainerBelow = new Container();
 		this.recapContainer = new Container();
@@ -1137,20 +1081,21 @@ export class InteractiveMode {
 		this.mainViewContainer = new Container();
 		this.promptDock = new Container();
 		this.footerSlot = new Container();
-		this.restoreMainAgentView();
+		this.mainViewContainer.addChild(this.chatContainer);
+		this.mainViewContainer.addChild(this.shortcutGuideContainer);
+		this.mainViewContainer.addChild(this.pendingMessagesContainer);
+		this.mainViewContainer.addChild(this.statusContainer);
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
-		this.childAgentSummary = new ChildAgentSummaryComponent(
+		this.subagentSummaryLine = new SubagentSummaryLine(
 			() => this.getTrayLocationLabel(),
 			() => this.getTrayContextLabel(),
 			() => this.getTrayOverrideLabel(),
 		);
-		this.childAgentSummary.onOpenDetail = () => void this.openScopedAgentsView();
-		// Fallback for Enter when the list emptied out while focused.
-		this.childAgentSummary.onOpen = () => void this.openScopedAgentsView();
-		this.childAgentSummary.onCancel = () => this.focusEditor();
-		this.childAgentSummary.onExit = () => this.handleSubagentSummaryExit();
-		this.childAgentSummary.onChatAction = (data) => this.handleSubagentSummaryChatAction(data);
+		this.subagentSummaryLine.setOpenable(this.options.returnToAgentsView === true);
+		this.subagentSummaryLine.onOpen = () => void this.openScopedAgentsView();
+		this.subagentSummaryLine.onCancel = () => this.focusEditor();
+		this.subagentSummaryLine.onChatAction = (data) => this.handleSubagentSummaryChatAction(data);
 		this.footerDataProvider = new FooterDataProvider(this.uiServices.getInitialCwd());
 		this.footer = new FooterComponent(this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.settingsManager.getCompactionEnabled());
@@ -1429,7 +1374,7 @@ export class InteractiveMode {
 				verboseInstructions,
 				{
 					topPadding: true,
-					getHideStartHint: () => this.childAgentPanelMode !== undefined || !this.isNewChat(),
+					getHideStartHint: () => !this.isNewChat(),
 					getStartHint: () => this.startHint,
 				},
 			);
@@ -1449,7 +1394,7 @@ export class InteractiveMode {
 			this.mainContainer.addChild(container);
 		}
 		this.mainContainer.addChild(this.editorContainer);
-		this.mainContainer.addChild(this.childAgentSummary);
+		this.mainContainer.addChild(this.subagentSummaryLine);
 		this.mainContainer.addChild(this.widgetContainerBelow);
 		this.footerSlot.addChild(this.footer);
 		this.mainContainer.addChild(this.footerSlot);
@@ -2582,7 +2527,7 @@ export class InteractiveMode {
 		const heartbeats = scopeHeartbeatsToSession(
 			this.heartbeatCatalog,
 			this.connectionState,
-			this.childAgentSnapshots.values(),
+			this.subagentSnapshots.values(),
 		);
 		if (
 			heartbeats.length === this.heartbeats.length &&
@@ -2593,7 +2538,8 @@ export class InteractiveMode {
 		this.heartbeats = heartbeats;
 		this.heartbeatManager?.setHeartbeats(heartbeats);
 		this.scheduleHeartbeatManagerRefresh();
-		this.refreshChildAgentInspector();
+		this.updateSubagentSummaryLine();
+		this.ui.requestRender();
 	}
 
 	private applyConnectionStateSnapshot(state: AgentConnectionState): void {
@@ -2867,7 +2813,7 @@ export class InteractiveMode {
 		this.renderRecap();
 		this.ipythonToolComponents.clear();
 		this.lateIpythonSentAgentMessages.clear();
-		this.resetChildAgentInspector();
+		this.resetSubagentSummary();
 		this.setGoalAnnouncementBaseline(this.getGoalState());
 		this.syncGoalTray(this.getGoalState());
 	}
@@ -2906,7 +2852,8 @@ export class InteractiveMode {
 		this.applyConnectionStateSnapshot(snapshot.state);
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
-		this.replaceChildAgentInspector(snapshot.children);
+		this.rlmNodeId = snapshot.parent?.childId;
+		this.replaceSubagentSummary(snapshot.children);
 		await this.renderSessionContext(this.getSessionContextFromConnectionSnapshot(snapshot), {
 			clearChat: true,
 			updateFooter: true,
@@ -3303,9 +3250,6 @@ export class InteractiveMode {
 	}
 
 	private shouldSuppressFeatureHint(): boolean {
-		if (this.childAgentPanelMode) {
-			return true;
-		}
 		const { steering, followUp } = this.getAllQueuedMessages();
 		return steering.length > 0 || followUp.length > 0;
 	}
@@ -3336,7 +3280,7 @@ export class InteractiveMode {
 	}
 
 	private updateWorkingPulse(): void {
-		const active = this.isAgentStreaming() || this.countRunningChildAgents() > 0;
+		const active = this.isAgentStreaming() || this.countRunningSubagents() > 0;
 		if (!active) {
 			this.stopWorkingPulse();
 			return;
@@ -3360,9 +3304,9 @@ export class InteractiveMode {
 		}
 	}
 
-	private countRunningChildAgents(): number {
+	private countRunningSubagents(): number {
 		let count = 0;
-		for (const child of this.childAgentSnapshots.values()) {
+		for (const child of this.subagentSnapshots.values()) {
 			if (child.status === "running") {
 				count += 1;
 			}
@@ -3571,8 +3515,8 @@ export class InteractiveMode {
 	private renderRecap(): void {
 		if (!this.recapContainer) return;
 		this.recapContainer.clear();
-		const recap = this.childAgentPanelMode ? undefined : this.sessionRecap?.trim();
-		const showChanges = !this.childAgentPanelMode && !this.isAgentStreaming() && this.agentRunFileChanges.size > 0;
+		const recap = this.sessionRecap?.trim();
+		const showChanges = !this.isAgentStreaming() && this.agentRunFileChanges.size > 0;
 		if (showChanges) {
 			this.recapContainer.addChild(
 				new TruncatedText(formatTotalChangeSummary([...this.agentRunFileChanges.values()]), 1, 0),
@@ -3936,18 +3880,6 @@ export class InteractiveMode {
 	 */
 	private setCustomEditorComponent(factory: EditorFactory | undefined): void {
 		this.editorComponentFactory = factory;
-		if (this.childAgentPanelMode) {
-			this.restoreMainAgentView();
-			// Re-render queued previews cleared on panel entry; the queue may still hold messages.
-			this.updatePendingMessagesDisplay();
-			this.childAgentDetailNodeId = undefined;
-			this.childAgentDetail.setBackHintLabel("back to chat");
-			this.childAgentDetail.setNode(undefined);
-			this.childAgentPanelMode = undefined;
-			this.resumeFeatureHintPresentation();
-		}
-		this.childAgentSummary.setHidden(false);
-
 		// Snapshot the current editor before replacing it. Paste markers are only
 		// meaningful while their originating editor still owns the paste snapshot.
 		const currentEditor = this.editor;
@@ -4180,7 +4112,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
-		this.defaultEditor.onAction("app.subagents.focus", () => this.focusChildAgentSummary());
+		this.defaultEditor.onAction("app.subagents.focus", () => this.focusSubagentSummary());
 		this.defaultEditor.onAction("app.heartbeats.open", () => {
 			void this.showHeartbeatManager();
 		});
@@ -4201,7 +4133,7 @@ export class InteractiveMode {
 			void this.requestAgentsView();
 		});
 		this.defaultEditor.onAgentsBack = () => this.handleAgentsBack();
-		this.defaultEditor.onMoveBelowPrompt = () => this.focusChildAgentSummary();
+		this.defaultEditor.onMoveBelowPrompt = () => this.focusSubagentSummary();
 
 		this.defaultEditor.onChange = (text: string) => {
 			if (text.length > 0) {
@@ -5368,13 +5300,13 @@ export class InteractiveMode {
 
 			case "thinking_level_changed":
 				this.footer.invalidate();
-				this.childAgentSummary.invalidate();
+				this.subagentSummaryLine.invalidate();
 				this.updateEditorBorderColor();
 				break;
 
 			case "service_tier_changed":
 				this.footer.invalidate();
-				this.childAgentSummary.invalidate();
+				this.subagentSummaryLine.invalidate();
 				break;
 
 			case "bash_start": {
@@ -5699,7 +5631,7 @@ export class InteractiveMode {
 			}
 
 			case "rlm_child_update":
-				this.updateChildAgentInspector(event.child);
+				this.updateSubagentSummary(event.child);
 				break;
 
 			case "goal_update":
@@ -5753,7 +5685,7 @@ export class InteractiveMode {
 	}
 
 	private syncGoalTray(goal: GoalState): void {
-		this.childAgentSummary.invalidate();
+		this.subagentSummaryLine.invalidate();
 		this.updateGoalTrayTimer(goal);
 	}
 
@@ -5761,7 +5693,7 @@ export class InteractiveMode {
 		if (goal.status === "active") {
 			if (!this.goalTrayTimer) {
 				this.goalTrayTimer = setInterval(() => {
-					this.childAgentSummary.invalidate();
+					this.subagentSummaryLine.invalidate();
 					this.ui.requestRender();
 				}, 1000);
 				this.goalTrayTimer.unref?.();
@@ -5871,108 +5803,77 @@ export class InteractiveMode {
 		return `: ${truncateToWidth(detail, availableWidth)}`;
 	}
 
-	private seedChildAgentInspector(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {
-		if (!children?.length) {
-			return;
-		}
+	private seedSubagentSummary(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {
 		let changed = false;
-		for (const child of children) {
-			// Live rlm_child_update events are richer than the snapshot; never
-			// clobber state that already arrived from the event stream.
-			if (!this.childAgentSnapshots.has(child.id) && child.status !== "cancelled") {
-				this.childAgentSnapshots.set(child.id, child);
+		for (const child of children ?? []) {
+			// Live updates can arrive before the initial snapshot; do not replace them
+			// with the snapshot's older state.
+			if (!this.subagentSnapshots.has(child.id) && child.status !== "cancelled") {
+				this.subagentSnapshots.set(child.id, child);
 				changed = true;
 			}
 		}
-		if (changed) {
-			this.refreshChildAgentInspector();
-		}
+		if (changed) this.refreshSubagentSummary();
 	}
 
-	private replaceChildAgentInspector(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {
+	private replaceSubagentSummary(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {
 		const next = new Map<string, AgentConnectionRlmChildAgentSnapshot>();
 		for (const child of children ?? []) {
-			if (child.status === "cancelled") {
-				continue;
-			}
-			const previous = this.childAgentSnapshots.get(child.id);
-			next.set(child.id, previous ? mergeChildAgentSnapshots(previous, child) : child);
+			if (child.status === "cancelled") continue;
+			const previous = this.subagentSnapshots.get(child.id);
+			next.set(child.id, previous ? mergeSubagentSnapshot(previous, child) : child);
 		}
-		this.childAgentSnapshots = next;
-		this.refreshChildAgentInspector();
+		this.subagentSnapshots = next;
+		this.refreshSubagentSummary();
 	}
 
-	private updateChildAgentInspector(child: AgentConnectionRlmChildAgentSnapshot): void {
-		// Cancellation is also the lifecycle tombstone for deleted subagents.
+	private updateSubagentSummary(child: AgentConnectionRlmChildAgentSnapshot): void {
 		if (child.status === "cancelled") {
-			this.removeChildAgentSnapshot(child.id);
-			this.refreshChildAgentInspector();
-			return;
+			this.removeSubagentSnapshot(child.id);
+		} else {
+			const previous = this.subagentSnapshots.get(child.id);
+			this.subagentSnapshots.set(child.id, previous ? mergeSubagentSnapshot(previous, child) : child);
 		}
-		const previous = this.childAgentSnapshots.get(child.id);
-		const next = previous ? mergeChildAgentSnapshots(previous, child) : child;
-		this.childAgentSnapshots.set(child.id, next);
-		if (!previous || childAgentSummaryChanged(previous, next) || this.childAgentDetailNodeId === child.id) {
-			this.refreshChildAgentInspector();
-		}
+		this.refreshSubagentSummary();
 	}
 
-	private refreshChildAgentInspector(): void {
-		this.childAgentNodes = this.buildChildAgentInspectorNodes();
-		this.childAgentSummary.setNodes(this.childAgentNodes);
+	private refreshSubagentSummary(): void {
 		this.updateScopedHeartbeats();
+		this.updateSubagentSummaryLine();
 		this.updateWorkingPulse();
 		this.syncWorkingLoader();
 		this.updateWorkingLoaderMessage();
-		if (this.childAgentDetailNodeId) {
-			const detailNode = this.findChildAgentInspectorNode(this.childAgentDetailNodeId);
-			if (!detailNode && this.childAgentPanelMode === "detail") {
-				this.closeChildAgentPanel();
-				return;
-			}
-			this.childAgentDetail.setNode(detailNode);
-			this.maybeRetryChildAgentWatch(detailNode);
-		}
 		this.ui.requestRender();
 	}
 
-	private removeChildAgentSnapshot(id: string): void {
-		this.childAgentSnapshots.delete(id);
-		for (const child of [...this.childAgentSnapshots.values()]) {
-			if (child.parentId === id) {
-				this.removeChildAgentSnapshot(child.id);
-			}
+	private updateSubagentSummaryLine(): void {
+		const activeHeartbeatSessionIds = new Set(
+			this.heartbeatCatalog
+				.filter((heartbeat) => heartbeat.job.status === "active")
+				.map((heartbeat) => heartbeat.job.activeSessionId),
+		);
+		this.subagentSummaryLine.setSubagentCounts(
+			countDirectSubagentStatuses(this.subagentSnapshots.values(), this.rlmNodeId, activeHeartbeatSessionIds),
+		);
+		if (!this.subagentSummaryLine.isSelectable() && this.subagentSummaryLine.focused) this.focusEditor();
+	}
+
+	private removeSubagentSnapshot(id: string): void {
+		this.subagentSnapshots.delete(id);
+		for (const child of [...this.subagentSnapshots.values()]) {
+			if (child.parentId === id) this.removeSubagentSnapshot(child.id);
 		}
 	}
 
-	private restoreMainAgentView(): void {
-		this.mainViewContainer.clear();
-		this.mainViewContainer.addChild(this.chatContainer);
-		this.mainViewContainer.addChild(this.shortcutGuideContainer);
-		this.mainViewContainer.addChild(this.pendingMessagesContainer);
-		this.mainViewContainer.addChild(this.statusContainer);
-	}
-
-	private resetChildAgentInspector(): void {
-		this.childAgentSnapshots.clear();
-		this.childAgentNodes = [];
-		this.childAgentSummary.setNodes([]);
+	private resetSubagentSummary(): void {
+		this.subagentSnapshots.clear();
+		this.rlmNodeId = undefined;
+		this.updateSubagentSummaryLine();
 		this.updateScopedHeartbeats();
-		this.childAgentSummary.setHidden(false);
-		this.childAgentDetail.setNode(undefined);
-		this.childAgentDetailNodeId = undefined;
-		if (this.childAgentPanelMode) {
-			this.closeChildAgentPanel();
-		}
 		// Clearing snapshots can drop the last running subagent; reconcile the
 		// pulse and loader so neither lingers when nothing is in flight.
 		this.updateWorkingPulse();
 		this.syncWorkingLoader();
-	}
-
-	private getChildAgentPanelRows(): number {
-		const rows = this.ui.terminal.rows;
-		return Math.max(4, Math.min(12, Math.floor(rows * 0.4)));
 	}
 
 	private focusEditor(): void {
@@ -5980,11 +5881,9 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private focusChildAgentSummary(): boolean {
-		if (!this.childAgentSummary.hasNodes() || this.childAgentPanelMode || this.getTrayOverrideLabel()) {
-			return false;
-		}
-		this.ui.setFocus(this.childAgentSummary);
+	private focusSubagentSummary(): boolean {
+		if (!this.subagentSummaryLine.isSelectable() || this.getTrayOverrideLabel()) return false;
+		this.ui.setFocus(this.subagentSummaryLine);
 		this.ui.requestRender();
 		return true;
 	}
@@ -6003,18 +5902,6 @@ export class InteractiveMode {
 		await this.returnToAgentsView("scoped_agents_view");
 	}
 
-	// Left from the focused subagent list: exit to manage sessions if available,
-	// otherwise just drop focus back to the editor.
-	private handleSubagentSummaryExit(): void {
-		if (this.options.returnToAgentsView && !this.editor.getText().trim()) {
-			void this.returnToAgentsView();
-			return;
-		}
-		this.focusEditor();
-	}
-
-	// Chat actions stay live while the subagent list holds focus; the editor's
-	// own handlers are bypassed because input routes only to the focused list.
 	private handleSubagentSummaryChatAction(data: string): void {
 		if (this.keybindings.matches(data, "app.tools.expand")) {
 			this.toggleToolOutputExpansion();
@@ -6042,7 +5929,7 @@ export class InteractiveMode {
 
 	private getTrayLocationLabel(): string | undefined {
 		const modelLabel = this.getModelTrayLabel();
-		const hasChildren = this.options.sessionHasChildren === true || (this.childAgentSnapshots?.size ?? 0) > 0;
+		const hasChildren = this.options.sessionHasChildren === true || (this.subagentSnapshots?.size ?? 0) > 0;
 		const depthLabel = formatAgentDepthLabel(this.options.sessionDepth, hasChildren);
 		const shortcutsHint = this.getShortcutsTrayHint();
 		const agentsHint = this.getAgentsViewTrayHint();
@@ -6068,7 +5955,7 @@ export class InteractiveMode {
 		}
 		this.sessionHasMessages = hasMessages;
 		this.builtInHeader?.invalidate();
-		this.childAgentSummary.invalidate();
+		this.subagentSummaryLine.invalidate();
 	}
 
 	private getModelTrayLabel(): string {
@@ -6151,214 +6038,6 @@ export class InteractiveMode {
 		const hours = Math.floor(minutes / 60);
 		const remainingMinutes = minutes % 60;
 		return `${hours}h ${remainingMinutes.toString().padStart(2, "0")}m`;
-	}
-
-	private async killChildAgent(nodeId: string): Promise<void> {
-		try {
-			const cancelled = await this.agentConnection.cancelRlmChild(nodeId);
-			if (!cancelled) {
-				this.showError("Subagent already finished");
-			}
-		} catch (error) {
-			this.showError(`Failed to stop subagent: ${error instanceof Error ? error.message : String(error)}`);
-		}
-		this.ui.requestRender();
-	}
-
-	private async startChildAgentWatch(node: ChildAgentInspectorNode): Promise<void> {
-		this.stopChildAgentWatch();
-		const key = node.activeSessionId ?? node.id;
-		const token = ++this.childAgentWatcherToken;
-		this.childAgentWatchedKey = key;
-		const watcher = await this.agentConnection.watchSession(key).catch(() => undefined);
-		// The panel may have closed (or another node opened) while attaching.
-		if (token !== this.childAgentWatcherToken) {
-			await watcher?.close().catch(() => undefined);
-			return;
-		}
-		if (!watcher) {
-			// A still-running child may not have registered yet (in-process snapshots never
-			// carry activeSessionId, so the key won't change). Clear the watched key so the
-			// next rlm_child_update retries the attach until a watcher is obtained.
-			if (node.status === "running" || node.status === "queued") {
-				this.childAgentWatchedKey = undefined;
-				return;
-			}
-			const fallback = node.error?.trim()
-				? theme.fg("error", `  ${node.error.trim()}`)
-				: theme.fg("muted", "  conversation unavailable");
-			this.childAgentDetail.setBodyComponents([new Text(fallback, 1, 0)]);
-			return;
-		}
-		this.childAgentWatcher = watcher;
-		watcher.subscribe((event) => {
-			if (token !== this.childAgentWatcherToken) {
-				return;
-			}
-			// Replacement and resync snapshots both carry authoritative messages.
-			if (event.type === "session_event" || event.type === "session_replaced" || event.type === "session_resynced") {
-				void this.refreshChildAgentWatch(token, watcher);
-			}
-		});
-		await this.refreshChildAgentWatch(token, watcher);
-	}
-
-	// (Re)attach when the key differs from what we last attached with — including the
-	// undefined left by a failed attach on a not-yet-registered child. Once a watcher is
-	// held the key matches, so this won't re-attach (or cancel an in-flight attach) per update.
-	private maybeRetryChildAgentWatch(node: ChildAgentInspectorNode | undefined): void {
-		if (!node || this.childAgentPanelMode !== "detail") {
-			return;
-		}
-		const key = node.activeSessionId ?? node.id;
-		if (key !== this.childAgentWatchedKey) {
-			void this.startChildAgentWatch(node);
-		}
-	}
-
-	private async refreshChildAgentWatch(token: number, watcher: AgentConnectionSessionWatcher): Promise<void> {
-		const seq = ++this.childAgentRefreshSeq;
-		const messages = await watcher.getMessages().catch(() => undefined);
-		// Drop a fetch that a newer refresh (or a different watch) has already superseded.
-		if (!messages || token !== this.childAgentWatcherToken || seq !== this.childAgentRefreshSeq) {
-			return;
-		}
-		this.childAgentWatcherMessages = messages;
-		await this.rebuildChildAgentBody(token);
-	}
-
-	private async rebuildChildAgentBody(token: number): Promise<void> {
-		const watcher = this.childAgentWatcher;
-		if (!watcher || token !== this.childAgentWatcherToken) {
-			return;
-		}
-		const buildSeq = ++this.childAgentBodyBuildSeq;
-		const messages = this.childAgentWatcherMessages;
-		const toolNames = new Set<string>();
-		for (const message of messages) {
-			if (message.role === "assistant") {
-				for (const content of message.content) {
-					if (content.type === "toolCall") {
-						toolNames.add(content.name);
-					}
-				}
-			}
-		}
-		const definitions = new Map<string, ToolExecutionDefinition | undefined>();
-		const childCommandsPromise = watcher.getCommands().catch(() => []);
-		await Promise.all(
-			[...toolNames].map(async (name) => {
-				definitions.set(name, (await watcher.getToolDefinition(name).catch(() => undefined)) ?? undefined);
-			}),
-		);
-		const childCommands = await childCommandsPromise;
-		const childCommandNames = new Set(childCommands.map((command) => command.name));
-		if (token !== this.childAgentWatcherToken || buildSeq !== this.childAgentBodyBuildSeq) {
-			return;
-		}
-		this.childAgentDetail.setBodyComponents(
-			buildConversationComponents(messages, {
-				ui: this.ui,
-				cwd: this.getCurrentCwd(),
-				toolOptions: {
-					showImages: this.settingsManager.getShowImages(),
-				},
-				getToolDefinition: (name) => definitions.get(name),
-				markdownTheme: this.getMarkdownThemeWithSettings(),
-				hideThinkingBlock: this.hideThinkingBlock,
-				hiddenThinkingLabel: this.hiddenThinkingLabel,
-				toolsExpanded: this.toolOutputExpanded,
-				isRecognizedSlashCommand: (name) => isBuiltinSlashCommandName(name) || childCommandNames.has(name),
-			}),
-		);
-	}
-
-	private stopChildAgentWatch(): void {
-		this.childAgentWatcherToken++;
-		this.childAgentWatcherMessages = [];
-		this.childAgentWatchedKey = undefined;
-		const watcher = this.childAgentWatcher;
-		this.childAgentWatcher = undefined;
-		void watcher?.close().catch(() => undefined);
-	}
-
-	private closeChildAgentPanel(options: { selectNodeId?: string } = {}): void {
-		this.stopChildAgentWatch();
-		this.childAgentPanelMode = undefined;
-		this.childAgentDetailNodeId = undefined;
-		this.childAgentDetail.setBackHintLabel("back to chat");
-		this.childAgentDetail.setNode(undefined);
-		this.childAgentDetail.setBodyComponents([]);
-		this.childAgentSummary.setHidden(false);
-		this.restoreMainAgentView();
-		this.resumeFeatureHintPresentation();
-		// Restore the parent recap that was suppressed while the panel was open.
-		this.renderRecap();
-		// Re-render queued previews cleared on panel entry; the queue may still hold messages.
-		this.updatePendingMessagesDisplay();
-		this.editorContainer.clear();
-		this.editorContainer.addChild(this.editor);
-		// Returning from a subagent's detail keeps that subagent selected in the
-		// inline list; other closes drop back to the editor.
-		if (options.selectNodeId && this.childAgentSummary.hasNodes()) {
-			this.childAgentSummary.selectNode(options.selectNodeId);
-			this.ui.setFocus(this.childAgentSummary);
-		} else {
-			this.ui.setFocus(this.editor);
-		}
-		this.ui.requestRender();
-	}
-
-	private buildChildAgentInspectorNodes(): ChildAgentInspectorNode[] {
-		const activeHeartbeatSessionIds = new Set(
-			this.heartbeats
-				.filter((heartbeat) => heartbeat.job.status === "active")
-				.map((heartbeat) => heartbeat.job.activeSessionId),
-		);
-		const childrenByParent = new Map<string | undefined, AgentConnectionRlmChildAgentSnapshot[]>();
-		for (const child of this.childAgentSnapshots.values()) {
-			const siblings = childrenByParent.get(child.parentId) ?? [];
-			siblings.push(child);
-			childrenByParent.set(child.parentId, siblings);
-		}
-
-		const build = (child: AgentConnectionRlmChildAgentSnapshot): ChildAgentInspectorNode => ({
-			id: child.id,
-			activeSessionId: child.activeSessionId,
-			sessionName: child.sessionName,
-			model: child.model,
-			label: child.label,
-			status: child.status,
-			durationMs: child.durationMs,
-			answerPreview: child.answerPreview,
-			toolUseCount: child.toolUseCount,
-			tokenCount: child.tokenCount,
-			recap: child.recap,
-			sessionDir: child.sessionDir,
-			activity: child.activity,
-			hasActiveHeartbeat:
-				child.activeSessionId !== undefined && activeHeartbeatSessionIds.has(child.activeSessionId),
-			error: child.error,
-			children: childrenByParent.get(child.id)?.map(build),
-		});
-
-		return (childrenByParent.get(undefined) ?? []).map(build);
-	}
-
-	private findChildAgentInspectorNode(nodeId: string): ChildAgentInspectorNode | undefined {
-		const visit = (nodes: readonly ChildAgentInspectorNode[]): ChildAgentInspectorNode | undefined => {
-			for (const node of nodes) {
-				if (node.id === nodeId) {
-					return node;
-				}
-				const child = visit(node.children ?? []);
-				if (child) {
-					return child;
-				}
-			}
-			return undefined;
-		};
-		return visit(this.childAgentNodes);
 	}
 
 	/** Extract text content from a user message */
@@ -6783,7 +6462,8 @@ export class InteractiveMode {
 		const context = this.getSessionContextFromConnectionSnapshot(snapshot);
 		const state = snapshot.state;
 		const streamingMessage = snapshot.streamingMessage;
-		this.seedChildAgentInspector(snapshot.children);
+		this.rlmNodeId = snapshot.parent?.childId;
+		this.seedSubagentSummary(snapshot.children);
 		this.setSessionHasMessages(context.messages.length > 0);
 		this.applyConnectionStateSnapshot(state);
 		await this.renderSessionContext(context, {
@@ -6944,12 +6624,12 @@ export class InteractiveMode {
 			this.ctrlCExitHintTimer = undefined;
 			if (!this.isCtrlCExitHintVisible()) {
 				this.ctrlCExitHintExpiresAt = 0;
-				this.childAgentSummary.invalidate();
+				this.subagentSummaryLine.invalidate();
 				this.ui.requestRender();
 			}
 		}, InteractiveMode.EXIT_HINT_DURATION_MS);
 		this.ctrlCExitHintTimer.unref?.();
-		this.childAgentSummary.invalidate();
+		this.subagentSummaryLine.invalidate();
 		this.ui.requestRender();
 	}
 
@@ -6963,7 +6643,7 @@ export class InteractiveMode {
 		}
 		this.ctrlCExitHintExpiresAt = 0;
 		if (options.render !== false) {
-			this.childAgentSummary.invalidate();
+			this.subagentSummaryLine.invalidate();
 			this.ui.requestRender();
 		}
 	}
@@ -7215,7 +6895,7 @@ export class InteractiveMode {
 	}
 
 	private getPromptDockComponents(): Component[] {
-		return [this.editorContainer, this.childAgentSummary, this.footerSlot];
+		return [this.editorContainer, this.subagentSummaryLine, this.footerSlot];
 	}
 
 	/** Enter or leave fullscreen rendering without touching the persisted setting. */
@@ -7270,7 +6950,6 @@ export class InteractiveMode {
 				child.setExpanded(expanded);
 			}
 		}
-		this.childAgentDetail.setToolsExpanded(expanded);
 		// Expanding/collapsing changes blocks above the viewport, which would
 		// otherwise force a full redraw that scrolls to the top and replays the
 		// whole transcript. Keep the user anchored at their current position.
@@ -7295,11 +6974,6 @@ export class InteractiveMode {
 				this.streamingComponent.setHideThinkingBlock(this.hideThinkingBlock);
 				this.streamingComponent.updateContent(this.streamingMessage);
 				this.chatContainer.addChild(this.streamingComponent);
-			}
-
-			// The open subagent body bakes in thinking visibility at build time.
-			if (this.childAgentWatcher) {
-				await this.rebuildChildAgentBody(this.childAgentWatcherToken);
 			}
 
 			this.showStatus(`Thinking blocks: ${this.hideThinkingBlock ? "hidden" : "visible"}`);
@@ -7736,7 +7410,7 @@ export class InteractiveMode {
 			availableThinkingLevels: state.availableThinkingLevels,
 		});
 		this.footer.invalidate();
-		this.childAgentSummary.invalidate();
+		this.subagentSummaryLine.invalidate();
 		this.updateEditorBorderColor();
 		// Rebuild so the /effort argument hint reflects the new model's levels.
 		this.setupAutocompleteProvider();
@@ -7992,7 +7666,7 @@ export class InteractiveMode {
 				}
 				this.patchConnectionState({ serviceTier: state.serviceTier });
 				this.footer.invalidate();
-				this.childAgentSummary.invalidate();
+				this.subagentSummaryLine.invalidate();
 				this.showStatus(`Fast mode: ${state.serviceTier === "priority" ? "on" : "off"}`);
 			})
 			.catch((error) => {
@@ -9819,7 +9493,7 @@ ${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shor
 | \`${selectModel}\` | Open model selector |
 | \`${expandTools}\` | Toggle tool output expansion |
 | \`${toggleThinking}\` | Toggle thinking block visibility |
-| \`${focusSubagents}\` | Open subagent inspector |
+| \`${focusSubagents}\` | Focus the subagent summary / open the scoped agents view |
 | \`${manageHeartbeats}\` | Manage heartbeats |
 | \`${externalEditor}\` | Edit message in external editor |
 | \`${promptStash}\` | Stash or restore draft prompt |
