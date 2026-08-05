@@ -988,6 +988,7 @@ export class InteractiveMode {
 	};
 	private readonly pendingMessageNavigation = new PendingMessageNavigation();
 	private pendingMessageMutation: Promise<PendingMessageMutationOutcome> = Promise.resolve("noop");
+	private queueMutationInFlight = 0;
 	private queueEventGeneration = 0;
 	private isPendingMessageNavigationTextChange = false;
 	private editorChangeGeneration = 0;
@@ -2498,7 +2499,7 @@ export class InteractiveMode {
 			...(actions.items ? { items: [...actions.items] } : {}),
 		};
 		this.queueEventGeneration++;
-		const draft = this.pendingMessageNavigation.sync(nextQueue);
+		const draft = this.queueMutationInFlight === 0 ? this.pendingMessageNavigation.sync(nextQueue) : undefined;
 		if (draft !== undefined) this.setEditorFromPendingNavigation(draft);
 		this.connectionQueue = nextQueue;
 		this.updatePendingMessagesDisplay();
@@ -4148,10 +4149,14 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.message.navigateOlder", () => this.navigatePendingMessage(-1));
 		this.defaultEditor.onAction("app.message.navigateNewer", () => this.navigatePendingMessage(1));
 		this.defaultEditor.onAction("app.message.moveEarlier", () => {
-			void this.moveSelectedPendingMessage(-1);
+			void this.moveSelectedPendingMessage(-1).catch((error) =>
+				this.showError(error instanceof Error ? error.message : String(error)),
+			);
 		});
 		this.defaultEditor.onAction("app.message.moveLater", () => {
-			void this.moveSelectedPendingMessage(1);
+			void this.moveSelectedPendingMessage(1).catch((error) =>
+				this.showError(error instanceof Error ? error.message : String(error)),
+			);
 		});
 		this.defaultEditor.onAction("app.session.new", () => this.handleClearCommand());
 		this.defaultEditor.onAction("app.session.tree", () => {
@@ -7040,6 +7045,7 @@ export class InteractiveMode {
 		const queueEventGeneration = this.queueEventGeneration;
 		const connectionQueue = this.connectionQueue;
 		let result: AgentConnectionQueueMutationResult;
+		this.queueMutationInFlight++;
 		try {
 			result = await this.agentConnection.mutateQueueItem(selected.id, checkpoint.queue?.revision ?? -1, mutation);
 		} catch (error) {
@@ -7047,6 +7053,8 @@ export class InteractiveMode {
 				this.pendingMessageNavigation.restore(checkpoint);
 			}
 			throw error;
+		} finally {
+			this.queueMutationInFlight--;
 		}
 		if ((result.queue.revision ?? -1) < (this.connectionQueue.revision ?? -1)) {
 			const stillPending = this.connectionQueue.items?.some((item) => item.id === selected.id) === true;
@@ -7057,6 +7065,14 @@ export class InteractiveMode {
 				this.pendingMessageNavigation.reset();
 			}
 			return "obsolete";
+		}
+		if (result.status === "noop") {
+			this.pendingMessageNavigation.restore(checkpoint);
+			this.pendingMessageNavigation.reconcile(result.queue, selected.id);
+			this.connectionQueue = result.queue;
+			if (this.editorChangeGeneration === editorGeneration) this.setEditorFromPendingNavigation(text);
+			this.showStatus("Queued message is already at the queue boundary");
+			return "noop";
 		}
 		if (result.status !== "applied") {
 			this.connectionQueue = result.queue;

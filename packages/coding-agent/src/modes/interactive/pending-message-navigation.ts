@@ -36,14 +36,24 @@ const items = (queue: AgentConnectionQueueState): Item[] =>
 					text,
 				})),
 			];
-const equal = (a: AgentConnectionQueueState, b: AgentConnectionQueueState): boolean =>
-	a.steering.length === b.steering.length &&
-	a.followUp.length === b.followUp.length &&
-	a.steering.every((text, index) => text === b.steering[index]) &&
-	a.followUp.every((text, index) => text === b.followUp[index]) &&
-	(!a.items ||
-		!b.items ||
-		(a.items.length === b.items.length && a.items.every((item, index) => item.id === b.items![index]?.id)));
+const equal = (a: AgentConnectionQueueState, b: AgentConnectionQueueState): boolean => {
+	const left = items(a);
+	const right = items(b);
+	return (
+		a.steering.length === b.steering.length &&
+		a.followUp.length === b.followUp.length &&
+		a.steering.every((text, index) => text === b.steering[index]) &&
+		a.followUp.every((text, index) => text === b.followUp[index]) &&
+		left.length === right.length &&
+		left.every(
+			(item, index) =>
+				item.id === right[index]?.id &&
+				item.lane === right[index]?.lane &&
+				item.index === right[index]?.index &&
+				item.text === right[index]?.text,
+		)
+	);
+};
 
 /** Pending-message history plus all pure mutations of its selected item. */
 export class PendingMessageNavigation {
@@ -101,7 +111,29 @@ export class PendingMessageNavigation {
 	}
 
 	sync(queue: AgentConnectionQueueState): string | undefined {
-		if (!this.queue || equal(this.queue, queue)) return undefined;
+		if (!this.queue) return undefined;
+		const previous = this.queue;
+		const selectedId = this.selected?.id;
+		const atDraft = this.cursor === items(previous).length;
+		if (equal(previous, queue)) {
+			// The content may be unchanged while a newer CAS revision arrived.
+			this.queue = clone(queue);
+			if (atDraft) this.cursor = items(this.queue).length;
+			return undefined;
+		}
+		if (atDraft) {
+			this.queue = clone(queue);
+			this.cursor = items(this.queue).length;
+			return undefined;
+		}
+		if (selectedId) {
+			const cursor = items(queue).findIndex((item) => item.id === selectedId);
+			if (cursor >= 0) {
+				this.queue = clone(queue);
+				this.cursor = cursor;
+				return undefined;
+			}
+		}
 		const draft = this.draft;
 		this.reset();
 		return draft;

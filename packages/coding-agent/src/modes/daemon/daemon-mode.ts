@@ -4179,13 +4179,18 @@ export class AgentDaemon {
 				const supportsMutation = daemonClientCapabilitiesForSession(client, command.activeSessionId).has(
 					"queue_item_mutation",
 				);
+				const items = supportsMutation ? state.runtime.session.getEditableQueueItems() : undefined;
 				return success(command.id, "get_queue", {
-					steering: [...state.runtime.session.getSteeringMessagePreviews()],
-					followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
-					...(supportsMutation
+					steering: items
+						? items.filter((item) => item.lane === "steering").map((item) => item.text)
+						: [...state.runtime.session.getSteeringMessagePreviews()],
+					followUp: items
+						? items.filter((item) => item.lane === "followUp").map((item) => item.text)
+						: [...state.runtime.session.getFollowUpMessagePreviews()],
+					...(items
 						? {
 								revision: state.runtime.session.queueRevision,
-								items: state.runtime.session.getEditableQueueItems(),
+								items,
 							}
 						: {}),
 				});
@@ -4193,18 +4198,20 @@ export class AgentDaemon {
 
 			case "mutate_queue_item": {
 				const state = this.getSessionState(command.activeSessionId);
-				const applied = state.runtime.session.mutateQueuedUserMessage(
+				const mutationResult: unknown = state.runtime.session.mutateQueuedUserMessage(
 					command.actionId,
 					command.expectedRevision,
 					command.mutation,
 				);
+				const outcome = mutationResult === true ? "applied" : mutationResult === false ? "stale" : mutationResult;
+				const items = state.runtime.session.getEditableQueueItems();
 				return success(command.id, "mutate_queue_item", {
-					status: applied ? "applied" : "stale",
+					status: outcome,
 					queue: {
-						steering: [...state.runtime.session.getSteeringMessagePreviews()],
-						followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
+						steering: items.filter((item) => item.lane === "steering").map((item) => item.text),
+						followUp: items.filter((item) => item.lane === "followUp").map((item) => item.text),
 						revision: state.runtime.session.queueRevision,
-						items: state.runtime.session.getEditableQueueItems(),
+						items,
 					},
 				});
 			}

@@ -76,6 +76,32 @@ describe("PendingMessageNavigation", () => {
 		expect(state.browse(reordered, "f1", 1)).toBe("f3 edited");
 	});
 
+	it("refreshes revisions and reanchors stable selection without dropping edits", () => {
+		const state = new PendingMessageNavigation();
+		state.browse({ ...queue, revision: 1 }, "draft", -1);
+		state.capture("f3 edited");
+		const changed = {
+			...queue,
+			revision: 2,
+			followUp: ["inserted", ...queue.followUp],
+			items: [
+				...queue.items.filter((item) => item.lane === "steering"),
+				{ id: "new", lane: "followUp" as const, index: 0, text: "inserted" },
+				...queue.items
+					.filter((item) => item.lane === "followUp")
+					.map((item) => ({ ...item, index: item.index + 1 })),
+			],
+		};
+		expect(state.sync(changed)).toBeUndefined();
+		expect(state.selected).toEqual({ id: "f3", lane: "followUp", index: 3 });
+		expect(state.browse(changed, "f3 edited", 1)).toBe("draft");
+
+		// Same content still refreshes the cached CAS revision.
+		state.browse({ ...queue, revision: 3 }, "draft", -1);
+		expect(state.sync({ ...queue, revision: 4 })).toBeUndefined();
+		expect(state.checkpoint().queue?.revision).toBe(4);
+	});
+
 	it("resets when the authoritative queue changes", () => {
 		const state = new PendingMessageNavigation();
 		state.browse(queue, "draft", -1);
@@ -84,6 +110,16 @@ describe("PendingMessageNavigation", () => {
 
 		state.browse(queue, "", -1);
 		expect(state.sync({ steering: [], followUp: [] })).toBe("");
+	});
+
+	it("dispatches xterm, Kitty, and macOS ctrl-alt arrow sequences", () => {
+		const keys = new KeybindingsManager();
+		expect(keys.matches("\x1b[1;8A", "app.message.moveEarlier")).toBe(true);
+		expect(keys.matches("\x1b[1;8B", "app.message.moveLater")).toBe(true);
+		expect(keys.matches("\x1b[57419;7u", "app.message.moveEarlier")).toBe(true);
+		expect(keys.matches("\x1b[57420;7u", "app.message.moveLater")).toBe(true);
+		expect(keys.matches("\x1b\x1b[1;5A", "app.message.moveEarlier")).toBe(true);
+		expect(keys.matches("\x1b\x1b[1;5B", "app.message.moveLater")).toBe(true);
 	});
 
 	it("uses configurable conflict-free defaults", () => {

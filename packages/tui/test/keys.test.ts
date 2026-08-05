@@ -614,4 +614,20 @@ describe("parseKey", () => {
 			assert.strictEqual(parseKey("\x1b[[5~"), "pageUp");
 		});
 	});
+
+	describe("combined modified arrows", () => {
+		it("matches xterm and Kitty Ctrl+Alt arrows", () => {
+			assert.equal(matchesKey("\x1b[1;8A", "ctrl+alt+up"), true);
+			assert.equal(matchesKey("\x1b[1;8B", "ctrl+alt+down"), true);
+			assert.equal(matchesKey("\x1b[57419;7u", "ctrl+alt+up"), true);
+			assert.equal(matchesKey("\x1b[57420;7u", "ctrl+alt+down"), true);
+		});
+
+		it("matches legacy Option-as-Meta wrapped Ctrl arrows", () => {
+			assert.equal(matchesKey("\x1b\x1b[1;5A", "ctrl+alt+up"), true);
+			assert.equal(matchesKey("\x1b\x1b[1;5B", "ctrl+alt+down"), true);
+			assert.equal(matchesKey("\x1b\x1bOa", "ctrl+alt+up"), true);
+			assert.equal(matchesKey("\x1b\x1bOb", "ctrl+alt+down"), true);
+		});
+	});
 });

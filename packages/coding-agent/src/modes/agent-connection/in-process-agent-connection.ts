@@ -184,11 +184,12 @@ export class InProcessAgentConnection implements AgentConnection {
 	}
 
 	async getQueue(): Promise<AgentConnectionQueueState> {
+		const items = this.session.getEditableQueueItems();
 		return {
-			steering: [...this.session.getSteeringMessagePreviews()],
-			followUp: [...this.session.getFollowUpMessagePreviews()],
+			steering: items.filter((item) => item.lane === "steering").map((item) => item.text),
+			followUp: items.filter((item) => item.lane === "followUp").map((item) => item.text),
 			revision: this.session.queueRevision,
-			items: this.session.getEditableQueueItems(),
+			items,
 		};
 	}
 
@@ -197,7 +198,7 @@ export class InProcessAgentConnection implements AgentConnection {
 		expectedRevision: number,
 		mutation: AgentConnectionQueueMutation,
 	): Promise<AgentConnectionQueueMutationResult> {
-		const status = this.session.mutateQueuedUserMessage(id, expectedRevision, mutation) ? "applied" : "stale";
+		const status = this.session.mutateQueuedUserMessage(id, expectedRevision, mutation);
 		return { status, queue: await this.getQueue() };
 	}
 

@@ -529,7 +529,7 @@ export type AgentConnectionQueueMutation =
 	| { type: "move_earlier" }
 	| { type: "move_later" };
 export interface AgentConnectionQueueMutationResult {
-	status: "applied" | "stale" | "unsupported";
+	status: "applied" | "noop" | "stale" | "unsupported";
 	queue: AgentConnectionQueueState;
 }
 

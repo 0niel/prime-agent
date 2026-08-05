@@ -792,6 +792,16 @@ function visibleSessionActionProjection(actions: readonly QueuedSessionAction[])
 	);
 }
 
+/** Queue-visible user turns are editable regardless of which input path admitted them. */
+function isEditableQueuedUserTurn(action: QueuedSessionAction): action is SessionAction<PreparedTurnPayload> {
+	return (
+		action.payload.kind === "turn" &&
+		action.payload.queueVisible &&
+		!action.payload.acceptedAgentMessage &&
+		action.payload.customMessage === undefined
+	);
+}
+
 const IPYTHON_SENT_AGENT_MESSAGE_CUSTOM_ENTRY = "ipython_sent_agent_message";
 
 interface PersistedIpythonSentAgentMessage {
@@ -1499,9 +1509,13 @@ export class AgentSession {
 
 	private _emitQueueUpdate(): void {
 		const actions = this.getSessionActionSnapshot();
-		if (JSON.stringify(actions) === JSON.stringify(this._lastSessionActionSnapshot)) return;
-		this._queueRevision++;
-		actions.revision = this._queueRevision;
+		const previous = this._lastSessionActionSnapshot;
+		const projection = ({ steering, followUps, items }: SessionActionSnapshot) => ({ steering, followUps, items });
+		if (JSON.stringify(projection(actions)) !== JSON.stringify(projection(previous))) {
+			this._queueRevision++;
+			actions.revision = this._queueRevision;
+		}
+		if (JSON.stringify(actions) === JSON.stringify(previous)) return;
 		this._lastSessionActionSnapshot = actions;
 		this._emit({ type: "session_action_update", actions });
 	}
@@ -6104,12 +6118,7 @@ export class AgentSession {
 			["next_turn_boundary", "steering"],
 			["when_run_idle", "followUp"],
 		] as const) {
-			const editable = this._actionStore
-				.queuedActions(delivery)
-				.filter(
-					(action) =>
-						action.payload.kind === "turn" && action.payload.queueVisible && action.source === "interactive",
-				);
+			const editable = this._actionStore.queuedActions(delivery).filter(isEditableQueuedUserTurn);
 			for (const [index, action] of editable.entries()) {
 				if (action.payload.kind === "turn")
 					result.push({
@@ -6133,24 +6142,16 @@ export class AgentSession {
 		mutation:
 			| { type: "delete" | "move_earlier" | "move_later" }
 			| { type: "replace_follow_up" | "replace_steering"; text: string; images?: ImageContent[] },
-	): boolean {
-		if (expectedRevision !== this._queueRevision) return false;
+	): "applied" | "noop" | "stale" {
+		if (expectedRevision !== this._queueRevision) return "stale";
 		const action = this._actionStore.queuedActions().find((candidate) => candidate.id === actionId);
-		if (!action || action.payload.kind !== "turn" || !action.payload.queueVisible || action.source !== "interactive")
-			return false;
+		if (!action || !isEditableQueuedUserTurn(action)) return "stale";
 		const lane = action.delivery;
-		const laneActions = this._actionStore
-			.queuedActions(lane)
-			.filter(
-				(candidate) =>
-					candidate.payload.kind === "turn" &&
-					candidate.payload.queueVisible &&
-					candidate.source === "interactive",
-			);
+		const laneActions = this._actionStore.queuedActions(lane).filter(isEditableQueuedUserTurn);
 		const index = laneActions.indexOf(action);
 		if (mutation.type === "move_earlier" || mutation.type === "move_later") {
 			const target = index + (mutation.type === "move_earlier" ? -1 : 1);
-			if (target < 0 || target >= laneActions.length) return true;
+			if (target < 0 || target >= laneActions.length) return "noop";
 			this._actionStore.swapQueued(action, laneActions[target]!);
 		} else if (mutation.type === "delete") {
 			this._cancelSessionActions(
@@ -6160,10 +6161,7 @@ export class AgentSession {
 		} else if ("text" in mutation) {
 			const targetLane: DeliveryPolicy =
 				mutation.type === "replace_steering" ? "next_turn_boundary" : "when_run_idle";
-			const targetIndex =
-				targetLane === lane
-					? this._actionStore.queuedActions(lane).indexOf(action)
-					: this._actionStore.queuedActions(targetLane).length;
+			const targetIndex = this._actionStore.queuedActions(targetLane).length;
 			action.payload.text = mutation.text;
 			if (mutation.images !== undefined) {
 				action.payload.images = mutation.images.length ? mutation.images.map((image) => ({ ...image })) : undefined;
@@ -6184,10 +6182,10 @@ export class AgentSession {
 						: mutation.text;
 				}
 			}
-			this._actionStore.moveQueued(action, targetLane, targetIndex);
+			if (targetLane !== lane) this._actionStore.moveQueued(action, targetLane, targetIndex);
 		}
 		this._emitQueueUpdate();
-		return true;
+		return "applied";
 	}
 
 	get queuedActionCount(): number {

@@ -149,6 +149,21 @@ describe("AgentSession concurrent prompt guard", () => {
 		await firstPrompt.catch(() => {}); // Ignore abort error
 	});
 
+	it("does not bump queue revision for active phase-only updates", async () => {
+		createSession();
+		const revisions: number[] = [];
+		const unsubscribe = session.subscribe((event) => {
+			if (event.type === "session_action_update" && event.actions.active)
+				revisions.push(event.actions.revision ?? -1);
+		});
+		const prompt = session.prompt("running");
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		expect(new Set(revisions).size).toBeLessThanOrEqual(1);
+		unsubscribe();
+		await session.abort();
+		await prompt.catch(() => {});
+	});
+
 	it("should allow steer() while streaming", async () => {
 		createSession();
 
@@ -196,20 +211,35 @@ describe("AgentSession concurrent prompt guard", () => {
 		});
 		await session.prompt("follow", { streamingBehavior: "followUp", queueIfBusy: true, source: "interactive" });
 		const staleRevision = session.queueRevision - 1;
-		const [first, second, follow] = session.getEditableQueueItems();
-		expect([first?.text, second?.text, follow?.text]).toEqual(["duplicate", "duplicate [image #1]", "follow"]);
+		const [first, extension, second, follow] = session.getEditableQueueItems();
+		expect([first?.text, extension?.text, second?.text, follow?.text]).toEqual([
+			"duplicate",
+			"extension item",
+			"duplicate [image #1]",
+			"follow",
+		]);
 
 		expect(session.getSteeringMessages()).toEqual(["duplicate", "extension item", "duplicate [image #1]"]);
-		expect(session.mutateQueuedUserMessage(second!.id, staleRevision, { type: "delete" })).toBe(false);
-		expect(session.mutateQueuedUserMessage("missing", session.queueRevision, { type: "delete" })).toBe(false);
-		expect(session.mutateQueuedUserMessage(second!.id, session.queueRevision, { type: "move_earlier" })).toBe(true);
-		expect(session.getEditableQueueItems().map((item) => item.id)).toEqual([second!.id, first!.id, follow!.id]);
+		const boundaryRevision = session.queueRevision;
+		expect(session.mutateQueuedUserMessage(first!.id, boundaryRevision, { type: "move_earlier" })).toBe("noop");
+		expect(session.queueRevision).toBe(boundaryRevision);
+		expect(session.mutateQueuedUserMessage(second!.id, staleRevision, { type: "delete" })).toBe("stale");
+		expect(session.mutateQueuedUserMessage("missing", session.queueRevision, { type: "delete" })).toBe("stale");
+		expect(session.mutateQueuedUserMessage(second!.id, session.queueRevision, { type: "move_earlier" })).toBe(
+			"applied",
+		);
+		expect(session.getEditableQueueItems().map((item) => item.id)).toEqual([
+			first!.id,
+			second!.id,
+			extension!.id,
+			follow!.id,
+		]);
 		expect(
 			session.mutateQueuedUserMessage(second!.id, session.queueRevision, {
 				type: "replace_steering",
 				text: "reconnected edit [image #1]",
 			}),
-		).toBe(true);
+		).toBe("applied");
 		let preserved = session.getSessionActionRecoverySnapshot().actions.find((action) => action.id === second!.id);
 		expect(preserved?.payload).toMatchObject({ images: [originalImage] });
 		expect(
@@ -218,7 +248,7 @@ describe("AgentSession concurrent prompt guard", () => {
 				text: "removed marker",
 				images: [],
 			}),
-		).toBe(true);
+		).toBe("applied");
 		preserved = session.getSessionActionRecoverySnapshot().actions.find((action) => action.id === second!.id);
 		expect(preserved?.payload).not.toHaveProperty("images");
 		const image: ImageContent = { type: "image", data: "encoded", mimeType: "image/png" };
@@ -228,9 +258,10 @@ describe("AgentSession concurrent prompt guard", () => {
 				text: "converted",
 				images: [image],
 			}),
-		).toBe(true);
+		).toBe("applied");
 		expect(session.getEditableQueueItems()).toMatchObject([
 			{ id: first!.id, lane: "steering", text: "duplicate" },
+			{ id: extension!.id, lane: "steering", text: "extension item" },
 			{ id: follow!.id, lane: "followUp", text: "follow" },
 			{ id: second!.id, lane: "followUp", text: "converted" },
 		]);
@@ -240,8 +271,8 @@ describe("AgentSession concurrent prompt guard", () => {
 			{ type: "text", text: "converted" },
 			image,
 		]);
-		expect(session.mutateQueuedUserMessage(second!.id, session.queueRevision, { type: "delete" })).toBe(true);
-		expect(session.mutateQueuedUserMessage(second!.id, session.queueRevision, { type: "delete" })).toBe(false);
+		expect(session.mutateQueuedUserMessage(second!.id, session.queueRevision, { type: "delete" })).toBe("applied");
+		expect(session.mutateQueuedUserMessage(second!.id, session.queueRevision, { type: "delete" })).toBe("stale");
 		expect(session.isStreaming).toBe(true);
 
 		await session.abort();
