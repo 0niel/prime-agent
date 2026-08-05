@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added a feature hint for enabling automatic trace sharing.
+
 ## [0.7.0] - 2026-08-05
 
 ### Breaking Changes
