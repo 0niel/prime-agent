@@ -1378,6 +1378,29 @@ export class AgentSession {
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
 	}
 
+	extendTemporarySkills(skillPaths: string[], source: string): void {
+		if (skillPaths.length === 0) return;
+		if (this.isStreaming) {
+			throw new Error("Cannot extend temporary skills while the agent is running");
+		}
+		const activeToolNames = this.getActiveToolNames();
+		const flagValues = this._extensionRunner.getFlagValues();
+		this._resourceLoader.extendResources({
+			skillPaths: skillPaths.map((path) => ({
+				path,
+				metadata: {
+					source,
+					scope: "temporary",
+					origin: "top-level",
+					baseDir: dirname(path),
+				},
+			})),
+		});
+		this._buildRuntime({ activeToolNames, flagValues, includeAllExtensionTools: true });
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._baseSystemPrompt;
+	}
+
 	/** Model registry for API key resolution and model discovery */
 	get modelRegistry(): ModelRegistry {
 		return this._modelRegistry;

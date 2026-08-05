@@ -13,6 +13,7 @@ import { InProcessAgentConnection } from "../agent-connection/in-process-agent-c
 import type { AgentConnection } from "../agent-connection/types.js";
 import { latestAutonomousGateAttempt } from "../headless-completion.js";
 import { type AcpEventMappingState, acpUpdatesForSessionEvent } from "./acp-events.js";
+import { AcpMcpSkillInstaller } from "./acp-mcp.js";
 import { primeAgentMeta } from "./acp-meta.js";
 import { type AcpStopReason, acpStopReason } from "./acp-stop-reason.js";
 
@@ -87,6 +88,8 @@ function sameCwd(left: string, right: string): boolean {
 export interface AcpModeOptions {
 	/** Bind headless extensions once the connection is live (in-process mode). */
 	bindHeadlessExtensions?: () => Promise<void>;
+	/** Install the MCP servers supplied when the ACP session is created. */
+	configureMcpServers?: (servers: readonly acp.McpServer[]) => Promise<void> | void;
 	/**
 	 * Transport override. Defaults to NDJSON over stdio; tests supply an
 	 * in-memory stream pair so the protocol runs without a subprocess.
@@ -229,9 +232,15 @@ async function turnFailure(connection: AgentConnection, boundary: TurnBoundary):
 
 export async function runAcpMode(runtimeHost: AgentSessionRuntime): Promise<never> {
 	const connection = new InProcessAgentConnection(runtimeHost);
-	return runAcpModeWithConnection(connection, {
-		bindHeadlessExtensions: () => connection.bindHeadlessExtensions({}),
-	});
+	const mcp = new AcpMcpSkillInstaller(runtimeHost.session);
+	try {
+		return await runAcpModeWithConnection(connection, {
+			bindHeadlessExtensions: () => connection.bindHeadlessExtensions({}),
+			configureMcpServers: (servers) => mcp.configure(servers),
+		});
+	} finally {
+		mcp.dispose();
+	}
 }
 
 export async function runAcpModeWithConnection(
@@ -260,6 +269,7 @@ export async function runAcpModeWithConnection(
 			agentCapabilities: {
 				loadSession: false,
 				promptCapabilities: { image: true, embeddedContext: true },
+				mcpCapabilities: { http: true },
 				// Advertise close so a client knows it can release the session (and
 				// the single-session slot) instead of dropping the connection.
 				sessionCapabilities: { close: {} },
@@ -270,23 +280,30 @@ export async function runAcpModeWithConnection(
 			_meta: primeAgentMeta({}),
 		}))
 		.onRequest("session/new", async (ctx: any) => {
-			if (!bound) {
-				// Only latch after a successful bind: a rejected bind must not leave
-				// extensions permanently unavailable for the rest of the process.
-				await options.bindHeadlessExtensions?.();
-				bound = true;
-			}
 			if (session) {
 				throw new Error(
 					"prime-agent ACP mode hosts one session per connection; " +
 						"start another prime-agent process for a second session",
 				);
 			}
+			const params = ctx.params as acp.NewSessionRequest;
+			if (params.mcpServers.length > 0) {
+				if (!options.configureMcpServers) {
+					throw acp.RequestError.invalidParams({ reason: "MCP servers are unavailable in this ACP host" });
+				}
+				await options.configureMcpServers(params.mcpServers);
+			}
+			if (!bound) {
+				// Only latch after a successful bind: a rejected bind must not leave
+				// extensions permanently unavailable for the rest of the process.
+				await options.bindHeadlessExtensions?.();
+				bound = true;
+			}
 			// prime-agent's cwd is fixed at startup by the session it was launched
 			// with, so a client-supplied cwd cannot be adopted after the fact.
 			// Report the real cwd back in `_meta` rather than failing the request or
 			// letting the client assume a directory the agent is not using.
-			const requestedCwd = (ctx.params as { cwd?: unknown } | undefined)?.cwd;
+			const requestedCwd = params.cwd;
 			let cwdMismatch: { requested: string; actual: string } | undefined;
 			if (typeof requestedCwd === "string" && requestedCwd.length > 0) {
 				const actual = await connection
