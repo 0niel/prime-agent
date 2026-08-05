@@ -7313,6 +7313,7 @@ export class InteractiveMode {
 		options: { abort?: boolean } = {},
 	): Promise<{ steering: string[]; followUp: string[] }> {
 		const navigation = this.pendingMessageNavigation?.checkpoint();
+		const selectedId = this.pendingMessageNavigation?.selected?.id;
 		const queueEventGeneration = this.queueEventGeneration;
 		const connectionQueue = this.connectionQueue;
 		this.pendingMessageNavigation?.reset();
@@ -7329,7 +7330,7 @@ export class InteractiveMode {
 			) {
 				this.pendingMessageNavigation?.restore(navigation);
 			} else if (navigation) {
-				const selectedId = navigation.queue?.items?.[navigation.cursor]?.id;
+				this.pendingMessageNavigation?.restore(navigation);
 				if (selectedId) this.pendingMessageNavigation?.reconcile(this.connectionQueue, selectedId);
 			}
 			throw error;
