@@ -4148,7 +4148,11 @@ export class InteractiveMode {
 		});
 		this.defaultEditor.onAction("app.editor.external", () => this.openExternalEditor());
 		this.defaultEditor.onAction("app.prompt.stash", () => this.handlePromptStash());
-		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
+		this.defaultEditor.onAction("app.message.followUp", () => {
+			void this.handleFollowUp().catch((error) =>
+				this.showError(error instanceof Error ? error.message : String(error)),
+			);
+		});
 		this.defaultEditor.onAction("app.message.navigateOlder", () => this.navigatePendingMessage(-1));
 		this.defaultEditor.onAction("app.message.navigateNewer", () => this.navigatePendingMessage(1));
 		this.defaultEditor.onAction("app.message.moveEarlier", () => {
@@ -7066,6 +7070,7 @@ export class InteractiveMode {
 				this.pendingMessageNavigation.reconcile(this.connectionQueue, selected.id);
 			} else {
 				this.pendingMessageNavigation.reset();
+				this.showWarning("That queued message was already delivered or removed; your edit is now a draft.");
 			}
 			return "obsolete";
 		}
@@ -7307,6 +7312,7 @@ export class InteractiveMode {
 	private async clearAllQueues(
 		options: { abort?: boolean } = {},
 	): Promise<{ steering: string[]; followUp: string[] }> {
+		this.pendingMessageNavigation?.reset();
 		const { steering, followUp } = options.abort
 			? await this.agentConnection.abortAndClearQueue()
 			: await this.agentConnection.clearQueue();
@@ -7360,6 +7366,9 @@ export class InteractiveMode {
 	}
 
 	private async restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): Promise<number> {
+		const navigation = this.pendingMessageNavigation?.checkpoint();
+		const currentText =
+			options?.currentText ?? (this.pendingMessageNavigation?.selected ? navigation?.draft : this.editor.getText());
 		const { steering, followUp } = await this.clearAllQueues({ abort: options?.abort });
 		const allQueued = [...steering, ...followUp];
 		if (allQueued.length === 0) {
@@ -7367,7 +7376,6 @@ export class InteractiveMode {
 			return 0;
 		}
 		const queuedText = allQueued.join("\n\n");
-		const currentText = options?.currentText ?? this.editor.getText();
 		const combinedText = [queuedText, currentText].filter((t) => t.trim()).join("\n\n");
 		// The image registry persists, so the restored `[image #N]` markers resolve
 		// on resubmit without any re-registration here.

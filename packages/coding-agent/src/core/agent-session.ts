@@ -1507,11 +1507,11 @@ export class AgentSession {
 		}
 	}
 
-	private _emitQueueUpdate(): void {
+	private _emitQueueUpdate(forceRevision = false): void {
 		const actions = this.getSessionActionSnapshot();
 		const previous = this._lastSessionActionSnapshot;
 		const projection = ({ steering, followUps, items }: SessionActionSnapshot) => ({ steering, followUps, items });
-		if (JSON.stringify(projection(actions)) !== JSON.stringify(projection(previous))) {
+		if (forceRevision || JSON.stringify(projection(actions)) !== JSON.stringify(projection(previous))) {
 			this._queueRevision++;
 			actions.revision = this._queueRevision;
 		}
@@ -6184,7 +6184,7 @@ export class AgentSession {
 			}
 			if (targetLane !== lane) this._actionStore.moveQueued(action, targetLane, targetIndex);
 		}
-		this._emitQueueUpdate();
+		this._emitQueueUpdate(true);
 		return "applied";
 	}
 

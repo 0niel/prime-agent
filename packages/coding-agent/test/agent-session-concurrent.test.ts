@@ -242,6 +242,16 @@ describe("AgentSession concurrent prompt guard", () => {
 		).toBe("applied");
 		let preserved = session.getSessionActionRecoverySnapshot().actions.find((action) => action.id === second!.id);
 		expect(preserved?.payload).toMatchObject({ images: [originalImage] });
+		const imageOnlyRevision = session.queueRevision;
+		const imageOnlyReplacement: ImageContent = { type: "image", data: "replacement", mimeType: "image/png" };
+		expect(
+			session.mutateQueuedUserMessage(second!.id, imageOnlyRevision, {
+				type: "replace_steering",
+				text: "reconnected edit [image #1]",
+				images: [imageOnlyReplacement],
+			}),
+		).toBe("applied");
+		expect(session.queueRevision).toBe(imageOnlyRevision + 1);
 		expect(
 			session.mutateQueuedUserMessage(second!.id, session.queueRevision, {
 				type: "replace_steering",
