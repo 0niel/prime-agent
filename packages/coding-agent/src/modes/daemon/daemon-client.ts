@@ -139,6 +139,16 @@ export class DaemonClient {
 		return this.helloMessage?.serverCapabilities?.includes(capability) === true;
 	}
 
+	canRequest(command: DaemonCommandBody): boolean {
+		const hello = this.helloMessage;
+		return (
+			hello !== undefined &&
+			getDaemonCommandCompatibilities(command).every((compatibility) =>
+				this.meetsCommandCompatibility(hello, compatibility),
+			)
+		);
+	}
+
 	/** Wait for the daemon_hello greeting sent on connect. */
 	async waitForHello(timeoutMs = 3000): Promise<DaemonHello> {
 		if (this.helloMessage) {

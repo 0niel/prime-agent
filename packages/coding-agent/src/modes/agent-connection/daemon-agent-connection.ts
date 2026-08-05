@@ -533,16 +533,15 @@ export class DaemonAgentConnection implements AgentConnection {
 		expectedRevision: number,
 		mutation: AgentConnectionQueueMutation,
 	): Promise<AgentConnectionQueueMutationResult> {
-		if (!this.client.supportsServerCapability("queue_item_mutation")) {
-			return { status: "unsupported", queue: await this.getQueue() };
-		}
-		return this.requestData<AgentConnectionQueueMutationResult>({
-			type: "mutate_queue_item",
+		const command = {
+			type: "mutate_queue_item" as const,
 			activeSessionId: this.activeSessionId,
 			actionId: id,
 			expectedRevision,
 			mutation,
-		});
+		};
+		if (!this.client.canRequest(command)) return { status: "unsupported", queue: await this.getQueue() };
+		return this.requestData<AgentConnectionQueueMutationResult>(command);
 	}
 
 	async clearQueue(): Promise<AgentConnectionQueueState> {

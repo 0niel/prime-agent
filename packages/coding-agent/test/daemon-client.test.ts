@@ -275,6 +275,15 @@ describe("DaemonClient", () => {
 		socket.emit("connect");
 		await connect;
 		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["queue_item_mutation"], 14);
+		expect(
+			client.canRequest({
+				type: "mutate_queue_item",
+				activeSessionId: "active-1",
+				actionId: "action-1",
+				expectedRevision: 1,
+				mutation: { type: "delete" },
+			}),
+		).toBe(false);
 		await expect(
 			client.request({
 				type: "mutate_queue_item",

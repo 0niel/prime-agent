@@ -54,6 +54,7 @@ class FakeDaemonClient {
 	promptResponseError: string | undefined;
 	cancelPromptAdmissionStatus: "cancelled" | "owned" | "unknown" = "owned";
 	serverCapabilities = new Set<string>();
+	queueMutationCompatible = true;
 	updateRestartSessions: Array<Record<string, unknown>> = [];
 	hello: DaemonHello | undefined = {
 		type: "daemon_hello",
@@ -482,6 +483,13 @@ class FakeDaemonClient {
 
 	supportsServerCapability(capability: string): boolean {
 		return this.serverCapabilities.has(capability);
+	}
+
+	canRequest(command: DaemonCommand): boolean {
+		return (
+			command.type !== "mutate_queue_item" ||
+			(this.queueMutationCompatible && this.serverCapabilities.has("queue_item_mutation"))
+		);
 	}
 
 	onMessage(listener: DaemonClientMessageListener): () => void {
@@ -2244,6 +2252,18 @@ describe("DaemonAgentConnection", () => {
 			actionId: "action-1",
 			expectedRevision: 2,
 		});
+	});
+
+	it("degrades schema-14 queue mutation to unsupported without writing", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("queue_item_mutation");
+		fakeClient.queueMutationCompatible = false;
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		await expect(connection.mutateQueueItem("action-1", 2, { type: "delete" })).resolves.toMatchObject({
+			status: "unsupported",
+		});
+		expect(fakeClient.requests.some((request) => request.type === "mutate_queue_item")).toBe(false);
 	});
 
 	it("sends queue commands through the daemon protocol", async () => {

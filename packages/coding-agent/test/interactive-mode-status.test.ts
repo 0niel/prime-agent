@@ -854,9 +854,39 @@ describe("InteractiveMode submit handling", () => {
 			),
 		).resolves.toBe(false);
 		expect(fakeThis.connectionQueue).toBe(queue);
-		expect(fakeThis.setEditorFromPendingNavigation).not.toHaveBeenCalled();
+		expect(fakeThis.setEditorFromPendingNavigation).toHaveBeenCalledWith("edited");
 		expect(fakeThis.showWarning).not.toHaveBeenCalled();
+		expect(navigation.selected?.id).toBe("selected");
+		expect(navigation.draftText).toBe("draft");
 		expect(editorText).toBe("newer editor");
+	});
+
+	test("clears a dead selection and restores draft after an obsolete response", async () => {
+		const navigation = new PendingMessageNavigation();
+		const selectedQueue = {
+			steering: [],
+			followUp: ["selected"],
+			revision: 8,
+			items: [{ id: "selected", lane: "followUp" as const, index: 0, text: "selected" }],
+		};
+		navigation.select(selectedQueue, "draft", selectedQueue.items[0]!);
+		const setEditor = vi.fn();
+		const fakeThis = {
+			editor: { getText: () => "edited" },
+			pendingMessageNavigation: navigation,
+			connectionQueue: { steering: [], followUp: ["external"], revision: 9, items: [] },
+			agentConnection: { mutateQueueItem: vi.fn(async () => ({ status: "stale" as const, queue: selectedQueue })) },
+			queueMutationImages: () => [],
+			setEditorFromPendingNavigation: setEditor,
+			showWarning: vi.fn(),
+		};
+		await Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange").call(
+			fakeThis,
+			"followUp",
+			"edited",
+		);
+		expect(navigation.selected).toBeUndefined();
+		expect(setEditor).toHaveBeenCalledWith("draft");
 	});
 
 	test.each([

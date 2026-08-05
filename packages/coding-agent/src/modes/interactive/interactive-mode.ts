@@ -7021,7 +7021,18 @@ export class InteractiveMode {
 			this.pendingMessageNavigation.restore(checkpoint);
 			throw error;
 		}
-		if ((result.queue.revision ?? -1) < (this.connectionQueue.revision ?? -1)) return false;
+		if ((result.queue.revision ?? -1) < (this.connectionQueue.revision ?? -1)) {
+			const stillPending = this.connectionQueue.items?.some((item) => item.id === selected.id) === true;
+			if (stillPending) {
+				this.pendingMessageNavigation.restore(checkpoint);
+				this.pendingMessageNavigation.reconcile(this.connectionQueue, selected.id);
+				this.setEditorFromPendingNavigation(text);
+			} else {
+				this.pendingMessageNavigation.reset();
+				this.setEditorFromPendingNavigation(checkpoint.draft);
+			}
+			return false;
+		}
 		if (result.status !== "applied") {
 			this.connectionQueue = result.queue;
 			if (result.status === "unsupported") {
