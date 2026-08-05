@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `--mode acp`: prime-agent now runs as an Agent Client Protocol agent over NDJSON on stdio, driving an `AgentConnection` in-process. IPython surfaces as an ACP `execute` tool call carrying its cell source, and capabilities ACP has no native concept for (subagents, autonomous gate state, rich IPython MIME output, compaction) travel in a namespaced `ai.primeintellect.prime-agent` `_meta` envelope that vanilla ACP clients ignore.
+
 - Added missing argument hints to /name, /model, /export, and /import in autocomplete.
 
 - Fixed `stop` and `rename` rejecting custom daemon socket options.
