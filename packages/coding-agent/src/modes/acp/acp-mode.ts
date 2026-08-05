@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { Readable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
@@ -44,6 +45,43 @@ function rawStdoutSink(): WritableStream<Uint8Array> {
 			writeRawStdout(typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true }));
 		},
 	});
+}
+
+function normalizeWindowsDriveLetter(path: string): string {
+	if (process.platform !== "win32" || !/^[A-Z]:/i.test(path)) return path;
+	return path.slice(0, 1).toLowerCase() + path.slice(1);
+}
+
+function canonicalCwd(path: string): string {
+	const resolved = resolve(path);
+	let canonical: string;
+	try {
+		canonical = realpathSync(resolved);
+	} catch {
+		// Preserve the previous lexical comparison when a path is missing or inaccessible.
+		canonical = resolved;
+	}
+	return normalizeWindowsDriveLetter(canonical);
+}
+
+function sameCwd(left: string, right: string): boolean {
+	const canonicalLeft = canonicalCwd(left);
+	const canonicalRight = canonicalCwd(right);
+	if (canonicalLeft === canonicalRight) return true;
+
+	try {
+		const leftStat = statSync(canonicalLeft, { bigint: true });
+		const rightStat = statSync(canonicalRight, { bigint: true });
+		// Either half being zero makes the pair untrustworthy: Windows path-based
+		// stat can report dev 0 with a real ino, and comparing ino alone would match
+		// distinct directories on different volumes, since file IDs are volume-local.
+		const leftIdentityMissing = leftStat.dev === 0n || leftStat.ino === 0n;
+		const rightIdentityMissing = rightStat.dev === 0n || rightStat.ino === 0n;
+		if (leftIdentityMissing || rightIdentityMissing) return false;
+		return leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
+	} catch {
+		return false;
+	}
 }
 
 export interface AcpModeOptions {
@@ -255,7 +293,7 @@ export async function runAcpModeWithConnection(
 					.getState()
 					.then((state) => state.cwd)
 					.catch(() => undefined);
-				if (actual && resolve(requestedCwd) !== resolve(actual)) {
+				if (actual && !sameCwd(requestedCwd, actual)) {
 					cwdMismatch = { requested: requestedCwd, actual };
 				}
 			}
