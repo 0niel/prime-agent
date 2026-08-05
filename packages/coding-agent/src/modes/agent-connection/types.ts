@@ -519,6 +519,7 @@ export interface AgentConnectionQueueState {
 	steering: string[];
 	followUp: string[];
 	/** Present when the connection supports atomic queue-item mutation. */
+	revision?: number;
 	items?: AgentConnectionQueueItem[];
 }
 export type AgentConnectionQueueMutation =
@@ -662,7 +663,11 @@ export interface AgentConnection {
 		callbacks?: AgentConnectionSessionListCallbacks,
 	): Promise<AgentConnectionSavedSessionInfo[]>;
 	getQueue(): Promise<AgentConnectionQueueState>;
-	mutateQueueItem(id: string, mutation: AgentConnectionQueueMutation): Promise<AgentConnectionQueueMutationResult>;
+	mutateQueueItem(
+		id: string,
+		expectedRevision: number,
+		mutation: AgentConnectionQueueMutation,
+	): Promise<AgentConnectionQueueMutationResult>;
 	clearQueue(): Promise<AgentConnectionQueueState>;
 	abortAndClearQueue(): Promise<AgentConnectionQueueState>;
 	listCronJobs(options?: { includeInactive?: boolean }): Promise<AgentCronJob[]>;

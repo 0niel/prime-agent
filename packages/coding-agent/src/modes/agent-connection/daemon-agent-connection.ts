@@ -305,6 +305,7 @@ export class DaemonAgentConnection implements AgentConnection {
 				...(supportsExtensionUi ? (["extension_ui"] as const) : []),
 				"slim_attach",
 				"chunked_snapshot",
+				"queue_item_mutation",
 				...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
 			],
 			env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,
@@ -529,6 +530,7 @@ export class DaemonAgentConnection implements AgentConnection {
 
 	async mutateQueueItem(
 		id: string,
+		expectedRevision: number,
 		mutation: AgentConnectionQueueMutation,
 	): Promise<AgentConnectionQueueMutationResult> {
 		if (!this.client.supportsServerCapability("queue_item_mutation")) {
@@ -538,6 +540,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			type: "mutate_queue_item",
 			activeSessionId: this.activeSessionId,
 			actionId: id,
+			expectedRevision,
 			mutation,
 		});
 	}
@@ -1152,6 +1155,7 @@ export class DaemonAgentConnection implements AgentConnection {
 					...(supportsExtensionUi ? (["extension_ui"] as const) : []),
 					"slim_attach",
 					"chunked_snapshot",
+					"queue_item_mutation",
 					...(this.options.ownedSession ? (["client_owned_sessions"] as const) : []),
 				],
 				env: this.options.sendClientEnv ? collectDaemonClientEnv() : undefined,

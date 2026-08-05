@@ -59,7 +59,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 13 narrows agent-origin reach and roster wire shapes to the nuclear family.
 // Revision 14 adds capability-gated atomic queued-message mutation.
 export const DAEMON_SCHEMA_REVISION = 14;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-14-681741af12c5";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-14-183e264f7df2";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -516,6 +516,7 @@ export type DaemonCommand =
 			type: "mutate_queue_item";
 			activeSessionId: string;
 			actionId: string;
+			expectedRevision: number;
 			mutation: AgentConnectionQueueMutation;
 	  }
 	| { id?: string; type: "abort_and_clear_queue"; activeSessionId: string }

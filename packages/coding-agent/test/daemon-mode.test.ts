@@ -8311,6 +8311,7 @@ describe("daemon mode helpers", () => {
 		const state = makeState("active-1") as ActiveSessionState;
 		(state.runtime as { session: unknown }).session = {
 			mutateQueuedUserMessage,
+			queueRevision: 4,
 			getEditableQueueItems,
 			getSteeringMessagePreviews: () => [],
 			getFollowUpMessagePreviews: () => ["edited"],
@@ -8333,13 +8334,17 @@ describe("daemon mode helpers", () => {
 				type: "mutate_queue_item",
 				activeSessionId: state.activeSessionId,
 				actionId: "action-1",
+				expectedRevision: 4,
 				mutation: { type: "replace_follow_up", text: "edited" },
 			}),
 		).resolves.toMatchObject({
 			success: true,
 			data: { status: "applied", queue: { followUp: ["edited"], items: [{ id: "action-1" }] } },
 		});
-		expect(mutateQueuedUserMessage).toHaveBeenCalledWith("action-1", { type: "replace_follow_up", text: "edited" });
+		expect(mutateQueuedUserMessage).toHaveBeenCalledWith("action-1", 4, {
+			type: "replace_follow_up",
+			text: "edited",
+		});
 	});
 
 	it("gets and sets RLM max depth directly on the active session", async () => {

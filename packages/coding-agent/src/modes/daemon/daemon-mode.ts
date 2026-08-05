@@ -4182,18 +4182,28 @@ export class AgentDaemon {
 				return success(command.id, "get_queue", {
 					steering: [...state.runtime.session.getSteeringMessagePreviews()],
 					followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
-					...(supportsMutation ? { items: state.runtime.session.getEditableQueueItems() } : {}),
+					...(supportsMutation
+						? {
+								revision: state.runtime.session.queueRevision,
+								items: state.runtime.session.getEditableQueueItems(),
+							}
+						: {}),
 				});
 			}
 
 			case "mutate_queue_item": {
 				const state = this.getSessionState(command.activeSessionId);
-				const applied = state.runtime.session.mutateQueuedUserMessage(command.actionId, command.mutation);
+				const applied = state.runtime.session.mutateQueuedUserMessage(
+					command.actionId,
+					command.expectedRevision,
+					command.mutation,
+				);
 				return success(command.id, "mutate_queue_item", {
 					status: applied ? "applied" : "stale",
 					queue: {
 						steering: [...state.runtime.session.getSteeringMessagePreviews()],
 						followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
+						revision: state.runtime.session.queueRevision,
 						items: state.runtime.session.getEditableQueueItems(),
 					},
 				});

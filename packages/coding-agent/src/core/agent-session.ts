@@ -1091,6 +1091,7 @@ export class AgentSession {
 	// Event subscription state
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
+	private _queueRevision = 0;
 	private _lastSessionActionSnapshot: SessionActionSnapshot = {
 		queuedCount: 0,
 		steering: [],
@@ -1497,6 +1498,8 @@ export class AgentSession {
 	private _emitQueueUpdate(): void {
 		const actions = this.getSessionActionSnapshot();
 		if (JSON.stringify(actions) === JSON.stringify(this._lastSessionActionSnapshot)) return;
+		this._queueRevision++;
+		actions.revision = this._queueRevision;
 		this._lastSessionActionSnapshot = actions;
 		this._emit({ type: "session_action_update", actions });
 	}
@@ -6089,31 +6092,48 @@ export class AgentSession {
 			["next_turn_boundary", "steering"],
 			["when_run_idle", "followUp"],
 		] as const) {
-			for (const [index, action] of this._actionStore.queuedActions(delivery).entries()) {
-				if (action.payload.kind === "turn" && action.payload.queueVisible && action.source === "interactive") {
-					result.push({ id: action.id, lane, index, text: action.payload.text });
-				}
+			const editable = this._actionStore
+				.queuedActions(delivery)
+				.filter(
+					(action) =>
+						action.payload.kind === "turn" && action.payload.queueVisible && action.source === "interactive",
+				);
+			for (const [index, action] of editable.entries()) {
+				if (action.payload.kind === "turn") result.push({ id: action.id, lane, index, text: action.payload.text });
 			}
 		}
 		return result;
 	}
 
+	get queueRevision(): number {
+		return this._queueRevision;
+	}
+
 	mutateQueuedUserMessage(
 		actionId: string,
+		expectedRevision: number,
 		mutation:
 			| { type: "delete" | "move_earlier" | "move_later" }
 			| { type: "replace_follow_up" | "replace_steering"; text: string; images?: ImageContent[] },
 	): boolean {
+		if (expectedRevision !== this._queueRevision) return false;
 		const action = this._actionStore.queuedActions().find((candidate) => candidate.id === actionId);
 		if (!action || action.payload.kind !== "turn" || !action.payload.queueVisible || action.source !== "interactive")
 			return false;
 		const lane = action.delivery;
-		const laneActions = this._actionStore.queuedActions(lane);
+		const laneActions = this._actionStore
+			.queuedActions(lane)
+			.filter(
+				(candidate) =>
+					candidate.payload.kind === "turn" &&
+					candidate.payload.queueVisible &&
+					candidate.source === "interactive",
+			);
 		const index = laneActions.indexOf(action);
 		if (mutation.type === "move_earlier" || mutation.type === "move_later") {
 			const target = index + (mutation.type === "move_earlier" ? -1 : 1);
 			if (target < 0 || target >= laneActions.length) return true;
-			this._actionStore.moveQueued(action, lane, target);
+			this._actionStore.swapQueued(action, laneActions[target]!);
 		} else if (mutation.type === "delete") {
 			this._cancelSessionActions(
 				(candidate) => candidate === action,
@@ -6122,7 +6142,10 @@ export class AgentSession {
 		} else if ("text" in mutation) {
 			const targetLane: DeliveryPolicy =
 				mutation.type === "replace_steering" ? "next_turn_boundary" : "when_run_idle";
-			const targetIndex = targetLane === lane ? index : this._actionStore.queuedActions(targetLane).length;
+			const targetIndex =
+				targetLane === lane
+					? this._actionStore.queuedActions(lane).indexOf(action)
+					: this._actionStore.queuedActions(targetLane).length;
 			action.payload.text = mutation.text;
 			action.payload.images = mutation.images?.map((image) => ({ ...image }));
 			action.payload.content = mutation.images
@@ -6182,6 +6205,8 @@ export class AgentSession {
 			queuedCount: steering.length + followUps.length,
 			steering,
 			followUps,
+			revision: this._queueRevision,
+			items: this.getEditableQueueItems(),
 			...(active && phase
 				? {
 						active: {

@@ -67,6 +67,14 @@ describe("daemon protocol helpers", () => {
 		);
 	});
 
+	it("forwards queue mutation capability through supervisor worker subscriptions and snapshot loads", () => {
+		const supervisor = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-supervisor.ts"), "utf8");
+		expect(supervisor).toContain(
+			'["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot", "queue_item_mutation"]',
+		);
+		expect(supervisor).toContain('["attach_snapshot", "event_sequence", "slim_attach", "queue_item_mutation"]');
+	});
+
 	it("capability- and schema-gates atomic queue item mutation", () => {
 		expect(DAEMON_SCHEMA_REVISION).toBe(14);
 		expect(DAEMON_COMMAND_COMPATIBILITY.mutate_queue_item).toEqual({

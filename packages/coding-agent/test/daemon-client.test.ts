@@ -260,6 +260,7 @@ describe("DaemonClient", () => {
 				type: "mutate_queue_item",
 				activeSessionId: "active-1",
 				actionId: "action-1",
+				expectedRevision: 1,
 				mutation: { type: "delete" },
 			}),
 		).rejects.toThrow("does not support queue_item_mutation");

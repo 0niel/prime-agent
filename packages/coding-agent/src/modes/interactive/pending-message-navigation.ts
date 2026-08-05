@@ -134,8 +134,9 @@ export class PendingMessageNavigation {
 		if (kind === "earlier" || kind === "later") {
 			const target = selected.index + (kind === "earlier" ? -1 : 1);
 			const lane = queue[selected.lane];
-			if (target < 0 || target >= lane.length) return undefined;
-			[lane[selected.index], lane[target]] = [lane[target]!, lane[selected.index]!];
+			const editableCount = queue.items?.filter((item) => item.lane === selected.lane).length ?? lane.length;
+			if (target < 0 || target >= editableCount) return undefined;
+			if (!queue.items) [lane[selected.index], lane[target]] = [lane[target]!, lane[selected.index]!];
 			if (queue.items) {
 				const other = queue.items.find((item) => item.lane === selected.lane && item.index === target);
 				const current = queue.items.find((item) => item.id === selected.id);
@@ -148,14 +149,14 @@ export class PendingMessageNavigation {
 			this.edits.set(selected.id, text);
 			return { queue, draft: this.draft, selected: moved };
 		}
-		queue[selected.lane].splice(selected.index, 1);
+		if (!queue.items) queue[selected.lane].splice(selected.index, 1);
 		if (queue.items)
 			queue.items = queue.items
 				.filter((item) => item.id !== selected.id)
 				.map((item) =>
 					item.lane === selected.lane && item.index > selected.index ? { ...item, index: item.index - 1 } : item,
 				);
-		if (kind === "followUp")
+		if (kind === "followUp" && !queue.items)
 			queue.followUp.splice(selected.lane === "followUp" ? selected.index : queue.followUp.length, 0, text);
 		const draft = this.draft;
 		this.reset();

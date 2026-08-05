@@ -2363,8 +2363,15 @@ export class DaemonSupervisor {
 			type: "worker_subscribe",
 			activeSessionId,
 			capabilities: supportsExtensionUi
-				? ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"]
-				: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+				? [
+						"attach_snapshot",
+						"event_sequence",
+						"extension_ui",
+						"slim_attach",
+						"chunked_snapshot",
+						"queue_item_mutation",
+					]
+				: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot", "queue_item_mutation"],
 			supportsExtensionUi,
 		});
 		if (!response.success) {
@@ -3313,8 +3320,14 @@ export class DaemonSupervisor {
 							type: "attach",
 							activeSessionId,
 							capabilities: client.capabilities.has("chunked_snapshot")
-								? ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"]
-								: ["attach_snapshot", "event_sequence", "slim_attach"],
+								? [
+										"attach_snapshot",
+										"event_sequence",
+										"slim_attach",
+										"chunked_snapshot",
+										"queue_item_mutation",
+									]
+								: ["attach_snapshot", "event_sequence", "slim_attach", "queue_item_mutation"],
 							supportsExtensionUi: false,
 							env: command.env ?? collectDaemonClientEnv(),
 						});

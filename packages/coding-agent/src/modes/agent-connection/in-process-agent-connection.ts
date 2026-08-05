@@ -187,15 +187,17 @@ export class InProcessAgentConnection implements AgentConnection {
 		return {
 			steering: [...this.session.getSteeringMessagePreviews()],
 			followUp: [...this.session.getFollowUpMessagePreviews()],
+			revision: this.session.queueRevision,
 			items: this.session.getEditableQueueItems(),
 		};
 	}
 
 	async mutateQueueItem(
 		id: string,
+		expectedRevision: number,
 		mutation: AgentConnectionQueueMutation,
 	): Promise<AgentConnectionQueueMutationResult> {
-		const status = this.session.mutateQueuedUserMessage(id, mutation) ? "applied" : "stale";
+		const status = this.session.mutateQueuedUserMessage(id, expectedRevision, mutation) ? "applied" : "stale";
 		return { status, queue: await this.getQueue() };
 	}
 

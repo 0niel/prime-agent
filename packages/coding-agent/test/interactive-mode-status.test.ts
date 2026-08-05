@@ -728,15 +728,19 @@ describe("InteractiveMode submit handling", () => {
 	test.each(["unsupported", "stale"] as const)(
 		"keeps the selected edit when atomic mutation is %s",
 		async (status) => {
-			const editorText = "edited";
+			let editorText = "edited";
 			const showWarning = vi.fn();
 			const fakeThis = {
 				editor: { getText: () => editorText },
 				pendingMessageNavigation: {
 					selected: { id: "action-1", lane: "followUp", index: 0 },
-					checkpoint: () => ({ marker: true }),
+					checkpoint: () => ({ marker: true, draft: "draft" }),
 					change: () => ({ queue: { steering: [], followUp: [] }, draft: "draft" }),
 					restore: vi.fn(),
+					reset: vi.fn(),
+				},
+				setEditorFromPendingNavigation: (text: string) => {
+					editorText = text;
 				},
 				agentConnection: {
 					mutateQueueItem: vi.fn(async () => ({ status, queue: { steering: [], followUp: ["old"] } })),
@@ -750,7 +754,7 @@ describe("InteractiveMode submit handling", () => {
 				editorText,
 			);
 			expect(applied).toBe(false);
-			expect(editorText).toBe("edited");
+			expect(editorText).toBe(status === "unsupported" ? "edited" : "draft");
 			expect(showWarning).toHaveBeenCalledOnce();
 		},
 	);

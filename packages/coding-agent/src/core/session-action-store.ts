@@ -11,6 +11,8 @@ export interface SessionActionSnapshot {
 	queuedCount: number;
 	steering: readonly string[];
 	followUps: readonly string[];
+	revision?: number;
+	items?: readonly { id: string; lane: "steering" | "followUp"; index: number; text: string }[];
 	active?: {
 		kind: "turn" | "session_command";
 		phase: "preparing" | "committing" | "running";
@@ -228,6 +230,17 @@ export class ActionStore<TAction extends SessionAction = SessionAction> {
 
 	rollback(action: TAction, proof?: RollbackProof): void {
 		transitionSessionAction(action, { state: "queued" }, { rollbackProof: proof });
+	}
+
+	swapQueued(left: TAction, right: TAction): void {
+		if (left.lifecycle.state !== "queued" || right.lifecycle.state !== "queued" || left.delivery !== right.delivery) {
+			throw new Error("Only queued actions in the same lane can be swapped");
+		}
+		const list = this.list(left.delivery);
+		const leftIndex = list.indexOf(left);
+		const rightIndex = list.indexOf(right);
+		if (leftIndex < 0 || rightIndex < 0) throw new Error("Queued action is not owned by this store");
+		[list[leftIndex], list[rightIndex]] = [right, left];
 	}
 
 	moveQueued(action: TAction, delivery: DeliveryPolicy, index: number): void {

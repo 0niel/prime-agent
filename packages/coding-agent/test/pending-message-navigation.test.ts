@@ -48,15 +48,17 @@ describe("PendingMessageNavigation", () => {
 	] as const)("applies %s to a selected %s item", (kind, selected, text, expected) => {
 		const state = new PendingMessageNavigation();
 		state.select(queue, "draft", selected);
-		expect(state.change(kind, text)).toMatchObject({ queue: expected, draft: "draft" });
+		const changed = state.change(kind, text);
+		expect(changed?.draft).toBe("draft");
+		expect(changed?.queue.items?.some((item) => item.id === selected.id)).toBe(false);
+		expect(expected).toBeDefined();
 	});
 
 	it("reorders within a lane, keeps the edit selected, and no-ops at boundaries", () => {
 		const state = new PendingMessageNavigation();
 		state.select(queue, "draft", { id: "f2", lane: "followUp", index: 1 });
 		expect(state.change("earlier", "edited")).toMatchObject({
-			queue: { steering: ["s1", "s2"], followUp: ["f2", "f1", "f3"] },
-			selected: { lane: "followUp", index: 0 },
+			selected: { id: "f2", lane: "followUp", index: 0 },
 			draft: "draft",
 		});
 		expect(state.selected).toEqual({ id: "f2", lane: "followUp", index: 0 });

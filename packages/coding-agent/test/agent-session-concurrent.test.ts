@@ -186,19 +186,25 @@ describe("AgentSession concurrent prompt guard", () => {
 		const firstPrompt = session.prompt("running");
 		await new Promise((resolve) => setTimeout(resolve, 10));
 		await session.prompt("duplicate", { streamingBehavior: "steer", queueIfBusy: true, source: "interactive" });
+		await session.sendUserMessage("extension item", { deliverAs: "steer" });
 		await session.prompt("duplicate", { streamingBehavior: "steer", queueIfBusy: true, source: "interactive" });
 		await session.prompt("follow", { streamingBehavior: "followUp", queueIfBusy: true, source: "interactive" });
-		await session.sendUserMessage("extension item", { deliverAs: "followUp" });
+		const staleRevision = session.queueRevision - 1;
 		const [first, second, follow] = session.getEditableQueueItems();
 		expect([first?.text, second?.text, follow?.text]).toEqual(["duplicate", "duplicate", "follow"]);
 
-		expect(session.getFollowUpMessages()).toEqual(["follow", "extension item"]);
-		expect(session.mutateQueuedUserMessage("missing", { type: "delete" })).toBe(false);
-		expect(session.mutateQueuedUserMessage(second!.id, { type: "move_earlier" })).toBe(true);
+		expect(session.getSteeringMessages()).toEqual(["duplicate", "extension item", "duplicate"]);
+		expect(session.mutateQueuedUserMessage(second!.id, staleRevision, { type: "delete" })).toBe(false);
+		expect(session.mutateQueuedUserMessage("missing", session.queueRevision, { type: "delete" })).toBe(false);
+		expect(session.mutateQueuedUserMessage(second!.id, session.queueRevision, { type: "move_earlier" })).toBe(true);
 		expect(session.getEditableQueueItems().map((item) => item.id)).toEqual([second!.id, first!.id, follow!.id]);
 		const image: ImageContent = { type: "image", data: "encoded", mimeType: "image/png" };
 		expect(
-			session.mutateQueuedUserMessage(second!.id, { type: "replace_follow_up", text: "converted", images: [image] }),
+			session.mutateQueuedUserMessage(second!.id, session.queueRevision, {
+				type: "replace_follow_up",
+				text: "converted",
+				images: [image],
+			}),
 		).toBe(true);
 		expect(session.getEditableQueueItems()).toMatchObject([
 			{ id: first!.id, lane: "steering", text: "duplicate" },
@@ -211,8 +217,8 @@ describe("AgentSession concurrent prompt guard", () => {
 			{ type: "text", text: "converted" },
 			image,
 		]);
-		expect(session.mutateQueuedUserMessage(second!.id, { type: "delete" })).toBe(true);
-		expect(session.mutateQueuedUserMessage(second!.id, { type: "delete" })).toBe(false);
+		expect(session.mutateQueuedUserMessage(second!.id, session.queueRevision, { type: "delete" })).toBe(true);
+		expect(session.mutateQueuedUserMessage(second!.id, session.queueRevision, { type: "delete" })).toBe(false);
 		expect(session.isStreaming).toBe(true);
 
 		await session.abort();

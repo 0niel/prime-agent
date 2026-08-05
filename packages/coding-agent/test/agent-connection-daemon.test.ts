@@ -129,7 +129,21 @@ class FakeDaemonClient {
 					type: "response",
 					command: command.type,
 					success: true,
-					data: { steering: ["steer"], followUp: ["follow"] },
+					data: this.serverCapabilities.has("queue_item_mutation")
+						? {
+								steering: ["steer"],
+								followUp: ["follow"],
+								revision: 2,
+								items: [{ id: "action-1", lane: "steering", index: 0, text: "steer" }],
+							}
+						: { steering: ["steer"], followUp: ["follow"] },
+				};
+			case "mutate_queue_item":
+				return {
+					type: "response",
+					command: command.type,
+					success: true,
+					data: { status: "applied", queue: { steering: [], followUp: ["follow"], revision: 3, items: [] } },
 				};
 			case "get_connection_state":
 				await this.connectionStateGate;
@@ -1991,7 +2005,14 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests.at(-1)).toMatchObject({
 			type: "attach",
 			activeSessionId: "active-1",
-			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"],
+			capabilities: [
+				"attach_snapshot",
+				"event_sequence",
+				"extension_ui",
+				"slim_attach",
+				"chunked_snapshot",
+				"queue_item_mutation",
+			],
 			resumeCursor: {
 				activeSessionId: "active-1",
 				generation: "generation-active-1",
@@ -2204,6 +2225,24 @@ describe("DaemonAgentConnection", () => {
 		]);
 		await expect(connection.getState()).resolves.toMatchObject({
 			sessionId: "session-new",
+		});
+	});
+
+	it("negotiates stable queue ids and sends revisioned atomic mutations", async () => {
+		const fakeClient = new FakeDaemonClient();
+		fakeClient.serverCapabilities.add("queue_item_mutation");
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+		expect(fakeClient.requests[0]).toMatchObject({ capabilities: expect.arrayContaining(["queue_item_mutation"]) });
+		await expect(connection.getQueue()).resolves.toMatchObject({ revision: 2, items: [{ id: "action-1" }] });
+		await expect(connection.mutateQueueItem("action-1", 2, { type: "delete" })).resolves.toMatchObject({
+			status: "applied",
+			queue: { revision: 3, items: [] },
+		});
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "mutate_queue_item",
+			actionId: "action-1",
+			expectedRevision: 2,
 		});
 	});
 
@@ -2486,7 +2525,14 @@ describe("DaemonAgentConnection", () => {
 			type: "attach",
 			activeSessionId: "active-1",
 			clientId: expect.any(String),
-			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"],
+			capabilities: [
+				"attach_snapshot",
+				"event_sequence",
+				"extension_ui",
+				"slim_attach",
+				"chunked_snapshot",
+				"queue_item_mutation",
+			],
 			resumeCursor: {
 				activeSessionId: "active-1",
 				generation: "generation-active-1",
@@ -2498,7 +2544,14 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests.at(-1)).toMatchObject({
 			type: "attach",
 			activeSessionId: "active-1",
-			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"],
+			capabilities: [
+				"attach_snapshot",
+				"event_sequence",
+				"extension_ui",
+				"slim_attach",
+				"chunked_snapshot",
+				"queue_item_mutation",
+			],
 			resumeCursor: {
 				activeSessionId: "active-1",
 				generation: "generation-active-1",
@@ -2557,7 +2610,14 @@ describe("DaemonAgentConnection", () => {
 			activeSessionId: "active-1",
 			supportsExtensionUi: true,
 			clientId: expect.any(String),
-			capabilities: ["attach_snapshot", "event_sequence", "extension_ui", "slim_attach", "chunked_snapshot"],
+			capabilities: [
+				"attach_snapshot",
+				"event_sequence",
+				"extension_ui",
+				"slim_attach",
+				"chunked_snapshot",
+				"queue_item_mutation",
+			],
 		});
 
 		fakeClient.emitMessage({
