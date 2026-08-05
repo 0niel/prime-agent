@@ -7,7 +7,6 @@ export interface PendingMessageLocation {
 	index: number;
 }
 export interface PendingMessageChange {
-	queue: AgentConnectionQueueState;
 	draft: string;
 	selected?: PendingMessageLocation;
 }
@@ -65,9 +64,6 @@ export class PendingMessageNavigation {
 	get selected(): PendingMessageLocation | undefined {
 		const item = this.queue && items(this.queue)[this.cursor];
 		return item ? { id: item.id, lane: item.lane, index: item.index } : undefined;
-	}
-	get draftText(): string {
-		return this.draft;
 	}
 	get isAtDraft(): boolean {
 		return !!this.queue && this.cursor === items(this.queue).length;
@@ -139,16 +135,6 @@ export class PendingMessageNavigation {
 		return draft;
 	}
 
-	select(queue: AgentConnectionQueueState, draft: string, selected: PendingMessageLocation): string | undefined {
-		const cursor = items(queue).findIndex((item) => item.id === selected.id);
-		if (cursor < 0) return undefined;
-		this.queue = clone(queue);
-		this.cursor = cursor;
-		this.draft = draft;
-		this.edits.clear();
-		return this.value(cursor);
-	}
-
 	browse(queue: AgentConnectionQueueState, text: string, delta: -1 | 1): string | undefined {
 		if (!this.queue || !equal(this.queue, queue)) {
 			if (delta > 0 || items(queue).length === 0) return undefined;
@@ -194,7 +180,7 @@ export class PendingMessageNavigation {
 			this.queue = queue;
 			this.cursor = items(queue).findIndex((item) => item.id === selected.id);
 			this.edits.set(selected.id, text);
-			return { queue, draft: this.draft, selected: moved };
+			return { draft: this.draft, selected: moved };
 		}
 		if (!queue.items) queue[selected.lane].splice(selected.index, 1);
 		if (queue.items)
@@ -207,6 +193,6 @@ export class PendingMessageNavigation {
 			queue.followUp.splice(selected.lane === "followUp" ? selected.index : queue.followUp.length, 0, text);
 		const draft = this.draft;
 		this.reset();
-		return { queue, draft };
+		return { draft };
 	}
 }

@@ -186,8 +186,8 @@ export class InProcessAgentConnection implements AgentConnection {
 	async getQueue(): Promise<AgentConnectionQueueState> {
 		const items = this.session.getEditableQueueItems();
 		return {
-			steering: items.filter((item) => item.lane === "steering").map((item) => item.text),
-			followUp: items.filter((item) => item.lane === "followUp").map((item) => item.text),
+			steering: [...this.session.getSteeringMessagePreviews()],
+			followUp: [...this.session.getFollowUpMessagePreviews()],
 			revision: this.session.queueRevision,
 			items,
 		};

@@ -4181,12 +4181,8 @@ export class AgentDaemon {
 				);
 				const items = supportsMutation ? state.runtime.session.getEditableQueueItems() : undefined;
 				return success(command.id, "get_queue", {
-					steering: items
-						? items.filter((item) => item.lane === "steering").map((item) => item.text)
-						: [...state.runtime.session.getSteeringMessagePreviews()],
-					followUp: items
-						? items.filter((item) => item.lane === "followUp").map((item) => item.text)
-						: [...state.runtime.session.getFollowUpMessagePreviews()],
+					steering: [...state.runtime.session.getSteeringMessagePreviews()],
+					followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
 					...(items
 						? {
 								revision: state.runtime.session.queueRevision,
@@ -4198,18 +4194,24 @@ export class AgentDaemon {
 
 			case "mutate_queue_item": {
 				const state = this.getSessionState(command.activeSessionId);
-				const mutationResult: unknown = state.runtime.session.mutateQueuedUserMessage(
-					command.actionId,
-					command.expectedRevision,
-					command.mutation,
-				);
-				const outcome = mutationResult === true ? "applied" : mutationResult === false ? "stale" : mutationResult;
+				const mutationResult: "applied" | "noop" | "stale" | boolean =
+					state.runtime.session.mutateQueuedUserMessage(
+						command.actionId,
+						command.expectedRevision,
+						command.mutation,
+					);
+				const outcome =
+					(mutationResult as unknown) === true
+						? "applied"
+						: (mutationResult as unknown) === false
+							? "stale"
+							: mutationResult;
 				const items = state.runtime.session.getEditableQueueItems();
 				return success(command.id, "mutate_queue_item", {
 					status: outcome,
 					queue: {
-						steering: items.filter((item) => item.lane === "steering").map((item) => item.text),
-						followUp: items.filter((item) => item.lane === "followUp").map((item) => item.text),
+						steering: [...state.runtime.session.getSteeringMessagePreviews()],
+						followUp: [...state.runtime.session.getFollowUpMessagePreviews()],
 						revision: state.runtime.session.queueRevision,
 						items,
 					},
