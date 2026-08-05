@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Changed self-updates to report the previous and new Prime Agent versions.
 - Changed agent messages to always use steering delivery and removed delivery-mode options from the Python, CLI, RPC, and connection APIs.
 
 ## [0.6.1] - 2026-08-05
