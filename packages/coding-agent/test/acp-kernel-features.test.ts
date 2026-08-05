@@ -205,20 +205,10 @@ print(json.dumps({
 		provisioner = new IpythonKernelProvisioner(tempDir, {
 			pythonSkills: [AGENT_MESSAGE_SKILL],
 			hostHandlers: {
-				// Host request type on main is "agent_message.list"; the roster rename
-				// lives in an unmerged stack, so this branch targets main's API.
-				"agent_message.list": async () => ({
-					current: { activeSessionId: "alpha", sessionId: "session-alpha" },
-					agents: [
-						{
-							activeSessionId: "beta",
-							sessionId: "session-beta",
-							sessionName: "reviewer",
-							cwd: tempDir,
-							isStreaming: false,
-							unfinishedActionCount: 0,
-						},
-					],
+				// The family roster: parent, siblings, and children of this agent.
+				"agent_message.list_agents": async () => ({
+					current: { name: "root", id: "session-alpha", depth: 0 },
+					entries: [{ relationship: "child", name: "reviewer", id: "session-beta", depth: 1, status: "idle" }],
 				}),
 				"agent_message.send": async (payload) => ({
 					id: "agentmsg-acp",
@@ -246,9 +236,9 @@ print(json.dumps({
 		const result = await manager.execute(`
 import json
 roster = await agent_message.list_agents()
-receipt = await agent_message.send("beta", "status update")
+receipt = await agent_message.send("status update", receiver_role="child", receiver_name="reviewer")
 print(json.dumps({
-    "roster": [a.get("sessionName") for a in roster["agents"]],
+    "roster": [e["name"] for e in roster["entries"]],
     "status": receipt["deliveryStatus"],
 }))
 `);
