@@ -34,6 +34,7 @@ export async function handlePublicCommand(args: string[]): Promise<PublicCommand
 }
 
 async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
+	args = normalizeLeadingDaemonSocketOption(args);
 	if (args[0] === "help" && isHelpCommandRequest(args.slice(1))) {
 		return printRequestedHelp(args.slice(1));
 	}
@@ -142,6 +143,19 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 		default:
 			return continueWith(args);
 	}
+}
+
+function normalizeLeadingDaemonSocketOption(args: string[]): string[] {
+	const option = args[0];
+	if (option !== "--daemon-socket") {
+		return args;
+	}
+	const socketPath = args[1];
+	const command = args[2];
+	if (socketPath === undefined || (command !== "stop" && command !== "rename")) {
+		return args;
+	}
+	return [command, ...args.slice(3), option, socketPath];
 }
 
 function continueWith(args: string[]): PublicCommandResult {
