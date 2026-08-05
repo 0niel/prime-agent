@@ -179,6 +179,30 @@ describe("buildSessionList", () => {
 		});
 	});
 
+	it("keeps file-keyed schedule pins on active rows while active ids are being rebound", () => {
+		const sessionFile = "/tmp/child.jsonl";
+		const [entry] = buildSessionList(
+			[makeState({ activeSessionId: "new-active-id", sessionFile })],
+			[makeSessionInfo({ id: "child-session", path: sessionFile })],
+			[
+				makeCronJob({
+					id: "stale-heartbeat",
+					activeSessionId: "old-active-id",
+					sessionFile,
+					source: "heartbeat",
+				}),
+				makeCronJob({
+					id: "stale-cron",
+					activeSessionId: "old-active-id",
+					sessionFile,
+					source: "cron",
+				}),
+			],
+		);
+
+		expect(entry).toMatchObject({ hasRegisteredHeartbeat: true, hasRegisteredCronJob: true });
+	});
+
 	it("reports accepted in-flight prompts as active with no queued work", () => {
 		const oneMessage = [{ role: "user", content: "hi" }] as unknown as AgentMessage[];
 		const summary = summaryForActiveSession(

@@ -11,6 +11,7 @@ interface SupervisorInternals {
 	workers: Map<string, WorkerFixture>;
 	refreshWorkerSummaries(worker: WorkerFixture): Promise<void>;
 	syncAgentPeers(): Promise<void>;
+	findSummaryInWorker(worker: WorkerFixture, selector: string): SessionSummary | undefined;
 }
 
 interface WorkerFixture {
@@ -67,6 +68,23 @@ function worker(workerId: string, summaries: SessionSummary[] = []): WorkerFixtu
 }
 
 describe("daemon supervisor passive subagent topology", () => {
+	it("finds a child summary by its displayed session ID suffix", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-child-suffix-"));
+		tempDirs.push(directory);
+		const supervisor = new DaemonSupervisor(join(directory, "daemon.sock"), {
+			defaultSessionConfig: { agentDir: directory, cwd: directory },
+			descriptorDir: join(directory, "workers"),
+		}) as unknown as SupervisorInternals;
+		const child = summary({
+			id: "bbbb6666777788889999cccc",
+			activeSessionId: "bbbb6666777788889999cccc",
+			sessionId: "aaaa6666777788889999dddd",
+		});
+		const resident = worker("first", [child]);
+
+		expect(supervisor.findSummaryInWorker(resident, "88889999cccc")).toBe(child);
+	});
+
 	it("retains passive worker summaries and sends them to cross-worker agent peer maps", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "prime-supervisor-passive-peers-"));
 		tempDirs.push(directory);

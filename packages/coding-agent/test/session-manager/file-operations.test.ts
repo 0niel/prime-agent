@@ -158,6 +158,37 @@ describe("loadEntriesFromFile", () => {
 });
 
 describe("session tree metadata", () => {
+	it.each(["2.5", "2oops", "9007199254740993"])("rejects invalid RLM_DEPTH value %s", (value) => {
+		const tempDir = join(tmpdir(), `invalid-root-depth-test-${Date.now()}-${Math.random()}`);
+		mkdirSync(tempDir, { recursive: true });
+		vi.stubEnv("RLM_DEPTH", value);
+		try {
+			expect(() => SessionManager.create(tempDir, tempDir)).toThrow("RLM_DEPTH must be a non-negative integer");
+		} finally {
+			vi.unstubAllEnvs();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not persist an unsafe derived depth", () => {
+		const tempDir = join(tmpdir(), `max-parent-depth-test-${Date.now()}-${Math.random()}`);
+		mkdirSync(tempDir, { recursive: true });
+		try {
+			const parent = SessionManager.create(tempDir, tempDir);
+			parent.newSession({ rlmDepth: Number.MAX_SAFE_INTEGER });
+			parent.flushNow();
+			const parentFile = parent.getSessionFile();
+			if (!parentFile) throw new Error("Missing parent session file");
+
+			const child = SessionManager.create(tempDir, tempDir);
+			child.newSession({ parentSession: parentFile });
+
+			expect(child.getHeader()?.rlmDepth).toBeUndefined();
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("persists a derived depth and exposes parent linkage from the header", async () => {
 		const tempDir = join(tmpdir(), `session-tree-test-${Date.now()}-${Math.random()}`);
 		mkdirSync(tempDir, { recursive: true });

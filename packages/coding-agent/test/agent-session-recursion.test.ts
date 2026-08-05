@@ -1,5 +1,6 @@
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Agent, type StreamFn } from "@earendil-works/pi-agent-core";
@@ -24,7 +25,7 @@ import {
 	type SubagentRuntimeHost,
 } from "../src/core/rlm-runtime.js";
 import { SessionManager } from "../src/core/session-manager.js";
-import { SettingsManager } from "../src/core/settings-manager.js";
+import { SettingsManager, type SettingsStorage } from "../src/core/settings-manager.js";
 import type { Skill } from "../src/core/skills.js";
 import { createSyntheticSourceInfo } from "../src/core/source-info.js";
 import { createTestResourceLoader } from "./utilities.js";
@@ -291,6 +292,24 @@ describe("AgentSession rlm recursion", () => {
 		try {
 			const resumed = createSession({ maxDepth: 3, sessionManager: persistedManager });
 			expect(resumed.rlmDepth).toBe(2);
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
+
+	it.each([-1, "0"])("ignores invalid persisted RLM depth %j", (invalidDepth) => {
+		const persistedManager = SessionManager.create(tempDir, join(tempDir, "invalid-depth-sessions"));
+		persistedManager.newSession({ rlmDepth: 2 });
+		persistedManager.flushNow();
+		const sessionFile = persistedManager.getSessionFile();
+		if (!sessionFile) throw new Error("Missing persisted session file");
+		const lines = readFileSync(sessionFile, "utf8").split("\n");
+		lines[0] = JSON.stringify({ ...JSON.parse(lines[0] ?? "{}"), rlmDepth: invalidDepth });
+		writeFileSync(sessionFile, lines.join("\n"));
+		const reopened = SessionManager.open(sessionFile, join(tempDir, "invalid-depth-sessions"));
+		vi.stubEnv("RLM_DEPTH", "1");
+		try {
+			expect(createSession({ maxDepth: 2, sessionManager: reopened }).rlmDepth).toBe(1);
 		} finally {
 			vi.unstubAllEnvs();
 		}
@@ -657,7 +676,7 @@ describe("AgentSession rlm recursion", () => {
 		});
 		const expected = {
 			rlm_child_id: "passive-child",
-			active_session_id: null,
+			active_session_id: "passive-session",
 			session_id: "passive-session",
 			session_name: "passive-worker",
 			session_dir: join(tempDir, "passive-child"),
@@ -668,6 +687,53 @@ describe("AgentSession rlm recursion", () => {
 		await expect(root.deleteRlmSubagent("passive-worker")).resolves.toEqual({ subagent: expected });
 		expect(deleteRlmSubagentRuntime).toHaveBeenCalledWith("passive-child", undefined);
 		expect(await root.listRlmSubagents()).toEqual({ subagents: [] });
+	});
+
+	it("coalesces concurrent deletion of the same passive daemon child", async () => {
+		let releaseListing!: () => void;
+		const listingGate = new Promise<void>((resolve) => {
+			releaseListing = resolve;
+		});
+		const deleteRlmSubagentRuntime = vi.fn(async () => {});
+		const root = createSession({
+			agentMessageController: {
+				listAgents: async () => {
+					await listingGate;
+					return {
+						current: { activeSessionId: "parent-active", sessionId: "parent-session" },
+						agents: [
+							{
+								activeSessionId: "passive-session",
+								sessionId: "passive-session",
+								sessionName: "passive-worker",
+								runtimeKind: "subagent" as const,
+								cwd: tempDir,
+								isStreaming: false,
+								unfinishedActionCount: 0,
+								parentActiveSessionId: "parent-active",
+								rlmChildId: "passive-child",
+								sessionDir: join(tempDir, "passive-child"),
+							},
+						],
+					};
+				},
+				sendAgentMessage: async () => {
+					throw new Error("unexpected send");
+				},
+			},
+			subagentRuntimeHost: {
+				createRlmSubagentRuntime: async () => {
+					throw new Error("unexpected hydration");
+				},
+				deleteRlmSubagentRuntime,
+			},
+		});
+
+		const first = root.deleteRlmSubagent("passive-worker");
+		const second = root.deleteRlmSubagent("passive-worker");
+		releaseListing();
+		await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+		expect(deleteRlmSubagentRuntime).toHaveBeenCalledOnce();
 	});
 
 	it("disposes an inline child when setting its session name fails", async () => {
@@ -717,7 +783,8 @@ describe("AgentSession rlm recursion", () => {
 			releaseChild = resolve;
 		});
 		let childStarted = false;
-		const root = createSession({
+		let root: AgentSession;
+		root = createSession({
 			streamFn: (_model, context) => {
 				const text = userText(context);
 				const stream = createAssistantMessageEventStream();
@@ -726,6 +793,32 @@ describe("AgentSession rlm recursion", () => {
 					stream.push({ type: "done", reason: "stop", message: assistantMessage(`child answer: ${text}`) });
 				});
 				return stream;
+			},
+			agentMessageController: {
+				listAgents: () => {
+					const run = [...(root as unknown as InspectableRlmSession)._activeRlmChildRuns.values()][0];
+					return {
+						current: { activeSessionId: "parent-active", sessionId: root.sessionId },
+						agents: run?.session
+							? [
+									{
+										activeSessionId: "running-active",
+										sessionId: run.session.sessionId,
+										runtimeKind: "subagent" as const,
+										cwd: tempDir,
+										isStreaming: true,
+										unfinishedActionCount: 0,
+										parentActiveSessionId: "parent-active",
+										rlmChildId: run.id,
+										sessionDir: run.sessionDir,
+									},
+								]
+							: [],
+					};
+				},
+				sendAgentMessage: async () => {
+					throw new Error("unexpected send");
+				},
 			},
 		});
 
@@ -746,7 +839,7 @@ describe("AgentSession rlm recursion", () => {
 			subagents: [
 				{
 					rlm_child_id: rootRun.id,
-					active_session_id: null,
+					active_session_id: "running-active",
 					session_id: rootRun.session.sessionId,
 					session_name: createDefaultRlmSubagentSessionName("slow shard", rootRun.id),
 					session_dir: rootRun.sessionDir,
@@ -962,6 +1055,118 @@ describe("AgentSession rlm recursion", () => {
 		existing.dispose();
 	});
 
+	it("does not claim a failed global max-depth write was saved", async () => {
+		const globalSettings = JSON.stringify({ rlmMaxDepth: 1 });
+		const storage: SettingsStorage = {
+			withLock(scope, update) {
+				const current = scope === "global" ? globalSettings : undefined;
+				const next = update(current);
+				if (scope === "global" && next !== undefined) {
+					throw new Error("EROFS: read-only file system");
+				}
+			},
+		};
+		const current = createSession({ settingsManager: SettingsManager.fromStorage(storage) });
+
+		const result = await current.setRlmMaxDepth(5, { global: true });
+
+		expect(result).toMatchObject({ maxDepth: 5, source: "chat", globalSaved: false });
+		expect(result.globalError).toContain("EROFS: read-only file system");
+		expect(SettingsManager.fromStorage(storage).getRlmMaxDepth()).toBe(1);
+		expect(globalSettings).toBe(JSON.stringify({ rlmMaxDepth: 1 }));
+	});
+
+	it("does not attribute stale errors to a successful global max-depth write", async () => {
+		const writes: Record<"global" | "project", string | undefined> = {
+			global: JSON.stringify({ rlmMaxDepth: 1 }),
+			project: undefined,
+		};
+		let failGlobal = true;
+		let failProject = true;
+		const storage: SettingsStorage = {
+			withLock(scope, update) {
+				const next = update(writes[scope]);
+				if (scope === "global" && failGlobal && next !== undefined) {
+					throw new Error("stale global failure");
+				}
+				if (scope === "project" && failProject && next !== undefined) {
+					throw new Error("project warning");
+				}
+				writes[scope] = next;
+			},
+		};
+		const settingsManager = SettingsManager.fromStorage(storage);
+		settingsManager.setDefaultModelAndProvider("provider", "model");
+		await settingsManager.flush();
+		settingsManager.setProjectExtensionPaths(["broken-project-extension"]);
+		await settingsManager.flush();
+		// Preserve the queued project diagnostic while recovering the global store.
+		failGlobal = false;
+		failProject = false;
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const current = createSession({ settingsManager });
+
+		const result = await current.setRlmMaxDepth(5, { global: true });
+
+		expect(result).toMatchObject({ maxDepth: 5, source: "chat", globalSaved: true });
+		expect(warn).toHaveBeenCalledWith("Warning: Earlier global settings write failed: stale global failure");
+		expect(settingsManager.drainErrors()).toMatchObject([
+			{ scope: "project", error: { message: "project warning" } },
+		]);
+		expect(JSON.parse(writes.global ?? "{}")).toMatchObject({ rlmMaxDepth: 5 });
+		warn.mockRestore();
+	});
+
+	it("rolls back max-depth state when chat persistence fails", async () => {
+		const root = createSession();
+		const originalPrompt = root.systemPrompt;
+		const flush = vi.spyOn(root.sessionManager, "flushNow").mockImplementation(() => {
+			throw new Error("disk full");
+		});
+
+		await expect(root.setRlmMaxDepth(0)).rejects.toThrow("disk full");
+		expect(root.rlmMaxDepth).toBe(1);
+		expect(root.systemPrompt).toBe(originalPrompt);
+		expect(
+			root.sessionManager
+				.getBranch()
+				.some((entry) => entry.type === "custom" && entry.customType === "rlm_max_depth_state"),
+		).toBe(false);
+
+		flush.mockRestore();
+		root.sessionManager.flushNow();
+		expect(readFileSync(root.sessionFile!, "utf8")).not.toContain('"customType":"rlm_max_depth_state"');
+	});
+	it("falls through an invalid global max depth while navigating off a chat override", async () => {
+		const original = createSession();
+		await original.prompt("baseline branch");
+		await original.agent.waitForIdle();
+		const baselineLeafId = original.sessionManager.getLeafId();
+		if (!baselineLeafId) throw new Error("Missing baseline branch leaf");
+		await original.setRlmMaxDepth(2);
+		const sessionFile = original.sessionFile;
+		if (!sessionFile) throw new Error("Missing persisted session file");
+		original.dispose();
+
+		vi.stubEnv("RLM_MAX_DEPTH", "0");
+		try {
+			const resumed = createSession({
+				sessionManager: SessionManager.open(sessionFile, join(tempDir, "sessions")),
+				settingsManager: SettingsManager.inMemory({ rlmMaxDepth: -1 }),
+			});
+			expect(resumed.rlmMaxDepth).toBe(2);
+
+			await expect(resumed.navigateTree(baselineLeafId, { summarize: false })).resolves.toMatchObject({
+				cancelled: false,
+			});
+			expect(resumed.sessionManager.getLeafId()).toBe(baselineLeafId);
+			expect(resumed.rlmMaxDepth).toBe(0);
+			expect(resumed.systemPrompt).not.toContain("A callable `rlm`");
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
+
 	it("keeps a spawned child's chat override when reconstructed with its inherited config", async () => {
 		const root = createSession({ maxDepth: 2 });
 		const childResult = await root.runRlmChild("child with a durable override");
@@ -1002,6 +1207,24 @@ describe("AgentSession rlm recursion", () => {
 			"RLM recursion depth limit reached (RLM_DEPTH=0, RLM_MAX_DEPTH=0)",
 		);
 		expect(child.rlmMaxDepth).toBe(3);
+	});
+
+	it("lets a stale kernel depth cap defer to the live host gate", () => {
+		const python =
+			process.env.PRIME_AGENT_KERNEL_PYTHON ?? join(homedir(), ".prime", "agent", "kernel-venv", "bin", "python");
+		const runtime = join(process.cwd(), "..", "..", "prime-agent-runtime", "src");
+		const probe = spawnSync(
+			python,
+			["-c", "import asyncio, rlm; rlm.Comm = None; asyncio.run(rlm.run('raised live cap'))"],
+			{
+				env: { ...process.env, PYTHONPATH: runtime, RLM_DEPTH: "1", RLM_MAX_DEPTH: "1" },
+				encoding: "utf8",
+			},
+		);
+
+		expect(probe.status).not.toBe(0);
+		expect(probe.stderr).toContain("Jupyter comm support is unavailable in this kernel");
+		expect(probe.stderr).not.toContain("RLM recursion depth limit reached");
 	});
 
 	it("rejects child creation at the configured recursion depth cap", async () => {

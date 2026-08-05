@@ -73,6 +73,7 @@ function createState(
 		activeSessionId,
 		runtime,
 		clients: new Set(),
+		pendingAttaches: 0,
 		extensionUiRequests: new Map(),
 		eventGeneration: `generation-${activeSessionId}`,
 		lastEventSequence: 0,

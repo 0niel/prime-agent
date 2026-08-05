@@ -152,6 +152,7 @@ export type AgentsViewPersistentState = {
 	selectedRowIdentity?: string;
 	backSession?: SessionSummary;
 	scopeFrames?: AgentsViewScopeFrame[];
+	scopeRootSummary?: SessionSummary;
 	selectedSessionKey?: AgentsViewSelectionKey;
 	// Ancestor chain to re-expand on return to a nested agent. Kept by sessionId,
 	// not row identity, so it survives an active→persisted identity flip.
@@ -421,6 +422,7 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 		let result: Extract<AgentsViewRunResult, { type: "open" }>;
 		if (viewResult.type === "scope_back") {
 			persistentState.scopeFrames = transitionAgentsViewScope(persistentState.scopeFrames ?? [], { type: "back" });
+			persistentState.scopeRootSummary = undefined;
 			persistentState.selectedRowIdentity = getSummaryIdentity(viewResult.selection);
 			persistentState.selectedSessionKey = getAgentsViewSelectionKey(viewResult.selection);
 			persistentState.pendingExpandedAncestorSessionIds = viewResult.expandedAncestorSessionIds;
@@ -441,6 +443,7 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 		let opened: OpenedAgentsViewSession | undefined;
 		try {
 			opened = await openAgentsViewSession(options, result.summary);
+			persistentState.backSession = opened.summary;
 			if (opened.cwdFallbackNotice) {
 				persistentState.statusMessage = combineAgentsViewStartupNotices(
 					result.statusMessage,
@@ -494,6 +497,7 @@ export async function runAgentsViewMode(options: AgentsViewModeOptions): Promise
 						cachedIndex === -1
 							? [...cachedLiveSummaries, returnedSession]
 							: cachedLiveSummaries.map((summary, index) => (index === cachedIndex ? returnedSession : summary));
+					persistentState.scopeRootSummary = undefined;
 					persistentState.query = "";
 				}
 				persistentState.backSession = returnedSession;
@@ -689,6 +693,7 @@ export class AgentsViewMode implements Component, Focusable {
 			);
 		persistentState.scopeFrames = initialFrames;
 		this.scopeKey = initialFrames.at(-1)?.scope;
+		this.scopeRootSummary = persistentState.scopeRootSummary;
 		this.selectedRowIdentity = persistentState.selectedRowIdentity;
 		this.selectedSessionKey = persistentState.selectedSessionKey;
 		this.selectedActiveSessionId = persistentState.selectedSessionKey?.activeSessionId;
@@ -2136,6 +2141,7 @@ export class AgentsViewMode implements Component, Focusable {
 			this.persistentState.scopeFrames = resolution.frames;
 			this.scopeKey = resolution.frames.at(-1)?.scope;
 			this.scopeRootSummary = resolution.root ? summaryForUnifiedRecord(resolution.root) : undefined;
+			this.persistentState.scopeRootSummary = this.scopeRootSummary;
 			if (resolution.droppedFrames > 0) {
 				const destination = resolution.root ? "the nearest available parent" : "the global view";
 				this.setStatusMessage(`Scope is no longer available; returned to ${destination}`, { render: false });
@@ -2169,6 +2175,7 @@ export class AgentsViewMode implements Component, Focusable {
 		const generation = ++this.savedCatalogGeneration;
 		this.persistentState.savedCatalogGeneration = generation;
 		this.savedCatalogRefreshPending = true;
+		this.savedCatalogReady = false;
 		const successfulSessions = this.lastSuccessfulSavedSessions;
 		const progressiveSessions = new Map(
 			successfulSessions.map((session) => [resolvePath(canonicalizePath(session.path)), session]),

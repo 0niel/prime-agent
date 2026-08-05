@@ -352,6 +352,15 @@ describe("SettingsManager", () => {
 			expect(errors[0]?.error.message).toContain("Project settings not saved: settings file failed to parse:");
 			expect(readFileSync(settingsPath, "utf-8")).toBe(invalidSettings);
 		});
+
+		it("drains only the requested scope", () => {
+			writeFileSync(join(agentDir, "settings.json"), "{ invalid global json");
+			writeFileSync(join(projectDir, ".prime", "agent", "settings.json"), "{ invalid project json");
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.drainErrors("global").map((entry) => entry.scope)).toEqual(["global"]);
+			expect(manager.drainErrors().map((entry) => entry.scope)).toEqual(["project"]);
+		});
 	});
 
 	describe("project settings directory creation", () => {

@@ -113,6 +113,38 @@ describe("SubagentSummaryLine", () => {
 		expect(stripAnsi(line.render(100).join("\n"))).toContain("0 running · 1 idle · 0 inactive");
 	});
 
+	it("refreshes counts when startup seeding follows an early live child update", () => {
+		const line = new SubagentSummaryLine();
+		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+		Object.assign(mode, {
+			subagentSnapshots: new Map<string, AgentConnectionRlmChildAgentSnapshot>(),
+			rlmNodeId: undefined,
+			heartbeatCatalog: [],
+			subagentSummaryLine: line,
+			updateScopedHeartbeats: vi.fn(),
+			updateWorkingPulse: vi.fn(),
+			syncWorkingLoader: vi.fn(),
+			updateWorkingLoaderMessage: vi.fn(),
+			ui: { requestRender: vi.fn() },
+		});
+		const worker = child("worker", "done", { parentId: "me" });
+		const update = Reflect.get(InteractiveMode.prototype, "updateSubagentSummary") as (
+			this: typeof mode,
+			value: AgentConnectionRlmChildAgentSnapshot,
+		) => void;
+		const seed = Reflect.get(InteractiveMode.prototype, "seedSubagentSummary") as (
+			this: typeof mode,
+			children: readonly AgentConnectionRlmChildAgentSnapshot[],
+		) => void;
+
+		update.call(mode, worker);
+		expect(line.render(100)).toEqual([]);
+		Reflect.set(mode, "rlmNodeId", "me");
+		seed.call(mode, [worker]);
+
+		expect(stripAnsi(line.render(100).join("\n"))).toContain("1 subagent:");
+	});
+
 	it("clears a resident session id when a terminal update reports an evicted child", () => {
 		const line = new SubagentSummaryLine();
 		const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;

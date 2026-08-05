@@ -512,7 +512,10 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		const sessionDir = this.session.sessionManager.getSessionDir();
 		const sessionManager = SessionManager.create(this.cwd, sessionDir);
 		if (options?.parentSession) {
-			sessionManager.newSession({ parentSession: options.parentSession });
+			sessionManager.newSession({
+				parentSession: options.parentSession,
+				rlmDepth: this.session.sessionManager.getHeader()?.rlmDepth ?? this.session.rlmDepth,
+			});
 		}
 		const lease = this.acquireReplacementLease(sessionManager.getSessionFile());
 
@@ -577,7 +580,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				const sessionManager = SessionManager.create(this.cwd, sessionDir);
 				sessionManager.newSession({
 					parentSession: currentSessionFile,
-					rlmDepth: sourceHeader?.rlmDepth,
+					rlmDepth: sourceHeader?.rlmDepth ?? this.session.rlmDepth,
 				});
 				const lease = this.acquireReplacementLease(sessionManager.getSessionFile());
 				await this.teardownForReplacement("fork", sessionManager.getSessionFile(), lease);
@@ -628,7 +631,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			const sourceHeader = sessionManager.getHeader();
 			sessionManager.newSession({
 				parentSession: this.session.sessionFile,
-				rlmDepth: sourceHeader?.rlmDepth,
+				rlmDepth: sourceHeader?.rlmDepth ?? this.session.rlmDepth,
 			});
 		} else {
 			sessionManager.createBranchedSession(targetLeafId);

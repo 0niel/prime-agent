@@ -3280,7 +3280,7 @@ export class InteractiveMode {
 	}
 
 	private updateWorkingPulse(): void {
-		const active = this.isAgentStreaming() || this.countRunningSubagents() > 0;
+		const active = this.isAgentStreaming();
 		if (!active) {
 			this.stopWorkingPulse();
 			return;
@@ -3302,16 +3302,6 @@ export class InteractiveMode {
 			clearInterval(this.pulseTimer);
 			this.pulseTimer = undefined;
 		}
-	}
-
-	private countRunningSubagents(): number {
-		let count = 0;
-		for (const child of this.subagentSnapshots.values()) {
-			if (child.status === "running") {
-				count += 1;
-			}
-		}
-		return count;
 	}
 
 	private shouldShowWorkingLoader(): boolean {
@@ -5804,16 +5794,14 @@ export class InteractiveMode {
 	}
 
 	private seedSubagentSummary(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {
-		let changed = false;
 		for (const child of children ?? []) {
 			// Live updates can arrive before the initial snapshot; do not replace them
 			// with the snapshot's older state.
 			if (!this.subagentSnapshots.has(child.id) && child.status !== "cancelled") {
 				this.subagentSnapshots.set(child.id, child);
-				changed = true;
 			}
 		}
-		if (changed) this.refreshSubagentSummary();
+		this.refreshSubagentSummary();
 	}
 
 	private replaceSubagentSummary(children: readonly AgentConnectionRlmChildAgentSnapshot[] | undefined): void {

@@ -925,6 +925,7 @@ const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 
 function noopRlmChildAbort(): void {}
+function noopRlmChildEventUnsubscribe(): void {}
 
 function isRlmChildRunCancelled(run: RlmChildRun): boolean {
 	return run.status === "cancelled";
@@ -1076,6 +1077,7 @@ export class AgentSession {
 	private readonly _queuedWorkPauses = new Set<symbol>();
 	private _sessionActionCommitTail: Promise<void> = Promise.resolve();
 	private _sessionActionCommitOwner: symbol | undefined;
+	private _pendingSessionActionFenceWaiters = 0;
 	private readonly _sessionActionCommitContext = new AsyncLocalStorage<symbol>();
 	private readonly _sessionActionCommitDisposeAbortController = new AbortController();
 	// Checkpoint and handoff waiters share lifecycle-edge notifications to avoid polling.
@@ -1255,10 +1257,10 @@ export class AgentSession {
 		this._mcpManager = config.mcpManager;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		const headerRlmDepth = this.sessionManager.getHeader()?.rlmDepth;
 		this._rlmDepth =
 			config.rlmDepth ??
-			this.sessionManager.getHeader()?.rlmDepth ??
-			parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH");
+			(isNonNegativeInteger(headerRlmDepth) ? headerRlmDepth : parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH"));
 		this._configuredRlmMaxDepth = config.rlmMaxDepth;
 		if (this._configuredRlmMaxDepth !== undefined && !isNonNegativeInteger(this._configuredRlmMaxDepth)) {
 			throw new Error("rlmMaxDepth must be a non-negative integer");
@@ -1521,10 +1523,7 @@ export class AgentSession {
 			return { maxDepth: this._configuredRlmMaxDepth, source: "inherited" };
 		}
 		const global = this.settingsManager.getRlmMaxDepth();
-		if (global !== undefined) {
-			if (!isNonNegativeInteger(global)) {
-				throw new Error("The rlmMaxDepth setting must be a non-negative integer");
-			}
+		if (global !== undefined && isNonNegativeInteger(global)) {
 			return { maxDepth: global, source: "global" };
 		}
 		const env = process.env.RLM_MAX_DEPTH;
@@ -5224,6 +5223,14 @@ export class AgentSession {
 		});
 	}
 
+	get hasPendingAdmissionWaiters(): boolean {
+		return (
+			this._sessionActionCommitOwner !== undefined ||
+			this._pendingSessionActionFenceWaiters > 0 ||
+			this._sessionInputCheckpointWaiters.size > 0
+		);
+	}
+
 	private _scheduleSessionInputPump(): void {
 		if (this._sessionInputPumpSuspended || this._queuedWorkPauses.size > 0) return;
 		if (this._disposed || this._disposing || this._sessionInputPumpRequested || !this._hasSelectableSessionInput()) {
@@ -6164,9 +6171,11 @@ export class AgentSession {
 		});
 		const disposeSignal = this._sessionActionCommitDisposeAbortController.signal;
 		const waitSignal = signal ? AbortSignal.any([signal, disposeSignal]) : disposeSignal;
+		this._pendingSessionActionFenceWaiters++;
 		try {
 			await waitForPromiseOrAbort(previous, waitSignal, "Update restart preparation cancelled");
 		} catch (error) {
+			this._pendingSessionActionFenceWaiters--;
 			// A cancelled waiter remains in the FIFO chain until its predecessor releases.
 			void previous.then(resolve, resolve);
 			if (disposeSignal.aborted) {
@@ -6176,6 +6185,7 @@ export class AgentSession {
 		}
 		const owner = Symbol("session-action-commit");
 		this._sessionActionCommitOwner = owner;
+		this._pendingSessionActionFenceWaiters--;
 		let released = false;
 		return {
 			owner,
@@ -8881,7 +8891,7 @@ export class AgentSession {
 			}
 			subagents.push({
 				rlm_child_id: childId,
-				active_session_id: null,
+				active_session_id: daemonChild.activeSessionId,
 				session_id: daemonChild.sessionId,
 				session_name: daemonChild.sessionName ?? createDefaultRlmSubagentSessionName("", childId),
 				session_dir: daemonChild.sessionDir,
@@ -8943,7 +8953,7 @@ export class AgentSession {
 		}
 		if (localMatches[0]) {
 			const subagent = localMatches[0];
-			const deletion = (async () => {
+			return this._trackRlmSubagentDeletion(subagent, async () => {
 				const listedAgents = await this._agentMessageController?.listAgents();
 				const listedSubagents = this._buildRlmSubagentList(listedAgents).subagents;
 				const passiveMatches = listedSubagents.filter(
@@ -8966,8 +8976,7 @@ export class AgentSession {
 						}
 					: subagent;
 				return this._deleteResolvedRlmSubagent(resolvedSubagent);
-			})();
-			return this._trackRlmSubagentDeletion(subagent, deletion);
+			});
 		}
 
 		const directMatches = [
@@ -8979,13 +8988,16 @@ export class AgentSession {
 			throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
 		}
 		const subagent = directMatches[0] ?? (await this._resolveDirectRlmSubagent(target));
-		return this._trackRlmSubagentDeletion(subagent, this._deleteResolvedRlmSubagent(subagent));
+		return this._trackRlmSubagentDeletion(subagent, () => this._deleteResolvedRlmSubagent(subagent));
 	}
 
 	private async _trackRlmSubagentDeletion(
 		subagent: RlmSubagentRegistryEntry,
-		deletion: Promise<RlmDeleteSubagentResult>,
+		startDeletion: () => Promise<RlmDeleteSubagentResult>,
 	): Promise<RlmDeleteSubagentResult> {
+		const existing = this._deletingRlmChildren.get(subagent.rlm_child_id);
+		if (existing) return existing.promise;
+		const deletion = Promise.resolve().then(startDeletion);
 		this._deletingRlmChildren.set(subagent.rlm_child_id, { subagent, promise: deletion });
 		try {
 			return await deletion;
@@ -9117,7 +9129,7 @@ export class AgentSession {
 	 * the child) when the parent is already tearing down, so the caller can drop the
 	 * matching event forwarder too.
 	 */
-	retainFinishedRlmChildSession(childId: string, session: AgentSession): boolean {
+	retainFinishedRlmChildSession(childId: string, session: AgentSession, unsubscribe?: () => void): boolean {
 		// A child can finish concurrently while the parent is (or has) torn down; don't
 		// resurrect the map (it would never be disposed), just drop the child now.
 		if (this._disposed || this._disposing) {
@@ -9128,7 +9140,19 @@ export class AgentSession {
 			return false;
 		}
 		this._retainedRlmChildSessions.set(childId, session);
+		if (unsubscribe) {
+			this._retainedRlmChildUnsubscribes.set(childId, unsubscribe);
+		}
 		return true;
+	}
+
+	/** Stop retaining an idle daemon child without deleting its durable registry row. */
+	releaseFinishedRlmChildSession(childId: string, session: AgentSession): (() => void) | false {
+		if (this._retainedRlmChildSessions.get(childId) !== session) return false;
+		const unsubscribe = this._retainedRlmChildUnsubscribes.get(childId) ?? noopRlmChildEventUnsubscribe;
+		this._retainedRlmChildUnsubscribes.delete(childId);
+		this._retainedRlmChildSessions.delete(childId);
+		return unsubscribe;
 	}
 
 	/** True when any direct or nested subagent is still running or queued. */
@@ -10177,9 +10201,14 @@ export class AgentSession {
 
 		let globalError: string | undefined;
 		if (options.global) {
+			await this.settingsManager.flush();
+			const staleErrors = this.settingsManager.drainErrors("global");
+			for (const { error } of staleErrors) {
+				console.warn(`Warning: Earlier global settings write failed: ${error.message}`);
+			}
 			this.settingsManager.setRlmMaxDepth(maxDepth);
 			await this.settingsManager.flush();
-			const errors = this.settingsManager.drainErrors().filter(({ scope }) => scope === "global");
+			const errors = this.settingsManager.drainErrors("global");
 			globalError = errors.map(({ error }) => error.message).join("; ") || undefined;
 		}
 

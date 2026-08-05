@@ -4,6 +4,7 @@ import type {
 	AgentSessionMessageDeliveryMode,
 	AgentSessionMessageSender,
 } from "../../core/agent-messages.js";
+import type { IdleEvictionMinutes } from "../../core/session-action-store.js";
 
 export { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../../core/session-lease.js";
 
@@ -57,6 +58,13 @@ export type DaemonWorkerCommand =
 	| { id?: string; type: "worker_unsubscribe"; activeSessionId: string }
 	| { id?: string; type: "worker_sync_agent_peers"; peers: AgentSessionMessageAgentSummary[] }
 	| { id?: string; type: "worker_archive_and_shutdown" }
+	| {
+			id?: string;
+			type: "worker_passivate_idle_children";
+			idleEvictionMinutes: IdleEvictionMinutes;
+			now: number;
+			limit: number;
+	  }
 	| {
 			id?: string;
 			type: "worker_deliver_message";

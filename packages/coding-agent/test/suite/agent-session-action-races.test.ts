@@ -9,6 +9,7 @@ type ActionKind = "turn" | "command";
 
 interface CommitFenceInternals {
 	_actionStore: ActionStore<SessionAction>;
+	_pendingSessionActionFenceWaiters: number;
 	_refineInFlight?: Promise<void>;
 	_scheduleSessionInputPump(): void;
 	_acquireDirectTurnAdmissionFence(signal?: AbortSignal): Promise<{ release(): void }>;
@@ -123,6 +124,23 @@ describe("AgentSession action commit-fence races", () => {
 		}
 		await Promise.resolve();
 		expect(settlementCount).toBe(1);
+	});
+
+	it("reports a queued commit-fence waiter while its predecessor releases", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const internals = harness.session as unknown as CommitFenceInternals;
+		const heldFence = await internals._acquireSessionActionCommitFence();
+		const nextFencePromise = internals._acquireSessionActionCommitFence();
+		await vi.waitFor(() => expect(internals._pendingSessionActionFenceWaiters).toBe(1));
+
+		heldFence.release();
+		expect(harness.session.hasPendingAdmissionWaiters).toBe(true);
+
+		const nextFence = await nextFencePromise;
+		expect(harness.session.hasPendingAdmissionWaiters).toBe(true);
+		nextFence.release();
+		expect(harness.session.hasPendingAdmissionWaiters).toBe(false);
 	});
 
 	it("aborts a prompt waiting for the commit fence without leaking the fence", async () => {

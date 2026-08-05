@@ -759,7 +759,8 @@ function legacyChildDepthFromPath(sessionPath: string): number {
 }
 
 function deriveChildRlmDepth(parentHeader: Partial<SessionHeader> | undefined): number | undefined {
-	return isValidRlmDepth(parentHeader?.rlmDepth) ? parentHeader.rlmDepth + 1 : undefined;
+	const depth = parentHeader?.rlmDepth;
+	return isValidRlmDepth(depth) && depth < Number.MAX_SAFE_INTEGER ? depth + 1 : undefined;
 }
 
 function rootRlmDepthFromEnv(): number {
@@ -767,8 +768,8 @@ function rootRlmDepthFromEnv(): number {
 	if (value === undefined || value === "") {
 		return 0;
 	}
-	const parsed = Number.parseInt(value, 10);
-	if (!Number.isFinite(parsed) || parsed < 0) {
+	const parsed = Number(value);
+	if (!/^\d+$/.test(value) || !isValidRlmDepth(parsed)) {
 		throw new Error("RLM_DEPTH must be a non-negative integer");
 	}
 	return parsed;

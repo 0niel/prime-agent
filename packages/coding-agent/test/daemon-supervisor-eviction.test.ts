@@ -30,6 +30,7 @@ interface WorkerFixture {
 interface SupervisorInternals {
 	workers: Map<string, WorkerFixture>;
 	clients: Set<{ id: string; attachedActiveSessionIds: Set<string> }>;
+	idleEvictionFence?: Promise<void>;
 	catalog: { resolve: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn> };
 	createOrReuseWorker: ReturnType<typeof vi.fn>;
 	stopWorker: ReturnType<typeof vi.fn>;
@@ -131,6 +132,65 @@ describe("daemon supervisor whole-tree eviction", () => {
 			expect.stringMatching(/Evicted idle worker idle .*idleMinutes=120 sessions=2/),
 		);
 		expect([...supervisor.workers.keys()].sort()).toEqual(["active", "attached", "cron", "heartbeat"]);
+	});
+
+	it("delegates capped child passivation only to live non-evictable workers", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const active = makeWorker("active", [
+			makeSummary("active-root", now, { isSessionActive: true }),
+			makeSummary("idle-child", now, { runtimeKind: "subagent", parentActiveSessionId: "active-root" }),
+		]);
+		const whollyIdle = makeWorker("wholly-idle", [makeSummary("idle-root", now)]);
+		active.client!.requestWorker.mockResolvedValue({
+			type: "response",
+			command: "worker_passivate_idle_children",
+			success: true,
+			data: { count: 1 },
+		});
+		supervisor.workers.set("active", active);
+		supervisor.workers.set("wholly-idle", whollyIdle);
+
+		await supervisor.runIdleEvictionSweep(now);
+
+		expect(active.client?.requestWorker).toHaveBeenCalledWith(
+			{
+				type: "worker_passivate_idle_children",
+				idleEvictionMinutes: 90,
+				now,
+				limit: 2,
+			},
+			30_000,
+		);
+		expect(whollyIdle.client?.requestWorker).not.toHaveBeenCalled();
+		expect(supervisor.stopWorker).toHaveBeenCalledWith(whollyIdle, true);
+	});
+
+	it("does not fence unrelated mutations while child passivation is in flight", async () => {
+		const now = Date.parse("2026-08-01T12:00:00.000Z");
+		const supervisor = makeSupervisor();
+		const active = makeWorker("active", [makeSummary("active-root", now, { isSessionActive: true })]);
+		let releasePassivation!: () => void;
+		active.client!.requestWorker.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					releasePassivation = () =>
+						resolve({
+							type: "response",
+							command: "worker_passivate_idle_children",
+							success: true,
+							data: { count: 0 },
+						});
+				}),
+		);
+		supervisor.workers.set("active", active);
+
+		const sweep = supervisor.runIdleEvictionSweep(now);
+		await vi.waitFor(() => expect(active.client?.requestWorker).toHaveBeenCalledOnce());
+
+		expect(supervisor.idleEvictionFence).toBeUndefined();
+		releasePassivation();
+		await sweep;
 	});
 
 	it("uses canonical busy state so a stale parent with a running child is not evicted", async () => {

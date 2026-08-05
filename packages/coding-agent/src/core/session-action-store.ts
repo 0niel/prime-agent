@@ -319,6 +319,12 @@ export interface SessionEvictionSnapshot {
 	lastActivityAt: number;
 }
 
+export interface SessionPassivationSnapshot extends SessionEvictionSnapshot {
+	hasParent: boolean;
+	hasNonPassiveDescendants: boolean;
+	isHydrating: boolean;
+}
+
 export interface WorkerEvictionSnapshot {
 	lifecycle: "starting" | "ready" | "recovering" | "failed";
 	isConnected: boolean;
@@ -328,6 +334,38 @@ export interface WorkerEvictionSnapshot {
 	sessions: readonly SessionEvictionSnapshot[];
 }
 
+function isIdleEvictionThresholdMet(
+	session: SessionEvictionSnapshot,
+	idleEvictionMinutes: IdleEvictionMinutes,
+	now: number,
+): boolean {
+	if (idleEvictionMinutes === "off" || !Number.isFinite(idleEvictionMinutes) || idleEvictionMinutes <= 0) {
+		return false;
+	}
+	return (
+		!session.isSessionActive &&
+		session.attachedClients === 0 &&
+		!session.hasRegisteredHeartbeat &&
+		!session.hasRegisteredCronJob &&
+		Number.isFinite(session.lastActivityAt) &&
+		now - session.lastActivityAt >= idleEvictionMinutes * 60_000
+	);
+}
+
+/** Pure per-node residency policy. Roots remain owned by whole-worker eviction. */
+export function canPassivateSession(
+	session: SessionPassivationSnapshot,
+	idleEvictionMinutes: IdleEvictionMinutes,
+	now = Date.now(),
+): boolean {
+	return (
+		session.hasParent &&
+		!session.hasNonPassiveDescendants &&
+		!session.isHydrating &&
+		isIdleEvictionThresholdMet(session, idleEvictionMinutes, now)
+	);
+}
+
 /** Pure whole-tree residency policy. Callers must supply supervisor-owned attachment state. */
 export function canEvictWorker(
 	worker: WorkerEvictionSnapshot,
@@ -335,9 +373,6 @@ export function canEvictWorker(
 	now = Date.now(),
 ): boolean {
 	if (
-		idleEvictionMinutes === "off" ||
-		!Number.isFinite(idleEvictionMinutes) ||
-		idleEvictionMinutes <= 0 ||
 		worker.lifecycle !== "ready" ||
 		!worker.isConnected ||
 		worker.isStopping ||
@@ -347,16 +382,7 @@ export function canEvictWorker(
 	) {
 		return false;
 	}
-	const idleThresholdMs = idleEvictionMinutes * 60_000;
-	return worker.sessions.every(
-		(session) =>
-			!session.isSessionActive &&
-			session.attachedClients === 0 &&
-			!session.hasRegisteredHeartbeat &&
-			!session.hasRegisteredCronJob &&
-			Number.isFinite(session.lastActivityAt) &&
-			now - session.lastActivityAt >= idleThresholdMs,
-	);
+	return worker.sessions.every((session) => isIdleEvictionThresholdMet(session, idleEvictionMinutes, now));
 }
 
 export function canSelectSessionAction(activity: RuntimeActivity): boolean {

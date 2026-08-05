@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 import types
 from dataclasses import dataclass, field
@@ -61,26 +60,6 @@ class RLMSubagent:
     session_name: str
     session_dir: Path
     status: str
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return default
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise RuntimeError(f"{name} must be an integer, got {raw!r}") from exc
-
-
-def _ensure_recursion_allowed() -> None:
-    depth = _env_int("RLM_DEPTH", 0)
-    max_depth = _env_int("RLM_MAX_DEPTH", 1)
-    if depth >= max_depth:
-        raise RuntimeError(
-            f"RLM recursion depth limit reached "
-            f"(RLM_DEPTH={depth}, RLM_MAX_DEPTH={max_depth})"
-        )
 
 
 def _install_control_comm_handlers() -> None:
@@ -184,7 +163,6 @@ async def run(prompt: str, **kwargs: Any) -> RLMResult:
     """
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
-    _ensure_recursion_allowed()
     payload = await host_request("rlm.run", {"prompt": prompt, "kwargs": kwargs})
     return _result_from_payload(payload)
 

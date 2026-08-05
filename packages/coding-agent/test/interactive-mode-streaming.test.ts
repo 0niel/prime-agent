@@ -325,4 +325,29 @@ describe("InteractiveMode streaming events", () => {
 		expect(fakeThis.focusEditor).not.toHaveBeenCalled();
 		expect(fakeThis.editor.handleInput).not.toHaveBeenCalled();
 	});
+
+	test("does not pulse renders for background-only subagent work", () => {
+		vi.useFakeTimers();
+		try {
+			const requestRender = vi.fn();
+			const mode = Object.create(InteractiveMode.prototype) as InteractiveMode & Record<string, unknown>;
+			Object.assign(mode, {
+				connectionState: { isStreaming: false },
+				subagentSnapshots: new Map([["worker", { id: "worker", status: "running" }]]),
+				pulseTimer: undefined,
+				ui: { requestRender },
+			});
+			const updatePulse = Reflect.get(InteractiveMode.prototype, "updateWorkingPulse") as (
+				this: typeof mode,
+			) => void;
+
+			updatePulse.call(mode);
+			vi.advanceTimersByTime(1000);
+
+			expect(requestRender).not.toHaveBeenCalled();
+			expect(Reflect.get(mode, "pulseTimer")).toBeUndefined();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });

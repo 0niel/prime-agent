@@ -203,6 +203,11 @@ export class SettingsSelectorComponent extends Container {
 		super();
 
 		let currentWarnings = { ...config.warnings };
+		const idleEvictionValues = [30, 60, 90, 180, 360];
+		if (typeof config.idleEvictionMinutes === "number" && !idleEvictionValues.includes(config.idleEvictionMinutes)) {
+			idleEvictionValues.push(config.idleEvictionMinutes);
+			idleEvictionValues.sort((a, b) => a - b);
+		}
 
 		const items: SettingItem[] = [
 			{
@@ -217,7 +222,7 @@ export class SettingsSelectorComponent extends Container {
 				label: "Idle worker eviction",
 				description: "Stop fully idle agent trees after this many minutes (global daemon policy)",
 				currentValue: String(config.idleEvictionMinutes),
-				values: ["off", "30", "60", "90", "180", "360"],
+				values: ["off", ...idleEvictionValues.map(String)],
 			},
 			{
 				id: "steering-mode",
@@ -451,7 +456,7 @@ export class SettingsSelectorComponent extends Container {
 						callbacks.onAutoCompactChange(newValue === "true");
 						break;
 					case "idle-eviction-minutes":
-						callbacks.onIdleEvictionMinutesChange(newValue === "off" ? "off" : parseInt(newValue, 10));
+						callbacks.onIdleEvictionMinutesChange(newValue === "off" ? "off" : Number(newValue));
 						break;
 					case "show-images":
 						callbacks.onShowImagesChange(newValue === "true");

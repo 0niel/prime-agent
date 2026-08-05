@@ -626,9 +626,14 @@ export class SettingsManager {
 		await this.writeQueue;
 	}
 
-	drainErrors(): SettingsError[] {
-		const drained = [...this.errors];
-		this.errors = [];
+	drainErrors(scope?: SettingsScope): SettingsError[] {
+		if (!scope) {
+			const drained = [...this.errors];
+			this.errors = [];
+			return drained;
+		}
+		const drained = this.errors.filter((entry) => entry.scope === scope);
+		this.errors = this.errors.filter((entry) => entry.scope !== scope);
 		return drained;
 	}
 

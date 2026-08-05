@@ -4,6 +4,7 @@ import {
 	type ActionLifecycle,
 	ActionStore,
 	canEvictWorker,
+	canPassivateSession,
 	canSelectSessionAction,
 	type DeliveryPolicy,
 	type RuntimeActivity,
@@ -287,5 +288,43 @@ describe("whole-tree eviction capability", () => {
 		expect(canEvictWorker(idleWorker, "off", now)).toBe(false);
 		expect(canEvictWorker(idleWorker, 0, now)).toBe(false);
 		expect(canEvictWorker(idleWorker, Number.NaN, now)).toBe(false);
+	});
+});
+
+describe("child passivation capability", () => {
+	const now = Date.parse("2026-08-01T12:00:00.000Z");
+	const idleChild = {
+		isSessionActive: false,
+		attachedClients: 0,
+		hasRegisteredHeartbeat: false,
+		hasRegisteredCronJob: false,
+		lastActivityAt: now - 90 * 60_000,
+		hasParent: true,
+		hasNonPassiveDescendants: false,
+		isHydrating: false,
+	};
+
+	it("accepts an idle leaf child at the shared inclusive threshold", () => {
+		expect(canPassivateSession(idleChild, 90, now)).toBe(true);
+	});
+
+	it.each([
+		["root", { hasParent: false }],
+		["child with a resident descendant", { hasNonPassiveDescendants: true }],
+		["hydrating child", { isHydrating: true }],
+		["busy child", { isSessionActive: true }],
+		["attached child", { attachedClients: 1 }],
+		["heartbeat child", { hasRegisteredHeartbeat: true }],
+		["cron child", { hasRegisteredCronJob: true }],
+		["recent child", { lastActivityAt: now - 89 * 60_000 }],
+		["child without activity time", { lastActivityAt: Number.NaN }],
+	])("rejects a %s", (_name, override) => {
+		expect(canPassivateSession({ ...idleChild, ...override }, 90, now)).toBe(false);
+	});
+
+	it("shares the whole-tree off and invalid threshold behavior", () => {
+		expect(canPassivateSession(idleChild, "off", now)).toBe(false);
+		expect(canPassivateSession(idleChild, 0, now)).toBe(false);
+		expect(canPassivateSession(idleChild, Number.NaN, now)).toBe(false);
 	});
 });
