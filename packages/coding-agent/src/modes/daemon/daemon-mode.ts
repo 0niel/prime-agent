@@ -294,6 +294,8 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"export_html",
 	"export_jsonl",
 	"set_session_name",
+	"get_rlm_max_depth_status",
+	"set_rlm_max_depth",
 	"rename_saved_session",
 	"delete_saved_session",
 	"get_session_context",
@@ -2380,7 +2382,7 @@ export class AgentDaemon {
 						rlmDepth: existsSync(entry.sessionFile)
 							? resolveSessionRlmDepth(sessionManager.getHeader() ?? {}, entry.sessionFile)
 							: undefined,
-						rlmMaxDepth: entry.rlmMaxDepth ?? 1,
+						rlmMaxDepth: entry.rlmMaxDepth,
 						rlmParentNodeId: entry.rlmParentNodeId ?? entry.childId,
 					},
 					runtimeMetadata: {
@@ -3922,6 +3924,17 @@ export class AgentDaemon {
 				}
 				state.runtime.session.setSessionName(name);
 				return success(command.id, "set_session_name");
+			}
+
+			case "get_rlm_max_depth_status": {
+				const state = this.getSessionState(command.activeSessionId);
+				return success(command.id, "get_rlm_max_depth_status", state.runtime.session.getRlmMaxDepthStatus());
+			}
+
+			case "set_rlm_max_depth": {
+				const state = this.getSessionState(command.activeSessionId);
+				const result = await state.runtime.session.setRlmMaxDepth(command.maxDepth, { global: command.global });
+				return success(command.id, "set_rlm_max_depth", result);
 			}
 
 			case "get_session_context": {

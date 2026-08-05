@@ -316,6 +316,42 @@ describe("SettingsManager", () => {
 			expect(errors.map((e) => e.scope).sort()).toEqual(["global", "project"]);
 			expect(manager.drainErrors()).toEqual([]);
 		});
+
+		it("should report a new global error when saving after the load error was drained", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const invalidSettings = "{ invalid global json";
+			writeFileSync(settingsPath, invalidSettings);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.drainErrors()).toHaveLength(1);
+
+			manager.setRlmMaxDepth(3);
+			await manager.flush();
+
+			const errors = manager.drainErrors();
+			expect(errors).toHaveLength(1);
+			expect(errors[0]?.scope).toBe("global");
+			expect(errors[0]?.error.message).toContain("Global settings not saved: settings file failed to parse:");
+			expect(readFileSync(settingsPath, "utf-8")).toBe(invalidSettings);
+		});
+
+		it("should report a new project error when saving after the load error was drained", async () => {
+			const settingsPath = join(projectDir, ".prime", "agent", "settings.json");
+			const invalidSettings = "{ invalid project json";
+			writeFileSync(settingsPath, invalidSettings);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+			expect(manager.drainErrors()).toHaveLength(1);
+
+			manager.setProjectPackages(["npm:test-pkg"]);
+			await manager.flush();
+
+			const errors = manager.drainErrors();
+			expect(errors).toHaveLength(1);
+			expect(errors[0]?.scope).toBe("project");
+			expect(errors[0]?.error.message).toContain("Project settings not saved: settings file failed to parse:");
+			expect(readFileSync(settingsPath, "utf-8")).toBe(invalidSettings);
+		});
 	});
 
 	describe("project settings directory creation", () => {

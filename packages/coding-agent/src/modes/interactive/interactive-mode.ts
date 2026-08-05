@@ -4737,6 +4737,11 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
+				if (commandName === "rlm-max-depth") {
+					this.editor.setText("");
+					await this.handleRlmMaxDepthCommand(commandArgs);
+					return;
+				}
 				if (commandName === "session" && !commandArgs) {
 					this.echoLocalCommand(text);
 					await this.handleSessionCommand();
@@ -9126,6 +9131,57 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(theme.fg("dim", `Session name set: ${name}`), 1, 0));
 		this.ui.requestRender();
+	}
+
+	private async handleRlmMaxDepthCommand(args: string): Promise<void> {
+		const tokens = args ? args.split(/\s+/) : [];
+		if (tokens.length === 0) {
+			try {
+				const status = await this.agentConnection.getRlmMaxDepthStatus();
+				this.chatContainer.addChild(new Spacer(1));
+				this.chatContainer.addChild(
+					new Text(theme.fg("dim", `RLM max depth: ${status.maxDepth} (${status.source})`), 1, 0),
+				);
+				this.ui.requestRender();
+			} catch (error) {
+				this.showError(error instanceof Error ? error.message : String(error));
+			}
+			return;
+		}
+
+		const global = tokens[1] === "--global";
+		if (tokens.length > (global ? 2 : 1) || !/^\d+$/.test(tokens[0] ?? "")) {
+			this.showWarning("Usage: /rlm-max-depth [<non-negative integer> [--global]]");
+			return;
+		}
+		const maxDepth = Number(tokens[0]);
+		if (!Number.isSafeInteger(maxDepth)) {
+			this.showWarning("RLM max depth must be a non-negative integer.");
+			return;
+		}
+
+		try {
+			const result = await this.agentConnection.setRlmMaxDepth(maxDepth, { global });
+			this.chatContainer.addChild(new Spacer(1));
+			this.chatContainer.addChild(
+				new Text(
+					theme.fg(
+						"dim",
+						`RLM max depth set: ${result.maxDepth}${result.globalSaved ? " and saved as global default" : ""}`,
+					),
+					1,
+					0,
+				),
+			);
+			this.ui.requestRender();
+			if (result.globalError) {
+				this.showError(
+					`RLM max depth set for this chat, but the global default was not saved: ${result.globalError}`,
+				);
+			}
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+		}
 	}
 
 	private async handleSessionCommand(): Promise<void> {

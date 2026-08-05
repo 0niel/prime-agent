@@ -4868,6 +4868,45 @@ describe("daemon mode helpers", () => {
 		});
 	});
 
+	it("gets and sets RLM max depth directly on the active session", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const getRlmMaxDepthStatus = vi.fn(() => ({ maxDepth: 2, source: "chat" as const }));
+		const setRlmMaxDepth = vi.fn(async () => ({
+			maxDepth: 3,
+			source: "chat" as const,
+			globalSaved: true,
+		}));
+		const state = makeState("active-1") as ActiveSessionState;
+		(state.runtime as { session: unknown }).session = { getRlmMaxDepthStatus, setRlmMaxDepth };
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		const client = makeClient("client-1", state.activeSessionId);
+
+		await expect(
+			internals.handleCommand(client, {
+				type: "get_rlm_max_depth_status",
+				activeSessionId: state.activeSessionId,
+			}),
+		).resolves.toMatchObject({ success: true, data: { maxDepth: 2, source: "chat" } });
+		await expect(
+			internals.handleCommand(client, {
+				type: "set_rlm_max_depth",
+				activeSessionId: state.activeSessionId,
+				maxDepth: 3,
+				global: true,
+			}),
+		).resolves.toMatchObject({ success: true, data: { maxDepth: 3, globalSaved: true } });
+		expect(setRlmMaxDepth).toHaveBeenCalledWith(3, { global: true });
+	});
+
 	it.each([
 		{
 			name: "defers busy heartbeat cron jobs instead of queueing a follow-up",

@@ -53,8 +53,9 @@ export const DAEMON_PROTOCOL_VERSION = 7;
 export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 9 publishes persisted RLM spawn depth on passive session rows.
 // Revision 10 publishes persisted RLM spawn depth on all session catalog rows.
-export const DAEMON_SCHEMA_REVISION = 10;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-10-37a654228732";
+// Revision 11 adds immediate get/set commands for active-session RLM max depth.
+export const DAEMON_SCHEMA_REVISION = 11;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-11-5bd6b0b12204";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -570,6 +571,8 @@ export type DaemonCommand =
 	| { id?: string; type: "export_html"; activeSessionId: string; outputPath?: string }
 	| { id?: string; type: "export_jsonl"; activeSessionId: string; outputPath?: string }
 	| { id?: string; type: "set_session_name"; activeSessionId: string; name: string }
+	| { id?: string; type: "get_rlm_max_depth_status"; activeSessionId: string }
+	| { id?: string; type: "set_rlm_max_depth"; activeSessionId: string; maxDepth: number; global?: boolean }
 	| { id?: string; type: "rename_saved_session"; activeSessionId?: string; sessionPath: string; name: string }
 	| { id?: string; type: "delete_saved_session"; activeSessionId?: string; sessionPath: string }
 	| { id?: string; type: "get_session_context"; activeSessionId: string }
@@ -602,6 +605,7 @@ export interface DaemonCommandCompatibility {
 
 const LEGACY_DAEMON_COMMAND = { minProtocol: 7 } as const;
 const CURRENT_DAEMON_COMMAND = { minProtocol: 7 } as const;
+const RLM_MAX_DEPTH_COMMAND = { minProtocol: 7, minSchemaRevision: 11 } as const;
 const SESSION_INPUT_ADMISSION_COMMAND = {
 	minProtocol: 7,
 	capability: "session_input_admission",
@@ -698,6 +702,8 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	export_html: LEGACY_DAEMON_COMMAND,
 	export_jsonl: LEGACY_DAEMON_COMMAND,
 	set_session_name: LEGACY_DAEMON_COMMAND,
+	get_rlm_max_depth_status: RLM_MAX_DEPTH_COMMAND,
+	set_rlm_max_depth: RLM_MAX_DEPTH_COMMAND,
 	rename_saved_session: LEGACY_DAEMON_COMMAND,
 	delete_saved_session: LEGACY_DAEMON_COMMAND,
 	get_session_context: LEGACY_DAEMON_COMMAND,
@@ -1012,6 +1018,7 @@ const READ_ONLY_DAEMON_COMMANDS: ReadonlySet<DaemonCommand["type"]> = new Set([
 	"get_user_messages_for_forking",
 	"get_last_assistant_text",
 	"get_system_prompt",
+	"get_rlm_max_depth_status",
 	"get_tool_definition",
 ]);
 

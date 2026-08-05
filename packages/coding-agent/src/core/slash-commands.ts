@@ -172,6 +172,13 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		takesArgument: true,
 	},
 	{
+		name: "rlm-max-depth",
+		description:
+			"Set/view the per-chat persistent RLM max depth immediately; never interrupts or queues the running turn",
+		argumentHint: "[<int> [--global]]",
+		takesArgument: true,
+	},
+	{
 		name: "heartbeat",
 		description:
 			"Set or view a persistent heartbeat; delivery defaults to steer, use --follow-up to queue; supports pause, resume, stop, and clear",

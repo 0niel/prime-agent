@@ -496,13 +496,6 @@ async function streamAssistantResponse(
 		// Convert to LLM-compatible messages (AgentMessage[] → Message[])
 		const llmMessages = await maybePromiseWithAbort(config.convertToLlm(messages), signal);
 
-		// Build LLM context
-		const llmContext: Context = {
-			systemPrompt: context.systemPrompt,
-			messages: llmMessages,
-			tools: context.tools,
-		};
-
 		const streamFunction = streamFn || streamSimple;
 
 		// Resolve API key (important for expiring tokens)
@@ -510,6 +503,13 @@ async function streamAssistantResponse(
 			(config.getApiKey
 				? await maybePromiseWithAbort(config.getApiKey(config.model.provider), signal)
 				: undefined) || config.apiKey;
+
+		// Build LLM context immediately before starting the provider call.
+		const llmContext: Context = {
+			systemPrompt: config.getSystemPrompt?.() ?? context.systemPrompt,
+			messages: llmMessages,
+			tools: context.tools,
+		};
 
 		const response = await maybePromiseWithAbort(
 			streamFunction(config.model, llmContext, {

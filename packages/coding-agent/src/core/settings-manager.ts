@@ -126,6 +126,7 @@ export interface Settings {
 	recentModels?: string[]; // "provider/id" keys, most-recently-used first
 	defaultThinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 	defaultServiceTier?: ServiceTier;
+	rlmMaxDepth?: number; // default for new sessions; unset falls through to RLM_MAX_DEPTH, then 1
 	transport?: TransportSetting; // default: "auto"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
@@ -579,6 +580,12 @@ export class SettingsManager {
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 
 		if (this.globalSettingsLoadError) {
+			this.recordError(
+				"global",
+				new Error(
+					`Global settings not saved: settings file failed to parse: ${this.globalSettingsLoadError.message}`,
+				),
+			);
 			return;
 		}
 
@@ -596,6 +603,12 @@ export class SettingsManager {
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 
 		if (this.projectSettingsLoadError) {
+			this.recordError(
+				"project",
+				new Error(
+					`Project settings not saved: settings file failed to parse: ${this.projectSettingsLoadError.message}`,
+				),
+			);
 			return;
 		}
 
@@ -728,6 +741,16 @@ export class SettingsManager {
 	setDefaultServiceTier(serviceTier: ServiceTier): void {
 		this.globalSettings.defaultServiceTier = serviceTier;
 		this.markModified("defaultServiceTier");
+		this.save();
+	}
+
+	getRlmMaxDepth(): number | undefined {
+		return this.globalSettings.rlmMaxDepth;
+	}
+
+	setRlmMaxDepth(maxDepth: number): void {
+		this.globalSettings.rlmMaxDepth = maxDepth;
+		this.markModified("rlmMaxDepth");
 		this.save();
 	}
 

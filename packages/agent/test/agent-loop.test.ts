@@ -596,6 +596,59 @@ describe("agentLoop with AgentMessage", () => {
 		expect(convertedMessages[0].role).toBe("user");
 	});
 
+	it("should resolve the system prompt after asynchronous API key lookup", async () => {
+		let systemPrompt = "before lookup";
+		let resolveApiKey: ((apiKey: string) => void) | undefined;
+		const apiKey = new Promise<string>((resolve) => {
+			resolveApiKey = resolve;
+		});
+		let markLookupStarted: (() => void) | undefined;
+		const lookupStarted = new Promise<void>((resolve) => {
+			markLookupStarted = resolve;
+		});
+		let providerSystemPrompt: string | undefined;
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			getApiKey: async () => {
+				markLookupStarted?.();
+				return apiKey;
+			},
+			getSystemPrompt: () => systemPrompt,
+		};
+		const stream = agentLoop(
+			[createUserMessage("Hello")],
+			{ systemPrompt: "fallback", messages: [], tools: [] },
+			config,
+			undefined,
+			(_model, context, options) => {
+				providerSystemPrompt = context.systemPrompt;
+				expect(options?.apiKey).toBe("resolved key");
+				const mockStream = new MockAssistantStream();
+				queueMicrotask(() => {
+					mockStream.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "Response" }]),
+					});
+				});
+				return mockStream;
+			},
+		);
+		const consume = (async () => {
+			for await (const _event of stream) {
+				// consume
+			}
+		})();
+
+		await lookupStarted;
+		systemPrompt = "after lookup";
+		resolveApiKey?.("resolved key");
+		await consume;
+
+		expect(providerSystemPrompt).toBe("after lookup");
+	});
+
 	it("should apply transformContext before convertToLlm", async () => {
 		const context: AgentContext = {
 			systemPrompt: "You are helpful.",

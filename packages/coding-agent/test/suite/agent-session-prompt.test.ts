@@ -458,6 +458,43 @@ describe("AgentSession prompt characterization", () => {
 		await promptPromise;
 	});
 
+	it("preserves the active extension system prompt when max depth changes mid-run", async () => {
+		const responseStarted = createDeferred();
+		const responseGate = createDeferred();
+		const harness = await createHarness({
+			rlmDepth: 1,
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", async (event) => ({
+						systemPrompt: `${event.systemPrompt}
+
+active extension doctrine`,
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			async () => {
+				responseStarted.resolve();
+				await responseGate.promise;
+				return fauxAssistantMessage("done");
+			},
+		]);
+
+		const promptPromise = harness.session.prompt("start");
+		await responseStarted.promise;
+		expect(harness.session.agent.state.systemPrompt).toContain("active extension doctrine");
+		expect(harness.session.agent.state.systemPrompt).not.toContain("A callable `rlm`");
+
+		await harness.session.setRlmMaxDepth(2);
+
+		expect(harness.session.agent.state.systemPrompt).toContain("A callable `rlm`");
+		expect(harness.session.agent.state.systemPrompt).toContain("active extension doctrine");
+		responseGate.resolve();
+		await promptPromise;
+	});
+
 	it("resets stale extension system prompt for accepted agent messages", async () => {
 		const harness = await createHarness({
 			systemPrompt: "base prompt",

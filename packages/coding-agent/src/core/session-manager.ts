@@ -1576,6 +1576,11 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Append a custom entry and undo its in-memory index if persistence fails. */
+	appendCustomEntryWithRollback(customType: string, data?: unknown): string {
+		return this._appendEntryWithRollback(() => this.appendCustomEntry(customType, data));
+	}
+
 	/** Append an RLM child usage attribution and update the parent assistant aggregate in memory. */
 	appendChildUsageAttribution(targetId: string, childUsage: Usage, aggregateUsage: Usage): string {
 		const target = this.byId.get(targetId);
@@ -1780,9 +1785,13 @@ export class SessionManager {
 		display: boolean,
 		details?: T,
 	): string {
+		return this._appendEntryWithRollback(() => this.appendCustomMessageEntry(customType, content, display, details));
+	}
+
+	private _appendEntryWithRollback(append: () => string): string {
 		const previousLeafId = this.leafId;
 		try {
-			const entryId = this.appendCustomMessageEntry(customType, content, display, details);
+			const entryId = append();
 			this.flushNow();
 			return entryId;
 		} catch (error) {

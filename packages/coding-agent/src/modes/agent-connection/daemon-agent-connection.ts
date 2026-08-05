@@ -1246,6 +1246,27 @@ export class DaemonAgentConnection implements AgentConnection {
 		await this.requestOk({ type: "set_session_name", activeSessionId: this.activeSessionId, name });
 	}
 
+	async getRlmMaxDepthStatus() {
+		return this.requestData<{ maxDepth: number; source: "default" | "env" | "global" | "inherited" | "chat" }>({
+			type: "get_rlm_max_depth_status",
+			activeSessionId: this.activeSessionId,
+		});
+	}
+
+	async setRlmMaxDepth(maxDepth: number, options?: { global?: boolean }) {
+		return this.requestData<{
+			maxDepth: number;
+			source: "default" | "env" | "global" | "inherited" | "chat";
+			globalSaved: boolean;
+			globalError?: string;
+		}>({
+			type: "set_rlm_max_depth",
+			activeSessionId: this.activeSessionId,
+			maxDepth,
+			global: options?.global,
+		});
+	}
+
 	async renameSavedSession(sessionPath: string, name: string): Promise<void> {
 		await renameDaemonSavedSession(this.client, { activeSessionId: this.activeSessionId }, sessionPath, name);
 	}

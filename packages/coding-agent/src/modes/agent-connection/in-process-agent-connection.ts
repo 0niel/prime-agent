@@ -529,6 +529,14 @@ export class InProcessAgentConnection implements AgentConnection {
 		this.session.setSessionName(trimmedName);
 	}
 
+	async getRlmMaxDepthStatus() {
+		return this.session.getRlmMaxDepthStatus();
+	}
+
+	async setRlmMaxDepth(maxDepth: number, options?: { global?: boolean }) {
+		return this.session.setRlmMaxDepth(maxDepth, options);
+	}
+
 	async renameSavedSession(sessionPath: string, name: string): Promise<void> {
 		const trimmedName = name.trim();
 		if (!trimmedName) {

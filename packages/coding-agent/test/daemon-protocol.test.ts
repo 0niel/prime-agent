@@ -75,6 +75,11 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("model_catalog");
 	});
 
+	it("schema-gates the RLM max depth commands at their introducing revision", () => {
+		expect(DAEMON_COMMAND_COMPATIBILITY.get_rlm_max_depth_status).toEqual({ minProtocol: 7, minSchemaRevision: 11 });
+		expect(DAEMON_COMMAND_COMPATIBILITY.set_rlm_max_depth).toEqual({ minProtocol: 7, minSchemaRevision: 11 });
+	});
+
 	it("version- and capability-gates prompt admission cancellation", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.cancel_prompt_admission).toEqual({
 			minProtocol: 7,

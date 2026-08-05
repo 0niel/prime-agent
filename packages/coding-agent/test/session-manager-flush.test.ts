@@ -356,6 +356,17 @@ const failAfterPartialTempWrite: WriteFileSync = (path, data, options) => {
 };
 
 describe("SessionManager.appendCustomMessageEntryWithRollback", () => {
+	it("flushes rollback-aware value entries immediately", () => {
+		const dir = createTempDir();
+		const mgr = SessionManager.create(dir, join(dir, "sessions"));
+
+		mgr.appendCustomEntryWithRollback("rlm_max_depth_state", { maxDepth: 2 });
+
+		expect(readFileSync(mgr.getSessionFile()!, "utf8")).toContain(
+			'"customType":"rlm_max_depth_state","data":{"maxDepth":2}',
+		);
+	});
+
 	it("flushes rollback-aware custom messages before the first assistant response", () => {
 		const dir = createTempDir();
 		const sessionDir = join(dir, "sessions");

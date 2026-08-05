@@ -169,6 +169,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
 
+	/** Resolves the system prompt immediately before each LLM call. */
+	getSystemPrompt?: () => string;
+
 	/**
 	 * Resolves an API key dynamically for each LLM call.
 	 *

@@ -872,6 +872,14 @@ type GoalSlashCommand =
 
 type AutonomousSlashCommand = { kind: "status" } | { kind: "on" } | { kind: "off" };
 
+import type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
+
+export type { RlmMaxDepthSource, RlmMaxDepthStatus, SetRlmMaxDepthResult } from "./rlm-max-depth.js";
+
+interface PersistedRlmMaxDepthState {
+	maxDepth: number;
+}
+
 type AutonomousRuntimeSnapshot = Pick<
 	AutonomousRuntimeState,
 	"continuationsUsed" | "gateAttempts" | "lastGateFailure" | "lastGateFailureSnapshot"
@@ -914,6 +922,7 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 
 /** Cap on the post-compaction kernel namespace probe so a wedged kernel can't stall recovery. */
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 
 function noopRlmChildAbort(): void {}
 
@@ -929,15 +938,28 @@ Reviewer instructions: ${review.instructions}`
 	return `Automatic refine review triggered by ${reason}. Only create/update/delete local harness entries if there is clear evidence that should help this session continue. Prefer an empty edits array over speculative or one-off memories. Do not promote anything global unless explicitly requested. Reviewer rationale: ${review.rationale}${detail}`;
 }
 
+function isNonNegativeInteger(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
 function parseDepth(value: string | undefined, fallback: number, name: string): number {
 	if (value === undefined || value === "") {
 		return fallback;
 	}
-	const parsed = Number.parseInt(value, 10);
-	if (!Number.isFinite(parsed) || parsed < 0) {
+	if (!/^\d+$/.test(value)) {
+		throw new Error(`${name} must be a non-negative integer`);
+	}
+	const parsed = Number(value);
+	if (!isNonNegativeInteger(parsed)) {
 		throw new Error(`${name} must be a non-negative integer`);
 	}
 	return parsed;
+}
+
+function isPersistedRlmMaxDepthState(value: unknown): value is PersistedRlmMaxDepthState {
+	return (
+		typeof value === "object" && value !== null && isNonNegativeInteger((value as PersistedRlmMaxDepthState).maxDepth)
+	);
 }
 
 function parseGoalBudgetValue(value: string): number {
@@ -1142,7 +1164,9 @@ export class AgentSession {
 	private _ipythonRuntimeBuilt = false;
 	private readonly _prewarmIpythonKernel: boolean;
 	private _rlmDepth: number;
+	private readonly _configuredRlmMaxDepth: number | undefined;
 	private _rlmMaxDepth: number;
+	private _rlmMaxDepthSource: RlmMaxDepthSource;
 	private _rlmSessionDir?: string;
 	private _rlmParentNodeId?: string;
 	private _subagentRuntimeHost?: SubagentRuntimeHost;
@@ -1235,7 +1259,13 @@ export class AgentSession {
 			config.rlmDepth ??
 			this.sessionManager.getHeader()?.rlmDepth ??
 			parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH");
-		this._rlmMaxDepth = config.rlmMaxDepth ?? parseDepth(process.env.RLM_MAX_DEPTH, 1, "RLM_MAX_DEPTH");
+		this._configuredRlmMaxDepth = config.rlmMaxDepth;
+		if (this._configuredRlmMaxDepth !== undefined && !isNonNegativeInteger(this._configuredRlmMaxDepth)) {
+			throw new Error("rlmMaxDepth must be a non-negative integer");
+		}
+		const resolvedRlmMaxDepth = this._resolveRlmMaxDepth();
+		this._rlmMaxDepth = resolvedRlmMaxDepth.maxDepth;
+		this._rlmMaxDepthSource = resolvedRlmMaxDepth.source;
 		this._prewarmIpythonKernel = (config.prewarmIpythonKernel ?? false) && this._rlmDepth === 0;
 		this._autoRefineReviewer = config.autoRefineReviewer;
 		this._serializedRefine = config.serializedRefine ?? false;
@@ -1467,6 +1497,43 @@ export class AgentSession {
 		this._emit({ type: "goal_update", goal: this.goalState });
 	}
 
+	private _loadPersistedRlmMaxDepthState(): PersistedRlmMaxDepthState | undefined {
+		const branch = this.sessionManager.getBranch();
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const entry = branch[i];
+			if (
+				entry.type === "custom" &&
+				entry.customType === RLM_MAX_DEPTH_STATE_CUSTOM_TYPE &&
+				isPersistedRlmMaxDepthState(entry.data)
+			) {
+				return entry.data;
+			}
+		}
+		return undefined;
+	}
+
+	private _resolveRlmMaxDepth(): { maxDepth: number; source: RlmMaxDepthSource } {
+		const persisted = this._loadPersistedRlmMaxDepthState();
+		if (persisted) {
+			return { maxDepth: persisted.maxDepth, source: "chat" };
+		}
+		if (this._configuredRlmMaxDepth !== undefined) {
+			return { maxDepth: this._configuredRlmMaxDepth, source: "inherited" };
+		}
+		const global = this.settingsManager.getRlmMaxDepth();
+		if (global !== undefined) {
+			if (!isNonNegativeInteger(global)) {
+				throw new Error("The rlmMaxDepth setting must be a non-negative integer");
+			}
+			return { maxDepth: global, source: "global" };
+		}
+		const env = process.env.RLM_MAX_DEPTH;
+		if (env !== undefined && env !== "") {
+			return { maxDepth: parseDepth(env, 1, "RLM_MAX_DEPTH"), source: "env" };
+		}
+		return { maxDepth: 1, source: "default" };
+	}
+
 	private _loadPersistedGoalState(): GoalState {
 		const branch = this.sessionManager.getBranch();
 		for (let i = branch.length - 1; i >= 0; i--) {
@@ -1514,6 +1581,17 @@ export class AgentSession {
 		this._goalState = this._loadPersistedGoalState();
 		this._goalAccountingStartedAt = this._goalState.status === "active" ? Date.now() : undefined;
 		this._emitGoalUpdate();
+	}
+
+	private _reloadRlmMaxDepthFromBranch(): void {
+		const previousMaxDepth = this._rlmMaxDepth;
+		const resolved = this._resolveRlmMaxDepth();
+		this._rlmMaxDepth = resolved.maxDepth;
+		this._rlmMaxDepthSource = resolved.source;
+		if (resolved.maxDepth !== previousMaxDepth) {
+			this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+			this.agent.state.systemPrompt = this._baseSystemPrompt;
+		}
 	}
 
 	private _persistGoalState(goal: GoalState): void {
@@ -3996,6 +4074,11 @@ export class AgentSession {
 	/** Current RLM spawn depth for this session. */
 	get rlmDepth(): number {
 		return this._rlmDepth;
+	}
+
+	/** Current absolute RLM spawn-depth cap. */
+	get rlmMaxDepth(): number {
+		return this._rlmMaxDepth;
 	}
 
 	/** Current session display name, if set */
@@ -8422,6 +8505,8 @@ export class AgentSession {
 	}
 
 	private _rlmKernelEnv(): Record<string, string> {
+		// Kernel env is provisioning-time only: RLM_MAX_DEPTH may be stale in an already-running kernel;
+		// the TypeScript-side spawn check remains authoritative.
 		const env: Record<string, string> = {
 			RLM_DEPTH: String(this._rlmDepth),
 			RLM_MAX_DEPTH: String(this._rlmMaxDepth),
@@ -10072,9 +10157,40 @@ export class AgentSession {
 	// Session Management
 	// =========================================================================
 
-	/**
-	 * Set a display name for the current session.
-	 */
+	/** Current RLM max-depth value and the source that supplied it. */
+	getRlmMaxDepthStatus(): RlmMaxDepthStatus {
+		return { maxDepth: this._rlmMaxDepth, source: this._rlmMaxDepthSource };
+	}
+
+	/** Persist and immediately apply a per-chat RLM max-depth override. */
+	async setRlmMaxDepth(maxDepth: number, options: { global?: boolean } = {}): Promise<SetRlmMaxDepthResult> {
+		if (!isNonNegativeInteger(maxDepth)) {
+			throw new Error("RLM max depth must be a non-negative integer.");
+		}
+
+		this.sessionManager.appendCustomEntryWithRollback(RLM_MAX_DEPTH_STATE_CUSTOM_TYPE, { maxDepth });
+		this._rlmMaxDepth = maxDepth;
+		this._rlmMaxDepthSource = "chat";
+		const oldBase = this._baseSystemPrompt;
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._refreshExtensionSystemPrompt(this.agent.state.systemPrompt, oldBase);
+
+		let globalError: string | undefined;
+		if (options.global) {
+			this.settingsManager.setRlmMaxDepth(maxDepth);
+			await this.settingsManager.flush();
+			const errors = this.settingsManager.drainErrors().filter(({ scope }) => scope === "global");
+			globalError = errors.map(({ error }) => error.message).join("; ") || undefined;
+		}
+
+		return {
+			...this.getRlmMaxDepthStatus(),
+			globalSaved: options.global === true && globalError === undefined,
+			...(globalError ? { globalError } : {}),
+		};
+	}
+
+	/** Set a display name for the current session. */
 	setSessionName(name: string): void {
 		this.sessionManager.appendSessionInfo(name);
 		this._emit({ type: "session_info_changed", name: this.sessionManager.getSessionName() });
@@ -10315,6 +10431,7 @@ export class AgentSession {
 			this._mergeUnpersistedCompactionOutcomes(this.agent.state.messages);
 			this._restoreLateIpythonSentAgentMessages();
 			this._reloadGoalStateFromBranch();
+			this._reloadRlmMaxDepthFromBranch();
 			this._invalidateQueuedPromptPreparation();
 
 			// Emit session_tree event
