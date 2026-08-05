@@ -32,6 +32,8 @@ export interface SessionSummary {
 	isSessionActive: boolean;
 	hasActiveHeartbeat?: boolean;
 	runtimeKind?: "top-level" | "subagent";
+	/** RLM spawn depth for persisted passive subagent rows. */
+	rlmDepth?: number;
 	activeSessionId?: string;
 	sessionId: string;
 	sessionFile?: string;

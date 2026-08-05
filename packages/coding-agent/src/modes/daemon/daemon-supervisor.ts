@@ -1247,6 +1247,22 @@ export class DaemonSupervisor {
 				return this.handleSavedSessionList(client, command);
 			case "create": {
 				const worker = await this.createOrReuseWorker(this.protocolClientId(client), command);
+				const requestedSummary = command.sessionPath
+					? this.findSummaryInWorker(worker, command.sessionPath)
+					: undefined;
+				if (
+					requestedSummary &&
+					(requestedSummary.activeSessionId ?? requestedSummary.id) !== worker.descriptor.rootActiveSessionId
+				) {
+					// A create forwarded to a recovering worker still surfaces an opaque lifecycle error.
+					const response = await this.forwardToWorker(worker, withoutSupervisorCreateFields(command));
+					if (response.success && isSessionSummary(response.data)) {
+						await this.refreshWorkerSummaries(worker);
+						await this.syncAgentPeers().catch(() => undefined);
+						return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
+					}
+					return responseWithId(response, command.id);
+				}
 				const summary = worker.summaries.get(worker.descriptor.rootActiveSessionId);
 				if (!summary) {
 					throw new Error("Session worker started without a root session");
@@ -1748,6 +1764,8 @@ export class DaemonSupervisor {
 			if (existing) {
 				return this.reuseWorkerForCreate(existing.worker, ownerClientId, sessionPath);
 			}
+			// A passive child from a stopped worker reopens as top-level here (pre-existing behavior);
+			// the recursive-harness residency/eviction PR will revisit it.
 		}
 		const key = createCommand.sessionPath
 			? canonicalSessionPath(createCommand.sessionPath)
@@ -2771,6 +2789,21 @@ export class DaemonSupervisor {
 			}
 		}
 		return exact.length > 0 ? exact : suffix;
+	}
+
+	private findSummaryInWorker(worker: ResidentWorker, selector: string): SessionSummary | undefined {
+		const pathSelector = looksLikeSessionPath(selector) ? canonicalSessionPath(selector) : undefined;
+		return [...worker.summaries.values()].find((summary) => {
+			const activeSessionId = summary.activeSessionId ?? summary.id;
+			return (
+				activeSessionId === selector ||
+				summary.sessionId === selector ||
+				summary.sessionName === selector ||
+				(pathSelector !== undefined &&
+					summary.sessionFile !== undefined &&
+					canonicalSessionPath(summary.sessionFile) === pathSelector)
+			);
+		});
 	}
 
 	private findWorkerBySessionFile(sessionFile: string): WorkerMatch | undefined {

@@ -2893,7 +2893,7 @@ export class AgentSession {
 	handleAgentMessageHostRequest(
 		type: string,
 		payload: Record<string, unknown> = {},
-	): AgentSessionMessageListResult | Promise<AgentSessionMessageReceipt> {
+	): Promise<AgentSessionMessageListResult | AgentSessionMessageReceipt> | AgentSessionMessageListResult {
 		if (!this._agentMessageController) {
 			throw new Error("agent messaging is not available in this session");
 		}
@@ -2922,7 +2922,11 @@ export class AgentSession {
 	handleAgentObserveHostRequest(
 		type: string,
 		payload: Record<string, unknown> = {},
-	): AgentObserveListResult | AgentObserveAgentSnapshot | AgentObserveRecentMessagesResult {
+	):
+		| AgentObserveListResult
+		| AgentObserveAgentSnapshot
+		| AgentObserveRecentMessagesResult
+		| Promise<AgentObserveAgentSnapshot | AgentObserveRecentMessagesResult> {
 		const controller = this._agentObserveController;
 		if (!controller) {
 			throw new Error("agent observation is not available in this session");
@@ -8348,8 +8352,8 @@ export class AgentSession {
 			Object.assign(
 				handlers,
 				createAgentMessageHostHandlers({
-					listAgents: () =>
-						this.handleAgentMessageHostRequest("agent_message.list") as AgentSessionMessageListResult,
+					listAgents: async () =>
+						(await this.handleAgentMessageHostRequest("agent_message.list")) as AgentSessionMessageListResult,
 					sendAgentMessage: async (input) =>
 						(await this.handleAgentMessageHostRequest("agent_message.send", {
 							target: input.target,
@@ -8709,9 +8713,12 @@ export class AgentSession {
 	}
 
 	/** Current direct-child registry for the model-facing rlm.list_subagents API. */
-	listRlmSubagents(): RlmListSubagentsResult {
+	async listRlmSubagents(): Promise<RlmListSubagentsResult> {
+		return this._buildRlmSubagentList(await this._agentMessageController?.listAgents());
+	}
+
+	private _buildRlmSubagentList(listedAgents?: AgentSessionMessageListResult): RlmListSubagentsResult {
 		const daemonChildren = new Map<string, AgentSessionMessageAgentSummary>();
-		const listedAgents = this._agentMessageController?.listAgents();
 		const parentActiveSessionId = listedAgents?.current?.activeSessionId;
 		if (parentActiveSessionId) {
 			for (const agent of listedAgents.agents) {
@@ -8764,6 +8771,26 @@ export class AgentSession {
 				session_dir: sessionDir,
 				status: "completed",
 			});
+			recorded.add(childId);
+		}
+		for (const [childId, daemonChild] of daemonChildren) {
+			if (
+				recorded.has(childId) ||
+				this._deletingRlmChildren.has(childId) ||
+				this._deletedRlmChildIds.has(childId) ||
+				this._retryableRlmSubagentDeletions.has(childId) ||
+				!daemonChild.sessionDir
+			) {
+				continue;
+			}
+			subagents.push({
+				rlm_child_id: childId,
+				active_session_id: null,
+				session_id: daemonChild.sessionId,
+				session_name: daemonChild.sessionName ?? createDefaultRlmSubagentSessionName("", childId),
+				session_dir: daemonChild.sessionDir,
+				status: "completed",
+			});
 		}
 		return { subagents };
 	}
@@ -8777,8 +8804,11 @@ export class AgentSession {
 		);
 	}
 
-	private _resolveDirectRlmSubagent(target: string): RlmSubagentRegistryEntry {
-		const candidates = [...this.listRlmSubagents().subagents, ...this._retryableRlmSubagentDeletions.values()];
+	private async _resolveDirectRlmSubagent(target: string): Promise<RlmSubagentRegistryEntry> {
+		const candidates = [
+			...(await this.listRlmSubagents()).subagents,
+			...this._retryableRlmSubagentDeletions.values(),
+		];
 		const matches = candidates.filter((entry) => this._rlmSubagentMatchesTarget(entry, target));
 		if (matches.length === 0) {
 			throw new Error(`No direct RLM subagent matches "${target}" in the current parent session`);
@@ -8789,28 +8819,77 @@ export class AgentSession {
 		return matches[0]!;
 	}
 
-	/** Delete a running or retained direct child selected from this parent session's registry. */
+	/** Delete a running, retained, or passive direct child selected from this parent session's registry. */
 	async deleteRlmSubagent(target: string): Promise<RlmDeleteSubagentResult> {
 		const inFlight = [...this._deletingRlmChildren.values()].filter(({ subagent }) =>
 			this._rlmSubagentMatchesTarget(subagent, target),
 		);
-		const directMatches = [
-			...this.listRlmSubagents().subagents,
+		if (inFlight.length > 1) {
+			throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
+		}
+
+		// Running and retained children can be reserved synchronously. This keeps
+		// them hidden immediately while the async daemon listing checks for a
+		// conflicting passive selector.
+		const localMatches = [
+			...this._buildRlmSubagentList().subagents,
 			...this._retryableRlmSubagentDeletions.values(),
 		].filter((entry) => this._rlmSubagentMatchesTarget(entry, target));
 		const matchingChildIds = new Set([
 			...inFlight.map(({ subagent }) => subagent.rlm_child_id),
-			...directMatches.map((subagent) => subagent.rlm_child_id),
+			...localMatches.map((subagent) => subagent.rlm_child_id),
 		]);
-		if (matchingChildIds.size > 1) {
+		if (matchingChildIds.size > 1 || localMatches.length > 1) {
 			throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
 		}
 		if (inFlight[0]) {
 			return inFlight[0].promise;
 		}
+		if (localMatches[0]) {
+			const subagent = localMatches[0];
+			const deletion = (async () => {
+				const listedAgents = await this._agentMessageController?.listAgents();
+				const listedSubagents = this._buildRlmSubagentList(listedAgents).subagents;
+				const passiveMatches = listedSubagents.filter(
+					(entry) => entry.rlm_child_id !== subagent.rlm_child_id && this._rlmSubagentMatchesTarget(entry, target),
+				);
+				if (passiveMatches.length > 0) {
+					throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
+				}
+				const parentActiveSessionId = listedAgents?.current?.activeSessionId;
+				const daemonChild = listedAgents?.agents.find(
+					(agent) =>
+						agent.rlmChildId === subagent.rlm_child_id && agent.parentActiveSessionId === parentActiveSessionId,
+				);
+				const resolvedSubagent = daemonChild
+					? {
+							...subagent,
+							active_session_id: daemonChild.activeSessionId,
+							session_id: daemonChild.sessionId,
+							session_name: daemonChild.sessionName ?? subagent.session_name,
+						}
+					: subagent;
+				return this._deleteResolvedRlmSubagent(resolvedSubagent);
+			})();
+			return this._trackRlmSubagentDeletion(subagent, deletion);
+		}
 
-		const subagent = directMatches[0] ?? this._resolveDirectRlmSubagent(target);
-		const deletion = this._deleteResolvedRlmSubagent(subagent);
+		const directMatches = [
+			...(await this.listRlmSubagents()).subagents,
+			...this._retryableRlmSubagentDeletions.values(),
+		].filter((entry) => this._rlmSubagentMatchesTarget(entry, target));
+		const directChildIds = new Set(directMatches.map((subagent) => subagent.rlm_child_id));
+		if (directChildIds.size > 1) {
+			throw new Error(`RLM subagent selector "${target}" is ambiguous in the current parent session`);
+		}
+		const subagent = directMatches[0] ?? (await this._resolveDirectRlmSubagent(target));
+		return this._trackRlmSubagentDeletion(subagent, this._deleteResolvedRlmSubagent(subagent));
+	}
+
+	private async _trackRlmSubagentDeletion(
+		subagent: RlmSubagentRegistryEntry,
+		deletion: Promise<RlmDeleteSubagentResult>,
+	): Promise<RlmDeleteSubagentResult> {
 		this._deletingRlmChildren.set(subagent.rlm_child_id, { subagent, promise: deletion });
 		try {
 			return await deletion;
@@ -8821,11 +8900,11 @@ export class AgentSession {
 		}
 	}
 
-	private _deleteRlmSubagentSession(childId: string, session: AgentSession): Promise<void> {
+	private _deleteRlmSubagentSession(childId: string, session?: AgentSession): Promise<void> {
 		if (this._subagentRuntimeHost) {
 			return this._subagentRuntimeHost.deleteRlmSubagentRuntime(childId, session);
 		}
-		return session.disposeAsync();
+		return session?.disposeAsync() ?? Promise.resolve();
 	}
 
 	private _removeRlmSubagentTracking(childId: string, run?: RlmChildRun): void {
@@ -8918,20 +8997,18 @@ export class AgentSession {
 		this._emitRlmSubagentRemoval(subagent);
 
 		const retained = this._retainedRlmChildSessions.get(childId);
-		if (retained) {
-			try {
-				await this._deleteRlmSubagentSession(childId, retained);
-			} catch (error) {
-				if (this._disposed || this._disposing) {
-					this._removeRlmSubagentTracking(childId);
-					void retained.disposeAsync().catch(() => undefined);
-				} else {
-					// Hide failed cleanup from the public registry while preserving the
-					// original selector and session for an explicit retry.
-					this._retryableRlmSubagentDeletions.set(childId, subagent);
-				}
-				throw error;
+		try {
+			await this._deleteRlmSubagentSession(childId, retained);
+		} catch (error) {
+			if (this._disposed || this._disposing) {
+				this._removeRlmSubagentTracking(childId);
+				void retained?.disposeAsync().catch(() => undefined);
+			} else {
+				// Hide failed cleanup from the public registry while preserving the
+				// original selector and any retained session for an explicit retry.
+				this._retryableRlmSubagentDeletions.set(childId, subagent);
 			}
+			throw error;
 		}
 		this._deletedRlmChildIds.add(childId);
 		this._removeRlmSubagentTracking(childId);
@@ -9023,8 +9100,8 @@ export class AgentSession {
 		return false;
 	}
 
-	private _assertRlmSubagentSessionNameAvailable(name: string): void {
-		if (this._pendingRlmSubagentSessionNames.has(name)) {
+	private async _assertRlmSubagentSessionNameAvailable(name: string, ignorePendingReservation = false): Promise<void> {
+		if (!ignorePendingReservation && this._pendingRlmSubagentSessionNames.has(name)) {
 			throw new Error(`RLM subagent session name "${name}" is already in use`);
 		}
 		const conflictsWithSelector = (endpoint: {
@@ -9057,7 +9134,7 @@ export class AgentSession {
 				throw new Error(`RLM subagent session name "${name}" is already in use`);
 			}
 		}
-		const listedAgents = this._agentMessageController?.listAgents();
+		const listedAgents = await this._agentMessageController?.listAgents();
 		if (
 			listedAgents &&
 			((listedAgents.current ? conflictsWithSelector(listedAgents.current) : false) ||
@@ -9134,11 +9211,16 @@ export class AgentSession {
 			);
 		}
 		if (requestedSessionName) {
-			this._assertRlmSubagentSessionNameAvailable(requestedSessionName);
+			if (this._pendingRlmSubagentSessionNames.has(requestedSessionName)) {
+				throw new Error(`RLM subagent session name "${requestedSessionName}" is already in use`);
+			}
 			this._pendingRlmSubagentSessionNames.add(requestedSessionName);
 		}
 		let modelSelection: RlmSubagentModelSelection;
 		try {
+			if (requestedSessionName) {
+				await this._assertRlmSubagentSessionNameAvailable(requestedSessionName, true);
+			}
 			modelSelection = await this._resolveRlmSubagentModel(requestedModel);
 		} finally {
 			if (requestedSessionName) {
@@ -9153,7 +9235,7 @@ export class AgentSession {
 		const childNodeId = basename(childSessionDir);
 		const sessionName = requestedSessionName ?? createDefaultRlmSubagentSessionName(prompt, childNodeId);
 		if (!requestedSessionName) {
-			this._assertRlmSubagentSessionNameAvailable(sessionName);
+			await this._assertRlmSubagentSessionNameAvailable(sessionName);
 		}
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();

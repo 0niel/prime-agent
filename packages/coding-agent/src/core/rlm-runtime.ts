@@ -60,7 +60,7 @@ export interface RlmFindModelsResult {
 }
 
 export type RlmRunHandler = (request: RlmRunRequest) => Promise<RlmRunResult>;
-export type RlmListSubagentsHandler = () => RlmListSubagentsResult;
+export type RlmListSubagentsHandler = () => RlmListSubagentsResult | Promise<RlmListSubagentsResult>;
 export type RlmDeleteSubagentHandler = (target: string) => Promise<RlmDeleteSubagentResult>;
 export type RlmFindModelsHandler = (query: string, limit: number) => RlmFindModelsResult | Promise<RlmFindModelsResult>;
 
@@ -188,7 +188,7 @@ export function createRlmFindModelsHostHandler(handler: RlmFindModelsHandler): H
 /** Expose the current parent session's RLM child registry to its kernel. */
 export function createRlmListSubagentsHostHandler(handler: RlmListSubagentsHandler): HostRequestHandler {
 	return async () => {
-		const { subagents } = handler();
+		const { subagents } = await handler();
 		return { subagents };
 	};
 }
@@ -237,8 +237,8 @@ export type RlmSubagentReleaseStatus = "done" | "error" | "cancelled";
 
 export interface SubagentRuntimeHost {
 	createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime>;
-	/** Close the host-owned child identified by childId; session may predate an in-child session replacement. */
-	deleteRlmSubagentRuntime(childId: string, session: AgentSession): Promise<void>;
+	/** Close or remove the host-owned child; session is absent when a persisted child is still passive. */
+	deleteRlmSubagentRuntime(childId: string, session?: AgentSession): Promise<void>;
 	releaseRlmSubagentRuntime?(
 		runtime: RlmSubagentRuntime,
 		options: CreateRlmSubagentRuntimeOptions,

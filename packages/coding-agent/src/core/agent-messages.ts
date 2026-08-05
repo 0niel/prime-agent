@@ -34,6 +34,7 @@ export interface AgentSessionMessageAgentSummary extends AgentSessionMessageEndp
 	unfinishedActionCount: number;
 	parentActiveSessionId?: string;
 	rlmChildId?: string;
+	sessionDir?: string;
 }
 
 export interface AgentSessionMessageListResult {
@@ -85,7 +86,7 @@ export interface AgentSessionMessageSendInput {
 }
 
 export interface AgentSessionMessageController {
-	listAgents(): AgentSessionMessageListResult;
+	listAgents(): AgentSessionMessageListResult | Promise<AgentSessionMessageListResult>;
 	sendAgentMessage(input: AgentSessionMessageSendInput): Promise<AgentSessionMessageReceipt>;
 }
 
@@ -305,7 +306,7 @@ export function createAgentMessageHostHandlers(
 	controller: AgentSessionMessageController,
 ): Record<string, HostRequestHandler> {
 	return {
-		"agent_message.list": async () => controller.listAgents() as unknown as Record<string, unknown>,
+		"agent_message.list": async () => (await controller.listAgents()) as unknown as Record<string, unknown>,
 		"agent_message.send": async (payload) => {
 			if (typeof payload.target !== "string") {
 				throw new Error("agent_message.send target must be a string");

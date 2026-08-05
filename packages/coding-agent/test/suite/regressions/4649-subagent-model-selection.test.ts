@@ -44,7 +44,7 @@ describe("ENG-4649 subagent model selection", () => {
 				model: `${provider}/model-319`,
 			});
 
-			const childEntry = harness.session.listRlmSubagents().subagents[0];
+			const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
 			const child = harness.session.getRlmChildSession(childEntry!.rlm_child_id);
 			expect(child?.model?.id).toBe("model-319");
 			expect(result.model).toBe(`${provider}/model-319`);
@@ -220,7 +220,7 @@ describe("ENG-4649 subagent model selection", () => {
 
 			await expect(run).rejects.toThrow("parent session has been disposed");
 			expect(providerCalls).toBe(0);
-			expect(harness.session.listRlmSubagents().subagents).toEqual([]);
+			expect((await harness.session.listRlmSubagents()).subagents).toEqual([]);
 		} finally {
 			releasePreflight();
 			harness.cleanup();
@@ -273,7 +273,7 @@ describe("ENG-4649 subagent model selection", () => {
 				name: "api-reviewer",
 				model: `${provider}/child-model`,
 			});
-			const childEntry = harness.session.listRlmSubagents().subagents[0];
+			const childEntry = (await harness.session.listRlmSubagents()).subagents[0];
 			expect(childEntry?.status).toBe("completed");
 			const child = harness.session.getRlmChildSession(childEntry!.rlm_child_id);
 			expect(child?.model?.id).toBe("child-model");
@@ -392,8 +392,8 @@ describe("ENG-4649 subagent model selection", () => {
 			expect(failedPreflight.model).toBe(`${provider}/parent-model`);
 			expect(failedPreflight.warning).toContain("failed authentication preflight");
 
-			expect(harness.session.listRlmSubagents().subagents).toHaveLength(4);
-			for (const child of harness.session.listRlmSubagents().subagents) {
+			expect((await harness.session.listRlmSubagents()).subagents).toHaveLength(4);
+			for (const child of (await harness.session.listRlmSubagents()).subagents) {
 				expect(harness.session.getRlmChildSession(child.rlm_child_id)?.model?.id).toBe("parent-model");
 			}
 		} finally {

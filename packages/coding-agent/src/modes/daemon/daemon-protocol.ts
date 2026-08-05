@@ -51,9 +51,9 @@ import type { SessionSummary } from "./daemon-session-list.js";
 export const DAEMON_PROTOCOL_NAME = "prime-agent.daemon";
 export const DAEMON_PROTOCOL_VERSION = 7;
 export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
-// Revision 8 publishes literal session-action queues and activity separately.
-export const DAEMON_SCHEMA_REVISION = 8;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-8-b56e29842cfa";
+// Revision 9 publishes persisted RLM spawn depth on passive session rows.
+export const DAEMON_SCHEMA_REVISION = 9;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-9-b56e29842cfa";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
