@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed daemon startup crashes hiding their exit status and daemon log until the startup timeout.
+
 ## [0.6.0] - 2026-08-04
 
 ### Breaking Changes

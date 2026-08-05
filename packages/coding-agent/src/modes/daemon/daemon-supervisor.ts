@@ -709,6 +709,7 @@ export class DaemonSupervisor {
 			this.markReady();
 		} catch (error) {
 			const startupError = error instanceof Error ? error : new Error(String(error));
+			this.log(`Daemon supervisor startup failed: ${startupError.stack ?? startupError.message}`);
 			await this.cleanupSupervisorResources();
 			this.rejectReady(startupError);
 			throw startupError;
