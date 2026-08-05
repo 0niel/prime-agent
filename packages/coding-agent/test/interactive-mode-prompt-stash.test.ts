@@ -453,6 +453,7 @@ describe("InteractiveMode prompt stash", () => {
 			streamingBehavior: "steer",
 			queueIfBusy: true,
 			images: [],
+			source: "interactive",
 		});
 		expect(mode.editor.addToHistory).toHaveBeenCalledWith("temporary prompt");
 		expect(mode.promptStash).toBeUndefined();
@@ -471,6 +472,7 @@ describe("InteractiveMode prompt stash", () => {
 				streamingBehavior: "steer",
 				queueIfBusy: true,
 				images: [],
+				source: "interactive",
 			});
 		}
 	});
@@ -711,6 +713,7 @@ describe("InteractiveMode prompt stash", () => {
 			streamingBehavior: "followUp",
 			queueIfBusy: true,
 			images: [],
+			source: "interactive",
 		});
 		expect(mode.showError).toHaveBeenCalledWith("send failed");
 		expect(mode.editor.getText()).toBe("quick follow-up");

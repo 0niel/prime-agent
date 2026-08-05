@@ -1096,6 +1096,8 @@ export class AgentSession {
 		queuedCount: 0,
 		steering: [],
 		followUps: [],
+		revision: 0,
+		items: [],
 	};
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
