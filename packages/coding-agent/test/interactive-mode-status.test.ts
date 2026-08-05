@@ -762,12 +762,45 @@ describe("InteractiveMode submit handling", () => {
 				reset: vi.fn(),
 			},
 		});
-		Object.assign(fakeThis, { changeSelectedPendingMessage: vi.fn(() => mutation) });
+		Object.assign(fakeThis, { editorChangeGeneration: 0, changeSelectedPendingMessage: vi.fn(() => mutation) });
 		const submission = fakeThis.defaultEditor.onSubmit!("edited");
 		editorText = "newer editor";
+		Object.assign(fakeThis, { editorChangeGeneration: 1 });
 		resolveMutation("obsolete");
 		await submission;
 		expect(editorText).toBe("newer editor");
+	});
+
+	test("recalled Enter restores submitted text after an obsolete response when it still owns the editor", async () => {
+		let editorText = "";
+		let resolveMutation!: (outcome: "obsolete") => void;
+		const firstMutation = new Promise<"obsolete">((resolve) => {
+			resolveMutation = resolve;
+		});
+		const change = vi
+			.fn()
+			.mockImplementationOnce(() => firstMutation)
+			.mockResolvedValueOnce("retained");
+		const fakeThis = createSubmitHandlerHarness({
+			editor: {
+				getText: () => editorText,
+				setText: (value: string) => {
+					editorText = value;
+				},
+			},
+			pendingMessageNavigation: {
+				selected: { lane: "followUp", index: 0 },
+				reset: vi.fn(),
+			},
+		});
+		Object.assign(fakeThis, { editorChangeGeneration: 0, changeSelectedPendingMessage: change });
+		const submission = fakeThis.defaultEditor.onSubmit!("edited");
+		resolveMutation("obsolete");
+		await submission;
+		expect(editorText).toBe("edited");
+		await fakeThis.defaultEditor.onSubmit!(editorText);
+		expect(change).toHaveBeenNthCalledWith(2, "steer", "edited");
+		expect(change).not.toHaveBeenCalledWith("delete");
 	});
 
 	test.each([

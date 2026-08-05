@@ -4623,6 +4623,14 @@ export class InteractiveMode {
 					try {
 						const outcome = await this.changeSelectedPendingMessage("steer", text);
 						if (outcome === "applied") this.editor.addToHistory?.(text);
+						else if (
+							outcome === "obsolete" &&
+							submissionGeneration === this.inputSubmissionGeneration &&
+							recalledEditorGeneration === this.editorChangeGeneration &&
+							this.editor.getText().length === 0
+						) {
+							this.setEditorFromPendingNavigation(text);
+						}
 					} catch (error) {
 						if (
 							submissionGeneration === this.inputSubmissionGeneration &&
