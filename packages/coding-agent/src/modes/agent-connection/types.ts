@@ -506,7 +506,6 @@ export interface AgentConnectionNavigateTreeResult {
 export interface AgentConnectionUserMessage {
 	entryId: string;
 	text: string;
-	hasImages?: boolean;
 }
 
 export type AgentConnectionQueueLane = "steering" | "followUp";

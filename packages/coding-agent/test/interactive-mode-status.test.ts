@@ -861,7 +861,7 @@ describe("InteractiveMode submit handling", () => {
 
 	test.each([
 		["plain text", [], "clear"],
-		["keep [image #1]", undefined, "preserve"],
+		["keep [image #1]", undefined, "preserve unresolved marker or non-vision model"],
 		["replace [image #1]", [{ type: "image", data: "new", mimeType: "image/png" }], "replace"],
 	] as const)("uses explicit image semantics for %s (%s)", (text, resolved, _label) => {
 		const result = Reflect.get(InteractiveMode.prototype, "queueMutationImages").call(

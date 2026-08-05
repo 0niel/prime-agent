@@ -6091,14 +6091,12 @@ export class AgentSession {
 		lane: "steering" | "followUp";
 		index: number;
 		text: string;
-		hasImages?: boolean;
 	}> {
 		const result: Array<{
 			id: string;
 			lane: "steering" | "followUp";
 			index: number;
 			text: string;
-			hasImages?: boolean;
 		}> = [];
 		for (const [delivery, lane] of [
 			["next_turn_boundary", "steering"],
@@ -6117,7 +6115,6 @@ export class AgentSession {
 						lane,
 						index,
 						text: action.payload.text,
-						...(action.payload.images?.length ? { hasImages: true } : {}),
 					});
 			}
 		}

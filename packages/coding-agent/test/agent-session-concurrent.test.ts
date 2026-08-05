@@ -198,7 +198,6 @@ describe("AgentSession concurrent prompt guard", () => {
 		const staleRevision = session.queueRevision - 1;
 		const [first, second, follow] = session.getEditableQueueItems();
 		expect([first?.text, second?.text, follow?.text]).toEqual(["duplicate", "duplicate [image #1]", "follow"]);
-		expect(second?.hasImages).toBe(true);
 
 		expect(session.getSteeringMessages()).toEqual(["duplicate", "extension item", "duplicate [image #1]"]);
 		expect(session.mutateQueuedUserMessage(second!.id, staleRevision, { type: "delete" })).toBe(false);
