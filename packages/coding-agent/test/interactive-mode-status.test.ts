@@ -2439,7 +2439,7 @@ describe("InteractiveMode model selection persistence", () => {
 		expect(fakeThis.getCachedModelCandidates()).toEqual([scopedModel, catalogModel]);
 		await expect(fakeThis.findExactModelMatch("catalog")).resolves.toEqual(catalogModel);
 
-		getSelector().handleInput("\x1b[Z");
+		getSelector().handleInput("\x1bs");
 		expect(getSelector().render(120).join("\n")).toContain("catalog");
 		expect(getAvailableModels).not.toHaveBeenCalled();
 		getSelector().handleInput("\t");

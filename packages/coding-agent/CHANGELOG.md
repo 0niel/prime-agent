@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added reverse tab navigation to the `/login` configuration menu and moved the model scope shortcut to `Alt+S`.
 - Fixed daemon startup crashes hiding their exit status and daemon log until the startup timeout.
 
 ## [0.6.0] - 2026-08-04
