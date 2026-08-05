@@ -2,8 +2,18 @@
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-05
+
+### Breaking Changes
+
+- Changed agent messages to always use steering delivery and removed delivery-mode options from the Python, CLI, RPC, and connection APIs. Code passing `mode` to `agent_message.send`, or a delivery mode over the CLI/RPC, must drop it.
+
+### Changed
+
 - Changed self-updates to report the previous and new Prime Agent versions.
-- Changed agent messages to always use steering delivery and removed delivery-mode options from the Python, CLI, RPC, and connection APIs.
+
+### Fixed
+
 - Fixed the subagent summary showing retained children as idle while they run follow-up work.
 
 ## [0.6.1] - 2026-08-05
