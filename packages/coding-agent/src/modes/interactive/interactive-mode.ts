@@ -4593,7 +4593,11 @@ export class InteractiveMode {
 			text = text.trim();
 			if (!text) {
 				if (recalledPendingMessage) {
-					await this.changeSelectedPendingMessage("delete");
+					try {
+						await this.changeSelectedPendingMessage("delete");
+					} catch (error) {
+						this.showError(error instanceof Error ? error.message : String(error));
+					}
 				}
 				return;
 			}
@@ -7025,11 +7029,15 @@ export class InteractiveMode {
 								images: this.queueMutationImages(text),
 							};
 		const editorGeneration = this.editorChangeGeneration;
+		const queueEventGeneration = this.queueEventGeneration;
+		const connectionQueue = this.connectionQueue;
 		let result: AgentConnectionQueueMutationResult;
 		try {
 			result = await this.agentConnection.mutateQueueItem(selected.id, checkpoint.queue?.revision ?? -1, mutation);
 		} catch (error) {
-			this.pendingMessageNavigation.restore(checkpoint);
+			if (this.queueEventGeneration === queueEventGeneration && this.connectionQueue === connectionQueue) {
+				this.pendingMessageNavigation.restore(checkpoint);
+			}
 			throw error;
 		}
 		if ((result.queue.revision ?? -1) < (this.connectionQueue.revision ?? -1)) {

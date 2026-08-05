@@ -730,6 +730,19 @@ describe("InteractiveMode submit handling", () => {
 		expect(changeSelectedPendingMessage).toHaveBeenCalledWith(expected, ...(expected === "delete" ? [] : ["edited"]));
 	});
 
+	test("observes an empty recalled delete rejection and reports it", async () => {
+		const fakeThis = createSubmitHandlerHarness({
+			pendingMessageNavigation: { selected: { lane: "followUp", index: 0 }, reset: vi.fn() },
+		});
+		Object.assign(fakeThis, {
+			changeSelectedPendingMessage: vi.fn(async () => {
+				throw new Error("delete failed");
+			}),
+		});
+		await expect(fakeThis.defaultEditor.onSubmit!("   ")).resolves.toBeUndefined();
+		expect(fakeThis.showError).toHaveBeenCalledWith("delete failed");
+	});
+
 	test("recalled Enter leaves newer editor ownership intact after an obsolete response", async () => {
 		let editorText = "";
 		let resolveMutation!: (outcome: "obsolete") => void;
@@ -880,6 +893,42 @@ describe("InteractiveMode submit handling", () => {
 		expect(navigation.draftText).toBe("original draft");
 		expect(editorText).toBe("f2 edited");
 		expect(navigation.browse(fakeThis.connectionQueue, editorText, 1)).toBe("f3 edited");
+	});
+
+	test("does not resurrect navigation checkpoint when mutation rejects after a newer queue event", async () => {
+		const navigation = new PendingMessageNavigation();
+		const initial = {
+			steering: [],
+			followUp: ["selected"],
+			revision: 4,
+			items: [{ id: "selected", lane: "followUp" as const, index: 0, text: "selected" }],
+		};
+		navigation.select(initial, "draft", initial.items[0]!);
+		let rejectMutation!: (error: Error) => void;
+		const response = new Promise<never>((_resolve, reject) => {
+			rejectMutation = reject;
+		});
+		const fakeThis = {
+			editor: { getText: () => "edited" },
+			editorChangeGeneration: 0,
+			queueEventGeneration: 1,
+			pendingMessageNavigation: navigation,
+			connectionQueue: initial,
+			agentConnection: { mutateQueueItem: vi.fn(() => response) },
+			queueMutationImages: () => [],
+		};
+		const mutation = Reflect.get(InteractiveMode.prototype, "applySelectedPendingMessageChange").call(
+			fakeThis,
+			"followUp",
+			"edited",
+		);
+		fakeThis.connectionQueue = { steering: [], followUp: [], revision: 5, items: [] };
+		fakeThis.queueEventGeneration++;
+		navigation.reset();
+		rejectMutation(new Error("transport failed"));
+		await expect(mutation).rejects.toThrow("transport failed");
+		expect(navigation.selected).toBeUndefined();
+		expect(navigation.draftText).toBe("");
 	});
 
 	test.each([
