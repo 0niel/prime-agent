@@ -103,6 +103,10 @@ export class InProcessAgentConnection implements AgentConnection {
 		await this.bindCurrentSessionExtensions();
 	}
 
+	async extendTemporarySkills(skillPaths: string[], source: string): Promise<void> {
+		this.runtimeHost.session.extendTemporarySkills(skillPaths, source);
+	}
+
 	subscribe(listener: AgentConnectionEventListener): () => void {
 		this.listeners.add(listener);
 		return () => {

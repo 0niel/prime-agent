@@ -23,12 +23,11 @@ describe("ACP MCP servers", () => {
 	it("advertises HTTP support and configures session/new servers", async () => {
 		const harness = await createHarness();
 		const connection = new InProcessAgentConnection(runtimeHostFor(harness.session));
+		const extendTemporarySkills = vi.spyOn(connection, "extendTemporarySkills");
 		const toAgent = new TransformStream<Uint8Array, Uint8Array>();
 		const toClient = new TransformStream<Uint8Array, Uint8Array>();
-		const configureMcpServers = vi.fn();
 		const modeDone = runAcpModeWithConnection(connection, {
 			stream: acp.ndJsonStream(toClient.writable, toAgent.readable),
-			configureMcpServers,
 		});
 		const handle = acp
 			.client({ name: "mcp-test-client" })
@@ -50,7 +49,7 @@ describe("ACP MCP servers", () => {
 			cwd: harness.tempDir,
 			mcpServers: [server],
 		});
-		expect(configureMcpServers).toHaveBeenCalledWith([server]);
+		expect(extendTemporarySkills).toHaveBeenCalledOnce();
 
 		handle.close();
 		await toAgent.writable.close().catch(() => undefined);
@@ -72,7 +71,7 @@ describe("ACP MCP servers", () => {
 			const harness = await createHarness({ resourceLoader });
 			const installer = new AcpMcpSkillInstaller(harness.session);
 			try {
-				installer.configure([
+				await installer.configure([
 					{
 						type: "http",
 						name: "remote-tools",

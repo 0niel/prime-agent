@@ -232,15 +232,9 @@ async function turnFailure(connection: AgentConnection, boundary: TurnBoundary):
 
 export async function runAcpMode(runtimeHost: AgentSessionRuntime): Promise<never> {
 	const connection = new InProcessAgentConnection(runtimeHost);
-	const mcp = new AcpMcpSkillInstaller(runtimeHost.session);
-	try {
-		return await runAcpModeWithConnection(connection, {
-			bindHeadlessExtensions: () => connection.bindHeadlessExtensions({}),
-			configureMcpServers: (servers) => mcp.configure(servers),
-		});
-	} finally {
-		mcp.dispose();
-	}
+	return runAcpModeWithConnection(connection, {
+		bindHeadlessExtensions: () => connection.bindHeadlessExtensions({}),
+	});
 }
 
 export async function runAcpModeWithConnection(
@@ -251,6 +245,12 @@ export async function runAcpModeWithConnection(
 	if (options.ownStdout !== false && !options.stream) {
 		takeOverStdout();
 	}
+	const mcp = connection.extendTemporarySkills
+		? new AcpMcpSkillInstaller({
+				extendTemporarySkills: (skillPaths, source) => connection.extendTemporarySkills!(skillPaths, source),
+			})
+		: undefined;
+	const configureMcpServers = options.configureMcpServers ?? (mcp ? (servers) => mcp.configure(servers) : undefined);
 
 	// One ACP connection drives one AgentConnection, whose newSession() replaces
 	// the live session rather than creating a parallel one. Tracking a single
@@ -287,17 +287,17 @@ export async function runAcpModeWithConnection(
 				);
 			}
 			const params = ctx.params as acp.NewSessionRequest;
-			if (params.mcpServers.length > 0) {
-				if (!options.configureMcpServers) {
-					throw acp.RequestError.invalidParams({ reason: "MCP servers are unavailable in this ACP host" });
-				}
-				await options.configureMcpServers(params.mcpServers);
-			}
 			if (!bound) {
 				// Only latch after a successful bind: a rejected bind must not leave
 				// extensions permanently unavailable for the rest of the process.
 				await options.bindHeadlessExtensions?.();
 				bound = true;
+			}
+			if (params.mcpServers.length > 0) {
+				if (!configureMcpServers) {
+					throw acp.RequestError.invalidParams({ reason: "MCP servers are unavailable in this ACP host" });
+				}
+				await configureMcpServers(params.mcpServers);
 			}
 			// prime-agent's cwd is fixed at startup by the session it was launched
 			// with, so a client-supplied cwd cannot be adopted after the fact.
@@ -437,6 +437,7 @@ export async function runAcpModeWithConnection(
 	session?.unsubscribe?.();
 	session = undefined;
 	await connection.dispose().catch(() => undefined);
+	mcp?.dispose();
 	// Only the real stdio entrypoint owns the process; a caller-supplied transport
 	// (tests, embedding) must never have its host exited from under it.
 	if (options.stream) return undefined as never;

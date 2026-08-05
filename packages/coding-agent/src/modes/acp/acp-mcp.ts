@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
-import type { AgentSession } from "../../core/agent-session.js";
+
+interface TemporarySkillHost {
+	extendTemporarySkills(skillPaths: string[], source: string): Promise<void> | void;
+}
 
 type AcpMcpServerConfig =
 	| { type: "http"; url: string; headers: Record<string, string> }
@@ -134,9 +137,9 @@ packages = ["src/acp_mcp"]
 export class AcpMcpSkillInstaller {
 	private root: string | undefined;
 
-	constructor(private readonly session: AgentSession) {}
+	constructor(private readonly host: TemporarySkillHost) {}
 
-	configure(servers: readonly McpServer[]): void {
+	async configure(servers: readonly McpServer[]): Promise<void> {
 		if (servers.length === 0) return;
 		const config = resolveServers(servers);
 		this.root ??= mkdtempSync(join(tmpdir(), "prime-agent-acp-mcp-"));
@@ -147,7 +150,7 @@ export class AcpMcpSkillInstaller {
 		writeFileSync(join(skillDir, "pyproject.toml"), PYPROJECT, { encoding: "utf-8", mode: 0o600 });
 		writeFileSync(join(packageDir, "__init__.py"), pythonModule(config), { encoding: "utf-8", mode: 0o600 });
 		const source = `acp:${createHash("sha256").update(JSON.stringify(config)).digest("hex").slice(0, 12)}`;
-		this.session.extendTemporarySkills([join(skillDir, "SKILL.md")], source);
+		await this.host.extendTemporarySkills([join(skillDir, "SKILL.md")], source);
 	}
 
 	dispose(): void {

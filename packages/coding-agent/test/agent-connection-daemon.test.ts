@@ -180,6 +180,8 @@ class FakeDaemonClient {
 						},
 					},
 				};
+			case "extend_temporary_skills":
+				return { type: "response", command: command.type, success: true };
 			case "get_model_catalog":
 				return {
 					type: "response",
@@ -2308,6 +2310,21 @@ describe("DaemonAgentConnection", () => {
 		expect(fakeClient.requests[1]).toMatchObject({
 			type: "get_resource_snapshot",
 			activeSessionId: "active-1",
+		});
+	});
+
+	it("extends temporary skills through the daemon protocol", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await connection.extendTemporarySkills(["/tmp/acp-mcp/SKILL.md"], "acp:test");
+
+		expect(fakeClient.requests[1]).toMatchObject({
+			type: "extend_temporary_skills",
+			activeSessionId: "active-1",
+			skillPaths: ["/tmp/acp-mcp/SKILL.md"],
+			source: "acp:test",
 		});
 	});
 

@@ -57,7 +57,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 12 publishes idle-residency metadata on session summary rows.
 // Revision 13 narrows agent-origin reach and roster wire shapes to the nuclear family.
 export const DAEMON_SCHEMA_REVISION = 13;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-13-816309b1cd50";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-13-a013caa216af";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -502,6 +502,13 @@ export type DaemonCommand =
 	| { id?: string; type: "get_context_tree"; activeSessionId: string }
 	| { id?: string; type: "get_commands"; activeSessionId: string }
 	| { id?: string; type: "get_resource_snapshot"; activeSessionId: string }
+	| {
+			id?: string;
+			type: "extend_temporary_skills";
+			activeSessionId: string;
+			skillPaths: string[];
+			source: string;
+	  }
 	| { id?: string; type: "get_model_catalog"; activeSessionId: string }
 	| { id?: string; type: "get_available_models"; activeSessionId: string }
 	| { id?: string; type: "get_queue"; activeSessionId: string }
@@ -675,6 +682,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	get_context_tree: LEGACY_DAEMON_COMMAND,
 	get_commands: LEGACY_DAEMON_COMMAND,
 	get_resource_snapshot: LEGACY_DAEMON_COMMAND,
+	extend_temporary_skills: CURRENT_DAEMON_COMMAND,
 	get_model_catalog: { minProtocol: 7, capability: "model_catalog" },
 	get_available_models: LEGACY_DAEMON_COMMAND,
 	get_queue: LEGACY_DAEMON_COMMAND,

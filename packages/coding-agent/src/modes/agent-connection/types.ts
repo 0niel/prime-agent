@@ -673,6 +673,8 @@ export interface AgentConnection {
 	getToolDefinition(name: string): Promise<AgentConnectionToolDefinition | undefined>;
 	setSessionEntryLabel(entryId: string, label: string | undefined): Promise<void>;
 	respondToExtensionUiRequest(requestId: string, response: AgentConnectionExtensionUiResponse): Promise<void>;
+	/** Attach process-local Python skills before a headless session starts streaming. */
+	extendTemporarySkills?(skillPaths: string[], source: string): Promise<void>;
 
 	prompt(message: string, options?: AgentConnectionPromptOptions): Promise<void>;
 	promptAndWait(message: string, options?: AgentConnectionPromptOptions): Promise<void>;

@@ -187,6 +187,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"get_context_tree",
 	"get_commands",
 	"get_resource_snapshot",
+	"extend_temporary_skills",
 	"get_model_catalog",
 	"get_available_models",
 	"get_queue",
