@@ -3597,6 +3597,15 @@ describe("daemon mode helpers", () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-lazy-rlm-list-"));
 		try {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			// Simulate children written before rlmDepth was added to the extensible header.
+			// Their persisted registry rows remain the compatibility source after restart.
+			for (const sessionFile of [fixture.childSessionFile, fixture.grandchildSessionFile]) {
+				const lines = readFileSync(sessionFile, "utf8").split("\n");
+				const header = JSON.parse(lines[0] ?? "{}") as Record<string, unknown>;
+				delete header.rlmDepth;
+				lines[0] = JSON.stringify(header);
+				writeFileSync(sessionFile, lines.join("\n"));
+			}
 			const internals = fixture.daemon as unknown as {
 				sessions: Map<string, ActiveSessionState>;
 				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
@@ -3644,6 +3653,7 @@ describe("daemon mode helpers", () => {
 				parentActiveSessionId: parentState.activeSessionId,
 				rlmChildId: fixture.childId,
 				parentSessionPath: fixture.parentSessionFile,
+				rlmDepth: 1,
 			});
 			expect(passiveRow?.activeSessionId).toBeUndefined();
 			const nestedRow = listResponse.data.sessions.find(
@@ -3654,6 +3664,7 @@ describe("daemon mode helpers", () => {
 				runtimeKind: "subagent",
 				rlmChildId: fixture.grandchildId,
 				parentSessionPath: fixture.childSessionFile,
+				rlmDepth: 2,
 			});
 
 			const activeOnlyResponse = (await internals.handleCommand(
@@ -3714,6 +3725,40 @@ describe("daemon mode helpers", () => {
 			});
 			expect(grandchild?.parentActiveSessionId).toBeUndefined();
 			expect(fixture.createRuntime).not.toHaveBeenCalled();
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("prefers registry depth when listing a passive legacy child", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passive-legacy-depth-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const parentManager = SessionManager.open(fixture.parentSessionFile);
+			parentManager.appendMessage({ role: "user", content: "parent task", timestamp: 0 });
+			parentManager.flushNow();
+			const lines = readFileSync(fixture.childSessionFile, "utf8").split("\n");
+			const header = JSON.parse(lines[0] ?? "{}") as Record<string, unknown>;
+			delete header.rlmDepth;
+			lines[0] = JSON.stringify(header);
+			writeFileSync(fixture.childSessionFile, lines.join("\n"));
+			const registryFile = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
+			const registryEntry = JSON.parse(readFileSync(registryFile, "utf8")) as Record<string, unknown>;
+			registryEntry.rlmDepth = 5;
+			registryEntry.rlmMaxDepth = 8;
+			writeFileSync(registryFile, `${JSON.stringify(registryEntry)}\n`);
+			const parentInfo = await readSessionInfo(fixture.parentSessionFile);
+			if (!parentInfo) throw new Error("Missing parent session info");
+			const internals = fixture.daemon as unknown as {
+				buildSessionListWithPassiveRlmSubagents(
+					activeSessions: ActiveSessionState[],
+					savedSessions: SessionInfo[],
+					scheduledJobs: AgentCronJob[],
+				): Promise<SessionSummary[]>;
+			};
+
+			const sessions = await internals.buildSessionListWithPassiveRlmSubagents([], [parentInfo], []);
+			expect(sessions.find((session) => session.sessionFile === fixture.childSessionFile)?.rlmDepth).toBe(5);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -3802,6 +3847,33 @@ describe("daemon mode helpers", () => {
 			expect(
 				[...internals.sessions.values()].filter((state) => state.runtime.metadata.kind === "subagent"),
 			).toHaveLength(1);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rehydrates a legacy child with depth inferred from its session file path", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-legacy-rlm-depth-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const lines = readFileSync(fixture.childSessionFile, "utf8").split("\n");
+			const header = JSON.parse(lines[0] ?? "{}") as Record<string, unknown>;
+			delete header.rlmDepth;
+			lines[0] = JSON.stringify(header);
+			writeFileSync(fixture.childSessionFile, lines.join("\n"));
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createAgentMessageController(
+					getCurrentState: () => ActiveSessionState | undefined,
+				): AgentSessionMessageController;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+
+			await internals
+				.createAgentMessageController(() => parentState)
+				.sendAgentMessage({ target: "renamed-worker", message: "report progress" });
+
+			expect(fixture.createRuntime.mock.calls[1]?.[0].sessionOptions?.rlmDepth).toBe(1);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -6108,7 +6180,7 @@ function makePersistedRlmDaemonFixture(
 	}
 
 	const childId = "child-1";
-	const childSessionDir = join(parentArtifactDir, childId);
+	const childSessionDir = join(parentArtifactDir, "sub-1234abcd");
 	const childManager = SessionManager.create(tempDir, childSessionDir);
 	childManager.newSession({ parentSession: parentSessionFile });
 	childManager.appendSessionInfo("spawn-worker");
@@ -6121,7 +6193,8 @@ function makePersistedRlmDaemonFixture(
 		throw new Error("Missing child session paths");
 	}
 	const grandchildId = "grandchild-1";
-	const grandchildSessionDir = join(childArtifactDir, grandchildId);
+	mkdirSync(childArtifactDir, { recursive: true });
+	const grandchildSessionDir = join(childSessionDir, "sub-deadbeef");
 	const grandchildManager = SessionManager.create(tempDir, grandchildSessionDir);
 	grandchildManager.newSession({ parentSession: childSessionFile });
 	grandchildManager.appendSessionInfo("nested-worker");

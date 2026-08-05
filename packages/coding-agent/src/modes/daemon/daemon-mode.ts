@@ -99,7 +99,12 @@ import type {
 } from "../../core/rlm-runtime.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { acquireSessionLease, type SessionLease } from "../../core/session-lease.js";
-import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
+import {
+	readSessionInfo,
+	resolveSessionRlmDepth,
+	type SessionInfo,
+	SessionManager,
+} from "../../core/session-manager.js";
 import { resolveSessionPath } from "../../core/session-resolver.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import { type SideQuestionRun, startSideQuestion } from "../../core/side-question.js";
@@ -141,7 +146,6 @@ import {
 	type DaemonCommand,
 	type DaemonOutbound,
 	type DaemonResponse,
-	type DaemonSavedSessionInfo,
 	type DaemonSessionClosedReason,
 	type DaemonSessionSnapshot,
 	type DaemonUpdateRestartManifest,
@@ -186,6 +190,7 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
+import { serializeSavedSessionInfo } from "./saved-session-info.js";
 import {
 	createSnapshotTranscriptChunks,
 	SNAPSHOT_TARGET_CHUNK_BYTES,
@@ -1070,9 +1075,9 @@ export class AgentDaemon {
 					parentEntry?.sessionFile ??
 					passive.rootParentState?.runtime.session.sessionFile ??
 					passive.rootInfo?.path,
+				rlmDepth: passive.entry.rlmDepth ?? passive.info.rlmDepth,
 				rlmChildId: passive.entry.childId,
 				rlmParentNodeId: passive.entry.rlmParentNodeId ?? passive.entry.childId,
-				...(!passive.rootParentState ? { rlmDepth: passive.entry.rlmDepth } : {}),
 				spawnCode: passive.entry.spawnCode,
 			};
 		});
@@ -2146,7 +2151,10 @@ export class AgentDaemon {
 	): Promise<AgentSessionRuntime> {
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		if (options.parentSession.sessionFile) {
-			sessionManager.newSession({ parentSession: options.parentSession.sessionFile });
+			sessionManager.newSession({
+				parentSession: options.parentSession.sessionFile,
+				rlmDepth: options.rlmDepth,
+			});
 		}
 		let stateRef: ActiveSessionState | undefined;
 		// Subagents inherit the parent's client env (e.g. herdr pane identity).
@@ -2369,7 +2377,9 @@ export class AgentDaemon {
 							},
 						},
 						rlmSessionDir: entry.sessionDir,
-						rlmDepth: entry.rlmDepth ?? 1,
+						rlmDepth: existsSync(entry.sessionFile)
+							? resolveSessionRlmDepth(sessionManager.getHeader() ?? {}, entry.sessionFile)
+							: undefined,
 						rlmMaxDepth: entry.rlmMaxDepth ?? 1,
 						rlmParentNodeId: entry.rlmParentNodeId ?? entry.childId,
 					},
@@ -5583,23 +5593,6 @@ function hasDaemonOutboundActiveSessionId(
 	message: DaemonOutbound,
 ): message is DaemonOutbound & { activeSessionId: string } {
 	return "activeSessionId" in message && typeof message.activeSessionId === "string";
-}
-
-function serializeSavedSessionInfo(session: SessionInfo): DaemonSavedSessionInfo {
-	return {
-		path: session.path,
-		id: session.id,
-		cwd: session.cwd,
-		name: session.name,
-		state: session.state,
-		parentSessionPath: session.parentSessionPath,
-		created: session.created.toISOString(),
-		modified: session.modified.toISOString(),
-		messageCount: session.messageCount,
-		firstMessage: session.firstMessage,
-		allMessagesText: session.allMessagesText,
-		agentStatus: session.agentStatus,
-	};
 }
 
 export function getChildActiveSessionStates(

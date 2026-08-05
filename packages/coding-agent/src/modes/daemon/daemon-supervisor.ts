@@ -56,7 +56,6 @@ import {
 	type DaemonCommand,
 	type DaemonOutbound,
 	type DaemonResponse,
-	type DaemonSavedSessionInfo,
 	type DaemonUpdateRestartManifest,
 	failure,
 	isDaemonCommandEnvelope,
@@ -100,6 +99,7 @@ import {
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
+import { serializeSavedSessionInfo } from "./saved-session-info.js";
 import { SNAPSHOT_TARGET_CHUNK_BYTES, SnapshotTranscriptCache } from "./snapshot-transcript-cache.js";
 import { WorkerRecoveryJournal } from "./worker-recovery-journal.js";
 
@@ -454,23 +454,6 @@ function sortCronJobs(jobs: AgentCronJob[]): AgentCronJob[] {
 		}
 		return Date.parse(left.nextRunAt) - Date.parse(right.nextRunAt);
 	});
-}
-
-function serializeSavedSessionInfo(session: SessionInfo): DaemonSavedSessionInfo {
-	return {
-		path: session.path,
-		id: session.id,
-		cwd: session.cwd,
-		name: session.name,
-		state: session.state,
-		parentSessionPath: session.parentSessionPath,
-		created: session.created.toISOString(),
-		modified: session.modified.toISOString(),
-		messageCount: session.messageCount,
-		firstMessage: session.firstMessage,
-		allMessagesText: session.allMessagesText,
-		agentStatus: session.agentStatus,
-	};
 }
 
 function descriptorKey(socketPath: string): string {

@@ -346,6 +346,21 @@ describe("buildSessionList", () => {
 			firstMessage: "Audit the retry logic for races",
 		});
 	});
+
+	it("uses runtime depth for live rows and catalog depth for saved-only rows", () => {
+		const livePath = resolve("/tmp/project/live-depth.jsonl");
+		const savedPath = resolve("/tmp/project/saved-depth.jsonl");
+		const entries = buildSessionList(
+			[makeState({ activeSessionId: "live", sessionFile: livePath, rlmDepth: 2 })],
+			[
+				makeSessionInfo({ path: livePath, id: "live", rlmDepth: 99 }),
+				makeSessionInfo({ path: savedPath, id: "saved", rlmDepth: 3 }),
+			],
+		);
+
+		expect(entries.find((entry) => entry.activeSessionId === "live")?.rlmDepth).toBe(2);
+		expect(entries.find((entry) => entry.sessionFile === savedPath)?.rlmDepth).toBe(3);
+	});
 });
 
 describe("summaryForActiveSession recap currency", () => {
@@ -568,6 +583,7 @@ interface StateOptions {
 	unfinishedActionCount?: number;
 	contextTokens?: number;
 	streamingMessage?: AgentMessage;
+	rlmDepth?: number;
 	metadata?: {
 		kind: "top-level" | "subagent";
 		createdAt: number;
@@ -602,6 +618,7 @@ function makeState(options: StateOptions): ActiveSessionState {
 				isCompacting: false,
 				sessionFile: options.sessionFile,
 				sessionId: options.sessionId ?? `session-${options.activeSessionId}`,
+				rlmDepth: options.rlmDepth ?? 0,
 				sessionName: `session ${options.activeSessionId}`,
 				sessionManager: {
 					getCwd: () => "/tmp/project",
@@ -641,6 +658,8 @@ function makeSessionInfo(overrides: Pick<SessionInfo, "path" | "id"> & Partial<S
 		cwd: "/tmp/project",
 		name: overrides.name,
 		state: overrides.state,
+		parentSessionPath: overrides.parentSessionPath,
+		rlmDepth: overrides.rlmDepth ?? 0,
 		created: new Date("2026-05-01T00:00:00.000Z"),
 		modified: new Date("2026-05-02T00:00:00.000Z"),
 		messageCount: overrides.messageCount ?? 2,

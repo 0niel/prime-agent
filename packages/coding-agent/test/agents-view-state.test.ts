@@ -1160,6 +1160,7 @@ function makeSessionInfo(overrides: Partial<SessionInfo> & { path: string; id: s
 		name: overrides.name,
 		state: overrides.state,
 		parentSessionPath: overrides.parentSessionPath,
+		rlmDepth: overrides.rlmDepth ?? 0,
 		created: overrides.created ?? new Date("2026-01-01T00:00:00Z"),
 		modified: overrides.modified ?? new Date("2026-01-01T00:00:00Z"),
 		messageCount: overrides.messageCount ?? 1,

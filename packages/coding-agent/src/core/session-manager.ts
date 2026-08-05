@@ -79,12 +79,16 @@ export interface SessionHeader {
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
+	/** RLM spawn depth. Optional for backward compatibility. Forks preserve the source depth. */
+	rlmDepth?: number;
 	git?: GitContext;
 }
 
 export interface NewSessionOptions {
 	id?: string;
 	parentSession?: string;
+	/** Explicit RLM spawn depth. An explicitly undefined value suppresses parent derivation. */
+	rlmDepth?: number;
 }
 
 export type SessionPersistListener = (sessionFile: string) => void;
@@ -291,6 +295,8 @@ export interface SessionInfo {
 	state?: SessionState;
 	/** Path to the parent session (if this session was forked). */
 	parentSessionPath?: string;
+	/** Resolved RLM spawn depth. */
+	rlmDepth: number;
 	created: Date;
 	modified: Date;
 	messageCount: number;
@@ -692,6 +698,82 @@ function readSessionHeader(filePath: string): Partial<SessionHeader> | undefined
 	return JSON.parse(firstLine) as Partial<SessionHeader>;
 }
 
+function isValidRlmDepth(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+export function resolveSessionRlmDepth(
+	header: { rlmDepth?: number; parentSession?: string },
+	sessionPath: string,
+): number {
+	return resolveLegacySessionRlmDepth(header, sessionPath, new Set()) ?? legacyChildDepthFromPath(sessionPath);
+}
+
+function resolveLegacySessionRlmDepth(
+	header: { rlmDepth?: number; parentSession?: string },
+	sessionPath: string,
+	visitedPaths: Set<string>,
+): number | undefined {
+	if (isValidRlmDepth(header.rlmDepth)) {
+		return header.rlmDepth;
+	}
+	if (!header.parentSession) {
+		return 0;
+	}
+
+	const resolvedSessionPath = resolve(sessionPath);
+	if (visitedPaths.has(resolvedSessionPath)) {
+		return undefined;
+	}
+	visitedPaths.add(resolvedSessionPath);
+
+	const pathDepth = legacyChildDepthFromPath(sessionPath);
+	const parentSessionPath = resolve(dirname(sessionPath), header.parentSession);
+	try {
+		const parentHeader = readSessionHeader(parentSessionPath);
+		if (parentHeader) {
+			const parentDepth = resolveLegacySessionRlmDepth(parentHeader, parentSessionPath, visitedPaths);
+			if (parentDepth !== undefined) {
+				return pathDepth > 0 ? parentDepth + 1 : parentDepth;
+			}
+		}
+	} catch {
+		// Fall back to artifact ancestry for unavailable or invalid legacy parents.
+	} finally {
+		visitedPaths.delete(resolvedSessionPath);
+	}
+	return pathDepth;
+}
+
+function legacyChildDepthFromPath(sessionPath: string): number {
+	let depth = 0;
+	for (const segment of dirname(sessionPath)
+		.split(/[\\/]+/)
+		.reverse()) {
+		if (!/^sub-[0-9a-f]{8}$/.test(segment)) {
+			break;
+		}
+		depth += 1;
+	}
+	return depth;
+}
+
+function deriveChildRlmDepth(parentHeader: Partial<SessionHeader> | undefined): number | undefined {
+	return isValidRlmDepth(parentHeader?.rlmDepth) ? parentHeader.rlmDepth + 1 : undefined;
+}
+
+function rootRlmDepthFromEnv(): number {
+	const value = process.env.RLM_DEPTH;
+	if (value === undefined || value === "") {
+		return 0;
+	}
+	const parsed = Number.parseInt(value, 10);
+	if (!Number.isFinite(parsed) || parsed < 0) {
+		throw new Error("RLM_DEPTH must be a non-negative integer");
+	}
+	return parsed;
+}
+
 function isValidSessionFile(filePath: string): boolean {
 	try {
 		const header = readSessionHeader(filePath);
@@ -1021,6 +1103,7 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 		if (!header) return null;
 		const cwd = typeof header.cwd === "string" ? header.cwd : "";
 		const parentSessionPath = header.parentSession;
+		const rlmDepth = resolveSessionRlmDepth(header, filePath);
 		const modified = getSessionModifiedDateFromLastActivity(lastActivityTime, header, stats.mtime);
 
 		return {
@@ -1030,6 +1113,7 @@ async function scanSessionInfo(filePath: string, stats: Awaited<ReturnType<typeo
 			name,
 			state,
 			parentSessionPath,
+			rlmDepth,
 			created: new Date(header.timestamp),
 			modified,
 			messageCount,
@@ -1161,7 +1245,12 @@ export class SessionManager {
 			const header = this.fileEntries.find((e) => e.type === "session") as SessionHeader | undefined;
 			this.sessionId = header?.id ?? createSessionId();
 
-			if (migrateToCurrentVersion(this.fileEntries)) {
+			let shouldRewrite = migrateToCurrentVersion(this.fileEntries);
+			if (header?.parentSession && !isValidRlmDepth(header.rlmDepth)) {
+				header.rlmDepth = resolveSessionRlmDepth(header, this.sessionFile);
+				shouldRewrite = true;
+			}
+			if (shouldRewrite) {
 				this._rewriteFile();
 			}
 
@@ -1177,6 +1266,15 @@ export class SessionManager {
 	newSession(options?: NewSessionOptions): string | undefined {
 		let sessionId = options?.id ?? createSessionId();
 		let sessionFile: string | undefined;
+		const hasExplicitRlmDepth = options !== undefined && Object.hasOwn(options, "rlmDepth");
+		let parentHeader: Partial<SessionHeader> | undefined;
+		if (options?.parentSession && !hasExplicitRlmDepth) {
+			try {
+				parentHeader = readSessionHeader(options.parentSession);
+			} catch {
+				// Legacy-invalid or unavailable parents leave the child depth unknown.
+			}
+		}
 		if (this.persist) {
 			if (options?.id) {
 				sessionFile = getSessionFilePath(this.getSessionDir(), sessionId);
@@ -1193,6 +1291,11 @@ export class SessionManager {
 		this.sessionId = sessionId;
 		const timestamp = new Date().toISOString();
 		const git = this.persist ? (captureGitContext(this.cwd) ?? undefined) : undefined;
+		const rlmDepth = hasExplicitRlmDepth
+			? options?.rlmDepth
+			: options?.parentSession
+				? deriveChildRlmDepth(parentHeader)
+				: rootRlmDepthFromEnv();
 		const header: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
@@ -1200,6 +1303,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.cwd,
 			parentSession: options?.parentSession,
+			rlmDepth,
 			git,
 		};
 		this.fileEntries = [header];
@@ -1305,6 +1409,7 @@ export class SessionManager {
 		if (!existsSync(dir)) {
 			mkdirSync(dir, { recursive: true });
 		}
+		const previousHeader = this.getHeader();
 		const target = createUniqueSessionFileTarget(dir);
 		this.sessionDir = dir;
 		this.sessionId = target.sessionId;
@@ -1318,6 +1423,8 @@ export class SessionManager {
 			id: this.sessionId,
 			timestamp,
 			cwd: this.cwd,
+			parentSession: previousHeader?.parentSession,
+			rlmDepth: resolveSessionRlmDepth(previousHeader ?? {}, target.sessionFile),
 			git,
 		};
 		this.fileEntries = [header, ...this.getEntries()];
@@ -1941,6 +2048,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.cwd,
 			parentSession: this.persist ? previousSessionFile : undefined,
+			rlmDepth: resolveSessionRlmDepth(this.getHeader() ?? {}, previousSessionFile ?? newSessionFile ?? ""),
 			git: this.persist ? (captureGitContext(this.cwd) ?? undefined) : undefined,
 		};
 
@@ -2134,6 +2242,7 @@ export class SessionManager {
 			timestamp,
 			cwd: targetCwd,
 			parentSession: sourcePath,
+			rlmDepth: resolveSessionRlmDepth(sourceHeader, sourcePath),
 			git: captureGitContext(targetCwd) ?? undefined,
 		};
 		appendFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`);

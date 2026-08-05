@@ -32,7 +32,7 @@ export interface SessionSummary {
 	isSessionActive: boolean;
 	hasActiveHeartbeat?: boolean;
 	runtimeKind?: "top-level" | "subagent";
-	/** RLM spawn depth for persisted passive subagent rows. */
+	/** RLM spawn depth (0 for roots); fork edges preserve the source depth. */
 	rlmDepth?: number;
 	activeSessionId?: string;
 	sessionId: string;
@@ -167,6 +167,7 @@ export function summaryForActiveSession(
 		isSessionActive: session.isSessionActive,
 		hasActiveHeartbeat: hasActiveHeartbeat || undefined,
 		runtimeKind: metadata.kind,
+		rlmDepth: session.rlmDepth,
 		activeSessionId: activeSession.activeSessionId,
 		sessionId: session.sessionId,
 		sessionFile: session.sessionFile,
@@ -238,6 +239,7 @@ export function summaryForInactiveSession(session: SessionInfo): SessionSummary 
 		modified: session.modified.toISOString(),
 		firstMessage: session.firstMessage,
 		parentSessionPath: session.parentSessionPath,
+		rlmDepth: session.rlmDepth,
 		// Carry the persisted recap/verdict so an off-daemon session keeps its
 		// agents-view bucket (e.g. Completed) instead of defaulting to Needs Input.
 		// Gate on message-count currency like isSummaryCurrent does for resident

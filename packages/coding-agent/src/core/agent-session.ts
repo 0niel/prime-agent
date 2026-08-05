@@ -1231,7 +1231,10 @@ export class AgentSession {
 		this._mcpManager = config.mcpManager;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
-		this._rlmDepth = config.rlmDepth ?? parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH");
+		this._rlmDepth =
+			config.rlmDepth ??
+			this.sessionManager.getHeader()?.rlmDepth ??
+			parseDepth(process.env.RLM_DEPTH, 0, "RLM_DEPTH");
 		this._rlmMaxDepth = config.rlmMaxDepth ?? parseDepth(process.env.RLM_MAX_DEPTH, 1, "RLM_MAX_DEPTH");
 		this._prewarmIpythonKernel = (config.prewarmIpythonKernel ?? false) && this._rlmDepth === 0;
 		this._autoRefineReviewer = config.autoRefineReviewer;
@@ -3988,6 +3991,11 @@ export class AgentSession {
 	/** Current session ID */
 	get sessionId(): string {
 		return this.sessionManager.getSessionId();
+	}
+
+	/** Current RLM spawn depth for this session. */
+	get rlmDepth(): number {
+		return this._rlmDepth;
 	}
 
 	/** Current session display name, if set */
@@ -8625,7 +8633,10 @@ export class AgentSession {
 	private _createInlineRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): RlmSubagentRuntime {
 		const childSessionManager = SessionManager.create(this._cwd, options.sessionDir);
 		if (options.parentSession.sessionFile) {
-			childSessionManager.newSession({ parentSession: options.parentSession.sessionFile });
+			childSessionManager.newSession({
+				parentSession: options.parentSession.sessionFile,
+				rlmDepth: options.rlmDepth,
+			});
 		}
 		childSessionManager.appendModelChange(options.model.provider, options.model.id);
 		childSessionManager.appendThinkingLevelChange(options.thinkingLevel);

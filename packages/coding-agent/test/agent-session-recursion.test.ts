@@ -231,11 +231,12 @@ describe("AgentSession rlm recursion", () => {
 			agentMessageController?: AgentSessionMessageController;
 			subagentRuntimeHost?: SubagentRuntimeHost;
 			rlmSessionDir?: string;
+			sessionManager?: SessionManager;
 		} = {},
 	): AgentSession {
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const sessionManager = SessionManager.create(tempDir, join(tempDir, "sessions"));
+		const sessionManager = options.sessionManager ?? SessionManager.create(tempDir, join(tempDir, "sessions"));
 		const settingsManager = SettingsManager.create(tempDir, tempDir);
 
 		const agent = new Agent({
@@ -266,6 +267,50 @@ describe("AgentSession rlm recursion", () => {
 		return session;
 	}
 
+	it("persists RLM_DEPTH for a fresh session and reports the seeded depth", () => {
+		vi.stubEnv("RLM_DEPTH", "1");
+		try {
+			const fresh = createSession({ maxDepth: 2 });
+			fresh.sessionManager.flushNow();
+			if (!fresh.sessionFile) throw new Error("Missing fresh session file");
+
+			const header = JSON.parse(readFileSync(fresh.sessionFile, "utf8").split("\n")[0] ?? "{}");
+			expect(header.rlmDepth).toBe(1);
+			expect(fresh.rlmDepth).toBe(1);
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
+
+	it("prefers persisted depth over RLM_DEPTH when resuming a session", () => {
+		const persistedManager = SessionManager.create(tempDir, join(tempDir, "resumed-sessions"));
+		persistedManager.newSession({ rlmDepth: 2 });
+		persistedManager.flushNow();
+		vi.stubEnv("RLM_DEPTH", "1");
+		try {
+			const resumed = createSession({ maxDepth: 3, sessionManager: persistedManager });
+			expect(resumed.rlmDepth).toBe(2);
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
+
+	it("keeps a forked root at depth zero so recursion remains allowed", async () => {
+		const source = SessionManager.create(tempDir, join(tempDir, "source-sessions"));
+		source.newSession({ rlmDepth: 0 });
+		source.appendMessage({ role: "user", content: "source prompt", timestamp: 1 });
+		source.flushNow();
+		const sourceFile = source.getSessionFile();
+		if (!sourceFile) throw new Error("Missing source session file");
+		const forkedManager = SessionManager.forkFrom(sourceFile, tempDir, join(tempDir, "forked-sessions"));
+		const forked = createSession({ maxDepth: 1, sessionManager: forkedManager });
+
+		expect(forked.rlmDepth).toBe(0);
+		await expect(forked.runRlmChild("recursion remains available")).resolves.toMatchObject({
+			answer: "child answer: recursion remains available",
+		});
+	});
+
 	it("creates readable collision-resistant default subagent session names", () => {
 		expect(createDefaultRlmSubagentSessionName("Summarize the HTTP API!", "sub-a1b2c3d4")).toBe(
 			"subagent-summarize-the-http-api-a1b2c3d4",
@@ -277,6 +322,18 @@ describe("AgentSession rlm recursion", () => {
 			createDefaultRlmSubagentSessionName("same task", "sub-AbCdEfGh"),
 		);
 		expect(createDefaultRlmSubagentSessionName("x".repeat(200), "sub-a1b2c3d4")).toHaveLength(64);
+	});
+
+	it("persists the spawned child's parent edge and derived runtime depth in its header", async () => {
+		const root = createSession({ depth: 2, maxDepth: 4 });
+		const result = await root.runRlmChild("persist my tree position");
+		if (!result.session_dir) throw new Error("Missing child session directory");
+		const child = root.getRlmChildSession(basename(result.session_dir));
+		if (!child?.sessionFile || !root.sessionFile) throw new Error("Missing persisted session paths");
+
+		const header = JSON.parse(readFileSync(child.sessionFile, "utf8").split("\n")[0] ?? "{}");
+		expect(header).toMatchObject({ parentSession: root.sessionFile, rlmDepth: 3 });
+		expect(child.rlmDepth).toBe(3);
 	});
 
 	it("lets the orchestrator choose a unique subagent session name", async () => {

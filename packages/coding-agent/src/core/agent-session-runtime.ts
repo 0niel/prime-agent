@@ -344,7 +344,10 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	async createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		if (options.parentSession.sessionFile) {
-			sessionManager.newSession({ parentSession: options.parentSession.sessionFile });
+			sessionManager.newSession({
+				parentSession: options.parentSession.sessionFile,
+				rlmDepth: options.rlmDepth,
+			});
 		}
 		const runtime = await this.scopedBuild(() =>
 			createAgentSessionRuntime(this.createRuntime, {
@@ -570,8 +573,12 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			}
 			const sessionDir = this.session.sessionManager.getSessionDir();
 			if (!targetLeafId) {
+				const sourceHeader = this.session.sessionManager.getHeader();
 				const sessionManager = SessionManager.create(this.cwd, sessionDir);
-				sessionManager.newSession({ parentSession: currentSessionFile });
+				sessionManager.newSession({
+					parentSession: currentSessionFile,
+					rlmDepth: sourceHeader?.rlmDepth,
+				});
 				const lease = this.acquireReplacementLease(sessionManager.getSessionFile());
 				await this.teardownForReplacement("fork", sessionManager.getSessionFile(), lease);
 				await this.buildAndApplyReplacement(
@@ -618,7 +625,11 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 
 		const sessionManager = this.session.sessionManager;
 		if (!targetLeafId) {
-			sessionManager.newSession({ parentSession: this.session.sessionFile });
+			const sourceHeader = sessionManager.getHeader();
+			sessionManager.newSession({
+				parentSession: this.session.sessionFile,
+				rlmDepth: sourceHeader?.rlmDepth,
+			});
 		} else {
 			sessionManager.createBranchedSession(targetLeafId);
 		}
