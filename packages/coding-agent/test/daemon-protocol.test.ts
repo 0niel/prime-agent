@@ -20,6 +20,7 @@ import {
 	isDaemonMutatingCommand,
 	salvageDaemonCommandId,
 } from "../src/modes/daemon/daemon-protocol.js";
+import { workerAttachCapabilities } from "../src/modes/daemon/daemon-supervisor.js";
 
 describe("daemon protocol helpers", () => {
 	it("keeps the advertised schema identity synchronized with wire type shapes", () => {
@@ -67,12 +68,21 @@ describe("daemon protocol helpers", () => {
 		);
 	});
 
-	it("forwards queue mutation capability through supervisor worker subscriptions and snapshot loads", () => {
-		const supervisor = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-supervisor.ts"), "utf8");
-		expect(supervisor).toContain(
-			'["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot", "queue_item_mutation"]',
-		);
-		expect(supervisor).toContain('["attach_snapshot", "event_sequence", "slim_attach", "queue_item_mutation"]');
+	it("builds worker capabilities for chunked, non-chunked, and extension subscriptions", () => {
+		expect(workerAttachCapabilities()).toEqual([
+			"attach_snapshot",
+			"event_sequence",
+			"slim_attach",
+			"chunked_snapshot",
+			"queue_item_mutation",
+		]);
+		expect(workerAttachCapabilities({ chunkedSnapshot: false })).toEqual([
+			"attach_snapshot",
+			"event_sequence",
+			"slim_attach",
+			"queue_item_mutation",
+		]);
+		expect(workerAttachCapabilities({ extensionUi: true })).toContain("extension_ui");
 	});
 
 	it("capability- and schema-gates atomic queue item mutation", () => {

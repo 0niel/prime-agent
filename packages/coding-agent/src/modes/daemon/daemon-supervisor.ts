@@ -244,6 +244,19 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"shutdown",
 ]);
 
+export function workerAttachCapabilities(
+	options: { extensionUi?: boolean; chunkedSnapshot?: boolean } = {},
+): DaemonClientCapability[] {
+	return [
+		"attach_snapshot",
+		"event_sequence",
+		...(options.extensionUi ? (["extension_ui"] as const) : []),
+		"slim_attach",
+		...(options.chunkedSnapshot === false ? [] : (["chunked_snapshot"] as const)),
+		"queue_item_mutation",
+	];
+}
+
 interface ResidentWorker {
 	descriptor: DaemonWorkerDescriptor;
 	descriptorPath: string;
@@ -2362,16 +2375,7 @@ export class DaemonSupervisor {
 		const response = await worker.client.requestWorker({
 			type: "worker_subscribe",
 			activeSessionId,
-			capabilities: supportsExtensionUi
-				? [
-						"attach_snapshot",
-						"event_sequence",
-						"extension_ui",
-						"slim_attach",
-						"chunked_snapshot",
-						"queue_item_mutation",
-					]
-				: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot", "queue_item_mutation"],
+			capabilities: workerAttachCapabilities({ extensionUi: supportsExtensionUi }),
 			supportsExtensionUi,
 		});
 		if (!response.success) {
@@ -3319,15 +3323,9 @@ export class DaemonSupervisor {
 						const response = await match.worker.client.request({
 							type: "attach",
 							activeSessionId,
-							capabilities: client.capabilities.has("chunked_snapshot")
-								? [
-										"attach_snapshot",
-										"event_sequence",
-										"slim_attach",
-										"chunked_snapshot",
-										"queue_item_mutation",
-									]
-								: ["attach_snapshot", "event_sequence", "slim_attach", "queue_item_mutation"],
+							capabilities: workerAttachCapabilities({
+								chunkedSnapshot: client.capabilities.has("chunked_snapshot"),
+							}),
 							supportsExtensionUi: false,
 							env: command.env ?? collectDaemonClientEnv(),
 						});
