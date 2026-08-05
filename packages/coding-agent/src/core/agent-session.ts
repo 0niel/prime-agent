@@ -68,7 +68,6 @@ import {
 	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
 	normalizeAgentSessionMessage,
-	normalizeAgentSessionMessageDeliveryMode,
 	parseAgentSessionMessagePromptId,
 } from "./agent-messages.js";
 import {
@@ -3075,11 +3074,9 @@ export class AgentSession {
 				if (typeof payload.message !== "string") {
 					throw new Error("agent_message.send message must be a string");
 				}
-				const deliveryMode = normalizeAgentSessionMessageDeliveryMode(payload.mode);
 				return this._agentMessageController.sendAgentMessage({
 					target: assertDirectAgentMessageTarget(payload.target),
 					message: normalizeAgentSessionMessage(payload.message),
-					...(deliveryMode ? { deliveryMode } : {}),
 				});
 			}
 			default:
@@ -8716,7 +8713,6 @@ export class AgentSession {
 						const receipt = (await this.handleAgentMessageHostRequest("agent_message.send", {
 							target: input.target,
 							message: input.message,
-							mode: input.deliveryMode,
 						})) as AgentSessionMessageReceipt;
 						if (this._rlmDepth > 0) {
 							let addressedParent = input.receiverRole === "parent";
@@ -9694,9 +9690,6 @@ export class AgentSession {
 			const childController = childSession?._agentMessageController;
 			if (childController) {
 				try {
-					// deliveryMode is deliberately omitted: the "auto" default steers into
-					// a busy parent, whereas "follow_up" parks a child's last signal in the
-					// when-run-idle lane, which drains only once the steer lane empties.
 					await childController.sendAgentMessage({
 						target: this.sessionId,
 						message: message.content as string,

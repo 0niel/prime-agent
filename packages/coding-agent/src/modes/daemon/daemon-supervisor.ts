@@ -1845,7 +1845,6 @@ export class DaemonSupervisor {
 							runtimeKind: source.summary.runtimeKind ?? "top-level",
 							clientId: client.id,
 						},
-						deliveryMode: command.deliveryMode,
 					},
 					WORKER_REQUEST_TIMEOUT_MS,
 				);

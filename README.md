@@ -89,7 +89,7 @@ prime-agent shutdown [--force]       # Stop every agent, worker, and background 
 Prime Agent is built for long-running work, especially for evaluations in research. These features are available in the TUI, and when run autonomously. 
 
 - **Continual Harness:** `/refine` can persist focused, reviewable lessons as supplemental prompts, memories, reusable skill descriptions, or subagent specifications, with recorded refinement history. It does not replace packaging and reviewing new executable skills.
-- **Direct agent-to-agent communication:** running agents and retained subagents can discover one another, exchange messages, steer active work, or queue follow-ups.
+- **Direct agent-to-agent communication:** running agents and retained subagents can discover one another, exchange messages, and steer active work.
 - **Daemon-backed continuity:** active sessions, IPython state, schedules, and subagents keep running when the terminal detaches and can be reattached later.
 - **Heartbeats and schedules:** `/heartbeat`, `rlm_heartbeat`, and `prime-agent schedule` can re-enter a session periodically or at a specific time.
 - **Persistent goals:** `/goal` keeps an objective and its progress active across turns until it is completed, paused, or cleared.

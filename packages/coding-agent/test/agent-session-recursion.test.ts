@@ -726,7 +726,6 @@ describe("AgentSession rlm recursion", () => {
 			target: { activeSessionId: "parent-active", sessionId: "parent-session" },
 			message: "done",
 			deliveryStatus: "delivered" as const,
-			deliveryMode: "auto" as const,
 		}));
 		const child = createSession({
 			depth: 1,
@@ -765,7 +764,6 @@ describe("AgentSession rlm recursion", () => {
 			target: { activeSessionId: "child-active", sessionId: input.target },
 			message: input.message,
 			deliveryStatus: "delivered" as const,
-			deliveryMode: "auto" as const,
 		}));
 		const roster = vi.fn(() => ({
 			current: { name: "root", id: root.sessionId, depth: 0 },
@@ -833,7 +831,6 @@ describe("AgentSession rlm recursion", () => {
 			target: { activeSessionId: "child-active", sessionId: input.target },
 			message: input.message,
 			deliveryStatus: "delivered" as const,
-			deliveryMode: "auto" as const,
 		}));
 		const root = createSession({
 			agentMessageController: {
@@ -921,7 +918,6 @@ describe("AgentSession rlm recursion", () => {
 			target: { activeSessionId: "healthy-active", sessionId: input.target },
 			message: input.message,
 			deliveryStatus: "delivered" as const,
-			deliveryMode: "auto" as const,
 		}));
 		const root = createSession({
 			agentMessageController: {
@@ -1029,7 +1025,6 @@ describe("AgentSession rlm recursion", () => {
 			target: { activeSessionId: "parent-active", sessionId: "parent-session" },
 			message: "status",
 			deliveryStatus: "delivered" as const,
-			deliveryMode: "auto" as const,
 		}));
 		const child = createSession({
 			depth: 1,
@@ -1092,7 +1087,6 @@ describe("AgentSession rlm recursion", () => {
 				targetSelector: string;
 				message: string;
 				fromState: ActiveSessionState;
-				deliveryMode?: "auto" | "steer" | "follow_up";
 				origin: "agent";
 			}): Promise<unknown>;
 		};
@@ -1112,7 +1106,6 @@ describe("AgentSession rlm recursion", () => {
 			targetSelector: childState.activeSessionId,
 			message: "continue",
 			fromState: parentState,
-			deliveryMode: "steer",
 			origin: "agent",
 		});
 		const steer = findLastMessage(child.messages, isAgentSessionMessage);
@@ -1129,7 +1122,6 @@ describe("AgentSession rlm recursion", () => {
 			message: "new task",
 			fromRelationship: "parent",
 			target: { activeSessionId: "child-active", sessionId: child.sessionId },
-			deliveryMode: "auto",
 		});
 
 		await child.acceptAgentMessagePrompt(message.content as string, { customMessage: message });
@@ -1146,7 +1138,6 @@ describe("AgentSession rlm recursion", () => {
 			message: "continue",
 			fromRelationship: "parent",
 			target: { activeSessionId: "child-active", sessionId: child.sessionId },
-			deliveryMode: "follow_up",
 		});
 
 		await child.queueAgentMessagePrompt(message.content as string, "followUp", message);
@@ -1266,7 +1257,6 @@ describe("AgentSession rlm recursion", () => {
 					target: { activeSessionId: "parent-active", sessionId: "parent-session" },
 					message: "done",
 					deliveryStatus: "delivered",
-					deliveryMode: "auto",
 				}),
 			},
 		});
@@ -1280,7 +1270,6 @@ describe("AgentSession rlm recursion", () => {
 				message: "continue cleanup",
 				fromRelationship: "parent",
 				target: { activeSessionId: "child-active", sessionId: child.sessionId },
-				deliveryMode: "follow_up",
 			});
 			await child.queueAgentMessagePrompt(followUp.content as string, "followUp", followUp);
 			expect(child.repliedToParentSinceTask).toBe(false);

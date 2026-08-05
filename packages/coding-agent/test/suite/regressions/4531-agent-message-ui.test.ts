@@ -30,7 +30,6 @@ function createPayload(message: string): AgentSessionMessagePayload {
 		id: "agentmsg_4531",
 		source: AGENT_MESSAGE_SOURCE,
 		message,
-		deliveryMode: "auto",
 		from: {
 			activeSessionId: "planner-active",
 			sessionId: "planner-session",

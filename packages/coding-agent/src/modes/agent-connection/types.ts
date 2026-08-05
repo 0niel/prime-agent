@@ -1,10 +1,6 @@
 import type { AgentEvent, AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, ServiceTier, TextContent, Transport, Usage } from "@earendil-works/pi-ai";
-import type {
-	AgentSessionMessageDeliveryMode,
-	AgentSessionMessageReceipt,
-	AgentSessionMessageSafetyStatus,
-} from "../../core/agent-messages.js";
+import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AuthSourceToken } from "../../core/auth-storage.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
@@ -665,11 +661,7 @@ export interface AgentConnection {
 		deliveryMode?: AgentHeartbeatDeliveryMode,
 	): Promise<AgentCronJob>;
 	updateHeartbeat(action: AgentHeartbeatUpdateAction): Promise<AgentCronJob | undefined>;
-	sendAgentMessage(
-		targetActiveSessionId: string,
-		message: string,
-		deliveryMode?: AgentSessionMessageDeliveryMode,
-	): Promise<AgentSessionMessageReceipt>;
+	sendAgentMessage(targetActiveSessionId: string, message: string): Promise<AgentSessionMessageReceipt>;
 	getAgentMessageStatus(): Promise<AgentSessionMessageSafetyStatus>;
 	pauseAgentMessages(): Promise<AgentSessionMessageSafetyStatus>;
 	resumeAgentMessages(): Promise<AgentSessionMessageSafetyStatus>;

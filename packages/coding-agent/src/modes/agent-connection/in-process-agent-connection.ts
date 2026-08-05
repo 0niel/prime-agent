@@ -1,11 +1,7 @@
 import { resolve } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
-import type {
-	AgentSessionMessageDeliveryMode,
-	AgentSessionMessageReceipt,
-	AgentSessionMessageSafetyStatus,
-} from "../../core/agent-messages.js";
+import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type { AgentAutonomousStatus } from "../../core/autonomous.js";
 import type { BashResult } from "../../core/bash-executor.js";
@@ -242,11 +238,7 @@ export class InProcessAgentConnection implements AgentConnection {
 		throw new Error("Heartbeats require daemon mode");
 	}
 
-	async sendAgentMessage(
-		_targetActiveSessionId: string,
-		_message: string,
-		_deliveryMode?: AgentSessionMessageDeliveryMode,
-	): Promise<AgentSessionMessageReceipt> {
+	async sendAgentMessage(_targetActiveSessionId: string, _message: string): Promise<AgentSessionMessageReceipt> {
 		throw new Error("Agent messaging requires daemon mode");
 	}
 
