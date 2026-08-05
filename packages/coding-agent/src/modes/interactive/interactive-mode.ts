@@ -7312,10 +7312,18 @@ export class InteractiveMode {
 	private async clearAllQueues(
 		options: { abort?: boolean } = {},
 	): Promise<{ steering: string[]; followUp: string[] }> {
+		const navigation = this.pendingMessageNavigation?.checkpoint();
 		this.pendingMessageNavigation?.reset();
-		const { steering, followUp } = options.abort
-			? await this.agentConnection.abortAndClearQueue()
-			: await this.agentConnection.clearQueue();
+		let cleared: { steering: string[]; followUp: string[] };
+		try {
+			cleared = options.abort
+				? await this.agentConnection.abortAndClearQueue()
+				: await this.agentConnection.clearQueue();
+		} catch (error) {
+			if (navigation) this.pendingMessageNavigation?.restore(navigation);
+			throw error;
+		}
+		const { steering, followUp } = cleared;
 		this.connectionQueue = { steering: [], followUp: [] };
 		return { steering, followUp };
 	}
