@@ -27,6 +27,8 @@ export interface BuildSystemPromptOptions {
 	skills?: Skill[];
 	/** Whether to include the model-facing rlm recursion guidance. */
 	allowRecursion?: boolean;
+	/** Fixed recursive-agent depth for this session. */
+	rlmDepth?: number;
 	/** Global harness state to inject as compact persistent context. */
 	harnessState?: HarnessState;
 }
@@ -104,6 +106,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 		installedSkills: getPythonSkillRuntimeInfo(visibleSkills).map((skill) => skill.importName),
 		activeTools: tools.filter((name) => name === "ipython" || name === "bash" || name === "edit"),
 		allowRecursion,
+		depth: options.rlmDepth,
 	});
 
 	// Appended AFTER the trained buildRlmPrompt prefix, and before the harness-state

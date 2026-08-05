@@ -34,6 +34,8 @@ import {
 } from "../../config.js";
 import {
 	AGENT_MESSAGE_SOURCE,
+	type AgentFamilyCatalogEntry,
+	type AgentFamilyRosterResult,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	type AgentSessionMessageDeliveryStatus,
@@ -44,7 +46,9 @@ import {
 	type AgentSessionMessageReceipt,
 	type AgentSessionMessageSender,
 	assertAgentMessageQueueCapacity,
+	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
+	buildAgentFamilyRoster,
 	createAgentSessionMessage,
 	createAgentSessionMessageId,
 	createAgentSessionMessageReceipt,
@@ -168,6 +172,7 @@ import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
 import {
 	buildRlmChildSnapshots,
 	buildSessionList,
+	classifySessionRosterStatus,
 	inactiveLifecycleForSession,
 	isActiveSessionBusy,
 	type SessionSummary,
@@ -253,6 +258,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"execute_bash_and_wait",
 	"abort_bash",
 	"cancel_rlm_child",
+	"delete_rlm_subagent",
 	"wait_for_idle",
 	"wait_for_headless_completion",
 	"get_session_header",
@@ -1187,7 +1193,7 @@ export class AgentDaemon {
 			clientEnv,
 		};
 		if (name) {
-			state.runtime.session.setSessionName(name);
+			await this.setStateSessionName(state, name);
 		}
 		this.sessions.set(state.activeSessionId, state);
 		this.bindingSessions.add(state.activeSessionId);
@@ -1317,7 +1323,7 @@ export class AgentDaemon {
 				throw new RuntimeOpenCancelledError();
 			}
 			if (command.name) {
-				state.runtime.session.setSessionName(command.name);
+				await this.setStateSessionName(state, command.name);
 			}
 			this.adoptClientEnv(state, clientEnv);
 			this.rebindCronJobsToState(state);
@@ -1329,12 +1335,29 @@ export class AgentDaemon {
 			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
 				throw new RuntimeOpenCancelledError();
 			}
+			if (command.name) {
+				const normalizedName = command.name.trim();
+				if (!normalizedName) {
+					throw new Error("Session name cannot be empty");
+				}
+				await this.assertFamilySessionNameAvailable({
+					name: normalizedName,
+					depth: passiveSubagent.info.rlmDepth ?? passiveSubagent.entry.rlmDepth ?? 1,
+					parentSessionId: passiveSubagent.entry.parentSessionId,
+					parentSessionPath:
+						passiveSubagent.entry.parentSessionFile ??
+						passiveSubagent.chain.at(-2)?.sessionFile ??
+						passiveSubagent.rootParentState?.runtime.session.sessionFile ??
+						passiveSubagent.rootInfo?.path,
+					ignoreSessionId: passiveSubagent.info.id,
+				});
+			}
 			const state = await this.hydratePassiveRlmSubagent(passiveSubagent, clientEnv);
 			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
 				throw new RuntimeOpenCancelledError();
 			}
 			if (command.name) {
-				state.runtime.session.setSessionName(command.name);
+				await this.setStateSessionName(state, command.name);
 			}
 			if (passiveSubagent.rootParentState) this.adoptClientEnv(passiveSubagent.rootParentState, clientEnv);
 			this.adoptClientEnv(state, clientEnv);
@@ -1378,7 +1401,7 @@ export class AgentDaemon {
 				throw new RuntimeOpenCancelledError();
 			}
 			if (command.name) {
-				existing.runtime.session.setSessionName(command.name);
+				await this.setStateSessionName(existing, command.name);
 			}
 			this.adoptClientEnv(existing, clientEnv);
 			this.rebindCronJobsToState(existing);
@@ -1417,7 +1440,7 @@ export class AgentDaemon {
 				// the creator's identity at load, and swapping it would only make
 				// pi.exec disagree with those captures.
 				if (command.name) {
-					existing.runtime.session.setSessionName(command.name);
+					await this.setStateSessionName(existing, command.name);
 				}
 				this.adoptClientEnv(existing, clientEnv);
 				this.rebindCronJobsToState(existing);
@@ -2784,6 +2807,9 @@ export class AgentDaemon {
 		};
 		return {
 			listAgents: () => this.createAgentMessageListResult(requireCurrentState()),
+			roster: () => this.createAgentFamilyRoster(requireCurrentState()),
+			assertSessionNameAvailable: (input) => this.assertFamilySessionNameAvailable(input),
+			setSessionName: (name) => this.setStateSessionName(requireCurrentState(), name),
 			sendAgentMessage: (input) =>
 				this.sendAgentSessionMessage({
 					targetSelector: input.target,
@@ -3571,6 +3597,7 @@ export class AgentDaemon {
 				if (!name) {
 					throw new Error("Session name cannot be empty");
 				}
+				await this.assertStateSessionNameAvailable(state, name);
 				state.runtime.session.setSessionName(name);
 				return success(command.id, "rename", summaryForActiveSession(state));
 			}
@@ -3585,8 +3612,18 @@ export class AgentDaemon {
 					throw new Error("Session name cannot be empty");
 				}
 				if (state) {
+					await this.assertStateSessionNameAvailable(state, name);
 					state.runtime.session.setSessionName(name);
 				} else {
+					const info = await readSessionInfo(command.sessionPath);
+					if (!info) throw new Error(`Session not found: ${command.sessionPath}`);
+					const depth = info.rlmDepth ?? 0;
+					await this.assertFamilySessionNameAvailable({
+						name,
+						depth,
+						...(depth > 0 && info.parentSessionPath ? { parentSessionPath: info.parentSessionPath } : {}),
+						ignoreSessionId: info.id,
+					});
 					SessionManager.open(command.sessionPath).appendSessionInfo(name);
 				}
 				return success(command.id, "rename_saved_session");
@@ -3936,6 +3973,28 @@ export class AgentDaemon {
 				return success(command.id, "cancel_rlm_child", { cancelled });
 			}
 
+			case "delete_rlm_subagent": {
+				const state = this.getSessionState(command.activeSessionId);
+				const isResidentChildRunning = () => {
+					const childState = [...this.sessions.values()].find(
+						(candidate) =>
+							candidate.runtime.metadata.kind === "subagent" &&
+							candidate.runtime.metadata.rlmChildId === command.childId,
+					);
+					return (
+						childState !== undefined &&
+						(childState.runtime.session.isStreaming || childState.runtime.session.unfinishedActionCount > 0)
+					);
+				};
+				const result = isResidentChildRunning()
+					? "running"
+					: await state.runtime.session.deleteInactiveRlmSubagent(command.childId, isResidentChildRunning);
+				return success(command.id, "delete_rlm_subagent", {
+					deleted: result === "deleted",
+					...(result === "running" ? { reason: "running" } : {}),
+				});
+			}
+
 			case "wait_for_idle": {
 				const state = this.getSessionState(command.activeSessionId);
 				await state.runtime.session.waitForIdle();
@@ -4279,6 +4338,7 @@ export class AgentDaemon {
 				if (!name) {
 					throw new Error("Session name cannot be empty");
 				}
+				await this.assertStateSessionNameAvailable(state, name);
 				state.runtime.session.setSessionName(name);
 				return success(command.id, "set_session_name");
 			}
@@ -4712,14 +4772,28 @@ export class AgentDaemon {
 
 	private createAgentMessageAgentSummary(state: ActiveSessionState): AgentSessionMessageAgentSummary {
 		const metadata = state.runtime.metadata;
+		const session = state.runtime.session;
 		return {
 			...this.createAgentSessionMessageEndpoint(state),
 			cwd: state.runtime.cwd,
-			isStreaming: state.runtime.session.isStreaming,
-			unfinishedActionCount: state.runtime.session.unfinishedActionCount,
+			isStreaming: session.isStreaming,
+			unfinishedActionCount: session.unfinishedActionCount,
 			...(metadata.parentActiveSessionId ? { parentActiveSessionId: metadata.parentActiveSessionId } : {}),
+			...(metadata.parentSessionId ? { parentSessionId: metadata.parentSessionId } : {}),
+			...(metadata.parentSessionFile ? { parentSessionPath: metadata.parentSessionFile } : {}),
+			rlmDepth: session.rlmDepth,
+			status: classifySessionRosterStatus({
+				activeSessionId: state.activeSessionId,
+				runtimeKind: metadata.kind,
+				activity: session.isSessionActive ? "working" : "idle",
+				isSessionActive: session.isSessionActive,
+				hasRunningRlmChildren: session.hasRunningRlmChildren?.() ?? false,
+				hasActiveHeartbeat: this.cronStore.getHeartbeat(state.activeSessionId)?.status === "active",
+				isStreaming: session.isStreaming,
+			} as SessionSummary),
 			...(metadata.rlmChildId ? { rlmChildId: metadata.rlmChildId } : {}),
 			...(metadata.sessionDir ? { sessionDir: metadata.sessionDir } : {}),
+			...(session.sessionFile ? { sessionPath: session.sessionFile } : {}),
 		};
 	}
 
@@ -4741,8 +4815,17 @@ export class AgentDaemon {
 				...(passive.chain.length === 1 && passive.rootParentState
 					? { parentActiveSessionId: passive.rootParentState.activeSessionId }
 					: {}),
+				parentSessionId: entry.parentSessionId,
+				parentSessionPath:
+					entry.parentSessionFile ??
+					passive.chain.at(-2)?.sessionFile ??
+					passive.rootParentState?.runtime.session.sessionFile ??
+					passive.rootInfo?.path,
+				rlmDepth: info.rlmDepth ?? entry.rlmDepth,
+				status: "inactive",
 				rlmChildId: entry.childId,
 				sessionDir: entry.sessionDir,
+				sessionPath: entry.sessionFile,
 			});
 		}
 		const localIds = new Set(localAgents.map((agent) => agent.activeSessionId));
@@ -4751,10 +4834,104 @@ export class AgentDaemon {
 			agents: [
 				...localAgents,
 				...[...this.remoteAgentPeers.values()].filter(
-					(peer) => !localIds.has(peer.activeSessionId) && !this.closingSessions.has(peer.activeSessionId),
+					(peer) =>
+						peer.status !== "inactive" &&
+						!localIds.has(peer.activeSessionId) &&
+						!this.closingSessions.has(peer.activeSessionId),
 				),
 			],
 		};
+	}
+
+	private async createAgentFamilyCatalog(): Promise<AgentFamilyCatalogEntry[]> {
+		const current = [...this.sessions.values()].find((state) => !this.bindingSessions.has(state.activeSessionId));
+		const listed = current ? await this.createAgentMessageListResult(current) : { agents: [] };
+		const remotePeers = new Set(this.remoteAgentPeers.values());
+		const localAgents = current
+			? [this.createAgentMessageAgentSummary(current), ...listed.agents.filter((agent) => !remotePeers.has(agent))]
+			: listed.agents.filter((agent) => !remotePeers.has(agent));
+		const activePaths = new Set(
+			localAgents.flatMap((agent) => (agent.sessionPath ? [resolve(agent.sessionPath)] : [])),
+		);
+		const savedRoots = (await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir))
+			.filter(
+				(info) =>
+					(info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) === 0 && !activePaths.has(resolve(info.path)),
+			)
+			.map(
+				(info): AgentFamilyCatalogEntry => ({
+					id: info.id,
+					...(info.name ? { name: info.name } : {}),
+					depth: info.rlmDepth ?? 0,
+					status: "inactive",
+					sessionPath: resolve(info.path),
+				}),
+			);
+		const byId = new Map<string, AgentFamilyCatalogEntry>(savedRoots.map((entry) => [entry.id, entry]));
+		const addAgent = (agent: AgentSessionMessageAgentSummary) => {
+			byId.set(agent.sessionId, {
+				id: agent.sessionId,
+				...(agent.sessionName ? { name: agent.sessionName } : {}),
+				depth: agent.rlmDepth ?? 0,
+				status: agent.status ?? "idle",
+				...(agent.parentSessionId ? { parentSessionId: agent.parentSessionId } : {}),
+				...(agent.parentSessionPath ? { parentSessionPath: resolve(agent.parentSessionPath) } : {}),
+				...(agent.sessionPath ? { sessionPath: resolve(agent.sessionPath) } : {}),
+			});
+		};
+		for (const peer of this.remoteAgentPeers.values()) addAgent(peer);
+		for (const agent of localAgents) addAgent(agent);
+		for (const state of this.sessions.values()) {
+			const entry = byId.get(state.runtime.session.sessionId);
+			if (entry && state.runtime.session.sessionFile) entry.sessionPath = resolve(state.runtime.session.sessionFile);
+		}
+		for (const passive of await this.listPassiveRlmSubagents()) {
+			const entry = byId.get(passive.info.id);
+			if (entry) entry.sessionPath = resolve(passive.entry.sessionFile);
+		}
+		return [...byId.values()];
+	}
+
+	private async createAgentFamilyRoster(currentState: ActiveSessionState): Promise<AgentFamilyRosterResult> {
+		const catalog = await this.createAgentFamilyCatalog();
+		const current = catalog.find((entry) => entry.id === currentState.runtime.session.sessionId);
+		if (!current) throw new Error("Current agent is missing from the family catalog");
+		return buildAgentFamilyRoster(current, catalog);
+	}
+
+	private async assertFamilySessionNameAvailable(input: {
+		name: string;
+		depth: number;
+		parentSessionId?: string;
+		parentSessionPath?: string;
+		ignoreSessionId?: string;
+	}): Promise<void> {
+		assertAgentSessionNameAvailable(await this.createAgentFamilyCatalog(), {
+			...input,
+			...(input.parentSessionPath ? { parentSessionPath: resolve(input.parentSessionPath) } : {}),
+		});
+	}
+
+	private async assertStateSessionNameAvailable(state: ActiveSessionState, name: string): Promise<void> {
+		const session = state.runtime.session;
+		const metadata = state.runtime.metadata;
+		const depth = session.rlmDepth ?? 0;
+		await this.assertFamilySessionNameAvailable({
+			name,
+			depth,
+			...(depth > 0 && metadata.parentSessionId ? { parentSessionId: metadata.parentSessionId } : {}),
+			...(depth > 0 && metadata.parentSessionFile ? { parentSessionPath: metadata.parentSessionFile } : {}),
+			ignoreSessionId: session.sessionId,
+		});
+	}
+
+	private async setStateSessionName(state: ActiveSessionState, name: string): Promise<void> {
+		const normalizedName = name.trim();
+		if (!normalizedName) {
+			throw new Error("Session name cannot be empty");
+		}
+		await this.assertStateSessionNameAvailable(state, normalizedName);
+		state.runtime.session.setSessionName(normalizedName);
 	}
 
 	// Half-bound sessions are hidden from other sessions' listings; the current

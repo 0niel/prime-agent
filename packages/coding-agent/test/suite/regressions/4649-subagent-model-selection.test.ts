@@ -237,7 +237,7 @@ describe("ENG-4649 subagent model selection", () => {
 
 			const first = harness.session.runRlmChild("first task", { name: "shared-reviewer" });
 			await expect(harness.session.runRlmChild("second task", { name: "shared-reviewer" })).rejects.toThrow(
-				'RLM subagent session name "shared-reviewer" is already in use',
+				'Agent name "shared-reviewer" is unavailable: an agent of that name already exists at depth 1 under this parent',
 			);
 			await expect(first).resolves.toMatchObject({ answer: "first child answer" });
 		} finally {

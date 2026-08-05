@@ -25,6 +25,10 @@ if child is not None:
 
 ## API
 
+- `await agent_message.roster()` — returns `current` (`name`, `id`, `depth`) and
+  relationship-scoped `entries` (`relationship`, `name`, `id`, `depth`, `status`)
+  for the current agent's parent, siblings, and children. It includes inactive
+  family members and sorts parent, siblings by name, then children by name.
 - `await agent_message.list_agents()` — returns `current` and `agents`, where
   each agent includes active session id, session id, optional name, runtime
   kind, cwd, streaming state, and pending message count. This includes live

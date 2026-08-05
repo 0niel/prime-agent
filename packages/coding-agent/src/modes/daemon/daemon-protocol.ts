@@ -56,7 +56,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 11 adds immediate get/set commands for active-session RLM max depth.
 // Revision 12 publishes idle-residency metadata on session summary rows.
 export const DAEMON_SCHEMA_REVISION = 12;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-12-5bd6b0b12204";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-12-670d88ac98dd";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -81,6 +81,7 @@ export interface DaemonPromptAdmissionCancellationResult {
 }
 export type DaemonServerCapability =
 	| DaemonClientCapability
+	| "delete_rlm_subagent"
 	| "heartbeat_catalog"
 	| "heartbeat_management"
 	| "model_catalog"
@@ -123,6 +124,7 @@ export const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: readonly DaemonClientCapabili
 
 export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	...DAEMON_SUPPORTED_CLIENT_CAPABILITIES,
+	"delete_rlm_subagent",
 	"heartbeat_catalog",
 	"heartbeat_management",
 	"model_catalog",
@@ -486,6 +488,7 @@ export type DaemonCommand =
 	  }
 	| { id?: string; type: "abort_bash"; activeSessionId: string }
 	| { id?: string; type: "cancel_rlm_child"; activeSessionId: string; childId: string }
+	| { id?: string; type: "delete_rlm_subagent"; activeSessionId: string; childId: string }
 	| { id?: string; type: "wait_for_idle"; activeSessionId: string }
 	| { id?: string; type: "wait_for_headless_completion"; activeSessionId: string }
 	| { id?: string; type: "get_session_header"; activeSessionId: string }
@@ -620,6 +623,10 @@ const CLIENT_OWNED_DAEMON_COMMAND = {
 	minProtocol: 7,
 	capability: "client_owned_sessions",
 } as const;
+const DELETE_RLM_SUBAGENT_COMMAND = {
+	minProtocol: 7,
+	capability: "delete_rlm_subagent",
+} as const;
 const FLAT_SESSION_TREE_COMMAND = { minProtocol: 7 } as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
@@ -654,6 +661,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	execute_bash: LEGACY_DAEMON_COMMAND,
 	abort_bash: LEGACY_DAEMON_COMMAND,
 	cancel_rlm_child: LEGACY_DAEMON_COMMAND,
+	delete_rlm_subagent: DELETE_RLM_SUBAGENT_COMMAND,
 	wait_for_idle: LEGACY_DAEMON_COMMAND,
 	wait_for_headless_completion: CURRENT_DAEMON_COMMAND,
 	get_session_header: CURRENT_DAEMON_COMMAND,

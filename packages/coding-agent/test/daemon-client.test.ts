@@ -215,6 +215,39 @@ describe("DaemonClient", () => {
 		client.close();
 	});
 
+	it("does not send subagent deletion to an old daemon without the capability", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, []);
+
+		await expect(
+			client.request({ type: "delete_rlm_subagent", activeSessionId: "active-1", childId: "child-1" }),
+		).rejects.toThrow("does not support delete_rlm_subagent");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("sends subagent deletion to a capable daemon without requiring a schema bump", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["delete_rlm_subagent"], DAEMON_SCHEMA_REVISION - 1);
+
+		const request = client.request({
+			type: "delete_rlm_subagent",
+			activeSessionId: "active-1",
+			childId: "child-1",
+		});
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
+	});
+
 	it("rejects an old daemon before requesting session state", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();

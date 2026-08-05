@@ -69,7 +69,7 @@ function heartbeat(id: string, nextRunAt?: string, activeSessionId = "child") {
 }
 
 describe("agents view state", () => {
-	test("classifies active daemon sessions into coarse fleet sections", () => {
+	test("classifies sessions by live runtime status at any depth", () => {
 		expect(classifyAgentsViewSession(makeSummary({ isStreaming: true, activity: "working" }))).toBe("running");
 		expect(
 			classifyAgentsViewSession(
@@ -77,9 +77,25 @@ describe("agents view state", () => {
 			),
 		).toBe("running");
 		expect(classifyAgentsViewSession(makeSummary({ activity: "working" }))).toBe("running");
+		expect(
+			classifyAgentsViewSession(
+				makeSummary({ runtimeKind: "subagent", rlmDepth: 3, activity: "working", isSessionActive: true }),
+			),
+		).toBe("running");
 		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 2 }))).toBe("idle");
-		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 0 }))).toBe("idle");
-		expect(classifyAgentsViewSession(makeSummary({ activity: "idle", messageCount: 4 }))).toBe("idle");
+		expect(classifyAgentsViewSession(makeSummary({ runtimeKind: "subagent", activity: "idle" }))).toBe("idle");
+		expect(
+			classifyAgentsViewSession(
+				makeSummary({
+					activeSessionId: undefined,
+					runtimeKind: "subagent",
+					rlmDepth: 3,
+					activity: "working",
+					isSessionActive: true,
+					hasActiveHeartbeat: true,
+				}),
+			),
+		).toBe("inactive");
 	});
 
 	test("places all non-busy resident sessions in Idle", () => {
@@ -1418,7 +1434,7 @@ describe("agents view state", () => {
 				"saved-child",
 			]);
 			expect(rows).toHaveLength(2);
-			expect(rows.every((row) => row.kind === "agent" && row.depth === 0)).toBe(true);
+			expect(rows.every((row) => row.kind === "agent" && row.depth === 0 && row.section === "inactive")).toBe(true);
 			expect(rows.find((row) => row.summary.sessionId === "registry-child")?.summary).toMatchObject({
 				parentSessionId: "root-session",
 				rlmDepth: 1,

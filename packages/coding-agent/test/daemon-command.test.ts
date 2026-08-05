@@ -14,6 +14,7 @@ const daemonClientMock = vi.hoisted(() => {
 		schedule?: string;
 		prompt?: string;
 		includeInactive?: boolean;
+		all?: boolean;
 		sessionPath?: string;
 		config?: {
 			extensionFlagValues?: Record<string, boolean | string>;
@@ -217,6 +218,18 @@ describe("daemon command", () => {
 		await expect(command).resolves.toBe(true);
 		expect(client?.messageListenerCountAtClose).toBe(0);
 		expect(client?.closeListenerCountAtClose).toBe(0);
+	});
+
+	it("chooses a terminating non-colliding default name past the safe-integer range", async () => {
+		const unsafeIntegerName = "9007199254740992";
+		daemonClientMock.behavior.sessions = [makeSessionSummary("active-1", "session-1", unsafeIntegerName)];
+
+		await expect(handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock"])).resolves.toBe(true);
+
+		const client = daemonClientMock.instances[1];
+		expect(client?.requests[0]).toEqual({ type: "list", all: true });
+		expect(client?.requests[1]).toMatchObject({ type: "create", name: "1" });
+		expect(client?.requests[1]?.name).not.toBe(unsafeIntegerName);
 	});
 
 	it("keeps create session name after an unknown boolean extension flag", async () => {

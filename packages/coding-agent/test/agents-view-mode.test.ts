@@ -108,6 +108,127 @@ describe("AgentsViewMode", () => {
 		expect(self.selectedIndex).toBe(4);
 	});
 
+	it("re-resolves subagent state before choosing stop or delete intent", async () => {
+		const child = summary({
+			id: "passive-child-session",
+			activeSessionId: undefined,
+			sessionId: "passive-child-session",
+			runtimeKind: "subagent",
+			rlmChildId: "passive-child",
+		});
+		const request = vi.fn(async (command: { type: string }) => ({
+			success: true as const,
+			data: command.type === "cancel_rlm_child" ? { cancelled: false } : { deleted: true },
+		}));
+		const client = { request, supportsServerCapability: vi.fn(() => true) };
+		const self = {
+			rows: [
+				{
+					kind: "subagent",
+					section: "running",
+					summary: child,
+					selectable: true,
+					identity: "child-row",
+					parentIdentity: "root-row",
+				},
+				{
+					kind: "agent",
+					section: "idle",
+					summary: summary({ id: "root-active", activeSessionId: "root-active", sessionId: "root-session" }),
+					selectable: true,
+					identity: "root-row",
+				},
+			],
+			selectedIndex: 0,
+			pendingDeleteAgent: undefined,
+			pendingKillSubagent: undefined,
+			deleteConfirmExpiresAt: 0,
+			deleteConfirmTimer: undefined,
+			ui: { requestRender: vi.fn() },
+			requireClient: () => client,
+			setStatusMessage: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+			handleKillSubagentSelected(row: unknown) {
+				return invoke("handleKillSubagentSelected", self, row);
+			},
+			findSubagentRootRow(row: unknown) {
+				return invoke("findSubagentRootRow", self, row);
+			},
+			isDeleteConfirmationVisible() {
+				return invoke("isDeleteConfirmationVisible", self);
+			},
+			showDeleteConfirmation() {
+				return invoke("showDeleteConfirmation", self);
+			},
+			clearDeleteConfirmation(options: unknown) {
+				return invoke("clearDeleteConfirmation", self, options);
+			},
+			killSubagent(pending: unknown, row: unknown) {
+				return invoke("killSubagent", self, pending, row);
+			},
+		};
+
+		await invoke("handleDeleteSelected", self);
+		expect(request).not.toHaveBeenCalled();
+
+		// The child finishes during confirmation. The second keypress must use the
+		// current row state rather than the original running state.
+		self.rows[0]!.section = "inactive";
+		await invoke("handleDeleteSelected", self);
+		expect(request).toHaveBeenCalledWith({
+			type: "delete_rlm_subagent",
+			activeSessionId: "root-active",
+			childId: "passive-child",
+		});
+		expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ type: "cancel_rlm_child" }));
+		expect(self.setStatusMessage).toHaveBeenCalledWith("Subagent deleted", { render: false });
+	});
+
+	it("uses cancel when an inactive subagent starts running during confirmation", async () => {
+		const request = vi.fn(async () => ({ success: true as const, data: { cancelled: true } }));
+		const self = {
+			requireClient: () => ({ request, supportsServerCapability: () => true }),
+			setStatusMessage: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+		};
+		await invoke(
+			"killSubagent",
+			self,
+			{ identity: "child-row", rootActiveSessionId: "root-active", childId: "passive-child" },
+			{ section: "running" },
+		);
+		expect(request).toHaveBeenCalledWith({
+			type: "cancel_rlm_child",
+			activeSessionId: "root-active",
+			childId: "passive-child",
+		});
+		expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ type: "delete_rlm_subagent" }));
+	});
+
+	it("falls back to cancel-only when subagent deletion is unsupported", async () => {
+		const request = vi.fn(async () => ({ success: true as const, data: { cancelled: false } }));
+		const self = {
+			requireClient: () => ({ request, supportsServerCapability: () => false }),
+			setStatusMessage: vi.fn(),
+			refreshSessions: vi.fn(async () => true),
+		};
+		await invoke(
+			"killSubagent",
+			self,
+			{ identity: "child-row", rootActiveSessionId: "root-active", childId: "passive-child" },
+			{ section: "inactive" },
+		);
+		expect(request).toHaveBeenCalledWith({
+			type: "cancel_rlm_child",
+			activeSessionId: "root-active",
+			childId: "passive-child",
+		});
+		expect(self.setStatusMessage).toHaveBeenCalledWith("The daemon cannot delete subagents; it was left unchanged", {
+			render: false,
+			tone: "warning",
+		});
+	});
+
 	it("uses the opened session as the crash-path back target", async () => {
 		const opened = summary({ sessionName: "opened" });
 		const previous = summary({ id: "previous", activeSessionId: "previous", sessionId: "previous" });

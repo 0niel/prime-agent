@@ -68,6 +68,13 @@ describe("agent-message skill over the kernel host bridge", () => {
 						],
 					};
 				},
+				"agent_message.roster": async (payload) => {
+					requests.push({ type: "agent_message.roster", payload });
+					return {
+						current: { name: "alpha", id: "session-alpha", depth: 0 },
+						entries: [{ relationship: "sibling", name: "Beta", id: "session-beta", depth: 0, status: "idle" }],
+					};
+				},
 				"agent_message.send": async (payload) => {
 					requests.push({ type: "agent_message.send", payload });
 					return {
@@ -88,13 +95,18 @@ describe("agent-message skill over the kernel host bridge", () => {
 		const result = await manager.execute(`
 import json
 agents = await agent_message.list_agents()
+roster = await agent_message.roster()
 receipt = await agent_message.send("beta", "hello beta", mode="follow_up")
-print(json.dumps({"agents": agents, "receipt": receipt}, sort_keys=True))
+print(json.dumps({"agents": agents, "roster": roster, "receipt": receipt}, sort_keys=True))
 `);
 
 		expect(result.status).toBe("ok");
 		const output = JSON.parse(result.stdout.trim());
 		expect(output.agents.agents).toHaveLength(2);
+		expect(output.roster).toMatchObject({
+			current: { id: "session-alpha", depth: 0 },
+			entries: [{ relationship: "sibling", id: "session-beta", status: "idle" }],
+		});
 		expect(output.receipt).toMatchObject({
 			id: "agentmsg-test",
 			source: "agent_message",
@@ -111,7 +123,8 @@ print(json.dumps({"agents": agents, "receipt": receipt}, sort_keys=True))
 			},
 		]);
 		expect(requests[0]).toMatchObject({ type: "agent_message.list", payload: { type: "agent_message.list" } });
-		expect(requests[1]).toMatchObject({
+		expect(requests[1]).toMatchObject({ type: "agent_message.roster", payload: { type: "agent_message.roster" } });
+		expect(requests[2]).toMatchObject({
 			type: "agent_message.send",
 			payload: {
 				type: "agent_message.send",
@@ -120,7 +133,7 @@ print(json.dumps({"agents": agents, "receipt": receipt}, sort_keys=True))
 				mode: "follow_up",
 			},
 		});
-		expect(requests[1].payload).not.toHaveProperty("from");
+		expect(requests[2].payload).not.toHaveProperty("from");
 	});
 
 	it("validates mode before sending to the host", async () => {

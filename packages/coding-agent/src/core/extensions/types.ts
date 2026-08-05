@@ -1145,7 +1145,7 @@ export interface ExtensionAPI {
 	// =========================================================================
 
 	/** Set the session display name (shown in session selector). */
-	setSessionName(name: string): void;
+	setSessionName(name: string): void | Promise<void>;
 
 	/** Get the current session name, if set. */
 	getSessionName(): string | undefined;
@@ -1364,7 +1364,7 @@ export type SendUserMessageHandler = (
 
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
 
-export type SetSessionNameHandler = (name: string) => void;
+export type SetSessionNameHandler = (name: string) => void | Promise<void>;
 
 export type GetSessionNameHandler = () => string | undefined;
 

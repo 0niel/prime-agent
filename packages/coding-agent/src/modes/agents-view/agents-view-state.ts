@@ -1,7 +1,7 @@
 import { basename, resolve } from "node:path";
 import { canonicalizePath } from "../../utils/paths.js";
 import type { AgentConnectionHeartbeat, AgentConnectionSavedSessionInfo } from "../agent-connection/index.js";
-import type { SessionSummary } from "../daemon/daemon-session-list.js";
+import { classifySessionRosterStatus, type SessionSummary } from "../daemon/daemon-session-list.js";
 
 export type AgentsViewSection = "running" | "idle" | "inactive";
 
@@ -88,14 +88,7 @@ export interface AgentsViewRow {
 }
 
 export function classifyAgentsViewSession(summary: SessionSummary): AgentsViewSection {
-	if (summary.hasActiveHeartbeat || summary.activity === "working" || isAgentsViewSessionBusy(summary)) {
-		return "running";
-	}
-	return "idle";
-}
-
-function isAgentsViewSessionBusy(summary: SessionSummary): boolean {
-	return summary.isSessionActive || summary.hasRunningRlmChildren === true;
+	return classifySessionRosterStatus(summary);
 }
 
 export function classifyUnifiedSession(record: Pick<UnifiedSessionRecord, "daemon" | "heartbeat">): AgentsViewSection {

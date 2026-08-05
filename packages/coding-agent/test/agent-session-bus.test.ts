@@ -3,7 +3,9 @@ import {
 	AGENT_MESSAGE_SOURCE,
 	AgentSessionMessageRateLimiter,
 	assertAgentMessageQueueCapacity,
+	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
+	buildAgentFamilyRoster,
 	createAgentSessionMessagePrompt,
 	createAgentSessionMessageReceipt,
 	normalizeAgentSessionMessage,
@@ -166,6 +168,103 @@ describe("agent session bus", () => {
 		expect(() => assertDirectAgentMessageTarget("all")).toThrow("Broadcast agent messaging is not supported");
 		expect(() => assertAgentMessageQueueCapacity(20, 20)).toThrow("Target session has too many pending messages");
 		expect(() => assertAgentMessageQueueCapacity(19, 20)).not.toThrow();
+	});
+
+	it("enforces names per sibling set across active and inactive catalog rows", () => {
+		const catalog = [
+			{ id: "root-a", name: "alpha", depth: 0, status: "running" as const, sessionPath: "/root-a" },
+			{ id: "root-b", name: "beta", depth: 0, status: "inactive" as const, sessionPath: "/root-b" },
+			{ id: "child-a", name: "reviewer", depth: 1, status: "idle" as const, parentSessionPath: "/root-a" },
+			{ id: "child-b", name: "reviewer", depth: 1, status: "inactive" as const, parentSessionPath: "/root-b" },
+		];
+
+		expect(() => assertAgentSessionNameAvailable(catalog, { name: "beta", depth: 0 })).toThrow(
+			"an agent of that name already exists at depth 0 under this parent",
+		);
+		expect(() =>
+			assertAgentSessionNameAvailable(
+				[...catalog, { id: "fork", name: "forked", depth: 0, status: "idle", parentSessionPath: "/root-a" }],
+				{ name: "beta", depth: 0, parentSessionPath: "/root-a", ignoreSessionId: "fork" },
+			),
+		).toThrow("an agent of that name already exists at depth 0 under this parent");
+		expect(() =>
+			assertAgentSessionNameAvailable(catalog, { name: "reviewer", depth: 1, parentSessionPath: "/root-a" }),
+		).toThrow("an agent of that name already exists at depth 1 under this parent");
+		expect(() =>
+			assertAgentSessionNameAvailable(catalog, { name: "reviewer", depth: 2, parentSessionPath: "/child-a" }),
+		).not.toThrow();
+		expect(() =>
+			assertAgentSessionNameAvailable(catalog, {
+				name: "reviewer",
+				depth: 1,
+				parentSessionPath: "/root-a",
+				ignoreSessionId: "child-a",
+			}),
+		).not.toThrow();
+	});
+
+	it("resolves sibling parents canonically without grouping parentless non-roots", () => {
+		const catalog = [
+			{ id: "root", name: "orchestrator", depth: 0, status: "running" as const, sessionPath: "/root" },
+			{ id: "id-child", name: "reviewer", depth: 1, status: "idle" as const, parentSessionId: "root" },
+			{
+				id: "path-child",
+				name: "builder",
+				depth: 1,
+				status: "inactive" as const,
+				parentSessionPath: "/root",
+			},
+			{ id: "orphan", name: "reviewer", depth: 1, status: "inactive" as const },
+		];
+
+		expect(() =>
+			assertAgentSessionNameAvailable(catalog, { name: "reviewer", depth: 1, parentSessionPath: "/root" }),
+		).toThrow("an agent of that name already exists at depth 1 under this parent");
+		expect(() =>
+			assertAgentSessionNameAvailable(catalog, { name: "builder", depth: 1, parentSessionId: "root" }),
+		).toThrow("an agent of that name already exists at depth 1 under this parent");
+		expect(() => assertAgentSessionNameAvailable(catalog, { name: "reviewer", depth: 1 })).not.toThrow();
+		expect(() =>
+			assertAgentSessionNameAvailable(catalog, {
+				name: "reviewer",
+				depth: 1,
+				parentSessionPath: "/unknown-root",
+			}),
+		).not.toThrow();
+		expect(buildAgentFamilyRoster(catalog[1]!, catalog).entries).toEqual([
+			{ relationship: "parent", name: "orchestrator", id: "root", depth: 0, status: "running" },
+			{ relationship: "sibling", name: "builder", id: "path-child", depth: 1, status: "inactive" },
+		]);
+	});
+
+	it("builds a sorted nuclear-family roster with inactive members", () => {
+		const catalog = [
+			{ id: "root", name: "orchestrator", depth: 0, status: "running" as const, sessionPath: "/root" },
+			{
+				id: "current",
+				name: "builder",
+				depth: 1,
+				status: "idle" as const,
+				parentSessionPath: "/root",
+				sessionPath: "/builder",
+			},
+			{ id: "sibling-z", name: "zeta", depth: 1, status: "running" as const, parentSessionPath: "/root" },
+			{ id: "sibling-a", name: "alpha", depth: 1, status: "inactive" as const, parentSessionPath: "/root" },
+			{ id: "child-z", name: "tester", depth: 2, status: "inactive" as const, parentSessionPath: "/builder" },
+			{ id: "child-a", name: "reviewer", depth: 2, status: "idle" as const, parentSessionPath: "/builder" },
+			{ id: "cousin", name: "ignored", depth: 2, status: "idle" as const, parentSessionPath: "/other" },
+		];
+
+		expect(buildAgentFamilyRoster(catalog[1]!, catalog)).toEqual({
+			current: { name: "builder", id: "current", depth: 1 },
+			entries: [
+				{ relationship: "parent", name: "orchestrator", id: "root", depth: 0, status: "running" },
+				{ relationship: "sibling", name: "alpha", id: "sibling-a", depth: 1, status: "inactive" },
+				{ relationship: "sibling", name: "zeta", id: "sibling-z", depth: 1, status: "running" },
+				{ relationship: "child", name: "reviewer", id: "child-a", depth: 2, status: "idle" },
+				{ relationship: "child", name: "tester", id: "child-z", depth: 2, status: "inactive" },
+			],
+		});
 	});
 
 	it("rate limits senders with a token bucket", () => {

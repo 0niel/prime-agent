@@ -6,6 +6,7 @@ export interface RlmPromptOptions {
 	installedSkills?: string[];
 	messagesPath: string;
 	allowRecursion?: boolean;
+	depth?: number;
 	activeTools?: string[];
 }
 
@@ -35,6 +36,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 	const { cwd, skillsDir, messagesPath } = options;
 	const installedSkills = options.installedSkills ?? [];
 	const allowRecursion = options.allowRecursion ?? true;
+	const depth = options.depth ?? 0;
 	const activeTools = options.activeTools ?? [];
 	const hasIpython = options.activeTools === undefined ? true : activeTools.includes("ipython");
 	const canRunShellSkills = hasIpython || activeTools.includes("bash");
@@ -45,6 +47,7 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		"",
 		`Working directory: ${cwd}`,
 		`Conversation log: ${messagesPath}`,
+		`Recursive agent depth: ${depth}`,
 		`Pre-installed Python packages: ${DEFAULT_RLM_EXTRA_IMPORT_LABELS.join(", ")}.`,
 		"Install additional packages with `uv pip install <pkg>` (this is a uv-managed venv with no pip module).",
 	];
@@ -82,10 +85,11 @@ export function buildRlmPrompt(options: RlmPromptOptions): string {
 		parts.push(
 			"",
 			"A callable `rlm` is already in your global namespace. It returns an `RLMResult` with `.answer` (string), `.usage`, `.turns`, `.session_dir`, `.model`, and optional `.warning`. A direct `await rlm('sub-task')` is valid only when the result is immediately required.",
-			"Choose a stable child name with `await rlm('sub-task', name='api-reviewer')`; names must be non-empty and unique among addressable sessions. If omitted, the host generates a readable unique name.",
+			"Choose a stable child name with `await rlm('sub-task', name='api-reviewer')`; names must be non-empty and unique among siblings (children of the same parent). If omitted, the host generates a readable unique name.",
 			"A child inherits your current model by default. When the user or an applicable skill requests a different model, search the bounded authenticated catalog with `matches = await rlm.find_models('requested model')`, choose from each match's `provider`, `id`, `name`, and `selector`, then pass the exact `provider/model` selector with `model=matches[0].selector`. Do not choose a different model on your own.",
 			"If an `RLMResult.warning` is set, the requested model could not be used and the child fell back to `.model`; follow the warning and tell the user which model actually ran.",
 			"Sub-agents should not block Prime Agent by default: start them with `task = asyncio.create_task(rlm('sub-task'))`, keep the task handle, continue any independent work, and await the task only when you need its result.",
+			"Use `await agent_message.roster()` when available to discover your parent, siblings, and children, including inactive family members, with their fixed depths and current statuses.",
 			"For long-running fan-out, do not rely only on in-memory `asyncio.Task` handles: they can be lost if the kernel restarts or state is restored. Recover the current parent session's automatic child registry with `children = await rlm.list_subagents()`; each entry exposes `rlm_child_id`, `active_session_id`, `session_id`, `session_name`, `session_dir`, and `status`.",
 			"Delete a running or retained direct child with `await rlm.delete_subagent(child)` (or pass its name/ID); deletion cancels running work, closes the child runtime, and removes it from the registry and daemon addressability.",
 			"For parallel sub-agents, launch them together and collect them with normal Python async patterns such as `await asyncio.gather(rlm('task1'), rlm('task2'))`; `asyncio` is already imported.",

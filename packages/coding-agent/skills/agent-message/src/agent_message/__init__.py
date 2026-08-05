@@ -20,6 +20,11 @@ async def list_agents() -> dict[str, Any]:
     return await host_request("agent_message.list")
 
 
+async def roster() -> dict[str, Any]:
+    """List this agent's parent, siblings, and children, including inactive family."""
+    return await host_request("agent_message.roster")
+
+
 async def send(target: str, message: str, mode: MessageMode = "auto") -> dict[str, Any]:
     """Send one direct text message to another active Prime Agent session.
 

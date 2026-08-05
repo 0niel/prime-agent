@@ -272,15 +272,24 @@ async function runOpen(parsed: ParsedDaemonClientCommand): Promise<void> {
 	const client = new DaemonClient(parsed.socketPath);
 	await client.connect();
 	try {
-		const sessions = await getLiveSessions(client);
-		const sessionName = sessionArgs.name ?? nextDefaultSessionName(sessions);
-		const response = await client.request({
-			type: "create",
-			name: sessionName,
-			config: sessionArgs.config,
-			sessionPath: sessionArgs.sessionPath,
-			continueRecent: sessionArgs.continueRecent,
-		});
+		const autoName = sessionArgs.name === undefined;
+		const sessions = await getLiveSessions(client, autoName);
+		let sessionName = sessionArgs.name ?? nextDefaultSessionName(sessions);
+		let response: DaemonResponse;
+		while (true) {
+			response = await client.request({
+				type: "create",
+				name: sessionName,
+				config: sessionArgs.config,
+				sessionPath: sessionArgs.sessionPath,
+				continueRecent: sessionArgs.continueRecent,
+			});
+			if (response.success || !autoName || !response.error.includes(`Agent name "${sessionName}" is unavailable`)) {
+				break;
+			}
+			sessions.push({ sessionName } as SessionSummary);
+			sessionName = nextDefaultSessionName(sessions);
+		}
 		const data = requireSuccess(response);
 		if (!isLiveSessionSummary(data)) {
 			throw new Error("Daemon returned an invalid create response");
@@ -629,8 +638,8 @@ function resolvePathOption(value: string, cwd: string): string {
 	return isLocalPath(expanded) ? resolve(cwd, expanded) : expanded;
 }
 
-async function getLiveSessions(client: DaemonClient): Promise<SessionSummary[]> {
-	const response = await client.request({ type: "list" });
+async function getLiveSessions(client: DaemonClient, all = false): Promise<SessionSummary[]> {
+	const response = await client.request({ type: "list", ...(all ? { all: true } : {}) });
 	const data = requireSuccess(response);
 	const sessions = getSessionSummaries(data);
 	if (!sessions) {
@@ -645,12 +654,20 @@ function nextDefaultSessionName(sessions: SessionSummary[]): string {
 	);
 	const numericNames = [...existingNames]
 		.map((name) => Number.parseInt(name, 10))
-		.filter((value) => Number.isInteger(value) && value > 0);
+		.filter((value) => Number.isSafeInteger(value) && value > 0);
 	let next = numericNames.length > 0 ? Math.max(...numericNames) + 1 : 1;
-	while (existingNames.has(String(next))) {
+	while (Number.isSafeInteger(next)) {
+		if (!existingNames.has(String(next))) {
+			return String(next);
+		}
 		next++;
 	}
-	return String(next);
+
+	let fallback = "session";
+	while (existingNames.has(fallback)) {
+		fallback += "-";
+	}
+	return fallback;
 }
 
 async function runStart(parsed: ParsedDaemonClientCommand): Promise<void> {

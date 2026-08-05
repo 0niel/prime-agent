@@ -54,13 +54,17 @@ import { sleep } from "../utils/sleep.js";
 import {
 	AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL,
 	AGENT_MESSAGE_SKILL_NAME,
+	type AgentFamilyCatalogEntry,
+	type AgentFamilyRosterResult,
 	type AgentSessionMessage,
 	type AgentSessionMessageAgentSummary,
 	type AgentSessionMessageController,
 	type AgentSessionMessageListResult,
 	type AgentSessionMessageReceipt,
+	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
 	createAgentMessageHostHandlers,
+	formatAgentSessionNameUnavailable,
 	isAgentSessionMessage,
 	normalizeAgentSessionMessage,
 	normalizeAgentSessionMessageDeliveryMode,
@@ -2973,13 +2977,20 @@ export class AgentSession {
 	handleAgentMessageHostRequest(
 		type: string,
 		payload: Record<string, unknown> = {},
-	): Promise<AgentSessionMessageListResult | AgentSessionMessageReceipt> | AgentSessionMessageListResult {
+	):
+		| Promise<AgentSessionMessageListResult | AgentSessionMessageReceipt | AgentFamilyRosterResult>
+		| AgentSessionMessageListResult
+		| AgentFamilyRosterResult {
 		if (!this._agentMessageController) {
 			throw new Error("agent messaging is not available in this session");
 		}
 		switch (type) {
 			case "agent_message.list":
 				return this._agentMessageController.listAgents();
+			case "agent_message.roster":
+				if (!this._agentMessageController.roster)
+					throw new Error("agent family roster is not available in this session");
+				return this._agentMessageController.roster();
 			case "agent_message.send": {
 				if (typeof payload.target !== "string") {
 					throw new Error("agent_message.send target must be a string");
@@ -4187,6 +4198,7 @@ export class AgentSession {
 			toolSnippets,
 			promptGuidelines,
 			allowRecursion: this._rlmDepth < this._rlmMaxDepth,
+			rlmDepth: this._rlmDepth,
 			harnessState: this._loadMergedHarnessState(),
 		};
 		return buildSystemPrompt(this._baseSystemPromptOptions);
@@ -8126,7 +8138,11 @@ export class AgentSession {
 				appendEntry: (customType, data) => {
 					this.sessionManager.appendCustomEntry(customType, data);
 				},
-				setSessionName: (name) => {
+				setSessionName: async (name) => {
+					if (this._agentMessageController?.setSessionName) {
+						await this._agentMessageController.setSessionName(name);
+						return;
+					}
 					this.setSessionName(name);
 				},
 				getSessionName: () => {
@@ -8455,6 +8471,8 @@ export class AgentSession {
 				createAgentMessageHostHandlers({
 					listAgents: async () =>
 						(await this.handleAgentMessageHostRequest("agent_message.list")) as AgentSessionMessageListResult,
+					roster: async () =>
+						(await this.handleAgentMessageHostRequest("agent_message.roster")) as AgentFamilyRosterResult,
 					sendAgentMessage: async (input) =>
 						(await this.handleAgentMessageHostRequest("agent_message.send", {
 							target: input.target,
@@ -8925,6 +8943,46 @@ export class AgentSession {
 		return matches[0]!;
 	}
 
+	/** Delete an inactive direct or nested child by its registry child id without affecting active runs. */
+	async deleteInactiveRlmSubagent(
+		childId: string,
+		isExternallyRunning: () => boolean = () => false,
+	): Promise<"deleted" | "not_found" | "running"> {
+		const isRunning = (): boolean => this._activeRlmChildRuns.has(childId) || isExternallyRunning();
+		if (isRunning()) {
+			return "running";
+		}
+		const subagent = [
+			...(await this.listRlmSubagents()).subagents,
+			...this._retryableRlmSubagentDeletions.values(),
+		].find((entry) => entry.rlm_child_id === childId);
+		if (!subagent) {
+			for (const run of this._activeRlmChildRuns.values()) {
+				const result = await run.session?.deleteInactiveRlmSubagent(childId, isExternallyRunning);
+				if (result && result !== "not_found") {
+					return result;
+				}
+			}
+			for (const retained of this._retainedRlmChildSessions.values()) {
+				const result = await retained.deleteInactiveRlmSubagent(childId, isExternallyRunning);
+				if (result !== "not_found") {
+					return result;
+				}
+			}
+			return "not_found";
+		}
+		if (isRunning()) {
+			return "running";
+		}
+		const result = await this._trackRlmSubagentDeletion(subagent, () => {
+			if (isRunning()) {
+				return Promise.resolve({ subagent, outcome: "skipped_running" });
+			}
+			return this._deleteResolvedRlmSubagent(subagent);
+		});
+		return result.outcome === "skipped_running" ? "running" : "deleted";
+	}
+
 	/** Delete a running, retained, or passive direct child selected from this parent session's registry. */
 	async deleteRlmSubagent(target: string): Promise<RlmDeleteSubagentResult> {
 		const inFlight = [...this._deletingRlmChildren.values()].filter(({ subagent }) =>
@@ -9221,47 +9279,44 @@ export class AgentSession {
 	}
 
 	private async _assertRlmSubagentSessionNameAvailable(name: string, ignorePendingReservation = false): Promise<void> {
+		const depth = this._rlmDepth + 1;
 		if (!ignorePendingReservation && this._pendingRlmSubagentSessionNames.has(name)) {
-			throw new Error(`RLM subagent session name "${name}" is already in use`);
+			throw new Error(formatAgentSessionNameUnavailable(name, depth));
 		}
-		const conflictsWithSelector = (endpoint: {
-			activeSessionId: string;
-			sessionId: string;
-			sessionName?: string;
-			rlmChildId?: string;
-		}) =>
-			endpoint.activeSessionId === name ||
-			endpoint.sessionId === name ||
-			endpoint.sessionName === name ||
-			endpoint.rlmChildId === name;
-		for (const [childId, run] of this._activeRlmChildRuns) {
-			if (
-				childId === name ||
-				run.sessionName === name ||
-				run.session?.sessionId === name ||
-				run.session?.sessionName === name
-			) {
-				throw new Error(`RLM subagent session name "${name}" is already in use`);
-			}
+		const localConflict =
+			[...this._activeRlmChildRuns.values()].some(
+				(run) => run.session?.sessionName === name || (!run.session && run.sessionName === name),
+			) ||
+			[...this._retainedRlmChildSessions.values()].some((session) => session.sessionName === name) ||
+			[...this._retryableRlmSubagentDeletions.values()].some((entry) => entry.session_name === name);
+		if (localConflict) {
+			throw new Error(formatAgentSessionNameUnavailable(name, depth));
 		}
-		for (const [childId, session] of this._retainedRlmChildSessions) {
-			if (childId === name || session.sessionId === name || session.sessionName === name) {
-				throw new Error(`RLM subagent session name "${name}" is already in use`);
-			}
+		const controller = this._agentMessageController;
+		if (!controller) return;
+		const input = {
+			name,
+			depth,
+			parentSessionId: this.sessionId,
+			parentSessionPath: this.sessionFile,
+		};
+		if (controller.assertSessionNameAvailable) {
+			await controller.assertSessionNameAvailable(input);
+			return;
 		}
-		for (const subagent of this._retryableRlmSubagentDeletions.values()) {
-			if (this._rlmSubagentMatchesTarget(subagent, name)) {
-				throw new Error(`RLM subagent session name "${name}" is already in use`);
-			}
-		}
-		const listedAgents = await this._agentMessageController?.listAgents();
-		if (
-			listedAgents &&
-			((listedAgents.current ? conflictsWithSelector(listedAgents.current) : false) ||
-				listedAgents.agents.some(conflictsWithSelector))
-		) {
-			throw new Error(`RLM subagent session name "${name}" is already in use`);
-		}
+		const listed = await controller.listAgents();
+		const catalog = listed.agents.map(
+			(agent): AgentFamilyCatalogEntry => ({
+				id: agent.sessionId,
+				...(agent.sessionName ? { name: agent.sessionName } : {}),
+				depth: agent.rlmDepth ?? 0,
+				status: agent.status ?? "idle",
+				...(agent.parentSessionId ? { parentSessionId: agent.parentSessionId } : {}),
+				...(agent.parentSessionPath ? { parentSessionPath: agent.parentSessionPath } : {}),
+				...(agent.sessionPath ? { sessionPath: agent.sessionPath } : {}),
+			}),
+		);
+		assertAgentSessionNameAvailable(catalog, input);
 	}
 
 	private async _authenticatedRlmModels(): Promise<Model<Api>[]> {
@@ -9332,7 +9387,7 @@ export class AgentSession {
 		}
 		if (requestedSessionName) {
 			if (this._pendingRlmSubagentSessionNames.has(requestedSessionName)) {
-				throw new Error(`RLM subagent session name "${requestedSessionName}" is already in use`);
+				throw new Error(formatAgentSessionNameUnavailable(requestedSessionName, this._rlmDepth + 1));
 			}
 			this._pendingRlmSubagentSessionNames.add(requestedSessionName);
 		}

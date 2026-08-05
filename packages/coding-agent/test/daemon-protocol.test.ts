@@ -67,6 +67,14 @@ describe("daemon protocol helpers", () => {
 		);
 	});
 
+	it("capability-gates explicit subagent deletion instead of schema-gating it", () => {
+		expect(DAEMON_COMMAND_COMPATIBILITY.delete_rlm_subagent).toEqual({
+			minProtocol: 7,
+			capability: "delete_rlm_subagent",
+		});
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("delete_rlm_subagent");
+	});
+
 	it("capability-gates the optional model catalog surface", () => {
 		expect(DAEMON_COMMAND_COMPATIBILITY.get_model_catalog).toEqual({
 			minProtocol: 7,
