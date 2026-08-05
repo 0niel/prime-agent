@@ -1054,8 +1054,6 @@ export function matchesKey(data: string, keyId: KeyId): boolean {
 			return matchesKittySequence(data, FUNCTIONAL_CODEPOINTS.pageDown, modifier);
 
 		case "up":
-			// xterm reports Ctrl+Alt+Arrow with modifier parameter 8.
-			if (modifier === MODIFIERS.ctrl + MODIFIERS.alt && data === "\x1b[1;8A") return true;
 			if (modifier === MODIFIERS.alt) {
 				return (
 					data === "\x1b[1;3A" ||
@@ -1075,8 +1073,6 @@ export function matchesKey(data: string, keyId: KeyId): boolean {
 			return matchesKittySequence(data, ARROW_CODEPOINTS.up, modifier);
 
 		case "down":
-			// xterm reports Ctrl+Alt+Arrow with modifier parameter 8.
-			if (modifier === MODIFIERS.ctrl + MODIFIERS.alt && data === "\x1b[1;8B") return true;
 			if (modifier === MODIFIERS.alt) {
 				return (
 					data === "\x1b[1;3B" ||
