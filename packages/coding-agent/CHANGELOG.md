@@ -4,6 +4,7 @@
 
 - Changed self-updates to report the previous and new Prime Agent versions.
 - Changed agent messages to always use steering delivery and removed delivery-mode options from the Python, CLI, RPC, and connection APIs.
+- Fixed the subagent summary showing retained children as idle while they run follow-up work.
 
 ## [0.6.1] - 2026-08-05
 

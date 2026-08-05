@@ -349,7 +349,10 @@ function mergeSubagentSnapshot(
 		// Active updates may omit a previously known daemon session id, but a
 		// terminal update without one means the child is no longer resident.
 		activeSessionId: active ? (incoming.activeSessionId ?? previous.activeSessionId) : incoming.activeSessionId,
-		activity: active ? (incoming.activity ?? previous.activity) : undefined,
+		// A completed retained child can become active again when it receives a
+		// follow-up. Its RLM run status stays terminal, so activity must remain an
+		// independent projection of the live session state.
+		activity: active ? (incoming.activity ?? previous.activity) : incoming.activity,
 	};
 }
 

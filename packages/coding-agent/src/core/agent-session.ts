@@ -9726,7 +9726,13 @@ export class AgentSession {
 						this._emit(event);
 						return;
 					}
-					if (event.type === "message_end" && event.message.role === "assistant") {
+					if (event.type === "agent_start") {
+						activity = { kind: "waiting" };
+						emitChildUpdate();
+					} else if (event.type === "agent_end") {
+						activity = undefined;
+						emitChildUpdate();
+					} else if (event.type === "message_end" && event.message.role === "assistant") {
 						const assistant = event.message as AssistantMessage;
 						if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
 							attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
